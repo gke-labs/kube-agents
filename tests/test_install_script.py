@@ -33,13 +33,16 @@ _SOURCE_INSTALLER_COMMON = f'source "{_INSTALLER_COMMON}"; '
 
 
 class InstallScriptValidationTest(unittest.TestCase):
-    def _run_install_func(self, func_call, env=None, cwd=None):
-        """Source install.sh in test mode and run the given function call."""
+    def _run_install_func(self, func_call, env=None, cwd=None, bin_dir=None):
+        """Source install.sh in test mode and run the given function call.
+
+        `bin_dir` is prepended to PATH, for the calls that shell out.
+        """
         setup = f"""
 KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
 {func_call}
 """
-        full_env = get_isolated_test_env(overrides=env)
+        full_env = get_isolated_test_env(overrides=env, bin_dir=bin_dir)
         return subprocess.run(
             ["bash", "-c", setup],
             capture_output=True,
@@ -524,6 +527,108 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{isolated_install_sh}"
             proc = self._run_install_func(cmd, cwd=repo_path)
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn("dirty checkout", proc.stdout)
+
+    def test_gvisor_defaults_to_on(self):
+        """The agent runs model-authored commands; the sandbox is the default."""
+        proc = self._run_install_func('echo "GVISOR=$PARAM_ENABLE_GVISOR"')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("GVISOR=true", proc.stdout)
+
+    def test_parse_args_keeps_an_empty_gvisor_value_empty(self):
+        """`--gvisor=` must reach main's validator rather than read as a default.
+
+        main uses ${PARAM_ENABLE_GVISOR-true} for exactly this: parse_args
+        leaves the empty string in place, the `:-` form would silently
+        substitute it back to the default, and the validator rejects it.
+        """
+        cmd = 'parse_args --gvisor=; echo "GVISOR=[$PARAM_ENABLE_GVISOR]"'
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("GVISOR=[]", proc.stdout)
+
+    def test_prompt_menu_defaults_to_the_first_option(self):
+        """The premise the gVisor prompt's ordering rests on.
+
+        main lists the incoming value as option 1 and treats option 2 as "the
+        other one", so that answering the prompt with nothing confirms what
+        `--gvisor` asked for and the `(Default)` label matches what that
+        produces. It holds only while prompt_menu resolves an unanswered
+        prompt to option 1; if that moves, the prompt starts inverting the
+        caller's choice in silence.
+
+        With no controlling TTY this takes prompt_read's auto-select branch
+        rather than a literal empty line, but both resolve through the same
+        default_val="1" that prompt_menu passes.
+        """
+        cmd = (
+            'gvisor_choice=""; prompt_menu "Pick" "first" "second" gvisor_choice; '
+            'echo "CHOICE=$gvisor_choice"'
+        )
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("CHOICE=1", proc.stdout)
+
+    def _run_with_kubectl_stub(self, func_call, kubectl_script, env=None):
+        """Run `func_call` with a stub `kubectl` on PATH.
+
+        `@COUNTER@` in either string becomes a scratch file private to this
+        run, for a stub that has to answer differently on each call.
+
+        The poll interval is flattened after sourcing rather than through the
+        environment: install.sh assigns it outright, the way it does every
+        other timing constant, so only a post-source assignment takes.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            counter = str(pathlib.Path(tmp) / "calls")
+            kubectl = bin_dir / "kubectl"
+            kubectl.write_text(
+                "#!/usr/bin/env bash\n" + kubectl_script.replace("@COUNTER@", counter) + "\n"
+            )
+            kubectl.chmod(kubectl.stat().st_mode | stat.S_IEXEC)
+            return self._run_install_func(
+                "DEPLOYMENT_POLL_INTERVAL_SECS=0\n" + func_call.replace("@COUNTER@", counter),
+                env=env,
+                bin_dir=str(bin_dir),
+            )
+
+    def test_wait_for_deployment_object_returns_once_it_exists(self):
+        proc = self._run_with_kubectl_stub(
+            'rc=0; wait_for_deployment_object dep ns 0 || rc=$?; echo "RC=$rc"',
+            "exit 0",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("RC=0", proc.stdout)
+
+    def test_wait_for_deployment_object_waits_for_a_late_deployment(self):
+        """The reason the health check waits rather than asking once.
+
+        The operator writes the agent Deployment after the apply returns, and
+        later still when it has a RuntimeClass to resolve first, so a single
+        unretried `kubectl get` reports a Deployment that is merely late as one
+        that was never created.
+        """
+        stub = (
+            'n=$(cat @COUNTER@ 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > @COUNTER@; '
+            '[ "$n" -ge 3 ] && exit 0; exit 1'
+        )
+        proc = self._run_with_kubectl_stub(
+            'rc=0; wait_for_deployment_object dep ns 30 || rc=$?; '
+            'echo "RC=$rc TRIES=$(cat @COUNTER@)"',
+            stub,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("RC=0 TRIES=3", proc.stdout)
+
+    def test_wait_for_deployment_object_gives_up_after_the_budget(self):
+        """A Deployment that is never coming still has to end the run."""
+        proc = self._run_with_kubectl_stub(
+            'rc=0; wait_for_deployment_object dep ns 0 || rc=$?; echo "RC=$rc"',
+            "exit 1",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("RC=1", proc.stdout)
 
 
 class EnsureExistingClusterNetworkPolicyTest(unittest.TestCase):

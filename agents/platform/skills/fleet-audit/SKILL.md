@@ -90,20 +90,21 @@ audit crons start in the profile directory; the harness clones the GitOps reposi
 inside it. The clone is keyed by audit id because the audit streams share the volume with each other
 and with every kanban worker: each one gets a tree nobody else writes in, so a colliding schedule
 can no longer reset another stream's working copy out from under it. The repository comes from the
-`Git Repo:` line of `/opt/data/SETTINGS.md`, which the operator writes at provisioning time and
-which is readable before any clone exists.
+`$GITOPS_STATE_CONFIGMAP` ConfigMap, which the operator manages and which is readable before any clone exists.
 
 ### Step 1 — `start`
 
 Before inspecting anything, claim the workspace:
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit <audit-id>
+./skills/fleet-audit/scripts/audit_report.py start \
+  --audit <audit-id> \
+  [--repo "<owner>/<repo>"]
 ```
 
-This resolves the target repository, mints a repo-scoped GitHub token, clones or refreshes the
+This resolves the target repository (using `--repo` if specified, falling back to the single configured repo in `$GITOPS_STATE_CONFIGMAP`, or failing if ambiguous across multiple repos), mints a repo-scoped GitHub token, clones or refreshes the
 GitOps workspace and leaves it on a clean `main`, ensures the audit's labels exist, locates the
-stream's open ledger issue, and clears any findings document a crashed run left behind. It creates
+stream's open ledger issue, and clears any findings document a crashed run left behind. If the user asked for a specific repository that is not yet registered, instruct the user or cluster administrator to add it to `$GITOPS_STATE_CONFIGMAP`. It creates
 **no branch** — there is no report branch. It prints exactly one JSON line:
 
 ```json
@@ -160,7 +161,10 @@ about is not covered by that guarantee.
 ### Step 3 — `finish`
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py finish --audit <audit-id> --findings-file <findings_path>
+./skills/fleet-audit/scripts/audit_report.py finish \
+  --audit <audit-id> \
+  --findings-file <findings_path> \
+  [--repo "<owner>/<repo>"]
 ```
 
 The script validates the document, reconciles every finding against the pull requests already open
@@ -541,12 +545,12 @@ Every `/remediate` gets exactly one answer, and the answer is never silence:
 - Refused — one reply saying why, for a commenter without write access, a `/remediate` naming a
   finding that is not in the current document, or one naming a non-`manifest` finding.
 - Refused **on syntax**, likewise once, because a command the parser will not honour is a person
-  waiting for a fix that is never coming. `/remediate` is only read at the start of its own line, so
-  one written mid-sentence gets a reply pointing that out; one written with no target at all gets a
-  reply too, because reading it as `all` would open every promotable pull request the cap allows on
-  someone who typed the command and then went to look up the id. Both replies carry the correct
-  syntax and the promotable ids — up to ten, then "and N more", since a refusal is help and not a
-  second copy of the report.
+  waiting for a fix that is never coming. `/remediate` is only read at the start of its own line outside
+  block quotes, so one written mid-sentence or rendered inside a block quote / lazy continuation gets a reply
+  pointing that out; one written with no target at all gets a reply too, because reading it as `all` would open
+  every promotable pull request the cap allows on someone who typed the command and then went to look up the id.
+  These replies carry the correct syntax and the promotable ids — up to ten, then "and N more", since a refusal
+  is help and not a second copy of the report.
 - Overtaken by a **clean run** — answered anyway, and answered _before_ the ledger closes. A run that
   finds nothing still replies to every unanswered `/remediate` in the thread to say the finding no
   longer reproduces, and whether the ledger is closing or staying open on partial coverage. This is
@@ -555,7 +559,7 @@ Every `/remediate` gets exactly one answer, and the answer is never silence:
   nothing is being acted on for anybody, and "it no longer reproduces" is equally true and equally
   useful to a commenter without write access.
 
-Two deliberate silences. A mid-sentence `/remediate` from someone _without_ write access gets
+Two deliberate silences. A mid-sentence or quoted `/remediate` from someone _without_ write access gets
 nothing: their correctly-typed command would have been refused anyway, and two replies to one
 comment that was probably never a command is a bot picking an argument. And a `/remediate` inside a
 code span is prose about the command, not an attempt at it — which is why every `/remediate` the
@@ -573,7 +577,8 @@ per id:
 
 ```bash
 ./skills/fleet-audit/scripts/audit_report.py remediate --audit <audit-id> \
-  --findings-file <findings_path> --finding <id> [--finding <id> …] [--issue <n>]
+  --findings-file <findings_path> --finding <id> [--finding <id> …] [--issue <n>] \
+  [--repo "<owner>/<repo>"]
 ```
 
 **It opens exactly what you name, and nothing else.** The auto-promotion sweep does not ride along:

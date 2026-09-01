@@ -27,6 +27,12 @@ steps:
       - "BUILDKIT_INLINE_CACHE=1"
       - "--build-arg"
       - "HERMES_AGENT_TAG=$_HERMES_AGENT_TAG"
+      # Baked into the image as an env var and sent as the User-Agent on every
+      # remote MCP call. Callers pass the tag they are publishing under; the
+      # default below keeps a build that omits it well-formed rather than
+      # empty.
+      - "--build-arg"
+      - "KUBE_AGENTS_VERSION=$_KUBE_AGENTS_VERSION"
       - "."
   # Publish a mode=max build cache beside the image: inline cache above covers
   # only the final image's layers, so presubmits re-ran every intermediate
@@ -55,6 +61,7 @@ steps:
           -f deploy/docker/Dockerfile \
           --target "$_TARGET" \
           --build-arg HERMES_AGENT_TAG="$_HERMES_AGENT_TAG" \
+          --build-arg KUBE_AGENTS_VERSION="$_KUBE_AGENTS_VERSION" \
           --cache-from "type=registry,ref=$_BUILDCACHE_URI" \
           --cache-from "type=registry,ref=$_IMAGE_URI_LATEST" \
           --cache-to "type=registry,ref=$_BUILDCACHE_URI,mode=max" \
@@ -74,3 +81,4 @@ substitutions:
   _TARGET: ""
   _HERMES_AGENT_TAG: ""
   _BUILDCACHE_URI: ""
+  _KUBE_AGENTS_VERSION: "dev"

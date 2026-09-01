@@ -37,8 +37,23 @@ sets `CHAT_HOME_CHANNEL` on every cron child unconditionally, so the target alwa
 relay is always attempted. The home channel is needed one hop later, where the Session KV server
 posts what the Chat Agent composed: `_send_to_chat` runs `hermes send --to <platform>` with no
 chat id, and that bare form is the one `hermes send` documents as "platform (home channel)". Where
-there is none the send fails and the roster entry records
-`last_delivery_error: "composed but not delivered to google_chat"`. The value is set either by the
+there is none the send fails and the roster entry records a `last_delivery_error` that nests three
+layers of wrapping — the relay's own words inside the route's 502 detail inside the plugin's report
+of it, so grep for a fragment rather than the whole string:
+
+```
+chat relay answered HTTP 502: chat relay failed: composed but not delivered to google_chat
+```
+
+On an install with more than one chat platform enabled the send fans out to all of them, so one
+platform missing a home channel costs the recap only that audience. The run is then a delivery, and
+the entry records:
+
+```
+chat relay partial: the report did not reach slack. Delivered — do not re-run to resend.
+```
+
+The home channel is set either by the
 CR — `spec.integration.googleChat.homeChannel`, which the operator renders into the pod as
 `GOOGLE_CHAT_HOME_CHANNEL` — or by running `/sethome` in the channel you want it in. Every entry
 on the roster shipping `deliver: "chat"` takes this route; nothing about it is specific to

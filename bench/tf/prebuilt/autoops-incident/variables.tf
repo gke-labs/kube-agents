@@ -21,12 +21,13 @@
 # and NOT declared here raises ConfigError. So the task file and this one are a
 # matched pair.
 
-# The cluster the Platform Agent pod runs in, which is the ONLY cluster this
-# scenario can use. k8s-event-watcher is a peer process inside that pod's
-# envoy-credential-proxy container and reads events through --in-cluster, so an
-# incident planted anywhere else is never seen. hack/ci-eval-pr.sh passes these
-# two from HOST_CLUSTER_NAME/REGION -- deliberately not from the per-run task
-# cluster the other tofu stacks build, which has no agent on it.
+# The cluster the Platform Agent pod runs in, and the only cluster this
+# scenario can use -- not because k8s-event-watcher is confined to the cluster
+# it runs in (it fans in over the Cluster Agent profile clusters as well), but
+# because a per-run cluster joins that watch set too late to be watched inside
+# the run. main.tf's header carries the argument. hack/ci-eval-pr.sh passes
+# these two from HOST_CLUSTER_NAME/REGION -- deliberately not from the per-run
+# task cluster the other tofu stacks build, which has no agent on it.
 variable "host_cluster_name" {
   type        = string
   description = "Name of the cluster the Platform Agent runs in; the incident is planted here."

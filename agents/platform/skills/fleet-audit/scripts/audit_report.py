@@ -441,6 +441,20 @@ DRY_RUN_PR_SEPARATOR = "=== WOULD OPEN PULL REQUEST ==="
 # ends the block early and leaves the lines after it exposed. That is how a
 # `/remediate` a reader quoted inside a code block gets read as a command.
 FENCE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+# A block quote opener (CommonMark §5.1): 0-3 spaces followed by '>'.
+BLOCKQUOTE_OPEN_RE = re.compile(r"^ {0,3}>")
+# Block starters that terminate a paragraph's lazy continuation in a blockquote:
+# Heading (#), thematic break (---, ***, ___), non-blank list item (-, *, +, 1.), fence (```, ~~~)
+PARAGRAPH_BREAK_RE = re.compile(
+    r"^ {0,3}(?:#{1,6}\s|[-*_]{3,}\s*$|(?:[*+-]|1[.)])\s+\S|`{3,}|~{3,})"
+)
+# Block structures inside a block quote that do NOT contain an open paragraph:
+# Heading (#), thematic break (---, ***, ___), fence (```, ~~~), or empty bullet list item.
+# Note: list items with content (e.g. `> - item`, `> 1. item`) or ordered markers
+# without starting from 1 contain/continue open paragraphs and accept CommonMark lazy continuations.
+NON_PARAGRAPH_BLOCK_RE = re.compile(
+    r"^ {0,3}(?:#{1,6}\s|[-*_]{3,}\s*$|`{3,}|~{3,}|[*+-]\s*$)"
+)
 
 MAX_EXCERPT_LINES = 40
 MAX_EXCERPT_CHARS = 2000
@@ -2136,6 +2150,10 @@ def strip_fenced_blocks(text: str) -> str:
     and GitHub both render as literal text inside the enclosing block — reads
     as a closer, the block ends four lines early, and the `/remediate` the
     author put inside it to talk *about* fires as a command.
+
+    Stripped lines are replaced with blank lines rather than deleted, preserving
+    line boundaries so that a code fence interrupts enclosing paragraphs and
+    subsequent commands are not swallowed by upstream paragraph continuation.
     """
     if not text:
         return ""
@@ -2152,13 +2170,72 @@ def strip_fenced_blocks(text: str) -> str:
             ):
                 fence_char = ""
                 fence_len = 0
+            out.append("")
             continue
         match = FENCE_OPEN_RE.match(line)
         if match:
             fence_char = match.group(1)[0]
             fence_len = len(match.group(1))
+            out.append("")
             continue
         out.append(line)
+    return "\n".join(out)
+
+
+def strip_block_quotes(text: str) -> str:
+    """Drop block quotes, including CommonMark lazy paragraph continuation lines.
+
+    A block quote line opens with `>` (indented 0-3 spaces). Under CommonMark / GFM,
+    subsequent non-blank lines that continue the paragraph without a `>` prefix
+    are lazy continuation lines that render inside the enclosing block quote.
+
+    Lazy continuation applies to open paragraphs (including list items) within
+    the block quote. It ends when:
+    1. An empty or blank line appears (unprefixed, or a `>`-only line inside the quote).
+    2. An unprefixed line starts with another block structure (code fence, heading, HR, list item).
+    3. A non-paragraph block inside the block quote (such as a code fence, heading, HR, or empty list item) resets the open paragraph.
+    """
+    if not text:
+        return ""
+    out: list[str] = []
+    in_quote_paragraph = False
+    for line in text.split("\n"):
+        if BLOCKQUOTE_OPEN_RE.match(line):
+            # A line starting with '>' is part of a blockquote and is stripped.
+            # Determine whether this line opens/continues a paragraph or closes/resets it.
+            rest = line.lstrip()[1:]  # content after '>'
+            inner = rest.lstrip()
+            while inner.startswith(">"):
+                inner = inner[1:].lstrip()
+
+            if not inner.strip():
+                # A blank line inside the quote (e.g. '>', '> >', '>   ') terminates
+                # any open paragraph, so following lines cannot lazily continue.
+                in_quote_paragraph = False
+            elif NON_PARAGRAPH_BLOCK_RE.match(inner):
+                # A block starter inside the quote that does not contain an open
+                # paragraph (fence, heading, HR, empty list) interrupts paragraph continuation.
+                in_quote_paragraph = False
+            else:
+                # A paragraph line or a list item with content (e.g. '> - item')
+                # contains an open paragraph that accepts CommonMark lazy continuations.
+                in_quote_paragraph = True
+            continue
+
+        if not line.strip():
+            in_quote_paragraph = False
+            out.append(line)
+            continue
+
+        if in_quote_paragraph:
+            if PARAGRAPH_BREAK_RE.match(line):
+                in_quote_paragraph = False
+                out.append(line)
+            else:
+                # Lazy continuation line inside the block quote
+                continue
+        else:
+            out.append(line)
     return "\n".join(out)
 
 
@@ -2347,7 +2424,8 @@ def parse_remediate_commands(
     requested_at: dict[str, str] = {}
 
     for comment in comments or []:
-        body = strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
+        unfenced = strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
+        body = strip_block_quotes(unfenced)
         matches = REMEDIATE_RE.findall(body)
         # Nothing at the start of a line, but the word is in there somewhere and
         # not inside a code span: an attempt at the command, not a discussion of
@@ -2355,7 +2433,10 @@ def parse_remediate_commands(
         mention_only = not matches and bool(
             REMEDIATE_MENTION_RE.search(strip_inline_code(body))
         )
-        if not matches and not mention_only:
+        blockquote_swallowed = not matches and not mention_only and bool(
+            REMEDIATE_MENTION_RE.search(strip_inline_code(unfenced))
+        )
+        if not matches and not mention_only and not blockquote_swallowed:
             continue
 
         # Before authorization, because this is not a question of standing. A
@@ -2371,7 +2452,7 @@ def parse_remediate_commands(
         reasons: list[str] = []
 
         if association not in WRITE_ASSOCIATIONS:
-            if mention_only:
+            if mention_only or blockquote_swallowed:
                 # Prose, from somebody whose correctly-typed command would have
                 # been refused anyway. Two refusals for one comment that was
                 # probably never a command is a bot picking an argument.
@@ -2391,6 +2472,23 @@ def parse_remediate_commands(
                         f"repository (`authorAssociation: {association or 'NONE'}`), "
                         "so this command was not acted on. A remediation pull "
                         "request may only be requested by someone who could merge it."
+                    ],
+                }
+            )
+            continue
+
+        if blockquote_swallowed:
+            refusals.append(
+                {
+                    "comment_id": node_id,
+                    "author": author,
+                    "reasons": [
+                        "`/remediate` is only read outside block quotes, and "
+                        "that comment has it inside a block quote or CommonMark "
+                        "lazy continuation line. Post it on a line of its own "
+                        "separated from any quote by a blank line: "
+                        "`/remediate <finding-id>`, or `/remediate all`"
+                        + _promotable_hint(promotable)
                     ],
                 }
             )
@@ -2499,19 +2597,24 @@ def unanswered_remediate_comments(comments: list[dict]) -> list[dict]:
     Authorization is deliberately not consulted here. It decides whether a
     command is *acted on*, and on a clean run nothing is acted on for anybody —
     so "that finding no longer reproduces" is both the true answer and the more
-    useful one, for a writer and a non-writer alike. Mention-only comments are
-    included for the same reason: there is no pull request to open by mistake,
-    so the only cost of answering is a comment, and the cost of not answering is
-    a person waiting on a closed issue.
+    useful one, for a writer and a non-writer alike. Mention-only and
+    blockquote-swallowed comments are included for the same reason: there is no
+    pull request to open by mistake, so the only cost of answering is a comment,
+    and the cost of not answering is a person waiting on a closed issue.
 
     The guard is the same pair of hidden markers the findings path uses, so a
     ledger that stays open over a coverage gap does not re-answer every morning.
     """
     out: list[dict] = []
     for comment in comments or []:
-        body = strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
+        unfenced = strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
+        body = strip_block_quotes(unfenced)
         targets = [raw.strip().strip("`") for raw in REMEDIATE_RE.findall(body)]
-        if not targets and not REMEDIATE_MENTION_RE.search(strip_inline_code(body)):
+        if (
+            not targets
+            and not REMEDIATE_MENTION_RE.search(strip_inline_code(body))
+            and not REMEDIATE_MENTION_RE.search(strip_inline_code(unfenced))
+        ):
             continue
         # Authorization is deliberately not consulted here, as above — but
         # authorship is. "That finding no longer reproduces" is the useful
@@ -2552,7 +2655,9 @@ def pending_remediate_targets(comments: list[dict]) -> list[str]:
         association = str(comment.get("authorAssociation", "") or "").upper()
         if association not in WRITE_ASSOCIATIONS:
             continue
-        body = strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
+        body = strip_block_quotes(
+            strip_fenced_blocks(normalise_newlines(comment.get("body", "")))
+        )
         for raw in REMEDIATE_RE.findall(body):
             target = raw.strip().strip("`")
             if target and target != "all":
@@ -4087,26 +4192,48 @@ def refresh_credentials(repo: str | None = None) -> None:
     refresh_git_credentials(repo)
 
 
-SETTINGS_PATH = os.environ.get("FLEET_AUDIT_SETTINGS") or "/opt/data/SETTINGS.md"
+BARE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
-# Both of these live in `gitops_workspace` now, because `submit-suggestion`
-# needs the same answer and a third copy of the SETTINGS.md parser is how the
-# skills start disagreeing about which repository they are writing to. They stay
-# named here so this module's own callers — and its tests, which patch
-# SETTINGS_PATH — do not have to care where the implementation moved.
-def repo_from_settings(path: str | None = None) -> str | None:
-    """The target repository as `owner/name`, from SETTINGS.md, or None."""
+def resolve_repo(
+    audit_id: str | None = None,
+    repo: str | None = None,
+    workspace: str | Path | None = None,
+) -> str:
+    """Resolve the GitOps repository as `owner/name`, checking explicit repo, workspace, lease record, then ConfigMap."""
     import gitops_workspace
 
-    return gitops_workspace.repo_from_settings(path or SETTINGS_PATH)
+    if repo and str(repo).strip():
+        r = str(repo).strip()
+        if not BARE_REPO_RE.match(r):
+            raise ValueError(f"Invalid repository format: {r!r}. Expected 'owner/name'.")
+        managed = gitops_workspace.get_managed_github_repos()
+        if managed and r not in managed:
+            raise ValueError(
+                f"Repository {r!r} is not in the managed repositories list: {managed}"
+            )
+        return r
 
+    if workspace is not None:
+        try:
+            w_repo = gitops_workspace.resolve_repo(workspace=workspace)
+            if w_repo and BARE_REPO_RE.match(w_repo):
+                return w_repo
+        except Exception:
+            pass
 
-def resolve_repo() -> str:
-    """Resolve the GitOps repository as `owner/name`, without needing a clone."""
-    import gitops_workspace
+    if audit_id:
+        try:
+            holder = gitops_workspace.lease_dir(
+                GITOPS_WORKSPACE or gitops_workspace.default_root(), audit_id
+            )
+            record = gitops_workspace.read_lease(holder)
+            if record and record.get("repo"):
+                return record["repo"]
+        except Exception:
+            pass
 
-    return gitops_workspace.resolve_repo(SETTINGS_PATH)
+    return gitops_workspace.resolve_repo()
 
 
 def repo_root() -> Path:
@@ -4126,7 +4253,7 @@ def repo_root_best_effort() -> Path:
         return Path.cwd()
 
 
-def dry_run_repo_root(audit_id: str) -> Path:
+def dry_run_repo_root(audit_id: str, repo: str | None = None) -> Path:
     """Where a dry run looks for the manifests the real run would stage.
 
     The real run resolves every `remediation.path` inside the GitOps clone that
@@ -4140,15 +4267,15 @@ def dry_run_repo_root(audit_id: str) -> Path:
     The clone's location is a pure function of the repository name and this
     stream's lease, so it can be derived without cloning, fetching, or any other
     side effect — which keeps the dry run's promise intact. If it is not on disk
-    yet (nothing has cloned it, or `SETTINGS.md` is absent because this is a
-    laptop and not the pod), fall back rather than fail: a command that is safe
-    to run anywhere has to run anywhere.
+    yet (nothing has cloned it, or the managed repositories ConfigMap is absent
+    because this is a laptop and not the pod), fall back rather than fail: a
+    command that is safe to run anywhere has to run anywhere.
     """
     try:
         import gitops_workspace
 
         target = gitops_workspace.workspace_path(
-            resolve_repo(), GITOPS_WORKSPACE, lease=audit_id
+            resolve_repo(audit_id=audit_id, repo=repo), GITOPS_WORKSPACE, lease=audit_id
         )
     except Exception:
         return repo_root_best_effort()
@@ -5178,9 +5305,8 @@ def _workspace_runner(
 def handle_start(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
 
-    # Resolve first, then mint: the token is repo-scoped, and the repository
-    # cannot be read off a clone that does not exist yet.
-    repo = resolve_repo()
+    opt_repo = getattr(args, "repo", None)
+    repo = resolve_repo(audit_id=audit_id, repo=opt_repo)
     refresh_credentials(repo)
     # The one place a scrub is correct: the audit has not written anything yet,
     # so whatever is in the tree is debris from a run that did not finish.
@@ -5256,11 +5382,11 @@ def handle_start(args: argparse.Namespace) -> None:
     )
 
 
-def _handle_finish_dry_run(audit_id: str, data: dict, now: datetime) -> None:
+def _handle_finish_dry_run(audit_id: str, data: dict, now: datetime, repo: str | None = None) -> None:
     findings = list(data["findings"])
 
     log("DRY RUN: validated findings; nothing will be committed, pushed, or published.")
-    root = dry_run_repo_root(audit_id)
+    root = dry_run_repo_root(audit_id, repo=repo)
     log(f"DRY RUN: resolving remediation paths under {root}.")
 
     # The same degradation the real run applies, so a dry run shows the body
@@ -5485,6 +5611,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
     data = load_findings(args.findings_file, audit_id)
     findings = list(data["findings"])
+    opt_repo = getattr(args, "repo", None)
 
     by_id = {str(f.get("id", "")): f for f in findings}
     unknown = [fid for fid in args.finding if fid not in by_id]
@@ -5513,7 +5640,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
         # command is to show what the pull request would say, and an operator
         # drafting a document before writing its manifests would otherwise get a
         # blank preview and no explanation.
-        dry_root = dry_run_repo_root(audit_id)
+        dry_root = dry_run_repo_root(audit_id, repo=opt_repo)
         log(f"DRY RUN: resolving remediation paths under {dry_root}.")
         for fid in args.finding:
             if remediation_file_problem(by_id[fid], dry_root):
@@ -5542,7 +5669,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
             )
         return
 
-    repo = resolve_repo()
+    repo = resolve_repo(audit_id=audit_id, repo=opt_repo)
     refresh_credentials(repo)
     root = ensure_workspace(repo, audit_id)
     ensure_labels(repo, audit_id)
@@ -5656,12 +5783,13 @@ def handle_finish(args: argparse.Namespace) -> None:
     data = load_findings(args.findings_file, audit_id)
     findings = list(data["findings"])
     now = datetime.now(timezone.utc)
+    opt_repo = getattr(args, "repo", None)
 
     if args.dry_run:
-        _handle_finish_dry_run(audit_id, data, now)
+        _handle_finish_dry_run(audit_id, data, now, repo=opt_repo)
         return
 
-    repo = resolve_repo()
+    repo = resolve_repo(audit_id=audit_id, repo=opt_repo)
     refresh_credentials(repo)
     root = ensure_workspace(repo, audit_id)
     ensure_labels(repo, audit_id)
@@ -6144,6 +6272,10 @@ def build_parser() -> argparse.ArgumentParser:
     start_parser.add_argument(
         "--audit", required=True, help=f"Audit id: one of {', '.join(sorted(AUDITS))}."
     )
+    start_parser.add_argument(
+        "--repo",
+        help="Optional target GitOps repository (defaults to ConfigMap registered repo).",
+    )
 
     finish_parser = subparsers.add_parser(
         "finish", help="Validate findings and publish/refresh/close the ledger issue."
@@ -6151,6 +6283,10 @@ def build_parser() -> argparse.ArgumentParser:
     finish_parser.add_argument("--audit", required=True, help="Audit id.")
     finish_parser.add_argument(
         "--findings-file", required=True, help="Path to the findings.json to publish."
+    )
+    finish_parser.add_argument(
+        "--repo",
+        help="Optional target GitOps repository (defaults to leased workspace repo or ConfigMap registered repo).",
     )
     finish_parser.add_argument(
         "--dry-run",
@@ -6172,6 +6308,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         metavar="ID",
         help="Finding id to remediate; repeat for more than one.",
+    )
+    remediate_parser.add_argument(
+        "--repo",
+        help="Optional target GitOps repository (defaults to leased workspace repo or ConfigMap registered repo).",
     )
     remediate_parser.add_argument(
         "--issue",

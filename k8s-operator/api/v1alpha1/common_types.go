@@ -18,13 +18,13 @@ package v1alpha1
 
 import (
 	"fmt"
-	"net/url"
 	"regexp"
 	"strings"
 	"unicode"
 	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -495,6 +495,50 @@ type SecuritySpec struct {
 	// +optional
 	ServiceAccountAnnotations map[string]string `json:"serviceAccountAnnotations,omitempty"`
 
+	// ScopedServiceAccounts maps each GKE cluster the agent may read to the
+	// Google service account that reads it. The credential broker mints a
+	// short-lived token for the account a request's cluster maps to, instead of
+	// using the agent's own identity — which, holding a project-level
+	// roles/container.viewer, can read objects in every cluster in the project.
+	//
+	// Each account is provisioned by Terraform, never by this operator. A
+	// controller must not grant authority beyond its requester's, and minting
+	// cloud principals inside the loop that is supposed to bound the agent
+	// would put the grant on the wrong side of that boundary.
+	//
+	// As of 2026-08-12 the accounts hold no IAM grant. They were scoped by an
+	// IAM Condition on the cluster's resource.name, and that was measured to
+	// grant nothing for Kubernetes object operations; removing the condition
+	// without removing the grant would have given every account project-wide
+	// container.viewer. Authority arrives with per-cluster RBAC, and until it
+	// does the pool is off by default.
+	//
+	// A cluster absent from this list is REFUSED, not served by a wider
+	// credential. That is the point of the field, and it is also the first thing
+	// an operator will hit: adding a cluster to the fleet without adding it here
+	// produces a refusal naming the missing scope.
+	//
+	// Leaving the list empty keeps the previous behaviour — one identity for
+	// every cluster — and renders CREDENTIAL_PROXY_SCOPED_SA_POOL=0 so that the
+	// mode a deployment is in can be read off the Deployment rather than
+	// inferred from what is absent.
+	//
+	// Keyed on the cluster tuple by the API server, so a repeated cluster is
+	// rejected at admission. Without that a copy-pasted entry whose clusterName
+	// was never changed is admitted, reconciles, changes the ConfigMap hash and
+	// rolls the broker — which then refuses to start, because the broker will
+	// not resolve one cluster to two accounts by taking whichever came last.
+	// The failure is a crashloop with the cause several layers away, so it is
+	// worth catching in `kubectl apply`. Terraform's scoped_clusters already
+	// validates the same thing on its own path.
+	// +kubebuilder:validation:MaxItems=100
+	// +listType=map
+	// +listMapKey=projectId
+	// +listMapKey=location
+	// +listMapKey=clusterName
+	// +optional
+	ScopedServiceAccounts []ScopedServiceAccount `json:"scopedServiceAccounts,omitempty"`
+
 	// SplitCredentialBrokerPod moves the credential broker out of the agent Pod
 	// into a Deployment and Service of its own, so that a compromised agent no
 	// longer shares a network namespace with the process holding the cloud
@@ -547,6 +591,240 @@ type SecuritySpec struct {
 	// network in cleartext.
 	// +optional
 	SplitCredentialBrokerPod *bool `json:"splitCredentialBrokerPod,omitempty"`
+
+	// EgressPolicy selects the NetworkPolicy the operator renders for the agent
+	// Pod. "None" (the default) renders nothing.
+	//
+	// "Allowlist" renders a default-deny egress policy that permits only the
+	// destinations the agent legitimately needs. Because NetworkPolicy has no
+	// deny rule, a destination is denied by not appearing on the list, and the
+	// link-local metadata server — 169.254.169.254, where anything that can
+	// make an HTTP request can mint the node or Workload Identity service
+	// account's tokens — is one of the destinations left off.
+	//
+	// READ THIS BEFORE YOU BELIEVE THE NAME. THIS FIELD BLOCKS NOTHING TODAY.
+	// Not the metadata server, not anything else. Setting it to Allowlist can
+	// only widen what the agent Pod may send, never narrow it.
+	//
+	// That is not a bug in the rules below; it is what NetworkPolicy does.
+	// Policies selecting one Pod are unioned — the Pod may send whatever any of
+	// them permits — and the API has no deny rule, so an added policy is a
+	// monotone operation. It cannot subtract. The agent Pod is already selected
+	// for egress by <name>-gateway-netpol, which the operator renders on every
+	// reconcile whether this field is set or not — unless
+	// spec.networkPolicy.enabled is false, which withholds the gateway policy.
+	// On a Helm install that makes this the Pod's only policy: the one shape
+	// where this field enforces for real on an enforcing CNI, denying
+	// everything off its list. A Kustomize install still carries the static
+	// platform-agent-core-egress set over the same Pod, so the union resumes
+	// there. Everywhere else, turning this on leaves the
+	// Pod's permitted egress a strict superset of what it was. In the default
+	// shape the only destination it adds is the credential broker on TCP 8765
+	// — plus, when the agent is not exporting telemetry, the collector
+	// namespace on 4317/4318, because the gateway policy omits its own OTel
+	// rule in that case and this one is rendered unconditionally. Anything
+	// egressAllowlist names is added on top of that.
+	//
+	// What the gateway policy already permits, and therefore what this cannot
+	// take away:
+	//
+	//   - 169.254.169.254/32 on TCP 80, plus the discovered metadata-daemon port (988 by default) to both link-local
+	//     metadata addresses — the pre- and post-DNAT forms of a metadata
+	//     request (the 988 rule is suppressed when the resolved metadata
+	//     daemon IP is empty). So the metadata path stays open.
+	//   - TCP 443 to 0.0.0.0/0 minus the private ranges, unless the
+	//     FQDNNetworkPolicy annotation is set. So every HTTPS destination on
+	//     the public internet stays open, and with it the exfiltration half of
+	//     what this control is meant to be.
+	//
+	// A Kustomize install additionally applies platform-agent-core-egress
+	// (deploy/kustomize/platform/networkpolicy-core-egress.yaml), which selects
+	// the agent Pod by app.kubernetes.io/name and permits the same metadata
+	// path. A Helm install does not carry it, and it changes nothing either
+	// way: the gateway policy alone is enough to make the point above.
+	//
+	// The overlap is deliberate rather than an oversight. Workload Identity
+	// needs the metadata path, and in the sidecar layout the credential broker
+	// shares the Pod, so <name>-gateway-netpol cannot stop permitting it
+	// without breaking every install. Narrowing it to the broker Pod once the
+	// broker has left is the work that turns this field into a control.
+	//
+	// So what is this for today? Two things, and they are worth having, but
+	// neither is enforcement. It renders an auditable statement of the
+	// destinations the agent is supposed to need, in an object an operator can
+	// diff and a reviewer can read. And it establishes the field, the refusal
+	// rules and the reconcile behaviour, so that narrowing the gateway policy
+	// later is a change to one policy rather than a new feature.
+	//
+	// REQUIRES splitCredentialBrokerPod: true. Containers in one Pod share a
+	// network namespace, and the credential broker reaches the metadata server
+	// on purpose: minting the cloud token is its job. A Pod-level NetworkPolicy
+	// cannot deny the metadata server to the agent container while allowing it
+	// to the broker container beside it. Asking for the combination is refused
+	// with Degraded/EgressPolicyRequiresSplitBroker rather than rendered — so
+	// the default install, which has the split off, has none of this.
+	//
+	// Three further conditions the operator cannot check for you.
+	//
+	//   - The policy does nothing at all on a cluster whose CNI does not
+	//     enforce NetworkPolicy (GKE Standard without network policy enabled);
+	//     Autopilot and GKE Dataplane V2 always enforce. An unenforced policy
+	//     is stored and returned by kubectl exactly like an enforced one, so
+	//     there is nothing for the operator to read.
+	//   - Any other policy in the namespace that selects this Pod and permits
+	//     wider egress re-opens what this one closes, as the two above do.
+	//   - NodeLocal DNSCache, if the cluster runs it, may lose DNS entirely.
+	//     It runs hostNetwork, so on Cilium and Dataplane V2 its traffic
+	//     carries a host or remote-node identity, which neither the
+	//     k8s-app: node-local-dns Pod selector nor the 169.254.20.10/32 CIDR
+	//     peer in the rendered DNS rule is guaranteed to match. Both work on
+	//     an iptables dataplane, which is why both are rendered. This is the
+	//     only one of the three that can take the agent down rather than
+	//     quietly weaken it — every allowlisted destination is reached by
+	//     name, so no DNS means no egress at all. Check
+	//     `kubectl -n kube-system get ds node-local-dns` and confirm
+	//     resolution from the agent container after enabling.
+	//
+	// WHAT IT WILL COST, once the gateway policy is narrowed and this field
+	// starts blocking things. None of the following happens today, for the
+	// reason above: every destination on this list is one <name>-gateway-netpol
+	// still permits to the same Pod. Read it as the bill that falls due, not as
+	// the current behaviour — and do not schedule a capability review for a
+	// change that will not alter anything yet.
+	//
+	// The allowlist covers DNS, the credential broker, LiteLLM, the managed
+	// OpenTelemetry collector, and whatever egressAllowlist adds. Everything
+	// else the agent container reaches on its own would go away:
+	//
+	//   - DuckDuckGo web search, which the shared default config turns on for
+	//     every profile, and the "browser" toolset, which only the Chat Agent
+	//     disables;
+	//   - the gke and developer_knowledge MCP servers, which proxy
+	//     container.googleapis.com and developerknowledge.googleapis.com;
+	//   - github.com reached directly from the sandbox, though not the gh and
+	//     git wrappers, which go through the broker;
+	//   - the metadata lookup in cluster_agent_reconcile.py, which finds that
+	//     script's project id. It fails soft after a five-second timeout and
+	//     falls back to a broker gcloud call; set RECONCILE_PROJECT to skip it.
+	//
+	// Those would not be accidental casualties. A headless browser with
+	// unrestricted egress is the exfiltration path, so the capabilities this
+	// would remove are the same ones that make the control worth having. Restore
+	// individual destinations with egressAllowlist.extraRules — noting that
+	// NetworkPolicy matches addresses, never DNS names, so restoring a hosted
+	// service means naming its address ranges.
+	//
+	// Credentialed gcloud, kubectl, gh and git are unaffected: they are shims
+	// that call the broker, and the broker is on the allowlist.
+	//
+	// TURNING THIS OFF DOES NOT DELETE THE POLICY. An egress policy is a
+	// guardrail, and the operator will not remove a guardrail it may not have
+	// created, so setting this back to "None" leaves
+	// <name>-sandbox-metadata-deny in place. That is fail-closed and harmless
+	// on its own. Reverting both flags together leaves the returned broker
+	// inside the leftover policy's selection — which the gateway policy's
+	// union papers over today, by the same argument as above, but which
+	// becomes a broker cut off from the metadata server the moment the
+	// gateway policy is narrowed or absent (networkPolicy.enabled: false).
+	// Treat the order below as required rather than relying on the union to
+	// keep saving it.
+	//
+	// Revert in three steps, which never leaves a broker inside a policy that
+	// denies it:
+	//
+	//   1. set egressPolicy: None, leaving splitCredentialBrokerPod: true;
+	//   2. kubectl -n NS delete networkpolicy NAME-sandbox-metadata-deny
+	//      (safe now — with the field off the operator will not re-apply it,
+	//      whereas deleting it while the field is still "Allowlist" only
+	//      earns it back on the next reconcile);
+	//   3. set splitCredentialBrokerPod: false.
+	// +kubebuilder:validation:Enum=None;Allowlist
+	// +optional
+	EgressPolicy string `json:"egressPolicy,omitempty"`
+
+	// EgressAllowlist tunes the destinations egressPolicy: Allowlist permits.
+	// Ignored for any other egressPolicy value.
+	// +optional
+	EgressAllowlist *EgressAllowlistSpec `json:"egressAllowlist,omitempty"`
+}
+
+// EgressAllowlistSpec supplies the parts of the agent Pod's egress allowlist
+// that the operator cannot derive from the PlatformAgent itself.
+type EgressAllowlistSpec struct {
+	// ControlPlaneCIDRs are the address ranges of the Kubernetes API server,
+	// permitted on port 443.
+	//
+	// Refused, with the same Degraded report extraRules gets, if a range
+	// contains a metadata server address or is broader than /16 (/32 for
+	// IPv6). A GKE control plane is a /28 or a single address, so a wider
+	// range is an internet rule in a field named for the control plane — and
+	// this policy is an exfiltration control as well as a metadata one.
+	//
+	// The operator cannot derive this and NetworkPolicy has no selector for it:
+	// on GKE the control plane is outside the cluster, at a private /28 you
+	// chose at creation time or at a public address, and the in-cluster
+	// "kubernetes" Service is translated to that address before policy is
+	// evaluated. Leaving this empty is allowed and is the stricter choice. It
+	// costs the agent container its API-server connection, which matters at
+	// spec.deployment.replicas above 1, where the container runs
+	// leader_elect.py and holds a Lease, and to any sidecar or plugin you
+	// added that talks to the API. Find the range with
+	// `gcloud container clusters describe CLUSTER --format='value(privateClusterConfig.masterIpv4CidrBlock,endpoint)'`.
+	// On a cluster with a public endpoint that command emits a bare address;
+	// paste it as-is and it is widened to a single-host prefix.
+	// +optional
+	ControlPlaneCIDRs []string `json:"controlPlaneCIDRs,omitempty"`
+
+	// ExtraRules are appended verbatim to the rendered policy, for
+	// destinations a plugin or a custom sidecar needs.
+	//
+	// A rule that would re-permit the metadata server is not rendered — an
+	// escape hatch that can reopen the escape is not one. It is also not
+	// silently skipped: the agent goes Degraded with reason
+	// EgressAllowlistRefused, naming the rule and why, while the policy
+	// without that rule is still rendered and still maintained. A dropped rule
+	// that left the agent Ready would mean an unreachable destination with
+	// nothing in kubectl describe to explain it.
+	// +optional
+	ExtraRules []networkingv1.NetworkPolicyEgressRule `json:"extraRules,omitempty"`
+}
+
+// ScopedServiceAccount binds one GKE cluster to the Google service account
+// permitted to read it.
+//
+// The three cluster fields are a tuple rather than a name because they compose
+// into the GKE resource name — projects/P/locations/L/clusters/C — which is the
+// key the credential broker looks the account up by, and the key Terraform
+// files the account under. Keying on the cluster name alone would let a second
+// project reusing a name be served by the first project's account.
+//
+// The patterns are the broker's own component regexes, which is the property
+// that matters: they are narrower than GKE's naming rules in places, and being
+// identical to what the broker will accept is what stops the API server
+// admitting an entry the broker then refuses. They are enforced here as well as
+// there because a separator or a quote in one of them would produce a key that
+// silently matches nothing.
+type ScopedServiceAccount struct {
+	// ProjectID is the project the cluster lives in, which need not be the
+	// project the agent runs in.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9-]*$`
+	// +kubebuilder:validation:MaxLength=63
+	ProjectID string `json:"projectId"`
+
+	// Location is the cluster's region or zone.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9-]*$`
+	// +kubebuilder:validation:MaxLength=63
+	Location string `json:"location"`
+
+	// ClusterName is the GKE cluster's name.
+	// +kubebuilder:validation:Pattern=`^[a-z0-9][a-z0-9-]*$`
+	// +kubebuilder:validation:MaxLength=63
+	ClusterName string `json:"clusterName"`
+
+	// ServiceAccountEmail is the account scoped to this cluster. Terraform's
+	// `scoped_service_accounts` output is the source of these values.
+	// +kubebuilder:validation:Pattern=`^[a-z][a-z0-9-]{4,28}[a-z0-9]@[a-z0-9-]{6,30}\.iam\.gserviceaccount\.com$`
+	ServiceAccountEmail string `json:"serviceAccountEmail"`
 }
 
 // IntegrationSpec isolates common platform-specific external connections.
@@ -558,7 +836,16 @@ type IntegrationSpec struct {
 
 // GitHubSpec contains the configuration for the GitHub integration.
 type GitHubSpec struct {
-	// GitRepo is the target GitOps repository URL for the agent environment.
+	// Org is the target GitHub organization or user account for the agent environment.
+	// If omitted and GitRepo is provided, the organization is inferred from the repository owner.
+	// +kubebuilder:validation:MaxLength=39
+	// +kubebuilder:validation:Pattern=`^$|^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$`
+	// +optional
+	Org string `json:"org,omitempty"`
+
+	// GitRepo is the optional target GitOps repository URL or owner/repo shorthand for the agent environment.
+	// When omitted or empty, no repository is initially configured, and repositories can be registered
+	// in the gitops-state ConfigMap by a cluster administrator.
 	// +kubebuilder:validation:MaxLength=2048
 	// +optional
 	GitRepo string `json:"gitRepo,omitempty"`
@@ -607,12 +894,12 @@ type NetworkPolicySpec struct {
 	// +optional
 	DNSClusterIPs []string `json:"dnsClusterIPs,omitempty"`
 
-	// MetadataDaemon describes the node-local cloud metadata daemon. There is no
-	// discovery for this one, unlike the DNS ClusterIP above: leave nil and the
-	// operator takes the kubeagents.x-k8s.io/metadata-daemon-ip annotation, then its
-	// own --kubernetes-metadata-daemon-ip flag, then the documented default
-	// 169.254.169.252. Present with Endpoint "" emits no post-NAT rule at all, for
-	// datapaths that evaluate pre-NAT or clouds without one.
+	// MetadataDaemon describes the node-local cloud metadata daemon. Leave nil to let
+	// the operator discover the container port from the kube-system/gke-metadata-server
+	// DaemonSet (falling back to port 988 and 169.254.169.252). Overriding the endpoint
+	// via annotation, spec, or operator flag opts out of discovery and uses port 988.
+	// Present with Endpoint "" emits no post-NAT rule at all, for datapaths that evaluate
+	// pre-NAT or clouds without one.
 	// +optional
 	MetadataDaemon *MetadataDaemonSpec `json:"metadataDaemon,omitempty"`
 
@@ -805,7 +1092,12 @@ type NetworkPolicyStatus struct {
 	// +optional
 	MetadataDaemonIP string `json:"metadataDaemonIP,omitempty"`
 
-	// MetadataDaemonIPSource reports which rung answered the metadata daemon IP (Annotation, Spec, OperatorEnv, Default, or Suppressed).
+	// MetadataDaemonPort is the post-NAT daemon port in rule 3, resolved from the live
+	// DaemonSet when metadataDaemonIPSource is Discovered, else the documented default (988).
+	// +optional
+	MetadataDaemonPort int32 `json:"metadataDaemonPort,omitempty"`
+
+	// MetadataDaemonIPSource reports which rung answered the metadata daemon IP (Annotation, Spec, OperatorEnv, Discovered, Default, or Suppressed).
 	// +optional
 	MetadataDaemonIPSource string `json:"metadataDaemonIPSource,omitempty"`
 }
@@ -866,61 +1158,151 @@ type AgentStatus struct {
 }
 
 const (
-	// MaxGitRepoURLLength defines the maximum character length for GitRepo URLs,
-	// matching the +kubebuilder:validation:MaxLength marker on GitHubSpec.GitRepo.
+	// MaxGitHubOrgLength defines the maximum character length for GitHub org/user names.
+	MaxGitHubOrgLength = 39
+	// MaxGitRepoURLLength defines the maximum character length for Git repository URLs.
 	MaxGitRepoURLLength = 2048
 )
 
-// scpRegex validates SCP-style SSH Git URLs (e.g., git@github.com:owner/repo.git).
-// Compiled at package level to avoid re-compilation overhead on every validation invocation.
-var scpRegex = regexp.MustCompile(`^git@[a-zA-Z0-9.-]+:[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+(\.git)?$`)
+// githubOrgRegex validates GitHub organization or username format
+// (alphanumeric and hyphens, not starting or ending with hyphen, max 39 chars).
+var githubOrgRegex = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$`)
 
-// ownerRepoRegex validates bare "owner/repo" shorthand (e.g. "gke-labs/kube-agents").
-var ownerRepoRegex = regexp.MustCompile(`^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$`)
+// CleanRepoSlug cleans up git URLs, HTTPS/SSH endpoints, or bare shorthands into "owner/repo" format.
+func CleanRepoSlug(rawURL string) (string, error) {
+	return CleanRepoSlugWithOrg(rawURL, "")
+}
 
-// ValidateGitRepoURL verifies that a GitRepo string is a valid Git repository URL
-// and contains no control characters or newline injections (PI-004).
-func ValidateGitRepoURL(rawURL string) error {
+// CleanRepoSlugWithOrg cleans up git URLs, HTTPS/SSH endpoints, or bare shorthands into "owner/repo" format,
+// using the provided org if a bare repository name (without a slash) is given.
+func CleanRepoSlugWithOrg(rawURL, org string) (string, error) {
+	cleaned := strings.TrimSpace(rawURL)
+	cleaned = strings.TrimSuffix(cleaned, ".git")
+
+	// Validate URL scheme if a scheme is present
+	if idx := strings.Index(cleaned, "://"); idx != -1 {
+		scheme := strings.ToLower(cleaned[:idx])
+		if scheme != "http" && scheme != "https" && scheme != "git" && scheme != "ssh" {
+			return "", fmt.Errorf("unsupported URL scheme %q; must be http, https, git, or ssh", scheme)
+		}
+	}
+
+	// Strip known URL schemes
+	for _, scheme := range []string{"ssh://", "git://", "https://", "http://"} {
+		cleaned = strings.TrimPrefix(cleaned, scheme)
+	}
+
+	// Handle user@host prefix (e.g. git@github.com:owner/repo or git@github.com/owner/repo)
+	if idx := strings.Index(cleaned, "@"); idx != -1 {
+		cleaned = cleaned[idx+1:]
+	}
+
+	// Handle SCP-style host:path syntax (e.g. github.com:owner/repo)
+	if strings.Contains(cleaned, ":") {
+		parts := strings.SplitN(cleaned, ":", 2)
+		if len(parts) == 2 {
+			cleaned = parts[1]
+		}
+	}
+
+	// Strip common domain prefixes
+	cleaned = strings.TrimPrefix(cleaned, "github.com/")
+	cleaned = strings.TrimPrefix(cleaned, "www.github.com/")
+	cleaned = strings.Trim(cleaned, "/")
+
+	if cleaned == "" {
+		return "", fmt.Errorf("empty repository")
+	}
+
+	// If no slash is present and an org was supplied, prefix with org
+	if !strings.Contains(cleaned, "/") && strings.TrimSpace(org) != "" {
+		cleaned = strings.TrimSpace(org) + "/" + cleaned
+	}
+
+	// Basic verification of owner/repo structure
+	if strings.Count(cleaned, "/") != 1 {
+		return "", fmt.Errorf("invalid repository format")
+	}
+	return cleaned, nil
+}
+
+// CleanRepoURLWithOrg cleans up git URLs, SSH endpoints, or shorthands into a full HTTPS URL format (e.g. "https://github.com/owner/repo").
+func CleanRepoURLWithOrg(rawURL, org string) (string, error) {
 	trimmed := strings.TrimSpace(rawURL)
-	if trimmed == "" {
+	if trimmed == "" || trimmed == "None" {
+		return "", fmt.Errorf("empty repository")
+	}
+	if strings.HasPrefix(trimmed, "https://") || strings.HasPrefix(trimmed, "http://") {
+		u := strings.TrimSuffix(trimmed, ".git")
+		u = strings.TrimSuffix(u, "/")
+		return u, nil
+	}
+	cleanedSlug, err := CleanRepoSlugWithOrg(rawURL, org)
+	if err != nil {
+		return "", err
+	}
+	return "https://github.com/" + cleanedSlug, nil
+}
+
+// ValidateGitRepoURL verifies that a Git repository URL or shorthand is structurally valid
+// and contains no whitespace or non-graphic character injections.
+func ValidateGitRepoURL(gitRepo string) error {
+	return ValidateGitRepoURLWithOrg(gitRepo, "")
+}
+
+// ValidateGitRepoURLWithOrg verifies that a Git repository URL or shorthand (with optional org context)
+// is structurally valid and contains no whitespace or non-graphic character injections.
+func ValidateGitRepoURLWithOrg(gitRepo, org string) error {
+	trimmed := strings.TrimSpace(gitRepo)
+	if trimmed == "" || trimmed == "None" {
 		return nil
 	}
 
 	if utf8.RuneCountInString(trimmed) > MaxGitRepoURLLength {
-		return fmt.Errorf("gitRepo URL exceeds maximum length of %d characters", MaxGitRepoURLLength)
+		return fmt.Errorf("git repo URL exceeds maximum length of %d characters", MaxGitRepoURLLength)
 	}
 
-	// Disallow whitespace (ASCII and Unicode) and any non-graphic characters (control chars, zero-width chars, etc.)
 	for _, r := range trimmed {
 		if unicode.IsSpace(r) || !unicode.IsGraphic(r) {
-			return fmt.Errorf("gitRepo URL contains whitespace or non-graphic characters")
+			return fmt.Errorf("git repo URL contains whitespace or non-graphic characters")
 		}
 	}
 
-	// Check SCP-style SSH format: git@host:owner/repo.git
-	if scpRegex.MatchString(trimmed) {
-		return nil
-	}
-
-	// Check bare owner/repo shorthand (e.g., gke-labs/kube-agents)
-	if ownerRepoRegex.MatchString(trimmed) {
-		return nil
-	}
-
-	// Parse standard URIs
-	u, err := url.ParseRequestURI(trimmed)
-	if err != nil {
-		return fmt.Errorf("invalid URL structure: %w", err)
-	}
-
-	scheme := strings.ToLower(u.Scheme)
-	if scheme != "http" && scheme != "https" && scheme != "git" && scheme != "ssh" {
-		return fmt.Errorf("unsupported URL scheme %q; must be http, https, git, or ssh", u.Scheme)
-	}
-
-	if u.Host == "" {
-		return fmt.Errorf("gitRepo URL missing host")
+	if _, err := CleanRepoSlugWithOrg(trimmed, org); err != nil {
+		return fmt.Errorf("invalid git repository format %q: expected owner/repo or valid git URL", trimmed)
 	}
 
 	return nil
+}
+
+// ValidateGitHubOrg verifies that a GitHub Org string is a valid organization or user name
+// and contains no control characters, slashes, or newline injections (PI-004).
+func ValidateGitHubOrg(org string) error {
+	trimmed := strings.TrimSpace(org)
+	if trimmed == "" {
+		return nil
+	}
+
+	if utf8.RuneCountInString(trimmed) > MaxGitHubOrgLength {
+		return fmt.Errorf("github org exceeds maximum length of %d characters", MaxGitHubOrgLength)
+	}
+
+	// Disallow whitespace and any non-graphic characters
+	for _, r := range trimmed {
+		if unicode.IsSpace(r) || !unicode.IsGraphic(r) {
+			return fmt.Errorf("github org contains whitespace or non-graphic characters")
+		}
+	}
+
+	if !githubOrgRegex.MatchString(trimmed) {
+		return fmt.Errorf("invalid github org %q: must contain only alphanumeric characters and hyphens, and cannot begin or end with a hyphen", trimmed)
+	}
+
+	return nil
+}
+
+// ManagedRepoEntry represents a single managed repository in the gitops-state ConfigMap.
+type ManagedRepoEntry struct {
+	Type string `json:"type"`
+	URL  string `json:"url"`
 }

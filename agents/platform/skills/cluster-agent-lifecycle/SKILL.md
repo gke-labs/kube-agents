@@ -107,7 +107,8 @@ forever.
 
 It never deletes on ambiguity: any inconclusive check (auth/network/timeout, or a missing
 `cluster_identity`) leaves the profile untouched. `created=0 pruned=0 kept=0` is a normal,
-successful result. When it creates or prunes anything it posts a Google Chat summary.
+successful result. When it creates or prunes anything it posts a summary to every chat platform it
+can resolve as enabled, falling back to Google Chat when it can resolve none.
 
 Profile lifecycle belongs to this script and to the explicit onboarding/teardown paths above. Do
 not repair the roster from other work by calling `cluster_agent_profile.py` directly — a profile

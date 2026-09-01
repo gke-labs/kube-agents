@@ -70,7 +70,7 @@ into KMS (the PEM must not enter Terraform state). The installer sources
 registry prefix) and its accepted values live in exactly one place; see
 [Shared defaults live in `installer_common.sh`](k8s-operator/scripts/README.md#shared-defaults-live-in-installer_commonsh).
 
-Two behaviours worth knowing before the first run:
+Three behaviours worth knowing before the first run:
 
 - **The image/source ref defaults to the checkout's `HEAD`** and must be a SemVer release tag or a
   full 40-character commit SHA. Provisioning refuses to start from a dirty or mismatched checkout so
@@ -80,6 +80,12 @@ Two behaviours worth knowing before the first run:
   controls cloud-plane writes only — Kubernetes RBAC is read-only in every set, and the GitOps
   pull-request path works in every set. See the site's
   [security and IAM reference](docs/site/src/content/docs/reference/security-and-iam.md).
+- **The agent runs sandboxed under gVisor**, because it executes model-authored commands and an
+  unsandboxed pod shares the node kernel with everything else on the node. Autopilot, the shape a
+  fresh install creates, ships the RuntimeClass and needs no node pool, from GKE `1.27.4-gke.800`
+  on — so the sandbox costs nothing there. On a Standard cluster it provisions a `gvisor-pool`
+  node pool of one `e2-standard-4` per zone. Pass `--gvisor=false` to run on the standard
+  container runtime.
 
 ### Non-Interactive & AI Agent Execution Mode
 
@@ -124,7 +130,7 @@ Before beginning installation, ensure your environment meets the following requi
 
 | CLI Tool / Utility              | Required Version                                | Verification Command       | Description                                                                                                 |
 | :------------------------------ | :---------------------------------------------- | :------------------------- | :---------------------------------------------------------------------------------------------------------- |
-| **Go**                          | `1.26+`                                         | `go version`               | Required for building operator binaries and running tests.                                                  |
+| **Go**                          | `1.27+`                                         | `go version`               | Required for building operator binaries and running tests.                                                  |
 | **Docker / Podman**             | `20.10+`                                        | `docker --version`         | Required to build container images for the operator.                                                        |
 | **kubectl**                     | `1.28+`                                         | `kubectl version --client` | Communicates with your target Kubernetes or GKE cluster.                                                    |
 | **Kubernetes Cluster**          | `1.29+` (`1.35+` for `AgentPlugin` OCI volumes) | `kubectl version`          | Target Kubernetes or GKE cluster (`AgentPlugin` OCI volumes require K8s 1.35+ `ImageVolume` gate).          |
@@ -189,10 +195,18 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
   for local state — fine for a hand-driven evaluation, wrong for anything `uninstall.sh` or
   `upgrade.sh` should later find. The state contains every secret the install was given; the
   bucket's IAM is its protection.
-- `install.sh` re-runs are idempotent: it reuses `k8s-operator/scripts/vars.sh` from the first run,
-  regenerates `terraform.tfvars` from it, and `terraform apply` reconciles whatever changed. To
-  change configuration, use `./install.sh --menu` (Save & Apply re-applies through the same
-  engine), edit `vars.sh` and re-run, or edit your hand-written tfvars and re-apply.
+- `install.sh` re-runs rebuild `k8s-operator/scripts/vars.sh` from that run's flags and environment
+  rather than reading the previous one, then regenerate `terraform.tfvars` from it and let
+  `terraform apply` reconcile whatever changed. Anything you do not re-supply falls back to its
+  default — including `--gvisor`, which defaults to `true`, so a bare re-run moves an unsandboxed
+  install onto the sandbox. `./install.sh --menu` is the re-run that carries the previous choices:
+  it reads the existing state, and Save & Apply re-applies through the same engine. Sourcing
+  `k8s-operator/scripts/vars.sh` before a flag-driven re-run gets most of the way — its entries are
+  `export`ed, so a child `./install.sh` sees them — but not all of it. The file records the memory
+  choice as `MEMORY_PROVIDER` and the dashboard as `HERMES_DASHBOARD_ENABLED`, while `install.sh`
+  reads `MEMORY` and `ENABLE_WEBUI`, so both revert to their defaults (file-backed memory, dashboard
+  off) unless you also pass `--memory` and `--enable-web-ui`. For a hand-driven install, edit your
+  tfvars and re-apply.
 
 - **Private Container Registry**: If your GKE clusters may only pull from an approved registry, see
   [Private container registry](#private-container-registry) below for the full recipe. Mirroring

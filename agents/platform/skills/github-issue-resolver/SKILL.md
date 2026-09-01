@@ -56,24 +56,25 @@ card is a pointer written minutes ago, not a transcript: the issue may have been
 claimed, closed, or labelled `agent:ignore` since. Re-reading the truth costs one
 API call. It also performs the stale sweep, which the card cannot.
 
-- If the script outputs `{"status": "NO_ISSUES", ...}`, there is nothing to do.
-  End the turn per [Ending the turn](#ending-the-turn). Arriving here from a card
-  is normal and is not a fault — it means the issue was addressed between the
-  poll and your dispatch.
+- If the script outputs `{"status": "NO_ISSUES", ...}`:
+  - If `unreachable_repos` is non-empty (contains one or more failed repositories), do NOT respond `[SILENT]`. Alert the chat room:
+    `⚠️ **GitHub issue resolver warning:** Could not check repository: <unreachable_repos>` and end the turn per [Ending the turn](#ending-the-turn).
+  - Otherwise (`unreachable_repos` is empty and all managed repositories were checked cleanly), there is nothing to do. Arriving here from a card is normal and is not a fault — it means the issue was addressed between the poll and your dispatch. End the turn per [Ending the turn](#ending-the-turn).
 - If the script outputs `{"status": "NOT_CONFIGURED"}`, this deployment has no
   target repository. That is a supported state, not a fault. End the turn per
   [Ending the turn](#ending-the-turn).
-- If the script outputs `{"status": "ERROR", "reason": <reason>, ...}`, the
-  resolver could not run. This is a fault that would otherwise recur silently on
+- If the script outputs `{"status": "ERROR", "reason": <reason>, ...}`:
+  The resolver could not run. This is a fault that would otherwise recur silently on
   every poll, so it is never silent: alert the chat room with
-  `⚠️ **GitHub issue resolver is not running:** <reason>`, then end the turn per
+  `⚠️ **GitHub issue resolver is not running:** <reason>` (including `unreachable_repos` if listed), then end the turn per
   [Ending the turn](#ending-the-turn) — on a card, `kanban_block` rather than
   `kanban_complete`.
-- If the script outputs `{"status": "FOUND", "issue_number": <number>, ...}`,
-  read `priority` before you start. `priority` is `P0`–`P3` or `UNLABELLED`,
-  derived from the issue's own labels; it does not change the procedure, but a
-  `P0` belongs in your triage report and in the escalation alert if you send
-  one. Claim the issue in Step 2 and investigate in Step 3.
+- If the script outputs `{"status": "FOUND", "issue_number": <number>, "repository": "<repo>", ...}`:
+  - If `unreachable_repos` is non-empty, note the unreachable repository warning in your final chat update.
+  - Read `priority` before you start. `priority` is `P0`–`P3` or `UNLABELLED`,
+    derived from the issue's own labels; it does not change the procedure, but a
+    `P0` belongs in your triage report and in the escalation alert if you send
+    one. Claim the issue in Step 2 and investigate in Step 3.
 
   **Deciding whether an issue is asking you to change something is your reading
   of it, not a field in the payload.** An issue that asks you to destroy,
@@ -94,7 +95,7 @@ Immediately claim the issue before starting your investigation so other agents
 or engineers do not duplicate work:
 
 ```bash
-"$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py claim --issue <number>
+"$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py claim --issue <number>  --repo <repo>
 ```
 
 ### Step 3: Investigate & Diagnose (Reasoning Phase)
@@ -124,13 +125,13 @@ Once your investigation is complete:
    - **Case A: Issue Resolved / False Alarm (`status:resolved`)**:
 
      ```bash
-     "$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py transition --issue <number> --state resolved --report-file /opt/data/scratch/report_<number>.md
+     "$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py transition --issue <number> --repo <repo> --state resolved --report-file /opt/data/scratch/report_<number>.md
      ```
      - Then end the turn per [Ending the turn](#ending-the-turn).
 
    - **Case B: Human Review / SRE Action Needed (`status:escalation-needed`)**:
      ```bash
-     "$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py transition --issue <number> --state escalation-needed --report-file /opt/data/scratch/report_<number>.md
+     "$HERMES_HOME"/skills/github-issue-resolver/scripts/resolver.py transition --issue <number>  --repo <repo> --state escalation-needed --report-file /opt/data/scratch/report_<number>.md
      ```
      - You MUST message the chat room to alert the on-call engineer. Use
        `title_plain`, not `title` — the boundary tags are for you, not for a

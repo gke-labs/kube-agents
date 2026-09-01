@@ -587,7 +587,7 @@ class HarnessTestCase(BaseTestCase):
         self.patch_attr("SCRATCH_DIR", str(self.tmp_path / "scratch"))
         self.patch_attr("run_cmd", self.harness)
         self.patch_attr("refresh_credentials", lambda repo=None: None)
-        self.patch_attr("resolve_repo", lambda: "acme/fleet")
+        self.patch_attr("resolve_repo", lambda *a, **k: "acme/fleet")
         self.patch_attr("repo_root", lambda: self.workspace)
         # Most tests describe a pod that has audited before, so the clone
         # already exists and `ensure_workspace` takes the fetch path. Tests
@@ -4146,6 +4146,109 @@ class TestRemediateCommands(BaseTestCase):
         self.assertEqual(targets, [])
         self.assertEqual(refusals, [])
 
+    def test_a_quoted_command_never_fires(self):
+        body = "> /remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("inside a block quote", refusals[0]["reasons"][0])
+        self.assertIn("`netpol-missing`", refusals[0]["reasons"][0])
+
+    def test_a_quoted_command_from_a_stranger_is_left_alone(self):
+        body = "> /remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse(
+            [comment(body, association="NONE", login="drive-by")]
+        )
+        self.assertEqual(targets, [])
+        self.assertEqual(refusals, [])
+
+    def test_a_lazy_continuation_quoted_command_never_fires(self):
+        """CommonMark lazy continuation includes following lines in the blockquote."""
+        body = "> Quoting a suggestion:\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("inside a block quote", refusals[0]["reasons"][0])
+        self.assertIn("`netpol-missing`", refusals[0]["reasons"][0])
+
+    def test_a_command_after_blank_line_following_a_quote_fires(self):
+        body = "> Quoting context:\n\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, ["netpol-missing"])
+        self.assertEqual(refusals, [])
+
+    def test_a_command_after_empty_quote_line_fires(self):
+        body = "> The audit flagged netpol-missing.\n>\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, ["netpol-missing"])
+        self.assertEqual(refusals, [])
+
+    def test_a_command_after_fenced_block_outside_quote_fires(self):
+        body = "> Quoting the report:\n```yaml\nreplicas: 2\n```\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, ["netpol-missing"])
+        self.assertEqual(refusals, [])
+
+    def test_a_command_after_fenced_block_inside_quote_fires(self):
+        body = "> ```yaml\n> replicas: 2\n> ```\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, ["netpol-missing"])
+        self.assertEqual(refusals, [])
+
+    def test_a_command_inside_fenced_block_inside_quote_never_fires(self):
+        body = "> ```yaml\n> /remediate netpol-missing\n> ```\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("inside a block quote", refusals[0]["reasons"][0])
+
+    def test_a_lazy_continuation_after_quoted_list_item_never_fires(self):
+        body = "> Findings:\n> - netpol-missing\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("inside a block quote", refusals[0]["reasons"][0])
+
+    def test_a_lazy_continuation_after_quoted_numbered_list_item_never_fires(self):
+        body = "> Findings:\n> 1. netpol-missing\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("inside a block quote", refusals[0]["reasons"][0])
+
+    def test_a_lazy_continuation_after_ordered_list_item_starting_above_one_never_fires(self):
+        body = "> Quoting the checklist:\n2. Fix the netpol\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("inside a block quote", refusals[0]["reasons"][0])
+
+    def test_a_lazy_continuation_after_quoted_and_unprefixed_continuation_list_never_fires(self):
+        body = "> 1. netpol-missing\n2. rbac-broad\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("inside a block quote", refusals[0]["reasons"][0])
+
+    def test_a_lazy_continuation_after_empty_ordered_marker_inside_quote_never_fires(self):
+        body = "> Findings:\n> 2.\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, [])
+        self.assertEqual(len(refusals), 1)
+        self.assertIn("inside a block quote", refusals[0]["reasons"][0])
+
+    def test_a_command_after_unprefixed_numbered_list_item_starting_with_one_fires(self):
+        body = "> Quoting context:\n1. Fix the netpol\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, ["netpol-missing"])
+        self.assertEqual(refusals, [])
+
+    def test_a_command_after_blank_quote_line_following_quoted_list_item_fires(self):
+        body = "> Findings:\n> - netpol-missing\n>\n/remediate netpol-missing\n"
+        targets, refusals, _, _ = self.parse([comment(body)])
+        self.assertEqual(targets, ["netpol-missing"])
+        self.assertEqual(refusals, [])
+
     def test_remediate_all_expands_to_promotable_targets_only(self):
         targets, refusals, _, _ = self.parse([comment("/remediate all")])
         self.assertEqual(targets, ["netpol-missing"])
@@ -5346,9 +5449,21 @@ class TestUnansweredRemediateComments(unittest.TestCase):
     def comment(self, body, cid="IC_1"):
         return {"id": cid, "body": body, "author": {"login": "operator"}}
 
-    def test_a_quoted_command_is_not_a_command(self):
+    def test_a_fenced_command_is_not_a_command(self):
         fenced = self.comment("```\n/remediate a\n```")
         self.assertEqual(audit_report.unanswered_remediate_comments([fenced]), [])
+
+    def test_a_quoted_command_earns_an_answer_on_clean_run(self):
+        quoted = self.comment("> /remediate a")
+        got = audit_report.unanswered_remediate_comments([quoted])
+        self.assertEqual([r["comment_id"] for r in got], ["IC_1"])
+        self.assertEqual(got[0]["targets"], [])
+
+    def test_a_lazy_continuation_quoted_command_earns_an_answer_on_clean_run(self):
+        lazy = self.comment("> Quoting:\n/remediate a")
+        got = audit_report.unanswered_remediate_comments([lazy])
+        self.assertEqual([r["comment_id"] for r in got], ["IC_1"])
+        self.assertEqual(got[0]["targets"], [])
 
     def test_a_mention_still_earns_an_answer_when_nothing_can_be_opened(self):
         # Unlike the findings path, authorization is not consulted: nothing is
@@ -6291,6 +6406,113 @@ class TestFenceScanning(unittest.TestCase):
 
     def test_a_closer_may_carry_trailing_whitespace(self):
         self.assertIn("/remediate real", self.strip("```\nx\n``` \n/remediate real"))
+
+
+class TestBlockQuoteScanning(unittest.TestCase):
+    def strip(self, text):
+        return audit_report.strip_block_quotes(text)
+
+    def test_a_single_line_blockquote_is_stripped(self):
+        out = self.strip("> /remediate x\n\nrest")
+        self.assertNotIn("/remediate x", out)
+        self.assertIn("rest", out)
+
+    def test_a_lazy_continuation_line_is_stripped(self):
+        out = self.strip("> Quote header:\n/remediate x\n\nreal text")
+        self.assertNotIn("/remediate x", out)
+        self.assertIn("real text", out)
+
+    def test_a_blank_line_terminates_lazy_continuation(self):
+        out = self.strip("> Quote header:\n\n/remediate real")
+        self.assertIn("/remediate real", out)
+
+    def test_an_empty_quote_line_terminates_lazy_continuation(self):
+        out = self.strip("> Quote header:\n>\n/remediate real")
+        self.assertIn("/remediate real", out)
+
+    def test_an_empty_quote_line_with_spaces_terminates_lazy_continuation(self):
+        out = self.strip("> Quote header:\n>   \n/remediate real")
+        self.assertIn("/remediate real", out)
+
+    def test_a_fence_terminates_lazy_continuation(self):
+        out = self.strip("> Quote header:\n```yaml\nfoo: bar\n```\n/remediate real")
+        self.assertIn("/remediate real", out)
+
+    def test_a_fence_inside_quote_terminates_lazy_continuation(self):
+        out = self.strip("> ```yaml\n> foo: bar\n> ```\n/remediate real")
+        self.assertIn("/remediate real", out)
+
+    def test_a_heading_terminates_lazy_continuation(self):
+        out = self.strip("> Quote header:\n# Heading\n/remediate real")
+        self.assertIn("# Heading", out)
+        self.assertIn("/remediate real", out)
+
+    def test_a_thematic_break_terminates_lazy_continuation(self):
+        out = self.strip("> Quote header:\n---\n/remediate real")
+        self.assertIn("---", out)
+        self.assertIn("/remediate real", out)
+
+    def test_a_list_item_terminates_lazy_continuation(self):
+        out = self.strip("> Quote header:\n- list item\n/remediate real")
+        self.assertIn("- list item", out)
+        self.assertIn("/remediate real", out)
+
+    def test_an_ordered_list_item_starting_with_one_terminates_lazy_continuation(self):
+        out = self.strip("> Quote header:\n1. list item\n/remediate real")
+        self.assertIn("1. list item", out)
+        self.assertIn("/remediate real", out)
+
+    def test_an_ordered_list_item_starting_above_one_does_not_terminate_lazy_continuation(self):
+        out = self.strip("> Quote header:\n2. list item\n/remediate x\n\nreal text")
+        self.assertNotIn("/remediate x", out)
+        self.assertIn("real text", out)
+
+    def test_an_ordered_list_unprefixed_continuation_does_not_terminate_lazy_continuation(self):
+        out = self.strip("> 1. netpol-missing\n2. rbac-broad\n/remediate x\n\nreal text")
+        self.assertNotIn("/remediate x", out)
+        self.assertIn("real text", out)
+
+    def test_a_content_free_ordered_marker_inside_quote_does_not_terminate_lazy_continuation(self):
+        out = self.strip("> Findings:\n> 2.\n/remediate x\n\nreal text")
+        self.assertNotIn("/remediate x", out)
+        self.assertIn("real text", out)
+
+    def test_an_empty_list_item_without_content_does_not_terminate_lazy_continuation(self):
+        out = self.strip("> Quoting context:\n- \n/remediate x\n\nreal text")
+        self.assertNotIn("/remediate x", out)
+        self.assertIn("real text", out)
+
+    def test_a_lazy_continuation_under_quoted_bullet_list_item_is_stripped(self):
+        out = self.strip("> Findings:\n> - netpol-missing\n/remediate netpol-missing\n\nreal text")
+        self.assertNotIn("/remediate netpol-missing", out)
+        self.assertIn("real text", out)
+
+    def test_a_lazy_continuation_under_quoted_numbered_list_item_is_stripped(self):
+        out = self.strip("> 1. netpol-missing\n/remediate netpol-missing\n\nreal text")
+        self.assertNotIn("/remediate netpol-missing", out)
+        self.assertIn("real text", out)
+
+    def test_an_empty_quote_line_after_quoted_list_item_terminates_lazy_continuation(self):
+        out = self.strip("> - netpol-missing\n>\n/remediate real")
+        self.assertIn("/remediate real", out)
+
+    def test_an_empty_list_item_inside_quote_terminates_lazy_continuation(self):
+        out = self.strip("> -\n/remediate real")
+        self.assertIn("/remediate real", out)
+
+    def test_a_nested_quote_with_list_item_lazy_continuation_is_stripped(self):
+        out = self.strip("> > - item\n/remediate x\n\nreal text")
+        self.assertNotIn("/remediate x", out)
+        self.assertIn("real text", out)
+
+    def test_three_spaces_indent_is_a_blockquote(self):
+        out = self.strip("   > /remediate x\n\nrest")
+        self.assertNotIn("/remediate x", out)
+        self.assertIn("rest", out)
+
+    def test_empty_string_returns_empty(self):
+        self.assertEqual(self.strip(""), "")
+        self.assertEqual(self.strip(None), "")
 
 
 class TestPathContainment(unittest.TestCase):
@@ -7609,69 +7831,65 @@ class TestRepoResolution(BaseTestCase):
     directory. The audit crons start in the agent's profile directory, which is
     not a working tree, so that call returned nothing and the run died before
     it could clone anything — the token it needed to clone is repo-scoped, and
-    the repo came from the clone. SETTINGS.md breaks the cycle.
+    the repo came from the clone. The managed repositories ConfigMap breaks the cycle.
     """
 
-    def settings(self, text):
-        path = self.tmp_path / "SETTINGS.md"
-        path.write_text(text, encoding="utf-8")
-        self.patch_attr("SETTINGS_PATH", str(path))
-        return path
 
-    def test_the_operator_written_line_is_parsed(self):
-        self.settings(
-            "# GKE Scope Configuration\n"
-            "- **Git Repo:** https://github.com/acme/fleet.git\n"
+    def test_configmap_resolution_succeeds(self):
+        fake_cm = CompletedProcess(
+            args=["kubectl"],
+            returncode=0,
+            stdout='{"data": {"managed_repos": "[{\\"type\\": \\"github\\", \\"url\\": \\"https://github.com/acme/from-configmap\\"}]"}}',
+            stderr="",
         )
-        self.assertEqual(audit_report.resolve_repo(), "acme/fleet")
+        with patch("subprocess.run", return_value=fake_cm):
+            self.assertEqual(audit_report.resolve_repo(), "acme/from-configmap")
 
-    def test_an_ssh_remote_is_parsed(self):
-        self.settings("- **Git Repo:** git@github.com:acme/fleet.git\n")
-        self.assertEqual(audit_report.resolve_repo(), "acme/fleet")
-
-    def test_a_bare_owner_name_is_parsed(self):
-        self.settings("- **Git Repo:** acme/fleet\n")
-        self.assertEqual(audit_report.resolve_repo(), "acme/fleet")
-
-    def test_the_unset_placeholder_is_not_a_repository(self):
-        # The operator writes the literal `None` when the CR omits the repo.
-        # Treating that as an owner/name would send every gh call to a repo
-        # called "None".
-        self.settings("- **Git Repo:** None\n")
-        self.assertIsNone(audit_report.repo_from_settings())
-
-    def test_a_missing_settings_file_is_not_an_error_on_its_own(self):
-        self.patch_attr("SETTINGS_PATH", str(self.tmp_path / "absent.md"))
-        self.assertIsNone(audit_report.repo_from_settings())
-
-    def test_it_falls_back_to_the_git_remote(self):
-        self.patch_attr("SETTINGS_PATH", str(self.tmp_path / "absent.md"))
-        module = type(sys)("github_token_refresh")
-        module.get_current_git_repo = lambda: "acme/from-remote"
-        with patch.dict(sys.modules, {"github_token_refresh": module}):
-            self.assertEqual(audit_report.resolve_repo(), "acme/from-remote")
-
-    def test_both_sources_failing_names_both_sources(self):
-        missing = self.tmp_path / "absent.md"
-        self.patch_attr("SETTINGS_PATH", str(missing))
-        module = type(sys)("github_token_refresh")
-        module.get_current_git_repo = lambda: None
-        with patch.dict(sys.modules, {"github_token_refresh": module}):
+    def test_configmap_resolution_multi_repo_raises(self):
+        fake_cm = CompletedProcess(
+            args=["kubectl"],
+            returncode=0,
+            stdout='{"data": {"managed_repos": "[{\\"type\\": \\"github\\", \\"url\\": \\"https://github.com/acme/first\\"}, {\\"type\\": \\"github\\", \\"url\\": \\"https://github.com/acme/second\\"}]"}}',
+            stderr="",
+        )
+        with patch("subprocess.run", return_value=fake_cm):
             with self.assertRaises(RuntimeError) as caught:
                 audit_report.resolve_repo()
-        self.assertIn(str(missing), str(caught.exception))
+            self.assertIn("Multiple repositories configured", str(caught.exception))
+
+    def test_it_falls_back_to_the_git_remote(self):
+        module = type(sys)("github_token_refresh")
+        module.get_current_git_repo = lambda: "acme/from-remote"
+        with patch("gitops_workspace.get_managed_github_repos", return_value=[]), patch.dict(sys.modules, {"github_token_refresh": module}):
+            self.assertEqual(audit_report.resolve_repo(), "acme/from-remote")
+
+    def test_all_sources_failing_names_sources(self):
+        module = type(sys)("github_token_refresh")
+        module.get_current_git_repo = lambda: None
+        with patch("gitops_workspace.get_managed_github_repos", return_value=[]), patch.dict(sys.modules, {"github_token_refresh": module}):
+            with self.assertRaises(RuntimeError) as caught:
+                audit_report.resolve_repo()
+        self.assertIn("ConfigMap", str(caught.exception))
         self.assertIn("origin remote", str(caught.exception))
 
-    def test_settings_wins_over_whatever_directory_the_agent_is_in(self):
-        self.settings("- **Git Repo:** https://github.com/acme/fleet\n")
-        module = type(sys)("github_token_refresh")
+    def test_explicit_repo_in_managed_repos_succeeds(self):
+        with patch("gitops_workspace.get_managed_github_repos", return_value=["acme/first", "acme/second"]):
+            self.assertEqual(audit_report.resolve_repo(repo="acme/first"), "acme/first")
 
-        def explode():
-            raise AssertionError("the git remote must not be consulted first")
+    def test_explicit_repo_not_in_managed_repos_raises(self):
+        with patch("gitops_workspace.get_managed_github_repos", return_value=["acme/first", "acme/second"]):
+            with self.assertRaises(ValueError) as caught:
+                audit_report.resolve_repo(repo="acme/unregistered")
+            self.assertIn("not in the managed repositories list", str(caught.exception))
 
-        module.get_current_git_repo = explode
-        with patch.dict(sys.modules, {"github_token_refresh": module}):
-            self.assertEqual(audit_report.resolve_repo(), "acme/fleet")
+    def test_explicit_repo_raises_when_get_managed_github_repos_fails(self):
+        with patch(
+            "gitops_workspace.get_managed_github_repos",
+            side_effect=RuntimeError("kubectl failed: Forbidden"),
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                audit_report.resolve_repo(repo="acme/first")
+            self.assertIn("kubectl failed: Forbidden", str(caught.exception))
 
 
 class TestCredentialOrdering(HarnessTestCase):
@@ -7689,7 +7907,7 @@ class TestCredentialOrdering(HarnessTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def _resolve(self):
+    def _resolve(self, *a, **k):
         self.order.append("resolve")
         return "acme/fleet"
 

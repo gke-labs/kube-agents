@@ -55,6 +55,7 @@ Consolidating did take something away: an operator could previously stop one
 poller by disabling its roster entry. ``GITHUB_WATCHER_SWEEPS`` gives that back.
 """
 
+from collections import defaultdict
 import json
 import os
 import re
@@ -360,6 +361,7 @@ class _Pending:
     pr: "forge.PullRequest"
     comment: "forge.Comment"
     trigger: "pr_triggers.Trigger"
+    repo: str = ""
 
 
 REFUSAL_BODY = (
@@ -533,10 +535,11 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
     warnings: list[str] = []
 
     try:
-        repo = forge.target_repo()
-    except forge.ForgeError as error:
-        return SweepResult(warnings=[_forge_warning(error)])
-    if not repo:
+        from gitops_workspace import get_managed_github_repos
+        repos = get_managed_github_repos()
+    except Exception as error:
+        return SweepResult(warnings=[_forge_warning(error if isinstance(error, forge.ForgeError) else forge.ForgeError("DISCOVERY_FAILED", str(error)))])
+    if not repos:
         # No GitOps repository configured. A supported install with nothing to
         # watch, not a fault — same reading as the issues sweep's NOT_CONFIGURED.
         return SweepResult()
@@ -556,11 +559,11 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
                     "so the agent cannot recognise its own pull requests."
                 ]
             )
-        prs = [
-            pr
-            for pr in provider.list_open_prs(repo)
-            if forge.is_agent_pull_request(pr, repo, viewer) and not pr.is_ignored
-        ]
+        prs: list[tuple[str, forge.PullRequest]] = []
+        for r in repos:
+            for pr in provider.list_open_prs(r):
+                if forge.is_agent_pull_request(pr, r, viewer) and not pr.is_ignored:
+                    prs.append((r, pr))
     except forge.ForgeError as error:
         return SweepResult(warnings=[_forge_warning(error)])
 
@@ -569,24 +572,24 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
     allowed_bots = pr_triggers.bot_allowlist()
     pending: list[_Pending] = []
     refusals: list[_Pending] = []
-    unreadable: list[int] = []
+    unreadable: list[tuple[str, int]] = []
     indeterminate = 0
     # Refusals already on each pull request, so the bound is a total rather than
     # a per-tick allowance that resets every ten minutes.
-    refused_so_far: dict[int, int] = {}
+    refused_so_far: dict[tuple[str, int], int] = {}
 
-    for pr in prs:
+    for repo, pr in prs:
         try:
             comments = provider.list_comments(repo, pr)
         except forge.ForgeError:
             # One pull request that will not load must not blind the sweep for
             # the others. Collected into a single warning below rather than one
             # line each, so a repo-wide outage is one message.
-            unreadable.append(pr.number)
+            unreadable.append((repo, pr.number))
             continue
 
         handled = pr_triggers.handled_node_ids(comments, viewer)
-        refused_so_far[pr.number] = len(pr_triggers.refused_node_ids(comments, viewer))
+        refused_so_far[(repo, pr.number)] = len(pr_triggers.refused_node_ids(comments, viewer))
 
         for comment in comments:
             if comment.node_id in handled:
@@ -609,7 +612,7 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
                 indeterminate += 1
                 continue
             (pending if comment.can_write else refusals).append(
-                _Pending(pr=pr, comment=comment, trigger=trigger)
+                _Pending(pr=pr, comment=comment, trigger=trigger, repo=repo)
             )
 
     if indeterminate:
@@ -622,7 +625,7 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
     if unreadable:
         warnings.append(
             "⚠️ **GitHub PR watcher could not read** "
-            + ", ".join(f"{repo}#{n}" for n in sorted(unreadable))
+            + ", ".join(f"{repo}#{n}" for repo, n in sorted(unreadable))
             + " — those conversations were skipped this tick."
         )
     # Oldest first, so a burst of new comments cannot starve a request that has
@@ -642,7 +645,7 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
         if posted_refusals >= cap:
             dropped_refusals += 1
             continue
-        if refused_so_far.get(item.pr.number, 0) >= refusal_budget:
+        if refused_so_far.get((item.repo, item.pr.number), 0) >= refusal_budget:
             # Past the budget the request is ignored rather than answered. No
             # marker is written, so nothing is claimed to have been handled.
             dropped_refusals += 1
@@ -651,20 +654,20 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
         if dry_run:
             sys.stderr.write(
                 f"github_scan_gate: would refuse {item.trigger.node_id} "
-                f"on #{item.pr.number} (@{item.comment.author})\n"
+                f"on {item.repo}#{item.pr.number} (@{item.comment.author})\n"
             )
             posted_refusals += 1
-            refused_so_far[item.pr.number] = refused_so_far.get(item.pr.number, 0) + 1
+            refused_so_far[(item.repo, item.pr.number)] = refused_so_far.get((item.repo, item.pr.number), 0) + 1
             continue
         try:
-            _post_body(provider, repo, item.pr, body)
+            _post_body(provider, item.repo, item.pr, body)
         except forge.ForgeError as error:
             sys.stderr.write(
-                f"github_scan_gate: could not post refusal on #{item.pr.number}: {error}\n"
+                f"github_scan_gate: could not post refusal on {item.repo}#{item.pr.number}: {error}\n"
             )
             continue
         posted_refusals += 1
-        refused_so_far[item.pr.number] = refused_so_far.get(item.pr.number, 0) + 1
+        refused_so_far[(item.repo, item.pr.number)] = refused_so_far.get((item.repo, item.pr.number), 0) + 1
 
     accepted = pending[:cap]
     deferred = len(pending) - len(accepted)
@@ -682,7 +685,7 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
             f"(per-tick cap {cap}, per-PR budget {refusal_budget})\n"
         )
 
-    by_pr: dict[int, list[_Pending]] = {}
+    by_pr: dict[tuple[str, int], list[_Pending]] = defaultdict(list)
     for item in accepted:
         # Acknowledge before filing, so the reviewer sees something inside this
         # tick rather than after a model has been scheduled. Best-effort by
@@ -690,18 +693,18 @@ def sweep_pr_comments(dry_run: bool = False) -> SweepResult:
         if dry_run:
             sys.stderr.write(
                 f"github_scan_gate: would acknowledge {item.comment.node_id} "
-                f"on #{item.pr.number}\n"
+                f"on {item.repo}#{item.pr.number}\n"
             )
         elif provider.supports_acknowledge:
             try:
-                provider.acknowledge(repo, item.comment)
+                provider.acknowledge(item.repo, item.comment)
             except forge.ForgeError:
                 pass
-        by_pr.setdefault(item.pr.number, []).append(item)
+        by_pr[(item.repo, item.pr.number)].append(item)
 
     cards = [
         _pr_card(items[0].pr, items, repo)
-        for _number, items in sorted(by_pr.items())
+        for (repo, _number), items in sorted(by_pr.items(), key=lambda x: x[0])
     ]
     return SweepResult(cards=cards, warnings=warnings)
 

@@ -216,11 +216,12 @@ func otelTelemetryEnvVars(agentType, name, namespace, endpoint string, disabled 
 // platform-agent manifest, so it falls back to a tag if present before the digest (e.g. :v1@sha256:...)
 // or :latest.
 // E.g.:
-//   "ghcr.io/gke-labs/kube-agents/k8s-operator:0.2.0"                -> "ghcr.io/gke-labs/kube-agents/platform-agent:0.2.0"
-//   "ghcr.io/gke-labs/kube-agents/k8s-operator:rc_2608201147_1c06e1a" -> "ghcr.io/gke-labs/kube-agents/platform-agent:rc_2608201147_1c06e1a"
-//   "ghcr.io/gke-labs/kube-agents/k8s-operator@sha256:111111..."    -> "ghcr.io/gke-labs/kube-agents/platform-agent:latest"
-//   "mirror.corp.internal:5000/kube-agents/k8s-operator:0.2.0"       -> "mirror.corp.internal:5000/kube-agents/platform-agent:0.2.0"
-//   "k8s-operator:1c06e1ab71fdeea55e6100e61c0394206188a5ba"          -> "platform-agent:1c06e1ab71fdeea55e6100e61c0394206188a5ba"
+//
+//	"ghcr.io/gke-labs/kube-agents/k8s-operator:0.2.0"                -> "ghcr.io/gke-labs/kube-agents/platform-agent:0.2.0"
+//	"ghcr.io/gke-labs/kube-agents/k8s-operator:rc_2608201147_1c06e1a" -> "ghcr.io/gke-labs/kube-agents/platform-agent:rc_2608201147_1c06e1a"
+//	"ghcr.io/gke-labs/kube-agents/k8s-operator@sha256:111111..."    -> "ghcr.io/gke-labs/kube-agents/platform-agent:latest"
+//	"mirror.corp.internal:5000/kube-agents/k8s-operator:0.2.0"       -> "mirror.corp.internal:5000/kube-agents/platform-agent:0.2.0"
+//	"k8s-operator:1c06e1ab71fdeea55e6100e61c0394206188a5ba"          -> "platform-agent:1c06e1ab71fdeea55e6100e61c0394206188a5ba"
 func deriveAgentImageFromOperator(operatorImage string) string {
 	lastSlash := strings.LastIndex(operatorImage, "/")
 	prefix := ""

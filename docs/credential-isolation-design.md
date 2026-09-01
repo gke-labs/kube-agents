@@ -108,6 +108,24 @@ This design therefore meets the scoped filesystem-and-environment goal, but it
 does not provide the stronger identity boundary of separate Pods. It assumes
 the agent does not deliberately request credentials from the metadata server.
 
+That assumption is no longer the only thing available, but it is still what the
+default install runs on. `spec.security.splitCredentialBrokerPod` moves the
+broker into a Pod of its own, and `spec.security.egressPolicy: Allowlist` then
+renders a default-deny egress NetworkPolicy on the agent Pod that leaves the
+metadata server off its allowlist. Both default to false, and the second is
+refused outright without the first. Neither closes the path yet. Adding a
+NetworkPolicy is monotone — policies selecting one Pod are unioned and the API
+has no deny rule — and the agent Pod is already selected for egress by the
+`<agent>-gateway-netpol` this same operator renders (unless
+`spec.networkPolicy.enabled: false` withholds it — on a Helm install the one
+shape where the allowlist stands alone and enforces; a Kustomize install's
+static `platform-agent-core-egress` still selects the same Pod), which permits the metadata
+path. So enabling the allowlist widens what the Pod may send and narrows
+nothing; it is an auditable object rather than a control until that gateway
+policy is narrowed to the broker Pod. It would in any case do nothing on a
+cluster whose CNI does not enforce NetworkPolicy. See
+[Denying the sandbox the metadata server](site/src/content/docs/reference/credential-isolation.md#denying-the-sandbox-the-metadata-server).
+
 The shared workspace is the other way in, and it is not closed by the UID split
 either. Both containers mount the agent PVC and both write there with
 `umask 0002`, which they must: each has to be able to change what the other
@@ -761,17 +779,25 @@ Azure, Docker, npm, and Python credential files from that PVC. This preserves
 agent state without carrying credentials forward from an older deployment. It
 deletes operator-owned resources from the abandoned two-Pod design:
 
-- `<agent>-sandbox` Deployment;
-- `<agent>-sandbox` ServiceAccount; and
-- `<agent>-sandbox-metadata-deny` NetworkPolicy.
+- `<agent>-sandbox` Deployment; and
+- `<agent>-sandbox` ServiceAccount.
 
 Deletion refuses to remove resources not owned by the PlatformAgent.
 
-Two names that used to be on that list are no longer deleted, and the
+Three names that used to be on that list are no longer deleted, and the
 difference is load-bearing. The `<agent>-credential-proxy` Deployment and
 Service are not legacy any more: they are exactly what the operator renders
 under `splitCredentialBrokerPod: true`, and it owns them in both directions —
 applied while the flag is on, deleted when it goes off.
+
+The `<agent>-sandbox-metadata-deny` NetworkPolicy is left alone for a different
+reason. It is a guardrail rather than a workload, and this controller does not
+delete a guardrail it did not create, so a cluster operator who applies that
+policy by hand can rely on it surviving a reconcile. A stale
+NetworkPolicy fails closed; a stale Deployment does not. Leaving it on the list
+was also a live bug: nothing owns a hand-applied copy, so the ownership check
+above refused it and failed every reconcile before `updateStatusReady`, which
+left the CR's status silently not tracking the agent.
 
 The credential-sidecar image contains Envoy, the real credential-aware CLIs,
 and the credential runtime. The sandbox image contains only the wrappers for
@@ -829,7 +855,9 @@ CI and deployment tests should assert that:
    reconciliation in the sidecar layout, and present under
    `splitCredentialBrokerPod: true` — the name is reconciled in both
    directions, not unconditionally removed. The `<agent>-sandbox`
-   Deployment and ServiceAccount are absent in every configuration;
+   Deployment and ServiceAccount are absent in every configuration, and
+   `<agent>-sandbox-metadata-deny` survives a reconcile that did not create
+   it, whether or not it carries an owner reference;
 9. the external PlatformAgent API key is accepted by the sidecar and replaced
    before forwarding to the loopback-only sandbox API; and
 10. Pod readiness fails when either Envoy or the credential runtime fails.

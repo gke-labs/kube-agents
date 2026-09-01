@@ -40,6 +40,8 @@ mcp_servers:
     command: "node"
     args:
       - "/opt/mcp-remote/dist/proxy.js"
+      - "--header"
+      - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION}"
       - "https://container.googleapis.com/mcp"
     lazy: true
     connect_timeout: 30
@@ -102,6 +104,8 @@ Every server is `lazy: true`, so none of them is started at boot. Hermes registe
 
 - **`platform_control`** — In-pod Python MCP server (`agents/platform/scripts/platform_mcp_server.py`). Handles session state and agent-internal ops (chat ingress lives with the Planning Agent). The `env:` block is an allowlist rather than a pass-through: Hermes gives a stdio MCP server a safe baseline (`PATH`, `HOME`, `TMPDIR`, `XDG_*`) plus exactly the keys named there and drops every other pod variable, so anything a tool needs has to be listed. Currently the Kubernetes DNS variables, Hermes home, the Chat Pub/Sub config, the project ids, the Google Chat and Slack home channels, the API server key, and the Session KV bearer token and database path. A home channel is what `send_notification` falls back to when a notification has no thread to reply into — every alert-driven investigation — and it needs `spec.integration.googleChat.homeChannel` set to carry a value; the bearer token is what lets it read `chat_id` and `thread_id` back in the first place, so an absent one costs the thread and the incident report both. See the comments on those keys in the source file.
 - **`gke`** — Remote GKE MCP server proxied via `mcp-remote`. All Kubernetes/GKE reads and writes route through this endpoint.
+
+The two servers reached through `mcp-remote` — `gke` here, and `developer_knowledge` from the shared defaults — each pass `--header User-Agent: kube-agents/${KUBE_AGENTS_VERSION}`. Without it the request reaches Google as undici's default `node` and the API team serving the endpoint cannot separate kube-agents traffic from anything else running on Node. Hermes resolves `${KUBE_AGENTS_VERSION}` in `args` from the agent process environment, where the image build put it — the commit the image was built from, or `dev` for a build that passed no version. The string is the same everywhere it appears, including in the Cluster Agent template; it names the product and the build, and nothing else. The shared defaults and the platform overlay in particular have to stay character-identical, since the build-time merge unions the two arg lists: the repeated `--header` token dedups away and a divergent value is left as a stray positional after the URL, so the overlay's spelling is silently the one that goes missing.
 
 The two servers are timed out differently on purpose. `platform_control` gets `connect_timeout: 120` for cold-start latency — under `lazy` that bounds the first tool call rather than startup — and `timeout: 300` for long reasoning chains; it is a local subprocess, so a slow call is a slow call. `gke` gets `connect_timeout: 30` / `timeout: 60` because it is a remote endpoint reached through `mcp-remote`, where a failed call can consume the whole deadline without ever returning; the rationale is recorded in full alongside the block in [`agents/platform/config.yaml`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/config.yaml). Healthy calls to it measure under a second.
 

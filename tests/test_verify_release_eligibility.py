@@ -16,7 +16,8 @@ from tests.testing.release import (
     MOCK_COLLIDING_RELEASE_TAG,
     MOCK_EMERGENCY_OVERRIDE_REASON,
     MOCK_NONEXISTENT_REF,
-    MOCK_RC_VALIDATED_TAG,
+    MOCK_HANDMADE_STAGING_TAG,
+    MOCK_LATEST_STAGING_TAG,
     MOCK_TARGET_RELEASE_TAG,
     create_mock_gh_binary,
 )
@@ -125,11 +126,11 @@ exit {docker_exit}
         finally:
             temp_dir.cleanup()
 
-    def test_auto_resolve_latest_validated_commit(self):
+    def test_auto_resolve_newest_staging_promoted_commit(self):
         temp_dir, repo_dir, git, first_sha, bin_dir = self._create_mock_repo()
         try:
-            # Tag first commit with validated RC tag
-            git("tag", "-a", MOCK_RC_VALIDATED_TAG, first_sha, "-m", f"Validated {MOCK_RC_VALIDATED_TAG}")
+            # Tag first commit with a staging promotion tag
+            git("tag", "-a", MOCK_LATEST_STAGING_TAG, first_sha, "-m", f"Promoted {MOCK_LATEST_STAGING_TAG}")
 
             # Create second unvalidated commit on main
             (pathlib.Path(repo_dir) / "file2.txt").write_text("Unvalidated change")
@@ -145,11 +146,11 @@ exit {docker_exit}
                 bin_dir=bin_dir,
             )
             self.assertEqual(proc.returncode, 0)
-            self.assertIn("Auto-resolved latest validated commit", proc.stdout)
+            self.assertIn("Auto-resolved newest staging-promoted commit", proc.stdout)
 
             outputs = gh_out.read_text()
             self.assertIn("eligible=true", outputs)
-            self.assertIn(f"validated_rc_tag={MOCK_RC_VALIDATED_TAG}", outputs)
+            self.assertIn(f"gate_tag={MOCK_LATEST_STAGING_TAG}", outputs)
             self.assertIn(f"release_commit={first_sha}", outputs)
         finally:
             temp_dir.cleanup()
@@ -157,17 +158,17 @@ exit {docker_exit}
     def test_auto_resolve_tag_sorting_prefers_newest(self):
         temp_dir, repo_dir, git, first_sha, bin_dir = self._create_mock_repo()
         try:
-            # Tag first commit with older validated RC tag
-            older_tag = "rc_2608181000_1111111_validated"
-            git("tag", "-a", older_tag, first_sha, "-m", f"Validated {older_tag}")
+            # Tag first commit with an older staging promotion tag
+            older_tag = "staging_2608181000_1111111"
+            git("tag", "-a", older_tag, first_sha, "-m", f"Promoted {older_tag}")
 
-            # Create second commit with newer validated RC tag
+            # Create second commit with a newer staging promotion tag
             (pathlib.Path(repo_dir) / "file2.txt").write_text("Second change")
             git("add", "file2.txt")
             git("commit", "-m", "feat: second commit")
             second_sha = git("rev-parse", "HEAD").stdout.strip()
-            newer_tag = "rc_2608191200_2222222_validated"
-            git("tag", "-a", newer_tag, second_sha, "-m", f"Validated {newer_tag}")
+            newer_tag = "staging_2608191200_2222222"
+            git("tag", "-a", newer_tag, second_sha, "-m", f"Promoted {newer_tag}")
 
             gh_out = pathlib.Path(repo_dir) / "gh_output.txt"
             # Auto-resolve should deterministically pick newer_tag (second_sha)
@@ -178,22 +179,22 @@ exit {docker_exit}
                 bin_dir=bin_dir,
             )
             self.assertEqual(proc.returncode, 0)
-            self.assertIn("Auto-resolved latest validated commit", proc.stdout)
+            self.assertIn("Auto-resolved newest staging-promoted commit", proc.stdout)
 
             outputs = gh_out.read_text()
             self.assertIn("eligible=true", outputs)
-            self.assertIn(f"validated_rc_tag={newer_tag}", outputs)
+            self.assertIn(f"gate_tag={newer_tag}", outputs)
             self.assertIn(f"release_commit={second_sha}", outputs)
         finally:
             temp_dir.cleanup()
 
-    def test_no_validated_commits_and_no_param_fails(self):
+    def test_no_promoted_commits_and_no_param_fails(self):
         temp_dir, repo_dir, _, _, bin_dir = self._create_mock_repo()
         try:
-            # No rc_*_validated tags exist in repo and no commit param passed -> hard fail
+            # No staging_<ts>_<sha> tags exist in repo and no commit param passed -> hard fail
             proc = self._run_verify_script(repo_dir, args=[MOCK_TARGET_RELEASE_TAG], bin_dir=bin_dir)
             self.assertNotEqual(proc.returncode, 0)
-            self.assertIn("No validated RC commit found in history", proc.stderr)
+            self.assertIn("No staging-promoted commit found in history", proc.stderr)
         finally:
             temp_dir.cleanup()
 
@@ -202,7 +203,7 @@ exit {docker_exit}
         try:
             gh_out = pathlib.Path(repo_dir) / "gh_output.txt"
             env = {
-                "SKIP_RC_VALIDATION": "true",
+                "SKIP_STAGING_VALIDATION": "true",
                 "EMERGENCY_OVERRIDE_REASON": MOCK_EMERGENCY_OVERRIDE_REASON,
                 "GITHUB_OUTPUT": str(gh_out),
             }
@@ -227,7 +228,7 @@ exit {docker_exit}
         try:
             # Empty reason
             env = {
-                "SKIP_RC_VALIDATION": "true",
+                "SKIP_STAGING_VALIDATION": "true",
                 "EMERGENCY_OVERRIDE_REASON": "",
             }
             proc = self._run_verify_script(
@@ -256,7 +257,7 @@ exit {docker_exit}
         temp_dir, repo_dir, _, _, bin_dir = self._create_mock_repo()
         try:
             env = {
-                "SKIP_RC_VALIDATION": "true",
+                "SKIP_STAGING_VALIDATION": "true",
                 "EMERGENCY_OVERRIDE_REASON": MOCK_EMERGENCY_OVERRIDE_REASON,
             }
             proc = self._run_verify_script(
@@ -278,7 +279,7 @@ exit {docker_exit}
                 repo_dir,
                 args=[MOCK_TARGET_RELEASE_TAG, commit_sha],
                 env={
-                    "SKIP_RC_VALIDATION": "true",
+                    "SKIP_STAGING_VALIDATION": "true",
                     "EMERGENCY_OVERRIDE_REASON": MOCK_EMERGENCY_OVERRIDE_REASON,
                 },
                 bin_dir=bin_dir,
@@ -297,7 +298,7 @@ exit {docker_exit}
                 repo_dir,
                 args=[MOCK_TARGET_RELEASE_TAG, commit_sha],
                 env={
-                    "SKIP_RC_VALIDATION": "true",
+                    "SKIP_STAGING_VALIDATION": "true",
                     "EMERGENCY_OVERRIDE_REASON": MOCK_EMERGENCY_OVERRIDE_REASON,
                     "GITHUB_OUTPUT": str(gh_out),
                 },
@@ -315,7 +316,7 @@ exit {docker_exit}
         temp_dir, repo_dir, _, commit_sha, bin_dir = self._create_mock_repo(mock_docker_succeeds=False)
         try:
             env = {
-                "SKIP_RC_VALIDATION": "true",
+                "SKIP_STAGING_VALIDATION": "true",
                 "EMERGENCY_OVERRIDE_REASON": MOCK_EMERGENCY_OVERRIDE_REASON,
             }
             proc = self._run_verify_script(
@@ -366,10 +367,10 @@ exit {docker_exit}
         finally:
             temp_dir.cleanup()
 
-    def test_eligible_when_rc_validated_tag_exists(self):
+    def test_eligible_when_staging_promotion_tag_exists(self):
         temp_dir, repo_dir, git, commit_sha, bin_dir = self._create_mock_repo()
         try:
-            git("tag", "-a", MOCK_RC_VALIDATED_TAG, commit_sha, "-m", f"Validated {MOCK_RC_VALIDATED_TAG}")
+            git("tag", "-a", MOCK_LATEST_STAGING_TAG, commit_sha, "-m", f"Promoted {MOCK_LATEST_STAGING_TAG}")
             gh_out = pathlib.Path(repo_dir) / "gh_output.txt"
             proc = self._run_verify_script(
                 repo_dir,
@@ -378,15 +379,15 @@ exit {docker_exit}
                 bin_dir=bin_dir,
             )
             self.assertEqual(proc.returncode, 0)
-            self.assertIn("ELIGIBLE: Found validated RC tag", proc.stdout)
+            self.assertIn("ELIGIBLE: Found staging promotion tag", proc.stdout)
 
             outputs = gh_out.read_text()
             self.assertIn("eligible=true", outputs)
-            self.assertIn(f"validated_rc_tag={MOCK_RC_VALIDATED_TAG}", outputs)
+            self.assertIn(f"gate_tag={MOCK_LATEST_STAGING_TAG}", outputs)
         finally:
             temp_dir.cleanup()
 
-    def test_blocked_when_no_rc_validated_tag(self):
+    def test_blocked_when_no_staging_promotion_tag(self):
         temp_dir, repo_dir, _, commit_sha, bin_dir = self._create_mock_repo()
         try:
             proc = self._run_verify_script(
@@ -396,14 +397,55 @@ exit {docker_exit}
             )
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn("BLOCKED: Commit", proc.stderr)
-            self.assertIn("has NOT passed live RC E2E validation", proc.stderr)
+            self.assertIn("has NOT been promoted to staging", proc.stderr)
+        finally:
+            temp_dir.cleanup()
+
+    def test_blocked_when_the_staging_tag_is_prefix_only(self):
+        """`staging_*` is a live deploy trigger; only the shape is release evidence.
+
+        `staging-redeploy-*.yml` fires on the bare prefix, so a hand-pushed
+        `staging_hotfix` is a supported way to redeploy staging. Match the prefix
+        here and that tag authorises a GA release of a commit the nightly matrix
+        never ran against. Swapping `staging_promotion_tags_at_commit` back to a
+        prefix match is what this test exists to fail on.
+        """
+        temp_dir, repo_dir, git, commit_sha, bin_dir = self._create_mock_repo()
+        try:
+            git(
+                "tag", "-a", MOCK_HANDMADE_STAGING_TAG, commit_sha,
+                "-m", f"Hand-made {MOCK_HANDMADE_STAGING_TAG}",
+            )
+            proc = self._run_verify_script(
+                repo_dir,
+                args=[MOCK_TARGET_RELEASE_TAG, commit_sha],
+                bin_dir=bin_dir,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("has NOT been promoted to staging", proc.stderr)
+        finally:
+            temp_dir.cleanup()
+
+    def test_a_prefix_only_tag_does_not_auto_resolve_a_candidate(self):
+        """The auto-resolve path reads the same family and must filter it the same way."""
+        temp_dir, repo_dir, git, commit_sha, bin_dir = self._create_mock_repo()
+        try:
+            git(
+                "tag", "-a", MOCK_HANDMADE_STAGING_TAG, commit_sha,
+                "-m", f"Hand-made {MOCK_HANDMADE_STAGING_TAG}",
+            )
+            proc = self._run_verify_script(
+                repo_dir, args=[MOCK_TARGET_RELEASE_TAG], bin_dir=bin_dir
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("No staging-promoted commit found in history", proc.stderr)
         finally:
             temp_dir.cleanup()
 
     def test_env_vars_invocation_without_args(self):
         temp_dir, repo_dir, git, commit_sha, bin_dir = self._create_mock_repo()
         try:
-            git("tag", "-a", MOCK_RC_VALIDATED_TAG, commit_sha, "-m", f"Validated {MOCK_RC_VALIDATED_TAG}")
+            git("tag", "-a", MOCK_LATEST_STAGING_TAG, commit_sha, "-m", f"Promoted {MOCK_LATEST_STAGING_TAG}")
             gh_out = pathlib.Path(repo_dir) / "gh_output.txt"
             proc = self._run_verify_script(
                 repo_dir,
@@ -416,7 +458,7 @@ exit {docker_exit}
                 bin_dir=bin_dir,
             )
             self.assertEqual(proc.returncode, 0)
-            self.assertIn("ELIGIBLE: Found validated RC tag", proc.stdout)
+            self.assertIn("ELIGIBLE: Found staging promotion tag", proc.stdout)
 
             outputs = gh_out.read_text()
             self.assertIn("eligible=true", outputs)
@@ -428,7 +470,7 @@ exit {docker_exit}
         temp_dir, repo_dir, git, commit_sha, bin_dir = self._create_mock_repo()
         try:
             # Commit has validated RC tag and GA tag, but mock gh CLI returns 1 on gh release view (release not published)
-            git("tag", "-a", MOCK_RC_VALIDATED_TAG, commit_sha, "-m", f"Validated {MOCK_RC_VALIDATED_TAG}")
+            git("tag", "-a", MOCK_LATEST_STAGING_TAG, commit_sha, "-m", f"Promoted {MOCK_LATEST_STAGING_TAG}")
             git("tag", "-a", MOCK_TARGET_RELEASE_TAG, commit_sha, "-m", f"Release {MOCK_TARGET_RELEASE_TAG}")
             create_mock_gh_binary(bin_dir, existing_releases=[])
             gh_out = pathlib.Path(repo_dir) / "gh_output.txt"
@@ -440,20 +482,20 @@ exit {docker_exit}
             )
             self.assertEqual(proc.returncode, 0)
             self.assertIn("Resuming release workflow", proc.stdout)
-            self.assertIn("ELIGIBLE: Found validated RC tag", proc.stdout)
+            self.assertIn("ELIGIBLE: Found staging promotion tag", proc.stdout)
 
             outputs = gh_out.read_text()
             self.assertIn("eligible=true", outputs)
             self.assertIn("resuming=true", outputs)
-            self.assertIn(f"validated_rc_tag={MOCK_RC_VALIDATED_TAG}", outputs)
+            self.assertIn(f"gate_tag={MOCK_LATEST_STAGING_TAG}", outputs)
             self.assertIn(f"release_commit={commit_sha}", outputs)
         finally:
             temp_dir.cleanup()
 
-    def test_resumes_release_blocked_when_no_rc_validated_tag(self):
+    def test_resumes_release_blocked_when_no_staging_promotion_tag(self):
         temp_dir, repo_dir, git, commit_sha, bin_dir = self._create_mock_repo()
         try:
-            # GA tag exists, but commit was NEVER validated and has no rc_*_validated tag
+            # GA tag exists, but the commit was never promoted and carries no staging_<ts>_<sha> tag
             git("tag", "-a", MOCK_TARGET_RELEASE_TAG, commit_sha, "-m", f"Release {MOCK_TARGET_RELEASE_TAG}")
             create_mock_gh_binary(bin_dir, existing_releases=[])
             proc = self._run_verify_script(
@@ -464,7 +506,7 @@ exit {docker_exit}
             )
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn("BLOCKED: Commit", proc.stderr)
-            self.assertIn("has NOT passed live RC E2E validation", proc.stderr)
+            self.assertIn("has NOT been promoted to staging", proc.stderr)
         finally:
             temp_dir.cleanup()
 
@@ -480,7 +522,7 @@ exit {docker_exit}
                 args=[MOCK_TARGET_RELEASE_TAG, commit_sha],
                 env={
                     "GH_TOKEN": "mock-token",
-                    "SKIP_RC_VALIDATION": "true",
+                    "SKIP_STAGING_VALIDATION": "true",
                     "EMERGENCY_OVERRIDE_REASON": "Emergency security CVE patch",
                     "GITHUB_OUTPUT": str(gh_out),
                 },

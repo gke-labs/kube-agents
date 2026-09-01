@@ -61,6 +61,26 @@ helm install kube-agents oci://ghcr.io/gke-labs/kube-agents/charts/kube-agents \
 `platformAgent.harness.{clusterName,location,projectId}` are required and have
 no defaults — rendering fails until they are set.
 
+These commands also sandbox the agent under the `gvisor` RuntimeClass, which the
+chart enables by default. On a cluster that has no such RuntimeClass the
+operator reports `RuntimeClassNotFound` and never writes the agent Deployment;
+add `--set platformAgent.deployment.availability.runtimeClassName=""` to run on
+the standard container runtime. See
+[Agent runtime knobs](#agent-runtime-knobs) for what the sandbox needs.
+
+**Upgrading an existing release picks this up too.** Helm applies the new
+chart's defaults for any key your release does not already set, so a release
+installed before this default and upgraded without pinning the value starts
+asking for the sandbox. On a cluster with no `gvisor` RuntimeClass that upgrade
+is quiet rather than loud: the operator stops at its RuntimeClass check before
+touching the workload, so the agent Deployment from the previous reconcile keeps
+running on the standard runtime — and every later change to the CR goes
+unapplied — while `.status` reports `Degraded` with `RuntimeClassNotFound`.
+`helm upgrade` itself reports success. Pass the same `--set …runtimeClassName=""`
+to stay on the standard runtime, or check
+`kubectl get platformagent -n kubeagents-system -o jsonpath='{.items[0].status}'`
+after the upgrade.
+
 ### Installing from a repository checkout
 
 The `appVersion` in a checkout's `Chart.yaml` is a placeholder that never
@@ -306,8 +326,10 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   `tenantId`, and user authorization is configured via `allowedUsers` (or
   `allowAllUsers: true`). Supports Microsoft Adaptive Cards v1.5 with markdown
   fallback.
-- **GitHub** — `platformAgent.integration.github.gitRepo` sets the agent's
-  GitOps target repository.
+- **GitHub** — `platformAgent.integration.github.org` sets the GitHub
+  Organization where the GitHub App is installed, and optional
+  `platformAgent.integration.github.gitRepo` sets the initial GitOps repository.
+  GitOps repositories can also be registered in the ConfigMap by cluster administrators.
 
 Chat, Slack, and Teams each need a one-time manual registration that no install
 automation can perform (the Chat app on the Chat API console page pointed at
@@ -344,13 +366,36 @@ tag is the case that wants the override.
 
 Two knobs need context beyond the chart:
 
-- `deployment.availability.runtimeClassName: gvisor` needs a GKE Sandbox node
-  pool on a Standard cluster — the `gke-cluster` module's
-  `enable_gvisor_node_pool` creates one; Autopilot ships the RuntimeClass
-  natively.
+- `deployment.availability.runtimeClassName` defaults to `gvisor`, because the
+  agent executes model-authored commands and an unsandboxed pod shares the node
+  kernel with everything else on the node. That needs a GKE Sandbox node pool on
+  a Standard cluster — the `gke-cluster` module's `enable_gvisor_node_pool`
+  creates one; Autopilot ships the RuntimeClass natively from GKE
+  `1.27.4-gke.800`. Where neither holds, the operator refuses to write the agent
+  Deployment and reports `RuntimeClassNotFound` on the PlatformAgent; set the
+  value to `""` to run on the standard container runtime instead. Installs
+  driven by the Terraform composition never see this default — it always renders
+  `runtimeClassName` explicitly, from its own `agent_runtime_class` variable,
+  which `install.sh` writes from `--gvisor`. That variable still defaults to
+  `""`, so a bare `terraform apply` against the composition leaves the agent
+  unsandboxed where a bare `helm install` sandboxes it.
 - `harness.hermes.dashboardEnabled` defaults to `null`, which leaves the field
   out of the CR so the CRD default (`true`) applies. Set it explicitly when an
   install must pin the dashboard on or off rather than float with the CRD.
+
+### Scoped service accounts
+
+`platformAgent.security.scopedServiceAccounts` maps each GKE cluster the agent
+may read to the Google service account that reads it. Empty is the default and
+should stay empty: the accounts hold no IAM grant as of 2026-08-12, so a
+non-empty list arms the credential broker onto identities that can read
+nothing, and every cluster read fails — a mapped cluster gets a powerless
+token and a `Forbidden` from GKE, an unmapped one is refused by the broker
+before any GKE call. The
+`terraform/examples/full-install` composition fills it in from its
+`scoped_service_accounts` output when `scoped_clusters` is set. See the site's
+[security-and-iam reference](https://github.com/gke-labs/kube-agents/blob/main/docs/site/src/content/docs/reference/security-and-iam.md)
+for what the pool does and does not bound.
 
 ### ServiceAccount ownership
 
@@ -406,7 +451,7 @@ other third-party images, so a mirrored install needs nothing extra; set
 entirely — any image with `kubectl` and `/bin/sh` works.
 
 > **Breaking:** `platformAgent.cleanupHook.image` was a single string
-> (`alpine/k8s:1.34.9`) and is now a `{repository, tag}` map, because the
+> (`alpine/k8s:<tag>`) and is now a `{repository, tag}` map, because the
 > registry rewrite needs the two halves separately. A values file that still
 > sets the string form fails the render rather than installing something wrong:
 >
@@ -423,14 +468,15 @@ entirely — any image with `kubectl` and `/bin/sh` works.
 > platformAgent:
 >   cleanupHook:
 >     image:
->       repository: docker.io/alpine/k8s # was: image: alpine/k8s:1.34.9
->       tag: "1.34.9"
+>       repository: docker.io/alpine/k8s # was: image: alpine/k8s:<tag>
+>       tag: "<tag>" # or drop both lines to take the chart default
 > ```
 >
-> The default reference also gained its registry — `alpine/k8s:1.34.9` is now
-> spelled `docker.io/alpine/k8s:1.34.9`. That resolves to the same image on a
+> The default reference also gained its registry — the implied `alpine/k8s` is
+> now spelled `docker.io/alpine/k8s`. That resolves to the same image on a
 > default install; it is written out because a prefix cannot be prepended to a
-> reference whose registry is implied.
+> reference whose registry is implied. The default tag itself is in
+> `values.yaml`, mirrored from `images.json`.
 
 With `platformAgent.cleanupHook.enabled=false`, the ordering is yours to keep:
 

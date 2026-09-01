@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
-# Verifies that a target commit is eligible for official GA release (has passed live RC E2E validation)
-# and performs an idempotent skip if the commit has already been released under the EXACT SAME tag.
+# Verifies that a target commit is eligible for official GA release (has been promoted to staging by
+# the nightly pipeline, meaning the full E2E matrix passed on it) and performs an idempotent skip if
+# the commit has already been released under the EXACT SAME tag.
 # Releases strictly use pure numeric SemVer without 'v' prefix (e.g. 0.1.0, 0.2.0).
+#
+# The gate is the staging_<ts>_<sha> tag and nothing beside it. An rc_*_validated tag is not checked
+# as well, because it is implied: a staging tag is only ever created by the nightly pipeline, which
+# only ever promotes a candidate that already carries one. Two gates to keep in step is how one of
+# them ends up answering for the other.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -11,7 +17,7 @@ source "${SCRIPT_DIR}/common.sh"
 TARGET_VERSION="${1:-${TARGET_VERSION:-${RELEASE_VERSION:-${TARGET_TAG:-}}}}"
 TARGET_COMMIT_INPUT="${2:-${RC_CANDIDATE_COMMIT:-${TARGET_COMMIT:-}}}"
 TARGET_REPO="$(get_target_repo)"
-SKIP_VALIDATION="${SKIP_RC_VALIDATION:-${3:-false}}"
+SKIP_VALIDATION="${SKIP_STAGING_VALIDATION:-${3:-false}}"
 EMERGENCY_REASON="${EMERGENCY_OVERRIDE_REASON:-${4:-}}"
 
 if [ -z "${TARGET_VERSION}" ]; then
@@ -63,14 +69,14 @@ else
     RC_CANDIDATE_COMMIT="$(git rev-parse --verify HEAD)"
     echo "ℹ️ Emergency override: defaulted target commit to HEAD (${RC_CANDIDATE_COMMIT:0:7})"
   else
-    # In standard release mode, auto-resolve the latest validated commit with rc_*_validated tag
-    LATEST_VALIDATED_TAG="$(get_latest_validated_rc_tag)"
-    if [ -z "${LATEST_VALIDATED_TAG}" ]; then
-      echo "❌ ERROR: No validated RC commit found in history! Cannot publish release without a commit carrying 'rc_*_validated' tag." >&2
+    # In standard release mode, auto-resolve the newest staging-promoted commit
+    LATEST_GATE_TAG="$(get_latest_staging_tag)"
+    if [ -z "${LATEST_GATE_TAG}" ]; then
+      echo "❌ ERROR: No staging-promoted commit found in history! Cannot publish release without a commit carrying a 'staging_<ts>_<sha>' tag." >&2
       exit 1
     fi
-    RC_CANDIDATE_COMMIT="$(git rev-parse --verify "${LATEST_VALIDATED_TAG}^{commit}")"
-    echo "ℹ️ Auto-resolved latest validated commit from tag '${LATEST_VALIDATED_TAG}': ${RC_CANDIDATE_COMMIT:0:7}"
+    RC_CANDIDATE_COMMIT="$(git rev-parse --verify "${LATEST_GATE_TAG}^{commit}")"
+    echo "ℹ️ Auto-resolved newest staging-promoted commit from tag '${LATEST_GATE_TAG}': ${RC_CANDIDATE_COMMIT:0:7}"
   fi
 fi
 
@@ -137,7 +143,7 @@ done
 if is_truthy "${SKIP_VALIDATION}"; then
   CLEAN_REASON="${EMERGENCY_REASON//[[:space:]]/}"
   if [ -z "${CLEAN_REASON}" ]; then
-    echo "❌ ERROR: Emergency override (SKIP_RC_VALIDATION=true) requires an explicit non-whitespace EMERGENCY_OVERRIDE_REASON for audit compliance." >&2
+    echo "❌ ERROR: Emergency override (SKIP_STAGING_VALIDATION=true) requires an explicit non-whitespace EMERGENCY_OVERRIDE_REASON for audit compliance." >&2
     exit 1
   fi
 
@@ -158,22 +164,25 @@ if is_truthy "${SKIP_VALIDATION}"; then
   exit 0
 fi
 
-# 5. Check for validated RC tag pointing at target commit
-echo "🔎 Checking for rc_*_validated tags pointing at commit ${RC_CANDIDATE_COMMIT}..."
-VALIDATED_TAGS="$(git tag --points-at "${RC_CANDIDATE_COMMIT}" | grep -E '^rc_.*_validated$' || true)"
+# 5. Check for a staging promotion tag pointing at target commit.
+#
+# Shape-matched via common.sh rather than by the staging_ prefix: the prefix is a live deploy
+# trigger anyone can push, so a hand-made 'staging_hotfix' would otherwise satisfy the release gate.
+echo "🔎 Checking for staging_<ts>_<sha> tags pointing at commit ${RC_CANDIDATE_COMMIT}..."
+VALIDATED_TAGS="$(staging_promotion_tags_at_commit "${RC_CANDIDATE_COMMIT}")"
 
 if [ -z "${VALIDATED_TAGS}" ]; then
-  echo "❌ BLOCKED: Commit ${RC_CANDIDATE_COMMIT} has NOT passed live RC E2E validation!" >&2
-  echo "   No tag matching 'rc_*_validated' points to this commit." >&2
+  echo "❌ BLOCKED: Commit ${RC_CANDIDATE_COMMIT} has NOT been promoted to staging!" >&2
+  echo "   No tag matching 'staging_<ts>_<sha>' points to this commit." >&2
   echo "   To release this version:" >&2
-  echo "     1. Wait for the scheduled RC pipeline to validate this commit." >&2
-  echo "     2. Or run the '.github/workflows/release-rc.yml' workflow manually on this commit." >&2
-  echo "     3. For emergency CVE hotfixes, run with skip_rc_validation=true and an explicit reason." >&2
+  echo "     1. Wait for the nightly pipeline to run the full E2E matrix and promote this commit." >&2
+  echo "     2. Or run the '.github/workflows/nightly-pipeline.yml' workflow manually on its candidate." >&2
+  echo "     3. For emergency CVE hotfixes, run with skip_staging_validation=true and an explicit reason." >&2
   exit 1
 fi
 
-FIRST_VAL_TAG="$(echo "${VALIDATED_TAGS}" | head -n 1)"
-echo "✅ ELIGIBLE: Found validated RC tag(s) on commit ${RC_CANDIDATE_COMMIT}:"
+FIRST_VAL_TAG="$(head -n 1 <<<"${VALIDATED_TAGS}")"
+echo "✅ ELIGIBLE: Found staging promotion tag(s) on commit ${RC_CANDIDATE_COMMIT}:"
 for tag in ${VALIDATED_TAGS}; do
   echo "   • ${tag}"
 done
@@ -187,7 +196,7 @@ fi
 
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
   echo "eligible=true" >> "${GITHUB_OUTPUT}"
-  echo "validated_rc_tag=${FIRST_VAL_TAG}" >> "${GITHUB_OUTPUT}"
+  echo "gate_tag=${FIRST_VAL_TAG}" >> "${GITHUB_OUTPUT}"
   echo "rc_candidate_commit=${RC_CANDIDATE_COMMIT}" >> "${GITHUB_OUTPUT}"
   echo "release_commit=${RC_CANDIDATE_COMMIT}" >> "${GITHUB_OUTPUT}"
   if [ "${IS_RESUMING_RELEASE}" = "true" ]; then

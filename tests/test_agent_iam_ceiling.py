@@ -549,21 +549,162 @@ class NoShippedInstallPathGrantsContainerAdminTest(unittest.TestCase):
                 continue
             yield n, line
 
+    # roles/iam.serviceAccountTokenCreator is forbidden at project scope —
+    # there it lets the agent mint a token for any service account in the
+    # project — and bounded only when bound on a single *pool member* as the
+    # resource, which is how the scoped pool grants it so that
+    # impersonated_credentials can mint at all
+    # (terraform/modules/kube-agents-iam/scoped_pool.tf). So the suppression
+    # is scope- and target-aware rather than by name: the role is waived only
+    # on lines inside a `resource "google_service_account_iam_member"` block
+    # whose body binds on `google_service_account.scoped`. Member scope alone
+    # is deliberately not enough — tokenCreator bound on a wider account (an
+    # operator GSA, a token signer) is escalation to that identity, and a
+    # future member-scoped grant on anything but the pool fails the sweep and
+    # has to argue its way in here. A project-scoped reintroduction —
+    # google_project_iam_member, a role bundle, an installer list — is still
+    # caught, and the role stays in FORBIDDEN_ROLES.
+    _MEMBER_SCOPED_RESOURCE = re.compile(
+        r'^\s*resource\s+"google_service_account_iam_member"'
+    )
+    # The attribute assignment itself, not any mention: a comment naming the
+    # pool, or a member= line, must not be what waives the block. Comments are
+    # stripped before matching for the same reason.
+    _POOL_MEMBER_TARGET = re.compile(
+        r"\bservice_account_id\s*=\s*google_service_account\.scoped\b"
+    )
+
+    @classmethod
+    def _binds_on_pool_member(cls, line: str) -> bool:
+        code = re.split(r"#|//", line, 1)[0]
+        return cls._POOL_MEMBER_TARGET.search(code) is not None
+
+    @classmethod
+    def _member_scoped_lines(cls, text: str) -> set[int]:
+        """Line numbers inside member-scoped blocks that bind on a pool member.
+
+        The declaration line counts as part of the block, so a one-line
+        `resource ... { ... }` is scoped to exactly its own line rather than
+        leaking the waiver onto the line after it.
+        """
+        lines: set[int] = set()
+        block: list[tuple[int, str]] = []
+        inside = False
+        depth = 0
+        for n, line in enumerate(text.splitlines(), 1):
+            if not inside:
+                if not cls._MEMBER_SCOPED_RESOURCE.search(line):
+                    continue
+                inside = True
+                depth = 0
+            block.append((n, line))
+            depth += line.count("{") - line.count("}")
+            if depth <= 0:
+                inside = False
+                if any(cls._binds_on_pool_member(text) for _, text in block):
+                    lines.update(number for number, _ in block)
+                block = []
+        return lines
+
     def test_no_shipped_install_source_grants_a_forbidden_role(self):
         exempt = self._exempt_lines()
-        offenders = [
-            f"{path.relative_to(REPO_ROOT)}:{n}: {role}"
-            for path in self._shipped_install_sources()
-            for n, line in self._effective_lines(path)
-            for role in FORBIDDEN_ROLES
-            if role in line and line not in exempt
-        ]
+        offenders = []
+        for path in self._shipped_install_sources():
+            member_scoped: set[int] = set()
+            if path.suffix == ".tf":
+                member_scoped = self._member_scoped_lines(
+                    path.read_text(encoding="utf-8")
+                )
+            for n, line in self._effective_lines(path):
+                for role in FORBIDDEN_ROLES:
+                    if role not in line or line in exempt:
+                        continue
+                    if (
+                        role == "roles/iam.serviceAccountTokenCreator"
+                        and n in member_scoped
+                    ):
+                        continue
+                    offenders.append(f"{path.relative_to(REPO_ROOT)}:{n}: {role}")
         self.assertEqual(
             [],
             sorted(offenders),
             "a shipped install path grants a role that authorizes the agent through "
             "IAM regardless of its Kubernetes RBAC",
         )
+
+    def test_the_token_creator_suppression_is_scope_and_target_aware(self):
+        # The suppression must turn on the resource type AND the bound
+        # account. All three refused snippets grant the same role; only the
+        # member-scoped grant on a pool member is waived, so widening the
+        # suppression to a name match, a file match, or member-scope-alone
+        # fails here before it can hide a wider grant.
+        pool_member = (
+            'resource "google_service_account_iam_member" "x" {\n'
+            "  service_account_id = google_service_account.scoped[each.key].name\n"
+            '  role               = "roles/iam.serviceAccountTokenCreator"\n'
+            "}\n"
+        )
+        self.assertIn(3, self._member_scoped_lines(pool_member))
+        # Member-scoped, but bound on an account that is not a pool member:
+        # tokenCreator there is escalation to that identity, not a bounded
+        # pool grant, and it must stay flagged.
+        wider_target = pool_member.replace(
+            "google_service_account.scoped[each.key].name",
+            "google_service_account.agent.name",
+        )
+        self.assertEqual(set(), self._member_scoped_lines(wider_target))
+        project_scoped = (
+            'resource "google_project_iam_member" "x" {\n'
+            '  role = "roles/iam.serviceAccountTokenCreator"\n'
+            "}\n"
+        )
+        self.assertEqual(set(), self._member_scoped_lines(project_scoped))
+        # A mention is not a binding: a comment naming the pool, or a member=
+        # line referencing it, must not waive a block that binds elsewhere.
+        commented = (
+            'resource "google_service_account_iam_member" "x" {\n'
+            "  # narrower than google_service_account.scoped would be\n"
+            "  service_account_id = google_service_account.agent.name\n"
+            '  role               = "roles/iam.serviceAccountTokenCreator"\n'
+            "}\n"
+        )
+        self.assertEqual(set(), self._member_scoped_lines(commented))
+        # The waiver ends with the block: the same role one line after the
+        # closing brace is not waived.
+        trailing = pool_member + 'role = "roles/iam.serviceAccountTokenCreator"\n'
+        self.assertNotIn(5, self._member_scoped_lines(trailing))
+        # A one-line block is scoped to exactly its own line — the waiver
+        # covers an inline grant and does not leak onto the next line.
+        one_line = (
+            'resource "google_service_account_iam_member" "x" '
+            "{ service_account_id = google_service_account.scoped[k].name, "
+            'role = "roles/iam.serviceAccountTokenCreator" }\n'
+            'role = "roles/iam.serviceAccountTokenCreator"\n'
+        )
+        waived = self._member_scoped_lines(one_line)
+        self.assertIn(1, waived)
+        self.assertNotIn(2, waived)
+
+    def test_the_pool_grant_is_what_the_suppression_waives(self):
+        # The suppression exists for exactly one shipped line. Pin that it is
+        # still needed and still covered: the pool's grant sits inside a
+        # member-scoped block, so if the resource is retyped or the grant
+        # moves out of it, this fails alongside the sweep rather than leaving
+        # a dead waiver behind.
+        pool = (
+            TERRAFORM_DIR / "modules" / "kube-agents-iam" / "scoped_pool.tf"
+        ).read_text(encoding="utf-8")
+        waived = self._member_scoped_lines(pool)
+        grant_lines = [
+            n
+            for n, line in enumerate(pool.splitlines(), 1)
+            if "roles/iam.serviceAccountTokenCreator" in line
+            and not line.lstrip().startswith("#")
+        ]
+        self.assertEqual(
+            1, len(grant_lines), "scoped_pool.tf should grant tokenCreator exactly once"
+        )
+        self.assertIn(grant_lines[0], waived)
 
     def test_no_shipped_install_source_offers_the_removed_permission_set(self):
         # The refusal itself has to compare against the literal to recognise

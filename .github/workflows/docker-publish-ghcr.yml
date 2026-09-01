@@ -57,8 +57,12 @@ jobs:
           tags: |
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/platform-agent:latest
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/platform-agent:${{ github.sha }}
+          # KUBE_AGENTS_VERSION is the commit SHA the image is tagged with: it
+          # becomes the version in the User-Agent the agent's remote MCP calls
+          # carry, so a request in a Google API log names the exact image.
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
+            KUBE_AGENTS_VERSION=${{ github.sha }}
 
       - name: Build and Push Replay Proxy (GHCR)
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0

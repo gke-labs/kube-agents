@@ -297,6 +297,7 @@ func buildCredentialBrokerDeployment(agent *agentv1alpha1.PlatformAgent, policyH
 			},
 		},
 	})
+	volumes = append(volumes, buildGitopsStateVolume(agent))
 
 	return &appsv1.Deployment{
 		TypeMeta: metav1.TypeMeta{APIVersion: "apps/v1", Kind: "Deployment"},

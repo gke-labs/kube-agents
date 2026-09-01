@@ -864,9 +864,14 @@ class TestSessionKvServerAuth(unittest.TestCase):
         # happens after.
         self._trigger = patch.object(session_kv_server, "trigger_agent_troubleshooter")
         self._trigger.start()
-        # (error, degraded) — an unconfigured MagicMock would not unpack.
+        # (error, degraded, undelivered) — an unconfigured MagicMock would not
+        # unpack, and neither would a stale 2-tuple: the route would raise
+        # ValueError, get caught by the 502 handler, and this suite would still
+        # pass because it only asserts the status is not 401/403/503. So the
+        # arity here is what keeps the authenticated case exercising a healthy
+        # relay rather than the exception path.
         self._relay = patch.object(
-            session_kv_server, "relay_cron_report", return_value=(None, False)
+            session_kv_server, "relay_cron_report", return_value=(None, False, [])
         )
         self._relay.start()
 
@@ -1070,19 +1075,18 @@ class TestSessionRoutingRecordsThePlatform(unittest.TestCase):
 
 
 class TestActivePlatformFallback(unittest.TestCase):
-    """`get_active_platform` when config.yaml does not name a platform.
+    """`get_active_platform` when no config file names a platform.
 
-    Which is every operator-managed pod: `platforms.<p>.enabled` is rendered
-    into the managed scope at /etc/hermes and overlaid inside Hermes' config
-    loader, never written to the CONFIG_PATH file this function opens. So the
-    environment branch is the live selector, and getting it wrong sends every
-    alert to a platform the install does not have. The config branch is still
-    covered below because it answers for a `docker run` off the image and for
-    any install whose writable config was edited to name one -- and because
-    the ordering between the two is what keeps this a fallback.
+    The three sources are the managed scope (/etc/hermes/config.yaml, which the
+    operator writes and which settles it outright on a deployed pod), the
+    profile's own writable CONFIG_PATH, and the environment. This class covers
+    the last two; `TestEnabledChatPlatforms` below covers the managed scope and
+    the per-platform resolution across all three.
     """
 
-    _KEYS = ("SLACK_RELAY_URL", "SLACK_BOT_TOKEN")
+    _KEYS = ("SLACK_RELAY_URL", "SLACK_BOT_TOKEN", "SLACK_HOME_CHANNEL",
+             "GOOGLE_CHAT_RELAY_URL", "GOOGLE_CHAT_PROJECT_ID",
+             "GOOGLE_CHAT_HOME_CHANNEL")
 
     def setUp(self):
         # patch.dict restores the whole mapping, and addCleanup runs even if a
@@ -1093,6 +1097,12 @@ class TestActivePlatformFallback(unittest.TestCase):
         self.addCleanup(env.stop)
         for key in self._KEYS:
             os.environ.pop(key, None)
+        # No managed scope, which is what a `docker run` off the image has and
+        # what makes the two lower-precedence sources observable here.
+        managed = patch.object(
+            session_kv_server, "MANAGED_CONFIG_PATH", "/nonexistent/managed.yaml")
+        managed.start()
+        self.addCleanup(managed.stop)
         # A path that cannot parse, so tests that do not override it land in
         # the environment branch the way a deployed pod does.
         self._config = tempfile.NamedTemporaryFile(
@@ -1162,6 +1172,286 @@ class TestActivePlatformFallback(unittest.TestCase):
         os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
         self._with_config("platforms:\n  google_chat:\n    enabled: true\n")
         self.assertEqual(session_kv_server.get_active_platform(), "google_chat")
+
+
+class TestEnabledChatPlatforms(unittest.TestCase):
+    """`enabled_chat_platforms` — every platform, not the first `if` that matched.
+
+    The invariant: a platform the install has enabled is never dropped, the
+    resolution never returns nothing, and the sources are consulted per platform
+    so one naming Slack cannot hide a Google Chat another knows about. That
+    short circuit is #1094 — `get_active_platform` returned on its first match,
+    so a dual-platform install resolved to Slack alone and seven days of
+    governance reports went to a leg with no home channel.
+    """
+
+    _KEYS = ("SLACK_RELAY_URL", "SLACK_BOT_TOKEN", "SLACK_HOME_CHANNEL",
+             "GOOGLE_CHAT_RELAY_URL", "GOOGLE_CHAT_PROJECT_ID",
+             "GOOGLE_CHAT_HOME_CHANNEL")
+
+    def setUp(self):
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for key in self._KEYS:
+            os.environ.pop(key, None)
+        self._point("MANAGED_CONFIG_PATH", None)
+        self._point("CONFIG_PATH", None)
+
+    def _point(self, attribute, text):
+        """Point `attribute` at a config holding `text`, or at a missing file."""
+        if text is None:
+            named = "/nonexistent/kube-agents-test-absent.yaml"
+        else:
+            with tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".yaml", delete=False) as handle:
+                handle.write(text)
+                named = handle.name
+            self.addCleanup(os.unlink, named)
+        patcher = patch.object(session_kv_server, attribute, named)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_managed_scope_settles_a_dual_platform_install(self):
+        # What the operator actually writes: renderConfigYAML emits both keys as
+        # explicit booleans on every reconcile, so there is nothing to infer.
+        self._point(
+            "MANAGED_CONFIG_PATH",
+            "platforms:\n  google_chat:\n    enabled: true\n  slack:\n    enabled: true\n",
+        )
+        self.assertEqual(
+            session_kv_server.enabled_chat_platforms(), ["google_chat", "slack"])
+
+    def test_the_managed_scope_outranks_the_environment(self):
+        # The autopush shape inverted: Slack is off in the CR but the pod still
+        # holds a stale SLACK_RELAY_URL. The file the operator wrote wins.
+        self._point(
+            "MANAGED_CONFIG_PATH",
+            "platforms:\n  google_chat:\n    enabled: true\n  slack:\n    enabled: false\n",
+        )
+        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+        self.assertEqual(session_kv_server.enabled_chat_platforms(), ["google_chat"])
+
+    def test_the_managed_scope_outranks_the_profile_config(self):
+        self._point("MANAGED_CONFIG_PATH", "platforms:\n  slack:\n    enabled: false\n")
+        self._point("CONFIG_PATH", "platforms:\n  slack:\n    enabled: true\n")
+        self.assertEqual(session_kv_server.enabled_chat_platforms(), ["google_chat"])
+
+    def test_a_slack_only_install_does_not_regress_to_google_chat(self):
+        # #855's defect, and the reason CHAT_PLATFORMS ordering does not bring it
+        # back: Google Chat leads the list but nothing puts it in the result.
+        self._point(
+            "MANAGED_CONFIG_PATH",
+            "platforms:\n  google_chat:\n    enabled: false\n  slack:\n    enabled: true\n",
+        )
+        self.assertEqual(session_kv_server.enabled_chat_platforms(), ["slack"])
+        self.assertEqual(session_kv_server.get_active_platform(), "slack")
+
+    def test_a_file_naming_one_platform_does_not_silence_the_other(self):
+        # Per platform, not per source. The config mentions only Slack; Google
+        # Chat is still resolved, from the environment.
+        self._point("CONFIG_PATH", "platforms:\n  slack:\n    enabled: true\n")
+        os.environ["GOOGLE_CHAT_RELAY_URL"] = "http://127.0.0.1:8765"
+        self.assertEqual(
+            session_kv_server.enabled_chat_platforms(), ["google_chat", "slack"])
+
+    def test_a_platforms_block_with_no_enabled_key_is_not_an_answer(self):
+        # The operator-managed shape of the *profile* copy: the subtree is there,
+        # `enabled` is not, because Hermes overlays that leaf in its own loader.
+        # It must fall through to the environment rather than read as False.
+        self._point("CONFIG_PATH", "platforms:\n  slack:\n    home_channel: C0123ABCD\n")
+        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+        self.assertEqual(session_kv_server.enabled_chat_platforms(), ["slack"])
+
+    def test_a_valueless_enabled_is_not_an_explicit_no(self):
+        # `enabled:` with nothing after it parses to None — "this file does not
+        # say", not "this file says no".
+        self._point("MANAGED_CONFIG_PATH", "platforms:\n  slack:\n    enabled:\n")
+        os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+        self.assertEqual(session_kv_server.enabled_chat_platforms(), ["slack"])
+
+    def test_an_empty_environment_value_is_not_a_signal(self):
+        os.environ["SLACK_RELAY_URL"] = "   "
+        self.assertEqual(session_kv_server.enabled_chat_platforms(), ["google_chat"])
+
+    def test_valid_yaml_of_the_wrong_shape_does_not_raise(self):
+        # `platforms: slack` is valid YAML, so safe_load returns cleanly and the
+        # wrong type reaches the traversal. config.yaml is hand-editable.
+        for text in ("platforms: [google_chat, slack]\n", "platforms: slack\n",
+                     "platforms: 3\n", "platforms:\n  slack: enabled\n",
+                     "- just\n- a list\n"):
+            with self.subTest(config=text):
+                with tempfile.NamedTemporaryFile(
+                        mode="w", suffix=".yaml", delete=False) as handle:
+                    handle.write(text)
+                    named = handle.name
+                self.addCleanup(os.unlink, named)
+                with patch.object(session_kv_server, "MANAGED_CONFIG_PATH", named):
+                    os.environ["SLACK_RELAY_URL"] = "http://127.0.0.1:8765"
+                    self.assertEqual(
+                        session_kv_server.enabled_chat_platforms(), ["slack"])
+
+    def test_nothing_configured_resolves_to_the_default_rather_than_nothing(self):
+        # A send addressed to the empty string is worse than one addressed to the
+        # platform every caller used before any of this existed.
+        self.assertEqual(
+            session_kv_server.enabled_chat_platforms(),
+            [session_kv_server.DEFAULT_CHAT_PLATFORM],
+        )
+
+    def test_a_single_destination_caller_says_which_platform_lost(self):
+        # #1094's other half: picking is fine, picking silently is not. The log
+        # has to name the platform that will NOT receive it -- naming only the
+        # winner leaves a reader to infer the loss from a list.
+        self._point(
+            "MANAGED_CONFIG_PATH",
+            "platforms:\n  google_chat:\n    enabled: true\n  slack:\n    enabled: true\n",
+        )
+        with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+            self.assertEqual(session_kv_server.get_active_platform(), "google_chat")
+        line = "".join(logs.output)
+        self.assertIn("slack", line)
+        self.assertIn("will not receive it", line)
+
+
+class TestAlertPlatformFallback(unittest.TestCase):
+    """The alert path takes the first platform that ACCEPTS the alert.
+
+    It cannot fan out — it registers the thread it gets back as the session's
+    routing and the triage card's completion is addressed there — so it picks
+    one. Picking without a fallback would only move which install loses: #1094
+    was a dual-platform install whose Slack leg was dead, and an order that
+    leads with Google Chat mirrors it exactly for an install whose Google Chat
+    leg is the broken one.
+    """
+
+    def setUp(self):
+        patcher = patch.object(
+            session_kv_server, "enabled_chat_platforms",
+            return_value=["google_chat", "slack"])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in ("_register_session_routing", "_create_gateway_session",
+                     "_start_agent_turn", "mark_delivery_failed"):
+            p = patch.object(session_kv_server, name)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _run(self, post):
+        with patch.object(session_kv_server, "_post_initial_alert", side_effect=post) as alert:
+            session_kv_server.trigger_agent_troubleshooter("s1", "alert", {}, 7)
+        return alert
+
+    def test_a_dead_first_leg_does_not_cost_the_alert(self):
+        alert = self._run(
+            lambda platform, _msg: None if platform == "google_chat" else "1712345678.000100")
+        self.assertEqual([c.args[0] for c in alert.call_args_list], ["google_chat", "slack"])
+        session_kv_server._register_session_routing.assert_called_once_with(
+            "s1", "slack", "1712345678.000100")
+        session_kv_server.mark_delivery_failed.assert_not_called()
+
+    def test_the_first_leg_wins_when_it_works(self):
+        alert = self._run(lambda _platform, _msg: "spaces/AAA/threads/T1")
+        self.assertEqual([c.args[0] for c in alert.call_args_list], ["google_chat"],
+                         "a working first leg must not also post to the second")
+        session_kv_server._register_session_routing.assert_called_once_with(
+            "s1", "google_chat", "spaces/AAA/threads/T1")
+
+    def test_every_leg_failing_is_still_recorded_as_undelivered(self):
+        self._run(lambda _platform, _msg: None)
+        session_kv_server._register_session_routing.assert_not_called()
+        session_kv_server.mark_delivery_failed.assert_called_once()
+        detail = session_kv_server.mark_delivery_failed.call_args.args[1]
+        self.assertIn("google_chat", detail)
+        self.assertIn("slack", detail)
+
+    def test_the_pick_says_which_platform_will_not_get_the_alert(self):
+        """#1094's other half: picking is fine, picking SILENTLY is the defect.
+
+        The warning has to come off the pick, not out of the fall-through. The
+        fall-through logs only after a leg has refused, so on the common
+        dual-platform install -- where the first leg accepts -- it never runs,
+        and taking `platforms[0]` directly would emit nothing at all.
+        """
+        with self.assertLogs(session_kv_server.logger, level="WARNING") as logs:
+            self._run(lambda _platform, _msg: "spaces/AAA/threads/T1")
+        picked = [line for line in logs.output if "will not receive it" in line]
+        self.assertEqual(len(picked), 1, "exactly one warning, on the pick")
+        self.assertIn("google_chat", picked[0])
+        self.assertIn("slack", picked[0])
+
+    def test_a_send_with_no_message_id_is_not_posted_to_a_second_platform(self):
+        """`hermes send` can succeed and return stdout with no parseable id.
+
+        The alert is in that channel already, so falling through to the next
+        platform to chase a thread id posts it twice. Delivered-but-unthreaded
+        is recorded as unconfirmed instead.
+        """
+        alert = self._run(
+            lambda platform, _msg: session_kv_server.ALERT_SENT_WITHOUT_THREAD
+            if platform == "google_chat" else "1712345678.000100")
+        self.assertEqual(
+            [c.args[0] for c in alert.call_args_list], ["google_chat"],
+            "an alert that landed must not be posted again to chase a thread id")
+        session_kv_server._register_session_routing.assert_not_called()
+        session_kv_server.mark_delivery_failed.assert_called_once()
+
+
+class TestSlackHomeChannelResolution(unittest.TestCase):
+    """`_slack_home_channel` -- the environment, then either config file.
+
+    The operator renders SLACK_HOME_CHANNEL only when the CR sets
+    `slack.homeChannel`, but `/sethome` writes `platforms.slack.home_channel`
+    into the writable config.yaml instead -- which is why that file is not
+    mounted read-only. Reading the environment alone gave such an install an
+    empty `chat_id`, which `_lookup_platform_threads` drops, so the Slack leg
+    opened a fresh top-level message on every report and got no incident row
+    while the send itself succeeded.
+    """
+
+    def setUp(self):
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("SLACK_HOME_CHANNEL", None)
+        self._point("MANAGED_CONFIG_PATH", None)
+        self._point("CONFIG_PATH", None)
+
+    def _point(self, attribute, text):
+        if text is None:
+            named = "/nonexistent/kube-agents-test-absent.yaml"
+        else:
+            with tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".yaml", delete=False) as handle:
+                handle.write(text)
+                named = handle.name
+            self.addCleanup(os.unlink, named)
+        patcher = patch.object(session_kv_server, attribute, named)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_environment_wins_when_the_operator_rendered_one(self):
+        os.environ["SLACK_HOME_CHANNEL"] = "C0ENV"
+        self._point("CONFIG_PATH", "platforms:\n  slack:\n    home_channel: C0FILE\n")
+        self.assertEqual(session_kv_server._slack_home_channel(), "C0ENV")
+
+    def test_a_sethome_channel_is_found_when_the_environment_is_silent(self):
+        self._point("CONFIG_PATH", "platforms:\n  slack:\n    home_channel: C0FILE\n")
+        self.assertEqual(session_kv_server._slack_home_channel(), "C0FILE")
+
+    def test_the_managed_scope_is_read_before_the_profile_copy(self):
+        self._point("MANAGED_CONFIG_PATH", "platforms:\n  slack:\n    home_channel: C0MANAGED\n")
+        self._point("CONFIG_PATH", "platforms:\n  slack:\n    home_channel: C0FILE\n")
+        self.assertEqual(session_kv_server._slack_home_channel(), "C0MANAGED")
+
+    def test_nothing_anywhere_is_the_empty_string(self):
+        # #1094's autopush shape. Still no home channel -- the point is that it
+        # degrades to "" rather than raising.
+        self.assertEqual(session_kv_server._slack_home_channel(), "")
+
+    def test_a_hostile_config_shape_costs_the_lookup_and_not_the_caller(self):
+        self._point("CONFIG_PATH", "platforms: slack\n")
+        self.assertEqual(session_kv_server._slack_home_channel(), "")
 
 
 class TestAlertDailyQuota(unittest.TestCase):
@@ -1870,6 +2160,14 @@ class TestCronReportRelay(unittest.TestCase):
 
         os.environ["SESSION_KV_API_KEY"] = API_KEY
         self.client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
+        # Slack's chat_id comes from SLACK_HOME_CHANNEL (`_register_session_routing`),
+        # and without one `_send_to_chat` cannot thread a Slack reply at all --
+        # which is #1094's autopush install, not a properly configured one. The
+        # fan-out tests below are about a dual-platform install that works, so
+        # they get the home channel autopush is missing.
+        env = patch.dict(os.environ, {"SLACK_HOME_CHANNEL": "C0123456789"})
+        env.start()
+        self.addCleanup(env.stop)
         # The temp database is shared across this file; a stale routing row for
         # a derived session id would make the second test see the first's thread.
         with sqlite3.connect(temp_db_path) as conn:
@@ -1896,7 +2194,7 @@ class TestCronReportRelay(unittest.TestCase):
 
     def test_relay_runs_a_chat_agent_turn_and_posts_what_it_composed(self):
         """The report goes through the Chat Agent; its wording is what reaches chat."""
-        with patch.object(session_kv_server, "get_active_platform", return_value="google_chat"), \
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat"]), \
              patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
              patch.object(session_kv_server, "_run_relay_turn", return_value="Chat Agent framing") as turn, \
              patch.object(session_kv_server, "_send_to_chat", return_value="spaces/AAA/threads/T1") as send:
@@ -1922,7 +2220,7 @@ class TestCronReportRelay(unittest.TestCase):
         """
         import sqlite3
 
-        with patch.object(session_kv_server, "get_active_platform", return_value="google_chat"), \
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat"]), \
              patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
              patch.object(session_kv_server, "_run_relay_turn", return_value="composed report"), \
              patch.object(session_kv_server, "_send_to_chat", return_value="spaces/AAA/threads/T1"):
@@ -1934,7 +2232,7 @@ class TestCronReportRelay(unittest.TestCase):
         self.assertEqual(row[1], "composed report")
 
     def test_second_report_same_day_replies_into_the_first_thread(self):
-        with patch.object(session_kv_server, "get_active_platform", return_value="google_chat"), \
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat"]), \
              patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
              patch.object(session_kv_server, "_run_relay_turn", return_value="composed"), \
              patch.object(session_kv_server, "_send_to_chat", return_value="spaces/AAA/threads/T1") as send:
@@ -1947,7 +2245,7 @@ class TestCronReportRelay(unittest.TestCase):
 
     def test_a_failed_relay_turn_still_delivers_the_report(self):
         """A finding must not be lost because the front door was unavailable."""
-        with patch.object(session_kv_server, "get_active_platform", return_value="google_chat"), \
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat"]), \
              patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
              patch.object(session_kv_server, "_run_relay_turn", return_value=None), \
              patch.object(session_kv_server, "_send_to_chat", return_value="spaces/AAA/threads/T1") as send:
@@ -1961,7 +2259,7 @@ class TestCronReportRelay(unittest.TestCase):
         Seven consecutive relay failures on this job class went unnoticed because
         the raw report looks like a report.
         """
-        with patch.object(session_kv_server, "get_active_platform", return_value="google_chat"), \
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat"]), \
              patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
              patch.object(session_kv_server, "_run_relay_turn", return_value=None), \
              patch.object(session_kv_server, "_send_to_chat", return_value="spaces/AAA/threads/T1") as send:
@@ -1976,7 +2274,7 @@ class TestCronReportRelay(unittest.TestCase):
 
     def test_a_failed_relay_turn_is_reported_as_degraded_not_as_success(self):
         """`relay` is what a scheduler can see without reading logs."""
-        with patch.object(session_kv_server, "get_active_platform", return_value="google_chat"), \
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat"]), \
              patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
              patch.object(session_kv_server, "_run_relay_turn", return_value=None), \
              patch.object(session_kv_server, "_send_to_chat", return_value="spaces/AAA/threads/T1"):
@@ -1988,7 +2286,7 @@ class TestCronReportRelay(unittest.TestCase):
         self.assertEqual(degraded.json()["status"], "delivered")
         self.assertEqual(degraded.json()["relay"], "degraded")
 
-        with patch.object(session_kv_server, "get_active_platform", return_value="google_chat"), \
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat"]), \
              patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
              patch.object(session_kv_server, "_run_relay_turn", return_value="composed"), \
              patch.object(session_kv_server, "_send_to_chat", return_value="spaces/AAA/threads/T1"):
@@ -2006,7 +2304,7 @@ class TestCronReportRelay(unittest.TestCase):
         the channel. Under the `deliver: "all"` these jobs came off, that same
         failure surfaced in the cron child.
         """
-        with patch.object(session_kv_server, "get_active_platform", return_value="google_chat"), \
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat"]), \
              patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
              patch.object(session_kv_server, "_run_relay_turn", return_value="composed"), \
              patch.object(session_kv_server, "_send_to_chat", return_value=None):
@@ -2018,7 +2316,7 @@ class TestCronReportRelay(unittest.TestCase):
 
     def test_an_exception_mid_relay_is_answered_as_a_failure(self):
         """Not a 500 with a stack trace: the string is stored per job run."""
-        with patch.object(session_kv_server, "get_active_platform", return_value="google_chat"), \
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat"]), \
              patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
              patch.object(session_kv_server, "_run_relay_turn", side_effect=RuntimeError("boom")):
             response = self.client.post("/v1/cron-reports", json={"job_id": "j6", "report": "finding"})
@@ -2032,7 +2330,7 @@ class TestCronReportRelay(unittest.TestCase):
         that does not exist."""
         import sqlite3
 
-        with patch.object(session_kv_server, "get_active_platform", return_value="google_chat"), \
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat"]), \
              patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
              patch.object(session_kv_server, "_run_relay_turn", return_value="composed"), \
              patch.object(session_kv_server, "_send_to_chat", return_value=None):
@@ -2063,7 +2361,7 @@ class TestCronReportRelay(unittest.TestCase):
         self.assertIn("`kubectl get po` [INST]", defanged)
 
     def test_the_turn_receives_the_defanged_report(self):
-        with patch.object(session_kv_server, "get_active_platform", return_value="google_chat"), \
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat"]), \
              patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
              patch.object(session_kv_server, "_send_to_chat", return_value="spaces/AAA/threads/T1"), \
              patch.object(session_kv_server.urllib.request, "urlopen") as urlopen:
@@ -2088,7 +2386,7 @@ class TestCronReportRelay(unittest.TestCase):
         with sqlite3.connect(temp_db_path) as conn:
             with conn:
                 conn.execute("DELETE FROM alert_quota")
-        with patch.object(session_kv_server, "get_active_platform", return_value="google_chat"), \
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat"]), \
              patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
              patch.object(session_kv_server, "_run_relay_turn", return_value="composed"), \
              patch.object(session_kv_server, "_send_to_chat", return_value="spaces/AAA/threads/T1"):
@@ -2099,13 +2397,330 @@ class TestCronReportRelay(unittest.TestCase):
             spent = conn.execute("SELECT COUNT(*) FROM alert_quota").fetchone()[0]
         self.assertEqual(spent, 0)
 
-    def test_missing_fields_and_oversized_reports_are_rejected(self):
+    def test_missing_fields_are_rejected(self):
         self.assertEqual(self.client.post("/v1/cron-reports", json={"report": "x"}).status_code, 400)
         self.assertEqual(self.client.post("/v1/cron-reports", json={"job_id": "j"}).status_code, 400)
-        over = "x" * (session_kv_server.CRON_REPORT_MAX_CHARS + 1)
-        self.assertEqual(
-            self.client.post("/v1/cron-reports", json={"job_id": "j", "report": over}).status_code, 413
+
+    def test_an_oversized_report_is_truncated_rather_than_dropped(self):
+        """#1094: a 413 here threw the finding away and told nobody who could act.
+
+        The fleet-wide audits produce 60k characters against a 12000 cap, and
+        `stockout-prevention` and `compliance-audit` were lost whole on 30 and
+        31 August 2026. A cut report is worse than a whole one and much better
+        than none.
+        """
+        over = "H" * (session_kv_server.CRON_REPORT_MAX_CHARS + 50_000)
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat"]), \
+             patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
+             patch.object(session_kv_server, "_run_relay_turn", side_effect=lambda *a, **k: a[2]), \
+             patch.object(session_kv_server, "_send_to_chat", return_value="spaces/AAA/threads/T1") as send:
+            response = self.client.post(
+                "/v1/cron-reports", json={"job_id": "compliance-audit", "report": over}
+            )
+
+        self.assertEqual(response.status_code, 200)
+        posted = send.call_args.args[1]
+        # The cap bounds the REPORT -- what reaches the model -- not the posted
+        # message, which also carries the notice this server wrote.
+        self.assertIn("HHH", posted)
+        self.assertLessEqual(
+            len(posted.split("[truncated]")[-1].split("\n\n", 1)[-1]),
+            session_kv_server.CRON_REPORT_MAX_CHARS,
         )
+        # The reader is told where the whole thing is, rather than being left to
+        # believe the cut copy is all there was.
+        self.assertIn("[truncated]", posted)
+        self.assertIn("cron/output/compliance-audit/", posted)
+
+    def test_a_report_at_the_limit_is_left_alone(self):
+        """Off-by-one at the boundary would mark every full-size report cut."""
+        exact = "x" * session_kv_server.CRON_REPORT_MAX_CHARS
+        self.assertEqual(
+            session_kv_server._truncate_report(exact, "platform", "j"), (exact, ""))
+
+    def test_the_truncation_notice_survives_a_chat_agent_that_drops_it(self):
+        """The notice is prepended after the turn, not fed to the model.
+
+        `_build_relay_instructions` tells the Chat Agent to add "nothing at the
+        bottom", so a notice appended to the report is the line it is most
+        likely to drop -- and it is the one line telling the reader the report
+        is incomplete. This stubs a turn that returns only its own prose, the
+        way a compliant Chat Agent would.
+        """
+        over = "H" * (session_kv_server.CRON_REPORT_MAX_CHARS + 50_000)
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat"]), \
+             patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
+             patch.object(session_kv_server, "_run_relay_turn", return_value="A composed summary."), \
+             patch.object(session_kv_server, "_send_to_chat", return_value="spaces/AAA/threads/T1") as send:
+            self.client.post(
+                "/v1/cron-reports", json={"job_id": "compliance-audit", "report": over}
+            )
+
+        posted = send.call_args.args[1]
+        self.assertTrue(posted.startswith("[truncated]"), posted[:40])
+        self.assertIn("cron/output/compliance-audit/", posted)
+        self.assertIn("A composed summary.", posted)
+
+    def test_the_model_never_sees_more_than_the_cap(self):
+        """The cap exists to bound what reaches the model, so truncation must
+        cut the report itself and not merely mark it."""
+        over = "H" * (session_kv_server.CRON_REPORT_MAX_CHARS + 50_000)
+        report, notice = session_kv_server._truncate_report(over, "platform", "compliance-audit")
+        self.assertLessEqual(len(report), session_kv_server.CRON_REPORT_MAX_CHARS)
+        self.assertTrue(notice)
+
+    def test_a_cap_smaller_than_the_notice_still_bounds_the_report(self):
+        """The notice is not part of the report, so it cannot push it over.
+
+        When the notice was appended, `max(0, cap - len(notice))` returned a
+        string ~2.5x a small cap -- the bound silently exceeded by the thing
+        enforcing it.
+        """
+        with patch.object(session_kv_server, "CRON_REPORT_MAX_CHARS", 100):
+            report, notice = session_kv_server._truncate_report("y" * 500, "platform", "j")
+        self.assertEqual(len(report), 100)
+        self.assertTrue(notice)
+
+    def test_the_fan_out_reaches_every_enabled_platform(self):
+        """#1094: a dual-platform install has two audiences, not a favourite.
+
+        Slack-first selection sent seven days of governance reports to a Slack
+        leg with no home channel while Google Chat, which had one, got nothing.
+        """
+        with patch.object(session_kv_server, "enabled_chat_platforms",
+                          return_value=["google_chat", "slack"]), \
+             patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
+             patch.object(session_kv_server, "_run_relay_turn", return_value="composed"), \
+             patch.object(session_kv_server, "_send_to_chat", return_value="T1") as send:
+            response = self.client.post("/v1/cron-reports", json={"job_id": "jf", "report": "r"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([c.args[0] for c in send.call_args_list], ["google_chat", "slack"])
+        self.assertEqual(response.json()["undelivered"], "")
+
+    def test_a_dead_leg_does_not_cost_the_live_one_its_report(self):
+        """Autopush exactly: Slack enabled, unreachable, and Google Chat working."""
+        def only_google_chat(platform, *_args, **_kwargs):
+            return "spaces/AAA/threads/T1" if platform == "google_chat" else None
+
+        with patch.object(session_kv_server, "enabled_chat_platforms",
+                          return_value=["google_chat", "slack"]), \
+             patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
+             patch.object(session_kv_server, "_run_relay_turn", return_value="composed"), \
+             patch.object(session_kv_server, "_send_to_chat", side_effect=only_google_chat):
+            response = self.client.post("/v1/cron-reports", json={"job_id": "jg", "report": "r"})
+
+        # 200: the report is in a channel, and a re-run would double-post there.
+        self.assertEqual(response.status_code, 200)
+        # But the audience that heard nothing is named, which is the whole of the
+        # issue — the failure was recorded nowhere a reader would find it.
+        self.assertEqual(response.json()["undelivered"], "slack")
+
+    def test_every_leg_failing_is_still_a_failure(self):
+        with patch.object(session_kv_server, "enabled_chat_platforms",
+                          return_value=["google_chat", "slack"]), \
+             patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
+             patch.object(session_kv_server, "_run_relay_turn", return_value="composed"), \
+             patch.object(session_kv_server, "_send_to_chat", return_value=None):
+            response = self.client.post("/v1/cron-reports", json={"job_id": "jh", "report": "r"})
+
+        self.assertEqual(response.status_code, 502)
+        detail = response.json()["detail"]
+        self.assertIn("google_chat", detail)
+        self.assertIn("slack", detail)
+
+    def test_each_leg_replays_its_own_thread_and_never_another_s(self):
+        """A thread id is platform-local; replaying it on the other leg addresses
+        a thread that does not exist."""
+        def per_platform(platform, *_args, **_kwargs):
+            return "spaces/AAA/threads/T1" if platform == "google_chat" else "1712345678.000100"
+
+        with patch.object(session_kv_server, "enabled_chat_platforms",
+                          return_value=["google_chat", "slack"]), \
+             patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
+             patch.object(session_kv_server, "_run_relay_turn", return_value="composed"), \
+             patch.object(session_kv_server, "_send_to_chat", side_effect=per_platform) as send:
+            self.client.post("/v1/cron-reports", json={"job_id": "ji", "report": "first"})
+            send.reset_mock()
+            self.client.post("/v1/cron-reports", json={"job_id": "ji", "report": "second"})
+
+        by_platform = {c.args[0]: c.args[2:] for c in send.call_args_list}
+        self.assertEqual(by_platform["google_chat"], ("spaces/AAA", "spaces/AAA/threads/T1"))
+        # Slack replays Slack's own thread, not Google Chat's, and not nothing.
+        self.assertEqual(by_platform["slack"][1], "1712345678.000100")
+
+    def test_a_leg_that_fails_once_keeps_its_thread_for_the_next_report(self):
+        """A transient failure used to unthread a leg for the rest of the day.
+
+        Ownership moved to the leg that landed, and because only the owner
+        replayed a thread, the recovered platform started a fresh top-level
+        message on every subsequent report -- orphans nobody could reply into
+        with context.
+        """
+        state = {"google_chat_up": True}
+
+        def flaky(platform, *_args, **_kwargs):
+            if platform == "google_chat":
+                return "spaces/AAA/threads/T1" if state["google_chat_up"] else None
+            return "1712345678.000100"
+
+        with patch.object(session_kv_server, "enabled_chat_platforms",
+                          return_value=["google_chat", "slack"]), \
+             patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
+             patch.object(session_kv_server, "_run_relay_turn", return_value="composed"), \
+             patch.object(session_kv_server, "_send_to_chat", side_effect=flaky) as send:
+            self.client.post("/v1/cron-reports", json={"job_id": "jk", "report": "one"})
+            state["google_chat_up"] = False           # transient outage
+            self.client.post("/v1/cron-reports", json={"job_id": "jk", "report": "two"})
+            state["google_chat_up"] = True            # recovered
+            send.reset_mock()
+            self.client.post("/v1/cron-reports", json={"job_id": "jk", "report": "three"})
+
+        third = {c.args[0]: c.args[2:] for c in send.call_args_list}
+        self.assertEqual(
+            third["google_chat"], ("spaces/AAA", "spaces/AAA/threads/T1"),
+            "the recovered leg must reply into the thread it opened, not orphan a new one",
+        )
+
+    def test_a_leg_that_missed_this_report_does_not_get_its_incident_row(self):
+        """Keeping the thread is not the same as being sent the report.
+
+        `platform_threads` is additive and the session id is per UTC day, so
+        after a leg fails once the map still holds its thread -- deliberately,
+        so the next report can reply into it. Writing this report's incident
+        row against that thread would overwrite the channel's stored context
+        with a report it never received, and `_store_incident_report` is
+        INSERT OR REPLACE on (chat_id, thread_id), so the report still on
+        screen there is the one destroyed. A reply under it would then have
+        `incident_context` prepend text that was never posted in that channel.
+        """
+        import sqlite3
+
+        state = {"google_chat_up": True}
+
+        def flaky(platform, *_args, **_kwargs):
+            if platform == "google_chat":
+                return "spaces/AAA/threads/T1" if state["google_chat_up"] else None
+            return "1712345678.000100"
+
+        with patch.object(session_kv_server, "enabled_chat_platforms",
+                          return_value=["google_chat", "slack"]), \
+             patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
+             patch.object(session_kv_server, "_run_relay_turn",
+                          side_effect=lambda *a, **k: f"COMPOSED:{a[2]}"), \
+             patch.object(session_kv_server, "_send_to_chat", side_effect=flaky):
+            self.client.post("/v1/cron-reports", json={"job_id": "jm", "report": "ONE"})
+            state["google_chat_up"] = False
+            self.client.post("/v1/cron-reports", json={"job_id": "jm", "report": "TWO"})
+
+        with sqlite3.connect(temp_db_path) as conn:
+            stored = dict(conn.execute("SELECT thread_id, report FROM incidents"))
+
+        self.assertIn("TWO", stored["1712345678.000100"],
+                      "the leg that landed must carry the report it received")
+        self.assertIn(
+            "ONE", stored["spaces/AAA/threads/T1"],
+            "the leg that missed report two must keep report one -- the one its "
+            "channel can actually see -- not be overwritten with report two",
+        )
+
+    def test_a_session_routed_before_the_upgrade_keeps_its_thread(self):
+        """Roll-forward, which is the direction that actually happens.
+
+        A row written by the code this replaces has the top-level
+        platform/chat_id/thread_id triple and no `platform_threads` map. Without
+        seeding the owning leg from the triple the first report after the
+        rollout sends with ('', '') and orphans a top-level message instead of
+        replying into the thread the session already has.
+        """
+        import sqlite3
+        from datetime import datetime, timezone
+
+        session_id = session_kv_server._cron_report_session_id(
+            "platform", "jn", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+        pre_upgrade = {
+            "platform": "google_chat",
+            "chat_id": "spaces/AAA",
+            "thread_id": "spaces/AAA/threads/T1",
+        }
+        with sqlite3.connect(temp_db_path) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO session_metadata (session_id, metadata) VALUES (?, ?)",
+                    (session_id, json.dumps(pre_upgrade)),
+                )
+
+        with patch.object(session_kv_server, "enabled_chat_platforms",
+                          return_value=["google_chat"]), \
+             patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
+             patch.object(session_kv_server, "_run_relay_turn", return_value="composed"), \
+             patch.object(session_kv_server, "_send_to_chat",
+                          return_value="spaces/AAA/threads/T1") as send:
+            self.client.post("/v1/cron-reports", json={"job_id": "jn", "report": "r"})
+
+        self.assertEqual(
+            send.call_args.args[2:], ("spaces/AAA", "spaces/AAA/threads/T1"),
+            "the first report after the rollout must reply into the existing thread",
+        )
+
+    def test_the_receipt_says_when_the_report_was_truncated(self):
+        """The human sees the [truncated] line in the channel; the agent that
+        wrote the report -- the only party that could split it -- saw nothing."""
+        with patch.object(session_kv_server, "enabled_chat_platforms",
+                          return_value=["google_chat"]), \
+             patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
+             patch.object(session_kv_server, "_run_relay_turn", return_value="composed"), \
+             patch.object(session_kv_server, "_send_to_chat",
+                          return_value="spaces/AAA/threads/T1"):
+            over = self.client.post(
+                "/v1/cron-reports",
+                json={"job_id": "jo", "report": "x" * (session_kv_server.CRON_REPORT_MAX_CHARS + 1)},
+            )
+            fits = self.client.post("/v1/cron-reports", json={"job_id": "jp", "report": "short"})
+
+        self.assertEqual(over.json()["truncated"], "true")
+        self.assertEqual(fits.json()["truncated"], "")
+
+    def test_a_reply_in_either_channel_finds_the_report(self):
+        """`incident_context` resolves by (chat_id, thread_id), so a fan-out that
+        stores only the owner's address leaves the other channel's readers
+        talking to an agent that never saw the report."""
+        import sqlite3
+
+        def per_platform(platform, *_args, **_kwargs):
+            return "spaces/AAA/threads/T1" if platform == "google_chat" else "1712345678.000100"
+
+        with patch.object(session_kv_server, "enabled_chat_platforms",
+                          return_value=["google_chat", "slack"]), \
+             patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
+             patch.object(session_kv_server, "_run_relay_turn", return_value="composed"), \
+             patch.object(session_kv_server, "_send_to_chat", side_effect=per_platform):
+            self.client.post("/v1/cron-reports", json={"job_id": "jl", "report": "r"})
+
+        with sqlite3.connect(temp_db_path) as conn:
+            threads = {row[0] for row in conn.execute("SELECT thread_id FROM incidents")}
+        self.assertIn("spaces/AAA/threads/T1", threads)
+        self.assertIn("1712345678.000100", threads)
+
+    def test_the_routing_falls_to_a_leg_that_actually_landed(self):
+        """If the routed platform is the one that failed, the follow-up thread has
+        to move — otherwise a reply reaches a session addressed at a channel the
+        report never arrived in."""
+        import sqlite3
+
+        def only_slack(platform, *_args, **_kwargs):
+            return "1712345678.000100" if platform == "slack" else None
+
+        with patch.object(session_kv_server, "enabled_chat_platforms",
+                          return_value=["google_chat", "slack"]), \
+             patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
+             patch.object(session_kv_server, "_run_relay_turn", return_value="composed"), \
+             patch.object(session_kv_server, "_send_to_chat", side_effect=only_slack):
+            self.client.post("/v1/cron-reports", json={"job_id": "jj", "report": "r"})
+
+        with sqlite3.connect(temp_db_path) as conn:
+            (blob,) = conn.execute("SELECT metadata FROM session_metadata").fetchone()
+        self.assertEqual(json.loads(blob)["platform"], "slack")
 
     def test_route_requires_the_api_key(self):
         from fastapi.testclient import TestClient
@@ -2124,7 +2739,7 @@ class TestCronReportRelay(unittest.TestCase):
         """`title` is stored for one reader: /v1/incidents/recent."""
         import sqlite3
 
-        with patch.object(session_kv_server, "get_active_platform", return_value="google_chat"), \
+        with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat"]), \
              patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
              patch.object(session_kv_server, "_run_relay_turn", return_value="composed"), \
              patch.object(session_kv_server, "_send_to_chat", return_value="spaces/AAA/threads/T1"):
@@ -2213,7 +2828,7 @@ class TestCronReportLabelSanitisation(unittest.TestCase):
 
             client = TestClient(session_kv_server.app, headers=AUTH_HEADERS)
             build = session_kv_server._build_relay_instructions
-            with patch.object(session_kv_server, "get_active_platform", return_value="google_chat"), \
+            with patch.object(session_kv_server, "enabled_chat_platforms", return_value=["google_chat"]), \
                  patch.object(session_kv_server, "_create_gateway_session", return_value=True), \
                  patch.object(session_kv_server, "_build_relay_instructions", side_effect=build) as built, \
                  patch.object(session_kv_server, "_run_relay_turn", return_value="composed"), \

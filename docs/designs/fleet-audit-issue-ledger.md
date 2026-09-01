@@ -383,10 +383,10 @@ layout.
 
 That also fixes an ordering problem worth recording: the GitHub App token is repo-scoped, so it
 cannot be minted before the repo is known, and the repo used to be derived from the clone the token
-was needed to create. The repo now comes from the `Git Repo:` line of `/opt/data/SETTINGS.md`, which
-the operator writes at provisioning time and which is present from the pod's first second, with the
-git remote kept only as a fallback. This resolves §13 Q1 in passing: `github-issue-resolver` already
-read that same line, so the two skills now agree by construction rather than by coincidence.
+was needed to create. The repo now comes from the managed repositories ConfigMap (`$GITOPS_STATE_CONFIGMAP`),
+with workspace lease markers and the git remote kept as fallbacks. This resolves §13 Q1 in passing:
+`github-issue-resolver` and `fleet-audit` read from the same ConfigMap, so the two skills now agree
+by construction rather than by coincidence.
 
 `start` is also the **only** subcommand that scrubs the working tree — see the note under
 `remediate`. Note the removed behaviour: it no longer resets a report branch. There is no report
@@ -428,15 +428,15 @@ is indistinguishable from "3 requests silently dropped": opened with its URL, re
 open and deliberately not force-pushed over, `superseded` by a human close written after the request
 (§3.1), or not published this run and queued for a retry. A **refusal** is likewise never silence.
 Naming a `gcloud` or `manual` finding, naming an id that is not in the document, lacking write
-access, writing `/remediate` mid-sentence where the line-anchored parser will not honour it, or
-writing it with no target at all each get exactly one reply.
+access, writing `/remediate` mid-sentence where the line-anchored parser will not honour it,
+writing it inside a block quote or CommonMark lazy continuation line, or writing it with no target at all each get exactly one reply.
 
-Four of those five replies carry the ids that would have worked — capped at ten, then "and N more",
+Five of those six replies carry the ids that would have worked — capped at ten, then "and N more",
 since a refusal is help and not a second copy of the report. **The write-access refusal deliberately
 carries neither the id list nor the syntax.** Every other refusal is a correction to someone who may
 retry and succeed; that one is a "no" to someone who cannot, and handing them a menu of fixes they
 are not permitted to request reads as an invitation rather than an answer. It says what the rule is
-and stops. The one deliberate silence is a mid-sentence mention from someone without write access:
+and stops. The one deliberate silence is a mid-sentence or quoted mention from someone without write access:
 their correctly-typed command would have been refused anyway, and two replies to one comment that
 was probably never a command is a bot picking an argument. A `/remediate` the harness itself renders
 into a comment is always inside a code span, and inline code is stripped before the mention search
@@ -722,6 +722,11 @@ nobody controls, so all of it is untrusted input to a Markdown renderer that wil
   likewise indented at most three, nothing else on the line, unterminated fences run to the end.
   Dropping the indentation bound — stripping each line before comparing — makes four-space
   ` ``` `, which CommonMark and GitHub both render as literal text, read as a closer.
+- **Block quotes and lazy continuations are stripped.** `strip_block_quotes` drops blockquote
+  lines starting with `>` (indented 0-3 spaces) and consumes subsequent lazy continuation lines
+  that CommonMark (§5.1) includes in the block quote until a paragraph break (such as an empty quote line,
+  blank line, code fence, heading, or thematic break) is encountered, preserving lazy continuations
+  for both quoted paragraphs and list items inside the quote to prevent quoted `/remediate` suggestions from firing.
 - **Table cells escape `|` and flatten newlines**; identifiers additionally replace a backtick,
   because one backtick closes the inline code span they sit in and the rest of the value renders as
   live Markdown.
@@ -1093,11 +1098,10 @@ This is worth the cost of a real repository in the suite: the bug it guards agai
 Tier 2 — every manifest the audit wrote would have been deleted moments before the harness looked
 for it, and every finding would have been published as "the fix was named but never written".
 
-**Repo-resolution cases** (§13 Q1): the `Git Repo:` line parsed from `https://`, `git@`, and bare
-`owner/name` forms; the literal `None` the operator writes for an unset CR field; a missing
-`SETTINGS.md` falling back to the git remote; SETTINGS winning when both are present; and an error
-that names both sources when neither works. Plus ordering: the repo is resolved before the token is
-minted, the token is minted for the resolved repo, and both happen before the clone.
+**Repo-resolution cases** (§13 Q1): repo resolution from the managed repositories ConfigMap,
+workspace lease markers, and the git remote fallback, with an error that names all sources when
+none work. Plus ordering: the repo is resolved before the token is minted, the token is minted
+for the resolved repo, and both happen before the clone.
 
 **One hazard the suite has to defend against itself.** Two test classes were both named
 `TestStaleClose`. Python rebinds the name at import, long before `unittest` collects anything, so the
@@ -1121,13 +1125,13 @@ issue-repo argument and the App token needs scope on both.
 _Resolved: the GitOps repo._ No new argument, no second token scope, no second place to look.
 
 The divergence this question surfaced — `audit_report.py` deriving the repo from the working
-directory's `origin` remote while `github-issue-resolver/scripts/resolver.py` derives it from the
-`Git Repo:` line of `/opt/data/SETTINGS.md` — was first recorded as cosmetic and deferred. It was
+directory's `origin` remote while `github-issue-resolver/scripts/resolver.py` derives it from
+the managed repositories ConfigMap — was first recorded as cosmetic and deferred. It was
 not cosmetic. Reading the remote requires a working tree, the audit cron does not start in one, and
 the clone that would create one needs a repo-scoped token that cannot be minted until the repo is
 known. The old resolution was circular and would have failed on the first real run. `resolve_repo()`
-now reads `SETTINGS.md` first and falls back to the remote, so the two skills agree by construction
-and the repo is knowable before anything has been cloned (§6, `start`).
+now reads the managed repositories ConfigMap first and falls back to the remote, so the two skills
+agree by construction and the repo is knowable before anything has been cloned (§6, `start`).
 
 **Q2. Does the App token already carry `issues: write`?** `github-issue-resolver/scripts/resolver.py`
 creates labels, comments, and closes issues with the same token, so issue write is established — but

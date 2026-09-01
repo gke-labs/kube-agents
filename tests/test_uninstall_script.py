@@ -19,6 +19,7 @@ engine it does not carry.
 """
 
 import pathlib
+import re
 import shlex
 import shutil
 import stat
@@ -410,6 +411,45 @@ class SourceRefDispatchTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("REF=", proc.stdout)
             self.assertNotIn("REF=0.2.0", proc.stdout)
+
+
+class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
+    """A destroy is not refusable on the sandbox's account.
+
+    `write_tfvars_from_state` runs the Autopilot version-floor check whenever
+    ENABLE_GVISOR is truthy, and returns 1 below the floor. uninstall.sh sources
+    vars.sh whenever the checkout has one, and since the installer default
+    flipped that file says "true" on every new install -- so the ordinary
+    teardown, from the checkout that installed, is the case the floor can abort.
+    The `false` fallback inside write_tfvars_from_state does not cover it; only
+    the export in uninstall.sh does.
+
+    Asserted against the script's text rather than by running it, because the
+    call sits inside the teardown's confirmation and lock machinery. What makes
+    the assertion meaningful is the ordering: an export placed after the call
+    would read as a fix and change nothing.
+    """
+
+    def test_uninstall_forces_gvisor_off_before_generating_tfvars(self):
+        text = _UNINSTALL_SH.read_text()
+        export_at = text.find('export ENABLE_GVISOR="false"')
+        self.assertNotEqual(
+            export_at,
+            -1,
+            "uninstall.sh must export ENABLE_GVISOR=false; without it a "
+            "sub-floor Autopilot cluster cannot be torn down from the checkout "
+            "that installed it.",
+        )
+        # The invocation, not the two comments that name the function.
+        call = re.search(r"^\s*write_tfvars_from_state \"", text, re.MULTILINE)
+        self.assertIsNotNone(call, "write_tfvars_from_state call not found")
+        call_at = call.start()
+        self.assertLess(
+            export_at,
+            call_at,
+            "the ENABLE_GVISOR export must come before write_tfvars_from_state, "
+            "which is what runs the floor check.",
+        )
 
 
 if __name__ == "__main__":

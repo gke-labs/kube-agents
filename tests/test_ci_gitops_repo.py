@@ -52,6 +52,11 @@ _EXPECTED_MAPPING = {
     "kube-agents-evals-8": "gke-agentic/kube-agents-evals-8-infra",
     "kube-agents-evals-9": "gke-agentic/kube-agents-evals-9-infra",
     "kube-agents-evals-10": "gke-agentic/kube-agents-evals-10-infra",
+    "kube-agents-evals-11": "gke-agentic/kube-agents-evals-11-infra",
+    "kube-agents-evals-12": "gke-agentic/kube-agents-evals-12-infra",
+    "kube-agents-evals-13": "gke-agentic/kube-agents-evals-13-infra",
+    "kube-agents-evals-14": "gke-agentic/kube-agents-evals-14-infra",
+    "kube-agents-evals-15": "gke-agentic/kube-agents-evals-15-infra",
 }
 
 # The fail-closed tests need a project the mapping will never contain, and for

@@ -11,11 +11,16 @@
 ### 0. Open the audit run
 
 ```bash
-./skills/fleet-audit/scripts/audit_report.py start --audit compliance-audit
+./skills/fleet-audit/scripts/audit_report.py start --audit compliance-audit [--repo "<owner>/<repo>"]
 # -> {"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/compliance-audit/org__repo",
 #     "findings_path":"/opt/data/scratch/findings_compliance-audit.json",
 #     "pending_remediation_requests":["<finding-id>", ...]}
 ```
+
+If multiple repositories are registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`), pass `--repo "<owner>/<repo>"` explicitly:
+
+- **Interactive session:** If no `--repo` was specified, prompt the user to choose which repository to target before proceeding.
+- **Scheduled / unattended cron:** Iterate over all repositories in `managed_repos` in sequence, executing the audit and running `audit_report.py start` and `audit_report.py finish` for each repository with `--repo "<owner>/<repo>"`.
 
 `findings_path` is the only file you write findings to. `issue` is the stream's open ledger issue, or `null` when the stream has none. `pending_remediation_requests` is the set of finding ids a repo writer asked for with a `/remediate` comment on the ledger — write a `kind: manifest` file for every one of them during §2 and §3, whether or not this SOP would have promoted it on its own.
 
@@ -227,6 +232,7 @@ kubectl get netpol -A -o json | jq -r '.items[]
 - **Severity:** `major` for zero policies — unrestricted lateral movement, though the namespace boundary and RBAC still hold. `minor` for allow-all-only: the team engaged with NetworkPolicy and the fix is a one-line edit.
 - **Impact:** "Every pod in this namespace accepts traffic from every pod in the cluster; a compromise anywhere reaches these workloads unimpeded."
 - **Remediation:** the two flag conditions are two different problems, and only one of them is fixed by adding a file.
+
   - **Zero policies** — the object does not exist, so §3's create rule applies: `kind: manifest`, with §3 deciding the path by finding where this namespace is already declared. Generate **exactly one** `NetworkPolicy`, `default-deny-ingress` (`podSelector: {}`, `policyTypes: [Ingress]`, no `ingress` rules), and nothing else.
   - **Allow-all only** — the offending policy _is_ the finding, and adding a second file does not fix it. NetworkPolicy is additive: a pod is reachable if **any** policy selecting it permits the traffic, so a deny-everything policy sitting alongside an allow-all one changes nothing. Emitting it produces a pull request that merges cleanly, closes the finding for exactly one run, and leaves the namespace as open as it was — worse than no fix, because it also spends the reviewer's trust. Name the allow-all policy in `object` as `NetworkPolicy/<name>` and fix _that_ object, under §3's change-an-existing-object rule: `kind: manifest` **only** when the GitOps repo already declares it — `remediation.path` is that existing file, rewritten as the policy's complete desired manifest with the empty `ingress` rule removed (`podSelector: {}`, `policyTypes: [Ingress]`, no `ingress`) and its name unchanged — and `kind: manual` otherwise, because the harness will not edit or delete a live object it cannot find declared. Never write a second file for this branch.
 
@@ -367,7 +373,8 @@ Three `rationale`/`risk` pairs in this SOP are check-specific and must not be wr
 
 ```bash
 ./skills/fleet-audit/scripts/audit_report.py finish --audit compliance-audit \
-  --findings-file /opt/data/scratch/findings_compliance-audit.json
+  --findings-file /opt/data/scratch/findings_compliance-audit.json \
+  [--repo "<owner>/<repo>"]
 # -> {"status":"CLEAN"|"OPENED"|"UPDATED","issue_url":...,"new":n,"resolved":m,
 #     "prs_opened":[...],"prs_closed":[...],"partial":false,"coverage_gaps":[],
 #     "silent_ok":true}

@@ -184,6 +184,77 @@ get_latest_validated_rc_tag() {
   git tag -l --sort=-v:refname 'rc_*_validated' 2>/dev/null | grep -E '^rc_.*_validated$' | head -n 1 || echo ""
 }
 
+# Reads the commits between the last GA tag and a candidate, into
+# RELEASE_RANGE_SUBJECTS (`%s`) and RELEASE_RANGE_BODIES (`%b`).
+#
+# Shared for the same reason the predicate below is: calculate_next_version.sh
+# applies it to pick a bump and resolve_scheduled_release.sh applies it to decide
+# whether to release at all, so the two have to be looking at the same commits.
+# A `--no-merges` or a path filter added to one range and not the other would
+# scope the bump and the halt differently, silently.
+#
+# Stderr is kept out of the captured value. `$(git log … 2>&1)` merges warnings
+# into the output on SUCCESS, not only on failure — and git warns on success for
+# an ambiguous refname, which is what a branch sharing a GA tag's name produces.
+# An empty range then captures `warning: refname '0.1.0' is ambiguous.`, reads as
+# non-empty, and an unattended run publishes a release for a week with nothing in
+# it. The message is still reported, from the failure branch, where it belongs.
+#
+# Arguments: $1 = base GA tag, $2 = candidate commit-ish. Returns non-zero if the
+# range cannot be read.
+#
+# shellcheck disable=SC2034  # RELEASE_RANGE_* are the return channel, read by callers.
+release_read_commit_range() {
+  local base_tag="${1:-}"
+  local target="${2:-}"
+  local range="${base_tag}..${target}"
+  local stderr_file
+  stderr_file="$(mktemp)"
+
+  RELEASE_RANGE_SUBJECTS=""
+  RELEASE_RANGE_BODIES=""
+
+  if ! RELEASE_RANGE_SUBJECTS="$(git log "${range}" --format="%s" 2>"${stderr_file}")"; then
+    echo "❌ ERROR: Failed to read commit log for range '${range}': $(cat "${stderr_file}")" >&2
+    rm -f "${stderr_file}"
+    return 1
+  fi
+  rm -f "${stderr_file}"
+
+  RELEASE_RANGE_BODIES="$(git log "${range}" --format="%b" 2>/dev/null || echo "")"
+  return 0
+}
+
+# Answers "does this commit range carry a breaking change?" — a `feat!:`-style
+# bang on the type, or a BREAKING CHANGE / BREAKING-CHANGE footer.
+#
+# Both callers take the same answer from here rather than each holding a copy of
+# the regexes. calculate_next_version.sh reads it to pick the bump, and
+# resolve_scheduled_release.sh reads it to decide whether an unattended release
+# has to stop for a human. Two copies drift in a way nothing notices: widen one
+# to catch a footer variant and the gate silently stops halting on that shape,
+# so a breaking change ships unattended with every suite green.
+#
+# Herestrings rather than `echo … | grep -q`. Under `set -o pipefail` grep exits
+# on its first match, the producer then dies on SIGPIPE, and the pipeline reports
+# 141 — so a corpus large enough to still be buffered makes matching input read
+# as "no breaking change". That is the unsafe direction, and it is the same
+# hazard candidate_supports_shared_pipeline already avoids for the same reason.
+#
+# Arguments: $1 = commit subjects (`git log --format=%s`), $2 = bodies (`%b`).
+commit_messages_have_breaking_change() {
+  local subjects="${1:-}"
+  local bodies="${2:-}"
+
+  if grep -qE "^[a-z]+(\([^)]+\))?!:" <<<"${subjects}"; then
+    return 0
+  fi
+  if grep -qE "^[[:space:]]*BREAKING[ -]CHANGE:[[:space:]]+" <<<"${bodies}"; then
+    return 0
+  fi
+  return 1
+}
+
 # Resolves target GitHub repository (e.g. gke-labs/kube-agents)
 get_target_repo() {
   if [ -n "${GH_ORG:-}" ] && [ -n "${GH_REPO:-}" ]; then
@@ -245,8 +316,10 @@ is_commit_already_attempted() {
 #
 # Anchored to the rc_ family, and named for it: this gates resolve_rc_tag.sh's
 # skip decision and the nightly promotion, so a marker minted by some other tag
-# family must not read as an RC validation. verify_release_eligibility.sh and
-# get_latest_validated_rc_tag anchor the same way.
+# family must not read as an RC validation. get_latest_validated_rc_tag anchors
+# the same way. The GA gate does not appear in that list any more:
+# verify_release_eligibility.sh reads the staging family alone, and takes the RC
+# validation as implied by it — see STAGING_TAG_SHAPE_REGEX below.
 is_rc_candidate_commit_already_validated() {
   local sha="$1"
   local validated_tags
@@ -289,11 +362,75 @@ staging_tag_for_rc() {
   echo "${STAGING_TAG_PREFIX}${core}"
 }
 
+# The shape a staging tag must have to count as release evidence:
+# staging_<YYMMDDHHMM>_<7-hex>, which is exactly what staging_tag_for_rc composes
+# from a validated rc_ tag and therefore exactly what the nightly pipeline
+# pushes.
+#
+# The GA gate matches this rather than the STAGING_TAG_PREFIX the deploy
+# workflows trigger on, and the difference is the whole defence. The prefix is a
+# trigger anyone can push by hand; a `staging_hotfix` typed at a terminal would
+# otherwise read back to the release gate as "the full nightly matrix passed on
+# this commit". The timestamp and short SHA in the right places are not produced
+# by accident.
+#
+# It stops an accident, not an attacker. Nothing checks that the 7-hex field is
+# the short SHA of the commit the tag points at, or that the commit carries
+# rc_*_validated, so a deliberately composed `staging_<ts>_<sha>` satisfies the
+# gate. That is no weaker than the rc_*_validated gate it replaces — equally a
+# tag anyone with push access could create — but it is not the stronger
+# guarantee the shape makes it look like.
+export STAGING_TAG_SHAPE_REGEX='^staging_[0-9]{10}_[0-9a-f]{7}$'
+
+# Finds the newest shape-valid staging promotion tag anywhere in the repository.
+# Empty output means nothing has been promoted to staging.
+#
+# `--sort=-v:refname` orders by the timestamp immediately after the prefix, which
+# is why staging_tag_for_rc puts it there. The list is materialised before it is
+# filtered rather than piped into `grep | head`: under `set -o pipefail` head
+# closing the pipe early makes grep exit 141, which a trailing `|| echo ""` then
+# turns into "nothing has passed the gate" — a skipped release, silently, once
+# the tag list outgrows a pipe buffer.
+get_latest_staging_tag() {
+  local tags
+  tags="$(git tag -l --sort=-v:refname "${STAGING_TAG_PREFIX}*" 2>/dev/null || true)"
+  grep -m1 -E "${STAGING_TAG_SHAPE_REGEX}" <<<"${tags}" || true
+}
+
+# Lists the shape-valid staging promotion tags pointing at a commit, one per
+# line. Empty output means this commit has not passed the nightly matrix.
+staging_promotion_tags_at_commit() {
+  local sha="${1:-}"
+  local tags
+  tags="$(git tag --points-at "${sha}" "${STAGING_TAG_PREFIX}*" 2>/dev/null || true)"
+  grep -E "${STAGING_TAG_SHAPE_REGEX}" <<<"${tags}" || true
+}
+
 # Finds an existing staging promotion tag on a commit SHA, if any. Empty output
 # means the commit has not been promoted yet.
+#
+# Shape-matched, like the two above, and it has to be. This is what
+# resolve_promotion_candidate.sh reads to set `skip_promotion`, so a prefix match
+# here means a hand-pushed `staging_hotfix` — which staging-redeploy-*.yml
+# legitimately triggers on — tells the nightly the commit is already promoted. It
+# then never pushes the real staging_<ts>_<sha> tag, and the release gate, which
+# does match on shape, reads that same commit as unreleasable. The candidate goes
+# quietly unshippable, and the two lookups have to agree for it not to.
+#
+# Erring towards not-yet-promoted is the safe direction on its own terms too:
+# `ensure_git_tag` no-ops when the tag already points at the same commit, so a
+# redundant promotion costs nothing.
 get_existing_staging_tag() {
   local sha="$1"
-  git tag --points-at "${sha}" "${STAGING_TAG_PREFIX}*" 2>/dev/null | head -n 1 || echo ""
+  local tags
+  tags="$(staging_promotion_tags_at_commit "${sha}")"
+  # Narrowed to the first line with a parameter expansion rather than a pipe into
+  # `head -n 1`, for the reason get_latest_staging_tag gives above: under
+  # `set -o pipefail` head closing the pipe early makes the producer exit 141, and
+  # the `|| echo ""` that usually sits beside it reads that as "not promoted" —
+  # which is the exact misreport this function was shape-anchored to prevent.
+  [ -n "${tags}" ] && printf '%s\n' "${tags%%$'\n'*}"
+  return 0
 }
 
 # Reports whether a candidate commit's tree carries what the shared pipeline

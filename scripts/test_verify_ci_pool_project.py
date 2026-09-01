@@ -1603,6 +1603,395 @@ class GithubAppProbeTest(unittest.TestCase):
         self.assertEqual(header["alg"], "RS256")
 
 
+_FAKE_PEM = "-----BEGIN RSA PRIVATE KEY-----\nnot-a-key\n-----END RSA PRIVATE KEY-----\n"
+
+
+class LedgerAppKeyReadTest(unittest.TestCase):
+    """Reading the App's private key out of the build cluster.
+
+    A None pem must always carry a reason, because the reason is the whole of
+    what the operator is told when the check reports unverified.
+    """
+
+    def _read(self, *results):
+        with mock.patch.object(checker, "run_cmd", side_effect=list(results)):
+            return checker._read_ledger_app_key()
+
+    def test_reads_and_decodes_the_secret(self):
+        encoded = base64.b64encode(_FAKE_PEM.encode()).decode()
+        pem, reason = self._read((0, "", ""), (0, encoded, ""))
+        self.assertEqual(_FAKE_PEM, pem)
+        self.assertEqual("", reason)
+
+    def test_the_cluster_is_named_by_its_gke_name_not_the_prow_alias(self):
+        # `build-kube-agents` is the prowjob's cluster: field. There is no GKE
+        # cluster by that name, and get-credentials on it fails.
+        calls = []
+
+        def run_cmd(cmd, **kw):
+            calls.append(cmd)
+            return (0, base64.b64encode(_FAKE_PEM.encode()).decode(), "") if len(calls) > 1 else (0, "", "")
+
+        with mock.patch.object(checker, "run_cmd", side_effect=run_cmd):
+            checker._read_ledger_app_key()
+        context = " ".join(calls[1])
+        self.assertIn(checker.PROW_BUILD_CLUSTER, context)
+        self.assertNotIn("build-kube-agents", context)
+
+    def test_absent_kubectl_is_a_reason_not_a_crash(self):
+        pem, reason = self._read((127, "", "no kubectl"))
+        self.assertIsNone(pem)
+        self.assertIn("kubectl", reason)
+
+    def test_a_refused_read_says_so_rather_than_calling_the_secret_absent(self):
+        # Real kubectl RBAC text, verbatim: it carries no status code, so the
+        # invented `403 Forbidden` this used to assert on was matching a pattern
+        # production never sees.
+        pem, reason = self._read((0, "", ""), (1, "", (
+            f'Error from server (Forbidden): secrets "{checker.LEDGER_KEY_SECRET}" is forbidden: '
+            'User "operator@example.com" cannot get resource "secrets" in API group "" '
+            'in the namespace "test-pods"')))
+        self.assertIsNone(pem)
+        self.assertIn("refused", reason)
+
+    def test_a_missing_entry_reads_as_empty_not_as_an_error(self):
+        # kubectl exits 0 with empty output when the jsonpath misses, so an
+        # absent key.pem would otherwise decode to an empty PEM and sign nothing.
+        pem, reason = self._read((0, "", ""), (0, "", ""))
+        self.assertIsNone(pem)
+        self.assertIn(checker.LEDGER_KEY_SECRET_ENTRY, reason)
+
+    def test_a_missing_context_names_the_get_credentials_command(self):
+        pem, reason = self._read((0, "", ""), (1, "", 'error: context "gke_x" does not exist'))
+        self.assertIsNone(pem)
+        self.assertIn("get-credentials", reason)
+
+    def test_undecodable_material_is_a_reason_not_a_traceback(self):
+        pem, reason = self._read((0, "", ""), (0, "!!!not base64!!!", ""))
+        self.assertIsNone(pem)
+        self.assertIn(checker.LEDGER_KEY_SECRET_ENTRY, reason)
+
+
+class LedgerTokenMintTest(unittest.TestCase):
+    """Trading the App key for an installation token."""
+
+    def _mint(self, sign_rc=0, urlopen=None):
+        def run_cmd(cmd, **kw):
+            if sign_rc == 0:
+                with open(cmd[cmd.index("-out") + 1], "wb") as fh:
+                    fh.write(b"signature-bytes")
+            return sign_rc, "", "openssl said no"
+
+        opener = urlopen or (lambda *a, **kw: _Response({"token": "ghs_minted", "expires_at": "z"}))
+        with mock.patch.object(checker, "run_cmd", side_effect=run_cmd), \
+             mock.patch.object(checker.urllib.request, "urlopen", opener):
+            return checker._mint_ledger_token(_FAKE_PEM)
+
+    def _http_error(self, code, reason="err"):
+        def raise_it(*a, **kw):
+            raise urllib.error.HTTPError("u", code, reason, {}, None)
+
+        return raise_it
+
+    def test_returns_the_token_on_success(self):
+        token, status, message = self._mint()
+        self.assertEqual("ghs_minted", token)
+        self.assertEqual("ok", status)
+        self.assertEqual("", message)
+
+    def test_posts_to_the_installation_this_script_names(self):
+        seen = {}
+
+        def urlopen(request, timeout=None):
+            seen["url"] = request.full_url
+            seen["method"] = request.get_method()
+            return _Response({"token": "ghs_minted"})
+
+        self._mint(urlopen=urlopen)
+        self.assertIn(str(checker.LEDGER_INSTALLATION_ID), seen["url"])
+        self.assertEqual("POST", seen["method"])
+
+    def test_the_jwt_is_issued_by_the_ledger_app(self):
+        captured = {}
+
+        def urlopen(request, timeout=None):
+            jwt = request.get_header("Authorization").split()[1]
+            captured["claims"] = json.loads(base64.urlsafe_b64decode(jwt.split(".")[1] + "=="))
+            return _Response({"token": "ghs_minted"})
+
+        self._mint(urlopen=urlopen)
+        self.assertEqual(str(checker.LEDGER_APP_ID), captured["claims"]["iss"])
+        # GitHub rejects an App JWT more than ten minutes out.
+        self.assertLess(captured["claims"]["exp"] - int(time.time()), 600)
+
+    def test_a_wrong_key_fails_rather_than_reporting_unverified(self):
+        token, status, message = self._mint(urlopen=self._http_error(401, "Unauthorized"))
+        self.assertIsNone(token)
+        self.assertEqual("failed", status)
+        self.assertIn("401", message)
+
+    def test_a_missing_installation_fails(self):
+        _, status, message = self._mint(urlopen=self._http_error(404, "Not Found"))
+        self.assertEqual("failed", status)
+        self.assertIn(str(checker.LEDGER_INSTALLATION_ID), message)
+
+    def test_an_installation_scoped_to_all_repositories_fails(self):
+        # The read App's containment boundary. `all` reads this project's issues
+        # fine, so every check below would pass while the scope was gone.
+        token, status, message = self._mint(
+            urlopen=lambda *a, **kw: _Response(
+                {"token": "ghs_minted", "repository_selection": "all"}))
+        self.assertIsNone(token)
+        self.assertEqual("failed", status)
+        self.assertIn("repository_selection", message)
+
+    def test_only_all_trips_the_scope_guard(self):
+        for selection in ("selected", None):
+            body = {"token": "ghs_minted"}
+            if selection:
+                body["repository_selection"] = selection
+            with self.subTest(selection=selection):
+                token, status, _ = self._mint(urlopen=lambda *a, **kw: _Response(dict(body)))
+                self.assertEqual("ghs_minted", token)
+                self.assertEqual("ok", status)
+
+    def test_a_server_error_is_unverified_not_failed(self):
+        _, status, _ = self._mint(urlopen=self._http_error(503, "Service Unavailable"))
+        self.assertEqual("unverified", status)
+
+    def test_absent_openssl_is_unverified_not_a_bad_key(self):
+        _, status, message = self._mint(sign_rc=127)
+        self.assertEqual("unverified", status)
+        self.assertIn("openssl", message)
+
+    def test_a_key_openssl_rejects_fails(self):
+        _, status, _ = self._mint(sign_rc=1)
+        self.assertEqual("failed", status)
+
+    def test_the_pem_never_reaches_a_message(self):
+        _, _, message = self._mint(sign_rc=1)
+        self.assertNotIn("not-a-key", message)
+
+
+class LedgerReadCredentialTest(unittest.TestCase):
+    """The grading credential, which is not the minter App and not the operator's own login."""
+
+    def _check(self, urlopen, pem=_FAKE_PEM, key_reason="kubectl is not on PATH",
+               mint=("ghs_fake", "ok", ""), project="kube-agents-evals-7"):
+        with mock.patch.object(checker, "_read_ledger_app_key",
+                               return_value=(pem, "" if pem else key_reason)), \
+             mock.patch.object(checker, "_mint_ledger_token", return_value=mint), \
+             mock.patch.object(checker.urllib.request, "urlopen", urlopen):
+            return checker.check_ledger_read_credential(project)
+
+    def _http_error(self, code, reason="err", headers=None):
+        def raise_it(*a, **kw):
+            raise urllib.error.HTTPError("u", code, reason, headers or {}, None)
+
+        return raise_it
+
+    def test_readable_issues_pass(self):
+        seen = {}
+
+        def urlopen(request, timeout=None):
+            seen["url"] = request.full_url
+            seen["auth"] = request.get_header("Authorization")
+            return _Response([])
+
+        result = self._check(urlopen)
+        self.assertTrue(result.passed)
+        self.assertEqual([], result.warnings)
+        self.assertIn("gke-agentic/kube-agents-evals-7-infra", seen["url"])
+        self.assertEqual("Bearer ghs_fake", seen["auth"])
+
+    def test_empty_issue_list_is_still_a_pass(self):
+        # The question is whether the read is permitted. A pool repository has no
+        # ledger issue until its first lease publishes one, so requiring content
+        # would fail every project this check is run on.
+        self.assertTrue(self._check(lambda *a, **kw: _Response([])).passed)
+
+    def test_repo_outside_the_installation_fails(self):
+        # kube-agents-evals-6's first lease, exactly: everything provisioned, the
+        # ledger filed, and 404 on the read back.
+        result = self._check(self._http_error(404, "Not Found"))
+        self.assertFalse(result.passed)
+        self.assertIn("404", " ".join(result.details))
+
+    def test_repo_reachable_without_issues_read_fails(self):
+        result = self._check(self._http_error(403, "Forbidden"))
+        self.assertFalse(result.passed)
+        self.assertIn("issues: read", " ".join(result.details))
+
+    def test_rate_limited_403_is_unverified_not_failed(self):
+        result = self._check(self._http_error(403, "rate limit exceeded", {"x-ratelimit-remaining": "0"}))
+        self.assertTrue(result.passed)
+        self.assertTrue(result.warnings)
+
+    def test_server_error_is_unverified_not_failed(self):
+        result = self._check(self._http_error(503, "Service Unavailable"))
+        self.assertTrue(result.passed)
+        self.assertTrue(result.warnings)
+
+    def test_untrusted_ca_names_the_cert_bundle_not_a_firewall(self):
+        def untrusted(*a, **kw):
+            raise urllib.error.URLError("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+
+        result = self._check(untrusted)
+        self.assertTrue(result.passed)
+        self.assertIn("SSL_CERT_FILE", " ".join(result.warnings))
+
+    def test_an_unreadable_key_is_unverified_and_reads_nothing(self):
+        # The operator is an org member, so falling back to their own login would
+        # answer 200 for a repository the CI credential cannot see.
+        def fail_if_called(*a, **kw):
+            raise AssertionError("no request may be made without the CI credential")
+
+        result = self._check(fail_if_called, pem=None)
+        self.assertTrue(result.passed)
+        self.assertIn("kubectl is not on PATH", " ".join(result.warnings))
+        self.assertIn(checker.LEDGER_KEY_SECRET, " ".join(result.warnings))
+
+    def test_a_failed_mint_fails_the_check(self):
+        def fail_if_called(*a, **kw):
+            raise AssertionError("nothing may be read without a token")
+
+        result = self._check(fail_if_called, mint=(None, "failed", "the stored key is wrong"))
+        self.assertFalse(result.passed)
+        self.assertIn("the stored key is wrong", " ".join(result.details))
+
+    def test_an_unverified_mint_is_amber_not_a_pass_claim(self):
+        def fail_if_called(*a, **kw):
+            raise AssertionError("nothing may be read without a token")
+
+        result = self._check(fail_if_called, mint=(None, "unverified", "GitHub answered HTTP 502"))
+        self.assertTrue(result.passed)
+        self.assertIn("502", " ".join(result.warnings))
+
+    def test_no_environment_variable_can_stand_in_for_the_cluster_key(self):
+        # bench's verifier falls back to GITHUB_TOKEN; this check must not. On a
+        # laptop that variable is the operator's PAT, and a pass read with it says
+        # nothing about what CI can read.
+        def fail_if_called(*a, **kw):
+            raise AssertionError("GITHUB_TOKEN must not be used here")
+
+        env = {"GITHUB_TOKEN": "ghp_operator", "BENCH_GITHUB_TOKEN": "ghp_operator"}
+        with mock.patch.dict(checker.os.environ, env, clear=True):
+            result = self._check(fail_if_called, pem=None)
+        self.assertTrue(result.warnings)
+
+    def test_the_token_never_reaches_a_message(self):
+        result = self._check(self._http_error(403, "Forbidden"), mint=("ghs_secret_value", "ok", ""))
+        printed = " ".join([result.message] + result.details + result.warnings)
+        self.assertNotIn("ghs_secret_value", printed)
+
+
+class LedgerCredentialMatchesCiEvalPrTest(unittest.TestCase):
+    """This check must attest the credential hack/ci-eval-pr.sh actually mints.
+
+    The App, its installation, and the variable the token lands in are written
+    in three files that do not read each other -- here, hack/ci-eval-pr.sh, and
+    bench/kube_agents_bench/verifiers.py. Change one and this check goes on
+    reporting a project healthy against a credential CI no longer uses. Parsed
+    rather than imported: the verifier is deliberately dependency-free, bench is
+    an installable package, and the third file is shell.
+    """
+
+    def setUp(self):
+        self.script = (checker._ROOT / "hack" / "ci-eval-pr.sh").read_text()
+
+    def _default(self, name):
+        m = re.search(rf'^export {name}="\$\{{{name}:-([^}}]+)\}}"', self.script, re.M)
+        self.assertIsNotNone(m, f"could not find the {name} default in hack/ci-eval-pr.sh")
+        return m.group(1)
+
+    def test_the_app_and_installation_match_the_script(self):
+        self.assertEqual(str(checker.LEDGER_APP_ID), self._default("EVAL_LEDGER_APP_ID"))
+        self.assertEqual(
+            str(checker.LEDGER_INSTALLATION_ID), self._default("EVAL_LEDGER_INSTALLATION_ID")
+        )
+
+    def test_the_script_mints_into_the_variable_bench_reads_first(self):
+        text = (checker._ROOT / "bench" / "kube_agents_bench" / "verifiers.py").read_text()
+        block = re.search(r"^LEDGER_TOKEN_ENV_VARS\s*=\s*\((.*?)\)", text, re.S | re.M)
+        self.assertIsNotNone(block, "could not find LEDGER_TOKEN_ENV_VARS in bench's verifiers.py")
+        preferred = re.findall(r'"([^"]+)"', block.group(1))[0]
+        self.assertIn(f"export {preferred}=", self.script)
+
+    def _unit(self):
+        unit = re.search(r"^run_one_unit\(\) \{.*?^\}", self.script, re.S | re.M)
+        self.assertIsNotNone(unit, "could not find run_one_unit in hack/ci-eval-pr.sh")
+        return unit.group(0)
+
+    def test_a_failed_mint_does_not_fall_back_to_the_mounted_pat(self):
+        # A fallback would let a smoke test pass while proving nothing about the
+        # credential it was added to exercise.
+        mint = re.search(r"^mint_ledger_token\(\) \{.*?^\}", self.script, re.S | re.M)
+        self.assertIsNotNone(mint, "could not find mint_ledger_token in hack/ci-eval-pr.sh")
+        body = mint.group(0)
+        failure = re.search(r'^    if \[ "\$\{rc\}".*?^    fi', body, re.S | re.M)
+        self.assertIsNotNone(failure, "could not find the branch that gives up on the mint")
+        self.assertNotIn("BENCH_GITHUB_TOKEN", failure.group(0))
+        # Non-zero rather than `exit`: the unit call site holds two locks by the
+        # time it mints, and exiting there would strand them for lock_acquire's
+        # full timeout. Each caller unwinds its own scope instead.
+        self.assertIn("return 1", failure.group(0))
+        self.assertIsNone(re.search(r"\bexit\b", body))
+        # And the token is assigned once, below the retry loop rather than on
+        # any path through it. tests/test_ci_eval_ledger_mint.py executes what
+        # that loop does; this only pins where the assignment sits.
+        self.assertEqual(1, body.count("export BENCH_GITHUB_TOKEN="))
+        self.assertLess(body.index("\n  done"), body.index("export BENCH_GITHUB_TOKEN="))
+
+    def test_the_preflight_mint_is_the_one_that_stops_the_run(self):
+        # The other half of the rule above: a key that cannot mint at all is a
+        # run-wide fault, and nothing is held here to strand.
+        self.assertIn('mint_ledger_token "preflight" || exit 1', self.script)
+
+    def test_the_unit_mints_after_it_has_taken_every_lock(self):
+        # A unit can sit in lock_acquire for longer than the hour a token lasts:
+        # repetitions of one task serialize on the task lock and EVAL_REPETITIONS
+        # defaults to 3, so minting above the waiting hands devops-bench a token
+        # that expired while the unit was queued.
+        body = self._unit()
+        self.assertLess(
+            body.rindex("lock_acquire"),
+            body.index("mint_ledger_token"),
+            "run_one_unit must mint below its last lock_acquire, not above it",
+        )
+
+    def test_a_unit_that_cannot_mint_releases_what_it_holds(self):
+        # Returning without releasing would park every sibling for lock_acquire's
+        # timeout and grade their repetitions MISSING.
+        branch = re.search(
+            r"^  if ! mint_ledger_token .*?^  fi", self._unit(), re.S | re.M
+        )
+        self.assertIsNotNone(branch, "could not find the unit's mint-failure branch")
+        self.assertEqual(2, branch.group(0).count("lock_release"))
+        self.assertIn("return 0", branch.group(0))
+
+    def test_every_bench_invocation_is_preceded_by_a_mint(self):
+        # #1057 rewrote the serial repetition loop into a fan-out of background
+        # subshells, and a call site left behind in the old loop would define a
+        # mint nothing reaches: units would run on whatever token they inherited
+        # and the check here would attest a credential CI does not use.
+        body = self._unit()
+        self.assertIn("mint_ledger_token", body)
+        self.assertLess(
+            body.index("mint_ledger_token"),
+            body.index("uv run devops-bench"),
+            "the unit must mint before it invokes devops-bench",
+        )
+        # And nowhere else runs one: a second invocation site would need its own
+        # mint, and the fan-out is the only place the token is read. Counted over
+        # command lines rather than the whole file, so a comment quoting the
+        # command does not read as a second call site.
+        sites = [
+            line for line in self.script.splitlines()
+            if "uv run devops-bench" in line and not line.lstrip().startswith("#")
+        ]
+        self.assertEqual(1, len(sites), sites)
+
+
 class IamGrantsTest(unittest.TestCase):
     def _wi_policy(self, project_id):
         member = f"serviceAccount:{project_id}.svc.id.goog[kubeagents-system/kubeagents-platform-agent]"
@@ -1656,15 +2045,23 @@ class IamGrantsTest(unittest.TestCase):
 
     def test_missing_legacy_cloudbuild_reader_fails(self):
         # This is exactly the drift found on kube-agents-evals-2.
+        project_number = "123456"
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-2")),
                 _ok(self._project_policy("kube-agents-evals-2")),
-                _ok(self._reader_policy(["serviceAccount:123456-compute@developer.gserviceaccount.com"])),
+                _ok(self._reader_policy([f"serviceAccount:{project_number}-compute@developer.gserviceaccount.com"])),
             ]
-            result = checker.check_iam_and_service_accounts("kube-agents-evals-2", "123456")
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-2", project_number)
         self.assertFalse(result.passed)
-        self.assertTrue(any("cloudbuild.gserviceaccount.com" in d for d in result.details), result.details)
+        # The whole member the checker builds, not the domain it ends in. A
+        # detail naming any cloudbuild SA -- another project's, or a
+        # remediation hint quoting the domain -- satisfied the old spelling
+        # without the reported identity being this project's. Matching a bare
+        # host literal also reads to CodeQL as an incomplete URL check
+        # (py/incomplete-url-substring-sanitization).
+        cloudbuild_sa = f"serviceAccount:{project_number}@cloudbuild.gserviceaccount.com"
+        self.assertTrue(any(cloudbuild_sa in d for d in result.details), result.details)
 
     def test_missing_workload_identity_binding_fails(self):
         with mock.patch.object(checker, "run_cmd") as run:
@@ -2261,6 +2658,7 @@ class RunChecksTest(unittest.TestCase):
              mock.patch.object(checker, "check_gke_and_state", return_value=checker.CheckResult("g", True)), \
              mock.patch.object(checker, "check_seeded_fleet_fixtures", return_value=checker.CheckResult("f", True)), \
              mock.patch.object(checker, "check_github_repo_and_app", return_value=checker.CheckResult("h", True)), \
+             mock.patch.object(checker, "check_ledger_read_credential", return_value=checker.CheckResult("l", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
             results = checker.run_checks("kube-agents-evals-3")
         skipped = [c for c in results if c.message.startswith("Skipped")]
@@ -2277,6 +2675,7 @@ class RunChecksTest(unittest.TestCase):
              mock.patch.object(checker, "check_gke_and_state", return_value=checker.CheckResult("g", True)), \
              mock.patch.object(checker, "check_seeded_fleet_fixtures", return_value=checker.CheckResult("f", True)), \
              mock.patch.object(checker, "check_github_repo_and_app", return_value=checker.CheckResult("h", True)), \
+             mock.patch.object(checker, "check_ledger_read_credential", return_value=checker.CheckResult("l", True)), \
              mock.patch.object(checker, "check_token_minter", return_value=checker.CheckResult("k", True)):
             results = checker.run_checks("kube-agents-evals-6")
         dependent = [c for c in results if c.name in

@@ -30,13 +30,13 @@ After sending the initial notification, perform two critical safety checks to se
 
 To prevent duplicate effort and redundant PRs, inspect currently open Pull Requests in the repository:
 
-1. Resolve the GitOps repository as `<owner>/<repo>`, and name it on every `gh` call from here on. The pod is not a git checkout (Step 3 explains why), so `gh` has no `origin` remote to infer a repository from: an unqualified `gh pr list` fails on repository resolution rather than returning a list, and the duplicate check silently never happens. The operator writes the repository into `SETTINGS.md` at provisioning time, so it is readable before anything has been cloned:
+1. Resolve the GitOps repository as `<owner>/<repo>`, and name it on every `gh` call from here on. The pod is not a git checkout (Step 3 explains why), so `gh` has no `origin` remote to infer a repository from: an unqualified `gh pr list` fails on repository resolution rather than returning a list, and the duplicate check silently never happens. Query the `$GITOPS_STATE_CONFIGMAP` ConfigMap:
 
    ```bash
-   grep -i "Git Repo:" "${PLATFORM_AGENT_HOME:-/opt/data}/SETTINGS.md"
+   kubectl get configmap "${GITOPS_STATE_CONFIGMAP:-platform-agent-gitops-state}" -n "${KUBE_DEFAULT_NAMESPACE:-kubeagents-system}" -o jsonpath='{.data.managed_repos}'
    ```
 
-   Strip any `https://github.com/` prefix and `.git` suffix from the value that line carries; what is left is `<owner>/<repo>`. Step 3 prints the same value as `repo`.
+   If multiple repositories are returned, choose the target repository. Step 3 prints the same value as `repo`.
 
 2. List all open PRs in that repository:
    ```bash
@@ -83,6 +83,7 @@ If the pre-diagnosis checks pass (no duplicate PRs and it is a real active stock
 
    ```bash
    ./skills/submit-suggestion/scripts/submit_suggestion.py prepare \
+     --repo "<owner>/<repo>" \
      --branch "platform-agent/remediate-stockout-<workload_name>"
    ```
 

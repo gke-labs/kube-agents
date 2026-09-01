@@ -153,7 +153,10 @@ execute_image_build() {
     docker pull "$IMAGE_URI_LATEST" 2>/dev/null || true
     # --platform linux/amd64: these images deploy to amd64 GKE nodes, and the
     # multi-arch bases otherwise resolve to this machine's architecture (#560).
-    DOCKER_BUILDKIT=1 docker build --platform linux/amd64 --cache-from "$IMAGE_URI_LATEST" --build-arg BUILDKIT_INLINE_CACHE=1 --build-arg HERMES_AGENT_TAG="$HERMES_AGENT_TAG" --target "$AGENT_TARGET" -t "$IMAGE_URI" -t "$IMAGE_URI_LATEST" -f "${REPO_ROOT}/deploy/docker/Dockerfile" "${REPO_ROOT}" || return 1
+    # KUBE_AGENTS_VERSION is the dev tag: it is what the agent's remote MCP
+    # calls report as their User-Agent, so traffic from a hand-built image is
+    # distinguishable from a published one.
+    DOCKER_BUILDKIT=1 docker build --platform linux/amd64 --cache-from "$IMAGE_URI_LATEST" --build-arg BUILDKIT_INLINE_CACHE=1 --build-arg HERMES_AGENT_TAG="$HERMES_AGENT_TAG" --build-arg KUBE_AGENTS_VERSION="$DEV_TAG" --target "$AGENT_TARGET" -t "$IMAGE_URI" -t "$IMAGE_URI_LATEST" -f "${REPO_ROOT}/deploy/docker/Dockerfile" "${REPO_ROOT}" || return 1
     print_info "Pushing images to Artifact Registry ($IMAGE_BASE)..."
     docker push "$IMAGE_URI" || return 1
     docker push "$IMAGE_URI_LATEST" || return 1
@@ -167,7 +170,7 @@ execute_image_build() {
       cd "${REPO_ROOT}"
       gcloud builds submit \
           --config="deploy/docker/cloudbuild.yaml" \
-          --substitutions="_IMAGE_URI=${IMAGE_URI},_IMAGE_URI_LATEST=${IMAGE_URI_LATEST},_TARGET=${AGENT_TARGET},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG}" \
+          --substitutions="_IMAGE_URI=${IMAGE_URI},_IMAGE_URI_LATEST=${IMAGE_URI_LATEST},_TARGET=${AGENT_TARGET},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${DEV_TAG}" \
           --project="${PROJECT_ID}" \
           ${BUILD_POOL_ARGS[@]+"${BUILD_POOL_ARGS[@]}"} \
           .

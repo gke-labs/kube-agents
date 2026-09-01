@@ -11,13 +11,20 @@ Every image an install pulls or a rebuild needs, and how their tags are managed.
 
 [`images.json`](https://github.com/gke-labs/kube-agents/blob/main/images.json) at the repository root is the source of truth for this list. It is what `make mirror-images` copies from, what the chart and the dev tooling resolve their third-party pins from, and what the table below is generated from — so there is one pin per image, not one per install path.
 
-That cuts both ways: **a version bump edits `images.json` and nothing else.** The manifest,
-Dockerfile, or chart value that used to carry a pin now names a variable, so editing the old
-location changes nothing. `make images-check` cross-checks the entries that still have a second
-copy — LiteLLM and fluent-bit against the chart values, the build-time bases against their
-Dockerfile `ARG` defaults — but for `github-token-minter-server`, both Hindsight images, and the
-four cert-manager entries this file is the only copy, and nothing else in the tree is left to
-disagree with it. Bump the pin here, then run `make images-check` and `make docs-generate`.
+A bump starts here but rarely ends here. Several images keep a second copy that this file is the
+source for — a chart value, a Dockerfile `ARG` default, a compiled constant in the operator — and
+`make images-check` is what holds them in step. It covers every image the chart renders, on both a
+default and a mirrored install; the build-time bases against their Dockerfile `ARG` defaults; the
+fluent-bit fallback baked into the operator binary; the example manifests; and the kustomize
+integrations, which it requires to name a variable this file owns rather than a literal.
+
+Two copies it does not reach, where a stale pin passes every check. An image behind a non-default
+chart toggle is never rendered, so Hindsight (`memory.provider`) and the GitHub token minter
+(`githubMinter.enabled`) keep unguarded pins in `charts/kube-agents/values.yaml`. And cert-manager's
+version is set again in `terraform/examples/full-install/variables.tf`, which no check reads.
+
+Bump the pin here, run `make images-check` and `make docs-generate`, then grep the tree for the old
+version before opening the pull request.
 
 <!-- BEGIN GENERATED: container-images -->
 <!-- Regenerate with: make docs-generate -- do not edit by hand. -->
@@ -42,9 +49,9 @@ Pinned here so `make mirror-images` and the install ask for the same version.
 | ----- | ------------------ | --- | -------- | --------- |
 | `litellm` | `ghcr.io/berriai/litellm` | `v1.96.2` | `LITELLM_IMAGE` | The LiteLLM gateway, from either the chart or the kustomize integration. |
 | `fluent-bit` | `docker.io/fluent/fluent-bit` | `5.1.0` | `FLUENT_BIT_IMAGE` | The logging sidecar the operator injects into every agent pod. |
-| `k8s` | `docker.io/alpine/k8s` | `1.34.9` | — | The chart's pre-delete cleanup hook Job. |
+| `k8s` | `docker.io/alpine/k8s` | `1.36.2` | — | The chart's pre-delete cleanup hook Job. |
 | `github-token-minter-server` | `us-docker.pkg.dev/abcxyz-artifacts/docker-images/github-token-minter-server` | `v2.7.1-amd64` | `GITHUB_MINTER_IMAGE` | The optional GitHub integration. |
-| `hindsight-api` | `ghcr.io/vectorize-io/hindsight-api` | `0.9.1@sha256:24a079bead8aa58e45d728bf535ea727bfe559d8784024b6b9f89d56646954ab` | `HINDSIGHT_API_IMAGE` | The chart, when the memory provider uses Hindsight (make deploy-hindsight for the kustomize dev path). |
+| `hindsight-api` | `ghcr.io/vectorize-io/hindsight-api` | `0.9.2@sha256:7b14a1f4062252992d0176758753615e0a2071d9a269995be007be223ab01812` | `HINDSIGHT_API_IMAGE` | The chart, when the memory provider uses Hindsight (make deploy-hindsight for the kustomize dev path). |
 | `hindsight-postgresql` | `docker.io/ankane/pgvector` | `latest@sha256:956744bd14e9cbdf639c61c2a2a7c7c2c48a9c8cdd42f7de4ac034f4e96b90f8` | `HINDSIGHT_POSTGRES_IMAGE` | The chart, alongside the Hindsight API. |
 | `cert-manager-controller` | `quay.io/jetstack/cert-manager-controller` | `v1.21.1` | — | cert-manager, installed by the full-install composition unless enable_cert_manager is false. |
 | `cert-manager-cainjector` | `quay.io/jetstack/cert-manager-cainjector` | `v1.21.1` | — | cert-manager, installed by the full-install composition unless enable_cert_manager is false. |
@@ -59,9 +66,9 @@ Needed only to rebuild the images above from source, not to run an install. Each
 | Image | Upstream reference | Pin | Override | Pulled by |
 | ----- | ------------------ | --- | -------- | --------- |
 | `hermes-agent` | `docker.io/nousresearch/hermes-agent` | `HERMES_AGENT_TAG` in [`tags.env`](https://github.com/gke-labs/kube-agents/blob/main/tags.env) | `HERMES_AGENT_IMAGE` | deploy/docker/Dockerfile (agent-base stage). |
-| `envoy` | `docker.io/envoyproxy/envoy` | `v1.39.0` | `ENVOY_IMAGE` | deploy/docker/Dockerfile (envoy-bin stage). |
-| `golang` | `docker.io/library/golang` | `1.26-alpine` | `GOLANG_IMAGE` | deploy/docker/Dockerfile and k8s-operator/Dockerfile builder stages. |
-| `python` | `docker.io/library/python` | `3.11-slim` | `PYTHON_IMAGE` | examples/inference-replay/replay-proxy/Dockerfile. |
+| `envoy` | `docker.io/envoyproxy/envoy` | `v1.39.1` | `ENVOY_IMAGE` | deploy/docker/Dockerfile (envoy-bin stage). |
+| `golang` | `docker.io/library/golang` | `1.27-alpine` | `GOLANG_IMAGE` | deploy/docker/Dockerfile and k8s-operator/Dockerfile builder stages. |
+| `python` | `docker.io/library/python` | `3.14-slim` | `PYTHON_IMAGE` | examples/inference-replay/replay-proxy/Dockerfile. |
 | `distroless-static` | `gcr.io/distroless/static` | `nonroot` | `DISTROLESS_IMAGE` | k8s-operator/Dockerfile runtime stage. |
 
 <!-- prettier-ignore-end -->

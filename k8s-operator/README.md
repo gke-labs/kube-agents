@@ -12,7 +12,7 @@ The operator is built using the Kubebuilder framework and is written in Go.
 
 Before building or deploying the operator, ensure you have the following installed:
 
-- [Go](https://go.dev/doc/install) (version 1.26+)
+- [Go](https://go.dev/doc/install) (version 1.27+)
 - [Docker](https://docs.docker.com/get-docker/) or Podman (for building container images)
 - [kubectl](https://kubernetes.io/docs/tasks/tools/) (configured to access your Kubernetes/GKE cluster)
 - Access to a running Kubernetes/GKE cluster

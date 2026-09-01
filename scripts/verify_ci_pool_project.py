@@ -96,6 +96,36 @@ MINTER_KSA = "kubeagents-system/kubeagents-github-minter"
 # is what makes it a usable identity probe rather than just a reachability test.
 GITHUB_APP_URL = "https://api.github.com/app"
 
+# The read-only App the EVAL RUNNER grades ledger issues with, which is not the
+# minter App above. hack/ci-eval-pr.sh mints an installation token from it into
+# BENCH_GITHUB_TOKEN before each devops-bench invocation; a test pins these two
+# to that script, so changing the App there cannot leave this check attesting a
+# credential CI no longer uses.
+LEDGER_APP_ID = 4739812
+LEDGER_INSTALLATION_ID = 157029058
+GITHUB_INSTALLATION_TOKEN_URL = (
+    "https://api.github.com/app/installations/{installation}/access_tokens"
+)
+
+# Its private key, read from the cluster rather than the operator's disk: a
+# local copy answers a question nobody asked. `build-kube-agents` is the Prow
+# cluster ALIAS the prowjob names, not a GKE cluster.
+LEDGER_KEY_SECRET = "kube-agents-evals-ledger-app-key"
+LEDGER_KEY_SECRET_ENTRY = "key.pem"
+LEDGER_KEY_NAMESPACE = "test-pods"
+PROW_BUILD_CLUSTER = "kube-agents-prow"
+PROW_BUILD_CLUSTER_ZONE = "us-west1-b"
+PROW_BUILD_CLUSTER_PROJECT = "kube-agents-prow"
+
+# One issue is enough: the question is whether the read is permitted, not what
+# the repository contains. state=all because a repository whose only ledger
+# issue has been closed still has to be readable. Not the call
+# `ledger_issue_contains` makes -- that fetches an issue by number, and a
+# candidate project has none yet -- but the same permission: listing a private
+# repository's issues needs `issues: read`. The installation's repository list
+# needs only `metadata: read`, so it would have passed the evals-6 case.
+GITHUB_ISSUES_URL = "https://api.github.com/repos/{repo}/issues?per_page=1&state=all"
+
 # GitHub rejects an App JWT whose `exp` is more than ten minutes ahead. Building
 # the payload, shelling out to gcloud, and the round trip all elapse between
 # reading the clock and GitHub reading the claim, so exactly 600 sits on the
@@ -257,6 +287,16 @@ _DENIAL_PATTERNS = (
     re.compile(r"\(http 403\)", re.I),
     re.compile(r"insufficient authentication scopes", re.I),
     re.compile(r"resource not accessible", re.I),
+    # kubectl's RBAC denial: `Error from server (Forbidden): secrets "x" is
+    # forbidden: User "y" cannot get resource "secrets" in API group "" in the
+    # namespace "test-pods"`. It carries no status code, so none of the 403
+    # patterns above see it and a refused read of the ledger App key would report
+    # as an absent secret. The second form keeps the quote the API server always
+    # prints: a denial read as absence is the error worth catching, but so is the
+    # reverse -- `_denial_reason` turns a failure into unverified, so a pattern
+    # loose enough to match `cannot find resource` would mask a real one.
+    re.compile(r"error from server \(forbidden\)", re.I),
+    re.compile(r'cannot \w+ resource "', re.I),
 )
 
 # Not refusals, but not reads either. A call that timed out and a credential
@@ -543,9 +583,10 @@ def check_codebase_mapping(project_id: str) -> CheckResult:
     because Prow builds an eval run from main plus that run's own pull
     request rather than from this branch. A row that exists only here is the
     evals-3 outage with the safety catch removed: the verdict line says the
-    project is safe to register, it is registered, and the next presubmit to
-    lease it stops at gitops_repo_for_project()'s refusal -- taking a share
-    of every open pull request's smoke test with it.
+    project is provisioned as the prerequisites describe, it is registered,
+    and the next presubmit to lease it exits 1 at ci-deploy.sh's unmapped-
+    project refusal -- taking a share of every open pull request's smoke test
+    with it.
 
     Missing from main is reported unverified rather than failed. The row is
     written and about to land, so this is a "not yet" for a human to time,
@@ -1500,6 +1541,252 @@ def check_github_repo_and_app(
     )
 
 
+def _read_ledger_app_key(timeout: int = 30) -> Tuple[Optional[str], str]:
+    """The ledger App's PEM, read out of the build cluster. Returns (pem, reason).
+
+    A None pem always carries a reason. Read from the cluster rather than from a
+    file the operator supplies: the question is whether the key CI mounts can see
+    the repository, and a local copy cannot answer it.
+    """
+    context = f"gke_{PROW_BUILD_CLUSTER_PROJECT}_{PROW_BUILD_CLUSTER_ZONE}_{PROW_BUILD_CLUSTER}"
+    credentials = (
+        f"gcloud container clusters get-credentials {PROW_BUILD_CLUSTER} "
+        f"--zone {PROW_BUILD_CLUSTER_ZONE} --project {PROW_BUILD_CLUSTER_PROJECT}"
+    )
+    rc, _, _ = run_cmd(["kubectl", "version", "--client=true"])
+    if rc == 127:
+        return None, "kubectl is not on PATH"
+    rc, out, err = run_cmd(
+        [
+            "kubectl", "--context", context,
+            "-n", LEDGER_KEY_NAMESPACE,
+            "get", "secret", LEDGER_KEY_SECRET,
+            "-o", f"jsonpath={{.data.{LEDGER_KEY_SECRET_ENTRY.replace('.', chr(92) + '.')}}}",
+        ],
+        timeout=timeout,
+    )
+    if rc != 0:
+        unread = _unread_reason(err)
+        if unread:
+            return None, f"the read was refused or did not complete: {unread}"
+        if "context" in err and "does not exist" in err:
+            return None, f"kubeconfig has no context {context}; run `{credentials}`"
+        return None, f"kubectl could not read the secret: {err.strip()[:200]}"
+    if not out.strip():
+        # The secret exists and the entry does not, which kubectl reports as an
+        # empty jsonpath rather than an error.
+        return None, (
+            f"secret {LEDGER_KEY_SECRET} in {LEDGER_KEY_NAMESPACE} has no "
+            f"{LEDGER_KEY_SECRET_ENTRY} entry"
+        )
+    try:
+        return base64.b64decode(out.strip()).decode("ascii"), ""
+    except (ValueError, UnicodeDecodeError) as exc:
+        return None, f"the stored {LEDGER_KEY_SECRET_ENTRY} is not a readable PEM ({exc})"
+
+
+def _mint_ledger_token(pem: str, timeout: int = 15) -> Tuple[Optional[str], str, str]:
+    """Trade the App key for an installation token. Returns (token, status, message).
+
+    status is one of {"ok", "failed", "unverified"}, and the token is only ever
+    returned, never logged: it is a live credential for every repository in the
+    installation.
+    """
+
+    def _b64(raw: bytes) -> bytes:
+        return base64.urlsafe_b64encode(raw).rstrip(b"=")
+
+    now = int(time.time())
+    header = _b64(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
+    payload = _b64(
+        json.dumps(
+            {
+                "iat": now - JWT_BACKDATE_SECONDS,
+                "exp": now + JWT_LIFETIME_SECONDS,
+                "iss": str(LEDGER_APP_ID),
+            },
+            separators=(",", ":"),
+        ).encode()
+    )
+    signing_input = header + b"." + payload
+
+    with tempfile.TemporaryDirectory(prefix="verify-ledger-") as tmpdir:
+        key_path = os.path.join(tmpdir, "key.pem")
+        in_path = os.path.join(tmpdir, "jwt.in")
+        sig_path = os.path.join(tmpdir, "jwt.sig")
+        # 0600 inside a 0700 directory. The PEM is the whole credential, and it
+        # is on disk only for the length of one openssl call.
+        with open(os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as fh:
+            fh.write(pem)
+        with open(in_path, "wb") as fh:
+            fh.write(signing_input)
+        rc, _, err = run_cmd([
+            "openssl", "dgst", "-sha256", "-sign", key_path, "-out", sig_path, in_path
+        ])
+        if rc == 127:
+            return None, "unverified", "openssl is not on PATH, so no JWT could be signed"
+        if rc != 0:
+            return None, "failed", (
+                f"the key in secret {LEDGER_KEY_SECRET} would not sign a JWT: {err.strip()[:200]}"
+            )
+        with open(sig_path, "rb") as fh:
+            signature = fh.read()
+
+    jwt = (signing_input + b"." + _b64(signature)).decode("ascii")
+    request = urllib.request.Request(
+        GITHUB_INSTALLATION_TOKEN_URL.format(installation=LEDGER_INSTALLATION_ID),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {jwt}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "kube-agents-verify-ci-pool-project",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            return None, "failed", (
+                f"GitHub rejected a JWT signed by secret {LEDGER_KEY_SECRET} (401). The stored key "
+                f"is not App {LEDGER_APP_ID}'s, which breaks ledger grading on every pool project"
+            )
+        if exc.code == 404:
+            return None, "failed", (
+                f"App {LEDGER_APP_ID} has no installation {LEDGER_INSTALLATION_ID} (404). It was "
+                "uninstalled from gke-agentic, or the id moved; ledger grading is broken pool-wide"
+            )
+        return None, "unverified", (
+            f"GitHub answered HTTP {exc.code} ({exc.reason}) instead of minting a token"
+        )
+    except Exception as exc:  # timeout, DNS, blocked egress, untrusted CA
+        remedy = (
+            "point SSL_CERT_FILE at a CA bundle (/etc/ssl/cert.pem on macOS) and re-run"
+            if "CERTIFICATE_VERIFY_FAILED" in str(exc)
+            else "re-run from somewhere with egress to api.github.com"
+        )
+        return None, "unverified", (
+            f"Could not reach api.github.com to mint a token ({type(exc).__name__}: {exc}); {remedy}"
+        )
+
+    # The mint response carries the installation's scope, so the containment
+    # boundary costs no extra call. `all` would still read this project's issues
+    # and pass every check below -- and would also read every other gke-agentic
+    # repository, most of which are not pool infrastructure. Only an explicit
+    # `all` fails: an absent key is GitHub changing its response, not a flip.
+    if body.get("repository_selection") == "all":
+        return None, "failed", (
+            f"App {LEDGER_APP_ID}'s installation {LEDGER_INSTALLATION_ID} is "
+            "repository_selection: all, so it reads every gke-agentic repository rather than the "
+            "pool's. Set it back to `selected` with the -infra repositories listed"
+        )
+
+    token = body.get("token")
+    if not token:
+        return None, "unverified", "GitHub's mint response carried no token"
+    return token, "ok", ""
+
+
+def check_ledger_read_credential(project_id: str, timeout: int = 15) -> CheckResult:
+    """Verify the credential the eval runner grades ledgers with can read this repo's issues.
+
+    Every other GitHub check here covers the WRITE half: the minter App that lets
+    a run publish its ledger issue. This is the read half, and it is a different
+    App with a different key. `ledger_issue_contains`
+    (bench/kube_agents_bench/verifiers.py) reads the published issue back from
+    the Prow runner, needing `issues: read` and nothing else. Nothing in the
+    project implies it, and nothing else here looks at it.
+
+    kube-agents-evals-6 is why this exists. It passed every other check, was
+    registered, and redded the first pull request that leased it: the agent filed
+    the ledger correctly and the grader got a 404 reading it back
+    (gke-labs/kube-agents#994). The provisioning half was verified and the
+    grading half was not, and the grading half is the one that failed.
+
+    Deliberately NOT read through `gh`. The operator running this script is an
+    org member with broad access, so `gh api` answers 200 for a repository the
+    CI credential cannot see -- a pass on precisely the question. Only that
+    credential can answer it, so a key this cannot reach is unverified, never a
+    pass.
+    """
+    name = "Ledger Read Credential"
+    repo_slug = f"gke-agentic/{project_id}-infra"
+
+    pem, reason = _read_ledger_app_key()
+    if pem is None:
+        return CheckResult(name, True, "Not checked", warnings=[
+            f"Not checked: {reason}, so nothing here says whether the eval runner can read "
+            f"{repo_slug}'s issues -- the read that failed on kube-agents-evals-6's first lease. "
+            f"The key is secret {LEDGER_KEY_SECRET} ({LEDGER_KEY_SECRET_ENTRY}) in namespace "
+            f"{LEDGER_KEY_NAMESPACE} on cluster {PROW_BUILD_CLUSTER}"
+        ])
+
+    token, status, message = _mint_ledger_token(pem, timeout=timeout)
+    if status == "failed":
+        return CheckResult(name, False, "Ledger issues not readable", details=[message])
+    if token is None:
+        return CheckResult(name, True, "Not checked", warnings=[
+            f"{message}, so the eval runner's access to {repo_slug}'s issues is unknown"
+        ])
+
+    request = urllib.request.Request(
+        GITHUB_ISSUES_URL.format(repo=repo_slug),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "kube-agents-verify-ci-pool-project",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            response.read()
+    except urllib.error.HTTPError as exc:
+        # A 403 is two different answers. Rate limiting is a limit of the moment
+        # and leaves the question open; anything else is the token reaching the
+        # repository without `issues: read`, which is a real failure and the one
+        # a blanket "403 is unverified" would hide.
+        if exc.code == 403 and (exc.headers or {}).get("x-ratelimit-remaining") == "0":
+            return CheckResult(
+                name,
+                True,
+                "Not checked",
+                warnings=[
+                    f"GitHub rate-limited the read of {repo_slug}'s issues, so the eval runner's "
+                    "access to them was never established. Re-run when the limit resets"
+                ],
+            )
+        if exc.code == 403:
+            return CheckResult(name, False, "Ledger issues not readable", details=[
+                f"App {LEDGER_APP_ID} reaches {repo_slug} but is refused its issues "
+                f"(403 {exc.reason}). Its installation needs `issues: read`, which is a pool-wide "
+                f"permission rather than anything about {project_id}; accept it and re-run"
+            ])
+        if exc.code == 404:
+            return CheckResult(name, False, "Ledger issues not readable", details=[
+                f"App {LEDGER_APP_ID} cannot see {repo_slug} at all (404). Its installation is "
+                "repository_selection: selected, so add this repository to it -- see section 5.4 "
+                "of deploy/ci-pool-projects.md. (The same 404 covers a repository that does not "
+                "exist; the check above settles which.)"
+            ])
+        return CheckResult(name, True, "Not checked", warnings=[
+            f"GitHub answered HTTP {exc.code} ({exc.reason}) instead of allowing or refusing the "
+            f"read of {repo_slug}'s issues, so the eval runner's access is unknown. Re-run when "
+            "it clears"
+        ])
+    except Exception as exc:  # timeout, DNS, blocked egress, untrusted CA
+        remedy = (
+            "point SSL_CERT_FILE at a CA bundle (/etc/ssl/cert.pem on macOS) and re-run"
+            if "CERTIFICATE_VERIFY_FAILED" in str(exc)
+            else "re-run from somewhere with egress to api.github.com"
+        )
+        return CheckResult(name, True, "Not checked", warnings=[
+            f"Could not reach api.github.com to read {repo_slug}'s issues "
+            f"({type(exc).__name__}: {exc}), so the eval runner's access is unknown; {remedy}"
+        ])
+
+    return CheckResult(name, True, f"App {LEDGER_APP_ID} can read {repo_slug}'s issues")
+
+
 def _probe_github_app_identity(
     project_id: str, location: str, version: str, app_id: int, timeout: int = 15
 ) -> Tuple[str, str]:
@@ -1939,6 +2226,7 @@ def run_checks(
     checks.append(check_gke_and_state(project_id))
     checks.append(check_seeded_fleet_fixtures(project_id))
     checks.append(check_github_repo_and_app(project_id, app_id, repo_membership_confirmed))
+    checks.append(check_ledger_read_credential(project_id))
     checks.append(check_token_minter(project_id, app_id, location))
     return checks
 
@@ -1999,7 +2287,7 @@ def report(project_id: str, checks: List[CheckResult]) -> int:
         )
         status = EXIT_UNVERIFIED
     else:
-        print(f"ALL CHECKS PASSED. Project {project_id} is safe to register in Boskos.")
+        print(f"ALL CHECKS PASSED. Project {project_id} is provisioned as the prerequisites describe.")
         status = EXIT_OK
     print("-" * 80 + "\n")
     return status

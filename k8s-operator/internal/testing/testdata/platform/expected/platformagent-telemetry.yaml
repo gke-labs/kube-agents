@@ -388,7 +388,6 @@ apiVersion: v1
 data:
   SETTINGS.md: |
     # GKE Scope Configuration
-    - **Git Repo:** None
 kind: ConfigMap
 metadata:
   labels:
@@ -397,6 +396,24 @@ metadata:
     app.kubernetes.io/name: platform-agent
     app.kubernetes.io/part-of: kube-agents
   name: platformagent-settings
+  namespace: kubeagents-system
+  ownerReferences:
+    - apiVersion: kubeagents.x-k8s.io/v1alpha1
+      blockOwnerDeletion: true
+      controller: true
+      kind: PlatformAgent
+      name: platformagent
+      uid: ""
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  labels:
+    app.kubernetes.io/instance: kubeagents-system-platformagent
+    app.kubernetes.io/managed-by: platformagent-controller
+    app.kubernetes.io/name: platform-agent
+    app.kubernetes.io/part-of: kube-agents
+  name: platformagent-gitops-state
   namespace: kubeagents-system
   ownerReferences:
     - apiVersion: kubeagents.x-k8s.io/v1alpha1
@@ -504,6 +521,10 @@ spec:
               value: cluster-internal-trusted
             - name: SESSION_KV_DB_PATH
               value: /var/lib/kube-agents/session/session_kv.db
+            - name: GITOPS_STATE_CONFIGMAP
+              value: platformagent-gitops-state
+            - name: GITOPS_STATE_PATH
+              value: /etc/gitops/managed_repos
             - name: SESSION_KV_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -617,6 +638,9 @@ spec:
             - mountPath: /var/lib/kube-agents/session
               name: system-metadata
               subPath: session
+            - mountPath: /etc/gitops
+              name: gitops-state-volume
+              readOnly: true
             - mountPath: /tmp
               name: tmp-scratch
         - args:
@@ -767,8 +791,14 @@ spec:
               value: /var/run/secrets/kubeagents/serviceaccount/token
             - name: TOKEN_BROKER_URL
               value: http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token
+            - name: GITOPS_STATE_CONFIGMAP
+              value: platformagent-gitops-state
+            - name: GITOPS_STATE_PATH
+              value: /etc/gitops/managed_repos
             - name: API_SERVER_KEY
               value: cluster-internal-trusted
+            - name: CREDENTIAL_PROXY_SCOPED_SA_POOL
+              value: "0"
             - name: AGENT_API_PROXY_PORT
               value: "8643"
             - name: AGENT_API_UPSTREAM_KEY
@@ -826,7 +856,6 @@ spec:
                 - http://127.0.0.1:8765/healthz
             initialDelaySeconds: 5
             periodSeconds: 15
-          restartPolicy: Always
           resources:
             limits:
               cpu: "2"
@@ -835,6 +864,7 @@ spec:
             requests:
               cpu: 150m
               memory: 384Mi
+          restartPolicy: Always
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -864,6 +894,9 @@ spec:
               readOnly: true
             - mountPath: /opt/data
               name: platform-agent-data-vol
+            - mountPath: /etc/gitops
+              name: gitops-state-volume
+              readOnly: true
       securityContext:
         fsGroup: 10000
         runAsGroup: 10000
@@ -902,6 +935,10 @@ spec:
             defaultMode: 420
             name: platformagent-settings
           name: settings-volume
+        - configMap:
+            defaultMode: 420
+            name: platformagent-gitops-state
+          name: gitops-state-volume
         - emptyDir:
             sizeLimit: 2Gi
           name: tmp-scratch

@@ -80,6 +80,11 @@ steps:
 
         # Deployment targets are always amd64 GKE nodes; the multi-arch bases
         # otherwise resolve to the build host (#560).
+        #
+        # KUBE_AGENTS_VERSION is the User-Agent this image's remote MCP calls
+        # send. hack/ci-deploy.sh passes the pull-request tag, so an evaluation
+        # cluster's traffic reads as `kube-agents/pr-1234-abc1234` in the
+        # serving team's logs rather than being counted as a release.
         docker build \
           --platform linux/amd64 \
           -t "$_PLATFORM_URI" \
@@ -87,6 +92,7 @@ steps:
           -f deploy/docker/Dockerfile \
           --target platform \
           --build-arg HERMES_AGENT_TAG="$_HERMES_AGENT_TAG" \
+          --build-arg KUBE_AGENTS_VERSION="$_KUBE_AGENTS_VERSION" \
           .
 
   # No waitFor: this runs straight after platform on the same worker, which is
@@ -161,4 +167,5 @@ substitutions:
   _BUILDCACHE_IMAGE: ""
   _PROXY_BUILDCACHE_IMAGE: ""
   _HERMES_AGENT_TAG: ""
+  _KUBE_AGENTS_VERSION: "dev"
   _REQUIRE_CACHE: "false"

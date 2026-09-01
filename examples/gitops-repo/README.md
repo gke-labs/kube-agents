@@ -2,7 +2,7 @@
 
 This is the **template customers fork** as their kube-agents GitOps repo — the single source of truth
 for desired state (`05` C13). It is separate from the kube-agents source tree; agents check it out
-via `integration.github.gitRepo` and `submit-suggestion` opens PRs against it. Layout defined in
+dynamically into the agent workspace and `submit-suggestion` opens PRs against it. Layout defined in
 [`docs/architecture/06-api-and-data-contracts.md` §3](../../docs/architecture/06-api-and-data-contracts.md).
 
 ```

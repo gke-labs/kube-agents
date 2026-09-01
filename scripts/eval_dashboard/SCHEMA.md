@@ -109,6 +109,14 @@ below).
 - `ov_history` — `{build_id, value}` per run that recorded an
   OutcomeValidity, oldest first.
 
+### Optional top-level fields
+
+Additive, optional, and safe to omit — consumers must default them.
+
+- `stale_after_s` — seconds after `generated_at` beyond which the rendered
+  page labels itself `STALE`. No collector version emits it yet; the
+  renderer defaults to `7200` when it is absent.
+
 ### `coverage` — from `docs/designs/domains.yaml`
 
 - `domains_total` — number of entries under `domains:`.

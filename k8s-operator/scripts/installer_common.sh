@@ -657,6 +657,22 @@ write_tfvars_from_state() {
   # RuntimeClass natively and has no pool to manage, so asking the gke-cluster
   # module for one there fails the plan. Deriving both from the probed
   # cluster_mode keeps --gvisor=true meaning the same thing on either shape.
+  #
+  # The fallback stays false even though a fresh install now defaults to the
+  # sandbox. install.sh owns that default and always writes the result to
+  # vars.sh before sourcing it and calling this function, so the fallback here
+  # never decides a new install — it only decides the callers that read an
+  # install that already exists. uninstall.sh is the one that matters: vars.sh
+  # is optional there, and the documented `curl … | bash` teardown runs from a
+  # fresh clone that has none. Defaulting on for that caller would let the
+  # Autopilot version-floor check below abort a destroy, leaving an install
+  # with no working way to remove itself.
+  #
+  # The fallback only reaches the teardown that has no vars.sh, which is not
+  # the ordinary one — a teardown from the checkout that installed sources a
+  # vars.sh saying ENABLE_GVISOR="true". uninstall.sh therefore exports false
+  # itself before calling this, and the comment there is where that argument
+  # lives. Do not read the fallback as protecting the teardown on its own.
   local gvisor_node_pool="false" agent_runtime_class=""
   if is_truthy "${ENABLE_GVISOR:-false}"; then
     agent_runtime_class="gvisor"
@@ -671,17 +687,18 @@ write_tfvars_from_state() {
       print_info "Creating Autopilot cluster '${CLUSTER_NAME}': using its built-in gvisor RuntimeClass, with no sandbox node pool to provision."
     else
       # Autopilot's gvisor RuntimeClass arrived in a specific GKE version, and
-      # asking an older cluster for it fails late and unrecognisably: the
-      # operator stops at its RuntimeClass check before writing the agent
-      # Deployment, the Helm release still reports success because that
-      # Deployment is operator-created rather than chart-rendered, and
-      # install.sh's post-apply gate exits 1 with "Expected deployment
-      # 'platform-agent-gateway' was not created" — after the cluster, IAM,
-      # KMS, cert-manager and the release have all been applied, naming
-      # nothing about a RuntimeClass. Refuse here instead, which is where the
-      # gke-cluster module's precondition refuses the equivalent Standard
-      # mistake. This branch is reached only when the describe above found a
-      # live Autopilot cluster, so there is always one to ask.
+      # asking an older cluster for it fails late: the operator stops at its
+      # RuntimeClass check before writing the agent Deployment, the Helm
+      # release still reports success because that Deployment is
+      # operator-created rather than chart-rendered, and install.sh's
+      # post-apply gate waits out its budget on a Deployment that is never
+      # coming and exits 1 — after the cluster, IAM, KMS, cert-manager and the
+      # release have all been applied. That gate does name the RuntimeClass,
+      # but it names it having already spent the apply. Refuse here instead,
+      # which is where the gke-cluster module's precondition refuses the
+      # equivalent Standard mistake. This branch is reached only when the
+      # describe above found a live Autopilot cluster, so there is always one
+      # to ask.
       #
       # `trap - ERR` as well as `|| true`, for the bash 3.2 reason the probe
       # above gives: a gcloud failure here is a best-effort miss, not an abort.
@@ -694,7 +711,8 @@ write_tfvars_from_state() {
         print_warning "Could not read the GKE version of Autopilot cluster '${CLUSTER_NAME}'; proceeding as though it supports GKE Sandbox. Below ${GVISOR_AUTOPILOT_MIN_VERSION} the agent Deployment is never created and this run fails at its final check."
       elif ! gke_version_at_least "$master_version" "$GVISOR_AUTOPILOT_MIN_VERSION"; then
         print_error "Autopilot cluster '${CLUSTER_NAME}' runs GKE ${master_version}, and its gvisor RuntimeClass needs ${GVISOR_AUTOPILOT_MIN_VERSION} or later."
-        print_info "Upgrade the cluster, or re-run with --gvisor=false. Continuing would apply every GCP and Helm resource and then fail on a missing agent Deployment."
+        print_info "Upgrade the cluster, or run the agent on the standard runtime: install.sh takes --gvisor=false, and upgrade.sh reads the choice from ENABLE_GVISOR in k8s-operator/scripts/vars.sh. Continuing would apply every GCP and Helm resource and then fail on a missing agent Deployment."
+        print_info "Tearing down instead? uninstall.sh forces ENABLE_GVISOR=false and is never blocked by this check; if you reach it from some other caller, export ENABLE_GVISOR=false first."
         return 1
       fi
       print_info "Cluster '${CLUSTER_NAME}' is Autopilot: using its built-in gvisor RuntimeClass, with no sandbox node pool to provision."

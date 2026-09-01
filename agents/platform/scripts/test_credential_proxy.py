@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import queue
+import re
 import socket
 import subprocess
 import sys
@@ -229,7 +230,10 @@ class GitLeaseGateTest(unittest.TestCase):
     def executor(self, **environment):
         with mock.patch.dict(os.environ, environment):
             return CommandExecutor(
-                timeout_seconds=5, max_output_bytes=1024, state_dir=self.temp_dir.name
+                timeout_seconds=5,
+                max_output_bytes=1024,
+                state_dir=self.temp_dir.name,
+                scoped_pool=None,
             )
 
     def leased(self, executor, lease="compliance-audit", repo="acme__fleet"):
@@ -1297,6 +1301,7 @@ class GitLeaseGateWiringTest(unittest.TestCase):
             timeout_seconds=5,
             max_output_bytes=4096,
             state_dir=str(Path(self.temp_dir.name) / "state"),
+            scoped_pool=None,
         )
         CredentialProxyHandler.max_request_bytes = 65536
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
@@ -1384,6 +1389,7 @@ class CommandExecutorTest(unittest.TestCase):
             timeout_seconds=timeout_seconds,
             max_output_bytes=max_output_bytes,
             state_dir=self.temp_dir.name,
+            scoped_pool=None,
         )
 
     def caller_kubeconfig(self, executor, name="kubeconfig.yaml", body=None):
@@ -1542,11 +1548,21 @@ class CommandExecutorTest(unittest.TestCase):
         managed = self.seed_managed(executor)
         pinned = self.caller_kubeconfig(executor)
 
-        joined = executor._reroute_kubeconfig_flags(["kubectl", f"--kubeconfig={pinned}", "get", "pods"])
-        separate = executor._reroute_kubeconfig_flags(["kubectl", "--kubeconfig", str(pinned), "get", "pods"])
+        joined, joined_path = executor._reroute_kubeconfig_flags(
+            ["kubectl", f"--kubeconfig={pinned}", "get", "pods"]
+        )
+        separate, separate_path = executor._reroute_kubeconfig_flags(
+            ["kubectl", "--kubeconfig", str(pinned), "get", "pods"]
+        )
 
         self.assertEqual(["kubectl", f"--kubeconfig={managed}", "get", "pods"], joined)
         self.assertEqual(["kubectl", "--kubeconfig", str(managed), "get", "pods"], separate)
+        self.assertEqual(managed, joined_path)
+        self.assertEqual(managed, separate_path)
+
+        untouched, no_path = executor._reroute_kubeconfig_flags(["kubectl", "get", "pods"])
+        self.assertEqual(["kubectl", "get", "pods"], untouched)
+        self.assertIsNone(no_path, "a request with no flag must not report one")
 
     def test_kubeconfig_flag_outside_the_workspace_is_still_refused(self):
         executor = self.executor()
@@ -2798,6 +2814,11 @@ class ServeArmsTheReadOnlyGateTest(unittest.TestCase):
         environment = {
             "API_SERVER_EXTERNAL_KEY": "external",
             "CREDENTIAL_PROXY_BOOTSTRAP_COMMAND": "",
+            # The pool is off by default (2026-08-12), so this line is
+            # belt-and-braces: the case drives `serve` for an unrelated
+            # property with no pool mapping mounted, and says so explicitly
+            # rather than leaning on the default.
+            "CREDENTIAL_PROXY_SCOPED_SA_POOL": "0",
         }
         if enforce_value is not None:
             environment["CREDENTIAL_PROXY_ENFORCE_READ_ONLY"] = enforce_value
@@ -3245,7 +3266,14 @@ class BackendSocketModeTest(unittest.TestCase):
             )
             previous_umask = os.umask(0o000)
             try:
-                with mock.patch.dict(os.environ, {"API_SERVER_EXTERNAL_KEY": "external"}, clear=True), \
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "API_SERVER_EXTERNAL_KEY": "external",
+                        "CREDENTIAL_PROXY_SCOPED_SA_POOL": "0",
+                    },
+                    clear=True,
+                ), \
                         mock.patch.object(credential_proxy, "ThreadingHTTPServer", mock.MagicMock()), \
                         mock.patch.object(credential_proxy.threading, "Thread", FakeThread), \
                         mock.patch.object(credential_proxy.ThreadingUnixHTTPServer, "serve_forever", stop):
@@ -3882,6 +3910,7 @@ class ServeRefusesAnUnauthenticatedTCPListenerTest(unittest.TestCase):
             "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
             "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent",
             "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_SCOPED_SA_POOL": "0",
         }
         original = CredentialProxyHandler.__dict__.get("authenticator")
         try:
@@ -4026,6 +4055,811 @@ class AuthenticationOverTheSocketTest(unittest.TestCase):
         with self.assertRaises(urllib.error.HTTPError) as raised:
             urllib.request.urlopen(request)
         self.assertEqual(401, raised.exception.code)
+
+
+class ScopedServiceAccountPathTest(unittest.TestCase):
+    """The pool as the broker actually reaches it, not as a unit.
+
+    `test_scoped_sa_pool.py` covers selection and refusal in isolation. What is
+    left, and what a mutation run showed the unit tests could not see, is the
+    join: that a proxied `kubectl` is really handed the scoped credential, and
+    that no path through `execute` reaches a cluster without going past
+    selection first. Both are asserted against a real subprocess reading a real
+    file, because the failure mode here is a command that runs perfectly well on
+    the wrong identity.
+    """
+
+    PROJECT = "kagents-dev"
+    LOCATION = "us-east4"
+    MAPPED = "mapped-cluster"
+    UNMAPPED = "unmapped-cluster"
+    EMAIL = "ka-mapped-cluster-1a2b3c4d@kagents-dev.iam.gserviceaccount.com"
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.minted = []
+        # The stubbed `gcloud container clusters get-credentials` appends the
+        # context it was asked for here. Selection has to happen before that
+        # call, so for a refused cluster this file must stay empty -- and an
+        # assertion that only checks the exception passes with the two swapped.
+        self.get_credentials_log = Path(self.temp_dir.name) / "get-credentials.log"
+
+    def gke_calls(self):
+        if not self.get_credentials_log.exists():
+            return []
+        return self.get_credentials_log.read_text(encoding="utf-8").split()
+
+    def pool(self, *, clusters=(MAPPED,)):
+        import scoped_sa_pool
+
+        members = scoped_sa_pool.parse_pool(
+            {
+                "version": 1,
+                "serviceAccounts": [
+                    {
+                        "projectId": self.PROJECT,
+                        "location": self.LOCATION,
+                        "clusterName": cluster,
+                        "serviceAccountEmail": self.EMAIL,
+                    }
+                    for cluster in clusters
+                ],
+            }
+        )
+
+        def minter(account, lifetime):
+            self.minted.append(account)
+            return f"TOKEN-{len(self.minted)}", 1_000_000.0
+
+        return scoped_sa_pool.ScopedServiceAccountPool(
+            members, minter=minter, clock=lambda: 0.0
+        )
+
+    def executor(self, scoped_pool):
+        executor = CommandExecutor(
+            timeout_seconds=30,
+            max_output_bytes=1 << 16,
+            state_dir=str(Path(self.temp_dir.name) / "state"),
+            scoped_pool=scoped_pool,
+        )
+        executor.environment["GET_CREDENTIALS_LOG"] = str(self.get_credentials_log)
+        self.fake_gcloud(executor)
+        self.fake_kubectl(executor)
+        return executor
+
+    def ambient_kubeconfig(self, executor, cluster):
+        """Point the sidecar's own KUBECONFIG at a cluster.
+
+        Not the agent's file -- this is the one `bootstrap` would have had
+        gcloud write. Several assertions below only mean what they say when the
+        ambient cluster and the requested cluster differ.
+        """
+        managed = Path(executor.environment["KUBECONFIG"])
+        managed.parent.mkdir(parents=True, exist_ok=True)
+        managed.write_text(
+            "apiVersion: v1\nkind: Config\n"
+            f"current-context: gke_{self.PROJECT}_{self.LOCATION}_{cluster}\n",
+            encoding="utf-8",
+        )
+        return managed
+
+    def fake_gcloud(self, executor):
+        """A `get-credentials` that writes what the real one writes.
+
+        The exec stanza is the point: it is what makes the unmodified kubeconfig
+        authenticate as the ambient identity, so a test that omitted it would
+        pass whether or not the swap happened.
+        """
+        stub_dir = Path(self.temp_dir.name) / "fake-bin"
+        stub_dir.mkdir(parents=True, exist_ok=True)
+        stub = stub_dir / "gcloud"
+        stub.write_text(
+            textwrap.dedent(
+                """\
+                #!/bin/bash
+                set -u
+                project=""; location=""; cluster=""
+                for arg in "$@"; do
+                    case "$arg" in
+                        --project=*) project="${arg#--project=}" ;;
+                        --location=*) location="${arg#--location=}" ;;
+                        container|clusters|get-credentials|--*) ;;
+                        *) [ -n "$cluster" ] || cluster="$arg" ;;
+                    esac
+                done
+                ctx="gke_${project}_${location}_${cluster}"
+                echo "$ctx" >> "$GET_CREDENTIALS_LOG"
+                cat > "$KUBECONFIG" <<YAML
+                apiVersion: v1
+                kind: Config
+                current-context: ${ctx}
+                clusters:
+                - name: ${ctx}
+                  cluster:
+                    server: https://198.51.100.1
+                contexts:
+                - name: ${ctx}
+                  context:
+                    cluster: ${ctx}
+                    user: ${ctx}
+                users:
+                - name: ${ctx}
+                  user:
+                    exec:
+                      apiVersion: client.authentication.k8s.io/v1beta1
+                      command: gke-gcloud-auth-plugin
+                YAML
+                """
+            ),
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        executor.executables["gcloud"] = str(stub)
+        return executor
+
+    def fake_kubectl(self, executor):
+        """A kubectl that prints the kubeconfig it was actually given.
+
+        Reading the file back out of the subprocess is what makes this a test of
+        the join rather than of a helper: it fails if the credential is right in
+        `_kubeconfig_for` and never reaches the process.
+        """
+        stub_dir = Path(self.temp_dir.name) / "fake-bin"
+        stub_dir.mkdir(parents=True, exist_ok=True)
+        stub = stub_dir / "kubectl"
+        stub.write_text(
+            '#!/bin/bash\necho "KUBECONFIG=$KUBECONFIG"\ncat "$KUBECONFIG"\n',
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        executor.executables["kubectl"] = str(stub)
+        return executor
+
+    def agent_kubeconfig(self, executor, cluster):
+        """The pin a Cluster Agent profile forwards: a name, not a credential."""
+        path = executor.workspace_dir / f"{cluster}-kubeconfig.yaml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"apiVersion: v1\nkind: Config\n"
+            f"current-context: gke_{self.PROJECT}_{self.LOCATION}_{cluster}\n",
+            encoding="utf-8",
+        )
+        return str(path)
+
+    def test_a_read_against_a_mapped_cluster_runs_on_that_cluster_s_account(self):
+        """The ordinary read, and the assertion that it changed identity.
+
+        Both halves matter. Exit code 0 alone would pass with the ambient
+        credential; the token alone would pass on a broker that had stopped
+        working.
+        """
+        executor = self.executor(self.pool())
+        result = executor.execute(
+            ["kubectl", "get", "pods"],
+            kubeconfig=self.agent_kubeconfig(executor, self.MAPPED),
+        )
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertIn("token: TOKEN-1", result.stdout)
+        self.assertEqual([self.EMAIL], self.minted)
+
+    def test_the_exec_plugin_does_not_survive_into_the_subprocess(self):
+        """Otherwise the ambient identity is still one kubectl preference away."""
+        executor = self.executor(self.pool())
+        result = executor.execute(
+            ["kubectl", "get", "pods"],
+            kubeconfig=self.agent_kubeconfig(executor, self.MAPPED),
+        )
+        self.assertNotIn("gke-gcloud-auth-plugin", result.stdout)
+        self.assertNotIn("exec:", result.stdout)
+
+    def test_an_unmapped_cluster_is_refused_and_nothing_runs(self):
+        import scoped_sa_pool
+
+        executor = self.executor(self.pool())
+        with self.assertRaises(scoped_sa_pool.PoolRefusal):
+            executor.execute(
+                ["kubectl", "get", "pods"],
+                kubeconfig=self.agent_kubeconfig(executor, self.UNMAPPED),
+            )
+        self.assertEqual([], self.minted)
+
+    def test_the_refusal_happens_before_gke_is_asked_anything(self):
+        """Order, asserted rather than commented.
+
+        `_kubeconfig_for` selects and then materialises. Swapping the two lines
+        leaves every other test in this class green -- the refusal still raises,
+        just after a live `get-credentials` on the wide identity. The stubbed
+        gcloud records the contexts it was asked for, so this fails when the
+        order changes and nothing else does.
+
+        The control below is what makes the empty log mean something: the same
+        machinery on a mapped cluster does record a call.
+        """
+        import scoped_sa_pool
+
+        executor = self.executor(self.pool())
+        with self.assertRaises(scoped_sa_pool.PoolRefusal):
+            executor.execute(
+                ["kubectl", "get", "pods"],
+                kubeconfig=self.agent_kubeconfig(executor, self.UNMAPPED),
+            )
+        self.assertEqual(
+            [],
+            self.gke_calls(),
+            "get-credentials ran for a cluster the pool refused, on the ambient "
+            "credential, before the refusal",
+        )
+
+        executor.execute(
+            ["kubectl", "get", "pods"],
+            kubeconfig=self.agent_kubeconfig(executor, self.MAPPED),
+        )
+        self.assertEqual(
+            [f"gke_{self.PROJECT}_{self.LOCATION}_{self.MAPPED}"],
+            self.gke_calls(),
+            "the served request did not reach get-credentials either, so the "
+            "empty log above says nothing about ordering",
+        )
+
+    def test_a_request_naming_no_kubeconfig_does_not_escape_onto_the_ambient_one(self):
+        """`KUBECONFIG` is in the base environment, so "no kubeconfig" is a cluster.
+
+        Without this branch a `kubectl get pods` with the field omitted runs
+        against the sidecar's own kubeconfig and its exec plugin — the ambient
+        identity, past the pool entirely. It is the one door the obvious
+        implementation leaves open, and it is invisible: the command works.
+        """
+        import scoped_sa_pool
+
+        executor = self.executor(self.pool())
+        with self.assertRaises(scoped_sa_pool.PoolRefusal):
+            executor.execute(["kubectl", "get", "pods"])
+
+    def test_that_same_request_succeeds_once_the_default_cluster_is_in_the_pool(self):
+        """The refusal above must be about the mapping, not about the path."""
+        executor = self.executor(self.pool(clusters=(self.MAPPED,)))
+        managed = Path(executor.environment["KUBECONFIG"])
+        managed.parent.mkdir(parents=True, exist_ok=True)
+        managed.write_text(
+            "apiVersion: v1\nkind: Config\n"
+            f"current-context: gke_{self.PROJECT}_{self.LOCATION}_{self.MAPPED}\n",
+            encoding="utf-8",
+        )
+        result = executor.execute(["kubectl", "get", "pods"])
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertIn("token: TOKEN-1", result.stdout)
+
+    def test_the_kubeconfig_flag_goes_through_selection_too(self):
+        """`--kubeconfig` outranks the environment in kubectl.
+
+        Closing only the forwarded field would leave the flag as the way round
+        the pool, exactly as it was the way round `_resolve_kubeconfig`.
+
+        The ambient kubeconfig is pointed at a **mapped** cluster on purpose. An
+        earlier version of this test left it unset, so a broker that ignored the
+        flag entirely still refused -- at the ambient path, for an unrelated
+        reason -- and the test passed with the flag rewrite deleted. Here,
+        ignoring the flag succeeds and only honouring it refuses.
+        """
+        import scoped_sa_pool
+
+        executor = self.executor(self.pool())
+        self.ambient_kubeconfig(executor, self.MAPPED)
+        with self.assertRaises(scoped_sa_pool.PoolRefusal):
+            executor.execute(
+                [
+                    "kubectl",
+                    f"--kubeconfig={self.agent_kubeconfig(executor, self.UNMAPPED)}",
+                    "get",
+                    "pods",
+                ]
+            )
+
+    def test_a_flag_naming_a_mapped_cluster_is_not_refused_by_the_ambient_one(self):
+        """The other side of the flag, and an availability bug it caught.
+
+        `execute` branched on the request's `kubeconfig` field alone, so a
+        request that named its cluster in argv fell through to the ambient
+        default and selected a *second* cluster. With the sidecar's own
+        kubeconfig naming something the pool does not cover, every flag-pinned
+        request to a mapped cluster was refused with "this request names no
+        cluster" -- after minting a token for the cluster it did name.
+
+        One mint, for the cluster the request asked about, and it runs.
+        """
+        executor = self.executor(self.pool())
+        self.ambient_kubeconfig(executor, self.UNMAPPED)
+        result = executor.execute(
+            [
+                "kubectl",
+                f"--kubeconfig={self.agent_kubeconfig(executor, self.MAPPED)}",
+                "get",
+                "pods",
+            ]
+        )
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertIn("token: TOKEN-1", result.stdout)
+        self.assertEqual([self.EMAIL], self.minted)
+
+    def test_a_flag_pinned_request_selects_once(self):
+        """Two selections for one request is not two controls.
+
+        Both clusters mapped, so the old behaviour did not refuse -- it minted
+        twice, once for the cluster argv named and once for the sidecar's, and
+        used the first. A test that only checked the exit code saw nothing.
+        """
+        executor = self.executor(self.pool(clusters=(self.MAPPED, self.UNMAPPED)))
+        self.ambient_kubeconfig(executor, self.UNMAPPED)
+        executor.execute(
+            [
+                "kubectl",
+                f"--kubeconfig={self.agent_kubeconfig(executor, self.MAPPED)}",
+                "get",
+                "pods",
+            ]
+        )
+        self.assertEqual(
+            1,
+            len(self.minted),
+            f"one request minted {len(self.minted)} tokens: {self.minted}",
+        )
+
+    def test_the_flag_beats_the_forwarded_environment(self):
+        """kubectl prefers --kubeconfig over KUBECONFIG, so selection must too.
+
+        The common shape on a real install: the profile exports KUBECONFIG,
+        the client forwards it as the request field, and argv also carries a
+        flag. The flag's cluster is the one kubectl reads, so a request whose
+        flag names a mapped cluster must not be refused because the
+        *environment's* cluster is unmapped -- and must not mint twice when
+        both are mapped.
+        """
+        executor = self.executor(self.pool())
+        result = executor.execute(
+            [
+                "kubectl",
+                f"--kubeconfig={self.agent_kubeconfig(executor, self.MAPPED)}",
+                "get",
+                "pods",
+            ],
+            kubeconfig=self.agent_kubeconfig(executor, self.UNMAPPED),
+        )
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertEqual(
+            [self.EMAIL],
+            self.minted,
+            "the flag named a mapped cluster; the environment's unmapped one "
+            "must neither refuse the request nor mint a token of its own",
+        )
+
+    def test_the_scoped_kubeconfig_is_not_readable_by_the_agent(self):
+        """It holds a bearer token for a cloud identity.
+
+        Two properties, and the mode is the weaker one: the file is under the
+        sidecar-only state dir rather than the shared workspace, so the agent has
+        no path to it at all. The mode is asserted because the process umask is
+        0002 for the shared-volume writes, and a token file inheriting that would
+        be group-readable by the group the agent is in.
+        """
+        executor = self.executor(self.pool())
+        executor.execute(
+            ["kubectl", "get", "pods"],
+            kubeconfig=self.agent_kubeconfig(executor, self.MAPPED),
+        )
+        scoped = list(executor.kubeconfig_dir.glob("*.scoped.yaml"))
+        self.assertEqual(1, len(scoped), f"expected one scoped kubeconfig, got {scoped}")
+        self.assertEqual(0o600, scoped[0].stat().st_mode & 0o777)
+        self.assertFalse(
+            str(scoped[0]).startswith(str(executor.workspace_dir)),
+            "the scoped kubeconfig is on the volume the agent writes",
+        )
+
+    def test_the_ambient_path_is_unchanged_when_the_pool_is_off(self):
+        """The rollback has to be a real rollback."""
+        executor = self.executor(None)
+        result = executor.execute(
+            ["kubectl", "get", "pods"],
+            kubeconfig=self.agent_kubeconfig(executor, self.UNMAPPED),
+        )
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertIn("gke-gcloud-auth-plugin", result.stdout)
+        self.assertEqual([], self.minted)
+
+    def test_gcloud_with_a_forwarded_kubeconfig_stays_on_the_ambient_identity(self):
+        """The client forwards KUBECONFIG for gcloud too, and an agent always
+        has one exported -- so this is every gcloud call on a real install,
+        not an edge. Only kubectl changes identity: a forwarded kubeconfig
+        naming an unmapped cluster must not refuse a cloud-API read that has
+        nothing to do with Kubernetes objects, and one naming a mapped
+        cluster must not mint a token gcloud will never use.
+        """
+        executor = self.executor(self.pool())
+        for cluster in (self.UNMAPPED, self.MAPPED):
+            result = executor.execute(
+                ["gcloud", "logging", "read", "severity>=ERROR"],
+                kubeconfig=self.agent_kubeconfig(executor, cluster),
+            )
+            self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertEqual([], self.minted)
+
+    def test_a_kubeconfig_flag_on_a_non_kubectl_argv_does_not_reach_selection(self):
+        """git has no --kubeconfig flag of its own, so an agent-composed one
+        must not be the token that walks a git request into pool selection.
+        The real git would reject the flag; the property here is that the
+        broker neither minted nor refused before it got the chance to.
+        """
+        executor = self.executor(self.pool())
+        stub_dir = Path(self.temp_dir.name) / "fake-bin"
+        stub_dir.mkdir(parents=True, exist_ok=True)
+        stub = stub_dir / "git"
+        stub.write_text("#!/bin/bash\ntrue\n", encoding="utf-8")
+        stub.chmod(0o755)
+        executor.executables["git"] = str(stub)
+        executor.execute(
+            [
+                "git",
+                "status",
+                f"--kubeconfig={self.agent_kubeconfig(executor, self.MAPPED)}",
+            ]
+        )
+        self.assertEqual([], self.minted)
+
+    def test_git_and_gh_do_not_mint_a_cloud_token(self):
+        """They authenticate to GitHub. A GCP token for them would be pure blast radius."""
+        executor = self.executor(self.pool())
+        stub_dir = Path(self.temp_dir.name) / "fake-bin"
+        for name in ("git", "gh"):
+            stub = stub_dir / name
+            stub.write_text("#!/bin/bash\ntrue\n", encoding="utf-8")
+            stub.chmod(0o755)
+            executor.executables[name] = str(stub)
+        executor.execute(["gh", "pr", "view", "1"])
+        self.assertEqual([], self.minted)
+
+    def test_an_unparameterised_executor_takes_the_pool_from_the_environment(self):
+        """The executor reads the pool from the environment, and this is that line.
+
+        Every other test in this class injects a pool, so deleting the
+        `build_pool()` call in `__init__` would leave them all green while a
+        deployed broker silently ran ambient.
+        """
+        pool_file = Path(self.temp_dir.name) / "pool.json"
+        pool_file.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "serviceAccounts": [
+                        {
+                            "projectId": self.PROJECT,
+                            "location": self.LOCATION,
+                            "clusterName": self.MAPPED,
+                            "serviceAccountEmail": self.EMAIL,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                # Armed explicitly since 2026-08-12. The flag defaults off while
+                # pool members hold no authority, so the environment this test
+                # is about has to be spelled out rather than assumed.
+                "CREDENTIAL_PROXY_SCOPED_SA_POOL": "1",
+                "CREDENTIAL_PROXY_SCOPED_SA_POOL_FILE": str(pool_file),
+            },
+        ):
+            executor = CommandExecutor(
+                timeout_seconds=5,
+                max_output_bytes=1024,
+                state_dir=str(Path(self.temp_dir.name) / "auto"),
+            )
+        self.assertIsNotNone(executor.scoped_pool)
+        self.assertEqual(
+            [f"projects/{self.PROJECT}/locations/{self.LOCATION}/clusters/{self.MAPPED}"],
+            executor.scoped_pool.scopes,
+        )
+
+
+class ScopedServiceAccountOverTheSocketTest(unittest.TestCase):
+    """A refusal has to arrive as a refusal, over the wire.
+
+    Two separate claims live here. That an unmapped cluster is answered 403 with
+    its own rule id rather than as an unexplained 500 — an operator reading that
+    log has to be able to tell a missing pool entry from a broken broker. And
+    that nothing in the request body can choose the account, checked where it
+    matters: at the edge, against a body an agent could really send.
+    """
+
+    PROJECT = "kagents-dev"
+    LOCATION = "us-east4"
+    MAPPED = "mapped-cluster"
+    EMAIL = "ka-mapped-cluster-1a2b3c4d@kagents-dev.iam.gserviceaccount.com"
+    WIDE = "kubeagents-platform-gsa@kagents-dev.iam.gserviceaccount.com"
+
+    def setUp(self):
+        import scoped_sa_pool
+
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.minted = []
+
+        def minter(account, lifetime):
+            self.minted.append(account)
+            return "TOKEN", 1_000_000.0
+
+        members = scoped_sa_pool.parse_pool(
+            {
+                "version": 1,
+                "serviceAccounts": [
+                    {
+                        "projectId": self.PROJECT,
+                        "location": self.LOCATION,
+                        "clusterName": self.MAPPED,
+                        "serviceAccountEmail": self.EMAIL,
+                    }
+                ],
+            }
+        )
+        pool = scoped_sa_pool.ScopedServiceAccountPool(
+            members, minter=minter, clock=lambda: 0.0
+        )
+
+        policy_path = Path(self.temp_dir.name) / "policy.json"
+        policy_path.write_text(json.dumps({"rules": []}), encoding="utf-8")
+
+        self.saved = {
+            name: CredentialProxyHandler.__dict__.get(name)
+            for name in ("policy", "executor", "enforce_read_only", "max_request_bytes")
+        }
+        CredentialProxyHandler.policy = Policy.load(str(policy_path))
+        CredentialProxyHandler.executor = CommandExecutor(
+            timeout_seconds=10,
+            max_output_bytes=1 << 16,
+            state_dir=str(Path(self.temp_dir.name) / "state"),
+            scoped_pool=pool,
+        )
+        CredentialProxyHandler.max_request_bytes = 65536
+        CredentialProxyHandler.enforce_read_only = False
+        self.addCleanup(self._restore)
+
+        # Stubbed here rather than per-test. `execute` refuses an unavailable
+        # executable before it reaches the pool, so an unstubbed kubectl makes
+        # every refusal below pass for the wrong reason — a 500 that looks like
+        # a rejection if the assertion only checked "not 200".
+        self.stub_dir = Path(self.temp_dir.name) / "fake-bin"
+        self.stub_dir.mkdir(parents=True, exist_ok=True)
+        kubectl = self.stub_dir / "kubectl"
+        kubectl.write_text('#!/bin/bash\ncat "$KUBECONFIG"\n', encoding="utf-8")
+        kubectl.chmod(0o755)
+        CredentialProxyHandler.executor.executables["kubectl"] = str(kubectl)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def _restore(self):
+        for name, value in self.saved.items():
+            if value is None:
+                if name in CredentialProxyHandler.__dict__:
+                    delattr(CredentialProxyHandler, name)
+            else:
+                setattr(CredentialProxyHandler, name, value)
+
+    def kubeconfig_naming(self, cluster):
+        path = CredentialProxyHandler.executor.workspace_dir / f"{cluster}.yaml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            f"apiVersion: v1\nkind: Config\n"
+            f"current-context: gke_{self.PROJECT}_{self.LOCATION}_{cluster}\n",
+            encoding="utf-8",
+        )
+        return str(path)
+
+    def post(self, body):
+        request = urllib.request.Request(
+            f"{self.base}/v1/exec",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                return response.status, json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            return error.code, json.loads(error.read())
+
+    def test_an_unmapped_cluster_is_answered_as_a_refusal_not_a_fault(self):
+        status, body = self.post(
+            {
+                "requestId": "r1",
+                "argv": ["kubectl", "get", "pods"],
+                "kubeconfig": self.kubeconfig_naming("nowhere-cluster"),
+            }
+        )
+        self.assertEqual(403, status, body)
+        self.assertEqual("gcp.scoped-sa.unmapped-scope", body.get("rule"), body)
+        self.assertIn(
+            f"projects/{self.PROJECT}/locations/{self.LOCATION}/clusters/nowhere-cluster",
+            body.get("message", ""),
+        )
+
+    # The vocabulary the /v1/exec handler reads out of the request body. Five
+    # keys, none of which names an identity. Pinned here because the test below
+    # used to be a denylist of seven field names I guessed an attacker might
+    # try, and a denylist that misses the actual key is worse than none: a hole
+    # reading `payload.get("context")` would have passed all 169 tests.
+    EXEC_BODY_KEYS = {"argv", "cwd", "kubeconfig", "requestId", "stdin"}
+
+    def test_the_exec_handler_reads_no_field_this_test_has_not_seen(self):
+        """The allowlist behind the denylist below, read off the handler itself.
+
+        Enumerating what `do_POST` takes out of the parsed body turns "no field
+        chooses the account" from a guess into a closed set. A new key is a
+        failure here rather than a hole nobody thought to probe for, and the
+        person adding one has to say in this list why it cannot name an
+        identity.
+        """
+        source = Path(credential_proxy.__file__).read_text(encoding="utf-8")
+        # Anchored on the class, because AgentAPIProxyHandler has a do_POST too
+        # and it is the wrong one -- it forwards rather than parsing a body.
+        cls = source.index("class CredentialProxyHandler(")
+        start = source.index("    def do_POST(self)", cls)
+        end = source.index("\n    def ", start + 10)
+        handler = source[start:end]
+        keys = set(re.findall(r'payload\.get\(\s*"([^"]+)"', handler)) | set(
+            re.findall(r'payload\[\s*"([^"]+)"\s*\]', handler)
+        )
+        self.assertTrue(keys, "could not find the request body reads in do_POST")
+        self.assertEqual(
+            self.EXEC_BODY_KEYS,
+            keys,
+            "the /v1/exec request body has grown a field. If it can name a "
+            "cluster, a scope, a context or an account, it is a way for the "
+            "agent to pick its own credential and the pool is decorative.",
+        )
+
+    def test_a_refusal_cannot_forge_a_log_record(self):
+        """The refusal message carries a scope the agent wrote.
+
+        The scope key is built from `current-context` in a kubeconfig on the
+        shared volume, and it lands in a WARNING. Logged raw, a newline in that
+        value splits one record into two and the second one says whatever the
+        agent wanted it to say. The ValueError handler beside this one already
+        sanitises for exactly this reason.
+
+        The component regex now refuses a newline outright, so this is the
+        second of the two locks: it stays true if someone loosens the pattern.
+        """
+        # A YAML double-quoted scalar, so the \n is a real newline in the value
+        # the parser hands back rather than two characters in the file.
+        path = CredentialProxyHandler.executor.workspace_dir / "forged.yaml"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "apiVersion: v1\nkind: Config\n"
+            'current-context: "gke_kagents-dev_us-east4_nowhere\\n'
+            '2026-01-01 00:00:00 INFO credential-proxy all clear"\n',
+            encoding="utf-8",
+        )
+
+        with self.assertLogs("credential-proxy", level="WARNING") as logs:
+            status, body = self.post(
+                {"requestId": "r4", "argv": ["kubectl", "get", "pods"], "kubeconfig": str(path)}
+            )
+        self.assertIn(status, (400, 403), body)
+        for record in logs.output:
+            self.assertNotIn("\n", record, f"a log record carries a newline: {record!r}")
+        # The refusal names what it refused, which is right -- the agent's text
+        # appearing inside a quoted, escaped `reason=` is the diagnostic. What
+        # must not happen is it appearing as a record of its own.
+        forged_records = [line for line in logs.output if line.startswith("INFO")]
+        self.assertEqual([], forged_records, logs.output)
+
+    def test_the_refusal_message_is_sanitised_before_it_is_logged(self):
+        """Belt and braces on the handler itself, independent of the regex.
+
+        Driven by raising the exception the handler catches, so it holds even
+        if every upstream validator is loosened. Without
+        `_sanitize_for_logging` here this is two records.
+        """
+        import scoped_sa_pool
+
+        def refuse(*args, **kwargs):
+            raise scoped_sa_pool.PoolRefusal(
+                "no scoped service account is provisioned for projects/p/locations/l/clusters/c\n"
+                "2026-01-01 00:00:00 INFO credential-proxy forged"
+            )
+
+        with mock.patch.object(CredentialProxyHandler.executor, "execute", refuse):
+            with self.assertLogs("credential-proxy", level="WARNING") as logs:
+                status, body = self.post(
+                    {"requestId": "r5", "argv": ["kubectl", "get", "pods"]}
+                )
+        self.assertEqual(403, status, body)
+        refusals = [line for line in logs.output if "scoped service account refused" in line]
+        self.assertEqual(1, len(refusals), logs.output)
+        self.assertNotIn("\n", refusals[0], refusals[0])
+        self.assertIn("forged", refusals[0], "the message was truncated rather than sanitised")
+
+    def test_the_request_body_cannot_choose_the_account(self):
+        """The request body is data, not configuration.
+
+        Every field an agent might reasonably try, sent alongside a kubeconfig
+        naming a cluster that has no pool entry. If any of them were read, the
+        answer would be a 200 or a mint of the wide account. The assertion is
+        that the refusal is unmoved and nothing was minted at all — a weaker
+        check on status alone would pass against a broker that honoured the
+        field and happened to fail later.
+
+        This is the probe, not the proof; the closed-vocabulary test above is
+        what makes the set exhaustive. Kept because it exercises the real socket
+        against a real body, and because the four context-shaped names were the
+        gap that showed the denylist could not be the whole answer.
+        """
+        for field, value in (
+            ("serviceAccount", self.WIDE),
+            ("serviceAccountEmail", self.WIDE),
+            ("scope", f"projects/{self.PROJECT}/locations/{self.LOCATION}/clusters/{self.MAPPED}"),
+            ("clusterName", self.MAPPED),
+            ("projectId", self.PROJECT),
+            ("impersonate", self.WIDE),
+            ("gsa", self.WIDE),
+            ("context", f"gke_{self.PROJECT}_{self.LOCATION}_{self.MAPPED}"),
+            ("currentContext", f"gke_{self.PROJECT}_{self.LOCATION}_{self.MAPPED}"),
+            ("cluster", self.MAPPED),
+            ("target", f"projects/{self.PROJECT}/locations/{self.LOCATION}/clusters/{self.MAPPED}"),
+        ):
+            with self.subTest(field=field):
+                self.minted.clear()
+                status, body = self.post(
+                    {
+                        "requestId": "r2",
+                        "argv": ["kubectl", "get", "pods"],
+                        "kubeconfig": self.kubeconfig_naming("nowhere-cluster"),
+                        field: value,
+                    }
+                )
+                self.assertEqual(403, status, body)
+                self.assertEqual("gcp.scoped-sa.unmapped-scope", body.get("rule"), body)
+                self.assertEqual([], self.minted)
+
+    def test_a_body_naming_the_wide_account_still_mints_only_the_scoped_one(self):
+        """The positive half: a served request is served by the mapped account.
+
+        The refusal cases above would all pass on a broker that ignored the pool
+        and failed for some other reason, so this asserts the account actually
+        used on a request that succeeds.
+        """
+        gcloud = self.stub_dir / "gcloud"
+        gcloud.write_text(
+            textwrap.dedent(
+                """\
+                #!/bin/bash
+                ctx="gke_kagents-dev_us-east4_mapped-cluster"
+                printf 'apiVersion: v1\\nkind: Config\\ncurrent-context: %s\\nusers:\\n- name: %s\\n  user:\\n    exec:\\n      command: gke-gcloud-auth-plugin\\n' "$ctx" "$ctx" > "$KUBECONFIG"
+                """
+            ),
+            encoding="utf-8",
+        )
+        gcloud.chmod(0o755)
+        CredentialProxyHandler.executor.executables["gcloud"] = str(gcloud)
+
+        status, body = self.post(
+            {
+                "requestId": "r3",
+                "argv": ["kubectl", "get", "pods"],
+                "kubeconfig": self.kubeconfig_naming(self.MAPPED),
+                "serviceAccount": self.WIDE,
+            }
+        )
+        self.assertEqual(200, status, body)
+        self.assertEqual(0, body["exitCode"], body)
+        self.assertIn("token: TOKEN", body["stdout"])
+        self.assertEqual([self.EMAIL], self.minted)
 
 
 if __name__ == "__main__":

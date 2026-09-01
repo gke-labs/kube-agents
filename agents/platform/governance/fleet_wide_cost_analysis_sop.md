@@ -12,7 +12,14 @@
 
 ### 0. Open the audit run
 
-Run `./skills/fleet-audit/scripts/audit_report.py start --audit fleet-wide-cost-analysis`. It prints one JSON line:
+Run `./skills/fleet-audit/scripts/audit_report.py start --audit fleet-wide-cost-analysis [--repo "<owner>/<repo>"]`.
+
+If multiple repositories are registered in `$GITOPS_STATE_CONFIGMAP` (`managed_repos`), pass `--repo "<owner>/<repo>"` explicitly:
+
+- **Interactive session:** If no `--repo` was specified, prompt the user to choose which repository to target before proceeding.
+- **Scheduled / unattended cron:** Iterate over all repositories in `managed_repos` in sequence, executing the audit and running `audit_report.py start` and `audit_report.py finish` for each repository with `--repo "<owner>/<repo>"`.
+
+It prints one JSON line:
 
 ```json
 {
@@ -231,7 +238,7 @@ Worked example, for a 3.7 finding on an idle batch pool — a `gcloud` remediati
 
 ### 6. Close the audit run
 
-Run `./skills/fleet-audit/scripts/audit_report.py finish --audit fleet-wide-cost-analysis --findings-file <findings_path>`. Exit 0 means published; exit 2 means the validator rejected the document and nothing was published — fix the document and re-run, never delete the finding that tripped it; exit 1 is fatal. The helper prints one JSON line, carrying `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, and `silent_ok`.
+Run `./skills/fleet-audit/scripts/audit_report.py finish --audit fleet-wide-cost-analysis --findings-file <findings_path> [--repo "<owner>/<repo>"]`. Exit 0 means published; exit 2 means the validator rejected the document and nothing was published — fix the document and re-run, never delete the finding that tripped it; exit 1 is fatal. The helper prints one JSON line, carrying `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`, `partial`, `coverage_gaps`, and `silent_ok`.
 
 `partial` and `coverage_gaps` describe how much of the fleet the run can actually speak for: `partial` is `true` if any cluster is in `scope.skipped` or any audited cluster carries a `limitations` note, and `coverage_gaps` states each gap in a sentence. This matters most on a cost audit, where the conclusion is usually drawn from an absence — an idle disk that stops appearing has not necessarily been released, it may sit in a project nobody could list this week. So over a partial run the helper reports `resolved: 0` and posts no resolved-delta, retires no remediation PR as stale, and keeps the ledger open even with an empty findings array: `status` is still `CLEAN`, but the issue stays and gains a comment naming the gaps. A check declared in `checks_not_applicable` is not a gap and does not raise the flag; it left the denominator. Coverage is the only thing the flag tracks, so `partial` is `true` if and only if `coverage_gaps` is non-empty: the §5 body budget dropping findings from the description does not set it, because the audit still saw them and says as much in the body.
 

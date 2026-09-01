@@ -58,7 +58,7 @@
       "name": "k8s",
       "origin": "third-party",
       "repository": "docker.io/alpine/k8s",
-      "tag": "1.34.9",
+      "tag": "1.36.2",
       "pulledBy": "The chart's pre-delete cleanup hook Job.",
       "description": "alpine/k8s — kubectl plus a shell, for the hook that deletes the PlatformAgent CR before Helm removes the operator. The name is the trailing path segment because the chart renders this one: kube-agents.imageRepository rewrites onto <prefix>/<trailing name>, which has to be the destination mirror_images.sh writes (<prefix>/<name>)."
     },
@@ -75,7 +75,7 @@
       "name": "hindsight-api",
       "origin": "third-party",
       "repository": "ghcr.io/vectorize-io/hindsight-api",
-      "tag": "0.9.1@sha256:24a079bead8aa58e45d728bf535ea727bfe559d8784024b6b9f89d56646954ab",
+      "tag": "0.9.2@sha256:7b14a1f4062252992d0176758753615e0a2071d9a269995be007be223ab01812",
       "override": "HINDSIGHT_API_IMAGE",
       "pulledBy": "The chart, when the memory provider uses Hindsight (make deploy-hindsight for the kustomize dev path).",
       "description": "Serves the agents' long-term memory. Pinned by digest as well as tag; a mirrored install pulls the copy by tag, because that is what 'make mirror-images' pushes."
@@ -145,7 +145,7 @@
       "name": "envoy",
       "origin": "build-time",
       "repository": "docker.io/envoyproxy/envoy",
-      "tag": "v1.39.0",
+      "tag": "v1.39.1",
       "buildArg": "ENVOY_IMAGE",
       "pulledBy": "deploy/docker/Dockerfile (envoy-bin stage).",
       "description": "Source of the envoy binary copied into the credential-proxy image."
@@ -154,7 +154,7 @@
       "name": "golang",
       "origin": "build-time",
       "repository": "docker.io/library/golang",
-      "tag": "1.26-alpine",
+      "tag": "1.27-alpine",
       "buildArg": "GOLANG_IMAGE",
       "pulledBy": "deploy/docker/Dockerfile and k8s-operator/Dockerfile builder stages.",
       "description": "Go toolchain for the operator and k8s-event-watcher builds."
@@ -163,7 +163,7 @@
       "name": "python",
       "origin": "build-time",
       "repository": "docker.io/library/python",
-      "tag": "3.11-slim",
+      "tag": "3.14-slim",
       "buildArg": "PYTHON_IMAGE",
       "pulledBy": "examples/inference-replay/replay-proxy/Dockerfile.",
       "description": "Runtime base for the replay proxy."

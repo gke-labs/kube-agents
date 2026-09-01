@@ -137,6 +137,107 @@ source "{_COMMON_SH}"
         finally:
             temp_dir.cleanup()
 
+    def test_get_latest_staging_tag_matches_the_shape_not_the_prefix(self):
+        """`staging_*` is a deploy trigger anyone can push; the GA gate reads this.
+
+        `staging-redeploy-*.yml` fires on the bare prefix, so hand-made trigger
+        tags are a supported thing to have in the graph. Matching the prefix here
+        would let one of them read back as "the full nightly matrix passed on
+        this commit", which is the only evidence a GA release has.
+        """
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            proc = self._run_common_func("get_latest_staging_tag", cwd=repo_dir)
+            self.assertEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout.strip(), "")
+
+            git("tag", "-a", "staging_2608181000_1111111", "-m", "Older promotion")
+            git("tag", "-a", "staging_2608191200_2222222", "-m", "Newer promotion")
+            # Sorts newest-first, so a hand-made tag must not win by name alone.
+            git("tag", "-a", "staging_zzzz", "-m", "Hand-made trigger")
+            git("tag", "-a", "staging_hotfix", "-m", "Hand-made trigger")
+            git("tag", "-a", "rc_2608191300_3333333_validated", "-m", "RC only")
+
+            proc = self._run_common_func("get_latest_staging_tag", cwd=repo_dir)
+            self.assertEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout.strip(), "staging_2608191200_2222222")
+        finally:
+            temp_dir.cleanup()
+
+    def test_get_latest_staging_tag_agrees_with_staging_tag_for_rc(self):
+        """The shape is derived, not declared: a real promotion has to match it.
+
+        STAGING_TAG_SHAPE_REGEX and staging_tag_for_rc are two spellings of the
+        same format. If either moves without the other, the nightly pipeline
+        pushes tags the release gate cannot see and GA releases stop silently.
+        """
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            proc = self._run_common_func(
+                'staging_tag_for_rc "rc_2608241820_b35543c_validated"', cwd=repo_dir
+            )
+            derived = proc.stdout.strip()
+            self.assertEqual(derived, "staging_2608241820_b35543c")
+
+            git("tag", "-a", derived, "-m", "Promoted")
+            proc = self._run_common_func("get_latest_staging_tag", cwd=repo_dir)
+            self.assertEqual(proc.stdout.strip(), derived)
+        finally:
+            temp_dir.cleanup()
+
+    def test_staging_promotion_tags_at_commit_filters_by_shape(self):
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            head = git("rev-parse", "HEAD").stdout.strip()
+            git("tag", "-a", "staging_hotfix", head, "-m", "Hand-made trigger")
+
+            proc = self._run_common_func(
+                f'staging_promotion_tags_at_commit "{head}"', cwd=repo_dir
+            )
+            self.assertEqual(proc.returncode, 0)
+            self.assertEqual(proc.stdout.strip(), "")
+
+            git("tag", "-a", "staging_2608191200_2222222", head, "-m", "Promoted")
+            proc = self._run_common_func(
+                f'staging_promotion_tags_at_commit "{head}"', cwd=repo_dir
+            )
+            self.assertEqual(proc.stdout.strip(), "staging_2608191200_2222222")
+        finally:
+            temp_dir.cleanup()
+
+    def test_the_promotion_check_and_the_release_gate_agree_on_one_commit(self):
+        """A tag one of them counts and the other does not makes a candidate unshippable.
+
+        `get_existing_staging_tag` sets `skip_promotion` in
+        `resolve_promotion_candidate.sh`; `staging_promotion_tags_at_commit` is what
+        the release gate reads. Let the first count a hand-pushed `staging_hotfix`
+        and the nightly concludes the commit is already promoted, so it never
+        pushes the real tag — while the gate, matching on shape, reads the same
+        commit as never promoted. Nothing is red and the candidate quietly cannot
+        be released.
+        """
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            head = git("rev-parse", "HEAD").stdout.strip()
+            git("tag", "-a", "staging_hotfix", head, "-m", "Hand-made trigger")
+
+            existing = self._run_common_func(
+                f'get_existing_staging_tag "{head}"', cwd=repo_dir
+            ).stdout.strip()
+            gate = self._run_common_func(
+                f'staging_promotion_tags_at_commit "{head}"', cwd=repo_dir
+            ).stdout.strip()
+            self.assertEqual(existing, gate, "the two lookups disagree on a prefix-only tag")
+            self.assertEqual(existing, "")
+
+            git("tag", "-a", "staging_2608191200_2222222", head, "-m", "Promoted")
+            existing = self._run_common_func(
+                f'get_existing_staging_tag "{head}"', cwd=repo_dir
+            ).stdout.strip()
+            self.assertEqual(existing, "staging_2608191200_2222222")
+        finally:
+            temp_dir.cleanup()
+
     def test_is_rc_candidate_commit_already_validated_is_anchored_to_the_rc_family(self):
         """The glob has to be rc_*_validated, not *_validated.
 
@@ -599,6 +700,128 @@ source "{_COMMON_SH}"
         )
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("AGENT_NAMESPACE", proc.stderr)
+
+    # ── commit_messages_have_breaking_change ─────────────────────────────────
+    #
+    # Shared by calculate_next_version.sh, which reads it to pick the bump, and
+    # resolve_scheduled_release.sh, which reads it to decide whether an
+    # unattended release stops for a human. The two disagreeing is silent in the
+    # unsafe direction, so the last test here pins that neither keeps a copy.
+
+    def test_commit_messages_have_breaking_change_detects_a_bang_subject(self):
+        for subject in ("feat!: drop it", "fix(operator)!: drop the v1alpha1 field"):
+            with self.subTest(subject=subject):
+                proc = self._run_common_func(f'commit_messages_have_breaking_change "{subject}" ""')
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_commit_messages_have_breaking_change_detects_a_footer(self):
+        for body in ("BREAKING CHANGE: the yaml spec moved", "BREAKING-CHANGE: the yaml spec moved"):
+            with self.subTest(body=body):
+                proc = self._run_common_func(f'commit_messages_have_breaking_change "" "{body}"')
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_commit_messages_have_breaking_change_ignores_ordinary_commits(self):
+        proc = self._run_common_func(
+            'commit_messages_have_breaking_change "feat: add a thing\nfix: mend a thing" "just prose"'
+        )
+        self.assertNotEqual(proc.returncode, 0)
+
+    def test_commit_messages_have_breaking_change_survives_a_large_corpus(self):
+        """`echo … | grep -q` would report 141 here, which reads as "not breaking".
+
+        grep exits on its first match, the producer dies on SIGPIPE, and under
+        `set -o pipefail` the pipeline reports 141 — so matching input reads as no
+        breaking change, in the direction that ships one unattended. The herestring
+        form is immune, and this is what holds it that way.
+        """
+        proc = self._run_common_func(
+            'set -o pipefail\n'
+            'big="BREAKING CHANGE: something"$\'\\n\'"$(head -c 400000 /dev/zero | tr "\\0" "y")"\n'
+            'commit_messages_have_breaking_change "" "${big}"'
+        )
+        self.assertEqual(proc.returncode, 0, f"stderr={proc.stderr} rc={proc.returncode}")
+
+    # ── release_read_commit_range ────────────────────────────────────────────
+
+    def test_release_read_commit_range_reports_subjects_and_bodies(self):
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            git("tag", "-a", "0.1.0", "-m", "r")
+            (pathlib.Path(repo_dir) / "b.txt").write_text("b\n")
+            git("add", "b.txt")
+            git("commit", "-m", "feat: a thing\n\nBREAKING CHANGE: it moved")
+            proc = self._run_common_func(
+                'release_read_commit_range "0.1.0" "HEAD"\n'
+                'echo "S=${RELEASE_RANGE_SUBJECTS}"\necho "B=${RELEASE_RANGE_BODIES}"',
+                cwd=repo_dir,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("S=feat: a thing", proc.stdout)
+            self.assertIn("BREAKING CHANGE: it moved", proc.stdout)
+        finally:
+            temp_dir.cleanup()
+
+    def test_release_read_commit_range_keeps_git_warnings_out_of_the_subjects(self):
+        """An empty range must read as empty even when git warns on success.
+
+        A branch sharing a GA tag's name makes `git log 0.1.0..HEAD` succeed and
+        warn about the ambiguous refname. Captured with `2>&1` that warning
+        becomes the subject list, so an empty range reads as "there are commits
+        to ship" — and the scheduled gate publishes a release for a week with
+        nothing in it.
+        """
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            git("tag", "-a", "0.1.0", "-m", "r")
+            git("branch", "0.1.0")
+            proc = self._run_common_func(
+                'release_read_commit_range "0.1.0" "HEAD"\n'
+                'echo "SUBJECTS=[${RELEASE_RANGE_SUBJECTS}]"',
+                cwd=repo_dir,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("SUBJECTS=[]", proc.stdout)
+            self.assertNotIn("ambiguous", proc.stdout)
+        finally:
+            temp_dir.cleanup()
+
+    def test_release_read_commit_range_fails_and_reports_on_a_bad_range(self):
+        temp_dir, repo_dir, _ = create_mock_git_repo()
+        try:
+            proc = self._run_common_func(
+                'release_read_commit_range "no-such-tag" "HEAD"', cwd=repo_dir
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("Failed to read commit log", proc.stderr)
+        finally:
+            temp_dir.cleanup()
+
+    def test_neither_caller_keeps_its_own_copy_of_the_range_read(self):
+        """Scoping the bump and the halt to different commit sets is silent."""
+        for script in ("calculate_next_version.sh", "resolve_scheduled_release.sh"):
+            with self.subTest(script=script):
+                text = (_REPO_ROOT / "scripts" / "release" / script).read_text()
+                body = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+                self.assertNotIn(
+                    '--format="%s"',
+                    body,
+                    f"{script} reads the commit range itself instead of calling common.sh",
+                )
+                self.assertIn("release_read_commit_range", body, f"{script} does not call the helper")
+
+    def test_neither_caller_keeps_its_own_copy_of_the_breaking_regexes(self):
+        """A second copy is how the bump and the halt come to disagree."""
+        bang_regex = r"^[a-z]+(\([^)]+\))?!:"
+        for script in ("calculate_next_version.sh", "resolve_scheduled_release.sh"):
+            with self.subTest(script=script):
+                text = (_REPO_ROOT / "scripts" / "release" / script).read_text()
+                body = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+                self.assertNotIn(
+                    bang_regex,
+                    body,
+                    f"{script} re-implements the breaking-change test instead of calling common.sh",
+                )
+                self.assertIn("commit_messages_have_breaking_change", body, f"{script} does not call the helper")
 
 
 if __name__ == "__main__":

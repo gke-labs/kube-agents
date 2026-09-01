@@ -46,10 +46,14 @@ DOTENV_PATH = os.environ.get("PLATFORM_AGENT_DOTENV_PATH", "/opt/data/.env")
 #     /opt/hermes, outside CREDENTIAL_PROXY_WORKSPACE_ROOT=/opt/data (see
 #     _within_workspace in credential_proxy.py, and docker-entrypoint.sh step
 #     5.5, which already records the cwd).
-# Both readers of the variable (platform_mcp_server.get_active_platform and
-# session_kv_server's active-platform helper) consult CONFIG_PATH first and only
-# fall back to the env var. Pinned by TestNoSubprocessAtImport in
-# test_agent_common_server.py.
+# No reader of the variable depends on this having populated it, because each
+# consults a config file before the environment:
+# platform_mcp_server.get_enabled_platforms reads CONFIG_PATH first, and
+# session_kv_server.enabled_chat_platforms and chat_platforms.enabled_chat_platforms
+# both read the managed scope (/etc/hermes/config.yaml) first and CONFIG_PATH
+# second, falling through to the environment per platform only where neither file
+# says. Do not maintain that as a count — it has been wrong once already. Pinned by
+# TestNoSubprocessAtImport in test_agent_common_server.py.
 
 def _run_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     """Build a subprocess env with HOME redirected to /tmp for GKE container compatibility.

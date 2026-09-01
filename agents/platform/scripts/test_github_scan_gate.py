@@ -730,8 +730,8 @@ class PrCommentsSweepTest(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def _sweep(self, provider, repo=REPO, env=None, repo_error=None, dry_run=False):
-        target = mock.Mock(side_effect=repo_error) if repo_error else mock.Mock(return_value=repo)
-        with mock.patch.object(forge, "target_repo", target), \
+        managed_mock = mock.Mock(side_effect=repo_error) if repo_error else mock.Mock(return_value=[repo] if repo else [])
+        with mock.patch("gitops_workspace.get_managed_github_repos", managed_mock), \
              mock.patch.object(forge, "provider_for", return_value=provider), \
              mock.patch.dict("os.environ", env or {}, clear=False):
             import os
@@ -835,6 +835,36 @@ class PrCommentsSweepTest(unittest.TestCase):
             },
         )
         self.assertEqual(len(self._sweep(provider).cards), 2)
+
+    def test_sweep_across_multiple_repositories(self):
+        """sweep_pr_comments iterates across all managed repos and files cards per repo."""
+        pr1 = make_pr(1, head_ref="platform-agent/fix-1", head_repo="acme/repo1")
+        pr2 = make_pr(2, head_ref="platform-agent/fix-2", head_repo="acme/repo2")
+
+        class MultiRepoFakeProvider(FakeProvider):
+            def list_open_prs(self, repo):
+                if repo == "acme/repo1":
+                    return [pr1]
+                elif repo == "acme/repo2":
+                    return [pr2]
+                return []
+
+            def list_comments(self, repo, pr):
+                if repo == "acme/repo1" and pr.number == 1:
+                    return [make_comment("IC_1", "/agent fix repo1")]
+                elif repo == "acme/repo2" and pr.number == 2:
+                    return [make_comment("IC_2", "/agent fix repo2")]
+                return []
+
+        provider = MultiRepoFakeProvider()
+        managed_mock = mock.Mock(return_value=["acme/repo1", "acme/repo2"])
+        with mock.patch("gitops_workspace.get_managed_github_repos", managed_mock), \
+             mock.patch.object(forge, "provider_for", return_value=provider):
+            res = gate.sweep_pr_comments()
+            self.assertEqual(len(res.cards), 2)
+            keys = [card.idempotency_key for card in res.cards]
+            self.assertTrue(any("acme-repo1-1" in k for k in keys))
+            self.assertTrue(any("acme-repo2-2" in k for k in keys))
 
     def test_the_card_body_says_it_is_a_pointer_not_a_transcript(self):
         provider = FakeProvider(

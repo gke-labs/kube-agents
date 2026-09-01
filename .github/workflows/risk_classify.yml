@@ -1,0 +1,75 @@
+name: Risk Classification
+
+# Classifies every pull request's risk tier (low / medium / high) from its
+# diff, against the rules in .github/risk-rules.yml -- a non-blocking signal
+# for reviewers (#818). The verdict lands as a `Risk Classification` check run
+# that always concludes `success`, and a `risk:*` label.
+#
+# The trigger cannot be `pull_request`: every pull request here comes from a
+# fork, and on a fork `pull_request` hands the workflow a read-only
+# `GITHUB_TOKEN` that `permissions:` cannot raise, so it could post neither
+# the check run nor the label.
+#
+# `edited` is in the list because the declared-vs-computed flag reads the pull
+# request body: without it, fixing the Risk & Rollout section would leave a
+# stale mismatch banner until the next push.
+on:
+  # zizmor: ignore[dangerous-triggers] - the job never checks out or executes
+  # pull-request code: the checkout below pins `ref:` to the default branch
+  # (the script and its rules), and the diff arrives as text through the
+  # API, so no pull-request content reaches the write token's context.
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+    # Like every other PR-triggered workflow here: without the filter, a PR
+    # based on a branch that predates this workflow would run against a tree
+    # where the classifier does not exist.
+    branches: [main]
+
+permissions: {}
+
+# One run per pull request, newest wins: a push supersedes the classification
+# of the commit it replaced.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  classify:
+    # Not "Risk Classification": the job's own check run takes this name, and
+    # sharing it with the script's check run put two same-named runs on every
+    # head SHA. The script's run carries the verdict; this one is plumbing.
+    name: classify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # check out the default branch: the script and its rules
+      checks: write # post the Risk Classification check run
+      pull-requests: write # swap the risk:* label on the pull request
+      issues: write # create the risk:* labels the first time
+    steps:
+      # The default branch, never the pull request head: this job holds a
+      # writable token and must not run code from a fork. The `ref:` is
+      # explicit because on `pull_request_target` the fallback is the pull
+      # request's *base* branch -- an unreviewed ref that anyone with push
+      # access could point a PR at to serve this job their own classifier.
+      - name: Checkout the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install the script's one third-party import
+        run: python3 -m pip install pyyaml
+
+      - name: Classify the pull request
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Through the environment, not interpolated into the script: event
+          # fields are attacker-controlled input on a pull-request trigger.
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          python3 scripts/classify_risk.py --pr "$PR_NUMBER"

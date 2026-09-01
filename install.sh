@@ -82,7 +82,7 @@ PARAM_GITOPS_ORG="${GITHUB_ORG:-}"
 PARAM_GITOPS_REPO="${GITHUB_REPO:-}"
 PARAM_PERMISSION_SET="${PLATFORM_AGENT_PERMISSION_SET:-read-only}"
 PARAM_CUSTOM_ROLES="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
-PARAM_ENABLE_GVISOR="${ENABLE_GVISOR:-false}"
+PARAM_ENABLE_GVISOR="${ENABLE_GVISOR:-true}"
 PARAM_ENABLE_WEBUI="${ENABLE_WEBUI:-false}"
 PARAM_MEMORY="${MEMORY:-file}"
 PARAM_IMAGE_TAG="${IMAGE_TAG:-}"
@@ -133,7 +133,7 @@ Flags for AI Agents & Automation:
   --permission-set=SET          Agent GCP IAM permission set: read-only | custom
                                 (default: read-only)
   --custom-roles=ROLES          Roles for --permission-set=custom (space- or comma-separated)
-  --gvisor=true|false           Enable GKE Sandbox (gVisor) runtime isolation (default: false)
+  --gvisor=true|false           Enable GKE Sandbox (gVisor) runtime isolation (default: true)
   --enable-web-ui=true|false    Enable Hermes Web UI port 9119 dashboard (default: false)
   --user-profile-enabled=BOOL   Enable user profile persona extensions (default: false)
   --memory=MODE                 Long-term agent memory: file | hindsight | off
@@ -669,6 +669,27 @@ wait_for_rollout() {
   return "$rc"
 }
 
+# Wait for a Deployment object to exist, ahead of waiting for it to roll out.
+# `kubectl rollout status` on a Deployment that is not there yet fails
+# immediately rather than waiting, and the operator writes the agent's after the
+# apply returns — later still when it has a RuntimeClass to resolve first. This
+# is the difference between "the operator has not got to it" and "the operator
+# refuses to create it", which is worth the wait to tell apart.
+wait_for_deployment_object() {
+  local deployment="$1"
+  local namespace="$2"
+  local timeout_secs="$3"
+
+  local deadline=$((SECONDS + timeout_secs))
+  while ! kubectl get deployment "$deployment" -n "$namespace" >/dev/null 2>&1; do
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      return 1
+    fi
+    sleep "$DEPLOYMENT_POLL_INTERVAL_SECS"
+  done
+  return 0
+}
+
 has_controlling_tty() {
   [ -c /dev/tty ] && ( : </dev/tty ) 2>/dev/null
 }
@@ -762,6 +783,15 @@ prompt_menu() {
 
 # How long each deployment gets to report ready in the post-install health check.
 ROLLOUT_TIMEOUT_SECS=300
+
+# How long each deployment gets to exist at all before that check calls it
+# missing. The operator creates the agent Deployment asynchronously and, when a
+# RuntimeClass is asked for, only after that RuntimeClass resolves — retrying on
+# a 30s requeue (validateRuntimeClass in
+# k8s-operator/internal/controller/platformagent_controller.go). Three requeues
+# is the budget: below one, "not yet" and "never" are indistinguishable.
+DEPLOYMENT_APPEAR_TIMEOUT_SECS=90
+DEPLOYMENT_POLL_INTERVAL_SECS=5
 
 # Number of projects listed in the interactive project picker. Accounts with
 # more projects than this can still type an ID that the list does not show.
@@ -1305,6 +1335,12 @@ run_menu_system() {
   local chat_sub_name="${CHAT_SUB_NAME:-platform-agent-chat-events-sub}"
   local permission_set="${PLATFORM_AGENT_PERMISSION_SET:-read-only}"
   local custom_roles="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
+  # Not the fresh-install default. The control panel describes an install that
+  # already exists and its Save & Apply re-applies what it displays, so a
+  # vars.sh with no ENABLE_GVISOR has to read as the standard runtime — that is
+  # what such a cluster is actually running. Defaulting on here would show
+  # "gVisor Sandbox" for an unsandboxed install and then provision a node pool
+  # nobody asked for on the next apply.
   local enable_gvisor="${ENABLE_GVISOR:-false}"
   local enable_webui="${HERMES_DASHBOARD_ENABLED:-false}"
   local github_org="${GITHUB_ORG:-}"
@@ -2049,7 +2085,11 @@ main() {
   if [ "$permission_set" = "custom" ] && [ -n "$custom_roles" ]; then
     warn_on_overreaching_custom_roles "$custom_roles"
   fi
-  local enable_gvisor="${PARAM_ENABLE_GVISOR:-false}"
+  # ${VAR-default}, not ${VAR:-default}: PARAM_ENABLE_GVISOR is always set (see
+  # its declaration), so the only way it arrives empty is `--gvisor=` with no
+  # value. Substituting on empty would silently read that as the default; this
+  # form lets it reach the validator below and be rejected.
+  local enable_gvisor="${PARAM_ENABLE_GVISOR-true}"
   if [[ ! "$enable_gvisor" =~ ^(true|false)$ ]]; then
     print_error "--gvisor must be either true or false."
     exit 1
@@ -2105,14 +2145,26 @@ main() {
       warn_on_overreaching_custom_roles "$custom_roles"
     fi
 
+    # prompt_menu answers an empty line with option 1, so the current value has
+    # to be listed first — otherwise the "(Default)" label contradicts what a
+    # bare Enter actually produces. The value reaching here is the sandbox
+    # unless --gvisor=false said otherwise, so the usual order is Yes first;
+    # the else branch keeps an explicit --gvisor=false from being re-enabled by
+    # someone confirming the prompt. Option 2 is "the other one" either way.
     local gvisor_choice=""
-    prompt_menu "Enable GKE Sandbox (gVisor) Runtime Isolation for Agent Workloads?" \
-      "No - Standard Container Runtime (Default)" \
-      "Yes - gVisor Secure Kernel Sandbox (Hardened Workload Isolation)" \
-      gvisor_choice
-
-    if [ "$gvisor_choice" = "2" ]; then
-      enable_gvisor="true"
+    local gvisor_yes="Yes - gVisor Secure Kernel Sandbox (Hardened Workload Isolation)"
+    local gvisor_no="No - Standard Container Runtime"
+    local gvisor_prompt="Enable GKE Sandbox (gVisor) Runtime Isolation for Agent Workloads?"
+    if [ "$enable_gvisor" = "true" ]; then
+      prompt_menu "$gvisor_prompt" "${gvisor_yes} (Default)" "$gvisor_no" gvisor_choice
+      if [ "$gvisor_choice" = "2" ]; then
+        enable_gvisor="false"
+      fi
+    else
+      prompt_menu "$gvisor_prompt" "${gvisor_no} (Default)" "$gvisor_yes" gvisor_choice
+      if [ "$gvisor_choice" = "2" ]; then
+        enable_gvisor="true"
+      fi
     fi
 
     local webui_choice=""
@@ -2427,8 +2479,17 @@ main() {
   # kube-agents-controller-manager, not kubeagents-: the chart prefixes the
   # operator Deployment with the release name.
   for deployment in kube-agents-controller-manager litellm platform-agent-gateway; do
-    if ! kubectl get deployment "$deployment" -n kubeagents-system >/dev/null 2>&1; then
-      print_error "Expected deployment '$deployment' was not created."
+    if ! wait_for_deployment_object "$deployment" kubeagents-system "$DEPLOYMENT_APPEAR_TIMEOUT_SECS"; then
+      print_error "Expected deployment '$deployment' was not created within ${DEPLOYMENT_APPEAR_TIMEOUT_SECS}s."
+      # platform-agent-gateway is the agent, and the sandbox is the one thing
+      # that stops the operator writing it while leaving everything else
+      # healthy: no gvisor RuntimeClass, no Deployment, and the reason is on the
+      # CR rather than in any of the logs an operator would reach for first.
+      if [ "$deployment" = "platform-agent-gateway" ] && [ "$enable_gvisor" = "true" ]; then
+        print_info "The agent asks for the ${C_BOLD}gvisor${C_RESET} RuntimeClass; the operator will not create its Deployment until that RuntimeClass exists."
+        print_info "Read the reason with: ${C_BOLD}kubectl get platformagent -n kubeagents-system -o jsonpath='{.items[*].status.conditions}'${C_RESET}"
+        print_info "Re-run with ${C_BOLD}--gvisor=false${C_RESET} to run the agent on the standard container runtime instead."
+      fi
       exit 1
     fi
     # The agent pulls a large image and waits on LiteLLM before it reports ready,
@@ -2473,7 +2534,17 @@ main() {
   fi
   if [ "${PARAM_ENABLE_WEBUI:-false}" = "true" ] || [ "${HERMES_DASHBOARD_ENABLED:-false}" = "true" ]; then
     echo -e "  • ${C_CYAN}Hermes Web UI (Port 9119):${C_RESET} ${C_GREEN}Enabled${C_RESET}"
-    echo -e "    ${C_YELLOW}Workstation Access Command:${C_RESET} kubectl port-forward deploy/platform-agent-gateway -n kubeagents-system 9119:9119"
+    # A sandboxed pod cannot be reached with `kubectl port-forward`: the forward
+    # is established in the host-side CNI netns while the dashboard listens in
+    # the sandbox's own network stack, so the connection is refused. The relay
+    # in scripts/exec_tunnel.py goes through `kubectl exec` instead; print
+    # whichever one will actually work here.
+    if [ "${enable_gvisor:-false}" = "true" ]; then
+      echo -e "    ${C_YELLOW}Workstation Access Command:${C_RESET} ${repo_dir}/scripts/hermes-dashboard-tunnel.py"
+      echo -e "      (the agent is sandboxed under gVisor, which kubectl port-forward cannot reach)"
+    else
+      echo -e "    ${C_YELLOW}Workstation Access Command:${C_RESET} kubectl port-forward deploy/platform-agent-gateway -n kubeagents-system 9119:9119"
+    fi
     echo -e "    ${C_YELLOW}Browser Dashboard URL:${C_RESET} ${C_UNDERLINE}http://localhost:9119${C_RESET}"
   fi
 

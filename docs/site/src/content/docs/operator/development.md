@@ -11,7 +11,7 @@ Everything below runs from `k8s-operator/`.
 
 ## Prerequisites
 
-- Go 1.26+.
+- Go 1.27+.
 - `docker` (or `podman`) for image builds.
 - `kubectl` pointed at a target cluster for `make install` / `make deploy`.
 - `make` — the entire workflow is Makefile-driven.

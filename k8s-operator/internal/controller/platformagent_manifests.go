@@ -398,19 +398,7 @@ func allowAllUsers(users []string) bool {
 
 // buildSettingsConfigMap generates the ConfigMap manifest containing SETTINGS.md
 func buildSettingsConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
-	gitRepo := ""
-	if agent.Spec.Integration != nil && agent.Spec.Integration.GitHub != nil {
-		gitRepo = strings.TrimSpace(agent.Spec.Integration.GitHub.GitRepo)
-	}
-
-	if err := agentv1alpha1.ValidateGitRepoURL(gitRepo); err != nil {
-		manifestsLog.Info("Invalid gitRepo URL in PlatformAgent spec, defaulting SETTINGS.md to None", "err", err, "gitRepo", gitRepo)
-		gitRepo = "None"
-	} else if gitRepo == "" {
-		gitRepo = "None"
-	}
-
-	settingsContent := fmt.Sprintf("# GKE Scope Configuration\n- **Git Repo:** %s\n", gitRepo)
+	settingsContent := "# GKE Scope Configuration\n"
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
@@ -572,6 +560,11 @@ const (
 	// managedVolumeName projects the two keys above into managedScopeDir under the names
 	// Hermes expects (config.yaml and .env).
 	managedVolumeName = "platform-agent-managed-vol"
+
+	// gitopsStateVolumeName projects the GitOps state ConfigMap as a mounted directory
+	// volume into the agent container so skills can read managed repositories directly from disk.
+	gitopsStateVolumeName = "gitops-state-volume"
+	gitopsStateDir        = "/etc/gitops"
 )
 
 // loopbackAgentAPIKey is the bearer the Hermes API server on 127.0.0.1:8642 accepts, and
@@ -1162,6 +1155,43 @@ func filterValidAgentPlugins(agentPlugins []*agentv1alpha1.AgentPlugin) []*agent
 	return valid
 }
 
+// buildGitopsStateConfigMap generates the ConfigMap manifest containing runtime state (e.g. repos)
+func buildGitopsStateConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
+	data := map[string]string{}
+
+	// Extract primary repository from CR Spec if provided
+	if agent.Spec.Integration != nil && agent.Spec.Integration.GitHub != nil {
+		gitRepo := strings.TrimSpace(agent.Spec.Integration.GitHub.GitRepo)
+		org := strings.TrimSpace(agent.Spec.Integration.GitHub.Org)
+		if gitRepo != "" && gitRepo != "None" {
+			if err := agentv1alpha1.ValidateGitRepoURLWithOrg(gitRepo, org); err == nil {
+				if cleanedURL, err := agentv1alpha1.CleanRepoURLWithOrg(gitRepo, org); err == nil {
+					entries := []agentv1alpha1.ManagedRepoEntry{
+						{Type: "github", URL: cleanedURL},
+					}
+					if jsonBytes, err := json.Marshal(entries); err == nil {
+						data["managed_repos"] = string(jsonBytes)
+					}
+				}
+			} else {
+				manifestsLog.Info("Skipping initial configmap seed due to unparseable or invalid GitRepo", "raw", gitRepo, "error", err)
+			}
+		}
+	}
+
+	return &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "ConfigMap",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      agent.Name + "-gitops-state",
+			Namespace: agent.Namespace,
+		},
+		Data: data,
+	}
+}
+
 // renderConfigYAML builds the MANAGED config the pod runs under.
 //
 // Unlike every other profile rendering, this one is not an overlay merged into the PVC.
@@ -1715,6 +1745,14 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			Name:  "SESSION_KV_DB_PATH",
 			Value: sessionKVDBPath,
 		},
+		{
+			Name:  "GITOPS_STATE_CONFIGMAP",
+			Value: agent.Name + "-gitops-state",
+		},
+		{
+			Name:  "GITOPS_STATE_PATH",
+			Value: path.Join(gitopsStateDir, "managed_repos"),
+		},
 	}
 
 	// The two exceptions to "no credentials in the sandbox", both of them
@@ -1853,6 +1891,23 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 				envVars = append(envVars, corev1.EnvVar{
 					Name:  "SLACK_HOME_CHANNEL_NAME",
 					Value: slack.HomeChannelName,
+				})
+			}
+		}
+		if github := integration.GitHub; github != nil {
+			org := strings.TrimSpace(github.Org)
+			if org == "" && github.GitRepo != "" {
+				if cleaned, err := agentv1alpha1.CleanRepoSlug(github.GitRepo); err == nil {
+					parts := strings.SplitN(cleaned, "/", 2)
+					if len(parts) == 2 {
+						org = parts[0]
+					}
+				}
+			}
+			if org != "" {
+				envVars = append(envVars, corev1.EnvVar{
+					Name:  "GITHUB_ORG",
+					Value: org,
 				})
 			}
 		}
@@ -2245,6 +2300,15 @@ func buildDefaultVolumeMounts(homeDir string) []corev1.VolumeMount {
 			SubPath:   "session",
 		},
 		{
+			// Directory mount, never subPath: a subPath does not receive kubelet
+			// ConfigMap updates. As a mounted directory, updates to managed repos
+			// in the ConfigMap are automatically synced live by the kubelet without
+			// restarting the agent pod.
+			Name:      gitopsStateVolumeName,
+			MountPath: gitopsStateDir,
+			ReadOnly:  true,
+		},
+		{
 			// The one writable path outside the PVC, and the reason
 			// readOnlyRootFilesystem is survivable here: docker-entrypoint.sh runs
 			// four hermes invocations with HOME=/tmp before the agent starts, and
@@ -2356,14 +2420,83 @@ func buildSandboxCredentialCleanup(image string, pullPolicy corev1.PullPolicy) c
 	}
 }
 
+// scopedSAPoolKey is the ConfigMap key, and the basename the broker mounts it
+// under. It rides in the credential-proxy policy ConfigMap rather than one of
+// its own, for a reason worth keeping: that ConfigMap is already hashed into
+// the Pod template annotation, so a change to the mapping rolls the broker.
+// The broker reads this file once at startup and refuses to serve if it is
+// unusable, so a mapping change that did not restart it would take effect at
+// the next unrelated restart — which is the kind of delay nobody debugs.
+const scopedSAPoolKey = "scoped-sa-pool.json"
+
+const scopedSAPoolMountPath = "/etc/credential-proxy/" + scopedSAPoolKey
+
+// scopedSAPoolJSON renders the mapping the broker consumes, or "" when the
+// agent has none configured.
+//
+// Sorted by the scope key. The CR is a list and Kubernetes preserves its order,
+// so an operator reordering two entries would otherwise rewrite the ConfigMap,
+// change its hash and roll the broker for no change in meaning.
+//
+// No error return, because there is no failure to report: the document is a
+// struct of strings and ints, which json.Marshal cannot fail on. An error
+// return here would have to be either swallowed or propagated through a builder
+// that has nowhere to put it, and a swallowed one would leave the broker armed
+// by its environment variable with no mapping file to read.
+func scopedSAPoolJSON(agent *agentv1alpha1.PlatformAgent) string {
+	if agent.Spec.Security == nil || len(agent.Spec.Security.ScopedServiceAccounts) == 0 {
+		return ""
+	}
+	type entry struct {
+		ProjectID           string `json:"projectId"`
+		Location            string `json:"location"`
+		ClusterName         string `json:"clusterName"`
+		ServiceAccountEmail string `json:"serviceAccountEmail"`
+	}
+	entries := make([]entry, 0, len(agent.Spec.Security.ScopedServiceAccounts))
+	for _, account := range agent.Spec.Security.ScopedServiceAccounts {
+		entries = append(entries, entry{
+			ProjectID:           account.ProjectID,
+			Location:            account.Location,
+			ClusterName:         account.ClusterName,
+			ServiceAccountEmail: account.ServiceAccountEmail,
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		return scopedSAPoolScopeKey(entries[i].ProjectID, entries[i].Location, entries[i].ClusterName) <
+			scopedSAPoolScopeKey(entries[j].ProjectID, entries[j].Location, entries[j].ClusterName)
+	})
+	document, _ := json.Marshal(struct {
+		Version         int     `json:"version"`
+		ServiceAccounts []entry `json:"serviceAccounts"`
+	}{Version: 1, ServiceAccounts: entries})
+	return string(document)
+}
+
+// scopedSAPoolScopeKey is the GKE resource name. Written here as well as in the
+// broker and in Terraform because all three have to agree; the broker's
+// `scoped_sa_pool.scope_key` and the key the Terraform module files each pool
+// member under are the other two, and tests compare them.
+func scopedSAPoolScopeKey(project, location, cluster string) string {
+	return fmt.Sprintf("projects/%s/locations/%s/clusters/%s", project, location, cluster)
+}
+
+func scopedSAPoolEnabled(agent *agentv1alpha1.PlatformAgent) bool {
+	return agent.Spec.Security != nil && len(agent.Spec.Security.ScopedServiceAccounts) > 0
+}
+
 func buildCredentialProxyPolicyConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
+	data := map[string]string{"policy.json": credentialProxyPolicyJSON}
+	if pool := scopedSAPoolJSON(agent); pool != "" {
+		data[scopedSAPoolKey] = pool
+	}
 	return &corev1.ConfigMap{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      agent.Name + "-credential-proxy-policy",
 			Namespace: agent.Namespace,
 		},
-		Data: map[string]string{"policy.json": credentialProxyPolicyJSON},
+		Data: data,
 	}
 }
 
@@ -2447,6 +2580,19 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 	securityContext := hardenedSecurityContext()
 	securityContext.RunAsUser = ptr.To(credentialProxyUID)
 	securityContext.RunAsGroup = ptr.To(agentFSGroup)
+
+	// Conditional because it is a SubPath mount: naming a key the ConfigMap
+	// does not carry leaves the container unable to start, so the mount and the
+	// key have to appear and disappear together.
+	scopedPoolMounts := []corev1.VolumeMount{}
+	if scopedSAPoolEnabled(agent) {
+		scopedPoolMounts = append(scopedPoolMounts, corev1.VolumeMount{
+			Name:      "credential-proxy-policy",
+			MountPath: scopedSAPoolMountPath,
+			SubPath:   scopedSAPoolKey,
+			ReadOnly:  true,
+		})
+	}
 	return corev1.Container{
 		Name:            "envoy-credential-proxy",
 		Image:           image,
@@ -2474,7 +2620,7 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 				corev1.ResourceCPU: resource.MustParse("2"), corev1.ResourceMemory: resource.MustParse("2Gi"), corev1.ResourceEphemeralStorage: resource.MustParse("2Gi"),
 			},
 		},
-		VolumeMounts: []corev1.VolumeMount{
+		VolumeMounts: append([]corev1.VolumeMount{
 			{Name: "credential-proxy-policy", MountPath: "/etc/credential-proxy/policy.json", SubPath: "policy.json", ReadOnly: true},
 			{Name: "credential-proxy-tmp", MountPath: "/tmp"},
 			{Name: "credential-proxy-state", MountPath: "/var/lib/credential-proxy"},
@@ -2486,7 +2632,8 @@ func buildCredentialProxySidecar(agent *agentv1alpha1.PlatformAgent, homeDir str
 			// the management cluster, which never gets a Cluster Agent profile.
 			{Name: "event-watcher-ksa-token", MountPath: "/var/run/secrets/kubernetes.io/serviceaccount", ReadOnly: true},
 			{Name: "platform-agent-data-vol", MountPath: homeDir},
-		},
+			{Name: gitopsStateVolumeName, MountPath: gitopsStateDir, ReadOnly: true},
+		}, scopedPoolMounts...),
 		SecurityContext: securityContext,
 	}
 }
@@ -2528,7 +2675,22 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		// reserves the name — appending after that call would leave it
 		// protected only by its presence in SensitiveEnvVars, which is
 		// incidental and would not hold for a name not on that list.
+		{Name: "GITOPS_STATE_CONFIGMAP", Value: agent.Name + "-gitops-state"},
+		{Name: "GITOPS_STATE_PATH", Value: path.Join(gitopsStateDir, "managed_repos")},
 		{Name: "API_SERVER_KEY", Value: loopbackAgentAPIKey},
+	}
+	// Set in both directions, deliberately. The broker's own default is off, so
+	// the "0" changes nothing on its own — what it buys is that the credential
+	// mode an install is in can be read off the Deployment rather than inferred
+	// from an absent variable. Same reason the mapping is a ConfigMap rather
+	// than something the broker derives.
+	if scopedSAPoolEnabled(agent) {
+		envVars = append(envVars,
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_SCOPED_SA_POOL", Value: "1"},
+			corev1.EnvVar{Name: "CREDENTIAL_PROXY_SCOPED_SA_POOL_FILE", Value: scopedSAPoolMountPath},
+		)
+	} else {
+		envVars = append(envVars, corev1.EnvVar{Name: "CREDENTIAL_PROXY_SCOPED_SA_POOL", Value: "0"})
 	}
 	if credentialBrokerIsSplit(agent) {
 		// Everything the split changes about the broker's own configuration.
@@ -2658,6 +2820,18 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		"CREDENTIAL_PROXY_POLICY",
 		"CREDENTIAL_PROXY_PORT",
 		"CREDENTIAL_PROXY_ROLE",
+		// Same argument as the authentication settings above, one layer over.
+		// A plugin that could set CREDENTIAL_PROXY_SCOPED_SA_POOL would switch
+		// the broker back onto the agent's own project-wide identity, and one
+		// that could set the FILE variable would point it at a mapping of its
+		// own choosing — naming, for instance, an account it would rather be.
+		//
+		// The flag is in `managed` on every render, so the loop above already
+		// reserves it and this line is belt and braces. The FILE variable is
+		// only in `managed` when a pool is configured, so on an install with no
+		// pool this line is the only thing reserving it.
+		"CREDENTIAL_PROXY_SCOPED_SA_POOL",
+		"CREDENTIAL_PROXY_SCOPED_SA_POOL_FILE",
 		"CREDENTIAL_PROXY_STATE_DIR",
 		"CREDENTIAL_PROXY_TIMEOUT_SECONDS",
 		"CREDENTIAL_PROXY_UNIX_SOCKET",
@@ -2784,6 +2958,20 @@ func buildCredentialProxyVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Vo
 			}}},
 		}}},
 		buildEventWatcherTokenVolume(),
+	}
+}
+
+func buildGitopsStateVolume(agent *agentv1alpha1.PlatformAgent) corev1.Volume {
+	return corev1.Volume{
+		Name: gitopsStateVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{
+					Name: agent.Name + "-gitops-state",
+				},
+				DefaultMode: ptr.To(int32(0644)),
+			},
+		},
 	}
 }
 
@@ -3356,6 +3544,7 @@ func buildDefaultVolumes(agent *agentv1alpha1.PlatformAgent) []corev1.Volume {
 				},
 			},
 		},
+		buildGitopsStateVolume(agent),
 		{
 			// Bounded, like every other scratch emptyDir here. Without a
 			// sizeLimit a runaway write fills the node's ephemeral storage and the
@@ -4036,9 +4225,13 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 	//    of them.
 	if profile.MetadataDaemonIP != "" {
 		metadataDaemonPeers := formatCIDRPeers([]string{metadataLinkLocalIP, profile.MetadataDaemonIP}, true)
+		port := profile.MetadataDaemonPort
+		if port == 0 {
+			port = metadataDaemonDefaultPort
+		}
 		egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
 			Ports: []networkingv1.NetworkPolicyPort{
-				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(988))},
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(port))},
 			},
 			To: metadataDaemonPeers,
 		})

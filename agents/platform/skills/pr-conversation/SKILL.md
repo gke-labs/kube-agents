@@ -43,7 +43,7 @@ nothing, it is a GitHub pull request.
 ### Step 1: Re-read the conversation
 
 ```bash
-"$HERMES_HOME"/skills/pr-conversation/scripts/pr_conversation.py poll --pr <N>
+"$HERMES_HOME"/skills/pr-conversation/scripts/pr_conversation.py poll --repo <owner/repo> --pr <N>
 ```
 
 Run this even though the card already lists comment ids. The card was written
@@ -198,7 +198,7 @@ would close that request for good, and nobody would be told.
 
 ```bash
 "$HERMES_HOME"/skills/pr-conversation/scripts/pr_conversation.py reply \
-  --pr <N> --comment-id <node-id> --body-file /opt/data/scratch/pr_<N>_reply.md \
+  --repo <owner/repo> --pr <N> --comment-id <node-id> --body-file /opt/data/scratch/pr_<N>_reply.md \
   --verify-commit <sha from Step 2b>     # or: --no-change
 ```
 

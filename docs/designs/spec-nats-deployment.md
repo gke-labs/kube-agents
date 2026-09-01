@@ -79,7 +79,19 @@ Three KV buckets ride the same JetStream deployment:
 - `runtime-state` - which agents are alive, what is in flight. Runtime state does not
   belong in git, and this is where it goes instead.
 - `session-state` - the gateway's session registry (session key, `contextId`, current
-  pod, roster). The gateway's user is the only writer.
+  pod, roster, and the active task's bounded ask echo - user content, deliberately; the
+  gateway design owns the content-vs-identifier rule). The gateway's user is the only
+  writer by grant, and since the 8/31 narrowing the only reader too: no other user
+  holds `$KV.session-state.>` on either side, and the web user's consumer-create route
+  INTO the bucket - a push consumer bound to `KV_session-state` - is closed by the
+  per-stream enumeration. One write route survives and is the deliver-subject residue
+  recorded with the web user below, not an exception to it: a consumer created on a
+  granted stream may aim its deliver subject at `$KV.session-state.>`, and the server's
+  own replay publishes land as bucket revisions. What the gateway reads back is
+  corruptible that way - current pod name, bus session name, roster - so "only writer"
+  is a statement about grants, not a property the subject list enforces. The residue's
+  closes are the residue paragraph's: the callout, or a separate account with an
+  export/import.
 - A bucket reserved for capability entries per the capability envelope design
   (`docs/architecture/09-capability-envelope.md`), which landed on KV-backed
   capabilities. Reserved so the account layout allows for it; it arms with the
@@ -106,6 +118,11 @@ API server - zero key handling, works on any conformant cluster - with local JWT
 verification against the API server's `openid/v1/jwks` endpoint as the offline
 alternative.
 
+Stage 1 status (recorded 8/31): the rendered config still authenticates its users
+statically - rendered credentials, deny-by-default grants in `nats.conf`. The callout
+is the design of record, and the residues named in this section as "closed by the
+callout" are open until it arms.
+
 Layout:
 
 - **`$SYS`** - human operators and monitoring only. No agent ever authenticates into it.
@@ -119,10 +136,110 @@ Layout:
   shared topics it is granted. The addressee token in the task subjects (payload spec
   0.4) is what makes these grants expressible - executor-granularity at connect time,
   with per-task scoping the parked tightening under the authority work.
+- **The JetStream tax.** Deny-by-default reaches JetStream's own plumbing, and three
+  grants are part of being a JetStream client at all: the `$JS.API.>` surface a role's
+  streams and buckets need; `$JS.ACK.<its streams>.>` for explicit acks - an ack is a
+  publish, and missing this grant means every consumer redelivers forever while TCP
+  health stays green, the NR-5 incident class created at connect time; and `$JS.FC.>`
+  for flow control. The inbox rule cuts both ways, too: a client whose subscribe grant
+  is `_INBOX.<user>.>` MUST configure its inbox prefix to match - the client library's
+  default random inbox is refused by the user's own grant and every API call times out.
+  Both halves were found live (8/26): the provision Job could never succeed and no
+  consumer could ever ack until these landed. The ack grant should be scoped per
+  stream, for the reason the web section below teaches: an ack subject names a stream
+  and a consumer, never the caller, so an unscoped `$JS.ACK.>` lets any holder `+TERM`
+  another principal's in-flight delivery. The stage 1 render still grants the unscoped
+  form to the trusted system users; narrowing it is recorded debt, not a settled shape.
+- **Topic publish grants are exact, never namespace wildcards.** Publish grants match
+  the provisioned topic list subject-for-subject. A wildcard over a topic namespace
+  turns provisioned-only into silent loss - a publish to an unprovisioned topic sails
+  into core NATS and vanishes; an exact grant makes it a connect-time refusal. The
+  corollary is operational: adding a topic is two edits that must travel together, the
+  stream's subject list and the writer's grant. The rationale is publish-side only: a
+  read-side wildcard (`a2a.topics.>` in a subscribe list) loses nothing and stays fine.
 - **Per-user inbox prefixes.** Push delivery uses inbox subjects, so each user gets its own
   prefix (`_INBOX.<user>.>`) and permission to subscribe only to that. Without this, any
   agent can subscribe to any inbox and the whole property above leaks through the reply
   path.
+- **The web read surface (amended 8/31; rewritten the same day after review).** One
+  `web` user for the read-only web UI, and the only bus credential that is published to
+  a browser by design. Subscribe on `a2a.>` and its own inbox; publish only the JetStream
+  read API - account-level `INFO`, and `STREAM.INFO`, `CONSUMER.CREATE`, `CONSUMER.INFO`,
+  `CONSUMER.MSG.NEXT` **enumerated per stream** over the four message streams - plus its
+  own inbox. It rides a websocket listener on 9222 rendered plain (`no_tls: true`) with
+  an `allowed_origins` allow-list.
+
+  **"Read-only" is not expressible as a subject list, and the first version of this user
+  proved it.** Subject permissions cannot see a request BODY, and JetStream puts the
+  reach there - a consumer's target stream, its durability and its delivery subject are
+  all fields. Reproduced live against the rendered config before the narrowing:
+  `$JS.API.CONSUMER.CREATE.>` let `web` build a push consumer on
+  `KV_session-state` delivering into its own inbox and read the session registry out of a
+  bucket it has no `$KV` grant for (subscribe permissions are not consulted at consumer
+  creation; the deliver subject is); `$JS.ACK.>` let it publish `+TERM` onto the
+  gateway's in-flight delivery, because an ack subject names a stream and a consumer and
+  never the caller. The consumer-create escape is closed by the enumeration; the ack
+  escape by deleting the grant outright - web consumers are ack-none by design, so a
+  well-behaved client needs no ack grant (and no `$JS.FC.>`: ack-none push takes no
+  flow control), while granting either would reopen what the deletion closed. Ack
+  policy is a body field, so ack-none is a design intent the grant list cannot
+  enforce - the residue is recorded below with its siblings. The lesson generalises past this
+  user: **for JetStream, a grant list is a capability surface, not a read/write
+  distinction** - enumerate the streams, and never hand a browser-facing user
+  `$JS.API.>`.
+
+  Residues, all closed by the auth callout and none of them "can read what it shouldn't":
+  durability is a body field, so withholding the legacy `DURABLE.CREATE` subject does not
+  prevent a durable - `max_consumers` per stream bounds the cost instead; ack policy is
+  the same class of body field, so a hostile holder can create an explicit-ack consumer
+  it holds no grant to ack - endless redeliveries, churn against the server, and an
+  amplifier for the deliver-subject write below; within the four
+  granted streams consumer names are the caller's choice, so `web` can pull a delivery
+  off another reader's consumer or retune it through create-as-update; and a consumer's
+  deliver subject can aim replay of stored messages at another stream's subject, which is
+  a persisted write, reaching `a2a.agents.>` (the identity plane) as easily as
+  annotations. Per-name scoping is **not** available as a mitigation: NATS wildcards match
+  whole tokens, so a `web-*` grant matches a consumer literally named `web-*` and nothing
+  else - measured, not assumed. The real closes are the callout or a separate account
+  with an export/import.
+
+  **The probe subject.** `a2a.topics.shared.probe` is provisioned into `TOPICS-STATE`
+  with **no writer in any user's publish list** - the single deliberate exception to the
+  rule above that a topic's subject list and its writer's grant travel together. It
+  exists so an authorization probe has a real provisioned subject to be refused on: a
+  refusal against an unprovisioned subject proves only that the subject is missing, while
+  a refusal here proves the grant. Aiming such a probe at a topic the fleet reads means
+  that the one time the grant is wrong, the probe writes junk into standing state; a
+  writerless subject makes that failure land nowhere.
+
+  Posture, stated accurately: plain ws puts the credential on the pod network in
+  cleartext, and the Service is ClusterIP, so nothing outside the cluster reaches it.
+  Amended 8/31: the pod network is fenced too. The operator renders an ingress
+  NetworkPolicy on the NATS pod granting **4222 to exactly the enumerated bus clients**
+  (the agent pod - whose sidecars, the Hermes bridge included, share its labels - the
+  A2A gateway, session pods by the spawner's labels, the provision Job, and the
+  hand-applied seed Job), and **no pod-network peer for 8222 or 9222**. The demo's
+  `kubectl port-forward` and the kubelet's readiness probe both enter from the node,
+  which NetworkPolicy does not govern, so the ws surface stays reachable through
+  kubectl and through nothing else in-cluster. The enumeration is today's client
+  list, and it must grow with the components this spec designs: the auth callout
+  service first of all - it is itself a bus client (a system-account subscriber on
+  the connection path), so arming it against the fence as-enumerated refuses the one
+  peer every new connection depends on and takes the fabric dark to new work - then
+  the audit exporter, the janitor, and the metrics scrape (the alert set above is
+  scraped series) each add a peer when they arm, and the NATS pods themselves join the enumeration on
+  their route port the moment the deployment leaves the single-node dev shape - a
+  3-node cluster's servers dial each other, and a fence without the route peer
+  prevents the cluster from ever forming. The topic-grant corollary that two edits
+  travel together, applied to the fence. A second policy in the same amendment
+  fences the session pods' egress (DNS, 4222 by label, LiteLLM - a spawned worker has
+  no other legitimate destination, carrying no ServiceAccount and no Workload
+  Identity; its bus credential is the static worker user until the callout arms). The origin
+  allow-list (`allowed_origins`, not `same_origin`, which can never match a UI on a
+  different port) remains the browser-side control: WebSockets are exempt from CORS,
+  so for as long as a port-forward runs, any page the operator's browser visits could
+  otherwise drive this surface.
+
 - **Bucket access is subject access.** KV and the Object Store ride internal subjects -
   `$KV.{bucket}.>`, `$O.{bucket}.C.>` / `$O.{bucket}.M.>`, plus the `$JS.API` surface for
   their streams - and the deny-by-default map grants them explicitly per role: the
@@ -176,11 +293,22 @@ deployment's job is to keep the substrate intact and reachable:
   told W is the only thing that can delete evidence. Lag is a first-class alert on
   whichever horizon is nearer: backlog age approaching W, or stream bytes approaching
   `max_bytes`.
-- The audit path is read-only by construction: the exporter's user may subscribe and may
-  not publish, enforced at connect like everything else.
-- The attribution salt the gateway hashes identifiers with is one shared Secret per
-  install, provisioned with this deployment - replicas must agree or the pseudonyms on
-  the stream stop joining.
+- The audit path is read-only by construction, and "read-only" means what the
+  JetStream tax above establishes it can mean: the exporter's user publishes nothing
+  onto the A2A subjects, and holds no grant that can destroy evidence - no purge, no
+  stream or message delete, no consumer delete beyond its own. It does hold the
+  client grants reading requires, because reading a stream is not a subscribe-only
+  act: the reserved durable `audit` consumer is created through `$JS.API`, and its
+  acks are publishes to `$JS.ACK`. A user rendered from a literal no-publish reading
+  cannot create its consumer, and would redeliver forever if it somehow had one -
+  its own lag alerts firing on a user structurally unable to make progress. Enforced
+  at connect like everything else.
+- The attribution salt the gateway hashes identifiers with is `SESSION_KV_SALT`, the
+  per-install salt the chart already provisions into `platform-agent-secrets` for the
+  shipped attribution path - not a new secret this deployment mints. Replicas must
+  read that one value or the pseudonyms on the stream stop joining, to each other and
+  to session metadata. The gateway design owns the rule and why a second salt is worse
+  than no salt.
 - W stays a tenancy decision as well as a cost one - the bus holds labelled content at rest
   for the whole window.
 

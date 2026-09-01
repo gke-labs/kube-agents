@@ -25,9 +25,11 @@ documentation and governance playbooks around them.
    `terraform/modules/<module-name>/` and consumers pin them with
    `git::https://github.com/gke-labs/kube-agents.git//terraform/modules/<module-name>?ref=1.2.0`,
    avoiding a separate module-registry backend.
-3. **RC pipeline feeds SemVer promotion.** Pre-release validation keeps using RC tags
-   (`rc_YYMMDDHHMM_<short_sha>`, `*_validated` on success — see `scripts/release/README.md`).
-4. **GA release pipeline creates stamped release child commit.** When promoting a validated
+3. **The staging rung feeds SemVer promotion.** Pre-release validation keeps using RC tags
+   (`rc_YYMMDDHHMM_<short_sha>`, `*_validated` on success), and the nightly pipeline promotes a
+   validated candidate that passes the full E2E matrix to `staging_YYMMDDHHMM_<short_sha>`. That
+   staging tag is what a GA release is gated on — see `scripts/release/README.md`.
+4. **GA release pipeline creates stamped release child commit.** When promoting a staging-promoted
    candidate, `release-publish.yml` creates a single-parent child commit on detached HEAD
    (baking `BAKED_RELEASE_VERSION` into installer scripts), tags it `MAJOR.MINOR.PATCH` (`X.Y.Z`),
    and orchestrates clean image promotion and chart publication. Because the GA tag points at this
@@ -55,7 +57,8 @@ documentation and governance playbooks around them.
 
 ```mermaid
 graph TD
-    A["RC pipeline: rc_YYMMDDHHMM_sha → *_validated"] --> B["Release Publish Workflow (release-publish.yml)"]
+    A["RC pipeline: rc_YYMMDDHHMM_sha → *_validated"] --> A2["Nightly pipeline: full E2E matrix → staging_YYMMDDHHMM_sha"]
+    A2 --> B["Release Publish Workflow (release-publish.yml)"]
     B --> C["Clean Image Promotion: retags :sha to :X.Y.Z in GHCR"]
     B --> D["CI publishes + signs OCI chart (version = appVersion = X.Y.Z)"]
     B --> E["Git tag becomes ?ref=X.Y.Z for TF modules"]
