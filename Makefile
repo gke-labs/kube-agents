@@ -13,7 +13,7 @@ BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 BASE_IMAGE_VARS := HERMES_AGENT_IMAGE ENVOY_IMAGE GOLANG_IMAGE
 BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent mirror-images images-check status prettier-check prettier-write test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests e2e-test-deps test-e2e test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-context-budget chart-sync chart-check tf-apply tf-destroy coverage coverage-check test-integration
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent mirror-images images-check status prettier-check prettier-write test-python conformance test-python-deps test-bench test-bench-deps bench-case-check e2e-tests e2e-test-deps test-e2e test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-context-budget chart-sync chart-check tf-apply tf-destroy coverage coverage-check test-integration
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -398,6 +398,13 @@ tf-apply: ## Apply terraform/examples/full-install, adopting KMS resources a pre
 
 tf-destroy: ## Destroy terraform/examples/full-install, clearing the finalizer, backups, and deletion protection first.
 	@./terraform/examples/full-install/lifecycle.sh destroy $(ARGS)
+
+# Deliberately not reached through PYTHON_TEST_DIRS: those globs live and die
+# by someone remembering them, and a conformance suite whose CI entry depends
+# on a glob is a conformance suite that stops running. It has its own
+# unfiltered workflow (.github/workflows/conformance.yml) for the same reason.
+conformance: ## Run the security invariant conformance suite (bucket 1, no cluster)
+	@python3 tests/conformance/run.py
 
 validate: ## Fail if any skill sits under agents/*/defaults/skills/.
 	@if [ -n "$(BAD_SKILLS)" ]; then \
