@@ -266,7 +266,9 @@ reason and what would close it. An entry there is a debt with a name on it.
 `bench/tasks/` are not discovered. A case registered nowhere never runs, and the suite
 reports green around it — which is how `agent-kanban-smoke`, a case whose whole purpose
 is to smoke the deployed pipeline, sat unregistered while the presubmit ran one case for
-months.
+months. A change-based selector (`hack/eval_triggers.yaml`) can additionally narrow a
+pull request's run to the tasks its changed files can affect — shadow-logged only until
+`EVAL_TASK_SELECTION=auto` is set, and falling back to the full matrix on any doubt.
 
 A commented-out entry counts as registered. That is the intended state for a case whose
 fixture or blocker is not ready: it is written down, it is greppable, and activation is

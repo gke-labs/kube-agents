@@ -1,0 +1,61 @@
+# Maps changed files to the eval tasks that must run; hack/eval_triggers.py
+# applies it. First matching bucket decides a file. Anything unmapped -- or
+# any selector failure -- runs the full matrix, so a gap costs time, never
+# coverage. Written in the restricted YAML subset the reader parses: two
+# top-level keys, scalar lists, one level of bucket fields.
+#
+# `extensions` limits what a bucket's wildcard patterns may claim; other
+# file types fall through. Literal patterns (no wildcard) skip the gate.
+# `**` crosses slashes; `*` and `?` do not.
+
+# Added to every non-empty selection: the cheapest task that proves the
+# platform->cluster-agent chain.
+floor:
+  - cluster-agent-crashloop-debug
+
+buckets:
+  # Prose and images that cannot change agent behaviour. Patterns mirror the
+  # presubmit's skip_if_only_changed (oss-test-infra), but the extension gate
+  # is narrower on purpose: docs-site build code and workflow yaml fall
+  # through. agents/** markdown is absent -- it bakes into the image.
+  - name: docs
+    kind: no-tasks
+    patterns:
+      - docs/**
+      - .github/**
+      - examples/**
+      - "*.md"
+      - LICENSE
+      - OWNERS
+      - OWNERS_ALIASES
+      - bench/tasks/DRAFTS.md
+    extensions:
+      - md
+      - mdx
+      - txt
+      - png
+      - jpg
+      - jpeg
+      - svg
+      - gif
+      - css
+
+  # A task's directory triggers that task; inactive tasks trigger nothing.
+  - name: bench-task
+    kind: task-dir
+    patterns:
+      - bench/tasks/*/**
+    extensions:
+      - yaml
+      - md
+
+  # A prebuilt stack triggers the active tasks whose task.yaml declares it;
+  # a stack no active task uses runs the full matrix.
+  - name: bench-stack
+    kind: stack-dir
+    patterns:
+      - bench/tf/prebuilt/*/**
+    extensions:
+      - tf
+      - tfvars
+      - md

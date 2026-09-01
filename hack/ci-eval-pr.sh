@@ -1068,6 +1068,56 @@ TASKS=(
   # "./tasks/cluster-agent-crashloop-fix-request/task.yaml"
 )
 
+# ─── Change-based task selection ──────────────────────────────────────────────
+# hack/eval_triggers.yaml maps changed files to the tasks that must run;
+# anything unmapped, and any selector failure, keeps the full matrix.
+# Modes: shadow (default) only logs what auto would keep; auto filters TASKS;
+# off skips the call. NONE never shrinks TASKS: whole-job skips are Prow's
+# skip_if_only_changed, so NONE inside a running job reads as a disagreement
+# between the two layers, and a disagreement gets the full matrix.
+EVAL_TASK_SELECTION="${EVAL_TASK_SELECTION:-shadow}"
+case "${EVAL_TASK_SELECTION}" in shadow | auto | off) ;; *)
+  echo "ERROR: EVAL_TASK_SELECTION must be shadow, auto or off, got '${EVAL_TASK_SELECTION}'." >&2
+  echo "A typo silently behaving as shadow is a misconfiguration on a knob meant to be flipped remotely -- refusing." >&2
+  exit 1
+  ;;
+esac
+if [ "${EVAL_TASK_SELECTION}" != "off" ] && [ -n "${PULL_BASE_SHA:-}" ]; then
+  SELECT_ACTIVE=()
+  for TASK in "${TASKS[@]}"; do
+    SELECT_ACTIVE+=("$(basename "$(dirname "${TASK}")")")
+  done
+  # Three-dot: what the PR changes, not what main gained since it branched.
+  if SELECTION="$(git -C "${SCRIPT_DIR}/.." diff --name-only "${PULL_BASE_SHA}...${PULL_PULL_SHA:-HEAD}" \
+    | python3 "${SCRIPT_DIR}/eval_triggers.py" "${SELECT_ACTIVE[@]}")"; then
+    SELECTION_KIND="$(printf '%s\n' "${SELECTION}" | head -n 1)"
+    case "${SELECTION_KIND}" in
+      SUBSET)
+        SELECTED_NAMES="$(printf '%s\n' "${SELECTION}" | tail -n +2)"
+        KEPT="$(printf '%s\n' "${SELECTED_NAMES}" | grep -c . || true)"
+        echo "task selection (${EVAL_TASK_SELECTION}): ${KEPT} of ${#TASKS[@]} tasks: $(printf '%s' "${SELECTED_NAMES}" | tr '\n' ' ')"
+        if [ "${EVAL_TASK_SELECTION}" = "auto" ] && [ "${KEPT}" -ge 1 ]; then
+          SELECTED_TASKS=()
+          for IDX in "${!TASKS[@]}"; do
+            if printf '%s\n' "${SELECTED_NAMES}" | grep -Fqx "${SELECT_ACTIVE[IDX]}"; then
+              SELECTED_TASKS+=("${TASKS[IDX]}")
+            fi
+          done
+          TASKS=("${SELECTED_TASKS[@]}")
+        fi
+        ;;
+      NONE)
+        echo "task selection (${EVAL_TASK_SELECTION}): no task triggered; running the full matrix (job-level skip is Prow's skip_if_only_changed)"
+        ;;
+      *)
+        echo "task selection (${EVAL_TASK_SELECTION}): full matrix"
+        ;;
+    esac
+  else
+    echo "task selection: selector failed; keeping the full matrix (fail closed)"
+  fi
+fi
+
 # Floor for VerificationCorrectness on a repetition of a task that declares a
 # verification_spec. 1.0 while every declared objective is meant to hold
 # outright. Exported: bench-gate reads it, so it is a starting point to tune
