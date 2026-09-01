@@ -845,23 +845,24 @@ print(m.group(1).strip('\'\"') if m else '')
 # nothing to main's side of the aggregate. Screening replaces it.
 #
 # This roster is what blocks a pull request once the Prow job stops being
-# optional. Fifteen of the sixteen active cases are admitted -- the
-# deliberate call was full coverage over a curated subset, accepting that
-# two admitted cases carry a named, tracked risk rather than a clean
-# record:
+# optional. Thirteen of the sixteen active cases are admitted: the ones
+# whose recent record shows failures only on their own regressions or on
+# infra classes the harness already excludes from the verdict. Three are
+# held out, each with a filed issue naming its exit condition -- they
+# still run and report on every pull request, they just cannot red one:
 #
 #   capacity-pinned-pool-probe            -- #1010: worker completes its
 #     card at fan-out ("Awaiting synthesis" as the final answer). The
 #     failure is correlated across repetitions when the agent chooses to
-#     fan out, so the collapse rule does not absorb it.
+#     fan out, so the collapse rule does not absorb it. Enters when the
+#     fix merges.
 #   cluster-agent-healthy-workload-no-finding -- #1100: the agent invents
 #     a finding on a healthy workload ~1 run in 8. Main's own trait, so a
-#     collapse taxes an innocent PR; rung-6 screening retires the risk.
-#
-# autoops-warning-event-triage is the one case NOT admitted -- #1101: it
-# has failed its exact checks on every graded repetition on record (0/5
-# across its two runs), so admitting it reds every pull request today.
-# It enters when #1101's bar is settled and it has a clean record.
+#     collapse would tax an innocent PR. Enters when the false-positive
+#     rate drops or when rung-6 screening can compare against main.
+#   autoops-warning-event-triage          -- #1101: 0/5 graded repetitions
+#     on record; admitting it reds every pull request today. Enters when
+#     the lettered-options bar is settled and it has a clean record.
 #
 # If an admitted case reds a pull request its diff cannot explain, demote
 # it here and reference its issue. Demotion is a one-line same-day edit to
@@ -871,7 +872,7 @@ print(m.group(1).strip('\'\"') if m else '')
 # agent-kanban-smoke earned its seat back after the 08-27 redesign (a real
 # SRE question graded on kanban_create plus cluster names); the reds that
 # once argued for un-arming it belonged to the old vocabulary check.
-export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,capacity-pinned-pool-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,rca-remediation-pr,compliance-rbac-overgrant,cluster-agent-crashloop-debug,cluster-agent-crashloop-misleading-symptom,cluster-agent-crashloop-evidence-chain,cluster-agent-healthy-workload-no-finding,gpu-stress-test-diagnosis,agent-kanban-smoke}"
+export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,rca-remediation-pr,compliance-rbac-overgrant,cluster-agent-crashloop-debug,cluster-agent-crashloop-misleading-symptom,cluster-agent-crashloop-evidence-chain,gpu-stress-test-diagnosis,agent-kanban-smoke}"
 
 # Where the evidence itself lives. Unset means bench/baselines/ in the
 # checkout: hermetic, no credential, no network -- and no way for this job to
