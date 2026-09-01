@@ -744,7 +744,7 @@ class C4ProvenanceOfExecutableContent(unittest.TestCase):
         Local reusable workflows are exempt: `uses: ./…` resolves within the
         commit under test and there is nothing to pin it to.
         """
-        workflows = sorted((h.REPO_ROOT / ".github" / "workflows").glob("*.yml"))
+        workflows = sorted((h.REPO_ROOT / ".github" / "workflows").glob("*.y*ml"))
         self.assertTrue(workflows, "no workflows found; the glob is wrong")
 
         unpinned = []

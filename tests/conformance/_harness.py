@@ -314,13 +314,16 @@ def policy_blocks(argv: list[str]) -> str | None:
     """The rule id the shipped denylist matches for `argv`, or None.
 
     Reimplements nothing: it compiles the shipped patterns with the same flags
-    `credential_proxy.Policy.load` uses and joins argv the same way
-    `Policy.blocked_by` does. Keeping the join here rather than importing
-    `blocked_by` is deliberate -- test_D15_parser_differentials.py needs to
-    vary the join to expose the checker/executor split, and it cannot do that
-    through a method that hardcodes one.
+    `credential_proxy.Policy.load` uses and builds the match text with the
+    broker's own `policy_match_text` — the normalisation `Policy.blocked_by`
+    matches against, imported rather than re-spelled so this helper cannot
+    drift into a second, quieter parser (D15's whole subject). The join stays
+    variable through `_match_rules`, which is what
+    test_D15_parser_differentials.py uses to expose the checker/executor
+    split; this function is the fidelity half, that one is the differential
+    half.
     """
-    return _match_rules(shlex.join(argv))
+    return _match_rules(credential_proxy.policy_match_text(argv))
 
 
 def _match_rules(command: str) -> str | None:

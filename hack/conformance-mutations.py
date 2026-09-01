@@ -57,7 +57,7 @@ class Mutation:
     #: True for a mutation that must NOT be caught. A suite that goes red on a
     #: harmless change is a suite people learn to override, so a no-op edit is
     #: run as a control on the harness itself: SURVIVED is the pass for these
-    #: and KILLED is the failure. One today, B1-denylist-rule.
+    #: and KILLED is the failure. Two today, B1-denylist-rule and A3-fastpath-redundant.
     must_survive: bool = False
 
 

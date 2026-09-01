@@ -289,9 +289,10 @@ class A4DelegationAttenuates(unittest.TestCase):
 
         Without `escalate`, the API server refuses to let the operator create a
         role granting permissions the operator does not itself hold. With it,
-        the ceiling in C5 is advisory. `bind` is present but restricted by
-        `resourceNames: [view]`, which is exactly the one ClusterRole the
-        operator legitimately binds an agent to.
+        the ceiling in C5 is advisory. `bind` used to be present, restricted
+        by `resourceNames: [view]`; #387 removed the rule outright, so the
+        branch below guarding a restricted bind is defence-in-depth for its
+        return rather than a description of the tree.
         """
         documents = h.yaml_documents("operator_clusterrole")
         cluster_roles = h.objects_of_kind(documents, "ClusterRole")

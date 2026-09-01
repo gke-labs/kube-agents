@@ -212,9 +212,18 @@ class Scenario5MetadataServerUnreachable(unittest.TestCase):
                     "-n", NAMESPACE, "exec", f"deployment/{AGENT}-gateway",
                     "-c", "platform-agent", "--",
                     "python3", "-c",
-                    "import socket,sys;"
-                    "s=socket.socket();s.settimeout(3);"
-                    f"sys.exit(0 if s.connect_ex(({address.strip('[]')!r},80))!=0 else 1)",
+                    # create_connection resolves the family, so the IPv6
+                    # spelling probes over AF_INET6 instead of raising
+                    # gaierror off an AF_INET socket -- which exited 1 and
+                    # read as "reached" for an address that was never tried.
+                    # Any exception is unreachability; only a completed
+                    # connection is the finding.
+                    "import socket,sys\n"
+                    "try:\n"
+                    f"    socket.create_connection(({address.strip('[]')!r}, 80), timeout=3).close()\n"
+                    "except Exception:\n"
+                    "    sys.exit(0)\n"
+                    "sys.exit(1)",
                 )
                 self.assertEqual(
                     0,

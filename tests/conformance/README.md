@@ -12,7 +12,7 @@ built, so the line is worth stating once:
 | Judged by       | an LLM                                             | an assertion                                      |
 | Deterministic   | no                                                 | yes                                               |
 | Needs a cluster | yes                                                | no, for bucket 1                                  |
-| Lives in        | not built yet; `bench/` is the intended home       | here                                              |
+| Lives in        | `bench/tasks/`, run as the Prow presubmit          | here                                              |
 
 ## Running it
 
@@ -47,9 +47,12 @@ reason rather than a missing test, and recorded in two different places
 depending on how much of the invariant is affected.
 
 Three invariants are bucket 3 _outright_ — D3, D5 and D6 have no mechanism to
-test at all. Each has a class whose docstring says `BUCKET 3`, why, and what
-would make it bucket 1, and `test_harness_selfcheck.py` fails if an invariant
-has neither a test nor such a docstring.
+test the invariant itself. Each has a class whose docstring says `BUCKET 3`,
+why, and what would make it bucket 1, and `test_harness_selfcheck.py` fails if
+an invariant has neither a test nor such a docstring. The bucket-1 tests the
+table shows under D5 and D6 pin the _reason_ — that the docstring still
+stands, and that the nearest thing to a kill switch is still not one — not
+the invariant.
 
 The other nine bucket-3 entries in the table below are _aspects_ of an
 invariant that also has bucket-1 tests — A2's staleness bound, B4's deploy
@@ -81,10 +84,12 @@ a symbol and the self-check goes red before anything gets a chance to pass
 quietly.
 
 One set of inputs is not registered: the group-B workflow tests glob
-`.github/workflows/*.yml` rather than naming each file, because the assertion
+`.github/workflows/*.y*ml` (both extensions, so a `.yaml` workflow cannot
+slip past an allowlist) rather than naming each file, because the assertion
 is about the set and a registry would have to be edited every time a workflow
-is added. Those tests assert a non-empty glob for the same reason the registry
-exists.
+is added. The non-empty-glob guard lives with C4's SHA-pin sweep; the group-B
+allowlists are guarded differently — a holder appearing or vanishing moves a
+set the test compares exactly.
 
 ## Invariant → test → bucket → historical attack
 
@@ -117,7 +122,7 @@ currently fails.
 | A3  | attached shorthand `-shttp://host` refused                       | 1        | `test_A3_rejects_attached_shorthand_server`                           | **slice 2a**: exact-token matching evaded by pflag's attached shorthand                                                                                                                                            |
 | A3  | …and `--sort-by`/`--since`/`--selector` still work               | 1        | `test_A3_the_attached_shorthand_rule_does_not_overreach`              | the over-broad fix that breaks reads and gets switched off                                                                                                                                                         |
 | A3  | a request with no verified principal is refused                  | 2        | `Scenario4NoVerifiedIdentity`                                         | a session with no principal executed under the agent's own identity, which makes D1 unenforceable                                                                                                                  |
-| A3  | the session-inject endpoint authenticates its caller             | 1 **KV** | `test_A3_the_session_inject_endpoint_authenticates_its_caller`        | **slice 2b 1.8**: `/sessions/{id}/inject` on `0.0.0.0:8699`, no auth, triggers a full agent turn                                                                                                                   |
+| A3  | the session-inject endpoint authenticates its caller             | 1        | `test_A3_the_session_inject_endpoint_authenticates_its_caller`        | **slice 2b 1.8, closed on main**: was `/sessions/{id}/inject`, no auth, full agent turn; the server now requires the key and binds loopback, and the test keeps it that way                                        |
 | A4  | the operator cannot escalate its own grants                      | 1        | `test_A4_the_operator_cannot_escalate_its_own_grants`                 | a controller with RBAC CRUD and `escalate` makes every ceiling advisory                                                                                                                                            |
 | A4  | the chart grants the same ceiling as the kustomize role          | 1        | `test_A4_the_chart_grants_the_same_ceiling_as_the_kustomize_role`     | a ceiling asserted on one install path only                                                                                                                                                                        |
 | A4  | triggering is delegation                                         | 1        | `test_A4_triggering_is_covered_by_the_A3_inject_finding`              | see A3 above — the one instance in this codebase                                                                                                                                                                   |
@@ -148,9 +153,9 @@ currently fails.
 | C1  | the backend socket is bound _under_ a private umask              | 1        | `test_C1_the_broker_backend_socket_is_bound_private`                  | **slice 2b §3**: `umask 0002` for the shared PVC would have taken the socket from 0600 to group-writable                                                                                                           |
 | C1  | the executor never reaches a shell                               | 1        | `test_C1_the_executor_never_reaches_a_shell`                          | `realtime_iam`: a compound command with a read verb first; `#` neutralising appended flags                                                                                                                         |
 | C1  | the executor refuses an executable it does not ship              | 1        | `test_C1_the_executor_refuses_an_executable_it_does_not_ship`         | `sh -c` as the landing pad for the two above                                                                                                                                                                       |
-| C1  | `git` in the broker cannot execute arbitrary code                | 1 **KV** | `test_C1_git_in_the_broker_cannot_execute_arbitrary_code`             | **slice 2b 1.1**: `git -c protocol.ext.allow=always clone "ext::sh -c"` — RCE in the credential holder                                                                                                             |
-| C1  | the rendered egress policy is default-deny                       | 1        | `test_C1_the_rendered_egress_policy_is_default_deny`                  | **slice 2b 1.3**: `0.0.0.0/0 except 169.254.169.254/32` adds the internet rather than subtracting the address                                                                                                      |
-| C1  | the rendered egress policy reaches no metadata address           | 1        | `test_C1_the_rendered_egress_policy_reaches_no_metadata_address`      | a guard written against one of the three spellings                                                                                                                                                                 |
+| C1  | `git` in the broker cannot execute arbitrary code                | 1        | `test_C1_git_in_the_broker_cannot_execute_arbitrary_code`             | **slice 2b 1.1, closed on main**: was `git -c protocol.ext.allow=always clone "ext::sh -c"` — RCE in the credential holder — until the git hardening landed                                                        |
+| C1  | the rendered egress policy is default-deny                       | 1 **KV** | `test_C1_the_rendered_egress_policy_is_default_deny`                  | **slice 2b 1.3, and back**: `0.0.0.0/0 except 169.254.169.254/32` adds the internet rather than subtracting the address — #676 gave the gateway policy exactly that rule, so this is a violation again             |
+| C1  | the rendered egress policy reaches no metadata address           | 1 **KV** | `test_C1_the_rendered_egress_policy_reaches_no_metadata_address`      | a guard written against one of the three spellings; a violation again since #676 for the same reason as the row above                                                                                              |
 | C1  | every operator-supplied CIDR reaches the refusal guards          | 1        | `test_C1_every_operator_supplied_cidr_reaches_the_refusal_guards`     | a new CRD field that accepts a CIDR and never calls the guard                                                                                                                                                      |
 | C1  | the metadata server is unreachable from the sandbox              | 2        | `Scenario5`                                                           | the controller deleting the metadata-deny NetworkPolicy; the credential-free sandbox minting the GSA token                                                                                                         |
 | C1  | a violating request is rejected by the API server                | 2        | `Scenario6`                                                           | **slice 2b 1.2**: kustomize `namePrefix` leaving the policy applied and silently inert                                                                                                                             |
@@ -236,8 +241,11 @@ python3 hack/conformance-mutations.py --list
 python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 ```
 
-74 mutations: 55 KILLED, 18 NOISY, one deliberately harmless as a control on
-the harness itself, zero genuine survivors, zero stale. Each names the control
+76 mutations: 59 KILLED, 15 NOISY, two `must_survive` controls (one on the
+harness itself, one pinning a deliberate redundancy in the shorthand
+handling), zero genuine survivors, zero stale — as of the re-land against
+2026-09-01's `main`; re-run the harness rather than trusting these numbers,
+which is the sentence this paragraph exists to make cheap. Each names the control
 it removes, the test that must notice, and the plausible bad change it
 imitates. It is not run in CI — it edits tracked files in place — so it is a
 thing to run when adding a test, which step 4 below says to do.

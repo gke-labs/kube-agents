@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Run the conformance suite standalone.
+"""Run the conformance suite. This runner is the suite's only entry.
 
-`python3 -m unittest discover -s tests` finds this suite too, and that is how
-CI runs it. This exists so the suite can be run on its own without anyone
-having to remember that `-t tests` is required for the package-relative imports
-to resolve — the sort of invocation detail that ends with someone running
-`discover -s tests/conformance`, collecting zero tests, and reading the `OK`.
+Root discovery (`make test-python`'s `discover -s tests`) deliberately
+collects nothing from this package: the package __init__ defines a
+`load_tests` that returns an empty suite, because the alternative was the
+suite running twice per pull request with bucket 2 surfacing as skips in the
+run that cannot honour the bucket split. This file therefore loads the test
+modules by name rather than by discovery, so the guard cannot hide the suite
+from its own runner.
 
     python3 tests/conformance/run.py            # bucket 1
     python3 tests/conformance/run.py --bucket2  # include the cluster scenarios
@@ -20,6 +22,7 @@ decorator.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import os
 import sys
 import unittest
@@ -50,17 +53,26 @@ def main() -> int:
 
     sys.path.insert(0, str(TESTS_DIR))
     loader = unittest.TestLoader()
-    suite = loader.discover(
-        start_dir=str(CONFORMANCE_DIR),
-        pattern=arguments.pattern,
-        top_level_dir=str(TESTS_DIR),
+    suite = unittest.TestSuite()
+    module_files = sorted(CONFORMANCE_DIR.glob("test_*.py")) + sorted(
+        (CONFORMANCE_DIR / "bucket2").glob("test_*.py")
     )
-    if loader.errors:
-        # discover() reports an unimportable module as a synthetic failing test.
-        # Saying so here as well, because "1 test, 1 error" from a suite of a
-        # hundred is easy to read as a single broken assertion.
+    import_failures = 0
+    for module_file in module_files:
+        if not fnmatch.fnmatch(module_file.name, arguments.pattern):
+            continue
+        name = ".".join(module_file.relative_to(TESTS_DIR).with_suffix("").parts)
+        try:
+            suite.addTests(loader.loadTestsFromName(name))
+        except Exception as error:  # noqa: BLE001 - report and keep loading
+            import_failures += 1
+            print(f"failed to import {name}: {error}", file=sys.stderr)
+    if import_failures:
+        # An unimportable module would otherwise vanish from the run entirely.
+        # Saying so here, because a green suite that quietly lost a module is
+        # the failure mode this runner exists to prevent.
         print(
-            f"{len(loader.errors)} test module(s) failed to import; the suite "
+            f"{import_failures} test module(s) failed to import; the suite "
             f"below is incomplete.",
             file=sys.stderr,
         )
@@ -74,6 +86,8 @@ def main() -> int:
         return 2
 
     result = unittest.TextTestRunner(verbosity=1 if arguments.quiet else 2).run(suite)
+    if import_failures:
+        return 1
     return 0 if result.wasSuccessful() else 1
 
 

@@ -41,8 +41,11 @@ EXCLUDED = {
     # Has its own runner (`make conformance` -> tests/conformance/run.py) and
     # its own unfiltered workflow (conformance.yml), deliberately outside the
     # globs: the suite's premise is that its CI entry must not depend on a
-    # glob being remembered. bucket2 additionally needs a live cluster and is
-    # opt-in through KUBE_AGENTS_CONFORMANCE_CLUSTER.
+    # glob being remembered. The exclusion is enforced, not just stated -- the
+    # package's load_tests returns an empty suite to root discovery, so the
+    # `tests/` glob cannot sweep it in through package recursion. bucket2
+    # additionally needs a live cluster and is opt-in through
+    # KUBE_AGENTS_CONFORMANCE_CLUSTER.
     "tests/conformance": "own runner and workflow, conformance.yml",
     # pytest-native (fixtures, parametrize); unittest discovery collects two
     # of its tests and errors on both. Runs under `make test-bench`.

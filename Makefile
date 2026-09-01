@@ -402,7 +402,9 @@ tf-destroy: ## Destroy terraform/examples/full-install, clearing the finalizer, 
 # Deliberately not reached through PYTHON_TEST_DIRS: those globs live and die
 # by someone remembering them, and a conformance suite whose CI entry depends
 # on a glob is a conformance suite that stops running. It has its own
-# unfiltered workflow (.github/workflows/conformance.yml) for the same reason.
+# unfiltered workflow (.github/workflows/conformance.yml) for the same reason,
+# and the package's load_tests refuses root discovery so `make test-python`
+# cannot also half-run it with bucket 2 surfacing as skips.
 conformance: ## Run the security invariant conformance suite (bucket 1, no cluster)
 	@python3 tests/conformance/run.py
 

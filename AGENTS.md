@@ -41,6 +41,10 @@ did not expect, or nowhere at all, and the suite reports green around it.
   `tests/` when there is nothing to sit beside, as for a shell script or a rendered manifest; or in
   `tests/integration/` when it spans two components.
   See [`tests/integration/README.md`](tests/integration/README.md).
+  One carve-out: a **security or permissions invariant** goes in `tests/conformance/`, which runs
+  on every pull request through its own runner and workflow and adds duties the ordinary tiers do
+  not have — an anchor in the self-check registry and a mutation in the harness.
+  [`tests/conformance/README.md`](tests/conformance/README.md) is the contract.
 - **Yes, and you plant the defect it has to find** — it is an eval, it belongs in
   `bench/tasks/<name>/task.yaml`, and it runs in the Prow presubmit, so adding one changes what
   every pull request reports. [`docs/designs/bench-case-format.md`](docs/designs/bench-case-format.md)
@@ -56,7 +60,9 @@ did not expect, or nowhere at all, and the suite reports green around it.
 
 One rule holds wherever it lands: a new test directory only runs if a `PYTHON_TEST_DIRS` glob in the
 `Makefile` reaches it, and a directory the globs miss fails nothing — it sits unexecuted while the
-suite reports green around it. Add the glob in the same change.
+suite reports green around it. Add the glob in the same change. (`tests/conformance/` is the one
+deliberate exception: its CI entry is its own unfiltered workflow, precisely so it cannot be lost
+to a forgotten glob, and its package refuses root discovery so it cannot half-run by accident.)
 
 The ten homes, what runs each, and how far "runs on a pull request" is from "gates a merge" are in
 [`docs/testing-map.md`](docs/testing-map.md).

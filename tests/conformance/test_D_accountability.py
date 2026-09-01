@@ -159,7 +159,9 @@ class D2AutonomyIsADial(unittest.TestCase):
         if docs.is_dir():
             offenders = [
                 str(page.relative_to(h.REPO_ROOT))
-                for page in docs.rglob("*.md")
+                # .mdx too: the site's index and several install pages are
+                # MDX, and an escape hatch documented there is documented.
+                for page in list(docs.rglob("*.md")) + list(docs.rglob("*.mdx"))
                 if name in page.read_text()
             ]
             self.assertEqual(

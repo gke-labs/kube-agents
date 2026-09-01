@@ -25,7 +25,12 @@ import yaml
 from . import _harness as h
 from ._harness import command_policy
 
-WORKFLOWS = sorted((h.REPO_ROOT / ".github" / "workflows").glob("*.yml"))
+WORKFLOWS = sorted(
+    # Both extensions: GitHub Actions accepts .yaml too, and every assertion
+    # over this set is an allowlist -- a workflow added as .yaml would
+    # otherwise escape all of them silently.
+    (h.REPO_ROOT / ".github" / "workflows").glob("*.y*ml")
+)
 
 
 def _workflow_documents():
