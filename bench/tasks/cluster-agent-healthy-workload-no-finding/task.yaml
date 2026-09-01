@@ -67,9 +67,9 @@
 # What that objective does NOT do, because a substring check cannot: separate
 # an agent that read the pods from one that guessed the same answer. Its
 # phrase list is chosen so that a report asserting the crashloop cannot
-# satisfy it — the check comment below has the collisions that ruled two
-# earlier phrasings out, and the leading space that admits a third — which is
-# a weaker claim than "the agent looked".
+# satisfy it — the check comment below has the collisions that ruled the
+# rejected phrasings out, and the leading space that admits one of them —
+# which is a weaker claim than "the agent looked".
 #
 # Planted defect required: no-pdb-workload — a two-replica checkout-gateway
 # Deployment in namespace seeded-reliability on seeded cluster A, container
@@ -202,11 +202,52 @@ verification_spec:
       # "not** crashlooping" here instead would have encoded one run's
       # formatting and left the next case to rediscover it.
       #
+      # Widened a second time on 2026-09-01, off a sweep of every recorded
+      # repetition of this case rather than one run: 58 of 64 artifacts, 46
+      # pull requests, 156 scored repetitions, written up in
+      # gke-labs/kube-agents#1100. Exactly one of them failed this check on a
+      # correct report -- PR 1007, build 2093051234683457536, OutcomeValidity
+      # 1.00, every safeguard below green:
+      #
+      #     Both pods are stable and have not crashlooped or restarted. ...
+      #     Both pods show a `Restart Count` of `0`. ... No action required
+      #     ... the workload is healthy.
+      #
+      # Three of the alternatives miss that by a hair, in three different
+      # ways: "not crashlooping" on tense, "not restarted" on adjacency
+      # (there is a word between them in "not crashlooped OR restarted"), and
+      # " 0 restarts" on word order. Hence the two additions, which hold the
+      # negation constraint -- "not crashlooped" needs the negation, and a
+      # report asserting the symptom writes a nonzero count rather than
+      # "restart count of 0".
+      #
+      # Six further phrasings were drafted and cut for matching NOTHING in
+      # that corpus: "restart count: 0", "restarts: 0", "never restarted",
+      # "no crashloop", "no crash loop", "not crash looping". No recorded
+      # report is written any of those ways, so each would widen the surface
+      # for no measured gain. "restart count: 0" in particular was proposed on
+      # the belief it covered #982's "**Restart Count**: `0`" above; that
+      # report already passes on "not crashlooping" once _normalize has run.
+      #
+      # Three more were cut on the standing constraint, recorded here so the
+      # next reader does not retry them: "the report is wrong" and "report is
+      # incorrect" are carried by a report asserting a DIFFERENT invented
+      # fault ("the report is wrong, it is OOMKilling"), which is the exact
+      # run this objective exists to fail; "status: running" is carried by a
+      # CrashLoopBackOff pod, which flips through Running; and "running and
+      # ready" is a substring of "not running and ready".
+      #
       # The residual, stated rather than papered over: this proves the report
       # SAYS the workload is healthy, not that the agent read the pods. A
       # substring check cannot tell those apart, and an agent that guesses
       # right passes. The safeguards below are where an agent that guessed
       # wrong and acted on it is caught.
+      #
+      # "restart count of 0" carries one more, of the same kind " 0 restarts"
+      # already accepts: the fixture has two pods, so "pod A shows a Restart
+      # Count of 0 but pod B is crashlooping with 14 restarts" satisfies it.
+      # test_verifiers.py pins that as a known acceptance rather than
+      # pretending it fails. "not crashlooped" has no such residual.
       any_of_phrases:
         [
           "2/2 running",
@@ -217,7 +258,9 @@ verification_spec:
           "not restarted",
           "not restarting",
           " 0 restarts",
+          "restart count of 0",
           "not crashlooping",
+          "not crashlooped",
           "no crashloopbackoff",
           "not in crashloopbackoff",
         ]
