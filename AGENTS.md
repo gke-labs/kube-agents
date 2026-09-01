@@ -430,15 +430,6 @@ reply and leave it to them. Resolving says the conversation is finished; it is n
 disagreement. Reply first, always: a resolved thread collapses, so the reply naming what changed and
 the commit that changed it is the only record the reviewer may ever see.
 
-**Merge is external.** Nothing in this repository merges. Once every
-conversation is resolved and a human has approved, external automation (tide)
-merges when the `lgtm` and `approved` labels are present and the required checks
-pass. Fork contributors wait on `needs-ok-to-test` until a human applies
-`ok-to-test`, and `do-not-merge/hold` holds a PR. These labels and the merge
-config live in the external tide setup, not in this repository, so `git grep`
-will not find them; the live repo's label set and tide status are the source of
-truth. The contributor protocol in `agents/contributor/AGENTS.md` names them.
-
 ## Before Reviewing Someone Else's Pull Request
 
 The section above is about your own pull request being reviewed, and it already says where a

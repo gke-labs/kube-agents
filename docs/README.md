@@ -175,7 +175,7 @@ identifier appears, add its source here.
 | Context budget for the always-loaded agent instruction files (`AGENTS.md`, `CLAUDE.md`) | `BUDGET` in `scripts/check_context_budget.py` |
 | Who may set the `approved` label on a change | `OWNERS`, `k8s-operator/OWNERS`, and `OWNERS_ALIASES` |
 | Which labels Tide merges on, and which Prow presubmits gate | `prow/oss/config.yaml` and `prow/prowjobs/gke-labs/kube-agents/` in `GoogleCloudPlatform/oss-test-infra` — not a file in this repository |
-| Contributor-agent merge labels (`lgtm`, `approved`, `ok-to-test`, `do-not-merge/hold`) and the `triage` permission grant | external tide automation and GitHub repo settings (not in-tree); named in `AGENTS.md` "Automated Review" and `agents/contributor/AGENTS.md` |
+| Contributor-agent merge labels (`lgtm`, `approved`, `ok-to-test`, `do-not-merge/hold`) and the `triage` permission grant | external tide automation and GitHub repo settings (not in-tree); named in `AGENTS.md` and `agents/contributor/AGENTS.md` |
 | Testing-domain slugs a bench case may claim | `docs/designs/domains.yaml` |
 | Seeded-fleet fixture role names and the cluster slot each lives on | `bench/tf/fleet/fixtures.json` |
 | Day-N availability gate per fixture, and the project-scoped fixtures that sit on no cluster | `docs/designs/fleet-fixtures.yaml`, which overlays `fixtures.json` and may not rename a role |

@@ -48,8 +48,8 @@ cycle.
    substantial. A clean pass is what puts the change in front of a human
    reviewer, so trigger it yourself rather than waiting. If `lgtm` is present,
    you are done only when the full merge gate holds - `lgtm` _and_ `approved`
-   present and the required checks passing (and `ok-to-test` applied for a
-   fork PR). The system then merges; you never do. `lgtm` alone is not the
+   present and the required checks passing (and `ok-to-test` applied when Prow
+   does not trust the author). The system then merges; you never do. `lgtm` alone is not the
    finish line: verify the rest before moving on. If `do-not-merge/hold` is
    present, read the comment explaining why and wait.
 2. **Continue in-progress work.** If you have an assigned issue with a branch
