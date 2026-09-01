@@ -136,28 +136,65 @@ def tool_operations(
 #: must score the reply that follows them, or a journey whose specialist never
 #: reported back would be judged on boilerplate.
 _DELEGATION_ACK = re.compile(
-    r"delegated to the platform agent"
-    r"|\bstarted this\b[^.\n]{0,80}\btask t_[0-9a-f]+"
-    r"|\btask t_[0-9a-f]+\b"
+    r"\b(?:delegated|delegating|routed|assigned|handed off|started)\b"
+    r"[^.\n]{0,120}"
+    r"(?:\bplatform agent\b|\btask t_[0-9a-f]+\b|\bwill post\b)"
     r"|\bwill post\b[^.\n]{0,60}\b(?:thread|here)\b",
     re.IGNORECASE,
 )
 
 
 def substantive_output(interaction: dict[str, Any]) -> str:
-    """The user-visible answer with leading delegation acknowledgments skipped.
+    """The user-visible answer with leading delegation acknowledgments removed.
 
-    Splits the terminal output into paragraphs and drops leading ones that
-    read as hand-off boilerplate. Returns an empty string when nothing but
-    the acknowledgment ever arrived, which is itself the finding.
+    Acknowledgments are dropped sentence by sentence rather than paragraph by
+    paragraph: a coordinator that opens its answer with "Delegated to the
+    platform agent. Here is the design: ..." must keep the design, while an
+    interaction that only ever acknowledged returns the empty string — that
+    silence is the finding, not something to paper over.
     """
 
     text = str(interaction.get("output") or "")
-    paragraphs = re.split(r"\n\s*\n", text)
-    index = 0
-    while index < len(paragraphs) and _DELEGATION_ACK.search(paragraphs[index]):
-        index += 1
-    return "\n\n".join(paragraphs[index:]).strip()
+    kept: list[str] = []
+    skipping = True
+    for paragraph in re.split(r"\n\s*\n", text):
+        if not skipping:
+            kept.append(paragraph)
+            continue
+        sentences = re.split(r"(?<=[.!?])\s+", paragraph.strip())
+        remainder = list(sentences)
+        while remainder and _DELEGATION_ACK.search(remainder[0]):
+            remainder.pop(0)
+        if remainder:
+            skipping = False
+            kept.append(" ".join(remainder))
+    return "\n\n".join(kept).strip()
+
+
+def latest_artifact(
+    artifacts: list[dict[str, Any]],
+    *,
+    kind: str = "",
+    artifact_type: str = "",
+) -> dict[str, Any] | None:
+    """The most recent artifact matching a manifest kind and/or record type.
+
+    Latest wins: a worker that attaches a corrected manifest supersedes its
+    earlier attempt, exactly as a re-uploaded file would. Both CUJ scenarios
+    read artifacts through this, so they cannot grade the same recorder
+    behavior in opposite directions.
+    """
+
+    for artifact in reversed(artifacts):
+        manifest = artifact.get("manifest")
+        if not isinstance(manifest, dict):
+            continue
+        if kind and manifest.get("kind") != kind:
+            continue
+        if artifact_type and artifact.get("type") != artifact_type:
+            continue
+        return artifact
+    return None
 
 
 def unnormalized_tool_calls(interaction: dict[str, Any]) -> list[str]:
