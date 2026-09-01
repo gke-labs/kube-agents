@@ -84,8 +84,8 @@ domain: incident-triage
 #     k8s-evt-* cards on the live install, an uncontended card runs a median of
 #     ~7 minutes. An agent that reads the board once will find it running.
 #  3. Verbatim reproduction. The phrase checks read the final message, and a
-#     summary of a correct report drops exactly the lettered options the
-#     objective is looking for.
+#     summary of a correct report drops exactly the "What to do" section and
+#     its call to action that the delivery objective is looking for.
 #
 # It names the namespace, because that is how the card is found, and nothing
 # else the scenario planted. Not the workload, not the reason, not the limit --
@@ -234,7 +234,7 @@ verification_spec:
       # remediations a cause warrants is the agent's call, and the template
       # says so.
       #
-      # Two ways this is deliberately weaker than `actionable_report`, neither
+      # Three ways this is deliberately weaker than `actionable_report`, none
       # of which is reachable by a report that failed honestly:
       #  * Not positional. The notifier searches for the option or the
       #    authorize bullet AFTER the heading match; a substring check cannot,
@@ -243,12 +243,18 @@ verification_spec:
       #  * Not case-sensitive on the letter. `_OPTION_RE` is, on purpose ("a
       #    lowercase 'option a' in prose is a sentence, not a label"), while
       #    `_normalize` lowercases both sides.
+      #  * Not a heading. `_WHAT_TO_DO_RE` requires one -- `^ {0,3}#{1,6} +what
+      #    to do` -- so the notifier rejects the phrase in running prose and
+      #    this check accepts it.
       #
-      # "What to do" without a leading # so the check does not pin the heading
-      # depth: normalization strips *, _ and ` but leaves # alone. That same
-      # stripping is what lets "To authorize:" match every emphasis spelling
-      # the notifier needed a lookbehind for -- `**To authorize:**`,
-      # `**To authorize**:`, `__To authorize__:` all normalize alike.
+      # That last one is why "What to do" is written here without a leading #:
+      # pinning the heading depth is not on offer, because normalization strips
+      # *, _ and ` but leaves # alone, so a literal "## What to do" would red on
+      # the "###" the template is equally free to emit. The looser phrase is the
+      # deliberate trade. That same stripping is what lets "To authorize:" match
+      # every emphasis spelling the notifier needed a lookbehind for --
+      # `**To authorize:**`, `**To authorize**:`, `__To authorize__:` all
+      # normalize alike.
       #
       # bench/tests/test_triage_delivery_contract.py holds this check and that
       # template together; a reword on either side reds there.

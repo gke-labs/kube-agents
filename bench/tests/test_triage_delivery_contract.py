@@ -30,22 +30,38 @@ template:
 * ``autoops-warning-event-triage``'s delivery objective decides whether the eval
   case passes. Phrase lists in a task.yaml.
 
-So one decision lives in three files, joined by string literals, and nothing
-executes all three together. A reword of the template silently un-gates both
-readers: the notifier stops writing the row (the #802 failure, reintroduced with
-nothing red) and the eval check stops asserting delivery while still reporting
-green. That is the drift this module exists to catch, and it is the same
-silent-green shape scripts/test_integration_contracts.py was written for — it
-cannot live there because ``verifiers`` needs pydantic and devops-bench, which
-only the bench environment has.
+So one decision lives in three files, joined by string literals. **The
+template↔notifier half of that join is already held**, by
+``test_the_gate_recognises_the_shape_the_template_asks_the_agent_for`` in
+agents/platform/scripts/test_triage_reply_roundtrip.py, which calls the real
+``_triage_task_body`` and drives ``actionable_report`` on both shapes; it runs
+on every pull request. The half nobody held is task.yaml↔template — a reword
+there leaves the eval check asserting a string nothing writes, and a check no
+report can satisfy reds the case rather than the reword, so the diagnosis lands
+a long way from the edit. That is what this module is for.
+
+The notifier assertions below are kept anyway, and they are the smaller half of
+this file's value: the roundtrip test transcribes its exemplars by hand, while
+these are cut from the template's own text, so a reword moves them with it. Read
+them as the cross-check that the two gates have not diverged on the shapes the
+template emits, not as first coverage of a join that had none.
+
+Living in bench/tests/ rather than scripts/test_integration_contracts.py is
+forced by ``verifiers``, which imports devops_bench — the bench environment is
+the only one that has it. (pydantic, the other heavy import, is in the root test
+environment already; Makefile PYTHON_TEST_IMPORTS names it.) Only the two tests
+that instantiate ``ReportContainsVerifier`` actually need that; the phrase-join
+test needs nothing beyond ``ast`` and ``yaml``, and is here to sit with them.
 
 What is NOT asserted here is that the two gates are equivalent. They are not:
 ``actionable_report`` searches for the option or authorize bullet strictly after
-the heading, and is case-sensitive on the option letter, while the eval check is
-a normalized substring match that can do neither. The claim is narrower and is
-the one that matters — **on the shapes the template actually produces, both
-gates say yes** — plus a negative on each, so a gate that accepts everything
-fails here rather than passing quietly.
+the heading, requires that heading to be a real markdown heading, and is
+case-sensitive on the option letter, while the eval check is a normalized
+substring match that can do none of the three. The task.yaml comment enumerates
+all three and says why each is an acceptable relaxation. The claim here is
+narrower and is the one that matters — **on the shapes the template actually
+produces, both gates say yes** — plus negatives, so a gate that accepts
+everything fails here rather than passing quietly.
 
 The template is read as TEXT rather than imported: ``session_kv_server`` pulls in
 fastapi, ``agent_common_server`` and mcp, none of which the bench environment
@@ -58,6 +74,7 @@ quoting and escapes are Python's problem and not ours.
 from __future__ import annotations
 
 import ast
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -70,9 +87,10 @@ from kube_agents_bench.verifiers import ReportContainsVerifier
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 #: The case whose delivery objective this module pins. One case, deliberately:
-#: the sibling AutoOps cases carry no delivery objective (see #1103), and a glob
-#: over the directory would silently cover nothing on the day this one is
-#: renamed.
+#: it is currently the only one in `domain: incident-triage` and the only one
+#: carrying a delivery objective at all (#1103's sibling case drops its own,
+#: citing the very defect this module's check fixes), and a glob over the
+#: directory would silently cover nothing on the day this one is renamed.
 CASE_PATH = REPO_ROOT / "bench" / "tasks" / "autoops-warning-event-triage" / "task.yaml"
 CHECK_NAME = "triage-delivers-an-actionable-report"
 
@@ -80,16 +98,21 @@ CHECK_NAME = "triage-delivers-an-actionable-report"
 TEMPLATE_MODULE = REPO_ROOT / "agents" / "platform" / "scripts" / "session_kv_server.py"
 TEMPLATE_FUNCTION = "_triage_task_body"
 
-#: ``kanban_notifier`` is stdlib-only at module level, so a path append is the
-#: whole import ceremony.
+#: The notifier is a Dockerfile-applied patch that lands flat at
+#: ``/opt/hermes/gateway/`` in the image and has no package in the checkout, so
+#: it is loaded by path below — and its directory goes on ``sys.path`` too,
+#: because it imports siblings (``kanban_handoff_clip``) the way it will find
+#: them at runtime, side by side in one directory.
 NOTIFIER_DIR = REPO_ROOT / "deploy" / "docker" / "patches"
+NOTIFIER_PATH = NOTIFIER_DIR / "kanban_notifier.py"
 
 #: Where each shape starts and stops inside the template text. Each of these is
 #: unique in it, and an anchor that stops matching means the template was
 #: reworded — which is a red worth having rather than a lenient fallback.
 SINGLE_OPTION_ANCHOR = "- **Proposed fix ("
 SINGLE_OPTION_BULLETS = 2
-WHAT_TO_DO_HEADING = "## What to do"
+WHAT_TO_DO_PHRASE = "What to do"
+WHAT_TO_DO_HEADING = f"## {WHAT_TO_DO_PHRASE}"
 LETTERED_END_ANCHOR = "\U0001f517"  # the console-links line that follows the section
 
 #: A report the front door might deliver instead of the card's own: true about
@@ -104,9 +127,35 @@ SUMMARY_ONLY_REPORT = (
 #: separates "has the heading" from "offers something".
 EMPTY_SECTION_REPORT = "## What's wrong\n\nIt is OOMKilled.\n\n## What to do\n\n- Look into it.\n"
 
-sys.path.insert(0, str(NOTIFIER_DIR))
+#: A call to action with no section to hang it on. The negative that separates
+#: "offers something" from "has the heading" — the other direction from
+#: EMPTY_SECTION_REPORT, and the one that reds if the case ever stops requiring
+#: the heading phrase while keeping its any_of alternatives.
+NO_HEADING_REPORT = (
+    "It is OOMKilled. Raise the limit to 128Mi.\n\n"
+    "- **To authorize:** reply **'apply'** to open a GitOps Pull Request.\n"
+)
 
-from kanban_notifier import actionable_report  # noqa: E402
+#: append, not insert(0, ...). deploy/docker/patches/ holds some eighty flat
+#: modules, twenty-odd of them named ``test_*.py``, and putting that in FRONT of
+#: the path would shadow same-named modules for the rest of the pytest session.
+#: The tail is enough to resolve the notifier's siblings.
+sys.path.append(str(NOTIFIER_DIR))
+
+
+def _load(name: str, path: Path):
+    """Import a module by file path, the way the runtime loads it.
+
+    agents/platform/scripts/test_triage_reply_roundtrip.py loads this same
+    module this same way, with the same path append beside it.
+    """
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+actionable_report = _load("kanban_notifier", NOTIFIER_PATH).actionable_report
 
 
 def _template_text() -> str:
@@ -216,12 +265,17 @@ def test_the_notifier_gate_accepts_both_template_shapes(shape):
     assert actionable_report(_report_shapes()[shape])
 
 
-@pytest.mark.parametrize("report", [SUMMARY_ONLY_REPORT, EMPTY_SECTION_REPORT])
+@pytest.mark.parametrize(
+    "report", [SUMMARY_ONLY_REPORT, EMPTY_SECTION_REPORT, NO_HEADING_REPORT]
+)
 def test_both_gates_reject_a_report_with_nothing_to_act_on(report):
     """Neither gate may be satisfiable by everything.
 
     Without this the module would pass just as happily against a check that
-    asserted nothing, which is the failure it was written to prevent.
+    asserted nothing, which is the failure it was written to prevent. The three
+    exemplars fail in three different ways — no section, a section with nothing
+    under it, and a call to action with no section — so a relaxation on either
+    side of the contract trips at least one of them.
     """
     assert not _eval_check_accepts(report)
     assert not actionable_report(report)
@@ -237,7 +291,15 @@ def test_every_phrase_the_case_requires_is_still_in_the_template():
     """
     text = _template_text()
     check = _delivery_check()
-    missing = [p for p in check.get("required_phrases", []) if p not in text]
+    required = check.get("required_phrases", [])
+    assert WHAT_TO_DO_PHRASE in required, (
+        f"{CHECK_NAME} no longer requires {WHAT_TO_DO_PHRASE!r}. `actionable_report` "
+        "hard-requires that heading and returns False without it, so a case that "
+        "stops asking for it passes reports the production gate would refuse. "
+        "Without this assertion an empty required_phrases satisfies every check "
+        "below vacuously."
+    )
+    missing = [p for p in required if p not in text]
     assert not missing, f"{CHECK_NAME} requires phrases the template no longer writes: {missing}"
     alternatives = check.get("any_of_phrases", [])
     assert alternatives, (

@@ -322,8 +322,11 @@ class TriageReplyRoundTripTest(unittest.TestCase):
         self.assertEqual(row[0][2], REPORT.strip())
 
     def test_the_gate_recognises_the_shape_the_template_asks_the_agent_for(self):
-        # The one coupling between the two halves of this change, and the only
-        # test in the repository that has both in scope. `actionable_report`
+        # The one coupling between the two halves of this change, held here
+        # against hand-written exemplars and again in
+        # bench/tests/test_triage_delivery_contract.py against exemplars cut
+        # from the template's own text (which also holds the third reader, the
+        # autoops-warning-event-triage eval case). `actionable_report`
         # lives in deploy/docker/patches/ and matches two literals; the template
         # that makes an agent produce them lives here. Reword the heading to
         # "## Recommended actions", or the labels to "Choice A", and every other
