@@ -1,0 +1,5 @@
+kubernetes>=29.0.0
+pyyaml>=6.0
+pydantic>=2.0.0
+matplotlib>=3.8.0
+rich>=13.0.0
