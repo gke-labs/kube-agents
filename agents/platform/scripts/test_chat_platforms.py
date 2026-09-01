@@ -147,7 +147,7 @@ class ConfigFileTest(unittest.TestCase):
     def test_valueless_enabled_is_not_an_explicit_no(self):
         # `enabled:` with nothing after it parses to None. That is "this file does not
         # say", not "this file says no", so it must not outrank the relay URL the
-        # operator rendered — the distinction _config_enabled's docstring promises.
+        # operator rendered — the distinction _platforms_enabled_in's docstring promises.
         with _config("platforms:\n  slack:\n    enabled:\n"), \
              _env(SLACK_RELAY_URL="http://x"):
             self.assertEqual(cp.enabled_chat_platforms(), ["slack"])
