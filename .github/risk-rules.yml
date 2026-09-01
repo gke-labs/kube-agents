@@ -1,0 +1,89 @@
+# Risk rules for scripts/classify_risk.py (#818).
+#
+# Each rule names the evidence (`why`), ideally a past incident or an
+# architecture constraint. The classifier takes the highest tier among the
+# rules that trigger; when nothing triggers, `default_tier` applies -- an
+# unclassified path is not the same thing as a safe one.
+#
+# Selectors, one flavour per rule:
+#   match:          triggers when any changed file matches a glob. Combined
+#                   with patch_contains, the regex must also hit a matched
+#                   file's patch.
+#   patch_contains: alone, triggers when any file's patch matches. A file the
+#                   API returns no patch for (binary, or a very large diff)
+#                   never satisfies it, so rules that must not miss stay
+#                   path-only.
+#   only_match:     triggers only when EVERY changed file matches -- the shape
+#                   for `low`, so a mixed pull request never classifies low on
+#                   its safe half.
+#   all_of:         a list of glob groups; triggers when each group matches at
+#                   least one changed file.
+#
+# Globs follow the same minimatch subset as .github/auto_request_review.yml:
+# `*` and `**` never match a path segment that starts with a dot.
+
+default_tier: medium
+
+rules:
+  - id: workflows-are-supply-chain
+    tier: high
+    match: [".github/workflows/**"]
+    why: "CI runs with repository credentials; the SHA-pinning policy in AGENTS.md exists for the same reason"
+
+  - id: risk-rules-are-policy
+    tier: high
+    match: [".github/risk-rules.yml"]
+    why: "editing the rules is how a change buys itself a lower tier; the policy file classifies as high so a rules edit is always read"
+
+  - id: dockerfile-layer-budget
+    tier: high
+    match: ["deploy/docker/Dockerfile"]
+    patch_contains: ["^\\+\\s*(RUN|COPY)\\b"]
+    why: "#658 -- a layer added past the overlay2 budget passes every PR build and fails only in Cloud Build, after merge"
+
+  - id: iam-role-bundles
+    tier: high
+    match: ["k8s-operator/scripts/**", "terraform/**"]
+    patch_contains: ["^[+-].*\\broles/"]
+    why: "cross-scope/privilege change, a mandatory-gate class in docs/architecture/04-workflow-model.md section 2.2"
+
+  - id: agent-behavior-is-config-not-docs
+    tier: medium
+    match: ["agents/**/*.md", ".agents/skills/**", "AGENTS.md"]
+    why: "Markdown here is executable agent configuration, not documentation; a SKILL.md edit changes what a deployed agent does"
+
+  - id: image-pins
+    tier: medium
+    match: ["images.json"]
+    why: "a one-character error in a pin is invisible in review and breaks every install"
+
+  - id: multi-surface-touch
+    tier: medium
+    all_of:
+      - ["k8s-operator/scripts/**"]
+      - ["charts/**", "terraform/**"]
+    why: "the install surfaces drift apart silently; make iac-parity-check catches only the scalar subset"
+
+  - id: test-deletion
+    tier: medium
+    patch_contains: ["^-.*\\bfunc Test", "^-.*\\bdef test_"]
+    why: "a coverage regression is invisible in a green run"
+
+  - id: docs-site-build-inputs
+    tier: high
+    match:
+      - "docs/site/package.json"
+      - "docs/site/package-lock.json"
+      - "docs/site/astro.config.mjs"
+      - "docs/site/tsconfig.json"
+      - "docs/site/public/**"
+    why: "docs-deploy runs npm ci and the build on these and publishes the site users fetch install.sh from via curl|bash -- a dependency or config swap here is a supply-chain edit, the workflows-are-supply-chain reasoning one artifact downstream"
+
+  - id: docs-site-only
+    tier: low
+    only_match:
+      - "docs/site/src/content/docs/**/*.md"
+      - "docs/designs/**"
+      - "docs/README.md"
+      - "README.md"
+    why: "narrative documentation; no runtime or agent-behavior path. Deliberately narrow: INSTALL.md is agent-executable, docs/architecture gates design decisions, and the rest of docs/site (manifests, astro config, components) executes in the docs-deploy build. Within the content tree only plain .md is prose -- .mdx accepts imports and JS expressions that run in that same build, so it falls through to medium"

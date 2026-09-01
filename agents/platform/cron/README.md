@@ -82,6 +82,11 @@ prompt contract: **the job's prompt says nothing about it**, because the
 scheduler applies `[SILENT]` and builds the failure summary before delivery is
 reached.
 
+The relay itself posts to every chat platform the install has enabled, so on a
+dual-platform install a job left on `"all"` is now heard twice on _each_ of them
+rather than twice in one place. Every entry here names `"chat"`, so this reaches
+only a runtime-created job or a hand-edited roster.
+
 The mode is a bundled platform plugin, not a patch: `chat` is a delivery-only
 platform ([`deploy/docker/plugins/chat/`](../../../deploy/docker/plugins/chat/))
 that Hermes registers like any other. So it is one target among several — a job

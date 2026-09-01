@@ -1656,15 +1656,23 @@ class IamGrantsTest(unittest.TestCase):
 
     def test_missing_legacy_cloudbuild_reader_fails(self):
         # This is exactly the drift found on kube-agents-evals-2.
+        project_number = "123456"
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-2")),
                 _ok(self._project_policy("kube-agents-evals-2")),
-                _ok(self._reader_policy(["serviceAccount:123456-compute@developer.gserviceaccount.com"])),
+                _ok(self._reader_policy([f"serviceAccount:{project_number}-compute@developer.gserviceaccount.com"])),
             ]
-            result = checker.check_iam_and_service_accounts("kube-agents-evals-2", "123456")
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-2", project_number)
         self.assertFalse(result.passed)
-        self.assertTrue(any("cloudbuild.gserviceaccount.com" in d for d in result.details), result.details)
+        # The whole member the checker builds, not the domain it ends in. A
+        # detail naming any cloudbuild SA -- another project's, or a
+        # remediation hint quoting the domain -- satisfied the old spelling
+        # without the reported identity being this project's. Matching a bare
+        # host literal also reads to CodeQL as an incomplete URL check
+        # (py/incomplete-url-substring-sanitization).
+        cloudbuild_sa = f"serviceAccount:{project_number}@cloudbuild.gserviceaccount.com"
+        self.assertTrue(any(cloudbuild_sa in d for d in result.details), result.details)
 
     def test_missing_workload_identity_binding_fails(self):
         with mock.patch.object(checker, "run_cmd") as run:

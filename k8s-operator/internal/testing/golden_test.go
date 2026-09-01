@@ -126,6 +126,21 @@ func TestAgentsGolden(t *testing.T) {
 				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}
 			},
 		},
+		{
+			// The egress policy on. Diff this against
+			// platformagent-split-broker.yaml and the whole of what
+			// spec.security.egressPolicy renders is one NetworkPolicy —
+			// which is the object that has to be read carefully, since an
+			// egress allowlist that is subtly wrong either breaks the agent
+			// or protects nothing.
+			name:         "PlatformAgentEgressAllowlist",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-egress-allowlist.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-egress-allowlist.yaml"),
+			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}
+			},
+		},
 	}
 
 	for _, tt := range tests {

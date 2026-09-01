@@ -191,7 +191,7 @@ class AlertPathTest(unittest.TestCase):
                 "PLATFORM_API_URL": self.gateway.url,
                 "PATH": f"{os.environ.get('PATH', '')}{os.pathsep}{workstation_bin}",
                 # The other half of the hazard: with a token in the
-                # environment, `get_active_platform` returns "slack" and the
+                # environment, `enabled_chat_platforms` resolves Slack and the
                 # send targets whatever the machine is really configured for.
                 "SLACK_BOT_TOKEN": "xoxb-the-runners-real-token",
             },

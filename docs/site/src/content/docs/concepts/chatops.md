@@ -81,6 +81,8 @@ The harness doesn't only reply to messages. A cluster event posted to the in-pod
 - **Google Chat**: to the space that owns the interaction, or the space set via `GOOGLE_CHAT_HOME_CHANNEL`.
 - **Slack**: to `SLACK_HOME_CHANNEL`.
 
+An alert goes to **one** of them, not both: it opens a thread that the triage turn then replies into, and a thread belongs to a single platform. With both integrations enabled the alert goes to Google Chat, falling through to Slack if that send is not accepted. A scheduled report has no such constraint and is posted to every enabled platform — [the relay design](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/cron-report-relay.md) is canonical for both rules.
+
 A governance watchdog's findings are not on this path. An audit publishes to its ledger issue and to the remediation pull requests that link back to it, so the report to read is the issue rather than a channel message — see [Proactive autonomy](/kube-agents/overview/proactive-autonomy/) and [Autonomous watchdogs](/kube-agents/concepts/autonomous-watchdogs/) for the schedules.
 
 ## First-run onboarding

@@ -482,8 +482,10 @@ platformAgent:
     enabled: true
     # Needs kubectl AND a shell: the `|| true` that keeps a wait timeout from
     # failing the hook (and with it the whole uninstall) needs `sh -c`, which
-    # rules out the distroless registry.k8s.io/kubectl. Skew of a minor or two
-    # is fine for a delete.
+    # rules out the distroless registry.k8s.io/kubectl. One pin serves the whole
+    # kubeVersion range rather than tracking the server, because the hook only
+    # deletes a CRD-backed object and waits on it — never the built-in API
+    # surface kubectl's +/-1 skew policy governs.
     #
     # Third-party, so it follows global.thirdPartyImageRegistry: an uninstall
     # on an air-gapped cluster otherwise fails to pull the very hook that keeps
@@ -491,7 +493,7 @@ platformAgent:
     # images.json like every other third-party image.
     image:
       repository: docker.io/alpine/k8s
-      tag: "1.34.9"
+      tag: "1.36.2"
     # How long to wait for the finalizer to clear.
     timeout: 120s
     # Bounds the Job itself (image pull, scheduling) above that wait.

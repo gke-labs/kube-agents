@@ -291,23 +291,119 @@ func TestDeleteLegacyCredentialIsolationResources(t *testing.T) {
 		UID:        agent.UID,
 		Controller: ptr.To(true),
 	}
-	objects := []client.Object{
-		agent,
+	removed := []client.Object{
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
 		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
-		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox-metadata-deny", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
 	}
+	// The metadata-deny NetworkPolicy is a guardrail this controller does not
+	// create, so deleting it is out of bounds and it belongs on the survivor
+	// side of this test, not the deleted side. Owned here on purpose: an owner
+	// reference is the one thing that would have made deleting it defensible,
+	// and it must survive even so.
+	guardrail := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox-metadata-deny", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}}
+
+	objects := append([]client.Object{agent, guardrail}, removed...)
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
 	if err := r.deleteLegacyCredentialIsolationResources(context.Background(), agent); err != nil {
 		t.Fatalf("deleteLegacyCredentialIsolationResources failed: %v", err)
 	}
-	for _, object := range objects[1:] {
+	for _, object := range removed {
 		err := cl.Get(context.Background(), client.ObjectKeyFromObject(object), object)
 		if !errors.IsNotFound(err) {
 			t.Errorf("expected legacy %T to be deleted, got %v", object, err)
 		}
+	}
+	surviving := &networkingv1.NetworkPolicy{}
+	if err := cl.Get(context.Background(), client.ObjectKeyFromObject(guardrail), surviving); err != nil {
+		t.Errorf("the metadata-deny NetworkPolicy is a guardrail the controller does not create; it must survive a reconcile, got %v", err)
+	}
+}
+
+// TestReconcileDoesNotDeleteTheMetadataDenyGuardrail runs a full Reconcile
+// rather than the cleanup helper alone, so the assertion holds no matter which
+// step of Reconcile a future change wires the deletion into.
+//
+// The unowned case is the one that was a live bug rather than only a doctrinal
+// one. The operator stopped creating this policy, so a copy applied by hand —
+// which the security documentation tells an operator to do — is owned by
+// nobody, hit the IsControlledBy guard, and returned "refusing to delete
+// unowned legacy *v1.NetworkPolicy" from every reconcile. The cleanup runs
+// after the workload and before updateStatusReady, so the CR's status stopped
+// tracking reality while the agent itself kept running. Both cases are checked
+// here because the fix has to be "the name is off the list", not "the guard
+// got friendlier".
+func TestReconcileDoesNotDeleteTheMetadataDenyGuardrail(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		owned bool
+	}{
+		{name: "applied by the operator in an earlier release", owned: true},
+		{name: "applied by hand, owned by nobody", owned: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := setupScheme()
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:       "test-agent",
+					Namespace:  "test-ns",
+					UID:        types.UID("agent-uid"),
+					Finalizers: []string{platformAgentFinalizer},
+				},
+				Spec: agentv1alpha1.PlatformAgentSpec{
+					Harness: &agentv1alpha1.HarnessSpec{
+						ProjectID:   "proj",
+						Location:    "us-central1",
+						ClusterName: "cluster",
+					},
+				},
+			}
+			policy := &networkingv1.NetworkPolicy{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-agent-sandbox-metadata-deny",
+					Namespace: "test-ns",
+				},
+			}
+			if tc.owned {
+				policy.OwnerReferences = []metav1.OwnerReference{{
+					APIVersion: agentv1alpha1.GroupVersion.String(),
+					Kind:       "PlatformAgent",
+					Name:       agent.Name,
+					UID:        agent.UID,
+					Controller: ptr.To(true),
+				}}
+			}
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(agent, policy).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+				Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+			if _, err := r.Reconcile(context.Background(), req); err != nil {
+				t.Fatalf("Reconcile failed: %v", err)
+			}
+
+			if err := cl.Get(context.Background(), client.ObjectKeyFromObject(policy), &networkingv1.NetworkPolicy{}); err != nil {
+				t.Fatalf("Reconcile deleted the metadata-deny NetworkPolicy; a controller must not delete a guardrail it did not create: %v", err)
+			}
+
+			// The status is the half the hot loop took away: the reconcile
+			// returned an error before updateStatusReady, so the CR stopped
+			// being updated at all. Asserting only that the policy survived
+			// would pass against a controller that still errors out.
+			stored := &agentv1alpha1.PlatformAgent{}
+			if err := cl.Get(context.Background(), client.ObjectKeyFromObject(agent), stored); err != nil {
+				t.Fatalf("failed to re-read the agent: %v", err)
+			}
+			if stored.Status.Phase == "" {
+				t.Error("Reconcile completed without writing a status phase; the legacy cleanup is still " +
+					"failing the reconcile before updateStatusReady")
+			}
+		})
 	}
 }
 

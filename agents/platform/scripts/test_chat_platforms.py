@@ -19,12 +19,33 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import chat_platforms as cp  # noqa: E402
 
 
-def _config(text: str):
-    """A CONFIG_PATH patch pointing at a temp config.yaml holding `text`."""
+MISSING = "/nonexistent/config.yaml"
+
+
+def _tmp_yaml(text: str) -> str:
     tmp = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
     tmp.write(text)
     tmp.close()
-    return mock.patch.object(cp, "CONFIG_PATH", tmp.name)
+    return tmp.name
+
+
+def _config(text: str):
+    """A CONFIG_PATH patch pointing at a temp config.yaml holding `text`.
+
+    The managed scope is pinned away at the same time: it outranks CONFIG_PATH, so a
+    test that left it on its real default would be asserting against whatever
+    /etc/hermes the machine running the suite happens to have.
+    """
+    return mock.patch.multiple(cp, CONFIG_PATH=_tmp_yaml(text), MANAGED_CONFIG_PATH=MISSING)
+
+
+def _managed(text: str, profile: str | None = None):
+    """A MANAGED_CONFIG_PATH patch, with CONFIG_PATH set only if `profile` is given."""
+    return mock.patch.multiple(
+        cp,
+        MANAGED_CONFIG_PATH=_tmp_yaml(text),
+        CONFIG_PATH=MISSING if profile is None else _tmp_yaml(profile),
+    )
 
 
 def _env(**kwargs):
@@ -37,7 +58,10 @@ class EnvSignalTest(unittest.TestCase):
 
     def setUp(self):
         # A missing file is the "config says nothing" case and needs no temp file.
-        self.no_config = mock.patch.object(cp, "CONFIG_PATH", "/nonexistent/config.yaml")
+        # Both files, so nothing above the environment can answer.
+        self.no_config = mock.patch.multiple(
+            cp, CONFIG_PATH=MISSING, MANAGED_CONFIG_PATH=MISSING
+        )
         self.no_config.start()
         self.addCleanup(self.no_config.stop)
 
@@ -144,21 +168,82 @@ class ConfigFileTest(unittest.TestCase):
             self.assertEqual(cp.enabled_chat_platforms(), ["slack"])
 
 
+class ManagedScopeTest(unittest.TestCase):
+    """The operator's own answer, which outranks both sources below it."""
+
+    def test_managed_scope_settles_both_platforms(self):
+        # The shape renderConfigYAML always writes: neither `enabled` field carries
+        # `omitempty`, so both keys are emitted as explicit booleans every reconcile.
+        with _managed("platforms:\n  google_chat:\n    enabled: true\n"
+                      "  slack:\n    enabled: true\n"), _env():
+            self.assertEqual(cp.enabled_chat_platforms(), ["google_chat", "slack"])
+
+    def test_managed_false_beats_a_stale_relay_url(self):
+        # The regression #1111's docstring warns whoever lands second about, and the
+        # reason the managed scope had to come across rather than being left out: an
+        # operator set slack.enabled: false, but SLACK_RELAY_URL is still on the
+        # container. Reading the environment here re-enables a leg that was turned
+        # off. It must not.
+        with _managed("platforms:\n  google_chat:\n    enabled: true\n"
+                      "  slack:\n    enabled: false\n"), \
+             _env(SLACK_RELAY_URL="http://x", GOOGLE_CHAT_RELAY_URL="http://x"):
+            self.assertEqual(cp.enabled_chat_platforms(), ["google_chat"])
+
+    def test_managed_scope_outranks_the_profile_file(self):
+        # /sethome and hand edits write the profile's file; the CR writes the managed
+        # one. When they disagree the operator wins.
+        with _managed("platforms:\n  slack:\n    enabled: false\n",
+                      profile="platforms:\n  slack:\n    enabled: true\n"), _env():
+            self.assertEqual(cp.enabled_chat_platforms(), ["google_chat"])
+
+    def test_a_platform_the_managed_scope_omits_falls_through(self):
+        # Per platform, not per source. A managed file that names only Slack must not
+        # hide the Google Chat the profile file knows about — the same short circuit
+        # this module exists to avoid, one source higher up.
+        with _managed("platforms:\n  slack:\n    enabled: true\n",
+                      profile="platforms:\n  google_chat:\n    enabled: true\n"), _env():
+            self.assertEqual(cp.enabled_chat_platforms(), ["google_chat", "slack"])
+
+    def test_unreadable_managed_scope_degrades_to_the_sources_below(self):
+        with _managed("platforms: [not a mapping\n"), _env(SLACK_RELAY_URL="http://x"):
+            self.assertEqual(cp.enabled_chat_platforms(), ["slack"])
+
+
 class ConfigPathContractTest(unittest.TestCase):
+    """Both path constants are copied rather than imported; neither may drift."""
+
+    @staticmethod
+    def _definition(module: str, name: str) -> str:
+        # Read as text rather than imported: importing either neighbour for its
+        # constant would pull FastMCP in, which ImportCostTest below exists to
+        # prevent. Consumes lines until the parentheses balance, so a one-line and a
+        # wrapped definition are both handled.
+        src = (Path(__file__).resolve().parent / module).read_text().splitlines()
+        start = next(i for i, l in enumerate(src) if l.startswith(f"{name} ="))
+        block: list[str] = []
+        for line in src[start:]:
+            block.append(line.strip())
+            joined = "".join(block)
+            if joined.count("(") == joined.count(")"):
+                break
+        return " ".join(block)
+
     def test_config_path_matches_agent_common_server(self):
         # CONFIG_PATH is deliberately repeated rather than imported — importing
-        # agent_common_server for it would pull FastMCP in, which ImportCostTest below
-        # exists to prevent. The copy is the cheap half of that trade; this is the
-        # other half, so the two cannot silently desynchronise. Read as text rather
-        # than imported, for the same reason the constant is not imported.
-        here = Path(__file__).resolve().parent
+        # agent_common_server for it would pull FastMCP in. The copy is the cheap half
+        # of that trade; this is the other half, so the two cannot silently
+        # desynchronise.
+        self.assertEqual(self._definition("chat_platforms.py", "CONFIG_PATH"),
+                         self._definition("agent_common_server.py", "CONFIG_PATH"))
 
-        def config_path_line(module: str) -> str:
-            src = (here / module).read_text().splitlines()
-            return next(l for l in src if l.startswith("CONFIG_PATH ="))
-
-        self.assertEqual(config_path_line("chat_platforms.py"),
-                         config_path_line("agent_common_server.py"))
+    def test_managed_config_path_matches_session_kv_server(self):
+        # The same trade, for the constant #1111 added. These two modules resolve the
+        # managed scope independently and must agree on where it is: a divergence
+        # would put the cron report relay and the reconcile summary on different
+        # answers to the same question, which is the whole failure this module is
+        # named for.
+        self.assertEqual(self._definition("chat_platforms.py", "MANAGED_CONFIG_PATH"),
+                         self._definition("session_kv_server.py", "MANAGED_CONFIG_PATH"))
 
 
 class ImportCostTest(unittest.TestCase):

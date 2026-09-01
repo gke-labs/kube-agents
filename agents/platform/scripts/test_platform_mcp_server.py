@@ -846,6 +846,66 @@ class TestReportToChat(unittest.TestCase):
         result = report_to_chat("finding", job_id="j1")
         self.assertIn("SUCCESS", result)
         self.assertNotIn("degraded", result)
+        self.assertNotIn("partial", result)
+
+    @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform", "SESSION_KV_API_KEY": "k"})
+    @patch("urllib.request.urlopen")
+    def test_a_partial_fan_out_is_not_reported_as_a_clean_success(self, mock_urlopen):
+        """The route fans out, so `relay: ok` no longer means everyone saw it.
+
+        This is the sibling of the relay adapter's own `undelivered` handling;
+        a caller that reads only `relay` tells the agent a half-delivered report
+        went out cleanly.
+        """
+        mock_urlopen.return_value = self._urlopen(
+            b'{"status": "delivered", "relay": "ok", "undelivered": "slack", "session_id": "s1"}'
+        )
+        result = report_to_chat("finding", job_id="j1")
+        self.assertIn("partial", result)
+        self.assertIn("slack", result)
+        self.assertNotIn("ERROR", result)
+        self.assertIn("do not send it again", result.lower())
+
+    @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform", "SESSION_KV_API_KEY": "k"})
+    @patch("urllib.request.urlopen")
+    def test_a_truncated_report_says_so_to_the_agent_that_wrote_it(self, mock_urlopen):
+        """The `[truncated]` line goes to the human reading the channel.
+
+        The agent that composed the report is the only party that could have
+        split it, and without this it is told the report was accepted and
+        nothing else.
+        """
+        mock_urlopen.return_value = self._urlopen(
+            b'{"status": "delivered", "relay": "ok", "truncated": "true", "session_id": "s1"}'
+        )
+        result = report_to_chat("finding", job_id="j1")
+        self.assertIn("truncated", result)
+        self.assertNotIn("ERROR", result)
+        self.assertIn("do not send it again", result.lower())
+
+    @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform", "SESSION_KV_API_KEY": "k"})
+    @patch("urllib.request.urlopen")
+    def test_an_untruncated_report_is_not_labelled_truncated(self, mock_urlopen):
+        """The route sends `truncated: ""` for a report that fit, and an empty
+        string must not read as a flag."""
+        mock_urlopen.return_value = self._urlopen(
+            b'{"status": "delivered", "relay": "ok", "truncated": "", "session_id": "s1"}'
+        )
+        result = report_to_chat("finding", job_id="j1")
+        self.assertNotIn("truncated", result)
+
+    @patch.dict(os.environ, {"HERMES_HOME": "/opt/data/profiles/platform", "SESSION_KV_API_KEY": "k"})
+    @patch("urllib.request.urlopen")
+    def test_degraded_and_partial_are_both_reported(self, mock_urlopen):
+        """A run can hit both, and an early return would drop one of them."""
+        mock_urlopen.return_value = self._urlopen(
+            b'{"status": "delivered", "relay": "degraded", "undelivered": "slack",'
+            b' "session_id": "s1"}'
+        )
+        result = report_to_chat("finding", job_id="j1")
+        self.assertIn("degraded", result)
+        self.assertIn("partial", result)
+        self.assertIn("unrelayed", result)
 
 
 class TestSanitizationAndMutationRemoval(unittest.TestCase):

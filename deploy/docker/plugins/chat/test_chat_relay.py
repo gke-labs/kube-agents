@@ -395,15 +395,68 @@ class TestStandaloneSend(unittest.TestCase):
                 result = asyncio.run(mod.standalone_send(None, "c", "r"))
         self.assertIn("502", result["error"])
 
-    def test_post_returns_an_error_and_a_verdict(self):
+    def test_post_returns_an_error_and_a_receipt(self):
         """Every path out of `_post` is a 2-tuple; the callers unpack it."""
         with RecordingRelay(body=b'{"relay":"degraded"}') as relay:
             with patch.dict(os.environ, {}, clear=True):
-                self.assertEqual(mod._post(relay.url, {}, "k"), (None, "degraded"))
+                self.assertEqual(
+                    mod._post(relay.url, {}, "k"), (None, {"relay": "degraded"})
+                )
         with patch.dict(os.environ, {}, clear=True):
-            error, verdict = mod._post("not-a-url", {}, "k")
+            error, receipt = mod._post("not-a-url", {}, "k")
         self.assertIsNotNone(error)
-        self.assertEqual(verdict, "")
+        self.assertEqual(receipt, {})
+
+    def test_a_body_that_is_not_an_object_is_not_a_receipt(self):
+        """`_relay_receipt` indexes what it returns, so a list must not reach it."""
+        with RecordingRelay(body=b'["relay","degraded"]') as relay:
+            with patch.dict(
+                os.environ,
+                {"SESSION_KV_API_KEY": "k", "CRON_REPORT_RELAY_URL": relay.url},
+            ):
+                result = asyncio.run(mod.standalone_send(None, "c", "r"))
+        self.assertTrue(result.get("success"), result)
+
+    def test_a_partial_fan_out_is_recorded_but_not_a_failed_delivery(self):
+        """#1094: the report reached one platform and missed another.
+
+        `last_delivery_error` has to say so — that is the whole complaint — but
+        the run is still a delivery, so the string must not read as "nothing was
+        sent" and invite a re-run that double-posts to the platform that has it.
+        """
+        body = b'{"status":"delivered","relay":"ok","undelivered":"slack"}'
+        with RecordingRelay(body=body) as relay:
+            with patch.dict(
+                os.environ,
+                {"SESSION_KV_API_KEY": "k", "CRON_REPORT_RELAY_URL": relay.url},
+            ):
+                result = asyncio.run(mod.standalone_send(None, "c", "r"))
+        self.assertIn("slack", result["error"])
+        self.assertIn("do not re-run", result["error"].lower())
+
+    def test_a_clean_fan_out_reports_no_error(self):
+        """An empty `undelivered` is the normal case and must not read as a miss."""
+        body = b'{"status":"delivered","relay":"ok","undelivered":""}'
+        with RecordingRelay(body=body) as relay:
+            with patch.dict(
+                os.environ,
+                {"SESSION_KV_API_KEY": "k", "CRON_REPORT_RELAY_URL": relay.url},
+            ):
+                result = asyncio.run(mod.standalone_send(None, "c", "r"))
+        self.assertTrue(result.get("success"), result)
+        self.assertNotIn("error", result)
+
+    def test_degraded_and_partial_are_both_reported(self):
+        """A run can hit both, and an early return would drop one of them."""
+        body = b'{"status":"delivered","relay":"degraded","undelivered":"slack"}'
+        with RecordingRelay(body=body) as relay:
+            with patch.dict(
+                os.environ,
+                {"SESSION_KV_API_KEY": "k", "CRON_REPORT_RELAY_URL": relay.url},
+            ):
+                result = asyncio.run(mod.standalone_send(None, "c", "r"))
+        self.assertIn("unrelayed", result["error"])
+        self.assertIn("slack", result["error"])
 
     def test_the_timeout_outlasts_a_chat_agent_turn(self):
         """Time out before the route answers and a delivered report is recorded

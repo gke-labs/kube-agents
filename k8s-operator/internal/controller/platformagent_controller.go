@@ -284,16 +284,85 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
-	// 10c. Reconcile the credential broker's own Pod, if it has one.
+	// 10c. Refuse an egress policy whose layout the broker reconcile below
+	// would otherwise dismantle.
+	//
+	// Before reconcileCredentialBroker, deliberately, and the order is the
+	// finding this step answers: on the reconcile that flips
+	// splitCredentialBrokerPod off while egressPolicy is still Allowlist —
+	// the single-field edit warnSplitNeedsSharedFilesystem itself suggests —
+	// validating after the broker reconcile deletes the broker Deployment and
+	// Service first and refuses second. The refusal then withholds the
+	// workload, so the agent Deployment keeps its split shape, wired to a
+	// Service that no longer exists, every proxied command failing, and the
+	// 30-second requeue repeating the same refusal without ever putting the
+	// broker back. Refusing here leaves the broker running instead: the CR
+	// parks Degraded, the agent keeps working, and the message names the two
+	// ways out.
+	//
+	// The guardrail note on the allowlist refusal below applies here too, so
+	// this path reconciles the same two policies before returning.
+	if reason, msg := validateEgressPolicyLayout(instance); reason != "" {
+		log.Info(msg)
+		if err := r.reconcileAgentNetworkGuardrails(ctx, instance, reason); err != nil {
+			return ctrl.Result{}, err
+		}
+		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
+	// 10d. Reconcile the credential broker's own Pod, if it has one.
 	//
 	// Before the agent's workload, not after. On the reconcile that first turns
 	// the split on, the agent Deployment is re-rendered pointing at the broker
 	// Service; creating that Service afterwards leaves the restarted agent
 	// failing every proxied command with a connection refused until the next
 	// pass. The other direction is safe either way, because turning the split
-	// off deletes a broker the re-rendered agent has already stopped using.
+	// off deletes a broker the re-rendered agent has already stopped using —
+	// step 10c has already refused the one shape where it has not.
 	if err := r.reconcileCredentialBroker(ctx, instance, proxyPolicyHash); err != nil {
 		return ctrl.Result{}, err
+	}
+
+	// 10e. Refuse an allowlist destination the policy will not render.
+	//
+	// Immediately before the workload, deliberately: an operator who asked for
+	// the agent Pod to be denied the metadata server must not get a running
+	// agent that silently is not. Below the broker reconcile, also
+	// deliberately: this refusal is about one destination, and it should not
+	// stop the broker being reconciled the way the layout refusal at 10c must.
+	if reason, msg := validateEgressAllowlist(instance); reason != "" {
+		log.Info(msg)
+		// Returning here withholds the workload, the Service, the
+		// PodDisruptionBudget, the legacy cleanup and updateStatusReady. What
+		// it must not withhold is a guardrail, and the agent Pod has two:
+		// <name>-gateway-netpol, which is reconciled below in the normal path
+		// and so is reconciled here as well, and <name>-sandbox-metadata-deny,
+		// which step 11b renders.
+		//
+		// Both have to survive a refusal for the same reason. An operator
+		// triaging an EgressAllowlistRefused who deletes them gets neither back
+		// until the spec is fixed, and with nothing selecting the agent Pod
+		// NetworkPolicy permits all egress — so the outcome is wide-open egress
+		// behind a Degraded status that names only the allowlist. The gateway
+		// policy is unconditional because it has nothing to do with either
+		// refusal; it is the Pod's baseline and it predates this field.
+		//
+		// This closes the hazard at the two egress refusals only — this one
+		// and step 10c's. The two refusals above them — step 10's
+		// RuntimeClassNotFound and step 10b's SplitBrokerStrandsEventWatcher —
+		// return without reconciling the gateway policy and still have it.
+		// Issue #964 tracks that; do not read the rule stated here as one the
+		// whole function keeps yet.
+		if err := r.reconcileAgentNetworkGuardrails(ctx, instance, reason); err != nil {
+			return ctrl.Result{}, err
+		}
+		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
 	// 11. Reconcile the Agent Sandbox Pod with its Envoy credential sidecar.
@@ -301,6 +370,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	otlpDisabled := otlpSource == otlpSourceNone
 	netpolProf := r.resolveNetpolProfile(ctx, instance)
 	if err := r.reconcileWorkload(ctx, instance, configMapHash, fluentBitHash, settingsHash, proxyPolicyHash, agentPlugins, otlpEndpoint, otlpDisabled); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 11b. Reconcile the agent Pod's default-deny egress policy, if it has one.
+	if err := r.reconcileAgentEgressPolicy(ctx, instance, r.agentEgressDNSClusterIPs(ctx, instance, netpolProf)); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -569,11 +643,29 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 // The <name>-credential-proxy Deployment and Service used to be on this list.
 // They are not legacy any more — they are what reconcileCredentialBroker
 // renders when the split is enabled, and it owns them in both directions.
+//
+// It also deliberately does NOT touch the <name>-sandbox-metadata-deny
+// NetworkPolicy. That object is a guardrail, not a workload: it denies the
+// sandbox egress to the link-local metadata server. Deleting it removed a
+// control this controller no longer creates, and the rule this controller keeps
+// is that it does not delete, weaken, or stop reconciling a guardrail it did
+// not create. A cluster operator who applies that policy by
+// hand, or a future release that renders it again, has to be able to rely on
+// it surviving a reconcile. A stale NetworkPolicy fails closed; a stale
+// Deployment does not, which is why the two are treated differently here.
+//
+// Leaving it on the list was also a live bug, not only a doctrinal one. The
+// operator stopped creating the policy, so nothing in the wild owns it, and a
+// hand-applied copy hit the IsControlledBy guard below and failed the whole
+// reconcile with "refusing to delete unowned legacy *v1.NetworkPolicy" on
+// every pass. This step runs after RBAC, the ConfigMaps, the workload, the
+// Service and the NetworkPolicy, so what the failure blocked was
+// updateStatusReady: the CR's status silently stopped tracking reality while
+// an admin followed the documented deletion path straight onto the error path.
 func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	resources := []client.Object{
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-sandbox", Namespace: agent.Namespace}},
 		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-sandbox", Namespace: agent.Namespace}},
-		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: agent.Name + "-sandbox-metadata-deny", Namespace: agent.Namespace}},
 	}
 	for _, resource := range resources {
 		if err := r.Get(ctx, client.ObjectKeyFromObject(resource), resource); err != nil {
@@ -733,6 +825,204 @@ func (r *PlatformAgentReconciler) deleteIfManaged(ctx context.Context, object cl
 		return fmt.Errorf("refusing to delete unmanaged %T %s", object, object.GetName())
 	}
 	return client.IgnoreNotFound(r.Delete(ctx, object))
+}
+
+const (
+	// reasonEgressPolicyRequiresSplitBroker refuses the layout: the policy
+	// cannot be rendered at all, because it would govern the credential broker
+	// sharing the Pod.
+	reasonEgressPolicyRequiresSplitBroker = "EgressPolicyRequiresSplitBroker"
+
+	// reasonEgressAllowlistRefused refuses the contents: the policy is fine and
+	// still gets rendered, minus the destinations that were refused.
+	reasonEgressAllowlistRefused = "EgressAllowlistRefused"
+)
+
+// refusalStillRendersTheGuardrail reports whether the egress policy should be
+// reconciled despite the agent's spec being refused.
+//
+// The distinction is between refusing a layout and refusing a value. A refused
+// value leaves a perfectly good policy to render — the builder has already
+// dropped the offending destination — and withholding it would mean the
+// operator's mistake in one field silently removes the whole control.
+func refusalStillRendersTheGuardrail(reason string) bool {
+	return reason == reasonEgressAllowlistRefused
+}
+
+// validateEgressPolicy returns a Degraded reason and message when
+// spec.security.egressPolicy asks for something the operator cannot honestly
+// render, or "" when it can.
+//
+// There are two such cases.
+//
+// The first, and the important one: the rendered policy denies the agent Pod
+// the link-local metadata server by not listing it, and a NetworkPolicy selects
+// Pods, never containers. With the credential broker still a sidecar the two
+// share a network namespace, so the same policy governs both — and the broker
+// reaches the metadata server on purpose, because minting the cloud token is
+// its entire job. Rendering it there would take the agent's credentials away
+// and every proxied command would fail.
+//
+// The second: an operator-supplied destination the policy refuses to render.
+// The builder drops those rather than narrowing them, and a silently dropped
+// rule is its own failure — an operator who added a rule to restore GitHub
+// would get a Ready agent, an unreachable github.com, and nothing in
+// kubectl describe to connect the two. So the refusal is surfaced here rather
+// than left in a log line the operator has no reason to read.
+//
+// The alternative to refusing was to render anyway and let the operator find
+// out, or to render and quietly permit the metadata server so nothing breaks.
+// The second is worse than doing nothing: it is a control that appears on
+// kubectl get netpol and protects nothing.
+func validateEgressPolicy(agent *agentv1alpha1.PlatformAgent) (string, string) {
+	if reason, msg := validateEgressPolicyLayout(agent); reason != "" {
+		return reason, msg
+	}
+	return validateEgressAllowlist(agent)
+}
+
+// validateEgressPolicyLayout is the first case alone. Reconcile checks it
+// before reconcileCredentialBroker rather than with the allowlist check below,
+// because on the reconcile that flips splitCredentialBrokerPod off under a
+// live egressPolicy the broker teardown is the mutation this refusal exists to
+// stop — validated afterwards, the refusal arrives one step too late: the
+// broker Deployment and Service are already deleted, the refusal withholds the
+// workload, and the running agent is left wired to a Service that no longer
+// exists with nothing on the requeue path that puts it back.
+func validateEgressPolicyLayout(agent *agentv1alpha1.PlatformAgent) (string, string) {
+	if !agentEgressPolicyEnabled(agent) {
+		return "", ""
+	}
+	if !credentialBrokerIsSplit(agent) {
+		return reasonEgressPolicyRequiresSplitBroker, "spec.security.egressPolicy: Allowlist requires " +
+			"spec.security.splitCredentialBrokerPod: true. The policy denies the agent Pod the link-local " +
+			"metadata server, and a NetworkPolicy cannot tell two containers in one Pod apart — with the " +
+			"credential broker still a sidecar it would lose the metadata server too, and minting the cloud " +
+			"token there is what the broker is for. Enable the split or set egressPolicy: None and accept " +
+			"that the agent can reach the metadata server."
+	}
+	return "", ""
+}
+
+// validateEgressAllowlist is the second case alone. It stays below
+// reconcileCredentialBroker in Reconcile, deliberately: a refusal about one
+// destination should not stop the broker being reconciled.
+func validateEgressAllowlist(agent *agentv1alpha1.PlatformAgent) (string, string) {
+	if !agentEgressPolicyEnabled(agent) {
+		return "", ""
+	}
+	if refusals := egressAllowlistRefusals(agent); len(refusals) > 0 {
+		return reasonEgressAllowlistRefused, "spec.security.egressAllowlist names destinations the operator " +
+			"will not render, so the agent is not being reconciled rather than being given a policy that " +
+			"quietly omits them: " + strings.Join(refusals, "; ") +
+			". Note that an ipBlock \"except\" clause does not rescue a range containing a metadata " +
+			"address — NAT rewrites the destination before the policy is evaluated " +
+			"(kubernetes/kubernetes#68078). Split the range around it instead."
+	}
+	return "", ""
+}
+
+// reconcileAgentNetworkGuardrails keeps the agent Pod's NetworkPolicies
+// maintained on a reconcile that is about to bail out over its egress spec.
+//
+// A refusal withholds the workload. It must not also withhold a guardrail,
+// because a guardrail that stops being reconciled is a guardrail an operator
+// can delete permanently — and deleting every policy that selects the agent
+// Pod does not leave it restricted, it leaves NetworkPolicy permitting all
+// egress. That the CR reads Degraded at the time makes it worse rather than
+// better: the status names one bad CIDR while the Pod's egress is wide open.
+//
+// <name>-gateway-netpol is reconciled whatever the refusal was. It is the
+// Pod's baseline policy, it predates spec.security.egressPolicy, and neither
+// refusal is an objection to it. <name>-sandbox-metadata-deny is reconciled
+// only when refusalStillRendersTheGuardrail says so — see validateEgressPolicy
+// for why EgressPolicyRequiresSplitBroker is the case where rendering it is
+// itself the harm.
+func (r *PlatformAgentReconciler) reconcileAgentNetworkGuardrails(ctx context.Context, agent *agentv1alpha1.PlatformAgent, reason string) error {
+	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, agent)
+	netpolProf := r.resolveNetpolProfile(ctx, agent)
+	if err := r.reconcileNetworkPolicy(ctx, agent, netpolProf, otlpEndpoint, otlpSource == otlpSourceNone); err != nil {
+		return err
+	}
+	if !refusalStillRendersTheGuardrail(reason) {
+		return nil
+	}
+	return r.reconcileAgentEgressPolicy(ctx, agent, r.agentEgressDNSClusterIPs(ctx, agent, netpolProf))
+}
+
+// agentEgressDNSClusterIPs is the resolved cluster DNS VIP list for the agent
+// egress policy's DNS rule.
+//
+// In the ordinary shape it is the profile's own answer. When
+// spec.networkPolicy.enabled is false, resolveNetpolProfile returns before the
+// DNS ladder runs — correct for the gateway policy, which that flag withholds,
+// and exactly wrong for this one: that flag creates the only shape where the
+// egress policy stands alone and enforces, so it is where a hard-coded
+// fallback VIP is a total egress block on a VIP-matching dataplane and where
+// the documented dnsClusterIPs override must still work. Re-run the ladder
+// with the gate lifted; the flag gates the gateway policy, not DNS
+// resolution.
+func (r *PlatformAgentReconciler) agentEgressDNSClusterIPs(ctx context.Context, agent *agentv1alpha1.PlatformAgent, profile netpolProfile) []string {
+	if profile.Generated {
+		return profile.DNSClusterIPs
+	}
+	if !agentEgressPolicyEnabled(agent) {
+		// Nothing will render, so skip the discovery round-trip.
+		return nil
+	}
+	ungated := agent.DeepCopy()
+	ungated.Spec.NetworkPolicy.Enabled = nil
+	return r.resolveNetpolProfile(ctx, ungated).DNSClusterIPs
+}
+
+// reconcileAgentEgressPolicy renders the agent Pod's default-deny egress policy.
+//
+// It applies the policy when spec.security.egressPolicy asks for it, and
+// otherwise does nothing at all — note that "nothing at all" includes not
+// deleting. An egress policy is a guardrail, and this controller does not
+// remove one it did not create, which is the mistake that left
+// <name>-sandbox-metadata-deny deleted on every reconcile; see
+// deleteLegacyCredentialIsolationResources. A cluster operator who applies
+// their own policy under this name, or who turns the field off after the
+// operator rendered one, keeps a closed door rather than silently getting an
+// open one.
+//
+// The cost is a stale policy after an opt-out. That is fail-closed on its own,
+// but it is not harmless if splitCredentialBrokerPod is reverted in the same
+// edit: the broker returns to the agent Pod, the leftover policy selects that
+// Pod, and the broker loses the metadata server along with the sandbox. The
+// egressPolicy CRD field description carries the warning and the three-step
+// revert order, so it reaches kubectl explain.
+func (r *PlatformAgentReconciler) reconcileAgentEgressPolicy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, dnsClusterIPs []string) error {
+	if !agentEgressPolicyEnabled(agent) {
+		return nil
+	}
+	log := logf.FromContext(ctx)
+
+	// validateEgressPolicy has already refused the reconcile if any of these
+	// fired, so reaching the loop below means something calls this builder on a
+	// path that skipped validation. Log it rather than assume: the drop is what
+	// keeps the rendered object safe, and a silent drop is the failure mode
+	// this guard exists for.
+	policy, dropped := buildAgentEgressNetworkPolicy(agent, dnsClusterIPs)
+	for _, reason := range dropped {
+		log.Info("WARNING: dropped an egressAllowlist destination that would widen the policy onto the "+
+			"metadata server or the open internet. It was dropped, not narrowed: an ipBlock \"except\" "+
+			"clause does not reliably block the metadata server (kubernetes/kubernetes#68078).",
+			"agent", agent.Name, "namespace", agent.Namespace, "destination", reason)
+	}
+	if err := ctrl.SetControllerReference(agent, policy, r.Scheme); err != nil {
+		return err
+	}
+	if err := r.applyManaged(ctx, agent, policy); err != nil {
+		return fmt.Errorf("failed to reconcile agent egress NetworkPolicy: %w", err)
+	}
+	log.Info("agent Pod egress is default-deny with an allowlist; the metadata server is not on it. "+
+		"This does nothing unless the cluster CNI enforces NetworkPolicy, which the operator cannot "+
+		"detect, and it is unioned with every other policy selecting this Pod — including the "+
+		"gateway policy this operator renders, which does permit the metadata server.",
+		"policy", policy.Name, "rules", len(policy.Spec.Egress))
+	return nil
 }
 
 func (r *PlatformAgentReconciler) reconcileService(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
