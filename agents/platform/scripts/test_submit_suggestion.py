@@ -307,6 +307,28 @@ class TestSubmit(SubmitSuggestionTestCase):
         self.assertEqual(argv[argv.index("--head") + 1], "platform-agent/fix-netpol")
         self.assertEqual(argv[argv.index("--base") + 1], "main")
 
+    def test_normalize_text_unescapes_cli_newlines_and_tabs(self):
+        self.assertEqual(submit_suggestion._normalize_text("Title\\nLine 2"), "Title\nLine 2")
+        self.assertEqual(submit_suggestion._normalize_text("Body\\r\\nLine 2\\tIndented"), "Body\nLine 2\tIndented")
+        self.assertEqual(submit_suggestion._normalize_text(""), "")
+        self.assertIsNone(submit_suggestion._normalize_text(None))
+
+    def test_submit_normalizes_escaped_newlines_in_title_and_body(self):
+        payload = self.prepare()
+        self.commit(payload["workspace"])
+        self.submit(
+            payload["branch"],
+            payload["workspace"],
+            title="Fix: Update config\\nSub-title",
+            body="First paragraph\\n\\nSecond paragraph\\t- Item",
+        )
+        self.assertEqual(len(self.gh_calls), 1)
+        argv, _ = self.gh_calls[0]
+        title_val = argv[argv.index("--title") + 1]
+        body_val = argv[argv.index("--body") + 1]
+        self.assertEqual(title_val, "Fix: Update config\nSub-title")
+        self.assertEqual(body_val, "First paragraph\n\nSecond paragraph\t- Item")
+
     def test_another_agents_workspace_is_refused(self):
         # The check the credential proxy cannot make. The audit's tree holds a
         # perfectly valid `.lease` — just not ours.

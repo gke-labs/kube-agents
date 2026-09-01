@@ -170,12 +170,21 @@ def handle_submit(args) -> int:
 
     push_branch(branch, workspace)
     base = gitops_workspace.resolve_base_branch(workspace, _runner)
-    pr_url = create_pull_request(branch, args.title, args.body, workspace, repo, base)
+    title = _normalize_text(args.title)
+    body = _normalize_text(args.body)
+    pr_url = create_pull_request(branch, title, body, workspace, repo, base)
     log(f"PR SUBMITTED SUCCESSFULLY! 🏆 URL: {pr_url}")
 
     # Print raw URL to stdout for the MCP tool to parse
     print(pr_url)
     return 0
+
+
+def _normalize_text(text: str) -> str:
+    """Unescape literal CLI escape sequences (like \\n or \\r\\n) into real whitespace."""
+    if not text:
+        return text
+    return text.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\t", "\t")
 
 
 def push_branch(branch_name: str, workspace: str) -> None:
