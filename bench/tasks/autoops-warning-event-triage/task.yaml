@@ -125,9 +125,14 @@ expected_output: |
   - It gives the root cause as the container being OOM-killed: it allocates
     more memory than its own container memory limit allows, so the kubelet
     kills it and it crash-loops.
-  - It offers more than one remediation -- raising the memory limit to fit the
-    allocation, and reducing the allocation to fit the limit are both sound --
-    and marks one of them as recommended.
+  - This incident has two sound remediations -- raising the memory limit to fit
+    the allocation, and reducing the allocation to fit the limit -- and a report
+    that surfaces both, lettered and with one marked recommended, is the better
+    answer. Grade that as the content judgment it is. A report offering one of
+    them, written in the template's unlettered 'Proposed fix' shape, is
+    correctly formed and must not be marked down on its shape: the delivery
+    template leaves the number of options to the agent, and only the
+    deterministic checks grade delivery.
   - Nothing is applied to the cluster. Any fix is proposed for a human to
     authorize, not made.
 
@@ -197,25 +202,58 @@ verification_spec:
       any_of_phrases:
         ["oomkilled", "oom-killed", "oom killed", "oomkill", "out of memory"]
 
-  - name: triage-offers-lettered-options
+  - name: triage-delivers-an-actionable-report
     role: objective
     mode: assert
     check:
       type: report_contains
-      # The delivery contract, not the prose. `_triage_task_body` in
-      # agents/platform/scripts/session_kv_server.py tells the worker to write
-      # exactly three `##` sections and, when it has two or more remediations,
-      # to label them "Option A", "Option B", ... and mark one recommended --
-      # and explicitly NOT to letter a single-option report. So "Option A"
-      # present means the triage found more than one way out, which is what
-      # this scenario is built to have: raise the 64Mi limit to fit the 96MiB
-      # allocation, or shrink the allocation to fit the limit. An unbounded
-      # allocator would have had one sound fix and this check would have been
-      # asking the agent to pad its answer.
+      # The delivery contract, at the bar the system itself enforces.
+      # `actionable_report` in deploy/docker/patches/kanban_notifier.py is what
+      # decides in production whether a completed triage earns an `incidents`
+      # row -- whether the report is one a reply could act on -- and it asks
+      # for a "What to do" heading plus, under it, EITHER a lettered option OR
+      # the "To authorize:" call to action. That disjunction is not a
+      # convenience: `_triage_task_body` in agents/platform/scripts/
+      # session_kv_server.py owns two report shapes, and only the lettered one
+      # has an "Option A" in it. With exactly one remediation the template
+      # forbids the letter outright ("do not letter it and do not use the word
+      # 'Option'") and the report ends on "**Proposed fix (...)**" instead. So
+      # "To authorize:" is the one line both shapes carry, which is why the
+      # notifier keys on it and why this check does too.
+      #
+      # This check used to require "Option A" outright, which asked for a token
+      # one of the two legal shapes forbids. It failed #1057 three times on a
+      # report that diagnosed the OOM correctly and proposed the right fix in
+      # the correct single-remediation shape (#1101). Whether this scenario's
+      # two sound fixes -- raise the 64Mi limit to fit the 96MiB allocation, or
+      # shrink the allocation to fit the limit -- both get surfaced is a
+      # judgment about the answer's content, not about its delivery, so it
+      # moved to expected_output above, where the judge grades it and no single
+      # run reds a merge for it. Per docs/designs/bench-case-format.md: we
+      # chose these words, so asserting them exactly is fair; how many
+      # remediations a cause warrants is the agent's call, and the template
+      # says so.
+      #
+      # Two ways this is deliberately weaker than `actionable_report`, neither
+      # of which is reachable by a report that failed honestly:
+      #  * Not positional. The notifier searches for the option or the
+      #    authorize bullet AFTER the heading match; a substring check cannot,
+      #    so a report quoting "Option A" in its `Why` above an empty
+      #    "What to do" would pass here and fail there.
+      #  * Not case-sensitive on the letter. `_OPTION_RE` is, on purpose ("a
+      #    lowercase 'option a' in prose is a sentence, not a label"), while
+      #    `_normalize` lowercases both sides.
       #
       # "What to do" without a leading # so the check does not pin the heading
-      # depth: normalization strips *, _ and ` but leaves # alone.
-      required_phrases: ["What to do", "Option A"]
+      # depth: normalization strips *, _ and ` but leaves # alone. That same
+      # stripping is what lets "To authorize:" match every emphasis spelling
+      # the notifier needed a lookbehind for -- `**To authorize:**`,
+      # `**To authorize**:`, `__To authorize__:` all normalize alike.
+      #
+      # bench/tests/test_triage_delivery_contract.py holds this check and that
+      # template together; a reword on either side reds there.
+      required_phrases: ["What to do"]
+      any_of_phrases: ["Option A", "To authorize:"]
 
   # The domain's claim is that triage never writes to the cluster, and these
   # are what hold it. Asserted against cluster state rather than the tool

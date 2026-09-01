@@ -94,10 +94,10 @@ locals {
 # `dd bs=<n>M count=1` allocates a single buffer of exactly that size and then
 # exits, so the overshoot is bounded and legible in the pod spec itself. That
 # boundedness is the point. An unbounded allocator (`tail /dev/zero`) has only
-# one sound remediation -- no limit fits it -- and the lettered-options
-# objective would then be grading the agent on padding its answer. With 96MiB
-# against a 64Mi limit both fixes are real: raise the limit, or shrink the
-# allocation.
+# one sound remediation -- no limit fits it -- and the case's judge reference,
+# which grades a report on surfacing both, would then be rewarding the agent for
+# padding its answer. With 96MiB against a 64Mi limit both fixes are real: raise
+# the limit, or shrink the allocation.
 #
 # What the agent has to find is not in the event. The Warning kubelet emits is
 # `BackOff`, "Back-off restarting failed container", which says a container is

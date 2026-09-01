@@ -105,9 +105,9 @@ variable "workload_name" {
 # edits to the manifest, which is what the report is asked to propose.
 #
 # A workload that allocated WITHOUT bound would have only one sound fix -- no
-# limit fits it -- and the lettered-options objective below would then be
-# asking the agent to pad its answer. Keep the allocation bounded and keep it
-# above the limit.
+# limit fits it -- and the case's judge reference, which grades a report on
+# surfacing both, would then be asking the agent to pad its answer. Keep the
+# allocation bounded and keep it above the limit.
 variable "memory_limit_mib" {
   type        = number
   description = "The container's memory limit, in MiB. Must be below allocate_mib."
