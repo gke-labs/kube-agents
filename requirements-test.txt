@@ -25,7 +25,7 @@
 # runs Python 3.12, the image 3.13 -- so a failure that turns on a patch
 # release or an interpreter version will not reproduce from this file.
 #
-# If the install fails with "No matching distribution found for mcp>=2", pip is
+# If the install fails with "No matching distribution found for mcp>=2.1.1", pip is
 # pointed at a mirror that does not carry it -- check `pip config debug`. The
 # package is on PyPI, so the fix is to name the index for this one install
 # rather than to reconfigure the machine:
@@ -60,7 +60,7 @@ fastapi
 # It bounds the package and not the interpreter -- 1.x and 2.x both declare
 # requires-python >=3.10 and ship one pure-Python wheel -- so it rules out no
 # Python version CI runs.
-mcp>=2
+mcp>=2.1.1
 
 python-dotenv
 pyyaml
