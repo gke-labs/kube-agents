@@ -528,10 +528,12 @@ function agentTilesHtml(data, events) {
       ? deltaChip("up", "all covered")
       : deltaChip("flat", `${coverage.domains_total - coverage.domains_covered} open`);
     const cases = (data.cases || []).filter((c) => c && typeof c === "object");
-    const blocking = cases.filter((c) => c.active).length;
+    // ``active`` means "runs in presubmit", NOT "can red a PR" -- admission is
+    // BOOTSTRAP_ADMITTED's roster, which the collector does not read yet.
+    const inPresubmit = cases.filter((c) => c.active).length;
     const detail = uncovered.length
       ? `uncovered: ${uncovered.join(", ")}`
-      : `${cases.length} scenarios · ${blocking} blocking`;
+      : `${cases.length} scenarios · ${inPresubmit} in presubmit`;
     tiles.push(tile("Domains covered",
       `${coverage.domains_covered}<small>/ ${coverage.domains_total}</small>`, chip, detail));
   } else {

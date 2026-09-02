@@ -646,11 +646,15 @@ def agent_tiles_html(data: dict, events: dict) -> str:
             else delta_chip("flat", f"{total - covered} open")
         )
         cases = [c for c in data.get("cases") or [] if isinstance(c, dict)]
-        blocking = sum(1 for c in cases if c.get("active"))
+        # ``active`` means "runs in presubmit" (named in the TASKS array), NOT
+        # "can red a PR" -- admission is BOOTSTRAP_ADMITTED's roster, which the
+        # collector does not read yet. Until a cases[].admitted field exists,
+        # calling this count "blocking" overstates the gate.
+        in_presubmit = sum(1 for c in cases if c.get("active"))
         if uncovered:
             detail = f"uncovered: {', '.join(uncovered)}"
         else:
-            detail = f"{len(cases)} scenarios · {blocking} blocking"
+            detail = f"{len(cases)} scenarios · {in_presubmit} in presubmit"
         tiles.append(tile("Domains covered", f"{covered}<small>/ {total}</small>", chip, detail))
     else:
         tiles.append(tile("Domains covered", "—", "", "not reported"))

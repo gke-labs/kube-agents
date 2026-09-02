@@ -255,7 +255,7 @@ class RenderGoldenTest(unittest.TestCase):
     def test_domains_tile(self):
         self.assertIn("11<small>/ 11</small>", self.app)
         self.assertIn("all covered", self.app)
-        self.assertIn("6 scenarios · 5 blocking", self.app)
+        self.assertIn("6 scenarios · 5 in presubmit", self.app)
 
     def test_false_reds_tile_from_events_yaml(self):
         self.assertIn(
@@ -545,7 +545,7 @@ class RenderToleranceTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         app = baked_app(html)
         self.assertNotIn("uncovered: a, b, c", app)
-        self.assertIn("6 scenarios · 5 blocking", app)
+        self.assertIn("6 scenarios · 5 in presubmit", app)
 
     def test_unknown_additive_fields_ignored(self):
         data = fixture_data()
