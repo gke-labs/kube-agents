@@ -228,10 +228,13 @@ map (`docs/README.md`), and this file plus `CLAUDE.md` stay inside the context b
 
 ## Contributing as an agent
 
-If you are an agent collaborating on issues and pushing PRs, also read
+If you are an *unattended* agent — collaborating on issues and pushing PRs
+with no human in the loop — read
 [`agents/contributor/AGENTS.md`](agents/contributor/AGENTS.md). It defines the
-agent-to-agent loop (claiming, escalating, and the review you'll receive) on
-top of the PR hygiene and `kube-agents-bot` contract in this file.
+agent-to-agent loop (claiming, escalating, and the review you'll receive) and,
+for an unattended agent, governs where it conflicts with this file's "work
+with the user" and "ask the user before acting" clauses. An agent with a user
+in the loop follows this file and uses only the loop mechanics there.
 
 ## Pull Request Hygiene
 
