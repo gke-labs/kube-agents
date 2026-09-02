@@ -14,8 +14,9 @@ writing one path at once.
 **Never block this card, whatever fails** — not for a failed `cluster_preflight.sh`, denied
 permissions, a cluster in `ERROR`, credentials that will not mint, or an MCP tool that errors. This
 overrides `SOUL.md` §6 step 2, your own `AGENTS.md` ("Fail loud, never silent"), and `SOUL.md` §2.
-The aggregation card lists this card in its `parents`, and `claim_task` will not claim it while any
-parent is anything but `done` or `archived`. A block is not `done`, nothing re-arms
+The platform card that fanned this one out waits for it to reach `done` or `archived` before it
+compiles the fleet report (and a pre-#1010 aggregation card, where one is still in flight, lists
+this card in its `parents`, which `claim_task` enforces the same way). A block is not `done`, nothing re-arms
 `.bootstrap_scan_filed`, and the notifier reaches nobody on a card the cron gate filed — so one
 blocked card costs the fleet report permanently and silently. Record what failed in `gaps`, and
 complete.
