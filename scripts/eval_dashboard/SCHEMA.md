@@ -116,6 +116,16 @@ Additive, optional, and safe to omit — consumers must default them.
 - `stale_after_s` — seconds after `generated_at` beyond which the rendered
   page labels itself `STALE`. No collector version emits it yet; the
   renderer defaults to `7200` when it is absent.
+- `pending_builds` — builds the GCS scan listed but could not record: no
+  readable `finished.json` yet (still running, or the upload failed), so
+  they are not in `runs[]` and do not raise the watermark. Entries are
+  `{"build_id": "<id>", "first_seen": "<iso8601>"}`, lowest id first;
+  `first_seen` is when the collector first listed the build. The next
+  incremental scan re-reads exactly these ids even though they sit at or
+  below the watermark, and drops an entry once it is recorded or once
+  `first_seen` is more than 2 days old (`PENDING_RETRY_DAYS` — a build
+  unfinished that long is a pod that died without uploading). Omitted when
+  empty; a malformed value is ignored with a warning, never a crash.
 
 ### `coverage` — from `docs/designs/domains.yaml`
 
@@ -131,12 +141,16 @@ Additive, optional, and safe to omit — consumers must default them.
 - `--from-dir <dir>` — local `<build_id>/` subdirectories with the same
   three files; the offline/testing path.
 
-### Incremental collection (CLI behaviour only — the output stays schema v1)
+### Incremental collection (the output stays schema v1; it may add the optional `pending_builds`)
 
 - `--merge-with <data.json | gs:// URL>` — load a previously written
   data.json, carry its `runs[]` over verbatim, and skip every GCS build
-  whose id is ≤ the newest **numeric** `build_id` on record (Prow build
-  ids increase monotonically, so the watermark is free). Overlapping
+  whose id is ≤ the newest **numeric** `build_id` on record — except the
+  ids on the prior's `pending_builds`, which are re-read regardless. Prow
+  build ids increase monotonically **by start time**, not by finish time,
+  so the watermark alone would permanently skip a build that was still in
+  flight when a later, shorter build got recorded; `pending_builds` (see
+  Optional top-level fields) is how those builds get back in. Overlapping
   builds dedupe by `build_id` with the **freshly parsed** copy winning;
   `cases[]` and `coverage` are recomputed from the merged run list on the
   current checkout. A missing, unreadable, truncated, non-v1 or

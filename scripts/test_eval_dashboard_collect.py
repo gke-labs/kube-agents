@@ -24,6 +24,7 @@ import shutil
 import stat
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 
 from eval_dashboard import collect
 
@@ -426,6 +427,127 @@ class TestIncrementalGcsScan(_MergeBase):
         self.assertEqual(len(merged["runs"]), 1)
         calls = [c for c in log.read_text().splitlines() if "started.json" in c]
         self.assertEqual(len(calls), 1)  # probe cached, not re-fetched by build_run
+
+    def test_in_flight_build_below_the_watermark_is_retried_via_pending(self):
+        """Prow ids are monotonic by START: a long build can finish after a
+        shorter, newer one is already on record. The watermark alone would
+        skip it forever; the prior's pending_builds punches it through."""
+        gsutil, log = self.fake_gsutil(
+            [BUILD_956_TRUNCATED, BUILD_998_INFRA, BUILD_998_FULL]
+        )
+        with tempfile.TemporaryDirectory() as sub:
+            shutil.copytree(TESTDATA / BUILD_998_FULL, pathlib.Path(sub) / BUILD_998_FULL)
+            prior_data = collect.collect(from_dir=pathlib.Path(sub))
+        # INFRA (a lower id than FULL) was in flight when FULL got recorded.
+        prior_data["pending_builds"] = [
+            {
+                "build_id": BUILD_998_INFRA,
+                "first_seen": datetime.now(timezone.utc).isoformat(),
+            }
+        ]
+        prior = self.write_prior(prior_data)
+        merged, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], merge_with=prior, gsutil=gsutil
+        )
+        self.assertEqual(
+            [run["build_id"] for run in merged["runs"]],
+            [BUILD_998_INFRA, BUILD_998_FULL],
+        )
+        self.assertNotIn("pending_builds", merged)  # recorded -> off the list
+        self.assertIn("retrying 1 pending", stderr)
+        calls = log.read_text()
+        self.assertIn(BUILD_998_INFRA + "/finished.json", calls)
+        # A build below the watermark and NOT pending still costs zero reads.
+        self.assertNotIn(BUILD_956_TRUNCATED + "/finished.json", calls)
+        self.assertNotIn(BUILD_956_TRUNCATED + "/started.json", calls)
+
+    def test_unfinished_build_lands_on_pending_and_keeps_first_seen(self):
+        gsutil, _ = self.fake_gsutil([BUILD_998_FULL])
+        bucket_build = (
+            pathlib.Path(os.environ["FAKE_GSUTIL_ROOT"])
+            / FAKE_GLOB[len("gs://fake-prow/"):].rstrip("*")
+            / BUILD_998_FULL
+        )
+        (bucket_build / "finished.json").unlink()  # still in flight
+        first_sweep = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        first, _ = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], gsutil=gsutil, now=first_sweep
+        )
+        self.assertEqual(first["runs"], [])
+        self.assertEqual(
+            first["pending_builds"],
+            [{"build_id": BUILD_998_FULL, "first_seen": first_sweep.isoformat()}],
+        )
+        # An hour later it is STILL unfinished: the entry is carried with its
+        # original first_seen, so the retry clock runs from the first sighting.
+        prior = self.write_prior(first)
+        second, _ = self.quiet_collect(
+            pr_globs=[FAKE_GLOB],
+            merge_with=prior,
+            gsutil=gsutil,
+            now=first_sweep + timedelta(hours=1),
+        )
+        self.assertEqual(
+            second["pending_builds"],
+            [{"build_id": BUILD_998_FULL, "first_seen": first_sweep.isoformat()}],
+        )
+        # Another hour on, finished.json has landed: recorded, list emptied.
+        shutil.copy(
+            TESTDATA / BUILD_998_FULL / "finished.json",
+            bucket_build / "finished.json",
+        )
+        prior = self.write_prior(second)
+        third, _ = self.quiet_collect(
+            pr_globs=[FAKE_GLOB],
+            merge_with=prior,
+            gsutil=gsutil,
+            now=first_sweep + timedelta(hours=2),
+        )
+        self.assertEqual(
+            [run["build_id"] for run in third["runs"]], [BUILD_998_FULL]
+        )
+        self.assertNotIn("pending_builds", third)
+
+    def test_expired_pending_entry_is_dropped_without_paying_a_read(self):
+        gsutil, log = self.fake_gsutil([BUILD_998_INFRA, BUILD_998_FULL])
+        with tempfile.TemporaryDirectory() as sub:
+            shutil.copytree(TESTDATA / BUILD_998_FULL, pathlib.Path(sub) / BUILD_998_FULL)
+            prior_data = collect.collect(from_dir=pathlib.Path(sub))
+        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        prior_data["pending_builds"] = [
+            {
+                "build_id": BUILD_998_INFRA,
+                "first_seen": (
+                    now - timedelta(days=collect.PENDING_RETRY_DAYS, hours=1)
+                ).isoformat(),
+            }
+        ]
+        prior = self.write_prior(prior_data)
+        merged, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], merge_with=prior, gsutil=gsutil, now=now
+        )
+        self.assertEqual(
+            [run["build_id"] for run in merged["runs"]], [BUILD_998_FULL]
+        )
+        self.assertNotIn("pending_builds", merged)
+        self.assertIn("giving up", stderr)
+        self.assertNotIn(BUILD_998_INFRA + "/", log.read_text())  # zero reads
+
+    def test_malformed_pending_builds_is_ignored_but_runs_are_kept(self):
+        prior_data = collect.collect(from_dir=TESTDATA)
+        for label, bad in {
+            "not a list": {"oops": 1},
+            "entry missing first_seen": [{"build_id": "123"}],
+            "non-numeric id": [{"build_id": "abc", "first_seen": "2026-09-01"}],
+        }.items():
+            with self.subTest(label):
+                prior = self.write_prior({**prior_data, "pending_builds": bad})
+                merged, stderr = self.quiet_collect(
+                    from_dir=TESTDATA, merge_with=prior
+                )
+                self.assertEqual(len(merged["runs"]), 3)
+                self.assertIn("pending_builds is malformed", stderr)
+                self.assertNotIn("pending_builds", merged)
 
     def test_gs_prior_url_is_read_through_gsutil(self):
         gsutil, _ = self.fake_gsutil([])

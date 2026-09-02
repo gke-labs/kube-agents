@@ -26,10 +26,17 @@ Incremental mode (what the hourly refresh job runs):
               cases/coverage are recomputed from the merged run list. The
               cold sweep is ~3 serial gsutil calls per archived build --
               tens of minutes over two weeks of history -- so an hourly
-              job MUST ride this watermark. A missing, unreadable or
-              implausible prior file is a warning that degrades to a fresh
-              sweep bounded by --since-days (default 14 in that case),
-              never a crash: the first armed run has no prior file at all.
+              job MUST ride this watermark. Prow build ids are monotonic in
+              START order, not finish order, so a build still in flight
+              when a later, shorter build gets recorded would sit below the
+              watermark forever; the prior file's pending_builds list is
+              how those get back in: every listed-but-unrecorded build
+              rides it and is re-read on the next scan regardless of the
+              watermark, until it finishes or PENDING_RETRY_DAYS passes.
+              A missing, unreadable or implausible prior file is a warning
+              that degrades to a fresh sweep bounded by --since-days
+              (default 14 in that case), never a crash: the first armed
+              run has no prior file at all.
   --since-days  skip GCS builds whose started.json is older than N days.
               Costs one probe read per candidate build and saves the other
               two; the watermark filter above is free and runs first.
@@ -58,6 +65,14 @@ SCHEMA_VERSION = 1
 # is missing or unusable. Two weeks matches the depth the dashboard displays;
 # unbounded would mean re-reading every archived build ever.
 DEGRADED_SINCE_DAYS = 14.0
+
+# How long a listed-but-unfinished build stays on pending_builds before the
+# scan stops re-reading it. Prow's job deadline caps a real run at a few
+# hours, and 2 days of hourly retries also rides out a transiently unreadable
+# finished.json; a build still unfinished after that is a pod that died
+# without uploading, and dropping it is what keeps the retry list -- and the
+# reads it costs every sweep -- bounded.
+PENDING_RETRY_DAYS = 2.0
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 TASKS_DIR = REPO_ROOT / "bench" / "tasks"
@@ -377,6 +392,8 @@ def runs_from_gcs(
     gsutil: str = "gsutil",
     after_build: int | None = None,
     since_cutoff: datetime | None = None,
+    retry_builds: frozenset[str] = frozenset(),
+    unfinished: set[str] | None = None,
 ) -> list[dict]:
     runs = []
     for glob in pr_globs:
@@ -398,10 +415,19 @@ def runs_from_gcs(
             build_id = line.rstrip("/").rsplit("/", 1)[-1]
             if not build_id.isdigit():
                 continue
-            # The incremental watermark: Prow build ids are monotonically
-            # increasing, so anything at or below the newest id already on
-            # record is already in the prior data and costs zero reads here.
-            if after_build is not None and int(build_id) <= after_build:
+            # The incremental watermark. Prow build ids are monotonic in
+            # START order, so a build at or below the newest RECORDED id may
+            # still be in flight (started earlier, outlived the build the
+            # watermark came from) -- skipping on the id alone would drop it
+            # from the dashboard permanently once the watermark climbs past
+            # it. retry_builds carries exactly those ids (the prior file's
+            # pending_builds) back through the filter; everything else at or
+            # below the watermark is already on record and costs zero reads.
+            if (
+                after_build is not None
+                and int(build_id) <= after_build
+                and build_id not in retry_builds
+            ):
                 continue
             m = _PR_IN_PATH.search(line)
             pr_hint = int(m.group(1)) if m else None
@@ -425,9 +451,13 @@ def runs_from_gcs(
                 run = build_run(build_id, reader, pr_hint)
             except Exception as exc:  # noqa: BLE001 -- one bad build must not kill the sweep
                 print(f"warning: build {build_id}: {exc}; skipping", file=sys.stderr)
+                if unfinished is not None:
+                    unfinished.add(build_id)
                 continue
             if run is None:
                 print(f"note: build {build_id}: no finished.json; skipping", file=sys.stderr)
+                if unfinished is not None:
+                    unfinished.add(build_id)
                 continue
             runs.append(run)
     return runs
@@ -481,8 +511,8 @@ def _plausible_run(run) -> bool:
     )
 
 
-def load_prior_runs(source: str, gsutil: str = "gsutil") -> list[dict] | None:
-    """The runs of an existing data.json, or None when it cannot be trusted.
+def load_prior(source: str, gsutil: str = "gsutil") -> dict | None:
+    """An existing data.json parsed whole, or None when it cannot be trusted.
 
     None -- never an exception -- for every failure mode: file or object
     missing (the first armed run has no prior), unreadable, truncated by a
@@ -532,7 +562,59 @@ def load_prior_runs(source: str, gsutil: str = "gsutil") -> list[dict] | None:
             file=sys.stderr,
         )
         return None
-    return runs
+    return data
+
+
+def load_prior_runs(source: str, gsutil: str = "gsutil") -> list[dict] | None:
+    """The runs of an existing data.json, or None when it cannot be trusted."""
+    data = load_prior(source, gsutil)
+    return None if data is None else data["runs"]
+
+
+def pending_from_prior(data: dict) -> dict[str, str]:
+    """The prior file's pending_builds as {build_id: first_seen}.
+
+    pending_builds is a retry hint, not history: dropping it merely delays
+    the listed builds until the next cold sweep re-finds them. So unlike an
+    implausible runs[] -- which distrusts the whole file -- a malformed
+    entry only discards this field, with a warning.
+    """
+    entries = data.get("pending_builds")
+    if entries is None:
+        return {}
+    pending: dict[str, str] = {}
+    valid = isinstance(entries, list)
+    if valid:
+        for entry in entries:
+            if (
+                isinstance(entry, dict)
+                and isinstance(entry.get("build_id"), str)
+                and entry["build_id"].isdigit()
+                and isinstance(entry.get("first_seen"), str)
+            ):
+                pending[entry["build_id"]] = entry["first_seen"]
+            else:
+                valid = False
+                break
+    if not valid:
+        print(
+            "warning: prior pending_builds is malformed; ignoring it (the"
+            " affected builds return on the next cold sweep)",
+            file=sys.stderr,
+        )
+        return {}
+    return pending
+
+
+def _pending_expired(first_seen: str, now: datetime) -> bool:
+    """Whether a pending entry is past PENDING_RETRY_DAYS (unparseable == yes)."""
+    try:
+        seen = datetime.fromisoformat(first_seen)
+    except ValueError:
+        return True
+    if seen.tzinfo is None:
+        seen = seen.replace(tzinfo=timezone.utc)
+    return now - seen > timedelta(days=PENDING_RETRY_DAYS)
 
 
 def newest_build_id(runs: list[dict]) -> int | None:
@@ -578,13 +660,25 @@ def collect(
     now: datetime | None = None,
     stale_after_s: int | None = None,
 ) -> dict:
+    now_dt = now or datetime.now(timezone.utc)
     prior: list[dict] = []
+    retry: dict[str, str] = {}  # build_id -> first_seen, still worth re-reading
     after_build = None
     if merge_with is not None:
-        loaded = load_prior_runs(merge_with, gsutil)
-        if loaded is not None:
-            prior = loaded
+        prior_data = load_prior(merge_with, gsutil)
+        if prior_data is not None:
+            prior = prior_data["runs"]
             after_build = newest_build_id(prior)
+            for build_id, first_seen in pending_from_prior(prior_data).items():
+                if _pending_expired(first_seen, now_dt):
+                    print(
+                        f"note: build {build_id}: still unfinished after"
+                        f" {PENDING_RETRY_DAYS:g} days on pending_builds;"
+                        " giving up on it",
+                        file=sys.stderr,
+                    )
+                else:
+                    retry[build_id] = first_seen
         # No usable prior -- or a prior that yields no numeric watermark --
         # means the incremental scan cannot resume, and an unbounded cold
         # sweep is ~3 serial gsutil calls per archived build. Bound the
@@ -599,24 +693,41 @@ def collect(
 
     since_cutoff = None
     if since_days is not None:
-        since_cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=since_days)
+        since_cutoff = now_dt - timedelta(days=since_days)
 
     fresh: list[dict] = []
+    unfinished: set[str] = set()
     if from_dir is not None:
         fresh.extend(runs_from_dir(from_dir))
     if pr_globs:
         fresh.extend(
             runs_from_gcs(
-                pr_globs, gsutil, after_build=after_build, since_cutoff=since_cutoff
+                pr_globs,
+                gsutil,
+                after_build=after_build,
+                since_cutoff=since_cutoff,
+                retry_builds=frozenset(retry),
+                unfinished=unfinished,
             )
         )
     if merge_with is not None:
         print(
             f"note: merged {len(prior)} prior runs with {len(fresh)} newly"
-            f" collected (GCS scan resumed above build {after_build})",
+            f" collected (GCS scan resumed above build {after_build},"
+            f" retrying {len(retry)} pending)",
             file=sys.stderr,
         )
     runs = merge_runs(prior, fresh)
+
+    # The next scan's retry list: every build listed but not (yet) recorded
+    # -- still running, or its finished.json unreadable this sweep -- keeps
+    # its original first_seen so the PENDING_RETRY_DAYS clock runs from the
+    # first sighting, and anything that made it into runs[] drops off.
+    recorded = {run["build_id"] for run in runs}
+    pending = {b: seen for b, seen in retry.items() if b not in recorded}
+    for build_id in unfinished - recorded:
+        pending.setdefault(build_id, now_dt.isoformat())
+
     data = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -625,6 +736,11 @@ def collect(
         "cases": build_cases(runs, repo_root),
         "coverage": coverage(repo_root),
     }
+    if pending:
+        data["pending_builds"] = [
+            {"build_id": build_id, "first_seen": pending[build_id]}
+            for build_id in sorted(pending, key=int)
+        ]
     if stale_after_s is not None:
         # The renderer's freshness badge trips this many seconds after
         # generated_at. The publisher sets it to its own cadence with slack,
