@@ -6,12 +6,16 @@
 # Preserves static cluster & GCP IAM setup for fast re-use across PR runs.
 #
 # One `helm uninstall` (the release owns every Kubernetes object ci-deploy.sh
-# created) plus an explicit CRD delete, since the chart leaves CRDs behind by
-# Helm's own design, plus an unconditional label sweep of every cluster-scoped
-# kind the chart or the operator can create — because a run killed mid-install
-# leaves cluster-scoped objects with no Helm release record for `helm
-# uninstall` to act on, and Helm then refuses to adopt them on the project's
-# next lease (#1006).
+# created) plus a CRD delete, since the chart leaves CRDs behind by Helm's own
+# design, plus an unconditional label sweep of every cluster-scoped and
+# namespaced kind the chart or the operator can create *with the part-of label*
+# — because a run killed mid-install leaves objects with no Helm release record
+# for `helm uninstall` to act on, and Helm then refuses to adopt them on the
+# project's next lease (#1006). Step 4 names the kinds the label cannot reach.
+#
+# The CRD delete is the one conditional step: a release record that outlives
+# Step 1 needs its CRDs, or the next lease can neither uninstall nor upgrade
+# over it (#1172).
 # ==============================================================================
 
 set -uo pipefail
@@ -32,6 +36,15 @@ readonly RELEASE_UNINSTALL_TIMEOUT="10m"
 # name prefix `kubectl delete -o name` prints per deleted Secret.
 readonly HELM_DEPLOYED_STATUS_RE='"status"[[:space:]]*:[[:space:]]*"deployed"'
 readonly SECRET_NAME_PREFIX_RE='^secret/'
+# The chart's CRDs, and a bound on waiting for them to go. `kubectl delete`
+# defaults to waiting forever, and deleting a CRD blocks on
+# customresourcecleanup.apiextensions.k8s.io until every CR of that kind is
+# gone — which a PlatformAgent finalizer no live operator can clear never is.
+# Unbounded, that hangs teardown until Prow's job timeout and Steps 3 and 4
+# never run, leaving exactly the orphans they exist to sweep. Five minutes is
+# well clear of the 206s a healthy-but-slow delete has been observed to take.
+readonly CHART_CRD_DIR="charts/kube-agents/crds/"
+readonly CRD_DELETE_TIMEOUT="5m"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
@@ -80,9 +93,9 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 1: Uninstalling the kube-agent
 # greets the project's next lease as `UPGRADE FAILED: "kube-agents" has no
 # deployed releases` at ci-deploy.sh's `helm upgrade --install` — and the
 # poisoned run's own teardown cannot remove it either, so the state is
-# self-sustaining until something drops the record. Step 3's sweep already
-# handles the cluster-scoped objects the release owned, so this strands
-# nothing a failed uninstall was not going to strand anyway.
+# self-sustaining until something drops the record. The sweeps in Steps 3 and
+# 4 already handle the objects the release owned, so this strands nothing a
+# failed uninstall was not going to strand anyway.
 #
 # The deployed-revision gate is what makes the fallback safe on a *healthy*
 # release whose uninstall failed transiently (pre-delete hook stuck, --wait
@@ -94,7 +107,12 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 1: Uninstalling the kube-agent
 # rest of the file: nothing here may change the teardown's exit code, and
 # the fallback logs what it deleted so a red run's artifacts show the heal
 # happened.
-if ! helm uninstall "${HELM_RELEASE_NAME}" -n "${NAMESPACE}" --wait --timeout "${RELEASE_UNINSTALL_TIMEOUT}"; then
+#
+# --debug because Helm hands deleteRelease's real errors to cfg.Log
+# (pkg/action/uninstall.go), which drops them without it, and returns only
+# `failed to delete release: <name>`. That line was all CI recorded for the
+# 25 hours #1172 went unnoticed.
+if ! helm uninstall "${HELM_RELEASE_NAME}" -n "${NAMESPACE}" --wait --timeout "${RELEASE_UNINSTALL_TIMEOUT}" --debug; then
   if RELEASE_HISTORY_JSON="$(helm history "${HELM_RELEASE_NAME}" -n "${NAMESPACE}" -o json 2>/dev/null)" \
     && grep -Eq "${HELM_DEPLOYED_STATUS_RE}" <<<"${RELEASE_HISTORY_JSON}"; then
     echo "WARNING: helm uninstall failed with a deployed revision still recorded; leaving the release record for the next lease to upgrade over (#1172)"
@@ -112,9 +130,40 @@ echo "✓ Release uninstall finished in $((SECONDS - STEP_START))s"
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 2: Deleting CRDs ==="
 # Helm leaves crds/ objects behind by design; a PR evaluation cluster should
-# not accumulate them.
-kubectl delete -f charts/kube-agents/crds/ --ignore-not-found || true
-echo "✓ CRD deletion finished in $((SECONDS - STEP_START))s"
+# not accumulate them. Only when no release record survived Step 1, though.
+# Both of Helm's routes over a surviving record need the CRDs: `uninstall`
+# resolves a REST mapping for every object in the stored manifest, which
+# contains a PlatformAgent, and `upgrade` never reinstalls crds/. Delete them
+# under a record and the next lease can do neither — #1172, where every re-run
+# deleted the CRDs again and re-armed the trap. No record means the next lease
+# is a fresh install, which reinstalls crds/ itself, so #1006's case (CRDs from
+# a run killed mid-install) is still swept. Unreadable counts as "may survive":
+# keeping a CRD costs one lease's tidiness, deleting one costs the project.
+CRD_STEP_RESULT="deleted"
+PROBE_ERROR_LOG="$(mktemp)"
+if RELEASE_RECORD_NAMES="$(kubectl get secret -n "${NAMESPACE}" \
+  -l "${HELM_RELEASE_SECRET_SELECTOR}" -o name 2>"${PROBE_ERROR_LOG}")"; then
+  if [ -n "${RELEASE_RECORD_NAMES}" ]; then
+    echo "WARNING: a ${HELM_RELEASE_NAME} release record survived Step 1; keeping the CRDs so the next lease's Helm can read its own manifest (#1172)"
+    CRD_STEP_RESULT="skipped, release record survived Step 1"
+  elif kubectl delete -f "${CHART_CRD_DIR}" --ignore-not-found --timeout "${CRD_DELETE_TIMEOUT}"; then
+    CRD_STEP_RESULT="deleted"
+  else
+    # Bounded rather than hung: the CRDs may be left Terminating, which the
+    # next lease's fresh install can still collide with, but Steps 3 and 4
+    # now run and the log says which happened.
+    echo "WARNING: the CRD delete did not finish within ${CRD_DELETE_TIMEOUT}; continuing so the sweeps still run (#1172)"
+    CRD_STEP_RESULT="delete timed out or failed after ${CRD_DELETE_TIMEOUT}"
+  fi
+else
+  # The reason matters and used to go to /dev/null: a missing namespace is a
+  # knowably-empty read, an RBAC or API-server failure is not, and the branch
+  # below treats them alike.
+  echo "WARNING: could not read the ${HELM_RELEASE_NAME} release records; keeping the CRDs (#1172). kubectl said: $(tr '\n' ' ' <"${PROBE_ERROR_LOG}")"
+  CRD_STEP_RESULT="skipped, release records unreadable"
+fi
+rm -f "${PROBE_ERROR_LOG}"
+echo "✓ CRD step (${CRD_STEP_RESULT}) finished in $((SECONDS - STEP_START))s"
 
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 3: Sweeping cluster-scoped kube-agents resources ==="
@@ -155,6 +204,52 @@ for SWEEP_KIND in "${SWEEP_KINDS[@]}"; do
   kubectl delete "${SWEEP_KIND}" -l "${SWEEP_SELECTOR}" --ignore-not-found || true
 done
 echo "✓ Cluster-scoped sweep finished in $((SECONDS - STEP_START))s"
+
+STEP_START=$SECONDS
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 4: Sweeping namespaced kube-agents resources ==="
+# The same sweep, one scope down, for the same reason: once the release stops
+# accounting for a namespaced object, nothing else deletes it. Teardown never
+# deletes the kubeagents-system namespace, and the operator's children are
+# reaped by owner-reference GC, which stops resolving owners as soon as Step 2
+# removes the PlatformAgent CRD.
+#
+# Same selector as Step 3: every object the operator creates is stamped with
+# app.kubernetes.io/part-of=kube-agents — through applyManaged, or, on the two
+# paths that bypass it, through withCommonLabels on the PVC and commonLabels
+# handed to ReconcileServiceAccount. Helm's release records are Secrets
+# labelled owner=helm carrying none of the chart's labels, so this sweep cannot
+# delete one — whether a record survives stays Step 1's decision. The chart's
+# own CRs are absent for the same reason: on the delete path Step 2 takes them
+# with their CRDs, and on the keep path they are what the next lease upgrades
+# over.
+#
+# The claims the operator creates itself are labelled and swept; the ones it
+# materialises from a StatefulSet's volumeClaimTemplates are not, because that
+# ObjectMeta carries a name and nothing else. That is hindsight's claim and any
+# RWO custom storage, and deleting the StatefulSet leaves them behind — no
+# selector reaches either. PVCs sweep last so the workloads releasing them are
+# already deleted, or kubernetes.io/pvc-protection holds the delete open.
+SWEEP_NAMESPACED_KINDS=(
+  deployments.apps
+  statefulsets.apps
+  jobs.batch
+  services
+  configmaps
+  secrets
+  serviceaccounts
+  roles.rbac.authorization.k8s.io
+  rolebindings.rbac.authorization.k8s.io
+  networkpolicies.networking.k8s.io
+  poddisruptionbudgets.policy
+  podmonitorings.monitoring.googleapis.com
+  certificates.cert-manager.io
+  issuers.cert-manager.io
+  persistentvolumeclaims
+)
+for SWEEP_KIND in "${SWEEP_NAMESPACED_KINDS[@]}"; do
+  kubectl delete "${SWEEP_KIND}" -n "${NAMESPACE}" -l "${SWEEP_SELECTOR}" --ignore-not-found || true
+done
+echo "✓ Namespaced sweep finished in $((SECONDS - STEP_START))s"
 
 TOTAL_DURATION=$((SECONDS - START_TIME))
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Cleanup Complete (Total Duration: ${TOTAL_DURATION}s) ==="

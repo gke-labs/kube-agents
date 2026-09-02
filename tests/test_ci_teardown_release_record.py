@@ -26,6 +26,15 @@ These tests pin the fallback's four properties:
 * a failing kubectl neither stops the steps after the fallback nor changes
   the teardown's exit code, which nothing in the script may do.
 
+Step 2 then asks the same question before deleting the chart's CRDs, and its
+three branches are pinned here too. Both of Helm's routes over a surviving
+record need those CRDs — `uninstall` resolves a REST mapping for every object
+in the stored manifest, which contains a PlatformAgent, and `upgrade` never
+reinstalls `crds/` — so deleting them under a record leaves the next lease able
+to do neither. That held `kube-agents-evals-4` from 2026-09-01 14:33 UTC until
+a human repaired it the following afternoon, every re-run deleting the CRDs
+again on the way past. An unreadable probe keeps them for the same reason.
+
 The steps are lifted from the script's own text and executed under bash with
 stubbed kubectl/helm, the same approach as tests/test_ci_teardown_sweep.py.
 """
@@ -50,6 +59,7 @@ _STEPS_START = "START_TIME=$SECONDS"
 # Repeated here on purpose rather than parsed out of the script: a test that
 # derives the expected selector from the code under test asserts nothing.
 _RECORD_SELECTOR = "owner=helm,name=kube-agents"
+_CRD_DELETE_PREFIX = "kubectl delete -f charts/kube-agents/crds/"
 
 # What the stubbed `kubectl delete secret ... -o name` prints when it is asked
 # for the release record: two record Secrets, the way a release with a failed
@@ -60,6 +70,11 @@ _STUB_RECORD_NAMES = (
 )
 
 _NAMESPACE = "kubeagents-system"
+
+# What the stubbed probe writes to stderr when it fails: the real message for
+# the one unreadable state that is knowably empty, so the test can show the
+# log now carries the distinction the branch itself cannot make.
+_PROBE_STDERR = f'Error from server (NotFound): namespaces "{_NAMESPACE}" not found'
 
 # helm history -o json output shapes, as the real encoder emits them.
 _HISTORY_DEPLOYED = json.dumps(
@@ -101,7 +116,15 @@ def _teardown_steps(text):
 class CiTeardownReleaseRecordTest(unittest.TestCase):
     maxDiff = None
 
-    def _run_steps(self, kubectl_exit=0, uninstall_exit=0, history_json="", history_exit=1):
+    def _run_steps(
+        self,
+        kubectl_exit=0,
+        uninstall_exit=0,
+        history_json="",
+        history_exit=1,
+        records=(),
+        crd_delete_exit=0,
+    ):
         """Run the teardown steps with recording stubs.
 
         Returns (returncode, call argv lines, stdout, stderr). Each stub
@@ -111,6 +134,13 @@ class CiTeardownReleaseRecordTest(unittest.TestCase):
         delete, so the fallback's count log can be asserted. `history_exit`
         defaults red — the poisoned run's record is typically unreadable the
         same way its uninstall failed.
+
+        `kubectl get` is answered separately, from `records`, because Step 2
+        probes the same selector Step 1 deletes by and the two must be able to
+        disagree: after a successful uninstall Helm has removed its records,
+        so the probe reads empty while the delete would have printed names.
+        The default empty matches that — and note the probe is also subject to
+        `kubectl_exit`, which is how the unreadable branch is reached.
         """
         text = _teardown_text()
         with tempfile.TemporaryDirectory() as tmp:
@@ -136,6 +166,17 @@ class CiTeardownReleaseRecordTest(unittest.TestCase):
             kubectl_stub.write_text(
                 "#!/usr/bin/env bash\n"
                 f'echo "kubectl $*" >> "{log}"\n'
+                'if [[ "$1" == "get" ]]; then\n'
+                + "".join(f'  echo "{name}"\n' for name in records)
+                + f"  [[ {kubectl_exit} -ne 0 ]] && echo '{_PROBE_STDERR}' >&2\n"
+                + f"  exit {kubectl_exit}\n"
+                "fi\n"
+                # The CRD delete answers separately so a test can reach Step
+                # 2's timed-out branch, which needs a readable probe (else the
+                # keep branch fires first) and a red delete.
+                'if [[ "$1" == "delete" && "$2" == "-f" ]]; then\n'
+                f"  exit {crd_delete_exit}\n"
+                "fi\n"
                 f'if [[ "$*" == *"{_RECORD_SELECTOR}"* && {kubectl_exit} -eq 0 ]]; then\n'
                 + "".join(f'  echo "{name}"\n' for name in _STUB_RECORD_NAMES)
                 + "fi\n"
@@ -169,6 +210,9 @@ class CiTeardownReleaseRecordTest(unittest.TestCase):
             for c in calls
             if c.startswith("kubectl delete secret") and _RECORD_SELECTOR in c.split()
         ]
+
+    def _crd_deletes(self, calls):
+        return [c for c in calls if c.startswith(_CRD_DELETE_PREFIX)]
 
     # --- the fallback fires when the uninstall fails ------------------------
 
@@ -222,17 +266,120 @@ class CiTeardownReleaseRecordTest(unittest.TestCase):
         self.assertEqual(self._record_deletes(calls), [])
         self.assertIn("leaving the release record", out)
 
+    # --- Step 2 asks the same question before deleting the CRDs -------------
+
+    def test_no_surviving_record_deletes_the_crds(self):
+        """The common path, and #1006's: nothing to strand, and the next lease
+        is a fresh install, which reinstalls crds/ itself."""
+        rc, calls, out, err = self._run_steps()
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len(self._crd_deletes(calls)), 1, calls)
+
+    def test_a_surviving_record_keeps_the_crds(self):
+        """Both of Helm's routes over a record need the CRDs — `uninstall`
+        resolves a REST mapping for every object in the stored manifest, which
+        contains a PlatformAgent, and `upgrade` never reinstalls crds/. Delete
+        them under a record and the next lease can do neither (#1172)."""
+        rc, calls, out, err = self._run_steps(
+            uninstall_exit=1,
+            history_json=_HISTORY_DEPLOYED,
+            history_exit=0,
+            records=_STUB_RECORD_NAMES[:1],
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self._crd_deletes(calls), [], out)
+        self.assertIn("release record survived Step 1", out)
+
+    def test_an_unreadable_probe_keeps_the_crds(self):
+        """Unreadable has to count as "may survive": keeping a CRD costs one
+        lease's tidiness, deleting one costs the project."""
+        rc, calls, out, err = self._run_steps(uninstall_exit=1, kubectl_exit=1)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self._crd_deletes(calls), [], out)
+        self.assertIn("could not read", out)
+
+    def test_the_probe_reads_records_by_helms_own_labels(self):
+        """A probe on the chart's part-of label would find no record at all —
+        Helm stamps owner=helm and none of the chart's labels — so the gate
+        would open on every run and nothing would look wrong."""
+        rc, calls, out, err = self._run_steps()
+        self.assertEqual(rc, 0, err)
+        probes = [c for c in calls if c.startswith("kubectl get secret")]
+        self.assertEqual(len(probes), 1, calls)
+        argv = probes[0].split()
+        self.assertIn(_RECORD_SELECTOR, argv)
+        self.assertIn("-n", argv)
+        self.assertIn(_NAMESPACE, argv)
+
+    def test_the_crd_step_reports_which_branch_it_took(self):
+        """#1172 went 25 hours unnoticed because the log said only ✓."""
+        for branch, kwargs in (
+            ("deleted", {}),
+            ("skipped", {"kubectl_exit": 1}),
+            ("delete timed out or failed", {"crd_delete_exit": 1}),
+        ):
+            with self.subTest(branch=branch):
+                rc, calls, out, err = self._run_steps(**kwargs)
+                self.assertEqual(rc, 0, err)
+                self.assertIn(f"CRD step ({branch}", out)
+
+    def test_the_crd_delete_is_bounded(self):
+        """`kubectl delete` waits forever by default, and a CRD delete blocks
+        on customresourcecleanup until every CR of that kind is gone — which a
+        PlatformAgent finalizer no live operator can clear never is. Unbounded,
+        that hangs teardown past Prow's job timeout and Steps 3 and 4, whose
+        own comment says they must stay reachable on every path, never run."""
+        rc, calls, out, err = self._run_steps()
+        self.assertEqual(rc, 0, err)
+        deletes = self._crd_deletes(calls)
+        self.assertEqual(len(deletes), 1, calls)
+        self.assertIn("--timeout", deletes[0].split(), deletes[0])
+
+    def test_a_crd_delete_that_does_not_finish_still_reaches_the_sweeps(self):
+        """The point of bounding it: the run continues, says so, and stays
+        green, so the orphans Steps 3 and 4 exist to remove still go."""
+        rc, calls, out, err = self._run_steps(crd_delete_exit=1)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("did not finish within", out)
+        self.assertIn("Step 3", out)
+        self.assertIn("Step 4", out)
+
+    def test_the_uninstall_asks_helm_for_the_real_error(self):
+        """Without --debug Helm returns only `failed to delete release: <name>`
+        and hands the cause to cfg.Log, which drops it. That one line was all
+        CI recorded for the 25 hours #1172 went unnoticed, so the flag is the
+        change's diagnostic and not a convenience."""
+        rc, calls, out, err = self._run_steps(
+            uninstall_exit=1, history_json=_HISTORY_POISONED, history_exit=0
+        )
+        self.assertEqual(rc, 0, err)
+        uninstalls = [c for c in calls if c.startswith("helm uninstall")]
+        self.assertEqual(len(uninstalls), 1, calls)
+        self.assertIn("--debug", uninstalls[0].split(), uninstalls[0])
+
+    def test_an_unreadable_probe_says_why(self):
+        """The reason used to go to /dev/null. A missing namespace is a
+        knowably-empty read and an RBAC failure is not; the branch treats them
+        alike, so the log is the only place the difference survives."""
+        rc, calls, out, err = self._run_steps(uninstall_exit=1, kubectl_exit=1)
+        self.assertEqual(rc, 0, err)
+        self.assertIn("namespaces", out)
+        self.assertIn("not found", out)
+
     # --- the exit-code contract holds ---------------------------------------
 
     def test_a_failing_kubectl_neither_stops_teardown_nor_reds_it(self):
-        """Fallback delete red, CRD delete red, sweep red — the teardown
+        """Fallback delete red, record probe red, sweep red — the teardown
         still exits 0 and still reaches the steps after Step 1."""
         rc, calls, out, err = self._run_steps(uninstall_exit=1, kubectl_exit=1)
         self.assertEqual(rc, 0, err)
-        # Step 2 (the CRD delete by file) still ran after the failed fallback.
+        # Step 2 ran, and with its probe red it cannot rule out a surviving
+        # record, so it keeps the CRDs rather than re-arming #1172's trap.
+        self.assertIn("could not read", out)
+        # And the steps after it ran too.
         self.assertTrue(
-            any(c.startswith("kubectl delete -f") for c in calls),
-            f"the CRD delete never ran after a failed record fallback: {calls}",
+            any(c.startswith("kubectl delete clusterroles") for c in calls),
+            f"the cluster-scoped sweep never ran: {calls}",
         )
 
 
