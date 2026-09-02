@@ -97,10 +97,11 @@ A build with no `finished.json` is still running and is skipped entirely.
       `infra`, as is any **non-pass** rep whose line carries the literal
       `KUBE_AGENTS_INFRA_FAILURE` marker; anything else (`fail`, `blocked`,
       tokens this collector has never seen) → `fail`.
-    - `reason` — the free text after the first ` -- ` (later ` -- `
-      occurrences belong to the reason), with the trailing
-      `[OutcomeScore=…]` metrics dump stripped, truncated to 300 chars.
-      `null` for passing reps and when nothing remains.
+    - `reason` — the free text after the first space-padded `--` separator
+      (later separators belong to the reason — fail reasons contain the
+      delimiter themselves), with the trailing `[OutcomeScore=…]` metrics
+      dump stripped, truncated to 300 chars. `null` for passing reps and
+      when nothing remains.
     - **Omission semantics:** the key is absent — never `[]` — when the log
       has no `rep N:` grading lines for the task: single-repetition-era
       builds (branches predating the multi-repetition eval of 2026-08-28;
@@ -159,9 +160,9 @@ below).
 - **Known gap:** multi-repetition verdict lines carry no task-level
   duration or OutcomeValidity, so `durations` and `ov_history` accrue only
   from single-repetition-era runs and freeze once those age out of the
-  window. Collecting per-rep durations (the `<<< finished <task> rep N in
-  Ss` markers) is a follow-up; renderers should not present these two as
-  current for repetition-era data.
+  window. Collecting per-rep durations from the per-rep finish markers
+  (`<<< finished <task> rep N in Ss`) is a follow-up; renderers should not
+  present these two as current for repetition-era data.
 
 ### Optional top-level fields
 
@@ -203,8 +204,8 @@ stay: they pin the omission semantics of `reps` (no grading lines, no key).
 same trimming, covering both launch-marker formats and every rep verdict
 token observed in the wild (`pass`, `fail`, `infra`, `blocked`):
 
-| build               | why it is here                                       |
-| ------------------- | ---------------------------------------------------- |
-| 2094432646640701440 | PR 1057 — parallel fan-out, green, one infra rep     |
-| 2094467976156680192 | PR 1075 — serial markers, aborted mid-task           |
-| 2094714569262895104 | PR 1089 — blocked/infra-heavy, >300-char reasons     |
+| build               | why it is here                                   |
+| ------------------- | ------------------------------------------------ |
+| 2094432646640701440 | PR 1057 — parallel fan-out, green, one infra rep |
+| 2094467976156680192 | PR 1075 — serial markers, aborted mid-task       |
+| 2094714569262895104 | PR 1089 — blocked/infra-heavy, >300-char reasons |
