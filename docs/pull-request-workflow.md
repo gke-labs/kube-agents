@@ -301,9 +301,10 @@ therefore finds nothing and concludes wrongly.
 
 Those six are not the whole required set either. Tide also requires every Prow presubmit not marked
 `optional`, and those are configured in `oss-test-infra` rather than in branch protection —
-`pull-kube-agents-smoke-test` carries `optional: true`, which is why it reports on a pull request
-without gating one. So the command below answers half the question, and a red check in neither list
-blocks no merge:
+`pull-kube-agents-smoke-test` dropped its `optional: true` on 2026-09-02
+(GoogleCloudPlatform/oss-test-infra#2677), so the behavioural presubmit gates every merge from that
+date. The command below therefore answers half the question, and a red check in neither list blocks
+no merge:
 
 ```bash
 gh api repos/gke-labs/kube-agents/branches/main/protection \

@@ -1,6 +1,6 @@
 # kube-agents Testing Strategy
 
-> **STATUS: draft.** Real today: unit tests, a gating integration tier, and a standing seeded fleet. Presubmit runs two cases and blocks nothing; the release gate is one test. Nightly is a merged pipeline that has never run: `nightly-pipeline.yml` exists, with the full E2E matrix and the staging promotion, and its GCP project and `nightly` GitHub environment now exist too, but it has no cron and no dispatch has been made against it. None of the eval tier §4.4 describes is built either. Everything else here is the plan.
+> **STATUS: draft.** Real today: unit tests, a gating integration tier, and a standing seeded fleet. Presubmit runs twenty cases at three repetitions and has blocked merges since 2026-09-02; the release gate is one test. Nightly is a merged pipeline that has never run: `nightly-pipeline.yml` exists, with the full E2E matrix and the staging promotion, and its GCP project and `nightly` GitHub environment now exist too, but it has no cron and no dispatch has been made against it. None of the eval tier §4.4 describes is built either. Everything else here is the plan.
 
 ## 1. What we are building
 
@@ -60,7 +60,7 @@ Budget is minutes, not hours, and anything needing a full install belongs to the
 
 ### 4.2 Presubmit evals: the tier that does the work
 
-Today a pull request gets a namespace on a shared cluster and two devops-bench tasks, `gpu-stress-test-diagnosis` and `agent-kanban-smoke`. Both declare a `verification_spec`, so both take the deterministic path: the gate is `VerificationCatastrophic`, `VerificationCoverage` and `VerificationCorrectness`, not a judged score. The fixed 0.7 in `hack/ci-eval-pr.sh` is the transition fallback for a task carrying no spec, and becomes dead code once every task carries one. The Prow job is `optional: true`, so nothing behavioural blocks a merge.
+Today a pull request gets a namespace on a shared cluster and the full matrix in `hack/ci-eval-pr.sh`: twenty active cases across all eleven domains (`docs/designs/domains.yaml`), three repetitions each. Every active case declares a `verification_spec`, so every case takes the deterministic path: the gate is `VerificationCatastrophic`, `VerificationCoverage` and `VerificationCorrectness`, not a judged score. Thirteen of the twenty are bootstrap-admitted — the `BOOTSTRAP_ADMITTED` roster in `hack/ci-eval-pr.sh`, which is also where the demotion protocol lives — and only those can red the job by collapsing, failing every repetition; the absolute rungs below block for every case, admitted or not. And a red job now blocks: the Prow job stopped being `optional: true` on 2026-09-02 (GoogleCloudPlatform/oss-test-infra#2677).
 
 Expand on two axes. The unit throughout is the **case**: one question against a named fixture, plus what the answer must contain. There is no second kind of test; a journey is covered by one case or by twenty.
 
@@ -107,7 +107,7 @@ Four properties matter:
 - **Fixtures are named by role, never by cluster.** Each eval project gets its own trio from the same module, so cases say `hpa-saturated` or `idle-nodepool`, never a cluster name or a project id. A case written once runs anywhere.
 - **The clock cannot be cheated.** `creationTimestamp` is server-set, and the cost SOP filters server-side, so the "usable from" column is a real wait. A fixture that has not aged in yet is dormant, not failing. The fleet README carries the dates.
 
-A run gets two hours of wall-clock. Compute is deliberately not the constraint.
+A run gets six hours of wall-clock. Compute is deliberately not the constraint.
 
 #### What blocks, per case
 
@@ -141,7 +141,7 @@ Each case gets one verdict. The gate checks these in order and stops at the firs
 
 The order says that authority outranks quality, and that no evidence blocks rather than passing quietly.
 
-Throughout this document, "blocks" means the presubmit job goes red. Whether a red job stops a merge is a separate question decided Tide-side on labels, and today it does not: the job is `optional: true`.
+Throughout this document, "blocks" means the presubmit job goes red. Whether a red job stops a merge is a separate question decided Tide-side, and since 2026-09-02 it does: `pull-kube-agents-smoke-test` is no longer `optional: true` (GoogleCloudPlatform/oss-test-infra#2677), so Tide will not merge past a red presubmit.
 
 #### Scaling to hundreds of cases
 
