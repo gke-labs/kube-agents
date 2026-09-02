@@ -1,10 +1,12 @@
-# REGISTERED, INACTIVE — recast to the nightly tier on 2026-08-26 (a
-# commented entry in hack/ci-eval-pr.sh TASKS). Its one measured run PASSED
+# NIGHTLY-TIER ACTIVE — recast out of the presubmit on 2026-08-26, an
+# entry in hack/ci-eval-pr.sh NIGHTLY_TASKS since 2026-09-02: the nightly
+# runs it (EVAL_TIER=nightly), the presubmit never does. Its one measured
+# run PASSED
 # clean — every exact check green, OutcomeValidity 0.7 recorded — in 962s
 # (build 2092638061140643840, kube-agents-evals-3), and 962s is the reason it
 # moved: six full audits at that price do not fit one presubmit. The
 # reliability domain is covered there by reliability-pdb-probe; this full
-# sweep is the SOP-fidelity version and activates with the nightly tier.
+# sweep is the SOP-fidelity version and runs nightly.
 # It was held by A1, A4 and A5 (bench/tasks/DRAFTS.md); all three are closed.
 #
 # A1 and A4 cleared together on 2026-08-25, when

@@ -1,9 +1,10 @@
-# Registered (commented out) in hack/ci-eval-pr.sh TASKS — superseded in
+# Registered in hack/ci-eval-pr.sh NIGHTLY_TASKS (nightly-tier active since
+# 2026-09-02) — superseded in
 # presubmit by reliability-pdb-probe, which is active and asks the same
 # question of the same planted defect (checkout-gateway's missing PDB),
 # graded the same way. Activating both spends presubmit budget grading one
-# behavior twice. It passed live validation 1.0 on #984, so it is a
-# nightly-tier candidate as a prompt-phrasing variation, not a presubmit one.
+# behavior twice. It passed live validation 1.0 on #984, so it runs in the
+# nightly as a prompt-phrasing variation, not in the presubmit.
 #
 # Domain: reliability (obtainability-audit).
 # Journey: Ask a direct query about a workload's survivability during voluntary
@@ -12,7 +13,7 @@
 # Planted defect required: a two-replica Deployment named "checkout-gateway" in
 # namespace "seeded-reliability" on the seeded fleet, with no PodDisruptionBudget.
 # Isolation class: read-only.
-# Eligible tier: nightly (presubmit signal is the probe's).
+# Tier: nightly (presubmit signal is the probe's).
 id: obtainability-direct-query
 name: Direct query identifies voluntary disruption risk for checkout-gateway
 prompt: >-

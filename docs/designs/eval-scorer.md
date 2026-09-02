@@ -71,7 +71,8 @@ hypothetical — it is what kept the audit scenarios commented out in `TASKS` in
 `hack/ci-eval-pr.sh`, since their `ledger_issue_contains` checks returned `status: "error"` without
 an `issues: read` credential the Prow job supplied. That was rung 2 working, not misfiring; the job
 mounts one now. The canary `compliance-rbac-overgrant` runs on every presubmit, and the other audit
-scenarios stay commented out on cost, recast to the nightly tier. The
+scenarios run in the nightly tier only (`NIGHTLY_TASKS` in `hack/ci-eval-pr.sh`), kept
+out of the presubmit on cost. The
 alternative — scoping 1–3 to admitted cases — means an unscreened case can never report that its
 checks are broken, which is the state it is most likely to be in.
 

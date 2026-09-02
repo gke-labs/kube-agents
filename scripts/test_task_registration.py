@@ -19,11 +19,10 @@ invoked by no workflow; this lint, reached through PYTHON_TEST_DIRS
 (Makefile:129) and run by .github/workflows/python-tests.yml, is the whole of
 the enforcement on a pull request. A case passes by being named in
 TASKS (a commented-out entry counts: it is registered, pending activation,
-which is how scenarios wait for the seeded fleet) or by a reviewed entry in
-the validator's KNOWN_UNREGISTERED with the reason. There is deliberately no
-nightly exemption yet: no nightly runner exists anywhere in the tree, and an
-exemption into a runner that does not exist is an exemption into nothing.
-It returns with the nightly tier (testing implementation plan, Phase 4).
+which is how scenarios wait for the seeded fleet), by an entry in
+NIGHTLY_TASKS (the nightly tier, which EVAL_TIER=nightly appends to TASKS --
+the runner this docstring once said did not exist), or by a reviewed entry in
+the validator's KNOWN_UNREGISTERED with the reason.
 
 This lint and scripts/test_domain_coverage.py ratchet together. That one
 counts a domain covered only when a task carrying its slug and a non-empty
@@ -111,13 +110,48 @@ class TestEveryTaskIsRegistered(unittest.TestCase):
         # The parse reads the first TASKS=( ... ) block. A later reassignment
         # would silently win in the shell while this test kept reading the
         # first -- the one escape that would not fail loudly red.
-        # Anchored to line start: FAILED_TASKS=( contains the bare substring.
+        # Anchored to line start: FAILED_TASKS=( contains the bare substring,
+        # and so do NIGHTLY_TASKS=( and the tier switch's TASKS+=(, neither of
+        # which is a reassignment.
         count = len(re.findall(r"^TASKS=\(", EVAL_SCRIPT.read_text(), re.M))
         self.assertEqual(
             count,
             1,
             f"hack/ci-eval-pr.sh declares TASKS=( {count} times; this test "
             "reads the first, the shell obeys the last -- keep it to one.",
+        )
+
+    def test_the_nightly_array_is_declared_exactly_once(self):
+        # Same escape as above, for the nightly half of the registration
+        # parse: the validator reads the first NIGHTLY_TASKS=( ... ) block.
+        count = len(re.findall(r"^NIGHTLY_TASKS=\(", EVAL_SCRIPT.read_text(), re.M))
+        self.assertEqual(
+            count,
+            1,
+            f"hack/ci-eval-pr.sh declares NIGHTLY_TASKS=( {count} times; the "
+            "validator reads the first, the shell obeys the last -- keep it "
+            "to one.",
+        )
+
+    def test_a_nightly_entry_counts_as_registered(self):
+        # The property scripts/test_ci_eval_nightly.py's tier tests stand on:
+        # a case listed only in NIGHTLY_TASKS is registered, not an orphan.
+        # Read the array the same way the shell does rather than hand-listing
+        # its contents, so this holds through every future re-tiering.
+        text = EVAL_SCRIPT.read_text()
+        block = re.search(r"^NIGHTLY_TASKS=\((.*?)^\)$", text, re.M | re.S)
+        self.assertIsNotNone(block, "NIGHTLY_TASKS=( ... ) block not found")
+        nightly = {
+            name
+            for name in re.findall(r'^\s*"\./tasks/([A-Za-z0-9_-]+)/task\.yaml"', block.group(1), re.M)
+        }
+        self.assertTrue(nightly, "NIGHTLY_TASKS parsed to no active entries")
+        registered = validator.registered_cases()
+        self.assertTrue(
+            nightly <= registered,
+            f"NIGHTLY_TASKS entries missing from registered_cases(): "
+            f"{sorted(nightly - registered)} -- the validator's nightly parse "
+            "has drifted from the script.",
         )
 
 
