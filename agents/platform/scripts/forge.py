@@ -7,12 +7,19 @@ every skill script on the Platform Agent's `sys.path` can import it.
 What this is for
 ----------------
 Reading and answering a pull-request conversation needs a handful of things from
-a code-hosting service, and `ForgeProvider` below is the whole list: can I reach
-it, who am I, which pull requests are open, what has been said on one, what has
-landed on one, say something back, and acknowledge that a request was seen.
-Those are the whole forge-shaped surface of the feature; everything above them —
-what counts as addressing the agent, who is allowed to, when a request has
-already been answered — is harness policy that does not change between forges.
+a code-hosting service, and the first seven methods of `ForgeProvider` below are
+the whole list: can I reach it, who am I, which pull requests are open, what has
+been said on one, what has landed on one, say something back, and acknowledge
+that a request was seen. Opening a change adds three more — create, update, and
+read back the pull request for a branch — which `submit-suggestion` needs and
+used to get by shelling `gh` itself at three call sites.
+
+Everything above those — what counts as addressing the agent, who is allowed to,
+when a request has already been answered, whether an existing pull request is a
+conflict or a resubmission — is harness policy that does not change between
+forges. The protocol grows one migrated consumer at a time rather than by
+copying an API surface; `docs/designs/multi-forge-support.md` §4 says why, and
+names the two consumers still to come (`audit_report.py`, `resolver.py`).
 
 Splitting the two here is what makes a second forge a new class rather than a
 second copy of the sweep. It is *not* a claim that a second forge is cheap:
@@ -145,6 +152,17 @@ DEFINITIVE_HTTP_STATUS_RE = re.compile(r"HTTP (?:401|403|404)\b", re.IGNORECASE)
 #: `repo_ref.REASON_UNPARSEABLE`. `_forge_warning` renders it verbatim.
 REASON_HOST_UNSUPPORTED = "FORGE_HOST_UNSUPPORTED"
 
+#: Reason code for "this branch already has an open change". Not an error to
+#: every caller: `submit-suggestion` treats it as the success case of a
+#: resubmission. See `PullRequestExists`.
+REASON_PULL_REQUEST_EXISTS = "PULL_REQUEST_EXISTS"
+
+#: What `gh pr create` says when the branch already has an open pull request,
+#: matched case-insensitively against the merged output. Recognising the phrase
+#: is GitHub-shaped and so belongs to `GitHubProvider`; deciding that it is not
+#: a failure is harness policy and belongs to the caller.
+_PR_EXISTS_MARKER = "already exists"
+
 
 class ForgeError(Exception):
     """A fault with a machine-readable reason code.
@@ -187,6 +205,26 @@ class UnknownForgeHost(ForgeError):
 
     def __init__(self, host: str):
         super().__init__(REASON_HOST_UNSUPPORTED, host)
+
+
+class PullRequestExists(ForgeError):
+    """The head branch already has an open change.
+
+    A distinct type because it is the one forge refusal whose right handling
+    differs per caller. `submit-suggestion` gets here on every second round of
+    review feedback — the push has already landed by then, and reporting the
+    submission as failed is how the skill shipped exiting 1 for every card that
+    came back. Something opening a change for the first time would treat it as
+    a real conflict. The provider therefore reports the fact and says nothing
+    about what to do with it.
+
+    `value` is the refusal text, which for GitHub names the existing pull
+    request's URL.
+    """
+
+    def __init__(self, head: str, detail: str = ""):
+        super().__init__(REASON_PULL_REQUEST_EXISTS, detail or head)
+        self.head = head
 
 
 @dataclass(frozen=True)
@@ -263,7 +301,15 @@ class Commit:
 
 
 class ForgeProvider(Protocol):
-    """The complete forge-shaped surface of the PR-conversation feature."""
+    """The forge-shaped surface this harness needs.
+
+    Two groups. The first seven are the PR-conversation feature — reading a
+    review thread and answering it. The last three are opening a change, which
+    `submit-suggestion` needs and which is the first consumer migrated onto this
+    protocol from a private `gh` runner of its own. The list grows by migration,
+    not by copying a forge's API surface: see
+    `docs/designs/multi-forge-support.md` §4.
+    """
 
     #: False on a forge with no reaction API (Bitbucket Cloud), so a caller can
     #: skip the acknowledgement rather than discover it fails.
@@ -282,6 +328,16 @@ class ForgeProvider(Protocol):
     def acknowledge(self, repo: str, comment: Comment) -> bool: ...
 
     def list_commits(self, repo: str, pr: PullRequest) -> list[Commit]: ...
+
+    def create_pull_request(
+        self, repo: str, *, head: str, base: str, title: str, body: str
+    ) -> str: ...
+
+    def update_pull_request(
+        self, repo: str, *, head: str, title: str, body: str
+    ) -> None: ...
+
+    def pull_request_url(self, repo: str, *, head: str) -> str: ...
 
 
 def normalise_login(login: str) -> str:
@@ -800,6 +856,84 @@ class GitHubProvider:
             committer = ((row.get("commit") or {}).get("committer")) or {}
             commits.append(Commit(sha=sha, committed_at=str(committer.get("date", ""))))
         return commits
+
+    # -- opening a change --------------------------------------------------
+    def create_pull_request(
+        self, repo: str, *, head: str, base: str, title: str, body: str
+    ) -> str:
+        """Open a pull request from `head` into `base`, returning its URL.
+
+        Raises `PullRequestExists` when the branch already has an open one. That
+        refusal arrives *after* the push has landed, so the caller has to be
+        able to tell it from a real failure — a protected base, a credential
+        without permission — and only the text distinguishes them.
+
+        This is the one method that reads `self._run`'s result rather than going
+        through `_call`, because `_call`'s contract is to raise on any non-zero
+        exit and this is the case where the exit code is not the answer. Both
+        reach the forge the same way, so a test's injected runner still sees it.
+
+        The body travels on stdin, for the reason `post_comment` sets out: since
+        #913 the caller, the sandbox and the broker are three containers with
+        three filesystems, so `--body-file <path>` names a file that only one of
+        them can open. `-R` is always passed, so the call does not depend on the
+        process being inside a clone of `repo` either.
+        """
+        result = self._run(
+            [
+                "pr", "create",
+                "-R", repo,
+                "--base", base,
+                "--head", head,
+                "--title", title,
+                "--body-file", BODY_STDIN,
+            ],
+            stdin=body,
+        )
+        if result.returncode != 0:
+            merged = f"{result.stdout or ''}\n{result.stderr or ''}"
+            if _PR_EXISTS_MARKER in merged.lower():
+                raise PullRequestExists(head, merged.strip()[:200])
+            raise ForgeError("REPO_UNREACHABLE", (result.stderr or "").strip()[:200])
+        # `gh` prints the URL, but a version that printed nothing would
+        # otherwise return "" as though the pull request had no address.
+        return (result.stdout or "").strip() or self.pull_request_url(repo, head=head)
+
+    def update_pull_request(
+        self, repo: str, *, head: str, title: str, body: str
+    ) -> None:
+        """Point the open pull request for `head` at the work just pushed.
+
+        Title and body as well as commits: a resubmission's description was
+        written for the commits it is pushing now, and leaving the old one in
+        place describes work the branch no longer contains.
+
+        On stdin, for the reason `create_pull_request` gives.
+        """
+        self._call(
+            [
+                "pr", "edit", head,
+                "-R", repo,
+                "--title", title,
+                "--body-file", BODY_STDIN,
+            ],
+            repo=repo,
+            expect_json=False,
+            stdin=body,
+        )
+
+    def pull_request_url(self, repo: str, *, head: str) -> str:
+        """The open pull request's address, or "" when it has none.
+
+        `--json url` rather than `--jq`: the projection is one field either way,
+        and reading it here keeps the parse in Python where a malformed answer
+        raises `FORGE_RESPONSE_UNREADABLE` instead of arriving as an empty
+        string that looks like "no pull request".
+        """
+        row = self._call(["pr", "view", head, "-R", repo, "--json", "url"])
+        if not isinstance(row, dict):
+            return ""
+        return str(row.get("url") or "")
 
 
 #: Host -> provider, keyed on the parsed host and matched exactly. One forge
