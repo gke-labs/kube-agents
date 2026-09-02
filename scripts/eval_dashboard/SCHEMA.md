@@ -124,9 +124,9 @@ collector version in this tree emits them yet; the renderer already reads
 both.
 
 - `runs[].pr_merged` — `true` | `false` | `null`: whether the run's PR has
-  merged. The renderer's "agent" band charts only runs with `pr_merged:
-  true` (the final such run per PR); absent or `null` keeps a run out of
-  that cohort without any other effect.
+  merged. The renderer's "agent" band charts only runs where it is `true`
+  (the final such run per PR); absent or `null` keeps a run out of that
+  cohort without any other effect.
 - `runs[].tasks[].reps` — the task's individual repetitions, in order:
   `[{"n": 1, "result": "pass"|"fail"|"infra", "reason": "<string>"|null}]`.
   `reason` is free-form log text (renderers must escape it). `infra` reps
