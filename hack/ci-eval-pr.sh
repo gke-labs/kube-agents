@@ -53,12 +53,23 @@ set -euo pipefail
 # ~2h that dominates the job. Hoisting the check ahead of the lease would be
 # an oss-test-infra change; this one is deliberately kube-agents-side only.
 #
-# Trust surface: none new. The job history under gs://kube-agents-prow is
-# written by Prow's pod utilities; more to the point, a pull request that
-# wants a green context can already edit this script to `exit 0` -- its own
-# code IS the job -- so revalidation adds no capability an attacker lacked.
-# And it is self-defending: a PR that edits the revalidation logic touches
-# hack/, which is not on the inert list, so that PR's own run goes full.
+# Trust surface. For the SELF case, subsumption: a pull request that wants
+# its own context green can already edit this script to `exit 0` -- its own
+# code IS the job -- and a PR that edits the revalidation logic touches
+# hack/, which is not inert, so its own run goes full. That argument does
+# NOT cover the CROSS-PR case: the job history under gs://kube-agents-prow
+# is written by pod utilities that may share the test container's identity,
+# so a hostile PR's run could conceivably plant a fabricated "green" record
+# under a VICTIM PR's history path (kube-agents-bot's review of #1186 built
+# the full attack). The GCS records are therefore never trusted alone: a
+# candidate green build counts only when GitHub holds a SUCCESS status
+# event for this job's context on the recovered head whose target URL names
+# that same build id. Statuses are posted by Prow's reporter with
+# repository write permission -- google-oss-prow[bot] -- which no pull
+# request holds, and the events are append-only per build (a later aborted
+# run does not erase an earlier build's success event; verified against
+# #1127's head 50e0f44f). The SHAs are also required to be 40-hex before
+# any git command sees them, so a forged record cannot smuggle arguments.
 #
 # Downstream note: a revalidated run's build log carries no per-task result
 # lines and no final-verdict line. scripts/eval_dashboard/collect.py already
@@ -83,6 +94,11 @@ readonly REVALIDATION_SPYGLASS_PREFIX="https://oss.gprow.dev/view/gs/kube-agents
 # base ref assumed when the decoration did not export PULL_BASE_REF.
 readonly REVALIDATION_REPO_KEY="gke-labs/kube-agents"
 readonly REVALIDATION_DEFAULT_BASE_REF="main"
+# Where the Prow-posted status events live: the attestation that a claimed
+# green build really ran and really passed (see the trust-surface note
+# above). Read with BENCH_GITHUB_TOKEN when the job mounts one, falling back
+# to an anonymous read of the public repo.
+readonly REVALIDATION_STATUS_API="https://api.github.com/repos/gke-labs/kube-agents/commits"
 # How many of the newest builds to inspect for a green one. Each costs one
 # gsutil cat (~1s); an active PR rarely stacks this many pushes between
 # greens, and a bound keeps the fall-through path seconds long.
@@ -119,6 +135,10 @@ revalidate_against_green_history() {
   # instead of every finished.json silently classifying as not-green.
   if ! command -v python3 >/dev/null 2>&1; then
     echo "Step 0: full run: no python3 on PATH to parse the job records with"
+    return 1
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "Step 0: full run: no curl on PATH to read the GitHub status attestation with"
     return 1
   fi
 
@@ -178,11 +198,53 @@ print(base, head)
   prev_base="${shas%% *}"
   prev_head="${shas##* }"
 
+  # Nothing recovered from GCS is trusted yet -- see the trust-surface note
+  # in the header. Three bindings, all fail-closed:
+  #   1. well-formed SHAs, so a forged record cannot smuggle git arguments;
+  #   2. the build's two records agree on the head they claim;
+  #   3. GitHub holds a Prow-posted SUCCESS status event for this job's
+  #      context on that head whose target URL names this very build.
+  local sha
+  for sha in "${prev_base}" "${prev_head}"; do
+    if ! printf '%s' "${sha}" | grep -Eq '^[0-9a-f]{40}$'; then
+      echo "Step 0: full run: build ${prev_green}'s started.json holds a malformed SHA"
+      return 1
+    fi
+  done
+  local finished_revision
+  finished_revision="$(printf '%s' "${finished}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("revision") or "")' 2>/dev/null)" || finished_revision=""
+  if [ "${finished_revision}" != "${prev_head}" ]; then
+    echo "Step 0: full run: build ${prev_green}'s finished.json revision (${finished_revision:-unreadable}) does not match its started.json head (${prev_head})"
+    return 1
+  fi
+  local statuses curl_auth=()
+  [ -n "${BENCH_GITHUB_TOKEN:-}" ] && curl_auth=(-H "Authorization: Bearer ${BENCH_GITHUB_TOKEN}")
+  statuses="$(curl -fsS --max-time 30 ${curl_auth[@]+"${curl_auth[@]}"} "${REVALIDATION_STATUS_API}/${prev_head}/statuses?per_page=100" 2>/dev/null)" \
+    || statuses="$(curl -fsS --max-time 30 "${REVALIDATION_STATUS_API}/${prev_head}/statuses?per_page=100" 2>/dev/null)" \
+    || { echo "Step 0: full run: could not read GitHub statuses for ${prev_head} to attest green build ${prev_green}"; return 1; }
+  if ! printf '%s' "${statuses}" | python3 -c '
+import json
+import sys
+
+context, build = sys.argv[1], sys.argv[2]
+needle = "/" + context + "/" + build
+for status in json.load(sys.stdin):
+    if (
+        status.get("context") == context
+        and status.get("state") == "success"
+        and needle in (status.get("target_url") or "")
+    ):
+        sys.exit(0)
+sys.exit(1)
+' "${REVALIDATION_JOB_NAME}" "${prev_green}" 2>/dev/null; then
+    echo "Step 0: full run: GitHub holds no ${REVALIDATION_JOB_NAME} success status on ${prev_head} naming build ${prev_green} -- refusing to trust the GCS record alone"
+    return 1
+  fi
+
   # Both previous SHAs must exist locally. The decorated checkout normally
   # has them (they are ancestors of the current base and head); a force-push
   # can orphan prev_head, so try one fetch from origin -- the clonerefs
   # remote for this repository, never anywhere else -- then fail closed.
-  local sha
   for sha in "${prev_base}" "${prev_head}"; do
     if ! git -C "${repo_dir}" cat-file -e "${sha}^{commit}" 2>/dev/null; then
       git -C "${repo_dir}" fetch --quiet origin "${sha}" 2>/dev/null || true
@@ -220,6 +282,7 @@ print(base, head)
 
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 0: REVALIDATED against green build ${prev_green} -- every change since is inert, skipping the eval matrix ==="
   echo "Reused verdict: ${REVALIDATION_SPYGLASS_PREFIX}/${PULL_NUMBER}/${REVALIDATION_JOB_NAME}/${prev_green}"
+  echo "Attested by the Prow-posted ${REVALIDATION_JOB_NAME} success status on ${prev_head}"
   _revalidation_print_delta "head delta" "${prev_head}..${PULL_PULL_SHA}" "${head_delta}"
   _revalidation_print_delta "base delta" "${prev_base}..${PULL_BASE_SHA}" "${base_delta}"
   echo "Predicate: every file above matches REVALIDATION_INERT_PATHS ${REVALIDATION_INERT_PATHS}"

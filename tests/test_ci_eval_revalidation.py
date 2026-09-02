@@ -15,6 +15,7 @@ and so that any future dashboard-collector support has a stable line to key
 on (scripts/eval_dashboard/collect.py reads nothing from it today).
 """
 
+import json
 import pathlib
 import re
 import subprocess
@@ -59,6 +60,23 @@ esac
 """
 
 
+_CURL_STUB = """#!/usr/bin/env bash
+# curl stub for the GitHub status attestation: serves
+# GITHUB_STATUS_DIR/<sha>.json for .../commits/<sha>/statuses requests and
+# fails like `curl -f` otherwise. Flags are skipped; the URL is the last
+# argument.
+url=""
+for arg in "$@"; do url="${arg}"; done
+sha="$(printf '%s' "${url}" | sed -n 's|.*/commits/\\([0-9a-f]*\\)/statuses.*|\\1|p')"
+object="${GITHUB_STATUS_DIR:-}/${sha}.json"
+if [ -n "${sha}" ] && [ -f "${object}" ]; then
+  cat "${object}"
+else
+  exit 22
+fi
+"""
+
+
 def _extract(pattern, what):
     text = _CI_EVAL_PR.read_text(encoding="utf-8")
     match = re.search(pattern, text, re.S | re.M)
@@ -81,15 +99,18 @@ class RevalidationTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.tmp = pathlib.Path(tmp.name)
 
-        # The stub gsutil, first on PATH.
+        # The stub gsutil and curl, first on PATH.
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
-        stub = self.bin / "gsutil"
-        stub.write_text(_GSUTIL_STUB)
-        stub.chmod(0o755)
+        for name, content in (("gsutil", _GSUTIL_STUB), ("curl", _CURL_STUB)):
+            stub = self.bin / name
+            stub.write_text(content)
+            stub.chmod(0o755)
 
         self.objects = self.tmp / "objects"
         self.objects.mkdir()
+        self.statuses = self.tmp / "statuses"
+        self.statuses.mkdir()
 
         # The fixture checkout. A linear chain is enough: deltas are plain
         # `git diff A B`, so each scenario just picks its four SHAs.
@@ -135,26 +156,47 @@ class RevalidationTest(unittest.TestCase):
         )
         return out.stdout.strip()
 
-    def _plant_history(self, builds):
-        """builds: [(build_id, passed, base_sha, head_sha)], any record None to omit."""
+    def _plant_history(self, builds, attest=True):
+        """builds: [(build_id, passed, base_sha, head_sha)], any record None to omit.
+
+        With attest=True (the default), each green build also gets the
+        Prow-posted GitHub success status event the script demands; a test
+        that plants a "green" GCS record WITHOUT one is modelling the forged
+        record kube-agents-bot's review described.
+        """
         listing = []
+        status_events = {}
         for build_id, passed, base_sha, head_sha in builds:
             listing.append(
                 f"gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{_PR}/{_JOB}/{build_id}/finished.json"
             )
             if passed is not None:
+                revision = f', "revision": "{head_sha}"' if head_sha else ""
                 (self.objects / f"{build_id}.finished.json").write_text(
-                    '{"passed": %s, "result": "%s"}'
-                    % ("true" if passed else "false", "SUCCESS" if passed else "FAILURE")
+                    '{"passed": %s, "result": "%s"%s}'
+                    % ("true" if passed else "false", "SUCCESS" if passed else "FAILURE", revision)
                 )
             if base_sha is not None:
                 (self.objects / f"{build_id}.started.json").write_text(
                     '{"repos": {"gke-labs/kube-agents": "main:%s,%s:%s"}}'
                     % (base_sha, _PR, head_sha)
                 )
+            if attest and passed and head_sha:
+                status_events.setdefault(head_sha, []).append(
+                    {
+                        "context": _JOB,
+                        "state": "success",
+                        "target_url": f"https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{_PR}/{_JOB}/{build_id}",
+                    }
+                )
+        for head_sha, events in status_events.items():
+            self._plant_statuses(head_sha, events)
         ls_file = self.tmp / "ls.txt"
         ls_file.write_text("\n".join(listing) + "\n")
         return ls_file
+
+    def _plant_statuses(self, head_sha, events):
+        (self.statuses / f"{head_sha}.json").write_text(json.dumps(events))
 
     def _run(self, cur_head, cur_base, ls_file=None, env_overrides=None):
         # Written into the fixture repo's hack/ so the function's own
@@ -189,6 +231,8 @@ class RevalidationTest(unittest.TestCase):
             "PULL_BASE_REF": "main",
             "GSUTIL_OBJECT_DIR": str(self.objects),
             "GSUTIL_CALL_LOG": str(self.call_log),
+            "GITHUB_STATUS_DIR": str(self.statuses),
+            "BENCH_GITHUB_TOKEN": "",
         }
         if ls_file is not None:
             env["GSUTIL_LS_FILE"] = str(ls_file)
@@ -327,6 +371,59 @@ class RevalidationTest(unittest.TestCase):
         proc = self._run(cur_head=self.c7, cur_base=self.c2, ls_file=ls)
         self.assertIn("VERDICT: FULL-RUN", proc.stdout)
         self.assertIn("code.py", proc.stdout)
+
+    def test_a_forged_green_record_without_a_github_status_is_a_full_run(self):
+        """The cross-PR forgery from kube-agents-bot's review: a fabricated
+        finished.json/started.json pair under this PR's history path, with no
+        Prow-posted success status behind it, must not be trusted."""
+        ls = self._plant_history([("9999999999999999999", True, self.c2, self.c4)], attest=False)
+        # GitHub answers 200 with an empty list for a commit that has no
+        # status events; an unreadable statuses endpoint is a separate
+        # fail-closed path with its own reason line.
+        self._plant_statuses(self.c4, [])
+        proc = self._run(cur_head=self.c4, cur_base=self.c2, ls_file=ls)
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn("refusing to trust the GCS record alone", proc.stdout)
+
+    def test_a_status_for_a_different_build_does_not_attest_this_one(self):
+        """A success status exists on the head, but its target URL names
+        another build -- the forged record cannot borrow it."""
+        ls = self._plant_history([("200", True, self.c2, self.c4)], attest=False)
+        self._plant_statuses(
+            self.c4,
+            [
+                {
+                    "context": _JOB,
+                    "state": "success",
+                    "target_url": f"https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{_PR}/{_JOB}/111",
+                },
+                {"context": _JOB, "state": "pending", "target_url": None},
+            ],
+        )
+        proc = self._run(cur_head=self.c4, cur_base=self.c2, ls_file=ls)
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn("refusing to trust the GCS record alone", proc.stdout)
+
+    def test_a_malformed_sha_is_a_full_run(self):
+        """A forged started.json must not be able to hand git anything but a
+        full-length commit id -- '--flag' smuggling dies here."""
+        ls = self._plant_history([("200", True, self.c1, self.c3)])
+        (self.objects / "200.started.json").write_text(
+            '{"repos": {"gke-labs/kube-agents": "main:%s,%s:--upload-pack=/tmp/evil"}}'
+            % (self.c1, _PR)
+        )
+        proc = self._run(cur_head=self.c4, cur_base=self.c2, ls_file=ls)
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn("malformed SHA", proc.stdout)
+
+    def test_disagreeing_finished_and_started_records_are_a_full_run(self):
+        ls = self._plant_history([("200", True, self.c1, self.c3)])
+        (self.objects / "200.finished.json").write_text(
+            '{"passed": true, "result": "SUCCESS", "revision": "%s"}' % self.c5
+        )
+        proc = self._run(cur_head=self.c4, cur_base=self.c2, ls_file=ls)
+        self.assertIn("VERDICT: FULL-RUN", proc.stdout)
+        self.assertIn("does not match its started.json head", proc.stdout)
 
     def test_a_missing_git_object_is_a_full_run(self):
         ghost = "deadbeef" * 5
