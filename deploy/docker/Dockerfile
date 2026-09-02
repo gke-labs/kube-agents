@@ -997,7 +997,25 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_kanban_guardr
 # fall-through.
 # See the module docstring in deploy/docker/patches/kanban_event_routing.py.
 #
-# All five patches ship in ONE COPY + ONE RUN on purpose. This stage is the base
+# Hotfix: a worker that fanned work out completed its own card on a dispatch
+# receipt, and the receipt was delivered as the final answer (issue #1010: card
+# t_470a97c5 closed "finished" with "Fanned out cluster investigation tasks ...
+# Awaiting synthesis"; 49 of 156 scored repetitions of the same eval case show
+# the identical shape). Completing IS the delivery, and nothing on the board
+# connected the receipt to the work it dispatched: task_links is a predecessor
+# edge and fan-out children are created parentless. So kanban_create now
+# records which running card created which child (kanban_worker_children), and
+# kanban_complete refuses — once, never wedging — to close a card whose
+# recorded children are neither settled nor gated on it, telling the worker to
+# wait and synthesize instead. Must run AFTER apply_kanban_auto_subscribe.py
+# and AFTER apply_kanban_result_required.py (earlier stage): both of its
+# anchors are text those patches introduced, deliberately, because the sites
+# it needs only exist in the patched tree. kanban_result_required.py is copied
+# here again solely so the applier can import the anchor constant; the module
+# itself was installed by its own stage.
+# See the module docstring in deploy/docker/patches/kanban_children_settled.py.
+#
+# All six patches ship in ONE COPY + ONE RUN on purpose. This stage is the base
 # for `platform`, and the block-per-patch layout these would normally get pushed
 # that chain past Docker's layer-depth ceiling ("max depth exceeded" on build
 # f9f1747c, 2026-08-07). The guarantees are unchanged — same appliers,
@@ -1017,6 +1035,10 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/kanban_event_routing.py \
      deploy/docker/patches/apply_kanban_event_routing.py \
      deploy/docker/patches/verify_kanban_event_routing.py \
+     deploy/docker/patches/kanban_children_settled.py \
+     deploy/docker/patches/apply_kanban_children_settled.py \
+     deploy/docker/patches/verify_kanban_children_settled.py \
+     deploy/docker/patches/kanban_result_required.py \
      deploy/docker/patches/patchlib.py \
      /tmp/latency-patches/
 RUN cp /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes_cli/kanban_wake_nudge.py && \
@@ -1044,12 +1066,18 @@ RUN cp /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes_cli/kanban_w
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_event_routing.py /opt/hermes && \
     grep -qF 'platform, chat_id, thread_id = _kanban_event_route(' /opt/hermes/tools/kanban_tools.py && \
     grep -q "from tools.kanban_event_routing import" /opt/hermes/tools/kanban_tools.py && \
+    cp /tmp/latency-patches/kanban_children_settled.py /opt/hermes/tools/kanban_children_settled.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_children_settled.py /opt/hermes && \
+    grep -qF '_kanban_record_worker_child(conn, new_tid)' /opt/hermes/tools/kanban_tools.py && \
+    grep -qF '_require_children_settled(tid, _kanban_children_connect)' /opt/hermes/tools/kanban_tools.py && \
+    grep -q "from tools.kanban_children_settled import" /opt/hermes/tools/kanban_tools.py && \
     cd /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_wake_nudge.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_auto_subscribe.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_comment_status.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_notify_delivery.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_event_routing.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_children_settled.py && \
     rm -rf /tmp/latency-patches
 
 
