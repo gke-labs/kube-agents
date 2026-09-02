@@ -95,7 +95,9 @@ edit away from being gone.
 
 A store that will not parse is an **error**, never an empty store. Empty means
 "nothing admitted, aggregate advisory", which is a green; a corrupt file
-reaching that state would silently disarm the gate.
+reaching that state would silently disarm the gate. (One exception to that
+green: under `EVAL_TASK_SELECTION=auto`, a run that also failed to grade an
+armed case reds — see the Bootstrap section of `docs/designs/eval-scorer.md`.)
 
 A leftover `<case-id>.json` from the pre-JSONL format is an **error**, not a
 file to skip: skipping it would read as "never screened" and silently de-admit

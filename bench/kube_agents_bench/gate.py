@@ -411,9 +411,42 @@ def _cmd_suite(args: argparse.Namespace) -> int:
     #
     # A warning rather than a red. The name might belong to a case that is
     # legitimately absent from this run -- commented out of TASKS, or filtered
-    # -- and redding the job for naming a case it did not run would make the
-    # variable unusable for the transition it exists to cover.
+    # by hand -- and redding the job for naming a case it did not run would
+    # make the variable unusable for the transition it exists to cover. The
+    # one exception is automatic selection, handled below.
     unknown = sorted(_bootstrap_admitted() - {str(c.get("case")) for c in cases})
+
+    # Under EVAL_TASK_SELECTION=auto the "legitimately filtered" escape does
+    # not hold: the filter is a program running on every pull request, and a
+    # subset that dropped every case the gate arms on grades a suite in which
+    # nothing can reach a blocking rung -- a disarmed gate reporting green.
+    # The selection floor (EVAL_ADMITTED_CASES in hack/ci-eval-pr.sh) exists
+    # to keep an admitted case in every subset; this is the backstop that
+    # reds the run if that wiring ever drops one. The trigger is `unknown`
+    # -- an armed case selection FAILED TO GRADE -- not "zero admitted",
+    # which a store outage or stale evidence also produces with the floor
+    # intact and which must stay advisory for the reasons _load_store gives.
+    # When the baseline store replaces BOOTSTRAP_ADMITTED as the source of
+    # admission, extend `unknown` with the store's admitted ids.
+    disarmed = (
+        os.environ.get("EVAL_TASK_SELECTION", "") == "auto"
+        and bool(unknown)
+        and not any(c.get("admitted") for c in cases)
+    )
+    if disarmed:
+        verdict.green = False
+        verdict.reasons.append(
+            "automatic task selection dropped every case the gate arms on "
+            f"({', '.join(unknown)}); nothing this run graded could have "
+            "blocked the merge. The selection floor must carry the admitted "
+            "cases (EVAL_ADMITTED_CASES in hack/ci-eval-pr.sh)."
+        )
+        print(
+            "::error::EVAL_TASK_SELECTION=auto graded no admitted case: "
+            f"selection dropped {', '.join(unknown)}. The selection floor "
+            "must carry the admitted cases (EVAL_ADMITTED_CASES).",
+            file=sys.stderr,
+        )
 
     # Per-case notes, deduplicated. A misspelled EVAL_JUDGED_METRICS name is
     # one configuration mistake, not one per case, and repeating it fourteen
@@ -425,7 +458,7 @@ def _cmd_suite(args: argparse.Namespace) -> int:
     # silently loosens the gate, and the one thing that must not happen is a
     # green nobody knows was measured against nothing.
     banners = []
-    if unknown:
+    if unknown and not disarmed:
         print(
             f"WARNING: BOOTSTRAP_ADMITTED names no graded case: {unknown}",
             file=sys.stderr,

@@ -1068,6 +1068,111 @@ TASKS=(
   # "./tasks/cluster-agent-crashloop-fix-request/task.yaml"
 )
 
+# The transition bridge. bench/baselines/ ships EMPTY, so no case is admitted
+# and nothing can reach the collapse rung -- which would mean the presubmit
+# blocks on nothing for as long as screening takes. Cases named here keep their
+# old blocking behaviour meanwhile.
+#
+# It is a bridge and not a destination: a bootstrap-admitted case has no
+# measured evidence, so it arms rung 4 but leaves rung 6 quiet and contributes
+# nothing to main's side of the aggregate. Screening replaces it.
+#
+# This roster is what blocks a pull request once the Prow job stops being
+# optional. Thirteen of the seventeen active cases are admitted: the ones
+# whose recent record shows failures only on their own regressions or on
+# infra classes the harness already excludes from the verdict. Four are
+# held out -- they still run and report on every pull request, and they
+# cannot red one on a GRADED failure. The scope of that promise is rungs
+# 4 and 6: rungs 1-3 (a forbidden mutation, an erroring check, a record
+# that is not a real run) stay blocking for every case by design,
+# admitted or not -- see grade_case, which evaluates them before it reads
+# admission. security-overgrant-remediation-proposal (#1066) is simply
+# new: it earns its record like any case, then enters. The other three
+# each have a filed issue naming the exit condition:
+#
+#   capacity-pinned-pool-probe            -- #1010: worker completes its
+#     card at fan-out ("Awaiting synthesis" as the final answer). The
+#     failure is correlated across repetitions when the agent chooses to
+#     fan out, so the collapse rule does not absorb it. Enters when the
+#     fix merges.
+#   cluster-agent-healthy-workload-no-finding -- #1100: the agent invents
+#     a finding on a healthy workload ~1 run in 8. Main's own trait, so a
+#     collapse would tax an innocent PR. Enters when the false-positive
+#     rate drops or when rung-6 screening can compare against main.
+#   autoops-warning-event-triage          -- #1101: 0/5 graded repetitions
+#     on record; admitting it reds every pull request today. Enters when
+#     the lettered-options bar is settled and it has a clean record.
+#
+# If an admitted case reds a pull request its diff cannot explain on a
+# graded failure, demote it here and reference its issue. Demotion is a
+# one-line same-day edit to this list -- this file, not the Prow config,
+# is deliberately the fast lever. It is the lever for rung-4 reds ONLY: a
+# rung-1-3 red (mutation, erroring verifier, an empty record on a task
+# that provisions nothing -- a record whose deployer died before any
+# agent ran grades INFRA and reds nobody) does not stop when its case
+# leaves this list, because those classes signal a broken case or
+# install, not flake, and the fix is on that side.
+#
+# agent-kanban-smoke earned its seat back after the 08-27 redesign (a real
+# SRE question graded on kanban_create plus cluster names); the reds that
+# once argued for un-arming it belonged to the old vocabulary check.
+export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,rca-remediation-pr,compliance-rbac-overgrant,cluster-agent-crashloop-debug,cluster-agent-crashloop-misleading-symptom,cluster-agent-crashloop-evidence-chain,gpu-stress-test-diagnosis,agent-kanban-smoke}"
+
+# ─── Change-based task selection ──────────────────────────────────────────────
+# hack/eval_triggers.yaml maps changed files to the tasks that must run;
+# anything unmapped, and any selector failure, keeps the full matrix.
+# Modes: shadow (default) only logs what auto would keep; auto filters TASKS;
+# off skips the call. NONE never shrinks TASKS: whole-job skips are Prow's
+# skip_if_only_changed, so NONE inside a running job reads as a disagreement
+# between the two layers, and a disagreement gets the full matrix.
+EVAL_TASK_SELECTION="${EVAL_TASK_SELECTION:-shadow}"
+case "${EVAL_TASK_SELECTION}" in shadow | auto | off) ;; *)
+  echo "ERROR: EVAL_TASK_SELECTION must be shadow, auto or off, got '${EVAL_TASK_SELECTION}'." >&2
+  echo "A typo silently behaving as shadow is a misconfiguration on a knob meant to be flipped remotely -- refusing." >&2
+  exit 1
+  ;;
+esac
+# Exported so bench-gate (a child process) can see which mode selected its
+# input: under auto it reds a run whose subset dropped every armed case.
+export EVAL_TASK_SELECTION
+if [ "${EVAL_TASK_SELECTION}" != "off" ] && [ -n "${PULL_BASE_SHA:-}" ]; then
+  SELECT_ACTIVE=()
+  for TASK in "${TASKS[@]}"; do
+    SELECT_ACTIVE+=("$(basename "$(dirname "${TASK}")")")
+  done
+  # Three-dot: what the PR changes, not what main gained since it branched.
+  # The admitted roster rides along so at least one admitted case survives
+  # any subset: the gate's blocking rungs arm on admitted cases alone.
+  if SELECTION="$(git -C "${SCRIPT_DIR}/.." diff --name-only "${PULL_BASE_SHA}...${PULL_PULL_SHA:-HEAD}" \
+    | EVAL_ADMITTED_CASES="${BOOTSTRAP_ADMITTED:-}" python3 "${SCRIPT_DIR}/eval_triggers.py" "${SELECT_ACTIVE[@]}")"; then
+    SELECTION_KIND="$(printf '%s\n' "${SELECTION}" | head -n 1)"
+    case "${SELECTION_KIND}" in
+      SUBSET)
+        SELECTED_NAMES="$(printf '%s\n' "${SELECTION}" | tail -n +2)"
+        KEPT="$(printf '%s\n' "${SELECTED_NAMES}" | grep -c . || true)"
+        echo "task selection (${EVAL_TASK_SELECTION}): ${KEPT} of ${#TASKS[@]} tasks: $(printf '%s' "${SELECTED_NAMES}" | tr '\n' ' ')"
+        if [ "${EVAL_TASK_SELECTION}" = "auto" ] && [ "${KEPT}" -ge 1 ]; then
+          SELECTED_TASKS=()
+          for IDX in "${!TASKS[@]}"; do
+            if printf '%s\n' "${SELECTED_NAMES}" | grep -Fqx "${SELECT_ACTIVE[IDX]}"; then
+              SELECTED_TASKS+=("${TASKS[IDX]}")
+            fi
+          done
+          TASKS=("${SELECTED_TASKS[@]}")
+        fi
+        ;;
+      NONE)
+        echo "task selection (${EVAL_TASK_SELECTION}): no task triggered; running the full matrix (job-level skip is Prow's skip_if_only_changed)"
+        ;;
+      *)
+        echo "task selection (${EVAL_TASK_SELECTION}): full matrix"
+        ;;
+    esac
+  else
+    echo "task selection: selector failed; keeping the full matrix (fail closed)"
+  fi
+fi
+
 # Floor for VerificationCorrectness on a repetition of a task that declares a
 # verification_spec. 1.0 while every declared objective is meant to hold
 # outright. Exported: bench-gate reads it, so it is a starting point to tune
@@ -1206,56 +1311,6 @@ m = re.search(r'^\s*stack:\s*(.+?)\s*\$', text, re.M)
 print(m.group(1).strip('\'\"') if m else '')
 " "$1" 2>/dev/null || echo ""
 }
-
-# The transition bridge. bench/baselines/ ships EMPTY, so no case is admitted
-# and nothing can reach the collapse rung -- which would mean the presubmit
-# blocks on nothing for as long as screening takes. Cases named here keep their
-# old blocking behaviour meanwhile.
-#
-# It is a bridge and not a destination: a bootstrap-admitted case has no
-# measured evidence, so it arms rung 4 but leaves rung 6 quiet and contributes
-# nothing to main's side of the aggregate. Screening replaces it.
-#
-# This roster is what blocks a pull request once the Prow job stops being
-# optional. Thirteen of the seventeen active cases are admitted: the ones
-# whose recent record shows failures only on their own regressions or on
-# infra classes the harness already excludes from the verdict. Four are
-# held out -- they still run and report on every pull request, and they
-# cannot red one on a GRADED failure. The scope of that promise is rungs
-# 4 and 6: rungs 1-3 (a forbidden mutation, an erroring check, a record
-# that is not a real run) stay blocking for every case by design,
-# admitted or not -- see grade_case, which evaluates them before it reads
-# admission. security-overgrant-remediation-proposal (#1066) is simply
-# new: it earns its record like any case, then enters. The other three
-# each have a filed issue naming the exit condition:
-#
-#   capacity-pinned-pool-probe            -- #1010: worker completes its
-#     card at fan-out ("Awaiting synthesis" as the final answer). The
-#     failure is correlated across repetitions when the agent chooses to
-#     fan out, so the collapse rule does not absorb it. Enters when the
-#     fix merges.
-#   cluster-agent-healthy-workload-no-finding -- #1100: the agent invents
-#     a finding on a healthy workload ~1 run in 8. Main's own trait, so a
-#     collapse would tax an innocent PR. Enters when the false-positive
-#     rate drops or when rung-6 screening can compare against main.
-#   autoops-warning-event-triage          -- #1101: 0/5 graded repetitions
-#     on record; admitting it reds every pull request today. Enters when
-#     the lettered-options bar is settled and it has a clean record.
-#
-# If an admitted case reds a pull request its diff cannot explain on a
-# graded failure, demote it here and reference its issue. Demotion is a
-# one-line same-day edit to this list -- this file, not the Prow config,
-# is deliberately the fast lever. It is the lever for rung-4 reds ONLY: a
-# rung-1-3 red (mutation, erroring verifier, an empty record on a task
-# that provisions nothing -- a record whose deployer died before any
-# agent ran grades INFRA and reds nobody) does not stop when its case
-# leaves this list, because those classes signal a broken case or
-# install, not flake, and the fix is on that side.
-#
-# agent-kanban-smoke earned its seat back after the 08-27 redesign (a real
-# SRE question graded on kanban_create plus cluster names); the reds that
-# once argued for un-arming it belonged to the old vocabulary check.
-export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,rca-remediation-pr,compliance-rbac-overgrant,cluster-agent-crashloop-debug,cluster-agent-crashloop-misleading-symptom,cluster-agent-crashloop-evidence-chain,gpu-stress-test-diagnosis,agent-kanban-smoke}"
 
 # Where the evidence itself lives. Unset means bench/baselines/ in the
 # checkout: hermetic, no credential, no network -- and no way for this job to
