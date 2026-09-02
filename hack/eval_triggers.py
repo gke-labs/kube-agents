@@ -202,12 +202,18 @@ def main() -> int:
         print("ALL")
         return 0
     floor, buckets = load_config(CONFIG)
-    # Admitted cases join the floor at runtime (ci-eval-pr.sh exports them
-    # from BOOTSTRAP_ADMITTED): the gate's blocking rungs arm on admitted
-    # cases alone, so a subset without one could never red the job. Runtime
-    # rather than the yaml so admission keeps a single home.
-    floor += [c for c in re.split(r"[,\s]+", os.environ.get("EVAL_ADMITTED_CASES", "")) if c]
     result = Selector(buckets, floor).select(changed, active)
+    # The gate's blocking rungs arm on admitted cases alone (EVAL_ADMITTED_CASES,
+    # exported from BOOTSTRAP_ADMITTED by ci-eval-pr.sh), so a subset without
+    # one could never red the job. Guarantee ONE, not the whole roster -- since
+    # #1096 that is most of the matrix, and unioning it would defeat selection.
+    # Read at runtime rather than mirrored in the yaml so admission keeps a
+    # single home.
+    admitted = [c for c in re.split(r"[,\s]+", os.environ.get("EVAL_ADMITTED_CASES", "")) if c]
+    if result is not ALL and result and not result & set(admitted):
+        keep = next((c for c in admitted if c in active), None)
+        if keep:
+            result.add(keep)
     if result is ALL:
         print("ALL")
     elif not result:

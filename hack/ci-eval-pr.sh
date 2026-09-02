@@ -1141,8 +1141,8 @@ if [ "${EVAL_TASK_SELECTION}" != "off" ] && [ -n "${PULL_BASE_SHA:-}" ]; then
     SELECT_ACTIVE+=("$(basename "$(dirname "${TASK}")")")
   done
   # Three-dot: what the PR changes, not what main gained since it branched.
-  # Admitted cases ride along so they survive any subset: the gate's
-  # blocking rungs arm on admitted cases alone.
+  # The admitted roster rides along so at least one admitted case survives
+  # any subset: the gate's blocking rungs arm on admitted cases alone.
   if SELECTION="$(git -C "${SCRIPT_DIR}/.." diff --name-only "${PULL_BASE_SHA}...${PULL_PULL_SHA:-HEAD}" \
     | EVAL_ADMITTED_CASES="${BOOTSTRAP_ADMITTED:-}" python3 "${SCRIPT_DIR}/eval_triggers.py" "${SELECT_ACTIVE[@]}")"; then
     SELECTION_KIND="$(printf '%s\n' "${SELECTION}" | head -n 1)"

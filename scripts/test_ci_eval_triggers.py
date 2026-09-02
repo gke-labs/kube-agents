@@ -170,13 +170,26 @@ class MainTest(unittest.TestCase):
         # ACTIVE's order, not alphabetical and not discovery order.
         self.assertEqual(out, ["SUBSET"] + ACTIVE)
 
-    def test_admitted_cases_from_the_environment_join_the_floor(self):
+    def test_a_subset_lacking_an_admitted_case_gains_exactly_one(self):
         code, out = run_main(
             ["bench/tasks/gpu-stress-test-diagnosis/task.yaml"],
             env={"EVAL_ADMITTED_CASES": "autoops-warning-event-triage"},
         )
         self.assertEqual(code, 0)
         self.assertIn("autoops-warning-event-triage", out)
+        # gpu task + yaml floor + the one admitted guarantee, nothing more
+        self.assertEqual(len(out), 1 + 3)
+
+    def test_a_subset_already_containing_an_admitted_case_gains_nothing(self):
+        """Guarantee ONE armed case, not the roster: since #1096 the roster
+        is most of the matrix, and unioning it would defeat selection."""
+        code, out = run_main(
+            ["bench/tasks/gpu-stress-test-diagnosis/task.yaml"],
+            env={"EVAL_ADMITTED_CASES": "cluster-agent-crashloop-debug,autoops-warning-event-triage"},
+        )
+        self.assertEqual(code, 0)
+        # crashloop-debug (yaml floor) is admitted, so nothing is added
+        self.assertNotIn("autoops-warning-event-triage", out)
 
     def test_an_admitted_case_not_in_the_active_matrix_is_dropped(self):
         code, out = run_main(
@@ -245,6 +258,16 @@ class AdmittedWiringTest(unittest.TestCase):
         export_at = src.index("export BOOTSTRAP_ADMITTED=")
         block_at = src.index("# ─── Change-based task selection")
         self.assertLess(export_at, block_at)
+
+    def test_the_yaml_floor_overlaps_the_admitted_default(self):
+        """If no floor task is admitted, every narrow subset leans on the
+        runtime guarantee alone; keep the common case static."""
+        floor, _ = eval_triggers.load_config(eval_triggers.CONFIG)
+        src = SCRIPT.read_text(encoding="utf-8")
+        match = re.search(r'BOOTSTRAP_ADMITTED="\$\{BOOTSTRAP_ADMITTED:-([^}"]*)\}"', src)
+        self.assertIsNotNone(match)
+        admitted = set(re.split(r"[,\s]+", match.group(1)))
+        self.assertTrue(set(floor) & admitted)
 
     def test_the_mode_is_exported_for_the_gate(self):
         """bench-gate reds an auto-mode run that dropped every armed case;

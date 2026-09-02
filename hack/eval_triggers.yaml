@@ -12,10 +12,11 @@
 # means run everything.
 
 # Added to every non-empty selection: the cheapest task that proves the
-# platform->cluster-agent chain. The gate's admitted cases (today
-# BOOTSTRAP_ADMITTED, later the baseline store) join at runtime via
-# EVAL_ADMITTED_CASES rather than being mirrored here, so admission keeps a
-# single home. scripts/test_ci_eval_triggers.py pins that wiring.
+# platform->cluster-agent chain. Separately, at least one of the gate's
+# admitted cases (today BOOTSTRAP_ADMITTED, later the baseline store) is
+# guaranteed in every subset at runtime via EVAL_ADMITTED_CASES rather than
+# mirrored here, so admission keeps a single home.
+# scripts/test_ci_eval_triggers.py pins that wiring.
 floor:
   - cluster-agent-crashloop-debug
 
