@@ -16,6 +16,7 @@ matrix on any non-zero exit.
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from abc import ABC, abstractmethod
@@ -201,6 +202,11 @@ def main() -> int:
         print("ALL")
         return 0
     floor, buckets = load_config(CONFIG)
+    # Admitted cases join the floor at runtime (ci-eval-pr.sh exports them
+    # from BOOTSTRAP_ADMITTED): the gate's blocking rungs arm on admitted
+    # cases alone, so a subset without one could never red the job. Runtime
+    # rather than the yaml so admission keeps a single home.
+    floor += [c for c in re.split(r"[,\s]+", os.environ.get("EVAL_ADMITTED_CASES", "")) if c]
     result = Selector(buckets, floor).select(changed, active)
     if result is ALL:
         print("ALL")
