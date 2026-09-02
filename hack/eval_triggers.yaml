@@ -1,12 +1,15 @@
 # Maps changed files to the eval tasks that must run; hack/eval_triggers.py
-# applies it. First matching bucket decides a file. Anything unmapped -- or
-# any selector failure -- runs the full matrix, so a gap costs time, never
-# coverage. Written in the restricted YAML subset the reader parses: two
-# top-level keys, scalar lists, one level of bucket fields.
+# applies it. Buckets are written like a GitHub Actions path filter: an
+# ordered `paths` list per bucket, `!` negates, the last matching pattern
+# wins, `**` crosses slashes while `*` and `?` do not. The first bucket that
+# owns a file decides it. Anything unmapped -- and any selector failure --
+# runs the full matrix, so a gap costs time, never coverage.
 #
-# `extensions` limits what a bucket's wildcard patterns may claim; other
-# file types fall through. Literal patterns (no wildcard) skip the gate.
-# `**` crosses slashes; `*` and `?` do not.
+# `extensions` narrows what a bucket's positive wildcard patterns may claim;
+# other file types fall through. Literal patterns (no wildcard) skip the
+# gate. The lists name what each directory holds in git today, so a new
+# file type is a fallthrough until someone classifies it here -- unsure
+# means run everything.
 
 # Added to every non-empty selection: the cheapest task that proves the
 # platform->cluster-agent chain.
@@ -14,13 +17,13 @@ floor:
   - cluster-agent-crashloop-debug
 
 buckets:
-  # Prose and images that cannot change agent behaviour. Patterns mirror the
-  # presubmit's skip_if_only_changed (oss-test-infra), but the extension gate
-  # is narrower on purpose: docs-site build code and workflow yaml fall
-  # through. agents/** markdown is absent -- it bakes into the image.
-  - name: docs
+  # Prose and images that cannot change agent behaviour. Paths mirror the
+  # presubmit's skip_if_only_changed (oss-test-infra), but the extension
+  # gate is narrower on purpose: docs-site build code and workflow yaml
+  # fall through. agents/** markdown is absent -- it bakes into the image.
+  docs:
     kind: no-tasks
-    patterns:
+    paths:
       - docs/**
       - .github/**
       - examples/**
@@ -29,33 +32,19 @@ buckets:
       - OWNERS
       - OWNERS_ALIASES
       - bench/tasks/DRAFTS.md
-    extensions:
-      - md
-      - mdx
-      - txt
-      - png
-      - jpg
-      - jpeg
-      - svg
-      - gif
-      - css
+    extensions: [md, mdx, txt, png, jpg, jpeg, svg, gif, css]
 
   # A task's directory triggers that task; inactive tasks trigger nothing.
-  - name: bench-task
+  bench-task:
     kind: task-dir
-    patterns:
+    paths:
       - bench/tasks/*/**
-    extensions:
-      - yaml
-      - md
+    extensions: [yaml, md]
 
   # A prebuilt stack triggers the active tasks whose task.yaml declares it;
   # a stack no active task uses runs the full matrix.
-  - name: bench-stack
+  bench-stack:
     kind: stack-dir
-    patterns:
+    paths:
       - bench/tf/prebuilt/*/**
-    extensions:
-      - tf
-      - tfvars
-      - md
+    extensions: [tf, tfvars, md]
