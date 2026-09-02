@@ -160,7 +160,32 @@ resource "null_resource" "incident" {
       # nothing then cleans up, and prints a WARNING that reads like a failure in
       # a CI log. Handing it a path that does not exist yet skips all three.
       kubeconfig_dir="$(mktemp -d)"
-      trap 'rm -rf "$kubeconfig_dir"' EXIT
+
+      # A plant that fails must not leave ${local.ns} behind, because the
+      # leftover is what breaks the NEXT run -- see step 0b for that mechanism.
+      # The teardown at the bottom of this file cannot be what prevents it:
+      # Terraform taints a resource whose create-time provisioner failed and
+      # skips destroy-time provisioners on a tainted resource, so the destroy
+      # reports "1 destroyed" without running a line of it.
+      #
+      # Every failure path below writes its diagnostics to stderr before
+      # exiting, so this deletes the namespace after the evidence has been
+      # captured rather than instead of it.
+      #
+      # Guarded on step 0 having completed: until KUBECONFIG points at the host
+      # cluster a kubectl here would run against the ambient context, which is a
+      # different cluster entirely (again, step 0).
+      host_kubeconfig_ready=""
+      on_exit() {
+        status=$?
+        if [ "$status" -ne 0 ] && [ -n "$host_kubeconfig_ready" ]; then
+          echo "Plant failed (exit $status). Deleting ${local.ns} so the next run starts from a clean namespace." >&2
+          kubectl delete namespace "${local.ns}" --ignore-not-found --wait=false >&2 || true
+        fi
+        rm -rf "$kubeconfig_dir"
+      }
+      trap on_exit EXIT
+
       KUBECONFIG="$kubeconfig_dir/config"
       export KUBECONFIG
 
@@ -177,6 +202,39 @@ resource "null_resource" "incident" {
 
       gcloud container clusters get-credentials "${var.host_cluster_name}" \
         --location "${var.host_cluster_location}" --project "$project" --quiet
+      host_kubeconfig_ready=1
+
+      # ---- 0b. Clear what an earlier run left behind ------------------------
+      # A leftover ${local.ns} does not just sit there, it silently defeats the
+      # whole scenario, and it does so through the plant appearing to succeed.
+      #
+      # Step 1 is idempotent by construction, so against a namespace that
+      # already holds an identical Deployment `kubectl apply` reports
+      # `unchanged` and creates no new pod. The pod still running is the one
+      # from the earlier run, which means it keeps its UID -- and the watcher's
+      # dedup key is exactly {UID, Reason} (k8s-event-watcher/types.go). Its
+      # window for that pod opened hours ago, so it logs
+      # `dedup BackOff pod=... (window active)` where step 3 is waiting for
+      # `fire`, and step 3 times out. Step 2 does not catch it either: the old
+      # pod's BackOff events are already past the debounce, so the wait returns
+      # `after 0s` and everything looks healthy right up to the timeout.
+      #
+      # Deleting first is what makes the case recover on its own. It is also
+      # the only thing that can: the run that leaked the namespace is over, and
+      # nothing else visits these clusters between runs.
+      #
+      # 180s is well clear of the ~35s a busybox pod with no finalizers takes to
+      # go (30s grace plus the namespace controller), and short enough that a
+      # namespace genuinely wedged on a finalizer fails here, with a message
+      # naming the real problem, rather than 300s later as a mystery timeout.
+      if kubectl get namespace "${local.ns}" >/dev/null 2>&1; then
+        echo "Found a leftover ${local.ns} from an earlier run; deleting it before planting."
+        if ! kubectl delete namespace "${local.ns}" --wait=true --timeout=180s; then
+          echo "ERROR: a leftover ${local.ns} did not delete within 180s, so this run cannot plant a fresh pod and the watcher would dedup against the old one. The namespace is most likely stuck on a finalizer; it follows." >&2
+          kubectl get namespace "${local.ns}" -o yaml >&2 || true
+          exit 1
+        fi
+      fi
 
       # Recorded before anything is planted, so the step-3 log poll cannot match
       # a `fire` line left by an earlier run against this same namespace name.
@@ -270,9 +328,10 @@ resource "null_resource" "incident" {
       # The fire line carries no cluster (k8s-event-watcher/main.go), and the
       # watcher fans in over several, so in principle this matches a pod of
       # that name on any watched cluster. Nothing reaches it today: only this
-      # stack plants ${local.ns}, the destroy removes it, and the task loop is
-      # sequential. A leftover namespace from a failed teardown on another
-      # watched cluster, or the concurrency of #637, would.
+      # stack plants ${local.ns}, step 0b clears any leftover of it on this
+      # cluster and the destroy removes it on the success path, and the task
+      # loop is sequential. A leftover namespace on a DIFFERENT watched cluster,
+      # which step 0b does not reach, or the concurrency of #637, would.
       elapsed=0
       until kubectl logs "deployment/${var.agent_deployment}" \
               -n "${var.agent_namespace}" -c "${var.agent_container}" \
@@ -297,16 +356,25 @@ resource "null_resource" "incident" {
     EOT
   }
 
-  # Namespace-scoped by design, and this is the half that keeps it that way.
-  # The presubmit isolation rule admits a mutating case only if it is read-only
-  # or namespace-scoped, and a scenario that leaves its namespace behind is
-  # neither by the second run.
+  # Namespace-scoped by design, and this is the half that keeps it that way on
+  # the success path. The presubmit isolation rule admits a mutating case only
+  # if it is read-only or namespace-scoped, and a scenario that leaves its
+  # namespace behind is neither by the second run.
   #
-  # It fetches credentials the same way step 0 does, and for a sharper reason: a
-  # create-time provisioner that failed taints the resource, and _teardown runs
-  # `tofu destroy` from a `finally` on that path too, so this can execute with
-  # the ambient context pointed anywhere at all. Deleting a namespace by name on
-  # the wrong cluster is the kind of thing --ignore-not-found makes survivable
+  # It does NOT cover the failure path, which is why the plant above cleans up
+  # after itself. Terraform taints a resource whose create-time provisioner
+  # failed and skips destroy-time provisioners on a tainted resource, so
+  # `teardown: true` reaches a `tofu destroy` that reports "1 destroyed"
+  # without running a line of this. #1122's two smoke runs measured that
+  # destroy at 28ms and 29ms, against a provisioner whose first command is a
+  # ~1s `gcloud get-credentials`. An earlier version of this comment claimed
+  # the opposite -- that the tainted path runs this too -- and #1143 is what
+  # believing it cost.
+  #
+  # It fetches its own credentials for the same reason step 0 does: devops-bench
+  # moves the ambient context off the host cluster after up(), so this can
+  # execute with it pointed anywhere at all. Deleting a namespace by name on the
+  # wrong cluster is the kind of thing --ignore-not-found makes survivable
   # rather than safe.
   provisioner "local-exec" {
     when        = destroy
