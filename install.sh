@@ -322,8 +322,6 @@ PARAM_GITOPS_REPO="${GITOPS_REPO:-${GITHUB_REPO:-}}"
 # helpers are sourced, so no default is spelled twice.
 PARAM_PERMISSION_SET="${PLATFORM_AGENT_PERMISSION_SET:-}"
 PARAM_CUSTOM_ROLES="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
-PARAM_ENABLE_GVISOR="${ENABLE_GVISOR:-true}"
-PARAM_ENABLE_WEBUI="${ENABLE_WEBUI:-false}"
 PARAM_ENABLE_PUBSUB_PLATFORM="${ENABLE_PUBSUB_PLATFORM:-false}"
 PARAM_ENABLE_STOCKOUT_INVESTIGATOR="${ENABLE_STOCKOUT_INVESTIGATOR:-false}"
 # Set-ness, never ${VAR:-...}: `--gvisor=` with no value sets this to the empty
@@ -3033,6 +3031,8 @@ main() {
   export USER_PROFILE_ENABLED="$PARAM_USER_PROFILE_ENABLED"
   export HERMES_DASHBOARD_ENABLED="$PARAM_ENABLE_WEBUI"
   export REGISTRY_PREFIX="$registry_prefix"
+  export ENABLE_PUBSUB_PLATFORM="${PARAM_ENABLE_PUBSUB_PLATFORM:-false}"
+  export ENABLE_STOCKOUT_INVESTIGATOR="${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-false}"
   # Exported only when asked for, the way it was only ever persisted when asked
   # for: an empty value here is an override the installer never took a flag
   # for, turning "leave the third-party images upstream" from a default into an
