@@ -48,6 +48,7 @@ import shutil
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -79,15 +80,23 @@ _INTERPOLATIONS = {
     "var.memory_limit_mib": "64",
 }
 
+#: The label step 1 writes, and the value step 0b requires before it will
+#: delete anything.
+_OWNER_LABEL = "kube-agents-bench"
+
 #: `kubectl` records every invocation to $CALLS and answers from the
 #: environment, so a test picks a scenario by setting these. Defaults are the
 #: healthy path: no leftover namespace, debounce already cleared, watcher fires.
+#: `NS_OWNER` uses `${VAR-default}` rather than `${VAR:-default}` so a test can
+#: set it empty to mean "the namespace carries no managed-by label".
 _KUBECTL_STUB = """#!/bin/bash
 echo "kubectl $*" >> "$CALLS"
 case "$*" in
+  *"get namespace"*jsonpath*)   echo "${NS_OWNER-%(owner)s}"; exit 0 ;;
   *"get namespace"*"-o yaml"*)  echo "kind: Namespace"; exit 0 ;;
   *"get namespace"*)            exit "${NS_EXISTS_RC:-1}" ;;
   *"delete namespace"*)         exit "${NS_DELETE_RC:-0}" ;;
+  *"apply -f -"*)               exit "${APPLY_RC:-0}" ;;
   *"get events"*)               echo 7; exit 0 ;;
   *"logs "*)
     if [ "${WATCHER_FIRES:-1}" = "1" ]; then
@@ -96,7 +105,7 @@ case "$*" in
     exit 0 ;;
   *) exit 0 ;;
 esac
-""" % {"ns": _NAMESPACE, "workload": _WORKLOAD}
+""" % {"ns": _NAMESPACE, "workload": _WORKLOAD, "owner": _OWNER_LABEL}
 
 _GCLOUD_STUB = """#!/bin/bash
 echo "gcloud $*" >> "$CALLS"
@@ -108,7 +117,15 @@ exit 0
 """
 
 #: The plant polls on 10-second sleeps and its timeouts are minutes long.
-_SLEEP_STUB = "#!/bin/bash\nexit 0\n"
+#: `STUB_SLEEP` buys back a little real time for the signal test, which needs
+#: the script still running when it sends SIGTERM.
+_SLEEP_STUB = '#!/bin/bash\nexec /bin/sleep "${STUB_SLEEP:-0}"\n'
+
+#: Bounds for the signal test's two waits -- for the plant to reach the watcher
+#: poll, and for it to finish once signalled. Generous, because blowing either
+#: is a hang rather than a red.
+_SIGNAL_TIMEOUT_SECONDS = 60
+_SIGNAL_POLL_SECONDS = 0.05
 
 
 def _render_plant() -> str:
@@ -254,21 +271,90 @@ class AutoopsIncidentPlantTest(unittest.TestCase):
             f"makes every later run fail:\n{chr(10).join(calls)}",
         )
 
-    def test_failed_plant_reports_diagnostics_before_deleting(self):
-        # Cleanup must not destroy the evidence: the failure path dumps the
-        # watcher log to stderr, and that has to happen while the namespace is
-        # still there to be described.
-        completed, calls = self._run(WATCHER_FIRES=0)
-        deletes = self._indices(calls, "delete namespace")
-        diagnostics = self._indices(calls, "logs ")
-        self.assertTrue(deletes)
-        self.assertTrue(diagnostics)
-        self.assertLess(
-            max(diagnostics),
-            deletes[0],
-            "the namespace was deleted before the failure diagnostics ran",
-        )
+    def test_failed_plant_reports_its_own_diagnostics(self):
+        completed, _ = self._run(WATCHER_FIRES=0)
         self.assertIn("k8s-event-watcher logged no 'fire'", completed.stderr)
+
+    def test_a_failure_carrying_no_diagnostics_still_dumps_before_cleanup(self):
+        # Cleanup must not take the evidence with it. Steps 2 and 3 dump before
+        # they exit, so asserting order on those proves nothing -- the delete
+        # lives in an EXIT trap and is last by construction. Step 1 is the real
+        # case: a rejected `apply` exits under `set -e` with no dump of its own,
+        # so the only state anybody gets is whatever the trap writes on the way
+        # out. Anything reaching the namespace here came from the trap.
+        completed, calls = self._run(APPLY_RC=1)
+        self.assertNotEqual(
+            completed.returncode, 0, "a rejected apply should fail the plant"
+        )
+        deletes = self._indices(calls, "delete namespace")
+        dumps = self._indices(calls, "get pods") + self._indices(calls, "get events")
+        self.assertTrue(deletes, f"the namespace leaked:\n{chr(10).join(calls)}")
+        self.assertTrue(
+            dumps,
+            "the plant deleted the namespace without recording any of its "
+            f"state, so a rejected apply leaves nothing to debug:\n"
+            f"{chr(10).join(calls)}",
+        )
+        self.assertLess(
+            max(dumps),
+            deletes[0],
+            "the namespace was deleted before its state was recorded",
+        )
+
+    def test_a_namespace_the_stack_did_not_plant_is_refused_not_deleted(self):
+        # Step 0b is the only unconditional namespace delete in the stack and it
+        # runs against the shared host cluster, so the `managed-by` label step 1
+        # writes is what separates "our leftover" from someone else's namespace.
+        completed, calls = self._run(NS_EXISTS_RC=0, NS_OWNER="")
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(
+            self._indices(calls, "delete namespace"),
+            [],
+            "the plant deleted a namespace it had not labelled as its own:\n"
+            f"{chr(10).join(calls)}",
+        )
+        self.assertIn("will not delete it", completed.stderr)
+
+    def test_a_deadline_sigterm_still_deletes_the_namespace(self):
+        # Prow enforces its deadline with SIGTERM, and bash does not run an EXIT
+        # trap when the shell dies from an untrapped signal. Steps 2 and 3 can
+        # hold this script for twelve minutes, so without a TERM trap the
+        # deadline kill leaks the namespace exactly as a failed plant used to.
+        env = dict(os.environ)
+        env["PATH"] = f"{self._stub_dir}{os.pathsep}{env['PATH']}"
+        env["CALLS"] = str(self._calls)
+        env["WATCHER_FIRES"] = "0"
+        env["STUB_SLEEP"] = "0.05"
+
+        process = subprocess.Popen(
+            ["bash", str(self._script)],
+            env=env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            # Signal only once the plant is inside the watcher poll, which is
+            # well past the point the traps are installed.
+            deadline = time.monotonic() + _SIGNAL_TIMEOUT_SECONDS
+            while time.monotonic() < deadline:
+                if self._calls.exists() and "logs " in self._calls.read_text():
+                    break
+                time.sleep(_SIGNAL_POLL_SECONDS)
+            else:
+                self.fail("the plant never reached the watcher poll")
+            process.terminate()
+            process.wait(timeout=_SIGNAL_TIMEOUT_SECONDS)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=_SIGNAL_TIMEOUT_SECONDS)
+
+        calls = self._calls.read_text().splitlines()
+        self.assertTrue(
+            self._indices(calls, "delete namespace", _NAMESPACE),
+            "SIGTERM ended the plant without running the cleanup, so the "
+            f"namespace leaked:\n{chr(10).join(calls)}",
+        )
 
     def test_no_cleanup_runs_before_the_host_kubeconfig_is_fetched(self):
         # Until step 0 fetches credentials, kubectl would resolve against the
@@ -290,7 +376,7 @@ class AutoopsIncidentPlantTest(unittest.TestCase):
         # and reports that nothing fired.
         completed, _ = self._run(NS_EXISTS_RC=0, NS_DELETE_RC=1)
         self.assertNotEqual(completed.returncode, 0)
-        self.assertIn("did not delete within", completed.stderr)
+        self.assertIn("could not clear the leftover", completed.stderr)
 
 
 if __name__ == "__main__":
