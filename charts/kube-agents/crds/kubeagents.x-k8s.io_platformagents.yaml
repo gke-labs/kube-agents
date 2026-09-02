@@ -9125,8 +9125,70 @@ spec:
                 integration:
                   description: Integration configures platform-specific external connections.
                   properties:
+                    git:
+                      description: |-
+                        Git configures the forge this agent's GitOps repository lives on.
+                        Set at most one of Git and GitHub; declaring both is rejected, because
+                        there is no rule for which one wins that would not surprise somebody.
+                      properties:
+                        host:
+                          description: |-
+                            Host is the forge hostname. Omit it for the provider's default
+                            ("github.com" for GitHub). A host the declared provider does not serve is
+                            rejected, and an alternative spelling of one it does serve resolves to the
+                            provider's canonical host.
+
+                            The pattern is a DNS name, which every forge's host is; it is here rather
+                            than only in the webhook so the API server still refuses whitespace and
+                            control characters when the operator runs with ENABLE_WEBHOOKS=false.
+                          maxLength: 253
+                          pattern: ^$|^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$
+                          type: string
+                        namespace:
+                          description: |-
+                            Namespace is the owning organization, user, or group path — the GitHub org
+                            that GitHubSpec called Org. If omitted and Repository names one, it is
+                            inferred from the repository.
+
+                            The schema pattern is every forge's grammar at once, not GitHub's: the
+                            tight rule depends on Provider and a CRD pattern cannot dispatch on a
+                            sibling field, so the provider applies that one. What the schema is for is
+                            the part that does not vary — a namespace holds no whitespace and no
+                            control characters, which is the guard GitHubSpec.Org's pattern was also
+                            providing and which the API server must keep enforcing when the operator
+                            runs with ENABLE_WEBHOOKS=false.
+                          maxLength: 255
+                          pattern: ^$|^[A-Za-z0-9][A-Za-z0-9._/-]*$
+                          type: string
+                        provider:
+                          default: github
+                          description: |-
+                            Provider names the forge. It is the discriminator the operator writes into
+                            the gitops-state ConfigMap as a managed repository's `type`, so the agent
+                            reads which forge was declared rather than guessing from the URL's text.
+
+                            Only "github" is registered today; the enum grows with each agent-side
+                            provider. Defaults to "github".
+                          enum:
+                            - github
+                          type: string
+                        repository:
+                          description: |-
+                            Repository is the GitOps repository: a clone URL, an scp-style remote, a
+                            namespace-qualified path, or a bare name to be qualified by Namespace.
+                            When omitted or empty, no repository is initially configured, and
+                            repositories can be registered in the gitops-state ConfigMap by a cluster
+                            administrator.
+                          maxLength: 2048
+                          type: string
+                      type: object
                     github:
-                      description: GitHub configures the GitHub integration.
+                      description: |-
+                        GitHub configures the GitHub integration.
+
+                        Deprecated: use Git instead, which names its forge. This field is kept as
+                        an alias and maps onto Git with provider "github"; it will be removed in a
+                        future API version.
                       properties:
                         gitRepo:
                           description: |-

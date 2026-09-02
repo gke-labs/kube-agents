@@ -1,10 +1,12 @@
 # Supporting a Second Forge
 
-> **STATUS — design of record; step 1 of §9 is in, the rest is not.** No second forge works today.
-> One provider exists (`GitHubProvider`), two consumers use it, three more shell `gh` directly, and
-> every layer beneath them is GitHub-shaped except repository identity, whose Python half now runs on
-> `repo_ref.py`. This document is the plan for the rest, and the order it has to happen in. Each
-> section says what is true on `main` now and what the design changes.
+> **STATUS — design of record; steps 1 and 2 of §9 are in, the rest is not.** No second forge works
+> today. One provider exists (`GitHubProvider`), two consumers use it, three more shell `gh`
+> directly. Repository identity now runs on `repo_ref.py` in Python and `repo_ref.go` in Go, and the
+> CRD declares the forge in `spec.integration.git` with validation dispatched per provider — but
+> only GitHub is registered, and every layer beneath the declaration is still GitHub-shaped. This
+> document is the plan for the rest, and the order it has to happen in. Each section says what is
+> true on `main` now and what the design changes.
 
 **Scope:** What it would take for a kube-agents install to drive a forge that is not GitHub, and how
 to get there without a flag day. GitLab is the worked example throughout because it is the one asked
@@ -32,27 +34,28 @@ The coupling runs through five layers, each with a different owner and a differe
    than for forge work; they are layer 3.)
 2. **Repository identity.** `owner/repo` — exactly two path segments — was asserted in seven places
    across Python and Go, one regex expressing it copy-pasted into six modules. The widest assumption
-   and the one least visible from any single file. Every Python assertion now runs through one
-   parser (§3); the Go one, which is also the CRD's admission check, does not.
+   and the one least visible from any single file. Both halves now run through one parser each —
+   `repo_ref.py` and `repo_ref.go` (§3) — and the CRD's admission check is one of the Go parser's
+   callers.
 3. **The credential plane.** The sandbox may hold no token, so every forge call is brokered. The
    broker's executable allowlist, its refresh route, the git credential shape it writes, and the
    token-minting pipeline behind it are each written for GitHub specifically — as is the FQDN
    network policy that decides where the pod may reach at all.
-4. **The declarative surface.** `GitHubSpec` is the only forge integration in the CRD, its `org`
-   field takes GitHub's namespace grammar, the state ConfigMap the operator writes labels every
-   repository `github` by a constant, and the chart, installer and Terraform composition all carry
-   GitHub App inputs.
+4. **The declarative surface.** The CRD now declares the forge — `spec.integration.git` carries a
+   provider, validation dispatches on it, and the state ConfigMap records the declared provider
+   rather than a constant — but only GitHub is registered, and the installer and Terraform
+   composition still carry GitHub App inputs unconditionally.
 5. **The prompts.** Four `SKILL.md` files instruct the model in `gh` spellings; seven governance
    SOPs name `gh` to forbid it and call the artefact a pull request throughout.
 
 Layers 1, 2 and 3 are worth changing whether or not a second forge ever arrives — each one removes a
-duplicated parser, a silent fallback, or a hardcoded host. Layer 2's half of that is done: the
-duplicated parser and `provider_for`'s silent fallback both went with §3. Layer 5 is only worth
-changing for a second forge, and layer 4 almost is: its one standalone defect is that the CR
-silently rewrites one shape of non-GitHub URL into a GitHub one (§3), which is worth fixing on its
-own but does not need any of this. That split says what is worth doing; it does not decide the
-order, which §9 derives from three sequencing constraints instead — and one of those pulls part of
-layer 4 forward ahead of layers 1 and 3.
+duplicated parser, a silent fallback, or a hardcoded host. Layer 2 is done: the duplicated parser
+and `provider_for`'s silent fallback both went with §3, and the Go half followed. Layer 5 is only
+worth changing for a second forge, and layer 4 almost was: its one standalone defect was that the CR
+silently rewrote non-GitHub URLs into GitHub ones (§3), which was worth fixing on its own and did
+not need any of the rest. That split says what is worth doing; it does not decide the order, which
+§9 derives from three sequencing constraints instead — and one of those pulled part of layer 4
+forward ahead of layers 1 and 3.
 
 ## 2. What already generalises
 
@@ -74,8 +77,10 @@ of `{"type", "url"}` entries — `ManagedRepoEntry` in Go, `get_managed_repo_ent
 the discriminator is already per repository rather than per install, and already crosses the
 operator-to-agent boundary.
 
-Nothing dispatches on it, and the gap is already costing something. The operator only ever authors
-`{Type: "github", URL: …}`, but it does not confine the field to that: `parseManagedRepoEntries`
+Nothing dispatches on it, and the gap is already costing something. The operator now writes the
+declared provider into `Type` rather than a constant, but with one provider registered every entry
+it authors still reads `{Type: "github", URL: …}` — and it does not confine the field to that:
+`parseManagedRepoEntries`
 unmarshals whatever type string the ConfigMap holds, the merge writes existing entries back
 verbatim, and `GitHubSpec.GitRepo`'s own comment invites a cluster administrator to register
 repositories in that ConfigMap directly. A `{"type": "gitlab", …}` entry therefore survives
@@ -121,49 +126,48 @@ validates across a trust boundary and must not pull in a module that shells out 
   quietly trimmed would be answering about a string nobody holds.
 - `forge._parse_repo` was the sixth. #504 removed the `SETTINGS.md` path that called it, so it is
   deleted rather than converted; `provider_for` calls `repo_ref.parse` directly.
-- `CleanRepoSlugWithOrg` in the operator is the Go one, and is unchanged. It strips the scheme, a
-  `user@` prefix, an SCP `host:` prefix and a `github.com/` prefix, then requires exactly one slash
-  in what is left. `ValidateGitRepoURLWithOrg` — the CRD's admission check — is a call to it, so
-  admission and normalisation are one rule. §6 and step 2 of §9 own moving it.
+- `CleanRepoSlugWithOrg` in the operator was the Go one. It stripped the scheme, a `user@` prefix,
+  an SCP `host:` prefix and a `github.com/` prefix, then required exactly one slash in what was
+  left, and `ValidateGitRepoURLWithOrg` — the CRD's admission check — was a call to it. Both are now
+  deprecated shims over `repo_ref.go` and `GitProvider.Resolve`, and admission calls
+  `validateGitIntegration` instead (§6).
 
 The regex behind the bare-slug form used to be copy-pasted under its own name into `forge.py`,
 `gitops_workspace.py`, `resolver.py`, `pr_conversation.py`, `audit_report.py` and
 `submit_suggestion.py`, two of the copies already dead. All of them are gone.
 
-GitLab projects live at arbitrary depth — `group/subgroup/project` is ordinary, not exotic. The
-parser now carries one; what refuses it is the GitHub provider's two-segment rule, at the points
-where GitHub is the provider, and the operator's Go rule at admission. The difference is that the
-refusal is a provider's, and states a reason, instead of being an invariant of the whole stack
-expressed in four dialects.
+GitLab projects live at arbitrary depth — `group/subgroup/project` is ordinary, not exotic. Both
+parsers now carry one; what refuses it is the GitHub provider's two-segment rule, at the points
+where GitHub is the provider. The difference is that the refusal is a provider's, and states a
+reason, instead of being an invariant of the whole stack expressed in four dialects.
 
-**The one non-GitHub input that is not refused.** `CleanRepoSlugWithOrg` counts slashes _after_
-discarding the host, so an SCP-style URL whose path holds exactly one slash survives — and that is
+**The non-GitHub input that was not refused.** `CleanRepoSlugWithOrg` counted slashes _after_
+discarding the host, so an SCP-style URL whose path held exactly one slash survived — and that is
 the form GitLab's clone button hands you for a project sitting directly under its group.
-`git@gitlab.com:group/project` is admitted by the CRD, reduced to `group/project`, and then
-`CleanRepoURLWithOrg`, which prefixes a literal `https://github.com/` to any shorthand, writes it
+`git@gitlab.com:group/project` was admitted by the CRD, reduced to `group/project`, and then
+`CleanRepoURLWithOrg`, which prefixed a literal `https://github.com/` to any shorthand, wrote it
 into the state ConfigMap as `{"type": "github", "url": "https://github.com/group/project"}`. The
-GitLab repository is not rejected; it is rewritten into a GitHub one and labelled `github` by the
-constant §2 describes. Every reader downstream then behaves correctly, on a repository the operator
-invented. This is the layer-4 defect §1 says is worth fixing on its own.
+GitLab repository was not rejected; it was rewritten into a GitHub one. The https spelling took a
+different route to the same place — `CleanRepoURLWithOrg` returned http(s) URLs verbatim without
+that reduction, so `https://gitlab.com/group/project` seeded an entry whose `type` and `url` named
+different forges, and a test row pinned it. This was the layer-4 defect §1 says was worth fixing on
+its own; both spellings are refused from step 2, by the host check in `GitProvider.Resolve`.
 
-**What remains.** The Python side has one parser and one set of rules, and the host survives the
-parse instead of being discarded before the slashes are counted. What it does not yet have is
+**What remains.** Both sides have one parser and one set of rules, and the host survives the parse
+instead of being discarded before the slashes are counted. What the Python side does not yet have is
 `RepoRef` as the currency between modules: every caller parses at its own boundary and hands on a
 string, so the ref is a local variable rather than something passed. Making it the parameter type is
-step 3 of §9, alongside the consumers that would carry it. Two other things are outstanding: the Go
-rule above, which §6 moves, and the entry's declared `type` reaching provider selection, which §2
-describes and which needs a second provider before it selects anything.
+step 3 of §9, alongside the consumers that would carry it. One other thing is outstanding: the
+entry's declared `type` reaching provider selection, which §2 describes and which needs a second
+provider before it selects anything.
 
 **Where #1085 now stands.** [#1085](https://github.com/gke-labs/kube-agents/issues/1085) reported
 that `repo_from_settings` resolved `https://evil.example/victim-org/victim-repo` to
 `victim-org/victim-repo` with no host check, pointing the token refresher at a repository the URL did
-not name. That function is gone. Three of the issue's four examples are now rejected at admission by
-the slash count above, and the fourth — the SCP form — is admitted with its host silently discarded,
-which grants nothing the plain `owner/repo` shorthand does not already grant. The host confusion the
-issue reported is closed; what the same code path costs now is the rewrite in the paragraph above.
-What remains is the half the issue deferred — "decide separately whether `ValidateGitRepoURL` should
-reject a non-GitHub host at admission". It does not, which is §6, so the remedy is step 2 rather
-than `RepoRef`.
+not name. That function is gone, which closed the host confusion the issue reported. The half the
+issue deferred — "decide separately whether `ValidateGitRepoURL` should reject a non-GitHub host at
+admission" — is answered by step 2: it does, and a host the declared provider does not serve is now
+refused rather than discarded. #1085 closes there.
 
 **A latent defect this removed.** `provider_for` used to have two ways of choosing wrong. It selected
 by asking whether any key of the host table appeared anywhere in the repository string — a substring
@@ -277,37 +281,47 @@ literal could have covered it.
 
 ## 6. The declarative surface
 
-`IntegrationSpec` holds exactly one forge field, `GitHub *GitHubSpec`, and `GitHubSpec` holds two:
+`IntegrationSpec` used to hold exactly one forge field, `GitHub *GitHubSpec`, and `GitHubSpec` two:
 `GitRepo` and `Org`. (`PlatformAgentIntegrationSpec` embeds it alongside `GoogleChat` and `Slack`, so
-GitHub is the only _forge_ integration rather than the only integration.) `Org` carries GitHub's
+GitHub is the only _forge_ integration rather than the only integration.) `Org` carried GitHub's
 namespace grammar in a CRD pattern — alphanumerics and hyphens, at most 39 characters — which is not
 GitLab's: a group path admits dots and underscores, and a project can sit several groups deep, so no
 value of `org` names a nested GitLab namespace. `GitRepo`'s validation, `ValidateGitRepoURLWithOrg`,
-checks length and non-graphic runes and then defers to `CleanRepoSlugWithOrg`, so what the CR
-enforces about the repository is "exactly one slash once the host has been discarded" — and nothing
-at all about the host. The declarative surface names GitHub in the field path and nowhere in the
-validation, and the check that does fire is a shape check standing in for the host check §3 shows is
+checked length and non-graphic runes and then deferred to `CleanRepoSlugWithOrg`, so what the CR
+enforced about the repository was "exactly one slash once the host has been discarded" — and nothing
+at all about the host. The declarative surface named GitHub in the field path and nowhere in the
+validation, and the check that did fire was a shape check standing in for the host check §3 shows is
 the one that matters.
 
-The operator then writes the repository into the `managed_repos` state ConfigMap as a
-`ManagedRepoEntry` whose `type` is the literal `"github"`. §2 covers what the agent does with that;
-what belongs here is that the discriminator this design needs already has a field, a schema and a
-transport, and that the only thing missing at this layer is a way to declare it — which is why an
-administrator who writes one straight into the ConfigMap gets an entry the operator preserves and
-the agent discards.
+The operator writes the repository into the `managed_repos` state ConfigMap as a `ManagedRepoEntry`.
+§2 covers what the agent does with that; what belongs here is that the discriminator this design
+needs already had a field, a schema and a transport, and that the only thing missing at this layer
+was a way to declare it — which is why an administrator who writes one straight into the ConfigMap
+gets an entry the operator preserves and the agent discards.
 
-The change is `spec.integration.git` carrying a provider, a host and a repository, with
-`spec.integration.github` kept as a deprecated alias that maps onto it. Validation becomes
+Step 2 made that declaration `spec.integration.git`, carrying a provider, a host, a repository and a
+namespace, with `spec.integration.github` kept as a deprecated alias that resolves to the same
+thing. Setting both is refused rather than given a precedence rule. Validation is
 provider-dispatched — each provider asserting its own namespace grammar, and each rejecting a host
-that is not its own — rather than one host-blind shape check standing in for all of them.
-`ManagedRepoEntry.Type` stops being a constant and carries the declared provider, which is how the
+that is not its own — rather than one host-blind shape check standing in for all of them, and
+`ManagedRepoEntry.Type` carries the declared provider instead of a constant, which is how the
 discriminator reaches the agent: written down by the operator, rather than inferred from the URL's
-text.
+text. Only GitHub is registered; the CRD enum widens with the agent-side provider that honours it
+(§9 step 5), because a provider the CRD accepts and the agent discards is the worse failure.
 
 `install.sh` and `terraform/examples/full-install` carry the GitHub App inputs as
 `github_app_id`, `enable_github_minter` and `github_minter_kms_*`; the chart spells the same
 settings `githubMinter.appId`, `githubMinter.enabled` and `githubMinter.kms.*`. All of them become
 provider-conditional: an install that declares GitLab provisions no KMS key and no minter.
+
+The chart is guarded from step 2, because that is where the forge declaration lives — but guarded
+rather than conditional: `githubMinter.enabled` alongside a non-GitHub provider fails the render.
+That is the right shape while GitLab has no credential path of its own, since silently rendering no
+minter would leave the agent with no token source at all; step 5 turns the guard into the condition
+the paragraph above describes, once there is something to render instead. The installer and
+Terraform halves wait for step 5 too, when there is a second provider to select. A `terraform`
+variable whose only legal value is its default is configuration nobody can set, and the branch it
+would guard could not be exercised.
 
 ## 7. Vocabulary
 
@@ -406,13 +420,17 @@ The resulting sequence:
 2. **The declarative surface, Go half** (§6): `spec.integration.git`, the deprecated alias,
    provider-dispatched validation, and `ManagedRepoEntry.Type` carrying the declared provider for
    the agent to read. §3's SCP rewrite is fixed here and #1085 closes here, because this step is
-   already rewriting that admission path — either could land ahead of the sequence instead.
+   already rewriting that admission path — either could land ahead of the sequence instead. The
+   chart gains the guard §6 describes here; making its GitHub App inputs, the installer's and
+   Terraform's actually conditional waits for step 5, for the reason §6 gives. **Landed.**
 3. **The consumer migration** (§4): protocol widened, the three remaining scripts moved onto it.
    Splits naturally by consumer.
 4. **The credential plane** (§5): route, executable allowlist and egress allowlist parameterised,
    and the git credential helper selected per provider — for a CLI-backed forge that is its own
    `setup-git` equivalent, for a proxy-backed one a helper the sidecar serves. Still one provider.
-5. **`GitLabProvider`** (§4, §5): the first new forge, with a Secret-backed token.
+5. **`GitLabProvider`** (§4, §5): the first new forge, with a Secret-backed token. `install.sh` and
+   `terraform/examples/full-install` become provider-conditional here, alongside the provider that
+   gives their second branch a value to take.
 6. **Vocabulary** (§7): the four skills, then the SOPs' nouns and prohibitions.
 7. **MCP sidecar** (§8), if wanted. Depended on by nothing above.
 
