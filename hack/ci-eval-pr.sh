@@ -1217,11 +1217,13 @@ print(m.group(1).strip('\'\"') if m else '')
 # nothing to main's side of the aggregate. Screening replaces it.
 #
 # This roster is what blocks a pull request once the Prow job stops being
-# optional. Twelve of the seventeen active cases are admitted: the ones
+# optional. Twelve of the twenty active cases are admitted: the ones
 # whose recent record shows failures only on their own regressions or on
-# infra classes the harness already excludes from the verdict. Five are
-# held out -- they still run and report on every pull request, and they
-# cannot red one on a GRADED failure. The scope of that promise is rungs
+# infra classes the harness already excludes from the verdict. The rest
+# cannot red one on a GRADED failure: five are held out below with named
+# exits, and the three obtainability activations (#1049) simply run
+# unadmitted while they earn a record. Held-out cases still run and
+# report on every pull request. The scope of that promise is rungs
 # 4 and 6: rungs 1-3 (a forbidden mutation, an erroring check, a record
 # that is not a real run) stay blocking for every case by design,
 # admitted or not -- see grade_case, which evaluates them before it reads
@@ -1243,11 +1245,13 @@ print(m.group(1).strip('\'\"') if m else '')
 #     the lettered-options bar is settled and it has a clean record.
 #   compliance-rbac-overgrant             -- #1171: demoted 2026-09-02
 #     after rung-4 collapses on unrelated pull requests (#1153 was red on
-#     this case alone). The fleet-audit delegation chain is degraded --
-#     partial audits that skip check 2.4 ("access limitations"), runs
-#     that publish no ledger at all -- so the collapse is the
-#     environment's, not the diff's. Enters when #1171's re-admission
-#     bar holds: delegation fixed and a clean 3-day graded record.
+#     this case alone). The fleet-audit delegation chain is degraded:
+#     audits go partial on what the agent reports as "access
+#     limitations", skipping check 2.4 (the cluster-admin-binding check
+#     this case grades), and some runs publish no ledger at all -- so the
+#     collapse is the environment's, not the diff's. Enters when #1171's
+#     re-admission bar holds: delegation fixed and a clean 3-day graded
+#     record.
 #
 # If an admitted case reds a pull request its diff cannot explain on a
 # graded failure, demote it here and reference its issue. Demotion is a
