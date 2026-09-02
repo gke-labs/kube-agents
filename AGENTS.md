@@ -363,9 +363,10 @@ for what is admitted, the comment above it for how a flaky case is demoted, and
 ladder.
 
 On a red, ask whether your diff explains it. If yes, fix it. If no, file an issue with the
-`presubmit-gate` label and keep working — classifying the red and demoting a flaky admitted case is
-the eval crew's move, not yours. One `/retest` is reasonable for a suspected transient; repeated
-blind retests are noise. Never merge around a red gate, and never instruct anyone to.
+`presubmit-gate` label; if the cause is evident and the fix is quick, fixing it yourself is
+welcome — otherwise keep working while the eval crew classifies it. One `/retest` is reasonable
+for a suspected transient; repeated blind retests are noise. Never merge around a red gate, and
+never instruct anyone to.
 
 ## Automated Review After Opening a Pull Request
 
