@@ -131,6 +131,25 @@ Additive, optional, and safe to omit — consumers must default them.
 - `--from-dir <dir>` — local `<build_id>/` subdirectories with the same
   three files; the offline/testing path.
 
+### Incremental collection (CLI behaviour only — the output stays schema v1)
+
+- `--merge-with <data.json | gs:// URL>` — load a previously written
+  data.json, carry its `runs[]` over verbatim, and skip every GCS build
+  whose id is ≤ the newest **numeric** `build_id` on record (Prow build
+  ids increase monotonically, so the watermark is free). Overlapping
+  builds dedupe by `build_id` with the **freshly parsed** copy winning;
+  `cases[]` and `coverage` are recomputed from the merged run list on the
+  current checkout. A missing, unreadable, truncated, non-v1 or
+  implausible prior file is a **warning that degrades to a fresh sweep
+  bounded to `--since-days 14`** — never a crash (the first armed run has
+  no prior file at all). This is what lets an hourly periodic republish in
+  minutes instead of re-reading ~3 objects per archived build.
+- `--since-days <n>` — skip GCS builds whose `started.json` timestamp is
+  older than `n` days. Costs one probe read per candidate build and saves
+  the other two; builds with an unreadable `started.json` are kept (the
+  no-`finished.json` rule still skips them). `--from-dir` sources are
+  never filtered.
+
 ## Fixtures
 
 `testdata/` holds three **real** `pull-kube-agents-smoke-test` builds

@@ -19,6 +19,21 @@ Sources:
               build's build-log.txt / started.json / finished.json -- the
               offline path the unit tests use.
 
+Incremental mode (what the hourly refresh job runs):
+  --merge-with  a previously written data.json (local path or gs:// URL).
+              Its runs are carried over verbatim, the GCS scan skips every
+              build at or below the newest build id already on record, and
+              cases/coverage are recomputed from the merged run list. The
+              cold sweep is ~3 serial gsutil calls per archived build --
+              tens of minutes over two weeks of history -- so an hourly
+              job MUST ride this watermark. A missing, unreadable or
+              implausible prior file is a warning that degrades to a fresh
+              sweep bounded by --since-days (default 14 in that case),
+              never a crash: the first armed run has no prior file at all.
+  --since-days  skip GCS builds whose started.json is older than N days.
+              Costs one probe read per candidate build and saves the other
+              two; the watermark filter above is free and runs first.
+
 Builds with no finished.json are still running (or never finished uploading)
 and are skipped. Everything else is parsed best-effort: a truncated log
 yields a partial run, an unparseable build is skipped with a warning, and a
@@ -35,9 +50,14 @@ import re
 import statistics
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 SCHEMA_VERSION = 1
+
+# The sweep bound a degraded --merge-with falls back to when the prior file
+# is missing or unusable. Two weeks matches the depth the dashboard displays;
+# unbounded would mean re-reading every archived build ever.
+DEGRADED_SINCE_DAYS = 14.0
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 TASKS_DIR = REPO_ROOT / "bench" / "tasks"
@@ -341,7 +361,23 @@ def _gsutil(args: list[str], gsutil: str = "gsutil") -> str | None:
 _PR_IN_PATH = re.compile(r"/pull/[^/]+/(\d+)/")
 
 
-def runs_from_gcs(pr_globs: list[str], gsutil: str = "gsutil") -> list[dict]:
+def _started_at(started_text: str | None) -> datetime | None:
+    """The build's start time from started.json text, or None when unknowable."""
+    if started_text is None:
+        return None
+    try:
+        started = json.loads(started_text)
+        return datetime.fromtimestamp(int(started["timestamp"]), tz=timezone.utc)
+    except (ValueError, TypeError, KeyError, OSError, OverflowError):
+        return None
+
+
+def runs_from_gcs(
+    pr_globs: list[str],
+    gsutil: str = "gsutil",
+    after_build: int | None = None,
+    since_cutoff: datetime | None = None,
+) -> list[dict]:
     runs = []
     for glob in pr_globs:
         listing = _gsutil(["ls", glob], gsutil)
@@ -362,9 +398,29 @@ def runs_from_gcs(pr_globs: list[str], gsutil: str = "gsutil") -> list[dict]:
             build_id = line.rstrip("/").rsplit("/", 1)[-1]
             if not build_id.isdigit():
                 continue
+            # The incremental watermark: Prow build ids are monotonically
+            # increasing, so anything at or below the newest id already on
+            # record is already in the prior data and costs zero reads here.
+            if after_build is not None and int(build_id) <= after_build:
+                continue
             m = _PR_IN_PATH.search(line)
             pr_hint = int(m.group(1)) if m else None
-            reader = lambda name, base=line: _gsutil(["cat", base + name], gsutil)
+
+            cache: dict[str, str | None] = {}
+
+            def reader(name: str, base: str = line, cache: dict = cache) -> str | None:
+                if name not in cache:
+                    cache[name] = _gsutil(["cat", base + name], gsutil)
+                return cache[name]
+
+            if since_cutoff is not None:
+                # One probe read decides whether to pay the other two. An
+                # unparseable started.json keeps the build: build_run makes
+                # the final call, and a build with no readable metadata is
+                # skipped there anyway.
+                started_at = _started_at(reader("started.json"))
+                if started_at is not None and started_at < since_cutoff:
+                    continue
             try:
                 run = build_run(build_id, reader, pr_hint)
             except Exception as exc:  # noqa: BLE001 -- one bad build must not kill the sweep
@@ -398,6 +454,107 @@ def runs_from_dir(root: pathlib.Path) -> list[dict]:
 
 
 # --------------------------------------------------------------------------
+# Incremental merge (--merge-with)
+# --------------------------------------------------------------------------
+
+
+def _plausible_run(run) -> bool:
+    """Whether a prior run carries every field the aggregation indexes.
+
+    build_cases subscripts run["tasks"], task["name"], task["result"],
+    task["duration_s"] and task["outcome_validity"]; a prior file missing any
+    of them would crash mid-merge, so an implausible run distrusts the WHOLE
+    prior file (it is self-written -- any anomaly means corruption).
+    """
+    if not isinstance(run, dict) or not isinstance(run.get("build_id"), str):
+        return False
+    tasks = run.get("tasks")
+    if not isinstance(tasks, list):
+        return False
+    return all(
+        isinstance(task, dict)
+        and isinstance(task.get("name"), str)
+        and task.get("result") in ("pass", "fail", "infra")
+        and "duration_s" in task
+        and "outcome_validity" in task
+        for task in tasks
+    )
+
+
+def load_prior_runs(source: str, gsutil: str = "gsutil") -> list[dict] | None:
+    """The runs of an existing data.json, or None when it cannot be trusted.
+
+    None -- never an exception -- for every failure mode: file or object
+    missing (the first armed run has no prior), unreadable, truncated by a
+    partial download, not schema v1, or runs that do not look like this
+    collector's output. The caller degrades to a bounded fresh sweep.
+    """
+    if source.startswith("gs://"):
+        text = _gsutil(["cat", source], gsutil)
+        if text is None:
+            print(
+                f"warning: --merge-with {source}: gsutil cat failed (missing object"
+                " or unreadable bucket); treating as a first run",
+                file=sys.stderr,
+            )
+            return None
+    else:
+        try:
+            text = pathlib.Path(source).read_text()
+        except OSError as exc:
+            print(
+                f"warning: --merge-with {source}: {exc}; treating as a first run",
+                file=sys.stderr,
+            )
+            return None
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        print(
+            f"warning: --merge-with {source}: not valid JSON ({exc});"
+            " discarding the prior data",
+            file=sys.stderr,
+        )
+        return None
+    if not isinstance(data, dict) or data.get("schema_version") != SCHEMA_VERSION:
+        version = data.get("schema_version") if isinstance(data, dict) else "n/a"
+        print(
+            f"warning: --merge-with {source}: schema_version {version!r} is not"
+            f" {SCHEMA_VERSION}; discarding the prior data",
+            file=sys.stderr,
+        )
+        return None
+    runs = data.get("runs")
+    if not isinstance(runs, list) or not all(_plausible_run(run) for run in runs):
+        print(
+            f"warning: --merge-with {source}: runs[] does not look like this"
+            " collector's output; discarding the prior data",
+            file=sys.stderr,
+        )
+        return None
+    return runs
+
+
+def newest_build_id(runs: list[dict]) -> int | None:
+    """The numeric watermark the incremental GCS scan resumes above."""
+    ids = [int(r["build_id"]) for r in runs if str(r.get("build_id", "")).isdigit()]
+    return max(ids) if ids else None
+
+
+def merge_runs(prior: list[dict], fresh: list[dict]) -> list[dict]:
+    """Union by build_id, freshly parsed wins, sorted oldest first.
+
+    Fresh wins so a re-read of an overlapping build (a --from-dir merge, or a
+    watermark edge case) reflects what the source says NOW; a finished build
+    never changes, so the choice only matters when the prior copy was bad.
+    """
+    by_id = {run["build_id"]: run for run in prior}
+    for run in fresh:
+        by_id[run["build_id"]] = run
+    return sorted(by_id.values(), key=_run_sort_key)
+
+
+# --------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------
 
@@ -416,13 +573,49 @@ def collect(
     from_dir: pathlib.Path | None = None,
     repo_root: pathlib.Path = REPO_ROOT,
     gsutil: str = "gsutil",
+    merge_with: str | None = None,
+    since_days: float | None = None,
+    now: datetime | None = None,
 ) -> dict:
-    runs = []
+    prior: list[dict] = []
+    after_build = None
+    if merge_with is not None:
+        loaded = load_prior_runs(merge_with, gsutil)
+        if loaded is not None:
+            prior = loaded
+            after_build = newest_build_id(prior)
+        # No usable prior -- or a prior that yields no numeric watermark --
+        # means the incremental scan cannot resume, and an unbounded cold
+        # sweep is ~3 serial gsutil calls per archived build. Bound the
+        # recovery unless the caller already did.
+        if after_build is None and since_days is None:
+            since_days = DEGRADED_SINCE_DAYS
+            print(
+                f"warning: no incremental watermark from --merge-with; bounding"
+                f" the fresh sweep to the last {DEGRADED_SINCE_DAYS:g} days",
+                file=sys.stderr,
+            )
+
+    since_cutoff = None
+    if since_days is not None:
+        since_cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=since_days)
+
+    fresh: list[dict] = []
     if from_dir is not None:
-        runs.extend(runs_from_dir(from_dir))
+        fresh.extend(runs_from_dir(from_dir))
     if pr_globs:
-        runs.extend(runs_from_gcs(pr_globs, gsutil))
-    runs.sort(key=_run_sort_key)
+        fresh.extend(
+            runs_from_gcs(
+                pr_globs, gsutil, after_build=after_build, since_cutoff=since_cutoff
+            )
+        )
+    if merge_with is not None:
+        print(
+            f"note: merged {len(prior)} prior runs with {len(fresh)} newly"
+            f" collected (GCS scan resumed above build {after_build})",
+            file=sys.stderr,
+        )
+    runs = merge_runs(prior, fresh)
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -450,6 +643,22 @@ def main(argv: list[str] | None = None) -> int:
         help="local directory of <build_id>/ subdirs with build-log.txt,"
         " started.json and finished.json (offline/testing source)",
     )
+    parser.add_argument(
+        "--merge-with",
+        metavar="DATA_JSON",
+        help="existing data.json (local path or gs:// URL) to merge into: its"
+        " runs are kept, the GCS scan only reads builds newer than its newest"
+        " build id, and cases/coverage are recomputed. Missing or corrupt"
+        f" degrades to a fresh sweep bounded to --since-days"
+        f" {DEGRADED_SINCE_DAYS:g}",
+    )
+    parser.add_argument(
+        "--since-days",
+        type=float,
+        metavar="N",
+        help="skip GCS builds whose started.json is older than N days"
+        " (bounds a sweep; --from-dir sources are never filtered)",
+    )
     parser.add_argument("--out", type=pathlib.Path, default=pathlib.Path("data.json"))
     parser.add_argument(
         "--repo-root",
@@ -461,14 +670,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--gsutil", default="gsutil", help="gsutil binary to invoke")
     args = parser.parse_args(argv)
 
-    if not args.pr_glob and args.from_dir is None:
-        parser.error("nothing to collect: pass --pr-glob and/or --from-dir")
+    if not args.pr_glob and args.from_dir is None and args.merge_with is None:
+        parser.error("nothing to collect: pass --pr-glob, --from-dir and/or --merge-with")
 
     data = collect(
         pr_globs=args.pr_glob,
         from_dir=args.from_dir,
         repo_root=args.repo_root,
         gsutil=args.gsutil,
+        merge_with=args.merge_with,
+        since_days=args.since_days,
     )
     args.out.write_text(json.dumps(data, indent=2) + "\n")
     print(
