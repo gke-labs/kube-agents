@@ -30,6 +30,7 @@ from tests.testing.release import (
     MOCK_SAMPLE_SHORT_SHA,
     MOCK_TARGET_RELEASE_TAG,
     create_mock_docker_binary,
+    create_mock_ghcr_curl_binary,
 )
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -822,6 +823,148 @@ source "{_COMMON_SH}"
                     f"{script} re-implements the breaking-change test instead of calling common.sh",
                 )
                 self.assertIn("commit_messages_have_breaking_change", body, f"{script} does not call the helper")
+
+
+class RegistryImageProbeTest(unittest.TestCase):
+    """`registry_image_exists` must not read "no docker" as "no image".
+
+    `docker manifest inspect` is the probe that works against every registry,
+    and three other call sites in common.sh already check for the binary before
+    using it. `check_commit_images_exist` did not, so on a machine with no
+    docker it reported every image missing — which `find_latest_built_commit`
+    turns into "no commit in the last 30 has published images", a publish
+    outage that is really a missing binary. The Prow job image is exactly such
+    a machine: hack/ci-deploy.sh builds through `gcloud builds submit` because
+    there is no docker daemon there, and hack/resolve-rc-target.sh runs in the
+    same place.
+    """
+
+    _IMAGE = f"{MOCK_DEFAULT_REGISTRY_PREFIX}/platform-agent:{MOCK_SAMPLE_COMMIT_SHA}"
+    # Deliberately not ghcr.io: the curl fallback speaks one registry's API.
+    _FOREIGN_IMAGE = f"us-central1-docker.pkg.dev/p/r/platform-agent:{MOCK_SAMPLE_COMMIT_SHA}"
+    _REPOSITORY_PATH = "gke-labs/kube-agents/platform-agent"
+    _DIGEST = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+
+    def _run(self, func_call, bin_dir, env=None):
+        """common.sh sourced with PATH pinned to bin_dir plus the base utilities.
+
+        Pinned rather than prepended: this suite is about what happens when
+        docker is ABSENT, and a developer laptop with Docker Desktop installed
+        would otherwise find it further down the inherited PATH.
+        """
+        overrides = {"PATH": f"{bin_dir}:/usr/bin:/bin"}
+        overrides.update(env or {})
+        return subprocess.run(
+            ["bash", "-c", f'source "{_COMMON_SH}"\n{func_call}'],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(overrides=overrides),
+            cwd=str(_REPO_ROOT),
+        )
+
+    def test_docker_is_used_when_it_is_there(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            create_mock_docker_binary(tmp, existing_images=[self._IMAGE])
+            found = self._run(f'registry_image_exists "{self._IMAGE}"', tmp)
+            self.assertEqual(found.returncode, 0, found.stderr)
+            missing = self._run(f'registry_image_exists "{self._IMAGE}x"', tmp)
+            self.assertNotEqual(missing.returncode, 0)
+
+    def test_a_published_image_is_found_without_docker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            create_mock_ghcr_curl_binary(tmp)
+            proc = self._run(f'registry_image_exists "{self._IMAGE}"', tmp)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_an_unpublished_image_is_still_missing_without_docker(self):
+        """The fallback must not turn into an unconditional yes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            create_mock_ghcr_curl_binary(tmp, manifest_status=1)
+            proc = self._run(f'registry_image_exists "{self._IMAGE}"', tmp)
+            self.assertNotEqual(proc.returncode, 0)
+
+    def test_an_unauthenticated_registry_is_missing_rather_than_present(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            create_mock_ghcr_curl_binary(tmp, token_response="")
+            proc = self._run(f'registry_image_exists "{self._IMAGE}"', tmp)
+            self.assertNotEqual(proc.returncode, 0)
+
+    def test_another_registry_without_docker_says_why(self):
+        """Reporting "missing" for a registry the fallback cannot query is a
+        lie about the image. It still fails, but it must say what it is."""
+        with tempfile.TemporaryDirectory() as tmp:
+            create_mock_ghcr_curl_binary(tmp)
+            proc = self._run(f'registry_image_exists "{self._FOREIGN_IMAGE}"', tmp)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("no docker on PATH", proc.stderr)
+
+    def _manifest_probe(self, log_path):
+        """The one logged call that is not the token request."""
+        calls = [line for line in log_path.read_text().splitlines() if "/manifests/" in line]
+        self.assertEqual(len(calls), 1, log_path.read_text())
+        return calls[0]
+
+    def test_the_probe_carries_the_url_and_headers_ghcr_answers_on(self):
+        """GHCR returns 404, not 401, for a manifest request that omits the OCI
+        media types — a false "image missing" indistinguishable from the real
+        thing. Asserting only the exit code leaves both the URL and the header
+        free to be anything, so this reads the request the mock recorded."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _, log_path = create_mock_ghcr_curl_binary(tmp)
+            proc = self._run(f'registry_image_exists "{self._IMAGE}"', tmp)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            probe = self._manifest_probe(pathlib.Path(log_path))
+            self.assertIn(
+                f"https://ghcr.io/v2/{self._REPOSITORY_PATH}/manifests/{MOCK_SAMPLE_COMMIT_SHA}",
+                probe,
+            )
+            self.assertIn("Authorization: Bearer t", probe)
+            for media_type in (
+                "application/vnd.oci.image.index.v1+json",
+                "application/vnd.oci.image.manifest.v1+json",
+                "application/vnd.docker.distribution.manifest.list.v2+json",
+                "application/vnd.docker.distribution.manifest.v2+json",
+            ):
+                self.assertIn(media_type, probe)
+
+    def test_a_digest_reference_is_probed_as_a_digest(self):
+        """`<repo>@sha256:…` is what the docker branch accepts, so the fallback
+        has to accept it too — splitting it on the last colon would ask for a
+        repository named `…@sha256` and a tag of hex."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _, log_path = create_mock_ghcr_curl_binary(tmp)
+            image = f"{MOCK_DEFAULT_REGISTRY_PREFIX}/platform-agent@{self._DIGEST}"
+            proc = self._run(f'registry_image_exists "{image}"', tmp)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(
+                f"https://ghcr.io/v2/{self._REPOSITORY_PATH}/manifests/{self._DIGEST}",
+                self._manifest_probe(pathlib.Path(log_path)),
+            )
+
+    def test_a_reference_less_image_is_probed_at_latest(self):
+        """No tag and no digest means `latest` to a registry. Left unhandled it
+        becomes an empty reference and a URL ending in `/manifests/`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _, log_path = create_mock_ghcr_curl_binary(tmp)
+            image = f"{MOCK_DEFAULT_REGISTRY_PREFIX}/platform-agent"
+            proc = self._run(f'registry_image_exists "{image}"', tmp)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(
+                f"https://ghcr.io/v2/{self._REPOSITORY_PATH}/manifests/latest",
+                self._manifest_probe(pathlib.Path(log_path)),
+            )
+
+    def test_the_commit_check_stops_reporting_a_publish_outage(self):
+        """The regression the guard exists for, at the level callers use."""
+        with tempfile.TemporaryDirectory() as tmp:
+            create_mock_ghcr_curl_binary(tmp)
+            proc = self._run(
+                f'check_commit_images_exist "{MOCK_SAMPLE_COMMIT_SHA}"',
+                tmp,
+                env={"REGISTRY_PREFIX": MOCK_DEFAULT_REGISTRY_PREFIX},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
 if __name__ == "__main__":
