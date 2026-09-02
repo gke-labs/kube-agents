@@ -19,9 +19,12 @@ those patches introduced, on purpose: the sites this patch needs — "right
 after subscription inheritance", "right before the result gate" — are only
 addressable in the patched tree, and deriving anchors against a different
 tree than the build produces is how an anchor rots undetected (the same
-argument ``apply_kanban_notify_delivery.py`` makes for its ordering). Both
-strings are imported from their owning modules rather than restated, so a
-change to either patch breaks this one at import time, not at 3am in a build.
+argument ``apply_kanban_notify_delivery.py`` makes for its ordering). Neither
+anchor can drift silently: the completion anchor IS
+``kanban_result_required.NEW_GATE``, imported, and the create anchor is
+asserted at import time to be the last line of
+``apply_kanban_auto_subscribe.PATCHED`` — so a change to either owning patch
+breaks this one at import time, not at 3am in a build.
 
 Why the change is needed is documented in the module docstring of
 ``deploy/docker/patches/kanban_children_settled.py``. Usage::
@@ -37,14 +40,23 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import patchlib  # noqa: E402
+from apply_kanban_auto_subscribe import PATCHED as AUTO_SUBSCRIBE_PATCHED  # noqa: E402
 from kanban_result_required import NEW_GATE as RESULT_GATE  # noqa: E402
 
 RELATIVE = "tools/kanban_tools.py"
 
 # The line apply_kanban_auto_subscribe.py inserts into the kanban_create
 # handler. `conn` is open (the `kb.get_task(conn, new_tid)` two lines up) and
-# `new_tid` is the created card.
+# `new_tid` is the created card. Asserted against the owning patch below so a
+# rewrite there breaks this applier at import time rather than mid-build.
 CREATE_ANCHOR = "            _kanban_inherit_worker_subs(conn, new_tid)\n"
+
+if not AUTO_SUBSCRIBE_PATCHED.endswith(CREATE_ANCHOR):
+    raise SystemExit(
+        "apply_kanban_children_settled: apply_kanban_auto_subscribe.PATCHED no "
+        "longer ends with the line this patch anchors on. Re-derive "
+        "CREATE_ANCHOR against the auto-subscribe patch before building."
+    )
 
 CREATE_HOOK = CREATE_ANCHOR + (
     "            # kube-agents patch: remember which running card fanned this\n"

@@ -96,7 +96,8 @@ children never covered.
 ## Step 4: Compile Raw Inventory (`/opt/data/INVENTORY.raw.md`)
 
 **This step and the two after it run on the same card, after the Step 3 wait.** Your input is the
-`metadata` of every per-cluster card you just read — their `topology`, `workloads`,
+`metadata` of every per-cluster card — read during the Step 3 wait, or already in your worker
+context if you are a pre-#1010 aggregation card — their `topology`, `workloads`,
 `namespace_governance`, `findings` and `gaps`.
 
 **Get the fleet list before you write anything.** If you did not run Step 1 in this run — a
@@ -182,9 +183,14 @@ kanban_create(
   assignee='platform',
   idempotency_key='bootstrap-inventory-prioritize',
   title='Prioritize the onboarding inventory report',
+  parents=[<this card's id>],
   body=<the instructions below>,
 )
 ```
+
+`parents` matters: it queues the ranking to run after this card completes, which is what lets your
+own `kanban_complete` in Step 6 close this card while the ranking is still pending — a
+free-running child would be refused as unfinished fan-out work (#1010).
 
 The body must tell that worker to follow the prioritization SOP, reading whichever of these exists:
 
@@ -208,9 +214,12 @@ sweep instead, which produces a different report depending on how the sweep happ
 
 ---
 
-## Step 6: Silent Exit
+## Step 6: Complete the Card, Then Exit Silently
 
-Once the prioritization card is filed, return strictly `[SILENT]` immediately without running any
+Once the prioritization card is filed, call `kanban_complete`: `result` is a short factual account
+of the sweep — clusters audited, findings count, that the full findings are at
+`/opt/data/INVENTORY.raw.md` and ranking is queued. Completing is what releases the prioritization
+card (it lists this card in `parents`). Then return strictly `[SILENT]` without running any
 further terminal commands. Delivery to chat is handled separately by the
 `bootstrap-inventory-delivery` job, after prioritization writes `/opt/data/INVENTORY.md` — do not
 attempt to send the report yourself.

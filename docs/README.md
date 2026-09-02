@@ -339,7 +339,7 @@ only what the title does not say.
 | `overview/proactive-autonomy.md` | Site page | The hands-free loop: cron jobs fire the Platform Agent at governance SOPs; audits, PRs, alerts. | Watchdog loop, safety rails | New users |
 | `concepts/index.mdx` | Site page | Card-grid hub linking the nine concept pages. | Navigation | — |
 | `concepts/platform-agent.md` | Site page | Persona, safety rails, and tool wiring of the Platform Agent. | SOUL.md, MCP servers, toolsets, plugins | — |
-| `concepts/cluster-agents.md` | Site page | The per-cluster read-only specialists: scoping, the create/prune lifecycle and hourly reconcile, and the kanban delegation flow. | Cluster Agent lifecycle, read-only scoping, fan-out/fan-in | — |
+| `concepts/cluster-agents.md` | Site page | The per-cluster read-only specialists: scoping, the create/prune lifecycle and hourly reconcile, and the kanban delegation flow. | Cluster Agent lifecycle, read-only scoping, fan-out | — |
 | `concepts/chatops.md` | Site page | Chat ingress: Google Chat and Slack terminate at the Planning Agent front door, which delegates to the Platform Agent. Both opt-in. | Enablement flags, allowed users, session metadata | — |
 | `concepts/skills.md` | Site page | How the Platform Agent loads and invokes skill bundles; adding and importing skills. | SKILL.md format, frontmatter contract | — |
 | `concepts/governance-sops.md` | Site page | What the governance SOPs are (strategy vs skills' tactics) and which ship. | SOP roster | Sources live in `agents/platform/governance/` |

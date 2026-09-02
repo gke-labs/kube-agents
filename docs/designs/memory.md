@@ -1172,9 +1172,10 @@ write:
    the person sees it with no extra turn spent; `metadata` is the machine-readable
    copy `kanban_show` hands back later.
 2. A Platform Agent that fanned the work out carries its sub-workers'
-   `memory_candidates` onto its own card — every prerequisite's `metadata` is
-   already in the fan-in context — so a nomination survives a hop of delegation
-   instead of dying with the sub-card.
+   `memory_candidates` onto its own card — it reads every child's `metadata` with
+   `kanban_show` while waiting the children out (`SOUL.md` §6; the fan-in card
+   that used to carry this hop was retired by #1010) — so a nomination survives a
+   hop of delegation instead of dying with the sub-card.
 3. If the user asks to keep it, the Chat Agent reads the card with `kanban_show`,
    takes the sentence verbatim rather than from the thread it never saw, and writes
    it with `memory_retain(scope: "shared")`.
@@ -1198,14 +1199,16 @@ None of this is new machinery. `memory_candidates` is an ordinary key in an
 already free-form `metadata` dict, alongside `pr_url` and `proposed_patch`; what
 changed is prose — the three personas and `SYSTEM_PROMPT_READ_ONLY`.
 
-Three limits follow from that, and prose cannot lift any of them. A fan-in card is
-created by the Platform Agent, not the Chat Agent, and nothing links it back to the
-card the user is looking at, so a nomination collected there is reachable only if
-someone names the fan-in card — a `kanban_show` on the id the Chat Agent knows
-returns nothing, which is indistinguishable from nobody having nominated anything.
-The fan-in context serialises each prerequisite's `metadata` with a per-field cap
-and sorted keys, so `memory_candidates` sorts after a large `findings` payload and
-can be truncated away silently. And a nomination copied **verbatim** is a faithful
+Three limits follow from that, and prose cannot lift any of them. The relay's
+middle hop is prose-only: nothing checks that the waiting Platform Agent actually
+copies its children's `memory_candidates` into its own card's `metadata`, so a
+nomination it drops while synthesizing is gone, and a `kanban_show` on the id the
+Chat Agent knows returns nothing — indistinguishable from nobody having nominated
+anything. (Before #1010 retired the fan-in card this was worse: the collection
+point was a card nothing linked back to the one the user was looking at, and the
+fan-in context serialised each prerequisite's `metadata` with a per-field cap and
+sorted keys, so `memory_candidates` sorted after a large `findings` payload and
+could be truncated away silently.) And a nomination copied **verbatim** is a faithful
 relay of text the specialist read somewhere — a pod annotation, an issue comment —
 which the person approving "remember that" is reading as a fact rather than
 auditing as a string. The control is a person, and a person is the right control

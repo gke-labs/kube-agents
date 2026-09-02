@@ -132,9 +132,9 @@ Google Cloud and GKE best practices where it helps.
 ## Step 5: Report on your card
 
 Complete the card with `kanban_complete`, supplying **both** a human-readable `result` and a
-structured `metadata` object. The Platform Agent's aggregation card receives `metadata` verbatim and
-builds the fleet tables from it, so a finding that appears only in `result` prose is a finding the
-report loses.
+structured `metadata` object. The Platform Agent's waiting sweep card reads `metadata` verbatim off
+this card and builds the fleet tables from it, so a finding that appears only in `result` prose is a
+finding the report loses.
 
 `metadata` must have this shape:
 

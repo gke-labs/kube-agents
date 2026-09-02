@@ -134,10 +134,6 @@ NUDGE_TTL_SECONDS = 15 * 60
 #: refusal.
 MAX_LISTED_CHILDREN = 10
 
-#: ``timeout=`` IS the busy timeout, and the same value
-#: ``kanban_auto_subscribe`` uses: the gateway and CLI write this board too.
-CONNECT_TIMEOUT_SECONDS = 10
-
 #: Cards refused once and not yet completed, task id -> ``time.monotonic()``
 #: at refusal. Keyed per card for the reason ``kanban_result_required``
 #: documents: a shared gateway process must not spend card B's nudge on card
@@ -267,8 +263,13 @@ def require_children_settled(task_id, connect) -> str | None:
 
     Refused at most once per :data:`NUDGE_TTL_SECONDS` per card; the retry is
     accepted whatever the board says (see the module docstring on never
-    wedging). Fails open on any error: only a positive "live children exist"
-    read refuses.
+    wedging). One caveat on "at most once": the retry this gate waves through
+    can still be refused by the result gate behind it, and the attempt after
+    that arrives here with no memory and earns a second nudge. The alternation
+    is bounded — each gate spends at most one nudge per gate per window, so a
+    worker refused by both closes on its fourth call at worst — and it still
+    cannot wedge. Fails open on any error: only a positive "live children
+    exist" read refuses.
     """
     key = str(task_id or "").strip()
     if not key:
