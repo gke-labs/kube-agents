@@ -41,7 +41,10 @@
 # So this stack takes the host cluster as an input, applies one Deployment into
 # one namespace on it, waits until the pipeline has demonstrably started, and
 # deletes the namespace on destroy. `teardown: true` in the task file is what
-# runs that destroy.
+# runs that destroy. The destroy only covers the success path, so the plant
+# also clears a leftover namespace before it starts (step 0b) and deletes its
+# own on failure (the exit trap in step 0) -- see the teardown at the bottom of
+# this file for why it cannot be the only cleanup.
 #
 # WHY THE OUTPUTS EXIST even though nothing is provisioned: devops-bench calls
 # deployer.get_cluster_info() unconditionally after up() for any non-noop
@@ -173,8 +176,9 @@ resource "null_resource" "incident" {
       # captured rather than instead of it.
       #
       # Guarded on step 0 having completed: until KUBECONFIG points at the host
-      # cluster a kubectl here would run against the ambient context, which is a
-      # different cluster entirely (again, step 0).
+      # cluster a kubectl here would run against the ambient context, which is
+      # not reliably that cluster and is often another task's per-run one
+      # (again, step 0).
       host_kubeconfig_ready=""
       on_exit() {
         status=$?
@@ -211,11 +215,12 @@ resource "null_resource" "incident" {
       # Step 1 is idempotent by construction, so against a namespace that
       # already holds an identical Deployment `kubectl apply` reports
       # `unchanged` and creates no new pod. The pod still running is the one
-      # from the earlier run, which means it keeps its UID -- and the watcher's
-      # dedup key is exactly {UID, Reason} (k8s-event-watcher/types.go). Its
-      # window for that pod opened hours ago, so it logs
-      # `dedup BackOff pod=... (window active)` where step 3 is waiting for
-      # `fire`, and step 3 times out. Step 2 does not catch it either: the old
+      # from the earlier run, which means it keeps its UID -- and the watcher
+      # keys dedup on {UID, reason}, with the reason canonicalized into its
+      # family first (EventKey in k8s-event-watcher/types.go, canonicalizeReason
+      # in dedup.go). Its window for that pod opened hours ago, so it logs
+      # `dedup BackOff pod=... (count=N, window active)` where step 3 is waiting
+      # for `fire`, and step 3 times out. Step 2 does not catch it either: the old
       # pod's BackOff events are already past the debounce, so the wait returns
       # `after 0s` and everything looks healthy right up to the timeout.
       #
@@ -371,11 +376,15 @@ resource "null_resource" "incident" {
   # the opposite -- that the tainted path runs this too -- and #1143 is what
   # believing it cost.
   #
-  # It fetches its own credentials for the same reason step 0 does: devops-bench
-  # moves the ambient context off the host cluster after up(), so this can
-  # execute with it pointed anywhere at all. Deleting a namespace by name on the
-  # wrong cluster is the kind of thing --ignore-not-found makes survivable
-  # rather than safe.
+  # It fetches its own credentials for the same reason step 0 does, and the
+  # reason is not this stack's own up(): that one points the ambient kubeconfig
+  # AT the host cluster on purpose, as the header explains. It is the tasks
+  # around this one. The context in hand here is whatever the last
+  # get_cluster_info() selected -- and since that runs only after a successful
+  # up() while _teardown runs from a `finally` either way, the failure path can
+  # arrive with the previous task's per-run cluster still selected. Deleting a
+  # namespace by name on the wrong cluster is the kind of thing
+  # --ignore-not-found makes survivable rather than safe.
   provisioner "local-exec" {
     when        = destroy
     on_failure  = continue

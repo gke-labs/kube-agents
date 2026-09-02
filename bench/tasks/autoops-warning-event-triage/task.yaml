@@ -18,9 +18,9 @@
 #
 # This is the one presubmit case that mutates, which is why it is
 # namespace-scoped rather than read-only: the namespace is created by the
-# stack's apply and deleted by its destroy (`teardown: true`), and the
-# safeguards below assert the agent left the planted object exactly as the
-# stack wrote it.
+# stack's apply and deleted by its destroy (`teardown: true`), or by the plant's
+# own exit trap when the apply is what failed, and the safeguards below assert
+# the agent left the planted object exactly as the stack wrote it.
 #
 # Isolation class: namespace-scoped. Eligible tier: presubmit.
 ---
