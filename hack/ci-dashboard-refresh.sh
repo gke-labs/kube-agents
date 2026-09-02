@@ -58,6 +58,10 @@
 
 set -euo pipefail
 
+# The artifact-log filename cleanup() copies to $ARTIFACTS and the failure
+# message points readers at; named once so the two mentions cannot drift.
+readonly REFRESH_LOG_NAME="eval-dashboard-refresh.log"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DASH_SRC="${SCRIPT_DIR}/../scripts/eval_dashboard"
 
@@ -95,7 +99,7 @@ REFRESH_LOG="${WORK}/refresh.log"
 cleanup() {
   set +e
   if [ -n "${ARTIFACTS:-}" ] && [ -d "${ARTIFACTS}" ]; then
-    cp "${REFRESH_LOG}" "${ARTIFACTS}/eval-dashboard-refresh.log" 2>/dev/null || true
+    cp "${REFRESH_LOG}" "${ARTIFACTS}/${REFRESH_LOG_NAME}" 2>/dev/null || true
   fi
   rm -rf "${WORK}" || true
 }
@@ -146,7 +150,7 @@ BUDGET="${EVAL_DASHBOARD_TIMEOUT:-900}"
 TIMEOUT_CMD=(timeout "${BUDGET}")
 command -v timeout >/dev/null 2>&1 || TIMEOUT_CMD=()
 
-# Single quotes on purpose: $1..$6 are the child bash's own positionals, so
+# Single quotes on purpose: $1..$7 are the child bash's own positionals, so
 # no value ever meets an outer expansion. --merge-with always points at the
 # prior path; when the download above left nothing there, collect.py treats
 # it as a first run and bounds the sweep itself.
@@ -184,7 +188,7 @@ if [ "${rc}" -ne 0 ]; then
   if [ "${rc}" -eq 124 ]; then
     echo "ERROR: eval-dashboard refresh timed out after ${BUDGET}s (EVAL_DASHBOARD_TIMEOUT raises it; a first run with no prior data.json can need a full sweep)" >&2
   else
-    echo "ERROR: eval-dashboard refresh pipeline exited ${rc}; see the stage log above (also ${ARTIFACTS:+${ARTIFACTS}/}eval-dashboard-refresh.log)" >&2
+    echo "ERROR: eval-dashboard refresh pipeline exited ${rc}; see the stage log above (also ${ARTIFACTS:+${ARTIFACTS}/}${REFRESH_LOG_NAME})" >&2
   fi
   exit "${rc}"
 fi
