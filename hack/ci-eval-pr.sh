@@ -1246,9 +1246,11 @@ print(m.group(1).strip('\'\"') if m else '')
 # graded failure, demote it here and reference its issue. Demotion is a
 # one-line same-day edit to this list -- this file, not the Prow config,
 # is deliberately the fast lever. It is the lever for rung-4 reds ONLY: a
-# rung-1-3 red (mutation, erroring verifier, empty record) does not stop
-# when its case leaves this list, because those classes signal a broken
-# case or install, not flake, and the fix is on that side.
+# rung-1-3 red (mutation, erroring verifier, an empty record on a task
+# that provisions nothing -- a record whose deployer died before any
+# agent ran grades INFRA and reds nobody) does not stop when its case
+# leaves this list, because those classes signal a broken case or
+# install, not flake, and the fix is on that side.
 #
 # agent-kanban-smoke earned its seat back after the 08-27 redesign (a real
 # SRE question graded on kanban_create plus cluster names); the reds that
