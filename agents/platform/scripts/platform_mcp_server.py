@@ -663,6 +663,12 @@ def send_notification(message: str, session_id: str = "") -> str:
     """
     Post a formatted alert or operational notification directly to configured chat platforms (Google Chat and/or Slack).
 
+    Link every artifact you name in the message — issue, PR, cluster, workload,
+    console view — as a markdown link `[text](url)` with the URL written out in
+    full. Never a bare `#39` and never a repo-relative reference: a chat message
+    carries no repo context, so both render as plain text and leave the reader
+    guessing which repo was meant.
+
     Args:
         message: The plaintext or markdown-formatted message string to post.
         session_id: The active session ID (e.g. k8s-evt-XYZ) to route the notification as a threaded reply. Optional.
