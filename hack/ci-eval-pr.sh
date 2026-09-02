@@ -1132,6 +1132,9 @@ case "${EVAL_TASK_SELECTION}" in shadow | auto | off) ;; *)
   exit 1
   ;;
 esac
+# Exported so bench-gate (a child process) can see which mode selected its
+# input: under auto it reds a run whose subset dropped every armed case.
+export EVAL_TASK_SELECTION
 if [ "${EVAL_TASK_SELECTION}" != "off" ] && [ -n "${PULL_BASE_SHA:-}" ]; then
   SELECT_ACTIVE=()
   for TASK in "${TASKS[@]}"; do

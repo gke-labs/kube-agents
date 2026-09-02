@@ -246,6 +246,11 @@ class AdmittedWiringTest(unittest.TestCase):
         block_at = src.index("# ─── Change-based task selection")
         self.assertLess(export_at, block_at)
 
+    def test_the_mode_is_exported_for_the_gate(self):
+        """bench-gate reds an auto-mode run that dropped every armed case;
+        it can only see the mode if the shell exports it."""
+        self.assertIn("export EVAL_TASK_SELECTION", ShellBlockTest.block())
+
     def test_the_block_hands_the_admitted_set_to_the_selector(self):
         self.assertIn('EVAL_ADMITTED_CASES="${BOOTSTRAP_ADMITTED:-}"', ShellBlockTest.block())
 
