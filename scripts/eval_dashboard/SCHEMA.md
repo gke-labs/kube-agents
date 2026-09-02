@@ -72,8 +72,9 @@ A build with no `finished.json` is still running and is skipped entirely.
   `ABORTED`. This is the Prow job verdict, not the eval verdict.
 - `duration_s` — the `Total Duration` of the final
   `PR Smoke Test Evaluation Succeeded/Failed` line (eval loop only). A
-  truncated log has no verdict line; then it falls back to
-  `finished − started` (which also counts provisioning).
+  truncated log has no verdict line — and neither does a `SUCCESS` build that
+  `hack/ci-eval-pr.sh`'s step-0 revalidation ended before the eval loop; then
+  it falls back to `finished − started` (which also counts provisioning).
 - `tasks[]` — one entry per `Task <name> Result:` line, in log order:
   - `result` — `pass` for `[PASSED]`, `fail` for `[FAILED]`, `infra` for
     `[RESOURCE_PREPARATION_FAILED]` (resource prep, teardown or agent
