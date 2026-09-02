@@ -17,7 +17,7 @@ Resolve each cluster's profile name first (`cluster_agent_profile.py name --proj
 
 1. **Card A — can clusterA host it?** `kanban_create(assignee="<clusterA-profile>", title="Validate can-host <workload>", body="Can you host <ns/workload> (needs ~<cpu>/<mem>)? Check capacity, affinity/taints, quotas. Do NOT mutate.")`
 2. **Card B — is clusterB safe to evacuate?** `kanban_create(assignee="<clusterB-profile>", title="Validate safe-to-evacuate <workload>", body="Is it safe to evacuate <ns/workload>? Check PDBs, statefulness/local PVs, in-flight work. Do NOT mutate.")`
-3. **Wait on your own card:** poll A and B with `kanban_show(<id>)` (`sleep 30` between rounds) until both are settled, then read their `metadata`.
+3. **Wait on your own card:** poll A and B with `kanban_show(<id>)` (`sleep 60` between rounds) until both are settled, then read their `metadata`.
 
 Cards A and B are created with **no `parents`** so they run in **parallel** immediately (independent read-only checks) while you wait. Do not add your own currently-running card to A or B's `parents` — `parents` means "runs after", and that would stop them being claimed at all (`SOUL.md` §0). Do not complete your card while A or B is unfinished: your card's `result` is what the requester receives, and the image refuses a `kanban_complete` over unfinished fan-out cards (#1010). (The actual make-before-break ordering of the move is handled by KCC when it reconciles the PR, not by the agents.)
 

@@ -194,7 +194,7 @@ REFUSAL_HEADER = (
 REFUSAL_INSTRUCTIONS = (
     "Do not complete yet. Instead: "
     "(1) wait for the children — poll each with kanban_show(<child id>), and "
-    "run `sleep 30` between polling rounds rather than spinning; "
+    "run `sleep 60` between polling rounds rather than spinning; "
     "(2) when a child finishes, read its `result` and `metadata`; "
     "(3) once every child is settled, call kanban_complete again with the "
     "full synthesized answer to THIS card's request in `result`. "

@@ -366,7 +366,7 @@ def _task_body() -> str:
         "Each Cluster Agent is read-only and pinned to its own "
         "cluster, so these run in parallel and none can touch another's. "
         "**Step 3 — wait for the children on this card.** Poll each child with "
-        "`kanban_show(<id>)`, running `sleep 30` between polling rounds, until every one is "
+        "`kanban_show(<id>)`, running `sleep 60` between polling rounds (double it once the wait passes five minutes), until every one is "
         "`done` or `archived`; their structured `metadata` is how you collect the results. Do "
         "NOT complete this card while they are unfinished — completing is how a card hands back "
         "its final result, a dispatch receipt is not the report, and the board refuses such a "

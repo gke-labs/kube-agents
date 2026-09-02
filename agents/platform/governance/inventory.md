@@ -78,7 +78,7 @@ reach it, a row in the report saying so.
 ## Step 3: Wait for the per-cluster cards on this card
 
 Keep this card open and poll every per-cluster card from Step 2: `kanban_show(<id>)` for each,
-`sleep 30` between polling rounds, until all of them are settled (`done` or `archived`). Then read
+`sleep 60` between polling rounds (double it once the wait passes five minutes), until all of them are settled (`done` or `archived`). Then read
 each one's `metadata` and carry on to Step 4 **in this same run**.
 
 **Do not complete this card yet, and do not `kanban_block` on the per-cluster cards.** Completing
