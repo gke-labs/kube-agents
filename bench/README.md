@@ -60,7 +60,7 @@ That evidence is what `baselines/` holds, and admission is computed from it rath
 
 Two speeds, deliberately: the deterministic `Verification*` scores decide whether a repetition passed, and no judged score can fail a repetition on its own. The captured fixtures are the argument — three byte-identical failing runs scored `OutcomeValidity` 0.9, 1.0 and 0.2 while `VerificationCorrectness` held at 0.5 on all three. The judge is given exactly one job (rung 6): catching a **collapse** in judged quality against main's mean at the same version key, at a margin of two standard errors of that measured spread. At three repetitions it cannot see drift, and widening it is a matter of more repetitions or a less variable metric, not a smaller number.
 
-Thresholds are named environment variables, all with the documented default: `EVAL_REPETITIONS`, `DETERMINISTIC_CORRECTNESS_FLOOR`, `EVAL_ADMISSION_RATE`, `EVAL_ADMISSION_MIN_RUNS`, `EVAL_AGGREGATE_MARGIN`, `EVAL_JUDGED_MARGIN`, `EVAL_JUDGED_METRICS`, `EVAL_BASELINE_STORE`, `EVAL_BASELINE_MAX_OBJECTS`, and `BOOTSTRAP_ADMITTED` (the transition bridge — cases that keep blocking before any screening exists).
+Thresholds are named environment variables, all with the documented default: `EVAL_REPETITIONS`, `DETERMINISTIC_CORRECTNESS_FLOOR`, `EVAL_ADMISSION_RATE`, `EVAL_ADMISSION_MIN_RUNS`, `EVAL_AGGREGATE_MARGIN`, `EVAL_JUDGED_MARGIN`, `EVAL_JUDGED_METRICS`, `EVAL_BASELINE_STORE`, `EVAL_BASELINE_MAX_OBJECTS`, and `BOOTSTRAP_ADMITTED` (the transition bridge — cases that keep blocking before any screening exists). `EVAL_TASK_SELECTION` is read too: when it is `auto` and selection dropped every armed case, the suite verdict reds instead of warning.
 
 ## Portal CUJ evaluations
 
