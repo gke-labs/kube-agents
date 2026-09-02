@@ -12,9 +12,13 @@
 # means run everything.
 
 # Added to every non-empty selection: the cheapest task that proves the
-# platform->cluster-agent chain.
+# platform->cluster-agent chain, plus the BOOTSTRAP_ADMITTED case -- with
+# bench/baselines/ shipping empty it is the only case the gate's blocking
+# rungs arm on, so a filtered run without it grades nothing that can red
+# the job. scripts/test_ci_eval_triggers.py pins that coupling.
 floor:
   - cluster-agent-crashloop-debug
+  - gpu-stress-test-diagnosis
 
 buckets:
   # Prose and images that cannot change agent behaviour. Paths mirror the

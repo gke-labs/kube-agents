@@ -91,7 +91,14 @@ class SelectionTest(unittest.TestCase):
 
     def test_stack_change_selects_its_declaring_task(self):
         got = select(["bench/tf/prebuilt/autoops-incident/main.tf"])
-        self.assertEqual(got, {"autoops-warning-event-triage", "cluster-agent-crashloop-debug"})
+        self.assertEqual(
+            got,
+            {
+                "autoops-warning-event-triage",
+                "cluster-agent-crashloop-debug",
+                "gpu-stress-test-diagnosis",
+            },
+        )
 
     def test_inactive_task_change_selects_nothing(self):
         self.assertEqual(select(["bench/tasks/fleet-cost-idle-pool/task.yaml"]), set())
@@ -123,6 +130,18 @@ class ConfigTest(unittest.TestCase):
                 rf'(?m)^  "\./tasks/{re.escape(task)}/task\.yaml"$',
                 f"floor task {task} must be an active TASKS entry",
             )
+
+    def test_the_floor_carries_every_bootstrap_admitted_case(self):
+        """With bench/baselines/ empty, BOOTSTRAP_ADMITTED is the only source
+        of admission, and the gate's blocking rungs arm on admitted cases
+        alone -- a filtered run without them grades nothing that can red the
+        job. So the floor must carry each one until the baseline store is on."""
+        floor, _ = eval_triggers.load_config(eval_triggers.CONFIG)
+        src = SCRIPT.read_text(encoding="utf-8")
+        match = re.search(r'BOOTSTRAP_ADMITTED="\$\{BOOTSTRAP_ADMITTED:-([^}"]*)\}"', src)
+        self.assertIsNotNone(match, "BOOTSTRAP_ADMITTED default not found")
+        for case in filter(None, re.split(r"[,\s]+", match.group(1))):
+            self.assertIn(case, floor)
 
     def rejects(self, text):
         with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
