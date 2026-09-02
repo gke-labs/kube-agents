@@ -350,7 +350,10 @@ map (`docs/README.md`), and this file plus `CLAUDE.md` stay inside the context b
 three repetitions each — and has been merge-blocking since 2026-09-02
 (GoogleCloudPlatform/oss-test-infra#2677). It is slow — recent green runs took 1.5 to 3.5 hours
 against a 360-minute ceiling — and a new push restarts it, so open the pull request early and
-batch changes rather than stacking pushes.
+batch changes rather than stacking pushes. One exception: when a pull request already has a green
+run and everything changed since — on the PR and on `main` — is inert (docs, root Markdown, and
+the rest of the script's `REVALIDATION_INERT_PATHS`), the job's step 0 reuses that verdict and
+exits in minutes instead of re-running the matrix.
 
 Two things red it. A case on the `BOOTSTRAP_ADMITTED` roster in `hack/ci-eval-pr.sh` fails **all**
 of its repetitions — one failed repetition out of three does nothing on its own. Or any case,
@@ -358,7 +361,8 @@ admitted or not, trips an absolute rung: a forbidden cluster mutation, a verifie
 instead of running, or a record that is not from a real agent run. Repetitions classified as
 infrastructure failures are excluded from the verdict automatically, unless every case hits one —
 a suite that evaluated nothing reds rather than reporting green. The roster is the source of truth
-for what is admitted, the comment above it for how a flaky case is demoted, and
+for what is admitted, [`docs/eval-gate-roster.md`](docs/eval-gate-roster.md) for who is held out
+and how a flaky case is demoted, and
 [`docs/designs/testing-strategy.md`](docs/designs/testing-strategy.md) §4.2 for the full verdict
 ladder.
 
