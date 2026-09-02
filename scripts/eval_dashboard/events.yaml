@@ -1,0 +1,34 @@
+# Optional human annotations for the eval dashboard that no log line can
+# carry: dated event markers, and the few human-judgment counts the tiles
+# show. Everything measurable comes from data.json; this file is only for
+# what a human classified or decided. render.py tolerates an absent or
+# empty file (markers disappear, the annotated tiles render an em-dash), so
+# deleting a stale line can never break a render.
+#
+# File shape (all keys optional):
+#
+#   events:                       # vertical markers on the day trend and the matrix
+#     - date: "2026-08-29"        # UTC day, YYYY-MM-DD
+#       label: "#1053 publish fix"
+#   catches:                      # band 1 "Product bugs caught" tile
+#     product_bugs: 4             # real product bugs the suite caught
+#     prs_blocked: 2              # PRs the gate stopped from merging
+#     ledger: "#1054"             # where the receipts live
+#   false_reds_7d: 1              # band 2 tile: human-classified false reds
+
+events:
+  - date: "2026-08-27"
+    label: "kanban redesign"
+  - date: "2026-08-29"
+    label: "#1053 publish fix"
+  - date: "2026-08-31"
+    label: "#1063 + 360m timeout"
+  - date: "2026-09-01"
+    label: "#1095 429→infra + #1096 roster"
+
+catches:
+  product_bugs: 4
+  prs_blocked: 2
+  ledger: "#1054"
+
+false_reds_7d: 1
