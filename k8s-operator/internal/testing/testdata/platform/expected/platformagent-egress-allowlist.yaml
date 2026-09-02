@@ -331,6 +331,7 @@ data:
           rich_blocks: true
   managed.env: |
     API_SERVER_KEY=cluster-internal-trusted
+    KUBEAGENTS_MODE=today
     GOOGLE_CHAT_RELAY_URL=http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
     GOOGLE_CHAT_PROJECT_ID=kube-agents-gkedemos
     GOOGLE_CHAT_SUBSCRIPTION_NAME=projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub

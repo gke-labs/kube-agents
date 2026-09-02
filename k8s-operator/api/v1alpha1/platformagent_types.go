@@ -32,6 +32,13 @@ type PlatformAgentSpec struct {
 	// Integration configures platform-specific external connections.
 	// +optional
 	Integration *PlatformAgentIntegrationSpec `json:"integration,omitempty"`
+
+	// Mode selects which component stack the operator renders.  "today" is the
+	// current architecture.  "next" additionally renders the NATS and A2A
+	// gateway components, which are otherwise dark.  Absent means "today".
+	// +kubebuilder:validation:Enum=today;next
+	// +optional
+	Mode *string `json:"mode,omitempty"`
 }
 
 // PlatformAgentIntegrationSpec extends common IntegrationSpec with platform-specific connections.

@@ -303,6 +303,7 @@ data:
           rich_blocks: true
   managed.env: |
     API_SERVER_KEY=cluster-internal-trusted
+    KUBEAGENTS_MODE=today
   profile-platform.overlay.yaml: |
     memory:
       provider: ""
