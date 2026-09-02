@@ -114,8 +114,9 @@ below).
 Additive, optional, and safe to omit — consumers must default them.
 
 - `stale_after_s` — seconds after `generated_at` beyond which the rendered
-  page labels itself `STALE`. No collector version emits it yet; the
-  renderer defaults to `7200` when it is absent.
+  page labels itself `STALE`. Emitted only when the collector is invoked
+  with `--stale-after-s` (the hourly refresh job passes its cadence plus
+  slack); the renderer defaults to `7200` when it is absent.
 - `pending_builds` — builds the GCS scan listed but could not record: no
   readable `finished.json` yet (still running, or the upload failed), so
   they are not in `runs[]` and do not raise the watermark. Entries are
@@ -163,6 +164,9 @@ Additive, optional, and safe to omit — consumers must default them.
   the other two; builds with an unreadable `started.json` are kept (the
   no-`finished.json` rule still skips them). `--from-dir` sources are
   never filtered.
+- `--stale-after-s <seconds>` — write `stale_after_s` (see Optional
+  top-level fields) into the output. Omitted, the field is omitted and the
+  renderer's default applies.
 
 ## Fixtures
 
