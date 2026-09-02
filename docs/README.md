@@ -66,7 +66,8 @@ kube-agents/
 ├── examples/                                      gitops-repo template + inference/
 │                                                  integration READMEs
 ├── k8s-operator/                                  operator, event watcher, Minty READMEs
-├── scripts/                                       installer/, dev/ and release/ READMEs
+├── scripts/                                       installer/, dev/, release/ and
+│                                                  testdata/ READMEs
 ├── terraform/                                     companion Terraform modules +
 │                                                  the full-install composition
 └── tests/e2e/                                     Google Chat E2E suite README
@@ -176,6 +177,7 @@ identifier appears, add its source here.
 | Context budget for the always-loaded agent instruction files (`AGENTS.md`, `CLAUDE.md`) | `BUDGET` in `scripts/check_context_budget.py` |
 | Who may set the `approved` label on a change | `OWNERS`, `k8s-operator/OWNERS`, and `OWNERS_ALIASES` |
 | Which labels Tide merges on, and which Prow presubmits gate | `prow/oss/config.yaml` and `prow/prowjobs/gke-labs/kube-agents/` in `GoogleCloudPlatform/oss-test-infra` — not a file in this repository |
+| Queue-wait thresholds that justify onboarding an eval project, and the window they run over | `scripts/pool_pressure.py` |
 | Testing-domain slugs a bench case may claim | `docs/designs/domains.yaml` |
 | Seeded-fleet fixture role names and the cluster slot each lives on | `bench/tf/fleet/fixtures.json` |
 | Day-N availability gate per fixture, and the project-scoped fixtures that sit on no cluster | `docs/designs/fleet-fixtures.yaml`, which overlays `fixtures.json` and may not rename a role |
@@ -411,6 +413,7 @@ only what the title does not say.
 | `k8s-operator/testing/staging_workloads/README.md` | Component README | Terraform PoC that stamps out multi-cluster GKE staging fleets with realistic workload bundles and traffic simulators. | Cluster maps, workload bundle, load shapes | Developers building staging fleets |
 | `scripts/eval_dashboard/SCHEMA.md` | Reference | The `data.json` contract (schema version 1) between the eval-dashboard collector (`scripts/eval_dashboard/collect.py`, which writes it from Prow logs) and the dashboard renderer and publisher built against it in parallel: field names, types, derivation rules, and the additive-only change policy with `schema_version` bumps. | Run and case records, task results, pass rates, additive-only evolution | Dashboard collector/renderer/publisher developers |
 | `scripts/release/README.md` | Component README | Overview of the release automation scripts: candidate tag creation, environment provisioning and teardown, GKE readiness & E2E test execution, validated tag promotion, the nightly staging promotion, the in-place reconcile and drift report for the long-lived environments, and the GA release. Carries what the nightly environment needs before it can run, and is canonical for the GA release gate and how its schedule is turned on. | Release Candidate scripts, RC automation, environment reconcile | CI maintainers and release operators |
+| `scripts/testdata/pool_pressure/README.md` | Reference | Provenance of the fixtures behind `scripts/test_pool_pressure.py`: which artifacts are real captures and which are hand-built, why the build logs are truncated to the head the check actually reads, why `breach/boskos.json` holds an exhausted pool, and how to re-capture a build. | Fixture provenance, truncation, re-capture | Developers changing the pool-pressure check |
 | `terraform/examples/ci-pool-minter/README.md` | Component README | Additive root composition provisioning the GitHub token minter's GCP half in one Prow evaluation-pool project, so its GitOps scenarios can mint a token scoped to that project's repository; documents the App-installation and KMS PEM-import steps Terraform cannot take. | Per-project minter, one repo per lease, manual steps | CI engineers |
 | `terraform/examples/full-install/README.md` | Component README | Single-apply root composition of the modules plus a helm_release of the canonical chart — the install engine `./install.sh` drives via `lifecycle.sh`; covers image-tag overrides, Chat/GitHub integration wiring, teardown order. | Install engine, composed values | Infrastructure engineers |
 | `terraform/modules/gke-cluster/README.md` | Component README | Reusable Terraform module for the GKE cluster hosting Kube-Agents: Autopilot or Standard (`cluster_mode`), existing-cluster mode, optional gVisor pool and CMEK. | Cluster shapes, Workload Identity, CMEK | Infrastructure engineers |
