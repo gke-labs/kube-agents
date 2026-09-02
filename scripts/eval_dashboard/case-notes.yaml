@@ -25,7 +25,8 @@ notes:
   cluster-agent-healthy-workload-no-finding:
     badge: held-out
   compliance-rbac-overgrant:
-    issues: ["#998", "#985"]
+    issues: ["#998", "#985", "#1171"]
+    badge: held-out
   gpu-stress-test-diagnosis:
     note: reuse regression under investigation
   security-overgrant-remediation-proposal:

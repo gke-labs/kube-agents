@@ -670,7 +670,8 @@ class CaseNotesTest(unittest.TestCase):
             "gpu-stress-test-diagnosis",
         ):
             self.assertIn(name, notes)
-        self.assertEqual(notes["compliance-rbac-overgrant"]["issues"], ["#998", "#985"])
+        self.assertEqual(notes["compliance-rbac-overgrant"]["issues"], ["#998", "#985", "#1171"])
+        self.assertEqual(notes["compliance-rbac-overgrant"]["badge"], "held-out")
         self.assertEqual(notes["capacity-pinned-pool-probe"]["badge"], "held-out")
         self.assertEqual(notes["security-overgrant-remediation-proposal"]["badge"], "new")
 
