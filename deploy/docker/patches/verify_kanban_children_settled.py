@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 from pathlib import Path
@@ -73,14 +74,20 @@ def status(task_id):
 
 
 def attributed_to(task_id):
-    return [
-        r[0]
-        for r in conn.execute(
-            f"SELECT child_id FROM {kcs.CHILDREN_TABLE} WHERE creator_id = ? "
-            "ORDER BY child_id",
-            (task_id,),
-        ).fetchall()
-    ]
+    # The attribution table is created by the first worker write, so a fresh
+    # board legitimately has no table yet — exactly the fail-open state the
+    # gate must treat as "no children".
+    try:
+        return [
+            r[0]
+            for r in conn.execute(
+                f"SELECT child_id FROM {kcs.CHILDREN_TABLE} WHERE creator_id = ? "
+                "ORDER BY child_id",
+                (task_id,),
+            ).fetchall()
+        ]
+    except sqlite3.OperationalError:
+        return []
 
 
 def tool_complete(result=RECEIPT):

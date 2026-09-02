@@ -20,7 +20,7 @@ Two communication channels, with different shapes and different reliability requ
 | Channel                           | Direction          | Shape                                   | Mechanism                                                            |
 | --------------------------------- | ------------------ | --------------------------------------- | -------------------------------------------------------------------- |
 | **Structured handover (primary)** | cluster → platform | continuous status (latest-wins, typed)  | files under `/opt/data/fleet/…`, written via a `write_handover` tool |
-| **Task delegation (optional)**    | platform → cluster | discrete work items (lifecycle, fan-out) | Hermes kanban board                                                  |
+| **Task delegation (optional)**    | platform → cluster | discrete work items (lifecycle/fan-out) | Hermes kanban board                                                  |
 
 **Guiding principles**
 
