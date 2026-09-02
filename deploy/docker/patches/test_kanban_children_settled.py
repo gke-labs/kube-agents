@@ -36,7 +36,7 @@ RECEIPT = (
 # own table is deliberately absent: the module creates it on first write, and
 # a board that predates the patch must read as "no children" (fail-open).
 BOARD_SCHEMA = """
-CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, status TEXT);
+CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, status TEXT, result TEXT);
 CREATE TABLE IF NOT EXISTS task_links (
     parent_id TEXT NOT NULL,
     child_id  TEXT NOT NULL,
@@ -49,13 +49,15 @@ def board(path):
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     conn.executescript(BOARD_SCHEMA)
-    conn.execute("INSERT INTO tasks VALUES (?, 'running')", (DELEGATION_CARD,))
+    conn.execute(
+        "INSERT INTO tasks VALUES (?, 'running', NULL)", (DELEGATION_CARD,)
+    )
     conn.commit()
     return conn
 
 
 def add_card(conn, task_id, status="running"):
-    conn.execute("INSERT INTO tasks VALUES (?, ?)", (task_id, status))
+    conn.execute("INSERT INTO tasks VALUES (?, ?, NULL)", (task_id, status))
     conn.commit()
 
 
@@ -79,10 +81,16 @@ class Fixture(unittest.TestCase):
         kcs._refused_at.clear()
         self.addCleanup(kcs._refused_at.clear)
 
-    def gate(self, task_id=DELEGATION_CARD):
+    def gate(self, task_id=DELEGATION_CARD, result=None):
         return require_children_settled(
-            task_id, lambda: sqlite3.connect(self.path)
+            task_id, lambda: sqlite3.connect(self.path), result
         )
+
+    def stored_result(self, task_id=DELEGATION_CARD):
+        row = self.conn.execute(
+            "SELECT result FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        return row[0]
 
 
 class TestTheIncidentShape(Fixture):
@@ -119,6 +127,64 @@ class TestTheIncidentShape(Fixture):
 
     def test_a_card_with_no_children_is_untouched(self):
         self.assertIsNone(self.gate())
+
+
+class TestTheRefusalPreservesTheSubmission(Fixture):
+    """A refusal that returns before ``kb.complete_task`` writes nothing, so
+    the refused ``result`` would otherwise exist only in the worker's context
+    — the report-losing bug kanban_result_required's deleted shape check
+    documents. This gate stashes the submission on the card before refusing,
+    and accepts rather than refuse when it cannot."""
+
+    def test_the_refused_result_is_stashed_on_the_card(self):
+        spawn(self.conn, "t_kid")
+        self.assertIsNotNone(self.gate(result=RECEIPT))
+        self.assertEqual(self.stored_result(), RECEIPT)
+
+    def test_the_card_stays_open_around_the_stash(self):
+        spawn(self.conn, "t_kid")
+        self.gate(result=RECEIPT)
+        row = self.conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (DELEGATION_CARD,)
+        ).fetchone()
+        self.assertEqual(row[0], "running")
+
+    def test_the_refusal_says_the_submission_was_saved(self):
+        spawn(self.conn, "t_kid")
+        err = self.gate(result=RECEIPT)
+        self.assertIn("saved on this card", err)
+
+    def test_a_newer_submission_overwrites_an_older_stash(self):
+        spawn(self.conn, "t_kid")
+        self.gate(result="first draft")
+        kcs._refused_at.clear()  # a fresh attempt window
+        self.gate(result="second draft")
+        self.assertEqual(self.stored_result(), "second draft")
+
+    def test_a_blank_submission_stashes_nothing(self):
+        spawn(self.conn, "t_kid")
+        self.assertIsNotNone(self.gate(result="   "))
+        self.assertIsNone(self.stored_result())
+
+    def test_a_board_that_cannot_take_the_stash_is_not_refused(self):
+        """Read-only board: the children query succeeds, the preserving write
+        cannot — so the completion is accepted rather than refused, because a
+        refusal that has not preserved the text risks losing it."""
+        spawn(self.conn, "t_kid")
+        ro = lambda: sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+        self.assertIsNone(
+            require_children_settled(DELEGATION_CARD, ro, RECEIPT)
+        )
+        self.assertIsNone(self.stored_result())
+
+    def test_a_failed_stash_does_not_spend_the_nudge(self):
+        """The accepted-on-stash-failure completion left no refusal on file,
+        so a later attempt on a writable board still gets its nudge."""
+        spawn(self.conn, "t_kid")
+        ro = lambda: sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+        require_children_settled(DELEGATION_CARD, ro, RECEIPT)
+        self.assertEqual(kcs._refused_at, {})
+        self.assertIsNotNone(self.gate(result=RECEIPT))
 
 
 class TestTheContinuationExemption(Fixture):
@@ -344,7 +410,7 @@ class TestTheApplier(unittest.TestCase):
     def test_both_hooks_land_and_the_file_still_parses(self):
         self.applier.apply(self.tmp)
         out = self.patched()
-        self.assertIn("_require_children_settled(tid, _kanban_children_connect)", out)
+        self.assertIn("tid, _kanban_children_connect, result", out)
         self.assertIn("_kanban_record_worker_child(conn, new_tid)", out)
         self.assertIn("from tools.kanban_children_settled import", out)
         import ast

@@ -134,7 +134,12 @@ check("the card is still open", status(parent) != "done", f"status={status(paren
 stored = conn.execute(
     "SELECT COALESCE(result, '') FROM tasks WHERE id = ?", (parent,)
 ).fetchone()[0]
-check("nothing was stored as the answer", stored == "", f"result={stored!r}")
+check(
+    "the refusal preserved the submitted result on the still-open card",
+    stored == RECEIPT,
+    f"result={stored!r}",
+)
+check("the refusal says the submission was saved", "saved on this card" in refused)
 
 # --- 4. Never a wedge ----------------------------------------------------------
 retry = tool_complete()

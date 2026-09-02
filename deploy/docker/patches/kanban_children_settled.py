@@ -69,15 +69,33 @@ into a stuck card. The deliberate cost: a worker that ignores the nudge and
 resubmits its receipt unchanged ships the receipt, exactly as before the
 patch.
 
+A refusal never destroys the submitted text
+-------------------------------------------
+``kanban_result_required``'s module docstring records why its shape check was
+deleted: a refusal that returns before ``kb.complete_task`` writes nothing,
+so if the run ends between the refusal and the retry — a turn limit, a
+cancellation — the only copy of the report dies with the worker's context.
+This gate's window is wider than that one's was (the instruction is to poll
+children for minutes, not to reformat), so it pays for its refusal up front:
+the submitted ``result`` is stashed onto the card's ``result`` column, status
+untouched, **before** the refusal is returned, and if that write fails the
+completion is accepted instead — the gate refuses only when it has preserved
+what it is refusing. A run that dies mid-wait therefore leaves the card open
+with the best text available on it, which is strictly no worse than the
+pre-patch behaviour of delivering that text as final; the accepted retry's
+``kb.complete_task`` overwrites the stash with the real answer.
+
 False positives, and why they are cheap
 ---------------------------------------
 A worker can legitimately finish with a real answer while a card it spawned is
 still running — follow-up work it queued for later rather than a piece of this
 card's answer. Queued correctly (``parents=[<this card>]``) it is exempt.
 Queued as a free-running card, the worker pays one nudge: it re-reads its
-answer, resubmits, and the retry is accepted. One extra model turn, bounded by
-the nudge memory. Set against a terminal "finished" message that answers
-nothing — 31% of scored repetitions on the probe above — that trade holds.
+answer, resubmits, and the retry is accepted. One extra model turn — and only
+the turn, because the refused submission is already stashed on the card —
+bounded by the nudge memory. Set against a terminal "finished" message that
+answers nothing — 31% of scored repetitions on the probe above — that trade
+holds.
 
 Fail-open throughout
 --------------------
@@ -98,7 +116,6 @@ from __future__ import annotations
 
 import logging
 import os
-import sqlite3
 import time
 
 logger = logging.getLogger(__name__)
@@ -184,6 +201,9 @@ REFUSAL_INSTRUCTIONS = (
     "If a child is blocked or keeps failing, escalate with "
     "kanban_block(kind=\"needs_input\") naming it, or complete with the "
     "answer you have and say plainly which part is missing and why. "
+    "The `result` you just submitted has been saved on this card in the "
+    "meantime, so it is not lost — but pass the full final text to "
+    "kanban_complete again when you finish. "
     "(A follow-up card created with parents=[<this card id>] is exempt — it "
     "is queued to run after you finish and does not carry this card's "
     "answer.)"
@@ -254,12 +274,34 @@ def _format_refusal(children: list[tuple[str, str]]) -> str:
     )
 
 
-def require_children_settled(task_id, connect) -> str | None:
+def _stash_submitted_result(conn, task_id: str, result) -> None:
+    """Preserve a refused completion's ``result`` on the card, status untouched.
+
+    Raises on failure — the caller answers a failed stash by accepting the
+    completion, because a refusal that has not preserved what it refuses is
+    the report-losing bug ``kanban_result_required``'s module docstring
+    documents. A blank submission stashes nothing (there is nothing to lose).
+    The accepted retry's ``kb.complete_task`` overwrites whatever is stashed.
+    """
+    text = "" if result is None else str(result)
+    if not text.strip():
+        return
+    conn.execute(
+        "UPDATE tasks SET result = ? WHERE id = ?", (text, task_id)
+    )
+    if getattr(conn, "in_transaction", False):
+        conn.commit()
+
+
+def require_children_settled(task_id, connect, result=None) -> str | None:
     """The completion gate. ``None`` when the completion may proceed.
 
     ``connect`` is ``hermes_cli.kanban_db.connect`` (injected by the applier's
     import trailer; injected so this module imports cleanly outside the
-    image). The connection it returns is closed here.
+    image). The connection it returns is closed here. ``result`` is the
+    completion's submitted result, passed so a refusal can preserve it on the
+    card first — a refusal that cannot is not issued (see
+    :func:`_stash_submitted_result`).
 
     Refused at most once per :data:`NUDGE_TTL_SECONDS` per card; the retry is
     accepted whatever the board says (see the module docstring on never
@@ -269,7 +311,7 @@ def require_children_settled(task_id, connect) -> str | None:
     is bounded — each gate spends at most one nudge per gate per window, so a
     worker refused by both closes on its fourth call at worst — and it still
     cannot wedge. Fails open on any error: only a positive "live children
-    exist" read refuses.
+    exist" read, with the submitted result already stashed, refuses.
     """
     key = str(task_id or "").strip()
     if not key:
@@ -282,34 +324,36 @@ def require_children_settled(task_id, connect) -> str | None:
         and time.monotonic() - refused_at <= NUDGE_TTL_SECONDS
     )
 
-    conn = None
     try:
         conn = connect()
-        rows = conn.execute(_LIVE_CHILDREN_SQL, (key,)).fetchall()
-        children = [(str(r[0]), str(r[1])) for r in rows]
-    except Exception as exc:  # noqa: BLE001 — advisory read, never block
-        logger.warning(
-            "kanban_children_settled: could not check %s's children "
-            "(allowing the completion): %r",
-            key, exc,
-        )
-        return None
-    finally:
-        if conn is not None:
+        try:
+            rows = conn.execute(_LIVE_CHILDREN_SQL, (key,)).fetchall()
+            children = [(str(r[0]), str(r[1])) for r in rows]
+            if not children:
+                return None
+            if nudge_spent:
+                logger.warning(
+                    "kanban_children_settled: %s is completing over %d live "
+                    "child(ren) on its retry; letting it close rather than "
+                    "wedge the card",
+                    key, len(children),
+                )
+                return None
+            # The point of no return: nothing is refused until the submitted
+            # text is safe on the board.
+            _stash_submitted_result(conn, key, result)
+        finally:
             try:
                 conn.close()
             except Exception:  # noqa: BLE001
                 pass
-
-    if not children:
-        return None
-    if nudge_spent:
+    except Exception as exc:  # noqa: BLE001 — advisory gate, never block
         logger.warning(
-            "kanban_children_settled: %s is completing over %d live "
-            "child(ren) on its retry; letting it close rather than wedge "
-            "the card",
-            key, len(children),
+            "kanban_children_settled: could not check %s's children or "
+            "preserve its submitted result (allowing the completion): %r",
+            key, exc,
         )
         return None
+
     _refused_at[key] = time.monotonic()
     return _format_refusal(children)

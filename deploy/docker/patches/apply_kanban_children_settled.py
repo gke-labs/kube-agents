@@ -69,8 +69,11 @@ CREATE_HOOK = CREATE_ANCHOR + (
 COMPLETE_GATE = (
     "    # kube-agents patch: completing IS the delivery, and a card whose\n"
     "    # fanned-out children are still running has no answer to deliver yet.\n"
-    "    # See tools/kanban_children_settled.py (issue #1010).\n"
-    "    _children_err = _require_children_settled(tid, _kanban_children_connect)\n"
+    "    # The submitted result rides along so a refusal preserves it on the\n"
+    "    # card first. See tools/kanban_children_settled.py (issue #1010).\n"
+    "    _children_err = _require_children_settled(\n"
+    "        tid, _kanban_children_connect, result\n"
+    "    )\n"
     "    if _children_err:\n"
     "        return tool_error(_children_err)\n"
 )
@@ -98,7 +101,7 @@ def apply(root: Path) -> None:
     # than stack second hooks and a second trailer import.
     patch.refuse_if_patched(
         "_kanban_record_worker_child(conn, new_tid)",
-        "_require_children_settled(tid, _kanban_children_connect)",
+        "_require_children_settled(",
     )
     patch.substitute(CREATE_ANCHOR, CREATE_HOOK, label="create attribution hook")
     patch.substitute(
