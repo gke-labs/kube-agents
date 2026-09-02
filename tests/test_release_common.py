@@ -20,6 +20,7 @@ from tests.testing.common import (
     MOCK_DEFAULT_RELEASE_REPO,
     TRUTHY_BOOLEAN_INPUTS,
     VALID_GA_RELEASE_TAGS,
+    create_minimal_tools_bin,
     create_mock_git_repo,
     get_isolated_test_env,
 )
@@ -845,14 +846,21 @@ class RegistryImageProbeTest(unittest.TestCase):
     _REPOSITORY_PATH = "gke-labs/kube-agents/platform-agent"
     _DIGEST = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
 
-    def _run(self, func_call, bin_dir, env=None):
-        """common.sh sourced with PATH pinned to bin_dir plus the base utilities.
+    def _bin(self, tmp):
+        """A PATH holding the base utilities, symlinked, and no docker.
 
-        Pinned rather than prepended: this suite is about what happens when
-        docker is ABSENT, and a developer laptop with Docker Desktop installed
-        would otherwise find it further down the inherited PATH.
+        Most of this suite is about what happens when docker is ABSENT, so the
+        binary has to be absent from PATH rather than merely shadowed. Naming
+        system directories does not achieve that: `ubuntu-latest` ships docker
+        at `/usr/bin/docker`, which put the real binary in front of six of
+        these cases and let them pass on a laptop with no docker installed
+        while failing in CI.
         """
-        overrides = {"PATH": f"{bin_dir}:/usr/bin:/bin"}
+        return create_minimal_tools_bin(tmp)
+
+    def _run(self, func_call, bin_dir, env=None):
+        """common.sh sourced with PATH pinned to bin_dir, and nothing else."""
+        overrides = {"PATH": str(bin_dir)}
         overrides.update(env or {})
         return subprocess.run(
             ["bash", "-c", f'source "{_COMMON_SH}"\n{func_call}'],
@@ -864,37 +872,42 @@ class RegistryImageProbeTest(unittest.TestCase):
 
     def test_docker_is_used_when_it_is_there(self):
         with tempfile.TemporaryDirectory() as tmp:
-            create_mock_docker_binary(tmp, existing_images=[self._IMAGE])
-            found = self._run(f'registry_image_exists "{self._IMAGE}"', tmp)
+            bin_dir = self._bin(tmp)
+            create_mock_docker_binary(bin_dir, existing_images=[self._IMAGE])
+            found = self._run(f'registry_image_exists "{self._IMAGE}"', bin_dir)
             self.assertEqual(found.returncode, 0, found.stderr)
-            missing = self._run(f'registry_image_exists "{self._IMAGE}x"', tmp)
+            missing = self._run(f'registry_image_exists "{self._IMAGE}x"', bin_dir)
             self.assertNotEqual(missing.returncode, 0)
 
     def test_a_published_image_is_found_without_docker(self):
         with tempfile.TemporaryDirectory() as tmp:
-            create_mock_ghcr_curl_binary(tmp)
-            proc = self._run(f'registry_image_exists "{self._IMAGE}"', tmp)
+            bin_dir = self._bin(tmp)
+            create_mock_ghcr_curl_binary(bin_dir)
+            proc = self._run(f'registry_image_exists "{self._IMAGE}"', bin_dir)
             self.assertEqual(proc.returncode, 0, proc.stderr)
 
     def test_an_unpublished_image_is_still_missing_without_docker(self):
         """The fallback must not turn into an unconditional yes."""
         with tempfile.TemporaryDirectory() as tmp:
-            create_mock_ghcr_curl_binary(tmp, manifest_status=1)
-            proc = self._run(f'registry_image_exists "{self._IMAGE}"', tmp)
+            bin_dir = self._bin(tmp)
+            create_mock_ghcr_curl_binary(bin_dir, manifest_status=1)
+            proc = self._run(f'registry_image_exists "{self._IMAGE}"', bin_dir)
             self.assertNotEqual(proc.returncode, 0)
 
     def test_an_unauthenticated_registry_is_missing_rather_than_present(self):
         with tempfile.TemporaryDirectory() as tmp:
-            create_mock_ghcr_curl_binary(tmp, token_response="")
-            proc = self._run(f'registry_image_exists "{self._IMAGE}"', tmp)
+            bin_dir = self._bin(tmp)
+            create_mock_ghcr_curl_binary(bin_dir, token_response="")
+            proc = self._run(f'registry_image_exists "{self._IMAGE}"', bin_dir)
             self.assertNotEqual(proc.returncode, 0)
 
     def test_another_registry_without_docker_says_why(self):
         """Reporting "missing" for a registry the fallback cannot query is a
         lie about the image. It still fails, but it must say what it is."""
         with tempfile.TemporaryDirectory() as tmp:
-            create_mock_ghcr_curl_binary(tmp)
-            proc = self._run(f'registry_image_exists "{self._FOREIGN_IMAGE}"', tmp)
+            bin_dir = self._bin(tmp)
+            create_mock_ghcr_curl_binary(bin_dir)
+            proc = self._run(f'registry_image_exists "{self._FOREIGN_IMAGE}"', bin_dir)
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn("no docker on PATH", proc.stderr)
 
@@ -910,8 +923,9 @@ class RegistryImageProbeTest(unittest.TestCase):
         thing. Asserting only the exit code leaves both the URL and the header
         free to be anything, so this reads the request the mock recorded."""
         with tempfile.TemporaryDirectory() as tmp:
-            _, log_path = create_mock_ghcr_curl_binary(tmp)
-            proc = self._run(f'registry_image_exists "{self._IMAGE}"', tmp)
+            bin_dir = self._bin(tmp)
+            _, log_path = create_mock_ghcr_curl_binary(bin_dir)
+            proc = self._run(f'registry_image_exists "{self._IMAGE}"', bin_dir)
             self.assertEqual(proc.returncode, 0, proc.stderr)
 
             probe = self._manifest_probe(pathlib.Path(log_path))
@@ -933,9 +947,10 @@ class RegistryImageProbeTest(unittest.TestCase):
         has to accept it too — splitting it on the last colon would ask for a
         repository named `…@sha256` and a tag of hex."""
         with tempfile.TemporaryDirectory() as tmp:
-            _, log_path = create_mock_ghcr_curl_binary(tmp)
+            bin_dir = self._bin(tmp)
+            _, log_path = create_mock_ghcr_curl_binary(bin_dir)
             image = f"{MOCK_DEFAULT_REGISTRY_PREFIX}/platform-agent@{self._DIGEST}"
-            proc = self._run(f'registry_image_exists "{image}"', tmp)
+            proc = self._run(f'registry_image_exists "{image}"', bin_dir)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn(
                 f"https://ghcr.io/v2/{self._REPOSITORY_PATH}/manifests/{self._DIGEST}",
@@ -946,9 +961,10 @@ class RegistryImageProbeTest(unittest.TestCase):
         """No tag and no digest means `latest` to a registry. Left unhandled it
         becomes an empty reference and a URL ending in `/manifests/`."""
         with tempfile.TemporaryDirectory() as tmp:
-            _, log_path = create_mock_ghcr_curl_binary(tmp)
+            bin_dir = self._bin(tmp)
+            _, log_path = create_mock_ghcr_curl_binary(bin_dir)
             image = f"{MOCK_DEFAULT_REGISTRY_PREFIX}/platform-agent"
-            proc = self._run(f'registry_image_exists "{image}"', tmp)
+            proc = self._run(f'registry_image_exists "{image}"', bin_dir)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn(
                 f"https://ghcr.io/v2/{self._REPOSITORY_PATH}/manifests/latest",
@@ -958,10 +974,11 @@ class RegistryImageProbeTest(unittest.TestCase):
     def test_the_commit_check_stops_reporting_a_publish_outage(self):
         """The regression the guard exists for, at the level callers use."""
         with tempfile.TemporaryDirectory() as tmp:
-            create_mock_ghcr_curl_binary(tmp)
+            bin_dir = self._bin(tmp)
+            create_mock_ghcr_curl_binary(bin_dir)
             proc = self._run(
                 f'check_commit_images_exist "{MOCK_SAMPLE_COMMIT_SHA}"',
-                tmp,
+                bin_dir,
                 env={"REGISTRY_PREFIX": MOCK_DEFAULT_REGISTRY_PREFIX},
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
