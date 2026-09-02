@@ -1252,6 +1252,14 @@ print(m.group(1).strip('\'\"') if m else '')
 #     collapse is the environment's, not the diff's. Enters when #1171's
 #     re-admission bar holds: delegation fixed and a clean 3-day graded
 #     record.
+#   rca-remediation-pr                    -- #1189: demoted 2026-09-02
+#     evening after rung-4 collapses on six unrelated pull requests in
+#     one day. The suite's longest delegation chain, so it integrates
+#     over every environment fault in its window: the #1097 429 storms,
+#     the #1144 proxy EACCES (fix #1183), and #1184's gap (infra-blocked
+#     repetitions graded rather than classified) turn one dirty window
+#     into a correlated collapse. Its own record was 12/13 clean before
+#     the storms. Enters when #1189's re-admission bar holds.
 #
 # If an admitted case reds a pull request its diff cannot explain on a
 # graded failure, demote it here and reference its issue. Demotion is a
@@ -1266,7 +1274,7 @@ print(m.group(1).strip('\'\"') if m else '')
 # agent-kanban-smoke earned its seat back after the 08-27 redesign (a real
 # SRE question graded on kanban_create plus cluster names); the reds that
 # once argued for un-arming it belonged to the old vocabulary check.
-export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,rca-remediation-pr,cluster-agent-crashloop-debug,cluster-agent-crashloop-misleading-symptom,cluster-agent-crashloop-evidence-chain,gpu-stress-test-diagnosis,agent-kanban-smoke}"
+export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,cluster-agent-crashloop-debug,cluster-agent-crashloop-misleading-symptom,cluster-agent-crashloop-evidence-chain,gpu-stress-test-diagnosis,agent-kanban-smoke}"
 
 # Where the evidence itself lives. Unset means bench/baselines/ in the
 # checkout: hermetic, no credential, no network -- and no way for this job to
