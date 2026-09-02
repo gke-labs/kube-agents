@@ -66,6 +66,7 @@ def _clean_env(monkeypatch):
     """The gate reads the environment; CI's must not leak into a test."""
     for name in (
         "BOOTSTRAP_ADMITTED",
+        "EVAL_TASK_SELECTION",
         "JUDGE_MODEL",
         "DETERMINISTIC_CORRECTNESS_FLOOR",
         "EVAL_AGGREGATE_MARGIN",
@@ -347,6 +348,50 @@ def test_a_red_suite_exits_one(tmp_path, capsys):
     assert main(["suite", "--case-result", str(path)]) == 1
     printed = capsys.readouterr().out
     assert "**RED**" in printed and "### Why it is red" in printed
+
+
+def test_auto_selection_that_dropped_the_armed_case_reds_the_suite(tmp_path, capsys, monkeypatch):
+    """The backstop for the selection floor: under automatic selection, an
+    armed case the run failed to grade plus zero admitted cases means the
+    filter dropped the only thing that could block -- a wiring bug, not a
+    judgment call. The red rides in the verdict itself, so the markdown and
+    the JSON artifact agree with the exit code."""
+    monkeypatch.setenv("EVAL_TASK_SELECTION", "auto")
+    monkeypatch.setenv("BOOTSTRAP_ADMITTED", "floor-case")
+    path = case_file(tmp_path, "a", admitted=False)
+    out_json = tmp_path / "verdict.json"
+    rc = main(["suite", "--case-result", str(path), "--json-out", str(out_json)])
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "selection dropped floor-case" in captured.err
+    assert "**RED**" in captured.out and "dropped every case the gate arms on" in captured.out
+    assert json.loads(out_json.read_text())["green"] is False
+
+
+def test_auto_selection_with_an_admitted_case_grades_normally(tmp_path, capsys, monkeypatch):
+    monkeypatch.setenv("EVAL_TASK_SELECTION", "auto")
+    assert main(["suite", "--case-result", str(case_file(tmp_path, "a"))]) == 0
+    assert "dropped every case" not in capsys.readouterr().out
+
+
+def test_a_zero_admitted_run_whose_armed_case_was_graded_stays_advisory(tmp_path, capsys, monkeypatch):
+    """The store-outage shape: everything de-admitted but nothing dropped.
+    _load_store's own comment says an unreachable store must degrade, not
+    red, and the backstop must not reintroduce that failure mode."""
+    monkeypatch.setenv("EVAL_TASK_SELECTION", "auto")
+    monkeypatch.setenv("BOOTSTRAP_ADMITTED", "a")
+    assert main(["suite", "--case-result", str(case_file(tmp_path, "a", admitted=False))]) == 0
+
+
+def test_shadow_selection_keeps_the_warning_only_behaviour(tmp_path, capsys, monkeypatch):
+    """Outside auto, a dropped armed case stays a warning: a human commented
+    the case out, or selection is only shadow-logging."""
+    monkeypatch.setenv("EVAL_TASK_SELECTION", "shadow")
+    monkeypatch.setenv("BOOTSTRAP_ADMITTED", "floor-case")
+    assert main(["suite", "--case-result", str(case_file(tmp_path, "a", admitted=False))]) == 0
+    assert "names no graded case" in capsys.readouterr().out
+    monkeypatch.delenv("EVAL_TASK_SELECTION")
+    assert main(["suite", "--case-result", str(case_file(tmp_path, "b", admitted=False))]) == 0
 
 
 def test_a_missing_case_result_reds_the_suite(tmp_path, capsys):

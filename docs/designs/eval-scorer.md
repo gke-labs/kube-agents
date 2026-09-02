@@ -905,6 +905,17 @@ in the markdown verdict. It is a warning rather than a red: the list is also leg
 to name a case that is deactivated in the `TASKS` array or skipped on a given run, and redding for
 that would make the bridge harder to hold than the thing it bridges.
 
+**The exception is automatic task selection.** Under `EVAL_TASK_SELECTION=auto` (the change-based
+selector of `hack/eval_triggers.yaml`), "legitimately skipped" stops applying: the filter is a
+program running on every pull request, and a subset that dropped every case the gate arms on
+grades a suite in which nothing can reach a blocking rung — a disarmed gate reporting green,
+invisible in shadow logs because they record picks, not armament. The selection floor is what
+keeps an admitted case in every subset; `bench-gate suite` backstops it by folding a red into the
+verdict when selection ran in `auto`, an armed case went ungraded, and nothing graded was
+admitted. The trigger is the ungraded armed case, not "zero admitted" alone — a store outage or
+stale evidence also de-admits everything with the floor intact, and those must keep degrading to
+advisory rather than redding every open pull request.
+
 ## How "judged scores below main's baseline" is determined
 
 This is rung 6, and it is the only place in the ladder where "it technically passed but got worse"
