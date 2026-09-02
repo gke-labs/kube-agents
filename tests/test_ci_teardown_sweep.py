@@ -61,10 +61,18 @@ _SELECTOR = "app.kubernetes.io/part-of=kube-agents"
 
 
 def _teardown_steps():
+    """The lifted steps, prefixed with the file-head `readonly` constants.
+
+    The no-magic-constants rule declares names at the top of the file, above
+    _STEPS_START, so the lift carries them along or `set -u` kills the run.
+    """
     text = _CI_TEARDOWN.read_text(encoding="utf-8")
     start = text.find(_STEPS_START)
     assert start != -1, f"{_STEPS_START!r} not found in hack/ci-teardown.sh"
-    return text[start:]
+    constants = "\n".join(
+        line for line in text[:start].splitlines() if line.startswith("readonly ")
+    )
+    return constants + "\n" + text[start:]
 
 
 class CiTeardownSweepTest(unittest.TestCase):

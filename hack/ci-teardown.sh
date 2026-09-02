@@ -16,6 +16,23 @@
 
 set -uo pipefail
 
+# The release ci-deploy.sh installs; Step 1 uninstalls it and, when that
+# fails, falls back on deleting its record Secrets by the label pair Helm
+# stamps on every record it writes (`owner=helm` plus `name=<release>`) —
+# selecting every revision's record of this release and nothing else in the
+# namespace (#1172).
+readonly HELM_RELEASE_NAME="kube-agents"
+readonly HELM_RELEASE_SECRET_SELECTOR="owner=helm,name=${HELM_RELEASE_NAME}"
+# Bounds the uninstall's --wait; generous because the chart's pre-delete hook
+# waits for the operator to clear the PlatformAgent finalizer.
+readonly RELEASE_UNINSTALL_TIMEOUT="10m"
+# What a healthy revision looks like in `helm history -o json` (the encoder
+# emits compact `"status":"deployed"`; the pattern tolerates spacing so a
+# Helm formatting change cannot silently blind the fallback's check), and the
+# name prefix `kubectl delete -o name` prints per deleted Secret.
+readonly HELM_DEPLOYED_STATUS_RE='"status"[[:space:]]*:[[:space:]]*"deployed"'
+readonly SECRET_NAME_PREFIX_RE='^secret/'
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
@@ -56,7 +73,40 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 1: Uninstalling the kube-agent
 # The chart's pre-delete hook removes the PlatformAgent CR and waits for the
 # operator to clear its finalizer, so one uninstall replaces the old
 # per-step teardown scripts (09 LiteLLM, 08 CR, 07 secrets, 03 operator).
-helm uninstall kube-agents -n "${NAMESPACE}" --wait --timeout 10m || true
+#
+# When the uninstall fails and no revision is deployed, fall back to
+# deleting the release-record Secrets directly (#1172). Teardown never
+# deletes the namespace, so a no-deployed-revision record that survives here
+# greets the project's next lease as `UPGRADE FAILED: "kube-agents" has no
+# deployed releases` at ci-deploy.sh's `helm upgrade --install` — and the
+# poisoned run's own teardown cannot remove it either, so the state is
+# self-sustaining until something drops the record. Step 3's sweep already
+# handles the cluster-scoped objects the release owned, so this strands
+# nothing a failed uninstall was not going to strand anyway.
+#
+# The deployed-revision gate is what makes the fallback safe on a *healthy*
+# release whose uninstall failed transiently (pre-delete hook stuck, --wait
+# past the timeout): its record is exactly what lets the next lease take the
+# clean upgrade path over the surviving objects, so it stays. With no
+# deployed revision the record is pure poison, and a probe that itself
+# fails loses nothing — the delete is --ignore-not-found against a record
+# that, if it exists at all, is already unusable. Same discipline as the
+# rest of the file: nothing here may change the teardown's exit code, and
+# the fallback logs what it deleted so a red run's artifacts show the heal
+# happened.
+if ! helm uninstall "${HELM_RELEASE_NAME}" -n "${NAMESPACE}" --wait --timeout "${RELEASE_UNINSTALL_TIMEOUT}"; then
+  if RELEASE_HISTORY_JSON="$(helm history "${HELM_RELEASE_NAME}" -n "${NAMESPACE}" -o json 2>/dev/null)" \
+    && grep -Eq "${HELM_DEPLOYED_STATUS_RE}" <<<"${RELEASE_HISTORY_JSON}"; then
+    echo "WARNING: helm uninstall failed with a deployed revision still recorded; leaving the release record for the next lease to upgrade over (#1172)"
+  else
+    echo "WARNING: helm uninstall failed with no deployed revision; removing any release record left behind so the next lease starts clean (#1172)"
+    RECORD_SECRETS_DELETED="$(kubectl delete secret -n "${NAMESPACE}" \
+      -l "${HELM_RELEASE_SECRET_SELECTOR}" --ignore-not-found -o name)" || true
+    RECORD_SECRETS_COUNT="$(printf '%s\n' "${RECORD_SECRETS_DELETED}" | grep -c "${SECRET_NAME_PREFIX_RE}")" || true
+    echo "${RECORD_SECRETS_DELETED}"
+    echo "✓ Release-record fallback deleted ${RECORD_SECRETS_COUNT} Helm record Secret(s)"
+  fi
+fi
 echo "✓ Release uninstall finished in $((SECONDS - STEP_START))s"
 
 STEP_START=$SECONDS
@@ -89,8 +139,9 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 3: Sweeping cluster-scoped kub
 # (ValidatingAdmissionPolicy needs 1.30+) or one flaky delete must not stop
 # the sweep of the kinds that do exist, and nothing here may change the
 # teardown's exit code. This block must stay reachable on every path through
-# the script — steps before it end in `|| true` and there is no `set -e`; the
-# only early exits are the two must-not-delete-the-wrong-cluster guards above.
+# the script — steps before it end in `|| true` or run as `if` conditions,
+# and there is no `set -e`; the only early exits are the two
+# must-not-delete-the-wrong-cluster guards above.
 SWEEP_SELECTOR="app.kubernetes.io/part-of=kube-agents"
 SWEEP_KINDS=(
   validatingadmissionpolicies.admissionregistration.k8s.io
