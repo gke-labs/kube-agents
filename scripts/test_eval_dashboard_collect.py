@@ -289,6 +289,14 @@ class TestMergeWithPrior(_MergeBase):
         self.assertEqual(merged["cases"], baseline["cases"])
         self.assertEqual(merged["schema_version"], 1)
 
+    def test_stale_after_s_is_written_only_when_asked(self):
+        """The publisher owns the freshness contract; a plain collect stays
+        silent so the renderer's default applies."""
+        plain = collect.collect(from_dir=TESTDATA)
+        self.assertNotIn("stale_after_s", plain)
+        tuned = collect.collect(from_dir=TESTDATA, stale_after_s=2400)
+        self.assertEqual(tuned["stale_after_s"], 2400)
+
     def test_fresh_parse_wins_over_a_stale_prior_copy(self):
         stale = collect.collect(from_dir=TESTDATA)
         for run in stale["runs"]:

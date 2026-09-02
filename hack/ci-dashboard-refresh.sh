@@ -43,6 +43,8 @@
 #   EVAL_DASHBOARD_PR_GLOB     Prow build-dir glob(s) for collect.py; default
 #                              below is the smoke-test presubmit's archive.
 #   EVAL_DASHBOARD_SINCE_DAYS  sweep bound when no usable prior data exists
+#   EVAL_DASHBOARD_STALE_AFTER_S  freshness-badge threshold written into
+#                              data.json (default 2400 = 15m cadence x ~2.5)
 #                              (default 14).
 #   EVAL_DASHBOARD_TIMEOUT     whole-pipeline budget in seconds (default 900).
 #   EVAL_DASHBOARD_FROM_DIR    local build-dir source instead of the GCS glob
@@ -104,6 +106,11 @@ trap 'exit 143' TERM INT
 
 EVAL_DASHBOARD_PR_GLOB="${EVAL_DASHBOARD_PR_GLOB:-gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*}"
 EVAL_DASHBOARD_SINCE_DAYS="${EVAL_DASHBOARD_SINCE_DAYS:-14}"
+# Freshness contract with the rendered page: the badge turns amber this many
+# seconds after generated_at. Sized to the periodic's 15m cadence with slack
+# for ~2 missed ticks, so amber means "the refresh job is missing ticks",
+# not ordinary jitter.
+EVAL_DASHBOARD_STALE_AFTER_S="${EVAL_DASHBOARD_STALE_AFTER_S:-2400}"
 
 # ─── Step 1: fetch the currently published data.json (missing is fine) ──────
 # Downloaded here rather than left to collect.py's gs:// --merge-with support
@@ -155,6 +162,7 @@ ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} bash -c '
   python3 "$1/collect.py" "${src_args[@]}" \
     --merge-with "$2/prior-data.json" \
     --since-days "$5" \
+    --stale-after-s "$7" \
     --out "$2/data.json"
   python3 -c "
 import json, sys
@@ -165,6 +173,7 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
   python3 "$1/publish.py" --out-dir "$2/site" --target "$3"
 ' _ "${DASH_SRC}" "${WORK}" "${EVAL_DASHBOARD_TARGET}" "${EVAL_DASHBOARD_PR_GLOB}" \
   "${EVAL_DASHBOARD_SINCE_DAYS}" "${EVAL_DASHBOARD_FROM_DIR:-}" \
+  "${EVAL_DASHBOARD_STALE_AFTER_S}" \
   >>"${REFRESH_LOG}" 2>&1 || rc=$?
 
 # The full stage log always goes to stdout too: on a periodic, the build log

@@ -576,6 +576,7 @@ def collect(
     merge_with: str | None = None,
     since_days: float | None = None,
     now: datetime | None = None,
+    stale_after_s: int | None = None,
 ) -> dict:
     prior: list[dict] = []
     after_build = None
@@ -616,7 +617,7 @@ def collect(
             file=sys.stderr,
         )
     runs = merge_runs(prior, fresh)
-    return {
+    data = {
         "schema_version": SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source": "logs",
@@ -624,6 +625,12 @@ def collect(
         "cases": build_cases(runs, repo_root),
         "coverage": coverage(repo_root),
     }
+    if stale_after_s is not None:
+        # The renderer's freshness badge trips this many seconds after
+        # generated_at. The publisher sets it to its own cadence with slack,
+        # so the badge means "the refresh job missed ticks", not jitter.
+        data["stale_after_s"] = stale_after_s
+    return data
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -668,6 +675,15 @@ def main(argv: list[str] | None = None) -> int:
         " docs/designs/domains.yaml from",
     )
     parser.add_argument("--gsutil", default="gsutil", help="gsutil binary to invoke")
+    parser.add_argument(
+        "--stale-after-s",
+        type=int,
+        metavar="SECONDS",
+        help="write stale_after_s into data.json: how long after generated_at"
+        " the rendered page's freshness badge turns amber. Set by the refresh"
+        " job to its cadence plus slack; omitted, the renderer's default"
+        " applies",
+    )
     args = parser.parse_args(argv)
 
     if not args.pr_glob and args.from_dir is None and args.merge_with is None:
@@ -680,6 +696,7 @@ def main(argv: list[str] | None = None) -> int:
         gsutil=args.gsutil,
         merge_with=args.merge_with,
         since_days=args.since_days,
+        stale_after_s=args.stale_after_s,
     )
     args.out.write_text(json.dumps(data, indent=2) + "\n")
     print(
