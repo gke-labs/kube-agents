@@ -181,7 +181,7 @@ class SpecToolRegistryTest(unittest.TestCase):
 class DnsPredicateParityTest(unittest.TestCase):
     """The bash and python DNS-endpoint predicates answer alike, case by case.
 
-    `k8s-operator/scripts/gke_dns_endpoint.sh` says "Keep the two predicates
+    `scripts/installer/gke_dns_endpoint.sh` says "Keep the two predicates
     in step" about `agents/platform/scripts/gke_endpoint.py`; this is the
     table that enforces the sentence. Both sides run for real — bash through
     a fake gcloud on PATH, python through its Runner seam.
@@ -239,7 +239,7 @@ class DnsPredicateParityTest(unittest.TestCase):
             )
             fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
             script = (
-                f'source "{REPO_ROOT}/k8s-operator/scripts/gke_dns_endpoint.sh"\n'
+                f'source "{REPO_ROOT}/scripts/installer/gke_dns_endpoint.sh"\n'
                 "gke_dns_endpoint_flag c l p\n"
                 'printf "%s" "$GKE_DNS_ENDPOINT_FLAG"\n'
             )

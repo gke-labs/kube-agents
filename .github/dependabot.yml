@@ -67,31 +67,28 @@ updates:
       - "python"
     commit-message:
       prefix: "ci"
-    # requirements-test.txt holds mcp below 2.0 to match the runtime image,
-    # which ships 1.28.1 from the digest-pinned Hermes base and cannot move:
-    # hermes-agent itself imports mcp.server.fastmcp, the module 2.x deletes.
-    # The full reasoning is on the pin in that file; the ceiling comes off when
-    # the base image ships 2.x (#800). #751 widened the constraint to <3 anyway
-    # and nothing caught it -- the tests fell back to a stub on the failing
-    # import -- so this rule stops Dependabot re-proposing it.
-    # `versions` and not `update-types`: a semver-major comparison needs a
-    # resolved current version, and `mcp<2` is a bare range rather than an `==`
-    # pin, so there is none. That is why #751 arrived titled "update mcp
-    # requirement from <2 to <3" instead of as a version bump.
+    # There is no mcp rule here any more, and its absence is deliberate.
+    # requirements-test.txt used to hold `mcp<2` to match a runtime image on
+    # 1.28.1, and this list carried a `>=2` ignore because #751 widened that
+    # ceiling to <3 and nothing caught it. Hermes v2026.8.19 moved the base to
+    # mcp 2.0.0, hermes-agent's own code and our three servers were ported to
+    # `mcp.server.MCPServer` with it (#800), and the constraint is now a `>=2`
+    # floor. Re-adding the old ignore would pin the package to the 1.x line the
+    # image no longer has. What stops a silent regression now is
+    # agents/platform/scripts/test_mcp_package_contract.py, which fails by name
+    # rather than falling back to a stub.
     #
     # admin_console/requirements.txt caps websockets below 17 because Streamlit
     # does: 1.62.0, the newest release, still requires websockets<17,>=12.0.0.
     # Raising the floor past that cap does not go merely untested -- it makes
     # the file unresolvable. #830 hit it and restored the cap; #1002 proposed
     # `websockets>=17.0.1,<18` anyway and pip answered ResolutionImpossible,
-    # taking the Python unit tests and the coverage job with it. `versions` for
-    # the same reason as mcp: the pin is a bare range, so there is no resolved
-    # version for `update-types` to compare against. Remove this rule and lift
-    # the pin in one change when Streamlit lifts its own.
+    # taking the Python unit tests and the coverage job with it. `versions` and
+    # not `update-types`: a semver-major comparison needs a resolved current
+    # version, and the cap is a bare range rather than an `==` pin, so there is
+    # none. Remove this rule and lift the pin in one change when Streamlit
+    # lifts its own.
     ignore:
-      - dependency-name: "mcp"
-        versions:
-          - ">=2"
       - dependency-name: "websockets"
         versions:
           - ">=17"

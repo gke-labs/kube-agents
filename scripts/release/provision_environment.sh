@@ -24,7 +24,7 @@ teardown_require_inputs
 
 # Half-configured minter: refuse before anything is destroyed.
 #
-# All three of GITHUB_ORG/GITHUB_REPO/GITHUB_APP_ID must be non-empty before
+# All three of GITOPS_ORG/GITOPS_REPO/GITHUB_APP_ID must be non-empty before
 # installer_common.sh provisions the minter at all, and its own "GitHub minter
 # deferred" warning only fires once they are, so one missing value skips the
 # minter in silence.
@@ -44,9 +44,18 @@ teardown_require_inputs
 #
 # Why a value goes missing is in scripts/release/README.md under "Enabling the
 # GitHub token minter on the RC".
+# The deprecated spellings, folded in before the guard rather than after it.
+# installer_common.sh's normalize_gitops_repo_vars does the same thing for the
+# installers, but this check runs before the repository's helpers are sourced --
+# and a half-configured minter passed under the old names has to be caught here
+# too, or the deprecation would quietly disable the guard.
+: "${GITOPS_ORG:=${GITHUB_ORG:-}}"
+: "${GITOPS_REPO:=${GITHUB_REPO:-}}"
+export GITOPS_ORG GITOPS_REPO
+
 GITHUB_MINTER_SET=""
 GITHUB_MINTER_MISSING=""
-for _v in GITHUB_ORG GITHUB_REPO GITHUB_APP_ID; do
+for _v in GITOPS_ORG GITOPS_REPO GITHUB_APP_ID; do
   if [ -n "${!_v:-}" ]; then
     GITHUB_MINTER_SET="${GITHUB_MINTER_SET} ${_v}"
   else
@@ -150,12 +159,12 @@ if [ -n "${USER_PROFILE_ENABLED:-}" ]; then
 fi
 
 # No --gitops-org/--gitops-repo flags here: install.sh already seeds PARAM_GITOPS_ORG
-# and PARAM_GITOPS_REPO from the GITHUB_ORG and GITHUB_REPO this step exports
+# and PARAM_GITOPS_REPO from the GITOPS_ORG and GITOPS_REPO this step exports
 # (the PARAM_GITOPS_* assignments near the top of install.sh), so passing them again
 # would be the same values by a second route. GITHUB_APP_ID is read from the
 # environment the same way. All three unset leaves enable_github_minter false and the
 # install byte-identical to one that never had them (the three-way guard on
-# GITHUB_ORG/GITHUB_REPO/GITHUB_APP_ID in installer_common.sh's write_tfvars_from_state).
+# GITOPS_ORG/GITOPS_REPO/GITHUB_APP_ID in installer_common.sh's write_tfvars_from_state).
 #
 # The half-configured case is refused at the top of this script, above the
 # teardown, so it never reaches here.

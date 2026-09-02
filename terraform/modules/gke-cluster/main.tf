@@ -6,7 +6,7 @@ locals {
 
   # Cloud KMS has no zonal locations, so a zonal cluster location maps to its
   # enclosing region — the same derivation as derive_kms_location in
-  # k8s-operator/scripts/installer_common.sh.
+  # scripts/installer/installer_common.sh.
   kms_location = replace(var.location, "/-[a-z]$/", "")
 }
 
@@ -88,7 +88,7 @@ resource "google_container_cluster" "autopilot" {
   # cluster with only an IP endpoint it cannot route to is unreachable.
   # allow_external_traffic is the field the agent's detection reads before it
   # passes `get-credentials --dns-endpoint`; see
-  # k8s-operator/scripts/gke_dns_endpoint.sh.
+  # scripts/installer/gke_dns_endpoint.sh.
   #
   # Defaults to false, matching GKE's own default and the value every cluster
   # this module already manages is sitting at. The module did not set this block

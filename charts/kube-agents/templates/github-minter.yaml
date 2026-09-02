@@ -17,7 +17,7 @@ the module README for the manual command).
 {{- $clusterName := required "platformAgent.harness.clusterName is required when githubMinter.enabled" .Values.platformAgent.harness.clusterName }}
 {{- /* KMS rings are regional; a zonal cluster location maps to its region —
        the same derivation as derive_kms_location in
-       k8s-operator/scripts/installer_common.sh, so chart and installer name
+       scripts/installer/installer_common.sh, so chart and installer name
        the same ring. */}}
 {{- $kmsLocation := $m.kms.location | default (regexReplaceAll "-[a-z]$" $location "") }}
 {{- $allowedSa := $m.allowedServiceAccount | default (printf "kubeagents-platform-gsa@%s.iam.gserviceaccount.com" $projectId) }}

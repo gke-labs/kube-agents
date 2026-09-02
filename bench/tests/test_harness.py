@@ -622,7 +622,8 @@ def _one_call_response(output: Any, status: str | None = None) -> dict[str, Any]
     [
         ("Error executing tool 'terminal': boom", "error"),  # tool_executor.py
         ("Error executing tool: boom", "error"),  # conversation_loop.py
-        # mcp_tool.py on CallToolResult.isError, and registry.py tool_error()
+        # mcp_tool.py on CallToolResult.is_error (isError before mcp 2.0, and
+        # it still reads both), and registry.py tool_error()
         (json.dumps({"error": "MCP tool returned an error"}), "error"),
         (json.dumps({"error": "bad input", "success": False}), "error"),
         (json.dumps({"success": False, "transcript": ""}), "error"),
@@ -1085,21 +1086,81 @@ def test_non_object_json_becomes_errored_result(stub_agent: _StubAgentServer) ->
     assert "non-object JSON" in result.errors[0]
 
 
-def test_unreachable_endpoint_becomes_errored_result(
+def test_unreachable_endpoint_is_infra_not_an_answer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # A closed port with kubectl missing from PATH: the port-forward attempt
-    # fails fast and surfaces as a known error, not an exception.
+    # fails fast on every retry and gives up as a run class, not an answer.
     monkeypatch.setenv("AGENT_LOCAL_PORT", "1")  # privileged port, never open
     monkeypatch.setenv("PATH", "/nonexistent")
 
     result = KubeAgentsHarness().run("prompt")
 
     assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
     # The spawn failure must travel the harness's own known-error path, not
     # the base class's unexpected-exception safety net: the error names the
     # port-forward rather than a bare FileNotFoundError traceback.
     assert "port-forward" in result.errors[0]
+    assert result.output == ""
+    assert result.trajectory == []
+
+
+def test_a_dead_gateway_on_the_opening_tunnel_is_infra_not_an_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tunnel that never comes up gives up as a run class, not the answer.
+
+    Before the establishment retry, the RuntimeError text was returned as an
+    errored result, so "kubectl port-forward exited with 1" was graded as the
+    agent's output -- rung 3 NOT_A_REAL_RUN, or rung 2 CHECK_DID_NOT_RUN when
+    the safeguard kubectl calls died of the same outage first. 11 of the 17
+    no-agent-ran repetitions in #1116's 46-PR sweep carry this shape, and on
+    builds 2094792115153276928 and 2094793470475505664 it took all three
+    repetitions at once, which repetition voting cannot absorb.
+    """
+    attempts: list[int] = []
+
+    def _dead(port: int) -> None:
+        attempts.append(port)
+        raise RuntimeError(
+            "kubectl port-forward exited with 1: Error from server: rpc error: "
+            "code = Unknown desc = Unknown Error."
+        )
+
+    monkeypatch.setattr(harness, "_ensure_port_forward", _dead)
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert result.has_errors()
+    assert result.errors[0].startswith(harness.INFRA_FAILURE_MARKER)
+    assert "rpc error" in result.errors[0]
+    assert result.output == ""
+    assert result.trajectory == []
+    assert len(attempts) == harness._MAX_TRANSPORT_FAILURES
+
+
+def test_a_tunnel_that_establishes_on_retry_reaches_the_answer(
+    stub_agent: _StubAgentServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One dead spawn -- the gateway pod mid-replacement -- then the answer."""
+    attempts: list[int] = []
+
+    def _flaky(port: int) -> None:
+        attempts.append(port)
+        if len(attempts) == 1:
+            raise RuntimeError(
+                "unable to forward port because pod is not running. "
+                "Current status=Pending"
+            )
+
+    monkeypatch.setattr(harness, "_ensure_port_forward", _flaky)
+
+    result = KubeAgentsHarness().run("Provision operator agent in cluster mercury-09.")
+
+    assert not result.has_errors()
+    assert result.output == _FINAL_TEXT
+    assert attempts == [stub_agent.server_address[1]] * 2
 
 
 def test_an_unpinned_port_forward_failure_names_the_cluster_it_used(
@@ -1477,7 +1538,13 @@ def test_an_agent_error_without_the_marker_is_still_graded(results_json: Any) ->
 
 
 def test_a_scoreless_record_still_blocks(results_json: Any) -> None:
-    """The blocking branch must survive the marker check being inserted above it."""
+    """The blocking branch must survive the checks inserted above it.
+
+    Not the provisioning-death shape: this record has no ``status="failed"``,
+    no ``verification_status``, and no error naming the deployer's command,
+    so even on an infra deployer it blocks. ``test_scoring.py``'s
+    ``fail_the_provision`` tests own the carve-out.
+    """
     path = results_json(AgentResult(output="", trajectory=[]), scores={})
 
     rep = _classify(path, "opentofu")

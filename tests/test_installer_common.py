@@ -1,4 +1,4 @@
-"""Unit tests for k8s-operator/scripts/installer_common.sh helpers.
+"""Unit tests for scripts/installer/installer_common.sh helpers.
 
 Covers the Terraform-state cluster probe (a managed-mode cluster entry reads
 as "ours", a data-mode entry from an existing-cluster install does not, and
@@ -8,6 +8,7 @@ behind --custom-roles, and the API_SERVER_KEY guard in the tfvars generator.
 
 import json
 import pathlib
+import re
 import stat
 import subprocess
 import tempfile
@@ -16,7 +17,7 @@ import unittest
 from tests.testing.common import get_isolated_test_env
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-_INSTALLER_COMMON = _REPO_ROOT / "k8s-operator" / "scripts" / "installer_common.sh"
+_INSTALLER_COMMON = _REPO_ROOT / "scripts" / "installer" / "installer_common.sh"
 
 # installer_common.sh's contract: the caller defines the print helpers.
 _PRINT_STUBS = """
@@ -174,7 +175,7 @@ class InstallerCommonTest(unittest.TestCase):
     # ── write_tfvars_from_state: the API_SERVER_KEY guard ────────────────────
 
     def test_tfvars_generation_without_api_server_key_fails_with_guidance(self):
-        # vars.sh omits API_SERVER_KEY when PERSIST_SECRETS_ON_DISK=false
+        # install.env omits API_SERVER_KEY when PERSIST_SECRETS_ON_DISK=false
         # stripped it; under the front doors' `set -u` an unguarded read would
         # abort on an opaque unbound-variable error mid-run.
         proc = self._run(
@@ -230,7 +231,7 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("create_cluster             = true", content)
 
     def test_tfvars_fresh_create_honours_cluster_mode(self):
-        # --cluster-mode reaches the generator through vars.sh. The probe found
+        # --cluster-mode reaches the generator through the exported environment. The probe found
         # nothing, so the interview's choice is the only shape on offer.
         #
         # Asks for "standard" specifically: autopilot is now DEFAULT_CLUSTER_MODE,
@@ -247,7 +248,7 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("create_cluster             = true", content)
 
     def test_tfvars_fresh_create_rejects_an_unknown_cluster_mode(self):
-        # vars.sh is hand-editable, and an unknown shape reaching Terraform
+        # install.env is hand-editable, and an unknown shape reaching Terraform
         # fails at validate with the whole interview already paid for.
         proc = self._run(
             'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
@@ -258,14 +259,14 @@ class InstallerCommonTest(unittest.TestCase):
 
     def test_tfvars_live_cluster_outranks_a_conflicting_cluster_mode(self):
         # The teardown path: uninstall.sh and upgrade.sh regenerate through
-        # this generator from vars.sh alone and have no flag to correct a wrong
+        # this generator from install.env alone and have no flag to correct a wrong
         # CLUSTER_MODE with. A persisted value that disagrees with the live
         # cluster must lose in BOTH directions — either way round, the losing
         # answer takes the cluster's count to 0 and turns the next apply into a
         # replacement.
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
-            # Live Autopilot, vars.sh says standard.
+            # Live Autopilot, install.env says standard.
             proc = self._run(
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
                 env={"API_SERVER_KEY": "k", "CLUSTER_MODE": "standard"},
@@ -273,7 +274,7 @@ class InstallerCommonTest(unittest.TestCase):
             )
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             self.assertIn('cluster_mode               = "autopilot"', dest.read_text())
-            # Live Standard, vars.sh says autopilot.
+            # Live Standard, install.env says autopilot.
             proc = self._run(
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
                 env={"API_SERVER_KEY": "k", "CLUSTER_MODE": "autopilot"},
@@ -382,8 +383,8 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("enable_gvisor_node_pool    = true", dest.read_text())
 
     def test_tfvars_leaves_the_agent_unsandboxed_when_gvisor_is_unset(self):
-        # install.sh owns the default-on policy and always writes the result to
-        # vars.sh before calling this, so an unset ENABLE_GVISOR here is not a
+        # install.sh owns the default-on policy and always exports the result
+        # before calling this, so an unset ENABLE_GVISOR here is not a
         # fresh install -- it is a caller reading an install that already
         # exists, and such an install is not sandboxed. Deciding otherwise
         # would make the generator disagree with the running cluster.
@@ -414,10 +415,62 @@ class InstallerCommonTest(unittest.TestCase):
         self.assertIn("rc=0", proc.stdout, proc.stderr)
         self.assertNotIn("1.27.4-gke.800", proc.stderr)
 
+    def _tfvars(self, env):
+        """Generate a terraform.tfvars and return its text.
+
+        The generator writes `<dest>.tmp` and renames it into place, so the
+        destination has to be a real path in a writable directory.
+        """
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(f'write_tfvars_from_state "{dest}"; echo "rc=$?"', env=env)
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            return dest.read_text()
+
+    def test_memory_provider_is_derived_from_the_recorded_mode(self):
+        """install.env records MEMORY; the tfvars carry memory_provider.
+
+        upgrade.sh and the Day-2 menu load the file and never pass through
+        install.sh's parameter block, so with only MEMORY set the generator
+        used to fall through to multiuser_memory and the apply deleted a
+        Hindsight install's API server and Postgres.
+        """
+        for mode, provider in (
+            ("hindsight", "kube_agents_memory"),
+            ("off", "none"),
+            ("file", "multiuser_memory"),
+        ):
+            with self.subTest(mode=mode):
+                self.assertIn(
+                    f'memory_provider          = "{provider}"',
+                    self._tfvars(env={"API_SERVER_KEY": "k", "MEMORY": mode}),
+                )
+
+    def test_an_explicit_memory_provider_still_wins_over_the_mode(self):
+        """install.sh exports MEMORY_PROVIDER on its own run; that is the
+        more specific answer and the mode must not override it."""
+        self.assertIn(
+            'memory_provider          = "kube_agents_memory"',
+            self._tfvars(
+                env={
+                    "API_SERVER_KEY": "k",
+                    "MEMORY": "file",
+                    "MEMORY_PROVIDER": "kube_agents_memory",
+                }
+            ),
+        )
+
+    def test_memory_provider_falls_back_when_nothing_is_recorded(self):
+        """Neither name set — the project default, not an empty string."""
+        self.assertIn(
+            'memory_provider          = "multiuser_memory"',
+            self._tfvars(env={"API_SERVER_KEY": "k"}),
+        )
+
     def test_tfvars_autopilot_floor_names_a_way_out_for_every_caller(self):
         # The abort's remedy has to work for whoever hit it. --gvisor=false is
-        # install.sh's; upgrade.sh rejects that flag and reads vars.sh instead,
-        # so naming only the flag sends its callers to a dead end.
+        # install.sh's; upgrade.sh rejects that flag and reads install.env
+        # instead, so naming only the flag sends its callers to a dead end.
         proc = self._run(
             # _PRINT_STUBS swallows print_info, and the way out is printed
             # there rather than beside the error.
@@ -428,13 +481,13 @@ class InstallerCommonTest(unittest.TestCase):
         )
         self.assertIn("rc=1", proc.stdout, proc.stderr)
         self.assertIn("--gvisor=false", proc.stderr)
-        self.assertIn("vars.sh", proc.stderr)
+        self.assertIn("install.env", proc.stderr)
 
     def test_tfvars_gvisor_off_clears_the_floor_on_a_sub_floor_autopilot(self):
         # The composition uninstall.sh relies on: an explicit false must skip
         # the floor check, not merely the tfvars values. The unset case above
-        # only covers a teardown from a fresh clone with no vars.sh; the
-        # ordinary teardown sources one saying "true" and uninstall.sh exports
+        # only covers a teardown from a fresh clone with no install.env; the
+        # ordinary teardown loads one saying "true" and uninstall.sh exports
         # false over it, which is this row.
         proc = self._run(
             'rc=0; write_tfvars_from_state /dev/null || rc=$?; echo "rc=$rc"',
@@ -486,7 +539,7 @@ class InstallerCommonTest(unittest.TestCase):
         self.assertIn("Could not probe cluster", proc.stderr)
 
     def test_tfvars_generation_recovers_credentials_from_live_secret(self):
-        # PERSIST_SECRETS_ON_DISK=false leaves vars.sh without the keys; the
+        # PERSIST_SECRETS_ON_DISK=false leaves install.env without the keys; the
         # live Secret is their home, so the generator reads them back from it.
         recovered_b64 = "cmVjb3ZlcmVkLWtleQ=="  # base64("recovered-key")
         kubectl_stub = (
@@ -538,10 +591,13 @@ class InstallerCommonTest(unittest.TestCase):
         # readiness, and the apply waits on it — the generator defers.
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            # GITOPS_*, the installer's names as of #1026. The generator reads
+            # them directly; normalize_gitops_repo_vars folds the deprecated
+            # GITHUB_* pair in before it runs, and is covered separately.
             env = {
                 "API_SERVER_KEY": "k",
-                "GITHUB_ORG": "org",
-                "GITHUB_REPO": "repo",
+                "GITOPS_ORG": "org",
+                "GITOPS_REPO": "repo",
                 "GITHUB_APP_ID": "42",
             }
             proc = self._run(f'write_tfvars_from_state "{dest}"', env=env, kms_versions="")
@@ -588,6 +644,179 @@ class InstallerCommonTest(unittest.TestCase):
         region, vertex_location = proc.stdout.split()
         self.assertEqual(vertex_location, "global")
         self.assertNotEqual(region, vertex_location)
+
+
+class InstallDefaultsFileTest(unittest.TestCase):
+    """install.defaults.env holds every default, and only defaults.
+
+    One file, one job. The alternative -- a `${VAR:-value}` at each point of use
+    -- is a second copy of the default living next to the code that reads it,
+    and copies drift: that is how the installer's permission-set default once
+    disagreed with the provisioner's, and how the chart sat on LiteLLM v1.92.0
+    for a release after the kustomize base had moved on.
+    """
+
+    _DEFAULTS = _REPO_ROOT / "install.defaults.env"
+    _INSTALLER_COMMON = _REPO_ROOT / "scripts" / "installer" / "installer_common.sh"
+
+    def test_the_file_ships_with_the_repository(self):
+        """Not git-ignored, unlike install.env. Every front door needs it to
+        decide anything at all, including on a fresh clone."""
+        self.assertTrue(self._DEFAULTS.is_file())
+        tracked = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "install.defaults.env"],
+            cwd=str(_REPO_ROOT), capture_output=True, text=True,
+        )
+        self.assertEqual(tracked.returncode, 0, "install.defaults.env must be committed")
+
+    def test_it_holds_nothing_but_defaults(self):
+        """A configuration key here would apply to every install rather than
+        one, which is the opposite of what install.env is for."""
+        assignments = [
+            line.split("=", 1)[0].strip()
+            for line in self._DEFAULTS.read_text().splitlines()
+            if line.strip() and not line.lstrip().startswith("#") and "=" in line
+        ]
+        self.assertTrue(assignments, "the defaults file declares nothing")
+        for name in assignments:
+            with self.subTest(name=name):
+                self.assertTrue(
+                    name.startswith("DEFAULT_"),
+                    f"{name} is not a default; install configuration belongs in install.env",
+                )
+
+    def test_the_defaults_are_not_inlined_anywhere_else(self):
+        """installer_common.sh must source them, not restate them."""
+        source = self._INSTALLER_COMMON.read_text()
+        self.assertIn("install.defaults.env", source)
+        # re.MULTILINE, or `^` anchors at offset 0 only and a DEFAULT_* added
+        # anywhere below the first line passes this guard unnoticed.
+        self.assertNotRegex(
+            source,
+            re.compile(r"^DEFAULT_\w+=", re.MULTILINE),
+            "installer_common.sh must not declare a default; they live in "
+            "install.defaults.env so there is exactly one copy",
+        )
+
+    def test_sourcing_the_helpers_puts_them_in_scope(self):
+        """The half that can break silently: whether the source actually
+        resolves. Under `set -u` a missing constant aborts rather than
+        expanding empty, so this is what a broken path would look like."""
+        proc = subprocess.run(
+            ["bash", "-c",
+             f'set -u; source "{self._INSTALLER_COMMON}"; '
+             'echo "$DEFAULT_CLUSTER_NAME|$DEFAULT_CLUSTER_MODE|$DEFAULT_MEMORY|'
+             '$DEFAULT_PERMISSION_SET|$DEFAULT_REGISTRY_PREFIX"'],
+            capture_output=True, text=True, cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            proc.stdout.strip(),
+            "platform-agent-host|autopilot|file|read-only|ghcr.io/gke-labs/kube-agents",
+        )
+
+    def test_they_are_not_exported(self):
+        """Shell variables, not environment. install.env is sourced with
+        `set -a` because its values must reach Terraform; these must not --
+        DEFAULT_* in the environment the agent and Terraform see would be noise
+        at best and an accidental override at worst.
+        """
+        proc = subprocess.run(
+            ["bash", "-c",
+             f'source "{self._INSTALLER_COMMON}" >/dev/null 2>&1; '
+             'env | grep -c "^DEFAULT_" || true'],
+            capture_output=True, text=True, cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(proc.stdout.strip(), "0", "DEFAULT_* leaked into the environment")
+
+    def test_it_is_found_from_any_working_directory(self):
+        """upgrade.sh and uninstall.sh source the helpers from a fresh clone,
+        so the path is resolved relative to installer_common.sh rather than to
+        the caller's cwd."""
+        proc = subprocess.run(
+            ["bash", "-c",
+             f'set -u; source "{self._INSTALLER_COMMON}"; echo "$DEFAULT_CLUSTER_MODE"'],
+            capture_output=True, text=True, cwd=tempfile.gettempdir(),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "autopilot")
+
+
+class NormalizeMemoryVarsTest(unittest.TestCase):
+    """install.env's MEMORY must beat a migrated vars.sh's MEMORY_PROVIDER.
+
+    The two files spell the setting differently, so the load order that gives
+    install.env the last word on every other key cannot do it for this one. The
+    pre-install.env installer wrote `export MEMORY_PROVIDER=...` into vars.sh
+    and every migrated install still has it; install.sh's migration writes only
+    MEMORY. write_tfvars_from_state prefers MEMORY_PROVIDER, so without the
+    normalizer the stale provider won and an upgrade regenerated the tfvars
+    against the old store -- the apply then deleting the Hindsight API and its
+    Postgres. #1060 item 5, on the front doors install.sh does not cover.
+    """
+
+    _INSTALLER_COMMON = _REPO_ROOT / "scripts" / "installer" / "installer_common.sh"
+
+    def _normalize(self, assignments):
+        proc = subprocess.run(
+            ["bash", "-c",
+             f'set -u; {_PRINT_STUBS}\nsource "{self._INSTALLER_COMMON}"\n'
+             f'{assignments}\nnormalize_memory_vars\n'
+             'echo "P=${MEMORY_PROVIDER:-}"'],
+            capture_output=True, text=True, cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.strip()
+
+    def test_the_install_env_mode_overrides_a_legacy_provider(self):
+        """A legacy vars.sh says the file store, the operator's install.env says
+        Hindsight, and the generated provider must be Hindsight's."""
+        self.assertEqual(
+            "P=kube_agents_memory",
+            self._normalize('MEMORY_PROVIDER=multiuser_memory\nMEMORY=hindsight'),
+        )
+
+    def test_every_mode_translates(self):
+        for mode, provider in (
+            ("hindsight", "kube_agents_memory"),
+            ("file", "multiuser_memory"),
+            ("off", "none"),
+        ):
+            with self.subTest(mode=mode):
+                self.assertEqual(
+                    f"P={provider}",
+                    self._normalize(f'MEMORY_PROVIDER=multiuser_memory\nMEMORY={mode}'),
+                )
+
+    def test_nothing_recorded_leaves_the_provider_alone(self):
+        """An install that never carried MEMORY -- a vars.sh-only install that
+        has not been migrated yet -- must keep the provider it has."""
+        self.assertEqual(
+            "P=kube_agents_memory",
+            self._normalize('MEMORY_PROVIDER=kube_agents_memory'),
+        )
+
+    def test_an_unrecognised_mode_leaves_the_provider_alone(self):
+        """A typo in install.env must not silently retarget the store: blanking
+        the provider here would fall through to the project default and plan
+        the same deletion the normalizer exists to prevent."""
+        self.assertEqual(
+            "P=kube_agents_memory",
+            self._normalize('MEMORY_PROVIDER=kube_agents_memory\nMEMORY=hindsigt'),
+        )
+
+    def test_the_front_doors_that_load_both_files_call_it(self):
+        """upgrade.sh, uninstall.sh and install.sh's Day-2 menu each source a
+        legacy vars.sh and then load install.env over it, and each generates
+        tfvars without passing through install.sh's parameter block. A caller
+        that loads both and skips the normalizer has the defect back."""
+        for name in ("upgrade.sh", "uninstall.sh", "install.sh"):
+            with self.subTest(name=name):
+                self.assertIn(
+                    "normalize_memory_vars",
+                    (_REPO_ROOT / name).read_text(),
+                    f"{name} loads vars.sh and install.env; it must normalize the pair",
+                )
 
 
 if __name__ == "__main__":

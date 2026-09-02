@@ -41,7 +41,7 @@ resource "google_container_cluster" "primary" {
   ip_allocation_policy {}
 
   # deploy_infra.sh reaches these clusters over the DNS endpoint when it is
-  # available; see k8s-operator/scripts/gke_dns_endpoint.sh.
+  # available; see scripts/installer/gke_dns_endpoint.sh.
   #
   # A literal rather than a variable, unlike terraform/modules/gke-cluster,
   # which defaults it off so that upgrading cannot publish an endpoint on
@@ -99,7 +99,7 @@ resource "google_container_cluster" "standard" {
   ip_allocation_policy {}
 
   # deploy_infra.sh reaches these clusters over the DNS endpoint when it is
-  # available; see k8s-operator/scripts/gke_dns_endpoint.sh.
+  # available; see scripts/installer/gke_dns_endpoint.sh.
   #
   # A literal rather than a variable, unlike terraform/modules/gke-cluster,
   # which defaults it off so that upgrading cannot publish an endpoint on

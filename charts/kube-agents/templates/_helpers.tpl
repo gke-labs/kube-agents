@@ -38,7 +38,7 @@ the operator handing its managed pods public references after `helm install`
 reported success.
 
 This deliberately does NOT match third_party_registry_prefix in
-k8s-operator/scripts/common.sh, which requires THIRD_PARTY_REGISTRY_PREFIX
+scripts/installer/common.sh, which requires THIRD_PARTY_REGISTRY_PREFIX
 explicitly. The asymmetry is about history, not preference: REGISTRY_PREFIX
 shipped before this inventory existed and has always meant "the registry
 holding the images this project builds", so widening it would redirect working
@@ -144,7 +144,7 @@ them here would not suit every caller.
 
 {{/*
 A complete third-party image reference, reproducing third_party_image() from
-k8s-operator/scripts/common.sh: mirrored installs pull <prefix>/<name>:<tag>
+scripts/installer/common.sh: mirrored installs pull <prefix>/<name>:<tag>
 with any @sha256 digest dropped — `make mirror-images` pushes by tag, and the
 copy's digest differs from the upstream one, so keeping it would break every
 mirrored pull — while unmirrored installs pull the inventory's full pin,

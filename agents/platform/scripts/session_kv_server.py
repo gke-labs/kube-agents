@@ -1121,8 +1121,12 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
     the ``To authorize:`` bullet as that evidence, which is the one line both
     shapes carry. So the label in this template and the pattern in that gate are
     one decision in two files: change the words here and the gate stops
-    recognising the report. ``test_triage_reply_roundtrip.py`` is the test that
-    holds both halves in scope.
+    recognising the report. A third file reads it too —
+    bench/tasks/autoops-warning-event-triage/task.yaml's delivery objective
+    keys on the same literals — so a reword here has three readers to
+    reconcile, not one. ``test_triage_reply_roundtrip.py`` holds this template
+    against the gate; bench/tests/test_triage_delivery_contract.py holds it
+    against both the gate and that eval case.
 
     §7 rule 3 — "no offer to help further" — does not reach the bullet. Rule 3
     is about closing chatter, the "let me know if you need anything else" that

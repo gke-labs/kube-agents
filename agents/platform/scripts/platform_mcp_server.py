@@ -15,7 +15,7 @@ import tempfile
 from typing import Any
 from pathlib import Path
 from datetime import datetime
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 from agent_common_server import _run_env, CONFIG_PATH
 from gke_endpoint import dns_endpoint_args
 
@@ -39,8 +39,8 @@ DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 # left that one second of headroom.
 CRON_REPORT_TIMEOUT_SECONDS = 360.0
 
-# Initialize the FastMCP server
-mcp = FastMCP("GKE Platform Control Plane")
+# Initialize the MCP server
+mcp = MCPServer("GKE Platform Control Plane")
 
 def log(msg: str):
     print(f"[PLATFORM-MCP-SERVER] {msg}", file=sys.stderr)

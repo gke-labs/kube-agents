@@ -11,7 +11,7 @@ uv run --project bench pytest -s bench/cuj
 ```
 
 The suite targets the stock `platform-agent` resource created by
-`k8s-operator/scripts/provision.sh`. Set `CUJ_PROJECT_ID` for scenarios that
+`./install.sh`. Set `CUJ_PROJECT_ID` for scenarios that
 need a Google Cloud project. `CUJ_PROFILE`, `CUJ_TIMEOUT`, and
 `CUJ_POLL_INTERVAL` are optional overrides shared by the whole suite.
 Pytest reports every journey independently using its normal test discovery.

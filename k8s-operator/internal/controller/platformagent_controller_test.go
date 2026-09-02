@@ -4380,3 +4380,82 @@ func TestSyncGithubTokenMinterConfigMap(t *testing.T) {
 		t.Errorf("expected cross-org forbidden-repo.yaml to be skipped when primaryOrg is inferred from GitRepo")
 	}
 }
+
+// An unrecognized spec.mode can only reach the reconciler through version skew
+// (enum validation rejects it at admission — the fake client, like a newer CRD
+// with an older binary, does not). The contract from the mode spec: Degraded
+// with reason ModeNotRecognized, today's stack still rendered, and a requeue.
+func TestPlatformAgentReconciler_Reconcile_UnrecognizedMode(t *testing.T) {
+	scheme := setupScheme()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.PlatformAgentSpec{Mode: ptr.To("quantum")},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-agent", Namespace: "test-ns"}}
+	ctx := context.Background()
+
+	// 1st reconcile adds the finalizer, 2nd does the work.
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 1 failed: %v", err)
+	}
+	result, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("Reconcile 2 failed: %v", err)
+	}
+	if result.RequeueAfter != 30*time.Second {
+		t.Errorf("expected 30s requeue while mode is unrecognized, got %v", result.RequeueAfter)
+	}
+
+	updated := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	if updated.Status.Phase != "Degraded" {
+		t.Errorf("expected phase Degraded, got %q", updated.Status.Phase)
+	}
+	cond := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+	if cond == nil {
+		t.Fatal("expected a Ready condition")
+	}
+	if cond.Reason != "ModeNotRecognized" {
+		t.Errorf("expected reason ModeNotRecognized, got %q", cond.Reason)
+	}
+	if !strings.Contains(cond.Message, "quantum") {
+		t.Errorf("condition message must name the unrecognized value, got %q", cond.Message)
+	}
+
+	// Fail-closed means the dark stack stays dark AND today's stack still renders:
+	// the cluster keeps running what it ran, with the skew visible in status.
+	dep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-gateway", Namespace: "test-ns"}, dep); err != nil {
+		t.Errorf("today's Deployment should still be rendered under an unrecognized mode: %v", err)
+	}
+
+	// Correcting the mode clears the Degraded phase on the next reconcile.
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to refetch agent: %v", err)
+	}
+	updated.Spec.Mode = nil
+	if err := cl.Update(ctx, updated); err != nil {
+		t.Fatalf("failed to update agent: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 3 failed: %v", err)
+	}
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	if updated.Status.Phase == "Degraded" {
+		t.Errorf("expected Degraded to clear once the mode is valid, still %q", updated.Status.Phase)
+	}
+}

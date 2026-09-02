@@ -49,7 +49,7 @@
       "name": "fluent-bit",
       "origin": "third-party",
       "repository": "docker.io/fluent/fluent-bit",
-      "tag": "5.1.0",
+      "tag": "5.1.1",
       "override": "FLUENT_BIT_IMAGE",
       "pulledBy": "The logging sidecar the operator injects into every agent pod.",
       "description": "Ships agent container logs off the pod."

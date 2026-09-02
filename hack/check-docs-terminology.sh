@@ -52,7 +52,7 @@ forbid() {
 }
 
 # --- Identity names -------------------------------------------------------
-# Ground truth: k8s-operator/scripts/common.sh
+# Ground truth: scripts/installer/common.sh
 forbid 'kubeagents-platform-agent-gsa' \
   "Wrong GCP service account name. common.sh sets PLATFORM_AGENT_GSA_NAME=kubeagents-platform-gsa."
 
@@ -64,11 +64,11 @@ forbid 'platform-agent-system' \
   "Stale namespace. The namespace is kubeagents-system."
 
 # --- GKE host-discovery label -------------------------------------------
-# Ground truth: k8s-operator/scripts/common.sh. The Terraform full-install
+# Ground truth: scripts/installer/common.sh. The Terraform full-install
 # composition must mirror the stable key because it cannot source Bash.
-HOST_LABEL=$(awk -F'"' '/^KUBE_AGENTS_HOST_LABEL=/{print $2; exit}' k8s-operator/scripts/common.sh)
+HOST_LABEL=$(awk -F'"' '/^KUBE_AGENTS_HOST_LABEL=/{print $2; exit}' scripts/installer/common.sh)
 if [ -z "$HOST_LABEL" ]; then
-  echo "ERROR: could not read KUBE_AGENTS_HOST_LABEL from k8s-operator/scripts/common.sh." >&2
+  echo "ERROR: could not read KUBE_AGENTS_HOST_LABEL from scripts/installer/common.sh." >&2
   exit 1
 fi
 

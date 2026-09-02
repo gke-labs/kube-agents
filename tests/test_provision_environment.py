@@ -546,6 +546,34 @@ exit {install_exit}
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn("half-configured", proc.stdout + proc.stderr)
 
+    def test_the_gitops_names_are_accepted(self):
+        """GITOPS_ORG / GITOPS_REPO are the installer's names. (see #1026)
+
+        The old pair collided with GH_ORG / GH_REPO on these very environments,
+        which name the *release* repository — so the workflow had to write
+        `GITHUB_ORG: ${{ vars.GITOPS_ORG }}`, a line that reads like a bug and
+        invites a "fix" that scopes a live App token at the release repo.
+        """
+        proc, _ = self._run(
+            {"GITOPS_ORG": "acme", "GITOPS_REPO": "infra", "GITHUB_APP_ID": "4143620"}
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("half-configured", proc.stdout + proc.stderr)
+
+    def test_a_half_configured_minter_is_caught_under_the_old_names_too(self):
+        """The deprecation must not quietly disable this guard.
+
+        The check moved to GITOPS_*, so an environment still exporting the old
+        pair would satisfy nothing and read as "no minter configured" — which is
+        an allowed state, and would provision an RC with a silently absent
+        minter. Folding the old names in before the guard is what stops that.
+        """
+        proc, _ = self._run({"GITHUB_ORG": "acme", "GITHUB_REPO": "infra"})
+        self.assertNotEqual(
+            proc.returncode, 0, "a half-configured minter must not provision an RC"
+        )
+        self.assertIn("half-configured", proc.stdout + proc.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

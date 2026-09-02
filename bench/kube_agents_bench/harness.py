@@ -80,12 +80,13 @@ _log = logging.getLogger("kube_agents_bench.harness")
 SERVICE_API_PORT = 8642
 
 # Prefix on ``AgentResult.errors[0]`` that marks a run whose transport died on
-# every attempt: the opening turn never reached the agent, or the delegation
-# wait lost the endpoint on every status-turn retry with cards still
-# outstanding. ``hack/ci-eval-pr.sh`` matches this string in results.json
-# and classifies the task ``RUN_CLASS=INFRA``, so it lands in
-# ``INFRA_FAILED_TASKS`` instead of failing the pull request. The literal is the
-# contract between the two files: change it in both or in neither.
+# every attempt: the agent tunnel never established, the opening turn never
+# reached the agent, or the delegation wait lost the endpoint on every
+# status-turn retry with cards still outstanding. ``scoring.py`` matches this
+# string on a record's error and classifies the repetition as infrastructure
+# rather than grading it. The literal is duplicated there (importing the
+# harness would drag ``devops_bench`` into the scorer), and ``test_scoring.py``
+# asserts the two strings agree: change it in both files or in neither.
 INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 
 # Where hermes keeps per-card state in the agent's data volume. A card's
@@ -721,7 +722,7 @@ def _infra_failure(detail: str) -> AgentResult:
     graded as the agent's answer to ``gpu-stress-test-diagnosis``
     ("The Actual Output consists entirely of an HTTP 502 Bad Gateway",
     OutcomeValidity 0.0). A transport failure has to set a run class, not an
-    output: the marker on ``errors[0]`` is what ``hack/ci-eval-pr.sh`` reads.
+    output: the marker on ``errors[0]`` is what ``scoring.py`` reads.
     """
     return AgentResult(
         output="",
@@ -797,10 +798,38 @@ class KubeAgentsHarness(AgentHarness):
         if not api_path.startswith("/"):
             return AgentResult.errored(f"AGENT_API_PATH must start with '/': {api_path!r}")
 
-        try:
-            _ensure_port_forward(local_port)
-        except RuntimeError as exc:
-            return AgentResult.errored(str(exc))
+        # A tunnel that cannot be established is the same outage as one that
+        # dies mid-run -- the gateway pod replaced, its node draining, its
+        # cluster unreachable -- so it gets the same bounded retry the two
+        # turn loops use and the same run class on exhaustion. Returning the
+        # RuntimeError text as an errored result put "kubectl port-forward
+        # exited with 1" in front of the judge as the agent's answer: 11 of
+        # the 17 no-agent-ran repetitions in #1116's 46-PR sweep are this
+        # shape, and three builds lost every repetition of a case to it,
+        # which repetition voting cannot absorb. INFRA instead drops the
+        # repetition from the denominator, the class terminal 429s join
+        # via #1095's _RETRYABLE_STATUSES entry.
+        transport_failures = 0
+        while True:
+            try:
+                _ensure_port_forward(local_port)
+                break
+            except RuntimeError as exc:
+                transport_failures += 1
+                _log.warning(
+                    "port-forward failed to establish (%d/%d): %s",
+                    transport_failures,
+                    _MAX_TRANSPORT_FAILURES,
+                    exc,
+                )
+                if transport_failures >= _MAX_TRANSPORT_FAILURES:
+                    # Not AgentResult.errored: see _infra_failure. No agent
+                    # ever saw the request, so this is the run class, not an
+                    # answer.
+                    return _infra_failure(
+                        f"the agent tunnel failed to establish {transport_failures} "
+                        f"times running; last failure: {exc}"
+                    )
 
         # 127.0.0.1 rather than localhost, matching _port_open's probe host: a
         # v4/v6 mismatch would make the probe and the request disagree.

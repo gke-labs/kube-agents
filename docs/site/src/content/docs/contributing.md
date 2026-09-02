@@ -99,7 +99,7 @@ What that section should say:
 
 Some changes can't reach a running installation — docs-only edits, CI workflow changes, code paths that need infrastructure you don't have. Write "Not live-tested" and say why. An empty section is not an answer.
 
-If your team shares one installation, take the lease before you mutate it: `scripts/live_test_lease.py` holds it as a ConfigMap in the install's own namespace. Copy `.claude/settings.json.example` to `.claude/settings.json` once per checkout, and its `PreToolUse` hook claims the lease on your first mutating command and blocks the command while another agent holds it. Read-only commands are never blocked, and nothing is protected until a checkout has a `vars.sh` or you configure an install. The hook is not committed — it would be branch content Claude Code runs unprompted — and it is Claude Code-specific, so from any other harness, or a plain shell, run `acquire` and `release` yourself:
+If your team shares one installation, take the lease before you mutate it: `scripts/live_test_lease.py` holds it as a ConfigMap in the install's own namespace. Copy `.claude/settings.json.example` to `.claude/settings.json` once per checkout, and its `PreToolUse` hook claims the lease on your first mutating command and blocks the command while another agent holds it. Read-only commands are never blocked, and nothing is protected until a checkout has an `install.env` (or a legacy `vars.sh`) or you configure an install. The hook is not committed — it would be branch content Claude Code runs unprompted — and it is Claude Code-specific, so from any other harness, or a plain shell, run `acquire` and `release` yourself:
 
 ```bash
 cp .claude/settings.json.example .claude/settings.json   # opt into the hook

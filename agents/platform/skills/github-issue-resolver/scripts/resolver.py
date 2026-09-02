@@ -354,7 +354,7 @@ def _is_safe_char(ch: str) -> bool:
     # agents/platform/scripts/platform_mcp_server.py, which is the canonical
     # copy: both classify untrusted external text bound for the same model, and
     # a class stripped in one place but not the other is a hole in whichever
-    # side forgot. Importing it is not an option — that module builds a FastMCP
+    # side forgot. Importing it is not an option — that module builds an MCP
     # server at import time and pulls in `mcp`, `agent_common_server` and
     # `gke_endpoint`, none of which this script has or needs. The mirror is held
     # honest by test_resolver.py's drift test, which compares the two as parsed

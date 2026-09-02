@@ -24,7 +24,7 @@ locals {
   # Not var.location: a model is only callable from a location that serves it,
   # and the cluster's is often not one — on a zonal cluster it is not even a
   # valid Vertex location. Mirrors DEFAULT_VERTEX_LOCATION in
-  # k8s-operator/scripts/installer_common.sh.
+  # scripts/installer/installer_common.sh.
   vertex_location = var.vertex_location != "" ? var.vertex_location : "global"
   litellm_ksa     = "kubeagents-litellm"
 

@@ -168,7 +168,12 @@ jobs:
           # scopes its tokens to. Deliberately NOT vars.GH_ORG/vars.GH_REPO: that
           # pair names the RELEASE repository, so reusing it here would scope a
           # live GitHub App token at this repository. GITOPS_REPO is bare —
-          # installer_common.sh composes "${GITHUB_ORG}/${GITHUB_REPO}".
+          # installer_common.sh composes "${GITOPS_ORG}/${GITOPS_REPO}".
+          #
+          # The installer's own names, passed straight through. Until #1026 this
+          # read `GITHUB_ORG: ${{ vars.GITOPS_ORG }}`, a mapping that looked like
+          # a mistake and invited someone to "fix" it to vars.GH_ORG — which is
+          # precisely how a live App token gets scoped at the release repository.
           #
           # These three and GITHUB_APP_ID must all be set before the minter is
           # provisioned at all (write_tfvars_from_state's three-way guard); with
@@ -176,7 +181,18 @@ jobs:
           # pair must also match what the E2E suite probes, since a token minted
           # for one repository does not authenticate against another — which is
           # why e2e-run.yml reads the same two variables rather than
-          # tests/e2e/e2e_config.yaml pinning them.
+          # tests/e2e/e2e_config.yaml pinning them. That workflow still passes
+          # them as GITHUB_ORG/GITHUB_REPO, because those are the E2E suite's own
+          # variable names for the repository a test acts on.
+          GITOPS_ORG: ${{ vars.GITOPS_ORG }}
+          GITOPS_REPO: ${{ vars.GITOPS_REPO }}
+          # The old names as well, for the same reason as the
+          # provision_rc_environment.sh fallback in the run block below: this
+          # step executes the checked-out candidate's scripts, and every
+          # candidate predating the GITOPS_* rename reads GITHUB_ORG/GITHUB_REPO
+          # — with those empty and GITHUB_APP_ID set, its half-configured-minter
+          # guard refuses the deploy outright. On a post-rename tree GITOPS_*
+          # wins and these two are ignored. Delete them alongside that fallback.
           GITHUB_ORG: ${{ vars.GITOPS_ORG }}
           GITHUB_REPO: ${{ vars.GITOPS_REPO }}
           GITHUB_APP_ID: ${{ secrets.GH_APP_ID }}

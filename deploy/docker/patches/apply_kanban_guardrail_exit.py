@@ -41,7 +41,7 @@ HALT_ANCHOR = (
     '                    agent._emit_status(\n'
     '                        f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}"\n'
     '                    )\n'
-    '                    messages.append({"role": "assistant", "content": final_response})\n'
+    '                    append_message(messages, {"role": "assistant", "content": final_response})\n'
 )
 
 HALT_INSERT = '''                    # kube-agents patch: the break below jumps over the
@@ -73,7 +73,7 @@ HALT_INSERT = '''                    # kube-agents patch: the break below jumps 
                         agent._kanban_stop_nudges = (
                             getattr(agent, "_kanban_stop_nudges", 0) + 1
                         )
-                        messages.append({
+                        append_message(messages, {
                             "role": "user",
                             "content": _kanban_halt_nudge,
                             "_kanban_stop_synthetic": True,

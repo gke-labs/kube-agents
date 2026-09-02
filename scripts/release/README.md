@@ -88,7 +88,7 @@ A run that fails anywhere does leave its environment standing, deliberately — 
 
 The repository it probes comes from the same two variables that scope the minter, so the two cannot drift: `deploy-environment.yml` gives them to the installer and `e2e-run.yml` gives them to the suite. The GitHub App has to be installed on that repository — a token minted for one repository does not authenticate against another.
 
-Three settings on the `rc` GitHub environment turn it on, and all three must be present before the minter is provisioned at all ([`installer_common.sh`](../../k8s-operator/scripts/installer_common.sh)). All three empty is a supported configuration — an install without a minter, which is the default everywhere outside the RC. Some set and some empty is not: `provision_environment.sh` refuses, before the teardown, rather than reprovisioning an RC whose token-minting test would fail with an HTTP 502 forty minutes later.
+Three settings on the `rc` GitHub environment turn it on, and all three must be present before the minter is provisioned at all ([`installer_common.sh`](../../scripts/installer/installer_common.sh)). All three empty is a supported configuration — an install without a minter, which is the default everywhere outside the RC. Some set and some empty is not: `provision_environment.sh` refuses, before the teardown, rather than reprovisioning an RC whose token-minting test would fail with an HTTP 502 forty minutes later.
 
 `GH_APP_ID` is a _secret_, and that takes one thing the two variables do not. A called workflow receives only the secrets its caller passes, so reaching the `rc` environment's copy needs both halves: `rc-release-pipeline.yml` calling this workflow with `secrets: inherit`, and the `deploy-environment` job declaring an `environment:` — which it renders from its `github_environment` input, so the RC caller has to pass `rc`. An explicit `secrets:` mapping in the caller cannot substitute — a `uses:` job has no environment, so it resolves the names against nothing and forwards empty strings, which is indistinguishable from never having configured the minter. `tests/test_minter_secret_wiring.py` pins both halves.
 
@@ -97,7 +97,7 @@ Set all three on the environment rather than the repository. A repository-level 
 | Setting                | Value                  | Notes                                                                                                 |
 | ---------------------- | ---------------------- | ----------------------------------------------------------------------------------------------------- |
 | Variable `GITOPS_ORG`  | `gke-agentic`          | Repository owner.                                                                                     |
-| Variable `GITOPS_REPO` | `kube-agents-rc-infra` | Bare name, not `owner/repo`. Terraform's `github_repo` is composed as `${GITHUB_ORG}/${GITHUB_REPO}`. |
+| Variable `GITOPS_REPO` | `kube-agents-rc-infra` | Bare name, not `owner/repo`. Terraform's `github_repo` is composed as `${GITOPS_ORG}/${GITOPS_REPO}`. |
 | Secret `GH_APP_ID`     | the App ID             | Same App that is installed on the repository above.                                                   |
 
 `GITOPS_ORG` and `GITOPS_REPO` are deliberately separate from `GH_ORG` and `GH_REPO`, which every other workflow does use for this. On the `rc` environment that pair names the _release_ repository (`gke-labs/kube-agents`) and is what `common.sh`'s `get_target_repo` resolves for tag and release operations; pointing the minter at it would scope a live App token to this repository.
@@ -146,7 +146,7 @@ reproduce, and because a value deleted from the web form fails the same way as o
 1. **A GCP project of its own.** `kube-agents-nightly`, not `kube-agents-rc`: sharing the project
    would put the two pipelines back on one cluster, which is the collision this exists to remove.
 2. **Workload Identity Federation and the deploy service account**, created with
-   [`setup-gcp-github-wif.sh --admin`](../../k8s-operator/scripts/dev/setup-gcp-github-wif.sh)
+   [`setup-gcp-github-wif.sh --admin`](../../scripts/dev/setup-gcp-github-wif.sh)
    against that project. It creates the pool, the provider with its `assertion.repository`
    attribute condition, the service account and the full autonomous-E2E role set. Do not hand-roll
    the equivalent `gcloud` calls.
@@ -172,7 +172,7 @@ reproduce, and because a value deleted from the web form fails the same way as o
 
    The secrets are separate from the variables, and `nightly` needs `GH_APP_ID` and
    `GEMINI_API_KEY` on top of them. `GH_APP_ID` is not optional and its absence is not a skipped
-   feature — `provision_environment.sh` treats `GITHUB_ORG`/`GITHUB_REPO`/`GITHUB_APP_ID` as
+   feature — `provision_environment.sh` treats `GITOPS_ORG`/`GITOPS_REPO`/`GITHUB_APP_ID` as
    all-or-nothing and hard-exits before teardown when two of three are set.
 
    The four `E2E_CHAT_*` secrets exist at repository scope and cascade, so an environment that

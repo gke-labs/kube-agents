@@ -388,7 +388,7 @@ githubMinter:
 fluentBit:
   image:
     repository: docker.io/fluent/fluent-bit
-    tag: "5.1.0"
+    tag: "5.1.1"
 
 platformAgent:
   enabled: true
@@ -501,7 +501,7 @@ platformAgent:
   security:
     # Kubernetes ServiceAccount the agent pod runs as. The Workload Identity
     # binding must target this KSA (see the chart README); the default matches
-    # PLATFORM_AGENT_KSA_NAME in k8s-operator/scripts/common.sh.
+    # PLATFORM_AGENT_KSA_NAME in scripts/installer/common.sh.
     # Ownership: with serviceAccountAnnotations set, the OPERATOR creates and
     # manages the KSA; with no annotations, the operator treats it as
     # user-managed and the CHART creates it instead.

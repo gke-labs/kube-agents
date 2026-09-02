@@ -72,7 +72,7 @@ REQUIRED_APIS = {
 HOST_CLUSTER = "platform-agent-host"
 EXPECTED_CLUSTERS = {HOST_CLUSTER, "seeded-a", "seeded-b", "seeded-c"}
 
-# The two states k8s-operator/scripts/installer_common.sh accepts in
+# The two states scripts/installer/installer_common.sh accepts in
 # is_valid_cmek_encryption_state(). Its only caller is install.sh's
 # ensure_existing_cluster_cmek(), which -- unless ALLOW_UNENCRYPTED_SECRETS is
 # truthy -- does not reject an unencrypted cluster but rewrites the live control

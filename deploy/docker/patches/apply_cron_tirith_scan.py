@@ -29,15 +29,22 @@ import patchlib
 
 # --- tools/approval.py: scan the command even when the prompt is waived -----
 #
-# The three inner lines are NOT unique on their own: `_run_approval_gate` opens
-# with the same comment, the same `_is_cron_approval_context()` test and the
-# same `== "deny"` compare at the same indentation. The `is_ask` line above them
-# is what distinguishes `check_all_command_guards`, so the anchor starts there.
+# The three opening lines are NOT unique on their own: `_run_approval_gate`
+# opens with the same comment, the same `_is_cron_approval_context()` test and
+# the same `== "deny"` compare at the same indentation. The trailing detection
+# comment is what distinguishes `check_all_command_guards` -- `_run_approval_gate`
+# already holds a `description` and returns immediately.
+#
+# It used to be the `if not is_cli and not is_gateway and not is_ask:` line
+# above instead. v2026.8.19 interposed a `_is_single_query_approval_context()`
+# arm between that line and this one, so the anchor no longer spanned adjacent
+# text. Anchoring below rather than above also puts the disambiguator inside
+# the branch being patched, where upstream is less free to insert a sibling.
 APPROVAL_CRON_ARM = (
-    "    if not is_cli and not is_gateway and not is_ask:\n"
     "        # Cron sessions: respect cron_mode config\n"
     "        if _is_cron_approval_context():\n"
     '            if _get_cron_approval_mode() == "deny":\n'
+    "                # Run detection to get a description for the block message\n"
 )
 
 # The mode is read once into a local and then branched on twice. Reading it
@@ -58,7 +65,6 @@ APPROVAL_CRON_ARM = (
 # model reads the same rendering of a finding that an interactive user would.
 # It is a module-level function defined above this one in the same file.
 APPROVAL_CRON_ARM_PATCHED = (
-    "    if not is_cli and not is_gateway and not is_ask:\n"
     "        # Cron sessions: respect cron_mode config\n"
     "        if _is_cron_approval_context():\n"
     "            _cron_mode = _get_cron_approval_mode()\n"
@@ -77,6 +83,7 @@ APPROVAL_CRON_ARM_PATCHED = (
     "                if _scan_block is not None:\n"
     "                    return _scan_block\n"
     '            if _cron_mode == "deny":\n'
+    "                # Run detection to get a description for the block message\n"
 )
 
 # (relative path, [(anchor, replacement, expected occurrences)])

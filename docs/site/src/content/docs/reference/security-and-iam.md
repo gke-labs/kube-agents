@@ -52,7 +52,7 @@ The IAM side of the binding is provisioned by the [`kube-agents-iam` Terraform m
 
 ## GCP IAM permission sets
 
-The install grants the agent GSA one of two permission sets. Both entry points choose from the same vocabulary, and `read-only` is the default in each: the installer asks the question — or takes `--permission-set` / `--custom-roles` — and records the answer in `vars.sh` as `PLATFORM_AGENT_PERMISSION_SET` before generating `terraform.tfvars`; a hand-driven Terraform composition takes the same two values in its `permission_set` variable, with `custom` requiring a `project_roles` list (setting `project_roles` explicitly overrides `permission_set` either way).
+The install grants the agent GSA one of two permission sets. Both entry points choose from the same vocabulary, and `read-only` is the default in each: the installer asks the question — or takes `--permission-set` / `--custom-roles` — and records the answer in `install.env` as `PLATFORM_AGENT_PERMISSION_SET` before generating `terraform.tfvars`; a hand-driven Terraform composition takes the same two values in its `permission_set` variable, with `custom` requiring a `project_roles` list (setting `project_roles` explicitly overrides `permission_set` either way).
 
 | Permission set | `PLATFORM_AGENT_PERMISSION_SET` | Use it when                                                   |
 | -------------- | ------------------------------- | ------------------------------------------------------------- |
@@ -157,7 +157,7 @@ What they do **not** cover, stated plainly because a backstop misread as complet
 
 ### The operator controller is a separate identity
 
-Everything above describes the _agent_. The controller-manager that reconciles `PlatformAgent` CRs runs under its own KSA, `kubeagents-controller` (the kustomize `namePrefix: kubeagents-` applied to the base `controller` ServiceAccount), and its Kubernetes permissions are the Kubebuilder-generated ClusterRole in [`k8s-operator/config/rbac/role.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/rbac/role.yaml) (regenerated with `make manifests`): write access to the object kinds it reconciles for the agent pod — Deployments/StatefulSets, ServiceAccounts, Services, ConfigMaps, PVCs, NetworkPolicies, PodDisruptionBudgets, and the agent RBAC objects above — plus read-only access to what it merely watches (nodes, namespaces, CRDs, RuntimeClasses). Unlike the agent, the controller has no GCP identity: no install path creates a controller GSA or Workload Identity binding for it (the `CONTROLLER_GSA_NAME` default in `scripts/common.sh` is a leftover of older installs that did bind one).
+Everything above describes the _agent_. The controller-manager that reconciles `PlatformAgent` CRs runs under its own KSA, `kubeagents-controller` (the kustomize `namePrefix: kubeagents-` applied to the base `controller` ServiceAccount), and its Kubernetes permissions are the Kubebuilder-generated ClusterRole in [`k8s-operator/config/rbac/role.yaml`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/rbac/role.yaml) (regenerated with `make manifests`): write access to the object kinds it reconciles for the agent pod — Deployments/StatefulSets, ServiceAccounts, Services, ConfigMaps, PVCs, NetworkPolicies, PodDisruptionBudgets, and the agent RBAC objects above — plus read-only access to what it merely watches (nodes, namespaces, CRDs, RuntimeClasses). Unlike the agent, the controller has no GCP identity: no install path creates a controller GSA or Workload Identity binding for it (the `CONTROLLER_GSA_NAME` default in `scripts/installer/common.sh` is a leftover of older installs that did bind one).
 
 ### The Vertex AI gateway is a separate identity
 
@@ -258,12 +258,12 @@ The install enforces Customer-Managed Encryption Keys (CMEK) for GKE database en
 - **Existing clusters**: Terraform cannot mutate a cluster it did not create, so `./install.sh` runs a `gcloud` pre-step before the apply: it ensures the keyring, key, and service-agent binding exist and updates the live cluster's database encryption. Clusters that are already encrypted are left alone.
 - **`ALLOW_UNENCRYPTED_SECRETS` Override**: When installing onto an existing cluster or local test environment where CMEK must stay off, export `ALLOW_UNENCRYPTED_SECRETS=true` to skip that pre-step.
 
-### Local State Security (`vars.sh`)
+### Local State Security (`install.env`)
 
-Local configuration and state saved during installer execution (`k8s-operator/scripts/vars.sh`) are hardened as follows:
+The install configuration written during installer execution (`install.env`) is hardened as follows:
 
-- **File Permissions**: State files are created with strict POSIX permissions (`umask 077` and `chmod 600`), preventing non-owner access. The `terraform.tfvars` the installer generates from `vars.sh` gets the same `0600` treatment, and is regenerated on every run so the two cannot disagree.
-- **`PERSIST_SECRETS_ON_DISK`**: By default (`PERSIST_SECRETS_ON_DISK=true`), credentials entered during installation are stored in `vars.sh` for non-interactive re-runs. Set `PERSIST_SECRETS_ON_DISK=false` to prevent writing sensitive credentials to disk.
+- **File Permissions**: State files are created with strict POSIX permissions (`umask 077` and `chmod 600`), preventing non-owner access. The `terraform.tfvars` the installer generates from it gets the same `0600` treatment, and is regenerated on every run so the two cannot disagree.
+- **`PERSIST_SECRETS_ON_DISK`**: By default (`PERSIST_SECRETS_ON_DISK=true`), credentials entered during installation are stored in `install.env` for non-interactive re-runs. Set `PERSIST_SECRETS_ON_DISK=false` to prevent writing sensitive credentials to disk.
 - **Secrets also live in Terraform state.** Every credential passed through the composition is stored in plaintext in the Terraform state, which the installer keeps in a GCS bucket (`<project>-kube-agents-tfstate`, versioned). Restrict that bucket's IAM to the administrators who may read the credentials; see the [composition README](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install)'s warning.
 
 ## Where to go next

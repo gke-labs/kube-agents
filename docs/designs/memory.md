@@ -376,8 +376,8 @@ The second is backward compatibility, and it is what picks _which_ store. The fi
 store is what this repository shipped before `kube_agents_memory` existed. Every
 place a default is taken is a place something older is being read: an upgrade
 re-running `install.sh` with no `--memory`, a CR written against the previous CRD
-schema and reconciled by a newer operator, a `vars.sh` from before
-`MEMORY_PROVIDER` was prompted for. Defaulting those to ranked recall would grow
+schema and reconciled by a newer operator, an install configuration from before
+the memory question was prompted for. Defaulting those to ranked recall would grow
 each of them an API server and a Postgres database nobody asked for, and would
 point the agent at a Hindsight service the install never deployed. Taking a
 default has to mean "keep what you have". An enterprise fleet that wants ranked
@@ -392,15 +392,15 @@ to agree about it, and the reason they are listed together is that a disagreemen
 between any two of them is silent: the install still succeeds, and what is wrong
 is either a database nobody asked for or a memory tool that never loads.
 
-| Where                                               | What it holds                                                                  |
-| --------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `install.sh --memory=file\|hindsight\|off`          | the question a human answers, also prompted interactively                      |
-| `MEMORY_PROVIDER` in `k8s-operator/scripts/vars.sh` | the answer, as a provider name; validated against `MEMORY_PROVIDER_CHOICES`    |
-| `spec.harness.memory.provider`                      | the answer, on the CR — the only copy the running system reads                 |
-| `MEMORY_PROVIDER` env on the pod                    | the same value, for the entrypoint, which runs before `config.yaml` is in play |
+| Where                                      | What it holds                                                                  |
+| ------------------------------------------ | ------------------------------------------------------------------------------ |
+| `install.sh --memory=file\|hindsight\|off` | the question a human answers, also prompted interactively                      |
+| `MEMORY` in `install.env`                  | the answer, as the mode the flag takes; `memory_provider_from_mode` maps it    |
+| `spec.harness.memory.provider`             | the answer, on the CR — the only copy the running system reads                 |
+| `MEMORY_PROVIDER` env on the pod           | the same value, for the entrypoint, which runs before `config.yaml` is in play |
 
-`MEMORY_PROVIDER` is the only variable in that answer. The install also writes
-`MEMORY_ENABLED`, and it is deliberately **not** consulted anywhere in the list
+`MEMORY_PROVIDER` is the only variable in that answer. The install also renders
+`MEMORY_ENABLED` into the tfvars, and it is deliberately **not** consulted anywhere in the list
 above: it switches on Hermes' own `MEMORY.md`/`USER.md`, a store with no per-user
 scoping that each provider here replaces rather than supplements, so every install
 this repository has ever written set it `false` while running a provider quite

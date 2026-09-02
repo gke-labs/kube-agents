@@ -6,10 +6,10 @@
 # ==============================================================================
 
 # gke_dns_endpoint_flag, so every CI get-credentials picks the same endpoint the
-# installer would. Only this helper is pulled in, not k8s-operator/scripts/common.sh,
+# installer would. Only this helper is pulled in, not scripts/installer/common.sh,
 # whose state file and print_* helpers CI has no use for.
-# shellcheck source=k8s-operator/scripts/gke_dns_endpoint.sh
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../k8s-operator/scripts" && pwd)/gke_dns_endpoint.sh"
+# shellcheck source=scripts/installer/gke_dns_endpoint.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../scripts/installer" && pwd)/gke_dns_endpoint.sh"
 
 # TODO(boskos): Once oss-test-infra#2655 merges and deploys Boskos project leasing,
 # consider failing closed if JOB_NAME is set and PROJECT_ID is unset.

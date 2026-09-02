@@ -7,43 +7,93 @@
 # install to the same engine (terraform/examples/full-install).
 #
 # Contract: the caller defines print_info / print_warning / print_error before
-# calling anything here that reports. Functions read the vars.sh variable set
-# from the environment (source vars.sh first); none of them prompt.
+# calling anything here that reports. Functions read the install.env variable
+# set from the environment (load it first); none of them prompt.
 # ==============================================================================
 
 # ─── Shared Installer Defaults ────────────────────────────────────────────────
-# The values every installer front-end must agree on. Each default has exactly
-# one home here so the entry points cannot drift apart.
-DEFAULT_CLUSTER_NAME="platform-agent-host"
-DEFAULT_REGION="us-central1"
-# Autopilot, because it is the shape this project is developed and validated
-# against: the autopush and staging installs already run it, the chart needs no
-# node pool, and gVisor comes from Autopilot's built-in RuntimeClass rather than
-# a dedicated pool. Standard remains a first-class choice and is what
-# --cluster-mode=standard, CLUSTER_MODE=standard, or a hand-written tfvars
-# selects; it is also required for a zonal install, which Autopilot cannot do.
+# Every default an install gets for saying nothing lives in install.defaults.env
+# at the repository root, beside install.env. One file, one job: this one has
+# none of them inline, and a point of use reads its DEFAULT_* key rather than
+# repeating the value. The exception is a fallback that deliberately differs
+# from the fresh-install default because it describes an install that already
+# exists -- `${ENABLE_GVISOR:-false}` here and in install.sh's control panel,
+# each with the argument beside it. Precedence is
+# install.defaults.env → an exported environment variable → install.env → a flag.
+# install.env is sourced with `set -a`, which is what puts it above the export.
 #
-# This decides ONE thing: the shape a FRESH install creates. It never reaches a
-# cluster that already exists -- see write_tfvars_from_state, where every branch
-# with a live cluster takes its mode from the probe instead.
-DEFAULT_CLUSTER_MODE="autopilot"
-# Vertex serves each model from its own subset of locations, and the cluster's
-# region is usually not one of them -- gemini-3.5-flash, the vertex_ai default,
-# is not served from us-central1 (DEFAULT_REGION), so a region-derived default
-# 404s on a stock install. The global endpoint serves the first-party Gemini
-# models from wherever has capacity, which is the only default that works
-# without knowing the cluster's region. Two reasons to override it: it gives no
-# in-region ML processing guarantee, and a Model Garden partner model (Claude,
-# Llama, Mistral) may be served only from specific regions. Which locations
-# serve which model:
-# https://docs.cloud.google.com/vertex-ai/generative-ai/docs/learn/locations
-DEFAULT_VERTEX_LOCATION="global"
-DEFAULT_MODEL_PROVIDER="gemini"
+# Sourced WITHOUT `set -a`, unlike install.env. These stay shell variables: they
+# are this project's defaults, not the install's configuration, and exporting
+# them would put DEFAULT_* into the environment Terraform and the agent see.
+#
+# Resolved relative to this file rather than the working directory, because
+# upgrade.sh and uninstall.sh source these helpers from a fresh clone whose
+# path nobody knows in advance.
+_installer_common_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-.}")" 2>/dev/null && pwd || echo "")"
+INSTALL_DEFAULTS_FILE="${KUBE_AGENTS_INSTALL_DEFAULTS:-${_installer_common_dir}/../../install.defaults.env}"
+unset _installer_common_dir
+if [ -r "$INSTALL_DEFAULTS_FILE" ]; then
+  # shellcheck source=/dev/null
+  . "$INSTALL_DEFAULTS_FILE"
+else
+  # Reachable only from a broken checkout. Every front door needs these to
+  # decide anything at all, so guessing here would produce an install nobody
+  # asked for; refuse and name the file.
+  echo "  ✗ Cannot find the install defaults at ${INSTALL_DEFAULTS_FILE}." >&2
+  echo "  ℹ It ships with the repository. Re-clone, or point KUBE_AGENTS_INSTALL_DEFAULTS at a copy." >&2
+  return 1 2>/dev/null || exit 1
+fi
 
-# All kube-agents images (k8s-operator, platform-agent, credential-proxy,
-# replay-proxy) default to this public registry prefix. Behind-the-firewall
-# installs set REGISTRY_PREFIX to pull mirrored images instead.
-DEFAULT_REGISTRY_PREFIX="ghcr.io/gke-labs/kube-agents"
+# Memory mode (the input spelling, recorded in install.env as MEMORY) → the
+# provider name everything downstream reads. The inverse of install.sh's
+# memory_mode_from_provider, and needed here because install.env records the
+# mode while write_tfvars_from_state emits the provider: upgrade.sh and the
+# Day-2 menu load the file and never pass through install.sh's parameter block,
+# so without this they would generate memory_provider = "multiuser_memory" for
+# a Hindsight install and the apply would delete it.
+memory_provider_from_mode() {
+  case "${1:-}" in
+    hindsight) echo "kube_agents_memory" ;;
+    off) echo "none" ;;
+    file) echo "multiuser_memory" ;;
+    *) echo "" ;;
+  esac
+}
+
+# Make install.env's MEMORY win over a legacy vars.sh MEMORY_PROVIDER, for the
+# front doors that load both files and then generate tfvars directly.
+#
+# The two files spell the setting differently, so "install.env wins on every key
+# it carries" cannot hold for this one by load order alone: the pre-install.env
+# installer persisted `export MEMORY_PROVIDER=…` into vars.sh, every migrated
+# install still has it on disk, and install.sh's migration writes only MEMORY.
+# write_tfvars_from_state prefers MEMORY_PROVIDER (install.sh's own run exports
+# the interview's answer there, and must keep winning), so the stale provider
+# would shadow the operator's edited MEMORY and regenerate the tfvars against
+# the old store -- an apply then deleting the Hindsight API and its Postgres.
+#
+# Call after BOTH loads and before anything reads the pair. Not called by
+# install.sh's own run, which resolves the same precedence in its parameter
+# block (PARAM_MEMORY) and exports MEMORY_PROVIDER from the interview later.
+#
+# The cost, stated because it is real: this cannot distinguish a stale
+# MEMORY_PROVIDER sourced from a legacy vars.sh -- the case it exists for --
+# from one the operator exported for this run. So on these three front doors a
+# recognised MEMORY in install.env beats `MEMORY_PROVIDER=… ./upgrade.sh`, and
+# upgrade.sh has no --memory flag to override it with. That is the accepted
+# trade: MEMORY_PROVIDER is not a documented install.env or environment input
+# (it appears nowhere in install.env.example, and docs/designs/memory.md names
+# MEMORY as the recorded spelling), while the stale-file case silently deletes
+# a Hindsight deployment. To force one for a single run, set MEMORY instead.
+normalize_memory_vars() {
+  local from_mode
+  [ -n "${MEMORY:-}" ] || return 0
+  from_mode="$(memory_provider_from_mode "${MEMORY}")"
+  # An unrecognised MEMORY leaves whatever was already there rather than
+  # blanking it: a typo in install.env must not silently retarget the store.
+  [ -n "$from_mode" ] || return 0
+  export MEMORY_PROVIDER="$from_mode"
+}
 
 # Model provider → the model the install defaults to for that provider.
 default_model_for_provider() {
@@ -222,9 +272,149 @@ retry() {
   return 1
 }
 
-# ─── vars.sh Persistence ──────────────────────────────────────────────────────
-# vars.sh is the install's machine-readable record: the admin console, the e2e
-# tests, and the Day-2 menu all read it. VARS_FILE must be set by the caller.
+# ─── install.env: the hand-authored install configuration ─────────────────────
+# The input every front door reads. install.sh carries its own copy of this
+# loader because it must run before its parameter block and has to work as a
+# standalone curl | bash download with no checkout to source from; the two are
+# kept in step by tests/test_install_script.py. upgrade.sh and uninstall.sh use
+# these.
+#
+# Where the file is, given a repository directory. An explicit
+# KUBE_AGENTS_INSTALL_ENV wins, which is how CI renders one from its own
+# variables rather than keeping install state on an ephemeral runner.
+default_install_env_file() {
+  local repo_dir="${1:-.}"
+  if [ -n "${KUBE_AGENTS_INSTALL_ENV:-}" ]; then
+    echo "${KUBE_AGENTS_INSTALL_ENV}"
+    return 0
+  fi
+  echo "${repo_dir}/install.env"
+}
+
+# Load it into the environment. `set -a` rather than a K=V parser because these
+# values have to reach write_tfvars_from_state and the TF_VAR_* handoff at the
+# end of it, both of which read the environment: a conventional dotenv without
+# `export` would parse and then not travel.
+#
+# Returns 1 when there is no file, so a caller can tell "nothing to load" from
+# "loaded". A file that exists but does not parse is fatal — continuing would
+# provision from defaults, which is the failure this whole input model exists
+# to remove.
+load_install_env() {
+  local file="${1:-}"
+  [ -n "$file" ] && [ -f "$file" ] || return 1
+  # Checked before sourcing: a stray quote would otherwise abort the caller
+  # through its ERR trap with a bash parse error naming no file.
+  if ! bash -n "$file" 2>/dev/null; then
+    print_error "Install configuration '$file' is not valid shell and could not be loaded."
+    print_info "Each line is NAME=value; quote any value containing spaces."
+    exit 1
+  fi
+  set -a
+  # shellcheck disable=SC1090
+  . "$file"
+  set +a
+  return 0
+}
+
+# ─── install.env Persistence ──────────────────────────────────────────────────
+# Rewrite ONE key in install.env, leaving every other line -- including the
+# operator's comments and ordering -- exactly as it was. INSTALL_ENV_FILE must
+# be set by the caller.
+#
+# The Day-2 control panel is the only caller, and it is the one place that may
+# write here: "Save & Apply Configuration Changes" is an explicit instruction
+# to record a change, not the installer quietly overwriting an input. install.sh
+# itself only ever creates the file when there is none.
+#
+# No `export` keyword in the output: install.env is a dotenv, loaded with
+# `set -a`. The value is still %q-quoted, so spaces and quotes survive.
+save_env_var() {
+  local var_name=$1
+  local var_val=$2
+  export "${var_name}=${var_val}"
+
+  local old_umask
+  old_umask=$(umask)
+  umask 077
+
+  if [ -f "$INSTALL_ENV_FILE" ]; then
+    chmod 600 "$INSTALL_ENV_FILE" 2>/dev/null || true
+    # Drops the previous assignment whichever spelling it used, so a file
+    # migrated from vars.sh does not end up carrying both.
+    grep -E -v "^[[:space:]]*(export[[:space:]]+)?${var_name}=" "$INSTALL_ENV_FILE" \
+      > "$INSTALL_ENV_FILE.tmp" 2>/dev/null || true
+    chmod 600 "$INSTALL_ENV_FILE.tmp" 2>/dev/null || true
+    mv "$INSTALL_ENV_FILE.tmp" "$INSTALL_ENV_FILE"
+  fi
+  printf "%s=%q\n" "$var_name" "$var_val" >> "$INSTALL_ENV_FILE"
+  chmod 600 "$INSTALL_ENV_FILE" 2>/dev/null || true
+
+  umask "$old_umask"
+}
+
+# The same, for a credential. PERSIST_SECRETS_ON_DISK=false keeps it out of the
+# file and removes any copy already there, while still exporting it for this
+# run -- the live Secret is its home, and write_tfvars_from_state recovers it.
+save_secret_env_var() {
+  local var_name=$1
+  local var_val=$2
+  export "${var_name}=${var_val}"
+  if is_truthy "${PERSIST_SECRETS_ON_DISK:-$DEFAULT_PERSIST_SECRETS_ON_DISK}"; then
+    save_env_var "$var_name" "$var_val"
+  elif [ -f "$INSTALL_ENV_FILE" ]; then
+    local old_umask
+    old_umask=$(umask)
+    umask 077
+    chmod 600 "$INSTALL_ENV_FILE" 2>/dev/null || true
+    grep -E -v "^[[:space:]]*(export[[:space:]]+)?${var_name}=" "$INSTALL_ENV_FILE" \
+      > "$INSTALL_ENV_FILE.tmp" 2>/dev/null || true
+    chmod 600 "$INSTALL_ENV_FILE.tmp" 2>/dev/null || true
+    mv "$INSTALL_ENV_FILE.tmp" "$INSTALL_ENV_FILE"
+    chmod 600 "$INSTALL_ENV_FILE" 2>/dev/null || true
+    umask "$old_umask"
+  fi
+}
+
+# ─── GitOps repository input names ────────────────────────────────────────────
+# The installer's GitOps coordinates are GITOPS_ORG / GITOPS_REPO. They used to
+# be GITHUB_ORG / GITHUB_REPO, which collided with two other things that mean
+# something else:
+#
+#   - GH_ORG / GH_REPO on the rc and nightly environments name the RELEASE
+#     repository (gke-labs/kube-agents), read by scripts/release/common.sh.
+#     GITOPS_ORG / GITOPS_REPO there name the GitOps repository. A workflow
+#     wiring the installer therefore had to write
+#     `GITHUB_ORG: ${{ vars.GITOPS_ORG }}`, which reads like a mistake and
+#     invites someone to "fix" it to vars.GH_ORG -- scoping a live GitHub App
+#     token at the release repository.
+#   - tests/e2e declares GITHUB_ORG / GITHUB_REPO for the repository a TEST
+#     acts on. Those keep their names; only the installer's inputs move.
+#
+# Call this once, after the install configuration is loaded and before anything
+# reads the coordinates. One home for the fallback, so no reader needs to know
+# both spellings.
+normalize_gitops_repo_vars() {
+  if [ -z "${GITOPS_ORG:-}" ] && [ -n "${GITHUB_ORG:-}" ]; then
+    export GITOPS_ORG="${GITHUB_ORG}"
+    print_warning "GITHUB_ORG is deprecated as an installer input; rename it to GITOPS_ORG (it still works this release)."
+  fi
+  if [ -z "${GITOPS_REPO:-}" ] && [ -n "${GITHUB_REPO:-}" ]; then
+    export GITOPS_REPO="${GITHUB_REPO}"
+    print_warning "GITHUB_REPO is deprecated as an installer input; rename it to GITOPS_REPO (it still works this release)."
+  fi
+  # Exported back under the old names too. The agent runtime, the chart values
+  # and k8s-operator/config/integrations/github all still speak GITHUB_*, and
+  # this is one release of overlap rather than a second source of truth: the
+  # value always comes from GITOPS_*.
+  export GITHUB_ORG="${GITOPS_ORG:-}"
+  export GITHUB_REPO="${GITOPS_REPO:-}"
+}
+
+# ─── vars.sh Persistence (legacy) ─────────────────────────────────────────────
+# The generated state file install.env replaced. Still written by the dev
+# scripts through common.sh's init_var helpers, and still read everywhere as a
+# fallback, so these stay. VARS_FILE must be set by the caller.
 save_var() {
   local var_name=$1
   local var_val=$2
@@ -256,7 +446,7 @@ save_secret_var() {
   if [ "${DRY_RUN:-0}" -eq 1 ]; then
     return 0
   fi
-  if is_truthy "${PERSIST_SECRETS_ON_DISK:-true}"; then
+  if is_truthy "${PERSIST_SECRETS_ON_DISK:-$DEFAULT_PERSIST_SECRETS_ON_DISK}"; then
     save_var "$var_name" "$var_val"
   else
     if [ -f "$VARS_FILE" ]; then
@@ -334,7 +524,7 @@ github_account_type() {
 # fallback to the /users/{user}/installation endpoint that serves personal
 # accounts, so a user-owned GitOps repo can never mint a token. Left unchecked
 # that surfaces far downstream, as an HTTP 500 from a Minty that deployed and
-# passed its readiness probes, so catch it while GITHUB_ORG is still being set.
+# passed its readiness probes, so catch it while GITOPS_ORG is still being set.
 #
 # This exits, so it is the wrong entry point for anything that can still
 # re-prompt: install.sh calls github_account_type directly and settles the value
@@ -352,22 +542,22 @@ check_github_org_is_organization() {
   case "$(github_account_type "$org")" in
     organization) return 0 ;;
     user)
-      print_error "GITHUB_ORG='${org}' is a GitHub user account, not an organization."
+      print_error "GITOPS_ORG='${org}' is a GitHub user account, not an organization."
       print_error "The GitHub Token Minter looks installations up at /orgs/${org}/installation,"
       print_error "which does not exist for personal accounts, so every token request would"
       print_error "fail with a 404 after deployment."
       print_error "Move the GitOps repository to an organization (a free one is enough) and set"
-      print_error "GITHUB_ORG in ${VARS_FILE:-scripts/vars.sh} to it, or re-run with"
+      print_error "GITOPS_ORG in install.env to it, or re-run with"
       print_error "SKIP_GITHUB_ORG_CHECK=true to bypass this check."
       print_error "See the chart's githubMinter values and terraform/modules/github-minter."
       exit 1
       ;;
     missing)
-      print_error "GITHUB_ORG='${org}' does not exist on GitHub."
+      print_error "GITOPS_ORG='${org}' does not exist on GitHub."
       print_error "Check the spelling. The Token Minter resolves installations at"
       print_error "/orgs/${org}/installation, so a name that does not exist fails every"
       print_error "token request after deployment."
-      print_error "Edit GITHUB_ORG in ${VARS_FILE:-scripts/vars.sh}, or re-run with"
+      print_error "Edit GITOPS_ORG in install.env, or re-run with"
       print_error "SKIP_GITHUB_ORG_CHECK=true to bypass this check."
       print_error "(GitHub Enterprise Server is not supported: this check, and the Minter,"
       print_error "both talk to api.github.com.)"
@@ -452,7 +642,7 @@ sys.exit(0 if managed else 1)
 }
 
 # Writes the terraform.tfvars the full-install composition consumes, from the
-# vars.sh variable set in the environment (source vars.sh first). The same
+# install.env variable set in the environment (load it first). The same
 # generator runs from install.sh, upgrade.sh, and uninstall.sh, so the three
 # front-ends can never describe different installs.
 #
@@ -466,6 +656,23 @@ write_tfvars_from_state() {
   local dest="$1"
   local image_tag="${2:-${IMAGE_TAG:-latest}}"
 
+  # MEMORY_PROVIDER when the caller set it (install.sh's own run exports it),
+  # otherwise translated from the MEMORY mode install.env records, and only
+  # then the project default. Taking the default when a Hindsight install said
+  # nothing is what reverted it to the file store.
+  #
+  # The two branches below are reached by different callers. install.sh's own
+  # run arrives with MEMORY_PROVIDER exported from the interview and takes the
+  # first. upgrade.sh, uninstall.sh and the Day-2 menu call
+  # normalize_memory_vars beforehand, which sets MEMORY_PROVIDER from their
+  # MEMORY, so they take the first too and the fallback beneath it is dead for
+  # them -- it still covers a caller that sources these helpers directly.
+  local memory_provider="${MEMORY_PROVIDER:-}"
+  if [ -z "$memory_provider" ]; then
+    memory_provider="$(memory_provider_from_mode "${MEMORY:-}")"
+  fi
+  : "${memory_provider:=${DEFAULT_MEMORY_PROVIDER}}"
+
   # cluster_mode follows the LIVE cluster when there is one. Hardcoding
   # "standard" here planned the destruction of every existing Autopilot
   # install the moment a front door regenerated tfvars against it — the
@@ -473,7 +680,7 @@ write_tfvars_from_state() {
   # deletion-protection apply and upgrade's full apply both became cluster
   # replacements.
   #
-  # CLUSTER_MODE (install.sh --cluster-mode, persisted to vars.sh) therefore
+  # CLUSTER_MODE (install.sh --cluster-mode, recorded in install.env) therefore
   # decides ONE case: the fresh create, where the probe found no cluster and
   # the interview is the only information there is. Every branch on which a
   # cluster exists assigns cluster_mode from the probe, so a stale or
@@ -548,14 +755,14 @@ write_tfvars_from_state() {
 
   # Installing onto an existing cluster: fetch its credentials now, before the
   # recovery loop below — adoption is exactly the case where the credentials
-  # live only in that cluster's Secret (a fresh clone has no vars.sh values),
+  # live only in that cluster's Secret (a fresh clone has no install.env values),
   # and recovery is gated on the kubectl context actually being this cluster.
   if [ "$create_cluster" = "false" ] && command -v kubectl >/dev/null 2>&1; then
     gcloud container clusters get-credentials "${CLUSTER_NAME}" --location "${REGION}" \
       --project "${PROJECT_ID}" >/dev/null 2>&1 || true
   fi
 
-  # vars.sh does not always carry the credentials: PERSIST_SECRETS_ON_DISK=false
+  # install.env does not always carry the credentials: PERSIST_SECRETS_ON_DISK=false
   # keeps them out of it. Their home is the live Secret, so recover any
   # missing key from it — best-effort, since on a fresh install there is
   # no cluster to ask yet and the keys are still in the environment.
@@ -586,16 +793,36 @@ write_tfvars_from_state() {
         -o jsonpath="{.data.${secret_key}}" 2>/dev/null || true; } | base64 --decode 2>/dev/null || true)"
       if [ -n "$secret_val" ]; then
         export "${secret_key}=${secret_val}"
-        print_info "Recovered ${secret_key} from the live 'platform-agent-secrets' Secret (vars.sh does not persist it)."
+        print_info "Recovered ${secret_key} from the live 'platform-agent-secrets' Secret (install.env does not persist it)."
       fi
     done
+  fi
+
+  # Minting the key happens HERE, after the recovery loop above, and only for a
+  # caller that opted in — install.sh, which is the one front door entitled to
+  # create an install that did not exist. Order matters: the loop above skips
+  # any key already set, so a key minted before it would shadow the live Secret
+  # and every run would replace it and restart the pods holding it.
+  # upgrade.sh and uninstall.sh deliberately do not set this: for them an
+  # unfindable key means something is wrong, not that a new install is starting.
+  if [ -z "${API_SERVER_KEY:-}" ] && is_truthy "${KUBE_AGENTS_GENERATE_API_SERVER_KEY:-false}"; then
+    local generated
+    generated="$(openssl rand -hex 16 2>/dev/null \
+      || python3 -c "import secrets; print(secrets.token_hex(16))" 2>/dev/null \
+      || head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    if [ -z "$generated" ]; then
+      print_error "Unable to generate API_SERVER_KEY from a secure random source."
+      return 1
+    fi
+    export API_SERVER_KEY="$generated"
+    print_info "Generated a new API_SERVER_KEY: this install had none and none could be recovered from a live cluster."
   fi
 
   # The composition requires api_server_key non-empty, so fail here with the
   # recovery path spelled out rather than aborting the caller on an opaque
   # unbound-variable error under set -u.
   if [ -z "${API_SERVER_KEY:-}" ]; then
-    print_error "API_SERVER_KEY is not set, vars.sh does not carry it (PERSIST_SECRETS_ON_DISK=false keeps it out), and it could not be recovered from the live Secret."
+    print_error "API_SERVER_KEY is not set, the install configuration does not carry it (PERSIST_SECRETS_ON_DISK=false keeps it out), and it could not be recovered from the live Secret."
     print_info "Recover it and re-run: export API_SERVER_KEY=\"\$(kubectl get secret platform-agent-secrets -n kubeagents-system -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode)\""
     return 1
   fi
@@ -635,11 +862,11 @@ write_tfvars_from_state() {
   # import mutating anything before the confirmation (or on a dry run).
   # With no key and no PEM, defer the minter loudly rather than wedge.
   local enable_github_minter="false"
-  if [ -n "${GITHUB_ORG:-}" ] && [ -n "${GITHUB_REPO:-}" ] && [ -n "${GITHUB_APP_ID:-}" ]; then
+  if [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ] && [ -n "${GITHUB_APP_ID:-}" ]; then
     local minter_key_version=""
     minter_key_version="$({ gcloud kms keys versions list \
-      --key "${KMS_KEY:-github-token-minter-key}" \
-      --keyring "${KMS_KEYRING:-github-token-minter-keyring}" \
+      --key "${KMS_KEY:-$DEFAULT_KMS_KEY}" \
+      --keyring "${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}" \
       --location "$(derive_kms_location "${REGION}")" \
       --project "${PROJECT_ID}" --filter='state=ENABLED' \
       --format='value(name)' 2>/dev/null || true; } | head -1)"
@@ -659,18 +886,18 @@ write_tfvars_from_state() {
   # cluster_mode keeps --gvisor=true meaning the same thing on either shape.
   #
   # The fallback stays false even though a fresh install now defaults to the
-  # sandbox. install.sh owns that default and always writes the result to
-  # vars.sh before sourcing it and calling this function, so the fallback here
+  # sandbox. install.sh owns that default and exports ENABLE_GVISOR before
+  # calling this function, so the fallback here
   # never decides a new install — it only decides the callers that read an
-  # install that already exists. uninstall.sh is the one that matters: vars.sh
-  # is optional there, and the documented `curl … | bash` teardown runs from a
-  # fresh clone that has none. Defaulting on for that caller would let the
-  # Autopilot version-floor check below abort a destroy, leaving an install
-  # with no working way to remove itself.
+  # install that already exists. uninstall.sh is the one that matters:
+  # install.env is optional there, and the documented `curl … | bash` teardown
+  # runs from a fresh clone that has none. Defaulting on for that caller would
+  # let the Autopilot version-floor check below abort a destroy, leaving an
+  # install with no working way to remove itself.
   #
-  # The fallback only reaches the teardown that has no vars.sh, which is not
-  # the ordinary one — a teardown from the checkout that installed sources a
-  # vars.sh saying ENABLE_GVISOR="true". uninstall.sh therefore exports false
+  # The fallback only reaches the teardown that has no install.env, which is not
+  # the ordinary one — a teardown from the checkout that installed loads an
+  # install.env saying ENABLE_GVISOR="true". uninstall.sh therefore exports false
   # itself before calling this, and the comment there is where that argument
   # lives. Do not read the fallback as protecting the teardown on its own.
   local gvisor_node_pool="false" agent_runtime_class=""
@@ -711,7 +938,7 @@ write_tfvars_from_state() {
         print_warning "Could not read the GKE version of Autopilot cluster '${CLUSTER_NAME}'; proceeding as though it supports GKE Sandbox. Below ${GVISOR_AUTOPILOT_MIN_VERSION} the agent Deployment is never created and this run fails at its final check."
       elif ! gke_version_at_least "$master_version" "$GVISOR_AUTOPILOT_MIN_VERSION"; then
         print_error "Autopilot cluster '${CLUSTER_NAME}' runs GKE ${master_version}, and its gvisor RuntimeClass needs ${GVISOR_AUTOPILOT_MIN_VERSION} or later."
-        print_info "Upgrade the cluster, or run the agent on the standard runtime: install.sh takes --gvisor=false, and upgrade.sh reads the choice from ENABLE_GVISOR in k8s-operator/scripts/vars.sh. Continuing would apply every GCP and Helm resource and then fail on a missing agent Deployment."
+        print_info "Upgrade the cluster, or run the agent on the standard runtime: install.sh takes --gvisor=false, and upgrade.sh reads the choice from ENABLE_GVISOR in install.env. Continuing would apply every GCP and Helm resource and then fail on a missing agent Deployment."
         print_info "Tearing down instead? uninstall.sh forces ENABLE_GVISOR=false and is never blocked by this check; if you reach it from some other caller, export ENABLE_GVISOR=false first."
         return 1
       fi
@@ -722,8 +949,12 @@ write_tfvars_from_state() {
   local old_umask
   old_umask="$(umask)"
   umask 077
+  # Published for the front doors' ERR traps: the partial file below is mode
+  # 600 and holds every secret this run was given, and it sits one character
+  # from the real terraform.tfvars. Cleared after the mv succeeds.
+  TFVARS_TMP_FILE="${dest}.tmp"
   {
-    echo "# Generated by the kube-agents installer from vars.sh — regenerated on every"
+    echo "# Generated by the kube-agents installer from install.env — regenerated on every"
     echo "# run. Change settings through install.sh (or its --menu) rather than here."
     echo "project_id   = $(hcl_str "${PROJECT_ID}")"
     echo "cluster_name = $(hcl_str "${CLUSTER_NAME}")"
@@ -737,7 +968,7 @@ write_tfvars_from_state() {
     echo "allow_external_dns_traffic = true"
     echo "deletion_protection        = false"
     echo "enable_gvisor_node_pool    = ${gvisor_node_pool}"
-    echo "gvisor_pool_name           = $(hcl_str "${GVISOR_POOL_NAME:-gvisor-pool}")"
+    echo "gvisor_pool_name           = $(hcl_str "${GVISOR_POOL_NAME:-$DEFAULT_GVISOR_POOL_NAME}")"
     echo "agent_runtime_class        = $(hcl_str "${agent_runtime_class}")"
     echo "enable_cert_manager        = ${enable_cert_manager}"
     echo ""
@@ -750,7 +981,7 @@ write_tfvars_from_state() {
     echo "vertex_project_id  = $(hcl_str "${VERTEX_PROJECT_ID:-}")"
     echo "vertex_location    = $(hcl_str "${VERTEX_LOCATION:-}")"
     echo ""
-    if is_truthy "${PERSIST_SECRETS_ON_DISK:-true}"; then
+    if is_truthy "${PERSIST_SECRETS_ON_DISK:-$DEFAULT_PERSIST_SECRETS_ON_DISK}"; then
       echo "api_server_key    = $(hcl_str "${API_SERVER_KEY:-}")"
       echo "gemini_api_key    = $(hcl_str "${GEMINI_API_KEY:-}")"
       echo "openai_api_key    = $(hcl_str "${OPENAI_API_KEY:-}")"
@@ -767,19 +998,19 @@ write_tfvars_from_state() {
       echo "# terraform as TF_VAR_* environment variables instead."
     fi
     echo ""
-    echo "permission_set = $(hcl_str "${PLATFORM_AGENT_PERMISSION_SET:-read-only}")"
+    echo "permission_set = $(hcl_str "${PLATFORM_AGENT_PERMISSION_SET:-$DEFAULT_PERMISSION_SET}")"
     if [ "${PLATFORM_AGENT_PERMISSION_SET:-}" = "custom" ]; then
       echo "project_roles  = $(hcl_csv_list "${PLATFORM_AGENT_CUSTOM_ROLES:-}")"
     fi
     echo ""
-    echo "enable_google_chat        = $(hcl_bool "${GOOGLE_CHAT_ENABLED:-false}")"
-    echo "chat_topic_name           = $(hcl_str "${CHAT_TOPIC_NAME:-platform-agent-chat-events}")"
-    echo "chat_subscription_name    = $(hcl_str "${CHAT_SUB_NAME:-platform-agent-chat-events-sub}")"
+    echo "enable_google_chat        = $(hcl_bool "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}")"
+    echo "chat_topic_name           = $(hcl_str "${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}")"
+    echo "chat_subscription_name    = $(hcl_str "${CHAT_SUB_NAME:-$DEFAULT_CHAT_SUB_NAME}")"
     echo "google_chat_allowed_users = $(hcl_csv_list "${ALLOWED_USERS:-}")"
-    echo "google_chat_mode          = $(hcl_str "${GOOGLE_CHAT_MODE:-default}")"
+    echo "google_chat_mode          = $(hcl_str "${GOOGLE_CHAT_MODE:-$DEFAULT_GOOGLE_CHAT_MODE}")"
     echo ""
-    echo "enable_slack            = $(hcl_bool "${SLACK_ENABLED:-false}")"
-    if is_truthy "${PERSIST_SECRETS_ON_DISK:-true}"; then
+    echo "enable_slack            = $(hcl_bool "${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}")"
+    if is_truthy "${PERSIST_SECRETS_ON_DISK:-$DEFAULT_PERSIST_SECRETS_ON_DISK}"; then
       echo "slack_bot_token         = $(hcl_str "${SLACK_BOT_TOKEN:-}")"
       echo "slack_app_token         = $(hcl_str "${SLACK_APP_TOKEN:-}")"
     fi
@@ -787,8 +1018,8 @@ write_tfvars_from_state() {
     echo "slack_home_channel      = $(hcl_str "${SLACK_HOME_CHANNEL:-}")"
     echo "slack_home_channel_name = $(hcl_str "${SLACK_HOME_CHANNEL_NAME:-}")"
     echo ""
-    if [ -n "${GITHUB_ORG:-}" ] && [ -n "${GITHUB_REPO:-}" ]; then
-      echo "github_repo = $(hcl_str "${GITHUB_ORG}/${GITHUB_REPO}")"
+    if [ -n "${GITOPS_ORG:-}" ] && [ -n "${GITOPS_REPO:-}" ]; then
+      echo "github_repo = $(hcl_str "${GITOPS_ORG}/${GITOPS_REPO}")"
     fi
     echo "enable_github_minter = ${enable_github_minter}"
     echo "github_app_id        = $(hcl_str "${GITHUB_APP_ID:-}")"
@@ -799,17 +1030,23 @@ write_tfvars_from_state() {
       echo "github_minter_kms_key = $(hcl_str "${KMS_KEY}")"
     fi
     echo ""
-    echo "enable_gke_backup_plan = $(hcl_bool "${ENABLE_GKE_BACKUP_PLAN:-false}")"
+    echo "enable_gke_backup_plan = $(hcl_bool "${ENABLE_GKE_BACKUP_PLAN:-$DEFAULT_ENABLE_GKE_BACKUP_PLAN}")"
     echo ""
     echo "# The CRD defaults dashboardEnabled to true; the installer has always"
     echo "# defaulted it to false and asks. Memory settings mirror --memory."
-    echo "hermes_dashboard_enabled = $(hcl_bool "${HERMES_DASHBOARD_ENABLED:-false}")"
-    echo "memory_enabled           = $(hcl_bool "${MEMORY_ENABLED:-false}")"
-    echo "memory_provider          = $(hcl_str "${MEMORY_PROVIDER:-multiuser_memory}")"
-    echo "user_profile_enabled     = $(hcl_bool "${USER_PROFILE_ENABLED:-false}")"
+    echo "hermes_dashboard_enabled = $(hcl_bool "${HERMES_DASHBOARD_ENABLED:-$DEFAULT_ENABLE_WEBUI}")"
+    echo "memory_enabled           = $(hcl_bool "${MEMORY_ENABLED:-$DEFAULT_MEMORY_ENABLED}")"
+    echo "memory_provider          = $(hcl_str "$memory_provider")"
+    echo "user_profile_enabled     = $(hcl_bool "${USER_PROFILE_ENABLED:-$DEFAULT_USER_PROFILE_ENABLED}")"
   } > "${dest}.tmp"
   chmod 600 "${dest}.tmp"
   mv -f -- "${dest}.tmp" "$dest"
+  # In flight no longer: the front doors' ERR traps read this to remove the
+  # partial file. It is mode 600 and carries every secret the run was given, so
+  # a failure between the redirect above and this line must not leave it in
+  # terraform/examples/full-install/ under a name one letter from the real one.
+  # shellcheck disable=SC2034  # read by install/upgrade/uninstall's ERR traps
+  TFVARS_TMP_FILE=""
   umask "$old_umask"
 
   # Terraform reads TF_VAR_* only where terraform.tfvars is silent, so with

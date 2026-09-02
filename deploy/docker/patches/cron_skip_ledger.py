@@ -28,7 +28,7 @@ hourly and half-hourly jobs fire, so they are contention, not noise. Every one
 of the board's 1000 rows reads ``completed``. There is no query against the
 current schema that can find the twenty.
 
-The five ways an occurrence is lost, all now recorded with a distinguishing
+Five ways an occurrence is lost, all recorded with a distinguishing
 reason (the codes below are the vocabulary, and they are content-free so they
 can also be projected to monitoring):
 
@@ -87,6 +87,20 @@ The timezone-repair branch in ``get_due_jobs`` is also left alone: in the
 common case it re-anchors onto the same wall-clock time later in the same
 period and nothing is lost, so a row there would be a false positive in every
 case but a rare DST collision.
+
+v2026.8.19 added two more drop paths, and neither is recorded here yet.
+``tick``'s dispatch loop grew an ``except`` around ``create_execution``: it
+releases the in-flight claim and returns, and because ``advance_next_runs``
+already moved ``next_run_at``, the occurrence is gone leaving nothing but a
+``logger.exception`` — the exact shape this ledger exists to close. Separately,
+``_run_and_release`` now re-takes the fire claim at execution time and, when
+that CAS loses, writes ``Fire claim lost; execution was not started.`` as a
+FAILED execution — ``dispatch_claim_rejected``'s complaint again, an
+at-most-once guarantee working correctly and counted as a fault by
+``cron_health``. Both are deliberately left out of the base-image bump that
+found them and tracked in #1131: a sixth and seventh code is a change to the
+vocabulary above, which monitoring reads, and wants reviewing on its own
+merits.
 
 Hole 2 — pruning is global, so a chatty job evicts a quiet one
 ---------------------------------------------------------------

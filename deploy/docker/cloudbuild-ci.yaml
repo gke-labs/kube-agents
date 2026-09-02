@@ -3,7 +3,7 @@
 # Why this exists next to cloudbuild.yaml rather than replacing it: that config
 # builds exactly one --target and is called with a different one by
 # .github/workflows/docker-publish-gcp.yml and
-# k8s-operator/scripts/dev/dev_rebuild_agent.sh. Only hack/ci-deploy.sh needs
+# scripts/dev/dev_rebuild_agent.sh. Only hack/ci-deploy.sh needs
 # all three at once, so the multi-image shape lives here and the single-target
 # contract those two depend on stays untouched.
 #

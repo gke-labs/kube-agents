@@ -9188,6 +9188,15 @@ spec:
                             "!has(self.enabled) || self.enabled == false || (has(self.botTokenSecretRef)
                             && has(self.appTokenSecretRef))"
                   type: object
+                mode:
+                  description: |-
+                    Mode selects which component stack the operator renders.  "today" is the
+                    current architecture.  "next" additionally renders the NATS and A2A
+                    gateway components, which are otherwise dark.  Absent means "today".
+                  enum:
+                    - today
+                    - next
+                  type: string
                 networkPolicy:
                   description:
                     NetworkPolicy configures the operator-generated egress

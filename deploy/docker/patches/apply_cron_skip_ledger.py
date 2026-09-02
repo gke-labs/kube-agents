@@ -239,11 +239,18 @@ SCHED_IMPORT_PATCHED = (
 # advance_next_runs() has already moved next_run_at for the whole due set by
 # the time any of the three guards below runs, so each one drops the
 # occurrence permanently rather than deferring it.
+#
+# The trailing _clear_run_claim_best_effort() arrived in v2026.8.19. It is in
+# the anchor because the anchor is verbatim source, not because it separates
+# anything: the near-identical guard on the submit-failure path logs the same
+# two lines, and what keeps this anchor off it is that one's deeper
+# indentation and its `isinstance(submit_err, RuntimeError) and` condition.
 SCHED_SHUTDOWN_GUARD = '''            if _interpreter_shutting_down():
                 logger.warning(
                     "Job '%s' not dispatched — interpreter is shutting down",
                     job.get("name", job_id),
                 )
+                _clear_run_claim_best_effort()
                 return None
 '''
 
@@ -252,6 +259,7 @@ SCHED_SHUTDOWN_GUARD_PATCHED = '''            if _interpreter_shutting_down():
                     "Job '%s' not dispatched — interpreter is shutting down",
                     job.get("name", job_id),
                 )
+                _clear_run_claim_best_effort()
                 # kube-agents patch: next_run_at was advanced for this whole
                 # due set before dispatch, so the occurrence is gone, not
                 # deferred. See tools/cron_skip_ledger.py.

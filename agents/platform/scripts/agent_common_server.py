@@ -11,11 +11,11 @@ import urllib.error
 
 from typing import Annotated
 from pydantic import Field
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 from session_manager import SessionManager
 
-# Initialize the FastMCP server
-mcp = FastMCP("Agent Common")
+# Initialize the MCP server
+mcp = MCPServer("Agent Common")
 
 def log(msg: str):
     print(f"[COMMON-MCP] {msg}", file=sys.stderr)

@@ -43,14 +43,14 @@
   body.viz-root { background:var(--surface-0); color:var(--text-primary);
     font:14.5px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
     -webkit-font-smoothing:antialiased; }
-  .wrap { max-width:1060px; margin:0 auto; padding:0 28px 80px; }
+  .wrap { max-width:1120px; margin:0 auto; padding:0 28px 80px; }
   a { color:var(--accent-link,var(--accent)); text-decoration:none; font-weight:600; }
   b, strong { font-weight:650; }
-  code, .num, .tile .v, .score .val, .cap { font-family:'DM Mono',ui-monospace,SFMono-Regular,Menlo,monospace; }
+  code, .num, .tile .v, .cap, .pa-count { font-family:'DM Mono',ui-monospace,SFMono-Regular,Menlo,monospace; }
   code { font:600 12px ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--text-secondary); }
 
   .top { position:sticky; top:0; z-index:5; background:var(--surface-1); border-bottom:1px solid var(--line); }
-  .top-in { max-width:1060px; margin:0 auto; padding:13px 28px; display:flex; align-items:center; gap:16px; }
+  .top-in { max-width:1120px; margin:0 auto; padding:13px 28px; display:flex; align-items:center; gap:16px; }
   .brand { font-size:15px; font-weight:750; letter-spacing:-.01em; display:flex; align-items:center; gap:9px; }
   .brand .logo { width:22px; height:22px; border-radius:6px; background:var(--accent-deep,var(--accent)); display:inline-flex;
     align-items:center; justify-content:center; color:#fff; font-size:12px; font-weight:800; }
@@ -70,13 +70,23 @@
   h2 { font-size:15px; font-weight:750; letter-spacing:-.01em; margin:40px 0 4px; }
   .sub { font-size:12.5px; color:var(--text-muted); margin-bottom:12px; }
 
+  /* bands */
+  .band { margin-top:38px; }
+  .band-h { display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; }
+  .band-h h2 { margin:0; font-size:12px; font-weight:800; letter-spacing:.14em; text-transform:uppercase;
+    color:var(--accent-link,var(--accent)); }
+  .band-h .cohort { font-size:12px; color:var(--text-muted); }
+  .band .sub { margin-top:3px; }
+  .band .card { margin-top:14px; }
+
   /* metric tiles */
-  .tiles { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-top:24px; }
+  .tiles { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-top:12px; }
+  .tiles-3 { grid-template-columns:repeat(3,1fr); }
   .tile { background:var(--surface-1); border:1px solid var(--line); border-radius:12px;
     padding:16px 18px 14px; box-shadow:var(--shadow); }
   .tile .k { font-size:11.5px; font-weight:700; letter-spacing:.05em; text-transform:uppercase; color:var(--text-muted); }
   .tile .v { font-size:28px; font-weight:800; letter-spacing:-.02em; margin-top:6px; font-variant-numeric:tabular-nums;
-    display:flex; align-items:baseline; gap:10px; }
+    display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; }
   .tile .v small { font-size:13px; color:var(--text-muted); font-weight:600; }
   .delta { font-size:12px; font-weight:750; border-radius:999px; padding:2px 9px; }
   .delta.up { background:var(--good-bg); color:var(--good-text); }
@@ -85,6 +95,9 @@
 
   .card { background:var(--surface-1); border:1px solid var(--line); border-radius:12px; box-shadow:var(--shadow); }
   .pad { padding:18px 20px; }
+  .card .t { font-size:14px; font-weight:750; }
+  .card .s { font-size:12px; color:var(--text-muted); margin-top:1px; }
+  .chartcard svg { display:block; width:100%; height:196px; margin-top:10px; }
 
   /* pills */
   .pill { display:inline-flex; align-items:center; gap:6px; border-radius:6px; padding:3px 9px;
@@ -92,10 +105,9 @@
   .p-pass { background:var(--good-bg); color:var(--good-text); }
   .p-fail { background:var(--crit-bg); color:var(--crit-text); }
   .p-infra { background:var(--ser-bg); color:var(--ser-text); }
-  .p-pend { background:var(--skip-bg); color:var(--text-secondary); }
   .p-fix { background:var(--accent-soft); color:var(--accent-link,var(--accent)); }
 
-  /* case table */
+  /* evidence table */
   table { border-collapse:collapse; width:100%; }
   th { text-align:left; font-size:11px; color:var(--text-muted); text-transform:uppercase;
     letter-spacing:.06em; font-weight:750; padding:10px 16px; border-bottom:1px solid var(--line); }
@@ -105,31 +117,43 @@
   td.num { font-variant-numeric:tabular-nums; font-weight:600; color:var(--text-secondary); text-align:right; }
   .tname { font-weight:700; }
   .tnote { font-size:12px; color:var(--text-muted); margin-top:1px; }
-  .tdom { font-size:11px; font-weight:700; color:var(--text-secondary); background:var(--surface-2);
-    border:1px solid var(--line); border-radius:999px; padding:2px 9px; white-space:nowrap; }
-  .hist { display:inline-flex; gap:3px; vertical-align:middle; }
-  .hist i { width:9px; height:9px; border-radius:50%; }
-  .h-pass{background:var(--good);} .h-fail{background:var(--crit);}
-  .h-infra{background:var(--ser);} .h-na{background:var(--skip-bg); border:1.5px solid var(--line-2);}
-
-  /* score bar */
-  .score { display:flex; align-items:center; gap:9px; min-width:150px; }
-  .score .bar { position:relative; flex:1; height:6px; border-radius:6px; background:var(--surface-2); overflow:visible; }
-  .score .fill { position:absolute; inset:0; right:auto; border-radius:6px; background:var(--accent); }
-  .score .thr { position:absolute; top:-3px; width:2px; height:12px; background:var(--line-2); border-radius:2px; }
-  .score .val { font-size:12.5px; font-weight:750; font-variant-numeric:tabular-nums; width:30px; text-align:right; }
-
-  .legend { font-size:12px; font-weight:550; color:var(--text-secondary); margin-top:10px; display:flex; gap:18px; }
-  .legend span { display:inline-flex; gap:6px; align-items:center; }
-  .legend i { width:9px; height:9px; border-radius:50%; }
-
-  .split { display:grid; grid-template-columns:1.1fr .9fr; gap:14px; }
-  .chartcard .t { font-size:14px; font-weight:750; }
-  .chartcard .s { font-size:12px; color:var(--text-muted); margin-top:1px; }
-  .chartcard svg { display:block; width:100%; height:170px; margin-top:10px; }
   .prog { position:relative; width:100px; height:6px; border-radius:6px; background:var(--surface-2); overflow:hidden; }
   .prog i { position:absolute; inset:0; right:auto; border-radius:6px; background:var(--accent); }
   .cap { font-size:11.5px; color:var(--text-muted); font-weight:550; }
+
+  /* case x run matrix */
+  .mx { overflow-x:auto; margin-top:12px; padding-bottom:2px; }
+  .mx-row { display:flex; align-items:center; gap:3px; margin-bottom:3px; width:max-content; }
+  .mx-name { width:300px; min-width:300px; font-size:12px; white-space:nowrap; overflow:hidden;
+    text-overflow:ellipsis; display:flex; align-items:center; gap:6px; }
+  .mx-name em { font-style:normal; font-size:9.5px; font-weight:700; padding:1px 7px; border-radius:999px; }
+  .b-hold { background:var(--accent-soft); color:var(--accent-link,var(--accent)); }
+  .b-new { background:var(--skip-bg); color:var(--text-muted); }
+  .cell { width:22px; min-width:22px; height:16px; border-radius:3px; }
+  .c-g { background:var(--good); opacity:.85; }
+  .c-a { background:linear-gradient(180deg, var(--warn) 55%, var(--warn-bg) 55%); }
+  .c-r { background:var(--crit);
+    background-image:repeating-linear-gradient(45deg, transparent 0 3px, rgba(0,0,0,.45) 3px 5px); }
+  .c-i { background:transparent; border:1.5px solid var(--text-muted); }
+  .c-n { background:var(--skip-bg); }
+  .mx-head .mx-col { width:22px; min-width:22px; height:13px; text-align:center; font-size:9px;
+    color:var(--accent-link,var(--accent)); }
+  .mx-ev { margin-top:8px; display:flex; gap:16px; flex-wrap:wrap; font-size:11px;
+    color:var(--accent-link,var(--accent)); }
+  .legend { font-size:12px; font-weight:550; color:var(--text-secondary); margin-top:12px; display:flex; gap:18px; flex-wrap:wrap; }
+  .legend span { display:inline-flex; gap:6px; align-items:center; }
+  .mx-legend .cell { display:inline-block; }
+
+  /* failure-signature pareto */
+  .pa-row { display:grid; grid-template-columns:minmax(140px,220px) 34px 1fr; gap:10px; align-items:center; margin-top:10px; }
+  .pa-bar-wrap { background:var(--surface-2); border-radius:4px; height:14px; }
+  .pa-bar { height:14px; border-radius:4px; }
+  .pa-infra { background:var(--text-muted); }
+  .pa-check { background:var(--accent); }
+  .pa-agent { background:var(--warn); }
+  .pa-unknown { background:var(--line-2); }
+  .pa-count { font-size:13px; font-weight:600; text-align:right; font-variant-numeric:tabular-nums; }
+  .pa-name { font-size:12.5px; }
 
   .empty { border:1.5px dashed var(--line-2); border-radius:12px; padding:24px 26px; background:var(--surface-1); }
   .empty b { font-size:14px; }
@@ -140,7 +164,7 @@
   #tip { position:fixed; top:0; left:0; pointer-events:none; background:var(--text-primary);
     color:var(--surface-1); font-size:12px; font-weight:600; padding:4px 9px; border-radius:7px;
     opacity:0; transition:opacity .08s; z-index:9; white-space:nowrap; }
-  .foot { margin-top:44px; font-size:12.5px; color:var(--text-muted); max-width:84ch; }
+  .foot { margin-top:44px; font-size:12.5px; color:var(--text-muted); max-width:90ch; }
 </style>
 </head>
 <body class="viz-root" data-palette="#8b5cf6">
@@ -149,7 +173,7 @@
 <div class="top"><div class="top-in">
   <span class="brand"><span class="logo">ka</span>evals</span>
   <nav class="nav">
-    <a class="on" href="#suite">Test suite</a><a href="#trends">Trends</a>
+    <a class="on" href="#agent">The agent</a><a href="#gate">The gate</a>
     <a href="#nightly">Evidence</a><a href="#release">Releases</a>
   </nav>
   <span class="meta"><span id="headmeta">__META__</span> · <span id="freshness" class="fresh">__FRESHNESS__</span></span>
@@ -188,12 +212,34 @@ document.addEventListener("mousemove",e=>{
 const DASH = {
   bootstrap: __DATA_JSON__,
   notes: __NOTES_JSON__,
+  events: __EVENTS_JSON__,
   refreshMs: 60000,
   freshnessTickMs: 30000,
   staleDefaultS: 7200,
-  judgeThreshold: 0.8,
   screeningWindow: 20,
-  maxTrendPoints: 10,
+  repResults: ["pass", "fail", "infra"],
+  matrixRuns: 30,
+  trendDays: 30,
+  paretoWindowDays: 7,
+  paretoMaxRows: 8,
+  runEventFailFraction: 0.8,
+  weekMs: 7 * 24 * 3600 * 1000,
+  dayMs: 24 * 3600 * 1000,
+  reasonSnippetChars: 60,
+  runResultGreen: "SUCCESS",
+  // Failure-signature maps; mirrors render.py's SIG_* / *_REASON_KEYWORDS.
+  sig429: "http 429",
+  sigNotRealRun: ["not evidence of a real agent run", "not_a_real_run"],
+  sigPhrasesAbsent: "required phrases absent",
+  checkNameRe: /check[ :]+['"]?([A-Za-z0-9_.\/-]+)/i,
+  infraReasonKeywords: ["http 429", "rate limit", "timed out", "timeout", "connection"],
+  checkReasonKeywords: ["required phrases absent"],
+  agentReasonKeywords: ["false finding"],
+  labelNoReason: "(no reason recorded)",
+  labelNoReasonInfra: "(infra, no reason recorded)",
+  trendEventLabelChars: 18,
+  trendEventRowOffset: 10,
+  runEventCaption: "run-level events excluded from per-case stats",
   issueUrl: "https://github.com/gke-labs/kube-agents/issues",
 };
 
@@ -203,14 +249,6 @@ let unreachable = false;
 const esc = (value) => String(value)
   .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
   .replace(/"/g, "&quot;").replace(/'/g, "&#x27;");
-
-const RESULT_PILLS = {
-  pass: '<span class="pill p-pass">PASSED</span>',
-  fail: '<span class="pill p-fail">FAILED</span>',
-  infra: '<span class="pill p-infra">INFRA</span>',
-  pend: '<span class="pill p-pend">IN BUILD</span>',
-};
-const HIST_CLASSES = { pass: "h-pass", fail: "h-fail", infra: "h-infra", na: "h-na" };
 
 /* ---- data.json access (tolerant, mirrors render.py) ---- */
 
@@ -223,40 +261,24 @@ function sortedRuns(data) {
 }
 const runTasks = (run) => (run ? (run.tasks || []).filter((t) => t && typeof t === "object") : []);
 // Runs that measured anything: at least one task row. An aborted build
-// parses to zero tasks; anchoring the tiles or the suite table to one
-// would render vacuous 0/0 states. Trends and the header sha stay on
-// sortedRuns. Mirrors render.py's measured_runs.
+// parses to zero tasks; giving one a matrix column or a trend point would
+// chart a run that measured nothing. Mirrors render.py's measured_runs.
 const measuredRuns = (data) => sortedRuns(data).filter((r) => runTasks(r).length);
-
-function countedResults(run) {
-  let passed = 0, failed = 0, infra = 0;
-  for (const task of runTasks(run)) {
-    const result = String(task.result || "").toLowerCase();
-    if (result === "pass") passed += 1;
-    else if (result === "fail") failed += 1;
-    else if (result === "infra") infra += 1;
-  }
-  return [passed, failed, infra];
-}
-function passFraction(run) {
-  const [passed, failed] = countedResults(run);
-  return passed + failed ? passed / (passed + failed) : null;
-}
-function medianTaskMinutes(run) {
-  const durations = runTasks(run).map((t) => t.duration_s)
-    .filter((d) => typeof d === "number").sort((a, b) => a - b);
-  if (!durations.length) return null;
-  const mid = Math.floor(durations.length / 2);
-  const median = durations.length % 2 ? durations[mid] : (durations[mid - 1] + durations[mid]) / 2;
-  return median / 60;
-}
-const latestTaskFor = (name, run) => runTasks(run).find((t) => t.name === name) || null;
 
 function parseIso(value) {
   if (typeof value !== "string") return null;
-  const ms = Date.parse(value);
+  // render.py's parse_iso assumes UTC for a timezone-naive stamp; bare
+  // Date.parse would read one as *local* time and break baked-vs-live
+  // parity for any viewer outside UTC.
+  let text = value;
+  if (text.includes("T") && !/(?:[zZ]|[+-]\d\d:?\d\d)$/.test(text)) text += "Z";
+  const ms = Date.parse(text);
   return Number.isNaN(ms) ? null : ms;
 }
+const utcDay = (value) => {
+  const ms = parseIso(value);
+  return ms == null ? null : new Date(ms).toISOString().slice(0, 10);
+};
 const utcStamp = (ms) => new Date(ms).toISOString().slice(0, 16).replace("T", " ");
 
 function runLabel(run, index) {
@@ -264,8 +286,120 @@ function runLabel(run, index) {
   const buildId = String(run.build_id || "");
   return buildId ? buildId.slice(0, 6) : `run ${index + 1}`;
 }
+// Whole-number guard, mirroring render.py's is_count (bools are data errors).
+const isCount = (value) => typeof value === "number" && Number.isInteger(value);
 
-/* ---- HTML fragments (mirrors render.py) ---- */
+/* ---- reps, cell states, run-level events (mirrors render.py) ---- */
+
+function taskReps(task) {
+  const reps = [];
+  if (Array.isArray(task.reps)) {
+    for (const rep of task.reps) {
+      if (!rep || typeof rep !== "object") continue;
+      const result = String(rep.result || "").toLowerCase();
+      if (DASH.repResults.includes(result)) {
+        reps.push({ result, reason: typeof rep.reason === "string" ? rep.reason : null });
+      }
+    }
+  }
+  if (reps.length) return reps;
+  const result = String(task.result || "").toLowerCase();
+  if (DASH.repResults.includes(result)) return [{ result, reason: null }];
+  return [];
+}
+
+function repCounts(reps) {
+  let passed = 0, failed = 0, infra = 0;
+  for (const rep of reps) {
+    if (rep.result === "pass") passed += 1;
+    else if (rep.result === "fail") failed += 1;
+    else infra += 1;
+  }
+  return [passed, failed, infra];
+}
+
+function cellState(task) {
+  const reps = taskReps(task);
+  if (!reps.length) return "none";
+  const [passed, failed] = repCounts(reps);
+  if (passed && failed) return "partial";
+  if (failed) return "fail";
+  if (passed) return "pass";
+  return "infra";
+}
+
+function isRunEvent(run) {
+  const graded = runTasks(run).map(cellState)
+    .filter((s) => s === "pass" || s === "partial" || s === "fail");
+  if (!graded.length) return false;
+  return graded.filter((s) => s === "fail").length / graded.length >= DASH.runEventFailFraction;
+}
+
+/* ---- cohorts and windows (mirrors render.py) ---- */
+
+function mergedFinalRuns(data) {
+  const runs = measuredRuns(data).filter((r) => r.pr_merged === true);
+  const key = (run) => (run.pr !== undefined && run.pr !== null ? `pr:${run.pr}` : run);
+  const final = new Map();
+  for (const run of runs) final.set(key(run), run); // chronological: last wins
+  return runs.filter((r) => final.get(key(r)) === r);
+}
+
+function referenceMs(data) {
+  // Deliberately not the wall clock, so the baked HTML and this re-render
+  // of the same data.json agree.
+  const anchor = parseIso(data.generated_at);
+  if (anchor != null) return anchor;
+  const runs = sortedRuns(data);
+  for (let i = runs.length - 1; i >= 0; i -= 1) {
+    const ms = parseIso(runs[i].started);
+    if (ms != null) return ms;
+  }
+  return null;
+}
+
+function weekPassStats(data) {
+  const anchor = referenceMs(data);
+  const cur = { pass: 0, fail: 0, runs: 0 };
+  const prev = { pass: 0, fail: 0 };
+  for (const run of mergedFinalRuns(data)) {
+    const started = parseIso(run.started);
+    let bucket = null;
+    if (anchor == null || started == null) bucket = cur;
+    else if (anchor - DASH.weekMs < started && started <= anchor) bucket = cur;
+    else if (anchor - 2 * DASH.weekMs < started && started <= anchor - DASH.weekMs) bucket = prev;
+    if (!bucket) continue;
+    for (const task of runTasks(run)) {
+      const [p, f] = repCounts(taskReps(task));
+      bucket.pass += p;
+      bucket.fail += f;
+    }
+    if (bucket === cur) cur.runs += 1;
+  }
+  const rate = (b) => (b.pass + b.fail ? b.pass / (b.pass + b.fail) : null);
+  return { cur: rate(cur), prev: rate(prev), runsCur: cur.runs };
+}
+
+function dayPoints(data) {
+  const buckets = new Map();
+  for (const run of mergedFinalRuns(data)) {
+    const day = utcDay(run.started);
+    if (day == null) continue;
+    if (!buckets.has(day)) buckets.set(day, [0, 0]);
+    const bucket = buckets.get(day);
+    for (const task of runTasks(run)) {
+      const [p, f] = repCounts(taskReps(task));
+      bucket[0] += p;
+      bucket[1] += f;
+    }
+  }
+  const points = [...buckets.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))
+    .filter(([, c]) => c[0] + c[1])
+    .map(([day, c]) => [day, c[0] / (c[0] + c[1])]);
+  return points.slice(-DASH.trendDays);
+}
+
+/* ---- notes, badges, events ---- */
 
 function noteHtml(entry) {
   if (!entry) return "";
@@ -280,250 +414,384 @@ function noteHtml(entry) {
   return parts.length ? `<div class="tnote">${parts.join(" · ")}</div>` : "";
 }
 
+function badgeHtml(entry) {
+  const badge = String((entry && entry.badge) || "").trim().toLowerCase();
+  if (badge === "held-out") return '<em class="b-hold">held out</em>';
+  if (badge === "new") return '<em class="b-new">new</em>';
+  return "";
+}
+
+/* ---- failure signatures (mirrors render.py) ---- */
+
+function reasonSignature(reason) {
+  const text = (reason || "").trim();
+  if (!text) return DASH.labelNoReason;
+  const low = text.toLowerCase();
+  if (low.includes(DASH.sig429)) return "endpoint saturation (infra)";
+  if (DASH.sigNotRealRun.some((sig) => low.includes(sig))) return "not a real agent run";
+  if (low.includes(DASH.sigPhrasesAbsent)) {
+    const match = DASH.checkNameRe.exec(text);
+    return match ? `exact-check: ${match[1]}` : "exact-check: required phrases absent";
+  }
+  // Code points, not UTF-16 units, so the snippet matches Python's text[:N].
+  const chars = Array.from(text);
+  return chars.length > DASH.reasonSnippetChars
+    ? chars.slice(0, DASH.reasonSnippetChars).join("") + "…" : text;
+}
+
+function reasonClass(reason) {
+  const low = (reason || "").toLowerCase();
+  if (DASH.infraReasonKeywords.some((kw) => low.includes(kw))) return "infra";
+  if (DASH.checkReasonKeywords.some((kw) => low.includes(kw))) return "check";
+  if (DASH.agentReasonKeywords.some((kw) => low.includes(kw))) return "agent";
+  return "unknown";
+}
+
+function paretoGroups(data) {
+  const anchor = referenceMs(data);
+  const groups = new Map();
+  for (const run of sortedRuns(data)) {
+    const started = parseIso(run.started);
+    if (anchor != null) {
+      if (started == null) continue;
+      if (started <= anchor - DASH.paretoWindowDays * DASH.dayMs || started > anchor) continue;
+    }
+    if (isRunEvent(run)) continue; // charged to the run, not the cases
+    for (const task of runTasks(run)) {
+      for (const rep of taskReps(task)) {
+        if (rep.result === "pass") continue;
+        const reason = (rep.reason || "").trim();
+        let label, cls;
+        if (reason) {
+          label = reasonSignature(reason);
+          cls = reasonClass(reason);
+        } else if (rep.result === "infra") {
+          // No reason, but the result itself says what it was.
+          label = DASH.labelNoReasonInfra;
+          cls = "infra";
+        } else {
+          label = DASH.labelNoReason;
+          cls = "unknown";
+        }
+        if (!groups.has(label)) groups.set(label, { label, count: 0, cls });
+        groups.get(label).count += 1;
+      }
+    }
+  }
+  return [...groups.values()]
+    .sort((a, b) => b.count - a.count || (a.label < b.label ? -1 : 1))
+    .slice(0, DASH.paretoMaxRows);
+}
+
+/* ---- HTML fragments (mirrors render.py) ---- */
+
 const deltaChip = (cls, text) => `<span class="delta ${cls}">${esc(text)}</span>`;
 const tile = (key, valueHtml, chipHtml, detail) =>
   `<div class="tile"><div class="k">${esc(key)}</div>` +
   `<div class="v">${valueHtml}${chipHtml}</div><div class="d2">${esc(detail)}</div></div>`;
 
-function ratioChip(currentValue, previousValue, unit, havePreviousRun) {
-  // "first run" only when there is genuinely no prior run -- a prior run
-  // that just failed to report this metric gets no chip at all.
-  if (currentValue == null || previousValue == null || !previousValue || !currentValue) {
-    return previousValue == null && !havePreviousRun ? deltaChip("flat", "first run") : "";
-  }
-  if (previousValue / currentValue >= 1.5) {
-    return deltaChip("up", `▲ ${(previousValue / currentValue).toFixed(1)}× cheaper`);
-  }
-  if (currentValue / previousValue >= 1.5) {
-    return deltaChip("flat", `▼ ${(currentValue / previousValue).toFixed(1)}× slower`);
-  }
-  return deltaChip("flat", `≈ prev ${previousValue.toFixed(0)}${unit}`);
-}
-
-function tilesHtml(data) {
-  const runs = measuredRuns(data);
-  const latest = runs[runs.length - 1] || null;
-  const previous = runs.length > 1 ? runs[runs.length - 2] : null;
+function agentTilesHtml(data, events) {
   const tiles = [];
 
-  if (latest) {
-    const [passed, failed, infra] = countedResults(latest);
-    // "all passed" must never be claimed by a run that measured nothing.
-    const chip = failed ? deltaChip("flat", `${failed} failed`)
-      : infra ? deltaChip("flat", `${infra} infra`)
-      : passed ? deltaChip("up", "all passed") : "";
-    const buildId = String(latest.build_id || "?");
-    tiles.push(tile("Latest run", `${passed}<small>/ ${passed + failed} passed</small>`, chip,
-      `build ${buildId.slice(0, 8)}… · ${latest.project || "?"}`));
+  const stats = weekPassStats(data);
+  if (stats.cur != null) {
+    const pct = Math.round(stats.cur * 100);
+    let chip = "";
+    if (stats.prev != null) {
+      const diff = pct - Math.round(stats.prev * 100);
+      chip = diff > 0 ? deltaChip("up", `▲ +${diff}pt vs prior week`)
+        : diff < 0 ? deltaChip("flat", `▼ ${diff}pt vs prior week`)
+        : deltaChip("flat", "= prior week");
+    }
+    tiles.push(tile("Pass rate · this week", `${pct}<small>%</small>`, chip,
+      `merged-PR cohort · ${stats.runsCur} run${stats.runsCur !== 1 ? "s" : ""} this week`));
   } else {
-    tiles.push(tile("Latest run", "—", "",
-      sortedRuns(data).length ? "no measured runs yet" : "no runs on record"));
+    tiles.push(tile("Pass rate · this week", "—", "",
+      mergedFinalRuns(data).length ? "no merged-PR runs this week" : "no merged-PR runs on record"));
   }
 
-  const coverage = data.coverage || {};
-  // Whole numbers only, mirroring render.py's is_count: value_html is raw
-  // (it carries <small>), so anything else must not be interpolated.
-  if (Number.isInteger(coverage.domains_covered) && Number.isInteger(coverage.domains_total)) {
-    const uncovered = (coverage.uncovered || []).map(String);
+  const catches = events.catches || {};
+  if (isCount(catches.product_bugs)) {
+    let value = `${catches.product_bugs}`;
+    if (isCount(catches.prs_blocked)) value += `<small> + ${catches.prs_blocked} PRs blocked</small>`;
+    tiles.push(tile("Product bugs caught", value, "",
+      catches.ledger ? `catch ledger ${catches.ledger}` : "events.yaml annotation"));
+  } else {
+    tiles.push(tile("Product bugs caught", "—", "", "not annotated (events.yaml)"));
+  }
+
+  const coverage = data.coverage && typeof data.coverage === "object"
+    && !Array.isArray(data.coverage) ? data.coverage : {};
+  if (isCount(coverage.domains_covered) && isCount(coverage.domains_total)) {
+    const uncovered = Array.isArray(coverage.uncovered) ? coverage.uncovered.map(String) : [];
     const chip = coverage.domains_covered >= coverage.domains_total
       ? deltaChip("up", "all covered")
       : deltaChip("flat", `${coverage.domains_total - coverage.domains_covered} open`);
-    tiles.push(tile("Domain coverage",
-      `${coverage.domains_covered}<small>/ ${coverage.domains_total}</small>`, chip,
-      uncovered.length ? `uncovered: ${uncovered.join(", ")}` : "all domains covered"));
+    const cases = (data.cases || []).filter((c) => c && typeof c === "object");
+    const blocking = cases.filter((c) => c.active).length;
+    const detail = uncovered.length
+      ? `uncovered: ${uncovered.join(", ")}`
+      : `${cases.length} scenarios · ${blocking} blocking`;
+    tiles.push(tile("Domains covered",
+      `${coverage.domains_covered}<small>/ ${coverage.domains_total}</small>`, chip, detail));
   } else {
-    tiles.push(tile("Domain coverage", "—", "", "not reported"));
-  }
-
-  const med = medianTaskMinutes(latest);
-  if (med != null) {
-    tiles.push(tile("Median case cost", `${med.toFixed(1)}<small>min</small>`,
-      ratioChip(med, medianTaskMinutes(previous), "min", previous != null),
-      `median across ${runTasks(latest).length} cases · latest run`));
-  } else {
-    tiles.push(tile("Median case cost", "—", "", "no task durations yet"));
-  }
-
-  const duration = latest ? latest.duration_s : null;
-  if (typeof duration === "number") {
-    const prevDuration = previous && typeof previous.duration_s === "number"
-      ? previous.duration_s / 60 : null;
-    const finished = latest ? parseIso(latest.finished) : null;
-    tiles.push(tile("Wall clock", `${(duration / 60).toFixed(0)}<small>min</small>`,
-      ratioChip(duration / 60, prevDuration, "min", previous != null),
-      finished != null ? `finished ${utcStamp(finished)} UTC` : "whole-run wall clock"));
-  } else {
-    tiles.push(tile("Wall clock", "—", "", "not reported"));
+    tiles.push(tile("Domains covered", "—", "", "not reported"));
   }
 
   return tiles.join("");
 }
 
-function scoreHtml(judge) {
-  if (typeof judge !== "number") return '<span class="cap">—</span>';
-  const value = Math.min(Math.max(judge, 0), 1);
-  return `<div class="score"><div class="bar">` +
-    `<div class="fill" style="width:${(value * 100).toFixed(0)}%"></div>` +
-    `<div class="thr" style="left:${(DASH.judgeThreshold * 100).toFixed(0)}%"></div></div>` +
-    `<span class="val">${value.toFixed(1)}</span></div>`;
-}
+function gateTilesHtml(data, events) {
+  const tiles = [];
 
-function caseRow(kase, latestRun) {
-  const name = String(kase.name || "?");
-  const task = latestTaskFor(name, latestRun);
-
-  let status;
-  if (task) {
-    status = String(task.result || "").toLowerCase();
-    if (!["pass", "fail", "infra"].includes(status)) status = "pend";
+  if (isCount(events.false_reds_7d)) {
+    tiles.push(tile("False reds · 7d", `${events.false_reds_7d}`, "", "human-classified · events.yaml"));
   } else {
-    const measured = (kase.last3 || [])
-      .map((h) => String(h).toLowerCase())
-      .filter((h) => ["pass", "fail", "infra"].includes(h));
-    status = measured.length ? measured[measured.length - 1] : "pend";
+    tiles.push(tile("False reds · 7d", "—", "", "not annotated (events.yaml)"));
   }
 
-  let last3 = (kase.last3 || []).map((h) => String(h).toLowerCase()).slice(-3);
-  last3 = Array(3 - last3.length).fill("na")
-    .concat(last3.map((h) => (h in HIST_CLASSES ? h : "na")));
-  const hist = last3.map((h) => `<i class="${HIST_CLASSES[h]}" title="${h}"></i>`).join("");
-
-  let judge = task ? task.outcome_validity : null;
-  if (judge == null) {
-    const history = (kase.ov_history || []).filter((h) => typeof h.value === "number");
-    judge = history.length ? history[history.length - 1].value : null;
+  const window = measuredRuns(data).slice(-DASH.matrixRuns);
+  let total = 0, infra = 0, repsReported = false;
+  for (const run of window) {
+    for (const task of runTasks(run)) {
+      if (Array.isArray(task.reps) && task.reps.some((r) => r && typeof r === "object"
+          && DASH.repResults.includes(String(r.result || "").toLowerCase()))) {
+        repsReported = true;
+      }
+      for (const rep of taskReps(task)) {
+        total += 1;
+        if (rep.result === "infra") infra += 1;
+      }
+    }
+  }
+  if (total) {
+    tiles.push(tile("Infra-rep rate", `${(100 * infra / total).toFixed(1)}<small>%</small>`, "",
+      repsReported ? `${infra} of ${total} reps · last ${window.length} runs`
+        : `task-level fallback · last ${window.length} runs`));
+  } else {
+    tiles.push(tile("Infra-rep rate", "—", "", "no measured runs yet"));
   }
 
-  let duration = task ? task.duration_s : null;
-  if (typeof duration !== "number") duration = (kase.durations || {}).med;
-  const durationText = typeof duration === "number" ? `${duration.toFixed(0)}s` : "—";
+  const runs = sortedRuns(data);
+  let green = null, greenIndex = -1;
+  for (let i = runs.length - 1; i >= 0; i -= 1) {
+    if (String(runs[i].result || "") === DASH.runResultGreen && runTasks(runs[i]).length
+        && typeof runs[i].duration_s === "number") {
+      green = runs[i];
+      greenIndex = i;
+      break;
+    }
+  }
+  if (green) {
+    tiles.push(tile("Wall clock · green run", `${(green.duration_s / 60).toFixed(0)}<small>min</small>`,
+      "", `latest green full run · ${runLabel(green, greenIndex)}`));
+  } else {
+    tiles.push(tile("Wall clock · green run", "—", "", "no green full run on record"));
+  }
 
-  const domainHtml = kase.domain ? `<span class="tdom">${esc(kase.domain)}</span>` : "";
+  // Queue wait: data.json carries no queued-at timestamp, so this cannot
+  // be computed. An honest em-dash beats an invented number.
+  tiles.push(tile("Queue wait · median", "—", "", "not reported in data.json"));
 
-  return `<tr><td>${RESULT_PILLS[status]}</td>` +
-    `<td><div class="tname">${esc(name)}</div>${noteHtml(DASH.notes[name])}</td>` +
-    `<td>${domainHtml}</td><td><span class="hist">${hist}</span></td>` +
-    `<td>${scoreHtml(judge)}</td><td class="num">${durationText}</td></tr>`;
+  return tiles.join("");
 }
 
-function suiteHtml(data) {
-  const runs = measuredRuns(data);
-  const latest = runs[runs.length - 1] || null;
-  const rows = (data.cases || []).map((c) => caseRow(c, latest)).join("")
-    || '<tr><td colspan="6"><span class="cap">no cases on record yet</span></td></tr>';
-  return `
-  <h2 id="suite">Test suite</h2>
-  <div class="sub">Latest measured result per case · <b>Result</b> is the gating exact-check verdict · <b>Judge</b> is advisory (threshold tick at ${DASH.judgeThreshold}) · history dots = last 3 runs</div>
-  <div class="card"><table id="cases">
-    <thead><tr><th>Result</th><th>Test case</th><th>Domain</th><th>History</th><th>Judge (advisory)</th><th style="text-align:right">Duration</th></tr></thead>
-    <tbody>${rows}</tbody>
-  </table></div>
-  <div class="legend">
-    <span><i class="h-pass"></i>pass</span><span><i class="h-fail"></i>fail</span>
-    <span><i class="h-infra"></i>INFRA — excluded from verdict</span><span><i class="h-na"></i>not in run</span>
-  </div>`;
-}
+const CELL_CLASSES = { pass: "c-g", partial: "c-a", fail: "c-r", infra: "c-i", none: "c-n" };
+const CELL_TITLES = {
+  pass: "passed all reps",
+  partial: "partial (some reps passed)",
+  fail: "failed all reps",
+  infra: "infra — excluded",
+  none: "not in run",
+};
 
-function chartSvg(points, threshold) {
-  if (points.length < 2) return "";
-  const width = 480, height = 170, px = 14, py = 16, ymax = 1;
-  const xs = (i) => px + (i * (width - 2 * px)) / (points.length - 1);
-  const ys = (v) => height - py - (v / ymax) * (height - 2 * py);
-  const poly = points.map(([, v], i) => `${xs(i).toFixed(1)},${ys(v).toFixed(1)}`).join(" ");
-  const dots = points.map(([label, v], i) =>
-    `<circle cx="${xs(i).toFixed(1)}" cy="${ys(v).toFixed(1)}" r="5" fill="var(--accent)" ` +
-    `stroke="var(--surface-1)" stroke-width="2" data-l="${esc(label)} · ${v.toFixed(2)}"/>`).join("");
-  const xlab = points.map(([label], i) =>
-    `<text x="${xs(i).toFixed(1)}" y="${height - 2}" text-anchor="middle" font-size="10.5" ` +
-    `font-weight="600" fill="var(--text-muted)">${esc(label)}</text>`).join("");
-  const thrLine = threshold != null
-    ? `<line x1="${px}" y1="${ys(threshold).toFixed(1)}" x2="${width - px}" y2="${ys(threshold).toFixed(1)}" ` +
-      `stroke="var(--line-2)" stroke-dasharray="3 4"/>`
-    : "";
-  return `<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">` +
-    `${thrLine}<line x1="${px}" y1="${ys(0).toFixed(1)}" x2="${width - px}" y2="${ys(0).toFixed(1)}" stroke="var(--line)"/>` +
-    `<polyline points="${poly}" fill="none" stroke="var(--accent)" stroke-width="2.5" ` +
-    `stroke-linejoin="round" stroke-linecap="round"/>${dots}${xlab}</svg>`;
-}
+function matrixHtml(data, notes, events) {
+  const runs = measuredRuns(data).slice(-DASH.matrixRuns);
+  const cases = (data.cases || []).filter((c) => c && typeof c === "object" && c.active !== false);
+  if (!runs.length) {
+    return '<div class="cap" style="margin-top:12px">no measured runs yet</div>';
+  }
+  if (!cases.length) {
+    return '<div class="cap" style="margin-top:12px">no active cases on record yet</div>';
+  }
 
-function ratePoints(data) {
-  const points = [];
-  sortedRuns(data).forEach((run, index) => {
-    const fraction = passFraction(run);
-    if (fraction != null) points.push([runLabel(run, index), fraction]);
+  const eventDays = {};
+  for (const e of events.events || []) eventDays[e.date] = e.label;
+  const runDays = runs.map((r) => utcDay(r.started));
+  const runEvents = runs.map(isRunEvent);
+  const taskMaps = runs.map((r) => {
+    const map = new Map();
+    for (const t of runTasks(r)) map.set(String(t.name), t);
+    return map;
   });
-  return points.slice(-DASH.maxTrendPoints);
-}
 
-function judgeTrendCase(data) {
-  const candidates = (data.cases || []).filter((c) => (c.ov_history || []).length >= 2);
-  if (!candidates.length) return null;
-  return candidates.reduce((best, c) =>
-    (c.ov_history.length > best.ov_history.length ? c : best));
-}
+  const head = ['<div class="mx-row mx-head"><div class="mx-name"></div>'];
+  runs.forEach((run, index) => {
+    const day = runDays[index];
+    const marker = day in eventDays ? "▲" : "";
+    let title = `${runLabel(run, index)} · ${day || "?"}`;
+    if (day in eventDays) title += ` · ${eventDays[day]}`;
+    if (runEvents[index]) title += " · run-level event";
+    head.push(`<div class="mx-col" title="${esc(title)}">${marker}</div>`);
+  });
+  head.push("</div>");
 
-function trendsHtml(data) {
-  // No threshold line here: 0.8 is the judge threshold, and drawing it on
-  // the pass-fraction chart would present it as a pass-rate target.
-  const rate = chartSvg(ratePoints(data))
-    || '<div class="cap" style="margin-top:14px">not enough runs yet</div>';
-
-  const labels = {};
-  sortedRuns(data).forEach((run, index) => { labels[String(run.build_id)] = runLabel(run, index); });
-  const judgeCase = judgeTrendCase(data);
-  let judgeTitle = "judge score", judge = "";
-  if (judgeCase) {
-    const points = judgeCase.ov_history
-      .filter((h) => typeof h.value === "number")
-      .map((h) => [labels[String(h.build_id)] || String(h.build_id || "?").slice(0, 6), h.value])
-      .slice(-DASH.maxTrendPoints);
-    judgeTitle = `${judgeCase.name || "?"} · judge score`;
-    judge = chartSvg(points, DASH.judgeThreshold);
+  const rows = [head.join("")];
+  for (const kase of cases) {
+    const name = String(kase.name || "?");
+    const entry = notes[name];
+    const row = [`<div class="mx-row"><div class="mx-name"><span>${esc(name)}</span>${badgeHtml(entry)}</div>`];
+    runs.forEach((run, index) => {
+      const task = taskMaps[index].get(name);
+      const state = task ? cellState(task) : "none";
+      let title = `${name} · ${runLabel(run, index)} · ${CELL_TITLES[state]}`;
+      if (runEvents[index]) title += " · run-level event (charged to the run)";
+      row.push(`<div class="cell ${CELL_CLASSES[state]}" title="${esc(title)}"></div>`);
+    });
+    row.push("</div>");
+    rows.push(row.join(""));
   }
-  judge = judge || '<div class="cap" style="margin-top:14px">no judge history yet</div>';
 
+  const marks = [...new Set(runDays.filter((d) => d != null && d in eventDays))].sort()
+    .map((day) => `<span>▲ ${esc(day.slice(5))} ${esc(eventDays[day])}</span>`);
+  if (marks.length) rows.push(`<div class="mx-ev">${marks.join("")}</div>`);
+  return `<div class="mx">${rows.join("")}</div>`;
+}
+
+function paretoHtml(data) {
+  const groups = paretoGroups(data);
+  if (!groups.length) {
+    return `<div class="cap" style="margin-top:12px">no failing or infra reps in the last ${DASH.paretoWindowDays} days</div>`;
+  }
+  const top = groups[0].count;
+  return groups.map((g) =>
+    `<div class="pa-row"><div class="pa-bar-wrap">` +
+    `<div class="pa-bar pa-${g.cls}" style="width:${(100 * g.count / top).toFixed(1)}%"></div></div>` +
+    `<div class="pa-count">${g.count}</div>` +
+    `<div class="pa-name">${esc(g.label)}</div></div>`).join("");
+}
+
+function trendSvg(points, events) {
+  if (points.length < 2) return "";
+  const width = 1000, height = 196, px = 34, py = 28;
+  const xs = (i) => px + (i * (width - 2 * px)) / (points.length - 1);
+  const ys = (v) => height - py - v * (height - 2 * py);
+  const parts = [`<svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">`];
+  for (const grid of [0.25, 0.5, 0.75, 1.0]) {
+    parts.push(
+      `<line x1="${px}" y1="${ys(grid).toFixed(1)}" x2="${width - px}" y2="${ys(grid).toFixed(1)}" stroke="var(--line)"/>` +
+      `<text x="${px - 6}" y="${(ys(grid) + 3).toFixed(1)}" text-anchor="end" font-size="9" ` +
+      `fill="var(--text-muted)">${Math.round(grid * 100)}</text>`);
+  }
+  const eventDays = {};
+  for (const e of events.events || []) eventDays[e.date] = e.label;
+  let marker = 0;
+  points.forEach(([day], i) => {
+    if (day in eventDays) {
+      let label = eventDays[day];
+      if (label.length > DASH.trendEventLabelChars) {
+        label = label.slice(0, DASH.trendEventLabelChars) + "…";
+      }
+      const textY = py - 6 - (marker % 2) * DASH.trendEventRowOffset;
+      marker += 1;
+      parts.push(
+        `<line x1="${xs(i).toFixed(1)}" y1="${py}" x2="${xs(i).toFixed(1)}" y2="${height - py}" ` +
+        `stroke="var(--accent)" stroke-opacity=".35" stroke-dasharray="3 3"/>` +
+        `<text x="${xs(i).toFixed(1)}" y="${textY}" text-anchor="middle" font-size="9" ` +
+        `fill="var(--accent-link,var(--accent))">${esc(label)}</text>`);
+    }
+  });
+  const poly = points.map(([, v], i) => `${xs(i).toFixed(1)},${ys(v).toFixed(1)}`).join(" ");
+  parts.push(`<polyline points="${poly}" fill="none" stroke="var(--accent)" stroke-width="2.5" ` +
+    `stroke-linejoin="round" stroke-linecap="round"/>`);
+  points.forEach(([day, v], i) => {
+    parts.push(`<circle cx="${xs(i).toFixed(1)}" cy="${ys(v).toFixed(1)}" r="4" fill="var(--accent)" ` +
+      `stroke="var(--surface-1)" stroke-width="2" data-l="${esc(day)} · ${Math.round(v * 100)}%"/>`);
+  });
+  const step = Math.max(1, Math.ceil(points.length / 8));
+  points.forEach(([day], i) => {
+    if (i % step === 0 || i === points.length - 1) {
+      parts.push(`<text x="${xs(i).toFixed(1)}" y="${height - 4}" text-anchor="middle" font-size="9.5" ` +
+        `font-weight="600" fill="var(--text-muted)">${esc(day.slice(5))}</text>`);
+    }
+  });
+  parts.push("</svg>");
+  return parts.join("");
+}
+
+function bandAgentHtml(data, events) {
+  const chart = trendSvg(dayPoints(data), events)
+    || '<div class="cap" style="margin-top:14px">not enough merged-PR days yet (needs runs with pr_merged from the collector)</div>';
   return `
-  <h2 id="trends">Trends</h2>
-  <div class="split">
+  <section class="band">
+    <div class="band-h"><h2 id="agent">The agent</h2><span class="cohort">cohort: final run of each merged PR</span></div>
+    <div class="sub">Measured only where the codebase is what actually shipped.</div>
+    <div class="tiles tiles-3">${agentTilesHtml(data, events)}</div>
     <div class="card pad chartcard">
-      <div class="t">Suite pass fraction, per run</div>
-      <div class="s">pass / (pass + fail) — INFRA excluded</div>
-      <div id="ratechart">${rate}</div>
+      <div class="t">Suite pass fraction, by day</div>
+      <div class="s">merged-PR cohort · pass / (pass + fail) over reps, INFRA excluded · event markers from events.yaml</div>
+      <div id="daytrend">${chart}</div>
     </div>
-    <div class="card pad chartcard">
-      <div class="t">${esc(judgeTitle)}</div>
-      <div class="s">advisory · threshold tick at ${DASH.judgeThreshold}</div>
-      <div id="judgechart">${judge}</div>
+  </section>`;
+}
+
+function bandGateHtml(data, notes, events) {
+  const matrixRuns = measuredRuns(data).slice(-DASH.matrixRuns).length;
+  return `
+  <section class="band">
+    <div class="band-h"><h2 id="gate">The gate</h2><span class="cohort">cohort: all PR runs · ${DASH.runEventCaption}</span></div>
+    <div class="sub">Is the gate trustworthy — flake forensics, infra tax, and the cost of a run.</div>
+    <div class="tiles">${gateTilesHtml(data, events)}</div>
+    <div class="card pad">
+      <div class="t">Case × run outcome matrix</div>
+      <div class="s">one row per active case, one cell per run · last ${matrixRuns} measured runs · ▲ = events.yaml marker · ${DASH.runEventCaption}</div>
+      ${matrixHtml(data, notes, events)}
+      <div class="legend mx-legend">
+        <span><span class="cell c-g"></span>passed all reps</span>
+        <span><span class="cell c-a"></span>partial</span>
+        <span><span class="cell c-r"></span>failed all reps</span>
+        <span><span class="cell c-i"></span>infra — excluded</span>
+        <span><span class="cell c-n"></span>not in run</span>
+      </div>
     </div>
-  </div>`;
+    <div class="card pad">
+      <div class="t">Failure signatures · last ${DASH.paretoWindowDays} days</div>
+      <div class="s">non-pass reps grouped by normalized reason · ${DASH.runEventCaption} · gray = infra, violet = check design, amber = agent behaviour, neutral = unclassified</div>
+      ${paretoHtml(data)}
+    </div>
+  </section>`;
 }
 
 function evidenceRow(kase) {
   const name = String(kase.name || "?");
-  const have = typeof kase.runs_on_record === "number" ? Math.trunc(kase.runs_on_record) : 0;
+  const have = isCount(kase.runs_on_record) ? kase.runs_on_record : 0;
   const width = Math.min(100, (100 * have) / DASH.screeningWindow);
-  const rateText = typeof kase.pass_rate === "number" ? `${Math.round(kase.pass_rate * 100)}%` : "—";
   const presubmit = kase.active
     ? '<span class="pill p-pass">IN PRESUBMIT</span>'
     : '<span class="pill p-fix">NOT IN PRESUBMIT</span>';
-  return `<tr><td style="font-weight:650">${esc(name)}</td>` +
+  return `<tr><td><div class="tname">${esc(name)}</div>${noteHtml(DASH.notes[name])}</td>` +
     `<td><div style="display:flex;align-items:center;gap:10px">` +
     `<div class="prog"><i style="width:${width.toFixed(0)}%"></i></div>` +
     `<span class="cap">${have} of ${DASH.screeningWindow}</span></div></td>` +
-    `<td class="num" style="text-align:left">${rateText}</td><td>${presubmit}</td></tr>`;
+    `<td>${presubmit}</td></tr>`;
 }
 
 function evidenceHtml(data) {
-  const cases = [...(data.cases || [])].sort((a, b) =>
-    ((b.runs_on_record || 0) - (a.runs_on_record || 0))
-    || String(a.name || "").localeCompare(String(b.name || "")));
+  const depth = (c) => (isCount(c.runs_on_record) ? c.runs_on_record : 0);
+  // Code-point name comparison, matching Python's tuple sort.
+  const byName = (a, b) => {
+    const na = String(a.name || ""), nb = String(b.name || "");
+    return na < nb ? -1 : na > nb ? 1 : 0;
+  };
+  const cases = (data.cases || []).filter((c) => c && typeof c === "object")
+    .sort((a, b) => (depth(b) - depth(a)) || byName(a, b));
   const rows = cases.map(evidenceRow).join("")
-    || '<tr><td colspan="4"><span class="cap">no cases on record yet</span></td></tr>';
+    || '<tr><td colspan="3"><span class="cap">no cases on record yet</span></td></tr>';
   return `
   <h2 id="nightly">Evidence on record</h2>
-  <div class="sub">Recorded task appearances per case (all collected runs, infra included), against the ${DASH.screeningWindow}-run yardstick · history depth, not admission progress — the screening window fills only from main-branch runs in the baseline store (bench/baselines/README.md)</div>
+  <div class="sub">Recorded task appearances per case (all collected runs, infra included), against the ${DASH.screeningWindow}-run yardstick · history depth, not admission progress — the screening window fills only from main-branch runs in the baseline store (bench/baselines/README.md) · annotations from case-notes.yaml</div>
   <div class="card"><table id="evidence">
-    <thead><tr><th>Case</th><th>Evidence collected</th><th>Pass rate</th><th>In presubmit</th></tr></thead>
+    <thead><tr><th>Case</th><th>Evidence collected</th><th>In presubmit</th></tr></thead>
     <tbody>${rows}</tbody>
   </table></div>`;
 }
@@ -539,22 +807,25 @@ const HERO_LEDE = "Every pull request runs the agent against a real seeded fleet
   "Exact checks gate; judged scores are recorded, never blocking; infrastructure " +
   "failures never count against a PR.";
 
-const heroHtml = (data) => `
+const HERO_HTML = `
   <section style="margin-top:30px">
     <span class="eyebrow">Agent evaluation · presubmit</span>
     <h1>Is the agent getting better or worse?</h1>
     <div class="lede">${HERO_LEDE}</div>
-    <div class="tiles" id="tiles">${tilesHtml(data)}</div>
   </section>`;
 
 function footHtml(data) {
   const generated = parseIso(data.generated_at);
   const runs = (data.runs || []).length;
+  const threshold = Math.round(DASH.runEventFailFraction * 100);
   return `<div class="foot" id="foot">Every number on this page is computed from ` +
-    `<code>data.json</code> (source: ${esc(data.source || "?")}, ` +
+    `<code>data.json</code> (source: ${esc(String(data.source || "?"))}, ` +
     `generated ${generated != null ? utcStamp(generated) + " UTC" : "unknown time"}, ` +
     `${runs} run${runs !== 1 ? "s" : ""} on record). ` +
-    `Row annotations come from <code>case-notes.yaml</code> and are advisory only.</div>`;
+    `Run-level event rule: a run where ≥${threshold}% of its graded tasks failed is ` +
+    `charged to the run, not the cases. Event markers and catch counts come from ` +
+    `<code>events.yaml</code>; row annotations and badges from ` +
+    `<code>case-notes.yaml</code>. All three are advisory only.</div>`;
 }
 
 const EMPTY_STATE_HTML = `
@@ -563,13 +834,13 @@ const EMPTY_STATE_HTML = `
     <h1>Is the agent getting better or worse?</h1>
     <div class="empty" style="margin-top:24px">
       <span class="banner">⏳ No evaluation data yet</span>
-      <p style="margin-top:12px">No runs are on record in <code>data.json</code>. Once the collector publishes its first run, the header tiles, the per-case suite table, the trend charts and the nightly evidence all render from that file automatically — nothing else feeds this page.</p>
+      <p style="margin-top:12px">No runs are on record in <code>data.json</code>. Once the collector publishes its first run, the band tiles, the day trend, the case × run matrix, the failure signatures and the evidence table all render from that file automatically — nothing else feeds this page.</p>
     </div>
   </section>`;
 
 function appHtml(data) {
   if (!((data.runs || []).length || (data.cases || []).length)) return EMPTY_STATE_HTML;
-  return heroHtml(data) + suiteHtml(data) + trendsHtml(data)
+  return HERO_HTML + bandAgentHtml(data, DASH.events) + bandGateHtml(data, DASH.notes, DASH.events)
     + evidenceHtml(data) + RELEASES_HTML + footHtml(data);
 }
 

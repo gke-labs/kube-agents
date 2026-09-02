@@ -25,7 +25,7 @@
 # swapping the last path element (resolveCredentialProxyImage in
 # k8s-operator/internal/controller/platformagent_manifests.go), and the
 # provisioning scripts build every default as "<prefix>/<name>" through
-# third_party_image in k8s-operator/scripts/common.sh.
+# third_party_image in scripts/installer/common.sh.
 #
 # The Helm chart is the one consumer that cannot read this file, so it rewrites
 # onto the repository's trailing segment instead (kube-agents.imageRepository).

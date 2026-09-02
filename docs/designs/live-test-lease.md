@@ -118,11 +118,11 @@ running install:
 - **`helm`**, the state-changing **`terraform`** subcommands, and the installer and redeploy entry
   points — `install.sh`, `uninstall.sh`, `upgrade.sh`, `lifecycle.sh`, `dev_rebuild_agent.sh`, and
   the `make` targets that redeploy. The root installers **ignore your current kubectl context
-  entirely** and act on the install recorded in `k8s-operator/scripts/vars.sh`, so the checkout is
+  entirely** and act on the install its `install.env` names, so the checkout is
   what resolves their target when nothing more direct is on the line. Asking one of them for
   `--help` or a `--dry-run` is not running it. An `agentplugins/*/install.sh` shares that basename
   and nothing else: it applies an AgentPlugin CR through your current context and reads no
-  `vars.sh`, so it resolves the way a `kubectl` does.
+  install configuration, so it resolves the way a `kubectl` does.
 - **`gcloud`** cluster mutations, and `pubsub publish`, which drives a real agent turn. The match
   is on the install's markers rather than on a hardcoded topic: a publish that reaches an install
   names its project, or a topic the install records.
@@ -130,12 +130,12 @@ running install:
   registry prefix the install records. The push itself touches no cluster, but overwriting a tag
   the install is running is how one agent's image became another's, which is the incident this
   exists to prevent. A stock install records the public
-  [`DEFAULT_REGISTRY_PREFIX`](../../k8s-operator/scripts/installer_common.sh) rather than a private
+  [`DEFAULT_REGISTRY_PREFIX`](../../scripts/installer/installer_common.sh) rather than a private
   one, so this guard is only as specific as the prefix the install was given. A push whose image ref
   did not expand asks rather than passing, because an unreadable ref and an absent one are different
   answers. That covers the ref that says nothing at all — `docker push $(cat last-image)` — and the
   half-spelled one, where what the ref does say is still on the path to a protected registry:
-  `vars.sh` exports `PROJECT_ID`, so `docker push $REGION-docker.pkg.dev/$PROJECT_ID/platform:dev`
+  The configuration carries `PROJECT_ID`, so `docker push $REGION-docker.pkg.dev/$PROJECT_ID/platform:dev`
   and `docker push us-central1-docker.pkg.dev/$PROJECT_ID/platform:dev` both ask, while
   `us-central1-docker.pkg.dev/some-other-project/x:$TAG` has already answered the question and stays
   silent.
@@ -156,7 +156,7 @@ keywords that stand in front of a command word (`do`, `then`, a subshell's paren
 stripped, so the `kubectl delete` in a cleanup loop is still a `kubectl delete`. `bash -c "…"`
 payloads, `eval`'s arguments, and `$(…)` substitutions are classified as the shell will actually run
 them, and a function definition's `f() {` is stepped over the way a wrapper is. And a `cd`
-changes the checkout, and so the `vars.sh`, that the segments after it resolve against — including
+changes the checkout, and so the install configuration, that the segments after it resolve against — including
 when the install it lands on is one this session had not otherwise heard of.
 
 It does not follow the shell everywhere. A `case` arm hides the command word behind its pattern
@@ -172,20 +172,23 @@ that takes them — `kubectl`, `helm`, a plugin installer — an explicit `--con
 definite answer rather than a missing one, and `--kubeconfig` is next, since the live-test workflow
 keeps a dedicated kubeconfig per install and a marker is only a substring that happened to appear
 on the line. Everything else falls back to the
-markers, then to the checkout's `vars.sh` where that is the honest signal, then to the ambient
+markers, then to the checkout's install configuration where that is the honest signal, then to the ambient
 context. A context renamed locally is reached through an `aliases` entry, not by guessing.
 
 ## Which installs are protected
 
-Discovered, never hardcoded. The checkout's `k8s-operator/scripts/vars.sh` records the install it
-is pointed at. `PROJECT_ID`, `CLUSTER_NAME`, and `REGION` compose the context
+Discovered, never hardcoded. The checkout's `install.env` records the install it is pointed at —
+as does a legacy `k8s-operator/scripts/vars.sh`, still read so a checkout from before that change
+stays protected. Both are taken from the first directory up the tree that has either, and where
+both exist their keys are merged with `install.env` winning, matching the order every shell front
+door loads them in. `PROJECT_ID`, `CLUSTER_NAME`, and `REGION` compose the context
 (`gke_<project>_<location>_<cluster>`, the name `installer_common.sh` itself reconstructs);
 `REGISTRY_PREFIX` gives the prefix `docker push` is matched against — the installer always records
-one, so `<REGION>-docker.pkg.dev/<PROJECT_ID>` is a fallback for a hand-written `vars.sh` that
+one, so `<REGION>-docker.pkg.dev/<PROJECT_ID>` is a fallback for a hand-written configuration that
 omits it. `CHAT_TOPIC_NAME` becomes a marker, because a `gcloud pubsub publish` often names the
 topic and nothing else on the line. The ConfigMap lives in `kubeagents-system` unless the install
-records a `NAMESPACE`, which a stock `vars.sh` does not. An install with no `REGION` recorded is
-not protected rather than guessed at.
+records a `NAMESPACE`, which a stock configuration does not. An install with no `REGION` recorded
+is not protected rather than guessed at.
 
 Those keys are matched with a regex against an allowlist and the file is never sourced — it is
 mode-600 install state that holds credentials, and sourcing a file to read a handful of variables
@@ -237,14 +240,15 @@ Claude Code executes without being asked. A pull request can change both it and 
 so checking out a fork's branch into an already-trusted checkout — or into a worktree of one, which
 is how `.claude/commands/pr-review-batch.md` reviews every open pull request — would arm whatever
 that branch says on the reviewer's next Bash call, with their kubeconfigs and their mode-600
-`vars.sh` in reach. Workspace trust is granted per directory and is not re-asked when the branch
+install configuration in reach. Workspace trust is granted per directory and is not re-asked when the branch
 changes, so the reviewing case is exactly the one it does not cover. Shipping an example keeps the
 reviewer's execution path free of fork content; the cost is that the protection has to be asked
 for.
 
 Once copied, the file is repository-controlled code running on a contributor's machine on every
-Bash tool call, and the script is written for that: it reads `vars.sh` with a regex over an
-allowlist rather than sourcing it, exits before any cluster round-trip when nothing is configured,
+Bash tool call, and the script is written for that: it reads the install configuration with a
+regex over an allowlist rather than sourcing it — accepting both `K=V` and `export K=V`, since
+`install.env` is a dotenv and `vars.sh` was generated with `printf %q` — exits before any cluster round-trip when nothing is configured,
 and shells out to nothing but `kubectl` and `git`. Read the diff of `scripts/live_test_lease.py`
 before pulling a branch you do not trust, since the copy points at the working tree's script.
 Personal hooks unrelated to the lease belong in `.claude/settings.local.json`, which stays ignored
@@ -254,7 +258,8 @@ The lease renews only when another Bash call passes through the hook, so a singl
 longer than the TTL — `install.sh` against a fresh GKE cluster — expires mid-run and can legitimately
 be taken over. Take a longer one by hand first: `acquire --ttl 180`.
 
-A context renamed locally is invisible to discovery: `vars.sh` records what the install _is_, and
+A context renamed locally is invisible to discovery: the configuration records what the install
+_is_, and
 `gke_<project>_<location>_<cluster>` is the name `gcloud` writes, so a `kubectl config
 rename-context` leaves commands naming the short form unresolvable. Add the new name to that
 install's `aliases` in the config file, keyed on the **canonical** context. Aliases are further

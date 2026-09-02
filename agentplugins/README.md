@@ -51,7 +51,8 @@ laptop reliably has, and the installers have to work there.
 
 `AR_LOCATION`, `AR_PROJECT` and `AR_REPOSITORY` each pin one part of the reference and
 switch discovery off for that part alone. `REGION` and `GCP_ARTIFACT_REGISTRY_REPO_NAME` —
-the variables the installer and dev tooling save into `vars.sh`, and the last fallbacks for
+the variables the installer records in `install.env` and the dev tooling saves into its own
+state file, and the last fallbacks for
 the location and the repository — are deliberately not pins: one left in your shell by
 `dev_rebuild_agent.sh` must not outrank the registry the agent is demonstrably being pulled
 from.

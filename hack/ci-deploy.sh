@@ -8,6 +8,22 @@
 
 set -euo pipefail
 
+# The session daemon caps Warning alerts at 5 per UTC day, fleet-wide per
+# install (ALERT_DAILY_LIMIT_WARNING, #641). That cap is alert-storm
+# protection for a human-watched channel; an eval install's whole job is
+# generating alerts. Every smoke build that leases a pool project that day
+# spends the same shared budget on its own crash-loop scenarios, and once it
+# is gone the daemon quota-suppresses the very alert
+# autoops-warning-event-triage waits 300s for, timing out the plant (#1101).
+# 0 is the documented off-switch — `_alert_daily_limit` in
+# agents/platform/scripts/session_kv_server.py parses it as "cap off" and
+# `_claim_alert_quota` lets `limit <= 0` through uncapped — and setting it
+# here, on the deploy, leaves the production
+# default untouched. tests/test_ci_deploy_alert_quota.py pins the whole
+# chain: this flag, the chart rendering it onto the CR, and the operator's
+# env allowlist letting it through to the container.
+readonly EVAL_ALERT_DAILY_LIMIT_WARNING="0"
+
 # ─── 1. Validation & Pre-checks ───────────────────────────────────────────────
 if [ -z "${GEMINI_API_KEY:-}" ]; then
   echo "ERROR: GEMINI_API_KEY environment variable is required"
@@ -298,6 +314,8 @@ helm upgrade --install kube-agents ./charts/kube-agents \
   --set-string "litellm.modelProvider=${MODEL_PROVIDER}" \
   --set-string "litellm.modelDefaultName=${MODEL_DEFAULT_NAME}" \
   --set "platformAgent.deployment.availability.runtimeClassName=" \
+  --set-string "platformAgent.deployment.env[0].name=ALERT_DAILY_LIMIT_WARNING" \
+  --set-string "platformAgent.deployment.env[0].value=${EVAL_ALERT_DAILY_LIMIT_WARNING}" \
   --wait --timeout 15m
 echo "✓ Chart deployment finished in $((SECONDS - STEP_START))s"
 

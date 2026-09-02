@@ -35,8 +35,8 @@
 # trailing name only, so gcr.io/distroless/static lands as <prefix>/distroless
 # -static and no amount of prefix-splicing reproduces the original path.
 #
-# HERMES_AGENT_TAG has no default — the release workflows read the one pin from
-# tags.env, and the root Makefile `include`s it — so a direct docker build has
+# HERMES_AGENT_TAG has no default — the image-build workflows read the one pin
+# from tags.env, and the root Makefile `include`s it — so a direct docker build has
 # to pass it too, or the agent-base stage resolves to a reference with an empty
 # tag:
 #
@@ -193,7 +193,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-progress/apply_kanban_progress_lin
 # Hotfix: make a dispatched cron run report back, and stop it closing the
 # kanban card of the caller that dispatched it. Upstream discards the run's
 # final response and lets the run inherit HERMES_KANBAN_TASK, which is how
-# three fleet-audit streams published wrong ledgers on 2026-08-04. Ten edits
+# three fleet-audit streams published wrong ledgers on 2026-08-04. Twelve edits
 # across three files, so the surgery lives in an applier script rather than
 # inline; it fails the build on any anchor that no longer matches.
 # verify_cron_run_scope.py then exercises the patched code. The applier only
@@ -239,7 +239,7 @@ exit(1) if ('https://' in clipped or not 3000 < len(clipped) <= 4000) else None"
 # The platform profile has no ticker thread -- it is ticked once a minute by
 # spawning `hermes cron tick`, whose body is verbatim `tick(verbose=True)` --
 # so everything Hermes hangs off the ticker's lifetime is absent or wrong there.
-# Three consequences, all fixed by the eleven anchored edits in the applier:
+# Three consequences, all fixed by the fourteen anchored edits in the applier:
 #   * `tick()` defaults to sync=True and held <HERMES_HOME>/cron/.tick.lock
 #     across the whole `as_completed` wait, so a fleet audit starved every other
 #     job for its full runtime. Measured over 17h: 3 of 35

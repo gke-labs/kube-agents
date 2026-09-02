@@ -66,7 +66,7 @@ KUBE_AGENTS_STATE_PREFIX="full-install/platform-agent-host" \
 
 ## 3. Service accounts and IAM
 
-- **Workload Identity**: Google Service Account `kubeagents-platform-gsa@${PROJECT_ID}.iam.gserviceaccount.com` bound to KSA `kubeagents-platform-agent` in namespace `kubeagents-system` (the KSA name `hack/ci-deploy.sh` and `k8s-operator/scripts/common.sh` both use):
+- **Workload Identity**: Google Service Account `kubeagents-platform-gsa@${PROJECT_ID}.iam.gserviceaccount.com` bound to KSA `kubeagents-platform-agent` in namespace `kubeagents-system` (the KSA name `hack/ci-deploy.sh` and `scripts/installer/common.sh` both use):
   ```bash
   gcloud iam service-accounts add-iam-policy-binding \
     kubeagents-platform-gsa@${PROJECT_ID}.iam.gserviceaccount.com \

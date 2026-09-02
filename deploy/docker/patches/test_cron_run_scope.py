@@ -3,12 +3,16 @@
 Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t deploy/docker/patches
 """
 
+import ast
 import concurrent.futures
 import contextvars
 import os
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 
+import apply_cron_run_scope
 from cron_run_scope import (
     CRON_RESPONSE_LIMIT,
     CRON_RUN_ENV,
@@ -238,6 +242,211 @@ class ClipCronResponseTest(unittest.TestCase):
 
     def test_the_budget_is_roomier_than_the_chat_handoff(self):
         self.assertGreaterEqual(CRON_RESPONSE_LIMIT, 4000)
+
+
+# The applier is exercised against a miniature of the three real files. The
+# real anchors are asserted against the shipped image by
+# verify_cron_run_scope.py; what these miniatures carry is the SHAPE the
+# v2026.8.19 split introduced, which is the thing a version bump moves.
+#
+# The wrapper/body split is the whole reason this test exists. `run_one_job`
+# stopped being the execute→deliver→mark body and became a wrapper that
+# delegates through `_run_with_fire_claim_heartbeat`; putting the out-param on
+# the wrapper alone leaves both anchors matched, the file parsing, and the body
+# raising NameError on the first real tick.
+SCHEDULER_STUB = '''from typing import Optional
+
+
+def run_one_job(
+    job: dict,
+    *,
+    adapters=None,
+    loop=None,
+    verbose: bool = False,
+    extra_prompt: Optional[str] = None,
+    cancel_event=None,
+) -> bool:
+    """Register the fire owner, then delegate."""
+    execution_token = object()
+    try:
+        return _run_with_fire_claim_heartbeat(
+            job,
+            lambda lost_ownership: _run_one_job_body(
+                job,
+                adapters=adapters,
+                loop=loop,
+                verbose=verbose,
+                extra_prompt=extra_prompt,
+                fire_claim_lost=lost_ownership,
+                execution_token=execution_token,
+            ),
+        )
+    finally:
+        pass
+
+
+def _run_one_job_body(
+    job: dict,
+    *,
+    adapters=None,
+    loop=None,
+    verbose: bool = False,
+    extra_prompt: Optional[str] = None,
+    fire_claim_lost=None,
+    execution_token=None,
+) -> bool:
+    try:
+        output = execute_job(job)
+        if output:
+            output_file = save_job_output(job["id"], output)
+        finish_execution(
+            execution_id,
+            success=success,
+            error=error,
+            delivery_outcome=delivery_outcome,
+        )
+        return True
+    except Exception:
+        finish_execution(execution_id, success=False)
+        return False
+'''
+
+CRONJOB_STUB = '''import json
+from typing import Any, Dict
+
+
+def _notify_provider_jobs_changed_safe() -> None:
+    pass
+
+
+def _run_claimed_job(job, job_id, adapters, gateway_loop, extra_prompt):
+    with heartbeat:
+        try:
+            try:
+                processed = run_one_job(
+                    job, adapters=adapters, loop=gateway_loop,
+                    extra_prompt=extra_prompt,
+                )
+            finally:
+                unregister_running_job(job_id)
+        finally:
+            stop_heartbeat()
+        refreshed = get_job(job_id) or {}
+        ok = refreshed.get("last_status") == "ok"
+        return {
+            "claimed": True,
+            "success": bool(processed and ok),
+            "error": refreshed.get("last_error"),
+        }
+
+
+def cronjob(action, result, exec_result):
+    if action == "run":
+        if exec_result is not None:
+            if exec_result.get("skipped"):
+                result["skipped"] = True
+            elif exec_result.get("error"):
+                result["execution_error"] = exec_result["error"]
+            return json.dumps({"success": True, "job": result}, indent=2)
+'''
+
+KANBAN_STUB = '''import os
+
+from hermes_cli.config import cfg_get, load_config
+
+
+def _task_scope_error(tid):
+    env_tid = os.environ.get("HERMES_KANBAN_TASK")
+    if not env_tid:
+        # Orchestrator or CLI context — no task-scope restriction.
+        return None
+    return None
+
+
+def kanban_complete(task_id=None):
+    if not task_id:
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
+
+
+def kanban_block(task_id=None):
+    if not task_id:
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
+'''
+
+
+class ApplierTest(unittest.TestCase):
+    """The applier against the v2026.8.19 wrapper/body shape."""
+
+    def _apply(self):
+        root = Path(tempfile.mkdtemp())
+        (root / "cron").mkdir()
+        (root / "tools").mkdir()
+        (root / "cron" / "scheduler.py").write_text(SCHEDULER_STUB)
+        (root / "tools" / "cronjob_tools.py").write_text(CRONJOB_STUB)
+        (root / "tools" / "kanban_tools.py").write_text(KANBAN_STUB)
+        apply_cron_run_scope.apply(root)
+        return (root / "cron" / "scheduler.py").read_text()
+
+    @staticmethod
+    def _keyword_only(source, name):
+        tree = ast.parse(source)
+        for node in tree.body:
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                return [arg.arg for arg in node.args.kwonlyargs]
+        raise AssertionError(f"no def {name} in the patched source")
+
+    def test_both_halves_take_the_out_param(self):
+        """The wrapper is what callers name; the body is what the writes read."""
+        scheduler = self._apply()
+        ast.parse(scheduler)
+        self.assertIn("outcome", self._keyword_only(scheduler, "run_one_job"))
+        self.assertIn("outcome", self._keyword_only(scheduler, "_run_one_job_body"))
+
+    def test_the_wrapper_forwards_it_across_the_split(self):
+        """Both signatures can carry it and the body still see None.
+
+        Nothing else notices: expect_keyword_only checks the body's parameter
+        list, not its callers, and the file parses either way.
+        """
+        scheduler = self._apply()
+        delegation = scheduler[scheduler.index("_run_one_job_body(") :]
+        delegation = delegation[: delegation.index(")\n")]
+        self.assertIn("outcome=outcome,", delegation)
+
+    def test_the_writes_land_in_the_body_not_the_wrapper(self):
+        scheduler = self._apply()
+        body = scheduler[scheduler.index("def _run_one_job_body(") :]
+        self.assertIn('outcome["response"] = final_response', body)
+        self.assertIn('outcome["output_file"] = str(output_file)', body)
+
+    def test_a_wrapper_that_stopped_delegating_is_fatal_not_silent(self):
+        """The shape that shipped the NameError: no lambda to forward through."""
+        root = Path(tempfile.mkdtemp())
+        (root / "cron").mkdir()
+        (root / "tools").mkdir()
+        (root / "cron" / "scheduler.py").write_text(
+            SCHEDULER_STUB.replace(
+                "lambda lost_ownership: _run_one_job_body(", "_run_one_job_body("
+            )
+        )
+        (root / "tools" / "cronjob_tools.py").write_text(CRONJOB_STUB)
+        (root / "tools" / "kanban_tools.py").write_text(KANBAN_STUB)
+        with self.assertRaises(SystemExit) as ctx:
+            apply_cron_run_scope.apply(root)
+        self.assertIn("found 0", str(ctx.exception))
+
+    def test_applying_twice_is_refused(self):
+        """Deliberately not idempotent: the out-param is inserted, not
+        substituted, so a second pass would append a second `outcome=None`."""
+        root = Path(tempfile.mkdtemp())
+        (root / "cron").mkdir()
+        (root / "tools").mkdir()
+        (root / "cron" / "scheduler.py").write_text(SCHEDULER_STUB)
+        (root / "tools" / "cronjob_tools.py").write_text(CRONJOB_STUB)
+        (root / "tools" / "kanban_tools.py").write_text(KANBAN_STUB)
+        apply_cron_run_scope.apply(root)
+        with self.assertRaises(SystemExit):
+            apply_cron_run_scope.apply(root)
 
 
 if __name__ == "__main__":

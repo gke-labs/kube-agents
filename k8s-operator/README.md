@@ -38,8 +38,9 @@ cp terraform.tfvars.example terraform.tfvars   # then edit it
 
 Teardown is `../uninstall.sh`, or `./lifecycle.sh destroy` from the composition directory. See
 [INSTALL.md](../INSTALL.md) for the full walkthrough and
-[scripts/README.md](scripts/README.md) for the helper scripts that remain in this directory,
-including the `vars.sh` state file the installer still writes.
+[scripts/installer/README.md](../scripts/installer/README.md) for the installer's shared
+helpers and the `install.env` configuration model. Those helpers used to live in this
+directory; they moved out because they serve the installer, not the operator.
 
 For fast local iteration when updating agent skills, prompts, or code without waiting for CI/CD
 pipelines, use the dedicated rebuild script or `make` target:
@@ -52,7 +53,7 @@ make dev-rebuild-agent
 make dev-rebuild-agent ARGS="platform"
 ```
 
-- **[dev/dev_rebuild_agent.sh](scripts/dev/dev_rebuild_agent.sh)**:
+- **[scripts/dev/dev_rebuild_agent.sh](../scripts/dev/dev_rebuild_agent.sh)**:
   - Prompts for or accepts an agent target (`platform`).
   - Ensures the GCP Artifact Registry repository exists.
   - Builds and pushes the updated container image via Google Cloud Build (or locally with `--local`).
@@ -234,7 +235,7 @@ Before deploying the GitHub integration, ensure you have:
 
 ### Step-by-Step Deployment
 
-Run the `make deploy-github` target, passing the required environment variables. The KSA/GSA names below are the same defaults the installer uses (see [`scripts/installer_common.sh`](scripts/installer_common.sh) and [`scripts/common.sh`](scripts/common.sh)), but they still have to be exported here: `make deploy-github` renders the manifests with `envsubst` and does not source `common.sh`, so an unset variable would be substituted as an empty string.
+Run the `make deploy-github` target, passing the required environment variables. The KSA/GSA names below are the same defaults the installer uses (see [`scripts/installer/installer_common.sh`](../scripts/installer/installer_common.sh) and [`scripts/installer/common.sh`](../scripts/installer/common.sh)), but they still have to be exported here: `make deploy-github` renders the manifests with `envsubst` and does not source `common.sh`, so an unset variable would be substituted as an empty string.
 
 `KMS_LOCATION` is the Cloud KMS location, which is separate from `REGION`, the GKE cluster location. Cloud KMS has no zonal locations, so the two differ for a zonal cluster: a cluster in `us-central1-c` needs `KMS_LOCATION=us-central1`. For a regional cluster they are the same value.
 

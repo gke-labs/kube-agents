@@ -16,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.absolute()))
 # module still imports in a bare checkout. ABSENT is not BROKEN, and only the
 # first earns a stub -- see test_mcp_package_contract.py.
 try:
-    import mcp.server.fastmcp
+    from mcp.server import MCPServer  # noqa: F401
 except Exception:
     import importlib
     import importlib.metadata
@@ -44,15 +44,13 @@ except Exception:
     mcp_module.__path__ = []
     mcp_server = types.ModuleType("mcp.server")
     mcp_server.__path__ = []
-    fastmcp = types.ModuleType("mcp.server.fastmcp")
-    fastmcp.FastMCP = lambda *a, **k: types.SimpleNamespace(
-        tool=lambda *a, **k: (lambda f: f), run=lambda: None
+    mcp_server.MCPServer = lambda *a, **k: types.SimpleNamespace(
+        tool=lambda *a, **k: (lambda f: f), run=lambda *a, **k: None
     )
     pydantic = types.ModuleType("pydantic")
     pydantic.Field = lambda *a, **k: None
     _stub_if_missing("mcp", mcp_module)
     _stub_if_missing("mcp.server", mcp_server)
-    _stub_if_missing("mcp.server.fastmcp", fastmcp)
     _stub_if_missing("pydantic", pydantic)
 
 import platform_mcp_server

@@ -31,7 +31,7 @@ how build f9f1747c broke on 2026-08-07 before them (#658).
 The budget is checked against a real image rather than by counting ``RUN`` and
 ``COPY`` lines, because the two disagree: BuildKit elides instructions that
 produce no filesystem diff, and the base image contributes layers this file
-cannot see (38 of them, as of ``nousresearch/hermes-agent:v2026.8.13``). The
+cannot see (38 of them, as of ``nousresearch/hermes-agent:v2026.8.19``). The
 count that matters is the one the daemon will have to stack, which is the one
 recorded in the image.
 

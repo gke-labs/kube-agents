@@ -9,9 +9,10 @@ on:
       - "upgrade.sh"
       # The three scripts source their defaults, validators, and the tfvars
       # generator from these helpers, so a change there must run this gate too.
-      - "k8s-operator/scripts/installer_common.sh"
-      - "k8s-operator/scripts/min_versions.sh"
-      - "k8s-operator/scripts/gke_dns_endpoint.sh"
+      - "install.defaults.env"
+      - "scripts/installer/installer_common.sh"
+      - "scripts/installer/min_versions.sh"
+      - "scripts/installer/gke_dns_endpoint.sh"
       - ".github/workflows/installer-matrix-test.yml"
   push:
     branches: [main]
@@ -99,7 +100,7 @@ jobs:
             chmod +x "$RUNNER_TEMP/kube-agents-test-bin/$tool"
           done
           # terraform is stubbed like the cloud CLIs: the dry run asserts the
-          # installer's own flow (interview → vars.sh → terraform.tfvars →
+          # installer's own flow (install.env → interview → terraform.tfvars →
           # validate/plan), not Terraform's. validate.yml runs the real
           # terraform validate over the composition the generated tfvars feed.
           cat > "$RUNNER_TEMP/kube-agents-test-bin/terraform" <<'EOF'
@@ -134,7 +135,6 @@ jobs:
         run: |
           set -euo pipefail
           tfvars="terraform/examples/full-install/terraform.tfvars"
-          vars_sh="k8s-operator/scripts/vars.sh"
           for mode in standard autopilot; do
             PATH="$RUNNER_TEMP/kube-agents-test-bin:$PATH" ./install.sh --dry-run -y \
               --project-id="ci-test-project" --cluster-name="ci-test-cluster" \
@@ -144,31 +144,34 @@ jobs:
               grep cluster_mode "$tfvars" >&2
               exit 1
             fi
-            # vars.sh is what uninstall.sh and upgrade.sh regenerate from, so
-            # it has to carry the same answer.
-            if ! grep -qE "^export CLUSTER_MODE=${mode}\$" "$vars_sh"; then
-              echo "--cluster-mode=${mode} did not reach vars.sh:" >&2
-              grep CLUSTER_MODE "$vars_sh" >&2
-              exit 1
-            fi
           done
 
-          # Adoption: the live cluster's shape overrules --cluster-mode, and
-          # vars.sh must end up holding the LIVE shape rather than the request.
-          # A vars.sh naming the other shape is what turns a later upgrade.sh
-          # or uninstall.sh regeneration into a cluster replacement.
+          # Adoption: the live cluster's shape overrules --cluster-mode.
+          #
+          # This used to assert the same thing about vars.sh, because the
+          # installer wrote the probed shape back there and upgrade.sh and
+          # uninstall.sh regenerated from it -- a vars.sh naming the other
+          # shape turned a later regeneration into a cluster replacement.
+          # There is no such file and no such writeback now: every front door
+          # re-probes through write_tfvars_from_state, so the generated tfvars
+          # is the whole contract. terraform.tfvars is also what CI can check
+          # on a dry run, which deliberately creates no install.env.
           STUB_LIVE_AUTOPILOT=true PATH="$RUNNER_TEMP/kube-agents-test-bin:$PATH" \
             ./install.sh --dry-run -y --project-id="ci-test-project" \
             --cluster-name="ci-test-cluster" --region="us-central1" \
             --cluster-mode="standard" --image-tag="$GITHUB_SHA"
-          for f in "$tfvars:^cluster_mode[[:space:]]+= \"autopilot\"$" \
-                   "$vars_sh:^export CLUSTER_MODE=autopilot$"; do
-            if ! grep -qE "${f#*:}" "${f%%:*}"; then
-              echo "the live Autopilot cluster did not overrule --cluster-mode=standard in ${f%%:*}:" >&2
-              grep -iE "cluster_mode" "${f%%:*}" >&2
-              exit 1
-            fi
-          done
+          if ! grep -qE "^cluster_mode[[:space:]]+= \"autopilot\"\$" "$tfvars"; then
+            echo "the live Autopilot cluster did not overrule --cluster-mode=standard:" >&2
+            grep -iE "cluster_mode" "$tfvars" >&2
+            exit 1
+          fi
+
+          # A dry run must not leave an install.env behind: it provisions
+          # nothing, so it has no install to record.
+          if [ -f install.env ]; then
+            echo "--dry-run created install.env, which describes an install that was never made" >&2
+            exit 1
+          fi
 
       - name: Create Ephemeral Kind Kubernetes Cluster (Linux)
         if: runner.os == 'Linux'

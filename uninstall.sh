@@ -59,6 +59,13 @@ on_error() {
   fi
   echo -e "\n\033[91m\033[1m✗ Teardown error encountered at line ${line_no} (exit code ${exit_code}): ${bash_cmd}\033[0m" >&2
   write_report "FAILED" "true" "${line_no}" "${bash_cmd}" 2>/dev/null || true
+  # A tfvars the generator was midway through writing is mode 600, carries
+  # every secret this run was given, and is named one character from the file
+  # the next reader would open. write_tfvars_from_state publishes the path
+  # while the write is in flight and clears it after the mv.
+  if [ -n "${TFVARS_TMP_FILE:-}" ] && [ -f "${TFVARS_TMP_FILE}" ]; then
+    rm -f -- "${TFVARS_TMP_FILE}"
+  fi
   exit "$exit_code"
 }
 trap 'on_error $? $LINENO "$BASH_COMMAND"' ERR
@@ -335,7 +342,10 @@ main() {
   # Defaults, validators, and the terraform.tfvars generator shared with
   # install.sh. Print helpers are already defined above, as the file expects.
   # shellcheck disable=SC1091
-  source "${repo_dir}/k8s-operator/scripts/installer_common.sh"
+  source "${repo_dir}/scripts/installer/installer_common.sh"
+  # Legacy state first, then install.env over the top of it, so the
+  # hand-authored input wins. Both are optional here: unlike upgrade.sh, a
+  # teardown can proceed on --project-id/--cluster-name/--region alone.
   if [ -f "${repo_dir}/k8s-operator/scripts/vars.sh" ]; then
     # shellcheck disable=SC1091
     if ! source "${repo_dir}/k8s-operator/scripts/vars.sh"; then
@@ -344,10 +354,22 @@ main() {
     fi
     print_success "Loaded configuration state from k8s-operator/scripts/vars.sh"
   fi
+  local install_env_file
+  install_env_file="$(default_install_env_file "$repo_dir")"
+  if load_install_env "$install_env_file"; then
+    print_success "Loaded install configuration from: ${install_env_file}"
+  fi
+  # GITOPS_ORG / GITOPS_REPO are the names; a configuration still carrying
+  # GITHUB_ORG / GITHUB_REPO is accepted with a warning.
+  normalize_gitops_repo_vars
+  # Same shape, for the memory setting: install.env records MEMORY, a migrated
+  # vars.sh still carries the old MEMORY_PROVIDER, and the file loaded second
+  # has to win. This teardown regenerates tfvars before destroying.
+  normalize_memory_vars
 
   local target_project="${PARAM_PROJECT_ID:-${PROJECT_ID:-}}"
-  local target_cluster="${PARAM_CLUSTER_NAME:-${CLUSTER_NAME:-platform-agent-host}}"
-  local target_region="${PARAM_REGION:-${REGION:-us-central1}}"
+  local target_cluster="${PARAM_CLUSTER_NAME:-${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}}"
+  local target_region="${PARAM_REGION:-${REGION:-$DEFAULT_REGION}}"
 
   if [ -z "$target_project" ]; then
     target_project="$(gcloud config get-value project 2>/dev/null || true)"
@@ -452,8 +474,8 @@ main() {
 
   # A destroy needs no sandbox, so it must not be refusable on the sandbox's
   # account. write_tfvars_from_state runs the Autopilot version-floor check
-  # whenever ENABLE_GVISOR is truthy, and the block above has just sourced a
-  # vars.sh that — since the installer default flipped — says "true" on every
+  # whenever ENABLE_GVISOR is truthy, and the block above has just loaded an
+  # install.env that — since the installer default flipped — says "true" on every
   # new install. Against a sub-floor Autopilot cluster that check returns 1
   # under `set -Eeuo pipefail` and the destroy never runs, which is an install
   # with no working way to remove itself. The reachable route there is the
@@ -471,7 +493,14 @@ main() {
     cd "$compose_dir"
     ./lifecycle.sh destroy -auto-approve -input=false
   )
+  # The derived state goes; install.env stays. It is the operator's own file,
+  # not something this tool generated, and deleting it would throw away the
+  # configuration a re-install would otherwise reuse. Say so rather than
+  # leaving a file behind silently.
   rm -f "$state_file"
+  if [ -f "$install_env_file" ]; then
+    print_info "Left your install configuration in place: ${install_env_file}"
+  fi
 
   write_report "SUCCESS"
 

@@ -19,7 +19,7 @@
 # for up to 5 minutes with no visible progress and was removed in favor of the
 # kanban-only model.
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
 # Same directory as this script, which Python puts on sys.path[0] when it runs
 # a file — the MCP server is launched as `python3 <home>/scripts/router_server.py`.
@@ -28,7 +28,7 @@ from mcp.server.fastmcp import FastMCP
 # rebinding the module's own never reaches.
 import agent_roster
 
-mcp = FastMCP("Chat Router")
+mcp = MCPServer("Chat Router")
 
 
 @mcp.tool()

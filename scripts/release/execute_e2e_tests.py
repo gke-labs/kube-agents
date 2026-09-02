@@ -71,11 +71,23 @@ def canonical_suite_name(name: str) -> str:
         return name[: -len(_LEGACY_SUITE_SUFFIX)]
     return name
 
+# tests/e2e/.env, not the repository root: the root name belongs to install.env,
+# and the two files spell GITHUB_ORG, GITHUB_REPO, GITHUB_APP_ID and
+# CHAT_TOPIC_NAME the same while meaning different things by them. Kept in step
+# with the identical block in tests/e2e/conftest.py — both entry points must
+# read the same file, or a suite behaves differently depending on how it started.
 try:
     from dotenv import load_dotenv
-    _env_file = _REPO_ROOT / ".env"
+    _env_file = _REPO_ROOT / "tests" / "e2e" / ".env"
     if _env_file.is_file():
         load_dotenv(_env_file)
+    _legacy_env_file = _REPO_ROOT / ".env"
+    if _legacy_env_file.is_file():
+        print(
+            f"warning: {_legacy_env_file} is no longer read; the E2E environment "
+            f"file moved to {_env_file}. Move it there.",
+            file=sys.stderr,
+        )
 except ImportError:
     pass
 

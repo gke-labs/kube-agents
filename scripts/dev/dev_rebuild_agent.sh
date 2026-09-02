@@ -8,24 +8,18 @@
 
 set -e
 
+# scripts/dev/ is two levels below the repository root, and the shared helpers
+# are its sibling in scripts/installer/.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ "$SCRIPT_DIR" == */scripts/dev ]]; then
-  SCRIPTS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-  OPERATOR_DIR="$(cd "${SCRIPTS_DIR}/.." && pwd)"
-  REPO_ROOT="$(cd "${OPERATOR_DIR}/.." && pwd)"
-elif [[ "$SCRIPT_DIR" == */scripts ]]; then
-  SCRIPTS_DIR="${SCRIPT_DIR}"
-  OPERATOR_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-  REPO_ROOT="$(cd "${OPERATOR_DIR}/.." && pwd)"
-else
-  SCRIPTS_DIR="${SCRIPT_DIR}"
-  OPERATOR_DIR="${SCRIPT_DIR}"
-  REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-fi
-VARS_FILE="${SCRIPTS_DIR}/vars.sh"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+INSTALLER_DIR="${REPO_ROOT}/scripts/installer"
+# Pointed at the installer helpers rather than at this directory: load_state
+# creates the file when it is absent, and defaulting it from SCRIPT_DIR would
+# leave a stray scripts/dev/vars.sh behind.
+VARS_FILE="${INSTALLER_DIR}/vars.sh"
 
 # ─── ANSI Colors ──────────────────────────────────────────────────────────────
-source "${SCRIPTS_DIR}/common.sh" "$@"
+source "${INSTALLER_DIR}/common.sh" "$@"
 
 # ─── Argument Parsing ─────────────────────────────────────────────────────────
 USE_LOCAL_BUILD=0

@@ -216,6 +216,16 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, nil
 	}
 
+	// 2b. Validate the mode gate once at the top; everything downstream asks
+	// renderMode, which fails closed. An error here is version skew — a newer
+	// CRD's mode value this binary does not know (see mode.go). Today's stack
+	// still renders below, so the cluster keeps running what it ran; status
+	// reports Degraded/ModeNotRecognized at the end instead of Ready.
+	_, modeErr := resolveMode(instance)
+	if modeErr != nil {
+		log.Info("Unrecognized spec.mode; rendering today's stack and reporting Degraded", "error", modeErr.Error())
+	}
+
 	// 3. Reconcile Service Account (with Workload Identity annotation)
 	if err := r.reconcileServiceAccount(ctx, instance); err != nil {
 		return ctrl.Result{}, err
@@ -403,7 +413,19 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	// 9. Update status phase to Ready
+	// 9. Update status phase. While the mode is unrecognized the phase is
+	// Degraded with a named reason — silently rendering today at that point
+	// would leave nothing in `kubectl describe` saying the cluster runs
+	// something other than what the spec asks. Requeue: the skew resolves by
+	// an operator upgrade or a spec correction, neither of which is an event
+	// on this object's watches.
+	if modeErr != nil {
+		msg := modeErr.Error() + " (version skew); rendering today's stack until the operator is upgraded or spec.mode is corrected"
+		if statusErr := r.updateStatusDegraded(ctx, instance, "ModeNotRecognized", msg); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
 	phase, err := r.updateStatusReady(ctx, instance, otlpEndpoint, otlpSource, netpolProf)
 	if err != nil {
 		return ctrl.Result{}, err

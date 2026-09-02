@@ -8,19 +8,19 @@ if [ -z "${SCRIPT_DIR:-}" ]; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 fi
 # Honour a caller-provided path. Scripts under scripts/dev/ set SCRIPT_DIR to
-# their own directory but keep the single state file in scripts/, so deriving
-# the path from SCRIPT_DIR here would point them at a scripts/dev/vars.sh that
-# load_state then creates empty — silently blanking IMAGE_TAG and AGENT_IMAGE.
+# their own directory but keep the single state file in scripts/installer/, so
+# deriving the path from SCRIPT_DIR here would point them at a
+# scripts/dev/vars.sh holding none of the state they saved.
 VARS_FILE="${VARS_FILE:-${SCRIPT_DIR}/vars.sh}"
 
 # Minimum tool versions. Sourced from the helper's own directory rather than
 # SCRIPT_DIR, which callers under scripts/dev/ override to point at themselves.
-# shellcheck source=k8s-operator/scripts/min_versions.sh
+# shellcheck source=scripts/installer/min_versions.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/min_versions.sh"
 
 # gke_dns_endpoint_flag, shared with hack/ci-env.sh and scripts/release/common.sh.
 # Resolved from BASH_SOURCE for the same reason as the line above.
-# shellcheck source=k8s-operator/scripts/gke_dns_endpoint.sh
+# shellcheck source=scripts/installer/gke_dns_endpoint.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gke_dns_endpoint.sh"
 
 # Defaults, validators, vars.sh persistence, and the terraform.tfvars
@@ -28,7 +28,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/gke_dns_endpoint.sh"
 # upgrade.sh). The definitions moved there so the installers do not have to
 # source this whole pipeline helper; this file keeps only what the numbered
 # provision/teardown steps need on top.
-# shellcheck source=k8s-operator/scripts/installer_common.sh
+# shellcheck source=scripts/installer/installer_common.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/installer_common.sh"
 
 # ─── ANSI Colors ──────────────────────────────────────────────────────────────
@@ -253,26 +253,13 @@ init_third_party_image() {
   warn_on_third_party_prefix_mismatch "$var_name"
 }
 
-# Warn when a persisted *_IMAGE value no longer lives under the effective
-# registry prefix — e.g. REGISTRY_PREFIX was exported after a first run
-# already saved image defaults derived from another registry. The saved
-# value still wins (state reuse), so surface the mixed state instead of
-# silently applying it halfway.
-warn_on_registry_prefix_mismatch() {
-  local var_name=$1
-  local image_val="${!var_name:-}"
-  [ -z "$image_val" ] && return 0
-  case "$image_val" in
-    "$(registry_prefix)"/*) ;;
-    *)
-      print_warning "${var_name}='${image_val}' does not match REGISTRY_PREFIX '$(registry_prefix)'. The saved value wins; edit ${VARS_FILE} (or unset ${var_name}) to migrate this image to the new registry."
-      ;;
-  esac
-}
-
-# The same check for an image this project does not build, which belongs under
-# the third-party prefix rather than REGISTRY_PREFIX. A default install leaves
-# that prefix empty and the image upstream, so there is nothing to compare.
+# Warn when an *_IMAGE value for an image this project does not build sits
+# outside the third-party prefix rather than REGISTRY_PREFIX. A default install
+# leaves that prefix empty and the image upstream, so there is nothing to
+# compare.
+#
+# Only third-party images are checked. OPERATOR_IMAGE and PLATFORM_AGENT_IMAGE
+# are not persisted, so there is no recorded value left to go stale.
 warn_on_third_party_prefix_mismatch() {
   local var_name=$1
   local image_val="${!var_name:-}"
@@ -354,7 +341,7 @@ init_var_model_provider() {
 }
 
 init_var_platform_agent_permission_set() {
-  init_var "PLATFORM_AGENT_PERMISSION_SET" "read-only" "Enter Platform Agent Permission Set (read-only, custom)"
+  init_var "PLATFORM_AGENT_PERMISSION_SET" "$DEFAULT_PERMISSION_SET" "Enter Platform Agent Permission Set (read-only, custom)"
 
   PLATFORM_AGENT_PERMISSION_SET=$(echo "$PLATFORM_AGENT_PERMISSION_SET" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
   # require_supported_permission_set (installer_common.sh) owns the vocabulary
@@ -394,7 +381,7 @@ init_var_platform_agent_permission_set() {
 MEMORY_PROVIDER_CHOICES="none kube_agents_memory multiuser_memory hindsight mem0 openviking holographic retaindb byterover"
 
 init_var_memory_provider() {
-  init_var "MEMORY_PROVIDER" "multiuser_memory" \
+  init_var "MEMORY_PROVIDER" "$DEFAULT_MEMORY_PROVIDER" \
     "Enter agent memory provider (${MEMORY_PROVIDER_CHOICES// /, })"
 
   MEMORY_PROVIDER=$(echo "$MEMORY_PROVIDER" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
@@ -418,7 +405,7 @@ init_var_memory_provider() {
   fi
 
   # Persist the normalised value so the migration and the lower-casing stick,
-  # and so the later steps that read vars.sh see what this step decided.
+  # and so a later run of the dev tooling sees what this step decided.
   save_var "MEMORY_PROVIDER" "$MEMORY_PROVIDER"
 }
 
@@ -461,34 +448,63 @@ init_var_image_tag() {
   fi
 }
 
+# Where the install configuration lives, relative to this file. VARS_FILE sits
+# in scripts/installer/; install.env sits at the repository root two levels
+# up. Derived from VARS_FILE rather than SCRIPT_DIR so that a caller which
+# redirects VARS_FILE for a test redirects both together.
+install_env_file_for_state() {
+  if [ -n "${KUBE_AGENTS_INSTALL_ENV:-}" ]; then
+    echo "${KUBE_AGENTS_INSTALL_ENV}"
+    return 0
+  fi
+  local scripts_dir
+  scripts_dir="$(cd "$(dirname "${VARS_FILE}")" 2>/dev/null && pwd || echo "")"
+  [ -n "$scripts_dir" ] || return 0
+  echo "$(cd "${scripts_dir}/../.." 2>/dev/null && pwd || echo "")/install.env"
+}
+
 load_state() {
   local env_registry_prefix="${REGISTRY_PREFIX:-}"
   local env_third_party_prefix="${THIRD_PARTY_REGISTRY_PREFIX:-}"
+  # Read if present, never created here. save_var below still appends to
+  # VARS_FILE on its own, so a run that records anything creates the file
+  # whether or not this block ran; opening it eagerly would only add an empty
+  # one to the runs that record nothing.
+  #
+  # $state_source tracks which file last supplied a value, so the warnings
+  # below can name the file an operator has to edit. install.env is loaded
+  # second and wins, and it is the file most installs now have.
+  local state_source="$VARS_FILE"
   if [ -f "$VARS_FILE" ]; then
     chmod 600 "$VARS_FILE" 2>/dev/null || true
     source "$VARS_FILE"
-  elif [ "${DRY_RUN:-0}" -ne 1 ]; then
-    local old_umask
-    old_umask=$(umask)
-    umask 077
-    echo "# SRE Sourced Variables for GKE & GCP Setup" > "$VARS_FILE"
-    chmod 600 "$VARS_FILE" 2>/dev/null || true
-    umask "$old_umask"
-    source "$VARS_FILE"
   fi
-  # Sourcing vars.sh restores the saved REGISTRY_PREFIX over a freshly
-  # exported one (saved state wins, as for every knob). Say so instead of
-  # silently ignoring the export.
+  # install.env last, so the hand-authored input wins over the derived state.
+  # This is what lets the dev scripts and the print_instructions_* helpers keep
+  # working on an install that has an install.env and no vars.sh.
+  local state_install_env
+  state_install_env="$(install_env_file_for_state)"
+  if [ -n "$state_install_env" ] && [ -f "$state_install_env" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$state_install_env"
+    set +a
+    state_source="$state_install_env"
+  fi
+  # A recorded REGISTRY_PREFIX wins over a freshly exported one, as for every
+  # knob. Say so instead of silently ignoring the export, and name the file
+  # that actually holds it -- naming VARS_FILE sends an operator whose value
+  # came from install.env to edit a file that may not exist.
   if [ -n "$env_registry_prefix" ] && [ -n "${REGISTRY_PREFIX:-}" ] \
     && [ "$env_registry_prefix" != "$REGISTRY_PREFIX" ]; then
-    print_warning "Ignoring exported REGISTRY_PREFIX='${env_registry_prefix}': the saved value '${REGISTRY_PREFIX}' from ${VARS_FILE} wins. Edit ${VARS_FILE} (REGISTRY_PREFIX and the saved *_IMAGE values) to change registries."
+    print_warning "Ignoring exported REGISTRY_PREFIX='${env_registry_prefix}': the recorded value '${REGISTRY_PREFIX}' from ${state_source} wins. Edit ${state_source} (REGISTRY_PREFIX and any recorded *_IMAGE values) to change registries."
   fi
   # And the same for the third-party prefix, which is the one an operator is
   # most likely to export on a re-run after pointing cert-manager and
   # fluent-bit at a different mirror.
   if [ -n "$env_third_party_prefix" ] && [ -n "${THIRD_PARTY_REGISTRY_PREFIX:-}" ] \
     && [ "$env_third_party_prefix" != "$THIRD_PARTY_REGISTRY_PREFIX" ]; then
-    print_warning "Ignoring exported THIRD_PARTY_REGISTRY_PREFIX='${env_third_party_prefix}': the saved value '${THIRD_PARTY_REGISTRY_PREFIX}' from ${VARS_FILE} wins. Edit ${VARS_FILE} to change it."
+    print_warning "Ignoring exported THIRD_PARTY_REGISTRY_PREFIX='${env_third_party_prefix}': the recorded value '${THIRD_PARTY_REGISTRY_PREFIX}' from ${state_source} wins. Edit ${state_source} to change it."
   fi
   if [ "${REQUIRES_IMAGE_TAG:-0}" -eq 1 ]; then
     init_var_image_tag
@@ -507,9 +523,33 @@ load_state() {
 }
 
 ensure_teardown_state() {
+  # Both files, in load_state's order: VARS_FILE first, install.env last so the
+  # hand-authored input wins. Reading only VARS_FILE is not enough here --
+  # it holds dev scratch state (the artifact-registry repo name, whether this
+  # checkout created it) and never the install coordinates, because
+  # dev_rebuild_agent.sh takes those from install.env and init_var saves only a
+  # variable that was empty. Callers expand PROJECT_ID and REGION under
+  # `set -u`, so an unset one aborts the teardown before it deletes anything.
+  local state_install_env=""
+  state_install_env="$(install_env_file_for_state)"
   if [ -f "$VARS_FILE" ]; then
     chmod 600 "$VARS_FILE" 2>/dev/null || true
     source "$VARS_FILE"
+  fi
+  if [ -n "$state_install_env" ] && [ -f "$state_install_env" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$state_install_env"
+    set +a
+  fi
+  # Branch on whether the coordinates are known, not on whether a file exists:
+  # a VARS_FILE carrying only dev scratch state satisfies the second and not
+  # the first, and prompting is the correct answer there.
+  if [ -n "${PROJECT_ID:-}" ]; then
+    # install.env is hand-authored, so a file naming PROJECT_ID and not REGION
+    # is a plausible thing to receive, and both are expanded under `set -u`.
+    export REGION="${REGION:-$DEFAULT_REGION}"
+    export CLUSTER_NAME="${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}"
     export GKE_DB_KMS_KEYRING="${GKE_DB_KMS_KEYRING:-}"
     export GKE_DB_KMS_KEY="${GKE_DB_KMS_KEY:-}"
     export GCP_ARTIFACT_REGISTRY_REPO_NAME="${GCP_ARTIFACT_REGISTRY_REPO_NAME:-${REPO_NAME:-kube-agents}}"
@@ -525,7 +565,7 @@ ensure_teardown_state() {
     export LITELLM_KSA_NAME="kubeagents-litellm"
     export LITELLM_GSA_NAME="kubeagents-litellm-gsa"
   else
-    echo -e "  ${C_YELLOW}⚠ State file ${VARS_FILE} not found. Prompting for target values...${C_RESET}"
+    echo -e "  ${C_YELLOW}⚠ No install coordinates in ${VARS_FILE} or install.env. Prompting for target values...${C_RESET}"
     local ACTIVE_PROJECT
     ACTIVE_PROJECT="$(gcloud config get-value project 2>/dev/null || echo "")"
     if is_non_interactive; then
@@ -552,7 +592,7 @@ ensure_teardown_state() {
       read -r INPUT_REGION
       export REGION="${INPUT_REGION:-$REGION}"
 
-      export CLUSTER_NAME="${CLUSTER_NAME:-platform-agent-host}"
+      export CLUSTER_NAME="${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}"
       echo -ne "  ${C_CYAN}Enter GKE Cluster Name [${C_WHITE}${CLUSTER_NAME}${C_CYAN}]: ${C_RESET}"
       read -r INPUT_CLUSTER_NAME
       export CLUSTER_NAME="${INPUT_CLUSTER_NAME:-$CLUSTER_NAME}"
@@ -562,9 +602,9 @@ ensure_teardown_state() {
     export GKE_DB_KMS_KEY="${GKE_DB_KMS_KEY:-}"
     export GCP_ARTIFACT_REGISTRY_REPO_NAME="${GCP_ARTIFACT_REGISTRY_REPO_NAME:-${REPO_NAME:-kube-agents}}"
     export DEV_ARTIFACT_REGISTRY_CREATED="${DEV_ARTIFACT_REGISTRY_CREATED:-false}"
-    if [ "${GOOGLE_CHAT_ENABLED:-false}" = "true" ]; then
-      export CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-platform-agent-chat-events}"
-      export CHAT_SUB_NAME="${CHAT_SUB_NAME:-platform-agent-chat-events-sub}"
+    if [ "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}" = "true" ]; then
+      export CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
+      export CHAT_SUB_NAME="${CHAT_SUB_NAME:-$DEFAULT_CHAT_SUB_NAME}"
     else
       export CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-}"
       export CHAT_SUB_NAME="${CHAT_SUB_NAME:-}"

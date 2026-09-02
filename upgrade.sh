@@ -10,8 +10,8 @@
 #     --upgrade-mode=full --image-tag=<SEMVER_TAG_OR_FULL_COMMIT_SHA>
 #
 # Run this from the directory holding your original install checkout: the
-# upgrade refuses to re-render cluster configuration without the saved
-# k8s-operator/scripts/vars.sh state from the installation.
+# upgrade refuses to re-render cluster configuration without the install's
+# install.env (a legacy k8s-operator/scripts/vars.sh also satisfies it).
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -51,6 +51,13 @@ on_error() {
   local bash_cmd="$3"
   echo -e "\n${C_RED}${C_BOLD}✗ Upgrade error encountered at line ${line_no} (exit code ${exit_code}): ${bash_cmd}${C_RESET}" >&2
   write_report "FAILED" 2>/dev/null || true
+  # A tfvars the generator was midway through writing is mode 600, carries
+  # every secret this run was given, and is named one character from the file
+  # the next reader would open. write_tfvars_from_state publishes the path
+  # while the write is in flight and clears it after the mv.
+  if [ -n "${TFVARS_TMP_FILE:-}" ] && [ -f "${TFVARS_TMP_FILE}" ]; then
+    rm -f -- "${TFVARS_TMP_FILE}"
+  fi
   exit "$exit_code"
 }
 trap 'on_error $? $LINENO "$BASH_COMMAND"' ERR
@@ -136,9 +143,10 @@ json_escape() {
   printf '%s' "$value"
 }
 
-# Persist one variable into the saved installer state. The provisioning
-# scripts re-source vars.sh via load_state, so exporting alone is not enough:
-# a value must be written here for the delegated scripts to honor it.
+# Persist one variable into a legacy vars.sh, for an install that still has
+# one. Nothing in this repository re-sources it -- the exports after each call
+# are what this run reads -- but a tool still pointed at the old file would
+# otherwise name a different target than the one this run acts on.
 persist_state_var() {
   local state_file="$1"
   local var_name="$2"
@@ -311,10 +319,10 @@ main() {
 
   local script_dir repo_dir
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  if [ -f "${script_dir}/k8s-operator/scripts/installer_common.sh" ]; then
+  if [ -f "${script_dir}/scripts/installer/installer_common.sh" ]; then
     repo_dir="$script_dir"
     verify_local_source_ref "$repo_dir" "$PARAM_IMAGE_TAG"
-  elif [ -f "$(pwd)/k8s-operator/scripts/installer_common.sh" ]; then
+  elif [ -f "$(pwd)/scripts/installer/installer_common.sh" ]; then
     repo_dir="$(pwd)"
     verify_local_source_ref "$repo_dir" "$PARAM_IMAGE_TAG"
   else
@@ -343,10 +351,21 @@ main() {
     fi
   done
 
+  # Shared defaults, the install.env loader, and the terraform.tfvars generator.
+  # Sourced here rather than just before the generator, because the state load
+  # below needs load_install_env. Print helpers are already defined above, as
+  # the file expects.
+  # shellcheck disable=SC1091
+  source "${repo_dir}/scripts/installer/installer_common.sh"
+
+  # Two sources, in this order, so the hand-authored input wins: a legacy
+  # vars.sh from an install that predates install.env, then install.env over
+  # the top of it. Either one on its own is enough to upgrade.
   local state_file="${repo_dir}/k8s-operator/scripts/vars.sh"
+  local install_env_file
+  install_env_file="$(default_install_env_file "$repo_dir")"
   local state_loaded="false"
   if [ -f "$state_file" ]; then
-    # Load state
     # shellcheck disable=SC1090,SC1091
     if ! source "$state_file"; then
       print_error "Configuration state is invalid and could not be loaded."
@@ -354,13 +373,26 @@ main() {
     fi
     state_loaded="true"
     print_success "Loaded existing configuration state from k8s-operator/scripts/vars.sh"
-  else
-    print_warning "No saved configuration state (k8s-operator/scripts/vars.sh) was found in ${repo_dir}."
   fi
+  if load_install_env "$install_env_file"; then
+    state_loaded="true"
+    print_success "Loaded install configuration from: ${install_env_file}"
+  fi
+  if [ "$state_loaded" != "true" ]; then
+    print_warning "No install configuration (install.env) and no saved state (k8s-operator/scripts/vars.sh) was found in ${repo_dir}."
+  fi
+  # GITOPS_ORG / GITOPS_REPO are the names; a configuration still carrying
+  # GITHUB_ORG / GITHUB_REPO is accepted with a warning. Runs after the load and
+  # before anything reads the coordinates.
+  normalize_gitops_repo_vars
+  # Same shape, for the memory setting: install.env records MEMORY, a migrated
+  # vars.sh still carries the old MEMORY_PROVIDER, and the file loaded second
+  # has to win.
+  normalize_memory_vars
 
   local target_project="${PARAM_PROJECT_ID:-${PROJECT_ID:-}}"
-  local target_cluster="${PARAM_CLUSTER_NAME:-${CLUSTER_NAME:-platform-agent-host}}"
-  local target_region="${PARAM_REGION:-${REGION:-us-central1}}"
+  local target_cluster="${PARAM_CLUSTER_NAME:-${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}}"
+  local target_region="${PARAM_REGION:-${REGION:-$DEFAULT_REGION}}"
 
   if [ -z "$target_project" ]; then
     target_project="$(gcloud config get-value project 2>/dev/null || true)"
@@ -376,32 +408,41 @@ main() {
   if [ "$PARAM_DRY_RUN" = "true" ]; then
     print_step "2. Dry-Run Upgrade Plan Preview"
     echo -e "  • ${C_CYAN}Action:${C_RESET} Perform ${PARAM_UPGRADE_MODE} upgrade on cluster '${target_cluster}'"
-    echo -e "  • ${C_CYAN}Image Overrides:${C_RESET} ${REGISTRY_PREFIX:-ghcr.io/gke-labs/kube-agents}/*:${PARAM_IMAGE_TAG}"
+    echo -e "  • ${C_CYAN}Image Overrides:${C_RESET} ${REGISTRY_PREFIX:-$DEFAULT_REGISTRY_PREFIX}/*:${PARAM_IMAGE_TAG}"
     echo -e "  • ${C_CYAN}Secrets:${C_RESET} generate SESSION_KV_API_KEY / SESSION_KV_SALT into 'platform-agent-secrets' only if absent (existing values are never rewritten)"
     write_report "DRY_RUN_COMPLETE"
     exit 0
   fi
 
-  # Fail closed without saved installer state: the delegated provisioning
-  # scripts re-render the PlatformAgent Custom Resource (and operator images)
-  # from vars.sh, so upgrading without it would silently reset chat, allowed
-  # users, dashboard, and model-provider configuration to blank defaults.
+  # Fail closed without any configuration: the upgrade re-renders the
+  # PlatformAgent Custom Resource from it, so upgrading without it would
+  # silently reset chat, allowed users, dashboard, and model-provider
+  # configuration to blank defaults.
   if [ "$state_loaded" != "true" ]; then
-    print_error "Refusing to upgrade without the installation's saved configuration state."
-    print_info "Run upgrade.sh from the directory where kube-agents was installed (it contains k8s-operator/scripts/vars.sh), or restore that file first."
+    print_error "Refusing to upgrade without the installation's configuration."
+    print_info "Run upgrade.sh from the directory holding the install's install.env, point KUBE_AGENTS_INSTALL_ENV at one, or restore k8s-operator/scripts/vars.sh."
     exit 1
   fi
 
-  # Persist explicit target overrides so the delegated provisioning scripts,
-  # which re-source vars.sh, act on the same cluster we fetch credentials for.
-  if [ -n "$PARAM_PROJECT_ID" ]; then
-    persist_state_var "$state_file" PROJECT_ID "$target_project"
-  fi
-  if [ -n "$PARAM_CLUSTER_NAME" ]; then
-    persist_state_var "$state_file" CLUSTER_NAME "$target_cluster"
-  fi
-  if [ -n "$PARAM_REGION" ]; then
-    persist_state_var "$state_file" REGION "$target_region"
+  # Keep a legacy vars.sh agreeing with the confirmed target, the way
+  # uninstall.sh does, so no tool still pointed at it names another cluster.
+  #
+  # Only into a vars.sh that is already there, the way uninstall.sh guards the
+  # same three calls. persist_state_var's append is unconditional -- only its
+  # grep/mv rewrite tests for the file -- so on an install.env-only install the
+  # redirect would open a path under k8s-operator/scripts/, a directory this
+  # release no longer creates, and `set -Eeuo pipefail` would abort the upgrade
+  # at step 1. The exports below are what the rest of this run actually reads.
+  if [ -f "$state_file" ]; then
+    if [ -n "$PARAM_PROJECT_ID" ]; then
+      persist_state_var "$state_file" PROJECT_ID "$target_project"
+    fi
+    if [ -n "$PARAM_CLUSTER_NAME" ]; then
+      persist_state_var "$state_file" CLUSTER_NAME "$target_cluster"
+    fi
+    if [ -n "$PARAM_REGION" ]; then
+      persist_state_var "$state_file" REGION "$target_region"
+    fi
   fi
   export PROJECT_ID="$target_project"
   export CLUSTER_NAME="$target_cluster"
@@ -410,13 +451,13 @@ main() {
   print_step "2. Connecting kubectl to GKE Cluster"
   # Taken from repo_dir rather than beside this script: upgrade.sh is also run
   # piped from curl, where BASH_SOURCE names no directory to look in.
-  local dns_helper="${repo_dir}/k8s-operator/scripts/gke_dns_endpoint.sh"
+  local dns_helper="${repo_dir}/scripts/installer/gke_dns_endpoint.sh"
   GKE_DNS_ENDPOINT_FLAG=""
   if [ -f "$dns_helper" ]; then
     # source= points -x runs at the real file; disable=SC1091 covers the bare
     # `shellcheck upgrade.sh` that CI runs, where the directive locates the file
     # but following it still needs -x, so the info-level finding fails the job.
-    # shellcheck source=k8s-operator/scripts/gke_dns_endpoint.sh
+    # shellcheck source=scripts/installer/gke_dns_endpoint.sh
     # shellcheck disable=SC1091
     source "$dns_helper"
     gke_dns_endpoint_flag "$target_cluster" "$target_region" "$target_project"
@@ -431,11 +472,6 @@ main() {
   local target_namespace="${NAMESPACE:-kubeagents-system}"
   print_step "3. Reconciling Pod-Scoped Session Keys"
   backfill_session_kv_keys "$target_namespace"
-
-  # Shared defaults and the terraform.tfvars generator. Print helpers are
-  # already defined above, as the file expects.
-  # shellcheck disable=SC1091
-  source "${repo_dir}/k8s-operator/scripts/installer_common.sh"
 
   # Helm never touches the crds/ directory on upgrade — that is Helm's own
   # documented behaviour, and the Terraform helm provider inherits it — so CRD
@@ -468,7 +504,7 @@ main() {
     exit 1
   fi
 
-  # NAMESPACE steers the generator's Secret-recovery reads (vars.sh omits
+  # NAMESPACE steers the generator's Secret-recovery reads (install.env omits
   # credentials when PERSIST_SECRETS_ON_DISK=false; the live Secret has them).
   NAMESPACE="$target_namespace" \
     write_tfvars_from_state "${repo_dir}/terraform/examples/full-install/terraform.tfvars" "$PARAM_IMAGE_TAG"
@@ -491,25 +527,25 @@ main() {
       print_step "4. Executing Full Atomic Upgrade (Terraform + Helm)"
       apply_crd_upgrades
       # install.sh's post-generation minter guard, without its import step:
-      # an upgrade never imports the App key, so a vars.sh that enables the
+      # an upgrade never imports the App key, so an install.env that enables the
       # minter against a key with no ENABLED version would wedge the apply on
       # the minter's readiness until the helm timeout fails the upgrade.
       # Refuse up front instead and name the two ways out.
       if grep -q '^enable_github_minter = true$' \
         "${repo_dir}/terraform/examples/full-install/terraform.tfvars" 2>/dev/null; then
         minter_enabled_version="$({ gcloud kms keys versions list \
-          --key "${KMS_KEY:-github-token-minter-key}" \
-          --keyring "${KMS_KEYRING:-github-token-minter-keyring}" \
+          --key "${KMS_KEY:-$DEFAULT_KMS_KEY}" \
+          --keyring "${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}" \
           --location "$(derive_kms_location "${REGION}")" --project "${PROJECT_ID}" \
           --filter='state=ENABLED' --format='value(name)' 2>/dev/null || true; } | head -1)"
         if [ -z "$minter_enabled_version" ]; then
           print_error "The GitHub minter is enabled in the generated configuration, but its KMS signing key has no ENABLED version — the apply would wait on a minter that can never become ready."
-          print_info "Import the App key with install.sh (which runs the import before its apply), or unset GITHUB_APP_ID in vars.sh to upgrade without the minter."
+          print_info "Import the App key with install.sh (which runs the import before its apply), or unset GITHUB_APP_ID in install.env to upgrade without the minter."
           exit 1
         fi
       fi
       # A full terraform apply against the regenerated tfvars: both image tags
-      # move, and every setting saved in vars.sh is re-rendered — the successor
+      # move, and every setting recorded in install.env is re-rendered — the successor
       # of the old path's re-render of the CR from saved state.
       (
         cd "${repo_dir}/terraform/examples/full-install"
