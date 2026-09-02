@@ -667,7 +667,8 @@ def send_notification(message: str, session_id: str = "") -> str:
     console view — as a markdown link `[text](url)` with the URL written out in
     full. Never a bare `#39` and never a repo-relative reference: a chat message
     carries no repo context, so both render as plain text and leave the reader
-    guessing which repo was meant.
+    guessing which repo was meant. If you cannot resolve the URL, name the
+    artifact plainly — never construct or guess one.
 
     Args:
         message: The plaintext or markdown-formatted message string to post.
