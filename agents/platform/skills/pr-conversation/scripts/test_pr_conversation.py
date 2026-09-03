@@ -159,7 +159,7 @@ class _Harness(unittest.TestCase):
         Path(path).write_text(content, encoding="utf-8")
         return path
 
-    def run_helper(self, argv, provider, repo=REPO, repo_error=None):
+    def run_helper(self, argv, provider, repo=REPO, repo_error=None, provider_error=None):
         if argv and argv[0] in ("reply", "refuse") and "--repo" not in argv:
             argv = [argv[0], "--repo", repo or REPO] + list(argv[1:])
         managed_mock = (
@@ -167,9 +167,18 @@ class _Harness(unittest.TestCase):
             if repo_error
             else mock.Mock(return_value=[repo] if repo else [])
         )
+        # `provider_error` is the only way to reach the raising branch of
+        # `provider_for`. Every other test patches it to hand back a provider,
+        # which is what let the two call sites sit outside their guards
+        # unnoticed.
+        selector = (
+            mock.Mock(side_effect=provider_error)
+            if provider_error
+            else mock.Mock(return_value=provider)
+        )
         buf = StringIO()
         with mock.patch("gitops_workspace.get_managed_github_repos", managed_mock), \
-             mock.patch.object(forge, "provider_for", return_value=provider), \
+             mock.patch.object(forge, "provider_for", selector), \
              redirect_stdout(buf):
             rc = helper.main(argv)
         return rc, buf.getvalue()
@@ -294,6 +303,25 @@ class PollTest(_Harness):
             ["poll"], FakeProvider(), repo_error=forge.RepoUnparseable("evil.com/a/b")
         )
         self.assertEqual(json.loads(out)["reason"], "GIT_REPO_UNPARSEABLE")
+
+    def test_a_forge_with_no_provider_reports_its_reason_code(self):
+        """`provider_for` raising has to land in the payload, not a traceback.
+
+        It could not raise before — an unknown host fell back to
+        `GitHubProvider` — so the call sat above the guard. Selecting the
+        provider is inside it now, and this is what holds it there.
+        """
+        for error in (
+            forge.UnknownForgeHost("gitlab.com"),
+            forge.RepoUnparseable("git@gitlab.com:g/s/p"),
+        ):
+            with self.subTest(reason=error.reason):
+                _rc, out = self.run_helper(
+                    ["poll"], FakeProvider(), provider_error=error
+                )
+                payload = json.loads(out)
+                self.assertEqual(payload["status"], "ERROR")
+                self.assertEqual(payload["reason"], error.reason)
 
 
 class ConversationContextTest(_Harness):
@@ -770,6 +798,31 @@ class ReplyTest(_Harness):
         provider = answerable(viewer="")
         with self.assertRaises(SystemExit):
             self._reply(provider)
+
+    def test_a_forge_with_no_provider_blocks_the_post(self):
+        """Selecting the provider is inside the guard the comment there names.
+
+        Above it, an unknown host would have been a traceback thrown after the
+        model had already written the body — and `provider_for` only started
+        raising when repository identity moved into `repo_ref`.
+        """
+        provider = answerable()
+        with self.assertRaises(SystemExit):
+            self.run_helper(
+                [
+                    "reply",
+                    "--pr",
+                    "12",
+                    "--comment-id",
+                    "IC_1",
+                    "--body-file",
+                    self.scratch_file("reply.md", "Bumped it to 4."),
+                    "--no-change",
+                ],
+                provider,
+                provider_error=forge.UnknownForgeHost("gitlab.com"),
+            )
+        self.assertEqual(provider.posted, [])
         self.assertEqual(provider.posted, [])
 
 

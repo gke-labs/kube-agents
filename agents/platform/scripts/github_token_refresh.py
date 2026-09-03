@@ -11,19 +11,19 @@ import email.message
 import io
 import json
 import os
-import re
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from urllib.parse import urlsplit
 
 # Add scripts directory so gitops_workspace is importable
 sys.path.append("/opt/defaults/scripts")
 sys.path.append("/opt/data/scripts")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import repo_ref  # noqa: E402  (needs the sys.path lines above)
 
 from credential_proxy_client import authorization_headers
 
@@ -39,77 +39,35 @@ TOKEN_BROKER_URL = os.getenv(
 )
 
 
-# Hosts this refresher will mint a token for. `ssh.github.com` is GitHub's
-# SSH-over-443 endpoint and `www.github.com` is the redirecting alias `git
-# clone` accepts, both naming the same repositories as `github.com`. An
-# enterprise host is deliberately absent: Minty issues tokens for github.com
-# installations only.
-GITHUB_HOSTS = frozenset({"github.com", "www.github.com", "ssh.github.com"})
-
-# scp-like remote syntax — `[user@]host:path` — which is not a URL and so has
-# to be split before the host can be compared.
-_SCP_REMOTE = re.compile(r"^(?:[^/@]+@)?(?P<host>[^/:]+):(?P<path>.+)$")
-
-# One `owner/name` slug, the shape `credential_proxy.is_valid_repository`
-# accepts on the sidecar path. Checked here because the other path — direct to
-# Minty, for the standalone deployments the module docstring names — has no
-# validator downstream, so a deep link's extra segments would be posted as a
-# repository name.
-_REPOSITORY_SEGMENT = re.compile(r"[A-Za-z0-9_.-]+")
-
-
 def github_repo_from_remote(url: str) -> str | None:
     """Return `owner/repo` when `url` is a GitHub remote, else None.
 
-    The host is compared against `GITHUB_HOSTS` after parsing rather than
-    searched for in the raw string: `https://evil.example/github.com/o/r.git`
-    and `https://github.com.evil.example/o/r.git` both contain `github.com`,
-    and a substring check would hand a token request for someone else's
-    repository to Minty.
+    A remote always names a host, so the bare shorthand is refused here even
+    though `repo_ref` parses it: git cannot produce an `origin` of `acme/repo`,
+    and accepting one would let a stray config value stand in for a clone URL.
+
+    The host is compared after parsing rather than searched for in the raw
+    string — `https://evil.example/github.com/o/r.git` and
+    `https://github.com.evil.example/o/r.git` both contain `github.com`, and a
+    substring check would hand a token request for someone else's repository to
+    Minty. `repo_ref` is where that happens now; the log lines here are what
+    keeps a refusal from surfacing only as the caller's "Could not identify
+    target repository 'None'".
     """
-    if "://" in url:
-        parts = urlsplit(url)
-        host, path = parts.hostname, parts.path
-    else:
-        match = _SCP_REMOTE.match(url)
-        if not match:
-            return None
-        host, path = match.group("host"), match.group("path")
-
-    if not host:
+    ref = repo_ref.try_parse(url)
+    if ref is None:
+        log(f"Ignoring git remote: '{url}' is not a repository URL.")
         return None
-    if host.lower() not in GITHUB_HOSTS:
-        # The host, never the URL: a remote can carry `user:token@` in front of
-        # it. Without this an operator whose clone uses an SSH host alias sees
-        # only the caller's "Could not identify target repository 'None'".
-        log(f"Ignoring git remote: host '{host}' is not a GitHub host.")
+    if not ref.host:
+        log(f"Ignoring git remote: '{url}' names no host.")
         return None
-
-    path = path.strip("/")
-    if path.endswith(".git"):
-        path = path[:-4]
-    owner, slash, name = path.partition("/")
-    if (
-        not slash
-        or not _valid_repository_segment(owner)
-        or not _valid_repository_segment(name)
-    ):
-        log(f"Ignoring git remote: path '{path}' is not an owner/repo slug.")
+    if not ref.is_github:
+        log(f"Ignoring git remote: host '{ref.host}' is not a GitHub host.")
         return None
-    return f"{owner}/{name}"
-
-
-def _valid_repository_segment(segment: str) -> bool:
-    """One half of an `owner/name` slug, with the traversal shapes rejected.
-
-    The character class permits `.` and `-`, so it matches `..` and a leading
-    dash as happily as a real name; neither is a repository.
-    """
-    return (
-        _REPOSITORY_SEGMENT.fullmatch(segment) is not None
-        and segment not in (".", "..")
-        and not segment.startswith("-")
-    )
+    if len(ref.segments) != repo_ref.GITHUB_PATH_DEPTH:
+        log(f"Ignoring git remote: path '{ref.path}' is not an owner/repo slug.")
+        return None
+    return ref.path
 
 
 def get_current_git_repo(cwd: str | None = None) -> str | None:
@@ -138,7 +96,12 @@ def refresh_git_credentials(
     """Query local Minty, retrieve token, and cache inside git credentials."""
     repository = target_repo.strip().strip("/") if target_repo else get_current_git_repo()
 
-    if not repository or repository.count("/") != 1:
+    # The slash count this replaced counted separators in whatever it was
+    # handed, so `github.com/acme` passed it. The other path out of here —
+    # direct to Minty, for the standalone deployments the module docstring
+    # names — has no validator downstream, so this is the last check before a
+    # value is posted as a repository name.
+    if not repo_ref.is_github_slug(repository):
         raise RuntimeError(
             f"Could not identify target repository '{repository}'. Must be in 'owner/repo' format."
         )

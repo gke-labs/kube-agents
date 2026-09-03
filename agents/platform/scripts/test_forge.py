@@ -20,9 +20,10 @@ Four properties carry most of the weight:
 * **An unknown permission is not a "no".** A 404 from the collaborator endpoint
   means no write access; a proxy fault means nothing at all, and the sweep turns
   a "no" into a public refusal that is never retried.
-* **The repository parser agrees with `resolver.py`'s.** They are two copies of
-  one hardened parser, and `ParserAgreementTest` is what stops them drifting
-  until `resolver.py` migrates onto this module.
+* **An unsupported host raises rather than falling back to GitHub.** Falling
+  back is what would point `gh` at a same-named GitHub repository on behalf of
+  a URL naming somebody else's forge. The parse behind that decision is
+  `test_repo_ref.py`'s subject, not this file's.
 """
 
 import importlib.util
@@ -76,62 +77,47 @@ class FakeGh:
         raise AssertionError(f"no gh call matched {fragment!r}; saw {self.calls}")
 
 
-def write_settings(tmpdir: str, value: str) -> str:
-    path = os.path.join(tmpdir, "SETTINGS.md")
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(f"# Settings\n\n- **Git Repo:** {value}\n")
-    return path
+class ProviderSelectionTest(unittest.TestCase):
+    """`provider_for`. The parse itself is `test_repo_ref.py`'s subject."""
 
+    def test_no_repository_means_github(self):
+        """What the sweep passes: it discovers repositories after choosing."""
+        self.assertIsInstance(forge.provider_for(), forge.GitHubProvider)
 
-class ParseRepoTest(unittest.TestCase):
-    def _resolve(self, value):
-        return forge._parse_repo(value)
+    def test_bare_shorthand_means_github(self):
+        self.assertIsInstance(forge.provider_for("acme/toolkit"), forge.GitHubProvider)
 
-    def test_bare_shorthand(self):
-        self.assertEqual(self._resolve("acme/toolkit"), "acme/toolkit")
+    def test_github_url_selects_github(self):
+        for value in (
+            "https://github.com/acme/toolkit",
+            "git@github.com:acme/toolkit.git",
+            "https://www.github.com/acme/toolkit",
+        ):
+            with self.subTest(value=value):
+                self.assertIsInstance(
+                    forge.provider_for(value), forge.GitHubProvider
+                )
 
-    def test_https_url(self):
-        self.assertEqual(
-            self._resolve("https://github.com/acme/toolkit"), "acme/toolkit"
-        )
+    def test_a_host_with_no_provider_raises_rather_than_falling_back(self):
+        """The fallback is what would run `gh` against a same-named GitHub repo."""
+        with self.assertRaises(forge.UnknownForgeHost) as ctx:
+            forge.provider_for("git@gitlab.com:group/project")
+        self.assertEqual(ctx.exception.reason, "FORGE_HOST_UNSUPPORTED")
 
-    def test_scp_form_ssh_remote(self):
-        self.assertEqual(
-            self._resolve("git@github.com:acme/toolkit.git"), "acme/toolkit"
-        )
+    def test_github_com_inside_another_host_no_longer_selects_github(self):
+        """The substring test this replaced selected `GitHubProvider` here."""
+        with self.assertRaises(forge.UnknownForgeHost):
+            forge.provider_for("https://example.invalid/github.com/o/r")
 
-    def test_www_prefix(self):
-        self.assertEqual(
-            self._resolve("https://www.github.com/acme/toolkit"), "acme/toolkit"
-        )
+    def test_an_unparseable_value_carries_the_operator_facing_reason_code(self):
+        with self.assertRaises(forge.RepoUnparseable) as ctx:
+            forge.provider_for("../..")
+        self.assertEqual(ctx.exception.reason, "GIT_REPO_UNPARSEABLE")
 
-    def test_git_suffix_is_stripped(self):
-        self.assertEqual(self._resolve("acme/toolkit.git"), "acme/toolkit")
-
-    def test_github_com_as_a_path_segment_on_another_host_is_rejected(self):
-        """The confused-deputy shape the anchored regex exists for."""
-        with self.assertRaises(forge.RepoUnparseable):
-            self._resolve("https://evil.com/github.com/attacker/repo")
-
-    def test_userinfo_cannot_smuggle_the_host(self):
-        with self.assertRaises(forge.RepoUnparseable):
-            self._resolve("https://user@evil.com/github.com/attacker/repo")
-
-    def test_lookalike_host_is_rejected(self):
-        with self.assertRaises(forge.RepoUnparseable):
-            self._resolve("https://evilgithub.com/attacker/repo")
-
-    def test_traversal_satisfies_the_shorthand_pattern_and_is_still_rejected(self):
-        """`BARE_REPO_RE` admits "../.." — the component check is what stops it."""
-        self.assertTrue(forge.BARE_REPO_RE.match("../.."))
-        with self.assertRaises(forge.RepoUnparseable):
-            self._resolve("../..")
-
-    def test_leading_dash_would_be_parsed_as_a_flag(self):
-        with self.assertRaises(forge.RepoUnparseable):
-            self._resolve("-oops/repo")
-
-
+    def test_the_run_seam_is_forwarded_to_the_provider(self):
+        fake = FakeGh()
+        provider = forge.provider_for(repo="acme/toolkit", run=fake)
+        self.assertIs(provider._run, fake)
 
 
 class NormaliseLoginTest(unittest.TestCase):
@@ -1047,23 +1033,6 @@ class PermissionUnknownTest(unittest.TestCase):
         pr = forge.PullRequest(number=12, head_ref="platform-agent/x", author="bot")
         comments = forge.GitHubProvider(run=fake).list_comments(REPO, pr)
         self.assertTrue(comments[0].can_write)
-
-
-class ProviderForTest(unittest.TestCase):
-    def test_github_host_selects_the_github_provider(self):
-        self.assertIsInstance(forge.provider_for(repo="https://github.com/acme/toolkit"), forge.GitHubProvider)
-
-    def test_bare_shorthand_means_github(self):
-        """The operator writes `owner/repo` through verbatim; it is `gh -R`'s own form."""
-        self.assertIsInstance(forge.provider_for(repo="acme/toolkit"), forge.GitHubProvider)
-
-    def test_omitted_repo_defaults_to_github_provider(self):
-        self.assertIsInstance(forge.provider_for(), forge.GitHubProvider)
-
-    def test_the_run_seam_is_forwarded_to_the_provider(self):
-        fake = FakeGh()
-        provider = forge.provider_for(repo="acme/toolkit", run=fake)
-        self.assertIs(provider._run, fake)
 
 
 class ProtocolConformanceTest(unittest.TestCase):

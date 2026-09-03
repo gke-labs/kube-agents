@@ -34,33 +34,36 @@ from pathlib import Path
 from typing import Any
 
 import command_policy
+import repo_ref
 import scoped_sa_pool
 
 LOGGER = logging.getLogger("credential-proxy")
 SLACK_EVENT_QUEUE_MAXSIZE = 1000
 SLACK_ERROR_DIAGNOSTIC_FIELDS = ("ok", "error", "needed", "provided")
 
-# GitHub "owner/name" slug validation. Each segment is matched with a single,
-# unambiguous character class rather than two adjacent "+" groups around the
-# "/" separator, so the match is linear-time and cannot be forced into
-# polynomial backtracking (ReDoS). The length guard bounds untrusted input as
-# defense-in-depth; 256 is far above real GitHub owner/name limits, so valid
-# input is never rejected.
-MAX_REPOSITORY_LENGTH = 256
-_REPOSITORY_SEGMENT = re.compile(r"[A-Za-z0-9_.-]+")
+# GitHub "owner/name" slug validation, shared with the agent-side callers via
+# `repo_ref` — which imports nothing but the standard library precisely so this
+# process, the one holding the credentials, can use it. The linear-time segment
+# match and the length guard both live there, at the same 256 this module
+# enforced before; the alias keeps the name this module's own tests use.
+MAX_REPOSITORY_LENGTH = repo_ref.MAX_REPO_LENGTH
 
 
 def is_valid_repository(repository: Any) -> bool:
-    """Return True if ``repository`` is a well-formed ``owner/name`` slug."""
-    if not isinstance(repository, str) or len(repository) > MAX_REPOSITORY_LENGTH:
-        return False
-    owner, slash, name = repository.partition("/")
-    if not slash:
-        return False
-    return (
-        _REPOSITORY_SEGMENT.fullmatch(owner) is not None
-        and _REPOSITORY_SEGMENT.fullmatch(name) is not None
-    )
+    """Return True if ``repository`` is a well-formed ``owner/name`` slug.
+
+    Strictly narrower than the local copy this replaced. It additionally
+    refuses the traversal and leading-dash shapes — `acme/..`, `acme/-x` —
+    which every other validator in the tree already rejected, and `github.com/o`,
+    which is a host and a one-segment path rather than a slug.
+
+    Nothing is admitted that was not admitted before. That matters here more
+    than elsewhere: the caller passes the *original* string on to
+    `github_token_refresh.py`, so a value this accepts after normalising it
+    would reach Minty in its unnormalised form. `repo_ref.is_github_slug`
+    requires the value to already be the slug for that reason.
+    """
+    return repo_ref.is_github_slug(repository)
 
 
 # Two shapes, because two are what the GitHub refresh helper handles: the

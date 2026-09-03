@@ -21,7 +21,6 @@ this script takes one, and refuses to write in anyone else's.
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -35,7 +34,6 @@ sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
 import gitops_workspace
 from github_token_refresh import refresh_git_credentials, log
 
-BARE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 # Branches a suggestion may never target. `main` and `master` are the GitOps
 # rollout branches; `production` is the convention some fleets use instead.

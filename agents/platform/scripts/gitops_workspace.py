@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
 import re
 import subprocess
@@ -58,6 +59,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
+
+import repo_ref
 
 DEFAULT_AGENT_HOME = "/opt/data"
 
@@ -114,12 +117,18 @@ class GitOpsRepoEmpty(RuntimeError):
     """Raised when a GitOps repository has no commits on any branch."""
 
 
-# Tolerates the operator's Markdown bullet and bold markers, and the literal
-# `None` when the CR leaves it unset.
-SETTINGS_REPO_RE = re.compile(r"^\s*[-*]?\s*\**Git Repo:\**\s*(\S+)\s*$", re.M)
 _LEASE_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _MAX_LEASE_CHARS = 64
-BARE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+LOGGER = logging.getLogger(__name__)
+
+#: The `type` on a `managed_repos` entry that this agent has a provider for.
+#: The operator only ever authors this value, but `parseManagedRepoEntries`
+#: round-trips whatever it finds, so an administrator editing the ConfigMap by
+#: hand — the unregistration path, described in the comment on
+#: `platformagent_controller.go`'s repository reconcile — can put another one
+#: there.
+GITHUB_REPO_TYPE = "github"
 
 Runner = Callable[..., object]
 # One `git symbolic-ref` per clone per process, keyed by workspace path. The
@@ -610,45 +619,29 @@ def configure_identity(
     runner(["git", "config", "user.email", email], cwd=str(target))
 
 
-def _valid_repo_component(part: str) -> bool:
-    """Reject path components unsafe to hand to `gh -R` or use as a filesystem path.
-
-    The slug pattern permits "." and "-", so it happily produces "../..", and a
-    leading dash is parsed by `gh` as a flag. Neither is a shape the regex can
-    express.
-    """
-    return bool(part) and part not in (".", "..") and not part.startswith("-")
-
-
 def is_valid_repo_slug(repo: str) -> bool:
     """Validate that repo is formatted as owner/name without path traversal or flag injection."""
-    if not repo or not BARE_REPO_RE.match(repo):
-        return False
-    owner, _, name = repo.partition("/")
-    return _valid_repo_component(owner) and _valid_repo_component(name)
+    return repo_ref.is_github_slug(repo)
 
 
 def extract_github_slug(entry: str) -> str | None:
-    """Extracts 'owner/repo' slug from a raw URL or shorthand if it refers to GitHub."""
-    s = entry.strip()
-    if not s:
-        return None
-    if s.endswith(".git"):
-        s = s[:-4]
-    s = s.rstrip("/")
+    """Extracts 'owner/repo' slug from a raw URL or shorthand if it refers to GitHub.
 
-    for prefix in ("https://github.com/", "http://github.com/", "git@github.com:", "github.com/"):
-        if s.startswith(prefix):
-            s = s[len(prefix):]
-            break
-    else:
-        if "://" in s or (":" in s and "@" in s):
-            return None
+    The host set is narrowed to `GITHUB_CANONICAL_HOST` rather than every
+    spelling a git remote can carry, because this reads a *registered*
+    repository URL rather than a clone URL.
 
-    s = s.lstrip("/")
-    if is_valid_repo_slug(s):
-        return s
-    return None
+    The accepted *syntax* is wider than the four literal prefixes this
+    replaced, and deliberately so: `ssh://`, `git://` and any other scheme,
+    userinfo, a `?query` or `#fragment`, and `GitHub.com` in any casing all now
+    resolve. Each of them still names `github.com/owner/name` — the host is
+    parsed, so a scheme cannot redirect it elsewhere — so the widening changes
+    the spellings an administrator may write, not which repository an entry
+    resolves to.
+    """
+    return repo_ref.try_github_slug(
+        entry, hosts=frozenset({repo_ref.GITHUB_CANONICAL_HOST})
+    )
 
 
 DEFAULT_GITOPS_STATE_PATH = "/etc/gitops/managed_repos"
@@ -723,14 +716,32 @@ def get_managed_repo_entries() -> list[dict[str, str]]:
 
 
 def get_managed_github_repos() -> list[str]:
-    """Extracts managed GitHub repositories ('owner/name' slugs) from the state ConfigMap."""
-    entries = get_managed_repo_entries()
+    """Extracts managed GitHub repositories ('owner/name' slugs) from the state ConfigMap.
+
+    An entry naming a forge this agent cannot drive is logged rather than
+    dropped in silence. It is still skipped — there is one provider — but this
+    is the point at which a `type` becomes a choice of provider rather than a
+    filter, and the silent version made a registered repository the agent will
+    never touch indistinguishable from one that was never registered.
+    """
     res: list[str] = []
-    for e in entries:
-        if e.get("type") == "github":
-            slug = extract_github_slug(e["url"])
-            if slug and slug not in res:
-                res.append(slug)
+    for entry in get_managed_repo_entries():
+        url = entry.get("url", "")
+        if entry.get("type") != GITHUB_REPO_TYPE:
+            LOGGER.warning(
+                "Skipping managed repository %r: no provider for type %r.",
+                url,
+                entry.get("type"),
+            )
+            continue
+        slug = extract_github_slug(url)
+        if not slug:
+            LOGGER.warning(
+                "Skipping managed repository %r: not a GitHub repository URL.", url
+            )
+            continue
+        if slug not in res:
+            res.append(slug)
     return res
 
 

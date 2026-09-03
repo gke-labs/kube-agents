@@ -2009,6 +2009,47 @@ class RepositoryValidationTest(unittest.TestCase):
         # runs (defense-in-depth against regex denial-of-service).
         self.assertFalse(is_valid_repository("-" * (MAX_REPOSITORY_LENGTH + 1)))
 
+    def test_rejects_traversal_and_flag_segments(self):
+        # The local validator this replaced accepted both; every other copy in
+        # the tree rejected them. `acme/..` names the owner's namespace rather
+        # than a repository, and a leading dash makes `gh -R <slug>` read the
+        # slug as a flag.
+        for value in ("acme/..", "acme/.", "acme/-x", "-acme/repo", "../.."):
+            with self.subTest(value=value):
+                self.assertFalse(is_valid_repository(value))
+
+    def test_rejects_a_value_it_would_have_to_normalise(self):
+        # The caller passes the *original* string to github_token_refresh.py,
+        # which splits it on "/" and sends the left half to Minty as an org
+        # name. Accepting a value that merely normalises to a slug would put
+        # "  acme" in that request.
+        for value in (
+            " acme/repo ",
+            "acme/repo\n",
+            "/acme/repo",
+            "acme/repo/",
+            "acme/repo.git",
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(is_valid_repository(value))
+
+    def test_rejects_a_value_carrying_a_host(self):
+        for value in (
+            "github.com/acme",
+            "github.com/acme/repo",
+            "https://github.com/acme/repo",
+            "git@github.com:acme/repo",
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(is_valid_repository(value))
+
+    def test_stays_total_on_a_malformed_url(self):
+        # urlsplit raises a bare ValueError on these; nothing may escape a
+        # predicate the request handler calls on untrusted input.
+        for value in ("https://[::1/x", "http://[abc]:x/a/b", "https://a]b/c/d"):
+            with self.subTest(value=value):
+                self.assertFalse(is_valid_repository(value))
+
 
 class GitHubRefreshHandlerTest(unittest.TestCase):
     """A failed refresh splits its diagnosis: detail to the log, none to the reply.
