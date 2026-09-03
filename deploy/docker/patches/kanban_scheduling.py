@@ -756,12 +756,13 @@ def release_dead_foreign_claims(
                     # Same test, same source as the per-row loop in
                     # ``detect_crashed_workers``.
                     continue
-        fate = classify_reclaim(lock, claimer_id, row["claimed_at"], process_start)
-        if fate != POD_REPLACED and pid_alive(pid):
-            # Either a real live worker or a PID collision on this host. The TTL
-            # remains the backstop; never take a card away from something that
-            # might be running it.
+        if pid_alive(pid):
+            # Either a real live worker or a PID collision. The TTL remains the
+            # backstop; never take a card away from something that might be
+            # running it.
             continue
+
+        fate = classify_reclaim(lock, claimer_id, row["claimed_at"], process_start)
         charged = fate != POD_REPLACED
 
         # ``ready``, not ``todo``: ``recompute_ready`` promotes a ``todo`` row

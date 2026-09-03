@@ -90,6 +90,7 @@ _AGENT_AVAILABILITY_TIMEOUT_SECONDS = 180
 _AGENT_POLL_INTERVAL_SECONDS = 5
 _DEFAULT_ROUTE_NAME = "gke_stockout_alerts"
 _SMOKE_VERIFY_TIMEOUT_SECONDS = 300
+# Headroom covers preflight checks (bounded by AGENT_AVAILABILITY_TIMEOUT=180 plus SKILL_MOUNT_TIMEOUT=30 = 210s max) and cleanup.
 _SCENARIO_RUN_HEADROOM_SECONDS = 300
 
 
@@ -530,27 +531,60 @@ def _verify_skill_mounted(
     )
 
 
-def _clean_stale_kanban_tasks(pod: str, namespace: str, route_name: str) -> None:
-    """Reclaims and archives any lingering kanban tasks for route_name so slots are open."""
+def _clean_stale_kanban_tasks(pod: str, namespace: str, route_name: str) -> int:
+    """Reclaims and archives any lingering kanban tasks for route_name so slots are open.
+
+    Returns the count of tasks archived, or raises RuntimeError if cleanup or verification fails.
+    """
     py_code = (
-        "import subprocess, json\n"
+        "import json, subprocess, sys\n"
+        "route_name = sys.argv[1] if len(sys.argv) > 1 else ''\n"
+        "cmd_env = {'HOME': '/tmp', 'PATH': '/opt/hermes/.venv/bin:/usr/local/bin:/usr/bin:/bin'}\n"
         "try:\n"
-        "    cmd_env = {'HOME': '/tmp', 'PATH': '/opt/hermes/.venv/bin:/usr/local/bin:/usr/bin:/bin'}\n"
-        "    out = subprocess.check_output(['hermes', 'kanban', 'ls', '--json'], env=cmd_env)\n"
-        "    data = json.loads(out)\n"
-        "    tasks = data.get('tasks') if isinstance(data, dict) else data\n"
-        "    for t in (tasks or []):\n"
-        "        tid = t.get('id')\n"
-        "        title = str(t.get('title', ''))\n"
-        "        status = t.get('status')\n"
-        f"        if tid and title.startswith({route_name!r}) and status in ('running', 'claimed', 'ready', 'blocked', 'todo'):\n"
-        "            if status in ('running', 'claimed'):\n"
-        "                subprocess.run(['hermes', 'kanban', 'reclaim', tid], env=cmd_env, capture_output=True)\n"
-        "            subprocess.run(['hermes', 'kanban', 'archive', tid], env=cmd_env, capture_output=True)\n"
-        "except Exception:\n"
-        "    pass\n"
+        "    res = subprocess.run(['hermes', 'kanban', 'ls', '--json'], env=cmd_env, capture_output=True, text=True, check=True)\n"
+        "    data = json.loads(res.stdout)\n"
+        "except Exception as e:\n"
+        "    sys.stderr.write(f'kanban ls failed: {e}\\n')\n"
+        "    sys.exit(1)\n"
+        "tasks = data.get('tasks') if isinstance(data, dict) else data\n"
+        "archived = 0\n"
+        "errors = []\n"
+        "for t in (tasks or []):\n"
+        "    tid = t.get('id')\n"
+        "    title = str(t.get('title', ''))\n"
+        "    status = t.get('status')\n"
+        "    if tid and title.startswith(route_name) and status in ('running', 'claimed', 'ready', 'blocked', 'todo'):\n"
+        "        if status in ('running', 'claimed'):\n"
+        "            rec = subprocess.run(['hermes', 'kanban', 'reclaim', tid], env=cmd_env, capture_output=True, text=True)\n"
+        "            if rec.returncode != 0:\n"
+        "                errors.append(f'reclaim {tid}: {rec.stderr.strip()}')\n"
+        "        arc = subprocess.run(['hermes', 'kanban', 'archive', tid], env=cmd_env, capture_output=True, text=True)\n"
+        "        if arc.returncode != 0:\n"
+        "            errors.append(f'archive {tid}: {arc.stderr.strip()}')\n"
+        "        else:\n"
+        "            archived += 1\n"
+        "verify = subprocess.run(['hermes', 'kanban', 'ls', '--json'], env=cmd_env, capture_output=True, text=True)\n"
+        "if verify.returncode == 0:\n"
+        "    vdata = json.loads(verify.stdout)\n"
+        "    vtasks = vdata.get('tasks') if isinstance(vdata, dict) else vdata\n"
+        "    lingering = [t.get('id') for t in (vtasks or []) if str(t.get('title', '')).startswith(route_name) and t.get('status') in ('running', 'claimed', 'ready', 'blocked', 'todo')]\n"
+        "    if lingering:\n"
+        "        errors.append(f'{len(lingering)} tasks still active: {lingering}')\n"
+        "if errors:\n"
+        "    sys.stderr.write('; '.join(errors) + '\\n')\n"
+        "    sys.exit(1)\n"
+        "print(archived)\n"
     )
-    _kubectl("exec", "-i=false", "-n", namespace, pod, "-c", "platform-agent", "--", "python3", "-c", py_code)
+    res = _kubectl(
+        "exec", "-i=false", "-n", namespace, pod, "-c", "platform-agent", "--",
+        "python3", "-c", py_code, route_name,
+    )
+    if res.returncode != 0:
+        raise RuntimeError(f"Kanban cleanup failed on pod {pod}: {res.stderr or res.stdout}")
+    try:
+        return int(res.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return 0
 
 
 def _wait_for_agent_available(
@@ -567,12 +601,14 @@ def _wait_for_agent_available(
             f"PlatformAgent '{agent_ref}' has no gateway workload."
         )
     target = f"{kind}/{workload_name}"
-    deadline = time.time() + timeout
 
     res = _kubectl("rollout", "status", target, "-n", namespace, f"--timeout={timeout}s", timeout=timeout + 30)
     if res.returncode != 0:
         pytest.fail(f"Gateway {target} rollout not ready within {timeout}s: {res.stderr}")
 
+    # Recompute the deadline so pod readiness and skill mount have their own dedicated budget,
+    # rather than sharing a deadline that a slow rollout could exhaust before the probe loop starts.
+    deadline = time.time() + timeout
     ready_pod = None
     while time.time() < deadline:
         revision = _current_revision_selector(kind, workload_name, namespace)

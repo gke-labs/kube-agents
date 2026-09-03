@@ -513,6 +513,47 @@ class WaitAgentAvailableTest(unittest.TestCase):
                 sof._wait_for_agent_available("platform-agent", "ns", timeout=0)
         self.assertIn("not available and ready", str(caught.exception))
 
+    def test_slow_rollout_does_not_consume_probe_budget(self):
+        probe_iterations = 0
+
+        def fake_kubectl(*args, **kwargs):
+            nonlocal probe_iterations
+            if "rollout" in args:
+                return _completed(returncode=0)
+            if "deployment" in args:
+                return _completed(returncode=0)
+            if "exec" in args:
+                probe_iterations += 1
+                if probe_iterations >= 2:
+                    return _completed(stdout="PRESENT\n")
+                return _completed(stdout="ABSENT\n")
+            if "platformagent" in args:
+                return _completed(stdout="/opt/data")
+            return _completed(stdout=json.dumps({"items": [GatewayPodTest._pod("gw-ready")]}))
+
+        with mock.patch.object(sof, "_kubectl", side_effect=fake_kubectl), \
+                mock.patch.object(sof, "_current_revision_selector", return_value=None), \
+                mock.patch.object(sof.time, "sleep"):
+            pod = sof._wait_for_agent_available("platform-agent", "ns", timeout=10)
+        self.assertEqual(pod, "gw-ready")
+        self.assertGreaterEqual(probe_iterations, 2)
+
+
+class CleanStaleKanbanTasksTest(unittest.TestCase):
+    """Verifies that _clean_stale_kanban_tasks returns archived count and raises on failure."""
+
+    def test_clean_stale_kanban_tasks_returns_count(self):
+        with mock.patch.object(sof, "_kubectl", return_value=_completed(stdout="archived 2 tasks\n2\n")):
+            count = sof._clean_stale_kanban_tasks("gw-pod", "ns", "gke_stockout_alerts")
+        self.assertEqual(count, 2)
+
+    def test_clean_stale_kanban_tasks_raises_on_error(self):
+        with mock.patch.object(sof, "_kubectl", return_value=_completed(returncode=1, stderr="reclaim failed")):
+            with self.assertRaises(RuntimeError) as caught:
+                sof._clean_stale_kanban_tasks("gw-pod", "ns", "gke_stockout_alerts")
+        self.assertIn("Kanban cleanup failed on pod gw-pod", str(caught.exception))
+        self.assertIn("reclaim failed", str(caught.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

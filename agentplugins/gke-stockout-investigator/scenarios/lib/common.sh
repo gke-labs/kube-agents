@@ -112,6 +112,7 @@ DRY_RUN=0
 EMIT_MANIFEST=""
 WATCH_TIMEOUT="${WATCH_TIMEOUT:-600}"
 AGENT_AVAILABILITY_TIMEOUT="${AGENT_AVAILABILITY_TIMEOUT:-180}"
+SKILL_MOUNT_TIMEOUT="${SKILL_MOUNT_TIMEOUT:-30}"
 IN_LOOP_POD_RESOLVE_TIMEOUT="${IN_LOOP_POD_RESOLVE_TIMEOUT:-15}"
 AGENT_POLL_INTERVAL=5
 
@@ -335,10 +336,12 @@ preflight() {
     _resolve_platform_pod
     dim "gateway pod ${PLATFORM_POD}"
 
-    # Wait up to AGENT_AVAILABILITY_TIMEOUT for the skill to be readable in the resolved pod
+    # Wait up to SKILL_MOUNT_TIMEOUT for the skill to be readable in the resolved pod.
+    # Transient mount lag resolves within seconds; a short bound keeps permanent failures
+    # from consuming the scenario headroom.
     _sync_platform_pod
     local skill_waited=0 skill_found=0
-    while [ "$skill_waited" -lt "$AGENT_AVAILABILITY_TIMEOUT" ]; do
+    while [ "$skill_waited" -lt "$SKILL_MOUNT_TIMEOUT" ]; do
         if kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
             sh -c 'test -f "${HERMES_HOME:-/opt/data}/profiles/platform/plugins/'"${PLUGIN_NAME}"'/skills/gke-stockout-investigator/SKILL.md"' 2>/dev/null; then
             skill_found=1
@@ -370,25 +373,61 @@ preflight() {
 cleanup_kanban() {
     _sync_platform_pod
     [ -n "$PLATFORM_POD" ] || return 0
-    kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
-        python3 -c "
-import subprocess, json
+    local out
+    if out="$(kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
+        python3 -c '
+import json, subprocess, sys
+
+route_name = sys.argv[1] if len(sys.argv) > 1 else ""
+cmd_env = {"HOME": "/tmp", "PATH": "/opt/hermes/.venv/bin:/usr/local/bin:/usr/bin:/bin"}
 try:
-    cmd_env = {'HOME': '/tmp', 'PATH': '/opt/hermes/.venv/bin:/usr/local/bin:/usr/bin:/bin'}
-    out = subprocess.check_output(['hermes', 'kanban', 'ls', '--json'], env=cmd_env)
-    data = json.loads(out)
-    tasks = data.get('tasks') if isinstance(data, dict) else data
-    for t in (tasks or []):
-        tid = t.get('id')
-        title = str(t.get('title', ''))
-        status = t.get('status')
-        if tid and title.startswith('${ROUTE_NAME}') and status in ('running', 'claimed', 'ready', 'blocked', 'todo'):
-            if status in ('running', 'claimed'):
-                subprocess.run(['hermes', 'kanban', 'reclaim', tid], env=cmd_env, capture_output=True)
-            subprocess.run(['hermes', 'kanban', 'archive', tid], env=cmd_env, capture_output=True)
-except Exception:
-    pass
-" >/dev/null 2>&1 || true
+    res = subprocess.run(["hermes", "kanban", "ls", "--json"], env=cmd_env, capture_output=True, text=True, check=True)
+    data = json.loads(res.stdout)
+except Exception as e:
+    sys.stderr.write(f"kanban ls failed: {e}\n")
+    sys.exit(1)
+
+tasks = data.get("tasks") if isinstance(data, dict) else data
+archived = 0
+errors = []
+for t in (tasks or []):
+    tid = t.get("id")
+    title = str(t.get("title", ""))
+    status = t.get("status")
+    if tid and title.startswith(route_name) and status in ("running", "claimed", "ready", "blocked", "todo"):
+        if status in ("running", "claimed"):
+            rec = subprocess.run(["hermes", "kanban", "reclaim", tid], env=cmd_env, capture_output=True, text=True)
+            if rec.returncode != 0:
+                errors.append(f"reclaim {tid}: {rec.stderr.strip()}")
+        arc = subprocess.run(["hermes", "kanban", "archive", tid], env=cmd_env, capture_output=True, text=True)
+        if arc.returncode != 0:
+            errors.append(f"archive {tid}: {arc.stderr.strip()}")
+        else:
+            archived += 1
+
+verify = subprocess.run(["hermes", "kanban", "ls", "--json"], env=cmd_env, capture_output=True, text=True)
+if verify.returncode == 0:
+    vdata = json.loads(verify.stdout)
+    vtasks = vdata.get("tasks") if isinstance(vdata, dict) else vdata
+    lingering = [t.get("id") for t in (vtasks or []) if str(t.get("title", "")).startswith(route_name) and t.get("status") in ("running", "claimed", "ready", "blocked", "todo")]
+    if lingering:
+        errors.append(f"{len(lingering)} tasks still active: {lingering}")
+
+if errors:
+    sys.stderr.write("; ".join(errors) + "\n")
+    sys.exit(1)
+
+print(archived)
+' "$ROUTE_NAME" 2>&1)"; then
+        local count="${out##*$'\n'}"
+        if [ "$count" -gt 0 ] 2>/dev/null; then
+            ok "archived ${count} stale kanban task(s) for ${ROUTE_NAME}"
+        else
+            dim "kanban board clean for ${ROUTE_NAME} (0 active tasks)"
+        fi
+    else
+        warn "kanban cleanup encountered an error: ${out}"
+    fi
 }
 
 # The adapter dedups on cluster + namespace + controller for 24h. Re-running a
@@ -398,8 +437,8 @@ clear_dedup() {
     _sync_platform_pod
     kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
         rm -f /opt/data/pubsub_registry.json >/dev/null 2>&1 || true
+    ok "cleared the adapter dedup registry"
     cleanup_kanban
-    ok "cleared the adapter dedup registry and kanban route tasks"
 }
 
 # ------------------------------------------------------------------- the payload
