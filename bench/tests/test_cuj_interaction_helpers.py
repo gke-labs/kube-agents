@@ -10,7 +10,9 @@ give it.
 
 from __future__ import annotations
 
+import re
 import sys
+import textwrap
 from pathlib import Path
 
 BENCH_ROOT = Path(__file__).resolve().parents[1]
@@ -19,10 +21,28 @@ if str(BENCH_ROOT) not in sys.path:
 
 from cuj.utils.interaction import substantive_output  # noqa: E402
 
+def _soul_handoff_template() -> str:
+    """The hand-off Kage is instructed to send, read from its own SOUL.md.
+
+    Hand-written prose drifts from the instruction it stands in for: an
+    earlier version of this fixture had no emphasis markers or backticks, so
+    it passed against a matcher that could not read a real reply.
+    """
+
+    soul = (Path(__file__).resolve().parents[2] / "agents/chat/SOUL.md").read_text(
+        encoding="utf-8"
+    )
+    block = re.search(
+        r"```\n(\s*> [^\n]*Delegated to the .*?)```", soul, re.S
+    )
+    assert block, "agents/chat/SOUL.md no longer shows the delegation template"
+    return textwrap.dedent(block.group(1)).strip()
+
+
 ACK = (
-    "Delegated to the platform agent.\n\n"
-    "I've started this design process under task t_cbb05c69. The complete "
-    "design report will post directly to this thread as soon as it's ready."
+    _soul_handoff_template()
+    .replace("<agent-name>", "platform")
+    .replace("<task_id>", "t_cbb05c69")
 )
 REPORT = (
     "## Executive Summary\n\n"
