@@ -1,14 +1,26 @@
 name: "Nightly: Pipeline"
 
 # Builds a nightly environment from nothing, runs the full E2E matrix on it,
-# promotes the candidate to staging if the matrix passes, and destroys the
-# environment again.
+# and — if the matrix passes — applies that same composition to the two
+# long-lived environments and promotes the candidate to staging, before
+# destroying the nightly environment again.
 #
-# Nothing in it touches the RC environment. The three jobs that touch a cluster —
-# deploy, the matrix, teardown — bind `nightly` and take the
+# The two reconcile steps are what keeps the long-lived environments current.
+# `rc` and `nightly` are rebuilt from terraform/examples/full-install every run
+# and so always match main; `autopush` and `staging` are never rebuilt, so
+# without a reconcile they receive image tags and nothing else and end up
+# running last month's infrastructure while reporting themselves as main —
+# #1117 found both of them a month behind. They reconcile HERE, after the
+# matrix, rather than on their own schedule: applying
+# a composition that has not been proved from scratch to an environment people
+# live-test against is worse than leaving it stale.
+#
+# Nothing in it touches the RC environment. The three jobs that touch the
+# nightly cluster — deploy, the matrix, teardown — bind `nightly` and take the
 # `nightly-environment` lock, so none of them queues behind or races the
 # three-hourly RC pipeline. Step 1 binds `nightly` for its variables without
-# taking the lock; step 4 only pushes a Git tag, so it does neither.
+# taking the lock; the promotion only pushes a Git tag, so it does neither; and
+# the reconciles take their own environments' locks.
 #
 # Dispatch-only on purpose: turning the schedule on is its own decision and its
 # own reviewable change. Exercise it by hand against the nightly project until it
@@ -28,7 +40,8 @@ on:
         type: string
 
 # Distinct from the `nightly-environment` lock the called workflows take. That
-# one is acquired and released three times over — by steps 2, 3 and 5 — so a
+# one is acquired and released three times over — by the deploy, the matrix and
+# the teardown, whatever their step numbers happen to be — so a
 # workflow pointed at the `nightly` environment can interleave in a gap. This
 # group is held for the whole run, and it is what keeps the only thing that
 # drives the environment end to end, another nightly, out of those gaps.
@@ -150,18 +163,74 @@ jobs:
       timeout_minutes: 120
     secrets: inherit
 
-  step-4-promote-to-staging:
-    name: Step 4 - Promote Candidate to Staging
+  step-4-reconcile-staging:
+    name: Step 4 - Reconcile Staging Infrastructure
     needs: [step-1-resolve-candidate, step-3-run-e2e-matrix]
-    # The implicit success() on `needs` is the gate: a red matrix promotes
-    # nothing and leaves staging where it is.
-    #
-    # skip_promotion — the candidate already carries a staging tag — is checked on
-    # the STEPS below rather than here. A skipped job skips everything that
-    # `needs` it, and step 5 needs this one, so gating the job would strand a GKE
-    # cluster on every night whose candidate was already promoted.
+    # The implicit success() on `needs` is the gate, and it is the whole point
+    # of putting this here rather than on a schedule: promoting a composition
+    # that has not been proved from scratch into an environment agents live-test
+    # against is strictly worse than leaving that environment stale.
     if: |
       github.repository == 'gke-labs/kube-agents' &&
+      needs.step-1-resolve-candidate.outputs.skip_pipeline != 'true'
+    # BEFORE the promotion job pushes its tag, deliberately. That tag starts
+    # staging-redeploy-{agent,controller,integrations}.yml, all three of which
+    # `helm upgrade` the same release the composition's helm_release.kube_agents
+    # owns — so a reconcile running alongside them either fails on the release
+    # lock or has its work re-tagged out from under it. Applying first and
+    # tagging second leaves nothing to race: the redeploys then set image tags
+    # the apply has already set.
+    #
+    # Staging as well as autopush, because the promotion below moves staging's
+    # IMAGES and nothing else: reconciling autopush alone would leave staging's
+    # INFRASTRUCTURE exactly as stale. That is #1117 §9.
+    uses: ./.github/workflows/reconcile-environment.yml # zizmor: ignore[secrets-inherit]
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
+    with:
+      github_environment: "staging"
+      mode: "apply"
+      # The candidate, because that is what this pipeline is promoting. autopush
+      # below is the opposite case and passes nothing.
+      image_tag: ${{ needs.step-1-resolve-candidate.outputs.commit_sha }}
+      # A nightly that stops because somebody is live-testing has cost nothing:
+      # the next one reconciles, and the drift report says so until one does.
+      lease_policy: "defer"
+    secrets: inherit
+
+  step-5-promote-to-staging:
+    name: Step 5 - Promote Candidate to Staging
+    needs:
+      [
+        step-1-resolve-candidate,
+        step-3-run-e2e-matrix,
+        step-4-reconcile-staging,
+      ]
+    # step-4 is in `needs` for ORDER, not for outcome. The reconcile has to
+    # finish before the tag is pushed — that tag starts three `helm upgrade`s on
+    # the release `helm_release.kube_agents` owns, and applying into them races —
+    # but a reconcile that FAILS must not take the image promotion with it.
+    # The ways the reconcile can go red are wider than "the composition is bad":
+    # a missing GitHub variable, an unreadable lease, a rotated minter key. None
+    # of those says anything about the candidate, so coupling them would mean
+    # every nightly silently dropping a promotion the matrix had just earned.
+    #
+    # `always() && !cancelled()` is what decouples it, and it removes the
+    # implicit success() on every other `needs` along with it — so the matrix and
+    # candidate gates are restated explicitly below rather than inherited. A red
+    # matrix still promotes nothing.
+    #
+    # skip_promotion — the candidate already carries a staging tag — is checked on
+    # the STEPS below rather than here, so the job runs and succeeds whenever its
+    # gates pass. Gating the job would skip it, and a skipped job skips everything
+    # that `needs` it.
+    if: |
+      always() && !cancelled() &&
+      github.repository == 'gke-labs/kube-agents' &&
+      needs.step-1-resolve-candidate.result == 'success' &&
+      needs.step-3-run-e2e-matrix.result == 'success' &&
       needs.step-1-resolve-candidate.outputs.skip_pipeline != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -194,20 +263,45 @@ jobs:
           echo "Candidate ${RC_TAG} already carries a staging tag; the matrix ran, nothing was pushed." \
             >> "${GITHUB_STEP_SUMMARY}"
 
-  step-5-teardown-env:
-    name: Step 5 - Tear Down Nightly Environment
+  step-6-reconcile-autopush:
+    name: Step 6 - Reconcile Autopush Infrastructure
+    needs: [step-1-resolve-candidate, step-3-run-e2e-matrix]
+    # Same gate as staging's: only a composition the matrix has just built from
+    # nothing and passed against gets applied to an environment people work in.
+    if: |
+      github.repository == 'gke-labs/kube-agents' &&
+      needs.step-1-resolve-candidate.outputs.skip_pipeline != 'true'
+    uses: ./.github/workflows/reconcile-environment.yml # zizmor: ignore[secrets-inherit]
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
+    with:
+      github_environment: "autopush"
+      mode: "apply"
+      # No image tag, which is the difference from staging above. autopush
+      # tracks main's TIP — every GHCR publish redeploys it — while this
+      # pipeline is holding a candidate that was validated hours or days ago.
+      # Passing that candidate would roll autopush's images backwards. Empty
+      # makes this converge the infrastructure and leave the images alone.
+      image_tag: ""
+      lease_policy: "defer"
+    secrets: inherit
+
+  step-7-teardown-env:
+    name: Step 7 - Tear Down Nightly Environment
     # The implicit success() on `needs` is the gate: a failure in resolve, deploy
     # or the matrix leaves the environment standing to be examined live. The `if:`
     # below adds to that check rather than replacing it — an `always()` here would
     # remove it and start destroying the environments this exists to preserve.
     #
-    # `step-4-promote-to-staging` is deliberately absent from the list. Its only
-    # failure modes are credential ones — an expired RELEASE_BOT_TOKEN, a rejected
-    # push — which leave nothing on the cluster worth looking at, and depending on
-    # it would strand a GKE cluster that nothing else reclaims: this pipeline has
-    # no schedule, so there is no next run to clean up after it. Running the two
-    # concurrently is safe, because step 4 touches no GCP resource and this job
-    # holds the nightly-environment lock.
+    # The promotion and the two reconciles are deliberately absent from the list,
+    # and for the same reason: none of them touches the NIGHTLY cluster, and
+    # depending on them would strand a GKE cluster that nothing else reclaims —
+    # this pipeline has no schedule, so there is no next run to clean up after
+    # it. A staging apply that fails must not leave the nightly environment
+    # standing. Running them concurrently is safe: this job holds the
+    # nightly-environment lock and they hold their own environments'.
     needs: [step-1-resolve-candidate, step-2-deploy-env, step-3-run-e2e-matrix]
     if: |
       github.repository == 'gke-labs/kube-agents' &&

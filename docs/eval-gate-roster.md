@@ -27,13 +27,13 @@ The variable is comma- or whitespace-separated task ids; `_bootstrap_admitted()`
 
 ## The admission bar, and who clears it
 
-Twelve of the twenty active cases are admitted (recount the uncommented entries in the
+Eleven of the twenty active cases are admitted (recount the uncommented entries in the
 script's `TASKS` array rather than trusting this sentence — an earlier copy of it
 miscounted twice): the ones whose recent record shows failures only on their own
 regressions or on infra classes the harness already excludes from the verdict.
 
 The rest still run and report on every pull request, and they cannot red one on a GRADED
-failure. Four are held out with a filed issue naming the exit condition:
+failure. Five are held out with a filed issue naming the exit condition:
 
 - **capacity-pinned-pool-probe** —
   [#1010](https://github.com/gke-labs/kube-agents/issues/1010): worker completes its card
@@ -57,6 +57,14 @@ failure. Four are held out with a filed issue naming the exit condition:
   grades), and some runs publish no ledger at all — so the collapse is the environment's,
   not the diff's. Enters when #1171's re-admission bar holds: delegation fixed and a clean
   3-day graded record.
+- **rca-remediation-pr** —
+  [#1189](https://github.com/gke-labs/kube-agents/issues/1189): demoted 2026-09-02 evening
+  after rung-4 collapses on six unrelated pull requests in one day. The suite's longest
+  delegation chain, so it integrates over every environment fault in its window: the
+  #1097 429 storms, the #1144 proxy EACCES (fix #1183), and #1184's gap (infra-blocked
+  repetitions graded rather than classified) turn one dirty window into a correlated
+  collapse. Its own record was 12/13 clean before the storms. Enters when #1189's
+  re-admission bar holds.
 
 The others are simply new and earn their record like any case, then enter:
 **security-overgrant-remediation-proposal**

@@ -97,11 +97,16 @@ def _gh_stub(
     return run
 
 
+import github_token_refresh
+
+
 @contextlib.contextmanager
 def _fresh_refresh_state():
-    with mock.patch.object(resolver, "_refresh_attempted", False):
-        with mock.patch.object(resolver, "_refresh_failed", False):
-            yield
+    github_token_refresh.reset_refresh_state()
+    try:
+        yield
+    finally:
+        github_token_refresh.reset_refresh_state()
 
 
 class GetManagedReposTest(unittest.TestCase):
@@ -155,9 +160,10 @@ class HandlePollRoutingTest(unittest.TestCase):
         with contextlib.ExitStack() as stack:
             stack.enter_context(contextlib.redirect_stdout(buf))
             stack.enter_context(contextlib.redirect_stderr(err))
+            stack.enter_context(mock.patch("gitops_workspace.get_managed_github_repos", return_value=repos))
             stack.enter_context(mock.patch.object(resolver, "get_managed_github_repos", return_value=repos))
             stack.enter_context(mock.patch.object(subprocess, "run", _gh_stub(**stub)))
-            stack.enter_context(mock.patch.object(resolver, "refresh_credentials", _refresh))
+            stack.enter_context(mock.patch("github_token_refresh.refresh_git_credentials", _refresh))
             stack.enter_context(_fresh_refresh_state())
             resolver.handle_poll(argparse.Namespace())
         self.stderr = err.getvalue()
@@ -468,8 +474,9 @@ class ReportFilePathGuardTest(unittest.TestCase):
             stack.enter_context(contextlib.redirect_stdout(buf))
             stack.enter_context(contextlib.redirect_stderr(err))
             stack.enter_context(mock.patch.object(subprocess, "run", _gh_stub(record=calls, **stub)))
-            stack.enter_context(mock.patch.object(resolver, "refresh_credentials", lambda repo: self.refresh_calls.append(repo)))
+            stack.enter_context(mock.patch("github_token_refresh.refresh_git_credentials", lambda repo: self.refresh_calls.append(repo)))
             if mock_repos is not None:
+                stack.enter_context(mock.patch("gitops_workspace.get_managed_github_repos", return_value=mock_repos))
                 stack.enter_context(mock.patch.object(resolver, "get_managed_github_repos", return_value=mock_repos))
             stack.enter_context(_fresh_refresh_state())
             try:
@@ -555,7 +562,8 @@ class RunGhRetryTest(unittest.TestCase):
     def _run(self, argv, check, **stub):
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(subprocess, "run", _gh_stub(**stub)))
-            stack.enter_context(mock.patch.object(resolver, "refresh_credentials", lambda repo: self.refresh_calls.append(repo)))
+            stack.enter_context(mock.patch("github_token_refresh.refresh_git_credentials", lambda repo: self.refresh_calls.append(repo)))
+            stack.enter_context(mock.patch("gitops_workspace.get_managed_github_repos", return_value=["acme/toolkit"]))
             stack.enter_context(mock.patch.object(resolver, "get_managed_github_repos", return_value=["acme/toolkit"]))
             stack.enter_context(_fresh_refresh_state())
             return resolver.run_gh(argv, check=check)
@@ -580,7 +588,7 @@ class RunGhRetryTest(unittest.TestCase):
     def test_a_missing_binary_never_reaches_the_broker(self):
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(subprocess, "run", side_effect=FileNotFoundError))
-            stack.enter_context(mock.patch.object(resolver, "refresh_credentials", lambda repo: self.refresh_calls.append(repo)))
+            stack.enter_context(mock.patch("github_token_refresh.refresh_git_credentials", lambda repo: self.refresh_calls.append(repo)))
             stack.enter_context(_fresh_refresh_state())
             result = resolver.run_gh(["auth", "status"], check=False)
         self.assertEqual(result.returncode, 127)
@@ -589,7 +597,7 @@ class RunGhRetryTest(unittest.TestCase):
     def test_one_mint_covers_a_whole_invocation(self):
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(subprocess, "run", _gh_stub(write_rcs=[1], write_stderr=GH_AUTH_STDERR)))
-            stack.enter_context(mock.patch.object(resolver, "refresh_credentials", lambda repo: self.refresh_calls.append(repo)))
+            stack.enter_context(mock.patch("github_token_refresh.refresh_git_credentials", lambda repo: self.refresh_calls.append(repo)))
             stack.enter_context(_fresh_refresh_state())
             resolver.ensure_labels_exist("acme/toolkit")
         self.assertEqual(self.refresh_calls, ["acme/toolkit"])
@@ -612,7 +620,8 @@ class RunGhRetryTest(unittest.TestCase):
     def test_an_unconfigured_repo_is_not_a_mint(self):
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(subprocess, "run", _gh_stub(list_rc=1)))
-            stack.enter_context(mock.patch.object(resolver, "refresh_credentials", lambda repo: self.refresh_calls.append(repo)))
+            stack.enter_context(mock.patch("github_token_refresh.refresh_git_credentials", lambda repo: self.refresh_calls.append(repo)))
+            stack.enter_context(mock.patch("gitops_workspace.get_managed_github_repos", return_value=[]))
             stack.enter_context(mock.patch.object(resolver, "get_managed_github_repos", return_value=[]))
             stack.enter_context(_fresh_refresh_state())
             result = resolver.run_gh(["issue", "list"], check=False)
@@ -641,7 +650,8 @@ class RunGhTest(unittest.TestCase):
             stack.enter_context(contextlib.redirect_stdout(buf))
             stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
             stack.enter_context(mock.patch.object(subprocess, "run", side_effect=FileNotFoundError))
-            stack.enter_context(mock.patch.object(resolver, "refresh_credentials", lambda repo: refreshed.append(repo)))
+            stack.enter_context(mock.patch("github_token_refresh.refresh_git_credentials", lambda repo: refreshed.append(repo)))
+            stack.enter_context(mock.patch("gitops_workspace.get_managed_github_repos", return_value=["acme/toolkit"]))
             stack.enter_context(mock.patch.object(resolver, "get_managed_github_repos", return_value=["acme/toolkit"]))
             stack.enter_context(_fresh_refresh_state())
             resolver.handle_poll(argparse.Namespace())

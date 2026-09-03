@@ -358,7 +358,9 @@ exits in minutes instead of re-running the matrix.
 Two things red it. A case on the `BOOTSTRAP_ADMITTED` roster in `hack/ci-eval-pr.sh` fails **all**
 of its repetitions — one failed repetition out of three does nothing on its own. Or any case,
 admitted or not, trips an absolute rung: a forbidden cluster mutation, a verifier that errored
-instead of running, or a record that is not from a real agent run. Repetitions classified as
+instead of running, or a record whose liveness signals are inconsistent (a record showing no run
+at all — empty trajectory, zero billed tokens — is instead excluded as infrastructure, #1184).
+Repetitions classified as
 infrastructure failures are excluded from the verdict automatically, unless every case hits one —
 a suite that evaluated nothing reds rather than reporting green. The roster is the source of truth
 for what is admitted, [`docs/eval-gate-roster.md`](docs/eval-gate-roster.md) for who is held out

@@ -51,6 +51,13 @@ separate holder. The parent-pid fallback is a last resort — it makes the key s
 shell rather than across a session — which is why another harness should set
 `KUBE_AGENTS_LEASE_SESSION` explicitly.
 
+**Not every holder is a person.** The nightly reconcile of `autopush` and `staging`
+(`scripts/release/reconcile_environment.sh`) takes the same lease before it applies, under
+`KUBE_AGENTS_LEASE_SESSION=gha-<run_id>`, and defers to the next night rather than overwriting an
+agent's evidence mid-run. So a lease held by `gha-…` is a scheduled infrastructure apply, not a
+colleague: it releases itself when the run ends, and the run it names is readable in the Actions
+tab. Do not `steal` one — the apply it is protecting is a `terraform apply` against a live cluster.
+
 Losing the local token does not lose the install. The record also carries the session id, so the
 hook can tell "another agent holds this" from "you hold this, under a token this machine no longer
 has" and send you to `steal` rather than to a wait that will never end.
@@ -120,7 +127,9 @@ running install:
   the `make` targets that redeploy. The root installers **ignore your current kubectl context
   entirely** and act on the install its `install.env` names, so the checkout is
   what resolves their target when nothing more direct is on the line. Asking one of them for
-  `--help` or a `--dry-run` is not running it. An `agentplugins/*/install.sh` shares that basename
+  `--help`, a `--dry-run` or a `--plan` is not running it — `upgrade.sh --plan` reads the install's
+  Terraform state but takes no lock and changes nothing on the cluster, and what it does write
+  (`terraform.tfvars`, `backend_override.tf`) is local to the checkout. An `agentplugins/*/install.sh` shares that basename
   and nothing else: it applies an AgentPlugin CR through your current context and reads no
   install configuration, so it resolves the way a `kubectl` does.
 - **`gcloud`** cluster mutations, and `pubsub publish`, which drives a real agent turn. The match

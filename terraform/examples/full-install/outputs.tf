@@ -3,6 +3,21 @@ output "cluster_name" {
   value       = module.gke_cluster.cluster_name
 }
 
+# The image tag the last apply recorded, which is NOT the tag the cluster is
+# serving: the redeploy workflows move the running tag with `helm upgrade` and
+# never touch Terraform. A drift plan needs this one. Planning at the RUNNING
+# tag instead makes every out-of-band redeploy show up as a pending change to
+# helm_release.kube_agents, so the daily report opens on image lag and the
+# infra-drift issue never reaches the clean plan that would close it.
+#
+# An output rather than reading the helm_release's values out of state, because
+# outputs are what Terraform persists for exactly this purpose and `terraform
+# output -raw` is a stable interface where digging through `show -json` is not.
+output "image_tag" {
+  description = "Image tag recorded by the last apply of this composition"
+  value       = var.image_tag
+}
+
 output "cluster_location" {
   description = "Region the cluster runs in"
   value       = module.gke_cluster.cluster_location

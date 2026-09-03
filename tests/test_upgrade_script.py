@@ -8,6 +8,8 @@ import os
 import pathlib
 import re
 import subprocess
+import tempfile
+import time
 import unittest
 
 from tests.testing.common import (
@@ -15,6 +17,10 @@ from tests.testing.common import (
     UPGRADER_HELP_BANNER,
     VALID_IMMUTABLE_REFS,
     get_isolated_test_env,
+)
+from tests.testing.release import (
+    MOCK_RELEASE_BUNDLE_VERSION,
+    create_mock_release_bundle_marker,
 )
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -84,6 +90,32 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"
             proc = self._run_upgrade_func(cmd, cwd=archive_dir)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("Verified upgrade sources match baked official release 0.2.0", proc.stdout)
+
+    def test_verify_local_source_ref_accepts_release_bundle_marker_in_non_git_dir(self):
+        """Verifies verify_local_source_ref in upgrade.sh logs bundle provenance attribution when .release-bundle matches baked version."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="unpacked-upgrade-bundle-") as outer_dir:
+            archive_dir = pathlib.Path(outer_dir) / f"kube-agents-{MOCK_RELEASE_BUNDLE_VERSION}"
+            create_mock_release_bundle_marker(archive_dir)
+
+            cmd = f'BAKED_RELEASE_VERSION="{MOCK_RELEASE_BUNDLE_VERSION}"; verify_local_source_ref "{archive_dir}" "{MOCK_RELEASE_BUNDLE_VERSION}"'
+            proc = self._run_upgrade_func(cmd, cwd=archive_dir)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn(f"Verified upgrade sources match official release bundle {MOCK_RELEASE_BUNDLE_VERSION}", proc.stdout)
+
+    def test_verify_local_source_ref_rejects_unbaked_release_bundle_marker_in_non_git_dir(self):
+        """Verifies .release-bundle marker cannot bypass unversioned source directory rejection in upgrade.sh when baked version is empty."""
+        import tempfile
+
+        with tempfile.TemporaryDirectory(prefix="unpacked-unbaked-upgrade-") as outer_dir:
+            archive_dir = pathlib.Path(outer_dir) / f"kube-agents-{MOCK_RELEASE_BUNDLE_VERSION}"
+            create_mock_release_bundle_marker(archive_dir)
+
+            cmd = f'BAKED_RELEASE_VERSION=""; verify_local_source_ref "{archive_dir}" "{MOCK_RELEASE_BUNDLE_VERSION}"'
+            proc = self._run_upgrade_func(cmd, cwd=archive_dir)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("Refusing to upgrade from an unversioned source directory", proc.stdout)
 
     def test_verify_local_source_ref_in_git_worktree_enforces_git_alignment(self):
         """Verifies verify_local_source_ref in upgrade.sh enforces clean git status in real git checkouts."""
@@ -205,6 +237,152 @@ class PersistStateVarTest(unittest.TestCase):
         for var in ("PROJECT_ID", "CLUSTER_NAME", "REGION"):
             with self.subTest(var=var):
                 self.assertIn(f'export {var}="$target_', source)
+
+
+class DirtyCheckoutRefusalTest(unittest.TestCase):
+    """A tagless upgrade still applies this checkout to a live install.
+
+    `--image-tag` makes three refusals possible at once, and only the middle one
+    — does HEAD match the requested ref — actually needs a tag. Gating the whole
+    set on the tag's presence would let `--keep-image-tag` carry uncommitted
+    edits to `terraform/` or `charts/` into a real `terraform apply`: an install
+    running a composition that exists in no commit and that nobody can diff.
+    """
+
+    def _run(self, func_call, env=None, cwd=None):
+        setup = (f'KUBE_AGENTS_SOURCE_ONLY=true source "{_UPGRADE_SH}"\n'
+                 f"{func_call}\n")
+        return subprocess.run(
+            ["bash", "-c", setup], capture_output=True, text=True,
+            env=get_isolated_test_env(overrides=env), cwd=str(cwd or _REPO_ROOT),
+        )
+
+    def _repo(self, tmp, dirty):
+        """A real git checkout, clean or with a tracked file modified."""
+        subprocess.run(["git", "init", "-q", tmp], check=True)
+        for cmd in (["config", "user.email", "t@example.com"],
+                    ["config", "user.name", "T"]):
+            subprocess.run(["git", "-C", tmp, *cmd], check=True)
+        target = os.path.join(tmp, "main.tf")
+        with open(target, "w") as handle:
+            handle.write("# committed\n")
+        subprocess.run(["git", "-C", tmp, "add", "."], check=True)
+        subprocess.run(["git", "-C", tmp, "commit", "-qm", "init"], check=True)
+        if dirty:
+            with open(target, "a") as handle:
+                handle.write("# uncommitted local edit\n")
+        return tmp
+
+    def test_a_dirty_checkout_is_refused_without_a_tag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._repo(tmp, dirty=True)
+            proc = self._run(f'verify_local_source_clean "{repo}"')
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("dirty checkout", proc.stdout + proc.stderr)
+
+    def test_a_clean_checkout_passes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._repo(tmp, dirty=False)
+            proc = self._run(f'verify_local_source_clean "{repo}"')
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_an_unversioned_directory_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = self._run(f'verify_local_source_clean "{tmp}"')
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("unversioned source directory", proc.stdout + proc.stderr)
+
+    def test_the_previews_warn_instead_of_refusing(self):
+        """--plan and --dry-run change nothing, and a plan of a tree mid-edit is
+        the one command that answers "what have I changed here"."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self._repo(tmp, dirty=True)
+            for flag in ("PARAM_PLAN", "PARAM_DRY_RUN"):
+                with self.subTest(flag=flag):
+                    proc = self._run(
+                        f'{flag}=true; verify_local_source_clean "{repo}"')
+                    self.assertEqual(proc.returncode, 0,
+                                     proc.stdout + proc.stderr)
+                    self.assertIn("uncommitted source changes",
+                                  proc.stdout + proc.stderr)
+
+    def test_the_tagless_paths_call_it(self):
+        """Both in-checkout arms, so neither route skips the check."""
+        source = _UPGRADE_SH.read_text()
+        self.assertEqual(source.count('verify_local_source_clean "$repo_dir"'), 2)
+
+
+class InteractiveImageTagPromptTest(unittest.TestCase):
+    """A bare Enter at the tag prompt has to be a hard error.
+
+    `--plan` and `--keep-image-tag` make the tag optional, so
+    `validate_immutable_ref` — whose first branch rejects an empty ref — runs
+    only when a tag is present. Nothing else catches an empty answer: without an
+    explicit check it skips `verify_local_source_ref` (the dirty-checkout
+    refusal) and silently becomes `--keep-image-tag`.
+
+    Driven through a pty rather than asserted against the source, because the
+    prompt reads from /dev/tty specifically so that it cannot be fed on stdin.
+    """
+
+    def _answer_prompt_with_enter(self):
+        import pty
+        import select
+
+        pid, fd = pty.fork()
+        if pid == 0:  # pragma: no cover - replaced by execve
+            # os._exit, not an exception: a raise here would unwind inside a
+            # forked copy of the test runner and report a second suite result.
+            try:
+                os.chdir(str(_REPO_ROOT))
+                os.execve(
+                    "/bin/bash",
+                    ["bash", str(_UPGRADE_SH)],
+                    {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                     "HOME": os.environ.get("HOME", "/tmp"), "TERM": "dumb"},
+                )
+            finally:
+                os._exit(127)
+        out = b""
+        answered = False
+        # A cap rather than a wait: if the guard ever regresses, the run does
+        # not hang the suite, it proceeds and this fails on the exit code.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            ready, _, _ = select.select([fd], [], [], 0.5)
+            if ready:
+                try:
+                    chunk = os.read(fd, 4096)
+                except OSError:  # the child closed the pty
+                    break
+                if not chunk:
+                    break
+                out += chunk
+            if not answered and b"Target image tag" in out:
+                os.write(fd, b"\n")
+                answered = True
+        else:
+            os.kill(pid, 9)
+            self.fail("upgrade.sh did not exit within 30s of the empty answer")
+        _, status = os.waitpid(pid, 0)
+        self.assertTrue(answered, "the tag prompt never appeared")
+        return status, out.decode(errors="replace")
+
+    def test_a_bare_enter_at_the_prompt_aborts(self):
+        status, out = self._answer_prompt_with_enter()
+        self.assertTrue(os.WIFEXITED(status), f"upgrade.sh was signalled: {out}")
+        self.assertEqual(os.WEXITSTATUS(status), 1, out)
+        self.assertIn("--image-tag is required", out)
+        # And it names the flag that asks for what an empty answer looked like
+        # it might have meant, rather than leaving the reader to find it.
+        self.assertIn("--keep-image-tag", out)
+
+    def test_it_stops_before_touching_the_install(self):
+        """Nothing may run between the empty answer and the exit."""
+        _, out = self._answer_prompt_with_enter()
+        for forbidden in ("get-credentials", "terraform", "helm"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, out)
 
 
 if __name__ == "__main__":

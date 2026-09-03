@@ -108,8 +108,11 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
 ```
 
 `auto` derives the bucket name `<project_id>-kube-agents-tfstate`; any other
-value is used verbatim. The bucket is created on first use — versioned, with
-uniform bucket-level access, in the cluster's region — and a gitignored
+value is used verbatim. `apply` and `destroy` create the bucket on first use —
+versioned, with uniform bucket-level access, in the cluster's region. `plan`
+does not: it stops instead, because a plan that creates the backend has both
+changed the project and answered the wrong question, since an empty bucket
+plans the whole composition as new and reads as total drift. A gitignored
 `backend_override.tf` points Terraform at
 `gs://<bucket>/<prefix>`, where the prefix defaults to
 `kube-agents/<cluster_name>` (override with `KUBE_AGENTS_STATE_PREFIX`) so two
@@ -129,6 +132,23 @@ gcloud storage cp gs://<bucket>/<prefix>/default.tfstate#<generation> \
 If the state is gone entirely,
 re-run `lifecycle.sh apply` against the same tfvars — KMS adoption is
 automatic, and `terraform import` covers the rest.
+
+### Asking what an apply would change
+
+```bash
+KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh plan -detailed-exitcode
+```
+
+Read-only, and every part of that is deliberate: no state lock, so it can
+neither block nor be blocked by the apply it is reporting on; no bucket
+creation; and none of the adoption imports `apply` runs, since those write
+state. An install that needs adoption therefore shows those resources as "to
+create", which is what a plan alone can honestly say about them.
+
+`-detailed-exitcode` makes the answer machine-readable — 0 for in sync, 2 for
+there are changes, 1 for a plan that failed — which is what the scheduled drift
+report reads. `./upgrade.sh --plan`, run from the install's own checkout, is the
+front door: it renders the tfvars an upgrade would apply and then calls this.
 
 ### Recovering from an interrupted apply
 
@@ -466,10 +486,10 @@ Use `lifecycle.sh destroy` for teardown; anything that mutates the
 Terraform-managed resources out of band (for instance removing the
 `kube-agents-host` label by hand) causes plan drift the next apply reverts.
 
-Four things in this stack are not symmetric — applying them is not the inverse
-of destroying them — and each one breaks a plain `terraform destroy`, or the
-`terraform apply` that follows it. [`lifecycle.sh`](lifecycle.sh) handles all
-four, so the cycle is repeatable:
+Several things in this stack are not symmetric — applying them is not the
+inverse of destroying them — and each one breaks a plain `terraform destroy`, or
+the `terraform apply` that follows it. [`lifecycle.sh`](lifecycle.sh) handles
+them, so the cycle is repeatable:
 
 ```bash
 make tf-destroy     # or: ./terraform/examples/full-install/lifecycle.sh destroy
@@ -478,12 +498,13 @@ make tf-apply       # or: ./terraform/examples/full-install/lifecycle.sh apply
 
 What each one does that raw Terraform cannot:
 
-| Asymmetry                                                            | Handled by                                                                    |
-| -------------------------------------------------------------------- | ----------------------------------------------------------------------------- |
-| KMS key rings and keys can never be deleted, so the next apply 409s  | `tf-apply` imports the survivors before applying (`lifecycle.sh adopt-kms`)   |
-| The `PlatformAgent` finalizer strands the CR and hangs the namespace | `tf-destroy` deletes the CR and waits, force-clearing the finalizer if wedged |
-| A `BackupPlan` cannot be deleted while it owns backups               | `tf-destroy` purges the plan's backups first                                  |
-| `deletion_protection = true` cannot be overridden by a destroy alone | `tf-destroy` applies it as `false`, then destroys                             |
+| Asymmetry                                                                | Handled by                                                                                                                                   |
+| ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| KMS key rings and keys can never be deleted, so the next apply 409s      | `tf-apply` imports the survivors before applying (`lifecycle.sh adopt-kms`)                                                                  |
+| The `PlatformAgent` finalizer strands the CR and hangs the namespace     | `tf-destroy` deletes the CR and waits, force-clearing the finalizer if wedged                                                                |
+| A `BackupPlan` cannot be deleted while it owns backups                   | `tf-destroy` purges the plan's backups first                                                                                                 |
+| `deletion_protection = true` cannot be overridden by a destroy alone     | `tf-destroy` applies it as `false`, then destroys                                                                                            |
+| A Pub/Sub topic or subscription that already exists makes the create 409 | `tf-apply` imports it first (`adopt_pubsub`), so a topic created in the Cloud console while wiring up Google Chat does not block the install |
 
 The chart also carries a `pre-delete` hook that removes the CR and waits for
 its finalizer, so a plain `helm uninstall` is safe on its own; `tf-destroy`

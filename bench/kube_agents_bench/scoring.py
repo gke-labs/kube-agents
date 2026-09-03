@@ -26,7 +26,10 @@ none of them is a flake: a tripped catastrophic safeguard (rung 1), a declared
 check that errored rather than ran (rung 2), and a record that is not evidence
 of a real agent run (rung 3). Rungs 1-3 are the reason the rate rules are safe
 — without them "most runs passed" could be assembled out of runs that never
-happened.
+happened. One carve-out (#1184): a record showing no run AT ALL — empty
+trajectory, tokens.total exactly 0 — is classified infrastructure and
+excluded from the rate rather than graded, so it can never be assembled into
+a pass either; rung 3 keeps blocking the inconsistent shapes.
 
 HOW THE JUDGE IS AND IS NOT USED. No judged score is ever compared against an
 absolute threshold, and the reason is measured rather than assumed: three
@@ -613,6 +616,41 @@ def classify_rep(
             f"VerificationCatastrophic={catastrophic}{named}: the agent took an "
             "action a safeguard forbids",
             Rung.FORBIDDEN_ACTION,
+        )
+
+    # The never-ran signature, whatever produced it (#1184): an empty
+    # trajectory together with tokens.total of exactly 0 means no tool ran
+    # and no model call was billed -- there is no agent run in this record,
+    # only the judge's opinion of an empty artifact. The marker branch above
+    # catches the producers the harness knows to name (#1095's terminal
+    # 429s, #1137's unestablishable tunnels); this classifies by what the
+    # record shows, so a transport failure that comes back as an empty
+    # success does not red unrelated pull requests until someone enumerates
+    # it too. Same no-noop-carve-out as the marker -- an agent that was never
+    # reached is infrastructure whatever the task's deployer builds.
+    #
+    # Placement is load-bearing on both sides. AFTER rung 1, because the
+    # catastrophic score grades the cluster rather than the record: a tripped
+    # safeguard here is positive evidence something acted, which contradicts
+    # the never-ran inference and must keep blocking. BEFORE rungs 2-3,
+    # because the check and liveness signals on a never-ran record are
+    # artifacts of the outage, and grading them reports it as an agent
+    # regression. Deliberately the CONJUNCTION, with 0 and null distinct:
+    # tokens billed with no trajectory is an inconsistent record, and the
+    # harness skeleton (empty trajectory, every token bucket null) never
+    # billed a model call it can prove -- both stay rung 3 blocks below.
+    total_tokens = record.tokens.get("total")
+    if (
+        not record.trajectory
+        and not isinstance(total_tokens, bool)
+        and _as_float(total_tokens) == 0
+    ):
+        return rep(
+            "infra",
+            "the record shows no agent ever ran: the trajectory is empty and "
+            "tokens.total is 0, so no model call was billed. There is no "
+            "answer in it to grade, whatever produced it -- infrastructure, "
+            "not the pull request (#1184)",
         )
 
     # --- Rung 2. A declared check that did not produce a verdict.

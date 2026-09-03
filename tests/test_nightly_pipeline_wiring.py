@@ -54,12 +54,90 @@ class NightlyPipelineWiringTest(unittest.TestCase):
         self.assertNotIn("schedule", self.doc[True])
         self.assertIn("workflow_dispatch", self.doc[True])
 
-    def test_every_called_workflow_targets_the_nightly_environment(self):
+    def test_every_called_workflow_targets_the_environment_it_is_named_for(self):
+        """A job pointed at the wrong environment deploys to, or destroys, that one.
+
+        Everything that touches the NIGHTLY cluster has to say `nightly`; the
+        two reconcile jobs are the only exceptions, and each names the
+        long-lived environment it converges. Listing them here rather than
+        loosening the rule is the point: a new `uses:` job that targets anything
+        but `nightly` fails this test until somebody writes down why.
+        """
+        expected = {
+            "step-4-reconcile-staging": "staging",
+            "step-6-reconcile-autopush": "autopush",
+        }
         called = {name: job for name, job in self.jobs.items() if "uses" in job}
         self.assertTrue(called, "the pipeline is supposed to call reusable workflows")
         for name, job in called.items():
             with self.subTest(job=name):
-                self.assertEqual(job["with"]["github_environment"], "nightly")
+                self.assertEqual(
+                    job["with"]["github_environment"], expected.get(name, "nightly")
+                )
+
+    def test_the_reconciles_run_only_after_a_green_matrix(self):
+        """Nothing is applied to a live-tested environment on an unproven composition.
+
+        Applying a composition to an environment agents live-test against, before
+        the matrix has proved that composition builds an install from nothing, is
+        strictly worse than leaving that environment stale. The gate is the
+        implicit success() on `needs`, so an `always()` here would remove it.
+        """
+        for name in ("step-4-reconcile-staging", "step-6-reconcile-autopush"):
+            with self.subTest(job=name):
+                job = self.jobs[name]
+                self.assertIn("step-3-run-e2e-matrix", job["needs"])
+                self.assertNotIn("always()", job["if"])
+                self.assertEqual(job["with"]["mode"], "apply")
+
+    def test_staging_reconciles_before_the_promotion_tag_is_pushed(self):
+        """The tag starts three `helm upgrade`s on the release Terraform owns.
+
+        Applying after the tag would race them: whichever reaches the release
+        lock second either fails or overwrites the other's work. Applying first
+        leaves the redeploys setting image tags the apply has already set.
+        """
+        promotion = self.jobs["step-5-promote-to-staging"]
+        self.assertIn("step-4-reconcile-staging", promotion["needs"])
+
+    def test_a_failed_staging_reconcile_does_not_block_the_promotion(self):
+        """step-4 is in `needs` for order, not for outcome.
+
+        The implicit success() on `needs` would make any non-zero exit from the
+        reconcile skip the promotion — so no tag, and the three
+        staging-redeploy workflows that tag starts never run. The reconcile goes
+        red for reasons wider than a bad composition: a missing GitHub variable,
+        an unreadable lease, a rotated minter key. None of those says anything
+        about the candidate, so coupling them means every nightly quietly
+        dropping a promotion the matrix had just earned.
+        """
+        condition = self.jobs["step-5-promote-to-staging"]["if"]
+        self.assertIn("always()", condition)
+        self.assertIn("!cancelled()", condition)
+        self.assertNotIn("step-4-reconcile-staging.result", condition,
+                         "step-4's outcome must not gate the promotion")
+
+    def test_decoupling_the_reconcile_did_not_drop_the_matrix_gate(self):
+        """`always()` removes the implicit success() from EVERY need at once.
+
+        So the two gates that were being inherited — a green matrix and a
+        resolved candidate — have to be restated, or a red matrix promotes.
+        """
+        condition = self.jobs["step-5-promote-to-staging"]["if"]
+        for need in ("step-3-run-e2e-matrix", "step-1-resolve-candidate"):
+            with self.subTest(need=need):
+                self.assertIn("needs.%s.result == 'success'" % need, condition)
+        # And the fork guard, which `always()` would otherwise let through.
+        self.assertIn("github.repository == 'gke-labs/kube-agents'", condition)
+
+    def test_autopush_reconciles_without_pinning_an_image_tag(self):
+        """autopush tracks main's tip; the candidate is older than that.
+
+        Passing this pipeline's candidate would roll autopush's images BACKWARDS
+        to whichever commit was last validated. Empty converges the
+        infrastructure and leaves the images where the GHCR publish put them.
+        """
+        self.assertEqual(self.jobs["step-6-reconcile-autopush"]["with"]["image_tag"], "")
 
     def test_the_resolve_job_binds_the_nightly_environment(self):
         """It reads vars.REGISTRY_PREFIX; unbound, that resolves to empty in silence."""
@@ -72,7 +150,7 @@ class NightlyPipelineWiringTest(unittest.TestCase):
         "skipped" and lose the summary line saying why. The condition sits on the
         steps so the run records the decision it made.
         """
-        job = self.jobs["step-4-promote-to-staging"]
+        job = self.jobs["step-5-promote-to-staging"]
         self.assertNotIn("skip_promotion", job["if"])
         step_conditions = [step.get("if", "") for step in job["steps"]]
         self.assertTrue(
@@ -90,7 +168,7 @@ class NightlyPipelineWiringTest(unittest.TestCase):
         because its next scheduled run reclaims the environment within three
         hours; this pipeline has no schedule, so nothing would remove it at all.
         """
-        teardown = self.jobs["step-5-teardown-env"]
+        teardown = self.jobs["step-7-teardown-env"]
         self.assertEqual(
             set(teardown["needs"]),
             {"step-1-resolve-candidate", "step-2-deploy-env", "step-3-run-e2e-matrix"},
@@ -98,7 +176,7 @@ class NightlyPipelineWiringTest(unittest.TestCase):
 
     def test_teardown_keeps_the_success_gate_on_the_jobs_it_does_depend_on(self):
         """A failed matrix must leave its cluster standing to be examined live."""
-        teardown = self.jobs["step-5-teardown-env"]
+        teardown = self.jobs["step-7-teardown-env"]
         self.assertNotIn(
             "always()",
             teardown["if"],
@@ -111,7 +189,7 @@ class NightlyPipelineWiringTest(unittest.TestCase):
         """A tag pushed with GITHUB_TOKEN triggers no workflow, so staging never deploys."""
         checkout = next(
             step
-            for step in self.jobs["step-4-promote-to-staging"]["steps"]
+            for step in self.jobs["step-5-promote-to-staging"]["steps"]
             if str(step.get("uses", "")).startswith("actions/checkout@")
         )
         self.assertIn("RELEASE_BOT_TOKEN", checkout["with"]["token"])

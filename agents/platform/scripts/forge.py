@@ -83,13 +83,17 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional, Protocol, Sequence
 
+from github_token_refresh import (
+    GH_MISSING_RC,
+    GH_TIMEOUT_RC,
+    is_refresh_failed,
+    looks_like_auth_failure,
+    refresh_credentials_once,
+)
+
 LOGGER = logging.getLogger(__name__)
 
 SETTINGS_PATH = "/opt/data/SETTINGS.md"
-
-#: Shell convention for "command not found". Kept distinguishable from a `gh`
-#: command that ran and failed, because the two need different operators.
-GH_MISSING_RC = 127
 
 #: How long any single `gh` call may take. A hung proxy must not hold the cron
 #: tick's per-job lock open indefinitely.
@@ -142,6 +146,11 @@ HTTP_STATUS_RE = re.compile(r"\(HTTP (\d{3})\)")
 #: broken credential reports "Failed to log in to … account <login>", and that
 #: line names an account whose token no longer works.
 VIEWER_RE = re.compile(r"Logged in to \S+ account (\S+)")
+
+#: Definitive HTTP status codes in `gh` stderr that indicate permanent errors
+#: (401 Bad Credentials, 403 Forbidden, 404 Not Found), which should not be
+#: retried even for read-only queries.
+DEFINITIVE_HTTP_STATUS_RE = re.compile(r"HTTP (?:401|403|404)\b", re.IGNORECASE)
 
 
 class ForgeError(Exception):
@@ -355,15 +364,21 @@ def _parse_repo(configured: str) -> str:
     return repo
 
 
-def run_gh(argv: Sequence[str]) -> subprocess.CompletedProcess:
-    """One `gh` invocation, never raising for a non-zero exit.
+def _should_retry_transient(result: subprocess.CompletedProcess) -> bool:
+    """Return True if a non-zero `gh` result is worth a single transient retry.
 
-    Callers here always need the reason code more than the exception: a token
-    without scope for this repository and a repository that 404s both exit
-    non-zero with usable stderr, and turning that into a traceback loses it.
-    A missing binary is reported as `GH_MISSING_RC` so it stays distinguishable
-    from a command that ran and failed.
+    Definitive HTTP failures (401, 403, 404), missing binary (GH_MISSING_RC),
+    and sidecar timeouts (GH_TIMEOUT_RC) are skipped.
     """
+    if result.returncode in (GH_MISSING_RC, GH_TIMEOUT_RC):
+        return False
+    if DEFINITIVE_HTTP_STATUS_RE.search(result.stderr or ""):
+        return False
+    return True
+
+
+def run_gh_once(argv: Sequence[str]) -> subprocess.CompletedProcess:
+    """Run one gh command without retry, mapping a missing binary onto a return code."""
     try:
         return subprocess.run(
             ["gh", *argv],
@@ -379,10 +394,30 @@ def run_gh(argv: Sequence[str]) -> subprocess.CompletedProcess:
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(
             ["gh", *argv],
-            1,
+            GH_TIMEOUT_RC,
             stdout="",
             stderr=f"'gh' timed out after {GH_TIMEOUT_S}s.",
         )
+
+
+def run_gh(
+    argv: Sequence[str], repo: Optional[str] = None
+) -> subprocess.CompletedProcess:
+    """One `gh` invocation, never raising for a non-zero exit.
+
+    A failed call gets one retry behind a freshly minted token on auth failures.
+    Callers here always need the reason code more than the exception: a token
+    without scope for this repository and a repository that 404s both exit
+    non-zero with usable stderr, and turning that into a traceback loses it.
+    A missing binary is reported as `GH_MISSING_RC` so it stays distinguishable
+    from a command that ran and failed.
+    """
+    result = run_gh_once(argv)
+    if looks_like_auth_failure(argv, result) and refresh_credentials_once(
+        argv, repo=repo
+    ):
+        result = run_gh_once(argv)
+    return result
 
 
 def gh_preflight(run: Callable[[Sequence[str]], subprocess.CompletedProcess] = run_gh):
@@ -395,6 +430,8 @@ def gh_preflight(run: Callable[[Sequence[str]], subprocess.CompletedProcess] = r
     result = run(["auth", "status"])
     if result.returncode == 0:
         return
+    if is_refresh_failed():
+        raise ForgeError("GITHUB_TOKEN_REFRESH_FAILED")
     raise ForgeError(
         "GH_CLI_NOT_FOUND"
         if result.returncode == GH_MISSING_RC
@@ -409,6 +446,12 @@ class GitHubProvider:
     name = "github"
 
     def __init__(self, run: Optional[Callable] = None):
+        """Initialize the GitHub provider.
+
+        Args:
+            run: Runner callable matching `run(argv, repo=None)`. Defaults to
+                `run_gh`, which passes `repo` to credential refresh on auth failure.
+        """
         self._run = run or run_gh
         # One entry per distinct commenter per provider instance, which the
         # gate builds fresh each tick. A busy thread is usually three or four
@@ -420,15 +463,36 @@ class GitHubProvider:
         self._viewer: Optional[str] = None
 
     # -- the seam ---------------------------------------------------------
-    def _call(self, argv: Sequence[str], *, expect_json: bool = True):
+    def _call(
+        self,
+        argv: Sequence[str],
+        *,
+        repo: Optional[str] = None,
+        expect_json: bool = True,
+        retry_transient: bool = False,
+    ):
         """Every forge round trip goes through here. See the module docstring.
 
         Returns parsed JSON, or None for a call made only for its effect. A
         non-zero exit raises `REPO_UNREACHABLE`, which is the honest reading of
         a `gh` failure that survived the preflight: the credential works
         somewhere, just not here.
+
+        When `repo` is provided, it is passed to the runner for credential refresh
+        context on authentication failure.
+
+        When `retry_transient=True` (for read-only queries), a non-zero exit gets
+        a single bounded retry before raising `REPO_UNREACHABLE`. Mutating calls
+        (e.g., post_comment, acknowledge) must leave `retry_transient=False` to
+        avoid double-posting on a sidecar timeout.
         """
-        result = self._run(list(argv))
+        result = self._run(list(argv), repo=repo)
+        if (
+            result.returncode != 0
+            and retry_transient
+            and _should_retry_transient(result)
+        ):
+            result = self._run(list(argv), repo=repo)
         if result.returncode != 0:
             raise ForgeError("REPO_UNREACHABLE", (result.stderr or "").strip()[:200])
         if not expect_json:
@@ -494,7 +558,9 @@ class GitHubProvider:
                 "api",
                 f"repos/{repo}/pulls?state=open&per_page={PR_PAGE_SIZE}",
                 "--paginate",
-            ]
+            ],
+            repo=repo,
+            retry_transient=True,
         )
         return [
             PullRequest(
@@ -598,7 +664,8 @@ class GitHubProvider:
         quoted = urllib.parse.quote(login, safe="")
         try:
             data = self._call(
-                ["api", f"repos/{repo}/collaborators/{quoted}/permission"]
+                ["api", f"repos/{repo}/collaborators/{quoted}/permission"],
+                repo=repo,
             )
         except ForgeError as error:
             status = HTTP_STATUS_RE.search(error.value or "")
@@ -613,7 +680,12 @@ class GitHubProvider:
         return allowed
 
     def _collect(self, path: str, *, kind: str, repo: str) -> Iterable[Comment]:
-        rows = self._call(["api", path, "--paginate"]) or []
+        rows = (
+            self._call(
+                ["api", path, "--paginate"], repo=repo, retry_transient=True
+            )
+            or []
+        )
         for row in rows:
             body = str(row.get("body") or "")
             # A review with no summary body is an approval or a state change,
@@ -646,6 +718,7 @@ class GitHubProvider:
         """
         self._call(
             ["pr", "comment", str(pr.number), "-R", repo, "--body-file", body_file],
+            repo=repo,
             expect_json=False,
         )
 
@@ -665,7 +738,9 @@ class GitHubProvider:
             return False
         try:
             self._call(
-                ["api", "-X", "POST", path, "-f", "content=eyes"], expect_json=False
+                ["api", "-X", "POST", path, "-f", "content=eyes"],
+                repo=repo,
+                expect_json=False,
             )
         except ForgeError as error:
             # Expected through the credential proxy, which refuses mutating
@@ -698,7 +773,9 @@ class GitHubProvider:
                 "api",
                 f"repos/{repo}/pulls/{pr.number}/commits?per_page={PR_PAGE_SIZE}",
                 "--paginate",
-            ]
+            ],
+            repo=repo,
+            retry_transient=True,
         )
         commits = []
         for row in rows or []:

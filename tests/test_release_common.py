@@ -354,7 +354,8 @@ source "{_COMMON_SH}"
         head = git("rev-parse", "HEAD").stdout.strip()
         self.assertNotEqual(self._trigger_matches(repo_dir, head, "staging_2608241820_b35543c"), 0)
 
-    def _repo_with_pipeline_markers(self, optional_runner=True, suite_selector=True):
+    def _repo_with_pipeline_markers(self, optional_runner=True, suite_selector=True,
+                                    reconciler=True):
         temp_dir, repo_dir, git = create_mock_git_repo()
         self.addCleanup(temp_dir.cleanup)
         release = pathlib.Path(repo_dir) / "scripts" / "release"
@@ -363,6 +364,8 @@ source "{_COMMON_SH}"
             (release / "run_optional_e2e_suites.sh").write_text("#!/usr/bin/env bash\n")
         selector = "E2E_SUITE" if suite_selector else "E2E_ENV"
         (release / "execute_e2e_tests.py").write_text(f'_VAR = "{selector}"\n')
+        if reconciler:
+            (release / "reconcile_environment.sh").write_text("#!/usr/bin/env bash\n")
         git("add", "-A")
         git("commit", "-m", "chore: pipeline markers")
         return repo_dir, git("rev-parse", "HEAD").stdout.strip()
@@ -383,6 +386,18 @@ source "{_COMMON_SH}"
     def test_a_candidate_reading_only_the_old_selector_does_not(self):
         """The silent half: the gate would run the runner's default suite instead."""
         repo_dir, head = self._repo_with_pipeline_markers(suite_selector=False)
+        self.assertNotEqual(self._supports_shared_pipeline(repo_dir, head), 0)
+
+    def test_a_candidate_without_the_reconciler_does_not(self):
+        """The nightly checks the candidate OUT to reconcile staging at it.
+
+        A tree without reconcile_environment.sh aborts that step on a missing
+        file, and the promotion is deliberately decoupled from its outcome — so
+        the staging tag goes out, staging's images move, and its infrastructure
+        stays exactly as stale as before. Silent in the way this gate exists to
+        catch.
+        """
+        repo_dir, head = self._repo_with_pipeline_markers(reconciler=False)
         self.assertNotEqual(self._supports_shared_pipeline(repo_dir, head), 0)
 
     def test_candidate_support_requires_a_commit(self):
@@ -822,6 +837,34 @@ source "{_COMMON_SH}"
                     f"{script} re-implements the breaking-change test instead of calling common.sh",
                 )
                 self.assertIn("commit_messages_have_breaking_change", body, f"{script} does not call the helper")
+
+    def test_release_bundle_registries(self):
+        """Verifies common.sh exports release bundle directories, root files, and charts."""
+        script = """
+echo "DIRS:${RELEASE_BUNDLE_DIRECTORIES[*]}"
+echo "CHARTS:${RELEASE_HELM_CHARTS[*]}"
+echo "FILES:${RELEASE_BUNDLE_ROOT_FILES[*]}"
+"""
+        proc = self._run_common_func(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("DIRS:terraform k8s-operator deploy charts scripts examples", proc.stdout)
+        self.assertIn("CHARTS:charts/kube-agents", proc.stdout)
+        self.assertIn("FILES:install.sh uninstall.sh upgrade.sh install.defaults.env install.env.example images.json Makefile INSTALL.md README.md LICENSE", proc.stdout)
+
+    def test_extract_commit_tree(self):
+        """Verifies extract_commit_tree extracts exact committed files to target directory."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            head_commit = subprocess.check_output(
+                ["git", "-C", str(_REPO_ROOT), "rev-parse", "HEAD"], text=True
+            ).strip()
+            target_dir = pathlib.Path(temp_dir) / "extracted"
+            proc = self._run_common_func(
+                f'extract_commit_tree "{head_commit}" "{target_dir}" "README.md"',
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            extracted_file = target_dir / "README.md"
+            self.assertTrue(extracted_file.exists())
+            self.assertEqual(extracted_file.read_text(), (_REPO_ROOT / "README.md").read_text())
 
 
 if __name__ == "__main__":

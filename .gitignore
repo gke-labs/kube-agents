@@ -50,7 +50,8 @@ terraform.tfvars.json
 # and a user's backend override belongs to their environment, not the example.
 *_override.tf
 
-# Local helm package output
+# Local build & release packaging output
+build/
 *.tgz
 
 # Per-developer Claude Code state (session settings, local skills). The shared

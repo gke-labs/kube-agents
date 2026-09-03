@@ -158,8 +158,10 @@ and GitHub minter workloads).
 
 - **Canonical guide (self-contained):** [`terraform/examples/full-install/README.md`](terraform/examples/full-install/README.md)
 - Drive it through [`lifecycle.sh`](terraform/examples/full-install/lifecycle.sh) rather than bare
-  `terraform` commands: `apply` adopts the Cloud KMS resources GCP refuses to delete, and `destroy`
-  handles the four teardown asymmetries a bare `terraform destroy` trips over.
+  `terraform` commands: `apply` adopts the Cloud KMS resources GCP refuses to delete and any Pub/Sub
+  topic or subscription that already exists, `destroy` handles the four teardown asymmetries a bare
+  `terraform destroy` trips over, and `plan` reports what an apply would change while creating
+  nothing.
 - The composition installs `cert-manager` automatically (`enable_cert_manager`, default true), so
   you do **not** need to install it yourself on this path. (You do for
   [Method 2](#method-2-manual-kubernetes-cluster-deployment).)

@@ -826,7 +826,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_report_format.
 # that rather than leaving it to a reader.
 # See the module docstring in deploy/docker/patches/kanban_scheduling.py and the
 # applier docstring in deploy/docker/patches/apply_kanban_scheduling.py.
-COPY deploy/docker/patches/kanban_scheduling.py /opt/hermes/hermes_cli/kanban_scheduling.py
+COPY --chmod=0644 deploy/docker/patches/kanban_scheduling.py /opt/hermes/hermes_cli/kanban_scheduling.py
 COPY deploy/docker/patches/apply_kanban_scheduling.py \
      deploy/docker/patches/verify_kanban_scheduling.py \
      deploy/docker/patches/patchlib.py \
@@ -892,7 +892,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling
 # further down. It must not ship alone: raising the cap only moves when the bug
 # fires.
 # See the module docstring in deploy/docker/patches/kanban_guardrail_exit.py.
-COPY deploy/docker/patches/kanban_guardrail_exit.py /opt/hermes/hermes_cli/kanban_guardrail_exit.py
+COPY --chmod=0644 deploy/docker/patches/kanban_guardrail_exit.py /opt/hermes/hermes_cli/kanban_guardrail_exit.py
 COPY deploy/docker/patches/apply_kanban_guardrail_exit.py \
      deploy/docker/patches/verify_kanban_guardrail_exit.py \
      deploy/docker/patches/patchlib.py \
@@ -1019,7 +1019,18 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/verify_kanban_event_routing.py \
      deploy/docker/patches/patchlib.py \
      /tmp/latency-patches/
-RUN cp /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes_cli/kanban_wake_nudge.py && \
+# `install -m 0644`, not `cp`, for the first line. `cp` gives a newly created
+# destination the source's mode masked by the umask in force, and the source
+# here is whatever the build context held: git tracks one permission bit, so a
+# tree checked out under `umask 077` carries 0600 throughout and `cp`
+# propagates it rather than repairing it. The agent runs as uid 10000 and
+# cannot read the result. Same failure agentplugins/lib/plugin_image.sh:798
+# stages against for the plugin image, same cause.
+#
+# The other four land in /opt/hermes/tools and /opt/hermes/gateway, which the
+# `platform` stage normalizes; /opt/hermes/hermes_cli is the one patch
+# destination no loop walks, so it is stated here at the write site.
+RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes_cli/kanban_wake_nudge.py && \
     cp /tmp/latency-patches/kanban_auto_subscribe.py /opt/hermes/tools/kanban_auto_subscribe.py && \
     cp /tmp/latency-patches/kanban_comment_status.py /opt/hermes/tools/kanban_comment_status.py && \
     cp /tmp/latency-patches/kanban_notify_delivery.py /opt/hermes/gateway/kanban_notify_delivery.py && \
@@ -1194,6 +1205,14 @@ FROM agent-base AS platform
 # across template edits; the staged repo plugins arrive root-owned via the
 # final RUN's cp -a. Skills stay in the final RUN with their provenance
 # manifest. Not in agent-base: credential-proxy carries neither.
+#
+# /opt/hermes/hermes_cli is deliberately not on the list. The only files in it
+# whose mode is ever in question are the three modules the patch layers write,
+# and those state their mode on the instruction that writes them, back in
+# agent-base -- where the mode is wrong, and in the one image this stage is not
+# a part of. Cost is not the reason either way: a find/chmod over a tree whose
+# modes are already correct exports a ~4kB layer, since BuildKit diffs the
+# result rather than the syscall.
 RUN set -eu; \
     for d in /opt/hermes/plugins /opt/hermes/gateway /opt/hermes/tools; do \
         find "$d" -type d -exec chmod 755 {} + ; \

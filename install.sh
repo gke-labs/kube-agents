@@ -999,6 +999,23 @@ bootstrap_install_env_file() {
   print_info "Edit that file and re-run install.sh to change this install. It is never overwritten."
 }
 
+matches_release_bundle_ref() {
+  local repo_dir="$1"
+  local expected_ref="$2"
+  local bundle_file="${repo_dir}/.release-bundle"
+
+  if [ -f "$bundle_file" ]; then
+    local bundle_version bundle_tag
+    bundle_version="$(grep -E "^version=" "$bundle_file" 2>/dev/null | cut -d'=' -f2- | tr -d '[:space:]' || echo "")"
+    bundle_tag="$(grep -E "^tag=" "$bundle_file" 2>/dev/null | cut -d'=' -f2- | tr -d '[:space:]' || echo "")"
+    if [ -n "$bundle_version" ] && { [ "$bundle_version" = "$expected_ref" ] || [ "$bundle_tag" = "$expected_ref" ]; }; then
+      echo "$bundle_version"
+      return 0
+    fi
+  fi
+  return 1
+}
+
 verify_local_source_ref() {
   local repo_dir="$1"
   local expected_ref="$2"
@@ -1020,6 +1037,12 @@ verify_local_source_ref() {
     # In official stamped release archives (unpacked tarball/zip outside Git),
     # BAKED_RELEASE_VERSION is stamped during release automation.
     if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ]; then
+      local bundle_version=""
+      if bundle_version="$(matches_release_bundle_ref "$repo_dir" "$expected_ref")"; then
+        SOURCE_REF_VERIFIED="${repo_dir}@${expected_ref}"
+        print_success "Verified install sources match official release bundle ${bundle_version}."
+        return 0
+      fi
       SOURCE_REF_VERIFIED="${repo_dir}@${expected_ref}"
       print_success "Verified install sources match baked official release ${BAKED_RELEASE_VERSION}."
       return 0

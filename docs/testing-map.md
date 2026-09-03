@@ -79,7 +79,7 @@ The last column says what a trigger and its `if:` conditions support, which is a
 in this repository, so this table asserts nothing about either.
 [`pull-request-workflow.md`](pull-request-workflow.md#how-a-change-merges) names the required
 contexts as they stand, gives the command to read them back, and says why that command sees only
-the branch-protection half of the set. `make verify` (`Makefile:173`) is the
+the branch-protection half of the set. `make verify` (the `verify` target in the root `Makefile`) is the
 local answer to the same question — everything a pull request must pass offline, in one target —
 and [`site/src/content/docs/contributing.md`](site/src/content/docs/contributing.md) lists the
 individual targets to run when you have touched a given area.
