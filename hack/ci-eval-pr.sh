@@ -950,7 +950,7 @@ TASKS=(
   # Uncomment when the agent can diagnose a capped pool, not before.
   # "./tasks/cluster-agent-pending-replicas-capped-pool/task.yaml"
   # Removed from presubmit 2026-09-03 for wall clock: tofu provisioning
-  # serializes on the infra lock (~61 min/run for this case alone; #1202
+  # serializes on the infra lock (~20 min/rep x 3 reps ~= 61 min serialized; #1202
   # trim addendum). Re-enters via NIGHTLY_TASKS when the nightly tier
   # (#1175) lands.
   # "./tasks/gpu-stress-test-diagnosis/task.yaml"
@@ -966,7 +966,7 @@ TASKS=(
   # bench/tf/prebuilt/autoops-incident/main.tf for why it cannot, and why it
   # is the host cluster and not the per-run one that gets the incident.
   # Removed from presubmit 2026-09-03 for wall clock (tofu serialization,
-  # ~45 min/run; #1202 trim addendum). Held out of BOOTSTRAP_ADMITTED
+  # ~15 min/rep x 3 reps; #1202 trim addendum). Held out of BOOTSTRAP_ADMITTED
   # anyway (#1101); its admission record accrues via the nightly tier
   # (#1175) once that runs.
   # "./tasks/autoops-warning-event-triage/task.yaml"
@@ -1228,7 +1228,7 @@ print(m.group(1).strip('\'\"') if m else '')
 # optional. Ten of the eighteen active cases are admitted: the ones
 # whose recent record shows failures only on their own regressions or on
 # infra classes the harness already excludes from the verdict. The rest
-# cannot red one on a GRADED failure: five are held out below with named
+# cannot red one on a GRADED failure: four are held out below with named
 # exits, and the three obtainability activations (#1049) simply run
 # unadmitted while they earn a record. Held-out cases still run and
 # report on every pull request. The scope of that promise is rungs
@@ -1248,7 +1248,10 @@ print(m.group(1).strip('\'\"') if m else '')
 #     a finding on a healthy workload ~1 run in 8. Main's own trait, so a
 #     collapse would tax an innocent PR. Enters when the false-positive
 #     rate drops or when rung-6 screening can compare against main.
-#   autoops-warning-event-triage          -- #1101: 0/5 graded repetitions
+#   autoops-warning-event-triage          -- #1101; NOTE 2026-09-03: no
+#     longer in presubmit TASKS at all (tofu wall clock, #1218) -- it
+#     runs and accrues record via the nightly tier once that exists.
+#     Original hold-out rationale: 0/5 graded repetitions
 #     on record; admitting it reds every pull request today. Enters when
 #     the lettered-options bar is settled and it has a clean record.
 #   compliance-rbac-overgrant             -- #1171: demoted 2026-09-02
@@ -1338,6 +1341,8 @@ fi
 # A wrong hint costs packing efficiency, never correctness.
 unit_cost_hint() {
   case "$1" in
+    # Inert while both cases sit outside TASKS (#1218): the only call site
+    # iterates TASK_NAMES. Kept for their NIGHTLY_TASKS re-entry (#1175).
     gpu-stress-test-diagnosis | autoops-warning-event-triage) echo 900 ;;
     compliance-rbac-overgrant | rca-remediation-pr) echo 700 ;;
     consistency-authorized-networks-probe) echo 300 ;;
