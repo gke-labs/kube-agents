@@ -105,6 +105,19 @@
       "deliver": "all"
     },
     {
+      "id": "gce-compute-fleet-audit",
+      "name": "GCE Compute Engine and MIG Fleet Audit",
+      "schedule": {
+        "kind": "cron",
+        "expr": "45 7 * * *",
+        "display": "45 7 * * *"
+      },
+      "prompt": "Run the daily GCE Compute Engine and MIG fleet audit. Read the SOP at 'governance/gce_compute_fleet_sop.md' in your profile home — all 159 lines of it, before you run anything. Its five checks are section 2, lines 33-74, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
+      "skills": ["fleet-audit"],
+      "enabled": true,
+      "deliver": "all"
+    },
+    {
       "id": "github-repo-watcher",
       "name": "GitHub Repo Watcher",
       "schedule": {

@@ -49,6 +49,21 @@ To preview the upgrade plan and output a JSON status report without modifying cl
 
 Machine-readable JSON status reports are generated at `/tmp/kube-agents-upgrade-report.json`.
 
-`--image-tag` is required in every mode. Use a SemVer release tag or the full 40-character commit
+`--image-tag` is required for an upgrade. Use a SemVer release tag or the full 40-character commit
 SHA behind a validated RC tag; mutable refs such as `latest` and `main` are rejected so the upgrade
 scripts and container images stay on the same revision.
+
+Two flags make it optional, and they differ on whether it may be passed anyway:
+
+- `--plan` reports what a full upgrade would change against the install's real Terraform state, and
+  changes nothing. Exit 0 means in sync, 2 means there are changes, 1 means the plan failed. This is
+  the only preview that can see drift; `--dry-run` above answers offline from configuration alone
+  and plans against empty local state, so the two are refused together. `--image-tag` **is** accepted
+  alongside it, and plans at that tag — which is what a drift check of a specific candidate wants.
+- `--keep-image-tag` upgrades everything except the images, leaving them on the tag the install
+  already serves. This one refuses `--image-tag`, because the two ask for opposite things. It is what
+  a scheduled reconcile of an environment that tracks `main` uses.
+
+Given no tag, both read the running one off the agent Deployment and validate it exactly as a passed
+one, so an install serving a mutable ref stops the run rather than writing that ref into the
+composition.

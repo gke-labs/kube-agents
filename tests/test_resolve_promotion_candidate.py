@@ -44,6 +44,7 @@ class ResolvePromotionCandidateTest(unittest.TestCase):
         release.mkdir(parents=True, exist_ok=True)
         (release / "run_optional_e2e_suites.sh").write_text("#!/usr/bin/env bash\n")
         (release / "execute_e2e_tests.py").write_text('_SUITE_ENV_VAR = "E2E_SUITE"\n')
+        (release / "reconcile_environment.sh").write_text("#!/usr/bin/env bash\n")
         git("add", "-A")
         git("commit", "-m", "chore: shared pipeline scripts")
 
@@ -185,7 +186,7 @@ class ResolvePromotionCandidateTest(unittest.TestCase):
 
         proc, out = self._run(repo_dir, args=("rc_2608191200_2222222_validated",))
         self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("predates the shared-pipeline restructure", proc.stderr)
+        self.assertIn("predates a restructure the workflows depend on", proc.stderr)
         self.assertIn("Omit rc_tag", proc.stderr)
         self.assertEqual(out, {}, "a refused candidate must not emit outputs a later job reads")
 

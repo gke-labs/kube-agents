@@ -452,8 +452,8 @@ def test_audit_report_github_api_lifecycle_mocked(
         audit_report.SCRATCH_DIR = str(tmp_path)
         audit_report.set_workspace(workspace)
         audit_report.run_cmd = mock_run_cmd
-        audit_report.refresh_credentials = lambda repo=None: None
-        audit_report.resolve_repo = lambda: "test-org-kube-agent/agents-repo"
+        audit_report.refresh_credentials = lambda *args, **kwargs: None
+        audit_report.resolve_repo = lambda *args, **kwargs: "test-org-kube-agent/agents-repo"
         audit_report.repo_root = lambda: workspace
 
         valid_check = audit_report.AUDITS[audit_id].checks[0] if audit_id in audit_report.AUDITS and audit_report.AUDITS[audit_id].checks else "single-zone-nodepool"

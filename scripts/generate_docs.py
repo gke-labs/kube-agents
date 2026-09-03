@@ -96,6 +96,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
         "workload-rebalancing",
     ],
     "Cost and capacity": [
+        "gce-compute-fleet-audit",
         "gke-cluster-autoscaler",
         "gke-compute-classes",
         "gke-cost-analysis",

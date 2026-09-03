@@ -40,6 +40,7 @@ import subprocess
 import sys
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -53,6 +54,29 @@ def comment(author, body, node_id="n1"):
     return forge.Comment(
         node_id=node_id, author=author, body=body, can_write=True, created_at=""
     )
+
+
+class _CountingPattern:
+    """A compiled pattern that records how many times `sub` ran.
+
+    `strip_markers` substitutes to a fixpoint, so what its cost is really made
+    of is the number of passes: one per nesting level while each pass deletes a
+    whole match, one per character if a regression ever made it shave instead.
+    Counting the passes states that difference directly, where a stopwatch only
+    implies it. Wrapping is what makes the count reachable at all -- `re.Pattern`
+    is a C type and will not take an attribute.
+    """
+
+    def __init__(self, pattern):
+        self._pattern = pattern
+        self.sub_calls = 0
+
+    def sub(self, repl, string, count=0):
+        self.sub_calls += 1
+        return self._pattern.sub(repl, string, count)
+
+    def __getattr__(self, name):
+        return getattr(self._pattern, name)
 
 
 #: Every construct that can hide text in a Markdown comment, and the near-miss
@@ -467,20 +491,53 @@ class StripMarkersTest(unittest.TestCase):
     def test_no_marker_survives_at_any_nesting_depth(self):
         """A fixpoint makes the property total rather than tested to depth 2.
 
-        Also the cost bound. Every pass that changes anything deletes a whole
-        match and collapses the nest rather than shaving it, so a body nested
-        deeper than GitHub's 65,536-character limit allows still converges well
-        inside the bound.
+        Also the cost bound, counted in passes rather than seconds. Every pass
+        that changes anything deletes a whole match and collapses the nest
+        rather than shaving it, so a body nested deeper than GitHub's
+        65,536-character limit allows converges in one pass per level plus the
+        one that finds nothing left to do. Shaving would be one per character:
+        2,602 against 67,626, which is the regression this is really watching.
+
+        The bound used to be `elapsed < 0.3`, which measured the machine at
+        least as much as the algorithm: the honest cost is ~0.27s on an idle
+        developer box, so the bound had about 10% of headroom and any load at
+        all closed it. Running the suite's directories concurrently is what
+        finally did, at 0.459s. The three remaining timing bounds in this file
+        are a different case and stay as they are: they guard superlinear
+        regressions -- catastrophic backtracking at the two `find_trigger`
+        bounds, an unanchored line-by-line walk at the third -- where fixed and
+        broken are orders of magnitude apart rather than fractions of one, and
+        no amount of load closes that gap.
+
+        A wall-clock ceiling stays here too, at a size no load can reach. Pass
+        count is blind to a pass getting slow, which is what a MARKER_RE edit
+        that introduced backtracking would do, and a test that hangs for a
+        minute and then passes is worse than one that fails.
         """
+        depth = 2600
         body = "<!-- agent-answered:IC -->"
-        for _ in range(2600):
+        for _ in range(depth):
             body = "<!-- agent-" + body + "answered:IC -->"
+
+        counting = _CountingPattern(pr_triggers.MARKER_RE)
         started = time.monotonic()
-        out = pr_triggers.strip_markers(body)
+        with mock.patch.object(pr_triggers, "MARKER_RE", counting):
+            out = pr_triggers.strip_markers(body)
         elapsed = time.monotonic() - started
+
         self.assertEqual(out, "")
         self.assertEqual(pr_triggers.MARKER_RE.findall(out), [])
-        self.assertLess(elapsed, 0.3, f"took {elapsed:.3f}s")
+        # Equality, not a ceiling. The count is exact and deterministic -- one
+        # pass per level, plus the one that finds nothing left to do -- and a
+        # ceiling would also pass at zero, which is what a rewrite reaching for
+        # `finditer` or a differently named pattern would leave behind: the
+        # wrapper uncalled and the assertion guarding nothing while still
+        # reading like a cost bound. Converging in fewer passes is welcome and
+        # is a deliberate edit to this line, not a silent pass.
+        self.assertEqual(depth + 2, counting.sub_calls)
+        # Nearly 40x the measured cost: catches a backtracking blowup, and no
+        # amount of load on a shared runner reaches it.
+        self.assertLess(elapsed, 10.0, f"took {elapsed:.3f}s")
 
     def test_stripping_does_not_change_what_counts_as_answered(self):
         """`handled_node_ids` reads raw bodies — a stripped one is not the record."""

@@ -2,10 +2,10 @@
 #
 # Makes `apply` and `destroy` repeatable for this composition.
 #
-# Four things in this stack are not symmetric — applying them is not the inverse
-# of destroying them — and every one of them turns the second `terraform apply`
-# of a project's life into a failure. Terraform cannot express any of them, so
-# they live here rather than in a README telling you to remember them:
+# Several things in this stack are not symmetric — applying them is not the
+# inverse of destroying them — and every one of them turns the second `terraform
+# apply` of a project's life into a failure. Terraform cannot express any of
+# them, so they live here rather than in a README telling you to remember them:
 #
 #   1. Cloud KMS key rings and crypto keys CANNOT be deleted, ever. `terraform
 #      destroy` drops them from state and leaves them in the project, so the next
@@ -22,17 +22,27 @@
 #   3. A GKE BackupPlan cannot be deleted while it still owns backups.
 #   4. The cluster is created with deletion_protection = true, which a destroy
 #      cannot override on its own — the attribute has to be applied as false first.
+#   5. A Pub/Sub topic or subscription that already exists makes the create 409.
+#      Reachable on a FIRST install too: configuring the Chat app in the Cloud
+#      console creates the topic before the installer ever runs. `adopt_pubsub`
+#      imports whichever of the two is already there before applying.
 #
 # Usage:
 #   ./lifecycle.sh apply    [extra terraform args...]
+#   ./lifecycle.sh plan     [extra terraform args...]
 #   ./lifecycle.sh destroy  [extra terraform args...]
 #   ./lifecycle.sh adopt-kms
 #
+# `plan` reports what an apply would change and touches nothing — no state lock,
+# no state bucket creation, no adoption imports. Pass -detailed-exitcode to get
+# 0 for "in sync" and 2 for "there are changes".
+#
 # Remote state (opt-in): set KUBE_AGENTS_STATE_BUCKET to a GCS bucket name, or
-# to "auto" for <project_id>-kube-agents-tfstate. The bucket is created if
-# missing (versioned, uniform access) and a gitignored backend_override.tf
-# points Terraform at gs://<bucket>/<KUBE_AGENTS_STATE_PREFIX, default
-# kube-agents/<cluster_name>>. Unset, state stays local as before.
+# to "auto" for <project_id>-kube-agents-tfstate. On `apply` and `destroy` the
+# bucket is created if missing (versioned, uniform access); `plan` creates
+# nothing and fails instead, per its read-only contract above. A gitignored
+# backend_override.tf points Terraform at gs://<bucket>/<KUBE_AGENTS_STATE_PREFIX,
+# default kube-agents/<cluster_name>>. Unset, state stays local as before.
 #
 set -euo pipefail
 
@@ -54,7 +64,15 @@ warn() { printf '\033[1;33m warn\033[0m %s\n' "$*" >&2; }
 # state behaves exactly as before.
 BACKEND_OVERRIDE_FILE="backend_override.tf"
 
+#
+# One argument, "readonly", suppresses the bucket creation for `plan`. A plan
+# is meant to report on an install without changing anything about it, and a
+# plan that creates the state bucket has both changed the project and answered
+# the wrong question — an empty bucket plans the whole composition as new,
+# which reads as total drift when the truth is that this is not the install's
+# backend at all.
 ensure_backend() {
+  local mode="${1:-}"
   [[ -n "${KUBE_AGENTS_STATE_BUCKET:-}" ]] || return 0
 
   # project/cluster/location come from tfvars, which terraform console only
@@ -74,6 +92,11 @@ ensure_backend() {
   region=$(sed -E 's/-[a-z]$//' <<<"$(tfvar location)")
 
   if ! gcloud storage buckets describe "gs://$bucket" --project "$project" >/dev/null 2>&1; then
+    if [[ "$mode" == "readonly" ]]; then
+      warn "no Terraform state bucket at gs://$bucket — nothing has ever been applied here,"
+      warn "or KUBE_AGENTS_STATE_BUCKET/KUBE_AGENTS_STATE_PREFIX name a different install."
+      exit 1
+    fi
     log "creating Terraform state bucket gs://$bucket in $region (versioned, uniform access)"
     gcloud storage buckets create "gs://$bucket" --project "$project" \
       --location "$region" --uniform-bucket-level-access >/dev/null
@@ -103,7 +126,7 @@ ensure_backend() {
 # when nothing changed, and skipping it is how a routine `git pull` that adds a
 # module turns every subcommand below into a failure.
 ensure_init() {
-  ensure_backend
+  ensure_backend "${1:-}"
   terraform init -input=false >/dev/null || {
     warn "terraform init failed; run it by hand to see why"
     exit 1
@@ -281,6 +304,77 @@ adopt_kms() {
   log "resource adoption complete: $adopted imported"
 }
 
+# Pub/Sub topics and subscriptions are deletable, so they are not undeletable
+# the way a KMS key ring is — but they are routinely created outside this
+# composition, and creating one that exists is a hard 409 rather than a no-op:
+#
+#   Error 409: Resource already exists in the project
+#     with module.chat_pubsub[0].google_pubsub_topic.chat_events
+#
+# Two ways in, and neither is a mistake. Configuring the Google Chat app in the
+# Cloud console walks you through creating the topic before you ever run the
+# installer; and an earlier install in the same project leaves both behind
+# whenever the destroy did not reach them. The install then cannot proceed at
+# all until someone deletes a topic by hand, which is not a thing to ask of a
+# scheduled reconcile running unattended.
+#
+# Adopting is safe in a way that deleting is not: import moves an existing
+# resource under management without touching it, and the apply that follows
+# reconciles its settings. A topic this composition already manages is skipped
+# by the in_state check, so a steady-state apply does no gcloud work here.
+adopt_pubsub() {
+  [[ "$(tfvar enable_google_chat)" == "true" ]] || return 0
+
+  local project topic sub
+  load_state
+  project=$(tfvar project_id)
+  topic=$(tfvar chat_topic_name)
+  sub=$(tfvar chat_subscription_name)
+
+  # The subscription is listed after the topic on purpose, and is skipped
+  # unless the topic is in state by the time its turn comes. A subscription
+  # whose topic Terraform is about to CREATE has a `topic` attribute that is
+  # about to change, so importing it produces a plan that immediately replaces
+  # it — which is the outcome adopting was meant to avoid. That happens
+  # whenever the topic is absent from GCP while the subscription is not: a
+  # half-finished console setup, or a destroy that stopped partway.
+  #
+  # address <TAB> gcloud-kind <TAB> resource id <TAB> requires-in-state
+  local topic_address="module.chat_pubsub[0].google_pubsub_topic.chat_events"
+  local -a targets=(
+    "$topic_address	topics	projects/$project/topics/$topic	"
+    "module.chat_pubsub[0].google_pubsub_subscription.chat_events	subscriptions	projects/$project/subscriptions/$sub	$topic_address"
+  )
+
+  local adopted=0 address kind id requires
+  for target in "${targets[@]}"; do
+    IFS=$'\t' read -r address kind id requires <<<"$target"
+
+    in_state "$address" && continue
+    if [[ -n "$requires" ]] && ! in_state "$requires"; then
+      log "not adopting $id: its topic is not under management, so importing it would plan a replacement"
+      continue
+    fi
+    gcloud pubsub "$kind" describe "${id##*/}" --project "$project" >/dev/null 2>&1 || continue
+
+    log "adopting existing Pub/Sub resource: $id"
+    [[ -f "$OVERRIDE_FILE" ]] || with_override
+    if terraform import -input=false "$address" "$id" >/dev/null 2>&1; then
+      adopted=$((adopted + 1))
+      # STATE_LIST is a snapshot taken by load_state above, so the
+      # subscription's check below would not see the topic this import just
+      # added without re-reading it.
+      load_state
+    else
+      warn "could not import $address ($id); the apply will fail with a 409"
+    fi
+  done
+
+  drop_override
+  trap - EXIT
+  [[ "$adopted" -eq 0 ]] || log "Pub/Sub adoption complete: $adopted imported"
+}
+
 # create_cluster = false means "somebody else's cluster" — but if THIS state
 # already manages the cluster, flipping the variable off does not hand the
 # cluster back: it removes the resource from configuration, and the next apply
@@ -439,11 +533,35 @@ case "${1:-}" in
     ensure_init
     adopt_kms
     ;;
+  plan)
+    shift
+    # Read-only, and every argument here is what makes it so:
+    #
+    #   readonly       do not create the state bucket (see ensure_backend)
+    #   -lock=false    do not take the state lock, so a plan can never block or
+    #                  be blocked by the apply it is reporting on
+    #   -input=false   never prompt; this runs unattended
+    #
+    # adopt_kms and adopt_pubsub are deliberately absent: both run
+    # `terraform import`, which writes state. A plan against an install that
+    # needs adoption therefore shows the resources as "to create" — which is
+    # honest about what a plan alone can tell you, and the apply below is what
+    # adopts them.
+    #
+    # -detailed-exitcode passes through from the caller rather than being set
+    # here, because it changes the meaning of a non-zero exit: 2 stops meaning
+    # "failed" and starts meaning "there are changes". Only a caller that knows
+    # to treat 2 as a report should ask for it.
+    ensure_init readonly
+    log "terraform plan"
+    terraform plan -lock=false -input=false "$@"
+    ;;
   apply)
     shift
     ensure_init
     guard_cluster_ownership
     adopt_kms
+    adopt_pubsub
     log "terraform apply"
     # No -input=false: this prompts like plain `terraform apply` does. Pass
     # -auto-approve through ARGS for unattended runs.
@@ -486,7 +604,10 @@ case "${1:-}" in
     log "delete them. The next 'lifecycle.sh apply' adopts them automatically."
     ;;
   *)
-    sed -n '2,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    # The line range is the header comment above, so it moves whenever that
+    # comment grows. It ends at the blank comment line before `set -euo
+    # pipefail`.
+    sed -n '2,46p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

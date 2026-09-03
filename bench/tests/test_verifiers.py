@@ -1037,7 +1037,7 @@ def test_the_pinned_stream_list_matches_the_audit_scripts_registry():
         / "agents/platform/skills/fleet-audit/scripts/audit_report.py"
     )
     ids = set(re.findall(r'^ {4}"([a-z0-9-]+)": AuditSpec\($', script.read_text(), re.M))
-    assert len(ids) == 8, ids  # the parse itself must not silently find nothing
+    assert len(ids) == 9, ids  # the parse itself must not silently find nothing
     assert ids == set(verifiers.LEDGER_AUDIT_IDS)
     literal = LedgerIssueContainsVerifier.model_fields["audit"].annotation
     assert set(literal.__args__) == set(verifiers.LEDGER_AUDIT_IDS)

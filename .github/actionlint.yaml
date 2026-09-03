@@ -1,10 +1,13 @@
 # actionlint configuration.
 #
 # actionlint types the `secrets` context of a reusable workflow from its
-# `on.workflow_call.secrets` block alone. It has no model of ENVIRONMENT
-# secrets, so it reports GH_APP_ID and GH_APP_PRIVATE_KEY — which
-# deploy-environment.yml's `deploy-environment` job reads from the
-# environment it declares — as undefined properties. These two patterns silence that.
+# `on.workflow_call.secrets` block alone. It has no model of ENVIRONMENT or
+# repository secrets, so it reports every secret
+# deploy-environment.yml's `deploy-environment` job reads from the environment
+# it declares — GH_APP_ID and GH_APP_PRIVATE_KEY for the token minter, and the
+# model-provider and Slack credentials the job now carries so that a
+# destroy-and-rebuild installs the same configuration a reconcile would — as
+# undefined properties. These patterns silence that.
 #
 # Suppressing a warning is not the same as answering it, and the real guard is
 # elsewhere: provision_environment.sh refuses to provision when
@@ -32,3 +35,7 @@ paths:
     ignore:
       - 'property "gh_app_id" is not defined in object type \{.*gemini_api_key:'
       - 'property "gh_app_private_key" is not defined in object type \{.*gemini_api_key:'
+      - 'property "anthropic_api_key" is not defined in object type \{.*gemini_api_key:'
+      - 'property "openai_api_key" is not defined in object type \{.*gemini_api_key:'
+      - 'property "slack_bot_token" is not defined in object type \{.*gemini_api_key:'
+      - 'property "slack_app_token" is not defined in object type \{.*gemini_api_key:'

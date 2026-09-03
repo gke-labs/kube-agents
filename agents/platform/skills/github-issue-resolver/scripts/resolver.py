@@ -16,50 +16,21 @@ from pathlib import Path
 
 # The shared scripts dir holds github_token_refresh (docker-entrypoint.sh keeps
 # executable scripts shared across profiles rather than copying them into each
-# one). The import itself is lazy, in refresh_credentials below, so this module
-# still imports on a dev machine with nothing staged under /opt. The third entry
-# is the same directory in a source checkout. Mirrors fleet-audit's audit_report,
-# which needs the same module for the same reason.
+# one). The third entry is the same directory in a source checkout. Mirrors
+# fleet-audit's audit_report, which needs the same module for the same reason.
 sys.path.append("/opt/defaults/scripts")
 sys.path.append("/opt/data/scripts")
 sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
 
+from github_token_refresh import (
+    GH_MISSING_RC,
+    is_refresh_failed,
+    looks_like_auth_failure,
+    refresh_credentials_once,
+)
 from gitops_workspace import get_managed_github_repos, is_valid_repo_slug
 
 SCRATCH_DIR = "/opt/data/scratch"
-
-# Shell convention for "command not found", reused so a missing binary stays
-# distinguishable from a gh command that ran and failed.
-GH_MISSING_RC = 127
-
-# The credential sidecar's own timeout (`_execute` in credential_proxy.py),
-# surfaced through credential_proxy_client. Excluded from the retry because a
-# command that ran for the full timeout may well have landed its write; see
-# _looks_like_auth_failure.
-GH_TIMEOUT_RC = 124
-
-# What `gh` prints when the credential is the problem, as opposed to the
-# repository, the network, or the rate limit. Matched case-insensitively
-# against stderr: the REST paths emit `HTTP 401: Bad credentials`, the GraphQL
-# ones `requires authentication`, and `auth status` (which is handled
-# separately, being the explicit question) `not logged in` / `token is invalid`.
-_GH_AUTH_FAILURE = re.compile(
-    r"HTTP 401"
-    r"|bad credentials"
-    r"|requires authentication"
-    r"|authentication failed"
-    r"|not logged in"
-    r"|token is invalid"
-    r"|invalid token",
-    re.IGNORECASE,
-)
-
-# Per-process credential-refresh state, owned by _refresh_credentials_once.
-# `_attempted` bounds an invocation to a single mint; `_failed` lets handle_poll
-# tell "the broker refused" apart from "nobody configured credentials", which
-# need different operators. Tests reset both.
-_refresh_attempted = False
-_refresh_failed = False
 
 # The operator accepts a bare "owner/repo" shorthand as a valid gitRepo and
 # writes it through to SETTINGS.md verbatim, so it reaches us hostless. This
@@ -91,94 +62,6 @@ def _run_gh_once(args: list) -> subprocess.CompletedProcess:
         )
 
 
-def _looks_like_auth_failure(args: list, result) -> bool:
-    """Does this failure look like one a fresh token would fix?
-
-    The retry exists for an expired installation token, and minting on anything
-    else spends a credential on a fault no credential can repair. `gh auth
-    status` passes whenever *any* host is authenticated, so a repository the
-    token cannot reach fails only at `issue list` with a 404 -- and gating the
-    retry on ``returncode != 0`` alone turned that permanent misconfiguration
-    into a mint on every ten-minute tick, indefinitely.
-
-    Two ways in. `auth status` failing needs no pattern: asking whether the
-    credential works is the command's whole purpose, so a non-zero exit *is*
-    the authentication answer, and this is the path the reported expiry took.
-    Every other subcommand is judged on what gh printed.
-
-    ``GH_TIMEOUT_RC`` is excluded rather than pattern-matched. A command killed
-    at the sidecar's timeout may already have landed its write, and a retry
-    would repeat it -- `handle_transition` posts the report with `issue
-    comment`, which is not idempotent.
-    """
-    if result.returncode == 0:
-        return False
-    if result.returncode in (GH_MISSING_RC, GH_TIMEOUT_RC):
-        return False
-    if args[:2] == ["auth", "status"]:
-        return True
-    return bool(_GH_AUTH_FAILURE.search(result.stderr or ""))
-
-
-def _refresh_credentials_once(args: list = None) -> bool:
-    """Mint a fresh token, at most once per process.
-
-    Returns True only when a new token actually landed -- i.e. when retrying
-    the gh command that just failed is worth doing.
-
-    The at-most-once guard is what bounds the cost. Each entry point runs as
-    its own ``resolver.py <verb>`` invocation, so one invocation makes one mint
-    however many gh calls it makes, and a credential broken for a reason no
-    token fixes cannot turn a single poll into a mint per call.
-    """
-    global _refresh_attempted, _refresh_failed
-    if _refresh_attempted:
-        return False
-    _refresh_attempted = True
-
-    repo = None
-    if args and "-R" in args:
-        try:
-            repo = args[args.index("-R") + 1]
-        except (ValueError, IndexError):
-            pass
-
-    if not repo:
-        try:
-            managed = get_managed_github_repos()
-            repo = managed[0] if managed else None
-        except Exception:
-            repo = None
-
-    if not repo:
-        # No repository to scope a token to, so there is nothing to mint. Let
-        # the original failure stand; the caller reports it as it always did.
-        return False
-
-    try:
-        refresh_credentials(repo)
-    except Exception as exc:
-        # This line is for an operator running the script by hand; the reason
-        # code the caller derives from `_refresh_failed` deliberately carries no
-        # detail, because github_scan_gate renders `reason` into a chat room and
-        # a broker error body is not something to forward unread.
-        #
-        # Nor is this print the record. On the proxy path github_token_refresh
-        # raises a fixed string, and the gate reads our stderr only when stdout
-        # is empty, which it never is here. What refused, and why, is recorded
-        # by the sidecar: `_handle_github_refresh` in credential_proxy.py logs
-        # the refresh helper's stderr where only an operator sees it. Diagnosing
-        # a refusal means that log, or Minty's own.
-        print(
-            f"resolver: GitHub credential refresh failed: "
-            f"{type(exc).__name__}: {exc}",
-            file=sys.stderr,
-        )
-        _refresh_failed = True
-        return False
-    return True
-
-
 def run_gh(args: list, check: bool = True) -> subprocess.CompletedProcess:
     """Runs a gh CLI command safely without shell escaping or ampersand backgrounding issues.
 
@@ -194,13 +77,13 @@ def run_gh(args: list, check: bool = True) -> subprocess.CompletedProcess:
     leaving the issue pinned at `status:in-progress` until the stale sweep
     escalated it.
 
-    Only an *authentication* failure earns the retry. ``_looks_like_auth_failure``
+    Only an *authentication* failure earns the retry. ``looks_like_auth_failure``
     owns that judgement, including why a missing binary and a sidecar timeout are
     excluded: no token puts an absent binary back on PATH, and a 404, a rate
     limit, or a timeout is not a credential problem either.
     """
     result = _run_gh_once(args)
-    if _looks_like_auth_failure(args, result) and _refresh_credentials_once(args):
+    if looks_like_auth_failure(args, result) and refresh_credentials_once(args):
         result = _run_gh_once(args)
 
     if check and result.returncode != 0:
@@ -213,24 +96,6 @@ def run_gh(args: list, check: bool = True) -> subprocess.CompletedProcess:
             )
         sys.exit(result.returncode)
     return result
-
-
-def refresh_credentials(repo: str) -> None:
-    """Mint a fresh repo-scoped GitHub App token into gh's credential store.
-
-    `repo` is passed explicitly rather than left to the no-argument form, which
-    re-derives the repository by running `git config --get remote.origin.url` in
-    the current directory. This poller has no clone of the target checked out,
-    so that fallback would either name the wrong repository or fail outright --
-    the same reason fleet-audit's identically-named helper passes it too.
-
-    Kept as a module-level function so tests can replace it: the real one talks
-    to the credential sidecar, and a unit test that reached it would make a live
-    network call.
-    """
-    from github_token_refresh import refresh_git_credentials
-
-    refresh_git_credentials(repo)
 
 
 def ensure_labels_exist(repo: str):
@@ -600,7 +465,7 @@ def handle_poll(args):
         # is the conflation that made this failure unreadable to begin with.
         # A broker that refused is not a missing binary and neither is a
         # credential nobody ever configured.
-        if _refresh_failed:
+        if is_refresh_failed():
             reason = "GITHUB_TOKEN_REFRESH_FAILED"
         elif auth.returncode == GH_MISSING_RC:
             reason = "GH_CLI_NOT_FOUND"

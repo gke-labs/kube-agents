@@ -32,6 +32,13 @@ BAKED_RELEASE_VERSION=""
 PARAM_UPGRADE_MODE="full"
 PARAM_NON_INTERACTIVE="false"
 PARAM_DRY_RUN="false"
+# --plan and --dry-run are both previews and are deliberately not the same one.
+# --dry-run answers offline, from configuration alone, and never contacts the
+# install. --plan answers from the install's real Terraform state, so it needs
+# credentials and it is the only one of the two that can tell you an
+# environment has drifted from the composition on main.
+PARAM_PLAN="false"
+PARAM_KEEP_IMAGE_TAG="false"
 PARAM_PROJECT_ID=""
 PARAM_CLUSTER_NAME=""
 PARAM_REGION=""
@@ -98,11 +105,17 @@ Usage: ./upgrade.sh [OPTIONS]
 Options:
   --upgrade-mode, -m MODE  Upgrade mode: full, harness, operator (Default: full)
   --non-interactive, -y    Automated execution mode (no interactive prompts)
+  --plan                   Report what a full upgrade would change, against the
+                           install's real Terraform state. Changes nothing.
+                           Exit 0 = in sync, 2 = there are changes, 1 = error.
   --dry-run                Preview upgrade plan and configuration state without touching cloud resources
   --project-id ID          GCP Target Project ID
   --cluster-name NAME      GKE Target Cluster Name
   --region REGION          GKE GCP Region
   --image-tag TAG          Validated immutable release tag or full commit SHA (required)
+  --keep-image-tag         Upgrade everything except the images, leaving them on
+                           the tag the install already serves. Use instead of
+                           --image-tag, not alongside it.
   --help, -h               Show this help message
 
 Examples:
@@ -111,7 +124,35 @@ Examples:
 
   # Dry-run upgrade preview
   ./upgrade.sh --dry-run --upgrade-mode=full
+
+  # What has this install drifted from? Holds the image tag at the one
+  # Terraform state records, so the report is composition drift, not image lag.
+  ./upgrade.sh --plan
 EOF
+}
+
+# The image tag an install is currently serving, read off the agent Deployment.
+#
+# The Deployment rather than the Helm release: `helm get values` reports what
+# the last upgrade was ASKED for, and on these environments the last upgrade was
+# a `--reset-then-reuse-values` re-tag whose recorded values are the install-day
+# blob. The Deployment reports what is running.
+running_image_tag() {
+  local namespace="$1" image=""
+  # Selected by name, not by index. The operator builds this list and appends
+  # the dashboard and fluent-bit after the agent, so a positional read is one
+  # reordering away from pinning the composition's image_tag to a sidecar's
+  # version — on a scheduled apply, silently.
+  image="$(kubectl get deployment platform-agent-gateway -n "$namespace" \
+    -o jsonpath='{.spec.template.spec.containers[?(@.name=="platform-agent")].image}' \
+    2>/dev/null || true)"
+  [ -n "$image" ] || return 0
+  # Everything after the last colon, unless that colon belongs to a registry
+  # port (no slash may follow it).
+  case "${image##*:}" in
+    */*) return 0 ;;
+    *) printf '%s\n' "${image##*:}" ;;
+  esac
 }
 
 validate_immutable_ref() {
@@ -215,6 +256,64 @@ backfill_session_kv_keys() {
   fi
 }
 
+matches_release_bundle_ref() {
+  local repo_dir="$1"
+  local expected_ref="$2"
+  local bundle_file="${repo_dir}/.release-bundle"
+
+  if [ -f "$bundle_file" ]; then
+    local bundle_version bundle_tag
+    bundle_version="$(grep -E "^version=" "$bundle_file" 2>/dev/null | cut -d'=' -f2- | tr -d '[:space:]' || echo "")"
+    bundle_tag="$(grep -E "^tag=" "$bundle_file" 2>/dev/null | cut -d'=' -f2- | tr -d '[:space:]' || echo "")"
+    if [ -n "$bundle_version" ] && { [ "$bundle_version" = "$expected_ref" ] || [ "$bundle_tag" = "$expected_ref" ]; }; then
+      echo "$bundle_version"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# The two refusals that do not need a ref to make sense: an unversioned source
+# directory, and a dirty one. Split out of verify_local_source_ref because a
+# tagless run still applies this checkout's Terraform and charts to a live
+# install -- so skipping the ref COMPARISON, which is the only part a missing
+# tag actually makes impossible, must not take these with it. Without this,
+# `--keep-image-tag` would apply uncommitted local edits to an environment and
+# say nothing, which is the invisible drift #1117 exists to end.
+#
+# The previews are warned rather than refused. --dry-run and --plan change
+# nothing, and a plan of what the working tree WOULD apply is a reasonable thing
+# to want from a tree that is mid-edit; refusing it would take away the one
+# command that answers "what have I changed here".
+verify_local_source_clean() {
+  local repo_dir="$1" preview="false"
+  if [ "$PARAM_DRY_RUN" = "true" ] || [ "$PARAM_PLAN" = "true" ]; then
+    preview="true"
+  fi
+
+  if ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if [ -n "${BAKED_RELEASE_VERSION:-}" ]; then
+      return 0
+    fi
+    if [ "$preview" = "true" ]; then
+      print_warning "Cannot verify the source directory because '$repo_dir' is not a Git worktree."
+      return 0
+    fi
+    print_error "Refusing to upgrade from an unversioned source directory: $repo_dir"
+    return 1
+  fi
+
+  if [ -n "$(git -C "$repo_dir" status --porcelain --untracked-files=no)" ]; then
+    if [ "$preview" = "true" ]; then
+      print_warning "This preview is using uncommitted source changes; a real upgrade would require a clean checkout."
+      return 0
+    fi
+    print_error "Refusing to upgrade from a dirty checkout: its Terraform, charts and scripts match no commit, so what this run would apply exists nowhere else. Commit or stash, or use --plan to preview."
+    return 1
+  fi
+  print_success "Verified the upgrade sources are a clean checkout of $(git -C "$repo_dir" rev-parse --short HEAD)."
+}
+
 verify_local_source_ref() {
   local repo_dir="$1"
   local expected_ref="$2"
@@ -223,6 +322,11 @@ verify_local_source_ref() {
     # In official stamped release archives (unpacked tarball/zip outside Git),
     # BAKED_RELEASE_VERSION is stamped during release automation.
     if [ -n "${BAKED_RELEASE_VERSION:-}" ] && [ "${BAKED_RELEASE_VERSION}" = "${expected_ref}" ]; then
+      local bundle_version=""
+      if bundle_version="$(matches_release_bundle_ref "$repo_dir" "$expected_ref")"; then
+        print_success "Verified upgrade sources match official release bundle ${bundle_version}."
+        return 0
+      fi
       print_success "Verified upgrade sources match baked official release ${BAKED_RELEASE_VERSION}."
       return 0
     fi
@@ -262,6 +366,8 @@ parse_args() {
       --upgrade-mode=*|-m=*) PARAM_UPGRADE_MODE="${1#*=}"; shift ;;
       --upgrade-mode|-m) PARAM_UPGRADE_MODE="$2"; shift 2 ;;
       --non-interactive|-y) PARAM_NON_INTERACTIVE="true"; shift ;;
+      --plan) PARAM_PLAN="true"; shift ;;
+      --keep-image-tag) PARAM_KEEP_IMAGE_TAG="true"; shift ;;
       --dry-run) PARAM_DRY_RUN="true"; shift ;;
       --project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
       --project-id) PARAM_PROJECT_ID="$2"; shift 2 ;;
@@ -293,11 +399,50 @@ EOF
   print_success "Upgrade report written to: $report_file"
 }
 
+# Runs lifecycle.sh from the composition directory with the install's Terraform
+# state coordinates in the environment.
+#
+# One function rather than the same subshell written out at each call site: the
+# plan and the apply must not be able to come to disagree about which state they
+# are talking to. It also keeps `cd` and the two exports from leaking into the
+# rest of the run -- and keeps shellcheck's SC2030/SC2031 quiet, which matters
+# because CI runs a bare `shellcheck upgrade.sh` and fails on info severity.
+run_lifecycle() {
+  local composition_dir="$1"
+  shift
+  (
+    cd "$composition_dir" || return 1
+    KUBE_AGENTS_STATE_BUCKET="${KUBE_AGENTS_STATE_BUCKET:-auto}"
+    KUBE_AGENTS_STATE_PREFIX="$(tf_state_prefix)"
+    export KUBE_AGENTS_STATE_BUCKET KUBE_AGENTS_STATE_PREFIX
+    ./lifecycle.sh "$@"
+  )
+}
+
 main() {
   parse_args "$@"
   print_banner
 
-  if [ -z "$PARAM_IMAGE_TAG" ]; then
+  # --image-tag may be omitted, and for a plan it usually should be. The tag is
+  # then read off the running install further down, which separates the two
+  # things a run could be about: an install whose IMAGES are behind main
+  # (visible, expected, and what the redeploy workflows exist to fix) and one
+  # whose INFRASTRUCTURE is behind main (invisible — #1117).
+  #
+  # An UPGRADE can ask for the same thing, but only by saying so:
+  # --keep-image-tag means "converge everything except the images". That is
+  # what a scheduled reconcile of autopush wants, because autopush tracks
+  # main's tip through GHCR publishes and pinning it to whichever commit the
+  # reconcile ran from would roll its images BACKWARDS to that commit.
+  #
+  # A flag rather than "empty means keep", because empty already means
+  # something: it is the shape of a CI job whose IMAGE_TAG variable did not
+  # resolve, and that has to stay the hard error it has always been.
+  if [ -z "$PARAM_IMAGE_TAG" ] && [ "$PARAM_KEEP_IMAGE_TAG" = "true" ]; then
+    print_info "--keep-image-tag: this run keeps the tag the install is already serving."
+  elif [ -z "$PARAM_IMAGE_TAG" ] && [ "$PARAM_PLAN" = "true" ]; then
+    print_info "No --image-tag given; the plan will use the tag this install is already running."
+  elif [ -z "$PARAM_IMAGE_TAG" ]; then
     if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
       print_error "--image-tag is required; use a validated release tag or full commit SHA."
       exit 1
@@ -305,26 +450,60 @@ main() {
     if [ -c /dev/tty ] && ( : </dev/tty ) 2>/dev/null; then
       printf '%b' "  ${C_CYAN}Target image tag (validated release tag or full commit SHA): ${C_RESET}" >/dev/tty
       read -r PARAM_IMAGE_TAG </dev/tty
+      # A bare Enter is still the empty tag this arm exists to reject, and
+      # nothing further down catches it: validate_immutable_ref, whose first
+      # branch rejects an empty ref, runs only when a tag is present. Without
+      # this, pressing Enter would skip verify_local_source_ref and silently
+      # become --keep-image-tag.
+      if [ -z "$PARAM_IMAGE_TAG" ]; then
+        print_error "--image-tag is required; use a validated release tag or full commit SHA. To upgrade everything except the images, pass --keep-image-tag."
+        exit 1
+      fi
     else
       print_error "--image-tag is required when no interactive terminal is available (e.g. curl | bash)."
       exit 1
     fi
   fi
-  validate_immutable_ref "$PARAM_IMAGE_TAG"
+  if [ -n "$PARAM_IMAGE_TAG" ] && [ "$PARAM_KEEP_IMAGE_TAG" = "true" ]; then
+    print_error "--keep-image-tag and --image-tag ask for opposite things. Pass one."
+    exit 1
+  fi
+  if [ -n "$PARAM_IMAGE_TAG" ]; then
+    validate_immutable_ref "$PARAM_IMAGE_TAG"
+  fi
 
   case "$PARAM_UPGRADE_MODE" in
     full|harness|operator) ;;
     *) print_error "Unsupported upgrade mode '$PARAM_UPGRADE_MODE'. Use full, harness, or operator."; exit 1 ;;
   esac
 
+  # A tagless run cannot fetch its own engine — there is no tag to fetch — and
+  # cannot compare the checkout against a ref it was not given. Both are things
+  # the tag makes possible rather than things the run needs.
+  #
+  # What the tag does NOT excuse is the state of the checkout itself: a tagless
+  # run still applies this directory's Terraform and charts to a live install,
+  # so verify_local_source_clean runs either way and only the ref comparison is
+  # conditional.
   local script_dir repo_dir
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   if [ -f "${script_dir}/scripts/installer/installer_common.sh" ]; then
     repo_dir="$script_dir"
-    verify_local_source_ref "$repo_dir" "$PARAM_IMAGE_TAG"
+    if [ -n "$PARAM_IMAGE_TAG" ]; then
+      verify_local_source_ref "$repo_dir" "$PARAM_IMAGE_TAG"
+    else
+      verify_local_source_clean "$repo_dir"
+    fi
   elif [ -f "$(pwd)/scripts/installer/installer_common.sh" ]; then
     repo_dir="$(pwd)"
-    verify_local_source_ref "$repo_dir" "$PARAM_IMAGE_TAG"
+    if [ -n "$PARAM_IMAGE_TAG" ]; then
+      verify_local_source_ref "$repo_dir" "$PARAM_IMAGE_TAG"
+    else
+      verify_local_source_clean "$repo_dir"
+    fi
+  elif [ -z "$PARAM_IMAGE_TAG" ]; then
+    print_error "--plan and --keep-image-tag have to run from a kube-agents checkout: without --image-tag there is no ref to fetch the engine at."
+    exit 1
   else
     TEMP_REPO_DIR="$(mktemp -d)"
     repo_dir="${TEMP_REPO_DIR}/kube-agents"
@@ -405,6 +584,11 @@ main() {
   print_info "GCP Target Project: ${C_BOLD}${target_project}${C_RESET}"
   print_info "GKE Target Cluster: ${C_BOLD}${target_cluster}${C_RESET} (${target_region})"
 
+  if [ "$PARAM_DRY_RUN" = "true" ] && [ "$PARAM_PLAN" = "true" ]; then
+    print_error "--dry-run and --plan are different previews and cannot be combined: --dry-run answers offline from configuration, --plan answers from the install's Terraform state."
+    exit 1
+  fi
+
   if [ "$PARAM_DRY_RUN" = "true" ]; then
     print_step "2. Dry-Run Upgrade Plan Preview"
     echo -e "  • ${C_CYAN}Action:${C_RESET} Perform ${PARAM_UPGRADE_MODE} upgrade on cluster '${target_cluster}'"
@@ -470,8 +654,59 @@ main() {
   gcloud container clusters get-credentials "$target_cluster" --location="$target_region" --project="$target_project" $GKE_DNS_ENDPOINT_FLAG
 
   local target_namespace="${NAMESPACE:-kubeagents-system}"
-  print_step "3. Reconciling Pod-Scoped Session Keys"
-  backfill_session_kv_keys "$target_namespace"
+
+  if [ -z "$PARAM_IMAGE_TAG" ] && [ "$PARAM_PLAN" = "true" ]; then
+    # A PLAN's reference point is Terraform state, not the cluster, so the tag
+    # it plans at has to be the one the last apply RECORDED. The two differ by
+    # design on these environments: the redeploy workflows move the running tag
+    # with `helm upgrade --reset-then-reuse-values` and never run Terraform, so
+    # autopush's cluster advances with every push to main while state stays
+    # where the last reconcile left it.
+    #
+    # Planning at the running tag would therefore render an image_tag into
+    # terraform.tfvars that state does not have, helm_release.kube_agents would
+    # plan an in-place update, and the daily drift report would open on image
+    # lag every day main has moved — the exact thing reading the tag off the
+    # cluster was meant to keep OUT of the report, and an issue that never
+    # reaches the clean plan that closes it.
+    PARAM_IMAGE_TAG="$(tf_state_image_tag)"
+    if [ -n "$PARAM_IMAGE_TAG" ]; then
+      print_success "Planning at the tag this install's Terraform state records: ${PARAM_IMAGE_TAG}"
+    else
+      # No state, or state written before this composition had the output.
+      # Falling back to the cluster keeps the plan possible; it just cannot
+      # promise the image tag is out of it, so say so rather than let a reader
+      # take an image-lag diff for infrastructure drift.
+      print_warning "This install's Terraform state records no image tag, so the plan falls back to the tag the cluster is running. Any difference between the two will appear in the plan as a change to helm_release.kube_agents. The first apply records it and later plans are clean."
+    fi
+  fi
+
+  if [ -z "$PARAM_IMAGE_TAG" ]; then
+    PARAM_IMAGE_TAG="$(running_image_tag "$target_namespace")"
+    if [ -z "$PARAM_IMAGE_TAG" ]; then
+      print_error "Could not read the running image tag from deployment/platform-agent-gateway in '${target_namespace}'."
+      print_info "Pass --image-tag to name one instead."
+      exit 1
+    fi
+    # Validated like any other, because this one is applied like any other. It
+    # reaches terraform.tfvars and the composition, so an install that happens
+    # to be serving a mutable ref — `:latest` from a hand-rolled redeploy —
+    # must not have that ref written into the configuration by an unattended
+    # run. Reading the tag off the cluster rather than off a flag is not a
+    # reason to trust it any further.
+    validate_immutable_ref "$PARAM_IMAGE_TAG"
+    print_success "Using the tag this install is running: ${PARAM_IMAGE_TAG}"
+  fi
+
+  if [ "$PARAM_PLAN" = "true" ]; then
+    # backfill_session_kv_keys PATCHES the live Secret when a key is absent,
+    # which a plan may not do. Skipping it costs the plan nothing: the keys it
+    # would add are not Terraform-managed and so appear in no plan either way.
+    print_info "Plan mode: skipping the Session KV backfill, which would patch the live Secret."
+  else
+    print_step "3. Reconciling Pod-Scoped Session Keys"
+    backfill_session_kv_keys "$target_namespace"
+  fi
 
   # Helm never touches the crds/ directory on upgrade — that is Helm's own
   # documented behaviour, and the Terraform helm provider inherits it — so CRD
@@ -508,6 +743,34 @@ main() {
   # credentials when PERSIST_SECRETS_ON_DISK=false; the live Secret has them).
   NAMESPACE="$target_namespace" \
     write_tfvars_from_state "${repo_dir}/terraform/examples/full-install/terraform.tfvars" "$PARAM_IMAGE_TAG"
+
+  if [ "$PARAM_PLAN" = "true" ]; then
+    print_step "4. Planning (read-only)"
+    print_info "Comparing this checkout's composition against the install's Terraform state."
+    local plan_status=0
+    run_lifecycle "${repo_dir}/terraform/examples/full-install" \
+      plan -detailed-exitcode || plan_status=$?
+
+    # terraform's -detailed-exitcode contract: 0 no changes, 1 error, 2 changes.
+    # It is passed through as this script's own exit code so a caller can act on
+    # it without parsing the plan text.
+    case "$plan_status" in
+      0)
+        print_success "In sync: a full upgrade at ${PARAM_IMAGE_TAG} would change nothing."
+        write_report "PLAN_IN_SYNC"
+        ;;
+      2)
+        print_warning "Drift: this install differs from the composition in this checkout."
+        print_info "The plan above lists every difference. 'terraform apply' is what closes them; ./upgrade.sh --upgrade-mode=full is the supported way to run one."
+        write_report "PLAN_DRIFT"
+        ;;
+      *)
+        print_error "The plan could not be produced (exit ${plan_status})."
+        write_report "PLAN_FAILED"
+        ;;
+    esac
+    exit "$plan_status"
+  fi
 
   case "$PARAM_UPGRADE_MODE" in
     operator)
@@ -547,13 +810,8 @@ main() {
       # A full terraform apply against the regenerated tfvars: both image tags
       # move, and every setting recorded in install.env is re-rendered — the successor
       # of the old path's re-render of the CR from saved state.
-      (
-        cd "${repo_dir}/terraform/examples/full-install"
-        export KUBE_AGENTS_STATE_BUCKET="${KUBE_AGENTS_STATE_BUCKET:-auto}"
-        export KUBE_AGENTS_STATE_PREFIX
-        KUBE_AGENTS_STATE_PREFIX="$(tf_state_prefix)"
-        ./lifecycle.sh apply -auto-approve -input=false
-      )
+      run_lifecycle "${repo_dir}/terraform/examples/full-install" \
+        apply -auto-approve -input=false
       print_success "Full atomic upgrade completed successfully!"
       ;;
   esac

@@ -16,3 +16,4 @@ Pages in this section:
 - [**Telemetry**](/kube-agents/deploy/telemetry/) — OpenTelemetry + Prometheus + Cloud Logging.
 - [**GitOps with ArgoCD**](/kube-agents/deploy/gitops-argocd/) — standing up the reconciler that applies what the agent proposes.
 - [**CI pool project prerequisites**](/kube-agents/deploy/ci-pool-projects/) — prerequisites and setup for GCP projects in the Boskos evaluation pool.
+- [**Reconciling the long-lived environments**](/kube-agents/deploy/environment-reconcile/) — keeping `autopush` and `staging` in step with the composition rather than only re-tagging their images.

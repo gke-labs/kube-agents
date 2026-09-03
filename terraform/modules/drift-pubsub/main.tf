@@ -131,16 +131,21 @@ resource "google_logging_project_sink" "drift_audit" {
 # happened" from the consumer's side.
 #
 # writer_identity already carries the "serviceAccount:" prefix.
+#
+# `.id`, never `.name`. A replaced topic or subscription loses its whole IAM
+# policy in GCP, and a binding keyed on the plan-time-known `.name` is left out
+# of the plan that replaced it — green apply, empty policy. chat-pubsub's
+# main.tf carries the full account of that failure.
 resource "google_pubsub_topic_iam_member" "sink_writer" {
   project = var.project_id
-  topic   = google_pubsub_topic.drift_audit.name
+  topic   = google_pubsub_topic.drift_audit.id
   role    = "roles/pubsub.publisher"
   member  = google_logging_project_sink.drift_audit.writer_identity
 }
 
 resource "google_pubsub_subscription_iam_member" "detector_subscriber" {
   project      = var.project_id
-  subscription = google_pubsub_subscription.drift_audit.name
+  subscription = google_pubsub_subscription.drift_audit.id
   role         = "roles/pubsub.subscriber"
   member       = "serviceAccount:${var.detector_service_account_email}"
 }
@@ -154,7 +159,7 @@ resource "google_pubsub_subscription_iam_member" "detector_subscriber" {
 # nothing like a missing grant.
 resource "google_pubsub_subscription_iam_member" "detector_viewer" {
   project      = var.project_id
-  subscription = google_pubsub_subscription.drift_audit.name
+  subscription = google_pubsub_subscription.drift_audit.id
   role         = "roles/pubsub.viewer"
   member       = "serviceAccount:${var.detector_service_account_email}"
 }

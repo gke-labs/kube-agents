@@ -121,6 +121,21 @@ gitops_repo_for_project() {
     kube-agents-evals-13) echo "gke-agentic/kube-agents-evals-13-infra" ;;
     kube-agents-evals-14) echo "gke-agentic/kube-agents-evals-14-infra" ;;
     kube-agents-evals-15) echo "gke-agentic/kube-agents-evals-15-infra" ;;
+    kube-agents-evals-16) echo "gke-agentic/kube-agents-evals-16-infra" ;;
+    kube-agents-evals-17) echo "gke-agentic/kube-agents-evals-17-infra" ;;
+    kube-agents-evals-18) echo "gke-agentic/kube-agents-evals-18-infra" ;;
+    kube-agents-evals-19) echo "gke-agentic/kube-agents-evals-19-infra" ;;
+    kube-agents-evals-20) echo "gke-agentic/kube-agents-evals-20-infra" ;;
+    kube-agents-evals-21) echo "gke-agentic/kube-agents-evals-21-infra" ;;
+    kube-agents-evals-22) echo "gke-agentic/kube-agents-evals-22-infra" ;;
+    kube-agents-evals-23) echo "gke-agentic/kube-agents-evals-23-infra" ;;
+    kube-agents-evals-24) echo "gke-agentic/kube-agents-evals-24-infra" ;;
+    kube-agents-evals-25) echo "gke-agentic/kube-agents-evals-25-infra" ;;
+    kube-agents-evals-26) echo "gke-agentic/kube-agents-evals-26-infra" ;;
+    kube-agents-evals-27) echo "gke-agentic/kube-agents-evals-27-infra" ;;
+    kube-agents-evals-28) echo "gke-agentic/kube-agents-evals-28-infra" ;;
+    kube-agents-evals-29) echo "gke-agentic/kube-agents-evals-29-infra" ;;
+    kube-agents-evals-30) echo "gke-agentic/kube-agents-evals-30-infra" ;;
     *) return 1 ;;
   esac
 }

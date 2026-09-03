@@ -1,0 +1,57 @@
+# chat - the session persona behind a conversation.
+#
+# This is an AgentProfile spec block in the schema of
+# docs/designs/spec-subagent-profiles.md, minus the CRD wrapping (the loader's
+# tests hold the field set to the spec's table). The profile name is the file
+# name: stage 3
+# promotes this to `kind: AgentProfile` with `metadata.name: chat` and this
+# document under `spec:`, and nothing else changes.
+#
+# The image references below use the spec's placeholder idiom - nothing builds
+# or pulls them today. This file is declarative intent that parses, not
+# something the operator renders: profiles render nothing until the mode switch
+# says `next` and stage 3's dispatcher exists.
+
+description: >-
+  The conversation front door.  Holds a chat thread's context, answers directly
+  from standing state when it can, and delegates anything that needs privilege
+  or a cluster to a specialist profile.  Never provisions, never writes to a
+  GitOps repo, never touches another tenant's namespace.
+
+persona:
+  # SOUL.md, AGENTS.md, the chat skills, persona config.
+  image: <registry>/kube-agents/persona-chat:2026.08
+
+harness:
+  # The session worker: a harness speaking the headless CLI contract, wrapped
+  # by the bus adapter.
+  image: <registry>/kube-agents/agent-worker:2026.08
+  model: model-default
+  # A conversation turn is short. The long budgets belong to the profiles that
+  # run remediation loops, not to the front door.
+  maxTurns: 60
+
+bus:
+  # Read-only on the blackboard: the front door answers "are we ready to
+  # upgrade?" from standing state instead of starting a fresh diagnosis, which
+  # is the whole point of topics. It writes nothing - a front door that can
+  # write standing state can be talked into writing standing state.
+  subscribeTopics:
+    - agent.platform.upgrade-readiness
+    - shared.blueprint
+
+identity: {}
+  # Operator-created KSA, zero RoleBindings. A chat session has no business
+  # with the API server; the token exists to authenticate to the bus.
+
+lifecycle:
+  # A conversation turn that has run half an hour has stopped being a
+  # conversation turn.
+  activeDeadlineSeconds: 1800
+  ttlSecondsAfterFinished: 600
+
+concurrency: 4
+
+resources:
+  requests: { cpu: 250m, memory: 512Mi }
+  limits: { cpu: "1", memory: 2Gi }

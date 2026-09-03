@@ -14,9 +14,22 @@ on:
         options:
           - "rc"
           - "nightly"
+          # autopush and staging are here as the escape hatch for when an
+          # in-place reconcile cannot converge — #1117's Option B. They are
+          # long-lived and this workflow DESTROYS what it finds, so they are
+          # dispatch-only and guarded by confirm_destroy below.
+          # `Shared: Reconcile Environment` is the routine way to move these
+          # two, and the nightly runs it.
+          - "autopush"
+          - "staging"
       rc_tag:
         description: "Release Candidate Tag or Commit SHA (Mandatory for standalone launch)"
         required: true
+        type: string
+      confirm_destroy:
+        description: "For autopush/staging only: type the environment name to confirm the teardown"
+        required: false
+        default: ""
         type: string
   workflow_call:
     inputs:
@@ -62,6 +75,32 @@ jobs:
       CLOUDSDK_PYTHON: "/usr/bin/python3"
 
     steps:
+      # First, before the checkout, because everything after it costs minutes
+      # and this is a typo check.
+      #
+      # `rc` and `nightly` exist to be destroyed and are not gated. The other
+      # two are what agents live-test against and what the demo installs run
+      # on; a teardown there takes the cluster, every AgentPlugin and Secret on
+      # it, and any evidence somebody was midway through gathering. Nothing
+      # about picking an environment from a dropdown communicates that, so the
+      # confirmation is a second, deliberate act.
+      - name: Confirm a long-lived environment teardown
+        # Keyed on the input, not on github.event_name. Inside a called
+        # workflow that context reports the ORIGINATING event, so a future
+        # workflow_call from a scheduled parent that targeted a long-lived
+        # environment would skip both guards and destroy it unannounced. No
+        # caller passes these two today; the gate is what keeps that true.
+        if: inputs.github_environment == 'autopush' || inputs.github_environment == 'staging'
+        env:
+          TARGET: ${{ inputs.github_environment }}
+          CONFIRM: ${{ inputs.confirm_destroy }}
+        run: |
+          if [ "${CONFIRM}" != "${TARGET}" ]; then
+            echo "::error title=Teardown not confirmed::This DESTROYS the '${TARGET}' cluster and everything on it, including any live validation in progress. Re-run with confirm_destroy set to '${TARGET}'. To move '${TARGET}' without destroying it, run 'Shared: Reconcile Environment' with mode: apply instead."
+            exit 1
+          fi
+          echo "==> Teardown of '${TARGET}' confirmed."
+
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -123,6 +162,56 @@ jobs:
         with:
           version: "579.0.0"
           install_components: "beta,gke-gcloud-auth-plugin"
+
+      # A teardown that lands mid-validation destroys somebody's evidence and
+      # the ConfigMap recording that they held the lease, in the same breath —
+      # the lease lives in the namespace on the cluster this is about to remove.
+      # Refusing rather than deferring is right for a manual act: name who is on
+      # the cluster and let the operator decide.
+      #
+      # Only the long-lived environments. `rc` and `nightly` are rebuilt every
+      # pipeline run and nobody live-tests against them.
+      - name: Refuse while somebody is live-testing
+        if: inputs.github_environment == 'autopush' || inputs.github_environment == 'staging'
+        env:
+          TARGET: ${{ inputs.github_environment }}
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+          AGENT_NAMESPACE: ${{ vars.AGENT_NAMESPACE }}
+          NAMESPACE: ${{ vars.NAMESPACE }}
+        run: |
+          set -euo pipefail
+          # The workspace here is the CANDIDATE's tree (see the checkout step
+          # above), and render_install_env.sh only exists from the commit that
+          # added it. Every rc_*_validated tag older than that resolves to a
+          # tree without it, so say which of the two things went wrong rather
+          # than letting `No such file or directory` stand for both.
+          #
+          # No `if [ -f ]` fallthrough: skipping the check and carrying on to
+          # the teardown is the silent half of this, and the whole point of the
+          # step is to refuse. Pass a post-merge commit SHA as rc_tag — the
+          # input takes one — to rebuild from a tree that has the script.
+          if [ ! -f ./scripts/release/render_install_env.sh ]; then
+            echo "::error title=This candidate predates the live-test lease check::The commit being deployed has no scripts/release/render_install_env.sh, so this job cannot name the install to ask whether its lease is held — and it will not tear '${TARGET}' down without asking. Re-run with rc_tag set to a commit SHA at or after the one that added that script."
+            exit 1
+          fi
+          # Not --strict: this only has to name the install, and a missing
+          # install setting is the reconcile path's problem, not the lease's.
+          ./scripts/release/render_install_env.sh install.env
+          gcloud container clusters get-credentials "${GKE_CLUSTER_NAME}" \
+            --location "${GCP_REGION}" --project "${GCP_PROJECT_ID}"
+          status="$(python3 scripts/live_test_lease.py status --json)"
+          echo "${status}"
+          # Proceed only on a positive "free". `status --json` reports
+          # `unreachable` as its own state precisely because a cluster that
+          # could not be asked has not answered "no" — and refusing to grep for
+          # "held" is what keeps a transient API-server error from reading as
+          # an idle cluster and destroying somebody's live validation.
+          if ! printf '%s' "${status}" | grep -q '"state": "free"'; then
+            echo "::error title=The live-test lease is held, or could not be read::Refusing to tear down '${TARGET}'. A held lease means somebody is live-testing against it and a teardown destroys their evidence mid-run; an unreadable one means this job cannot tell. Ask the holder to release it (scripts/live_test_lease.py release), wait for it to expire, or fix the cluster access this job reported above."
+            exit 1
+          fi
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -219,6 +308,58 @@ jobs:
           # over repository over organization, so a repository-level one also
           # works and is the easier of the two to set by accident.
           TEARDOWN_STRICT: ${{ vars.TEARDOWN_STRICT }}
+          # Everything below is what `render_install_env.sh`'s MAPPING carries
+          # and this step used not to. Both paths read the same GitHub
+          # environment, so a setting missing here is not "defaulted on the
+          # rebuild" — it is a rebuild that installs something different from
+          # what the reconcile would have applied, with nothing in the run
+          # saying so.
+          #
+          # ALLOWED_USERS is why this is not cosmetic. install.sh seeds
+          # PARAM_ALLOWED_USERS from the environment and an absent list is not
+          # "no opinion": it renders `google_chat_allowed_users = []`, the
+          # chart omits the key, and the operator reads an absent list as
+          # allow-all. A rebuild of a long-lived environment without it opens
+          # the install to the whole domain, which is the one omission here
+          # that WIDENS access rather than removing a feature.
+          #
+          # No flags for any of these: install.sh reads them from the
+          # environment, the same mechanism the GITOPS_* pair above already
+          # relies on.
+          ALLOWED_USERS: ${{ vars.ALLOWED_USERS }}
+          # Not install settings — the empty allowlist is already what produces
+          # allow-all. Their only job is to let an operator SAY that the open
+          # allowlist is intended, which is what the guard in
+          # provision_environment.sh asks for. Same pair, same purpose, as in
+          # reconcile-environment.yml.
+          GOOGLE_CHAT_ALLOW_ALL_USERS: ${{ vars.GOOGLE_CHAT_ALLOW_ALL_USERS }}
+          SLACK_ALLOW_ALL_USERS: ${{ vars.SLACK_ALLOW_ALL_USERS }}
+          # Turns that guard on. `rc` and `nightly` are torn down and rebuilt
+          # every run and carry no allowlist by design, so they stay exempt —
+          # the same long-lived/ephemeral split `render_install_env.sh` draws
+          # with --strict.
+          LONG_LIVED_ENVIRONMENT: ${{ (inputs.github_environment == 'autopush' || inputs.github_environment == 'staging') && 'true' || '' }}
+          SLACK_ENABLED: ${{ vars.SLACK_ENABLED }}
+          SLACK_ALLOWED_USERS: ${{ vars.SLACK_ALLOWED_USERS }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_APP_TOKEN: ${{ secrets.SLACK_APP_TOKEN }}
+          SLACK_HOME_CHANNEL: ${{ vars.SLACK_HOME_CHANNEL }}
+          SLACK_HOME_CHANNEL_NAME: ${{ vars.SLACK_HOME_CHANNEL_NAME }}
+          CLUSTER_MODE: ${{ vars.CLUSTER_MODE }}
+          VERTEX_PROJECT_ID: ${{ vars.VERTEX_PROJECT_ID }}
+          VERTEX_LOCATION: ${{ vars.VERTEX_LOCATION }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          CHAT_SUB_NAME: ${{ vars.CHAT_SUB_NAME }}
+          KMS_KEYRING: ${{ vars.KMS_KEYRING }}
+          KMS_KEY: ${{ vars.KMS_KEY }}
+          PLATFORM_AGENT_CUSTOM_ROLES: ${{ vars.PLATFORM_AGENT_CUSTOM_ROLES }}
+          HERMES_DASHBOARD_ENABLED: ${{ vars.HERMES_DASHBOARD_ENABLED }}
+          THIRD_PARTY_REGISTRY_PREFIX: ${{ vars.THIRD_PARTY_REGISTRY_PREFIX }}
+          # The installer's own spelling, from the CI-side name — the same
+          # translation render_install_env.sh's `NAMESPACE:AGENT_NAMESPACE`
+          # mapping makes. The bare NAMESPACE fallback is staging's spelling.
+          NAMESPACE: ${{ vars.AGENT_NAMESPACE || vars.NAMESPACE }}
         # provision_environment.sh is this change's name for what candidates up
         # to and including rc_2608310656_cf038a2_validated carry as
         # provision_rc_environment.sh. get_latest_validated_rc_tag has no recency

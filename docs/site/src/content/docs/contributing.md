@@ -30,7 +30,7 @@ This project follows [Google's Open Source Community Guidelines](https://opensou
 ## Local validation
 
 Before pushing, run the checks CI enforces. This section is about running the tests; for deciding
-where a new one belongs, `docs/testing-map.md` maps the nine test homes to their runners.
+where a new one belongs, `docs/testing-map.md` maps the ten test homes to their runners.
 
 - **Prettier** on changed Markdown and YAML (what the `Prettier Check` CI job enforces — it checks changed `.md`/`.yaml`/`.yml` files):
 
@@ -64,6 +64,12 @@ where a new one belongs, `docs/testing-map.md` maps the nine test homes to their
 
   ```bash
   make -C k8s-operator test   # runs manifests, generate, fmt, vet, then go test — this is what the Operator Tests CI job runs
+  ```
+
+- **A2A module** (if you touched `a2a/`):
+
+  ```bash
+  cd a2a && go vet ./... && go test -race ./...   # what the A2A Module Tests CI job runs; the conformance suite uses an embedded JetStream server, no cluster needed
   ```
 
 - **Integration seams** (if you touched a component that another one talks to across a process, language, or protocol boundary):

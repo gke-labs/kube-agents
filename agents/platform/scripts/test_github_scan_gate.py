@@ -28,6 +28,7 @@ import io
 import json
 import subprocess
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
@@ -1277,6 +1278,49 @@ class PrCommentsSweepTest(unittest.TestCase):
         provider = FakeProvider()
         self._sweep(provider)
         self.assertTrue(provider.preflighted)
+
+
+class ResolverPathTest(unittest.TestCase):
+    def test_finds_resolver_in_platform_profile(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            target = home / gate.PLATFORM_PROFILE_DIR / gate.RESOLVER_REL
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("#!/usr/bin/env python3\n")
+            with mock.patch("github_scan_gate.hermes_home", return_value=home):
+                self.assertEqual(gate._resolver_path(), target)
+
+    def test_finds_resolver_in_home_root(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            target = home / gate.RESOLVER_REL
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("#!/usr/bin/env python3\n")
+            with mock.patch("github_scan_gate.hermes_home", return_value=home):
+                self.assertEqual(gate._resolver_path(), target)
+
+    def test_finds_resolver_in_platform_template(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "data"
+            home.mkdir(parents=True, exist_ok=True)
+            template_root = Path(tmpdir) / "template"
+            target = template_root / gate.RESOLVER_REL
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("#!/usr/bin/env python3\n")
+            with mock.patch("github_scan_gate.hermes_home", return_value=home), \
+                 mock.patch.object(gate, "PLATFORM_TEMPLATE_DIR", str(template_root)):
+                self.assertEqual(gate._resolver_path(), target)
+
+    def test_fallback_returns_home_resolver_rel(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "profiles" / "platform"
+            home.mkdir(parents=True, exist_ok=True)
+            expected = home / gate.RESOLVER_REL
+            nonexistent = str(Path(tmpdir) / "nonexistent" / "github_scan_gate.py")
+            with mock.patch("github_scan_gate.hermes_home", return_value=home), \
+                 mock.patch.object(gate, "PLATFORM_TEMPLATE_DIR", str(Path(tmpdir) / "nonexistent")), \
+                 mock.patch.object(gate, "__file__", nonexistent):
+                self.assertEqual(gate._resolver_path(), expected)
 
 
 if __name__ == "__main__":
