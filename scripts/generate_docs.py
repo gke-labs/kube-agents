@@ -124,6 +124,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
     "Observability": [
         "gke-basics",
         "gke-observability",
+        "gke-runtime-telemetry-audit",
         "kube-agents-observability",
     ],
     "Reliability": [
@@ -153,6 +154,7 @@ CRON_CADENCE = {
     "50 8 * * *": "Daily 08:50",
     "0 9 * * *": "Daily 09:00",
     "20 9 * * *": "Daily 09:20",
+    "50 9 * * *": "Daily 09:50",
     "0 10 * * *": "Daily 10:00",
     "0 11 * * *": "Daily 11:00",
     "0 12 * * *": "Daily 12:00",
