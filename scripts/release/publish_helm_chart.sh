@@ -40,10 +40,7 @@ RELEASE_COMMIT="$(resolve_release_commit "${RELEASE_VERSION}")"
 
 echo "🔍 Extracting Helm chart from release tag '${RELEASE_VERSION}' (commit ${RELEASE_COMMIT:0:7})..."
 TMP_EXTRACT_DIR="$(mktemp -d)"
-if ! git archive "${RELEASE_COMMIT}" charts/kube-agents | tar -x -C "${TMP_EXTRACT_DIR}"; then
-  echo "❌ ERROR: Failed to extract charts/kube-agents from commit ${RELEASE_COMMIT:0:7}!" >&2
-  exit 1
-fi
+extract_commit_tree "${RELEASE_COMMIT}" "${TMP_EXTRACT_DIR}" charts/kube-agents
 CHART_DIR="${TMP_EXTRACT_DIR}/charts/kube-agents"
 
 if [ ! -d "${CHART_DIR}" ]; then

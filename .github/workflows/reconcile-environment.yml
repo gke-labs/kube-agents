@@ -1,0 +1,236 @@
+name: "Shared: Reconcile Environment"
+
+# Applies terraform/examples/full-install to an environment that already exists,
+# or reports what applying it would change.
+#
+# This is the in-place half of #1117. deploy-environment.yml is the other half:
+# it destroys the environment and builds it again, which is right for `rc` and
+# `nightly` — they exist to prove an install works from nothing — and wrong for
+# `autopush` and `staging`, which people live-test against and which hold state
+# nobody wants rebuilt nightly.
+#
+# In-place is also the only path that exercises what a real user upgrading an
+# existing install goes through. Nothing else in CI covers it.
+
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    inputs:
+      github_environment:
+        description: "GitHub environment supplying the GCP project, region, cluster and install settings"
+        required: true
+        type: string
+      mode:
+        description: "plan (read-only) or apply"
+        required: true
+        type: string
+      image_tag:
+        description: "Image tag to reconcile to. Empty holds the images where they are: a plan uses the tag Terraform state records, an apply keeps the one the install is running."
+        required: false
+        default: ""
+        type: string
+      lease_policy:
+        description: "What an apply does when the live-test lease is held: defer, fail or ignore"
+        required: false
+        default: "defer"
+        type: string
+    outputs:
+      result:
+        description: "planned, applied, deferred or failed"
+        value: ${{ jobs.reconcile.outputs.result }}
+      drift:
+        description: "true, false or unknown — only meaningful for mode: plan"
+        value: ${{ jobs.reconcile.outputs.drift }}
+  #checkov:skip=CKV_GHA_7:Standalone launch has to name the environment and the mode
+  workflow_dispatch:
+    inputs:
+      github_environment:
+        description: "GitHub environment to reconcile"
+        required: true
+        type: choice
+        options:
+          - "autopush"
+          - "staging"
+          - "rc"
+          - "nightly"
+      mode:
+        description: "plan (read-only) or apply"
+        required: true
+        default: "plan"
+        type: choice
+        options:
+          - "plan"
+          - "apply"
+      image_tag:
+        description: "Image tag to reconcile to (optional; keeps the running tag when empty)"
+        required: false
+        default: ""
+        type: string
+      lease_policy:
+        description: "What to do when somebody is live-testing against this install"
+        required: false
+        default: "fail"
+        type: choice
+        options:
+          - "fail"
+          - "defer"
+          - "ignore"
+
+jobs:
+  reconcile:
+    name: ${{ inputs.mode }} ${{ inputs.github_environment }}
+    # A fork inherits workflow_dispatch but none of the credentials, and this
+    # one authenticates to GCP. Repeated on the job rather than left to cascade.
+    if: github.repository == 'gke-labs/kube-agents'
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.github_environment }}
+    # Shared with deploy-environment.yml's group for the same environment, so a
+    # reconcile and a teardown-and-rebuild of the same cluster can never run at
+    # once. Not shared with the redeploy workflows: GitHub queues only one
+    # pending run per group, so a group they all sat in would let them evict
+    # each other. reconcile_environment.sh waits those out by asking the API
+    # instead.
+    concurrency:
+      group: ${{ inputs.github_environment }}-environment
+      cancel-in-progress: false
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+      # `gh run list`, for the in-flight redeploy check.
+      actions: read
+    outputs:
+      result: ${{ steps.reconcile.outputs.result }}
+      drift: ${{ steps.reconcile.outputs.drift }}
+      plan_log: ${{ steps.reconcile.outputs.plan_log }}
+    env:
+      CLOUDSDK_PYTHON: "/usr/bin/python3"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The revision being reconciled TO, not the one the caller happens to
+          # sit on. `upgrade.sh --image-tag=X` refuses a checkout whose HEAD is
+          # not X (verify_local_source_ref), and the nightly's whole job is to
+          # promote a candidate OLDER than the commit it was dispatched from --
+          # so without this, every staging reconcile exits 1 on a version
+          # mismatch before applying anything. Worse than a red job: the
+          # nightly's promotion job is deliberately decoupled from this one's
+          # outcome, so the tag would still be pushed and staging's images would
+          # move with its infrastructure left exactly as stale as before.
+          #
+          # It is also the right thing on its own terms. An environment runs one
+          # commit: its images, its Helm values and its Terraform composition
+          # come from the same tree, and reconciling the candidate's images with
+          # main's composition would be a combination nothing has ever tested.
+          #
+          # Empty is the tagless case -- autopush, and every plan -- where
+          # actions/checkout falls back to the caller's ref, which is what those
+          # want: main's composition, images left where they are.
+          ref: ${{ inputs.image_tag }}
+          persist-credentials: false
+
+      - name: Authenticate to GCP via Workload Identity Federation (WIF)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Google Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+        with:
+          version: "579.0.0"
+          install_components: "beta,gke-gcloud-auth-plugin"
+
+      # terraform_wrapper: false for the reason deploy-environment.yml records —
+      # lifecycle.sh reads terraform's stdout directly, and the wrapper re-prints
+      # it. Here it matters twice over: `plan -detailed-exitcode` reports drift
+      # through its exit code, and the wrapper does not preserve one.
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.15.8"
+          terraform_wrapper: false
+
+      - name: Reconcile
+        id: reconcile
+        env:
+          CLOUDSDK_CORE_DISABLE_PROMPTS: "1"
+          RECONCILE_MODE: ${{ inputs.mode }}
+          GITHUB_ENVIRONMENT: ${{ inputs.github_environment }}
+          IMAGE_TAG: ${{ inputs.image_tag }}
+          LEASE_POLICY: ${{ inputs.lease_policy }}
+          GH_TOKEN: ${{ github.token }}
+          # Every install setting, under the names render_install_env.sh maps.
+          # An environment missing one of the required ones fails there, naming
+          # all of them at once — see #1117 §1, where autopush and staging were
+          # found carrying almost none of these.
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
+          CLUSTER_MODE: ${{ vars.CLUSTER_MODE }}
+          REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
+          THIRD_PARTY_REGISTRY_PREFIX: ${{ vars.THIRD_PARTY_REGISTRY_PREFIX }}
+          AGENT_NAMESPACE: ${{ vars.AGENT_NAMESPACE }}
+          NAMESPACE: ${{ vars.NAMESPACE }}
+          MODEL_PROVIDER: ${{ vars.MODEL_PROVIDER }}
+          MODEL_DEFAULT_NAME: ${{ vars.MODEL_DEFAULT_NAME }}
+          VERTEX_PROJECT_ID: ${{ vars.VERTEX_PROJECT_ID }}
+          VERTEX_LOCATION: ${{ vars.VERTEX_LOCATION }}
+          GOOGLE_CHAT_ENABLED: ${{ vars.GOOGLE_CHAT_ENABLED }}
+          GOOGLE_CHAT_MODE: ${{ vars.GOOGLE_CHAT_MODE }}
+          CHAT_TOPIC_NAME: ${{ vars.CHAT_TOPIC_NAME }}
+          CHAT_SUB_NAME: ${{ vars.CHAT_SUB_NAME }}
+          ALLOWED_USERS: ${{ vars.ALLOWED_USERS }}
+          SLACK_ENABLED: ${{ vars.SLACK_ENABLED }}
+          SLACK_ALLOWED_USERS: ${{ vars.SLACK_ALLOWED_USERS }}
+          # Not install.env keys, and deliberately so: an empty allowlist is
+          # already what makes the operator admit everyone. These say that the
+          # empty one is intended, which is the difference between an open
+          # install and a variable somebody cleared by accident.
+          GOOGLE_CHAT_ALLOW_ALL_USERS: ${{ vars.GOOGLE_CHAT_ALLOW_ALL_USERS }}
+          SLACK_ALLOW_ALL_USERS: ${{ vars.SLACK_ALLOW_ALL_USERS }}
+          SLACK_HOME_CHANNEL: ${{ vars.SLACK_HOME_CHANNEL }}
+          SLACK_HOME_CHANNEL_NAME: ${{ vars.SLACK_HOME_CHANNEL_NAME }}
+          ENABLE_GVISOR: ${{ vars.ENABLE_GVISOR }}
+          ENABLE_GKE_BACKUP_PLAN: ${{ vars.ENABLE_GKE_BACKUP_PLAN }}
+          PLATFORM_AGENT_PERMISSION_SET: ${{ vars.PLATFORM_AGENT_PERMISSION_SET }}
+          PLATFORM_AGENT_CUSTOM_ROLES: ${{ vars.PLATFORM_AGENT_CUSTOM_ROLES }}
+          MEMORY_PROVIDER: ${{ vars.MEMORY_PROVIDER }}
+          USER_PROFILE_ENABLED: ${{ vars.USER_PROFILE_ENABLED }}
+          HERMES_DASHBOARD_ENABLED: ${{ vars.HERMES_DASHBOARD_ENABLED }}
+          KMS_KEYRING: ${{ vars.KMS_KEYRING }}
+          KMS_KEY: ${{ vars.KMS_KEY }}
+          # GITOPS_, not GH_ORG/GH_REPO: that pair names the RELEASE repository,
+          # and pointing the minter at it would scope a live GitHub App token at
+          # this repository. deploy-environment.yml carries the same warning.
+          GITOPS_ORG: ${{ vars.GITOPS_ORG }}
+          GITOPS_REPO: ${{ vars.GITOPS_REPO }}
+          GITHUB_APP_ID: ${{ secrets.GH_APP_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_APP_TOKEN: ${{ secrets.SLACK_APP_TOKEN }}
+        run: ./scripts/release/reconcile_environment.sh
+
+      # The plan text, for the drift report to quote and for a human to read
+      # once the job log has aged out. Safe to publish: every credential
+      # variable in terraform/examples/full-install/variables.tf carries
+      # `sensitive = true`, so terraform renders them as `(sensitive value)`.
+      # Adding an unmarked credential variable would change that — tests/
+      # test_reconcile_environment.py asserts the marking so it cannot happen
+      # quietly.
+      #
+      # always(), because a failed plan is the artifact worth having.
+      - name: Upload the plan
+        if: always() && steps.reconcile.outputs.plan_log != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: reconcile-${{ inputs.github_environment }}-${{ inputs.mode }}
+          path: ${{ steps.reconcile.outputs.plan_log }}
+          if-no-files-found: warn
+          retention-days: 14

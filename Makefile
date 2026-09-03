@@ -144,6 +144,82 @@ PYTHON_TEST_DIRS := $(sort $(dir \
 	$(wildcard tests/test_*.py) \
 	$(wildcard tests/memory/test_*.py)))
 
+# How many of those directories `test-python` and `coverage` run at once. They
+# are separate `python3` processes that share nothing -- each cd's into its own
+# directory, servers in the seam tier bind port 0, and fixtures go through
+# tempfile -- so the sweep costs its slowest single directory rather than the
+# sum of all of them. Four directories are most of that sum, so the win is
+# large and then flat: raising this past a handful buys nothing.
+#
+# Set it to 1 to serialise. That is for reproducing a failure you suspect is
+# concurrency's doing, or for a machine you need the cores back on -- not for
+# readability, since the sweep captures each directory's output either way:
+#   make test-python PYTHON_TEST_JOBS=1
+PYTHON_TEST_JOBS ?= $(shell nproc 2>/dev/null || echo 4)
+
+# The sweep over PYTHON_TEST_DIRS that `test-python` and `coverage` both run.
+# $(1) is the command executed inside each directory, and it is the only thing
+# the two callers differ by.
+#
+# One macro rather than two loops because that mirroring is load-bearing and
+# used to be only asserted in a comment: a coverage target that walks the
+# directories differently measures a different suite than the one that gates,
+# and nothing would say so. Sharing the sweep makes it structural.
+#
+# Contract: leaves `$$failed` set to a space-separated list of the directories
+# whose command exited non-zero, empty when none did. The caller decides what
+# that means -- test-python exits 1, coverage prints a note and carries on.
+#
+# Two properties the sequential loop had, kept by different means now that the
+# directories run concurrently. Every directory still runs even after another
+# fails: xargs keeps going, and each worker records its own verdict in a file
+# because a variable assigned in a subprocess cannot come back to the parent.
+# And each directory's output still arrives as a labelled block, because it is
+# captured to its own file and printed afterwards in PYTHON_TEST_DIRS order --
+# concurrent writers to one stream interleave mid-line and the "==> dir" headers
+# stop meaning anything. What that costs is progress, and a run killed mid-sweep
+# (a CI cancellation, a step timeout) loses the captured output entirely, so
+# each worker prints a line as it finishes to leave something behind.
+#
+# The verdict file is per-directory and read as fail-closed: a directory whose
+# .rc is missing or non-zero counts as failed. One shared append-only file would
+# be shorter, but a failed append -- a full TMPDIR, which 25 concurrent suites
+# make likelier than the old loop did -- would silently drop a red directory and
+# let the gate pass. Absence has to mean failure, not success.
+#
+# $(1) is interpolated into a single-quoted sh -c string, so it must not contain
+# a single quote. It also must not contain a comma: $(call) splits arguments on
+# commas before the body ever sees them, so `python3 -c "import os, sys"` would
+# arrive silently truncated at the comma. Both callers avoid each.
+define sweep_python_test_dirs
+work=$$(mktemp -d); \
+trap 'rm -rf "$$work"' EXIT INT TERM; \
+export work; \
+printf '%s\n' $(PYTHON_TEST_DIRS) | xargs -P $(PYTHON_TEST_JOBS) -I{} sh -c ' \
+	dir="$$1"; \
+	stem="$$work/$$(printf "%s" "$$dir" | tr "/" "_")"; \
+	if (cd "$$dir" && $(1)) >"$$stem.log" 2>&1; then \
+		rc=0; printf "    ok  %s\n" "$$dir"; \
+	else \
+		rc=1; printf "  FAIL  %s\n" "$$dir"; \
+	fi; \
+	echo "$$rc" >"$$stem.rc" \
+' _ {}; \
+echo; \
+failed=""; \
+for dir in $(PYTHON_TEST_DIRS); do \
+	echo "==> $$dir"; \
+	stem="$$work/$$(printf "%s" "$$dir" | tr "/" "_")"; \
+	if [ -f "$$stem.log" ]; then \
+		cat "$$stem.log"; \
+	else \
+		echo "no output captured -- this directory never ran"; \
+	fi; \
+	[ "$$(cat "$$stem.rc" 2>/dev/null)" = "0" ] || failed="$$failed $$dir"; \
+done; \
+failed=$${failed# }
+endef
+
 # The same packages as `import` names rather than distribution names, because
 # that is what the preflight below can actually test for: python-dotenv imports
 # as `dotenv` and pyyaml as `yaml`.
@@ -210,34 +286,39 @@ test-python: ## Run the Python unit tests outside k8s-operator/.
 # tests) never ran at all, while the output still ended in a familiar-looking
 # failure. A red run that hides four green directories is survivable; one that
 # hides an untested directory is not.
-	@failed=""; \
-	for dir in $(PYTHON_TEST_DIRS); do \
-		echo "==> $$dir"; \
-		(cd $$dir && PYTHONPATH="$(CURDIR):$(CURDIR)/agentplugins/lib:$(CURDIR)/agentplugins/pubsub-platform:$${PYTHONPATH:-}" python3 -m unittest discover -p "test_*.py") || failed="$$failed $$dir"; \
-	done; \
+#
+# Both survive the move to concurrency; sweep_python_test_dirs says how.
+	@export PYTHONPATH="$(CURDIR):$(CURDIR)/agentplugins/lib:$(CURDIR)/agentplugins/pubsub-platform:$${PYTHONPATH:-}"; \
+	$(call sweep_python_test_dirs,python3 -m unittest discover -p "test_*.py"); \
 	missing=""; \
 	for mod in $(PYTHON_TEST_IMPORTS); do \
 		python3 -c "import $$mod" >/dev/null 2>&1 || missing="$$missing $$mod"; \
 	done; \
 	if [ -n "$$failed" ]; then \
 		echo; \
-		echo "Failing test directories:$$failed"; \
+		echo "Failing test directories: $$failed"; \
 		if [ -n "$$missing" ]; then \
 			echo "Missing third-party imports:$$missing -- run: make test-python-deps"; \
 		fi; \
 		exit 1; \
 	fi
 
-# Coverage runs the same suite the same way -- the loop below is test-python's
-# loop with `coverage run` in place of `python3`. That mirroring is the point:
-# a coverage target that discovers tests any other way measures a different
-# suite. Two things differ. COVERAGE_ROOT pins the measured tree to the
-# repository root (the loop cd's into each directory, and .coveragerc reads the
-# variable because `source` cannot be relative from seventeen places), and
-# COVERAGE_FILE parks every per-directory data file in one place for
-# `coverage combine`. Failing directories are reported but do not stop the
-# measurement: test-python is the gate, this is the meter, and the 13
-# pre-existing failures must not hide the number for the other directories.
+# Coverage runs the same suite the same way -- literally the same sweep as
+# test-python, through sweep_python_test_dirs, with `coverage run` in place of
+# `python3`. That mirroring is the point: a coverage target that discovers tests
+# any other way measures a different suite. Two things differ. COVERAGE_ROOT
+# pins the measured tree to the repository root (the sweep cd's into each
+# directory, and .coveragerc reads the variable because `source` cannot be
+# relative from seventeen places), and COVERAGE_FILE parks every per-directory
+# data file in one place for `coverage combine`. Failing directories are
+# reported but do not stop the measurement: test-python is the gate, this is the
+# meter, and the 13 pre-existing failures must not hide the number for the other
+# directories.
+#
+# Concurrency needs nothing extra here: .coveragerc already sets parallel = True,
+# so each process writes its own data file suffixed with host and pid and the
+# `coverage combine` below merges them. That setting was there for the
+# per-directory loop, and it is the same property concurrent directories need.
 COVERAGE_DIR := .coverage-data
 
 coverage: ## Measure unit-test coverage; writes coverage.xml (and coverage-go.xml when tooling allows).
@@ -247,16 +328,11 @@ coverage: ## Measure unit-test coverage; writes coverage.xml (and coverage-go.xm
 		echo "ERROR: PYTHON_TEST_DIRS expanded to nothing; the globs above are stale."; \
 		exit 1; \
 	fi
-	@failed=""; \
-	for dir in $(PYTHON_TEST_DIRS); do \
-		echo "==> $$dir"; \
-		(cd $$dir && COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage \
-			PYTHONPATH="$(CURDIR):$${PYTHONPATH:-}" \
-			python3 -m coverage run --rcfile=$(CURDIR)/.coveragerc -m unittest discover -p "test_*.py") \
-			|| failed="$$failed $$dir"; \
-	done; \
+	@export COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage; \
+	export PYTHONPATH="$(CURDIR):$${PYTHONPATH:-}"; \
+	$(call sweep_python_test_dirs,python3 -m coverage run --rcfile=$(CURDIR)/.coveragerc -m unittest discover -p "test_*.py"); \
 	if [ -n "$$failed" ]; then \
-		echo "Note: failing test directories (their coverage is still recorded):$$failed"; \
+		echo "Note: failing test directories (their coverage is still recorded): $$failed"; \
 	fi
 	@COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage \
 		python3 -m coverage combine --rcfile=$(CURDIR)/.coveragerc

@@ -481,5 +481,64 @@ class GitHubTokenRefreshTest(unittest.TestCase):
                 self.assertEqual(1, cm.exception.code)
 
 
+class LooksLikeAuthFailureTest(unittest.TestCase):
+    def _proc(self, returncode: int, stderr: str = ""):
+        import subprocess
+        return subprocess.CompletedProcess(["gh"], returncode, stdout="", stderr=stderr)
+
+    def test_auth_status_failure_is_always_auth_failure(self):
+        self.assertTrue(
+            github_token_refresh.looks_like_auth_failure(["auth", "status"], self._proc(1))
+        )
+
+    def test_bad_credentials_and_401(self):
+        self.assertTrue(
+            github_token_refresh.looks_like_auth_failure(
+                ["api"], self._proc(1, "HTTP 401: Bad credentials")
+            )
+        )
+        self.assertTrue(
+            github_token_refresh.looks_like_auth_failure(
+                ["api"], self._proc(1, "requires authentication")
+            )
+        )
+        self.assertTrue(
+            github_token_refresh.looks_like_auth_failure(
+                ["api"], self._proc(1, "token is invalid")
+            )
+        )
+
+    def test_success_and_non_auth_failures(self):
+        self.assertFalse(
+            github_token_refresh.looks_like_auth_failure(["api"], self._proc(0))
+        )
+        self.assertFalse(
+            github_token_refresh.looks_like_auth_failure(
+                ["api"], self._proc(1, "HTTP 404: Not Found")
+            )
+        )
+        self.assertFalse(
+            github_token_refresh.looks_like_auth_failure(
+                ["api"], self._proc(github_token_refresh.GH_MISSING_RC, "binary not found")
+            )
+        )
+        self.assertFalse(
+            github_token_refresh.looks_like_auth_failure(
+                ["api"], self._proc(github_token_refresh.GH_TIMEOUT_RC, "timed out")
+            )
+        )
+
+
+class RefreshCredentialsOnceTest(unittest.TestCase):
+    def test_refresh_credentials_once_at_most_once(self):
+        github_token_refresh.reset_refresh_state()
+        with patch("gitops_workspace.get_managed_github_repos", return_value=["acme/toolkit"]), \
+             patch("github_token_refresh.refresh_git_credentials") as mock_refresh:
+            self.assertTrue(github_token_refresh.refresh_credentials_once())
+            mock_refresh.assert_called_once_with("acme/toolkit")
+            self.assertFalse(github_token_refresh.refresh_credentials_once())
+            self.assertEqual(mock_refresh.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

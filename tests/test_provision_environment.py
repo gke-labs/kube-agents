@@ -10,6 +10,8 @@ import subprocess
 import tempfile
 import unittest
 
+import yaml
+
 from tests.testing.common import (
     MOCK_GOOGLE_CHAT_MODE,
     TRUTHY_BOOLEAN_INPUTS,
@@ -613,6 +615,242 @@ exit {install_exit}
             proc.returncode, 0, "a half-configured minter must not provision an RC"
         )
         self.assertIn("half-configured", proc.stdout + proc.stderr)
+
+
+class LongLivedAllowlistGuardTest(GithubMinterInputsTest):
+    """The rebuild path's copy of the guard render_install_env.sh runs under --strict.
+
+    `deploy-environment.yml` offers `autopush` and `staging` in its dropdown, so
+    this script is a route into a long-lived environment and not only into an
+    ephemeral one. An empty allowlist is the single omission on that route that
+    WIDENS access: install.sh renders `google_chat_allowed_users = []`, the
+    chart's `with` omits the key, and the operator reads an absent list as
+    allow-all. A rebuild would otherwise hand the whole domain an install that
+    had been restricted, with nothing in the run saying so.
+
+    Inherits the harness, not the assertions: `_run` executes the real script
+    with a mock install.sh, so these drive the guard rather than reading the
+    source for it.
+    """
+
+    _LONG_LIVED = {"LONG_LIVED_ENVIRONMENT": "true", "GOOGLE_CHAT_ENABLED": "true"}
+
+    @staticmethod
+    def _install_ran(tmp_dir):
+        """The mock records itself in the calls log, not on stdout."""
+        log = tmp_dir / MOCK_CALLS_LOG
+        return log.exists() and MOCK_INSTALL_SUCCESS_SIGNAL in log.read_text()
+
+    def test_a_long_lived_rebuild_with_no_allowlist_is_refused(self):
+        proc, tmp_dir = self._run(dict(self._LONG_LIVED))
+        self.assertNotEqual(
+            proc.returncode,
+            0,
+            "a rebuild that opens the allowlist must not proceed to the teardown",
+        )
+        self.assertIn("Google Chat is enabled with no allowlist", proc.stdout)
+        self.assertFalse(
+            self._install_ran(tmp_dir),
+            "the guard has to fire before install.sh, and before the teardown",
+        )
+        self.assertNotIn(
+            "Tearing down",
+            proc.stdout,
+            "the guard sits above the teardown; refusing after it destroys the "
+            "environment it was protecting",
+        )
+
+    def test_a_separator_only_allowlist_names_nobody_and_is_refused(self):
+        """Non-empty to `-z`, empty to the installer — the same gap the renderer has.
+
+        hcl_csv_list splits on `, \\t\\n` and drops empty items, so a list
+        cleared down to a stray comma renders `[]` exactly as an unset one
+        does. Both guards therefore have to measure emptiness that way.
+        """
+        for value in (" ", ",", ", ,", ",,"):
+            with self.subTest(value=value):
+                proc, _ = self._run({**self._LONG_LIVED, "ALLOWED_USERS": value})
+                self.assertNotEqual(
+                    proc.returncode, 0, f"{value!r} names no users but was accepted"
+                )
+                self.assertIn("Google Chat is enabled with no allowlist", proc.stdout)
+
+    def test_a_real_allowlist_provisions(self):
+        proc, tmp_dir = self._run(
+            {**self._LONG_LIVED, "ALLOWED_USERS": "a@example.com"}
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(self._install_ran(tmp_dir))
+
+    def test_allow_all_has_to_be_stated_and_then_provisions(self):
+        proc, tmp_dir = self._run(
+            {**self._LONG_LIVED, "GOOGLE_CHAT_ALLOW_ALL_USERS": "true"}
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(self._install_ran(tmp_dir))
+
+    def test_slack_is_guarded_on_its_own_switch(self):
+        proc, _ = self._run(
+            {
+                "LONG_LIVED_ENVIRONMENT": "true",
+                "SLACK_ENABLED": "true",
+                "SLACK_ALLOWED_USERS": "",
+            }
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("Slack is enabled with no allowlist", proc.stdout)
+
+    def test_both_platforms_are_reported_in_one_run(self):
+        proc, _ = self._run({**self._LONG_LIVED, "SLACK_ENABLED": "true"})
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("Google Chat is enabled with no allowlist", proc.stdout)
+        self.assertIn("Slack is enabled with no allowlist", proc.stdout)
+
+    def test_enabled_means_what_it_means_to_the_installer(self):
+        """A guard with its own vocabulary is a guard with its own blind spot."""
+        for spelling in TRUTHY_BOOLEAN_INPUTS:
+            with self.subTest(spelling=spelling):
+                proc, _ = self._run(
+                    {
+                        "LONG_LIVED_ENVIRONMENT": "true",
+                        "GOOGLE_CHAT_ENABLED": spelling,
+                    }
+                )
+                self.assertNotEqual(
+                    proc.returncode, 0, f"{spelling!r} was not read as enabled"
+                )
+
+    def test_long_lived_is_recognised_in_every_truthy_spelling(self):
+        for spelling in TRUTHY_BOOLEAN_INPUTS:
+            with self.subTest(spelling=spelling):
+                proc, _ = self._run(
+                    {
+                        "LONG_LIVED_ENVIRONMENT": spelling,
+                        "GOOGLE_CHAT_ENABLED": "true",
+                    }
+                )
+                self.assertNotEqual(
+                    proc.returncode, 0, f"LONG_LIVED_ENVIRONMENT={spelling!r} was ignored"
+                )
+
+    def test_an_ephemeral_environment_is_deliberately_exempt(self):
+        """`rc` and `nightly` carry GOOGLE_CHAT_ENABLED=true and no allowlist today.
+
+        They are destroyed and rebuilt every run and no real user reaches them,
+        so the guard must not fire — an unconditional one would fail the RC
+        pipeline on its next run rather than protect anything.
+        """
+        proc, tmp_dir = self._run({"GOOGLE_CHAT_ENABLED": "true"})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("no allowlist", proc.stdout)
+        self.assertTrue(self._install_ran(tmp_dir))
+
+    def test_an_integration_that_is_off_needs_no_allowlist(self):
+        proc, _ = self._run(
+            {"LONG_LIVED_ENVIRONMENT": "true", "GOOGLE_CHAT_ENABLED": "false"}
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+
+class DeployEnvironmentCarriesTheInstallSettingsTest(unittest.TestCase):
+    """A setting the workflow never exports is unset everywhere, permanently.
+
+    `render_install_env.sh`'s MAPPING is the contract for what reconciling a
+    long-lived environment carries, and its left-hand column is the name the
+    installer reads. `deploy-environment.yml` rebuilds the same two
+    environments from scratch, from the same GitHub environment, and
+    `provision_environment.sh` runs `./install.sh` directly — so the step's
+    `env:` block is how those settings reach it. A name in the mapping and not
+    in that block is not "defaulted on the rebuild"; it is a rebuild that
+    installs something other than what the reconcile would have applied.
+
+    This is the check that would have caught the gap, and the one the guard in
+    provision_environment.sh depends on: a guard keyed on ALLOWED_USERS can
+    only refuse an empty one if the workflow hands it the variable at all.
+    """
+
+    _WORKFLOW = _REPO_ROOT / ".github" / "workflows" / "deploy-environment.yml"
+    _RENDERER = _REPO_ROOT / "scripts" / "release" / "render_install_env.sh"
+    _STEP = "Provision Environment in GCP"
+
+    # Carried some other way, and each for a stated reason.
+    _NOT_IN_ENV = {
+        # The three coordinates go as explicit install.sh flags, built from
+        # GCP_PROJECT_ID / GCP_REGION / GKE_CLUSTER_NAME.
+        "PROJECT_ID",
+        "REGION",
+        "CLUSTER_NAME",
+        # Derived, not mapped: the workflow passes the CI-side MEMORY_PROVIDER
+        # and both paths translate it into the installer's MEMORY vocabulary.
+        "MEMORY",
+    }
+
+    def _mapping_keys(self):
+        """The install.env keys the renderer writes — the left column."""
+        block = self._RENDERER.read_text().split('MAPPING="', 1)[1].split('"', 1)[0]
+        return {
+            line.split(":", 1)[0].strip()
+            for line in block.splitlines()
+            if ":" in line
+        }
+
+    def _provision_step_env(self):
+        workflow = yaml.safe_load(self._WORKFLOW.read_text())
+        for job in workflow["jobs"].values():
+            for step in job.get("steps", []):
+                if step.get("name") == self._STEP:
+                    return set(step.get("env", {}))
+        self.fail(f"no step named {self._STEP!r} in {self._WORKFLOW.name}")
+
+    def test_every_mapped_setting_reaches_the_rebuild_path(self):
+        missing = sorted(
+            self._mapping_keys() - self._NOT_IN_ENV - self._provision_step_env()
+        )
+        self.assertEqual(
+            missing,
+            [],
+            "render_install_env.sh writes these into install.env for the "
+            "reconcile path, but deploy-environment.yml's provision step never "
+            "puts them in the environment install.sh reads — so a "
+            "destroy-and-rebuild of autopush or staging installs without them: "
+            f"{missing}",
+        )
+
+    def test_the_allowlist_guard_gets_what_it_needs(self):
+        """A guard keyed on a variable the workflow never sets can never fire."""
+        step_env = self._provision_step_env()
+        for name in (
+            "ALLOWED_USERS",
+            "SLACK_ENABLED",
+            "SLACK_ALLOWED_USERS",
+            "GOOGLE_CHAT_ALLOW_ALL_USERS",
+            "SLACK_ALLOW_ALL_USERS",
+            "LONG_LIVED_ENVIRONMENT",
+        ):
+            with self.subTest(name=name):
+                self.assertIn(name, step_env)
+
+    def test_the_guard_is_armed_for_the_long_lived_environments_only(self):
+        """The dropdown's two long-lived options, and neither ephemeral one."""
+        workflow = yaml.safe_load(self._WORKFLOW.read_text())
+        dispatch = workflow[True]["workflow_dispatch"]
+        options = dispatch["inputs"]["github_environment"]["options"]
+        self.assertEqual(sorted(options), ["autopush", "nightly", "rc", "staging"])
+
+        expression = None
+        for job in workflow["jobs"].values():
+            for step in job.get("steps", []):
+                if step.get("name") == self._STEP:
+                    expression = step["env"]["LONG_LIVED_ENVIRONMENT"]
+        self.assertIsNotNone(expression)
+        for env_name in ("autopush", "staging"):
+            self.assertIn(
+                f"'{env_name}'",
+                expression,
+                f"{env_name} is in the dropdown but does not arm the allowlist guard",
+            )
+        for env_name in ("rc", "nightly"):
+            self.assertNotIn(f"'{env_name}'", expression)
 
 
 if __name__ == "__main__":

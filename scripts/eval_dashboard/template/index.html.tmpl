@@ -229,10 +229,11 @@ const DASH = {
   runResultGreen: "SUCCESS",
   // Failure-signature maps; mirrors render.py's SIG_* / *_REASON_KEYWORDS.
   sig429: "http 429",
+  sigNeverRan: "no agent ever ran",
   sigNotRealRun: ["not evidence of a real agent run", "not_a_real_run"],
   sigPhrasesAbsent: "required phrases absent",
   checkNameRe: /check[ :]+['"]?([A-Za-z0-9_.\/-]+)/i,
-  infraReasonKeywords: ["http 429", "rate limit", "timed out", "timeout", "connection"],
+  infraReasonKeywords: ["http 429", "rate limit", "timed out", "timeout", "connection", "no agent ever ran"],
   checkReasonKeywords: ["required phrases absent"],
   agentReasonKeywords: ["false finding"],
   labelNoReason: "(no reason recorded)",
@@ -428,6 +429,7 @@ function reasonSignature(reason) {
   if (!text) return DASH.labelNoReason;
   const low = text.toLowerCase();
   if (low.includes(DASH.sig429)) return "endpoint saturation (infra)";
+  if (low.includes(DASH.sigNeverRan)) return "never ran: empty trajectory, zero tokens (infra)";
   if (DASH.sigNotRealRun.some((sig) => low.includes(sig))) return "not a real agent run";
   if (low.includes(DASH.sigPhrasesAbsent)) {
     const match = DASH.checkNameRe.exec(text);

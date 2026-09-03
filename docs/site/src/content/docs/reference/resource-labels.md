@@ -99,6 +99,13 @@ existed before the upgrade stay unlabelled until they are recreated. They will n
 `-l app.kubernetes.io/part-of=kube-agents` query above. The constraint above means Hindsight's
 claim stays unlabelled permanently, not just until recreation.
 
+Claims backed by a `volumeClaimTemplates` entry are permanently unlabelled for the same reason
+wherever they come from, not only under Kustomize: `buildRWOVolumeClaimTemplates` sets a name and
+nothing else on the template's `metadata`, so an agent declaring RWO `spec.deployment.storages`
+gets claims the part-of query cannot reach either. Claims the controller creates directly —
+`<agent>-data`, `system-metadata`, and non-RWO custom storage — go through `withCommonLabels` and
+are labelled.
+
 ## Query recipes
 
 Everything one PlatformAgent owns, including its cluster-scoped RBAC:

@@ -116,11 +116,19 @@ RUN_RESULT_GREEN = "SUCCESS"
 # Signature substrings (matched case-insensitively against reps[].reason):
 SIG_429 = "http 429"  # endpoint saturation; infra-classed since #1095
 SIG_NOT_REAL_RUN = ("not evidence of a real agent run", "not_a_real_run")
+SIG_NEVER_RAN = "no agent ever ran"  # the never-ran signature; infra-classed since #1184
 SIG_PHRASES_ABSENT = "required phrases absent"  # an exact-check miss
 # "check <name>" inside a phrases-absent reason names the exact check.
 CHECK_NAME_RE = re.compile(r"check[ :]+['\"]?([A-Za-z0-9_./-]+)", re.I)
 # Bar-color classification keywords, applied to the raw reason:
-INFRA_REASON_KEYWORDS = ("http 429", "rate limit", "timed out", "timeout", "connection")
+INFRA_REASON_KEYWORDS = (
+    "http 429",
+    "rate limit",
+    "timed out",
+    "timeout",
+    "connection",
+    SIG_NEVER_RAN,
+)
 CHECK_REASON_KEYWORDS = (SIG_PHRASES_ABSENT,)
 AGENT_REASON_KEYWORDS = ("false finding",)
 
@@ -516,6 +524,8 @@ def reason_signature(reason: str | None) -> str:
     low = text.lower()
     if SIG_429 in low:
         return "endpoint saturation (infra)"
+    if SIG_NEVER_RAN in low:
+        return "never ran: empty trajectory, zero tokens (infra)"
     if any(sig in low for sig in SIG_NOT_REAL_RUN):
         return "not a real agent run"
     if SIG_PHRASES_ABSENT in low:

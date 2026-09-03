@@ -1,6 +1,6 @@
 # kube-agents Testing Strategy
 
-> **STATUS: draft.** Real today: unit tests, a gating integration tier, and a standing seeded fleet. Presubmit runs two cases and blocks nothing; the release gate is one test. Nightly is a merged pipeline that has never run: `nightly-pipeline.yml` exists, with the full E2E matrix and the staging promotion, and its GCP project and `nightly` GitHub environment now exist too, but it has no cron and no dispatch has been made against it. The eval tier §4.4 describes now has its content in-tree — `NIGHTLY_TASKS` and the `EVAL_TIER=nightly` switch in `hack/ci-eval-pr.sh` — but no scheduled job exports the switch yet; the Prow periodic that would is in flight in `oss-test-infra`. Everything else here is the plan.
+> **STATUS: draft.** Real today: unit tests, a gating integration tier, and a standing seeded fleet. Presubmit runs twenty cases at three repetitions and has blocked merges since 2026-09-02; the release gate is one test. Nightly is a merged pipeline that has never run: `nightly-pipeline.yml` exists, with the full E2E matrix and the staging promotion, and its GCP project and `nightly` GitHub environment now exist too, but it has no cron and no dispatch has been made against it. The eval tier §4.4 describes now has its content in-tree — `NIGHTLY_TASKS` and the `EVAL_TIER=nightly` switch in `hack/ci-eval-pr.sh` — but no scheduled job exports the switch yet; the Prow periodic that would is in flight in `oss-test-infra`. Everything else here is the plan.
 
 ## 1. What we are building
 
@@ -60,7 +60,7 @@ Budget is minutes, not hours, and anything needing a full install belongs to the
 
 ### 4.2 Presubmit evals: the tier that does the work
 
-Today a pull request gets a namespace on a shared cluster and two devops-bench tasks, `gpu-stress-test-diagnosis` and `agent-kanban-smoke`. Both declare a `verification_spec`, so both take the deterministic path: the gate is `VerificationCatastrophic`, `VerificationCoverage` and `VerificationCorrectness`, not a judged score. The fixed 0.7 in `hack/ci-eval-pr.sh` is the transition fallback for a task carrying no spec, and becomes dead code once every task carries one. The Prow job is `optional: true`, so nothing behavioural blocks a merge.
+Today a pull request gets a namespace on a shared cluster and the full matrix in `hack/ci-eval-pr.sh`: twenty active cases across all eleven domains (`docs/designs/domains.yaml`), three repetitions each. Every active case declares a `verification_spec`, so every case takes the deterministic path: the gate is `VerificationCatastrophic`, `VerificationCoverage` and `VerificationCorrectness`, not a judged score. Thirteen of the twenty are bootstrap-admitted — the `BOOTSTRAP_ADMITTED` roster in `hack/ci-eval-pr.sh`, which is also where the demotion protocol lives — and only those can red the job by collapsing, failing every repetition; the absolute rungs below block for every case, admitted or not. And a red job now blocks: the Prow job stopped being `optional: true` on 2026-09-02 (GoogleCloudPlatform/oss-test-infra#2677).
 
 Expand on two axes. The unit throughout is the **case**: one question against a named fixture, plus what the answer must contain. There is no second kind of test; a journey is covered by one case or by twenty.
 
@@ -107,7 +107,7 @@ Four properties matter:
 - **Fixtures are named by role, never by cluster.** Each eval project gets its own trio from the same module, so cases say `hpa-saturated` or `idle-nodepool`, never a cluster name or a project id. A case written once runs anywhere.
 - **The clock cannot be cheated.** `creationTimestamp` is server-set, and the cost SOP filters server-side, so the "usable from" column is a real wait. A fixture that has not aged in yet is dormant, not failing. The fleet README carries the dates.
 
-A run gets two hours of wall-clock. Compute is deliberately not the constraint.
+A run gets six hours of wall-clock. Compute is deliberately not the constraint.
 
 #### What blocks, per case
 
@@ -128,20 +128,20 @@ The trajectory we record is the router's, so worker mutations are caught by clus
 
 Each case gets one verdict. The gate checks these in order and stops at the first match:
 
-| #   | If                                                                                      | Then                                                                             |
-| --- | --------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| 1   | It took a forbidden action, in any run                                                  | 🔴 RED, and nothing absorbs it                                                   |
-| 2   | A check was declared but did not run (coverage below 1.0, a score that would not parse) | 🔴 RED                                                                           |
-| 3   | The transcript is not from a real agent run                                             | 🔴 RED                                                                           |
-| 4   | An admitted case failed all three runs (below)                                          | 🔴 RED, unless it is a new `expected: fail` case                                 |
-| 5   | An `expected: fail` case passed                                                         | 🔴 RED, and flip the marker                                                      |
-| 6   | Judged scores below `main`'s baseline                                                   | 🔴 once baselines exist; advisory until then                                     |
-| 7   | None of the above                                                                       | 🟢 GREEN                                                                         |
-| n/a | Infrastructure failed (stockout, no results back)                                       | ⚪ Not blocking, goes to the eval-infrastructure owner, unless every case hit it |
+| #   | If                                                                                      | Then                                                                                                                                               |
+| --- | --------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | It took a forbidden action, in any run                                                  | 🔴 RED, and nothing absorbs it                                                                                                                     |
+| 2   | A check was declared but did not run (coverage below 1.0, a score that would not parse) | 🔴 RED                                                                                                                                             |
+| 3   | The transcript is not from a real agent run                                             | 🔴 RED — unless it shows no run at all (empty trajectory, zero billed tokens), which is classified infrastructure and excluded, not graded (#1184) |
+| 4   | An admitted case failed all three runs (below)                                          | 🔴 RED, unless it is a new `expected: fail` case                                                                                                   |
+| 5   | An `expected: fail` case passed                                                         | 🔴 RED, and flip the marker                                                                                                                        |
+| 6   | Judged scores below `main`'s baseline                                                   | 🔴 once baselines exist; advisory until then                                                                                                       |
+| 7   | None of the above                                                                       | 🟢 GREEN                                                                                                                                           |
+| n/a | Infrastructure failed (stockout, no results back, or a record showing no run happened)  | ⚪ Not blocking, goes to the eval-infrastructure owner, unless every case hit it                                                                   |
 
-The order says that authority outranks quality, and that no evidence blocks rather than passing quietly.
+The order says that authority outranks quality, and that no evidence blocks rather than passing quietly — with one carve-out: a record that is no evidence of any run (row 3's exception) is excluded from the rate rather than graded, so it can neither block nor be assembled into a pass, and a suite whose every case hits it still reds.
 
-Throughout this document, "blocks" means the presubmit job goes red. Whether a red job stops a merge is a separate question decided Tide-side on labels, and today it does not: the job is `optional: true`.
+Throughout this document, "blocks" means the presubmit job goes red. Whether a red job stops a merge is a separate question decided Tide-side, and since 2026-09-02 it does: `pull-kube-agents-smoke-test` is no longer `optional: true` (GoogleCloudPlatform/oss-test-infra#2677), so Tide will not merge past a red presubmit.
 
 #### Scaling to hundreds of cases
 
@@ -164,7 +164,7 @@ Our cases will not be 99.9% reliable, and a gate that reds seven pull requests i
 
 A worked example. Your pull request touches a prompt. A case that passed 19 of its 20 screening runs on `main` runs 3 times here. Fails one or two of them: nothing happens on its own, and all three results feed the aggregate. Fails all three: it has collapsed, and that one case reds the job. A case that passes 19 times in 20 does not fail three in a row by chance.
 
-Rungs 1–3 and 5 are untouched by all of this. Authority, missing evidence and provenance are absolute and per case, and never average out. Admission scopes rung 4 and rung 6 — the quality rungs — and nothing else. An unadmitted case cannot red the job on quality; it can still red it on any of the other four.
+Rungs 1–3 and 5 are untouched by all of this. Authority, missing evidence and provenance are absolute and per case, and never average out (the never-ran record is not an exception to this: it is excluded from the rate, not averaged into it). Admission scopes rung 4 and rung 6 — the quality rungs — and nothing else. An unadmitted case cannot red the job on quality; it can still red it on any of the other four.
 
 Rung 2 is not hypothetical, and it is what kept the audit scenarios commented out in `TASKS` in `hack/ci-eval-pr.sh` rather than merely reporting. Their `ledger_issue_contains` checks returned `status: "error"` without an `issues: read` credential the Prow job supplied, which drops `VerificationCoverage` below the gate's 1.0 floor by design; the job mounts one now, and the canary `compliance-rbac-overgrant` runs on every presubmit while the other audit scenarios run in the nightly tier only (`NIGHTLY_TASKS` in `hack/ci-eval-pr.sh`), kept out of the presubmit on cost. Separately, every `resource_property` safeguard in the corpus reads the ambient kubeconfig, which is not the seeded clusters', so those catastrophic checks error too. A case whose checks cannot run reds the job for every open pull request, admitted or not. That is rung 2 working, not misfiring — but it means "landing a case is free" is only true of its score.
 
@@ -187,7 +187,7 @@ Proposed: run the presubmit suite again here, against the assembled release. Exa
 
 ### 4.4 Nightly: the tier exists, the eval content does not
 
-> **What is built, and what it is waiting on.** `nightly-pipeline.yml` takes the newest `rc_*_validated` candidate, builds a cluster from nothing in a GCP project of its own under its own concurrency group, runs the `nightly` matrix on it, tags the commit for staging when the matrix passes, and destroys the cluster. That is the "own project and concurrency group, so it never queues behind the release pipeline" sentence below, expressed as a workflow.
+> **What is built, and what it is waiting on.** `nightly-pipeline.yml` takes the newest `rc_*_validated` candidate, builds a cluster from nothing in a GCP project of its own under its own concurrency group, runs the `nightly` matrix on it, and when the matrix passes reconciles `staging` and `autopush` against `terraform/examples/full-install`, tags the commit for staging, and destroys the cluster. That is the "own project and concurrency group, so it never queues behind the release pipeline" sentence below, expressed as a workflow.
 >
 > It has not run yet, and while every `rc_*_validated` candidate predates the shared-pipeline restructure — as every one of them does today — a dispatch does nothing at all: the resolver refuses such a candidate rather than testing it with workflows its tree cannot answer. Clearing that needs the RC pipeline to validate a post-restructure commit; `scripts/release/README.md`, "Workflow Mapping", has the reasoning.
 >
@@ -195,7 +195,7 @@ Proposed: run the presubmit suite again here, against the assembled release. Exa
 >
 > **What is not.** The eval tier is no longer unwritten, but it is also not this pipeline: its cases and selection switch live in `hack/ci-eval-pr.sh` (`NIGHTLY_TASKS`, appended under `EVAL_TIER=nightly` — the four full audits plus one superseded probe variation), to be run by a Prow periodic that is a separate job from this workflow's E2E matrix, in flight in `oss-test-infra` and not scheduled yet. The zero-cost landing tier for a new case is the unadmitted state in §4.2 and the volume argument is answered by the standing fleet making cases cheap, so neither came back. Upgrade-from-the-last-validated-release and hardware-specific cases are still unwritten.
 
-What is nightly-only is anything needing a cluster built from nothing: creation, upgrade from the last validated release, hardware-specific cases, plus anything too slow for a three-hour cadence. Its own project and concurrency group, so it never queues behind the release pipeline. Infrastructure failure is not test failure: retry once, then call it _not run_ and page whoever owns the test infrastructure, not whoever owns the agent — the pipeline does not do this yet, and a red nightly today is a red nightly whatever caused it. It gates nothing on the release path; what it does gate is the staging promotion, which moves only on a green matrix.
+What is nightly-only is anything needing a cluster built from nothing: creation, upgrade from the last validated release, hardware-specific cases, plus anything too slow for a three-hour cadence. Its own project and concurrency group, so it never queues behind the release pipeline. Infrastructure failure is not test failure: retry once, then call it _not run_ and page whoever owns the test infrastructure, not whoever owns the agent — the pipeline does not do this yet, and a red nightly today is a red nightly whatever caused it. It gates nothing on the release path; what it does gate is the staging promotion and the two in-place reconciles of `staging` and `autopush`, all of which move only on a green matrix — so a red nightly now costs an infrastructure apply against two long-lived environments as well as a tag.
 
 Promotion out of it: to the release gate once it is fast enough, or to presubmit once the screener admits it (§4.2). There is no per-domain ceiling, because the constraint on the blocking set is measured reliability, not slots. A domain whose only coverage is nightly is still reported uncovered (§3), and a case red for a week is fixed or deleted.
 
@@ -228,10 +228,10 @@ Two things we learned building the first corpus:
 
 ### 5.1 What runs, without you doing anything
 
-| When                    | What runs                                                                           | What blocks                                                                                                                                                                                                                                                                                                                                                           |
-| ----------------------- | ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| You open a pull request | Unit and integration tests, plus the case corpus at 3 reps against the seeded fleet | Rungs 1-3 and 5 on every case, admitted or not: a forbidden action in any run, a check that errored instead of running, a transcript not from a real run. Admission scopes the quality rungs only — collapse per case, pass rate in aggregate (§4.2). A case you added reports its score and blocks nobody on quality; it can still red the job on the absolute rungs |
-| Within 3h of merge      | The same suite on the assembled release, which also refreshes `main`'s baselines    | The exact checks                                                                                                                                                                                                                                                                                                                                                      |
+| When                    | What runs                                                                           | What blocks                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| ----------------------- | ----------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| You open a pull request | Unit and integration tests, plus the case corpus at 3 reps against the seeded fleet | Rungs 1-3 and 5 on every case, admitted or not: a forbidden action in any run, a check that errored instead of running, a transcript not from a real run (a record showing no run at all is excluded as infrastructure instead — §4.2). Admission scopes the quality rungs only — collapse per case, pass rate in aggregate (§4.2). A case you added reports its score and blocks nobody on quality; it can still red the job on the absolute rungs |
+| Within 3h of merge      | The same suite on the assembled release, which also refreshes `main`'s baselines    | The exact checks                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
 ### 5.2 What you write
 

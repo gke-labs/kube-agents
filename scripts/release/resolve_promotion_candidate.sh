@@ -92,9 +92,11 @@ else
   # matching trigger check.
   if ! candidate_supports_shared_pipeline "${COMMIT_SHA}"; then
     if [ "${RC_TAG_WAS_EXPLICIT}" = "true" ]; then
-      echo "❌ ERROR: Candidate '${RC_TAG}' (${COMMIT_SHA:0:7}) predates the shared-pipeline restructure." >&2
-      echo "   Its tree carries neither the E2E_SUITE selector nor run_optional_e2e_suites.sh, so the" >&2
-      echo "   matrix would run a suite nobody asked for and report green. Refusing to test it." >&2
+      echo "❌ ERROR: Candidate '${RC_TAG}' (${COMMIT_SHA:0:7}) predates a restructure the workflows depend on." >&2
+      echo "   Its tree is missing at least one of: the E2E_SUITE selector, run_optional_e2e_suites.sh," >&2
+      echo "   reconcile_environment.sh. The matrix would run a suite nobody asked for and report green," >&2
+      echo "   or the staging reconcile would abort on a missing file while the promotion tag went out" >&2
+      echo "   anyway. Refusing to test it." >&2
       echo "   Omit rc_tag to take the newest eligible candidate instead." >&2
       exit 1
     fi

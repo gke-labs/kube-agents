@@ -344,6 +344,32 @@ map (`docs/README.md`), and this file plus `CLAUDE.md` stay inside the context b
   commands and those reasons are in
   [`docs/pull-request-workflow.md`](docs/pull-request-workflow.md#local-validation-before-committing).
 
+### The behavioural presubmit gate
+
+`pull-kube-agents-smoke-test` runs the eval matrix in `hack/ci-eval-pr.sh` — every active case,
+three repetitions each — and has been merge-blocking since 2026-09-02
+(GoogleCloudPlatform/oss-test-infra#2677). It is slow — recent green runs took 1.5 to 3.5 hours
+against a 360-minute ceiling — and a new push restarts it, so open the pull request early and
+batch changes rather than stacking pushes.
+
+Two things red it. A case on the `BOOTSTRAP_ADMITTED` roster in `hack/ci-eval-pr.sh` fails **all**
+of its repetitions — one failed repetition out of three does nothing on its own. Or any case,
+admitted or not, trips an absolute rung: a forbidden cluster mutation, a verifier that errored
+instead of running, or a record whose liveness signals are inconsistent (a record showing no run
+at all — empty trajectory, zero billed tokens — is instead excluded as infrastructure, #1184).
+Repetitions classified as
+infrastructure failures are excluded from the verdict automatically, unless every case hits one —
+a suite that evaluated nothing reds rather than reporting green. The roster is the source of truth
+for what is admitted, the comment above it for how a flaky case is demoted, and
+[`docs/designs/testing-strategy.md`](docs/designs/testing-strategy.md) §4.2 for the full verdict
+ladder.
+
+On a red, ask whether your diff explains it. If yes, fix it. If no, file an issue with the
+`presubmit-gate` label; if the cause is evident and the fix is quick, fixing it yourself is
+welcome — otherwise keep working while the eval crew classifies it. One `/retest` is reasonable
+for a suspected transient; repeated blind retests are noise. Never merge around a red gate, and
+never instruct anyone to.
+
 ## Automated Review After Opening a Pull Request
 
 Every pull request here is reviewed automatically by `kube-agents-bot`, a GitHub App that runs a

@@ -389,6 +389,38 @@ class RenderGoldenTest(unittest.TestCase):
         self.assertEqual(copied["generated_at"], "2026-09-01T12:00:00Z")
 
 
+class ReasonSignatureTest(unittest.TestCase):
+    def test_the_never_ran_reason_groups_and_classes_as_infra(self):
+        # The wording classify_rep() writes for #1184's empty-success record
+        # (bench/kube_agents_bench/scoring.py); a #1184 wave must group under
+        # one named infra bar, not scatter into first-60-chars groups.
+        reason = (
+            "the record shows no agent ever ran: the trajectory is empty and "
+            "tokens.total is 0, so no model call was billed. There is no "
+            "answer in it to grade, whatever produced it -- infrastructure, "
+            "not the pull request (#1184)"
+        )
+        self.assertEqual(
+            render.reason_signature(reason),
+            "never ran: empty trajectory, zero tokens (infra)",
+        )
+        self.assertEqual(render.reason_class(reason), "infra")
+
+    def test_the_js_mirror_carries_the_never_ran_signature(self):
+        # The page re-renders the Pareto client-side from the template's own
+        # JS mirror of these maps, so a signature added to render.py alone is
+        # invisible on the live surface — the server-rendered bar is replaced
+        # on load. Caught by a headless-Chrome capture during #1184's review.
+        tmpl = (
+            pathlib.Path(__file__).resolve().parent
+            / "eval_dashboard" / "template" / "index.html.tmpl"
+        ).read_text()
+        self.assertIn(f'sigNeverRan: "{render.SIG_NEVER_RAN}"', tmpl)
+        self.assertIn('return "never ran: empty trajectory, zero tokens (infra)"', tmpl)
+        # ...and the class map: the keyword must sit in the JS infra list too.
+        self.assertIn(f'"{render.SIG_NEVER_RAN}"]', tmpl)
+
+
 class RenderToleranceTest(unittest.TestCase):
     def test_empty_data_renders_designed_empty_state(self):
         data = {"schema_version": 1, "generated_at": "2026-08-28T14:02:11Z",
@@ -670,7 +702,8 @@ class CaseNotesTest(unittest.TestCase):
             "gpu-stress-test-diagnosis",
         ):
             self.assertIn(name, notes)
-        self.assertEqual(notes["compliance-rbac-overgrant"]["issues"], ["#998", "#985"])
+        self.assertEqual(notes["compliance-rbac-overgrant"]["issues"], ["#998", "#985", "#1171"])
+        self.assertEqual(notes["compliance-rbac-overgrant"]["badge"], "held-out")
         self.assertEqual(notes["capacity-pinned-pool-probe"]["badge"], "held-out")
         self.assertEqual(notes["security-overgrant-remediation-proposal"]["badge"], "new")
 

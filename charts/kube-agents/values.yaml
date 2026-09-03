@@ -217,7 +217,7 @@ litellm:
     # copies: a chart pinned to a version the mirror was never populated with
     # is an ImagePullBackOff. This pin sat a release behind the kustomize base
     # for exactly that reason.
-    tag: v1.96.2
+    tag: v1.98.0
     pullPolicy: IfNotPresent
   replicaCount: 2
   # Rollout strategy — the canonical home for this argument. The chart template

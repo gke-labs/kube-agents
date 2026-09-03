@@ -68,6 +68,67 @@ if [ -n "${GITHUB_MINTER_SET}" ] && [ -n "${GITHUB_MINTER_MISSING}" ]; then
   exit 1
 fi
 
+# Chat allowlists on a long-lived environment: refuse before anything is
+# destroyed, in the same place and for the same reason as the minter check.
+#
+# render_install_env.sh makes this check for the reconcile path, under
+# --strict. This is the same guarantee for the rebuild path, and the two have
+# to agree: deploy-environment.yml offers `autopush` and `staging` in its
+# dropdown, so without it the escape hatch you reach for when a reconcile
+# cannot converge is also the one route into these environments that does not
+# ask about the allowlist.
+#
+# Empty is not "no opinion". install.sh renders `google_chat_allowed_users =
+# []`, the chart's `with` omits the key, and the operator turns an absent list
+# into allow-all (platformagent_manifests.go's allowAllUsers) -- so a rebuild
+# of an environment whose allowlist variable was never set admits the whole
+# domain, and nothing in the run says so.
+#
+# LONG_LIVED_ENVIRONMENT only. `rc` and `nightly` carry GOOGLE_CHAT_ENABLED=true
+# with no ALLOWED_USERS today and are deliberately open: they are destroyed and
+# rebuilt every run and no real user reaches them. An unconditional guard here
+# would fail the RC pipeline on its next run rather than protect anything.
+#
+# Truthiness and emptiness are both inlined for the reason teardown_common.sh
+# gives -- these scripts do not source installer_common.sh -- and both match it
+# exactly. Emptiness in particular is the installer's, not `-z`: hcl_csv_list
+# splits on `, \t\n` and drops empty items, so a list cleared down to a stray
+# comma names nobody and still renders `[]`.
+provision_is_truthy() {
+  local val="${1:-}"
+  val="${val//[[:space:]]/}"
+  case "$val" in
+    [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss] | [Yy] | 1 | [Oo][Nn]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+provision_names_nobody() {
+  local val="${1:-}"
+  # Every separator hcl_csv_list splits on; what is left is the real items.
+  val="${val//[, $'\t'$'\n']/}"
+  [ -z "$val" ]
+}
+
+provision_check_allowlist() {
+  local enabled_var="$1" list_var="$2" allow_all_var="$3" platform="$4"
+  provision_is_truthy "${!enabled_var:-}" || return 0
+  provision_names_nobody "${!list_var:-}" || return 0
+  ! provision_is_truthy "${!allow_all_var:-}" || return 0
+  echo "::error title=${platform} is enabled with no allowlist::${list_var} names no users on this environment — it is unset, or it holds only separators — and an empty allowlist means EVERY user is admitted, because the operator turns an absent list into allow-all for ${platform}. Refusing to tear down and rebuild '${GKE_CLUSTER_NAME:-this environment}' into a wider-open install than the one it is replacing. Set ${list_var} to the users this install should admit, or set ${allow_all_var}=true to say the open allowlist is intended."
+  echo "==> ${platform} enabled with an empty ${list_var} and no ${allow_all_var}=true." >&2
+  return 1
+}
+
+if provision_is_truthy "${LONG_LIVED_ENVIRONMENT:-}"; then
+  ALLOWLIST_STATUS=0
+  provision_check_allowlist GOOGLE_CHAT_ENABLED ALLOWED_USERS \
+    GOOGLE_CHAT_ALLOW_ALL_USERS "Google Chat" || ALLOWLIST_STATUS=1
+  provision_check_allowlist SLACK_ENABLED SLACK_ALLOWED_USERS \
+    SLACK_ALLOW_ALL_USERS "Slack" || ALLOWLIST_STATUS=1
+  [ "$ALLOWLIST_STATUS" -eq 0 ] || exit 1
+fi
+
 TEARDOWN_LOG="$(mktemp)"
 
 echo "==> Tearing down the existing environment (${TEARDOWN_TARGET}) via canonical uninstall.sh..."

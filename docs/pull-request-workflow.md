@@ -293,17 +293,22 @@ waiting on it.
 `/hold cancel` releases it — #1045 held that way for a smoke test. `/override <context>`, which only
 a repository admin can use, forces a required check that cannot pass on its own.
 
-**Branch protection is not the gate and reads as though there is none.** `main` requires six
-contexts — `cla/google`, `actionlint`, `build`, `prettier`, `validate`, `Run Controller Tests` —
-and conversation resolution, but **zero** approving reviews, because approval is Tide's business
-rather than GitHub's. A reader who checks the repository settings for the review requirement
-therefore finds nothing and concludes wrongly.
+**Branch protection is not the gate and reads as though there is none.** `main` requires ten
+contexts — `cla/google`, `actionlint`, `build`, `prettier`, `validate`, `Run Controller Tests`,
+`Run Python Unit Tests`, `Documentation Checks`, `Validate Conventional Commit PR Title`, and
+`Agent instructions cite assets that exist` — and conversation resolution, but **zero** approving
+reviews, because approval is Tide's business rather than GitHub's. A reader who checks the
+repository settings for the review requirement therefore finds nothing and concludes wrongly.
 
-Those six are not the whole required set either. Tide also requires every Prow presubmit not marked
+The last four joined the set on 2026-09-02; before that they reported on every pull request without
+gating one.
+
+Those ten are not the whole required set either. Tide also requires every Prow presubmit not marked
 `optional`, and those are configured in `oss-test-infra` rather than in branch protection —
-`pull-kube-agents-smoke-test` carries `optional: true`, which is why it reports on a pull request
-without gating one. So the command below answers half the question, and a red check in neither list
-blocks no merge:
+`pull-kube-agents-smoke-test` dropped its `optional: true` on 2026-09-02
+(GoogleCloudPlatform/oss-test-infra#2677), so the behavioural presubmit gates every merge from that
+date. The command below therefore answers half the question, and a red check in neither list blocks
+no merge:
 
 ```bash
 gh api repos/gke-labs/kube-agents/branches/main/protection \
@@ -349,7 +354,7 @@ Four states that look like somebody else's problem and are not:
   `/request-review` is the override. Answering every bot thread does not summon one by itself, so
   an author who has done everything asked of them can still be sitting with nobody assigned.
 - **A red check that is not required.** It blocks no merge and is not the author's problem — but
-  "required" means both lists above, not branch protection's six alone, and `tide` is what actually
+  "required" means both lists above, not branch protection's ten alone, and `tide` is what actually
   knows. Ask it before treating a failing job as work owed, and before concluding one is not.
 - **`mergeable: UNKNOWN`.** GitHub computes mergeability lazily and the first query only triggers
   the job, so a conflict reads as conflict-free until you ask twice.
