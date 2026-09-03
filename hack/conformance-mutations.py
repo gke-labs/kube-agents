@@ -254,6 +254,19 @@ MUTATIONS: list[Mutation] = [
         "is legitimately needed at build time",
     ),
             Mutation(
+        # The bucket-2 gate check asserts the class-level skip flag by
+        # inspection; this is its kill, proven by execution before it was
+        # encoded: strip the decorator from one scenario and the check goes
+        # red without anything running.
+        "bucket2-scenario-ungated",
+        "tests/conformance/bucket2/test_cluster_scenarios.py",
+        ("@h.requires_cluster\nclass Scenario5", "class Scenario5"),
+        "test_bucket_two_is_skipped_for_the_stated_reason",
+        "drop the cluster gate from one scenario while renaming the class -- "
+        "before the check went structural, the next bucket-1 run would have "
+        "executed a mutating kubectl against the developer's ambient context",
+    ),
+    Mutation(
         # The merge rule is one of the two the wide review found covered by
         # nothing: the original B1 known violation absorbed every subset of
         # its corpus, so deleting this rule left the suite green.
