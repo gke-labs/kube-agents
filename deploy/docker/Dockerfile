@@ -35,8 +35,8 @@
 # trailing name only, so gcr.io/distroless/static lands as <prefix>/distroless
 # -static and no amount of prefix-splicing reproduces the original path.
 #
-# HERMES_AGENT_TAG has no default — the release workflows read the one pin from
-# tags.env, and the root Makefile `include`s it — so a direct docker build has
+# HERMES_AGENT_TAG has no default — the image-build workflows read the one pin
+# from tags.env, and the root Makefile `include`s it — so a direct docker build has
 # to pass it too, or the agent-base stage resolves to a reference with an empty
 # tag:
 #
@@ -52,7 +52,13 @@ ARG HERMES_AGENT_IMAGE=nousresearch/hermes-agent
 ARG ENVOY_VERSION=v1.39.1
 ARG ENVOY_IMAGE=envoyproxy/envoy
 ARG GOLANG_IMAGE=golang
-ARG GOLANG_VERSION=1.26-alpine
+ARG GOLANG_VERSION=1.27-alpine
+# Declared here as well as in the `platform` stage that consumes it, so the
+# credential-proxy build -- which shares deploy/docker/cloudbuild.yaml and is
+# therefore handed the same --build-arg -- does not warn about an argument no
+# stage declares. The value and what it is for are documented where the ENV is
+# set, at the end of the `platform` stage.
+ARG KUBE_AGENTS_VERSION=dev
 FROM ${ENVOY_IMAGE}:${ENVOY_VERSION} AS envoy-bin
 
 # Every binary in the final image must match the architecture the image ships
@@ -187,7 +193,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-progress/apply_kanban_progress_lin
 # Hotfix: make a dispatched cron run report back, and stop it closing the
 # kanban card of the caller that dispatched it. Upstream discards the run's
 # final response and lets the run inherit HERMES_KANBAN_TASK, which is how
-# three fleet-audit streams published wrong ledgers on 2026-08-04. Ten edits
+# three fleet-audit streams published wrong ledgers on 2026-08-04. Twelve edits
 # across three files, so the surgery lives in an applier script rather than
 # inline; it fails the build on any anchor that no longer matches.
 # verify_cron_run_scope.py then exercises the patched code. The applier only
@@ -233,7 +239,7 @@ exit(1) if ('https://' in clipped or not 3000 < len(clipped) <= 4000) else None"
 # The platform profile has no ticker thread -- it is ticked once a minute by
 # spawning `hermes cron tick`, whose body is verbatim `tick(verbose=True)` --
 # so everything Hermes hangs off the ticker's lifetime is absent or wrong there.
-# Three consequences, all fixed by the eleven anchored edits in the applier:
+# Three consequences, all fixed by the fourteen anchored edits in the applier:
 #   * `tick()` defaults to sync=True and held <HERMES_HOME>/cron/.tick.lock
 #     across the whole `as_completed` wait, so a fleet audit starved every other
 #     job for its full runtime. Measured over 17h: 3 of 35
@@ -820,7 +826,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_report_format.
 # that rather than leaving it to a reader.
 # See the module docstring in deploy/docker/patches/kanban_scheduling.py and the
 # applier docstring in deploy/docker/patches/apply_kanban_scheduling.py.
-COPY deploy/docker/patches/kanban_scheduling.py /opt/hermes/hermes_cli/kanban_scheduling.py
+COPY --chmod=0644 deploy/docker/patches/kanban_scheduling.py /opt/hermes/hermes_cli/kanban_scheduling.py
 COPY deploy/docker/patches/apply_kanban_scheduling.py \
      deploy/docker/patches/verify_kanban_scheduling.py \
      deploy/docker/patches/patchlib.py \
@@ -886,7 +892,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling
 # further down. It must not ship alone: raising the cap only moves when the bug
 # fires.
 # See the module docstring in deploy/docker/patches/kanban_guardrail_exit.py.
-COPY deploy/docker/patches/kanban_guardrail_exit.py /opt/hermes/hermes_cli/kanban_guardrail_exit.py
+COPY --chmod=0644 deploy/docker/patches/kanban_guardrail_exit.py /opt/hermes/hermes_cli/kanban_guardrail_exit.py
 COPY deploy/docker/patches/apply_kanban_guardrail_exit.py \
      deploy/docker/patches/verify_kanban_guardrail_exit.py \
      deploy/docker/patches/patchlib.py \
@@ -1013,7 +1019,18 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/verify_kanban_event_routing.py \
      deploy/docker/patches/patchlib.py \
      /tmp/latency-patches/
-RUN cp /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes_cli/kanban_wake_nudge.py && \
+# `install -m 0644`, not `cp`, for the first line. `cp` gives a newly created
+# destination the source's mode masked by the umask in force, and the source
+# here is whatever the build context held: git tracks one permission bit, so a
+# tree checked out under `umask 077` carries 0600 throughout and `cp`
+# propagates it rather than repairing it. The agent runs as uid 10000 and
+# cannot read the result. Same failure agentplugins/lib/plugin_image.sh:798
+# stages against for the plugin image, same cause.
+#
+# The other four land in /opt/hermes/tools and /opt/hermes/gateway, which the
+# `platform` stage normalizes; /opt/hermes/hermes_cli is the one patch
+# destination no loop walks, so it is stated here at the write site.
+RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes_cli/kanban_wake_nudge.py && \
     cp /tmp/latency-patches/kanban_auto_subscribe.py /opt/hermes/tools/kanban_auto_subscribe.py && \
     cp /tmp/latency-patches/kanban_comment_status.py /opt/hermes/tools/kanban_comment_status.py && \
     cp /tmp/latency-patches/kanban_notify_delivery.py /opt/hermes/gateway/kanban_notify_delivery.py && \
@@ -1188,6 +1205,14 @@ FROM agent-base AS platform
 # across template edits; the staged repo plugins arrive root-owned via the
 # final RUN's cp -a. Skills stay in the final RUN with their provenance
 # manifest. Not in agent-base: credential-proxy carries neither.
+#
+# /opt/hermes/hermes_cli is deliberately not on the list. The only files in it
+# whose mode is ever in question are the three modules the patch layers write,
+# and those state their mode on the instruction that writes them, back in
+# agent-base -- where the mode is wrong, and in the one image this stage is not
+# a part of. Cost is not the reason either way: a find/chmod over a tree whose
+# modes are already correct exports a ~4kB layer, since BuildKit diffs the
+# result rather than the syscall.
 RUN set -eu; \
     for d in /opt/hermes/plugins /opt/hermes/gateway /opt/hermes/tools; do \
         find "$d" -type d -exec chmod 755 {} + ; \
@@ -1541,6 +1566,24 @@ RUN set -eu; \
     chown -R root:root /opt/hermes/skills /opt/platform-template /opt/cluster-template /opt/chat-template /opt/defaults/scripts
 
 USER 10000:10000
+
+# The build this image came from, for the `User-Agent` that remote MCP calls
+# carry. Hermes resolves `${KUBE_AGENTS_VERSION}` in an `mcp_servers` entry's
+# `args` from the agent process environment, so the value has to be on the
+# container rather than only in the config -- see the `--header` argument on the
+# mcp-remote entries in deploy/shared/defaults/config.yaml.
+#
+# Last instruction in the stage, not beside the ARGs at the top: the value
+# changes on every commit, and an ENV that early would invalidate the whole
+# `platform` chain's cache on every build. ENV writes no filesystem diff, so it
+# costs nothing against the layer budget.
+#
+# `dev` is the default (declared with the other build args above) because an
+# unset build arg must still produce a well-formed header. The publish workflows
+# pass the commit SHA the image is tagged with, so a User-Agent on the wire
+# names the exact image.
+ARG KUBE_AGENTS_VERSION
+ENV KUBE_AGENTS_VERSION=${KUBE_AGENTS_VERSION}
 
 # --- CREDENTIAL PROXY TOOLING ---
 # Everything the sidecar needs that is not agent source: the credential-aware

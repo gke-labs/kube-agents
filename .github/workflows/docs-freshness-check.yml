@@ -71,10 +71,10 @@ jobs:
 
             HAS_OPERATOR=$(printf '%s\n' "${CODE_FILES[@]}" | grep -c '^k8s-operator/' || true)
             HAS_SKILLS=$(printf '%s\n' "${CODE_FILES[@]}" | grep -c '^agents/platform/skills/' || true)
-            HAS_SCRIPTS=$(printf '%s\n' "${CODE_FILES[@]}" | grep -c '^k8s-operator/scripts/' || true)
+            HAS_SCRIPTS=$(printf '%s\n' "${CODE_FILES[@]}" | grep -c '^scripts/installer/' || true)
 
             if [ "$HAS_SCRIPTS" -gt 0 ]; then
-              echo "- 💡 \`k8s-operator/scripts/\` modified: Consider updating \`k8s-operator/scripts/README.md\` or \`INSTALL.md\`." >> "$GITHUB_STEP_SUMMARY"
+              echo "- 💡 \`scripts/installer/\` modified: Consider updating \`scripts/installer/README.md\` or \`INSTALL.md\`." >> "$GITHUB_STEP_SUMMARY"
             elif [ "$HAS_OPERATOR" -gt 0 ]; then
               echo "- 💡 \`k8s-operator/\` modified: Consider updating \`k8s-operator/README.md\` or \`docs/\`." >> "$GITHUB_STEP_SUMMARY"
             fi

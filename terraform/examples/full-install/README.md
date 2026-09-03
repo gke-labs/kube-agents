@@ -50,6 +50,12 @@ install without the interview.
   idempotent without reading the cluster — and because rotating the salt
   re-anonymises every user, severing their past sessions from their future
   ones.
+- Optionally (`enable_pubsub_platform = true`) the Cloud Pub/Sub platform adapter
+  `AgentPlugin/pubsubplatform` for message and alert ingress.
+- Optionally (`enable_stockout_investigator = true`) the GKE Stockout Investigator
+  backend and `AgentPlugin/gkestockoutinvestigator`: Pub/Sub topic (`stockout_pubsub_topic`),
+  subscription (`stockout_pubsub_subscription`), Cloud Logging project sink
+  (`stockout_pubsub_sink`), and publisher IAM binding.
 - Optionally (`model_provider = "vertex_ai"`) the Vertex AI / Model Garden path:
   a second [`kube-agents-iam`](../../modules/kube-agents-iam) instantiation for
   the gateway's service account, `roles/aiplatform.user` on
@@ -405,6 +411,22 @@ With `enable_github_minter = true`, set `github_repo` to your primary GitOps rep
 credentials Secret and turns on the CR's `slack` section, the same pair
 install.sh collects. Slack needs no GCP resources, so this is
 purely configuration — the Slack app itself is a manual step (below).
+
+### Pub/Sub Platform and Stockout Investigator Plugins
+
+- `enable_pubsub_platform = true` deploys the `pubsub-platform` adapter
+  `AgentPlugin/pubsubplatform` via Helm, giving the Platform Agent Cloud Pub/Sub
+  ingress capabilities.
+- `enable_stockout_investigator = true` provisions the GCP Pub/Sub topic
+  (`stockout_pubsub_topic`), pull subscription (`stockout_pubsub_subscription`),
+  and Log Router sink (`stockout_pubsub_sink`), and deploys the
+  `AgentPlugin/gkestockoutinvestigator` resource targeting the `platform` profile
+  with tuned execution limits. Requires `enable_pubsub_platform = true`.
+
+If a plugin was previously installed using the standalone `agentplugins/*/install.sh` scripts,
+uninstall its standalone release before setting these variables (`helm uninstall pubsubplatform -n <namespace>`,
+`helm uninstall gkestockoutinvestigator -n <namespace>`). Helm checks object ownership metadata
+(`meta.helm.sh/release-name`) and refuses to adopt existing resources owned by another release.
 
 **Manual steps that no IaC can perform** — canonical walkthrough:
 [INSTALL.md § Enable Google Chat & Slack Integrations](../../../INSTALL.md#step-4-enable-google-chat--slack-integrations-manual-required-steps):

@@ -114,8 +114,36 @@ below).
 Additive, optional, and safe to omit — consumers must default them.
 
 - `stale_after_s` — seconds after `generated_at` beyond which the rendered
-  page labels itself `STALE`. No collector version emits it yet; the
-  renderer defaults to `7200` when it is absent.
+  page labels itself `STALE`. Emitted only when the collector is invoked
+  with `--stale-after-s` (the hourly refresh job passes its cadence plus
+  slack); the renderer defaults to `7200` when it is absent.
+- `pending_builds` — builds the GCS scan listed but could not record: no
+  readable `finished.json` yet (still running, or the upload failed), so
+  they are not in `runs[]` and do not raise the watermark. Entries are
+  `{"build_id": "<id>", "first_seen": "<iso8601>"}`, lowest id first;
+  `first_seen` is when the collector first listed the build. The next
+  incremental scan re-reads exactly these ids even though they sit at or
+  below the watermark, and drops an entry once it is recorded or once
+  `first_seen` is more than 2 days old (`PENDING_RETRY_DAYS` — a build
+  unfinished that long is a pod that died without uploading). Omitted when
+  empty; a malformed value is ignored with a warning, never a crash.
+
+### Optional run and task fields
+
+Additive, optional, and safe to omit — consumers must default them. No
+collector version in this tree emits them yet; the renderer already reads
+both.
+
+- `runs[].pr_merged` — `true` | `false` | `null`: whether the run's PR has
+  merged. The renderer's "agent" band charts only runs where it is `true`
+  (the final such run per PR); absent or `null` keeps a run out of that
+  cohort without any other effect.
+- `runs[].tasks[].reps` — the task's individual repetitions, in order:
+  `[{"n": 1, "result": "pass"|"fail"|"infra", "reason": "<string>"|null}]`.
+  `reason` is free-form log text (renderers must escape it). `infra` reps
+  are excluded from every pass-fraction denominator, exactly like `infra`
+  task results. When `reps` is absent the task's single `result` stands in
+  for one rep.
 
 ### `coverage` — from `docs/designs/domains.yaml`
 
@@ -130,6 +158,32 @@ Additive, optional, and safe to omit — consumers must default them.
   `gsutil ls`, read with `gsutil cat`. **Read-only.**
 - `--from-dir <dir>` — local `<build_id>/` subdirectories with the same
   three files; the offline/testing path.
+
+### Incremental collection (the output stays schema v1; it may add the optional `pending_builds`)
+
+- `--merge-with <data.json | gs:// URL>` — load a previously written
+  data.json, carry its `runs[]` over verbatim, and skip every GCS build
+  whose id is ≤ the newest **numeric** `build_id` on record — except the
+  ids on the prior's `pending_builds`, which are re-read regardless. Prow
+  build ids increase monotonically **by start time**, not by finish time,
+  so the watermark alone would permanently skip a build that was still in
+  flight when a later, shorter build got recorded; `pending_builds` (see
+  Optional top-level fields) is how those builds get back in. Overlapping
+  builds dedupe by `build_id` with the **freshly parsed** copy winning;
+  `cases[]` and `coverage` are recomputed from the merged run list on the
+  current checkout. A missing, unreadable, truncated, non-v1 or
+  implausible prior file is a **warning that degrades to a fresh sweep
+  bounded to `--since-days 14`** — never a crash (the first armed run has
+  no prior file at all). This is what lets an hourly periodic republish in
+  minutes instead of re-reading ~3 objects per archived build.
+- `--since-days <n>` — skip GCS builds whose `started.json` timestamp is
+  older than `n` days. Costs one probe read per candidate build and saves
+  the other two; builds with an unreadable `started.json` are kept (the
+  no-`finished.json` rule still skips them). `--from-dir` sources are
+  never filtered.
+- `--stale-after-s <seconds>` — write `stale_after_s` (see Optional
+  top-level fields) into the output. Omitted, the field is omitted and the
+  renderer's default applies.
 
 ## Fixtures
 

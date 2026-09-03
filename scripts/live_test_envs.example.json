@@ -2,7 +2,7 @@
   "_comment": [
     "Extra kube-agents installs that scripts/live_test_lease.py must protect.",
     "Only needed for an install you have no checkout of: the install a checkout",
-    "is pointed at is discovered from its k8s-operator/scripts/vars.sh.",
+    "is pointed at is discovered from its install.env.",
     "Copy to ~/.config/kube-agents/live-test-envs.json, or point",
     "$KUBE_AGENTS_LIVE_TEST_ENVS at it. `context` is the only required field;",
     "name, markers, registry, and label are derived from it when omitted.",

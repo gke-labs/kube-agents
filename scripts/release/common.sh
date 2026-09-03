@@ -6,20 +6,22 @@ export REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 # gke_dns_endpoint_flag, so release automation reaches a cluster over the same
 # endpoint the installer would.
-# shellcheck source=k8s-operator/scripts/gke_dns_endpoint.sh
-source "${REPO_ROOT}/k8s-operator/scripts/gke_dns_endpoint.sh"
+# shellcheck source=scripts/installer/gke_dns_endpoint.sh
+source "${REPO_ROOT}/scripts/installer/gke_dns_endpoint.sh"
 
 # Centralized definition of required container images and registry defaults
 export DEFAULT_REGISTRY_PREFIX="ghcr.io/gke-labs/kube-agents"
 export DEFAULT_RELEASE_REPO="gke-labs/kube-agents"
 export DEFAULT_INITIAL_VERSION="0.1.0"
 
-# Declarative registry of all 4 required container images
+# Declarative registry of all required release container images
 export REQUIRED_RELEASE_IMAGES=(
   "k8s-operator"
   "platform-agent"
   "credential-proxy"
   "replay-proxy"
+  "pubsub-platform"
+  "gke-stockout-investigator"
 )
 
 # ─── Boolean Parsing ──────────────────────────────────────────────────────────
@@ -42,14 +44,12 @@ is_ci_pipeline() {
 }
 
 # ─── Cluster connection ───────────────────────────────────────────────────────
-# Two scripts in this directory point kubectl at the RC cluster before doing
-# anything to it — install_pubsub_platform.sh and wait_for_gke_readiness.sh — and
-# a workflow runs them as separate steps, so each starts from a fresh shell and
-# has to resolve the target itself. The pair lives here rather than being
-# duplicated, because the resolution order below is a contract with the
-# workflows: GKE_CLUSTER_NAME/GCP_REGION/GCP_PROJECT_ID are what the `env:` blocks
-# set, and CLUSTER_NAME/REGION/PROJECT_ID are the installer's own names, which a
-# developer running these by hand after install.sh already has exported.
+# Release scripts point kubectl at the RC cluster before doing anything to it,
+# such as wait_for_gke_readiness.sh, resolving the target itself. The helpers live
+# here rather than being duplicated, because the resolution order below is a
+# contract with the workflows: GKE_CLUSTER_NAME/GCP_REGION/GCP_PROJECT_ID are what
+# the `env:` blocks set, and CLUSTER_NAME/REGION/PROJECT_ID are the installer's own
+# names, which a developer running these by hand after install.sh already has exported.
 #
 # Assigns to globals rather than echoing: a caller reading an echo would need
 # command substitution, and a `set -u` abort inside a subshell would leave the

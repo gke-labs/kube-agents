@@ -1,0 +1,198 @@
+# This template renders AgentPlugin custom resources for optional platform plugins
+# (pubsub-platform and gke-stockout-investigator) into the main kube-agents release.
+# This provides declarative deployment via Helm and Terraform (gke-labs/kube-agents#1013),
+# mirroring the specs from agentplugins/*/templates/agentplugin.yaml.
+{{- if .Values.plugins }}
+{{- if and .Values.plugins.stockoutInvestigator .Values.plugins.stockoutInvestigator.enabled }}
+{{- if not (and .Values.plugins.pubsubPlatform .Values.plugins.pubsubPlatform.enabled) }}
+{{- fail "plugins.stockoutInvestigator is enabled, but plugins.pubsubPlatform is disabled: the GKE Stockout Investigator requires the pubsub-platform adapter for Cloud Pub/Sub alert ingress. Set plugins.pubsubPlatform.enabled=true." }}
+{{- end }}
+{{- end }}
+
+{{- if and .Values.plugins.pubsubPlatform .Values.plugins.pubsubPlatform.enabled }}
+---
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: AgentPlugin
+metadata:
+  name: {{ .Values.plugins.pubsubPlatform.name | default "pubsubplatform" }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  agentRef: {{ .Values.plugins.pubsubPlatform.agentRef | default .Values.platformAgent.name | quote }}
+  image: {{ printf "%s:%s" (include "kube-agents.imageRepository" (dict "repository" .Values.plugins.pubsubPlatform.image.repository "registry" (include "kube-agents.imageRegistry" .))) (.Values.plugins.pubsubPlatform.image.tag | default .Values.platformAgent.deployment.image.tag | default .Chart.AppVersion) | quote }}
+  {{- with .Values.plugins.pubsubPlatform.image.pullPolicy }}
+  imagePullPolicy: {{ . | quote }}
+  {{- end }}
+  config: |
+    platform_toolsets:
+      pubsub:
+        # Delegation set every working platform key carries (cli, api_server,
+        # google_chat). Without mcp-router the gateway cannot hand an alert to a
+        # specialist profile, and kanban is the second gate the dispatcher checks.
+        #
+        # `mcp-<name>` maps to `mcp_servers.<name>`. Hermes logs a benign startup
+        # warning for these ("Unknown toolsets: mcp-platform_control, …", issue
+        # #38798): the startup check validates against the bare keys of `mcp_servers`
+        # and does not know the prefixed spelling yet. The tools load regardless, via
+        # the alias registered during discover_mcp_tools.
+        #
+        # Do not add `mcp-agent_common`: the `agent_common` server is no longer
+        # declared for any profile (see the note above `mcp_servers` in
+        # deploy/shared/defaults/config.yaml), so the grant would name a server that
+        # never starts. Delegation is kanban-only.
+        - mcp-router
+        - kanban
+        - memory
+        - hermes-cli
+        - hermes-api-server
+        - mcp-platform_control
+        - mcp-developer_knowledge
+
+    platforms:
+      pubsub:
+        enabled: true
+{{- end }}
+
+{{- if and .Values.plugins.stockoutInvestigator .Values.plugins.stockoutInvestigator.enabled }}
+{{- $cluster := .Values.plugins.stockoutInvestigator.clusterName | default .Values.platformAgent.harness.clusterName -}}
+{{- if not $cluster }}
+{{- fail "plugins.stockoutInvestigator is enabled, but neither plugins.stockoutInvestigator.clusterName nor platformAgent.harness.clusterName is set. Set plugins.stockoutInvestigator.clusterName to the target GKE cluster name." }}
+{{- end }}
+---
+apiVersion: kubeagents.x-k8s.io/v1alpha1
+kind: AgentPlugin
+metadata:
+  name: {{ .Values.plugins.stockoutInvestigator.name | default "gkestockoutinvestigator" }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  agentRef: {{ .Values.plugins.stockoutInvestigator.agentRef | default .Values.platformAgent.name | quote }}
+  image: {{ printf "%s:%s" (include "kube-agents.imageRepository" (dict "repository" .Values.plugins.stockoutInvestigator.image.repository "registry" (include "kube-agents.imageRegistry" .))) (.Values.plugins.stockoutInvestigator.image.tag | default .Values.platformAgent.deployment.image.tag | default .Chart.AppVersion) | quote }}
+  {{- with .Values.plugins.stockoutInvestigator.image.pullPolicy }}
+  imagePullPolicy: {{ . | quote }}
+  {{- end }}
+  # Install into the Platform Agent's profile, not the front door. The skill is used by
+  # whichever profile does the remediation, and a Hermes plugin is only usable by the
+  # profile it is installed in — the profile's load is what runs register(ctx), and that
+  # is what makes `gkestockoutinvestigator:gke-stockout-investigator` resolvable.
+  #
+  # The `platforms` block below is unaffected: platform adapters are gateway singletons,
+  # so the operator always routes that subtree to the default profile where the Pub/Sub
+  # listener actually runs. The subscription's own `agent_profile: platform` is what
+  # sends the resulting work here.
+  targetProfile: {{ .Values.plugins.stockoutInvestigator.targetProfile | default "platform" | quote }}
+  # No `approvals:` block, deliberately. It carried `mode: off`, which was neither
+  # needed nor as narrow as it looked.
+  #
+  # Not needed: the alert is dispatched with `dispatch: kanban`, and the board's worker
+  # is a detached `hermes -p platform chat -q` subprocess — the dispatcher strips the
+  # session context vars from its environment, and HERMES_INTERACTIVE, HERMES_EXEC_ASK
+  # and HERMES_GATEWAY_SESSION are unset in the pod. Hermes' approval gates return
+  # approved for exactly that case (non-interactive, non-gateway, non-cron), so nothing
+  # prompts and nothing hangs. Cron watchdogs are separately covered by the fleet
+  # default `approvals.cron_mode: approve`.
+  #
+  # Not narrow: `approvals` is one of the subtrees a plugin may set, and it lands on the
+  # whole `platform` profile — every session it runs, not just this route's. Turning
+  # approvals off there is an authority grant, which the site's security-and-iam page
+  # names as the caveat that allowlisting bounds where a plugin writes, not how much
+  # authority it grants itself. Paying that for a path that does not need it is a bad
+  # trade.
+  #
+  # Anyone switching this route to `dispatch: api` should revisit that: a gateway-hosted
+  # turn IS a gateway approval context, and a dangerous command there would wait out the
+  # approval timeout with no human attached.
+  config: |
+    platforms:
+      pubsub:
+        enabled: true
+        extra:
+          subscriptions:
+            gke_stockout_alerts:
+              deliver: log
+              agent_profile: platform
+              # File the alert on the board rather than running the turn in the gateway.
+              #
+              # The gateway is the default profile. This plugin installs into `platform`,
+              # so a turn run there cannot open `gkestockoutinvestigator:...` however the
+              # prompt is worded — the agent tries the name, fails, and improvises, which
+              # is indistinguishable from a real investigation until you check whether the
+              # skill was ever read. `dispatch: kanban` hands the alert to the board, whose
+              # dispatcher spawns the worker AS `platform`, where the plugin is loaded.
+              #
+              # This is also the cheaper path, not the more expensive one. The API route
+              # does not avoid a kanban task: the Chat Agent it lands on has no cluster
+              # tools, so it delegates one anyway — after burning a full turn of its own to
+              # decide that. Filing directly skips that turn.
+              dispatch: kanban
+              # No `require_skills` here, though the guard it names is one this route
+              # would want. It cannot work on this path: skills are only loaded in the
+              # gateway for turns that run in the gateway, and this route's do not, so
+              # the adapter never sees a skill go missing and has nothing to refuse.
+              # Setting it anyway advertised a guarantee nothing enforced. The adapter
+              # now warns at startup if a route pairs it with `dispatch: kanban`.
+              prompt: 'GKE Scale-up Failure Alert.
+
+                Judge whether this is a real, active stockout or a duplicate/stale signal,
+                and if it is real, diagnose it and propose a GitOps remediation PR.
+
+                Alert Details:
+                {__raw__}'
+              query: '(log_id("test-stockout") OR log_id("container.googleapis.com/cluster-autoscaler-visibility")) AND (jsonPayload.messageId:("scale.up.error.out.of.resources" OR "scale.up.error.quota.exceeded" OR "scale.up.error.ip.space.exhausted" OR "scale.up.no.scale.up") OR jsonPayload.noDecisionStatus.noScaleUp:* OR jsonPayload.resultInfo.results.errorMsg.messageId:("scale.up.error.out.of.resources" OR "scale.up.error.quota.exceeded" OR "scale.up.error.ip.space.exhausted" OR "scale.up.no.scale.up"))'
+              # Each clause pairs the cluster label with a workload identity. Two clauses
+              # because the label sits at the top level in some payload shapes and under
+              # jsonPayload in others. The identity requirement matters as much as the
+              # cluster one: the autoscaler also emits NAP summary events that name no
+              # controller, and an investigation of "something, somewhere, could not
+              # schedule" has nothing to inspect — the skill's first step is to look at that
+              # workload's pods. Those events used to open an investigation each.
+              filter: "resource.labels.cluster_name == '{{ $cluster }}' and jsonPayload.noDecisionStatus.noScaleUp.unhandledPodGroups.0.podGroup.samplePod.controller.name != '' or jsonPayload.resource.labels.cluster_name == '{{ $cluster }}' and jsonPayload.noDecisionStatus.noScaleUp.unhandledPodGroups.0.podGroup.samplePod.controller.name != ''"
+              threshold_count: {{ (.Values.plugins.stockoutInvestigator.pubsub | default dict).thresholdCount | default 1 }}
+              threshold_window_seconds: {{ (.Values.plugins.stockoutInvestigator.pubsub | default dict).thresholdWindowSeconds | default 300 }}
+              # An entry may be a path, or a list of alternative paths where the first
+              # non-empty one wins. Alternatives matter because the query above matches two
+              # payload shapes — the autoscaler's `noDecisionStatus.noScaleUp` event and the
+              # `resultInfo.results` variety — and a field written for one resolves empty in
+              # the other. If EVERY field resolves empty the alert is not deduplicated at
+              # all, rather than being filed under a key that identifies nothing and would
+              # then suppress every later alert of that shape.
+              deduplicate_fields:
+              # Which cluster, in which project and region. Cluster name alone collides
+              # across projects and regions.
+              - [resource.labels.project_id, jsonPayload.resource.labels.project_id]
+              - [resource.labels.location, jsonPayload.resource.labels.location]
+              - [resource.labels.cluster_name, jsonPayload.resource.labels.cluster_name]
+              # Which workload could not be scheduled. The controller name keeps its
+              # ReplicaSet hash on purpose: that suffix is the pod-template revision, so a
+              # new revision that STILL cannot schedule is a failed remediation — a new
+              # incident worth investigating, not a duplicate to suppress for a day.
+              - jsonPayload.noDecisionStatus.noScaleUp.unhandledPodGroups.0.podGroup.samplePod.namespace
+              - jsonPayload.noDecisionStatus.noScaleUp.unhandledPodGroups.0.podGroup.samplePod.controller.kind
+              - jsonPayload.noDecisionStatus.noScaleUp.unhandledPodGroups.0.podGroup.samplePod.controller.name
+              #
+              # Identity ONLY — deliberately no failure detail. It is tempting to add the
+              # reason so that, say, a quota failure after a scarcity fix opens a fresh
+              # investigation. Measured against real autoscaler output, that backfires: one
+              # incident emits `napFailureReasons.0.messageId` as
+              # zonal.failing.predicates / zonal.illegal.config / zonal.resources.exceeded
+              # on successive attempts, `napFailureReasons.0.parameters.0` cycles through
+              # the zones tried (us-east1-b/-c/-d — it is the zone, not the accelerator),
+              # and `jsonPayload.messageId` is absent from the NAP-shaped events entirely.
+              # Keying on any of them turns one stockout into an investigation per retry.
+              # A new pod-template revision already gives a new key via the ReplicaSet
+              # suffix, which covers the case that actually matters: a remediation that did
+              # not work.
+              skills:
+              # Namespaced as <plugin.yaml name>:<registered skill name>, which is how
+              # ctx.register_skill() exposes it. The bare name resolves only for bundled
+              # skills in ~/.hermes/skills/.
+              - gkestockoutinvestigator:gke-stockout-investigator
+              subscription: {{ (.Values.plugins.stockoutInvestigator.pubsub | default dict).subscription | default "gke-stockout-alerts-sub" | quote }}
+              topic: {{ (.Values.plugins.stockoutInvestigator.pubsub | default dict).topic | default "gke-stockout-alerts-topic" | quote }}
+              # Sink configuration matching the Log Router sink that exports autoscaler logs
+              # to the topic above.
+              sink: {{ (.Values.plugins.stockoutInvestigator.pubsub | default dict).sink | default "gke-stockout-alerts-sink" | quote }}
+{{- end }}
+{{- end }}

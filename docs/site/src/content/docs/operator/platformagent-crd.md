@@ -27,9 +27,10 @@ spec:
   telemetry: { ... } # OTLP collector endpoint (optional)
   networkPolicy: { ... } # generated egress NetworkPolicy (optional)
   integration: { ... } # Google Chat, Slack, GitHub
+  mode: today # unsupported dev toggle for the A2A stack (optional)
 ```
 
-`spec.deployment`, `spec.security`, `spec.telemetry`, and `spec.networkPolicy` are inlined from the shared `AgentSpec`, so they are common to every agent type. `spec.harness` is required; `spec.integration`, `spec.telemetry`, and `spec.networkPolicy` are optional.
+`spec.deployment`, `spec.security`, `spec.telemetry`, and `spec.networkPolicy` are inlined from the shared `AgentSpec`, so they are common to every agent type. `spec.harness` is required; `spec.integration`, `spec.telemetry`, and `spec.networkPolicy` are optional. `spec.mode` is an optional enum (`today`/`next`, absent means `today`) and, like `experimental.platformFrontDoor`, **unsupported**: it is the dev toggle from `docs/designs/spec-mode-switch.md` that keeps the A2A `next` stack dark, it is deliberately not surfaced in the Helm chart, and nothing renders differently under `next` yet.
 
 ## `spec.harness`
 
@@ -479,7 +480,7 @@ The operator writes observed state to the `status` subresource:
 
 | Field                                  | Type     | Purpose                                                                                             |
 | -------------------------------------- | -------- | --------------------------------------------------------------------------------------------------- |
-| `phase`                                | string   | Overall state (`Pending`, `Provisioning`, `Ready`, `Failed`).                                       |
+| `phase`                                | string   | Overall state (`Pending`, `Provisioning`, `Ready`, `Degraded`, `Failed`).                           |
 | `address`                              | string   | Fully qualified domain name (FQDN) of the agent service.                                            |
 | `lastReconcileTime`                    | time     | Timestamp of the last status update.                                                                |
 | `conditions`                           | list     | Standard `metav1.Condition` observations, keyed by `type`.                                          |
@@ -498,11 +499,11 @@ The operator writes observed state to the `status` subresource:
 
 Three condition types appear in `conditions`, and only the first is always present:
 
-| Type           | Written                                      | Meaning                                                                                                                                                                                                                                                                       |
-| -------------- | -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Ready`        | Always                                       | Tracks `phase`; its `reason` and `message` carry whatever the reconcile is waiting on — including the four spec refusals that park `phase: Degraded` (`RuntimeClassNotFound`, `SplitBrokerStrandsEventWatcher`, `EgressPolicyRequiresSplitBroker`, `EgressAllowlistRefused`). |
-| `Degraded`     | Only while degraded                          | Something in the spec cannot be honoured — today, `Reason: InvalidGitRepoURL`. The refusals above ride the `Ready` condition instead of this one.                                                                                                                             |
-| `EventWatcher` | Only while `eventWatcher.enabled` is `false` | `status: False`, `Reason: DisabledBySpec`. The emergency stop is still pressed and no cluster events are reaching the agent.                                                                                                                                                  |
+| Type           | Written                                      | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| -------------- | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Ready`        | Always                                       | Tracks `phase`; its `reason` and `message` carry whatever the reconcile is waiting on — including the five spec refusals that park `phase: Degraded` (`RuntimeClassNotFound`, `SplitBrokerStrandsEventWatcher`, `EgressPolicyRequiresSplitBroker`, `EgressAllowlistRefused`, `ModeNotRecognized`). The last is the version-skew refusal from the mode spec and behaves differently on purpose: today's stack still renders in full and the refusal is reported at the end, rather than returning early. |
+| `Degraded`     | Only while degraded                          | Something in the spec cannot be honoured — today, `Reason: InvalidGitRepoURL`. The refusals above ride the `Ready` condition instead of this one.                                                                                                                                                                                                                                                                                                                                                       |
+| `EventWatcher` | Only while `eventWatcher.enabled` is `false` | `status: False`, `Reason: DisabledBySpec`. The emergency stop is still pressed and no cluster events are reaching the agent.                                                                                                                                                                                                                                                                                                                                                                            |
 
 `EventWatcher` is absent on a healthy install rather than `True`, deliberately: the operator can say
 it asked for a watcher, but nothing here checks that one is alive, and a permanently-`True`
@@ -585,7 +586,7 @@ from chat. The platform credentials and endpoints that have no `config.yaml` equ
 through a companion `/etc/hermes/.env`, which Hermes applies last with `override=True` and refuses to
 let the agent overwrite — without that, a container env var would beat the pinned `platforms.*` leaf.
 
-That file also pins one value that is not a credential at all: `API_SERVER_KEY=cluster-internal-trusted`,
+That file also pins two values that are not credentials at all. The first is `API_SERVER_KEY=cluster-internal-trusted`,
 the non-secret loopback sentinel the Hermes API server on `127.0.0.1:8642` validates. It is pinned here
 because Hermes' stage2 hook generates a random `API_SERVER_KEY` into `$HERMES_HOME/.env` whenever that
 file carries none, and the PVC `.env` is applied with `override=True` too — ahead of the container env,
@@ -594,6 +595,10 @@ credential proxy, the startup probe and every in-pod loopback call get `401 Inva
 (issue #786). The container entrypoint warns at boot when this pin and the container env disagree.
 The credential that guards the API from _outside_ is `API_SERVER_EXTERNAL_KEY`, set from
 `hermes.apiServerSecretRef`; the sidecar authenticates the caller against it and swaps in the sentinel.
+The second is `KUBEAGENTS_MODE` (`today` or `next`, from `spec.mode`) — the mode switch's delivery
+contract (`docs/designs/spec-mode-switch.md`). It is pinned always, with the real value, because an
+absent key is a key the agent may write, and it is read back by exactly one module,
+`agents/platform/scripts/runtime_mode.py` (a grep test enforces the pair).
 
 One consequence is worth knowing before you edit `renderConfigYAML`: the managed overlay is a
 leaf-level merge, and a list is a leaf, so a list rendered here **replaces** the image's rather than

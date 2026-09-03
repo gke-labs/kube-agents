@@ -8,16 +8,15 @@
 
 set -euo pipefail
 
+# See dev_rebuild_agent.sh: the shared helpers are the sibling directory, and
+# VARS_FILE points there so load_state does not create a stray one here.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [[ "$SCRIPT_DIR" == */scripts/dev ]]; then
-  SCRIPTS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
-else
-  SCRIPTS_DIR="${SCRIPT_DIR}"
-fi
-VARS_FILE="${SCRIPTS_DIR}/vars.sh"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+INSTALLER_DIR="${REPO_ROOT}/scripts/installer"
+VARS_FILE="${INSTALLER_DIR}/vars.sh"
 
 # ─── ANSI Colors ──────────────────────────────────────────────────────────────
-source "${SCRIPTS_DIR}/common.sh" "$@"
+source "${INSTALLER_DIR}/common.sh" "$@"
 
 # ─── Configuration State Restoration ──────────────────────────────────────────
 ensure_teardown_state

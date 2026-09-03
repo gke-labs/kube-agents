@@ -16,6 +16,8 @@ MOCK_REQUIRED_RELEASE_IMAGES = [
     "platform-agent",
     "credential-proxy",
     "replay-proxy",
+    "pubsub-platform",
+    "gke-stockout-investigator",
 ]
 
 MOCK_INITIAL_VERSION = "0.1.0"

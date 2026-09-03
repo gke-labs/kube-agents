@@ -911,7 +911,7 @@ class SanitizerMirrorDriftTest(unittest.TestCase):
 
         `platform_mcp_server.py` holds the canonical copy; this script mirrors
         it because importing that module means importing `mcp`,
-        `agent_common_server` and `gke_endpoint` and constructing a FastMCP
+        `agent_common_server` and `gke_endpoint` and constructing an MCP
         server as a side effect. A mirror nobody checks is how the two drift,
         and a character class stripped on one path but not the other is a hole
         in whichever side forgot. The Unicode tag block is the standard

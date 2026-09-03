@@ -1,6 +1,6 @@
 """The DNS-endpoint predicate is implemented three times. Hold them together.
 
-`gke_endpoint.py` decides for the agent, `k8s-operator/scripts/gke_dns_endpoint.sh`
+`gke_endpoint.py` decides for the agent, `scripts/installer/gke_dns_endpoint.sh`
 for every shell script, and an inlined `awk` program in
 `platformagent_manifests.go` for the credential proxy's bootstrap — the operator
 cannot describe the cluster when it renders that manifest, so the check has to
@@ -27,7 +27,7 @@ import unittest
 import gke_endpoint
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-BASH_HELPER = os.path.join(REPO_ROOT, "k8s-operator", "scripts", "gke_dns_endpoint.sh")
+BASH_HELPER = os.path.join(REPO_ROOT, "scripts", "installer", "gke_dns_endpoint.sh")
 MANIFESTS_GO = os.path.join(
     REPO_ROOT, "k8s-operator", "internal", "controller", "platformagent_manifests.go"
 )

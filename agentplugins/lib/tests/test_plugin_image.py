@@ -954,6 +954,39 @@ class PublishGuardTests(PluginTreeMixin, unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(self.crane_calls.exists())
 
+    def test_crane_honours_dockerfile_base_image(self):
+        plugin = self.make_plugin(
+            dockerfile="FROM busybox:musl\nCOPY files/ /\nCOPY files/ /files/\n",
+            files={"files/a.txt": "a"},
+        )
+        env = self.crane_stub()
+        stub = pathlib.Path(env["CRANE_BIN"])
+        stub.write_text(
+            '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CRANE_CALLS"\ncase "$1" in\n    digest) exit 1 ;;\n    *) exit 0 ;;\nesac\n'
+        )
+        stub.chmod(0o755)
+        result = self.publish_unresolved(plugin, env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.crane_calls.read_text()
+        self.assertIn("append -b busybox:musl", calls)
+
+    def test_crane_omits_base_flag_for_scratch_image(self):
+        plugin = self.make_plugin(
+            dockerfile="FROM scratch\nCOPY files/ /\n",
+            files={"files/a.txt": "a"},
+        )
+        env = self.crane_stub()
+        stub = pathlib.Path(env["CRANE_BIN"])
+        stub.write_text(
+            '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CRANE_CALLS"\ncase "$1" in\n    digest) exit 1 ;;\n    *) exit 0 ;;\nesac\n'
+        )
+        stub.chmod(0o755)
+        result = self.publish_unresolved(plugin, env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.crane_calls.read_text()
+        self.assertIn("append -f", calls)
+        self.assertNotIn("-b", calls)
+
 
 class RecipeCounterTests(unittest.TestCase):
     """PLUGIN_IMAGE_RECIPE is bumped by hand, and forgetting to is invisible.

@@ -844,8 +844,8 @@ func TestBuildDeployment(t *testing.T) {
 	if fbContainer.Name != "fluent-bit" {
 		t.Errorf("expected container name fluent-bit, got %s", fbContainer.Name)
 	}
-	if fbContainer.Image != "fluent/fluent-bit:5.1.0" {
-		t.Errorf("expected fluent-bit image fluent/fluent-bit:5.1.0, got %s", fbContainer.Image)
+	if fbContainer.Image != "fluent/fluent-bit:5.1.1" {
+		t.Errorf("expected fluent-bit image fluent/fluent-bit:5.1.1, got %s", fbContainer.Image)
 	}
 	if fbContainer.SecurityContext == nil || fbContainer.SecurityContext.ReadOnlyRootFilesystem == nil || !*fbContainer.SecurityContext.ReadOnlyRootFilesystem {
 		t.Errorf("expected SecurityContext.ReadOnlyRootFilesystem true on fluent-bit container")
@@ -1412,10 +1412,10 @@ func TestImageEnvOverrides(t *testing.T) {
 }
 
 func TestFluentBitImageEnvOverride(t *testing.T) {
-	if got := fluentBitImage(); got != "fluent/fluent-bit:5.1.0" {
+	if got := fluentBitImage(); got != "fluent/fluent-bit:5.1.1" {
 		t.Fatalf("unexpected default fluent-bit image: %s", got)
 	}
-	t.Setenv("FLUENT_BIT_IMAGE", "registry.corp/mirror/fluent-bit:5.1.0")
+	t.Setenv("FLUENT_BIT_IMAGE", "registry.corp/mirror/fluent-bit:5.1.1")
 
 	agent := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
@@ -1425,7 +1425,7 @@ func TestFluentBitImageEnvOverride(t *testing.T) {
 	for _, c := range dep.Spec.Template.Spec.Containers {
 		if c.Name == "fluent-bit" {
 			found = true
-			if c.Image != "registry.corp/mirror/fluent-bit:5.1.0" {
+			if c.Image != "registry.corp/mirror/fluent-bit:5.1.1" {
 				t.Fatalf("expected FLUENT_BIT_IMAGE override on sidecar, got %s", c.Image)
 			}
 		}
@@ -1444,7 +1444,7 @@ func TestFluentBitImageEnvOverride(t *testing.T) {
 func TestNoPublicRegistryWhenMirrored(t *testing.T) {
 	const mirror = "registry.corp/mirror"
 	t.Setenv("PLATFORM_AGENT_IMAGE", mirror+"/platform-agent:v1.2.3")
-	t.Setenv("FLUENT_BIT_IMAGE", mirror+"/fluent-bit:5.1.0")
+	t.Setenv("FLUENT_BIT_IMAGE", mirror+"/fluent-bit:5.1.1")
 	// CREDENTIAL_PROXY_IMAGE deliberately left unset: the sidecar must derive
 	// its registry from PLATFORM_AGENT_IMAGE, not fall back to ghcr.io.
 
@@ -2763,7 +2763,7 @@ func TestManagedEnvPinsPlatformKeysButNotHome(t *testing.T) {
 	// would only be a key the agent is refused permission to set. What survives is the
 	// loopback bearer, which is not conditional on anything; see the next test.
 	bare := renderManagedEnv(newTestPlatformAgent())
-	if got, want := bare, "API_SERVER_KEY="+loopbackAgentAPIKey+"\n"; got != want {
+	if got, want := bare, "API_SERVER_KEY="+loopbackAgentAPIKey+"\n"+kubeagentsModeEnvKey+"=today\n"; got != want {
 		t.Errorf("renderManagedEnv with no integration = %q, want %q", got, want)
 	}
 }
@@ -2827,7 +2827,14 @@ func assertManagedEnvAgrees(t *testing.T, agent *agentv1alpha1.PlatformAgent) {
 	// operator does not configure has no value to place there, and the pin exists purely
 	// to occupy the key name so save_env_value refuses the agent's write. Absent from the
 	// container env is not a disagreement — only a different answer is.
-	pinnedOnly := map[string]bool{"GATEWAY_ALLOWED_USERS": true, "GATEWAY_ALLOW_ALL_USERS": true}
+	// The mode key is pinned-only by design: the managed .env is the one path the
+	// mode takes into the runtime (spec-mode-switch.md), so a container-env copy
+	// would be a second answer to a question that must have exactly one.
+	pinnedOnly := map[string]bool{
+		"GATEWAY_ALLOWED_USERS":   true,
+		"GATEWAY_ALLOW_ALL_USERS": true,
+		kubeagentsModeEnvKey:      true,
+	}
 
 	for _, line := range strings.Split(strings.TrimSpace(renderManagedEnv(agent)), "\n") {
 		key, want, _ := strings.Cut(line, "=")
@@ -3073,17 +3080,50 @@ func TestBuildDeployment_AgentPlugins_ImageVolumeUnsupported(t *testing.T) {
 	// Pass isImageVolumeSupported = false
 	dep := buildDeployment(agent, "h1", "h2", "h3", "h4", plugins, renderOptions{})
 
-	for _, vol := range dep.Spec.Template.Spec.Volumes {
-		if vol.Name == "plugin-myplugin" {
-			t.Errorf("expected plugin-myplugin volume to NOT be attached when isImageVolumeSupported is false")
+	// 1. Volume must be attached as EmptyDir
+	var pluginVol *corev1.Volume
+	for i := range dep.Spec.Template.Spec.Volumes {
+		if dep.Spec.Template.Spec.Volumes[i].Name == "plugin-myplugin" {
+			pluginVol = &dep.Spec.Template.Spec.Volumes[i]
+			break
 		}
 	}
+	if pluginVol == nil {
+		t.Fatalf("expected plugin-myplugin volume to be attached as EmptyDir when isImageVolumeSupported is false")
+	}
+	if pluginVol.EmptyDir == nil {
+		t.Errorf("expected plugin-myplugin volume source to be EmptyDir, got %+v", pluginVol)
+	}
 
-	container := dep.Spec.Template.Spec.Containers[0]
-	for _, m := range container.VolumeMounts {
-		if m.Name == "plugin-myplugin" {
-			t.Errorf("expected plugin-myplugin volume mount to NOT be attached when isImageVolumeSupported is false")
+	// 2. InitContainer must stage the plugin
+	var stageInit *corev1.Container
+	for i := range dep.Spec.Template.Spec.InitContainers {
+		if dep.Spec.Template.Spec.InitContainers[i].Name == "stage-myplugin" {
+			stageInit = &dep.Spec.Template.Spec.InitContainers[i]
+			break
 		}
+	}
+	if stageInit == nil {
+		t.Fatalf("expected stage-myplugin init container to be present")
+	}
+	if stageInit.Image != "gcr.io/my-plugin:v1" {
+		t.Errorf("expected init container image 'gcr.io/my-plugin:v1', got %q", stageInit.Image)
+	}
+
+	// 3. Main container must mount the volume
+	container := dep.Spec.Template.Spec.Containers[0]
+	var pluginMount *corev1.VolumeMount
+	for i := range container.VolumeMounts {
+		if container.VolumeMounts[i].Name == "plugin-myplugin" {
+			pluginMount = &container.VolumeMounts[i]
+			break
+		}
+	}
+	if pluginMount == nil {
+		t.Fatalf("expected plugin-myplugin volume mount in platform-agent container")
+	}
+	if pluginMount.MountPath != "/opt/data/plugins/myplugin" {
+		t.Errorf("expected mount path /opt/data/plugins/myplugin, got %q", pluginMount.MountPath)
 	}
 }
 
@@ -5299,8 +5339,11 @@ var operatorBuiltContainers = []string{
 // the author forgot to harden arrives as an unknown name, not as a silent pass.
 func TestEveryContainerHasAHardenedSecurityContext(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		agent *agentv1alpha1.PlatformAgent
+		name            string
+		agent           *agentv1alpha1.PlatformAgent
+		plugins         []*agentv1alpha1.AgentPlugin
+		extraContainers []string
+		renderOpts      renderOptions
 		// The dashboard is the one operator-built container a CR can switch off.
 		absent string
 	}{
@@ -5316,15 +5359,30 @@ func TestEveryContainerHasAHardenedSecurityContext(t *testing.T) {
 			}(),
 			absent: "platform-agent-dashboard",
 		},
+		{
+			name:  "with staging plugin",
+			agent: newTestPlatformAgent(),
+			plugins: []*agentv1alpha1.AgentPlugin{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "myplugin", Namespace: "default"},
+					Spec:       agentv1alpha1.AgentPluginSpec{Image: "example.com/plugin:v1"},
+				},
+			},
+			extraContainers: []string{"stage-myplugin"},
+			renderOpts:      renderOptions{imageVolumeSupported: false},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			pod := buildPodTemplateSpec(tc.agent, "h", "h", "h", "h", nil, renderOptions{})
+			pod := buildPodTemplateSpec(tc.agent, "h", "h", "h", "h", tc.plugins, tc.renderOpts)
 
-			want := make(map[string]bool, len(operatorBuiltContainers))
+			want := make(map[string]bool, len(operatorBuiltContainers)+len(tc.extraContainers))
 			for _, n := range operatorBuiltContainers {
 				if n != tc.absent {
 					want[n] = true
 				}
+			}
+			for _, n := range tc.extraContainers {
+				want[n] = true
 			}
 
 			all := append(append([]corev1.Container{}, pod.Spec.InitContainers...), pod.Spec.Containers...)
@@ -5386,6 +5444,31 @@ func TestCRSuppliedSidecarsAreNotHardenedByTheOperator(t *testing.T) {
 	}
 }
 
+func TestBuildPluginStagingContainerName(t *testing.T) {
+	cases := []struct {
+		pluginName string
+	}{
+		{"myplugin"},
+		{"gkestockoutinvestigator"},
+		{"pubsubplatform"},
+		{"verylongpluginnameexceedingthelimitbyalot"},
+	}
+
+	for _, tc := range cases {
+		got := buildPluginStagingContainerName(tc.pluginName)
+		if len(got) > maxAutopilotContainerNameLen {
+			t.Errorf("buildPluginStagingContainerName(%q) = %q (len %d), exceeds max length %d",
+				tc.pluginName, got, len(got), maxAutopilotContainerNameLen)
+		}
+		// Verify that GKE Autopilot gVisor annotation key will not exceed 63 bytes
+		gvisorAnnotation := "dev.gvisor.internal.seccomp." + got
+		if len(gvisorAnnotation) > 63 {
+			t.Errorf("gVisor annotation %q for %q exceeds 63 bytes (len %d)",
+				gvisorAnnotation, tc.pluginName, len(gvisorAnnotation))
+		}
+	}
+}
+
 // TestGitOpsStateVolumeIsMountedAsDirectory verifies that the GitOps state ConfigMap
 // is mounted as a directory (never subPath) so kubelet live updates work without pod restart,
 // and is propagated to both the agent and credential proxy containers.
@@ -5443,5 +5526,90 @@ func TestGitOpsStateVolumeIsMountedAsDirectory(t *testing.T) {
 		} else if gotPath != filepath.Join(gitopsStateDir, "managed_repos") {
 			t.Errorf("[%s] expected GITOPS_STATE_PATH %s, got %s", containerName, filepath.Join(gitopsStateDir, "managed_repos"), gotPath)
 		}
+	}
+}
+
+func TestBuildPluginStagingInitContainer_AssertsNonEmptyAndFailsOnErrors(t *testing.T) {
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "myplugin"},
+		Spec: agentv1alpha1.AgentPluginSpec{
+			Image: "busybox:musl",
+		},
+	}
+	c := buildPluginStagingInitContainer("/home/agent", plugin)
+	if len(c.Command) != 3 || c.Command[0] != "/bin/sh" || c.Command[1] != "-c" {
+		t.Fatalf("unexpected command: %v", c.Command)
+	}
+	script := c.Command[2]
+	if strings.HasSuffix(strings.TrimSpace(script), "; true") {
+		t.Errorf("script must not swallow errors with trailing '; true', got: %s", script)
+	}
+	expectedAssertion := `[ -n "$(ls -A /home/agent/plugins/myplugin)" ]`
+	if !strings.Contains(script, expectedAssertion) {
+		t.Errorf("script must assert non-empty mount with %q, got: %s", expectedAssertion, script)
+	}
+}
+
+// The mode pin (docs/designs/spec-mode-switch.md): the managed key is the only
+// way the mode reaches the agent runtime, and it is emitted always, with the
+// real value, per this file's pin doctrine — an absent key is a key the agent
+// may write into the PVC .env, and the mode must not be the agent's to fake.
+func TestManagedEnvPinsTheMode(t *testing.T) {
+	bare := newTestPlatformAgent()
+	if env := renderManagedEnv(bare); !strings.Contains(env, kubeagentsModeEnvKey+"=today") {
+		t.Errorf("mode absent must pin today, got:\n%s", env)
+	}
+
+	next := newTestPlatformAgent()
+	next.Spec.Mode = ptr.To("next")
+	if env := renderManagedEnv(next); !strings.Contains(env, kubeagentsModeEnvKey+"=next") {
+		t.Errorf("mode next must pin next, got:\n%s", env)
+	}
+
+	// Flipping the mode rolls the agent pod: the managed .env feeds the config
+	// ConfigMap, whose hash is a pod-template annotation (config-hash). Same
+	// mechanism as every other config change; this asserts the mode rides it.
+	todayHash, err := getConfigMapHash(buildConfigMap(bare, nil))
+	if err != nil {
+		t.Fatalf("hashing today's config: %v", err)
+	}
+	nextHash, err := getConfigMapHash(buildConfigMap(next, nil))
+	if err != nil {
+		t.Fatalf("hashing next's config: %v", err)
+	}
+	if todayHash == nextHash {
+		t.Error("flipping the mode does not move the config hash, so the pod never rolls and the running agent keeps the old mode")
+	}
+}
+
+func TestManagedEnvValuesCannotSmuggleALine(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				GoogleChat: &agentv1alpha1.GoogleChatSpec{
+					Enabled:      ptr.To(true),
+					ProjectID:    "p",
+					AllowedUsers: []string{"someone\nKUBEAGENTS_MODE=next"},
+				},
+			},
+		},
+	}
+	rendered := renderManagedEnv(agent)
+	// The property is about LINES, which is how every reader of this file
+	// parses it: the smuggled text surviving inside another key's value is
+	// harmless (the parser splits on the first `=`, so it stays that key's
+	// data), but a line of its own would be a second pin.
+	modeLines := 0
+	for _, line := range strings.Split(rendered, "\n") {
+		if strings.HasPrefix(line, "KUBEAGENTS_MODE=") {
+			modeLines++
+			if line != "KUBEAGENTS_MODE=today" {
+				t.Errorf("a CR value smuggled a mode line: %q", line)
+			}
+		}
+	}
+	if modeLines != 1 {
+		t.Errorf("expected exactly one KUBEAGENTS_MODE line, got %d:\n%s", modeLines, rendered)
 	}
 }

@@ -6,8 +6,9 @@ The platform profile has no cron ticker thread. It is ticked once a minute by
 whose CLI body is verbatim ``tick(verbose=True)``. Everything Hermes attaches to
 the ticker's lifetime -- the in-flight job set, the startup recovery sweep, the
 assumption that a tick is a short scheduling pass inside a long-lived process --
-is therefore either absent or wrong on that profile. This module and the twelve
-anchored edits in ``apply_cron_tick_lock_scope.py`` supply what is missing.
+is therefore either absent or wrong on that profile. This module and the
+fourteen anchored edits in ``apply_cron_tick_lock_scope.py`` supply what is
+missing.
 
 Head-of-line blocking: the tick lock covered execution
 ------------------------------------------------------

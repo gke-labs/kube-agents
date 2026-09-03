@@ -50,7 +50,7 @@ func fallbackPlatformAgentImage() string {
 }
 
 const (
-	fallbackFluentBitImage = "fluent/fluent-bit:5.1.0"
+	fallbackFluentBitImage = "fluent/fluent-bit:5.1.1"
 
 	// Operator-level image overrides for installs that mirror images into a
 	// private registry. Set on the controller-manager Deployment; a CR's
@@ -266,7 +266,7 @@ func fluentBitImage() string {
 
 // resolveAgentImage determines the full image reference using the optional deployment spec and a fallback default.
 //
-// qualify_image_ref() in k8s-operator/scripts/common.sh is the provisioning-time
+// qualify_image_ref() in scripts/installer/common.sh is the provisioning-time
 // twin of this rule and must agree on how a reference is split. The no-tag
 // fallback deliberately differs: this path is serving a live CR and settles for
 // "latest", while the shell helper can still abort the run and does.

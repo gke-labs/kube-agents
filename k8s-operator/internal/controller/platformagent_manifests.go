@@ -80,6 +80,11 @@ const (
 	// entrypoints run with umask 0002 so files created after mount stay
 	// group-writable.
 	agentFSGroup = int64(10000)
+
+	// maxAutopilotContainerNameLen is the maximum container name length that avoids
+	// exceeding Kubernetes 63-byte annotation key limits when GKE Autopilot / gVisor injects
+	// "dev.gvisor.internal.seccomp.<container-name>" (28-byte prefix without slash).
+	maxAutopilotContainerNameLen = 35
 )
 
 // Shared-state ownership. Step 1.5 of deploy/shared/docker-entrypoint.sh reads this
@@ -316,6 +321,20 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	// reshuffles on every reconcile would roll the pod for no reason.
 	var lines []string
 	add := func(key, value string) {
+		// One line per key, enforced rather than assumed. Most values here come
+		// from CR strings with no pattern or maxLength on the field (chat user
+		// lists, project and subscription names), and this file is line-oriented
+		// to every reader it has. A newline in one of them appends a line the
+		// render never intended — and the mode this file delivers is read back
+		// through exactly that line shape (Hermes loads the file per-line into
+		// the environment with override semantics, last occurrence winning;
+		// agents/platform/scripts/runtime_mode.py answers from the result), so
+		// a smuggled `KUBEAGENTS_MODE=next` line rendered after the operator's
+		// own pin is a mode flip written by whoever can edit the CR's chat
+		// settings. Stripped, not escaped: nothing downstream reads a
+		// multi-line value, so there is nothing to preserve.
+		value = strings.ReplaceAll(value, "\n", "")
+		value = strings.ReplaceAll(value, "\r", "")
 		lines = append(lines, fmt.Sprintf("%s=%s", key, value))
 	}
 
@@ -345,6 +364,14 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 	// sidecar's AGENT_API_UPSTREAM_KEY and to the probe's bearer, reintroducing exactly
 	// the several-parties-must-agree problem this closes.
 	add("API_SERVER_KEY", loopbackAgentAPIKey)
+
+	// The mode pin, also unconditional and also not about chat. The managed key
+	// is the only way the mode reaches the agent runtime, and pinning it is what
+	// keeps the agent from writing a competing answer into the PVC .env — which
+	// stack the install runs is not the agent's to decide. Deliberately absent
+	// from the container env: one delivery path means one answer
+	// (docs/designs/spec-mode-switch.md).
+	add(kubeagentsModeEnvKey, string(renderMode(agent, "settings")))
 
 	integration := agent.Spec.Integration
 	if integration == nil {
@@ -565,6 +592,14 @@ const (
 	// volume into the agent container so skills can read managed repositories directly from disk.
 	gitopsStateVolumeName = "gitops-state-volume"
 	gitopsStateDir        = "/etc/gitops"
+
+	// kubeagentsModeEnvKey carries the mode switch into the managed .env — the
+	// only way the mode reaches the agent runtime (docs/designs/spec-mode-switch.md).
+	// Agent-side, exactly one reader exists: agents/platform/scripts/runtime_mode.py.
+	// The spec's grep rule holds the pair to that: a third code site naming this
+	// key is a review comment, so new readers go through runtime_mode, and any
+	// operator-side use goes through this constant.
+	kubeagentsModeEnvKey = "KUBEAGENTS_MODE"
 )
 
 // loopbackAgentAPIKey is the bearer the Hermes API server on 127.0.0.1:8642 accepts, and
@@ -928,7 +963,7 @@ func frontDoorOverlay(agent *agentv1alpha1.PlatformAgent) map[string]any {
 
 // memoryProviderIsHindsightBacked reports whether a provider talks to the in-cluster
 // Hindsight service. Keep in sync with memory_provider_uses_hindsight in
-// k8s-operator/scripts/common.sh, which decides whether to deploy it.
+// scripts/installer/common.sh, which decides whether to deploy it.
 func memoryProviderIsHindsightBacked(provider string) bool {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
 	case kubeAgentsMemoryProvider, "hindsight":
@@ -962,6 +997,36 @@ func pluginMountPath(homeDir string, plugin *agentv1alpha1.AgentPlugin) string {
 		return fmt.Sprintf("%s/%s/%s", pluginProfileMountRoot, profile, plugin.Name)
 	}
 	return fmt.Sprintf("%s/plugins/%s", homeDir, plugin.Name)
+}
+
+// buildPluginStagingInitContainer builds an init container that extracts a plugin's container image
+// into an emptyDir volume on clusters where ImageVolumeSource is unsupported or restricted (e.g. GKE Autopilot).
+func buildPluginStagingInitContainer(homeDir string, plugin *agentv1alpha1.AgentPlugin) corev1.Container {
+	mountPath := pluginMountPath(homeDir, plugin)
+	pullPolicy := corev1.PullIfNotPresent
+	if plugin.Spec.ImagePullPolicy != nil {
+		pullPolicy = *plugin.Spec.ImagePullPolicy
+	}
+	stageScript := fmt.Sprintf("mkdir -p %s && (if [ -d /files ]; then cp -a /files/. %s/; else for item in /*; do case \"$item\" in /bin|/boot|/dev|/etc|/home|/lib*|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var) ;; *) cp -a \"$item\" %s/ ;; esac; done; fi) && [ -n \"$(ls -A %s)\" ]",
+		mountPath, mountPath, mountPath, mountPath)
+
+	return corev1.Container{
+		Name:            buildPluginStagingContainerName(plugin.Name),
+		Image:           plugin.Spec.Image,
+		ImagePullPolicy: pullPolicy,
+		SecurityContext: hardenedSecurityContext(),
+		Command: []string{
+			"/bin/sh",
+			"-c",
+			stageScript,
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      buildPluginVolumeName(plugin.Name),
+				MountPath: mountPath,
+			},
+		},
+	}
 }
 
 // partitionPluginsByProfile splits plugins into those belonging to the default profile
@@ -1701,6 +1766,12 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	// credentialed deployments before the agent sandbox can mount the PVC.
 	initContainers = append([]corev1.Container{buildSandboxCredentialCleanup(image, pullPolicy)}, initContainers...)
 
+	if !opts.imageVolumeSupported {
+		for _, plugin := range agentPlugins {
+			initContainers = append(initContainers, buildPluginStagingInitContainer(homeDir, plugin))
+		}
+	}
+
 	pluginsDebugVal := "0"
 	if agent.Spec.Harness != nil && agent.Spec.Harness.Hermes != nil && agent.Spec.Harness.Hermes.PluginsDebug != nil {
 		if *agent.Spec.Harness.Hermes.PluginsDebug {
@@ -2095,10 +2166,12 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 				},
 			})
 		} else {
-			manifestsLog.Error(fmt.Errorf("ImageVolumeSource unsupported on Kubernetes < 1.35"),
-				"skipping plugin OCI image volume mount to prevent deployment pod validation failure",
-				"plugin", plugin.Name,
-				"platformagent", agent.Name)
+			volumes = append(volumes, corev1.Volume{
+				Name: buildPluginVolumeName(plugin.Name),
+				VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{},
+				},
+			})
 		}
 	}
 	volumes = append(volumes, buildCustomStorageVolumes(agent)...)
@@ -2739,7 +2812,7 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 			// cannot answer that when it renders the manifest — the answer is a
 			// property of the cluster, read at bootstrap time — so the describe is
 			// inlined here. agents/platform/scripts/gke_endpoint.py and
-			// k8s-operator/scripts/gke_dns_endpoint.sh implement the same predicate;
+			// scripts/installer/gke_dns_endpoint.sh implement the same predicate;
 			// keep all three in step.
 			//
 			// Deciding on the configuration rather than trying --dns-endpoint and
@@ -3137,13 +3210,11 @@ func buildBaseContainers(agent *agentv1alpha1.PlatformAgent, image string, envVa
 		args = []string{"hermes", "--profile", platformProfileName, "gateway", "run"}
 	}
 
-	if isImageVolumeSupported {
-		for _, plugin := range agentPlugins {
-			volumeMounts = append(volumeMounts, corev1.VolumeMount{
-				Name:      buildPluginVolumeName(plugin.Name),
-				MountPath: pluginMountPath(homeDir, plugin),
-			})
-		}
+	for _, plugin := range agentPlugins {
+		volumeMounts = append(volumeMounts, corev1.VolumeMount{
+			Name:      buildPluginVolumeName(plugin.Name),
+			MountPath: pluginMountPath(homeDir, plugin),
+		})
 	}
 
 	// APPENDED LAST, and that position is the guard, not a style choice. It is not routed
@@ -4501,3 +4572,17 @@ func buildPluginVolumeName(pluginName string) string {
 	}
 	return name
 }
+
+// buildPluginStagingContainerName generates the container name for the plugin staging initContainer.
+// GKE Autopilot / gVisor injects the annotation "dev.gvisor.internal.seccomp.<container-name>" (28 bytes)
+// into pod metadata without a slash prefix. The Kubernetes annotation name length limit is 63 bytes,
+// so any container name longer than 35 bytes causes admission rejection.
+func buildPluginStagingContainerName(pluginName string) string {
+	name := "stage-" + pluginName
+	if len(name) > maxAutopilotContainerNameLen {
+		hash := fmt.Sprintf("%x", sha256.Sum256([]byte(pluginName)))[:8]
+		name = name[:maxAutopilotContainerNameLen-9] + "-" + hash
+	}
+	return name
+}
+

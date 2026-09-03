@@ -22,7 +22,7 @@ The clone-and-run needs a Go toolchain that can build and execute a binary, whic
 
 The keyring follows `var.location`, which the full-install composition passes straight from the cluster's location — so changing `location` on an install that has the minter enabled creates a **new, empty** keyring in the new region. Nothing is copied across: the key is `import_only` and KMS never releases private key material, so the version in the old keyring stays where it is.
 
-What that costs depends on whether you still have the PEM GitHub issued. KMS is not the source of truth for the App key; that file is. `import_github_pem` derives the KMS location from the region, and imports `GITHUB_PEM_PATH` whenever the key in that location has no ENABLED version — which is exactly the state a region move produces — so re-running `install.sh` against the new region with the same PEM completes the move. `install.sh` persists `GITHUB_PEM_PATH` into `vars.sh`, and the gcloud path above takes the location as an input, so either route works.
+What that costs depends on whether you still have the PEM GitHub issued. KMS is not the source of truth for the App key; that file is. `import_github_pem` derives the KMS location from the region, and imports `GITHUB_PEM_PATH` whenever the key in that location has no ENABLED version — which is exactly the state a region move produces — so re-running `install.sh` against the new region with the same PEM completes the move. `install.sh` persists `GITHUB_PEM_PATH` into `install.env`, and the gcloud path above takes the location as an input, so either route works.
 
 Only if the PEM is gone does the move cost a credential: GitHub does not re-issue a private key it has already handed out, and the KMS copy cannot be exported, so there is nothing left to import and you have to generate a fresh one on the App and import that. Either way the old keyring and key stay in the project forever, per the warning below.
 
@@ -40,7 +40,7 @@ GitHub integration is configured) uses for the minter's GCP half; the chart's
 `githubMinter.*` values render the Kubernetes half, and the PEM import above completes
 the pair. The canonical identifiers (GSA `kubeagents-github-minter-gsa`, KSA
 `kubeagents-github-minter`, namespace `kubeagents-system`) also appear in
-`k8s-operator/scripts/common.sh` for the dev tooling, and the module's defaults mirror
+`scripts/installer/common.sh` for the dev tooling, and the module's defaults mirror
 them.
 
 ## Usage

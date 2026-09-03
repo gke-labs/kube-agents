@@ -10,7 +10,7 @@ source "${SCRIPT_DIR}/common.sh" "$@"
 
 load_state
 
-if [ "${GOOGLE_CHAT_ENABLED:-false}" = "true" ]; then
+if [ "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}" = "true" ]; then
   if [ -z "${CHAT_TOPIC_NAME:-}" ] || [ -z "${CHAT_SUB_NAME:-}" ]; then
     print_warning "Google Chat integration is enabled but CHAT_TOPIC_NAME or CHAT_SUB_NAME is missing. It may not work properly."
   fi

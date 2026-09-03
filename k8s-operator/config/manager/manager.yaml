@@ -57,7 +57,7 @@ spec:
             # - name: CREDENTIAL_PROXY_IMAGE
             #   value: "registry.example.com/kube-agents/credential-proxy:latest"
             # - name: FLUENT_BIT_IMAGE
-            #   value: "registry.example.com/mirror/fluent-bit:5.1.0"
+            #   value: "registry.example.com/mirror/fluent-bit:5.1.1"
             # IMAGE_PULL_SECRETS is the pull identity for those images, as
             # comma-separated names of Secrets that must already exist in each
             # agent's namespace. Needed only for a registry the nodes cannot

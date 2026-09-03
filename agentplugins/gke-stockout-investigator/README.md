@@ -16,6 +16,10 @@ controller name; everything else comes from the agent looking at the cluster aft
 
 ## Install
 
+For root installations, deploy declaratively by setting `enable_pubsub_platform = true` and `enable_stockout_investigator = true` in `terraform.tfvars` (or passing `--enable-pubsub-platform` and `--enable-stockout-investigator` to root `install.sh`).
+
+For standalone developer workflows or attaching to an existing cluster:
+
 ```bash
 GCP_PROJECT_ID=<project> \
 TARGET_CLUSTER_NAME=<cluster the alerts are about> \
@@ -27,7 +31,8 @@ KUBECTL_CONTEXT=<context of the cluster running the agent> \
 filter expression, so a wrong value drops every alert without an error anywhere. The
 installer builds the image locally and pushes it to Artifact Registry — see
 [Images](../README.md#images) for the reference it derives and the variables that override
-it; `PLUGIN_IMAGE` installs one that already exists and skips the build.
+it; `PLUGIN_IMAGE` installs one that already exists and skips the build. If the plugin is
+already deployed by the main `kube-agents` release, the sub-chart deployment is skipped.
 
 `HERMES_NAMESPACE` (default `kubeagents-system`) and `AGENT_REF` (default `platform-agent`)
 say which agent to attach to. Give both installers the same pair: a route installed beside

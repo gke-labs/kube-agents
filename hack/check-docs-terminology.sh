@@ -52,7 +52,7 @@ forbid() {
 }
 
 # --- Identity names -------------------------------------------------------
-# Ground truth: k8s-operator/scripts/common.sh
+# Ground truth: scripts/installer/common.sh
 forbid 'kubeagents-platform-agent-gsa' \
   "Wrong GCP service account name. common.sh sets PLATFORM_AGENT_GSA_NAME=kubeagents-platform-gsa."
 
@@ -64,11 +64,11 @@ forbid 'platform-agent-system' \
   "Stale namespace. The namespace is kubeagents-system."
 
 # --- GKE host-discovery label -------------------------------------------
-# Ground truth: k8s-operator/scripts/common.sh. The Terraform full-install
+# Ground truth: scripts/installer/common.sh. The Terraform full-install
 # composition must mirror the stable key because it cannot source Bash.
-HOST_LABEL=$(awk -F'"' '/^KUBE_AGENTS_HOST_LABEL=/{print $2; exit}' k8s-operator/scripts/common.sh)
+HOST_LABEL=$(awk -F'"' '/^KUBE_AGENTS_HOST_LABEL=/{print $2; exit}' scripts/installer/common.sh)
 if [ -z "$HOST_LABEL" ]; then
-  echo "ERROR: could not read KUBE_AGENTS_HOST_LABEL from k8s-operator/scripts/common.sh." >&2
+  echo "ERROR: could not read KUBE_AGENTS_HOST_LABEL from scripts/installer/common.sh." >&2
   exit 1
 fi
 
@@ -93,7 +93,11 @@ if [ -z "$GO_MOD_VERSION" ]; then
 fi
 GO_MINOR=$(printf '%s' "$GO_MOD_VERSION" | cut -d. -f1,2)   # 1.25.8 -> 1.25
 
-WRONG_GO=$(search 'Go[^0-9]{0,20}1\.[0-9]+\+' | grep -vF "${GO_MINOR}+" || true)
+# {0,60} rather than {0,20}: at 20 this reached only "Go 1.N+." in the operator
+# development guide. INSTALL.md states it inside a padded table cell and
+# k8s-operator/README.md behind a ~38-character markdown link, so both sat
+# outside the window and a stale version in either passed the check.
+WRONG_GO=$(search 'Go[^0-9]{0,60}1\.[0-9]+\+' | grep -vF "${GO_MINOR}+" || true)
 if [ -n "$WRONG_GO" ]; then
   echo "::error::Documented Go version does not match k8s-operator/go.mod (go ${GO_MOD_VERSION}; expected \"${GO_MINOR}+\")."
   printf '%s\n\n' "$WRONG_GO" | sed 's/^/    /'

@@ -11,6 +11,10 @@ the suppression behaviour that decides whether an alert becomes work at all.
 
 ## Install
 
+For root installations, deploy declaratively by setting `enable_pubsub_platform = true` in `terraform.tfvars` or passing `--enable-pubsub-platform` to root `install.sh`.
+
+For standalone developer workflows or attaching to an existing cluster:
+
 ```bash
 GCP_PROJECT_ID=<project> KUBECTL_CONTEXT=<context> ./install.sh
 ```
@@ -18,7 +22,8 @@ GCP_PROJECT_ID=<project> KUBECTL_CONTEXT=<context> ./install.sh
 The installer builds the image locally and pushes it to Artifact Registry — see
 [Images](../README.md#images) for the reference it derives, the builders it picks from and
 the variables that override them. `PLUGIN_IMAGE` installs one that already exists and skips
-the build.
+the build. If the plugin is already deployed by the main `kube-agents` release, the installer
+skips the sub-chart deployment automatically.
 
 `HERMES_NAMESPACE` (default `kubeagents-system`) and `AGENT_REF` (default `platform-agent`)
 say which agent to attach to, and any plugin whose routes this adapter is to serve must be

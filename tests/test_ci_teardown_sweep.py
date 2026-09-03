@@ -1,4 +1,4 @@
-"""The teardown's cluster-scoped sweep runs on every path, whatever Helm says.
+"""The teardown's label sweeps run on every path, whatever Helm says.
 
 #961 gave the chart its first cluster-scoped resources (two
 ValidatingAdmissionPolicies and their bindings), and #1006 is what happened
@@ -16,6 +16,13 @@ rather than a decoration:
   have failed, because the aborted-run case is the whole point;
 * a failing kubectl neither stops the sweep at the first kind nor changes
   the teardown's exit code.
+
+#1172 added the same sweep one scope down. Nothing else deletes a namespaced
+object the release stops accounting for: teardown never deletes the namespace,
+and owner-reference GC stops resolving owners once the PlatformAgent CRD goes.
+The three properties above apply to it, plus one — it must select by the
+part-of label and leave Helm's release-record Secrets, labelled owner=helm,
+alone. Whether a record survives is Step 1's decision.
 
 The steps are lifted from the script's own text and executed under bash with
 stubbed kubectl/helm, so the assertions are against the code that ships
@@ -57,14 +64,56 @@ _SWEPT_KINDS = (
     "clusterrolebindings.rbac.authorization.k8s.io",
 )
 
+# The #1172 audit: every namespaced kind the chart renders or the operator
+# applies, all of which carry the part-of label — from kube-agents.labels in
+# the chart's templates, and from commonLabels() in the operator's Go.
+# Hand-copied for the reason above. The chart's own CRs are absent: the CRD
+# delete takes them on one path and the next lease's upgrade needs them on the
+# other.
+#
+# persistentvolumeclaims is in the list because reconcilePVC creates the
+# operator's own claims through withCommonLabels, so they are labelled and
+# selectable. The claims that come from a StatefulSet's volumeClaimTemplates
+# are not — that ObjectMeta carries a name and nothing else — which is why
+# hindsight's claim and any RWO custom storage survive the sweep.
+_SWEPT_NAMESPACED_KINDS = (
+    "deployments.apps",
+    "statefulsets.apps",
+    "jobs.batch",
+    "services",
+    "configmaps",
+    "secrets",
+    "serviceaccounts",
+    "roles.rbac.authorization.k8s.io",
+    "rolebindings.rbac.authorization.k8s.io",
+    "networkpolicies.networking.k8s.io",
+    "poddisruptionbudgets.policy",
+    "podmonitorings.monitoring.googleapis.com",
+    "certificates.cert-manager.io",
+    "issuers.cert-manager.io",
+    "persistentvolumeclaims",
+)
+
+_NAMESPACE = "kubeagents-system"
 _SELECTOR = "app.kubernetes.io/part-of=kube-agents"
+# Step 1's fallback selects release records by Helm's own labels. Named here so
+# the sweep test can assert the two selectors never converge.
+_RECORD_SELECTOR = "owner=helm,name=kube-agents"
 
 
 def _teardown_steps():
+    """The lifted steps, prefixed with the file-head `readonly` constants.
+
+    The no-magic-constants rule declares names at the top of the file, above
+    _STEPS_START, so the lift carries them along or `set -u` kills the run.
+    """
     text = _CI_TEARDOWN.read_text(encoding="utf-8")
     start = text.find(_STEPS_START)
     assert start != -1, f"{_STEPS_START!r} not found in hack/ci-teardown.sh"
-    return text[start:]
+    constants = "\n".join(
+        line for line in text[:start].splitlines() if line.startswith("readonly ")
+    )
+    return constants + "\n" + text[start:]
 
 
 class CiTeardownSweepTest(unittest.TestCase):
@@ -158,6 +207,96 @@ class CiTeardownSweepTest(unittest.TestCase):
         for kind in _SWEPT_KINDS:
             with self.subTest(kind=kind):
                 self.assertTrue(any(kind in c.split() for c in sweeps), sweeps)
+
+    # --- (d) the namespaced sweep, same three properties ---------------------
+
+    def test_every_audited_namespaced_kind_is_swept_by_label(self):
+        rc, calls, err = self._run_steps()
+        self.assertEqual(rc, 0, err)
+        sweeps = self._sweep_calls(calls)
+        for kind in _SWEPT_NAMESPACED_KINDS:
+            with self.subTest(kind=kind):
+                matching = [c for c in sweeps if kind in c.split()]
+                self.assertEqual(
+                    len(matching), 1, f"expected exactly one sweep of {kind}: {sweeps}"
+                )
+                argv = matching[0].split()
+                self.assertIn(_SELECTOR, argv)
+                self.assertIn("--ignore-not-found", argv)
+                self.assertIn("-n", argv)
+                self.assertIn(_NAMESPACE, argv)
+
+    def test_claims_are_swept_after_the_workloads_that_mount_them(self):
+        """A PVC still mounted by a running pod does not delete: the
+        kubernetes.io/pvc-protection finalizer holds it open until the pod is
+        gone, and `kubectl delete` waits. Deleting the Deployment and the
+        StatefulSet first is what keeps that wait short, so the ordering is a
+        property of the step rather than an accident of how the list was
+        typed."""
+        rc, calls, err = self._run_steps()
+        self.assertEqual(rc, 0, err)
+        sweeps = self._sweep_calls(calls)
+
+        def index_of(kind):
+            for i, call in enumerate(sweeps):
+                if kind in call.split():
+                    return i
+            self.fail(f"{kind} never swept: {sweeps}")
+
+        claim_at = index_of("persistentvolumeclaims")
+        for workload in ("deployments.apps", "statefulsets.apps"):
+            with self.subTest(workload=workload):
+                self.assertLess(
+                    index_of(workload),
+                    claim_at,
+                    f"{workload} must be deleted before persistentvolumeclaims",
+                )
+
+    def test_the_namespaced_sweep_never_deletes_a_helm_release_record(self):
+        """Helm's records are Secrets, and the sweep deletes Secrets. It must
+        select them by the chart's part-of label — which no record carries —
+        and never by owner=helm, which every record carries. Whether a record
+        survives is Step 1's decision (#1180), not this sweep's.
+
+        Run with a red helm deliberately. That is the only path on which Step
+        1's fallback issues its own `kubectl delete secret -l owner=helm,...`,
+        so it is the only run where both selectors are in flight and the
+        assertion has two things to tell apart. An earlier version of this test
+        ran the green path and filtered on `"secrets" in call.split()`, which
+        the fallback's singular `secret` could not match either way: it
+        inspected nothing and passed against a script with no Step 4 at all.
+        """
+        rc, calls, err = self._run_steps(helm_exit=1)
+        self.assertEqual(rc, 0, err)
+        secret_deletes = [
+            c
+            for c in calls
+            if c.startswith("kubectl delete") and {"secret", "secrets"} & set(c.split())
+        ]
+        by_owner = [c for c in secret_deletes if _RECORD_SELECTOR in c.split()]
+        by_part_of = [c for c in secret_deletes if _SELECTOR in c.split()]
+        # Both must be present, or this is again asserting over an empty list.
+        self.assertEqual(
+            len(by_owner), 1, f"expected Step 1's record delete: {secret_deletes}"
+        )
+        self.assertEqual(
+            len(by_part_of), 1, f"expected Step 4's Secret sweep: {secret_deletes}"
+        )
+        self.assertNotIn(_RECORD_SELECTOR, by_part_of[0].split(), by_part_of[0])
+        self.assertNotIn(_SELECTOR, by_owner[0].split(), by_owner[0])
+
+    def test_namespaced_sweep_survives_earlier_failures(self):
+        """The aborted-run case one scope down: helm red, kubectl red, and
+        every kind still attempted."""
+        for label, kwargs in (("helm", {"helm_exit": 1}), ("kubectl", {"kubectl_exit": 1})):
+            with self.subTest(failing=label):
+                rc, calls, err = self._run_steps(**kwargs)
+                self.assertEqual(rc, 0, err)
+                sweeps = self._sweep_calls(calls)
+                for kind in _SWEPT_NAMESPACED_KINDS:
+                    self.assertTrue(
+                        any(kind in c.split() for c in sweeps), f"{kind}: {sweeps}"
+                    )
 
     # --- the file itself -----------------------------------------------------
 

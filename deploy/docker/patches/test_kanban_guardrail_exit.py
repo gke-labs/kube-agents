@@ -490,6 +490,14 @@ LOOP_STUB = '''import os
 
 logger = None
 
+# v2026.8.19 routed the loop's appends through this helper instead of calling
+# list.append directly, which is the one line of the halt anchor that moved.
+# The real one (agent/message_metadata.py) stamps a timestamp on the way past,
+# so the nudge this patch inserts has to go through it too.
+def append_message(messages, message):
+    message.setdefault("timestamp", 0.0)
+    messages.append(message)
+
 def run_conversation(agent, messages):
     _pending_verification_response = None
     _pending_verification_response_previewed = False
@@ -503,7 +511,7 @@ def run_conversation(agent, messages):
                     agent._emit_status(
                         f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}"
                     )
-                    messages.append({"role": "assistant", "content": final_response})
+                    append_message(messages, {"role": "assistant", "content": final_response})
                     break
     return final_response
 '''
@@ -553,6 +561,13 @@ class ApplierTest(unittest.TestCase):
             body.index("agent._tool_guardrail_halt_decision = None"),
             body.index("continue"),
         )
+
+    def test_the_nudge_is_appended_through_the_stamping_helper(self):
+        """A raw list.append leaves one undated message in a dated transcript."""
+        loop, _ = self._apply()
+        body = loop[loop.index("if _kanban_halt_nudge:") :]
+        self.assertIn("append_message(messages, {", body)
+        self.assertNotIn("messages.append(", body)
 
     def test_the_exit_reason_is_taken_back_off_guardrail_halt(self):
         loop, _ = self._apply()

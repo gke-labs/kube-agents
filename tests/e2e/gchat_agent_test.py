@@ -30,7 +30,7 @@ except ImportError:
     HttpError = Exception  # type: ignore
 import pytest
 
-# Configuration from Environment Variables (read dynamically from vars.sh or CI environment)
+# Configuration from Environment Variables (read dynamically from tests/e2e/.env or the CI environment)
 GCP_PROJECT_ID: Optional[str] = os.environ.get("GCP_PROJECT_ID") or os.environ.get("PROJECT_ID")
 CHAT_SPACE_ID: Optional[str] = os.environ.get("CHAT_SPACE_ID")
 CHAT_TOPIC_NAME: str = os.environ.get("CHAT_TOPIC_NAME", "platform-agent-chat-events")
@@ -74,7 +74,8 @@ def chat_service(credentials: Credentials) -> Resource:
     if not CHAT_SPACE_ID:
         pytest.fail(
             "CHAT_SPACE_ID environment variable is required (e.g., spaces/AAQAfrKMyng)\n"
-            "Tip: SRE variables can be loaded by running 'source k8s-operator/scripts/vars.sh'"
+            "Tip: the install's coordinates can be loaded with "
+            "'set -a; . install.env; set +a'"
         )
 
     return build("chat", "v1", credentials=credentials)

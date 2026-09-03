@@ -94,10 +94,25 @@ mcp_servers:
   # The whole entry is redundant with the shared defaults — the build-time merge
   # unions the two — but repeating it here keeps this file from reading as if
   # gke were the one server without these settings.
+  #
+  # `--header User-Agent: …` names this product and the build it came from, so
+  # the API team serving the endpoint can attribute the traffic;
+  # deploy/shared/defaults/config.yaml carries the full rationale, including
+  # where the version comes from. That merge unions the two arg lists, so this
+  # copy has to stay character-identical to the one there. Drift does not
+  # produce two headers, which is the intuitive guess and the wrong one: the
+  # union dedups, so the repeated `--header` token collapses and the divergent
+  # VALUE survives alone, as a bare positional after the URL. mcp-remote reads
+  # that second positional as its optional callback port, parses it to NaN and
+  # ignores it — leaving one header, silently the shared-defaults one, whatever
+  # this file says. tests/test_remote_mcp_user_agent.py checks the merged argv
+  # for exactly that shape.
   gke:
     command: "node"
     args:
       - "/opt/mcp-remote/dist/proxy.js"
+      - "--header"
+      - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION}"
       - "https://container.googleapis.com/mcp"
     lazy: true
     connect_timeout: 30

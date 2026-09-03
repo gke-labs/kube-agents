@@ -20,7 +20,7 @@
 #
 # This file is deliberately dependency-free -- no colours, no state file, no
 # print_* helpers -- because it is sourced by three shell libraries that do not
-# share anything else: k8s-operator/scripts/common.sh, hack/ci-env.sh, and
+# share anything else: scripts/installer/common.sh, hack/ci-env.sh, and
 # scripts/release/common.sh.
 #
 # The Python equivalent, used by the agent at runtime, is

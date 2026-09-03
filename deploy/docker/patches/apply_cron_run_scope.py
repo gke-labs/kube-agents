@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Wire tools/cron_run_scope.py into the Hermes source tree.
 
-Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. One AST locator
-and nine anchored string replacements across three files is past the point
+Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. Two AST locators
+and ten anchored string replacements across three files is past the point
 where an inline ``python3 -c`` stays readable, so the edits live here — but the
 guarantee is the same as the other patches in the Dockerfile: every anchor must
 be found the number of times expected, every edited file must still parse, and
@@ -23,13 +23,24 @@ import patchlib
 
 # --- cron/scheduler.py: stop discarding the run's own report ----------------
 #
-# The out-param goes on the end of run_one_job's keyword-only parameters.
-# Located rather than spelled out: this used to be a literal anchor on the
-# whole one-line signature, and v2026.8.13 both wrapped that line onto three
-# and added an ``extra_prompt`` of its own, either of which broke the build for
-# a change the patch has no opinion about. What it does have an opinion about
-# is that this is still the shared execute→deliver→mark body the ticker and the
-# cronjob tool both call, which is what expect_keyword_only asserts.
+# The out-param goes on the end of the keyword-only parameters of *both* halves
+# of the run entry point. Located rather than spelled out: this used to be a
+# literal anchor on the whole one-line signature, and v2026.8.13 both wrapped
+# that line onto three and added an ``extra_prompt`` of its own, either of which
+# broke the build for a change the patch has no opinion about. What it does have
+# an opinion about is that this is still the shared execute→deliver→mark body
+# the ticker and the cronjob tool both call, which is what expect_keyword_only
+# asserts.
+#
+# Both halves, because v2026.8.19 split the function in two: ``run_one_job`` is
+# now a wrapper that registers the fire owner and delegates, through
+# ``_run_with_fire_claim_heartbeat``, to ``_run_one_job_body``, where the
+# execute→deliver→mark sequence — and every write site below — actually lives.
+# The parameter has to be on the wrapper because that is what callers name, on
+# the body because that is what the writes read, and forwarded across the lambda
+# in between. Putting it on the wrapper alone is not a build failure: both
+# anchors still match, the file still parses, and the body raises ``name
+# 'outcome' is not defined`` on the first real cron tick in a cluster.
 
 SCHEDULER_OUTCOME_PARAM = ", outcome=None"
 
@@ -37,6 +48,20 @@ SCHEDULER_OUTCOME_PARAM = ", outcome=None"
 #: patch means. Not the whole signature: upstream may add to it, and this patch
 #: does not care.
 SCHEDULER_EXPECTED_PARAMS = ("adapters", "loop", "verbose")
+
+#: The wrapper's delegation to the body. Anchored so the out-param is forwarded
+#: rather than dropped at the split; ``expect_keyword_only`` on the body cannot
+#: notice a caller that stops passing it.
+SCHEDULER_DELEGATE = (
+    "            lambda lost_ownership: _run_one_job_body(\n"
+    "                job,\n"
+    "                adapters=adapters,\n"
+    "                loop=loop,\n"
+    "                verbose=verbose,\n"
+    "                extra_prompt=extra_prompt,\n"
+)
+
+SCHEDULER_DELEGATE_PATCHED = SCHEDULER_DELEGATE + "                outcome=outcome,\n"
 
 #: Text only a successful run leaves behind. The out-param is inserted rather
 #: than substituted for an anchor, so the count check cannot tell a fresh file
@@ -237,15 +262,26 @@ def apply(root: Path) -> None:
     scheduler.refuse_if_patched(SCHEDULER_PATCHED_MARKER)
     run_one = scheduler.find_def("run_one_job", label="cron run entry point")
     run_one.expect_keyword_only(*SCHEDULER_EXPECTED_PARAMS)
-    # First, and by offset: substitute() rewrites the whole string and would
-    # invalidate the locator's spans. The two anchors below sit inside this
-    # same def, so the order also has to be this way round.
-    scheduler.insert(run_one.keyword_only_end(), SCHEDULER_OUTCOME_PARAM)
+    run_body = scheduler.find_def("_run_one_job_body", label="cron run body")
+    run_body.expect_keyword_only(*SCHEDULER_EXPECTED_PARAMS)
+    # Both locators first, then both inserts, then the substitutes:
+    # substitute() rewrites the whole string and would invalidate a locator's
+    # spans, and an insert moves every offset after it. Splicing the higher
+    # offset first is what leaves the other where its locator found it. Sorted
+    # rather than hand-ordered, so which of the two defs comes first in the
+    # file stays upstream's business.
+    for offset in sorted(
+        (run_one.keyword_only_end(), run_body.keyword_only_end()), reverse=True
+    ):
+        scheduler.insert(offset, SCHEDULER_OUTCOME_PARAM)
+    scheduler.substitute(
+        SCHEDULER_DELEGATE, SCHEDULER_DELEGATE_PATCHED, label="body delegation"
+    )
     scheduler.substitute(
         SCHEDULER_SAVE_OUTPUT, SCHEDULER_SAVE_OUTPUT_PATCHED, label="saved output"
     )
     scheduler.substitute(SCHEDULER_TAIL, SCHEDULER_TAIL_PATCHED, label="run tail")
-    scheduler.commit("1 locator, 2 anchors")
+    scheduler.commit("2 locators, 3 anchors")
 
     cronjob = patchlib.Patch(root, "tools/cronjob_tools.py", prefix=PREFIX)
     cronjob.substitute(

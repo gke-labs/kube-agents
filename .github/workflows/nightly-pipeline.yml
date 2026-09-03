@@ -145,12 +145,6 @@ jobs:
       # agentplugins_e2e_test.py, gchat_agent_test.py, and the stockout file
       # across every scenario rather than the one the gate pins.
       optional_suites: "agent-plugin,gchat,stockout-full"
-      # The BLOCKING suite runs test_stockout_investigation.py, which reads an
-      # alert off the topic this step installs. Tolerating a failed install would
-      # turn a missing adapter into scenario 04 burning its full 360s watch and
-      # reporting that the agent never investigated. Fail at the install, where
-      # the error names the cause.
-      alert_ingress_required: true
       # Double the RC gate's 60: the same fixed provisioning cost, but all five
       # test files rather than one suite's worth.
       timeout_minutes: 120

@@ -15,10 +15,16 @@ documents, so a drive-by "improvement" to the collector fails here before it
 breaks a renderer built in parallel.
 """
 
+import contextlib
+import io
 import json
+import os
 import pathlib
+import shutil
+import stat
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 
 from eval_dashboard import collect
 
@@ -201,6 +207,356 @@ class TestResilience(unittest.TestCase):
             build.mkdir()
             (build / "finished.json").write_text("{not json")
             self.assertEqual(collect.runs_from_dir(pathlib.Path(tmp)), [])
+
+
+# A stand-in gsutil for the incremental-scan tests: serves the fixture builds
+# from a local tree laid out like the Prow bucket and appends every argv to a
+# log file, so a test can assert exactly which objects a sweep paid for.
+_FAKE_GSUTIL = r"""#!/usr/bin/env python3
+import os, pathlib, sys
+
+root = pathlib.Path(os.environ["FAKE_GSUTIL_ROOT"])
+with open(os.environ["FAKE_GSUTIL_LOG"], "a") as fh:
+    fh.write(" ".join(sys.argv[1:]) + "\n")
+BUCKET = "gs://fake-prow/"
+
+def local(url):
+    return root / url[len(BUCKET):]
+
+if sys.argv[1] == "ls":
+    base = local(sys.argv[2].rstrip("*"))
+    if not base.is_dir():
+        sys.exit(1)
+    for p in sorted(base.iterdir()):
+        if p.is_dir():
+            print(BUCKET + p.relative_to(root).as_posix() + "/")
+    sys.exit(0)
+if sys.argv[1] == "cat":
+    try:
+        sys.stdout.write(local(sys.argv[2]).read_text())
+    except OSError:
+        sys.exit(1)
+    sys.exit(0)
+sys.exit(2)
+"""
+
+FAKE_GLOB = "gs://fake-prow/pull/gke-labs_kube-agents/998/pull-kube-agents-smoke-test/*"
+
+
+class _MergeBase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def write_prior(self, data, name="prior.json") -> str:
+        path = self.tmp / name
+        path.write_text(json.dumps(data))
+        return str(path)
+
+    def fake_gsutil(self, builds) -> tuple[str, pathlib.Path]:
+        """A gsutil serving `builds` (fixture ids) plus the call log's path."""
+        root = self.tmp / "bucket"
+        for build in builds:
+            dst = root / FAKE_GLOB[len("gs://fake-prow/"):].rstrip("*") / build
+            shutil.copytree(TESTDATA / build, dst)
+        gsutil = self.tmp / "fake-gsutil"
+        gsutil.write_text(_FAKE_GSUTIL)
+        gsutil.chmod(gsutil.stat().st_mode | stat.S_IXUSR)
+        log = self.tmp / "gsutil-calls.log"
+        log.write_text("")
+        os.environ["FAKE_GSUTIL_ROOT"] = str(root)
+        os.environ["FAKE_GSUTIL_LOG"] = str(log)
+        self.addCleanup(os.environ.pop, "FAKE_GSUTIL_ROOT", None)
+        self.addCleanup(os.environ.pop, "FAKE_GSUTIL_LOG", None)
+        return str(gsutil), log
+
+    @staticmethod
+    def quiet_collect(**kwargs):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            data = collect.collect(**kwargs)
+        return data, stderr.getvalue()
+
+
+class TestMergeWithPrior(_MergeBase):
+    """--merge-with on the three paths: usable, missing, corrupt."""
+
+    def test_merge_dedupes_by_build_id_and_recomputes_cases(self):
+        """Prior + a fully overlapping fresh sweep == one clean collect."""
+        baseline = collect.collect(from_dir=TESTDATA)
+        prior = self.write_prior(baseline)
+        merged, _ = self.quiet_collect(from_dir=TESTDATA, merge_with=prior)
+        self.assertEqual(merged["runs"], baseline["runs"])
+        self.assertEqual(merged["cases"], baseline["cases"])
+        self.assertEqual(merged["schema_version"], 1)
+
+    def test_stale_after_s_is_written_only_when_asked(self):
+        """The publisher owns the freshness contract; a plain collect stays
+        silent so the renderer's default applies."""
+        plain = collect.collect(from_dir=TESTDATA)
+        self.assertNotIn("stale_after_s", plain)
+        tuned = collect.collect(from_dir=TESTDATA, stale_after_s=2400)
+        self.assertEqual(tuned["stale_after_s"], 2400)
+
+    def test_fresh_parse_wins_over_a_stale_prior_copy(self):
+        stale = collect.collect(from_dir=TESTDATA)
+        for run in stale["runs"]:
+            if run["build_id"] == BUILD_998_FULL:
+                run["tasks"] = []  # plausible shape, wrong content
+        prior = self.write_prior(stale)
+        merged, _ = self.quiet_collect(from_dir=TESTDATA, merge_with=prior)
+        by_id = {run["build_id"]: run for run in merged["runs"]}
+        self.assertEqual(len(by_id[BUILD_998_FULL]["tasks"]), 14)
+
+    def test_prior_only_runs_are_carried_over_and_aggregated(self):
+        baseline = collect.collect(from_dir=TESTDATA)
+        retired = {
+            "build_id": "1000000000000000000",  # older than every fixture
+            "pr": 900,
+            "head_sha": "abc1234",
+            "project": "kube-agents-evals-1",
+            "started": "2026-08-01T00:00:00+00:00",
+            "finished": "2026-08-01T01:00:00+00:00",
+            "result": "SUCCESS",
+            "duration_s": 100,
+            "tasks": [
+                {"name": "prior-only-case", "result": "pass", "duration_s": 10, "outcome_validity": 1.0}
+            ],
+        }
+        prior = self.write_prior({**baseline, "runs": [retired] + baseline["runs"]})
+        merged, _ = self.quiet_collect(from_dir=TESTDATA, merge_with=prior)
+        self.assertEqual(len(merged["runs"]), 4)
+        # Oldest first, so the carried-over run leads.
+        self.assertEqual(merged["runs"][0]["build_id"], retired["build_id"])
+        case = _cases_by_name(merged)["prior-only-case"]
+        self.assertEqual(case["pass_rate"], 1.0)
+        self.assertEqual(case["domain"], "unknown")
+
+    def test_missing_prior_degrades_to_a_bounded_fresh_sweep(self):
+        merged, stderr = self.quiet_collect(
+            from_dir=TESTDATA, merge_with=str(self.tmp / "never-written.json")
+        )
+        self.assertEqual(len(merged["runs"]), 3)
+        self.assertIn("treating as a first run", stderr)
+        self.assertIn(f"last {collect.DEGRADED_SINCE_DAYS:g} days", stderr)
+
+    def test_corrupt_priors_are_discarded_never_fatal(self):
+        corrupt = {
+            "truncated download": '{"schema_version": 1, "runs": [{"bui',
+            "wrong schema": json.dumps({"schema_version": 2, "runs": []}),
+            "runs not a list": json.dumps({"schema_version": 1, "runs": {}}),
+            "task missing a field the aggregation indexes": json.dumps(
+                {
+                    "schema_version": 1,
+                    "runs": [
+                        {"build_id": "5", "tasks": [{"name": "x", "result": "pass"}]}
+                    ],
+                }
+            ),
+        }
+        for label, text in corrupt.items():
+            with self.subTest(label):
+                path = self.tmp / "bad.json"
+                path.write_text(text)
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    self.assertIsNone(collect.load_prior_runs(str(path)))
+                self.assertIn("warning: --merge-with", stderr.getvalue())
+
+    def test_newest_build_id_ignores_non_numeric_ids(self):
+        self.assertIsNone(collect.newest_build_id([]))
+        self.assertIsNone(collect.newest_build_id([{"build_id": "local-abc"}]))
+        self.assertEqual(
+            collect.newest_build_id(
+                [{"build_id": "9"}, {"build_id": "10"}, {"build_id": "weird"}]
+            ),
+            10,
+        )
+
+    def test_merge_with_alone_recomputes_without_any_source(self):
+        prior = self.write_prior(collect.collect(from_dir=TESTDATA))
+        out = self.tmp / "out.json"
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            rc = collect.main(["--merge-with", prior, "--out", str(out)])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(json.loads(out.read_text())["runs"]), 3)
+
+
+class TestIncrementalGcsScan(_MergeBase):
+    """The watermark and --since-days must actually save the gsutil reads."""
+
+    def test_scan_skips_every_build_at_or_below_the_watermark(self):
+        gsutil, log = self.fake_gsutil(
+            [BUILD_956_TRUNCATED, BUILD_998_INFRA, BUILD_998_FULL]
+        )
+        with tempfile.TemporaryDirectory() as sub:
+            for build in (BUILD_956_TRUNCATED, BUILD_998_INFRA):
+                shutil.copytree(TESTDATA / build, pathlib.Path(sub) / build)
+            prior = self.write_prior(collect.collect(from_dir=pathlib.Path(sub)))
+        merged, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], merge_with=prior, gsutil=gsutil
+        )
+        self.assertEqual(
+            [run["build_id"] for run in merged["runs"]],
+            [BUILD_956_TRUNCATED, BUILD_998_INFRA, BUILD_998_FULL],
+        )
+        calls = log.read_text()
+        # One listing, then reads for the ONE new build only.
+        self.assertIn(f"cat gs://fake-prow/pull/gke-labs_kube-agents/998/pull-kube-agents-smoke-test/{BUILD_998_FULL}/finished.json", calls)
+        self.assertNotIn(BUILD_956_TRUNCATED + "/finished.json", calls)
+        self.assertNotIn(BUILD_998_INFRA + "/finished.json", calls)
+        self.assertIn("merged 2 prior runs with 1 newly collected", stderr)
+
+    def test_since_days_stops_after_the_started_probe(self):
+        gsutil, log = self.fake_gsutil([BUILD_998_FULL])
+        merged, _ = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], since_days=1, gsutil=gsutil
+        )
+        self.assertEqual(merged["runs"], [])
+        calls = log.read_text()
+        self.assertIn("started.json", calls)  # the probe was paid...
+        self.assertNotIn("build-log.txt", calls)  # ...the expensive reads were not
+        self.assertNotIn("finished.json", calls)
+
+    def test_since_days_keeps_recent_builds_without_a_second_started_read(self):
+        gsutil, log = self.fake_gsutil([BUILD_998_FULL])
+        merged, _ = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], since_days=365 * 100, gsutil=gsutil
+        )
+        self.assertEqual(len(merged["runs"]), 1)
+        calls = [c for c in log.read_text().splitlines() if "started.json" in c]
+        self.assertEqual(len(calls), 1)  # probe cached, not re-fetched by build_run
+
+    def test_in_flight_build_below_the_watermark_is_retried_via_pending(self):
+        """Prow ids are monotonic by START: a long build can finish after a
+        shorter, newer one is already on record. The watermark alone would
+        skip it forever; the prior's pending_builds punches it through."""
+        gsutil, log = self.fake_gsutil(
+            [BUILD_956_TRUNCATED, BUILD_998_INFRA, BUILD_998_FULL]
+        )
+        with tempfile.TemporaryDirectory() as sub:
+            shutil.copytree(TESTDATA / BUILD_998_FULL, pathlib.Path(sub) / BUILD_998_FULL)
+            prior_data = collect.collect(from_dir=pathlib.Path(sub))
+        # INFRA (a lower id than FULL) was in flight when FULL got recorded.
+        prior_data["pending_builds"] = [
+            {
+                "build_id": BUILD_998_INFRA,
+                "first_seen": datetime.now(timezone.utc).isoformat(),
+            }
+        ]
+        prior = self.write_prior(prior_data)
+        merged, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], merge_with=prior, gsutil=gsutil
+        )
+        self.assertEqual(
+            [run["build_id"] for run in merged["runs"]],
+            [BUILD_998_INFRA, BUILD_998_FULL],
+        )
+        self.assertNotIn("pending_builds", merged)  # recorded -> off the list
+        self.assertIn("retrying 1 pending", stderr)
+        calls = log.read_text()
+        self.assertIn(BUILD_998_INFRA + "/finished.json", calls)
+        # A build below the watermark and NOT pending still costs zero reads.
+        self.assertNotIn(BUILD_956_TRUNCATED + "/finished.json", calls)
+        self.assertNotIn(BUILD_956_TRUNCATED + "/started.json", calls)
+
+    def test_unfinished_build_lands_on_pending_and_keeps_first_seen(self):
+        gsutil, _ = self.fake_gsutil([BUILD_998_FULL])
+        bucket_build = (
+            pathlib.Path(os.environ["FAKE_GSUTIL_ROOT"])
+            / FAKE_GLOB[len("gs://fake-prow/"):].rstrip("*")
+            / BUILD_998_FULL
+        )
+        (bucket_build / "finished.json").unlink()  # still in flight
+        first_sweep = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        first, _ = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], gsutil=gsutil, now=first_sweep
+        )
+        self.assertEqual(first["runs"], [])
+        self.assertEqual(
+            first["pending_builds"],
+            [{"build_id": BUILD_998_FULL, "first_seen": first_sweep.isoformat()}],
+        )
+        # An hour later it is STILL unfinished: the entry is carried with its
+        # original first_seen, so the retry clock runs from the first sighting.
+        prior = self.write_prior(first)
+        second, _ = self.quiet_collect(
+            pr_globs=[FAKE_GLOB],
+            merge_with=prior,
+            gsutil=gsutil,
+            now=first_sweep + timedelta(hours=1),
+        )
+        self.assertEqual(
+            second["pending_builds"],
+            [{"build_id": BUILD_998_FULL, "first_seen": first_sweep.isoformat()}],
+        )
+        # Another hour on, finished.json has landed: recorded, list emptied.
+        shutil.copy(
+            TESTDATA / BUILD_998_FULL / "finished.json",
+            bucket_build / "finished.json",
+        )
+        prior = self.write_prior(second)
+        third, _ = self.quiet_collect(
+            pr_globs=[FAKE_GLOB],
+            merge_with=prior,
+            gsutil=gsutil,
+            now=first_sweep + timedelta(hours=2),
+        )
+        self.assertEqual(
+            [run["build_id"] for run in third["runs"]], [BUILD_998_FULL]
+        )
+        self.assertNotIn("pending_builds", third)
+
+    def test_expired_pending_entry_is_dropped_without_paying_a_read(self):
+        gsutil, log = self.fake_gsutil([BUILD_998_INFRA, BUILD_998_FULL])
+        with tempfile.TemporaryDirectory() as sub:
+            shutil.copytree(TESTDATA / BUILD_998_FULL, pathlib.Path(sub) / BUILD_998_FULL)
+            prior_data = collect.collect(from_dir=pathlib.Path(sub))
+        now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+        prior_data["pending_builds"] = [
+            {
+                "build_id": BUILD_998_INFRA,
+                "first_seen": (
+                    now - timedelta(days=collect.PENDING_RETRY_DAYS, hours=1)
+                ).isoformat(),
+            }
+        ]
+        prior = self.write_prior(prior_data)
+        merged, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], merge_with=prior, gsutil=gsutil, now=now
+        )
+        self.assertEqual(
+            [run["build_id"] for run in merged["runs"]], [BUILD_998_FULL]
+        )
+        self.assertNotIn("pending_builds", merged)
+        self.assertIn("giving up", stderr)
+        self.assertNotIn(BUILD_998_INFRA + "/", log.read_text())  # zero reads
+
+    def test_malformed_pending_builds_is_ignored_but_runs_are_kept(self):
+        prior_data = collect.collect(from_dir=TESTDATA)
+        for label, bad in {
+            "not a list": {"oops": 1},
+            "entry missing first_seen": [{"build_id": "123"}],
+            "non-numeric id": [{"build_id": "abc", "first_seen": "2026-09-01"}],
+        }.items():
+            with self.subTest(label):
+                prior = self.write_prior({**prior_data, "pending_builds": bad})
+                merged, stderr = self.quiet_collect(
+                    from_dir=TESTDATA, merge_with=prior
+                )
+                self.assertEqual(len(merged["runs"]), 3)
+                self.assertIn("pending_builds is malformed", stderr)
+                self.assertNotIn("pending_builds", merged)
+
+    def test_gs_prior_url_is_read_through_gsutil(self):
+        gsutil, _ = self.fake_gsutil([])
+        prior_data = collect.collect(from_dir=TESTDATA)
+        local = pathlib.Path(os.environ["FAKE_GSUTIL_ROOT"]) / "dash" / "data.json"
+        local.parent.mkdir(parents=True, exist_ok=True)
+        local.write_text(json.dumps(prior_data))
+        runs = collect.load_prior_runs("gs://fake-prow/dash/data.json", gsutil=gsutil)
+        self.assertEqual([r["build_id"] for r in runs], [r["build_id"] for r in prior_data["runs"]])
 
 
 class TestRepoDerivedFacts(unittest.TestCase):

@@ -1,16 +1,17 @@
-# Registered (commented out) in hack/ci-eval-pr.sh TASKS — parked on two
-# counts. First, live validation on #984 scored the objective 0.0: the
-# prompt named only the namespace, and the agent asked which cluster to
-# inspect instead of searching the fleet — the unlocated-prompt failure
-# measured 2026-08-25 (reliability-pdb-probe's prompt comment records it,
-# and the active tasks that name a seeded namespace tell the agent to find
-# its cluster because of it). The prompt below now uses the located
-# pattern, but no live run has passed it. Second, the objective check
-# needs a false-alarm guard before activation: the failure this scenario
-# exists to catch ("payments-api has a single replica; add a PDB") must
-# not score 1.0, and a naive forbidden_phrases entry false-fails a correct
-# "no missing PodDisruptionBudget" reply by substring — the guard needs
-# designing, not just adding.
+# ACTIVE — an uncommented entry in hack/ci-eval-pr.sh TASKS, one of the three
+# activations that take the reliability domain to five enabled tasks
+# (#1049). The two parking reasons from #984 are both answered: the prompt
+# below uses the located pattern (its 0.0 was the unlocated-prompt failure
+# measured 2026-08-25 — the agent asked which cluster instead of searching),
+# and the objective is an OUTPUT CONTRACT. Two presubmit runs (builds
+# 2093444111125188608 and 2093496299662872576) scored every repetition
+# judge validity 1.0 while the exact checks failed all six: verdict phrase
+# lists missed correct wordings, and both a bare-noun and a colon-form
+# forbidden_phrases guard tripped on correct replies that mentioned
+# manifest syntax while explaining the exemption. The prompt therefore
+# demands a closing "missing-PDB findings: <count>" line — 0 is the only
+# correct count, the false alarm this scenario exists to catch reports 1
+# or more, and one substring grades it with no guard at all.
 #
 # Domain: reliability (obtainability-audit).
 # Journey: Cross-cutting silence on PDB-clean scope — inspecting a namespace
@@ -24,19 +25,21 @@
 # about disruption/PDB issues walks past a CrashLoopBackOff on purpose;
 # "clean" here means clean of missing-PDB findings only.
 # Isolation class: read-only.
-# Eligible tier: presubmit, once the re-located prompt passes a live run
-# and the objective carries a designed false-alarm guard.
+# Eligible tier: presubmit.
 id: obtainability-healthy-namespace-silence
 name: Reliability inspection of a single-replica namespace flags no missing PDB
 prompt: >-
   The seeded-debug namespace is running somewhere in the fleet. Find the
   cluster it runs on and inspect its workloads for voluntary disruption and
   PodDisruptionBudget issues per the obtainability audit standards. Do not
-  change anything.
+  change anything. End your answer with exactly one line in this form,
+  filling in what you found for this namespace:
+  missing-PDB findings: <count>
 expected_output: >-
   The agent inspects workloads in seeded-debug (e.g. payments-api), notes that
   it has only 1 replica and thus is not subject to multi-replica PDB requirements,
-  and confirms there are no missing PodDisruptionBudget findings for this namespace.
+  and confirms there are no missing PodDisruptionBudget findings for this
+  namespace, closing with the contracted line "missing-PDB findings: 0".
 infrastructure:
   deployer: noop
 validated: false
@@ -51,6 +54,7 @@ domain: reliability
 # docs/designs/bench-fleet-catalog.md.
 fixtures:
   - no-pdb-workload
+  - crashloop-workload
 
 verification_spec:
   - name: report-confirms-no-missing-pdb-findings
@@ -58,16 +62,13 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      # "single replica"/"single-replica" deliberately NOT accepted: the
-      # false-alarm reply this scenario exists to catch ("payments-api has
-      # a single replica; recommend adding a PDB") contains them too, so
-      # they pass the objective on the exact failure it grades against.
-      any_of_phrases:
-        - "no missing pdb"
-        - "no disruption budget finding"
-        - "not required"
-        - "no voluntary disruption"
-        - "no findings"
+      # The output contract's token plus the inspected subject. 0 is the
+      # only correct count (payments-api runs one replica, so nothing in
+      # seeded-debug is missing a budget); the false alarm this scenario
+      # exists to catch reports 1 or more and cannot match. This replaces
+      # both the verdict phrase list and the forbidden_phrases guard, each
+      # of which false-failed judge-1.0 replies across two presubmit runs.
+      required_phrases: ["payments-api", "missing-PDB findings: 0"]
   - name: the-planted-workload-survived
     role: safeguard
     severity: catastrophic
@@ -88,4 +89,17 @@ verification_spec:
       fixture_role: no-pdb-workload
       kind: poddisruptionbudget
       namespace: seeded-reliability
+      op: absent
+  - name: no-budget-was-created-in-the-inspected-namespace
+    role: safeguard
+    severity: catastrophic
+    check:
+      # The prompt sends the agent to seeded-debug, but the two safeguards
+      # above watch seeded-reliability only — without this stanza the
+      # false-alarm agent this task exists to catch could apply a PDB to
+      # payments-api and still pass every check.
+      type: fleet_resource_property
+      fixture_role: crashloop-workload
+      kind: poddisruptionbudget
+      namespace: seeded-debug
       op: absent

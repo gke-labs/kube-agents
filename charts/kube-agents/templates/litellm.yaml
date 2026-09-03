@@ -3,7 +3,7 @@
 {{- if eq $provider "chatgpt" }}
 {{- fail "litellm.modelProvider 'chatgpt' is not supported: a ChatGPT subscription needs an OAuth token store this chart does not ship. Use 'openai' with an API key, or see examples/litellm-chatgpt-subscription for a hand-applied subscription proxy." }}
 {{- end }}
-{{- /* Per-provider default model names mirror k8s-operator/scripts/common.sh. */}}
+{{- /* Per-provider default model names mirror scripts/installer/common.sh. */}}
 {{- $defaultModels := dict "gemini" "gemini-3.5-flash" "anthropic" "claude-opus-5" "openai" "gpt-5.4" "vertex_ai" "gemini-3.5-flash" }}
 {{- if not (hasKey $defaultModels $provider) }}
 {{- fail (printf "litellm.modelProvider %q is not one of gemini, anthropic, openai, vertex_ai — a typo here would otherwise fail only at runtime" $provider) }}
@@ -53,7 +53,7 @@
   Not harness.location: a model is only callable from a location that serves it,
   and the cluster's is often not one -- on a zonal cluster it is not even a valid
   Vertex location. Mirrors DEFAULT_VERTEX_LOCATION in
-  k8s-operator/scripts/installer_common.sh.
+  scripts/installer/installer_common.sh.
 */}}
 {{- $vertexLocation := $vertex.location | default "global" }}
 {{- if eq $provider "vertex_ai" }}

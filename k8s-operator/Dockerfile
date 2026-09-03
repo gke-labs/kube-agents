@@ -3,7 +3,7 @@
 # a full reference rather than a shared prefix. Defaults are upstream, so an
 # ordinary build is unchanged.
 ARG GOLANG_IMAGE=golang
-ARG GOLANG_VERSION=1.26-alpine
+ARG GOLANG_VERSION=1.27-alpine
 ARG DISTROLESS_IMAGE=gcr.io/distroless/static
 ARG DISTROLESS_VERSION=nonroot
 

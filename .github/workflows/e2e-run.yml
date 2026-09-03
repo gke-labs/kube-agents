@@ -49,12 +49,6 @@ on:
         required: false
         default: 60
         type: number
-      # See the step that reads it for when a caller should pass true.
-      alert_ingress_required:
-        description: "Fail the job when the Pub/Sub alert ingress install fails"
-        required: false
-        default: false
-        type: boolean
 
 jobs:
   run-e2e:
@@ -113,24 +107,6 @@ jobs:
           cluster_name: ${{ vars.GKE_CLUSTER_NAME }}
           location: ${{ vars.GCP_REGION }}
           project_id: ${{ vars.GCP_PROJECT_ID }}
-
-      # Tolerance is the caller's decision, because which suite depends on the
-      # alert ingress differs per caller. A caller whose BLOCKING suite reads an
-      # alert passes alert_ingress_required, so a broken ingress fails here rather
-      # than 360s later as an agent that never started an investigation; a caller
-      # that only reads alerts in an optional suite leaves it false so a
-      # stockout-only problem cannot sink its gate.
-      #
-      # Runs before readiness so the gateway re-template the adapter triggers is
-      # already in flight when the rollout waits start.
-      - name: Install Pub/Sub Alert Ingress
-        continue-on-error: ${{ !inputs.alert_ingress_required }}
-        env:
-          AGENT_NAMESPACE: ${{ vars.AGENT_NAMESPACE }}
-          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
-          GCP_REGION: ${{ vars.GCP_REGION }}
-          GKE_CLUSTER_NAME: ${{ vars.GKE_CLUSTER_NAME }}
-        run: ./scripts/release/install_pubsub_platform.sh
 
       - name: Connect to GKE & Wait for Pod Readiness
         env:

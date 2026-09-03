@@ -140,7 +140,7 @@ pip install -r tests/e2e/requirements.txt
 > **Note on Local Runs**: When running locally without `E2E_CHAT_*` environment variables, the test runner automatically falls back to your personal `gcloud` ADC credentials. You can run the test locally against any GCP project and target Google Chat Space without requiring OTA user credentials!
 
 ```bash
-source k8s-operator/scripts/vars.sh
+set -a; . install.env; set +a
 export CHAT_SPACE_ID="spaces/XXXXXXXXX"
 
 gcloud auth application-default set-quota-project "$PROJECT_ID"

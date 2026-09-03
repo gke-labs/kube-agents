@@ -222,8 +222,28 @@ adopt_kms() {
     )
   fi
 
+  if [[ "$(tfvar enable_stockout_investigator)" == "true" ]]; then
+    local stockout_topic stockout_sub stockout_sink
+    stockout_topic=$(tfvar stockout_pubsub_topic)
+    [[ -n "$stockout_topic" ]] || stockout_topic="gke-stockout-alerts-topic"
+    stockout_sub=$(tfvar stockout_pubsub_subscription)
+    [[ -n "$stockout_sub" ]] || stockout_sub="gke-stockout-alerts-sub"
+    stockout_sink=$(tfvar stockout_pubsub_sink)
+    [[ -n "$stockout_sink" ]] || stockout_sink="gke-stockout-alerts-sink"
+    targets+=(
+      "google_pubsub_topic.stockout_alerts[0]	pubsub_topic	projects/$project/topics/$stockout_topic"
+      "google_pubsub_subscription.stockout_alerts[0]	pubsub_sub	projects/$project/subscriptions/$stockout_sub"
+      "google_logging_project_sink.stockout_alerts[0]	logging_sink	projects/$project/sinks/$stockout_sink"
+    )
+  fi
+
+  # Skipping both halves — cluster KMS (create_cluster or database encryption
+  # off) and the minter — leaves targets empty, and macOS's bash 3.2 treats an
+  # empty array expansion as unbound under `set -u`. The ${arr[@]+...} form
+  # expands to nothing instead, so the loop runs zero times and the tail below
+  # still clears any stale provider override and logs what happened.
   local adopted=0 address kind id
-  for target in "${targets[@]}"; do
+  for target in ${targets[@]+"${targets[@]}"}; do
     IFS=$'\t' read -r address kind id <<<"$target"
 
     if in_state "$address"; then
@@ -231,14 +251,20 @@ adopt_kms() {
     fi
 
     case "$kind" in
-      keyring) gcloud kms keyrings describe "${id##*/}" --location "$location" \
-                 --project "$project" >/dev/null 2>&1 || continue ;;
-      key)     gcloud kms keys describe "${id##*/}" --location "$location" \
-                 --keyring "$(echo "$id" | sed -E 's|.*/keyRings/([^/]+)/.*|\1|')" \
-                 --project "$project" >/dev/null 2>&1 || continue ;;
+      keyring)      gcloud kms keyrings describe "${id##*/}" --location "$location" \
+                      --project "$project" >/dev/null 2>&1 || continue ;;
+      key)          gcloud kms keys describe "${id##*/}" --location "$location" \
+                      --keyring "$(echo "$id" | sed -E 's|.*/keyRings/([^/]+)/.*|\1|')" \
+                      --project "$project" >/dev/null 2>&1 || continue ;;
+      pubsub_topic) gcloud pubsub topics describe "${id##*/}" \
+                      --project "$project" >/dev/null 2>&1 || continue ;;
+      pubsub_sub)   gcloud pubsub subscriptions describe "${id##*/}" \
+                      --project "$project" >/dev/null 2>&1 || continue ;;
+      logging_sink) gcloud logging sinks describe "${id##*/}" \
+                      --project "$project" >/dev/null 2>&1 || continue ;;
     esac
 
-    log "adopting undeletable KMS resource: $id"
+    log "adopting pre-existing resource: $id"
     [[ -f "$OVERRIDE_FILE" ]] || with_override
     if terraform import -input=false "$address" "$id" >/dev/null 2>&1; then
       adopted=$((adopted + 1))
@@ -252,7 +278,7 @@ adopt_kms() {
 
   drop_override
   trap - EXIT
-  log "KMS adoption complete: $adopted imported"
+  log "resource adoption complete: $adopted imported"
 }
 
 # create_cluster = false means "somebody else's cluster" — but if THIS state

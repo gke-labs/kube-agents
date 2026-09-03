@@ -70,7 +70,7 @@ graph TD
 ## 5. Deliberate exceptions and known gaps
 
 - **Development flows keep `latest`.** `k8s-operator/config/manager/kustomization.yaml`
-  still sets `newTag: latest` and `k8s-operator/scripts/common.sh` still offers `latest`
+  still sets `newTag: latest` and `scripts/installer/common.sh` still offers `latest`
   as the default `IMAGE_TAG` — both serve the interactive/dev install path, not GitOps
   production deploys. Rule 3 of the standardization validator is what guards production
   namespaces.

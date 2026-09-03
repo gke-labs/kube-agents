@@ -217,7 +217,7 @@ litellm:
     # copies: a chart pinned to a version the mirror was never populated with
     # is an ImagePullBackOff. This pin sat a release behind the kustomize base
     # for exactly that reason.
-    tag: v1.96.2
+    tag: v1.98.0
     pullPolicy: IfNotPresent
   replicaCount: 2
   # Rollout strategy — the canonical home for this argument. The chart template
@@ -388,7 +388,7 @@ githubMinter:
 fluentBit:
   image:
     repository: docker.io/fluent/fluent-bit
-    tag: "5.1.0"
+    tag: "5.1.1"
 
 platformAgent:
   enabled: true
@@ -416,6 +416,18 @@ platformAgent:
       enabled: null # CRD default: false
       provider: "" # CRD default: multiuser_memory
       userProfileEnabled: null # CRD default: false
+    # Execution limits per agent persona. Empty omits the field so CRD/Hermes
+    # defaults apply. When plugins.stockoutInvestigator.enabled=true, the chart
+    # automatically applies tuning (maxInProgress: 3, platform.maxTurns: 200,
+    # cluster.maxTurns: 150) unless overridden here.
+    tuning: {}
+      # maxInProgress: 3
+      # platform:
+      #   apiMaxRetries: 8
+      #   maxTurns: 200
+      # cluster:
+      #   apiMaxRetries: 8
+      #   maxTurns: 150
   deployment:
     image:
       repository: ghcr.io/gke-labs/kube-agents/platform-agent
@@ -501,7 +513,7 @@ platformAgent:
   security:
     # Kubernetes ServiceAccount the agent pod runs as. The Workload Identity
     # binding must target this KSA (see the chart README); the default matches
-    # PLATFORM_AGENT_KSA_NAME in k8s-operator/scripts/common.sh.
+    # PLATFORM_AGENT_KSA_NAME in scripts/installer/common.sh.
     # Ownership: with serviceAccountAnnotations set, the OPERATOR creates and
     # manages the KSA; with no annotations, the operator treats it as
     # user-managed and the CHART creates it instead.
@@ -631,3 +643,35 @@ platformAgent:
       serviceUrl: "https://smba.trafficmanager.net/teams/"
       # Render responses with Microsoft Adaptive Cards v1.5 (markdown fallback if false).
       adaptiveCards: true
+
+# AgentPlugins deployed into the cluster.
+plugins:
+  # Pub/Sub platform adapter AgentPlugin: opens the event listener for Cloud Pub/Sub subscriptions.
+  pubsubPlatform:
+    enabled: false
+    name: pubsubplatform
+    agentRef: "" # defaults to platformAgent.name
+    image:
+      repository: ghcr.io/gke-labs/kube-agents/pubsub-platform
+      tag: "" # defaults to Chart.appVersion
+      pullPolicy: IfNotPresent
+
+  # GKE Stockout Investigator AgentPlugin: diagnoses autoscaler scale-up failures and opens GitOps PRs.
+  # Requires plugins.pubsubPlatform.enabled=true for alert ingress.
+  stockoutInvestigator:
+    enabled: false
+    name: gkestockoutinvestigator
+    agentRef: "" # defaults to platformAgent.name
+    targetProfile: platform
+    # Target cluster name. Required when enabled (defaults to platformAgent.harness.clusterName if empty).
+    clusterName: ""
+    image:
+      repository: ghcr.io/gke-labs/kube-agents/gke-stockout-investigator
+      tag: "" # defaults to Chart.appVersion
+      pullPolicy: IfNotPresent
+    pubsub:
+      topic: gke-stockout-alerts-topic
+      subscription: gke-stockout-alerts-sub
+      sink: gke-stockout-alerts-sink
+      thresholdCount: 1
+      thresholdWindowSeconds: 300

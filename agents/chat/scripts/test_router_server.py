@@ -17,9 +17,9 @@ def _load_router_server():
     """Import the module under test.
 
     These tests exercise only stdlib logic (delegation to agent_roster + the
-    absence of the removed relay). When the hermes runtime deps (FastMCP /
+    absence of the removed relay). When the hermes runtime deps (MCPServer /
     pydantic) aren't installed at all, fall back to minimal stubs so the module
-    still imports in a bare checkout. `FastMCP().tool()` returns identity, so
+    still imports in a bare checkout. `MCPServer().tool()` returns identity, so
     the decorated tools remain plain callables.
 
     ABSENT is not BROKEN: stub only when no mcp distribution is installed, and
@@ -52,14 +52,12 @@ def _load_router_server():
 
         mcp = types.ModuleType("mcp"); mcp.__path__ = []
         mcp_server = types.ModuleType("mcp.server"); mcp_server.__path__ = []
-        fastmcp = types.ModuleType("mcp.server.fastmcp")
-        fastmcp.FastMCP = lambda *a, **k: types.SimpleNamespace(
-            tool=lambda *a, **k: (lambda f: f), run=lambda: None)
+        mcp_server.MCPServer = lambda *a, **k: types.SimpleNamespace(
+            tool=lambda *a, **k: (lambda f: f), run=lambda *a, **k: None)
         pydantic = types.ModuleType("pydantic")
         pydantic.Field = lambda *a, **k: None
         _stub_if_missing("mcp", mcp)
         _stub_if_missing("mcp.server", mcp_server)
-        _stub_if_missing("mcp.server.fastmcp", fastmcp)
         _stub_if_missing("pydantic", pydantic)
         return importlib.import_module("router_server")
 

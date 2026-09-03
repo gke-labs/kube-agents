@@ -1866,19 +1866,22 @@ func TestUpdatePluginStatuses_ImageVolumeUnsupported(t *testing.T) {
 		t.Fatalf("failed to fetch updated plugin: %v", err)
 	}
 
-	if updatedPlugin.Status.Phase != "Degraded" {
-		t.Errorf("expected Status.Phase 'Degraded', got '%s'", updatedPlugin.Status.Phase)
+	if updatedPlugin.Status.Phase != "Ready" {
+		t.Errorf("expected Status.Phase 'Ready', got '%s'", updatedPlugin.Status.Phase)
 	}
 
 	cond := meta.FindStatusCondition(updatedPlugin.Status.Conditions, "Ready")
 	if cond == nil {
 		t.Fatalf("expected 'Ready' status condition to be set")
 	}
-	if cond.Status != metav1.ConditionFalse {
-		t.Errorf("expected condition Status False, got %s", cond.Status)
+	if cond.Status != metav1.ConditionTrue {
+		t.Errorf("expected condition Status True, got %s", cond.Status)
 	}
-	if cond.Reason != "ImageVolumeUnsupported" {
-		t.Errorf("expected condition Reason 'ImageVolumeUnsupported', got '%s'", cond.Reason)
+	if cond.Reason != "Applied" {
+		t.Errorf("expected condition Reason 'Applied', got '%s'", cond.Reason)
+	}
+	if !strings.Contains(cond.Message, "init container") {
+		t.Errorf("expected condition Message to mention init container staging, got '%s'", cond.Message)
 	}
 }
 
@@ -1971,11 +1974,19 @@ func TestUpdatePluginStatuses_DuplicatePluginName(t *testing.T) {
 
 type fakeVersionDiscovery struct {
 	discovery.DiscoveryInterface
-	ver *version.Info
+	ver    *version.Info
+	groups *metav1.APIGroupList
 }
 
 func (f *fakeVersionDiscovery) ServerVersion() (*version.Info, error) {
 	return f.ver, nil
+}
+
+func (f *fakeVersionDiscovery) ServerGroups() (*metav1.APIGroupList, error) {
+	if f.groups != nil {
+		return f.groups, nil
+	}
+	return &metav1.APIGroupList{}, nil
 }
 
 func TestIsImageVolumeSupported_DiscoveryVersion(t *testing.T) {
@@ -2027,6 +2038,28 @@ func TestIsImageVolumeSupported_DiscoveryVersion(t *testing.T) {
 	}
 	if isImageVolumeSupported(dc35, agentDisableAnnot) {
 		t.Errorf("expected annotation override 'false' to force isImageVolumeSupported to false even on K8s 1.35")
+	}
+
+	// 5. Server version >= 1.35 on GKE Standard returns true (natively supported)
+	dcGKEStandard := &fakeVersionDiscovery{ver: &version.Info{Major: "1", Minor: "35", GitVersion: "v1.35.7-gke.1027000"}}
+	if !isImageVolumeSupported(dcGKEStandard, agent) {
+		t.Errorf("expected isImageVolumeSupported to return true on GKE Standard >= 1.35")
+	}
+
+	// 6. GKE Autopilot returns false (falls back to initContainer staging)
+	dcGKEAutopilot := &fakeVersionDiscovery{
+		ver: &version.Info{Major: "1", Minor: "35", GitVersion: "v1.35.7-gke.1027000"},
+		groups: &metav1.APIGroupList{
+			Groups: []metav1.APIGroup{{Name: "auto.gke.io"}},
+		},
+	}
+	if isImageVolumeSupported(dcGKEAutopilot, agent) {
+		t.Errorf("expected isImageVolumeSupported to return false on GKE Autopilot (falls back to initContainer staging)")
+	}
+
+	// 7. Annotation override "true" on GKE Autopilot forces isImageVolumeSupported to true
+	if !isImageVolumeSupported(dcGKEAutopilot, agentEnableAnnot) {
+		t.Errorf("expected annotation override 'true' to force isImageVolumeSupported to true on GKE Autopilot")
 	}
 }
 
@@ -2315,7 +2348,7 @@ func TestUpdatePluginStatuses_NoWriteWhenUnchanged(t *testing.T) {
 		t.Errorf("expected no second status write (resourceVersion %s), got %s", rvFirst, afterSecond.ResourceVersion)
 	}
 
-	// A genuine change must still be written.
+	// A genuine change (message updated to reflect init container staging) must still be written.
 	changed := afterSecond.DeepCopy()
 	r.updatePluginStatuses(ctx, agent, []*agentv1alpha1.AgentPlugin{changed}, false /* imageVolumeSupported */)
 	var afterThird agentv1alpha1.AgentPlugin
@@ -2323,10 +2356,10 @@ func TestUpdatePluginStatuses_NoWriteWhenUnchanged(t *testing.T) {
 		t.Fatalf("get after third: %v", err)
 	}
 	if afterThird.ResourceVersion == rvFirst {
-		t.Errorf("expected a status write when the plugin degrades, resourceVersion unchanged at %s", rvFirst)
+		t.Errorf("expected a status write when the condition changes, resourceVersion unchanged at %s", rvFirst)
 	}
-	if afterThird.Status.Phase != "Degraded" {
-		t.Errorf("expected Phase 'Degraded', got '%s'", afterThird.Status.Phase)
+	if afterThird.Status.Phase != "Ready" {
+		t.Errorf("expected Phase 'Ready', got '%s'", afterThird.Status.Phase)
 	}
 }
 
@@ -2445,6 +2478,84 @@ func TestUpdatePluginStatuses_ImagePullFailureIsReported(t *testing.T) {
 	}
 	if good.Status.Phase != "Ready" {
 		t.Errorf("expected unaffected plugin to stay Ready, got %q", good.Status.Phase)
+	}
+}
+
+func TestUpdatePluginStatuses_StagingFailureIsReported(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "target-agent", Namespace: "test-ns"},
+	}
+	failingPlugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "failstage", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "target-agent", Image: "gcr.io/proj/plugin:v1"},
+	}
+	healthyPlugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "okstage", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "target-agent", Image: "gcr.io/proj/plugin:v2"},
+	}
+
+	stagingContainerName := buildPluginStagingContainerName("failstage")
+	okContainerName := buildPluginStagingContainerName("okstage")
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "target-agent-gateway-xyz",
+			Namespace: "test-ns",
+			Labels:    map[string]string{"app": "target-agent-gateway"},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+			InitContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: stagingContainerName,
+					State: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{
+							ExitCode: 1,
+							Reason:   "Error",
+						},
+					},
+				},
+				{
+					Name: okContainerName,
+					State: corev1.ContainerState{
+						Running: &corev1.ContainerStateRunning{},
+					},
+				},
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(failingPlugin, healthyPlugin, pod).
+		WithStatusSubresource(failingPlugin, healthyPlugin).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	r.updatePluginStatuses(ctx, agent, []*agentv1alpha1.AgentPlugin{failingPlugin, healthyPlugin}, false)
+
+	var bad, good agentv1alpha1.AgentPlugin
+	if err := cl.Get(ctx, types.NamespacedName{Name: "failstage", Namespace: "test-ns"}, &bad); err != nil {
+		t.Fatalf("get bad plugin: %v", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "okstage", Namespace: "test-ns"}, &good); err != nil {
+		t.Fatalf("get good plugin: %v", err)
+	}
+
+	if bad.Status.Phase != "Degraded" {
+		t.Errorf("expected failing staging plugin Phase 'Degraded', got %q", bad.Status.Phase)
+	}
+	cond := meta.FindStatusCondition(bad.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "StagingFailed" {
+		t.Fatalf("expected Reason 'StagingFailed', got %+v", cond)
+	}
+	if !strings.Contains(cond.Message, "staging init container exited with code 1") {
+		t.Errorf("expected exit code 1 in condition message, got %q", cond.Message)
+	}
+	if good.Status.Phase != "Ready" {
+		t.Errorf("expected healthy staging plugin Phase 'Ready', got %q", good.Status.Phase)
 	}
 }
 
@@ -4378,5 +4489,84 @@ func TestSyncGithubTokenMinterConfigMap(t *testing.T) {
 
 	if _, exists := updatedCM.Data["forbidden-repo.yaml"]; exists {
 		t.Errorf("expected cross-org forbidden-repo.yaml to be skipped when primaryOrg is inferred from GitRepo")
+	}
+}
+
+// An unrecognized spec.mode can only reach the reconciler through version skew
+// (enum validation rejects it at admission — the fake client, like a newer CRD
+// with an older binary, does not). The contract from the mode spec: Degraded
+// with reason ModeNotRecognized, today's stack still rendered, and a requeue.
+func TestPlatformAgentReconciler_Reconcile_UnrecognizedMode(t *testing.T) {
+	scheme := setupScheme()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.PlatformAgentSpec{Mode: ptr.To("quantum")},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-agent", Namespace: "test-ns"}}
+	ctx := context.Background()
+
+	// 1st reconcile adds the finalizer, 2nd does the work.
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 1 failed: %v", err)
+	}
+	result, err := r.Reconcile(ctx, req)
+	if err != nil {
+		t.Fatalf("Reconcile 2 failed: %v", err)
+	}
+	if result.RequeueAfter != 30*time.Second {
+		t.Errorf("expected 30s requeue while mode is unrecognized, got %v", result.RequeueAfter)
+	}
+
+	updated := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	if updated.Status.Phase != "Degraded" {
+		t.Errorf("expected phase Degraded, got %q", updated.Status.Phase)
+	}
+	cond := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+	if cond == nil {
+		t.Fatal("expected a Ready condition")
+	}
+	if cond.Reason != "ModeNotRecognized" {
+		t.Errorf("expected reason ModeNotRecognized, got %q", cond.Reason)
+	}
+	if !strings.Contains(cond.Message, "quantum") {
+		t.Errorf("condition message must name the unrecognized value, got %q", cond.Message)
+	}
+
+	// Fail-closed means the dark stack stays dark AND today's stack still renders:
+	// the cluster keeps running what it ran, with the skew visible in status.
+	dep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-gateway", Namespace: "test-ns"}, dep); err != nil {
+		t.Errorf("today's Deployment should still be rendered under an unrecognized mode: %v", err)
+	}
+
+	// Correcting the mode clears the Degraded phase on the next reconcile.
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to refetch agent: %v", err)
+	}
+	updated.Spec.Mode = nil
+	if err := cl.Update(ctx, updated); err != nil {
+		t.Fatalf("failed to update agent: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 3 failed: %v", err)
+	}
+	if err := cl.Get(ctx, req.NamespacedName, updated); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+	if updated.Status.Phase == "Degraded" {
+		t.Errorf("expected Degraded to clear once the mode is valid, still %q", updated.Status.Phase)
 	}
 }

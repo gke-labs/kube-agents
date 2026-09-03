@@ -253,23 +253,19 @@ The module also owns the plumbing that would otherwise become a third copy: the 
 
 ### What a second forge actually costs
 
-The provider protocol makes this feature portable. The stack under it is not, and four places would
-each need work. None is caused by this design; all are worth naming so the next person does not
-discover them one at a time.
+The provider protocol makes this feature portable. The stack under it is not — token brokering, the
+sidecar's executable allowlist, the git credential shape and the CRD each name GitHub, and none of
+that is caused by this design. [`multi-forge-support.md`](multi-forge-support.md) owns the full
+account and the order the layers have to be unwound in; this section records only what bears on the
+protocol above them.
 
-1. **Token brokering.** `terraform/modules/github-minter` mints GitHub App installation tokens.
-   GitLab and Bitbucket have no equivalent shape — project access tokens, or OAuth refresh flows.
-2. **The sidecar.** `ALLOWED_EXECUTABLES = ("gcloud", "kubectl", "gh", "git")`. GitLab could add
-   `glab`; **Bitbucket has no comparable CLI**, so it needs a `/v1/<forge>/…` proxy route, because
-   the agent container may never hold the token. That route is the `ProxyForgeProvider` the `_call()`
-   seam exists for.
-3. **Git credentials.** `refresh_git_credentials` writes GitHub-shaped credentials; other forges want
-   a different username convention.
-4. **The CRD.** `GitHubSpec` is the only integration (`common_types.go`), while `ValidateGitRepoURL`
-   is host-agnostic — so the CR already accepts a URL nothing downstream serves.
-
-Also worth recording: "Bitbucket" is two providers. Cloud (`/2.0/repositories/…`) and Data Center
-(`/rest/api/1.0/projects/…`) share almost nothing.
+"Bitbucket" is two providers, which is the limit of how far one provider class stretches. Cloud
+(`/2.0/repositories/…`) and Data Center (`/rest/api/1.0/projects/…`) share almost nothing, so a class
+branching on which one it is talking to would be two implementations in a trench coat. Two separate
+providers are cheap here because of the `_call()` seam, which exists for a different reason: a forge
+with no CLI to shell cannot reach anything except through a sidecar route, and Bitbucket has no `gh`
+equivalent at all. Its tokens come from OAuth refresh flows, so it would want a third token strategy
+again.
 
 ## 4. The pull-request sweep
 
@@ -605,16 +601,18 @@ Three details are deliberate:
 - **Markers are stripped from the bodies** (`pr_triggers.strip_markers`, display only —
   `handled_node_ids` still reads raw bodies). Feeding the model its own `<!-- agent-answered:… -->`
   syntax invites it to imitate it in prose that `reply` then stamps a second, real marker onto.
-- **Both caps report what they dropped** — `omitted_earlier` on the thread, `truncated_chars` on the
-  comment. A silently shortened transcript reads exactly like a complete one, and the worker would
-  answer confidently from a conversation it half saw.
+- **Caps report what they dropped** — `omitted_earlier` on the thread transcript (`CONTEXT_MAX_COMMENTS = 40`),
+  `omitted_requests` on the thread (`CONTEXT_MAX_REQUESTS = 10`), `truncated_chars` on the comment body
+  (`CONTEXT_MAX_BODY_CHARS = 4000`) and on the request line (`CONTEXT_MAX_REQUEST_CHARS = 500`), and a stderr
+  notice for requests deferred past `CONTEXT_MAX_REQUESTS = 10`. A silently shortened transcript reads exactly
+  like a complete one, and the worker would answer confidently from a conversation it half saw.
 - **The comment cap drops the oldest**, the opposite of the sweep's oldest-first rule for triggers.
   A trigger queue must not starve its head; a transcript is a story whose recent end explains the
   request being answered now. **The requests themselves are pinned past the cap**, because those two
   rules point at the same comment: on a thread longer than the cap, the oldest unanswered trigger —
   the one the sweep just handed over — is the first thing the window throws away. For a bare
   `@mention` the card carries no copy of the request either, so the worker would be asked to answer
-  words that appear nowhere in its context. Pinning costs at most `PR_AGENT_MAX_PER_TICK` rows.
+  words that appear nowhere in its context. Pinning costs at most `CONTEXT_MAX_REQUESTS` rows.
 
 This widens what reaches the model — a comment from an account with no write access is now in the
 prompt even though it can never be acted on. That is the point, and it is why SKILL.md states in the

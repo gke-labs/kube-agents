@@ -231,7 +231,7 @@ with st.form(
             # cluster's often is not one. This field is submitted verbatim, so
             # a regional prefill would override the same default the gateway
             # applies -- see DEFAULT_VERTEX_LOCATION in
-            # k8s-operator/scripts/installer_common.sh.
+            # scripts/installer/installer_common.sh.
             default = current_settings.get(setting["id"]) or (
                 target.project_id if setting["id"] == "project_id" else "global"
             )

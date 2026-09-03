@@ -8,6 +8,33 @@
 
 set -euo pipefail
 
+# The session daemon caps Warning alerts at 5 per UTC day, fleet-wide per
+# install (ALERT_DAILY_LIMIT_WARNING, #641). That cap is alert-storm
+# protection for a human-watched channel; an eval install's whole job is
+# generating alerts. Every smoke build that leases a pool project that day
+# spends the same shared budget on its own crash-loop scenarios, and once it
+# is gone the daemon quota-suppresses the very alert
+# autoops-warning-event-triage waits 300s for, timing out the plant (#1101).
+# 0 is the documented off-switch — `_alert_daily_limit` in
+# agents/platform/scripts/session_kv_server.py parses it as "cap off" and
+# `_claim_alert_quota` lets `limit <= 0` through uncapped — and setting it
+# here, on the deploy, leaves the production
+# default untouched. tests/test_ci_deploy_alert_quota.py pins the whole
+# chain: this flag, the chart rendering it onto the CR, and the operator's
+# env allowlist letting it through to the container.
+readonly EVAL_ALERT_DAILY_LIMIT_WARNING="0"
+
+# The release step 5 installs, and — for the poisoned-record guard (#1172) —
+# the label pair Helm stamps on every release-record Secret it writes
+# (`owner=helm` plus `name=<release>`), selecting every revision's record of
+# this release and nothing else in the namespace.
+readonly HELM_RELEASE_NAME="kube-agents"
+readonly HELM_RELEASE_SECRET_SELECTOR="owner=helm,name=${HELM_RELEASE_NAME}"
+# What a healthy revision looks like in `helm history -o json` output. The
+# encoder emits compact `"status":"deployed"`; the pattern tolerates spacing
+# so a Helm formatting change cannot silently blind the guard.
+readonly HELM_DEPLOYED_STATUS_RE='"status"[[:space:]]*:[[:space:]]*"deployed"'
+
 # ─── 1. Validation & Pre-checks ───────────────────────────────────────────────
 if [ -z "${GEMINI_API_KEY:-}" ]; then
   echo "ERROR: GEMINI_API_KEY environment variable is required"
@@ -89,6 +116,11 @@ gitops_repo_for_project() {
     kube-agents-evals-8) echo "gke-agentic/kube-agents-evals-8-infra" ;;
     kube-agents-evals-9) echo "gke-agentic/kube-agents-evals-9-infra" ;;
     kube-agents-evals-10) echo "gke-agentic/kube-agents-evals-10-infra" ;;
+    kube-agents-evals-11) echo "gke-agentic/kube-agents-evals-11-infra" ;;
+    kube-agents-evals-12) echo "gke-agentic/kube-agents-evals-12-infra" ;;
+    kube-agents-evals-13) echo "gke-agentic/kube-agents-evals-13-infra" ;;
+    kube-agents-evals-14) echo "gke-agentic/kube-agents-evals-14-infra" ;;
+    kube-agents-evals-15) echo "gke-agentic/kube-agents-evals-15-infra" ;;
     *) return 1 ;;
   esac
 }
@@ -252,7 +284,7 @@ export CACHE_IMAGE="${CACHE_IMAGE:-us-docker.pkg.dev/kube-agents-prow/kube-agent
 export BUILDCACHE_IMAGE="${BUILDCACHE_IMAGE:-us-docker.pkg.dev/kube-agents-prow/kube-agents/platform-agent:buildcache}"
 export PROXY_BUILDCACHE_IMAGE="${PROXY_BUILDCACHE_IMAGE:-us-docker.pkg.dev/kube-agents-prow/kube-agents/credential-proxy:buildcache}"
 gcloud builds submit --config="deploy/docker/cloudbuild-ci.yaml" \
-  --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}" \
+  --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}" \
   --project="${PROJECT_ID}" "${BUILD_WORKER_ARGS[@]}" --quiet .
 echo "✓ Container image builds finished in $((SECONDS - STEP_START))s"
 
@@ -274,8 +306,48 @@ echo "✓ Container image builds finished in $((SECONDS - STEP_START))s"
 # test's.
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Deploying the kube-agents chart ==="
+
+# ─── 5a. Heal a poisoned release record (#1172) ───────────────────────────────
+# A failed or killed prior run can leave the release record behind with no
+# deployed revision: its teardown's `helm uninstall` failed, or the teardown
+# was killed mid-uninstall — the cause no teardown-side fallback can cover.
+# `helm upgrade --install` below then takes the upgrade path and dies with
+# `UPGRADE FAILED: "kube-agents" has no deployed releases`, instantly
+# failing whichever PR drew this pool project. Heal it here, at lease time,
+# where every cause of the no-deployed-revision state converges. (A release
+# stuck `pending-upgrade` *above* a deployed revision is a different state —
+# upgrade then fails on Helm's in-progress lock, but that run's own teardown
+# uninstall clears it, so it burns one run rather than poisoning the pool.)
+#
+# The probe is `helm history -o json` because it reads the same store the
+# failing code path reads: Helm's upgrade errors in Releases.Deployed()
+# (pkg/action/upgrade.go) when no release-record Secret carries status
+# "deployed", and `helm history` lists exactly those record Secrets with
+# their statuses. "History succeeds but no revision is deployed" is
+# therefore precisely the state upgrade rejects — including a latest-failed
+# release with an older deployed revision, which upgrades fine and is left
+# alone. One call; a healthy or absent release costs the probe and nothing
+# more.
+if RELEASE_HISTORY_JSON="$(helm history "${HELM_RELEASE_NAME}" -n "${NAMESPACE}" -o json 2>/dev/null)" \
+  && ! grep -Eq "${HELM_DEPLOYED_STATUS_RE}" <<<"${RELEASE_HISTORY_JSON}"; then
+  echo "WARNING: the ${HELM_RELEASE_NAME} release record exists with no deployed revision —"
+  echo "         a previous run left this pool project poisoned (#1172). Clearing the"
+  echo "         record before installing."
+  # --no-hooks: the pre-delete hook waits on an operator a failed install
+  # never started. If even the uninstall cannot clear it, drop the
+  # release-record Secrets directly — with no deployed revision there is
+  # nothing real for Helm to unwind, and the record is all that blocks the
+  # install. Both failing leaves the record in place, so let set -e stop
+  # the run here, before the upgrade fails less legibly. No --wait and no
+  # hooks means Helm's uninstall timeout would bound nothing, so none is
+  # passed.
+  helm uninstall "${HELM_RELEASE_NAME}" -n "${NAMESPACE}" --no-hooks \
+    || kubectl delete secret -n "${NAMESPACE}" -l "${HELM_RELEASE_SECRET_SELECTOR}" --ignore-not-found
+  echo "✓ Cleared the poisoned ${HELM_RELEASE_NAME} release record"
+fi
+
 API_SERVER_KEY="${API_SERVER_KEY:-$(openssl rand -hex 16)}"
-helm upgrade --install kube-agents ./charts/kube-agents \
+helm upgrade --install "${HELM_RELEASE_NAME}" ./charts/kube-agents \
   --namespace "${NAMESPACE}" --create-namespace \
   --set-string "operator.image.repository=${AR_REPO}/kube-agents-operator" \
   --set-string "operator.image.tag=${TAG}" \
@@ -293,6 +365,8 @@ helm upgrade --install kube-agents ./charts/kube-agents \
   --set-string "litellm.modelProvider=${MODEL_PROVIDER}" \
   --set-string "litellm.modelDefaultName=${MODEL_DEFAULT_NAME}" \
   --set "platformAgent.deployment.availability.runtimeClassName=" \
+  --set-string "platformAgent.deployment.env[0].name=ALERT_DAILY_LIMIT_WARNING" \
+  --set-string "platformAgent.deployment.env[0].value=${EVAL_ALERT_DAILY_LIMIT_WARNING}" \
   --wait --timeout 15m
 echo "✓ Chart deployment finished in $((SECONDS - STEP_START))s"
 

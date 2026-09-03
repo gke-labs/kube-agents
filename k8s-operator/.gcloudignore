@@ -3,4 +3,3 @@
 bin/
 cover.out
 *.test
-**/vars.sh

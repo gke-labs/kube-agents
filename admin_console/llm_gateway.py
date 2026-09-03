@@ -755,7 +755,7 @@ except urllib.error.HTTPError as error:
             "VERTEX_PROJECT_ID": settings.get("project_id", self.target.project_id),
             # Not the target's region: a model is only callable from a location
             # that serves it, and the cluster's often is not one. Mirrors
-            # DEFAULT_VERTEX_LOCATION in k8s-operator/scripts/installer_common.sh.
+            # DEFAULT_VERTEX_LOCATION in scripts/installer/installer_common.sh.
             "VERTEX_LOCATION": settings.get("location") or "global",
         }
         if provider.workload_identity:
