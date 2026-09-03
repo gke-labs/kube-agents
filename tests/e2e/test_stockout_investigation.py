@@ -86,6 +86,10 @@ _SKILL_MOUNT_TIMEOUT_SECONDS = 120
 # either test for it or pass fail_on_timeout.
 _KUBECTL_TIMEOUT_RC = 124
 
+_AGENT_AVAILABILITY_TIMEOUT_SECONDS = 180
+_AGENT_POLL_INTERVAL_SECONDS = 5
+_DEFAULT_ROUTE_NAME = "gke_stockout_alerts"
+
 
 def _as_text(stream: Any) -> str:
     """Renders captured output as text.
@@ -524,6 +528,73 @@ def _verify_skill_mounted(
     )
 
 
+def _clean_stale_kanban_tasks(pod: str, namespace: str, route_name: str) -> None:
+    """Reclaims and archives any lingering kanban tasks for route_name so slots are open."""
+    py_code = (
+        "import subprocess, json\n"
+        "try:\n"
+        "    cmd_env = {'HOME': '/tmp', 'PATH': '/opt/hermes/.venv/bin:/usr/local/bin:/usr/bin:/bin'}\n"
+        "    out = subprocess.check_output(['hermes', 'kanban', 'ls', '--json'], env=cmd_env)\n"
+        "    data = json.loads(out)\n"
+        "    tasks = data.get('tasks') if isinstance(data, dict) else data\n"
+        "    for t in (tasks or []):\n"
+        "        tid = t.get('id')\n"
+        "        title = str(t.get('title', ''))\n"
+        "        status = t.get('status')\n"
+        f"        if tid and title.startswith({route_name!r}) and status in ('running', 'claimed', 'ready', 'blocked', 'todo'):\n"
+        "            if status in ('running', 'claimed'):\n"
+        "                subprocess.run(['hermes', 'kanban', 'reclaim', tid], env=cmd_env, capture_output=True)\n"
+        "            subprocess.run(['hermes', 'kanban', 'archive', tid], env=cmd_env, capture_output=True)\n"
+        "except Exception:\n"
+        "    pass\n"
+    )
+    _kubectl("exec", "-i=false", "-n", namespace, pod, "-c", "platform-agent", "--", "python3", "-c", py_code)
+
+
+def _wait_for_agent_available(
+    agent_ref: str,
+    namespace: str,
+    timeout: int = _AGENT_AVAILABILITY_TIMEOUT_SECONDS,
+    clean_kanban: bool = True,
+) -> str:
+    """Waits until the platform-agent gateway workload is rolled out, ready, and responsive."""
+    kind, workload_name = _gateway_workload(agent_ref, namespace)
+    if kind is None:
+        pytest.fail(
+            f"No Deployment or StatefulSet '{workload_name}' in namespace '{namespace}'; "
+            f"PlatformAgent '{agent_ref}' has no gateway workload."
+        )
+    target = f"{kind}/{workload_name}"
+    deadline = time.time() + timeout
+
+    res = _kubectl("rollout", "status", target, "-n", namespace, f"--timeout={timeout}s", timeout=timeout + 30)
+    if res.returncode != 0:
+        pytest.fail(f"Gateway {target} rollout not ready within {timeout}s: {res.stderr}")
+
+    ready_pod = None
+    while time.time() < deadline:
+        revision = _current_revision_selector(kind, workload_name, namespace)
+        pod, _ = _gateway_pod(agent_ref, namespace, revision)
+        if pod:
+            home = _agent_home(agent_ref, namespace)
+            skill_path = f"{home}/profiles/platform/plugins/{_PLUGIN_NAME}/skills/{_PLUGIN_SKILL_NAME}/SKILL.md"
+            probe = f'test -f "{skill_path}" && echo PRESENT || echo ABSENT'
+            probe_res = _kubectl("exec", "-i=false", "-n", namespace, pod, "-c", "platform-agent", "--", "sh", "-c", probe)
+            if probe_res.returncode == 0 and "PRESENT" in probe_res.stdout:
+                ready_pod = pod
+                break
+        time.sleep(_AGENT_POLL_INTERVAL_SECONDS)
+
+    if not ready_pod:
+        pytest.fail(f"Platform Agent pod for {target} not available and ready within {timeout}s in {namespace}")
+
+    if clean_kanban:
+        route_name = os.environ.get("STOCKOUT_ROUTE", _DEFAULT_ROUTE_NAME)
+        _clean_stale_kanban_tasks(ready_pod, namespace, route_name)
+
+    return ready_pod
+
+
 # All 10 GKE Stockout Investigator diagnostic failure scenarios
 STOCKOUT_SCENARIO_DEFINITIONS: List[Tuple[str, str, str]] = [
     (
@@ -714,6 +785,7 @@ def ensure_stockout_plugin_installed(
         workload_name,
         budget_deadline,
     )
+    _clean_stale_kanban_tasks(pod, agent_namespace, os.environ.get("STOCKOUT_ROUTE", _DEFAULT_ROUTE_NAME))
     print(f"stockout plugin verified in {pod}; the tests below run against it")
 
 
@@ -743,6 +815,10 @@ def test_stockout_ingress_alert_smoke(
     )
     if res_plugin.returncode != 0:
         pytest.fail("gkestockoutinvestigator AgentPlugin is not active in cluster; ingress smoke test failed.")
+
+    agent_ref = os.environ.get("AGENT_REF") or _DEFAULT_AGENT_REF
+    pod = _wait_for_agent_available(agent_ref, agent_namespace)
+    print(f"Platform agent available in {pod}; starting ingress alert smoke test")
 
     env = {
         **os.environ,
@@ -805,6 +881,10 @@ def test_stockout_scenario(
         pytest.fail(f"Scenario script '{scenario_script}' missing.")
     if not gcp_project_id or not gke_cluster_name:
         pytest.fail("GCP_PROJECT_ID and GKE_CLUSTER_NAME are required for stockout scenario.")
+
+    agent_ref = os.environ.get("AGENT_REF") or _DEFAULT_AGENT_REF
+    pod = _wait_for_agent_available(agent_ref, agent_namespace)
+    print(f"Platform agent available in {pod}; starting scenario {scenario_slug}")
 
     env = {
         **os.environ,

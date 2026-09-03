@@ -459,9 +459,59 @@ class BudgetTest(unittest.TestCase):
     def test_every_wait_is_capped_by_the_budget(self):
         for name in ("_INSTALL_TIMEOUT_SECONDS", "_ROLLOUT_TIMEOUT_SECONDS",
                      "_PLUGIN_READY_TIMEOUT_SECONDS", "_SKILL_MOUNT_TIMEOUT_SECONDS",
-                     "_GENERATION_STABLE_SECONDS"):
+                     "_GENERATION_STABLE_SECONDS", "_AGENT_AVAILABILITY_TIMEOUT_SECONDS"):
             with self.subTest(constant=name):
                 self.assertLessEqual(getattr(sof, name), sof._FIXTURE_BUDGET_SECONDS)
+
+
+class WaitAgentAvailableTest(unittest.TestCase):
+    """Verifies that _wait_for_agent_available checks rollout, pod readiness, skill mount, and kanban cleanup."""
+
+    def test_ready_agent_returns_pod_name(self):
+        def fake_kubectl(*args, **kwargs):
+            if "rollout" in args:
+                return _completed(returncode=0)
+            if "exec" in args:
+                # Skill probe or kanban cleanup
+                return _completed(stdout="PRESENT\n")
+            if "deployment" in args:
+                return _completed(returncode=0)
+            if "platformagent" in args:
+                return _completed(stdout="/opt/data")
+            return _completed(stdout=json.dumps({"items": [GatewayPodTest._pod("gw-ready")]}))
+
+        with mock.patch.object(sof, "_kubectl", side_effect=fake_kubectl), \
+                mock.patch.object(sof, "_current_revision_selector", return_value=None):
+            pod = sof._wait_for_agent_available("platform-agent", "ns", timeout=10)
+        self.assertEqual(pod, "gw-ready")
+
+    def test_rollout_failure_raises(self):
+        def fake_kubectl(*args, **kwargs):
+            if "rollout" in args:
+                return _completed(returncode=1, stderr="rollout timeout")
+            if "deployment" in args:
+                return _completed(returncode=0)
+            return _completed(returncode=0)
+
+        with mock.patch.object(sof, "_kubectl", side_effect=fake_kubectl):
+            with self.assertRaises(_StubFailure) as caught:
+                sof._wait_for_agent_available("platform-agent", "ns", timeout=10)
+        self.assertIn("rollout not ready", str(caught.exception))
+
+    def test_unready_pod_raises_when_timeout_exhausted(self):
+        def fake_kubectl(*args, **kwargs):
+            if "rollout" in args:
+                return _completed(returncode=0)
+            if "deployment" in args:
+                return _completed(returncode=0)
+            return _completed(stdout=json.dumps({"items": [GatewayPodTest._pod("gw-unready", ready=False)]}))
+
+        with mock.patch.object(sof, "_kubectl", side_effect=fake_kubectl), \
+                mock.patch.object(sof, "_current_revision_selector", return_value=None), \
+                mock.patch.object(sof.time, "sleep"):
+            with self.assertRaises(_StubFailure) as caught:
+                sof._wait_for_agent_available("platform-agent", "ns", timeout=0)
+        self.assertIn("not available and ready", str(caught.exception))
 
 
 if __name__ == "__main__":

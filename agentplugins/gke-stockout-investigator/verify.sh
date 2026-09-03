@@ -48,6 +48,7 @@ CONTROLLER_NAME="ml-training-job-gpu-2-${TEST_ID##*-}"
 # The adapter route these alerts arrive on, and the string every log line about them
 # carries. Must match the subscription key in templates/agentplugin.yaml.
 ROUTE_NAME="${STOCKOUT_ROUTE:-gke_stockout_alerts}"
+GATEWAY_WAIT_TIMEOUT="${GATEWAY_WAIT_TIMEOUT:-120}"
 
 echo "============================================================"
 echo "Verifying GKE Stockout Investigator Extension"
@@ -58,6 +59,10 @@ echo "PubSub Topic:    ${TOPIC}"
 echo "Test Event ID:   ${TEST_ID}"
 echo "Test Workload:   ${CONTROLLER_NAME}"
 echo "============================================================"
+
+echo "Step 0: Verifying platform-agent-gateway availability and readiness..."
+kubectl --context="$CONTEXT" rollout status deployment/platform-agent-gateway \
+    -n "$NAMESPACE" --timeout="${GATEWAY_WAIT_TIMEOUT}s"
 
 # Construct test payload matching log sink filter & stockout investigator template
 PAYLOAD=$(cat <<EOF
