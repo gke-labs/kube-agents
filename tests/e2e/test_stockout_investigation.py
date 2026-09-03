@@ -817,8 +817,7 @@ def test_stockout_ingress_alert_smoke(
         pytest.fail("gkestockoutinvestigator AgentPlugin is not active in cluster; ingress smoke test failed.")
 
     agent_ref = os.environ.get("AGENT_REF") or _DEFAULT_AGENT_REF
-    pod = _wait_for_agent_available(agent_ref, agent_namespace)
-    print(f"Platform agent available in {pod}; starting ingress alert smoke test")
+    _wait_for_agent_available(agent_ref, agent_namespace)
 
     env = {
         **os.environ,
@@ -883,8 +882,7 @@ def test_stockout_scenario(
         pytest.fail("GCP_PROJECT_ID and GKE_CLUSTER_NAME are required for stockout scenario.")
 
     agent_ref = os.environ.get("AGENT_REF") or _DEFAULT_AGENT_REF
-    pod = _wait_for_agent_available(agent_ref, agent_namespace)
-    print(f"Platform agent available in {pod}; starting scenario {scenario_slug}")
+    _wait_for_agent_available(agent_ref, agent_namespace)
 
     env = {
         **os.environ,
