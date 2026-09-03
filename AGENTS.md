@@ -370,6 +370,14 @@ welcome — otherwise keep working while the eval crew classifies it. One `/rete
 for a suspected transient; repeated blind retests are noise. Never merge around a red gate, and
 never instruct anyone to.
 
+Two merge mechanics follow (#1202). A plain `/override` (admins only) stamps the base SHA at
+override time, so the next merge to `main` re-triggers the job over your green context;
+`/override-sticky` survives base moves, and either is only for a red the eval crew classified
+as not the pull request's. An unresolved review thread blocks the merge silently: approved,
+green, and unmerged means check threads first, then the `err` field in
+[tide-history](https://oss.gprow.dev/tide-history) — mechanics and the measured incident in
+[how a change merges](docs/pull-request-workflow.md#how-a-change-merges).
+
 ## Automated Review After Opening a Pull Request
 
 Every pull request here is reviewed automatically by `kube-agents-bot`, a GitHub App that runs a
