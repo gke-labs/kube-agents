@@ -1034,6 +1034,15 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
             # carve-out.
             (["kubectl", "apply", "set-last-applied", "--dry-run=server",
               "-f", "cc.yaml"], False, "apply set-last-applied"),
+            # edit-last-applied spawns $KUBE_EDITOR; the carve-out exists for
+            # the plain apply the obtainability skill runs, so the whole
+            # subcommand family stays out of it.
+            (["kubectl", "apply", "edit-last-applied", "--dry-run=client",
+              "-f", "cc.yaml"], False, "apply edit-last-applied"),
+            # kubectl rejects an invalid value only when it is the last one,
+            # so the ordering that reaches the API decides here too.
+            (["kubectl", "apply", "--dry-run=bogus", "--dry-run=server",
+              "-f", "cc.yaml"], True, "last flag decides, invalid first"),
         ):
             with self.subTest(desc=desc):
                 self.assertEqual(evaluate(argv).allowed, allowed, desc)
