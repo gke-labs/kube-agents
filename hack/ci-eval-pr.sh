@@ -949,7 +949,11 @@ TASKS=(
   # this array calls a case that can only fail.
   # Uncomment when the agent can diagnose a capped pool, not before.
   # "./tasks/cluster-agent-pending-replicas-capped-pool/task.yaml"
-  "./tasks/gpu-stress-test-diagnosis/task.yaml"
+  # Removed from presubmit 2026-09-03 for wall clock: tofu provisioning
+  # serializes on the infra lock (~61 min/run for this case alone; #1202
+  # trim addendum). Re-enters via NIGHTLY_TASKS when the nightly tier
+  # (#1175) lands.
+  # "./tasks/gpu-stress-test-diagnosis/task.yaml"
   "./tasks/agent-kanban-smoke/task.yaml"
   # Last, because it is the only entry that pays twice. Its stack plants an
   # OOM-killed workload on the host cluster and blocks until the event
@@ -961,7 +965,11 @@ TASKS=(
   # It provisions no cluster despite being deployer: tofu -- see the header of
   # bench/tf/prebuilt/autoops-incident/main.tf for why it cannot, and why it
   # is the host cluster and not the per-run one that gets the incident.
-  "./tasks/autoops-warning-event-triage/task.yaml"
+  # Removed from presubmit 2026-09-03 for wall clock (tofu serialization,
+  # ~45 min/run; #1202 trim addendum). Held out of BOOTSTRAP_ADMITTED
+  # anyway (#1101); its admission record accrues via the nightly tier
+  # (#1175) once that runs.
+  # "./tasks/autoops-warning-event-triage/task.yaml"
   # Ten registered scenarios stay commented out. The task-registration lint
   # counts a commented entry as registered, so a line here is a promise the
   # scenario exists, not that it runs; the domain-coverage lint counts only
@@ -1217,7 +1225,7 @@ print(m.group(1).strip('\'\"') if m else '')
 # nothing to main's side of the aggregate. Screening replaces it.
 #
 # This roster is what blocks a pull request once the Prow job stops being
-# optional. Twelve of the twenty active cases are admitted: the ones
+# optional. Ten of the eighteen active cases are admitted: the ones
 # whose recent record shows failures only on their own regressions or on
 # infra classes the harness already excludes from the verdict. The rest
 # cannot red one on a GRADED failure: five are held out below with named
@@ -1274,7 +1282,7 @@ print(m.group(1).strip('\'\"') if m else '')
 # agent-kanban-smoke earned its seat back after the 08-27 redesign (a real
 # SRE question graded on kanban_create plus cluster names); the reds that
 # once argued for un-arming it belonged to the old vocabulary check.
-export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,cluster-agent-crashloop-debug,cluster-agent-crashloop-misleading-symptom,cluster-agent-crashloop-evidence-chain,gpu-stress-test-diagnosis,agent-kanban-smoke}"
+export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,cluster-agent-crashloop-debug,cluster-agent-crashloop-misleading-symptom,cluster-agent-crashloop-evidence-chain,agent-kanban-smoke}"
 
 # Where the evidence itself lives. Unset means bench/baselines/ in the
 # checkout: hermetic, no credential, no network -- and no way for this job to
