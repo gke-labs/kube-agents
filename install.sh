@@ -77,7 +77,7 @@ trap 'on_error $? $LINENO "$BASH_COMMAND"' ERR
 
 # Sourced/baked release version. On developer checkouts (main), this is empty.
 # Release automation stamps this value (e.g. BAKED_RELEASE_VERSION="0.2.0") when publishing a GA release.
-BAKED_RELEASE_VERSION=""
+BAKED_RELEASE_VERSION="0.4.0"
 
 # ─── Install Defaults (install.defaults.env) ──────────────────────────────────
 # Sourced before the parameter block so the DEFAULT_* values are in scope where

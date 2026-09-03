@@ -26,7 +26,7 @@ C_RESET="\033[0m"
 
 # Sourced/baked release version. On developer checkouts (main), this is empty.
 # Release automation stamps this value (e.g. BAKED_RELEASE_VERSION="0.2.0") when publishing a GA release.
-BAKED_RELEASE_VERSION=""
+BAKED_RELEASE_VERSION="0.4.0"
 
 # Default CLI Configuration
 PARAM_UPGRADE_MODE="full"
