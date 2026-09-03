@@ -1734,6 +1734,11 @@ def main() -> int:
         parser.error("--window-days must be at least 1")
     if args.deadline_seconds <= 0:
         parser.error("--deadline-seconds must be positive")
+    # ThreadPoolExecutor raises on max_workers < 1, and the sweep catches its own
+    # errors, so without this the run reports "could not measure" -- a usage
+    # mistake wearing the exit code that means the pool could not be read.
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
 
     return measure(
         window_days=args.window_days,

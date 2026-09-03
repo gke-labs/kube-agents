@@ -838,6 +838,13 @@ class CommandLine(unittest.TestCase):
         code, _, _ = self._main(["--window-days", "0"])
         self.assertEqual(pp.EXIT_USAGE, code)
 
+    def test_zero_workers_exits_64(self):
+        """ThreadPoolExecutor rejects it and the sweep catches its own errors,
+        so unguarded this exits 2 -- a typo wearing "could not measure"."""
+        code, _, err = self._main(["--workers", "0"])
+        self.assertEqual(pp.EXIT_USAGE, code)
+        self.assertIn("--workers", err)
+
     def test_a_bare_date_is_accepted_as_of(self):
         code, out, _ = self._main(
             ["--from-dir", QUIET_DIR, "--as-of", "2026-08-28", "--window-days", "1"]
