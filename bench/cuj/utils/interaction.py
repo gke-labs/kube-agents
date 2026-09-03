@@ -141,15 +141,22 @@ def tool_operations(
     ]
 
 
-#: Paragraphs a coordinator emits when it hands work off — "Delegated to the
-#: platform agent … I've started this as task t_… The answer will post into
-#: this thread as soon as it's ready." — carry no answer content. Evaluators
-#: must score the reply that follows them, or a journey whose specialist never
-#: reported back would be judged on boilerplate.
+#: The hand-off Kage is told to send, verbatim from agents/chat/SOUL.md §4:
+#:
+#:     > 🔀 Delegated to the **<agent-name>** agent
+#:
+#:     I've started this as task `<task_id>`. The answer will post into this
+#:     thread as soon as it's ready.
+#:
+#: Matching has to survive that formatting — the agent name arrives wrapped in
+#: bold markers and the task id in backticks — and must not fire on a report
+#: that merely cites its own task id. Every branch therefore pairs hand-off
+#: phrasing with the thing handed off.
 _DELEGATION_ACK = re.compile(
-    r"\b(?:delegated|delegating|routed|assigned|handed off|started)\b"
-    r"[^.\n]{0,120}"
-    r"(?:\bplatform agent\b|\btask t_[0-9a-f]+\b|\bwill post\b)"
+    r"\bdelegat(?:ed|ing)\b[^.\n]{0,60}\b\**\w[\w-]*\**\s+agent\b"
+    r"|\b(?:started|routed|assigned|handed off)\b[^.\n]{0,80}"
+    r"\btask\s+[`'\"]?t_[0-9a-f]+"
+    r"|\b(?:answer|results?|report)\b[^.\n]{0,60}\bwill post\b"
     r"|\bwill post\b[^.\n]{0,60}\b(?:thread|here)\b",
     re.IGNORECASE,
 )
