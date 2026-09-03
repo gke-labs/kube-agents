@@ -3,11 +3,18 @@
 `hack/ci-eval-rc.sh` runs four steps — resolve the candidate, check it out,
 deploy its published images, evaluate them — and the second one moves the
 ground under the first. Bash reads a script incrementally as it executes, so a
-script that checks out a revision where its own file differs resumes at the
-same byte offset in a different file. The failure is silent: the remaining
-steps disappear and the shell exits 0. `test_bash_self_rewrite_silently_drops_
-steps` demonstrates that on the bare mechanism, and it is the reason the whole
-driver lives inside `main()` and exits rather than returning.
+script that checks out a revision where its own file differs can resume at the
+same byte offset in different content, and when that goes wrong it goes wrong
+silently: a step vanishes and the shell still exits 0. That is why the whole
+driver lives inside `main()`, which bash parses in full before running any of
+it, and exits rather than returning.
+
+Two tests hold that down from opposite ends.
+`test_survives_a_candidate_whose_tree_lacks_the_driver` runs the real script
+through a real checkout that deletes it mid-run, and
+`test_a_wrapped_body_runs_every_step_after_rewriting_its_own_file` pins the
+wrapper property on the bare mechanism. Neither asserts that the *unwrapped*
+form breaks, deliberately — `MainWrapperTestCase` explains why.
 
 Everything else here runs the real script — copied into a throwaway git
 repository with its three siblings stubbed — rather than grepping it, because a
@@ -80,6 +87,7 @@ class RcEvalDriverTestCase(unittest.TestCase):
         deploy_supports_rc: bool = True,
         eval_supports_tier: bool = True,
         eval_exit_code: int = 0,
+        truncate_driver_from_deploy: bool = False,
     ) -> tuple[pathlib.Path, str]:
         """A repository with a candidate commit and a later HEAD to start from.
 
@@ -122,11 +130,21 @@ class RcEvalDriverTestCase(unittest.TestCase):
         # mention it ANYWHERE — including in the trace lines _stub emits,
         # which is why that variant is written out longhand.
         if deploy_supports_rc:
-            deploy_stub = _stub(
-                self.trace,
-                "deploy",
-                body=f'echo "  marker {_DEPLOY_RC_MARKER}" >> "{self.trace}"',
-            )
+            deploy_body = f'echo "  marker {_DEPLOY_RC_MARKER}" >> "{self.trace}"'
+            if truncate_driver_from_deploy:
+                # Truncate the driver IN PLACE, which is the mechanism the
+                # wrapper exists for and the one a checkout does not perform:
+                # git replaces a file by rename, leaving the running shell's
+                # descriptor on the intact original inode, so no checkout can
+                # reproduce this. `: >` keeps the inode and drops it to zero
+                # bytes, so a shell still reading from disk hits EOF at its
+                # offset and the remaining steps silently vanish.
+                #
+                # The path resolves to the same inode the driver is running
+                # from only because the candidate's copy of it is byte-identical
+                # to HEAD's, so the checkout left the file alone.
+                deploy_body += f'\n: > "{hack / "ci-eval-rc.sh"}"'
+            deploy_stub = _stub(self.trace, "deploy", body=deploy_body)
         else:
             deploy_stub = textwrap.dedent(
                 f"""\
@@ -304,13 +322,63 @@ class RcEvalDriverTestCase(unittest.TestCase):
             self.steps(), ["resolve"], "the refusal must land before deploying"
         )
 
-    def test_notes_but_allows_a_candidate_predating_the_tier(self):
-        """A smaller matrix than intended is a note; it is not a wrong verdict."""
+    def test_notes_but_allows_a_candidate_without_the_tier_switch(self):
+        """A smaller matrix than intended is a note; it is not a wrong verdict.
+
+        This is the ordinary case, not a legacy one: the tier switch is not on
+        main, so every candidate reaches here until it lands.
+        """
         root, _ = self.build_repo(eval_supports_tier=False)
         result = self.run_driver(root)
         self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn("predates the nightly tier", result.stdout)
+        self.assertIn("carries no EVAL_TIER switch", result.stdout)
+        self.assertIn("presubmit matrix", result.stdout)
         self.assertEqual(self.steps(), ["resolve", "deploy", "eval"])
+
+    def test_finishes_the_run_after_its_own_file_is_emptied_mid_step(self):
+        """The negative control for main(): flatten the wrapper and this fails.
+
+        Every other test here passes against an unwrapped driver, because they
+        all move the file by checkout and a checkout cannot hurt a running
+        shell — git renames, so the descriptor keeps the original inode. This
+        one truncates the live inode from inside the deploy step, which is the
+        hazard the header actually describes. Wrapped, the body is already in
+        memory and the eval still runs; unwrapped, bash reads EOF at its offset
+        and the run ends after deploy having reported nothing and exited 0.
+        """
+        root, _ = self.build_repo(truncate_driver_from_deploy=True)
+        result = self.run_driver(root)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(
+            self.steps(),
+            ["resolve", "deploy", "eval"],
+            "the eval must run after the driver's own file is emptied",
+        )
+        self.assertTrue(
+            (self.artifacts / "rc-eval-summary.md").is_file(),
+            "a run that loses its tail exits 0 with no summary: the silent failure",
+        )
+
+    # ─── The markers are contracts with real files, not with the stubs ──────
+
+    def test_the_deploy_marker_is_a_string_the_real_ci_deploy_reads(self):
+        """The guard greps for it, so a rename there makes this grep vacuous."""
+        deploy = (_REPO_ROOT / "hack" / "ci-deploy.sh").read_text(encoding="utf-8")
+        self.assertIn(_DEPLOY_RC_MARKER, deploy)
+
+    @unittest.expectedFailure
+    def test_the_tier_marker_is_a_string_the_real_ci_eval_pr_reads(self):
+        """Expected to fail until the EVAL_TIER switch (#1175) lands.
+
+        The driver exports EVAL_TIER and greps the candidate for it, but
+        nothing on main reads it, so today the note fires on every candidate
+        and the export is inert. This is the mechanism that notices when that
+        stops being true — including if #1175 lands under a different name.
+        Turn it into a plain assertion then, and drop the note's "expected
+        until that switch lands" wording with it.
+        """
+        evaluator = (_REPO_ROOT / "hack" / "ci-eval-pr.sh").read_text(encoding="utf-8")
+        self.assertIn("EVAL_TIER", evaluator)
 
     # ─── Reporting ──────────────────────────────────────────────────────────
 

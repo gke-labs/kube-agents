@@ -3,8 +3,10 @@
 # Release-candidate eval (the periodic job's entrypoint)
 # ==============================================================================
 # Resolve the newest release candidate, check it out, deploy its published
-# images, and run the full eval catalog against them. Non-gating: the verdict
-# is reported, and nothing here can hold up a release.
+# images, and evaluate them. Non-gating: the verdict is reported, and nothing
+# here can hold up a release. How wide that evaluation is depends on a tier
+# switch that has not landed yet -- see RC_EVAL_TIER below, which is the one
+# place in this file describing something the repository does not have.
 #
 # The four steps, and why they need a driver at all:
 #
@@ -53,28 +55,42 @@
 #   JOB_NAME/BUILD_ID Prow's. Both set, the summary carries the run's Deck URL
 #                     so the verdict is findable without a credential.
 #
+# NOT a whole job: the four steps stop at the verdict, and teardown is the job
+# config's to run -- as a separate step, unconditionally, whatever this script
+# exits with. hack/ci-teardown.sh explains what a leased project left holding a
+# live install does to the next lease that gets it (#1006), and this lane
+# borrows the same pool the presubmit eval does, so skipping it is the one way
+# a non-gating lane can still cost somebody a run.
+#
 # The path of this file is a CONTRACT: the periodic job in oss-test-infra
 # invokes hack/ci-eval-rc.sh by name. Do not rename it.
 # ==============================================================================
 
 set -euo pipefail
 
-# The tier exported to ci-eval-pr.sh. `nightly` and not a value of this lane's
-# own, because the tier switch is #1175's and its default branch rejects
+# The tier exported to ci-eval-pr.sh. NOTHING READS IT TODAY: the switch that
+# would is #1175's and is not on main, so `grep EVAL_TIER` finds only this file.
+# Every run therefore measures the presubmit matrix, and the NOTE below prints
+# for every candidate rather than only for old ones. That is a smaller run than
+# the lane intends, not a wrong one, which is why it is a note and not a
+# failure. The export is here so the lane widens to the full catalog on the day
+# that switch merges, with no edit to this file.
+#
+# `nightly` and not a value of this lane's own, because #1175's switch rejects
 # anything it does not know: a value invented here would exit 1 the day the two
 # land together. What distinguishes this run from the main-branch nightly is
 # RC_COMMIT_SHA, which ci-eval-pr.sh already reads as the third condition on
 # the baseline store, so the tier does not have to carry that meaning too.
-#
-# Against a candidate whose tree predates the switch the variable is simply
-# unread and the run measures the presubmit matrix. That is a smaller run than
-# intended, not a wrong one, so it is a note below rather than a failure.
 readonly RC_EVAL_TIER="nightly"
 
 # Written by resolve-rc-target.sh through RC_TARGET_OUTPUT: the tag and commit
 # in key=value form, for anything downstream that needs to know what was
 # measured without parsing a log.
 readonly RC_TARGET_FILE="rc-target.env"
+
+# The key read back out of that file. A cross-file contract with the writer in
+# resolve-rc-target.sh, so it is named for the same reason the filename is.
+readonly RC_TARGET_TAG_KEY="rc_tag"
 
 # This script's own artifact. The verdict file is bench-gate's, named here so
 # the summary can point at it; keep in step with the --markdown-out in
@@ -96,7 +112,8 @@ readonly DEPLOY_RC_MARKER="RC_COMMIT_SHA"
 
 # The same question asked of the candidate's ci-eval-pr.sh, with a softer
 # answer: absent, the tier switch is not there to read and the run measures
-# the presubmit matrix.
+# the presubmit matrix. Absent is the norm until #1175 lands, so expect this
+# one to fire on every candidate for now.
 readonly EVAL_TIER_MARKER="EVAL_TIER"
 
 # The siblings this script drives. Named because each name is a contract with
@@ -126,6 +143,19 @@ main() {
     echo "rc eval skipped: PULL_NUMBER=${PULL_NUMBER} is set: a pull request measures itself, never a release candidate"
     exit 0
   fi
+  # PULL_NUMBER alone is one condition short. Prow sets it for presubmits, but
+  # a batch job carries PULL_REFS and no PULL_NUMBER, so it would walk through
+  # the check above and have the tree replaced underneath the merge it is
+  # testing. Both siblings gate on the job shape as well -- ci-eval-pr.sh at
+  # its baseline-store append, ci-dashboard-refresh.sh at its gs:// write --
+  # and there is no reason for this one to be the weaker of the three.
+  case "${JOB_TYPE:-periodic}" in
+    periodic | postsubmit) ;;
+    *)
+      echo "rc eval skipped: JOB_TYPE=${JOB_TYPE:-} is not a main-branch job shape; only a periodic or postsubmit measures a release candidate"
+      exit 0
+      ;;
+  esac
 
   # Recorded before anything moves, so a local run can be put back. Prow
   # workspaces are disposable and this is only ever printed, never restored:
@@ -136,6 +166,14 @@ main() {
   if [ "${original_ref}" = "HEAD" ]; then
     original_ref="$(git -C "${repo_root}" rev-parse HEAD)"
   fi
+  # On an EXIT trap rather than inline, because every interesting way to leave
+  # a detached tree behind is a failure path: the marker refusal below, an
+  # errexit abort inside ci-deploy.sh, a Prow deadline. Printing the hint only
+  # on success would withhold it from exactly the runs that need it. The guard
+  # keeps it quiet on the paths that never moved the tree.
+  RC_EVAL_CHECKOUT_DONE="false"
+  RC_EVAL_ORIGINAL_REF="${original_ref}"
+  trap 'if [ "${RC_EVAL_CHECKOUT_DONE}" = "true" ]; then echo "This tree is detached at $(git -C "'"${repo_root}"'" rev-parse --short HEAD 2>/dev/null || echo unknown); \`git checkout ${RC_EVAL_ORIGINAL_REF}\` restores it."; fi' EXIT
 
   artifacts_dir="${ARTIFACTS:-}"
   if [ -n "${artifacts_dir}" ] && [ ! -d "${artifacts_dir}" ]; then
@@ -156,7 +194,7 @@ main() {
   rc_commit_sha="$("${script_dir}/${RESOLVE_SCRIPT}")"
   rc_tag="${RC_TAG:-}"
   if [ -z "${rc_tag}" ] && [ -n "${RC_TARGET_OUTPUT:-}" ] && [ -f "${RC_TARGET_OUTPUT}" ]; then
-    rc_tag="$(sed -n 's/^rc_tag=//p' "${RC_TARGET_OUTPUT}" | tail -n 1)"
+    rc_tag="$(sed -n "s/^${RC_TARGET_TAG_KEY}=//p" "${RC_TARGET_OUTPUT}" | tail -n 1)"
   fi
   rc_tag="${rc_tag:-${rc_commit_sha}}"
 
@@ -173,7 +211,16 @@ main() {
   fi
 
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Checking out ${rc_tag} (${rc_commit_sha:0:7}); this tree was ${original_ref} ==="
-  git -C "${repo_root}" checkout --detach "${rc_commit_sha}"
+  # The pre-check above deliberately ignores untracked files -- a Prow
+  # workspace legitimately holds build output -- which leaves one case it
+  # cannot see: an untracked file at a path the candidate tracks, where git
+  # refuses rather than clobbering it. Widening the pre-check would fail runs
+  # that are fine, so the explanation is attached to the abort instead.
+  if ! git -C "${repo_root}" checkout --detach "${rc_commit_sha}"; then
+    echo "ERROR: checking out ${rc_tag} (${rc_commit_sha:0:7}) failed, so nothing was measured. If git named untracked files above, the workspace is holding files the candidate tracks; clear them and re-run." >&2
+    exit 1
+  fi
+  RC_EVAL_CHECKOUT_DONE="true"
 
   # The candidate's ci-deploy.sh is what runs next, and a candidate cut before
   # the RC deploy path landed does not have one that can install published
@@ -185,7 +232,7 @@ main() {
     exit 1
   fi
   if ! grep -q "${EVAL_TIER_MARKER}" "${script_dir}/${EVAL_SCRIPT}"; then
-    echo "NOTE: ${rc_tag} predates the ${RC_EVAL_TIER} tier, so this run measures the presubmit matrix rather than the full catalog. The verdict is valid for the cases it ran."
+    echo "NOTE: ${rc_tag} carries no ${EVAL_TIER_MARKER} switch, so this run measures the presubmit matrix rather than the full ${RC_EVAL_TIER} catalog. Expected until that switch lands; the verdict is valid for the cases it ran."
   fi
 
   # ─── Steps 3 and 4: deploy the candidate, then grade it ───────────────────
@@ -253,7 +300,7 @@ main() {
     echo "rc eval summary: ${summary_path}"
   fi
 
-  echo "This tree is detached at ${rc_commit_sha:0:7}; \`git checkout ${original_ref}\` restores it."
+  # The restore hint is the EXIT trap's, so that the failure paths get it too.
 
   # The eval's own status is preserved rather than forced to 0. Which one the
   # job reports is the JOB's decision (an `|| true` in its config), kept there
