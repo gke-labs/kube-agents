@@ -85,11 +85,19 @@ Loaded from a design, planning, or capacity-check request — for example the
   `attach_artifact` tool — the parsed object, not YAML text:
   `type: computeclass` for a ComputeClass, `type: node_auto_provisioning`
   for a NAP specification; use one shared `pair_id` for a design's set.
-- **Your final report must name every provisioning path by name** — the
-  words On-Demand, Spot, and Flex-Start must each appear with their
-  trade-off, even when a path's probe failed (then state the failure and
-  what you used instead). A path you analyzed but never mentioned does not
-  exist for the reader.
+- **Your final report must carry this section, with all three paths named**
+  — a path you analyzed but never mentioned does not exist for the reader,
+  and a probe that failed is a finding, not a gap to leave silent:
+
+  ```markdown
+  ## Provisioning paths
+
+  - **On-Demand** — <quota headroom and reservations; no advance
+    obtainability signal exists for this path>
+  - **Spot** — <obtainability score and zone, and the preemption trade-off>
+  - **Flex-Start** — <obtainability for the run duration, or, if the probe
+    failed, what failed and what you relied on instead>
+  ```
 - **Generated manifests must use the real schemas.** Do not invent API
   versions or fields; start from these shapes and adjust values only:
 
