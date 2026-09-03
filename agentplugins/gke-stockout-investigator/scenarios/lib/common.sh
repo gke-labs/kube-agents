@@ -112,6 +112,7 @@ DRY_RUN=0
 EMIT_MANIFEST=""
 WATCH_TIMEOUT="${WATCH_TIMEOUT:-600}"
 AGENT_AVAILABILITY_TIMEOUT="${AGENT_AVAILABILITY_TIMEOUT:-180}"
+IN_LOOP_POD_RESOLVE_TIMEOUT="${IN_LOOP_POD_RESOLVE_TIMEOUT:-15}"
 AGENT_POLL_INTERVAL=5
 
 SCENARIO_SLUG="$(basename "${BASH_SOURCE[1]:-scenario}" .sh)"
@@ -247,11 +248,22 @@ _parse_args() {
 
 # -------------------------------------------------------------------- preflight
 
+# Sync PLATFORM_POD from the file latch if a subshell resolved a new pod.
+_sync_platform_pod() {
+    if [ -f "${SCENARIO_RUN_DIR}/platform_pod" ]; then
+        PLATFORM_POD="$(cat "${SCENARIO_RUN_DIR}/platform_pod")"
+    fi
+}
+
 # Wait for a ready, non-terminating gateway pod with container platform-agent ready.
+# Accepts an optional timeout in seconds (defaulting to AGENT_AVAILABILITY_TIMEOUT).
+# Returns 0 on success, 1 on timeout (does not call die so subshell callers don't trigger set -e).
+# All progress output is directed to stderr to keep caller stdout unpolluted.
 _wait_for_platform_pod() {
+    local timeout="${1:-$AGENT_AVAILABILITY_TIMEOUT}"
     local waited=0 pod=""
-    dim "waiting up to ${AGENT_AVAILABILITY_TIMEOUT}s for a ready platform-agent-gateway pod"
-    while [ "$waited" -lt "$AGENT_AVAILABILITY_TIMEOUT" ]; do
+    dim "waiting up to ${timeout}s for a ready platform-agent-gateway pod" >&2
+    while [ "$waited" -lt "$timeout" ]; do
         pod="$(kmgmt get pods -n "$AGENT_NAMESPACE" -l app=platform-agent-gateway -o json 2>/dev/null | python3 -c '
 import sys, json
 try:
@@ -271,16 +283,18 @@ except Exception:
 ' || true)"
         if [ -n "$pod" ]; then
             PLATFORM_POD="$pod"
+            printf '%s' "$pod" > "${SCENARIO_RUN_DIR}/platform_pod"
             return 0
         fi
         sleep "$AGENT_POLL_INTERVAL"
         waited=$((waited + AGENT_POLL_INTERVAL))
     done
-    die "no ready platform-agent-gateway pod in ${AGENT_NAMESPACE} after ${AGENT_AVAILABILITY_TIMEOUT}s"
+    return 1
 }
 
 _resolve_platform_pod() {
-    _wait_for_platform_pod
+    _wait_for_platform_pod "$AGENT_AVAILABILITY_TIMEOUT" \
+        || die "no ready platform-agent-gateway pod in ${AGENT_NAMESPACE} after ${AGENT_AVAILABILITY_TIMEOUT}s"
 }
 
 # The failure modes below are the ones that have actually cost time: an alert that is
@@ -322,6 +336,7 @@ preflight() {
     dim "gateway pod ${PLATFORM_POD}"
 
     # Wait up to AGENT_AVAILABILITY_TIMEOUT for the skill to be readable in the resolved pod
+    _sync_platform_pod
     local skill_waited=0 skill_found=0
     while [ "$skill_waited" -lt "$AGENT_AVAILABILITY_TIMEOUT" ]; do
         if kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
@@ -353,6 +368,7 @@ preflight() {
 # Reclaim and archive any active, blocked, or stuck tasks on the kanban board for this route
 # so concurrency slots (max_in_progress = 2) are not starved.
 cleanup_kanban() {
+    _sync_platform_pod
     [ -n "$PLATFORM_POD" ] || return 0
     kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
         python3 -c "
@@ -379,6 +395,7 @@ except Exception:
 # scenario is the normal case here, so clear the registry unless asked not to.
 clear_dedup() {
     [ "$KEEP_DEDUP" -eq 1 ] && { dim "keeping dedup registry (--keep-dedup)"; return 0; }
+    _sync_platform_pod
     kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
         rm -f /opt/data/pubsub_registry.json >/dev/null 2>&1 || true
     cleanup_kanban
@@ -722,6 +739,7 @@ warn_once() {
 # that waits. The contract is unchanged for callers; what is new is that a human reading
 # the transcript can tell the two apart.
 _sessions_json() {
+    _sync_platform_pod
     local out
     # The diagnostic goes to stdout inside the pod and is CAPTURED, not printed: this
     # function's stdout is piped straight into a json.load. Only the failure branch
@@ -739,7 +757,7 @@ print(r.text)
 " 2>/dev/null)"; then
         printf '%s\n' "$out"
     else
-        _wait_for_platform_pod || true
+        _wait_for_platform_pod "$IN_LOOP_POD_RESOLVE_TIMEOUT" || true
         warn_once sessions "could not read the agent's session list; treating it as empty — ${out:-no response} (issue #786)"
         echo '{}'
     fi
@@ -747,6 +765,7 @@ print(r.text)
 
 # Sessions started before we published are from earlier runs; only a newer one is ours.
 _task_after() {
+    _sync_platform_pod
     # The kanban twin of _session_after, for routes with `dispatch: kanban`. Those file
     # the alert as a task owned by the specialist profile and never create a gateway
     # session, so watching only for sessions reports "nothing happened" while the
@@ -772,7 +791,7 @@ _task_after() {
         errtext="$(head -c 200 "$err")"
         rm -f "$err"
         if [[ "$errtext" == *"not found"* || "$errtext" == *"NotFound"* || "$errtext" == *"terminating"* || "$errtext" == *"closed before"* ]]; then
-            _wait_for_platform_pod || true
+            _wait_for_platform_pod "$IN_LOOP_POD_RESOLVE_TIMEOUT" || true
         fi
         warn_once tasks "could not read the agent's kanban board; treating it as empty — ${errtext:-${out:-no response}}"
         return 0
@@ -851,8 +870,15 @@ watch_investigation() {
     step "Watching for the investigation (up to ${WATCH_TIMEOUT}s)"
     info "the agent notifies chat, checks for duplicate PRs, then diagnoses"
 
-    local waited=0 found="" line kind
-    while [ "$waited" -lt "$WATCH_TIMEOUT" ]; do
+    local start_time deadline now waited found="" line kind
+    start_time="$(date +%s)"
+    deadline=$((start_time + WATCH_TIMEOUT))
+
+    while true; do
+        now="$(date +%s)"
+        [ "$now" -ge "$deadline" ] && break
+        _sync_platform_pod
+
         # Either dispatch mode counts: a gateway session (`dispatch: api`) or a board task
         # (`dispatch: kanban`). Checking both keeps one watcher honest for both routes.
         kind="session"
@@ -883,7 +909,7 @@ watch_investigation() {
             return 0
         fi
         sleep 10
-        waited=$((waited + 10))
+        waited=$(( $(date +%s) - start_time ))
         printf '    %s%ds%s\r' "$C_DIM" "$waited" "$C_OFF"
     done
     printf '                    \r'

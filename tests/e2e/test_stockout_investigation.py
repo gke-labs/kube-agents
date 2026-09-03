@@ -89,6 +89,8 @@ _KUBECTL_TIMEOUT_RC = 124
 _AGENT_AVAILABILITY_TIMEOUT_SECONDS = 180
 _AGENT_POLL_INTERVAL_SECONDS = 5
 _DEFAULT_ROUTE_NAME = "gke_stockout_alerts"
+_SMOKE_VERIFY_TIMEOUT_SECONDS = 300
+_SCENARIO_RUN_HEADROOM_SECONDS = 300
 
 
 def _as_text(stream: Any) -> str:
@@ -830,7 +832,19 @@ def test_stockout_ingress_alert_smoke(
         "AGENT_NAMESPACE": agent_namespace,
     }
 
-    proc = subprocess.run([str(verify_script)], capture_output=True, text=True, env=env)
+    try:
+        proc = subprocess.run(
+            [str(verify_script)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=_SMOKE_VERIFY_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(
+            f"Stockout ingress alert verify.sh timed out after {_SMOKE_VERIFY_TIMEOUT_SECONDS}s:\n"
+            f"STDOUT:\n{_as_text(exc.stdout)}\nSTDERR:\n{_as_text(exc.stderr)}"
+        )
     assert proc.returncode == 0, (
         f"Stockout ingress alert verify.sh failed with exit code {proc.returncode}:\n"
         f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
@@ -895,13 +909,21 @@ def test_stockout_scenario(
 
     # Watch timeout can be customized via STOCKOUT_WATCH_TIMEOUT (default 360 seconds)
     watch_timeout = os.environ.get("STOCKOUT_WATCH_TIMEOUT", "360")
+    scenario_timeout = int(watch_timeout) + _SCENARIO_RUN_HEADROOM_SECONDS
 
-    proc = subprocess.run(
-        [str(scenario_script), "--teardown", "--watch-timeout", watch_timeout],
-        capture_output=True,
-        text=True,
-        env=env,
-    )
+    try:
+        proc = subprocess.run(
+            [str(scenario_script), "--teardown", "--watch-timeout", watch_timeout],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=scenario_timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(
+            f"Stockout Scenario '{scenario_slug}' ({rule}) timed out after {scenario_timeout}s:\n"
+            f"STDOUT:\n{_as_text(exc.stdout)}\nSTDERR:\n{_as_text(exc.stderr)}"
+        )
     assert proc.returncode == 0, (
         f"Stockout Scenario '{scenario_slug}' ({rule} - {description}) failed with exit code {proc.returncode}:\n"
         f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
