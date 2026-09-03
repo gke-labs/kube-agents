@@ -14,6 +14,30 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../scripts/installer" && pwd)/gke_d
 # TODO(boskos): Once oss-test-infra#2655 merges and deploys Boskos project leasing,
 # consider failing closed if JOB_NAME is set and PROJECT_ID is unset.
 export PROJECT_ID="${PROJECT_ID:-kube-agents-evals}"
+
+# ─── TEMPORARY PIN — REVERT BEFORE MERGE ─────────────────────────────────────
+# Pins this pull request's presubmit to kube-agents-evals-16, to prove #1051's
+# fix end to end: the project has had the fleet_reader_token_creators binding
+# applied by hand, so a run against it must NOT emit the
+# "kubeconfig keeps the runner's own credential" warning that every other
+# project's runs emit three times. Absence of that warning is the result.
+#
+# -16 rather than a live pool project because it is not registered in Boskos
+# yet, so no other pull request can lease it and a bad run breaks nothing.
+#
+# The assignment is unconditional on purpose. The Prow job exports
+# PROJECT_ID="${LEASED_PROJECT}" *before* sourcing this file, so the `:-`
+# default above cannot override a lease and a pin written that way would be
+# silently ignored. Boskos still leases a project and leaves it idle; deploy,
+# eval and teardown all follow PROJECT_ID, so -16 is what gets used and what
+# gets cleaned up, and the idle lease is released as normal.
+#
+# This must not merge: on main it would send every presubmit to one project,
+# serialising the pool behind it. Precedent: 442cbf53 (#995), reverted by
+# 8e42c3b4 before that branch merged.
+export PROJECT_ID="kube-agents-evals-16"
+# ─────────────────────────────────────────────────────────────────────────────
+
 export GCP_PROJECT_ID="${PROJECT_ID}"
 export REGION="${REGION:-us-central1}"
 
