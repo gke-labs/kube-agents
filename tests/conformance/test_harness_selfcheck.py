@@ -193,6 +193,13 @@ class TheBucketTwoScenariosLoad(unittest.TestCase):
         The scenarios mutate a cluster. Gating them on an explicit environment
         variable rather than on the presence of a kubeconfig is what stops them
         running against whatever cluster a developer was last pointed at.
+
+        Verified by inspection, never by execution: `requires_cluster` is
+        `skipUnless`, which marks the class at import, so the gate is visible
+        on the type before anything runs. An earlier version called
+        `suite.run()` and counted skips -- which detects a scenario that lost
+        its gate only by executing it, against the ambient kubectl context,
+        the exact accident the gate exists to prevent.
         """
         import os
 
@@ -204,16 +211,26 @@ class TheBucketTwoScenariosLoad(unittest.TestCase):
         )
         self.assertEqual([], loader.errors, "bucket 2 failed to load")
 
-        count = suite.countTestCases()
-        self.assertGreater(count, 0, "bucket 2 discovered no tests")
+        def flatten(item):
+            if isinstance(item, unittest.TestSuite):
+                for child in item:
+                    yield from flatten(child)
+            else:
+                yield item
+
+        tests = list(flatten(suite))
+        self.assertGreater(len(tests), 0, "bucket 2 discovered no tests")
 
         if os.environ.get("KUBE_AGENTS_CONFORMANCE_CLUSTER"):
             self.skipTest("a cluster is configured; the scenarios are running for real")
-        result = unittest.TestResult()
-        suite.run(result)
-        self.assertEqual(count, len(result.skipped), "a bucket-2 scenario ran anyway")
-        self.assertEqual([], result.errors)
-        self.assertEqual([], result.failures)
+        ungated = sorted(
+            test.id()
+            for test in tests
+            if not getattr(type(test), "__unittest_skip__", False)
+        )
+        self.assertEqual(
+            [], ungated, "bucket-2 scenarios that would run without the cluster gate"
+        )
 
 
 class TheSuiteCoversEveryInvariant(unittest.TestCase):
