@@ -83,6 +83,20 @@ BUILD_LOG_ARTIFACT = "build-log.txt"
 PROWJOB_KIND = "ProwJob"
 STARTED_TIMESTAMP_KEY = "timestamp"
 
+# How Boskos is reached. These are --boskos-via's choices and they are compared
+# against in fetch_pool_state, so the argument parser and the dispatch read from
+# one list rather than two spellings that can drift apart.
+BOSKOS_VIA_KUBECTL = "kubectl"
+BOSKOS_VIA_HTTP = "http"
+BOSKOS_VIA_NONE = "none"
+BOSKOS_VIA_CHOICES = (BOSKOS_VIA_KUBECTL, BOSKOS_VIA_HTTP, BOSKOS_VIA_NONE)
+KUBECTL_BINARY = "kubectl"
+
+# Unit conversions.
+MILLIS_PER_SECOND = 1000.0
+SECONDS_PER_HOUR = 3600
+PERCENT_SCALE = 100.0
+
 # --from-dir mirrors the bucket, one directory per artifact, named by build ID.
 FIXTURE_PROWJOBS_DIR = "prowjobs"
 FIXTURE_STARTED_DIR = "started"
@@ -493,7 +507,7 @@ def parse_rfc3339(value: str) -> Optional[datetime]:
 def snowflake_time(build_id: int) -> datetime:
     """The time encoded in a Prow build ID."""
     millis = (build_id >> SNOWFLAKE_TIMESTAMP_SHIFT) + SNOWFLAKE_EPOCH_MS
-    return datetime.fromtimestamp(millis / 1000.0, tz=timezone.utc)
+    return datetime.fromtimestamp(millis / MILLIS_PER_SECOND, tz=timezone.utc)
 
 
 def percentile(values: Sequence[float], pct: int) -> float:
@@ -507,7 +521,7 @@ def percentile(values: Sequence[float], pct: int) -> float:
     ordered = sorted(values)
     if len(ordered) == 1:
         return ordered[0]
-    rank = (len(ordered) - 1) * (pct / 100.0)
+    rank = (len(ordered) - 1) * (pct / PERCENT_SCALE)
     low = int(rank)
     high = min(low + 1, len(ordered) - 1)
     return ordered[low] + (ordered[high] - ordered[low]) * (rank - low)
@@ -973,22 +987,22 @@ def fetch_pool_state(
             return Source(error=f"could not parse {payload}: {exc}")
         return Source(value=_pool_state_from(document))
 
-    if via == "none":
+    if via == BOSKOS_VIA_NONE:
         return Source(error="Boskos was not queried (--boskos-via none)")
 
-    if via == "http":
+    if via == BOSKOS_VIA_HTTP:
         document, err = _read_boskos_metric(BOSKOS_IN_CLUSTER_URL)
         if err:
             return Source(error=f"could not reach Boskos in-cluster: {err}")
         return Source(value=_pool_state_from(document))
 
-    if shutil.which("kubectl") is None:
+    if shutil.which(KUBECTL_BINARY) is None:
         return Source(error="kubectl is not on PATH, so Boskos cannot be reached")
 
     port = _free_port()
     process = subprocess.Popen(
         [
-            "kubectl",
+            KUBECTL_BINARY,
             "--context",
             context,
             "-n",
@@ -1376,7 +1390,7 @@ def render(summary: dict) -> str:
             marker = "  BREACH" if wait["minutes"] > limits["p95_minutes"] else ""
             out.append(f"  {_fmt(wait['minutes']):>8} min  PR {wait['pull'] or '?'}{marker}")
         out.append(
-            f"  (Deck keeps {int(DECK_HORIZON.total_seconds() // 3600)}h of history;"
+            f"  (Deck keeps {int(DECK_HORIZON.total_seconds() // SECONDS_PER_HOUR)}h of history;"
             " a run older than that is invisible here.)"
         )
 
@@ -1556,7 +1570,7 @@ def measure(
     p50_limit: float = DEFAULT_P50_THRESHOLD_MINUTES,
     p95_limit: float = DEFAULT_P95_THRESHOLD_MINUTES,
     outlier_limit: float = DEFAULT_OUTLIER_THRESHOLD_MINUTES,
-    boskos_via: str = "kubectl",
+    boskos_via: str = BOSKOS_VIA_KUBECTL,
     context: str = PROW_BUILD_CLUSTER_CONTEXT,
     workers: int = DEFAULT_WORKERS,
     from_dir: Optional[str] = None,
@@ -1656,8 +1670,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--boskos-via",
-        choices=("kubectl", "http", "none"),
-        default="kubectl",
+        choices=BOSKOS_VIA_CHOICES,
+        default=BOSKOS_VIA_KUBECTL,
         help=(
             "how to reach the Boskos metric endpoint: port-forward with kubectl "
             "(default), direct HTTP when running inside the build cluster, or skip "

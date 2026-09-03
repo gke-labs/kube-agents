@@ -675,6 +675,44 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(pp.EXIT_BREACH, code)
         self.assertIn("Cause unknown", out)
 
+    def _quiet_day_with_a_live_queue(self, tmp, waiting_minutes):
+        """A green day, with a Deck payload holding one run still queued.
+
+        Everything but deck.json comes from `quiet/`, so the trend is the same
+        green trend and the live queue is the only thing that can change the
+        verdict.
+        """
+        for name in ("prowjobs", "started", "logs", "boskos.json"):
+            os.symlink(os.path.join(QUIET_DIR, name), os.path.join(tmp, name))
+        created = QUIET_AS_OF - timedelta(minutes=waiting_minutes)
+        deck = {"items": [{
+            "metadata": {"creationTimestamp": created.strftime("%Y-%m-%dT%H:%M:%SZ")},
+            "spec": {"job": pp.JOB_NAME, "refs": {"pulls": [{"number": 1234}]}},
+            "status": {"build_id": "2092900000000000000", "state": "triggered"},
+        }]}
+        with open(os.path.join(tmp, "deck.json"), "w") as fh:
+            json.dump(deck, fh)
+
+    def test_one_run_queued_past_p95_breaches_on_its_own(self):
+        """The half GCS cannot see. A run still in `triggered` has written no
+        artifacts, so during a stall the trend goes quiet as the queue grows --
+        which is why the live queue trips the verdict without it.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            self._quiet_day_with_a_live_queue(tmp, waiting_minutes=90)
+            code, out = run(from_dir=tmp, as_of=QUIET_AS_OF, window_days=1)
+        self.assertEqual(pp.EXIT_BREACH, code)
+        self.assertIn("Queued right now", out)
+
+    def test_a_live_queue_under_p95_leaves_the_day_green(self):
+        """Pins the previous test to the threshold rather than to the presence
+        of a queued run at all."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._quiet_day_with_a_live_queue(tmp, waiting_minutes=5)
+            code, out = run(from_dir=tmp, as_of=QUIET_AS_OF, window_days=1)
+        self.assertEqual(pp.EXIT_OK, code)
+        self.assertIn("WITHIN THRESHOLD", out)
+
     def test_an_unmeasured_segment_stays_in_its_own_column(self):
         """"container start -> lease requested" is exactly as wide as "not
         measured", so a label column sized to the longest label leaves no gap
@@ -822,6 +860,39 @@ class CommandLine(unittest.TestCase):
         )
         self.assertEqual(pp.EXIT_OK, code)
         self.assertIn("p95 > 600.0", out)
+
+
+class PublishedInterface(unittest.TestCase):
+    """The values other things hardcode.
+
+    Every assertion here is a literal on purpose. `hack/pool_pressure_cron.sh`,
+    the oss-test-infra periodic and the runbook each write these out by hand, so
+    asserting against the module's own constant would pass through a rename that
+    silently breaks all three.
+    """
+
+    def test_the_exit_codes(self):
+        self.assertEqual(0, pp.EXIT_OK)
+        self.assertEqual(1, pp.EXIT_BREACH)
+        self.assertEqual(2, pp.EXIT_UNMEASURED)
+        self.assertEqual(64, pp.EXIT_USAGE)
+
+    def test_the_verdicts(self):
+        self.assertEqual("OK", pp.VERDICT_OK)
+        self.assertEqual("BREACH", pp.VERDICT_BREACH)
+        self.assertEqual("UNMEASURED", pp.VERDICT_UNMEASURED)
+
+    def test_the_causes(self):
+        self.assertEqual("CAPACITY", pp.CAUSE_CAPACITY)
+        self.assertEqual("CONCURRENCY_CAP", pp.CAUSE_CONCURRENCY_CAP)
+        self.assertEqual("CONTROL_PLANE", pp.CAUSE_CONTROL_PLANE)
+        self.assertEqual("UNKNOWN", pp.CAUSE_UNKNOWN)
+
+    def test_the_thresholds_are_the_runbook_numbers(self):
+        """Section 10 of the pool runbook: p50 over 15 minutes or p95 over 45
+        onboards the next project. Changing either is a policy change."""
+        self.assertEqual(15, pp.DEFAULT_P50_THRESHOLD_MINUTES)
+        self.assertEqual(45, pp.DEFAULT_P95_THRESHOLD_MINUTES)
 
 
 if __name__ == "__main__":

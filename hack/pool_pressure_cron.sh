@@ -14,28 +14,28 @@
 # list of environment variables.
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CHECK="${REPO_ROOT}/scripts/pool_pressure.py"
+readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly CHECK="${REPO_ROOT}/scripts/pool_pressure.py"
 
-PYTHON="${POOL_PRESSURE_PYTHON:-python3}"
-STATE_DIR="${POOL_PRESSURE_STATE_DIR:-${XDG_STATE_HOME:-${HOME}/.local/state}/pool-pressure}"
-WINDOW_DAYS="${POOL_PRESSURE_WINDOW_DAYS:-7}"
-COOLDOWN_HOURS="${POOL_PRESSURE_COOLDOWN_HOURS:-6}"
-HISTORY_DAYS="${POOL_PRESSURE_HISTORY_DAYS:-90}"
-NOTIFY_COMMAND="${POOL_PRESSURE_NOTIFY_COMMAND:-}"
+readonly PYTHON="${POOL_PRESSURE_PYTHON:-python3}"
+readonly STATE_DIR="${POOL_PRESSURE_STATE_DIR:-${XDG_STATE_HOME:-${HOME}/.local/state}/pool-pressure}"
+readonly WINDOW_DAYS="${POOL_PRESSURE_WINDOW_DAYS:-7}"
+readonly COOLDOWN_HOURS="${POOL_PRESSURE_COOLDOWN_HOURS:-6}"
+readonly HISTORY_DAYS="${POOL_PRESSURE_HISTORY_DAYS:-90}"
+readonly NOTIFY_COMMAND="${POOL_PRESSURE_NOTIFY_COMMAND:-}"
 
 # Mirrors scripts/pool_pressure.py. Kept as names because the branching below
 # reads better for it, and because 2 meaning "could not measure" is the whole
 # point of the exit-code taxonomy.
-EXIT_OK=0
-EXIT_BREACH=1
-EXIT_UNMEASURED=2
+readonly EXIT_OK=0
+readonly EXIT_BREACH=1
+readonly EXIT_UNMEASURED=2
 
-SECONDS_PER_HOUR=3600
+readonly SECONDS_PER_HOUR=3600
 
 # The state file records nothing sensitive, but it is this user's alert state
 # and nobody else's business.
-STATE_MODE_OWNER_ONLY=600
+readonly STATE_MODE_OWNER_ONLY=600
 
 usage() {
   cat <<'USAGE'
