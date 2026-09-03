@@ -970,7 +970,7 @@ TASKS=(
   # anyway (#1101); its admission record accrues via the nightly tier
   # (#1175) once that runs.
   # "./tasks/autoops-warning-event-triage/task.yaml"
-  # Ten registered scenarios stay commented out. The task-registration lint
+  # Twelve registered scenarios stay commented out. The task-registration lint
   # counts a commented entry as registered, so a line here is a promise the
   # scenario exists, not that it runs; the domain-coverage lint counts only
   # an UNCOMMENTED one, so activating a scenario also deletes its domain from
