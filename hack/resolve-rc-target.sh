@@ -5,16 +5,33 @@
 # Prints the candidate's commit SHA on stdout. Everything else goes to stderr,
 # so the caller can do:
 #
-#   RC_COMMIT_SHA="$(hack/resolve-rc-target.sh)"
-#   git checkout --detach "${RC_COMMIT_SHA}"
-#   RC_COMMIT_SHA="${RC_COMMIT_SHA}" hack/ci-deploy.sh
+#   main() {
+#     local rc_commit_sha
+#     rc_commit_sha="$(hack/resolve-rc-target.sh)"
+#     git checkout --detach "${rc_commit_sha}"
+#     RC_COMMIT_SHA="${rc_commit_sha}" hack/ci-deploy.sh
+#     exit $?
+#   }
+#   main "$@"
 #
 # The checkout is the caller's job and not this script's, and not
-# hack/ci-deploy.sh's either. Bash reads a script incrementally as it executes,
-# so a script that checks out a different revision of itself is rewriting the
-# bytes the interpreter has not read yet. .github/workflows/deploy-environment.yml
-# already settles this the same way — a second actions/checkout step at the
-# candidate's SHA, before anything that reads the tree runs.
+# hack/ci-deploy.sh's either. .github/workflows/deploy-environment.yml already
+# settles this the same way — a second actions/checkout step at the candidate's
+# SHA, before anything that reads the tree runs.
+#
+# The main() wrapper is not decoration. Bash reads a script incrementally as it
+# executes, keeping a byte offset into the file, so a script that rewrites its
+# own file mid-run can resume at that offset in different content. A checkout
+# is usually the benign case — it replaces a file by rename, leaving the
+# descriptor bash holds pointed at the intact original — but a tool that
+# rewrites in place instead truncates the live inode, and then the offset lands
+# in whatever is there now. "Usually", for a failure whose signature is a green
+# run with steps missing from it, is not a property to build on. Wrapping the
+# body removes the question: bash parses main() into memory in full before
+# running any of it, and the exit means control never returns to the file. Copy
+# the shape above rather than the three bare statements it wraps.
+# hack/ci-eval-rc.sh is the worked example, and tests/test_ci_eval_rc.py pins
+# the property by emptying that file mid-run.
 #
 # Checking out matters because only the images come from the candidate. The
 # chart, the CRDs, bench/tasks, and the seeded fleet in bench/tf/fleet all come
