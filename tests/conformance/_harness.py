@@ -78,6 +78,16 @@ SOURCES: dict[str, Source] = {
         "agents/platform/scripts/command_policy.py",
         ("def evaluate(", "KUBECTL_READ_VERBS", "_KUBECTL_IDENTITY_FLAGS", "_IMPERSONATION_FLAGS"),
     ),
+    # B5 imports this module and calls four renderers by attribute. Registered
+    # so the self-check polices those names: the B5 assertion is an expected
+    # failure, and unittest records ANY exception under one -- so an
+    # AttributeError from a renamed renderer counted among the twelve while
+    # asserting nothing about bidi or zero-width characters, and the violation
+    # could never have closed by its documented route.
+    "audit_report": Source(
+        "agents/platform/skills/fleet-audit/scripts/audit_report.py",
+        ("def _ident(", "def _cell(", "def trim_command(", "def trim_excerpt("),
+    ),
     "credential_proxy": Source(
         "agents/platform/scripts/credential_proxy.py",
         (

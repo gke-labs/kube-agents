@@ -572,11 +572,28 @@ class B5WhatTheApproverSeesIsWhatWillBeApplied(unittest.TestCase):
         markup. `_cell` escapes the pipe that would otherwise forge a table
         column. Both are real controls and neither should be lost while the
         expected failure below is being fixed.
+
+        It also pins that all four renderers the expected failure calls still
+        EXIST. That belongs in a passing test rather than in the violation: an
+        expected failure records any exception, so an AttributeError from a
+        renamed renderer would be counted among the twelve while the bidi
+        assertions never ran -- and the violation could then never close, since
+        an unexpected success cannot fire from a test that always raises.
+        `audit_report.py` is a 3000-line module nobody editing it would connect
+        to this suite, which is why the anchors in SOURCES back this up.
         """
         self.assertEqual("a'b", self.audit_report._ident("a`b"))
         self.assertEqual("a b", self.audit_report._ident("a\nb"))
         self.assertEqual("a\\|b", self.audit_report._cell("a|b"))
         self.assertEqual("a b", self.audit_report._cell("a\nb"))
+        for name in ("_ident", "_cell", "trim_command", "trim_excerpt"):
+            with self.subTest(renderer=name):
+                self.assertTrue(
+                    callable(getattr(self.audit_report, name, None)),
+                    f"audit_report.{name} is gone; the B5 violation below calls "
+                    "it and would record the AttributeError as its expected "
+                    "failure",
+                )
 
     @h.known_violation("B5", "overnight-b/findings.md 2.4")
     def test_B5_rendered_evidence_carries_no_direction_or_width_trickery(self) -> None:
