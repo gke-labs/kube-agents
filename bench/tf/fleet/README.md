@@ -223,31 +223,27 @@ An eval run reads this fleet to check its fixtures survived. It has no business 
 able to change them, and the safeguards are worth less if the credential that checks
 them could also have caused what it is checking for.
 
-**This is not true today, and nothing in this change makes it true.** Measured, not
-assumed: `prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com` — the identity
-every presubmit runs as — holds `roles/container.admin`, `roles/container.developer`,
-`roles/storage.admin`, `roles/resourcemanager.projectIamAdmin` and
-`roles/iam.serviceAccountAdmin` in every eval project — `scripts/provision_ci_pool_project.sh`
-grants that set at onboarding, so onboarding another one does not dilute it — and
+Applying this stack is what makes it true. It provisions
+`seeded-fleet-reader@<project>.iam.gserviceaccount.com` with `roles/container.viewer` on
+the project and nothing else, and grants `roles/iam.serviceAccountTokenCreator` on that
+account to the members in `var.fleet_reader_token_creators` — which defaults to
+`prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com`, the identity every
+presubmit runs as. `hack/ci-eval-pr.sh` exports `FLEET_READONLY_SA` pointing at the
+account, and `hack/fleet-kubeconfigs.sh` mints a token for it and writes each kubeconfig
+with that token as its only credential.
+
+Without the grant the script warns loudly on every run and the kubeconfigs carry the
+runner's own identity, which is `roles/container.admin` and four more write roles that
+`scripts/provision_ci_pool_project.sh` grants at onboarding — measured, not assumed:
 `kubectl auth can-i delete deployments -n seeded-debug` answers yes. There are zero
 ClusterRoleBindings or RoleBindings on these clusters naming any `*.gserviceaccount.com`
 subject; authorization comes entirely from the GKE IAM webhook, so there is nothing to
-narrow in-cluster either. A read-only identity does not exist to hand the harness yet.
+narrow in-cluster either.
 
-What this change adds is the **seam**, so that closing the gap is a configuration
-change rather than another code change. The stack provisions
-`seeded-fleet-reader@<project>.iam.gserviceaccount.com` with `roles/container.viewer`
-on the project and nothing else, and grants impersonation to the identities named in
-`var.fleet_reader_token_creators` (a list of IAM members, empty by default) via
-`roles/iam.serviceAccountTokenCreator` on that account alone. Set `FLEET_READONLY_SA` to
-the account's email and `hack/fleet-kubeconfigs.sh` mints a token for it and writes each
-kubeconfig with that token as its only credential. Unset — the state today — the script
-warns loudly on every run and the kubeconfigs carry the runner's own identity.
-
-Closing it needs three things, in order, none of them done here: apply this stack in
-each eval project; add the Prow identity to `fleet_reader_token_creators` and re-apply;
-export `FLEET_READONLY_SA=seeded-fleet-reader@<project>.iam.gserviceaccount.com` in the
-Prow job. Then the property is checkable rather than asserted:
+The default landed after the pool was provisioned, so a project applied before it still
+lacks the binding — `scripts/verify_ci_pool_project.py` fails such a project, and
+re-applying this stack against it is the repair. Where the grant is in place the property
+is checkable rather than asserted:
 
     gcloud auth print-access-token \
       --impersonate-service-account="seeded-fleet-reader@<project>.iam.gserviceaccount.com" \
