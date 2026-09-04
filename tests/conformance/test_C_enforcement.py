@@ -430,6 +430,24 @@ class C1IsolationIsStructural(unittest.TestCase):
         169.254.169.252 and fd20:ce::254 reach the same metadata service on
         GKE. A guard written against 169.254.169.254 alone is a guard against
         one spelling.
+
+        ON A CREDENTIAL PORT, which is the qualifier the invariant is written
+        in and this assertion used to drop. `metadataServerAddresses`
+        (platformagent_egress_policy.go) says it in as many words -- "on a
+        credential port" and not "at all" -- because the DNS rule names
+        169.254.169.254 on port 53 deliberately: under Cloud DNS for GKE that
+        host is the resolver in every Pod's resolv.conf, and 53 reaches no
+        token.
+
+        Dropping the qualifier cost more than precision, because this test is
+        an expected failure and a failing subTest abandons the method. The DNS
+        rule is the FIRST metadata match in the fixture, so it was the recorded
+        verdict and #676's rules -- the actual violation, on 80 and 988 -- were
+        never evaluated. Worse, the closure route this docstring promises was
+        unreachable: scope #676's rules to the broker Pod and the test would
+        STILL be red on the DNS rule, so the decorator could never come off and
+        the unexpected success could never fire. A permanent expected failure
+        is the thing the register exists to prevent.
         """
         import ipaddress
 
@@ -437,10 +455,17 @@ class C1IsolationIsStructural(unittest.TestCase):
             ipaddress.ip_address(a)
             for a in ("169.254.169.254", "169.254.169.252", "fd20:ce::254")
         ]
+        resolver = ipaddress.ip_address("169.254.169.254")
         for policy in h.objects_of_kind(
             h.yaml_documents("golden_egress_allowlist"), "NetworkPolicy"
         ):
             for rule in policy["spec"].get("egress") or []:
+                ports = rule.get("ports") or []
+                # A rule naming no ports opens every port, so it is never the
+                # DNS exemption however it is spelled.
+                dns_only = bool(ports) and all(
+                    str(port.get("port")) == "53" for port in ports
+                )
                 for peer in rule.get("to") or []:
                     block = peer.get("ipBlock")
                     if not block:
@@ -448,6 +473,22 @@ class C1IsolationIsStructural(unittest.TestCase):
                     network = ipaddress.ip_network(block["cidr"], strict=False)
                     for address in addresses:
                         if address.version != network.version:
+                            continue
+                        if dns_only:
+                            # The exemption is one address in one role, not a
+                            # hole: the other two spellings reach the same
+                            # service and are permitted on no port at all.
+                            with self.subTest(
+                                cidr=block["cidr"], address=str(address), port=53
+                            ):
+                                if address in network:
+                                    self.assertEqual(
+                                        resolver,
+                                        address,
+                                        "only the resolver address is the DNS "
+                                        "grant; this one is a metadata address "
+                                        "reachable on 53 for no stated reason",
+                                    )
                             continue
                         with self.subTest(cidr=block["cidr"], address=str(address)):
                             self.assertNotIn(address, network)
