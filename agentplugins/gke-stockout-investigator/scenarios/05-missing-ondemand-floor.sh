@@ -92,8 +92,14 @@ _resolve_spot_only_shapes() {
     fi
 }
 
+# Memoised: this runs from both hooks, and scenario_manifest itself runs twice, so an
+# unmemoised resolver would query the API up to six times per run.
+_spot_only_shapes() {
+    scenario_memo spot _resolve_spot_only_shapes SCENARIO_MACHINES
+}
+
 scenario_manifest() {
-    _resolve_spot_only_shapes
+    _spot_only_shapes
     # stderr, not stdout: this function's stdout is piped straight into kubectl.
     # On --cleanup the shapes are the unprobed placeholder, so claiming their Spot is
     # unsupported would state the opposite of what this file documents about c3.
@@ -160,7 +166,7 @@ YAML
 }
 
 scenario_reasons() {
-    _resolve_spot_only_shapes
+    _spot_only_shapes
     local primary="${SCENARIO_MACHINES%% *}"
     cat <<JSON
 "rejectedMigs": [
@@ -189,7 +195,7 @@ JSON
 }
 
 scenario_notes() {
-    _resolve_spot_only_shapes
+    _spot_only_shapes
     # Quoted heredoc below, and printf here: the prose is full of backticked command
     # names, and an unquoted heredoc runs every one of them as a command substitution.
     printf '%s\n\n' "The Spot tiers here are unobtainable by construction, not by luck: \
