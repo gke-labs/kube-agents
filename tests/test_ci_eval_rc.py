@@ -87,6 +87,7 @@ class RcEvalDriverTestCase(unittest.TestCase):
         deploy_supports_rc: bool = True,
         eval_supports_tier: bool = True,
         eval_exit_code: int = 0,
+        deploy_exit_code: int = 0,
         truncate_driver_from_deploy: bool = False,
     ) -> tuple[pathlib.Path, str]:
         """A repository with a candidate commit and a later HEAD to start from.
@@ -144,7 +145,9 @@ class RcEvalDriverTestCase(unittest.TestCase):
                 # from only because the candidate's copy of it is byte-identical
                 # to HEAD's, so the checkout left the file alone.
                 deploy_body += f'\n: > "{hack / "ci-eval-rc.sh"}"'
-            deploy_stub = _stub(self.trace, "deploy", body=deploy_body)
+            deploy_stub = _stub(
+                self.trace, "deploy", body=deploy_body, exit_code=deploy_exit_code
+            )
         else:
             deploy_stub = textwrap.dedent(
                 f"""\
@@ -381,6 +384,25 @@ class RcEvalDriverTestCase(unittest.TestCase):
         self.assertIn("EVAL_TIER", evaluator)
 
     # ─── Reporting ──────────────────────────────────────────────────────────
+
+    def test_a_failed_deploy_is_reported_and_is_not_a_verdict(self):
+        """Found live: a real ci-deploy.sh exiting non-zero wrote no artifact.
+
+        The deploy was invoked bare, so errexit aborted the run before the
+        summary — which left the summary's own "did not reach the verdict step"
+        branch unreachable and a Prow run with nothing but a log to read. It
+        must not report RED either: nothing was measured, and RED is a
+        judgement on the candidate that this run never formed.
+        """
+        root, _ = self.build_repo(deploy_exit_code=3)
+        result = self.run_driver(root)
+        self.assertEqual(result.returncode, 3, "the deploy's own status survives")
+        self.assertEqual(self.steps(), ["resolve", "deploy"], "the eval must not run")
+        self.assertIn("NOT RUN", result.stdout)
+        self.assertNotIn("RED", result.stdout)
+        summary = (self.artifacts / "rc-eval-summary.md").read_text(encoding="utf-8")
+        self.assertIn("| Verdict | NOT RUN |", summary)
+        self.assertIn("never evaluated", summary)
 
     def test_a_red_verdict_is_reported_not_swallowed(self):
         """Non-gating is the job config's `|| true`, not a hidden exit 0 here."""

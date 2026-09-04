@@ -129,7 +129,8 @@ readonly RESOLVE_SCRIPT="resolve-rc-target.sh"
 # be in memory before it happens, and control must never return to the file.
 main() {
   local script_dir repo_root rc_commit_sha rc_tag original_ref
-  local artifacts_dir summary_path verdict_path deck_url eval_status
+  local artifacts_dir summary_path verdict_path deck_url
+  local deploy_status eval_status verdict
 
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   repo_root="$(cd "${script_dir}/.." && pwd)"
@@ -243,16 +244,36 @@ main() {
   export RC_COMMIT_SHA="${rc_commit_sha}"
   export EVAL_TIER="${RC_EVAL_TIER}"
 
+  # errexit is suspended for both steps, for the same reason: whatever happens,
+  # this run owes Prow an artifact saying what happened. A bare invocation here
+  # aborts main() on the spot, which skips the summary below and leaves a
+  # deploy failure legible only to somebody willing to read the raw log --
+  # and makes the summary's own "did not reach the verdict step" branch
+  # unreachable. Measured against a real candidate: ci-deploy.sh exits non-zero
+  # before it reaches a cluster if the environment is short a variable, which
+  # is an ordinary Tuesday for a job whose config is maintained in another
+  # repository.
   echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Deploying release candidate ${rc_commit_sha:0:7} ==="
-  "${script_dir}/${DEPLOY_SCRIPT}"
+  deploy_status=0
+  "${script_dir}/${DEPLOY_SCRIPT}" || deploy_status=$?
 
-  # errexit is suspended for the eval alone. A red verdict is this job's
-  # OUTPUT, not its failure -- this lane is non-gating by charter -- so the
-  # status is captured, reported, and handed back at the end rather than
-  # skipping the summary that says where to read it.
-  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Evaluating release candidate ${rc_commit_sha:0:7} (tier: ${RC_EVAL_TIER}) ==="
+  # A failed deploy is not a red verdict. Nothing was measured, so saying RED
+  # would report a judgement on the candidate that this run never formed --
+  # the one reading that matters, because the whole lane exists to answer
+  # "is this candidate worse than main".
   eval_status=0
-  "${script_dir}/${EVAL_SCRIPT}" || eval_status=$?
+  if [ "${deploy_status}" -ne 0 ]; then
+    verdict="NOT RUN"
+    echo "ERROR: deploying ${rc_tag} (${rc_commit_sha:0:7}) failed with status ${deploy_status}, so the candidate was never evaluated. This is not a verdict on the candidate." >&2
+  else
+    echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Evaluating release candidate ${rc_commit_sha:0:7} (tier: ${RC_EVAL_TIER}) ==="
+    "${script_dir}/${EVAL_SCRIPT}" || eval_status=$?
+    if [ "${eval_status}" -eq 0 ]; then
+      verdict="GREEN"
+    else
+      verdict="RED"
+    fi
+  fi
 
   # ─── Reporting: make the verdict findable without a credential ────────────
   deck_url=""
@@ -264,7 +285,7 @@ main() {
   echo "🏷️ RELEASE CANDIDATE EVAL"
   echo "Candidate:   ${rc_tag} (${rc_commit_sha})"
   echo "Tier:        ${RC_EVAL_TIER}"
-  echo "Verdict:     $([ "${eval_status}" -eq 0 ] && echo "GREEN" || echo "RED") (advisory: this lane gates nothing)"
+  echo "Verdict:     ${verdict} (advisory: this lane gates nothing)"
   if [ -n "${deck_url}" ]; then
     echo "Artifacts:   ${deck_url}"
   fi
@@ -281,7 +302,7 @@ main() {
       echo "| Candidate | \`${rc_tag}\` |"
       echo "| Commit | \`${rc_commit_sha}\` |"
       echo "| Tier | \`${RC_EVAL_TIER}\` |"
-      echo "| Verdict | $([ "${eval_status}" -eq 0 ] && echo "GREEN" || echo "RED") |"
+      echo "| Verdict | ${verdict} |"
       if [ -n "${deck_url}" ]; then
         echo "| Run | ${deck_url} |"
       fi
@@ -292,6 +313,10 @@ main() {
       echo
       if [ -f "${verdict_path}" ]; then
         echo "Per-case detail is in \`${RC_VERDICT_FILE}\` alongside this file."
+      elif [ "${deploy_status}" -ne 0 ]; then
+        echo "The candidate was never evaluated: deploying it failed with"
+        echo "status ${deploy_status}. Nothing here is a judgement on the"
+        echo "candidate. The build log above is where it stopped."
       else
         echo "No \`${RC_VERDICT_FILE}\` was written: the run did not reach the"
         echo "verdict step. The build log above is where it stopped."
@@ -302,11 +327,16 @@ main() {
 
   # The restore hint is the EXIT trap's, so that the failure paths get it too.
 
-  # The eval's own status is preserved rather than forced to 0. Which one the
-  # job reports is the JOB's decision (an `|| true` in its config), kept there
-  # so "non-gating" is one line in the config a reader can see, instead of a
-  # swallowed exit code here that makes a red run indistinguishable from a
-  # green one to anything reading exit statuses.
+  # The failing step's own status is preserved rather than forced to 0. Which
+  # one the job reports is the JOB's decision (an `|| true` in its config),
+  # kept there so "non-gating" is one line in the config a reader can see,
+  # instead of a swallowed exit code here that makes a red run
+  # indistinguishable from a green one to anything reading exit statuses.
+  # Deploy first: on that path eval_status is 0 because the eval never ran,
+  # and returning it would call a run that measured nothing a success.
+  if [ "${deploy_status}" -ne 0 ]; then
+    exit "${deploy_status}"
+  fi
   exit "${eval_status}"
 }
 
