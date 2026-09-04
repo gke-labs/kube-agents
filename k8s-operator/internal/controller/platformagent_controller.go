@@ -288,8 +288,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			rcName := *instance.Spec.Deployment.Availability.RuntimeClassName
 			msg := fmt.Sprintf("RuntimeClass '%s' is not configured in this cluster. For GKE Standard, enable GKE Sandbox by provisioning a gVisor node pool first. In GKE Autopilot, gVisor is supported automatically.", rcName)
 			log.Info(msg)
-			if statusErr := r.updateStatusDegraded(ctx, instance, "RuntimeClassNotFound", msg); statusErr != nil {
+			guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance, reasonRuntimeClassNotFound)
+			if statusErr := r.updateStatusDegraded(ctx, instance, reasonRuntimeClassNotFound, msg); statusErr != nil {
 				return ctrl.Result{}, statusErr
+			}
+			if guardrailErr != nil {
+				return ctrl.Result{}, guardrailErr
 			}
 			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 		}
@@ -304,8 +308,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// validateCredentialBrokerSplit.
 	if reason, msg := validateCredentialBrokerSplit(instance); reason != "" {
 		log.Info(msg)
+		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance, reason)
 		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg); statusErr != nil {
 			return ctrl.Result{}, statusErr
+		}
+		if guardrailErr != nil {
+			return ctrl.Result{}, guardrailErr
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
@@ -330,11 +338,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// this path reconciles the same two policies before returning.
 	if reason, msg := validateEgressPolicyLayout(instance); reason != "" {
 		log.Info(msg)
-		if err := r.reconcileAgentNetworkGuardrails(ctx, instance, reason); err != nil {
-			return ctrl.Result{}, err
-		}
+		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance, reason)
 		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg); statusErr != nil {
 			return ctrl.Result{}, statusErr
+		}
+		if guardrailErr != nil {
+			return ctrl.Result{}, guardrailErr
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
@@ -376,17 +385,14 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// policy is unconditional because it has nothing to do with either
 		// refusal; it is the Pod's baseline and it predates this field.
 		//
-		// This closes the hazard at the two egress refusals only — this one
-		// and step 10c's. The two refusals above them — step 10's
-		// RuntimeClassNotFound and step 10b's SplitBrokerStrandsEventWatcher —
-		// return without reconciling the gateway policy and still have it.
-		// Issue #964 tracks that; do not read the rule stated here as one the
-		// whole function keeps yet.
-		if err := r.reconcileAgentNetworkGuardrails(ctx, instance, reason); err != nil {
-			return ctrl.Result{}, err
-		}
+		// All refusal paths above (steps 10, 10b, 10c, 10e) maintain the agent
+		// Pod's network guardrails before returning.
+		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance, reason)
 		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg); statusErr != nil {
 			return ctrl.Result{}, statusErr
+		}
+		if guardrailErr != nil {
+			return ctrl.Result{}, guardrailErr
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
@@ -1160,6 +1166,9 @@ func (r *PlatformAgentReconciler) deleteIfManaged(ctx context.Context, object cl
 }
 
 const (
+	// reasonRuntimeClassNotFound indicates that the requested RuntimeClass was not found in the cluster.
+	reasonRuntimeClassNotFound = "RuntimeClassNotFound"
+
 	// reasonEgressPolicyRequiresSplitBroker refuses the layout: the policy
 	// cannot be rendered at all, because it would govern the credential broker
 	// sharing the Pod.

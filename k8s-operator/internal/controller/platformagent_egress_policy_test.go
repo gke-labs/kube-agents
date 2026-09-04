@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"net/netip"
 	"strings"
 	"testing"
@@ -25,6 +26,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
@@ -1261,6 +1263,33 @@ func TestARefusalDoesNotSuspendTheGatewayNetworkPolicy(t *testing.T) {
 				a.Spec.Security.SplitCredentialBrokerPod = nil
 			},
 		},
+		{
+			name:   "RuntimeClassNotFound",
+			reason: reasonRuntimeClassNotFound,
+			mutate: func(a *agentv1alpha1.PlatformAgent) {
+				if a.Spec.Deployment == nil {
+					a.Spec.Deployment = &agentv1alpha1.DeploymentSpec{}
+				}
+				if a.Spec.Deployment.Availability == nil {
+					a.Spec.Deployment.Availability = &agentv1alpha1.AvailabilitySpec{}
+				}
+				a.Spec.Deployment.Availability.RuntimeClassName = ptr.To("nonexistent-runtime-class")
+			},
+		},
+		{
+			name:   "SplitBrokerStrandsEventWatcher",
+			reason: reasonSplitBrokerStrandsEventWatcher,
+			mutate: func(a *agentv1alpha1.PlatformAgent) {
+				a.Spec.Security.SplitCredentialBrokerPod = ptr.To(true)
+				if a.Spec.Harness == nil {
+					a.Spec.Harness = &agentv1alpha1.HarnessSpec{}
+				}
+				if a.Spec.Harness.EventWatcher == nil {
+					a.Spec.Harness.EventWatcher = &agentv1alpha1.EventWatcherSpec{}
+				}
+				a.Spec.Harness.EventWatcher.Enabled = ptr.To(true)
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			scheme := setupScheme()
@@ -1322,6 +1351,109 @@ func TestARefusalDoesNotSuspendTheGatewayNetworkPolicy(t *testing.T) {
 			}
 			if !tc.guarded && err == nil {
 				t.Error("the split-broker refusal rendered the egress policy, which is the outage it exists to prevent")
+			}
+		})
+	}
+}
+
+// TestARefusalRecordsStatusDegradedEvenIfGuardrailsReconcileFails covers the
+// case where reconciling the gateway NetworkPolicy returns an error on a
+// refusal path: the controller must still record the Degraded condition with
+// the refusal reason and message in the status before returning the error.
+func TestARefusalRecordsStatusDegradedEvenIfGuardrailsReconcileFails(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*agentv1alpha1.PlatformAgent)
+		reason string
+	}{
+		{
+			name:   "RuntimeClassNotFound",
+			reason: reasonRuntimeClassNotFound,
+			mutate: func(a *agentv1alpha1.PlatformAgent) {
+				if a.Spec.Deployment == nil {
+					a.Spec.Deployment = &agentv1alpha1.DeploymentSpec{}
+				}
+				if a.Spec.Deployment.Availability == nil {
+					a.Spec.Deployment.Availability = &agentv1alpha1.AvailabilitySpec{}
+				}
+				a.Spec.Deployment.Availability.RuntimeClassName = ptr.To("nonexistent-runtime-class")
+			},
+		},
+		{
+			name:   "SplitBrokerStrandsEventWatcher",
+			reason: reasonSplitBrokerStrandsEventWatcher,
+			mutate: func(a *agentv1alpha1.PlatformAgent) {
+				a.Spec.Security.SplitCredentialBrokerPod = ptr.To(true)
+				if a.Spec.Harness == nil {
+					a.Spec.Harness = &agentv1alpha1.HarnessSpec{}
+				}
+				if a.Spec.Harness.EventWatcher == nil {
+					a.Spec.Harness.EventWatcher = &agentv1alpha1.EventWatcherSpec{}
+				}
+				a.Spec.Harness.EventWatcher.Enabled = ptr.To(true)
+			},
+		},
+		{
+			name:   "EgressPolicyRequiresSplitBroker",
+			reason: reasonEgressPolicyRequiresSplitBroker,
+			mutate: func(a *agentv1alpha1.PlatformAgent) {
+				a.Spec.Security.SplitCredentialBrokerPod = nil
+			},
+		},
+		{
+			name:   "EgressAllowlistRefused",
+			reason: reasonEgressAllowlistRefused,
+			mutate: func(a *agentv1alpha1.PlatformAgent) {
+				a.Spec.Security.EgressAllowlist = &agentv1alpha1.EgressAllowlistSpec{
+					ControlPlaneCIDRs: []string{"0.0.0.0/0"},
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := setupScheme()
+			agent := egressPolicyAgent(tc.mutate)
+			interceptors := ssaApplyInterceptor()
+			origPatch := interceptors.Patch
+			interceptors.Patch = func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+				if _, ok := obj.(*networkingv1.NetworkPolicy); ok {
+					return errors.NewInternalError(fmt.Errorf("simulated network policy apply error"))
+				}
+				if origPatch != nil {
+					return origPatch(ctx, cl, obj, patch, opts...)
+				}
+				return cl.Patch(ctx, obj, patch, opts...)
+			}
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(agent).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(interceptors).
+				Build()
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+			ctx := context.Background()
+
+			_, err := r.Reconcile(ctx, req)
+			if err == nil {
+				t.Fatal("expected Reconcile to return error from failed NetworkPolicy apply, got nil")
+			}
+
+			stored := &agentv1alpha1.PlatformAgent{}
+			if getErr := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); getErr != nil {
+				t.Fatalf("failed to re-read the agent: %v", getErr)
+			}
+			if stored.Status.Phase != "Degraded" {
+				t.Errorf("expected phase Degraded, got %q", stored.Status.Phase)
+			}
+			var gotReason string
+			for _, condition := range stored.Status.Conditions {
+				if condition.Type == "Ready" {
+					gotReason = condition.Reason
+				}
+			}
+			if gotReason != tc.reason {
+				t.Errorf("expected condition reason %q, got %q", tc.reason, gotReason)
 			}
 		})
 	}
