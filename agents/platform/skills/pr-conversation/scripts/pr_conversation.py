@@ -47,7 +47,11 @@ comment that did the addressing.
 
 Reply bodies are confined to ``/opt/data/scratch`` by the same ``realpath``
 check ``resolver.handle_transition`` uses. The body is posted publicly, so the
-path it comes from is bounded rather than merely checked for existence.
+path it comes from is bounded rather than merely checked for existence. That
+confinement, and the check that the pull request is one the agent may post on
+at all, live in ``pr_skill`` — shared with ``update_pr.py``, because a gate
+with two implementations is a gate with one implementation and one copy of it
+that will drift.
 """
 
 from __future__ import annotations
@@ -57,7 +61,6 @@ import json
 import os
 import re
 import sys
-import tempfile
 from datetime import datetime
 
 # `$HERMES_HOME/scripts`, where the entrypoint's step 2b force-sync stages the
@@ -69,9 +72,24 @@ if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
 
 import forge  # noqa: E402
+import pr_skill  # noqa: E402
 import pr_triggers  # noqa: E402
 
-SCRATCH_DIR = "/opt/data/scratch"
+# The things this script and `update_pr.py` both do before they post. Aliased
+# rather than reimplemented: `validate_repo`, `find_agent_pr` and
+# `confined_body` are gates, and a gate with a second copy is one that drifts
+# silently. See `pr_skill`'s module docstring.
+#
+# `SCRATCH_DIR` is deliberately *not* aliased here. A module-level rebinding
+# would be read once and would not follow `pr_skill`, so patching or reassigning
+# it would move the help text below and leave the real confinement check still
+# pointing at the packaged path — which is the trap the test fixture had to work
+# around. Spell `pr_skill.SCRATCH_DIR` at the point of use instead.
+_fail = pr_skill.fail
+validate_repo = pr_skill.validate_repo
+_resolve_repo = pr_skill.resolve_repo
+_find_pr = pr_skill.find_agent_pr
+_confined_body = pr_skill.confined_body
 
 BARE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
@@ -85,62 +103,6 @@ CONTEXT_MAX_COMMENTS = 40
 CONTEXT_MAX_BODY_CHARS = 4000
 CONTEXT_MAX_REQUEST_CHARS = pr_triggers.MAX_REQUEST_CHARS
 CONTEXT_MAX_REQUESTS = 10
-
-
-def _fail(message: str):
-    print(f"Error: {message}", file=sys.stderr)
-    sys.exit(1)
-
-
-def validate_repo(repo: str) -> str:
-    """Ensure repo is formatted as owner/name and is in the managed repos allowlist if configured."""
-    from gitops_workspace import get_managed_github_repos, is_valid_repo_slug
-    if not repo or not is_valid_repo_slug(repo):
-        raise ValueError(f"Invalid repository format: {repo!r}. Expected 'owner/name'.")
-    managed = get_managed_github_repos()
-    if managed and repo not in managed:
-        raise ValueError(
-            f"Repository {repo!r} is not in the managed repositories list: {managed}"
-        )
-    return repo
-
-
-def _resolve_repo(args=None) -> str:
-    if args and getattr(args, "repo", None):
-        try:
-            return validate_repo(args.repo)
-        except ValueError as error:
-            _fail(str(error))
-    _fail("No target repository specified; pass --repo <owner/repo>.")
-
-
-def _find_pr(provider, repo: str, number: int, viewer: str):
-    """The agent's own open pull request `number`, or exit.
-
-    Scoped by `is_agent_pull_request` rather than by number alone: `reply`
-    posts publicly under the agent's identity, and the sweep only ever files
-    cards for pull requests the agent opened. A number that resolves to
-    somebody else's is a bad card or a bad hand-run, not something to answer.
-
-    `agent:ignore` is honoured for the same reason the sweep honours it, and
-    honouring it in only one of the two places would make the label a request
-    rather than an opt-out: a card filed before the label went on still runs
-    afterwards, and a hand-run never consulted it at all. The label is how a
-    maintainer says "stop posting here", and the posting is what it has to
-    stop.
-    """
-    for pr in provider.list_open_prs(repo):
-        if pr.number != number:
-            continue
-        if not forge.is_agent_pull_request(pr, repo, viewer):
-            _fail(f"{repo}#{number} is not one of this agent's pull requests.")
-        if pr.is_ignored:
-            _fail(
-                f"{repo}#{number} is labelled {forge.IGNORE_LABEL}, so the agent does not "
-                "post on it. Nothing was posted."
-            )
-        return pr
-    _fail(f"{repo}#{number} is not an open pull request.")
 
 
 def _context_request(request: str) -> tuple[str, int]:
@@ -207,25 +169,6 @@ def _refusals_already_posted(comments, viewer: str) -> int:
 def _refusals_exhausted(comments, viewer: str) -> bool:
     """Whether this pull request has spent its whole refusal budget."""
     return _refusals_already_posted(comments, viewer) >= pr_triggers.max_refusals_per_pr()
-
-
-def _confined_body(path: str) -> str:
-    """The reply body, read from a path confined to the scratch directory.
-
-    Symlinks are resolved before the prefix check, so a link planted inside
-    scratch cannot reach outside it.
-    """
-    scratch = os.path.realpath(SCRATCH_DIR)
-    real = os.path.realpath(path)
-    if not real.startswith(scratch + os.sep):
-        _fail(f"Reply body {path} resolves outside {scratch}.")
-    if not os.path.isfile(real):
-        _fail(f"Reply body {path} does not exist.")
-    with open(real, "r", encoding="utf-8") as handle:
-        body = handle.read()
-    if not body.strip():
-        _fail(f"Reply body {path} is empty.")
-    return body
 
 
 # --------------------------------------------------------------------------
@@ -698,21 +641,10 @@ def _post(args, marker_kind: str) -> int:
 
     # The stamped copy stays inside scratch: same confinement as the input, and
     # the same directory the skill is already allowed to write.
-    os.makedirs(SCRATCH_DIR, exist_ok=True)
-    handle = tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", suffix=".md", dir=SCRATCH_DIR, delete=False
-    )
     try:
-        handle.write(stamped)
-        handle.close()
-        provider.post_comment(repo, pr, handle.name)
+        pr_skill.post_body(provider, repo, pr, stamped)
     except forge.ForgeError as error:
         _fail(f"could not post to {repo}#{args.pr}: {error}")
-    finally:
-        try:
-            os.unlink(handle.name)
-        except OSError:
-            pass
 
     print(
         json.dumps(
@@ -764,7 +696,7 @@ def build_parser() -> argparse.ArgumentParser:
         cmd.add_argument(
             "--body-file",
             required=True,
-            help=f"path to the comment body, under {SCRATCH_DIR}",
+            help=f"path to the comment body, under {pr_skill.SCRATCH_DIR}",
         )
         if name == "reply":
             # Required and exclusive: an answer either changed the branch or it

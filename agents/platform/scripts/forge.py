@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""forge.py — the five forge operations this harness needs, behind one seam.
+"""forge.py — the forge operations this harness needs, behind one seam.
 
 Staged into `$HERMES_HOME/scripts` by the entrypoint's step 2b force-sync, so
 every skill script on the Platform Agent's `sys.path` can import it.
 
 What this is for
 ----------------
-Reading and answering a pull-request conversation needs exactly five things from
-a code-hosting service: who am I, which pull requests are open, what has been
-said on one, say something back, and acknowledge that a request was seen. Those
-five are the whole forge-shaped surface of the feature; everything above them —
-what counts as addressing the agent, who is allowed to, when a request has
-already been answered — is harness policy that does not change between forges.
+Reading and answering a pull-request conversation needs five things from a
+code-hosting service: who am I, which pull requests are open, what has been said
+on one, say something back, and acknowledge that a request was seen. Keeping an
+open pull request mergeable needs two more: does this branch conflict with its
+base, and what is red on its head commit. Those are the whole
+forge-shaped surface of both features; everything above them — what counts as
+addressing the agent, who is allowed to, when a request has already been
+answered, how many times the agent may try to fix one branch — is harness policy
+that does not change between forges.
 
 Splitting the two here is what makes a second forge a new class rather than a
 second copy of the sweep. It is *not* a claim that a second forge is cheap:
@@ -27,7 +30,7 @@ no GitHub token: `gh` is proxied to the credential sidecar, which is also why
 `ALLOWED_EXECUTABLES` is a closed list. Bitbucket has no comparable CLI, so a
 Bitbucket provider cannot shell anything at all — it needs a `/v1/<forge>/…`
 route on that sidecar. Funnelling every call through one override point means
-that provider replaces one method instead of reimplementing five.
+that provider replaces one method instead of reimplementing every read.
 
 Three normalisations, and the forge that forced each
 ----------------------------------------------------
@@ -138,6 +141,79 @@ BARE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 #: `triage` as `read` — which is the intended reading either way.
 WRITE_PERMISSIONS = frozenset({"admin", "write", "maintain"})
 
+#: `mergeable_state` while GitHub is still computing the merge. The merge is
+#: computed lazily, on the first read after a push to either branch, so the
+#: first poll after any push routinely lands here. It is an unknown, not a
+#: clean bill: `_has_write` has the same three-valued shape for the same reason.
+MERGEABLE_STATE_UNKNOWN = "unknown"
+
+#: `mergeable_state` for a branch that conflicts with its base. The other values
+#: — `blocked`, `behind`, `unstable`, `draft` — are all things a human or a
+#: check decides and none of them is a conflict, so this is the only one of
+#: *this field's* values that means one. `conflict_state` still ORs it with
+#: `mergeable is False`, which is not a second reading of the same field: those
+#: other states come back with `mergeable: true`, so the OR widens the answer
+#: only where GitHub itself says the merge cannot be produced.
+MERGEABLE_STATE_CONFLICTED = "dirty"
+
+#: Check-run conclusions that mean CI is asking the author to change something.
+#: `cancelled` and `stale` are excluded deliberately: a run somebody stopped, or
+#: one a newer push superseded, says nothing about the code and re-running the
+#: agent at it would spend a model turn on a verdict nobody reached.
+FAILING_CONCLUSIONS = frozenset(
+    {"failure", "timed_out", "action_required", "startup_failure"}
+)
+
+#: Commit-status states that mean the same thing. Read as well as check runs
+#: because GitHub keeps two registers and CI that predates the Checks API only
+#: ever appears in this one — Prow, which gates this repository, is in it.
+#: Reading one register is how a red pull request looks green.
+FAILING_STATUS_STATES = frozenset({"failure", "error"})
+
+#: Page size for the CI reads. Both endpoints answer with a JSON *object*
+#: wrapping the array, and `gh api --paginate` concatenates objects into
+#: something `json.loads` rejects, so these are one request each and this is a
+#: real ceiling rather than a round-trip bound. A pull request with more than
+#: this many checks reports the first page; the sweep's job is to notice that CI
+#: is red, and a hundred checks in it will not be uniformly green.
+CHECK_PAGE_SIZE = 100
+
+#: How much of a check's name and details URL any caller may pass on. Both come
+#: from whatever posted the check — anything holding `checks:write` or
+#: `statuses:write` on the repository — so both are third-party text on its way
+#: to a board entry or a prompt, and neither has a length GitHub bounds. They
+#: live here, beside `CheckRun`, because a truncation width two callers each
+#: keep their own copy of is two widths: a card and a `poll` row would then show
+#: the model different amounts of the same name.
+MAX_CHECK_NAME_CHARS = 120
+MAX_CHECK_URL_CHARS = 300
+
+#: What a check name may still carry once it leaves this module. Word
+#: characters — Unicode, so a job named in a non-Latin script survives — spaces,
+#: and the punctuation real names use: `build (ubuntu-latest, 3.12)`,
+#: `e2e/kind`, `pull-kube-agents-smoke-test`.
+#:
+#: An allowlist rather than a denylist, because the characters that matter in
+#: third-party text on its way to a prompt are the ones that end one context and
+#: begin another, and the set of those grows every time a caller changes its
+#: markup. A newline forges a second entry in the bullet list `_update_card`
+#: builds; a backtick closes the code span the name sits inside; `<`, `[` and
+#: `]` are the delimiters `pr_triggers` refuses outright in a slash request
+#: (`HIDING_CHARS`) and `resolver.py` neutralises in an issue title. Truncation
+#: is no substitute and stays where it is: cutting a name at 120 characters does
+#: nothing about a newline in its first ten.
+CHECK_NAME_DISALLOWED_RE = re.compile(r"[^\w .:/#+,()@'-]", re.UNICODE)
+
+#: The only schemes a check's log URL may carry. The URL comes from whoever
+#: posted the check — `checks:write` alone, no access to the code — and it
+#: reaches a card body a model reads and may fetch. `javascript:` and `data:`
+#: are the ones that are obviously not addresses; `file:` is the one that is
+#: not obvious, because it looks like a path and names one inside the agent's
+#: own container. Anything else is dropped to "" rather than rewritten: the
+#: check's name and conclusion still reach the card, which is what a worker
+#: needs to go and find the log itself.
+CHECK_URL_ALLOWED_SCHEMES = frozenset({"http", "https"})
+
 #: `gh api` puts the HTTP status in its stderr line: `gh: Not Found (HTTP 404)`.
 #: A 404 from the collaborator endpoint is an answer; every other failure is not.
 HTTP_STATUS_RE = re.compile(r"\(HTTP (\d{3})\)")
@@ -159,7 +235,7 @@ class ForgeError(Exception):
     The gate turns `reason` into the `⚠️` line an operator reads, so the codes
     are part of the contract rather than debug text. They match the vocabulary
     `resolver.py handle_poll` already emits, so one operator-facing glossary
-    covers both sweeps.
+    covers every sweep.
     """
 
     def __init__(self, reason: str, value: str = ""):
@@ -187,6 +263,12 @@ class PullRequest:
     author: str
     labels: tuple[str, ...] = ()
     url: str = ""
+    #: The branch this pull request merges into. Carried because the `update-pr`
+    #: skill merges it into the head branch to clear a conflict, and the default
+    #: branch is not a safe guess: a stacked pull request bases on another
+    #: feature branch, and merging `main` into it would be the wrong resolution
+    #: rather than a failed one.
+    base_ref: str = ""
     #: `owner/name` of the repository the head branch lives in. Empty when the
     #: fork it came from has been deleted, which `is_agent_pull_request` reads
     #: as "not ours" rather than as "unknown".
@@ -253,8 +335,77 @@ class Commit:
     committed_at: str = ""
 
 
+@dataclass(frozen=True)
+class CheckRun:
+    """One red CI signal on a pull request's head commit.
+
+    Flattened from GitHub's two registers — a check run has a `conclusion` and a
+    commit status has a `state` — because every caller asks the same question of
+    both: what is called what, and where does a human go to read why. `register`
+    survives the flattening only so a report can say where it came from; nothing
+    branches on it.
+    """
+
+    #: Already reduced by `plain_check_name`, so every consumer — a card body,
+    #: a `poll` row, a report — gets the same constrained string and none of
+    #: them has to remember to constrain it. `_pr_card` leans on `find_trigger`
+    #: the same way rather than re-checking at the card.
+    name: str
+    #: The forge's own word for the failure: a check-run conclusion
+    #: (`failure`, `timed_out`, …) or a status state (`failure`, `error`).
+    conclusion: str
+    #: Where the log lives. A `details_url` for a check run, a `target_url` for
+    #: a status. Already reduced by `safe_check_url`, so it is either an
+    #: `http`/`https` address or empty — empty when the reporter set neither,
+    #: and empty when what it set was not a web address at all.
+    details_url: str = ""
+    #: "check_run" | "status"
+    register: str = "check_run"
+
+
+def plain_check_name(name: str) -> str:
+    """`name` with everything `CHECK_NAME_DISALLOWED_RE` rejects taken out.
+
+    Applied at ingest, where the name enters the process, rather than at each
+    of the places it leaves it. A check name reaches a board entry that wakes a
+    model holding a workspace lease, and whoever posted the check needs only
+    `checks:write` or `statuses:write` on the repository — which an integration
+    with no write access to the code still has.
+
+    Disallowed characters become spaces and runs of whitespace collapse, so a
+    name broken across two lines reads as one line rather than as one word.
+    """
+    return " ".join(CHECK_NAME_DISALLOWED_RE.sub(" ", name or "").split())
+
+
+def safe_check_url(url: str) -> str:
+    """`url` if it is an ordinary web address, otherwise "".
+
+    The mechanical half of the rule `update-pr/SKILL.md` states in prose: a
+    `details_url` is an address somebody else chose. Constrained at ingest for
+    the reason `plain_check_name` is — one place, so no consumer has to
+    remember — and by scheme only. Which hosts are worth reading is a judgment
+    a self-hosted runner or an on-prem CI makes differently in every install,
+    and an allowlist of them would break those installs silently; a scheme that
+    is not `http` or `https` is wrong everywhere.
+
+    Whitespace goes first, because a URL split across two lines would otherwise
+    parse as a scheme-less path and be dropped for the wrong reason.
+    """
+    text = "".join(str(url or "").split())
+    if not text:
+        return ""
+    try:
+        scheme = urllib.parse.urlsplit(text).scheme.lower()
+    except ValueError:
+        # `urlsplit` raises on a malformed IPv6 literal, which is a URL nothing
+        # downstream can use either.
+        return ""
+    return text if scheme in CHECK_URL_ALLOWED_SCHEMES else ""
+
+
 class ForgeProvider(Protocol):
-    """The complete forge-shaped surface of the PR-conversation feature."""
+    """The complete forge-shaped surface of the pull-request features."""
 
     #: False on a forge with no reaction API (Bitbucket Cloud), so a caller can
     #: skip the acknowledgement rather than discover it fails.
@@ -273,6 +424,10 @@ class ForgeProvider(Protocol):
     def acknowledge(self, repo: str, comment: Comment) -> bool: ...
 
     def list_commits(self, repo: str, pr: PullRequest) -> list[Commit]: ...
+
+    def conflict_state(self, repo: str, pr: PullRequest) -> Optional[bool]: ...
+
+    def failing_checks(self, repo: str, pr: PullRequest) -> list[CheckRun]: ...
 
 
 def normalise_login(login: str) -> str:
@@ -505,7 +660,7 @@ class GitHubProvider:
         except ValueError as exc:
             raise ForgeError("FORGE_RESPONSE_UNREADABLE", str(exc)) from exc
 
-    # -- the five operations ----------------------------------------------
+    # -- the forge operations ----------------------------------------------
     def preflight(self) -> None:
         """`gh_preflight` against *this* provider's runner.
 
@@ -572,6 +727,7 @@ class GitHubProvider:
                     ((row.get("head") or {}).get("repo") or {}).get("full_name", "")
                 ),
                 head_sha=str((row.get("head") or {}).get("sha", "")),
+                base_ref=str((row.get("base") or {}).get("ref", "")),
                 author=str((row.get("user") or {}).get("login", "")),
                 labels=tuple(
                     str(label.get("name", "")) for label in (row.get("labels") or [])
@@ -785,6 +941,104 @@ class GitHubProvider:
             committer = ((row.get("commit") or {}).get("committer")) or {}
             commits.append(Commit(sha=sha, committed_at=str(committer.get("date", ""))))
         return commits
+
+    def conflict_state(self, repo: str, pr: PullRequest) -> Optional[bool]:
+        """Does this branch conflict with its base? None when the forge cannot say.
+
+        The single-pull-request endpoint, because the list endpoint carries no
+        `mergeable` at all — GitHub computes the merge only when a pull request
+        is asked about by itself. That makes this one extra round trip per
+        agent-owned pull request per tick, which is the price of the answer.
+
+        Three-valued for the reason `_has_write` is. The computation is lazy and
+        asynchronous: the first read after a push to either branch gets
+        `mergeable: null` and `mergeable_state: "unknown"` while a background job
+        works it out. Collapsing that to "no conflict" would make the sweep blind
+        for exactly the tick after every push — the tick where a conflict is most
+        likely to have just appeared — and collapsing it to "conflict" would send
+        a worker to merge a branch that merges fine. The caller waits instead;
+        the next tick is ten minutes away and the answer is cached by then.
+
+        `mergeable` and `mergeable_state` are both read because either alone has
+        a gap: `mergeable_state` carries values (`blocked`, `behind`, `unstable`)
+        that are not conflicts and must not read as one, and `mergeable` is the
+        field GitHub documents as authoritative for the merge itself.
+        """
+        data = (
+            self._call(
+                ["api", f"repos/{repo}/pulls/{pr.number}"],
+                repo=repo,
+                retry_transient=True,
+            )
+            or {}
+        )
+        mergeable = data.get("mergeable")
+        state = str(data.get("mergeable_state") or "").strip().lower()
+        if mergeable is None or not state or state == MERGEABLE_STATE_UNKNOWN:
+            return None
+        return mergeable is False or state == MERGEABLE_STATE_CONFLICTED
+
+    def failing_checks(self, repo: str, pr: PullRequest) -> list[CheckRun]:
+        """Red CI on the head commit, from both of GitHub's two registers.
+
+        A check run that has not finished is not a failure, so `status` is
+        tested before `conclusion`: a queued or in-progress run has
+        `conclusion: null`, which is neither red nor green, and treating the
+        absence as red would wake the agent at CI that is still running.
+
+        Empty is a real answer meaning "nothing red", and it is the same answer
+        as "no CI configured". The two do not need separating here: neither is
+        something for the agent to fix.
+        """
+        found: list[CheckRun] = []
+
+        runs = self._call(
+            [
+                "api",
+                f"repos/{repo}/commits/{pr.head_sha}/check-runs"
+                f"?per_page={CHECK_PAGE_SIZE}",
+            ],
+            repo=repo,
+            retry_transient=True,
+        )
+        for row in (runs or {}).get("check_runs") or []:
+            if str(row.get("status") or "").strip().lower() != "completed":
+                continue
+            conclusion = str(row.get("conclusion") or "").strip().lower()
+            if conclusion not in FAILING_CONCLUSIONS:
+                continue
+            found.append(
+                CheckRun(
+                    name=plain_check_name(str(row.get("name") or "")),
+                    conclusion=conclusion,
+                    details_url=safe_check_url(row.get("details_url")),
+                    register="check_run",
+                )
+            )
+
+        combined = self._call(
+            [
+                "api",
+                f"repos/{repo}/commits/{pr.head_sha}/status"
+                f"?per_page={CHECK_PAGE_SIZE}",
+            ],
+            repo=repo,
+            retry_transient=True,
+        )
+        for row in (combined or {}).get("statuses") or []:
+            state = str(row.get("state") or "").strip().lower()
+            if state not in FAILING_STATUS_STATES:
+                continue
+            found.append(
+                CheckRun(
+                    name=plain_check_name(str(row.get("context") or "")),
+                    conclusion=state,
+                    details_url=safe_check_url(row.get("target_url")),
+                    register="status",
+                )
+            )
+
+        return found
 
 
 #: Host substring -> provider. One entry today; the point of the table is that

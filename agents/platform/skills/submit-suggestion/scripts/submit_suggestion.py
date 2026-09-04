@@ -24,6 +24,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 # Append global scripts path to allow importing the shared helpers
@@ -181,18 +182,53 @@ def handle_submit(args) -> int:
             "are actually on."
         )
 
+    body = _submit_body(args)
+    if not args.keep_description and not (args.title and body):
+        raise ValueError(
+            "--title and one of --body / --body-file are required unless "
+            "--keep-description is given."
+        )
+
     repo = args.repo or gitops_workspace.resolve_repo(workspace=workspace)
     validate_repo(repo)
     refresh_git_credentials(repo)
 
     push_branch(branch, workspace)
     base = gitops_workspace.resolve_base_branch(workspace, _runner)
-    pr_url = create_pull_request(branch, args.title, args.body, workspace, repo, base)
+    pr_url = create_pull_request(
+        branch,
+        args.title,
+        body,
+        workspace,
+        repo,
+        base,
+        keep_description=args.keep_description,
+    )
     log(f"PR SUBMITTED SUCCESSFULLY! 🏆 URL: {pr_url}")
 
     # Print raw URL to stdout for the MCP tool to parse
     print(pr_url)
     return 0
+
+
+def _submit_body(args) -> str:
+    """The description text, from `--body-file` if one was given.
+
+    A pull request body is long, full of backticks, and assembled by a model
+    into a shell command. Through argv it is one `$(...)` away from executing
+    in the leased clone, where a credentialed `gh` and `git` are on `PATH`, and
+    one stray backtick away from silently deleting its own text. `--body-file`
+    is the channel the rest of this repository already uses for third-party
+    prose — `pr_conversation.py reply`, `update_pr.py record` and
+    `pr_skill.post_body` all take a path — and the asymmetry was that the
+    larger document went the other way.
+
+    `--body` stays because callers outside this repository pass it and short
+    bodies are fine.
+    """
+    if args.body_file:
+        return Path(args.body_file).read_text(encoding="utf-8")
+    return args.body or ""
 
 
 def push_branch(branch_name: str, workspace: str) -> None:
@@ -217,7 +253,13 @@ def push_branch(branch_name: str, workspace: str) -> None:
 
 
 def create_pull_request(
-    branch: str, title: str, body: str, workspace: str, repo: str, base: str
+    branch: str,
+    title: str,
+    body: str,
+    workspace: str,
+    repo: str,
+    base: str,
+    keep_description: bool = False,
 ) -> str:
     """Open the pull request — or refresh the one that is already open.
 
@@ -234,8 +276,29 @@ def create_pull_request(
     the old description in place would describe work the branch no longer
     contains. `audit_report.open_remediation_pr` edits its own pull requests
     for the same reason.
+
+    `keep_description` inverts that, for a caller that is not re-describing the
+    change. `update-pr` pushes a conflict merge or a CI fix onto a pull request
+    that has been under human review: the description is somebody else's work
+    and rewriting it is pure loss, invisible in the output — `submit` prints a
+    URL and `record`'s JSON says nothing about the body. The alternative on
+    offer was prose telling the model to read the description and hand it back
+    unchanged, which is asking it to reproduce a multi-kilobyte markdown
+    document byte-for-byte through its own context. In this mode the pull
+    request must already exist; there is no description to keep otherwise.
     """
     log(f"Submitting GitOps Pull Request for branch '{branch}'...")
+
+    if keep_description:
+        url = _existing_pull_request(branch, workspace, repo)
+        if not url:
+            raise RuntimeError(
+                f"--keep-description was given but no pull request is open for "
+                f"'{branch}' on {repo}. There is no description to keep. Open "
+                "it with a --title and a --body first."
+            )
+        log(f"Leaving the description of '{branch}' as its author wrote it.")
+        return url
 
     cmd = [
         "gh", "pr", "create",
@@ -261,19 +324,44 @@ def create_pull_request(
     return update_pull_request(branch, title, body, workspace, repo)
 
 
+def _existing_pull_request(branch: str, workspace: str, repo: str) -> str:
+    """The URL of the open pull request for `branch`, or "" if there is none."""
+    res = subprocess.run(
+        ["gh", "pr", "view", branch, "--repo", repo, "--json", "url", "--jq", ".url"],
+        cwd=workspace, capture_output=True, text=True, check=False,
+    )
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
 def update_pull_request(
     branch: str, title: str, body: str, workspace: str, repo: str
 ) -> str:
-    """Point the existing pull request for `branch` at the work just pushed."""
-    subprocess.run(
-        ["gh", "pr", "edit", branch, "--repo", repo, "--title", title, "--body", body],
-        cwd=workspace, capture_output=True, text=True, check=True,
-    )
-    res = subprocess.run(
-        ["gh", "pr", "view", branch, "--repo", repo, "--json", "url", "--jq", ".url"],
-        cwd=workspace, capture_output=True, text=True, check=True,
-    )
-    url = res.stdout.strip()
+    """Point the existing pull request for `branch` at the work just pushed.
+
+    Overwrites the title and description. `create_pull_request`'s
+    `keep_description` is the way past this for a caller that did not write
+    them.
+    """
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".md", delete=False, encoding="utf-8"
+    ) as handle:
+        # Not `--body`. `gh` takes it fine, but the value has already crossed
+        # one shell to get here and the proxy is another; a file is the channel
+        # that carries a body with backticks in it unchanged. Same reason
+        # `_submit_body` accepts `--body-file` on the way in.
+        handle.write(body)
+        body_file = handle.name
+    try:
+        subprocess.run(
+            [
+                "gh", "pr", "edit", branch, "--repo", repo,
+                "--title", title, "--body-file", body_file,
+            ],
+            cwd=workspace, capture_output=True, text=True, check=True,
+        )
+    finally:
+        os.unlink(body_file)
+    url = _existing_pull_request(branch, workspace, repo)
     if not url:
         raise RuntimeError(
             f"`gh pr view {branch}` returned no URL for the pull request it just "
@@ -309,8 +397,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     submit = subparsers.add_parser("submit", help="Push the branch and open the PR")
     submit.add_argument("--branch", required=True, help="Active Git branch name")
-    submit.add_argument("--title", required=True, help="Pull Request title")
-    submit.add_argument("--body", required=True, help="Pull Request description body")
+    # Not `required=True` any more: `--keep-description` submits without them,
+    # and `handle_submit` refuses a call that gives neither. Argparse cannot
+    # express "required unless" without a mutually-exclusive group that would
+    # also forbid the legitimate `--title` + `--keep-description` combination.
+    submit.add_argument("--title", default=None, help="Pull Request title")
+    body_source = submit.add_mutually_exclusive_group()
+    body_source.add_argument(
+        "--body", default=None, help="Pull Request description body"
+    )
+    body_source.add_argument(
+        "--body-file",
+        default=None,
+        help="File holding the description; the safe channel for a long body",
+    )
+    submit.add_argument(
+        "--keep-description",
+        action="store_true",
+        help="Leave the open pull request's title and body alone",
+    )
     submit.add_argument(
         "--workspace", default=None, help="The leased workspace from `prepare`"
     )

@@ -189,6 +189,11 @@ class ForgeProvider(Protocol):
 `Commit` carries the committer date beside the sha because a list of shas cannot express the bound
 the claim check enforces — see step 4 of the worker skill below.
 
+The protocol has since grown two more operations — `conflict_state` and `failing_checks`, the two
+reads that decide whether a pull request can still merge. They are not part of this feature and
+[`pr-update-sweep.md`](pr-update-sweep.md) §2 owns them; what belongs here is that a second
+implementation of this protocol owes them too.
+
 `GitHubProvider` implements it over the proxied `gh`, merging GitHub's three comment endpoints
 (`issues/N/comments`, `pulls/N/comments`, `pulls/N/reviews`) into one normalised list. Selection
 dispatches on the host in `SETTINGS.md`'s `Git Repo:` line. Every provider call goes through one
@@ -280,7 +285,10 @@ deterministic lives here, so an idle tick still costs no model at all.
   authenticates as, a head branch starting with `platform-agent/` — written in code only by
   `audit_report.group_branch_for`, and instructed rather than enforced for `submit-suggestion`,
   whose `check_branch` rejects an empty or protected branch name and nothing more — and a head that
-  lives in the configured repository rather than a fork. Minus any carrying `agent:ignore`.
+  lives in the configured repository rather than a fork. Minus any carrying `agent:ignore`, and
+  minus any the `pr_updates` sweep claimed earlier in the same tick — that pull request already has
+  a worker, and answering these comments is its stage 2. [`pr-update-sweep.md`](pr-update-sweep.md)
+  §3 owns the claim.
 
   The plan scoped on the branch prefix alone, which is attacker-chosen: anyone may fork the
   repository, push `platform-agent/anything`, and open a pull request from it. Every comment on that
@@ -337,9 +345,13 @@ key -->` renders as `/agent fix the typo`, so the request acted on and the reque
   as one did, live, before this moved. `audit_report._write_temp` documents the same trap, which is
   the sort of thing a second implementation rediscovers the hard way.
 - **Cap.** At most `PR_AGENT_MAX_PER_TICK` (default 3) worker cards per tick, oldest first, with
-  `deferred: <n>` logged. No silent truncation. The same cap bounds **refusals**, which the design
-  above missed: an account posting a hundred untrusted comments would otherwise draw a hundred
-  refusal comments in one tick, which is the amplification the trust gate exists to prevent.
+  `deferred: <n>` logged. No silent truncation. The allowance belongs to the tick rather than to
+  this sweep: `pr_updates` runs first and draws from the same one, so a tick that spent it on
+  unmergeable branches files no comment cards at all — see `pr-update-sweep.md` §4. The same
+  _number_ separately bounds **refusals**, which the design above missed: an account posting a
+  hundred untrusted comments would otherwise draw a hundred refusal comments in one tick, which is
+  the amplification the trust gate exists to prevent. Separately, because a refusal costs a comment
+  rather than a model turn, and a tick that spent its cards has not spent the repository's patience.
   Deferral is logged to stderr rather than stdout — it is ordinary backpressure that clears on the
   next tick, not a fault the room needs to hear about.
 - **Refusals have a second, total bound**: `PR_AGENT_MAX_REFUSALS_PER_PR` (default 10), counted from

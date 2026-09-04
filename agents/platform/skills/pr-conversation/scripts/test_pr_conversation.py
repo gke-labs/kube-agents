@@ -149,7 +149,10 @@ class _Harness(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.scratch = os.path.join(self._tmp.name, "scratch")
         os.makedirs(self.scratch)
-        patch = mock.patch.object(helper, "SCRATCH_DIR", self.scratch)
+        # Patched on `pr_skill`, which is where the confinement check and the
+        # stamped-copy write both read it. The helper deliberately keeps no
+        # alias of its own, so this is the only binding there is to patch.
+        patch = mock.patch.object(helper.pr_skill, "SCRATCH_DIR", self.scratch)
         patch.start()
         self.addCleanup(patch.stop)
         self.addCleanup(self._tmp.cleanup)

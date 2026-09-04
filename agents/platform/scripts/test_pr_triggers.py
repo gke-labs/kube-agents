@@ -40,6 +40,7 @@ import subprocess
 import sys
 import time
 import unittest
+import unittest.mock
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -602,6 +603,122 @@ class HandledNodeIdsTest(unittest.TestCase):
         self.assertEqual(
             pr_triggers.handled_node_ids([comment(SELF, built)], SELF), {"IC_9"}
         )
+
+
+SHA = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
+
+
+class UpdatedHeadShasTest(unittest.TestCase):
+    """The third marker: one update attempt against one head commit.
+
+    Keyed on a sha rather than a comment node id, because an update run is
+    triggered by the state of the branch and not by anything anyone said.
+    """
+
+    def test_a_self_authored_marker_records_an_attempt(self):
+        comments = [comment(SELF, f"Tried.\n\n<!-- agent-updated:{SHA} -->")]
+        self.assertEqual(pr_triggers.updated_head_shas(comments, SELF), {SHA})
+
+    def test_a_marker_pasted_by_someone_else_is_ignored(self):
+        """Otherwise anyone could stop the agent maintaining its own branch.
+
+        Worse: pasting five would spend the whole attempt budget in one
+        comment, and the agent would never touch the pull request again.
+        """
+        comments = [comment("attacker", f"<!-- agent-updated:{SHA} -->")]
+        self.assertEqual(pr_triggers.updated_head_shas(comments, SELF), set())
+
+    def test_the_answered_and_refused_markers_are_not_attempts(self):
+        """Three markers, three budgets. Counting across them spends the wrong
+        one, and a pull request with five answered comments would report its
+        update budget exhausted before a single update run had happened."""
+        comments = [
+            comment(SELF, "<!-- agent-answered:IC_1 -->"),
+            comment(SELF, "<!-- agent-refused:IC_2 -->"),
+        ]
+        self.assertEqual(pr_triggers.updated_head_shas(comments, SELF), set())
+
+    def test_an_update_marker_does_not_answer_a_request(self):
+        """The converse: the attempt marker must not close a reviewer's comment.
+
+        `handled_node_ids` reads answered and refused only, so an update run
+        that happens to name a sha cannot silence a request nobody replied to.
+        """
+        comments = [comment(SELF, f"<!-- agent-updated:{SHA} -->")]
+        self.assertEqual(pr_triggers.handled_node_ids(comments, SELF), set())
+
+    def test_each_attempt_is_counted_separately(self):
+        comments = [
+            comment(SELF, pr_triggers.marker("a" * 40, pr_triggers.UPDATED_MARKER)),
+            comment(SELF, pr_triggers.marker("b" * 40, pr_triggers.UPDATED_MARKER)),
+        ]
+        self.assertEqual(len(pr_triggers.updated_head_shas(comments, SELF)), 2)
+
+    def test_the_marker_builder_round_trips_through_the_scanner(self):
+        built = pr_triggers.marker(SHA, pr_triggers.UPDATED_MARKER)
+        self.assertEqual(
+            pr_triggers.updated_head_shas([comment(SELF, built)], SELF), {SHA}
+        )
+
+    def test_whitespace_inside_the_marker_is_tolerated(self):
+        comments = [comment(SELF, f"<!--  agent-updated : {SHA}  -->")]
+        self.assertEqual(pr_triggers.updated_head_shas(comments, SELF), {SHA})
+
+    def test_the_strip_removes_it_like_the_others(self):
+        """`update_pr.py record` strips the model's body before stamping.
+
+        A marker the model imitated becomes a real one the moment the comment
+        posts, and one naming a different sha records an attempt that never
+        happened.
+        """
+        stripped = pr_triggers.strip_markers(f"Done.\n<!-- agent-updated:{SHA} -->")
+        self.assertNotIn(SHA, stripped)
+        self.assertEqual(
+            pr_triggers.updated_head_shas([comment(SELF, stripped)], SELF), set()
+        )
+
+
+class MaxUpdateAttemptsTest(unittest.TestCase):
+    """The bound that makes an autonomous fix loop terminate.
+
+    Read here rather than in each caller because the `pr_updates` sweep and the
+    `update-pr` skill both count against it, and a budget each keeps its own
+    copy of is one the second can spend again.
+    """
+
+    def _with(self, value):
+        env = {} if value is None else {pr_triggers.MAX_UPDATE_ATTEMPTS_ENV: value}
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
+            return pr_triggers.max_update_attempts()
+
+    def test_unset_is_the_default(self):
+        self.assertEqual(self._with(None), pr_triggers.MAX_UPDATE_ATTEMPTS_DEFAULT)
+
+    def test_a_number_is_honoured(self):
+        self.assertEqual(self._with("2"), 2)
+
+    def test_zero_switches_the_sweep_off(self):
+        self.assertEqual(self._with("0"), 0)
+
+    def test_a_negative_value_clamps_to_zero_rather_than_inverting_the_bound(self):
+        self.assertEqual(self._with("-3"), 0)
+
+    def test_unparseable_falls_back_to_the_default(self):
+        """Not to zero and not to unbounded. A typo in a Helm value must not
+        silently switch the feature off, nor remove the bound that stops the
+        agent pushing to one branch forever."""
+        self.assertEqual(self._with("five"), pr_triggers.MAX_UPDATE_ATTEMPTS_DEFAULT)
+        self.assertEqual(self._with(""), pr_triggers.MAX_UPDATE_ATTEMPTS_DEFAULT)
+
+    def test_it_is_a_separate_budget_from_the_refusals(self):
+        with unittest.mock.patch.dict(
+            os.environ, {pr_triggers.MAX_REFUSALS_ENV: "1"}, clear=True
+        ):
+            self.assertEqual(pr_triggers.max_refusals_per_pr(), 1)
+            self.assertEqual(
+                pr_triggers.max_update_attempts(),
+                pr_triggers.MAX_UPDATE_ATTEMPTS_DEFAULT,
+            )
 
 
 class SlashPatternTest(unittest.TestCase):

@@ -139,6 +139,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
         "fleet-audit",
         "github-issue-resolver",
         "pr-conversation",
+        "update-pr",
     ],
 }
 

@@ -118,7 +118,8 @@ class SubmitSuggestionTestCase(unittest.TestCase):
 
         # `gh pr create` needs a GitHub. Record the call instead.
         self.gh_calls = []
-        self.patch_attr(submit_suggestion, "subprocess", _GhStub(self))
+        self.gh_stub = _GhStub(self)
+        self.patch_attr(submit_suggestion, "subprocess", self.gh_stub)
 
     def seed_origin(self) -> Path:
         origin = self.tmp_path / "origin.git"
@@ -154,15 +155,30 @@ class SubmitSuggestionTestCase(unittest.TestCase):
             submit_suggestion.dispatch(args)
         return json.loads(out.getvalue())
 
-    def submit(self, branch, workspace, lease=None, title="t", body="b"):
+    def submit(
+        self,
+        branch,
+        workspace,
+        lease=None,
+        title="t",
+        body="b",
+        body_file=None,
+        keep_description=False,
+    ):
         args = [
             "submit",
             "--branch", branch,
-            "--title", title,
-            "--body", body,
             "--workspace", str(workspace),
             "--repo", "acme/fleet",
         ]
+        if title is not None:
+            args += ["--title", title]
+        if body_file is not None:
+            args += ["--body-file", str(body_file)]
+        elif body is not None:
+            args += ["--body", body]
+        if keep_description:
+            args.append("--keep-description")
         if lease:
             args += ["--lease", lease]
         out = io.StringIO()
@@ -480,6 +496,93 @@ class TestSubmit(SubmitSuggestionTestCase):
         stub = submit_suggestion.subprocess
         self.assertEqual(stub.titles["platform-agent/fix-netpol"], "round two")
 
+    def test_keep_description_leaves_the_open_pull_requests_body_alone(self):
+        """`update-pr` is not re-describing the change; it is fixing a branch.
+
+        A conflict merge or a CI fix lands on a pull request that has been
+        under human review, and `submit`'s ordinary path overwrites the
+        description unconditionally. The loss is invisible — `submit` prints a
+        URL — and the only mitigation on offer otherwise is prose asking a
+        model to echo a multi-kilobyte markdown document back byte-for-byte.
+        """
+        payload = self.prepare()
+        self.commit(payload["workspace"])
+        authored = "## Context\n\nHand-written, with `backticks` and a list:\n- one\n"
+        first = self.submit(payload["branch"], payload["workspace"], body=authored)
+
+        again = self.prepare()
+        self.commit(again["workspace"], name="clusters/prod/netpol-v2.yaml")
+        second = self.submit(
+            again["branch"],
+            again["workspace"],
+            title=None,
+            body=None,
+            keep_description=True,
+        )
+
+        self.assertEqual(second, first)
+        self.assertEqual(self.gh_stub.bodies["platform-agent/fix-netpol"], authored)
+        self.assertEqual(self.gh_stub.titles["platform-agent/fix-netpol"], "t")
+        # The push still happened — this mode changes the description, nothing
+        # else — and no `pr edit` was issued at all.
+        self.assertIn(["pr", "create"], [argv[1:3] for argv, _ in self.gh_calls])
+        self.assertNotIn(["pr", "edit"], [argv[1:3] for argv, _ in self.gh_calls])
+
+    def test_keep_description_without_an_open_pull_request_says_so(self):
+        """There is no description to keep, so the flag is a caller error."""
+        payload = self.prepare()
+        self.commit(payload["workspace"])
+        with self.assertRaises(RuntimeError) as caught:
+            self.submit(
+                payload["branch"],
+                payload["workspace"],
+                title=None,
+                body=None,
+                keep_description=True,
+            )
+        self.assertIn("no pull request is open", str(caught.exception))
+        # The lookup itself is fine; what must not happen is falling through to
+        # a `create` with the empty title and body this mode allows.
+        verbs = [argv[1:3] for argv, _ in self.gh_calls]
+        self.assertEqual(verbs, [["pr", "view"]])
+
+    def test_a_description_without_keep_still_needs_a_title_and_a_body(self):
+        payload = self.prepare()
+        self.commit(payload["workspace"])
+        with self.assertRaises(ValueError) as caught:
+            self.submit(payload["branch"], payload["workspace"], title=None, body=None)
+        self.assertIn("--keep-description", str(caught.exception))
+
+    def test_a_body_survives_backticks_on_both_the_create_and_the_edit(self):
+        """argv is the wrong channel for a document a shell will see.
+
+        Inside double quotes bash expands backticks and `$(...)`, so a body
+        that reaches `gh` through a shell-built argv either loses its own text
+        or runs it. Every other body in this repository travels as a file —
+        `pr_conversation.py reply`, `update_pr.py record`, `pr_skill.post_body`
+        — and the pull request description was the one that did not.
+        """
+        hostile = "Fixes the `main` branch.\n\nRun `id` to check. $(whoami)\n"
+        path = Path(self.tmp_path) / "body.md"
+        path.write_text(hostile, encoding="utf-8")
+
+        payload = self.prepare()
+        self.commit(payload["workspace"])
+        self.submit(payload["branch"], payload["workspace"], body_file=path)
+        self.assertEqual(self.gh_stub.bodies["platform-agent/fix-netpol"], hostile)
+
+        again = self.prepare()
+        self.commit(again["workspace"], name="clusters/prod/netpol-v2.yaml")
+        self.submit(again["branch"], again["workspace"], body_file=path)
+        self.assertEqual(self.gh_stub.bodies["platform-agent/fix-netpol"], hostile)
+        # The edit hands it over as a file too, so the body never becomes a
+        # shell word on either path.
+        edits = [argv for argv, _ in self.gh_calls if argv[1:3] == ["pr", "edit"]]
+        self.assertTrue(edits)
+        for argv in edits:
+            self.assertIn("--body-file", argv)
+            self.assertNotIn("--body", argv)
+
     def test_a_gh_failure_that_is_not_an_existing_pr_still_raises(self):
         # The fallback must not swallow "not authenticated" or "base branch is
         # protected" — those are real failures and the run has to stop.
@@ -640,6 +743,16 @@ class _GhStub:
         self._test = test
         self.open_prs: dict[str, str] = {}
         self.titles: dict[str, str] = {}
+        self.bodies: dict[str, str] = {}
+
+    @staticmethod
+    def _body_of(argv):
+        """The description `gh` was handed, whichever channel carried it."""
+        if "--body-file" in argv:
+            return Path(argv[argv.index("--body-file") + 1]).read_text(
+                encoding="utf-8"
+            )
+        return argv[argv.index("--body") + 1]
 
     def __getattr__(self, name):
         return getattr(subprocess, name)
@@ -670,6 +783,7 @@ class _GhStub:
         url = f"https://github.com/acme/fleet/pull/{len(self.open_prs) + 1}"
         self.open_prs[branch] = url
         self.titles[branch] = argv[argv.index("--title") + 1]
+        self.bodies[branch] = self._body_of(argv)
         return subprocess.CompletedProcess(argv, 0, url + "\n", "")
 
     def _edit(self, argv):
@@ -677,6 +791,7 @@ class _GhStub:
         if branch not in self.open_prs:
             return subprocess.CompletedProcess(argv, 1, "", "no pull requests found\n")
         self.titles[branch] = argv[argv.index("--title") + 1]
+        self.bodies[branch] = self._body_of(argv)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     def _view(self, argv):

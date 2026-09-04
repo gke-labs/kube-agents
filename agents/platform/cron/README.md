@@ -42,9 +42,13 @@ nothing and relays nothing, and only a sweep that failed produces text.
 
 Adding a sweep is one line in `github_scan_gate.py`'s `SWEEPS` registry —
 `SWEEP_ORDER` is derived from it, so there is no second list to keep in step —
-not a new cron entry. The consequences of dispatching through a card are in
+not a new cron entry. Where in that registry is load-bearing, not cosmetic: the
+order sweeps are written in is the order they run, and `pr_updates` sits above
+`pr_comments` because it claims the pull requests it cards and the comment sweep
+passes over them. The consequences of dispatching through a card are in
 [`docs/designs/pr-comment-conversation.md`](../../../docs/designs/pr-comment-conversation.md) §2,
-and the env knobs that bound a sweep are in §§2 and 4 of the same document.
+and the env knobs that bound a sweep are in §§2 and 4 of that document and §4 of
+[`docs/designs/pr-update-sweep.md`](../../../docs/designs/pr-update-sweep.md).
 
 ## Never put an id on both rosters
 

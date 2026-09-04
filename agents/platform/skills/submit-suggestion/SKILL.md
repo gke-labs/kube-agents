@@ -119,19 +119,32 @@ credential configuration, branch push, and Pull Request creation. Pass **both**
 the `workspace` and the `lease` from Step 1 — the script verifies the lease on
 that tree is still yours and refuses outright if it belongs to another agent:
 
+Write the description to a file first and pass the path. Inside double quotes
+bash expands backticks and `$(...)`, and a pull request body is full of
+backticks — through `--body` a benign one silently deletes its own text and a
+hostile one runs in the leased clone, where a credentialed `git` and `gh` are
+on `PATH`:
+
 ```bash
+cat > /opt/data/scratch/pr_body.md <<'EOF'
+This Pull Request was generated automatically by the **Platform Agent** control plane.
+
+### 🚀 Functional Impact:
+<detailed_markdown_bulleted_impact_description>
+
+Please review the code diffs and merge this PR to trigger the GitOps CI/CD rollout!
+EOF
+
 python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py submit \
   --workspace "<workspace>" \
   --lease "<lease>" \
   --branch "platform-agent/<change_type>-<target_id>" \
   --title "<pr_title>" \
-  --body "This Pull Request was generated automatically by the **Platform Agent** control plane.
-
-### 🚀 Functional Impact:
-<detailed_markdown_bulleted_impact_description>
-
-Please review the code diffs and merge this PR to trigger the GitOps CI/CD rollout!"
+  --body-file /opt/data/scratch/pr_body.md
 ```
+
+The quoted `<<'EOF'` matters as much as `--body-file`: unquoted, the heredoc
+expands the same constructs the argument would have.
 
 `--lease` is not optional bookkeeping. `prepare` and `submit` are separate
 processes, and outside a kanban card there is no session identity for `submit`
@@ -168,6 +181,9 @@ When you are asked to **address review comments / reviewer feedback** on an exis
    `--branch <headRefName>` so the existing PR updates in place. `submit` pushes
    with `--force-with-lease`: it will update the branch your workspace fetched,
    and refuse rather than overwrite one somebody else has moved in the meantime.
+   Pass `--title` and `--body-file` again so the description matches the
+   commits now on the branch — or `--keep-description`, with neither, when the
+   change you were asked for does not alter what the pull request is for.
 4. **Reply on the PR** summarizing what changed (`gh pr comment <PR_NUMBER> --repo <owner/repo> --body "..."`), then relay a clean confirmation (PR URL + what you changed) back through your kanban result.
 
 Never ask the requester to paste the comment text — fetching it from GitHub and addressing it is your job.
