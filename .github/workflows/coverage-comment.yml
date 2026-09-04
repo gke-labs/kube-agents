@@ -1,8 +1,9 @@
 name: Coverage Comment
 
-# Posts the sticky coverage comment for python-tests.yml's coverage job.
+# Posts the sticky coverage comment for python-tests.yml's test job, which
+# measures coverage as it runs the suite.
 #
-# A separate workflow because of who runs where: the coverage job runs on the
+# A separate workflow because of who runs where: that job runs on the
 # pull request's own code with the PR's token, and in this repository every
 # PR comes from a fork, so that token is read-only and cannot comment. This
 # workflow runs on workflow_run in the base repository's context, where the
@@ -37,7 +38,9 @@ jobs:
     name: Post the coverage comment
     runs-on: ubuntu-latest
     # Only runs that were pull requests carry a report; pushes to main run
-    # the same workflow but the coverage job skips itself there. The
+    # the same workflow, but its diff-cover and hand-off steps skip
+    # themselves there, so its artifact carries no report and no PR
+    # number. The
     # repository check keeps this credentialed workflow from self-starting
     # on forks of this repository (AGENTS.md convention).
     if: github.event.workflow_run.event == 'pull_request' && github.repository == 'gke-labs/kube-agents'

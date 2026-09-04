@@ -43,6 +43,31 @@ JOB_COUNTS = (1, 2)
 FAILED_MARKER = "SWEEP-FAILED:"
 SWEEP_TIMEOUT_SECONDS = 300
 
+
+def _has_coverage():
+    """Whether `make coverage` can get past `coverage run` at all.
+
+    Asked of `python3` by subprocess rather than with an import, because that
+    is the interpreter the Makefile invokes -- this test may be running under
+    a different one.
+
+    Everything above needs only make and python3, which is what lets
+    agent-startup-test.yml run this file with pyyaml as its single dependency,
+    deliberately, so the tests run anywhere the agent image does. The coverage
+    cases below need the package too. Without this they do not fail honestly
+    there: the strict case asserts a non-zero exit and gets one from the
+    missing package rather than from the gate, so it passes while testing
+    nothing. The `test` job installs requirements-test.txt, which is the job
+    whose verdict the gate controls and where these must not skip.
+    """
+    return (
+        subprocess.run(
+            ["python3", "-m", "coverage", "--version"],
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+
 #: A target that runs the sweep over a trivial command and reports the one
 #: thing the macro promises its callers: what `$failed` holds afterwards.
 PROBE_MAKEFILE = f"""\
@@ -129,6 +154,82 @@ class TestPythonExitStatusTest(unittest.TestCase):
         )
         self.assertNotEqual(0, done.returncode, done.stdout + done.stderr)
         self.assertIn(MISSING_DIR, done.stdout.split("Failing test directories:")[-1])
+
+
+@unittest.skipUnless(_has_coverage(), "the coverage package is not installed")
+class CoverageStrictTest(unittest.TestCase):
+    """`make coverage COVERAGE_STRICT=1` turns the same `$failed` into an exit.
+
+    The argument is TestPythonExitStatusTest's, for the other caller of the
+    sweep. It matters more here: `coverage` is the target CI's required job
+    runs, and the target tolerates a failing directory by default -- it is the
+    meter, and one red directory must not hide the number for the rest. Strict
+    mode is the only thing making a red suite a red check, so an unnoticed
+    regression in it reports success on failing tests.
+
+    Two cases rather than four, because each one that reaches the end of the
+    target costs about nine seconds -- `coverage xml` and `coverage report`
+    walk the source tree whether or not the sweep produced any data, and
+    tests/ is already one of the slower directories in the sweep these run
+    inside. The pair below pins the gate to the flag in both directions. The
+    third case, strict mode passing on a green sweep, is what every green run
+    of the CI job already demonstrates, so buying it again here is nine
+    seconds for nothing.
+    """
+
+    #: Emptying it skips the target's missing-import preflight, which starts one
+    #: interpreter per entry -- pure cost here, since the sweep runs no tests.
+    NO_PREFLIGHT = "PYTHON_TEST_IMPORTS="
+
+    def _coverage(self, strict, dirs=(EMPTY_DIR, MISSING_DIR)):
+        # Every output path is redirected into a temp directory. tests/ is a
+        # PYTHON_TEST_DIR, so under CI this runs *inside* `make coverage`, and
+        # with the defaults the nested run's `rm -rf` would delete the outer
+        # run's data mid-sweep.
+        #
+        # Under the repository root, and COVERAGE_DIR passed relative to it,
+        # because the target composes `$(CURDIR)/$(COVERAGE_DIR)`: an absolute
+        # path there is concatenated rather than used, so /tmp/x becomes
+        # <repo>/tmp/x and the data lands in the working tree. It does that
+        # quietly -- the run still passes.
+        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as out:
+            relative = pathlib.Path(out).relative_to(REPO_ROOT)
+            return _run_make(
+                [
+                    "coverage",
+                    f"PYTHON_TEST_DIRS={' '.join(dirs)}",
+                    f"PYTHON_TEST_JOBS={max(JOB_COUNTS)}",
+                    f"COVERAGE_STRICT={strict}",
+                    "COVERAGE_SKIP_GO=1",
+                    self.NO_PREFLIGHT,
+                    f"COVERAGE_DIR={relative}/data",
+                    f"COVERAGE_XML={out}/coverage.xml",
+                    f"COVERAGE_GO_XML={out}/coverage-go.xml",
+                ]
+            )
+
+    def test_strict_fails_when_a_directory_fails(self):
+        done = self._coverage(1)
+        self.assertNotEqual(0, done.returncode, done.stdout + done.stderr)
+        self.assertIn(MISSING_DIR, done.stdout.split("FAIL (COVERAGE_STRICT=1)")[-1])
+
+    def test_the_default_still_reports_the_number_on_a_red_directory(self):
+        # The other direction. Strict mode is opt-in precisely so a local run
+        # against a tree with known-red directories still prints a total.
+        done = self._coverage(0)
+        self.assertEqual(0, done.returncode, done.stdout + done.stderr)
+        self.assertIn("TOTAL", done.stdout)
+
+    def test_a_value_that_is_neither_0_nor_1_is_refused(self):
+        # Not guessed. Every truthy-looking spelling reads as "not 1" to the
+        # gate, which turns it off silently -- the one failure the flag exists
+        # to prevent. Refusing costs a typo'd run; guessing costs the gate.
+        done = self._coverage("true")
+        self.assertNotEqual(0, done.returncode, done.stdout + done.stderr)
+        self.assertIn("COVERAGE_STRICT must be 0 or 1", done.stdout)
+        # And before the sweep, not after it: validated at the top of the
+        # target so a typo does not cost the whole suite first.
+        self.assertNotIn(f"==> {EMPTY_DIR}", done.stdout)
 
 
 if __name__ == "__main__":

@@ -211,10 +211,12 @@ spec:
       containers:
         - name: postgresql
           # pgvector supplies the vector extension Hindsight's embeddings need.
-          # Pinned by digest in values (from images.json): upstream publishes
-          # only a floating `latest`, so without the pin a pod reschedule can
-          # silently change the database engine. A mirrored install pulls the
-          # copy by tag, because that is what `make mirror-images` pushes.
+          # Pinned by digest in values (from images.json): upstream rebuilds a
+          # version tag in place when the Postgres base is patched, so without
+          # the pin a pod reschedule can move the database to a Postgres minor
+          # nobody chose. A mirrored install pulls the copy by tag, because that
+          # is what `make mirror-images` pushes. Before changing the tag, read
+          # the constraints on it in images.json, which is where they live.
           image: {{ include "kube-agents.thirdPartyImage" (dict "repository" .Values.hindsight.postgresql.image.repository "tag" .Values.hindsight.postgresql.image.tag "name" "hindsight-postgresql" "root" .) }}
           imagePullPolicy: {{ .Values.hindsight.postgresql.image.pullPolicy }}
           ports:

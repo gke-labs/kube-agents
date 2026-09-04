@@ -245,6 +245,10 @@ publish_eval_dashboard() {
     echo "eval-dashboard publish skipped: PULL_NUMBER=${PULL_NUMBER} is set: a pull request never writes the dashboard"
     return 0
   fi
+  if [ -n "${RC_COMMIT_SHA:-}" ]; then
+    echo "eval-dashboard publish skipped: RC_COMMIT_SHA=${RC_COMMIT_SHA} is set: a release-candidate run measures a candidate, it does not report main's history"
+    return 0
+  fi
   if [ -z "${EVAL_DASHBOARD_TARGET:-}" ]; then
     echo "eval-dashboard publish skipped: EVAL_DASHBOARD_TARGET is not set (the Prow job config arms this later)"
     return 0
@@ -949,7 +953,7 @@ TASKS=(
   # this array calls a case that can only fail.
   # Uncomment when the agent can diagnose a capped pool, not before.
   # "./tasks/cluster-agent-pending-replicas-capped-pool/task.yaml"
-  "./tasks/gpu-stress-test-diagnosis/task.yaml"
+  # gpu-stress-test-diagnosis: moved to NIGHTLY_TASKS 2026-09-03 (tofu wall clock, #1218/#1202).
   "./tasks/agent-kanban-smoke/task.yaml"
   # Last, because it is the only entry that pays twice. Its stack plants an
   # OOM-killed workload on the host cluster and blocks until the event
@@ -961,7 +965,7 @@ TASKS=(
   # It provisions no cluster despite being deployer: tofu -- see the header of
   # bench/tf/prebuilt/autoops-incident/main.tf for why it cannot, and why it
   # is the host cluster and not the per-run one that gets the incident.
-  "./tasks/autoops-warning-event-triage/task.yaml"
+  # autoops-warning-event-triage: moved to NIGHTLY_TASKS 2026-09-03 (tofu wall clock, #1218/#1202).
   # Five registered scenarios stay commented out, and five more run in the
   # nightly tier only -- NIGHTLY_TASKS below; the task-registration lint
   # reads both arrays. A commented entry here counts as registered, so a
@@ -1122,6 +1126,14 @@ NIGHTLY_TASKS=(
   # Superseded in presubmit by reliability-pdb-probe (same planted defect,
   # same question), not by any doubt: 1.0 on #984's live validation.
   "./tasks/obtainability-direct-query/task.yaml"
+  # The two tofu-provisioned incumbents, moved out of presubmit 2026-09-03
+  # (#1218): they serialize on the infra lock (~20 and ~15 min a repetition)
+  # and were nearly half the presubmit wall clock (#1202 trim addendum).
+  # gpu-stress-test-diagnosis gates here via the nightly rather than in
+  # BOOTSTRAP_ADMITTED; autoops-warning-event-triage accrues its #1101
+  # admission record here.
+  "./tasks/gpu-stress-test-diagnosis/task.yaml"
+  "./tasks/autoops-warning-event-triage/task.yaml"
 )
 
 # Which matrix this run gets. "presubmit" -- the default, and what every
@@ -1313,10 +1325,13 @@ print(m.group(1).strip('\'\"') if m else '')
 #     failure is correlated across repetitions when the agent chooses to
 #     fan out, so the collapse rule does not absorb it. Enters when the
 #     fix merges.
-#   cluster-agent-healthy-workload-no-finding -- #1100: the agent invents
-#     a finding on a healthy workload ~1 run in 8. Main's own trait, so a
-#     collapse would tax an innocent PR. Enters when the false-positive
-#     rate drops or when rung-6 screening can compare against main.
+#   cluster-agent-healthy-workload-no-finding -- #1010: the delegation
+#     receipt is graded as the answer, 51 of 156 recorded repetitions.
+#     #1100 held this seat until its own sweep closed it: the agent
+#     invents nothing here, so the false-positive premise is gone and
+#     the reason for the hold is not. Still main's own trait, so a
+#     collapse would tax an innocent PR. Enters when #1010's fix merges
+#     or when rung-6 screening can compare against main.
 #   autoops-warning-event-triage          -- #1101: 0/5 graded repetitions
 #     on record; admitting it reds every pull request today. Enters when
 #     the lettered-options bar is settled and it has a clean record.
@@ -1351,7 +1366,7 @@ print(m.group(1).strip('\'\"') if m else '')
 # agent-kanban-smoke earned its seat back after the 08-27 redesign (a real
 # SRE question graded on kanban_create plus cluster names); the reds that
 # once argued for un-arming it belonged to the old vocabulary check.
-export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,cluster-agent-crashloop-debug,cluster-agent-crashloop-misleading-symptom,cluster-agent-crashloop-evidence-chain,gpu-stress-test-diagnosis,agent-kanban-smoke}"
+export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,cluster-agent-crashloop-debug,cluster-agent-crashloop-misleading-symptom,cluster-agent-crashloop-evidence-chain,agent-kanban-smoke}"
 
 # Where the evidence itself lives. Unset means bench/baselines/ in the
 # checkout: hermetic, no credential, no network -- and no way for this job to
@@ -1650,10 +1665,23 @@ profile_begin "record + final gate"
 # closes. Unset, the store is the git checkout and this job has no push
 # credential, so the append dies with the workspace; --lines-out is what
 # survives, as a Prow artefact somebody lands by hand in the meantime.
+#
+# RC_COMMIT_SHA is the third condition and the one that is not about pull
+# requests. A release-candidate eval is a periodic with no PULL_NUMBER, so it
+# satisfies the two conditions above exactly, and without this it would file the
+# candidate's results as main's. That is not a mistake anybody can undo later:
+# VersionKey in bench/kube_agents_bench/baselines.py is setup_id,
+# scoring_version, judge_model, fleet and verifiers, with no field naming the
+# build a sample came from, so an RC record and a main record are the same
+# record once written. The candidate would then be measured for non-inferiority
+# against a window it had just moved.
 case "${JOB_TYPE:-}" in
   postsubmit | periodic) EVAL_IS_MAIN_RUN="true" ;;
   *) EVAL_IS_MAIN_RUN="false" ;;
 esac
+if [ -n "${RC_COMMIT_SHA:-}" ]; then
+  EVAL_IS_MAIN_RUN="false"
+fi
 if [ "${EVAL_IS_MAIN_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then
   echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Recording baseline evidence from main <<<"
   # Never fatal. Bookkeeping must not be the reason a merge to main reds.
@@ -1661,6 +1689,8 @@ if [ "${EVAL_IS_MAIN_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then
     "${CASE_RESULTS[@]}" \
     --lines-out "${ARTIFACT_DIR}/baseline-append.jsonl") || \
     echo "WARNING: recording baseline evidence failed; the verdict below is unaffected."
+elif [ -n "${RC_COMMIT_SHA:-}" ]; then
+  echo "Release-candidate run (RC_COMMIT_SHA=${RC_COMMIT_SHA}): the baseline store is read, never written — the candidate is judged against main's window, not added to it."
 else
   echo "Not a main-branch recorder run (JOB_TYPE=${JOB_TYPE:-unset}): the baseline store is read, never written."
 fi

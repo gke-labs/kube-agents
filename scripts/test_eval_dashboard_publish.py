@@ -49,6 +49,7 @@ def run_hook(
     pull_number: str = "",
     artifacts: str = "",
     timeout_s: str = "",
+    rc_commit_sha: str = "",
 ) -> subprocess.CompletedProcess:
     """Exit a `set -euo pipefail` shell with `exit_code`, real trap installed.
 
@@ -64,6 +65,7 @@ def run_hook(
             f'SCRIPT_DIR="{script_dir}"',
             f'export JOB_TYPE="{job_type}"',
             f'export PULL_NUMBER="{pull_number}"',
+            f'export RC_COMMIT_SHA="{rc_commit_sha}"',
             # Always pinned: the suite itself runs under Prow, where a real
             # $ARTIFACTS is set, and the hook copies its log there.
             f'export ARTIFACTS="{artifacts}"',
@@ -162,6 +164,29 @@ class PublishHookFailSafeTest(unittest.TestCase):
                     pull_number="1043",
                 )
                 self.assert_skipped_once(result, code, "PULL_NUMBER=1043")
+
+    def test_a_release_candidate_run_never_publishes(self):
+        """An RC eval is a periodic with no PULL_NUMBER -- the exact shape the
+        two gates above let through. It measures a candidate rather than main's
+        history, so publishing from one would overwrite the dashboard everyone
+        reads with a run about a different artefact."""
+        marker = (
+            "import pathlib, sys\n"
+            "pathlib.Path(sys.path[0], 'collect.py.ran').touch()\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_hack = dashboard_stubs(pathlib.Path(tmp), marker)
+            for code in (0, 7):
+                result = run_hook(
+                    code,
+                    fake_hack,
+                    target="gs://kube-agents-dashboards/evals/",
+                    job_type="periodic",
+                    rc_commit_sha="b4ee5f3eb9c2aceb7f03460d2e573278ab9483fe",
+                )
+                self.assert_skipped_once(result, code, "RC_COMMIT_SHA=")
+            dash = pathlib.Path(tmp) / "scripts" / "eval_dashboard"
+            self.assertEqual(list(dash.glob("*.ran")), [])
 
     def test_missing_collect_py_skips_fast_and_preserves_the_exit_code(self):
         """This PR may merge before the siblings that add scripts/eval_dashboard/."""

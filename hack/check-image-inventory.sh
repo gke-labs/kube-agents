@@ -162,9 +162,12 @@ chart_images() {
 # Split a reference into repository and tag. The digest, if any, goes first;
 # the tag is then the part after a colon in the final path segment, so a
 # registry port (host:5000/name) is not mistaken for one. ref_pin keeps the
-# digest (tag@sha256:...), because that is the form images.json pins
-# digest-only upstreams with (hindsight-postgresql) and what the chart's
-# default render must match byte for byte.
+# digest (tag@sha256:...), because that is the form images.json pins a tag and
+# a digest together with and what the chart's default render must match byte for
+# byte. Of the entries this function sees — the ones a chart render emits — that
+# is hindsight-api and hindsight-postgresql; images.json pins two more the same
+# way (busybox and, through tags.env, the Hermes base), but both are build-time
+# and never appear in a render.
 split_ref() {
   local ref=${1%%@*} digest=""
   case "$1" in
@@ -227,7 +230,7 @@ done <<<"$mirrored_images"
 #     rule by taking the repository's trailing path segment, and
 #     kube-agents.thirdPartyImage takes the real name explicitly for the
 #     entries where the two differ (hindsight-postgresql is
-#     docker.io/ankane/pgvector). So the check reads the mirrored render
+#     docker.io/pgvector/pgvector). So the check reads the mirrored render
 #     directly: every image under the mirror prefix must sit at a name the
 #     inventory carries, or it points at a path 'make mirror-images' never
 #     pushed to and the install fails at pull time on the one path this

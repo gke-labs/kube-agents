@@ -21,8 +21,8 @@ Two things follow from that, and both bite people who do not know them:
   compiles and runs the real Go client from `k8s-operator/cmd/k8s-event-watcher`
   against the live Python server, and the whole class is `skipUnless(GO)`. Without
   `go` on `PATH` those four tests skip and the run still prints `OK`, which is
-  indistinguishable from having run them. CI's `test` and `coverage` jobs both set
-  up Go for exactly this reason.
+  indistinguishable from having run them. CI's `test` job sets up Go for exactly
+  this reason.
 - **An `expectedFailure` that starts passing now fails the build.** That is the
   design, not an accident: the pins below assert the contract we want, so the day
   the product code satisfies one, unittest reports an unexpected success and the

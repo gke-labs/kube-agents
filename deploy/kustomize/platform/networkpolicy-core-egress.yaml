@@ -33,6 +33,19 @@ spec:
               k8s-app: node-local-dns
         - ipBlock:
             cidr: 169.254.20.10/32
+        # Cloud DNS for GKE resolves at the metadata address rather than through
+        # kube-dns: a Pod's resolv.conf names 169.254.169.254, so none of the
+        # peers above is the resolver and none of the blocks below reaches it —
+        # the 0.0.0.0/0 peer excepts the whole 169.254.0.0/16 range. Port 53
+        # only; rule 2 grants the same host TCP 80 for token fetches, and the
+        # two stay separate rules so neither widens the other. On a kube-dns
+        # cluster the peer carries no traffic, but it is not inert: GKE's
+        # metadata interception rewrites TCP 80 and 8080, not 53, so the address
+        # answers DNS from the node's GCE resolver unless gke-metadata-server or
+        # metadata concealment is intercepting. That reaches a resolver, not the
+        # token API, which is HTTP on 80 pre-NAT and 988 post-NAT.
+        - ipBlock:
+            cidr: 169.254.169.254/32
         - ipBlock:
             cidr: 10.96.0.10/32
         # Cluster DNS answers on the kube-dns Service ClusterIP, which a static

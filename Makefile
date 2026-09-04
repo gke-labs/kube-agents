@@ -144,6 +144,20 @@ PYTHON_TEST_DIRS := $(sort $(dir \
 	$(wildcard tests/test_*.py) \
 	$(wildcard tests/memory/test_*.py)))
 
+# What both callers of the sweep below -- test-python and coverage -- export as
+# PYTHONPATH, prepended to whatever the caller already has. Declared once
+# because the two had already drifted: coverage exported only $(CURDIR), so it
+# resolved imports differently from the suite it claims to mirror. Nothing
+# depended on the difference yet, which is exactly why it went unnoticed -- the
+# coverage target tolerates a failing directory, so a test that needed the
+# missing entries would have been swallowed by the "failing test directories"
+# note. Now that the same run produces the required verdict, that drift would
+# read as a test that passes locally under `make test-python` and fails in CI.
+#
+# Sharing the sweep made the discovery structural; this makes the environment it
+# runs in structural too, which is the other half of measuring the same suite.
+PYTHON_TEST_PATH := $(CURDIR):$(CURDIR)/agentplugins/lib:$(CURDIR)/agentplugins/pubsub-platform
+
 # How many of those directories `test-python` and `coverage` run at once. They
 # are separate `python3` processes that share nothing -- each cd's into its own
 # directory, servers in the seam tier bind port 0, and fixtures go through
@@ -251,6 +265,9 @@ verify: ## Run everything a PR must pass offline: go build, go vet, go test, pyt
 	@echo "==> go build"; cd k8s-operator && go build ./...
 	@echo "==> go vet";   cd k8s-operator && go vet ./...
 	@echo "==> go test";  cd k8s-operator && go test ./...
+	@echo "==> go build (a2a)"; cd a2a && go build ./...
+	@echo "==> go vet (a2a)";   cd a2a && go vet ./...
+	@echo "==> go test (a2a)";  cd a2a && go test ./...
 	@echo "==> python (k8s-operator)"; $(MAKE) --no-print-directory -C k8s-operator test-python
 	@echo "==> python (everything else)"; $(MAKE) --no-print-directory test-python
 	@echo "==> verify OK"
@@ -288,7 +305,7 @@ test-python: ## Run the Python unit tests outside k8s-operator/.
 # hides an untested directory is not.
 #
 # Both survive the move to concurrency; sweep_python_test_dirs says how.
-	@export PYTHONPATH="$(CURDIR):$(CURDIR)/agentplugins/lib:$(CURDIR)/agentplugins/pubsub-platform:$${PYTHONPATH:-}"; \
+	@export PYTHONPATH="$(PYTHON_TEST_PATH):$${PYTHONPATH:-}"; \
 	$(call sweep_python_test_dirs,python3 -m unittest discover -p "test_*.py"); \
 	missing=""; \
 	for mod in $(PYTHON_TEST_IMPORTS); do \
@@ -310,34 +327,80 @@ test-python: ## Run the Python unit tests outside k8s-operator/.
 # pins the measured tree to the repository root (the sweep cd's into each
 # directory, and .coveragerc reads the variable because `source` cannot be
 # relative from seventeen places), and COVERAGE_FILE parks every per-directory
-# data file in one place for `coverage combine`. Failing directories are
-# reported but do not stop the measurement: test-python is the gate, this is the
-# meter, and the 13 pre-existing failures must not hide the number for the other
-# directories.
+# data file in one place for `coverage combine`. By default a failing directory
+# is reported but does not stop the measurement, so a red directory cannot hide
+# the number for the others.
 #
 # Concurrency needs nothing extra here: .coveragerc already sets parallel = True,
 # so each process writes its own data file suffixed with host and pid and the
 # `coverage combine` below merges them. That setting was there for the
 # per-directory loop, and it is the same property concurrent directories need.
+#
+# COVERAGE_STRICT=1 makes the target fail at the end when any directory failed,
+# which is what lets one run serve as both the verdict and the meter. CI's
+# required job sets it, so a pull request pays for the 5638 tests once instead
+# of running them again unmeasured in a second job. The default stays 0 because
+# a local run against a tree with known-red directories should still print a
+# total. The failing list travels through a file because each recipe line is its
+# own shell: the sweep leaves `$$failed` set in the shell that called it, and
+# the check at the bottom of the target runs in a different one.
 COVERAGE_DIR := .coverage-data
+COVERAGE_STRICT ?= 0
+COVERAGE_FAILED_FILE := failed-dirs.txt
+# Named rather than written literally in the four places below so a test can
+# point one run's output somewhere else. tests/ is itself a PYTHON_TEST_DIR, so
+# a test that invoked this target with the defaults would `rm -rf` the data
+# directory of the very sweep it is running inside -- concurrently, and with no
+# error, leaving the outer run to combine whatever survived.
+COVERAGE_XML ?= coverage.xml
+COVERAGE_GO_XML ?= coverage-go.xml
 
 coverage: ## Measure unit-test coverage; writes coverage.xml (and coverage-go.xml when tooling allows).
-	@rm -rf $(COVERAGE_DIR) coverage.xml coverage-go.xml
+	@rm -rf $(COVERAGE_DIR) $(COVERAGE_XML) $(COVERAGE_GO_XML)
 	@mkdir -p $(COVERAGE_DIR)
 	@if [ -z "$(strip $(PYTHON_TEST_DIRS))" ]; then \
 		echo "ERROR: PYTHON_TEST_DIRS expanded to nothing; the globs above are stale."; \
 		exit 1; \
 	fi
+# Validated here rather than beside the gate it controls, which runs last: a
+# typo would otherwise cost the whole suite before saying so. Anything but 0 or
+# 1 is refused instead of guessed -- every truthy-looking spelling (true, yes,
+# on) reads as "not 1" to the test below, which turns the gate off silently and
+# is the one failure this flag exists to prevent.
+	@case "$(COVERAGE_STRICT)" in \
+		0|1) ;; \
+		*) echo "ERROR: COVERAGE_STRICT must be 0 or 1, got '$(COVERAGE_STRICT)'."; \
+		   exit 1;; \
+	esac
+# The same preflight test-python runs, and here for the same reason: a missing
+# package surfaces as an ImportError inside one directory's discovery, where it
+# reads like a broken test rather than a missing install. Duplicated rather than
+# factored out because a `define` would have to be expanded by both targets and
+# the indirection costs more than the six lines. A warning, not a hard stop --
+# the sweep's own exit status is what fails the run. It also keeps
+# PYTHON_TEST_IMPORTS exercised by CI: this target is the one CI invokes, so
+# without this the list could drift out of step with requirements-test.txt and
+# nothing would notice.
+	@missing=""; \
+	for mod in $(PYTHON_TEST_IMPORTS); do \
+		python3 -c "import $$mod" >/dev/null 2>&1 || missing="$$missing $$mod"; \
+	done; \
+	if [ -n "$$missing" ]; then \
+		echo "Warning: missing third-party imports:$$missing"; \
+		echo "         Install them with:  make test-python-deps"; \
+		echo; \
+	fi
 	@export COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage; \
-	export PYTHONPATH="$(CURDIR):$${PYTHONPATH:-}"; \
+	export PYTHONPATH="$(PYTHON_TEST_PATH):$${PYTHONPATH:-}"; \
 	$(call sweep_python_test_dirs,python3 -m coverage run --rcfile=$(CURDIR)/.coveragerc -m unittest discover -p "test_*.py"); \
 	if [ -n "$$failed" ]; then \
 		echo "Note: failing test directories (their coverage is still recorded): $$failed"; \
-	fi
+	fi; \
+	printf '%s' "$$failed" > $(COVERAGE_DIR)/$(COVERAGE_FAILED_FILE)
 	@COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage \
 		python3 -m coverage combine --rcfile=$(CURDIR)/.coveragerc
 	@COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage \
-		python3 -m coverage xml --rcfile=$(CURDIR)/.coveragerc -o coverage.xml
+		python3 -m coverage xml --rcfile=$(CURDIR)/.coveragerc -o $(COVERAGE_XML)
 	@COVERAGE_ROOT=$(CURDIR) COVERAGE_FILE=$(CURDIR)/$(COVERAGE_DIR)/.coverage \
 		python3 -m coverage report --rcfile=$(CURDIR)/.coveragerc | grep '^TOTAL'
 # The Go half is best-effort: it needs gocover-cobertura for the XML diff-cover
@@ -359,7 +422,7 @@ coverage: ## Measure unit-test coverage; writes coverage.xml (and coverage-go.xm
 			test -n "$$KUBEBUILDER_ASSETS" && \
 			KUBEBUILDER_ASSETS="$$KUBEBUILDER_ASSETS" \
 			go test -coverpkg=./... $$(go list ./... | grep -v /e2e) -coverprofile=$(CURDIR)/$(COVERAGE_DIR)/go-cover.out && \
-			gocover-cobertura < $(CURDIR)/$(COVERAGE_DIR)/go-cover.out > $(CURDIR)/coverage-go.xml) \
+			gocover-cobertura < $(CURDIR)/$(COVERAGE_DIR)/go-cover.out > $(COVERAGE_GO_XML)) \
 		|| echo "Go coverage failed; the Python half above is unaffected."; \
 	fi
 # The envtest version is read from k8s-operator/Makefile's own pin rather than
@@ -367,10 +430,18 @@ coverage: ## Measure unit-test coverage; writes coverage.xml (and coverage-go.xm
 # operator's 1.36.0), and the empty-string failure mode -- setup-envtest
 # failing, KUBEBUILDER_ASSETS="" exported, every suite red, all of it
 # swallowed by the || echo above -- is why both reads are guarded with test -n.
+#
+# The strict gate, last in the target on purpose: combine, xml and report have
+# all run by the time it fails, so a red run still leaves coverage.xml on disk
+# for the CI job to upload and the coverage comment to be posted from.
+	@if [ "$(COVERAGE_STRICT)" = "1" ] && [ -s $(COVERAGE_DIR)/$(COVERAGE_FAILED_FILE) ]; then \
+		echo "FAIL (COVERAGE_STRICT=1) -- failing test directories: $$(cat $(COVERAGE_DIR)/$(COVERAGE_FAILED_FILE))"; \
+		exit 1; \
+	fi
 
-# 55 is a deliberately loose placeholder: the real floor gets committed from
-# the first green CI run of the coverage job, not from a laptop measurement,
-# because CI's Python and dependency set produce a different number.
+# 55 is a deliberately loose placeholder: the real floor gets committed from the
+# first green CI run of the `test` job's coverage sweep, not from a laptop
+# measurement, because CI's Python and dependency set produce a different number.
 COVERAGE_FLOOR ?= 55
 
 coverage-check: ## Fail if total Python coverage is below COVERAGE_FLOOR. Run `make coverage` first.
@@ -423,7 +494,7 @@ bench-case-check: ## Validate every bench task.yaml against the case-format cont
 # Install a Go toolchain before trusting a green run here: the injector seam
 # compiles the real Go client, and without `go` on PATH it skips itself rather
 # than failing, which reads exactly like a pass.
-test-integration: ## Run just the integration seam tests; CI reaches them through `make test-python`.
+test-integration: ## Run just the integration seam tests; CI reaches them through the PYTHON_TEST_DIRS sweep.
 	@cd tests/integration && PYTHONPATH="$(CURDIR):$${PYTHONPATH:-}" python3 -m unittest discover -p "test_*.py"
 
 # The agent's own instructions are prose, and prose is not compiled: a persona

@@ -124,7 +124,7 @@ The trailing segment is a stand-in for the real rule. mirror_images.sh names
 each destination after the images.json entry's .name, and a chart cannot read
 images.json at render time, so this reproduces it by convention rather than by
 lookup. An image whose inventory name differs from its trailing segment
-(hindsight-postgresql is docker.io/ankane/pgvector) cannot use this helper —
+(hindsight-postgresql is docker.io/pgvector/pgvector) cannot use this helper —
 kube-agents.thirdPartyImage below takes the real name explicitly. Check 3c in
 hack/check-image-inventory.sh fails the build when a rendered mirror name is
 not an inventory name, which is what keeps the shortcut safe.
@@ -153,7 +153,7 @@ digest and all.
 `name` is the images.json entry name, which is what mirror_images.sh names the
 destination; it defaults to the repository's trailing segment, the common case
 where the two agree. Passing it explicitly is what lets an image like
-hindsight-postgresql (docker.io/ankane/pgvector) render correctly under a
+hindsight-postgresql (docker.io/pgvector/pgvector) render correctly under a
 mirror.
 
 Takes a dict: {repository, tag, name (optional), root (the root context)}.

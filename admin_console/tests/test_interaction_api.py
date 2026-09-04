@@ -768,9 +768,22 @@ class InteractionApiTest(unittest.TestCase):
             completed = service.wait(interaction.interaction_id, timeout=2)
             self.assertEqual(completed.status, InteractionStatus.COMPLETED)
 
-            reopened = SQLiteInteractionStore(path)
+            # wait() returns as soon as the interaction is terminal, and
+            # _run_root makes that status transition before it appends the
+            # completion event, so the event can still be in flight here. Poll
+            # for it rather than reading once -- the same deadline idiom as
+            # _await_terminal above. Reading once left the last event as
+            # tasks.observed under load, roughly one run in ten.
+            deadline = time.monotonic() + 2
+            events = []
+            while time.monotonic() < deadline:
+                reopened = SQLiteInteractionStore(path)
+                events = reopened.events_after(interaction.interaction_id)
+                if events and events[-1].event == "interaction.completed":
+                    break
+                time.sleep(0.005)
+
             persisted = reopened.get(interaction.interaction_id)
-            events = reopened.events_after(interaction.interaction_id)
 
             self.assertEqual(persisted.output, "The cluster is healthy.")
             self.assertEqual(persisted.tool_calls[0].name, "kanban_create")

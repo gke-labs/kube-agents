@@ -595,10 +595,41 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # gets.
 # See the module docstring in
 # deploy/docker/patches/apply_google_chat_attachment_notice.py.
+#
+# Slack: ask for the reactions scope the adapter already spends. `hermes slack
+# manifest` is the only description of the Slack app an installer ever writes --
+# the operator pastes that JSON in and clicks Save -- and its bot_scopes list
+# grants reactions:read and stops. The adapter calls reactions.add three times
+# (eyes on pickup, white_check_mark/x on the outcome) and reactions.remove once,
+# all of which need reactions:write, so Slack answers every one missing_scope
+# and no kube-agents install has ever shown a reaction. The manifest is
+# self-inconsistent rather than merely short: it already subscribes to
+# reaction_added and reaction_removed, so the app it describes is built to hear
+# reactions and not to make any.
+#
+# Nothing surfaces the failure. _add_reaction logs at debug with a comment that
+# names this exact case ("may fail if already reacted or missing scope"),
+# neither caller reads the False it returns, and the turn otherwise succeeds --
+# a dead feature is indistinguishable from a slow agent. SLACK_REACTIONS
+# defaults to true, so it is enabled everywhere and works nowhere.
+#
+# A grep guard is not enough on its own here either. _build_full_manifest
+# appends to bot_scopes on two of its three messaging_experience branches and
+# sorts before emitting, so the element being in the source says nothing about
+# the JSON that gets pasted. verify_slack_reactions_scope.py calls the real
+# function once per branch and reads the scope out of the manifest it returns,
+# and fails the build the other way too -- if upstream drops the reaction calls,
+# the patch is widening the app's permissions for nothing.
+#
+# Rides this COPY and RUN for the same budget reason as the block above.
+# See the module docstring in
+# deploy/docker/patches/apply_slack_reactions_scope.py.
 COPY deploy/docker/patches/apply_slack_code_emphasis.py \
      deploy/docker/patches/verify_slack_code_emphasis.py \
      deploy/docker/patches/apply_google_chat_attachment_notice.py \
      deploy/docker/patches/verify_google_chat_attachment_notice.py \
+     deploy/docker/patches/apply_slack_reactions_scope.py \
+     deploy/docker/patches/verify_slack_reactions_scope.py \
      deploy/docker/patches/patchlib.py \
      /tmp/message-surface/
 RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis.py /opt/hermes && \
@@ -608,9 +639,12 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_code_emphasis
     grep -qF "kube-agents patch: attachment-fallback notice" /opt/hermes/plugins/platforms/google_chat/adapter.py && \
     grep -qF "_credential_proxy_relay_patched" /opt/hermes/plugins/platforms/google_chat/adapter.py && \
     ! grep -qF "No he podido adjuntar" /opt/hermes/plugins/platforms/google_chat/adapter.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/apply_slack_reactions_scope.py /opt/hermes && \
+    grep -qF '"reactions:write"' /opt/hermes/hermes_cli/slack_cli.py && \
     cd /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_code_emphasis.py && \
     /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_google_chat_attachment_notice.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/message-surface/verify_slack_reactions_scope.py && \
     rm -rf /tmp/message-surface
 
 # Perf: hide worker-only kanban tools from orchestrator profiles. Upstream gates
@@ -997,7 +1031,25 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_kanban_guardr
 # fall-through.
 # See the module docstring in deploy/docker/patches/kanban_event_routing.py.
 #
-# All five patches ship in ONE COPY + ONE RUN on purpose. This stage is the base
+# Hotfix: a worker that fanned work out completed its own card on a dispatch
+# receipt, and the receipt was delivered as the final answer (issue #1010: card
+# t_470a97c5 closed "finished" with "Fanned out cluster investigation tasks ...
+# Awaiting synthesis"; 49 of 156 scored repetitions of the same eval case show
+# the identical shape). Completing IS the delivery, and nothing on the board
+# connected the receipt to the work it dispatched: task_links is a predecessor
+# edge and fan-out children are created parentless. So kanban_create now
+# records which running card created which child (kanban_worker_children), and
+# kanban_complete refuses — once, never wedging — to close a card whose
+# recorded children are neither settled nor gated on it, telling the worker to
+# wait and synthesize instead. Must run AFTER apply_kanban_auto_subscribe.py
+# and AFTER apply_kanban_result_required.py (earlier stage): both of its
+# anchors are text those patches introduced, deliberately, because the sites
+# it needs only exist in the patched tree. kanban_result_required.py is copied
+# here again solely so the applier can import the anchor constant; the module
+# itself was installed by its own stage.
+# See the module docstring in deploy/docker/patches/kanban_children_settled.py.
+#
+# All six patches ship in ONE COPY + ONE RUN on purpose. This stage is the base
 # for `platform`, and the block-per-patch layout these would normally get pushed
 # that chain past Docker's layer-depth ceiling ("max depth exceeded" on build
 # f9f1747c, 2026-08-07). The guarantees are unchanged — same appliers,
@@ -1017,6 +1069,10 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/kanban_event_routing.py \
      deploy/docker/patches/apply_kanban_event_routing.py \
      deploy/docker/patches/verify_kanban_event_routing.py \
+     deploy/docker/patches/kanban_children_settled.py \
+     deploy/docker/patches/apply_kanban_children_settled.py \
+     deploy/docker/patches/verify_kanban_children_settled.py \
+     deploy/docker/patches/kanban_result_required.py \
      deploy/docker/patches/patchlib.py \
      /tmp/latency-patches/
 # `install -m 0644`, not `cp`, for the first line. `cp` gives a newly created
@@ -1055,12 +1111,18 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_event_routing.py /opt/hermes && \
     grep -qF 'platform, chat_id, thread_id = _kanban_event_route(' /opt/hermes/tools/kanban_tools.py && \
     grep -q "from tools.kanban_event_routing import" /opt/hermes/tools/kanban_tools.py && \
+    cp /tmp/latency-patches/kanban_children_settled.py /opt/hermes/tools/kanban_children_settled.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_kanban_children_settled.py /opt/hermes && \
+    grep -qF '_kanban_record_worker_child(conn, new_tid)' /opt/hermes/tools/kanban_tools.py && \
+    grep -qF 'tid, _kanban_children_connect, result' /opt/hermes/tools/kanban_tools.py && \
+    grep -q "from tools.kanban_children_settled import" /opt/hermes/tools/kanban_tools.py && \
     cd /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_wake_nudge.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_auto_subscribe.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_comment_status.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_notify_delivery.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_event_routing.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_children_settled.py && \
     rm -rf /tmp/latency-patches
 
 

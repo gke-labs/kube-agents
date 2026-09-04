@@ -39,9 +39,9 @@ kustomize alone leaves them unsubstituted for the API server to reject. The
 target resolves them from `images.json` and runs `envsubst` first.
 
 There is nothing else to configure and no prerequisite Secret. Both images are
-pinned by digest; `ankane/pgvector` publishes only a floating `latest`, so the
-digest is the only thing standing between a pod reschedule and a different
-database engine. Both pins live in [`images.json`](../../../../images.json) at
+pinned by digest; `pgvector/pgvector` rebuilds a version tag like `0.8.6-pg15` in
+place when the Postgres base image is patched, so the digest is what stands between
+a pod reschedule and a Postgres minor nobody chose. Both pins live in [`images.json`](../../../../images.json) at
 the repository root, not here — that is what lets `make mirror-images` copy them
 and a mirrored install ask for the copy. Re-pin there, deliberately, rather than
 dropping the digest.

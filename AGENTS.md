@@ -12,6 +12,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
   - `cluster/`: The Cluster Agent profile _template_ (persona, scoped config, and runtime-debugging skills). The Platform Agent scaffolds this into per-cluster Hermes profiles at runtime; it is not deployed directly.
 - `.agents/skills/`: Repository-level skills, not shipped in the agent images — review skills (adversarial change review, security audits, docs-drift, skill quality) run against pull requests and clusters, with `review-preflight` running the pre-PR set of them in a context that did not write the change, plus the `install-kube-agents`/`uninstall-kube-agents`/`upgrade-kube-agents` lifecycle skills that drive the repository's installer scripts.
 - `.agents/rules/`: Repository-level rules an agent follows, one file per family and none shipped in the agent images — `core_engineering.md` for the code itself, `github_actions.md` for workflow authoring, `pre_pr_review.md` for the mechanics of the two pre-PR passes. This file states each rule and links there for the form it takes; the split keeps `AGENTS.md` inside the context budget `scripts/check_context_budget.py` enforces.
+- `a2a/`: Go module for the agent-to-agent bus — the JetStream wire-protocol library and conformance suite for `docs/designs/spec-a2a-payloads.md`, the `a2a` topics CLI, and declarative agent profiles. Nothing imports or invokes it yet; components arrive behind the mode switch.
 - `charts/`: Canonical Helm charts (`kube-agents`) for deploying the Kube-Agents operator and profiles.
 - `terraform/`: Companion reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `chat-pubsub`, `github-minter`, `gke-backup-plan`, `drift-pubsub`) for infrastructure provisioning, plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top. `drift-pubsub` is not yet part of that composition.
 - `deploy/`: Deployment infrastructure code (Dockerfile, Kustomize bases, shared runtime assets).
@@ -32,7 +33,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
 
 ## Where Tests Go
 
-Tests live in nine places here, with different runners and different answers to "does this catch a
+Tests live in ten places here, with different runners and different answers to "does this catch a
 regression before merge". Choosing the wrong one rarely fails loudly — the test runs somewhere you
 did not expect, or nowhere at all, and the suite reports green around it.
 
@@ -60,12 +61,12 @@ One rule holds wherever it lands: a new test directory only runs if a `PYTHON_TE
 `Makefile` reaches it, and a directory the globs miss fails nothing — it sits unexecuted while the
 suite reports green around it. Add the glob in the same change.
 
-The nine homes, what runs each, and how far "runs on a pull request" is from "gates a merge" are in
+The ten homes, what runs each, and how far "runs on a pull request" is from "gates a merge" are in
 [`docs/testing-map.md`](docs/testing-map.md).
 
 ## Agent Setup & Integration
 
-This repository is primarily a configuration and documentation repository for AI agents. The main exception is the Go-based Kubernetes operator in `k8s-operator/`, which requires compilation (see Local Validation Checks below).
+This repository is primarily a configuration and documentation repository for AI agents. The main exceptions are the Go modules — the Kubernetes operator in `k8s-operator/` and the A2A bus module in `a2a/` — which require compilation (see Local Validation Checks below).
 
 To use these agents:
 
@@ -338,7 +339,8 @@ map (`docs/README.md`), and this file plus `CLAUDE.md` stay inside the context b
   required.
 - **Local Validation Checks:** Before committing, run what your change touches — `prettier --write`
   on changed Markdown and YAML, a local Docker build of the agent runner, the image-layer budget if
-  you added a `RUN` or `COPY` to `deploy/docker/Dockerfile`, and `go build` inside `k8s-operator/`.
+  you added a `RUN` or `COPY` to `deploy/docker/Dockerfile`, and `go build` inside whichever Go
+  module you touched (`k8s-operator/`, `a2a/`).
   Each has a constraint that costs a CI run to rediscover — the pinned prettier version, the
   mandatory `--platform linux/amd64`, the layer ceiling that only fails after merge. The
   commands and those reasons are in
@@ -350,7 +352,9 @@ map (`docs/README.md`), and this file plus `CLAUDE.md` stay inside the context b
 three repetitions each — and has been merge-blocking since 2026-09-02
 (GoogleCloudPlatform/oss-test-infra#2677). It is slow — recent green runs took 1.5 to 3.5 hours
 against a 360-minute ceiling — and a new push restarts it, so open the pull request early and
-batch changes rather than stacking pushes.
+batch changes rather than stacking pushes. Another pull request merging usually does not: a green
+status is re-pinned to the new head of `main` so Tide keeps crediting it
+([how a change merges](docs/pull-request-workflow.md#how-a-change-merges)).
 
 Two things red it. A case on the `BOOTSTRAP_ADMITTED` roster in `hack/ci-eval-pr.sh` fails **all**
 of its repetitions — one failed repetition out of three does nothing on its own. Or any case,
@@ -369,6 +373,14 @@ On a red, ask whether your diff explains it. If yes, fix it. If no, file an issu
 welcome — otherwise keep working while the eval crew classifies it. One `/retest` is reasonable
 for a suspected transient; repeated blind retests are noise. Never merge around a red gate, and
 never instruct anyone to.
+
+Two more mechanics (#1202). A plain `/override` (admins only) is only for a red the eval crew
+classified as not the pull request's, and it expires with the next merge to `main`, so repeat it if
+`main` moves first — the re-pin leaves an admin's override alone; `/override-sticky` is not in the
+Prow build this repository merges through and is silently ignored. An unresolved review thread
+blocks the merge silently: approved, green, and unmerged means check threads first, then the `err`
+field in [tide-history](https://oss.gprow.dev/tide-history) — detail in
+[how a change merges](docs/pull-request-workflow.md#how-a-change-merges).
 
 ## Automated Review After Opening a Pull Request
 
