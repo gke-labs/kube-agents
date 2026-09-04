@@ -1,0 +1,104 @@
+name: "Staging: Deploy"
+
+# Atomically deploys a promoted candidate to the staging environment.
+#
+# Replaces legacy staging-redeploy-{agent,controller,integrations}.yml workflows
+# with a single, consolidated invocation of ./upgrade.sh --upgrade-mode=full.
+# This ensures Terraform composition, Helm values, and container images deploy
+# together from a single validated commit SHA without race conditions.
+
+on:
+  push:
+    tags:
+      # Pushed by nightly-pipeline.yml (Step 4) after green E2E matrix
+      # Format: staging_<timestamp>_<commit_sha>
+      - "staging_*"
+  #checkov:skip=CKV_GHA_7:Standalone launch requires optional image tag, lease policy and force reconcile inputs
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Commit SHA or staging tag to deploy (leave empty to peel latest staging tag)"
+        required: false
+        default: ""
+        type: string
+      lease_policy:
+        description: "What to do when somebody is live-testing against staging"
+        required: false
+        default: "fail"
+        type: choice
+        options:
+          - "fail"
+          - "ignore"
+          - "defer"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: staging-deploy
+  cancel-in-progress: false
+
+jobs:
+  resolve-commit:
+    if: github.repository == 'gke-labs/kube-agents'
+    runs-on: ubuntu-latest
+    environment: staging
+    permissions:
+      contents: read
+    outputs:
+      commit_sha: ${{ steps.peel.outputs.commit_sha }}
+      lease_policy: ${{ steps.peel.outputs.lease_policy }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve target commit and parameters
+        id: peel
+        env:
+          TARGET_ENVIRONMENT: "staging"
+          INPUT_TAG: ${{ inputs.image_tag }}
+          INPUT_LEASE_POLICY: ${{ inputs.lease_policy }}
+        run: ./scripts/release/resolve_deploy.sh
+
+      - name: Verify candidate images exist in GHCR
+        env:
+          COMMIT_SHA: ${{ steps.peel.outputs.commit_sha }}
+          REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
+        run: ./scripts/release/verify_candidate_images.sh
+
+  deploy:
+    needs: resolve-commit
+    if: github.repository == 'gke-labs/kube-agents'
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
+    uses: ./.github/workflows/reconcile-environment.yml # zizmor: ignore[secrets-inherit]
+    with:
+      github_environment: "staging"
+      mode: "apply"
+      image_tag: ${{ needs.resolve-commit.outputs.commit_sha }}
+      lease_policy: ${{ needs.resolve-commit.outputs.lease_policy }}
+    secrets: inherit
+
+  verify-deploy:
+    name: Verify Deploy Applied
+    needs: [resolve-commit, deploy]
+    if: github.repository == 'gke-labs/kube-agents'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify Staging Deploy Result
+        env:
+          TARGET_ENVIRONMENT: "staging"
+          DEPLOY_RESULT: ${{ needs.deploy.outputs.result }}
+        run: ./scripts/release/verify_deploy_result.sh

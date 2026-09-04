@@ -34,7 +34,7 @@ from test_gateway_rollout_budgets import _rollout_gate_seconds
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _FIXTURE = _ROOT / "tests" / "e2e" / "test_stockout_investigation.py"
-_AGENT_WORKFLOW = _ROOT / ".github" / "workflows" / "reusable-deploy-agent.yml"
+_UPGRADE_SCRIPT = _ROOT / "upgrade.sh"
 _E2E_RUN_WORKFLOW = _ROOT / ".github" / "workflows" / "e2e-run.yml"
 
 
@@ -430,7 +430,7 @@ class BudgetTest(unittest.TestCase):
         # rewritten: test_gateway_rollout_budgets.py owns that expression.
         self.assertLess(
             sof._ROLLOUT_TIMEOUT_SECONDS,
-            _rollout_gate_seconds(_AGENT_WORKFLOW, "platform-agent-gateway"),
+            _rollout_gate_seconds(_UPGRADE_SCRIPT, "platform-agent-gateway"),
             "the fixture waits on a warm re-template, so its ceiling should sit below the "
             "cold-boot budget the deploy workflow sanctions",
         )

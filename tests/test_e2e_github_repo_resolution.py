@@ -1,6 +1,6 @@
 """Unit tests for the owner/repo resolution in tests/e2e/conftest.py.
 
-GH_REPO is bare by repository convention -- reusable-deploy-integrations.yml hands the
+GH_REPO is bare by repository convention -- the install hands the
 org and the repo to the GitHub Token Minter as separate values -- while the e2e suite
 needs 'owner/repo': test_agent_fleet_audit.py asserts the shape and
 agents/platform/scripts/github_token_refresh.py refuses anything else. The RC pipeline

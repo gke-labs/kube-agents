@@ -117,7 +117,7 @@ The inference replay proxy used for record/replay of model traffic. Built from [
 
 The Kubebuilder-generated operator manager image.
 
-- **Published by**: [`.github/workflows/docker-publish-k8s-operator.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-k8s-operator.yml)
+- **Published by**: [`.github/workflows/docker-publish-ghcr.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-ghcr.yml)
 - **Build**: `k8s-operator/Dockerfile` (`make docker-build IMG=...`)
 
 ## Container entrypoint

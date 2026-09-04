@@ -21,7 +21,7 @@ import unittest
 import yaml
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
-_AGENT_WORKFLOW = _ROOT / ".github" / "workflows" / "reusable-deploy-agent.yml"
+_UPGRADE_SCRIPT = _ROOT / "upgrade.sh"
 _SCRIPT = _ROOT / "scripts" / "confirm_agent_image.sh"
 _READINESS_SCRIPT = _ROOT / "scripts" / "release" / "wait_for_gke_readiness.sh"
 
@@ -34,29 +34,18 @@ _MIRROR = "europe-docker.pkg.dev/acme/mirror"
 
 
 class DeployWorkflowWiringTest(unittest.TestCase):
-    """Where the read-back sits in the deploy job."""
+    """Where the read-back sits in the upgrade and deploy flow."""
 
     def setUp(self):
-        self.steps = yaml.safe_load(_AGENT_WORKFLOW.read_text())["jobs"]["deploy"]["steps"]
-        self.runs = [step.get("run", "") for step in self.steps]
-
-    def _index_of(self, needle, description):
-        for index, run in enumerate(self.runs):
-            if needle in run:
-                return index
-        self.fail(f"no step in {_AGENT_WORKFLOW.name} {description}")
+        self.text = _UPGRADE_SCRIPT.read_text()
 
     def test_the_deploy_confirms_the_tag_it_set(self):
-        self._index_of(_SCRIPT.name, f"runs {_SCRIPT.name}")
+        self.assertIn(_SCRIPT.name, self.text)
 
     def test_the_confirmation_precedes_the_rollout_gate(self):
-        # Ordering is not cosmetic; the step's own comment in the workflow says
-        # why. Past the gate the job has already reported success.
-        confirm = self._index_of(_SCRIPT.name, f"runs {_SCRIPT.name}")
-        gate = self._index_of(
-            f"rollout status deployment/{_GATEWAY}",
-            f"runs `kubectl rollout status` on {_GATEWAY}",
-        )
+        # Ordering is not cosmetic; past the gate the job has already reported success.
+        confirm = self.text.index(_SCRIPT.name)
+        gate = self.text.index(f"rollout status deployment/{_GATEWAY}")
         self.assertLess(
             confirm,
             gate,
@@ -64,22 +53,22 @@ class DeployWorkflowWiringTest(unittest.TestCase):
         )
 
     def test_the_confirmation_can_still_fail_the_job(self):
-        # A guard whose failure is swallowed is worse than no guard: the deploy
-        # reports the same green it did before, and the step in the log implies
-        # the tag was checked. Both routes to that are cheap to add later and
-        # invisible in review, so pin them.
-        index = self._index_of(_SCRIPT.name, f"runs {_SCRIPT.name}")
-        step = self.steps[index]
-        self.assertNotIn(
-            "continue-on-error",
-            step,
-            "continue-on-error on the confirmation step lets an ignored tag deploy green",
+        # A guard whose failure is swallowed is worse than no guard.
+        matching_lines = [
+            line.strip()
+            for line in self.text.splitlines()
+            if _SCRIPT.name in line and not line.strip().startswith("#")
+        ]
+        self.assertTrue(
+            matching_lines,
+            f"no active invocation of {_SCRIPT.name} found in {_UPGRADE_SCRIPT.name}",
         )
-        self.assertNotRegex(
-            step["run"],
-            r"(\|\|\s*true|;\s*exit\s+0)\s*$",
-            "the confirmation's exit status must reach the job",
-        )
+        for line in matching_lines:
+            self.assertNotRegex(
+                line,
+                r"(\|\|\s*(true|:|exit\s+0)|;\s*exit\s+0)\s*$",
+                f"the confirmation's exit status must reach the caller and not be swallowed: {line}",
+            )
 
 
 class ReleaseReadinessDelegatesTest(unittest.TestCase):

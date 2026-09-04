@@ -28,17 +28,6 @@
 #   plus every install setting render_install_env.sh maps.
 set -euo pipefail
 
-# How long to wait for an in-flight redeploy of this environment, and how often
-# to look. A `terraform apply` running concurrently with the `helm upgrade` a
-# redeploy performs contends for the same release, so the reconcile waits;
-# past the deadline it gives up and runs again tomorrow rather than blocking a
-# nightly on a stuck deploy.
-readonly REDEPLOY_WAIT_SECONDS=900
-readonly REDEPLOY_POLL_SECONDS=30
-# `gh run list` page size. Only the in-flight states are counted, and a
-# redeploy workflow with more than this many runs already queued is a problem
-# no wait will fix.
-readonly REDEPLOY_RUN_QUERY_LIMIT=20
 # Long enough to cover a full apply, short enough that a crashed run does not
 # lock the environment out for a working day.
 readonly LEASE_TTL_MINUTES=90
@@ -117,63 +106,7 @@ gcloud container clusters get-credentials "${CLUSTER_NAME}" \
   --location="${REGION}" --project="${PROJECT_ID}" $GKE_DNS_ENDPOINT_FLAG
 
 # ---------------------------------------------------------------------------
-# 3. Wait out any image redeploy already in flight
-# ---------------------------------------------------------------------------
-# The redeploy workflows run `helm upgrade` on the `kube-agents` release, and
-# the composition's helm_release.kube_agents owns that same release. Both at
-# once is either a failed apply or a lost deploy, depending on which one gets
-# the release lock. They are not scheduled against each other — autopush's
-# redeploys start from a GHCR publish, which is every push to main — so the
-# overlap is real and this waits it out rather than racing it.
-#
-# Bounded, and a timeout is a deferral rather than a failure: the reconcile runs
-# again tomorrow, and blocking a nightly on a stuck deploy helps nobody.
-await_redeploys() {
-  command -v gh >/dev/null 2>&1 || { echo "==> gh not available; skipping the redeploy check."; return 0; }
-  [ -n "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ] || { echo "==> No token for the redeploy check; skipping."; return 0; }
-
-  local deadline=$((SECONDS + REDEPLOY_WAIT_SECONDS)) running
-  while [ "$SECONDS" -lt "$deadline" ]; do
-    running=""
-    for component in agent controller integrations; do
-      local wf="${ENV_NAME}-redeploy-${component}.yml"
-      # `gh run list` on a workflow this repository does not have exits
-      # non-zero; an environment with no redeploy workflows simply has nothing
-      # to wait for.
-      # queued and waiting count, not just in_progress. Each redeploy sits in
-      # its own concurrency group, so a second one queued behind the first is
-      # invisible to an in_progress-only query -- and autopush's redeploys
-      # start on every push to main, so one dequeuing into a `helm upgrade`
-      # halfway through the apply is the collision this loop exists to avoid.
-      # `--status` takes one value, so the filtering is done in jq instead.
-      local n
-      n="$(gh run list --repo "${GITHUB_REPOSITORY:-gke-labs/kube-agents}" \
-        --workflow "$wf" --limit "$REDEPLOY_RUN_QUERY_LIMIT" --json status \
-        --jq '[.[] | select(.status == "in_progress" or .status == "queued" or .status == "waiting")] | length' \
-        2>/dev/null || echo 0)"
-      [ "$n" = "0" ] || running="${running} ${wf}(${n})"
-    done
-    [ -n "$running" ] || return 0
-    echo "==> Waiting for in-flight redeploys:${running}"
-    sleep "$REDEPLOY_POLL_SECONDS"
-  done
-
-  echo "::warning title=Redeploy still running::A redeploy of '${ENV_NAME}' was still in flight after $((REDEPLOY_WAIT_SECONDS / 60)) minutes; skipping this reconcile rather than running a terraform apply concurrently with a helm upgrade on the same release."
-  return 1
-}
-
-if [ "$MODE" = "apply" ]; then
-  if ! await_redeploys; then
-    summary "### Reconcile deferred — \`${ENV_NAME}\`"
-    summary ""
-    summary "An image redeploy was still running. Nothing was applied."
-    output "result" "deferred"
-    exit 0
-  fi
-fi
-
-# ---------------------------------------------------------------------------
-# 4. The live-test lease
+# 3. The live-test lease
 # ---------------------------------------------------------------------------
 # AGENTS.md requires every pull request to be validated against a running
 # install, and autopush is that install for most of this repository's agents.
@@ -188,11 +121,20 @@ fi
 # apply. A plan takes nothing, because it changes nothing.
 LEASE_HELD="false"
 release_lease() {
-  [ "$LEASE_HELD" = "true" ] || return 0
-  python3 "${REPO_ROOT}/scripts/live_test_lease.py" release >/dev/null 2>&1 || true
-  LEASE_HELD="false"
+  if [ "$LEASE_HELD" = "true" ]; then
+    if ! python3 "${REPO_ROOT}/scripts/live_test_lease.py" release >/dev/null 2>&1; then
+      echo "⚠️ Warning: Failed to release live-test lease." >&2
+    fi
+    LEASE_HELD="false"
+  fi
 }
+
+# Release lease on normal or error exit, and terminate immediately on signals
+# so execution does not resume after cancellation.
 trap release_lease EXIT
+trap 'release_lease; exit 130' INT
+trap 'release_lease; exit 143' TERM
+trap 'release_lease; exit 129' HUP
 
 if [ "$MODE" = "apply" ] && [ "$LEASE_POLICY" != "ignore" ]; then
   # A run id rather than a pid: the lease keys holder identity on the session,
@@ -202,7 +144,7 @@ if [ "$MODE" = "apply" ] && [ "$LEASE_POLICY" != "ignore" ]; then
     --note "scheduled reconcile of ${ENV_NAME}" --ttl "$LEASE_TTL_MINUTES"; then
     LEASE_HELD="true"
   else
-    holder="$(python3 "${REPO_ROOT}/scripts/live_test_lease.py" status --json 2>/dev/null || echo '[]')"
+    holder="$(python3 "${REPO_ROOT}/scripts/live_test_lease.py" status --json 2>/dev/null)" || holder="[]"
     # A cluster that could not be asked has not answered "no". `acquire` exits
     # non-zero for both, so deferring on the strength of that alone would turn
     # every kind of breakage -- a bad kubeconfig, an API server mid-upgrade, a
@@ -218,9 +160,17 @@ if [ "$MODE" = "apply" ] && [ "$LEASE_POLICY" != "ignore" ]; then
     fi
     if [ "$LEASE_POLICY" = "fail" ]; then
       echo "::error title=Live-test lease is held::Somebody is live-testing against '${ENV_NAME}'. Refusing to apply. ${holder}"
+      summary "### Reconcile failed — \`${ENV_NAME}\`"
+      summary ""
+      summary "The live-test lease was held, so nothing was applied."
+      summary ""
+      summary '```json'
+      summary "${holder}"
+      summary '```'
+      output "result" "failed"
       exit 1
     fi
-    echo "::warning title=Live-test lease is held::Somebody is live-testing against '${ENV_NAME}'; skipping this reconcile. It will run again on the next schedule. ${holder}"
+    echo "::warning title=Live-test lease is held::Somebody is live-testing against '${ENV_NAME}'; skipping this reconcile. ${holder}"
     summary "### Reconcile deferred — \`${ENV_NAME}\`"
     summary ""
     summary "The live-test lease was held, so nothing was applied."
@@ -345,5 +295,4 @@ else
   fi
 fi
 
-release_lease
 exit "$status"

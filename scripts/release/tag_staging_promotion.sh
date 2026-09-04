@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Promotes a validated Release Candidate commit to staging by tagging it staging_<ts>_<sha>.
 #
-# The tag is the deploy trigger: staging-redeploy-{agent,controller,integrations}.yml
-# start on `push: tags: staging_*` and deploy github.sha, so a tag pushed here is a
-# staging deploy. Two consequences the guards below exist for — the tag must be
+# The tag is the deploy trigger: staging-deploy.yml starts on
+# `push: tags: staging_*` and atomically deploys the commit, so a tag pushed
+# here is a staging deploy. Two consequences the guards below exist for — the tag must be
 # derived from a real validated candidate rather than composed by hand, and it must
 # carry the staging_ prefix exactly.
 #
-# It must also be pushed with a PAT (RELEASE_BOT_TOKEN). A tag pushed with the
-# default GITHUB_TOKEN triggers no workflow, so the promotion would go green and
-# deploy nothing.
+# It must also be pushed with the dedicated GitHub App token (kube-agents-release-bot).
+# A tag pushed with the default GITHUB_TOKEN triggers no workflow, so the promotion
+# would go green and deploy nothing. The App token also bypasses tag protection rulesets.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

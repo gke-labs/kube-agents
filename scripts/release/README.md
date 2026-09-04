@@ -42,8 +42,9 @@ page under "Why there is no `gke-admin` set".
 - `dispatch_rc_pipeline.sh`: Starts `rc-release-pipeline.yml` for a candidate `rc-scheduler.yml` resolved. Since the scheduler is the only thing that starts the pipeline, a failure here means no candidate is being tested at all, so it raises an `::error` annotation saying so before exiting non-zero, rather than leaving a bare exit code for the reader to interpret. The default `GITHUB_TOKEN` is enough: GitHub's recursion suppression exempts `workflow_dispatch`, which is why the staging tag push needs a PAT and this does not.
 - `record_rc_scheduler_skip.sh`: Records a quiet three-hourly tick. Because such a tick deliberately leaves no pipeline run behind, this summary is its only trace, and it says outright that a green scheduler reports nothing about the last pipeline run's result.
 - `run_optional_e2e_suites.sh`: Runs `e2e-run.yml`'s `optional_suites` list one suite at a time. Every suite runs regardless of what the ones before it did — a failure that short-circuited the loop would silently drop the coverage behind it — and the script exits non-zero if any failed, which the `continue-on-error` step turns into a red-but-tolerated result with the failing suites named in the job summary. The list is comma-separated because `workflow_call` has no list input type.
-- `tag_staging_promotion.sh`: Pushes the `staging_<ts>_<sha>` tag that `staging-redeploy-*.yml` deploy on. It derives the tag from the candidate rather than trusting one passed in, and refuses anything outside the `staging_` namespace — the tag is a live deploy trigger. It must be pushed with `RELEASE_BOT_TOKEN`; a tag pushed with the default `GITHUB_TOKEN` triggers no workflow, so the promotion would go green having deployed nothing.
-- `peel_tag_commit.sh`: Resolves the ref a push event fired on to the commit it points at and writes it to `GITHUB_OUTPUT` as `commit_sha`. `staging-redeploy-*.yml` run it because `ensure_git_tag` creates annotated tags: a push event's `github.sha` is the new value of the ref, which for an annotated tag is the tag object's SHA, and passing that to `helm upgrade --set …image.tag` names a GHCR image that was never published — a `--wait` deploy then times out on `ImagePullBackOff` and strands the shared release in `pending-upgrade`. Peeling a lightweight tag or a branch head returns the same SHA, so a caller need not know which it got.
+- `tag_staging_promotion.sh`: Pushes the `staging_<ts>_<sha>` tag that `staging-deploy.yml` deploys on. It derives the tag from the candidate rather than trusting one passed in, and refuses anything outside the `staging_` namespace — the tag is a live deploy trigger. It must be pushed with the dedicated GitHub App token (`kube-agents-release-bot`, configured via `RELEASE_BOT_APP_ID` and `RELEASE_BOT_APP_PRIVATE_KEY`); a tag pushed with the default `GITHUB_TOKEN` triggers no workflow, so the promotion would go green having deployed nothing.
+- `peel_tag_commit.sh`: Resolves the ref a push event fired on to the commit it points at and writes it to `GITHUB_OUTPUT` as `commit_sha`. `staging-deploy.yml` runs it because `ensure_git_tag` creates annotated tags: a push event's `github.sha` is the new value of the ref, which for an annotated tag is the tag object's SHA, and passing that to container image tags names a GHCR image that was never published. Peeling a lightweight tag or a branch head returns the same SHA, so a caller need not know which it got.
+- `resolve_deploy.sh`: Resolves candidate target commit SHA and validates lease policy for long-lived environments (`autopush` and `staging`). Configured via `TARGET_ENVIRONMENT` environment variable (`autopush` or `staging`). Called by `autopush-deploy.yml` and `staging-deploy.yml`.
 - `validate_and_log_deploy_summary.sh`: Validates required environment variables and secrets, then logs a formatted deployment matrix and GCP cluster target overview for auditing before provisioning.
 - `teardown_common.sh`: Sourced by the two scripts below, which both call `uninstall.sh` and read the same three outcomes out of its exit code (`./uninstall.sh --help` lists them). Holds the invocation, the `TEARDOWN_STRICT` parsing, and the job-summary rendering; each caller decides for itself what a failure means. The variable is read under both names — `TEARDOWN_STRICT` first, then the legacy `RC_TEARDOWN_STRICT` — because reading only the new one would have left the parser on an unset variable until the settings caught up, and unset is "off" with no error. Both `rc` and `nightly` now define `TEARDOWN_STRICT`, so `deploy-environment.yml` forwards that name alone; the fallback stays for anyone running these scripts by hand against an environment nobody has migrated, and is dropped when the old variable is deleted from both settings pages.
 - `provision_environment.sh`: Tears the environment down with `uninstall.sh`, then reinstalls it at the candidate commit with `install.sh`. Which environment is entirely `GCP_PROJECT_ID` / `GCP_REGION` / `GKE_CLUSTER_NAME` and the rest of the install inputs, which `deploy-environment.yml` reads from the GitHub environment named by its `github_environment` input — `rc` for the RC pipeline, `nightly` for the nightly one. A failed teardown raises an `::error` annotation and a job-summary entry carrying the teardown output, and provisions anyway unless `TEARDOWN_STRICT` is truthy — the choice between validating a candidate against stale state and letting a teardown problem block every release. It also forwards the GitOps repository and, with it, the GitHub token minter, and stages an optional `GH_APP_PRIVATE_KEY` to a private temporary file because `install.sh` takes a path; see "Enabling the GitHub token minter on the RC" below for what to set.
@@ -73,7 +74,7 @@ The end-to-end pipeline (`.github/workflows/rc-release-pipeline.yml`) is dispatc
 - **Scheduled Cadence (`rc-scheduler.yml`, every 3 hours `17 */3 * * *`, best-effort)**:
   - Automatically scans recent commits on `main` (`FETCH_HEAD`) for published container images in GHCR, using the same `resolve_rc_tag.sh` the pipeline runs.
   - **Redundant Run Skipping**: If the latest candidate commit already carries an `rc_*_validated` tag or was previously attempted, the scheduler dispatches nothing and records why in its job summary. The pipeline gets no run at all, which is the point — a skipped pipeline run concluded `success` and painted over the last run that failed.
-  - Dispatches with the default `GITHUB_TOKEN` and `actions: write` on the job. `workflow_dispatch` and `repository_dispatch` are the two events GitHub exempts from the rule that suppresses runs triggered by that token, so no PAT is needed here — unlike a tag push, where the suppression is real and `RELEASE_BOT_TOKEN` is required.
+  - Dispatches with the default `GITHUB_TOKEN` and `actions: write` on the job. `workflow_dispatch` and `repository_dispatch` are the two events GitHub exempts from the rule that suppresses runs triggered by that token, so no PAT is needed here — unlike a tag push, where the suppression is real and the release bot GitHub App token is required.
   - _Note_: Scheduled runs are scheduled at minute `17` to avoid GitHub Actions peak top-of-the-hour queue congestion; actual start times are best-effort based on GitHub scheduler availability.
 - **Manual Trigger (`workflow_dispatch`)**:
   - Requires an explicit `commit_sha` input to rigorously test a specific target commit.
@@ -124,18 +125,14 @@ Setting an optional `GH_APP_PRIVATE_KEY` secret to the `.pem` contents is the al
 ## The nightly environment
 
 `nightly-pipeline.yml` resolves the newest `rc_*_validated` candidate, builds a whole environment
-at that commit, and runs the `nightly` matrix on it. If the matrix passes it reconciles `staging`
-against the same composition, tags the commit `staging_<ts>_<sha>`, reconciles `autopush`, and
-destroys the nightly environment. The staging tag is the deploy trigger: pushing it starts
-`staging-redeploy-{agent,controller,integrations}.yml` — which is why staging's reconcile goes
-before it and autopush's, which no tag starts, goes after.
+at that commit, and runs the `nightly` matrix on it. If the matrix passes it promotes the candidate
+by creating and pushing `staging_<ts>_<sha>`, and destroys the nightly environment. The staging tag
+is the deploy trigger: pushing it starts `staging-deploy.yml`, which atomically reconciles
+the composition, Helm release, and images together via `upgrade.sh --upgrade-mode=full`.
 
-The two reconciles are #1117, and their placement is the substance of it. They run only after the
-matrix, because applying a composition nobody has built from scratch to an environment people
-live-test against is worse than leaving it stale; and staging's runs _before_ the tag is pushed,
-because that tag starts three `helm upgrade`s on the release `helm_release.kube_agents` owns.
-autopush's passes no image tag at all — it tracks main's tip, so pinning this pipeline's older
-candidate would roll its images backwards.
+Similarly, `autopush` receives atomic deploys through `autopush-deploy.yml` whenever container images
+are published to GHCR. Both workflows enforce atomic full upgrades, preventing image drift and
+contention.
 [`environment-reconcile.md`](../../docs/site/src/content/docs/deploy/environment-reconcile.md) is
 the canonical page for that whole path.
 
@@ -236,7 +233,7 @@ An `rc_*_validated` tag is not checked alongside it, because it is implied: a st
 ever created by `tag_staging_promotion.sh`, which refuses a commit that does not already carry one.
 Requiring both would re-check a property the first guarantees and leave two gates to keep in step.
 
-What replaces it as the defence against a fabricated tag is the **shape**. `staging-redeploy-*.yml`
+What replaces it as the defence against a fabricated tag is the **shape**. `staging-deploy.yml`
 triggers on the bare `staging_` prefix, so a hand-typed `staging_hotfix` is a supported way to
 redeploy staging — and must not read back as "the matrix passed here". `STAGING_TAG_SHAPE_REGEX` in
 `common.sh` is what the release path matches: the timestamp and short SHA in the positions
@@ -346,7 +343,7 @@ These modular scripts back the corresponding child workflows in `.github/workflo
 | `teardown-environment.yml`  | Step 5 - Tear Down Environment              | `resolve_rc_tag.sh`, `teardown_environment.sh`                                                                                                                                                                                                           |
 | `nightly-pipeline.yml`      | Nightly promotion to staging                | `resolve_promotion_candidate.sh`, `verify_candidate_images.sh`, `record_nightly_candidate_summary.sh`, `tag_staging_promotion.sh`, plus the shared workflows listed elsewhere in this table                                                              |
 | `rc-scheduler.yml`          | Three-hourly RC trigger                     | `resolve_rc_tag.sh`, `record_rc_scheduler_skip.sh`, `dispatch_rc_pipeline.sh`                                                                                                                                                                            |
-| `staging-redeploy-*.yml`    | Staging deploy on a promotion tag           | `peel_tag_commit.sh`                                                                                                                                                                                                                                     |
+| `staging-deploy.yml`        | Staging deploy on a promotion tag           | `peel_tag_commit.sh`, `reconcile-environment.yml`                                                                                                                                                                                                        |
 | `reconcile-environment.yml` | Reconcile a long-lived environment in place | `render_install_env.sh`, `reconcile_environment.sh`                                                                                                                                                                                                      |
 | `drift-detect.yml`          | Daily drift report on `autopush`/`staging`  | `render_install_env.sh`, `reconcile_environment.sh`, `report_drift.py`                                                                                                                                                                                   |
 | `release-publish.yml`       | GA Release Orchestration                    | `decide_release_gate.sh`, `resolve_scheduled_release.sh`, `calculate_next_version.sh`, `verify_release_eligibility.sh`, `tag_ga_release.sh`, `promote_release_images.sh`, `sign_release_images.sh`, `publish_helm_chart.sh`, `publish_github_release.sh` |

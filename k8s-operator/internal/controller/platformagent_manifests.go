@@ -2323,7 +2323,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 // this number buys nothing. Kubernetes defaults it to 600s, which is *below*
 // the 605s cold boot agentAPIProbe(10, 60) already sanctions — the kubelet is
 // told to tolerate a boot the Deployment gives up on. 1200s clears the 900s
-// deploy gate in .github/workflows/reusable-deploy-agent.yml. hindsight-api
+// deploy gate in upgrade.sh. hindsight-api
 // carries an explicit 900 for the same reason; see tests/test_hindsight_probes.py.
 const gatewayProgressDeadlineSeconds int32 = 1200
 

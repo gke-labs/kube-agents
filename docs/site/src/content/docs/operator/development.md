@@ -113,5 +113,5 @@ Prettier is enforced in CI ([`.github/workflows/prettier.yml`](https://github.co
 Relevant workflows:
 
 - [`k8s-operator-test.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/k8s-operator-test.yml) — runs `make test`.
-- [`docker-publish-k8s-operator.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-k8s-operator.yml) — publishes the manager image.
+- [`docker-publish-ghcr.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-ghcr.yml) — publishes the manager image alongside agent images.
 - [`e2e-gchat-test.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/e2e-gchat-test.yml) — end-to-end Google Chat test.
