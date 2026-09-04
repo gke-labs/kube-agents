@@ -1224,7 +1224,11 @@ TASKS=(
   # this array calls a case that can only fail.
   # Uncomment when the agent can diagnose a capped pool, not before.
   # "./tasks/cluster-agent-pending-replicas-capped-pool/task.yaml"
-  "./tasks/gpu-stress-test-diagnosis/task.yaml"
+  # Removed from presubmit 2026-09-03 for wall clock: tofu provisioning
+  # serializes on the infra lock (~20 min/rep x 3 reps ~= 61 min serialized; #1202
+  # trim addendum). Re-enters via NIGHTLY_TASKS when the nightly tier
+  # (#1175) lands.
+  # "./tasks/gpu-stress-test-diagnosis/task.yaml"
   "./tasks/agent-kanban-smoke/task.yaml"
   # Last, because it is the only entry that pays twice. Its stack plants an
   # OOM-killed workload on the host cluster and blocks until the event
@@ -1236,8 +1240,12 @@ TASKS=(
   # It provisions no cluster despite being deployer: tofu -- see the header of
   # bench/tf/prebuilt/autoops-incident/main.tf for why it cannot, and why it
   # is the host cluster and not the per-run one that gets the incident.
-  "./tasks/autoops-warning-event-triage/task.yaml"
-  # Ten registered scenarios stay commented out. The task-registration lint
+  # Removed from presubmit 2026-09-03 for wall clock (tofu serialization,
+  # ~15 min/rep x 3 reps; #1202 trim addendum). Held out of BOOTSTRAP_ADMITTED
+  # anyway (#1101); its admission record accrues via the nightly tier
+  # (#1175) once that runs.
+  # "./tasks/autoops-warning-event-triage/task.yaml"
+  # Twelve registered scenarios stay commented out. The task-registration lint
   # counts a commented entry as registered, so a line here is a promise the
   # scenario exists, not that it runs; the domain-coverage lint counts only
   # an UNCOMMENTED one, so activating a scenario also deletes its domain from
@@ -1497,7 +1505,7 @@ print(m.group(1).strip('\'\"') if m else '')
 # Demoting a flaky case is a one-line same-day edit: delete its name from
 # this list, referencing the issue that names its re-admission condition.
 
-export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,cluster-agent-crashloop-debug,cluster-agent-crashloop-misleading-symptom,cluster-agent-crashloop-evidence-chain,gpu-stress-test-diagnosis,agent-kanban-smoke}"
+export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,cluster-agent-crashloop-debug,cluster-agent-crashloop-misleading-symptom,cluster-agent-crashloop-evidence-chain,agent-kanban-smoke}"
 
 # Where the evidence itself lives. Unset means bench/baselines/ in the
 # checkout: hermetic, no credential, no network -- and no way for this job to
@@ -1553,6 +1561,8 @@ fi
 # A wrong hint costs packing efficiency, never correctness.
 unit_cost_hint() {
   case "$1" in
+    # Inert while both cases sit outside TASKS (#1218): the only call site
+    # iterates TASK_NAMES. Kept for their NIGHTLY_TASKS re-entry (#1175).
     gpu-stress-test-diagnosis | autoops-warning-event-triage) echo 900 ;;
     compliance-rbac-overgrant | rca-remediation-pr) echo 700 ;;
     consistency-authorized-networks-probe) echo 300 ;;

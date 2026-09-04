@@ -10,7 +10,11 @@ data.json the dashboard renders.
 
 data.json is a CONTRACT: the renderer and the publisher are built against the
 exact shape documented in SCHEMA.md. Changes must be additive optional fields
-only, with schema_version bumped on anything else.
+only, with schema_version bumped on anything else. The two additive fields
+this collector emits beyond the v1 core: `tasks[].reps` (per-repetition
+grading detail, present only when the log carries `rep N:` grading lines) and
+`runs[].pr_merged` (whether the run's PR had merged at collection time,
+resolved best-effort through `gh`).
 
 Sources:
   --pr-glob   gsutil glob(s) of Prow build directories (read-only; requires
@@ -61,6 +65,35 @@ from datetime import datetime, timedelta, timezone
 
 SCHEMA_VERSION = 1
 
+# Cap on the free-text reason kept from a per-repetition grading line. Fail
+# reasons quote whole grader checklists and run past 1000 chars; the dashboard
+# needs a tooltip-sized excerpt, not the full transcript, and the cap keeps a
+# pathological line from bloating data.json.
+REP_REASON_MAX_CHARS = 300
+
+# The literal hack/ci-eval-pr.sh stamps on a repetition it excluded as an
+# infrastructure failure. The `infra` verdict token on the grading line is the
+# primary signal; the marker is the fallback for lines that carry the literal
+# under another token.
+INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
+
+# runs[].pr_merged is resolved against this repository. The collector only
+# reads this repo's Prow archive (the --pr-glob defaults in the CI scripts),
+# so the repo is a constant rather than a flag.
+GH_PR_REPO = "gke-labs/kube-agents"
+
+# Ceiling on one `gh pr view`; past it that PR's pr_merged degrades to null.
+GH_TIMEOUT_S = 60
+
+# pr_merged is resolved (and re-resolved, for a run carrying false/null from
+# an earlier collection) only while the run's build started within this
+# window -- the depth the dashboard displays. It is what bounds the gh spend
+# of one collect however large the archive grows: without it a full sweep
+# would pay one gh call per distinct PR ever archived. Older runs keep the
+# value they carry, or get null without a call. true is terminal and is never
+# re-asked at any age.
+PR_MERGED_WINDOW_DAYS = 14
+
 # The sweep bound a degraded --merge-with falls back to when the prior file
 # is missing or unusable. Two weeks matches the depth the dashboard displays;
 # unbounded would mean re-reading every archived build ever.
@@ -87,11 +120,32 @@ DOMAINS_YAML = REPO_ROOT / "docs" / "designs" / "domains.yaml"
 #       OutcomeValidity recorded: 0.0 (Duration: 129s)
 #   Task compliance-rbac-overgrant Result: [RESOURCE_PREPARATION_FAILED] \
 #       Infrastructure setup/teardown or agent transport error (Duration: 41s)
+# and, since the multi-repetition eval (2026-08-28; parallel fan-out
+# 2026-08-31 -- both print the same verdict and grading lines):
+#   Task reliability-pdb-probe Result: [PASSED] passed all 3 repetitions
+#   Task upgrades-lagging-master-probe Result: [UNSTABLE] passed 2 of 3 \
+#       repetitions (not admitted, so it cannot collapse)
+#   Task security-overgrant-probe Result: [FAILED] repetition 3: <reason>
 _TASK_LINE = re.compile(
     r"^Task (?P<name>\S+) Result: "
-    r"\[(?P<verdict>PASSED|FAILED|RESOURCE_PREPARATION_FAILED)\]"
+    r"\[(?P<verdict>PASSED|FAILED|UNSTABLE|RESOURCE_PREPARATION_FAILED)\]"
     r"(?P<rest>.*)$"
 )
+# One line per graded repetition, indented under its `Task <name> Result:`
+# line; serial and parallel fan-out runs print the same grading block.
+# Observed verdict tokens: pass, fail, infra, blocked. The reason may itself
+# contain ` -- `, so only the first separator splits verdict from reason.
+#   rep 2: fail -- VerificationCorrectness=0.5 (floor 1.0) -- <check>: ... \
+#       [OutcomeScore=0.5 OutcomeValidity=0.8 ToolInvocation=0.0]
+# The verdict class is wider than the observed tokens on purpose: a token
+# this collector has never seen must still match, so it can grade as fail
+# rather than silently vanish from reps[].
+_REP_LINE = re.compile(
+    r"^\s+rep (?P<n>\d+): (?P<verdict>[A-Za-z0-9_-]+)(?: -- (?P<rest>.*))?$"
+)
+# The bracketed per-rep score dump ending most grading lines: structured
+# metrics, not reason text.
+_REP_SCORES_TAIL = re.compile(r"\s*\[OutcomeScore=[^\]]*\]\s*$")
 _OUTCOME_VALIDITY = re.compile(r"OutcomeValidity recorded:\s*([0-9]*\.?[0-9]+)")
 _DURATION = re.compile(r"\(Duration:\s*(\d+)s\)")
 _LEASE = re.compile(r"Successfully leased project:\s*(\S+)")
@@ -105,10 +159,19 @@ _FINAL_VERDICT = re.compile(
 _RESULT_BY_VERDICT = {
     "PASSED": "pass",
     "FAILED": "fail",
+    # A multi-repetition case that passed some but not all graded reps. Not a
+    # clean pass, so it grades as fail here; reps[] carries the split, and the
+    # schema's result vocabulary (pass|fail|infra) stays closed.
+    "UNSTABLE": "fail",
     # Infrastructure (resource prep, teardown, agent transport) failed before
     # the case could be graded; the case is skipped, not failed.
     "RESOURCE_PREPARATION_FAILED": "infra",
 }
+
+# Per-rep verdict tokens map the same way: pass and infra verbatim, and
+# everything else -- fail, blocked (an inadmissible record, e.g. an empty
+# trajectory), or a token this collector has never seen -- grades as fail.
+_REP_RESULT_BY_VERDICT = {"pass": "pass", "infra": "infra"}
 
 
 # --------------------------------------------------------------------------
@@ -116,14 +179,35 @@ _RESULT_BY_VERDICT = {
 # --------------------------------------------------------------------------
 
 
+def _rep_from_match(m: re.Match) -> dict:
+    """One reps[] entry from a matched grading line."""
+    verdict = m.group("verdict")
+    rest = m.group("rest") or ""
+    result = _REP_RESULT_BY_VERDICT.get(verdict, "fail")
+    if verdict != "pass" and INFRA_FAILURE_MARKER in rest:
+        # Belt and braces: an infra-excluded rep carries the literal marker
+        # even if the verdict token in front of it ever changes.
+        result = "infra"
+    reason = None
+    if result != "pass":
+        # The text after the first ` -- `, scores tail stripped, capped. A
+        # pass needs no reason and dropping it keeps data.json lean.
+        reason = _REP_SCORES_TAIL.sub("", rest).strip()[:REP_REASON_MAX_CHARS] or None
+    return {"n": int(m.group("n")), "result": result, "reason": reason}
+
+
 def parse_build_log(text: str) -> dict:
     """Extract the eval facts from one build-log.txt, best effort.
 
     Never raises on malformed content: a truncated log simply yields fewer
-    tasks and no final verdict.
+    tasks and no final verdict. `rep N:` grading lines attach to the `Task
+    <name> Result:` line they follow; a task whose log has none (single-rep
+    era, or a log truncated before grading) simply gets no `reps` key --
+    absence means unknown, never fabricated.
     """
     project = None
     tasks = []
+    current = None  # the task the next rep grading line belongs to
     eval_verdict = None
     eval_duration_s = None
     for line in text.splitlines():
@@ -136,19 +220,30 @@ def parse_build_log(text: str) -> dict:
             rest = m.group("rest")
             ov = _OUTCOME_VALIDITY.search(rest)
             dur = _DURATION.search(rest)
-            tasks.append(
-                {
-                    "name": m.group("name"),
-                    "result": _RESULT_BY_VERDICT[m.group("verdict")],
-                    "duration_s": int(dur.group(1)) if dur else None,
-                    "outcome_validity": float(ov.group(1)) if ov else None,
-                }
-            )
+            current = {
+                "name": m.group("name"),
+                "result": _RESULT_BY_VERDICT[m.group("verdict")],
+                "duration_s": int(dur.group(1)) if dur else None,
+                "outcome_validity": float(ov.group(1)) if ov else None,
+            }
+            tasks.append(current)
             continue
+        if current is not None:
+            m = _REP_LINE.match(line)
+            if m:
+                current.setdefault("reps", []).append(_rep_from_match(m))
+                continue
+            if line.startswith((">>>", "===", "---")):
+                # A section header (a launch or grading marker, a stage
+                # banner, a profile line) closes the grading block, so a
+                # stray rep-shaped line deeper in the log cannot attach to a
+                # task it does not belong to.
+                current = None
         m = _FINAL_VERDICT.search(line)
         if m:
             eval_verdict = m.group("verdict")
             eval_duration_s = int(m.group("duration"))
+            current = None  # nothing after the verdict is grading detail
     return {
         "project": project,
         "tasks": tasks,
@@ -353,6 +448,99 @@ def build_cases(runs: list[dict], repo_root: pathlib.Path = REPO_ROOT) -> list[d
             }
         )
     return cases
+
+
+# --------------------------------------------------------------------------
+# PR merged-state enrichment (runs[].pr_merged)
+# --------------------------------------------------------------------------
+
+
+class _GhUnavailable(Exception):
+    """gh cannot be spawned, or hangs: systemic, not a per-PR failure."""
+
+
+def _pr_merged_via_gh(pr: int, gh: str) -> bool | None:
+    """Whether the PR has merged, per `gh pr view`; None when gh cannot say.
+
+    A non-zero exit (auth, rate limit, deleted PR) and unparseable output
+    degrade to None; a missing binary or a call that hits GH_TIMEOUT_S raises
+    _GhUnavailable so the caller can stop paying for calls that cannot
+    succeed (or that each cost a full timeout).
+    """
+    try:
+        proc = subprocess.run(
+            [gh, "pr", "view", str(pr), "--repo", GH_PR_REPO, "--json", "state,mergedAt"],
+            capture_output=True,
+            text=True,
+            timeout=GH_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise _GhUnavailable(str(exc)) from exc
+    if proc.returncode != 0:
+        return None
+    try:
+        info = json.loads(proc.stdout)
+        return info.get("state") == "MERGED" or bool(info.get("mergedAt"))
+    except (ValueError, AttributeError):
+        return None
+
+
+def _started_since(run: dict, cutoff: datetime) -> bool:
+    try:
+        return datetime.fromisoformat(run["started"]) >= cutoff
+    except (KeyError, TypeError, ValueError):
+        # Unknown age reads as old: the bounded path keeps whatever value the
+        # run already carries rather than paying a gh call forever.
+        return False
+
+
+def annotate_pr_merged(runs: list[dict], gh: str, now: datetime | None = None) -> None:
+    """Set run["pr_merged"] in place, best effort: true, false, or null.
+
+    One `gh pr view` per DISTINCT PR, cached for this invocation, and only
+    for runs whose build started within PR_MERGED_WINDOW_DAYS -- the depth
+    the dashboard displays -- so the gh spend of one collect stays bounded
+    however many builds the sweep covers. A run outside the window keeps the
+    value it already carries (an earlier collection's answer) or gets null
+    without a call. Merged is terminal: a run already carrying true is never
+    re-asked at any age. Any gh failure leaves runs at null and the whole
+    pass emits at most one warning naming how many PRs went unresolved --
+    never a crash -- and the first missing-binary or timed-out call stops
+    further calls, so a dead network costs one timeout, not one per PR.
+    """
+    cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=PR_MERGED_WINDOW_DAYS)
+    cache: dict[int, bool | None] = {}
+    unresolved: set[int] = set()
+    gh_usable = True
+    for run in runs:
+        if run.get("pr_merged") is True:
+            continue
+        if not _started_since(run, cutoff):
+            if "pr_merged" not in run:
+                run["pr_merged"] = None
+            continue
+        pr = run.get("pr")
+        if not isinstance(pr, int):
+            run["pr_merged"] = None
+            continue
+        if pr not in cache:
+            answer = None
+            if gh_usable:
+                try:
+                    answer = _pr_merged_via_gh(pr, gh)
+                except _GhUnavailable:
+                    gh_usable = False
+            if answer is None:
+                unresolved.add(pr)
+            cache[pr] = answer
+        run["pr_merged"] = cache[pr]
+    if unresolved:
+        print(
+            f"warning: pr_merged unresolved for {len(unresolved)} PR(s)"
+            f" ({gh} failed or unavailable); left null",
+            file=sys.stderr,
+        )
 
 
 # --------------------------------------------------------------------------
@@ -655,11 +843,17 @@ def collect(
     from_dir: pathlib.Path | None = None,
     repo_root: pathlib.Path = REPO_ROOT,
     gsutil: str = "gsutil",
+    gh: str | None = None,
     merge_with: str | None = None,
     since_days: float | None = None,
     now: datetime | None = None,
     stale_after_s: int | None = None,
 ) -> dict:
+    # gh=None skips pr_merged resolution entirely (runs carry no key), which
+    # keeps library callers and unit tests hermetic; the CLI passes its --gh
+    # default so a normal collect resolves best-effort. `now` anchors the
+    # pr_merged resolution window and the pending-build/--since-days clocks
+    # (tests pin it; the CLI leaves it None).
     now_dt = now or datetime.now(timezone.utc)
     prior: list[dict] = []
     retry: dict[str, str] = {}  # build_id -> first_seen, still worth re-reading
@@ -718,6 +912,11 @@ def collect(
             file=sys.stderr,
         )
     runs = merge_runs(prior, fresh)
+    if gh is not None:
+        # After merge_runs so runs carried forward from --merge-with are
+        # covered too: a prior false/null within PR_MERGED_WINDOW_DAYS is
+        # re-asked, a prior true is terminal and never re-asked.
+        annotate_pr_merged(runs, gh, now=now)
 
     # The next scan's retry list: every build listed but not (yet) recorded
     # -- still running, or its finished.json unreadable this sweep -- keeps
@@ -792,6 +991,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--gsutil", default="gsutil", help="gsutil binary to invoke")
     parser.add_argument(
+        "--gh",
+        default="gh",
+        help="gh binary used to resolve runs[].pr_merged, best-effort (one"
+        " `gh pr view` per distinct PR; failures degrade to null). Pass an"
+        " empty string to skip resolution",
+    )
+    parser.add_argument(
         "--stale-after-s",
         type=int,
         metavar="SECONDS",
@@ -810,6 +1016,7 @@ def main(argv: list[str] | None = None) -> int:
         from_dir=args.from_dir,
         repo_root=args.repo_root,
         gsutil=args.gsutil,
+        gh=args.gh or None,
         merge_with=args.merge_with,
         since_days=args.since_days,
         stale_after_s=args.stale_after_s,

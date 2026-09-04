@@ -27,13 +27,13 @@ The variable is comma- or whitespace-separated task ids; `_bootstrap_admitted()`
 
 ## The admission bar, and who clears it
 
-Eleven of the twenty active cases are admitted (recount the uncommented entries in the
+Ten of the eighteen active cases are admitted (recount the uncommented entries in the
 script's `TASKS` array rather than trusting this sentence — an earlier copy of it
 miscounted twice): the ones whose recent record shows failures only on their own
 regressions or on infra classes the harness already excludes from the verdict.
 
 The rest still run and report on every pull request, and they cannot red one on a GRADED
-failure. Five are held out with a filed issue naming the exit condition:
+failure. Four are held out with a filed issue naming the exit condition:
 
 - **capacity-pinned-pool-probe** —
   [#1010](https://github.com/gke-labs/kube-agents/issues/1010): worker completes its card
@@ -48,10 +48,6 @@ failure. Five are held out with a filed issue naming the exit condition:
   but the reason for the hold is not. Still main's own trait, so a collapse would tax an
   innocent PR. Enters when #1010's fix merges or when rung-6 screening can compare against
   main.
-- **autoops-warning-event-triage** —
-  [#1101](https://github.com/gke-labs/kube-agents/issues/1101): 0/5 graded repetitions on
-  record; admitting it reds every pull request today. Enters when the lettered-options bar
-  is settled and it has a clean record.
 - **compliance-rbac-overgrant** —
   [#1171](https://github.com/gke-labs/kube-agents/issues/1171): demoted 2026-09-02 after
   rung-4 collapses on unrelated pull requests (#1153 was red on this case alone). The
@@ -68,6 +64,15 @@ failure. Five are held out with a filed issue naming the exit condition:
   repetitions graded rather than classified) turn one dirty window into a correlated
   collapse. Its own record was 12/13 clean before the storms. Enters when #1189's
   re-admission bar holds.
+
+**autoops-warning-event-triage** is no longer in the presubmit `TASKS` array at all
+(tofu wall clock, [#1218](https://github.com/gke-labs/kube-agents/pull/1218)); it runs
+and accrues its record via the nightly tier
+([#1175](https://github.com/gke-labs/kube-agents/pull/1175)) once that runs. Its
+original hold-out rationale stands —
+[#1101](https://github.com/gke-labs/kube-agents/issues/1101): 0/5 graded repetitions on
+record. It enters `BOOTSTRAP_ADMITTED` when the lettered-options bar is settled and it
+has a clean record.
 
 The others are simply new and earn their record like any case, then enter:
 **security-overgrant-remediation-proposal**
