@@ -572,7 +572,9 @@ class TestRepoDerivedFacts(unittest.TestCase):
         self.assertIn("reliability-pdb-probe", active)
         self.assertIn("compliance-rbac-overgrant", active)
         self.assertNotIn("obtainability-planted-pdb", active)  # registered, commented out
-        self.assertNotIn("stockout-pinned-pool", active)
+        # Reactivated by #1082 (the #1023 second-case slate).
+        self.assertIn("stockout-pinned-pool", active)
+        self.assertIn("consistency-drift-outlier", active)
 
 
 class TestContractShape(unittest.TestCase):

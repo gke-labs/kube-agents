@@ -830,7 +830,7 @@ TASKS=(
   # domains at 600-1300s each do not fit one presubmit, so each audit domain
   # is covered by a PROBE -- a targeted question about that domain's planted
   # defect, graded on the reply, the shape cluster-agent-crashloop-debug
-  # proved at 142s -- and exactly ONE full audit stays active as the
+  # proved at 142s -- and exactly ONE full audit stayed active as the
   # machinery canary: compliance-rbac-overgrant, the measured-clean one,
   # which exercises SOP dispatch, delegation, the token minter and the
   # ledger write end to end under the fleet-audits domain. Budget: canary
@@ -905,6 +905,18 @@ TASKS=(
   # (minted token, cloned *-infra workspace, published ledger issue) in a
   # real presubmit.
   "./tasks/compliance-rbac-overgrant/task.yaml"
+  # REACTIVATED (#1023): the capacity and consistency full audits, second
+  # cases for domains their probes cover with a question. Both were parked
+  # by the 2026-08-26 recast for a serial-budget reason the merged fan-out
+  # (#1057, 167min GREEN, zero model 429s at P=4) removed, and both failed
+  # that day's only run on agent-endpoint HTTP 502s -- transport, not
+  # scenario bugs; the endpoint has run green since (build
+  # 2093054834931404800 onward). Still `validated: false`: the activating
+  # PR's own /test all run is the clean measured run, a red takes the
+  # entry back out before that PR leaves draft, and their cost hints below
+  # are audit-shape estimates until it prices them.
+  "./tasks/stockout-pinned-pool/task.yaml"
+  "./tasks/consistency-drift-outlier/task.yaml"
   # Activated by #939, the first Phase 2 domain scenario to run. It was blocked
   # on A5 and nothing else -- no GitHub write, so no A1 and no A4 -- and it
   # exercises the whole of step 2b end to end: label discovery, slot-to-role
@@ -966,7 +978,7 @@ TASKS=(
   # bench/tf/prebuilt/autoops-incident/main.tf for why it cannot, and why it
   # is the host cluster and not the per-run one that gets the incident.
   "./tasks/autoops-warning-event-triage/task.yaml"
-  # Ten registered scenarios stay commented out. The task-registration lint
+  # Eight registered scenarios stay commented out. The task-registration lint
   # counts a commented entry as registered, so a line here is a promise the
   # scenario exists, not that it runs; the domain-coverage lint counts only
   # an UNCOMMENTED one, so activating a scenario also deletes its domain from
@@ -978,14 +990,18 @@ TASKS=(
   #      upgrade-readiness-lagging-cluster, consistency-drift-outlier:
   #      full-audit shape recast to the nightly tier (600-1300s each, measured
   #      or transport-failed on 2026-08-26); each domain is now covered by a
-  #      probe above. They remain spec-ready and activation is uncommenting.
+  #      probe above. The recast's serial-budget reason ended with #1057's
+  #      fan-out: stockout and drift-outlier are reactivated above (#1023),
+  #      upgrade-readiness follows in its own PR, and planted-pdb stays
+  #      parked: reliability's coverage does not depend on it (its probe
+  #      and remediation-proposal variation are active; #1050's further
+  #      activations are in flight), so it is a nightly candidate rather
+  #      than a coverage need.
   #   -- rca-remediation-pr was parked here too until 2026-08-27; it is now
   #      active above, this pull request's smoke run being the clean measured
   #      run it was waiting for.
   # "./tasks/obtainability-planted-pdb/task.yaml"
-  # "./tasks/stockout-pinned-pool/task.yaml"
   # "./tasks/upgrade-readiness-lagging-cluster/task.yaml"
-  # "./tasks/consistency-drift-outlier/task.yaml"
   #
   # Two reliability prompt variations landed with #984 and stay commented
   # out (their siblings obtainability-remediation-proposal and, since
@@ -1086,7 +1102,7 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # that is issue #902's lane. The serial measurements kept below predate the
 # fan-out and are its baseline.
 #
-# TWENTY tasks at three repetitions is SIXTY devops-bench invocations,
+# TWENTY-TWO tasks at three repetitions is SIXTY-SIX devops-bench invocations,
 # where the presubmit's budget was sized for two. The per-invocation cost is no
 # longer an extrapolation from other builds: THIS matrix has run end to end, at
 # thirteen tasks x three repetitions, on build 2093054834931404800
@@ -1098,9 +1114,9 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 #       teardown)                                                16.4min
 #
 # So an invocation averages 3.6min, not the 4.7min extrapolated from #956's and
-# #982's builds -- those over-read it. Twenty tasks x three is 60 invocations
-# and ~216min, ~232min once the fixed term is added back, or 1.55x against the
-# 360m deadline.
+# #982's builds -- those over-read it. Twenty-two tasks x three is 66
+# invocations and ~238min, ~254min once the fixed term is added back, or 1.42x
+# against the 360m deadline.
 #
 # One term in that is still a substitution rather than a measurement:
 # rca-remediation-pr, activated by #998 so that its own smoke run would BE the
@@ -1174,6 +1190,15 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # pull request. It is not a legitimate default: at 1 the collapse rung
 # degenerates to "the single run failed", which is exactly the trigger-happy
 # rule this change exists to replace.
+# #1023's two audit reactivations (stockout-pinned-pool,
+# consistency-drift-outlier) are the expensive additions: at the sibling-shape
+# estimate of ~700-1000s per repetition, six units add ~70-100 minutes of
+# INVOCATION time, roughly 25-35 minutes of span at the ~3x realized
+# parallelism build 2094432646640701440 measured (167 minutes for the 16-case
+# matrix, zero model 429s at P=4). At the 600-1300s bracket's tail the six
+# units are ~130 minutes of invocation, which is why the pricing run is
+# load-bearing rather than a formality. Replace this sentence with their
+# measured costs when the reactivating PR's run prices them.
 EVAL_REPETITIONS="${EVAL_REPETITIONS:-3}"
 if ! [ "${EVAL_REPETITIONS}" -ge 1 ] 2>/dev/null; then
   echo "ERROR: EVAL_REPETITIONS must be a positive integer, got '${EVAL_REPETITIONS}'." >&2
@@ -1338,6 +1363,10 @@ fi
 unit_cost_hint() {
   case "$1" in
     gpu-stress-test-diagnosis | autoops-warning-event-triage) echo 900 ;;
+    # Audit-shape ESTIMATES, not measurements: siblings priced the full
+    # audit at 606-962s (compliance 681s/rep, planted-pdb 962s). Replace
+    # with measured costs from the reactivating PR's run.
+    stockout-pinned-pool | consistency-drift-outlier) echo 900 ;;
     compliance-rbac-overgrant | rca-remediation-pr) echo 700 ;;
     consistency-authorized-networks-probe) echo 300 ;;
     *) echo 200 ;;
