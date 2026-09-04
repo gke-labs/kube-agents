@@ -27,7 +27,7 @@ errors retrieving GitHub installation: failed to get access token url for org <n
   ... Get "https://api.github.com/orgs/<name>/installation": retryable status code: 404
 ```
 
-This holds regardless of App ID, key, or installation state, so it is worth ruling out first: a 404 here means the org lookup, whereas a bad or mismatched key returns 401. The tooling checks this for you: `install.sh` validates the answer at the prompt and re-asks, so a bad value is settled before any GCP resource exists, and re-checks before the apply, which also covers a `vars.sh` edited by hand. It only warns when the lookup itself is inconclusive — an unreachable or rate-limited api.github.com must not block an install that is otherwise fine. Set `SKIP_GITHUB_ORG_CHECK=true` to bypass the check if it is ever wrong about your account; the Minter's own behaviour is unchanged by it.
+This holds regardless of App ID, key, or installation state, so it is worth ruling out first: a 404 here means the org lookup, whereas a bad or mismatched key returns 401. The tooling checks this for you: `install.sh` validates the answer at the prompt and re-asks, so a bad value is settled before any GCP resource exists, and re-checks before the apply, which also covers an `install.env` edited by hand. It only warns when the lookup itself is inconclusive — an unreachable or rate-limited api.github.com must not block an install that is otherwise fine. Set `SKIP_GITHUB_ORG_CHECK=true` to bypass the check if it is ever wrong about your account; the Minter's own behaviour is unchanged by it.
 
 Create the GitOps repository under an organization, or transfer an existing repository into one — a free organization suffices. GitHub shares a single namespace between users and organizations, so an organization cannot take the same name as your personal account.
 
@@ -43,7 +43,7 @@ The App may be owned by the organization or by a personal account, but an App cr
 
 ### Provisioning Configuration Variables
 
-To deploy the agent with GitHub integration, `install.sh` collects the details of your GitHub App into `vars.sh` (and the chart's `githubMinter.*` values through the generated `terraform.tfvars`).
+To deploy the agent with GitHub integration, `install.sh` collects the details of your GitHub App into `install.env` (and the chart's `githubMinter.*` values through the generated `terraform.tfvars`).
 
 - `GITHUB_APP_ID`: The unique numeric ID of the GitHub App (found in the App's General Settings).
 - `GITHUB_ORG`: The name of the GitHub organization or user account where the repository is hosted.

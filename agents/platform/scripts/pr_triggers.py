@@ -248,7 +248,11 @@ def strip_markers(text: str) -> str:
     The loop terminates because every pass that changes anything deletes at
     least one whole match, and it is cheap because each one collapses the nest
     rather than shaving it: a maximally nested 67,626-character body — deeper
-    than GitHub's comment limit allows — converges in 2,602 passes and 0.08s.
+    than GitHub's comment limit allows — converges in 2,602 passes, one per
+    level plus the pass that finds nothing left to do. Shaving would be one per
+    character. The pass count is the invariant and what the test asserts; the
+    wall-clock it buys is a tenth of a second up to a third, depending on the
+    machine, and is not a bound anything relies on.
     """
     text = normalise_newlines(text)
     while True:

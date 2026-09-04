@@ -1,5 +1,5 @@
 streamlit>=1.62.0,<2
-plotly>=6.9.0,<7
+plotly>=7.0.0,<8
 fastapi>=0.141.1,<1
 httpx>=0.28.1,<1
 pydantic>=2.13.4,<3

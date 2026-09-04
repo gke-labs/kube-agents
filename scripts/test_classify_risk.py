@@ -121,13 +121,13 @@ class RuleTriggerTest(unittest.TestCase):
             "id": "x",
             "tier": "medium",
             "why": "w",
-            "all_of": [["k8s-operator/scripts/**"], ["charts/**", "terraform/**"]],
+            "all_of": [["scripts/installer/**"], ["charts/**", "terraform/**"]],
         }
-        both = [_file("k8s-operator/scripts/common.sh"), _file("charts/kube-agents/values.yaml")]
-        one = [_file("k8s-operator/scripts/common.sh")]
+        both = [_file("scripts/installer/common.sh"), _file("charts/kube-agents/values.yaml")]
+        one = [_file("scripts/installer/common.sh")]
         self.assertEqual(
             classify_risk.rule_trigger(rule, both),
-            ["charts/kube-agents/values.yaml", "k8s-operator/scripts/common.sh"],
+            ["charts/kube-agents/values.yaml", "scripts/installer/common.sh"],
         )
         self.assertIsNone(classify_risk.rule_trigger(rule, one))
 

@@ -4,6 +4,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="${REPO_ROOT:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+DIST_DIR="${DIST_DIR:-${REPO_ROOT}/build/dist}"
+
 # shellcheck source=scripts/release/common.sh
 source "${SCRIPT_DIR}/common.sh"
 
@@ -21,11 +24,25 @@ validate_pure_numeric_semver "${RELEASE_VERSION}" "Release version" || exit 1
 # Single Source of Truth: Resolve commit directly from the Git tag created by tag_ga_release.sh
 RELEASE_COMMIT="$(resolve_release_commit "${RELEASE_VERSION}")"
 
+# Collect distribution bundle artifacts if DIST_DIR exists
+dist_files=()
+if [ -d "${DIST_DIR}" ]; then
+  while IFS= read -r file; do
+    [ -f "${file}" ] && dist_files+=("${file}")
+  done < <(find "${DIST_DIR}" -maxdepth 1 -type f | sort)
+fi
+
 echo "======================================================================"
 echo "🚀 PUBLISHING GITHUB RELEASE"
 echo "Release Version:   ${RELEASE_VERSION}"
 echo "Release Commit:     ${RELEASE_COMMIT}"
 echo "Target Repository: ${TARGET_REPO}"
+echo "Distribution Dir:  ${DIST_DIR}"
+if [ "${#dist_files[@]}" -gt 0 ]; then
+  echo "Release Artifacts: ${#dist_files[@]} files found to attach"
+else
+  echo "Release Artifacts: None found in ${DIST_DIR}"
+fi
 echo "======================================================================"
 
 if ! command -v gh >/dev/null 2>&1; then
@@ -40,7 +57,20 @@ fi
 
 # Check if release already exists on GitHub
 if gh release view "${RELEASE_VERSION}" --repo "${TARGET_REPO}" >/dev/null 2>&1; then
-  echo "ℹ️ GitHub Release '${RELEASE_VERSION}' already exists for repository ${TARGET_REPO}. Idempotent skip."
+  if ! is_ci_pipeline; then
+    echo "ℹ️ GitHub Release '${RELEASE_VERSION}' already exists for repository ${TARGET_REPO}. Idempotent skip."
+    exit 0
+  fi
+  echo "ℹ️ GitHub Release '${RELEASE_VERSION}' already exists for repository ${TARGET_REPO}."
+  if [ "${#dist_files[@]}" -gt 0 ]; then
+    echo "🚀 Uploading/updating release assets to existing release '${RELEASE_VERSION}'..."
+    gh release upload "${RELEASE_VERSION}" ${dist_files[@]+"${dist_files[@]}"} \
+      --repo "${TARGET_REPO}" \
+      --clobber
+    echo "✅ Successfully uploaded ${#dist_files[@]} artifacts to existing release '${RELEASE_VERSION}'."
+  else
+    echo "ℹ️ No release artifacts to upload. Idempotent skip."
+  fi
   exit 0
 fi
 
@@ -50,7 +80,7 @@ if ! is_ci_pipeline; then
   exit 0
 fi
 
-gh release create "${RELEASE_VERSION}" \
+gh release create "${RELEASE_VERSION}" ${dist_files[@]+"${dist_files[@]}"} \
   --repo "${TARGET_REPO}" \
   --target "${RELEASE_COMMIT}" \
   --title "Release ${RELEASE_VERSION}" \

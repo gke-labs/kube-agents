@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Image plumbing shared by the plugin installers. Source it; running it does nothing.
 #
-# Every plugin image in this directory is `FROM scratch` plus a COPY of one tree, so the
-# entire build is a single tar layer. That is what makes a local build practical, and a
-# local build is the point:
+# Plugin images in this directory use `FROM busybox:musl` (or a single tar layer)
+# plus a COPY of the plugin tree, so the image can either be mounted via native Kubernetes
+# ImageVolumeSource (on GKE Standard) or staged via an init container on platforms that
+# restrict image volumes (such as GKE Autopilot). That is what makes a local build practical,
+# and a local build is the point:
 #
 #   docker  builds the plugin's own Dockerfile and pushes it. Validates the Dockerfile.
 #   crane   assembles the same layer and pushes it. No daemon, no Dockerfile.
@@ -79,11 +81,12 @@ PLUGIN_CRANE_BIN="${CRANE_BIN:-crane}"
 #      builders stage a world-readable copy instead of shipping the working tree's modes
 #   4  the exclusion set is read from the plugin's .dockerignore rather than hardcoded
 #      here, so the crane layer and `docker build` cannot ship different files
+#   5  crane builder honours the Dockerfile base image and /files/ staging layout
 #
 # Note that 3 makes this counter a backstop rather than the first line of defence: a
 # per-plugin build change now moves that plugin's tag on its own. The counter still
 # covers a change to THIS file, which no plugin's digest can see.
-PLUGIN_IMAGE_RECIPE=4
+PLUGIN_IMAGE_RECIPE=5
 
 # Set by plugin_image_resolve.
 PLUGIN_IMAGE_REF=""
@@ -867,12 +870,42 @@ plugin_image_docker_publish() {
     docker push "$image" || return 1
 }
 
-# Assemble the same single-layer image with crane and push it. No daemon, no Dockerfile.
+# Assemble the same image with crane and push it without requiring a Docker daemon.
 plugin_image_crane_publish() {
     local plugin_dir="$1" src_dir="$2" image="$3"
     local root="$4/root" layer="$4/layer.tar" staging="$3.staging"
+    local base_image="" has_files_copy=0 line=""
+
+    if [ -f "${plugin_dir}/Dockerfile" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            case "$line" in
+                FROM\ *|from\ *)
+                    base_image="${line#* }"
+                    base_image="${base_image#"${base_image%%[![:space:]]*}"}"
+                    base_image="${base_image%% *}"
+                    ;;
+                COPY\ *\ /files*|copy\ *\ /files*)
+                    has_files_copy=1
+                    ;;
+            esac
+        done <"${plugin_dir}/Dockerfile"
+    fi
 
     plugin_image_stage "$plugin_dir" "$src_dir" "$root" || return 1
+
+    # When the Dockerfile stages files to /files/ in addition to /, replicate that
+    # directory in root so crane produces the same filesystem layout.
+    if [ "$has_files_copy" = "1" ]; then
+        mkdir -p "$root/files" || return 1
+        (
+            cd "$root" &&
+                find . -mindepth 1 -maxdepth 1 ! -name files |
+                while IFS= read -r item; do
+                    cp -R "$item" "$root/files/" || exit 1
+                done
+        ) || return 1
+    fi
 
     # --numeric-owner --owner=0 --group=0 is required, not cosmetic: without it macOS tar
     # writes the invoking user's ids and aborts with "Numeric user ID too large".
@@ -896,14 +929,13 @@ plugin_image_crane_publish() {
     ) || return 1
 
     # Published under a staging tag and moved onto the real one, never assembled in
-    # place. `crane append` on an empty base writes a config with os and architecture set
-    # to "" — not what `docker build --platform` produces for the same Dockerfile — and
-    # the mutate below is what fixes that. Were the append to write the final tag
-    # directly, a mutate that failed would leave a valid-looking image under the tag the
-    # content digest names, and every later install would find it published, skip the
-    # build, and deploy the broken platform forever. The final tag only ever appears
-    # fully formed, so a failure here is simply retried by re-running the installer.
-    "$PLUGIN_CRANE_BIN" append -f "$layer" -t "$staging" || return 1
+    # place. When a base image is specified in Dockerfile (e.g. busybox:musl), crane appends
+    # onto that base; otherwise it appends onto an empty scratch base.
+    if [ -n "$base_image" ] && [ "$base_image" != "scratch" ]; then
+        "$PLUGIN_CRANE_BIN" append -b "$base_image" -f "$layer" -t "$staging" || return 1
+    else
+        "$PLUGIN_CRANE_BIN" append -f "$layer" -t "$staging" || return 1
+    fi
     "$PLUGIN_CRANE_BIN" mutate "$staging" \
         --set-platform "$PLUGIN_TARGET_PLATFORM" -t "$image" >/dev/null || return 1
     # Best effort, and deliberately not a warning. Deleting a tag needs a permission that

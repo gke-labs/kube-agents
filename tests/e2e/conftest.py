@@ -15,11 +15,26 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pytest
 
+# tests/e2e/.env, not the repository root: the root name belongs to install.env,
+# and the two files spell GITHUB_ORG, GITHUB_REPO, GITHUB_APP_ID and
+# CHAT_TOPIC_NAME the same while meaning different things by them. Reading both
+# would let install values reach the suite under those names — and because
+# load_dotenv does not override an already-set variable, which one won would
+# depend on load order.
 try:
     from dotenv import load_dotenv
-    _repo_root_env = pathlib.Path(__file__).resolve().parents[2] / ".env"
-    if _repo_root_env.is_file():
-        load_dotenv(_repo_root_env)
+    _suite_env = pathlib.Path(__file__).resolve().parent / ".env"
+    if _suite_env.is_file():
+        load_dotenv(_suite_env)
+    # A root .env is a leftover from before the move. Saying so beats leaving
+    # the suite to run with none of the configuration its owner thinks it has.
+    _legacy_env = pathlib.Path(__file__).resolve().parents[2] / ".env"
+    if _legacy_env.is_file():
+        print(
+            f"warning: {_legacy_env} is no longer read; the E2E environment file "
+            f"moved to {_suite_env}. Move it there.",
+            file=sys.stderr,
+        )
 except ImportError:
     pass
 

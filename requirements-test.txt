@@ -19,13 +19,13 @@
 # run, so pinning them here would be pinning a fiction rather than what ships.
 #
 # For mcp that stand-in is checked rather than assumed, and it holds on the
-# major line only: the ceiling below keeps this file on the same 1.x line as
-# the image, which is what `mcp.server.fastmcp` needs and all it needs. The
+# major line only: the floor below keeps this file on the same 2.x line as
+# the image, which is what `mcp.server.MCPServer` needs and all it needs. The
 # patch versions differ and nothing makes the two environments identical -- CI
 # runs Python 3.12, the image 3.13 -- so a failure that turns on a patch
 # release or an interpreter version will not reproduce from this file.
 #
-# If the install fails with "No matching distribution found for mcp<2", pip is
+# If the install fails with "No matching distribution found for mcp>=2.1.1", pip is
 # pointed at a mirror that does not carry it -- check `pip config debug`. The
 # package is on PyPI, so the fix is to name the index for this one install
 # rather than to reconfigure the machine:
@@ -43,29 +43,29 @@ fastapi
 # reason the paragraph above can claim what it claims.
 #
 # agent_common_server.py, platform_mcp_server.py and router_server.py all do
-# `from mcp.server.fastmcp import FastMCP`, and 2.x deletes that module in
-# favour of `mcp.server.mcpserver.MCPServer`. The runtime image cannot follow.
-# mcp reaches /opt/hermes/.venv from the digest-pinned Hermes base in tags.env;
-# deploy/docker/Dockerfile names no mcp requirement of its own, and the
-# unpinned `uv pip install "hermes-agent[...]"` into that venv is a resolution
-# step that leaves an already-satisfied mcp where it is. That base ships 1.28.1
-# on Python 3.13.5, and hermes-agent's own code imports the same module
-# (mcp_serve.py, agent/transports/hermes_tools_mcp_server.py), so upgrading the
-# venv breaks the harness and not just our three scripts. Those last facts are
-# read out of the image, not out of this repo -- the digest they came from is
-# HERMES_AGENT_TAG in tags.env, and re-check them there if it moves. The
-# ceiling comes off when the base image ships 2.x, not when those three are
-# ported (#800).
+# `from mcp.server import MCPServer`, and 1.x has no such module -- there it is
+# `mcp.server.fastmcp.FastMCP`. mcp reaches /opt/hermes/.venv from the
+# digest-pinned Hermes base in tags.env; deploy/docker/Dockerfile names no mcp
+# requirement of its own, and the unpinned `uv pip install "hermes-agent[...]"`
+# into that venv is a resolution step that leaves an already-satisfied mcp
+# where it is. That base ships 2.0.0 on Python 3.13.5, and hermes-agent's own
+# code imports the same module (mcp_serve.py,
+# agent/transports/hermes_tools_mcp_server.py), so downgrading the venv breaks
+# the harness and not just our three scripts. Those last facts are read out of
+# the image, not out of this repo -- the digest they came from is
+# HERMES_AGENT_TAG in tags.env, and re-check them there if it moves. This was a
+# `<2` ceiling until v2026.8.19 moved the base to 2.0.0 and the three scripts
+# were ported with it (#800).
 #
 # It bounds the package and not the interpreter -- 1.x and 2.x both declare
 # requires-python >=3.10 and ship one pure-Python wheel -- so it rules out no
 # Python version CI runs.
-mcp<2
+mcp>=2.1.1
 
 python-dotenv
 pyyaml
 
-# `make coverage` and the CI coverage job. coverage runs the unittest suite
+# `make coverage`, which the CI `test` job runs. coverage runs the unittest suite
 # under measurement; diff-cover reads the resulting coverage.xml plus the
 # branch diff to report coverage of changed lines only. Neither is imported by
 # anything under test -- they are tooling, listed here so the local and CI

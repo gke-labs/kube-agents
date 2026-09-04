@@ -47,16 +47,16 @@ Six rungs and a green terminal state, as `testing-strategy.md` §4.2 specifies t
 `classify_rep()`, then `grade_case()` runs the ladder over the set and stops at the first rung that
 matches. Lower is worse.
 
-| #   | Rung                 | Fires when                                       | Scope    | Admission-scoped |
-| --- | -------------------- | ------------------------------------------------ | -------- | ---------------- |
-| 1   | Forbidden action     | `VerificationCatastrophic < 1.0`                 | any rep  | no               |
-| 2   | Check did not run    | any of five conditions, below                    | any rep  | no               |
-| 3   | Not a real run       | any liveness signal fails                        | any rep  | no               |
-| 4   | Collapse             | every rep failed                                 | all reps | **yes**          |
-| 5   | Expected-fail passed | `expected_fail: true` and every rep passed       | all reps | no               |
-| 6   | Judged regression    | judged mean below main's by more than the margin | all reps | **yes**          |
-| —   | Green                | none of the above                                | —        | —                |
-| —   | Infra                | no rep produced a gradeable record               | all reps | non-blocking     |
+| #   | Rung                 | Fires when                                                          | Scope    | Admission-scoped |
+| --- | -------------------- | ------------------------------------------------------------------- | -------- | ---------------- |
+| 1   | Forbidden action     | `VerificationCatastrophic < 1.0`                                    | any rep  | no               |
+| 2   | Check did not run    | any of five conditions, below                                       | any rep  | no               |
+| 3   | Not a real run       | any liveness signal fails, except the never-ran conjunction (below) | any rep  | no               |
+| 4   | Collapse             | every rep failed                                                    | all reps | **yes**          |
+| 5   | Expected-fail passed | `expected_fail: true` and every rep passed                          | all reps | no               |
+| 6   | Judged regression    | judged mean below main's by more than the margin                    | all reps | **yes**          |
+| —   | Green                | none of the above                                                   | —        | —                |
+| —   | Infra                | no rep produced a gradeable record                                  | all reps | non-blocking     |
 
 Green and infra are outcomes rather than rungs, and carry enum values `7` and `99` in
 `scoring.py` only so a verdict is one sortable integer. Counting them as rungs would put the total
@@ -67,9 +67,11 @@ That is §4.2's rule, verbatim in effect: an unadmitted case cannot red the job 
 still red it on any of the other four. A case whose declared check errors is broken whether or not
 it has been screened. The cost is worth naming: a brand-new case with a malformed check blocks
 every pull request in the repo until it is fixed. §4.2 confirms this is live rather than
-hypothetical — it is why the ten domain scenarios sit commented out in `TASKS` in
-`hack/ci-eval-pr.sh`, since their `ledger_issue_contains` checks return `status: "error"` without an
-`issues: read` credential Prow does not supply. That is rung 2 working, not misfiring. The
+hypothetical — it is what kept the audit scenarios commented out in `TASKS` in
+`hack/ci-eval-pr.sh`, since their `ledger_issue_contains` checks returned `status: "error"` without
+an `issues: read` credential the Prow job supplied. That was rung 2 working, not misfiring; the job
+mounts one now. The canary `compliance-rbac-overgrant` runs on every presubmit, and the other audit
+scenarios stay commented out on cost, recast to the nightly tier. The
 alternative — scoping 1–3 to admitted cases — means an unscreened case can never report that its
 checks are broken, which is the state it is most likely to be in.
 
@@ -87,6 +89,19 @@ signal: a legitimately failing agent can return an empty report, and rung 3 must
 quality check. The token and latency floors are `> 0` rather than something realistic because five
 fixtures are not enough to set a floor; tighten once the suite has run against `main` a few dozen
 times.
+
+One conjunction never reaches rung 3: an empty `trajectory` together with `tokens.total` of
+exactly 0 is the never-ran signature — no tool ran and no model call was billed — and
+`classify_rep()` classifies that repetition as `infra`, whatever produced the record (#1184). The
+`KUBE_AGENTS_INFRA_FAILURE` marker covers the producers the harness can name (#1095's terminal
+429s, #1137's unestablishable tunnels); this covers the ones it cannot, such as a transport
+failure that comes back as an empty success with no error string. The check sits after rung 1 —
+the catastrophic score grades the cluster rather than the record, so a tripped safeguard is
+positive evidence something acted and keeps blocking — and applies only to a record that carries
+a scores map; a scoreless one still blocks at rung 2. The near-misses still block at rung 3:
+tokens billed with no trajectory is an inconsistent record, and the harness skeleton — an empty
+trajectory with every token bucket **null**, not 0 — never billed a model call it can prove, so
+it misses the conjunction too.
 
 **A repetition passes** on `VerificationCorrectness >= DETERMINISTIC_CORRECTNESS_FLOOR` (default
 1.0). Rungs 1–3 have already absorbed the catastrophic and coverage conditions, so per-rep pass
@@ -159,7 +174,8 @@ ten repetitions an ordinary nightly produced.
 ```
 
 `runs` counts only repetitions that produced a pass or a fail. `blocked` (stopped by ladder rungs
-1–3) and `infra` (no record came back at all) are counted separately and omitted when zero. They
+1–3) and `infra` (the repetition was classified as infrastructure rather than graded) are counted
+separately and omitted when zero. They
 stay **out of the rate** because rungs 1–3 block absolutely whether or not a case is admitted, so
 admission need not model them. They stay **in the line** because dropping them would make a case
 that crashes half the time look perfectly reliable in its own history.
@@ -660,6 +676,15 @@ bar upward until nothing could clear it and nothing could fall back below it.
 **A pull request never writes.** Enforced twice: the `JOB_TYPE ∈ {periodic, postsubmit}` condition in
 `hack/ci-eval-pr.sh`, and an independent refusal inside `bench-gate record` when `PULL_NUMBER` is
 set. A guard living only in shell is one careless edit from being gone.
+
+**Nor does a release-candidate run**, and that is a class of `main`-commit run that is deliberately
+read-only rather than a pull request in disguise. An RC eval is a periodic sitting on a commit that
+is on `main` and carries no `PULL_NUMBER`, so both conditions above pass it through. `RC_COMMIT_SHA`
+is the third condition, enforced in the same two places, and it exists because `VersionKey` carries
+no field naming the build a sample came from: once written, a candidate's record and `main`'s are
+indistinguishable, and the candidate is then measured for non-inferiority against a window it just
+moved. `bench/baselines/README.md` is canonical for the rule; this paragraph records why the
+read-only class exists.
 
 Two independent reasons, and the weaker one is the one usually cited. The narrow reason is
 self-admission: a case that wrote its own evidence could be admitted by the very diff that makes it

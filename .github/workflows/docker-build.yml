@@ -51,6 +51,55 @@ jobs:
       # a transfer from the buildx cache into the daemon, which is why only this
       # build and the gate-test build below -- the two whose output a later step
       # runs or inspects -- pay for it.
+      #
+      # The only build here carrying a remote layer cache, and the only one that
+      # needs one: `platform` is the deepest chain the Dockerfile ships and nearly
+      # all of this job's ~5.5 minutes is spent on it. Measured on a fork: 211s and
+      # 236s uncached, 79s restoring, which takes the job from 5.4 to 3.6 minutes.
+      # The export costs the writing run about 150s, which is why only main pays it.
+      # The two builds below that
+      # share its lineage reuse it without a cache of their own --
+      # entrypoint-gate-test is FROM platform and credential-proxy reaches
+      # agent-base through proxy-tools, so both hit buildkit's local state from this
+      # step. Separate scopes for them would export the same layers again for no
+      # extra hit. Build Replay Proxy is not in that set: it builds from its own
+      # context and shares no stage with this chain, so a cache would have to be its
+      # own, and at ~7s of the job it is not worth one.
+      #
+      # Read on the pull request, build fresh and write on the push to main. The two
+      # events want opposite things and the split is the point.
+      #
+      # A pull request wants speed, and a slightly stale base is fine there because
+      # nothing it builds ships. The push to main must not read the cache: this
+      # workflow's header says the layer budget and the entrypoint gate are checked
+      # only here, and the image they check has to be the one that ships. What ships
+      # is built by docker-publish-ghcr.yml, which carries no cache at all. The
+      # agent-base stage installs its apt packages and `uv pip install
+      # hermes-agent[...]` without version pins, and buildkit keys those layers on the
+      # command string and parent digest, so neither key moves when upstream
+      # publishes. HERMES_AGENT_TAG is digest-pinned in tags.env, so the base image is
+      # not the exposure -- what is installed on top of it is. Restore those layers on
+      # main and the gate would validate one dependency set while the publish shipped
+      # another, which is the after-merge Cloud Build failure this job exists to
+      # prevent. Main pays for a full build today, so building fresh here costs
+      # nothing against the status quo and keeps each merge's export honest.
+      #
+      # Writing only on main is also a budget decision. A cache written on a pull
+      # request ref is restorable by later runs of that same pull request but is
+      # invisible to every other ref, so N branches exporting mode=max copies of an
+      # image this size compete for one repository budget -- already ~17 GB across
+      # ~378 entries when this was written, close enough to eviction to push the
+      # setup-go and CodeQL entries out. One writer per merge keeps a single lineage
+      # every pull request restores from its base. That write is not free either: the
+      # gha backend stores one entry per layer keyed by content digest, so unchanged
+      # layers cost nothing after the first export, but the first one is the whole
+      # lineage. Watch `gh api /repos/gke-labs/kube-agents/actions/cache/usage` after
+      # this merges -- if the total climbs rather than settling, this is why.
+      #
+      # scope= is explicit because buildkit's gha backend defaults every export to
+      # the scope `buildkit`, where docker-publish-k8s-operator.yml already writes a
+      # different image. Two images sharing a scope overwrite each other's index and
+      # both stop hitting.
       - name: Build Platform Agent
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
@@ -61,6 +110,8 @@ jobs:
           push: false
           load: true
           tags: platform-agent:latest
+          cache-from: ${{ github.event_name == 'pull_request' && 'type=gha,scope=platform-agent' || '' }}
+          cache-to: ${{ github.event_name == 'push' && 'type=gha,mode=max,scope=platform-agent' || '' }}
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
 

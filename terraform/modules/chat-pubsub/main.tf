@@ -38,16 +38,31 @@ resource "google_project_service_identity" "chat" {
   service = "chat.googleapis.com"
 }
 
+# `.id`, never `.name`, on every binding below.
+#
+# GCP purges a topic's or subscription's IAM policy when the resource is deleted
+# and recreated, so a binding that Terraform does not replace alongside it is
+# gone from the live policy while state still records it as present. `.name` is
+# resolved from an input variable and so is known at plan time: it reads the same
+# before and after a replacement, the binding is excluded from the plan
+# altogether, and the apply finishes green over an empty policy (`etag: ACAB`).
+# The credential proxy then fails its chat pulls with PermissionDenied and serves
+# HTTP 503, and nothing in the plan output ever mentioned the grant.
+#
+# `.id` is computed, so a replacement renders it unknown, which is what pulls the
+# bindings into the plan with it. The provider's diff suppression treats
+# `projects/P/topics/T` and `T` as the same value, so switching an existing
+# install from one to the other plans no change of its own.
 resource "google_pubsub_topic_iam_member" "chat_api_push_publisher" {
   project = var.project_id
-  topic   = google_pubsub_topic.chat_events.name
+  topic   = google_pubsub_topic.chat_events.id
   role    = "roles/pubsub.publisher"
   member  = "serviceAccount:chat-api-push@system.gserviceaccount.com"
 }
 
 resource "google_pubsub_topic_iam_member" "gsuiteaddons_publisher" {
   project = var.project_id
-  topic   = google_pubsub_topic.chat_events.name
+  topic   = google_pubsub_topic.chat_events.id
   role    = "roles/pubsub.publisher"
   member  = "serviceAccount:service-${data.google_project.this.number}@gcp-sa-gsuiteaddons.iam.gserviceaccount.com"
 
@@ -56,14 +71,14 @@ resource "google_pubsub_topic_iam_member" "gsuiteaddons_publisher" {
 
 resource "google_pubsub_subscription_iam_member" "agent_subscriber" {
   project      = var.project_id
-  subscription = google_pubsub_subscription.chat_events.name
+  subscription = google_pubsub_subscription.chat_events.id
   role         = "roles/pubsub.subscriber"
   member       = "serviceAccount:${var.agent_service_account_email}"
 }
 
 resource "google_pubsub_subscription_iam_member" "agent_viewer" {
   project      = var.project_id
-  subscription = google_pubsub_subscription.chat_events.name
+  subscription = google_pubsub_subscription.chat_events.id
   role         = "roles/pubsub.viewer"
   member       = "serviceAccount:${var.agent_service_account_email}"
 }

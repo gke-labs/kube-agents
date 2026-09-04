@@ -75,13 +75,16 @@ SCRATCH_DIR = "/opt/data/scratch"
 
 BARE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
-# How much of a thread travels with the requests. Both caps are generous enough
-# that no ordinary review conversation meets them, and both report what they
-# dropped — `omitted_earlier` on the thread, `truncated_chars` on the comment —
-# because a silently shortened transcript reads as a complete one, and the
-# worker would answer confidently from a conversation it only half saw.
+# How much of a thread travels with the requests. All caps are generous enough
+# that no ordinary review conversation meets them, and all report what they
+# dropped — `omitted_earlier` and `omitted_requests` on the thread, `truncated_chars`
+# on the comment / request — because a silently shortened transcript reads as a
+# complete one, and the worker would answer confidently from a conversation it only
+# half saw.
 CONTEXT_MAX_COMMENTS = 40
 CONTEXT_MAX_BODY_CHARS = 4000
+CONTEXT_MAX_REQUEST_CHARS = pr_triggers.MAX_REQUEST_CHARS
+CONTEXT_MAX_REQUESTS = 10
 
 
 def _fail(message: str):
@@ -140,6 +143,14 @@ def _find_pr(provider, repo: str, number: int, viewer: str):
     _fail(f"{repo}#{number} is not an open pull request.")
 
 
+def _context_request(request: str) -> tuple[str, int]:
+    """A request text as the model should see it, and how much was cut."""
+    text = request or ""
+    if len(text) <= CONTEXT_MAX_REQUEST_CHARS:
+        return text, 0
+    return text[:CONTEXT_MAX_REQUEST_CHARS], len(text) - CONTEXT_MAX_REQUEST_CHARS
+
+
 def _requests_on(provider, repo: str, pr, viewer: str) -> tuple[list, list]:
     """Every comment on one pull request, and the unanswered requests among them.
 
@@ -163,21 +174,23 @@ def _requests_on(provider, repo: str, pr, viewer: str) -> tuple[list, list]:
         )
         if trigger is None:
             continue
-        requests.append(
-            {
-                "pr": pr.number,
-                "head_ref": pr.head_ref,
-                "comment_id": comment.node_id,
-                "author": comment.author,
-                "can_write": comment.can_write,
-                "can_write_known": comment.can_write_known,
-                "kind": trigger.kind,
-                "request": trigger.request,
-                "created_at": comment.created_at,
-                "path": comment.path,
-                "line": comment.line,
-            }
-        )
+        req_text, truncated = _context_request(trigger.request)
+        row = {
+            "pr": pr.number,
+            "head_ref": pr.head_ref,
+            "comment_id": comment.node_id,
+            "author": comment.author,
+            "can_write": comment.can_write,
+            "can_write_known": comment.can_write_known,
+            "kind": trigger.kind,
+            "request": req_text,
+            "created_at": comment.created_at,
+            "path": comment.path,
+            "line": comment.line,
+        }
+        if truncated:
+            row["truncated_chars"] = truncated
+        requests.append(row)
     return comments, requests
 
 
@@ -226,7 +239,9 @@ def _context_body(body: str) -> tuple[str, int]:
     return text[:CONTEXT_MAX_BODY_CHARS], len(text) - CONTEXT_MAX_BODY_CHARS
 
 
-def _conversation(comments, self_login: str, request_ids) -> tuple[list, int]:
+def _conversation(
+    comments, self_login: str, request_ids, all_request_ids=None
+) -> tuple[list, int]:
     """The thread one pull request's requests arrived in, oldest first.
 
     Sorted here as well as in the provider: ordering is part of this payload's
@@ -243,13 +258,14 @@ def _conversation(comments, self_login: str, request_ids) -> tuple[list, int]:
     point opposite ways: the sweep hands the worker the *oldest* unanswered
     trigger, and the cap drops the *oldest* comments — so on a thread past the
     cap the comment being answered is the first thing thrown away. For a
-    `mention` trigger `Trigger.request` is empty by construction, so the card
+    `@mention` trigger `Trigger.request` is empty by construction, so the card
     carries no copy of it either, and the worker would be asked to answer a
     request whose text appears nowhere in its context. Pinning costs at most
-    `PR_AGENT_MAX_PER_TICK` extra rows.
+    `CONTEXT_MAX_REQUESTS` extra rows.
     """
     ordered = sorted(comments, key=lambda c: (c.created_at, c.node_id))
     wanted = set(request_ids or ())
+    is_req_ids = set(all_request_ids if all_request_ids is not None else wanted)
     recent = ordered[max(0, len(ordered) - CONTEXT_MAX_COMMENTS) :]
     kept_ids = {c.node_id for c in recent} | wanted
     kept = [c for c in ordered if c.node_id in kept_ids]
@@ -264,7 +280,7 @@ def _conversation(comments, self_login: str, request_ids) -> tuple[list, int]:
             "kind": comment.kind,
             "can_write": comment.can_write,
             "is_self": forge.normalise_login(comment.author) == self_login,
-            "is_request": comment.node_id in request_ids,
+            "is_request": comment.node_id in is_req_ids,
             "body": body,
         }
         if comment.path:
@@ -319,6 +335,7 @@ def handle_poll(args) -> int:
         found = []
         threads = []
         over_budget = 0
+        deferred_requests = 0
         for repo, pr in prs:
             comments, pr_requests = _requests_on(provider, repo, pr, viewer)
             # Untrusted requests past this pull request's refusal budget are not
@@ -338,6 +355,29 @@ def handle_poll(args) -> int:
                 ]
                 over_budget += len(pr_requests) - len(kept)
                 pr_requests = kept
+
+            # After the budget filter: cap-deferred rows keep is_request,
+            # budget-buried rows stay unflagged.
+            all_unanswered_ids = {row["comment_id"] for row in pr_requests}
+
+            # Prioritize trusted requests over untrusted ones so an untrusted burst
+            # before refusal budget exhaustion cannot starve maintainer requests.
+            trusted_requests = [
+                r for r in pr_requests if r.get("can_write") or not r.get("can_write_known")
+            ]
+            untrusted_requests = [
+                r for r in pr_requests if not r.get("can_write") and r.get("can_write_known")
+            ]
+            ordered_requests = trusted_requests + untrusted_requests
+
+            deferred_count = 0
+            if len(ordered_requests) > CONTEXT_MAX_REQUESTS:
+                deferred_count = len(ordered_requests) - CONTEXT_MAX_REQUESTS
+                deferred_requests += deferred_count
+                pr_requests = ordered_requests[:CONTEXT_MAX_REQUESTS]
+            else:
+                pr_requests = ordered_requests
+
             if not pr_requests:
                 # No thread without a request in it: the worker is answering
                 # something, and a transcript of a pull request nobody addressed
@@ -345,11 +385,16 @@ def handle_poll(args) -> int:
                 continue
             found.extend(pr_requests)
             rows, omitted_earlier = _conversation(
-                comments, viewer, {row["comment_id"] for row in pr_requests}
+                comments,
+                viewer,
+                request_ids={row["comment_id"] for row in pr_requests},
+                all_request_ids=all_unanswered_ids,
             )
             thread = {"repo": repo, "pr": pr.number, "head_ref": pr.head_ref, "comments": rows}
             if omitted_earlier:
                 thread["omitted_earlier"] = omitted_earlier
+            if deferred_count:
+                thread["omitted_requests"] = deferred_count
             threads.append(thread)
     except forge.ForgeError as error:
         print(json.dumps({"status": "ERROR", "reason": error.reason, "value": error.value}))
@@ -362,6 +407,11 @@ def handle_poll(args) -> int:
         sys.stderr.write(
             f"pr_conversation: {over_budget} untrusted request(s) not offered — "
             "the pull request's refusal budget is spent\n"
+        )
+    if deferred_requests:
+        sys.stderr.write(
+            f"pr_conversation: {deferred_requests} request(s) deferred — "
+            f"poll offers at most {CONTEXT_MAX_REQUESTS} per pull request\n"
         )
 
     if not found:

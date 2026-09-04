@@ -26,7 +26,10 @@ none of them is a flake: a tripped catastrophic safeguard (rung 1), a declared
 check that errored rather than ran (rung 2), and a record that is not evidence
 of a real agent run (rung 3). Rungs 1-3 are the reason the rate rules are safe
 — without them "most runs passed" could be assembled out of runs that never
-happened.
+happened. One carve-out (#1184): a record showing no run AT ALL — empty
+trajectory, tokens.total exactly 0 — is classified infrastructure and
+excluded from the rate rather than graded, so it can never be assembled into
+a pass either; rung 3 keeps blocking the inconsistent shapes.
 
 HOW THE JUDGE IS AND IS NOT USED. No judged score is ever compared against an
 absolute threshold, and the reason is measured rather than assumed: three
@@ -145,6 +148,34 @@ DEFAULT_JUDGED_MARGIN = 0.5
 #: duplication cannot drift silently.
 INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 
+#: Field values from devops-bench's ``_build_failed_record``: ``status`` is
+#: ``"failed"`` on every failed record, and ``verification_status`` is
+#: ``"not_evaluated"`` when verification did not run -- which has TWO
+#: producers, not one. The exception path writes it when the deployer never
+#: came up, and also when infrastructure WAS up but its own verification
+#: retry crashed while building the failed record. That second producer, and
+#: the fact that a failed record always carries an empty trajectory (the
+#: builder overlays ``_empty_record`` and never copies the agent's trajectory,
+#: even when an agent ran), are why these values narrow the provisioning-death
+#: shape but cannot identify it: ``classify_rep`` also requires the error
+#: signature below. Duplicated rather than imported for the same reason as
+#: the marker above: the scorer reads records as plain JSON and must not
+#: import ``devops_bench``.
+FAILED_RECORD_STATUS = "failed"
+VERIFICATION_NEVER_RAN = "not_evaluated"
+
+#: How devops-bench's ``SubprocessError`` renders a command that exited
+#: non-zero (``devops_bench/core/errors.py``): this prefix, one ``": "``, then
+#: the command line itself, with any stderr on later lines. ``classify_rep``
+#: accepts a scoreless failed record as a provisioning death only when the
+#: command after the prefix is the task's own deployer -- the registry key and
+#: the binary agree for every deployer devops-bench ships (``"tofu"`` shells
+#: ``tofu``), and nothing downstream of ``deployer.up()`` shells that binary,
+#: so an agent-step or verifier crash cannot produce the signature. A crash
+#: whose error does not match stays a blocking rung-2 record, which is the
+#: fail-closed side of the trade.
+PROVISION_FAILURE_PREFIX = "command failed with exit code "
+
 
 class Rung(IntEnum):
     """The verdict ladder, evaluated in order, stopping at the first match.
@@ -191,8 +222,13 @@ class RunRecord:
     #: but evaluated zero tasks, which is the resource-preparation signature.
     empty_record: bool
     #: False when the record exists but carries no ``scores`` map at all --
-    #: the scoring pass crashed.
+    #: the scoring pass crashed, unless the record is the provision-failure
+    #: shape, which never had a run to score. See ``classify_rep``.
     has_scores: bool
+    #: ``verification_status`` as devops-bench wrote it -- ``"evaluated"``,
+    #: ``"not_evaluated"`` or ``"skipped_no_infra"`` -- and None on a record
+    #: that predates the field.
+    verification_status: str | None
     setup_id: str | None
     scoring_version: str | None
     agent_model: str | None
@@ -295,6 +331,7 @@ def load_run(run_dir: str | Path) -> RunRecord | None:
             error=rec.get("error") or (rec.get("errors") or None),
             empty_record=empty,
             has_scores=bool(scores),
+            verification_status=_as_str(rec.get("verification_status")),
             setup_id=_as_str(manifest.get("setupId")),
             scoring_version=_as_str(row.get("scoringVersion")),
             agent_model=_as_str(manifest.get("model")),
@@ -416,6 +453,32 @@ def _failed_checks(record: RunRecord) -> list[str]:
     return out
 
 
+def _provision_death(error: Any, deployer: str) -> str | None:
+    """The first line of ``error`` when it is the deployer's own command
+    failing, else None.
+
+    Matches ``SubprocessError``'s rendering -- ``PROVISION_FAILURE_PREFIX``,
+    one ``": "``, then the command line -- and only when the command is the
+    task's deployer (``tofu`` or ``tofu apply ...``, never ``gcloud ...``).
+    ``error`` may be the ``errors`` list rather than the scalar: ``load_run``
+    falls back to it when the scalar is empty, and the first entry is the
+    same text ``_build_failed_record`` writes to both.
+    """
+    if isinstance(error, (list, tuple)):
+        error = error[0] if error else None
+    if error is None:
+        return None
+    first_line = str(error).splitlines()[0] if str(error) else ""
+    if not first_line.startswith(PROVISION_FAILURE_PREFIX):
+        return None
+    _, sep, command = first_line.partition(": ")
+    if not sep:
+        return None
+    if command == deployer or command.startswith(deployer + " "):
+        return first_line
+    return None
+
+
 def classify_rep(
     spec: CaseSpec,
     run_dir: str | Path | None,
@@ -425,10 +488,12 @@ def classify_rep(
 ) -> RepResult:
     """Grade one repetition against rungs 1-3, then the correctness floor.
 
-    Preserves the presubmit's existing three-way run classification exactly:
-    a missing or empty record is INFRA on a task with infrastructure and a
-    blocking failure on a ``noop`` task, and a record with no ``scores`` map
-    blocks either way.
+    Preserves the presubmit's existing three-way run classification: a missing
+    or empty record is INFRA on a task with infrastructure and a blocking
+    failure on a ``noop`` task. A record with no ``scores`` map blocks -- the
+    scoring pass crashed -- unless it is devops-bench's provision-failure
+    shape on a task with infrastructure, which is INFRA for the same reason
+    the missing record is: the deployer died before there was a run to score.
     """
     record = load_run(run_dir) if run_dir is not None else None
     where = None if run_dir is None or str(run_dir) == MISSING else str(run_dir)
@@ -487,6 +552,47 @@ def classify_rep(
             "answer in it to grade",
         )
 
+    # The provisioning-death shape: ``deployer.up()`` raised before any agent
+    # was launched, and devops-bench's ``_build_failed_record`` wrote the
+    # exception text with an empty trajectory, an empty scores map, and
+    # ``verification_status="not_evaluated"``. No scoring pass crashed here;
+    # none was ever reached, because there was no run to score. On a task
+    # with infrastructure that is resource preparation, not the pull request
+    # -- the reading the missing-record branch above already gives to a
+    # *weaker* signal, since this record states what died rather than leaving
+    # it inferred.
+    #
+    # The field guards narrow the shape but cannot finish the identification,
+    # because both have a second producer (see the constants): a failed record
+    # carries an empty trajectory even when an agent ran, and
+    # "not_evaluated" is also written when the exception path's own
+    # verification retry crashes after a live provision. Grading THAT record
+    # as weather would silence rung 2 on a deterministically broken check
+    # runner for as long as it stayed broken. What finishes it is the error
+    # itself: the run died in the task's own deployer command, a signature
+    # nothing downstream of a live provision can produce. Anything else --
+    # a verifier crash, a factory typo in the task file, a credentials fetch
+    # -- fails closed and blocks below, exactly as before this branch.
+    #
+    # Same noop carve-out as the missing record: a task that provisions
+    # nothing has no provisioning to fail, so on ``noop`` this shape falls
+    # through and blocks below.
+    died_on = _provision_death(record.error, spec.deployer)
+    if (
+        has_infra
+        and not record.has_scores
+        and record.status == FAILED_RECORD_STATUS
+        and record.verification_status == VERIFICATION_NEVER_RAN
+        and not record.trajectory
+        and died_on is not None
+    ):
+        return rep(
+            "infra",
+            f"the run died provisioning, before any agent ran ({died_on}); "
+            f"deployer={spec.deployer} had infrastructure to fail on, so this "
+            "is resource preparation, not the pull request",
+        )
+
     if not record.has_scores:
         return rep(
             "blocked",
@@ -510,6 +616,41 @@ def classify_rep(
             f"VerificationCatastrophic={catastrophic}{named}: the agent took an "
             "action a safeguard forbids",
             Rung.FORBIDDEN_ACTION,
+        )
+
+    # The never-ran signature, whatever produced it (#1184): an empty
+    # trajectory together with tokens.total of exactly 0 means no tool ran
+    # and no model call was billed -- there is no agent run in this record,
+    # only the judge's opinion of an empty artifact. The marker branch above
+    # catches the producers the harness knows to name (#1095's terminal
+    # 429s, #1137's unestablishable tunnels); this classifies by what the
+    # record shows, so a transport failure that comes back as an empty
+    # success does not red unrelated pull requests until someone enumerates
+    # it too. Same no-noop-carve-out as the marker -- an agent that was never
+    # reached is infrastructure whatever the task's deployer builds.
+    #
+    # Placement is load-bearing on both sides. AFTER rung 1, because the
+    # catastrophic score grades the cluster rather than the record: a tripped
+    # safeguard here is positive evidence something acted, which contradicts
+    # the never-ran inference and must keep blocking. BEFORE rungs 2-3,
+    # because the check and liveness signals on a never-ran record are
+    # artifacts of the outage, and grading them reports it as an agent
+    # regression. Deliberately the CONJUNCTION, with 0 and null distinct:
+    # tokens billed with no trajectory is an inconsistent record, and the
+    # harness skeleton (empty trajectory, every token bucket null) never
+    # billed a model call it can prove -- both stay rung 3 blocks below.
+    total_tokens = record.tokens.get("total")
+    if (
+        not record.trajectory
+        and not isinstance(total_tokens, bool)
+        and _as_float(total_tokens) == 0
+    ):
+        return rep(
+            "infra",
+            "the record shows no agent ever ran: the trajectory is empty and "
+            "tokens.total is 0, so no model call was billed. There is no "
+            "answer in it to grade, whatever produced it -- infrastructure, "
+            "not the pull request (#1184)",
         )
 
     # --- Rung 2. A declared check that did not produce a verdict.

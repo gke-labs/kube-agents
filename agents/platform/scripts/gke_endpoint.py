@@ -115,7 +115,7 @@ def gcloud_supports_dns_endpoint(run: Runner | None = None) -> bool:
 
     The agent image installs an unpinned `google-cloud-cli` from apt, so this is
     always true there. It is asked because the same helpers run from
-    `k8s-operator/scripts/common.sh` on an operator's workstation, where gcloud
+    `scripts/installer/common.sh` on an operator's workstation, where gcloud
     is whatever they happen to have; an unrecognised flag is a hard argparse
     failure, which would turn "we could have used a better endpoint" into "the
     install stopped".

@@ -1,0 +1,20 @@
+
+Turn off this advice by setting config variable advice.detachedHead to false
+
+HEAD is now at 7009752 feat(security)!: remove the gke-admin permission set and ship the agent-RBAC admission backstop (#961)
+$ PWD=/home/prow/go/src/github.com/gke-labs/kube-agents  git branch --force main 700975241c03d2ad48ec42607be8decbe6115231 (runtime: 2.766702ms)
+$ PWD=/home/prow/go/src/github.com/gke-labs/kube-agents  git checkout main (runtime: 141.425479ms)
+Switched to branch 'main'
+$ PWD=/home/prow/go/src/github.com/gke-labs/kube-agents  git fetch https://github.com/gke-labs/kube-agents.git 2e15ee4370a721280f76f9c3a9f618582a437324 (runtime: 554.21399ms)
+From https://github.com/gke-labs/kube-agents
+ * branch            2e15ee4370a721280f76f9c3a9f618582a437324 -> FETCH_HEAD
+$ PWD=/home/prow/go/src/github.com/gke-labs/kube-agents GIT_AUTHOR_DATE=1787786140 GIT_COMMITTER_DATE=1787786140 git merge --no-ff 2e15ee4370a721280f76f9c3a9f618582a437324 (runtime: 44.434364ms)
+Auto-merging bench/tasks/DRAFTS.md
+CONFLICT (content): Merge conflict in bench/tasks/DRAFTS.md
+Auto-merging bench/tasks/consistency-drift-outlier/task.yaml
+Auto-merging hack/ci-eval-pr.sh
+CONFLICT (content): Merge conflict in hack/ci-eval-pr.sh
+Automatic merge failed; fix conflicts and then commit the result.
+# Error: exit status 1
+# Final SHA: 
+# Total runtime: 0s

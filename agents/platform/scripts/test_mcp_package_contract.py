@@ -1,24 +1,27 @@
 """The installed `mcp` package still has to be one the agent's servers can use.
 
-Three modules build an MCP server on `mcp.server.fastmcp.FastMCP`:
+Three modules build an MCP server on `mcp.server.MCPServer`:
 agents/platform/scripts/agent_common_server.py, its sibling
-platform_mcp_server.py, and agents/chat/scripts/router_server.py. mcp 2.x
-deletes that module in favour of `mcp.server.mcpserver.MCPServer`, so an
-environment on 2.x cannot run any of them.
+platform_mcp_server.py, and agents/chat/scripts/router_server.py. mcp 1.x has
+no such module -- there it is `mcp.server.fastmcp.FastMCP` -- so an environment
+on 1.x cannot run any of them.
+
+This file used to assert the mirror image of that, and the flip is the whole
+content of #800. mcp reaches the runtime image from the digest-pinned Hermes
+base (tags.env), never from a requirement of ours, and that base moved to mcp
+2.0.0 in v2026.8.19: `mcp.server.fastmcp` is gone, hermes-agent's own
+mcp_serve.py and agent/transports/hermes_tools_mcp_server.py import
+`mcp.server.MCPServer` instead, and all three of our servers stopped importing
+at all until they followed. The floor in requirements-test.txt is now what
+keeps a test environment on the same side of that line as the image.
 
 Nothing used to say so. Each of those modules' test files falls back to a stub
 when the import fails, which is right for a bare checkout with no mcp installed
 and wrong for an mcp that is installed and incompatible: the fallback swallows
 the ImportError and the suite goes green having exercised a SimpleNamespace.
 That is how #751 widened the ceiling in requirements-test.txt from <2 to <3 and
-passed CI. Those fallbacks now re-raise when mcp is present (ABSENT is not
-BROKEN); this module is the part that fails by name rather than by side effect.
-
-The ceiling is not ours to lift by editing the three modules. mcp reaches the
-runtime image from the digest-pinned Hermes base (tags.env), which ships 1.28.1
-and whose own code imports mcp.server.fastmcp -- so upgrading that venv breaks
-the harness, not just these three. It comes off when the base image ships 2.x.
-The pin's comment in requirements-test.txt has the evidence; see also #800.
+passed CI. Those fallbacks re-raise when mcp is present (ABSENT is not BROKEN);
+this module is the part that fails by name rather than by side effect.
 
 This file lives under agents/platform/scripts because the Makefile's
 `agents/*/scripts/test_*.py` glob discovers it there, but it covers the chat
@@ -59,7 +62,7 @@ def _mcp_distribution_installed():
     This is the one copy of that reasoning. The four guards that ask the same
     question -- test_agent_common_server, test_platform_mcp_server,
     test_session_kv_server, agents/chat/scripts/test_router_server -- point
-    here rather than restate it, so lifting the ceiling changes one place.
+    here rather than restate it, so moving the constraint changes one place.
     """
     try:
         distribution("mcp")
@@ -86,21 +89,21 @@ def _installed_mcp_version():
 
 
 @requires_mcp
-class InstalledMcpExposesFastMcpTest(unittest.TestCase):
+class InstalledMcpExposesMcpServerTest(unittest.TestCase):
     """The symbol all three servers are written against."""
 
-    def test_the_installed_mcp_exposes_fastmcp(self):
+    def test_the_installed_mcp_exposes_mcpserver(self):
         try:
-            from mcp.server.fastmcp import FastMCP  # noqa: F401
+            from mcp.server import MCPServer  # noqa: F401
         except ImportError as exc:
             self.fail(
                 f"mcp {_installed_mcp_version()} does not provide "
-                f"mcp.server.fastmcp.FastMCP ({exc}).\n"
+                f"mcp.server.MCPServer ({exc}).\n"
                 "agent_common_server.py, platform_mcp_server.py and "
                 "router_server.py are all built on it, and the runtime image "
-                "is on the 1.x line that has it. requirements-test.txt holds "
-                "mcp<2 for exactly this reason -- if that ceiling was just "
-                "widened, this is what it broke. See #800."
+                "is on the 2.x line that has it. requirements-test.txt holds "
+                "mcp>=2 for exactly this reason -- if that floor was just "
+                "lowered, this is what it broke."
             )
 
 

@@ -21,6 +21,7 @@ regex over the file the weaker substitute.
 import importlib.util
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -59,6 +60,48 @@ def stage_body(dockerfile_text: str, target: str) -> str:
 def platform_stage(dockerfile_text: str) -> str:
     """The Dockerfile text belonging to the `platform` target."""
     return stage_body(dockerfile_text, "platform")
+
+
+def joined_instructions(dockerfile_text: str) -> list:
+    """Every instruction in the text, line continuations joined into one line.
+
+    A shell command in a Dockerfile is wrapped across physical lines with
+    trailing backslashes, and the parts that matter to a caller here — an
+    interpreter and its `||` fallback, a `cp` and the `chmod` that repairs it —
+    sit on different ones. Comment lines are dropped, including inside a
+    continuation, which is how BuildKit reads them: the instruction continues
+    around the comment rather than ending at it.
+    """
+    instructions = []
+    current = []
+    for line in dockerfile_text.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        current.append(line.rstrip().removesuffix("\\"))
+        if not line.rstrip().endswith("\\"):
+            instructions.append(" ".join(current))
+            current = []
+    if current:
+        instructions.append(" ".join(current))
+    return instructions
+
+
+# Dockerfile keywords are case-insensitive. Upper-casing them on the way out
+# means a lower-case `copy` cannot slip past a caller that matches on "COPY".
+DOCKERFILE_KEYWORDS = frozenset(
+    """ADD ARG CMD COPY ENTRYPOINT ENV EXPOSE FROM HEALTHCHECK LABEL MAINTAINER
+    ONBUILD RUN SHELL STOPSIGNAL USER VOLUME WORKDIR""".split()
+)
+
+
+def keyed_instructions(dockerfile_text: str) -> list:
+    """(keyword, argument) per instruction, keyword upper-cased."""
+    out = []
+    for instruction in joined_instructions(dockerfile_text):
+        parts = instruction.split(None, 1)
+        if len(parts) == 2 and parts[0].upper() in DOCKERFILE_KEYWORDS:
+            out.append((parts[0].upper(), parts[1]))
+    return out
 
 
 class EntrypointStartsInsideTheWorkspaceTest(unittest.TestCase):
@@ -287,22 +330,8 @@ class BytecodeIsBakedAtBuildTimeTest(unittest.TestCase):
         self.stage = platform_stage(DOCKERFILE.read_text())
 
     def compileall_command(self):
-        """The whole RUN instruction that precompiles, continuations joined.
-
-        A shell command in a Dockerfile is wrapped across physical lines with
-        trailing backslashes, and the parts that matter here — the interpreter
-        and the `||` fallback — sit on different ones.
-        """
-        instructions = []
-        current = []
-        for line in self.stage.splitlines():
-            if line.lstrip().startswith("#"):
-                continue
-            current.append(line.rstrip().removesuffix("\\"))
-            if not line.rstrip().endswith("\\"):
-                instructions.append(" ".join(current))
-                current = []
-        for instruction in instructions:
+        """The whole RUN instruction that precompiles, continuations joined."""
+        for instruction in joined_instructions(self.stage):
             if "compileall" in instruction:
                 return instruction
         self.fail("the platform stage does not precompile /opt/hermes")
@@ -454,16 +483,7 @@ class SkillProvenanceContractTest(unittest.TestCase):
 
     def generation_block(self):
         """The Dockerfile RUN that writes the manifests, continuations joined."""
-        instructions = []
-        current = []
-        for line in self.stage.splitlines():
-            if line.lstrip().startswith("#"):
-                continue
-            current.append(line.rstrip().removesuffix("\\"))
-            if not line.rstrip().endswith("\\"):
-                instructions.append(" ".join(current))
-                current = []
-        for instruction in instructions:
+        for instruction in joined_instructions(self.stage):
             if "sha256sum" in instruction:
                 return instruction
         self.fail("the platform stage does not generate a skill manifest")
@@ -662,6 +682,222 @@ class SkillProvenanceContractTest(unittest.TestCase):
         # which `cp -ru` can leave older than the image.
         self.assertIn("/opt/defaults/scripts/verify_skills_provenance.py", self.entrypoint)
         self.assertIn("agents/platform/scripts/ /opt/defaults/scripts/", self.stage)
+
+
+# The tree no normalization loop walks, so every write into it has to carry its
+# own mode. Held as a prefix rather than a set of filenames: the point is that a
+# fourth module dropped in beside the three is caught too.
+UNNORMALIZED_TREE = "/opt/hermes/hermes_cli"
+
+# The trees the `platform` stage's loop does normalize, which is what lets the
+# unmoded COPYs into them stand.
+NORMALIZED_TREES = ("/opt/hermes/plugins", "/opt/hermes/gateway", "/opt/hermes/tools")
+
+FILE_WRITING_COMMANDS = ("cp", "mv", "install")
+
+# `do`, `then` and friends lead a segment when a write sits inside a loop or a
+# conditional; stripping them reads the write as the write it is.
+SHELL_KEYWORDS = ("do", "done", "then", "else", "elif", "fi", "!")
+
+
+def grants_world_read(mode: str) -> bool:
+    """True when a `chmod` or `--chmod` mode argument grants read to `other`.
+
+    Both notations, because a false red here reads as "your correct Dockerfile
+    is wrong" and invites someone to change working code to satisfy a parser.
+    """
+    if re.fullmatch(r"[0-7]{3,4}", mode):
+        return bool(int(mode, 8) & 0o004)
+    # Symbolic. Only a clause naming `o` or `a` reaches `other`, and only `+`
+    # or `=` grants: `a+r`, `ugo+r` and `o=rX` do, `u+r` and `go-r` do not.
+    return any(
+        re.fullmatch(r"[ugoa]*[ao][ugoa]*[+=][rwxXst]*r[rwxXst]*", clause)
+        for clause in mode.split(",")
+    )
+
+
+def copy_destination_and_mode(argument: str):
+    """(destination, --chmod value or None) for a COPY, or (None, None).
+
+    Heredoc COPYs are skipped — the repository has none, and guessing at one
+    would be a false failure rather than a caught bug.
+    """
+    if "<<" in argument:
+        return None, None
+    try:
+        tokens = shlex.split(argument)
+    except ValueError:
+        return None, None
+    mode = None
+    while tokens and tokens[0].startswith("--"):
+        flag = tokens.pop(0)
+        if flag.startswith("--chmod="):
+            mode = flag.split("=", 1)[1]
+    if len(tokens) < 2:
+        return None, None
+    return tokens[-1], mode
+
+
+def install_mode(tokens):
+    """The mode an `install` command was given, in either notation, or None."""
+    for index, token in enumerate(tokens):
+        if token.startswith("--mode="):
+            return token.split("=", 1)[1]
+        if token.startswith("-m") and len(token) > 2:
+            return token[2:]
+        if token == "-m" and index + 1 < len(tokens):
+            return tokens[index + 1]
+    return None
+
+
+def run_commands(argument: str):
+    """The tokenized commands a shell would run for one RUN body."""
+    for segment in re.split(r"&&|\|\||[;|]", argument):
+        tokens = segment.split()
+        while tokens and tokens[0] in SHELL_KEYWORDS:
+            tokens.pop(0)
+        if tokens:
+            yield tokens
+
+
+def normalization_loops(stage_text: str):
+    """The tree lists of the stage's `for d in … ; do find … chmod` loops.
+
+    The lists themselves, not the enclosing RUN's text: a tree that a later
+    `cp -a` in the same RUN merely mentions is not a tree the loop normalizes,
+    and matching on the RUN as a whole cannot tell the two apart.
+    """
+    for keyword, argument in keyed_instructions(stage_text):
+        if keyword != "RUN" or "-type f -exec chmod" not in argument:
+            continue
+        for trees in re.findall(r"\bfor\s+\w+\s+in\s+(.*?);?\s*\bdo\b", argument):
+            yield trees.split()
+
+
+class HermesCliPatchesShipWorldReadableTest(unittest.TestCase):
+    """The patched modules have to be readable by the uid that imports them.
+
+    `agentplugins/lib/plugin_image.sh:798` states the mechanism and stages the
+    plugin image against it; the same thing reaches the agent image by a
+    different route. Git tracks one permission bit, so a tree checked out under
+    `umask 077` carries mode 0600 throughout, an unmoded `COPY` brings that into
+    the image, and `cp` — which masks the source's mode by the umask in force
+    rather than repairing it — carries it the rest of the way. The agent runs as
+    uid 10000, so the same Dockerfile yields a working image on one builder and,
+    on another, one that dies on its first import:
+
+        PermissionError: [Errno 13] Permission denied:
+          '/opt/hermes/hermes_cli/kanban_scheduling.py'
+
+    Precompiled bytecode does not paper over it. CPython derives a `.pyc`'s
+    mode from its source's, so an unreadable source has an unreadable cache.
+
+    Nothing else catches a regression here. CI builds under `umask 022`, where
+    an unmoded COPY lands at 0644 by luck and every gate stays green; the
+    failure reaches only whoever builds in a hardened environment, at agent
+    startup, as a stack trace with no visible connection to their umask.
+
+    Scope. These are pinned for `/opt/hermes/hermes_cli` because it is the one
+    patch destination no normalization loop walks, so a write into it is the one
+    that has to carry its own mode. The other destinations are swept by the
+    `platform` stage's loop, which is checked below — but only in the `platform`
+    image. `credential-proxy` builds from `agent-base` and never runs that loop,
+    so the unmoded COPYs into /opt/hermes/{tools,gateway} reach it as-is; that is
+    latent rather than live, since the sidecar runs only
+    /opt/defaults/scripts/credential_proxy.py and imports none of them.
+
+    These read the Dockerfile, so they pin what the build is told to do and not
+    what a layer ends up holding, and they see only `COPY` and the `cp`/`mv`/
+    `install` family. A module arriving by `ADD`, a redirect, `tar -x`, or a
+    Python applier using `shutil.copy` — which also preserves the source mode —
+    is outside them, as are the base image's own modes and the `/tmp/*` staging
+    directories the patch layers copy through.
+    """
+
+    def setUp(self):
+        self.text = DOCKERFILE.read_text()
+        self.instructions = keyed_instructions(self.text)
+        self.assertTrue(self.instructions, "the Dockerfile parsed to nothing")
+
+    def test_every_copy_into_hermes_cli_sets_a_world_readable_mode(self):
+        offenders = []
+        for keyword, argument in self.instructions:
+            if keyword != "COPY":
+                continue
+            destination, mode = copy_destination_and_mode(argument)
+            if destination is None or not destination.startswith(UNNORMALIZED_TREE):
+                continue
+            if mode is None:
+                offenders.append(f"{destination} (no --chmod)")
+            elif not grants_world_read(mode):
+                offenders.append(f"{destination} (--chmod={mode})")
+        self.assertEqual(
+            [],
+            offenders,
+            f"these COPY instructions write into {UNNORMALIZED_TREE}, which no "
+            "normalization loop walks, without a world-readable --chmod. On a builder "
+            "whose umask is stricter than 022 the file lands unreadable and the agent "
+            "dies at import as uid 10000. Add --chmod=0644.",
+        )
+
+    def test_every_run_that_writes_into_hermes_cli_sets_a_world_readable_mode(self):
+        offenders = []
+        for keyword, argument in self.instructions:
+            if keyword != "RUN":
+                continue
+            commands = list(run_commands(argument))
+            # A world-readable chmod anywhere in the same RUN is an equally good
+            # fix, so collect those before judging the writes. A chmod to some
+            # other mode is not a fix and does not count.
+            chmodded = set()
+            for tokens in commands:
+                if tokens[0] != "chmod":
+                    continue
+                # Flags first, so `chmod -R a+r <tree>` reads as the fix it is.
+                operands = [token for token in tokens[1:] if not token.startswith("-")]
+                if len(operands) > 1 and grants_world_read(operands[0]):
+                    chmodded.update(operands[1:])
+            for tokens in commands:
+                if tokens[0] not in FILE_WRITING_COMMANDS:
+                    continue
+                destination = tokens[-1]
+                if not destination.startswith(UNNORMALIZED_TREE):
+                    continue
+                if destination in chmodded:
+                    continue
+                mode = install_mode(tokens) if tokens[0] == "install" else None
+                if mode is not None and grants_world_read(mode):
+                    continue
+                offenders.append(" ".join(tokens))
+        self.assertEqual(
+            [],
+            offenders,
+            f"these commands write into {UNNORMALIZED_TREE} without setting a "
+            "world-readable mode. `cp` gives the destination the source's mode masked "
+            "by the umask, so a 0600 source stays 0600 and the uid 10000 the agent runs "
+            "as cannot read it. Use `install -m 0644` instead.",
+        )
+
+    def test_the_platform_stage_still_normalizes_the_other_patch_destinations(self):
+        # The two tests above are scoped to hermes_cli because everywhere else a
+        # patch lands is swept by the platform stage's loop. Dropping a tree from
+        # that loop would silently widen the bug rather than fail anything, so
+        # pin its membership here.
+        loops = list(normalization_loops(platform_stage(self.text)))
+        self.assertTrue(
+            loops,
+            "the platform stage no longer normalizes any tree with a `for d in … ; do "
+            "find … -type f -exec chmod` loop; the unmoded COPYs into /opt/hermes/tools "
+            "and /opt/hermes/gateway now depend on the builder's umask",
+        )
+        swept = {tree for trees in loops for tree in trees}
+        for tree in NORMALIZED_TREES:
+            self.assertIn(
+                tree,
+                swept,
+                f"{tree} is written by COPY instructions that set no mode, so it has to "
+                "stay in the platform stage's normalization loop",
+            )
 
 
 if __name__ == "__main__":

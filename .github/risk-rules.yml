@@ -43,7 +43,7 @@ rules:
 
   - id: iam-role-bundles
     tier: high
-    match: ["k8s-operator/scripts/**", "terraform/**"]
+    match: ["scripts/installer/**", "scripts/dev/**", "terraform/**"]
     patch_contains: ["^[+-].*\\broles/"]
     why: "cross-scope/privilege change, a mandatory-gate class in docs/architecture/04-workflow-model.md section 2.2"
 
@@ -60,7 +60,7 @@ rules:
   - id: multi-surface-touch
     tier: medium
     all_of:
-      - ["k8s-operator/scripts/**"]
+      - ["scripts/installer/**"]
       - ["charts/**", "terraform/**"]
     why: "the install surfaces drift apart silently; make iac-parity-check catches only the scalar subset"
 

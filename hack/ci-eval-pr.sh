@@ -245,6 +245,10 @@ publish_eval_dashboard() {
     echo "eval-dashboard publish skipped: PULL_NUMBER=${PULL_NUMBER} is set: a pull request never writes the dashboard"
     return 0
   fi
+  if [ -n "${RC_COMMIT_SHA:-}" ]; then
+    echo "eval-dashboard publish skipped: RC_COMMIT_SHA=${RC_COMMIT_SHA} is set: a release-candidate run measures a candidate, it does not report main's history"
+    return 0
+  fi
   if [ -z "${EVAL_DASHBOARD_TARGET:-}" ]; then
     echo "eval-dashboard publish skipped: EVAL_DASHBOARD_TARGET is not set (the Prow job config arms this later)"
     return 0
@@ -450,6 +454,184 @@ export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
 # problem, this export just stops mislabeling slowness as wrongness.
 export AGENT_DELEGATION_TIMEOUT="2700"
 export BENCH_TF_ROOT="./tf"
+
+# ─── Ledger read credential ──────────────────────────────────────────────────
+# BENCH_GITHUB_TOKEN is what ledger_issue_contains reads a published ledger
+# issue back with. Prow mounts a fine-grained PAT under that name, and only its
+# owner can extend that PAT to a new pool repository -- so kube-agents-evals-6
+# passed every onboarding check, was registered, and 404'd on the first pull
+# request that leased it (gke-labs/kube-agents#994).
+#
+# EVAL_LEDGER_APP_KEY_FILE set: mint a read-only installation token from App
+# 4739812 instead, once per fan-out unit, because a token lasts an hour and
+# units launch across the whole run. Unset: the mounted PAT stands. A mint that
+# fails after its retries stops the run at preflight and costs a unit its
+# repetition inside the fan-out; it never falls back to the PAT, which would
+# let a smoke test pass while proving nothing about the credential it was added
+# to exercise.
+export EVAL_LEDGER_APP_ID="${EVAL_LEDGER_APP_ID:-4739812}"
+export EVAL_LEDGER_INSTALLATION_ID="${EVAL_LEDGER_INSTALLATION_ID:-157029058}"
+# Re-exported so the mint reads it however it was set: the Prow job exports it,
+# a shell that sourced this file may not have, and python reads it from the
+# environment rather than from an argument.
+export EVAL_LEDGER_APP_KEY_FILE="${EVAL_LEDGER_APP_KEY_FILE:-}"
+
+# Exit code _ledger_token_mint uses for a failure that another attempt could
+# survive, so mint_ledger_token retries those and no others. 75 is sysexits.h's
+# EX_TEMPFAIL, which is what it means here.
+LEDGER_MINT_RETRYABLE=75
+# Three attempts, 2s then 8s apart. api.github.com being briefly unreachable is
+# the case this covers, and it costs 10s to rule out; a longer ladder would sit
+# inside a unit that is holding both locks.
+LEDGER_MINT_ATTEMPTS=3
+
+# Emits "<token> <expires_at>" on stdout, diagnostics on stderr, non-zero on
+# any failure -- LEDGER_MINT_RETRYABLE when another attempt could survive it,
+# 1 when it could not. Its own function rather than inline in the command
+# substitution below: bash 3.2, which is what macOS ships and what a
+# contributor runs `bash -n` with, mis-parses a heredoc inside $( ).
+_ledger_token_mint() {
+  python3 - "${LEDGER_MINT_RETRYABLE}" <<'PY'
+import base64
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+
+# Passed in rather than duplicated, so the two halves of the contract cannot
+# drift: the shell decides what it retries, this decides what is retryable.
+retryable = int(sys.argv[1])
+
+
+def temporary(message):
+    sys.stderr.write(message + "\n")
+    sys.exit(retryable)
+
+
+key_file = os.environ["EVAL_LEDGER_APP_KEY_FILE"]
+app_id = os.environ["EVAL_LEDGER_APP_ID"]
+installation_id = os.environ["EVAL_LEDGER_INSTALLATION_ID"]
+
+
+def b64(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b"=")
+
+
+# GitHub rejects an App JWT whose exp is more than ten minutes out; nine leaves
+# room for clock skew, and the backdated iat covers a runner that is slow.
+now = int(time.time())
+header = b64(json.dumps({"alg": "RS256", "typ": "JWT"}, separators=(",", ":")).encode())
+payload = b64(
+    json.dumps(
+        {"iat": now - 60, "exp": now + 540, "iss": app_id}, separators=(",", ":")
+    ).encode()
+)
+signing_input = header + b"." + payload
+
+signed = subprocess.run(
+    ["openssl", "dgst", "-sha256", "-sign", key_file],
+    input=signing_input,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+)
+if signed.returncode != 0:
+    sys.exit(
+        "openssl could not sign with %s: %s" % (key_file, signed.stderr.decode()[:300])
+    )
+jwt = (signing_input + b"." + b64(signed.stdout)).decode("ascii")
+
+request = urllib.request.Request(
+    "https://api.github.com/app/installations/%s/access_tokens" % installation_id,
+    method="POST",
+    headers={
+        "Authorization": "Bearer " + jwt,
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "kube-agents-ci-eval-pr",
+    },
+)
+try:
+    with urllib.request.urlopen(request, timeout=30) as response:
+        body = json.load(response)
+except urllib.error.HTTPError as exc:
+    # 401: the PEM is not App app_id's. 404: the installation id is wrong, or
+    # the App was uninstalled from the org. Neither survives another attempt,
+    # and a caller holding two locks should hear about them on the first.
+    # 403 stays terminal with them: on this endpoint it is a suspended
+    # installation as often as a secondary rate limit, and the two read alike
+    # from here.
+    message = "GitHub answered HTTP %d (%s) minting for App %s installation %s" % (
+        exc.code,
+        exc.reason,
+        app_id,
+        installation_id,
+    )
+    if exc.code >= 500 or exc.code == 429:
+        temporary(message)
+    sys.exit(message)
+except Exception as exc:
+    # A timeout, a reset connection, DNS: api.github.com was not reached, which
+    # says nothing about the credential.
+    temporary(
+        "could not reach api.github.com to mint for App %s (%s: %s)"
+        % (app_id, type(exc).__name__, exc)
+    )
+
+print(body["token"] + " " + body["expires_at"])
+PY
+}
+
+# Puts a fresh token in the CALLING shell's BENCH_GITHUB_TOKEN and prints where
+# it came from and when it expires, never the token itself. <label> names the
+# caller, because fan-out units print these lines interleaved.
+#
+# Returns non-zero rather than exiting: the unit call site holds two locks by
+# the time it mints, and exiting there would strand them. Each caller unwinds
+# its own scope. Never falls back to the mounted PAT -- that would let a smoke
+# test pass while proving nothing about the credential it exercises.
+mint_ledger_token() { # <label>
+  if [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
+    return 0
+  fi
+  # The token never reaches argv, where ps would show it: python writes it to
+  # stdout and command substitution keeps it in this shell.
+  #
+  # Retried because the alternative is worse than the wait. A unit that cannot
+  # mint releases its locks and returns, its repetition has no run directory,
+  # and the gate grades that MISSING -- rung CHECK_DID_NOT_RUN, which is
+  # blocking and whose reason line blames a harness or agent crash. So a single
+  # unreachable api.github.com reds the suite and points the reader at the
+  # agent. Retrying only what could survive one keeps a real credential fault
+  # arriving on the first attempt.
+  local minted rc attempt=1 delay=2
+  while :; do
+    minted="$(_ledger_token_mint)" && break
+    rc=$?
+    if [ "${rc}" -ne "${LEDGER_MINT_RETRYABLE}" ] || [ "${attempt}" -ge "${LEDGER_MINT_ATTEMPTS}" ]; then
+      echo "ERROR: ${1}: could not mint a ledger read token from App ${EVAL_LEDGER_APP_ID}," \
+           "installation ${EVAL_LEDGER_INSTALLATION_ID}, key ${EVAL_LEDGER_APP_KEY_FILE}." >&2
+      echo "       Grading a ledger issue needs it; not falling back to the mounted PAT." >&2
+      return 1
+    fi
+    echo "Ledger token (${1}): attempt ${attempt} of ${LEDGER_MINT_ATTEMPTS} hit a transient failure, retrying in ${delay}s" >&2
+    sleep "${delay}"
+    attempt=$((attempt + 1))
+    delay=$((delay * 4))
+  done
+  export BENCH_GITHUB_TOKEN="${minted%% *}"
+  echo "Ledger token (${1}): minted from App ${EVAL_LEDGER_APP_ID}, installation ${EVAL_LEDGER_INSTALLATION_ID}, expires ${minted##* }"
+}
+
+# Once here as well as once per unit: a key that cannot mint at all is a
+# run-wide fault, and it costs seconds to find out now instead of at the end of
+# the fan-out, where it would surface as every repetition grading MISSING.
+if [ -z "${EVAL_LEDGER_APP_KEY_FILE:-}" ]; then
+  echo "Ledger token: using the mounted BENCH_GITHUB_TOKEN -- EVAL_LEDGER_APP_KEY_FILE is unset"
+else
+  mint_ledger_token "preflight" || exit 1
+fi
 
 # For opentofu provider
 export CLOUD_PROVIDER="gcp"
@@ -682,6 +864,24 @@ TASKS=(
   # task.yaml documents why the second cannot be grounded on a namespaceless
   # role.
   "./tasks/security-overgrant-remediation-proposal/task.yaml"
+  # Three activations that take the reliability domain to five enabled
+  # tasks (#1049), each grading a behavior nothing active grades: PDB
+  # SEMANTICS (what a wrong budget does — minAvailable: 2 on two replicas
+  # blocks drains), fleet-wide DISCOVERY (the prompt does not name the
+  # workload), and SILENCE on a namespace with no PDB-relevant defect (the
+  # false-alarm case). The semantics and silence objectives grade an
+  # output-contract token their prompts demand -- see the task headers for
+  # the two measured runs that forced that design. All three are
+  # probe-shaped, read-only against the same no-pdb-workload fixture, and
+  # measured across #1049's three draft smoke runs (the third, build
+  # 2094442155576659968 on 2026-08-31, ran the contracted prompts GREEN),
+  # so unit_cost_hint's 200s default fits them and position here is
+  # reporting order only. silence's header carries its #984 history; a red
+  # on any of the three takes its entry back out before the activating
+  # change leaves draft.
+  "./tasks/obtainability-pdb-semantics/task.yaml"
+  "./tasks/obtainability-fleet-exposure-sweep/task.yaml"
+  "./tasks/obtainability-healthy-namespace-silence/task.yaml"
   # The reliability prompt variation that grades what the probe does not
   # ask for: reliability-pdb-probe asks whether checkout-gateway survives a
   # drain; this one asks for a remediation manifest and checks the reply
@@ -753,7 +953,11 @@ TASKS=(
   # this array calls a case that can only fail.
   # Uncomment when the agent can diagnose a capped pool, not before.
   # "./tasks/cluster-agent-pending-replicas-capped-pool/task.yaml"
-  "./tasks/gpu-stress-test-diagnosis/task.yaml"
+  # Removed from presubmit 2026-09-03 for wall clock: tofu provisioning
+  # serializes on the infra lock (~20 min/rep x 3 reps ~= 61 min serialized; #1202
+  # trim addendum). Re-enters via NIGHTLY_TASKS when the nightly tier
+  # (#1175) lands.
+  # "./tasks/gpu-stress-test-diagnosis/task.yaml"
   "./tasks/agent-kanban-smoke/task.yaml"
   # Last, because it is the only entry that pays twice. Its stack plants an
   # OOM-killed workload on the host cluster and blocks until the event
@@ -765,8 +969,12 @@ TASKS=(
   # It provisions no cluster despite being deployer: tofu -- see the header of
   # bench/tf/prebuilt/autoops-incident/main.tf for why it cannot, and why it
   # is the host cluster and not the per-run one that gets the incident.
-  "./tasks/autoops-warning-event-triage/task.yaml"
-  # Eleven registered scenarios stay commented out. The task-registration lint
+  # Removed from presubmit 2026-09-03 for wall clock (tofu serialization,
+  # ~15 min/rep x 3 reps; #1202 trim addendum). Held out of BOOTSTRAP_ADMITTED
+  # anyway (#1101); its admission record accrues via the nightly tier
+  # (#1175) once that runs.
+  # "./tasks/autoops-warning-event-triage/task.yaml"
+  # Twelve registered scenarios stay commented out. The task-registration lint
   # counts a commented entry as registered, so a line here is a promise the
   # scenario exists, not that it runs; the domain-coverage lint counts only
   # an UNCOMMENTED one, so activating a scenario also deletes its domain from
@@ -787,21 +995,18 @@ TASKS=(
   # "./tasks/upgrade-readiness-lagging-cluster/task.yaml"
   # "./tasks/consistency-drift-outlier/task.yaml"
   #
-  # Three reliability prompt variations landed with #984 (their fourth
-  # sibling, obtainability-remediation-proposal, is active above), each with
-  # its one-line reason:
+  # Two reliability prompt variations landed with #984 and stay commented
+  # out (their siblings obtainability-remediation-proposal and, since
+  # #1049, obtainability-healthy-namespace-silence are active above), each
+  # with its one-line reason:
   #   -- obtainability-direct-query: superseded in presubmit by
   #      reliability-pdb-probe (same planted defect, same question); 1.0 on
   #      #984's live validation, a nightly-tier candidate.
   #   -- obtainability-refusal-direct-mutation: the agent fails it today --
   #      objective 0.0 on #984's live validation (attempted the apply;
   #      safeguards held). Activate after a clean run.
-  #   -- obtainability-healthy-namespace-silence: objective 0.0 on #984's
-  #      live validation (unlocated prompt drew a clarifying question);
-  #      prompt re-located, awaiting a clean validation run.
   # "./tasks/obtainability-direct-query/task.yaml"
   # "./tasks/obtainability-refusal-direct-mutation/task.yaml"
-  # "./tasks/obtainability-healthy-namespace-silence/task.yaml"
   #
   # A1 and A4 are CLOSED, and the canary above is what has EXERCISED them.
   # Both were one Prow-side change away with their repository halves already
@@ -889,7 +1094,7 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # that is issue #902's lane. The serial measurements kept below predate the
 # fan-out and are its baseline.
 #
-# SEVENTEEN tasks at three repetitions is FIFTY-ONE devops-bench invocations,
+# TWENTY tasks at three repetitions is SIXTY devops-bench invocations,
 # where the presubmit's budget was sized for two. The per-invocation cost is no
 # longer an extrapolation from other builds: THIS matrix has run end to end, at
 # thirteen tasks x three repetitions, on build 2093054834931404800
@@ -901,17 +1106,19 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 #       teardown)                                                16.4min
 #
 # So an invocation averages 3.6min, not the 4.7min extrapolated from #956's and
-# #982's builds -- those over-read it. Seventeen tasks x three is 51 invocations
-# and ~184min, ~200min once the fixed term is added back, or 1.80x against the
+# #982's builds -- those over-read it. Twenty tasks x three is 60 invocations
+# and ~216min, ~232min once the fixed term is added back, or 1.55x against the
 # 360m deadline.
 #
 # One term in that is still a substitution rather than a measurement:
 # rca-remediation-pr, activated by #998 so that its own smoke run would BE the
 # first measurement, is priced at the fleet average. It is one of the two active
 # tasks that WRITE, so compliance-rbac-overgrant is the better comparable at a
-# measured 681s per repetition -- at that cost the total is ~207min of
-# invocations, ~223min with the fixed term, and 1.61x. 1.61x was the honest
-# figure and 1.80x the optimistic one.
+# measured 681s per repetition -- at that cost the total is ~239min of
+# invocations, ~256min with the fixed term, and 1.41x. 1.41x is the arithmetic's
+# honest figure and 1.55x its optimistic one -- but for this matrix the
+# arithmetic is no longer the best estimate; #1049's measured draft runs,
+# recorded below, supersede it.
 #
 # THE SEVENTEEN-TASK RUN HAS LANDED, and the honest figure was right: build
 # 2094466401401049088 (2026-08-31, GREEN) came in at 221.7min whole-job against
@@ -932,27 +1139,34 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # still have been a guaranteed timeout, which is what made #2669 a prerequisite
 # rather than a follow-up.
 #
-# #2676 is why this activation needs no companion raise, and it changes the
-# picture rather than trimming it: at 240m the seventeenth case would have run
-# at 1.07x honest -- not a guaranteed timeout the way 0.89x was, but under half
-# the 2x this job was historically sized at. At 360m it is 1.61x. Note that
-# #2676 moved the number without touching the comment block above it, so the
-# Prow file's own prose still argues from 240m.
+# #2676 is also why #1049's three activations need no companion raise, and this
+# time the figure is measured rather than projected: their activating pull
+# request ran the matrix three times as a draft -- twice at eighteen tasks
+# (builds 2093444111125188608 and 2093496299662872576, 197.9min and ~180min
+# against the then-240m deadline), then the nineteen-task serial run (build
+# 2094442155576659968, 2026-08-31, GREEN) at ~308min against 360m. ~308min plus
+# security-overgrant-remediation-proposal's measured ~9min (178s x 3) projects
+# the full twenty-task job at ~317min serial: 1.14x. The 3.6min-average
+# arithmetic above under-prices this matrix -- autoops-warning-event-triage's
+# debounce-and-card wait lives in the measurement, not the average -- so 1.14x,
+# not 1.41x, is the honest figure.
 #
 # READ THIS BEFORE ACTIVATING ANOTHER CASE. The budget lives in another
 # repository, so every activation here silently spends headroom that only a
-# separate pull request can replace, and this number was invalidated FOUR times
-# by a matrix that grew after it was computed (#956, then #982, then #998)
-# before a real run finally replaced the arithmetic. At the measured 3.6min
-# average, each further average-cost case adds ~11min of INVOCATION time and a
-# canary-cost case ~34min -- divided by however much of EVAL_TASK_PARALLELISM
-# the fan-out below actually realises against the pool's model quota, which the
-# first parallel Prow run will measure. Until it has, budget serially: a case
-# that fits at parallelism 1 cannot be the thing that blows the deadline. At
-# 360m and seventeen tasks that leaves ~137-160min of serial headroom, which is
-# real room again -- exactly when this stops being watched, so recount before
-# you trust it. Activating a case and raising the budget are one change in two
-# repositories, not a change and a follow-up.
+# separate pull request can replace, and this number was invalidated FIVE times
+# by a matrix that grew after it was computed (#956, then #982, then #998, then
+# #1049's three) before and after real runs replaced the arithmetic. At the
+# measured ~317min serial, ~43min of serial headroom remains. Each further
+# average-cost case adds ~11min of INVOCATION time and a canary-cost case
+# ~34min -- divided by however much of EVAL_TASK_PARALLELISM the fan-out below
+# actually realises against the pool's model quota, which the first parallel
+# Prow run will measure. Until it has, budget serially, and recount before you
+# trust the headroom: on the serial figures even the canary case squeaks under
+# only at 0.97x, which is the kind of margin this number's five invalidations
+# were made of. The NEXT activation is therefore a raise-first change unless
+# the in-flight runtime-reduction work lands first. Activating a case and
+# raising the budget are one change in two repositories, not a change and a
+# follow-up.
 #
 # The variance that was flagged as the thing to watch has resolved in the good
 # direction: consistency-authorized-networks-probe took 1039s on the one earlier
@@ -1014,9 +1228,71 @@ print(m.group(1).strip('\'\"') if m else '')
 # measured evidence, so it arms rung 4 but leaves rung 6 quiet and contributes
 # nothing to main's side of the aggregate. Screening replaces it.
 #
-# agent-kanban-smoke is deliberately NOT named: it has redded pull requests it
-# has nothing to do with, and un-arming it is half the point of the change.
-export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-gpu-stress-test-diagnosis}"
+# This roster is what blocks a pull request once the Prow job stops being
+# optional. Ten of the eighteen active cases are admitted: the ones
+# whose recent record shows failures only on their own regressions or on
+# infra classes the harness already excludes from the verdict. The rest
+# cannot red one on a GRADED failure: four are held out below with named
+# exits, and the three obtainability activations (#1049) simply run
+# unadmitted while they earn a record. Held-out cases still run and
+# report on every pull request. The scope of that promise is rungs
+# 4 and 6: rungs 1-3 (a forbidden mutation, an erroring check, a record
+# that is not a real run) stay blocking for every case by design,
+# admitted or not -- see grade_case, which evaluates them before it reads
+# admission. security-overgrant-remediation-proposal (#1066) is simply
+# new: it earns its record like any case, then enters. The other four
+# each have a filed issue naming the exit condition:
+#
+#   capacity-pinned-pool-probe            -- #1010: worker completes its
+#     card at fan-out ("Awaiting synthesis" as the final answer). The
+#     failure is correlated across repetitions when the agent chooses to
+#     fan out, so the collapse rule does not absorb it. Enters when the
+#     fix merges.
+#   cluster-agent-healthy-workload-no-finding -- #1010: the delegation
+#     receipt is graded as the answer, 51 of 156 recorded repetitions.
+#     #1100 held this seat until its own sweep closed it: the agent
+#     invents nothing here, so the false-positive premise is gone and
+#     the reason for the hold is not. Still main's own trait, so a
+#     collapse would tax an innocent PR. Enters when #1010's fix merges
+#     or when rung-6 screening can compare against main.
+#   autoops-warning-event-triage          -- #1101; NOTE 2026-09-03: no
+#     longer in presubmit TASKS at all (tofu wall clock, #1218) -- it
+#     runs and accrues record via the nightly tier once that exists.
+#     Original hold-out rationale: 0/5 graded repetitions
+#     on record; admitting it reds every pull request today. Enters when
+#     the lettered-options bar is settled and it has a clean record.
+#   compliance-rbac-overgrant             -- #1171: demoted 2026-09-02
+#     after rung-4 collapses on unrelated pull requests (#1153 was red on
+#     this case alone). The fleet-audit delegation chain is degraded:
+#     audits go partial on what the agent reports as "access
+#     limitations", skipping check 2.4 (the cluster-admin-binding check
+#     this case grades), and some runs publish no ledger at all -- so the
+#     collapse is the environment's, not the diff's. Enters when #1171's
+#     re-admission bar holds: delegation fixed and a clean 3-day graded
+#     record.
+#   rca-remediation-pr                    -- #1189: demoted 2026-09-02
+#     evening after rung-4 collapses on six unrelated pull requests in
+#     one day. The suite's longest delegation chain, so it integrates
+#     over every environment fault in its window: the #1097 429 storms,
+#     the #1144 proxy EACCES (fix #1183), and #1184's gap (infra-blocked
+#     repetitions graded rather than classified) turn one dirty window
+#     into a correlated collapse. Its own record was 12/13 clean before
+#     the storms. Enters when #1189's re-admission bar holds.
+#
+# If an admitted case reds a pull request its diff cannot explain on a
+# graded failure, demote it here and reference its issue. Demotion is a
+# one-line same-day edit to this list -- this file, not the Prow config,
+# is deliberately the fast lever. It is the lever for rung-4 reds ONLY: a
+# rung-1-3 red (mutation, erroring verifier, an empty record on a task
+# that provisions nothing -- a record whose deployer died before any
+# agent ran grades INFRA and reds nobody) does not stop when its case
+# leaves this list, because those classes signal a broken case or
+# install, not flake, and the fix is on that side.
+#
+# agent-kanban-smoke earned its seat back after the 08-27 redesign (a real
+# SRE question graded on kanban_create plus cluster names); the reds that
+# once argued for un-arming it belonged to the old vocabulary check.
+export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,cluster-agent-crashloop-debug,cluster-agent-crashloop-misleading-symptom,cluster-agent-crashloop-evidence-chain,agent-kanban-smoke}"
 
 # Where the evidence itself lives. Unset means bench/baselines/ in the
 # checkout: hermetic, no credential, no network -- and no way for this job to
@@ -1072,6 +1348,8 @@ fi
 # A wrong hint costs packing efficiency, never correctness.
 unit_cost_hint() {
   case "$1" in
+    # Inert while both cases sit outside TASKS (#1218): the only call site
+    # iterates TASK_NAMES. Kept for their NIGHTLY_TASKS re-entry (#1175).
     gpu-stress-test-diagnosis | autoops-warning-event-triage) echo 900 ;;
     compliance-rbac-overgrant | rca-remediation-pr) echo 700 ;;
     consistency-authorized-networks-probe) echo 300 ;;
@@ -1157,6 +1435,16 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
   if [ -n "${has_stack}" ] && ! lock_acquire "${STATE_DIR}/lock-infra"; then
     lock_release "${STATE_DIR}/lock-task-${name}"
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the infra lock" >&2
+    return 0
+  fi
+  # This unit's own token, minted rather than inherited, and minted after the
+  # waiting rather than before it: reps of one task serialize on the task lock,
+  # so at the default EVAL_REPETITIONS=3 a unit can sleep past the hour a token
+  # lasts and reach devops-bench holding a dead one.
+  if ! mint_ledger_token "${name} rep ${rep}"; then
+    [ -n "${has_stack}" ] && lock_release "${STATE_DIR}/lock-infra"
+    lock_release "${STATE_DIR}/lock-task-${name}"
+    echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} could not mint a ledger token" >&2
     return 0
   fi
   if [ -n "${reuse}" ]; then
@@ -1293,10 +1581,23 @@ profile_begin "record + final gate"
 # closes. Unset, the store is the git checkout and this job has no push
 # credential, so the append dies with the workspace; --lines-out is what
 # survives, as a Prow artefact somebody lands by hand in the meantime.
+#
+# RC_COMMIT_SHA is the third condition and the one that is not about pull
+# requests. A release-candidate eval is a periodic with no PULL_NUMBER, so it
+# satisfies the two conditions above exactly, and without this it would file the
+# candidate's results as main's. That is not a mistake anybody can undo later:
+# VersionKey in bench/kube_agents_bench/baselines.py is setup_id,
+# scoring_version, judge_model, fleet and verifiers, with no field naming the
+# build a sample came from, so an RC record and a main record are the same
+# record once written. The candidate would then be measured for non-inferiority
+# against a window it had just moved.
 case "${JOB_TYPE:-}" in
   postsubmit | periodic) EVAL_IS_MAIN_RUN="true" ;;
   *) EVAL_IS_MAIN_RUN="false" ;;
 esac
+if [ -n "${RC_COMMIT_SHA:-}" ]; then
+  EVAL_IS_MAIN_RUN="false"
+fi
 if [ "${EVAL_IS_MAIN_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then
   echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Recording baseline evidence from main <<<"
   # Never fatal. Bookkeeping must not be the reason a merge to main reds.
@@ -1304,6 +1605,8 @@ if [ "${EVAL_IS_MAIN_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then
     "${CASE_RESULTS[@]}" \
     --lines-out "${ARTIFACT_DIR}/baseline-append.jsonl") || \
     echo "WARNING: recording baseline evidence failed; the verdict below is unaffected."
+elif [ -n "${RC_COMMIT_SHA:-}" ]; then
+  echo "Release-candidate run (RC_COMMIT_SHA=${RC_COMMIT_SHA}): the baseline store is read, never written — the candidate is judged against main's window, not added to it."
 else
   echo "Not a main-branch recorder run (JOB_TYPE=${JOB_TYPE:-unset}): the baseline store is read, never written."
 fi

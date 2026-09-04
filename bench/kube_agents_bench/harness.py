@@ -80,12 +80,13 @@ _log = logging.getLogger("kube_agents_bench.harness")
 SERVICE_API_PORT = 8642
 
 # Prefix on ``AgentResult.errors[0]`` that marks a run whose transport died on
-# every attempt: the opening turn never reached the agent, or the delegation
-# wait lost the endpoint on every status-turn retry with cards still
-# outstanding. ``hack/ci-eval-pr.sh`` matches this string in results.json
-# and classifies the task ``RUN_CLASS=INFRA``, so it lands in
-# ``INFRA_FAILED_TASKS`` instead of failing the pull request. The literal is the
-# contract between the two files: change it in both or in neither.
+# every attempt: the agent tunnel never established, the opening turn never
+# reached the agent, or the delegation wait lost the endpoint on every
+# status-turn retry with cards still outstanding. ``scoring.py`` matches this
+# string on a record's error and classifies the repetition as infrastructure
+# rather than grading it. The literal is duplicated there (importing the
+# harness would drag ``devops_bench`` into the scorer), and ``test_scoring.py``
+# asserts the two strings agree: change it in both files or in neither.
 INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 
 # Where hermes keeps per-card state in the agent's data volume. A card's
@@ -645,10 +646,18 @@ class _TransportError(RuntimeError):
 
 # Gateway statuses a proxy in front of the agent emits when the upstream is
 # gone or saturated -- the pod restarted, the tunnel died -- and which clear
-# once it is back. Every other status is an answer about the request itself and
+# once it is back. 429 is the endpoint's own admission control ("Too many
+# concurrent runs"): the rejected request itself never reached an agent --
+# true of an opening turn and of a status poll alike, where the delegating
+# turn already ran but this poll was refused at the door -- and the condition
+# clears when a slot frees, the same run class as a saturated gateway. On
+# exhaustion both turn paths deliberately end in _infra_failure rather than
+# grading a partial record: see _DelegationTransportExhausted for why settling
+# the cards into a record that is about to be replaced wholesale is not a
+# rescue. Every other status is an answer about the request itself and
 # repeating the request cannot change it, 500 included: a handler that raised
 # will raise again.
-_RETRYABLE_STATUSES = frozenset({502, 503, 504})
+_RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
 
 
 def _connection_dropped(exc: BaseException) -> bool:
@@ -713,7 +722,7 @@ def _infra_failure(detail: str) -> AgentResult:
     graded as the agent's answer to ``gpu-stress-test-diagnosis``
     ("The Actual Output consists entirely of an HTTP 502 Bad Gateway",
     OutcomeValidity 0.0). A transport failure has to set a run class, not an
-    output: the marker on ``errors[0]`` is what ``hack/ci-eval-pr.sh`` reads.
+    output: the marker on ``errors[0]`` is what ``scoring.py`` reads.
     """
     return AgentResult(
         output="",
@@ -789,10 +798,38 @@ class KubeAgentsHarness(AgentHarness):
         if not api_path.startswith("/"):
             return AgentResult.errored(f"AGENT_API_PATH must start with '/': {api_path!r}")
 
-        try:
-            _ensure_port_forward(local_port)
-        except RuntimeError as exc:
-            return AgentResult.errored(str(exc))
+        # A tunnel that cannot be established is the same outage as one that
+        # dies mid-run -- the gateway pod replaced, its node draining, its
+        # cluster unreachable -- so it gets the same bounded retry the two
+        # turn loops use and the same run class on exhaustion. Returning the
+        # RuntimeError text as an errored result put "kubectl port-forward
+        # exited with 1" in front of the judge as the agent's answer: 11 of
+        # the 17 no-agent-ran repetitions in #1116's 46-PR sweep are this
+        # shape, and three builds lost every repetition of a case to it,
+        # which repetition voting cannot absorb. INFRA instead drops the
+        # repetition from the denominator, the class terminal 429s join
+        # via #1095's _RETRYABLE_STATUSES entry.
+        transport_failures = 0
+        while True:
+            try:
+                _ensure_port_forward(local_port)
+                break
+            except RuntimeError as exc:
+                transport_failures += 1
+                _log.warning(
+                    "port-forward failed to establish (%d/%d): %s",
+                    transport_failures,
+                    _MAX_TRANSPORT_FAILURES,
+                    exc,
+                )
+                if transport_failures >= _MAX_TRANSPORT_FAILURES:
+                    # Not AgentResult.errored: see _infra_failure. No agent
+                    # ever saw the request, so this is the run class, not an
+                    # answer.
+                    return _infra_failure(
+                        f"the agent tunnel failed to establish {transport_failures} "
+                        f"times running; last failure: {exc}"
+                    )
 
         # 127.0.0.1 rather than localhost, matching _port_open's probe host: a
         # v4/v6 mismatch would make the probe and the request disagree.
@@ -824,10 +861,11 @@ class KubeAgentsHarness(AgentHarness):
                 result, session_id = _post_turn(url, body, headers, timeout)
                 break
             except _TransportError as exc:
-                # A 4xx, a 500, or a body that is not JSON says the endpoint
-                # answered; that is the agent's own failure and still belongs
-                # in front of the judge. Only a gateway status or a dropped
-                # connection is worth a second attempt.
+                # A 500, a 4xx other than 429, or a body that is not JSON
+                # says a handler answered; that is the agent's own failure and
+                # still belongs in front of the judge. Only a gateway status,
+                # an admission-control 429, or a dropped connection is worth a
+                # second attempt: see _RETRYABLE_STATUSES.
                 if not exc.retryable:
                     return AgentResult.errored(str(exc))
                 transport_failures += 1
@@ -918,8 +956,10 @@ class KubeAgentsHarness(AgentHarness):
             turn ran or the header was absent.
 
         Raises:
-            _DelegationTransportExhausted: Every retry died without an HTTP
-                answer; the run is infrastructure, not a gradable result.
+            _DelegationTransportExhausted: Every retry died without reaching
+                an agent -- no HTTP answer at all, or a 429 refused at the
+                admission door; the run is infrastructure, not a gradable
+                result.
         """
         # The delegating turn may already have shown a card done, in which case
         # there is nothing to wait on and no reason to sleep a poll interval.
@@ -981,11 +1021,15 @@ class KubeAgentsHarness(AgentHarness):
                 if transport_failures < _MAX_TRANSPORT_FAILURES:
                     # Back off one poll interval and ask again: the loop top
                     # re-checks the deadline, so retries cannot outlive it.
-                    # A retryable failure means the endpoint never answered,
-                    # and the tunnel is the prime suspect (build
+                    # A retryable failure usually means the endpoint never
+                    # answered, and the tunnel is the prime suspect (build
                     # 2092638061140643840: three 502s over a live listener
                     # whose upstream pod had been replaced), so it is torn
-                    # down and respawned first, exactly like the opening turn.
+                    # down and respawned first, exactly like the opening
+                    # turn. The exception is 429, the one retryable status
+                    # the endpoint itself sends: the tunnel it arrived
+                    # through is healthy, and the respawn's few seconds are
+                    # merely pacing before the slot is asked for again.
                     if exc.retryable:
                         try:
                             _reset_port_forward(local_port)
@@ -1010,10 +1054,11 @@ class KubeAgentsHarness(AgentHarness):
                         f"status turns failed in transport {transport_failures} times "
                         "running; still waiting on: " + ", ".join(outstanding)
                     ) from exc
-                # The endpoint answered every time (a 4xx, a 500, non-JSON):
-                # that is the agent's own failure, so it stays in front of the
-                # judge as before -- recorded, not just logged, which is what
-                # stops devops-bench promoting the partial record.
+                # A handler answered every time (a non-429 4xx, a 500,
+                # non-JSON): that is the agent's own failure, so it stays in
+                # front of the judge as before -- recorded, not just logged,
+                # which is what stops devops-bench promoting the partial
+                # record.
                 result.errors.append(
                     f"status turns failed in transport {transport_failures} times running; "
                     "still waiting on: " + ", ".join(outstanding)

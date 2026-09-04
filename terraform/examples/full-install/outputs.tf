@@ -3,6 +3,21 @@ output "cluster_name" {
   value       = module.gke_cluster.cluster_name
 }
 
+# The image tag the last apply recorded, which is NOT the tag the cluster is
+# serving: the redeploy workflows move the running tag with `helm upgrade` and
+# never touch Terraform. A drift plan needs this one. Planning at the RUNNING
+# tag instead makes every out-of-band redeploy show up as a pending change to
+# helm_release.kube_agents, so the daily report opens on image lag and the
+# infra-drift issue never reaches the clean plan that would close it.
+#
+# An output rather than reading the helm_release's values out of state, because
+# outputs are what Terraform persists for exactly this purpose and `terraform
+# output -raw` is a stable interface where digging through `show -json` is not.
+output "image_tag" {
+  description = "Image tag recorded by the last apply of this composition"
+  value       = var.image_tag
+}
+
 output "cluster_location" {
   description = "Region the cluster runs in"
   value       = module.gke_cluster.cluster_location
@@ -63,6 +78,21 @@ output "github_minter_kms_keyring" {
 output "github_minter_kms_key" {
   description = "KMS signing key to import the GitHub App PEM into (null when the minter is disabled)"
   value       = try(module.github_minter[0].kms_key, null)
+}
+
+output "stockout_pubsub_topic" {
+  description = "Pub/Sub topic for GKE stockout alerts (null when enable_stockout_investigator is false)"
+  value       = try(google_pubsub_topic.stockout_alerts[0].name, null)
+}
+
+output "stockout_pubsub_subscription" {
+  description = "Pub/Sub subscription for GKE stockout alerts (null when enable_stockout_investigator is false)"
+  value       = try(google_pubsub_subscription.stockout_alerts[0].name, null)
+}
+
+output "stockout_pubsub_sink" {
+  description = "Cloud Logging sink for GKE stockout alerts (null when enable_stockout_investigator is false)"
+  value       = try(google_logging_project_sink.stockout_alerts[0].name, null)
 }
 
 output "scoped_service_accounts" {

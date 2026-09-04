@@ -49,7 +49,7 @@ For any request that concerns runtime behavior of workloads on a **single, speci
 
 3. **Read the result** — you are auto-subscribed, so the completion (or a `needs_input` block) is pushed into your chat. You can also inspect it: `kanban_show(<id>)`. The RCA is in the card's `result` — the field the gateway posts verbatim, and the only one the requester receives — with any proposed patch in `metadata`; neither is ever in the worker's chat reply, which is a bare acknowledgement by design.
 
-**Multi-cluster (fan-out / fan-in):** create one card per cluster **with no `parents`**, plus a card **assigned to yourself** with `parents=[<those card ids>]` (the fan-in). `parents` means "runs after", so a per-cluster card that lists your own running card as a parent can never be claimed — see `SOUL.md` §0. Complete your current card; once all the per-cluster cards finish, the dispatcher spawns you on the fan-in card, whose context includes every prerequisite's `metadata`. See the **`workload-rebalancing`** skill for the validation-then-declare pattern.
+**Multi-cluster (fan-out):** create one card per cluster **with no `parents`**, in one burst, so they run in parallel. `parents` means "runs after", so a per-cluster card that lists your own running card as a parent can never be claimed — see `SOUL.md` §0. Then **keep your own card open**: poll each per-cluster card with `kanban_show(<id>)` (`sleep 60` between rounds), and once all of them are settled, synthesize their `result`/`metadata` into your own `kanban_complete(result=...)`. Completing your card is the delivery, so never complete it on a dispatch receipt — the image refuses a `kanban_complete` while your fanned-out cards are unfinished (#1010). See the **`workload-rebalancing`** skill for the validation-then-declare pattern.
 
 ## Acting on the result
 
@@ -107,7 +107,8 @@ forever.
 
 It never deletes on ambiguity: any inconclusive check (auth/network/timeout, or a missing
 `cluster_identity`) leaves the profile untouched. `created=0 pruned=0 kept=0` is a normal,
-successful result. When it creates or prunes anything it posts a Google Chat summary.
+successful result. When it creates or prunes anything it posts a summary to every chat platform it
+can resolve as enabled, falling back to Google Chat when it can resolve none.
 
 Profile lifecycle belongs to this script and to the explicit onboarding/teardown paths above. Do
 not repair the roster from other work by calling `cluster_agent_profile.py` directly — a profile

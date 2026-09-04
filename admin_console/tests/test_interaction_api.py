@@ -78,7 +78,7 @@ class ScriptedBackend:
         self.prompts.append(kwargs["prompt"])
         if self.root.status == "waiting_for_approval":
             kwargs["on_update"](self.root)
-            self.approval_resolved.wait(timeout=2)
+            self.approval_resolved.wait(timeout=15)
             return ChatRunResult(
                 run_id=self.root.run_id,
                 session_id=self.root.session_id,
@@ -117,7 +117,7 @@ class BlockingBackend(ScriptedBackend):
     def run(self, *args, **kwargs) -> ChatRunResult:
         self.run_calls += 1
         self.started.set()
-        self.release.wait(timeout=2)
+        self.release.wait(timeout=15)
         return self.root
 
 
@@ -137,7 +137,7 @@ class CancellableBackend(ScriptedBackend):
             )
         )
         self.started.set()
-        self.stopped.wait(timeout=2)
+        self.stopped.wait(timeout=15)
         return ChatRunResult(
             run_id=self.root.run_id,
             session_id=self.root.session_id,
@@ -190,20 +190,36 @@ class InteractionApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 202)
         return response.json()["interactionId"]
 
+    # Ceiling, not a floor: condition waits return the moment the condition
+    # holds, so a generous value costs healthy runs nothing and only bounds a
+    # genuinely hung test. Never assert on elapsed time.
+    WAIT_CEILING_SECONDS = 15.0
+
+    def wait_until(self, condition, message: str, timeout: float | None = None):
+        """Poll until condition() is truthy and return its value; fail loudly
+        on timeout instead of falling through to a misleading assertion."""
+        deadline = time.monotonic() + (timeout or self.WAIT_CEILING_SECONDS)
+        while time.monotonic() < deadline:
+            value = condition()
+            if value:
+                return value
+            time.sleep(0.005)
+        self.fail(message)
+
     def wait_for_terminal(
         self,
         client: TestClient,
         interaction_id: str,
     ) -> dict:
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
+        def terminal_payload():
             payload = client.get(
                 f"/api/v1/interactions/{interaction_id}"
             ).json()
-            if payload["terminal"]:
-                return payload
-            time.sleep(0.005)
-        self.fail("interaction did not become terminal")
+            return payload if payload["terminal"] else None
+
+        return self.wait_until(
+            terminal_payload, "interaction did not become terminal"
+        )
 
     def test_completed_root_is_not_terminal_until_delegated_work_settles(self):
         backend = ScriptedBackend(
@@ -275,13 +291,17 @@ class InteractionApiTest(unittest.TestCase):
             max_workers=1,
         )
         first = service.start(agent_id="platform-agent", input_text="first")
-        self.assertTrue(backend.started.wait(timeout=1))
+        self.assertTrue(backend.started.wait(timeout=15))
         second = service.start(agent_id="platform-agent", input_text="second")
 
         cancelled = service.cancel(second.interaction_id)
         backend.release.set()
-        service.wait(first.interaction_id, timeout=2)
-        time.sleep(0.05)
+        service.wait(first.interaction_id, timeout=15)
+        # The root executor is a single FIFO worker here, so a sentinel
+        # submitted now completes only after the cancelled interaction's
+        # _run_root turn already ran — after this line, an absent
+        # "interaction.started" is absent forever, not merely not-yet.
+        service._executor.submit(lambda: None).result(timeout=15)
 
         self.assertEqual(cancelled.status, InteractionStatus.CANCELLED)
         self.assertEqual(service.get(second.interaction_id).status, InteractionStatus.CANCELLED)
@@ -293,10 +313,10 @@ class InteractionApiTest(unittest.TestCase):
         backend = CancellableBackend()
         service = ChatService(lambda: backend, poll_interval=0.001, task_timeout=1)
         interaction = service.start(agent_id="platform-agent", input_text="long run")
-        self.assertTrue(backend.started.wait(timeout=1))
+        self.assertTrue(backend.started.wait(timeout=15))
 
         cancelled = service.cancel(interaction.interaction_id)
-        final = service.wait(interaction.interaction_id, timeout=2)
+        final = service.wait(interaction.interaction_id, timeout=15)
 
         self.assertEqual(cancelled.status, InteractionStatus.CANCELLED)
         self.assertEqual(cancelled.root_run_id, backend.root.run_id)
@@ -415,15 +435,18 @@ class InteractionApiTest(unittest.TestCase):
         )
         client, _ = client_for(backend, max_workers=1)
         interaction_id = self.start(client)
-        deadline = time.monotonic() + 2
-        waiting = {}
-        while time.monotonic() < deadline:
-            waiting = client.get(
-                f"/api/v1/interactions/{interaction_id}"
-            ).json()
-            if waiting["status"] == "waiting_for_approval":
-                break
-            time.sleep(0.005)
+        waiting = self.wait_until(
+            lambda: (
+                payload
+                if (
+                    payload := client.get(
+                        f"/api/v1/interactions/{interaction_id}"
+                    ).json()
+                )["status"] == "waiting_for_approval"
+                else None
+            ),
+            "interaction never reached waiting_for_approval",
+        )
         self.assertEqual(waiting["approval"]["tool"], "kubectl")
 
         response = client.post(
@@ -461,12 +484,13 @@ class InteractionApiTest(unittest.TestCase):
         backend.run = run_with_completion
         client, _ = client_for(backend)
         interaction_id = self.start(client)
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
-            waiting = client.get(f"/api/v1/interactions/{interaction_id}").json()
-            if waiting["status"] == "waiting_for_approval":
-                break
-            time.sleep(0.005)
+        self.wait_until(
+            lambda: client.get(f"/api/v1/interactions/{interaction_id}").json()[
+                "status"
+            ]
+            == "waiting_for_approval",
+            "interaction never reached waiting_for_approval",
+        )
 
         response = client.post(
             f"/api/v1/interactions/{interaction_id}/approval",
@@ -491,11 +515,11 @@ class InteractionApiTest(unittest.TestCase):
         )
         client, service = client_for(backend)
         interaction_id = self.start(client)
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
-            if service.get(interaction_id).status == InteractionStatus.WAITING_FOR_APPROVAL:
-                break
-            time.sleep(0.005)
+        self.wait_until(
+            lambda: service.get(interaction_id).status
+            == InteractionStatus.WAITING_FOR_APPROVAL,
+            "interaction never reached waiting_for_approval",
+        )
 
         def approve_once() -> bool:
             try:
@@ -506,7 +530,7 @@ class InteractionApiTest(unittest.TestCase):
 
         with ThreadPoolExecutor(max_workers=16) as executor:
             accepted = list(executor.map(lambda _: approve_once(), range(16)))
-        result = service.wait(interaction_id, timeout=2)
+        result = service.wait(interaction_id, timeout=15)
 
         self.assertEqual(sum(accepted), 1)
         self.assertEqual(backend.approvals, ["once"])
@@ -765,17 +789,113 @@ class InteractionApiTest(unittest.TestCase):
                 agent_id="platform-agent",
                 input_text="Is the cluster healthy?",
             )
-            completed = service.wait(interaction.interaction_id, timeout=2)
+            completed = service.wait(interaction.interaction_id, timeout=15)
             self.assertEqual(completed.status, InteractionStatus.COMPLETED)
 
-            reopened = SQLiteInteractionStore(path)
+            # wait() returns as soon as the interaction is terminal, and
+            # _run_root makes that status transition before it appends the
+            # completion event, so the event can still be in flight here. Poll
+            # for it rather than reading once -- the same deadline idiom as
+            # _await_terminal above. Reading once left the last event as
+            # tasks.observed under load, roughly one run in ten.
+            deadline = time.monotonic() + 2
+            events = []
+            while time.monotonic() < deadline:
+                reopened = SQLiteInteractionStore(path)
+                events = reopened.events_after(interaction.interaction_id)
+                if events and events[-1].event == "interaction.completed":
+                    break
+                time.sleep(0.005)
+
             persisted = reopened.get(interaction.interaction_id)
-            events = reopened.events_after(interaction.interaction_id)
 
             self.assertEqual(persisted.output, "The cluster is healthy.")
             self.assertEqual(persisted.tool_calls[0].name, "kanban_create")
             self.assertEqual(events[-1].event, "interaction.completed")
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_terminal_event_is_atomic_with_the_terminal_status(self):
+        """#1210: a waiter woken by terminal status must see the terminal
+        event, which holds only when the event is appended inside
+        transition(). Data-flow, not timing: the store records every event
+        routed through the non-atomic append_event API, and the terminal
+        event must never be among them — a revert to the old
+        transition-then-append pattern fails this on any machine, loaded or
+        not, with no sleeps to miss the window."""
+
+        class RecordingStore(SQLiteInteractionStore):
+            appended: list[str] = []
+
+            def append_event(self, interaction_id, event, data=None):
+                RecordingStore.appended.append(event)
+                return super().append_event(interaction_id, event, data)
+
+        RecordingStore.appended.clear()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "interactions.db"
+            service = ChatService(
+                lambda: ScriptedBackend(),
+                store=RecordingStore(path),
+                poll_interval=0.001,
+                quiet_polls=2,
+                task_timeout=1,
+            )
+            interaction = service.start(
+                agent_id="platform-agent",
+                input_text="Is the cluster healthy?",
+            )
+            completed = service.wait(interaction.interaction_id, timeout=15)
+            self.assertEqual(completed.status, InteractionStatus.COMPLETED)
+            # The moment wait() returns, the event is already durable — even
+            # through a fresh connection to the same file.
+            events = SQLiteInteractionStore(path).events_after(
+                interaction.interaction_id
+            )
+            self.assertEqual(events[-1].event, "interaction.completed")
+            self.assertNotIn(
+                "interaction.completed",
+                RecordingStore.appended,
+                "terminal event must travel inside transition(), not through"
+                " the non-atomic append_event API",
+            )
+
+    def test_transition_event_appends_atomically_or_not_at_all(self):
+        """transition(event=...) appends exactly when the transition applies:
+        a refused transition (wrong expected status) must leave no event."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "interactions.db"
+            store = SQLiteInteractionStore(path)
+            now = datetime.now(UTC)
+            interaction = Interaction(
+                interaction_id="ix_atomic",
+                agent_id="platform-agent",
+                profile="default",
+                session_id="portal_atomic",
+                input_text="Inspect the cluster",
+                status=InteractionStatus.WAITING_FOR_TASKS,
+                created_at=now,
+                updated_at=now,
+            )
+            store.create(interaction)
+            refused = store.transition(
+                "ix_atomic",
+                frozenset({InteractionStatus.RUNNING}),  # actual status differs
+                event="interaction.completed",
+                status=InteractionStatus.COMPLETED,
+            )
+            self.assertIsNone(refused)
+            self.assertEqual(store.events_after("ix_atomic"), ())
+            applied = store.transition(
+                "ix_atomic",
+                frozenset({interaction.status}),
+                event="interaction.completed",
+                event_data={"why": "atomic"},
+                status=InteractionStatus.COMPLETED,
+            )
+            self.assertIsNotNone(applied)
+            events = store.events_after("ix_atomic")
+            self.assertEqual(events[-1].event, "interaction.completed")
+            self.assertEqual(events[-1].data, {"why": "atomic"})
 
     def test_sqlite_store_ignores_additive_fields_from_another_version(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -845,7 +965,7 @@ class InteractionApiTest(unittest.TestCase):
                 agent_id="platform-agent",
                 input_text=secret_prompt,
             )
-            completed = service.wait(interaction.interaction_id, timeout=2)
+            completed = service.wait(interaction.interaction_id, timeout=15)
             persisted = store.get(interaction.interaction_id)
 
         self.assertEqual(backend.prompts, [secret_prompt])

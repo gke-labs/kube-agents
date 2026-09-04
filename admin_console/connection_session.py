@@ -59,8 +59,13 @@ def initialize_connection_controller(
     st.session_state.authenticated_user = authenticated_user
     persisted_connection = load_connection(authenticated_user)
 
+    # The generated state file, then the hand-authored input over the top of
+    # it. install.env is what the installers read, so it is what the portal
+    # must agree with; vars.sh is still consulted for a deployment installed
+    # before install.env existed.
     provisioned_target = load_provisioned_target(
-        package_parent / "k8s-operator" / "scripts" / "vars.sh"
+        package_parent / "k8s-operator" / "scripts" / "vars.sh",
+        package_parent / "install.env",
     )
     query_project = str(st.query_params.get("project", "")).strip()
     configured_project = os.environ.get("KUBE_AGENTS_GCLOUD_PROJECT", "").strip()

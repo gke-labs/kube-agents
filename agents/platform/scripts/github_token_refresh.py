@@ -18,6 +18,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import Sequence
 from urllib.parse import urlsplit
 
 # Add scripts directory so gitops_workspace is importable
@@ -37,6 +38,124 @@ TOKEN_BROKER_URL = os.getenv(
     "TOKEN_BROKER_URL",
     "http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token",
 )
+
+#: Shell convention for "command not found", reused so a missing binary stays
+#: distinguishable from a gh command that ran and failed.
+GH_MISSING_RC = 127
+
+#: The credential sidecar's own timeout (`_execute` in credential_proxy.py),
+#: surfaced through credential_proxy_client. Excluded from the retry because a
+#: command that ran for the full timeout may well have landed its write; see
+#: looks_like_auth_failure.
+GH_TIMEOUT_RC = 124
+
+# What `gh` prints when the credential is the problem, as opposed to the
+# repository, the network, or the rate limit. Matched case-insensitively
+# against stderr: the REST paths emit `HTTP 401: Bad credentials`, the GraphQL
+# ones `requires authentication`, and `auth status` (which is handled
+# separately, being the explicit question) `not logged in` / `token is invalid`.
+_GH_AUTH_FAILURE = re.compile(
+    r"HTTP 401"
+    r"|bad credentials"
+    r"|requires authentication"
+    r"|authentication failed"
+    r"|not logged in"
+    r"|token is invalid"
+    r"|invalid token",
+    re.IGNORECASE,
+)
+
+
+def looks_like_auth_failure(args: Sequence[str] | list, result: subprocess.CompletedProcess) -> bool:
+    """Does this failure look like one a fresh token would fix?
+
+    The retry exists for an expired installation token, and minting on anything
+    else spends a credential on a fault no credential can repair. `gh auth
+    status` passes whenever *any* host is authenticated, so a repository the
+    token cannot reach fails only at `issue list` with a 404 -- and gating the
+    retry on ``returncode != 0`` alone turned that permanent misconfiguration
+    into a mint on every ten-minute tick, indefinitely.
+    """
+    if result.returncode == 0:
+        return False
+    if result.returncode in (GH_MISSING_RC, GH_TIMEOUT_RC):
+        return False
+    if list(args)[:2] == ["auth", "status"]:
+        return True
+    return bool(_GH_AUTH_FAILURE.search(result.stderr or ""))
+
+
+_refresh_attempted = False
+_refresh_failed = False
+
+
+def is_refresh_failed() -> bool:
+    """True if a credential refresh was attempted during this process and failed."""
+    return _refresh_failed
+
+
+def reset_refresh_state() -> None:
+    """Reset the at-most-once refresh guard and failure state (primarily for tests)."""
+    global _refresh_attempted, _refresh_failed
+    _refresh_attempted = False
+    _refresh_failed = False
+
+
+def refresh_credentials_once(
+    args: Sequence[str] | None = None,
+    *,
+    repo: str | None = None,
+) -> bool:
+    """Mint a fresh token, at most once per process.
+
+    Returns True only when a new token actually landed -- i.e. when retrying
+    the gh command that just failed is worth doing.
+
+    The at-most-once guard is what bounds the cost. Each entry point runs as
+    its own invocation, so one invocation makes one mint however many gh calls
+    it makes, and a credential broken for a reason no token fixes cannot turn a
+    single poll into a mint per call.
+
+    Note: In multi-org deployments, if an un-scoped preflight check (e.g. `auth
+    status`) triggers token refresh, it mints for the first managed repository.
+    Subsequent 401s for a repository in a different organization within the same
+    process will not trigger a second mint due to the process-wide at-most-once
+    guard. Full multi-org refresh across different organizations requires lifting
+    the guard to once-per-organization.
+    """
+    global _refresh_attempted, _refresh_failed
+    if _refresh_attempted:
+        return False
+    _refresh_attempted = True
+
+    if not repo and args:
+        argv_list = list(args)
+        for flag in ("-R", "--repo"):
+            if flag in argv_list:
+                try:
+                    repo = argv_list[argv_list.index(flag) + 1]
+                    break
+                except (ValueError, IndexError):
+                    pass
+
+    if not repo:
+        try:
+            from gitops_workspace import get_managed_github_repos
+            managed = get_managed_github_repos()
+            repo = managed[0] if managed else None
+        except Exception:
+            repo = None
+
+    if not repo:
+        return False
+
+    try:
+        refresh_git_credentials(repo)
+    except Exception as exc:
+        log(f"GitHub credential refresh failed: {type(exc).__name__}: {exc}")
+        _refresh_failed = True
+        return False
+    return True
 
 
 # Hosts this refresher will mint a token for. `ssh.github.com` is GitHub's

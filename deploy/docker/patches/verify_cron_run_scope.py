@@ -93,9 +93,46 @@ def main() -> int:
     check("card is back after the run", kt._default_task_id(None), CALLER_CARD)
     check("ownership restored", kt._enforce_worker_task_ownership(CALLER_CARD), None)
 
-    # --- the run's report reaches the caller --------------------------------
+    # --- the out-param reaches the code that writes it ----------------------
+    # Everything below stubs run_one_job out, which is the right shape for
+    # asserting that the caller's end of the contract holds but leaves the
+    # patched scheduler body entirely unexecuted. v2026.8.19 split run_one_job
+    # into a wrapper plus _run_one_job_body and moved every write site into the
+    # body; a patch that put ``outcome`` on the wrapper alone still matched its
+    # anchors, still parsed, and still passed every check in this file, and
+    # failed on the first real tick in a cluster with ``name 'outcome' is not
+    # defined``. So look at the signatures directly, before the stub hides them.
+    import inspect
+
     import cron.scheduler as sched
 
+    for fn_name in ("run_one_job", "_run_one_job_body"):
+        fn = getattr(sched, fn_name, None)
+        if fn is None:
+            failures.append(f"cron.scheduler has no {fn_name}()")
+            continue
+        params = inspect.signature(fn).parameters
+        check(
+            f"{fn_name} takes the outcome out-param",
+            "outcome" in params and params["outcome"].kind is inspect.Parameter.KEYWORD_ONLY,
+            True,
+        )
+
+    # And that the wrapper forwards it, rather than accepting it and dropping
+    # it on the floor — which is the same production failure with a quieter
+    # symptom, an empty report instead of a NameError.
+    forwarded: dict = {}
+    _real_body = sched._run_one_job_body
+    sched._run_one_job_body = lambda job, **kw: forwarded.update(kw) or True
+    try:
+        sched.run_one_job({"id": JOB_ID}, outcome={"probe": True})
+    except Exception as exc:  # noqa: BLE001
+        failures.append(f"run_one_job({{outcome=...}}) raised {type(exc).__name__}: {exc}")
+    finally:
+        sched._run_one_job_body = _real_body
+    check("run_one_job forwards it to the body", forwarded.get("outcome"), {"probe": True})
+
+    # --- the run's report reaches the caller --------------------------------
     seen = {}
 
     def fake_run_one_job(job, **kw):
@@ -108,7 +145,15 @@ def main() -> int:
         return True
 
     sched.run_one_job = fake_run_one_job
-    ct.claim_job_for_fire = lambda jid: True
+    # v2026.8.19 gave claim_job_for_fire a keyword-only `return_job`, and
+    # _execute_job_now now calls it with return_job=True and treats anything
+    # that is not a dict as "claim lost". A stub that returns a bare True
+    # therefore fails the claim rather than the assertion below, which is a
+    # much less legible way to be told the contract moved. **kw so the next
+    # keyword upstream adds does not break this the same way.
+    ct.claim_job_for_fire = lambda jid, **kw: (
+        {"id": jid} if kw.get("return_job") else True
+    )
     ct.get_job = lambda jid: {"id": jid, "last_status": "ok", "last_error": None}
 
     exec_result = ct._execute_job_now({"id": JOB_ID})

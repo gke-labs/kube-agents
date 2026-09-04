@@ -56,6 +56,25 @@ class DeployContractTest(unittest.TestCase):
     def test_uninstall_does_not_regenerate_manifests(self):
         self.assertNotIn("controller-gen", _make_n("uninstall"))
 
+    def test_dev_rebuild_agent_points_at_a_script_that_exists(self):
+        """The helpers moved to the repository root's scripts/dev/, and this
+        target ran ./scripts/dev/... relative to k8s-operator/ — a path that
+        stopped existing with the move. `make -n` still prints a recipe for a
+        missing script, so resolve what it names against the filesystem.
+        """
+        recipe = _make_n("dev-rebuild-agent")
+        script = "scripts/dev/dev_rebuild_agent.sh"
+        self.assertIn(script, recipe)
+        repo_root = _OPERATOR_DIR.parent
+        self.assertTrue(
+            (repo_root / script).is_file(),
+            f"{script} must resolve from the repository root, not {_OPERATOR_DIR}",
+        )
+        self.assertFalse(
+            (_OPERATOR_DIR / script).exists(),
+            "k8s-operator/scripts/ is gone; the recipe must not resolve there",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,7 +1,7 @@
 # Build args so this can be rebuilt from a mirrored base; see
 # deploy/docker/Dockerfile for the reasoning. Defaults are upstream.
 ARG PYTHON_IMAGE=python
-ARG PYTHON_VERSION=3.11-slim
+ARG PYTHON_VERSION=3.14-slim
 FROM ${PYTHON_IMAGE}:${PYTHON_VERSION}
 WORKDIR /app
 RUN pip install fastapi uvicorn httpx

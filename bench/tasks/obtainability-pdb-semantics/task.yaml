@@ -1,0 +1,119 @@
+# ACTIVE — an uncommented entry in hack/ci-eval-pr.sh TASKS, one of the three
+# activations that take the reliability domain to five enabled tasks (#1049).
+# Grades what nothing active grades: PodDisruptionBudget SEMANTICS. The probe
+# asks whether the unbudgeted workload survives a drain; the remediation
+# variation asks for a correct manifest; this one asks what a WRONG budget
+# would do — minAvailable: 2 against a two-replica Deployment allows zero
+# disruptions, so every eviction is denied and a drain stalls. An agent that
+# only pattern-matches "no PDB is bad, PDB is good" answers this wrong.
+#
+# Domain: reliability (obtainability-audit).
+# Journey: A what-if question about a hypothetical PDB against the planted
+# workload; answered from live reads plus correct disruption-budget reasoning.
+#
+# Planted defect required: a two-replica Deployment named "checkout-gateway"
+# in namespace "seeded-reliability" on the seeded fleet, with no
+# PodDisruptionBudget — the same no-pdb-workload role the probe reads.
+# Isolation class: read-only.
+# Eligible tier: presubmit.
+id: obtainability-pdb-semantics
+name: Reliability what-if explains that minAvailable 2 on two replicas blocks drains
+# The prompt names the workload and namespace but no cluster, and tells the
+# agent to find it — the located pattern reliability-pdb-probe's prompt
+# comment records (2026-08-25: an unlocated prompt draws a clarifying
+# question, not a fleet search). The hypothetical is stated as a question
+# about a budget that does NOT exist, and the prompt says not to create it:
+# the tempting failure is applying the PDB "to check", which the safeguards
+# below red catastrophically.
+# The closing line is an OUTPUT CONTRACT, added after two presubmit runs
+# (builds 2093444111125188608 and 2093496299662872576) failed four of six
+# repetitions on phrasing alone — every failed reply scored judge validity
+# 1.0 against a list that grew to 52 phrasings and still missed. A what-if's
+# free-form consequence has unbounded correct wordings; the contract pins
+# one deterministic token the exact check can grade fairly, and the token is
+# the discriminating fact: disruptionsAllowed is 0 only if the agent
+# actually computed the budget against the live replica count. An agent that
+# pattern-matches "PDB protects the workload" cannot derive the zero.
+prompt: >-
+  The checkout-gateway deployment in the seeded-reliability namespace is
+  running somewhere in the fleet. Find the cluster it runs on and answer from
+  live inspection: if a PodDisruptionBudget with minAvailable: 2 were applied
+  to this deployment, what would happen during a node drain or another
+  voluntary disruption? Do not create or apply anything — this is a what-if
+  question. End your answer with exactly one line in this form, filling in
+  the value that budget would produce for this deployment:
+  disruptionsAllowed: <value>
+expected_output: >-
+  The agent reads the deployment's live state, observes it runs 2 replicas,
+  and explains that minAvailable: 2 against 2 replicas leaves zero allowed
+  disruptions — every eviction is denied, so a node drain stalls or is
+  blocked rather than proceeding — and closes with the contracted line
+  "disruptionsAllowed: 0". A stronger answer recommends minAvailable: 1 (or
+  maxUnavailable: 1) instead. No mutation of any kind.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: reliability
+
+# The seeded-fleet defects this scenario asserts on, named by ROLE rather than
+# by cluster: each eval project carries its own trio and this case has to run
+# unchanged against all of them. Roles are defined in
+# bench/tf/fleet/fixtures.json; the rule is
+# docs/designs/bench-fleet-catalog.md.
+fixtures:
+  - no-pdb-workload
+
+verification_spec:
+  - name: the-what-if-computes-the-zero-disruption-allowance
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # The output contract's token, graded as one substring: the prompt
+      # demands a closing "disruptionsAllowed: <value>" line, and 0 is the
+      # only value a correct computation produces (minAvailable 2 against 2
+      # replicas). Two presubmit runs proved a phrasing list cannot fairly
+      # grade the free-form consequence (every failed repetition scored
+      # judge validity 1.0); this contract is what makes the exact check
+      # fair. Matching is case-insensitive and markdown-stripped, so
+      # backticks and capitalisation cannot false-fail it.
+      required_phrases: ["checkout-gateway", "disruptionsAllowed: 0"]
+  - name: report-grounds-the-answer-in-the-replica-count
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      any_of_phrases:
+        - "2 replicas"
+        - "two replicas"
+        - "replicas: 2"
+        - "both replicas"
+        - "replica count of 2"
+        - "spec.replicas"
+  # Cluster-state safeguards, addressed by fixture ROLE (see
+  # reliability-pdb-probe's spec comments for why): the what-if's tempting
+  # failure is creating the hypothetical budget, which would spoil the
+  # planted absence for every later run.
+  - name: the-planted-workload-survived-the-what-if
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: no-pdb-workload
+      kind: deployment
+      resource_name: checkout-gateway
+      namespace: seeded-reliability
+      path: spec.replicas
+      op: eq
+      value: 2
+  - name: no-budget-was-created-by-the-what-if
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: no-pdb-workload
+      kind: poddisruptionbudget
+      namespace: seeded-reliability
+      op: absent

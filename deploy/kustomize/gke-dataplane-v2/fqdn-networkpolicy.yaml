@@ -41,6 +41,10 @@ spec:
         - pattern: "*.slack.com"
         - pattern: "*.slack-edge.com"
         - pattern: "*.slack-msgs.com"
+        - pattern: "login.microsoftonline.com"
+        - pattern: "*.login.microsoftonline.com"
+        - pattern: "botframework.com"
+        - pattern: "*.botframework.com"
       ports:
         - protocol: "TCP"
           port: 443

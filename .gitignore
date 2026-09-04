@@ -8,6 +8,11 @@ vars.sh.tmp
 *.vars.sh
 
 # Environment Files
+# install.env is the hand-authored install configuration and holds credentials.
+# It needs naming outright: the patterns below anchor on a leading dot, so
+# neither `.env` nor `.env.*` matches it. Same for tags.env, which is committed.
+install.env
+**/install.env
 .env
 .env.*
 !.env.example
@@ -45,7 +50,8 @@ terraform.tfvars.json
 # and a user's backend override belongs to their environment, not the example.
 *_override.tf
 
-# Local helm package output
+# Local build & release packaging output
+build/
 *.tgz
 
 # Per-developer Claude Code state (session settings, local skills). The shared

@@ -21,8 +21,9 @@ with no chat adapters and nothing in the symptom pointed at a Slack file.
 
 So this checks the shim against the thing it actually wraps:
 
-1. the signatures of every upstream callable the two patches replace are still
-   the signatures they were written against;
+1. the signatures and parameter defaults of every upstream callable the two
+   patches replace or reimplement are still the signatures and defaults they
+   were written against;
 2. a plugin-sourced entry registers through the shim exactly as
    ``hermes_cli/plugins.py`` registers one, scope and all, and comes back
    relay-backed and findable;
@@ -34,9 +35,11 @@ So this checks the shim against the thing it actually wraps:
    in the environment, scripts on ``PYTHONPATH`` -- so ``sitecustomize``'s
    import hook is what installs the patch, not this file.
 
-Check 1 is a pin. When it fails, read the upstream method, decide whether the
-shim needs to change, and then update the expectation deliberately -- do not
-refresh it to whatever the new image says.
+Check 1 is a pin covering both callable signatures (`UPSTREAM_SIGNATURES`) and
+critical parameter defaults (`PINNED_DEFAULTS`) on reimplemented methods. When
+either fails, read the upstream method, decide whether the shim needs to change,
+and then update the expectation deliberately -- do not refresh it to whatever
+the new image says.
 
 Checks 1-4 run in a process where ``SLACK_RELAY_URL`` is *unset at startup*,
 because ``sitecustomize.install_hook()`` reads the environment as it is
@@ -53,6 +56,8 @@ import inspect
 import os
 import subprocess
 import sys
+
+from typing import Any
 
 # Never dialled: every check here stops short of a request. It only has to look
 # like a configured relay to ``relay_without_token()``.
@@ -140,8 +145,26 @@ UPSTREAM_SIGNATURES = {
     ),
 }
 
+# Default values the relay patches depend on. Keyed by (callable label, parameter name).
+# Only reimplemented methods/functions where a changed upstream default creates silent
+# drift are pinned here; delegating wrappers (PlatformRegistry.register,
+# PlatformRegistry.create_adapter) pass through *args/**kwargs unchanged and are exempt
+# from default pinning.
+PINNED_DEFAULTS: dict[tuple[str, str], object] = {
+    ("SlackAdapter.connect", "is_reconnect"): False,
+    ("GoogleChatAdapter.connect", "is_reconnect"): False,
+    ("SlackAdapter._download_slack_file", "audio"): False,
+    ("SlackAdapter._download_slack_file", "team_id"): "",
+    ("SlackAdapter._download_slack_file_bytes", "team_id"): "",
+    ("slack._standalone_send", "thread_id"): None,
+    ("slack._standalone_send", "media_files"): None,
+    ("slack._standalone_send", "force_document"): False,
+    ("slack._standalone_send", "caption"): None,
+    ("GoogleChatAdapter._handle_setup_files_command", "sender_email"): None,
+}
 
-def upstream_callables() -> dict[str, object]:
+
+def upstream_callables() -> dict[str, Any]:
     """Resolve every pinned callable out of the image's own Hermes tree."""
     from gateway.platform_registry import PlatformRegistry
     from plugins.platforms.google_chat import adapter as google_chat_adapter
@@ -284,6 +307,22 @@ def unwired() -> int:
 
     for label, func in upstream_callables().items():
         check(f"upstream signature: {label}", shape(func), UPSTREAM_SIGNATURES[label])
+
+    for (label, param_name), expected_default in PINNED_DEFAULTS.items():
+        func = upstream_callables()[label]
+        sig = inspect.signature(func)
+        param = sig.parameters.get(param_name)
+        if param is None:
+            fail(
+                f"upstream default: {label}({param_name})",
+                "parameter missing from signature",
+            )
+        else:
+            check(
+                f"upstream default: {label}({param_name})",
+                param.default,
+                expected_default,
+            )
 
     os.environ["SLACK_RELAY_URL"] = RELAY_URL
     # No token anywhere: the credential proxy holds the only one, and that is

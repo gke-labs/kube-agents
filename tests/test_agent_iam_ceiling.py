@@ -37,7 +37,7 @@ import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = REPO_ROOT / "k8s-operator" / "scripts"
+SCRIPTS = REPO_ROOT / "scripts" / "installer"
 COMMON_SH = SCRIPTS / "common.sh"
 INSTALLER_COMMON_SH = SCRIPTS / "installer_common.sh"
 INSTALL_SH = REPO_ROOT / "install.sh"
@@ -95,7 +95,7 @@ def _run_bash(script: str, env_overrides: dict[str, str]) -> subprocess.Complete
 
     CI=1 makes `init_var` take defaults instead of blocking on a prompt, and
     VARS_FILE points at a temp file so nothing touches the developer's real
-    (git-ignored) k8s-operator/scripts/vars.sh. TERM=dumb keeps common.sh's
+    (git-ignored) scripts/installer/vars.sh. TERM=dumb keeps common.sh's
     EXIT trap (`tput cnorm`) from writing cursor escapes into the stdout the
     assertions are read from.
     """
@@ -343,16 +343,23 @@ class InstallerFrontDoorTest(unittest.TestCase):
         every spelling reaches the right message, but it cannot fix the
         variable in the caller. Everything downstream of the call in install.sh
         compares against the lowercase literal -- the custom-roles requirement,
-        the over-reach warning, the two `write_state_var` lines, and (through
-        the generated tfvars) terraform's case-sensitive `contains()` on
-        permission_set. So a `--permission-set=Custom` that cleared the gate
+        the over-reach warning, the exported PLATFORM_AGENT_* pair, and
+        (through the generated tfvars) terraform's case-sensitive `contains()`
+        on permission_set. So a `--permission-set=Custom` that cleared the gate
         and stayed `Custom` would miss all of them and fail much later, in the
         apply, with an error about a different value entirely. The fix is one
         line and this is what holds it there.
+
+        The assignment carries no `:-read-only` any more: installer_common.sh
+        owns that default and resolve_shared_defaults binds it, so there is one
+        home for it rather than a copy at each point of use. What this test is
+        about is unchanged -- that whatever the variable is read from, it is
+        normalised before anything branches on it.
         """
         source = INSTALL_SH.read_text(encoding="utf-8")
         assignment = re.search(
-            r'^\s*local permission_set="\$\{PARAM_PERMISSION_SET:-read-only\}"$',
+            r'^\s*local permission_set="\$(?:PARAM_PERMISSION_SET|'
+            r'\{PARAM_PERMISSION_SET(?::-[^}]*)?\})"$',
             source,
             re.M,
         )
@@ -492,7 +499,7 @@ class NoShippedInstallPathGrantsContainerAdminTest(unittest.TestCase):
     Scoped to what an install actually runs — the Terraform composition and
     modules, and the three shell front doors. Deliberately not the whole
     repository: the evaluation fleet under bench/ and the developer bootstrap
-    under k8s-operator/scripts/dev/ grant admin roles to identities that are
+    under scripts/dev/ grant admin roles to identities that are
     not the agent, and folding them in here would either fail permanently or
     have to be excepted by name.
 

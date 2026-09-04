@@ -329,8 +329,13 @@ data:
         enabled: false
         extra:
           rich_blocks: true
+      teams:
+        enabled: false
+        extra:
+          adaptive_cards: true
   managed.env: |
     API_SERVER_KEY=cluster-internal-trusted
+    KUBEAGENTS_MODE=today
     GOOGLE_CHAT_RELAY_URL=http://platformagent-credential-proxy.kubeagents-system.svc.cluster.local:8765
     GOOGLE_CHAT_PROJECT_ID=kube-agents-gkedemos
     GOOGLE_CHAT_SUBSCRIPTION_NAME=projects/kube-agents-gkedemos/subscriptions/kubeagents-google-chat-events-sub
@@ -1039,7 +1044,7 @@ spec:
         - args:
             - -c
             - /fluent-bit/etc/fluent-bit.conf
-          image: fluent/fluent-bit:5.1.0
+          image: fluent/fluent-bit:5.1.1
           name: fluent-bit
           resources:
             limits:
@@ -1307,6 +1312,8 @@ spec:
               k8s-app: node-local-dns
         - ipBlock:
             cidr: 169.254.20.10/32
+        - ipBlock:
+            cidr: 169.254.169.254/32
         - ipBlock:
             cidr: 10.96.0.10/32
     - ports:

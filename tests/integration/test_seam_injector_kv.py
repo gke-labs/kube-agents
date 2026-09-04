@@ -10,8 +10,8 @@ watcher package) against the real server over a real socket.
 
 Skips when no Go toolchain is available, which makes a laptop without `go`
 report OK on four tests it never ran -- install one before you believe a green
-run here. CI's `test` and `coverage` jobs both set Go up for exactly that
-reason, since this tier gates from inside `make test-python`.
+run here. CI's `test` job sets Go up for exactly that reason, since this tier
+gates from inside the `PYTHON_TEST_DIRS` sweep that job runs.
 """
 
 from __future__ import annotations
@@ -26,17 +26,77 @@ from pathlib import Path
 from _seams import API_KEY, KVServer, REPO_ROOT, http_json
 
 
+SYSTEM_GO_PATH = "/usr/local/go/bin/go"
+# `go env GOCACHE` is a local read of the toolchain's own configuration; it
+# neither builds nor reaches the network, so anything approaching this bound
+# means the toolchain is wedged rather than slow.
+GO_ENV_PROBE_TIMEOUT_SECONDS = 30
+FALLBACK_GOCACHE_DIRNAME = "gocache"
+# What `go env GOCACHE` prints instead of a path when the build cache is
+# switched off -- which is what an unset HOME produces, since Go has nowhere to
+# put a default cache. It is a sentinel, not a directory.
+GOCACHE_DISABLED = "off"
+
+
 def _go_binary():
     found = shutil.which("go")
     if found:
         return found
     # PATH plus the one conventional system location. Never a /tmp path: a
     # world-writable directory is an execution hazard on shared hosts.
-    candidate = "/usr/local/go/bin/go"
-    return candidate if Path(candidate).exists() else None
+    return SYSTEM_GO_PATH if Path(SYSTEM_GO_PATH).exists() else None
 
 
 GO = _go_binary()
+
+
+def _go_cache_dir(fallback_parent):
+    """The toolchain's own build cache when it is usable, a temp dir when not.
+
+    `go test` below compiles the whole operator dependency tree -- controller-runtime
+    and client-go -- and whether that is free or expensive is decided entirely by
+    which cache it writes into. Measured on this package: 88s into an empty cache,
+    3.3s into a warm one. That is not a tuning detail, it is the runtime of this
+    file, and through it roughly 40% of `make test-python`.
+
+    So the default is what we want, because in both places that matter it is already
+    warm: CI's `test` and `coverage` jobs run actions/setup-go, which restores ~413 MB
+    into ~/.cache/go-build before this runs, and a developer's machine has whatever
+    they last built. This used to point unconditionally at a fresh temp directory,
+    which threw that away and paid the cold compile every run.
+
+    The fallback stays for the case that motivated it -- a HOME that is missing or
+    read-only, where the default path cannot be created and `go` would fail rather
+    than run slowly. Probing beats assuming: the cheap `go env` read below is what
+    tells the two apart, and it is why this is a function and not a constant.
+
+    The probe's answer is not always a path. With HOME unset, `go env GOCACHE`
+    prints "off" and exits 0, and taking that at its word both writes a stray
+    `off/` directory into whatever the cwd happens to be and hands `go test` a
+    disabled cache, which it refuses outright ("build cache is disabled by
+    GOCACHE=off, but required as of Go 1.12"). So the sentinel and anything else
+    that is not an absolute path go to the fallback.
+    """
+    try:
+        probe = subprocess.run(
+            [GO, "env", "GOCACHE"],
+            capture_output=True,
+            text=True,
+            timeout=GO_ENV_PROBE_TIMEOUT_SECONDS,
+        )
+        default = probe.stdout.strip()
+        if probe.returncode == 0 and default != GOCACHE_DISABLED and os.path.isabs(default):
+            # mkdir first: a configured-but-absent cache directory is the normal
+            # state of a fresh checkout, and `go` creates it on demand, so its
+            # not existing yet says nothing about whether it is usable.
+            Path(default).mkdir(parents=True, exist_ok=True)
+            if os.access(default, os.W_OK):
+                return default
+    except (OSError, subprocess.SubprocessError):
+        # Any failure here means we could not establish that the default is
+        # usable, which is exactly the case the fallback exists for.
+        pass
+    return str(Path(fallback_parent) / FALLBACK_GOCACHE_DIRNAME)
 
 
 @unittest.skipUnless(GO, "no Go toolchain on PATH")
@@ -45,6 +105,9 @@ class InjectorKVSeamTest(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory()
         cls.tmp_path = Path(cls.tmp.name)
+        # Resolved once per class rather than per call: the probe is cheap but
+        # not free, and every test in this class wants the same answer.
+        cls.gocache = _go_cache_dir(cls.tmp_path)
 
     @classmethod
     def tearDownClass(cls):
@@ -56,8 +119,9 @@ class InjectorKVSeamTest(unittest.TestCase):
             {
                 "SESSION_KV_INTEGRATION_URL": kv.url,
                 "SESSION_KV_INTEGRATION_TOKEN": API_KEY,
-                # A writable cache whatever the runner's HOME looks like.
-                "GOCACHE": str(self.tmp_path / "gocache"),
+                # A writable cache whatever the runner's HOME looks like, and a
+                # warm one wherever that is possible -- see _go_cache_dir.
+                "GOCACHE": self.gocache,
                 "GOFLAGS": "-count=1",
             }
         )
@@ -165,7 +229,7 @@ class InjectorKVSeamTest(unittest.TestCase):
             {
                 "SESSION_KV_INTEGRATION_URL": f"http://127.0.0.1:{stub.server_port}",
                 "SESSION_KV_INTEGRATION_TOKEN": API_KEY,
-                "GOCACHE": str(self.tmp_path / "gocache"),
+                "GOCACHE": self.gocache,
             }
         )
         completed = subprocess.run(

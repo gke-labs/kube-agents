@@ -1,0 +1,125 @@
+name: "Drift: Long-Lived Environments"
+
+# Asks every long-lived environment, once a day, whether it still matches
+# terraform/examples/full-install on main -- and files an issue when it does
+# not.
+#
+# Read-only. It runs `terraform plan`, never an apply, so it is safe on an
+# environment somebody is live-testing against and needs no lease. Closing the
+# drift it reports is `Shared: Reconcile Environment` with `mode: apply`, which
+# the nightly pipeline runs for both environments once its matrix is green.
+#
+# `rc` and `nightly` are deliberately absent: both are destroyed and rebuilt
+# from the composition on every pipeline run, so they cannot drift, and a plan
+# against an environment that does not currently exist reports the whole
+# composition as missing.
+#
+# A report is worth having even when nobody acts on it: the reason autopush's
+# drift went unnoticed for a month was not that it was hard to fix, it was that
+# nothing anywhere said it had happened. That is #1117 §8.
+
+permissions:
+  contents: read
+
+on:
+  schedule:
+    # 06:00 UTC, after the nightly pipeline's window, so a morning report
+    # reflects whatever the nightly reconciled rather than racing it.
+    - cron: "0 6 * * *"
+  #checkov:skip=CKV_GHA_7:No inputs; the environments are fixed
+  workflow_dispatch:
+
+concurrency:
+  group: drift-detect
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    # A fork inherits `schedule` but none of the secrets, so an unguarded job
+    # here fails on every sync and mails the fork owner.
+    if: github.repository == 'gke-labs/kube-agents'
+    strategy:
+      # Each environment is a separate project and a separate report; one
+      # failing plan must not cancel the other's.
+      fail-fast: false
+      matrix:
+        environment: [autopush, staging]
+    uses: ./.github/workflows/reconcile-environment.yml # zizmor: ignore[secrets-inherit]
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
+    with:
+      github_environment: ${{ matrix.environment }}
+      mode: "plan"
+      # No image_tag: the plan holds the tag at whatever the last apply
+      # RECORDED, read out of Terraform state. That is what separates "the
+      # infrastructure is behind" from "the images are behind" -- the second is
+      # expected between redeploys and is not drift.
+      #
+      # State, not the cluster. The two differ by design here: the redeploy
+      # workflows move the running tag with `helm upgrade` and never run
+      # Terraform, so planning at the RUNNING tag would show every out-of-band
+      # redeploy as a pending change to helm_release.kube_agents and open this
+      # report on image lag every day main has moved.
+      image_tag: ""
+    # `inherit` because the called job declares an `environment:` and reads that
+    # environment's secrets. A `uses:` job cannot declare one itself, so an
+    # explicit mapping would resolve at repository scope and forward empties.
+    secrets: inherit
+
+  report:
+    name: Report drift for ${{ matrix.environment }}
+    needs: plan
+    # always(), so a plan that failed for one environment still lets the other
+    # be reported -- and so a failed plan reaches report_drift.py, which leaves
+    # an existing report alone rather than closing it on no evidence.
+    if: always() && github.repository == 'gke-labs/kube-agents'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [autopush, staging]
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the plan
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: reconcile-${{ matrix.environment }}-plan
+          path: plan
+
+      - name: Open, update or close the drift report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # A matrix leg cannot read the sibling leg's outputs, and `needs.plan`
+          # on a matrixed reusable workflow collapses them. The plan text is the
+          # source of truth for both the verdict and the report, so the verdict
+          # is derived from it here rather than passed alongside it.
+          DRIFT: ${{ steps.download.outcome == 'success' && 'derive' || 'unknown' }}
+        run: |
+          set -euo pipefail
+          log="plan/reconcile-${{ matrix.environment }}.log"
+          if [ "${DRIFT}" != "derive" ] || [ ! -f "${log}" ]; then
+            echo "No plan artifact for ${{ matrix.environment }}; leaving any existing report alone."
+            exit 0
+          fi
+          # upgrade.sh prints one of these two lines for every completed plan.
+          if grep -q "In sync: a full upgrade" "${log}"; then
+            drift=false
+          elif grep -q "Drift: this install differs" "${log}"; then
+            drift=true
+          else
+            drift=unknown
+          fi
+          python3 scripts/release/report_drift.py \
+            --env "${{ matrix.environment }}" --plan-log "${log}" --drift "${drift}"

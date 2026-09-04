@@ -1,0 +1,20 @@
+$ PWD=/home/prow/go/src/github.com/gke-labs/kube-agents  git branch --force main 700975241c03d2ad48ec42607be8decbe6115231 (runtime: 2.69188ms)
+$ PWD=/home/prow/go/src/github.com/gke-labs/kube-agents  git checkout main (runtime: 128.084409ms)
+Switched to branch 'main'
+$ PWD=/home/prow/go/src/github.com/gke-labs/kube-agents  git fetch https://github.com/gke-labs/kube-agents.git ecc5eb07fa302f0be65c92e8e9fcce253b89e445 (runtime: 592.652959ms)
+From https://github.com/gke-labs/kube-agents
+ * branch            ecc5eb07fa302f0be65c92e8e9fcce253b89e445 -> FETCH_HEAD
+$ PWD=/home/prow/go/src/github.com/gke-labs/kube-agents GIT_AUTHOR_DATE=1787786140 GIT_COMMITTER_DATE=1787786140 git merge --no-ff ecc5eb07fa302f0be65c92e8e9fcce253b89e445 (runtime: 179.398254ms)
+Auto-merging bench/tasks/DRAFTS.md
+CONFLICT (content): Merge conflict in bench/tasks/DRAFTS.md
+Auto-merging bench/tf/fleet/README.md
+Auto-merging docs/README.md
+Auto-merging docs/site/src/content/docs/deploy/ci-pool-projects.md
+CONFLICT (content): Merge conflict in docs/site/src/content/docs/deploy/ci-pool-projects.md
+Auto-merging hack/ci-eval-pr.sh
+CONFLICT (content): Merge conflict in hack/ci-eval-pr.sh
+Auto-merging terraform/examples/ci-pool-minter/README.md
+Automatic merge failed; fix conflicts and then commit the result.
+# Error: exit status 1
+# Final SHA: 
+# Total runtime: 0s

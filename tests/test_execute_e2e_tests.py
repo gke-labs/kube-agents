@@ -200,5 +200,65 @@ class LegacySuiteSuffixTest(unittest.TestCase):
         )
 
 
+class EnvFileLocationTest(unittest.TestCase):
+    """Both entry points load tests/e2e/.env, and neither loads a root .env.
+
+    The repository root is install.env's name. The two files declare GITHUB_ORG,
+    GITHUB_REPO, GITHUB_APP_ID and CHAT_TOPIC_NAME alike and mean different
+    things by them, so a loader that reads the root would hand install values to
+    the suite under those names -- and since load_dotenv does not override an
+    already-set variable, which one won would depend on load order. That failure
+    does not reproduce consistently, which is why it is pinned here rather than
+    left to a test that would have to arrange it.
+
+    Asserted against the source because both loads happen at import time, before
+    a test can intercept them.
+    """
+
+    # Each loader and the path expression it must build. They differ because the
+    # two files sit at different depths: conftest.py is inside tests/e2e, the
+    # runner reaches it from the repository root.
+    _LOADERS = (
+        (_RUNNER, '_REPO_ROOT / "tests" / "e2e" / ".env"'),
+        (_CONFTEST, 'pathlib.Path(__file__).resolve().parent / ".env"'),
+    )
+
+    def test_the_suite_env_file_is_the_one_that_is_loaded(self):
+        for path, expected_expr in self._LOADERS:
+            with self.subTest(loader=path.name):
+                source = path.read_text(encoding="utf-8")
+                self.assertIn(
+                    expected_expr,
+                    source,
+                    f"{path.name} must resolve its env file to tests/e2e/.env",
+                )
+                # Both files still NAME the root path -- they warn when a
+                # leftover .env sits there. What must not happen is loading it.
+                self.assertNotRegex(
+                    source,
+                    r"load_dotenv\(\s*_legacy",
+                    f"{path.name} must not load the superseded repository-root .env; "
+                    "install.env owns that name and collides on four keys",
+                )
+                self.assertIn(
+                    "no longer read",
+                    source,
+                    f"{path.name} should say so when a leftover root .env is "
+                    "present, rather than silently ignoring it",
+                )
+
+    def test_the_example_lives_beside_the_suite_it_configures(self):
+        example = _REPO_ROOT / "tests" / "e2e" / ".env.example"
+        self.assertTrue(
+            example.is_file(),
+            "tests/e2e/.env.example is the template the loaders' path points at",
+        )
+        self.assertFalse(
+            (_REPO_ROOT / ".env.example").exists(),
+            "a root .env.example would tell readers to create the very file the "
+            "loaders no longer read, and whose name install.env now owns",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -30,3 +30,7 @@ k8s-operator/bin/
 .env.*
 !agents/shared/defaults/.env
 **/vars.sh
+# The hand-authored install configuration. It holds credentials, and the
+# patterns above do not reach it: they anchor on a leading dot.
+install.env
+**/install.env

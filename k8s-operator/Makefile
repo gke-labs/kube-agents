@@ -276,9 +276,11 @@ endef
 ##@ Setup & Cleanup
 
 .PHONY: dev-rebuild-agent
+# The script moved to the repository root's scripts/dev/, so the root Makefile
+# owns this target now and this one delegates up. Kept because the target has
+# always been reachable from inside k8s-operator/.
 dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
-	@chmod +x scripts/*.sh scripts/dev/*.sh 2>/dev/null || true
-	@./scripts/dev/dev_rebuild_agent.sh $(ARGS)
+	@$(MAKE) -C .. dev-rebuild-agent ARGS="$(ARGS)"
 
 ##@ Formatting
 

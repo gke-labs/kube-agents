@@ -17,7 +17,7 @@ os.environ["SESSION_KV_DB_PATH"] = temp_db_path
 # Add the directory containing session_kv_server.py to sys.path so it can be imported
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
-# session_kv_server imports agent_common_server, which imports mcp.server.fastmcp.
+# session_kv_server imports agent_common_server, which imports mcp.server.
 # When that import fails this whole module fails to import -- so every test in it
 # silently does not run. That is how three denial tests for the /inject
 # authentication came to be passing-by-not-existing.
@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent.absolute()))
 # ABSENT is not BROKEN: stub only when no mcp distribution is installed -- see
 # test_mcp_package_contract.py.
 try:  # pragma: no cover - depends on the installed mcp version
-    import mcp.server.fastmcp  # noqa: F401
+    from mcp.server import MCPServer  # noqa: F401
 except Exception:  # pragma: no cover
     import importlib.metadata
     import types
@@ -38,9 +38,10 @@ except Exception:  # pragma: no cover
     else:
         raise  # installed and incompatible: the ImportError is the finding
 
-    _stub = types.ModuleType("mcp.server.fastmcp")
+    _stub = types.ModuleType("mcp.server")
+    _stub.__path__ = []
 
-    class _FastMCP:  # minimal stand-in; nothing under test touches it
+    class _MCPServer:  # minimal stand-in; nothing under test touches it
         def __init__(self, *args, **kwargs):
             pass
 
@@ -53,8 +54,8 @@ except Exception:  # pragma: no cover
         def run(self, *args, **kwargs):
             pass
 
-    _stub.FastMCP = _FastMCP
-    sys.modules["mcp.server.fastmcp"] = _stub
+    _stub.MCPServer = _MCPServer
+    sys.modules["mcp.server"] = _stub
 
 import session_kv_server
 from session_kv_server import clean_workload_name, clean_reason_label, clean_event_message, get_severity_details

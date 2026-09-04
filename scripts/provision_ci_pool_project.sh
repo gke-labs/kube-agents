@@ -25,6 +25,11 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROJECT_ID=""
 REGION="us-central1"
 APP_ID="4675512"
+# The read half, and not settable by flag: verify_ci_pool_project.py fails a
+# project whose ledger issues this exact installation cannot read, so a
+# different one here would only mis-address the warning in step 1.4.
+LEDGER_APP_ID="4739812"
+LEDGER_INSTALLATION_ID="157029058"
 PEM_FILE=""
 SKIP_FLEET="false"
 SKIP_HOST_CLUSTER="false"
@@ -357,6 +362,14 @@ else
   echo "  token in use cannot see it. The minter cannot mint until that is fixed:"
   echo "  https://github.com/organizations/gke-agentic/settings/installations"
 fi
+
+# The same edit again on the read half. Two Apps, two installations: the minter
+# above writes the GitOps repo, and this one reads back the ledger issue the
+# bench grader scores. Missing it is the evals-6 red that #994 opened for -- and
+# step 5's Ledger Read Credential check fails the project until it is done.
+echo "⚠ ${GITOPS_REPO} must also be added to GitHub App ${LEDGER_APP_ID}'s installation."
+echo "  That edit widens which repositories a minted token can read issues from:"
+echo "  https://github.com/organizations/gke-agentic/settings/installations/${LEDGER_INSTALLATION_ID}"
 
 # ─── Step 2: Host GKE Cluster & Seeded Fleet ──────────────────────────────────
 # One bucket per project, one prefix per stack. Versioning and uniform

@@ -441,6 +441,36 @@ variable "enable_webhooks" {
   default     = true
 }
 
+variable "enable_pubsub_platform" {
+  description = "Enable the Pub/Sub platform adapter AgentPlugin (opens event listeners for Cloud Pub/Sub subscriptions)."
+  type        = bool
+  default     = false
+}
+
+variable "enable_stockout_investigator" {
+  description = "Enable the GKE Stockout Investigator AgentPlugin (diagnoses autoscaler capacity failures and proposes GitOps PRs). Automatically enables pubsub_platform for alert ingress."
+  type        = bool
+  default     = false
+}
+
+variable "stockout_pubsub_topic" {
+  description = "Pub/Sub topic for GKE stockout alerts. Only used when enable_stockout_investigator is true."
+  type        = string
+  default     = "gke-stockout-alerts-topic"
+}
+
+variable "stockout_pubsub_subscription" {
+  description = "Pub/Sub subscription for GKE stockout alerts. Only used when enable_stockout_investigator is true."
+  type        = string
+  default     = "gke-stockout-alerts-sub"
+}
+
+variable "stockout_pubsub_sink" {
+  description = "Log sink name for GKE stockout alerts. Only used when enable_stockout_investigator is true."
+  type        = string
+  default     = "gke-stockout-alerts-sink"
+}
+
 variable "extra_helm_values" {
   description = "Extra values for the kube-agents Helm release, covering chart settings this composition does not expose as its own variable (telemetry.otlpEndpoint, litellm.otel, the resource blocks, the PlatformAgent harness knobs). Passed as a second values document, so Helm deep-merges it key by key over the ones computed here and anything set wins. Setting a key the composition also computes — platformAgent.harness.clusterName, say — overrides it, which is rarely what you want."
   type        = any

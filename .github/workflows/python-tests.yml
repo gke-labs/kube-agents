@@ -20,17 +20,57 @@ permissions:
   contents: read
 
 jobs:
-  # This job runs everything `make test-python` discovers, which since the
-  # integration seam tier left probation includes tests/integration as well as
-  # the unit suites. The tier used to have a job of its own, and that job is
-  # gone: its only purpose was to keep a young, unproven suite from redding an
-  # already-gating check, and it finished its probation without a failure.
-  # Folding it in rather than keeping it alongside leaves one check for branch
-  # protection to require instead of two, and stops every pull request paying
-  # for the same 31 tests twice.
+  # This job runs everything the Makefile's PYTHON_TEST_DIRS globs discover,
+  # which since the integration seam tier left probation includes
+  # tests/integration as well as the unit suites. The tier used to have a job
+  # of its own, and that job is gone: its only purpose was to keep a young,
+  # unproven suite from redding an already-gating check, and it finished its
+  # probation without a failure. Folding it in rather than keeping it alongside
+  # leaves one check for branch protection to require instead of two, and stops
+  # every pull request paying for the same 31 tests twice.
+  #
+  # The coverage report used to be a second job for the same reason and was
+  # folded in the same way. It ran `make coverage`, which is `make test-python`
+  # with `coverage run` in place of `python3` -- the same 5638 tests, over the
+  # same directories, on a second runner, costing a full duplicate suite on
+  # every pull request and push. Running the gate under instrumentation gets
+  # both the verdict and the number out of one execution. It also makes the
+  # mirroring the Makefile's coverage target is built around structural rather
+  # than hand-maintained: the meter cannot drift into measuring a different
+  # suite from the gate when it *is* the gate.
+  #
+  # COVERAGE_STRICT=1 is what makes that safe. `make coverage` on its own
+  # tolerates a failing directory by design, so without the flag this job would
+  # report success on a red suite.
+  #
+  # The coverage half is report-only and blocks nothing on its own: the
+  # blocking rules (diff-coverage floor, no-test detector, total ratchet) turn
+  # on in stages once a baseline of merged-PR data exists, with thresholds set
+  # from the observed distribution rather than this file. The job runs on
+  # pushes to main too -- measurement only, no diff, no comment; those runs are
+  # what give the total ratchet a per-commit baseline measured in CI rather
+  # than on a laptop.
+  #
+  # Keeping it report-only takes deliberate work now that it shares a job with
+  # a required context: a job fails if any step fails, so a coverage tool that
+  # errors would red the merge gate with every test passing. diff-cover is
+  # unpinned on purpose (see the exclusion-pattern comment below), which makes
+  # it the likeliest thing here to break on someone else's release. Its two
+  # steps are therefore continue-on-error -- a broken report costs the comment,
+  # not the merge. What is left able to fail the job is the suite itself and
+  # coverage.py writing its own data, which are the two things that should.
   test:
     name: Run Python Unit Tests
     runs-on: ubuntu-latest
+
+    # No pull-requests: write here, deliberately. This job runs the pull
+    # request's own Makefile and tests, and on a fork PR the token is
+    # read-only whatever this block asks for -- which in this repository is
+    # every PR, since branches live on forks. The comment is posted by
+    # coverage-comment.yml on the workflow_run trigger, which runs in the
+    # base repository's context; this job's whole hand-off is the artifact.
+    permissions:
+      contents: read
 
     env:
       # platform_mcp_server writes its per-thread kubeconfigs under $HERMES_HOME,
@@ -41,14 +81,22 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # diff-cover diffs against the merge base, which a shallow clone
+          # does not have.
+          fetch-depth: 0
+          # Nothing after checkout needs git credentials (diff-cover diffs
+          # locally), and this job executes the pull request's own Makefile
+          # and tests -- don't leave a token on disk for them to read.
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version-file: ".python-version"
 
-      # Not for a Go suite -- k8s-operator-test.yml owns those. `make
-      # test-python` now sweeps tests/integration, and its injector seam
+      # Not for a Go suite -- k8s-operator-test.yml owns those. This job's
+      # sweep includes tests/integration, and its injector seam
       # compiles and runs the real Go client from
       # k8s-operator/cmd/k8s-event-watcher against the live Python server.
       # That whole class is decorated `skipUnless(GO)`, so a runner without a
@@ -74,110 +122,25 @@ jobs:
       # these tests from running: k8s-operator-test.yml
       # filters on `k8s-operator/**`, so a change to a skill helper script
       # never started a job at all.
-      - name: Run Python unit tests
-        run: make test-python
-
-  # Separate job because bench/tests is pytest-native and cannot run under the
-  # unittest discovery `make test-python` uses -- it sat outside every glob and
-  # had never once run in CI. Installing bench/ resolves devops-bench from the
-  # git SHA pinned in bench/pyproject.toml.
-  bench-tests:
-    name: Run Bench Harness Tests
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version-file: ".python-version"
-
-      - name: Install bench and its test runner
-        run: |
-          python3 -m pip install --upgrade pip
-          make test-bench-deps
-
-      - name: Run the bench harness tests
-        run: make test-bench
-
-  # Report-only for now: it posts numbers on the pull request and blocks
-  # nothing. The blocking rules (diff-coverage floor, no-test detector, total
-  # ratchet) turn on in stages once a baseline of merged-PR data exists --
-  # first the no-test detector, then the floor and the ratchet, with the
-  # thresholds set from the observed distribution rather than this file.
-  #
-  # The job also runs on pushes to main -- measurement only, no diff, no
-  # comment. Those runs are what give the total ratchet a per-commit baseline
-  # and the coverage-check floor a number measured in CI rather than on a
-  # laptop; without them "commit the first green run's total" has no run to
-  # read.
-  coverage:
-    name: Coverage report
-    runs-on: ubuntu-latest
-
-    # No pull-requests: write here, deliberately. This job runs the pull
-    # request's own Makefile and tests, and on a fork PR the token is
-    # read-only whatever this block asks for -- which in this repository is
-    # every PR, since branches live on forks. The comment is posted by
-    # coverage-comment.yml on the workflow_run trigger, which runs in the
-    # base repository's context; this job's whole hand-off is the artifact.
-    permissions:
-      contents: read
-
-    env:
-      HERMES_HOME: ${{ github.workspace }}/.hermes-home
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          # diff-cover diffs against the merge base, which a shallow clone
-          # does not have.
-          fetch-depth: 0
-          # Nothing after checkout needs git credentials (diff-cover diffs
-          # locally), and this job executes the pull request's own Makefile
-          # and tests -- don't leave a token on disk for them to read.
-          persist-credentials: false
-
-      - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
-        with:
-          python-version-file: ".python-version"
-
-      # Here for the mirroring the Makefile's coverage target is built around:
-      # the meter runs the gate's suite, the same way, or it is measuring
-      # something else. `make coverage` walks the same PYTHON_TEST_DIRS as
-      # `make test-python`, so without a toolchain it would silently run four
-      # fewer tests than the job it claims to mirror.
       #
-      # Honest accounting: today those four contribute no measured lines, since
-      # .coveragerc omits */tests/* and the server they drive is a subprocess
-      # coverage does not instrument -- so this step costs a Go install and
-      # buys no movement in the number. It is here for the invariant, not the
-      # number, and the invariant is what stops the two jobs from drifting into
-      # running different suites. Not in tension with COVERAGE_SKIP_GO=1 below:
-      # that switch is about not re-measuring the operator's own Go suite,
-      # while this toolchain is what a Python seam test shells out to.
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: k8s-operator/go.mod
-          cache-dependency-path: k8s-operator/go.sum
-
-      - name: Install the third-party imports the modules under test need
-        run: |
-          python3 -m pip install --upgrade pip
-          python3 -m pip install -r requirements-test.txt
-
       # COVERAGE_SKIP_GO=1: k8s-operator-test.yml already runs the Go suite,
-      # and the envtest setup is not worth repeating for a report-only job.
-      # `make coverage` tolerates failing test directories by design -- the
-      # `test` job above is the gate, this one is the meter.
-      - name: Measure coverage
-        run: make coverage COVERAGE_SKIP_GO=1
+      # and the envtest setup is not worth repeating to measure it twice. That
+      # switch is about not re-measuring the operator's own Go suite, and is
+      # not in tension with the toolchain installed above, which is what a
+      # Python seam test shells out to.
+      #
+      # COVERAGE_STRICT=1: fail the job when a test directory fails. Without
+      # it `make coverage` reports the number and exits 0 whatever the tests
+      # did, which for the required check would mean reporting success on a
+      # red suite.
+      - name: Run Python unit tests under coverage
+        run: make coverage COVERAGE_SKIP_GO=1 COVERAGE_STRICT=1
 
+      # !cancelled() rather than success(): COVERAGE_STRICT makes the step
+      # above fail on a red suite, and a red pull request still wants its
+      # coverage numbers. The Makefile runs the strict check last, after
+      # combine/xml/report, so coverage.xml is on disk either way.
+      #
       # fnmatch quirk: diff-cover matches exclusions against the basename and
       # then the ABSOLUTE path (diff_cover/diff_reporter.py, _is_path_excluded),
       # so a bare repo-relative pattern matches nothing and fails open. A `*`
@@ -191,7 +154,8 @@ jobs:
       # otherwise a PR adding uncovered lines under an excluded path reads
       # 100% on the diff while dragging down a total the floor is blind to.
       - name: Diff coverage against the merge base
-        if: github.event_name == 'pull_request'
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        continue-on-error: true
         env:
           # Through the environment rather than interpolated into the script:
           # zizmor flags template expansion inside `run:` as an injection
@@ -218,7 +182,8 @@ jobs:
       # trusting it. Skipped on the measurement-only pushes to main: there
       # is no PR to hand off to, and the poster ignores runs without one.
       - name: Write the comment hand-off data
-        if: github.event_name == 'pull_request'
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        continue-on-error: true
         env:
           PR: ${{ github.event.pull_request.number }}
         run: |
@@ -228,7 +193,7 @@ jobs:
             > coverage-total.txt
 
       - name: Upload the diff coverage report
-        if: always()
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: diff-cover-report
@@ -238,3 +203,28 @@ jobs:
             pr-number.txt
             coverage-total.txt
           if-no-files-found: ignore
+
+  # Separate job because bench/tests is pytest-native and cannot run under the
+  # unittest discovery `make test-python` uses -- it sat outside every glob and
+  # had never once run in CI. Installing bench/ resolves devops-bench from the
+  # git SHA pinned in bench/pyproject.toml.
+  bench-tests:
+    name: Run Bench Harness Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version-file: ".python-version"
+
+      - name: Install bench and its test runner
+        run: |
+          python3 -m pip install --upgrade pip
+          make test-bench-deps
+
+      - name: Run the bench harness tests
+        run: make test-bench

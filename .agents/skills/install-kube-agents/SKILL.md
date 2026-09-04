@@ -9,22 +9,23 @@ This skill provides step-by-step instructions for AI Agents to non-interactively
 
 ## What `install.sh` actually does
 
-It is a front-end, not a second provisioner. It collects configuration, writes
-`k8s-operator/scripts/vars.sh` (the install's machine-readable record), generates
-`terraform/examples/full-install/terraform.tfvars` from it, and then runs the composition's
+It is a front-end, not a second provisioner. It loads `install.env` (the install's
+hand-authored configuration), collects anything still missing, generates
+`terraform/examples/full-install/terraform.tfvars` from the result, and then runs the composition's
 `lifecycle.sh apply` — the Terraform root in
 [`terraform/examples/full-install/`](../../../terraform/examples/full-install/README.md) owns every
 GCP resource and installs the Helm chart (`charts/kube-agents`) that owns every Kubernetes one.
 Terraform state goes to a GCS bucket (`<project>-kube-agents-tfstate`, versioned, prefix
 `kube-agents/<cluster>`), so `uninstall.sh` and `upgrade.sh` can find the install from a fresh
 clone. The installer sources
-[`k8s-operator/scripts/installer_common.sh`](../../../k8s-operator/scripts/README.md) before its
+[`scripts/installer/installer_common.sh`](../../../scripts/installer/README.md) before its
 first prompt, so its defaults and accepted values are the ones defined there; that file is where a
 default changes.
 
 Order of operations: resolve the image/source ref → check CLI prerequisites (including
 `terraform`, which it offers to install; `make` is not needed) → put the repository on disk and
-verify it against that ref → interview → write `vars.sh` and generate `terraform.tfvars` → run
+verify it against that ref → load `install.env` → interview for what is missing → generate
+`terraform.tfvars` → run
 `lifecycle.sh apply`. The source check happens **before** the interview, so a bad ref fails in
 seconds rather than after a dozen answers. Two steps stay `gcloud` calls after the apply — the
 managed-OTel scope and CMEK on a pre-existing cluster — and the GitHub App PEM import runs through
@@ -66,8 +67,9 @@ the state bucket:
   --image-tag="<SEMVER_TAG_OR_FULL_COMMIT_SHA>"
 ```
 
-A dry run still overwrites `k8s-operator/scripts/vars.sh` (and `terraform.tfvars`). Back it up
-first if a real deployment's state is already there.
+A dry run regenerates `terraform.tfvars`, so back that up first if a real deployment's copy is
+already there. It writes no `install.env`: a dry run provisions nothing, so it has no install to
+record, and an existing one is never rewritten.
 
 ## Source verification
 
@@ -108,13 +110,14 @@ Upon completion, `install.sh` generates a machine-readable JSON status report at
 
 ## Supported Command-Line Flags
 
-Defaults marked "`installer_common.sh`" come from `k8s-operator/scripts/installer_common.sh` and
-are listed there, not here. Run `./install.sh --help` for the authoritative list.
+Defaults marked "`installer_common.sh`" reach the installer through
+`scripts/installer/installer_common.sh`; the values themselves are listed in
+`install.defaults.env` at the repository root, not here. Run `./install.sh --help` for the authoritative list.
 
 | Flag                                 | Description                                                                                                                                                                                                                                            | Default                                         |
 | :----------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :---------------------------------------------- |
 | `-y, --non-interactive`              | Run without blocking on `/dev/tty` prompts                                                                                                                                                                                                             | `false`                                         |
-| `--dry-run`                          | Output plan and `vars.sh` without creating resources                                                                                                                                                                                                   | `false`                                         |
+| `--dry-run`                          | Output plan and `terraform.tfvars` without creating resources                                                                                                                                                                                          | `false`                                         |
 | `--menu, --config`                   | Launch the Day-2 control panel instead of installing                                                                                                                                                                                                   | `false`                                         |
 | `--project-id=ID`                    | Target GCP Project ID                                                                                                                                                                                                                                  | Active `gcloud` project                         |
 | `--region=REGION`                    | Target GCP Region                                                                                                                                                                                                                                      | `installer_common.sh` `DEFAULT_REGION`          |
@@ -136,4 +139,5 @@ are listed there, not here. Run `./install.sh --help` for the authoritative list
 | `--enable-google-chat`               | Enable the Google Chat integration                                                                                                                                                                                                                     | `false`                                         |
 | `--gvisor=true\|false`               | Enable GKE Sandbox (gVisor) runtime isolation                                                                                                                                                                                                          | `true`                                          |
 | `--enable-web-ui=true\|false`        | Enable the Hermes Web UI on port 9119                                                                                                                                                                                                                  | `false`                                         |
+| `--allowed-users=EMAILS`             | Comma-separated chat users allowed to reach the agent; empty allows everyone                                                                                                                                                                           | _unset_                                         |
 | `-h, --help, -?`                     | Output CLI usage banner and parameter details                                                                                                                                                                                                          | `N/A`                                           |

@@ -121,8 +121,10 @@ def create_minimal_tools_bin(temp_dir_path, exclude=()):
     bin_dir.mkdir(parents=True, exist_ok=True)
     essential_tools = [
         "bash", "sh", "git", "tr", "cut", "sed", "awk", "grep",
-        "cat", "dirname", "basename", "echo", "mkdir", "rm",
-        "mktemp", "touch", "ls", "head", "tail"
+        "cat", "dirname", "basename", "echo", "mkdir", "rm", "cp", "mv",
+        "chmod", "date", "sort",
+        "mktemp", "touch", "ls", "head", "tail", "find", "tar", "gzip",
+        "sha256sum", "shasum", "zip"
     ]
     for tool in essential_tools:
         if tool in exclude:

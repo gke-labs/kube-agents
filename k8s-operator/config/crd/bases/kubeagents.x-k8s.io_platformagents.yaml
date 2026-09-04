@@ -9187,7 +9187,122 @@ spec:
                           rule:
                             "!has(self.enabled) || self.enabled == false || (has(self.botTokenSecretRef)
                             && has(self.appTokenSecretRef))"
+                    teams:
+                      description: Teams configures the Microsoft Teams integration.
+                      properties:
+                        adaptiveCards:
+                          default: true
+                          description:
+                            AdaptiveCards toggles rich Adaptive Card rendering
+                            for reports and updates.
+                          type: boolean
+                        allowAllUsers:
+                          default: false
+                          description: |-
+                            AllowAllUsers allows any authenticated tenant user to interact with the bot.
+                            When false (default), users not listed in allowedUsers are rejected.
+                          type: boolean
+                        allowedUsers:
+                          description: |-
+                            AllowedUsers is a list of allowed Entra ID Object IDs or User Principal Names.
+                            When empty and allowAllUsers is false (default), interactions are rejected.
+                          items:
+                            type: string
+                          type: array
+                          x-kubernetes-list-type: set
+                        appIdSecretRef:
+                          description:
+                            AppIdSecretRef securely references a Secret containing
+                            the Microsoft App (Client) ID.
+                          properties:
+                            key:
+                              description:
+                                The key of the secret to select from.  Must
+                                be a valid secret key.
+                              type: string
+                            name:
+                              default: ""
+                              description: |-
+                                Name of the referent.
+                                This field is effectively required, but due to backwards compatibility is
+                                allowed to be empty. Instances of this type with an empty value here are
+                                almost certainly wrong.
+                                More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                              type: string
+                            optional:
+                              description:
+                                Specify whether the Secret or its key must
+                                be defined
+                              type: boolean
+                          required:
+                            - key
+                          type: object
+                          x-kubernetes-map-type: atomic
+                        appPasswordSecretRef:
+                          description:
+                            AppPasswordSecretRef securely references a Secret
+                            containing the Microsoft App Client Secret.
+                          properties:
+                            key:
+                              description:
+                                The key of the secret to select from.  Must
+                                be a valid secret key.
+                              type: string
+                            name:
+                              default: ""
+                              description: |-
+                                Name of the referent.
+                                This field is effectively required, but due to backwards compatibility is
+                                allowed to be empty. Instances of this type with an empty value here are
+                                almost certainly wrong.
+                                More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                              type: string
+                            optional:
+                              description:
+                                Specify whether the Secret or its key must
+                                be defined
+                              type: boolean
+                          required:
+                            - key
+                          type: object
+                          x-kubernetes-map-type: atomic
+                        enabled:
+                          default: false
+                          description: Enabled toggles the Microsoft Teams integration.
+                          type: boolean
+                        homeChannel:
+                          description:
+                            HomeChannel is the default channel ID for scheduled
+                            messages.
+                          type: string
+                        homeChannelName:
+                          description:
+                            HomeChannelName is the human-readable name for
+                            the home channel.
+                          type: string
+                        tenantId:
+                          description:
+                            TenantId is the Microsoft Entra ID Tenant ID
+                            for single-tenant enterprise lock-down.
+                          type: string
+                      type: object
+                      x-kubernetes-validations:
+                        - message:
+                            appIdSecretRef and appPasswordSecretRef are required
+                            when Teams integration is enabled
+                          rule:
+                            "!has(self.enabled) || self.enabled == false || (has(self.appIdSecretRef)
+                            && has(self.appPasswordSecretRef))"
                   type: object
+                mode:
+                  description: |-
+                    Mode selects which component stack the operator renders.  "today" is the
+                    current architecture.  "next" additionally renders the NATS and A2A
+                    gateway components, which are otherwise dark.  Absent means "today".
+                  enum:
+                    - today
+                    - next
+                  type: string
                 networkPolicy:
                   description:
                     NetworkPolicy configures the operator-generated egress
@@ -9593,9 +9708,13 @@ spec:
                         "Allowlist" renders a default-deny egress policy that permits only the
                         destinations the agent legitimately needs. Because NetworkPolicy has no
                         deny rule, a destination is denied by not appearing on the list, and the
-                        link-local metadata server — 169.254.169.254, where anything that can
-                        make an HTTP request can mint the node or Workload Identity service
-                        account's tokens — is one of the destinations left off.
+                        credential API of the link-local metadata server — 169.254.169.254 on TCP
+                        80, where anything that can make an HTTP request can mint the node or
+                        Workload Identity service account's tokens — is one of the destinations
+                        left off. That address does appear on the list once, on port 53 only:
+                        under Cloud DNS for GKE it is the Pod's DNS resolver, and withholding it
+                        leaves the agent unable to resolve any of the names the rest of the
+                        allowlist is written in. Port 53 reaches no token.
 
                         READ THIS BEFORE YOU BELIEVE THE NAME. THIS FIELD BLOCKS NOTHING TODAY.
                         Not the metadata server, not anything else. Setting it to Allowlist can
@@ -9626,7 +9745,9 @@ spec:
                           - 169.254.169.254/32 on TCP 80, plus the discovered metadata-daemon port (988 by default) to both link-local
                             metadata addresses — the pre- and post-DNAT forms of a metadata
                             request (the 988 rule is suppressed when the resolved metadata
-                            daemon IP is empty). So the metadata path stays open.
+                            daemon IP is empty). So the metadata path stays open. The same
+                            address is also permitted on port 53, where it is the Cloud DNS for
+                            GKE resolver rather than a credential path.
                           - TCP 443 to 0.0.0.0/0 minus the private ranges, unless the
                             FQDNNetworkPolicy annotation is set. So every HTTPS destination on
                             the public internet stays open, and with it the exfiltration half of

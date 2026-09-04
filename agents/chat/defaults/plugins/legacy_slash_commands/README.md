@@ -85,7 +85,7 @@ hermes slack manifest > slack-manifest.json
 ```
 
 then paste the JSON into the Slack app config (Features → App Manifest → Edit)
-and reinstall when Slack prompts. `k8s-operator/scripts/print_instructions_slack.sh`
+and reinstall when Slack prompts. `scripts/installer/print_instructions_slack.sh`
 points at this step. With the slashes registered, `_handle_slash_command`
 handles `/hermes sethome` and this plugin sees `/sethome` already and passes it
 through untouched.

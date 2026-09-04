@@ -38,6 +38,8 @@ import urllib.request
 
 import yaml
 
+from github_api import API_ROOT, PER_PAGE, GitHubAPI, log
+
 # The `AI Review` check run comes from the kube-agents-bot GitHub App. The name
 # alone is not enough of an identity check: any App may post a check run with
 # any name, and this one decides who gets pinged.
@@ -50,9 +52,6 @@ DEFAULT_IGNORED_KEYWORDS = ["DO NOT REVIEW"]
 # Review states that mean a person has actually reviewed. `COMMENTED` is not one
 # of them: GitHub files a `COMMENTED` review for a reply to a review thread.
 HUMAN_VERDICT_STATES = {"APPROVED", "CHANGES_REQUESTED"}
-
-API_ROOT = "https://api.github.com"
-PER_PAGE = 100
 
 # Config keys the action supports and this port does not. Silently ignoring one
 # would hand the reviewer selection a rule nobody applied, so they are refused.
@@ -326,59 +325,6 @@ def ai_review_block_reason(check_run, author_is_bot):
     return f"{AI_REVIEW_CHECK_NAME} concluded {conclusion}{detail}, not success"
 
 
-# --------------------------------------------------------------------------- #
-# GitHub API
-# --------------------------------------------------------------------------- #
-
-
-class GitHubAPI:
-    def __init__(self, repo, token, root=API_ROOT):
-        self.repo = repo
-        self.token = token
-        self.root = root
-
-    def _request(self, method, path, body=None):
-        request = urllib.request.Request(
-            f"{self.root}{path}",
-            method=method,
-            data=json.dumps(body).encode() if body is not None else None,
-            headers={
-                "Accept": "application/vnd.github+json",
-                "Authorization": f"Bearer {self.token}",
-                "Content-Type": "application/json",
-                "User-Agent": "kube-agents-request-reviewers",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
-        )
-        with urllib.request.urlopen(request) as response:
-            payload = response.read()
-        return json.loads(payload) if payload else None
-
-    def get(self, path):
-        return self._request("GET", path)
-
-    def get_all(self, path):
-        """Every page of a list endpoint. A truncated list reads as complete."""
-        separator = "&" if "?" in path else "?"
-        items = []
-        page = 1
-        while True:
-            batch = self._request("GET", f"{path}{separator}per_page={PER_PAGE}&page={page}")
-            items.extend(batch)
-            if len(batch) < PER_PAGE:
-                return items
-            page += 1
-
-    def post(self, path, body):
-        return self._request("POST", path, body)
-
-    def patch(self, path, body):
-        return self._request("PATCH", path, body)
-
-    def delete(self, path):
-        return self._request("DELETE", path)
-
-
 def resolve_pull_request(api, head_sha):
     """Find the open pull request the commit `head_sha` belongs to.
 
@@ -494,7 +440,7 @@ def main(argv=None):
         return 1
 
     config = load_config(args.config)
-    api = GitHubAPI(args.repo, token)
+    api = GitHubAPI(args.repo, token, user_agent="kube-agents-request-reviewers")
 
     triggering_check_run = None
     if args.check_run_id:

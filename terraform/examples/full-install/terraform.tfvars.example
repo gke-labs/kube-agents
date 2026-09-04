@@ -96,6 +96,10 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # slack_home_channel      = "C01234567"
 # slack_home_channel_name = "#kube-agents"
 
+# Optional AgentPlugins.
+# enable_pubsub_platform       = true
+# enable_stockout_investigator = true
+
 # IAM. "read-only" (default) selects the bundle the composition grants;
 # "custom" requires project_roles. An explicit project_roles list overrides
 # permission_set either way. There is no admin bundle -- widening access

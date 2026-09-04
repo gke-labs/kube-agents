@@ -63,8 +63,8 @@ jobs:
               # the agent GSA a role authorizing it through IAM regardless of
               # its Kubernetes RBAC.
               - "install.sh"
-              - "k8s-operator/scripts/common.sh"
-              - "k8s-operator/scripts/installer_common.sh"
+              - "scripts/installer/common.sh"
+              - "scripts/installer/installer_common.sh"
               # The other half of that assertion: the Terraform composition is
               # what turns the answer into IAM bindings.
               - "terraform/examples/full-install/*.tf"

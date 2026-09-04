@@ -57,8 +57,12 @@ jobs:
           tags: |
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/platform-agent:latest
             ghcr.io/${{ env.IMAGE_REPOSITORY }}/platform-agent:${{ github.sha }}
+          # KUBE_AGENTS_VERSION is the commit SHA the image is tagged with: it
+          # becomes the version in the User-Agent the agent's remote MCP calls
+          # carry, so a request in a Google API log names the exact image.
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
+            KUBE_AGENTS_VERSION=${{ github.sha }}
 
       - name: Build and Push Replay Proxy (GHCR)
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
@@ -85,6 +89,28 @@ jobs:
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
 
+      - name: Build and Push Pubsub Platform Plugin (GHCR)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        id: build-pubsub-platform
+        with:
+          context: agentplugins/pubsub-platform
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ env.IMAGE_REPOSITORY }}/pubsub-platform:latest
+            ghcr.io/${{ env.IMAGE_REPOSITORY }}/pubsub-platform:${{ github.sha }}
+
+      - name: Build and Push GKE Stockout Investigator Plugin (GHCR)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        id: build-stockout-investigator
+        with:
+          context: agentplugins/gke-stockout-investigator
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/${{ env.IMAGE_REPOSITORY }}/gke-stockout-investigator:latest
+            ghcr.io/${{ env.IMAGE_REPOSITORY }}/gke-stockout-investigator:${{ github.sha }}
+
       - name: Install Cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
@@ -93,7 +119,11 @@ jobs:
           PLATFORM_DIGEST: ${{ steps.build-platform.outputs.digest }}
           REPLAY_PROXY_DIGEST: ${{ steps.build-replay-proxy.outputs.digest }}
           CREDENTIAL_PROXY_DIGEST: ${{ steps.build-credential-proxy.outputs.digest }}
+          PUBSUB_PLATFORM_DIGEST: ${{ steps.build-pubsub-platform.outputs.digest }}
+          STOCKOUT_INVESTIGATOR_DIGEST: ${{ steps.build-stockout-investigator.outputs.digest }}
         run: |
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/platform-agent@$PLATFORM_DIGEST"
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/replay-proxy@$REPLAY_PROXY_DIGEST"
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/credential-proxy@$CREDENTIAL_PROXY_DIGEST"
+          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/pubsub-platform@$PUBSUB_PLATFORM_DIGEST"
+          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/gke-stockout-investigator@$STOCKOUT_INVESTIGATOR_DIGEST"

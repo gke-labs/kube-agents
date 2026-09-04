@@ -173,6 +173,24 @@ class LinkPluginsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             pp.link_plugins(self.home / "profiles" / "..", self.mounts)
 
+    def test_plugin_with_busybox_rootfs_links_normally(self):
+        """When an ImageVolume mount contains a base rootfs (bin/, etc/), linking works normally."""
+        d = self.mounts / "platform" / "stockout"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "plugin.yaml").write_text("name: stockout\n")
+        (d / "bin").mkdir()
+        (d / "bin" / "sh").write_text("#!/bin/sh\n")
+        (d / "etc").mkdir()
+        (d / "etc" / "passwd").write_text("root:x:0:0::/root:/bin/sh\n")
+        (d / "usr").mkdir()
+        (d / "lib").mkdir()
+
+        self.assertEqual(pp.link_plugins(self.profile, self.mounts), ["stockout"])
+        link = self.profile / "plugins" / "stockout"
+        self.assertTrue(link.is_symlink())
+        self.assertTrue((link / "plugin.yaml").is_file())
+        self.assertTrue((link / "bin" / "sh").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

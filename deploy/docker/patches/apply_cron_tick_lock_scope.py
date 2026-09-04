@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Wire tools/cron_tick_lock_scope.py into the Hermes source tree.
 
-Twelve anchored edits across three files -- six in ``cron/scheduler.py``, five
-in ``tools/cronjob_tools.py``, one in ``hermes_cli/cron.py``. See the module
+Fourteen anchored edits across three files -- eight in ``cron/scheduler.py``,
+five in ``tools/cronjob_tools.py``, one in ``hermes_cli/cron.py``. See the module
 docstring in ``deploy/docker/patches/cron_tick_lock_scope.py`` for what each
 group is for. Usage::
 
@@ -40,21 +40,22 @@ IMPORT_PATCHED = (
 )
 
 # --- 2. own the tick lock's handle ------------------------------------------
+# v2026.8.19 (#87644) rewrote the acquire handler: `except (OSError, IOError)`
+# became `except OSError as exc`, and the blanket "another instance holds the
+# lock" skip now applies only when _is_lock_contention_errno(exc) agrees, with
+# fd exhaustion re-raised instead of swallowed. The anchor moved to the tail of
+# that handler, which is the last thing before the `try:` this insert has to
+# precede. Reaching the `try:` still means the same thing it always did — this
+# process holds the lock — because both other paths out return or raise.
 ACQUIRE_ANCHOR = (
-    "    except (OSError, IOError):\n"
-    '        logger.debug("Tick skipped — another instance holds the lock")\n'
-    "        if lock_fd is not None:\n"
-    "            lock_fd.close()\n"
-    "        return 0\n"
+    '            logger.error("Cron tick could not acquire tick lock: %s", exc)\n'
+    "        raise\n"
     "\n"
     "    try:\n"
 )
 ACQUIRE_PATCHED = (
-    "    except (OSError, IOError):\n"
-    '        logger.debug("Tick skipped — another instance holds the lock")\n'
-    "        if lock_fd is not None:\n"
-    "            lock_fd.close()\n"
-    "        return 0\n"
+    '            logger.error("Cron tick could not acquire tick lock: %s", exc)\n'
+    "        raise\n"
     "\n"
     "    # kube-agents patch: the tick lock guards the scheduling decision, not\n"
     "    # job execution. See tools/cron_tick_lock_scope.py.\n"
@@ -120,15 +121,6 @@ GUARD_ANCHOR = (
     "                return None\n"
     "            # Record the attempt before executor dispatch. Recovery classifies\n"
     "            # abandoned records as unknown; it never automatically retries them.\n"
-    '            execution = create_execution(job_id, source="builtin")\n'
-    '            dispatched_job = dict(job, execution_id=execution["id"])\n'
-    "            _ctx = contextvars.copy_context()\n"
-    "\n"
-    "            def _run_and_release(j=dispatched_job, ctx=_ctx):\n"
-    "                try:\n"
-    "                    return ctx.run(_process_job, j)\n"
-    "                finally:\n"
-    '                    release_running_job(j["id"])\n'
 )
 GUARD_PATCHED = (
     "            if not try_register_running_job(job_id):\n"
@@ -151,10 +143,39 @@ GUARD_PATCHED = (
     "                return None\n"
     "            # Record the attempt before executor dispatch. Recovery classifies\n"
     "            # abandoned records as unknown; it never automatically retries them.\n"
-    '            execution = create_execution(job_id, source="builtin")\n'
-    '            dispatched_job = dict(job, execution_id=execution["id"])\n'
-    "            _ctx = contextvars.copy_context()\n"
-    "\n"
+)
+
+# --- 5b. release it when execution creation fails ---------------------------
+# v2026.8.19 wrapped create_execution()/dispatched_job/_ctx in a try/except that
+# releases the in-flight claim and returns None when execution creation fails.
+# That is a third way out of this block between the claim above and the worker
+# that releases it, so the flock has to go with the claim or a failed
+# create_execution wedges the job until the process dies. It also split what
+# used to be one contiguous anchor, which is why 5 is now three edits.
+#
+# `logger.exception(` is what tells this handler apart from the submit-failure
+# one below: both open with the same two calls.
+EXECUTION_ERR_ANCHOR = (
+    "                release_running_job(job_id)\n"
+    "                _clear_run_claim_best_effort()\n"
+    "                logger.exception(\n"
+)
+EXECUTION_ERR_PATCHED = (
+    "                release_running_job(job_id)\n"
+    "                _job_lock.release()\n"
+    "                _clear_run_claim_best_effort()\n"
+    "                logger.exception(\n"
+)
+
+# --- 5c. the worker owns the claim for the run's duration -------------------
+RUN_AND_RELEASE_ANCHOR = (
+    "            def _run_and_release(j=dispatched_job, ctx=_ctx):\n"
+    "                try:\n"
+    "                    return ctx.run(_process_job, j)\n"
+    "                finally:\n"
+    '                    release_running_job(j["id"])\n'
+)
+RUN_AND_RELEASE_PATCHED = (
     "            def _run_and_release(j=dispatched_job, ctx=_ctx, lock=_job_lock):\n"
     "                try:\n"
     "                    return ctx.run(_process_job, j)\n"
@@ -238,6 +259,7 @@ DISPATCH_CLAIM_PATCHED = (
 # safe on the paths that never reach the claim.
 DISPATCH_IMPORT_ANCHOR = (
     "    _registered = False\n"
+    "    fire_owner = None\n"
     "    try:\n"
     "        from cron.scheduler import (\n"
     "            release_running_job,\n"
@@ -247,6 +269,7 @@ DISPATCH_IMPORT_ANCHOR = (
 )
 DISPATCH_IMPORT_PATCHED = (
     "    _registered = False\n"
+    "    fire_owner = None\n"
     "    # kube-agents patch: see below, and tools/cron_tick_lock_scope.py.\n"
     "    _run_lock = None\n"
     "    try:\n"
@@ -279,10 +302,19 @@ DISPATCH_RELEASE_ANCHOR = (
     "            except Exception:\n"
     "                pass\n"
     "        try:\n"
-    "            mark_job_run(job_id, False, str(e))\n"
+    "            mark_job_run(\n"
+    "                job_id,\n"
+    "                False,\n"
+    "                str(e),\n"
+    "                expected_fire_owner=fire_owner,\n"
+    "            )\n"
     "        except Exception:\n"
     "            pass\n"
-    '        return {"claimed": True, "success": False, "error": str(e)}\n'
+    "        return {\n"
+    '            "claimed": True,\n'
+    '            "success": False,\n'
+    '            "error": str(e),\n'
+    "        }\n"
 )
 DISPATCH_RELEASE_PATCHED = DISPATCH_RELEASE_ANCHOR + (
     "    finally:\n"
@@ -325,11 +357,17 @@ STALE_COMMENT_PATCHED = (
 # recover_interrupted_executions() runs only from the two gateway-ticker
 # lifecycles, so the platform profile -- ticked by spawning this CLI -- had
 # never once reaped an abandoned attempt. See the module docstring.
+#
+# v2026.8.19 (#87644) wrapped the tick() call in an OSError handler, so the
+# sweep now goes between the import and that try rather than ahead of a bare
+# call. It stays outside the handler deliberately: a sweep failure is already
+# caught below and must not be reported as a failed tick.
 RECOVER_ANCHOR = (
     "def cron_tick():\n"
     '    """Run due jobs once and exit."""\n'
     "    from cron.scheduler import tick\n"
-    "    tick(verbose=True)\n"
+    "    try:\n"
+    "        tick(verbose=True)\n"
 )
 RECOVER_PATCHED = (
     "def cron_tick():\n"
@@ -354,7 +392,8 @@ RECOVER_PATCHED = (
     "    except Exception as recover_err:\n"
     '        print(f"Execution recovery skipped: {recover_err}", file=sys.stderr)\n'
     "\n"
-    "    tick(verbose=True)\n"
+    "    try:\n"
+    "        tick(verbose=True)\n"
 )
 
 PATCHES = (
@@ -366,6 +405,8 @@ PATCHES = (
             (RELEASE_ANCHOR, RELEASE_PATCHED, 1),
             (FINALLY_ANCHOR, FINALLY_PATCHED, 1),
             (GUARD_ANCHOR, GUARD_PATCHED, 1),
+            (EXECUTION_ERR_ANCHOR, EXECUTION_ERR_PATCHED, 1),
+            (RUN_AND_RELEASE_ANCHOR, RUN_AND_RELEASE_PATCHED, 1),
             (SUBMIT_ERR_ANCHOR, SUBMIT_ERR_PATCHED, 1),
         ),
     ),

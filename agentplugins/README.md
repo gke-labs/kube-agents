@@ -15,12 +15,17 @@ adapter — but neither requires the other.
 
 ## Installing
 
-Each plugin has an `install.sh` that provisions whatever cloud resources it needs, builds
-and pushes its image, and installs the chart. It needs `gcloud`, `kubectl`, `helm`, an
-image builder and an agent already deployed to attach to — but no Cloud Build, and no
-image to build or push beforehand. Nothing is defaulted to a particular fleet: the
-project comes from your `gcloud` config, and values that cannot be guessed are required,
-because the failure they cause is silent. See the plugin's own README.
+Plugins can be deployed in two ways:
+
+1. **Declaratively via Terraform + Helm (Recommended)**:
+   Set `enable_pubsub_platform = true` and `enable_stockout_investigator = true` in `terraform.tfvars` (or pass `--enable-pubsub-platform` and `--enable-stockout-investigator` to root `install.sh`). The main `kube-agents` Helm chart renders the `AgentPlugin` custom resources and Terraform provisions any supporting GCP resources (Pub/Sub topics, subscriptions, and logging sinks).
+
+   > **Note on migrating from standalone installs:** If a plugin was previously installed via its standalone `install.sh` script, uninstall the standalone Helm release before enabling it in Terraform (`helm uninstall pubsubplatform -n <namespace>`, `helm uninstall gkestockoutinvestigator -n <namespace>`). Helm enforces resource ownership and rejects the upgrade if an existing release owns the `AgentPlugin`.
+
+2. **Standalone via `install.sh` (Developer workflows)**:
+   Each plugin directory carries an `install.sh` for developer iteration and dynamic attachment to existing clusters. It provisions necessary cloud resources via `gcloud`, builds and pushes a local OCI image, and deploys the plugin's standalone sub-chart. If the plugin is already managed by the main `kube-agents` release, the installer detects it and exits cleanly without conflicting.
+
+See the plugin's own README for detailed parameters.
 
 Before it provisions anything, an installer settles its image reference, checks its
 builder, creates the registry repository if it is missing and confirms it can get a
@@ -32,11 +37,14 @@ establishes. Everything after that point is idempotent.
 
 ## Images
 
-A plugin image is `FROM scratch` plus a COPY of one directory, so the whole build is a
-single tar layer and [`lib/plugin_image.sh`](lib/plugin_image.sh) — shared by both
-installers — can produce it locally. Nothing here submits a Cloud Build: that needs the
-API, the billing and a credential Cloud Build will accept for quota, none of which a
-laptop reliably has, and the installers have to work there.
+A plugin image is built on `busybox:musl` (pinned by immutable multi-arch digest in `images.json`)
+plus a COPY of the plugin files. The `busybox:musl` base provides a minimal userland (`/bin/sh`,
+`cp`, `ls`) required by the staging init container on clusters where native `ImageVolumeSource`
+is unsupported (such as GKE Autopilot, where GKE Warden restricts raw image volume mounts). The
+build is a single tar layer that [`lib/plugin_image.sh`](lib/plugin_image.sh) — shared by both
+installers — can produce locally using either Docker or crane. Nothing here submits a Cloud
+Build: that needs the API, the billing and a credential Cloud Build will accept for quota, none
+of which a laptop reliably has, and the installers have to work there.
 
 | Variable           | Default                                                    | What it changes                                       |
 | ------------------ | ---------------------------------------------------------- | ----------------------------------------------------- |
@@ -51,7 +59,8 @@ laptop reliably has, and the installers have to work there.
 
 `AR_LOCATION`, `AR_PROJECT` and `AR_REPOSITORY` each pin one part of the reference and
 switch discovery off for that part alone. `REGION` and `GCP_ARTIFACT_REGISTRY_REPO_NAME` —
-the variables the installer and dev tooling save into `vars.sh`, and the last fallbacks for
+the variables the installer records in `install.env` and the dev tooling saves into its own
+state file, and the last fallbacks for
 the location and the repository — are deliberately not pins: one left in your shell by
 `dev_rebuild_agent.sh` must not outrank the registry the agent is demonstrably being pulled
 from.

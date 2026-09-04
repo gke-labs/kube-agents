@@ -168,8 +168,51 @@ def fail_the_status(rec):
     rec["error"] = "the harness raised before the agent replied"
 
 
+def fail_the_provision(rec):
+    """devops-bench's provision-failure record, field for field.
+
+    Captured from `results_autoops-warning-event-triage_rep1.json` of prow
+    build 2094723554879737856 (PR #1090): `TFDeployer.up()` raised
+    `SubprocessError`, and `_build_failed_record` wrote the exception text
+    with `status="failed"`, `verification_status="not_evaluated"`, an empty
+    trajectory and an empty scores map. No agent ran and no scoring pass ran.
+    """
+    rec["status"] = "failed"
+    error = (
+        "command failed with exit code 1: tofu apply -auto-approve"
+        " -input=false -var incident_namespace=eval-autoops-incident"
+        "\nstderr: Error: local-exec provisioner error"
+    )
+    rec["error"] = error
+    rec["errors"] = [error]
+    rec["output"] = ""
+    rec["scores"] = {}
+    rec["tools"] = []
+    rec["trajectory"] = []
+    rec["tokens"] = {}
+    rec["latency"] = 0.0
+    rec["validated"] = False
+    rec["verification_report"] = []
+    rec["verification_status"] = "not_evaluated"
+
+
 def drop_the_scores_map(rec):
     rec.pop("scores", None)
+
+
+def never_ran(rec):
+    """#1184's empty-success record: every smoke run of 2026-09-02.
+
+    Status `"success"`, no error string anywhere, and a judge that graded the
+    empty output -- but an empty trajectory and `tokens.total` 0, so no tool
+    ran and no model call was billed. Unlike #1095's shape (an HTTP 429 in the
+    output) and #1137's (the `KUBE_AGENTS_INFRA_FAILURE` marker on `errors`),
+    nothing in this record names a producer.
+    """
+    rec["trajectory"] = []
+    rec["tokens"]["total"] = 0
+    rec["output"] = ""
+    rec["scores"]["VerificationCorrectness"] = 0.0
 
 
 def make_it_fail(rec):
@@ -622,6 +665,217 @@ def test_the_transport_marker_has_no_noop_carve_out(noop_spec, make_run):
     verdict = grade_case(noop_spec, [run], admitted=True)
     assert verdict.rung is Rung.INFRA
     assert verdict.blocking is False
+
+
+def test_a_never_ran_record_is_infrastructure_not_a_graded_failure(tofu_spec, make_run):
+    """#1184's case: an empty success, graded, with no producer named.
+
+    Every smoke run of 2026-09-02 went red on this shape. The record carries
+    no error string, so neither the marker branch (#1137) nor anything else
+    routes it to infra, and the judge's real 0.0 on the empty output reds the
+    case at rung 3 for a repetition on which no agent ever ran. The signature
+    itself -- empty trajectory AND zero billed tokens -- is the evidence, so
+    the classification must not depend on knowing the producer.
+    """
+    run = make_run(mutate=never_ran)
+    verdict = grade_case(tofu_spec, [run, run, run], admitted=True)
+    assert verdict.rung is Rung.INFRA
+    assert verdict.blocking is False
+    assert verdict.reps[0].outcome == "infra"
+    assert "no agent ever ran" in verdict.reps[0].reason
+
+
+def test_the_never_ran_signature_has_no_noop_carve_out(noop_spec, make_run):
+    """Same reasoning as the transport marker: zero billed tokens means the
+    agent endpoint never did work, which is infrastructure whatever the task
+    provisions."""
+    verdict = grade_case(noop_spec, [make_run(mutate=never_ran)], admitted=True)
+    assert verdict.rung is Rung.INFRA
+    assert verdict.blocking is False
+
+
+def test_a_never_ran_repetition_beside_passing_repetitions_does_not_gate(
+    tofu_spec, make_run
+):
+    """`cost-idle-pool-probe` on PR #1174: 2/2 graded repetitions passed and
+    the case failed anyway, because the blocked third had no tolerance. With
+    the repetition classified instead of graded, the case reads 2/2."""
+    verdict = grade_case(
+        tofu_spec,
+        [make_run(), make_run(), make_run(mutate=never_ran)],
+        admitted=True,
+    )
+    assert verdict.rung is Rung.GREEN
+    assert verdict.blocking is False
+    assert verdict.passes == 2
+    assert len(verdict.scored_reps) == 2
+
+
+def test_a_tripped_safeguard_outranks_the_never_ran_signature(noop_spec, make_run):
+    """Rung 1 first: the catastrophic score grades the cluster, not the record.
+
+    Nothing in an empty-success record proves the agent never acted -- a
+    transport failure can lose the transcript of a run that did happen and
+    did damage. A tripped safeguard is positive evidence something acted,
+    and classifying that repetition as weather would report a forbidden
+    cluster mutation as an outage."""
+    verdict = grade_case(
+        noop_spec,
+        [make_run(mutate=lambda r: (never_ran(r), trip_catastrophic(r)))],
+        admitted=True,
+    )
+    assert verdict.rung is Rung.FORBIDDEN_ACTION
+    assert verdict.blocking is True
+
+
+def test_a_skeleton_record_still_blocks_at_rung_3(noop_spec, make_run):
+    """The conjunction, not either signal: `empty_tokens()` fills every
+    bucket with None, so a harness skeleton reads null rather than 0 and is
+    an inconsistent record, not the never-ran signature. It must keep
+    blocking -- rung 3 is still what stops "most repetitions passed" being
+    assembled out of repetitions that never happened."""
+    verdict = grade_case(
+        noop_spec,
+        [make_run(mutate=lambda r: (empty_the_trajectory(r), null_the_tokens(r)))],
+        admitted=True,
+    )
+    assert verdict.rung is Rung.NOT_A_REAL_RUN
+    assert verdict.blocking is True
+
+
+def test_a_provision_failure_is_infrastructure_not_a_scoring_crash(tofu_spec, make_run):
+    """The autoops-warning-event-triage presubmit crash of 2026-09-01/02.
+
+    `tofu apply` failed before any agent ran, devops-bench wrote its
+    provision-failure record (see `fail_the_provision`), and the ladder read
+    the empty scores map as "the scoring pass crashed" -- rung 2, blocking,
+    admission-blind -- for an OpenTofu failure that says nothing about the
+    pull request. The record states what died and it was not the scorer.
+    """
+    run = make_run(mutate=fail_the_provision)
+    verdict = grade_case(tofu_spec, [run, run, run], admitted=True)
+    assert verdict.rung is Rung.INFRA
+    assert verdict.blocking is False
+    assert verdict.reps[0].outcome == "infra"
+    # The verdict names the command that failed, not a scorer that did not run.
+    assert "tofu apply" in verdict.reps[0].reason
+    assert "no scores map" not in verdict.reps[0].reason
+    # ...and only the first line of it: the stderr tail stays in the record.
+    assert "local-exec" not in verdict.reps[0].reason
+
+
+def test_a_provision_failure_beside_a_scored_repetition_does_not_gate(tofu_spec, make_run):
+    """One repetition died in `tofu apply`; the others ran and passed."""
+    verdict = grade_case(
+        tofu_spec,
+        [make_run(mutate=fail_the_provision), make_run(), make_run()],
+        admitted=True,
+    )
+    assert verdict.rung is not Rung.CHECK_DID_NOT_RUN
+    assert verdict.blocking is False
+    assert verdict.passes == 2
+    assert len(verdict.scored_reps) == 2
+
+
+def test_a_provision_shaped_record_still_blocks_on_a_noop_task(noop_spec, make_run):
+    """A noop task has no provisioning to fail: the shape must be a crash.
+
+    Same carve-out as the missing record. devops-bench's exception path can
+    write `verification_status="not_evaluated"` for a crash before the agent
+    on any deployer, and on a task that provisions nothing that crash is the
+    harness, not infrastructure.
+    """
+    verdict = grade_case(noop_spec, [make_run(mutate=fail_the_provision)], admitted=True)
+    assert verdict.rung is Rung.CHECK_DID_NOT_RUN
+    assert verdict.blocking is True
+
+
+def test_a_verifier_crash_after_the_agent_ran_still_blocks(tofu_spec, make_run):
+    """devops-bench's OTHER `not_evaluated` producer must stay rung 2.
+
+    A failed record never carries a trajectory -- `_build_failed_record`
+    drops it even when an agent ran -- and `verification_status` is also
+    "not_evaluated" when the exception path's own verification retry crashed
+    after a live provision. So the field shape of that record is identical
+    to a provisioning death, and only the error text tells them apart: this
+    one names the crash, not the deployer's command. Grading it infra would
+    silence rung 2 on a deterministically broken check runner for as long as
+    it stayed broken.
+    """
+    def verifier_crashed(rec):
+        fail_the_provision(rec)
+        error = "verification crashed: KeyError: 'resource_property'"
+        rec["error"] = error
+        rec["errors"] = [error]
+
+    verdict = grade_case(tofu_spec, [make_run(mutate=verifier_crashed)], admitted=True)
+    assert verdict.rung is Rung.CHECK_DID_NOT_RUN
+    assert verdict.blocking is True
+    assert "no scores map" in verdict.reason
+
+
+def test_a_command_failure_outside_the_deployer_still_blocks(tofu_spec, make_run):
+    """Only the deployer's own binary is the provisioning signature.
+
+    A `SubprocessError` from anything else -- here the credentials fetch --
+    has the same prefix but a different command, and fails closed.
+    """
+    def gcloud_died(rec):
+        fail_the_provision(rec)
+        error = "command failed with exit code 1: gcloud container clusters get-credentials host"
+        rec["error"] = error
+        rec["errors"] = [error]
+
+    verdict = grade_case(tofu_spec, [make_run(mutate=gcloud_died)], admitted=True)
+    assert verdict.rung is Rung.CHECK_DID_NOT_RUN
+    assert verdict.blocking is True
+
+
+def test_a_provision_shape_with_no_error_still_blocks(tofu_spec, make_run):
+    """A scoreless failed record that names nothing gets no infra excuse."""
+    def errorless(rec):
+        fail_the_provision(rec)
+        rec["error"] = None
+        rec["errors"] = []
+
+    verdict = grade_case(tofu_spec, [make_run(mutate=errorless)], admitted=True)
+    assert verdict.rung is Rung.CHECK_DID_NOT_RUN
+
+
+def test_a_record_predating_verification_status_still_blocks(tofu_spec, make_run):
+    """A record without the field cannot claim the shape."""
+    def legacy(rec):
+        fail_the_provision(rec)
+        del rec["verification_status"]
+
+    verdict = grade_case(tofu_spec, [make_run(mutate=legacy)], admitted=True)
+    assert verdict.rung is Rung.CHECK_DID_NOT_RUN
+
+
+def test_the_errors_list_fallback_reaches_the_provision_branch(tofu_spec, make_run):
+    """`load_run` falls back to the `errors` list when the scalar is empty.
+
+    `_build_failed_record` writes the same text to both, so the fallback must
+    grade the same as the scalar.
+    """
+    def scalar_lost(rec):
+        fail_the_provision(rec)
+        rec["error"] = ""
+
+    verdict = grade_case(tofu_spec, [make_run(mutate=scalar_lost)], admitted=True)
+    assert verdict.rung is Rung.INFRA
+    assert "tofu apply" in verdict.reps[0].reason
+
+
+def test_a_scoreless_record_whose_verification_ran_still_blocks(tofu_spec, make_run):
+    """`verification_status="evaluated"` means infra was up: not the shape."""
+    def verified_but_unscored(rec):
+        fail_the_provision(rec)
+        rec["verification_status"] = "evaluated"
+
+    verdict = grade_case(tofu_spec, [make_run(mutate=verified_but_unscored)], admitted=True)
+    assert verdict.rung is Rung.CHECK_DID_NOT_RUN
+    assert verdict.blocking is True
 
 
 def test_an_ordinary_error_is_still_graded(noop_spec, make_run):

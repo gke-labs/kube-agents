@@ -10,8 +10,9 @@ chat as `/opt/data/INVENTORY.md`. Your job is to be thorough; being brief is the
 
 ## Pre-Execution Check
 
-0. **Which card are you?** If your card body told you to resume this SOP at Step 4, you are the
-   aggregation worker: go straight there and skip the status check below. It describes the state
+0. **Which card are you?** If your card body told you to resume this SOP at Step 4, you are an
+   aggregation card a run of the older fan-in shape filed before it was retired (#1010): go
+   straight there and skip the status check below. It describes the state
    you are in — no `INVENTORY.raw.md`, no `INVENTORY.md` — and would send you back through
    discovery and the fan-out you were created to collect, re-filing your own card as its own
    parent and finishing onboarding with no report written.
@@ -74,39 +75,33 @@ reach it, a row in the report saying so.
 
 ---
 
-## Step 3: File the aggregation card and stand down
+## Step 3: Wait for the per-cluster cards on this card
 
-Create one more card, assigned to **yourself**, listing every per-cluster card from Step 2 in
-`parents`. That is the fan-in: the dispatcher spawns you on it once all of them are done, with each
-one's `metadata` in your context.
+Keep this card open and poll every per-cluster card from Step 2: `kanban_show(<id>)` for each,
+`sleep 60` between polling rounds (double it once the wait passes five minutes), until all of them are settled (`done` or `archived`). Then read
+each one's `metadata` and carry on to Step 4 **in this same run**.
 
-```
-kanban_create(
-  assignee='platform',
-  idempotency_key='bootstrap-inventory-aggregate',
-  title='Aggregate cluster inventory reports',
-  parents=[<every per-cluster card id from Step 2>],
-  body=<tell yourself to resume this SOP at Step 4>,
-)
-```
+**Do not complete this card yet, and do not `kanban_block` on the per-cluster cards.** Completing
+now hands back a dispatch receipt as this card's final result and loses the fleet report — the
+per-cluster results become metadata on cards nobody reads (`kanban_complete` refuses this shape
+while the per-cluster cards are unfinished; see `SOUL.md` §0/§6 and issue #1010). Blocking with
+`kind="dependency"` deadlocks the board instead of waiting (`SOUL.md` §0). Poll.
 
-Run `python3 /opt/data/scripts/kanban_notify_propagate.py --to <card_id>` for the fan-in card so the user gets one closing
-summary, then **complete this card**. Steps 4 to 6 run on the aggregation card, not this one.
-
-**Do not wait here.** Blocking this card on the per-cluster cards deadlocks the board (`SOUL.md`
-§0), and completing this card before the fan-in exists loses the fleet report entirely — the
-per-cluster results are then metadata on cards nobody reads.
+If a per-cluster card blocks or keeps failing, note the gap and proceed with the rest of the fleet
+— Step 4 already requires a row for every cluster the enumeration returned, reporting ones the
+children never covered.
 
 ---
 
 ## Step 4: Compile Raw Inventory (`/opt/data/INVENTORY.raw.md`)
 
-**This step and the two after it run on the aggregation card from Step 3.** Your input is the
-`metadata` of every per-cluster card in your context — their `topology`, `workloads`,
+**This step and the two after it run on the same card, after the Step 3 wait.** Your input is the
+`metadata` of every per-cluster card — read during the Step 3 wait, or already in your worker
+context if you are a pre-#1010 aggregation card — their `topology`, `workloads`,
 `namespace_governance`, `findings` and `gaps`.
 
-**Get the fleet list before you write anything.** If you came here as the aggregation card you did
-not run Step 1 — a different card did, and none of its output reaches you — so run it now:
+**Get the fleet list before you write anything.** If you did not run Step 1 in this run — a
+different card did, and none of its output reaches you — run it now:
 
 ```
 gcloud config get-value project
@@ -188,9 +183,14 @@ kanban_create(
   assignee='platform',
   idempotency_key='bootstrap-inventory-prioritize',
   title='Prioritize the onboarding inventory report',
+  parents=[<this card's id>],
   body=<the instructions below>,
 )
 ```
+
+`parents` matters: it queues the ranking to run after this card completes, which is what lets your
+own `kanban_complete` in Step 6 close this card while the ranking is still pending — a
+free-running child would be refused as unfinished fan-out work (#1010).
 
 The body must tell that worker to follow the prioritization SOP, reading whichever of these exists:
 
@@ -214,9 +214,12 @@ sweep instead, which produces a different report depending on how the sweep happ
 
 ---
 
-## Step 6: Silent Exit
+## Step 6: Complete the Card, Then Exit Silently
 
-Once the prioritization card is filed, return strictly `[SILENT]` immediately without running any
+Once the prioritization card is filed, call `kanban_complete`: `result` is a short factual account
+of the sweep — clusters audited, findings count, that the full findings are at
+`/opt/data/INVENTORY.raw.md` and ranking is queued. Completing is what releases the prioritization
+card (it lists this card in `parents`). Then return strictly `[SILENT]` without running any
 further terminal commands. Delivery to chat is handled separately by the
 `bootstrap-inventory-delivery` job, after prioritization writes `/opt/data/INVENTORY.md` — do not
 attempt to send the report yourself.

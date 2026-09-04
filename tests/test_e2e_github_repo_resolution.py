@@ -49,7 +49,7 @@ def _load_conftest():
     that raise when called directly, so the fixture tests below would pass on a checkout
     with tests/e2e/requirements.txt installed and fail without it.
 
-    os.environ is snapshotted because the module calls load_dotenv on a repo-root .env
+    os.environ is snapshotted because the module calls load_dotenv on tests/e2e/.env
     at import time, and sys.modules is restored so nothing that runs afterwards picks
     the stub up as pytest.
     """

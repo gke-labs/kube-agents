@@ -112,18 +112,19 @@ That assumption is no longer the only thing available, but it is still what the
 default install runs on. `spec.security.splitCredentialBrokerPod` moves the
 broker into a Pod of its own, and `spec.security.egressPolicy: Allowlist` then
 renders a default-deny egress NetworkPolicy on the agent Pod that leaves the
-metadata server off its allowlist. Both default to false, and the second is
-refused outright without the first. Neither closes the path yet. Adding a
-NetworkPolicy is monotone — policies selecting one Pod are unioned and the API
-has no deny rule — and the agent Pod is already selected for egress by the
-`<agent>-gateway-netpol` this same operator renders (unless
-`spec.networkPolicy.enabled: false` withholds it — on a Helm install the one
-shape where the allowlist stands alone and enforces; a Kustomize install's
-static `platform-agent-core-egress` still selects the same Pod), which permits the metadata
-path. So enabling the allowlist widens what the Pod may send and narrows
-nothing; it is an auditable object rather than a control until that gateway
-policy is narrowed to the broker Pod. It would in any case do nothing on a
-cluster whose CNI does not enforce NetworkPolicy. See
+metadata server's credential API off its allowlist — the address itself is
+permitted on port 53, where under Cloud DNS for GKE it is the Pod's resolver.
+Both default to false, and the second is refused outright without the first.
+Neither closes the path yet. Adding a NetworkPolicy is monotone — policies
+selecting one Pod are unioned and the API has no deny rule — and the agent Pod
+is already selected for egress by the `<agent>-gateway-netpol` this same
+operator renders (unless `spec.networkPolicy.enabled: false` withholds it — on
+a Helm install the one shape where the allowlist stands alone and enforces; a
+Kustomize install's static `platform-agent-core-egress` still selects the same
+Pod), which permits the metadata path. So enabling the allowlist widens what
+the Pod may send and narrows nothing; it is an auditable object rather than a
+control until that gateway policy is narrowed to the broker Pod. It would in
+any case do nothing on a cluster whose CNI does not enforce NetworkPolicy. See
 [Denying the sandbox the metadata server](site/src/content/docs/reference/credential-isolation.md#denying-the-sandbox-the-metadata-server).
 
 The shared workspace is the other way in, and it is not closed by the UID split

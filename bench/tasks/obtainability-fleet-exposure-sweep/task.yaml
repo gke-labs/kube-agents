@@ -1,0 +1,102 @@
+# ACTIVE — an uncommented entry in hack/ci-eval-pr.sh TASKS, one of the three
+# activations that take the reliability domain to five enabled tasks (#1049).
+# Grades what nothing active grades: fleet-wide DISCOVERY. Every active
+# reliability task names checkout-gateway in its prompt; this one does not —
+# the agent has to sweep the seeded namespaces across the clusters it
+# manages and find the exposed workload itself. The prompt states that an
+# exposed workload exists (the same information the located prompts leak by
+# naming it) but not which, where, or why.
+#
+# Domain: reliability (obtainability-audit).
+# Journey: An open fleet survey for voluntary-disruption exposure; the agent
+# discovers the unbudgeted multi-replica workload and reports it with the
+# evidence.
+#
+# Planted defect required: a two-replica Deployment named "checkout-gateway"
+# in namespace "seeded-reliability" on the seeded fleet, with no
+# PodDisruptionBudget — the same no-pdb-workload role the probe reads. It is
+# the fleet's only unprotected multi-replica workload by construction, so
+# the sweep has exactly one right answer.
+# Isolation class: read-only.
+# Eligible tier: presubmit.
+id: obtainability-fleet-exposure-sweep
+name: Reliability sweep discovers the unbudgeted workload without being told its name
+# Deliberately NOT the located pattern: discovery is the graded behavior, so
+# naming the workload or namespace would grade away the point. The known
+# unlocated-prompt failure (2026-08-25: a clarifying question instead of a
+# search) is mitigated differently — the prompt asserts the finding exists
+# and instructs a search of every managed cluster, leaving nothing to ask a
+# clarifying question about. If the agent still asks instead of sweeping,
+# that is a real discovery failure and this task is doing its job.
+# "Replicated" and "nothing bounds voluntary disruption" are load-bearing
+# qualifiers, not flavor: single-replica payments-api in seeded-debug also
+# cannot survive a drain of its node, so without them the question has two
+# true answers and a correct report naming the other one would false-fail.
+# The obtainability audit's scope (SOP 3.3, per the fixture's own comment
+# in bench/tf/fleet/defects-a.tf) is replicated workloads, which makes
+# checkout-gateway the unique answer to the question as asked.
+prompt: >-
+  Somewhere in the fleet's seeded namespaces there is a replicated,
+  multi-replica workload that nothing protects from voluntary disruption —
+  a node drain could take all of its replicas down at once. Search every
+  cluster you manage, identify it, and explain what makes it exposed,
+  citing what you observed. Single-replica workloads are out of scope. Do
+  not change anything.
+expected_output: >-
+  The agent sweeps the seeded clusters, finds checkout-gateway in
+  seeded-reliability, and reports that it runs two replicas with no
+  PodDisruptionBudget in the namespace, so one drain can evict both replicas
+  at once. Every claim cites live reads made during this run. No mutation of
+  any kind.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: reliability
+
+# The seeded-fleet defects this scenario asserts on, named by ROLE rather than
+# by cluster: each eval project carries its own trio and this case has to run
+# unchanged against all of them. Roles are defined in
+# bench/tf/fleet/fixtures.json; the rule is
+# docs/designs/bench-fleet-catalog.md.
+fixtures:
+  - no-pdb-workload
+
+verification_spec:
+  - name: the-sweep-names-the-workload-it-was-not-told
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["checkout-gateway"]
+      any_of_phrases: ["PodDisruptionBudget", "PDB"]
+  - name: the-sweep-locates-the-finding
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      required_phrases: ["seeded-reliability"]
+  # Cluster-state safeguards, addressed by fixture ROLE (see
+  # reliability-pdb-probe's spec comments for why).
+  - name: the-planted-workload-survived-the-sweep
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: no-pdb-workload
+      kind: deployment
+      resource_name: checkout-gateway
+      namespace: seeded-reliability
+      path: spec.replicas
+      op: eq
+      value: 2
+  - name: no-budget-was-created-by-the-sweep
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: no-pdb-workload
+      kind: poddisruptionbudget
+      namespace: seeded-reliability
+      op: absent

@@ -4,16 +4,17 @@
 mechanics behind it — the full set of homes, what runs each one, and the traps that make a
 misplaced test look fine.
 
-## The nine homes
+## The ten homes
 
 | What you are testing                                                                       | Where it goes                                                                                    | What runs it                                                                                                                                    | On a pull request                                                                                                 |
 | ------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| A Python module's own logic                                                                | beside the module; the exact directory set is the `PYTHON_TEST_DIRS` globs at `Makefile:129-142` | `make test-python`                                                                                                                              | runs, unconditionally                                                                                             |
-| A shell script, a rendered manifest, an installer — something with no module to sit beside | `tests/test_*.py`, and `tests/memory/` for the memory provider                                   | `make test-python`, and `agent-startup-test.yml` for the startup subset                                                                         | runs, unconditionally                                                                                             |
-| Two components across a seam, no model call                                                | `tests/integration/test_seam_*.py`                                                               | `make test-python`                                                                                                                              | runs, unconditionally                                                                                             |
-| The bench harness itself — verifiers, parsing                                              | `bench/tests/`                                                                                   | `make test-bench`                                                                                                                               | runs, unconditionally                                                                                             |
+| A Python module's own logic                                                                | beside the module; the exact directory set is the `PYTHON_TEST_DIRS` globs at `Makefile:129-144` | `make test-python` (`make coverage` in CI)                                                                                                      | runs, unconditionally                                                                                             |
+| A shell script, a rendered manifest, an installer — something with no module to sit beside | `tests/test_*.py`, and `tests/memory/` for the memory provider                                   | `make test-python` (`make coverage` in CI), and `agent-startup-test.yml` for the startup subset                                                 | runs, unconditionally                                                                                             |
+| Two components across a seam, no model call                                                | `tests/integration/test_seam_*.py`                                                               | `make test-python` (`make coverage` in CI)                                                                                                      | runs, unconditionally                                                                                             |
+| The bench harness itself — verifiers, parsing — plus contract tests needing its imports    | `bench/tests/`                                                                                   | `make test-bench`                                                                                                                               | runs, unconditionally                                                                                             |
 | The Go operator                                                                            | `k8s-operator/`                                                                                  | `make -C k8s-operator test`                                                                                                                     | paths-filtered: runs only when the change touches `k8s-operator/**` or `agents/platform/scripts/**`               |
 | An agent plugin                                                                            | `agentplugins/*/tests/test_*.py`                                                                 | `agentplugins-test.yml`                                                                                                                         | paths-filtered: runs only when the change touches `agentplugins/**`                                               |
+| The A2A bus module — library, topics CLI, profiles, conformance suite                      | `a2a/` (Go, beside the code; the conformance suite runs an embedded JetStream server)            | `a2a-test.yml` (`go vet` + `go test -race`), and `make verify` locally                                                                          | paths-filtered: runs only when the change touches `a2a/**`                                                        |
 | Whether the agent diagnoses a defect you planted for it                                    | `bench/tasks/<name>/task.yaml`                                                                   | `hack/ci-eval-pr.sh`, as the Prow presubmit                                                                                                     | runs as a presubmit and reports on the pull request; whether it blocks is Prow config this repository cannot read |
 | Whether an install you already have still works for a user                                 | `bench/cuj/test_<NN>_<name>.py`, or `bench/cuj/<area>/` under it                                 | `uv run --project bench pytest -s bench/cuj`, by hand                                                                                           | nothing runs it, by design                                                                                        |
 | The release gate                                                                           | `tests/e2e/`                                                                                     | `rc-release-pipeline.yml`, dispatched by `rc-scheduler.yml` on a three-hourly schedule; `nightly-pipeline.yml` and `e2e-gchat-test.yml` by hand | nothing — it gates releases, not pull requests                                                                    |
@@ -47,8 +48,8 @@ Rule of thumb: if you would have to break something on purpose for the test to b
 a `bench/tasks/` case. If you would run it against production to check the deploy landed, it is a
 `bench/cuj/` journey.
 
-**The two paths-filtered workflows report `success` on a pull request that ran nothing.**
-`k8s-operator-test.yml` and `agentplugins-test.yml` both run `dorny/paths-filter` and then gate
+**The three paths-filtered workflows report `success` on a pull request that ran nothing.**
+`k8s-operator-test.yml`, `agentplugins-test.yml`, and `a2a-test.yml` all run `dorny/paths-filter` and then gate
 every subsequent step on the result, so the job always completes and the check always goes green.
 `k8s-operator-test.yml`'s own header comment says it: the job "reports `success` on a pull request
 that ran no tests". A change that breaks an operator contract from outside `k8s-operator/**` gets a
@@ -79,7 +80,7 @@ The last column says what a trigger and its `if:` conditions support, which is a
 in this repository, so this table asserts nothing about either.
 [`pull-request-workflow.md`](pull-request-workflow.md#how-a-change-merges) names the required
 contexts as they stand, gives the command to read them back, and says why that command sees only
-the branch-protection half of the set. `make verify` (`Makefile:173`) is the
+the branch-protection half of the set. `make verify` (the `verify` target in the root `Makefile`) is the
 local answer to the same question — everything a pull request must pass offline, in one target —
 and [`site/src/content/docs/contributing.md`](site/src/content/docs/contributing.md) lists the
 individual targets to run when you have touched a given area.
@@ -101,7 +102,7 @@ and `python-tests.yml`. Read the contract before writing a case;
 ## The trap that spans every tier
 
 **A new test directory that no wildcard reaches never runs.** `make test-python` discovers from
-`PYTHON_TEST_DIRS`, a list of thirteen globs at `Makefile:129-142`. A directory the globs miss fails
+`PYTHON_TEST_DIRS`, a list of fifteen globs at `Makefile:129-144`. A directory the globs miss fails
 nothing — it sits unexecuted and the suite reports green around it, which is how eight test files
 stayed unrun for months. Adding a directory means adding its glob in the same change.
 `scripts/test_test_discovery.py` fails the build if you forget, and its `EXCLUDED` dict is where a

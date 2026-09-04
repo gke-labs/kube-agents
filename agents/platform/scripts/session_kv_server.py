@@ -813,18 +813,21 @@ def enabled_chat_platforms() -> list[str]:
     This is the third copy of this question in the tree, and the copies should
     converge rather than a fourth being added: `platform_mcp_server
     .get_enabled_platforms` is still keyed on the absent SLACK_BOT_TOKEN (#735
-    is open against it), and open PR #996 adds `chat_platforms
-    .enabled_chat_platforms` for the Cluster Agent reconcile summary (#989).
+    is open against it), and `chat_platforms.enabled_chat_platforms` answers it
+    for the Cluster Agent reconcile summary (#989).
 
-    Converging on #996's module is a re-point for the ORDER and the per-platform
-    resolution, which are deliberately the same, and NOT for the sources: #996
-    reads `CONFIG_PATH` then the environment, and the managed scope above is a
-    third source it does not have, at higher precedence than either. Dropping it
-    is not a refactor — on a pod whose CR sets `slack.enabled: false` while a
-    stale `SLACK_RELAY_URL` lingers in the container environment, this resolves
-    `["google_chat"]` and #996's resolves `["google_chat", "slack"]`, re-enabling
-    a leg an operator turned off. Whichever lands second has to carry
-    `_platforms_enabled_in(MANAGED_CONFIG_PATH)` across with it.
+    Converging on `chat_platforms` is now safe on the sources as well as on the
+    ORDER and the per-platform resolution. This paragraph used to warn that it
+    was not: #996 read `CONFIG_PATH` then the environment, so re-pointing at it
+    would have dropped the managed scope, and on a pod whose CR sets
+    `slack.enabled: false` while a stale `SLACK_RELAY_URL` lingers in the
+    container environment that is not a refactor but a re-enabled leg an
+    operator turned off. #996 carried `_platforms_enabled_in(MANAGED_CONFIG_PATH)`
+    across before merging, as that warning asked. The two functions now agree on
+    all three sources and their precedence, and both pin the stale-relay-URL case
+    (`test_managed_false_beats_a_stale_relay_url` there, `TestEnabledChatPlatforms`
+    here). What remains between them is which callers they serve, not what they
+    answer.
     """
     from_managed = _platforms_enabled_in(MANAGED_CONFIG_PATH)
     from_profile = _platforms_enabled_in(CONFIG_PATH)
@@ -1118,8 +1121,12 @@ def _triage_task_body(payload: Dict[str, Any]) -> str:
     the ``To authorize:`` bullet as that evidence, which is the one line both
     shapes carry. So the label in this template and the pattern in that gate are
     one decision in two files: change the words here and the gate stops
-    recognising the report. ``test_triage_reply_roundtrip.py`` is the test that
-    holds both halves in scope.
+    recognising the report. A third file reads it too —
+    bench/tasks/autoops-warning-event-triage/task.yaml's delivery objective
+    keys on the same literals — so a reword here has three readers to
+    reconcile, not one. ``test_triage_reply_roundtrip.py`` holds this template
+    against the gate; bench/tests/test_triage_delivery_contract.py holds it
+    against both the gate and that eval case.
 
     §7 rule 3 — "no offer to help further" — does not reach the bullet. Rule 3
     is about closing chatter, the "let me know if you need anything else" that

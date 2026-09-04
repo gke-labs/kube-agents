@@ -11,7 +11,7 @@ Everything below runs from `k8s-operator/`.
 
 ## Prerequisites
 
-- Go 1.26+.
+- Go 1.27+.
 - `docker` (or `podman`) for image builds.
 - `kubectl` pointed at a target cluster for `make install` / `make deploy`.
 - `make` — the entire workflow is Makefile-driven.
@@ -59,7 +59,7 @@ make deploy        IMG=<your-registry>/kube-agents-operator:dev
 
 ## Fast agent iteration (dev only)
 
-For local Platform Agent development you don't want to run the full installer every time. `make dev-rebuild-agent` shells out to `k8s-operator/scripts/dev/dev_rebuild_agent.sh`:
+For local Platform Agent development you don't want to run the full installer every time. `make dev-rebuild-agent` shells out to `scripts/dev/dev_rebuild_agent.sh`:
 
 ```bash
 make dev-rebuild-agent ARGS="platform"

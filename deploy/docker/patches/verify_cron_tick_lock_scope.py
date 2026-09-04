@@ -2,9 +2,9 @@
 """Build gate for the cron tick-lock-scope patch.
 
 Run by deploy/docker/Dockerfile from /opt/hermes after
-apply_cron_tick_lock_scope.py. The applier only proves twelve anchors matched;
-it proves nothing about WHERE the release landed, and a release placed one
-statement too early would silently break at-most-once.
+apply_cron_tick_lock_scope.py. The applier only proves fourteen anchors
+matched; it proves nothing about WHERE the release landed, and a release placed
+one statement too early would silently break at-most-once.
 
 Six checks, each a way the patch could match its anchors and still be wrong or
 harmful:

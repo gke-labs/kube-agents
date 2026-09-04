@@ -61,10 +61,45 @@ mcp_servers:
   # every worker's boot — paid even when no MCP tool was ever called. See the
   # fuller note in agents/platform/config.yaml; a cold cache falls back to an
   # eager connect and warms itself.
+  #
+  # `--header User-Agent: …` is what makes this traffic identifiable to the API
+  # teams that serve these endpoints. Without it every request goes out as
+  # undici's default `node`, indistinguishable from any other Node process on
+  # the internet, and the Developer Knowledge team asked for a name they can
+  # attribute in their logs and customer dashboards. This is the canonical
+  # explanation; agents/platform/config.yaml and agents/cluster/config.yaml
+  # carry the same flag and point back here.
+  #
+  #   - mcp-remote hands the header map to the SDK as `requestInit.headers`,
+  #     and undici sends a caller-set User-Agent rather than overwriting it, so
+  #     the value survives to the wire on the initialize POST and on every tool
+  #     call after it. The SDK's own OAuth metadata probes at connect
+  #     (/.well-known/…) are built without requestInit and still go out as
+  #     `node`; they are discovery, not MCP calls.
+  #   - `${KUBE_AGENTS_VERSION}` is resolved by Hermes, not by mcp-remote:
+  #     hermes `tools/mcp_tool.py` interpolates `${VAR}` in `args` from the agent
+  #     process environment, while the child itself gets only an allowlisted
+  #     baseline plus whatever an `env:` block names, which this variable is
+  #     not in. The value is baked into the image (deploy/docker/Dockerfile,
+  #     end of the `platform` stage) and is the commit the image was built
+  #     from, or `dev` for a build that passed no version.
+  #   - This copy and the one in agents/platform/config.yaml have to stay
+  #     character-identical, because deploy/docker/merge_configs.py unions the
+  #     two arg lists at image build. Drift does not produce two headers: the
+  #     union dedups, so the repeated `--header` token collapses and the
+  #     divergent value survives alone as a bare positional after the URL,
+  #     which mcp-remote reads as its optional callback port and discards as
+  #     NaN. The overlay's spelling is the one silently lost.
+  #   - One string, byte-identical at every call site. It names the product and
+  #     the build and nothing else; the customer project is already on the wire
+  #     as X-Goog-User-Project. Keep it that way — the API teams key dashboards
+  #     on this value, and a variation added in one file splits that key.
   developer_knowledge:
     command: "node"
     args:
       - "/opt/mcp-remote/dist/proxy.js"
+      - "--header"
+      - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION}"
       - "https://developerknowledge.googleapis.com/mcp"
     lazy: true
     connect_timeout: 30
@@ -73,6 +108,8 @@ mcp_servers:
     command: "node"
     args:
       - "/opt/mcp-remote/dist/proxy.js"
+      - "--header"
+      - "User-Agent: kube-agents/${KUBE_AGENTS_VERSION}"
       - "https://container.googleapis.com/mcp"
     lazy: true
     connect_timeout: 30

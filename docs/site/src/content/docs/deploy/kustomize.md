@@ -37,7 +37,7 @@ deploy/
 The Kustomize surface at [`deploy/kustomize/platform/`](https://github.com/gke-labs/kube-agents/tree/main/deploy/kustomize/platform) includes the base Service and modular network isolation policies:
 
 - [`networkpolicy-ingress.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/kustomize/platform/networkpolicy-ingress.yaml) — Explicitly allowlists required Ingress ports (`8642`, `8643`, `9119`) from within the namespace.
-- [`networkpolicy-core-egress.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/kustomize/platform/networkpolicy-core-egress.yaml) — Egress for CoreDNS/NodeLocal DNS and GCP Workload Identity / Metadata server (`169.254.169.254/32` and `169.254.169.252/32`).
+- [`networkpolicy-core-egress.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/kustomize/platform/networkpolicy-core-egress.yaml) — Egress for CoreDNS/NodeLocal DNS and GCP Workload Identity / Metadata server (`169.254.169.254/32` and `169.254.169.252/32`). The metadata address is also a DNS peer, on port `53` alone, because it is the resolver on a [Cloud DNS for GKE](https://cloud.google.com/kubernetes-engine/docs/how-to/cloud-dns) cluster.
 - [`networkpolicy-internal-egress.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/kustomize/platform/networkpolicy-internal-egress.yaml) — Egress for in-cluster services (LiteLLM, vLLM Gemma, GitHub Token Minter, and GKE Managed OTel Collector).
 - [`networkpolicy-apiserver-egress.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/kustomize/platform/networkpolicy-apiserver-egress.yaml) — Egress to the Kubernetes Control Plane API Server (`10.96.0.1/32`).
 - [`networkpolicy-external-egress.yaml`](https://github.com/gke-labs/kube-agents/blob/main/deploy/kustomize/platform/networkpolicy-external-egress.yaml) — Egress to external HTTPS endpoints (`0.0.0.0/0:443`) with RFC 1918 exclusions to prevent lateral movement.
@@ -91,9 +91,15 @@ patches:
       kind: NetworkPolicy
       name: platform-agent-core-egress
     patch: |-
-      - op: replace
-        path: /spec/egress/0/to/3/ipBlock/cidr
-        value: "10.0.0.10/32" # Replace with your custom kube-system/kube-dns Service ClusterIP
+      # Appended, not replaced at an index: the peer list is edited from several
+      # branches, and a positional path silently retargets when a peer is
+      # inserted above it. The default 10.96.0.10/32 stays and reaches nothing
+      # on a cluster that does not use it.
+      - op: add
+        path: /spec/egress/0/to/-
+        value:
+          ipBlock:
+            cidr: "10.0.0.10/32" # Replace with your custom kube-system/kube-dns Service ClusterIP
 ```
 
 > [!NOTE]

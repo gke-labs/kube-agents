@@ -14,7 +14,7 @@ the comment together.
 ## Guard automatically-triggered credentialed workflows against forks
 
 A workflow that needs this repository's secrets and starts on its own — `push`, a tag, `schedule`,
-or `workflow_run` — carries `if: github.repository == 'gke-labs/kube-agents'` on every job. A fork
+`status`, or `workflow_run` — carries `if: github.repository == 'gke-labs/kube-agents'` on every job. A fork
 inherits those triggers but none of the secrets, so an unguarded job fails there on every sync and
 mails the fork owner. Put the guard on each job rather than trusting the skip to cascade through
 `needs`; an `always()` added later removes the implicit `success()` and the job runs anyway.

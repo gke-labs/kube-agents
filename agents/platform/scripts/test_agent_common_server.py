@@ -41,7 +41,7 @@ def _load_agent_common_server():
 
     These tests run in CI via `make test-python`, and the credential logic under
     test (resolve_agent_credentials) depends only on the stdlib. When the hermes
-    runtime deps (FastMCP / pydantic / session_manager) aren't installed at all,
+    runtime deps (MCPServer / pydantic / session_manager) aren't installed at all,
     fall back to minimal stubs so the module still imports in a bare checkout.
     Each stub package sets __path__ so it is treated as a real package.
 
@@ -70,14 +70,12 @@ def _load_agent_common_server():
 
         mcp = types.ModuleType("mcp"); mcp.__path__ = []
         mcp_server = types.ModuleType("mcp.server"); mcp_server.__path__ = []
-        fastmcp = types.ModuleType("mcp.server.fastmcp")
-        fastmcp.FastMCP = lambda *a, **k: types.SimpleNamespace(
-            tool=lambda *a, **k: (lambda f: f), run=lambda: None)
+        mcp_server.MCPServer = lambda *a, **k: types.SimpleNamespace(
+            tool=lambda *a, **k: (lambda f: f), run=lambda *a, **k: None)
         pydantic = types.ModuleType("pydantic")
         pydantic.Field = lambda *a, **k: None
         _stub_if_missing("mcp", mcp)
         _stub_if_missing("mcp.server", mcp_server)
-        _stub_if_missing("mcp.server.fastmcp", fastmcp)
         _stub_if_missing("pydantic", pydantic)
         sys.modules["session_manager"] = real_session_manager
         return importlib.import_module("agent_common_server")

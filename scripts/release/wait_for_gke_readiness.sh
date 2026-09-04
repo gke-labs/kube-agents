@@ -1,13 +1,8 @@
 #!/usr/bin/env bash
 # Connects to GKE cluster and verifies that required deployments reach Ready state.
 #
-# Waits; it does not install. Where a caller needs alert ingress it installs it
-# in an earlier step — e2e-run.yml, the reusable job the RC and nightly
-# pipelines both call, runs install_pubsub_platform.sh before this, so the
-# gateway re-template the adapter causes is already in flight by the time the
-# rollout waits below start. That ordering is the caller's to get right, not an
-# invariant this script can assume: e2e-manual-runner.yml calls this script with
-# no such step today.
+# Waits; it does not install. Infrastructure and plugins are deployed in the deploy step
+# prior to waiting for readiness.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

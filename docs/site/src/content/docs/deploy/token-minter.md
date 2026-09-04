@@ -43,11 +43,17 @@ A personal-account App is created as "Only on this account", which cannot instal
 
 ### Install variables
 
-`./install.sh` collects these in its GitOps interview and saves them to `k8s-operator/scripts/vars.sh`:
+`./install.sh` collects these in its GitOps interview and saves them to `install.env`:
 
 - `GITHUB_APP_ID` — numeric App ID.
-- `GITHUB_ORG` — the organization hosting the repo. A username will not work; see above.
-- `GITHUB_REPO` — repo name.
+- `GITOPS_ORG` — the organization hosting the repo. A username will not work; see above.
+- `GITOPS_REPO` — repo name.
+
+  These were `GITHUB_ORG` / `GITHUB_REPO`, which still work for one release with a
+  deprecation warning. They were renamed because `GH_ORG` / `GH_REPO` name the _release_
+  repository on the rc and nightly environments, and `tests/e2e/.env` uses `GITHUB_ORG` /
+  `GITHUB_REPO` for the repository a test acts on — three repositories sharing two names.
+
 - `GITHUB_PEM_PATH` — absolute path to the `.pem` file. If provided, the installer auto-imports it to KMS via the Minty CLI. If omitted, deployment proceeds but Minty fails readiness until the key is imported manually.
 
 ## Why KMS instead of a Kubernetes Secret

@@ -24,7 +24,7 @@ teardown_require_inputs
 
 # Half-configured minter: refuse before anything is destroyed.
 #
-# All three of GITHUB_ORG/GITHUB_REPO/GITHUB_APP_ID must be non-empty before
+# All three of GITOPS_ORG/GITOPS_REPO/GITHUB_APP_ID must be non-empty before
 # installer_common.sh provisions the minter at all, and its own "GitHub minter
 # deferred" warning only fires once they are, so one missing value skips the
 # minter in silence.
@@ -44,9 +44,18 @@ teardown_require_inputs
 #
 # Why a value goes missing is in scripts/release/README.md under "Enabling the
 # GitHub token minter on the RC".
+# The deprecated spellings, folded in before the guard rather than after it.
+# installer_common.sh's normalize_gitops_repo_vars does the same thing for the
+# installers, but this check runs before the repository's helpers are sourced --
+# and a half-configured minter passed under the old names has to be caught here
+# too, or the deprecation would quietly disable the guard.
+: "${GITOPS_ORG:=${GITHUB_ORG:-}}"
+: "${GITOPS_REPO:=${GITHUB_REPO:-}}"
+export GITOPS_ORG GITOPS_REPO
+
 GITHUB_MINTER_SET=""
 GITHUB_MINTER_MISSING=""
-for _v in GITHUB_ORG GITHUB_REPO GITHUB_APP_ID; do
+for _v in GITOPS_ORG GITOPS_REPO GITHUB_APP_ID; do
   if [ -n "${!_v:-}" ]; then
     GITHUB_MINTER_SET="${GITHUB_MINTER_SET} ${_v}"
   else
@@ -57,6 +66,67 @@ if [ -n "${GITHUB_MINTER_SET}" ] && [ -n "${GITHUB_MINTER_MISSING}" ]; then
   echo "::error title=GitHub token minter is half-configured::Set:${GITHUB_MINTER_SET}; empty:${GITHUB_MINTER_MISSING}. All three are required. Refusing to tear down and reprovision an environment whose token-minting test would then fail with an HTTP 502. Check that each one is set on the GitHub environment this job binds to, and that the calling pipeline still invokes this workflow with \`secrets: inherit\` — without it an environment secret such as GH_APP_ID reaches this job empty."
   echo "==> GitHub token minter half-configured — set:${GITHUB_MINTER_SET}; empty:${GITHUB_MINTER_MISSING}." >&2
   exit 1
+fi
+
+# Chat allowlists on a long-lived environment: refuse before anything is
+# destroyed, in the same place and for the same reason as the minter check.
+#
+# render_install_env.sh makes this check for the reconcile path, under
+# --strict. This is the same guarantee for the rebuild path, and the two have
+# to agree: deploy-environment.yml offers `autopush` and `staging` in its
+# dropdown, so without it the escape hatch you reach for when a reconcile
+# cannot converge is also the one route into these environments that does not
+# ask about the allowlist.
+#
+# Empty is not "no opinion". install.sh renders `google_chat_allowed_users =
+# []`, the chart's `with` omits the key, and the operator turns an absent list
+# into allow-all (platformagent_manifests.go's allowAllUsers) -- so a rebuild
+# of an environment whose allowlist variable was never set admits the whole
+# domain, and nothing in the run says so.
+#
+# LONG_LIVED_ENVIRONMENT only. `rc` and `nightly` carry GOOGLE_CHAT_ENABLED=true
+# with no ALLOWED_USERS today and are deliberately open: they are destroyed and
+# rebuilt every run and no real user reaches them. An unconditional guard here
+# would fail the RC pipeline on its next run rather than protect anything.
+#
+# Truthiness and emptiness are both inlined for the reason teardown_common.sh
+# gives -- these scripts do not source installer_common.sh -- and both match it
+# exactly. Emptiness in particular is the installer's, not `-z`: hcl_csv_list
+# splits on `, \t\n` and drops empty items, so a list cleared down to a stray
+# comma names nobody and still renders `[]`.
+provision_is_truthy() {
+  local val="${1:-}"
+  val="${val//[[:space:]]/}"
+  case "$val" in
+    [Tt][Rr][Uu][Ee] | [Yy][Ee][Ss] | [Yy] | 1 | [Oo][Nn]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+provision_names_nobody() {
+  local val="${1:-}"
+  # Every separator hcl_csv_list splits on; what is left is the real items.
+  val="${val//[, $'\t'$'\n']/}"
+  [ -z "$val" ]
+}
+
+provision_check_allowlist() {
+  local enabled_var="$1" list_var="$2" allow_all_var="$3" platform="$4"
+  provision_is_truthy "${!enabled_var:-}" || return 0
+  provision_names_nobody "${!list_var:-}" || return 0
+  ! provision_is_truthy "${!allow_all_var:-}" || return 0
+  echo "::error title=${platform} is enabled with no allowlist::${list_var} names no users on this environment — it is unset, or it holds only separators — and an empty allowlist means EVERY user is admitted, because the operator turns an absent list into allow-all for ${platform}. Refusing to tear down and rebuild '${GKE_CLUSTER_NAME:-this environment}' into a wider-open install than the one it is replacing. Set ${list_var} to the users this install should admit, or set ${allow_all_var}=true to say the open allowlist is intended."
+  echo "==> ${platform} enabled with an empty ${list_var} and no ${allow_all_var}=true." >&2
+  return 1
+}
+
+if provision_is_truthy "${LONG_LIVED_ENVIRONMENT:-}"; then
+  ALLOWLIST_STATUS=0
+  provision_check_allowlist GOOGLE_CHAT_ENABLED ALLOWED_USERS \
+    GOOGLE_CHAT_ALLOW_ALL_USERS "Google Chat" || ALLOWLIST_STATUS=1
+  provision_check_allowlist SLACK_ENABLED SLACK_ALLOWED_USERS \
+    SLACK_ALLOW_ALL_USERS "Slack" || ALLOWLIST_STATUS=1
+  [ "$ALLOWLIST_STATUS" -eq 0 ] || exit 1
 fi
 
 TEARDOWN_LOG="$(mktemp)"
@@ -149,13 +219,21 @@ if [ -n "${USER_PROFILE_ENABLED:-}" ]; then
   INSTALL_ARGS+=(--user-profile-enabled="${USER_PROFILE_ENABLED}")
 fi
 
+if [ "${ENABLE_PUBSUB_PLATFORM:-false}" = "true" ]; then
+  INSTALL_ARGS+=(--enable-pubsub-platform)
+fi
+
+if [ "${ENABLE_STOCKOUT_INVESTIGATOR:-false}" = "true" ]; then
+  INSTALL_ARGS+=(--enable-stockout-investigator)
+fi
+
 # No --gitops-org/--gitops-repo flags here: install.sh already seeds PARAM_GITOPS_ORG
-# and PARAM_GITOPS_REPO from the GITHUB_ORG and GITHUB_REPO this step exports
+# and PARAM_GITOPS_REPO from the GITOPS_ORG and GITOPS_REPO this step exports
 # (the PARAM_GITOPS_* assignments near the top of install.sh), so passing them again
 # would be the same values by a second route. GITHUB_APP_ID is read from the
 # environment the same way. All three unset leaves enable_github_minter false and the
 # install byte-identical to one that never had them (the three-way guard on
-# GITHUB_ORG/GITHUB_REPO/GITHUB_APP_ID in installer_common.sh's write_tfvars_from_state).
+# GITOPS_ORG/GITOPS_REPO/GITHUB_APP_ID in installer_common.sh's write_tfvars_from_state).
 #
 # The half-configured case is refused at the top of this script, above the
 # teardown, so it never reaches here.
