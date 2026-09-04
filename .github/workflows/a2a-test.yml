@@ -1,0 +1,67 @@
+name: A2A Module Tests
+
+# Unit and conformance tests for the a2a/ Go module. The conformance suite
+# runs against an embedded JetStream server (a test-only dependency), so this
+# job needs no cluster and no credentials.
+#
+# The trigger arrangement is k8s-operator-test.yml's, for the reasons its
+# header comment gives: on a pull request the job always starts and the
+# `Detect changes` step decides whether to test, so the check can be required
+# without blocking unrelated changes; on a push to main the `paths:` filter
+# decides instead, so a run that tested nothing is never recorded as a green
+# run. Keep the `paths:` list and the `a2a:` filter below identical.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    paths:
+      - "a2a/**"
+      - ".github/workflows/a2a-test.yml"
+  workflow_dispatch:
+
+# A re-push supersedes this pull request's earlier run instead of stacking a
+# second full set of checks behind it. Runs that are not from a pull request
+# fall back to github.run_id, which is unique, so each sits alone in its own
+# group and none is ever cancelled. A shared key would not be safe there:
+# GitHub holds only one run pending per group, so a burst of merges to main
+# would lose the runs in the middle before they started.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Run A2A Module Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Detect changes
+        id: filter
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          filters: |
+            a2a:
+              - "a2a/**"
+              - ".github/workflows/a2a-test.yml"
+
+      - name: Set up Go
+        if: steps.filter.outputs.a2a == 'true'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "a2a/go.mod"
+          cache: true
+          cache-dependency-path: "a2a/go.sum"
+
+      - name: Run Tests
+        if: steps.filter.outputs.a2a == 'true'
+        run: |
+          cd a2a
+          go vet ./...
+          go test -race ./...

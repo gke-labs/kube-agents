@@ -177,7 +177,11 @@ reproduce, and because a value deleted from the web form fails the same way as o
    `REGISTRY_PREFIX` is read too but is **optional and set on no environment**, so do not go
    looking for it: the repository scope holds no variables at all, the workflows forward an empty
    string, and `get_registry_prefix` falls back to `DEFAULT_REGISTRY_PREFIX`. Set it only to point
-   an environment at a registry other than `ghcr.io/gke-labs/kube-agents`.
+   an environment at a registry other than `ghcr.io/gke-labs/kube-agents`. If you do, note that
+   `registry_image_exists` — the probe `check_commit_images_exist` runs per image — has a docker-free
+   fallback only for `ghcr.io`. Every release-path caller runs on a GitHub Actions runner with docker
+   and so takes the `docker manifest inspect` branch regardless; a caller without docker pointed at
+   another registry gets a warning and a "missing image" answer.
 
    Two of those earn a line of their own because getting them wrong is silent rather than loud.
    `GITOPS_ORG`/`GITOPS_REPO` name the repository the token minter is scoped to and the suite

@@ -305,6 +305,29 @@ class WorkflowNameJoinTest(unittest.TestCase):
             "has silently disabled these consumers: " + ", ".join(broken),
         )
 
+    def test_the_required_python_job_runs_the_suite_in_strict_mode(self):
+        """The gate is one flag on one line, and losing it fails open.
+
+        `make coverage` tolerates a failing test directory by design -- it is a
+        meter, and one red directory must not hide the number for the rest. The
+        job that reports the required `Run Python Unit Tests` context runs that
+        target, so COVERAGE_STRICT=1 is the only thing making a red suite a red
+        check. Drop it in a reformat and CI reports success on failing tests:
+        the suite still runs, the log still shows the failures, and the context
+        still goes green. Nothing else in the repository asserts this.
+        """
+        yaml = _yaml()
+        workflow = yaml.safe_load((WORKFLOWS / "python-tests.yml").read_text())
+        steps = workflow["jobs"]["test"]["steps"]
+        commands = " ".join(step.get("run", "") for step in steps)
+        self.assertIn(
+            "COVERAGE_STRICT=1",
+            commands,
+            "the required Run Python Unit Tests job no longer passes "
+            "COVERAGE_STRICT=1, so a failing test directory would be reported "
+            "but would not fail the check",
+        )
+
     def test_the_coverage_artifact_name_join_holds(self):
         producer = (WORKFLOWS / "python-tests.yml").read_text()
         consumer_path = WORKFLOWS / "coverage-comment.yml"

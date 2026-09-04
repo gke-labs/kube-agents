@@ -4,6 +4,11 @@
 # ==============================================================================
 # The evaluation cluster and its IAM are pre-configured; this script builds
 # the PR's images and deploys the kube-agents chart onto that cluster.
+#
+# Setting RC_COMMIT_SHA switches it to the release-candidate path: no build at
+# all, and the chart's published GHCR images at that commit instead. Section 2a
+# is the whole of the difference, and with the variable unset nothing below
+# behaves differently from the day this line was added.
 # ==============================================================================
 
 set -euo pipefail
@@ -58,6 +63,85 @@ export AGENT_IMAGE="${AR_REPO}/platform-agent"
 export AGENT_TAG="${TAG}"
 export IMAGE_TAG="${TAG}"
 
+# ─── 2a. Image Source: Pull Request Build, or Published Release Candidate ─────
+# RC_COMMIT_SHA unset is the presubmit and everything this script did before the
+# variable existed: build the pull request's images into the leased project's
+# Artifact Registry and install those. Set, it is the release-candidate eval —
+# the candidate's images are already published, so there is nothing to build and
+# rebuilding would measure a different artefact than the one being released.
+#
+# hack/resolve-rc-target.sh produces the value and documents why the caller, not
+# this script, checks the tree out at that commit.
+#
+# The two paths differ in registry AND in image name: Artifact Registry carries
+# `kube-agents-operator`, the published one is `k8s-operator`. That is why the
+# RC path drops the repository overrides rather than rewriting them — the chart
+# already defaults every image to the published GHCR path, so only the tag has
+# to be said. The same drop is what carries the credential-proxy sidecar across:
+# it is not a chart value at all, the operator derives it from the agent image by
+# rewriting the trailing path element and keeping the tag
+# (resolveCredentialProxyImage in k8s-operator/internal/controller/
+# platformagent_manifests.go), so it follows whichever repository the agent uses
+# without being named here. Both plugin images default to enabled=false and are
+# not rendered on either path.
+if [ -n "${RC_COMMIT_SHA:-}" ]; then
+  # Sourced inside the branch, deliberately. The presubmit path must not acquire
+  # a second file's exports and functions just because this one exists.
+  # shellcheck source=scripts/release/common.sh
+  source "${SCRIPT_DIR}/../scripts/release/common.sh"
+  RC_REGISTRY_PREFIX="$(get_registry_prefix)"
+
+  # The checkout contract, enforced rather than only documented. Only the images
+  # come from RC_COMMIT_SHA; the chart, the CRDs, bench/tasks and bench/tf/fleet
+  # all come from the tree this runs in, so a caller that sets the variable
+  # without checking the tree out first gets a run that installs the candidate's
+  # images against another revision's everything-else and reports an ordinary
+  # green verdict for a combination that will never ship. Nothing else in the
+  # run can notice that, which is why it fails here instead of warning.
+  RC_TREE_SHA="$(git -C "${SCRIPT_DIR}/.." rev-parse HEAD 2>/dev/null || echo "")"
+  if [ "${RC_TREE_SHA}" != "${RC_COMMIT_SHA}" ]; then
+    echo "ERROR: RC_COMMIT_SHA is ${RC_COMMIT_SHA} but this tree is at ${RC_TREE_SHA:-an unknown commit}."
+    echo "       Check the tree out at the candidate first, then re-run:"
+    echo "         git checkout --detach ${RC_COMMIT_SHA}"
+    echo "       hack/resolve-rc-target.sh's header explains why the checkout is"
+    echo "       the caller's job and cannot be done from inside this script."
+    exit 1
+  fi
+
+  # Cheap, and 15 minutes earlier than the alternative. Without it a missing
+  # image surfaces as `helm --wait` timing out on ImagePullBackOff, which reads
+  # as a broken chart rather than an unpublished commit. resolve-rc-target.sh
+  # checks the same thing; this repeats it because RC_COMMIT_SHA can be set by
+  # hand, and because that script is not what a Prow job is obliged to call.
+  if ! check_commit_images_exist "${RC_COMMIT_SHA}"; then
+    echo "ERROR: ${RC_REGISTRY_PREFIX} has no complete image set at ${RC_COMMIT_SHA}."
+    echo "       Required: ${REQUIRED_RELEASE_IMAGES[*]}"
+    echo "       docker-publish-ghcr.yml runs on every push to main; a queued or"
+    echo "       failed run leaves the commit with no images to install."
+    exit 1
+  fi
+
+  export TAG="${RC_COMMIT_SHA}"
+  export IMG="${RC_REGISTRY_PREFIX}/k8s-operator:${TAG}"
+  export AGENT_IMAGE="${RC_REGISTRY_PREFIX}/platform-agent"
+  export AGENT_TAG="${TAG}"
+  export IMAGE_TAG="${TAG}"
+
+  IMAGE_ARGS=(
+    --set-string "operator.image.tag=${TAG}"
+    --set-string "platformAgent.deployment.image.tag=${TAG}"
+  )
+  DEPLOY_SOURCE="release candidate ${RC_COMMIT_SHA:0:7} from ${RC_REGISTRY_PREFIX}"
+else
+  IMAGE_ARGS=(
+    --set-string "operator.image.repository=${AR_REPO}/kube-agents-operator"
+    --set-string "operator.image.tag=${TAG}"
+    --set-string "platformAgent.deployment.image.repository=${AR_REPO}/platform-agent"
+    --set-string "platformAgent.deployment.image.tag=${TAG}"
+  )
+  DEPLOY_SOURCE="PR #${PULL_NUMBER:-local} build (${TAG})"
+fi
+
 export MODEL_PROVIDER="gemini"
 export MODEL_DEFAULT_NAME="gemini-3.1-pro-preview"
 # Default to enforcing CMEK database encryption on CI evaluation clusters.
@@ -81,12 +165,16 @@ export SLACK_ENABLED="false"
 # "None" and those scenarios stop at step 0 with nothing to clone.
 #
 # CI supplies the value and deliberately does NOT lean on the chart default.
-# Everything this job deploys — chart, operator, agent — is built from the pull
-# request, so a PR that blanks `platformAgent.integration.github.gitRepo` in
-# values.yaml, or breaks the CR-to-SETTINGS.md rendering, is precisely the
-# regression the eval should catch as a failed scenario. It can only catch it
-# if the value the run is supposed to use arrives from outside the artefacts
-# under test. Note this is a *correctness* argument, not the containment
+# On the presubmit path everything this job deploys — chart, operator, agent —
+# is built from the pull request, so a PR that blanks
+# `platformAgent.integration.github.gitRepo` in values.yaml, or breaks the
+# CR-to-SETTINGS.md rendering, is precisely the regression the eval should catch
+# as a failed scenario. It can only catch it if the value the run is supposed to
+# use arrives from outside the artefacts under test. The release-candidate path
+# installs published images instead of built ones, which narrows what is under
+# test without changing this argument: the chart still comes from the checkout,
+# and supplying the value from outside is what keeps either artefact from
+# choosing it. Note this is a *correctness* argument, not the containment
 # boundary: what a run can actually write to is fixed by which repositories the
 # GitHub App is installed on, which no PR can change. See
 # docs/site/src/content/docs/deploy/ci-pool-projects.md.
@@ -272,7 +360,7 @@ else
 fi
 
 START_TIME=$SECONDS
-echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Deploying PR #${PULL_NUMBER:-local} (${TAG}) to Namespace: ${NAMESPACE} ==="
+echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Deploying ${DEPLOY_SOURCE} to Namespace: ${NAMESPACE} ==="
 
 # ─── 3. Cluster Auth ──────────────────────────────────────────────────────────
 STEP_START=$SECONDS
@@ -285,27 +373,45 @@ gcloud container clusters get-credentials "$CLUSTER_NAME" --region "$REGION" --p
 echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 
 # ─── 4. Build Container Images ────────────────────────────────────────────────
-STEP_START=$SECONDS
-echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Building Container Images (platform, credential-proxy, operator) ==="
-# One submit, not three. The two agent images share the agent-base chain, so
-# building them as consecutive steps on one worker lets the second reuse the
-# first's layers instead of rebuilding that chain on a cold daemon; the operator
-# build runs alongside them. See the header of cloudbuild-ci.yaml, and #635.
-# Set REQUIRE_CACHE=true in the job environment to fail the build on a cache
-# miss instead of cold-building. Default false so a broken cache source cannot
-# block the PR that fixes it.
-export CACHE_IMAGE="${CACHE_IMAGE:-us-docker.pkg.dev/kube-agents-prow/kube-agents/platform-agent:latest}"
-# The postsubmit's mode=max cache manifests; CACHE_IMAGE stays the fallback.
-export BUILDCACHE_IMAGE="${BUILDCACHE_IMAGE:-us-docker.pkg.dev/kube-agents-prow/kube-agents/platform-agent:buildcache}"
-export PROXY_BUILDCACHE_IMAGE="${PROXY_BUILDCACHE_IMAGE:-us-docker.pkg.dev/kube-agents-prow/kube-agents/credential-proxy:buildcache}"
-gcloud builds submit --config="deploy/docker/cloudbuild-ci.yaml" \
-  --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}" \
-  --project="${PROJECT_ID}" "${BUILD_WORKER_ARGS[@]}" --quiet .
-echo "✓ Container image builds finished in $((SECONDS - STEP_START))s"
+# Skipped whole on the release-candidate path: the candidate's images are what
+# is being evaluated, and a rebuild from the same source is a different artefact
+# — different base-image digests, different build timestamps, and a different
+# _KUBE_AGENTS_VERSION baked in as the remote-MCP User-Agent. An eval that graded
+# a rebuild would not be grading the thing the release ships.
+if [ -n "${RC_COMMIT_SHA:-}" ]; then
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Skipping image builds: installing published images at ${RC_COMMIT_SHA:0:7} ==="
+else
+  STEP_START=$SECONDS
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Building Container Images (platform, credential-proxy, operator) ==="
+  # One submit, not three. The two agent images share the agent-base chain, so
+  # building them as consecutive steps on one worker lets the second reuse the
+  # first's layers instead of rebuilding that chain on a cold daemon; the operator
+  # build runs alongside them. See the header of cloudbuild-ci.yaml, and #635.
+  # Set REQUIRE_CACHE=true in the job environment to fail the build on a cache
+  # miss instead of cold-building. Default false so a broken cache source cannot
+  # block the PR that fixes it.
+  export CACHE_IMAGE="${CACHE_IMAGE:-us-docker.pkg.dev/kube-agents-prow/kube-agents/platform-agent:latest}"
+  # The postsubmit's mode=max cache manifests; CACHE_IMAGE stays the fallback.
+  export BUILDCACHE_IMAGE="${BUILDCACHE_IMAGE:-us-docker.pkg.dev/kube-agents-prow/kube-agents/platform-agent:buildcache}"
+  export PROXY_BUILDCACHE_IMAGE="${PROXY_BUILDCACHE_IMAGE:-us-docker.pkg.dev/kube-agents-prow/kube-agents/credential-proxy:buildcache}"
+  gcloud builds submit --config="deploy/docker/cloudbuild-ci.yaml" \
+    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}" \
+    --project="${PROJECT_ID}" "${BUILD_WORKER_ARGS[@]}" --quiet .
+  echo "✓ Container image builds finished in $((SECONDS - STEP_START))s"
+fi
 
 # ─── 5. Chart Deployment ──────────────────────────────────────────────────────
 # One helm release carries the whole install — operator, credentials Secret,
 # agent CR, and LiteLLM — so there is nothing to apply piecemeal or keep in order.
+#
+# The chart is `./charts/kube-agents`, out of the checkout, on both paths. On the
+# release-candidate path that makes the checkout load-bearing: the images come
+# from RC_COMMIT_SHA and the chart, CRDs and eval tasks come from whatever tree
+# this runs in, so the caller has to have checked the tree out at that commit
+# first or the run grades the candidate's images against another revision's
+# everything-else. hack/resolve-rc-target.sh is where that contract is written
+# down, and .github/workflows/deploy-environment.yml is the existing precedent
+# for honouring it with a checkout step.
 # Webhooks stay at the chart's default (off): a PR evaluation cluster carries
 # no cert-manager, and admission-webhook coverage belongs to the operator's
 # own test suite rather than this smoke pipeline.
@@ -364,10 +470,7 @@ fi
 API_SERVER_KEY="${API_SERVER_KEY:-$(openssl rand -hex 16)}"
 helm upgrade --install "${HELM_RELEASE_NAME}" ./charts/kube-agents \
   --namespace "${NAMESPACE}" --create-namespace \
-  --set-string "operator.image.repository=${AR_REPO}/kube-agents-operator" \
-  --set-string "operator.image.tag=${TAG}" \
-  --set-string "platformAgent.deployment.image.repository=${AR_REPO}/platform-agent" \
-  --set-string "platformAgent.deployment.image.tag=${TAG}" \
+  "${IMAGE_ARGS[@]}" \
   --set-string "platformAgent.harness.clusterName=${CLUSTER_NAME}" \
   --set-string "platformAgent.harness.location=${REGION}" \
   --set-string "platformAgent.harness.projectId=${PROJECT_ID}" \

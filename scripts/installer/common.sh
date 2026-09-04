@@ -198,7 +198,7 @@ warn_unmirrored_third_party() {
 # mirrored. The mirrored form is named after the inventory entry, matching what
 # scripts/mirror_images.sh writes — the entry's .name, not the repository's
 # trailing segment. The two differ for hindsight-postgresql
-# (docker.io/ankane/pgvector), which is exactly the case this line used to get
+# (docker.io/pgvector/pgvector), which is exactly the case this line used to get
 # wrong: it said "the trailing image name only" while the code below has always
 # used $name.
 third_party_image() {

@@ -20,7 +20,7 @@ Two communication channels, with different shapes and different reliability requ
 | Channel                           | Direction          | Shape                                   | Mechanism                                                            |
 | --------------------------------- | ------------------ | --------------------------------------- | -------------------------------------------------------------------- |
 | **Structured handover (primary)** | cluster → platform | continuous status (latest-wins, typed)  | files under `/opt/data/fleet/…`, written via a `write_handover` tool |
-| **Task delegation (optional)**    | platform → cluster | discrete work items (lifecycle, fan-in) | Hermes kanban board                                                  |
+| **Task delegation (optional)**    | platform → cluster | discrete work items (lifecycle/fan-out) | Hermes kanban board                                                  |
 
 **Guiding principles**
 
@@ -293,7 +293,7 @@ If neither applies (a quick, single-cluster action), the platform just does it d
 - The platform (orchestrator) creates cards with `kanban_create(assignee=<cluster-profile>, body=<spec>, …)`.
 - The Hermes **dispatcher** (running in the platform gateway) automatically spawns the assigned cluster subagent as a local worker (`hermes -p <cluster> chat -q "work kanban task <id>"`). No polling; the worker reads its pre-built context.
 - The worker does the local work and returns a **structured result** via `kanban_complete(summary=…, metadata={…})`. `block_kind=needs_input` escalates to a human.
-- **Fan-out / fan-in:** per-cluster cards are **parents**; a platform **aggregation card** is their **child**, gated until all parents finish. The child runs as a new platform turn whose context contains every parent's structured `metadata` — that's where the platform synthesizes and acts.
+- **Fan-out:** the platform files the per-cluster cards in one burst (no `parents`, so they run in parallel), keeps its own card open while they run, reads each one's structured `metadata` via `kanban_show` as it settles, and synthesizes and acts there. Completing a card is the delivery of its `result`, so the image refuses a completion over unfinished fan-out children rather than let a dispatch receipt ship as the answer (#1010, `deploy/docker/patches/kanban_children_settled.py`). The `parents` edge still exists for what it says — a card gated until the listed cards finish — and an orchestrating _chat session_ (no worker card of its own) may still use a platform-assigned aggregation card as that child.
 
 ### 3.3 Read-only / declarative posture in delegated tasks
 
@@ -305,7 +305,7 @@ Delegation is **transparent to the user**, not hidden plumbing:
 
 - On `kanban_create`, the originating chat session is **auto-subscribed** to the task.
 - The gateway's kanban notifier surfaces a card's **terminal** events (`completed`, `blocked`, `gave_up`, `crashed`, `timed_out`, `status`, `archived`, `unblocked`, `block_loop_detected`) back into that chat, plus `heartbeat` for mid-run progress: a worker calls `kanban_heartbeat(note=…)` at each milestone and the note joins a `⏳` line in the card's rolling progress message, delivered straight from the board and deliberately not waking the subscribed agent, so progress costs no LLM turn. Only the first note posts a message; the rest are edits to it, on any platform whose adapter supports editing, so a talkative card interrupts the space once. A terminal event settles that message (`✓` or `⏹`) and posts its own — the completion is the notification. `claimed` is not among them, and `kanban_comment` posts nothing to chat at all — a comment reaches a human only by causing a worker to act.
-- The orchestrator (platform) narrates its plan when it decides to delegate ("delegating readiness checks to 3 clusters…") and reports the synthesized result when the fan-in completes.
+- The orchestrator (platform) narrates its plan when it decides to delegate ("delegating readiness checks to 3 clusters…") and reports the synthesized result as its own card's `result` once every delegated card has settled.
 
 Net effect: delegated cluster subagents **emit their thoughts and results to the chat**, so the platform admin can watch the orchestration unfold and intervene (e.g. answer a `needs_input` block) without digging into internal state.
 
@@ -317,13 +317,13 @@ Net effect: delegated cluster subagents **emit their thoughts and results to the
 
 **Decision (delegate or not):** the platform _chooses_ to orchestrate rather than do everything itself — to preserve its context and to make the plan deterministic. It uses the **validation-then-declare** pattern: cluster subagents **validate feasibility** (read-only); the platform **declares** the change (a single GitOps PR); KCC reconciles the actual move.
 
-**Card graph (fan-out validation → fan-in declare):**
+**Card graph (fan-out validation → decide on the platform's own card):**
 
 ```
-Card A  (assignee = clusterA):  "Can you host workload W?"      ─┐  parents
-Card B  (assignee = clusterB):  "Is it safe to evacuate W?"     ─┤  (parallel — independent checks)
-                                                                 ▼
-Card C  (assignee = platform, parents = [A, B]):  "Decide & declare"   fan-in card
+Card A  (assignee = clusterA):  "Can you host workload W?"      ─┐  parallel — independent
+Card B  (assignee = clusterB):  "Is it safe to evacuate W?"     ─┘  read-only checks
+                                                                 ▲
+platform's own card:  polls A and B (kanban_show), then "Decide & declare" here
 ```
 
 The two validation cards are **parallel** (no ordering dependency — they're read-only checks). The make-before-break _execution_ ordering is handled later by KCC when it reconciles the PR, not by the agents.
@@ -361,7 +361,7 @@ The two validation cards are **parallel** (no ordering dependency — they're re
 }
 ```
 
-**Card C — platform decision & declaration:**
+**Platform decision & declaration (on its own card, once A and B settle):**
 
 - If both green → generate the **relocation PR** (move the workload's manifest from clusterB's overlay to clusterA's overlay, or flip its target-cluster field) and open it. KCC/Config Sync performs the actual make-before-break move.
 - If either red → do not declare; report blockers to the user, or `block_kind=needs_input` for a human decision.
@@ -377,7 +377,7 @@ The two validation cards are **parallel** (no ordering dependency — they're re
 }
 ```
 
-**Failure / compensation:** because the change is a **PR**, rollback is a revert. If a validation fails mid-flight, the fan-in aborts the declaration (no partial move). Human-in-the-loop happens via `needs_input`.
+**Failure / compensation:** because the change is a **PR**, rollback is a revert. If a validation fails mid-flight, the decision step aborts the declaration (no partial move). Human-in-the-loop happens via `needs_input`.
 
 **Why this is a good kanban CUJ:** genuine cross-cluster coordination (not just parallel independent tasks), a real orchestrator/executor split, an autonomous _decide-to-delegate_, both channels working together (FleetStore trigger → kanban orchestration), and a declarative, reversible outcome. It's the "global capacity orchestrator" concern graduating from a single do-it-all bot to platform-orchestrates / clusters-validate / KCC-executes.
 

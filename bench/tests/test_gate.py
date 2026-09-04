@@ -74,6 +74,7 @@ def _clean_env(monkeypatch):
         "EVAL_JUDGED_MARGIN",
         "EVAL_JUDGED_METRICS",
         "PULL_NUMBER",
+        "RC_COMMIT_SHA",
         "PULL_BASE_SHA",
         "GIT_COMMIT",
         "EVAL_BASELINE_STORE",
@@ -503,6 +504,18 @@ def test_record_refuses_to_run_on_a_pull_request(tmp_path, monkeypatch, capsys):
     store = store_with(tmp_path)
     assert run_record(store, case_file(tmp_path, "a")) == 2
     assert "only runs on main" in capsys.readouterr().err
+    assert list(store.glob("*.jsonl")) == []
+
+
+def test_record_refuses_to_run_on_a_release_candidate(tmp_path, monkeypatch, capsys):
+    """The other way into the same invariant. An RC eval is a periodic with no
+    PULL_NUMBER, so the check above lets it through — and a record written from
+    one cannot be told apart later, because VersionKey carries no field naming
+    the build a sample came from."""
+    monkeypatch.setenv("RC_COMMIT_SHA", "b4ee5f3eb9c2aceb7f03460d2e573278ab9483fe")
+    store = store_with(tmp_path)
+    assert run_record(store, case_file(tmp_path, "a")) == 2
+    assert "release candidate is measured against" in capsys.readouterr().err
     assert list(store.glob("*.jsonl")) == []
 
 

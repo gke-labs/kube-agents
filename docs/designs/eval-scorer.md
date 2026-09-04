@@ -677,6 +677,15 @@ bar upward until nothing could clear it and nothing could fall back below it.
 `hack/ci-eval-pr.sh`, and an independent refusal inside `bench-gate record` when `PULL_NUMBER` is
 set. A guard living only in shell is one careless edit from being gone.
 
+**Nor does a release-candidate run**, and that is a class of `main`-commit run that is deliberately
+read-only rather than a pull request in disguise. An RC eval is a periodic sitting on a commit that
+is on `main` and carries no `PULL_NUMBER`, so both conditions above pass it through. `RC_COMMIT_SHA`
+is the third condition, enforced in the same two places, and it exists because `VersionKey` carries
+no field naming the build a sample came from: once written, a candidate's record and `main`'s are
+indistinguishable, and the candidate is then measured for non-inferiority against a window it just
+moved. `bench/baselines/README.md` is canonical for the rule; this paragraph records why the
+read-only class exists.
+
 Two independent reasons, and the weaker one is the one usually cited. The narrow reason is
 self-admission: a case that wrote its own evidence could be admitted by the very diff that makes it
 pass. The broader reason is that **a branch is not `main`.** The baseline answers "how does this

@@ -305,12 +305,12 @@ hindsight:
         cpu: "4"
         memory: 4Gi
   postgresql:
-    # Upstream publishes only a floating `latest`; the digest is the real pin.
-    # The images.json entry is named hindsight-postgresql, which is where a
-    # mirror holds the copy.
+    # Keep in step with images.json (`make mirror-images` copies from it), where
+    # the entry is named hindsight-postgresql and carries the constraints on
+    # this tag — the pg15 line among them. Read them there before changing it.
     image:
-      repository: docker.io/ankane/pgvector
-      tag: "latest@sha256:956744bd14e9cbdf639c61c2a2a7c7c2c48a9c8cdd42f7de4ac034f4e96b90f8"
+      repository: docker.io/pgvector/pgvector
+      tag: "0.8.6-pg15@sha256:a947c45cdc5906a1bc951f20a8709e321256343ee0f251e4ae00b5e7def4e6da"
       pullPolicy: IfNotPresent
     resources:
       requests:

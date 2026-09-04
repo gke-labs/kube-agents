@@ -300,7 +300,12 @@ class ScanGateTest(unittest.TestCase):
         self.assertIn(bootstrap_scan_gate.RECONCILE_SCRIPT_NAME, body)  # roster first
         self.assertIn("did not cover yourself", body)  # no silent hole
         self.assertIn("kanban_create", body)  # one child per cluster
-        self.assertIn("parents=", body)  # fan-in collects the results
+        # The sweep card waits for its children and synthesizes their results
+        # itself; completing on a dispatch receipt is the #1010 defect, and the
+        # retired aggregation-card handoff must not creep back into the body.
+        self.assertIn("wait for the children", body)
+        self.assertIn("kanban_show", body)
+        self.assertNotIn("aggregation card", body)
         self.assertIn("metadata", body)  # structured child results
 
     def test_roster_command_carries_both_fixes(self):
@@ -558,9 +563,12 @@ class ScanGateTest(unittest.TestCase):
     def test_body_propagates_idempotency_keys_to_the_fan_out(self):
         # The root card is guarded by a marker and a key; the cards it spawns
         # are guarded only by what these instructions tell the worker to set.
+        # (The aggregation card's key went with the fan-in shape, #1010: the
+        # sweep card now waits for its children and writes the findings itself,
+        # so the only spawned cards left are per-cluster and prioritize.)
         body = bootstrap_scan_gate._task_body()
-        self.assertIn(bootstrap_scan_gate.AGGREGATE_IDEMPOTENCY_KEY, body)
         self.assertIn(bootstrap_scan_gate.CLUSTER_IDEMPOTENCY_KEY_PREFIX, body)
+        self.assertIn(bootstrap_scan_gate.PRIORITIZE_IDEMPOTENCY_KEY, body)
 
     def test_parses_task_id_from_either_response_shape(self):
         # --json is what we ask for, but run_slash hands back stdout and stderr

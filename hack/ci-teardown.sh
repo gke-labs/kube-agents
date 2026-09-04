@@ -46,6 +46,26 @@ readonly SECRET_NAME_PREFIX_RE='^secret/'
 readonly CHART_CRD_DIR="charts/kube-agents/crds/"
 readonly CRD_DELETE_TIMEOUT="5m"
 
+# Exit nonzero when any step failed; default off so the Prow wrapper still
+# reaches its Boskos release — the honest signal is the ✗ lines and the final
+# summary. `readonly VAR="${VAR:-default}"` throughout this block: env still
+# overrides, and the step tests lift `readonly ` head lines along.
+readonly CI_TEARDOWN_STRICT="${CI_TEARDOWN_STRICT:-0}"
+
+# Bounds for the sweep deletes in Steps 3 and 4 (Steps 1 and 2 carry their
+# own budgets above). --timeout bounds the wait-for-deletion phase; the
+# request timeout bounds each API call, the phase an unreachable control
+# plane hangs — where the 2026-09-01 incident spent 546s.
+readonly SWEEP_DELETE_TIMEOUT="${CI_TEARDOWN_SWEEP_TIMEOUT:-60s}"
+readonly KUBECTL_REQUEST_TIMEOUT="${CI_TEARDOWN_KUBECTL_REQUEST_TIMEOUT:-30s}"
+
+# Endpoint and owner convention the Prow wrapper leases with
+# (BOSKOS_OWNER="${JOB_NAME}-${BUILD_ID}", oss-test-infra
+# prow/prowjobs/gke-labs/kube-agents/kube-agents-presubmits.yaml), so the
+# heartbeat below arms itself with no wrapper change. If the convention ever
+# changes, beats 401 — one loud daemon line, harmless to the teardown.
+readonly PROW_BOSKOS_DEFAULT_HOST="http://boskos.boskos.svc.cluster.local"
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
 
@@ -78,8 +98,43 @@ if [[ "$CURRENT_CTX" != "$EXPECTED_CTX" ]]; then
   exit 1
 fi
 
+# The Prow wrapper kills its boskosctl heartbeat BEFORE invoking this script
+# (so an orphaned heartbeat cannot 401-spam a released resource), which left
+# every teardown lease-blind against Boskos's ~5m reaper: on 2026-09-01 a
+# 546s CRD delete outlived the window, the pool re-leased the project
+# mid-teardown, and the final release got 401 OwnerNotMatch. The daemon
+# below heartbeats for exactly this script's lifetime; the EXIT trap kills
+# it before the wrapper's release, so the orphan problem cannot come back.
+# Outside Prow (no JOB_NAME/BUILD_ID) nothing is derived and the daemon
+# disables itself with one line; explicit BOSKOS_* env overrides everything.
+if [ -n "${JOB_NAME:-}" ] && [ -n "${BUILD_ID:-}" ]; then
+  export BOSKOS_HOST="${BOSKOS_HOST:-${PROW_BOSKOS_DEFAULT_HOST}}"
+  export BOSKOS_RESOURCE_NAME="${BOSKOS_RESOURCE_NAME:-${PROJECT_ID}}"
+  export BOSKOS_OWNER_NAME="${BOSKOS_OWNER_NAME:-${JOB_NAME}-${BUILD_ID}}"
+fi
+"${SCRIPT_DIR}/boskos_heartbeat.sh" &
+HEARTBEAT_PID=$!
+trap 'kill "${HEARTBEAT_PID}" 2>/dev/null || true' EXIT
+
 START_TIME=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Cleaning Up GKE Resources ==="
+
+# Truthful step accounting: every step still runs on every path (no step may
+# stop the sweep of the ones after it), but a failed step now prints ✗ and is
+# counted instead of being masked by an unconditional ✓. Defined below
+# START_TIME on purpose: the step tests lift the file from that line, and the
+# lifted steps call this function.
+FAILED_STEPS=0
+FAILED_STEP_NAMES=""
+finish_step() { # <name> <exit-status>
+  if [ "$2" -eq 0 ]; then
+    echo "✓ $1 finished in $((SECONDS - STEP_START))s"
+  else
+    echo "✗ $1 FAILED (status $2) after $((SECONDS - STEP_START))s; continuing"
+    FAILED_STEPS=$((FAILED_STEPS + 1))
+    FAILED_STEP_NAMES="${FAILED_STEP_NAMES}${FAILED_STEP_NAMES:+, }$1"
+  fi
+}
 
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 1: Uninstalling the kube-agents release ==="
@@ -112,7 +167,11 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 1: Uninstalling the kube-agent
 # (pkg/action/uninstall.go), which drops them without it, and returns only
 # `failed to delete release: <name>`. That line was all CI recorded for the
 # 25 hours #1172 went unnoticed.
-if ! helm uninstall "${HELM_RELEASE_NAME}" -n "${NAMESPACE}" --wait --timeout "${RELEASE_UNINSTALL_TIMEOUT}" --debug; then
+# --ignore-not-found: the wrapper also runs this script at job start to sweep
+# a hard-killed predecessor, where no release exists and that is not a failure.
+UNINSTALL_STATUS=0
+if ! helm uninstall "${HELM_RELEASE_NAME}" -n "${NAMESPACE}" --wait --timeout "${RELEASE_UNINSTALL_TIMEOUT}" --debug --ignore-not-found; then
+  UNINSTALL_STATUS=1
   if RELEASE_HISTORY_JSON="$(helm history "${HELM_RELEASE_NAME}" -n "${NAMESPACE}" -o json 2>/dev/null)" \
     && grep -Eq "${HELM_DEPLOYED_STATUS_RE}" <<<"${RELEASE_HISTORY_JSON}"; then
     echo "WARNING: helm uninstall failed with a deployed revision still recorded; leaving the release record for the next lease to upgrade over (#1172)"
@@ -125,7 +184,7 @@ if ! helm uninstall "${HELM_RELEASE_NAME}" -n "${NAMESPACE}" --wait --timeout "$
     echo "✓ Release-record fallback deleted ${RECORD_SECRETS_COUNT} Helm record Secret(s)"
   fi
 fi
-echo "✓ Release uninstall finished in $((SECONDS - STEP_START))s"
+finish_step "Release uninstall" "${UNINSTALL_STATUS}"
 
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 2: Deleting CRDs ==="
@@ -140,13 +199,18 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 2: Deleting CRDs ==="
 # a run killed mid-install) is still swept. Unreadable counts as "may survive":
 # keeping a CRD costs one lease's tidiness, deleting one costs the project.
 CRD_STEP_RESULT="deleted"
+# 0 for the outcomes the design intends (deleted, or kept on purpose under a
+# surviving record); 1 for the ones it does not (a timed-out delete, an
+# unreadable record probe), so finish_step counts them into the summary.
+CRD_STEP_STATUS=0
 PROBE_ERROR_LOG="$(mktemp)"
 if RELEASE_RECORD_NAMES="$(kubectl get secret -n "${NAMESPACE}" \
   -l "${HELM_RELEASE_SECRET_SELECTOR}" -o name 2>"${PROBE_ERROR_LOG}")"; then
   if [ -n "${RELEASE_RECORD_NAMES}" ]; then
     echo "WARNING: a ${HELM_RELEASE_NAME} release record survived Step 1; keeping the CRDs so the next lease's Helm can read its own manifest (#1172)"
     CRD_STEP_RESULT="skipped, release record survived Step 1"
-  elif kubectl delete -f "${CHART_CRD_DIR}" --ignore-not-found --timeout "${CRD_DELETE_TIMEOUT}"; then
+  elif kubectl delete -f "${CHART_CRD_DIR}" --ignore-not-found --timeout "${CRD_DELETE_TIMEOUT}" \
+    --request-timeout="${KUBECTL_REQUEST_TIMEOUT}"; then
     CRD_STEP_RESULT="deleted"
   else
     # Bounded rather than hung: the CRDs may be left Terminating, which the
@@ -154,6 +218,7 @@ if RELEASE_RECORD_NAMES="$(kubectl get secret -n "${NAMESPACE}" \
     # now run and the log says which happened.
     echo "WARNING: the CRD delete did not finish within ${CRD_DELETE_TIMEOUT}; continuing so the sweeps still run (#1172)"
     CRD_STEP_RESULT="delete timed out or failed after ${CRD_DELETE_TIMEOUT}"
+    CRD_STEP_STATUS=1
   fi
 else
   # The reason matters and used to go to /dev/null: a missing namespace is a
@@ -161,9 +226,10 @@ else
   # below treats them alike.
   echo "WARNING: could not read the ${HELM_RELEASE_NAME} release records; keeping the CRDs (#1172). kubectl said: $(tr '\n' ' ' <"${PROBE_ERROR_LOG}")"
   CRD_STEP_RESULT="skipped, release records unreadable"
+  CRD_STEP_STATUS=1
 fi
 rm -f "${PROBE_ERROR_LOG}"
-echo "✓ CRD step (${CRD_STEP_RESULT}) finished in $((SECONDS - STEP_START))s"
+finish_step "CRD step (${CRD_STEP_RESULT})" "${CRD_STEP_STATUS}"
 
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 3: Sweeping cluster-scoped kube-agents resources ==="
@@ -184,13 +250,15 @@ echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 3: Sweeping cluster-scoped kub
 # which Step 2 already deletes by file because Helm's crds/ convention installs
 # them unlabelled.
 #
-# One kind per call, each `|| true`: an API group missing from this cluster
-# (ValidatingAdmissionPolicy needs 1.30+) or one flaky delete must not stop
-# the sweep of the kinds that do exist, and nothing here may change the
-# teardown's exit code. This block must stay reachable on every path through
-# the script — steps before it end in `|| true` or run as `if` conditions,
-# and there is no `set -e`; the only early exits are the two
-# must-not-delete-the-wrong-cluster guards above.
+# One kind per call, failures counted but never fatal: an API group missing
+# from this cluster (ValidatingAdmissionPolicy needs 1.30+) or one flaky
+# delete must not stop the sweep of the kinds that do exist. This block must
+# stay reachable on every path through the script — steps before it end in
+# `|| true`, run as `if` conditions, or feed finish_step, and there is no
+# `set -e`; the only early exits are the two must-not-delete-the-wrong-cluster
+# guards above. A failed kind is real, though: on 2026-09-01 the VAP delete
+# was skipped because API discovery failed against a down control plane, and
+# the old unconditional ✓ hid it.
 SWEEP_SELECTOR="app.kubernetes.io/part-of=kube-agents"
 SWEEP_KINDS=(
   validatingadmissionpolicies.admissionregistration.k8s.io
@@ -200,10 +268,34 @@ SWEEP_KINDS=(
   clusterroles.rbac.authorization.k8s.io
   clusterrolebindings.rbac.authorization.k8s.io
 )
-for SWEEP_KIND in "${SWEEP_KINDS[@]}"; do
-  kubectl delete "${SWEEP_KIND}" -l "${SWEEP_SELECTOR}" --ignore-not-found || true
-done
-echo "✓ Cluster-scoped sweep finished in $((SECONDS - STEP_START))s"
+# A kind whose API group this cluster does not serve ("doesn't have a
+# resource type") is counted absent, not failed: VAP needs 1.30+, the
+# cert-manager and managed-collection groups exist only where those are
+# installed, and a permanent ✗ on healthy clusters would teach readers to
+# ignore the one that matters. Any other error is a real failure.
+sweep_kinds() { # <label> <namespace-or-""> <kind...>
+  local label="$1" ns="$2" failed=0 absent=0 total=0 out
+  shift 2
+  for kind in "$@"; do
+    total=$((total + 1))
+    # shellcheck disable=SC2086
+    if out="$(kubectl delete "${kind}" ${ns:+-n "${ns}"} -l "${SWEEP_SELECTOR}" \
+      --ignore-not-found --timeout="${SWEEP_DELETE_TIMEOUT}" \
+      --request-timeout="${KUBECTL_REQUEST_TIMEOUT}" 2>&1)"; then
+      echo "${out}"
+    else
+      echo "${out}"
+      if grep -q "doesn't have a resource type" <<<"${out}"; then
+        absent=$((absent + 1))
+      else
+        failed=$((failed + 1))
+      fi
+    fi
+  done
+  finish_step "${label} (${failed}/${total} kinds failed, ${absent} absent)" "${failed}"
+}
+
+sweep_kinds "Cluster-scoped sweep" "" "${SWEEP_KINDS[@]}"
 
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 4: Sweeping namespaced kube-agents resources ==="
@@ -246,10 +338,14 @@ SWEEP_NAMESPACED_KINDS=(
   issuers.cert-manager.io
   persistentvolumeclaims
 )
-for SWEEP_KIND in "${SWEEP_NAMESPACED_KINDS[@]}"; do
-  kubectl delete "${SWEEP_KIND}" -n "${NAMESPACE}" -l "${SWEEP_SELECTOR}" --ignore-not-found || true
-done
-echo "✓ Namespaced sweep finished in $((SECONDS - STEP_START))s"
+sweep_kinds "Namespaced sweep" "${NAMESPACE}" "${SWEEP_NAMESPACED_KINDS[@]}"
 
 TOTAL_DURATION=$((SECONDS - START_TIME))
-echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Cleanup Complete (Total Duration: ${TOTAL_DURATION}s) ==="
+if [ "${FAILED_STEPS}" -eq 0 ]; then
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Cleanup Complete (Total Duration: ${TOTAL_DURATION}s) ==="
+else
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Cleanup FINISHED WITH ${FAILED_STEPS} FAILED STEP(S): ${FAILED_STEP_NAMES} (Total Duration: ${TOTAL_DURATION}s) ==="
+  if [ "${CI_TEARDOWN_STRICT}" = "1" ]; then
+    exit 1
+  fi
+fi
