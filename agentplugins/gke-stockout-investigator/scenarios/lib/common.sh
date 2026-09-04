@@ -213,7 +213,7 @@ Usage: ./${SCENARIO_SLUG}.sh [options]
                     cluster+namespace+controller is otherwise silently dropped.
   --watch-timeout N Seconds to watch for the investigation (default ${WATCH_TIMEOUT}).
   --emit-manifest F Write the scenario's manifest to F ("-" for stdout) and exit, ready
-                    for `kubectl apply -f`. Includes the namespace and pins the workload
+                    for \`kubectl apply -f\`. Includes the namespace and pins the workload
                     to it, so the file stands alone — useful for launching a scenario by
                     hand, or for reading what a scenario actually deploys.
   --dry-run         Print the manifest and the alert payload; change nothing.
@@ -376,10 +376,12 @@ cleanup_kanban() {
     local out
     if out="$(kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
         python3 -c '
-import json, subprocess, sys
+import json, os, subprocess, sys
 
 route_name = sys.argv[1] if len(sys.argv) > 1 else ""
-cmd_env = {"HOME": "/tmp", "PATH": "/opt/hermes/.venv/bin:/usr/local/bin:/usr/bin:/bin"}
+cmd_env = dict(os.environ)
+cmd_env["HOME"] = "/tmp"
+cmd_env.setdefault("HERMES_HOME", "/opt/data")
 try:
     res = subprocess.run(["hermes", "kanban", "ls", "--json"], env=cmd_env, capture_output=True, text=True, check=True)
     data = json.loads(res.stdout)
@@ -826,7 +828,42 @@ _task_after() {
     # _sessions_json, the program on the other end is not ours to make print elsewhere.
     err="$(mktemp)"
     if ! out="$(kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
-        env HOME=/tmp hermes kanban ls --json 2>"$err")"; then
+        python3 -c '
+import json, os, subprocess, sys
+
+since = float(sys.argv[1]) if len(sys.argv) > 1 else 0.0
+route_name = sys.argv[2] if len(sys.argv) > 2 else ""
+cmd_env = dict(os.environ)
+cmd_env["HOME"] = "/tmp"
+cmd_env.setdefault("HERMES_HOME", "/opt/data")
+
+res = subprocess.run(["hermes", "kanban", "ls", "--json"], env=cmd_env, capture_output=True, text=True)
+if res.returncode != 0:
+    sys.stderr.write(res.stderr)
+    sys.exit(res.returncode)
+
+raw = res.stdout
+data = None
+try:
+    data = json.loads(raw)
+except Exception:
+    start = min([pos for pos in (raw.find("["), raw.find("{")) if pos != -1], default=-1)
+    end = max([pos for pos in (raw.rfind("]"), raw.rfind("}")) if pos != -1], default=-1)
+    if start != -1 and end != -1 and end > start:
+        try:
+            data = json.loads(raw[start:end+1])
+        except Exception:
+            pass
+if data is None:
+    sys.stderr.write(f"kanban ls did not return valid JSON: {raw[:200]}\n")
+    sys.exit(3)
+
+tasks = data.get("tasks") if isinstance(data, dict) else data
+for t in sorted(tasks or [], key=lambda x: x.get("created_at") or 0, reverse=True):
+    if (t.get("created_at") or 0) >= since and str(t.get("title","")).startswith(route_name):
+        print("%s\t%s\t%s" % (t.get("id",""), t.get("status") or "running", (t.get("title") or "")[:70]))
+        break
+' "$since" "$ROUTE_NAME" 2>"$err")"; then
         errtext="$(head -c 200 "$err")"
         rm -f "$err"
         if [[ "$errtext" == *"not found"* || "$errtext" == *"NotFound"* || "$errtext" == *"terminating"* || "$errtext" == *"closed before"* ]]; then
@@ -836,35 +873,7 @@ _task_after() {
         return 0
     fi
     rm -f "$err"
-    printf '%s\n' "$out" | python3 -c "
-import json, sys
-since = float('$since')
-raw = sys.stdin.read()
-data = None
-try:
-    data = json.loads(raw)
-except Exception:
-    start = min([pos for pos in (raw.find('['), raw.find('{')) if pos != -1], default=-1)
-    end = max([pos for pos in (raw.rfind(']'), raw.rfind('}')) if pos != -1], default=-1)
-    if start != -1 and end != -1 and end > start:
-        try:
-            data = json.loads(raw[start:end+1])
-        except Exception:
-            pass
-if data is None:
-    sys.exit(3)
-tasks = data.get('tasks') if isinstance(data, dict) else data
-for t in sorted(tasks or [], key=lambda x: x.get('created_at') or 0, reverse=True):
-    if (t.get('created_at') or 0) >= since and str(t.get('title','')).startswith('${ROUTE_NAME}'):
-        print('%s\t%s\t%s' % (t.get('id',''), t.get('status') or 'running',
-                              (t.get('title') or '')[:70]))
-        break
-" || {
-        # Only the parser's own 3 is a broken read; anything else (a SIGPIPE, an
-        # interpreter that is not there) stays as quiet as it was before.
-        [ "$?" -eq 3 ] && warn_once taskjson "the agent's kanban board did not return JSON; treating it as empty — $(printf '%s' "$out" | head -c 200)"
-        return 0
-    }
+    printf '%s\n' "$out"
 }
 
 _session_after() {

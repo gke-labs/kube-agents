@@ -554,6 +554,20 @@ class CleanStaleKanbanTasksTest(unittest.TestCase):
         self.assertIn("Kanban cleanup failed on pod gw-pod", str(caught.exception))
         self.assertIn("reclaim failed", str(caught.exception))
 
+    def test_clean_stale_kanban_tasks_sets_hermes_home(self):
+        recorded_args = None
+
+        def fake_kubectl(*args, **kwargs):
+            nonlocal recorded_args
+            recorded_args = args
+            return _completed(stdout="0\n")
+
+        with mock.patch.object(sof, "_kubectl", side_effect=fake_kubectl):
+            sof._clean_stale_kanban_tasks("gw-pod", "ns", "gke_stockout_alerts")
+        self.assertIsNotNone(recorded_args)
+        py_script = recorded_args[-2]
+        self.assertIn("HERMES_HOME", py_script)
+
 
 if __name__ == "__main__":
     unittest.main()

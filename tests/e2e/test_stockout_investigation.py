@@ -537,9 +537,11 @@ def _clean_stale_kanban_tasks(pod: str, namespace: str, route_name: str) -> int:
     Returns the count of tasks archived, or raises RuntimeError if cleanup or verification fails.
     """
     py_code = (
-        "import json, subprocess, sys\n"
+        "import json, os, subprocess, sys\n"
         "route_name = sys.argv[1] if len(sys.argv) > 1 else ''\n"
-        "cmd_env = {'HOME': '/tmp', 'PATH': '/opt/hermes/.venv/bin:/usr/local/bin:/usr/bin:/bin'}\n"
+        "cmd_env = dict(os.environ)\n"
+        "cmd_env['HOME'] = '/tmp'\n"
+        "cmd_env.setdefault('HERMES_HOME', '/opt/data')\n"
         "try:\n"
         "    res = subprocess.run(['hermes', 'kanban', 'ls', '--json'], env=cmd_env, capture_output=True, text=True, check=True)\n"
         "    data = json.loads(res.stdout)\n"
@@ -855,7 +857,7 @@ def test_stockout_ingress_alert_smoke(
         pytest.fail("gkestockoutinvestigator AgentPlugin is not active in cluster; ingress smoke test failed.")
 
     agent_ref = os.environ.get("AGENT_REF") or _DEFAULT_AGENT_REF
-    _wait_for_agent_available(agent_ref, agent_namespace)
+    ready_pod = _wait_for_agent_available(agent_ref, agent_namespace)
 
     env = {
         **os.environ,
@@ -881,6 +883,11 @@ def test_stockout_ingress_alert_smoke(
             f"Stockout ingress alert verify.sh timed out after {_SMOKE_VERIFY_TIMEOUT_SECONDS}s:\n"
             f"STDOUT:\n{_as_text(exc.stdout)}\nSTDERR:\n{_as_text(exc.stderr)}"
         )
+    finally:
+        try:
+            _clean_stale_kanban_tasks(ready_pod, agent_namespace, os.environ.get("STOCKOUT_ROUTE", _DEFAULT_ROUTE_NAME))
+        except Exception:
+            pass
     assert proc.returncode == 0, (
         f"Stockout ingress alert verify.sh failed with exit code {proc.returncode}:\n"
         f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
@@ -932,7 +939,7 @@ def test_stockout_scenario(
         pytest.fail("GCP_PROJECT_ID and GKE_CLUSTER_NAME are required for stockout scenario.")
 
     agent_ref = os.environ.get("AGENT_REF") or _DEFAULT_AGENT_REF
-    _wait_for_agent_available(agent_ref, agent_namespace)
+    ready_pod = _wait_for_agent_available(agent_ref, agent_namespace)
 
     env = {
         **os.environ,
@@ -960,6 +967,11 @@ def test_stockout_scenario(
             f"Stockout Scenario '{scenario_slug}' ({rule}) timed out after {scenario_timeout}s:\n"
             f"STDOUT:\n{_as_text(exc.stdout)}\nSTDERR:\n{_as_text(exc.stderr)}"
         )
+    finally:
+        try:
+            _clean_stale_kanban_tasks(ready_pod, agent_namespace, os.environ.get("STOCKOUT_ROUTE", _DEFAULT_ROUTE_NAME))
+        except Exception:
+            pass
     assert proc.returncode == 0, (
         f"Stockout Scenario '{scenario_slug}' ({rule} - {description}) failed with exit code {proc.returncode}:\n"
         f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
