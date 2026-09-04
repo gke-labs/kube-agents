@@ -1,0 +1,210 @@
+✓ Successfully leased project: kube-agents-evals-2
+>>> [2026-08-31T14:48:20Z] launching gpu-stress-test-diagnosis rep 1/3
+>>> [2026-08-31T14:48:25Z] launching autoops-warning-event-triage rep 1/3
+>>> [2026-08-31T14:48:30Z] launching gpu-stress-test-diagnosis rep 2/3
+>>> [2026-08-31T14:48:35Z] launching autoops-warning-event-triage rep 2/3
+<<< [2026-08-31T15:00:24Z] finished gpu-stress-test-diagnosis rep 1 in 724s
+>>> [2026-08-31T15:00:26Z] launching gpu-stress-test-diagnosis rep 3/3
+<<< [2026-08-31T15:06:25Z] finished gpu-stress-test-diagnosis rep 2 in 360s
+>>> [2026-08-31T15:06:26Z] launching autoops-warning-event-triage rep 3/3
+<<< [2026-08-31T15:23:55Z] finished autoops-warning-event-triage rep 1 in 1048s
+>>> [2026-08-31T15:23:57Z] launching rca-remediation-pr rep 1/3
+<<< [2026-08-31T15:28:41Z] finished gpu-stress-test-diagnosis rep 3 in 285s
+>>> [2026-08-31T15:28:42Z] launching compliance-rbac-overgrant rep 1/3
+<<< [2026-08-31T15:31:13Z] finished rca-remediation-pr rep 1 in 436s
+>>> [2026-08-31T15:31:14Z] launching rca-remediation-pr rep 2/3
+<<< [2026-08-31T15:32:07Z] finished autoops-warning-event-triage rep 2 in 205s
+>>> [2026-08-31T15:32:07Z] launching compliance-rbac-overgrant rep 2/3
+<<< [2026-08-31T15:34:27Z] finished rca-remediation-pr rep 2 in 193s
+>>> [2026-08-31T15:34:27Z] launching rca-remediation-pr rep 3/3
+<<< [2026-08-31T15:37:14Z] finished autoops-warning-event-triage rep 3 in 306s
+>>> [2026-08-31T15:37:15Z] launching compliance-rbac-overgrant rep 3/3
+<<< [2026-08-31T15:39:02Z] finished rca-remediation-pr rep 3 in 274s
+>>> [2026-08-31T15:39:05Z] launching consistency-authorized-networks-probe rep 1/3
+<<< [2026-08-31T15:43:21Z] finished compliance-rbac-overgrant rep 1 in 879s
+>>> [2026-08-31T15:43:22Z] launching consistency-authorized-networks-probe rep 2/3
+<<< [2026-08-31T15:45:17Z] finished consistency-authorized-networks-probe rep 1 in 372s
+>>> [2026-08-31T15:45:19Z] launching consistency-authorized-networks-probe rep 3/3
+<<< [2026-08-31T15:48:18Z] finished consistency-authorized-networks-probe rep 3 in 179s
+>>> [2026-08-31T15:48:18Z] launching reliability-pdb-probe rep 1/3
+<<< [2026-08-31T15:51:26Z] finished reliability-pdb-probe rep 1 in 188s
+<<< [2026-08-31T15:51:26Z] finished compliance-rbac-overgrant rep 3 in 485s
+>>> [2026-08-31T15:51:29Z] launching capacity-pinned-pool-probe rep 1/3
+>>> [2026-08-31T15:51:34Z] launching cluster-agent-crashloop-misleading-symptom rep 1/3
+<<< [2026-08-31T16:02:33Z] finished compliance-rbac-overgrant rep 2 in 666s
+>>> [2026-08-31T16:02:34Z] launching cluster-agent-crashloop-evidence-chain rep 1/3
+<<< [2026-08-31T16:04:38Z] finished capacity-pinned-pool-probe rep 1 in 788s
+>>> [2026-08-31T16:04:40Z] launching cluster-agent-healthy-workload-no-finding rep 1/3
+<<< [2026-08-31T16:13:23Z] finished consistency-authorized-networks-probe rep 2 in 1503s
+>>> [2026-08-31T16:13:25Z] launching agent-kanban-smoke rep 1/3
+<<< [2026-08-31T16:19:19Z] finished cluster-agent-crashloop-misleading-symptom rep 1 in 1664s
+>>> [2026-08-31T16:19:21Z] launching security-overgrant-probe rep 1/3
+<<< [2026-08-31T16:22:51Z] finished cluster-agent-crashloop-evidence-chain rep 1 in 1216s
+>>> [2026-08-31T16:22:54Z] launching upgrades-lagging-master-probe rep 1/3
+<<< [2026-08-31T16:25:59Z] finished cluster-agent-healthy-workload-no-finding rep 1 in 1279s
+>>> [2026-08-31T16:26:02Z] launching cost-idle-pool-probe rep 1/3
+<<< [2026-08-31T16:28:12Z] finished agent-kanban-smoke rep 1 in 887s
+>>> [2026-08-31T16:28:13Z] launching obtainability-remediation-proposal rep 1/3
+<<< [2026-08-31T16:36:58Z] finished security-overgrant-probe rep 1 in 1056s
+>>> [2026-08-31T16:36:58Z] launching cluster-agent-crashloop-debug rep 1/3
+<<< [2026-08-31T16:40:06Z] finished upgrades-lagging-master-probe rep 1 in 1032s
+>>> [2026-08-31T16:40:06Z] launching reliability-pdb-probe rep 2/3
+<<< [2026-08-31T16:44:24Z] finished cost-idle-pool-probe rep 1 in 1102s
+>>> [2026-08-31T16:44:27Z] launching capacity-pinned-pool-probe rep 2/3
+<<< [2026-08-31T16:45:25Z] finished obtainability-remediation-proposal rep 1 in 1032s
+>>> [2026-08-31T16:45:26Z] launching cluster-agent-crashloop-misleading-symptom rep 2/3
+<<< [2026-08-31T16:47:48Z] finished cluster-agent-crashloop-debug rep 1 in 649s
+>>> [2026-08-31T16:47:49Z] launching cluster-agent-crashloop-evidence-chain rep 2/3
+<<< [2026-08-31T16:49:23Z] finished reliability-pdb-probe rep 2 in 556s
+>>> [2026-08-31T16:49:24Z] launching cluster-agent-healthy-workload-no-finding rep 2/3
+<<< [2026-08-31T16:51:52Z] finished capacity-pinned-pool-probe rep 2 in 445s
+>>> [2026-08-31T16:51:54Z] launching agent-kanban-smoke rep 2/3
+<<< [2026-08-31T16:51:56Z] finished cluster-agent-crashloop-misleading-symptom rep 2 in 390s
+>>> [2026-08-31T16:51:59Z] launching security-overgrant-probe rep 2/3
+<<< [2026-08-31T16:53:44Z] finished cluster-agent-crashloop-evidence-chain rep 2 in 355s
+>>> [2026-08-31T16:53:46Z] launching upgrades-lagging-master-probe rep 2/3
+<<< [2026-08-31T16:54:14Z] finished cluster-agent-healthy-workload-no-finding rep 2 in 289s
+>>> [2026-08-31T16:54:15Z] launching cost-idle-pool-probe rep 2/3
+<<< [2026-08-31T16:54:29Z] finished agent-kanban-smoke rep 2 in 155s
+>>> [2026-08-31T16:54:32Z] launching obtainability-remediation-proposal rep 2/3
+<<< [2026-08-31T16:57:04Z] finished upgrades-lagging-master-probe rep 2 in 197s
+>>> [2026-08-31T16:57:04Z] launching cluster-agent-crashloop-debug rep 2/3
+<<< [2026-08-31T16:57:13Z] finished security-overgrant-probe rep 2 in 314s
+>>> [2026-08-31T16:57:15Z] launching reliability-pdb-probe rep 3/3
+<<< [2026-08-31T16:58:30Z] finished obtainability-remediation-proposal rep 2 in 238s
+>>> [2026-08-31T16:58:32Z] launching capacity-pinned-pool-probe rep 3/3
+<<< [2026-08-31T16:59:06Z] finished cost-idle-pool-probe rep 2 in 291s
+>>> [2026-08-31T16:59:07Z] launching cluster-agent-crashloop-misleading-symptom rep 3/3
+<<< [2026-08-31T16:59:44Z] finished reliability-pdb-probe rep 3 in 148s
+>>> [2026-08-31T16:59:46Z] launching cluster-agent-crashloop-evidence-chain rep 3/3
+<<< [2026-08-31T17:00:08Z] finished cluster-agent-crashloop-debug rep 2 in 183s
+>>> [2026-08-31T17:00:09Z] launching cluster-agent-healthy-workload-no-finding rep 3/3
+<<< [2026-08-31T17:07:11Z] finished capacity-pinned-pool-probe rep 3 in 518s
+>>> [2026-08-31T17:07:11Z] launching agent-kanban-smoke rep 3/3
+<<< [2026-08-31T17:08:15Z] finished cluster-agent-crashloop-misleading-symptom rep 3 in 547s
+>>> [2026-08-31T17:08:16Z] launching security-overgrant-probe rep 3/3
+<<< [2026-08-31T17:09:26Z] finished cluster-agent-crashloop-evidence-chain rep 3 in 580s
+>>> [2026-08-31T17:09:28Z] launching upgrades-lagging-master-probe rep 3/3
+<<< [2026-08-31T17:09:31Z] finished cluster-agent-healthy-workload-no-finding rep 3 in 562s
+>>> [2026-08-31T17:09:33Z] launching cost-idle-pool-probe rep 3/3
+<<< [2026-08-31T17:11:52Z] finished agent-kanban-smoke rep 3 in 280s
+>>> [2026-08-31T17:11:53Z] launching obtainability-remediation-proposal rep 3/3
+<<< [2026-08-31T17:14:17Z] finished security-overgrant-probe rep 3 in 360s
+>>> [2026-08-31T17:14:19Z] launching cluster-agent-crashloop-debug rep 3/3
+<<< [2026-08-31T17:14:41Z] finished cost-idle-pool-probe rep 3 in 307s
+<<< [2026-08-31T17:15:21Z] finished upgrades-lagging-master-probe rep 3 in 353s
+<<< [2026-08-31T17:16:48Z] finished obtainability-remediation-proposal rep 3 in 295s
+<<< [2026-08-31T17:17:00Z] finished cluster-agent-crashloop-debug rep 3 in 160s
+>>> [2026-08-31T17:17:00Z] Grading Task: reliability-pdb-probe (./tasks/reliability-pdb-probe/task.yaml) x3 <<<
+Task reliability-pdb-probe Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.8 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2026-08-31T17:17:00Z] Grading Task: capacity-pinned-pool-probe (./tasks/capacity-pinned-pool-probe/task.yaml) x3 <<<
+Task capacity-pinned-pool-probe Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.8 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.9 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2026-08-31T17:17:01Z] Grading Task: security-overgrant-probe (./tasks/security-overgrant-probe/task.yaml) x3 <<<
+Task security-overgrant-probe Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2026-08-31T17:17:01Z] Grading Task: upgrades-lagging-master-probe (./tasks/upgrades-lagging-master-probe/task.yaml) x3 <<<
+Task upgrades-lagging-master-probe Result: [UNSTABLE] passed 2 of 3 repetitions (not admitted, so it cannot collapse)
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.8 ToolInvocation=0.0]
+  rep 2: fail -- VerificationCorrectness=0.5 (floor 1.0) -- the-probe-identifies-the-version-lag: none of the alternative phrasings present: ['behind', 'lagging', 'not current', 'out of date', 'outdated', 'one minor', 'newer version'] [OutcomeScore=0.5 OutcomeValidity=0.8 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.8 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2026-08-31T17:17:01Z] Grading Task: consistency-authorized-networks-probe (./tasks/consistency-authorized-networks-probe/task.yaml) x3 <<<
+Task consistency-authorized-networks-probe Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2026-08-31T17:17:02Z] Grading Task: cost-idle-pool-probe (./tasks/cost-idle-pool-probe/task.yaml) x3 <<<
+Task cost-idle-pool-probe Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.8 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.8 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.8 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2026-08-31T17:17:02Z] Grading Task: obtainability-remediation-proposal (./tasks/obtainability-remediation-proposal/task.yaml) x3 <<<
+Task obtainability-remediation-proposal Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2026-08-31T17:17:02Z] Grading Task: rca-remediation-pr (./tasks/rca-remediation-pr/task.yaml) x3 <<<
+Task rca-remediation-pr Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.8 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2026-08-31T17:17:03Z] Grading Task: compliance-rbac-overgrant (./tasks/compliance-rbac-overgrant/task.yaml) x3 <<<
+Task compliance-rbac-overgrant Result: [UNSTABLE] passed 1 of 2 repetitions (not admitted, so it cannot collapse)
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.2 ToolInvocation=0.0]
+  rep 2: infra -- the harness exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): the record is scored, but there is no answer in it to grade [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  rep 3: fail -- VerificationCorrectness=0.0 (floor 1.0) -- ledger-names-the-planted-binding: required phrases absent from the body of gke-agentic/kube-agents-evals-2-infra#4: ['debug-binding']; a-finding-was-filed-against-the-binding: required phrases absent from the 4 finding id(s) on gke-agentic/kube-agents-evals-2-infra#4: ['debug-binding']; an-rbac-overgrant-finding-was-filed: none of the alternative phrasings present in the 4 finding id(s) on gke-agentic/kube-agents-evals-2-infra#4: ['cluster-admin-binding', 'wildcard-rbac'] [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2026-08-31T17:17:03Z] Grading Task: cluster-agent-crashloop-debug (./tasks/cluster-agent-crashloop-debug/task.yaml) x3 <<<
+Task cluster-agent-crashloop-debug Result: [UNSTABLE] passed 2 of 3 repetitions (not admitted, so it cannot collapse)
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.8 ToolInvocation=0.0]
+  rep 2: fail -- VerificationCorrectness=0.0 (floor 1.0) -- rca-names-the-oom: required phrases absent from the report: ['OOMKilled'] [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2026-08-31T17:17:03Z] Grading Task: cluster-agent-crashloop-misleading-symptom (./tasks/cluster-agent-crashloop-misleading-symptom/task.yaml) x3 <<<
+Task cluster-agent-crashloop-misleading-symptom Result: [UNSTABLE] passed 2 of 3 repetitions (not admitted, so it cannot collapse)
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.8 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.8 ToolInvocation=0.0]
+  rep 3: fail -- VerificationCorrectness=0.0 (floor 1.0) -- rca-names-the-oom: required phrases absent from the report: ['OOMKilled']; the-agent-read-past-the-reporters-hypothesis: none of the alternative phrasings present: ['limits.memory', '64mi', '64 mi'] [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2026-08-31T17:17:03Z] Grading Task: cluster-agent-crashloop-evidence-chain (./tasks/cluster-agent-crashloop-evidence-chain/task.yaml) x3 <<<
+Task cluster-agent-crashloop-evidence-chain Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2026-08-31T17:17:04Z] Grading Task: cluster-agent-healthy-workload-no-finding (./tasks/cluster-agent-healthy-workload-no-finding/task.yaml) x3 <<<
+Task cluster-agent-healthy-workload-no-finding Result: [UNSTABLE] passed 2 of 3 repetitions (not admitted, so it cannot collapse)
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: fail -- VerificationCorrectness=0.0 (floor 1.0) -- the-report-states-the-observed-replica-health: none of the alternative phrasings present: ['2/2 running', '2/2 ready', '2 of 2 ready', 'no restarts', 'zero restarts', 'not restarted', 'not restarting', ' 0 restarts', 'not crashlooping', 'no crashloopbackoff', 'not in crashloopbackoff'] [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2026-08-31T17:17:04Z] Grading Task: gpu-stress-test-diagnosis (./tasks/gpu-stress-test-diagnosis/task.yaml) x3 <<<
+Task gpu-stress-test-diagnosis Result: [PASSED] passed all 3 repetitions
+  deployer: tofu
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: admitted by BOOTSTRAP_ADMITTED (transition bridge)
+>>> [2026-08-31T17:17:04Z] Grading Task: agent-kanban-smoke (./tasks/agent-kanban-smoke/task.yaml) x3 <<<
+Task agent-kanban-smoke Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.5]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=1.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.5]
+  admission: no screening evidence for this case yet
+>>> [2026-08-31T17:17:05Z] Grading Task: autoops-warning-event-triage (./tasks/autoops-warning-event-triage/task.yaml) x3 <<<
+Task autoops-warning-event-triage Result: [UNSTABLE] passed 0 of 3 repetitions (not admitted, so it cannot collapse)
+  deployer: tofu
+  rep 1: fail -- VerificationCorrectness=0.75 (floor 1.0) -- triage-offers-lettered-options: required phrases absent from the report: ['Option A'] [OutcomeScore=0.75 OutcomeValidity=0.8 ToolInvocation=1.0]
+  rep 2: fail -- VerificationCorrectness=0.75 (floor 1.0) -- triage-offers-lettered-options: required phrases absent from the report: ['Option A'] [OutcomeScore=0.75 OutcomeValidity=0.8 ToolInvocation=0.8]
+  rep 3: fail -- VerificationCorrectness=0.75 (floor 1.0) -- triage-offers-lettered-options: required phrases absent from the report: ['Option A'] [OutcomeScore=0.75 OutcomeValidity=0.8 ToolInvocation=0.8]
+  admission: no screening evidence for this case yet
+=== [2026-08-31T17:17:05Z] PR Smoke Test Evaluation Succeeded (Total Duration: 8963s) ===

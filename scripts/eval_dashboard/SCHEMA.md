@@ -74,13 +74,62 @@ A build with no `finished.json` is still running and is skipped entirely.
   `PR Smoke Test Evaluation Succeeded/Failed` line (eval loop only). A
   truncated log has no verdict line; then it falls back to
   `finished − started` (which also counts provisioning).
-- `tasks[]` — one entry per `Task <name> Result:` line, in log order:
-  - `result` — `pass` for `[PASSED]`, `fail` for `[FAILED]`, `infra` for
-    `[RESOURCE_PREPARATION_FAILED]` (resource prep, teardown or agent
-    transport failed **before grading**; the case was skipped, not failed).
-  - `duration_s` — from `(Duration: <n>s)`; `null` if missing.
+- `tasks[]` — one entry per `Task <name> Result:` line, in log order (a
+  verdict outside the vocabulary below — only the currently-unreachable
+  `[EXPECTED_FAIL]`, which no `task.yaml` sets — does not parse and yields
+  no entry):
+  - `result` — `pass` for `[PASSED]`, `fail` for `[FAILED]` **and**
+    `[UNSTABLE]` (a multi-repetition case that passed some but not all
+    graded repetitions is not a clean pass; `reps` carries the split),
+    `infra` for `[RESOURCE_PREPARATION_FAILED]` (resource prep, teardown or
+    agent transport failed **before grading**; the case was skipped, not
+    failed).
+  - `duration_s` — from `(Duration: <n>s)`; `null` if missing (always the
+    case for multi-repetition logs, whose verdict lines carry no duration).
   - `outcome_validity` — from `OutcomeValidity recorded: <x>`; `null` when
-    none was recorded (always the case for `infra`).
+    none was recorded (always the case for `infra`, and for
+    multi-repetition logs).
+  - `reps` — **optional, additive**: per-repetition grading detail, one
+    entry per indented `rep N: <verdict> -- <text>` grading line under the
+    task's verdict line, in log order:
+    `{"n": <1-based int>, "result": "pass"|"fail"|"infra", "reason": <string|null>}`.
+    - `result` maps the grading verdict token: `pass` → `pass`; `infra` →
+      `infra`, as is any **non-pass** rep whose line carries the literal
+      `KUBE_AGENTS_INFRA_FAILURE` marker; anything else (`fail`, `blocked`,
+      tokens this collector has never seen) → `fail`.
+    - `reason` — the free text after the first space-padded `--` separator
+      (later separators belong to the reason — fail reasons contain the
+      delimiter themselves), with the trailing `[OutcomeScore=…]` metrics
+      dump stripped, truncated to 300 chars. `null` for passing reps and
+      when nothing remains.
+    - **Omission semantics:** the key is absent — never `[]` — when the log
+      has no `rep N:` grading lines for the task: single-repetition-era
+      builds (branches predating the multi-repetition eval of 2026-08-28;
+      presubmits run branch code, so no calendar date is sharp), logs
+      truncated before grading, and foreign logs. Absence means _unknown_,
+      and consumers must treat a missing `reps` exactly like a missing
+      field, not an empty history. Serial
+      (`--- [<ts>] <task> repetition N/3`) and parallel fan-out
+      (`>>> [<ts>] launching <task> rep N/3`, merged 2026-08-31) runs print
+      the same grading block, so both populate `reps` identically; launch
+      markers alone carry no verdict and never fabricate entries.
+
+- `pr_merged` — **optional, additive**: `true` when the run's `pr` had
+  merged at collection time, `false` when it was open or closed unmerged,
+  `null` when it could not be resolved (no `pr`, `gh` failed, or the run is
+  outside the resolution window below). Absent when the collector ran
+  without a `gh` binary configured; consumers must treat absent and `null`
+  identically (unknown). Resolved best-effort with one
+  `gh pr view <pr> --repo gke-labs/kube-agents --json state,mergedAt` per
+  **distinct** PR per collect invocation, and **only for runs whose build
+  started within the last 14 days** — the depth the dashboard displays —
+  which is what bounds the `gh` spend of one collect however large the
+  archive grows. An older run keeps whatever value it already carries, or
+  gets `null` without a call. Merged is terminal: a run already carrying
+  `true` is never re-asked at any age. Any failure degrades to `null` with
+  a single warning naming how many PRs went unresolved, never a crash, and
+  a missing binary or a timed-out call stops further calls for the rest of
+  the pass.
 
 A truncated log yields a **partial run** (fewer tasks, fallback duration),
 never an error. A task line whose name matches nothing under `bench/tasks/`
@@ -108,6 +157,12 @@ below).
   runs; all three `null` when there are none. Median is rounded to an int.
 - `ov_history` — `{build_id, value}` per run that recorded an
   OutcomeValidity, oldest first.
+- **Known gap:** multi-repetition verdict lines carry no task-level
+  duration or OutcomeValidity, so `durations` and `ov_history` accrue only
+  from single-repetition-era runs and freeze once those age out of the
+  window. Collecting per-rep durations from the per-rep finish markers
+  (`<<< finished <task> rep N in Ss`) is a follow-up; renderers should not
+  present these two as current for repetition-era data.
 
 ### Optional top-level fields
 
@@ -130,9 +185,9 @@ Additive, optional, and safe to omit — consumers must default them.
 
 ### Optional run and task fields
 
-Additive, optional, and safe to omit — consumers must default them. No
-collector version in this tree emits them yet; the renderer already reads
-both.
+Additive, optional, and safe to omit — consumers must default them. The
+collector's derivation rules for both live under `runs[]` above; this is
+what the renderer does with them.
 
 - `runs[].pr_merged` — `true` | `false` | `null`: whether the run's PR has
   merged. The renderer's "agent" band charts only runs where it is `true`
@@ -162,8 +217,11 @@ both.
 ### Incremental collection (the output stays schema v1; it may add the optional `pending_builds`)
 
 - `--merge-with <data.json | gs:// URL>` — load a previously written
-  data.json, carry its `runs[]` over verbatim, and skip every GCS build
-  whose id is ≤ the newest **numeric** `build_id` on record — except the
+  data.json, carry its `runs[]` over (verbatim except `pr_merged`, which
+  is re-resolved on carried runs by the same rules as on fresh ones — a
+  `false`/`null` inside the 14-day window is re-asked, `true` is
+  terminal), and skip every GCS build whose id is ≤ the newest
+  **numeric** `build_id` on record — except the
   ids on the prior's `pending_builds`, which are re-read regardless. Prow
   build ids increase monotonically **by start time**, not by finish time,
   so the watermark alone would permanently skip a build that was still in
@@ -196,3 +254,15 @@ both.
 | 2092688354838581248 | PR 956 — deadline truncated the log, no verdict line |
 | 2093030474753511424 | PR 998 — `RESOURCE_PREPARATION_FAILED` (infra) task  |
 | 2093054394793725952 | PR 998 — full run, pass/fail mix, verdict line       |
+
+These three predate the multi-repetition eval, which is exactly why they
+stay: they pin the omission semantics of `reps` (no grading lines, no key).
+`testdata_reps/` holds three more **real** builds from the repetition era,
+same trimming, covering both launch-marker formats and every rep verdict
+token observed in the wild (`pass`, `fail`, `infra`, `blocked`):
+
+| build               | why it is here                                   |
+| ------------------- | ------------------------------------------------ |
+| 2094432646640701440 | PR 1057 — parallel fan-out, green, one infra rep |
+| 2094467976156680192 | PR 1075 — serial markers, aborted mid-task       |
+| 2094714569262895104 | PR 1089 — blocked/infra-heavy, >300-char reasons |
