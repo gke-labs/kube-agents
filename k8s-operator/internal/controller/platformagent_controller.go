@@ -100,6 +100,8 @@ const (
 		"The k8s-event-watcher is not started, so no cluster warning reaches the agent and no autonomous triage " +
 		"session is created from one; the pod stays Ready regardless. Nothing restores this automatically — set " +
 		"spec.harness.eventWatcher.enabled=true (or remove the field) to start watching again."
+
+	reasonRuntimeClassNotFound = "RuntimeClassNotFound"
 )
 
 // PlatformAgentReconciler reconciles a PlatformAgent object
@@ -288,7 +290,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			rcName := *instance.Spec.Deployment.Availability.RuntimeClassName
 			msg := fmt.Sprintf("RuntimeClass '%s' is not configured in this cluster. For GKE Standard, enable GKE Sandbox by provisioning a gVisor node pool first. In GKE Autopilot, gVisor is supported automatically.", rcName)
 			log.Info(msg)
-			if statusErr := r.updateStatusDegraded(ctx, instance, "RuntimeClassNotFound", msg); statusErr != nil {
+			if err := r.reconcileAgentNetworkGuardrails(ctx, instance, reasonRuntimeClassNotFound); err != nil {
+				return ctrl.Result{}, err
+			}
+			if statusErr := r.updateStatusDegraded(ctx, instance, reasonRuntimeClassNotFound, msg); statusErr != nil {
 				return ctrl.Result{}, statusErr
 			}
 			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
@@ -304,6 +309,9 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	// validateCredentialBrokerSplit.
 	if reason, msg := validateCredentialBrokerSplit(instance); reason != "" {
 		log.Info(msg)
+		if err := r.reconcileAgentNetworkGuardrails(ctx, instance, reason); err != nil {
+			return ctrl.Result{}, err
+		}
 		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg); statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
@@ -376,12 +384,11 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// policy is unconditional because it has nothing to do with either
 		// refusal; it is the Pod's baseline and it predates this field.
 		//
-		// This closes the hazard at the two egress refusals only — this one
-		// and step 10c's. The two refusals above them — step 10's
-		// RuntimeClassNotFound and step 10b's SplitBrokerStrandsEventWatcher —
-		// return without reconciling the gateway policy and still have it.
-		// Issue #964 tracks that; do not read the rule stated here as one the
-		// whole function keeps yet.
+		// All four refusals — step 10's RuntimeClassNotFound, step 10b's
+		// SplitBrokerStrandsEventWatcher, step 10c's layout refusal, and this
+		// one — reconcile network guardrails via reconcileAgentNetworkGuardrails,
+		// ensuring neither the agent gateway policy nor the litellm policy is
+		// stranded when reconciliation pauses at Degraded.
 		if err := r.reconcileAgentNetworkGuardrails(ctx, instance, reason); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -414,6 +421,9 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 	// Reconcile NetworkPolicy
 	if err := r.reconcileNetworkPolicy(ctx, instance, netpolProf, otlpEndpoint, otlpDisabled); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := r.reconcileLiteLLMNetworkPolicy(ctx, instance, netpolProf, otlpEndpoint, otlpDisabled); err != nil {
 		return ctrl.Result{}, err
 	}
 	if err := r.deleteLegacyCredentialIsolationResources(ctx, instance); err != nil {
@@ -497,6 +507,15 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 			return ctrl.Result{}, err
 		}
 		if err := r.cleanupAgentRBAC(ctx, agent, true); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		// Delete managed litellm-policy if present so it is not orphaned.
+		// litellm-policy is managed without an OwnerReference (to avoid premature GC while
+		// the agent is running). When PlatformAgent is finalized (including during helm uninstall's
+		// pre-delete hook), clean up the policy. deleteManagedLiteLLMPolicy only deletes policies
+		// bearing app.kubernetes.io/managed-by: platformagent-controller, preserving user-managed policies.
+		if err := r.deleteManagedLiteLLMPolicy(ctx, agent); err != nil {
 			return ctrl.Result{}, err
 		}
 
@@ -1274,6 +1293,9 @@ func (r *PlatformAgentReconciler) reconcileAgentNetworkGuardrails(ctx context.Co
 	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, agent)
 	netpolProf := r.resolveNetpolProfile(ctx, agent)
 	if err := r.reconcileNetworkPolicy(ctx, agent, netpolProf, otlpEndpoint, otlpSource == otlpSourceNone); err != nil {
+		return err
+	}
+	if err := r.reconcileLiteLLMNetworkPolicy(ctx, agent, netpolProf, otlpEndpoint, otlpSource == otlpSourceNone); err != nil {
 		return err
 	}
 	if !refusalStillRendersTheGuardrail(reason) {
@@ -2114,6 +2136,20 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&networkingv1.NetworkPolicy{}).
 		Owns(&policyv1.PodDisruptionBudget{})
 
+	enqueueAgentsInNamespace := func(ctx context.Context, namespace string) []reconcile.Request {
+		var list agentv1alpha1.PlatformAgentList
+		if err := mgr.GetClient().List(ctx, &list, client.InNamespace(namespace)); err != nil {
+			return nil
+		}
+		var reqs []reconcile.Request
+		for _, agent := range list.Items {
+			reqs = append(reqs, reconcile.Request{
+				NamespacedName: types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name},
+			})
+		}
+		return reqs
+	}
+
 	// Only register AgentPlugin watch if CRD exists in cluster RESTMapper
 	gvk := agentv1alpha1.GroupVersion.WithKind("AgentPlugin")
 	if mgr != nil && mgr.GetRESTMapper() != nil {
@@ -2130,17 +2166,7 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 							{NamespacedName: types.NamespacedName{Namespace: ext.Namespace, Name: ext.Spec.AgentRef}},
 						}
 					}
-					var list agentv1alpha1.PlatformAgentList
-					if err := mgr.GetClient().List(ctx, &list, client.InNamespace(ext.Namespace)); err != nil {
-						return nil
-					}
-					var reqs []reconcile.Request
-					for _, agent := range list.Items {
-						reqs = append(reqs, reconcile.Request{
-							NamespacedName: types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name},
-						})
-					}
-					return reqs
+					return enqueueAgentsInNamespace(ctx, ext.Namespace)
 				}),
 				// Status writes on AgentPlugin come from this controller. Without a
 				// generation filter each of those writes would re-enqueue the agent that
@@ -2194,6 +2220,25 @@ func (r *PlatformAgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 				}
 				return nil
 			}),
+		).
+		Watches(
+			&networkingv1.NetworkPolicy{},
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+				if obj.GetName() != litellmNetworkPolicyName {
+					return nil
+				}
+				return enqueueAgentsInNamespace(ctx, obj.GetNamespace())
+			}),
+		).
+		Watches(
+			&appsv1.Deployment{},
+			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+				if obj.GetName() != litellmDeploymentName {
+					return nil
+				}
+				return enqueueAgentsInNamespace(ctx, obj.GetNamespace())
+			}),
+			builder.WithPredicates(predicate.GenerationChangedPredicate{}),
 		).
 		Named("platformagent").
 		Complete(r)

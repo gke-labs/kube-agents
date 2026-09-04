@@ -423,10 +423,12 @@ Optional, and omitting it is the point: with the field absent the operator disco
 Configures the operator-generated egress `NetworkPolicy`.
 
 - `enabled` (bool, optional) — toggle operator-managed NetworkPolicy generation. Default `true` (unset
-  means on). Setting `false` stops generation and deletes the two policies the operator owns for this
-  agent, `<name>-gateway-netpol` and the `<name>-fqdn-netpol` `FQDNNetworkPolicy`. Both deletions
-  check the owner reference first, so a policy of the same name that the operator did not create
-  survives.
+  means on). Setting `false` stops generation and deletes the policies the operator manages for this
+  agent: `<name>-gateway-netpol`, the `<name>-fqdn-netpol` `FQDNNetworkPolicy`, and the shared
+  `litellm-policy` (if LiteLLM is present). Deletions check ownership / managed labels first, so a
+  policy that the operator did not create survives. To opt only LiteLLM out of operator NetworkPolicy
+  management while keeping the agent pod's policies managed, set the annotation
+  `kubeagents.x-k8s.io/enable-litellm-network-policy: "false"` on the `PlatformAgent`.
 - `dnsClusterIPs` ([]string, optional, max 8 items) — pins the cluster DNS Service ClusterIPs in
   rule 1, suppressing dynamic discovery from `kube-system/kube-dns`. Each entry is a bare IPv4 or
   IPv6 address with no prefix. Admission bounds the IPv4 octets and rejects the leading-zero form
@@ -662,6 +664,7 @@ one reviewable place.
 - On delete, it garbage-collects owned resources.
 - The admission webhook (behind cert-manager) validates the spec before it's persisted; it enforces at most one `PlatformAgent` per project, forbids sensitive environment variable overrides (`API_SERVER_KEY`, `HERMES_HOME`) and privileged containers/volumes (`hostPath`), requires each `imagePullSecrets` entry to name a Secret, and acts as a name-based tripwire against obvious privileged service account names (`cluster-admin`, `system:admin`). Note that full RBAC least-privilege enforcement is handled by controller- and pipeline-level policies rather than the admission webhook.
 - The `kubeagents.x-k8s.io/prevent-deletion: "true"` annotation on a `PlatformAgent` blocks deletion of the resource via the validating webhook (`ValidateDelete`). This serves as an accidental-deletion guardrail rather than an authorization control — `ValidateUpdate` does not block removing the annotation, so any principal with update permissions can patch the annotation off before deleting.
+- The `kubeagents.x-k8s.io/enable-litellm-network-policy: "false"` annotation on a `PlatformAgent` opts the shared `litellm-policy` out of operator reconciliation and deletes any managed copy without affecting the agent pod's own NetworkPolicy.
 - The Helm chart renders and applies the CR (the install engine drives it through `terraform apply`); you can also edit it directly with `kubectl edit`.
 
 ## Where to go next

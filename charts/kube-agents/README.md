@@ -234,18 +234,19 @@ Deployment passes its readiness probe.
 ### Telemetry
 
 `telemetry.otlpEndpoint` (default `""`) is the OTLP/HTTP collector base URL.
-Empty means "do not decide here": the LiteLLM exporter and NetworkPolicy keep
-the GKE Managed OpenTelemetry collector, and the `telemetry` block is omitted
-from the PlatformAgent CR so the operator discovers an in-cluster collector at
-reconcile time. Setting it moves the agent and the policy's egress namespace
-together, and pins the agent so a release can't be internally split. It also
-moves the LiteLLM exporter, but that variable only exists when `litellm.otel=true`
-— off by default, and not turned on by naming a collector.
+Empty means "do not decide here": on default installs (`platformAgent.enabled=true`),
+the operator dynamically discovers an in-cluster collector at reconcile time for
+both agent and LiteLLM NetworkPolicies. When `platformAgent.enabled=false`,
+the LiteLLM exporter and NetworkPolicy keep the GKE Managed OpenTelemetry collector.
+Setting it moves the agent and the policy's egress namespace together, and pins
+the agent so a release can't be internally split. It also moves the LiteLLM exporter,
+but that variable only exists when `litellm.otel=true` — off by default, and not
+turned on by naming a collector.
 
 The egress namespace is read off the endpoint host when it names an in-cluster
-Service. An external endpoint has none to read: with `litellm.otel=true` that
-fails the render, so set `telemetry.collectorNamespace` (or
-`litellm.networkPolicy=false`); with the callback off the rule keeps
+Service. When `platformAgent.enabled=false`, an external endpoint has none to read:
+with `litellm.otel=true` that fails the render, so set `telemetry.collectorNamespace`
+(or `litellm.networkPolicy=false`); with the callback off the rule keeps
 `gke-managed-otel`, since nothing exports through it. Full precedence
 ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/kube-agents/deploy/telemetry/#pointing-at-your-own-collector).
 

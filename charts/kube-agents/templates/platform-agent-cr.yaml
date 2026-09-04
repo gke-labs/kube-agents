@@ -7,6 +7,17 @@ metadata:
   labels:
     app.kubernetes.io/name: {{ .Chart.Name }}
     {{- include "kube-agents.labels" . | nindent 4 }}
+  {{- $annotations := dict }}
+  {{- with .Values.platformAgent.annotations }}
+  {{- $annotations = deepCopy . }}
+  {{- end }}
+  {{- if and .Values.litellm (not .Values.litellm.networkPolicy) }}
+  {{- $_ := set $annotations "kubeagents.x-k8s.io/enable-litellm-network-policy" "false" }}
+  {{- end }}
+  {{- with $annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   harness:
     clusterName: {{ required "platformAgent.harness.clusterName is required" .Values.platformAgent.harness.clusterName | quote }}

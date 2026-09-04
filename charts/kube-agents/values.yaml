@@ -268,7 +268,11 @@ litellm:
       cpu: 500m
       memory: 2Gi
   # NetworkPolicy and GKE managed-Prometheus PodMonitoring for the gateway;
-  # disable podMonitoring off-GKE — the PodMonitoring CRD is GKE-managed, and
+  # when platformAgent.enabled is true (the default), litellm-policy is managed
+  # dynamically by the operator with cluster-discovered DNS VIPs. When
+  # platformAgent.enabled is false, setting networkPolicy: true renders the static
+  # template copy.
+  # Disable podMonitoring off-GKE — the PodMonitoring CRD is GKE-managed, and
   # helm template/lint cannot catch its absence: a non-GKE install fails at
   # apply time.
   networkPolicy: true
@@ -393,6 +397,8 @@ fluentBit:
 platformAgent:
   enabled: true
   name: platform-agent
+  # Annotations to add to the PlatformAgent custom resource metadata.
+  annotations: {}
   harness:
     # Required — the install fails fast when these are left empty.
     clusterName: ""
@@ -585,8 +591,8 @@ platformAgent:
   #
   #   networkPolicy:
   #     enabled: true              # false stops generation and deletes the
-  #                                # operator-owned <name>-gateway-netpol and
-  #                                # <name>-fqdn-netpol
+  #                                # operator-owned <name>-gateway-netpol,
+  #                                # <name>-fqdn-netpol and litellm-policy
   #     dnsClusterIPs: ["10.96.0.10"]
   #     metadataDaemon:
   #       endpoint: "169.254.169.252"  # "" suppresses the post-NAT rule

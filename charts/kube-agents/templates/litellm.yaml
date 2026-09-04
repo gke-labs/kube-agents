@@ -245,7 +245,7 @@ spec:
       port: 80
       targetPort: 8080
   type: ClusterIP
-{{- if .Values.litellm.networkPolicy }}
+{{- if and .Values.litellm.networkPolicy (not .Values.platformAgent.enabled) }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
