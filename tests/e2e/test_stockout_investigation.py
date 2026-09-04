@@ -5,6 +5,7 @@ import os
 import pathlib
 import subprocess
 import time
+import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
@@ -13,6 +14,7 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _PLUGIN_DIR = _REPO_ROOT / "agentplugins" / "gke-stockout-investigator"
 _SCENARIOS_DIR = _PLUGIN_DIR / "scenarios"
 _INSTALL_SCRIPT = _PLUGIN_DIR / "install.sh"
+_CLEAN_KANBAN_SCRIPT = _SCENARIOS_DIR / "lib" / "clean_stale_kanban_tasks.py"
 
 # AgentPlugin object name, Helm release, and Hermes plugin module — one identifier, fixed
 # as RELEASE in install.sh because the CRD's name pattern is ^[a-z][a-z0-9]*$.
@@ -443,6 +445,38 @@ def _agent_home(agent_ref: str, namespace: str) -> str:
     return home or "/opt/data"
 
 
+def _plugin_target_profile(namespace: str) -> str:
+    """Reads targetProfile from the AgentPlugin CR, or empty string if unset."""
+    res = _kubectl(
+        "get", "agentplugins", _PLUGIN_NAME, "-n", namespace,
+        "-o", "jsonpath={.spec.targetProfile}",
+    )
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
+def _plugin_skill_path(
+    agent_ref: str,
+    namespace: str,
+    target_profile: Optional[str] = None,
+) -> str:
+    """Returns the expected in-pod path to the plugin's SKILL.md.
+
+    A targeted profile is staged outside the PVC at /opt/agent-plugins/<profile>/<plugin>
+    and linked to <home>/profiles/<profile>/plugins/<plugin> by the entrypoint; the
+    default profile's plugins are mounted at <home>/plugins/<plugin> directly. The link
+    is what this probes, so the citation is the linker, not the mount:
+    deploy/shared/profile_plugins.py (and pluginMountPath in the operator for the mount).
+    """
+    if target_profile is None:
+        target_profile = _plugin_target_profile(namespace)
+    home = _agent_home(agent_ref, namespace)
+    if target_profile:
+        plugin_root = f"{home}/profiles/{target_profile}/plugins/{_PLUGIN_NAME}"
+    else:
+        plugin_root = f"{home}/plugins/{_PLUGIN_NAME}"
+    return f"{plugin_root}/skills/{_PLUGIN_SKILL_NAME}/SKILL.md"
+
+
 def _verify_skill_mounted(
     agent_ref: str,
     namespace: str,
@@ -462,17 +496,7 @@ def _verify_skill_mounted(
     Called after the rollout wait, so the pod it resolves is the one the tests below will
     use. Returns that pod, so the caller can record which one they inherit.
     """
-    home = _agent_home(agent_ref, namespace)
-    # A targeted profile is staged outside the PVC at /opt/agent-plugins/<profile>/<plugin>
-    # and linked to <home>/profiles/<profile>/plugins/<plugin> by the entrypoint; the
-    # default profile's plugins are mounted at <home>/plugins/<plugin> directly. The link
-    # is what this probes, so the citation is the linker, not the mount:
-    # deploy/shared/profile_plugins.py (and pluginMountPath in the operator for the mount).
-    if target_profile:
-        plugin_root = f"{home}/profiles/{target_profile}/plugins/{_PLUGIN_NAME}"
-    else:
-        plugin_root = f"{home}/plugins/{_PLUGIN_NAME}"
-    skill_path = f"{plugin_root}/skills/{_PLUGIN_SKILL_NAME}/SKILL.md"
+    skill_path = _plugin_skill_path(agent_ref, namespace, target_profile)
     # Both outcomes print a token and the command exits 0, so "the file is absent" and
     # "the exec did not run" stay distinguishable; only the first is conclusive.
     probe = f'test -f "{skill_path}" && echo PRESENT || echo ABSENT'
@@ -531,58 +555,36 @@ def _verify_skill_mounted(
     )
 
 
-def _clean_stale_kanban_tasks(pod: str, namespace: str, route_name: str) -> int:
+def _clean_stale_kanban_tasks(
+    pod: str,
+    namespace: str,
+    route_name: str,
+    fatal: bool = False,
+) -> int:
     """Reclaims and archives any lingering kanban tasks for route_name so slots are open.
 
-    Returns the count of tasks archived, or raises RuntimeError if cleanup or verification fails.
+    Uses the shared clean_stale_kanban_tasks.py script executed inside the platform-agent
+    container. When fatal is True, raises RuntimeError if cleanup encounters an error;
+    when fatal is False (default), logs a warning so transient board races do not fail tests.
     """
-    py_code = (
-        "import json, os, subprocess, sys\n"
-        "route_name = sys.argv[1] if len(sys.argv) > 1 else ''\n"
-        "cmd_env = dict(os.environ)\n"
-        "cmd_env['HOME'] = '/tmp'\n"
-        "cmd_env.setdefault('HERMES_HOME', '/opt/data')\n"
-        "try:\n"
-        "    res = subprocess.run(['hermes', 'kanban', 'ls', '--json'], env=cmd_env, capture_output=True, text=True, check=True)\n"
-        "    data = json.loads(res.stdout)\n"
-        "except Exception as e:\n"
-        "    sys.stderr.write(f'kanban ls failed: {e}\\n')\n"
-        "    sys.exit(1)\n"
-        "tasks = data.get('tasks') if isinstance(data, dict) else data\n"
-        "archived = 0\n"
-        "errors = []\n"
-        "for t in (tasks or []):\n"
-        "    tid = t.get('id')\n"
-        "    title = str(t.get('title', ''))\n"
-        "    status = t.get('status')\n"
-        "    if tid and title.startswith(route_name) and status in ('running', 'claimed', 'ready', 'blocked', 'todo'):\n"
-        "        if status in ('running', 'claimed'):\n"
-        "            rec = subprocess.run(['hermes', 'kanban', 'reclaim', tid], env=cmd_env, capture_output=True, text=True)\n"
-        "            if rec.returncode != 0:\n"
-        "                errors.append(f'reclaim {tid}: {rec.stderr.strip()}')\n"
-        "        arc = subprocess.run(['hermes', 'kanban', 'archive', tid], env=cmd_env, capture_output=True, text=True)\n"
-        "        if arc.returncode != 0:\n"
-        "            errors.append(f'archive {tid}: {arc.stderr.strip()}')\n"
-        "        else:\n"
-        "            archived += 1\n"
-        "verify = subprocess.run(['hermes', 'kanban', 'ls', '--json'], env=cmd_env, capture_output=True, text=True)\n"
-        "if verify.returncode == 0:\n"
-        "    vdata = json.loads(verify.stdout)\n"
-        "    vtasks = vdata.get('tasks') if isinstance(vdata, dict) else vdata\n"
-        "    lingering = [t.get('id') for t in (vtasks or []) if str(t.get('title', '')).startswith(route_name) and t.get('status') in ('running', 'claimed', 'ready', 'blocked', 'todo')]\n"
-        "    if lingering:\n"
-        "        errors.append(f'{len(lingering)} tasks still active: {lingering}')\n"
-        "if errors:\n"
-        "    sys.stderr.write('; '.join(errors) + '\\n')\n"
-        "    sys.exit(1)\n"
-        "print(archived)\n"
-    )
+    if not _CLEAN_KANBAN_SCRIPT.is_file():
+        msg = f"Kanban cleanup script missing at {_CLEAN_KANBAN_SCRIPT}"
+        if fatal:
+            raise RuntimeError(msg)
+        warnings.warn(msg)
+        return 0
+
+    py_code = _CLEAN_KANBAN_SCRIPT.read_text()
     res = _kubectl(
         "exec", "-i=false", "-n", namespace, pod, "-c", "platform-agent", "--",
         "python3", "-c", py_code, route_name,
     )
     if res.returncode != 0:
-        raise RuntimeError(f"Kanban cleanup failed on pod {pod}: {res.stderr or res.stdout}")
+        msg = f"Kanban cleanup failed on pod {pod}: {res.stderr or res.stdout}"
+        if fatal:
+            raise RuntimeError(msg)
+        warnings.warn(msg)
+        return 0
     try:
         return int(res.stdout.strip().splitlines()[-1])
     except (ValueError, IndexError):
@@ -594,6 +596,7 @@ def _wait_for_agent_available(
     namespace: str,
     timeout: int = _AGENT_AVAILABILITY_TIMEOUT_SECONDS,
     clean_kanban: bool = True,
+    target_profile: Optional[str] = None,
 ) -> str:
     """Waits until the platform-agent gateway workload is rolled out, ready, and responsive."""
     kind, workload_name = _gateway_workload(agent_ref, namespace)
@@ -611,14 +614,13 @@ def _wait_for_agent_available(
     # Recompute the deadline so pod readiness and skill mount have their own dedicated budget,
     # rather than sharing a deadline that a slow rollout could exhaust before the probe loop starts.
     deadline = time.time() + timeout
+    skill_path = _plugin_skill_path(agent_ref, namespace, target_profile)
+    probe = f'test -f "{skill_path}" && echo PRESENT || echo ABSENT'
     ready_pod = None
     while time.time() < deadline:
         revision = _current_revision_selector(kind, workload_name, namespace)
         pod, _ = _gateway_pod(agent_ref, namespace, revision)
         if pod:
-            home = _agent_home(agent_ref, namespace)
-            skill_path = f"{home}/profiles/platform/plugins/{_PLUGIN_NAME}/skills/{_PLUGIN_SKILL_NAME}/SKILL.md"
-            probe = f'test -f "{skill_path}" && echo PRESENT || echo ABSENT'
             probe_res = _kubectl("exec", "-i=false", "-n", namespace, pod, "-c", "platform-agent", "--", "sh", "-c", probe)
             if probe_res.returncode == 0 and "PRESENT" in probe_res.stdout:
                 ready_pod = pod
@@ -825,7 +827,12 @@ def ensure_stockout_plugin_installed(
         workload_name,
         budget_deadline,
     )
-    _clean_stale_kanban_tasks(pod, agent_namespace, os.environ.get("STOCKOUT_ROUTE", _DEFAULT_ROUTE_NAME))
+    # Pre-test cleanup: clear any stale kanban tasks from previous runs so concurrency slots
+    # (max_in_progress = 2) are not starved. Non-fatal so a board race or alert arrival during
+    # fixture setup does not error the entire test session.
+    _clean_stale_kanban_tasks(
+        pod, agent_namespace, os.environ.get("STOCKOUT_ROUTE", _DEFAULT_ROUTE_NAME), fatal=False
+    )
     print(f"stockout plugin verified in {pod}; the tests below run against it")
 
 
@@ -884,8 +891,12 @@ def test_stockout_ingress_alert_smoke(
             f"STDOUT:\n{_as_text(exc.stdout)}\nSTDERR:\n{_as_text(exc.stderr)}"
         )
     finally:
+        # Best-effort cleanup: archive tasks created by verify.sh so subsequent scenarios
+        # have open concurrency slots. Non-fatal so cleanup errors do not mask test assertions.
         try:
-            _clean_stale_kanban_tasks(ready_pod, agent_namespace, os.environ.get("STOCKOUT_ROUTE", _DEFAULT_ROUTE_NAME))
+            _clean_stale_kanban_tasks(
+                ready_pod, agent_namespace, os.environ.get("STOCKOUT_ROUTE", _DEFAULT_ROUTE_NAME), fatal=False
+            )
         except Exception:
             pass
     assert proc.returncode == 0, (
@@ -968,8 +979,12 @@ def test_stockout_scenario(
             f"STDOUT:\n{_as_text(exc.stdout)}\nSTDERR:\n{_as_text(exc.stderr)}"
         )
     finally:
+        # Best-effort cleanup: archive tasks created by the scenario script so subsequent
+        # scenarios have open concurrency slots. Non-fatal so cleanup errors do not mask test assertions.
         try:
-            _clean_stale_kanban_tasks(ready_pod, agent_namespace, os.environ.get("STOCKOUT_ROUTE", _DEFAULT_ROUTE_NAME))
+            _clean_stale_kanban_tasks(
+                ready_pod, agent_namespace, os.environ.get("STOCKOUT_ROUTE", _DEFAULT_ROUTE_NAME), fatal=False
+            )
         except Exception:
             pass
     assert proc.returncode == 0, (

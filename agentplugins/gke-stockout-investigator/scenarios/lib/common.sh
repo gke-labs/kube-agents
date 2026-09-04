@@ -373,62 +373,26 @@ preflight() {
 cleanup_kanban() {
     _sync_platform_pod
     [ -n "$PLATFORM_POD" ] || return 0
+    local script_dir clean_script
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    clean_script="${script_dir}/clean_stale_kanban_tasks.py"
+    if [ ! -f "$clean_script" ]; then
+        warn "kanban cleanup script missing: ${clean_script}"
+        return 1
+    fi
     local out
     if out="$(kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
-        python3 -c '
-import json, os, subprocess, sys
-
-route_name = sys.argv[1] if len(sys.argv) > 1 else ""
-cmd_env = dict(os.environ)
-cmd_env["HOME"] = "/tmp"
-cmd_env.setdefault("HERMES_HOME", "/opt/data")
-try:
-    res = subprocess.run(["hermes", "kanban", "ls", "--json"], env=cmd_env, capture_output=True, text=True, check=True)
-    data = json.loads(res.stdout)
-except Exception as e:
-    sys.stderr.write(f"kanban ls failed: {e}\n")
-    sys.exit(1)
-
-tasks = data.get("tasks") if isinstance(data, dict) else data
-archived = 0
-errors = []
-for t in (tasks or []):
-    tid = t.get("id")
-    title = str(t.get("title", ""))
-    status = t.get("status")
-    if tid and title.startswith(route_name) and status in ("running", "claimed", "ready", "blocked", "todo"):
-        if status in ("running", "claimed"):
-            rec = subprocess.run(["hermes", "kanban", "reclaim", tid], env=cmd_env, capture_output=True, text=True)
-            if rec.returncode != 0:
-                errors.append(f"reclaim {tid}: {rec.stderr.strip()}")
-        arc = subprocess.run(["hermes", "kanban", "archive", tid], env=cmd_env, capture_output=True, text=True)
-        if arc.returncode != 0:
-            errors.append(f"archive {tid}: {arc.stderr.strip()}")
-        else:
-            archived += 1
-
-verify = subprocess.run(["hermes", "kanban", "ls", "--json"], env=cmd_env, capture_output=True, text=True)
-if verify.returncode == 0:
-    vdata = json.loads(verify.stdout)
-    vtasks = vdata.get("tasks") if isinstance(vdata, dict) else vdata
-    lingering = [t.get("id") for t in (vtasks or []) if str(t.get("title", "")).startswith(route_name) and t.get("status") in ("running", "claimed", "ready", "blocked", "todo")]
-    if lingering:
-        errors.append(f"{len(lingering)} tasks still active: {lingering}")
-
-if errors:
-    sys.stderr.write("; ".join(errors) + "\n")
-    sys.exit(1)
-
-print(archived)
-' "$ROUTE_NAME" 2>&1)"; then
+        python3 -c "$(< "$clean_script")" "$ROUTE_NAME" 2>&1)"; then
         local count="${out##*$'\n'}"
         if [ "$count" -gt 0 ] 2>/dev/null; then
             ok "archived ${count} stale kanban task(s) for ${ROUTE_NAME}"
         else
             dim "kanban board clean for ${ROUTE_NAME} (0 active tasks)"
         fi
+        return 0
     else
         warn "kanban cleanup encountered an error: ${out}"
+        return 1
     fi
 }
 
@@ -440,7 +404,9 @@ clear_dedup() {
     kmgmt exec -i=false -n "$AGENT_NAMESPACE" "$PLATFORM_POD" -c platform-agent -- \
         rm -f /opt/data/pubsub_registry.json >/dev/null 2>&1 || true
     ok "cleared the adapter dedup registry"
-    cleanup_kanban
+    # Board cleanup is best-effort hygiene before starting a scenario run; if it fails,
+    # warn but proceed so a transient Hermes error does not abort the scenario setup.
+    cleanup_kanban || warn "proceeding despite kanban cleanup failure; slots may remain occupied"
 }
 
 # ------------------------------------------------------------------- the payload
@@ -695,7 +661,9 @@ apply_workload() {
 
 cleanup_workload() {
     step "Cleaning up"
-    cleanup_kanban
+    # Reclaim and archive any active tasks created during this run. Non-fatal so that
+    # k8s workload deletion and PVC cleanup below proceed even if Hermes encounters an error.
+    cleanup_kanban || true
     if ! declare -F scenario_manifest >/dev/null; then
         dim "nothing to remove"; return 0
     fi
