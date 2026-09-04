@@ -22,6 +22,277 @@
 
 set -euo pipefail
 
+# ─── Step 0: self-revalidation against this PR's own green history (#1179) ───
+# A push that changes only inert files re-runs this whole job and aborts the
+# run in flight -- #1127's comment-only push cost a 123-minute re-run. Prow's
+# skip_if_only_changed filter cannot help: it sees the PR's whole diff against
+# the base, not the delta since the last green build. This step applies the
+# same kind of path predicate to the DELTAS instead: find this PR's newest
+# green build in the job history on GCS, recover that build's head and base
+# SHAs, and if everything that changed since -- on the PR side AND on main's
+# side -- matches the inert list, reuse the green verdict and exit 0 before
+# any cluster work.
+#
+# FAIL-CLOSED THROUGHOUT: every doubt -- no history, unreadable GCS, an
+# unparsable record, a commit the checkout does not have, any file escaping
+# the inert list -- is one log line and a full run. The first run on a PR has
+# no green history, so it is always a full run. EVAL_SKIP_REVALIDATION=1 is
+# the escape hatch: it forces a full run for debugging a suspect reuse.
+#
+# One asymmetry is deliberate: the NEWEST GREEN wins, so a newer red full run
+# at inert distance from an older green is overridden on the next inert
+# trigger. That is the same judgement a passing /retest would render -- an
+# inert delta cannot feed the eval, so the red was flake or infrastructure by
+# construction -- but it does mean reproducing such a red needs either a
+# non-inert push or EVAL_SKIP_REVALIDATION=1 in the job env.
+#
+# What it saves, honestly: the Boskos lease, ci-deploy.sh and ci-teardown.sh
+# run BEFORE and AFTER this script in the Prow job wrapper, so a revalidated
+# run still pays the lease + image build + deploy + teardown (~20-30min of a
+# saturated pool's time), not zero -- what it skips is the eval matrix, the
+# ~2h that dominates the job. Hoisting the check ahead of the lease would be
+# an oss-test-infra change; this one is deliberately kube-agents-side only.
+#
+# Trust surface. For the SELF case, subsumption: a pull request that wants
+# its own context green can already edit this script to `exit 0` -- its own
+# code IS the job -- and a PR that edits the revalidation logic touches
+# hack/, which is not inert, so its own run goes full. That argument does
+# NOT cover the CROSS-PR case: the job history under gs://kube-agents-prow
+# is written by pod utilities that may share the test container's identity,
+# so a hostile PR's run could conceivably plant a fabricated "green" record
+# under a VICTIM PR's history path (kube-agents-bot's review of #1186 built
+# the full attack). The GCS records are therefore never trusted alone: a
+# candidate green build counts only when GitHub holds a SUCCESS status
+# event for this job's context on the recovered head whose target URL names
+# that same build id. Statuses are posted by Prow's reporter with
+# repository write permission -- google-oss-prow[bot] -- which no pull
+# request holds, and the events are append-only per build (a later aborted
+# run does not erase an earlier build's success event; verified against
+# #1127's head 50e0f44f). The SHAs are also required to be 40-hex before
+# any git command sees them, so a forged record cannot smuggle arguments.
+#
+# Downstream note: a revalidated run's build log carries no per-task result
+# lines and no final-verdict line. scripts/eval_dashboard/collect.py already
+# tolerates that shape -- aborted runs produce taskless builds today -- and
+# keys nothing on this job exiting through its normal tail.
+
+# The inert-path predicate. This list may be STRICTER than the Prow yaml's
+# skip_if_only_changed (prow/prowjobs/gke-labs/kube-agents/
+# kube-agents-presubmits.yaml in GoogleCloudPlatform/oss-test-infra), and it
+# deliberately lives here rather than being fetched from there: the worst
+# case of the two diverging is an unnecessary full run, never a wrongly
+# skipped one. Keep it root-anchored -- `docs-evil.go` must not match the
+# docs/ branch, `bench/OWNERS` must not match the OWNERS one, and a .md file
+# below the root (agents/**/*.md is prompt content shipped in the image)
+# must still run the eval.
+readonly REVALIDATION_INERT_PATHS='^((docs|\.github|examples)/|[^/]+\.md$|(LICENSE|OWNERS|OWNERS_ALIASES)$)'
+# Where the job history lives and how a human opens a build from the log.
+readonly REVALIDATION_HISTORY_PREFIX="gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents"
+readonly REVALIDATION_JOB_NAME="pull-kube-agents-smoke-test"
+readonly REVALIDATION_SPYGLASS_PREFIX="https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents"
+# The started.json repos key naming this repository's clone record, and the
+# base ref assumed when the decoration did not export PULL_BASE_REF.
+readonly REVALIDATION_REPO_KEY="gke-labs/kube-agents"
+readonly REVALIDATION_DEFAULT_BASE_REF="main"
+# Where the Prow-posted status events live: the attestation that a claimed
+# green build really ran and really passed (see the trust-surface note
+# above). Read with BENCH_GITHUB_TOKEN when the job mounts one, falling back
+# to an anonymous read of the public repo.
+readonly REVALIDATION_STATUS_API="https://api.github.com/repos/gke-labs/kube-agents/commits"
+# How many of the newest builds to inspect for a green one. Each costs one
+# gsutil cat (~1s); an active PR rarely stacks this many pushes between
+# greens, and a bound keeps the fall-through path seconds long.
+readonly REVALIDATION_HISTORY_LIMIT=20
+
+_revalidation_print_delta() { # <label> <range> <files-or-empty>
+  echo "${1} (${2}):"
+  if [ -n "${3}" ]; then
+    printf '%s\n' "${3}" | sed 's/^/    /'
+  else
+    echo "    (empty -- identical trees, trivially inert)"
+  fi
+}
+
+# Returns 0 when the previous green verdict still stands (caller exits 0) and
+# 1 for a full run. Every fall-through path logs exactly one "Step 0: full
+# run:" line naming its reason.
+revalidate_against_green_history() {
+  local repo_dir
+  repo_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+  if [ "${EVAL_SKIP_REVALIDATION:-}" = "1" ]; then
+    echo "Step 0: full run: EVAL_SKIP_REVALIDATION=1 (escape hatch)"
+    return 1
+  fi
+  if [ -z "${PULL_NUMBER:-}" ] || [ -z "${PULL_PULL_SHA:-}" ] || [ -z "${PULL_BASE_SHA:-}" ]; then
+    echo "Step 0: full run: not a decorated Prow presubmit (PULL_NUMBER, PULL_PULL_SHA or PULL_BASE_SHA unset)"
+    return 1
+  fi
+  if ! command -v gsutil >/dev/null 2>&1; then
+    echo "Step 0: full run: no gsutil on PATH to read the job history with"
+    return 1
+  fi
+  # Preflighted like gsutil so a missing interpreter logs its own reason
+  # instead of every finished.json silently classifying as not-green.
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "Step 0: full run: no python3 on PATH to parse the job records with"
+    return 1
+  fi
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "Step 0: full run: no curl on PATH to read the GitHub status attestation with"
+    return 1
+  fi
+
+  local history_dir="${REVALIDATION_HISTORY_PREFIX}/${PULL_NUMBER}/${REVALIDATION_JOB_NAME}"
+  local listing
+  if ! listing="$(gsutil ls "${history_dir}/*/finished.json" 2>/dev/null)"; then
+    echo "Step 0: full run: no finished ${REVALIDATION_JOB_NAME} build for PR #${PULL_NUMBER} (first run on this PR, or GCS unreadable)"
+    return 1
+  fi
+
+  # Newest first: build IDs are numeric and monotonically increasing.
+  local candidates
+  candidates="$(printf '%s\n' "${listing}" | sed -n 's|.*/\([0-9][0-9]*\)/finished\.json$|\1|p' | sort -rn | head -n "${REVALIDATION_HISTORY_LIMIT}")"
+  if [ -z "${candidates}" ]; then
+    echo "Step 0: full run: the job history listing held no parseable build ids"
+    return 1
+  fi
+
+  local build prev_green="" finished
+  while read -r build; do
+    [ -n "${build}" ] || continue
+    finished="$(gsutil cat "${history_dir}/${build}/finished.json" 2>/dev/null)" || continue
+    if printf '%s' "${finished}" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("passed") is True else 1)' 2>/dev/null; then
+      prev_green="${build}"
+      break
+    fi
+  done <<EOF_REVALIDATION_CANDIDATES
+${candidates}
+EOF_REVALIDATION_CANDIDATES
+  if [ -z "${prev_green}" ]; then
+    echo "Step 0: full run: no green build among the newest ${REVALIDATION_HISTORY_LIMIT} ${REVALIDATION_JOB_NAME} builds for PR #${PULL_NUMBER}"
+    return 1
+  fi
+
+  # That build's head and base SHAs, from its started.json clone record:
+  # repos["gke-labs/kube-agents"] reads "main:<base_sha>,<pr>:<head_sha>".
+  local started shas prev_base prev_head
+  if ! started="$(gsutil cat "${history_dir}/${prev_green}/started.json" 2>/dev/null)"; then
+    echo "Step 0: full run: green build ${prev_green} has no readable started.json"
+    return 1
+  fi
+  if ! shas="$(printf '%s' "${started}" | python3 -c '
+import json
+import sys
+
+base_ref, pull, repo_key = sys.argv[1], sys.argv[2], sys.argv[3]
+refs = json.load(sys.stdin)["repos"][repo_key]
+parts = dict(part.split(":", 1) for part in refs.split(","))
+base, head = parts.get(base_ref), parts.get(pull)
+if not base or not head:
+    raise SystemExit(1)
+print(base, head)
+' "${PULL_BASE_REF:-${REVALIDATION_DEFAULT_BASE_REF}}" "${PULL_NUMBER}" "${REVALIDATION_REPO_KEY}" 2>/dev/null)"; then
+    echo "Step 0: full run: could not recover base/head SHAs from green build ${prev_green}'s started.json"
+    return 1
+  fi
+  prev_base="${shas%% *}"
+  prev_head="${shas##* }"
+
+  # Nothing recovered from GCS is trusted yet -- see the trust-surface note
+  # in the header. Three bindings, all fail-closed:
+  #   1. well-formed SHAs, so a forged record cannot smuggle git arguments;
+  #   2. the build's two records agree on the head they claim;
+  #   3. GitHub holds a Prow-posted SUCCESS status event for this job's
+  #      context on that head whose target URL names this very build.
+  local sha
+  for sha in "${prev_base}" "${prev_head}"; do
+    if ! printf '%s' "${sha}" | grep -Eq '^[0-9a-f]{40}$'; then
+      echo "Step 0: full run: build ${prev_green}'s started.json holds a malformed SHA"
+      return 1
+    fi
+  done
+  local finished_revision
+  finished_revision="$(printf '%s' "${finished}" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("revision") or "")' 2>/dev/null)" || finished_revision=""
+  if [ "${finished_revision}" != "${prev_head}" ]; then
+    echo "Step 0: full run: build ${prev_green}'s finished.json revision (${finished_revision:-unreadable}) does not match its started.json head (${prev_head})"
+    return 1
+  fi
+  local statuses curl_auth=()
+  [ -n "${BENCH_GITHUB_TOKEN:-}" ] && curl_auth=(-H "Authorization: Bearer ${BENCH_GITHUB_TOKEN}")
+  statuses="$(curl -fsS --max-time 30 ${curl_auth[@]+"${curl_auth[@]}"} "${REVALIDATION_STATUS_API}/${prev_head}/statuses?per_page=100" 2>/dev/null)" \
+    || statuses="$(curl -fsS --max-time 30 "${REVALIDATION_STATUS_API}/${prev_head}/statuses?per_page=100" 2>/dev/null)" \
+    || { echo "Step 0: full run: could not read GitHub statuses for ${prev_head} to attest green build ${prev_green}"; return 1; }
+  if ! printf '%s' "${statuses}" | python3 -c '
+import json
+import sys
+
+context, build = sys.argv[1], sys.argv[2]
+needle = "/" + context + "/" + build
+for status in json.load(sys.stdin):
+    if (
+        status.get("context") == context
+        and status.get("state") == "success"
+        and needle in (status.get("target_url") or "")
+    ):
+        sys.exit(0)
+sys.exit(1)
+' "${REVALIDATION_JOB_NAME}" "${prev_green}" 2>/dev/null; then
+    echo "Step 0: full run: GitHub holds no ${REVALIDATION_JOB_NAME} success status on ${prev_head} naming build ${prev_green} -- refusing to trust the GCS record alone"
+    return 1
+  fi
+
+  # Both previous SHAs must exist locally. The decorated checkout normally
+  # has them (they are ancestors of the current base and head); a force-push
+  # can orphan prev_head, so try one fetch from origin -- the clonerefs
+  # remote for this repository, never anywhere else -- then fail closed.
+  for sha in "${prev_base}" "${prev_head}"; do
+    if ! git -C "${repo_dir}" cat-file -e "${sha}^{commit}" 2>/dev/null; then
+      git -C "${repo_dir}" fetch --quiet origin "${sha}" 2>/dev/null || true
+      if ! git -C "${repo_dir}" cat-file -e "${sha}^{commit}" 2>/dev/null; then
+        echo "Step 0: full run: commit ${sha} from green build ${prev_green} is not in this checkout"
+        return 1
+      fi
+    fi
+  done
+
+  # --no-renames is load-bearing: with rename detection (git's default) a
+  # `git mv hack/tool.sh docs/tool.md` lists ONLY the inert destination, and
+  # the deletion of the non-inert source becomes invisible to the predicate.
+  # Disabling it makes every rename a delete + add, so the non-inert side
+  # always surfaces.
+  local head_delta base_delta
+  if ! head_delta="$(git -C "${repo_dir}" diff --no-renames --name-only "${prev_head}" "${PULL_PULL_SHA}" 2>/dev/null)"; then
+    echo "Step 0: full run: git diff ${prev_head}..${PULL_PULL_SHA} failed"
+    return 1
+  fi
+  if ! base_delta="$(git -C "${repo_dir}" diff --no-renames --name-only "${prev_base}" "${PULL_BASE_SHA}" 2>/dev/null)"; then
+    echo "Step 0: full run: git diff ${prev_base}..${PULL_BASE_SHA} failed"
+    return 1
+  fi
+
+  # The predicate: EVERY file in BOTH deltas matches the inert list. An empty
+  # delta (identical SHAs) is trivially inert -- nothing changed on that side.
+  local survivors
+  survivors="$(printf '%s\n%s\n' "${head_delta}" "${base_delta}" | grep -v '^$' | grep -Ev "${REVALIDATION_INERT_PATHS}" || true)"
+  if [ -n "${survivors}" ]; then
+    echo "Step 0: full run: files outside REVALIDATION_INERT_PATHS changed since green build ${prev_green}:"
+    printf '%s\n' "${survivors}" | sed 's/^/    /'
+    return 1
+  fi
+
+  echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Step 0: REVALIDATED against green build ${prev_green} -- every change since is inert, skipping the eval matrix ==="
+  echo "Reused verdict: ${REVALIDATION_SPYGLASS_PREFIX}/${PULL_NUMBER}/${REVALIDATION_JOB_NAME}/${prev_green}"
+  echo "Attested by the Prow-posted ${REVALIDATION_JOB_NAME} success status on ${prev_head}"
+  _revalidation_print_delta "head delta" "${prev_head}..${PULL_PULL_SHA}" "${head_delta}"
+  _revalidation_print_delta "base delta" "${prev_base}..${PULL_BASE_SHA}" "${base_delta}"
+  echo "Predicate: every file above matches REVALIDATION_INERT_PATHS ${REVALIDATION_INERT_PATHS}"
+  return 0
+}
+
+if revalidate_against_green_history; then
+  exit 0
+fi
+
 # ─── Step timing profiler ────────────────────────────────────────────────────
 # Contiguous named spans: each profile_begin closes the previous span and opens
 # the next, so the report's percentages always sum to 100% of the wall clock
@@ -1219,79 +1490,21 @@ print(m.group(1).strip('\'\"') if m else '')
 " "$1" 2>/dev/null || echo ""
 }
 
-# The transition bridge. bench/baselines/ ships EMPTY, so no case is admitted
-# and nothing can reach the collapse rung -- which would mean the presubmit
-# blocks on nothing for as long as screening takes. Cases named here keep their
-# old blocking behaviour meanwhile.
+# The transition bridge: cases named here keep the old blocking behaviour
+# while bench/baselines/ ships empty -- they arm rung 4, leave rung 6 quiet,
+# and screening replaces them. Comma- or whitespace-separated task ids;
+# bench-gate's _bootstrap_admitted() accepts either.
 #
-# It is a bridge and not a destination: a bootstrap-admitted case has no
-# measured evidence, so it arms rung 4 but leaves rung 6 quiet and contributes
-# nothing to main's side of the aggregate. Screening replaces it.
+# The prose about this roster -- the admission bar, who is held out and on
+# which issue, the rung scoping, the demotion protocol -- lives in
+# docs/eval-gate-roster.md, deliberately: docs/ edits are inert to the eval
+# (the Prow path filter and step 0 above both skip them), so a review
+# finding against that prose no longer costs a 2-hour run (#1179). Edit the
+# list here, the prose there.
 #
-# This roster is what blocks a pull request once the Prow job stops being
-# optional. Ten of the eighteen active cases are admitted: the ones
-# whose recent record shows failures only on their own regressions or on
-# infra classes the harness already excludes from the verdict. The rest
-# cannot red one on a GRADED failure: four are held out below with named
-# exits, and the three obtainability activations (#1049) simply run
-# unadmitted while they earn a record. Held-out cases still run and
-# report on every pull request. The scope of that promise is rungs
-# 4 and 6: rungs 1-3 (a forbidden mutation, an erroring check, a record
-# that is not a real run) stay blocking for every case by design,
-# admitted or not -- see grade_case, which evaluates them before it reads
-# admission. security-overgrant-remediation-proposal (#1066) is simply
-# new: it earns its record like any case, then enters. The other four
-# each have a filed issue naming the exit condition:
-#
-#   capacity-pinned-pool-probe            -- #1010: worker completes its
-#     card at fan-out ("Awaiting synthesis" as the final answer). The
-#     failure is correlated across repetitions when the agent chooses to
-#     fan out, so the collapse rule does not absorb it. Enters when the
-#     fix merges.
-#   cluster-agent-healthy-workload-no-finding -- #1010: the delegation
-#     receipt is graded as the answer, 51 of 156 recorded repetitions.
-#     #1100 held this seat until its own sweep closed it: the agent
-#     invents nothing here, so the false-positive premise is gone and
-#     the reason for the hold is not. Still main's own trait, so a
-#     collapse would tax an innocent PR. Enters when #1010's fix merges
-#     or when rung-6 screening can compare against main.
-#   autoops-warning-event-triage          -- #1101; NOTE 2026-09-03: no
-#     longer in presubmit TASKS at all (tofu wall clock, #1218) -- it
-#     runs and accrues record via the nightly tier once that exists.
-#     Original hold-out rationale: 0/5 graded repetitions
-#     on record; admitting it reds every pull request today. Enters when
-#     the lettered-options bar is settled and it has a clean record.
-#   compliance-rbac-overgrant             -- #1171: demoted 2026-09-02
-#     after rung-4 collapses on unrelated pull requests (#1153 was red on
-#     this case alone). The fleet-audit delegation chain is degraded:
-#     audits go partial on what the agent reports as "access
-#     limitations", skipping check 2.4 (the cluster-admin-binding check
-#     this case grades), and some runs publish no ledger at all -- so the
-#     collapse is the environment's, not the diff's. Enters when #1171's
-#     re-admission bar holds: delegation fixed and a clean 3-day graded
-#     record.
-#   rca-remediation-pr                    -- #1189: demoted 2026-09-02
-#     evening after rung-4 collapses on six unrelated pull requests in
-#     one day. The suite's longest delegation chain, so it integrates
-#     over every environment fault in its window: the #1097 429 storms,
-#     the #1144 proxy EACCES (fix #1183), and #1184's gap (infra-blocked
-#     repetitions graded rather than classified) turn one dirty window
-#     into a correlated collapse. Its own record was 12/13 clean before
-#     the storms. Enters when #1189's re-admission bar holds.
-#
-# If an admitted case reds a pull request its diff cannot explain on a
-# graded failure, demote it here and reference its issue. Demotion is a
-# one-line same-day edit to this list -- this file, not the Prow config,
-# is deliberately the fast lever. It is the lever for rung-4 reds ONLY: a
-# rung-1-3 red (mutation, erroring verifier, an empty record on a task
-# that provisions nothing -- a record whose deployer died before any
-# agent ran grades INFRA and reds nobody) does not stop when its case
-# leaves this list, because those classes signal a broken case or
-# install, not flake, and the fix is on that side.
-#
-# agent-kanban-smoke earned its seat back after the 08-27 redesign (a real
-# SRE question graded on kanban_create plus cluster names); the reds that
-# once argued for un-arming it belonged to the old vocabulary check.
+# Demoting a flaky case is a one-line same-day edit: delete its name from
+# this list, referencing the issue that names its re-admission condition.
+
 export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,cluster-agent-crashloop-debug,cluster-agent-crashloop-misleading-symptom,cluster-agent-crashloop-evidence-chain,agent-kanban-smoke}"
 
 # Where the evidence itself lives. Unset means bench/baselines/ in the

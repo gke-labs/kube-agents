@@ -354,7 +354,8 @@ three repetitions each — and has been merge-blocking since 2026-09-02
 against a 360-minute ceiling — and a new push restarts it, so open the pull request early and
 batch changes rather than stacking pushes. Another pull request merging usually does not — the
 green status is re-pinned to `main`'s new head
-([how a change merges](docs/pull-request-workflow.md#how-a-change-merges)).
+([how a change merges](docs/pull-request-workflow.md#how-a-change-merges)); a push whose whole
+delta is inert paths (`REVALIDATION_INERT_PATHS`) reuses the prior green via step 0.
 
 Two things red it. A case on the `BOOTSTRAP_ADMITTED` roster in `hack/ci-eval-pr.sh` fails **all**
 of its repetitions — one failed repetition out of three does nothing on its own. Or any case,
@@ -363,7 +364,8 @@ instead of running, or a record whose liveness signals are inconsistent (one sho
 all is excluded as infrastructure instead, #1184). Repetitions classified as
 infrastructure failures are excluded from the verdict automatically, unless every case hits one —
 a suite that evaluated nothing reds rather than reporting green. The roster is the source of truth
-for what is admitted, the comment above it for how a flaky case is demoted, and
+for what is admitted, [`docs/eval-gate-roster.md`](docs/eval-gate-roster.md) for who is held out
+and how a flaky case is demoted, and
 [`docs/designs/testing-strategy.md`](docs/designs/testing-strategy.md) §4.2 for the full verdict
 ladder.
 
