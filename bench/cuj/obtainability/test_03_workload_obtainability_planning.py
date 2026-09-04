@@ -8,8 +8,10 @@ from typing import Any
 
 from cuj.utils.acceptance_criteria import AcceptanceCriteria, AcceptanceCriterion
 from cuj.utils.interaction import (
+    latest_artifact,
     projected_records,
     projected_tasks,
+    substantive_output,
     tool_operations,
     unnormalized_tool_calls,
 )
@@ -163,15 +165,7 @@ def _completed_records(
 def _artifact(
     artifacts: list[dict[str, Any]], kind: str
 ) -> dict[str, Any] | None:
-    return next(
-        (
-            item
-            for item in artifacts
-            if isinstance(item.get("manifest"), dict)
-            and item["manifest"].get("kind") == kind
-        ),
-        None,
-    )
+    return latest_artifact(artifacts, kind=kind)
 
 
 def _mapping(value: Any) -> dict[str, Any]:
@@ -343,7 +337,7 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         and created_at <= top_start
         and top_start + JOB_DURATION <= created_at + PLANNING_HORIZON
     )
-    final_output = str(interaction.get("output") or "")
+    final_output = substantive_output(interaction)
     recommended_in_output = (
         bool(top)
         and str(top.get("zone") or "") in final_output

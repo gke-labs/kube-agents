@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 import time
 import urllib.parse
 import uuid
@@ -36,6 +38,12 @@ class InteractionRunner:
         portal = Portal(self.config.endpoint, token=portal_token())
         interaction = portal.post("interactions", request)
         self.log.record("interaction", {"poll": 0, "value": interaction})
+        # Polling repeats the whole projection every couple of seconds, and
+        # an unchanged repeat says nothing a reader needs: a 15-minute run
+        # wrote 275 KB of near-identical payloads and buried the four moments
+        # that mattered. Only transitions are recorded from here, plus the
+        # terminal state, which the summary and every evaluator read.
+        previous = json.dumps(interaction, sort_keys=True, default=str)
         interaction_id = str(interaction.get("interactionId") or "")
         if not interaction_id:
             raise PortalError("portal response did not include interactionId")
@@ -62,11 +70,15 @@ class InteractionRunner:
                     f"interactions/{urllib.parse.quote(interaction_id, safe='')}"
                 )
             poll += 1
-            self.log.record(
-                "interaction",
-                {"poll": poll, "value": interaction},
-            )
+            current = json.dumps(interaction, sort_keys=True, default=str)
+            if current != previous:
+                self.log.record(
+                    "interaction",
+                    {"poll": poll, "value": interaction},
+                )
+                previous = current
 
+        self.log.record("interaction_final", {"poll": poll, "value": interaction})
         return interaction
 
 
@@ -127,6 +139,80 @@ def tool_operations(
         for call in projected_tool_calls(interaction)
         if not completed_only or call.get("status") == "completed"
     ]
+
+
+#: The hand-off Kage is told to send, verbatim from agents/chat/SOUL.md §4:
+#:
+#:     > 🔀 Delegated to the **<agent-name>** agent
+#:
+#:     I've started this as task `<task_id>`. The answer will post into this
+#:     thread as soon as it's ready.
+#:
+#: Matching has to survive that formatting — the agent name arrives wrapped in
+#: bold markers and the task id in backticks — and must not fire on a report
+#: that merely cites its own task id. Every branch therefore pairs hand-off
+#: phrasing with the thing handed off.
+_DELEGATION_ACK = re.compile(
+    r"\bdelegat(?:ed|ing)\b[^.\n]{0,60}\b\**\w[\w-]*\**\s+agent\b"
+    r"|\b(?:started|routed|assigned|handed off)\b[^.\n]{0,80}"
+    r"\btask\s+[`'\"]?t_[0-9a-f]+"
+    r"|\b(?:answer|results?|report)\b[^.\n]{0,60}\bwill post\b"
+    r"|\bwill post\b[^.\n]{0,60}\b(?:thread|here)\b",
+    re.IGNORECASE,
+)
+
+
+def substantive_output(interaction: dict[str, Any]) -> str:
+    """The user-visible answer with leading delegation acknowledgments removed.
+
+    Acknowledgments are dropped sentence by sentence rather than paragraph by
+    paragraph: a coordinator that opens its answer with "Delegated to the
+    platform agent. Here is the design: ..." must keep the design, while an
+    interaction that only ever acknowledged returns the empty string — that
+    silence is the finding, not something to paper over.
+    """
+
+    text = str(interaction.get("output") or "")
+    kept: list[str] = []
+    skipping = True
+    for paragraph in re.split(r"\n\s*\n", text):
+        if not skipping:
+            kept.append(paragraph)
+            continue
+        sentences = re.split(r"(?<=[.!?])\s+", paragraph.strip())
+        remainder = list(sentences)
+        while remainder and _DELEGATION_ACK.search(remainder[0]):
+            remainder.pop(0)
+        if remainder:
+            skipping = False
+            kept.append(" ".join(remainder))
+    return "\n\n".join(kept).strip()
+
+
+def latest_artifact(
+    artifacts: list[dict[str, Any]],
+    *,
+    kind: str = "",
+    artifact_type: str = "",
+) -> dict[str, Any] | None:
+    """The most recent artifact matching a manifest kind and/or record type.
+
+    Latest wins: a worker that attaches a corrected manifest supersedes its
+    earlier attempt, exactly as a re-uploaded file would. Both CUJ scenarios
+    read artifacts through this, so they cannot grade the same recorder
+    behavior in opposite directions.
+    """
+
+    for artifact in reversed(artifacts):
+        manifest = artifact.get("manifest")
+        if not isinstance(manifest, dict):
+            continue
+        if kind and manifest.get("kind") != kind:
+            continue
+        if artifact_type and artifact.get("type") != artifact_type:
+            continue
+        return artifact
+    return None
 
 
 def unnormalized_tool_calls(interaction: dict[str, Any]) -> list[str]:
