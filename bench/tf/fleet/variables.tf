@@ -31,9 +31,14 @@ variable "cluster_prefix" {
 }
 
 variable "fleet_reader_token_creators" {
-  description = "IAM members that may mint an access token as the seeded-fleet reader service account, in `serviceAccount:...`/`user:...`/`group:...` form. This is the eval project's Prow runner identity: hack/fleet-kubeconfigs.sh calls `gcloud auth print-access-token --impersonate-service-account` as that identity, so without an entry here the runner cannot assume the read-only account and falls back to its own cluster-admin credential (loudly). Empty by default so a project can adopt the stack before its runner identity is known."
+  description = "IAM members that may mint an access token as the seeded-fleet reader service account, in `serviceAccount:...`/`user:...`/`group:...` form. This is the eval project's Prow runner identity: hack/fleet-kubeconfigs.sh calls `gcloud auth print-access-token --impersonate-service-account` as that identity, so without an entry here the runner cannot assume the read-only account and falls back to its own cluster-admin credential (loudly). Defaults to that identity -- the same account in every pool project. Override it when applying this stack outside the CI pool."
   type        = list(string)
-  default     = []
+
+  # Defaulted, not passed by the caller: the resource is keyed by member, so an
+  # apply that omits it destroys the binding -- a hand-run apply to repair a fixture
+  # would silently drop the project back to the runner's write credential
+  # (gke-labs/kube-agents#1051).
+  default = ["serviceAccount:prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com"]
 
   # A bare email here applies cleanly and grants nothing: the IAM API treats an
   # unprefixed member as invalid, and the mistake would only surface as the

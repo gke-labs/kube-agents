@@ -415,16 +415,17 @@ echo "✓ Cluster authentication finished in $((SECONDS - STEP_START))s"
 # explicitly-set value still wins, for a laptop pointing at a fleet it does not
 # own.
 #
-# Only half of this is in the repository. The other half is the token-creator
-# grant -- `fleet_reader_token_creators` in bench/tf/fleet/variables.tf, empty
-# by default -- which is a per-project `tofu apply` a human has to do, naming
-# that project's Prow runner identity. Until it is done in a leased project,
+# The other half is the token-creator grant -- `fleet_reader_token_creators`
+# in bench/tf/fleet/variables.tf, which now defaults to the Prow runner, so an
+# apply of that stack grants it. A project whose fleet was applied before that
+# default landed still lacks it, and there
 # `gcloud auth print-access-token --impersonate-service-account` fails,
 # fleet-kubeconfigs.sh warns per cluster, and the role kubeconfigs keep the
 # runner's own read-write credential. That is a privilege gap on a fleet every
 # open PR shares, not a functional one: the files are still written, still
 # point at the right seeded cluster, and every check still grades the right
-# object. See bench/tf/fleet/README.md, "A read-only credential for
+# object. `scripts/verify_ci_pool_project.py` fails a project missing the
+# binding. See bench/tf/fleet/README.md, "A read-only credential for
 # evaluations".
 export FLEET_READONLY_SA="${FLEET_READONLY_SA:-seeded-fleet-reader@${PROJECT_ID}.iam.gserviceaccount.com}"
 
