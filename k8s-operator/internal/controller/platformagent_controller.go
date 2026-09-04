@@ -382,11 +382,12 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// until the spec is fixed, and with nothing selecting the agent Pod
 		// NetworkPolicy permits all egress — so the outcome is wide-open egress
 		// behind a Degraded status that names only the allowlist. The gateway
-		// policy is unconditional because it has nothing to do with either
+		// policy is unconditional because it has nothing to do with any
 		// refusal; it is the Pod's baseline and it predates this field.
 		//
-		// All refusal paths above (steps 10, 10b, 10c, 10e) maintain the agent
-		// Pod's network guardrails before returning.
+		// All refusal paths above (steps 10, 10b, 10c, 10e) maintain the gateway
+		// NetworkPolicy, and maintain the egress default-deny guardrail whenever
+		// the egress policy layout is valid (split broker enabled).
 		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance, reason)
 		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg); statusErr != nil {
 			return ctrl.Result{}, statusErr
@@ -1182,12 +1183,20 @@ const (
 // refusalStillRendersTheGuardrail reports whether the egress policy should be
 // reconciled despite the agent's spec being refused.
 //
-// The distinction is between refusing a layout and refusing a value. A refused
-// value leaves a perfectly good policy to render — the builder has already
-// dropped the offending destination — and withholding it would mean the
-// operator's mistake in one field silently removes the whole control.
-func refusalStillRendersTheGuardrail(reason string) bool {
-	return reason == reasonEgressAllowlistRefused
+// The distinction is between refusing a layout and refusing a value or another
+// subsystem. Refusing the layout (EgressPolicyRequiresSplitBroker) means the
+// policy cannot be rendered at all because the broker is not split and would
+// lose the metadata server. Refusing a value (EgressAllowlistRefused), or
+// refusing another spec field (RuntimeClassNotFound, SplitBrokerStrandsEventWatcher)
+// when the egress policy layout is valid (split broker enabled), leaves a
+// valid policy to render — and withholding it would mean an unrelated or
+// value mistake silently removes the egress guardrail.
+func refusalStillRendersTheGuardrail(agent *agentv1alpha1.PlatformAgent, reason string) bool {
+	if reason == reasonEgressPolicyRequiresSplitBroker {
+		return false
+	}
+	layoutReason, _ := validateEgressPolicyLayout(agent)
+	return layoutReason == ""
 }
 
 // validateEgressPolicy returns a Degraded reason and message when
@@ -1264,28 +1273,31 @@ func validateEgressAllowlist(agent *agentv1alpha1.PlatformAgent) (string, string
 }
 
 // reconcileAgentNetworkGuardrails keeps the agent Pod's NetworkPolicies
-// maintained on a reconcile that is about to bail out over its egress spec.
+// maintained on a reconcile that is about to bail out over a spec refusal.
 //
 // A refusal withholds the workload. It must not also withhold a guardrail,
 // because a guardrail that stops being reconciled is a guardrail an operator
 // can delete permanently — and deleting every policy that selects the agent
 // Pod does not leave it restricted, it leaves NetworkPolicy permitting all
 // egress. That the CR reads Degraded at the time makes it worse rather than
-// better: the status names one bad CIDR while the Pod's egress is wide open.
+// better: the status names a refusal reason while the Pod's egress is wide open.
 //
-// <name>-gateway-netpol is reconciled whatever the refusal was. It is the
-// Pod's baseline policy, it predates spec.security.egressPolicy, and neither
-// refusal is an objection to it. <name>-sandbox-metadata-deny is reconciled
-// only when refusalStillRendersTheGuardrail says so — see validateEgressPolicy
-// for why EgressPolicyRequiresSplitBroker is the case where rendering it is
-// itself the harm.
+// <name>-gateway-netpol is reconciled unconditionally across all refusal paths
+// (steps 10, 10b, 10c, 10e). It is the Pod's baseline policy, it predates
+// spec.security.egressPolicy, and no refusal is an objection to it.
+// <name>-sandbox-metadata-deny is reconciled when refusalStillRendersTheGuardrail
+// says so — whenever spec.security.egressPolicy is enabled and the credential
+// broker is split (steps 10, 10b, 10e). Step 10c (EgressPolicyRequiresSplitBroker)
+// is the sole case where rendering it is withheld, because an unsplit broker
+// shares the agent Pod's network namespace and rendering the metadata deny policy
+// would deny the broker its cloud token credentials.
 func (r *PlatformAgentReconciler) reconcileAgentNetworkGuardrails(ctx context.Context, agent *agentv1alpha1.PlatformAgent, reason string) error {
 	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, agent)
 	netpolProf := r.resolveNetpolProfile(ctx, agent)
 	if err := r.reconcileNetworkPolicy(ctx, agent, netpolProf, otlpEndpoint, otlpSource == otlpSourceNone); err != nil {
 		return err
 	}
-	if !refusalStillRendersTheGuardrail(reason) {
+	if !refusalStillRendersTheGuardrail(agent, reason) {
 		return nil
 	}
 	return r.reconcileAgentEgressPolicy(ctx, agent, r.agentEgressDNSClusterIPs(ctx, agent, netpolProf))

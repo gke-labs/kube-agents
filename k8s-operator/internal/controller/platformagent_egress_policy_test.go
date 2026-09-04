@@ -892,12 +892,25 @@ func TestARefusalDoesNotSuspendTheGuardrail(t *testing.T) {
 // broker sharing the Pod and take away the metadata server it mints the cloud
 // token from. Rendering it would be the outage the refusal exists to prevent.
 func TestTheSplitBrokerRefusalStillRendersNothing(t *testing.T) {
-	if refusalStillRendersTheGuardrail(reasonEgressPolicyRequiresSplitBroker) {
+	unsplitAgent := egressPolicyAgent(func(a *agentv1alpha1.PlatformAgent) {
+		a.Spec.Security.SplitCredentialBrokerPod = nil
+	})
+	if refusalStillRendersTheGuardrail(unsplitAgent, reasonEgressPolicyRequiresSplitBroker) {
 		t.Error("the split-broker refusal must not render the policy: it would deny the credential " +
 			"broker in the same Pod the metadata server it mints the cloud token from")
 	}
-	if !refusalStillRendersTheGuardrail(reasonEgressAllowlistRefused) {
+	splitAgent := egressPolicyAgent()
+	if !refusalStillRendersTheGuardrail(splitAgent, reasonEgressAllowlistRefused) {
 		t.Error("a refused allowlist value must still leave the guardrail rendered")
+	}
+	if !refusalStillRendersTheGuardrail(splitAgent, reasonRuntimeClassNotFound) {
+		t.Error("RuntimeClassNotFound with split broker must still leave the guardrail rendered")
+	}
+	if !refusalStillRendersTheGuardrail(splitAgent, reasonSplitBrokerStrandsEventWatcher) {
+		t.Error("SplitBrokerStrandsEventWatcher with split broker must still leave the guardrail rendered")
+	}
+	if refusalStillRendersTheGuardrail(unsplitAgent, reasonRuntimeClassNotFound) {
+		t.Error("RuntimeClassNotFound without split broker must not render the egress policy")
 	}
 }
 
@@ -1264,8 +1277,9 @@ func TestARefusalDoesNotSuspendTheGatewayNetworkPolicy(t *testing.T) {
 			},
 		},
 		{
-			name:   "RuntimeClassNotFound",
-			reason: reasonRuntimeClassNotFound,
+			name:    "RuntimeClassNotFound",
+			reason:  reasonRuntimeClassNotFound,
+			guarded: true,
 			mutate: func(a *agentv1alpha1.PlatformAgent) {
 				if a.Spec.Deployment == nil {
 					a.Spec.Deployment = &agentv1alpha1.DeploymentSpec{}
@@ -1277,8 +1291,24 @@ func TestARefusalDoesNotSuspendTheGatewayNetworkPolicy(t *testing.T) {
 			},
 		},
 		{
-			name:   "SplitBrokerStrandsEventWatcher",
-			reason: reasonSplitBrokerStrandsEventWatcher,
+			name:    "RuntimeClassNotFoundWithoutSplitBroker",
+			reason:  reasonRuntimeClassNotFound,
+			guarded: false,
+			mutate: func(a *agentv1alpha1.PlatformAgent) {
+				if a.Spec.Deployment == nil {
+					a.Spec.Deployment = &agentv1alpha1.DeploymentSpec{}
+				}
+				if a.Spec.Deployment.Availability == nil {
+					a.Spec.Deployment.Availability = &agentv1alpha1.AvailabilitySpec{}
+				}
+				a.Spec.Deployment.Availability.RuntimeClassName = ptr.To("nonexistent-runtime-class")
+				a.Spec.Security.SplitCredentialBrokerPod = nil
+			},
+		},
+		{
+			name:    "SplitBrokerStrandsEventWatcher",
+			reason:  reasonSplitBrokerStrandsEventWatcher,
+			guarded: true,
 			mutate: func(a *agentv1alpha1.PlatformAgent) {
 				a.Spec.Security.SplitCredentialBrokerPod = ptr.To(true)
 				if a.Spec.Harness == nil {
@@ -1346,11 +1376,24 @@ func TestARefusalDoesNotSuspendTheGatewayNetworkPolicy(t *testing.T) {
 
 			egress := types.NamespacedName{Name: agentEgressPolicyName(agent), Namespace: agent.Namespace}
 			err := cl.Get(ctx, egress, &networkingv1.NetworkPolicy{})
-			if tc.guarded && err != nil {
-				t.Errorf("the egress guardrail was withheld by a refusal about one destination: %v", err)
-			}
-			if !tc.guarded && err == nil {
-				t.Error("the split-broker refusal rendered the egress policy, which is the outage it exists to prevent")
+			if tc.guarded {
+				if err != nil {
+					t.Errorf("the egress guardrail was withheld under refusal %q: %v", tc.reason, err)
+				} else {
+					if err := cl.Delete(ctx, &networkingv1.NetworkPolicy{
+						ObjectMeta: metav1.ObjectMeta{Name: egress.Name, Namespace: egress.Namespace},
+					}); err != nil {
+						t.Fatalf("failed to delete the egress policy for the restore check: %v", err)
+					}
+					if _, err := r.Reconcile(ctx, req); err != nil {
+						t.Fatalf("third Reconcile failed: %v", err)
+					}
+					if err := cl.Get(ctx, egress, &networkingv1.NetworkPolicy{}); err != nil {
+						t.Fatalf("while the spec was refused under %q the egress NetworkPolicy stopped being reconciled, so deleting it stuck: %v", tc.reason, err)
+					}
+				}
+			} else if err == nil {
+				t.Error("the unsplit-broker refusal rendered the egress policy, which is the outage it exists to prevent")
 			}
 		})
 	}
