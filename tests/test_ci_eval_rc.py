@@ -47,6 +47,10 @@ _EXPECTED_DECK_URL = (
 # guard to let it through; the real marker is the variable ci-deploy.sh reads.
 _DEPLOY_RC_MARKER = "RC_COMMIT_SHA"
 
+# The tier switch's variable. The driver exports it and greps the candidate for
+# it; nothing on main reads it yet.
+_EVAL_TIER_MARKER = "EVAL_TIER"
+
 
 def _stub(trace: pathlib.Path, name: str, body: str = "", exit_code: int = 0) -> str:
     """A sibling script that records that it ran, with what, and in what order."""
@@ -369,19 +373,33 @@ class RcEvalDriverTestCase(unittest.TestCase):
         deploy = (_REPO_ROOT / "hack" / "ci-deploy.sh").read_text(encoding="utf-8")
         self.assertIn(_DEPLOY_RC_MARKER, deploy)
 
-    @unittest.expectedFailure
     def test_the_tier_marker_is_a_string_the_real_ci_eval_pr_reads(self):
-        """Expected to fail until the EVAL_TIER switch (#1175) lands.
+        """The driver's export and the candidate's switch must be one string.
 
-        The driver exports EVAL_TIER and greps the candidate for it, but
-        nothing on main reads it, so today the note fires on every candidate
-        and the export is inert. This is the mechanism that notices when that
-        stops being true — including if #1175 lands under a different name.
-        Turn it into a plain assertion then, and drop the note's "expected
-        until that switch lands" wording with it.
+        The half that can be checked today is the driver's: it greps the
+        candidate for the same name it exports, so a rename on one side alone
+        makes the grep vacuous. The candidate's half waits on #1175, which is
+        what adds the switch to hack/ci-eval-pr.sh.
+
+        A skip rather than @unittest.expectedFailure, deliberately. An
+        expected failure that starts passing is an unexpectedSuccess, which
+        unittest counts as a failure and exits 1 — so #1175 landing would have
+        reddened main's Python suite, with the failure naming this file rather
+        than the change that caused it.
         """
+        driver = _CI_EVAL_RC.read_text(encoding="utf-8")
+        self.assertIn(
+            _EVAL_TIER_MARKER,
+            driver,
+            "the driver must export the marker it greps the candidate for",
+        )
         evaluator = (_REPO_ROOT / "hack" / "ci-eval-pr.sh").read_text(encoding="utf-8")
-        self.assertIn("EVAL_TIER", evaluator)
+        if _EVAL_TIER_MARKER not in evaluator:
+            self.skipTest(
+                f"{_EVAL_TIER_MARKER} is not on main yet (#1175), so the "
+                "driver's export is inert and its note fires on every "
+                "candidate — the case above covers that state"
+            )
 
     # ─── Reporting ──────────────────────────────────────────────────────────
 
