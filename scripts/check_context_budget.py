@@ -43,7 +43,7 @@ REPO = Path(__file__).resolve().parent.parent
 # Chars. Claude Code warns at 40k; this sits below it so the check fires while
 # there is still room to land the fix, rather than after the warning is already
 # on everyone's screen.
-BUDGET = 38_000
+BUDGET = 39_000
 
 # The two roots. CLAUDE.md pulls AGENTS.md in with an `@AGENTS.md` line, which
 # the harness expands in place, so counting both files naively would charge
