@@ -83,7 +83,7 @@ updates:
     # Raising the floor past that cap does not go merely untested -- it makes
     # the file unresolvable. #830 hit it and restored the cap; #1002 proposed
     # `websockets>=17.0.1,<18` anyway and pip answered ResolutionImpossible,
-    # taking the Python unit tests and the coverage job with it. `versions` and
+    # taking the Python unit tests with it. `versions` and
     # not `update-types`: a semver-major comparison needs a resolved current
     # version, and the cap is a bare range rather than an `==` pin, so there is
     # none. Remove this rule and lift the pin in one change when Streamlit

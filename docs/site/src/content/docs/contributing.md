@@ -75,7 +75,7 @@ where a new one belongs, `docs/testing-map.md` maps the ten test homes to their 
 - **Integration seams** (if you touched a component that another one talks to across a process, language, or protocol boundary):
 
   ```bash
-  make test-integration   # just this tier, for working on a seam; CI reaches it through `make test-python`
+  make test-integration   # just this tier, for working on a seam; CI reaches it through the PYTHON_TEST_DIRS sweep
   ```
 
   Real components wired together with the agent replaced by a fake — no cluster, no model. The tier is in `PYTHON_TEST_DIRS`, so `make test-python` runs it and the Run Python Unit Tests job gates on it; the target above is the fast loop for one tier while you work on a seam. Install a Go toolchain first if you want an honest answer — the injector seam compiles the real Go event-watcher client, and without `go` on `PATH` its four tests skip and the run still prints `OK`. `tests/integration/README.md` states the tier's contract.

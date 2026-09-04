@@ -10,8 +10,8 @@ watcher package) against the real server over a real socket.
 
 Skips when no Go toolchain is available, which makes a laptop without `go`
 report OK on four tests it never ran -- install one before you believe a green
-run here. CI's `test` and `coverage` jobs both set Go up for exactly that
-reason, since this tier gates from inside `make test-python`.
+run here. CI's `test` job sets Go up for exactly that reason, since this tier
+gates from inside the `PYTHON_TEST_DIRS` sweep that job runs.
 """
 
 from __future__ import annotations

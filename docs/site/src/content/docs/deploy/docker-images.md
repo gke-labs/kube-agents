@@ -54,7 +54,7 @@ Pinned here so `make mirror-images` and the install ask for the same version.
 | `k8s` | `docker.io/alpine/k8s` | `1.36.2` | — | The chart's pre-delete cleanup hook Job. |
 | `github-token-minter-server` | `us-docker.pkg.dev/abcxyz-artifacts/docker-images/github-token-minter-server` | `v2.7.1-amd64` | `GITHUB_MINTER_IMAGE` | The optional GitHub integration. |
 | `hindsight-api` | `ghcr.io/vectorize-io/hindsight-api` | `0.9.2@sha256:7b14a1f4062252992d0176758753615e0a2071d9a269995be007be223ab01812` | `HINDSIGHT_API_IMAGE` | The chart, when the memory provider uses Hindsight (make deploy-hindsight for the kustomize dev path). |
-| `hindsight-postgresql` | `docker.io/ankane/pgvector` | `latest@sha256:956744bd14e9cbdf639c61c2a2a7c7c2c48a9c8cdd42f7de4ac034f4e96b90f8` | `HINDSIGHT_POSTGRES_IMAGE` | The chart, alongside the Hindsight API. |
+| `hindsight-postgresql` | `docker.io/pgvector/pgvector` | `0.8.6-pg15@sha256:a947c45cdc5906a1bc951f20a8709e321256343ee0f251e4ae00b5e7def4e6da` | `HINDSIGHT_POSTGRES_IMAGE` | The chart, alongside the Hindsight API. |
 | `cert-manager-controller` | `quay.io/jetstack/cert-manager-controller` | `v1.21.1` | — | cert-manager, installed by the full-install composition unless enable_cert_manager is false. |
 | `cert-manager-cainjector` | `quay.io/jetstack/cert-manager-cainjector` | `v1.21.1` | — | cert-manager, installed by the full-install composition unless enable_cert_manager is false. |
 | `cert-manager-webhook` | `quay.io/jetstack/cert-manager-webhook` | `v1.21.1` | — | cert-manager, installed by the full-install composition unless enable_cert_manager is false. |
@@ -201,7 +201,7 @@ Destinations are flat, named after the inventory entry's `name`, so
 `quay.io/jetstack/cert-manager-webhook:v1.21.1` lands as
 `<prefix>/cert-manager-webhook:v1.21.1`. The `name`, not the repository's trailing segment —
 they are the same word for almost every entry, but where they differ the name wins, and
-`docker.io/ankane/pgvector` lands as `<prefix>/hindsight-postgresql`. Every consumer below
+`docker.io/pgvector/pgvector` lands as `<prefix>/hindsight-postgresql`. Every consumer below
 assumes that flat layout.
 
 ### 2. Point the install at it

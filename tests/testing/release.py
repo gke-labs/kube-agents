@@ -158,6 +158,57 @@ exit 0
     return docker_path, log_path
 
 
+MOCK_GHCR_TOKEN_RESPONSE = '{"token":"t"}'
+MOCK_GHCR_CURL_LOG = "curl.log"
+# The exit code the mock uses for a call it does not recognise, distinct from
+# the 1 a real curl returns for a 404 so a test can tell "the probe ran and the
+# image is absent" from "the probe was not built the way the API needs".
+MOCK_GHCR_CURL_UNEXPECTED_EXIT = 99
+
+
+def create_mock_ghcr_curl_binary(
+    bin_dir,
+    log_file=None,
+    manifest_status=0,
+    token_response=MOCK_GHCR_TOKEN_RESPONSE,
+):
+    """Creates a mock curl answering common.sh's anonymous GHCR probe.
+
+    It asserts the shape of the request rather than answering anything: a
+    manifest call has to carry `/v2/<repo>/manifests/<ref>`, a bearer token,
+    and the OCI `Accept` header, because GHCR returns 404 for a manifest
+    request that omits those media types. A mock that answered any argument
+    list would leave that header untested — deleting it from common.sh is a
+    change that breaks every real probe and no fake one.
+    """
+    bin_path = pathlib.Path(bin_dir)
+    bin_path.mkdir(parents=True, exist_ok=True)
+    curl_path = bin_path / "curl"
+    log_path = log_file if log_file else (bin_path / MOCK_GHCR_CURL_LOG)
+
+    curl_path.write_text(
+        f"""#!/bin/sh
+echo "mock curl: $*" >> "{log_path}"
+case "$*" in
+  *'/token?scope=repository:'*':pull'*) printf '%s' '{token_response}'; exit 0 ;;
+esac
+for required in '/v2/' '/manifests/' 'Authorization: Bearer ' \\
+  'Accept: application/vnd.oci.image.index.v1+json'; do
+  case "$*" in
+    *"$required"*) ;;
+    *)
+      echo "mock curl: manifest probe missing '$required': $*" >&2
+      exit {MOCK_GHCR_CURL_UNEXPECTED_EXIT}
+      ;;
+  esac
+done
+exit {manifest_status}
+"""
+    )
+    curl_path.chmod(0o755)
+    return curl_path, log_path
+
+
 def create_mock_cosign_binary(bin_dir, log_file=None, fail_sign=False):
     """Creates a mock cosign CLI supporting sign commands."""
     bin_path = pathlib.Path(bin_dir)

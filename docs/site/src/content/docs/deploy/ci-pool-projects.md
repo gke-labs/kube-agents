@@ -369,3 +369,36 @@ Registration makes a project leasable; it does not make the presubmit use it. Th
 Raise it to the number of leasable projects, not the number provisioned. A slot with no project to lease blocks on Boskos rather than running.
 
 This is the one step in a different repository from section 8's roster: `oss-test-infra` holds the job config, `gke-internal/test-infra` holds the pool. Neither knows about the other, so a change to one is never a prompt to change the other.
+
+## 10. Know when to onboard the next one
+
+Onboard when the rolling p50 wait goes over 15 minutes or the rolling p95 over 45. `scripts/pool_pressure.py` measures that over a seven-day window and exits 1 when either trips; the two numbers are `DEFAULT_P50_THRESHOLD_MINUTES` and `DEFAULT_P95_THRESHOLD_MINUTES` at the top of that file, and this paragraph is what they cite. A day is judged on its own rather than blended into the window, so one bad day trips the check instead of being averaged away, and days under five runs are counted but not judged — a weekend here runs single digits, and two samples put any number at p95.
+
+```bash
+python3 scripts/pool_pressure.py                 # the last seven days
+python3 scripts/pool_pressure.py --json          # the same run as data
+python3 scripts/pool_pressure.py --as-of 2026-08-27 --window-days 1   # replay a past day
+```
+
+It exits 0 within threshold, 1 on a breach, and 2 when it could not measure — which is not a green run. Nothing it does provisions anything; `hack/pool_pressure_cron.sh` runs it on a schedule and hands a breach to a notifier, and it too only reports.
+
+### What "wait" means here
+
+Setup time: everything between Prow accepting the job and the test being able to start, in four segments the check reports separately.
+
+| segment | from              | to                                |
+| ------- | ----------------- | --------------------------------- |
+| queue   | ProwJob created   | pod created                       |
+| pod     | pod created       | container running                 |
+| setup   | container running | the run asks Boskos for a project |
+| lease   | the request       | the project is in hand            |
+
+The split is the point. A run that waited three hours in Prow's queue and a run that waited three hours inside `boskosctl acquire` are the same number in a single total and two different problems, and only one of them is solved by buying a project. Each segment reports how many runs it was measured on, because a log that stops early or a banner that has been reworded upstream makes a segment go quiet, and a median over the few runs that still parse reads exactly like a healthy pool.
+
+### Read the pool before you read the wait
+
+A long wait with the pool full is demand. A long wait with projects sitting free is not, and it has been seen: [oss-test-infra#2666](https://github.com/GoogleCloudPlatform/oss-test-infra/issues/2666) was runs stuck in `triggered` against an idle build cluster, a Prow control-plane problem that onboarding a project would have cost money and fixed nothing. So the check reads the pool alongside the wait and reports one of four causes, and **only `CAPACITY` justifies onboarding**: `CONCURRENCY_CAP` means projects exist that the cap will not let anything reach, `CONTROL_PLANE` is the #2666 shape, and `UNKNOWN` means the pool could not be read and the question is still open.
+
+The lease segment is the tiebreaker between the first and the third. A lease that took minutes is real contention; a prompt lease under a long total wait puts the delay before the pod, where Boskos has no say in it. That used to mean opening a slow build's `build-log.txt` by hand.
+
+Since [oss-test-infra#2678](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2678) the cap equals the pool, so Prow admits enough pods to claim every project and none is held in reserve. One project cleaning, dirty, or holding a leaked lease is then a run that starts on time and blocks in `boskosctl acquire` until its ten-minute timeout. The check says so when it applies, and it is the case where the lease segment is the only place the delay shows.

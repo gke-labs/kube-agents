@@ -525,6 +525,21 @@ def _cmd_record(args: argparse.Namespace) -> int:
         )
         return 2
 
+    if os.environ.get("RC_COMMIT_SHA") and not args.force:
+        # Same invariant, second way in. A release-candidate eval is a periodic
+        # with no PULL_NUMBER, so the check above lets it through, and a record
+        # written from one is indistinguishable afterwards: VersionKey names the
+        # setup, the scoring version, the judge and the two content versions,
+        # and nothing about which build produced the sample. The candidate would
+        # then be judged non-inferior to a window it had just moved.
+        print(
+            "::error::refusing to record a baseline with RC_COMMIT_SHA set "
+            f"({os.environ['RC_COMMIT_SHA']}): a release candidate is measured "
+            "against main's window, not added to it",
+            file=sys.stderr,
+        )
+        return 2
+
     cases = _read_case_results(args.case_result)
     if isinstance(cases, str):
         print(f"::error::{cases}", file=sys.stderr)
@@ -709,7 +724,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     record.add_argument(
         "--force",
         action="store_true",
-        help="append even with PULL_NUMBER set; for tests and local screening",
+        help="append even with PULL_NUMBER or RC_COMMIT_SHA set; for tests and local screening",
     )
     record.set_defaults(func=_cmd_record)
 

@@ -109,17 +109,14 @@ class ChatService:
         interaction = self.store.transition(
             interaction_id,
             frozenset({InteractionStatus.WAITING_FOR_APPROVAL}),
+            event="approval.resolved",
+            event_data={"choice": choice},
             status=InteractionStatus.RUNNING,
             approval=None,
         )
         if interaction is None:
             self._required(interaction_id)
             raise ValueError("interaction is not waiting for approval")
-        self.store.append_event(
-            interaction_id,
-            "approval.resolved",
-            {"choice": choice},
-        )
         self._control_executor.submit(self._send_approval, interaction_id, choice)
         return self._required(interaction_id)
 
@@ -127,13 +124,13 @@ class ChatService:
         updated = self.store.transition(
             interaction_id,
             NONTERMINAL_INTERACTION_STATUSES,
+            event="interaction.cancelled",
             status=InteractionStatus.CANCELLED,
             error="Interaction cancelled by the caller.",
             approval=None,
         )
         if updated is None:
             return self._required(interaction_id)
-        self.store.append_event(interaction_id, "interaction.cancelled")
         if updated.root_run_id:
             try:
                 self._backend_factory().stop(
@@ -172,11 +169,11 @@ class ChatService:
         started = self.store.transition(
             interaction_id,
             frozenset({InteractionStatus.QUEUED}),
+            event="interaction.started",
             status=InteractionStatus.RUNNING,
         )
         if started is None:
             return
-        self.store.append_event(interaction_id, "interaction.started")
         try:
             result = self._backend_factory().run(
                 interaction.agent_id,
@@ -248,17 +245,13 @@ class ChatService:
             updated = self.store.transition(
                 interaction_id,
                 frozenset({InteractionStatus.RUNNING}),
+                event="approval.requested",
+                event_data=result.approval or {},
                 **changes,
                 status=InteractionStatus.WAITING_FOR_APPROVAL,
                 approval=result.approval or {},
             )
-            if updated is not None:
-                self.store.append_event(
-                    interaction_id,
-                    "approval.requested",
-                    result.approval or {},
-                )
-            else:
+            if updated is None:
                 self._stop_cancelled_result(interaction_id, result.run_id)
 
     def _stop_cancelled_result(self, interaction_id: str, run_id: str) -> None:
@@ -299,9 +292,11 @@ class ChatService:
                 if result.status == "cancelled"
                 else InteractionStatus.FAILED
             )
-            updated = self.store.transition(
+            self.store.transition(
                 interaction_id,
                 NONTERMINAL_INTERACTION_STATUSES,
+                event=f"interaction.{status.value}",
+                event_data={"error": error},
                 **changes,
                 status=status,
                 output=result.output,
@@ -310,28 +305,19 @@ class ChatService:
                     "Inspect the root run and gateway logs before retrying.",
                 ),
             )
-            if updated is not None:
-                self.store.append_event(
-                    interaction_id,
-                    f"interaction.{status.value}",
-                    {"error": error},
-                )
             return
 
         updated = self.store.transition(
             interaction_id,
             frozenset({InteractionStatus.RUNNING}),
+            event="root.completed",
+            event_data={"output": result.output},
             **changes,
             status=InteractionStatus.WAITING_FOR_TASKS,
             output=result.output,
         )
         if updated is None:
             return
-        self.store.append_event(
-            interaction_id,
-            "root.completed",
-            {"output": result.output},
-        )
         self._settle_tasks(interaction_id)
 
     def _settle_tasks(self, interaction_id: str) -> None:
@@ -395,43 +381,37 @@ class ChatService:
                         f"{task.task_id}: {task.error or task.status}"
                         for task in failed
                     )
-                    updated = self.store.transition(
+                    self.store.transition(
                         interaction_id,
                         frozenset({InteractionStatus.WAITING_FOR_TASKS}),
+                        event="interaction.failed",
+                        event_data={"error": detail},
                         status=InteractionStatus.FAILED,
                         error=f"Delegated work failed: {detail}",
                         diagnostics=(
                             "Open Task Kanban for the failed task and inspect its latest run.",
                         ),
                     )
-                    if updated is not None:
-                        self.store.append_event(
-                            interaction_id,
-                            "interaction.failed",
-                            {"error": detail},
-                        )
                 else:
-                    updated = self.store.transition(
+                    self.store.transition(
                         interaction_id,
                         frozenset({InteractionStatus.WAITING_FOR_TASKS}),
+                        event="interaction.completed",
                         status=InteractionStatus.COMPLETED,
                     )
-                    if updated is not None:
-                        self.store.append_event(interaction_id, "interaction.completed")
                 return
             time.sleep(self._poll_interval)
 
-        updated = self.store.transition(
+        self.store.transition(
             interaction_id,
             frozenset({InteractionStatus.WAITING_FOR_TASKS}),
+            event="interaction.timed_out",
             status=InteractionStatus.TIMED_OUT,
             error="Delegated work did not reach a terminal state before the deadline.",
             diagnostics=(
                 "Inspect active tasks in Task Kanban, then retry with a longer evaluator timeout.",
             ),
         )
-        if updated is not None:
-            self.store.append_event(interaction_id, "interaction.timed_out")
 
     @staticmethod
     def _project_tasks(result: TaskUpdateResult) -> tuple[TaskProjection, ...]:
@@ -489,19 +469,15 @@ class ChatService:
             return
         guidance = str(getattr(exc, "guidance", "") or diagnostic)
         message = str(exc) or type(exc).__name__
-        updated = self.store.transition(
+        self.store.transition(
             interaction_id,
             NONTERMINAL_INTERACTION_STATUSES,
+            event="interaction.failed",
+            event_data={"error": message},
             status=InteractionStatus.FAILED,
             error=message,
             diagnostics=(guidance,),
         )
-        if updated is not None:
-            self.store.append_event(
-                interaction_id,
-                "interaction.failed",
-                {"error": message},
-            )
 
     def _required(self, interaction_id: str) -> Interaction:
         interaction = self.store.get(interaction_id)
