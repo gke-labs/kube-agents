@@ -284,9 +284,12 @@ class HelmInvocationTest(unittest.TestCase):
         `--set-string ...image.repository=` on the helm line would win by
         being later and would silently undo the release-candidate path."""
         text = _CI_DEPLOY.read_text(encoding="utf-8")
-        helm_call = text.partition("helm upgrade --install kube-agents")[2].partition(
-            "--wait"
-        )[0]
+        # Anchored on the parameterized form #1185 introduced; the literal
+        # "kube-agents" anchor this test merged with (#1170) predated that
+        # rename on its branch and went green against a stale merge-ref.
+        helm_call = text.partition('helm upgrade --install "${HELM_RELEASE_NAME}"')[
+            2
+        ].partition("--wait")[0]
         self.assertIn('"${IMAGE_ARGS[@]}"', helm_call)
         self.assertNotIn("image.repository", helm_call)
         self.assertNotIn("image.tag", helm_call)

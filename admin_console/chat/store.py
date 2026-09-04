@@ -36,6 +36,9 @@ class InteractionStoreProtocol(Protocol):
         self,
         interaction_id: str,
         expected: frozenset[InteractionStatus],
+        *,
+        event: str | None = None,
+        event_data: dict | None = None,
         **changes,
     ) -> Interaction | None: ...
 
@@ -100,9 +103,17 @@ class InteractionStore:
         self,
         interaction_id: str,
         expected: frozenset[InteractionStatus],
+        *,
+        event: str | None = None,
+        event_data: dict | None = None,
         **changes,
     ) -> Interaction | None:
-        """Apply a state change only when the current status is expected."""
+        """Apply a state change only when the current status is expected.
+
+        ``event`` is appended in the same critical section as the status
+        change: a waiter woken by the new status can never read the event
+        stream from before the event that announces it (#1210).
+        """
         with self._condition:
             current = self._interactions.get(interaction_id)
             if current is None:
@@ -111,8 +122,21 @@ class InteractionStore:
                 return None
             updated = replace(current, updated_at=utc_now(), **changes)
             self._interactions[interaction_id] = updated
+            if event is not None:
+                self._append_event_locked(interaction_id, event, event_data)
             self._condition.notify_all()
             return updated
+
+    def _append_event_locked(
+        self,
+        interaction_id: str,
+        event: str,
+        data: dict | None,
+    ) -> InteractionEvent:
+        events = self._events[interaction_id]
+        item = InteractionEvent(len(events) + 1, event, utc_now(), data or {})
+        events.append(item)
+        return item
 
     def append_event(
         self,
@@ -123,9 +147,7 @@ class InteractionStore:
         with self._condition:
             if interaction_id not in self._interactions:
                 raise KeyError(interaction_id)
-            events = self._events[interaction_id]
-            item = InteractionEvent(len(events) + 1, event, utc_now(), data or {})
-            events.append(item)
+            item = self._append_event_locked(interaction_id, event, data)
             self._condition.notify_all()
             return item
 
@@ -384,9 +406,18 @@ class SQLiteInteractionStore:
         self,
         interaction_id: str,
         expected: frozenset[InteractionStatus],
+        *,
+        event: str | None = None,
+        event_data: dict | None = None,
         **changes,
     ) -> Interaction | None:
-        """Apply a state change only when the current status is expected."""
+        """Apply a state change only when the current status is expected.
+
+        ``event`` is written on the same connection, inside the same lock,
+        as the status change: a waiter woken by the new status can never
+        read the event stream from before the event that announces it
+        (#1210). The ``with connection`` context commits both or neither.
+        """
         with self._condition, self._connect() as connection:
             row = connection.execute(
                 "SELECT payload FROM interactions WHERE interaction_id = ?",
@@ -407,8 +438,37 @@ class SQLiteInteractionStore:
                     interaction_id,
                 ),
             )
+            if event is not None:
+                self._insert_event(connection, interaction_id, event, event_data)
             self._notify(interaction_id)
             return updated
+
+    @staticmethod
+    def _insert_event(
+        connection: sqlite3.Connection,
+        interaction_id: str,
+        event: str,
+        data: dict | None,
+    ) -> InteractionEvent:
+        row = connection.execute(
+            "SELECT COALESCE(MAX(sequence), 0) FROM interaction_events "
+            "WHERE interaction_id = ?",
+            (interaction_id,),
+        ).fetchone()
+        item = InteractionEvent(int(row[0]) + 1, event, utc_now(), data or {})
+        connection.execute(
+            "INSERT INTO interaction_events "
+            "(interaction_id, sequence, event, occurred_at, data) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                interaction_id,
+                item.sequence,
+                item.event,
+                item.occurred_at.isoformat(),
+                json.dumps(item.data, separators=(",", ":"), sort_keys=True),
+            ),
+        )
+        return item
 
     def append_event(
         self,
@@ -423,24 +483,7 @@ class SQLiteInteractionStore:
             ).fetchone()
             if exists is None:
                 raise KeyError(interaction_id)
-            row = connection.execute(
-                "SELECT COALESCE(MAX(sequence), 0) FROM interaction_events "
-                "WHERE interaction_id = ?",
-                (interaction_id,),
-            ).fetchone()
-            item = InteractionEvent(int(row[0]) + 1, event, utc_now(), data or {})
-            connection.execute(
-                "INSERT INTO interaction_events "
-                "(interaction_id, sequence, event, occurred_at, data) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (
-                    interaction_id,
-                    item.sequence,
-                    item.event,
-                    item.occurred_at.isoformat(),
-                    json.dumps(item.data, separators=(",", ":"), sort_keys=True),
-                ),
-            )
+            item = self._insert_event(connection, interaction_id, event, data)
             self._notify(interaction_id)
             return item
 
@@ -504,8 +547,15 @@ class SQLiteInteractionStore:
             interaction = _decode_interaction(raw)
             if interaction.terminal:
                 continue
-            self.update(
+            # transition(event=...) rather than update-then-append: the same
+            # atomicity the live paths guarantee — a terminal status is never
+            # durable without the event announcing it, even if the process
+            # dies again mid-recovery.
+            updated = self.transition(
                 interaction_id,
+                frozenset({interaction.status}),
+                event="interaction.recovery_failed",
+                event_data={"previousStatus": interaction.status.value},
                 status=InteractionStatus.FAILED,
                 error="The portal API restarted before this interaction completed.",
                 diagnostics=(
@@ -514,12 +564,8 @@ class SQLiteInteractionStore:
                 ),
                 approval=None,
             )
-            self.append_event(
-                interaction_id,
-                "interaction.recovery_failed",
-                {"previousStatus": interaction.status.value},
-            )
-            recovered += 1
+            if updated is not None:
+                recovered += 1
         return recovered
 
     def prune(self, *, retention_days: int = 7, maximum: int = 1_000) -> int:

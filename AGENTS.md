@@ -352,16 +352,15 @@ map (`docs/README.md`), and this file plus `CLAUDE.md` stay inside the context b
 three repetitions each — and has been merge-blocking since 2026-09-02
 (GoogleCloudPlatform/oss-test-infra#2677). It is slow — recent green runs took 1.5 to 3.5 hours
 against a 360-minute ceiling — and a new push restarts it, so open the pull request early and
-batch changes rather than stacking pushes. Another pull request merging usually does not: a green
-status is re-pinned to the new head of `main` so Tide keeps crediting it
+batch changes rather than stacking pushes. Another pull request merging usually does not — the
+green status is re-pinned to `main`'s new head
 ([how a change merges](docs/pull-request-workflow.md#how-a-change-merges)).
 
 Two things red it. A case on the `BOOTSTRAP_ADMITTED` roster in `hack/ci-eval-pr.sh` fails **all**
 of its repetitions — one failed repetition out of three does nothing on its own. Or any case,
 admitted or not, trips an absolute rung: a forbidden cluster mutation, a verifier that errored
-instead of running, or a record whose liveness signals are inconsistent (a record showing no run
-at all — empty trajectory, zero billed tokens — is instead excluded as infrastructure, #1184).
-Repetitions classified as
+instead of running, or a record whose liveness signals are inconsistent (one showing no run at
+all is excluded as infrastructure instead, #1184). Repetitions classified as
 infrastructure failures are excluded from the verdict automatically, unless every case hits one —
 a suite that evaluated nothing reds rather than reporting green. The roster is the source of truth
 for what is admitted, the comment above it for how a flaky case is demoted, and
@@ -374,13 +373,9 @@ welcome — otherwise keep working while the eval crew classifies it. One `/rete
 for a suspected transient; repeated blind retests are noise. Never merge around a red gate, and
 never instruct anyone to.
 
-Two more mechanics (#1202). A plain `/override` (admins only) is only for a red the eval crew
-classified as not the pull request's, and it expires with the next merge to `main`, so repeat it if
-`main` moves first — the re-pin leaves an admin's override alone; `/override-sticky` is not in the
-Prow build this repository merges through and is silently ignored. An unresolved review thread
-blocks the merge silently: approved, green, and unmerged means check threads first, then the `err`
-field in [tide-history](https://oss.gprow.dev/tide-history) — detail in
-[how a change merges](docs/pull-request-workflow.md#how-a-change-merges).
+`/override` (admin-only) is only for a red the eval crew classified as not the pull request's;
+the rest of the override mechanics, and why an approved, green pull request can sit unmerged,
+are in [how a change merges](docs/pull-request-workflow.md#how-a-change-merges) (#1202).
 
 ## Automated Review After Opening a Pull Request
 
