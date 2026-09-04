@@ -117,17 +117,26 @@ def run_image_source(
 
 
 def run_build_section(rc_commit_sha: str) -> subprocess.CompletedProcess:
-    """Run section 4 with `gcloud` stubbed, so a build announces itself."""
+    """Run section 4 with `gcloud` stubbed, so a build announces itself.
+
+    SCRIPT_DIR is the repository's own `hack/`, the value the real script
+    computes for itself: the build path resolves the revision stamp through
+    `${SCRIPT_DIR}/../scripts/git_revision_stamp.sh`, and under `set -u` an
+    undefined one aborts the section before it reaches the submit. The stub
+    echoes its arguments so a test can assert on the substitutions rather than
+    only on the fact that a build happened.
+    """
     script = "\n".join(
         [
             "set -euo pipefail",
+            f'SCRIPT_DIR="{_REPO_ROOT / "hack"}"',
             f'export RC_COMMIT_SHA="{rc_commit_sha}"',
             f'export AR_REPO="{_AR_REPO}"',
             f'export TAG="{_PRESUBMIT_TAG}"',
             'export PROJECT_ID="kube-agents-evals"',
             'export HERMES_AGENT_TAG="v0"',
             "BUILD_WORKER_ARGS=(--machine-type=e2-highcpu-8)",
-            'gcloud() { echo "BUILD SUBMITTED"; }',
+            'gcloud() { echo "BUILD SUBMITTED"; echo "ARGV=$*"; }',
             lifted(*_BUILD_SECTION),
         ]
     )
@@ -192,6 +201,21 @@ class PresubmitPathUnchangedTest(unittest.TestCase):
         result = run_build_section(rc_commit_sha="")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("BUILD SUBMITTED", result.stdout)
+
+    def test_the_build_carries_the_revision_stamp(self) -> None:
+        """`_GIT_SHA` is what `deploy/docker/Dockerfile` turns into
+        `/opt/build-info.json`, and an image without it is one the
+        self-improvement runner refuses to investigate. The stamp is computed
+        from the uploaded tree rather than from PULL_PULL_SHA — under Prow the
+        upload is the pull request merged into its base — so the assertion is
+        that a 40-character sha arrives, not which one."""
+        result = run_build_section(rc_commit_sha="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = next(
+            line for line in result.stdout.splitlines() if line.startswith("ARGV=")
+        )
+        stamp = re.search(r"_GIT_SHA=([0-9a-f]{40}(?:-dirty)?)", argv)
+        self.assertIsNotNone(stamp, argv)
 
 
 class ReleaseCandidatePathTest(unittest.TestCase):

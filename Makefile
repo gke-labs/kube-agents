@@ -13,7 +13,16 @@ BAD_SKILLS := $(wildcard agents/*/defaults/skills/*)
 BASE_IMAGE_VARS := HERMES_AGENT_IMAGE ENVOY_IMAGE GOLANG_IMAGE
 BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=$($(v))))
 
-.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent mirror-images images-check status prettier-check prettier-write test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests e2e-test-deps test-e2e test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-context-budget chart-sync chart-check tf-apply tf-destroy coverage coverage-check test-integration
+# The repository the built image's source lives in, written to the OCI
+# org.opencontainers.image.source label. Unset by default and therefore empty in
+# the image: ghcr package linking and provenance scanners follow that label, and
+# a hardcoded upstream URL would point them at a repository that does not
+# contain a fork's code. Set it when you publish:
+#   make docker-push IMAGE_SOURCE=https://github.com/<owner>/<repo>
+IMAGE_SOURCE ?=
+IMAGE_SOURCE_ARG := $(if $(IMAGE_SOURCE),--build-arg IMAGE_SOURCE=$(IMAGE_SOURCE))
+
+.PHONY: default help docker-build docker-build-agents docker-build-credential-proxy docker-push docker-push-agents docker-push-credential-proxy dev-rebuild-agent selfimprove-ledger selfimprove-enable mirror-images images-check status prettier-check prettier-write test-python test-python-deps test-bench test-bench-deps bench-case-check e2e-tests e2e-test-deps test-e2e test-e2e-deps validate prompt-check docs-generate docs-check docs-check-generated docs-check-links docs-check-terminology docs-check-map docs-check-context-budget chart-sync chart-check tf-apply tf-destroy coverage coverage-check test-integration
 
 # The agent images this repository builds -- one per `--target` stage in
 # deploy/docker/Dockerfile, which is not the same thing as one per directory
@@ -25,6 +34,13 @@ BASE_IMAGE_ARGS := $(foreach v,$(BASE_IMAGE_VARS),$(if $($(v)),--build-arg $(v)=
 # Agent scaffolds per cluster at runtime. Adding a genuinely new image means
 # adding a Dockerfile stage, so name them here rather than guessing.
 AGENTS := platform
+
+# The revision baked into /opt/build-info.json, so a running pod can say which
+# commit it is. Computed by the shared helper rather than inline, because this
+# line and scripts/dev/dev_rebuild_agent.sh had drifted to two
+# different answers and the drift was a silent bug -- the helper's header says
+# which answer is right and why an abbreviation or a `describe --dirty` is not.
+GIT_SHA ?= $(shell ./scripts/git_revision_stamp.sh)
 
 
 default: docker-build
@@ -42,10 +58,14 @@ docker-build-agents: $(foreach agent,$(AGENTS),docker-build-$(agent)) ## Build t
 # otherwise resolve to the build host — an arm64 machine would silently produce
 # an image that crashloops on the cluster (#560).
 $(foreach agent,$(AGENTS),docker-build-$(agent)): docker-build-%:
-	docker build --platform linux/amd64 $(BASE_IMAGE_ARGS) --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target $* -t $(REPO)/$*-agent:latest -f deploy/docker/Dockerfile .
+	docker build --platform linux/amd64 $(BASE_IMAGE_ARGS) $(IMAGE_SOURCE_ARG) --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --build-arg GIT_SHA=$(GIT_SHA) --target $* -t $(REPO)/$*-agent:latest -f deploy/docker/Dockerfile .
 
+# Same GIT_SHA and IMAGE_SOURCE as the agent rule above. `docker-push` builds
+# both from one command, and without these the pair went to the registry
+# minutes apart with one image stamped and the other carrying the revision
+# label it inherited from the Hermes base -- a sha from another repository.
 docker-build-credential-proxy: ## Build the credential-proxy sidecar image.
-	docker build --platform linux/amd64 $(BASE_IMAGE_ARGS) --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --target credential-proxy -t $(REPO)/credential-proxy:latest -f deploy/docker/Dockerfile .
+	docker build --platform linux/amd64 $(BASE_IMAGE_ARGS) $(IMAGE_SOURCE_ARG) --build-arg HERMES_AGENT_TAG=$(HERMES_AGENT_TAG) --build-arg GIT_SHA=$(GIT_SHA) --target credential-proxy -t $(REPO)/credential-proxy:latest -f deploy/docker/Dockerfile .
 
 # Docker pushes
 docker-push: docker-push-agents docker-push-credential-proxy ## Build and push every image to $$REPO.
@@ -61,6 +81,17 @@ docker-push-credential-proxy: docker-build-credential-proxy ## Build and push th
 dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
 	@chmod +x scripts/installer/*.sh scripts/dev/*.sh 2>/dev/null || true
 	@./scripts/dev/dev_rebuild_agent.sh $(ARGS)
+
+# Read-only. Run `./scripts/selfimprove_ledger_view.py --help` for the filters,
+# and pass them through here as ARGS (e.g. ARGS="--detail 3").
+selfimprove-ledger: ## Show the self-improvement ledger from the current cluster (e.g. make selfimprove-ledger ARGS="--severity high").
+	@./scripts/selfimprove_ledger_view.py $(ARGS)
+
+# Five subcommands: preflight, secret, labels, values, verify. Run
+# `./scripts/selfimprove_enable.py --help` for the arguments each one takes, and
+# pass them through here as ARGS (e.g. ARGS="verify").
+selfimprove-enable: ## Set up and check the outside half of the self-improvement loop (e.g. make selfimprove-enable ARGS="preflight --mode upstream ...").
+	@./scripts/selfimprove_enable.py $(ARGS)
 
 # Copy every image in images.json into a registry of your own, for installs
 # that may only pull from an approved one. Run `./scripts/mirror_images.sh

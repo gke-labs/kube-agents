@@ -391,11 +391,28 @@ else
   # miss instead of cold-building. Default false so a broken cache source cannot
   # block the PR that fixes it.
   export CACHE_IMAGE="${CACHE_IMAGE:-us-docker.pkg.dev/kube-agents-prow/kube-agents/platform-agent:latest}"
+  # The revision stamped into /opt/build-info.json has to name the tree that was
+  # uploaded, and the upload below is `.` -- which under Prow is the PR merged
+  # into its base, not the PR head. PULL_PULL_SHA names the head, whose tree is a
+  # different one, so the stamp would point a reader at code that was not built.
+  #
+  # The cost of choosing accuracy here is that the merge commit exists on no
+  # remote, so the self-improvement runner could not fetch it: `git fetch` and
+  # codeload both 404 and the run aborts. That is the safe direction -- a refusal
+  # rather than a review of code the image does not contain -- and it costs
+  # nothing today, because this script never enables selfImprovement. Anything
+  # that changes either half of that has to revisit this line.
+  #
+  # scripts/git_revision_stamp.sh is the shared definition (full 40-character sha,
+  # `-dirty` from `git status --porcelain`). Tolerant of a missing helper for the
+  # same reason the old inline `|| echo ""` was: an unstamped PR image is a
+  # supported outcome, and failing the deploy over the stamp is worse.
+  BUILT_TREE_SHA="$("${SCRIPT_DIR}/../scripts/git_revision_stamp.sh" 2>/dev/null || echo "")"
   # The postsubmit's mode=max cache manifests; CACHE_IMAGE stays the fallback.
   export BUILDCACHE_IMAGE="${BUILDCACHE_IMAGE:-us-docker.pkg.dev/kube-agents-prow/kube-agents/platform-agent:buildcache}"
   export PROXY_BUILDCACHE_IMAGE="${PROXY_BUILDCACHE_IMAGE:-us-docker.pkg.dev/kube-agents-prow/kube-agents/credential-proxy:buildcache}"
   gcloud builds submit --config="deploy/docker/cloudbuild-ci.yaml" \
-    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false}" \
+    --substitutions="_PLATFORM_URI=${AR_REPO}/platform-agent:${TAG},_PROXY_URI=${AR_REPO}/credential-proxy:${TAG},_OPERATOR_URI=${AR_REPO}/kube-agents-operator:${TAG},_CACHE_IMAGE=${CACHE_IMAGE},_BUILDCACHE_IMAGE=${BUILDCACHE_IMAGE},_PROXY_BUILDCACHE_IMAGE=${PROXY_BUILDCACHE_IMAGE},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${TAG},_REQUIRE_CACHE=${REQUIRE_CACHE:-false},_GIT_SHA=${BUILT_TREE_SHA}" \
     --project="${PROJECT_ID}" "${BUILD_WORKER_ARGS[@]}" --quiet .
   echo "✓ Container image builds finished in $((SECONDS - STEP_START))s"
 fi

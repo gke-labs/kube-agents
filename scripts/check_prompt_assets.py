@@ -83,8 +83,10 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 
 # The profile source trees. `chat` is the Chat Agent (the `default` profile),
-# `cluster` is the per-cluster template the Platform Agent scaffolds at runtime.
-PROFILES = ("platform", "chat", "cluster")
+# `cluster` is the per-cluster template the Platform Agent scaffolds at runtime,
+# and `selfimprove` is the one the hourly self-improvement CronJob scaffolds
+# onto an emptyDir for its own run (docs/designs/self-improvement.md).
+PROFILES = ("platform", "chat", "cluster", "selfimprove")
 
 # Extensions an asset reference can end in. Anything else -- `.admin`,
 # `.global-static-ip-name`, `.conf` -- is a GCP role, an annotation key or an
@@ -152,6 +154,13 @@ PROFILE_HOME_ITEMS: dict[str, frozenset[str]] = {
     "cluster": frozenset(
         {"SOUL.md", "AGENTS.md", "CAPABILITIES.md", "config.yaml", "skills"}
     ),
+    # `scaffold_home` in agents/selfimprove/scripts/selfimprove_run.py, which
+    # names these three and nothing else. Two notable absences. `scripts`: the
+    # runner executes them from /opt/selfimprove/scripts and never copies them
+    # to the home, so a selfimprove document citing `scripts/x.py` is naming a
+    # path that does not exist where the agent reads from. `AGENTS.md`: this
+    # profile works in a checkout of kube-agents, which carries its own.
+    "selfimprove": frozenset({"SOUL.md", "config.yaml", "skills"}),
 }
 
 # The profile templates the entrypoint scaffolds from. Unlike /opt/defaults
@@ -160,6 +169,9 @@ OPT_TEMPLATES: tuple[tuple[str, str], ...] = (
     ("/opt/platform-template/", "agents/platform"),
     ("/opt/cluster-template/", "agents/cluster"),
     ("/opt/chat-template/", "agents/chat"),
+    # Not `-template` in the path, but the same thing: a whole-tree COPY the
+    # runner scaffolds from rather than a live profile.
+    ("/opt/selfimprove/", "agents/selfimprove"),
 )
 
 # Top-level repository directories. These make a token count as a *path* --

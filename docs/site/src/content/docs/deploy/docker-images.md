@@ -36,8 +36,8 @@ Tagged with the release version; `:latest` on every push to `main`.
 
 | Image | Upstream reference | Pin | Override | Pulled by |
 | ----- | ------------------ | --- | -------- | --------- |
-| `platform-agent` | `ghcr.io/gke-labs/kube-agents/platform-agent` | release tag | `PLATFORM_AGENT_IMAGE` | The agent Deployment the operator renders, and its sandbox init container. |
-| `credential-proxy` | `ghcr.io/gke-labs/kube-agents/credential-proxy` | release tag | `CREDENTIAL_PROXY_IMAGE` | The credential-proxy sidecar in the agent pod. |
+| `platform-agent` | `ghcr.io/gke-labs/kube-agents/platform-agent` | release tag | `PLATFORM_AGENT_IMAGE` | The agent Deployment the operator renders, its sandbox init container, and the optional self-improvement CronJob. |
+| `credential-proxy` | `ghcr.io/gke-labs/kube-agents/credential-proxy` | release tag | `CREDENTIAL_PROXY_IMAGE` | The credential-proxy sidecar in the agent pod, and in the self-improvement CronJob's pod under its fork and upstream modes. |
 | `k8s-operator` | `ghcr.io/gke-labs/kube-agents/k8s-operator` | release tag | `OPERATOR_IMAGE` | The controller-manager Deployment. |
 | `replay-proxy` | `ghcr.io/gke-labs/kube-agents/replay-proxy` | release tag | `REPLAY_IMAGE` | The optional inference-replay integration. |
 | `pubsub-platform` | `ghcr.io/gke-labs/kube-agents/pubsub-platform` | release tag | — | The pubsub-platform AgentPlugin. |
@@ -83,7 +83,7 @@ Built and published via GitHub Actions workflows on push to `main` (tagged with 
 
 ### `platform-agent`
 
-The agent Deployment image. Built from the `platform` target of [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile) on top of `nousresearch/hermes-agent`. It lays down the Planning Agent workspace at `/opt/defaults` (the `default` profile) plus two profile templates: the Platform Agent at `/opt/platform-template`, scaffolded into the `platform` profile at startup by the entrypoint, and the Cluster Agent at `/opt/cluster-template`, scaffolded into per-cluster `cluster-*` profiles at runtime by `cluster_agent_profile.py`.
+The agent Deployment image. Built from the `platform` target of [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile) on top of `nousresearch/hermes-agent`. It lays down the Planning Agent workspace at `/opt/defaults` (the `default` profile) plus three profile templates: the Platform Agent at `/opt/platform-template`, scaffolded into the `platform` profile at startup by the entrypoint; the Cluster Agent at `/opt/cluster-template`, scaffolded into per-cluster `cluster-*` profiles at runtime by `cluster_agent_profile.py`; and the self-improvement investigator at `/opt/selfimprove`, which `selfimprove_run.py` copies onto an emptyDir at the start of each run. The same image runs the self-improvement CronJob, and carries the build stamp the loop reads to learn which revision the agent is running before fetching that source from GitHub.
 
 - **Published by**: [`.github/workflows/docker-publish-ghcr.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-ghcr.yml)
 - **Also to GAR**: [`docker-publish-gcp.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-gcp.yml)
@@ -172,6 +172,35 @@ FROM ${HERMES_AGENT_IMAGE}:${HERMES_AGENT_TAG} AS agent-base
 The `ARG` has no default, so every build path has to pass it — the image-build workflows, `make docker-build-platform` and `make docker-build-credential-proxy`, and `dev_rebuild_agent.sh` all read it from `tags.env`. A build that omits it fails rather than falling back to `latest`.
 
 Bumping Hermes means editing `tags.env` and rebuilding both agent images: the pin is a build-time base, so nothing changes in a cluster until `platform-agent` and `credential-proxy` are rebuilt and rolled out.
+
+## Build-time provenance
+
+The agent image takes two more build args, both defaulting to empty:
+
+```bash
+docker build --platform linux/amd64 --target platform \
+  --build-arg GIT_SHA="$(git rev-parse HEAD)" \
+  --build-arg IMAGE_SOURCE=https://github.com/<owner>/kube-agents \
+  -f deploy/docker/Dockerfile .
+```
+
+`--target platform` is not optional. The Dockerfile's last stage is a test stage, so a build
+without it produces something other than the agent image.
+
+`GIT_SHA` sets the OCI `org.opencontainers.image.revision` label and is written to
+`/opt/build-info.json` inside the image, whose whole content is `{"revision":"<sha>"}`.
+`IMAGE_SOURCE` sets `org.opencontainers.image.source` and is not written to the file; it is what
+ghcr package linking and provenance scanners follow, which is why it defaults to empty rather than
+to the upstream URL — a fork's image would otherwise point at a repository that does not hold its
+code. The
+[self-improvement loop](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/self-improvement.md)
+reads `/opt/build-info.json` to decide which source revision it is auditing. An empty
+`revision` makes it refuse the run by default rather than guess, so a build whose
+image will run the loop should pass `GIT_SHA`; an install that cannot can set
+`selfImprovement.allowUnstampedImage: true` and get an investigation against
+`main`, whose line numbers may belong to neither the running image nor its
+source. Nothing else in the product reads the file, and the args sit at the end
+of the stage so a changing SHA rebuilds only the instruction that writes it.
 
 ## Private / custom registry
 

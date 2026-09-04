@@ -1163,6 +1163,19 @@ COPY --chown=hermes:hermes deploy/shared/defaults/ /opt/defaults/
 
 
 # 5.5. Install and enable hermes-otel plugin in /opt/defaults
+#
+# The source is `briancaffey/hermes-otel/hermes_otel`, not the repository root.
+# Upstream moved the plugin into that subdirectory in briancaffey/hermes-otel#54
+# (closing its #53) and released it as v1.0.0 BREAKING, so the root no longer
+# carries a plugin.yaml at all. Installing the root still exits 0 — with only a
+# warning — and `plugins enable` still succeeds, so the failure surfaces two
+# lines down instead: nothing was unpacked into plugins/hermes_otel/, and
+# write_text() into that missing parent directory raises FileNotFoundError. The
+# installed path is unchanged (plugin.yaml decides it, not the argument), which
+# is why only this one token moves.
+#
+# The source is unpinned — .install-metadata.json records "pinned": false — which
+# is how a semver-major break arrived here unannounced.
 RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins install briancaffey/hermes-otel/hermes_otel && \
     HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes plugins enable hermes_otel && \
     /opt/hermes/.venv/bin/python3 -c "import yaml, pathlib; p = pathlib.Path('/opt/defaults/plugins/hermes_otel/config.yaml'); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; c['backends'] = [{'name': 'gke-managed-otel', 'type': 'otlp', 'endpoint': 'http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces'}]; p.write_text(yaml.safe_dump(c))"
@@ -1368,8 +1381,8 @@ COPY --chown=hermes:hermes agents/platform/hindsight/ /opt/platform-template/hin
 # with the platform config. It checks the relay patches copied to
 # /opt/defaults/scripts above against the Hermes tree they monkeypatch, which
 # is why it cannot run in CI: this is the `platform` chain that
-# `scripts/check_image_layers.py` measures, and it sits at 114 of the 120 layers
-# that check allows, so a COPY/RUN pair of its own spends a third of what is
+# `scripts/check_image_layers.py` measures, and it sits at 116 of the 120 layers
+# that check allows, so a COPY/RUN pair of its own spends half of what is
 # left. See the
 # module docstring for what a failure here means.
 COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml
@@ -1393,6 +1406,25 @@ assert cfg.get('agent', {}).get('max_turns') == 250, 'iteration budget lost: %r'
 # Copy the Cluster Agent profile TEMPLATE (persona, config, skills), scaffolded
 # into per-cluster Hermes profiles at runtime by scripts/cluster_agent_profile.py.
 COPY --chown=hermes:hermes agents/cluster/ /opt/cluster-template/
+
+# The self-improvement runner: its persona, its profile config, its two skills,
+# and the three Python modules that drive one hourly run
+# (docs/designs/self-improvement.md). Like the cluster template above, this is a
+# TEMPLATE — selfimprove_run.py copies it onto an emptyDir at the start of each
+# run, so nothing here is ever the live profile.
+#
+# It ships in the agent image and not one of its own, which is the single thing
+# the loop shares with the rest of the install. The reason is in the design's
+# §2: the runner's first job is to say which commit the observed pod is running,
+# and the only statement of that nobody has to be trusted to keep in step is the
+# one carried by the very image the pod was started from. A separate image would
+# have to be told, and something would eventually tell it wrong.
+#
+# It costs one layer, and `scripts/check_image_layers.py` fails the build over
+# 120 (overlay2 itself stops at 128) — see the layer-budget note
+# at the top of this file. Its permissions ride the normalization RUN below
+# rather than buying a second.
+COPY --chown=hermes:hermes agents/selfimprove/ /opt/selfimprove/
 
 # Plugins land in the shared plugin root regardless of which profile owns them —
 # /opt/hermes/plugins is the only path Hermes resolves them from. The source
@@ -1470,6 +1502,13 @@ COPY agents/platform/plugins/ agents/chat/plugins/ /tmp/repo-plugins/
 #     rewrite-the-image-copy-and-let-the-entrypoint-propagate-it route the two
 #     templates above are covered against, over a file that holds toolsets,
 #     plugins.enabled and mcp_servers.
+#   - /opt/selfimprove, the self-improvement loop's own SOUL.md and two SKILL.md
+#     files. selfimprove_run.py re-copies the tree onto a fresh emptyDir at the
+#     start of every run, so the image copy is what each hourly investigation
+#     reads its instructions from — and the process reading them runs as the same
+#     uid that would be writing them. The loop investigates its own installation,
+#     which makes "the agent rewrites the instructions it is about to be given"
+#     the exact shape this barrier exists to prevent.
 #
 # /opt/defaults itself stays hermes-owned, scripts/ aside. It is the Chat Agent's
 # own default profile, and while the entrypoint copies it onto the PVC at boot, the
@@ -1601,12 +1640,12 @@ COPY agents/platform/plugins/ agents/chat/plugins/ /tmp/repo-plugins/
 # account for.
 RUN set -eu; \
     chown -R hermes:hermes /opt/defaults; \
-    for d in /opt/defaults /opt/hermes/skills /opt/cluster-template /opt/platform-template /opt/chat-template /tmp/repo-plugins; do \
+    for d in /opt/defaults /opt/hermes/skills /opt/cluster-template /opt/platform-template /opt/chat-template /opt/selfimprove /tmp/repo-plugins; do \
         find "$d" -type d -exec chmod 755 {} + ; \
         find "$d" -type f -exec chmod 644 {} + ; \
     done; \
     find /opt/defaults/scripts -type f -exec chmod 755 {} + ; \
-    for d in /opt/hermes/skills /opt/platform-template /opt/cluster-template; do \
+    for d in /opt/hermes/skills /opt/platform-template /opt/cluster-template /opt/selfimprove; do \
         find "$d" -path '*/scripts/*' -type f -exec chmod 755 {} + ; \
     done; \
     cp -a /tmp/repo-plugins/. /opt/hermes/plugins/; \
@@ -1625,7 +1664,47 @@ RUN set -eu; \
             || { echo "manifest for $d has $(wc -l < "$d/skills_manifest.sha256") entries, expected $n" >&2; exit 1; }; \
         chmod 644 "$d/skills_manifest.sha256"; \
     done; \
-    chown -R root:root /opt/hermes/skills /opt/platform-template /opt/cluster-template /opt/chat-template /opt/defaults/scripts
+    chown -R root:root /opt/hermes/skills /opt/platform-template /opt/cluster-template /opt/chat-template /opt/selfimprove /opt/defaults/scripts
+
+# The revision stamp: which commit this image was built from.
+#
+# Nothing else in the image answers that question. `.dockerignore` excludes
+# `.git`, so there is no repository to interrogate; the operator's
+# manifest_helpers.go omits a version from what it renders; and the registry
+# knows only because docker-publish-ghcr.yml happens to tag with
+# `${{ github.sha }}` — a convention, not a guarantee, and one a local
+# `make dev-rebuild-agent` does not follow. An agent asked to audit "the deployed code" therefore had no
+# grounded way to say which code that was, and would have reasoned about `main`.
+# See docs/designs/self-improvement.md §2.
+#
+# LAST in the stage, and that placement is deliberate. GIT_SHA changes on every
+# commit, and an ARG invalidates every layer BELOW it — declared any higher, the
+# compileall pass above (and, higher still, the config merges) would rebuild on
+# every single commit. Here the churn is bounded to this one instruction, which
+# writes 100 bytes.
+#
+# Both default to empty rather than to a placeholder like "unknown": the runner
+# treats an empty revision as a refusal to investigate, and a plausible-looking
+# default would turn that refusal into a confident wrong answer. A build that
+# wants the loop to work passes the full 40-character sha,
+# --build-arg GIT_SHA="$(git rev-parse HEAD)"; scripts/git_revision_stamp.sh is
+# the shared implementation, and its header says why an abbreviation is not
+# enough. IMAGE_SOURCE defaults to empty for the same reason the revision does:
+# ghcr package linking and provenance scanners follow that label, so a hardcoded
+# upstream URL would point them at a repository that does not hold a fork's
+# code, and no label is better than a confidently wrong one.
+ARG GIT_SHA=""
+ARG IMAGE_SOURCE=""
+LABEL org.opencontainers.image.revision="${GIT_SHA}"
+LABEL org.opencontainers.image.source="${IMAGE_SOURCE}"
+# /opt/build-info.json is what the self-improvement runner actually reads; the
+# label above is what registries and scanners read. Keep them in step -- a
+# release gate that checks only the label would stay green if this instruction
+# were deleted, typo'd, or moved out from under the ARGs, and every deployed pod
+# would fall back to report-only.
+RUN set -eu; \
+    printf '{"revision":"%s"}\n' "${GIT_SHA}" > /opt/build-info.json; \
+    chmod 644 /opt/build-info.json
 
 USER 10000:10000
 
@@ -1782,6 +1861,23 @@ COPY --chown=root:root --chmod=0755 \
      deploy/shared/profile_plugins.py \
      deploy/shared/otel_config.py \
      /opt/defaults/scripts/
+
+# The same stamp the `platform` stage takes, for a reason that is specific to
+# this stage rather than symmetry. Labels are inherited, and the Hermes base
+# image carries an
+# `org.opencontainers.image.revision` of its own: without these two lines this
+# image ships a commit sha that does not exist in this repository, so a
+# provenance scanner or an incident responder resolving the revision of a
+# security-sensitive credential sidecar reads somebody else's history. The
+# empty default is what the block in the `platform` stage argues for -- no
+# label beats a confidently wrong one -- and here it also *displaces* one.
+#
+# No /opt/build-info.json: that file exists for the self-improvement runner,
+# which reads the agent image and never runs here.
+ARG GIT_SHA=""
+ARG IMAGE_SOURCE=""
+LABEL org.opencontainers.image.revision="${GIT_SHA}"
+LABEL org.opencontainers.image.source="${IMAGE_SOURCE}"
 
 USER 10000:10000
 

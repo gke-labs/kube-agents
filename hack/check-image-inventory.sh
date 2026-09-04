@@ -193,6 +193,51 @@ default_images="$(chart_images)" || exit 1
 }
 mirrored_images="$(chart_images --set "global.imageRegistry=$MIRROR")" || exit 1
 
+# The self-improvement loop is off in the default values, so the render above
+# sees none of its containers. Render it once more with the loop on, in the mode
+# that pulls the most, and fold the result into both lists so checks 3a, 3b and
+# 3c cover it without being written twice.
+#
+# Not a no-op. The loop's runner does reuse the agent image the default render
+# already carries, but its fork and upstream modes also add the credential proxy
+# as a native sidecar, and templates/self-improvement.yaml is the only chart
+# template that emits that image at all -- the platform agent's own proxy
+# sidecar is rendered by the operator, not by the chart. Delete this render and
+# checks 3a, 3b and 3c stop seeing the credential-proxy reference entirely:
+# nothing would then notice it drifting off its images.json pin, rendering
+# outside the mirror prefix, or landing on a path `make mirror-images` never
+# pushed to.
+SELFIMPROVE_VALUES=(
+  --set selfImprovement.enabled=true
+  --set selfImprovement.mode=upstream
+  --set selfImprovement.github.patSecret=ci-pat
+  --set selfImprovement.github.forkRepo=ci-fork/kube-agents
+)
+#
+# `image:` fields only, unlike chart_images. Enabling the loop adds no operator
+# env var, so the second pattern would contribute nothing new -- and the loop's
+# own env carries a PATH and a comma-joined URL list, both of which look enough
+# like `<path>:<tag>` to be reported as un-mirrored images.
+selfimprove_image_fields() {
+  local rendered
+  rendered="$(helm template test-release charts/kube-agents "${REQUIRED_VALUES[@]}" "${SELFIMPROVE_VALUES[@]}" "$@")" || {
+    echo "ERROR: 'helm template' failed for the chart with the self-improvement loop enabled${*:+ and $*} — see the error above." >&2
+    return 1
+  }
+  # `"\{0,1\}` rather than `"\?`: the latter is a GNU extension that BSD sed
+  # matches literally, so on a developer's macOS the pattern silently extracts
+  # nothing and the guard below fires.
+  sed -n -e 's/^[[:space:]]*image:[[:space:]]*"\{0,1\}\([^"]*\)"\{0,1\}[[:space:]]*$/\1/p' <<<"$rendered" | sort -u
+}
+selfimprove_images="$(selfimprove_image_fields)" || exit 1
+selfimprove_mirrored="$(selfimprove_image_fields --set "global.imageRegistry=$MIRROR")" || exit 1
+[ -n "$selfimprove_images" ] || {
+  echo "ERROR: the chart rendered no image references with the self-improvement loop enabled — the render or the extraction no longer works, so the loop's own image pins are unchecked." >&2
+  exit 1
+}
+default_images="$(printf '%s\n%s\n' "$default_images" "$selfimprove_images" | sort -u)"
+mirrored_images="$(printf '%s\n%s\n' "$mirrored_images" "$selfimprove_mirrored" | sort -u)"
+
 # 3a. Default install: every rendered image must be in the inventory, at the
 #     pin the inventory carries, so the mirror built from it is complete and
 #     the tags it holds are the tags the install asks for. Matching on the

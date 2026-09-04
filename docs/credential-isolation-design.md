@@ -146,7 +146,11 @@ than to the Pod spec.
 
 ### In scope
 
-- PlatformAgent only.
+- PlatformAgent, and, as a second independently-configured instance of this
+  same sidecar script, the self-improvement loop's CronJob pod — that
+  instance's own scope, grants, and the behavior gated behind
+  `CREDENTIAL_PROXY_UNTRUSTED_WORKSPACE` are owned by
+  `docs/designs/self-improvement.md` §6, not by this document.
 - Credentials managed by the operator.
 - CLI forwarding for `gcloud`, `kubectl`, `gh`, and `git`.
 - Slack and Google Chat credentialed relays.

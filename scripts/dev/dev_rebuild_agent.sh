@@ -109,6 +109,14 @@ if [ -z "$HERMES_AGENT_TAG" ]; then
 fi
 
 DEV_TAG="dev-$(date +%Y%m%d-%H%M%S)"
+
+# The revision stamp baked into /opt/build-info.json: the full 40-character SHA,
+# plus `-dirty` when the tree has any modification. This used to be spelled out
+# here and differently again in the Makefile, which is how the Makefile came to
+# ship abbreviations the self-improvement runner accepts and `git fetch`
+# refuses. scripts/git_revision_stamp.sh is now the one definition, and its
+# header carries the reasoning.
+GIT_SHA="$("${REPO_ROOT}/scripts/git_revision_stamp.sh" "${REPO_ROOT}" 2>/dev/null || echo "")"
 IMAGE_BASE="$REGION-docker.pkg.dev/$PROJECT_ID/$GCP_ARTIFACT_REGISTRY_REPO_NAME/$IMAGE_NAME"
 IMAGE_URI="$IMAGE_BASE:$DEV_TAG"
 IMAGE_URI_LATEST="$IMAGE_BASE:latest"
@@ -150,7 +158,7 @@ execute_image_build() {
     # KUBE_AGENTS_VERSION is the dev tag: it is what the agent's remote MCP
     # calls report as their User-Agent, so traffic from a hand-built image is
     # distinguishable from a published one.
-    DOCKER_BUILDKIT=1 docker build --platform linux/amd64 --cache-from "$IMAGE_URI_LATEST" --build-arg BUILDKIT_INLINE_CACHE=1 --build-arg HERMES_AGENT_TAG="$HERMES_AGENT_TAG" --build-arg KUBE_AGENTS_VERSION="$DEV_TAG" --target "$AGENT_TARGET" -t "$IMAGE_URI" -t "$IMAGE_URI_LATEST" -f "${REPO_ROOT}/deploy/docker/Dockerfile" "${REPO_ROOT}" || return 1
+    DOCKER_BUILDKIT=1 docker build --platform linux/amd64 --cache-from "$IMAGE_URI_LATEST" --build-arg BUILDKIT_INLINE_CACHE=1 --build-arg HERMES_AGENT_TAG="$HERMES_AGENT_TAG" --build-arg GIT_SHA="$GIT_SHA" --build-arg KUBE_AGENTS_VERSION="$DEV_TAG" --target "$AGENT_TARGET" -t "$IMAGE_URI" -t "$IMAGE_URI_LATEST" -f "${REPO_ROOT}/deploy/docker/Dockerfile" "${REPO_ROOT}" || return 1
     print_info "Pushing images to Artifact Registry ($IMAGE_BASE)..."
     docker push "$IMAGE_URI" || return 1
     docker push "$IMAGE_URI_LATEST" || return 1
@@ -164,7 +172,7 @@ execute_image_build() {
       cd "${REPO_ROOT}"
       gcloud builds submit \
           --config="deploy/docker/cloudbuild.yaml" \
-          --substitutions="_IMAGE_URI=${IMAGE_URI},_IMAGE_URI_LATEST=${IMAGE_URI_LATEST},_TARGET=${AGENT_TARGET},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_KUBE_AGENTS_VERSION=${DEV_TAG}" \
+          --substitutions="_IMAGE_URI=${IMAGE_URI},_IMAGE_URI_LATEST=${IMAGE_URI_LATEST},_TARGET=${AGENT_TARGET},_HERMES_AGENT_TAG=${HERMES_AGENT_TAG},_GIT_SHA=${GIT_SHA},_KUBE_AGENTS_VERSION=${DEV_TAG}" \
           --project="${PROJECT_ID}" \
           ${BUILD_POOL_ARGS[@]+"${BUILD_POOL_ARGS[@]}"} \
           .

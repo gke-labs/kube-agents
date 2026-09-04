@@ -92,6 +92,7 @@ steps:
           -f deploy/docker/Dockerfile \
           --target platform \
           --build-arg HERMES_AGENT_TAG="$_HERMES_AGENT_TAG" \
+          --build-arg GIT_SHA="$_GIT_SHA" \
           --build-arg KUBE_AGENTS_VERSION="$_KUBE_AGENTS_VERSION" \
           .
 
@@ -169,3 +170,9 @@ substitutions:
   _HERMES_AGENT_TAG: ""
   _KUBE_AGENTS_VERSION: "dev"
   _REQUIRE_CACHE: "false"
+  # The revision stamp for /opt/build-info.json. Empty is legal and means
+  # "unknown". hack/ci-deploy.sh passes `git rev-parse HEAD` of the tree it
+  # uploads -- under Prow that is the PR merged into its base, a commit that
+  # exists on no remote, so the stamp names what was built but cannot be
+  # fetched. See the comment there for why that trade is the right way round.
+  _GIT_SHA: ""

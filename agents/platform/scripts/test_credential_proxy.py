@@ -5,6 +5,7 @@ import logging
 import os
 import queue
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -1367,6 +1368,726 @@ class GitLeaseGateWiringTest(unittest.TestCase):
         # gate let it through rather than answering 403 itself.
         self.assertEqual(200, status)
         self.assertEqual("completed", body["status"])
+
+
+class UntrustedWorkspaceTest(unittest.TestCase):
+    """The two refusals that assume the workspace was written by an attacker.
+
+    Off unless `CREDENTIAL_PROXY_UNTRUSTED_WORKSPACE` says otherwise, because
+    both change what argv the proxy accepts and every caller predating them was
+    written against the old rules. The self-improvement loop turns them on: its
+    agent turns write the tree and then ask the sidecar to run git in it, so the
+    tree is attacker-controlled input to the one process holding the credential.
+
+    What they answer is a policy that constrained subcommands and never files.
+    `git hash-object -w /var/run/secrets/selfimprove-github/token` was refused by
+    no rule, and `/v1/exec` returns stdout to the caller unredacted.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+
+    def executor(self, untrusted=True, **environment):
+        if untrusted:
+            environment.setdefault("CREDENTIAL_PROXY_UNTRUSTED_WORKSPACE", "1")
+        with mock.patch.dict(os.environ, environment):
+            return CommandExecutor(
+                timeout_seconds=5, max_output_bytes=1 << 16, state_dir=self.temp_dir.name
+            )
+
+    def test_off_by_default(self):
+        executor = self.executor(untrusted=False)
+        self.assertFalse(executor.untrusted_workspace)
+        self.assertIsNone(
+            executor.argv_path_violation(
+                ["git", "hash-object", "-w", "/etc/passwd"], str(executor.workspace_dir)
+            )
+        )
+
+    def test_the_flag_reads_the_usual_spellings(self):
+        for value, expected in (
+            ("1", True), ("true", True), ("yes", True), ("on", True),
+            ("0", False), ("false", False), ("", False), ("off", False),
+        ):
+            with self.subTest(value=value):
+                executor = self.executor(
+                    untrusted=False, CREDENTIAL_PROXY_UNTRUSTED_WORKSPACE=value
+                )
+                self.assertEqual(expected, executor.untrusted_workspace)
+
+    def test_an_absolute_path_outside_the_workspace_is_refused(self):
+        executor = self.executor()
+        cwd = str(executor.workspace_dir)
+        for argv in (
+            # The credential itself, and gh's store beside it. Every one of
+            # these subcommands prints or stores what it is pointed at.
+            ["git", "hash-object", "-w", "/var/run/secrets/selfimprove-github/token"],
+            ["git", "diff", "--no-index", "/dev/null", "/var/lib/credential-proxy/home/.config/gh/hosts.yml"],
+            ["git", "grep", "-h", "-f", "/etc/passwd", "--", "."],
+            ["gh", "pr", "create", "--body-file", "/var/run/secrets/selfimprove-github/token"],
+            # The `=` spelling of the same flag, which is the one a rule about
+            # `--body-file <path>` misses.
+            ["gh", "pr", "create", "--body-file=/etc/passwd"],
+            ["gh", "issue", "comment", "--body-file=/var/lib/credential-proxy/x"],
+        ):
+            with self.subTest(argv=argv):
+                violation = executor.argv_path_violation(argv, cwd)
+                self.assertIsNotNone(violation)
+                self.assertIn("outside the workspace", violation)
+
+    def test_a_relative_traversal_out_of_the_workspace_is_refused(self):
+        # `_execute` contains `cwd`; it does not read argv. So a contained cwd
+        # plus enough `..` is the same read spelled relatively, and the
+        # leading-slash test alone never sees it.
+        executor = self.executor()
+        deep = executor.workspace_dir / "base" / "abc" / "repo"
+        deep.mkdir(parents=True)
+        climb = "../" * 8
+        for argv in (
+            ["git", "diff", "--no-index", "/dev/null", climb + "etc/passwd"],
+            ["gh", "pr", "create", "--body-file=" + climb + "etc/passwd"],
+            ["git", "hash-object", "-w", climb + "var/run/secrets/x/token"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(executor.argv_path_violation(argv, str(deep)))
+
+    def test_a_free_text_value_describing_traversal_is_not_a_path(self):
+        # `pathlib` parses a joined-on string for `/` exactly as it would a
+        # literal path, so a commit message or PR title describing the exact
+        # vulnerability class this loop exists to report -- a path traversal
+        # -- resolves outside the workspace the same way a real argument
+        # would, and was refused reporting it. A free-text value is exempted
+        # when it names nothing on disk, which is every sentence; see
+        # `test_a_free_text_flag_does_not_hide_a_file_that_is_there` for the
+        # other half.
+        executor = self.executor()
+        cwd = executor.workspace_dir / "repo"
+        cwd.mkdir(parents=True)
+        # Eight, not three: a `../` following a word glues that word to the
+        # first component, so `via ../../../x` climbs two levels and from a
+        # cwd one below the workspace root it never leaves.
+        message = "fix: path traversal via " + "../" * 8 + "etc/passwd in the upload handler"
+        for argv in (
+            ["git", "commit", "-m", message],
+            ["git", "commit", "--message", message],
+            ["git", "commit", "--message=" + message],
+            ["gh", "pr", "create", "--title", message],
+            ["gh", "pr", "create", "--title=" + message],
+            ["gh", "pr", "create", "--body", "/" + message],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(executor.argv_path_violation(argv, str(cwd)))
+        # A flag that genuinely does take a path is unaffected: this is an
+        # exemption for free-text flags, not a hole in the check itself.
+        self.assertIsNotNone(
+            executor.argv_path_violation(
+                ["gh", "pr", "comment", "--body-file", "../../../var/run/secrets/token"],
+                str(cwd),
+            )
+        )
+
+    def test_a_free_text_flag_does_not_hide_a_file_that_is_there(self):
+        # `_FREE_TEXT_FLAGS` is matched without knowing the subcommand, and one
+        # short flag carries prose for one command and nothing at all for
+        # another: `-b` is `gh pr create`'s body, and `git diff`'s
+        # `--ignore-space-change`, which takes no value. Skipping the token
+        # after it walked the mounted credential past the whole check and
+        # printed it as a diff.
+        executor = self.executor()
+        outside = Path(self.temp_dir.name) / "sidecar-state"
+        outside.mkdir(parents=True)
+        (outside / "token").write_text("DECOY-NOT-A-REAL-TOKEN\n")
+        cwd = executor.workspace_dir / "src"
+        cwd.mkdir(parents=True)
+        (cwd / "empty").write_text("")
+        (executor.workspace_dir / "escape").symlink_to(outside)
+        secret = str(outside / "token")
+        for argv in (
+            ["git", "diff", "--no-index", "-b", secret, "empty"],
+            ["git", "diff", "--no-index", "-m", secret, "empty"],
+            ["git", "diff", "--no-index", "-b", "../escape/token", "empty"],
+            ["git", "diff", "--no-index", "--message=" + secret, "empty"],
+            ["gh", "pr", "create", "--title", secret],
+            ["gh", "release", "create", "v1", "--notes", secret],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(executor.argv_path_violation(argv, str(cwd)))
+
+    def test_attached_shorthand_carries_prose_the_way_the_spaced_form_does(self):
+        # `git commit -mfix: ...` is the same message written without the
+        # space. Reading the whole token as a path refused the filing turn a
+        # spelling `policy_match_text` already understood.
+        executor = self.executor()
+        cwd = executor.workspace_dir / "src"
+        cwd.mkdir(parents=True)
+        # The climb has to clear the workspace to be worth asserting on. A
+        # `../` directly after a word joins that word into one component, so
+        # `via ../../../x` is two `..` and not three, and from a cwd one level
+        # down it lands back inside and passes whatever the code does.
+        message = "fix: path traversal via " + "../" * 8 + "etc/passwd in the loader"
+        self.assertIsNone(executor.argv_path_violation(["git", "commit", "-m" + message], str(cwd)))
+        # Not a licence to glue a real path on either.
+        outside = Path(self.temp_dir.name) / "sidecar-state"
+        outside.mkdir(parents=True)
+        (outside / "token").write_text("DECOY-NOT-A-REAL-TOKEN\n")
+        self.assertIsNotNone(
+            executor.argv_path_violation(
+                ["git", "diff", "--no-index", "-b" + str(outside / "token"), "empty"], str(cwd)
+            )
+        )
+
+    def test_a_glued_flag_value_is_split_before_it_is_resolved(self):
+        # `--body-file=..` is a single literal component, so resolving the whole
+        # token both absorbs one `..` and adds a directory level: the check
+        # landed two levels shallower than the file `gh` opens. With the
+        # workspace at /home/selfimprove that put the mounted credential inside
+        # it, and the spelling differed from the already-refused `--body-file
+        # <path>` only by the `=`. Both depths that fit that two-deep window are
+        # exercised here; the `"../" * 8` case above over-climbs past it and so
+        # cannot see this.
+        executor = self.executor()
+        cwd = executor.workspace_dir / "src"
+        cwd.mkdir(parents=True)
+        for depth in (2, 3):
+            target = "../" * depth + "var/run/secrets/selfimprove-github/token"
+            with self.subTest(depth=depth):
+                glued = executor.argv_path_violation(
+                    ["gh", "pr", "create", "--body-file=" + target], str(cwd)
+                )
+                spaced = executor.argv_path_violation(
+                    ["gh", "pr", "create", "--body-file", target], str(cwd)
+                )
+                self.assertIsNotNone(spaced)
+                # The `=` is not a way to spell a path the space form refuses.
+                self.assertIsNotNone(glued)
+
+    def test_a_planted_symlink_cannot_walk_out_of_the_workspace(self):
+        # The runner writes the workspace emptyDir and the sidecar mounts the
+        # same one, so a symlink in the checkout is attacker-supplied. It needs
+        # no `..` and no leading `/`, which is the shape a check that tested
+        # token spelling before resolving never looked at.
+        executor = self.executor()
+        outside = Path(self.temp_dir.name) / "sidecar-state"
+        outside.mkdir(parents=True)
+        (outside / "token").write_text("DECOY-NOT-A-REAL-TOKEN\n")
+        cwd = executor.workspace_dir / "src"
+        cwd.mkdir(parents=True)
+        (executor.workspace_dir / "escape").symlink_to(outside)
+        (cwd / "notes.md").symlink_to(outside / "token")
+        for argv in (
+            ["git", "diff", "--no-index", "../escape/token", "empty"],
+            ["git", "diff", "--no-index", "notes.md", "empty"],
+            ["gh", "pr", "create", "--body-file=notes.md"],
+            ["gh", "pr", "create", "--body-file", "../escape/token"],
+            ["git", "hash-object", "-w", "../escape/token"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(executor.argv_path_violation(argv, str(cwd)))
+
+    def test_the_workspace_itself_is_reachable(self):
+        # HERMES_HOME is inside the workspace root, so the filing skill's
+        # `--body-file "$HERMES_HOME/pr-body.md"` has to survive this.
+        executor = self.executor()
+        cwd = str(executor.workspace_dir)
+        inside = str(executor.workspace_dir / "pr-body.md")
+        for argv in (
+            ["gh", "pr", "create", "--body-file", inside],
+            ["gh", "pr", "create", "--body-file=" + inside],
+            ["git", "add", "agents/selfimprove/scripts/selfimprove_run.py"],
+            ["git", "commit", "-m", "fix(run): close the file handle"],
+            ["git", "push", "-u", "fork", "HEAD"],
+            ["git", "show", "-s", "--format=%cI", "HEAD"],
+            ["git", "fetch", "--quiet", "--depth", "1", "origin", "abc123"],
+            ["git", "switch", "-c", "selfimprove/errors-close-handle"],
+            # A `..` inside a word is not a path component, and prose is where
+            # one shows up. Refusing these would cost the loop its filing turn
+            # for a finding whose title happens to mention a relative path.
+            ["git", "commit", "-m", "fix: the loader resolves ../x from the wrong root"],
+            ["git", "commit", "-m", "docs: explain why KEY=/opt/x is ignored"],
+            ["gh", "pr", "create", "--title", "fix: /etc/passwd is read at startup"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(executor.argv_path_violation(argv, cwd))
+
+    def test_argv_zero_is_not_a_path_to_check(self):
+        # `_execute` resolves the executable itself against `self.executables`,
+        # which is the sidecar's own PATH and deliberately outside the
+        # workspace. Reading it as an argument would refuse every command.
+        executor = self.executor()
+        self.assertIsNone(
+            executor.argv_path_violation(
+                ["/usr/bin/git", "status"], str(executor.workspace_dir)
+            )
+        )
+
+    def test_git_config_is_pinned_over_the_repositorys_own(self):
+        """`.git/config` is a file the agent writes and git runs.
+
+        `core.hooksPath`, `core.pager`, `core.sshCommand` and `credential.helper`
+        are all read out of the repository and executed, with no flag involved --
+        so `selfimprove.no-git-config-injection`, which reads `-c key=value`,
+        cannot see any of it. `GIT_CONFIG_COUNT` is read exactly where `-c` is,
+        which is above repo-local config rather than under it.
+        """
+        executor = self.executor()
+        # No gh config in the test's state dir, so the re-arm is empty and the
+        # injected list is `HARDENED_GIT_CONFIG` followed by the base layer
+        # every command gets. The re-arm has its own tests below; this one is
+        # about what gets pinned.
+        self.assertEqual((), executor.credential_helper_rearm())
+        environment = self.git_environment(executor)
+        # Both lists reach git, in this order. `GIT_CONFIG_COUNT` is one number
+        # covering the whole numbered set, so a renderer that wrote its own list
+        # over the other one would leave this holding a single list -- and would
+        # do it silently, which is why the assertion is the concatenation rather
+        # than a spot-check of a few keys.
+        pairs = self.pinned_pairs(environment)
+        self.assertEqual(
+            list(credential_proxy.HARDENED_GIT_CONFIG)
+            + list(executor.forced_git_config),
+            pairs,
+        )
+        pinned = self.resolved(environment)
+        self.assertEqual("cat", pinned["core.pager"])
+        self.assertEqual("false", pinned["core.editor"])
+        # Not pinned, deliberately: see the comment above `diff.external`'s
+        # removal from `HARDENED_GIT_CONFIG`. Asserted absent so a future
+        # re-add of the broken `""` value fails a test instead of a `git diff`.
+        self.assertNotIn("diff.external", pinned)
+        self.assertEqual("never", pinned["protocol.ext.allow"])
+        # An empty `credential.helper` resets the list. It must stay empty
+        # rather than being dropped: a repository that sets one of its own would
+        # otherwise have it honoured. What it resets is the whole accumulated
+        # list, gh's host-scoped entry included, which is why
+        # `credential_helper_rearm` appends that entry back after this one.
+        self.assertEqual("", pinned["credential.helper"])
+        # And the global config must stay nameable, because that file is where
+        # the re-arm reads gh's helper from. The neighbouring idea --
+        # GIT_CONFIG_GLOBAL=/dev/null -- takes the file away and severs
+        # authenticated push.
+        self.assertEqual(
+            str(executor.git_config_global), environment["GIT_CONFIG_GLOBAL"]
+        )
+        # `url.<x>.insteadOf` can turn the https remote into an ssh one, which is
+        # what puts `core.sshCommand` within reach of a repository; signing is
+        # what puts `gpg.program` there. Neither is used here, so both are shut.
+        self.assertEqual("false", pinned["core.sshCommand"])
+        self.assertEqual("false", pinned["commit.gpgsign"])
+        # The keys only the base layer carries. They are what a single-list
+        # renderer drops, and dropping them leaves the untrusted path weaker
+        # than the trusted one at running a program named by the repository's
+        # own signing config.
+        self.assertEqual("false", pinned["tag.gpgSign"])
+        self.assertEqual("false", pinned["gpg.program"])
+        self.assertEqual("false", pinned["gpg.ssh.program"])
+        self.assertEqual("false", pinned["gpg.ssh.defaultKeyCommand"])
+        self.assertEqual("false", pinned["gpg.x509.program"])
+        self.assertEqual("0", pinned["help.autocorrect"])
+        # `core.hooksPath` is in both lists, and the base layer is rendered
+        # second so its value is the one git resolves: a real empty directory
+        # the agent cannot write, which is a stronger claim than `/dev/null`, a
+        # path that merely does not exist. Asserted on the resolved value rather
+        # than on the ordered list, because that is what a reordering would
+        # change.
+        self.assertEqual(str(executor.git_hooks_dir), pinned["core.hooksPath"])
+        # Three keys appear twice on purpose. Naming them is what turns a fourth
+        # duplicate into a failure rather than a key that silently resolves to
+        # whichever copy happened to land last.
+        keys = [key for key, _ in pairs]
+        self.assertEqual(
+            ["commit.gpgsign", "core.fsmonitor", "core.hooksPath"],
+            sorted({key for key in keys if keys.count(key) > 1}),
+        )
+
+    def test_ordinary_git_still_works_when_the_workspace_is_untrusted(self):
+        # The test above asserts the pinned *environment*; this one runs real
+        # git under it, which is what actually would have caught the bug the
+        # environment-only assertion missed. `diff.external` was pinned to ""
+        # here until this fix, and git reads an empty value as a program to
+        # execute rather than as "off", so every `git diff` under the
+        # untrusted path died with `fatal: external diff died` (exit 128)
+        # while `test_git_config_is_pinned_over_the_repositorys_own` stayed
+        # green -- it only checks what was sent to git, not what git did
+        # with it.
+        executor = self.executor()
+        repository = executor.workspace_dir / "repo"
+        repository.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "init", "--quiet"], cwd=repository, check=True, capture_output=True
+        )
+        tracked = repository / "manifest.yaml"
+        tracked.write_text("replicas: 1\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "manifest.yaml"],
+            cwd=repository, check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t.invalid",
+             "commit", "--quiet", "-m", "seed"],
+            cwd=repository, check=True, capture_output=True,
+        )
+        tracked.write_text("replicas: 2\n", encoding="utf-8")
+        for argv in (
+            ["git", "diff"],
+            ["git", "diff", "--cached", "--quiet"],
+            ["git", "status", "--porcelain"],
+        ):
+            result = executor.execute(argv, cwd=str(repository))
+            self.assertEqual(0, result.exit_code, f"{argv}: {result.stderr}")
+
+    def test_only_the_base_layer_is_pinned_when_the_workspace_is_trusted(self):
+        """The hardening is opt-in. The base layer is not.
+
+        `forced_git_config` is rendered into every command's environment
+        whatever the setting, so "nothing is pinned" is no longer the claim --
+        what has to be absent are the keys the untrusted path adds on top.
+        """
+        executor = self.executor(untrusted=False)
+        pinned = self.resolved(self.git_environment(executor))
+        self.assertEqual(str(executor.git_hooks_dir), pinned["core.hooksPath"])
+        for key in (
+            "core.pager",
+            "core.editor",
+            "sequence.editor",
+            "diff.external",
+            "protocol.ext.allow",
+            "credential.helper",
+            "core.sshCommand",
+        ):
+            self.assertNotIn(key, pinned)
+
+    HOST_SCOPED_HELPER = "!/usr/bin/gh auth git-credential"
+
+    def seed_gh_global_config(self, executor, body=None):
+        """The global config `gh auth setup-git` leaves behind.
+
+        Its own empty reset is included, because dropping that line is what the
+        re-arm has to do and a fixture without it cannot show that it does.
+        """
+        executor.home_dir.mkdir(parents=True, exist_ok=True)
+        (executor.home_dir / ".gitconfig").write_text(
+            body
+            if body is not None
+            else (
+                '[credential "https://github.com"]\n'
+                "\thelper = \n"
+                "\thelper = %s\n" % self.HOST_SCOPED_HELPER
+            ),
+            encoding="utf-8",
+        )
+
+    def test_the_reset_would_take_ghs_helper_with_it(self):
+        """The regression this pair of settings exists to prevent.
+
+        `credential.helper = ""` empties the whole accumulated helper list, not
+        the repository's share of it. Config is read system-global-local-env and
+        `GIT_CONFIG_COUNT` lands last, so gh's host-scoped entry is already on
+        the list when the reset arrives. Left there alone, every push fails with
+        `could not read Username for 'https://github.com'` -- git asking a
+        terminal that is not attached for a password it was handed at boot.
+
+        Asserted against real git rather than reasoned about, because this is a
+        claim about git's precedence rules and the previous version of this file
+        asserted the opposite in a comment for weeks.
+        """
+        executor = self.executor()
+        self.seed_gh_global_config(
+            executor,
+            '[credential "https://example.invalid"]\n'
+            "\thelper = \n"
+            "\thelper = !printf 'username=decoy\\npassword=decoy\\n'\n",
+        )
+        filled = self.fill_credential(executor, pinned=(("credential.helper", ""),))
+        self.assertNotIn("username=decoy", filled)
+
+    def test_the_re_arm_puts_ghs_helper_back(self):
+        executor = self.executor()
+        self.seed_gh_global_config(
+            executor,
+            '[credential "https://example.invalid"]\n'
+            "\thelper = \n"
+            "\thelper = !printf 'username=decoy\\npassword=decoy\\n'\n",
+        )
+        filled = self.fill_credential(
+            executor,
+            pinned=(("credential.helper", ""),) + executor.credential_helper_rearm(),
+        )
+        self.assertIn("username=decoy", filled)
+
+    def test_the_re_arm_reads_back_what_gh_wrote(self):
+        executor = self.executor()
+        self.seed_gh_global_config(executor)
+        self.assertEqual(
+            (("credential.https://github.com.helper", self.HOST_SCOPED_HELPER),),
+            executor.credential_helper_rearm(),
+        )
+
+    def test_ghs_own_reset_is_not_re_armed(self):
+        """Copying the empty line back would empty the list after the re-arm.
+
+        gh writes `helper =` before its own helper for the same reason this file
+        does, and the two entries come back from `--get-regexp` in file order. A
+        re-arm that kept the empty one would reset the list a second time, this
+        time after the entry it was restoring.
+        """
+        executor = self.executor()
+        self.seed_gh_global_config(executor)
+        self.assertNotIn("", [value for _, value in executor.credential_helper_rearm()])
+
+    def test_the_re_arm_lands_after_the_reset(self):
+        executor = self.executor()
+        self.seed_gh_global_config(executor)
+        environment = self.git_environment(executor)
+        count = int(environment["GIT_CONFIG_COUNT"])
+        keys = [environment["GIT_CONFIG_KEY_%d" % i] for i in range(count)]
+        self.assertLess(
+            keys.index("credential.helper"),
+            keys.index("credential.https://github.com.helper"),
+            "the reset must precede the re-arm or it undoes it",
+        )
+        self.assertEqual(
+            len(credential_proxy.HARDENED_GIT_CONFIG)
+            + len(executor.forced_git_config)
+            + 1,
+            count,
+        )
+
+    def test_the_re_arm_is_read_once(self):
+        """Cached: every git command the filing turn issues would pay for it."""
+        executor = self.executor()
+        self.seed_gh_global_config(executor)
+        first = executor.credential_helper_rearm()
+        (executor.home_dir / ".gitconfig").unlink()
+        self.assertEqual(first, executor.credential_helper_rearm())
+
+    def test_a_missing_global_config_re_arms_nothing(self):
+        # The bootstrap failed, or this is the Platform Agent's own proxy. Git
+        # still has to run: the commands that would diagnose it are git commands.
+        self.assertEqual((), self.executor().credential_helper_rearm())
+
+    def test_an_empty_read_is_not_cached(self):
+        """"No helper yet" and "no helper" are not the same fact.
+
+        The Platform Agent's proxy writes the global config from
+        `/v1/github/refresh` rather than at startup, so a git command can
+        legitimately arrive before `gh auth setup-git` has run. Caching that
+        first empty read would pin an empty helper list for the life of the
+        process and break every push after it, with no way back short of a
+        restart. Re-reading costs one subprocess per git command only while the
+        answer is empty, which is already the broken case.
+        """
+        executor = self.executor()
+        self.assertEqual((), executor.credential_helper_rearm())
+        self.seed_gh_global_config(executor)
+        self.assertEqual(
+            (("credential.https://github.com.helper", self.HOST_SCOPED_HELPER),),
+            executor.credential_helper_rearm(),
+        )
+
+    def test_a_non_utf8_global_config_does_not_fail_every_git_command(self):
+        """`UnicodeDecodeError` is a `ValueError`, and `do_POST` catches those.
+
+        Decoding git's output strictly meant one byte anywhere in the global
+        config -- a name with a latin-1 accent in it -- turned every proxied
+        git command into an HTTP 400, with a message naming neither git nor the
+        config. Decode with replacement and the helper on the next line is
+        still read.
+        """
+        executor = self.executor()
+        executor.home_dir.mkdir(parents=True, exist_ok=True)
+        (executor.home_dir / ".gitconfig").write_bytes(
+            b"[user]\n\tname = Ren\xe9 Descartes\n"
+            b'[credential "https://github.com"]\n\thelper = \n\thelper = %s\n'
+            % self.HOST_SCOPED_HELPER.encode()
+        )
+        self.assertEqual(
+            (("credential.https://github.com.helper", self.HOST_SCOPED_HELPER),),
+            executor.credential_helper_rearm(),
+        )
+
+    def test_an_unscoped_helper_is_re_armed_too(self):
+        """`git config --global credential.helper` writes no host subsection.
+
+        The re-arm exists to put back what the reset removes, and the reset
+        empties the whole list rather than the host-scoped share of it. A
+        pattern that required a subsection matched what `gh auth setup-git`
+        writes and nothing else, so a config set by hand -- or by any other
+        tool -- was emptied and not restored.
+        """
+        executor = self.executor()
+        self.seed_gh_global_config(
+            executor, "[credential]\n\thelper = %s\n" % self.HOST_SCOPED_HELPER
+        )
+        self.assertEqual(
+            (("credential.helper", self.HOST_SCOPED_HELPER),),
+            executor.credential_helper_rearm(),
+        )
+
+    def test_the_re_arm_is_not_injected_into_a_trusted_workspace(self):
+        # The base layer is pinned either way, so the claim is about the re-arm
+        # and the reset it answers: neither belongs on a path that never emptied
+        # the helper list in the first place.
+        executor = self.executor(untrusted=False)
+        self.seed_gh_global_config(executor)
+        pinned = self.resolved(self.git_environment(executor))
+        self.assertNotIn("credential.helper", pinned)
+        self.assertNotIn("credential.https://github.com.helper", pinned)
+
+    def fill_credential(self, executor, pinned):
+        """What `git credential fill` resolves under `pinned`, via real git.
+
+        The repository is empty and the host is `example.invalid`, so nothing
+        here can reach a real credential store or the network.
+        """
+        git = shutil.which("git")
+        if git is None:
+            self.skipTest("git is not on PATH")
+        repo = Path(self.temp_dir.name) / "fill-repo"
+        repo.mkdir(parents=True, exist_ok=True)
+        subprocess.run([git, "init", "-q", str(repo)], check=True)
+        environment = {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": str(executor.home_dir),
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_COUNT": str(len(pinned)),
+        }
+        for position, (key, value) in enumerate(pinned):
+            environment["GIT_CONFIG_KEY_%d" % position] = key
+            environment["GIT_CONFIG_VALUE_%d" % position] = value
+        completed = subprocess.run(
+            [git, "credential", "fill"],
+            input="protocol=https\nhost=example.invalid\n\n",
+            capture_output=True,
+            text=True,
+            cwd=repo,
+            env=environment,
+            timeout=30,
+        )
+        return completed.stdout
+
+    def test_the_pinned_config_reaches_no_other_executable(self):
+        # Scoped to git for the same reason the commit identity is: gh has its
+        # own config and no business seeing this. The base layer is deliberately
+        # not scoped that way -- it is in `self.environment`, so every command
+        # carries it -- which makes the claim here narrower than "no pins at
+        # all": the untrusted-workspace additions, the credential reset among
+        # them, stop at git.
+        executor = self.executor()
+        result = executor.execute_internal(["/bin/bash", "-c", "env"])
+        self.assertEqual(0, result.exit_code, result.stderr)
+        environment = dict(
+            line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
+        )
+        self.assertEqual(
+            list(executor.forced_git_config), self.pinned_pairs(environment)
+        )
+
+    def test_the_refusal_arrives_over_the_wire(self):
+        """The containment check as the agent meets it, through /v1/exec.
+
+        A method nothing calls refuses nothing, and this one sits behind two
+        other gates -- the read-only gate and the policy denylist -- either of
+        which could answer first and hide it. The `rule` field is what the shim
+        renders, so the agent gets a refusal it can read rather than an
+        unexplained proxy failure.
+        """
+        policy_path = Path(self.temp_dir.name) / "policy.json"
+        policy_path.write_text(
+            json.dumps({"blockedMessage": "blocked", "rules": []}), encoding="utf-8"
+        )
+        # getattr with a default, not a bare read: this class is the only
+        # thing setting these two class attributes at all, and running it in
+        # isolation (rather than after whichever suite member sets them first)
+        # raised AttributeError before the test body ran -- passing only
+        # because unittest discover's alphabetical ordering happened to run
+        # a class that sets them earlier in the same suite.
+        original_policy = getattr(CredentialProxyHandler, "policy", None)
+        original_executor = getattr(CredentialProxyHandler, "executor", None)
+        original_max = getattr(CredentialProxyHandler, "max_request_bytes", None)
+        CredentialProxyHandler.policy = Policy.load(str(policy_path))
+        CredentialProxyHandler.executor = self.executor()
+        CredentialProxyHandler.max_request_bytes = 65536
+        server = ThreadingHTTPServer(("127.0.0.1", 0), CredentialProxyHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+        def restore():
+            server.shutdown()
+            server.server_close()
+            CredentialProxyHandler.policy = original_policy
+            CredentialProxyHandler.executor = original_executor
+            if original_max is not None:
+                CredentialProxyHandler.max_request_bytes = original_max
+
+        self.addCleanup(restore)
+        request = urllib.request.Request(
+            "http://127.0.0.1:%d/v1/exec" % server.server_port,
+            data=json.dumps(
+                {
+                    "requestId": "t",
+                    "argv": ["git", "hash-object", "-w", "/etc/passwd"],
+                    "cwd": str(CredentialProxyHandler.executor.workspace_dir),
+                }
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request)
+        self.assertEqual(403, caught.exception.code)
+        body = json.loads(caught.exception.read())
+        self.assertEqual("blocked", body["status"])
+        self.assertEqual("SECURITY_POLICY_BLOCKED", body["code"])
+        self.assertEqual("workspace.path-containment", body["rule"])
+        self.assertIn("/etc/passwd", body["message"])
+
+    def git_environment(self, executor):
+        """The environment a proxied `git` actually receives.
+
+        The stub hands `config` to the real git rather than dumping the
+        environment for it, because the re-arm reads the global config through
+        this same entry in `executables`. A stub that answered everything with
+        `env` would have the re-arm parsing its own environment dump and
+        pinning the first line of it as a credential helper.
+        """
+        stub_dir = Path(self.temp_dir.name) / "fake-bin"
+        stub_dir.mkdir(parents=True, exist_ok=True)
+        stub = stub_dir / "git"
+        stub.write_text(
+            '#!/bin/bash\nif [ "$1" = config ]; then exec "%s" "$@"; fi\nenv\n'
+            % (executor.executables.get("git") or shutil.which("git")),
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        executor.executables["git"] = str(stub)
+        result = executor.execute(["git", "status"])
+        self.assertEqual(0, result.exit_code, result.stderr)
+        self.assertFalse(result.truncated, "environment dump was truncated")
+        return dict(
+            line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
+        )
+
+    def pinned_pairs(self, environment):
+        """The forced-config layer as git reads it -- ordered, duplicates kept.
+
+        Bounded by `GIT_CONFIG_COUNT` rather than by scanning for
+        `GIT_CONFIG_KEY_*`, because the count is what decides how far git reads:
+        a key numbered above it sits in the environment and never reaches the
+        config, which is exactly the failure a scan would report as present.
+        """
+        count = int(environment["GIT_CONFIG_COUNT"])
+        return [
+            (
+                environment["GIT_CONFIG_KEY_%d" % index],
+                environment["GIT_CONFIG_VALUE_%d" % index],
+            )
+            for index in range(count)
+        ]
+
+    def resolved(self, environment):
+        """What each key ends up as, later entries winning as they do in git."""
+        return dict(self.pinned_pairs(environment))
 
 
 class CommandExecutorTest(unittest.TestCase):
@@ -2860,6 +3581,9 @@ class ReadOnlyOverTheSocketTest(unittest.TestCase):
             def git_lease_violation(self, argv, cwd):
                 return None
 
+            def argv_path_violation(self, argv, cwd):
+                return None
+
             def execute(self, argv, stdin=None, cwd=None, kubeconfig=None):
                 owner.executed.append(argv)
                 return credential_proxy.ExecutionResult(
@@ -3317,6 +4041,11 @@ class ExecAuditLineCannotBeForgedTest(unittest.TestCase):
             # one that logs the caller's cwd -- is actually reached.
             return "no lease" if argv and argv[0] == "git" else None
 
+        def argv_path_violation(self, argv, cwd):
+            # Allow, so the lease refusal above stays the reached path: the
+            # containment check runs ahead of it in `do_POST`.
+            return None
+
         def execute(self, argv, stdin=None, cwd=None, kubeconfig=None):
             return credential_proxy.ExecutionResult(
                 exit_code=0, stdout="", stderr="",
@@ -3432,6 +4161,9 @@ class AuditLogSurvivesAHostileRequestTest(unittest.TestCase):
             self.executed = []
 
         def git_lease_violation(self, argv, cwd):
+            return None
+
+        def argv_path_violation(self, argv, cwd):
             return None
 
         def execute(self, argv, stdin=None, cwd=None, kubeconfig=None):
@@ -3946,6 +4678,9 @@ class AuthenticationOverTheSocketTest(unittest.TestCase):
             self.executed = []
 
         def git_lease_violation(self, argv, cwd):
+            return None
+
+        def argv_path_violation(self, argv, cwd):
             return None
 
         def execute(self, argv, stdin=None, cwd=None, kubeconfig=None):

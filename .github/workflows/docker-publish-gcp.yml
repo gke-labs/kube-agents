@@ -43,13 +43,64 @@ jobs:
 
       - name: Build and Push Platform Agent (GCP Cloud Build)
         id: gcp-platform
+        # _GIT_SHA is the revision stamp cloudbuild.yaml turns into
+        # /opt/build-info.json and the OCI revision label. Its substitution
+        # default is an empty string, so omitting it here builds silently and
+        # produces an image the self-improvement runner refuses to investigate.
+        # _IMAGE_SOURCE is the repository the source came from, for the OCI
+        # source label -- derived from the workflow's own repository rather than
+        # hardcoded, so a fork's images do not point at gke-labs.
         run: |
           gcloud builds submit \
             --config=deploy/docker/cloudbuild.yaml \
-            --substitutions="_IMAGE_URI=$GCP_REGISTRY/platform-agent:$GITHUB_SHA,_IMAGE_URI_LATEST=$GCP_REGISTRY/platform-agent:latest,_TARGET=platform,_HERMES_AGENT_TAG=$HERMES_AGENT_TAG,_BUILDCACHE_URI=$GCP_REGISTRY/platform-agent:buildcache,_KUBE_AGENTS_VERSION=$GITHUB_SHA" \
+            --substitutions="_IMAGE_URI=$GCP_REGISTRY/platform-agent:$GITHUB_SHA,_IMAGE_URI_LATEST=$GCP_REGISTRY/platform-agent:latest,_TARGET=platform,_HERMES_AGENT_TAG=$HERMES_AGENT_TAG,_GIT_SHA=$GITHUB_SHA,_IMAGE_SOURCE=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY,_BUILDCACHE_URI=$GCP_REGISTRY/platform-agent:buildcache,_KUBE_AGENTS_VERSION=$GITHUB_SHA" \
             .
           DIGEST=$(gcloud artifacts docker images describe "$GCP_REGISTRY/platform-agent:$GITHUB_SHA" --format="value(image_summary.digest)")
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          # A dropped substitution fails silently -- the Dockerfile defaults
+          # GIT_SHA to empty and the build succeeds -- so read the stamp back
+          # off what was pushed rather than trusting the line above.
+          #
+          # Detection, not prevention: cloudbuild.yaml publishes through
+          # `images:`, so `:latest` has already moved by the time this runs and
+          # a failure here means revert and republish. Holding the tag back
+          # would mean dropping `_IMAGE_URI_LATEST` from that config, which
+          # scripts/dev/dev_rebuild_agent.sh also drives -- more
+          # blast radius than this branch should take on.
+          #
+          # Both places it lands, because they are two separate Dockerfile
+          # instructions. The label is what registries and provenance scanners
+          # read; /opt/build-info.json is what the self-improvement runner reads,
+          # and it is the one that decides whether a deployed pod can file
+          # anything. A gate on the label alone stays green if the `RUN printf`
+          # that writes the file is deleted, typo'd, or moved out from under the
+          # ARG, and every pod then falls back to report-only. The image is
+          # already pulled for the label check, so the file check is free.
+          REF="$GCP_REGISTRY/platform-agent@$DIGEST"
+          docker pull --quiet "$REF" >/dev/null
+          REVISION=$(docker inspect \
+            --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+            "$REF")
+          if [ "$REVISION" != "$GITHUB_SHA" ]; then
+            echo "::error::$REF carries revision label '$REVISION', expected '$GITHUB_SHA'. The _GIT_SHA substitution did not reach the image." >&2
+            exit 1
+          fi
+          FILE_REVISION=$(docker run --rm --entrypoint cat "$REF" /opt/build-info.json | jq -r '.revision // ""')
+          if [ "$FILE_REVISION" != "$GITHUB_SHA" ]; then
+            echo "::error::$REF carries /opt/build-info.json revision '$FILE_REVISION', expected '$GITHUB_SHA'. The self-improvement runner reads that file, not the label, and would treat this image as unstamped." >&2
+            exit 1
+          fi
+          # _IMAGE_SOURCE travels in the same substitution string as _GIT_SHA and
+          # is just as silently droppable, so check it here rather than leave one
+          # of the pair unguarded.
+          SOURCE=$(docker inspect \
+            --format '{{ index .Config.Labels "org.opencontainers.image.source" }}' \
+            "$REF")
+          if [ "$SOURCE" != "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" ]; then
+            echo "::error::$REF carries source label '$SOURCE', expected '$GITHUB_SERVER_URL/$GITHUB_REPOSITORY'. The _IMAGE_SOURCE substitution did not reach the image, and a provenance scanner will not find this repository from it." >&2
+            exit 1
+          fi
+          echo "revision stamp OK in both the label and /opt/build-info.json: $GITHUB_SHA (source $SOURCE)"
 
       - name: Build and Push Replay Proxy (GCP Cloud Build)
         id: gcp-replay-proxy
@@ -67,10 +118,28 @@ jobs:
         run: |
           gcloud builds submit \
             --config=deploy/docker/cloudbuild.yaml \
-            --substitutions="_IMAGE_URI=$GCP_REGISTRY/credential-proxy:$GITHUB_SHA,_IMAGE_URI_LATEST=$GCP_REGISTRY/credential-proxy:latest,_TARGET=credential-proxy,_HERMES_AGENT_TAG=$HERMES_AGENT_TAG,_BUILDCACHE_URI=$GCP_REGISTRY/credential-proxy:buildcache" \
+            --substitutions="_IMAGE_URI=$GCP_REGISTRY/credential-proxy:$GITHUB_SHA,_IMAGE_URI_LATEST=$GCP_REGISTRY/credential-proxy:latest,_TARGET=credential-proxy,_HERMES_AGENT_TAG=$HERMES_AGENT_TAG,_GIT_SHA=$GITHUB_SHA,_IMAGE_SOURCE=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY,_BUILDCACHE_URI=$GCP_REGISTRY/credential-proxy:buildcache" \
             .
           DIGEST=$(gcloud artifacts docker images describe "$GCP_REGISTRY/credential-proxy:$GITHUB_SHA" --format="value(image_summary.digest)")
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          # The same read-back the platform build does, for a reason that build
+          # does not have: this stage descends from the Hermes base image, which
+          # carries an org.opencontainers.image.revision of its own. A dropped
+          # substitution here does not leave the label empty -- it leaves an
+          # upstream commit sha in place, which reads as this repository's
+          # provenance and resolves to nothing in it. Label only: the sidecar
+          # writes no /opt/build-info.json, because the file exists for the
+          # self-improvement runner, which reads the agent image.
+          REF="$GCP_REGISTRY/credential-proxy@$DIGEST"
+          docker pull --quiet "$REF" >/dev/null
+          REVISION=$(docker inspect \
+            --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' \
+            "$REF")
+          if [ "$REVISION" != "$GITHUB_SHA" ]; then
+            echo "::error::$REF carries revision label '$REVISION', expected '$GITHUB_SHA'. The _GIT_SHA substitution did not reach the sidecar, and an inherited label from the base image is what a scanner will read instead." >&2
+            exit 1
+          fi
+          echo "sidecar revision stamp OK: $GITHUB_SHA"
 
       - name: Build and Push Pubsub Platform Plugin (GCP Cloud Build)
         id: gcp-pubsub-platform

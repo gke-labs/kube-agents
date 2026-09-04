@@ -23,7 +23,7 @@ agents/platform/skills/
 └── ... (32 more)
 ```
 
-Skills are placed by persona: fleet-wide, provisioning, and GitOps-write skills live in `agents/platform/skills/` (the Platform Agent); the six read-only, single-cluster runtime-debugging skills live in `agents/cluster/skills/` and are scaffolded into every per-cluster [Cluster Agent](/kube-agents/concepts/cluster-agents/) profile.
+Skills are placed by persona: fleet-wide, provisioning, and GitOps-write skills live in `agents/platform/skills/` (the Platform Agent); the six read-only, single-cluster runtime-debugging skills live in `agents/cluster/skills/` and are scaffolded into every per-cluster [Cluster Agent](/kube-agents/concepts/cluster-agents/) profile. `agents/selfimprove/skills/` is a third home, holding the two skills of the self-improvement loop ([`docs/designs/self-improvement.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/self-improvement.md)) — which audits kube-agents itself rather than the fleet, is disabled by default, and is not a place to add to.
 
 Some skills are pure Markdown; others carry supporting files (helper scripts, YAML templates) in the same directory. The Hermes runtime discovers `SKILL.md` files automatically at startup.
 
@@ -71,7 +71,7 @@ The `gke-compute-classes` skill is a good example — it explicitly delineates w
 
 ## Adding a new skill
 
-1. Create `agents/platform/skills/<your-skill>/SKILL.md` — or `agents/cluster/skills/<your-skill>/SKILL.md` if it is a read-only, single-cluster runtime-debugging procedure that belongs to the Cluster Agents.
+1. Create `agents/platform/skills/<your-skill>/SKILL.md` — or `agents/cluster/skills/<your-skill>/SKILL.md` if it is a read-only, single-cluster runtime-debugging procedure that belongs to the Cluster Agents. Those are the two homes a new skill goes in; `agents/selfimprove/skills/` is closed, since its two skills are the procedure of one cron job rather than a catalogue.
 2. Add frontmatter with `name` and a specific `description` — this is what routes the agent to the skill.
 3. Write the procedure. Prefer concrete steps and example manifests over abstract descriptions.
 4. If the skill has safety-critical operations (destructive changes, wide-blast-radius commands), list explicit red lines the model must honor.

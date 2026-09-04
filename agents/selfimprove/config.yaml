@@ -1,0 +1,88 @@
+# Self-improvement runner profile config (self-contained template).
+#
+# Copied verbatim onto the run's emptyDir by selfimprove_run.py, not merged with
+# deploy/shared/defaults/config.yaml at image build — the same arrangement as
+# agents/cluster/config.yaml, and for the same reason: this profile is scaffolded
+# at runtime rather than built into a profile home, so anything it needs has to
+# be in this file.
+#
+# What is deliberately absent is most of the point. No `mcp_servers`: the runner
+# has no platform_control, no gke, no developer_knowledge, so there is no tool
+# surface here that can reach a cluster under management even by accident. No
+# chat platform, so it cannot message a user. No memory provider. The isolation
+# ledger in docs/designs/self-improvement.md sec. 5.3 lists what is shared with
+# the rest of the install, and after this file it is two things: the container
+# image and the model endpoint.
+#
+# The model block is NOT here. It arrives through HERMES_MANAGED_DIR, which the
+# chart points at a ConfigMap of its own (see charts/kube-agents/templates/
+# self-improvement.yaml). Baking a base_url into the image would hardcode the
+# install's namespace, which agents/cluster/config.yaml does and should not.
+
+# The runner needs the core CLI pool — shell, file reads, file writes to its own
+# emptyDir — and nothing else. `hermes-cli` is that pool. There is no
+# `api_server` entry because nothing serves this profile over HTTP; it exists
+# only for the length of one `hermes -z` process.
+platform_toolsets:
+  cli:
+    - hermes-cli
+
+# DuckDuckGo search, for the one job that is hard without it: turning an
+# unfamiliar error signature into an upstream issue or a known bug. Guarded by
+# the same loop cap the Platform Agent uses, for the same reason — a research
+# question with no natural end will otherwise consume the whole turn budget.
+web:
+  backend: "ddgs"
+
+tool_loop_guardrails:
+  loop_caps:
+    max_web_searches: 40
+
+# `max_turns` DOES NOT BIND ON THIS PATH and the number below is not the cap.
+# `hermes -z` builds its AIAgent in hermes_cli/oneshot.py without passing
+# `max_iterations`, so the constructor default of 90 in run_agent.py applies and
+# neither this key, the `--max-turns` flag nor HERMES_MAX_ITERATIONS reaches it.
+# Measured, not read: a run with 400 here stopped at exactly 90 API calls. The
+# key stays because it is correct for any path that does honour it and costs
+# nothing if none does, but tuning it will not buy a longer investigation.
+#
+# 90 calls is 18 to 24 minutes of this workload, measured across live runs, and
+# does not cover every signal class, so being cut off mid-investigation is the
+# normal case rather than the exceptional one. The runner answers that with turns rather than with
+# a bigger cap it has no way to ask for: when a turn reports it did not finish,
+# it starts another against the same home, up to `investigateMaxTurns`. Three
+# things keep a capped turn from losing what it had. findings.json is written
+# incrementally rather than at the end (see the skill's sec. 6); `read_findings`
+# falls back to the turn's response text when that file is empty and the turn
+# did not finish, because an empty file at the cap is where the agent left off
+# and not what it concluded; and the runner merges each turn's findings itself,
+# so a later turn that rewrites the file cannot erase an earlier one's work.
+# Live run `selfimprove-fork-2` is why the second exists: it confirmed a
+# finding, emptied findings.json while disproving an earlier candidate, and hit
+# the cap before writing the real one back.
+#
+# The runner logs `api_calls` and `completed` from `--usage-file` every turn, so
+# the cap being hit is visible in the Job log rather than silent.
+agent:
+  max_turns: 400
+  # Four interpreters spawned to publish a Python-toolchain line that is wrong
+  # on this image. Off here for the same reason agents/cluster/config.yaml turns
+  # it off: this template is copied rather than merged, so the shared default
+  # does not reach it.
+  environment_probe: false
+
+# No memory, in either sense. The file store has nowhere to persist — the home
+# is an emptyDir that dies with the Job — and a shared provider would let the
+# runner launder its own prior conclusions back in as facts. What the previous
+# runs learned reaches this one exactly one way: the ledger summary in the
+# brief, which is data the runner cannot edit.
+memory:
+  memory_enabled: false
+  user_profile_enabled: false
+  read_only: true
+
+# No ingress plugins. hermes_otel would need egress to the collector namespace
+# that the runner's NetworkPolicy does not open, and session_store/incident_context
+# both exist to serve a gateway this profile does not have.
+plugins:
+  enabled: []

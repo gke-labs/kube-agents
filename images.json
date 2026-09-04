@@ -6,7 +6,7 @@
       "repository": "ghcr.io/gke-labs/kube-agents/platform-agent",
       "tagPolicy": "release",
       "override": "PLATFORM_AGENT_IMAGE",
-      "pulledBy": "The agent Deployment the operator renders, and its sandbox init container.",
+      "pulledBy": "The agent Deployment the operator renders, its sandbox init container, and the optional self-improvement CronJob.",
       "description": "Chat, Platform, and Cluster Agent workspaces on the Hermes base image."
     },
     {
@@ -15,7 +15,7 @@
       "repository": "ghcr.io/gke-labs/kube-agents/credential-proxy",
       "tagPolicy": "release",
       "override": "CREDENTIAL_PROXY_IMAGE",
-      "pulledBy": "The credential-proxy sidecar in the agent pod.",
+      "pulledBy": "The credential-proxy sidecar in the agent pod, and in the self-improvement CronJob's pod under its fork and upstream modes.",
       "description": "The platform-agent image plus the Envoy-based credential proxy runtime."
     },
     {

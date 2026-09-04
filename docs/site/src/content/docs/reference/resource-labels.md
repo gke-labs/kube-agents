@@ -23,6 +23,7 @@ Every install path sets `name`, `instance`, `part-of`, and `managed-by`:
 | PlatformAgent controller output (per CR)  | `platform-agent`                                    | `<namespace>-<agent name>` | `kube-agents` | `platformagent-controller` |
 | Operator install (`k8s-operator/config/`) | `kube-agents-operator`                              | `kube-agents-operator`     | `kube-agents` | `kustomize`                |
 | Helm chart (`charts/kube-agents/`)        | `kube-agents`, `kube-agents-operator`, or `litellm` | `<release name>`           | `kube-agents` | `Helm`                     |
+| Self-improvement loop (Helm chart)        | `kube-agents-selfimprove`                           | `<release name>`           | `kube-agents` | `Helm`                     |
 | LiteLLM integration                       | `litellm`                                           | `litellm`                  | `kube-agents` | `kustomize`                |
 | GitHub token minter                       | `github-token-minter`                               | `github-token-minter`      | `kube-agents` | `kustomize`                |
 | Inference replay                          | `inference-replay`                                  | `inference-replay`         | `kube-agents` | `kustomize`                |
@@ -127,6 +128,13 @@ Just the integrations:
 ```bash
 kubectl get all -A \
   -l 'app.kubernetes.io/part-of=kube-agents,app.kubernetes.io/name in (litellm,github-token-minter,inference-replay,hindsight)'
+```
+
+The self-improvement loop, which the chart renders only when `selfImprovement.enabled` is true:
+
+```bash
+kubectl get all,configmap,serviceaccount,secret,networkpolicy,role,rolebinding -A \
+  -l 'app.kubernetes.io/name=kube-agents-selfimprove'
 ```
 
 Cluster-scoped RBAC the project owns — the objects most easily orphaned, since a namespaced

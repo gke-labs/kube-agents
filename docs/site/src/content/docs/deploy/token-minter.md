@@ -7,6 +7,11 @@ sidebar:
 
 Minty is the GitHub Token Minter — an in-cluster service that mints short-lived (1-hour) repository-scoped GitHub App installation tokens on demand for the Platform Agent's `submit-suggestion`, `fleet-audit`, and `github-issue-resolver` skills. The GitHub App's private key never leaves GCP KMS.
 
+There is one minter in an install, and everything below describes it — the instance `githubMinter.*`
+renders. The [self-improvement loop](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/self-improvement.md)
+has a GitHub identity of its own but no minter behind it; see
+[The self-improvement loop does not use this](#the-self-improvement-loop-does-not-use-this).
+
 GCP half (minter GSA, Workload Identity binding, import-only KMS signing key): [`terraform/modules/github-minter`](https://github.com/gke-labs/kube-agents/tree/main/terraform/modules/github-minter).
 Kubernetes half (Deployment, Service, NetworkPolicy, KSA, rule ConfigMap, `github-app-credentials` Secret): the chart's `githubMinter.*` values; the dev copy is `make -C k8s-operator deploy-github`.
 Full README: [`k8s-operator/config/integrations/github/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/integrations/github/README.md).
@@ -34,7 +39,7 @@ Minty's rule ConfigMap is mounted in-container at `/etc/minty/<GITHUB_ORG>`. A s
 ### GitHub App
 
 1. Create a new GitHub App, owned either by the organization or by your personal account.
-2. Assign permissions: `Contents: Read & write`, `Pull requests: Read & write`, `Issues: Read & write`.
+2. Assign permissions: `Contents: Read & write`, `Pull requests: Read & write`, `Issues: Read & write`. This App is the Platform Agent's alone; the self-improvement loop has no App at all (see below).
 3. Note the **App ID**.
 4. Generate and download a **private key** (`.pem` file).
 5. Install the App on the target GitOps repo.
@@ -89,11 +94,15 @@ kubectl run debug-box --rm -it \
   --image=curlimages/curl \
   --namespace=kubeagents-system \
   --serviceaccount=kubeagents-platform-agent \
-  --labels="app=platform-agent" \
+  --labels="kubeagents.x-k8s.io/has-credential-proxy=true" \
   -- sh
 ```
 
-The `app=platform-agent` label is required: Minty's `NetworkPolicy` only accepts ingress from pods carrying it.
+The label is required and is the one the policy actually selects on: `github-token-minter-policy`
+admits ingress from pods carrying `kubeagents.x-k8s.io/has-credential-proxy: "true"`, which the
+operator stamps on the agent pod. A debug pod without it is dropped by the NetworkPolicy before
+Minty sees the request, which looks like a timeout rather than a refusal. The self-improvement
+loop's pod carries a different label and is dropped the same way — see below.
 
 From inside the pod (the OIDC `audience` must match the Minty service URL, and the token is passed in the `X-OIDC-Token` header — not `Authorization`):
 
@@ -110,7 +119,30 @@ curl -i -X POST http://github-token-minter.kubeagents-system.svc.cluster.local:8
 
 A 200 response whose body is the short-lived, repository-scoped GitHub installation token means the pipeline works end-to-end.
 
+## The self-improvement loop does not use this
+
+The self-improvement loop
+(`selfImprovement.mode: fork` or `upstream`) authenticates to GitHub as a robot account holding a
+classic personal access token, mounted from a Kubernetes Secret you create by hand and named in
+`selfImprovement.github.patSecret`. It has no App, no rule file and no minter of its own.
+
+It cannot reach the minter above either, and the control is the network rather than configuration.
+The CronJob's own NetworkPolicy renders no egress rule to the minter's Service, and the minter's
+ingress admits only pods labelled `kubeagents.x-k8s.io/has-credential-proxy: "true"` while this pod
+carries `kubeagents.x-k8s.io/selfimprove: "true"`. Leaving `TOKEN_BROKER_URL` off the pod is not
+part of that: unset, the refresh script falls back to the minter's in-cluster URL, so a run that
+tried would be stopped by the two policies and not by the empty variable.
+
+That is a deliberate trade rather than an omission. An App installation could have been granted
+`contents: write` on the fork and `pull_requests: write` on the upstream and nothing else; a classic
+token carries `repo` wherever its account can reach, and nothing rotates it. What it buys is that
+one credential covers a cross-fork pull request, which two App installations cannot — `gh` stores
+one token per host, so the second would discard the first.
+[`docs/designs/self-improvement.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/self-improvement.md)
+§6 is canonical for the whole argument.
+
 ## Where to go next
 
 - [Declarative workflow](/kube-agents/concepts/declarative-workflow/) — the `submit-suggestion` skill that uses Minty.
 - [`k8s-operator/config/integrations/github/README.md`](https://github.com/gke-labs/kube-agents/blob/main/k8s-operator/config/integrations/github/README.md) — full Minty install detail.
+- [Security and IAM](/kube-agents/reference/security-and-iam/) — the self-improvement loop's identities, and how they are kept apart from the agent's.

@@ -5,6 +5,8 @@ description: The skills shipping with the Platform and Cluster Agents, grouped b
 
 Every skill is a `SKILL.md` bundle. The Platform Agent's live in [`agents/platform/skills/`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills); the Cluster Agent's live in [`agents/cluster/skills/`](https://github.com/gke-labs/kube-agents/tree/main/agents/cluster/skills) and are scaffolded into each per-cluster profile. An agent loads them on demand based on the `description:` field in each skill's frontmatter — clicking through to source below gives you the full procedure the agent follows.
 
+A third directory, [`agents/selfimprove/skills/`](https://github.com/gke-labs/kube-agents/tree/main/agents/selfimprove/skills), is not in this catalogue. Its two skills are the procedure of one hourly cron job that audits kube-agents itself, off unless `selfImprovement.enabled` is set. That job's own agent turns load them the same way the agents above load theirs — the runner copies the tree into the agent's home before each turn — but neither the Platform Agent nor a Cluster Agent does.
+
 For how skills are structured and invoked, see [Concepts → Skills](/kube-agents/concepts/skills/).
 
 ## The catalogue
@@ -118,4 +120,4 @@ Generated from the `name` and `description` frontmatter of every `agents/platfor
 
 ## Adding a new skill
 
-See [Concepts → Skills](/kube-agents/concepts/skills/#adding-a-new-skill) for the process. New skills land under `agents/platform/skills/<name>/SKILL.md`; if they should also run on schedule, add an entry to `agents/platform/cron/jobs.json`.
+See [Concepts → Skills](/kube-agents/concepts/skills/#adding-a-new-skill) for the process. New skills land under `agents/platform/skills/<name>/SKILL.md`, or `agents/cluster/skills/` for a read-only single-cluster debugging procedure; if they should also run on schedule, add an entry to `agents/platform/cron/jobs.json`.

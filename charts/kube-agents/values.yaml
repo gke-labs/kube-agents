@@ -271,6 +271,13 @@ litellm:
   # disable podMonitoring off-GKE — the PodMonitoring CRD is GKE-managed, and
   # helm template/lint cannot catch its absence: a non-GKE install fails at
   # apply time.
+  #
+  # networkPolicy renders one policy, on the gateway itself: DNS, the GKE
+  # metadata server, and 443 to anything outside RFC1918. Off is for a cluster
+  # running a different policy engine, or one whose DNS or model endpoints sit
+  # inside the private ranges that rule excepts. It governs nothing else --
+  # the agent's policies come from the operator and the self-improvement loop
+  # has its own switch, `selfImprovement.networkPolicy`.
   networkPolicy: true
   podMonitoring: true
 
@@ -322,6 +329,11 @@ hindsight:
     # volumeClaimTemplate size. Immutable once the StatefulSet exists.
     storage: 8Gi
   # Disable podMonitoring off-GKE, same caveat as litellm.podMonitoring.
+  #
+  # networkPolicy renders one policy, on Postgres: ingress on 5432 from the
+  # Hindsight API pods and nothing else. It stands in for a database that
+  # deliberately has no password, so turning it off on a cluster with no
+  # default-deny leaves pgvector reachable from any pod in the namespace.
   networkPolicy: true
   podMonitoring: true
   podDisruptionBudget:
@@ -375,6 +387,13 @@ githubMinter:
     limits:
       cpu: 500m
       memory: 256Mi
+  # networkPolicy renders the minter's own policy, and its ingress rule is the
+  # thing keeping the minter to one caller: port 8080 from pods labelled
+  # `kubeagents.x-k8s.io/has-credential-proxy: "true"`, which is the agent and
+  # not the self-improvement loop. Turning it off on a cluster with no
+  # default-deny makes the token endpoint reachable from every pod in the
+  # namespace. Egress is DNS, the GKE metadata server, and 443 to anywhere --
+  # KMS and GitHub are not addressable as CIDRs.
   networkPolicy: true
   podDisruptionBudget:
     # Renders maxUnavailable: 1 at any replicaCount. Deliberately not
@@ -643,6 +662,479 @@ platformAgent:
       serviceUrl: "https://smba.trafficmanager.net/teams/"
       # Render responses with Microsoft Adaptive Cards v1.5 (markdown fallback if false).
       adaptiveCards: true
+
+# The self-improvement loop: an hourly, read-only investigation of kube-agents
+# itself — its source, its harness, and this installation — which grades what it
+# finds and, above the gate below, opens a pull request -- against the fork
+# under `mode: fork`, against the upstream repository under `mode: upstream`,
+# and against nothing at all under the default. Distinct from
+# the fleet audits, which look outward at the managed clusters. Rendered only
+# when enabled: with this off the chart emits nothing for it, so an install that
+# leaves it alone carries none of it. See docs/designs/self-improvement.md.
+selfImprovement:
+  enabled: false
+  schedule: "0 * * * *"
+  # Hard stop for one run, enforced by the Job, and the number every other
+  # budget here is clamped against. A filing turn gets `min(its own timeout,
+  # what is left of this)`; an investigation turn gets that same figure less
+  # `fileTimeoutSeconds`, which `investigation_budget` in the runner holds back
+  # before the loop sees the clock. So raising `investigateTimeoutSeconds`
+  # without raising this one changes nothing, while raising `fileTimeoutSeconds`
+  # without raising this one takes the difference out of the investigation.
+  #
+  # Which is also the one way to set this too low. Nothing validates the pair:
+  # below roughly `fileTimeoutSeconds` plus a filing turn's floor, the reserve
+  # leaves the investigation under its own floor, and every run refuses before
+  # it starts and exits 1 — a CronJob that fails hourly and says why in the Job
+  # log. The shipped 14400 has a wide margin; trim it and check the arithmetic.
+  #
+  # Four hours, against an hourly `schedule`. The pair is deliberate and the
+  # loop self-paces on it: `concurrencyPolicy: Forbid` means a run still going
+  # when the next hour comes round causes that fire to be skipped, so a run
+  # that finishes quickly keeps the hourly cadence and a run that goes deep
+  # takes its four hours and costs the fires in between. Sizing this to the
+  # schedule instead would cap investigation at what fits in an hour, which is
+  # the truncation `investigateMaxTurns` below exists to get out of.
+  #
+  # The cost of a long deadline is paid by the gate, not by the loop: the
+  # worst-case run rate is `24h / this`, so four hours puts a floor of six runs
+  # a day and `minOccurrencesPerDay` below cannot ask for more sightings than
+  # that. Change one and read the other.
+  activeDeadlineSeconds: 14400
+  # Bounds a single agent turn inside that, so the runner still gets to write
+  # its ledger when one overruns: the runner's own timeout ends the turn and
+  # files what it found, while the Job's deadline kills the pod, which records
+  # a `killed` row with whatever counts had accumulated — plus, if the kill
+  # landed inside a filing turn, an unconfirmed promotion for the finding that
+  # turn was filing, since it may have opened the pull request before it died.
+  #
+  # Per turn, not per run — `investigateMaxTurns` bounds the count. Turns
+  # measured on the live install end at Hermes' call cap rather than here, the
+  # longest at 1424s on run `selfimprove-fork-4`, so this is roughly two and a
+  # half times what one actually takes; it is here to stop a turn that does not
+  # hit the cap from spending the whole deadline.
+  investigateTimeoutSeconds: 3600
+  # A ceiling on investigation turns per run, not a target. Hermes caps a
+  # headless turn at 90 model calls and the profile cannot raise it — the
+  # `hermes -z` entrypoint constructs its agent without passing the config's
+  # `agent.max_turns`, so the library default applies. Both investigations
+  # measured on the live install stopped there, the longest at 1424s of its
+  # budget: the binding limit is calls, not clock. When a turn reports it was
+  # cut off, the runner starts another with findings.json still on disk and the
+  # previous turn's closing summary as the handoff, and stops as soon as one
+  # reports it finished — so on an install where one turn is enough this costs
+  # nothing.
+  #
+  # Six, sized against the measured 1424s rather than the ceiling above: six
+  # turns is ~8500s of the 14400s deadline, leaving room for `fileTimeoutSeconds`
+  # below plus the 90s ledger reserve and a wide margin on top. Raising it does
+  # not come out of filing, because `investigation_budget` in the runner holds
+  # `fileTimeoutSeconds` back before the loop sees the clock and stops the
+  # investigation early enough that filing is still affordable; what raising it
+  # spends is the deadline, and past six turns the loop hits that instead.
+  # Investigation stopped this way is not lost — a promoted finding keeps its
+  # occurrence counts and the next run files it first.
+  investigateMaxTurns: 6
+  # Same, for each pull-request turn in fork/upstream mode. A filing turn does
+  # more work than it looks like — re-read the finding against the tree, write
+  # the patch, commit, push, open the pull request — and 900s was not enough for
+  # it on the install this was validated against: live run `selfimprove-fork-3`
+  # promoted a finding and then hit the budget mid-turn with
+  # nothing pushed, recording `filed=0`. The investigate turns measured on the
+  # same install all ended at the 90-iteration cap, well short of
+  # investigateTimeoutSeconds. `budgeted` clamps to what actually remains and
+  # says so in the log, which is what keeps the ceilings here summing over
+  # activeDeadlineSeconds from being a problem.
+  #
+  # This is also the size of the reserve: `investigation_budget` subtracts it
+  # from what remains of the deadline before the investigation loop sees the
+  # clock, so the first filing turn is affordable however deep the investigation
+  # went. Raise it and the investigation gets correspondingly less.
+  #
+  # The reserve is a floor on the budget handed to that turn, not a bound on
+  # what the filing stage spends. `file_pull_request` does its forge preflight
+  # and its base-branch checkout before the turn starts, and neither is deducted
+  # from the number: two `gh repo view` calls at 60s each and up to five git
+  # subprocesses each bounded by min(timeout, 180). A pathological run can spend
+  # well past the reserve there and reach the deadline with the turn unstarted.
+  # It is a reserve in the sense that the seconds were kept out of the
+  # investigation's reach, not in the sense that filing is guaranteed to fit.
+  #
+  # 3000 rather than 1500 because a run that files three findings — the default
+  # `maxPullRequestsPerDay` — gives the later ones only what the first left
+  # behind. Only the first is reserved for; the rest take what remains and defer
+  # if that is under half of this, which costs a run and not the finding. Half,
+  # rather than the 120s a turn needs to reach the model at all: a filing turn
+  # that runs out mid-push is charged a daily slot and a 24-hour cooldown for a
+  # pull request that may not exist, so a budget it cannot finish in is worse
+  # than no attempt. 3300 is the sensible ceiling — a bound on how much of an
+  # hourly schedule one filing turn may consume rather than a credential
+  # deadline, since the App installation token this used to protect against
+  # expired after an hour and a personal access token does not. Nothing enforces
+  # it. The runner used to log a warning past it and no longer does, so a larger
+  # value is accepted in silence; what still holds it down is `budgeted`, which
+  # clamps every turn to what remains of `activeDeadlineSeconds`.
+  fileTimeoutSeconds: 3000
+
+  # How long the pod has to shut down after the Job's deadline, an eviction or
+  # a `kubectl delete` sends it SIGTERM. Kubernetes defaults to 30 and the
+  # runner needs more than that: its SIGTERM handler writes one `killed` row to
+  # the ledger, and a contended write is four PATCHes and three re-reads
+  # against a 20-second-per-round-trip client, so 140 seconds in the worst
+  # case. At 30 the row explaining why the run died is the one that is lost.
+  terminationGracePeriodSeconds: 150
+  # How long that handler may spend on the write before it gives up and logs
+  # instead. Must stay below terminationGracePeriodSeconds — the two are one
+  # setting in two places, and raising this without raising that hands the
+  # kubelet a process still waiting on a join. The runner also derives its
+  # deadline reserve from this, so the last ledger write of a run that was not
+  # killed gets at least as long as the handler would have allowed it.
+  killWriteBudgetSeconds: 140
+
+  # report-only  ledger only, no GitHub credential, no write path out of the cluster
+  # fork         branches and pull requests to a fork
+  # upstream     cross-fork pull requests against github.upstreamRepo
+  #
+  # report-only is not a degraded mode. It renders no credential proxy and
+  # mounts no token, so the runner has no GitHub identity at all — which is what
+  # makes it the right first thing to turn on.
+  #
+  # fork and upstream both need github.patSecret. They differ only in where the
+  # pull request is opened; the branch is pushed to github.forkRepo either way.
+  mode: report-only
+
+  # Which of the seven signal classes to investigate. Narrowing this is the
+  # cheapest way to cut the loop's cost.
+  #
+  # An empty list is refused at render. It reads as "investigate nothing" and
+  # the runner treats it as the opposite — an unset `SELFIMPROVE_SIGNALS` means
+  # all seven — so the one way to write it is the one way it does not work.
+  # Turn the loop off with `enabled: false` instead.
+  signals: [errors, inefficiency, latency, responses, delivery, forge, other]
+
+  # The agent Deployment the runner observes, and cross-checks its own image
+  # against. A mismatch aborts the run rather than attributing findings to a
+  # revision that is not deployed.
+  observedDeployment: ""
+
+  # Investigate even when the image carries no revision stamp (a build that
+  # passed no GIT_SHA). The run then reads source at `main`, which may not be
+  # the code the pod is running, and every finding says so. Off: an unstamped
+  # image refuses to investigate.
+  allowUnstampedImage: false
+
+  gate:
+    # A finding is promoted when it matches a rule, has been seen often enough
+    # inside the last 24 hours, is out of cooldown, and the day's budget is
+    # unspent. Everything else stays in the ledger and keeps counting.
+    #
+    # A severity with no rule is never promoted, which is how `low` is
+    # excluded: by omission, not by a separate switch.
+    #
+    # An occurrence is one RUN that reported the finding, not one sighting the
+    # agent claims -- a self-reported count is a number the agent writes and the
+    # gate reads, which is exactly the shape an injected instruction would use
+    # to promote itself. So `schedule` above is the ceiling: hourly means at
+    # most 24, and a daily schedule means at most 1, at which point the `high`
+    # rule below can never fire. Lengthen the schedule and lower these to match;
+    # nothing checks the pair for you.
+    #
+    # 24 is the ceiling, not the count, and the number to size these against is
+    # the floor underneath it. `activeDeadlineSeconds` is four hours against an
+    # hourly schedule, and `concurrencyPolicy: Forbid` skips a fire while a run
+    # is going, so a day of runs that each go the distance is six. Every
+    # threshold here has to be reachable at six or it is dead config: it reads
+    # as a policy and behaves as "never".
+    #
+    # One thing here is not yours to lower. Two runs must independently have
+    # reported a finding before it can be promoted at all, so `1` below means
+    # two, and `0` means two as well. Severity is a field the investigating
+    # agent writes about its own finding, and the log text it grades is text it
+    # does not control; a floor of one sighting would let a single run talk
+    # itself straight into a pull request. The run log says which number it
+    # used when the floor is the binding one.
+    rules:
+      - severity: critical
+        minOccurrencesPerDay: 1
+      # Three of a possible six. `high` is a broken capability -- a skill that
+      # always fails, alerts that never arrive -- so the bar is low enough to
+      # file inside a day while still needing the finding to survive a second
+      # and third independent investigation.
+      - severity: high
+        minOccurrencesPerDay: 3
+      # Medium is degraded-or-wasteful: something works, but slowly, expensively
+      # or after retries a user can see. That is where most of the loop's
+      # ordinary output lands, and excluding it entirely meant the common case
+      # could never be filed no matter how many times it recurred. 5 of a
+      # possible 6 is deliberately near the ceiling -- a slow path that shows up
+      # in almost every run of a day is a standing property of the install,
+      # which is the only kind of medium worth a maintainer's pull request.
+      - severity: medium
+        minOccurrencesPerDay: 5
+    # The backstop that matters most. Whatever the rules say, the loop opens at
+    # most this many pull requests a day.
+    #
+    # This and `minOccurrencesPerDay` above are read the same way: a negative is
+    # taken as zero, a value past the ceiling is clamped to it, and anything
+    # that is not a number at all falls back to the default. Each of those says
+    # so in the run log.
+    #
+    # Do not write `.inf` in either. Helm will not load a values file containing
+    # it at all -- the YAML parses, and then serialising it to JSON fails with
+    # `json: unsupported value: +Inf` before any template runs -- so the only
+    # way infinity reaches the runner is a hand-edited CronJob. It is not
+    # symmetric there either: `sanitise_gate_count` clamps an infinite count to
+    # the 1,000,000 ceiling, which reads as "no limit" and is close enough, but
+    # `sanitise_cooldown_hours` rejects it as not finite and falls back to 24 --
+    # so an infinite cooldown means re-file after a day, the opposite of what
+    # writing it would have meant. Use a large finite number for either intent.
+    #
+    # Only the first filing turn of a run has time reserved for it, so three is
+    # a ceiling on the day rather than a promise about any one run: a run that
+    # promotes three findings files what fits and defers the rest, which keep
+    # their counts. A deferred finding is not queued, though — the gate only
+    # sees fingerprints the next investigation reports again, and a fresh
+    # higher-severity finding is considered ahead of it.
+    maxPullRequestsPerDay: 3
+    # Do not re-open the same fingerprint inside this window. It also sets how
+    # long the ledger keeps a promotion record, since the cooldown is the only
+    # thing that reads one. Anything unusable -- negative, infinite, not a
+    # number -- falls back to 24 with a line in the run log, and a value past
+    # ten years is clamped there, that being where the date arithmetic stops
+    # working rather than a policy limit. Use a large finite number, `87600` for
+    # a decade, to mean "never re-file this"; see the note above about `.inf`.
+    cooldownHours: 24
+
+  github:
+    # Where the run reads its own source from, in every mode including
+    # report-only -- the tarball comes from here, so this is not a
+    # GitHub-write-path setting and the default is right for almost everyone.
+    # Under `upstream` it is additionally the repository pull requests are
+    # opened against.
+    #
+    # Those are two questions and the chart now answers them with two variables.
+    # `SELFIMPROVE_SOURCE_REPO` is always this value, because the source has to
+    # be a repository that holds the object the deployed image is stamped at,
+    # and a fork that has not been synced does not. `SELFIMPROVE_UPSTREAM_REPO`
+    # is the pull request's base, so it is this value under `upstream` and
+    # `report-only` and `forkRepo` under `fork`. Setting this to a fork
+    # therefore moves both, which is right only if that fork carries the
+    # revisions the install is built from.
+    upstreamRepo: gke-labs/kube-agents
+    # Required when mode is fork or upstream, where it is the repository
+    # branches are pushed to; ignored under report-only. Must not equal
+    # upstreamRepo -- the chart refuses that in both filing modes and compares
+    # the two case-insensitively, GitHub slugs being case-insensitive
+    # themselves. One token carries the same permissions everywhere, so the two
+    # being equal is what would let the loop push a branch to the upstream.
+    #
+    # The render check catches the misconfiguration, not the behaviour: it reads
+    # two strings and cannot constrain what the runner does with a remote at
+    # 3am. The constraint that binds at runtime is in the credential proxy's
+    # deny policy, which refuses any `git push` whose remote is not the literal
+    # name `fork` and refuses `git remote set-url` outright.
+    forkRepo: ""
+    # The branch pull requests are opened against, and the branch the filing
+    # turn writes its fix on. The runner checks it out fresh for each promoted
+    # finding and hands the turn that tree rather than the one the
+    # investigation read, so the pull request's merge base is this branch's tip
+    # and its diff is one commit — whatever revision the deployed image is
+    # stamped at, and however far this branch has moved since.
+    #
+    # That is worth stating because it used to be the operator's problem.
+    # GitHub computes a pull request's diff from the merge base, so a fix based
+    # on a revision this branch does not contain carried every commit of the
+    # difference: live run `kube-agents-selfimprove-29791620` committed a single
+    # file and opened a pull request showing 40,346 additions across 261 files,
+    # because the install was running a test branch the fork's main had never
+    # seen. Setting this correctly no longer prevents that and setting it wrong
+    # no longer causes it.
+    #
+    # What this value still decides is where the work lands and what the fix is
+    # written against. An install pinned to a branch of its own — a live test, a
+    # private deployment tracking a release line — sets this to that branch, and
+    # gets fixes written against that branch's code.
+    #
+    # A consequence worth knowing: on an install whose image is well behind this
+    # branch, a finding that has since been fixed here is no longer filable. The
+    # filing skill re-reads the finding in the base checkout before it writes
+    # anything and opens nothing when the code no longer says what the finding
+    # says. That is the intended answer — the fix already exists and the image
+    # needs a rebuild — but it means an old image files less, not more.
+    baseBranch: main
+    # Label applied to every pull request the loop opens, so a maintainer can
+    # tell one from a human's at a glance and filter a queue of them. Set to ""
+    # to open them unlabelled.
+    #
+    # The label has to already exist in the repository pull requests are opened
+    # against. Creating one needs write on that repository, which the robot
+    # account has on its own fork and generally not on the upstream — so under
+    # upstream mode this is a constraint and not an oversight. A missing label
+    # costs the label and not the pull request: the filing agent applies it
+    # with `gh pr edit` after opening, and is told to say so and carry on when
+    # that fails.
+    prLabel: self-improvement
+    # Prefix for a second label carrying the finding's severity, so a queue of
+    # the loop's pull requests can be read worst-first without opening any of
+    # them. The grade is appended to it, giving `severity:critical`,
+    # `severity:high`, `severity:medium` or `severity:low` — those four and no
+    # others, because they are the vocabulary the ledger grades against. Set to
+    # "" to open them without a severity label.
+    #
+    # A prefix rather than four names: the ledger fixes which four grades
+    # exist, while the scheme that spells them belongs to the install, so one
+    # already using `sev/` sets that here.
+    #
+    # Same "must already exist" constraint as `prLabel`, and it bites harder:
+    # a repository that has taken these pull requests before still needs the
+    # severity labels created once. Each label is applied by its own `gh pr
+    # edit`, so a missing one costs only itself.
+    severityLabelPrefix: "severity:"
+    # The Secret holding the loop's GitHub personal access token, required when
+    # mode is fork or upstream and ignored under report-only. The token belongs
+    # to a robot account that is deliberately NOT the identity githubMinter
+    # issues for: the loop's token cannot reach the GitOps repositories, the
+    # agent's cannot reach this one, and either can be revoked without the
+    # other noticing.
+    #
+    # This chart does not create it — the same reasoning as
+    # platformAgent.credentials.create: false. A token written here reaches
+    # version control and Helm's release state. Create it out of band:
+    #
+    #   make selfimprove-enable ARGS="secret -n <namespace> --token-stdin"
+    #
+    # That reads the token from stdin and applies it over a pipe.
+    # `kubectl create secret --from-literal=token=<PAT>` is the same object by
+    # a route that puts the token in argv, where the process table and the
+    # shell's history file both keep a copy.
+    #
+    # A classic token needs `repo` and `read:org`. Both, and not because the
+    # loop reads organisation membership: `gh auth login --with-token` checks
+    # the token's scopes against its own minimum before it stores anything, and
+    # refuses one carrying `repo` alone. `public_repo` does not substitute for
+    # `repo` there either, however public the two repositories are. A token
+    # short of that leaves the sidecar with nothing stored and the run reports
+    # it as a filing turn with no GitHub identity, an hour later, naming the
+    # Secret rather than the scope.
+    #
+    # Under upstream mode one token covers the push to the fork and the pull
+    # request against the upstream, which is what a GitHub App could not do —
+    # see sec. 6.1 of docs/designs/self-improvement.md.
+    #
+    # Nothing rotates or expires it for you. Set an expiry at GitHub and put a
+    # reminder on it; an expired token surfaces as a SKIPPED filing turn in the
+    # ledger and nowhere else.
+    patSecret: ""
+    # The key within that Secret. The mount path is fixed by the chart.
+    patSecretKey: token
+    ksaName: kubeagents-selfimprove
+    # The investigator's Google service account, checked at render time in
+    # every mode. It has to be a usable GCP service account id — 6 to 30
+    # characters matching `[a-z][a-z0-9-]{4,28}[a-z0-9]`. It reaches a Workload
+    # Identity annotation on the runner's KSA, and GCP does not reject an
+    # annotation naming an account that cannot exist: the pod starts and every
+    # telemetry read inside it 403s, an hour into a run, with no error anywhere
+    # naming the id.
+    #
+    # This account authenticates to Google, not to GitHub. Nothing here reaches
+    # GitHub — that is github.patSecret above, and the two identities have no
+    # relationship.
+    gsaName: kubeagents-selfimprove
+
+  # No volumeSnapshot block. The design's §3.4 argues for snapshotting the
+  # agent's volume to read its SQLite stores and records that the path is not
+  # built -- so there is no flag here, rather than one that would accept
+  # `enabled: true` and do nothing with it.
+
+  # Empty uses the in-cluster LiteLLM Service the agent uses. Set to give the
+  # loop its own model budget, or to point it at a cheaper model than the one
+  # answering users.
+  model:
+    endpoint: ""
+    name: model-default
+
+  # Where the run's counts and filed pull requests live between runs. A
+  # ConfigMap in the release namespace, granted to the runner by name so the
+  # grant cannot reach a second object. Deliberately not one the agent's
+  # Deployment references — the operator hashes those into the pod template,
+  # so writing to one would roll the agent every hour.
+  ledgerConfigMap: kube-agents-selfimprove-ledger
+
+  # emptyDir sizes for the run's private Hermes home (profile, logs, sessions),
+  # the source checkout it fetches, and one shallow checkout of `baseBranch` per
+  # promoted finding — so `maxPullRequestsPerDay` clones at worst, all of them
+  # depth 1 and all discarded with the pod.
+  workspaceSizeLimit: 4Gi
+
+  # RuntimeClass for the CronJob pod. Empty inherits
+  # platformAgent.deployment.availability.runtimeClassName, on the reasoning that an
+  # install that decided the agent needed a sandboxed kernel did not decide
+  # that the pod running the same image over source fetched from GitHub did
+  # not. Setting it here overrides that -- to a different class, not to none:
+  # empty is what asks for the agent's, so there is no way to say "sandbox the
+  # agent and not the loop" from this key alone.
+  runtimeClassName: ""
+
+  # Renders the loop's own NetworkPolicy for the runner, and nothing else; the
+  # agent's are unaffected either way. Off is for a cluster running a different
+  # policy engine, or one where the CIDRs below cannot be made to match. There
+  # is no partial setting: with this false the runner's egress is whatever the
+  # cluster's default is.
+  networkPolicy: true
+
+  # The cluster DNS VIP, for the runner's port 53 egress rule. A
+  # NetworkPolicy matches the address the pod dials, which is
+  # the Service VIP rather than a kube-dns pod, so the selectors alone are not
+  # enough on every cluster. Empty allows both service-CIDR conventions GKE
+  # ships -- 34.118.224.10 and 10.96.0.10, the same pair as `apiServerCIDRs` one
+  # octet along. Set it if `kubectl get svc kube-dns -n kube-system` shows
+  # neither, or nothing the loop reads will resolve.
+  #
+  # Setting it replaces that pair rather than adding to it, which is the
+  # opposite of `apiServerCIDRs` below and deliberate: there is nothing
+  # discovered here to preserve, only two guesses at a convention, and an
+  # operator who has read the Service knows which one is right.
+  dnsCIDRs: []
+
+  # The API server, as its own egress rule, so the wide 443 rule can exclude the
+  # private ranges and still leave the runner able to read its own Pod and write
+  # the ledger.
+  #
+  # Whatever is set here is added to, not substituted for, what the chart
+  # discovers: the ClusterIP defaults GKE ships (34.118.224.1 on the current
+  # range, 10.96.0.1 on the classic one) plus every address in the
+  # default/kubernetes Endpoints, looked up at install time. The Endpoints half
+  # is the one that matters on GKE Dataplane V2, which evaluates egress against
+  # the post-translation destination -- the control-plane endpoint, typically a
+  # private address the wide 443 rule deliberately excludes. Naming only the
+  # ClusterIP there produces a drop rather than a reject, so the runner hangs on
+  # its first read instead of failing.
+  #
+  # `lookup` returns nothing under `helm template` and during a dry run. Set this
+  # explicitly for any install rendered that way whose API server is not at one
+  # of the two defaults -- `kubectl get endpoints kubernetes -n default` prints
+  # the address -- or the ledger write fails and each run's findings are lost.
+  apiServerCIDRs: []
+
+  # Whether to do that Endpoints lookup at all. True reads
+  # `default/kubernetes`, which is the one object this chart reads outside its
+  # own namespace -- and Helm aborts the entire release render on a lookup it
+  # is refused, so on a cluster where the installer identity lacks that read,
+  # switching this loop on stops the agent installing too. Set false there:
+  # the policy falls back to the two static defaults plus `apiServerCIDRs`,
+  # which is what a `helm template` render gets in any case. Check
+  # `kubectl get endpoints kubernetes -n default` and name the address above
+  # if it is neither default, or the ledger write fails and each run's
+  # findings are lost at the last step.
+  discoverApiServerEndpoints: true
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
 
 # AgentPlugins deployed into the cluster.
 plugins:

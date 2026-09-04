@@ -37,6 +37,32 @@ away BEFORE `helm uninstall {{ .Release.Name }}`, otherwise the CR strands:
   kubectl delete platformagent {{ .Values.platformAgent.name }} -n {{ .Release.Namespace }} --wait
   helm uninstall {{ .Release.Name }} -n {{ .Release.Namespace }}
 {{- end }}
+{{- if .Values.selfImprovement.enabled }}
+{{- $siMode := .Values.selfImprovement.mode | default "report-only" }}
+{{- /*
+The same ternary self-improvement.yaml computes for $prTarget, and it has to
+stay the same one: fork mode bases its pull requests on github.forkRepo,
+upstream mode on github.upstreamRepo. Naming forkRepo in both -- which this
+note used to do -- tells an operator who chose upstream mode that pull requests
+will land somewhere they will not.
+*/ -}}
+{{- $siPrTarget := ternary .Values.selfImprovement.github.forkRepo (.Values.selfImprovement.github.upstreamRepo | default "gke-labs/kube-agents") (eq $siMode "fork") }}
+
+The self-improvement loop is ON in {{ $siMode }} mode, on
+{{ .Values.selfImprovement.schedule | default "0 * * * *" }}. It investigates this installation and
+writes to the ConfigMap "{{ .Values.selfImprovement.ledgerConfigMap | default "kube-agents-selfimprove-ledger" }}".
+{{- if ne $siMode "report-only" }}
+It opens pull requests against {{ $siPrTarget }}, so the Secret
+"{{ .Values.selfImprovement.github.patSecret }}" must exist in {{ .Release.Namespace }} with a
+"{{ .Values.selfImprovement.github.patSecretKey | default "token" }}" entry holding the robot account's personal access token. The
+chart checks that you named one, not that it is there. Getting it wrong is loud
+rather than expensive — the Job mounts that one entry by name, so a Secret that
+is absent, or present without that key, holds the pod in
+CreateContainerConfigError and nothing is investigated. The expensive case is
+the one that mounts: a token the robot account cannot file with, where the run
+investigates for an hour and only the filing turn at the end fails.
+{{- end }}
+{{- end }}
 
 {{ if and .Values.operator.enabled .Values.operator.webhooks.enabled -}}
 Admission webhooks are ON. The API server calls {{ include "kube-agents.webhookServiceName" . }}
