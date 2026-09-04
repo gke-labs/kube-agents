@@ -133,6 +133,26 @@ python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py sub
 Please review the code diffs and merge this PR to trigger the GitOps CI/CD rollout!"
 ```
 
+#### Optional Telemetry & SLA Flags
+
+When `HERMES_SESSION_ID` is present in the environment (automatically injected by the runtime harness), `submit_suggestion.py` queries token consumption directly from the Hermes API server (`GET /api/sessions/<id>`) and appends verified usage counts and machine-readable JSON metadata into the PR description.
+
+Other telemetry attributes (`--elapsed`, `--model`, `--steps`, `--trace-id`, or explicit `--input-tokens` / `--output-tokens` overrides) are agent-supplied flags. Pass them only if exact, verified measurements are known:
+
+```bash
+  --input-tokens 14820 \
+  --output-tokens 1240 \
+  --elapsed '49s' \
+  --model 'gemini-3.5-flash' \
+  --steps 4 \
+  --trace-id '<otel_trace_id>'
+```
+
+> [!NOTE]
+> **Scope & Coverage:** This telemetry is attached exclusively to one-off suggestion PRs generated via `submit_suggestion.py`. Scheduled fleet audit runs generate their own ledger issues and remediation PRs via the `fleet-audit` harness (`audit_report.py`).
+
+**CRITICAL ACCURACY RULE:** Never guess, estimate, or fabricate token counts, model names, or SLA durations. If exact metrics are unmeasured or unknown, omit these flags—`submit_suggestion.py` gracefully omits the telemetry section when data is absent.
+
 `--lease` is not optional bookkeeping. `prepare` and `submit` are separate
 processes, and outside a kanban card there is no session identity for `submit`
 to re-derive the lease from — so without it the script stops and tells you to
