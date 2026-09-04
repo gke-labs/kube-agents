@@ -34,16 +34,18 @@ would hand a 1-minute cron job licence to launch a fresh fleet-wide sweep
 every single minute. That is the "bootstrap ran several times" failure.
 
 The marker is also what makes a delegated sweep safe, and that is what broke
-here. Since the sweep started fanning out to subagents, the card this job
-files is completed almost immediately — the worker's job is to delegate, not
-to scan, so it hands the real work to per-cluster child cards and finishes.
-The findings appear minutes later, from the aggregation card, and
-``INVENTORY.md`` minutes after that, from the prioritization card the sweep
-files. For that whole window the board says "done" and the disk says "no
-report", which is indistinguishable from "never scanned" — so a 1-minute job
-with no memory of its own re-files the sweep, once a minute, for as long as
-the real work takes. Only a marker written at file time closes that window,
-and adding a prioritization stage lengthened the window it has to cover.
+here. When the sweep first fanned out to subagents, the card this job filed
+completed almost immediately — the worker of that era delegated to
+per-cluster child cards plus an aggregation card and finished, so the board
+said "done" while the disk said "no report" for the whole sweep, which is
+indistinguishable from "never scanned" — and a 1-minute job with no memory of
+its own re-filed the sweep, once a minute, for as long as the real work took.
+The sweep card now stays open until it has waited out its children and
+written ``INVENTORY.raw.md`` itself (#1010 retired the complete-at-fan-out
+shape), which narrows that window without closing it: ``INVENTORY.md`` still
+appears minutes later, from the prioritization card the sweep files, and a
+crashed sweep still leaves board-done/disk-empty. Only a marker written at
+file time covers every case.
 
 Deleting ``.bootstrap_scan_filed`` — together with ``INVENTORY.raw.md``, which
 nothing else ever removes and which ``should_skip`` also gates on — is the
@@ -70,7 +72,9 @@ SCAN_TASK_TITLE = "First-time environment discovery: write the onboarding invent
 SCAN_IDEMPOTENCY_KEY = "bootstrap-inventory-scan"
 # Propagated to the cards the worker fans out to, so a duplicate root card (if
 # one ever slips through) still cannot produce a duplicate sweep underneath it.
-AGGREGATE_IDEMPOTENCY_KEY = "bootstrap-inventory-aggregate"
+# (The retired aggregation card's key, `bootstrap-inventory-aggregate`, is gone
+# with the fan-in shape it guarded: the sweep card now waits for its children
+# and writes the findings itself — issue #1010.)
 CLUSTER_IDEMPOTENCY_KEY_PREFIX = "bootstrap-inventory-cluster-"
 # The sweep no longer writes the delivered report. It writes the complete findings
 # set, then files one card that ranks it down to the short report the user actually
@@ -323,8 +327,7 @@ def _task_body() -> str:
         "answer another way. A step that cannot answer is a finding, not a puzzle. Guessing "
         "costs far more than the missing answer is worth, and it produces a report that looks "
         "complete while resting on invented data.\n\n"
-        "**The step numbers below are the inventory SOP's.** Step 2 here covers the SOP's "
-        "Steps 2 and 3, which is why there is no Step 3 — the numbering is aligned so a "
+        "**The step numbers below are the inventory SOP's** — the numbering is aligned so a "
         "reference to a step means the same thing in both documents.\n\n"
         "**Step 1 — do not reconcile the roster yourself.** This gate already ran "
         f"`{RECONCILE_SCRIPT_NAME}`, and profile lifecycle belongs to that script alone: it "
@@ -361,33 +364,34 @@ def _task_body() -> str:
         "the `metadata` shape the aggregation stage reads are specific, and a body written "
         "freehand loses them: what comes back is a topology listing with no findings in it. "
         "Each Cluster Agent is read-only and pinned to its own "
-        "cluster, so these run in parallel and none can touch another's. Then create ONE "
-        "aggregation card assigned to `platform` with `parents=[<all child card ids>]` and "
-        f"`idempotency_key='{AGGREGATE_IDEMPOTENCY_KEY}'` — a fan-in child receives every "
-        "parent's `metadata` in its worker context, which is how you collect the results. "
-        "**Its body must send that worker to the same inventory SOP you are following, "
-        "resuming at Step 4**, reading whichever of these exists:\n"
-        f"{instruction_list}\n\n"
-        "Steps 4 and 5 below are that worker's job, not yours, and it has only the card body to "
-        "learn them from: a one-line 'aggregate the children' body produces a summary and stops "
-        "there, with no prioritization card filed and onboarding silently finished. "
-        "Complete your own card once those are filed; the aggregation card does the write-up."
-        "\n\n"
+        "cluster, so these run in parallel and none can touch another's. "
+        "**Step 3 — wait for the children on this card.** Poll each child with "
+        "`kanban_show(<id>)`, running `sleep 60` between polling rounds (double it once the wait passes five minutes), until every one is "
+        "`done` or `archived`; their structured `metadata` is how you collect the results. Do "
+        "NOT complete this card while they are unfinished — completing is how a card hands back "
+        "its final result, a dispatch receipt is not the report, and the board refuses such a "
+        "completion — and do NOT `kanban_block` on them (that deadlocks; see the inventory SOP). "
+        "Steps 4 and 5 below are your job, in this same run, once the children settle; the "
+        "full mechanics are in Step 3 of the inventory SOP above.\n\n"
         "**Use those exact idempotency keys.** This is onboarding: it must happen once. The "
         "keys are what guarantees that a retry, a second dispatch, or a duplicate of this "
         "card re-attaches to the sweep already in flight instead of launching a second "
         "fleet-wide scan on top of it.\n\n"
-        "**Step 4 — write the raw findings** (in the aggregation card, or directly here if "
-        "there were no Cluster Agents to fan out to). Audit any cluster the roster did not "
+        "**Step 4 — write the raw findings** (here, once the children have settled — or "
+        "immediately if there were no Cluster Agents to fan out to). Audit any cluster the roster did not "
         "cover yourself, and combine those findings "
         "with every child's metadata into a COMPLETE, verbose findings file at "
         f"`{RAW_INVENTORY_PATH}` — the full fleet and workload tables and the full set of SRE "
         "remediation suggestions. Do not summarize and do not trim for length: this file is the "
         "only record of what the sweep saw, and the next stage reads it and nothing else.\n\n"
-        f"**Step 5 — file the prioritization card.** `{RAW_INVENTORY_PATH}` is not what the user "
+        f"**Step 5 — file the prioritization card, then complete this one.** "
+        f"`{RAW_INVENTORY_PATH}` is not what the user "
         "receives. Once it is on disk, file exactly one card — "
         f"`kanban_create(assignee='{SCAN_ASSIGNEE}', "
-        f"idempotency_key='{PRIORITIZE_IDEMPOTENCY_KEY}', ...)` — telling that worker to follow "
+        f"idempotency_key='{PRIORITIZE_IDEMPOTENCY_KEY}', "
+        "parents=[<this card's id>], ...)` — `parents` matters: it queues the ranking to run "
+        "after you finish, which is what lets your own `kanban_complete` close this card while "
+        "the ranking is still pending. Tell that worker to follow "
         "the prioritization SOP, reading whichever of these exists:\n"
         f"{prioritize_list}\n\n"
         f"Its input is `{RAW_INVENTORY_PATH}` and its output is `{INVENTORY_PATH}`, the ranked "
@@ -400,6 +404,10 @@ def _task_body() -> str:
         "transcript instead, which changes the report depending on how the sweep went.\n\n"
         "If a cluster's scan fails or its agent never reports, say so explicitly in the raw "
         "findings rather than omitting the cluster — a silent gap reads as 'clean'.\n\n"
+        "Then finish by calling `kanban_complete`: `result` is a short factual account of the "
+        f"sweep (clusters audited, findings count, that the full findings are at "
+        f"`{RAW_INVENTORY_PATH}` and ranking is queued). Completing is what releases the "
+        "prioritization card to run.\n\n"
         "Do not message the user directly — delivery is handled for you."
     )
 

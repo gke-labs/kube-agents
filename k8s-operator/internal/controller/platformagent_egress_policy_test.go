@@ -37,6 +37,10 @@ import (
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
+// dnsPort is the one port on which the rendered policy is allowed to name a
+// metadata address; see permitsBeyondDNS.
+const dnsPort = 53
+
 // egressPolicyAgent is an agent with the split broker and the allowlist both on
 // — the only configuration in which the policy renders.
 //
@@ -114,6 +118,59 @@ func permits(policy *networkingv1.NetworkPolicy, address string) bool {
 	return false
 }
 
+// permitsBeyondDNS is permits, restricted to the rules that can carry a
+// credential request: every rule except one whose port list is nothing but 53.
+//
+// This is the shape of the invariant after the DNS rule started naming the
+// metadata address. It stays a property rather than an enumeration of the
+// credential ports on purpose — a future rule permitting the metadata server on
+// some port nobody has thought of yet is caught by this and would not be caught
+// by a list of 80, 987, 988 and 8080.
+//
+// The exemption is granted to one address, not to the DNS rule. metadataLinkLocalIP
+// is the resolver under Cloud DNS for GKE and is deliberately on that rule;
+// metadataDaemonIP and the IPv6 endpoint answer the token API and no DNS at all,
+// so there is no reading of "DNS-only" that should let them onto it. Exempting
+// the rule itself would drop them from every assertion in this file the moment
+// someone added one to the peer list — port 53 included — and the package comment
+// on metadataServerAddresses promises the opposite.
+func permitsBeyondDNS(policy *networkingv1.NetworkPolicy, address string) bool {
+	exemptDNSRule := address == metadataLinkLocalIP
+
+	beyondDNS := &networkingv1.NetworkPolicy{Spec: networkingv1.NetworkPolicySpec{}}
+	for _, rule := range policy.Spec.Egress {
+		if exemptDNSRule && ruleIsDNSOnly(rule) {
+			continue
+		}
+		beyondDNS.Spec.Egress = append(beyondDNS.Spec.Egress, rule)
+	}
+	return permits(beyondDNS, address)
+}
+
+// ruleIsDNSOnly reports whether every port the rule names is 53. A rule with no
+// ports permits all of them and is never DNS-only.
+//
+// An EndPort disqualifies the rule outright. A NetworkPolicyPort carrying one is
+// a range, and Port is only its lower bound: {Port: 53, EndPort: 988} permits
+// every port from 53 to 988 inclusive — the post-NAT token port among them —
+// while IntValue() still reads 53. Testing the lower bound alone would call that
+// rule DNS-only and drop it before permits ever saw it, which is precisely the
+// exemption this helper must not grant.
+func ruleIsDNSOnly(rule networkingv1.NetworkPolicyEgressRule) bool {
+	if len(rule.Ports) == 0 {
+		return false
+	}
+	for _, candidate := range rule.Ports {
+		if candidate.EndPort != nil {
+			return false
+		}
+		if candidate.Port == nil || candidate.Port.IntValue() != dnsPort {
+			return false
+		}
+	}
+	return true
+}
+
 // allowsPeerOnPort reports whether the policy has a rule that both selects a
 // Pod carrying podLabels in the named namespace and names port.
 //
@@ -180,15 +237,90 @@ func labelSet(from map[string]string) labels.Set {
 // DNATed that request by the time policy is evaluated; fd20:ce::254 is the
 // documented IPv6 metadata address, which a dual-stack Pod reaches without
 // touching either IPv4 one.
+//
+// It asks permitsBeyondDNS rather than permits because the DNS rule names
+// 169.254.169.254 on port 53 deliberately — that is the resolver under Cloud
+// DNS for GKE. The property being defended is that no rule permits a metadata
+// address on a port a token can be minted over, which is every port but that
+// one, and for the other two addresses it is every port without exception.
+// TestTheDNSRuleReachesTheCloudDNSResolver holds the other side of it.
 func TestTheRenderedPolicyDeniesEveryMetadataAddress(t *testing.T) {
 	policy, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), nil)
 
 	for _, address := range metadataServerAddresses {
-		if permits(policy, address) {
-			t.Errorf("the rendered egress policy permits the metadata server at %s; "+
-				"anything that can make an HTTP request there can mint the Workload Identity token "+
-				"and bypass the credential broker entirely", address)
+		if permitsBeyondDNS(policy, address) {
+			scope := "on any port"
+			if address == metadataLinkLocalIP {
+				scope = "on a port other than 53"
+			}
+			t.Errorf("the rendered egress policy permits the metadata server at %s %s; anything that "+
+				"can make an HTTP request there can mint the Workload Identity token and bypass the "+
+				"credential broker entirely", address, scope)
 		}
+	}
+}
+
+// TestTheDNSRuleReachesTheCloudDNSResolver is the Cloud DNS for GKE half of the
+// invariant above, and it is a separate test because the two fail for opposite
+// reasons: that one catches the metadata server being reopened, this one
+// catches it being closed so thoroughly that the Pod cannot resolve a name.
+//
+// Under Cloud DNS the node answers DNS at 169.254.169.254:53 and every Pod's
+// resolv.conf names it. With this peer missing, the allowlist below it is
+// unreachable in full — the broker, LiteLLM and the control plane are all
+// addressed by name — so the symptom is a total outage that reads like a
+// credential bug, which is how it was first reported.
+func TestTheDNSRuleReachesTheCloudDNSResolver(t *testing.T) {
+	policy, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), nil)
+
+	if !permits(policy, metadataLinkLocalIP) {
+		t.Errorf("the DNS rule does not name %s, so a Cloud DNS for GKE cluster has no resolver and "+
+			"every destination in the allowlist becomes unreachable by name", metadataLinkLocalIP)
+	}
+
+	// That it is granted on 53 alone is TestTheRenderedPolicyDeniesEveryMetadataAddress's
+	// half, and it genuinely covers the case: a single rule naming both 53 and 80
+	// is not DNS-only, so permitsBeyondDNS keeps it and that test fails on it.
+	// Re-checking it here would only restate the same property more narrowly.
+}
+
+// TestRuleIsDNSOnlyRefusesAnythingButBareFiftyThree tests the helper rather than
+// the policy, because every metadata assertion in this file is only as strong as
+// this predicate: a rule it wrongly calls DNS-only is a rule permitsBeyondDNS
+// drops before permits can object to it. The exemption has to be impossible to
+// widen by accident, so the cases below are the ways a rule can name 53 and
+// still reach further.
+func TestRuleIsDNSOnlyRefusesAnythingButBareFiftyThree(t *testing.T) {
+	port := func(number int32) *intstr.IntOrString {
+		value := intstr.FromInt32(number)
+		return &value
+	}
+	endPort := func(number int32) *int32 { return &number }
+	namedPort := func(name string) *intstr.IntOrString {
+		value := intstr.FromString(name)
+		return &value
+	}
+
+	for _, testCase := range []struct {
+		name  string
+		ports []networkingv1.NetworkPolicyPort
+		want  bool
+	}{
+		{"bare 53 is the exemption", []networkingv1.NetworkPolicyPort{{Port: port(dnsPort)}}, true},
+		{"UDP and TCP 53 together are still DNS", []networkingv1.NetworkPolicyPort{{Port: port(dnsPort)}, {Port: port(dnsPort)}}, true},
+		{"no ports permits everything", nil, false},
+		{"53 alongside the pre-NAT token port", []networkingv1.NetworkPolicyPort{{Port: port(dnsPort)}, {Port: port(80)}}, false},
+		{"a range starting at 53 reaches the post-NAT token port", []networkingv1.NetworkPolicyPort{{Port: port(dnsPort), EndPort: endPort(988)}}, false},
+		{"an entry with no port at all permits everything on its protocol", []networkingv1.NetworkPolicyPort{{Port: nil}}, false},
+		{"a named port is not 53, whatever it resolves to", []networkingv1.NetworkPolicyPort{{Port: namedPort("dns")}}, false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := ruleIsDNSOnly(networkingv1.NetworkPolicyEgressRule{Ports: testCase.ports})
+			if got != testCase.want {
+				t.Errorf("ruleIsDNSOnly(%v) = %v, want %v; a wrong answer here silently exempts the "+
+					"rule from every metadata assertion in this file", testCase.ports, got, testCase.want)
+			}
+		})
 	}
 }
 
@@ -837,8 +969,11 @@ func TestExtraRulesCannotReopenTheMetadataServer(t *testing.T) {
 				t.Fatalf("expected the rule to be refused, dropped=%v", dropped)
 			}
 			// Dropped, not narrowed: the rendered policy must not carry it.
+			// permitsBeyondDNS, because the DNS rule names the resolver at
+			// 169.254.169.254:53 on purpose and a port-blind check here would
+			// report every case as a re-opening.
 			for _, address := range metadataServerAddresses {
-				if permits(policy, address) {
+				if permitsBeyondDNS(policy, address) {
 					t.Errorf("extraRules re-permitted the metadata server at %s", address)
 				}
 			}
@@ -902,8 +1037,9 @@ func TestReconcileRendersAndRestoresTheEgressPolicy(t *testing.T) {
 		t.Fatalf("Reconcile did not render the agent egress policy: %v", err)
 	}
 	for _, address := range metadataServerAddresses {
-		if permits(rendered, address) {
-			t.Errorf("the policy Reconcile wrote to the cluster permits the metadata server at %s", address)
+		if permitsBeyondDNS(rendered, address) {
+			t.Errorf("the policy Reconcile wrote to the cluster permits the metadata server at %s "+
+				"on a port beyond 53", address)
 		}
 	}
 
@@ -986,9 +1122,13 @@ func TestReconcileRevertsAPermissiveEditToTheEgressPolicy(t *testing.T) {
 func assertClosed(t *testing.T, policy *networkingv1.NetworkPolicy, agent *agentv1alpha1.PlatformAgent, stage string) {
 	t.Helper()
 	for _, address := range metadataServerAddresses {
-		if permits(policy, address) {
-			t.Errorf("the %s policy permits the metadata server at %s", stage, address)
+		if permitsBeyondDNS(policy, address) {
+			t.Errorf("the %s policy permits the metadata server at %s on a port beyond 53", stage, address)
 		}
+	}
+	if !permits(policy, metadataLinkLocalIP) {
+		t.Errorf("the %s policy lost the Cloud DNS resolver at %s, which is a total outage on a "+
+			"cluster that does not run kube-dns", stage, metadataLinkLocalIP)
 	}
 	if permits(policy, "8.8.8.8") {
 		t.Errorf("the %s policy permits an arbitrary internet address; it is not default-deny", stage)
@@ -1402,18 +1542,31 @@ func TestTheDNSRuleCarriesTheResolvedClusterIP(t *testing.T) {
 	}
 
 	// The annotation rung of the resolution ladder is operator input, so a
-	// metadata address arriving as a "DNS ClusterIP" must be dropped, and the
-	// invariant test above must keep holding. The fallback then applies: a
-	// policy whose DNS rule names no address at all is the total block this
-	// rule exists to prevent.
+	// metadata address arriving as a "DNS ClusterIP" must not buy any reach the
+	// rule does not already grant. 169.254.169.254:53 it does grant, so naming
+	// it is a no-op rather than an escalation; what must still not appear on a
+	// credential port is any of the three. The fallback then applies, because
+	// the filter leaves the resolved set empty: a policy whose DNS rule names no
+	// address at all is the total block this rule exists to prevent.
 	poisoned, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), []string{"169.254.169.254"})
 	for _, address := range metadataServerAddresses {
-		if permits(poisoned, address) {
-			t.Errorf("a metadata address supplied as a DNS ClusterIP was rendered: %s", address)
+		if permitsBeyondDNS(poisoned, address) {
+			t.Errorf("a metadata address supplied as a DNS ClusterIP reached a credential port: %s", address)
 		}
 	}
 	if !permits(poisoned, defaultDNSClusterIP) {
 		t.Error("dropping a poisoned DNS IP must fall back to the default, not render a rule with no address")
+	}
+
+	// The credential-only metadata listeners are not resolvers and must not be
+	// rendered as DNS peers even though 169.254.169.254 now is. The daemon
+	// address answers the token API on 988 and no DNS at all, so a rule naming
+	// it on 53 grants reach for nothing.
+	for _, address := range []string{metadataDaemonIP, "fd20:ce::254"} {
+		daemonAsDNS, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), []string{address})
+		if permits(daemonAsDNS, address) {
+			t.Errorf("%s was rendered as a DNS peer; only the resolver address belongs on the DNS rule", address)
+		}
 	}
 
 	// The whole path: a spec-level dnsClusterIPs override must reach the
@@ -1442,6 +1595,32 @@ func TestTheDNSRuleCarriesTheResolvedClusterIP(t *testing.T) {
 	if !permits(rendered, "34.118.230.7") {
 		t.Error("spec.networkPolicy.dnsClusterIPs reached the gateway policy but not the egress policy; " +
 			"the override must apply to both policies over the same Pod")
+	}
+}
+
+// TestTheDNSRuleDoesNotRepeatAPeerItAlreadyCarries guards the same duplication
+// the gateway policy's DNS rule guards against, on the builder next door. The
+// fixed peers here include nodeLocalDNSCacheIP, and a cluster running NodeLocal
+// DNSCache puts that address in kubelet's --cluster-dns, so an operator naming
+// the value their nodes use arrives at a peer the rule already has.
+func TestTheDNSRuleDoesNotRepeatAPeerItAlreadyCarries(t *testing.T) {
+	bareNodeLocalIP := strings.TrimSuffix(nodeLocalDNSCacheIP, "/32")
+	policy, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), []string{bareNodeLocalIP})
+
+	occurrences := 0
+	for _, rule := range policy.Spec.Egress {
+		if !ruleIsDNSOnly(rule) {
+			continue
+		}
+		for _, peer := range rule.To {
+			if peer.IPBlock != nil && peer.IPBlock.CIDR == nodeLocalDNSCacheIP {
+				occurrences++
+			}
+		}
+	}
+	if occurrences != 1 {
+		t.Errorf("the DNS rule names %s %d times, want 1; a duplicate ipBlock is no wider but leaves a "+
+			"reader of an auditable policy guessing which peer is doing the work", nodeLocalDNSCacheIP, occurrences)
 	}
 }
 

@@ -93,6 +93,16 @@ be judged against. That is enforced twice — the `JOB_TYPE` condition in
 `PULL_NUMBER` is set — because a guard living only in shell is one careless
 edit away from being gone.
 
+A release-candidate run does not append either, and it is the case the sentence
+above does not cover: the candidate is a commit on `main`, and the run measuring
+it is a periodic with no `PULL_NUMBER`, so it satisfies both conditions exactly.
+`RC_COMMIT_SHA` being set is the third condition, enforced in the same two
+places. It has to be, because the mistake is not correctable afterwards:
+`VersionKey` names the setup, the scoring version, the judge and the two content
+versions, and nothing about which build produced a sample, so a candidate's
+record and `main`'s are the same record once written — and the candidate would
+then be judged non-inferior to a window it had just moved.
+
 A store that will not parse is an **error**, never an empty store. Empty means
 "nothing admitted, aggregate advisory", which is a green; a corrupt file
 reaching that state would silently disarm the gate.
@@ -241,8 +251,9 @@ uv run bench-gate record \
   --lines-out /tmp/appended.jsonl
 ```
 
-It refuses to run with `PULL_NUMBER` set. It is also unconditional on the
-verdict, deliberately — see above.
+It refuses to run with `PULL_NUMBER` or `RC_COMMIT_SHA` set; `--force` overrides
+both, for tests and local screening. It is also unconditional on the verdict,
+deliberately — see above.
 
 With `EVAL_BASELINE_STORE` pointing at a bucket the append lands and the loop
 closes. Against the default local store it does not: the store lives in git,

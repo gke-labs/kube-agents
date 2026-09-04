@@ -516,6 +516,10 @@ publish_eval_dashboard() {
     echo "eval-dashboard publish skipped: PULL_NUMBER=${PULL_NUMBER} is set: a pull request never writes the dashboard"
     return 0
   fi
+  if [ -n "${RC_COMMIT_SHA:-}" ]; then
+    echo "eval-dashboard publish skipped: RC_COMMIT_SHA=${RC_COMMIT_SHA} is set: a release-candidate run measures a candidate, it does not report main's history"
+    return 0
+  fi
   if [ -z "${EVAL_DASHBOARD_TARGET:-}" ]; then
     echo "eval-dashboard publish skipped: EVAL_DASHBOARD_TARGET is not set (the Prow job config arms this later)"
     return 0
@@ -1492,6 +1496,7 @@ print(m.group(1).strip('\'\"') if m else '')
 #
 # Demoting a flaky case is a one-line same-day edit: delete its name from
 # this list, referencing the issue that names its re-admission condition.
+
 export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,cluster-agent-crashloop-debug,cluster-agent-crashloop-misleading-symptom,cluster-agent-crashloop-evidence-chain,gpu-stress-test-diagnosis,agent-kanban-smoke}"
 
 # Where the evidence itself lives. Unset means bench/baselines/ in the
@@ -1779,10 +1784,23 @@ profile_begin "record + final gate"
 # closes. Unset, the store is the git checkout and this job has no push
 # credential, so the append dies with the workspace; --lines-out is what
 # survives, as a Prow artefact somebody lands by hand in the meantime.
+#
+# RC_COMMIT_SHA is the third condition and the one that is not about pull
+# requests. A release-candidate eval is a periodic with no PULL_NUMBER, so it
+# satisfies the two conditions above exactly, and without this it would file the
+# candidate's results as main's. That is not a mistake anybody can undo later:
+# VersionKey in bench/kube_agents_bench/baselines.py is setup_id,
+# scoring_version, judge_model, fleet and verifiers, with no field naming the
+# build a sample came from, so an RC record and a main record are the same
+# record once written. The candidate would then be measured for non-inferiority
+# against a window it had just moved.
 case "${JOB_TYPE:-}" in
   postsubmit | periodic) EVAL_IS_MAIN_RUN="true" ;;
   *) EVAL_IS_MAIN_RUN="false" ;;
 esac
+if [ -n "${RC_COMMIT_SHA:-}" ]; then
+  EVAL_IS_MAIN_RUN="false"
+fi
 if [ "${EVAL_IS_MAIN_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then
   echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Recording baseline evidence from main <<<"
   # Never fatal. Bookkeeping must not be the reason a merge to main reds.
@@ -1790,6 +1808,8 @@ if [ "${EVAL_IS_MAIN_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then
     "${CASE_RESULTS[@]}" \
     --lines-out "${ARTIFACT_DIR}/baseline-append.jsonl") || \
     echo "WARNING: recording baseline evidence failed; the verdict below is unaffected."
+elif [ -n "${RC_COMMIT_SHA:-}" ]; then
+  echo "Release-candidate run (RC_COMMIT_SHA=${RC_COMMIT_SHA}): the baseline store is read, never written — the candidate is judged against main's window, not added to it."
 else
   echo "Not a main-branch recorder run (JOB_TYPE=${JOB_TYPE:-unset}): the baseline store is read, never written."
 fi

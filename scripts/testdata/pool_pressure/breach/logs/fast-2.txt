@@ -1,0 +1,20 @@
+go: downloading github.com/prometheus/common v0.44.0
+go: downloading github.com/prometheus/procfs v0.10.1
+go: downloading google.golang.org/protobuf v1.30.0
+go: downloading github.com/matttproud/golang_protobuf_extensions v1.0.4
+go: downloading github.com/golang/protobuf v1.5.3
+=== [2026-08-26T07:52:36Z] Leasing GCP Project from Boskos ===
+✓ Successfully leased project: kube-agents-evals-3
+Installed helm v3.21.4 (amd64) to /tmp/kube-agents-helm-v3.21.4-amd64
+=== Target Cluster Context ===
+Project:   kube-agents-evals-3
+Cluster:   platform-agent-host
+Location:  us-central1
+Namespace: kubeagents-system
+Fetching cluster endpoint and auth data.
+kubeconfig entry generated for platform-agent-host.
+=== [2026-08-26T07:52:42Z] Cleaning Up GKE Resources ===
+=== [2026-08-26T07:52:42Z] Step 1: Uninstalling the kube-agents release ===
+Error: uninstall: Release not loaded: kube-agents: release: not found
+✓ Release uninstall finished in 1s
+=== [2026-08-26T07

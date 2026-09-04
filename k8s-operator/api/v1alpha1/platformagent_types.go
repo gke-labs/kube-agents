@@ -52,6 +52,10 @@ type PlatformAgentIntegrationSpec struct {
 	// Slack configures the Slack integration.
 	// +optional
 	Slack *SlackSpec `json:"slack,omitempty"`
+
+	// Teams configures the Microsoft Teams integration.
+	// +optional
+	Teams *TeamsSpec `json:"teams,omitempty"`
 }
 
 // GoogleChatSpec contains the configuration for the Google Chat integration,
@@ -121,6 +125,52 @@ type SlackSpec struct {
 	// HomeChannelName is the human-readable name for the home channel.
 	// +optional
 	HomeChannelName string `json:"homeChannelName,omitempty"`
+}
+
+// TeamsSpec contains the configuration for the Microsoft Teams integration.
+// +kubebuilder:validation:XValidation:rule="!has(self.enabled) || self.enabled == false || (has(self.appIdSecretRef) && has(self.appPasswordSecretRef))",message="appIdSecretRef and appPasswordSecretRef are required when Teams integration is enabled"
+type TeamsSpec struct {
+	// Enabled toggles the Microsoft Teams integration.
+	// +kubebuilder:default=false
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// AppIdSecretRef securely references a Secret containing the Microsoft App (Client) ID.
+	// +optional
+	AppIdSecretRef *corev1.SecretKeySelector `json:"appIdSecretRef,omitempty"`
+
+	// AppPasswordSecretRef securely references a Secret containing the Microsoft App Client Secret.
+	// +optional
+	AppPasswordSecretRef *corev1.SecretKeySelector `json:"appPasswordSecretRef,omitempty"`
+
+	// TenantId is the Microsoft Entra ID Tenant ID for single-tenant enterprise lock-down.
+	// +optional
+	TenantId string `json:"tenantId,omitempty"`
+
+	// AllowedUsers is a list of allowed Entra ID Object IDs or User Principal Names.
+	// When empty and allowAllUsers is false (default), interactions are rejected.
+	// +listType=set
+	// +optional
+	AllowedUsers []string `json:"allowedUsers,omitempty"`
+
+	// AllowAllUsers allows any authenticated tenant user to interact with the bot.
+	// When false (default), users not listed in allowedUsers are rejected.
+	// +kubebuilder:default=false
+	// +optional
+	AllowAllUsers *bool `json:"allowAllUsers,omitempty"`
+
+	// HomeChannel is the default channel ID for scheduled messages.
+	// +optional
+	HomeChannel string `json:"homeChannel,omitempty"`
+
+	// HomeChannelName is the human-readable name for the home channel.
+	// +optional
+	HomeChannelName string `json:"homeChannelName,omitempty"`
+
+	// AdaptiveCards toggles rich Adaptive Card rendering for reports and updates.
+	// +kubebuilder:default=true
+	// +optional
+	AdaptiveCards *bool `json:"adaptiveCards,omitempty"`
 }
 
 // +kubebuilder:object:root=true

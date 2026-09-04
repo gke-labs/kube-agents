@@ -99,11 +99,11 @@
     {
       "name": "hindsight-postgresql",
       "origin": "third-party",
-      "repository": "docker.io/ankane/pgvector",
-      "tag": "latest@sha256:956744bd14e9cbdf639c61c2a2a7c7c2c48a9c8cdd42f7de4ac034f4e96b90f8",
+      "repository": "docker.io/pgvector/pgvector",
+      "tag": "0.8.6-pg15@sha256:a947c45cdc5906a1bc951f20a8709e321256343ee0f251e4ae00b5e7def4e6da",
       "override": "HINDSIGHT_POSTGRES_IMAGE",
       "pulledBy": "The chart, alongside the Hindsight API.",
-      "description": "Postgres with the pgvector extension, the store behind the Hindsight API. Upstream publishes only a floating 'latest', so the digest is the real pin."
+      "description": "Postgres with the pgvector extension, the store behind the Hindsight API. The pg15 line, not a newer one: the StatefulSet keeps its data on a PVC, and Postgres refuses a data directory written by another major, so moving off pg15 is a pg_upgrade rather than a tag change. Postgres 15 is supported upstream until November 2027, though Hindsight's own floor is Postgres 15 too, so this sits at the oldest major it supports and a release that raises that floor forces the pg_upgrade sooner. Upstream also rebuilds a version tag in place when the Postgres base is patched, which is what the digest half of the pin holds still."
     },
     {
       "name": "cert-manager-controller",

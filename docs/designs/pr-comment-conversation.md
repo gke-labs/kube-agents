@@ -161,7 +161,7 @@ the gate is narrower rather than absent — the hardline floor (`rm -rf /`, `mkf
 sudo-stdin guard and any `approvals.deny` rule all sit above the bypass. If a session type is ever
 found that lands there, the route to covering it is `ctx.register_hook("pre_tool_call", …)`,
 dispatched from `model_tools.py` above the approval layer and not gated on session context, rather
-than a nineteenth anchored substitution in `deploy/docker/patches/`. That hook dispatch swallows
+than another anchored substitution in `deploy/docker/patches/`. That hook dispatch swallows
 exceptions and is fail-open, so such a hook must catch internally and decide explicitly.
 
 ## 3. The forge provider

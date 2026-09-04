@@ -39,10 +39,12 @@ spec:
       containers:
         - name: postgresql
           # pgvector supplies the vector extension Hindsight's embeddings need.
-          # Pinned by digest: upstream publishes only a floating `latest` tag, so
-          # without this a pod reschedule can silently change the database engine.
-          # The pin lives in images.json and the deploy target resolves it here,
-          # which is what lets a mirrored install redirect it.
+          # Pinned by digest: upstream rebuilds a version tag in place when the
+          # Postgres base is patched, so without this a pod reschedule can move the
+          # database to a Postgres minor nobody chose. The pin lives in images.json
+          # and the deploy target resolves it here, which is what lets a mirrored
+          # install redirect it — and images.json is also where the constraints on
+          # the tag are written, so read them there before changing it.
           image: ${HINDSIGHT_POSTGRES_IMAGE}
           ports:
             - name: postgresql

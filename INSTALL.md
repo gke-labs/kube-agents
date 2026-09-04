@@ -301,17 +301,18 @@ If you enabled Google Chat or Slack during the install, perform the following re
      ```bash
      kubectl exec -it deploy/platform-agent-gateway -n kubeagents-system -- hermes pairing approve google_chat <PAIRING_CODE>
      ```
-   - Re-display these instructions at any time from the `k8s-operator` directory:
+   - Re-display these instructions at any time from the repository root:
      ```bash
-     ./scripts/print_instructions_gchat.sh
+     ./scripts/installer/print_instructions_gchat.sh
      ```
 
 ##### 2. Slack Configuration (`SLACK_ENABLED=true`)
 
 1. **Verify Slack App Settings**:
    - Ensure **Socket Mode** is enabled in your Slack App console.
-   - Verify that your Bot Token (`SLACK_BOT_TOKEN`) has the required scopes: `app_mentions:read`, `channels:history`, `chat:write`, `channels:read`, `groups:read`, `im:read`, `mpim:read`, `files:write`.
+   - Verify that your Bot Token (`SLACK_BOT_TOKEN`) has the required scopes: `app_mentions:read`, `channels:history`, `chat:write`, `channels:read`, `groups:read`, `im:read`, `mpim:read`, `files:write`, `reactions:write`.
    - `files:write` is the one that is easy to miss, because omitting it looks like nothing is wrong. A card whose answer is text is delivered normally; a card that produces a **file** has its upload rejected with `missing_scope`, which the artifact delivery path catches and logs as a warning. The user is told the task completed and never sees the artifact. Add the scope and reinstall the app.
+   - `reactions:write` fails more quietly still. The agent puts 👀 on a message when it picks the work up and swaps it for ✅ or ❌ when the turn ends; without the scope Slack rejects each of those with `missing_scope`, the adapter logs it at debug and carries on, and the answer still arrives. The only symptom is that no reaction ever appears. Add the scope and reinstall.
 2. **Test Bot Connection**:
    - Invite the bot to a channel or send a direct message: `"Hi Platform Agent"`.
 3. **Approve Pairing Code (Optional / First-time setup)**:
@@ -329,9 +330,9 @@ If you enabled Google Chat or Slack during the install, perform the following re
 5. **Set the Home Channel (if you left `SLACK_HOME_CHANNEL` empty)**:
    - Scheduled audits have nowhere to post until one is set. From the Slack channel you want, run `/sethome` (or `/hermes sethome`). It takes effect immediately and persists across restarts.
 
-- Re-display these instructions at any time from the `k8s-operator` directory:
+- Re-display these instructions at any time from the repository root:
   ```bash
-  ./scripts/print_instructions_slack.sh
+  ./scripts/installer/print_instructions_slack.sh
   ```
 
 ---

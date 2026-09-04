@@ -598,9 +598,13 @@ type SecuritySpec struct {
 	// "Allowlist" renders a default-deny egress policy that permits only the
 	// destinations the agent legitimately needs. Because NetworkPolicy has no
 	// deny rule, a destination is denied by not appearing on the list, and the
-	// link-local metadata server — 169.254.169.254, where anything that can
-	// make an HTTP request can mint the node or Workload Identity service
-	// account's tokens — is one of the destinations left off.
+	// credential API of the link-local metadata server — 169.254.169.254 on TCP
+	// 80, where anything that can make an HTTP request can mint the node or
+	// Workload Identity service account's tokens — is one of the destinations
+	// left off. That address does appear on the list once, on port 53 only:
+	// under Cloud DNS for GKE it is the Pod's DNS resolver, and withholding it
+	// leaves the agent unable to resolve any of the names the rest of the
+	// allowlist is written in. Port 53 reaches no token.
 	//
 	// READ THIS BEFORE YOU BELIEVE THE NAME. THIS FIELD BLOCKS NOTHING TODAY.
 	// Not the metadata server, not anything else. Setting it to Allowlist can
@@ -631,7 +635,9 @@ type SecuritySpec struct {
 	//   - 169.254.169.254/32 on TCP 80, plus the discovered metadata-daemon port (988 by default) to both link-local
 	//     metadata addresses — the pre- and post-DNAT forms of a metadata
 	//     request (the 988 rule is suppressed when the resolved metadata
-	//     daemon IP is empty). So the metadata path stays open.
+	//     daemon IP is empty). So the metadata path stays open. The same
+	//     address is also permitted on port 53, where it is the Cloud DNS for
+	//     GKE resolver rather than a credential path.
 	//   - TCP 443 to 0.0.0.0/0 minus the private ranges, unless the
 	//     FQDNNetworkPolicy annotation is set. So every HTTPS destination on
 	//     the public internet stays open, and with it the exfiltration half of

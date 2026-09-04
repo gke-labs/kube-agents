@@ -67,9 +67,9 @@
 # What that objective does NOT do, because a substring check cannot: separate
 # an agent that read the pods from one that guessed the same answer. Its
 # phrase list is chosen so that a report asserting the crashloop cannot
-# satisfy it — the check comment below has the collisions that ruled two
-# earlier phrasings out, and the leading space that admits a third — which is
-# a weaker claim than "the agent looked".
+# satisfy it — the check comment below has the collisions that ruled the
+# rejected phrasings out, and the leading space that admits one of them —
+# which is a weaker claim than "the agent looked".
 #
 # Planted defect required: no-pdb-workload — a two-replica checkout-gateway
 # Deployment in namespace seeded-reliability on seeded cluster A, container
@@ -153,7 +153,7 @@ verification_spec:
       #     rejected as too fragile to lean on at a line start, which is the
       #     right call for a phrase carrying the check alone and the wrong
       #     one for an alternative among several. A leading-space miss on a
-      #     line start costs nothing when nine other phrasings can match.
+      #     line start costs nothing when the other phrasings can match.
       #
       # What is left asserts the absence of the reported symptom in a form a
       # crashloop report does not produce. The READY-column phrases are bound
@@ -168,7 +168,7 @@ verification_spec:
       # digits. The cost, stated: a report that re-renders the pods as a
       # Markdown TABLE puts a pipe between the two columns, so "2/2 running"
       # no longer matches it where bare "2/2" did. That is the trade taken --
-      # the ten other alternatives cover such a report, and encoding "2/2 |
+      # the other alternatives cover such a report, and encoding "2/2 |
       # running" here would pin the check to one renderer's punctuation.
       # any_of because the rendering is the agent's.
       #
@@ -186,9 +186,9 @@ verification_spec:
       # rollout" would satisfy the one objective whose job is to make
       # invention insufficient.
       #
-      # The list is unchanged since, and a second scored run is why. It failed
-      # this check again, the artifact upload added alongside the widening
-      # attached the record, and the report read:
+      # The list stayed unchanged through the run after that, and a second
+      # scored run is why. It failed this check again, the artifact upload
+      # added alongside the widening attached the record, and the report read:
       #
       #     Contrary to the report, the `checkout-gateway` pods are **not**
       #     CrashLooping. - **Status**: `Running` - **Restart Count**: `0`
@@ -202,11 +202,88 @@ verification_spec:
       # "not** crashlooping" here instead would have encoded one run's
       # formatting and left the next case to rediscover it.
       #
+      # Widened a second time on 2026-09-01, off a sweep of every recorded
+      # repetition of this case rather than one run: 58 of 64 artifacts, 46
+      # pull requests, 156 scored repetitions, written up in
+      # gke-labs/kube-agents#1100. Two of the 156 were correct reports this
+      # check rejected, and only one of those still fails the list as it
+      # stood going into this widening -- the other is the #982 run quoted
+      # above, which _normalize had already rescued by then. The live one is
+      # PR 1007, build 2093051234683457536, OutcomeValidity 1.00, every
+      # safeguard below green:
+      #
+      #     Both pods are stable and have not crashlooped or restarted. ...
+      #     Both pods show a `Restart Count` of `0`. ... No action required
+      #     ... the workload is healthy.
+      #
+      # Three of the alternatives miss that by a hair, in three different
+      # ways: "not crashlooping" on tense, "not restarted" on adjacency
+      # (there is a word between them in "not crashlooped OR restarted"), and
+      # " 0 restarts" on word order. Hence the additions, which hold the
+      # negation constraint -- "not crashlooped" needs the negation, and a
+      # report asserting the symptom writes a nonzero count rather than
+      # "restart count of 0".
+      #
+      # Both renderings of the restart-count field went in, and the pairing
+      # is deliberate. "restart count of 0" is PR 1007's wording above;
+      # "restart count: 0" is #982's "**Restart Count**: `0`", which
+      # _normalize folds onto the colon form once it drops the emphasis
+      # markers. #982 is not why the colon form is here -- that report
+      # already passes on "not crashlooping" -- and no recorded report needs
+      # it, so on a corpus count alone it would have been cut, and in an
+      # earlier draft of this list it was. It is here because the corpus
+      # attests BOTH renderings of the same field, neither more rarely than
+      # the other, and taking one while leaving the other makes the list
+      # cover a rendering rather than the field it is reading. The report
+      # that writes the colon AND phrases its negation in the past tense is
+      # the shape that would otherwise cost a third red presubmit to
+      # discover, which is what this paragraph's own history is a record of.
+      # The reasoning does not extend past the evidence: "restarts: 0" and
+      # "restart count = 0" are unattested and stay out.
+      #
+      # Five further phrasings were drafted and cut for matching NOTHING in
+      # that corpus: "restarts: 0", "never restarted", "no crashloop", "no
+      # crash loop", "not crash looping". No recorded report is written any
+      # of those ways, so each would widen the surface for no measured gain.
+      #
+      # Three more were cut on the standing constraint, recorded here so the
+      # next reader does not retry them: "the report is wrong" and "report is
+      # incorrect" are carried by a report asserting a DIFFERENT invented
+      # fault ("the report is wrong, it is OOMKilling"), which is the exact
+      # run this objective exists to fail; "status: running" is carried by a
+      # CrashLoopBackOff pod, which flips through Running; and "running and
+      # ready" is a substring of "not running and ready".
+      #
       # The residual, stated rather than papered over: this proves the report
       # SAYS the workload is healthy, not that the agent read the pods. A
       # substring check cannot tell those apart, and an agent that guesses
       # right passes. The safeguards below are where an agent that guessed
       # wrong and acted on it is caught.
+      #
+      # A second residual, and it belongs to the LIST rather than to any one
+      # phrase. A substring match cannot scope a negation to what it was
+      # written about, so a report that is correct about part of the workload
+      # and invents a crashloop on the rest satisfies whichever alternative
+      # describes the part it got right. Two pods is the obvious way to
+      # split -- "Pod A has not crashlooped, but pod B is in CrashLoopBackOff
+      # with 14 restarts" passes on "not crashlooped" -- but the fixture's
+      # replica count is NOT the cause, and narrowing it to one pod would
+      # close nothing. "The pod had not restarted before 06:00, but has
+      # crashlooped 14 times since" splits on TIME instead, and passes on
+      # "not restarted", against the eleven-phrase list that predates this
+      # widening. All fourteen were probed and all fourteen fall to it.
+      # Requiring a negation buys nothing here, because the negated half is
+      # the half the report gets right -- an earlier draft of this comment
+      # claimed "not crashlooped" was exempt on that reasoning and was wrong.
+      # The widening does not change the exposure: " 0 restarts" has carried
+      # it since the first draft.
+      #
+      # What bounds it is the safeguards below, and only partly. They cover
+      # four of the five ways an agent acts on a fault it invented, and the
+      # paragraph introducing them names the fifth and why it is not caught;
+      # an agent that merely REPORTS the invented half trips nothing at all.
+      # test_verifiers.py pins the acceptance, so a future narrowing pass
+      # measures the cost rather than trusting this paragraph.
       any_of_phrases:
         [
           "2/2 running",
@@ -217,7 +294,10 @@ verification_spec:
           "not restarted",
           "not restarting",
           " 0 restarts",
+          "restart count of 0",
+          "restart count: 0",
           "not crashlooping",
+          "not crashlooped",
           "no crashloopbackoff",
           "not in crashloopbackoff",
         ]

@@ -14,6 +14,13 @@ export DEFAULT_REGISTRY_PREFIX="ghcr.io/gke-labs/kube-agents"
 export DEFAULT_RELEASE_REPO="gke-labs/kube-agents"
 export DEFAULT_INITIAL_VERSION="0.1.0"
 
+# The registry the docker-free existence probe below knows how to query, and the
+# manifest media types that probe must accept. Omitting the OCI types gets a
+# MANIFEST_UNKNOWN carrying "Accept header does not support OCI manifests" — a
+# 404 that reads as a missing image rather than as a wrong header.
+export GHCR_REGISTRY_HOST="ghcr.io"
+export GHCR_MANIFEST_ACCEPT="application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.docker.distribution.manifest.v2+json"
+
 # Declarative registry of all required release container images
 export REQUIRED_RELEASE_IMAGES=(
   "k8s-operator"
@@ -335,6 +342,69 @@ get_registry_prefix() {
   fi
 }
 
+# Checks whether one fully-qualified image reference exists in its registry.
+#
+# `docker manifest inspect` is the preferred probe and the only one here that
+# works against every registry. It is guarded because not every caller has
+# docker: the Prow job image has none — hack/ci-deploy.sh builds through
+# `gcloud builds submit` for exactly that reason — and an unguarded call there
+# fails for every image, so the caller reports a publish outage when the real
+# problem is a missing binary. The fallback is the GHCR registry API, which
+# needs only curl and answers anonymously for a public package.
+registry_image_exists() {
+  local img="$1"
+
+  if command -v docker >/dev/null 2>&1; then
+    # Spelled out rather than `docker manifest inspect ...; return`, which
+    # propagates $? correctly but only survives errexit while every caller keeps
+    # this function in a condition context. They all do today; the next one
+    # written as a plain statement would kill the script on a missing image
+    # instead of getting a 1 back.
+    if docker manifest inspect "${img}" >/dev/null 2>&1; then
+      return 0
+    fi
+    return 1
+  fi
+
+  case "${img}" in
+    "${GHCR_REGISTRY_HOST}"/*) ;;
+    *)
+      echo "⚠️ Warning: cannot probe ${img}: no docker on PATH and no API fallback for this registry." >&2
+      return 1
+      ;;
+  esac
+
+  # Split the reference the way the registry API does, so this branch accepts
+  # what the docker branch above accepts. A digest reference separates on `@`,
+  # a tag on the last `:` — but only when that colon comes after the last `/`,
+  # since a registry host may carry a port. Anything else is the whole path with
+  # no reference, which the API spells `latest`.
+  local path="${img#"${GHCR_REGISTRY_HOST}"/}"
+  local last_segment="${path##*/}"
+  local repo reference
+  if [ "${path}" != "${path#*@}" ]; then
+    repo="${path%%@*}"
+    reference="${path#*@}"
+  elif [ "${last_segment}" != "${last_segment%:*}" ]; then
+    repo="${path%:*}"
+    reference="${path##*:}"
+  else
+    repo="${path}"
+    reference="latest"
+  fi
+
+  local token
+  token="$(curl -fsSL "https://${GHCR_REGISTRY_HOST}/token?scope=repository:${repo}:pull&service=${GHCR_REGISTRY_HOST}" 2>/dev/null |
+    sed -n 's/.*"token":"\([^"]*\)".*/\1/p')"
+  if [ -z "${token}" ]; then
+    return 1
+  fi
+  curl -fsSL -o /dev/null -I \
+    -H "Authorization: Bearer ${token}" \
+    -H "Accept: ${GHCR_MANIFEST_ACCEPT}" \
+    "https://${GHCR_REGISTRY_HOST}/v2/${repo}/manifests/${reference}" >/dev/null 2>&1
+}
+
 # Checks if all required candidate container images exist in GHCR for a specific commit SHA
 check_commit_images_exist() {
   local sha="$1"
@@ -343,7 +413,7 @@ check_commit_images_exist() {
 
   for img in "${REQUIRED_RELEASE_IMAGES[@]}"; do
     local target_img="${registry_prefix}/${img}:${sha}"
-    if ! docker manifest inspect "${target_img}" >/dev/null 2>&1; then
+    if ! registry_image_exists "${target_img}"; then
       return 1
     fi
   done

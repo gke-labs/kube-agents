@@ -41,10 +41,13 @@ failure. Five are held out with a filed issue naming the exit condition:
   repetitions when the agent chooses to fan out, so the collapse rule does not absorb it.
   Enters when the fix merges.
 - **cluster-agent-healthy-workload-no-finding** —
-  [#1100](https://github.com/gke-labs/kube-agents/issues/1100): the agent invents a
-  finding on a healthy workload ~1 run in 8. Main's own trait, so a collapse would tax an
-  innocent PR. Enters when the false-positive rate drops or when rung-6 screening can
-  compare against main.
+  [#1010](https://github.com/gke-labs/kube-agents/issues/1010): the delegation receipt is
+  graded as the answer (51 of 156 recorded repetitions).
+  [#1100](https://github.com/gke-labs/kube-agents/issues/1100) held this seat until its own
+  sweep closed it — the agent invents nothing here, so the false-positive premise is gone
+  but the reason for the hold is not. Still main's own trait, so a collapse would tax an
+  innocent PR. Enters when #1010's fix merges or when rung-6 screening can compare against
+  main.
 - **autoops-warning-event-triage** —
   [#1101](https://github.com/gke-labs/kube-agents/issues/1101): 0/5 graded repetitions on
   record; admitting it reds every pull request today. Enters when the lettered-options bar

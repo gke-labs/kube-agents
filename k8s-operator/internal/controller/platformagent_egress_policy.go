@@ -28,8 +28,14 @@ package controller
 // allowlist, it adds the entire internet to it. There is no deny rule in
 // NetworkPolicy at all. Denying is what you get by not allowing.
 //
-// So there is one policy, it is default-deny, and the metadata server is denied
-// because it does not appear on the list.
+// So there is one policy, it is default-deny, and the metadata server's
+// credential API is denied because it does not appear on the list.
+//
+// "Credential API" and not "the metadata address": the DNS rule names
+// 169.254.169.254 on port 53, because that is the resolver on a Cloud DNS for
+// GKE cluster and withholding it is a total outage rather than a control. The
+// ports the token is minted on — 80 pre-NAT, 988 post-NAT — appear nowhere.
+// buildAgentEgressNetworkPolicy's dnsPeers comment argues that split in full.
 //
 // # Why not the "0.0.0.0/0 except 169.254.169.254/32" form
 //
@@ -131,10 +137,27 @@ const (
 	// alongside the CNI-enforcement caveat in the credential-isolation
 	// reference page.
 	nodeLocalDNSCacheIP = "169.254.20.10/32"
+
+	// metadataResolverCIDR is the metadata address in the one role this policy
+	// grants it: the DNS resolver a Cloud DNS for GKE cluster puts in every
+	// Pod's resolv.conf. It is the same host as metadataLinkLocalIP, spelled as
+	// a CIDR because that is what an ipBlock takes, and kept separate from that
+	// constant so a reader of the DNS rule sees which role is meant. The
+	// credential ports on this host are permitted nowhere in this file; the
+	// dnsPeers comment in buildAgentEgressNetworkPolicy says why 53 is safe.
+	metadataResolverCIDR = metadataLinkLocalIP + "/32"
 )
 
 // metadataServerAddresses are every address a request for cloud credentials
-// can arrive at, and none of them may appear in a rendered egress rule.
+// can arrive at, and none of them may be permitted on a credential port by a
+// rendered egress rule.
+//
+// "On a credential port" and not "at all": the DNS rule in
+// buildAgentEgressNetworkPolicy names 169.254.169.254 on port 53, because that
+// is the resolver under Cloud DNS for GKE. Its comment argues why 53 reaches no
+// token, and permitsBeyondDNS in the tests is what holds the invariant at that
+// scope. The addresses below still may not appear anywhere else, and
+// egressRuleReachesMetadata refuses them in extraRules on every port.
 //
 //   - 169.254.169.254 is the documented GCE metadata address, and the one a
 //     Pod's own code connects to.
@@ -235,13 +258,36 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 	// same two peers appear in charts/kube-agents/templates/litellm.yaml and in
 	// deploy/kustomize/platform/networkpolicy-core-egress.yaml, and the
 	// resolved ClusterIP peers join them for the VIP-matching dataplanes.
-	// A resolved IP that is a metadata address is dropped rather than
-	// rendered: the annotation rung of the ladder is operator input, and this
-	// policy's one invariant is that no rule permits those addresses.
+	//
+	// The metadata address is on this rule, and on port 53 only. Under Cloud DNS
+	// for GKE the node answers DNS at 169.254.169.254:53 and a Pod's resolv.conf
+	// names it, so barring it there is not a narrower credential path — it is no
+	// name resolution, and this allowlist reaches every one of its destinations
+	// by name. Port 53 is not a way in: a TCP connection to :53 reaches the
+	// resolver, and the credential API this policy exists to withhold is on :80
+	// pre-NAT and :988 post-NAT. No rule below permits this address on either —
+	// the only rule naming 80 is LiteLLM's, whose peer is a Pod selector that no
+	// link-local address matches, and extraRules refuses a metadata address
+	// outright on every port. Nor is it a new exfiltration channel wherever
+	// CoreDNS forwards externally, as the stock configuration does: the kube-dns
+	// peers above already resolve arbitrary external names. The exception is a
+	// cluster that has removed that forwarding, where this peer does hand the
+	// sandbox a recursive resolver CoreDNS was withholding.
+	//
+	// So the invariant this policy holds is that no rule permits a metadata
+	// address on a *credential* port, and it is machine-checked at that scope by
+	// TestTheRenderedPolicyDeniesEveryMetadataAddress.
+	//
+	// A resolved IP that is a metadata address is still dropped below rather
+	// than rendered. That filter is no longer load-bearing for 169.254.169.254,
+	// which is granted here unconditionally, but 169.254.169.252 and fd20:ce::254
+	// are credential listeners that answer no DNS, and the annotation rung of the
+	// ladder is operator input that can name them.
 	dnsPeers := []networkingv1.NetworkPolicyPeer{
 		namespacedPodPeer("kube-system", map[string]string{"k8s-app": "kube-dns"}),
 		namespacedPodPeer("kube-system", map[string]string{"k8s-app": "node-local-dns"}),
 		{IPBlock: &networkingv1.IPBlock{CIDR: nodeLocalDNSCacheIP}},
+		{IPBlock: &networkingv1.IPBlock{CIDR: metadataResolverCIDR}},
 	}
 	safeDNSIPs := make([]string, 0, len(dnsClusterIPs))
 	for _, ip := range dnsClusterIPs {
@@ -254,9 +300,14 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 	if len(dnsIPPeers) == 0 {
 		dnsIPPeers = formatCIDRPeers([]string{defaultDNSClusterIP}, false)
 	}
+	// formatCIDRPeers dedupes within one call, not against the fixed peers above.
+	// The metadata address cannot collide, having been filtered out already, but
+	// nodeLocalDNSCacheIP can: a cluster running NodeLocal DNSCache puts
+	// 169.254.20.10 in kubelet's --cluster-dns, so an operator naming the value
+	// their nodes use lands on the peer this rule already carries.
 	rules = append(rules, networkingv1.NetworkPolicyEgressRule{
 		Ports: []networkingv1.NetworkPolicyPort{udpPort(53), tcpPort(53)},
-		To:    append(dnsPeers, dnsIPPeers...),
+		To:    append(dnsPeers, peersNotAlreadyPresent(dnsPeers, dnsIPPeers)...),
 	})
 
 	// The credential broker. This is the agent's route to every credentialed

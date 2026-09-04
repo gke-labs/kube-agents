@@ -16,7 +16,7 @@
 #
 # The name, not the repository's trailing segment. For most entries they are
 # the same word, which is why this is easy to state wrong; where they are not,
-# the name wins — docker.io/ankane/pgvector lands as "<prefix>/hindsight-
+# the name wins — docker.io/pgvector/pgvector lands as "<prefix>/hindsight-
 # postgresql", after the entry that describes what it is for rather than after
 # the upstream image it happens to be.
 #
@@ -137,14 +137,15 @@ if [ "$COPY_TOOL" = "docker" ] && [ "$DRY_RUN" -ne 1 ]; then
 fi
 
 # Drop the tag from a reference that carries both a tag and a digest, leaving
-# "repo@sha256:...". Three inventory entries pin that way — both Hindsight
-# images and the Hermes base — and skopeo's docker:// transport refuses the
-# combined form outright ("Docker references with both a tag and digest are
-# currently not supported"), so a skopeo host would fail exactly those copies
-# and mirror everything else. The digest half is the one to keep: it names the
-# same manifest the tag resolved to, whereas dropping the digest would copy
-# whatever the tag points at today and silently unpin the image. crane accepts
-# the combined form, so only the skopeo path needs this.
+# "repo@sha256:...". Four inventory entries pin that way — both Hindsight
+# images, busybox, and the Hermes base (through tags.env) — and skopeo's
+# docker:// transport refuses the combined form outright ("Docker references
+# with both a tag and digest are currently not supported"), so a skopeo host
+# would fail exactly those copies and mirror everything else. The digest half
+# is the one to keep: it names the same manifest the tag resolved to, whereas
+# dropping the digest would copy whatever the tag points at today and silently
+# unpin the image. crane accepts the combined form, so only the skopeo path
+# needs this.
 digest_only_ref() {
   local ref=$1
   case "$ref" in
