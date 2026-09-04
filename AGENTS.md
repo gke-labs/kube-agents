@@ -33,7 +33,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
 
 ## Where Tests Go
 
-Tests live in ten places here, with different runners and different answers to "does this catch a
+Tests live in eleven places here, with different runners and different answers to "does this catch a
 regression before merge". Choosing the wrong one rarely fails loudly — the test runs somewhere you
 did not expect, or nowhere at all, and the suite reports green around it.
 
@@ -44,6 +44,8 @@ did not expect, or nowhere at all, and the suite reports green around it.
   `tests/integration/` when it spans two components — but in `bench/tests/` when one of those
   components is the bench harness, which `tests/integration/` cannot import.
   See [`tests/integration/README.md`](tests/integration/README.md).
+  One carve-out: **security and permissions invariants** go in `tests/conformance/`, whose own
+  README is the contract.
 - **Yes, and you plant the defect it has to find** — it is an eval, it belongs in
   `bench/tasks/<name>/task.yaml`, and it runs in the Prow presubmit, so adding one changes what
   every pull request reports. [`docs/designs/bench-case-format.md`](docs/designs/bench-case-format.md)
@@ -59,9 +61,10 @@ did not expect, or nowhere at all, and the suite reports green around it.
 
 One rule holds wherever it lands: a new test directory only runs if a `PYTHON_TEST_DIRS` glob in the
 `Makefile` reaches it, and a directory the globs miss fails nothing — it sits unexecuted while the
-suite reports green around it. Add the glob in the same change.
+suite reports green around it. Add the glob in the same change — `tests/conformance/` excepted,
+deliberately; its README says why.
 
-The ten homes, what runs each, and how far "runs on a pull request" is from "gates a merge" are in
+The eleven homes, what runs each, and how far "runs on a pull request" is from "gates a merge" are in
 [`docs/testing-map.md`](docs/testing-map.md).
 
 ## Agent Setup & Integration
