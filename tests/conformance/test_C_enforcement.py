@@ -344,13 +344,7 @@ class C1IsolationIsStructural(unittest.TestCase):
         for policy in policies:
             spec = policy["spec"]
             name = policy["metadata"]["name"]
-            # The whole-internet check is the recorded violation, and it runs
-            # in its own subTest so a shape failure cannot mask it — the first
-            # spelling asserted policyTypes first inside one subTest, which
-            # abandoned the block before the cidr loop ever saw the gateway
-            # policy (the only one carrying 0.0.0.0/0), so dropping #676's
-            # rule could never have fired the unexpected-success signal.
-            with self.subTest(policy=name, property="no whole-internet block"):
+            with self.subTest(policy=name):
                 for rule in spec.get("egress") or []:
                     for peer in rule.get("to") or []:
                         block = peer.get("ipBlock")
@@ -362,7 +356,32 @@ class C1IsolationIsStructural(unittest.TestCase):
                             "an `except` clause does not subtract a destination "
                             "from an additive policy",
                         )
-            with self.subTest(policy=name, property="shape"):
+
+    def test_C1_the_rendered_egress_rules_are_shaped_to_deny_by_default(self) -> None:
+        """Egress-only on our own policy, and no rule that names no destination.
+
+        These two hold today, which is why they are here and not under the
+        `known_violation` above. That separation is the point of this test
+        existing at all: an expected failure records the FIRST failing subTest
+        and abandons the rest of the method, so while these assertions shared a
+        method with the recorded #676 violation, a regression in either one was
+        reported as that violation and CI stayed green -- and the recorded
+        violation itself was never evaluated, so it could not have fired the
+        unexpected-success signal that tells us #676 closed. Two properties, two
+        verdicts, so neither can stand in for the other.
+
+        An earlier round moved the whole-internet check ahead of these inside
+        one method, which fixed the ordering and left the masking: ordering only
+        decides WHICH property gets to be the expected failure.
+        """
+        documents = h.yaml_documents("golden_egress_allowlist")
+        policies = h.objects_of_kind(documents, "NetworkPolicy")
+        self.assertTrue(policies, "the allowlist fixture renders no NetworkPolicy")
+
+        for policy in policies:
+            spec = policy["spec"]
+            name = policy["metadata"]["name"]
+            with self.subTest(policy=name):
                 if name.endswith("-sandbox-metadata-deny"):
                     # Egress-only is this slice's own policy's property; the
                     # gateway policy legitimately carries Ingress too.

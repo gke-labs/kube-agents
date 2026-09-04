@@ -485,6 +485,30 @@ Mutation(
     # diagnosis. A known violation is verified by its precondition instead.
     #
     # Restore this the day the C1 decorators come off.
+    #
+    # The SHAPE half is no longer in that bind. It used to share a method with
+    # the whole-internet violation, so it inherited the expectedFailure and no
+    # mutation could report anything but SURVIVED against it. It is its own
+    # test now, passing, and so has a real kill below.
+    Mutation(
+        "C1-egress-rule-without-destination",
+        "k8s-operator/internal/testing/testdata/platform/expected/"
+        "platformagent-egress-allowlist.yaml",
+        ("""    - ports:
+        - port: 443
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 140.82.112.0/20
+""",
+         """    - ports:
+        - port: 443
+          protocol: TCP
+"""),
+        "test_C1_the_rendered_egress_rules_are_shaped_to_deny_by_default",
+        "strip the `to` from a rendered egress rule, which opens 443 to every "
+        "destination while still looking like an allowlist entry",
+    ),
     Mutation(
         "C1-cidr-guard-inert",
         "k8s-operator/internal/controller/platformagent_egress_policy.go",
