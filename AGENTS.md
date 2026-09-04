@@ -12,7 +12,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
   - `cluster/`: The Cluster Agent profile _template_ (persona, scoped config, and runtime-debugging skills). The Platform Agent scaffolds this into per-cluster Hermes profiles at runtime; it is not deployed directly.
 - `.agents/skills/`: Repository-level skills, not shipped in the agent images — review skills (adversarial change review, security audits, docs-drift, skill quality) run against pull requests and clusters, with `review-preflight` running the pre-PR set of them in a context that did not write the change, plus the `install-kube-agents`/`uninstall-kube-agents`/`upgrade-kube-agents` lifecycle skills that drive the repository's installer scripts.
 - `.agents/rules/`: Repository-level rules an agent follows, one file per family and none shipped in the agent images — `core_engineering.md` for the code itself, `github_actions.md` for workflow authoring, `pre_pr_review.md` for the mechanics of the two pre-PR passes. This file states each rule and links there for the form it takes; the split keeps `AGENTS.md` inside the context budget `scripts/check_context_budget.py` enforces.
-- `a2a/`: Go module for the agent-to-agent bus — the JetStream wire-protocol library and conformance suite for `docs/designs/spec-a2a-payloads.md`, the `a2a` topics CLI, and declarative agent profiles. Nothing imports or invokes it yet; components arrive behind the mode switch.
+- `a2a/`: Go module for the agent-to-agent bus — wire-protocol library and `a2a` topics CLI per `docs/designs/spec-a2a-payloads.md`, plus agent profiles. Nothing imports it yet.
 - `charts/`: Canonical Helm charts (`kube-agents`) for deploying the Kube-Agents operator and profiles.
 - `terraform/`: Companion reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `chat-pubsub`, `github-minter`, `gke-backup-plan`, `drift-pubsub`) for infrastructure provisioning, plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top. `drift-pubsub` is not yet part of that composition.
 - `deploy/`: Deployment infrastructure code (Dockerfile, Kustomize bases, shared runtime assets).
@@ -66,7 +66,7 @@ The ten homes, what runs each, and how far "runs on a pull request" is from "gat
 
 ## Agent Setup & Integration
 
-This repository is primarily a configuration and documentation repository for AI agents. The main exceptions are the Go modules — the Kubernetes operator in `k8s-operator/` and the A2A bus module in `a2a/` — which require compilation (see Local Validation Checks below).
+This repository is primarily configuration and documentation for AI agents. The main exceptions are the Go modules — the operator in `k8s-operator/` and the A2A bus in `a2a/` — which require compilation (see Local Validation Checks below).
 
 To use these agents:
 
