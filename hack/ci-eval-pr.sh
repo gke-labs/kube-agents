@@ -1094,10 +1094,14 @@ TASKS=(
 # commented one -- not at all.
 #
 # Budget, priced the way EVAL_REPETITIONS' comment prices the presubmit: the
-# twenty-task presubmit matrix measured ~317min SERIAL, and these five add
-# four audit-shaped cases (600-1300s a repetition -- hinted at 900s in
-# unit_cost_hint below) plus one probe-shaped one, ~190min serial at three
-# repetitions. IF the periodic mirrors the presubmit's shape -- 360m
+# twenty-five-task nightly matrix is the pre-#1218 twenty-task presubmit
+# (measured ~317min SERIAL) plus the five recast cases -- four audit-shaped
+# (600-1300s a repetition, hinted at 900s in unit_cost_hint below) and one
+# probe-shaped, ~190min serial at three repetitions. #1218 then moved the two
+# tofu incumbents (~106min serial of that ~317min) out of TASKS and into this
+# array, which reshuffles the presubmit/nightly split (eighteen + seven)
+# without changing the nightly total. IF the periodic mirrors the
+# presubmit's shape -- 360m
 # deadline, EVAL_REPETITIONS at its default 3; the periodic is in flight in
 # oss-test-infra, not merged, so this is the assumption and not yet a fact --
 # ~507min serial fits only through the fan-out: parallelism 4 has to realise
