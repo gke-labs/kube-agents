@@ -94,7 +94,7 @@ def _fail(message: str):
 
 def validate_repo(repo: str) -> str:
     """Ensure repo is formatted as owner/name and is in the managed repos allowlist if configured."""
-    from gitops_workspace import get_managed_github_repos, is_valid_repo_slug
+    from gitops_workspace import get_managed_github_repos, is_valid_repo_slug, validate_repo_org
     if not repo or not is_valid_repo_slug(repo):
         raise ValueError(f"Invalid repository format: {repo!r}. Expected 'owner/name'.")
     managed = get_managed_github_repos()
@@ -102,7 +102,7 @@ def validate_repo(repo: str) -> str:
         raise ValueError(
             f"Repository {repo!r} is not in the managed repositories list: {managed}"
         )
-    return repo
+    return validate_repo_org(repo)
 
 
 def _resolve_repo(args=None) -> str:
@@ -419,11 +419,6 @@ def handle_poll(args) -> int:
         return 0
 
     payload = {"status": "FOUND", "requests": found, "conversations": threads}
-    if over_budget:
-        payload["warnings"] = [
-            f"pr_conversation: {over_budget} untrusted request(s) not offered — "
-            "the per-pull-request refusal budget is exhausted"
-        ]
     print(json.dumps(payload))
     return 0
 

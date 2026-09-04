@@ -17,3 +17,17 @@ data:
           contents: 'write'
           pull_requests: 'write'
           issues: 'write'
+  ${GITHUB_REPO}.yaml: |
+    version: 'minty.abcxyz.dev/v2'
+    rule:
+      if: "assertion.iss == 'https://accounts.google.com'"
+    scope:
+      platform-agent-scope:
+        rule:
+          if: "assertion.email in ['${PLATFORM_AGENT_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com']"
+        repositories:
+          - '${GITHUB_REPO}'
+        permissions:
+          contents: 'write'
+          pull_requests: 'write'
+          issues: 'write'

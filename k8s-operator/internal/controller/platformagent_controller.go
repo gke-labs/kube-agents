@@ -100,6 +100,11 @@ const (
 		"The k8s-event-watcher is not started, so no cluster warning reaches the agent and no autonomous triage " +
 		"session is created from one; the pod stays Ready regardless. Nothing restores this automatically — set " +
 		"spec.harness.eventWatcher.enabled=true (or remove the field) to start watching again."
+
+	conditionReasonInvalidGitRepoURL   = "InvalidGitRepoURL"
+	conditionReasonCorruptManagedRepos = "CorruptManagedRepos"
+	gitopsStateConfigMapSuffix         = "-gitops-state"
+	managedReposConfigMapKey           = "managed_repos"
 )
 
 // PlatformAgentReconciler reconciles a PlatformAgent object
@@ -206,6 +211,26 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		log.Info("WARNING: spec.harness needs projectId, location, and clusterName; "+
 			"without all three the credential proxy skips its kubeconfig bootstrap and kubectl will not reach any cluster",
 			"name", instance.Name, "namespace", instance.Namespace)
+	}
+
+	// gitRepo validation restricts repository URLs to github.com. CRs stored
+	// before that change still reconcile, but subsequent updates will be rejected
+	// at admission by the validating webhook until corrected. Warn loudly so an
+	// administrator discovers un-updatable CRs immediately upon operator upgrade.
+	if instance.Spec.Integration != nil && instance.Spec.Integration.GitHub != nil {
+		github := instance.Spec.Integration.GitHub
+		var gitRepoErr error
+		if github.Org != "" {
+			gitRepoErr = agentv1alpha1.ValidateGitHubOrg(github.Org)
+		}
+		if gitRepoErr == nil && github.GitRepo != "" {
+			gitRepoErr = agentv1alpha1.ValidateGitRepoURLWithOrg(github.GitRepo, github.Org)
+		}
+		if gitRepoErr != nil {
+			log.Info("WARNING: spec.integration.github contains invalid gitRepo URL or org; "+
+				"updates to this PlatformAgent will be rejected by the admission webhook until corrected",
+				"name", instance.Name, "namespace", instance.Namespace, "error", gitRepoErr.Error())
+		}
 	}
 
 	// 1. Intercept Deletion
@@ -676,6 +701,7 @@ func parseManagedRepos(raw string) ([]string, error) {
 // If the repository to be removed was declared in spec.integration.github.gitRepo on the CR, clear or
 // update gitRepo on the CR as well so the reconciler does not re-append it on subsequent passes.
 func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	logger := logf.FromContext(ctx)
 	cm := buildGitopsStateConfigMap(agent)
 	if err := ctrl.SetControllerReference(agent, cm, r.Scheme); err != nil {
 		return err
@@ -710,11 +736,13 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 		}
 		specEntries, err := parseManagedRepoEntries(cmRepo)
 		if err != nil {
-			return fmt.Errorf("failed to parse spec repository JSON: %w", err)
+			logger.Error(err, "skipping gitops state reconcile due to unparseable spec repository JSON")
+			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data["managed_repos"])
 		}
 		existingEntries, err := parseManagedRepoEntries(existing)
 		if err != nil {
-			return fmt.Errorf("failed to parse existing managed_repos in ConfigMap %s: %w", found.Name, err)
+			logger.Error(err, "skipping gitops state reconcile due to unparseable existing managed_repos in ConfigMap", "configMap", found.Name)
+			return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data["managed_repos"])
 		}
 		updated := false
 		for _, se := range specEntries {
@@ -801,7 +829,13 @@ func renderRepoPolicy(baseTemplate string, repos []string) string {
 // entry exists in github-token-minter-config ConfigMap.
 // Repositories belonging to a different organization are skipped because the minter instance is
 // bound to the primary organization directory (/etc/minty/<primary-org>/).
-// Operator-managed <repo>.yaml entries for repositories that are no longer managed are pruned.
+//
+// Key ownership contract:
+// The operator owns every <repo>.yaml key for an active managed repository (including adopting
+// pre-rendered chart or template keys). Hand-editing <repo>.yaml keys for active managed repositories
+// is unsupported: custom edits will be overwritten with policy rendered from default.yaml on reconcile,
+// and the key will be pruned when the repository is unregistered. Keys for repositories not present in
+// managed_repos (and default.yaml itself) are never claimed or pruned.
 func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Context, agent *agentv1alpha1.PlatformAgent, managedReposStr string) error {
 	logger := logf.FromContext(ctx)
 	minterCM := &corev1.ConfigMap{}
@@ -831,7 +865,7 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 	}
 	operatorManagedKeys := parseManagedKeysAnnotation(existingAnn)
 
-	// An empty managed_repos with no previously operator-managed keys is a no-op to avoid wiping unmanaged keys.
+	// If managed_repos is empty and no keys are tracked as operator-managed, no-op to avoid touching unmanaged keys.
 	if managedReposStr == "" && len(operatorManagedKeys) == 0 {
 		return nil
 	}
@@ -852,7 +886,8 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 
 	repos, err := parseManagedRepos(managedReposStr)
 	if err != nil {
-		return fmt.Errorf("failed to parse managed_repos for minter policy sync: %w", err)
+		logger.Error(err, "skipping minter policy sync due to unparseable managed_repos in ConfigMap")
+		return nil
 	}
 	var allBareRepos []string
 	activeKeys := make(map[string]string, len(repos))
@@ -885,17 +920,17 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 
 	updated := false
 
-	// Ensure all active managed repositories have policy entries containing all same-org managed repositories
+	// Ensure all active managed repositories have policy entries containing all same-org managed repositories.
+	// The operator claims and owns every <repo>.yaml key for an active managed repository: if unmanaged (!managed),
+	// it adopts the key and overwrites it with rendered policy derived from default.yaml. Hand-editing <repo>.yaml
+	// for an active managed repository is unsupported; when the repository is later unregistered, the key is pruned.
 	expectedContent := renderRepoPolicy(baseTemplate, allBareRepos)
 	for key := range activeKeys {
 		currentVal, exists := minterCM.Data[key]
 		_, managed := operatorManagedKeys[key]
-		if !exists {
+		if !exists || !managed || currentVal != expectedContent {
 			minterCM.Data[key] = expectedContent
 			operatorManagedKeys[key] = struct{}{}
-			updated = true
-		} else if managed && currentVal != expectedContent {
-			minterCM.Data[key] = expectedContent
 			updated = true
 		}
 	}
@@ -1859,12 +1894,34 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		}
 	}
 
+	managedReposErr := error(nil)
+	if gitRepoErr == nil {
+		cmName := agent.Name + gitopsStateConfigMapSuffix
+		cm := &corev1.ConfigMap{}
+		if err := r.Get(ctx, client.ObjectKey{Name: cmName, Namespace: agent.Namespace}, cm); err == nil {
+			if raw, ok := cm.Data[managedReposConfigMapKey]; ok && strings.TrimSpace(raw) != "" {
+				if _, err := parseManagedRepos(raw); err != nil {
+					managedReposErr = err
+				}
+			}
+		}
+	}
+
 	degradedStatus := metav1.ConditionFalse
+	degradedReason := ""
 	if gitRepoErr != nil {
 		newPhase = "Degraded"
 		condStatus = metav1.ConditionFalse
-		condReason = "InvalidGitRepoURL"
-		condMsg = fmt.Sprintf("Invalid gitRepo URL or org (%s); GitOps disabled in config", gitRepoErr.Error())
+		condReason = conditionReasonInvalidGitRepoURL
+		degradedReason = conditionReasonInvalidGitRepoURL
+		condMsg = fmt.Sprintf("Invalid gitRepo URL or org (%s); GitOps disabled in config. Admission webhook will reject updates to this resource until corrected", gitRepoErr.Error())
+		degradedStatus = metav1.ConditionTrue
+	} else if managedReposErr != nil {
+		newPhase = "Degraded"
+		condStatus = metav1.ConditionFalse
+		condReason = conditionReasonCorruptManagedRepos
+		degradedReason = conditionReasonCorruptManagedRepos
+		condMsg = fmt.Sprintf("Corrupt %s in ConfigMap %s%s (%s); GitOps disabled", managedReposConfigMapKey, agent.Name, gitopsStateConfigMapSuffix, managedReposErr.Error())
 		degradedStatus = metav1.ConditionTrue
 	}
 
@@ -1890,7 +1947,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	existingCond := meta.FindStatusCondition(agent.Status.Conditions, "Ready")
 	existingDegradedCond := meta.FindStatusCondition(agent.Status.Conditions, "Degraded")
 	degradedUnchanged := (degradedStatus == metav1.ConditionFalse && existingDegradedCond == nil) ||
-		(degradedStatus == metav1.ConditionTrue && existingDegradedCond != nil && existingDegradedCond.Status == metav1.ConditionTrue && existingDegradedCond.Reason == "InvalidGitRepoURL" && existingDegradedCond.Message == condMsg)
+		(degradedStatus == metav1.ConditionTrue && existingDegradedCond != nil && existingDegradedCond.Status == metav1.ConditionTrue && existingDegradedCond.Reason == degradedReason && existingDegradedCond.Message == condMsg)
 
 	// Check if anything actually changed
 	if agent.Status.Phase == newPhase &&
@@ -1940,7 +1997,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		degradedCond := metav1.Condition{
 			Type:               "Degraded",
 			Status:             metav1.ConditionTrue,
-			Reason:             "InvalidGitRepoURL",
+			Reason:             degradedReason,
 			Message:            condMsg,
 			LastTransitionTime: now,
 		}

@@ -156,19 +156,17 @@ export GOOGLE_CHAT_ENABLED="false"
 export SLACK_ENABLED="false"
 
 # ─── 2b. GitOps Repository for This Run ───────────────────────────────────────
-# Every GitHub-writing eval scenario begins by reading the `Git Repo:` line out
-# of /opt/data/SETTINGS.md — the fleet-audit streams do it in `audit_report.py
-# start`, before anything else happens. The operator renders that line from
-# spec.integration.github.gitRepo on the PlatformAgent CR
-# (buildSettingsConfigMap in k8s-operator/internal/controller/
-# platformagent_manifests.go); with the field unset it writes the literal
-# "None" and those scenarios stop at step 0 with nothing to clone.
+# Every GitHub-writing eval scenario begins by reading the registered repositories
+# out of the gitops-state ConfigMap — the fleet-audit streams do it in `audit_report.py
+# start`, before anything else happens. The operator seeds that entry from
+# spec.integration.github.gitRepo on the PlatformAgent CR; with the field unset
+# no repository is registered and those scenarios stop at step 0 with nothing to clone.
 #
 # CI supplies the value and deliberately does NOT lean on the chart default.
 # On the presubmit path everything this job deploys — chart, operator, agent —
 # is built from the pull request, so a PR that blanks
 # `platformAgent.integration.github.gitRepo` in values.yaml, or breaks the
-# CR-to-SETTINGS.md rendering, is precisely the regression the eval should catch
+# CR-to-ConfigMap seeding, is precisely the regression the eval should catch
 # as a failed scenario. It can only catch it if the value the run is supposed to
 # use arrives from outside the artefacts under test. The release-candidate path
 # installs published images instead of built ones, which narrows what is under
@@ -270,7 +268,7 @@ else
   echo "       Prow run. A local deploy has no lease, so it has to say where it writes:" >&2
   echo "         EVAL_GITOPS_REPO=owner/repo  — your own throwaway GitOps repo" >&2
   echo "         EVAL_GITOPS_REPO=none        — deploy with the GitHub integration off" >&2
-  echo "                                        (SETTINGS.md gets 'Git Repo: None', and" >&2
+  echo "                                        (managed_repos stays empty, and" >&2
   echo "                                        every GitHub-writing scenario will fail)" >&2
   exit 1
 fi
@@ -325,7 +323,7 @@ if [ -n "${GITOPS_REPO}" ] && [ -n "${EVAL_GITHUB_APP_ID:-}" ]; then
 else
   GITHUB_MINTER_ARGS=(--set "githubMinter.enabled=false")
   echo "GitHub token minter: disabled (EVAL_GITHUB_APP_ID unset) — the agent can read" \
-    "SETTINGS.md but cannot mint a token, so GitHub-writing scenarios will fail."
+    "managed_repos but cannot mint a token, so GitHub-writing scenarios will fail."
 fi
 
 # ─── 2c. Image Build Worker ───────────────────────────────────────────────────

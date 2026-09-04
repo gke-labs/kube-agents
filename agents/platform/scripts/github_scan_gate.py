@@ -70,6 +70,7 @@ from pathlib import Path
 # Siblings in `$HERMES_HOME/scripts`, which is this script's own directory and
 # therefore already `sys.path[0]` when the scheduler runs it.
 import forge
+import gitops_workspace
 import pr_triggers
 
 # Which sweeps run, and in what order, is `SWEEP_ORDER` — derived from the
@@ -92,8 +93,9 @@ PLATFORM_TEMPLATE_DIR = "/opt/platform-template"
 # `resolver.py` and `audit_report.py` pin the same path for the same reason.
 SCRATCH_DIR = "/opt/data/scratch"
 
-# `resolver.py poll` sweeps stale issues before it queries, so it is not a
-# read-only call and its runtime is not bounded by a single request.
+# `resolver.py poll` sweeps stale issues before querying for each repository,
+# so its runtime is not bounded by a single request. Budgeted per managed repository
+# (at least one) so multi-repository sweeps have adequate budget to finish.
 RESOLVER_TIMEOUT_S = 300
 
 # Most worker cards — and most refusals — one tick will produce. A reviewer who
@@ -226,11 +228,17 @@ def run_resolver_poll() -> dict:
     if not script.is_file():
         raise FileNotFoundError(f"resolver not found at {script}")
 
+    try:
+        managed_count = len(gitops_workspace.get_managed_github_repos())
+    except Exception:
+        managed_count = 1
+    timeout = max(1, managed_count) * RESOLVER_TIMEOUT_S
+
     proc = subprocess.run(
         [sys.executable, str(script), "poll"],
         capture_output=True,
         text=True,
-        timeout=RESOLVER_TIMEOUT_S,
+        timeout=timeout,
     )
     # Deliberately not `check=True`: the resolver reports its faults as JSON on
     # stdout, and a non-zero exit with parseable output is still an answer. Only
@@ -336,28 +344,35 @@ def sweep_issues(dry_run: bool = False) -> SweepResult:
         )
     payload = run_resolver_poll()
     status = payload.get("status")
+    unreachable_repos = payload.get("unreachable_repos") or []
+    unreachable_warnings = [
+        f"⚠️ **GitHub issue resolver:** repository unreachable: `{r}`"
+        for r in unreachable_repos
+    ]
 
     if status in ("NO_ISSUES", "NOT_CONFIGURED"):
         # NOT_CONFIGURED is a supported deployment, not a fault: a install with
         # no target repository has nothing to watch and should stay silent.
-        return SweepResult()
+        return SweepResult(warnings=unreachable_warnings)
 
     if status == "FOUND":
-        return SweepResult(cards=[_issue_card(payload)])
+        return SweepResult(cards=[_issue_card(payload)], warnings=unreachable_warnings)
 
     if status == "ERROR":
         reason = payload.get("reason", "unknown")
-        value = payload.get("value")
-        detail = f"{reason}" + (f" ({value})" if value else "")
+        error_val = payload.get("error") or payload.get("value")
+        if not error_val and unreachable_repos:
+            error_val = f"unreachable repositories: {', '.join(unreachable_repos)}"
+        detail = f"{reason}" + (f" ({error_val})" if error_val else "")
         return SweepResult(
-            warnings=[f"⚠️ **GitHub issue resolver is not running:** {detail}"]
+            warnings=[f"⚠️ **GitHub issue resolver is not running:** {detail}"] + unreachable_warnings
         )
 
     return SweepResult(
         warnings=[
             f"⚠️ **GitHub repo watcher:** resolver poll returned an unrecognised "
             f"status `{status}`."
-        ]
+        ] + unreachable_warnings
     )
 
 

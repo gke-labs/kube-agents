@@ -4223,7 +4223,7 @@ def resolve_repo(
             raise ValueError(
                 f"Repository {r!r} is not in the managed repositories list: {managed}"
             )
-        return r
+        return gitops_workspace.validate_repo_org(r)
 
     if workspace is not None:
         try:

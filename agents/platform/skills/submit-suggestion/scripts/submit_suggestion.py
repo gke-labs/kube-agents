@@ -81,7 +81,7 @@ def validate_repo(repo: str) -> str:
         raise ValueError(
             f"Repository {repo!r} is not in the managed repositories list: {managed}"
         )
-    return repo
+    return gitops_workspace.validate_repo_org(repo)
 
 
 def handle_prepare(args) -> int:

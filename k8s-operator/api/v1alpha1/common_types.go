@@ -1170,6 +1170,8 @@ const (
 	MaxGitRepoURLLength = 2048
 )
 
+var validRepoSlugPart = regexp.MustCompile(`^[a-zA-Z0-9_.-]+$`)
+
 // githubOrgRegex validates GitHub organization or username format
 // (alphanumeric and hyphens, not starting or ending with hyphen, max 39 chars).
 var githubOrgRegex = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?$`)
@@ -1185,17 +1187,13 @@ func CleanRepoSlugWithOrg(rawURL, org string) (string, error) {
 	cleaned := strings.TrimSpace(rawURL)
 	cleaned = strings.TrimSuffix(cleaned, ".git")
 
-	// Validate URL scheme if a scheme is present
+	// Validate URL scheme if a scheme is present and strip it
 	if idx := strings.Index(cleaned, "://"); idx != -1 {
 		scheme := strings.ToLower(cleaned[:idx])
 		if scheme != "http" && scheme != "https" && scheme != "git" && scheme != "ssh" {
 			return "", fmt.Errorf("unsupported URL scheme %q; must be http, https, git, or ssh", scheme)
 		}
-	}
-
-	// Strip known URL schemes
-	for _, scheme := range []string{"ssh://", "git://", "https://", "http://"} {
-		cleaned = strings.TrimPrefix(cleaned, scheme)
+		cleaned = cleaned[idx+3:]
 	}
 
 	// Handle user@host prefix (e.g. git@github.com:owner/repo or git@github.com/owner/repo)
@@ -1207,13 +1205,30 @@ func CleanRepoSlugWithOrg(rawURL, org string) (string, error) {
 	if strings.Contains(cleaned, ":") {
 		parts := strings.SplitN(cleaned, ":", 2)
 		if len(parts) == 2 {
+			host := strings.ToLower(parts[0])
+			if host != "github.com" && host != "www.github.com" {
+				return "", fmt.Errorf("unsupported host %q for GitHub repository", host)
+			}
 			cleaned = parts[1]
 		}
 	}
 
-	// Strip common domain prefixes
-	cleaned = strings.TrimPrefix(cleaned, "github.com/")
-	cleaned = strings.TrimPrefix(cleaned, "www.github.com/")
+	// Strip common domain prefixes or validate host if present with slashes (e.g. host/owner/repo)
+	if strings.HasPrefix(cleaned, "github.com/") {
+		cleaned = strings.TrimPrefix(cleaned, "github.com/")
+	} else if strings.HasPrefix(cleaned, "www.github.com/") {
+		cleaned = strings.TrimPrefix(cleaned, "www.github.com/")
+	} else if strings.Count(cleaned, "/") > 1 {
+		parts := strings.SplitN(cleaned, "/", 2)
+		if len(parts) == 2 && parts[0] != "" {
+			host := strings.ToLower(parts[0])
+			if host != "github.com" && host != "www.github.com" {
+				return "", fmt.Errorf("unsupported host %q for GitHub repository", host)
+			}
+			cleaned = parts[1]
+		}
+	}
+
 	cleaned = strings.Trim(cleaned, "/")
 
 	if cleaned == "" {
@@ -1225,23 +1240,31 @@ func CleanRepoSlugWithOrg(rawURL, org string) (string, error) {
 		cleaned = strings.TrimSpace(org) + "/" + cleaned
 	}
 
-	// Basic verification of owner/repo structure
-	if strings.Count(cleaned, "/") != 1 {
+	// Basic verification of owner/repo structure and component character set
+	parts := strings.Split(cleaned, "/")
+	if len(parts) != 2 {
 		return "", fmt.Errorf("invalid repository format")
 	}
+
+	owner, repo := parts[0], parts[1]
+	for _, part := range []string{owner, repo} {
+		if part == "" || part == "." || part == ".." || strings.HasPrefix(part, "-") {
+			return "", fmt.Errorf("invalid repository slug %q", cleaned)
+		}
+	}
+	if !validRepoSlugPart.MatchString(owner) || !validRepoSlugPart.MatchString(repo) {
+		return "", fmt.Errorf("invalid characters in repository slug %q", cleaned)
+	}
+
 	return cleaned, nil
 }
 
 // CleanRepoURLWithOrg cleans up git URLs, SSH endpoints, or shorthands into a full HTTPS URL format (e.g. "https://github.com/owner/repo").
+// It rejects non-GitHub repository hosts.
 func CleanRepoURLWithOrg(rawURL, org string) (string, error) {
 	trimmed := strings.TrimSpace(rawURL)
 	if trimmed == "" || trimmed == "None" {
 		return "", fmt.Errorf("empty repository")
-	}
-	if strings.HasPrefix(trimmed, "https://") || strings.HasPrefix(trimmed, "http://") {
-		u := strings.TrimSuffix(trimmed, ".git")
-		u = strings.TrimSuffix(u, "/")
-		return u, nil
 	}
 	cleanedSlug, err := CleanRepoSlugWithOrg(rawURL, org)
 	if err != nil {
@@ -1250,14 +1273,14 @@ func CleanRepoURLWithOrg(rawURL, org string) (string, error) {
 	return "https://github.com/" + cleanedSlug, nil
 }
 
-// ValidateGitRepoURL verifies that a Git repository URL or shorthand is structurally valid
-// and contains no whitespace or non-graphic character injections.
+// ValidateGitRepoURL verifies that a Git repository URL or shorthand is structurally valid,
+// contains no whitespace or non-graphic character injections, and targets github.com.
 func ValidateGitRepoURL(gitRepo string) error {
 	return ValidateGitRepoURLWithOrg(gitRepo, "")
 }
 
 // ValidateGitRepoURLWithOrg verifies that a Git repository URL or shorthand (with optional org context)
-// is structurally valid and contains no whitespace or non-graphic character injections.
+// is structurally valid, contains no whitespace or non-graphic character injections, and targets github.com.
 func ValidateGitRepoURLWithOrg(gitRepo, org string) error {
 	trimmed := strings.TrimSpace(gitRepo)
 	if trimmed == "" || trimmed == "None" {

@@ -51,8 +51,11 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
 import re
+
+logger = logging.getLogger(__name__)
 import subprocess
 import time
 from contextlib import contextmanager
@@ -628,6 +631,18 @@ def is_valid_repo_slug(repo: str) -> bool:
     return _valid_repo_component(owner) and _valid_repo_component(name)
 
 
+def validate_repo_org(repo: str) -> str:
+    """Validate that repository slug belongs to the configured primary GitHub organization if set."""
+    primary_org = os.environ.get("GITOPS_ORG") or os.environ.get("GITHUB_ORG")
+    if primary_org and repo and "/" in repo:
+        owner = repo.split("/", 1)[0]
+        if owner.lower() != primary_org.lower():
+            raise ValueError(
+                f"Cross-org repository {repo!r} is not supported. Platform Agent minter is bound to organization {primary_org!r}."
+            )
+    return repo
+
+
 def extract_github_slug(entry: str) -> str | None:
     """Extracts 'owner/repo' slug from a raw URL or shorthand if it refers to GitHub."""
     s = entry.strip()
@@ -670,8 +685,12 @@ def _parse_managed_repos_json(repos_str: str) -> list[dict[str, str]]:
                         repo_type = str(item.get("type", "")).strip()
                         if url and repo_type:
                             entries.append({"type": repo_type, "url": url})
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as err:
+            logger.warning("Failed to decode managed_repos JSON: %s", err)
+            return []
+    else:
+        logger.warning("managed_repos JSON does not start with '[': %r", repos_str)
+        return []
     return entries
 
 
@@ -710,7 +729,8 @@ def get_managed_repo_entries() -> list[dict[str, str]]:
         ) from e
 
     try:
-        cm = json.loads(cm_res.stdout)
+        raw_stdout = cm_res.stdout if isinstance(cm_res.stdout, (str, bytes, bytearray)) else "{}"
+        cm = json.loads(raw_stdout)
         if not isinstance(cm, dict):
             raise RuntimeError(f"ConfigMap JSON is not an object: {cm}")
     except json.JSONDecodeError as e:
