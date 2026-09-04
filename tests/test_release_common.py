@@ -356,6 +356,24 @@ source "{_COMMON_SH}"
         head = git("rev-parse", "HEAD").stdout.strip()
         self.assertNotEqual(self._trigger_matches(repo_dir, head, "staging_2608241820_b35543c"), 0)
 
+    def _repo_with_staging_deploy_trigger(self, patterns):
+        """A mock repo whose HEAD carries staging-deploy.yml with `patterns`."""
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        self.addCleanup(temp_dir.cleanup)
+        workflow = pathlib.Path(repo_dir) / ".github" / "workflows"
+        workflow.mkdir(parents=True, exist_ok=True)
+        rendered = "\n".join(f'      - "{p}"' for p in patterns)
+        (workflow / "staging-deploy.yml").write_text(
+            "name: Staging Deploy\n\non:\n  push:\n    tags:\n" + rendered + "\n\njobs: {}\n"
+        )
+        git("add", "-A")
+        git("commit", "-m", "chore: staging deploy trigger")
+        return repo_dir, git("rev-parse", "HEAD").stdout.strip()
+
+    def test_staging_trigger_matches_in_consolidated_staging_deploy_workflow(self):
+        repo_dir, head = self._repo_with_staging_deploy_trigger(["staging_*"])
+        self.assertEqual(self._trigger_matches(repo_dir, head, "staging_2608241820_b35543c"), 0)
+
     def _repo_with_pipeline_markers(self, optional_runner=True, suite_selector=True,
                                     reconciler=True):
         temp_dir, repo_dir, git = create_mock_git_repo()

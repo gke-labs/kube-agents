@@ -220,7 +220,7 @@ def _resolve_github_org() -> Optional[str]:
 def _qualify_repo(repo: Optional[str]) -> Optional[str]:
     """Prefixes a bare repository name with the owner.
 
-    GH_REPO is bare by repository convention -- reusable-deploy-integrations.yml passes
+    GH_REPO is bare by repository convention -- the install configuration passes
     the org and the repo to the GitHub Token Minter as separate values -- while every
     consumer of this fixture wants 'owner/repo': test_github_target_repository_configuration
     asserts the shape, and github_token_refresh.py rejects anything else.

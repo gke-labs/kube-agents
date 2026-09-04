@@ -55,8 +55,8 @@ _INSTALL_TIMEOUT_SECONDS = 600
 # 20s and the reasoning are taken from the sibling suite that hit this first:
 # agentplugins/pubsub-platform/tests/dedup_e2e_test.py:125-131.
 _GENERATION_STABLE_SECONDS = 20
-# Not the 900s cold-boot budget that .github/workflows/reusable-deploy-agent.yml:150-157
-# derives from agentAPIProbe(10, 60) plus an image-pull allowance. That figure is for a
+# Not the 900s cold-boot budget that upgrade.sh derives from
+# agentAPIProbe(10, 60) plus an image-pull allowance. That figure is for a
 # gateway being started; by the time this suite runs, step 2 has already provisioned the
 # environment and `scripts/release/wait_for_gke_readiness.sh` has waited for the pod. What
 # is left for this wait is a re-template still in flight, so the ceiling is sized for a

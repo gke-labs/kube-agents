@@ -37,6 +37,8 @@ _STRICT_SETTINGS = {
     "MEMORY_PROVIDER": "kube_agents_memory",
     "USER_PROFILE_ENABLED": "true",
     "ENABLE_GKE_BACKUP_PLAN": "true",
+    "ENABLE_PUBSUB_PLATFORM": "true",
+    "ENABLE_STOCKOUT_INVESTIGATOR": "true",
 }
 
 # The allowlist is required too, but only while its integration is on, so it is
@@ -282,6 +284,19 @@ class RenderingTest(unittest.TestCase):
         self.assertNotIn("MODEL_DEFAULT_NAME", rendered)
         self.assertNotIn("SLACK_BOT_TOKEN", rendered)
         self.assertNotIn("MEMORY", rendered)
+        self.assertNotIn("ENABLE_PUBSUB_PLATFORM", rendered)
+        self.assertNotIn("ENABLE_STOCKOUT_INVESTIGATOR", rendered)
+
+    def test_plugin_variables_are_rendered_when_set(self):
+        rc, log, text = render({
+            **_COORDS,
+            "ENABLE_PUBSUB_PLATFORM": "true",
+            "ENABLE_STOCKOUT_INVESTIGATOR": "false",
+        })
+        self.assertEqual(rc, 0, log)
+        rendered = parse(text)
+        self.assertEqual(rendered["ENABLE_PUBSUB_PLATFORM"], "true")
+        self.assertEqual(rendered["ENABLE_STOCKOUT_INVESTIGATOR"], "false")
 
     def test_the_github_side_names_are_translated_to_installer_names(self):
         rc, log, text = render(dict(_COORDS))

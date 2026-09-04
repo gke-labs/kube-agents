@@ -625,9 +625,9 @@ candidate_supports_shared_pipeline() {
   return 0
 }
 
-# Reports whether the staging redeploys AT A GIVEN COMMIT would start on a given
+# Reports whether the staging deploy AT A GIVEN COMMIT would start on a given
 # tag, by reading the `push: tags:` patterns out of that commit's own copy of
-# staging-redeploy-agent.yml.
+# staging-deploy.yml (or legacy staging-redeploy-agent.yml for older commits).
 #
 # A push event runs the workflows in the pushed ref's tree, not the ones on the
 # default branch, and a promotion tag lands on a candidate commit that can be days
@@ -635,11 +635,9 @@ candidate_supports_shared_pipeline() {
 # candidate, and a promotion pushed at a commit whose trigger does not match the
 # tag succeeds, deploys nothing, and reports green — after which
 # get_existing_staging_tag sees the tag and no later run retries that candidate.
-#
-# The three redeploys share one trigger, so agent stands for all three.
 staging_trigger_matches_at_commit() {
   local commit="${1:-}" tag="${2:-}"
-  local workflow=".github/workflows/staging-redeploy-agent.yml"
+  local workflow=".github/workflows/staging-deploy.yml"
   local yaml patterns pattern
 
   if [ -z "${commit}" ] || [ -z "${tag}" ]; then
@@ -647,7 +645,11 @@ staging_trigger_matches_at_commit() {
     return 2
   fi
 
-  yaml="$(git show "${commit}:${workflow}" 2>/dev/null)" || return 1
+  yaml="$(git show "${commit}:${workflow}" 2>/dev/null)" || {
+    # Backward compatibility with candidates that predate the consolidation to staging-deploy.yml
+    workflow=".github/workflows/staging-redeploy-agent.yml"
+    yaml="$(git show "${commit}:${workflow}" 2>/dev/null)" || return 1
+  }
 
   # The list items under the single `tags:` key, unquoted. Stops at the first
   # line that is neither a list item nor blank, so it cannot run on into the rest

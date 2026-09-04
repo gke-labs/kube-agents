@@ -1,0 +1,114 @@
+name: "Autopush: Deploy"
+
+# Atomically deploys the latest built commit to the autopush environment.
+# Triggered when container image publishing succeeds on main, or via workflow_dispatch.
+#
+# Replaces fragmented autopush-redeploy-*.yml workflows with an atomic full
+# reconciliation of Terraform composition, Helm release, and container images via
+# reconcile-environment.yml and upgrade.sh.
+
+on:
+  # zizmor: ignore[dangerous-triggers]
+  workflow_run:
+    workflows:
+      - "Publish Images to GHCR"
+    types:
+      - completed
+  #checkov:skip=CKV_GHA_7:Standalone launch requires optional image tag, lease policy and force reconcile inputs
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Commit SHA to deploy (leave empty to deploy triggering commit or HEAD of main)"
+        required: false
+        default: ""
+        type: string
+      lease_policy:
+        description: "What to do when somebody is live-testing against autopush"
+        required: false
+        default: "fail"
+        type: choice
+        options:
+          - "fail"
+          - "ignore"
+          - "defer"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: autopush-deploy
+  cancel-in-progress: false
+
+jobs:
+  resolve-candidate:
+    if: |
+      github.repository == 'gke-labs/kube-agents' &&
+      (github.event_name == 'workflow_dispatch' || (
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch') &&
+        github.event.workflow_run.head_branch == 'main'
+      ))
+    runs-on: ubuntu-latest
+    environment: autopush
+    permissions:
+      contents: read
+    outputs:
+      commit_sha: ${{ steps.resolve.outputs.commit_sha }}
+      lease_policy: ${{ steps.resolve.outputs.lease_policy }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve target commit and parameters
+        id: resolve
+        env:
+          TARGET_ENVIRONMENT: "autopush"
+          INPUT_TAG: ${{ inputs.image_tag }}
+          INPUT_LEASE_POLICY: ${{ inputs.lease_policy }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: ./scripts/release/resolve_deploy.sh
+
+      - name: Verify candidate images exist in GHCR
+        env:
+          COMMIT_SHA: ${{ steps.resolve.outputs.commit_sha }}
+          REGISTRY_PREFIX: ${{ vars.REGISTRY_PREFIX }}
+        run: ./scripts/release/verify_candidate_images.sh
+
+  deploy:
+    needs: resolve-candidate
+    if: github.repository == 'gke-labs/kube-agents'
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
+    uses: ./.github/workflows/reconcile-environment.yml # zizmor: ignore[secrets-inherit]
+    with:
+      github_environment: "autopush"
+      mode: "apply"
+      image_tag: ${{ needs.resolve-candidate.outputs.commit_sha }}
+      lease_policy: ${{ needs.resolve-candidate.outputs.lease_policy }}
+    secrets: inherit
+
+  verify-deploy:
+    name: Verify Deploy Applied
+    needs: [resolve-candidate, deploy]
+    if: github.repository == 'gke-labs/kube-agents'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify Autopush Deploy Result
+        env:
+          TARGET_ENVIRONMENT: "autopush"
+          DEPLOY_RESULT: ${{ needs.deploy.outputs.result }}
+        run: ./scripts/release/verify_deploy_result.sh

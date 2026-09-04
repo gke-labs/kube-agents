@@ -43,7 +43,7 @@ CONFIG = {
         "**": ["repository-owners"],
         "k8s-operator/**": ["waw-leads"],
         ".github/workflows/k8s-operator-test.yml": ["waw-leads"],
-        ".github/workflows/staging-redeploy-*.yml": ["waw-leads"],
+        ".github/workflows/staging-deploy.yml": ["waw-leads"],
     },
     "options": {
         "ignore_draft": True,
