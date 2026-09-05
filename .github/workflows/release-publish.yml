@@ -218,7 +218,7 @@ jobs:
 
       - name: Install Syft
         if: steps.verify-eligibility.outputs.skip_release != 'true'
-        uses: anchore/sbom-action/download-syft@f325610c9f50a54015d37c8d16cb3b0e2c8f4de0 # v0.18.0
+        uses: anchore/sbom-action/download-syft@aa80c8c5bd439a416a62804f2151ab38c671a638 # v0.24.1
         with:
           syft-version: "v1.51.1"
 
