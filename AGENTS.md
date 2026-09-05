@@ -10,6 +10,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
   - `chat/`: The Planning Agent front door — the `default` Hermes profile that receives chat ingress, plans the work, and delegates each piece to a specialist.
   - `platform/`: Configuration for the Platform Agent, scaffolded at pod startup into the `platform` profile.
   - `cluster/`: The Cluster Agent profile _template_ (persona, scoped config, and runtime-debugging skills). The Platform Agent scaffolds this into per-cluster Hermes profiles at runtime; it is not deployed directly.
+  - `contributor/`: The contributor-agent protocol: the claim/PR/review/escalation loop for external bots (e.g. Kyber, Codebot Robot) coordinating over GitHub alone. Not a runtime blueprint; not shipped in the images.
 - `.agents/skills/`: Repository-level skills, not shipped in the agent images — review skills (adversarial change review, security audits, docs-drift, skill quality) run against pull requests and clusters, with `review-preflight` running the pre-PR set of them in a context that did not write the change, plus the `install-kube-agents`/`uninstall-kube-agents`/`upgrade-kube-agents` lifecycle skills that drive the repository's installer scripts.
 - `.agents/rules/`: Repository-level rules an agent follows, one file per family and none shipped in the agent images — `core_engineering.md` for the code itself, `github_actions.md` for workflow authoring, `pre_pr_review.md` for the mechanics of the two pre-PR passes. This file states each rule and links there for the form it takes; the split keeps `AGENTS.md` inside the context budget `scripts/check_context_budget.py` enforces.
 - `a2a/`: Go module for the agent-to-agent bus — wire-protocol library and `a2a` topics CLI per `docs/designs/spec-a2a-payloads.md`, plus agent profiles. Nothing imports it yet.
@@ -77,18 +78,10 @@ To use these agents:
 
 ### Branch from a `main` you have just fetched
 
-`main` takes on the order of ten commits a day, so a checkout that has sat for a week is a
-different repository from the one you are about to describe to the user. Reading a stale working
-tree does not fail loudly — it answers your questions, just about code that no longer exists — and
-the plan you build on those answers can be wrong in a way no amount of care during the work will
-catch. A session planned an addition to `.github/workflows/auto_request_review.yml` from a
-checkout 42 commits behind, describing the third-party action that workflow used to run; #736 had
-since rewritten it to drive `scripts/request_reviewers.py`, whose `skip_reason` already did the
-thing the session was proposing to add. Nothing about the plan looked wrong until it came time to
-edit the file.
-
-So fetch first, and branch from the fetched ref rather than from whatever the working tree happens
-to be sitting on:
+`main` takes roughly ten commits a day, so a week-old checkout is a different
+repository. Reading a stale tree answers your questions about code that no
+longer exists, and the plan you build can be wrong in ways no care during the
+work will catch. Always fetch first, and branch from the fetched ref:
 
 ```bash
 # `upstream` here is whichever remote points at gke-labs/kube-agents; on a clone of
@@ -227,6 +220,14 @@ resolve, identifiers match their source, every Markdown document outside the roo
 has an entry in the documentation
 map (`docs/README.md`), and this file plus `CLAUDE.md` stay inside the context budget
 (`scripts/check_context_budget.py`) — the same five checks CI runs.
+
+## Contributing as an agent
+
+Unattended agents (collaborating on issues and PRs without a human in the loop)
+must read [`agents/contributor/AGENTS.md`](agents/contributor/AGENTS.md). It
+defines the agent-to-agent loop (claims, escalations, and review tiers) and
+governs where unattended execution conflicts with "ask the user" clauses here.
+Agents with a user in the loop follow this file.
 
 ## Pull Request Hygiene
 
