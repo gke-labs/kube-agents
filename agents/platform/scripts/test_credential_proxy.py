@@ -31,6 +31,7 @@ from credential_proxy import (
     GoogleChatRelay,
     Policy,
     SlackRelay,
+    TeamsRelay,
     _chat_error_fields,
     _git_plan,
     _slack_error_detail,
@@ -5403,5 +5404,150 @@ class ScopedServiceAccountOverTheSocketTest(unittest.TestCase):
         self.assertEqual([self.EMAIL], self.minted)
 
 
+class TeamsRelayTest(unittest.TestCase):
+    def test_teams_relay_requires_app_id_and_password(self):
+        with self.assertRaises(ValueError):
+            TeamsRelay(app_id="", app_password="password")
+        with self.assertRaises(ValueError):
+            TeamsRelay(app_id="app-id", app_password="")
+
+    def test_teams_relay_queue_pull_and_settle(self):
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        activity = {"type": "message", "text": "hello teams"}
+        
+        self.assertTrue(relay.enqueue_event(activity))
+        
+        pulled = relay.pull(timeout_seconds=1)
+        self.assertIsNotNone(pulled)
+        self.assertEqual(pulled["event"]["text"], "hello teams")
+        receipt = pulled["receipt"]
+
+        # Settle ACK
+        self.assertTrue(relay.settle(receipt, acknowledge=True))
+        # Settle again is False because receipt is deleted
+        self.assertFalse(relay.settle(receipt, acknowledge=True))
+
+    def test_teams_relay_token_acquisition_and_caching(self):
+        relay = TeamsRelay(
+            app_id="app-id-123",
+            app_password="secret-password",
+            tenant_id="custom-tenant-456",
+        )
+        fake_token_response = {
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "access_token": "mock-entra-id-jwt-token",
+        }
+
+        with mock.patch("urllib.request.urlopen") as mock_urlopen:
+            mock_resp = mock.MagicMock()
+            mock_resp.read.return_value = json.dumps(fake_token_response).encode("utf-8")
+            mock_resp.__enter__.return_value = mock_resp
+            mock_urlopen.return_value = mock_resp
+
+            token = relay._get_access_token()
+            self.assertEqual(token, "mock-entra-id-jwt-token")
+
+            # Subsequent call should return cached token without HTTP request
+            mock_urlopen.reset_mock()
+            token2 = relay._get_access_token()
+            self.assertEqual(token2, "mock-entra-id-jwt-token")
+            mock_urlopen.assert_not_called()
+
+    def test_teams_relay_service_url_validation(self):
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        # Untrusted service URL must be rejected
+        with self.assertRaises(ValueError):
+            relay.api_call(
+                service_url="https://evil-attacker.com",
+                path="v3/conversations/123/activities",
+            )
+        with self.assertRaises(ValueError):
+            relay.api_call(
+                service_url="http://smba.trafficmanager.net",  # HTTP rejected
+                path="v3/conversations/123/activities",
+            )
+        with self.assertRaises(ValueError):
+            relay.api_call(
+                service_url="",
+                path="v3/conversations/123/activities",
+            )
+
+    def test_teams_relay_api_call_success_and_json_parsing(self):
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        with mock.patch("urllib.request.urlopen") as mock_urlopen:
+            mock_resp = mock.MagicMock()
+            mock_resp.read.return_value = json.dumps({"access_token": "token1", "expires_in": 3600}).encode("utf-8")
+            mock_resp.__enter__.return_value = mock_resp
+            mock_urlopen.return_value = mock_resp
+
+            # Force get token
+            relay._get_access_token()
+
+            # Now call api_call
+            mock_resp.read.return_value = json.dumps({"id": "act-resp-1"}).encode("utf-8")
+            res = relay.api_call(
+                service_url="https://smba.trafficmanager.net/teams/",
+                path="v3/conversations/123/activities",
+                method="POST",
+                payload={"text": "hello"},
+            )
+            self.assertEqual(res, {"id": "act-resp-1"})
+
+    def test_teams_relay_download_and_size_validation(self):
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password", max_file_bytes=100)
+        with mock.patch("urllib.request.urlopen") as mock_urlopen:
+            mock_resp = mock.MagicMock()
+            mock_resp.read.return_value = json.dumps({"access_token": "token1", "expires_in": 3600}).encode("utf-8")
+            mock_resp.__enter__.return_value = mock_resp
+            mock_urlopen.return_value = mock_resp
+
+            relay._get_access_token()
+
+            # Invalid host
+            with self.assertRaises(ValueError):
+                relay.download("https://untrusted-domain.com/file.png")
+
+            # Valid host, valid size
+            mock_resp.read.return_value = b"small content"
+            data = relay.download("https://attachment.botframework.com/v3/attachments/file.png")
+            self.assertEqual(data, b"small content")
+
+            # Size exceeded
+            mock_resp.read.return_value = b"x" * 101
+            with self.assertRaises(ValueError):
+                relay.download("https://attachment.botframework.com/v3/attachments/file.png")
+
+    def test_teams_relay_nack_requeue_and_empty_pull(self):
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        # Empty pull returns None
+        self.assertIsNone(relay.pull(timeout_seconds=0))
+
+        # Enqueue and pull
+        self.assertTrue(relay.enqueue_event({"type": "message", "id": "1"}))
+        pulled = relay.pull(timeout_seconds=1)
+        self.assertIsNotNone(pulled)
+        receipt = pulled["receipt"]
+
+        # NACK requeues
+        self.assertTrue(relay.settle(receipt, acknowledge=False))
+        # Now pull again should get the requeued event
+        pulled2 = relay.pull(timeout_seconds=1)
+        self.assertIsNotNone(pulled2)
+        self.assertEqual(pulled2["event"]["id"], "1")
+
+    def test_teams_relay_missing_token_raises(self):
+        relay = TeamsRelay(app_id="app-id-123", app_password="secret-password")
+        with mock.patch("urllib.request.urlopen") as mock_urlopen:
+            mock_resp = mock.MagicMock()
+            mock_resp.read.return_value = json.dumps({"error": "invalid_client"}).encode("utf-8")
+            mock_resp.__enter__.return_value = mock_resp
+            mock_urlopen.return_value = mock_resp
+
+            with self.assertRaises(RuntimeError):
+                relay._get_access_token()
+
+
 if __name__ == "__main__":
     unittest.main()
+

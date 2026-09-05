@@ -156,6 +156,12 @@ platform_toolsets:
     - mcp-router
     - kanban
     - memory
+  # Microsoft Teams ingress resolves under the `teams` platform key; pin
+  # it to the delegation surface too so it never falls back to a full base bundle.
+  teams:
+    - mcp-router
+    - kanban
+    - memory
 
 # Second gate for the kanban orchestrator surface (kanban_create/list/…): the
 # kanban tools' check_fn reads this top-level key, distinct from platform_toolsets.
@@ -298,6 +304,13 @@ platforms:
       # its input. Teaching an agent to emit Slack mrkdwn directly would defeat
       # both this renderer and format_message.
       rich_blocks: true
+  # Microsoft Teams egress presentation. `enabled` is the operator's to set, from the CR's
+  # spec.integration.teams.
+  teams:
+    typing_status_text: "Kage is thinking…"
+    extra:
+      # Render outbound messages as Adaptive Cards v1.5 JSON when enabled.
+      adaptive_cards: true
 
 # Memory. The built-in MEMORY.md/USER.md store stays off; the
 # `kube_agents_memory` provider (agents/chat/plugins/memory/kube_agents_memory/)

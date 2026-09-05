@@ -32,6 +32,7 @@ TRIGGER_MODULE = "gateway.platform_registry"
 RELAY_PATCHES = (
     ("GOOGLE_CHAT_RELAY_URL", "google_chat_relay_patch"),
     ("SLACK_RELAY_URL", "slack_relay_patch"),
+    ("TEAMS_RELAY_URL", "teams_relay_patch"),
 )
 
 
