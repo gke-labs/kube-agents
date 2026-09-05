@@ -1,15 +1,21 @@
-# REGISTERED, INACTIVE — recast to the nightly tier on 2026-08-26 (a
-# commented entry in hack/ci-eval-pr.sh TASKS). Its one run FAILED on
-# agent-endpoint HTTP 502s while its DELEGATED WORKER completed the sweep and
-# filed ledger issue #3 in gke-agentic/kube-agents-evals-3-infra — the
-# harness was deaf, the SOP worked, which is what pins the failure on
-# transport rather than this scenario. The audit shape budgets at 600-1300s
-# (bench/tasks/DRAFTS.md, the 2026-08-26 smoke run), so the upgrades domain
-# is covered in presubmit by upgrades-lagging-master-probe; this full sweep
-# is the SOP-fidelity version and activates with the nightly tier. It was
-# held by A1 and A4 (bench/tasks/DRAFTS.md) and by nothing else -- its checks
-# read GKE control-plane versions through the ledger, so A5's
-# ambient-kubeconfig problem never touched it.
+# REACTIVATED (#1023) — an uncommented entry in hack/ci-eval-pr.sh TASKS,
+# the upgrades domain's second active case beside its probe. The
+# 2026-08-26 recast that parked it was a serial-budget decision (600-1300s
+# per audit, which six domains could not spend in one sequential
+# presubmit); #1057's fan-out merged 2026-08-31 and removed that
+# constraint (16 cases x 3 reps GREEN in 167 minutes, zero model 429s at
+# P=4, build 2094432646640701440). Its one run FAILED on agent-endpoint
+# HTTP 502s while its DELEGATED WORKER completed the sweep and filed
+# ledger issue #3 in gke-agentic/kube-agents-evals-3-infra — the harness
+# was deaf, the SOP worked, which is what pins the failure on transport
+# rather than this scenario. Still `validated: false`: the reactivating
+# PR's own /test all run is the clean measured run, and a red takes the
+# entry back out before that PR leaves draft. What this grades that
+# upgrades-lagging-master-probe does not: the full SOP sweep — dispatch,
+# delegated worker, token minter, ledger write — against the same planted
+# version lag. It was held by A1 and A4 (bench/tasks/DRAFTS.md) and by
+# nothing else -- its checks read GKE control-plane versions through the
+# ledger, so A5's ambient-kubeconfig problem never touched it.
 #
 # A1 and A4 cleared together on 2026-08-25, when
 # GoogleCloudPlatform/oss-test-infra#2661 merged. It exports
@@ -44,8 +50,8 @@
 # remediation pull requests and closes findings that stopped reproducing.
 # Presubmit-eligible because that write path is pinned per eval project to a
 # throwaway GitOps repository, token-scoped -- see DRAFTS.md, activation
-# blocker A1, now closed. Eligible tier: presubmit, and active there
-# since 2026-08-25.
+# blocker A1, now closed. Eligible tier: presubmit — active 2026-08-25 to
+# the 2026-08-26 recast, reactivated by #1023.
 #
 # The SOP has no vulnerability feed and forbids naming CVEs; a CVE id in the
 # report is an invention. That rule becomes an exact forbidden-phrase check.

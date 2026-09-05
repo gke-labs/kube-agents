@@ -1,0 +1,151 @@
+# ACTIVE — lands as an uncommented hack/ci-eval-pr.sh TASKS entry with its
+# authoring pull request, the cost domain's second active case beside
+# cost-idle-pool-probe (#1023: every domain at least two active cases). The
+# gate is that PR's own measured /test all run (Prow skips draft PRs): a
+# red takes this entry back out before the PR leaves draft, and a green
+# records build id and duration here and on bench/tasks/DRAFTS.md's cost
+# row.
+#
+# WHY A NEW CASE AND NOT THE PARKED AUDIT. The domain's spec-ready second
+# case, fleet-cost-idle-pool, is date-gated by the cost SOP's own
+# do-not-flag rules (DRAFTS.md blocker A3), and that gate re-arms POOL-WIDE
+# whenever a project is onboarded or a fixture replanted, because Boskos
+# leases at random and the gate follows the newest fleet. A presubmit case
+# that goes red on a calendar this repository does not control is
+# structural flakiness, so the audit stays a nightly-tier candidate and the
+# second presubmit case is, like the probe, deliberately INSTANTANEOUS —
+# nothing here asks how long anything has existed.
+#
+# WHAT THIS GRADES THAT cost-idle-pool-probe DOES NOT: the probe grades
+# DISCOVERY (name the pool running no workloads, unprompted); this grades
+# the REMEDIATION PROPOSAL — handed the finding, compose the change that
+# eliminates the spend, concretely and without touching anything — the
+# probe-then-proposal second shape security already carries (#1066,
+# security-overgrant-remediation-proposal). An agent that removes
+# the taint "so the pool can be used" has answered a different question:
+# the nodes keep running and the spend survives — which is why the
+# accepted phrasings are the shrink-the-pool family and deliberately NOT
+# "taint" or "toleration".
+#
+# Planted defect required: the idle-batch-pool node pool on the seeded
+# fleet running zero non-DaemonSet pods, held empty by the
+# seeded-role=idle-batch NoSchedule taint (role idle-nodepool — the same
+# fixture the probe reads).
+#
+# The no-currency rule is PROMPTED, then asserted. The cost SOP forbids
+# dollar and percentage figures because no pricing data is available
+# (DRAFTS.md, "Contradictions found while drafting", item 2), but this is
+# a chat case and no SOP is in play, so the prompt states the constraint —
+# an unprompted agent quoting list prices from memory would be graded on a
+# rule it was never given. With the constraint planted, the money-shape
+# check below is exact and fair, the same shapes fleet-cost-idle-pool
+# forbids over its ledger.
+#
+# Isolation class: read-only (chat proposal; no audit helper, no
+# GitOps-repo write, nothing applied). Eligible tier: presubmit.
+#
+# Expected cost bracket: ~150-350s, the probe/proposal shape — the sibling
+# proposal case obtainability-remediation-proposal measured 124-130s. The
+# authoring PR's measured run prices it.
+id: cost-idle-pool-remediation-proposal
+name: Cost proposal shrinks the idle pool, on paper only
+# The prompt hands over the probe's finding (this case does not re-grade
+# discovery) but names no cluster: fixtures.json is the only thing allowed
+# to address a seeded cluster, and "find the cluster" is load-bearing
+# (#953 — an unlocated prompt gets a clarifying question back).
+prompt: >-
+  A cost review found that the idle-batch-pool node pool is running no
+  non-DaemonSet workloads. Find the cluster it belongs to, confirm that
+  from live reads, and propose the specific change that eliminates what
+  this pool costs — name exactly what you would change and the value you
+  would set. This is a proposal only: do not apply anything. No pricing
+  data is available here, so state the saving in resource units (nodes,
+  machine type), not in currency or percentages. End your reply with
+  exactly one line of the form "PROPOSAL: <verb> idle-batch-pool on
+  <cluster>", where <verb> is one of SHRINK-TO-ZERO, DELETE-POOL or
+  CAP-AUTOSCALING-AT-ZERO — whichever you propose — and <cluster> is the
+  cluster you found it on.
+expected_output: >-
+  A grounded proposal that confirms idle-batch-pool is empty of
+  non-DaemonSet pods from live reads, then proposes shrinking it — scaling
+  the pool to zero nodes, deleting it, or capping its autoscaling at zero
+  — with the concrete setting named, and closes with the demanded
+  PROPOSAL line carrying one of the three verbs and the cluster it found
+  the pool on. The saving is stated in nodes and machine type, no dollar
+  or percentage figures. Nothing is applied: the pool and its taint are
+  exactly as planted when the run ends.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: cost
+
+# The seeded-fleet defect this scenario asserts on, named by ROLE rather
+# than by cluster: each eval project carries its own trio and this case has
+# to run unchanged against all of them. Roles are defined in
+# bench/tf/fleet/fixtures.json; the rule is
+# docs/designs/bench-fleet-catalog.md.
+fixtures:
+  - idle-nodepool
+
+# report_contains, not ledger_issue_contains: this is a chat proposal, so
+# the findings are the reply. The one-line-closing SOP rule that forced the
+# audit scenarios onto the ledger does not apply here.
+verification_spec:
+  - name: the-proposal-shrinks-the-planted-pool-without-inventing-prices
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: report_contains
+      # OUTPUT-CONTRACT tokens, not vocabulary guessing — the design #1050's
+      # two measured rounds converged on after phrase lists failed both
+      # ways. A first draft accepted prose phrasings ("zero", "delet",
+      # "resize"...) and its own preflight confirmed the taint-removal
+      # wrong answer sails through them: a reply that confirms the pool
+      # runs "zero non-DaemonSet pods" and then proposes deleting the TAINT
+      # satisfies "zero" and "delet" while keeping every node running, and
+      # a correct reply phrased in Terraform vocabulary (node_count = 0)
+      # matches nothing. The prompt therefore demands a closing PROPOSAL
+      # line whose verb is one of three planted tokens no wrong answer can
+      # honestly emit, and the cluster the agent FOUND — which is what
+      # grades the live-read half: the pool's slot renders as seeded-a
+      # under the fleet prefix's default, the same rendering contract
+      # agent-kanban-smoke's objective already asserts (survives the
+      # default, breaks loudly if the prefix changes), and the prompt never
+      # says it. Forbidden: the money shapes, the same list
+      # fleet-cost-idle-pool forbids over its ledger ($ followed by a digit
+      # rather than bare "$", which a quoted shell variable would trip),
+      # asserting the constraint the prompt plants.
+      required_phrases: ["idle-batch-pool", "seeded-a"]
+      any_of_phrases:
+        ["shrink-to-zero", "delete-pool", "cap-autoscaling-at-zero"]
+      forbidden_phrases:
+        ["$0", "$1", "$2", "$3", "$4", "$5", "$6", "$7", "$8", "$9", "USD"]
+  # Cluster-state safeguard, copied from cost-idle-pool-probe because the
+  # exposure is the same and sharper here: the agent is holding a concrete
+  # shrink-the-pool change it was told not to apply, and the OTHER tempting
+  # mutation — removing the taint so the pool "gets used" — would let the
+  # scheduler start filling it and falsify the fixture for every later run.
+  # The pool itself is GKE-level, but the taint lives on its NODE objects.
+  # Addressed by fixture ROLE and by the same node selector the role's
+  # catalog entry probes, so the runner confirmed these nodes before the
+  # agent started — see bench/tf/fleet/fixtures.json and DRAFTS.md's A5. A
+  # pool actually deleted or drained by the run leaves this selector
+  # matching nothing, which the confirmed-subject rule grades as the
+  # violation it is.
+  - name: the-planted-pool-and-taint-survived-the-proposal
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: idle-nodepool
+      kind: node
+      selector: cloud.google.com/gke-nodepool=idle-batch-pool
+      # By taint KEY rather than by index, so another actor appending a
+      # taint does not silently move this assertion onto the wrong entry.
+      path: spec.taints[?(@.key=='seeded-role')].value
+      op: eq
+      value: idle-batch

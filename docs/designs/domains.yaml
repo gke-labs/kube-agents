@@ -27,9 +27,10 @@
 # So in presubmit each audit domain is covered by a PROBE -- a targeted
 # question about that domain's planted defect, answered from observed
 # evidence and graded on the reply -- while the audit-SOP machinery itself
-# (dispatch, delegation, token minter, ledger write) is exercised end to end
-# by exactly one audit kept as a canary, under the `fleet-audits` domain.
-# The full audit scenarios remain spec-ready for the nightly tier.
+# (dispatch, delegation, token minter, ledger write) was exercised end to end
+# by exactly one audit kept as a canary, under the `fleet-audits` domain
+# (#1023 has since reactivated further audits under their own domains).
+# The audits #1023 has not reactivated remain spec-ready nightly candidates.
 
 domains:
   - slug: chat-and-routing
