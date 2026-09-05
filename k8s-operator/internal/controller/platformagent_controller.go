@@ -354,7 +354,10 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			// only the sandbox one.
 			msg := fmt.Sprintf("RuntimeClass '%s' is not configured in this cluster. For GKE Standard, enable GKE Sandbox by provisioning a gVisor node pool first. In GKE Autopilot, gVisor is supported automatically.", rcName)
 			log.Info(msg)
-			if statusErr := r.updateStatusDegraded(ctx, instance, "RuntimeClassNotFound", msg); statusErr != nil {
+			if err := r.reconcileAgentNetworkGuardrails(ctx, instance); err != nil {
+				return ctrl.Result{}, err
+			}
+			if statusErr := r.updateStatusDegraded(ctx, instance, reasonRuntimeClassNotFound, msg); statusErr != nil {
 				return ctrl.Result{}, statusErr
 			}
 			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
@@ -407,10 +410,9 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// policy is unconditional because it has nothing to do with either
 		// refusal; it is the Pod's baseline and it predates this field.
 		//
-		// Steps 9b and 9c take the same rescue for the same reason. What is
-		// still open is step 10's RuntimeClassNotFound, which returns without
-		// reconciling the gateway policy. Issue #964 tracks that; do not read
-		// the rule stated here as one the whole function keeps yet.
+		// Steps 9b, 9c, and 10 take the same rescue for the same reason: all
+		// refusal paths maintain the agent Pod's network guardrails before
+		// returning.
 		if err := r.reconcileAgentNetworkGuardrails(ctx, instance); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -1399,10 +1401,15 @@ func (r *PlatformAgentReconciler) deleteIfManaged(ctx context.Context, object cl
 	return client.IgnoreNotFound(r.Delete(ctx, object))
 }
 
-// reasonEgressAllowlistRefused refuses the contents of an egress policy: the
-// policy is fine and still gets rendered, minus the destinations that were
-// refused.
-const reasonEgressAllowlistRefused = "EgressAllowlistRefused"
+const (
+	// reasonRuntimeClassNotFound indicates that the requested RuntimeClass was not found in the cluster.
+	reasonRuntimeClassNotFound = "RuntimeClassNotFound"
+
+	// reasonEgressAllowlistRefused refuses the contents of an egress policy: the
+	// policy is fine and still gets rendered, minus the destinations that were
+	// refused.
+	reasonEgressAllowlistRefused = "EgressAllowlistRefused"
+)
 
 // validateEgressPolicy returns a Degraded reason and message when
 // spec.security.egressPolicy asks for something the operator cannot honestly
@@ -1448,9 +1455,9 @@ func validateEgressAllowlist(agent *agentv1alpha1.PlatformAgent) (string, string
 // egress. That the CR reads Degraded at the time makes it worse rather than
 // better: the status names one bad CIDR while the Pod's egress is wide open.
 //
-// Both policies are reconciled whatever the refusal was. <name>-gateway-netpol
-// is the Pod's baseline, it predates spec.security.egressPolicy, and no refusal
-// is an objection to it; <name>-sandbox-metadata-deny is the refused policy
+// Both policies are reconciled whatever the refusal was (steps 9b, 9c, 10, 11e).
+// <name>-gateway-netpol is the Pod's baseline, it predates spec.security.egressPolicy,
+// and no refusal is an objection to it; <name>-sandbox-metadata-deny is the refused policy
 // itself, and the builder has already dropped the offending destination, so
 // what is left to render is a good policy minus one rule.
 func (r *PlatformAgentReconciler) reconcileAgentNetworkGuardrails(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
