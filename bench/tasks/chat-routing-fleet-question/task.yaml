@@ -10,17 +10,18 @@
 # the specialist to read.
 # Isolation class: read-only (the testing plan's isolation rule: read-only or namespace-scoped is presubmit-eligible). Eligible tier: presubmit.
 #
-# NOT ACTIVATABLE by uncommenting, and for a harness reason rather than a
-# fixture one -- unlike autoops-warning-event-triage, which was in the same
-# category until #1045 built it a scenario driver: hack/ci-eval-pr.sh exports a
-# single AGENT_SERVICE_NAME ("platform-agent") and the runner port-forwards
-# that one service, so every entry in TASKS reaches the platform agent. This
-# prompt would land on the specialist directly and never touch the front door
-# whose routing it exists to test -- the delegation objective would fail on a
-# correct system, and the failure would look like an agent regression rather
-# than a harness gap. Needs a per-task agent target in the harness; see
-# DRAFTS.md, activation blocker A2. The verification_spec below is written
-# against the front door and stands unchanged once the harness can reach it.
+# NOT ACTIVATABLE by uncommenting, but no longer for the routing reason this
+# header used to give. hack/ci-eval-pr.sh exports a single AGENT_SERVICE_NAME
+# ("platform-agent") and the runner port-forwards that one service -- and the
+# 2026-08-31 measurement (chat-routing-board-read's activating run, build
+# 2094517532634386432) settled that this endpoint serves the front-door
+# (default) profile, the profile this prompt needs, so the harness can reach
+# it. What holds it now is that it has never been run (validated: false
+# below) -- uncommenting a case nobody has watched pass is how a case that
+# can only fail reds every pull request -- and its delegation objective rides
+# the worker round trip whose dropped results #1097 is investigating. See
+# DRAFTS.md, blocker A2, for the measurement record. The verification_spec
+# below is written against the front door and stands unchanged.
 #
 # The front door holds no infrastructure tools by design (agents/chat/SOUL.md),
 # so the safeguard here is the delegation boundary: substantive work must go

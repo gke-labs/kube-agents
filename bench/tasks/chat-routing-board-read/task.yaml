@@ -1,0 +1,98 @@
+# ACTIVE — lands as an uncommented hack/ci-eval-pr.sh TASKS entry with
+# its authoring pull request, the second chat-and-routing case (#1023:
+# every domain at least two active cases). It was first written to merge
+# parked while #1057's fan-out was unlanded; #1057 merged 2026-08-31 with
+# its pool measurement clean (167min GREEN, 48/48 units, zero model 429s
+# at P=4, build 2094432646640701440), so activation rides the authoring
+# PR instead of a follow-up. MEASURED: 3/3 GREEN on that run — build
+# 2094517532634386432 (2026-08-31), 61s/59s/66s per repetition, the
+# cheapest case in the matrix as designed.
+#
+# WHAT THIS GRADES THAT agent-kanban-smoke DOES NOT: the front door's
+# routing decision in the direction no active case prices. The smoke
+# grades the delegation happy path — a substantive question is filed as a
+# kanban card and the specialist's answer folds back into the thread. This
+# case grades the documented exception (agents/chat/SOUL.md §1.5): a
+# question about the BOARD ITSELF is answered by READING the board
+# (kanban_list, kanban_show), never by filing a new card. A front door
+# that delegates the board question has failed the routing rule this
+# domain exists to measure, exactly as one that answers a fleet question
+# from imagination has.
+#
+# Unlike every delegation case, the calls under test are the responding
+# agent's own — the trajectory tool_called reads is the front door's, and
+# kanban_list / kanban_create are front-door calls — so this sits entirely
+# inside tool_called's router-only limit (verifiers.py) instead of working
+# around it.
+#
+# One standing text disagreed with that premise, and the measured run
+# adjudicated it: DRAFTS.md's activation blocker A2 said "every entry in
+# TASKS talks to the platform agent", while agent-kanban-smoke's header
+# and agents/chat/config.yaml say the harness endpoint serves the
+# front-door (default) profile. Build 2094517532634386432 settled it the
+# second way — three repetitions green with kanban_list in the responding
+# agent's own trajectory, a call no non-front-door reading explains.
+# DRAFTS.md's A2 entry now carries the dated reconciliation; what A2
+# still holds is per-task targeting of a profile OTHER than the one the
+# single endpoint serves.
+#
+# The board's CONTENT is deliberately not asserted. Cards on the board at
+# run time belong to whichever tasks ran before this one against the same
+# install (or none at all), so any content assertion would grade
+# scheduling, not routing. An empty board answered as "the board is empty"
+# is a correct run; so is a full one summarized. The deterministic
+# artifacts are the routing facts: the list read happened, the spurious
+# delegation did not.
+#
+# No `fixtures:` list, deliberately: both checks read the run's
+# transcript, not a cluster (the agent-kanban-smoke precedent).
+#
+# Expected cost bracket: the cheapest shape in the matrix — no delegation
+# round trip, no cluster read, a single front-door turn (~10-60s
+# expected); the authoring PR's draft-phase presubmit is the measurement.
+id: chat-routing-board-read
+name: Front door answers a board question by reading the board, not by filing a card
+prompt: >-
+  What is on the kanban board right now? List any tasks that exist and
+  their current status — and if the board is empty, just say so.
+expected_output: >-
+  The front door reads the board (kanban_list, optionally kanban_show for
+  detail) and summarizes what it finds — one line per card as status,
+  assignee and title, or a plain statement that the board is empty. No new
+  kanban card is filed: per the front door's own routing rule, a question
+  about the board is answered by reading it, and only a question needing
+  specialist work gets a new task.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml: choosing to read rather than
+# delegate is as much the front door's routing journey as choosing to
+# delegate is.
+domain: chat-and-routing
+
+verification_spec:
+  - name: the-board-was-actually-read
+    role: objective
+    # assert, not the converge default: the transcript is immutable once the
+    # run ends, so polling a failed check would only wait out the timeout.
+    mode: assert
+    check:
+      type: tool_called
+      tool_names: ["kanban_list"]
+      # An errored kanban_list read nothing, so only successful calls
+      # count toward this objective.
+      require_success: true
+  # The routing boundary, in the same shape chat-routing-fleet-question
+  # asserts its worker-verb boundary: a none-wrapped tool_called is the
+  # verifier's documented "this tool was never called" form. No
+  # require_success — an ATTEMPTED card for a board question is the routing
+  # failure whether or not the call succeeded.
+  - name: no-card-was-filed-for-a-board-question
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: none
+      checks:
+        - type: tool_called
+          tool_names: ["kanban_create"]

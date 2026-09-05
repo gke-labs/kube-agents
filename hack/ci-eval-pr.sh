@@ -821,6 +821,19 @@ BENCH_DIR="${SCRIPT_DIR}/../bench"
 # agent-kanban-smoke is deployer: noop, so it adds a delegation round trip
 # (~100-300s), not a cluster.
 TASKS=(
+  # Two second-domain cases (#1023): remediation's PR-landing shape and
+  # chat-and-routing's board-read routing exception. ACTIVE on the
+  # strength of this pull request's own measured run (Prow skips draft
+  # PRs, so that run is `/test all`-triggered); a red on either takes its
+  # entry back out before the PR leaves draft — the #1049 rule. Array
+  # position no longer sets execution order: the fan-out launches
+  # longest-first from unit_cost_hint below. MEASURED on build
+  # 2094517532634386432: board-read 59-66s (the matrix's cheapest case,
+  # left on the default hint), pdb-remediation-pr 267-489s (hinted 400
+  # from that measurement). Budget arithmetic for the pair is at the end
+  # of the block above EVAL_REPETITIONS.
+  "./tasks/chat-routing-board-read/task.yaml"
+  "./tasks/pdb-remediation-pr/task.yaml"
   # SEVEN DOMAINS THROUGH PROBES, THE AUDIT MACHINERY THROUGH ONE CANARY.
   # The 2026-08-26 smoke run (build 2092638061140643840, kube-agents-evals-3)
   # measured what six full audits cost: obtainability-planted-pdb PASSED in
@@ -897,8 +910,10 @@ TASKS=(
   # the job deadline before reaching it), so this entry's first smoke IS the
   # measurement. Launch priority lives in unit_cost_hint below, not in this
   # list's position.
-  # The one active task that WRITES: it files a remediation PR against the
-  # leased project's throwaway GitOps repo via submit-suggestion.
+  # One of the two active tasks that write through submit-suggestion — a
+  # remediation PR against the leased project's throwaway GitOps repo
+  # (pdb-remediation-pr above is the other; the compliance canary writes
+  # too, to its ledger).
   "./tasks/rca-remediation-pr/task.yaml"
   # The audit-machinery canary: measured 606s clean on 2026-08-26, every
   # exact check green -- the only task that has proven the A1/A4 path
@@ -1060,11 +1075,13 @@ TASKS=(
   #       the INSTANTANEOUS question (no age gate), so the cost domain is
   #       covered while this SOP-faithful audit waits for its calendar.
   #   A2  chat-routing-fleet-question. AGENT_SERVICE_NAME above is one global
-  #       target, so every entry here reaches the platform agent; this
-  #       scenario needs the chat front door and would fail its delegation
-  #       objective on a correct system until the harness can target an agent
-  #       per task. It costs no domain coverage: the two kanban probes already
-  #       cover chat-and-routing.
+  #       target, and the 2026-08-31 measurement (chat-routing-board-read's
+  #       activating run, build 2094517532634386432) settled that the endpoint
+  #       serves the front-door profile -- the one this scenario needs. So
+  #       what holds it is validation (validated: false, never run), not
+  #       routing; A2 proper -- targeting a profile OTHER than the endpoint's
+  #       -- holds no entry by itself. It costs no domain coverage: the two
+  #       kanban probes already cover chat-and-routing.
   # "./tasks/chat-routing-fleet-question/task.yaml"
   # "./tasks/fleet-cost-idle-pool/task.yaml"
   #
@@ -1094,8 +1111,10 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # that is issue #902's lane. The serial measurements kept below predate the
 # fan-out and are its baseline.
 #
-# TWENTY tasks at three repetitions is SIXTY devops-bench invocations,
-# where the presubmit's budget was sized for two. The per-invocation cost is no
+# TWENTY-TWO tasks at three repetitions is SIXTY-SIX devops-bench invocations
+# at this branch's head -- main's TWENTY plus this change's two ("keep this
+# count current when you activate", below, applied once more) -- where the
+# presubmit's budget was sized for two. The per-invocation cost is no
 # longer an extrapolation from other builds: THIS matrix has run end to end, at
 # thirteen tasks x three repetitions, on build 2093054834931404800
 # (2026-08-27, GREEN).
@@ -1112,13 +1131,13 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 #
 # One term in that is still a substitution rather than a measurement:
 # rca-remediation-pr, activated by #998 so that its own smoke run would BE the
-# first measurement, is priced at the fleet average. It is one of the two active
-# tasks that WRITE, so compliance-rbac-overgrant is the better comparable at a
-# measured 681s per repetition -- at that cost the total is ~239min of
-# invocations, ~256min with the fixed term, and 1.41x. 1.41x is the arithmetic's
-# honest figure and 1.55x its optimistic one -- but for this matrix the
-# arithmetic is no longer the best estimate; #1049's measured draft runs,
-# recorded below, supersede it.
+# first measurement, is priced at the fleet average. It is one of the active
+# tasks that WRITE (three with pdb-remediation-pr), so compliance-rbac-overgrant
+# is the better comparable at a measured 681s per repetition -- at that cost the
+# total is ~239min of invocations, ~256min with the fixed term, and 1.41x.
+# 1.41x is the arithmetic's honest figure and 1.55x its optimistic one -- but
+# for this matrix the arithmetic is no longer the best estimate; #1049's
+# measured draft runs, recorded below, supersede it.
 #
 # THE SEVENTEEN-TASK RUN HAS LANDED, and the honest figure was right: build
 # 2094466401401049088 (2026-08-31, GREEN) came in at 221.7min whole-job against
@@ -1182,6 +1201,13 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # pull request. It is not a legitimate default: at 1 the collapse rung
 # degenerates to "the single run failed", which is exactly the trigger-happy
 # rule this change exists to replace.
+# #1023's two second-domain activations are MEASURED, not estimated: on
+# build 2094517532634386432 (GREEN, 3/3 each) chat-routing-board-read cost
+# 59-66s and pdb-remediation-pr 267-489s per repetition -- ~25 minutes of
+# invocation for all six units, minutes of span at the fan-out's realized
+# parallelism. Sibling lanes (#1082, #1083, #1066, #1050) budget their own
+# additions against the same baseline; whichever merges LAST owns the
+# combined recompute.
 EVAL_REPETITIONS="${EVAL_REPETITIONS:-3}"
 if ! [ "${EVAL_REPETITIONS}" -ge 1 ] 2>/dev/null; then
   echo "ERROR: EVAL_REPETITIONS must be a positive integer, got '${EVAL_REPETITIONS}'." >&2
@@ -1352,6 +1378,8 @@ unit_cost_hint() {
     # iterates TASK_NAMES. Kept for their NIGHTLY_TASKS re-entry (#1175).
     gpu-stress-test-diagnosis | autoops-warning-event-triage) echo 900 ;;
     compliance-rbac-overgrant | rca-remediation-pr) echo 700 ;;
+    # Measured 267-489s across build 2094517532634386432's three reps.
+    pdb-remediation-pr) echo 400 ;;
     consistency-authorized-networks-probe) echo 300 ;;
     *) echo 200 ;;
   esac
