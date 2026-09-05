@@ -75,6 +75,7 @@ The default **read-only** set binds viewer roles only:
 - `roles/iam.serviceAccountUser` — act as service accounts when running jobs.
 - `roles/iam.securityReviewer` — read IAM policy for review.
 - `roles/mcp.toolUser` — call the GKE MCP server.
+- `roles/serviceusage.serviceUsageConsumer` — consume API quota for Developer Knowledge MCP queries.
 
 `roles/container.viewer` is project-wide and unconditioned, so it reads Kubernetes objects in **every** cluster in the project. The [scoped service account pool](#the-scoped-service-account-pool) is where that narrowing is designed to land — suspended as of 2026-08-12, so today nothing narrows it; the pool section says why.
 

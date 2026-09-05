@@ -12,6 +12,7 @@ locals {
     # enabled whether or not a BackupPlan follows, and the addon cannot be
     # enabled without the API.
     "gkebackup.googleapis.com",
+    "developerknowledge.googleapis.com",
   ]
   pubsub_apis = (var.enable_google_chat || var.enable_pubsub_platform || var.enable_stockout_investigator) ? [
     "pubsub.googleapis.com",
@@ -61,6 +62,7 @@ locals {
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",
     "roles/mcp.toolUser",
+    "roles/serviceusage.serviceUsageConsumer",
   ]
 
   # An explicit project_roles list always wins, so an existing configuration
