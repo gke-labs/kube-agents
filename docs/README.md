@@ -164,6 +164,8 @@ identifier appears, add its source here.
 | GKE host-discovery label | `scripts/installer/common.sh` |
 | GitOps clone layout (`/opt/data/gitops/...`) and leases | `agents/platform/scripts/gitops_workspace.py` |
 | Chat platforms an install posts to, the order, and the fallback | `agents/platform/scripts/chat_platforms.py` |
+| Which deliverables a Google Chat thread gets pasted inline, the size ceiling, and the per-message budget | `agents/platform/scripts/google_chat_relay_patch.py` |
+| Staging a sandbox-written artifact out for delivery: the per-file, per-card and total ceilings, the deadline, and the denied prefixes | `agents/platform/scripts/sandbox_artifact_patch.py` |
 | fleet-audit finding-id pattern and rendering caps | `agents/platform/skills/fleet-audit/scripts/audit_report.py` |
 | Helm chart value defaults (KSA/secret names, image repos, tag rules) | `charts/kube-agents/values.yaml` |
 | Release tag families (`rc_*`, `rc_*_validated`, `staging_<ts>_<sha>`, GA `X.Y.Z`) and the shared lookups over them | `scripts/release/common.sh` |

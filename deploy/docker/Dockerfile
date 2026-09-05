@@ -568,15 +568,19 @@ RUN cp /tmp/channel-directory/channel_directory_threads.py /opt/hermes/gateway/c
 # so a user who asked for a report in English gets a Spanish refusal and reads
 # it as the agent having switched language mid-thread. It is not a rare path:
 # native media.upload needs a *per-user* OAuth token, so until each user has run
-# /setup-files in their own DM every attachment lands here, and on the install
-# where this was reported no user had. The second half of the fix is the advice
-# itself: agents/platform/scripts/google_chat_relay_patch.py stubs /setup-files
-# out, and the operator sets GOOGLE_CHAT_RELAY_URL on every install with Google
-# Chat enabled, so on all of them that instruction is a dead end. The notice
-# branches on the _credential_proxy_relay_patched marker that patch leaves on
-# the class, and offers what does work there instead. The direct branch is for
-# an image run outside the operator; it is kept rather than folded away because
-# deleting it hard-codes the instruction off in the one place it works.
+# /setup-files in their own DM every attachment reaches this method, and on the
+# install where this was reported no user had. The second half of the fix is the
+# advice itself: agents/platform/scripts/google_chat_relay_patch.py stubs
+# /setup-files out, and the operator sets GOOGLE_CHAT_RELAY_URL on every install
+# with Google Chat enabled, so on all of them that instruction is a dead end. The
+# notice branches on the _credential_proxy_relay_patched marker that patch leaves
+# on the class, and gives the reason instead. The direct branch is for an image
+# run outside the operator; it is kept rather than folded away because deleting
+# it hard-codes the instruction off in the one place it works.
+# Since #999 the notice is not what the user sees for all of those: the same
+# relay patch overrides this method to paste a small UTF-8 text deliverable into
+# the thread, so what still reaches the notice is a format with no text form, a
+# file over 32 KiB, undecodable bytes, or a paste the API refused.
 #
 # A grep guard cannot catch this class of bug. The two branches differ only in
 # which strings are appended, so a patch that wired the condition backwards --

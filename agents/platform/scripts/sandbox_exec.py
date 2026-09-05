@@ -46,6 +46,8 @@ proxy holds credentials so that the sandbox never does.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import os
 import re
 import shlex
@@ -60,7 +62,7 @@ SANDBOX_PRINCIPAL = "hermes"
 # line rather than a second credential, and the separation the module docstring
 # describes is the only thing keeping them apart.
 #
-# Two callers pass it, both for the same reason: they have to write inside a
+# Two writers pass it, both for the same reason: they have to write inside a
 # tree that is `agent:agent` to the leaves, which uid 1001 cannot do.
 # `kanban_workspace_gc.py` unlinks scratch workspaces; `cluster_agent_profile.py`
 # writes one profile's kubeconfig. The alternative in either case — loosening
@@ -68,11 +70,41 @@ SANDBOX_PRINCIPAL = "hermes"
 # narrower login does, and leaves uid 1001 writing into a tree uid 1000 owns,
 # which is a symlink-follow waiting to happen.
 #
-# What makes it safe there does not generalise: neither caller consumes the
+# What makes it safe there does not generalise: neither writer consumes the
 # command's output as a fact about the cluster, and a `.bashrc` that hijacked
 # either would be doing to uid 1000's own files what uid 1000 can already do. A
 # caller that reads a command's output and believes it must use the default.
+#
+# `read_bytes` is the exception, and it is this module's own default rather than
+# an argument any caller passes. It does consume the output — but as the bytes
+# of a file uid 1000 wrote, not as a fact about the cluster, and reading them as
+# `hermes` would only widen what a model-composed path can reach. Its docstring
+# argues the case; the rule above still binds anything that runs a *command* and
+# believes the answer.
 TERMINAL_PRINCIPAL = "agent"
+
+# The marker `read_bytes` prints before its payload, so a login shell that
+# writes to stdout cannot corrupt the file. `agent` sources ~/.bashrc even for
+# `ssh host cmd`, and the model owns that file: anything it echoes lands in
+# front of the base64 and turns a readable report into a decode error. Slicing
+# at the marker discards the chatter instead. A model that echoes the marker
+# itself only truncates its own file, which is a paste it could have corrupted
+# by writing the file differently.
+_READ_MARKER = "--- sandbox-exec read ---"
+
+# `read_bytes`' exit code for a path that is not a readable regular file, as
+# distinct from the shell failing for any other reason. Both answer None; the
+# split is what lets a caller log the difference.
+_READ_UNREADABLE = 3
+
+# `read_bytes`' exit code for a file that was a readable regular file when it
+# was tested and could not be read through to the cap anyway -- unlinked or
+# replaced in between, an I/O error, a mode change, no scratch space to land it
+# in. It exists because the read and the encode cannot be a pipeline: the
+# pipeline's status is the encoder's, `base64` exits 0 on the empty input a
+# failed `head` hands it, and a failed read would arrive here as a successful
+# zero-byte file and be delivered as the report.
+_READ_INCOMPLETE = 4
 
 MANAGED_CONFIG_PATH = os.environ.get("HERMES_MANAGED_CONFIG_PATH", "/etc/hermes/config.yaml")
 
@@ -330,7 +362,7 @@ def run(argv: list[str], *, remote_env: dict[str, str] | None = None,
     """Run `argv` in the sandbox and return the finished process.
 
     `principal` selects the sandbox login and should be left alone; see
-    `TERMINAL_PRINCIPAL` for the two callers that do not.
+    `TERMINAL_PRINCIPAL` for the callers that do not.
 
     `remote_env` names the variables the command itself needs; they are
     rendered into the remote command line. `local_env` replaces the environment
@@ -357,6 +389,14 @@ def run(argv: list[str], *, remote_env: dict[str, str] | None = None,
     where the command belongs.
 
     Raises SandboxUnavailable when ssh itself could not connect.
+
+    The output is buffered whole, with no ceiling. `timeout` bounds how long a
+    command may run but not how much it may print, so a command that writes
+    faster than it runs long — or a shell startup file in the sandbox that
+    prints without stopping, since ssh runs the login shell before the command —
+    is held in this process's memory until it ends. That is a property of every
+    call here rather than of any one caller, and the agent pod trusts the
+    sandbox it dialled, so capping it is a hardening change of its own.
     """
     # `input=None` is not "no stdin". subprocess only redirects fd 0 when it is
     # given something to redirect it to, so with no `stdin` the child inherits
@@ -394,3 +434,76 @@ def run(argv: list[str], *, remote_env: dict[str, str] | None = None,
             completed.returncode, argv, completed.stdout, completed.stderr
         )
     return completed
+
+
+def read_bytes(path: str, *, max_bytes: int, principal: str = TERMINAL_PRINCIPAL,
+               timeout: float | None = None,
+               config_path: str | None = None) -> bytes | None:
+    """Up to `max_bytes` bytes of `path` in the sandbox, or None.
+
+    None is "there is nothing to read here": not a regular file, not readable,
+    or output that did not survive the trip. `SandboxUnavailable` is the other
+    answer and means the sandbox was never reached, which a caller may want to
+    retry. A caller that treats both the same is welcome to; keeping them apart
+    is what lets one of them be logged as a fault.
+
+    Reads at most `max_bytes`, and bounds the transfer as well as the result:
+    the cap is applied by `head` on the far side, so a caller asking for 32 KiB
+    of a 2 GB core dump moves 32 KiB. Pass one byte more than the real ceiling
+    to tell "at the limit" from "over it", the way a local capped read does.
+
+    `principal` defaults to `TERMINAL_PRINCIPAL`, which is NOT this module's
+    default and is deliberate. The other two callers that name it pass it to
+    write inside an `agent`-owned tree; this one passes it to read with no more
+    privilege than whoever wrote the file had. Every deliverable in the sandbox
+    is written by the model's own shell, which logs in as `terminal.ssh_user` --
+    `agent` -- so reading as `hermes` would add no access this needs while
+    adding one it must not have: the path reaching this function comes from a
+    record the model influences, and `hermes` can open files under /home/hermes
+    that `agent` cannot. A symlink is enough to turn a report into a private key,
+    and the caller pastes what comes back into a human's chat thread. The
+    `hermes` default protects a caller that believes the *output* of a command;
+    this one believes only the bytes of a file the model already owns.
+
+    The bytes are moved base64-encoded because the payload is a file rather than
+    text: `run` decodes stdout with the locale codec, which silently substitutes
+    a replacement character for anything that is not valid UTF-8. A PDF would
+    arrive corrupted and no caller could tell.
+
+    The marker line is there because the login shell runs first. A `.bashrc`
+    that prints anything -- a banner, a warning from a tool it sources -- puts
+    that text in front of the payload, and base64 would decode it as part of the
+    file. Everything up to and including the marker is discarded.
+
+    The read lands in a scratch file on the far side before it is encoded,
+    rather than being piped straight into `base64`. A pipeline's exit status is
+    its last command's, and `base64` exits 0 on the empty input a failed `head`
+    hands it -- so an unlinked, replaced or unreadable-after-the-test file came
+    back as a successful zero-byte read, which a caller delivers as the file. It
+    also means the marker is printed only once the bytes are safely across.
+
+    Like everything in this module, this runs the command locally when no
+    sandbox is configured. Call it behind `sandbox_enabled()`.
+    """
+    quoted = shlex.quote(path)
+    script = (
+        f'if [ ! -f {quoted} ] || [ ! -r {quoted} ]; then '
+        f'exit {_READ_UNREADABLE}; fi; '
+        f'scratch=$(mktemp) || exit {_READ_INCOMPLETE}; '
+        f"trap 'rm -f \"$scratch\"' EXIT; "
+        f'head -c {int(max_bytes)} -- {quoted} > "$scratch" '
+        f'|| exit {_READ_INCOMPLETE}; '
+        f'printf "%s\\n" {shlex.quote(_READ_MARKER)}; '
+        f'base64 -w0 < "$scratch"'
+    )
+    completed = run(["sh", "-c", script], principal=principal, timeout=timeout,
+                    path=config_path)
+    if completed.returncode != 0:
+        return None
+    _, marker, encoded = (completed.stdout or "").partition(_READ_MARKER)
+    if not marker:
+        return None
+    try:
+        return base64.b64decode(encoded.strip(), validate=True)
+    except (ValueError, binascii.Error):
+        return None

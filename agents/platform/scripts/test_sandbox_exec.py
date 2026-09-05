@@ -9,6 +9,7 @@ ways this helper can be wrong without any test failing elsewhere.
 Run:  python3 agents/platform/scripts/test_sandbox_exec.py
 """
 
+import base64
 import os
 import subprocess
 import sys
@@ -283,6 +284,204 @@ class RunTestCase(unittest.TestCase):
                              path=self.config, stdin="a pull-request body")
         self.assertEqual(runner.call_args.kwargs.get("input"), "a pull-request body")
         self.assertNotIn("stdin", runner.call_args.kwargs)
+
+
+class ReadBytesTestCase(unittest.TestCase):
+    """Pulling a file out of the sandbox, for a caller that cannot open it."""
+
+    def setUp(self):
+        self.config = write_config(SANDBOX_CONFIG)
+
+    def completed(self, returncode=0, stdout="", stderr=""):
+        return subprocess.CompletedProcess(args=["ssh"], returncode=returncode,
+                                           stdout=stdout, stderr=stderr)
+
+    def transferred(self, raw, *, preamble=""):
+        """What a successful read looks like on the wire."""
+        return self.completed(
+            stdout=preamble
+            + sandbox_exec._READ_MARKER
+            + "\n"
+            + base64.b64encode(raw).decode("ascii")
+        )
+
+    def read(self, completed, **kwargs):
+        with patch("subprocess.run", return_value=completed) as runner:
+            result = sandbox_exec.read_bytes(
+                kwargs.pop("path", "/opt/data/report.md"),
+                max_bytes=kwargs.pop("max_bytes", 1024),
+                config_path=self.config,
+                **kwargs,
+            )
+        return result, runner
+
+    def test_returns_the_exact_bytes(self):
+        raw = b"# findings\n\x00\xff not utf-8\n"
+        result, _ = self.read(self.transferred(raw))
+        self.assertEqual(result, raw)
+
+    def test_a_chatty_login_shell_does_not_corrupt_the_payload(self):
+        raw = b"# findings\n"
+        result, _ = self.read(
+            self.transferred(raw, preamble="Welcome to the sandbox.\nbash: ...\n")
+        )
+        self.assertEqual(result, raw)
+
+    def test_the_cap_is_applied_on_the_far_side(self):
+        _, runner = self.read(self.transferred(b"x"), max_bytes=32769)
+        remote = runner.call_args.args[0][-1]
+        self.assertIn("head -c 32769", remote)
+
+    def test_reads_as_the_login_that_writes_the_files(self):
+        # Not the module's `hermes` default: the path comes from a record the
+        # model influences, and `hermes` can open files `agent` cannot.
+        _, runner = self.read(self.transferred(b"x"))
+        destination = [
+            arg for arg in runner.call_args.args[0] if "@" in arg and " " not in arg
+        ]
+        self.assertEqual(len(destination), 1, runner.call_args.args[0])
+        self.assertTrue(
+            destination[0].startswith(sandbox_exec.TERMINAL_PRINCIPAL + "@"),
+            destination[0],
+        )
+
+    def test_a_path_that_is_not_a_readable_file_is_none(self):
+        result, _ = self.read(self.completed(returncode=sandbox_exec._READ_UNREADABLE))
+        self.assertIsNone(result)
+
+    def test_output_without_the_marker_is_none(self):
+        # A read that produced something this function cannot account for is
+        # not a file; decoding it would paste the shell's own chatter.
+        result, _ = self.read(self.completed(stdout="bash: base64: not found\n"))
+        self.assertIsNone(result)
+
+    def test_a_payload_that_is_not_base64_is_none(self):
+        result, _ = self.read(
+            self.completed(stdout=sandbox_exec._READ_MARKER + "\nnot base64 !!")
+        )
+        self.assertIsNone(result)
+
+    def test_an_unreachable_sandbox_raises_rather_than_reading_as_absent(self):
+        failure = self.completed(
+            255, stderr="ssh: connect to host x port 2222: Connection refused"
+        )
+        with patch("subprocess.run", return_value=failure):
+            with self.assertRaises(sandbox_exec.SandboxUnavailable):
+                sandbox_exec.read_bytes(
+                    "/opt/data/report.md", max_bytes=1024, config_path=self.config
+                )
+
+    def test_a_path_with_shell_metacharacters_is_quoted(self):
+        _, runner = self.read(
+            self.transferred(b"x"), path="/opt/data/$(id).md; rm -rf /"
+        )
+        remote = runner.call_args.args[0][-1]
+        self.assertNotIn("rm -rf /;", remote)
+        self.assertIn("'/opt/data/$(id).md; rm -rf /'", remote)
+
+
+def gnu_base64() -> bool:
+    """Whether the local `base64` takes `-w`, as the sandbox's GNU one does."""
+    probe = subprocess.run(["sh", "-c", "printf x | base64 -w0"],
+                           capture_output=True, text=True)
+    return probe.returncode == 0
+
+
+class ReadScriptTestCase(unittest.TestCase):
+    """The remote script's own behaviour, under a real shell.
+
+    What `read_bytes` sends is a shell program, and the defect these cover was
+    a property of that program rather than of any Python around it: a pipeline
+    takes its exit status from the *last* command, and `base64` exits 0 on the
+    empty input a failed `head` hands it. A file that vanished between the
+    readability test and the read therefore came back as a successful read of
+    zero bytes, and was delivered as the report.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        # The remote command opens with a `cd` into the workspace root, which
+        # on a real install is /opt/data. Point it somewhere that exists here,
+        # so what runs below is the whole program and not a fragment of it.
+        self.config = write_config(
+            SANDBOX_CONFIG + f"  workspace_root: {self.tmp.name}\n"
+        )
+
+    def script_for(self, path, max_bytes=1024):
+        """The program `read_bytes` would send for this path."""
+        idle = subprocess.CompletedProcess(args=["ssh"], returncode=0, stdout="")
+        with patch("subprocess.run", return_value=idle) as runner:
+            sandbox_exec.read_bytes(path, max_bytes=max_bytes,
+                                    config_path=self.config)
+        return runner.call_args.args[0][-1]
+
+    def shadow_head_with_a_failure(self):
+        """A directory to put first on PATH, where `head` exits non-zero."""
+        stub = os.path.join(self.tmp.name, "bin")
+        os.mkdir(stub)
+        head = os.path.join(stub, "head")
+        with open(head, "w", encoding="utf-8") as handle:
+            handle.write("#!/bin/sh\nexit 1\n")
+        os.chmod(head, 0o755)
+        return stub
+
+    def run_script(self, script, *, prepend_path=None):
+        env = dict(os.environ)
+        if prepend_path:
+            env["PATH"] = prepend_path + os.pathsep + env["PATH"]
+        return subprocess.run(["sh", "-c", script], capture_output=True,
+                              text=True, env=env)
+
+    def test_a_read_that_fails_partway_is_not_a_successful_empty_file(self):
+        target = os.path.join(self.tmp.name, "report.md")
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write("# findings\n")
+
+        result = self.run_script(self.script_for(target),
+                                 prepend_path=self.shadow_head_with_a_failure())
+
+        self.assertEqual(result.returncode, sandbox_exec._READ_INCOMPLETE)
+        # No marker, so even a caller that ignored the status has nothing to
+        # decode and answers None rather than b"".
+        self.assertNotIn(sandbox_exec._READ_MARKER, result.stdout)
+
+    def test_a_path_that_is_not_a_readable_file_exits_before_anything_else(self):
+        result = self.run_script(
+            self.script_for(os.path.join(self.tmp.name, "absent.md"))
+        )
+        self.assertEqual(result.returncode, sandbox_exec._READ_UNREADABLE)
+        self.assertEqual(result.stdout, "")
+
+    @unittest.skipUnless(gnu_base64(), "local base64 does not take -w0")
+    def test_the_script_a_healthy_read_sends_actually_runs(self):
+        raw = b"# findings\n\x00\xff not utf-8\n"
+        target = os.path.join(self.tmp.name, "report.md")
+        with open(target, "wb") as handle:
+            handle.write(raw)
+
+        result = self.run_script(self.script_for(target))
+
+        self.assertEqual(result.returncode, 0)
+        _, _, encoded = result.stdout.partition(sandbox_exec._READ_MARKER)
+        self.assertEqual(base64.b64decode(encoded.strip(), validate=True), raw)
+
+    @unittest.skipUnless(gnu_base64(), "local base64 does not take -w0")
+    def test_the_far_side_scratch_file_does_not_outlive_the_read(self):
+        target = os.path.join(self.tmp.name, "report.md")
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write("body")
+        scratch = os.path.join(self.tmp.name, "scratch")
+        os.mkdir(scratch)
+
+        env_script = self.script_for(target)
+        result = subprocess.run(
+            ["sh", "-c", env_script], capture_output=True, text=True,
+            env={**os.environ, "TMPDIR": scratch},
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(os.listdir(scratch), [])
 
 
 if __name__ == "__main__":

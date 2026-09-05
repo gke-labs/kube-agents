@@ -246,7 +246,11 @@ through the sandbox rather than by reading:
 - **`kanban_complete(artifacts=[...])` stats a guest path on the host.**
   `kanban_db.py` resolves each declared artifact with `pathlib` and calls `is_file()`
   in the gateway process, so a file that exists in the sandbox is reported as
-  unavailable.
+  unavailable. That is the loud half. An artifact outside the card's own workspace
+  skips the check entirely and is dropped later without a word — see
+  [`kanban_complete(artifacts=[...])` checks the file on the wrong
+  pod](#kanban_completeartifacts-checks-the-file-on-the-wrong-pod), where the quiet
+  half is now closed and the loud one is not.
 
 A fourth is a different shape, and worse, because it fails work that was
 otherwise succeeding — see [One connection under every
@@ -257,7 +261,8 @@ Three workarounds carry the design past them. The sandbox image's
 creates the working directory and recovers the two `HERMES_KANBAN_*` variables that a
 path can yield; the [skills tree is baked](#what-the-sandbox-needs-and-where-it-comes-from)
 into the image rather than left to the backend's profile-unaware sync; and workers use
-`kanban_attach` in place of declared artifacts. None of them are in Hermes source — see
+`kanban_attach` in place of an artifact declared under the card's own workspace, which
+is the part of that defect nothing on this side can reach. None of them are in Hermes source — see
 [Three problems deferred](#three-problems-deferred-and-what-has-already-been-ruled-out-for-them)
 for why the repository takes the parsing risk instead of a patch.
 
@@ -1193,7 +1198,12 @@ two different directories on two different volumes, and one rule that follows fr
 **no handoff may assume write-here-read-there.** Nothing is copied between them and
 nothing can read across, so a script that writes `/opt/data/x` in the agent pod and reads
 `/opt/data/x` through the shell gets a missing file — and, unlike before, gets it without
-the path itself looking wrong. The entrypoint writes a `.sandbox` marker into the
+the path itself looking wrong. One thing crosses, and only one: a file a finished card
+names in `artifacts` is copied sandbox-to-gateway for the length of its delivery and
+deleted after, which is
+[declared writeback](#three-problems-deferred-and-what-has-already-been-ruled-out-for-them)
+built for that one caller. Nothing crosses the other way, and nothing crosses because a path
+happened to match. The entrypoint writes a `.sandbox` marker into the
 sandbox's copy, which is how a script or a person tells which side they are on. The
 bootstrap inventory handoff is the known case; it has its own issue.
 
@@ -1447,13 +1457,32 @@ it is under the workspace root, and calling `is_file()`. All four run in the gat
 process. The file is on the sandbox, so the call fails with `declared scratch artifact
 is unavailable or not a regular file` for a file the worker can `cat` in the same turn.
 
-Nothing on this side can fix it. The validation is not a path the sandbox participates
-in — no command is sent, so there is nothing for the `ForceCommand` to repair — and the
-gateway genuinely cannot see the file, because the two pods hold separate
-ReadWriteOnce volumes. All three probes reached the same workaround unprompted:
-`kanban_attach` with the content inline, which travels through the tool call rather
-than through the filesystem. That is what a worker should use here, and the persona
-text has not been updated to say so.
+The check that raises is narrower than it first looked, and what it lets through is
+worse. `kanban_db.py` only stats an artifact it has already found to be under the card's
+workspace root; anything else is appended to the record verbatim and never opened. So
+`/opt/data/INVENTORY.md` — which is what `agents/platform/SOUL.md` tells a worker to
+declare — completes the card cleanly, reaches
+`GatewayKanbanWatchersMixin._deliver_kanban_artifacts`, is screened there with
+`os.path.isfile` in the same gateway process, and is dropped. No upload, no error, no
+notice: the card reports success and the file it named is never sent.
+
+That half is fixed, and the fix is the declared writeback the section below prefers,
+built for this one caller. `agents/platform/scripts/sandbox_artifact_patch.py` wraps the
+notifier, reads each declared path out of the sandbox over the connection that is already
+there, and hands the original method local copies to deliver — bounded at 8 MiB a file,
+16 files and 16 MiB a card, two minutes for the lot, deleted as soon as the delivery
+returns. Upstream's media-delivery denylist is applied to the path the model declared
+rather than to the staged copy, because staging rewrites every path to one under the
+system temp directory that no denylist covers. The notice the Google Chat adapter posts
+when it cannot attach a file names the path the agent wrote, not the temporary one.
+
+The half that raises is still open. Its validation is not a path the sandbox participates
+in — no command is sent, so there is nothing for the `ForceCommand` to repair, and
+nothing downstream to intercept — and the gateway genuinely cannot see the file, because
+the two pods hold separate ReadWriteOnce volumes. All three probes reached the same
+workaround unprompted: `kanban_attach` with the content inline, which travels through the
+tool call rather than through the filesystem. That is what a worker should use for an
+artifact inside its workspace, and the persona text has not been updated to say so.
 
 This is the concrete version of the open question above about whether anything needs to
 read a card's workspace after it finishes. One thing does, and it is a documented
@@ -1977,9 +2006,9 @@ rendered manifest, a diff staged for a PR — writes it on the sandbox's volume,
 and every agent-side reader looks on the gateway's. Nothing errors. The file is
 simply not there, and the failure reads as the task having produced nothing.
 
-This one has no workaround in this design and is not a defect in it: it is the
-split doing what the split does. Naming it as deferred rather than solving it
-here is deliberate, because the shape of the fix is a decision about what is
+This one has no general workaround in this design and is not a defect in it: it
+is the split doing what the split does. Naming it as deferred rather than solving
+it here is deliberate, because the shape of the fix is a decision about what is
 allowed to cross the boundary, and that is worth its own design rather than a
 mechanism chosen inside an isolation change. The options:
 
@@ -2006,11 +2035,29 @@ Re-enabling Hermes' own `sync_back` is not on the list: it is the channel
 [closed above](#the-residual-channel-sync_back), and reopening it to move a CSV
 would also reopen the write path into the agent's skills tree.
 
-Declared writeback is preferred, but a design is still owed before anything is
-built: who triggers the copy and at what point in a task's life, where the files
-land on the agent side and who cleans them up, what the size and count limits
-are, and whether the landing directory is treated as untrusted input by whatever
-reads it next.
+Declared writeback is preferred, and one caller now has it. Card delivery is the
+case that could not wait — a completed card names its files in `artifacts`, and
+those files were being dropped between the sandbox and the chat message with
+nothing said — so `sandbox_artifact_patch` answers the five questions for that
+caller and no other. The gateway's own notifier triggers the copy, after the card
+completes and before the message is sent. The files land in a per-delivery
+directory under the system temp directory, and the same wrapper deletes them in a
+`finally` as soon as the delivery returns; a sweep at install time clears any that
+a restart stranded. The limits are 8 MiB a file, 16 files and 16 MiB a card, and
+two minutes for the lot, each of them skipping what exceeds it and delivering the
+rest. And the landing directory is treated as untrusted: the paths are screened
+against upstream's media-delivery denylist before the read, applied to the path
+the model declared rather than to the staged copy, and staging refuses outright
+when strict media delivery is on, because that mode's allowlist and recency tests
+are questions about this pod that a file in the other one cannot answer.
+
+Reading that as the general answer would be a mistake. It crosses what one
+notifier was already going to deliver, at one moment in a card's life, into a
+directory nothing else reads. Every other agent-side reader still looks on the
+gateway's volume and still finds nothing, and generalising this — a tool the model
+can call to bring a file across on demand, with a landing directory that persists
+past a single delivery — is a decision about the boundary that still wants its own
+design.
 
 ### Three of the proxy's five roles move
 
@@ -2650,11 +2697,14 @@ anyway is in [The Session KV store](#the-session-kv-store).
 - **A card's scratch workspace is unreadable from the gateway, and one tool needs it.**
   The `ForceCommand` above makes a delegated card run, and it runs in the sandbox's copy
   of the workspace; the gateway's copy stays empty. `kanban_complete(artifacts=[...])`
-  is the known casualty, above — `kanban_attach` is the workaround, and the worker
-  protocol does not yet tell anyone that. Whether anything else depends on those files
-  is unenforced, and the failure mode is a card that reports success and leaves its
-  output on the wrong volume. Reclaiming the space is settled (`kanban-workspace-gc`,
-  above); getting the contents back before it runs is not.
+  is the known casualty, above — for an artifact under the workspace root it raises, and
+  `kanban_attach` is the workaround the worker protocol does not yet tell anyone about.
+  An artifact outside it is delivered now, staged across at delivery time, so the two
+  halves of one parameter behave differently depending on where the file sits. Whether
+  anything else depends on those files is unenforced, and the failure mode is a card that
+  reports success and leaves its output on the wrong volume. Reclaiming the space is
+  settled (`kanban-workspace-gc`, above); getting the contents back before it runs is
+  not.
 - **The GSA's actual scope.** The argument that a lifted token is worse than mediated use
   is strongest when the service account is broadly granted. Nobody has enumerated what
   `kubeagents-platform-gsa` can do, and that enumeration bounds how urgent this is.
