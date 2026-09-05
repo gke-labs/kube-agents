@@ -629,27 +629,16 @@ Mutation(
         "the one-line edit B3 names: 'unblock apply during upgrade window'",
     ),
     Mutation(
-        "C1-sandbox-back-in-the-broker-pod",
-        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-split-broker.yaml",
-        ("      containers:\n        - command:\n"
-         "            - /usr/local/bin/start-services\n",
-         "      containers:\n"
-         "        - image: ghcr.io/gke-labs/kube-agents/platform-agent:v9.9.9\n"
-         "          imagePullPolicy: IfNotPresent\n"
-         "          name: platform-agent\n"
-         "          securityContext:\n"
-         "            allowPrivilegeEscalation: false\n"
-         "            readOnlyRootFilesystem: true\n"
-         "            runAsUser: 10000\n"
-         "        - command:\n"
-         "            - /usr/local/bin/start-services\n"),
+        "C1-broker-colocation-flag-restored",
+        "k8s-operator/internal/controller/platformagent_manifests.go",
+        ("// buildPodTemplateSpec generates the shared PodTemplateSpec for Deployment and StatefulSet\n",
+         "// buildPodTemplateSpec generates the shared PodTemplateSpec for Deployment and StatefulSet\n"
+         "// TODO: honour splitCredentialBrokerPod again for single-node installs.\n"),
         "test_C1_the_credential_broker_is_its_own_deployment",
-        "a golden fixture regenerated after the sandbox was co-located back "
-        "into the broker Pod to share the workspace over localhost. Distinct "
-        "UIDs are kept, so every UID assertion still passes and only the "
-        "network namespace the split exists to separate is shared again. "
-        "Re-pointed after #913 retired the split-broker fixture: the assertion "
-        "moved from one flag's rendered shape to the topology itself",
+        "reintroduce a co-location switch by name. #913 made the broker's own "
+        "Deployment unconditional, so the separation is topology rather than a "
+        "setting; a flag coming back is the regression that turns it into a "
+        "setting again, and it starts life looking like a harmless TODO",
     ),
     Mutation(
         "C1-sandbox-sa-annotated-for-workload-identity",
@@ -735,7 +724,7 @@ Mutation(
     ),
     Mutation(
         "C5-tokenreview-gets-subjectaccessreviews",
-        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-split-broker.yaml",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-scoped-sa.yaml",
         ("    resources:\n      - tokenreviews\n    verbs:\n      - create\n",
          "    resources:\n      - tokenreviews\n      - subjectaccessreviews\n    verbs:\n      - create\n"),
         "test_C5_the_tokenreview_role_is_the_narrowest_form_of_itself",
@@ -745,7 +734,7 @@ Mutation(
     ),
     Mutation(
         "C5-binds-auth-delegator",
-        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-split-broker.yaml",
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-scoped-sa.yaml",
         ("roleRef:\n  apiGroup: rbac.authorization.k8s.io\n  kind: ClusterRole\n"
          "  name: kubeagents:tokenreview:kubeagents-system:platformagent",
          "roleRef:\n  apiGroup: rbac.authorization.k8s.io\n  kind: ClusterRole\n"
