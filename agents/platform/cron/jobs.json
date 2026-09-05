@@ -10,6 +10,7 @@
       },
       "prompt": "Run the daily fleet security and RBAC posture audit. Read the SOP at 'governance/compliance_audit_sop.md' in your profile home — all 413 lines of it, before you run anything. Its eleven checks are section 2, lines 107-320, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
       "skills": ["fleet-audit"],
+      "risk": "low",
       "enabled": true,
       "deliver": "chat"
     },
@@ -23,6 +24,7 @@
       },
       "prompt": "Run the daily workload reliability audit. Read the SOP at 'governance/obtainability_audit_sop.md' in your profile home — all 288 lines of it, before you run anything. Its eleven checks are section 3, lines 91-220, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
       "skills": ["fleet-audit"],
+      "risk": "low",
       "enabled": true,
       "deliver": "chat"
     },
@@ -36,6 +38,7 @@
       },
       "prompt": "Run the weekly GKE upgrade and patch readiness audit. Read the SOP at 'governance/security_patch_orchestrator_sop.md' in your profile home — all 289 lines of it, before you run anything. Its ten checks are section 3, lines 119-223, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run. This audit is read-only: never upgrade a cluster.",
       "skills": ["fleet-audit"],
+      "risk": "low",
       "enabled": true,
       "deliver": "chat"
     },
@@ -49,6 +52,7 @@
       },
       "prompt": "Run the weekly fleet waste audit. Read the SOP at 'governance/fleet_wide_cost_analysis_sop.md' in your profile home — all 268 lines of it, before you run anything. Its ten checks are section 3, lines 94-200, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run. Report findings in resource units only — you have no pricing data.",
       "skills": ["fleet-audit"],
+      "risk": "low",
       "enabled": true,
       "deliver": "chat"
     },
@@ -62,6 +66,7 @@
       },
       "prompt": "Run the weekly fleet consistency drift audit. Read the SOP at 'governance/fleet_consistency_drift_sop.md' in your profile home — all 271 lines of it, before you run anything. Its nineteen facets are section 4, lines 96-201, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run. The baseline is derived from the live fleet itself — never from an external blueprint.",
       "skills": ["fleet-audit"],
+      "risk": "low",
       "enabled": true,
       "deliver": "chat"
     },
@@ -75,6 +80,7 @@
       },
       "prompt": "Run the daily AI workload security audit. Read the SOP at 'governance/ai_security_audit_sop.md' in your profile home — all 348 lines of it, before you run anything. Its six checks are section 3, lines 153-277, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Section 2 defines which workloads count as AI workloads; on a cluster running none the six checks still ran and matched nothing, so record all six in checks_run with the collection command — never leave checks_run empty, which the validator rejects. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
       "skills": ["fleet-audit"],
+      "risk": "low",
       "enabled": true,
       "deliver": "chat"
     },
@@ -88,6 +94,7 @@
       },
       "prompt": "Run the daily fleet stockout prevention and capacity audit. Read the SOP at 'governance/stockout_prevention_sop.md' in your profile home — all 271 lines of it, before you run anything. Its twelve checks are section 3, lines 87-219, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
       "skills": ["fleet-audit"],
+      "risk": "low",
       "enabled": true,
       "deliver": "chat"
     },
@@ -101,6 +108,7 @@
       },
       "prompt": "Run the daily GCP networking fabric and VPC IPAM audit. Read the SOP at 'governance/gcp_networking_fabric_sop.md' in your profile home — all 209 lines of it, before you run anything. Its five checks are section 2, lines 38-77, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
       "skills": ["fleet-audit"],
+      "risk": "low",
       "enabled": true,
       "deliver": "all"
     },
@@ -114,6 +122,7 @@
       },
       "prompt": "Run the daily GCE Compute Engine and MIG fleet audit. Read the SOP at 'governance/gce_compute_fleet_sop.md' in your profile home — all 159 lines of it, before you run anything. Its five checks are section 2, lines 33-74, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
       "skills": ["fleet-audit"],
+      "risk": "low",
       "enabled": true,
       "deliver": "all"
     },
@@ -129,6 +138,7 @@
       "skills": [],
       "no_agent": true,
       "script": "github_scan_gate.py",
+      "risk": "high",
       "enabled": true,
       "deliver": "chat"
     },
@@ -159,6 +169,7 @@
       "skills": [],
       "no_agent": true,
       "script": "eod_report_generator.py",
+      "risk": "low",
       "enabled": true,
       "deliver": "chat"
     }

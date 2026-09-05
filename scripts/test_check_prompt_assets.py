@@ -380,6 +380,47 @@ class SyntheticProfileTests(unittest.TestCase):
         )
         self.assertEqual(["cron-asset"], self.fixture.rules())
 
+    def test_cron_job_missing_risk_is_reported(self):
+        self.fixture.write(
+            "agents/platform/cron/jobs.json",
+            '{"jobs": [{"id": "audit", "prompt": ""}]}',
+        )
+        with mock.patch.object(cpa, "REPO", self.fixture.root):
+            findings = cpa.check_cron_risk()
+        self.assertEqual(["cron-risk"], [f.rule for f in findings])
+        self.assertIn("has risk=None", findings[0].message)
+
+    def test_cron_job_with_invalid_risk_is_reported(self):
+        self.fixture.write(
+            "agents/platform/cron/jobs.json",
+            '{"jobs": [{"id": "audit", "prompt": "", "risk": "super-high"}]}',
+        )
+        with mock.patch.object(cpa, "REPO", self.fixture.root):
+            findings = cpa.check_cron_risk()
+        self.assertEqual(["cron-risk"], [f.rule for f in findings])
+        self.assertIn("has risk='super-high'", findings[0].message)
+
+    def test_cron_job_with_valid_risk_passes(self):
+        for risk in ("low", "high"):
+            with self.subTest(risk=risk):
+                self.fixture.write(
+                    "agents/platform/cron/jobs.json",
+                    f'{{"jobs": [{{"id": "audit", "prompt": "", "risk": "{risk}"}}]}}',
+                )
+                with mock.patch.object(cpa, "REPO", self.fixture.root):
+                    findings = cpa.check_cron_risk()
+                self.assertEqual([], findings)
+
+    def test_cron_job_with_medium_risk_is_reported(self):
+        self.fixture.write(
+            "agents/platform/cron/jobs.json",
+            '{"jobs": [{"id": "audit", "prompt": "", "risk": "medium"}]}',
+        )
+        with mock.patch.object(cpa, "REPO", self.fixture.root):
+            findings = cpa.check_cron_risk()
+        self.assertEqual(["cron-risk"], [f.rule for f in findings])
+        self.assertIn("has risk='medium'", findings[0].message)
+
     def test_runtime_state_paths_are_not_asset_references(self):
         self.fixture.write(
             "agents/platform/SOUL.md",
@@ -811,6 +852,7 @@ class RepositoryTests(unittest.TestCase):
                 + cpa.check_skill_refs(files, skills)
                 + cpa.check_skill_manifests(skills)
                 + cpa.check_cron_assets()
+                + cpa.check_cron_risk()
             )
         self.assertEqual([], [str(f) for f in findings])
 

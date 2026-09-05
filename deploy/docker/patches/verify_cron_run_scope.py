@@ -46,10 +46,11 @@ def main() -> int:
     import tools.cronjob_tools as ct
     import tools.kanban_tools as kt
     from agent.delegation_context import non_dispatcher_owned_context
-    from tools.cron_run_scope import cron_run_scope, current_cron_job
+    from tools.cron_run_scope import cron_run_scope, current_cron_job, current_cron_risk
 
     # --- outside a cron run: the worker keeps its ambient card --------------
     check("worker default task", kt._default_task_id(None), CALLER_CARD)
+    check("worker default risk", current_cron_risk(), "high")
     check("worker owns its card", kt._enforce_worker_task_ownership(CALLER_CARD), None)
     check(
         "worker refused a foreign card",
@@ -79,6 +80,7 @@ def main() -> int:
     # _default_task_id when it did — so this is the one place left that would
     # notice if that mechanism went away underneath us.
     with cron_run_scope(JOB_ID), non_dispatcher_owned_context():
+        check("cron run risk default", current_cron_risk(), "high")
         check("cron run has no ambient card", kt._default_task_id(None), None)
         denied = kt._enforce_worker_task_ownership(CALLER_CARD)
         check("cron run refused the caller's card", bool(denied), True)
@@ -131,6 +133,14 @@ def main() -> int:
     finally:
         sched._run_one_job_body = _real_body
     check("run_one_job forwards it to the body", forwarded.get("outcome"), {"probe": True})
+
+    target_fn = getattr(sched, "_run_one_job_body", sched.run_one_job)
+    sched_src = inspect.getsource(target_fn)
+    check(
+        f"{target_fn.__name__} wraps run_job in cron_run_scope",
+        "with cron_run_scope(" in sched_src,
+        True,
+    )
 
     # --- the run's report reaches the caller --------------------------------
     seen = {}

@@ -2,7 +2,7 @@
 """Wire tools/cron_run_scope.py into the Hermes source tree.
 
 Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. Two AST locators
-and ten anchored string replacements across three files is past the point
+and eleven anchored string replacements across three files is past the point
 where an inline ``python3 -c`` stays readable, so the edits live here — but the
 guarantee is the same as the other patches in the Dockerfile: every anchor must
 be found the number of times expected, every edited file must still parse, and
@@ -68,6 +68,47 @@ SCHEDULER_DELEGATE_PATCHED = SCHEDULER_DELEGATE + "                outcome=outco
 #: from one this has already run against, and a second pass would append a
 #: second ``outcome=None``.
 SCHEDULER_PATCHED_MARKER = 'outcome["response"] = final_response'
+
+SCHEDULER_RUN_JOB = (
+    "        _deferred_agents: list = []\n"
+    "        try:\n"
+    "            if fire_claim_lost is None:\n"
+    "                success, output, final_response, error = run_job(\n"
+    "                    job,\n"
+    "                    defer_agent_teardown=_deferred_agents,\n"
+    "                    extra_prompt=extra_prompt,\n"
+    "                )\n"
+    "            else:\n"
+    "                success, output, final_response, error = run_job(\n"
+    "                    job,\n"
+    "                    defer_agent_teardown=_deferred_agents,\n"
+    "                    extra_prompt=extra_prompt,\n"
+    "                    cancel_event=fire_claim_lost,\n"
+    "                )\n"
+)
+
+SCHEDULER_RUN_JOB_PATCHED = (
+    "        _deferred_agents: list = []\n"
+    "        try:\n"
+    "            # kube-agents patch: enter cron run & risk scope so scheduled runs\n"
+    "            # enforce risk-keyed approval gates and execute_code blocks.\n"
+    "            # See tools/cron_run_scope.py and tools/cron_risk_gate.py.\n"
+    "            from tools.cron_run_scope import cron_run_scope\n"
+    '            with cron_run_scope(job["id"], risk=str(job.get("risk") or "high")):\n'
+    "                if fire_claim_lost is None:\n"
+    "                    success, output, final_response, error = run_job(\n"
+    "                        job,\n"
+    "                        defer_agent_teardown=_deferred_agents,\n"
+    "                        extra_prompt=extra_prompt,\n"
+    "                    )\n"
+    "                else:\n"
+    "                    success, output, final_response, error = run_job(\n"
+    "                        job,\n"
+    "                        defer_agent_teardown=_deferred_agents,\n"
+    "                        extra_prompt=extra_prompt,\n"
+    "                        cancel_event=fire_claim_lost,\n"
+    "                    )\n"
+)
 
 SCHEDULER_SAVE_OUTPUT = '            output_file = save_job_output(job["id"], output)\n'
 
@@ -149,7 +190,7 @@ CRONJOB_EXECUTE_PATCHED = (
     "            # it away.\n"
     "            outcome: Dict[str, Any] = {}\n"
     "            try:\n"
-    "                with cron_run_scope(job_id):\n"
+    '                with cron_run_scope(job_id, risk=str(job.get("risk") or "high")):\n'
     "                    processed = run_one_job(\n"
     "                        job, adapters=adapters, loop=gateway_loop,\n"
     "                        extra_prompt=extra_prompt, outcome=outcome,\n"
@@ -278,10 +319,13 @@ def apply(root: Path) -> None:
         SCHEDULER_DELEGATE, SCHEDULER_DELEGATE_PATCHED, label="body delegation"
     )
     scheduler.substitute(
+        SCHEDULER_RUN_JOB, SCHEDULER_RUN_JOB_PATCHED, label="scoped run_job"
+    )
+    scheduler.substitute(
         SCHEDULER_SAVE_OUTPUT, SCHEDULER_SAVE_OUTPUT_PATCHED, label="saved output"
     )
     scheduler.substitute(SCHEDULER_TAIL, SCHEDULER_TAIL_PATCHED, label="run tail")
-    scheduler.commit("2 locators, 3 anchors")
+    scheduler.commit("2 locators, 4 anchors")
 
     cronjob = patchlib.Patch(root, "tools/cronjob_tools.py", prefix=PREFIX)
     cronjob.substitute(

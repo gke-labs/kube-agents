@@ -15,12 +15,14 @@ from pathlib import Path
 import apply_cron_run_scope
 from cron_run_scope import (
     CRON_RESPONSE_LIMIT,
+    CRON_RISK_ENV,
     CRON_RUN_ENV,
     WORKER_TASK_ENV,
     clip_cron_response,
     cron_ownership_violation,
     cron_run_scope,
     current_cron_job,
+    current_cron_risk,
     missing_task_id_error,
 )
 
@@ -37,13 +39,22 @@ class CronRunScopeTest(unittest.TestCase):
 
     def setUp(self):
         self.addCleanup(os.environ.pop, CRON_RUN_ENV, None)
+        self.addCleanup(os.environ.pop, CRON_RISK_ENV, None)
         os.environ.pop(CRON_RUN_ENV, None)
+        os.environ.pop(CRON_RISK_ENV, None)
 
     def test_the_marker_is_set_during_the_run_and_cleared_after(self):
         self.assertEqual(current_cron_job(), "")
-        with cron_run_scope(JOB_ID):
+        self.assertEqual(current_cron_risk(), "high")
+        with cron_run_scope(JOB_ID, risk="low"):
             self.assertEqual(current_cron_job(), JOB_ID)
+            self.assertEqual(current_cron_risk(), "low")
         self.assertEqual(current_cron_job(), "")
+        self.assertEqual(current_cron_risk(), "high")
+
+    def test_default_risk_is_high(self):
+        with cron_run_scope(JOB_ID):
+            self.assertEqual(current_cron_risk(), "high")
 
     def test_the_marker_is_cleared_when_the_run_raises(self):
         with self.assertRaises(RuntimeError):
@@ -296,7 +307,23 @@ def _run_one_job_body(
     execution_token=None,
 ) -> bool:
     try:
-        output = execute_job(job)
+        _deferred_agents: list = []
+        try:
+            if fire_claim_lost is None:
+                success, output, final_response, error = run_job(
+                    job,
+                    defer_agent_teardown=_deferred_agents,
+                    extra_prompt=extra_prompt,
+                )
+            else:
+                success, output, final_response, error = run_job(
+                    job,
+                    defer_agent_teardown=_deferred_agents,
+                    extra_prompt=extra_prompt,
+                    cancel_event=fire_claim_lost,
+                )
+        finally:
+            pass
         if output:
             output_file = save_job_output(job["id"], output)
         finish_execution(
@@ -418,6 +445,11 @@ class ApplierTest(unittest.TestCase):
         body = scheduler[scheduler.index("def _run_one_job_body(") :]
         self.assertIn('outcome["response"] = final_response', body)
         self.assertIn('outcome["output_file"] = str(output_file)', body)
+
+    def test_the_scoped_run_job_lands_in_the_body(self):
+        scheduler = self._apply()
+        body = scheduler[scheduler.index("def _run_one_job_body(") :]
+        self.assertIn('with cron_run_scope(job["id"], risk=str(job.get("risk") or "high")):', body)
 
     def test_a_wrapper_that_stopped_delegating_is_fatal_not_silent(self):
         """The shape that shipped the NameError: no lambda to forward through."""

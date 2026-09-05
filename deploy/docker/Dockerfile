@@ -218,7 +218,7 @@ COPY deploy/docker/patches/patchlib.py \
 # v2026.8.13 wrapped it onto three lines. The applier locates it by AST.
 RUN /opt/hermes/.venv/bin/python3 /tmp/apply_cron_run_scope.py /opt/hermes && \
     grep -qF ", outcome=None" /opt/hermes/cron/scheduler.py && \
-    grep -q "with cron_run_scope(job_id):" /opt/hermes/tools/cronjob_tools.py && \
+    grep -q "with cron_run_scope(job_id" /opt/hermes/tools/cronjob_tools.py && \
     grep -qF "extra_prompt=extra_prompt, outcome=outcome," /opt/hermes/tools/cronjob_tools.py && \
     grep -q "cron_ownership_violation(tid)" /opt/hermes/tools/kanban_tools.py && \
     grep -q 'outcome\["output_file"\] = str(output_file)' /opt/hermes/cron/scheduler.py && \
@@ -339,6 +339,20 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/apply_cron_tirith_scan.p
     grep -q "describe=_format_tirith_description" /opt/hermes/tools/approval.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/verify_cron_tirith_scan.py && \
     rm -rf /tmp/cron-tirith-scan
+
+# Security: cron risk gate, execute_code refuse, and content checks (THREAT-002).
+# Must run after cron_tirith_scan: anchors into tools/approval.py at the point
+# introduced by apply_cron_tirith_scan.py.
+COPY --chmod=0644 deploy/docker/patches/cron_risk_gate.py /opt/hermes/tools/cron_risk_gate.py
+COPY deploy/docker/patches/apply_cron_risk_gate.py \
+     deploy/docker/patches/verify_cron_risk_gate.py \
+     deploy/docker/patches/patchlib.py \
+     /tmp/cron-risk-gate/
+RUN /opt/hermes/.venv/bin/python3 /tmp/cron-risk-gate/apply_cron_risk_gate.py /opt/hermes && \
+    grep -q "from tools.cron_risk_gate import" /opt/hermes/tools/approval.py && \
+    grep -q "cron_execute_code_block" /opt/hermes/tools/approval.py && \
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/cron-risk-gate/verify_cron_risk_gate.py && \
+    rm -rf /tmp/cron-risk-gate
 
 # Cron delivery: `deliver: "chat"` hands a job's finished report to the Chat
 # Agent instead of posting it, so the finding lands in a thread that can answer

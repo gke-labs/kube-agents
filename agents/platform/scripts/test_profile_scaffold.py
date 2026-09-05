@@ -35,6 +35,7 @@ def job(job_id, **extra):
         "name": job_id.replace("-", " ").title(),
         "schedule": {"kind": "cron", "expr": "20 6 * * *"},
         "prompt": f"run {job_id}",
+        "risk": "low",
         "enabled": True,
         **extra,
     }
@@ -200,9 +201,25 @@ class CronStoreMergeTest(unittest.TestCase):
         merged = self.overlay([job("audit", deliver="chat")], [job("audit", deliver="all")])
         self.assertEqual("chat", merged[0]["deliver"])
 
+    def test_the_image_decides_the_risk_tier(self):
+        merged = self.overlay([job("audit", risk="low")], [job("audit", risk="high")])
+        self.assertEqual("low", merged[0]["risk"])
+
     def test_a_job_the_image_does_not_ship_is_kept(self):
         merged = self.overlay([job("audit")], [job("audit"), job("operator-added")])
         self.assertEqual(["audit", "operator-added"], [j["id"] for j in merged])
+
+    def test_an_unannotated_operator_job_is_backfilled_with_low_risk(self):
+        legacy = {"id": "legacy-custom", "schedule": {"kind": "cron", "expr": "* * * * *"}}
+        merged = self.overlay([job("audit")], [job("audit"), legacy])
+        custom = next(j for j in merged if j["id"] == "legacy-custom")
+        self.assertEqual("low", custom.get("risk"))
+
+    def test_an_operator_job_with_explicit_risk_is_preserved(self):
+        custom_high = {"id": "custom-high", "schedule": {"kind": "cron", "expr": "* * * * *"}, "risk": "high"}
+        merged = self.overlay([job("audit")], [job("audit"), custom_high])
+        custom = next(j for j in merged if j["id"] == "custom-high")
+        self.assertEqual("high", custom.get("risk"))
 
     def test_a_job_withdrawn_from_the_image_is_not_pruned(self):
         # The cost of the rule above, stated rather than discovered: nothing

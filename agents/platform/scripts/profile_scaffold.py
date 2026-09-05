@@ -25,6 +25,8 @@ from pathlib import Path
 # configuration, and so must be merged rather than replaced. Relative to the
 # profile home, POSIX-separated; each one needs a merge rule below.
 MERGE_PATHS: tuple[str, ...] = ("cron/jobs.json",)
+DEFAULT_LEGACY_CRON_RISK: str = "low"
+
 
 
 def make_log(prefix: str):
@@ -224,7 +226,11 @@ def merge_cron_store(
         out.append({**job, **{k: v for k, v in existing.items() if k not in job}})
 
     shipped = {str(j.get("id", "")) for j in image_jobs if isinstance(j, dict)}
-    out += [j for j in live_jobs if str(j.get("id", "")) not in shipped]
+    for j in live_jobs:
+        if str(j.get("id", "")) not in shipped:
+            if isinstance(j, dict) and "risk" not in j:
+                j["risk"] = DEFAULT_LEGACY_CRON_RISK
+            out.append(j)
     merged["jobs"] = out
     return merged
 

@@ -195,3 +195,23 @@ in production. Run it after touching anything in `../governance/`.
 No prompt is quoted here on purpose. A copy in prose is one more place for the
 same numbers to go stale, and the test above checks the roster against the SOPs
 — not this file against the roster.
+
+## `risk` tier contract
+
+Every job entry across both rosters declares an explicit `"risk": "low" | "high"`.
+The field is validated by `scripts/check_prompt_assets.py` (`check_cron_risk`) and enforced
+across pod restarts by `profile_scaffold.py::merge_cron_store` (an image-owned key).
+Unannotated jobs or unspecified dispatches default fail-closed to `"high"` at runtime
+under `cron_run_scope.py` and `cron_risk_gate.py`, while `profile_scaffold.py::merge_cron_store`
+backfills `"risk": "low"` onto unannotated volume entries during upgrade migration to preserve
+existing custom jobs.
+
+- `"low"`: Read-only governance watchdogs, audits, and internal scheduler plumbing. Runs under
+  the configured `cron_mode` (typically `approve`), protected by Tirith POSIX shell content
+  scans, terminal escape rejection, and lookalike TLD blocks.
+- `"high"`: Workloads with broad operational authority or untrusted input sources (such as
+  `github-repo-watcher`), as well as unannotated dispatches. For agentic (prompt-driven) jobs,
+  this escalates effective approval mode to `deny` under `cron_risk_gate.py`, routing commands
+  into strict pattern and policy evaluation. For `no_agent: true` jobs like `github-repo-watcher`,
+  `"high"` documents the threat posture of processing untrusted repository and issue data, while
+  command execution boundaries are enforced by dedicated script isolation rather than the agent tool gate.

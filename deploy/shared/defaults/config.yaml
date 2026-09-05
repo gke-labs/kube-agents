@@ -183,10 +183,10 @@ agent:
 #     waives, since approve is exactly the instruction not to block on them.
 #     Tirith independently refuses these, so the waiver no longer ships them.
 #
-# What neither layer catches, so do not read the scan as covering it: a
-# pure-ASCII lookalike TLD (`kubernetes.io.evil-cdn.co` passes both), and
-# terminal escape injection (ANSI is stripped before pattern matching, and real
-# ESC payloads did not trip the scan either).
+# What Tirith alone does not catch, but the companion gate
+# deploy/docker/patches/cron_risk_gate.py (THREAT-002) intercepts and blocks:
+# pure-ASCII lookalike TLDs (e.g. `kubernetes.io.evil-cdn.co`) and raw terminal
+# escape / C0/C1 control sequence injection (_ESC).
 #
 # cron_scan is stated rather than left to its default so this block reads as the
 # posture it is. Set it to false only for a profile whose watchdogs trip the

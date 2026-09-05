@@ -55,10 +55,10 @@ against the shipped image on 2026-08-08:
   the instruction not to block on a pattern. Tirith refuses them on its own
   authority, so the waiver stops shipping them.
 
-Do not over-read the coverage. A pure-ASCII lookalike TLD
-(``kubernetes.io.evil-cdn.co``) and terminal escape injection are caught by
-neither layer — ANSI is stripped before pattern matching, and real ESC payloads
-did not trip the scanner either.
+Do not over-read the coverage of this module alone. Pure-ASCII lookalike TLDs
+(``kubernetes.io.evil-cdn.co``) and raw terminal escape / C0/C1 control injection
+are caught not by Tirith, but by the companion gate ``tools/cron_risk_gate.py``
+(THREAT-002), which also blocks ``execute_code`` in unattended runs.
 
 Nor should the example be read as saying that turn is still covered here. Issue
 triage is no longer a cron turn: ``github-repo-watcher`` is a ``no_agent``
@@ -127,13 +127,12 @@ scan opt-in through a new ``cron_mode`` value would have left every
 already-written ``cron_mode: approve`` — the operator's overlay, every hand-authored
 ``AgentPlugin`` — silently unscanned, which is the state this patch exists to end.
 
-Out of scope, recorded so it is not mistaken for covered
---------------------------------------------------------
-``check_execute_code_guard`` still auto-approves ``execute_code`` under
-``cron_mode: approve``. Tirith scans POSIX shell strings (``--shell posix``);
-handing it a Python script would produce noise, not a verdict. A cron run can
-therefore still reach ``subprocess`` through ``execute_code`` without a content
-scan. Closing that needs a different scanner, not this one.
+Out of scope for this module; covered by companion gate
+------------------------------------------------------
+Tirith scans POSIX shell strings (``--shell posix``); handing it a Python
+script would produce noise, not a verdict. Closing the ``execute_code`` vector
+in unattended runs is handled by ``tools/cron_risk_gate.py`` (THREAT-002),
+which unconditionally refuses ``execute_code`` under cron approval contexts.
 """
 
 from __future__ import annotations
