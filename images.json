@@ -15,8 +15,17 @@
       "repository": "ghcr.io/gke-labs/kube-agents/credential-proxy",
       "tagPolicy": "release",
       "override": "CREDENTIAL_PROXY_IMAGE",
-      "pulledBy": "The credential-proxy sidecar in the agent pod.",
-      "description": "The platform-agent image plus the Envoy-based credential proxy runtime."
+      "pulledBy": "The credential-proxy Deployment, and the agent-api-auth sidecar in the agent pod.",
+      "description": "Envoy, the credential runtime, and the CLIs it wraps — the only image holding real credentials."
+    },
+    {
+      "name": "agent-sandbox",
+      "origin": "first-party",
+      "repository": "ghcr.io/gke-labs/kube-agents/agent-sandbox",
+      "tagPolicy": "release",
+      "override": "AGENT_SANDBOX_IMAGE",
+      "pulledBy": "The shell sandbox StatefulSet the operator renders beside every agent pod.",
+      "description": "SSH-reachable shell sandbox: Python, an SSH server, and the credential-proxy CLI wrappers, with no credentials and no path back into the agent pod."
     },
     {
       "name": "k8s-operator",
@@ -181,8 +190,8 @@
       "repository": "docker.io/library/python",
       "tag": "3.14-slim",
       "buildArg": "PYTHON_IMAGE",
-      "pulledBy": "examples/inference-replay/replay-proxy/Dockerfile.",
-      "description": "Runtime base for the replay proxy."
+      "pulledBy": "examples/inference-replay/replay-proxy/Dockerfile and deploy/sandbox/Dockerfile.",
+      "description": "Runtime base for the replay proxy, and for the agent sandbox — which needs a python3 on PATH because that is what execute_code invokes."
     },
     {
       "name": "distroless-static",

@@ -37,6 +37,7 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -76,6 +77,23 @@ const (
 	// - https://docs.cilium.io/en/stable/security/policy/layer3/
 	// - https://github.com/cilium/cilium/issues/12277 (CIDR rules don't match node IPs without --policy-cidr-match-mode=nodes)
 	metadataDaemonIP = "169.254.169.252"
+
+	// How long applyShellSandboxStatefulSet waits for an orphan-propagation
+	// delete to finish before giving the reconcile back. Orphan collection is
+	// a finalizer removal on one object, so it lands in milliseconds; the
+	// budget is for an overloaded garbage collector, not for the normal case,
+	// and expiry requeues rather than fails the recreation.
+	shellSandboxDeleteTimeout = 5 * time.Second
+	// The gap between reads while that wait runs.
+	shellSandboxDeletePollInterval = 100 * time.Millisecond
+
+	// How long applyCredentialProxyDeployment waits for its foreground delete.
+	// Longer than the sandbox's budget because this one waits on a pod to
+	// terminate and not only on a finalizer: foreground propagation holds the
+	// Deployment until the ReplicaSet and its pod are gone, and the broker has a
+	// termination grace period to serve out. Expiry requeues, so overshooting
+	// costs a reconcile rather than the recreation.
+	credentialProxyDeleteTimeout = 60 * time.Second
 
 	AnnotationAPIServerCIDR           = "kubeagents.x-k8s.io/apiserver-cidr"
 	AnnotationCustomEgressCIDRs       = "kubeagents.x-k8s.io/custom-egress-cidrs"
@@ -180,6 +198,14 @@ type PlatformAgentReconciler struct {
 // The split credential broker verifies its callers with a TokenReview. The operator has to
 // hold that permission in order to grant it; it confers no read access and cannot mint a token.
 // +kubebuilder:rbac:groups=authentication.k8s.io,resources=tokenreviews,verbs=create
+// `get` and nothing else on secrets, and checkShellSandboxKeys is the only caller. It asks
+// whether the sandbox's authorized-keys Secret exists so the status can say so; it never reads
+// a value out of one, and the operator creates that Secret nowhere. The read goes through
+// r.APIReader rather than the cached client on purpose: a cached Get of a type the manager does
+// not already watch starts a cluster-wide Secret informer, which would both hold every Secret in
+// the cluster in the operator's memory and, on any cluster where this grant is trimmed, block
+// WaitForCacheSync forever behind a forbidden LIST.
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 
 func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -282,86 +308,85 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
+	// 9b. Refuse a CR that mounts the broker's own volumes into the agent container.
+	//
+	// The guardrail reconcile before the refusal is the rule step 11e states at
+	// length: a refusal withholds the workload, and it must not also withhold a
+	// NetworkPolicy, because a policy that stops being reconciled is one an
+	// operator can delete permanently — and with nothing selecting the agent Pod,
+	// NetworkPolicy permits all egress. Read 11e for why; both refusals here are
+	// the same hazard and take the same rescue.
+	if msg := validateExtraVolumeMounts(instance); msg != "" {
+		log.Info(msg)
+		if err := r.reconcileAgentNetworkGuardrails(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
+		if statusErr := r.updateStatusDegraded(ctx, instance, "ForbiddenVolumeMount", msg); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{}, nil
+	}
+
+	// 9c. Refuse a CR that asks for the shell sandbox to be switched off.
+	//
+	// A refusal rather than a silent override: the request cannot be honoured —
+	// see validateShellSandbox — and answering it by rendering the opposite
+	// leaves an operator reading a field off the running CR that describes
+	// nothing. Returning here withholds every later step, so the agent keeps
+	// whatever it is already running rather than being half-reconfigured.
+	if reason, msg := validateShellSandbox(instance); reason != "" {
+		log.Info(msg)
+		if err := r.reconcileAgentNetworkGuardrails(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
+		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{}, nil
+	}
+
 	// 10. Validate RuntimeClass if specified
-	if err := r.validateRuntimeClass(ctx, instance); err != nil {
+	if rcName, err := r.validateRuntimeClass(ctx, instance); err != nil {
 		if errors.IsNotFound(err) {
-			rcName := *instance.Spec.Deployment.Availability.RuntimeClassName
+			// The name comes back from the check rather than being read off
+			// spec.deployment here: the sandbox has a RuntimeClass field of its
+			// own, and dereferencing the agent's would panic on a CR that names
+			// only the sandbox one.
 			msg := fmt.Sprintf("RuntimeClass '%s' is not configured in this cluster. For GKE Standard, enable GKE Sandbox by provisioning a gVisor node pool first. In GKE Autopilot, gVisor is supported automatically.", rcName)
 			log.Info(msg)
-			guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance, reasonRuntimeClassNotFound)
+			if err := r.reconcileAgentNetworkGuardrails(ctx, instance); err != nil {
+				return ctrl.Result{}, err
+			}
 			if statusErr := r.updateStatusDegraded(ctx, instance, reasonRuntimeClassNotFound, msg); statusErr != nil {
 				return ctrl.Result{}, statusErr
-			}
-			if guardrailErr != nil {
-				return ctrl.Result{}, guardrailErr
 			}
 			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 		}
 		return ctrl.Result{}, fmt.Errorf("failed to validate RuntimeClass: %w", err)
 	}
 
-	// 10b. Refuse a broker split that would strand the event watcher.
-	//
-	// Before the workload, deliberately: an operator who asked for the broker to
-	// leave the agent Pod must not get a running agent whose cluster events have
-	// silently stopped. The one refusable configuration is named in
-	// validateCredentialBrokerSplit.
-	if reason, msg := validateCredentialBrokerSplit(instance); reason != "" {
-		log.Info(msg)
-		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance, reason)
-		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg); statusErr != nil {
-			return ctrl.Result{}, statusErr
-		}
-		if guardrailErr != nil {
-			return ctrl.Result{}, guardrailErr
-		}
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-	}
-
-	// 10c. Refuse an egress policy whose layout the broker reconcile below
-	// would otherwise dismantle.
-	//
-	// Before reconcileCredentialBroker, deliberately, and the order is the
-	// finding this step answers: on the reconcile that flips
-	// splitCredentialBrokerPod off while egressPolicy is still Allowlist —
-	// the single-field edit warnSplitNeedsSharedFilesystem itself suggests —
-	// validating after the broker reconcile deletes the broker Deployment and
-	// Service first and refuses second. The refusal then withholds the
-	// workload, so the agent Deployment keeps its split shape, wired to a
-	// Service that no longer exists, every proxied command failing, and the
-	// 30-second requeue repeating the same refusal without ever putting the
-	// broker back. Refusing here leaves the broker running instead: the CR
-	// parks Degraded, the agent keeps working, and the message names the two
-	// ways out.
-	//
-	// The guardrail note on the allowlist refusal below applies here too, so
-	// this path reconciles the same two policies before returning.
-	if reason, msg := validateEgressPolicyLayout(instance); reason != "" {
-		log.Info(msg)
-		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance, reason)
-		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg); statusErr != nil {
-			return ctrl.Result{}, statusErr
-		}
-		if guardrailErr != nil {
-			return ctrl.Result{}, guardrailErr
-		}
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
-	}
-
-	// 10d. Reconcile the credential broker's own Pod, if it has one.
-	//
-	// Before the agent's workload, not after. On the reconcile that first turns
-	// the split on, the agent Deployment is re-rendered pointing at the broker
-	// Service; creating that Service afterwards leaves the restarted agent
-	// failing every proxied command with a connection refused until the next
-	// pass. The other direction is safe either way, because turning the split
-	// off deletes a broker the re-rendered agent has already stopped using —
-	// step 10c has already refused the one shape where it has not.
-	if err := r.reconcileCredentialBroker(ctx, instance, proxyPolicyHash); err != nil {
+	// 10b. Reconcile the shell sandbox before the credential proxy, and both before
+	// the workload that connects to them. Neither client blocks on the proxy — the
+	// wrapped CLIs report it unavailable and the chat relay retries its poll — but
+	// on a first install this order means the sandbox's ServiceAccount exists
+	// before the broker starts authenticating callers against it.
+	if err := r.reconcileShellSandbox(ctx, instance, settingsHash); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// 10e. Refuse an allowlist destination the policy will not render.
+	// 10c. Grant the broker the one verb it needs to authenticate its callers,
+	// before anything that runs it.
+	if err := r.reconcileCredentialBrokerTokenReviewRBAC(ctx, instance); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 11. Reconcile the credential proxy: its own Deployment, its Service and the
+	// NetworkPolicy narrowing who may reach it.
+	if err := r.reconcileCredentialProxy(ctx, instance, proxyPolicyHash); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	// 11e. Refuse an allowlist destination the policy will not render.
 	//
 	// Immediately before the workload, deliberately: an operator who asked for
 	// the agent Pod to be denied the metadata server must not get a running
@@ -375,30 +400,29 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// it must not withhold is a guardrail, and the agent Pod has two:
 		// <name>-gateway-netpol, which is reconciled below in the normal path
 		// and so is reconciled here as well, and <name>-sandbox-metadata-deny,
-		// which step 11b renders.
+		// which step 12b renders.
 		//
 		// Both have to survive a refusal for the same reason. An operator
 		// triaging an EgressAllowlistRefused who deletes them gets neither back
 		// until the spec is fixed, and with nothing selecting the agent Pod
 		// NetworkPolicy permits all egress — so the outcome is wide-open egress
 		// behind a Degraded status that names only the allowlist. The gateway
-		// policy is unconditional because it has nothing to do with any
+		// policy is unconditional because it has nothing to do with either
 		// refusal; it is the Pod's baseline and it predates this field.
 		//
-		// All refusal paths above (steps 10, 10b, 10c, 10e) maintain the gateway
-		// NetworkPolicy, and maintain the egress default-deny guardrail whenever
-		// the egress policy layout is valid (split broker enabled).
-		guardrailErr := r.reconcileAgentNetworkGuardrails(ctx, instance, reason)
+		// Steps 9b, 9c, and 10 take the same rescue for the same reason: all
+		// refusal paths maintain the agent Pod's network guardrails before
+		// returning.
+		if err := r.reconcileAgentNetworkGuardrails(ctx, instance); err != nil {
+			return ctrl.Result{}, err
+		}
 		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg); statusErr != nil {
 			return ctrl.Result{}, statusErr
-		}
-		if guardrailErr != nil {
-			return ctrl.Result{}, guardrailErr
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 
-	// 11. Reconcile the Agent Sandbox Pod with its Envoy credential sidecar.
+	// 12. Reconcile the Agent Sandbox Pod with its Envoy credential sidecar.
 	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, instance)
 	otlpDisabled := otlpSource == otlpSourceNone
 	netpolProf := r.resolveNetpolProfile(ctx, instance)
@@ -406,7 +430,7 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, err
 	}
 
-	// 11b. Reconcile the agent Pod's default-deny egress policy, if it has one.
+	// 12b. Reconcile the agent Pod's default-deny egress policy, if it has one.
 	if err := r.reconcileAgentEgressPolicy(ctx, instance, r.agentEgressDNSClusterIPs(ctx, instance, netpolProf)); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -440,6 +464,25 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
+	// 13. Report an install whose sandbox keypair was never generated.
+	//
+	// Last, below every reconcile step, because unlike the refusals above it this
+	// one withholds nothing: everything is already applied, and the StatefulSet is
+	// wanted in place so the pod starts on its own the moment the Secret appears.
+	// What is withheld is the Ready status, which would otherwise be the only
+	// thing an operator sees while no command the agent runs can execute.
+	//
+	// Requeued rather than watched. Secrets are not in this controller's watch
+	// set, and adding them for one check would wake every reconcile on every
+	// Secret write in the namespace.
+	if reason, msg := r.checkShellSandboxKeys(ctx, instance); reason != "" {
+		log.Info(msg)
+		if statusErr := r.updateStatusDegraded(ctx, instance, reason, msg); statusErr != nil {
+			return ctrl.Result{}, statusErr
+		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+
 	phase, err := r.updateStatusReady(ctx, instance, otlpEndpoint, otlpSource, netpolProf)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -980,8 +1023,11 @@ func (r *PlatformAgentReconciler) reconcileWorkload(ctx context.Context, agent *
 // running would leave a second, unreconciled copy of the agent alive.
 //
 // The <name>-credential-proxy Deployment and Service used to be on this list.
-// They are not legacy any more — they are what reconcileCredentialBroker
-// renders when the split is enabled, and it owns them in both directions.
+// They are not legacy any more — they carry the same names again, and
+// reconcileCredentialProxy applies them on every pass. Leaving them here
+// deleted the object the reconcile had just applied, every pass.
+// credentialProxySelector reproduces the pre-#368 labels so those objects are
+// adopted rather than orphaned.
 //
 // It also deliberately does NOT touch the <name>-sandbox-metadata-deny
 // NetworkPolicy. That object is a guardrail, not a workload: it denies the
@@ -1023,43 +1069,302 @@ func (r *PlatformAgentReconciler) deleteLegacyCredentialIsolationResources(ctx c
 	return nil
 }
 
-// reconcileCredentialBroker renders, or removes, the broker's own Pod.
+// reconcileShellSandbox creates or removes the agent's shell sandbox — the pod its
+// terminal, file and code-execution tools run in when the ssh backend is on. The
+// manifests and the reasoning behind them are in shell_sandbox_manifests.go.
 //
-// It owns <name>-credential-proxy in both directions: applied when
-// spec.security.splitCredentialBrokerPod is true, deleted when it is false, so
-// that turning the gate back off does not leave a second broker running against
-// the same workspace. That is cleanup of this controller's own workload, not the
-// removal of a guardrail it did not create — see
-// deleteLegacyCredentialIsolationResources.
-func (r *PlatformAgentReconciler) reconcileCredentialBroker(ctx context.Context, agent *agentv1alpha1.PlatformAgent, policyHash string) error {
-	log := logf.FromContext(ctx)
-	tokenReviewName := fmt.Sprintf("kubeagents:tokenreview:%s:%s", agent.Namespace, agent.Name)
+// There is no off path. Every agent gets a sandbox, because every command the
+// agent runs executes there — see validateShellSandbox for why the CR cannot ask
+// for anything else.
+//
+// The credential proxy is never a container of this StatefulSet, so what the
+// sandbox is handed is the broker's Service URL. credentialProxySandboxURL is
+// the one place that decides, and credential_proxy_manifests.go carries the
+// reasoning.
+func (r *PlatformAgentReconciler) reconcileShellSandbox(ctx context.Context, agent *agentv1alpha1.PlatformAgent, settingsHash string) error {
+	// Before the StatefulSet, because an install that predates agentDataStorageSize
+	// has a claim the template can no longer resize.
+	r.growShellSandboxDataClaim(ctx, agent)
 
-	if !credentialBrokerIsSplit(agent) {
-		owned := []client.Object{
-			&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: credentialBrokerName(agent), Namespace: agent.Namespace}},
-			&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: credentialBrokerName(agent), Namespace: agent.Namespace}},
+	sts := buildShellSandboxStatefulSet(agent, shellSandboxAuthorizedKeysSecretName(agent), credentialProxySandboxURL(agent), settingsHash)
+	objs := []client.Object{
+		buildShellSandboxServiceAccount(agent),
+		buildShellSandboxService(agent),
+		sts,
+		buildShellSandboxNetworkPolicy(agent, r.shellSandboxDNSClusterIPs(ctx, agent)),
+	}
+	for _, obj := range objs {
+		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
+			return fmt.Errorf("failed to set controller reference on shell sandbox %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
 		}
-		for _, object := range owned {
-			if err := r.deleteIfOwned(ctx, agent, object); err != nil {
-				return err
-			}
+		apply := r.applyManaged
+		if obj == sts {
+			apply = r.applyShellSandboxStatefulSet
 		}
-		for _, object := range []client.Object{
-			&rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: tokenReviewName}},
-			&rbacv1.ClusterRole{ObjectMeta: metav1.ObjectMeta{Name: tokenReviewName}},
-		} {
-			if err := r.deleteIfManaged(ctx, object); err != nil {
-				return err
-			}
+		if err := apply(ctx, agent, obj); err != nil {
+			return fmt.Errorf("failed to apply shell sandbox %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
 		}
-		return nil
+	}
+	return nil
+}
+
+// shellSandboxDNSClusterIPs is the resolved cluster DNS VIP list for the sandbox
+// policy's DNS rule.
+//
+// Always ungated, unlike agentEgressDNSClusterIPs, which reads the profile first.
+// The sandbox policy renders on every reconcile — spec.networkPolicy.enabled
+// withholds the gateway policy and nothing else — so a profile that returned early
+// because that flag is false would hand this rule an empty list and pin it to the
+// fallback VIP, silently discarding the documented dnsClusterIPs override on the
+// one policy that is still enforcing. The flag gates the gateway policy, not DNS
+// resolution.
+//
+// The nil check below is not shared with agentEgressDNSClusterIPs: that one reaches
+// its copy only on a path where spec.networkPolicy is provably set, while this runs
+// on every reconcile, including the common CR that omits the block entirely.
+func (r *PlatformAgentReconciler) shellSandboxDNSClusterIPs(ctx context.Context, agent *agentv1alpha1.PlatformAgent) []string {
+	if agent.Spec.NetworkPolicy == nil || agent.Spec.NetworkPolicy.Enabled == nil {
+		return r.resolveNetpolProfile(ctx, agent).DNSClusterIPs
+	}
+	ungated := agent.DeepCopy()
+	ungated.Spec.NetworkPolicy.Enabled = nil
+	return r.resolveNetpolProfile(ctx, ungated).DNSClusterIPs
+}
+
+// growShellSandboxDataClaim widens the sandbox's data claim to match the agent's.
+//
+// A StatefulSet's volumeClaimTemplate sizes only the claims it creates, so an
+// install from before agentDataStorageSize keeps the 5Gi it was given however the
+// template changes — and that claim is the destination sandbox_mirror.py copies
+// the agent's working directories into. Expansion is online; the volume stays
+// mounted and the shell keeps running.
+//
+// Best-effort and logged rather than returned. A StorageClass without
+// allowVolumeExpansion is how an administrator configured the cluster, and
+// failing the reconcile over it would take the whole agent down to fix a volume
+// that is merely smaller than we would like. The mirror already refuses to fill
+// the volume it is given, so the consequence is a bounded migration, not a broken
+// one.
+func (r *PlatformAgentReconciler) growShellSandboxDataClaim(ctx context.Context, agent *agentv1alpha1.PlatformAgent) {
+	log := logf.FromContext(ctx)
+	want := resource.MustParse(agentDataStorageSize)
+
+	name := shellSandboxDataClaimName(agent)
+	pvc := &corev1.PersistentVolumeClaim{}
+	if err := r.Get(ctx, client.ObjectKey{Name: name, Namespace: agent.Namespace}, pvc); err != nil {
+		// Not created yet on a first install: the template sizes it correctly.
+		if client.IgnoreNotFound(err) != nil {
+			log.Error(err, "could not read the sandbox data claim", "claim", name)
+		}
+		return
 	}
 
-	r.warnSplitNeedsSharedFilesystem(ctx, agent)
+	have := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+	if have.Cmp(want) >= 0 {
+		return
+	}
 
-	// The broker verifies its callers with a TokenReview, which needs one verb
-	// on one virtual resource and grants no read access to anything.
+	patched := pvc.DeepCopy()
+	patched.Spec.Resources.Requests[corev1.ResourceStorage] = want
+	if err := r.Patch(ctx, patched, client.MergeFrom(pvc)); err != nil {
+		log.Error(err, "could not grow the sandbox data claim; migration into it stays bounded by the space that is there",
+			"claim", name, "have", have.String(), "want", want.String())
+		return
+	}
+	log.Info("grew the sandbox data claim to match the agent's",
+		"claim", name, "from", have.String(), "to", want.String())
+}
+
+// applyShellSandboxStatefulSet applies the StatefulSet, recreating it when the
+// API server refuses the update.
+//
+// Only replicas, ordinals, template, updateStrategy,
+// persistentVolumeClaimRetentionPolicy and minReadySeconds are mutable on a
+// StatefulSet. Any change to volumeClaimTemplates therefore comes back 422
+// Invalid, which without this would error-loop the reconcile on every install
+// that already has a sandbox — and take the rest of the agent's reconcile with
+// it. Deleting with Orphan propagation leaves the pod and its claims running and
+// the replacement adopts the pod by selector, so the shell stays up across the
+// swap and the sandbox's disk is never at risk. awaitStatefulSetGone is what
+// makes the re-apply a creation rather than another update of the object that
+// is on its way out.
+func (r *PlatformAgentReconciler) applyShellSandboxStatefulSet(ctx context.Context, agent *agentv1alpha1.PlatformAgent, obj client.Object) error {
+	err := r.applyManaged(ctx, agent, obj)
+	if !errors.IsInvalid(err) {
+		return err
+	}
+
+	log := logf.FromContext(ctx)
+	log.Info("the sandbox StatefulSet needs an immutable field changed; recreating it with the pod left running",
+		"statefulset", obj.GetName(), "reason", err.Error())
+
+	orphan := metav1.DeletePropagationOrphan
+	existing := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: obj.GetName(), Namespace: obj.GetNamespace()},
+	}
+	if delErr := r.Delete(ctx, existing, &client.DeleteOptions{PropagationPolicy: &orphan}); client.IgnoreNotFound(delErr) != nil {
+		return fmt.Errorf("failed to delete the sandbox StatefulSet for recreation: %w", delErr)
+	}
+	if err := r.awaitStatefulSetGone(ctx, client.ObjectKeyFromObject(obj)); err != nil {
+		return err
+	}
+	return r.applyManaged(ctx, agent, obj)
+}
+
+// awaitStatefulSetGone blocks until a deleted StatefulSet has left the API
+// server, or the budget above runs out.
+//
+// Delete returns once the object is marked, not once it is gone: orphan
+// propagation puts the `orphan` finalizer on it and the garbage collector
+// clears the ownerReferences off the pod and the claims before removing that
+// finalizer. Applying the replacement inside that window addresses the object
+// that is still terminating, so it is validated against the immutable fields
+// the recreation exists to change and comes back Invalid a second time — and on
+// the runs where it does not, the collector deletes what the apply just wrote
+// and the agent has no sandbox until some later reconcile happens to find the
+// name free.
+//
+// Running out of budget is not a failure of the recreation, only of doing it in
+// this pass: the error requeues, the delete has already been accepted, and the
+// next reconcile finds the name free and applies. Say that in the message, so
+// the log line does not read as an agent stuck without a shell.
+func (r *PlatformAgentReconciler) awaitStatefulSetGone(ctx context.Context, key client.ObjectKey) error {
+	deadline := time.Now().Add(shellSandboxDeleteTimeout)
+	for {
+		err := r.Get(ctx, key, &appsv1.StatefulSet{})
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("failed to read the sandbox StatefulSet %s/%s while waiting for its deletion: %w", key.Namespace, key.Name, err)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("the sandbox StatefulSet %s/%s is still terminating %s after it was deleted for recreation; retrying on the next reconcile", key.Namespace, key.Name, shellSandboxDeleteTimeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(shellSandboxDeletePollInterval):
+		}
+	}
+}
+
+// reconcileCredentialProxy creates the broker's own pod: the Deployment that runs
+// it, the Service its callers reach it through, and the NetworkPolicy that
+// narrows who may connect.
+//
+// One placement, so there is nothing to swing. The gateway's chat relay clients
+// and the sandbox's wrapped CLIs both dial the Service, and neither has any
+// business knowing where the relays run. credential_proxy_manifests.go carries
+// the reasoning for why the pod is its own.
+func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, policyHash string) error {
+	objs := []client.Object{
+		buildCredentialProxyService(agent),
+		buildCredentialProxyDeployment(agent, policyHash),
+		buildCredentialProxyNetworkPolicy(agent),
+	}
+	for _, obj := range objs {
+		if err := ctrl.SetControllerReference(agent, obj, r.Scheme); err != nil {
+			return fmt.Errorf("failed to set controller reference on credential proxy %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
+		}
+		apply := r.applyManaged
+		if _, isDeployment := obj.(*appsv1.Deployment); isDeployment {
+			apply = r.applyCredentialProxyDeployment
+		}
+		if err := apply(ctx, agent, obj); err != nil {
+			return fmt.Errorf("failed to apply credential proxy %T %s/%s: %w", obj, obj.GetNamespace(), obj.GetName(), err)
+		}
+	}
+	return nil
+}
+
+// applyCredentialProxyDeployment applies the broker's Deployment, recreating it
+// when the API server refuses the update.
+//
+// spec.selector is immutable on a Deployment, and this Deployment's selector
+// changed. An install that ran the broker in its own pod before this PR — the
+// old splitCredentialBrokerPod field — matched on `app` alone; the selector now
+// also carries kubeagents.x-k8s.io/component=credential-proxy. Without this the
+// apply comes back 422 Invalid on every reconcile, forever, and takes the rest
+// of the agent's reconcile with it: the Service has already been applied by
+// then, so its endpoints are empty, every credentialed command fails, and the CR
+// still reads Ready because the status update is never reached.
+//
+// Foreground propagation rather than the Orphan the StatefulSet uses. Orphaning
+// works there because the replacement adopts the running pod by selector; here
+// the selector is the thing that changed and the new labels are not a superset,
+// so nothing would ever adopt the old pod. It would sit in the namespace
+// unowned, unreferenced by the Service, and still mounting the broker's
+// credentials. Deleting it costs the outage that the label change makes
+// unavoidable, and the outage is bounded by one pod start.
+func (r *PlatformAgentReconciler) applyCredentialProxyDeployment(ctx context.Context, agent *agentv1alpha1.PlatformAgent, obj client.Object) error {
+	err := r.applyManaged(ctx, agent, obj)
+	if !errors.IsInvalid(err) {
+		return err
+	}
+
+	log := logf.FromContext(ctx)
+	log.Info("the credential broker Deployment needs an immutable field changed; recreating it",
+		"deployment", obj.GetName(), "reason", err.Error())
+
+	foreground := metav1.DeletePropagationForeground
+	existing := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: obj.GetName(), Namespace: obj.GetNamespace()},
+	}
+	if delErr := r.Delete(ctx, existing, &client.DeleteOptions{PropagationPolicy: &foreground}); client.IgnoreNotFound(delErr) != nil {
+		return fmt.Errorf("failed to delete the credential broker Deployment for recreation: %w", delErr)
+	}
+	if err := r.awaitCredentialProxyDeploymentGone(ctx, client.ObjectKeyFromObject(obj)); err != nil {
+		return err
+	}
+	return r.applyManaged(ctx, agent, obj)
+}
+
+// awaitCredentialProxyDeploymentGone blocks until the deleted Deployment has left
+// the API server, or the budget runs out.
+//
+// Same reason as awaitStatefulSetGone: Delete returns once the object is marked,
+// and an apply issued inside that window addresses the object that is still
+// terminating, so it is validated against the immutable field the recreation
+// exists to change and comes back Invalid a second time. Running out of budget
+// requeues — the delete has been accepted, and the next reconcile finds the name
+// free.
+func (r *PlatformAgentReconciler) awaitCredentialProxyDeploymentGone(ctx context.Context, key client.ObjectKey) error {
+	deadline := time.Now().Add(credentialProxyDeleteTimeout)
+	for {
+		err := r.Get(ctx, key, &appsv1.Deployment{})
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("failed to read the credential broker Deployment %s/%s while waiting for its deletion: %w", key.Namespace, key.Name, err)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("the credential broker Deployment %s/%s is still terminating %s after it was deleted for recreation; retrying on the next reconcile", key.Namespace, key.Name, credentialProxyDeleteTimeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(shellSandboxDeletePollInterval):
+		}
+	}
+}
+
+// reconcileCredentialBrokerTokenReviewRBAC applies, or removes, the one verb the
+// broker needs to authenticate the callers it can no longer take on trust.
+//
+// Unconditional, because the broker is always off the agent's Pod: it stops
+// treating loopback as the control and reviews every bearer token it is handed.
+// This shipped once gated on a field an install could leave unset, and an
+// install that left it unset got a runtime asking the API server a question it
+// had no permission to ask. The TokenReview came back 403, which the
+// authenticator correctly treats as a rejection rather than an allow, and every
+// credentialed command in the sandbox failed with a 401 about the caller
+// instead of a message about the missing rule.
+func (r *PlatformAgentReconciler) reconcileCredentialBrokerTokenReviewRBAC(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	tokenReviewName := fmt.Sprintf("kubeagents:tokenreview:%s:%s", agent.Namespace, agent.Name)
+
+	// One verb on one virtual resource, which grants no read access to anything.
 	role := buildCredentialBrokerTokenReviewRole(agent)
 	if err := r.applyManaged(ctx, agent, role); err != nil {
 		return fmt.Errorf("failed to reconcile credential broker TokenReview ClusterRole: %w", err)
@@ -1068,77 +1373,7 @@ func (r *PlatformAgentReconciler) reconcileCredentialBroker(ctx context.Context,
 	if err := r.applyManaged(ctx, agent, binding); err != nil {
 		return fmt.Errorf("failed to reconcile credential broker TokenReview ClusterRoleBinding: %w", err)
 	}
-
-	homeDir := defaultAgentHome
-	if h := agent.Spec.Harness; h != nil && h.Hermes != nil && h.Hermes.AgentHome != "" {
-		homeDir = h.Hermes.AgentHome
-	}
-	deployment := buildCredentialBrokerDeployment(agent, policyHash, homeDir)
-	if err := ctrl.SetControllerReference(agent, deployment, r.Scheme); err != nil {
-		return err
-	}
-	if err := r.applyManaged(ctx, agent, deployment); err != nil {
-		return fmt.Errorf("failed to reconcile credential broker Deployment: %w", err)
-	}
-
-	service := buildCredentialBrokerService(agent)
-	if err := ctrl.SetControllerReference(agent, service, r.Scheme); err != nil {
-		return err
-	}
-	if err := r.applyManaged(ctx, agent, service); err != nil {
-		return fmt.Errorf("failed to reconcile credential broker Service: %w", err)
-	}
-
-	log.Info("credential broker runs in its own Pod",
-		"deployment", deployment.Name, "service", service.Name)
 	return nil
-}
-
-// warnSplitNeedsSharedFilesystem says so, loudly, when the split is enabled
-// while the two Pods cannot see the same files.
-//
-// The broker runs proxied commands with a working directory the agent created
-// on this volume, so today both Pods have to mount it read-write at the same
-// path. A ReadWriteOnce claim cannot do that across nodes: the broker Pod stays
-// Pending with a Multi-Attach error and never becomes a Service endpoint, so
-// the agent sees a connection refused on every command. The containment check
-// in the broker does not catch it either — it is lexical, both Pods are
-// configured with the same workspace root, so the path always looks right and
-// what is missing is the data behind it.
-//
-// The access mode is what this reads, because it is the one signal available.
-// It is not a product requirement, and the fix is not to go and buy a
-// ReadWriteMany volume — that is one way to satisfy today's design and an
-// operator may pick it, but the managed options bill on provisioned capacity
-// with a floor far above what a workspace needs. The supported answer is to
-// leave the split off until the broker owns the workspace on a volume of its
-// own and takes content rather than a directory, a separate change that
-// removes the coupling entirely. Co-scheduling both Pods on one node is
-// not the answer: it deadlocks the next rolling update on the volume and makes
-// the two Pods a single failure domain.
-//
-// A log line rather than a Degraded status, because unlike the event-watcher
-// refusal there is nothing the operator can set to make this correct — the
-// access mode of an existing claim cannot be changed in place, and refusing to
-// reconcile would not help them.
-func (r *PlatformAgentReconciler) warnSplitNeedsSharedFilesystem(ctx context.Context, agent *agentv1alpha1.PlatformAgent) {
-	log := logf.FromContext(ctx)
-	pvc := &corev1.PersistentVolumeClaim{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: agent.Name + "-data"}, pvc); err != nil {
-		return
-	}
-	if slices.Contains(pvc.Spec.AccessModes, corev1.ReadWriteMany) {
-		return
-	}
-	log.Info("WARNING: splitCredentialBrokerPod is enabled, and the agent Pod and the broker Pod cannot see the "+
-		"same files: the broker runs proxied commands in a directory the agent created on this claim, and its "+
-		"access mode does not let both Pods mount it read-write at once. The broker Pod will stay Pending with a "+
-		"Multi-Attach error and every proxied command will report the credential proxy as unavailable. Turn the "+
-		"split off. A ReadWriteMany claim also satisfies today's design and is a choice available to you, but it "+
-		"is not what this product asks for; the supported path is to wait for the broker to own the workspace and "+
-		"take content rather than a directory. Do not co-schedule the two Pods to work around this — it deadlocks "+
-		"the next rolling update on the volume.",
-		"claim", pvc.Name, "accessModes", pvc.Spec.AccessModes)
 }
 
 // deleteIfOwned removes a namespaced object this controller created, refusing
@@ -1170,93 +1405,31 @@ const (
 	// reasonRuntimeClassNotFound indicates that the requested RuntimeClass was not found in the cluster.
 	reasonRuntimeClassNotFound = "RuntimeClassNotFound"
 
-	// reasonEgressPolicyRequiresSplitBroker refuses the layout: the policy
-	// cannot be rendered at all, because it would govern the credential broker
-	// sharing the Pod.
-	reasonEgressPolicyRequiresSplitBroker = "EgressPolicyRequiresSplitBroker"
-
-	// reasonEgressAllowlistRefused refuses the contents: the policy is fine and
-	// still gets rendered, minus the destinations that were refused.
+	// reasonEgressAllowlistRefused refuses the contents of an egress policy: the
+	// policy is fine and still gets rendered, minus the destinations that were
+	// refused.
 	reasonEgressAllowlistRefused = "EgressAllowlistRefused"
 )
-
-// refusalStillRendersTheGuardrail reports whether the egress policy should be
-// reconciled despite the agent's spec being refused.
-//
-// The distinction is between refusing a layout and refusing a value or another
-// subsystem. Refusing the layout (EgressPolicyRequiresSplitBroker) means the
-// policy cannot be rendered at all because the broker is not split and would
-// lose the metadata server. Refusing a value (EgressAllowlistRefused), or
-// refusing another spec field (RuntimeClassNotFound, SplitBrokerStrandsEventWatcher)
-// when the egress policy layout is valid (split broker enabled), leaves a
-// valid policy to render — and withholding it would mean an unrelated or
-// value mistake silently removes the egress guardrail.
-func refusalStillRendersTheGuardrail(agent *agentv1alpha1.PlatformAgent, reason string) bool {
-	if reason == reasonEgressPolicyRequiresSplitBroker {
-		return false
-	}
-	layoutReason, _ := validateEgressPolicyLayout(agent)
-	return layoutReason == ""
-}
 
 // validateEgressPolicy returns a Degraded reason and message when
 // spec.security.egressPolicy asks for something the operator cannot honestly
 // render, or "" when it can.
 //
-// There are two such cases.
+// One case: an operator-supplied destination the policy refuses to render. The
+// builder drops those rather than narrowing them, and a silently dropped rule
+// is its own failure — an operator who added a rule to restore GitHub would get
+// a Ready agent, an unreachable github.com, and nothing in kubectl describe to
+// connect the two. So the refusal is surfaced here rather than left in a log
+// line the operator has no reason to read.
 //
-// The first, and the important one: the rendered policy denies the agent Pod
-// the link-local metadata server by not listing it, and a NetworkPolicy selects
-// Pods, never containers. With the credential broker still a sidecar the two
-// share a network namespace, so the same policy governs both — and the broker
-// reaches the metadata server on purpose, because minting the cloud token is
-// its entire job. Rendering it there would take the agent's credentials away
-// and every proxied command would fail.
-//
-// The second: an operator-supplied destination the policy refuses to render.
-// The builder drops those rather than narrowing them, and a silently dropped
-// rule is its own failure — an operator who added a rule to restore GitHub
-// would get a Ready agent, an unreachable github.com, and nothing in
-// kubectl describe to connect the two. So the refusal is surfaced here rather
-// than left in a log line the operator has no reason to read.
-//
-// The alternative to refusing was to render anyway and let the operator find
-// out, or to render and quietly permit the metadata server so nothing breaks.
-// The second is worse than doing nothing: it is a control that appears on
-// kubectl get netpol and protects nothing.
+// There used to be a second, and it is worth knowing why it is gone: the policy
+// denies the agent Pod the link-local metadata server, a NetworkPolicy selects
+// Pods rather than containers, and a broker sharing the Pod would have lost the
+// metadata server with it. The broker is now always in a Pod of its own, so the
+// combination the refusal named cannot be expressed.
 func validateEgressPolicy(agent *agentv1alpha1.PlatformAgent) (string, string) {
-	if reason, msg := validateEgressPolicyLayout(agent); reason != "" {
-		return reason, msg
-	}
 	return validateEgressAllowlist(agent)
 }
-
-// validateEgressPolicyLayout is the first case alone. Reconcile checks it
-// before reconcileCredentialBroker rather than with the allowlist check below,
-// because on the reconcile that flips splitCredentialBrokerPod off under a
-// live egressPolicy the broker teardown is the mutation this refusal exists to
-// stop — validated afterwards, the refusal arrives one step too late: the
-// broker Deployment and Service are already deleted, the refusal withholds the
-// workload, and the running agent is left wired to a Service that no longer
-// exists with nothing on the requeue path that puts it back.
-func validateEgressPolicyLayout(agent *agentv1alpha1.PlatformAgent) (string, string) {
-	if !agentEgressPolicyEnabled(agent) {
-		return "", ""
-	}
-	if !credentialBrokerIsSplit(agent) {
-		return reasonEgressPolicyRequiresSplitBroker, "spec.security.egressPolicy: Allowlist requires " +
-			"spec.security.splitCredentialBrokerPod: true. The policy denies the agent Pod the link-local " +
-			"metadata server, and a NetworkPolicy cannot tell two containers in one Pod apart — with the " +
-			"credential broker still a sidecar it would lose the metadata server too, and minting the cloud " +
-			"token there is what the broker is for. Enable the split or set egressPolicy: None and accept " +
-			"that the agent can reach the metadata server."
-	}
-	return "", ""
-}
-
-// validateEgressAllowlist is the second case alone. It stays below
-// reconcileCredentialBroker in Reconcile, deliberately: a refusal about one
-// destination should not stop the broker being reconciled.
 func validateEgressAllowlist(agent *agentv1alpha1.PlatformAgent) (string, string) {
 	if !agentEgressPolicyEnabled(agent) {
 		return "", ""
@@ -1273,32 +1446,25 @@ func validateEgressAllowlist(agent *agentv1alpha1.PlatformAgent) (string, string
 }
 
 // reconcileAgentNetworkGuardrails keeps the agent Pod's NetworkPolicies
-// maintained on a reconcile that is about to bail out over a spec refusal.
+// maintained on a reconcile that is about to bail out over its egress spec.
 //
 // A refusal withholds the workload. It must not also withhold a guardrail,
 // because a guardrail that stops being reconciled is a guardrail an operator
 // can delete permanently — and deleting every policy that selects the agent
 // Pod does not leave it restricted, it leaves NetworkPolicy permitting all
 // egress. That the CR reads Degraded at the time makes it worse rather than
-// better: the status names a refusal reason while the Pod's egress is wide open.
+// better: the status names one bad CIDR while the Pod's egress is wide open.
 //
-// <name>-gateway-netpol is reconciled unconditionally across all refusal paths
-// (steps 10, 10b, 10c, 10e). It is the Pod's baseline policy, it predates
-// spec.security.egressPolicy, and no refusal is an objection to it.
-// <name>-sandbox-metadata-deny is reconciled when refusalStillRendersTheGuardrail
-// says so — whenever spec.security.egressPolicy is enabled and the credential
-// broker is split (steps 10, 10b, 10e). Step 10c (EgressPolicyRequiresSplitBroker)
-// is the sole case where rendering it is withheld, because an unsplit broker
-// shares the agent Pod's network namespace and rendering the metadata deny policy
-// would deny the broker its cloud token credentials.
-func (r *PlatformAgentReconciler) reconcileAgentNetworkGuardrails(ctx context.Context, agent *agentv1alpha1.PlatformAgent, reason string) error {
+// Both policies are reconciled whatever the refusal was (steps 9b, 9c, 10, 11e).
+// <name>-gateway-netpol is the Pod's baseline, it predates spec.security.egressPolicy,
+// and no refusal is an objection to it; <name>-sandbox-metadata-deny is the refused policy
+// itself, and the builder has already dropped the offending destination, so
+// what is left to render is a good policy minus one rule.
+func (r *PlatformAgentReconciler) reconcileAgentNetworkGuardrails(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, agent)
 	netpolProf := r.resolveNetpolProfile(ctx, agent)
 	if err := r.reconcileNetworkPolicy(ctx, agent, netpolProf, otlpEndpoint, otlpSource == otlpSourceNone); err != nil {
 		return err
-	}
-	if !refusalStillRendersTheGuardrail(agent, reason) {
-		return nil
 	}
 	return r.reconcileAgentEgressPolicy(ctx, agent, r.agentEgressDNSClusterIPs(ctx, agent, netpolProf))
 }
@@ -1340,12 +1506,9 @@ func (r *PlatformAgentReconciler) agentEgressDNSClusterIPs(ctx context.Context, 
 // operator rendered one, keeps a closed door rather than silently getting an
 // open one.
 //
-// The cost is a stale policy after an opt-out. That is fail-closed on its own,
-// but it is not harmless if splitCredentialBrokerPod is reverted in the same
-// edit: the broker returns to the agent Pod, the leftover policy selects that
-// Pod, and the broker loses the metadata server along with the sandbox. The
-// egressPolicy CRD field description carries the warning and the three-step
-// revert order, so it reaches kubectl explain.
+// The cost is a stale policy after an opt-out: the door stays shut for anything
+// the agent Pod later needs to reach. The egressPolicy CRD field description
+// carries that warning, so it reaches kubectl explain.
 func (r *PlatformAgentReconciler) reconcileAgentEgressPolicy(ctx context.Context, agent *agentv1alpha1.PlatformAgent, dnsClusterIPs []string) error {
 	if !agentEgressPolicyEnabled(agent) {
 		return nil
@@ -1619,8 +1782,8 @@ func (r *PlatformAgentReconciler) cleanupAgentRBAC(ctx context.Context, agent *a
 	minimalBindingName := fmt.Sprintf("kubeagents:minimal:%s:%s", agent.Namespace, agent.Name)
 	localBindingName := fmt.Sprintf("kubeagents:local:%s:%s", agent.Namespace, agent.Name)
 	leaderBindingName := fmt.Sprintf("kubeagents:leader:%s:%s", agent.Namespace, agent.Name)
-	// The split credential broker's TokenReview grant is applied by
-	// reconcileCredentialBroker on every reconcile, through applyManaged,
+	// The credential broker's TokenReview grant is applied by
+	// reconcileCredentialBrokerTokenReviewRBAC on every reconcile, through applyManaged,
 	// which stamps the same instance labels this cleanup selects on. Reaping
 	// it here would delete what the same pass just applied — the reconcile
 	// would never stabilize. Spared like the minimal binding; deleteAll
@@ -1798,6 +1961,56 @@ func (r *PlatformAgentReconciler) reconcileRBAC(ctx context.Context, agent *agen
 	return nil
 }
 
+// splitWorkloadStatus is one of the two workloads the credential-broker split made
+// mandatory alongside the gateway, read back so Ready can depend on it.
+type splitWorkloadStatus struct {
+	// name is the object's name, and what the Provisioning message reports.
+	name string
+	// kind is "StatefulSet" or "Deployment", so the message says which to describe.
+	kind string
+	// ready is the workload's ReadyReplicas; zero when the object is absent.
+	ready int32
+}
+
+// readSplitWorkloads reads the shell sandbox StatefulSet and the credential broker
+// Deployment.
+//
+// Ready has to depend on both. Before the split the credential runtime was a native
+// sidecar of the gateway pod, so a broker that could not start held the gateway out of
+// readiness and the existing pod scan reported why. Splitting it into its own pod took
+// that away: the gateway now becomes Ready on its own while the model cannot run a single
+// command, because the shell it runs them in does not exist. sandbox_mirror returns
+// EXIT_OK when its wait times out, so nothing else in the gateway notices either.
+//
+// A read error other than NotFound is returned to the caller, which fails the reconcile
+// rather than reporting a readiness it could not check. NotFound is not an error here: it
+// is the ordinary state between applying the objects and the API server serving them back,
+// and it reads as not-ready, which is what it is.
+func (r *PlatformAgentReconciler) readSplitWorkloads(ctx context.Context, agent *agentv1alpha1.PlatformAgent) ([]splitWorkloadStatus, error) {
+	shell := &appsv1.StatefulSet{}
+	shellName := shellSandboxName(agent)
+	if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: shellName}, shell); err != nil {
+		if !errors.IsNotFound(err) {
+			return nil, fmt.Errorf("failed to get shell sandbox StatefulSet for status update: %w", err)
+		}
+		shell.Status.ReadyReplicas = 0
+	}
+
+	broker := &appsv1.Deployment{}
+	brokerName := credentialBrokerName(agent)
+	if err := r.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: brokerName}, broker); err != nil {
+		if !errors.IsNotFound(err) {
+			return nil, fmt.Errorf("failed to get credential broker Deployment for status update: %w", err)
+		}
+		broker.Status.ReadyReplicas = 0
+	}
+
+	return []splitWorkloadStatus{
+		{name: shellName, kind: "StatefulSet", ready: shell.Status.ReadyReplicas},
+		{name: brokerName, kind: "Deployment", ready: broker.Status.ReadyReplicas},
+	}, nil
+}
+
 // updateStatusReady writes the agent's status and returns the phase it settled on, so
 // the caller can decide whether the agent is still converging. otlpEndpoint, otlpSource,
 // and netpolProfile are the resolved telemetry and network policy wiring; they are reported
@@ -1853,21 +2066,40 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		newAddress = fmt.Sprintf("%s.%s.svc.cluster.local", svc.Name, svc.Namespace)
 	}
 
+	// The two workloads the split made mandatory. Read before the phase is decided,
+	// because Ready is a claim about all three and not about the gateway alone.
+	splitWorkloads, errSplit := r.readSplitWorkloads(ctx, agent)
+	if errSplit != nil {
+		return "", errSplit
+	}
+	notReady := make([]string, 0, len(splitWorkloads))
+	for _, w := range splitWorkloads {
+		if w.ready == 0 {
+			notReady = append(notReady, fmt.Sprintf("%s %s", w.kind, w.name))
+		}
+	}
+
 	// Determine Phase and Condition
 	newPhase := "Provisioning"
 	condStatus := metav1.ConditionFalse
 	condReason := "Provisioning"
 	condMsg := "Waiting for deployment replicas to be ready"
-	if errWorkload == nil && newDeploymentStatusReadyReplicas > 0 {
+	switch {
+	case errWorkload == nil && newDeploymentStatusReadyReplicas > 0 && len(notReady) == 0:
 		newPhase = "Ready"
 		condStatus = metav1.ConditionTrue
 		condReason = "Reconciled"
-		condMsg = "Agent sandbox and Envoy credential sidecar are fully reconciled"
-	} else if errWorkload == nil {
+		condMsg = "Gateway, shell sandbox and credential broker are all ready"
+	case errWorkload == nil:
 		if phaseOverride, reasonOverride, msgOverride := r.getDeploymentStatusDetails(ctx, agent); reasonOverride != "Provisioning" {
 			newPhase = phaseOverride
 			condReason = reasonOverride
 			condMsg = msgOverride
+		} else if newDeploymentStatusReadyReplicas > 0 && len(notReady) > 0 {
+			// The gateway is up and the pod scan found no fault to name, so the
+			// generic "waiting for replicas" message would point at the one
+			// workload that is fine. Say which of the other two is missing.
+			condMsg = fmt.Sprintf("Waiting for %s to become ready", strings.Join(notReady, " and "))
 		}
 	}
 
@@ -2017,13 +2249,29 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 	reason = "Provisioning"
 	message = "Waiting for deployment replicas to be ready"
 
-	podList := &corev1.PodList{}
-	err := r.List(ctx, podList, client.InNamespace(agent.Namespace), client.MatchingLabels{"app": agent.Name + "-gateway"})
-	if err != nil || len(podList.Items) == 0 {
+	// All three pods, gateway first so an install with a fault in more than one of
+	// them reports the same sentence it always has. The other two are here because
+	// the faults this function names are exactly the ones the split introduced a
+	// new way to hit: a runtimeClassName the cluster has no node pool for, and a
+	// sandbox or broker image tag nothing published. Neither is visible from the
+	// gateway's own pod any more.
+	pods := make([]corev1.Pod, 0)
+	for _, selector := range []map[string]string{
+		{"app": agent.Name + "-gateway"},
+		shellSandboxSelector(agent),
+		{"app": credentialProxyName(agent)},
+	} {
+		podList := &corev1.PodList{}
+		if err := r.List(ctx, podList, client.InNamespace(agent.Namespace), client.MatchingLabels(selector)); err != nil {
+			continue
+		}
+		pods = append(pods, podList.Items...)
+	}
+	if len(pods) == 0 {
 		return phase, reason, message
 	}
 
-	for _, pod := range podList.Items {
+	for _, pod := range pods {
 		// 1. Check container waiting states (CrashLoopBackOff, ImagePullBackOff, ErrImagePull, etc.)
 		//
 		// Init statuses first, and PodInitializing filtered out with
@@ -2058,9 +2306,20 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 			if cond.Type == corev1.PodScheduled && cond.Status == corev1.ConditionFalse && cond.Reason == "Unschedulable" {
 				phase = "Degraded"
 				reason = "PodUnschedulable"
-				if agent.Spec.Deployment != nil && agent.Spec.Deployment.Availability != nil && agent.Spec.Deployment.Availability.RuntimeClassName != nil && *agent.Spec.Deployment.Availability.RuntimeClassName != "" {
-					rcName := *agent.Spec.Deployment.Availability.RuntimeClassName
-					message = fmt.Sprintf("Pod %s is waiting to be scheduled because no nodes in the cluster match the requested RuntimeClass '%s'. For GKE Standard, enable GKE Sandbox by provisioning a gVisor node pool.", pod.Name, rcName)
+				if requested := requestedRuntimeClasses(agent); len(requested) > 0 {
+					// Plural only when the CR really does name two, which takes
+					// the agent pod and the sandbox having deliberately been
+					// given different runtimes. Every other install reads the
+					// sentence this condition has always produced.
+					noun := "RuntimeClass"
+					if len(requested) > 1 {
+						noun = "RuntimeClasses"
+					}
+					quoted := make([]string, 0, len(requested))
+					for _, name := range requested {
+						quoted = append(quoted, fmt.Sprintf("'%s'", name))
+					}
+					message = fmt.Sprintf("Pod %s is waiting to be scheduled because no nodes in the cluster match the requested %s %s. For GKE Standard, enable GKE Sandbox by provisioning a gVisor node pool.", pod.Name, noun, strings.Join(quoted, ", "))
 				} else {
 					cleanMsg := strings.TrimSuffix(strings.TrimSpace(cond.Message), ".")
 					message = fmt.Sprintf("Pod %s cannot be scheduled onto any available node: %s.", pod.Name, cleanMsg)
@@ -2073,18 +2332,72 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 	return phase, reason, message
 }
 
-func (r *PlatformAgentReconciler) validateRuntimeClass(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	if agent.Spec.Deployment == nil || agent.Spec.Deployment.Availability == nil || agent.Spec.Deployment.Availability.RuntimeClassName == nil || *agent.Spec.Deployment.Availability.RuntimeClassName == "" {
-		return nil
+// checkShellSandboxKeys returns a Degraded reason and message when the Secret the
+// sandbox mounts its authorized_keys from does not exist, or "" when it does.
+//
+// A read error other than NotFound returns "" as well. This runs after every object
+// is applied and its only job is to phrase a status; an API blip must not turn a
+// healthy agent Degraded on a claim this function could not check.
+//
+// The read goes through r.APIReader. Secrets are the one type the manager's cache does not
+// already hold, and a cached Get of an unwatched type starts a cluster-wide informer and
+// blocks in WaitForCacheSync until it syncs. On the RBAC this operator ships that LIST is
+// forbidden, so it never syncs: the call does not fail, it hangs, and with one reconcile
+// worker that is the whole controller stopped on an install that reports success. Reading
+// live also keeps every Secret in the cluster out of the operator's memory.
+func (r *PlatformAgentReconciler) checkShellSandboxKeys(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, string) {
+	reader := r.APIReader
+	if reader == nil {
+		reader = r.Client
 	}
+	if reader == nil {
+		return "", ""
+	}
+	name := shellSandboxAuthorizedKeysSecretName(agent)
+	err := reader.Get(ctx, types.NamespacedName{Name: name, Namespace: agent.Namespace}, &corev1.Secret{})
+	if err == nil || !errors.IsNotFound(err) {
+		return "", ""
+	}
+	return reasonShellSandboxKeysMissing, shellSandboxKeysMissingMessage(name)
+}
 
-	rcName := *agent.Spec.Deployment.Availability.RuntimeClassName
-	rc := &nodev1.RuntimeClass{}
-	err := r.Get(ctx, types.NamespacedName{Name: rcName}, rc)
-	if err != nil {
-		return err
+// validateRuntimeClass returns the name it could not resolve alongside the
+// error, because the caller's Degraded message names it and the error alone
+// does not carry it back.
+func (r *PlatformAgentReconciler) validateRuntimeClass(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (string, error) {
+	for _, rcName := range requestedRuntimeClasses(agent) {
+		rc := &nodev1.RuntimeClass{}
+		if err := r.Get(ctx, types.NamespacedName{Name: rcName}, rc); err != nil {
+			return rcName, err
+		}
 	}
-	return nil
+	return "", nil
+}
+
+// requestedRuntimeClasses is every RuntimeClass this CR asks for, deduplicated.
+//
+// Two pods can name one now — the agent's, and the sandbox's, which is a
+// separate field because the two workloads do not want the same runtime. Both
+// are checked here rather than each at its own builder because the failure is
+// the same failure and the operator already has one message for it: a
+// RuntimeClass that does not exist leaves the pod Pending with nothing in the CR
+// that explains why, and that is worth catching before either object is applied.
+func requestedRuntimeClasses(agent *agentv1alpha1.PlatformAgent) []string {
+	var names []string
+	add := func(name *string) {
+		if name == nil || *name == "" {
+			return
+		}
+		if slices.Contains(names, *name) {
+			return
+		}
+		names = append(names, *name)
+	}
+	if agent.Spec.Deployment != nil && agent.Spec.Deployment.Availability != nil {
+		add(agent.Spec.Deployment.Availability.RuntimeClassName)
+	}
+	add(shellSandboxRuntimeClassName(agent))
+	return names
 }
 
 func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agent *agentv1alpha1.PlatformAgent, reason, message string) error {

@@ -531,100 +531,57 @@ class ParseTaskIdTest(unittest.TestCase):
 
 
 class PostBodyTest(unittest.TestCase):
-    """`gh` runs in the sidecar, so the body file must be on the shared volume.
+    """The body reaches `gh` as bytes, never as a path.
 
-    Regression for a live failure: with the body in `/tmp` — a per-container
-    emptyDir — every refusal died on "no such file or directory", because the
-    container running `gh` cannot see the container that wrote the file.
+    Regression for two live failures that both came of staging it in a file.
+    With the body in `/tmp` — a per-container emptyDir — every refusal died on
+    "no such file or directory" (#1030). Moving it to a shared volume traded
+    that for the #955 uid split, where the 0600 file `NamedTemporaryFile`
+    creates was unreadable to the process that ran `gh`. Separate pods leave no
+    shared volume to move it back to, so it goes on fd 0 and neither can recur.
     """
 
     class _Recorder:
         def __init__(self):
-            self.path = None
             self.body = None
+            self.calls = 0
 
-        def post_comment(self, repo, pr, body_file):
-            self.path = body_file
-            with open(body_file, encoding="utf-8") as handle:
-                self.body = handle.read()
+        def post_comment(self, repo, pr, body):
+            self.calls += 1
+            self.body = body
 
-    def test_the_body_file_lands_on_the_shared_volume(self):
-        import tempfile as _tempfile
-
+    def test_the_body_is_handed_over_as_text(self):
         recorder = self._Recorder()
-        with _tempfile.TemporaryDirectory() as shared:
-            with mock.patch.object(gate, "SCRATCH_DIR", shared):
-                gate._post_body(recorder, "acme/toolkit", make_pr(), "the refusal")
-            self.assertTrue(
-                Path(recorder.path).is_relative_to(shared),
-                f"{recorder.path} is not under the shared volume {shared}",
-            )
+        gate._post_body(recorder, "acme/toolkit", make_pr(), "the refusal")
         self.assertEqual(recorder.body, "the refusal")
+        self.assertEqual(recorder.calls, 1)
 
-    def test_the_file_is_removed_afterwards(self):
+    def test_nothing_is_written_to_disk(self):
+        """No scratch file, so no shared volume and no uid agreement to get wrong."""
         import tempfile as _tempfile
 
-        recorder = self._Recorder()
-        with _tempfile.TemporaryDirectory() as shared:
-            with mock.patch.object(gate, "SCRATCH_DIR", shared):
-                gate._post_body(recorder, "acme/toolkit", make_pr(), "x")
-            self.assertFalse(Path(recorder.path).exists())
+        with _tempfile.TemporaryDirectory() as private:
+            before = set(Path(private).iterdir())
+            with mock.patch.object(_tempfile, "tempdir", private):
+                gate._post_body(self._Recorder(), "acme/toolkit", make_pr(), "x")
+            self.assertEqual(set(Path(private).iterdir()), before)
 
-    def test_the_body_file_is_group_readable_across_the_uid_split(self):
-        """Since #955 the sidecar running `gh` is a different uid; the 0600
-        file `NamedTemporaryFile` creates is unreadable to it even on the
-        shared volume, so the group bits are load-bearing."""
-        import os as _os
-        import tempfile as _tempfile
+    def test_the_gate_names_no_scratch_directory_at_all(self):
+        """The constant is gone, not merely unused; a reader must not find it.
 
-        modes = []
-        recorder = self._Recorder()
-        original = recorder.post_comment
+        It named "the one filesystem both this container and the credential
+        sidecar can see", which after the split into separate pods is no
+        filesystem at all.
+        """
+        self.assertFalse(hasattr(gate, "SCRATCH_DIR"))
 
-        def post_and_stat(repo, pr, body_file):
-            modes.append(_os.stat(body_file).st_mode)
-            original(repo, pr, body_file)
+    def test_a_failed_post_is_not_swallowed(self):
+        class Failing:
+            def post_comment(self, repo, pr, body):
+                raise RuntimeError("HTTP 403")
 
-        recorder.post_comment = post_and_stat
-        with _tempfile.TemporaryDirectory() as shared:
-            with mock.patch.object(gate, "SCRATCH_DIR", shared):
-                gate._post_body(recorder, "acme/toolkit", make_pr(), "the refusal")
-        self.assertEqual(
-            modes[0] & 0o060,
-            0o060,
-            f"body file is {oct(modes[0] & 0o777)}: the sidecar can only read "
-            "it through the group bits",
-        )
-
-    def test_an_unusable_volume_fails_loudly_with_no_private_tmp_file(self):
-        """The old silent fallback to the system temp dir guaranteed failure
-        in-cluster — the sidecar can never see this container's private tmp —
-        while looking like a graceful degrade (#1030). It must raise instead,
-        and leave nothing behind in the private temp dir."""
-        import tempfile as _tempfile
-
-        recorder = self._Recorder()
-        with _tempfile.TemporaryDirectory() as tmp:
-            parent = Path(tmp) / "readonly"
-            parent.mkdir()
-            parent.chmod(0o500)
-            private = Path(tmp) / "private-tmp"
-            private.mkdir()
-            try:
-                with mock.patch.object(
-                    gate, "SCRATCH_DIR", str(parent / "scratch")
-                ), mock.patch.object(_tempfile, "tempdir", str(private)):
-                    with self.assertRaises(RuntimeError) as ctx:
-                        gate._post_body(recorder, "acme/toolkit", make_pr(), "x")
-            finally:
-                parent.chmod(0o700)
-            message = str(ctx.exception)
-            self.assertIn("publish path broken", message)
-            self.assertIn("#1030", message)
-            self.assertIsNone(
-                recorder.path, "nothing must be posted from a private file"
-            )
-            self.assertEqual(list(private.iterdir()), [])
+        with self.assertRaises(RuntimeError):
+            gate._post_body(Failing(), "acme/toolkit", make_pr(), "x")
 
 
 # ---------------------------------------------------------------------------
@@ -669,9 +626,8 @@ class FakeProvider:
             raise forge.ForgeError("REPO_UNREACHABLE", f"#{pr.number}")
         return list(self.comments.get(pr.number, []))
 
-    def post_comment(self, repo, pr, body_file):
-        with open(body_file, "r", encoding="utf-8") as handle:
-            self.posted.append((pr.number, handle.read()))
+    def post_comment(self, repo, pr, body):
+        self.posted.append((pr.number, body))
 
     def acknowledge(self, repo, comment):
         self.acknowledged.append(comment.node_id)
@@ -717,19 +673,6 @@ def make_comment(
 
 
 class PrCommentsSweepTest(unittest.TestCase):
-    def setUp(self):
-        # A refusal posts through `_post_body`, which stages the body on the
-        # shared volume and — since the silent private-tmp fallback died with
-        # #1030 — raises where /opt/data does not exist. Off-cluster that is
-        # here, so point it at a directory that does.
-        import tempfile as _tempfile
-
-        scratch = _tempfile.TemporaryDirectory()
-        self.addCleanup(scratch.cleanup)
-        patcher = mock.patch.object(gate, "SCRATCH_DIR", scratch.name)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
     def _sweep(self, provider, repo=REPO, env=None, repo_error=None, dry_run=False):
         managed_mock = mock.Mock(side_effect=repo_error) if repo_error else mock.Mock(return_value=[repo] if repo else [])
         with mock.patch("gitops_workspace.get_managed_github_repos", managed_mock), \

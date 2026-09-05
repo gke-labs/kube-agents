@@ -155,6 +155,66 @@ type ExperimentalSpec struct {
 	// +kubebuilder:default=false
 	// +optional
 	PlatformFrontDoor *bool `json:"platformFrontDoor,omitempty"`
+
+	// ShellSandbox tunes the agent's shell sandbox — the separate pod it reaches
+	// over SSH, where every command it runs executes. The sandbox itself is not
+	// optional; this block sets its image and its container runtime. See
+	// docs/designs/agent-shell-sandboxing.md.
+	// +optional
+	ShellSandbox *ShellSandboxSpec `json:"shellSandbox,omitempty"`
+}
+
+// ShellSandboxSpec configures the per-agent shell sandbox: a StatefulSet running
+// sshd, which Hermes' `ssh` terminal backend points at. Every tool that reaches a
+// shell — terminal, the four file tools, and execute_code — follows the backend,
+// so the agent's whole execution surface is in that pod.
+//
+// Experimental because the shape of the spec is still open — whether the sandbox
+// belongs to this operator at all is listed as unresolved in the design.
+type ShellSandboxSpec struct {
+	// Enabled is retained so that an install carrying `enabled: true` still
+	// applies, and so that `enabled: false` is refused rather than silently
+	// ignored. The sandbox is not optional: the agent image ships no kubectl,
+	// gcloud, gh or git, so an agent without a sandbox has no shell tools at
+	// all, and running them back in the gateway pod is the arrangement this
+	// design exists to end. Setting it false parks the agent Degraded with
+	// reason ShellSandboxCannotBeDisabled and changes nothing about the running
+	// workload.
+	//
+	// The sandbox needs a keypair in the agent's credential Secret
+	// (SANDBOX_SSH_PRIVATE_KEY) and its public half in
+	// <agent>-shell-authorized-keys. Every install surface mints both; an
+	// install that predates them gets them from upgrade.sh. With no key, the
+	// sandbox runs and the agent cannot log into it.
+	// +optional
+	Enabled *bool `json:"enabled,omitempty"`
+
+	// Image overrides the sandbox image. Empty takes the operator's own default,
+	// which the install surfaces set from the same tag inventory as every other
+	// image (AGENT_SANDBOX_IMAGE).
+	// +optional
+	Image string `json:"image,omitempty"`
+
+	// RuntimeClassName runs the sandbox pod under a sandboxed container runtime,
+	// `gvisor` being the one GKE offers. This is a second boundary and not the
+	// one the sandbox is built on: unbinding the ServiceAccount is what takes the
+	// cloud credential away, and a shell running as a different pod is what takes
+	// the agent's filesystem away. What this adds is protection of the node from
+	// the code the model runs, by putting a user-space kernel between that code
+	// and the host's syscall surface.
+	//
+	// Separate from deployment.availability.runtimeClassName, which governs the
+	// agent pod, because the two pods do not want the same answer. The agent pod
+	// holds WAL-mode SQLite, which gVisor corrupts on the gofer-backed mount
+	// (#610); the sandbox pod holds none. Splitting the field is what lets an
+	// install sandbox the untrusted pod without sandboxing the trusted one.
+	//
+	// On GKE Standard this needs a node pool created with `--sandbox
+	// type=gvisor`; the operator reports Degraded rather than leaving the pod
+	// Pending if the named RuntimeClass does not exist. GKE adds the node pool's
+	// taint toleration itself, so nothing else has to be set here.
+	// +optional
+	RuntimeClassName *string `json:"runtimeClassName,omitempty"`
 }
 
 // EventWatcherSpec configures the k8s-event-watcher, which runs as a peer service
@@ -539,58 +599,21 @@ type SecuritySpec struct {
 	// +optional
 	ScopedServiceAccounts []ScopedServiceAccount `json:"scopedServiceAccounts,omitempty"`
 
-	// SplitCredentialBrokerPod moves the credential broker out of the agent Pod
-	// into a Deployment and Service of its own, so that a compromised agent no
-	// longer shares a network namespace with the process holding the cloud
-	// credentials.
+	// WorkloadIdentityFederation gives the credential proxy a GCP identity that
+	// does not come from the metadata server.
 	//
-	// LEAVE THIS OFF for now. The broker runs proxied commands in a working
-	// directory the agent created on the shared data volume, so today both Pods
-	// have to mount that claim read-write at the same path and see the same
-	// files. The default GKE persistent disk is ReadWriteOnce and cannot do
-	// that across nodes: the broker Pod stays Pending with a Multi-Attach
-	// error, never becomes a Service endpoint, and every proxied command
-	// reports "credential proxy unavailable: [Errno 111] Connection refused" —
-	// the same symptom an unhealthy sidecar produces.
+	// Optional hardening rather than a requirement. GKE resolves Workload
+	// Identity by pod IP, so the broker's pod holds one cloud identity for
+	// whatever runs in it, and what it can mint is whatever that identity may
+	// mint. Federation replaces the metadata server with a projected
+	// service-account token exchanged for a GCP access token over STS, which
+	// narrows the pod to what the provider's attribute conditions allow.
 	//
-	// That coupling is a property of the current directory-sharing design, not
-	// something the split needs, and it is being removed rather than worked
-	// around: the broker will own the workspace on an ordinary ReadWriteOnce
-	// volume of its own and take {path, content} pairs from the agent instead
-	// of a directory. That also closes the wider problem of the agent owning a
-	// tree the broker then runs git in. Until then the split is a mechanism
-	// with no adoptable storage story, which is why it defaults to false.
-	//
-	// A ReadWriteMany claim does satisfy today's design and is a choice
-	// available to you. It is not a requirement of this product and should not
-	// be treated as one — the managed options bill on provisioned capacity with
-	// a floor far above what an agent workspace needs. Co-scheduling both Pods
-	// on one node against a ReadWriteOnce claim is not a workaround: the next
-	// rolling update deadlocks on the volume, node affinity binds only at
-	// scheduling time, and the two Pods become a single failure domain.
-	//
-	// REQUIRES eventWatcher.enabled: false. The k8s-event-watcher is hosted
-	// inside the credential container and posts what it sees to the Session KV
-	// server the sandbox binds on the agent Pod's loopback, so the split takes
-	// the watcher away from the only address it can deliver to. Asking for both
-	// is refused rather than rendered: the agent goes Degraded with reason
-	// SplitBrokerStrandsEventWatcher and no workload is applied. The refusal
-	// sits after the ServiceAccount, RBAC, PVCs and ConfigMaps, so those are
-	// reconciled either way; and on an agent that is already running with the
-	// split, it leaves the running Pods alone rather than taking them down.
-	// eventWatcher
-	// defaults to enabled, so this fires on a stock spec, which is the intent —
-	// the split costs you fleet event delivery today and that should be a
-	// decision rather than a discovery. Giving the watcher a home that survives
-	// the split is separate work.
-	//
-	// Two further caveats. The agent Pod and the broker Pod share one
-	// ServiceAccount, because the Workload Identity IAM binding names it, so
-	// the identity the broker verifies is per-ServiceAccount rather than
-	// per-Pod. And the bearer token the agent presents crosses the cluster
-	// network in cleartext.
+	// Absent means the broker keeps using the metadata server. That is a
+	// supported arrangement: the broker has a pod of its own, so the identity is
+	// already out of reach of the shell that runs model-authored code.
 	// +optional
-	SplitCredentialBrokerPod *bool `json:"splitCredentialBrokerPod,omitempty"`
+	WorkloadIdentityFederation *WorkloadIdentityFederationSpec `json:"workloadIdentityFederation,omitempty"`
 
 	// EgressPolicy selects the NetworkPolicy the operator renders for the agent
 	// Pod. "None" (the default) renders nothing.
@@ -650,10 +673,10 @@ type SecuritySpec struct {
 	// way: the gateway policy alone is enough to make the point above.
 	//
 	// The overlap is deliberate rather than an oversight. Workload Identity
-	// needs the metadata path, and in the sidecar layout the credential broker
-	// shares the Pod, so <name>-gateway-netpol cannot stop permitting it
-	// without breaking every install. Narrowing it to the broker Pod once the
-	// broker has left is the work that turns this field into a control.
+	// needs the metadata path, and <name>-gateway-netpol still permits it to
+	// the agent Pod. Narrowing that allowance to the broker Pod, which is the
+	// only one that mints a cloud token, is the work that turns this field into
+	// a control.
 	//
 	// So what is this for today? Two things, and they are worth having, but
 	// neither is enforcement. It renders an auditable statement of the
@@ -662,15 +685,7 @@ type SecuritySpec struct {
 	// rules and the reconcile behaviour, so that narrowing the gateway policy
 	// later is a change to one policy rather than a new feature.
 	//
-	// REQUIRES splitCredentialBrokerPod: true. Containers in one Pod share a
-	// network namespace, and the credential broker reaches the metadata server
-	// on purpose: minting the cloud token is its job. A Pod-level NetworkPolicy
-	// cannot deny the metadata server to the agent container while allowing it
-	// to the broker container beside it. Asking for the combination is refused
-	// with Degraded/EgressPolicyRequiresSplitBroker rather than rendered — so
-	// the default install, which has the split off, has none of this.
-	//
-	// Three further conditions the operator cannot check for you.
+	// Three conditions the operator cannot check for you.
 	//
 	//   - The policy does nothing at all on a cluster whose CNI does not
 	//     enforce NetworkPolicy (GKE Standard without network policy enabled);
@@ -726,24 +741,11 @@ type SecuritySpec struct {
 	// TURNING THIS OFF DOES NOT DELETE THE POLICY. An egress policy is a
 	// guardrail, and the operator will not remove a guardrail it may not have
 	// created, so setting this back to "None" leaves
-	// <name>-sandbox-metadata-deny in place. That is fail-closed and harmless
-	// on its own. Reverting both flags together leaves the returned broker
-	// inside the leftover policy's selection — which the gateway policy's
-	// union papers over today, by the same argument as above, but which
-	// becomes a broker cut off from the metadata server the moment the
-	// gateway policy is narrowed or absent (networkPolicy.enabled: false).
-	// Treat the order below as required rather than relying on the union to
-	// keep saving it.
-	//
-	// Revert in three steps, which never leaves a broker inside a policy that
-	// denies it:
-	//
-	//   1. set egressPolicy: None, leaving splitCredentialBrokerPod: true;
-	//   2. kubectl -n NS delete networkpolicy NAME-sandbox-metadata-deny
-	//      (safe now — with the field off the operator will not re-apply it,
-	//      whereas deleting it while the field is still "Allowlist" only
-	//      earns it back on the next reconcile);
-	//   3. set splitCredentialBrokerPod: false.
+	// <name>-sandbox-metadata-deny in place, still denying what it denied. To
+	// undo it, set egressPolicy: None first and then
+	// `kubectl -n NS delete networkpolicy NAME-sandbox-metadata-deny`. Deleting
+	// it while the field still reads "Allowlist" only earns it back on the next
+	// reconcile.
 	// +kubebuilder:validation:Enum=None;Allowlist
 	// +optional
 	EgressPolicy string `json:"egressPolicy,omitempty"`
@@ -752,6 +754,41 @@ type SecuritySpec struct {
 	// Ignored for any other egressPolicy value.
 	// +optional
 	EgressAllowlist *EgressAllowlistSpec `json:"egressAllowlist,omitempty"`
+}
+
+// WorkloadIdentityFederationSpec names the pool the proxy federates through and
+// the service account it impersonates once it gets there.
+//
+// The Helm chart sets both fields from
+// platformAgent.security.workloadIdentityFederation, and refuses a half-filled
+// block rather than relying on the fail-safe below. What no install surface
+// does is create the pool itself: the runnable pool, provider and
+// roles/iam.workloadIdentityUser commands are in
+// docs/designs/agent-shell-sandboxing.md.
+type WorkloadIdentityFederationSpec struct {
+	// Audience is the provider's full resource name, in the form STS expects as
+	// the `aud` claim:
+	//
+	//	//iam.googleapis.com/projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>
+	//
+	// The projected token's audience is set from this verbatim. A mismatch is
+	// rejected by STS at exchange time with `invalid_target`, not at admission,
+	// so it surfaces as a proxy that starts and then fails every command.
+	// +kubebuilder:validation:MaxLength=512
+	// +kubebuilder:validation:Pattern=`^//iam\.googleapis\.com/projects/[0-9]+/locations/global/workloadIdentityPools/[^/]+/providers/[^/]+$`
+	// +optional
+	Audience string `json:"audience,omitempty"`
+
+	// ServiceAccountEmail is the GSA the federated principal impersonates.
+	//
+	// Impersonation rather than direct grants: the agent's roles are already
+	// attached to this service account by every install surface, and rebuilding
+	// that grant set against a federated principal would mean maintaining it
+	// twice. The federated principal therefore needs exactly one permission —
+	// roles/iam.workloadIdentityUser on this account — and nothing else moves.
+	// +kubebuilder:validation:MaxLength=256
+	// +optional
+	ServiceAccountEmail string `json:"serviceAccountEmail,omitempty"`
 }
 
 // EgressAllowlistSpec supplies the parts of the agent Pod's egress allowlist

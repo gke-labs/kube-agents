@@ -629,6 +629,34 @@ class RunGhRetryTest(unittest.TestCase):
         self.assertEqual(self.refresh_calls, [])
 
 
+class GhRoutingTest(unittest.TestCase):
+    """`gh` is reached through the sandbox, because `poll` runs in the agent pod.
+
+    Every other test in this file passes with either wiring: `sandbox_exec.run`
+    falls back to `subprocess.run` when no managed config names a sandbox, and
+    a test machine has none. These two are what would notice the call being
+    reverted to a direct `subprocess.run(["gh", ...])`.
+    """
+
+    def test_the_call_goes_through_sandbox_exec(self):
+        with mock.patch.object(
+            resolver.sandbox_exec, "run",
+            return_value=subprocess.CompletedProcess(["gh"], 0, "ok", ""),
+        ) as ran:
+            result = resolver._run_gh_once(["auth", "status"])
+        self.assertEqual(result.stdout, "ok")
+        self.assertEqual(ran.call_args.args[0], ["gh", "auth", "status"])
+
+    def test_an_unreachable_sandbox_is_not_an_empty_poll(self):
+        """The transport failing must not read as a repository with no work."""
+        with mock.patch.object(
+            resolver.sandbox_exec, "run",
+            side_effect=resolver.sandbox_exec.SandboxUnavailable("no route"),
+        ):
+            with self.assertRaises(resolver.sandbox_exec.SandboxUnavailable):
+                resolver._run_gh_once(["issue", "list"])
+
+
 class RunGhTest(unittest.TestCase):
     def test_missing_binary_exits_when_checking(self):
         with contextlib.redirect_stderr(io.StringIO()):

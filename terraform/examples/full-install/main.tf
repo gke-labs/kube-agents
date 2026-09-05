@@ -84,9 +84,14 @@ locals {
       # session history.
       SESSION_KV_API_KEY = var.session_kv_api_key != "" ? var.session_kv_api_key : random_password.session_kv_api_key.result
       SESSION_KV_SALT    = var.session_kv_salt != "" ? var.session_kv_salt : random_password.session_kv_salt.result
-      ANTHROPIC_API_KEY  = var.anthropic_api_key
-      GEMINI_API_KEY     = var.gemini_api_key
-      OPENAI_API_KEY     = var.openai_api_key
+      # The agent's half of the shell sandbox keypair, generated for the same
+      # reason: nobody has to choose its value. The chart copies the public
+      # half into <name>-shell-authorized-keys for the sandbox to mount.
+      SANDBOX_SSH_PRIVATE_KEY = tls_private_key.sandbox_ssh.private_key_openssh
+      SANDBOX_SSH_PUBLIC_KEY  = tls_private_key.sandbox_ssh.public_key_openssh
+      ANTHROPIC_API_KEY       = var.anthropic_api_key
+      GEMINI_API_KEY          = var.gemini_api_key
+      OPENAI_API_KEY          = var.openai_api_key
     } : key => value if value != ""
   }
 
@@ -167,6 +172,21 @@ resource "random_password" "session_kv_api_key" {
 resource "random_password" "session_kv_salt" {
   length  = 48
   special = false
+}
+
+# The agent's SSH keypair for the shell sandbox (#737 Part B). The agent pod
+# holds the private half and dials the sandbox with it; the sandbox authorises
+# it and holds nothing else.
+#
+# tls_private_key rather than shelling out to ssh-keygen, which is what the
+# installer scripts have to do: private_key_openssh and public_key_openssh give
+# both halves in the exact encodings sshd and `ssh -i` want, with no local-exec
+# and no provisioner. Held in Terraform state like the two passwords above, so
+# `terraform apply` is idempotent without reading the cluster — and so a plan
+# never proposes a new pair, which would lock the agent out of a running
+# sandbox until that pod restarted.
+resource "tls_private_key" "sandbox_ssh" {
+  algorithm = "ED25519"
 }
 
 resource "google_project_service" "required" {
@@ -453,10 +473,11 @@ resource "helm_release" "kube_agents" {
   timeout = 600
 
   values = [yamlencode({
-    # Reaches every image this release pulls, including the two the chart does
-    # not render itself — the agent Deployment and the fluent-bit sidecar the
-    # operator resolves at reconcile time. See the chart README's
-    # "Installing from a mirrored registry".
+    # Reaches every image this release pulls, including the three the chart
+    # does not render itself — the agent Deployment, the shell sandbox
+    # StatefulSet, and the fluent-bit sidecar the operator resolves at
+    # reconcile time. See the chart README's "Installing from a mirrored
+    # registry".
     #
     # It does NOT reach helm_release.cert_manager above: that is a separate
     # release of an upstream chart, and these values are not passed to it.
@@ -469,6 +490,18 @@ resource "helm_release" "kube_agents" {
       # Secret names only. The Secrets themselves are created out of band, so
       # no registry credential is ever written to Terraform state.
       imagePullSecrets = var.image_pull_secrets
+    }
+    # The sandbox is built from this repository at the same commit as the
+    # agent and the operator, so it takes image_tag with them. It needs its own
+    # entry because the operator does not derive it: unlike the credential
+    # broker, which comes from the agent image with the trailing name swapped,
+    # the sandbox is a separate repository the chart names in AGENT_SANDBOX_IMAGE.
+    # Leaving it out pins the sandbox to Chart.appVersion while everything
+    # around it moves, which fails the pull rather than running the wrong code.
+    agentSandbox = {
+      image = {
+        tag = var.image_tag
+      }
     }
     operator = {
       image = {

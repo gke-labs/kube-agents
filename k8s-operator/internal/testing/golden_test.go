@@ -98,18 +98,6 @@ func TestAgentsGolden(t *testing.T) {
 			},
 		},
 		{
-			// The gate on. Diff this against platformagent-tagged.yaml to see
-			// exactly what splitting the credential broker into its own Pod
-			// changes, and nothing else.
-			name:         "PlatformAgentSplitCredentialBroker",
-			inputPath:    filepath.Join("testdata", "platform", "platformagent-split-broker.yaml"),
-			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-split-broker.yaml"),
-			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
-			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
-				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}
-			},
-		},
-		{
 			// The scoped service account pool on. Diff this against
 			// platformagent-tagged.yaml and the whole of what
 			// spec.security.scopedServiceAccounts renders is a ConfigMap key,
@@ -128,7 +116,7 @@ func TestAgentsGolden(t *testing.T) {
 		},
 		{
 			// The egress policy on. Diff this against
-			// platformagent-split-broker.yaml and the whole of what
+			// platformagent-tagged.yaml and the whole of what
 			// spec.security.egressPolicy renders is one NetworkPolicy —
 			// which is the object that has to be read carefully, since an
 			// egress allowlist that is subtly wrong either breaks the agent

@@ -266,6 +266,108 @@ class TestEnsureWorkspace(WorkspaceTestCase):
         self.assertEqual(self.calls[0][:3], ["git", "config", "user.name"])
 
 
+class TestEnsureScratchWorkspace(WorkspaceTestCase):
+    """The same lease, with no clone in it.
+
+    What the content-passing path hands the agent. Two things have to hold at
+    once and they pull in opposite directions: there must be no `.git` here,
+    and the lease bookkeeping — the path, the marker, the reaper — has to be
+    the same as the clone path's, because `start` and `finish` find each other
+    by that path and the reaper is what stops abandoned trees accumulating.
+    """
+
+    def scratch(self, repo="acme/fleet", **kwargs):
+        kwargs.setdefault("lease", LEASE)
+        kwargs.setdefault("root", self.root)
+        return gitops_workspace.ensure_scratch_workspace(repo, **kwargs)
+
+    def test_it_hands_back_a_directory_with_no_repository_in_it(self):
+        target = self.scratch()
+        self.assertTrue(target.is_dir())
+        self.assertFalse((target / ".git").exists())
+
+    def test_it_runs_no_git_at_all(self):
+        # Not an incidental property. This function takes no runner precisely
+        # so that there is nowhere for a git call to be added later without
+        # someone noticing; the signature is the assertion and this is the
+        # regression test for it.
+        with patch.object(gitops_workspace, "subprocess") as forbidden:
+            self.scratch()
+        forbidden.run.assert_not_called()
+
+    def test_the_path_is_the_one_the_clone_path_would_have_used(self):
+        # `start` and `finish` are separate processes and exchange no state, so
+        # a scratch tree at a different path is a `finish` that finds none of
+        # the manifests `start`'s agent wrote.
+        self.assertEqual(
+            self.scratch(),
+            gitops_workspace.workspace_path("acme/fleet", self.root, lease=LEASE),
+        )
+
+    def test_it_stamps_the_lease_marker(self):
+        target = self.scratch(owner="fleet-audit:compliance-audit")
+        record = gitops_workspace.read_lease(target.parent)
+        self.assertEqual(record["lease"], LEASE)
+        self.assertEqual(record["repo"], "acme/fleet")
+        self.assertEqual(record["owner"], "fleet-audit:compliance-audit")
+
+    def test_it_reaps_abandoned_leases_on_the_way_in(self):
+        stale = gitops_workspace.lease_dir(self.root, "t_gone")
+        gitops_workspace.write_lease(stale, "t_gone", "acme/fleet")
+        marker = stale / gitops_workspace.LEASE_FILENAME
+        old = time.time() - 30 * 24 * 3600
+        os.utime(marker, (old, old))
+
+        self.scratch()
+        self.assertFalse(stale.exists())
+
+    def test_reset_empties_the_tree_and_the_default_leaves_it_alone(self):
+        target = self.scratch()
+        manifest = target / "clusters/prod/netpol.yaml"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text("kind: NetworkPolicy\n", encoding="utf-8")
+
+        self.scratch(reset=False)
+        self.assertTrue(manifest.is_file(), "finish deleted the fix it was about to send")
+
+        self.scratch(reset=True)
+        self.assertFalse(manifest.exists(), "start must hand the audit a clean tree")
+
+    def test_a_clone_left_by_the_other_mode_is_not_deleted_mid_stream(self):
+        """A fleet that arms the broker between `start` and `finish`.
+
+        `start` cloned, the agent wrote its manifests into the clone, and then
+        `finish` came back in content mode and found a `.git` here. Clearing it
+        would take the manifests with it — the same data loss `reset=False`
+        exists to prevent on the clone path. Nothing here runs git, so the
+        leftover `.git` is inert for the one run it survives.
+        """
+        target = self.ensure()
+        manifest = target / "clusters/prod/netpol.yaml"
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        manifest.write_text("kind: NetworkPolicy\n", encoding="utf-8")
+
+        self.assertEqual(self.scratch(reset=False), target)
+        self.assertTrue(manifest.is_file())
+
+    def test_a_lease_cannot_climb_out_of_the_root(self):
+        # Same rule as the clone path, asserted separately because this is a
+        # second entry point into the same lease layout.
+        for lease in ("../../etc", "a/../..", "/etc", "..", "."):
+            with self.subTest(lease=lease):
+                try:
+                    target = self.scratch(lease=lease)
+                except ValueError:
+                    continue
+                self.assertEqual(target.parent.parent, self.root)
+
+    def test_a_malformed_repository_is_refused(self):
+        for repo in ("fleet", "", "acme/"):
+            with self.subTest(repo=repo):
+                with self.assertRaises(ValueError):
+                    self.scratch(repo)
+
+
 class TestWorkspaceLock(WorkspaceTestCase):
     def test_the_lock_is_best_effort_not_a_reason_to_skip_the_audit(self):
         # A read-only or absent PVC must cost a retry, not the day's audit.
@@ -732,6 +834,42 @@ class TestResolveRepo(WorkspaceTestCase):
         with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch("subprocess.run") as mock_run:
             self.assertEqual(gitops_workspace.get_managed_repo_entries(), [])
             mock_run.assert_not_called()
+
+    def test_get_managed_repo_entries_treats_a_mounted_dir_with_no_key_as_empty(self):
+        mount = self.tmp_path / "gitops-mount"
+        mount.mkdir()
+        state_file = mount / "managed_repos"
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch("subprocess.run") as mock_run:
+            self.assertEqual(gitops_workspace.get_managed_repo_entries(), [])
+            self.assertEqual(gitops_workspace.get_managed_github_repos(), [])
+            mock_run.assert_not_called()
+
+    def test_get_managed_repo_entries_falls_back_when_the_mount_is_absent(self):
+        state_file = self.tmp_path / "no-such-mount" / "managed_repos"
+        fake_cm = CompletedProcess(
+            args=["kubectl"],
+            returncode=0,
+            stdout='{"data": {"managed_repos": "[{\\"type\\": \\"github\\", \\"url\\": \\"https://github.com/acme/repo1\\"}]"}}',
+            stderr="",
+        )
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch("subprocess.run", return_value=fake_cm) as mock_run:
+            self.assertEqual(
+                gitops_workspace.get_managed_github_repos(),
+                ["acme/repo1"],
+            )
+            mock_run.assert_called_once()
+
+    def test_get_managed_repo_entries_bounds_the_kubectl_fallback(self):
+        state_file = self.tmp_path / "no-such-mount" / "managed_repos"
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch("subprocess.run") as mock_run:
+            mock_run.side_effect = subprocess.TimeoutExpired(["kubectl"], 30)
+            with self.assertRaises(RuntimeError) as caught:
+                gitops_workspace.get_managed_repo_entries()
+            self.assertIn("Timed out", str(caught.exception))
+            self.assertEqual(
+                mock_run.call_args.kwargs["timeout"],
+                gitops_workspace.GITOPS_STATE_READ_TIMEOUT_SECONDS,
+            )
 
     def test_get_managed_github_repos_filters_github_urls(self):
         fake_cm = CompletedProcess(

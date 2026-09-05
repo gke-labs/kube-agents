@@ -16,12 +16,14 @@ import os
 import subprocess
 import sys
 import unittest
+import unittest.mock
 from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import gke_endpoint  # noqa: E402
+import sandbox_exec  # noqa: E402
 
 HELP_WITH_FLAG = "    --dns-endpoint\n        Whether to use the DNS-based endpoint.\n"
 HELP_WITHOUT_FLAG = "    --internal-ip\n        Use the internal IP address.\n"
@@ -349,13 +351,17 @@ class DescribeCommandTest(unittest.TestCase):
 class RunnerEnvironmentTest(unittest.TestCase):
     """The default runner must not hand gcloud a KUBECONFIG.
 
-    In the agent container `gcloud` is the credential-proxy shim, and the shim
-    forwards `$KUBECONFIG` on every gcloud call. `describe` is not
-    `get-credentials`, so the proxy resolves that path through `_target_of`,
-    which stats the file and returns HTTP 400 when it is missing. Both callers
-    pass the kubeconfig their `get-credentials` is about to *create*, so it is
-    reliably missing — which made the describe fail every time and the whole
-    detection a constant "no flag" inside the pod.
+    `gcloud` is the credential-proxy shim, and the shim forwards `$KUBECONFIG`
+    on every gcloud call. `describe` is not `get-credentials`, so the proxy
+    resolves that path through `_target_of`, which stats the file and returns
+    HTTP 400 when it is missing. Both callers pass the kubeconfig their
+    `get-credentials` is about to *create*, so it is reliably missing — which
+    made the describe fail every time and the whole detection a constant
+    "no flag" inside the pod.
+
+    Only the unsandboxed path can get this wrong now. With a sandbox the
+    command carries no environment at all, which is why the sandboxed case
+    below asserts the routing rather than the scrubbing.
     """
 
     def _env_seen_by_gcloud(self, passed_env):
@@ -369,8 +375,12 @@ class RunnerEnvironmentTest(unittest.TestCase):
         original = gke_endpoint.subprocess.run
         gke_endpoint.subprocess.run = fake_run
         try:
-            with redirect_stderr(io.StringIO()):
-                gke_endpoint.dns_endpoint_args("p", "c", "us-central1", env=passed_env)
+            # Pinned rather than inherited: inside the agent pod the managed
+            # config exists and this would take the ssh path, so the test would
+            # pass or fail depending on where it ran.
+            with unittest.mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=False):
+                with redirect_stderr(io.StringIO()):
+                    gke_endpoint.dns_endpoint_args("p", "c", "us-central1", env=passed_env)
         finally:
             gke_endpoint.subprocess.run = original
         return seen
@@ -381,6 +391,29 @@ class RunnerEnvironmentTest(unittest.TestCase):
         )
         self.assertNotIn("KUBECONFIG", seen)
         self.assertEqual(seen.get("HOME"), "/tmp")
+
+    def test_with_a_sandbox_gcloud_runs_there_rather_than_in_the_agent_pod(self):
+        """The agent image carries no gcloud, so a local run would be the bug."""
+        calls = []
+
+        def fake_run(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout=HELP_WITH_FLAG, stderr="")
+
+        gke_endpoint.reset_cache()
+        with unittest.mock.patch.object(sandbox_exec, "sandbox_enabled", return_value=True), \
+             unittest.mock.patch.object(sandbox_exec, "ssh_argv",
+                                        side_effect=lambda argv, **kw: ["ssh", "hermes@sandbox",
+                                                                        " ".join(argv)]), \
+             unittest.mock.patch.object(sandbox_exec.subprocess, "run", fake_run), \
+             redirect_stderr(io.StringIO()):
+            gke_endpoint.dns_endpoint_args("p", "c", "us-central1",
+                                           env={"KUBECONFIG": "/nope"})
+
+        self.assertTrue(calls, "gcloud was never run")
+        for argv in calls:
+            self.assertEqual(argv[0], "ssh")
+            self.assertTrue(argv[1].startswith("hermes@"))
 
     def test_kubeconfig_is_stripped_from_the_inherited_environment(self):
         original = os.environ.get("KUBECONFIG")

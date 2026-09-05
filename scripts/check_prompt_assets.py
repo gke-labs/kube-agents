@@ -91,8 +91,11 @@ PROFILES = ("platform", "chat", "cluster")
 # upstream file, not something this repository ships.
 ASSET_SUFFIXES = frozenset({".md", ".py", ".sh", ".json", ".yaml", ".yml"})
 
-# What `/opt/defaults` holds, in the order the image layers it, from the COPY
-# lines in deploy/docker/Dockerfile.
+# What `/opt/defaults` holds in the agent image, in the order that image layers
+# it, from the COPY lines in the `agent-base` and `platform` stages of
+# deploy/docker/Dockerfile. The credential-proxy stage has a /opt/defaults of
+# its own holding only the credential runtime; it is a different image and has
+# no profile homes, so its COPY lines are not part of this model.
 #
 # It reaches ONE profile home. docker-entrypoint.sh:253 does
 # `cp -ru /opt/defaults/. "$TARGET_DIR/"`, and $TARGET_DIR is the *default*
@@ -117,6 +120,7 @@ OPT_DEFAULTS: tuple[tuple[str, str], ...] = (
     ("scripts/profile_overlay.py", "deploy/shared/profile_overlay.py"),
     ("scripts/profile_plugins.py", "deploy/shared/profile_plugins.py"),
     ("scripts/otel_config.py", "deploy/shared/otel_config.py"),
+    ("scripts/sandbox_mirror.py", "deploy/shared/sandbox_mirror.py"),
 )
 
 # What a specialist profile home actually contains, which is not the whole of

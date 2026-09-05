@@ -14,6 +14,11 @@ terraform {
       source  = "hashicorp/random"
       version = ">= 3.5, < 4.0"
     }
+    tls = {
+      source = "hashicorp/tls"
+      # ED25519 support in tls_private_key landed in 4.0.
+      version = ">= 4.0, < 5.0"
+    }
     helm = {
       source = "hashicorp/helm"
       # The kubernetes = { ... } attribute syntax below is helm-provider-3.x

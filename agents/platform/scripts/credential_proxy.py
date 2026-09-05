@@ -27,14 +27,24 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import command_policy
 import scoped_sa_pool
+
+# Re-exported, not re-implemented. The shim owns kubeconfig parsing because the
+# file is in its pod and not in this one; these three are the vocabulary both
+# sides share, and importing them keeps the context-name grammar in one place.
+# Nothing else in credential_proxy_client runs on import.
+from credential_proxy_client import (  # noqa: F401  (re-export)
+    ClusterTarget,
+    parse_gke_context,
+    read_current_context,
+)
 
 LOGGER = logging.getLogger("credential-proxy")
 SLACK_EVENT_QUEUE_MAXSIZE = 1000
@@ -138,12 +148,187 @@ class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStre
 # What it is honestly *not*: encryption.  The token crosses the cluster
 # network in cleartext, exactly as the github-token-minter call already does
 # (see github_token_refresh.py).  Anyone who can observe pod-to-pod traffic in
-# the namespace can replay it until it expires.  mTLS closes that, and the
-# NetworkPolicy work in the next task narrows who can open the connection at
-# all.  Neither is done here.
+# the namespace can replay it until it expires.  mTLS closes that and is not
+# done here.  buildCredentialProxyNetworkPolicy narrows who can open the
+# connection at all, to the sandbox Pod and the gateway Pod.
 # ---------------------------------------------------------------------------
 
 DEFAULT_CREDENTIAL_PROXY_AUDIENCE = "kubeagents-credential-proxy"
+
+# The second audience, and the whole of the per-caller split.
+#
+# Two Pods call this broker and ``Principal.workload`` cannot tell them apart.
+# It is per-ServiceAccount, and the two ServiceAccounts are both on
+# CREDENTIAL_PROXY_ALLOWED_CALLERS, so knowing which one called says only that
+# the caller was one of the two Pods entitled to. What *can* separate them is
+# the audience their token was projected with: the operator chooses it per Pod,
+# and the API server refuses to validate a token against an audience it was not
+# minted for. So the gateway's token is minted for the chat audience and the
+# sandbox's for the audience above, and the routes each may reach follow from
+# whichever one the TokenReview echoed back.
+#
+# The split is real rather than notional because the two callers already need
+# disjoint routes and the operator already gives each only what its side needs:
+# the gateway has GOOGLE_CHAT_RELAY_URL and SLACK_RELAY_URL and an empty
+# CREDENTIAL_PROXY_URL, and the sandbox has the reverse. What was missing was
+# anything on this side that refused when a caller reached across.
+#
+# Enforced here rather than by splitting the listener across two ports and
+# letting the NetworkPolicy sort them out, for one reason:
+# buildCredentialProxyNetworkPolicy is inert on a cluster whose CNI does not
+# implement NetworkPolicy, and the API server's TokenReview is not. A port
+# split would have been a control on some clusters and a comment on the rest.
+DEFAULT_CREDENTIAL_PROXY_CHAT_AUDIENCE = "kubeagents-credential-proxy-chat"
+
+# The roles a caller can hold, named by which Pod holds them.
+CALLER_ROLE_SHELL = "shell"
+CALLER_ROLE_CHAT = "chat"
+
+# Which role each route demands. Checked by prefix, so the trailing slash on
+# the three families is load-bearing: without it "/v1/chatter" would match
+# "/v1/chat" and inherit its rule.
+#
+# A route absent from this table is reachable by any authenticated caller.
+# That is the right default for the two that are: /healthz, which the readiness
+# probe reaches before any token exists, and an unknown path, which must answer
+# 404 to the caller that may legitimately be probing for it —
+# credential_proxy_client.workspaces_available detects an older broker by
+# asking, and a 403 there would read as "not permitted" rather than "not
+# supported".
+ROUTE_ROLES: tuple[tuple[str, str], ...] = (
+    ("/v1/chat/", CALLER_ROLE_CHAT),
+    ("/v1/exec", CALLER_ROLE_SHELL),
+    ("/v1/github/", CALLER_ROLE_SHELL),
+    ("/v1/workspace/", CALLER_ROLE_SHELL),
+)
+
+
+def required_role(path: str) -> str:
+    """The caller role ``path`` demands, or "" if it demands none."""
+    for prefix, role in ROUTE_ROLES:
+        if path.startswith(prefix):
+            return role
+    return ""
+
+
+# How long a managed-repository allowlist read is reused.
+#
+# The list arrives as a ConfigMap mounted read-only at GITOPS_STATE_PATH, and
+# kubelet refreshes such a mount on its own schedule -- around a minute, and not
+# promptly. So there is already a window between registering a repository and
+# this Pod seeing it, and a cache shorter than that window buys nothing but
+# syscalls. Thirty seconds keeps the added delay well inside the one the mount
+# imposes anyway.
+MANAGED_REPOSITORY_CACHE_SECONDS = 30.0
+
+_managed_repository_cache: tuple[float, frozenset[str]] | None = None
+_managed_repository_lock = threading.Lock()
+
+
+def managed_repositories() -> frozenset[str]:
+    """The `owner/name` slugs this install is configured to act on, lowercased.
+
+    Read from the same mounted ConfigMap `github_token_refresh` already reads to
+    widen token scoping, through the same helper, so there is one parser and one
+    notion of what counts as a managed GitHub repository.
+
+    Raises rather than returning empty when the list cannot be read. The two
+    outcomes are not the same: an empty list is an install with nothing
+    registered, which is a legitimate state that refuses every repository, and
+    an unreadable one is a broker that does not know what it is allowed to do.
+    Returning empty for both would make them indistinguishable in the log at the
+    moment an operator most needs to tell them apart.
+    """
+    global _managed_repository_cache
+    now = time.monotonic()
+    with _managed_repository_lock:
+        cached = _managed_repository_cache
+        if cached is not None and cached[0] > now:
+            return cached[1]
+    from gitops_workspace import get_managed_github_repos
+
+    slugs = frozenset(slug.lower() for slug in get_managed_github_repos())
+    with _managed_repository_lock:
+        _managed_repository_cache = (now + MANAGED_REPOSITORY_CACHE_SECONDS, slugs)
+    return slugs
+
+
+def repository_is_managed(repository: str) -> bool:
+    """Is ``repository`` one this install registered?
+
+    Compared case-insensitively because GitHub treats owner and repository names
+    that way, and the two sides of this comparison are written by different
+    people: the slug in the request comes from a git remote or a model, and the
+    one in the ConfigMap from whoever registered it.
+    """
+    return repository.lower() in managed_repositories()
+
+
+def require_managed_workspace(store, handle: object) -> None:
+    """Refuse a workspace write to a repository this install does not manage.
+
+    `validate_repo` and `get_managed_github_repos` moved into skill scripts that
+    now run in the sandbox, which makes them advice the agent gives itself
+    rather than a control. The broker holds the installation token, so the
+    question "is this a repository we write to" has to be answered here.
+    `CredentialProxyHandler._repository_is_permitted` is the same check on the
+    GitHub API routes; this one raises instead of writing a reply, because the
+    workspace routes answer through the `ContentWorkspaceError` family.
+
+    On `commit` and `push` rather than on `open`: opening is a read, and
+    `inspect-repository` opens repositories this install does not manage on
+    purpose. The repository comes off the handle rather than off the request, so
+    a caller cannot name one repository and write to another.
+
+    An unreadable list refuses rather than allows -- an authorization check that
+    fails open is not one -- and says which of the two it was in the log.
+    """
+    import content_workspace
+
+    repository = store.get(handle).repo
+    try:
+        permitted = repository_is_managed(repository)
+    except Exception as exc:
+        LOGGER.warning(
+            "refusing a workspace write: the managed-repository list could not "
+            "be read type=%s",
+            type(exc).__name__,
+        )
+        raise content_workspace.ManagedRepositoriesUnavailable(
+            "the managed repository list is unavailable"
+        ) from exc
+    if not permitted:
+        raise content_workspace.RepositoryNotManaged(
+            f"{repository} is not one of the repositories this agent manages; "
+            "register it in the gitops-state ConfigMap first"
+        )
+
+
+# Chat API methods the relay refuses to spend its credential on.
+#
+# A denylist rather than an allowlist, for the reason the command policy below
+# gives at "A denylist rather than a read-only allowlist, deliberately": the
+# resource tree these names index belongs to the Hermes adapter and the Google
+# Chat discovery document, neither of which is in this repository, so an
+# allowlist would be enumerated by reading an image we do not build. A name
+# missed out of a denylist is a call that still works; a name missed out of an
+# allowlist is chat down, and chat is the front door.
+#
+# What is on it is the set whose effect cannot be undone by sending another
+# message: removing a space, removing a member, deleting a message or a
+# reaction. Reads and writes stay open, because the relay's whole purpose is
+# for the agent to read and answer chat.
+#
+# Case-folded on comparison. googleapiclient resolves method names exactly, so
+# a differing case would 404 upstream rather than execute -- but the check is
+# an authorization decision and should not depend on that being true.
+DESTRUCTIVE_CHAT_METHODS = frozenset({"delete", "batchdelete", "remove", "purge"})
+
+# The same, for Slack, whose API is flat `group.verb` strings rather than a
+# resource tree. Matched on the verb after the last dot so that a family added
+# upstream -- `bookmarks.remove` after `chat.delete` -- is covered without this
+# list naming it.
+DESTRUCTIVE_SLACK_VERBS = frozenset({"delete", "remove", "kick", "archive"})
 
 
 class AuthenticationError(Exception):
@@ -185,12 +370,22 @@ class Principal:
     neither field is ever derived from the request body — from ``argv``, from
     ``cwd``, from anything a model produced. Both come from a token the API
     server verified.
+
+    ``role`` is the coarse version of that idea which does hold today, and it
+    comes from the same place: the audience the API server validated the token
+    against, which the operator sets per Pod. It says which *side* is calling —
+    the shell or the chat gateway — and that is enough to keep either from
+    reaching the other's routes. It is not per-session and does not pretend to
+    be. "" means no role was established, which is the ``NullAuthenticator``
+    case and reaches every route, because that authenticator is only sound
+    behind a Unix socket where the filesystem is the access control.
     """
 
     workload: str
     uid: str = ""
     groups: tuple[str, ...] = ()
     caller: str | None = None
+    role: str = ""
 
     def describe(self) -> str:
         if self.caller:
@@ -227,13 +422,20 @@ class ServiceAccountAuthenticator:
     unless the audience matches — so a token stolen from the agent cannot be
     replayed against the Kubernetes API, and a token minted for anything else
     cannot be replayed against the broker.
+
+    ``audience_roles`` maps each audience this broker accepts to the caller role
+    it confers. The TokenReview asks about all of them at once and the API
+    server echoes back only those it actually validated, so the role is read off
+    the answer rather than guessed from the request. A projected token carries
+    exactly one audience, so exactly one can come back; more than one is a
+    disagreement with that assumption rather than a wider grant, and is refused.
     """
 
     authenticates = True
 
     def __init__(
         self,
-        audience: str,
+        audience_roles: Mapping[str, str],
         allowed_callers: frozenset[str],
         api_host: str,
         api_port: str,
@@ -242,13 +444,13 @@ class ServiceAccountAuthenticator:
         timeout_seconds: float = 10.0,
         cache_seconds: float = 60.0,
     ) -> None:
-        if not audience:
+        if not audience_roles or not all(audience_roles):
             raise ValueError("an audience is required to authenticate callers")
         if not allowed_callers:
             raise ValueError("at least one allowed caller is required")
         if not api_host:
             raise ValueError("the Kubernetes API server address is not configured")
-        self.audience = audience
+        self.audience_roles = dict(audience_roles)
         self.allowed_callers = allowed_callers
         self.api_host = api_host
         self.api_port = api_port
@@ -314,7 +516,7 @@ class ServiceAccountAuthenticator:
             {
                 "apiVersion": "authentication.k8s.io/v1",
                 "kind": "TokenReview",
-                "spec": {"token": token, "audiences": [self.audience]},
+                "spec": {"token": token, "audiences": sorted(self.audience_roles)},
             },
             separators=(",", ":"),
         ).encode("utf-8")
@@ -355,11 +557,23 @@ class ServiceAccountAuthenticator:
             raise AuthenticationError("TokenReview reported an error")
         if status.get("authenticated") is not True:
             raise AuthenticationError("the presented token is not authenticated")
+        # The API server echoes the audiences it actually validated. A token it
+        # authenticated for some other audience is not for us, and one it
+        # validated for two of ours breaks the assumption the role rests on.
         audiences = status.get("audiences") or []
-        if self.audience not in audiences:
-            # The API server echoes the audiences it actually validated. A token
-            # it authenticated for some other audience is not for us.
+        matched = sorted(
+            {
+                audience
+                for audience in audiences
+                if isinstance(audience, str) and audience in self.audience_roles
+            }
+        )
+        if not matched:
             raise AuthenticationError("the presented token is for another audience")
+        if len(matched) > 1:
+            raise AuthenticationError(
+                "the presented token names more than one of this broker's audiences"
+            )
         user = status.get("user") or {}
         username = user.get("username") or ""
         if username not in self.allowed_callers:
@@ -369,6 +583,7 @@ class ServiceAccountAuthenticator:
             workload=username,
             uid=str(user.get("uid") or ""),
             groups=tuple(str(group) for group in groups if isinstance(group, str)),
+            role=self.audience_roles[matched[0]],
         )
 
 
@@ -396,10 +611,31 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
             "CREDENTIAL_PROXY_AUTH_MODE=serviceaccount requires "
             "CREDENTIAL_PROXY_ALLOWED_CALLERS to name at least one ServiceAccount"
         )
+    shell_audience = os.getenv(
+        "CREDENTIAL_PROXY_AUDIENCE", DEFAULT_CREDENTIAL_PROXY_AUDIENCE
+    ).strip()
+    # Absent means "no split", and that is the whole of the upgrade story.
+    #
+    # A broker on this image rendered by an operator that predates the split
+    # sees one audience, and every caller presenting it gets role "" — which
+    # reaches every route, exactly as it did before this existed. Were the
+    # second audience defaulted instead, that broker would hand the gateway the
+    # shell role and answer 403 to every chat call, and an upgrade that rolls
+    # the broker before the operator would take chat down until it caught up.
+    #
+    # This is why the value is read raw rather than through a default: unset and
+    # set-to-the-default have to be distinguishable, and after os.getenv applies
+    # a default they are not.
+    chat_audience = os.getenv("CREDENTIAL_PROXY_CHAT_AUDIENCE", "").strip()
+    if chat_audience and chat_audience != shell_audience:
+        audience_roles = {
+            shell_audience: CALLER_ROLE_SHELL,
+            chat_audience: CALLER_ROLE_CHAT,
+        }
+    else:
+        audience_roles = {shell_audience: ""}
     return ServiceAccountAuthenticator(
-        audience=os.getenv(
-            "CREDENTIAL_PROXY_AUDIENCE", DEFAULT_CREDENTIAL_PROXY_AUDIENCE
-        ).strip(),
+        audience_roles=audience_roles,
         allowed_callers=allowed,
         api_host=os.getenv("KUBERNETES_SERVICE_HOST", "").strip(),
         api_port=os.getenv("KUBERNETES_SERVICE_PORT", "443").strip() or "443",
@@ -635,6 +871,10 @@ class GoogleChatRelay:
             target = getattr(target, name)()
         if not method or method.startswith("_"):
             raise ValueError("invalid Google Chat API method")
+        if method.lower() in DESTRUCTIVE_CHAT_METHODS:
+            raise ValueError(
+                f"the Google Chat method {method!r} is not available through the relay"
+            )
         operation = getattr(target, method)(**arguments)
         # num_retries opts into googleapiclient's own jittered backoff, which
         # covers ssl.SSLError, socket timeouts and 5xx. Left at its default of
@@ -841,6 +1081,10 @@ class SlackRelay:
     ) -> dict[str, Any]:
         if not method or method.startswith("_"):
             raise ValueError("Slack API method is not available through the relay")
+        if method.rpartition(".")[2].lower() in DESTRUCTIVE_SLACK_VERBS:
+            raise ValueError(
+                f"the Slack method {method!r} is not available through the relay"
+            )
         response = self._client(team_id).api_call(
             method, **self._decode_argument(arguments)
         )
@@ -1126,68 +1370,27 @@ class ExecutionResult:
     duration_ms: int
     truncated: bool
     timed_out: bool
+    # The kubeconfig `gcloud container clusters get-credentials` just wrote,
+    # returned to the caller because the caller is in another pod and gcloud
+    # ran in this one. Empty for every other command. See
+    # `_execute_get_credentials`.
+    kubeconfig: str = ""
 
 
 # A kubeconfig is not passive data. `users[].user.exec.command` runs a program
-# here in the sidecar, next to the credentials; `clusters[].cluster.server` and
-# `proxy-url` choose where the access token minted by gke-gcloud-auth-plugin is
-# sent; `users[].user.tokenFile` reads a file of the author's choosing and sends
-# it as the bearer token. The policy engine cannot see any of that, because every
-# rule it holds matches on argv and the argv is only ever `kubectl get pods`.
+# wherever the file is opened; `clusters[].cluster.server` and `proxy-url` choose
+# where the access token minted by gke-gcloud-auth-plugin is sent;
+# `users[].user.tokenFile` reads a file of the author's choosing and sends it as
+# the bearer token. The policy engine cannot see any of that, because every rule
+# it holds matches on argv and the argv is only ever `kubectl get pods`.
 #
-# The agent can write anywhere in the shared workspace, so any kubeconfig it
-# names is a document it controls. Rather than validate that document — a
-# denylist over a format that keeps growing, and racy besides, since the file can
-# be rewritten between the check and the open — the proxy reads exactly one
-# string out of it and regenerates the rest. See CommandExecutor._resolve_kubeconfig.
-# `\Z`, not `$`. `$` also matches immediately before a trailing newline, so
-# `re.match` on "nowhere\n" succeeds -- and that value goes on to build the
-# scope key in a log line and a filename in the sidecar state dir. `fullmatch`
-# at the call site says the same thing twice on purpose: whichever a later
-# reader changes, the other still holds.
-_GKE_CONTEXT_COMPONENT = re.compile(r"^[a-z0-9][a-z0-9-]*\Z")
-
-# Enough for any real kubeconfig; the point is that this file is attacker-chosen
-# and gets read into memory before anything is known about it.
-MAX_KUBECONFIG_BYTES = 1 << 20
-
-
-@dataclass(frozen=True)
-class ClusterTarget:
-    """A GKE cluster identified well enough to re-fetch credentials for it."""
-
-    project: str
-    location: str
-    cluster: str
-
-    @property
-    def context_name(self) -> str:
-        return f"gke_{self.project}_{self.location}_{self.cluster}"
-
-
-def parse_gke_context(context: str) -> ClusterTarget | None:
-    """Recover the cluster triple from a `gke_<project>_<location>_<cluster>` name.
-
-    This is the same convention the operator builds in `buildCredentialProxyEnv`
-    and the Cluster Agent preflight compares against, and it is what makes the
-    regeneration below possible: the context name alone says which cluster to ask
-    Google for. Underscores are the separator and none of the three components may
-    contain one, so a 4-way split is unambiguous.
-
-    Each component is held to the GKE naming rules, which is also what keeps the
-    value safe to use in a filename — no separators, no dots, no traversal, and
-    no newline, which `$` would have let through and `context_name` would then
-    have carried into a path and a log record.
-    """
-    parts = context.split("_", 3)
-    if len(parts) != 4 or parts[0] != "gke":
-        return None
-    project, location, cluster = parts[1], parts[2], parts[3]
-    if not all(
-        _GKE_CONTEXT_COMPONENT.fullmatch(part) for part in (project, location, cluster)
-    ):
-        return None
-    return ClusterTarget(project=project, location=location, cluster=cluster)
+# So the broker never opens one. The agent's kubeconfig is in the agent's own
+# pod, the shim there reads the single string that says which cluster is wanted
+# (`credential_proxy_client.kubeconfig_context`), and that name is what arrives
+# on the wire. Everything else is regenerated by `gcloud container clusters
+# get-credentials`. `ClusterTarget`, `parse_gke_context` and
+# `read_current_context` live with the shim for the same reason: the parsing
+# happens where the file is, which is not here.
 
 
 def _is_get_credentials(argv: list[str]) -> bool:
@@ -1203,40 +1406,6 @@ def _is_get_credentials(argv: list[str]) -> bool:
     except ValueError:
         return False
     return argv[index + 1 : index + 3] == ["clusters", "get-credentials"]
-
-
-def read_current_context(text: str) -> str | None:
-    """Read `current-context` out of a kubeconfig the way kubectl would.
-
-    `yaml.safe_load`, deliberately, and never `yaml.CSafeLoader`. The C loader
-    recurses in C: a deeply nested document takes the whole sidecar down with
-    SIGSEGV, where the pure-Python loader raises a catchable `RecursionError`.
-    This input is chosen by the agent, so that is the difference between one
-    rejected request and a dead credential proxy. `safe_load` picks the Python
-    loader on its own; the point of saying so is that switching it would be a
-    denial-of-service, not an optimisation.
-
-    Alias expansion is not a concern here. PyYAML resolves every reference to an
-    anchor to the same node and caches the object built from it, so a
-    billion-laughs document costs memory proportional to its own size rather
-    than to its nominal expansion.
-
-    Anything else — a syntax error, several documents, a top level that is not a
-    mapping, a non-string `current-context` — reads as absent, and the caller
-    turns that into a rejection.
-    """
-    import yaml  # lazy: keeps the module importable without pyyaml, as elsewhere in this directory
-
-    try:
-        document = yaml.safe_load(text)
-    except (yaml.YAMLError, RecursionError):
-        return None
-    if not isinstance(document, dict):
-        return None
-    context = document.get("current-context")
-    if not isinstance(context, str):
-        return None
-    return context.strip() or None
 
 
 # Identity stamped on commits the proxy makes on the agent's behalf. `git commit`
@@ -1262,23 +1431,30 @@ GIT_LEASE_MARKER = ".lease"
 # A denylist rather than a read-only allowlist, deliberately. The set of verbs
 # that can mutate a tree is closed and well known; the set of read verbs is not,
 # and a new one silently failing closed would be a worse outcome than the race
-# this closes. `clone` is absent on purpose: it runs at the lease root, one
-# directory above the tree it is about to create, and it cannot damage a tree
-# that does not exist yet. `fetch` is absent for the same reason it is safe —
-# it writes remote-tracking refs and nothing in the working tree. `config`,
-# `remote` and every read verb are likewise untouched.
+# this closes. `config`, `remote` and every read verb are untouched.
 #
 # `pull`, `submodule` and `sparse-checkout` are here because each one is a
 # working-tree write wearing another word: `pull` is `fetch` plus the `merge`
 # or `rebase` two lines up, `submodule update` checks out whole directories,
 # and `sparse-checkout set` adds and removes files across the entire tree. All
 # three were reachable in a clone another agent was midway through.
+#
+# `clone` and `fetch` were left out at first, on the argument that neither
+# writes a working tree it does not own. `fetch` does something worse: it moves
+# `origin/*` in whatever clone it is run in, and every lease-holder in this
+# product compares against those refs to decide whether its work raced someone
+# else's. A foreign fetch makes that comparison agree while the answer is
+# wrong. `clone` writes into a destination it does not choose, which can be a
+# directory inside another agent's lease. Both are leased today by every caller
+# that issues them — `ensure_workspace` writes the marker before it clones, at
+# the lease root the clone runs in — so requiring the lease costs nothing and
+# closes the two remaining ways one agent reaches another's tree.
 GIT_MUTATING_SUBCOMMANDS = frozenset(
     {
         "add", "am", "apply", "branch", "checkout", "cherry-pick", "clean",
-        "commit", "merge", "mv", "pull", "push", "rebase", "reset", "restore",
-        "revert", "rm", "sparse-checkout", "stash", "submodule", "switch",
-        "tag", "update-ref", "worktree",
+        "clone", "commit", "fetch", "merge", "mv", "pull", "push", "rebase",
+        "reset", "restore", "revert", "rm", "sparse-checkout", "stash",
+        "submodule", "switch", "tag", "update-ref", "worktree",
     }
 )
 
@@ -2046,7 +2222,8 @@ class CommandExecutor:
         argv: list[str],
         stdin: str | None = None,
         cwd: str | None = None,
-        kubeconfig: str | None = None,
+        kubeconfig_context: str | None = None,
+        wants_kubeconfig: bool = False,
     ) -> ExecutionResult:
         if (
             not isinstance(argv, list)
@@ -2066,7 +2243,7 @@ class CommandExecutor:
         # kubeconfig, so it is handled separately: it writes, everything else
         # reads.
         if _is_get_credentials(argv):
-            return self._execute_get_credentials(command, stdin, cwd, kubeconfig)
+            return self._execute_get_credentials(command, stdin, cwd, wants_kubeconfig)
 
         # Two ways in, and both have to be covered or the other is a bypass.
         # `--kubeconfig` predates the KUBECONFIG forward and takes precedence
@@ -2100,8 +2277,8 @@ class CommandExecutor:
             kubeconfig_path = (
                 flag_kubeconfig if self.scoped_pool is not None and scoped else None
             )
-        elif kubeconfig:
-            kubeconfig_path = self._resolve_kubeconfig(kubeconfig, scoped=scoped)
+        elif kubeconfig_context:
+            kubeconfig_path = self._resolve_kubeconfig(kubeconfig_context, scoped=scoped)
         elif self.scoped_pool is not None and executable == "kubectl":
             # `KUBECONFIG` is in the base environment, so this branch is not
             # "no cluster" — it is "the sidecar's default cluster", and it has to
@@ -2152,7 +2329,7 @@ class CommandExecutor:
 
         Three things are enforced here rather than assumed:
 
-        * the subcommand is one of the eleven this product issues, checked
+        * the subcommand is one of the twelve this product issues, checked
           against the argv as parsed rather than as composed, so a later edit
           that threads a caller's string into one of these vectors is refused
           instead of run;
@@ -2245,55 +2422,33 @@ class CommandExecutor:
             )
         return None
 
-    def _workspace_kubeconfig(self, kubeconfig: str) -> Path:
-        """Hold a caller-supplied kubeconfig path to the shared workspace.
+    def _resolve_kubeconfig(self, context: str, *, scoped: bool = True) -> Path:
+        """Turn the cluster name a caller sent into a kubeconfig the proxy wrote.
 
-        Cluster Agent profiles pin themselves to one cluster through this path,
-        but the client cannot simply forward its environment: the command
-        executes in the sidecar, where the agent must not be able to reach
-        credential material. The path is therefore held to the same containment
-        rule as `cwd`. Paths elsewhere in the sidecar filesystem are rejected
-        rather than silently ignored, so a mistake surfaces as an error instead
-        of a command that quietly talks to the wrong cluster.
+        A name is all that arrives. The shim in the agent's pod reads
+        `current-context` out of the kubeconfig there and sends that string
+        (`credential_proxy_client.kubeconfig_context`), so no document the agent
+        authored is ever opened on this side — the `exec` stanza, `auth-provider`,
+        `server`, `proxy-url`, `tokenFile` and `insecure-skip-tls-verify` are all
+        written by gcloud rather than by the agent, and there is no allowlist to
+        keep current.
 
-        A `path1:path2` merge list is refused outright. kubectl would flatten it
-        into one view, and there is no sound way to regenerate a merge of
-        documents whose contents are never trusted in the first place.
-        """
-        entries = [entry.strip() for entry in kubeconfig.split(os.pathsep) if entry.strip()]
-        if not entries:
-            raise ValueError("kubeconfig must not be empty")
-        if len(entries) > 1:
-            raise ValueError(
-                "kubeconfig must name a single file; merged KUBECONFIG lists are not supported"
-            )
-        candidate = Path(entries[0]).resolve()
-        if not self._within_workspace(candidate):
-            raise ValueError("kubeconfig is outside the shared workspace")
-        return candidate
-
-    def _resolve_kubeconfig(self, kubeconfig: str, *, scoped: bool = True) -> Path:
-        """Turn a caller's kubeconfig path into one the proxy wrote itself.
-
-        The caller's file is treated as a *name*, not as content. Exactly one
-        string is taken from it — `current-context` — and that string is only
-        accepted if it is a well-formed GKE context name, which is enough to say
-        which cluster is wanted. The kubeconfig the command then runs against is
-        regenerated by `gcloud container clusters get-credentials` against the
-        live GKE API and kept in a directory the agent cannot write.
-
-        So every field that made a caller-supplied kubeconfig dangerous — the
-        `exec` stanza, `auth-provider`, `server`, `proxy-url`, `tokenFile`,
-        `insecure-skip-tls-verify` — is now written by gcloud rather than by the
-        agent. There is no allowlist to keep current and no document to re-check
-        at open time, because nothing the agent authored is ever opened.
+        The name is still checked here rather than trusted, because the shim is
+        on the far side of the wire and everything that crosses it is caller
+        input: `parse_gke_context` is what keeps this value out of a filename
+        and a log line it has no business in.
 
         What the caller keeps is the ability to *name* a cluster. That is not new
         authority: `get-credentials` is bound by the same IAM the proxy already
         runs under, so it can only name clusters this identity could reach anyway.
         """
-        requested = self._workspace_kubeconfig(kubeconfig)
-        return self._kubeconfig_for(self._target_of(requested), scoped=scoped)
+        target = parse_gke_context(context.strip())
+        if target is None:
+            raise ValueError(
+                f"kubeconfigContext {context!r} is not a GKE context name"
+                " (expected gke_<project>_<location>_<cluster>)"
+            )
+        return self._kubeconfig_for(target, scoped=scoped)
 
     def _kubeconfig_for(self, target: ClusterTarget, *, scoped: bool = True) -> Path:
         """Swap the ambient credential for the one that only reads this cluster.
@@ -2385,10 +2540,12 @@ class CommandExecutor:
     ) -> tuple[list[str], Path | None]:
         """Point any `--kubeconfig` in argv at the regenerated file.
 
-        kubectl prefers this flag over the environment, and it reaches the
-        sidecar untouched — the policy engine matches on argv but has no rule for
-        it, and the workspace PVC is mounted here. Left alone it would be the
-        simplest way around everything `_resolve_kubeconfig` does.
+        kubectl prefers this flag over the environment, and it reaches the broker
+        untouched — the policy engine matches on argv but has no rule for it.
+        Left alone it would be the simplest way around everything
+        `_resolve_kubeconfig` does. The value is a context name by the time it
+        gets here: the shim rewrote it from a path in the pod that has the file
+        (`credential_proxy_client.resolve_kubeconfig_flags`).
 
         Returns the rewritten argv and the path the flag ends up naming, or None
         when there was no flag. The caller needs to know: resolving the flag has
@@ -2413,25 +2570,6 @@ class CommandExecutor:
                 rewritten[index] = f"--kubeconfig={resolved_path}"
             index += 1
         return rewritten, resolved_path
-
-    def _target_of(self, requested: Path) -> ClusterTarget:
-        """Read the wanted cluster out of the caller's kubeconfig."""
-        try:
-            if requested.stat().st_size > MAX_KUBECONFIG_BYTES:
-                raise ValueError(f"kubeconfig is implausibly large: {requested}")
-            text = requested.read_text(encoding="utf-8", errors="replace")
-        except OSError as error:
-            raise ValueError(f"kubeconfig is unreadable: {requested}") from error
-        context = read_current_context(text)
-        if not context:
-            raise ValueError(f"kubeconfig names no current-context: {requested}")
-        target = parse_gke_context(context)
-        if target is None:
-            raise ValueError(
-                f"current-context {context!r} is not a GKE context name"
-                " (expected gke_<project>_<location>_<cluster>)"
-            )
-        return target
 
     def _managed_kubeconfig(self, target: ClusterTarget) -> Path:
         return self.kubeconfig_dir / f"{target.context_name}.yaml"
@@ -2513,24 +2651,27 @@ class CommandExecutor:
         command: list[str],
         stdin: str | None,
         cwd: str | None,
-        kubeconfig: str | None,
+        wants_kubeconfig: bool,
     ) -> ExecutionResult:
         """Run the one command that is allowed to author a kubeconfig.
 
-        gcloud writes into the proxy's own directory, never straight to the path
-        the caller asked for. The generated file is then filed under the context
-        it selects — that read is trustworthy because gcloud, not the agent, just
-        wrote it — and copied out to the caller so the workspace still holds the
-        visible pin that `cluster_agent_profile.py` records and the Cluster Agent
-        preflight stats. That copy is an artefact for the agent to look at; it is
-        never what a later command runs against.
+        gcloud writes into the proxy's own directory. The generated file is then
+        filed under the context it selects — that read is trustworthy because
+        gcloud, not the agent, just wrote it — and returned to the caller so the
+        agent's pod can keep the visible pin that `cluster_agent_profile.py`
+        records and the Cluster Agent preflight stats. That copy is an artefact
+        for the agent to look at; it is never what a later command runs against,
+        because a later command names a cluster and this side regenerates the
+        file from that name.
+
+        Returned rather than written: the destination is a path in the agent's
+        pod, which this process cannot see and must not be handed a route into.
         """
-        if not kubeconfig:
-            # No destination asked for, so gcloud updates the sidecar's own
+        if not wants_kubeconfig:
+            # No destination asked for, so gcloud updates the broker's own
             # config as it always has. Nothing agent-authored is involved.
             return self._execute(command, stdin=stdin, cwd=cwd)
 
-        requested = self._workspace_kubeconfig(kubeconfig)
         scratch = self.kubeconfig_dir / f".pending-{uuid.uuid4().hex}.yaml"
         try:
             result = self._execute(command, stdin=stdin, cwd=cwd, kubeconfig_path=scratch)
@@ -2545,8 +2686,7 @@ class CommandExecutor:
                     # redundant fetch. Taking the lock here would serialise every
                     # scaffold behind every cold read for no benefit.
                     os.replace(scratch, self._managed_kubeconfig(target))
-                requested.parent.mkdir(parents=True, exist_ok=True)
-                requested.write_text(generated, encoding="utf-8")
+                result = replace(result, kubeconfig=generated)
             return result
         finally:
             scratch.unlink(missing_ok=True)
@@ -2816,7 +2956,6 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         """
         try:
             self.principal = self.authenticator.authenticate(self.headers)
-            return self.principal
         except AuthenticationError as exc:
             LOGGER.warning(
                 "rejected an unauthenticated request path=%s reason=%s",
@@ -2827,6 +2966,88 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 HTTPStatus.UNAUTHORIZED, {"error": "caller could not be authenticated"}
             )
             return None
+        if not self._role_permits(self.principal):
+            return None
+        return self.principal
+
+    def _role_permits(self, principal: Principal) -> bool:
+        """Answer 403 and return False if this caller's side may not use this route.
+
+        Separate from authentication because the answer is a different one: 401
+        says "I do not know who you are", 403 says "I do, and this is not
+        yours". Collapsing them would tell the gateway its token had expired
+        when what happened is that it asked for a route belonging to the shell.
+
+        A principal with no role reaches everything. That is the
+        ``NullAuthenticator`` behind a Unix socket, and a broker whose operator
+        has not been upgraded to project a second audience yet; ``role`` is set
+        only where the API server confirmed which audience it validated.
+        """
+        needed = required_role(self.path)
+        if not needed or not principal.role or principal.role == needed:
+            return True
+        LOGGER.warning(
+            "refused a route this caller's role does not reach path=%s role=%s needed=%s",
+            _sanitize_for_logging(self.path),
+            principal.role,
+            needed,
+        )
+        self._json(
+            HTTPStatus.FORBIDDEN,
+            {
+                "error": "this route is not available to this caller",
+                "code": "CALLER_ROLE_FORBIDDEN",
+            },
+        )
+        return False
+
+    def _repository_is_permitted(self, repository: str) -> bool:
+        """Answer 403 and return False unless this install registered ``repository``.
+
+        The broker is where this belongs and where it has not been until now.
+        `SOUL.md` tells the agent to check the managed-repository list before
+        acting, and the GitOps skills do -- but that is the agent policing
+        itself with the list it was handed, which is advice rather than a
+        control. Everything downstream of this method spends the installation
+        token, so the question "is this a repository we act on" has to be
+        answered on the side that holds the credential.
+
+        An unreadable list refuses rather than allows, and says which of the two
+        it was in the log: an authorization check that fails open is not one.
+        """
+        try:
+            permitted = repository_is_managed(repository)
+        except Exception as exc:
+            LOGGER.warning(
+                "refusing a repository request: the managed-repository list "
+                "could not be read type=%s",
+                type(exc).__name__,
+            )
+            self._json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {
+                    "error": "the managed repository list is unavailable",
+                    "code": "MANAGED_REPOSITORIES_UNAVAILABLE",
+                },
+            )
+            return False
+        if permitted:
+            return True
+        LOGGER.warning(
+            "refused a repository this install does not manage repository=%s",
+            _sanitize_for_logging(repository),
+        )
+        self._json(
+            HTTPStatus.FORBIDDEN,
+            {
+                "error": (
+                    "this repository is not one the agent manages; register it "
+                    "in the gitops-state ConfigMap first"
+                ),
+                "code": "REPOSITORY_NOT_MANAGED",
+            },
+        )
+        return False
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path != "/healthz" and self._authenticated() is None:
@@ -2908,9 +3129,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             cwd = payload.get("cwd")
             if cwd is not None and not isinstance(cwd, str):
                 raise ValueError("cwd must be a string")
-            kubeconfig = payload.get("kubeconfig")
-            if kubeconfig is not None and not isinstance(kubeconfig, str):
-                raise ValueError("kubeconfig must be a string")
+            # A GKE context name, not a path: the file it came from is in the
+            # caller's pod. `_resolve_kubeconfig` holds it to the grammar.
+            kubeconfig_context = payload.get("kubeconfigContext")
+            if kubeconfig_context is not None and not isinstance(kubeconfig_context, str):
+                raise ValueError("kubeconfigContext must be a string")
+            wants_kubeconfig = bool(payload.get("wantsKubeconfig", False))
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
@@ -3035,7 +3259,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
 
         try:
             result = self.executor.execute(
-                argv, stdin=stdin, cwd=cwd, kubeconfig=kubeconfig
+                argv,
+                stdin=stdin,
+                cwd=cwd,
+                kubeconfig_context=kubeconfig_context,
+                wants_kubeconfig=wants_kubeconfig,
             )
         except scoped_sa_pool.PoolRefusal as exc:
             # A refusal, not a fault and not a caller error: the request was
@@ -3094,18 +3322,20 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             result.duration_ms,
             result.truncated,
         )
-        self._json(
-            HTTPStatus.OK,
-            {
-                "status": "completed",
-                "exitCode": result.exit_code,
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-                "durationMs": result.duration_ms,
-                "truncated": result.truncated,
-                "timedOut": result.timed_out,
-            },
-        )
+        response = {
+            "status": "completed",
+            "exitCode": result.exit_code,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "durationMs": result.duration_ms,
+            "truncated": result.truncated,
+            "timedOut": result.timed_out,
+        }
+        # Only `get-credentials` fills this, and only when the caller asked for
+        # the file. It is gcloud's own output, not anything the agent wrote.
+        if result.kubeconfig:
+            response["kubeconfig"] = result.kubeconfig
+        self._json(HTTPStatus.OK, response)
 
     def _handle_workspace_post(self) -> None:
         """The content-passing routes: bytes in, bytes out, never a path.
@@ -3131,7 +3361,19 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         import content_workspace
 
         if self.workspaces is None:
-            self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
+            # A code as well as the status. A caller that can do either
+            # content-passing or a working-tree clone has to tell "the broker
+            # does not have this armed" from "that verb does not exist", and a
+            # bare 404 answers both. See
+            # `credential_proxy_client.workspaces_available`.
+            self._json(
+                HTTPStatus.NOT_FOUND,
+                {
+                    "status": "not_found",
+                    "code": "CONTENT_WORKSPACES_DISABLED",
+                    "message": "content workspaces are not enabled on this broker",
+                },
+            )
             return
         route = self.path[len("/v1/workspace/") :]
         try:
@@ -3176,14 +3418,46 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
 
         store = self.workspaces
         if route == "open":
-            workspace = store.open(payload.get("repo"), payload.get("base") or None)
+            requested = payload.get("repo")
+            if not is_valid_repository(requested):
+                # A ContentWorkspaceError rather than a ValueError, though both
+                # answer 400. `credential_proxy_client.workspaces_available`
+                # probes this route with an empty repo to find out whether the
+                # broker serves it at all, so a malformed slug is a reply this
+                # route owes an error *code* for, and the code is what tells a
+                # probe apart from a caller that got the name wrong. It also
+                # keeps the refusal on the same exception family as the write
+                # gate below, so a caller catching one catches both.
+                raise content_workspace.ContentWorkspaceError(
+                    "repo must be owner/name"
+                )
+            # No managed-repository gate here. `inspect-repository` exists to
+            # read code this install does not manage -- a dependency, an
+            # upstream project, a repository named in an issue -- so gating the
+            # clone would take the skill away rather than take a capability
+            # away. The gate is on `commit` and `push` below, which are where
+            # the installation token stops reading and starts writing.
+            workspace = store.open(
+                requested,
+                payload.get("base") or None,
+                payload.get("branch") or None,
+                payload.get("depth"),
+            )
             return {
                 "handle": workspace.handle,
                 "repo": workspace.repo,
                 "base": workspace.base,
                 "baseSha": workspace.base_sha,
+                "branchSha": workspace.branch_sha,
+                "startedFrom": workspace.started_from,
+                "shallow": workspace.shallow,
             }
         if route == "read":
+            # `paths` is the batched form and answers a different shape. Keyed
+            # on its presence rather than on a separate route so that a caller
+            # reading one file and a caller reading forty use one verb.
+            if payload.get("paths") is not None:
+                return store.read_many(payload.get("handle"), payload.get("paths"))
             content = store.read(payload.get("handle"), payload.get("path"))
             return {
                 "path": payload.get("path"),
@@ -3191,10 +3465,21 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 "size": len(content),
             }
         if route == "list":
-            return {
-                "entries": store.list(payload.get("handle"), payload.get("prefix") or None)
-            }
+            return store.list(
+                payload.get("handle"),
+                payload.get("prefix") or None,
+                payload.get("after") or None,
+            )
+        if route == "grep":
+            return store.grep(
+                payload.get("handle"),
+                payload.get("pattern"),
+                payload.get("prefix") or None,
+                regex=payload.get("regex") is True,
+                ignore_case=payload.get("ignoreCase") is True,
+            )
         if route == "commit":
+            require_managed_workspace(store, payload.get("handle"))
             changes = content_workspace.parse_changes(payload.get("changes"))
             return store.commit(
                 payload.get("handle"),
@@ -3202,8 +3487,10 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 payload.get("message"),
                 changes,
                 expected_base_sha=payload.get("expectedBaseSha") or None,
+                expected_branch_sha=payload.get("expectedBranchSha") or None,
             )
         if route == "push":
+            require_managed_workspace(store, payload.get("handle"))
             return store.push(payload.get("handle"), payload.get("branch"))
         if route == "close":
             store.close(payload.get("handle"))
@@ -3221,6 +3508,9 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 raise ValueError("repository must be owner/name")
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+
+        if not self._repository_is_permitted(repository):
             return
 
         try:

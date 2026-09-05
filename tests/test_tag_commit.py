@@ -17,6 +17,7 @@ from tests.testing.common import (
     create_mock_git_repo,
     get_isolated_test_env,
 )
+from tests.testing.release import populate_mock_release_files
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _RELEASE = _REPO_ROOT / "scripts" / "release"
@@ -202,14 +203,20 @@ class TagCommitTest(unittest.TestCase):
 
     def test_tag_ga_release_still_routes_through_the_shared_tagger(self):
         repo_dir, git = self._repo()
+        populate_mock_release_files(repo_dir)
+        git("add", ".")
+        git("commit", "-m", "feat: populate release files")
         head = git("rev-parse", "HEAD").stdout.strip()
 
         proc = self._run("tag_ga_release.sh", ["0.2.0", head], repo_dir)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("CREATING AND PUSHING GA RELEASE GIT TAG", proc.stdout)
         self.assertIn("Release Version:     0.2.0", proc.stdout)
-        self.assertEqual(git("rev-parse", "0.2.0^{commit}").stdout.strip(), head)
+        tag_commit = git("rev-parse", "0.2.0^{commit}").stdout.strip()
+        self.assertNotEqual(tag_commit, head)
+        self.assertEqual(git("rev-parse", f"{tag_commit}^1").stdout.strip(), head)
 
 
 if __name__ == "__main__":
     unittest.main()
+

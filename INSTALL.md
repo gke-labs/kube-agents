@@ -20,16 +20,17 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
 3. [Method 0: Zero-Friction One-Liner Installation (Fastest)](#method-0-zero-friction-one-liner-installation-fastest)
 4. [Method 1: The Install Engine — Terraform + Helm](#method-1-the-install-engine--terraform--helm)
    - [Step-by-Step Execution](#step-by-step-execution)
-5. [Method 2: Manual Kubernetes Cluster Deployment](#method-2-manual-kubernetes-cluster-deployment)
+5. [The Shell Sandbox](#the-shell-sandbox)
+6. [Method 2: Manual Kubernetes Cluster Deployment](#method-2-manual-kubernetes-cluster-deployment)
    - [Step 1: Install cert-manager](#step-1-install-cert-manager)
    - [Step 2: Create API Key & Access Secrets](#step-2-create-api-key--access-secrets)
    - [Step 3: Build & Push the Operator Image](#step-3-build--push-the-operator-image)
    - [Step 4: Deploy the Operator & CRDs](#step-4-deploy-the-operator--crds)
    - [Step 5: Deploy Integrations (LiteLLM & GitHub)](#step-5-deploy-integrations-litellm--github)
    - [Step 6: Apply Custom Resources](#step-6-apply-custom-resources)
-6. [Method 3: Local Development & Fast Iteration](#method-3-local-development--fast-iteration)
-7. [Teardown & Cleanup](#teardown--cleanup)
-8. [Troubleshooting & Common FAQ](#troubleshooting--common-faq)
+7. [Method 3: Local Development & Fast Iteration](#method-3-local-development--fast-iteration)
+8. [Teardown & Cleanup](#teardown--cleanup)
+9. [Troubleshooting & Common FAQ](#troubleshooting--common-faq)
 
 ---
 
@@ -337,6 +338,57 @@ If you enabled Google Chat or Slack during the install, perform the following re
 
 ---
 
+## The Shell Sandbox
+
+Every command the model writes runs in `platform-agent-shell-0`, a pod of its own that holds no
+credentials and is reached over SSH. It is not optional and there is nothing to turn on: the
+operator refuses `shellSandbox.enabled: false` with `Degraded`/`ShellSandboxCannotBeDisabled`, and
+the chart fails the render rather than installing something that would sit `Degraded`. The SSH
+keypair it needs is minted for you by `install.sh`, by the Terraform composition, and by
+`upgrade.sh` on an install that predates it, so there is no key ceremony.
+
+The one thing left to choose is the container runtime. `gvisor` puts a user-space kernel under the
+sandbox pod and needs a GKE Sandbox node pool; on Standard clusters `enable_gvisor_node_pool = true`
+builds one, and Autopilot ships the `gvisor` RuntimeClass with no pool to manage. Leave it empty to
+run on the node's standard runtime.
+
+Set it on a new install by adding this to `terraform.tfvars` before the first apply
+([Method 1](#method-1-the-install-engine--terraform--helm), Step 2):
+
+```hcl
+cluster_mode            = "standard" # omit both lines on Autopilot, which
+enable_gvisor_node_pool = true       # provides the gvisor RuntimeClass natively
+
+extra_helm_values = {
+  platformAgent = { harness = { experimental = { shellSandbox = {
+    runtimeClassName = "gvisor"
+  } } } }
+}
+```
+
+Or on an existing one:
+
+```bash
+helm upgrade kube-agents ./charts/kube-agents \
+  --namespace kubeagents-system --reuse-values \
+  --set platformAgent.harness.experimental.shellSandbox.runtimeClassName=gvisor \
+  --wait --timeout 10m
+```
+
+Confirm it took: `kubectl get pod platform-agent-shell-0 -n kubeagents-system -o jsonpath='{.spec.runtimeClassName}'`.
+
+On an install that came from `install.sh`, put the same value in `extra_helm_values` in
+`terraform/examples/full-install/terraform.tfvars` as well. The next `upgrade.sh` or `install.sh`
+re-run regenerates that file from `install.env`, which does not record this setting, and reverts a
+value set only on the Helm release.
+
+Installing the chart directly with `helm install` gives you a sandbox the agent cannot log into: the
+chart cannot generate an `authorized_keys`-form public key, so `platform-agent-shell-authorized-keys`
+renders empty. Supply the keypair yourself in `platformAgent.credentials.data`
+(`SANDBOX_SSH_PRIVATE_KEY`, `SANDBOX_SSH_PUBLIC_KEY`) or use Method 1.
+
+---
+
 ## Method 2: Manual Kubernetes Cluster Deployment
 
 If you are installing into an existing Kubernetes or GKE cluster without using the automated GCP provisioning pipeline, follow these steps.
@@ -612,8 +664,8 @@ make uninstall
 
 ### 4. Agent Pod Crashlooping, or CLIs Reporting `credential proxy unavailable`
 
-- The `platform-agent` Pod runs four containers, and `gcloud`/`kubectl` inside the sandbox are wrappers around the credential sidecar, so a failed sidecar looks like broken tooling rather than a failed container. Read the sidecar's log first:
+- `gcloud`/`kubectl` in the shell sandbox are wrappers around the credential proxy, which runs in a Pod of its own, so a failed proxy looks like broken tooling rather than a failed container. Read the proxy's log first:
   ```bash
-  kubectl logs -n kubeagents-system deploy/platform-agent-gateway -c envoy-credential-proxy
+  kubectl logs -n kubeagents-system deploy/platform-agent-credential-proxy
   ```
 - For the symptoms, what they mean, and how to check the Pod's identity from outside the sandbox, see the [credential isolation troubleshooting section](docs/site/src/content/docs/reference/credential-isolation.md#troubleshooting).

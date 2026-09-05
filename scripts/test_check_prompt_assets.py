@@ -60,31 +60,29 @@ def _stage_chain(text: str, target: str) -> set[str]:
     return chain
 
 
-def _copy_instructions(dockerfile: Path, target: str | None = None) -> list[list[str]]:
-    """Every build-context COPY in a Dockerfile, as its argument list.
+def _instructions(dockerfile: Path, keyword: str, target: str | None = None) -> list[str]:
+    """Every `keyword` line in a Dockerfile, continuations joined.
 
-    Continuations and the multi-source form both matter here: the lines this
-    model depends on are written as `COPY a.md \\\n b.md \\\n /opt/defaults/docs/`,
-    and a parser that reads physical lines sees none of them. That failure is
-    silent in the worst way -- it makes the comparison below pass over an empty
-    list until a `self.assertTrue(expected)` catches it.
+    Continuations matter here: the lines these models depend on are written as
+    `COPY a.md \\\n b.md \\\n /opt/defaults/docs/` and as `RUN foo; \\\n chmod
+    ...`, and a parser that reads physical lines sees neither. That failure is
+    silent in the worst way -- it makes a comparison pass over an empty list
+    until an `assertTrue` catches it.
 
-    `COPY --from=<stage>` is skipped rather than having its flag dropped. Its
-    source is another build stage, not this repository, so a path in it says
-    nothing about a file in the checkout. Today the only two land in
-    /usr/local/bin and OPT_DEFAULTS would ignore them anyway; the point is that
-    one aimed at an asset directory would otherwise be read as a repo path and
-    quietly agree with a model that is wrong.
+    `target` narrows the result to the stages that build one image. An
+    instruction in a sibling stage lands in a different image and says nothing
+    about this one -- `credential-proxy` writes its own /opt/defaults/scripts
+    from the same sources, and counting both would have the caller's model claim
+    the agent image copies each of them twice.
 
-    `target` narrows the result to the stages that build one image. A COPY in a
-    sibling stage lands in a different image and says nothing about this one --
-    `credential-proxy` writes its own /opt/defaults/scripts from the same
-    sources, and counting both would have the caller's model claim the agent
-    image copies each of them twice.
+    The result keeps file order, which is build order: a stage can only be built
+    `FROM` one defined above it, so a later line in the chain is a later layer.
+    Callers that care which instruction wins -- the last `chmod` of a directory,
+    say -- can rely on that.
     """
     text = re.sub(r"\\\n", " ", dockerfile.read_text(encoding="utf-8"))
     chain = _stage_chain(text, target) if target else None
-    instructions = []
+    lines = []
     stage = None
     for line in text.splitlines():
         tokens = line.split()
@@ -92,10 +90,26 @@ def _copy_instructions(dockerfile: Path, target: str | None = None) -> list[list
             arguments = [token for token in tokens[1:] if not token.startswith("--")]
             stage = arguments[-1] if len(arguments) >= 3 and arguments[-2].upper() == "AS" else None
             continue
-        if not line.startswith("COPY "):
+        if not tokens or tokens[0].upper() != keyword:
             continue
         if chain is not None and stage not in chain:
             continue
+        lines.append(line)
+    return lines
+
+
+def _copy_instructions(dockerfile: Path, target: str | None = None) -> list[list[str]]:
+    """Every build-context COPY in a Dockerfile, as its argument list.
+
+    `COPY --from=<stage>` is skipped rather than having its flag dropped. Its
+    source is another build stage, not this repository, so a path in it says
+    nothing about a file in the checkout. Today the only two land in
+    /usr/local/bin and OPT_DEFAULTS would ignore them anyway; the point is that
+    one aimed at an asset directory would otherwise be read as a repo path and
+    quietly agree with a model that is wrong.
+    """
+    instructions = []
+    for line in _instructions(dockerfile, "COPY", target):
         flags = [argument for argument in line.split()[1:] if argument.startswith("--")]
         if any(flag.startswith("--from=") for flag in flags):
             continue
@@ -107,6 +121,47 @@ def _copy_instructions(dockerfile: Path, target: str | None = None) -> list[list
         if len(arguments) >= 2:
             instructions.append(arguments)
     return instructions
+
+
+# `chmod <mode> /opt/defaults` anywhere inside a RUN's command chain, with or
+# without the trailing slash. The trailing lookahead is what keeps
+# /opt/defaults/scripts -- a different directory with its own mode -- out.
+_CHMOD_OPT_DEFAULTS = re.compile(
+    r"\bchmod\s+(?:-\S+\s+)*(?P<mode>\S+)\s+/opt/defaults/?(?=[\s;&|]|$)"
+)
+_NUMERIC_MODE = re.compile(r"[0-7]{3,4}")
+_SYMBOLIC_CLAUSE = re.compile(r"([ugoa]*)([-+=])([rwxXst]*)")
+
+
+def _leaves_other_execute(mode: str) -> bool | None:
+    """Whether `chmod <mode>` decides the `other` execute bit, and to what.
+
+    ``None`` means it does not decide: `chmod g+x` and `chmod o+r` both leave
+    whatever was there. A caller folding a sequence of modes skips those and
+    takes the last one that answered.
+
+    Raises on a mode it cannot read, which is the point -- a chmod this parser
+    silently ignored would let the check below pass on a directory nothing had
+    widened.
+    """
+    if _NUMERIC_MODE.fullmatch(mode):
+        return bool(int(mode[-1], 8) & 1)
+    decided = None
+    for clause in mode.split(","):
+        parsed = _SYMBOLIC_CLAUSE.fullmatch(clause)
+        if not parsed:
+            raise ValueError(f"unreadable chmod mode {mode!r}")
+        who, operator, permissions = parsed.groups()
+        # An empty `who` is `a` masked by the umask; treat it as touching other.
+        if "o" not in (who or "a") and "a" not in (who or "a"):
+            continue
+        # `X` sets execute on a directory, which /opt/defaults is.
+        executable = "x" in permissions or "X" in permissions
+        if operator == "=":
+            decided = executable
+        elif executable:
+            decided = operator == "+"
+    return decided
 
 
 class ProfileFixture:
@@ -403,6 +458,40 @@ class ResolutionModelTests(unittest.TestCase):
             parsed, [["agents/platform/docs/glossary.md", "/opt/defaults/docs/"]]
         )
 
+    def test_a_copy_in_an_unrelated_stage_is_not_part_of_the_agent_image(self):
+        """Two images, one Dockerfile, and /opt/defaults in both of them.
+
+        The credential-proxy stage puts the credential runtime under
+        /opt/defaults/scripts as well. It is a sibling of the agent image rather
+        than a layer of it and has no profile homes, so counting its COPY lines
+        would put a second `scripts` entry in the model for a directory the
+        entrypoint never sees. The fixture branches the two off a shared
+        agent-base, which is what the real file does: a parser that keyed on the
+        base image rather than on the stage graph would read them as one image.
+        """
+        with TemporaryDirectory() as directory:
+            dockerfile = Path(directory) / "Dockerfile"
+            dockerfile.write_text(
+                "COPY before/first-stage.md /opt/defaults/\n"
+                "FROM ${HERMES_AGENT_IMAGE}:${TAG} AS agent-base\n"
+                "COPY agents/chat/SOUL.md /opt/defaults/\n"
+                "FROM agent-base AS platform\n"
+                "COPY agents/platform/scripts/ /opt/defaults/scripts/\n"
+                "FROM agent-base AS credential-proxy\n"
+                "COPY agents/platform/scripts/ /opt/defaults/scripts/\n",
+                encoding="utf-8",
+            )
+            text = dockerfile.read_text(encoding="utf-8")
+            self.assertEqual(_stage_chain(text, "platform"), {"platform", "agent-base"})
+            parsed = _copy_instructions(dockerfile, target="platform")
+        self.assertEqual(
+            parsed,
+            [
+                ["agents/chat/SOUL.md", "/opt/defaults/"],
+                ["agents/platform/scripts/", "/opt/defaults/scripts/"],
+            ],
+        )
+
     def test_opt_defaults_matches_the_dockerfile(self):
         """OPT_DEFAULTS is a hand-written copy of the image layout.
 
@@ -418,10 +507,9 @@ class ResolutionModelTests(unittest.TestCase):
         its own /opt/defaults/scripts from the same five sources, but it is a
         different image and the entrypoint this table models never runs there.
         """
+        dockerfile = REPO / "deploy/docker/Dockerfile"
         expected: list[tuple[str, str]] = []
-        for arguments in _copy_instructions(
-            REPO / "deploy/docker/Dockerfile", target="platform"
-        ):
+        for arguments in _copy_instructions(dockerfile, target="platform"):
             *sources, destination = arguments
             if not destination.startswith("/opt/defaults/"):
                 continue
@@ -475,6 +563,78 @@ class ResolutionModelTests(unittest.TestCase):
             "from different sources; the sidecar runs credential_proxy.py out of "
             "that directory and has no other copy of it",
         )
+
+    def test_the_sidecar_leaves_opt_defaults_traversable(self):
+        """/opt/defaults must be traversable by a uid other than hermes.
+
+        agent-base leaves it 0700 hermes:hermes. Co-located with the shell
+        sandbox the sidecar runs as uid 1000, the sandbox login, so that the two
+        containers can share a working tree -- and 0700 there makes every script
+        under it unreachable however permissive the scripts' own modes are.
+
+        The symptom is a container that exits on its first line with "Permission
+        denied" against a path whose mode is 0755, which sends the reader to the
+        file rather than to its parent. It survives no other gate: the image
+        builds, the COPY comparison above passes, and the standalone placement
+        runs as hermes and never notices.
+
+        What the chain ends on is what ships, so the modes are folded in build
+        order and the last one to decide the bit is the one asserted on. A test
+        that only asked whether some line widened the directory would pass on a
+        chain that widened it and then narrowed it again -- which is exactly the
+        regression it is here to catch, since the stages below already carry
+        three chmods of this one path.
+        """
+        dockerfile = REPO / "deploy/docker/Dockerfile"
+        traversable = None
+        modes = []
+        for line in _instructions(dockerfile, "RUN", target="credential-proxy"):
+            for match in _CHMOD_OPT_DEFAULTS.finditer(line):
+                mode = match.group("mode")
+                modes.append(mode)
+                decided = _leaves_other_execute(mode)
+                if decided is not None:
+                    traversable = decided
+        self.assertTrue(
+            modes,
+            "no RUN in the credential-proxy chain chmods /opt/defaults; either the "
+            "widening is gone or this parser is stale",
+        )
+        self.assertTrue(
+            traversable,
+            "the credential-proxy chain leaves /opt/defaults untraversable by "
+            f"`other` (chmods, in build order: {modes}); co-located with the "
+            "sandbox the sidecar runs as uid 1000 and cannot reach the scripts it "
+            "is started with",
+        )
+
+    def test_the_mode_reader_behind_that_check_can_be_trusted(self):
+        """_leaves_other_execute, on the forms a Dockerfile can spell.
+
+        The check above is only as good as this: a mode it misreads as widening
+        passes a chain that ships 0700, and one it fails to read at all is a
+        chmod that silently does not count. Both are quiet, so pin the table.
+        """
+        for mode, expected in [
+            ("0755", True),
+            ("755", True),
+            ("0750", False),
+            ("0700", False),
+            ("1777", True),
+            ("o+x", True),
+            ("a+rx", True),
+            ("+x", True),
+            ("o-x", False),
+            ("o=rx", True),
+            ("o=r", False),
+            ("u+rwx,go+rX", True),
+            ("g+x", None),
+            ("o+r", None),
+        ]:
+            with self.subTest(mode=mode):
+                self.assertEqual(_leaves_other_execute(mode), expected)
+        with self.assertRaises(ValueError):
+            _leaves_other_execute("--reference=/etc/passwd")
 
     def test_the_defaults_layer_reaches_the_default_profile_and_no_other(self):
         """The `cp -ru` is to $TARGET_DIR, which is one home, not every home.

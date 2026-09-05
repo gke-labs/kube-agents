@@ -46,6 +46,28 @@ not a new cron entry. The consequences of dispatching through a card are in
 [`docs/designs/pr-comment-conversation.md`](../../../docs/designs/pr-comment-conversation.md) §2,
 and the env knobs that bound a sweep are in §§2 and 4 of the same document.
 
+## `kanban-workspace-gc` is neither a watchdog nor a poller
+
+The third shape, and the reason it is here rather than anywhere else: it is
+housekeeping that needs the board DB, and the board DB is on the agent pod.
+`kanban_workspace_gc.py` removes the scratch workspaces Hermes leaves behind —
+`kanban_db._cleanup_workspace` runs from `complete_task` and nowhere else, so a
+card that reaches a terminal state any other way keeps its directory forever, and
+under `terminal.backend: ssh` the sandbox's copy is never removed even on the
+path that works. `docs/designs/agent-shell-sandboxing.md` has the account.
+
+It reports nothing on a clean run and only on a run it could not finish, which
+is the same contract `github-repo-watcher` keeps. What it removed goes to
+stderr, where the scheduler logs it: a job announcing its own housekeeping every
+night is a job the room learns to skip, and the message that must not be skipped
+is the failure.
+
+Daily is deliberate rather than conservative. The first install to run this had
+accumulated 34 directories and 3.9 MB on the agent pod and 9 directories and
+68 KB in the sandbox; the first sweep removed 21 and 9 of them, leaving 164 KB
+and nothing. A tighter interval buys nothing against that rate and spends an SSH
+round trip per tick.
+
 ## Never put an id on both rosters
 
 Do not add any id here to `agents/chat/defaults/cron/jobs.json` as well. Two

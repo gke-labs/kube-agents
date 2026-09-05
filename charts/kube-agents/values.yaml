@@ -73,7 +73,8 @@ global:
 operator:
   enabled: true
   # Extra environment variables for the controller manager. The image
-  # overrides the operator reads (PLATFORM_AGENT_IMAGE, FLUENT_BIT_IMAGE) are
+  # overrides the operator reads (PLATFORM_AGENT_IMAGE, AGENT_SANDBOX_IMAGE,
+  # FLUENT_BIT_IMAGE) are
   # rendered from global.imageRegistry and the image values below, so a
   # mirrored install does not need to hand-write them; anything set here is
   # appended afterwards and therefore still wins.
@@ -390,6 +391,18 @@ fluentBit:
     repository: docker.io/fluent/fluent-bit
     tag: "5.1.1"
 
+# The shell sandbox StatefulSet the operator renders beside every agent pod.
+# Same shape as fluentBit above and for the same reason: the chart never renders
+# the workload itself, it passes the reference to the operator as
+# AGENT_SANDBOX_IMAGE, but the pin has to live somewhere the mirror can be
+# pointed at. Unlike the credential broker — which the operator derives from the
+# agent image by swapping the trailing name — the sandbox is a separate
+# repository built from deploy/sandbox, so it has to be named.
+agentSandbox:
+  image:
+    repository: ghcr.io/gke-labs/kube-agents/agent-sandbox
+    tag: "" # defaults to Chart.appVersion
+
 platformAgent:
   enabled: true
   name: platform-agent
@@ -416,6 +429,40 @@ platformAgent:
       enabled: null # CRD default: false
       provider: "" # CRD default: multiuser_memory
       userProfileEnabled: null # CRD default: false
+    # Unsupported switches. Nothing under here carries a compatibility promise:
+    # a field may change meaning, change default, or be removed between
+    # releases, and an install that sets one is expected to re-check it at every
+    # upgrade. The CRD says the same in ExperimentalSpec.
+    experimental:
+      # The agent's shell runs in a pod of its own (#737 Part B), reached over
+      # SSH with the keypair in credentials.secretName.
+      shellSandbox:
+        # Not a toggle. The operator refuses `false` with
+        # Degraded/ShellSandboxCannotBeDisabled, and this chart fails at
+        # template time rather than installing something that will sit
+        # Degraded. Leave it null; set it true only to say so explicitly.
+        enabled: null # always on
+        # Overrides the sandbox image for this agent only. Empty takes the
+        # operator's AGENT_SANDBOX_IMAGE, which this chart sets from the
+        # top-level agentSandbox block — so a mirrored install needs the mirror
+        # pointed at that block, not at this key.
+        image: ""
+        # Runs the sandbox pod under a sandboxed container runtime — `gvisor`
+        # on GKE. Empty leaves the node's default runtime, which is what every
+        # install renders today.
+        #
+        # Separate from deployment.availability.runtimeClassName, and
+        # deliberately: the agent pod holds WAL-mode SQLite, which gVisor
+        # corrupts, and the sandbox pod holds none. This is the field that lets
+        # an install put a user-space kernel between the model's code and the
+        # node without doing the same to the agent.
+        #
+        # On Standard, needs a node pool created with `--sandbox type=gvisor`;
+        # the gke-cluster module's enable_gvisor_node_pool creates one.
+        # Autopilot ships the RuntimeClass natively. Either way the operator
+        # reports Degraded rather than leaving the pod Pending if the named
+        # class does not exist.
+        runtimeClassName: ""
     # Execution limits per agent persona. Empty omits the field so CRD/Hermes
     # defaults apply. When plugins.stockoutInvestigator.enabled=true, the chart
     # automatically applies tuning (maxInProgress: 3, platform.maxTurns: 200,
@@ -549,6 +596,37 @@ platformAgent:
     #       clusterName: my-cluster
     #       serviceAccountEmail: ka-my-cluster-1a2b3c4d@my-project.iam.gserviceaccount.com
     scopedServiceAccounts: []
+    # Gives the credential proxy a GCP identity that does not come from the
+    # metadata server, which is what lets it run beside the shell sandbox.
+    #
+    # GKE resolves Workload Identity by POD IP, so every container in a pod
+    # shares one cloud identity: the broker's pod and the gateway's pod both run
+    # as the annotated KSA, so anything with execution in the gateway can mint
+    # the GSA's token straight from 169.254.169.254, with no policy layer in
+    # between. Federation replaces that with a projected token mounted into the
+    # broker's pod alone, whose credential source is a file rather than the
+    # metadata server. The shell sandbox pod is already unbound and needs none
+    # of this.
+    #
+    # Set both fields or neither — the operator reads a half-filled block as
+    # absent, and the chart refuses it outright. Leaving them empty is
+    # supported: the broker then reads the metadata server as the ServiceAccount
+    # the gateway also runs as, which is the gap federation closes.
+    #
+    # NOTHING CREATES THE POOL. Neither this chart, the Terraform modules, nor
+    # the provisioning scripts run the three gcloud commands; they are in
+    # docs/designs/agent-shell-sandboxing.md#setting-up-the-pool.
+    workloadIdentityFederation:
+      # The pool provider's full resource name, exactly as STS wants it as `aud`:
+      #   //iam.googleapis.com/projects/<number>/locations/global/workloadIdentityPools/<pool>/providers/<provider>
+      # A mismatch is rejected at exchange time, not at admission, so it shows up
+      # as a proxy that starts and then fails every credentialed command.
+      audience: ""
+      # The GSA the federated principal impersonates — the same one
+      # serviceAccountAnnotations names, since it already holds the agent's
+      # roles. The federated principal needs only roles/iam.workloadIdentityUser
+      # on it.
+      serviceAccountEmail: ""
   credentials:
     # Secret holding the agent's credential keys: API_SERVER_KEY plus the
     # model-provider key(s) (ANTHROPIC_API_KEY / GEMINI_API_KEY /
@@ -575,6 +653,19 @@ platformAgent:
     #   - identity hashing falls back to a per-pod random salt with a warning.
     # Upgrading an install that predates these keys is the case that hits this:
     # add them to the existing Secret (upgrade.sh backfills them additively).
+    #
+    # Two further keys belong to the shell sandbox (#737 Part B) and are the one
+    # pair the chart cannot generate for you — sprig can make an ed25519 private
+    # key but cannot encode its public half in authorized_keys form:
+    #   SANDBOX_SSH_PRIVATE_KEY  the agent dials the sandbox with it
+    #   SANDBOX_SSH_PUBLIC_KEY   copied into the <name>-shell-authorized-keys
+    #                            Secret the sandbox mounts
+    # Supply both or neither. The installer scripts and
+    # terraform/examples/full-install generate them, so only a bare `helm
+    # install` has to; without them the sandbox has no way to authenticate the
+    # agent and stays unusable. Rotating them locks the agent out until the
+    # sandbox pod restarts, so an existing pair is carried forward rather than
+    # regenerated. See docs/designs/agent-shell-sandboxing.md#key-management.
     create: false
     data: {}
   # spec.networkPolicy on the PlatformAgent CR, passed through verbatim. Empty

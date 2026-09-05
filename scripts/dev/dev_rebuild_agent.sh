@@ -225,7 +225,7 @@ execute_redeploy() {
     for dep_entry in $deployments; do
       local ns="${dep_entry%%:*}"
       local dep="${dep_entry#*:}"
-      if [[ "$dep" == *"${AGENT_TARGET}"* && "$dep" != *"credential-proxy"* ]]; then
+      if [[ "$dep" == *"${AGENT_TARGET}"* ]]; then
         print_info "Triggering rolling update for Deployment '${dep}' in namespace '${ns}'..."
         # Set image in case it's a standalone deployment not managed by a CR
         local container_name
@@ -234,16 +234,25 @@ execute_redeploy() {
         # initContainer. Querying only .containers[] silently skips its image
         # update and leaves the dev loop running a stale proxy.
         container_names=$(kubectl get deployment "${dep}" -n "${ns}" -o jsonpath='{range .spec.template.spec.containers[*]}{.name}{"\n"}{end}{range .spec.template.spec.initContainers[*]}{.name}{"\n"}{end}' 2>/dev/null || true)
-        container_name=$(echo "$container_names" | grep -E "agent|${AGENT_TARGET}" | head -n 1)
-        if [ -n "$container_name" ]; then
-          local image_updates=("${container_name}=${IMAGE_URI}")
-          if echo "$container_names" | grep -Fxq "envoy-credential-proxy"; then
-            image_updates+=("envoy-credential-proxy=${PROXY_IMAGE_URI}")
+        # Both containers built from the credential-proxy image, wherever they
+        # turn up: `envoy-credential-proxy` is the credential runtime, now a
+        # native sidecar in the agent pod, and `agent-api-auth` is what is left
+        # of it in the gateway pod. Matching by name rather than by Deployment
+        # or by which list it sits in is what keeps this working across both.
+        local image_updates=()
+        local proxy_container
+        for proxy_container in envoy-credential-proxy agent-api-auth; do
+          if echo "$container_names" | grep -Fxq "${proxy_container}"; then
+            image_updates+=("${proxy_container}=${PROXY_IMAGE_URI}")
           fi
-          kubectl set image "deployment/${dep}" -n "${ns}" "${image_updates[@]}" 2>/dev/null || true
-        else
-          kubectl set image "deployment/${dep}" -n "${ns}" "${AGENT_TARGET}=${IMAGE_URI}" 2>/dev/null || true
+        done
+        container_name=$(echo "$container_names" | grep -E "agent|${AGENT_TARGET}" | grep -Fxv agent-api-auth | head -n 1)
+        if [ -n "$container_name" ]; then
+          image_updates=("${container_name}=${IMAGE_URI}" ${image_updates[@]+"${image_updates[@]}"})
+        elif [ ${#image_updates[@]} -eq 0 ]; then
+          image_updates=("${AGENT_TARGET}=${IMAGE_URI}")
         fi
+        kubectl set image "deployment/${dep}" -n "${ns}" "${image_updates[@]}" 2>/dev/null || true
         dep_found=1
       fi
     done

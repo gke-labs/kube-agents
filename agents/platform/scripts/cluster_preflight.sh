@@ -36,9 +36,12 @@ JSON=0
 [ "${1:-}" = "--json" ] && JSON=1
 
 HERMES_HOME="${HERMES_HOME:-/opt/data}"
-# On the dispatch path the worker rewrites HERMES_HOME to its own profile home,
-# where the scaffold pins kubeconfig.yaml and writes USER.md. Fall back to that
-# pinned kubeconfig when KUBECONFIG is not already exported.
+# HERMES_HOME is the profile home, where the scaffold pins kubeconfig.yaml and
+# writes USER.md. On the dispatch path the worker sets it; this script runs in
+# the shell sandbox, which sshd starts with the data root instead, so
+# deploy/sandbox/session-command.sh narrows it back to the profile from the
+# session's working directory. Fall back to the pinned kubeconfig when
+# KUBECONFIG is not already exported.
 #
 # Remember whether the fallback was needed. The variable being absent is not a
 # cosmetic difference: checks 2 and 3 read the file by path either way, but the

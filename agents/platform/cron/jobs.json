@@ -133,6 +133,21 @@
       "deliver": "chat"
     },
     {
+      "id": "kanban-workspace-gc",
+      "name": "Kanban Workspace GC",
+      "schedule": {
+        "kind": "cron",
+        "expr": "40 5 * * *",
+        "display": "40 5 * * *"
+      },
+      "prompt": "",
+      "skills": [],
+      "no_agent": true,
+      "script": "kanban_workspace_gc.py",
+      "enabled": true,
+      "deliver": "chat"
+    },
+    {
       "id": "eod-event-watcher-daily-report",
       "name": "Event Watcher Daily Activity Recap",
       "schedule": {

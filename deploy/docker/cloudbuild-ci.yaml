@@ -1,10 +1,10 @@
-# CI-only build of all three images in a single Cloud Build.
+# CI-only build of all four images in a single Cloud Build.
 #
 # Why this exists next to cloudbuild.yaml rather than replacing it: that config
 # builds exactly one --target and is called with a different one by
 # .github/workflows/docker-publish-gcp.yml and
 # scripts/dev/dev_rebuild_agent.sh. Only hack/ci-deploy.sh needs
-# all three at once, so the multi-image shape lives here and the single-target
+# all four at once, so the multi-image shape lives here and the single-target
 # contract those two depend on stays untouched.
 #
 # What this buys, and why one build instead of three submits: the two agent
@@ -122,6 +122,28 @@ steps:
           --build-arg HERMES_AGENT_TAG="$_HERMES_AGENT_TAG" \
           .
 
+  # The shell sandbox every agent pod now talks to over ssh. Like the operator
+  # it shares no stage with the agent images, so it starts immediately; its
+  # context is the repository root rather than deploy/sandbox because it ships
+  # the same credential-proxy client and PATH script the agent image does (the
+  # root Makefile's docker-build-sandbox says why copying them would let the
+  # two drift). No cache ref: the base is a python image and the build is
+  # short enough that a cold one costs less than maintaining the ref.
+  - id: sandbox
+    name: "gcr.io/cloud-builders/docker"
+    waitFor: ["-"]
+    env:
+      - "DOCKER_BUILDKIT=1"
+    args:
+      - "build"
+      - "--platform"
+      - "linux/amd64"
+      - "-t"
+      - "$_SANDBOX_URI"
+      - "-f"
+      - "deploy/sandbox/Dockerfile"
+      - "."
+
   # k8s-operator/Dockerfile shares no stage with the agent images, so it starts
   # immediately instead of queueing behind them. It is much the shorter build
   # and finishes well inside theirs, so it costs no wall clock of its own.
@@ -145,6 +167,7 @@ steps:
 images:
   - "$_PLATFORM_URI"
   - "$_PROXY_URI"
+  - "$_SANDBOX_URI"
   - "$_OPERATOR_URI"
 
 # No `options.machineType` here on purpose. The operator step only genuinely
@@ -154,7 +177,7 @@ images:
 # when no pool is configured, which keeps that exclusion structural rather than
 # a comment someone has to notice.
 
-# Stated rather than inherited: this is now one build doing the work of three,
+# Stated rather than inherited: this is now one build doing the work of four,
 # so the ceiling should be visible here instead of depending on whatever
 # `gcloud builds submit` defaults to.
 timeout: 3600s
@@ -162,6 +185,7 @@ timeout: 3600s
 substitutions:
   _PLATFORM_URI: ""
   _PROXY_URI: ""
+  _SANDBOX_URI: ""
   _OPERATOR_URI: ""
   _CACHE_IMAGE: ""
   _BUILDCACHE_IMAGE: ""

@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -33,6 +34,7 @@ import (
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+	container "google.golang.org/api/container/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -96,7 +98,7 @@ func parseFlags(args []string) (*flags, error) {
 	// Kubernetes client.
 	fs.BoolVar(&f.inCluster, "in-cluster", false, "Use in-cluster service account credentials. Auto-detected inside a pod.")
 	fs.StringVar(&f.kubeconfig, "kubeconfig", "", "Explicit kubeconfig path (single cluster). Used outside a pod.")
-	fs.StringVar(&f.profilesDir, "profiles-dir", "", "Hermes profiles directory (normally /opt/data/profiles). Enables multi-cluster fan-in: every Cluster Agent profile found becomes a watched cluster, using that profile's own kubeconfig.yaml and cluster_identity. Combines with --in-cluster / --kubeconfig, which add one directly-reachable cluster on top; that combination also requires --cluster-name to name it.")
+	fs.StringVar(&f.profilesDir, "profiles-dir", "", "Hermes profiles directory (normally /opt/data/profiles). Enables multi-cluster fan-in: every Cluster Agent profile found becomes a watched cluster, addressed by asking the GKE API about that profile's cluster_identity. Combines with --in-cluster / --kubeconfig, which add one directly-reachable cluster on top; that combination also requires --cluster-name to name it.")
 	fs.StringVar(&f.clusterName, "cluster-name", "", "Human-readable cluster name included in every inject payload (single-cluster mode only; with --profiles-dir the name comes from each profile's cluster_identity).")
 
 	// Operational.
@@ -278,7 +280,7 @@ type profileConfig struct {
 // found. The Platform Agent creates these on cluster onboarding and removes
 // them on teardown — see agents/platform/scripts/cluster_agent_profile.py — so
 // the directory is the inventory of clusters we should be watching, and each
-// profile already holds credentials scoped to its own cluster.
+// profile records which cluster it is scoped to.
 //
 // This runs once, from buildWatchSet at startup, so the result is a snapshot
 // rather than something the watcher keeps in step with the directory. A cluster
@@ -287,11 +289,22 @@ type profileConfig struct {
 // Re-scanning on an interval and reconciling the running informers against the
 // result is deliberate follow-up work, not done here.
 //
-// A subdirectory is treated as a cluster profile only if it has both a
-// kubeconfig.yaml and a config.yaml carrying a complete cluster_identity
-// block. That is how non-cluster profiles ("default", "platform") are skipped:
-// testing for the data we need is more durable than hardcoding a list of names
-// that the Python side may extend.
+// A subdirectory is treated as a cluster profile only if its config.yaml
+// carries a complete cluster_identity block. That is how non-cluster profiles
+// ("default", "platform") are skipped: testing for the data we need is more
+// durable than hardcoding a list of names that the Python side may extend.
+//
+// The identity is also the whole of what a client is built from, and that is a
+// deliberate change of source. Discovery used to require a kubeconfig.yaml
+// beside config.yaml and read the API server address out of it, which stopped
+// working the moment the shell moved into its own pod: `gcloud container
+// clusters get-credentials` now runs there, so the file it writes lands on the
+// sandbox's volume and this pod never sees it. Every profile created after that
+// change would have been silently unwatched. Asking the GKE API for the address
+// removes the dependency rather than reinstating it — and it has to be removed
+// rather than reinstated, because anything read back out of the sandbox is
+// writable by the model, and this process attaches a cloud-platform token to
+// whatever host it is told to talk to.
 //
 // A profile that looks like a cluster profile but fails to load is skipped, not
 // fatal. Dropping one cluster is bad; the alternative is worse, because these
@@ -332,8 +345,9 @@ func discoverClusterProfiles(ctx context.Context, dir string, m *metrics) ([]tar
 	}
 	var clusters []targetCluster
 	// Minted on first use, then shared: every profile authenticates as the same
-	// pod identity, and a process with no Google credentials at all (a local
-	// run against hand-written kubeconfigs) should not pay for one it never needs.
+	// pod identity, and a process with no cluster profiles at all -- which is
+	// every single-cluster install -- should not pay for a credential it never
+	// uses.
 	var tokenSource oauth2.TokenSource
 	// Keyed on the full project/location/cluster triple, not the bare name:
 	// two clusters called "prod" in different locations are two clusters, and
@@ -344,10 +358,6 @@ func discoverClusterProfiles(ctx context.Context, dir string, m *metrics) ([]tar
 			continue
 		}
 		home := filepath.Join(dir, e.Name())
-		kubeconfig := filepath.Join(home, "kubeconfig.yaml")
-		if _, err := os.Stat(kubeconfig); err != nil {
-			continue // not a cluster profile
-		}
 		skip := func(format string, args ...any) {
 			log.Printf("k8s-event-watcher: skipping profile %s, its cluster will NOT be watched: %s",
 				e.Name(), fmt.Sprintf(format, args...))
@@ -373,22 +383,24 @@ func discoverClusterProfiles(ctx context.Context, dir string, m *metrics) ([]tar
 			continue
 		}
 
-		cfg, err := clientConfigForProfile(kubeconfig, *identity)
+		if tokenSource == nil {
+			tokenSource, err = newTokenSource(ctx)
+			if err != nil {
+				skip("this pod has no Google credentials, so its control plane cannot be reached: %v", err)
+				continue
+			}
+		}
+		described, err := describeCluster(ctx, *identity)
 		if err != nil {
-			skip("kubeconfig %s: %v", kubeconfig, err)
+			skip("asking the GKE API where %s is: %v", tc.identity(), err)
 			continue
 		}
-		if cfg.ExecProvider != nil {
-			if tokenSource == nil {
-				tokenSource, err = google.DefaultTokenSource(ctx, gkeAuthScope)
-				if err != nil {
-					skip("kubeconfig authenticates via the %q exec plugin, which is not in this image; falling back to Google credentials failed: %v",
-						cfg.ExecProvider.Command, err)
-					continue
-				}
-			}
-			useGoogleTokenSource(cfg, tokenSource)
+		cfg, err := clientConfigForIdentity(described)
+		if err != nil {
+			skip("%v", err)
+			continue
 		}
+		useGoogleTokenSource(cfg, tokenSource)
 		client, err := kubernetes.NewForConfig(cfg)
 		if err != nil {
 			skip("kubernetes client: %v", err)
@@ -401,51 +413,74 @@ func discoverClusterProfiles(ctx context.Context, dir string, m *metrics) ([]tar
 	return clusters, nil
 }
 
-// clientConfigForProfile builds a rest.Config from a profile's kubeconfig and
-// refuses anything that does not demonstrably point at the cluster the profile
-// claims to be.
-//
-// It exists because clientcmd.BuildConfigFromFlags cannot be trusted to fail
-// here. Given an *empty* kubeconfig it does not return an error: the deferred
-// loader treats an empty config as "nothing was specified" and silently falls
-// back to the in-cluster config. A profile whose credential fetch died before
-// writing anything therefore produced a working client — pointed at the
-// management cluster, the one cluster it certainly was not describing.
-//
-// Nothing downstream could notice. The cluster label comes from
-// cluster_identity, not from the connection, so that profile was watched under
-// its own name while reading another cluster's events. Observed in autopush:
-// two watchers on the management cluster, every event reported twice, one copy
-// naming a cluster where nothing had happened. A corrupt kubeconfig fails
-// loudly and always did; an empty one was the gap.
-//
-// So the context is resolved explicitly, and checked against the identity. GKE
-// context names are gke_<project>_<location>_<cluster>, which is the same shape
-// the credential proxy already requires of any kubeconfig the agent supplies
-// (see docs/credential-isolation-design.md), so this adds no new convention. It
-// also catches a kubeconfig that accumulated several clusters' contexts and is
-// pointing at the wrong one — merged kubeconfigs are how profiles go wrong in
-// practice, since `gcloud container clusters get-credentials` appends.
-func clientConfigForProfile(kubeconfig string, identity clusterIdentity) (*rest.Config, error) {
-	apiCfg, err := clientcmd.LoadFromFile(kubeconfig)
+// clusterResourceFormat is the GKE Cluster Manager API's name for one cluster.
+// The location segment takes a region or a zone, so one form covers both.
+const clusterResourceFormat = "projects/%s/locations/%s/clusters/%s"
+
+// describeCluster reads one cluster's control-plane addressing from the GKE
+// API. A variable rather than a plain function so the tests can answer it
+// without a Google credential or a network call; nothing else reassigns it.
+var describeCluster = describeClusterViaAPI
+
+// newTokenSource mints the credential every watched control plane is reached
+// with. A variable for the same reason as describeCluster.
+var newTokenSource = func(ctx context.Context) (oauth2.TokenSource, error) {
+	return google.DefaultTokenSource(ctx, gkeAuthScope)
+}
+
+func describeClusterViaAPI(ctx context.Context, identity clusterIdentity) (*container.Cluster, error) {
+	svc, err := container.NewService(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("load kubeconfig: %w", err)
+		return nil, fmt.Errorf("GKE API client: %w", err)
 	}
-	if apiCfg.CurrentContext == "" {
-		return nil, errors.New("kubeconfig has no current-context (it is empty or was never written); refusing to fall back to the in-cluster config, which would silently watch the wrong cluster")
-	}
-	want := fmt.Sprintf("gke_%s_%s_%s", identity.Project, identity.Location, identity.Cluster)
-	if apiCfg.CurrentContext != want {
-		return nil, fmt.Errorf("kubeconfig current-context is %q but this profile describes %q; it points at a different cluster than it claims",
-			apiCfg.CurrentContext, want)
-	}
-	// NewNonInteractiveClientConfig, not the deferred loader: this one reports an
-	// unusable config as an error instead of reaching for the in-cluster config.
-	cfg, err := clientcmd.NewNonInteractiveClientConfig(*apiCfg, apiCfg.CurrentContext, &clientcmd.ConfigOverrides{}, nil).ClientConfig()
+	name := fmt.Sprintf(clusterResourceFormat, identity.Project, identity.Location, identity.Cluster)
+	cluster, err := svc.Projects.Locations.Clusters.Get(name).Context(ctx).Do()
 	if err != nil {
-		return nil, fmt.Errorf("build client config for context %q: %w", apiCfg.CurrentContext, err)
+		return nil, fmt.Errorf("get %s: %w", name, err)
 	}
-	return cfg, nil
+	return cluster, nil
+}
+
+// clientConfigForIdentity turns a GKE cluster description into a rest.Config
+// addressing that cluster's control plane. It carries no credential; the caller
+// attaches one with useGoogleTokenSource.
+//
+// The DNS endpoint wins wherever the cluster publishes one that accepts
+// external traffic, which is the same rule agents/platform/scripts/
+// gke_endpoint.py applies when it decides whether to pass --dns-endpoint to
+// `gcloud container clusters get-credentials`. Keep the two in step: they exist
+// to reach the same control planes, and a cluster whose IP endpoint this pod
+// cannot route to is exactly the case the DNS endpoint was added for. It needs
+// no CA of its own — it terminates on a Google frontend with a WebPKI
+// certificate — where the IP endpoint is signed by the cluster's own CA.
+//
+// An address is required. Returning a config with an empty Host would hand
+// rest.Config a relative URL and produce a client that talks to nothing in a
+// way no error names.
+func clientConfigForIdentity(cluster *container.Cluster) (*rest.Config, error) {
+	if cluster == nil {
+		return nil, errors.New("the GKE API returned no cluster")
+	}
+	if endpoints := cluster.ControlPlaneEndpointsConfig; endpoints != nil && endpoints.DnsEndpointConfig != nil {
+		dns := endpoints.DnsEndpointConfig
+		if dns.AllowExternalTraffic && dns.Endpoint != "" {
+			return &rest.Config{Host: "https://" + dns.Endpoint}, nil
+		}
+	}
+	if cluster.Endpoint == "" {
+		return nil, errors.New("the cluster publishes neither an externally reachable DNS endpoint nor an IP endpoint")
+	}
+	if cluster.MasterAuth == nil || cluster.MasterAuth.ClusterCaCertificate == "" {
+		return nil, errors.New("the cluster's IP endpoint has no CA certificate to verify it against")
+	}
+	ca, err := base64.StdEncoding.DecodeString(cluster.MasterAuth.ClusterCaCertificate)
+	if err != nil {
+		return nil, fmt.Errorf("decode the cluster CA certificate: %w", err)
+	}
+	return &rest.Config{
+		Host:            "https://" + cluster.Endpoint,
+		TLSClientConfig: rest.TLSClientConfig{CAData: ca},
+	}, nil
 }
 
 // gkeAuthScope is the scope gke-gcloud-auth-plugin requests. A cloud-platform
@@ -460,20 +495,19 @@ const gkeAuthScope = "https://www.googleapis.com/auth/cloud-platform"
 // cluster syncing is enough to satisfy it.
 const initialSyncGrace = 2 * time.Minute
 
-// useGoogleTokenSource swaps a kubeconfig's exec-plugin authentication for a
-// bearer token minted from this process's Google credentials.
+// useGoogleTokenSource attaches a bearer token minted from this process's
+// Google credentials to every request the config makes.
 //
-// Cluster Agent profile kubeconfigs come from `gcloud container clusters
-// get-credentials`, so they authenticate by shelling out to
-// gke-gcloud-auth-plugin. That binary is deliberately absent here: the image
-// build refuses to ship credential-aware CLIs into the agent's containers
-// (deploy/docker/Dockerfile), concentrating them in the credential proxy
-// instead. Rather than widen that boundary, mint the token directly — the pod
-// already authenticates to Google as this identity via Workload Identity, which
-// is the same identity the plugin would have used.
+// A kubeconfig from `gcloud container clusters get-credentials` would
+// authenticate by shelling out to gke-gcloud-auth-plugin. That binary is
+// deliberately absent here: the image build refuses to ship credential-aware
+// CLIs into the agent's containers (deploy/docker/Dockerfile), concentrating
+// them in the credential proxy instead. Rather than widen that boundary, mint
+// the token directly — the pod already authenticates to Google as this identity
+// via Workload Identity, which is the same identity the plugin would have used.
 //
-// Only the credential is replaced. The API server address and CA certificate
-// still come from the kubeconfig, and are untouched.
+// Only the credential is set. The API server address and CA certificate come
+// from clientConfigForIdentity, and are untouched.
 func useGoogleTokenSource(cfg *rest.Config, ts oauth2.TokenSource) {
 	cfg.ExecProvider = nil
 	cfg.AuthProvider = nil
@@ -973,21 +1007,21 @@ func realMain(argv []string) error {
 // The two entries are not interchangeable, so which one survives matters. The
 // profile carries the project/location/cluster identity that stamps the payload
 // and labels every metric; the direct entry knows only a name. But the profile
-// also carries a credential that can be refused: it authenticates as the GSA
-// through a get-credentials kubeconfig, so a permission set without
-// roles/container.viewer, or master authorized networks that exclude the pod's
-// egress, denies it. The direct entry uses the pod's own service account against
+// also carries a credential that can be refused: it authenticates as the GSA,
+// so a permission set without roles/container.viewer, or master authorized
+// networks that exclude the pod's egress, denies it. The direct entry uses the pod's own service account against
 // kubernetes.default.svc and never leaves the cluster.
 //
-// Nothing here would notice the difference. discoverClusterProfiles builds a
-// client without contacting an API server, so a profile displaces on the
-// strength of a well-formed kubeconfig and the credential is not exercised until
-// the informer's initial list — by which time the entry it displaced is gone. On
-// a single-cluster install that leaves a watch set of one, and a watch set of one
-// that never syncs trips the initialSyncGrace check in run: the process exits and
-// the pod crashloops watching nothing. On a fleet it is quieter and worse — the
-// peers sync, nothing restarts, and the one cluster whose failure breaks
-// everything else is silently unmonitored.
+// Nothing here would notice the difference. discoverClusterProfiles contacts
+// the GKE API for the control plane's address, but nothing exercises that
+// address until the informer's initial list — so a profile still displaces on
+// the strength of an answer that says where the cluster is rather than one that
+// says the cluster will talk to us, and by the time it will not, the entry it
+// displaced is gone. On a single-cluster install that leaves a watch set of one,
+// and a watch set of one that never syncs trips the initialSyncGrace check in
+// run: the process exits and the pod crashloops watching nothing. On a fleet it
+// is quieter and worse — the peers sync, nothing restarts, and the one cluster
+// whose failure breaks everything else is silently unmonitored.
 //
 // So the direct entry wins and takes the profile's identity triple with it.
 // Reachability is the half that cannot be reconstructed; project and location are

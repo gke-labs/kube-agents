@@ -489,6 +489,25 @@ def _extract_shell_function(name):
     raise AssertionError(f"{name}() is never closed in {_ENTRYPOINT}")
 
 
+def _extract_shell_block(opener, closer="fi"):
+    """Return the text of a top-level block, from the line equal to `opener` to `closer`.
+
+    Same bargain as `_extract_shell_function`, for the steps that are written inline
+    rather than as a function: run the shipped lines, never a paraphrase of them. The
+    block must start at column zero and end at the first later line equal to `closer`,
+    which is how the script already writes its top-level steps.
+    """
+    lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+    starts = [i for i, line in enumerate(lines) if line == opener]
+    if len(starts) != 1:
+        raise AssertionError(f"expected one `{opener}` in {_ENTRYPOINT}, found {len(starts)}")
+    start = starts[0]
+    for end in range(start + 1, len(lines)):
+        if lines[end] == closer:
+            return "\n".join(lines[start : end + 1]) + "\n"
+    raise AssertionError(f"`{opener}` is never closed by `{closer}` in {_ENTRYPOINT}")
+
+
 class FreshVolumeDetectionTest(unittest.TestCase):
     """A fresh volume is not an absent file, and getting that wrong cost a whole install.
 
@@ -1518,6 +1537,121 @@ class ApiKeyPinCheckTest(unittest.TestCase):
                 proc = self._run(content)
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 self.assertIn("SURVIVED", proc.stdout)
+
+
+class SandboxMirrorGateTest(unittest.TestCase):
+    """Step 5.7 pushes the profile layout into the shell sandbox, and is fatal.
+
+    The agent's Kubernetes credentials are read-only, so nothing in this container can
+    write an Event or a condition to say the migration failed. Exiting non-zero is the
+    one channel it has: the kubelet restarts the container, and the operator's
+    getDeploymentStatusDetails scans the gateway pod's container statuses and copies the
+    waiting reason into the CR as phase Degraded. Come up 0 instead and the CR reads
+    Ready while the model's files sit on this volume where its shell cannot see them —
+    which is what happened on a live upgrade, to ten cluster profile homes at once.
+
+    So the exit status is the contract, and these pin both directions of it. The
+    transient case does not arrive here as a failure at all: sandbox_mirror.py returns 0
+    when the sandbox has not started yet and leaves its marker unwritten, so the next
+    start retries. What reaches this block non-zero is a wrong --remote-root or a
+    transfer that ran and failed, and neither gets better on its own.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._BLOCK = _extract_shell_block(
+            'SANDBOX_MIRROR_SCRIPT="/opt/defaults/scripts/sandbox_mirror.py"'
+        )
+
+    def _run(self, rc=0, primary="1", install_script=True):
+        """Run the shipped block with a python3 that exits `rc`.
+
+        Returns `(proc, invoked)` — `invoked` says whether the interpreter was reached
+        at all, which is the only way to tell "the mirror passed" from "the gate above
+        it never ran".
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            target = tmp / "data"
+            (target / "logs").mkdir(parents=True)
+            (target / "scripts").mkdir()
+            if install_script:
+                (target / "scripts" / "sandbox_mirror.py").write_text("", encoding="utf-8")
+
+            # Stands in for the venv interpreter, and records that it ran. The log line
+            # it writes is what the failure path is supposed to put in front of an
+            # operator, so the test can assert the tail carried it out to stderr.
+            marker = tmp / "invoked"
+            python = tmp / "hermes" / ".venv" / "bin" / "python3"
+            python.parent.mkdir(parents=True)
+            python.write_text(
+                "#!/bin/sh\n"
+                f'echo "$@" >"{marker}"\n'
+                'echo "mirror said something an operator needs to read"\n'
+                f"exit {rc}\n",
+                encoding="utf-8",
+            )
+            python.chmod(0o755)
+
+            proc = subprocess.run(
+                ["sh", "-c", f"set -e\n{self._BLOCK}\necho REACHED-EXEC\n"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env={
+                    **os.environ,
+                    "TARGET_DIR": str(target),
+                    "INSTALL_DIR": str(tmp / "hermes"),
+                    "IS_BOOTSTRAP_PRIMARY": primary,
+                },
+            )
+            return proc, marker.exists()
+
+    def test_a_failed_migration_ends_start_up(self):
+        proc, invoked = self._run(rc=1)
+        self.assertTrue(invoked, "the mirror never ran, so this asserts nothing")
+        self.assertNotEqual(
+            proc.returncode,
+            0,
+            "a migration that failed left the container coming up healthy; the CR will "
+            "say Ready and nothing will say the model's files did not cross",
+        )
+        self.assertNotIn("REACHED-EXEC", proc.stdout)
+
+    def test_the_failure_names_itself_and_carries_the_log_out(self):
+        """`kubectl logs` is where the CR's Degraded message sends you; it has to say why."""
+        proc, _ = self._run(rc=1)
+        self.assertIn("FATAL", proc.stderr)
+        self.assertIn(
+            "mirror said something an operator needs to read",
+            proc.stderr,
+            "the cause stayed in logs/sandbox_mirror.log on the PVC, which is exactly "
+            "the silence this change exists to end",
+        )
+
+    def test_a_clean_migration_leaves_start_up_alone(self):
+        proc, invoked = self._run(rc=0)
+        self.assertTrue(invoked)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_a_non_primary_replica_does_not_run_it(self):
+        """Two tar streams into one directory race; only the primary mirrors.
+
+        Run with a mirror that would fail, so a regression that drops the gate fails
+        this loudly rather than passing on a stub that happens to succeed.
+        """
+        proc, invoked = self._run(rc=1, primary="0")
+        self.assertFalse(invoked)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_an_image_without_the_script_is_not_a_failure(self):
+        """The block is guarded on the script existing, and predates it in some images."""
+        proc, invoked = self._run(rc=1, install_script=False)
+        self.assertFalse(invoked)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
 
 
 if __name__ == "__main__":

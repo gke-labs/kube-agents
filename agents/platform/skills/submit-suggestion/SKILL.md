@@ -44,12 +44,12 @@ _Crucially, you are strictly forbidden from executing direct, manual mutations. 
 
 Follow these steps to make, commit, and submit your GitOps suggestions asynchronously:
 
-### Step 1: Lease a Private Workspace and Branch
+### Step 1: Prepare
 
 Never run `git` from wherever your shell happens to be. You share one volume with
 every other agent in this pod — the fleet audits, the other kanban workers — and
 a bare `git checkout` there lands inside a clone somebody else is mid-way
-through. `prepare` hands you a clone that is yours alone.
+through. `prepare` gives you somewhere of your own to work.
 
 The script path is spelled out from `$HERMES_HOME` rather than as `./skills/…`
 because this skill is reached from a kanban card as well as from a cron turn,
@@ -73,11 +73,30 @@ _(Example: `--repo "acme/fleet" --branch "platform-agent/provision-mercury-09"` 
 
 In a multi-repository environment, pass `--repo "<owner>/<repo>"` for the repository your task targets (identified from cluster annotations or task context per SOUL.md §3.4).
 
-It clones and refreshes the GitOps repository, takes the branch, and prints one
-JSON line:
+It refreshes credentials, opens the GitOps repository, and prints one JSON line.
+**Keep that whole line — Step 3 needs it back.** Its `mode` field says which of
+two ways Steps 2 and 3 work, and you follow that field rather than choosing:
+
+**`"mode": "content"`** — the repository is checked out on the credential
+broker's side, where you have no path to it. There is no `.git` for you to touch
+and no `git` for you to run.
 
 ```json
 {
+  "mode": "content",
+  "handle": "4f1c…",
+  "branch": "platform-agent/provision-mercury-09",
+  "base": "main",
+  "baseSha": "9a3d…",
+  "repo": "acme/fleet"
+}
+```
+
+**`"mode": "directory"`** — a clone leased to you alone on the shared volume.
+
+```json
+{
+  "mode": "directory",
   "workspace": "/opt/data/gitops/t_9f3c1e07/acme__fleet",
   "lease": "t_9f3c1e07",
   "branch": "platform-agent/provision-mercury-09",
@@ -87,37 +106,81 @@ JSON line:
 }
 ```
 
-**Keep that whole line. Step 3 needs `workspace` and `lease` back.** The
-credential proxy refuses `git add`, `commit`, `checkout`, `push` and every other
-tree-mutating verb outside a leased workspace, so a command run anywhere else
-comes back as a security refusal rather than quietly damaging another agent's
-work.
+In directory mode the credential proxy refuses `git add`, `commit`, `checkout`,
+`push` and every other tree-mutating verb outside a leased workspace, so a
+command run anywhere else comes back as a security refusal rather than quietly
+damaging another agent's work.
 
-`base` is the repository's own default branch, not a hardcoded `main` —
-`started_from` records what the branch was actually cut from. When the branch
-already exists on the remote (Step 5, addressing feedback on an open PR),
-`started_from` is `origin/<branch>` and your commits land **on top of** the ones
-already under review. When it does not, the branch is cut fresh from
-`origin/<base>`.
+`base` is the repository's own default branch, not a hardcoded `main`. In
+directory mode `started_from` records what the branch was actually cut from:
+when the branch already exists on the remote (Step 5, addressing feedback on an
+open PR) it is `origin/<branch>` and your commits land **on top of** the ones
+already under review; when it does not, the branch is cut fresh from
+`origin/<base>`. Content mode always commits onto `origin/<base>` and carries the
+earlier commits by pushing on top of the same branch.
 
-### Step 2: Make and Commit the Changes
+### Step 2: Make the Changes
 
-1.  Generate or edit the required declarative files **inside the returned
-    `workspace`**.
-2.  Stage and commit the changes locally following Conventional Commit standards. **CRITICAL SECURITY RULE:** You **must** explicitly stage only the targeted declarative manifest files you generated or modified. **Never use `git add .` or `git add -A`** to prevent committing transient debugging files, volatile local credentials, or workspace logs:
-    ```bash
-    cd <workspace>
-    git add <file_path_1> <file_path_2>
-    git commit -m "<conventional_commit_message>"
-    ```
-    _(Example: `git add config/manifest.yaml && git commit -m "feat(fleet): provision GKE operator for mercury-09"` or `git add policies/baseline.yaml && git commit -m "fix(policy): restrict baseline network policy ingress"`)_
+**Content mode.** Work in a scratch directory of your own — `mktemp -d` is
+fine — laid out the way the repository is. A file at `<scratch>/policies/baseline.yaml`
+becomes `policies/baseline.yaml` in the commit.
+
+Editing a file that already exists means fetching it first; there is no checkout
+here to `cat`. Fetch into the same scratch directory you will submit from:
+
+```bash
+S="$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py
+SCRATCH=$(mktemp -d)
+"$S" list --handle "<handle>" --prefix policies      # what is there
+"$S" fetch --handle "<handle>" --path policies/baseline.yaml --to "$SCRATCH"
+# edit "$SCRATCH"/policies/baseline.yaml, and write any new files under $SCRATCH
+```
+
+**CRITICAL SECURITY RULE:** the scratch directory _is_ the change set — there is
+no staging step and nothing to un-stage. Put only the declarative files you mean
+to propose in it. Never point `--from` at a directory holding transient
+debugging output, local credentials or logs, and never at a directory you did
+not create for this purpose. Symlinks in it are skipped rather than followed.
+
+**Directory mode.** Generate or edit the files **inside the returned
+`workspace`**, then stage and commit following Conventional Commit standards.
+**CRITICAL SECURITY RULE:** explicitly stage only the targeted declarative files
+you generated or modified. **Never use `git add .` or `git add -A`** — the same
+reason as above.
+
+```bash
+cd <workspace>
+git add <file_path_1> <file_path_2>
+git commit -m "<conventional_commit_message>"
+```
+
+_(Example: `git add config/manifest.yaml && git commit -m "feat(fleet): provision GKE operator for mercury-09"`)_
 
 ### Step 3: Call the Secure Submit Suggestion Script
 
-Invoke the same helper with `submit` to handle the GitHub App token exchange, git
-credential configuration, branch push, and Pull Request creation. Pass **both**
-the `workspace` and the `lease` from Step 1 — the script verifies the lease on
-that tree is still yours and refuses outright if it belongs to another agent:
+The same helper with `submit` handles the GitHub App token exchange, git
+credential configuration, the push, and Pull Request creation. Pass back what
+Step 1 printed for the mode you are in.
+
+**Content mode** — the `handle`, the scratch directory, and the `baseSha`:
+
+```bash
+"$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py submit \
+  --handle "<handle>" \
+  --from "$SCRATCH" \
+  --base-sha "<baseSha>" \
+  --branch "platform-agent/<change_type>-<target_id>" \
+  --title "<pr_title>" \
+  --body "<pr_body>"
+```
+
+Add `--delete <path>` (repeatable) to remove a file the repository has.
+`--base-sha` is what makes the broker refuse rather than overwrite when somebody
+else changed one of these same files while you were working; without it the last
+writer wins. Drop it only when you are deliberately replacing whatever is there.
+
+**Directory mode** — the `workspace` and the `lease`, which the script checks is
+still yours and refuses outright if it belongs to another agent:
 
 ```bash
 python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py submit \
@@ -125,18 +188,28 @@ python3 "$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py sub
   --lease "<lease>" \
   --branch "platform-agent/<change_type>-<target_id>" \
   --title "<pr_title>" \
-  --body "This Pull Request was generated automatically by the **Platform Agent** control plane.
+  --body "<pr_body>"
+```
+
+For `--body`, use a description of this shape:
+
+```
+This Pull Request was generated automatically by the **Platform Agent** control plane.
 
 ### 🚀 Functional Impact:
 <detailed_markdown_bulleted_impact_description>
 
-Please review the code diffs and merge this PR to trigger the GitOps CI/CD rollout!"
+Please review the code diffs and merge this PR to trigger the GitOps CI/CD rollout!
 ```
 
 `--lease` is not optional bookkeeping. `prepare` and `submit` are separate
 processes, and outside a kanban card there is no session identity for `submit`
 to re-derive the lease from — so without it the script stops and tells you to
 pass it, rather than inventing an id that could never match the workspace.
+
+Finish in the mode you prepared in. A session that got a `handle` has no leased
+directory to fall back to, and one that got a `workspace` has no handle to
+present.
 
 The script returns the clean, live GitHub PR URL. If a Pull Request for this
 branch is already open, it updates that one's title and body in place and
@@ -156,18 +229,20 @@ When you are asked to **address review comments / reviewer feedback** on an exis
    gh pr view <PR_NUMBER> --repo <owner/repo> --json title,url,headRefName,body,comments,reviews
    gh api repos/<owner/repo>/pulls/<PR_NUMBER>/comments   # inline review-thread comments
    ```
-3. **Apply the requested changes on the PR's own branch.** Lease a workspace for
-   that branch the same way Step 1 does — `prepare --repo "<owner>/<repo>" --branch <headRefName>` — and
-   work inside the `workspace` it prints. Because the branch already exists on
-   the remote, `prepare` bases it on `origin/<headRefName>`, so the commits
-   already under review are still there and yours go on top;
-   `started_from` in its JSON says which. Make the targeted edits, then —
-   following the **same CRITICAL security rule as Step 2** — stage only the
-   specific files (**never `git add .` / `-A`**), commit with a Conventional
-   Commit message, and run `submit` with the same `--workspace`, `--lease` and
-   `--branch <headRefName>` so the existing PR updates in place. `submit` pushes
-   with `--force-with-lease`: it will update the branch your workspace fetched,
-   and refuse rather than overwrite one somebody else has moved in the meantime.
+3. **Apply the requested changes on the PR's own branch.** Run Step 1 against
+   that branch — `prepare --repo "<owner>/<repo>" --branch <headRefName>` — and
+   follow the `mode` it prints, exactly as Steps 2 and 3 describe. Two things differ from a first
+   submission, and both are handled for you: the commits already under review
+   stay on the branch and yours go on top, and `submit` pushes with
+   `--force-with-lease`, so it updates the branch it fetched and refuses rather
+   than overwrites one somebody else has moved in the meantime.
+
+   In content mode, `fetch` the files the reviewer commented on into your
+   scratch directory before editing them — what is on the branch is what you are
+   being asked to change, and rewriting it from memory loses the rest of the
+   file. Directory mode is unchanged: edit in the `workspace`, stage only the
+   specific files (**never `git add .` / `-A`**), and commit.
+
 4. **Reply on the PR** summarizing what changed (`gh pr comment <PR_NUMBER> --repo <owner/repo> --body "..."`), then relay a clean confirmation (PR URL + what you changed) back through your kanban result.
 
 Never ask the requester to paste the comment text — fetching it from GitHub and addressing it is your job.

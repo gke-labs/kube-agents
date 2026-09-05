@@ -215,7 +215,7 @@ random_hex_32() {
 # A fresh install generates these (the composition's random_password
 # resources), and the harness/operator fast paths never touch
 # platform-agent-secrets — `helm upgrade
-# --reuse-values` re-tags images and nothing else, so a Secret from an old
+# --reset-then-reuse-values` re-tags images and nothing else, so a Secret from an old
 # enough install keeps missing the keys until something adds them. The
 # operator marks both Secret references optional, so
 # a Secret without the keys yields containers without the variables rather than
@@ -254,6 +254,85 @@ backfill_session_kv_keys() {
   if [ "$SESSION_KV_KEYS_PATCHED" = "true" ]; then
     print_success "Session KV keys backfilled; the event watcher and Session KV server can authenticate after the rollout."
   fi
+}
+
+# Add the shell sandbox's SSH keypair to an install that predates it.
+#
+# Same additive contract as the Session KV backfill above and for a sharper
+# reason: the sandbox copies authorized_keys into place once at startup, so
+# replacing a keypair that is already in use locks the agent out of its own
+# shell until that pod restarts. An existing pair is therefore never rewritten,
+# and a half-written pair (one key present, the other missing) is treated as
+# absent rather than patched around — a private key whose public half was lost
+# authenticates nothing.
+#
+# Only platform-agent-secrets is written here. The sandbox mounts a Secret of
+# its own, <name>-shell-authorized-keys, and the chart renders that one from
+# whatever public half it finds in platform-agent-secrets — so the step 4 helm
+# upgrade below picks the pair up on its own. Writing it here too would create
+# the object without Helm's ownership metadata, and that same helm upgrade would
+# then refuse to adopt it. The sandbox must not mount platform-agent-secrets
+# itself; see docs/designs/agent-shell-sandboxing.md#key-management.
+#
+# Set when this run wrote the pair, so the caller can roll the agent: the
+# private half reaches the gateway pod through a Secret volume that an init
+# container copies into place once at startup, so a pod that started before the
+# backfill keeps the empty directory it was given until it restarts.
+SANDBOX_KEYS_PATCHED="false"
+
+# How long step 5 waits for the sandbox and the credential proxy. Longer than
+# the gateway's because the sandbox is a StatefulSet with a ReadWriteOnce
+# volume: the new pod cannot attach until the old one has detached, so its
+# rollout serialises where a Deployment's overlaps.
+SANDBOX_ROLLOUT_TIMEOUT="180s"
+
+backfill_sandbox_ssh_key() {
+  local namespace="$1"
+  local secret_name="platform-agent-secrets"
+
+  if ! command -v ssh-keygen >/dev/null 2>&1; then
+    print_warning "ssh-keygen not found; skipping the shell sandbox keypair backfill."
+    return 0
+  fi
+  if ! kubectl get secret "$secret_name" -n "$namespace" >/dev/null 2>&1; then
+    print_warning "Secret '$secret_name' not found in '$namespace'; skipping the shell sandbox keypair backfill."
+    return 0
+  fi
+
+  local existing_private existing_public
+  existing_private="$(kubectl get secret "$secret_name" -n "$namespace" -o jsonpath='{.data.SANDBOX_SSH_PRIVATE_KEY}' 2>/dev/null || echo "")"
+  existing_public="$(kubectl get secret "$secret_name" -n "$namespace" -o jsonpath='{.data.SANDBOX_SSH_PUBLIC_KEY}' 2>/dev/null || echo "")"
+  if [ -n "$existing_private" ] && [ -n "$existing_public" ]; then
+    print_info "The shell sandbox keypair is already present; leaving it untouched."
+    return 0
+  fi
+
+  print_info "Generating the missing shell sandbox SSH keypair into Secret '$secret_name'..."
+  local key_dir old_umask
+  old_umask="$(umask)"
+  umask 077
+  key_dir="$(mktemp -d)"
+  umask "$old_umask"
+  if ! ssh-keygen -q -t ed25519 -N '' -C "kube-agents-shell-sandbox" -f "$key_dir/id_ed25519"; then
+    rm -rf "$key_dir"
+    print_warning "ssh-keygen failed; skipping the shell sandbox keypair backfill."
+    return 0
+  fi
+
+  # Patching `data` with base64 rather than `stringData` with the raw key, which
+  # is what the Session KV backfill above does: a PEM contains newlines, and
+  # this patch is built by string interpolation into JSON. base64's alphabet
+  # needs no escaping, so there is nothing here for a newline to break. `tr`
+  # because macOS base64 has no -w0.
+  local priv_b64 pub_b64
+  priv_b64="$(base64 < "$key_dir/id_ed25519" | tr -d '\n')"
+  pub_b64="$(base64 < "$key_dir/id_ed25519.pub" | tr -d '\n')"
+  rm -rf "$key_dir"
+  kubectl patch secret "$secret_name" -n "$namespace" --type=merge \
+    -p "{\"data\":{\"SANDBOX_SSH_PRIVATE_KEY\":\"$priv_b64\",\"SANDBOX_SSH_PUBLIC_KEY\":\"$pub_b64\"}}" >/dev/null
+
+  SANDBOX_KEYS_PATCHED="true"
+  print_success "Shell sandbox keypair backfilled into '$secret_name'; the upgrade below renders the sandbox's authorized_keys from it."
 }
 
 matches_release_bundle_ref() {
@@ -594,6 +673,7 @@ main() {
     echo -e "  • ${C_CYAN}Action:${C_RESET} Perform ${PARAM_UPGRADE_MODE} upgrade on cluster '${target_cluster}'"
     echo -e "  • ${C_CYAN}Image Overrides:${C_RESET} ${REGISTRY_PREFIX:-$DEFAULT_REGISTRY_PREFIX}/*:${PARAM_IMAGE_TAG}"
     echo -e "  • ${C_CYAN}Secrets:${C_RESET} generate SESSION_KV_API_KEY / SESSION_KV_SALT into 'platform-agent-secrets' only if absent (existing values are never rewritten)"
+    echo -e "  • ${C_CYAN}Secrets:${C_RESET} generate the shell sandbox SSH keypair into 'platform-agent-secrets' and 'platform-agent-shell-authorized-keys' only if absent"
     write_report "DRY_RUN_COMPLETE"
     exit 0
   fi
@@ -699,13 +779,19 @@ main() {
   fi
 
   if [ "$PARAM_PLAN" = "true" ]; then
-    # backfill_session_kv_keys PATCHES the live Secret when a key is absent,
-    # which a plan may not do. Skipping it costs the plan nothing: the keys it
-    # would add are not Terraform-managed and so appear in no plan either way.
-    print_info "Plan mode: skipping the Session KV backfill, which would patch the live Secret."
+    # Both backfills PATCH a live Secret when a key is absent, which a plan may
+    # not do. Skipping them costs the plan nothing: what they would add is not
+    # Terraform-managed and so appears in no plan either way.
+    print_info "Plan mode: skipping the Session KV backfill and the shell sandbox key backfill, which would patch the live Secret."
   else
     print_step "3. Reconciling Pod-Scoped Session Keys"
     backfill_session_kv_keys "$target_namespace"
+    # Rolls the agent on the same terms as the Session KV keys, and for the same
+    # reason: the sandbox StatefulSet the operator renders mounts the public half,
+    # and the gateway pod stages the private half from a Secret volume in an init
+    # container that runs once. An install that gains the pair without a restart
+    # gains a sandbox it cannot ssh into.
+    backfill_sandbox_ssh_key "$target_namespace"
   fi
 
   # Helm never touches the crds/ directory on upgrade — that is Helm's own
@@ -718,15 +804,33 @@ main() {
     kubectl apply --server-side --force-conflicts -f "${repo_dir}/charts/kube-agents/crds/" >/dev/null
   }
 
-  # The chart-only fast path: a mode that moves no GCP resource re-tags one
-  # image on the live release and leaves the rest of the values as they are.
-  # The regenerated tfvars carry the same new tag, so the next full
+  # The chart-only fast path: a mode that moves no GCP resource re-tags the
+  # images it owns on the live release and leaves the rest of the values as
+  # they are. The regenerated tfvars carry the same new tag, so the next full
   # `terraform apply` agrees with the release instead of reverting it.
+  #
+  # Takes every key it must move in one `helm upgrade`, not one call per key:
+  # two sequential upgrades leave the release briefly holding a new agent
+  # against an old sandbox, and the second one's reused values would have to
+  # re-read what the first wrote.
+  #
+  # --reset-then-reuse-values, not --reuse-values. --reuse-values renders this
+  # checkout's chart against only the previous release's values, so any key the
+  # chart gained since that release is simply absent: upgrading a pre-split
+  # install this way hits a nil pointer in operator-deployment.yaml, or renders
+  # the sandbox image as ":<tag>" and leaves the StatefulSet unable to start.
+  # Resetting first takes the checkout's defaults for the new keys and re-applies
+  # the release's own overrides on top, which is what the redeploy workflows
+  # already do for the same reason.
   helm_retag() {
-    local set_key="$1"
+    local set_args=()
+    local set_key
+    for set_key in "$@"; do
+      set_args+=(--set "${set_key}=${PARAM_IMAGE_TAG}")
+    done
     helm upgrade kube-agents "${repo_dir}/charts/kube-agents" \
-      --namespace "$target_namespace" --reuse-values \
-      --set "${set_key}=${PARAM_IMAGE_TAG}" --wait --timeout 10m
+      --namespace "$target_namespace" --reset-then-reuse-values \
+      "${set_args[@]}" --wait --timeout 10m
   }
 
   # The release guard runs before the tfvars generation on purpose: a
@@ -782,7 +886,11 @@ main() {
 
     harness)
       print_step "4. Upgrading Platform Agent Deployment & Identity"
-      helm_retag "platformAgent.deployment.image.tag"
+      # The sandbox moves with the agent: both are built from this repository
+      # at the same commit, and the shell the agent reaches over ssh is the
+      # half that runs the new tools. Retagging the agent alone leaves the
+      # StatefulSet on the previous image.
+      helm_retag "platformAgent.deployment.image.tag" "agentSandbox.image.tag"
       print_success "Platform Agent deployment upgraded successfully!"
       ;;
 
@@ -818,16 +926,18 @@ main() {
 
   # An operator-mode upgrade rolls the controller manager and nothing else, so a
   # Secret patched above would sit unread until some later harness upgrade —
-  # with the watcher dead in the meantime. The other two modes re-render the
-  # agent Deployment and pick the keys up on their own rollout.
+  # with the watcher dead, or the sandbox unreachable, in the meantime. The
+  # other two modes re-render the agent Deployment and pick the keys up on their
+  # own rollout.
   local restarted_agent="false"
-  if [ "$SESSION_KV_KEYS_PATCHED" = "true" ] && [ "$PARAM_UPGRADE_MODE" = "operator" ]; then
+  if [ "$PARAM_UPGRADE_MODE" = "operator" ] &&
+    { [ "$SESSION_KV_KEYS_PATCHED" = "true" ] || [ "$SANDBOX_KEYS_PATCHED" = "true" ]; }; then
     if kubectl get deployment platform-agent-gateway -n "$target_namespace" >/dev/null 2>&1; then
-      print_info "Restarting the Platform Agent so it reads the newly added Session KV keys..."
+      print_info "Restarting the Platform Agent so it reads the newly added Secret keys..."
       kubectl rollout restart deployment/platform-agent-gateway -n "$target_namespace"
       restarted_agent="true"
     else
-      print_warning "Session KV keys were added but Deployment 'platform-agent-gateway' was not found in '$target_namespace'; restart the agent yourself so it reads them."
+      print_warning "Secret keys were added but Deployment 'platform-agent-gateway' was not found in '$target_namespace'; restart the agent yourself so it reads them."
     fi
   fi
 
@@ -840,6 +950,20 @@ main() {
   fi
   if [ "$PARAM_UPGRADE_MODE" = "harness" ] || [ "$PARAM_UPGRADE_MODE" = "full" ] || [ "$restarted_agent" = "true" ]; then
     kubectl rollout status deployment/platform-agent-gateway -n kubeagents-system --timeout=120s
+  fi
+  # A healthy gateway is not a working install. The agent runs no command in its
+  # own pod: every shell command goes over ssh to the sandbox StatefulSet, and
+  # every credentialed one through the proxy. Verifying only the gateway
+  # reported an upgrade that succeeded while the agent could not run kubectl.
+  #
+  # Guarded on the object existing, because the operator creates both and an
+  # operator-mode upgrade can reach here before its PlatformAgent has
+  # reconciled. A missing object is that, not a failed rollout.
+  if kubectl get statefulset platform-agent-shell -n "$target_namespace" >/dev/null 2>&1; then
+    kubectl rollout status statefulset/platform-agent-shell -n "$target_namespace" --timeout="$SANDBOX_ROLLOUT_TIMEOUT"
+  fi
+  if kubectl get deployment platform-agent-credential-proxy -n "$target_namespace" >/dev/null 2>&1; then
+    kubectl rollout status deployment/platform-agent-credential-proxy -n "$target_namespace" --timeout="$SANDBOX_ROLLOUT_TIMEOUT"
   fi
   print_success "Upgraded deployments verified healthy."
 

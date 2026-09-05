@@ -16,6 +16,7 @@ from typing import Any
 from pathlib import Path
 from datetime import datetime
 from mcp.server import MCPServer
+import sandbox_exec
 from agent_common_server import _run_env, CONFIG_PATH
 from gke_endpoint import dns_endpoint_args
 
@@ -287,10 +288,7 @@ def get_project_id() -> str:
             log(f"Warning: Failed to parse USER.md: {e}")
 
     try:
-        res = subprocess.run(
-            ["gcloud", "config", "get-value", "project"],
-            capture_output=True, text=True, check=True, env=_run_env()
-        )
+        res = _run_cluster(["gcloud", "config", "get-value", "project"])
         val = res.stdout.strip()
         if val and val != "(unset)":
             return val
@@ -303,14 +301,11 @@ def get_project_id() -> str:
 def get_valid_regions(project_id: str) -> list[str]:
     """Retrieve the live list of enabled Google Cloud regions for the GKE API."""
     try:
-        res = subprocess.run(
-            [
-                "gcloud", "compute", "regions", "list",
-                f"--project={project_id}",
-                "--format=value(name)"
-            ],
-            capture_output=True, text=True, check=True, env=_run_env()
-        )
+        res = _run_cluster([
+            "gcloud", "compute", "regions", "list",
+            f"--project={project_id}",
+            "--format=value(name)"
+        ])
         regions = [line.strip() for line in res.stdout.splitlines() if line.strip()]
         if regions:
             return regions
@@ -366,7 +361,7 @@ def verify_gke_cluster(cluster_name: str, location: str, project_id: str = "") -
     ]
 
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True, env=_run_env())
+        res = _run_cluster(cmd)
         data = json.loads(res.stdout)
         return json.dumps({
             "exists": True,
@@ -395,39 +390,76 @@ def _kubeconfig_slug(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9._-]", "_", value) or "unset"
 
 
+# Where the sandbox keeps these files. Only `hermes` can write here: the
+# directory is 0700 hermes:hermes, created in deploy/sandbox/Dockerfile.
+#
+# That is not tidiness. A kubeconfig carries an `exec` stanza naming a binary
+# and its arguments, and kubectl runs it — so a kubeconfig the model can write
+# is arbitrary code execution as the principal this server connects as, which
+# is the one account in the sandbox the model is not supposed to reach. Every
+# other writable path there (/opt/data, /tmp) is shared with `agent`.
+SANDBOX_KUBECONFIG_DIR = "/home/hermes/.kubeconfigs"
+
+
 def _thread_kubeconfig_path(project_id: str, cluster_name: str, location: str) -> str:
     """Where to keep the per-target kubeconfig `get-credentials` writes.
 
-    This has to sit inside the credential proxy's workspace root. The gcloud
-    and kubectl that use it are shims: the real commands run in the sidecar,
-    and the server honours a caller-supplied KUBECONFIG only when every entry
-    resolves inside the shared workspace, rejecting anything else with a 400
-    rather than ignoring it (credential_proxy._resolve_kubeconfig). `/tmp` is
-    per-container and outside that root, so a path there fails the request
-    outright and takes all four cluster-scoped tools down with it.
+    Written by a gcloud and read by a kubectl that both run in the shell
+    sandbox, so the path is a sandbox path and the agent pod never holds the
+    file. Nothing else reads it — the Cluster Agents' pinned configs are a
+    separate mechanism in cluster_agent_profile.py.
 
-    $HERMES_HOME is on the shared PVC and is already what the proxy accepts for
-    the Cluster Agents' pinned configs. Keeping one file per target preserves
-    the thread isolation the /tmp path was chosen for: concurrent calls to
-    different clusters do not race on a single current-context. What lands on
-    the PVC is a cluster endpoint, its CA, and an exec stanza naming
-    gke-gcloud-auth-plugin — no bearer token.
+    One file per target, which preserves the thread isolation this was
+    originally moved off /tmp for: concurrent calls to different clusters do
+    not race on a single current-context. What the file holds is a cluster
+    endpoint, its CA, and an exec stanza naming gke-gcloud-auth-plugin — no
+    bearer token.
+
+    Unsandboxed, it stays under $HERMES_HOME for the reason it always has: the
+    gcloud and kubectl are credential-proxy shims, and the proxy honours a
+    caller-supplied KUBECONFIG only when every entry resolves inside its
+    workspace root, rejecting anything else with a 400 rather than ignoring it
+    (credential_proxy._resolve_kubeconfig). #737 Part C has to give the
+    directory above the same standing once the proxy is reachable from the
+    sandbox; until then these calls fail before the kubeconfig is consulted.
     """
-    home = os.environ.get("HERMES_HOME", "/opt/data")
-    directory = os.path.join(home, ".kubeconfigs")
-    os.makedirs(directory, exist_ok=True)
+    if sandbox_exec.sandbox_enabled():
+        directory = SANDBOX_KUBECONFIG_DIR
+    else:
+        home = os.environ.get("HERMES_HOME", "/opt/data")
+        directory = os.path.join(home, ".kubeconfigs")
+        os.makedirs(directory, exist_ok=True)
     slug = "_".join(
         _kubeconfig_slug(part) for part in (project_id, cluster_name, location)
     )
     return os.path.join(directory, f"kubeconfig_{slug}.yaml")
 
 
+def _run_cluster(cmd: list[str], env: dict[str, str] | None = None, *,
+                 timeout: int | None = None, check: bool = True):
+    """Run a kubectl or gcloud command in the shell sandbox.
+
+    `env` is the dict `switch_kube_context` hands back. Only `KUBECONFIG` is
+    taken from it and rendered into the remote command; the rest is the agent
+    pod's environment, which includes `API_SERVER_KEY` and has no business
+    crossing the connection. Callers with no cluster context pass nothing.
+    """
+    kubeconfig = (env or {}).get("KUBECONFIG")
+    return sandbox_exec.run(
+        cmd,
+        remote_env={"KUBECONFIG": kubeconfig} if kubeconfig else None,
+        local_env=env if env is not None else _run_env(),
+        timeout=timeout,
+        check=check,
+    )
+
+
 def switch_kube_context(project_id: str, cluster_name: str, location: str) -> tuple[str, dict[str, str]]:
     """
     Point kubectl to the target GKE cluster using a thread-isolated kubeconfig.
     Returns (error_string, env_dict). If error_string is non-empty, switching failed.
-    env_dict is always populated (with HOME=/tmp injected) and should be passed as
-    env=env_dict to subsequent subprocess.run calls.
+    env_dict is always populated (with HOME=/tmp injected) and should be passed to
+    the `_run_cluster` calls that follow, which take KUBECONFIG out of it.
     """
     if not project_id and not cluster_name and not location:
         return "", _run_env()
@@ -452,7 +484,7 @@ def switch_kube_context(project_id: str, cluster_name: str, location: str) -> tu
         *dns_endpoint_args(project_id, cluster_name, location, env=env),
     ]
     try:
-        subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30, env=env)
+        _run_cluster(cmd, env, timeout=30)
         return "", env
     except subprocess.CalledProcessError as e:
         return (
@@ -461,6 +493,11 @@ def switch_kube_context(project_id: str, cluster_name: str, location: str) -> tu
         )
     except subprocess.TimeoutExpired:
         return f"ERROR: Timed out switching kube context to cluster '{cluster_name}'.", env
+    except sandbox_exec.SandboxUnavailable as e:
+        # Reported here rather than left to propagate, so every tool that
+        # switches context gets one error naming the sandbox. The command never
+        # ran, which is a different thing from the cluster refusing it.
+        return f"ERROR: Could not reach the shell sandbox to switch kube context: {e}", env
 
 
 @mcp.tool()
@@ -484,7 +521,7 @@ def list_cc_healthchecks(project_id: str = "", cluster_name: str = "", location:
         ctx_err, env = switch_kube_context(project_id, cluster_name, location)
         if ctx_err:
             return ctx_err
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30, env=env)
+        res = _run_cluster(cmd, env, timeout=30)
         return _strip_kubectl_noise(res.stdout)
     except subprocess.TimeoutExpired:
         return "ERROR: Timed out querying Config Controller health checks after 30 seconds."
@@ -513,7 +550,7 @@ def get_cc_operator_status(project_id: str = "", cluster_name: str = "", locatio
         ctx_err, env = switch_kube_context(project_id, cluster_name, location)
         if ctx_err:
             return ctx_err
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30, env=env)
+        res = _run_cluster(cmd, env, timeout=30)
         return _strip_kubectl_noise(res.stdout)
     except subprocess.TimeoutExpired:
         return "ERROR: Timed out retrieving Config Controller operator status after 30 seconds."
@@ -552,28 +589,39 @@ def get_cc_pod_diagnostics(
         return ctx_err
 
     try:
-        res = subprocess.run(describe_cmd, capture_output=True, text=True, check=True, timeout=30, env=env)
+        res = _run_cluster(describe_cmd, env, timeout=30)
         results.append(f"=== POD DESCRIBE ===\n{_sanitize_log_text(res.stdout)}\n")
     except subprocess.TimeoutExpired:
         results.append("=== POD DESCRIBE TIMEOUT ===\nCommand timed out after 30 seconds.\n")
     except subprocess.CalledProcessError as e:
         results.append(f"=== POD DESCRIBE ERROR ===\nExit Code: {e.returncode}\nStderr: {e.stderr}\n")
+    except sandbox_exec.SandboxUnavailable as e:
+        # The sandbox can go away between the three calls below — they are one
+        # burst over one multiplexed connection, and an eviction lands mid-burst.
+        # Recorded per section so a partial diagnostic still reports what it got.
+        results.append(f"=== POD DESCRIBE ERROR ===\nShell sandbox unreachable: {e}\n")
 
     try:
-        res = subprocess.run(logs_cmd, capture_output=True, text=True, check=True, timeout=30, env=env)
+        res = _run_cluster(logs_cmd, env, timeout=30)
         results.append(f"=== POD LOGS (CURRENT TAIL=100) ===\n{_sanitize_log_text(res.stdout)}\n")
     except subprocess.TimeoutExpired:
         results.append("=== POD LOGS (CURRENT TAIL=100) TIMEOUT ===\nCommand timed out after 30 seconds.\n")
     except subprocess.CalledProcessError as e:
         results.append(f"=== POD LOGS (CURRENT TAIL=100) ERROR ===\nExit Code: {e.returncode}\nStderr: {e.stderr}\n")
+    except sandbox_exec.SandboxUnavailable as e:
+        results.append(f"=== POD LOGS (CURRENT TAIL=100) ERROR ===\nShell sandbox unreachable: {e}\n")
 
     try:
-        res = subprocess.run(prev_logs_cmd, capture_output=True, text=True, check=True, timeout=30, env=env)
+        res = _run_cluster(prev_logs_cmd, env, timeout=30)
         results.append(f"=== POD LOGS (PREVIOUS TAIL=100) ===\n{_sanitize_log_text(res.stdout)}\n")
     except subprocess.TimeoutExpired:
         results.append("=== POD LOGS (PREVIOUS TAIL=100) TIMEOUT ===\nCommand timed out after 30 seconds.\n")
     except subprocess.CalledProcessError as e:
         results.append(f"=== POD LOGS (PREVIOUS TAIL=100) ===\nNo previous container logs available (container has not restarted or previous logs expired).\n")
+    except sandbox_exec.SandboxUnavailable as e:
+        # Not folded into the clause above: "no previous logs" is a statement
+        # about the pod, and the sandbox being gone is not evidence for it.
+        results.append(f"=== POD LOGS (PREVIOUS TAIL=100) ERROR ===\nShell sandbox unreachable: {e}\n")
 
     return "\n".join(results)
 
@@ -599,7 +647,7 @@ def list_cc_pods(project_id: str = "", cluster_name: str = "", location: str = "
         ctx_err, env = switch_kube_context(project_id, cluster_name, location)
         if ctx_err:
             return ctx_err
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30, env=env)
+        res = _run_cluster(cmd, env, timeout=30)
         data = json.loads(res.stdout)
         pods = [s for s in (_pod_summary(p) for p in (data.get("items") or [])) if s]
         return _neutralize_tokens(_strip_unsafe_chars(json.dumps(pods, indent=2)))
@@ -648,7 +696,7 @@ def audit_log_searcher(project_id: str = "", cluster_name: str = "", location: s
     ]
 
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=30, env=_run_env())
+        res = _run_cluster(cmd, timeout=30)
         return _strip_audit_log_noise(res.stdout)
     except subprocess.TimeoutExpired:
         return "ERROR: Cloud Audit Logs query timed out after 30 seconds."
@@ -741,6 +789,9 @@ def send_notification(message: str, session_id: str = "") -> str:
     for target in targets:
         platform_name = target.split(":", 1)[0]
         try:
+            # Stays in the agent pod. `hermes` is not cluster tooling: it needs
+            # the profiles on the data PVC and the gateway on loopback, and the
+            # sandbox image does not carry the binary.
             res = subprocess.run(
                 ["hermes", "send", "--to", target, message],
                 capture_output=True, text=True, check=True, env=_run_env()

@@ -101,6 +101,7 @@ check_base_image golang deploy/docker/Dockerfile GOLANG_IMAGE GOLANG_VERSION
 check_base_image golang k8s-operator/Dockerfile GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static k8s-operator/Dockerfile DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image python examples/inference-replay/replay-proxy/Dockerfile PYTHON_IMAGE PYTHON_VERSION
+check_base_image python deploy/sandbox/Dockerfile PYTHON_IMAGE PYTHON_VERSION
 
 # hermes-agent is the one base image whose tag lives outside the Dockerfile —
 # the release workflows read tags.env — so the inventory points at that file

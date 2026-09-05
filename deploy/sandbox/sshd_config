@@ -1,0 +1,104 @@
+# sshd for the agent shell sandbox. See deploy/sandbox/Dockerfile.
+#
+# This is the whole config, not an overlay: the Dockerfile replaces Debian's
+# /etc/ssh/sshd_config with this file so that what the sandbox accepts is
+# reviewable here rather than inferred from a distro default plus a diff.
+
+# Unprivileged port; the Sandbox CR's Service targets it by name.
+Port 2222
+
+# Host keys live on a volume, not in the container's ephemeral /etc/ssh. sshd
+# would happily regenerate them on a pod recycle, and Hermes connects with
+# StrictHostKeyChecking=accept-new — which accepts a key it has never seen and
+# refuses one that changed. A regenerated host key is therefore not a prompt, it
+# is every subsequent command failing until someone clears the known_hosts entry
+# by hand. The entrypoint creates these on first start.
+#
+# Their own volume, not the model's /opt/data. Both clients pin these keys, and
+# a pinned key whose private half the sandboxed account can read is not a
+# control. entrypoint.sh refuses to start if this directory is not root-owned.
+HostKey /var/lib/sandbox-sshd/ssh_host_ed25519_key
+HostKey /var/lib/sandbox-sshd/ssh_host_rsa_key
+
+# Public keys only, two accounts, no root. The agent pod holds the private half
+# and nothing else is meant to be able to open a session here.
+#
+# `agent` is the model's shell. `hermes` is what trusted agent-pod code connects
+# as to run a cluster command, and it exists because the model owns `agent`'s
+# home and can make a non-interactive session there return whatever it likes
+# (deploy/sandbox/Dockerfile says more).
+#
+# %h, not an absolute path, and that is the whole of what keeps the two apart.
+# An absolute AuthorizedKeysFile is read for every account, so with
+# /home/agent/.ssh/authorized_keys named here — a 0600 file the model owns and
+# can append to — the model could authorise its own key and then open a session
+# as `hermes`. Per-user resolution sends it to /home/hermes/.ssh/authorized_keys
+# instead, inside a 0700 home that uid 1000 cannot enter.
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PubkeyAuthentication yes
+AuthorizedKeysFile %h/.ssh/authorized_keys
+AllowUsers agent hermes
+
+# The client does not get to choose the sandbox's environment. Hermes' ssh
+# backend sets what it needs inside the command it runs, so nothing legitimate
+# depends on these — and both are ways to influence the login shell from the
+# far side of the connection.
+PermitUserEnvironment no
+AcceptEnv LANG LC_*
+
+# There is deliberately no SetEnv here; entrypoint.sh writes the one this
+# server has, into the drop-in included at the bottom. That is not a style
+# choice. sshd keeps the FIRST SetEnv directive it parses and silently discards
+# every later one — the whole directive, not the variables it duplicates — so a
+# `SetEnv PATH=...` line in this file would not merge with the entrypoint's
+# forwarded values, it would erase them. A build of this image shipped with both
+# and reached the sandbox with PATH correct and CREDENTIAL_PROXY_URL missing,
+# which looks exactly like the pod not setting it. One line, one writer.
+
+# No sftp subsystem. Hermes moves whole directories with tar over the
+# connection in both directions and never opens an sftp channel, so enabling
+# one would add a second file-transfer path into the sandbox that nothing uses
+# and nothing watches.
+
+# Hermes holds one ControlMaster connection open and spawns every command
+# through it, so the session count is not a proxy for how busy the agent is.
+# The idle timeout is what closes a connection the agent pod has stopped using
+# without waiting for TCP to notice.
+ClientAliveInterval 60
+ClientAliveCountMax 5
+
+# The session environment: PATH, plus whatever the entrypoint was able to
+# forward from the pod. It has to come through sshd rather than /etc/profile.d
+# because a non-login session reads no profile, and `ssh sandbox kubectl get
+# pods` — the shape of every command the agent sends — is not a login shell.
+# /etc/profile.d/credential-proxy-path.sh is still needed for the other case:
+# a login shell runs /etc/profile, which overwrites PATH wholesale, and that
+# script is what puts the wrappers back in front afterwards.
+#
+# Included last, and that placement is load-bearing: sshd keeps the first value
+# it obtains for a keyword, so every access-control decision above is settled
+# before this file is read and no generated drop-in can relax PermitRootLogin
+# or AllowUsers.
+Include /etc/ssh/sshd_config.d/*.conf
+
+# The working directory Hermes cds into has to exist on this side of the
+# connection, and nothing in Hermes' SSH backend creates it — a delegated kanban
+# card gets a scratch workspace on the agent pod's PVC and then every command it
+# runs here exits 126. sandbox-session-command creates the directory and then
+# runs what sshd would have run; the script says why the fix is here rather than
+# upstream, and docs/designs/agent-shell-sandboxing.md has the full account.
+#
+# Scoped to `agent` rather than global. `hermes` is the account trusted
+# agent-pod code connects as for cluster commands; it does not go through
+# Hermes' terminal wrapper, so there is nothing for this to fix there and one
+# fewer process between a cluster command and its output.
+#
+# Below the Include, and that matters as much as the Include being last. A Match
+# block ends the global section for everything after it, and SetEnv inside one
+# applies only to sessions that match — so putting this above would strand the
+# entrypoint's generated SetEnv inside a per-user block and leave the `hermes`
+# account with no PATH, no HERMES_HOME and no CREDENTIAL_PROXY_URL.
+Match User agent
+    ForceCommand /usr/local/bin/sandbox-session-command

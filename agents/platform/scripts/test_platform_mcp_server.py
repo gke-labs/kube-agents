@@ -54,8 +54,20 @@ except Exception:
     _stub_if_missing("pydantic", pydantic)
 
 import platform_mcp_server
+import sandbox_exec
 # Override the env helper globally to return static values and avoid running kubectl get secret sub-commands
 platform_mcp_server._run_env = lambda extra=None: {"HOME": "/tmp", "SLACK_BOT_TOKEN": "dummy-token", **(extra or {})}
+# Pin the transport rather than inheriting it. sandbox_exec decides from the
+# managed Hermes config, which exists inside the agent pod and not on a CI
+# runner, so without this the cases below would take a different path depending
+# on where they ran. TestSandboxRouting turns it back on for the cases that are
+# about it.
+#
+# The default path is redirected rather than sandbox_enabled() replaced, and the
+# distinction matters: discovery imports every test module into one process, so
+# a function swapped out here stays swapped out for test_sandbox_exec.py, whose
+# whole subject is that function. Every call there passes an explicit path.
+sandbox_exec.MANAGED_CONFIG_PATH = "/nonexistent/kube-agents-test/config.yaml"
 
 from platform_mcp_server import verify_gke_cluster, list_cc_healthchecks, get_cc_operator_status, list_cc_pods, switch_kube_context, get_cc_pod_diagnostics, audit_log_searcher, send_notification, report_to_chat, _sanitize_log_text, _sanitize_audit_value, _strip_audit_log_noise
 
@@ -63,7 +75,7 @@ class TestVerifyGkeCluster(unittest.TestCase):
 
     @patch('platform_mcp_server.get_project_id')
     @patch('platform_mcp_server.validate_location')
-    @patch('platform_mcp_server.subprocess.run')
+    @patch('platform_mcp_server._run_cluster')
     def test_verify_gke_cluster_success(self, mock_run, mock_validate_location, mock_get_project_id):
         mock_get_project_id.return_value = "test-project"
         mock_validate_location.return_value = ""
@@ -85,9 +97,7 @@ class TestVerifyGkeCluster(unittest.TestCase):
                 "--location=us-central1",
                 "--project=test-project",
                 "--format=json(status, id)"
-            ],
-            capture_output=True, text=True, check=True,
-            env={"HOME": "/tmp", "SLACK_BOT_TOKEN": "dummy-token"}
+            ]
         )
 
     @patch('platform_mcp_server.get_project_id')
@@ -140,7 +150,7 @@ class TestVerifyGkeCluster(unittest.TestCase):
 class TestCcDiagnosticTools(unittest.TestCase):
 
     @patch('platform_mcp_server.switch_kube_context')
-    @patch('platform_mcp_server.subprocess.run')
+    @patch('platform_mcp_server._run_cluster')
     def test_list_cc_healthchecks_success(self, mock_run, mock_switch):
         mock_response = MagicMock()
         mock_response.stdout = '{"items": []}'
@@ -157,11 +167,11 @@ class TestCcDiagnosticTools(unittest.TestCase):
                 "-n", "krmapihosting-system",
                 "-o", "json"
             ],
-            capture_output=True, text=True, check=True, timeout=30, env={"KUBECONFIG": "/tmp/test.yaml"}
+            {"KUBECONFIG": "/tmp/test.yaml"}, timeout=30
         )
 
     @patch('platform_mcp_server.switch_kube_context')
-    @patch('platform_mcp_server.subprocess.run')
+    @patch('platform_mcp_server._run_cluster')
     def test_get_cc_operator_status_success(self, mock_run, mock_switch):
         mock_response = MagicMock()
         mock_response.stdout = '{"status": {"healthy": True}}'
@@ -177,7 +187,7 @@ class TestCcDiagnosticTools(unittest.TestCase):
                 "kubectl", "get", "configconnectors.core.cnrm.cloud.google.com",
                 "-o", "json"
             ],
-            capture_output=True, text=True, check=True, timeout=30, env={"KUBECONFIG": "/tmp/test.yaml"}
+            {"KUBECONFIG": "/tmp/test.yaml"}, timeout=30
         )
 
     @patch('platform_mcp_server.switch_kube_context')
@@ -376,15 +386,16 @@ class TestSwitchKubeContext(unittest.TestCase):
         self.assertIsNotNone(env3)
         mock_run.assert_not_called()
 
-    @patch('platform_mcp_server.subprocess.run')
+    @patch('platform_mcp_server._run_cluster')
     def test_switch_kube_context_success(self, mock_run):
         err, env = switch_kube_context("my-project", "my-cluster", "us-central1")
 
         self.assertEqual(err, "")
         self.assertIsNotNone(env)
-        # Inside the workspace, not /tmp: the sidecar 400s any KUBECONFIG
-        # outside the shared workspace, which would fail the request and
-        # take every cluster-scoped tool with it.
+        # Inside the workspace, not /tmp: unsandboxed, the sidecar 400s any
+        # KUBECONFIG outside the shared workspace, which would fail the request
+        # and take every cluster-scoped tool with it. The sandboxed path uses a
+        # different directory for a different reason -- see TestSandboxRouting.
         self.assertEqual(
             env["KUBECONFIG"],
             os.path.join(self.home, ".kubeconfigs",
@@ -396,7 +407,7 @@ class TestSwitchKubeContext(unittest.TestCase):
                 "--location=us-central1",
                 "--project=my-project"
             ],
-            capture_output=True, text=True, check=True, timeout=30, env=env
+            env, timeout=30
         )
         # The cluster is asked about by the same triple that is being switched to.
         self.mock_dns.assert_called_once_with(
@@ -441,6 +452,96 @@ class TestSwitchKubeContext(unittest.TestCase):
         self.assertTrue(err.startswith("ERROR:"))
         self.assertIn("Timed out switching kube context", err)
         self.assertIsNotNone(env)
+
+
+class TestSandboxRouting(unittest.TestCase):
+    """Where kubectl and gcloud actually run, and what travels with them.
+
+    The agent image carries neither binary, so a command that stays in the pod
+    is not a slower path — it is the tool not working. These cases are the ones
+    the module-level `sandbox_enabled = False` above deliberately turns off.
+    """
+
+    SANDBOX_TERMINAL = {
+        "backend": "ssh",
+        "ssh_host": "platform-agent-shell-0.platform-agent-shell.svc.cluster.local",
+        "ssh_key": "/etc/sandbox-ssh/id_ed25519",
+        "ssh_port": 2222,
+        "ssh_user": "agent",
+    }
+
+    def setUp(self):
+        for name, value in (("sandbox_enabled", lambda path=None: True),
+                            ("_load_terminal_config", lambda path=None: self.SANDBOX_TERMINAL)):
+            patcher = patch.object(sandbox_exec, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _ssh_command(self, *args, **kwargs):
+        """Run through _run_cluster and return the argv ssh was handed."""
+        captured = {}
+
+        def fake_run(argv, **run_kwargs):
+            captured["argv"] = argv
+            captured["env"] = run_kwargs.get("env")
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        with patch.object(sandbox_exec.subprocess, "run", fake_run):
+            platform_mcp_server._run_cluster(*args, **kwargs)
+        return captured
+
+    def test_kubectl_runs_in_the_sandbox_as_hermes(self):
+        captured = self._ssh_command(["kubectl", "get", "pods"])
+        self.assertEqual(captured["argv"][0], "ssh")
+        target = [a for a in captured["argv"] if "@" in a]
+        self.assertEqual(len(target), 1)
+        # Not terminal.ssh_user: that account's ~/.bashrc is the model's, and
+        # bash sources it for a non-interactive `ssh host cmd`.
+        self.assertTrue(target[0].startswith("hermes@"))
+        self.assertNotIn("agent@", " ".join(captured["argv"]))
+
+    def test_only_kubeconfig_crosses_the_connection(self):
+        env = {"KUBECONFIG": "/home/hermes/.kubeconfigs/kubeconfig_p_c_l.yaml",
+               "API_SERVER_KEY": "sentinel", "SESSION_KV_API_KEY": "sentinel",
+               "HOME": "/tmp"}
+        captured = self._ssh_command(["kubectl", "get", "pods"], env, timeout=30)
+
+        remote = captured["argv"][-1]
+        self.assertIn("KUBECONFIG=/home/hermes/.kubeconfigs/kubeconfig_p_c_l.yaml", remote)
+        # Neither in the remote command nor in the ssh client's own environment.
+        self.assertNotIn("sentinel", remote)
+        self.assertNotIn("API_SERVER_KEY", captured["env"])
+        self.assertNotIn("SESSION_KV_API_KEY", captured["env"])
+
+    def test_a_call_without_cluster_context_carries_no_environment(self):
+        captured = self._ssh_command(["gcloud", "config", "get-value", "project"])
+        self.assertNotIn("env ", captured["argv"][-1])
+
+    def test_the_kubeconfig_lands_where_the_model_cannot_write_it(self):
+        """A kubeconfig names an exec plugin, and kubectl runs it.
+
+        Anywhere uid 1000 can write is arbitrary code execution as the
+        principal this server connects as, so the path must be inside
+        hermes' 0700 home rather than /opt/data or /tmp.
+        """
+        path = platform_mcp_server._thread_kubeconfig_path("proj", "clust", "us-central1")
+        self.assertTrue(path.startswith(platform_mcp_server.SANDBOX_KUBECONFIG_DIR + "/"), path)
+        self.assertTrue(path.startswith("/home/hermes/"), path)
+        self.assertEqual(
+            path,
+            "/home/hermes/.kubeconfigs/kubeconfig_proj_clust_us-central1.yaml",
+        )
+
+    def test_an_unreachable_sandbox_is_reported_as_such(self):
+        """Not as a cluster error: the command never ran, and retrying is valid."""
+        failure = subprocess.CompletedProcess(
+            ["ssh"], 255, stdout="",
+            stderr="ssh: connect to host x port 2222: Connection refused")
+        with patch.object(sandbox_exec.subprocess, "run", return_value=failure), \
+             patch('platform_mcp_server.dns_endpoint_args', return_value=[]):
+            err, _env = switch_kube_context("proj", "clust", "us-central1")
+        self.assertIn("shell sandbox", err)
+        self.assertNotIn("Failed to switch kube context", err)
 
 
 class TestContextSwitchFailurePropagation(unittest.TestCase):

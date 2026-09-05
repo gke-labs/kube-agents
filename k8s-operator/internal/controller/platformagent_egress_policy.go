@@ -64,11 +64,6 @@ package controller
 // It is a real control in exactly one configuration and the operator says so
 // out loud rather than rendering something that looks protective:
 //
-//   - It requires spec.security.splitCredentialBrokerPod. The broker mints the
-//     cloud token from the metadata server — that is its function — and a
-//     Pod-level policy cannot tell two containers in one network namespace
-//     apart. validateEgressPolicy refuses the reconcile in the sidecar layout
-//     and reports Degraded, and nothing is rendered.
 //   - It does nothing whatsoever on a cluster whose CNI does not enforce
 //     NetworkPolicy. The operator cannot detect that: an unenforced policy is
 //     accepted by the API server, stored, and returned by kubectl get exactly
@@ -82,10 +77,9 @@ package controller
 //     the private ranges), and platform-agent-core-egress from
 //     deploy/kustomize/platform, on installs that apply it. So the policy
 //     below denies the metadata server, and the Pod it selects can still
-//     reach it. Narrowing the gateway policy is not done here: Workload
-//     Identity needs that path and, in the sidecar layout, the broker sharing
-//     the Pod is what needs it. Scoping it to the broker Pod once the broker
-//     has left is the follow-up.
+//     reach it. Narrowing the gateway policy is not done here: the metadata
+//     path is still what Workload Identity uses, and the broker Pod is the one
+//     that needs it. Scoping the allowance to that Pod alone is the follow-up.
 
 import (
 	"fmt"
@@ -325,6 +319,22 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 		},
 	})
 
+	// The shell sandbox's sshd. Every command the model runs executes there, so
+	// this rule is the difference between an agent that can act and one whose
+	// every tool call times out. It duplicates rule 11 of buildNetworkPolicy
+	// because the two policies are rendered independently and either can be the
+	// only one present: spec.networkPolicy.enabled: false with
+	// spec.security.egressPolicy: Allowlist deletes the gateway policy and leaves
+	// this one standing alone. That combination is also the one that fails
+	// silently — the CR reads Ready, the sandbox Pod is Running, and the ssh dial
+	// just never completes.
+	rules = append(rules, networkingv1.NetworkPolicyEgressRule{
+		Ports: []networkingv1.NetworkPolicyPort{tcpPort(shellSandboxPort)},
+		To: []networkingv1.NetworkPolicyPeer{
+			namespacedPodPeer(agent.Namespace, shellSandboxSelector(agent)),
+		},
+	})
+
 	// The model gateway. buildAgentConfig pins the agent's model base_url to
 	// http://litellm.<namespace>.svc.cluster.local/v1 unconditionally, so the
 	// agent cannot think for a living without this rule. The port set matches
@@ -368,13 +378,12 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 	// is the one where the policy enforces. The component label keeps it off
 	// the Postgres Pod, which carries the same name label.
 	//
-	// Deliberately absent, and why: github-token-minter, because in the split
-	// layout this field requires, gh and git run in the broker Pod and the
-	// minter call is the broker's egress, not the agent's; gemma-server and
-	// standalone-replay, because buildAgentConfig pins the agent's model
-	// base_url to LiteLLM unconditionally, so those backends are LiteLLM's
-	// egress. The gateway policy names all three because it also serves the
-	// sidecar layout, where the broker's traffic is the agent Pod's.
+	// Deliberately absent, and why: github-token-minter, because gh and git run
+	// in the broker Pod and the minter call is the broker's egress, not the
+	// agent's; gemma-server and standalone-replay, because buildAgentConfig pins
+	// the agent's model base_url to LiteLLM unconditionally, so those backends
+	// are LiteLLM's egress. The gateway policy names all three anyway; narrowing
+	// it is the work that turns this field into a control.
 	rules = append(rules, networkingv1.NetworkPolicyEgressRule{
 		Ports: []networkingv1.NetworkPolicyPort{tcpPort(8888)},
 		To: []networkingv1.NetworkPolicyPeer{{
@@ -397,10 +406,6 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 	// Lease, and to any sidecar or plugin the operator added. That is a
 	// deliberate under-allow: inventing a range here would mean permitting a
 	// guess.
-	//
-	// The event-watcher is not on that list, because the split this policy
-	// requires already refuses to render while the watcher is enabled — see
-	// validateCredentialBrokerSplit.
 	//
 	// The supplied ranges go through the same refusal check extraRules gets.
 	// The field is named for the control plane, but nothing stops it being

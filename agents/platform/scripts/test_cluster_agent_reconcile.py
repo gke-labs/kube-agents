@@ -31,17 +31,29 @@ def _home_factory(root: Path, incomplete=frozenset()):
 
     reconcile() reads the filesystem to tell a finished scaffold from one killed
     after the identity stamp, so these have to exist. Names in ``incomplete`` get
-    the directory without the artifacts ``create_profile`` writes last.
+    the directory without the artifacts ``create_profile`` writes last. The
+    kubeconfig is written here too, for ``_local_kubeconfig_landed`` to find --
+    on a real install it is on the sandbox's volume, not this one.
     """
     def factory(name: str) -> Path:
         home = root / name
         home.mkdir(parents=True, exist_ok=True)
         if name not in incomplete:
-            for artifact in rec.SCAFFOLD_ARTIFACTS:
+            for artifact in (*rec.SCAFFOLD_ARTIFACTS, rec.KUBECONFIG_ARTIFACT):
                 (home / artifact).touch()
         return home
 
     return factory
+
+
+def _local_kubeconfig_landed(path: Path) -> bool:
+    """A ``kubeconfig_landed`` stub that answers from this filesystem.
+
+    The real one asks the sandbox over SSH. Patching it keeps these tests off
+    that path and off whatever HERMES_SANDBOX_* happens to be set in the
+    environment running them.
+    """
+    return path.exists()
 
 
 class HomesMixin(unittest.TestCase):
@@ -49,6 +61,14 @@ class HomesMixin(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.homes = Path(self._tmp.name)
+        # Answer the kubeconfig question from this filesystem for every test in
+        # these classes. The real one asks the sandbox over SSH, so leaving it
+        # in place would make the result depend on the environment running the
+        # suite. IncompleteScaffoldTest patches it again, per test, to say what
+        # the sandbox answered.
+        landed = mock.patch.object(rec, "kubeconfig_landed", side_effect=_local_kubeconfig_landed)
+        landed.start()
+        self.addCleanup(landed.stop)
 
 
 class ReconcileTest(HomesMixin):
@@ -186,7 +206,8 @@ class IncompleteScaffoldTest(HomesMixin):
 
     def _reconcile(self, incomplete):
         created: list = []
-        with mock.patch.object(rec, "_project", return_value="p"), \
+        with mock.patch.object(rec, "kubeconfig_landed", side_effect=_local_kubeconfig_landed), \
+             mock.patch.object(rec, "_project", return_value="p"), \
              mock.patch.object(rec, "_all_clusters", return_value=[("p", "beta", "us-central1")]), \
              mock.patch.object(rec, "list_profiles", return_value=["cluster-beta"]), \
              mock.patch.object(rec, "profile_home",
@@ -213,11 +234,41 @@ class IncompleteScaffoldTest(HomesMixin):
     def test_scaffold_gaps_names_what_is_missing(self):
         home = self.homes / "cluster-beta"
         home.mkdir()
-        self.assertEqual(rec._scaffold_gaps(home), list(rec.SCAFFOLD_ARTIFACTS))
-        (home / "kubeconfig.yaml").touch()
-        self.assertEqual(rec._scaffold_gaps(home), ["USER.md"])
+        with mock.patch.object(rec, "kubeconfig_landed", side_effect=_local_kubeconfig_landed):
+            self.assertEqual(rec._scaffold_gaps(home), ["kubeconfig.yaml", "USER.md"])
+            (home / "kubeconfig.yaml").touch()
+            self.assertEqual(rec._scaffold_gaps(home), ["USER.md"])
+            (home / "USER.md").touch()
+            self.assertEqual(rec._scaffold_gaps(home), [])
+
+    def test_a_kubeconfig_only_the_sandbox_can_see_is_not_a_gap(self):
+        """The regression the sandbox split introduces.
+
+        With a sandbox, `gcloud container clusters get-credentials` runs in the
+        shell pod and writes to the shell pod's volume. Stat'ing the path on
+        this pod finds nothing, so every profile would read as half-scaffolded
+        on every hourly tick: the whole fleet re-scaffolded, and a credential
+        re-fetched per cluster, forever.
+        """
+        home = self.homes / "cluster-beta"
+        home.mkdir()
         (home / "USER.md").touch()
-        self.assertEqual(rec._scaffold_gaps(home), [])
+        # Nothing at home/kubeconfig.yaml on this filesystem; the sandbox has it.
+        with mock.patch.object(rec, "kubeconfig_landed", return_value=True) as landed:
+            self.assertEqual(rec._scaffold_gaps(home), [])
+        self.assertEqual(landed.call_args.args[0], home / "kubeconfig.yaml")
+
+    def test_a_sandbox_that_cannot_answer_reads_as_a_gap(self):
+        """kubeconfig_landed returns False when it cannot ask, and that must count.
+
+        A recreated sandbox PVC is exactly this: the profile is on the gateway's
+        volume, its credential is not, and re-scaffolding is the repair.
+        """
+        home = self.homes / "cluster-beta"
+        home.mkdir()
+        (home / "USER.md").touch()
+        with mock.patch.object(rec, "kubeconfig_landed", return_value=False):
+            self.assertEqual(rec._scaffold_gaps(home), ["kubeconfig.yaml"])
 
 
 class AllClustersTest(unittest.TestCase):

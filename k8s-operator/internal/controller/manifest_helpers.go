@@ -223,6 +223,16 @@ func otelTelemetryEnvVars(agentType, name, namespace, endpoint string, disabled 
 //	"mirror.corp.internal:5000/kube-agents/k8s-operator:0.2.0"       -> "mirror.corp.internal:5000/kube-agents/platform-agent:0.2.0"
 //	"k8s-operator:1c06e1ab71fdeea55e6100e61c0394206188a5ba"          -> "platform-agent:1c06e1ab71fdeea55e6100e61c0394206188a5ba"
 func deriveAgentImageFromOperator(operatorImage string) string {
+	return deriveImageFromOperator(operatorImage, appNamePlatformAgent)
+}
+
+// deriveImageFromOperator is the same substitution for any repository built and
+// released alongside the operator, not the platform agent alone. The sandbox is
+// the second caller: it is a fourth image from the same workflow and the same
+// commit, so an install that mirrored the operator has mirrored it too, and
+// reaching ghcr.io for it on a private-registry install is the same failure
+// this derivation exists to avoid for the agent.
+func deriveImageFromOperator(operatorImage, repository string) string {
 	lastSlash := strings.LastIndex(operatorImage, "/")
 	prefix := ""
 	refPart := operatorImage
@@ -239,7 +249,7 @@ func deriveAgentImageFromOperator(operatorImage string) string {
 	if tagIdx := strings.Index(refPart, ":"); tagIdx >= 0 {
 		suffix = refPart[tagIdx:]
 	}
-	return prefix + appNamePlatformAgent + suffix
+	return prefix + repository + suffix
 }
 
 // defaultPlatformAgentImage returns the agent image used when a CR omits

@@ -33,6 +33,7 @@ from content_workspace import (
     Workspace,
     assert_disjoint_roots,
     check_branch,
+    check_expected_sha,
     parse_changes,
     repo_relative,
 )
@@ -362,6 +363,59 @@ class CheckBranchTest(unittest.TestCase):
         self.assertEqual("fix/cve-2026-1234", check_branch("  fix/cve-2026-1234  "))
 
 
+class CheckExpectedShaTest(unittest.TestCase):
+    """The conflict guard's two caller-supplied revisions.
+
+    Both reach a revision position in `git diff <expected> <current> --
+    <paths>`, which the workspace routes get to without passing
+    `git_argument_violation`, so this function is the only thing between the
+    caller and git's option parser.
+    """
+
+    def test_an_option_in_a_revision_position_is_refused(self):
+        # --output= is the sharp one: git writes the diff to that path and
+        # prints nothing, so the caller's guard reads the empty result as "no
+        # overlap" and the conflict it exists to catch never raises.
+        for value in ("--output=/opt/data/pwn", "-p", "--exit-code"):
+            with self.subTest(value=value):
+                with self.assertRaises(ContentWorkspaceError):
+                    check_expected_sha(value, "expectedBaseSha")
+
+    def test_a_revision_that_is_not_a_full_object_id_is_refused(self):
+        # Each of these resolves to a commit, so git would answer rather than
+        # fail — with a comparison against something other than what the caller
+        # meant. Wrong quietly is the failure mode this refuses.
+        for value in ("HEAD~1", "main", "origin/main", "deadbee", "@"):
+            with self.subTest(value=value):
+                with self.assertRaises(ContentWorkspaceError):
+                    check_expected_sha(value, "expectedBranchSha")
+
+    def test_the_field_name_is_in_the_message(self):
+        # Two of these are checked in a row and the payload carries both, so
+        # the caller has to be told which one they got wrong.
+        with self.assertRaises(ContentWorkspaceError) as raised:
+            check_expected_sha("HEAD", "expectedBranchSha")
+        self.assertIn("expectedBranchSha", str(raised.exception))
+
+    def test_an_empty_or_non_string_value_is_refused(self):
+        for value in ("", "   ", None, 42, ["a" * 40]):
+            with self.subTest(value=value):
+                with self.assertRaises(ContentWorkspaceError):
+                    check_expected_sha(value, "expectedBaseSha")
+
+    def test_both_object_id_lengths_are_accepted(self):
+        # A repository is SHA-1 or SHA-256 and the broker clones what it is
+        # pointed at, so refusing the longer one would refuse the guard itself
+        # on a SHA-256 repository.
+        sha1 = "e9ee1c37ab4f5d0c2b8a91f6d3e0c47a5b1d8e92"
+        sha256 = "b" * 64
+        self.assertEqual(sha1, check_expected_sha(sha1, "expectedBaseSha"))
+        self.assertEqual(sha256, check_expected_sha(sha256, "expectedBaseSha"))
+        self.assertEqual(
+            sha1.upper(), check_expected_sha(f"  {sha1.upper()}  ", "expectedBaseSha")
+        )
+
+
 class StoreTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -491,7 +545,8 @@ class ListAndOpenArgumentTest(unittest.TestCase):
         star, so a caller asking for one directory pages through its siblings.
         """
         paths = [
-            entry["path"] for entry in self.store.list(self.workspace.handle, "a")
+            entry["path"]
+            for entry in self.store.list(self.workspace.handle, "a")["entries"]
         ]
         self.assertEqual(["a/deep/z.yaml", "a/y.yaml"], paths)
         self.assertNotIn("ab/x.yaml", paths)
@@ -500,9 +555,9 @@ class ListAndOpenArgumentTest(unittest.TestCase):
         # no prefix still lists everything.
         self.assertEqual(
             ["ab/x.yaml"],
-            [e["path"] for e in self.store.list(self.workspace.handle, "ab")],
+            [e["path"] for e in self.store.list(self.workspace.handle, "ab")["entries"]],
         )
-        self.assertEqual(4, len(self.store.list(self.workspace.handle)))
+        self.assertEqual(4, self.store.list(self.workspace.handle)["total"])
 
     def test_the_base_branch_is_checked_the_way_the_commit_branch_is(self):
         """`base` reached git unvalidated while `branch` went through the check.
@@ -723,7 +778,7 @@ class ConcurrencyTest(unittest.TestCase):
             "calls get(), which takes it too, so it has to be reentrant",
         )
         self.assertIs(workspace, done[0])
-        self.assertEqual([], done[1])
+        self.assertEqual([], done[1]["entries"])
         self.assertTrue(done[2]["committed"])
         self.assertEqual("closed", done[3])
         self.assertEqual({}, store._workspaces)
@@ -1097,6 +1152,59 @@ class RealGitTest(unittest.TestCase):
         )
         self.assertTrue(result["committed"])
 
+    def test_a_working_branch_that_moved_under_the_same_file_is_a_conflict(self):
+        """The base check does not answer this one.
+
+        A second round of review starts from `origin/<branch>`, so a
+        maintainer's commit stays in the history -- but their edit to a file
+        this payload also writes is overwritten, and `--force-with-lease`
+        cannot object because it compares against the tip being overwritten.
+        """
+        branch = "platform-agent/change"
+        seed = self.base / "seed"
+        real_git_runner(["git", "checkout", "-b", branch], seed)
+        (seed / "manifests" / "proposal.yaml").write_text("kind: Deployment\n")
+        real_git_runner(["git", "add", "-A"], seed)
+        real_git_runner(["git", "commit", "-m", "ours, round one"], seed)
+        real_git_runner(["git", "push", "origin", branch], seed)
+
+        # What `open` records when it checks the branch out.
+        real_git_runner(["git", "fetch", "--prune", "origin"], self.tree)
+        self.workspace.opened_branch = branch
+        self.workspace.branch_sha = real_git_runner(
+            ["git", "rev-parse", "--verify", f"origin/{branch}"], self.tree
+        ).stdout.strip()
+
+        # A maintainer hand-edits the proposal on the pull request.
+        (seed / "manifests" / "proposal.yaml").write_text("kind: Deployment  # theirs\n")
+        real_git_runner(["git", "add", "-A"], seed)
+        real_git_runner(["git", "commit", "-m", "theirs"], seed)
+        real_git_runner(["git", "push", "origin", branch], seed)
+
+        with self.assertRaises(Conflict) as caught:
+            self.commit(
+                [Change(repo_relative("manifests/proposal.yaml"), b"kind: Deployment  # ours\n")]
+            )
+        self.assertIn("proposal.yaml", str(caught.exception))
+        self.assertIn(branch, str(caught.exception))
+
+        # Paired ordinary use: the branch moving under a file this commit does
+        # not write costs the agent nothing, and the maintainer's commit is
+        # still there afterwards.
+        result = self.commit(
+            [Change(repo_relative("manifests/another.yaml"), b"kind: Service\n")]
+        )
+        self.assertTrue(result["committed"])
+        self.assertEqual(
+            "kind: Deployment  # theirs\n",
+            real_git_runner(
+                ["git", "show", "HEAD:manifests/proposal.yaml"], self.tree
+            ).stdout,
+        )
+        # And the workspace now leases what it just saw, so the next round
+        # compares against the right sha rather than the sha `open` recorded.
+        self.assertEqual(result["branchSha"], self.workspace.branch_sha)
+
     def test_a_read_returns_content_and_a_list_never_shows_the_git_directory(self):
         self.assertEqual(
             b"kind: ConfigMap\n",
@@ -1105,7 +1213,10 @@ class RealGitTest(unittest.TestCase):
         with self.assertRaises(PathRefused):
             self.store.read(self.workspace.handle, ".git/config")
 
-        paths = [entry["path"] for entry in self.store.list(self.workspace.handle)]
+        paths = [
+            entry["path"]
+            for entry in self.store.list(self.workspace.handle)["entries"]
+        ]
         self.assertIn("manifests/existing.yaml", paths)
         self.assertFalse([path for path in paths if path.startswith(".git/")])
 
@@ -1230,6 +1341,398 @@ class RealGitTest(unittest.TestCase):
         self.assertTrue(
             self.commit([Change(repo_relative(".gitignore"), b"*.tmp\n")])["committed"]
         )
+
+
+class ReadVerbCeilingTest(unittest.TestCase):
+    """The batched read and the paged listing, which answer partially by design.
+
+    Both report what they left out. A caller that cannot tell a complete answer
+    from a truncated one materialises part of a repository, does not find what
+    it wanted, and goes on to `read` paths it invented -- which is the failure
+    the ceilings are there to make visible rather than the one they cause.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.agent = self.base / "data"
+        self.agent.mkdir()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = ContentWorkspaceStore(
+            self.base / "trees", self.agent, RecordingRunner()
+        )
+        self.workspace = Workspace(
+            handle="e" * 32,
+            repo="acme/fleet",
+            tree=self.store.tree_root / ("e" * 32) / "repo",
+            base="main",
+            base_sha="0" * 40,
+        )
+        for index in range(5):
+            target = self.workspace.tree / "manifests" / f"{index}.yaml"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("kind: ConfigMap\n")
+        self.store._workspaces[self.workspace.handle] = self.workspace
+
+    def handle(self) -> str:
+        return self.workspace.handle
+
+    def test_a_batch_read_names_what_it_did_not_return(self):
+        with mock.patch.object(content_workspace, "max_total_bytes", lambda: 20):
+            answer = self.store.read_many(
+                self.handle(),
+                ["manifests/0.yaml", "manifests/1.yaml", "manifests/2.yaml"],
+            )
+        # 16 bytes each, so the second exhausts the budget and the third is
+        # named rather than dropped -- `requestBudget` means ask again.
+        self.assertEqual(["manifests/0.yaml"], [f["path"] for f in answer["files"]])
+        self.assertEqual(
+            [("manifests/1.yaml", "requestBudget"), ("manifests/2.yaml", "requestBudget")],
+            [(s["path"], s["reason"]) for s in answer["skipped"]],
+        )
+
+        # A file that is not there is skipped, not fatal, and one over the
+        # per-file ceiling reports its size so a caller stops asking for it.
+        with mock.patch.object(content_workspace, "max_file_bytes", lambda: 4):
+            answer = self.store.read_many(
+                self.handle(), ["manifests/0.yaml", "manifests/absent.yaml"]
+            )
+        self.assertEqual([], answer["files"])
+        self.assertEqual(
+            [("manifests/0.yaml", "tooLarge"), ("manifests/absent.yaml", "notAFile")],
+            [(s["path"], s["reason"]) for s in answer["skipped"]],
+        )
+
+        # Paired ordinary use: within the ceilings every file comes back, as
+        # bytes, in the order it was asked for.
+        answer = self.store.read_many(
+            self.handle(), ["manifests/1.yaml", "manifests/0.yaml"]
+        )
+        self.assertEqual([], answer["skipped"])
+        self.assertEqual(
+            ["manifests/1.yaml", "manifests/0.yaml"],
+            [f["path"] for f in answer["files"]],
+        )
+        self.assertEqual(
+            b"kind: ConfigMap\n",
+            base64.b64decode(answer["files"][0]["contentBase64"]),
+        )
+
+    def test_a_link_the_broker_will_not_follow_says_so(self):
+        """A symlink is not a missing file, and the skip has to say which.
+
+        The caller only ever names what `list` and `grep` returned, so both of
+        these are names the repository itself supplied. Told `notAFile` about
+        one of them, a reader concludes the name is wrong and goes looking for
+        the right one -- there isn't one. `symlink` is the only skip reason it
+        can act on: ask for the target under its own name.
+        """
+        link = self.workspace.tree / "manifests" / "vendored.yaml"
+        link.symlink_to(self.workspace.tree / "manifests" / "0.yaml")
+
+        answer = self.store.read_many(
+            self.handle(), ["manifests/vendored.yaml", "manifests/absent.yaml"]
+        )
+        self.assertEqual([], answer["files"])
+        self.assertEqual(
+            [("manifests/vendored.yaml", "symlink"), ("manifests/absent.yaml", "notAFile")],
+            [(s["path"], s["reason"]) for s in answer["skipped"]],
+        )
+
+        # A directory on the way is the same refusal, and reports the same way:
+        # nothing here is a claim about the leaf alone.
+        (self.workspace.tree / "vendor").mkdir()
+        (self.workspace.tree / "vendor" / "app.yaml").write_text("kind: Pod\n")
+        (self.workspace.tree / "manifests" / "vendor").symlink_to(
+            self.workspace.tree / "vendor"
+        )
+        answer = self.store.read_many(self.handle(), ["manifests/vendor/app.yaml"])
+        self.assertEqual(
+            [("manifests/vendor/app.yaml", "symlink")],
+            [(s["path"], s["reason"]) for s in answer["skipped"]],
+        )
+
+        # Paired ordinary use: the target under its own name is served, which is
+        # what the reason is telling the caller to do.
+        self.assertEqual(
+            ["vendor/app.yaml"],
+            [f["path"] for f in self.store.read_many(self.handle(), ["vendor/app.yaml"])["files"]],
+        )
+
+    def test_a_batch_read_refuses_the_whole_request_for_one_bad_path(self):
+        """`.git/config` in the last entry does not get the others answered.
+
+        The same fail-before-side-effects rule `parse_changes` follows. A path
+        that is not a path is the caller being wrong about what it may name,
+        which is not the same class of thing as a file that is missing.
+        """
+        with self.assertRaises(PathRefused):
+            self.store.read_many(
+                self.handle(), ["manifests/0.yaml", ".git/config"]
+            )
+        with self.assertRaises(PathRefused):
+            self.store.read_many(self.handle(), ["../etc/passwd"])
+        for bad in ([], "manifests/0.yaml", None):
+            with self.subTest(paths=bad):
+                with self.assertRaises(ContentWorkspaceError):
+                    self.store.read_many(self.handle(), bad)
+        with mock.patch.object(content_workspace, "max_entries", lambda: 1):
+            with self.assertRaises(TooLarge):
+                self.store.read_many(
+                    self.handle(), ["manifests/0.yaml", "manifests/1.yaml"]
+                )
+
+        # Paired ordinary use: the same call with only nameable paths is served.
+        self.assertEqual(
+            2,
+            len(
+                self.store.read_many(
+                    self.handle(), ["manifests/0.yaml", "manifests/1.yaml"]
+                )["files"]
+            ),
+        )
+
+    def test_a_truncated_listing_says_so_and_pages_from_its_last_entry(self):
+        with mock.patch.object(content_workspace, "max_entries", lambda: 2):
+            first = self.store.list(self.handle())
+            self.assertTrue(first["truncated"])
+            self.assertEqual(5, first["total"])
+            self.assertEqual(
+                ["manifests/0.yaml", "manifests/1.yaml"],
+                [e["path"] for e in first["entries"]],
+            )
+
+            # The cursor is the last path of the page before, and the next page
+            # starts strictly after it -- no repeat, no gap.
+            second = self.store.list(
+                self.handle(), after=first["entries"][-1]["path"]
+            )
+            self.assertEqual(
+                ["manifests/2.yaml", "manifests/3.yaml"],
+                [e["path"] for e in second["entries"]],
+            )
+            self.assertEqual(3, second["total"])
+
+            last = self.store.list(
+                self.handle(), after=second["entries"][-1]["path"]
+            )
+            self.assertEqual(["manifests/4.yaml"], [e["path"] for e in last["entries"]])
+            self.assertFalse(last["truncated"])
+
+            # A cursor need not name a file that is still there. The page
+            # before named it and the tree can have moved on, so `after` is a
+            # position in the order rather than a lookup: a name that has gone
+            # resumes where it would have been instead of restarting the
+            # listing or returning nothing.
+            resumed = self.store.list(self.handle(), after="manifests/2a.yaml")
+            self.assertEqual(
+                ["manifests/3.yaml", "manifests/4.yaml"],
+                [e["path"] for e in resumed["entries"]],
+            )
+            self.assertEqual(2, resumed["total"])
+
+        # Paired ordinary use: under the ceiling one page is the whole answer
+        # and it does not claim to be truncated.
+        whole = self.store.list(self.handle())
+        self.assertFalse(whole["truncated"])
+        self.assertEqual(5, len(whole["entries"]))
+
+        # And the cursor is a path like any other, so it is validated like one.
+        with self.assertRaises(PathRefused):
+            self.store.list(self.handle(), after="../etc/passwd")
+
+
+class ShallowAndBranchOpenTest(unittest.TestCase):
+    """`open`'s two read-side arguments, and what each one commits the caller to."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.agent = self.base / "data"
+        self.agent.mkdir()
+        self.addCleanup(self.tmp.cleanup)
+
+    def store(self, responses=None):
+        self.runner = RecordingRunner(responses)
+        return ContentWorkspaceStore(self.base / "trees", self.agent, self.runner)
+
+    def test_a_depth_is_a_commit_count_and_not_a_yes(self):
+        store = self.store()
+        for depth in (True, False, 0, -1, "1", 1.0):
+            with self.subTest(depth=depth):
+                with self.assertRaises(ContentWorkspaceError):
+                    store.open("acme/fleet", None, None, depth)
+        # Refused together with `branch`: a single-branch clone cannot see
+        # whether the working branch exists, so the check would answer no and
+        # the caller would be told it had looked.
+        with self.assertRaises(ContentWorkspaceError):
+            store.open("acme/fleet", None, "platform-agent/fix", 1)
+
+        # Paired ordinary use: a count reaches git as a shallow single-branch
+        # clone, and the workspace says so.
+        workspace = store.open("acme/fleet", "main", None, 5)
+        self.assertTrue(workspace.shallow)
+        clone = next(argv for argv, _ in self.runner.calls if argv[1] == "clone")
+        self.assertEqual(
+            ["git", "clone", "--quiet", "--depth", "5", "--single-branch", "--branch", "main"],
+            clone[:8],
+        )
+        # And a full clone still is one.
+        before = len(self.runner.calls)
+        self.assertFalse(store.open("acme/fleet").shallow)
+        full = next(
+            argv for argv, _ in self.runner.calls[before:] if argv[1] == "clone"
+        )
+        self.assertNotIn("--depth", full)
+
+    def test_a_shallow_workspace_refuses_to_author(self):
+        """Refused at `commit` rather than discovered at `push`.
+
+        A shallow clone shares no merge base with the remote branch, so the push
+        is either rejected as unrelated or, on a remote configured to take it,
+        lands a history that discards everything before the depth.
+        """
+        store = self.store()
+        shallow = store.open("acme/fleet", "main", None, 1)
+        with self.assertRaises(ContentWorkspaceError):
+            store.commit(
+                shallow.handle,
+                "platform-agent/change",
+                "feat: a change",
+                [Change(repo_relative("a.yaml"), b"a\n")],
+            )
+
+        # Paired ordinary use: the same commit on a full clone gets as far as
+        # git, which is all this fake runner can show.
+        full = store.open("acme/fleet", "main")
+        result = store.commit(
+            full.handle,
+            "platform-agent/change",
+            "feat: a change",
+            [Change(repo_relative("a.yaml"), b"a\n")],
+        )
+        self.assertEqual("platform-agent/change", result["branch"])
+        self.assertIn("checkout", self.runner.subcommands)
+
+    def test_a_branch_that_exists_is_what_reads_answer_from(self):
+        """Second-round feedback is written against the pull request, not the base.
+
+        Left on the base, a re-read would return the file as `main` has it, the
+        caller would patch that, and the first round's reviewed work would be
+        silently rewritten out of the commit.
+        """
+        store = self.store()
+        workspace = store.open("acme/fleet", "main", "platform-agent/fix")
+        self.assertEqual("origin/platform-agent/fix", workspace.started_from)
+        checkout = next(argv for argv, _ in self.runner.calls if argv[1] == "checkout")
+        self.assertEqual(
+            ["checkout", "--force", "-B", "platform-agent/fix", "origin/platform-agent/fix"],
+            checkout[1:],
+        )
+
+        # Paired ordinary use: the first round names the same branch, the remote
+        # does not have it yet, and that is not an error -- the workspace opens
+        # on the base and says so.
+        absent = self.store({"refs/remotes/origin/": FakeResult(exit_code=1)})
+        first = absent.open("acme/fleet", "main", "platform-agent/fix")
+        self.assertEqual("origin/main", first.started_from)
+        self.assertNotIn("checkout", self.runner.subcommands)
+
+        # And the branch is a name in an argv like any other.
+        with self.assertRaises(ContentWorkspaceError):
+            store.open("acme/fleet", "main", "--upload-pack=/bin/sh")
+
+
+class GrepTest(unittest.TestCase):
+    """`git grep` over a real tree, because the argv is the whole control."""
+
+    def setUp(self):
+        if not git_available():
+            self.skipTest("git is not available")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+        self.agent = self.base / "data"
+        self.agent.mkdir()
+        self.store = ContentWorkspaceStore(
+            self.base / "trees", self.agent, real_git_runner
+        )
+        self.tree = self.base / "trees" / "work" / "repo"
+        (self.tree / "manifests").mkdir(parents=True)
+        real_git_runner(["git", "init", "--quiet", "--initial-branch=main", "."], self.tree)
+        (self.tree / "manifests" / "app.yaml").write_text(
+            "kind: Service\nreplicas: 2\n"
+        )
+        (self.tree / "other.yaml").write_text("kind: Service\n")
+        real_git_runner(["git", "add", "-A"], self.tree)
+        real_git_runner(["git", "commit", "-m", "seed"], self.tree)
+        self.workspace = Workspace(
+            handle="d" * 32,
+            repo="acme/fleet",
+            tree=self.tree,
+            base="main",
+            base_sha="0" * 40,
+        )
+        self.store._workspaces[self.workspace.handle] = self.workspace
+
+    def test_a_pattern_is_never_read_as_an_option_or_reaches_the_git_directory(self):
+        handle = self.workspace.handle
+        # `.git` is not in scope however the pattern is written: git grep
+        # searches tracked files, and git does not track its own directory.
+        # `core.repositoryformatversion` is in every `.git/config` there is.
+        self.assertEqual(
+            0, self.store.grep(handle, "repositoryformatversion")["total"]
+        )
+        # A pattern beginning with a dash is a pattern. `-O<file>` is the pager
+        # vector the executor's own allowlist tests cover from the other side.
+        self.assertEqual(0, self.store.grep(handle, "-O/tmp/payload.sh")["total"])
+        # Fixed-string unless asked: a regular expression given by accident
+        # matches itself rather than more than the caller meant.
+        self.assertEqual(0, self.store.grep(handle, "kind: S.rvice")["total"])
+        for bad in ("", "   ", None, 7, "two\nlines"):
+            with self.subTest(pattern=bad):
+                with self.assertRaises(ContentWorkspaceError):
+                    self.store.grep(handle, bad)
+        # An expression git will not parse is a 400 about the expression, and
+        # git's stderr -- which quotes the tree's path -- is not in it.
+        with self.assertRaises(ContentWorkspaceError) as refused:
+            self.store.grep(handle, "a[", regex=True)
+        self.assertNotIn(str(self.base), str(refused.exception))
+
+        # Paired ordinary use: the search a reader actually runs.
+        answer = self.store.grep(handle, "kind: Service")
+        self.assertEqual(
+            [("manifests/app.yaml", 1), ("other.yaml", 1)],
+            sorted((m["path"], m["line"]) for m in answer["matches"]),
+        )
+        self.assertFalse(answer["truncated"])
+        # The prefix narrows it, the regex flag turns the expression on, and
+        # ignoreCase does what it says.
+        self.assertEqual(
+            1, self.store.grep(handle, "kind: Service", "manifests")["total"]
+        )
+        self.assertEqual(2, self.store.grep(handle, "kind: S.rvice", regex=True)["total"])
+        self.assertEqual(2, self.store.grep(handle, "KIND: SERVICE", ignore_case=True)["total"])
+
+    def test_a_search_that_hit_the_ceiling_does_not_look_complete(self):
+        handle = self.workspace.handle
+        with mock.patch.object(content_workspace, "max_matches", lambda: 1):
+            answer = self.store.grep(handle, "kind: Service")
+        self.assertEqual(1, len(answer["matches"]))
+        self.assertEqual(2, answer["total"])
+        self.assertTrue(answer["truncated"])
+
+        # A long line is cut at the width and the match says it was.
+        with mock.patch.object(content_workspace, "max_match_chars", lambda: 4):
+            match = self.store.grep(handle, "replicas")["matches"][0]
+        self.assertEqual("repl", match["text"])
+        self.assertTrue(match["truncated"])
+
+        # Paired ordinary use: under both ceilings nothing claims to be cut.
+        answer = self.store.grep(handle, "replicas")
+        self.assertFalse(answer["truncated"])
+        self.assertNotIn("truncated", answer["matches"][0])
+        self.assertEqual("replicas: 2", answer["matches"][0]["text"])
 
 
 if __name__ == "__main__":

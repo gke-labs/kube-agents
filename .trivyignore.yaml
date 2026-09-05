@@ -39,8 +39,34 @@ misconfigurations:
       - "terraform/modules/gke-cluster/**"
       - "tests/**"
 
+  # Ignore DS-0002 on the sandbox image only. It has no USER line because sshd
+  # is the entrypoint, and sshd has to start as root: privilege separation and
+  # the setuid into the session account both need it, and neither is optional.
+  # The account model is in the image rather than in a USER line -- every
+  # session lands on `agent` (uid 1000) or uid 1001, never on root, and
+  # sshd_config's PermitRootLogin no is what enforces that. A USER line here
+  # would stop sshd from starting rather than harden anything.
+  - id: DS-0002
+    paths:
+      - "deploy/sandbox/**"
+
   # Ignore KSV-0056: manager-role requires networkpolicies access to manage agent sandboxes
   - id: KSV-0056
+    paths:
+      - "k8s-operator/config/rbac/**"
+
+  # Ignore KSV-0041: manager-role holds `get` on secrets and nothing else.
+  # checkShellSandboxKeys is the only caller and it asks whether the sandbox's
+  # authorized-keys Secret exists, so the CR can report a missing one instead of
+  # leaving the pod in ContainerCreating with the cause on an object nobody is
+  # looking at. It reads no value out of a Secret, and the operator creates that
+  # Secret nowhere. There is no API for "does this object exist" narrower than
+  # `get`, so the grant cannot be reduced further.
+  # This exemption covers every rule in the directory, because `paths` is the
+  # only scoping trivy offers. tests/test_operator_secrets_grant.py is what
+  # replaces the check: it fails if the verb set grows past `get`, if a second
+  # rule names secrets, or if this exemption widens past the rbac directory.
+  - id: KSV-0041
     paths:
       - "k8s-operator/config/rbac/**"
 

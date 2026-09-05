@@ -230,6 +230,23 @@ class PersistStateVarTest(unittest.TestCase):
                     f"Enclosing blocks were: {enclosing[:3]}",
                 )
 
+    def test_health_verification_covers_the_pods_that_run_the_commands(self):
+        """A healthy gateway is not a working install.
+
+        The agent executes nothing in its own pod: shell commands go to the
+        sandbox StatefulSet over ssh and credentialed ones through the proxy.
+        Step 5 verified the gateway alone, so an upgrade that left either of
+        those unready still printed "verified healthy" -- and the symptom
+        arrives later, as an agent that cannot run kubectl.
+        """
+        source = _UPGRADE_SH.read_text()
+        for target in (
+            "statefulset/platform-agent-shell",
+            "deployment/platform-agent-credential-proxy",
+        ):
+            with self.subTest(target=target):
+                self.assertIn(f"kubectl rollout status {target}", source)
+
     def test_an_install_env_only_install_still_records_the_override(self):
         """The guard must not lose the override, only the file write: the
         exports right after are what the rest of the run reads."""

@@ -2,8 +2,9 @@ apiVersion: v2
 name: kube-agents
 description: Canonical Helm chart for deploying Kube-Agents Kubernetes Operator and Platform Agent profiles on GKE.
 type: application
-# version and appVersion are placeholders: release-publish.yml (via publish_helm_chart.sh)
-# overwrites both with the SemVer release tag at publish time, so the chart version tracks the app version.
+# version and appVersion are placeholders: release-publish.yml stamps both with
+# the SemVer release tag on the release commit (via tag_ga_release.sh and publish_helm_chart.sh),
+# so the chart version tracks the app version.
 version: 0.1.0
 appVersion: "v0.1.0"
 kubeVersion: ">=1.29.0-0"

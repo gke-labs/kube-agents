@@ -60,6 +60,25 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
     {{- end }}
+    {{- $sandbox := (.Values.platformAgent.harness.experimental | default dict).shellSandbox | default dict }}
+    {{- /*
+      The shell sandbox is not optional. The operator refuses
+      shellSandbox.enabled: false with Degraded/ShellSandboxCannotBeDisabled and
+      leaves the running workload alone, so a chart that rendered it would install
+      cleanly and then sit Degraded with no Helm error to read. Fail at template
+      time instead, where the message reaches the person running the upgrade.
+    */}}
+    {{- if and (kindIs "bool" $sandbox.enabled) (not $sandbox.enabled) }}
+    {{- fail "platformAgent.harness.experimental.shellSandbox.enabled: false is not supported -- the operator refuses it. Remove the key or set it true." }}
+    {{- end }}
+    {{- with include "kube-agents.compactFields" (dict
+          "enabled" $sandbox.enabled
+          "image" $sandbox.image
+          "runtimeClassName" $sandbox.runtimeClassName) }}
+    experimental:
+      shellSandbox:
+        {{- . | nindent 8 }}
+    {{- end }}
   deployment:
     image: {{ include "kube-agents.imageRepository" (dict "repository" .Values.platformAgent.deployment.image.repository "registry" (include "kube-agents.imageRegistry" .)) | quote }}
     tag: {{ .Values.platformAgent.deployment.image.tag | default .Chart.AppVersion | quote }}
@@ -117,6 +136,21 @@ spec:
     {{- with .Values.platformAgent.security.scopedServiceAccounts }}
     scopedServiceAccounts:
       {{- toYaml . | nindent 6 }}
+    {{- end }}
+    {{- /*
+      Both fields or neither. The operator reads a half-filled block as absent and
+      keeps the proxy on the metadata server, which is safe but silent: the install
+      asked for federation and did not get it, and the only symptom is a placement
+      nobody looks at. Fail here instead.
+    */}}
+    {{- $wif := .Values.platformAgent.security.workloadIdentityFederation | default dict }}
+    {{- if or $wif.audience $wif.serviceAccountEmail }}
+    {{- if not (and $wif.audience $wif.serviceAccountEmail) }}
+    {{- fail "platformAgent.security.workloadIdentityFederation needs both audience and serviceAccountEmail, or neither" }}
+    {{- end }}
+    workloadIdentityFederation:
+      audience: {{ $wif.audience | quote }}
+      serviceAccountEmail: {{ $wif.serviceAccountEmail | quote }}
     {{- end }}
   {{- /*
     `with`, not `if`: an empty value must OMIT the field, not render it as "". Omitting is

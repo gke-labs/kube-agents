@@ -180,7 +180,7 @@ class ForgeProvider(Protocol):
     def list_comments(self, repo, pr) -> list[Comment]    # node_id, numeric_id, author, body,
                                                           # can_write, can_write_known,
                                                           # created_at, kind, path/line
-    def post_comment(self, repo, pr, body_file) -> None
+    def post_comment(self, repo, pr, body) -> None        # the text; travels on fd 0, not a path
     def acknowledge(self, repo, comment) -> bool          # optional; see supports_acknowledge
     def list_commits(self, repo, pr) -> list[Commit]      # sha + committed_at, tip last;
                                                           # backs the reply claim check
@@ -330,12 +330,13 @@ key -->` renders as `/agent fix the typo`, so the request acted on and the reque
   it as untrusted posts a public refusal at a collaborator over a transient API failure — which the
   marker then makes permanent. Holding costs one tick and the next one asks again. The count goes
   to stderr, like deferral.
-- **Anything the gate posts is written to `/opt/data/scratch`, never `/tmp`.** `gh` in this container
-  is a shim that POSTs argv to the credential sidecar, which runs the real `gh` in its own
-  filesystem; `/tmp` is a per-container `emptyDir`. A `--body-file /tmp/…` path therefore names a
-  file the container executing the command cannot open, and every refusal dies on "no such file" —
-  as one did, live, before this moved. `audit_report._write_temp` documents the same trap, which is
-  the sort of thing a second implementation rediscovers the hard way.
+- **Anything the gate posts goes to `gh` on stdin, never as a path.** `gh` does not run where the
+  caller does: the gate runs in the agent pod, ssh carries the command to the sandbox, and the shim
+  forwards it to the credential broker in a third pod. A `--body-file /some/path` names a file only
+  the first of those can open. Both earlier attempts to make a path work failed — `/tmp` is a
+  per-container `emptyDir`, so every refusal died on "no such file" live, and the shared volume that
+  replaced it then needed the file made group-readable across the uid split of #955. `--body-file -`
+  needs neither, and is what the fleet audit already does (`audit_report.BODY_STDIN`).
 - **Cap.** At most `PR_AGENT_MAX_PER_TICK` (default 3) worker cards per tick, oldest first, with
   `deferred: <n>` logged. No silent truncation. The same cap bounds **refusals**, which the design
   above missed: an account posting a hundred untrusted comments would otherwise draw a hundred

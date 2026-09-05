@@ -159,8 +159,8 @@ sync_bundle_versions() {
   local target_bundle_dir="${TMP_STAGE_DIR}/${BUNDLE_PREFIX}"
   echo "🏷️ Stamping baked release version and generating .release-bundle marker..."
 
-  # Stamp BAKED_RELEASE_VERSION into root installer scripts in the staged bundle
-  stamp_baked_release_version "${TAG_NAME}" "${target_bundle_dir}"
+  # Stamp release versions across installer scripts, Helm Chart.yaml, and Terraform defaults
+  stamp_release_versions "${TAG_NAME}" "${target_bundle_dir}"
 
   local commit_sha
   commit_sha="$(resolve_bundle_commit "${TAG_NAME}")"
@@ -173,24 +173,6 @@ tag=${TAG_NAME}
 commit=${commit_sha}
 build_date=${build_timestamp}
 BUNDLE_META
-
-  # Update and verify versions in staged Chart.yaml if present
-  for chart_rel_path in "${RELEASE_HELM_CHARTS[@]}"; do
-    local staged_chart_yaml="${target_bundle_dir}/${chart_rel_path}/Chart.yaml"
-    if [ -f "${staged_chart_yaml}" ]; then
-      sed -i.bak -E "s/^version: .*/version: ${TAG_NAME}/" "${staged_chart_yaml}" && rm -f "${staged_chart_yaml}.bak"
-      sed -i.bak -E "s/^appVersion: .*/appVersion: \"${TAG_NAME}\"/" "${staged_chart_yaml}" && rm -f "${staged_chart_yaml}.bak"
-
-      if ! grep -q "^version: ${TAG_NAME}" "${staged_chart_yaml}"; then
-        echo "❌ ERROR: Failed to stamp version in ${staged_chart_yaml}!" >&2
-        exit 1
-      fi
-      if ! grep -q "^appVersion: \"${TAG_NAME}\"" "${staged_chart_yaml}"; then
-        echo "❌ ERROR: Failed to stamp appVersion in ${staged_chart_yaml}!" >&2
-        exit 1
-      fi
-    fi
-  done
 }
 
 package_helm_charts() {

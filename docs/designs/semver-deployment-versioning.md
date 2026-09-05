@@ -31,7 +31,7 @@ documentation and governance playbooks around them.
    staging tag is what a GA release is gated on — see `scripts/release/README.md`.
 4. **GA release pipeline creates stamped release child commit.** When promoting a staging-promoted
    candidate, `release-publish.yml` creates a single-parent child commit on detached HEAD
-   (baking `BAKED_RELEASE_VERSION` into installer scripts), tags it `MAJOR.MINOR.PATCH` (`X.Y.Z`),
+   (baking `BAKED_RELEASE_VERSION` into installer scripts, and stamping SemVer release versions into Helm `Chart.yaml` and Terraform defaults), tags it `MAJOR.MINOR.PATCH` (`X.Y.Z`),
    and orchestrates clean image promotion and chart publication. Because the GA tag points at this
    stamped child commit outside `main`, `git log main` does not show the release commit and
    `git describe --tags` on `main` does not resolve to the GA tag (which is why `default_image_tag`
