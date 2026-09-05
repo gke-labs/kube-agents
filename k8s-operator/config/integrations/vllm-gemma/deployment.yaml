@@ -1,0 +1,114 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-gemma
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  progressDeadlineSeconds: 1200
+  selector:
+    matchLabels:
+      app: vllm-gemma
+  template:
+    metadata:
+      labels:
+        app: vllm-gemma
+        ai.gke.io/model: gemma4
+        ai.gke.io/inference-server: vllm
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: inference-server
+          image: ${VLLM_GEMMA_IMAGE}
+          resources:
+            requests:
+              cpu: "4"
+              memory: "24Gi"
+              ephemeral-storage: "30Gi"
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "8"
+              memory: "32Gi"
+              ephemeral-storage: "40Gi"
+              nvidia.com/gpu: "1"
+          command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+          args:
+            - --model=$(MODEL_ID)
+            - --host=0.0.0.0
+            - --port=8000
+            - --tensor-parallel-size=1
+            - --enable-chunked-prefill
+            - --enable-prefix-caching
+            - --enable-auto-tool-choice
+            - --generation-config=auto
+            - --tool-call-parser=gemma4
+            - --dtype=bfloat16
+            - --max-num-seqs=16
+            - --max-model-len=32768
+            - --gpu-memory-utilization=0.95
+            - --reasoning-parser=gemma4
+            - --otlp-traces-endpoint=opentelemetry-collector.gke-managed-otel.svc.cluster.local:4317
+          env:
+            - name: LD_LIBRARY_PATH
+              value: /usr/local/nvidia/lib64
+            - name: MODEL_ID
+              value: ${MODEL_DEFAULT_NAME}
+            - name: OTEL_SERVICE_NAME
+              value: vllm-gemma
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-secret
+                  key: token
+                  optional: true
+          ports:
+            - containerPort: 8000
+              name: http
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 36
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - mountPath: /dev/shm
+              name: dshm
+      terminationGracePeriodSeconds: 60
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Gi
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+      nodeSelector:
+        cloud.google.com/gke-accelerator: nvidia-l4
+        cloud.google.com/gke-gpu-driver-version: default

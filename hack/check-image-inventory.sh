@@ -265,7 +265,7 @@ while IFS=$'\t' read -r file line image; do
   split_ref "$image"
   want_tag="$(pin_of_repo "$ref_repo")"
   [ -n "$want_tag" ] || continue
-  [ "$ref_tag" = "$want_tag" ] ||
+  [ "$ref_pin" = "$want_tag" ] ||
     fail "${file}:${line} pins '$image', but $INVENTORY has '$want_tag' for '$ref_repo' — the mirror is populated from the inventory, so this example asks for a tag that was never copied."
 done <<<"$example_refs"
 

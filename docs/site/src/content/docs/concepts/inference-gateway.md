@@ -44,12 +44,13 @@ Two things have to name that alias, not one. The profile config covers Chat, whi
 
 The two substituted values come from the install (`MODEL_PROVIDER` and `MODEL_DEFAULT_NAME`, saved in `install.env` and carried into the chart values). Supported providers and their shipping defaults:
 
-| `MODEL_PROVIDER`   | Default `MODEL_DEFAULT_NAME` | Notes                                      |
-| ------------------ | ---------------------------- | ------------------------------------------ |
-| `gemini` (default) | `gemini-3.5-flash`           | Uses `GEMINI_API_KEY`.                     |
-| `anthropic`        | `claude-opus-5`              | Uses `ANTHROPIC_API_KEY`.                  |
-| `openai`           | `gpt-5.4`                    | Uses `OPENAI_API_KEY`.                     |
-| `vertex_ai`        | `gemini-3.5-flash`           | No API key — Workload Identity. See below. |
+| `MODEL_PROVIDER`   | Default `MODEL_DEFAULT_NAME` | Notes                                                                   |
+| ------------------ | ---------------------------- | ----------------------------------------------------------------------- |
+| `gemini` (default) | `gemini-3.5-flash`           | Uses `GEMINI_API_KEY`.                                                  |
+| `anthropic`        | `claude-opus-5`              | Uses `ANTHROPIC_API_KEY`.                                               |
+| `openai`           | `gpt-5.4`                    | Uses `OPENAI_API_KEY`.                                                  |
+| `vertex_ai`        | `gemini-3.5-flash`           | No API key — Workload Identity. See below.                              |
+| `gemma4` / `vllm`  | `google/gemma-4-E2B-it`      | Kustomize dev path only (`deploy-litellm`). Requires GPU & `hf-secret`. |
 
 Any model string the chosen provider accepts is valid — there is no allow-list in the harness. For example, [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) pins `gemini-3.1-flash-lite`.
 
@@ -59,6 +60,14 @@ To change the default on an installed system, re-run `./install.sh` (or its `--m
 export MODEL_PROVIDER=gemini
 export MODEL_DEFAULT_NAME=gemini-3.5-flash
 make -C k8s-operator deploy-litellm
+```
+
+For self-hosted `MODEL_PROVIDER=gemma4` (or `vllm`), deploy LiteLLM using the development path (`make -C k8s-operator deploy-litellm MODEL_PROVIDER=gemma4`). Running vLLM requires a GKE GPU node pool (e.g. `nvidia-l4`) and a Hugging Face secret containing an access token for gated weights:
+
+```bash
+kubectl create secret generic hf-secret \
+  --namespace kubeagents-system \
+  --from-literal=token="<your-huggingface-token>"
 ```
 
 Either way the agent picks up the new model on its next request without any change to its own config.

@@ -50,6 +50,7 @@ Pinned here so `make mirror-images` and the install ask for the same version.
 | Image | Upstream reference | Pin | Override | Pulled by |
 | ----- | ------------------ | --- | -------- | --------- |
 | `litellm` | `ghcr.io/berriai/litellm` | `v1.98.0` | `LITELLM_IMAGE` | The LiteLLM gateway, from either the chart or the kustomize integration. |
+| `pytorch-vllm-serve` | `us-docker.pkg.dev/vertex-ai/vertex-vision-model-garden-dockers/pytorch-vllm-serve` | `gemma4@sha256:3fbc0e08c46e7736145c9effbcc8839682c80b15b413335146f4428fc3523c8a` | `VLLM_GEMMA_IMAGE` | The optional self-hosted Gemma 4 vLLM integration (kustomize dev path only; not pulled by standard installs). |
 | `fluent-bit` | `docker.io/fluent/fluent-bit` | `5.1.1` | `FLUENT_BIT_IMAGE` | The logging sidecar the operator injects into every agent pod. |
 | `k8s` | `docker.io/alpine/k8s` | `1.36.2` | — | The chart's pre-delete cleanup hook Job. |
 | `github-token-minter-server` | `us-docker.pkg.dev/abcxyz-artifacts/docker-images/github-token-minter-server` | `v2.7.1-amd64` | `GITHUB_MINTER_IMAGE` | The optional GitHub integration. |

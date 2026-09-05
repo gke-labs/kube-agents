@@ -2,6 +2,9 @@
 
 This directory contains an example of deploying vLLM configured to serve Google's Gemma models on Kubernetes, based on the [official GKE tutorial](https://docs.cloud.google.com/kubernetes-engine/docs/tutorials/serve-gemma-gpu-vllm).
 
+> [!NOTE]
+> This directory is a standalone example. For integration with the LiteLLM gateway and the operator harness, `k8s-operator/config/integrations/vllm-gemma/` is the maintained kustomize package applied by `make deploy-litellm MODEL_PROVIDER=gemma4`.
+
 ## Prerequisites
 
 - A Kubernetes cluster with GPU nodes (e.g., NVIDIA L4 or RTX Pro 6000).

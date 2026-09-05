@@ -112,6 +112,7 @@ init_var() {
   fi
 }
 
+
 # ─── Container Registry ───────────────────────────────────────────────────────
 # DEFAULT_REGISTRY_PREFIX comes from installer_common.sh; individual *_IMAGE
 # variables still win over the prefix.

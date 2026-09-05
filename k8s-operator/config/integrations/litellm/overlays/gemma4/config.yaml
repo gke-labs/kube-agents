@@ -1,0 +1,30 @@
+model_list:
+  - model_name: model-default
+    litellm_params:
+      model: openai/${MODEL_DEFAULT_NAME}
+      api_base: http://vllm-gemma:8000/v1
+      api_key: none
+  - model_name: hermes-agent
+    litellm_params:
+      model: openai/${MODEL_DEFAULT_NAME}
+      api_base: http://vllm-gemma:8000/v1
+      api_key: none
+  - model_name: ${MODEL_DEFAULT_NAME}
+    litellm_params:
+      model: openai/${MODEL_DEFAULT_NAME}
+      api_base: http://vllm-gemma:8000/v1
+      api_key: none
+litellm_settings:
+  callbacks: ["otel", "prometheus"]
+router_settings:
+  default_litellm_params:
+    cache_control_injection_points:
+      - location: message
+        role: system
+        control:
+          type: ephemeral
+          ttl: 1h
+      - location: message
+        index: -3
+      - location: message
+        index: -1

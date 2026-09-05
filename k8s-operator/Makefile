@@ -151,12 +151,14 @@ require-var = @test -n "$${$(1)}" || { echo "$(1) is not set. Export it; the ref
 IMAGES_JSON ?= $(CURDIR)/../images.json
 image_from_inventory = $(shell jq -r --arg n "$(1)" '.images[] | select(.name == $$n) | "\(.repository):\(.tag)"' "$(IMAGES_JSON)" 2>/dev/null)
 LITELLM_IMAGE ?= $(call image_from_inventory,litellm)
+VLLM_GEMMA_IMAGE ?= $(call image_from_inventory,pytorch-vllm-serve)
 GITHUB_MINTER_IMAGE ?= $(call image_from_inventory,github-token-minter-server)
 HINDSIGHT_API_IMAGE ?= $(call image_from_inventory,hindsight-api)
 HINDSIGHT_POSTGRES_IMAGE ?= $(call image_from_inventory,hindsight-postgresql)
 # The recipes read these through the shell (envsubst and require-var both want
 # them in the environment), which a plain make variable would not reach.
 export LITELLM_IMAGE
+export VLLM_GEMMA_IMAGE
 export GITHUB_MINTER_IMAGE
 export HINDSIGHT_API_IMAGE
 export HINDSIGHT_POSTGRES_IMAGE
@@ -171,16 +173,29 @@ HINDSIGHT_VARS = $$HINDSIGHT_API_IMAGE $$HINDSIGHT_POSTGRES_IMAGE
 deploy-litellm: kustomize ## Deploy LiteLLM integration.
 	$(call require-var,LITELLM_IMAGE,images.json)
 	@if [ "$$MODEL_PROVIDER" = "vertex_ai" ]; then \
+		$(KUSTOMIZE) build config/integrations/vllm-gemma | kubectl delete --ignore-not-found -n $${NAMESPACE:-kubeagents-system} -f -; \
 		$(KUSTOMIZE) build config/integrations/litellm/overlays/vertex_ai | envsubst '$(LITELLM_VERTEX_VARS)' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -; \
+	elif [ "$$MODEL_PROVIDER" = "gemma4" ] || [ "$$MODEL_PROVIDER" = "vllm" ]; then \
+		test -n "$$VLLM_GEMMA_IMAGE" || { echo "VLLM_GEMMA_IMAGE is not set. Export it; the reference lives in images.json." >&2; exit 1; }; \
+		MODEL_DEFAULT_NAME=$${MODEL_DEFAULT_NAME:-google/gemma-4-E2B-it}; \
+		$(KUSTOMIZE) build config/integrations/vllm-gemma | envsubst '$$NAMESPACE $$MODEL_DEFAULT_NAME $$VLLM_GEMMA_IMAGE' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f - && \
+		$(KUSTOMIZE) build config/integrations/litellm/overlays/gemma4 | envsubst '$(LITELLM_VARS)' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -; \
 	else \
+		$(KUSTOMIZE) build config/integrations/vllm-gemma | kubectl delete --ignore-not-found -n $${NAMESPACE:-kubeagents-system} -f -; \
 		$(KUSTOMIZE) build config/integrations/litellm/base | envsubst '$(LITELLM_VARS)' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -; \
 	fi
 
 .PHONY: undeploy-litellm
 undeploy-litellm: kustomize ## Undeploy LiteLLM integration.
 	@if [ "$$MODEL_PROVIDER" = "vertex_ai" ]; then \
+		$(KUSTOMIZE) build config/integrations/vllm-gemma | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -; \
 		$(KUSTOMIZE) build config/integrations/litellm/overlays/vertex_ai | envsubst '$(LITELLM_VERTEX_VARS)' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -; \
+	elif [ "$$MODEL_PROVIDER" = "gemma4" ] || [ "$$MODEL_PROVIDER" = "vllm" ]; then \
+		MODEL_DEFAULT_NAME=$${MODEL_DEFAULT_NAME:-google/gemma-4-E2B-it}; \
+		$(KUSTOMIZE) build config/integrations/litellm/overlays/gemma4 | envsubst '$(LITELLM_VARS)' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -; \
+		$(KUSTOMIZE) build config/integrations/vllm-gemma | envsubst '$$NAMESPACE $$MODEL_DEFAULT_NAME $$VLLM_GEMMA_IMAGE' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -; \
 	else \
+		$(KUSTOMIZE) build config/integrations/vllm-gemma | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -; \
 		$(KUSTOMIZE) build config/integrations/litellm/base | envsubst '$(LITELLM_VARS)' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -; \
 	fi
 

@@ -62,6 +62,15 @@
       "description": "The model gateway the agent's baked default endpoint points at."
     },
     {
+      "name": "pytorch-vllm-serve",
+      "origin": "third-party",
+      "repository": "us-docker.pkg.dev/vertex-ai/vertex-vision-model-garden-dockers/pytorch-vllm-serve",
+      "tag": "gemma4@sha256:3fbc0e08c46e7736145c9effbcc8839682c80b15b413335146f4428fc3523c8a",
+      "override": "VLLM_GEMMA_IMAGE",
+      "pulledBy": "The optional self-hosted Gemma 4 vLLM integration (kustomize dev path only; not pulled by standard installs).",
+      "description": "Vertex AI Model Garden PyTorch vLLM serving container for Gemma 4."
+    },
+    {
       "name": "fluent-bit",
       "origin": "third-party",
       "repository": "docker.io/fluent/fluent-bit",

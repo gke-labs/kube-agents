@@ -15,6 +15,7 @@ assert on that.
 """
 
 import pathlib
+import shutil
 import subprocess
 import unittest
 
@@ -74,6 +75,52 @@ class DeployContractTest(unittest.TestCase):
             (_OPERATOR_DIR / script).exists(),
             "k8s-operator/scripts/ is gone; the recipe must not resolve there",
         )
+
+    def test_deploy_litellm_syntax_valid(self):
+        for provider in ("", "gemini", "vertex_ai", "gemma4", "vllm"):
+            with self.subTest(provider=provider):
+                args = ["make", "-n", "deploy-litellm", "KUSTOMIZE=/bin/true"]
+                if provider:
+                    args.append(f"MODEL_PROVIDER={provider}")
+                result = subprocess.run(
+                    args,
+                    cwd=_OPERATOR_DIR,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                syntax_check = subprocess.run(
+                    ["sh", "-n"],
+                    input=result.stdout,
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertEqual(
+                    syntax_check.returncode,
+                    0,
+                    f"Shell syntax error in make deploy-litellm (provider={provider}):\n{syntax_check.stderr}",
+                )
+
+    def test_kustomize_build_vllm_and_gemma4_packages(self):
+        tool = shutil.which("kustomize")
+        cmd_prefix = [tool, "build"] if tool else [shutil.which("kubectl"), "kustomize"]
+        if not cmd_prefix[0]:
+            self.skipTest("neither kustomize nor kubectl is available in PATH")
+        for pkg in (
+            "config/integrations/vllm-gemma",
+            "config/integrations/litellm/overlays/gemma4",
+        ):
+            with self.subTest(package=pkg):
+                res = subprocess.run(
+                    cmd_prefix + [str(_OPERATOR_DIR / pkg)],
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(
+                    res.returncode,
+                    0,
+                    f"kustomize build failed for {pkg}:\n{res.stderr}",
+                )
 
 
 if __name__ == "__main__":
