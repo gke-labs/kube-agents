@@ -240,7 +240,7 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "B1-image-gate",
         "deploy/docker/Dockerfile",
-        ("unexpected credential-aware CLI in sandbox image", "sandbox image note"),
+        ("unexpected cluster CLI in the agent image", "cluster CLI note"),
         "test_B1_the_sandbox_image_ships_no_credentialed_cli",
         "reword the build gate's message, which is what the assertion anchors "
         "on -- checks that the anchor is registered and policed",
@@ -248,7 +248,7 @@ MUTATIONS: list[Mutation] = [
     Mutation(
         "B1-image-gate-binaries",
         "deploy/docker/Dockerfile",
-        ("for binary in gcloud kubectl gh git;", "for binary in gcloud kubectl;"),
+        ("for binary in gcloud kubectl gh git helm k9s yq; do", "for binary in gcloud kubectl; do"),
         "test_B1_the_sandbox_image_ships_no_credentialed_cli",
         "shorten the gate's binary list, the plausible edit when one of them "
         "is legitimately needed at build time",
@@ -432,23 +432,6 @@ Mutation(
         "The one-word widening is the shape the real regression would take",
     ),
     Mutation(
-        "C1-share-process-namespace",
-        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
-        ("      serviceAccountName: kubeagents-platform-agent",
-         "      shareProcessNamespace: true\n      serviceAccountName: kubeagents-platform-agent"),
-        "test_C1_the_process_namespace_is_never_shared",
-        "a golden fixture regenerated after someone set the field, which is "
-        "how it would actually arrive",
-    ),
-    Mutation(
-        "C1-uid-collapse",
-        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
-        ("          runAsUser: 10001", "          runAsUser: 10000"),
-        "test_C1_the_agent_and_the_broker_run_as_different_users",
-        "collapse the broker onto the sandbox UID, restoring the procfs and "
-        "socket reach the split removed",
-    ),
-    Mutation(
         "C1-socket-umask",
         "agents/platform/scripts/credential_proxy.py",
         ("previous_umask = os.umask(0o177)", "previous_umask = os.umask(0o022)"),
@@ -471,6 +454,16 @@ Mutation(
         "test_C1_the_executor_refuses_an_executable_it_does_not_ship",
         "add sh to the allowlist, giving a compound command somewhere to land",
     ),
+    # C1-share-process-namespace and C1-uid-collapse are retired WITH their
+    # tests, not orphaned. Both attacked same-Pod mitigations the split-broker
+    # layout needed -- a shared PID namespace, and the credential holder running
+    # at the sandbox UID. #913 removed the thing they mitigated: nothing in the
+    # agent Pod holds a credential any more, and the shell runs in a Pod of its
+    # own. The replacement property (ShareProcessNamespace stays unset) is
+    # asserted in the operator's own suite; duplicating it here would pin
+    # someone else's invariant. What C1 asserts instead is the sandbox
+    # ServiceAccount's missing Workload Identity annotation, which has its own
+    # mutation above.
     # C1-egress-whole-internet is retired, not lost. It injected the exact
     # construction slice 2b 1.3 refused -- `0.0.0.0/0 except metadata`, which
     # adds the internet rather than subtracting an address -- into the

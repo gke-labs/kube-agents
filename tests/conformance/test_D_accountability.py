@@ -174,9 +174,20 @@ class D4CredentialsAreShortLivedAndBound(unittest.TestCase):
 
     @staticmethod
     def _projected_tokens():
-        """(fixture, deployment, volume name, serviceAccountToken) for every projection."""
+        """(fixture, workload, volume name, serviceAccountToken) for every projection.
+
+        Deployments AND StatefulSets. #913 moved the shell into a StatefulSet of
+        its own, and this walked Deployments only -- so the projection in the
+        one pod where model-authored commands run was the single token in the
+        render that D4 could not see. The mutation harness found it:
+        `D4-token-never-expires` edits the first `expirationSeconds` in the
+        default golden, which is now the sandbox's, and it SURVIVED.
+        """
         for name, documents in h.golden_documents().items():
-            for deployment in h.objects_of_kind(documents, "Deployment"):
+            workloads = h.objects_of_kind(documents, "Deployment") + h.objects_of_kind(
+                documents, "StatefulSet"
+            )
+            for deployment in workloads:
                 pod_spec = deployment["spec"]["template"]["spec"]
                 for volume in pod_spec.get("volumes") or []:
                     for projected in (volume.get("projected") or {}).get("sources") or []:
