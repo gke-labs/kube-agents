@@ -950,7 +950,7 @@ Mutation(
     Mutation(
         "harness-fixture-emptied",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
-        ("\nkind: ClusterRole\n", "\nkind: ClusterRoleXX\n"),
+        ("\nkind: StatefulSet\n", "\nkind: StatefulSetXX\n"),
         "test_the_golden_fixtures_render_more_than_a_stub",
         "corrupt a fixture's object kinds, which would turn every assertion "
         "that iterates it vacuously green",

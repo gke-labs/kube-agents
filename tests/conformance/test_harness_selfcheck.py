@@ -111,6 +111,11 @@ class TheSourcesAreReal(unittest.TestCase):
                 kinds = {d.get("kind") for d in documents}
                 self.assertIn("Deployment", kinds)
                 self.assertIn("ClusterRole", kinds)
+                # The shell StatefulSet since #913. Named because it is the pod
+                # every model-authored command runs in, so a fixture that has
+                # stopped rendering it is not a fixture group C can conclude
+                # anything from.
+                self.assertIn("StatefulSet", kinds)
 
 
 class TheExpectedFailuresAreDeclared(unittest.TestCase):
