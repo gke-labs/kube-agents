@@ -47,6 +47,16 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # node pool to provision. enable_gvisor_node_pool must stay false there.
 # agent_runtime_class = "gvisor"
 
+# A second install in this project: the agent GSA's default name is one fixed
+# name per project, so give each install after the first its own. Two caveats:
+# the installer front doors regenerate this file on every run, so through
+# install.sh/upgrade.sh put TF_VAR_agent_service_account_id=... in install.env
+# (sourced and exported by every front door) instead of editing here; and a
+# distinct name un-collides creation, not
+# identity - both installs still bind one Workload Identity principal (see the
+# variable description in variables.tf).
+# agent_service_account_id = "kubeagents-platform-gsa-2"
+
 # Cluster tuning
 # deletion_protection = true
 # release_channel     = "REGULAR"

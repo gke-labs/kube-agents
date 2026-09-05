@@ -20,9 +20,10 @@ install without the interview.
 - Optionally (`enable_gke_backup_plan = true`) a scheduled
   [`gke-backup-plan`](../../modules/gke-backup-plan) for the release namespace.
 - The agent's GCP identity ([`kube-agents-iam`](../../modules/kube-agents-iam)
-  module): the `kubeagents-platform-gsa` service account, its read-only
-  project roles, and the Workload Identity binding to the
-  `kubeagents-platform-agent` KSA (see
+  module): a service account (`kubeagents-platform-gsa` by default; a second
+  install in the same project sets `agent_service_account_id` to avoid the
+  name collision), its read-only project roles, and the Workload Identity
+  binding to the `kubeagents-platform-agent` KSA (see
   [IAM roles](#iam-roles-permission_set-and-project_roles) below).
 - Optionally (`enable_google_chat = true`) the Google Chat backend
   ([`chat-pubsub`](../../modules/chat-pubsub) module): Pub/Sub topic,
@@ -116,7 +117,24 @@ plans the whole composition as new and reads as total drift. A gitignored
 `backend_override.tf` points Terraform at
 `gs://<bucket>/<prefix>`, where the prefix defaults to
 `kube-agents/<cluster_name>` (override with `KUBE_AGENTS_STATE_PREFIX`) so two
-installs in one project keep separate state. Versioning is the recovery story:
+installs in one project keep separate state. State is only half of the
+second-install story: set `agent_service_account_id` too, or the installs
+collide on the agent GSA's fixed default name halfway through the second
+install's first apply. Through the installer front doors that means a
+`TF_VAR_agent_service_account_id=...` line in `install.env` - every front
+door sources it with `set -a`, so the line persists and exports on each
+run. Do not rely on a shell `export` instead: it dies with the shell, and
+the next front-door run resolves the variable back to the default name and
+plans the GSA's destroy-and-recreate under `-auto-approve`. And do not
+hand-edit `terraform.tfvars`: install.sh, upgrade.sh and uninstall.sh
+regenerate it on every run, silently dropping the line (Terraform reads
+`TF_VAR_*` only where the file is silent, and on this key it stays silent).
+And a distinct name un-collides creation, not identity: the Workload
+Identity principal names a namespace and KSA project-wide, no cluster, so
+both installs bind the same principal and each agent can mint the other's
+GSA tokens. The `agent_service_account_id` description in `variables.tf`
+carries the limits to read before relying on this. Versioning is the
+recovery story:
 a corrupted or mistakenly-overwritten state file can be rolled back to a prior
 generation by copying it over the live object (`gcloud storage ls -a` lists the
 generations; `gcloud storage restore` is for soft-deleted objects, which is a
