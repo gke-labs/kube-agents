@@ -50,7 +50,7 @@ kubectl top nodes
 kubectl describe nodes | grep -A 5 "Allocated resources"
 ```
 
-**Fix — increase surge capacity:**
+**Fix — increase surge capacity (Standard clusters only; Autopilot manages node upgrades automatically):**
 ```bash
 gcloud container node-pools update NODE_POOL_NAME \
   --cluster CLUSTER_NAME \
@@ -123,7 +123,7 @@ gcloud container operations list --cluster CLUSTER_NAME --zone ZONE --filter="op
 Upgrade is failing with `ZONE_RESOURCE_POOL_EXHAUSTED` or `QUOTA_EXCEEDED` errors, and the cluster has a critical pending deadline (e.g., control plane certificate expiring soon).
 
 **Fix:**
-1. **Change Upgrade Strategy**: Modify the node pool to use a rolling in-place upgrade (no surge) to bypass quota limits:
+1. **Change Upgrade Strategy (Standard clusters only)**: Modify the node pool to use a rolling in-place upgrade (no surge) to bypass quota limits:
    ```bash
    gcloud container node-pools update NODE_POOL_NAME \
      --cluster CLUSTER_NAME \
@@ -169,7 +169,7 @@ GPU nodes upgrade successfully, but ML pods are stuck in `CrashLoopBackOff` with
    ```
 
 **Fix:**
-1. **Pin Driver Version**: If the default driver version changed, update your node pool configuration to pin to the previous working driver version (e.g., `R535`):
+1. **Pin Driver Version (Standard clusters only)**: If the default driver version changed, update your node pool configuration to pin to the previous working driver version (e.g., `R535`):
    ```bash
    gcloud container node-pools update NODE_POOL_NAME \
      --cluster CLUSTER_NAME \
@@ -177,7 +177,7 @@ GPU nodes upgrade successfully, but ML pods are stuck in `CrashLoopBackOff` with
      --accelerator type=GPU_TYPE,count=COUNT,gpu-driver-version=DRIVER_VERSION
    ```
 2. **Update Workload Dependencies**: Rebuild container images with a CUDA version compatible with the new driver.
-3. **Rollback Node Pool**: If production is blocked, roll back the node pool to the previous GKE version:
+3. **Rollback Node Pool (Standard clusters only)**: If production is blocked, roll back the node pool to the previous GKE version:
    ```bash
    gcloud container node-pools upgrade NODE_POOL_NAME \
      --cluster CLUSTER_NAME \

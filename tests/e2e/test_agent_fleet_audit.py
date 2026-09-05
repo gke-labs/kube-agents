@@ -14,7 +14,7 @@ _AUDIT_REPORT_SCRIPT = (
     _REPO_ROOT / "agents" / "platform" / "skills" / "fleet-audit" / "scripts" / "audit_report.py"
 )
 
-# All 7 Registered Audit Streams and their human titles
+# All Registered Audit Streams and their human titles
 AUDIT_STREAMS: List[Tuple[str, str]] = [
     ("compliance-audit", "Security & RBAC Posture Audit"),
     ("security-patch-orchestrator", "Upgrade & Patch Readiness Audit"),
@@ -23,6 +23,8 @@ AUDIT_STREAMS: List[Tuple[str, str]] = [
     ("fleet-consistency-drift", "Fleet Consistency Drift Audit"),
     ("ai-security-audit", "AI Workload Security Audit"),
     ("stockout-prevention", "Fleet Stockout Prevention & Capacity Audit"),
+    ("gcp-networking-fabric-audit", "GCP Networking Fabric & VPC IPAM Audit"),
+    ("gce-compute-fleet-audit", "GCE Compute Engine and MIG Fleet Audit"),
 ]
 
 
@@ -304,8 +306,10 @@ def test_audit_report_ledger_dryrun_all_streams(
     cluster = gke_cluster_name or "test-cluster"
     project = gcp_project_id or "test-project"
 
-    # Retrieve first valid check slug for the audit stream
+    # Retrieve first valid check slug for checks_run and a distinct second check slug for checks_not_applicable.
+    # audit_report.py rejects any document where the same check slug appears in both checks_run and checks_not_applicable.
     valid_check = "sample-check"
+    checks_not_applicable = []
     try:
         import sys
         script_dir_str = str(_AUDIT_REPORT_SCRIPT.parent)
@@ -314,6 +318,15 @@ def test_audit_report_ledger_dryrun_all_streams(
         from audit_report import AUDITS
         if audit_id in AUDITS and AUDITS[audit_id].checks:
             valid_check = AUDITS[audit_id].checks[0]
+            # Use the second registered check slug for checks_not_applicable if available,
+            # so checks_run[0].check != checks_not_applicable[0].check.
+            if len(AUDITS[audit_id].checks) > 1:
+                checks_not_applicable.append(
+                    {
+                        "check": AUDITS[audit_id].checks[1],
+                        "reason": "GKE Autopilot: Google owns this resource; check is not applicable on Autopilot clusters.",
+                    }
+                )
     except Exception:
         pass
 
@@ -332,7 +345,7 @@ def test_audit_report_ledger_dryrun_all_streams(
                             "command": f"kubectl --context={cluster} get pods -A",
                         }
                     ],
-                    "checks_not_applicable": [],
+                    "checks_not_applicable": checks_not_applicable,
                 }
             ],
             "skipped": [],
