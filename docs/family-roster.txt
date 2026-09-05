@@ -55,6 +55,9 @@ agents/platform/governance/*.md
   agents/platform/governance/standardization_validator_sop.md
   agents/platform/governance/stockout_prevention_sop.md
 
+agents/platform/scripts/providers/*/fixtures/README.md
+  agents/platform/scripts/providers/github/fixtures/README.md
+
 agents/platform/skills/*/SKILL.md
   agents/platform/skills/cluster-agent-lifecycle/SKILL.md
   agents/platform/skills/fleet-audit/SKILL.md
@@ -95,6 +98,7 @@ agents/platform/skills/*/SKILL.md
   agents/platform/skills/manage-cluster/SKILL.md
   agents/platform/skills/pr-conversation/SKILL.md
   agents/platform/skills/submit-suggestion/SKILL.md
+  agents/platform/skills/version-control/SKILL.md
   agents/platform/skills/workload-rebalancing/SKILL.md
 
 agents/platform/skills/*/references/*.md

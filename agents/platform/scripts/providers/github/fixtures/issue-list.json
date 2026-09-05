@@ -1,0 +1,68 @@
+{
+  "payload": {
+    "state": "open",
+    "limit": 5
+  },
+  "responses": [
+    [
+      {
+        "number": 719,
+        "state": "open",
+        "title": "Ingest drops events during a node drain",
+        "user": {
+          "login": "jayantid",
+          "id": 88121,
+          "type": "User"
+        },
+        "body": "Reproduced twice on the staging cluster.\n",
+        "labels": [
+          {
+            "id": 9001,
+            "name": "kind/bug",
+            "color": "d73a4a"
+          },
+          {
+            "id": 9002,
+            "name": "area/ingest",
+            "color": "0e8a16"
+          }
+        ],
+        "assignees": [
+          {
+            "login": "kube-agents[bot]",
+            "id": 210943,
+            "type": "Bot"
+          }
+        ],
+        "created_at": "2026-08-11T07:55:40Z",
+        "updated_at": "2026-08-29T18:20:01Z",
+        "closed_at": null,
+        "html_url": "https://github.com/acme/infra/issues/719",
+        "comments": 4
+      },
+      {
+        "number": 4321,
+        "state": "open",
+        "title": "Raise the replica floor on the ingest deployment",
+        "user": {
+          "login": "jayantid",
+          "id": 88121,
+          "type": "User"
+        },
+        "body": "Reproduced twice on the staging cluster.\n",
+        "labels": [],
+        "assignees": [],
+        "created_at": "2026-08-11T07:55:40Z",
+        "updated_at": "2026-08-29T18:20:01Z",
+        "closed_at": null,
+        "html_url": "https://github.com/acme/infra/pull/4321",
+        "comments": 4,
+        "pull_request": {
+          "url": "https://api.github.com/repos/acme/infra/pulls/4321",
+          "html_url": "https://github.com/acme/infra/pull/4321",
+          "merged_at": null
+        }
+      }
+    ]
+  ]
+}

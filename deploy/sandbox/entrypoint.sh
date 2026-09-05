@@ -384,6 +384,11 @@ done
 #    leased clone goes. sshd starts sessions with neither.
 SANDBOX_SSHD_DROPIN=/etc/ssh/sshd_config.d/10-sandbox-env.conf
 SANDBOX_PATH=/opt/credential-proxy/bin:/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin
+# /opt/vcs/libexec is deliberately not on this list. The image carries a second,
+# credential-free git there for the version-control skill, and the skill reaches
+# it by absolute path; putting its directory ahead of the shim would take the
+# name `git` from every caller that means the shim, so that PATH edit travels
+# with those callers. deploy/sandbox/Dockerfile has the argument.
 setenv_args="PATH=\"$SANDBOX_PATH\" HERMES_HOME=\"$DATA\" PLATFORM_AGENT_HOME=\"$DATA\""
 # CREDENTIAL_PROXY_TOKEN_FILE is a path, not a token: the file it names is a
 # projected volume, and forwarding the name is what lets the client read it. It

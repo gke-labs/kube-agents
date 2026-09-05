@@ -317,7 +317,9 @@ def _no_symlink_on_the_way(root: Path, relative: PurePosixPath) -> Path:
     return current
 
 
-def assert_disjoint_roots(tree_root: Path, agent_workspace_root: Path) -> None:
+def assert_disjoint_roots(
+    tree_root: Path, agent_workspace_root: Path, purpose: str = "content workspace"
+) -> None:
     """Refuse to arm content-passing if the agent can name the tree.
 
     The whole mechanism is "the broker operates somewhere the agent has no path
@@ -329,15 +331,19 @@ def assert_disjoint_roots(tree_root: Path, agent_workspace_root: Path) -> None:
     same volume is a broker that will not start, not a broker that starts
     without the property. A property the deployment is supposed to have is
     worth a call rather than a comment.
+
+    `purpose` names which root is being checked, because the version-control
+    scratch tree has the same requirement for the same reason and a message
+    that named the wrong one would send whoever is debugging it to the wrong
+    control.
     """
     tree = Path(tree_root).resolve()
     agent = Path(agent_workspace_root).resolve()
     if tree == agent or agent in tree.parents or tree in agent.parents:
         raise RuntimeError(
-            f"the content workspace root ({tree}) and the agent-shared "
-            f"workspace root ({agent}) overlap. Content-passing exists to keep "
-            "the broker out of directories the agent can write; with these "
-            "roots it would not. Refusing to start."
+            f"the {purpose} root ({tree}) and the agent-shared workspace root "
+            f"({agent}) overlap. The broker operates where the agent has no "
+            "path; with these roots it would not. Refusing to start."
         )
 
 

@@ -500,6 +500,34 @@ check "PATH survives /etc/profile in a login shell" "/opt/credential-proxy/bin/k
   "$("${SSH[@]}" 'bash -l -c "command -v kubectl"' 2>&1)"
 
 echo
+echo "== 5b. the version-control skill's local git =="
+# A second git, off PATH, that the version-control skill reaches by absolute
+# path to read a clone the broker unpacked here. Asserted as absent from PATH
+# first, because that is the property the section is really about: the name
+# `git` still belongs to the shim, and every caller in the tree that types it
+# still means the shim.
+check "the name git still resolves to the shim" "/opt/credential-proxy/bin/git" \
+  "$("${SSH[@]}" 'command -v git' 2>&1)"
+check "and in a login session too" "/opt/credential-proxy/bin/git" \
+  "$("${SSH[@]}" "bash -l -c 'command -v git'" 2>&1)"
+check "the local git is a real git" "git version" \
+  "$("${SSH[@]}" '/opt/vcs/libexec/git --version' 2>&1)"
+# The message, not the exit status: example.invalid resolves nowhere, so an
+# https ls-remote fails on an image that still ships git-remote-https too, and a
+# check on failure alone would pass there. "not a git command" is git's external
+# dispatch failing to find the helper -- the shape it prints when
+# /usr/lib/git-core/git exists, which it does here. The Dockerfile guard asserts
+# the same thing at build time; this asserts it of the image that was actually
+# pulled, over the transport the agent uses.
+check "and cannot reach a network" "is not a git command" \
+  "$("${SSH[@]}" '/opt/vcs/libexec/git ls-remote https://example.invalid/x.git' 2>&1)"
+# The other half of the check above: a git broken outright also fails to reach a
+# network, and would pass it. This is what says the disarming was surgical.
+check "but still reads a local repository" "rc=0" \
+  "$("${SSH[@]}" '/opt/vcs/libexec/git init -q /tmp/sm && /opt/vcs/libexec/git ls-remote file:///tmp/sm >/dev/null; echo rc=$?' 2>&1 | tail -1)"
+"${SSH[@]}" 'rm -rf /tmp/sm' >/dev/null 2>&1
+
+echo
 echo "== 6. a restart must not change the host key or lose the model's work =="
 # Hermes connects with StrictHostKeyChecking=accept-new, which accepts a key it
 # has never seen and refuses one that changed. A regenerated host key is not a

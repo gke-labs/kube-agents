@@ -1,0 +1,44 @@
+{
+  "payload": {
+    "title": "Ingest drops events during a node drain",
+    "body": "Reproduced twice on the staging cluster.\n",
+    "labels": ["kind/bug", "area/ingest"]
+  },
+  "responses": [
+    {
+      "number": 719,
+      "state": "open",
+      "title": "Ingest drops events during a node drain",
+      "user": {
+        "login": "jayantid",
+        "id": 88121,
+        "type": "User"
+      },
+      "body": "Reproduced twice on the staging cluster.\n",
+      "labels": [
+        {
+          "id": 9001,
+          "name": "kind/bug",
+          "color": "d73a4a"
+        },
+        {
+          "id": 9002,
+          "name": "area/ingest",
+          "color": "0e8a16"
+        }
+      ],
+      "assignees": [
+        {
+          "login": "kube-agents[bot]",
+          "id": 210943,
+          "type": "Bot"
+        }
+      ],
+      "created_at": "2026-08-11T07:55:40Z",
+      "updated_at": "2026-08-29T18:20:01Z",
+      "closed_at": null,
+      "html_url": "https://github.com/acme/infra/issues/719",
+      "comments": 4
+    }
+  ]
+}

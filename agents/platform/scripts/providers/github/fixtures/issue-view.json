@@ -1,0 +1,71 @@
+{
+  "payload": {
+    "number": 719,
+    "comments": true
+  },
+  "responses": [
+    {
+      "number": 719,
+      "state": "open",
+      "title": "Ingest drops events during a node drain",
+      "user": {
+        "login": "jayantid",
+        "id": 88121,
+        "type": "User"
+      },
+      "body": "Reproduced twice on the staging cluster.\n",
+      "labels": [
+        {
+          "id": 9001,
+          "name": "kind/bug",
+          "color": "d73a4a"
+        },
+        {
+          "id": 9002,
+          "name": "area/ingest",
+          "color": "0e8a16"
+        }
+      ],
+      "assignees": [
+        {
+          "login": "kube-agents[bot]",
+          "id": 210943,
+          "type": "Bot"
+        }
+      ],
+      "created_at": "2026-08-11T07:55:40Z",
+      "updated_at": "2026-08-29T18:20:01Z",
+      "closed_at": null,
+      "html_url": "https://github.com/acme/infra/issues/719",
+      "comments": 4
+    },
+    [
+      {
+        "id": 55512309,
+        "user": {
+          "login": "kube-agents[bot]",
+          "id": 210943,
+          "type": "Bot"
+        },
+        "body": "Rolled out and the drain no longer drops events.",
+        "created_at": "2026-08-30T09:20:44Z",
+        "updated_at": "2026-08-30T09:20:44Z",
+        "html_url": "https://github.com/acme/infra/issues/719#issuecomment-55512309",
+        "author_association": "CONTRIBUTOR"
+      },
+      {
+        "id": 55512877,
+        "user": {
+          "login": "jayantid",
+          "id": 88121,
+          "type": "User"
+        },
+        "body": "Confirmed on staging.",
+        "created_at": "2026-08-30T10:02:15Z",
+        "updated_at": "2026-08-30T09:20:44Z",
+        "html_url": "https://github.com/acme/infra/issues/719#issuecomment-55512309",
+        "author_association": "CONTRIBUTOR"
+      }
+    ]
+  ]
+}

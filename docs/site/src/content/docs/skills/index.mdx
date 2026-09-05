@@ -103,6 +103,7 @@ Generated from the `name` and `description` frontmatter of every `agents/platfor
 | [`github-issue-resolver`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/github-issue-resolver/SKILL.md) | Autonomously poll, triage, investigate, and resolve unaddressed open issues on our target GitHub repository strictly within authorized scope. |
 | [`inspect-repository`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/inspect-repository/SKILL.md) | Read and analyze the source of any GitHub repository — public or one this install has a token for — without a local checkout. Clones broker-side and pulls file content back; use it to answer questions about code, not to change it. |
 | [`pr-conversation`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/pr-conversation/SKILL.md) | Answer a reviewer who addressed you on one of your own pull requests — read the thread, answer or amend the branch, and reply in the thread. |
+| [`version-control`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/version-control/SKILL.md) | Read and change a hosted repository through forge-neutral verbs. Version control here is abstracted — remote operations go through vcs.py, local operations use a credential-free VCS binary on a working copy that vcs.py puts on disk. Covers history, file modes, proposals and issues, so no forge CLI is needed. |
 
 ### Cluster Agent (per-cluster runtime)
 

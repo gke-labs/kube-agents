@@ -34,7 +34,9 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import command_policy
+import providers
 import scoped_sa_pool
+import vcs_broker
 
 # Re-exported, not re-implemented. The shim owns kubeconfig parsing because the
 # file is in its pod and not in this one; these three are the vocabulary both
@@ -103,6 +105,28 @@ def redact_credentials(text: str) -> str:
     from the Hermes plugin tree. Consolidating the three is separate work.
     """
     return _CREDENTIAL_SHAPES.sub("[REDACTED]", text)
+
+
+def _redacted_fields(exc) -> dict:
+    """A forge refusal, with anything token-shaped taken out of it.
+
+    A `WorkspaceError` from a forge can carry the CLI's or the API's own words
+    in `detail` -- that is the point of it, the caller needs to know what the
+    forge said -- and those words crossed back into the sandbox verbatim. Every
+    other route out of this process runs its subprocess output through
+    `redact_credentials` first, and this one is the same risk with a shorter
+    path: the sandbox is the side that must not learn a credential.
+
+    Applied here rather than in `providers`, because the shapes the redactor
+    matches are one forge's token formats and no module under `providers/` may
+    name a forge. Applying it at the boundary also means a forge added later
+    gets it without having asked.
+    """
+    fields = {key: value for key, value in exc.fields.items()}
+    for key, value in fields.items():
+        if isinstance(value, str):
+            fields[key] = redact_credentials(value)
+    return {"error": redact_credentials(str(exc)), **fields}
 
 
 class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
@@ -198,7 +222,9 @@ CALLER_ROLE_CHAT = "chat"
 ROUTE_ROLES: tuple[tuple[str, str], ...] = (
     ("/v1/chat/", CALLER_ROLE_CHAT),
     ("/v1/exec", CALLER_ROLE_SHELL),
+    ("/v1/forge/", CALLER_ROLE_SHELL),
     ("/v1/github/", CALLER_ROLE_SHELL),
+    ("/v1/vcs/", CALLER_ROLE_SHELL),
     ("/v1/workspace/", CALLER_ROLE_SHELL),
 )
 
@@ -1477,6 +1503,55 @@ GIT_HOOKS_DISABLED_DIR = "git-hooks-disabled"
 # Broker-owned git trees, under the state dir rather than the shared workspace.
 CONTENT_WORKSPACE_DIR = "content-workspaces"
 
+# Where the version-control routes build and delete their scratch trees. A
+# sibling of the content workspaces rather than a subdirectory: the two are
+# contained separately, and a shared parent would make one path's containment
+# check accept the other's directories.
+VCS_SCRATCH_DIR = "vcs"
+
+# The git subcommands the version-control broker issues on its own behalf. A
+# closed list checked against the argv as parsed, so a later edit that threads
+# a caller's string into a new vector is refused rather than run.
+#
+# `checkout` is on it for one caller, on the read path: `clone` puts the named
+# branch on HEAD before writing the bundle, because a clone that landed on the
+# remote's default branch would bundle the wrong revision. Nothing on the write
+# path needs it -- an incoming bundle is unbundled, inspected and pushed without
+# its objects ever being materialised into a working tree.
+#
+# `update-ref` is on the list for one caller: `bundle unbundle` puts the
+# objects in the store and prints the refs but writes none, so the broker names
+# the incoming tip itself. It is the narrower half of the alternative -- the
+# other way to read a bundle is `fetch <path>`, which is the `file` transport
+# `GIT_ALLOW_PROTOCOL` refuses everywhere for reasons the executor environment
+# spells out.
+VCS_GIT_SUBCOMMANDS = frozenset(
+    {
+        "bundle",
+        "checkout",
+        "clone",
+        "fetch",
+        "init",
+        "ls-remote",
+        "merge-base",
+        "push",
+        "remote",
+        "rev-parse",
+        "symbolic-ref",
+        "update-ref",
+    }
+)
+
+# Where a credential refresh helper is staged. A forge's helper is found by its
+# own name under this directory, which is how the generic route reaches a
+# provider-specific operation without this file listing providers.
+FORGE_REFRESH_HELPER_DIR = "/opt/defaults/scripts"
+
+# What may be spliced into that filename. Closed, anchored and lowercase: a
+# provider name reaching a path is the one place a forge's own string could
+# become a directory traversal.
+_PROVIDER_RE = re.compile(r"[a-z][a-z0-9]{0,31}")
+
 # Config keys forced onto every git invocation, as the `GIT_CONFIG_COUNT`
 # layer. That layer outranks system, global and repo-local config, which is
 # the point: the agent owns the working tree, so `.git/config` is a file it
@@ -1951,8 +2026,47 @@ def content_workspace_enabled() -> bool:
     }
 
 
+_forge_registry: providers.Registry | None = None
+_forge_registry_lock = threading.Lock()
+
+
+def forge_registry() -> providers.Registry:
+    """The forges this install has, for the questions that need no credential.
+
+    Resolving a repository spec and refusing an unserved host are pure
+    functions of the host table, so the routes that only need to *identify* a
+    repository share one registry rather than each building their own. The
+    broker keeps its own, constructed with the refresh operation, because that
+    one is the object that spends something.
+    """
+    global _forge_registry
+    with _forge_registry_lock:
+        if _forge_registry is None:
+            _forge_registry = providers.Registry()
+        return _forge_registry
+
+
+def broker_executables() -> tuple[str, ...]:
+    """What the credentialed process may run at all.
+
+    Two lists exist and they are not the same list. This one says what may run
+    *here*, in the container that holds the token;
+    `credential_proxy_client.SUPPORTED_EXECUTABLES` says what the sandbox may
+    ask to have run on its behalf. They used to be the same four names, which
+    read as one decision and was two.
+
+    `gcloud` and `kubectl` are on both: the agent names them and this process
+    runs them. `git` is only here -- the broker issues it on its own behalf and
+    the agent reaches version control by verb. And a forge CLI is here only if
+    some forge this install built declares one, so an install whose forges all
+    speak HTTP grants no forge binary rather than inheriting the union of every
+    binary any forge could want.
+    """
+    return ("gcloud", "kubectl", "git", *providers.Registry().executables)
+
+
 class CommandExecutor:
-    ALLOWED_EXECUTABLES = ("gcloud", "kubectl", "gh", "git")
+    ALLOWED_EXECUTABLES = broker_executables()
 
     def __init__(
         self,
@@ -2006,6 +2120,14 @@ class CommandExecutor:
             if content_workspace_enabled()
             else None
         )
+        # Always present, unlike the content-workspace root. Version control is
+        # not behind a switch -- there is no other way for the sandbox to reach
+        # a repository -- so the directory its scratch trees live in exists on
+        # every start, and `execute_vcs_git` is reachable whenever the process
+        # is. Resolved for the same reason as the roots above: `_execute`
+        # compares it against a resolved `cwd`, and an unresolved root under a
+        # symlinked prefix refuses every legitimate call.
+        self.vcs_root = (self.state_dir / VCS_SCRATCH_DIR).resolve()
         # git reads its global config from $HOME/.gitconfig, and $HOME is the
         # sidecar-only state dir, so the agent cannot open the file directly.
         # It can still *write* it through the proxy unless `git config
@@ -2029,6 +2151,7 @@ class CommandExecutor:
             self.kube_dir,
             self.kubeconfig_dir,
             self.git_hooks_dir,
+            self.vcs_root,
             *(
                 (self.content_workspace_root,)
                 if self.content_workspace_root is not None
@@ -2361,6 +2484,143 @@ class CommandExecutor:
             cwd=str(cwd),
             containment_root=self.content_workspace_root,
         )
+
+    def execute_vcs_git(
+        self,
+        argv: list[str],
+        cwd: Path,
+        check: bool = True,
+        config: tuple[tuple[str, str], ...] = (),
+    ) -> subprocess.CompletedProcess:
+        """git the version-control broker issues, in its own scratch tree.
+
+        A third door rather than a widening of the second. The broker needs
+        `bundle`, `init`, `remote` and `ls-remote`, which content-passing does
+        not, and putting them on one list would grant each path the other's
+        subcommands for no reason beyond sharing a method.
+
+        `config` is what the forge's credential asked for on this invocation --
+        a helper pin, an `insteadOf`, whatever presenting that forge's
+        credential to git takes. It goes into the `GIT_CONFIG_COUNT` layer
+        *before* the forced pins, so a forge cannot turn off hooks containment
+        or GPG program pinning by asking for the same key.
+
+        Answers as a `CompletedProcess` because that is what the broker's
+        callers read, and raises `CalledProcessError` when `check` is set --
+        the same contract `subprocess.run` has, so the broker's logic reads as
+        ordinary git plumbing rather than as an executor protocol.
+        """
+        if not argv or argv[0] != "git":
+            raise ValueError("only git runs on the version-control path")
+        executable_path = self.executables.get("git")
+        if not executable_path:
+            raise RuntimeError("supported executable is unavailable: git")
+        subcommand, redirects = _git_plan(argv)
+        if redirects:
+            raise ValueError("`-C` is not accepted on the version-control path")
+        if subcommand not in VCS_GIT_SUBCOMMANDS:
+            raise ValueError(
+                f"`git {subcommand}` is not one of the subcommands the "
+                "version-control broker issues on its own behalf"
+            )
+        result = self._execute(
+            [executable_path, *argv[1:]],
+            cwd=str(cwd),
+            containment_root=self.vcs_root,
+            extra_config=tuple(config),
+        )
+        if check and result.exit_code != 0:
+            raise subprocess.CalledProcessError(
+                result.exit_code, argv, result.stdout, result.stderr
+            )
+        return subprocess.CompletedProcess(
+            argv, result.exit_code, result.stdout, result.stderr
+        )
+
+    def execute_forge_cli(
+        self, argv: list[str], stdin: str | None = None
+    ) -> subprocess.CompletedProcess:
+        """Run a forge's CLI, from a directory that holds no repository.
+
+        The counterpart of `execute_vcs_git` for the collaboration verbs, and it
+        exists for the same reason: `_execute` is where the credential
+        environment is assembled, and a second copy of that assembly would
+        drift from the first.
+
+        The working directory is the scratch root itself, deliberately. A forge
+        CLI shells out to git and infers a repository from whatever
+        `.git/config` it can find above the cwd, so running it inside one of the
+        scratch clones would let a config that arrived in a caller's bundle
+        decide what the credentialed process does. Every call the broker makes
+        names an explicit API path, so it needs no repository at all.
+
+        `stdin` carries the request body. Not argv: what a caller wrote must not
+        be visible in `ps` or reappear inside a `CalledProcessError` that some
+        layer above logs -- the same argument `_execute`'s own stdin handling
+        already makes for the installation token.
+
+        Not reachable from `/v1/exec`. The argv is composed in `vcs_broker`, the
+        subcommand is always the CLI's API passthrough, and the only
+        caller-supplied strings in it are validated fields.
+        """
+        if not argv:
+            raise ValueError("a forge CLI invocation needs an executable")
+        executable_path = self.executables.get(argv[0])
+        if not executable_path:
+            raise RuntimeError(f"supported executable is unavailable: {argv[0]}")
+        self.vcs_root.mkdir(parents=True, exist_ok=True)
+        result = self._execute(
+            [executable_path, *argv[1:]],
+            stdin=stdin,
+            cwd=str(self.vcs_root),
+            containment_root=self.vcs_root,
+        )
+        return subprocess.CompletedProcess(
+            argv, result.exit_code, result.stdout, result.stderr
+        )
+
+    def refresh_forge_credential(self, provider: str, repository: str) -> None:
+        """Make this install's credential for `repository` current, or raise.
+
+        The privileged operation a `BrokeredCredential` names and does not
+        perform. Which forge is asking arrives as an argument rather than being
+        decided here, and the helper that does the work is found by the
+        provider's own name -- so a second forge that needs a brokered
+        credential ships a helper and edits nothing in this file.
+
+        The provider is matched against a closed grammar before it reaches a
+        path. It comes from a forge class rather than from a request today, and
+        the check is what keeps that true if a route ever passes one through.
+
+        Whether the repository is one this install acts on is settled here too,
+        for the reason `_repository_is_permitted` gives: this is the call that
+        spends the token, so it is the call that has to ask.
+        """
+        if not _PROVIDER_RE.fullmatch(provider or ""):
+            raise ValueError("provider is not a forge name")
+        if not repository_is_managed(repository):
+            raise PermissionError(f"{repository} is not a repository this install manages")
+        helper = Path(FORGE_REFRESH_HELPER_DIR) / f"{provider}_token_refresh.py"
+        if not helper.is_file():
+            # An absent helper is a refusal rather than a no-op. A credential
+            # strategy that asked to be made current and silently was not is a
+            # 401 later, from inside a clone, that reads like the repository is
+            # gone.
+            raise RuntimeError(f"no credential refresh helper for {provider}")
+        result = self.execute_internal([str(helper), repository])
+        if result.exit_code != 0:
+            # Logged here and not returned: the detail crosses back into the
+            # sandbox otherwise, and it is the one place a broker outage is
+            # diagnosable. Redacted before it is bounded, so a token cut in half
+            # by the slice is not what survives.
+            detail = redact_credentials(result.stderr.strip())
+            LOGGER.warning(
+                "%s credential refresh exited %d%s",
+                provider,
+                result.exit_code,
+                f": {detail[:1000]}" if detail else "",
+            )
+            raise RuntimeError("credential refresh failed")
 
     def _within_workspace(self, candidate: Path) -> bool:
         return _within(self.workspace_dir, candidate)
@@ -2698,6 +2958,7 @@ class CommandExecutor:
         cwd: str | None = None,
         kubeconfig_path: Path | None = None,
         containment_root: Path | None = None,
+        extra_config: tuple[tuple[str, str], ...] = (),
     ) -> ExecutionResult:
         """Run a command. `kubeconfig_path` is already resolved and trusted.
 
@@ -2719,18 +2980,35 @@ class CommandExecutor:
             requested_cwd = Path(cwd).resolve()
             if not _within(root, requested_cwd):
                 # Name the root that was actually checked. With one message for
-                # both, a refusal on the workspace path reads as though the
-                # agent-shared containment fired, which sends whoever is
-                # debugging it to the wrong control.
-                raise ValueError(
-                    "working directory is outside the shared workspace"
-                    if root == self.workspace_dir
-                    else "working directory is outside the content workspace"
-                )
+                # all of them, a refusal on the content or version-control path
+                # reads as though the agent-shared containment fired, which
+                # sends whoever is debugging it to the wrong control. Derived
+                # from the root rather than from a branch per caller, so a
+                # fourth door cannot be added without naming itself here.
+                named = {
+                    self.workspace_dir: "the shared workspace",
+                    self.content_workspace_root: "the content workspace",
+                    self.vcs_root: "the version-control scratch tree",
+                }.get(root, str(root))
+                raise ValueError(f"working directory is outside {named}")
             command_cwd = requested_cwd
         command_environment = self.environment.copy()
         if argv and Path(argv[0]).name == "git":
             command_environment.update(self.git_identity)
+        if extra_config:
+            # Rebuilt rather than appended to, because the count and the keys
+            # have to move together. The caller's pairs go first so the forced
+            # set still wins on a key both name -- git takes the last value in
+            # the layer, and the pins are what the last position is for.
+            command_environment.update(
+                _git_forced_config_environment(
+                    (
+                        *extra_config,
+                        ("core.hooksPath", str(self.git_hooks_dir)),
+                        *GIT_FORCED_CONFIG,
+                    )
+                )
+            )
         if kubeconfig_path is not None:
             command_environment["KUBECONFIG"] = str(kubeconfig_path)
         process = subprocess.Popen(
@@ -2797,6 +3075,38 @@ def build_workspace_store(executor: CommandExecutor):
     )
     LOGGER.info("content workspace enabled root=%s", executor.content_workspace_root)
     return store
+
+
+def build_vcs_broker(executor: CommandExecutor):
+    """The version-control broker. Always built; there is no switch.
+
+    Unlike the content workspace this has no off state. It is the forge-neutral
+    route, and a build that could return None here would be a build where the
+    neutral route is absent and every caller silently falls back to the one
+    thing it was meant to replace: a forge CLI, spelled `gh`.
+
+    The scratch tree is the broker's own -- same requirement as content
+    passing, same check, and it is a construction-time refusal for the same
+    reason: an overlap makes "the agent has no path to it" false while the
+    code goes on claiming it.
+    """
+    from content_workspace import assert_disjoint_roots
+
+    assert_disjoint_roots(
+        executor.vcs_root, executor.workspace_dir, purpose="version-control scratch"
+    )
+    broker = vcs_broker.VcsBroker(
+        executor.vcs_root,
+        git_runner=executor.execute_vcs_git,
+        cli_runner=executor.execute_forge_cli,
+        refresh=executor.refresh_forge_credential,
+    )
+    LOGGER.info(
+        "version control enabled root=%s forges=%s",
+        executor.vcs_root,
+        ",".join(sorted(forge.name for forge in broker.registry.forges)) or "none",
+    )
+    return broker
 
 
 def read_only_enforced() -> bool:
@@ -2932,6 +3242,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     # which is what lets a migrating client detect support by asking rather than
     # by version-sniffing.
     workspaces: object | None = None
+    # Named `vcs` rather than `vcs_broker`: a class attribute of that name does
+    # not shadow the module inside a method, but it reads as though it does.
+    # Unlike `workspaces` this is never None on a running broker -- version
+    # control is not behind a switch, because it is the only way the sandbox
+    # reaches a repository at all.
+    vcs: vcs_broker.VcsBroker | None = None
     # Replaced by serve(). The default keeps the sidecar deployment, where the
     # Unix socket is the access control, behaving as it did before there was an
     # authenticator at all.
@@ -3092,11 +3408,22 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/v1/chat/"):
             self._handle_chat_post()
             return
+        if self.path == "/v1/forge/refresh":
+            self._handle_forge_refresh()
+            return
         if self.path == "/v1/github/refresh":
-            self._handle_github_refresh()
+            # The name this route had before there was more than one forge.
+            # Kept for one release because the caller and the broker are
+            # separate images and an upgrade does not move them together --
+            # which is also why the provider travels in the body rather than in
+            # the path on the route that replaces it.
+            self._handle_forge_refresh(provider="github")
             return
         if self.path.startswith("/v1/workspace/"):
             self._handle_workspace_post()
+            return
+        if self.path.startswith("/v1/vcs/"):
+            self._handle_vcs_post()
             return
         if self.path != "/v1/exec":
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
@@ -3497,15 +3824,37 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return {"closed": True}
         return None
 
-    def _handle_github_refresh(self) -> None:
+    def _handle_forge_refresh(self, provider: str = "") -> None:
+        """`POST /v1/forge/refresh` — make a credential current before it is spent.
+
+        The provider travels in the body rather than in the path so that the
+        route's shape does not change when a second forge arrives, and so a
+        caller running an older image than the broker (or the other way round)
+        is a rejected value rather than a 404 that reads as "this broker is too
+        old".
+
+        The repository is validated by resolving it, which is the same parse the
+        broker itself would use: it accepts whatever shape the named forge's
+        repositories actually have -- two segments on one forge, a nested
+        namespace on another -- and refuses a host this install serves no
+        credential for, before that host is told anything.
+        """
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
             if content_length <= 0 or content_length > self.max_request_bytes:
                 raise ValueError("invalid request size")
             payload = json.loads(self.rfile.read(content_length))
-            repository = payload["repository"]
-            if not is_valid_repository(repository):
-                raise ValueError("repository must be owner/name")
+            if not isinstance(payload, dict):
+                raise ValueError("request body must be an object")
+            forge, repository = forge_registry().resolve(payload.get("repository"))
+            named = provider or payload.get("provider") or forge.name
+            if named != forge.name:
+                raise ValueError(
+                    f"{named} does not serve the repository this request names"
+                )
+        except providers.WorkspaceError as exc:
+            self._json(HTTPStatus(exc.status), _redacted_fields(exc))
+            return
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
@@ -3514,42 +3863,132 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            result = self.executor.execute_internal(
-                ["/opt/defaults/scripts/github_token_refresh.py", repository]
+            self.executor.refresh_forge_credential(forge.name, repository)
+        except PermissionError:
+            # `refresh_forge_credential` asks the managed list too, because the
+            # in-process callers do not come through here. Reaching it from this
+            # route means the two answers disagreed, which is a race with a
+            # ConfigMap remount rather than anything the caller did wrong.
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "error": "this install does not manage that repository",
+                    "code": "REPOSITORY_NOT_MANAGED",
+                },
             )
+            return
         except Exception as exc:
-            LOGGER.warning("GitHub credential refresh failed: %s", type(exc).__name__)
-            self._json(
-                HTTPStatus.BAD_GATEWAY, {"error": "GitHub credential refresh failed"}
-            )
-            return
-        if result.exit_code != 0:
-            # The helper's stderr is the only place the broker's actual refusal
-            # exists: github_token_refresh raises `Minty returned error (HTTP
-            # <code>): <body>` and its main() logs that line. Without this the
-            # caller's reason code -- GITHUB_TOKEN_REFRESH_FAILED, which the
-            # resolver renders into a chat room -- is the whole diagnosis, and
-            # an operator has nothing to read during a broker outage.
-            #
-            # Same split as the shell bootstrap above: the detail must not
-            # travel in the response, which crosses back into the agent sandbox,
-            # so it is logged here where only an operator reading the sidecar's
-            # own logs sees it and the reply stays output-free. Bounded because
-            # `_execute` caps output at CREDENTIAL_PROXY_MAX_OUTPUT_BYTES (4 MiB
-            # by default), which is not a log line, and this path can fire on
-            # every cron tick. Redacted before it is bounded, so that a token cut
-            # in half by the slice is not what survives.
-            detail = redact_credentials(result.stderr.strip())
+            # The helper's own stderr is the only place the refusal exists, and
+            # `refresh_forge_credential` has already logged it redacted. It must
+            # not travel in the response, which crosses back into the sandbox --
+            # the reason code is what the caller acts on.
             LOGGER.warning(
-                "GitHub credential refresh exited %d%s",
-                result.exit_code,
-                f": {detail[:1000]}" if detail else "",
+                "%s credential refresh failed: %s", forge.name, type(exc).__name__
             )
             self._json(
-                HTTPStatus.BAD_GATEWAY, {"error": "GitHub credential refresh failed"}
+                HTTPStatus.BAD_GATEWAY,
+                {
+                    "error": "credential refresh failed",
+                    "code": "FORGE_TOKEN_REFRESH_FAILED",
+                    "forge": forge.name,
+                },
             )
             return
-        self._json(HTTPStatus.OK, {"status": "refreshed"})
+        self._json(HTTPStatus.OK, {"status": "refreshed", "forge": forge.name})
+
+    def _handle_vcs_post(self) -> None:
+        """The version-control routes: `POST /v1/vcs/<verb>`.
+
+        A separate namespace rather than more verbs on an existing one, because
+        they are a different protocol: every route here stands alone, holds
+        nothing across calls and leaves nothing behind, so there is no handle
+        argument for any of them to carry.
+        """
+        if self.vcs is None:
+            self._json(
+                HTTPStatus.NOT_FOUND,
+                {
+                    "error": "version control is not available on this broker",
+                    "code": "VCS_UNAVAILABLE",
+                },
+            )
+            return
+        # Hyphens and underscores reach the same route. A caller that guessed
+        # the punctuation wrong should not get a 404 that reads as though the
+        # verb does not exist.
+        verb = self.path[len("/v1/vcs/"):].replace("_", "-")
+        route = vcs_broker.route_table(self.vcs).get(verb)
+        if route is None:
+            self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
+            return
+        try:
+            payload = self._read_json_body(
+                max_bytes=max(self.max_request_bytes, vcs_broker.max_bundle_bytes() * 2)
+            )
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            return
+        # The managed-repository control, on the same footing as
+        # `require_managed_workspace` on the content routes: the broker holds
+        # the forge credential, so "is this a repository we write to" can only
+        # be answered here. Nothing downstream answers it -- a forge is handed a
+        # repository and spends the token on it -- so this is the whole of the
+        # check for these routes.
+        #
+        # Resolved rather than compared as given, because the managed list holds
+        # slugs and a caller may name a repository by URL. Resolving here also
+        # rejects a host this install serves no credential for before the write
+        # verb is entered, which is the same order `/v1/forge/refresh` uses.
+        if verb in vcs_broker.WRITE_VERBS:
+            try:
+                _, repository = self.vcs.registry.resolve(payload.get("repository"))
+            except providers.WorkspaceError as exc:
+                self._json(HTTPStatus(exc.status), _redacted_fields(exc))
+                return
+            if not self._repository_is_permitted(repository):
+                return
+        try:
+            result = route(payload)
+        except PermissionError:
+            # `BrokeredCredential.ensure` lets this one through, and
+            # `refresh_forge_credential` raises it: the credential strategy asks
+            # the managed list as well, because the in-process callers do not
+            # come through the check above. Reaching it here means the two
+            # answers disagreed -- a ConfigMap remount between them -- or that a
+            # read verb's forge declined the repository outright.
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "error": "this install does not manage that repository",
+                    "code": "REPOSITORY_NOT_MANAGED",
+                },
+            )
+            return
+        except providers.WorkspaceError as exc:
+            self._json(HTTPStatus(exc.status), _redacted_fields(exc))
+            return
+        except subprocess.CalledProcessError as exc:
+            # git's stderr can carry the remote URL with a credential in it, so
+            # it goes to the log through the same redactor the exec path uses
+            # and never into the response.
+            LOGGER.warning(
+                "vcs %s failed rc=%s: %s",
+                verb,
+                exc.returncode,
+                redact_credentials(str(exc.stderr or "")[:2000]),
+            )
+            self._json(
+                HTTPStatus.BAD_GATEWAY,
+                {"error": f"vcs {verb} failed", "code": "GIT_FAILED"},
+            )
+            return
+        except Exception as exc:
+            LOGGER.warning("vcs %s error: %s", verb, type(exc).__name__)
+            self._json(
+                HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "vcs request failed"}
+            )
+            return
+        self._json(HTTPStatus.OK, result)
 
     def _read_json_body(self, max_bytes: int | None = None) -> dict[str, Any]:
         content_length = int(self.headers.get("Content-Length", "0"))
@@ -3786,6 +4225,7 @@ def serve(args: argparse.Namespace) -> None:
     executor.bootstrap(os.getenv("CREDENTIAL_PROXY_BOOTSTRAP_COMMAND", ""))
     CredentialProxyHandler.executor = executor
     CredentialProxyHandler.workspaces = build_workspace_store(executor)
+    CredentialProxyHandler.vcs = build_vcs_broker(executor)
     CredentialProxyHandler.max_request_bytes = args.max_request_bytes
     CredentialProxyHandler.enforce_read_only = read_only_enforced()
     LOGGER.info("read-only enforcement enabled=%s", CredentialProxyHandler.enforce_read_only)

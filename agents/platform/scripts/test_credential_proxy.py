@@ -23,6 +23,8 @@ from unittest import mock
 
 import credential_proxy
 import gke_endpoint
+import providers
+import vcs_broker
 from credential_proxy import (
     MAX_REPOSITORY_LENGTH,
     AgentAPIProxyHandler,
@@ -2019,31 +2021,44 @@ class RepositoryValidationTest(unittest.TestCase):
         self.assertFalse(is_valid_repository("-" * (MAX_REPOSITORY_LENGTH + 1)))
 
 
-class GitHubRefreshHandlerTest(unittest.TestCase):
-    """A failed refresh splits its diagnosis: detail to the log, none to the reply.
+class ForgeRefreshExecutorTest(unittest.TestCase):
+    """A failed refresh splits its diagnosis: detail to the log, none to the caller.
 
     The reply crosses back into the agent sandbox and the caller renders the
     resulting reason code into a chat room, so it stays output-free. The
     helper's stderr carries the broker's actual refusal and is the only thing
     an operator has to read, so it has to reach the sidecar's own log.
+
+    The split lives on the executor rather than on the route because the route
+    is not the only caller: a forge's credential strategy asks for the same
+    operation in-process, and a diagnosis only the HTTP path logged would be
+    absent for exactly the clone that failed.
     """
 
-    def _refresh(self, result):
-        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
-        handler.max_request_bytes = 10 * 1024 * 1024
-        body = json.dumps({"repository": "gke-agentic/adamparco-infra"}).encode()
-        handler.headers = {"Content-Length": str(len(body))}
-        handler.rfile = io.BytesIO(body)
-        handler.executor = types.SimpleNamespace(execute_internal=lambda argv: result)
-        replies = []
-        handler._json = lambda status, payload: replies.append((status, payload))
-        # The managed-repository gate runs before the refresh does, and reading
-        # the list needs the gitops-state ConfigMap. Answering it here keeps
-        # these tests about what a failed refresh logs.
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        helpers = Path(self.temp_dir.name)
+        (helpers / "github_token_refresh.py").write_text("#!/usr/bin/env python3\n")
+        patch = mock.patch.object(
+            credential_proxy, "FORGE_REFRESH_HELPER_DIR", str(helpers)
+        )
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def _refresh(self, result, provider="github"):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        executor.execute_internal = lambda argv: result
+        # Reading the managed list needs the gitops-state ConfigMap. Answering
+        # it here keeps these tests about what a failed refresh logs; the gate
+        # itself is tested below.
         with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
             with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
-                handler._handle_github_refresh()
-        return replies, logs.output
+                with self.assertRaises(RuntimeError) as raised:
+                    executor.refresh_forge_credential(provider, "gke-agentic/infra")
+        return str(raised.exception), logs.output
 
     @staticmethod
     def _failure(stderr):
@@ -2056,16 +2071,12 @@ class GitHubRefreshHandlerTest(unittest.TestCase):
             timed_out=False,
         )
 
-    def test_logs_broker_refusal_but_keeps_it_out_of_the_reply(self):
+    def test_logs_broker_refusal_but_keeps_it_out_of_what_it_raises(self):
         refusal = "Minty returned error (HTTP 403): installation not found"
-        replies, logs = self._refresh(self._failure(refusal + "\n"))
+        message, logs = self._refresh(self._failure(refusal + "\n"))
 
         self.assertIn(refusal, "\n".join(logs))
-        self.assertEqual(
-            replies,
-            [(HTTPStatus.BAD_GATEWAY, {"error": "GitHub credential refresh failed"})],
-        )
-        self.assertNotIn(refusal, json.dumps(replies[0][1]))
+        self.assertEqual(message, "credential refresh failed")
 
     def test_truncates_oversized_stderr(self):
         # `_execute` bounds output at CREDENTIAL_PROXY_MAX_OUTPUT_BYTES, 4 MiB by
@@ -2073,13 +2084,13 @@ class GitHubRefreshHandlerTest(unittest.TestCase):
         # cron tick.
         _, logs = self._refresh(self._failure("x" * 5000))
 
-        detail = logs[0].split("GitHub credential refresh exited 1: ", 1)[1]
+        detail = logs[0].split("github credential refresh exited 1: ", 1)[1]
         self.assertEqual(detail, "x" * 1000)
 
     def test_omits_the_detail_when_stderr_is_empty(self):
         _, logs = self._refresh(self._failure("   \n"))
 
-        self.assertTrue(logs[0].endswith("GitHub credential refresh exited 1"))
+        self.assertTrue(logs[0].endswith("github credential refresh exited 1"))
 
     def test_redacts_token_shapes_out_of_the_detail(self):
         token = "ghs_" + "A" * 36
@@ -2096,6 +2107,102 @@ class GitHubRefreshHandlerTest(unittest.TestCase):
 
         self.assertNotIn("ghs_", logs[0])
         self.assertNotIn("B" * 20, logs[0])
+
+    def test_an_unmanaged_repository_never_reaches_the_helper(self):
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        calls = []
+        executor.execute_internal = lambda argv: calls.append(argv)
+        with mock.patch.object(
+            credential_proxy, "repository_is_managed", return_value=False
+        ):
+            with self.assertRaises(PermissionError):
+                executor.refresh_forge_credential("github", "someone-else/infra")
+        self.assertEqual(calls, [])
+
+    def test_a_provider_name_cannot_reach_out_of_the_helper_directory(self):
+        # The provider comes from a forge class today rather than from a
+        # request. The grammar is what keeps that true if a route ever passes
+        # one through.
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        executor.execute_internal = lambda argv: self.fail("helper was run")
+        for provider in ("../../bin/sh", "git hub", "", "GitHub", "a" * 40):
+            with self.subTest(provider=provider):
+                with self.assertRaises(ValueError):
+                    executor.refresh_forge_credential(provider, "gke-agentic/infra")
+
+    def test_an_absent_helper_is_a_refusal_not_a_no_op(self):
+        # A strategy told its credential was made current, when it was not, is
+        # a 401 later from inside a clone that reads like a missing repository.
+        executor = credential_proxy.CommandExecutor.__new__(
+            credential_proxy.CommandExecutor
+        )
+        executor.execute_internal = lambda argv: self.fail("helper was run")
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            with self.assertRaises(RuntimeError) as raised:
+                executor.refresh_forge_credential("gitlab", "gke-agentic/infra")
+        self.assertIn("gitlab", str(raised.exception))
+
+
+class ForgeRefreshRouteTest(unittest.TestCase):
+    """What `POST /v1/forge/refresh` answers, and what it declines to say."""
+
+    def _post(self, body, **executor):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.max_request_bytes = 10 * 1024 * 1024
+        encoded = json.dumps(body).encode()
+        handler.headers = {"Content-Length": str(len(encoded))}
+        handler.rfile = io.BytesIO(encoded)
+        handler.executor = types.SimpleNamespace(**executor)
+        replies = []
+        handler._json = lambda status, payload: replies.append((status, payload))
+        handler.log_message = lambda *args: None
+        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
+            handler._handle_forge_refresh()
+        return replies
+
+    def test_a_refreshed_credential_names_the_forge_that_holds_it(self):
+        calls = []
+        replies = self._post(
+            {"repository": "gke-agentic/infra"},
+            refresh_forge_credential=lambda provider, repository: calls.append(
+                (provider, repository)
+            ),
+        )
+
+        self.assertEqual(calls, [("github", "gke-agentic/infra")])
+        self.assertEqual(
+            replies, [(HTTPStatus.OK, {"status": "refreshed", "forge": "github"})]
+        )
+
+    def test_a_failure_answers_a_reason_code_and_no_detail(self):
+        refusal = "Minty returned error (HTTP 403): installation not found"
+
+        def fail(provider, repository):
+            raise RuntimeError(refusal)
+
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            replies = self._post(
+                {"repository": "gke-agentic/infra"}, refresh_forge_credential=fail
+            )
+
+        status, payload = replies[0]
+        self.assertEqual(status, HTTPStatus.BAD_GATEWAY)
+        self.assertEqual(payload["code"], "FORGE_TOKEN_REFRESH_FAILED")
+        self.assertNotIn(refusal, json.dumps(payload))
+
+    def test_a_host_this_install_serves_no_credential_for_is_refused(self):
+        replies = self._post(
+            {"repository": "https://git.example.invalid/acme/infra"},
+            refresh_forge_credential=lambda provider, repository: self.fail(
+                "refreshed a credential for an unknown host"
+            ),
+        )
+
+        self.assertNotEqual(replies[0][0], HTTPStatus.OK)
 
 
 class RedactCredentialsTest(unittest.TestCase):
@@ -3261,6 +3368,464 @@ class WorkspaceGitPathTest(unittest.TestCase):
         )
 
 
+class VcsGitPathTest(unittest.TestCase):
+    """The version-control broker's git is a third door, not a wider second.
+
+    `execute_workspace_git` and `execute_vcs_git` are deliberately separate
+    methods with separate roots and separate subcommand lists. Sharing one
+    would grant each path the other's subcommands for no reason beyond the
+    convenience of a single method, so each test here checks that a subcommand
+    one path needs is still refused on the other.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+
+    def executor(self, **environment):
+        environment.setdefault("CREDENTIAL_PROXY_CONTENT_WORKSPACE", "1")
+        with mock.patch.dict(os.environ, environment):
+            return CommandExecutor(
+                timeout_seconds=10,
+                max_output_bytes=1 << 16,
+                state_dir=str(Path(self.temp_dir.name) / "state"),
+            )
+
+    def tree(self, executor, name="scratch"):
+        path = executor.vcs_root / name
+        path.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "init", "--quiet"], cwd=path, check=True, capture_output=True
+        )
+        return path
+
+    def test_the_scratch_root_is_not_inside_the_volume_the_agent_writes(self):
+        executor = self.executor()
+        self.assertFalse(
+            credential_proxy._within(executor.workspace_dir, executor.vcs_root),
+            "the agent's volume must not contain the broker's scratch trees",
+        )
+        self.assertFalse(
+            credential_proxy._within(executor.vcs_root, executor.workspace_dir)
+        )
+        # And it is disjoint from the *other* broker root too, so a bundle
+        # written by one path cannot be read as a workspace by the other.
+        self.assertNotEqual(executor.vcs_root, executor.content_workspace_root)
+        self.assertTrue(executor.vcs_root.is_dir())
+
+    def test_the_two_broker_doors_do_not_share_a_subcommand_list(self):
+        executor = self.executor()
+        scratch = self.tree(executor)
+        # `bundle` is the version-control path's and not the workspace path's:
+        # accepted here (git's own "refusing to create empty bundle" is an
+        # answer, not a refusal by the executor)...
+        executor.execute_vcs_git(
+            ["git", "bundle", "create", str(scratch / "out.bundle"), "--all"],
+            scratch,
+            check=False,
+        )
+        # ...and unavailable on the door that never needed it.
+        with self.assertRaises(ValueError):
+            executor.execute_workspace_git(
+                ["git", "bundle", "list-heads", "x.bundle"], scratch
+            )
+        # And neither door accepts what neither issues.
+        for argv in (
+            ["git", "config", "--get", "user.name"],
+            ["git", "submodule", "foreach", "id"],
+            ["git", "filter-branch", "--tree-filter", "id"],
+            ["git", "bisect", "run", "/bin/sh"],
+        ):
+            with self.subTest(argv=argv):
+                with self.assertRaises(ValueError):
+                    executor.execute_vcs_git(argv, scratch)
+
+        # Paired ordinary use: what the broker does issue answers git's answer.
+        result = executor.execute_vcs_git(
+            ["git", "rev-parse", "--is-inside-work-tree"], scratch
+        )
+        self.assertEqual("true", result.stdout.strip())
+
+    def test_only_git_runs_on_this_door(self):
+        executor = self.executor()
+        scratch = self.tree(executor)
+        for argv in (["gcloud", "auth", "print-access-token"], ["sh", "-c", "id"], []):
+            with self.subTest(argv=argv):
+                with self.assertRaises(ValueError):
+                    executor.execute_vcs_git(argv, scratch)
+
+    def test_a_working_directory_redirect_is_refused(self):
+        executor = self.executor()
+        scratch = self.tree(executor)
+        with self.assertRaises(ValueError):
+            executor.execute_vcs_git(
+                ["git", "-C", "/etc", "rev-parse", "--show-toplevel"], scratch
+            )
+        result = executor.execute_vcs_git(
+            ["git", "rev-parse", "--show-toplevel"], scratch
+        )
+        self.assertEqual(str(scratch.resolve()), result.stdout.strip())
+
+    def test_it_cannot_run_outside_its_own_root(self):
+        executor = self.executor()
+        for cwd in (
+            executor.workspace_dir,
+            executor.content_workspace_root,
+            Path("/etc"),
+            executor.state_dir,
+        ):
+            with self.subTest(cwd=cwd):
+                with self.assertRaises(ValueError):
+                    executor.execute_vcs_git(["git", "rev-parse", "HEAD"], cwd)
+
+    def test_a_failure_raises_the_error_the_broker_catches(self):
+        # The broker's plumbing reads as ordinary `subprocess.run`, so a
+        # non-zero exit has to arrive as `CalledProcessError` and not as an
+        # exit code someone forgets to check.
+        executor = self.executor()
+        scratch = self.tree(executor)
+        with self.assertRaises(subprocess.CalledProcessError):
+            executor.execute_vcs_git(["git", "rev-parse", "--verify", "nope"], scratch)
+        unchecked = executor.execute_vcs_git(
+            ["git", "rev-parse", "--verify", "nope"], scratch, check=False
+        )
+        self.assertNotEqual(0, unchecked.returncode)
+
+    def test_a_forge_cannot_use_config_to_undo_a_forced_pin(self):
+        """`config` is the credential's, and it is applied *before* the pins.
+
+        A credential asks for whatever presenting itself to git takes. If that
+        layer were applied last, a forge could name `core.hooksPath` and turn
+        off the containment the executor exists to impose.
+        """
+        executor = self.executor()
+        scratch = self.tree(executor)
+        # Asked of git itself rather than of the environment the executor
+        # composed: what matters is which value the child resolved, and the
+        # last-wins ordering is an implementation detail of getting there.
+        resolved = executor.execute_vcs_git(
+            ["git", "rev-parse", "--git-path", "hooks"],
+            scratch,
+            config=(("core.hooksPath", "/tmp/attacker"),),
+        )
+        self.assertEqual(str(executor.git_hooks_dir), resolved.stdout.strip())
+
+    def test_the_credentials_config_reaches_the_child(self):
+        # Paired with the test above: the layer is not simply ignored.
+        executor = self.executor()
+        scratch = self.tree(executor)
+        result = executor.execute_vcs_git(
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            scratch,
+            config=(("credential.helper", "!true"),),
+        )
+        self.assertEqual(0, result.returncode)
+
+
+class ForgeCliPathTest(unittest.TestCase):
+    """A forge's CLI runs where it can infer nothing."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.executor = CommandExecutor(
+            timeout_seconds=10,
+            max_output_bytes=1 << 16,
+            state_dir=str(Path(self.temp_dir.name) / "state"),
+        )
+
+    def test_it_runs_from_a_directory_that_holds_no_repository(self):
+        """The cwd is the scratch root, never one of the clones under it.
+
+        A forge CLI shells out to git and infers a repository from whatever
+        `.git/config` it finds above the cwd. Inside a clone, a config that
+        arrived in a caller's bundle would decide what the credentialed process
+        talks to.
+        """
+        clone = self.executor.vcs_root / "clone"
+        clone.mkdir(parents=True)
+        subprocess.run(
+            ["git", "init", "--quiet"], cwd=clone, check=True, capture_output=True
+        )
+        seen = {}
+
+        def record(argv, **kwargs):
+            seen.update(kwargs)
+            seen["argv"] = argv
+            return credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="{}",
+                stderr="",
+                duration_ms=1,
+                truncated=False,
+                timed_out=False,
+            )
+
+        self.executor.executables["fake-forge-cli"] = "/usr/bin/true"
+        with mock.patch.object(self.executor, "_execute", record):
+            self.executor.execute_forge_cli(["fake-forge-cli", "api", "repos/a/b"])
+
+        self.assertEqual(str(self.executor.vcs_root), seen["cwd"])
+        self.assertEqual(self.executor.vcs_root, seen["containment_root"])
+        self.assertFalse(Path(seen["cwd"], ".git").exists())
+
+    def test_the_request_body_travels_on_stdin_and_not_in_argv(self):
+        # What a caller wrote must not be visible in `ps`, nor reappear in a
+        # `CalledProcessError` that some layer above logs.
+        prose = "please review; here is the token-shaped string ghs_" + "z" * 36
+        seen = {}
+
+        def record(argv, **kwargs):
+            seen.update(kwargs)
+            seen["argv"] = argv
+            return credential_proxy.ExecutionResult(
+                exit_code=0,
+                stdout="{}",
+                stderr="",
+                duration_ms=1,
+                truncated=False,
+                timed_out=False,
+            )
+
+        self.executor.executables["fake-forge-cli"] = "/usr/bin/true"
+        with mock.patch.object(self.executor, "_execute", record):
+            self.executor.execute_forge_cli(
+                ["fake-forge-cli", "api", "repos/a/b/issues"], stdin=prose
+            )
+
+        self.assertEqual(prose, seen["stdin"])
+        self.assertNotIn(prose, " ".join(seen["argv"]))
+
+    def test_an_unavailable_cli_is_a_refusal_naming_what_is_missing(self):
+        with self.assertRaises(RuntimeError) as raised:
+            self.executor.execute_forge_cli(["not-installed-anywhere", "api"])
+        self.assertIn("not-installed-anywhere", str(raised.exception))
+        with self.assertRaises(ValueError):
+            self.executor.execute_forge_cli([])
+
+
+class VcsRouteTest(unittest.TestCase):
+    """`/v1/vcs/*`: what the surface answers, and what it never says."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.executor = CommandExecutor(
+            timeout_seconds=10,
+            max_output_bytes=1 << 16,
+            state_dir=str(Path(self.temp_dir.name) / "state"),
+        )
+
+    def _handler(self, path, body, vcs):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.vcs = vcs
+        handler.max_request_bytes = 1 << 20
+        encoded = json.dumps(body).encode()
+        handler.headers = {"Content-Length": str(len(encoded))}
+        handler.rfile = io.BytesIO(encoded)
+        handler.path = path
+        replies = []
+        handler._json = lambda status, payload: replies.append((status, payload))
+        handler._handle_vcs_post()
+        return replies[0]
+
+    def broker(self, **kwargs):
+        kwargs.setdefault("git_runner", lambda *a, **k: self.fail("git ran"))
+        kwargs.setdefault("refresh", lambda provider, repository: None)
+        return vcs_broker.VcsBroker(self.executor.vcs_root, **kwargs)
+
+    def test_the_routes_are_absent_rather_than_refusing_when_unbuilt(self):
+        # Absent, not present-and-erroring: a bug in a refusal cannot reach a
+        # route that does not exist.
+        status, payload = self._handler("/v1/vcs/capabilities", {}, None)
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+        self.assertEqual("VCS_UNAVAILABLE", payload["code"])
+
+    def test_an_unknown_verb_is_a_404_and_not_a_fall_through(self):
+        status, _ = self._handler("/v1/vcs/rm-rf", {}, self.broker())
+        self.assertEqual(HTTPStatus.NOT_FOUND, status)
+
+    def test_punctuation_does_not_decide_whether_a_verb_exists(self):
+        # `proposal_create` and `proposal-create` reach the same route. A
+        # caller that guessed wrong should not read a 404 as "unsupported".
+        for spelling in ("proposal-create", "proposal_create"):
+            with self.subTest(spelling=spelling):
+                status, _ = self._handler(f"/v1/vcs/{spelling}", {}, self.broker())
+                self.assertNotEqual(HTTPStatus.NOT_FOUND, status)
+
+    def test_a_forge_refusal_keeps_its_own_status_and_code(self):
+        # 501 and not a generic 500: "this install does not serve that" is a
+        # different thing for a caller to do about than "the broker broke".
+        status, payload = self._handler(
+            "/v1/vcs/proposal-create",
+            {"repository": "https://git.example.invalid/acme/infra"},
+            self.broker(),
+        )
+        self.assertEqual(HTTPStatus.NOT_IMPLEMENTED, status)
+        self.assertEqual("FORGE_UNSUPPORTED", payload.get("code"))
+
+    def test_a_write_verb_refuses_a_repository_this_install_does_not_manage(self):
+        # The control this route did not have. Nothing downstream asks the
+        # question -- a forge is handed a repository and spends the token on it
+        # -- so `POST /v1/vcs/publish` for an unregistered repository would have
+        # pushed with the installation token. The only check that existed lived
+        # inside the credential refresh, which caught the refusal and logged it.
+        with mock.patch.object(
+            credential_proxy, "managed_repositories",
+            return_value=frozenset({"acme/managed"}),
+        ):
+            status, payload = self._handler(
+                "/v1/vcs/publish",
+                {"repository": "https://github.com/acme/not-ours"},
+                self.broker(),
+            )
+        self.assertEqual(HTTPStatus.FORBIDDEN, status)
+        self.assertEqual("REPOSITORY_NOT_MANAGED", payload.get("code"))
+
+    def test_a_read_verb_is_not_gated_on_the_managed_list(self):
+        # Deliberately, and for the reason `require_managed_workspace` gives
+        # about the content workspace's `open`: reading a repository this
+        # install does not write to is something the agent is supposed to be
+        # able to do. What this asserts is that the gate above did not
+        # accidentally cover the read half.
+        with mock.patch.object(
+            credential_proxy, "managed_repositories",
+            return_value=frozenset({"acme/managed"}),
+        ):
+            status, payload = self._handler(
+                "/v1/vcs/capabilities",
+                {"repository": "https://github.com/acme/not-ours"},
+                self.broker(),
+            )
+        self.assertNotEqual(HTTPStatus.FORBIDDEN, status)
+        self.assertNotEqual("REPOSITORY_NOT_MANAGED", payload.get("code"))
+
+    def test_every_write_verb_is_covered_by_the_gate(self):
+        # Named against the route table rather than a hand-written list, so a
+        # verb added to the broker and not classified fails here instead of
+        # shipping ungated. `capabilities` and `clone` are reads; the rest of
+        # the split is asserted by name.
+        routes = set(vcs_broker.route_table(self.broker()))
+        self.assertTrue(vcs_broker.WRITE_VERBS <= routes)
+        unclassified = routes - vcs_broker.WRITE_VERBS
+        self.assertEqual(
+            {"capabilities", "clone", "proposal-list", "proposal-view",
+             "issue-list", "issue-view"},
+            unclassified,
+            "a new verb must be classified as a read or a write",
+        )
+
+    def test_a_forge_refusal_is_redacted_before_it_crosses_back(self):
+        # The forge's own words are what the caller needs, and they are also a
+        # string this process did not write. The sandbox is the side that must
+        # not learn a credential, so anything token-shaped comes out first.
+        leaked = "remote: denied for ghp_" + "A" * 36
+        broker = self.broker()
+
+        def refuse(payload):
+            raise providers.WorkspaceError(
+                leaked, status=403, code="FORGE_FORBIDDEN", detail=leaked
+            )
+
+        broker.publish = refuse
+        with mock.patch.object(
+            credential_proxy, "managed_repositories",
+            return_value=frozenset({"acme/infra"}),
+        ):
+            status, payload = self._handler(
+                "/v1/vcs/publish",
+                {"repository": "https://github.com/acme/infra"},
+                broker,
+            )
+        self.assertEqual(HTTPStatus.FORBIDDEN, status)
+        self.assertNotIn("ghp_", json.dumps(payload))
+        self.assertIn("[REDACTED]", json.dumps(payload))
+
+    def test_capabilities_answers_rather_than_refusing(self):
+        """The one verb that must not raise: it is how a caller finds out.
+
+        A client asks `capabilities` precisely because it does not know what
+        this install serves. Answering 501 to the question "what do you serve?"
+        gives it nothing to branch on, so the gap is named in the body of a 200.
+        """
+        status, payload = self._handler(
+            "/v1/vcs/capabilities",
+            {"repository": "https://git.example.invalid/acme/infra"},
+            self.broker(),
+        )
+        self.assertEqual(HTTPStatus.OK, status)
+        self.assertEqual([], payload["verbs"])
+        self.assertTrue(payload["missing"])
+
+    def test_gits_stderr_never_reaches_the_caller(self):
+        """git's stderr can carry a remote URL with a credential in it."""
+        secret = "https://x-access-token:ghs_" + "q" * 36 + "@example.test/a/b"
+
+        def explode(*args, **kwargs):
+            raise subprocess.CalledProcessError(128, ["git", "clone"], "", secret)
+
+        broker = self.broker(git_runner=explode)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            status, payload = self._handler(
+                "/v1/vcs/clone", {"repository": "acme/infra"}, broker
+            )
+
+        self.assertEqual(HTTPStatus.BAD_GATEWAY, status)
+        self.assertEqual("GIT_FAILED", payload["code"])
+        self.assertNotIn("ghs_", json.dumps(payload))
+        # And what did reach the log is redacted, because that log is shipped.
+        self.assertNotIn("ghs_" + "q" * 36, "\n".join(logs.output))
+
+    def test_an_unexpected_error_says_nothing_about_itself(self):
+        def explode(*args, **kwargs):
+            raise ZeroDivisionError("/etc/broker/private-key.pem line 3")
+
+        broker = self.broker(git_runner=explode)
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            status, payload = self._handler(
+                "/v1/vcs/clone", {"repository": "acme/infra"}, broker
+            )
+
+        self.assertEqual(HTTPStatus.INTERNAL_SERVER_ERROR, status)
+        self.assertNotIn("private-key", json.dumps(payload))
+
+    def test_a_bundle_is_allowed_past_the_ordinary_request_ceiling(self):
+        """`publish` carries a pack, which is larger than a JSON request.
+
+        The broker has its own bundle ceiling and refuses with a named code
+        above it. If the generic request limit bit first the caller would get
+        an unexplained 400 instead.
+        """
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.vcs = self.broker()
+        handler.max_request_bytes = 1024
+        oversized = json.dumps(
+            {"repository": "acme/infra", "bundle": "A" * 4096}
+        ).encode()
+        handler.headers = {"Content-Length": str(len(oversized))}
+        handler.rfile = io.BytesIO(oversized)
+        handler.path = "/v1/vcs/publish"
+        replies = []
+        handler._json = lambda status, payload: replies.append((status, payload))
+        handler._handle_vcs_post()
+
+        self.assertNotEqual(
+            "request exceeds configured size limit", replies[0][1].get("error")
+        )
+
+    def test_the_broker_is_built_unconditionally(self):
+        """There is no off switch, and the roots are proven disjoint at boot."""
+        broker = credential_proxy.build_vcs_broker(self.executor)
+        self.assertIsNotNone(broker)
+        self.assertTrue(broker.registry.forges)
+
+        overlapping = CommandExecutor.__new__(CommandExecutor)
+        overlapping.vcs_root = self.executor.workspace_dir / "vcs"
+        overlapping.workspace_dir = self.executor.workspace_dir
+        with self.assertRaises(RuntimeError):
+            credential_proxy.build_vcs_broker(overlapping)
+
+
 class WorkspaceRouteTest(unittest.TestCase):
     """Two claims about the routes that a behavioural test cannot make.
 
@@ -3298,7 +3863,15 @@ class WorkspaceRouteTest(unittest.TestCase):
         ]
         self.assertEqual(
             callers,
-            ["containment_root=self.content_workspace_root,"],
+            [
+                "containment_root=self.content_workspace_root,",
+                # `execute_vcs_git` and `execute_forge_cli`. Both roots are the
+                # broker's own scratch tree, which `assert_disjoint_roots`
+                # proves at construction is somewhere the agent cannot name --
+                # the same argument that admits the content workspace.
+                "containment_root=self.vcs_root,",
+                "containment_root=self.vcs_root,",
+            ],
             f"unexpected containment_root callers: {callers}",
         )
 
