@@ -1,7 +1,7 @@
 name: Eval Dashboard Refresh (on demand)
 
 # Manually refresh the live eval dashboard at
-# https://storage.googleapis.com/kube-agents-dashboards/evals/index.html
+# https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html (Google login; internal-only)
 # without waiting for the Prow periodic: Actions tab -> this workflow ->
 # "Run workflow". Runs the same pipeline the periodic runs
 # (hack/ci-dashboard-refresh.sh: incremental collect -> render -> publish).

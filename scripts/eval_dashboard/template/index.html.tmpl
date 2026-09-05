@@ -165,6 +165,8 @@
     color:var(--surface-1); font-size:12px; font-weight:600; padding:4px 9px; border-radius:7px;
     opacity:0; transition:opacity .08s; z-index:9; white-space:nowrap; }
   .foot { margin-top:44px; font-size:12.5px; color:var(--text-muted); max-width:90ch; }
+.refresh-link{color:inherit;text-decoration:none;opacity:.8}
+.refresh-link:hover{text-decoration:underline;opacity:1}
 </style>
 </head>
 <body class="viz-root" data-palette="#8b5cf6">
@@ -176,7 +178,7 @@
     <a class="on" href="#agent">The agent</a><a href="#gate">The gate</a>
     <a href="#nightly">Evidence</a><a href="#release">Releases</a>
   </nav>
-  <span class="meta"><span id="headmeta">__META__</span> · <span id="freshness" class="fresh">__FRESHNESS__</span></span>
+  <span class="meta"><span id="headmeta">__META__</span> · <span id="freshness" class="fresh">__FRESHNESS__</span> · <a class="refresh-link" href="https://github.com/gke-labs/kube-agents/actions/workflows/eval-dashboard-refresh.yml" target="_blank" rel="noopener" title="Runs the on-demand refresh workflow (repo access required); data lands here in ~2-5 min">↻ refresh data</a></span>
 </div></div>
 
 <div class="wrap"><div id="app">__APP__</div></div>
