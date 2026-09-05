@@ -37,6 +37,15 @@ load-bearing rather than decorative: the Deployment and StatefulSet selectors, t
 that lets only the API reach port 5432, and the `PodMonitoring` that must scrape the API and not the
 database are all built from them. Do not add `component` anywhere else on the strength of this.
 
+One more source exists in the tree but is dark by default: the a2a chatops gateway
+(`a2a/gateway/spawn.go`) stamps `app.kubernetes.io/component: a2a-session` and
+`app.kubernetes.io/part-of: a2a-next` on the session pods it spawns — and it spawns none until
+`A2A_SPAWN_SESSIONS` is set, which nothing renders yet. The values are load-bearing the same way
+Hindsight's are: the gateway's session cap counts pods and its sweeper lists them by exactly this
+pair. `part-of` is deliberately not `kube-agents`: a session pod is spawned per conversation at
+runtime rather than installed, so it stays out of the footprint query above and is reaped by its
+ownerReference to the gateway Deployment, not by uninstall.
+
 `version` is set only by the Helm chart, which fills it from `Chart.AppVersion` — a chart release
 is pinned to exactly one application release, so there is a correct value to write. See
 [Release versioning](/kube-agents/deploy/release-versioning/). No other path sets it. The

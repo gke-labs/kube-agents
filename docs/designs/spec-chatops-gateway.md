@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** draft for review
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord and Slack adapters) - session spawning is dark behind `A2A_SPAWN_SESSIONS`, and the operator renders neither the gateway Deployment nor its env yet
 
 ## Purpose
 
@@ -51,8 +51,9 @@ pod at a time.** Concretely:
   `Create`, compare-and-swap semantics), so that two replicas or a rehydrate racing
   first contact cannot fork a conversation - the loser reads and adopts the winner's
   value. The stage 1 gateway runs a single replica and serializes per conversation
-  in-process, which narrows the race without closing it (a plain `Put` persists the
-  record today); the `Create` is owed before a second replica is.
+  in-process, and minting is the KV `Create` this rule requires - the loser of a mint
+  race re-reads and adopts the winner's record before the contextId reaches any
+  envelope.
 - The pod is an incarnation, not the identity. Reaping and respawning changes the pod
   and the bus session name; `contextId` persists across every incarnation.
 - In a group thread, everyone in the room shares the one session. Attribution is per
@@ -323,7 +324,10 @@ rewritten on upgrade - rotating it re-anonymises every user and breaks correlati
 with their own history - and it is what the shipped attribution path already hashes
 with. Using it is what makes the "same posture" claim above true rather than
 approximate: one human hashes to one value in session metadata and in
-`authority.requester.principal`, so the cross-surface audit join resolves. A second
+`authority.requester.principal`, so the cross-surface audit join resolves. One
+presentation caveat rides that sentence: session metadata stores the full 64-hex
+digest while the gateway publishes `hmac:` plus the first 32 hex characters, so the
+join key is the digest - a prefix match, not string equality. A second
 salt would not merely be redundant, it would silently yield nothing on exactly the
 join this rule exists to preserve. The requirement that follows: one value per
 install, read by every gateway replica from that Secret. Deriving a salt from
@@ -429,24 +433,94 @@ principal.
 
 Google Chat stays the supported production ingress, for the trust-domain reason above -
 it is the first real adapter, built during stage 2 once the interface is proven against
-Discord. Slack follows when a customer asks, with the mapping table as a hard
-prerequisite.
+Discord. ~~Slack follows when a customer asks, with the mapping table as a hard
+prerequisite.~~ **Update 9/4:** Slack lands ahead of gchat - resequenced against this
+doc's stated order, with the mapping table built as part of the card rather than as a
+later chore. The section below is that adapter's design of record.
 
 The adapter interface is what makes the pick cheap: inbound message with verified sender,
 conversation and thread identity, roster read, post-to-conversation, `openDirect`. Five
 operations, normalized. If the Discord adapter leaks Discord-isms through that interface,
 that's a bug in the interface, and better to learn it on the throwaway backend.
 
+## The Slack adapter (added 9/4)
+
+The second adapter behind the five-operation interface, and the first with a real
+identity join. Transport is Socket Mode - an outbound websocket, so no inbound endpoint
+on the cluster and no ingress to secure, the same property that made Discord cheap. The
+existing `SlackSpec` already carries the two Secret refs Socket Mode needs (bot token
+for the Web API, app token for the socket).
+
+**Conversation keys.** `slack:dm/{channel}` for DMs, `slack:{channel}/{thread_ts}` for
+threads. Slack threads are implicit - replying with a `thread_ts` creates one - so a
+channel mention binds the session to the mention message's own ts as thread root, with
+no thread-creation failure mode to handle. Session semantics are unchanged: the whole
+DM is one conversation, a channel is not a session, a thread in it is.
+
+**Which messages become turns.** DMs carry every message. A channel message must
+mention the bot, and the ask roots the session thread. A thread reply is a turn when it
+mentions the bot or the thread root did - that is what lets a session thread carry
+every message (the Discord parity) without making every thread in a joined channel a
+session. Two subtypes count as turns besides plain messages: `thread_broadcast` (a
+thread reply with "also send to channel" checked - dropping it would eat a steer
+silently) and `file_share` (an ask with an attachment). Everything else drops in the
+adapter: bots, our own posts, edits and other subtypes, socket redeliveries. Group DMs
+(mpim) are group spaces here, not DMs - they have threads, so the mention affordance
+applies; Discord's group DMs read as DMs, and the asymmetry is deliberate. The bot
+only sees channels it has been invited to, so the invitation is the trust boundary for
+group ingress.
+
+**The mapping table - where it lives and who writes it.** The join is Slack's immutable
+`user_id` against a table sourced from our own IdP; never `profile.email` (the identity
+section above says why). The table is a Kubernetes Secret, mounted read-only at the
+gateway's principal-map path, same file format the Discord ConfigMap uses.
+`a2a-slack-principal-map` is the name for the hand-made Secret today and the one the
+future `principalMapSecretRef` render binds - nothing in-tree creates it yet, like the
+rest of the gateway's env. A Secret rather than a ConfigMap because a
+write to this table grants a principal - it is an impersonation primitive, and it holds
+emails besides. Write access is the install admin's, through the install path. No
+product ServiceAccount (gateway, platform-agent, broker, session workers) gets write on
+it, so nothing an agent can be talked into doing edits its own identity table. When the
+W6 rendering series reaches the gateway, the operator renders the mount from a
+`principalMapSecretRef` on `spec.integration.slack`, which makes write authority "may
+write the PlatformAgent CR" and puts changes in the API server audit log. Generating
+the Secret's content from the IdP is a job we do not build yet; until it exists the
+table is maintained by hand, which is honest at the current install count.
+
+**Unmapped senders.** Dropped at ingress, as everywhere - but visibly now: the gateway
+posts a one-line notice to the conversation, once per sender per process, and keeps
+the structured log line. A silent drop of a real user is a support burden. Per sender,
+not per conversation - a channel mention mints a fresh conversation every time, so a
+conversation-scoped dedupe would be no bound at all. This is gateway behavior, not
+Slack behavior, so Discord gets it too.
+
+**Roster.** Channel membership via the members API, one page; past a page the roster
+reports incomplete rather than paging (the roster cap truncates far below it anyway).
+Slack has no per-thread membership, and anyone in the channel can read the thread, so
+channel membership is the honest answer to "who could have read this."
+
+**One backend per gateway process.** The relay binds one durable, and two gateways on
+one durable split event deliveries - so config refuses a Slack pair and a Discord token
+together. A second backend is a second Deployment with its own durable, when we want
+one.
+
+`verifiedBy` is `slack-socket-mode+principal-map`: Slack authenticated the sender over
+the socket and asserted the `user_id`, our table joined it to a principal. Rendering
+into mrkdwn is a narrow deterministic translation of the two forms the relay emits
+(bold, links); the legacy Hermes converter stays where it is. Everything posted is
+escaped first (`&`, `<`, `>`) - relayed text is executor-authored, ie model output,
+and an unescaped `<!channel>` in a result would ping the room.
+
 ## What stage 2 builds from this doc
 
-- The gateway: Discord adapter, session manager (spawn / stream / reap / rehydrate /
-  sweep), bus client, KV session registry.
+- The gateway: Discord adapter (Slack joined it 9/4, per the section above), session
+  manager (spawn / stream / reap / rehydrate / sweep), bus client, KV session registry.
 - The session pod shim: bus-to-stream-json bridge, event mapping.
 - The `authority` block, populated at ingress, advisory.
 - Roster tracking and the `openDirect` primitive.
 
-Not in stage 2: the classifier, the LCD permissions tool, the gchat and slack adapters,
-`grants`, and anything that makes `authority` decision-grade.
+Not in stage 2: the classifier, the LCD permissions tool, the gchat adapter (~~and
+slack~~ - landed 9/4), `grants`, and anything that makes `authority` decision-grade.
 
 ## Inherited from the kanban retirement (added 8/24)
 
