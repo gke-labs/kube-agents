@@ -5,6 +5,7 @@ import os
 import pathlib
 import subprocess
 import time
+import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
 import pytest
@@ -13,6 +14,7 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _PLUGIN_DIR = _REPO_ROOT / "agentplugins" / "gke-stockout-investigator"
 _SCENARIOS_DIR = _PLUGIN_DIR / "scenarios"
 _INSTALL_SCRIPT = _PLUGIN_DIR / "install.sh"
+_CLEAN_KANBAN_SCRIPT = _SCENARIOS_DIR / "lib" / "clean_stale_kanban_tasks.py"
 
 # AgentPlugin object name, Helm release, and Hermes plugin module — one identifier, fixed
 # as RELEASE in install.sh because the CRD's name pattern is ^[a-z][a-z0-9]*$.
@@ -85,6 +87,13 @@ _SKILL_MOUNT_TIMEOUT_SECONDS = 120
 # no kubectl exit code collides with it; callers that must not read a timeout as "absent"
 # either test for it or pass fail_on_timeout.
 _KUBECTL_TIMEOUT_RC = 124
+
+_AGENT_AVAILABILITY_TIMEOUT_SECONDS = 180
+_AGENT_POLL_INTERVAL_SECONDS = 5
+_DEFAULT_ROUTE_NAME = "gke_stockout_alerts"
+_SMOKE_VERIFY_TIMEOUT_SECONDS = 300
+# Headroom covers preflight checks (bounded by AGENT_AVAILABILITY_TIMEOUT=180 plus SKILL_MOUNT_TIMEOUT=30 = 210s max) and cleanup.
+_SCENARIO_RUN_HEADROOM_SECONDS = 300
 
 
 def _as_text(stream: Any) -> str:
@@ -436,6 +445,38 @@ def _agent_home(agent_ref: str, namespace: str) -> str:
     return home or "/opt/data"
 
 
+def _plugin_target_profile(namespace: str) -> str:
+    """Reads targetProfile from the AgentPlugin CR, or empty string if unset."""
+    res = _kubectl(
+        "get", "agentplugins", _PLUGIN_NAME, "-n", namespace,
+        "-o", "jsonpath={.spec.targetProfile}",
+    )
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
+def _plugin_skill_path(
+    agent_ref: str,
+    namespace: str,
+    target_profile: Optional[str] = None,
+) -> str:
+    """Returns the expected in-pod path to the plugin's SKILL.md.
+
+    A targeted profile is staged outside the PVC at /opt/agent-plugins/<profile>/<plugin>
+    and linked to <home>/profiles/<profile>/plugins/<plugin> by the entrypoint; the
+    default profile's plugins are mounted at <home>/plugins/<plugin> directly. The link
+    is what this probes, so the citation is the linker, not the mount:
+    deploy/shared/profile_plugins.py (and pluginMountPath in the operator for the mount).
+    """
+    if target_profile is None:
+        target_profile = _plugin_target_profile(namespace)
+    home = _agent_home(agent_ref, namespace)
+    if target_profile:
+        plugin_root = f"{home}/profiles/{target_profile}/plugins/{_PLUGIN_NAME}"
+    else:
+        plugin_root = f"{home}/plugins/{_PLUGIN_NAME}"
+    return f"{plugin_root}/skills/{_PLUGIN_SKILL_NAME}/SKILL.md"
+
+
 def _verify_skill_mounted(
     agent_ref: str,
     namespace: str,
@@ -455,17 +496,7 @@ def _verify_skill_mounted(
     Called after the rollout wait, so the pod it resolves is the one the tests below will
     use. Returns that pod, so the caller can record which one they inherit.
     """
-    home = _agent_home(agent_ref, namespace)
-    # A targeted profile is staged outside the PVC at /opt/agent-plugins/<profile>/<plugin>
-    # and linked to <home>/profiles/<profile>/plugins/<plugin> by the entrypoint; the
-    # default profile's plugins are mounted at <home>/plugins/<plugin> directly. The link
-    # is what this probes, so the citation is the linker, not the mount:
-    # deploy/shared/profile_plugins.py (and pluginMountPath in the operator for the mount).
-    if target_profile:
-        plugin_root = f"{home}/profiles/{target_profile}/plugins/{_PLUGIN_NAME}"
-    else:
-        plugin_root = f"{home}/plugins/{_PLUGIN_NAME}"
-    skill_path = f"{plugin_root}/skills/{_PLUGIN_SKILL_NAME}/SKILL.md"
+    skill_path = _plugin_skill_path(agent_ref, namespace, target_profile)
     # Both outcomes print a token and the command exits 0, so "the file is absent" and
     # "the exec did not run" stay distinguishable; only the first is conclusive.
     probe = f'test -f "{skill_path}" && echo PRESENT || echo ABSENT'
@@ -522,6 +553,88 @@ def _verify_skill_mounted(
         f"({bound}) of the gateway rolling out: {detail}.\n"
         f"The path that would have been probed is {skill_path}."
     )
+
+
+def _clean_stale_kanban_tasks(
+    pod: str,
+    namespace: str,
+    route_name: str,
+    fatal: bool = False,
+) -> int:
+    """Reclaims and archives any lingering kanban tasks for route_name so slots are open.
+
+    Uses the shared clean_stale_kanban_tasks.py script executed inside the platform-agent
+    container. When fatal is True, raises RuntimeError if cleanup encounters an error;
+    when fatal is False (default), logs a warning so transient board races do not fail tests.
+    """
+    if not _CLEAN_KANBAN_SCRIPT.is_file():
+        msg = f"Kanban cleanup script missing at {_CLEAN_KANBAN_SCRIPT}"
+        if fatal:
+            raise RuntimeError(msg)
+        warnings.warn(msg)
+        return 0
+
+    py_code = _CLEAN_KANBAN_SCRIPT.read_text()
+    res = _kubectl(
+        "exec", "-i=false", "-n", namespace, pod, "-c", "platform-agent", "--",
+        "python3", "-c", py_code, route_name,
+    )
+    if res.returncode != 0:
+        msg = f"Kanban cleanup failed on pod {pod}: {res.stderr or res.stdout}"
+        if fatal:
+            raise RuntimeError(msg)
+        warnings.warn(msg)
+        return 0
+    try:
+        return int(res.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return 0
+
+
+def _wait_for_agent_available(
+    agent_ref: str,
+    namespace: str,
+    timeout: int = _AGENT_AVAILABILITY_TIMEOUT_SECONDS,
+    clean_kanban: bool = True,
+    target_profile: Optional[str] = None,
+) -> str:
+    """Waits until the platform-agent gateway workload is rolled out, ready, and responsive."""
+    kind, workload_name = _gateway_workload(agent_ref, namespace)
+    if kind is None:
+        pytest.fail(
+            f"No Deployment or StatefulSet '{workload_name}' in namespace '{namespace}'; "
+            f"PlatformAgent '{agent_ref}' has no gateway workload."
+        )
+    target = f"{kind}/{workload_name}"
+
+    res = _kubectl("rollout", "status", target, "-n", namespace, f"--timeout={timeout}s", timeout=timeout + 30)
+    if res.returncode != 0:
+        pytest.fail(f"Gateway {target} rollout not ready within {timeout}s: {res.stderr}")
+
+    # Recompute the deadline so pod readiness and skill mount have their own dedicated budget,
+    # rather than sharing a deadline that a slow rollout could exhaust before the probe loop starts.
+    deadline = time.time() + timeout
+    skill_path = _plugin_skill_path(agent_ref, namespace, target_profile)
+    probe = f'test -f "{skill_path}" && echo PRESENT || echo ABSENT'
+    ready_pod = None
+    while time.time() < deadline:
+        revision = _current_revision_selector(kind, workload_name, namespace)
+        pod, _ = _gateway_pod(agent_ref, namespace, revision)
+        if pod:
+            probe_res = _kubectl("exec", "-i=false", "-n", namespace, pod, "-c", "platform-agent", "--", "sh", "-c", probe)
+            if probe_res.returncode == 0 and "PRESENT" in probe_res.stdout:
+                ready_pod = pod
+                break
+        time.sleep(_AGENT_POLL_INTERVAL_SECONDS)
+
+    if not ready_pod:
+        pytest.fail(f"Platform Agent pod for {target} not available and ready within {timeout}s in {namespace}")
+
+    if clean_kanban:
+        route_name = os.environ.get("STOCKOUT_ROUTE", _DEFAULT_ROUTE_NAME)
+        _clean_stale_kanban_tasks(ready_pod, namespace, route_name)
+
+    return ready_pod
 
 
 # All 10 GKE Stockout Investigator diagnostic failure scenarios
@@ -714,6 +827,12 @@ def ensure_stockout_plugin_installed(
         workload_name,
         budget_deadline,
     )
+    # Pre-test cleanup: clear any stale kanban tasks from previous runs so concurrency slots
+    # (max_in_progress = 2) are not starved. Non-fatal so a board race or alert arrival during
+    # fixture setup does not error the entire test session.
+    _clean_stale_kanban_tasks(
+        pod, agent_namespace, os.environ.get("STOCKOUT_ROUTE", _DEFAULT_ROUTE_NAME), fatal=False
+    )
     print(f"stockout plugin verified in {pod}; the tests below run against it")
 
 
@@ -744,6 +863,9 @@ def test_stockout_ingress_alert_smoke(
     if res_plugin.returncode != 0:
         pytest.fail("gkestockoutinvestigator AgentPlugin is not active in cluster; ingress smoke test failed.")
 
+    agent_ref = os.environ.get("AGENT_REF") or _DEFAULT_AGENT_REF
+    ready_pod = _wait_for_agent_available(agent_ref, agent_namespace)
+
     env = {
         **os.environ,
         "TARGET_CLUSTER_NAME": gke_cluster_name,
@@ -755,7 +877,28 @@ def test_stockout_ingress_alert_smoke(
         "AGENT_NAMESPACE": agent_namespace,
     }
 
-    proc = subprocess.run([str(verify_script)], capture_output=True, text=True, env=env)
+    try:
+        proc = subprocess.run(
+            [str(verify_script)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=_SMOKE_VERIFY_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(
+            f"Stockout ingress alert verify.sh timed out after {_SMOKE_VERIFY_TIMEOUT_SECONDS}s:\n"
+            f"STDOUT:\n{_as_text(exc.stdout)}\nSTDERR:\n{_as_text(exc.stderr)}"
+        )
+    finally:
+        # Best-effort cleanup: archive tasks created by verify.sh so subsequent scenarios
+        # have open concurrency slots. Non-fatal so cleanup errors do not mask test assertions.
+        try:
+            _clean_stale_kanban_tasks(
+                ready_pod, agent_namespace, os.environ.get("STOCKOUT_ROUTE", _DEFAULT_ROUTE_NAME), fatal=False
+            )
+        except Exception:
+            pass
     assert proc.returncode == 0, (
         f"Stockout ingress alert verify.sh failed with exit code {proc.returncode}:\n"
         f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
@@ -806,6 +949,9 @@ def test_stockout_scenario(
     if not gcp_project_id or not gke_cluster_name:
         pytest.fail("GCP_PROJECT_ID and GKE_CLUSTER_NAME are required for stockout scenario.")
 
+    agent_ref = os.environ.get("AGENT_REF") or _DEFAULT_AGENT_REF
+    ready_pod = _wait_for_agent_available(agent_ref, agent_namespace)
+
     env = {
         **os.environ,
         "TARGET_CLUSTER_NAME": gke_cluster_name,
@@ -817,13 +963,30 @@ def test_stockout_scenario(
 
     # Watch timeout can be customized via STOCKOUT_WATCH_TIMEOUT (default 360 seconds)
     watch_timeout = os.environ.get("STOCKOUT_WATCH_TIMEOUT", "360")
+    scenario_timeout = int(watch_timeout) + _SCENARIO_RUN_HEADROOM_SECONDS
 
-    proc = subprocess.run(
-        [str(scenario_script), "--teardown", "--watch-timeout", watch_timeout],
-        capture_output=True,
-        text=True,
-        env=env,
-    )
+    try:
+        proc = subprocess.run(
+            [str(scenario_script), "--teardown", "--watch-timeout", watch_timeout],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=scenario_timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(
+            f"Stockout Scenario '{scenario_slug}' ({rule}) timed out after {scenario_timeout}s:\n"
+            f"STDOUT:\n{_as_text(exc.stdout)}\nSTDERR:\n{_as_text(exc.stderr)}"
+        )
+    finally:
+        # Best-effort cleanup: archive tasks created by the scenario script so subsequent
+        # scenarios have open concurrency slots. Non-fatal so cleanup errors do not mask test assertions.
+        try:
+            _clean_stale_kanban_tasks(
+                ready_pod, agent_namespace, os.environ.get("STOCKOUT_ROUTE", _DEFAULT_ROUTE_NAME), fatal=False
+            )
+        except Exception:
+            pass
     assert proc.returncode == 0, (
         f"Stockout Scenario '{scenario_slug}' ({rule} - {description}) failed with exit code {proc.returncode}:\n"
         f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"

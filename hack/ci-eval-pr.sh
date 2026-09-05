@@ -791,7 +791,10 @@ export JUDGE_PROVIDER="google"
 # them -- treat editing this line as that expensive.
 #
 # The judge and agent VALUES are still equal today, which partly measures the
-# judge grading itself. The split to a distinct judge model is blocked on one
+# judge grading itself. They no longer share a serving path: the agent's
+# traffic goes through LiteLLM to Vertex AI (hack/ci-deploy.sh, #1097), so
+# the judge is now this key's only eval-loop consumer. The split to a
+# distinct judge model is blocked on one
 # fact this repository cannot prove: that kube-agents-gemini-api-key serves a
 # second model. The tree says it should -- the chart's default for the same
 # GEMINI_API_KEY family is gemini-3.5-flash (charts/kube-agents/templates/
@@ -953,7 +956,7 @@ TASKS=(
   # this array calls a case that can only fail.
   # Uncomment when the agent can diagnose a capped pool, not before.
   # "./tasks/cluster-agent-pending-replicas-capped-pool/task.yaml"
-  "./tasks/gpu-stress-test-diagnosis/task.yaml"
+  # gpu-stress-test-diagnosis: moved to NIGHTLY_TASKS 2026-09-03 (tofu wall clock, #1218/#1202).
   "./tasks/agent-kanban-smoke/task.yaml"
   # Last, because it is the only entry that pays twice. Its stack plants an
   # OOM-killed workload on the host cluster and blocks until the event
@@ -965,39 +968,42 @@ TASKS=(
   # It provisions no cluster despite being deployer: tofu -- see the header of
   # bench/tf/prebuilt/autoops-incident/main.tf for why it cannot, and why it
   # is the host cluster and not the per-run one that gets the incident.
-  "./tasks/autoops-warning-event-triage/task.yaml"
-  # Ten registered scenarios stay commented out. The task-registration lint
-  # counts a commented entry as registered, so a line here is a promise the
-  # scenario exists, not that it runs; the domain-coverage lint counts only
-  # an UNCOMMENTED one, so activating a scenario also deletes its domain from
-  # the allowlist in docs/designs/domains.yaml. bench/tasks/DRAFTS.md carries
-  # the blockers, the measurements and the per-scenario status column.
+  # autoops-warning-event-triage: moved to NIGHTLY_TASKS 2026-09-03 (tofu wall clock, #1218/#1202).
+  # Five registered scenarios stay commented out, and seven more run in the
+  # nightly tier only -- NIGHTLY_TASKS below; the task-registration lint
+  # reads both arrays. A commented entry here counts as registered, so a
+  # line is a promise the scenario exists, not that it runs; the
+  # domain-coverage lint counts only an UNCOMMENTED entry in THIS array, so
+  # activating a scenario in presubmit also deletes its domain from the
+  # allowlist in docs/designs/domains.yaml, while a NIGHTLY_TASKS entry
+  # deliberately counts as presubmit coverage of nothing. bench/tasks/
+  # DRAFTS.md carries the blockers, the measurements and the per-scenario
+  # status column.
   #
   # Five moved DOWN here on 2026-08-26, each with its one-line reason:
   #   -- obtainability-planted-pdb, stockout-pinned-pool,
   #      upgrade-readiness-lagging-cluster, consistency-drift-outlier:
   #      full-audit shape recast to the nightly tier (600-1300s each, measured
   #      or transport-failed on 2026-08-26); each domain is now covered by a
-  #      probe above. They remain spec-ready and activation is uncommenting.
+  #      probe above. They moved again on 2026-09-02, to NIGHTLY_TASKS below,
+  #      when the nightly tier stopped being a plan: they run every night and
+  #      stay out of the presubmit.
   #   -- rca-remediation-pr was parked here too until 2026-08-27; it is now
   #      active above, this pull request's smoke run being the clean measured
   #      run it was waiting for.
-  # "./tasks/obtainability-planted-pdb/task.yaml"
-  # "./tasks/stockout-pinned-pool/task.yaml"
-  # "./tasks/upgrade-readiness-lagging-cluster/task.yaml"
-  # "./tasks/consistency-drift-outlier/task.yaml"
   #
-  # Two reliability prompt variations landed with #984 and stay commented
-  # out (their siblings obtainability-remediation-proposal and, since
-  # #1049, obtainability-healthy-namespace-silence are active above), each
-  # with its one-line reason:
+  # Two reliability prompt variations landed with #984 (their siblings
+  # obtainability-remediation-proposal and, since #1049,
+  # obtainability-healthy-namespace-silence are active above), each with its
+  # one-line reason:
   #   -- obtainability-direct-query: superseded in presubmit by
   #      reliability-pdb-probe (same planted defect, same question); 1.0 on
-  #      #984's live validation, a nightly-tier candidate.
+  #      #984's live validation. Nightly-tiered since 2026-09-02 -- see
+  #      NIGHTLY_TASKS below.
   #   -- obtainability-refusal-direct-mutation: the agent fails it today --
   #      objective 0.0 on #984's live validation (attempted the apply;
-  #      safeguards held). Activate after a clean run.
-  # "./tasks/obtainability-direct-query/task.yaml"
+  #      safeguards held). Activate after a clean run -- including into the
+  #      nightly, whose appends feed the baseline store.
   # "./tasks/obtainability-refusal-direct-mutation/task.yaml"
   #
   # A1 and A4 are CLOSED, and the canary above is what has EXERCISED them.
@@ -1071,6 +1077,92 @@ TASKS=(
   # how a case that can only fail reds every pull request here.
   # "./tasks/cluster-agent-crashloop-fix-request/task.yaml"
 )
+
+# ─── The nightly tier (#1021, the catch-all; #1023/#1024 consume it) ─────────
+# The nightly periodic runs the FULL catalog: every active TASKS entry above,
+# identically -- same repetitions, same gate, same reporting order -- PLUS the
+# entries here. What earns a case this array is measured cost or presubmit
+# redundancy, never doubt about the case: a case whose header above says it is
+# broken, unvalidated, or fails on a correct agent stays commented out in
+# TASKS (refusal-direct-mutation, pending-replicas-capped-pool, fix-request,
+# chat-routing-fleet-question, fleet-cost-idle-pool), because the nightly is
+# what appends to the baseline evidence store (EVAL_BASELINE_STORE below) and
+# a case that can only fail would append nothing but evidence keeping itself
+# unadmitted while spending ~10 minutes of matrix a night doing it.
+#
+# Selection is EVAL_TIER below, exported by the Prow periodic and nothing
+# else. The registration lint (scripts/validate_bench_cases.py) reads this
+# array as well as TASKS; the domain-coverage lint deliberately does not, so
+# an entry here satisfies presubmit domain coverage exactly as much as a
+# commented one -- not at all.
+#
+# Budget, priced the way EVAL_REPETITIONS' comment prices the presubmit: the
+# twenty-five-task nightly matrix is the pre-#1218 twenty-task presubmit
+# (measured ~317min SERIAL) plus the five recast cases -- four audit-shaped
+# (600-1300s a repetition, hinted at 900s in unit_cost_hint below) and one
+# probe-shaped, ~190min serial at three repetitions. #1218 then moved the two
+# tofu incumbents (~106min serial of that ~317min) out of TASKS and into this
+# array, which reshuffles the presubmit/nightly split (eighteen + seven)
+# without changing the nightly total. IF the periodic mirrors the
+# presubmit's shape -- 360m
+# deadline, EVAL_REPETITIONS at its default 3; the periodic is in flight in
+# oss-test-infra, not merged, so this is the assumption and not yet a fact --
+# ~507min serial fits only through the fan-out: parallelism 4 has to realise
+# 1.4x or better, which the first scheduled run measures, and at more
+# repetitions the required factor scales with them. A deadline kill is
+# survivable by design --
+# the cost-hinted queue means it truncates in-flight units, the EXIT trap
+# still records what completed -- but it is a truncated night, so if the
+# first runs blow the deadline the lever is the periodic's timeout, not this
+# list's tail.
+NIGHTLY_TASKS=(
+  # The four full audits recast out of presubmit on 2026-08-26, spec-ready,
+  # each domain covered in presubmit by its probe in TASKS:
+  #   -- obtainability-planted-pdb: measured PASSED at 962s on 2026-08-26
+  #      (build 2092638061140643840); too slow for a presubmit seat.
+  #   -- stockout-pinned-pool: same full-audit shape and cost band; its
+  #      2026-08-26 failures were agent-endpoint 502s, not scenario bugs.
+  #   -- upgrade-readiness-lagging-cluster: same shape, same 2026-08-26
+  #      transport failures; the worker filed its ledger issue even so.
+  #   -- consistency-drift-outlier: same shape; its domain's probe measured
+  #      233s a repetition, which is why the probe kept the presubmit seat.
+  "./tasks/obtainability-planted-pdb/task.yaml"
+  "./tasks/stockout-pinned-pool/task.yaml"
+  "./tasks/upgrade-readiness-lagging-cluster/task.yaml"
+  "./tasks/consistency-drift-outlier/task.yaml"
+  # Superseded in presubmit by reliability-pdb-probe (same planted defect,
+  # same question), not by any doubt: 1.0 on #984's live validation.
+  "./tasks/obtainability-direct-query/task.yaml"
+  # The two tofu-provisioned incumbents, moved out of presubmit 2026-09-03
+  # (#1218): they serialize on the infra lock (~20 and ~15 min a repetition)
+  # and were nearly half the presubmit wall clock (#1202 trim addendum).
+  # gpu-stress-test-diagnosis gates here via the nightly rather than in
+  # BOOTSTRAP_ADMITTED; autoops-warning-event-triage accrues its #1101
+  # admission record here.
+  "./tasks/gpu-stress-test-diagnosis/task.yaml"
+  "./tasks/autoops-warning-event-triage/task.yaml"
+)
+
+# Which matrix this run gets. "presubmit" -- the default, and what every
+# existing job runs -- is exactly the TASKS array, so this change is dormant
+# everywhere until a job exports the other value: the same
+# dormant-until-the-job-config-arms-it shape as EVAL_DASHBOARD_TARGET above.
+# "nightly" appends NIGHTLY_TASKS, so the nightly is a superset of the
+# presubmit by construction and a case active in both runs identically in
+# both. Anything else is a typo that would silently run the wrong matrix,
+# so it stops the job before it spends a cluster.
+EVAL_TIER="${EVAL_TIER:-presubmit}"
+case "${EVAL_TIER}" in
+  presubmit) ;;
+  nightly)
+    TASKS+=("${NIGHTLY_TASKS[@]}")
+    echo "EVAL_TIER=nightly: ${#NIGHTLY_TASKS[@]} nightly-only task(s) join the matrix, ${#TASKS[@]} tasks total"
+    ;;
+  *)
+    echo "ERROR: EVAL_TIER must be 'presubmit' or 'nightly', got '${EVAL_TIER}'." >&2
+    exit 1
+    ;;
+esac
 
 # Floor for VerificationCorrectness on a repetition of a task that declares a
 # verification_spec. 1.0 while every declared objective is meant to hold
@@ -1221,10 +1313,10 @@ print(m.group(1).strip('\'\"') if m else '')
 # nothing to main's side of the aggregate. Screening replaces it.
 #
 # This roster is what blocks a pull request once the Prow job stops being
-# optional. Twelve of the twenty active cases are admitted: the ones
+# optional. Ten of the eighteen active cases are admitted: the ones
 # whose recent record shows failures only on their own regressions or on
 # infra classes the harness already excludes from the verdict. The rest
-# cannot red one on a GRADED failure: five are held out below with named
+# cannot red one on a GRADED failure: four are held out below with named
 # exits, and the three obtainability activations (#1049) simply run
 # unadmitted while they earn a record. Held-out cases still run and
 # report on every pull request. The scope of that promise is rungs
@@ -1247,7 +1339,10 @@ print(m.group(1).strip('\'\"') if m else '')
 #     the reason for the hold is not. Still main's own trait, so a
 #     collapse would tax an innocent PR. Enters when #1010's fix merges
 #     or when rung-6 screening can compare against main.
-#   autoops-warning-event-triage          -- #1101: 0/5 graded repetitions
+#   autoops-warning-event-triage          -- #1101; NOTE 2026-09-03: no
+#     longer in presubmit TASKS at all (tofu wall clock, #1218) -- it
+#     runs and accrues record via the nightly tier once that exists.
+#     Original hold-out rationale: 0/5 graded repetitions
 #     on record; admitting it reds every pull request today. Enters when
 #     the lettered-options bar is settled and it has a clean record.
 #   compliance-rbac-overgrant             -- #1171: demoted 2026-09-02
@@ -1281,7 +1376,7 @@ print(m.group(1).strip('\'\"') if m else '')
 # agent-kanban-smoke earned its seat back after the 08-27 redesign (a real
 # SRE question graded on kanban_create plus cluster names); the reds that
 # once argued for un-arming it belonged to the old vocabulary check.
-export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,cluster-agent-crashloop-debug,cluster-agent-crashloop-misleading-symptom,cluster-agent-crashloop-evidence-chain,gpu-stress-test-diagnosis,agent-kanban-smoke}"
+export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,cluster-agent-crashloop-debug,cluster-agent-crashloop-misleading-symptom,cluster-agent-crashloop-evidence-chain,agent-kanban-smoke}"
 
 # Where the evidence itself lives. Unset means bench/baselines/ in the
 # checkout: hermetic, no credential, no network -- and no way for this job to
@@ -1307,7 +1402,14 @@ export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-
 # bucket that is not there is not fatal -- an unreachable store degrades to
 # advisory with a banner -- but it is a banner on every run, so both exports
 # wait for the bucket. Until then the store fills only by hand from the
-# --lines-out artefact below.
+# --lines-out artefact below. No job holds the writing export yet: two
+# oss-test-infra pull requests propose the nightly that would, and they need
+# to converge to ONE writer before either arms -- #2665
+# (periodic-kube-agents-eval-baseline, which exports this variable but not
+# EVAL_TIER, so as drafted it records the presubmit matrix only) and the
+# companion of this change (ci-kube-agents-eval-nightly, EVAL_TIER=nightly
+# with this export commented out until the bucket exists). Whichever job
+# survives, arming stays a Prow-config change, never a default here.
 export EVAL_BASELINE_STORE="${EVAL_BASELINE_STORE:-}"
 
 # Where the per-case hand-offs land. `bench-gate case` writes one per task and
@@ -1337,7 +1439,14 @@ fi
 # A wrong hint costs packing efficiency, never correctness.
 unit_cost_hint() {
   case "$1" in
+    # Inert while both cases sit outside TASKS (#1218): the only call site
+    # iterates TASK_NAMES. Kept for their NIGHTLY_TASKS re-entry (#1175).
     gpu-stress-test-diagnosis | autoops-warning-event-triage) echo 900 ;;
+    # The nightly-only full audits (NIGHTLY_TASKS): 600-1300s a repetition on
+    # 2026-08-26, planted-pdb's 962s the one clean measurement. Priced with
+    # the 900 band so a nightly run launches them first.
+    obtainability-planted-pdb | stockout-pinned-pool) echo 900 ;;
+    upgrade-readiness-lagging-cluster | consistency-drift-outlier) echo 900 ;;
     compliance-rbac-overgrant | rca-remediation-pr) echo 700 ;;
     consistency-authorized-networks-probe) echo 300 ;;
     *) echo 200 ;;

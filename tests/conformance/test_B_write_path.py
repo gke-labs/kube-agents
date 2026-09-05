@@ -185,7 +185,9 @@ class B1NoAgentCredentialCausesAProductionChange(unittest.TestCase):
                 break
             cursor = parent
 
-        gate = "unexpected credential-aware CLI in sandbox image"
+        # Reworded by #913, which moved the real CLIs into deploy/sandbox/: the
+        # guard that matters is still the agent image refusing to carry them.
+        gate = "unexpected cluster CLI in the agent image"
         gated = [stage for stage in lineage if gate in stages[stage]]
         self.assertTrue(
             gated,

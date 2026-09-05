@@ -208,7 +208,18 @@ class D4CredentialsAreShortLivedAndBound(unittest.TestCase):
         comparing a secret, which is the delegate-don't-parse answer to the
         parser-differential class -- and it only works while the audience is
         set.
+
+        There are two audiences since #913 split the broker's routes by caller:
+        the exec audience for the agent, and a `-chat` one for the gateway, so
+        the sandbox cannot reach `/v1/chat/**` and the gateway cannot reach
+        `/v1/exec`. Both are asserted, and both are required to be present --
+        collapsing them back to one audience would restore the reachability the
+        split removed while every individual token still looked audience-bound.
         """
+        audiences = {
+            "kubeagents-credential-proxy",
+            "kubeagents-credential-proxy-chat",
+        }
         broker_tokens = [
             (fixture, volume, token)
             for fixture, _, volume, token in self._projected_tokens()
@@ -217,7 +228,18 @@ class D4CredentialsAreShortLivedAndBound(unittest.TestCase):
         self.assertTrue(broker_tokens, "no broker token projection in any fixture")
         for fixture, volume, token in broker_tokens:
             with self.subTest(fixture=fixture, volume=volume):
-                self.assertEqual("kubeagents-credential-proxy", token.get("audience"))
+                self.assertIn(
+                    token.get("audience"),
+                    audiences,
+                    "a broker token is projected with an audience the broker "
+                    "does not TokenReview against",
+                )
+        self.assertEqual(
+            audiences,
+            {token.get("audience") for _, _, token in broker_tokens},
+            "the two broker audiences are not both rendered; the caller split "
+            "is what keeps the sandbox off /v1/chat and the gateway off /v1/exec",
+        )
 
     def test_D4_precondition_the_event_watcher_token_is_still_projected(self) -> None:
         volumes = {volume for _, _, volume, _ in self._projected_tokens()}

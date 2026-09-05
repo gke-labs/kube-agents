@@ -89,6 +89,19 @@ jobs:
           build-args: |
             HERMES_AGENT_TAG=${{ env.HERMES_AGENT_TAG }}
 
+      - name: Build and Push Agent Sandbox (GHCR)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        id: build-agent-sandbox
+        with:
+          context: .
+          file: deploy/sandbox/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ github.ref_type == 'branch' && format('ghcr.io/{0}/agent-sandbox:latest', env.IMAGE_REPOSITORY) || '' }}
+            ghcr.io/${{ env.IMAGE_REPOSITORY }}/agent-sandbox:${{ github.sha }}
+            ${{ github.ref_type == 'tag' && format('ghcr.io/{0}/agent-sandbox:{1}', env.IMAGE_REPOSITORY, github.ref_name) || '' }}
+
       - name: Build and Push Pubsub Platform Plugin (GHCR)
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         id: build-pubsub-platform
@@ -119,11 +132,13 @@ jobs:
           PLATFORM_DIGEST: ${{ steps.build-platform.outputs.digest }}
           REPLAY_PROXY_DIGEST: ${{ steps.build-replay-proxy.outputs.digest }}
           CREDENTIAL_PROXY_DIGEST: ${{ steps.build-credential-proxy.outputs.digest }}
+          AGENT_SANDBOX_DIGEST: ${{ steps.build-agent-sandbox.outputs.digest }}
           PUBSUB_PLATFORM_DIGEST: ${{ steps.build-pubsub-platform.outputs.digest }}
           STOCKOUT_INVESTIGATOR_DIGEST: ${{ steps.build-stockout-investigator.outputs.digest }}
         run: |
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/platform-agent@$PLATFORM_DIGEST"
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/replay-proxy@$REPLAY_PROXY_DIGEST"
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/credential-proxy@$CREDENTIAL_PROXY_DIGEST"
+          cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/agent-sandbox@$AGENT_SANDBOX_DIGEST"
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/pubsub-platform@$PUBSUB_PLATFORM_DIGEST"
           cosign sign --yes "ghcr.io/$IMAGE_REPOSITORY/gke-stockout-investigator@$STOCKOUT_INVESTIGATOR_DIGEST"

@@ -29,7 +29,8 @@
 # evidence and graded on the reply -- while the audit-SOP machinery itself
 # (dispatch, delegation, token minter, ledger write) is exercised end to end
 # by exactly one audit kept as a canary, under the `fleet-audits` domain.
-# The full audit scenarios remain spec-ready for the nightly tier.
+# The full audit scenarios run in the nightly tier (NIGHTLY_TASKS in
+# hack/ci-eval-pr.sh); only an uncommented TASKS entry counts as coverage.
 
 domains:
   - slug: chat-and-routing
@@ -83,4 +84,11 @@ domains:
 # being a chat-prompted post-incident RCA rather than event-fired triage.
 #
 # An entry goes back on here only alongside a scenario that stopped running.
-allowlist: []
+allowlist:
+  # incident-triage's presubmit coverage moved to the nightly tier on
+  # 2026-09-03: its only case (autoops-warning-event-triage) is
+  # tofu-provisioned — the wall-clock floor of the presubmit (#1202 trim
+  # addendum). Delete this entry when
+  # a non-tofu incident-triage probe activates in presubmit, or when the
+  # coverage contract formally recognizes the nightly tier (#1175).
+  - incident-triage

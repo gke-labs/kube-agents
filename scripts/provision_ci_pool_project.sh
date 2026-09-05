@@ -419,11 +419,20 @@ if [ "${SKIP_HOST_CLUSTER}" != "true" ]; then
     # -input=false, so a missing one is a hard "No value for required variable"
     # rather than a prompt. api_server_key is generated the same way
     # hack/ci-deploy.sh generates it when unset (openssl rand -hex 16).
+    # model_provider drives more than the chart: at "vertex_ai" the
+    # composition's litellm_vertex_iam module creates the gateway's own
+    # kubeagents-litellm-gsa, its roles/aiplatform.user grant, and the
+    # Workload Identity binding hack/ci-deploy.sh's per-lease helm upgrade
+    # relies on. The eval installs moved off the GEMINI_API_KEY path after
+    # its fixed paid-tier-3 quota redded every smoke run on 2026-09-02
+    # (#1097; diagnosis on #1184). verify_ci_pool_project.py checks the
+    # binding, so a project provisioned before this line reports the gap.
     cat > "${TFVARS}" <<EOF
 project_id     = "${PROJECT_ID}"
 cluster_name   = "${HOST_CLUSTER_NAME}"
 location       = "${REGION}"
 api_server_key = "$(openssl rand -hex 16)"
+model_provider = "vertex_ai"
 EOF
 
     KUBE_AGENTS_STATE_BUCKET="${STATE_BUCKET}" \

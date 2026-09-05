@@ -37,20 +37,19 @@
 # Every release image in the template is checked, not just the agent
 # container's. The operator renders the agent container, the
 # sandbox-credential-cleanup init container, the platform-agent-dashboard
-# container (on by default), and the envoy-credential-proxy sidecar -- the last
-# a different repository on the same tag, and the reason a template-wide check
-# is not redundant. Under spec.security.splitCredentialBrokerPod the proxy
-# moves to a Deployment of its own, which this script is not pointed at and so
-# does not cover. They normally move together, because the sidecar's
-# reference is derived from resolveAgentImage's output. They do not when the
-# agent image is digest-pinned: that path falls back to spec.deployment.tag, so
-# the agent freezes at its digest while the proxy beside it rolls forward on
-# every deploy. The operator logs that and carries on.
+# container (on by default), and the agent-api-auth sidecar. The credential
+# proxy is a Deployment of its own, which this script is not pointed at and so
+# does not cover, and neither is the shell sandbox StatefulSet. The proxy's
+# image reference is derived from resolveAgentImage's output, so it normally
+# moves with the agent's. It does not when the agent image is digest-pinned:
+# that path falls back to spec.deployment.tag, so the agent freezes at its
+# digest while the proxy rolls forward on every deploy. The operator logs that
+# and carries on.
 #
 # The check is that no release image found is off the tag, not that a
 # particular set of them is present. Which containers the operator renders
-# depends on the CR -- the dashboard and the split credential broker are both
-# switchable -- so an expected count would be wrong for some valid installs. A
+# depends on the CR -- the dashboard is switchable -- so an expected count
+# would be wrong for some valid installs. A
 # template that lost a container entirely therefore passes here; the rollout
 # gate and the agent's own probes are what cover that.
 #

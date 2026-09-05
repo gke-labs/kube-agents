@@ -1,0 +1,56 @@
+{{- /* The public half of the agent's SSH keypair, in a Secret the shell sandbox
+     can mount without mounting anything else (#737 Part B; see
+     docs/designs/agent-shell-sandboxing.md#key-management).
+
+     Both halves also live in platform-agent-secrets, so that a re-run of any
+     install surface can recover the pair from one place. The sandbox must not
+     mount THAT object: it holds every model API key, and `items:` selecting a
+     single entry from it is one careless edit away from exposing the rest
+     inside the pod this whole design exists to keep credential-free.
+
+     Rendered only when a public key is supplied. Unlike SESSION_KV_API_KEY and
+     SESSION_KV_SALT next door, the chart cannot generate this one: sprig's
+     genPrivateKey emits PEM and has no counterpart that encodes the public half
+     in authorized_keys form. The installer scripts and the Terraform
+     composition both generate the pair and pass it in; a bare `helm install`
+     that supplies nothing leaves the Secret unrendered and the sandbox
+     unusable, which is the same contract values.yaml already states for
+     credentials.create — convenience for dev installs, pre-created Secret in
+     production. */}}
+{{- if .Values.platformAgent.enabled }}
+{{- /* Not gated on credentials.create, unlike platform-agent-secret.yaml next
+     door: the sandbox needs this Secret whoever created the credential one, and
+     an install that pre-creates its own Secret (create=false) has no other way
+     to get it. credentials.data is only read when create is true, though —
+     when it is false the sibling ignores that map entirely, and reading it here
+     would make the same values mean different things in two templates. */}}
+{{- $supplied := dict }}
+{{- if .Values.platformAgent.credentials.create }}
+{{- $supplied = .Values.platformAgent.credentials.data | default dict }}
+{{- end }}
+{{- $publicKey := get $supplied "SANDBOX_SSH_PUBLIC_KEY" | default "" }}
+{{- if not $publicKey }}
+{{- /* Carry forward a pair an earlier install generated, so that a `helm
+     upgrade` which does not pass the key does not delete the Secret out from
+     under a running sandbox. `lookup` returns empty under `helm template` and
+     `--dry-run`; a rendered-only manifest therefore omits this Secret. */}}
+{{- $existing := (lookup "v1" "Secret" .Release.Namespace .Values.platformAgent.credentials.secretName) }}
+{{- $existingData := (get ($existing | default dict) "data") | default dict }}
+{{- if hasKey $existingData "SANDBOX_SSH_PUBLIC_KEY" }}
+{{- $publicKey = get $existingData "SANDBOX_SSH_PUBLIC_KEY" | b64dec }}
+{{- end }}
+{{- end }}
+{{- if $publicKey }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ printf "%s-shell-authorized-keys" .Values.platformAgent.name | quote }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    {{- include "kube-agents.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  authorized_keys: {{ $publicKey | toString | quote }}
+{{- end }}
+{{- end }}

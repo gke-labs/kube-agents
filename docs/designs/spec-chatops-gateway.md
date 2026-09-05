@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** draft for review
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord adapter) - session spawning is dark behind `A2A_SPAWN_SESSIONS`, and the operator renders neither the gateway Deployment nor its env yet
 
 ## Purpose
 
@@ -51,8 +51,9 @@ pod at a time.** Concretely:
   `Create`, compare-and-swap semantics), so that two replicas or a rehydrate racing
   first contact cannot fork a conversation - the loser reads and adopts the winner's
   value. The stage 1 gateway runs a single replica and serializes per conversation
-  in-process, which narrows the race without closing it (a plain `Put` persists the
-  record today); the `Create` is owed before a second replica is.
+  in-process, and minting is the KV `Create` this rule requires - the loser of a mint
+  race re-reads and adopts the winner's record before the contextId reaches any
+  envelope.
 - The pod is an incarnation, not the identity. Reaping and respawning changes the pod
   and the bus session name; `contextId` persists across every incarnation.
 - In a group thread, everyone in the room shares the one session. Attribution is per
@@ -323,7 +324,10 @@ rewritten on upgrade - rotating it re-anonymises every user and breaks correlati
 with their own history - and it is what the shipped attribution path already hashes
 with. Using it is what makes the "same posture" claim above true rather than
 approximate: one human hashes to one value in session metadata and in
-`authority.requester.principal`, so the cross-surface audit join resolves. A second
+`authority.requester.principal`, so the cross-surface audit join resolves. One
+presentation caveat rides that sentence: session metadata stores the full 64-hex
+digest while the gateway publishes `hmac:` plus the first 32 hex characters, so the
+join key is the digest - a prefix match, not string equality. A second
 salt would not merely be redundant, it would silently yield nothing on exactly the
 join this rule exists to preserve. The requirement that follows: one value per
 install, read by every gateway replica from that Secret. Deriving a salt from

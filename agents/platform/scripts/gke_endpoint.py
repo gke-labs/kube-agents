@@ -33,6 +33,8 @@ import sys
 import time
 from typing import Callable
 
+import sandbox_exec
+
 # (exit_code, stdout) — narrow enough that the credential proxy can satisfy it by
 # wrapping its own executor, which runs commands in the sidecar rather than here.
 Runner = Callable[[list[str]], "tuple[int, str]"]
@@ -77,34 +79,36 @@ def _log(message: str) -> None:
 
 
 def _default_runner(env: dict[str, str] | None, timeout: int) -> Runner:
-    """Run gcloud, deliberately without a KUBECONFIG.
+    """Run gcloud in the shell sandbox, deliberately without a KUBECONFIG.
 
     Both commands this module runs — `clusters describe` and `get-credentials
     --help` — talk to the GKE API and read no kubeconfig, so dropping the
-    variable costs nothing. It is dropped rather than merely unused because in
-    the agent container `gcloud` is the credential-proxy shim, which forwards
-    `$KUBECONFIG` on *every* gcloud call (`credential_proxy_client.py`,
-    `KUBECONFIG_AWARE`). `describe` is not `get-credentials`, so the proxy takes
-    its read path and resolves that path through `_target_of`, which stats the
-    file and rejects the request with HTTP 400 if it is not there.
+    variable costs nothing. It is dropped rather than merely unused because
+    `gcloud` here is the credential-proxy shim, which forwards `$KUBECONFIG` on
+    *every* gcloud call (`credential_proxy_client.py`, `KUBECONFIG_AWARE`).
+    `describe` is not `get-credentials`, so the proxy takes its read path and
+    resolves that path through `_target_of`, which stats the file and rejects
+    the request with HTTP 400 if it is not there.
 
     Every caller here passes the kubeconfig that the `get-credentials` being
     assembled is about to *create*, so it is reliably absent — forwarding it
     turned the describe into a guaranteed 400 and the detection into a constant
     "no flag". Callers may keep passing their own `env`; this strips the one key
     that must not travel.
+
+    Nothing is forwarded to the sandbox, which satisfies that requirement by
+    construction: the remote command inherits only what sshd sets. `env` now
+    shapes the local fallback alone, and is kept because the operator's install
+    scripts and the tests reach this module outside a sandboxed pod.
     """
     base = env if env is not None else {**os.environ, "HOME": "/tmp"}
     scrubbed = {key: value for key, value in base.items() if key != "KUBECONFIG"}
 
     def run(argv: list[str]) -> tuple[int, str]:
-        completed = subprocess.run(
+        completed = sandbox_exec.run(
             argv,
-            capture_output=True,
-            text=True,
+            local_env=scrubbed,
             timeout=timeout,
-            check=False,
-            env=scrubbed,
         )
         return completed.returncode, completed.stdout
     return run
@@ -129,7 +133,8 @@ def gcloud_supports_dns_endpoint(run: Runner | None = None) -> bool:
         exit_code, stdout = probe(
             ["gcloud", "container", "clusters", "get-credentials", "--help"]
         )
-    except (OSError, subprocess.SubprocessError) as error:
+    except (OSError, subprocess.SubprocessError,
+            sandbox_exec.SandboxUnavailable) as error:
         # Not cached: this says the probe could not run, not that the flag is
         # absent. A transient failure remembered here would disable the endpoint
         # detection for the rest of a long-lived process.
@@ -157,7 +162,8 @@ def _describe(
     ]
     try:
         exit_code, stdout = run(argv)
-    except (OSError, subprocess.SubprocessError) as error:
+    except (OSError, subprocess.SubprocessError,
+            sandbox_exec.SandboxUnavailable) as error:
         _log(f"describing {cluster} failed ({error})")
         return None
     if exit_code != 0:

@@ -213,6 +213,16 @@ PROW_RUNNER_ROLES = {
 # CI here rather than failing correctly-provisioned projects weeks later.
 PLATFORM_GSA_MEMBER_TEMPLATE = "serviceAccount:kubeagents-platform-gsa@{project_id}.iam.gserviceaccount.com"
 
+# The LiteLLM gateway's identity holds exactly this set and nothing else --
+# it is a network-exposed proxy forwarding attacker-influenceable prompt
+# content, so the set is closed in both directions like the platform GSA's
+# (the site's security-and-iam.md, "The Vertex AI gateway is a separate
+# identity"). Found by the 2026-09-03 pool rollout (#1208): the WI binding
+# check alone let a project pass the verifier and still fail at the model
+# call for want of this grant.
+LITELLM_GSA_MEMBER_TEMPLATE = "serviceAccount:kubeagents-litellm-gsa@{project_id}.iam.gserviceaccount.com"
+LITELLM_GSA_ROLES = {"roles/aiplatform.user"}
+
 # Neither belongs on a pool project at all. Called out separately because the
 # two checks above scan for one literal member each and would not see these.
 _PUBLIC_MEMBERS = {"allUsers", "allAuthenticatedUsers"}
@@ -749,6 +759,44 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             passed = False
             details.append(f"Failed parsing policy for {gsa_email}: {exc}")
 
+    # The LiteLLM gateway's own identity, created by the full-install
+    # composition's litellm_vertex_iam module once model_provider is
+    # "vertex_ai" (provision_ci_pool_project.sh writes it into the tfvars).
+    # hack/ci-deploy.sh's per-lease helm upgrade annotates the
+    # kubeagents-litellm KSA with this GSA, so a project missing the pair
+    # reds every presubmit it leases at the deploy's model-call gate (#1097).
+    litellm_gsa_email = f"kubeagents-litellm-gsa@{project_id}.iam.gserviceaccount.com"
+    rc, out, err = run_cmd([
+        "gcloud", "iam", "service-accounts", "get-iam-policy",
+        litellm_gsa_email,
+        f"--project={project_id}",
+        "--format=json",
+    ])
+    if rc != 0:
+        if not _record_unreadable(
+            err,
+            f"Missing GSA or failed reading policy for {litellm_gsa_email}",
+            f"Could not read the IAM policy on {litellm_gsa_email}, so its Workload Identity binding was not "
+            "checked (and neither was the GSA's existence)",
+            details,
+            warnings,
+        ):
+            passed = False
+    else:
+        try:
+            policy = _load_json(out)
+            expected_member = f"serviceAccount:{project_id}.svc.id.goog[kubeagents-system/kubeagents-litellm]"
+            wi_bound = any(
+                b.get("role") == "roles/iam.workloadIdentityUser" and expected_member in b.get("members", [])
+                for b in policy.get("bindings", [])
+            )
+            if not wi_bound:
+                passed = False
+                details.append(f"Workload Identity user binding missing on {litellm_gsa_email} for {expected_member}")
+        except Exception as exc:
+            passed = False
+            details.append(f"Failed parsing policy for {litellm_gsa_email}: {exc}")
+
     # Read off the project's own policy, which is not the effective one. Two
     # things it hides from a literal-member scan: a role inherited from an
     # ancestor (checked 2026-08-26, the pool projects sit directly under the
@@ -771,8 +819,10 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
         try:
             policy = _load_json(out)
             platform_member = PLATFORM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
+            litellm_member = LITELLM_GSA_MEMBER_TEMPLATE.format(project_id=project_id)
             prow_held = set()
             platform_held = set()
+            litellm_held = set()
             public_held = set()
             for b in policy.get("bindings", []):
                 members = b.get("members", [])
@@ -794,6 +844,8 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                     prow_held.add(b.get("role"))
                 if platform_member in members:
                     platform_held.add(b.get("role"))
+                if litellm_member in members:
+                    litellm_held.add(b.get("role"))
 
             missing = PROW_RUNNER_ROLES - prow_held
             if missing:
@@ -825,6 +877,26 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
                     "differently. Swap them per "
                     "docs/site/src/content/docs/reference/security-and-iam.md -- re-running the "
                     "install does not strip roles it no longer grants"
+                )
+            litellm_missing = LITELLM_GSA_ROLES - litellm_held
+            litellm_extra = litellm_held - LITELLM_GSA_ROLES
+            if litellm_missing:
+                passed = False
+                details.append(
+                    f"The LiteLLM gateway GSA is missing {len(litellm_missing)} role(s) on "
+                    f"{project_id}: {', '.join(sorted(litellm_missing))}. The gateway "
+                    "authenticates as this account for every vertex_ai model call, so a "
+                    "lease of this project fails at the deploy's model-call gate rather "
+                    "than at registration"
+                )
+            if litellm_extra:
+                passed = False
+                details.append(
+                    f"The LiteLLM gateway GSA holds {len(litellm_extra)} role(s) on "
+                    f"{project_id} beyond aiplatform.user: {', '.join(sorted(litellm_extra))}. "
+                    "The gateway is a network-exposed proxy forwarding "
+                    "attacker-influenceable prompt content, so its set is closed -- swap "
+                    "them per docs/site/src/content/docs/reference/security-and-iam.md"
                 )
             if public_held:
                 passed = False

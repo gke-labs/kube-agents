@@ -60,7 +60,21 @@ install without the interview.
   a second [`kube-agents-iam`](../../modules/kube-agents-iam) instantiation for
   the gateway's service account, `roles/aiplatform.user` on
   `vertex_project_id`, and the Workload Identity annotation the chart needs.
-  Vertex takes no API key, so no `*_api_key` variable applies.
+  Vertex takes no API key, so no `*_api_key` variable applies. The API
+  enablement and the role grant are the only two resources that live in
+  `vertex_project_id` rather than `project_id`; when that is a project the
+  applying identity cannot administer, set
+  `vertex_manage_serving_project = false` and enable the API and make the
+  grant by hand — the service account and its Workload Identity binding are
+  still created here. Decide it at the first apply: turning it off later, on
+  an install whose earlier apply created the two, destroys them on the next
+  apply and revokes the grant. To hand them over instead, remove both from
+  state first:
+
+  ```bash
+  terraform state rm 'google_project_service.vertex_ai[0]' \
+    'google_project_iam_member.litellm_vertex_user[0]'
+  ```
 
 > [!WARNING]
 > The credential variables (`api_server_key`, `*_api_key`, Slack tokens) are

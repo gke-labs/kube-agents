@@ -159,8 +159,10 @@ gcloud auth configure-docker gcr.io
 Set the image target URL and run the build/push targets:
 
 ```bash
-# Replace with your actual registry and image tag
-export IMG=us-central1-docker.pkg.dev/ai-platform-1-464114/k8s-harness-poc/kube-agents-operator:latest
+# Replace with your actual registry. The tag must be immutable: `make deploy`
+# refuses a floating tag such as `latest`, because it lets a pod reschedule
+# upgrade the controller past the RBAC applied with it (issue #1009).
+export IMG=us-central1-docker.pkg.dev/ai-platform-1-464114/k8s-harness-poc/kube-agents-operator:$(git rev-parse HEAD)
 
 # Build the image
 make docker-build IMG=$IMG

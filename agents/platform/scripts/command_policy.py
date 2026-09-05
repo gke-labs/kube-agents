@@ -285,10 +285,11 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         ("config", "get-value"),
         ("config", "list"),
         # `beta` is a word like any other here, so a beta path has to be
-        # listed on its own -- the GA entry above it grants nothing. These two
+        # listed on its own -- the GA entry above it grants nothing. These
         # are the stockout SOP's capacity forecast; the data has no GA
         # spelling yet.
         ("beta", "compute", "advice", "calendar-mode"),
+        ("beta", "compute", "advice", "capacity"),
         ("beta", "compute", "advice", "capacity-history"),
         # Budget reads for the cost skills. list only: budgets are written
         # by humans, and `billing accounts list` is deliberately absent --
@@ -299,23 +300,37 @@ GCLOUD_READ_COMMANDS: frozenset[tuple[str, ...]] = frozenset(
         ("compute", "backend-services", "list"),
         ("compute", "disks", "describe"),
         ("compute", "disks", "list"),
+        # Not spelled by any SOP. A live install refused both under
+        # gcp.read-only while the model investigated the fabric (#1126); they
+        # are the read side of the firewall rules the networking SOP's Red
+        # Lines forbid modifying, and list/describe is all that is granted.
+        ("compute", "firewall-rules", "describe"),
+        ("compute", "firewall-rules", "list"),
         ("compute", "forwarding-rules", "describe"),
         ("compute", "forwarding-rules", "list"),
         # The daily `gcp-networking-fabric-audit` cron executes
-        # governance/gcp_networking_fabric_sop.md exactly, and of the reads
-        # that SOP issues only forwarding-rules list was in this set --
-        # four of its five checks had no data source. Same shape as the
-        # stockout gap below: the job runs, reports, and measures nothing.
+        # governance/gcp_networking_fabric_sop.md exactly, and the networks,
+        # routers and security-policies entries were derived from the command
+        # spellings that SOP carries. A SOP spelling assumes its arguments are
+        # already bound, so a leaf read listed on its own can be unreachable:
+        # `routers get-nat-mapping-info $ROUTER` was listed while `routers
+        # list`, the only way to bind $ROUTER, was not, and the audit's one
+        # critical NAT check never ran (#1126). Grant a discovery read
+        # alongside every leaf read that needs one; `networks describe` and
+        # `routers describe` are the detail reads behind the two lists.
         # `compute project-info describe` is the stockout SOP's quota
         # remediation read. The writes one word away (networks create,
-        # security-policies create, project-info add-metadata) stay
-        # refused, and the tests assert it.
+        # routers create, firewall-rules create, security-policies create,
+        # project-info add-metadata) stay refused, and the tests assert it.
+        ("compute", "networks", "describe"),
         ("compute", "networks", "list"),
         ("compute", "networks", "subnets", "describe"),
         ("compute", "networks", "subnets", "list"),
         ("compute", "networks", "subnets", "list-usable"),
         ("compute", "project-info", "describe"),
+        ("compute", "routers", "describe"),
         ("compute", "routers", "get-nat-mapping-info"),
+        ("compute", "routers", "list"),
         ("compute", "security-policies", "list"),
         # The daily `stockout-prevention` cron reads these three and nothing
         # else can stand in for them: reservations list is the committed
@@ -392,6 +407,11 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
         # machine-types list uses --zones (plural; --zone alone was listed).
         # An allowlist entry whose flags are not here is unreachable.
         "--instance-selection-machine-types", "--size", "--types", "--zones",
+        "--machine-type", "--provisioning-model", "--target-distribution-shape",
+        "--instance-selection",
+        # `compute routers list` scopes by --regions (plural), the router
+        # analogue of the --zones trap above.
+        "--regions",
         # `billing budgets list` requires it.
         "--billing-account",
         # `container ai profiles manifests create` selectors, from its gcloud

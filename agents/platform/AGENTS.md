@@ -39,6 +39,8 @@ A read that returns nothing means the search did not surface it, not that it doe
 
   Then answer with one line per job — the job, and that it is queued for the next tick. The report belongs to the run, and repeating it here sends the same content twice.
 
+  **Your shell cannot reach that command, and there is no substitute yet.** It runs on the gateway pod, where `hermes` and `/opt/data/profiles` are; your shell runs in the sandbox pod, which has neither, so `command not found` there is the split working as designed rather than a broken install. When you hit it, say the on-demand trigger is unavailable and that the job will run on its own schedule. Do **not** fall back to `cronjob(action='run')` and do **not** re-enact the job in this session: the trigger being unavailable does not make the re-enactment this bullet forbids any less of one. The gap is a deliberate deferral of the shell-sandbox design, not an oversight.
+
   **Never do the audit in the session that received the request.** Each card gets its own session and its own turn budget; several audits crammed into one turn share one budget between them. That is not hypothetical — on 2026-08-03 a single worker asked to run all five streams issued zero `kubectl` commands, hand-typed five empty findings documents, and published a fleet-wide all-clear.
 
 ## Delegation

@@ -242,16 +242,21 @@ def fixture_catalog_disagreements() -> list[str]:
 
 
 def registered_cases() -> set[str] | None:
-    """Case names in the TASKS array, commented entries included.
+    """Case names in the TASKS and NIGHTLY_TASKS arrays, commented entries included.
 
-    A commented entry counts: it is registered, pending activation, which is
-    how the Phase 2 scenarios wait for the seeded fleet.
+    A commented TASKS entry counts: it is registered, pending activation,
+    which is how the Phase 2 scenarios wait for the seeded fleet. A
+    NIGHTLY_TASKS entry counts too: the nightly tier (EVAL_TIER=nightly in
+    hack/ci-eval-pr.sh) runs it every night, which is more registered than a
+    commented entry, not less.
 
-    TASKS is read from the script's text rather than by executing it: the
-    script provisions clusters and reads secrets, so running it to ask a
-    question is not an option. The parse is deliberately narrow -- the
-    TASKS=( ... ) block only -- and returns None when it finds nothing, so a
-    drifted parse fails loudly rather than calling every case an orphan.
+    Both arrays are read from the script's text rather than by executing it:
+    the script provisions clusters and reads secrets, so running it to ask a
+    question is not an option. The parse is deliberately narrow -- the two
+    named =( ... ) blocks only -- and returns None when TASKS is missing, so
+    a drifted parse fails loudly rather than calling every case an orphan.
+    NIGHTLY_TASKS missing is not None: were the array renamed away, its cases
+    would surface as named orphans, which is the better failure.
     """
     text = EVAL_SCRIPT.read_text(encoding="utf-8")
     # Multi-line arrays end at a line holding only ")": stopping at the first
@@ -262,7 +267,11 @@ def registered_cases() -> set[str] | None:
     )
     if match is None:
         return None
-    return set(re.findall(r"tasks/([A-Za-z0-9_-]+)/task\.yaml", match.group(1)))
+    blocks = [match.group(1)]
+    nightly = re.search(r"^NIGHTLY_TASKS=\((.*?)^\)", text, re.M | re.S)
+    if nightly is not None:
+        blocks.append(nightly.group(1))
+    return set(re.findall(r"tasks/([A-Za-z0-9_-]+)/task\.yaml", "\n".join(blocks)))
 
 
 def bench_cases() -> dict[str, pathlib.Path]:
@@ -517,12 +526,14 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
                 "and is still graded by the judge-only fallback"
             )
 
-    # Registration. hack/ci-eval-pr.sh runs the cases in TASKS and only those.
+    # Registration. hack/ci-eval-pr.sh runs the cases in TASKS and, on the
+    # nightly tier, NIGHTLY_TASKS -- and only those.
     if registered is not None and name not in registered and name not in KNOWN_UNREGISTERED:
         problems.append(
             "is registered nowhere and never runs. Add it to TASKS in "
             "hack/ci-eval-pr.sh (a commented entry counts as registered, "
-            "pending activation), or add a reviewed KNOWN_UNREGISTERED entry "
+            "pending activation), or to NIGHTLY_TASKS there if it is "
+            "nightly-tier, or add a reviewed KNOWN_UNREGISTERED entry "
             "in scripts/validate_bench_cases.py with the reason it must not run"
         )
 

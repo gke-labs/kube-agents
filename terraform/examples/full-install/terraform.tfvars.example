@@ -80,6 +80,9 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # model_default_name = "gemini-3.5-flash"
 # vertex_project_id  = ""
 # vertex_location    = ""
+# false when vertex_project_id is a project you cannot administer: you enable the
+# API and grant the gateway's service account roles/aiplatform.user by hand.
+# vertex_manage_serving_project = true
 
 
 # Optional GitHub integration and token minter backend (GSA + KMS signing key).

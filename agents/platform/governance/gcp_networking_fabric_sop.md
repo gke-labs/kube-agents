@@ -47,6 +47,7 @@ gcloud compute networks subnets list --format=json
 #### 2.2 Cloud NAT gateway port allocation saturation (`cloud-nat-exhaustion`)
 
 - **Severity**: `critical`
+- **Discovery**: `gcloud compute routers list --project=$PROJECT --format=json` — binds `$ROUTER` and `$REGION`; run the command below once per router whose `nats` list is non-empty. A router with no `nats` entry is a BGP router, not a NAT gateway: skip it rather than reading its empty mapping as a gateway without IPs. A project with no NAT router has nothing to inspect: record the check in `checks_run` with the discovery command, not in `limitations`.
 - **Command**: `gcloud compute routers get-nat-mapping-info $ROUTER --region=$REGION --project=$PROJECT --format=json`
 - **Condition**: Cloud NAT mapping indicates allocated ports exceed 80% available port capacity per VM or gateway lacks auto-allocated IP addresses.
 - **Remediation**: Increase `minPortsPerVm` or add additional NAT IP addresses in Cloud Router specification.

@@ -50,12 +50,16 @@ Kill the process with Ctrl-C. `make uninstall` removes the CRDs.
 ## Deploy the manager into a cluster
 
 ```bash
-make docker-build IMG=<your-registry>/kube-agents-operator:dev
-make docker-push  IMG=<your-registry>/kube-agents-operator:dev
-make deploy        IMG=<your-registry>/kube-agents-operator:dev
+export IMG=<your-registry>/kube-agents-operator:$(git rev-parse HEAD)
+make docker-build IMG=$IMG
+make docker-push  IMG=$IMG
+make deploy       IMG=$IMG
 ```
 
-`make undeploy` removes it.
+`make deploy` refuses a floating tag such as `latest`: a pod reschedule would pull a newer
+controller under the ClusterRole this deploy applied, and the next verb it needs fails with
+`forbidden`. The refused tags and the `ALLOW_MUTABLE_IMG=1` override are on the
+[operator page](/kube-agents/operator/#an-image-ahead-of-its-clusterrole). `make undeploy` removes it.
 
 ## Fast agent iteration (dev only)
 

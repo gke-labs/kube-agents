@@ -222,11 +222,13 @@ expected-fail, and the flip to `false` shows up in the diff that closes the gap.
 than by devops-bench.
 
 A new task must also be registered: the presubmit runs only what the `TASKS` array in
-`hack/ci-eval-pr.sh` names, and `scripts/test_task_registration.py` fails the build for a
-task that appears nowhere. A commented-out `TASKS` entry counts as registered, pending
-activation — that is how scenarios wait for infrastructure that does not exist yet — and a
-task that deliberately must not run needs a reviewed entry in
-`scripts/validate_bench_cases.py`'s `KNOWN_UNREGISTERED` with the reason.
+`hack/ci-eval-pr.sh` names, the nightly adds what `NIGHTLY_TASKS` names (appended when
+the job exports `EVAL_TIER=nightly`), and `scripts/test_task_registration.py` fails the
+build for a task that appears in neither. A commented-out `TASKS` entry counts as
+registered, pending activation — that is how scenarios wait for infrastructure that does
+not exist yet; a `NIGHTLY_TASKS` entry is for a validated case too slow or too redundant
+for a presubmit seat — and a task that deliberately must not run needs a reviewed entry
+in `scripts/validate_bench_cases.py`'s `KNOWN_UNREGISTERED` with the reason.
 
 A task whose verification reads live cluster state also carries `fixtures:`, a list of
 seeded-fleet role slugs from `bench/tf/fleet/fixtures.json`, or `fixtures: []` if it

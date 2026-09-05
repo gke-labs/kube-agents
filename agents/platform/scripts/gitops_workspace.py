@@ -1,4 +1,4 @@
-#!/opt/hermes/.venv/bin/python3
+#!/usr/bin/env python3
 """One private git clone per concurrent operation, so agents stop stomping.
 
 The pod does not run in a checkout. `hermes run` starts an agent in its profile
@@ -559,6 +559,57 @@ def ensure_workspace(
     return target
 
 
+def ensure_scratch_workspace(
+    repo: str,
+    *,
+    lease: str,
+    root: str | Path | None = None,
+    reset: bool = False,
+    owner: str | None = None,
+) -> Path:
+    """The same leased path as `ensure_workspace`, with no clone in it.
+
+    What a caller gets is a directory and nothing else: no `.git`, no remote, no
+    checkout. It is for the content-passing path, where the repository lives in
+    the broker and the agent's side of the exchange is a pile of files it wrote.
+    Removing the clone is the point — a `.git` the agent can write is where a
+    filter driver, an alias or a hook path would have to be defined for the
+    known code-execution routes through the credential container to work, and
+    an agent that never has one cannot define any of them.
+
+    Everything else about the lease is unchanged, deliberately. The path is the
+    same function of repository and lease, so `start` and `finish` still find
+    each other with no lookup state; the marker is still written, so the reaper
+    still collects the directory when the stream stops running; and the reap
+    still happens here, so a fleet that migrates does not leave its old clones
+    behind forever.
+
+    `reset` empties the directory. Same rule as the clone path: only the command
+    that runs *before* the agent writes anything may ask for it.
+    """
+    root = Path(root if root is not None else default_root())
+    lease = sanitize_lease(lease)
+    holder = lease_dir(root, lease)
+    target = workspace_path(repo, root, lease=lease)
+
+    with workspace_lock(root):
+        root.mkdir(parents=True, exist_ok=True)
+        reap_stale_leases(root, keep={lease})
+        write_lease(holder, lease, repo, owner=owner)
+
+    # `reset` is the only thing that deletes, including when what is there is a
+    # clone left by the directory path. A stream whose broker was armed between
+    # `start` and `finish` finds one, and clearing it then would delete the
+    # manifests the agent wrote in between — the same data loss `reset=False`
+    # exists to prevent on the clone path. Nothing runs `git` here, so an
+    # unwanted `.git` sitting in the directory for one run is inert; the next
+    # `start` takes it away.
+    if reset and target.exists():
+        _remove_tree(target)
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -652,6 +703,7 @@ def extract_github_slug(entry: str) -> str | None:
 
 
 DEFAULT_GITOPS_STATE_PATH = "/etc/gitops/managed_repos"
+GITOPS_STATE_READ_TIMEOUT_SECONDS = 30
 
 
 def _parse_managed_repos_json(repos_str: str) -> list[dict[str, str]]:
@@ -685,6 +737,15 @@ def get_managed_repo_entries() -> list[dict[str, str]]:
             return _parse_managed_repos_json(content)
         except Exception:
             pass
+    elif state_file.parent.is_dir():
+        # The mount is there and the key is not, which is what kubelet projects
+        # for a ConfigMap with no data: an install with nothing registered. That
+        # is a known-empty list, not an unreadable one, and the two get
+        # different answers from callers that gate on the list. Falling through
+        # to kubectl here would turn it into the unreadable one -- the broker
+        # pod has no context of its own to pass, so the fallback fails and every
+        # gated call answers 503 instead of refusing the repository.
+        return []
 
     cfg_name = os.environ.get("GITOPS_STATE_CONFIGMAP", "platform-agent-gitops-state")
     ns = os.environ.get("KUBE_DEFAULT_NAMESPACE", "kubeagents-system")
@@ -700,9 +761,15 @@ def get_managed_repo_entries() -> list[dict[str, str]]:
             capture_output=True,
             text=True,
             check=True,
+            timeout=GITOPS_STATE_READ_TIMEOUT_SECONDS,
         )
     except FileNotFoundError as e:
         raise RuntimeError("kubectl binary not found in PATH") from e
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"Timed out after {GITOPS_STATE_READ_TIMEOUT_SECONDS}s reading ConfigMap "
+            f"{cfg_name} in namespace {ns}"
+        ) from e
     except subprocess.CalledProcessError as e:
         err_msg = (e.stderr or e.stdout or "").strip()
         raise RuntimeError(

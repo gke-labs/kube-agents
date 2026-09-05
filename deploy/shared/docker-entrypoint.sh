@@ -11,6 +11,16 @@ set -e
 # files that already exist at mount time; this fixes up the ones created after.
 umask 0002
 
+# Below the umask and not above it, where the rest of this file's constants would
+# go: tests/test_startup_umask.py asserts that the umask is the first line here
+# that can create a file, and it reads the file rather than running it, so an
+# assignment above the umask reads to it as that line.
+#
+# EXIT_RETRY in deploy/shared/sandbox_mirror.py: the mirror failed in a way the
+# next container start fixes on its own. Step 5.7 warns on it and lets the agent
+# come up; every other non-zero exit there is still fatal. Change both together.
+readonly SANDBOX_MIRROR_RETRY_RC=2
+
 export TARGET_DIR="${PLATFORM_AGENT_HOME:-/opt/data}"
 export HERMES_HOME="$TARGET_DIR"
 export INSTALL_DIR="/opt/hermes"
@@ -199,16 +209,14 @@ if ! agent_owns_shared_state "$@"; then
     #
     # Skipping the SETUP is not skipping the cwd. This branch execs ~600 lines above the
     # `cd "$TARGET_DIR"` at the bottom, so without this the handed-over process keeps
-    # whatever directory the container started in — /opt/hermes for the dashboard sidecar.
-    # That is not cosmetic: the credential proxy refuses any cwd outside
-    # CREDENTIAL_PROXY_WORKSPACE_ROOT, which the operator sets to this same $TARGET_DIR,
-    # so every kubectl/gcloud/gh/git call in a non-owner container fails with "working
-    # directory is outside the shared workspace" before it runs. The reasoning for the
-    # cd, and why the cwd is the only lever that reaches every caller, is at the bottom.
+    # whatever directory the container started in — /opt/hermes for the dashboard sidecar,
+    # which is read-only to the runtime user, so every relative path it writes is lost.
+    # The reasoning for the cd, and why the cwd is the only lever that reaches every
+    # caller, is at the bottom.
     # Guarded for the same reason it is there: a non-owner can legitimately start before
     # the owner has created the tree, and that must not abort the container.
     if ! cd "$TARGET_DIR"; then
-        echo "WARN: could not enter $TARGET_DIR; credentialed CLIs (kubectl/gcloud/gh/git) will be refused by the credential proxy as out-of-workspace" >&2
+        echo "WARN: could not enter $TARGET_DIR; relative paths will resolve against a read-only directory" >&2
     fi
     exec "$@"
 fi
@@ -1438,8 +1446,11 @@ if [ -n "$BOOTSTRAP_LOCK_FD" ]; then
     exec 9>&-
 fi
 
-# 4.5 The scratch directory where scripts stage `gh --body-file` payloads for
-# the credential sidecar (audit_report._write_temp, github_scan_gate._post_body).
+# 4.5 The scratch directory scripts stage files in — the fleet audit's findings
+# JSON, and the `gh --body-file` payloads github_scan_gate._post_body hands to
+# the credential sidecar. The audit's own bodies no longer come through here:
+# they travel on stdin (audit_report.BODY_STDIN), which is where the remaining
+# body-file caller should end up too.
 # Created HERE, deterministically and under this script's umask-0002 discipline
 # (the header comment on the #955 UID split), rather than lazily by whichever
 # process reaches it first with whatever umask it happens to carry: the sandbox
@@ -1469,12 +1480,10 @@ if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$TARGET_DIR/scripts/session_kv_ser
     PYTHONPATH="$TARGET_DIR/scripts" "$INSTALL_DIR/.venv/bin/python3" -m uvicorn scripts.session_kv_server:app --app-dir "$TARGET_DIR" --host 127.0.0.1 --port 8699 >"$TARGET_DIR/logs/session_kv_server.log" 2>&1 &
 fi
 
-# 5.5. The default kubectl context is NOT established here. `gcloud` in this
-# container is the credential-proxy shim, so get-credentials would execute in
-# the sidecar and write the sidecar's kubeconfig, not ours — and it is rejected
-# outright, because the steps above run from a working directory outside
-# CREDENTIAL_PROXY_WORKSPACE_ROOT (step 6 moves into it, but only for the agent
-# process it execs). The sidecar bootstraps its own context from
+# 5.5. The default kubectl context is NOT established here. There is no `gcloud`
+# in this container at all as of #737 — not the binary and not the shim — and
+# before that the shim would have run get-credentials in the sidecar and written
+# the sidecar's kubeconfig, not ours. The sidecar bootstraps its own context from
 # CREDENTIAL_PROXY_BOOTSTRAP_COMMAND (see buildCredentialProxyEnv in the
 # operator), which runs inside the workspace root before the proxy serves any
 # request. The k8s-event-watcher does not need a copy either: it runs inside the
@@ -1532,16 +1541,92 @@ if [ -f "$TARGET_DIR/scripts/memory_file_import.py" ] && memory_import_wanted; t
     ) &
 fi
 
-# 6. Execute primary process from inside the shared workspace.
+# 5.7. Mirror the profile layout into the shell sandbox, and move the model's
+# existing files across the first time.
 #
-# The image inherits WORKDIR /opt/hermes from the upstream base, and every
-# credentialed CLI in this container (kubectl, gcloud, gh, git) is a PATH shim
-# for credential_proxy_client.py. That client posts `"cwd": os.getcwd()` on
-# every request unconditionally, and the proxy refuses any cwd outside
-# CREDENTIAL_PROXY_WORKSPACE_ROOT — which the operator sets to this same
-# $TARGET_DIR. Launched from /opt/hermes, therefore, a plain `kubectl version
-# --client` fails with "working directory is outside the shared workspace"
-# before it runs, purely because of where the process was started.
+# The shell, the file tools and execute_code all run in the sandbox pod now, so
+# two things that used to be true stopped being true on the day that landed.
+# Paths under $TARGET_DIR/profiles/<name> no longer resolve for a file tool —
+# the sandbox has the machine home and nothing below it — and everything the
+# model had already written to $TARGET_DIR became invisible to it while staying
+# on the volume. The script's docstring covers what crosses and what does not.
+#
+# Here rather than in the sandbox's own entrypoint because the profile list is
+# on this pod's PVC and cluster profiles are created at runtime; the sandbox
+# cannot enumerate what it has never seen. cluster_agent_profile.py calls the
+# same script with --skeleton-only when it scaffolds one, so a profile created
+# between restarts does not wait for the next one.
+#
+# Foreground, and fatal on EXIT_FATAL only. It was neither, and the reason it
+# was both is sound as far as it goes: the sandbox is a separate StatefulSet
+# with no start ordering against this Deployment, so "not up yet" is an ordinary
+# outcome rather than an error. What that misses is that the script already
+# draws the distinction. A sandbox that never answers inside --wait returns 0
+# and leaves the marker unwritten, so the next start retries; the fatal exits
+# are a --remote-root that is not the sandbox's volume, and a transfer that ran
+# and failed. Neither is survivable and neither is transient, so backgrounding
+# them bought nothing but silence: the agent came up healthy, the model's files
+# were still on this volume where its shell can no longer see them, and the sole
+# trace was a WARN line in a log file nobody reads. That happened on a live
+# upgrade — ten cluster profile homes, every one Permission denied — and it was
+# found by hand, days later.
+#
+# Fatal on *those* and not on everything non-zero, which is the correction. The
+# layout push and the marker write both reach a filesystem uid 1000 owns, so the
+# model can make either fail — and while any non-zero exit landed here, that was
+# a way for a prompt injection to CrashLoopBackOff this container permanently,
+# with no path back because the thing that would repair it is the thing that is
+# down. Those two now return EXIT_RETRY and warn instead.
+#
+# Exiting non-zero here is what makes it visible, and it needs no privilege the
+# agent does not have. The kubelet restarts the container, CrashLoopBackOff
+# follows, and getDeploymentStatusDetails in the operator already scans the
+# gateway pod's container statuses for a waiting reason and writes it into the
+# CR: phase Degraded, Ready=False, and a message naming this container. The
+# tail below puts the cause in `kubectl logs`, which is where the CR sends you.
+#
+# The cost is startup latency in the one case that blocks — a sandbox that is
+# slow rather than absent — bounded by --wait at 180s. The startupProbe budget
+# is agentAPIProbe(10, 60), 600s, and progressDeadlineSeconds is 1200, so the
+# wait fits with room over. The copy itself runs once: it is guarded by a marker
+# on the sandbox's own volume, so a fresh sandbox PVC gets a fresh copy and every
+# later start skips it and re-pushes only the layout.
+#
+# Gated on IS_BOOTSTRAP_PRIMARY: every replica can reach the sandbox, and two
+# tar streams extracting into the same directory would race. --skip-old-files
+# makes that lossless rather than harmful, but there is no reason to run it
+# twice.
+SANDBOX_MIRROR_SCRIPT="/opt/defaults/scripts/sandbox_mirror.py"
+[ -f "$SANDBOX_MIRROR_SCRIPT" ] || SANDBOX_MIRROR_SCRIPT="$TARGET_DIR/scripts/sandbox_mirror.py"
+if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$SANDBOX_MIRROR_SCRIPT" ]; then
+    echo "Mirroring the profile layout into the shell sandbox..."
+    SANDBOX_MIRROR_RC=0
+    HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
+        "$SANDBOX_MIRROR_SCRIPT" --agent-home "$TARGET_DIR" \
+        >>"$TARGET_DIR/logs/sandbox_mirror.log" 2>&1 || SANDBOX_MIRROR_RC=$?
+    if [ "$SANDBOX_MIRROR_RC" = "$SANDBOX_MIRROR_RETRY_RC" ]; then
+        echo "WARN: the shell sandbox mirror did not finish, in a way the next start retries. Nothing has been lost -- the copy either has not run or has already landed. Last lines of logs/sandbox_mirror.log:" >&2
+        tail -n 20 "$TARGET_DIR/logs/sandbox_mirror.log" >&2 || true
+    elif [ "$SANDBOX_MIRROR_RC" != "0" ]; then
+        echo "FATAL: the shell sandbox migration failed. The model's files are still on this pod's volume, where its shell cannot reach them, so this container is refusing to start rather than come up looking healthy with the agent's work missing. Last lines of logs/sandbox_mirror.log:" >&2
+        tail -n 20 "$TARGET_DIR/logs/sandbox_mirror.log" >&2 || true
+        exit 1
+    fi
+fi
+
+# 6. Execute primary process from inside the agent's own directory.
+#
+# The image inherits WORKDIR /opt/hermes from the upstream base, which is
+# read-only to the runtime user, so a process left there writes every relative
+# path into a directory it cannot write and loses every one it can. $TARGET_DIR
+# is the writable home on the PVC.
+#
+# This used to be a credential rule as well: every CLI in this container was a
+# credential-proxy shim, the client posted `"cwd": os.getcwd()` on every
+# request, and the proxy refused any cwd outside its workspace root — so a plain
+# `git status` launched from /opt/hermes failed before it ran. #737 took the
+# shims out of this image entirely, so what is left is the write-path reason
+# above, which is enough on its own.
 #
 # The cwd is the only lever that reaches every caller. Hermes resolves the
 # terminal and execute_code working directories from a ladder that ends at
@@ -1556,7 +1641,7 @@ fi
 # one. $TARGET_DIR is created in step 2 and written throughout, so the warning
 # is a canary for a broken mount rather than an expected path.
 if ! cd "$TARGET_DIR"; then
-    echo "WARN: could not enter $TARGET_DIR; credentialed CLIs (kubectl/gcloud/gh/git) will be refused by the credential proxy as out-of-workspace" >&2
+    echo "WARN: could not enter $TARGET_DIR; relative paths will resolve against a read-only directory" >&2
 fi
 
 exec "$@"

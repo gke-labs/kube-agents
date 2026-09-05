@@ -1,6 +1,6 @@
 """Cross-file contract lints: joins that nothing in any language checks.
 
-Three contracts, each of which fails silently today when the two sides drift:
+Four contracts, each of which fails silently today when the two sides drift:
 
 * A verification spec naming a tool that no registry defines can never trip —
   the silent-green shape review found on the first gate branch (a safeguard
@@ -12,6 +12,9 @@ Three contracts, each of which fails silently today when the two sides drift:
   workflows: [...]`) and artifact-name strings; renaming a workflow silently
   disables every consumer, which for the autopush chain means continuous
   deployment stops without a red anywhere.
+* The broken-main notifier watches a fixed roster of push-to-main workflows;
+  a required check dropped from that roster goes red on main without anyone
+  being told, which is how a thirteen-hour red main went unnoticed (#1223).
 """
 
 from __future__ import annotations
@@ -28,6 +31,22 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = REPO_ROOT / ".github" / "workflows"
+
+# The push-to-main workflows `main-broken-notify.yml` must watch: every required
+# push-to-main workflow whose run re-checks everything it covers, so its green on
+# main is a statement about the tree. The header of that workflow says what
+# qualifies and why `Prettier Check` does not. `Documentation Checks` and
+# `Python Unit Tests` are here because they were missing when both went red on
+# main for thirteen hours and nothing paged (gke-labs/kube-agents#1223).
+BROKEN_MAIN_NOTIFIER = "main-broken-notify.yml"
+BROKEN_MAIN_WATCHED_WORKFLOWS = (
+    "Actionlint",
+    "Docker Build",
+    "Documentation Checks",
+    "Operator Tests",
+    "Python Unit Tests",
+    "Validate Repo Structure",
+)
 SCRIPTS_DIR = REPO_ROOT / "agents" / "platform" / "scripts"
 
 
@@ -303,6 +322,27 @@ class WorkflowNameJoinTest(unittest.TestCase):
             broken,
             "workflow_run references that match no workflow name: a rename "
             "has silently disabled these consumers: " + ", ".join(broken),
+        )
+
+    def test_the_broken_main_notifier_watches_every_whole_tree_required_check(self):
+        """A required check missing from the watch list fails silently: main
+        goes red, every open pull request inherits the red, and nobody is told.
+        That is how #1223's thirteen-hour window happened. The test above
+        catches a watched name that stopped matching; this one catches a name
+        dropped from the list in an edit. Neither can tell that a context newly
+        promoted to required was never added: required-ness lives in branch
+        protection, not in the tree, so adding a workflow to this tuple stays a
+        review question whenever one joins the required set."""
+        document = self._workflows()[BROKEN_MAIN_NOTIFIER]
+        triggers = document.get("on") or document.get(True) or {}
+        watched = set((triggers.get("workflow_run") or {}).get("workflows") or [])
+        missing = sorted(set(BROKEN_MAIN_WATCHED_WORKFLOWS) - watched)
+        self.assertEqual(
+            [],
+            missing,
+            f"{BROKEN_MAIN_NOTIFIER} no longer watches these push-to-main "
+            "workflows, so a red on main from any of them files no issue: "
+            + ", ".join(missing),
         )
 
     def test_the_required_python_job_runs_the_suite_in_strict_mode(self):

@@ -44,6 +44,10 @@ define_print_helpers
 
 # ─── Process Lock File & Error Trap Handling ────────────────────────────────
 LOCK_FILE="/tmp/kube-agents-install.lock"
+# The gateway's service account id when the kustomize path's LITELLM_GSA_NAME is
+# not in the environment; must agree with module.litellm_vertex_iam in
+# terraform/examples/full-install/main.tf.
+LITELLM_GSA_DEFAULT_NAME="kubeagents-litellm-gsa"
 if command -v flock >/dev/null 2>&1; then
   if ( : >"$LOCK_FILE" ) 2>/dev/null && exec 200>"$LOCK_FILE"; then
     if ! flock -n 200 2>/dev/null; then
@@ -312,6 +316,7 @@ PARAM_CLUSTER_MODE="${CLUSTER_MODE:-}"
 PARAM_MODEL_PROVIDER="${MODEL_PROVIDER:-}"
 PARAM_VERTEX_PROJECT_ID="${VERTEX_PROJECT_ID:-}"
 PARAM_VERTEX_LOCATION="${VERTEX_LOCATION:-}"
+PARAM_VERTEX_MANAGE_SERVING_PROJECT="${VERTEX_MANAGE_SERVING_PROJECT:-}"
 PARAM_GEMINI_API_KEY="${GEMINI_API_KEY:-}"
 PARAM_OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 PARAM_ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
@@ -410,6 +415,13 @@ Flags for AI Agents & Automation:
   --vertex-project-id=ID        GCP project serving Vertex AI models (default: --project-id)
   --vertex-location=LOCATION    Vertex AI serving location, a region or "global"
                                 (default: DEFAULT_VERTEX_LOCATION, currently global)
+  --vertex-manage-serving-project=BOOL
+                                Whether the install enables the Vertex AI API in
+                                --vertex-project-id and grants the gateway's service
+                                account roles/aiplatform.user there. Pass false when
+                                that project is one you cannot administer, and enable
+                                the API and make the grant by hand
+                                (default: DEFAULT_VERTEX_MANAGE_SERVING_PROJECT, currently true)
   --gemini-api-key=KEY          Gemini API Key
   --openai-api-key=KEY          OpenAI API Key
   --anthropic-api-key=KEY       Anthropic API Key
@@ -493,6 +505,7 @@ parse_args() {
       --model-default-name=*) PARAM_MODEL_DEFAULT_NAME="${1#*=}"; shift ;;
       --vertex-project-id=*) PARAM_VERTEX_PROJECT_ID="${1#*=}"; shift ;;
       --vertex-location=*) PARAM_VERTEX_LOCATION="${1#*=}"; shift ;;
+      --vertex-manage-serving-project=*) PARAM_VERTEX_MANAGE_SERVING_PROJECT="${1#*=}"; shift ;;
       --gemini-api-key=*) PARAM_GEMINI_API_KEY="${1#*=}"; shift ;;
       --openai-api-key=*) PARAM_OPENAI_API_KEY="${1#*=}"; shift ;;
       --anthropic-api-key=*) PARAM_ANTHROPIC_API_KEY="${1#*=}"; shift ;;
@@ -951,6 +964,7 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" MODEL_DEFAULT_NAME "${MODEL_DEFAULT_NAME:-}"
   write_env_var "$tmp" VERTEX_PROJECT_ID "${VERTEX_PROJECT_ID:-}"
   write_env_var "$tmp" VERTEX_LOCATION "${VERTEX_LOCATION:-}"
+  write_env_var "$tmp" VERTEX_MANAGE_SERVING_PROJECT "${VERTEX_MANAGE_SERVING_PROJECT:-}"
   write_secret_env_var "$tmp" GEMINI_API_KEY "${GEMINI_API_KEY:-}"
   write_secret_env_var "$tmp" OPENAI_API_KEY "${OPENAI_API_KEY:-}"
   write_secret_env_var "$tmp" ANTHROPIC_API_KEY "${ANTHROPIC_API_KEY:-}"
@@ -2097,6 +2111,7 @@ run_menu_system() {
         save_env_var MODEL_DEFAULT_NAME "$model_default_name"
         save_env_var VERTEX_PROJECT_ID "$vertex_project_id"
         save_env_var VERTEX_LOCATION "$vertex_location"
+        save_env_var VERTEX_MANAGE_SERVING_PROJECT "${VERTEX_MANAGE_SERVING_PROJECT:-$DEFAULT_VERTEX_MANAGE_SERVING_PROJECT}"
         save_secret_env_var GEMINI_API_KEY "$gemini_api_key"
         save_secret_env_var OPENAI_API_KEY "$openai_api_key"
         save_secret_env_var ANTHROPIC_API_KEY "$anthropic_api_key"
@@ -2569,6 +2584,14 @@ main() {
   # DEFAULT_VERTEX_LOCATION in scripts/installer/installer_common.sh.
   local vertex_project_id="${PARAM_VERTEX_PROJECT_ID:-$project_id}"
   local vertex_location="${PARAM_VERTEX_LOCATION:-$DEFAULT_VERTEX_LOCATION}"
+  # Loud like --gvisor and --enable-web-ui, not lenient like the chat booleans:
+  # a typo read as false would silently skip the two serving-project resources,
+  # and the first sign would be the gateway's 403 on its first model call.
+  local vertex_manage_serving_project="${PARAM_VERTEX_MANAGE_SERVING_PROJECT:-$DEFAULT_VERTEX_MANAGE_SERVING_PROJECT}"
+  if [[ ! "$vertex_manage_serving_project" =~ ^(true|false)$ ]]; then
+    print_error "--vertex-manage-serving-project must be either true or false."
+    exit 1
+  fi
 
   local detected_gemini_key="${PARAM_GEMINI_API_KEY:-${GEMINI_API_KEY:-}}"
   if [ -z "$detected_gemini_key" ]; then
@@ -2650,6 +2673,10 @@ main() {
     vertex_ai)
       print_info "Vertex AI needs no API key: LiteLLM authenticates as ${LITELLM_GSA_NAME:-kubeagents-litellm-gsa}@${project_id}.iam.gserviceaccount.com via Workload Identity."
       print_info "Serving ${model_default_name} from projects/${vertex_project_id}/locations/${vertex_location}."
+      if [ "$vertex_manage_serving_project" != "true" ]; then
+        print_info "The install will not touch project ${vertex_project_id}. Enable aiplatform.googleapis.com there and grant roles/aiplatform.user to ${LITELLM_GSA_NAME:-$LITELLM_GSA_DEFAULT_NAME}@${project_id}.iam.gserviceaccount.com yourself; model calls fail until you do."
+        print_info "If an earlier apply of this install created that grant, remove both serving-project resources from Terraform state before continuing, or this apply revokes it — terraform/examples/full-install/README.md names the two addresses."
+      fi
       # The literal, not $DEFAULT_VERTEX_LOCATION: this warns about a property
       # of the global endpoint, not about the default being in effect. Tying it
       # to the constant would fire with false text if the default ever moved to
@@ -3022,6 +3049,7 @@ main() {
   export MODEL_DEFAULT_NAME="$model_default_name"
   export VERTEX_PROJECT_ID="$vertex_project_id"
   export VERTEX_LOCATION="$vertex_location"
+  export VERTEX_MANAGE_SERVING_PROJECT="$vertex_manage_serving_project"
   export GEMINI_API_KEY="$gemini_api_key"
   export OPENAI_API_KEY="$openai_api_key"
   export ANTHROPIC_API_KEY="$anthropic_api_key"

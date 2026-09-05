@@ -36,6 +36,20 @@ Canonical GKE-oriented Helm chart for deploying the Kube-Agents Kubernetes Opera
   whatever created the Secret supplies them; the Terraform full-install
   composition does.
 
+  Two more, `SANDBOX_SSH_PRIVATE_KEY` and `SANDBOX_SSH_PUBLIC_KEY`, are the
+  agent's keypair for the shell sandbox, and they are the one pair the chart
+  cannot generate: sprig can make an ed25519 private key but has no function
+  that encodes the public half in `authorized_keys` form. Supply both or
+  neither. The Terraform full-install composition generates them and
+  `upgrade.sh` backfills them, so only a bare `helm install` has to supply them
+  by hand. Given the public half, the chart
+  also renders `<platformAgent.name>-shell-authorized-keys`, the single-entry
+  Secret the sandbox mounts — the sandbox never mounts the credential Secret
+  itself. Without the pair nothing breaks on an install that leaves
+  `harness.experimental.shellSandbox` off, which is the default; with it on, the
+  agent has no key to dial the sandbox with. See
+  [`docs/designs/agent-shell-sandboxing.md`](../../docs/designs/agent-shell-sandboxing.md).
+
   Absent, the pod starts anyway — but the in-pod `k8s-event-watcher`
   authenticates with `SESSION_KV_API_KEY`, treats an empty value as fatal, and
   exits on every start, so **no cluster events are watched at all**; the
@@ -126,14 +140,17 @@ name only, matching the flat layout `mirror-images` writes. Set
 fluent-bit under a different path; it defaults to `global.imageRegistry`.
 
 It reaches more than the containers the chart renders. The operator resolves
-two images at reconcile time that appear in no chart template — the agent image
-for a `PlatformAgent` that omits `spec.deployment.image`, and the fluent-bit
-logging sidecar it injects into every agent pod — so the chart passes both to
-the operator as `PLATFORM_AGENT_IMAGE` and `FLUENT_BIT_IMAGE`. Without that a
-mirrored install reaches `ghcr.io` and Docker Hub minutes after `helm install`
-reported success. `CREDENTIAL_PROXY_IMAGE` is deliberately not passed: the
-operator derives that sidecar from the agent image by swapping the trailing
-name, so it follows the mirror on its own.
+three images at reconcile time that appear in no chart template — the agent
+image for a `PlatformAgent` that omits `spec.deployment.image`, the shell
+sandbox StatefulSet it renders beside every agent pod, and the fluent-bit
+logging sidecar it injects into that pod — so the chart passes all three to the
+operator as `PLATFORM_AGENT_IMAGE`, `AGENT_SANDBOX_IMAGE`, and
+`FLUENT_BIT_IMAGE`. Without that a mirrored install reaches `ghcr.io` and Docker
+Hub minutes after `helm install` reported success. `CREDENTIAL_PROXY_IMAGE` is
+deliberately not passed: the operator derives the broker image from the agent
+image by swapping the trailing name, so it follows the mirror on its own. The
+sandbox image cannot be derived that way — it is a separate repository — which
+is why it has to be named.
 
 The prefix is not a per-image default — it replaces every image's registry and
 path, keeping the trailing name, because that is the flat layout
@@ -142,8 +159,8 @@ path, keeping the trailing name, because that is the flat layout
 joined to, not where the image is pulled from. To place images individually —
 most on the mirror, one somewhere else — leave `global.imageRegistry` empty and
 give each `*.image.repository` its full mirrored path instead; the operator's
-`PLATFORM_AGENT_IMAGE` and `FLUENT_BIT_IMAGE` are rendered from those values
-either way.
+`PLATFORM_AGENT_IMAGE`, `AGENT_SANDBOX_IMAGE`, and `FLUENT_BIT_IMAGE` are
+rendered from those values either way.
 
 Anything in `operator.extraEnv` is appended after the env vars above and
 therefore wins.
@@ -364,7 +381,7 @@ node's cache. The chart and the Terraform composition agree on `Always` for the
 mutable-tag case they were both written for; an install at a pinned release
 tag is the case that wants the override.
 
-Two knobs need context beyond the chart:
+Four knobs need context beyond the chart:
 
 - `deployment.availability.runtimeClassName` defaults to `gvisor`, because the
   agent executes model-authored commands and an unsandboxed pod shares the node
@@ -379,6 +396,20 @@ Two knobs need context beyond the chart:
   which `install.sh` writes from `--gvisor`. That variable still defaults to
   `""`, so a bare `terraform apply` against the composition leaves the agent
   unsandboxed where a bare `helm install` sandboxes it.
+- `harness.experimental.shellSandbox.runtimeClassName` is the same choice for the
+  shell sandbox pod, and it is a separate key because the two pods are scheduled
+  and sized separately — a node pool that can run one need not be the pool the
+  other lands on. It has no default: unset leaves the sandbox on the node's
+  standard runtime, and `gvisor` needs the same GKE Sandbox node pool the agent's
+  key does.
+- `security.workloadIdentityFederation` needs a Workload Identity pool and
+  provider trusting the cluster's OIDC issuer, and one
+  `roles/iam.workloadIdentityUser` grant on the agent's GSA. Nothing creates
+  them: the three `gcloud` commands are in
+  [`designs/agent-shell-sandboxing.md`](../../docs/designs/agent-shell-sandboxing.md#setting-up-the-pool).
+  Set it with `harness.experimental.shellSandbox.enabled` — the chart fails the
+  render if you set one without the other, since federation only takes effect
+  when the credential proxy runs beside the sandbox.
 - `harness.hermes.dashboardEnabled` defaults to `null`, which leaves the field
   out of the CR so the CRD default (`true`) applies. Set it explicitly when an
   install must pin the dashboard on or off rather than float with the CRD.

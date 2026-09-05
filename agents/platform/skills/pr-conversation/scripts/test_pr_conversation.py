@@ -81,11 +81,10 @@ class FakeProvider:
             raise self.commits
         return list(self.commits)
 
-    def post_comment(self, repo, pr, body_file):
+    def post_comment(self, repo, pr, body):
         if self.post_error:
             raise self.post_error
-        with open(body_file, "r", encoding="utf-8") as handle:
-            self.posted.append((pr.number, handle.read()))
+        self.posted.append((pr.number, body))
 
 
 #: When the default request in these tests was made. Every commit below lands

@@ -76,6 +76,12 @@ FROM ${ENVOY_IMAGE}:${ENVOY_VERSION} AS envoy-bin
 # cross-compiles to TARGETARCH, the architecture of the image being produced.
 # The :-amd64 fallback only fires on builders that don't populate TARGETARCH.
 FROM --platform=$BUILDPLATFORM ${GOLANG_IMAGE}:${GOLANG_VERSION} AS watcher-builder
+# The official golang image sets this already; repeated so a substituted
+# GOLANG_IMAGE cannot reintroduce GOTOOLCHAIN=auto, under which a
+# k8s-operator/go.mod newer than GOLANG_VERSION would download a toolchain the
+# pin does not name instead of failing. Same reason as k8s-operator/Dockerfile
+# (#1138).
+ENV GOTOOLCHAIN=local
 ARG TARGETOS
 ARG TARGETARCH
 WORKDIR /workspace
@@ -103,17 +109,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Install credential-free utility CLIs used by the sandbox.
-RUN ARCH=$(dpkg --print-architecture) && \
-    curl -sSLf -o /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/v4.53.3/yq_linux_${ARCH}" && \
-    chmod +x /usr/local/bin/yq && \
-    curl -sSLf -o /tmp/k9s.tar.gz "https://github.com/derailed/k9s/releases/download/v0.51.0/k9s_Linux_${ARCH}.tar.gz" && \
-    tar -xzf /tmp/k9s.tar.gz -C /usr/local/bin k9s && \
-    rm /tmp/k9s.tar.gz && \
-    curl -sSLf -o /tmp/helm.tar.gz "https://get.helm.sh/helm-v3.15.2-linux-${ARCH}.tar.gz" && \
-    tar -xzf /tmp/helm.tar.gz -C /tmp && \
-    mv /tmp/linux-${ARCH}/helm /usr/local/bin/helm && \
-    rm -rf /tmp/helm.tar.gz /tmp/linux-${ARCH}
+# 2. No helm, k9s or yq. They were here for the model's shell, and the shell now
+# runs in the sandbox image (deploy/sandbox/Dockerfile), which installs the two
+# of them it can use at the same pinned versions. Nothing left in this container
+# invokes a cluster CLI: Hermes and the Python services that used to shell out to
+# one call agents/platform/scripts/sandbox_exec.py and run it over SSH instead.
+# The guard at the end of this stage fails the build if any of them returns.
 
 RUN /usr/local/bin/uv pip install --python /opt/hermes/.venv/bin/python \
     ddgs \
@@ -1168,11 +1169,17 @@ RUN HOME=/opt/defaults HERMES_HOME=/opt/defaults /opt/hermes/.venv/bin/hermes pl
     /opt/hermes/.venv/bin/python3 -c "import yaml, pathlib; p = pathlib.Path('/opt/defaults/plugins/hermes_otel/config.yaml'); c = yaml.safe_load(p.read_text()) or {} if p.exists() else {}; c['backends'] = [{'name': 'gke-managed-otel', 'type': 'otlp', 'endpoint': 'http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318/v1/traces'}]; p.write_text(yaml.safe_dump(c))"
 
 # Remove the build-only clone dependency after all plugin installation is done.
+#
+# The loop is what step 2 above defers to. git is native up to the purge on the
+# line above and nothing by the other six names is ever installed here — they all
+# left with #737 — so a hit is a step someone added rather than a leftover. This
+# catches a real binary only; the symlink case is the `platform` stage's guard,
+# which runs last and so sees everything both stages wrote.
 RUN apt-get purge -y git && apt-get autoremove -y && \
 	rm -rf /var/lib/apt/lists/* && \
-	for binary in gcloud kubectl gh git; do \
+	for binary in gcloud kubectl gh git helm k9s yq; do \
 		if command -v "${binary}" >/dev/null 2>&1; then \
-			echo "unexpected credential-aware CLI in sandbox image: ${binary}" >&2; \
+			echo "unexpected cluster CLI in the agent image: ${binary}" >&2; \
 			exit 1; \
 		fi; \
 	done
@@ -1229,13 +1236,23 @@ COPY --chown=hermes:hermes agents/platform/docs/glossary.md \
 # three destinations differ so these cannot be folded into one COPY. The layer
 # budget is why the modes are not a fourth instruction — see the note at the top.
 COPY --chmod=0755 deploy/shared/docker-entrypoint.sh /usr/local/bin/agent-entrypoint
-COPY --chmod=0755 deploy/shared/credential-proxy-path.sh /etc/profile.d/credential-proxy-path.sh
-COPY --chmod=0755 agents/platform/scripts/credential_proxy_client.py /usr/local/bin/credential-proxy-exec
-RUN mkdir -p /opt/credential-proxy/bin && \
-    ln -s /usr/local/bin/credential-proxy-exec /opt/credential-proxy/bin/kubectl && \
-    ln -s /usr/local/bin/credential-proxy-exec /opt/credential-proxy/bin/gcloud && \
-    ln -s /usr/local/bin/credential-proxy-exec /opt/credential-proxy/bin/gh && \
-    ln -s /usr/local/bin/credential-proxy-exec /opt/credential-proxy/bin/git
+
+# No credential-proxy shims here, and no /opt/credential-proxy at all. There
+# were four — kubectl, gcloud, gh, git — each a symlink to a client that posted
+# the command to the sidecar. #737 moved every caller of all four out of this
+# container: the model's shell runs in the sandbox, and the agent-pod code that
+# invoked one directly (the platform MCP server, gke_endpoint.py, forge.py,
+# resolver.py) calls agents/platform/scripts/sandbox_exec.py and runs it over
+# SSH. The sandbox image carries the shims, credential-proxy-exec and
+# credential-proxy-path.sh instead; deploy/sandbox/Dockerfile is where they live
+# now. The guard at the end of the `platform` stage fails the build if any of it
+# reappears here.
+#
+# Their absence is what makes the sandbox load-bearing rather than optional. A
+# `git` or `gh` issued in this container gets "command not found", which is the
+# honest answer for an install that turned the sandbox off. That is a known cost
+# of taking the credential out of reach of the container the model's code used
+# to run in.
 
 # Copy event-watcher binary from builder stage
 COPY --from=watcher-builder --chmod=0755 /workspace/k8s-event-watcher /usr/local/bin/k8s-event-watcher
@@ -1326,9 +1343,16 @@ COPY agents/chat/scripts/ agents/platform/scripts/ /opt/defaults/scripts/
 #                              OTEL_EXPORTER_OTLP_ENDPOINT, so without this the endpoint
 #                              baked above is the only one that ever takes effect — see
 #                              tests/test_otel_config.py.
+#   sandbox_mirror.py          pushes the profile directory layout into the shell sandbox
+#                              and moves the model's existing files across once (entrypoint
+#                              step 5.7, and cluster_agent_profile.py for profiles
+#                              scaffolded later). Runs here rather than in the sandbox
+#                              because the profile list and the SSH key are both on this
+#                              side — see tests/test_sandbox_mirror.py.
 COPY deploy/shared/profile_overlay.py \
      deploy/shared/profile_plugins.py \
      deploy/shared/otel_config.py \
+     deploy/shared/sandbox_mirror.py \
      /opt/defaults/scripts/
 
 # --- Platform Agent specialist profile TEMPLATE (scaffolded at startup) ---
@@ -1627,6 +1651,30 @@ RUN set -eu; \
     done; \
     chown -R root:root /opt/hermes/skills /opt/platform-template /opt/cluster-template /opt/chat-template /opt/defaults/scripts
 
+# Guard: nothing that carries a cluster credential may come back into this image.
+#
+# It rides at the end of the stage that produces the shipped agent image, so it
+# sees everything `agent-base` and `platform` wrote between them. `agent-base`'s
+# own loop catches a real binary at the point git is purged; this one catches the
+# other way cluster tooling comes back, which is a credential-proxy symlink.
+#
+# Worth a guard because reinstating one is a two-word diff with no visible
+# effect, and what it produces is a credentialed command running in the pod that
+# holds the Workload Identity — succeeding, silently, in the container #737
+# exists to take that capability away from. Nothing else in the build or the
+# test suite would report it.
+RUN set -eu; \
+    if [ -e /opt/credential-proxy ]; then \
+      echo "credential-proxy shims are back in the agent image: /opt/credential-proxy exists" >&2; \
+      exit 1; \
+    fi; \
+    for binary in gcloud kubectl gh git helm k9s yq; do \
+      if command -v "${binary}" >/dev/null 2>&1; then \
+        echo "cluster tooling is back in the agent image: ${binary}" >&2; \
+        exit 1; \
+      fi; \
+    done
+
 USER 10000:10000
 
 # The build this image came from, for the `User-Agent` that remote MCP calls
@@ -1750,6 +1798,16 @@ COPY --chmod=0755 deploy/shared/start-services.sh /usr/local/bin/start-services
 # of the whole platform chain.
 FROM proxy-tools AS credential-proxy
 
+# agent-base leaves /opt/defaults at 0700 hermes:hermes. Co-located with the
+# shell sandbox this container runs as uid 1000 — the sandbox login, so that the
+# two containers can share a working tree — and 0700 makes everything under the
+# directory unreachable for it. What that looks like is the container exiting on
+# its first line with "Permission denied" against a path whose own mode is 0755,
+# and no indication that the parent is the problem. Nothing below here is a
+# secret: it is the same scripts the agent image ships, world-readable one level
+# down. Ahead of the COPY so an agent source edit does not invalidate it.
+RUN chmod 0755 /opt/defaults
+
 # The same set the `platform` stage lays down at /opt/defaults/scripts, with the
 # same ownership and mode, so the directory is identical in both images. That
 # used to be structural — the sidecar WAS the platform image — and is now two
@@ -1781,6 +1839,7 @@ COPY --chown=root:root --chmod=0755 \
      deploy/shared/profile_overlay.py \
      deploy/shared/profile_plugins.py \
      deploy/shared/otel_config.py \
+     deploy/shared/sandbox_mirror.py \
      /opt/defaults/scripts/
 
 USER 10000:10000

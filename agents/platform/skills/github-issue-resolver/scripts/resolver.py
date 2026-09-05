@@ -22,15 +22,28 @@ sys.path.append("/opt/defaults/scripts")
 sys.path.append("/opt/data/scripts")
 sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
 
-from github_token_refresh import (
+# `sandbox_exec` has no import-time dependency on anything under /opt — the yaml
+# it needs to read the managed config is imported inside the function that reads
+# it, and a missing config just means "no sandbox".
+import sandbox_exec  # noqa: E402 — needs the sys.path lines above
+from github_token_refresh import (  # noqa: E402 — needs the sys.path lines above
     GH_MISSING_RC,
     is_refresh_failed,
     looks_like_auth_failure,
     refresh_credentials_once,
 )
-from gitops_workspace import get_managed_github_repos, is_valid_repo_slug
+from gitops_workspace import (  # noqa: E402 — needs the sys.path lines above
+    get_managed_github_repos,
+    is_valid_repo_slug,
+)
 
 SCRATCH_DIR = "/opt/data/scratch"
+
+# The value `gh` reads as "this input file is stdin". `forge.BODY_STDIN` and
+# `audit_report.BODY_STDIN` spell the same thing for the same reason; the shim
+# forwards fd 0 only for a `STDIN_FILE_FLAGS` flag whose value is exactly this.
+BODY_STDIN = "-"
+
 
 # The operator accepts a bare "owner/repo" shorthand as a valid gitRepo and
 # writes it through to SETTINGS.md verbatim, so it reaches us hostless. This
@@ -41,16 +54,31 @@ SCRATCH_DIR = "/opt/data/scratch"
 BARE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
-def _run_gh_once(args: list) -> subprocess.CompletedProcess:
+def _run_gh_once(args: list, stdin: str | None = None) -> subprocess.CompletedProcess:
     """Run one gh command, mapping a missing binary onto a return code.
 
-    Never raises, so :func:`run_gh` can inspect a failure and decide whether it
-    is worth retrying before applying the caller's ``check`` semantics.
+    Never raises for a non-zero exit, so :func:`run_gh` can inspect a failure
+    and decide whether it is worth retrying before applying the caller's
+    ``check`` semantics.
+
+    Routed through ``sandbox_exec`` because this file runs on both sides of the
+    sandbox boundary. ``poll`` is a subprocess of ``github_scan_gate.py`` in the
+    agent pod, which as of #737 has no ``gh``; ``claim``, ``transition`` and the
+    report subcommands are invoked by the model, from a shell that is already in
+    the sandbox. ``sandbox_exec.run`` forwards over ssh in the first case and
+    falls back to a local subprocess in the second, so one call site serves
+    both.
+
+    ``SandboxUnavailable`` is left to propagate. A poll that cannot reach the
+    sandbox has not learned that the repository is quiet, and reporting it as
+    quiet is the outcome this path exists to avoid.
+
+    ``stdin`` carries a document to a command that named ``-`` as its input
+    file. It is a string rather than a handle precisely so the retry in
+    :func:`run_gh` can send it twice; a stream would be empty the second time.
     """
     try:
-        return subprocess.run(
-            ["gh"] + args, check=False, text=True, capture_output=True
-        )
+        return sandbox_exec.run(["gh"] + args, stdin=stdin)
     except FileNotFoundError:
         # Distinguishable from a gh command that ran and failed, so callers can
         # name the fault precisely.
@@ -62,7 +90,7 @@ def _run_gh_once(args: list) -> subprocess.CompletedProcess:
         )
 
 
-def run_gh(args: list, check: bool = True) -> subprocess.CompletedProcess:
+def run_gh(args: list, check: bool = True, stdin: str | None = None) -> subprocess.CompletedProcess:
     """Runs a gh CLI command safely without shell escaping or ampersand backgrounding issues.
 
     A failed call gets one retry behind a freshly minted token. The credential
@@ -82,9 +110,9 @@ def run_gh(args: list, check: bool = True) -> subprocess.CompletedProcess:
     excluded: no token puts an absent binary back on PATH, and a 404, a rate
     limit, or a timeout is not a credential problem either.
     """
-    result = _run_gh_once(args)
+    result = _run_gh_once(args, stdin)
     if looks_like_auth_failure(args, result) and refresh_credentials_once(args):
-        result = _run_gh_once(args)
+        result = _run_gh_once(args, stdin)
 
     if check and result.returncode != 0:
         if result.returncode == GH_MISSING_RC:
@@ -719,8 +747,17 @@ def handle_transition(args):
 
     _validate_repo_or_exit(repo)
 
-    # Post report comment directly via file parameter (-F)
-    run_gh(["issue", "comment", issue_num, "-R", repo, "-F", real_report_path])
+    # The report is read here and posted on fd 0. A path would not work: this
+    # script runs in the sandbox, `gh` runs in the broker pod, and the two share
+    # no filesystem. `--body-file` rather than the `-F` short form it replaces —
+    # the shim matches the flag to decide whether to forward stdin, and a
+    # one-letter flag is the kind that means something else to another tool.
+    with open(real_report_path, "r", encoding="utf-8") as handle:
+        report_text = handle.read()
+    run_gh(
+        ["issue", "comment", issue_num, "-R", repo, "--body-file", BODY_STDIN],
+        stdin=report_text,
+    )
 
     # Transition label
     run_gh(

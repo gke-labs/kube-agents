@@ -41,6 +41,16 @@ rather than guessing an identity — see `SHARED_SESSION_NOTICE` in
 [`__init__.py`](__init__.py). `target='memory'` still works, because a shared fact is
 shared either way.
 
+## Security and prompt sanitization
+
+Memory entries undergo best-effort sanitization before being rendered into prompts:
+
+- Strips C0/C1 control characters, zero-width spaces, and bidirectional overrides (`sanitize_memory_entry`).
+- Neutralizes storage delimiter smuggling (`\n§\n` sequences).
+- Defuses common tag-based delimiter framing (`<system>`, `<prompt>`, `<admin>`, etc.), markdown heading injections, and LLM special tokens (`sanitize_for_prompt`).
+
+This sanitization is defense-in-depth against accidental or naive prompt framing; it is not an impermeable security boundary. Natural language instructions and multiline markup (such as newlines within brackets) intentionally pass through to prevent corrupting legitimate operational runbooks and inequality syntax (`CPU < system limit`). Downstream prompt consumers should continue to treat memory entries as untrusted input.
+
 ## Tests
 
 Not run in CI. Run them by hand after changing the provider:

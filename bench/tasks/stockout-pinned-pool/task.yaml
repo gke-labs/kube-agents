@@ -1,10 +1,12 @@
-# REGISTERED, INACTIVE — recast to the nightly tier on 2026-08-26 (a
-# commented entry in hack/ci-eval-pr.sh TASKS). Its one run failed on
+# NIGHTLY-TIER ACTIVE — recast out of the presubmit on 2026-08-26, an
+# entry in hack/ci-eval-pr.sh NIGHTLY_TASKS since 2026-09-02: the nightly
+# runs it (EVAL_TIER=nightly), the presubmit never does. Its one run failed
+# on
 # agent-endpoint HTTP 502s — transport, not a scenario bug — and the audit
 # shape budgets at 600-1300s (bench/tasks/DRAFTS.md, the 2026-08-26 smoke
 # run), which six domains cannot spend in one presubmit. The capacity domain
 # is covered there by capacity-pinned-pool-probe; this full sweep is the
-# SOP-fidelity version and activates with the nightly tier. It was held by
+# SOP-fidelity version and runs nightly. It was held by
 # A1, A4 and A5 (bench/tasks/DRAFTS.md); all three are closed.
 #
 # A1 and A4 cleared together on 2026-08-25, when

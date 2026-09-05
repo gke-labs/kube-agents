@@ -643,11 +643,34 @@ Mutation(
          "            runAsUser: 10000\n"
          "        - command:\n"
          "            - /usr/local/bin/start-services\n"),
-        "test_C1_the_split_broker_pod_holds_no_sandbox_container",
+        "test_C1_the_credential_broker_is_its_own_deployment",
         "a golden fixture regenerated after the sandbox was co-located back "
         "into the broker Pod to share the workspace over localhost. Distinct "
         "UIDs are kept, so every UID assertion still passes and only the "
-        "network namespace the split exists to separate is shared again",
+        "network namespace the split exists to separate is shared again. "
+        "Re-pointed after #913 retired the split-broker fixture: the assertion "
+        "moved from one flag's rendered shape to the topology itself",
+    ),
+    Mutation(
+        "C1-sandbox-sa-annotated-for-workload-identity",
+        "k8s-operator/internal/controller/shell_sandbox_manifests.go",
+        ("""			Name:      shellSandboxServiceAccountName(agent),
+			Namespace: agent.Namespace,
+			Labels:    shellSandboxSelector(agent),
+""",
+         """			Name:      shellSandboxServiceAccountName(agent),
+			Namespace: agent.Namespace,
+			Labels:    shellSandboxSelector(agent),
+			Annotations: map[string]string{
+				"iam.gke.io/gcp-service-account": agentGSAEmail(agent),
+			},
+"""),
+        "test_C1_the_sandbox_identity_carries_no_cloud_annotation",
+        "annotate the sandbox ServiceAccount for Workload Identity, the one "
+        "edit an operator would plausibly make to 'let the shell use gcloud'. "
+        "GKE resolves WI by pod IP, so this hands every model-authored command "
+        "a GSA token from the metadata server with no proxy in front of it -- "
+        "and nothing else in the suite would notice",
     ),
     Mutation(
         "C2-phase-two-skips-unknown-flag",

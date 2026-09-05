@@ -21,7 +21,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import credential_proxy
+import credential_proxy_client
 import scoped_sa_pool
 from scoped_sa_pool import (
     PoolConfigurationError,
@@ -104,7 +104,7 @@ class ScopeKeyTest(unittest.TestCase):
         into the scope key, the scope key goes into the refusal message, and the
         refusal message goes into a WARNING -- one agent-written newline in a
         kubeconfig's `current-context` splits that into two log records. The
-        same component also becomes part of a filename in the sidecar state dir.
+        same component also becomes part of a filename in the broker's state dir.
 
         Separate from the test below, which covers separators and quotes: those
         were always refused. This one was not.
@@ -133,13 +133,15 @@ class ScopeKeyTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     scope_key(project, location, cluster)
 
-    def test_the_pool_and_the_broker_agree_on_what_a_name_component_is(self):
+    def test_the_pool_and_the_shim_agree_on_what_a_name_component_is(self):
         """Two regexes, one idea — the shape every Critical here has had.
 
-        `scoped_sa_pool` cannot import the broker (the broker imports it), so
-        the GKE component pattern is written twice. This drives both with the
-        same inputs and insists they answer the same, so a future edit to either
-        one fails here rather than admitting a key the other half rejects.
+        The GKE component pattern is written twice: `credential_proxy_client`
+        owns one because it parses the caller's kubeconfig in the caller's own
+        pod, and `scoped_sa_pool` owns the other because it cannot import a
+        module the broker imports. This drives both with the same inputs and
+        insists they answer the same, so a future edit to either one fails here
+        rather than admitting a key the other half rejects.
         """
         candidates = [
             "abc",
@@ -167,16 +169,16 @@ class ScopeKeyTest(unittest.TestCase):
         for candidate in candidates:
             with self.subTest(candidate=candidate):
                 self.assertEqual(
-                    bool(credential_proxy._GKE_CONTEXT_COMPONENT.fullmatch(candidate)),
+                    bool(credential_proxy_client._GKE_CONTEXT_COMPONENT.fullmatch(candidate)),
                     bool(scoped_sa_pool._COMPONENT.fullmatch(candidate)),
-                    f"the broker and the pool disagree about {candidate!r}",
+                    f"the shim and the pool disagree about {candidate!r}",
                 )
                 # Also compared under `.match`, because that is how the pool
                 # calls it and an anchor fixed only in one place shows up here.
                 self.assertEqual(
-                    bool(credential_proxy._GKE_CONTEXT_COMPONENT.match(candidate)),
+                    bool(credential_proxy_client._GKE_CONTEXT_COMPONENT.match(candidate)),
                     bool(scoped_sa_pool._COMPONENT.match(candidate)),
-                    f"the broker and the pool disagree about {candidate!r} under match()",
+                    f"the shim and the pool disagree about {candidate!r} under match()",
                 )
 
 

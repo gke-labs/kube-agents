@@ -123,9 +123,19 @@ jobs:
             echo "::error::No Helm release 'kube-agents' in kubeagents-system — this environment predates the Terraform + Helm engine and must be re-installed from terraform/examples/full-install before redeploys can run."
             exit 1
           fi
+          # agentSandbox alongside the agent tag. The sandbox is where every
+          # shell command the model runs actually runs, and its
+          # forge.py/credential_proxy_client.py/workspace_paths.py have to be
+          # the same commit as the gateway that talks to them. Without this set
+          # the chart falls back to its Chart.yaml placeholder, a tag no
+          # workflow pushes, and the StatefulSet never starts — which the
+          # gateway-only gates below cannot see.
           echo "Redeploying platform-agent via helm upgrade with image: ${AGENT_IMAGE}:${IMAGE_TAG}"
           ./scripts/helm_upgrade_retry.sh kube-agents charts/kube-agents -n kubeagents-system \
-            --reset-then-reuse-values --set "platformAgent.deployment.image.tag=${IMAGE_TAG}" --wait --timeout 10m
+            --reset-then-reuse-values \
+            --set "platformAgent.deployment.image.tag=${IMAGE_TAG}" \
+            --set "agentSandbox.image.tag=${IMAGE_TAG}" \
+            --wait --timeout 10m
 
       - name: Confirm the Operator Applied the Requested Tag
         env:
@@ -171,3 +181,30 @@ jobs:
             kubectl logs -n "$NAMESPACE" -l app=platform-agent-gateway --all-containers --tail=50 || true
             exit 1
           fi
+
+      - name: Verify Sandbox and Credential Broker Rollout
+        run: |
+          # A healthy gateway is not a working install: the model runs no
+          # command in the gateway pod. The same pair upgrade.sh waits on, and
+          # the same reason — a redeploy that leaves the sandbox on an
+          # unpullable tag or the broker in CrashLoopBackOff passes every gate
+          # above while the agent can run no kubectl, gcloud, gh or git.
+          #
+          # Guarded on the object existing, because the operator creates both
+          # and the helm upgrade returns before its PlatformAgent has
+          # reconciled. A missing object is that, not a failed rollout.
+          for target in statefulset/platform-agent-shell deployment/platform-agent-credential-proxy; do
+            if ! kubectl get "$target" -n "$NAMESPACE" >/dev/null 2>&1; then
+              echo "$target not created yet; skipping its rollout wait."
+              continue
+            fi
+            echo "Waiting for rollout of $target..."
+            if ! kubectl rollout status "$target" -n "$NAMESPACE" --timeout=900s; then
+              echo "::error::Rollout of $target failed! Printing debug logs..."
+              kubectl describe "$target" -n "$NAMESPACE" || true
+              kubectl get pods -n "$NAMESPACE" -l "app=${target#*/}" || true
+              kubectl describe pods -n "$NAMESPACE" -l "app=${target#*/}" || true
+              kubectl logs -n "$NAMESPACE" -l "app=${target#*/}" --all-containers --tail=50 || true
+              exit 1
+            fi
+          done

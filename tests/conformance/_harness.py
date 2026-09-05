@@ -110,7 +110,7 @@ SOURCES: dict[str, Source] = {
     # --- the image --------------------------------------------------------
     "dockerfile": Source(
         "deploy/docker/Dockerfile",
-        ("FROM agent-base", "unexpected credential-aware CLI in sandbox image"),
+        ("FROM agent-base", "unexpected cluster CLI in the agent image"),
     ),
     # --- the operator -----------------------------------------------------
     "manifests_go": Source(
@@ -120,7 +120,6 @@ SOURCES: dict[str, Source] = {
             "buildMinimalPlatformRole",
             "No ShareProcessNamespace",
             "sandboxUID",
-            "credentialProxyUID",
         ),
     ),
     "controller_go": Source(
@@ -166,13 +165,21 @@ SOURCES: dict[str, Source] = {
         ("policyName",),
     ),
     # --- rendered output the operator is asserted against -----------------
+    "shell_sandbox_manifests_go": Source(
+        "k8s-operator/internal/controller/shell_sandbox_manifests.go",
+        (
+            "func buildShellSandboxServiceAccount",
+            "shellSandboxServiceAccountName",
+            "iam.gke.io/gcp-service-account",
+        ),
+    ),
     "golden_default": Source(
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
         ("kind: Deployment", "policy.json"),
     ),
-    "golden_split_broker": Source(
+    "golden_scoped_sa": Source(
         "k8s-operator/internal/testing/testdata/platform/expected/"
-        "platformagent-split-broker.yaml",
+        "platformagent-scoped-sa.yaml",
         ("kind: Deployment",),
     ),
     "golden_egress_allowlist": Source(
@@ -206,7 +213,7 @@ SOURCES: dict[str, Source] = {
 _GOLDEN_KEYS = (
     "golden_default",
     "golden_tagged",
-    "golden_split_broker",
+    "golden_scoped_sa",
     "golden_egress_allowlist",
 )
 
@@ -268,11 +275,14 @@ def yaml_documents(name: str) -> tuple[dict, ...]:
 def golden_documents() -> dict[str, tuple[dict, ...]]:
     """The rendered PlatformAgent object sets, keyed by fixture name.
 
-    Four fixtures cover the four spec shapes the operator renders: the default
-    single-Pod layout, the same with a pinned image tag, the split-broker
-    layout, and the split-broker layout with the egress allowlist on. An
-    invariant about the rendered output has to hold on all four or it is a
-    property of one configuration.
+    Four fixtures cover four spec shapes the operator renders: the default
+    layout, the same with a pinned image tag, the scoped service-account pool,
+    and the egress allowlist. An invariant about the rendered output has to hold
+    on all four or it is a property of one configuration.
+
+    The split-broker fixture was the third of these until #913 deleted it: the
+    broker is its own Deployment unconditionally now, so the layout it covered
+    is no longer a configuration to render.
     """
     return {key: yaml_documents(key) for key in _GOLDEN_KEYS}
 

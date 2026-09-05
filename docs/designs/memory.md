@@ -190,11 +190,13 @@ one Markdown file per user under `memories/users/<id>.md`, one shared
 prompt.
 
 It isolated users correctly — **zero tag leaks** at every corpus size. What it
-lost in the port from the built-in was everything the built-in does that the file
-format does not show: the character bound, the file lock, the external-drift
-guard, the prompt-injection scan, and the frozen snapshot. A lookalike is
+originally lost in the port from the built-in was everything the built-in does
+that the file format does not show: the file-level character bound, the file
+lock, the external-drift guard, the prompt-injection scan, and the frozen
+snapshot. Prompt-injection scanning and entry-level length bounds were later
+restored, but the store-level capacity bound remains absent. A lookalike is
 indistinguishable from its reference right up until one of the invisible
-behaviours is needed. The first of the five is what this document is about.
+behaviours is needed. That capacity bound is what this document is about.
 
 **It stays in the tree**, as the choice for an install that will not run a
 database for memory. Everything below argues that a file store does not hold at
@@ -236,10 +238,11 @@ refused, and the model is told to consolidate and retry.
 
 That bound is load-bearing. **Nothing else in a file store ever removes an
 entry** — no eviction, no TTL, no relevance filter, no compaction. Admission
-control is the sole mechanism keeping the file a summary rather than an
-append-only log. [`multiuser_memory`](#multiuser_memory-the-provider-this-displaces)
-lost it in the port, so the file arm the experiment measured is a defect rather
-than a configuration anyone would choose.
+control on total store capacity is the sole mechanism keeping the file a summary
+rather than an append-only log. [`multiuser_memory`](#multiuser_memory-the-provider-this-displaces)
+lost that store-wide bound in the port (bounding per-entry length and entry count
+instead), so the file arm the experiment measured is a defect rather than a
+configuration anyone would choose.
 
 **Unbounded, memory is 55% of the window before the user speaks.** The store is
 concatenated into the system prompt at session start, on every turn: 443,196
@@ -1728,9 +1731,10 @@ numbers up.
 **The file arm is measured unbounded.** `measure_file_based.py` writes `MEMORY.md` and
 `users/*.md` itself, in the on-disk format, and stubs `atomic_replace`; it never goes
 through the provider's write path, so admission control is never in play — and the
-provider being measured has none anyway. The 1.000 / 110,907 row is therefore the
-_unbounded_ file store, which is exactly what shipped. Adding the bound does not move
-that row, it produces a different one:
+provider had none when measured (its subsequent `validate_memory_entry` bounds
+individual entries and count, not total store character size). The 1.000 / 110,907 row is
+therefore the _unbounded_ file store, which is exactly what shipped. Adding the bound does
+not move that row, it produces a different one:
 [what a bounded store holds](#a-file-store-is-bounded-or-it-eats-the-window). Both are
 reported, because dropping the unbounded row would quietly discard the strongest
 result the file store has.

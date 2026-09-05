@@ -36,7 +36,7 @@ import (
 // helpers.
 
 func scopedAgent(accounts ...agentv1alpha1.ScopedServiceAccount) *agentv1alpha1.PlatformAgent {
-	agent := splitBrokerAgent(false)
+	agent := brokerPodAgent()
 	if agent.Spec.Security == nil {
 		agent.Spec.Security = &agentv1alpha1.SecuritySpec{}
 	}
@@ -170,8 +170,7 @@ func TestWithNoAccountsThereIsNoMappingAndTheFlagSaysSo(t *testing.T) {
 		t.Errorf("a pool file was named for an agent with no pool")
 	}
 
-	sidecar := buildCredentialProxySidecar(agent, "/opt/data")
-	for _, mount := range sidecar.VolumeMounts {
+	for _, mount := range buildCredentialProxyContainer(agent).VolumeMounts {
 		if mount.SubPath == scopedSAPoolKey {
 			t.Errorf("the pool is mounted by SubPath but the ConfigMap has no such key; the container cannot start")
 		}
@@ -192,11 +191,11 @@ func TestWithAccountsTheFlagAndTheMountAppearTogether(t *testing.T) {
 		t.Errorf("CREDENTIAL_PROXY_SCOPED_SA_POOL_FILE = %q (x%d), want %q", path, count, scopedSAPoolMountPath)
 	}
 
-	sidecar := buildCredentialProxySidecar(agent, "/opt/data")
+	mounts := buildCredentialProxyContainer(agent).VolumeMounts
 	var mounted *corev1.VolumeMount
-	for i := range sidecar.VolumeMounts {
-		if sidecar.VolumeMounts[i].MountPath == path {
-			mounted = &sidecar.VolumeMounts[i]
+	for i := range mounts {
+		if mounts[i].MountPath == path {
+			mounted = &mounts[i]
 		}
 	}
 	if mounted == nil {
@@ -338,7 +337,7 @@ func TestTheFlagTheKeyAndTheMountAgreeOnEveryShape(t *testing.T) {
 			armed := flagValue == "1"
 
 			mounted := false
-			for _, mount := range buildCredentialProxySidecar(agent, "/opt/data").VolumeMounts {
+			for _, mount := range buildCredentialProxyContainer(agent).VolumeMounts {
 				if mount.SubPath == scopedSAPoolKey {
 					mounted = true
 				}
@@ -390,27 +389,30 @@ func TestTheReservedListNamesThePoolVariablesInItsOwnRight(t *testing.T) {
 	}
 }
 
-func TestTheSplitBrokerAlsoGetsTheMapping(t *testing.T) {
-	// The split moves the broker into its own Pod, and it is the layout the
-	// security model is heading for. A control that only landed on the sidecar
-	// would be one nobody noticed missing after the migration.
-	agent := splitBrokerAgent(true)
-	agent.Spec.Security.ScopedServiceAccounts = []agentv1alpha1.ScopedServiceAccount{
-		account("proj", "us-central1", "cluster", "ka-cluster-1a2b3c4d@proj.iam.gserviceaccount.com"),
+func TestTheMappingReachesTheRenderedBrokerPod(t *testing.T) {
+	// The tests above check the container builder. This one checks the Pod it
+	// ends up in: a SubPath mount is only satisfiable if the Pod also declares
+	// the volume it names, and the two are assembled by different functions.
+	agent := scopedAgent(account("proj", "us-central1", "cluster", "ka-cluster-1a2b3c4d@proj.iam.gserviceaccount.com"))
+
+	if value, _ := envValueCount(buildCredentialProxyEnv(agent), "CREDENTIAL_PROXY_SCOPED_SA_POOL"); value != "1" {
+		t.Errorf("the broker does not arm the pool: %q", value)
 	}
 
-	envVars := buildCredentialProxyEnv(agent)
-	if value, _ := envValueCount(envVars, "CREDENTIAL_PROXY_SCOPED_SA_POOL"); value != "1" {
-		t.Errorf("the split broker does not arm the pool: %q", value)
-	}
-	sidecar := buildCredentialProxySidecar(agent, "/opt/data")
-	found := false
-	for _, mount := range sidecar.VolumeMounts {
-		if mount.SubPath == scopedSAPoolKey {
-			found = true
+	pod := buildCredentialProxyDeployment(agent, "policy-hash").Spec.Template.Spec
+	var mount *corev1.VolumeMount
+	for i := range pod.Containers[0].VolumeMounts {
+		if pod.Containers[0].VolumeMounts[i].SubPath == scopedSAPoolKey {
+			mount = &pod.Containers[0].VolumeMounts[i]
 		}
 	}
-	if !found {
-		t.Errorf("the split broker is armed with no mapping mounted; it will refuse to start")
+	if mount == nil {
+		t.Fatalf("the broker is armed with no mapping mounted; it will refuse to start")
 	}
+	for _, volume := range pod.Volumes {
+		if volume.Name == mount.Name {
+			return
+		}
+	}
+	t.Errorf("the mount names volume %q and the Pod declares no such volume", mount.Name)
 }

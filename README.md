@@ -86,7 +86,7 @@ The runtime is built on the Hermes agent framework and wires in MCP servers for 
 `kube-agents` is designed for enterprise fleets where agents must be powerful _and_ provably contained:
 
 - **Least-privilege RBAC** — the agent's Kubernetes identity is read-only and cannot read Secrets.
-- **Credential isolation** — the agent sandbox container never receives API keys or tokens; an Envoy credential-proxy sidecar injects them at the network boundary.
+- **Credential isolation** — model-authored code runs in a shell sandbox pod that holds no API keys or tokens; an Envoy credential broker in a pod of its own injects them at the network boundary.
 - **At-rest database encryption & state security** — GKE etcd database encryption (CMEK) via Cloud KMS, strict state file permissions (`umask 077`), and mandatory encryption pre-flight gates.
 - **Kernel-level sandboxing** — agent workloads run under a gVisor RuntimeClass (GKE Sandbox) by default; `--gvisor=false` opts out.
 - **GitOps-only mutations** — infrastructure changes are proposed as pull requests for human review.
@@ -140,6 +140,8 @@ Walkthrough: [Architecture](https://gke-labs.github.io/kube-agents/overview/arch
 ## 🤝 Contributing
 
 Contributions are welcome. See [docs/contributing.md](docs/contributing.md) for CLA requirements and the [contributing guide](https://gke-labs.github.io/kube-agents/contributing/) for PR hygiene, commit conventions, and the local checks CI enforces. Repository conventions for AI coding agents are in [AGENTS.md](AGENTS.md).
+
+Bug reports and feature requests go in [issues](https://github.com/gke-labs/kube-agents/issues). If your GitHub account cannot open one here, use the [feedback form](https://gke-labs.github.io/kube-agents/feedback), which files it for you.
 
 ## Disclaimer
 

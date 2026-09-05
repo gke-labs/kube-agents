@@ -14,23 +14,37 @@ name: Notify on Broken Main
 #
 # What may go on the list: a workflow whose green on a push to main is a
 # statement about the tree, not about the push. The script depends on that and
-# cannot check it -- see its docstring. All four below rebuild or re-check
-# everything they cover on every run they start, and `Operator Tests` only
-# starts on a push that touches an operator path.
+# cannot check it -- see its docstring. Every workflow below rebuilds or
+# re-checks everything it covers on every run it starts, and `Operator Tests`
+# only starts on a push that touches an operator path.
+#
+# `Documentation Checks` and `Python Unit Tests` joined the list after both sat
+# red on main for thirteen hours (2026-09-03 20:54Z to 2026-09-04 10:34Z,
+# gke-labs/kube-agents#1223) with sixteen merges landing on top and no
+# `ci:main-broken` issue filed: they became required contexts on 2026-09-02,
+# after this list was written, and nothing revisited it. Each runs its whole
+# suite on every push with no `paths:` filter.
+#
+# `Python Unit Tests` also carries `Run Bench Harness Tests`, which is not a
+# required context, so watching at run level files an issue when only that job
+# is red. That job resolves devops-bench and its dependencies at run time, so a
+# resolver outage during a push run would file an issue naming an innocent
+# commit. Accepted: the alternative is not watching the suite that took
+# thirteen hours to notice. `Validate Repo Structure` is the same shape with
+# both jobs required -- `validate`, and `prompt-assets`, which reports the
+# `Agent instructions cite assets that exist` context.
 #
 # `Prettier Check` is required and deliberately absent. It scopes itself to the
 # files the push changed, so its green says those files are formatted and
 # nothing about the rest of the tree: a bad `docs/a.md` would go red, and the
 # next merge touching only Go would go green and close the issue with an
 # innocent commit named as the fix. Whole-tree prettier is not the fix either --
-# 19 files under `.agents/skills/` have never been formatted, so it would be red
+# files under `.agents/skills/` have never been formatted, so it would be red
 # from the first run. Prettier is also the check least exposed to the stale-base
 # merge this exists to catch: it reads file contents, which a stale merge base
-# does not change. `cla/google` is an external app with no run to watch.
-#
-# `Validate Repo Structure` runs a second, non-required job (`prompt-assets`)
-# alongside the required `validate`. Watching at run level means its failure
-# also files an issue, which is the more useful behaviour, not an oversight.
+# does not change. `cla/google` is an external app with no run to watch, and
+# `Validate Conventional Commit PR Title` runs only on pull requests, so it has
+# no push run to watch either.
 
 on:
   # zizmor: ignore[dangerous-triggers] - workflow_run is only dangerous when it checks
@@ -40,7 +54,9 @@ on:
     workflows:
       - Actionlint
       - Docker Build
+      - Documentation Checks
       - Operator Tests
+      - Python Unit Tests
       - Validate Repo Structure
     types: [completed]
 

@@ -570,8 +570,10 @@ class TestRepoDerivedFacts(unittest.TestCase):
     def test_coverage_matches_domains_yaml(self):
         cov = collect.coverage()
         self.assertEqual(cov["domains_total"], 11)
-        # #1045 activated incident-triage, emptying the allowlist.
-        self.assertEqual(cov["uncovered"], [])
+        # incident-triage's presubmit coverage moved to the nightly tier on
+        # 2026-09-03 (tofu wall clock; #1202); the allowlist carries it until
+        # a non-tofu probe activates or the contract recognizes the tier.
+        self.assertEqual(cov["uncovered"], ["incident-triage"])
         self.assertEqual(cov["domains_covered"], cov["domains_total"] - len(cov["uncovered"]))
 
     def test_active_tasks_are_the_uncommented_entries(self):

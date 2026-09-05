@@ -32,13 +32,16 @@ Custom resources in the `kubeagents.x-k8s.io/v1alpha1` API group:
 
 The controller reconciles a `PlatformAgent` into:
 
-- A `Deployment` (named `<name>-gateway`) for the Platform Agent, running the Hermes runtime with a Fluent Bit log-forwarding sidecar.
-- A `Service` fronting the Deployment (API port `8642`, plus dashboard port `9119` when the dashboard is enabled).
+- A `Deployment` (named `<name>-gateway`) for the Platform Agent, running the Hermes runtime with a Fluent Bit log-forwarding sidecar and an `agent-api-auth` sidecar that terminates the PlatformAgent API bearer key and runs the `k8s-event-watcher`. The gateway holds no credential and executes nothing the model wrote.
+- A `StatefulSet` (named `<name>-shell`) and its `Service`, the shell sandbox: `sshd` on `2222`, the durable `/opt/data`, and the wrappers that stand in for `gcloud`, `kubectl`, `gh` and `git`. This is the pod that runs model-authored commands, and its ServiceAccount carries no Workload Identity annotation.
+- A `Deployment` (named `<name>-credential-proxy`), a `ClusterIP` `Service` on port `8765`, and a `NetworkPolicy` narrowing who may reach it — the credential broker, which holds every credential in the install and executes the real CLIs on the sandbox's behalf. See [Credential isolation](/kube-agents/reference/credential-isolation/).
+- A `Service` fronting the gateway `Deployment` (API port `8642`, plus dashboard port `9119` when the dashboard is enabled).
 - A `PodDisruptionBudget` selecting the Deployment's pods, `maxUnavailable: 1` at every replica count. That declares the agent evictable rather than blocking node drains, and it stays correct when the agent is scaled — a budget keyed to the replica count would deadlock drains the first time someone scaled back to one.
 - A `ServiceAccount` (annotated for Workload Identity) plus RBAC — a viewer `ClusterRoleBinding` and an "explorer" `ClusterRole` with its own `ClusterRoleBinding`.
 - `PersistentVolumeClaim`s for the agent's data and system metadata.
 - `ConfigMap`s for the pod: config overlays merged into each Hermes profile's `config.yaml` at startup (including the whole rendered config for the default, Planning Agent, profile — see [how config reaches each profile](/kube-agents/operator/platformagent-crd/#how-config-reaches-each-profile)), a `SETTINGS.md` (GKE scope) mounted into `/opt/data/`, and a Fluent Bit config for the logging sidecar. Each profile's base config is baked into the image and scaffolded at startup.
 - Optional integrations wired through the CR `spec.integration` block: Google Chat (Pub/Sub topic/subscription), Slack (bot/app token secret refs), and GitHub (GitOps repo, with the GitHub Token Minter endpoint injected as an env var).
+- Under the unsupported `spec.mode: next` dev toggle, additionally the A2A playground stack (NATS, bus provisioning, the A2A gateway) — see the [PlatformAgent CRD page](/kube-agents/operator/platformagent-crd/) for what it renders.
 
 ## Custom resource shape
 
@@ -141,7 +144,7 @@ controller-runtime fall back to its own 9443 default.
 Re-apply the manifests; do not bump the image alone. `targetPort` lives in the Service, so a
 `kubectl set image` — or any pipeline that rolls the tag without re-applying `config/webhook/` —
 leaves the Service pointing at 9443 while the new pod listens on 10250, which is the wedge described
-below on what looked like a routine version bump. `make deploy` applies both.
+below on what looked like a routine version bump. `make deploy IMG=$IMG` applies both.
 
 Applying both together still leaves a short window: the Service starts sending traffic to 10250 the
 moment it is applied, and the old pod does not answer there. Any `PlatformAgent` write in the gap
@@ -160,7 +163,31 @@ kubectl -n kubeagents-system set env deploy/kubeagents-controller-manager ENABLE
 ```
 
 That leaves the cluster with the same validation coverage a chart install has. Re-apply with
-`make deploy` once the cause is fixed.
+`make deploy IMG=$IMG` once the cause is fixed.
+
+## An image ahead of its ClusterRole
+
+The webhook port above is one instance of a general skew: `make deploy` ships the ClusterRole with
+the image, and only when it is re-run. A controller deployed from a floating tag such as `:latest`
+is upgraded on its next pod reschedule while the applied ClusterRole stays put, and the first verb
+the newer controller needs that the older role lacks fails every reconcile with `forbidden`
+(issue #1009). Two things say so.
+
+`make deploy` refuses an `IMG` whose tag is `latest`, `main`, `master`, `HEAD`, `dev`, or missing,
+unless `ALLOW_MUTABLE_IMG=1` is set for a cluster that will be thrown away before its next
+reschedule.
+
+The controller checks its own permissions with `SelfSubjectAccessReview` when it starts and every
+five minutes after, on its own ticker rather than on the reconcile worker. A denial is one
+`RBAC self-check failed` line in the startup log naming the denied permissions
+(`patch poddisruptionbudgets.policy`) and the fix, and a `Degraded` condition with reason
+`RBACIncomplete` carrying the same text on each `PlatformAgent` it reconciles that is not already
+`Degraded` for another reason. Reconciles continue; the steps that need the missing verb still fail
+until the manifests are re-applied. Re-applying them with the same image tag restarts nothing and
+triggers no reconcile, so the condition follows the next reconcile after the probe notices: every
+five minutes while the condition stands and the reconcile completes, or, while the reconcile itself
+is failing on the missing verb, on controller-runtime's retry backoff, which caps at about seventeen
+minutes.
 
 ## Related resources
 

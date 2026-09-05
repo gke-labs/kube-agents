@@ -672,6 +672,27 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("enable_pubsub_platform       = true", content)
             self.assertIn("enable_stockout_investigator = true", content)
 
+    def test_tfvars_generation_carries_vertex_manage_serving_project(self):
+        # Default true: the composition keeps enabling the API and granting the
+        # gateway's role in the serving project. False is the opt-out for a
+        # serving project the installing identity cannot administer, and it
+        # has to reach Terraform as the bare boolean, not a quoted string.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("vertex_manage_serving_project = true", dest.read_text())
+
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={"API_SERVER_KEY": "k", "VERTEX_MANAGE_SERVING_PROJECT": "false"},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("vertex_manage_serving_project = false", dest.read_text())
+
 
 class InstallDefaultsFileTest(unittest.TestCase):
     """install.defaults.env holds every default, and only defaults.

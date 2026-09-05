@@ -201,10 +201,10 @@ REST through a sidecar route. Both implement the same protocol; `_call()` is whe
 ## 5. The credential plane
 
 The governing constraint is [`../credential-isolation-design.md`](../credential-isolation-design.md):
-the agent sandbox receives no API keys or access tokens through its environment or filesystem (the
-ServiceAccount token is covered too under `spec.security.splitCredentialBrokerPod`). Every forge
-call is therefore brokered by the credential sidecar, and a second forge is a change to the broker
-before it is a change to the agent.
+the agent sandbox receives no API keys or access tokens through its environment or filesystem, and
+no ServiceAccount token either. Every forge call is therefore brokered by the credential broker,
+which runs in a Pod of its own, and a second forge is a change to the broker before it is a change
+to the agent.
 
 Five things name GitHub: three inside the broker, the minting pipeline behind it, and the network
 policy that lets the pod out at all.
@@ -247,7 +247,7 @@ policy ConfigMap have no analogue to build.
 
 That asymmetry decides the shape: token acquisition is a **strategy selected per provider**, not a
 pipeline every forge is fitted into. GitHub keeps Minty. GitLab starts with a group access token in a
-Secret mounted **into the credential sidecar** — never into the agent sandbox, which is what the
+Secret mounted **into the credential broker** — never into the agent sandbox, which is what the
 first paragraph of this section forbids — which is the smallest thing that works and the one an
 operator can rotate without new infrastructure. OIDC token exchange is the better long-run answer
 for GitLab and is deliberately deferred: it is a second design, and the first working install does

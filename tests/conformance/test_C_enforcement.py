@@ -29,30 +29,6 @@ from ._harness import command_policy
 class C1IsolationIsStructural(unittest.TestCase):
     """C1: no security property rests on the model choosing not to."""
 
-    def test_C1_the_process_namespace_is_never_shared(self) -> None:
-        """A shared PID namespace at matched UIDs reaches the broker through procfs.
-
-        `/proc/<pid>/environ` of the credential holder, and the backend socket
-        it binds, are both reachable from a process that shares the namespace.
-        That path bypasses the command policy entirely, so the field has to be
-        unsettable rather than merely unset -- asserted on every rendered spec
-        shape, not just the default one.
-        """
-        for name, documents in h.golden_documents().items():
-            for deployment in h.objects_of_kind(documents, "Deployment"):
-                pod_spec = deployment["spec"]["template"]["spec"]
-                with self.subTest(fixture=name, deployment=deployment["metadata"]["name"]):
-                    self.assertNotIn("shareProcessNamespace", pod_spec)
-
-        source = h.text("manifests_go")
-        assignments = re.findall(r"ShareProcessNamespace\s*:", source)
-        self.assertEqual(
-            [],
-            assignments,
-            "platformagent_manifests.go assigns ShareProcessNamespace; the only "
-            "permitted mention is the comment explaining why it is absent",
-        )
-
     # The container the model's tools run in, and the containers that hold a
     # credential. Named rather than pattern-matched: a rename then turns the
     # "at least one of each was found" assertion below red, where a pattern
@@ -62,77 +38,73 @@ class C1IsolationIsStructural(unittest.TestCase):
         {"envoy-credential-proxy", "agent-api-proxy", "credential-broker"}
     )
 
-    def test_C1_the_agent_and_the_broker_run_as_different_users(self) -> None:
-        """Matched UIDs make the ptrace and procfs boundary a formality.
+    def test_C1_the_sandbox_identity_carries_no_cloud_annotation(self) -> None:
+        """The sharpest assertion in this set after #913, and the one F10 owns.
 
-        Same-UID processes in one Pod can read each other's `/proc/<pid>/environ`
-        and reach each other's Unix sockets, so the credential holder running at
-        the sandbox's UID puts the cloud credentials one `cat` away from the
-        model's tools. The assertion is the *difference*, not the literal 10000
-        and 10001, so renumbering the users is allowed and collapsing them is
-        not.
+        GKE resolves Workload Identity by pod IP. So a sandbox pod running under
+        an annotated ServiceAccount gets a full GSA token from
+        169.254.169.254 -- whether or not anything mounts a Kubernetes token,
+        and whether or not the credential proxy is even reachable. The absence
+        of `iam.gke.io/gcp-service-account` on the sandbox's own ServiceAccount
+        is therefore the whole of what stands between model-written shell and
+        cloud credentials; every other control on that path is downstream of it.
+        `shell_sandbox_manifests.go` says so where the name is defined, and the
+        proxy takes its cloud identity from a projected token instead, which is
+        per-container where a pod IP is not.
 
-        Applied per Pod rather than per Deployment: in the split layout the
-        broker has a Pod of its own, where running as the broker user at the Pod
-        default is correct. What must never happen is a credential container
-        sharing a UID with a sandbox container *in the same Pod*.
+        This replaces two same-pod mitigations the split-broker layout needed --
+        distinct UIDs, and an unshared PID namespace -- which #913 retired by
+        removing the thing they mitigated rather than by weakening them. Their
+        replacement lives in the operator's own suite; duplicating it here would
+        pin someone else's invariant. This one is ours.
         """
-        seen_sandbox = seen_credential = False
-        for name, documents in h.golden_documents().items():
-            for deployment in h.objects_of_kind(documents, "Deployment"):
-                pod_spec = deployment["spec"]["template"]["spec"]
-                default_user = (pod_spec.get("securityContext") or {}).get("runAsUser")
-                effective = {
-                    container["name"]: (
-                        container.get("securityContext") or {}
-                    ).get("runAsUser", default_user)
-                    for container in h.containers_of(deployment)
-                }
-                if self.SANDBOX_CONTAINER not in effective:
-                    continue
-                seen_sandbox = True
-                sandbox_user = effective[self.SANDBOX_CONTAINER]
-                subject = f"{name}/{deployment['metadata']['name']}"
-                with self.subTest(pod=subject):
-                    self.assertIsNotNone(
-                        sandbox_user,
-                        "the sandbox container has no effective runAsUser, so "
-                        "the image's USER decides and the split is not enforced",
-                    )
-                for container_name in self.CREDENTIAL_CONTAINERS & effective.keys():
-                    seen_credential = True
-                    with self.subTest(pod=subject, container=container_name):
-                        self.assertNotEqual(
-                            sandbox_user,
-                            effective[container_name],
-                            f"{container_name} shares the sandbox UID",
-                        )
+        source = h.text("shell_sandbox_manifests_go")
+        body = h.go_function_body(source, "buildShellSandboxServiceAccount")
+        self.assertNotIn(
+            "iam.gke.io/gcp-service-account",
+            body,
+            "the sandbox ServiceAccount is annotated for Workload Identity; GKE "
+            "resolves WI by pod IP, so this hands the shell container a GSA "
+            "token from the metadata server no proxy is in front of",
+        )
+        # The absence above is only meaningful if the function still renders the
+        # ServiceAccount the sandbox pod actually names.
+        self.assertIn("shellSandboxServiceAccountName(agent)", body)
 
-        self.assertTrue(seen_sandbox, "no fixture renders the sandbox container")
-        self.assertTrue(
-            seen_credential,
-            "no fixture renders a credential container under any of the names "
-            "this test knows; the assertion above matched nothing",
+    def test_C1_the_credential_broker_is_its_own_deployment(self) -> None:
+        """Topology, not configuration -- which is the upgrade #913 delivered.
+
+        The broker used to share the agent's Pod unless
+        `spec.security.splitCredentialBrokerPod` was set, so the boundary was a
+        flag and this suite asserted the flag's rendered shape. #913 removed the
+        field: the broker renders as its own Deployment unconditionally and no
+        setting co-locates it again. Asserting that is strictly stronger than
+        asserting the old fixture, because there is no longer a configuration in
+        which the assertion can be true and the property false.
+        """
+        source = h.text("manifests_go")
+        self.assertEqual(
+            [],
+            re.findall(r"splitCredentialBrokerPod", source),
+            "a co-location switch is back; the broker's separation is a flag "
+            "again rather than the topology",
         )
 
-    def test_C1_the_split_broker_pod_holds_no_sandbox_container(self) -> None:
-        """What the split is for: separate network namespaces, separate Pods.
-
-        The broker Pod is only a boundary if the model's tools are not in it.
-        """
-        documents = h.yaml_documents("golden_split_broker")
-        broker_pods = [
+        deployments = [
             d
+            for name, documents in h.golden_documents().items()
             for d in h.objects_of_kind(documents, "Deployment")
-            if any(
-                c["name"] in self.CREDENTIAL_CONTAINERS - {"agent-api-proxy"}
-                for c in h.containers_of(d)
-            )
+        ]
+        broker_only = [
+            d
+            for d in deployments
+            if any(c["name"] in self.CREDENTIAL_CONTAINERS for c in h.containers_of(d))
             and not any(c["name"] == self.SANDBOX_CONTAINER for c in h.containers_of(d))
         ]
         self.assertTrue(
-            broker_pods,
-            "the split-broker fixture renders no Pod holding the broker alone",
+            broker_only,
+            "no rendered Deployment holds a credential container without the "
+            "sandbox container beside it",
         )
 
     def test_C1_the_broker_backend_socket_is_bound_private(self) -> None:

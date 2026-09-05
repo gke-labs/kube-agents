@@ -50,12 +50,17 @@ spec:
             # point the images the operator deploys at your own registry.
             # PLATFORM_AGENT_IMAGE is the default agent image when a
             # PlatformAgent CR omits spec.deployment.image; the credential-proxy
-            # sidecar image is derived from the agent image unless
-            # CREDENTIAL_PROXY_IMAGE is set explicitly.
+            # image is derived from the agent image unless
+            # CREDENTIAL_PROXY_IMAGE is set explicitly. AGENT_SANDBOX_IMAGE is
+            # the shell sandbox StatefulSet's image, which is not derived —
+            # it is a separate repository — and is overridden per agent by
+            # spec.harness.experimental.shellSandbox.image.
             # - name: PLATFORM_AGENT_IMAGE
             #   value: "registry.example.com/kube-agents/platform-agent:latest"
             # - name: CREDENTIAL_PROXY_IMAGE
             #   value: "registry.example.com/kube-agents/credential-proxy:latest"
+            # - name: AGENT_SANDBOX_IMAGE
+            #   value: "registry.example.com/kube-agents/agent-sandbox:latest"
             # - name: FLUENT_BIT_IMAGE
             #   value: "registry.example.com/mirror/fluent-bit:5.1.1"
             # IMAGE_PULL_SECRETS is the pull identity for those images, as
