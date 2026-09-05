@@ -1,0 +1,46 @@
+name: Eval Dashboard Refresh (on demand)
+
+# Manually refresh the live eval dashboard at
+# https://storage.googleapis.com/kube-agents-dashboards/evals/index.html
+# without waiting for the Prow periodic: Actions tab -> this workflow ->
+# "Run workflow". Runs the same pipeline the periodic runs
+# (hack/ci-dashboard-refresh.sh: incremental collect -> render -> publish).
+#
+# JOB_TYPE=periodic satisfies the script's main-branch publish guard: this
+# workflow is manual-only (workflow_dispatch), checks out main, and carries
+# the repo guard below, so it meets the guard's intent -- only main-branch,
+# non-fork contexts may write the shared bucket.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  refresh:
+    # Credentialed workflow: never run on forks (see .agents/rules/github_actions.md).
+    if: github.repository == 'gke-labs/kube-agents'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: projects/125393897113/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
+          service_account: github-actions@kube-agents-prow.iam.gserviceaccount.com
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Refresh the dashboard
+        env:
+          EVAL_DASHBOARD_TARGET: gs://kube-agents-dashboards/evals/
+          JOB_TYPE: periodic
+        run: ./hack/ci-dashboard-refresh.sh
