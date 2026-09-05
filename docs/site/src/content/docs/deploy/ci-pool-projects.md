@@ -293,12 +293,9 @@ A half-finished apply is the case to watch for. The stack's Kubernetes provider 
 
 ### 6.1 A read-only credential for the checks
 
-An eval run reads the fleet to confirm its fixtures survived; it has no business being able to change them, and a safeguard is worth less when the credential that checks it could also have caused what it is checking for. **This is not true today.** The Prow identity holds `roles/container.admin` in every eval project, and there are no in-cluster RoleBindings to narrow — GKE's IAM webhook is the whole authorization path.
+An eval run reads the fleet to confirm its fixtures survived; it has no business being able to change them, and a safeguard is worth less when the credential that checks it could also have caused what it is checking for. The apply above handles this: the fleet stack provisions `seeded-fleet-reader@${PROJECT_ID}.iam.gserviceaccount.com` with `roles/container.viewer` and nothing else, and binds `roles/iam.serviceAccountTokenCreator` on that account to `fleet_reader_token_creators`, which defaults to the Prow identity. `hack/ci-eval-pr.sh` already exports `FLEET_READONLY_SA` pointing at the account, so `hack/fleet-kubeconfigs.sh` mints a token for it and writes each kubeconfig with that token as its only credential.
 
-The seam exists: the fleet stack provisions `seeded-fleet-reader@${PROJECT_ID}.iam.gserviceaccount.com` with `roles/container.viewer` and nothing else. To use it, per project:
-
-1. Add the Prow identity to `fleet_reader_token_creators` and re-apply the stack, which binds it `roles/iam.serviceAccountTokenCreator` on that account alone.
-2. Export `FLEET_READONLY_SA=seeded-fleet-reader@${PROJECT_ID}.iam.gserviceaccount.com` in the Prow job. Unset, `hack/fleet-kubeconfigs.sh` warns on every run and the kubeconfigs carry the runner's own identity.
+That default landed after the pool was provisioned. A project whose fleet was applied before it has the account but not the binding, so `hack/fleet-kubeconfigs.sh` warns per cluster and the kubeconfigs keep the runner's own `roles/container.admin` on a fleet every open pull request shares — there are no in-cluster RoleBindings to narrow, GKE's IAM webhook is the whole authorization path. Section 7's check fails such a project; re-applying the stack against it is the repair.
 
 ## 7. Pre-flight verification
 

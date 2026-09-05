@@ -708,13 +708,14 @@ def check_project_and_apis(project_id: str) -> Tuple[Optional[str], CheckResult]
 
 
 def check_iam_and_service_accounts(project_id: str, project_number: str) -> CheckResult:
-    """Verify Workload Identity, the Prow runner's and platform GSA's project roles, and the cross-project AR reader grants."""
+    """Verify Workload Identity, the Prow runner's and platform GSA's project roles, the cross-project AR reader grants, and the fleet reader's token-creator binding."""
     details = []
     warnings: List[str] = []
     passed = True
     wi_checked = False
     roles_checked = False
     prow_checked = False
+    fleet_reader_checked = False
 
     gsa_email = f"kubeagents-platform-gsa@{project_id}.iam.gserviceaccount.com"
     rc, out, err = run_cmd([
@@ -880,12 +881,60 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
             passed = False
             details.append(f"Failed parsing kube-agents-prow AR policy: {exc}")
 
+    # The runner's permission to borrow the seeded fleet's read-only account.
+    # Without it hack/fleet-kubeconfigs.sh cannot mint a token for
+    # seeded-fleet-reader, so every role kubeconfig keeps the runner's own
+    # roles/container.admin credential on a fleet all open pull requests share --
+    # loud in the log, but the run still passes, which is why this went unnoticed
+    # across the whole pool (gke-labs/kube-agents#1051). bench/tf/fleet now
+    # defaults the grant, so a project failing here was last applied before that
+    # default landed and needs `tofu apply` against its seeded-fleet state.
+    fleet_reader_email = f"seeded-fleet-reader@{project_id}.iam.gserviceaccount.com"
+    rc, out, err = run_cmd([
+        "gcloud", "iam", "service-accounts", "get-iam-policy",
+        fleet_reader_email,
+        f"--project={project_id}",
+        "--format=json",
+    ])
+    if rc != 0:
+        if not _record_unreadable(
+            err,
+            f"Missing account or failed reading policy for {fleet_reader_email}. Apply "
+            f"bench/tf/fleet in {project_id}: the stack owns this account.",
+            f"Could not read the IAM policy on {fleet_reader_email}, so the Prow runner's "
+            "impersonation grant was not checked (and neither was the account's existence)",
+            details,
+            warnings,
+        ):
+            passed = False
+    else:
+        fleet_reader_checked = True
+        try:
+            policy = _load_json(out)
+            token_creator_bound = any(
+                b.get("role") == "roles/iam.serviceAccountTokenCreator"
+                and PROW_RUNNER_MEMBER in b.get("members", [])
+                for b in policy.get("bindings", [])
+            )
+            if not token_creator_bound:
+                passed = False
+                details.append(
+                    f"The Prow runner ({PROW_RUNNER_MEMBER.split(':', 1)[1]}) is missing "
+                    f"roles/iam.serviceAccountTokenCreator on {fleet_reader_email}, so every "
+                    f"fleet check in this project runs under the runner's own read-write "
+                    f"credential. Re-apply bench/tf/fleet against {project_id}."
+                )
+        except Exception as exc:
+            passed = False
+            details.append(f"Failed parsing policy for {fleet_reader_email}: {exc}")
+
     # The summary must not assert an item a warning above retracts.
     partial = _partial_summary(
         [
             ("the Workload Identity binding", wi_checked),
             ("the Prow runner and platform GSA project roles", roles_checked),
             ("the cross-project AR reader grants", prow_checked),
+            ("the fleet reader's token-creator binding", fleet_reader_checked),
         ]
     )
     if not passed:
@@ -895,7 +944,8 @@ def check_iam_and_service_accounts(project_id: str, project_number: str) -> Chec
     else:
         message = (
             "Workload Identity, Prow runner and platform GSA project roles, "
-            "and cross-project AR reader grants verified"
+            "cross-project AR reader grants, and the fleet reader's token-creator "
+            "binding verified"
         )
 
     return CheckResult(
