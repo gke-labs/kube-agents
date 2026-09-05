@@ -255,7 +255,7 @@ The module also owns the plumbing that would otherwise become a third copy: the 
 
 The provider protocol makes this feature portable. The stack under it is not — token brokering, the
 sidecar's executable allowlist, the git credential shape and the CRD each name GitHub, and none of
-that is caused by this design. [`multi-forge-support.md`](multi-forge-support.md) owns the full
+that is caused by this design. [`version-control-support.md`](version-control-support.md) owns the full
 account and the order the layers have to be unwound in; this section records only what bears on the
 protocol above them.
 

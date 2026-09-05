@@ -15,7 +15,7 @@ already been answered — is harness policy that does not change between forges.
 
 Splitting the two here is what makes a second forge a new class rather than a
 second copy of the sweep. It is *not* a claim that a second forge is cheap:
-`docs/designs/multi-forge-support.md` §5 covers the layers under this module —
+`docs/designs/version-control-support.md` covers the layers under this module —
 token brokering, the credential sidecar's executable allowlist, git credential
 shape, the egress policy — and §6 the CRD, each of which would need work first.
 The seam is here so that when that work happens it lands in one place.
