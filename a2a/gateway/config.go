@@ -36,6 +36,21 @@ type Config struct {
 	// PrincipalMapPath is the mounted principal-map ConfigMap.
 	PrincipalMapPath string
 
+	// GchatRelayURL is the credential proxy's relay base URL — the gchat
+	// backend's transport. Setting it selects the Google Chat adapter.
+	GchatRelayURL string
+	// GchatTokenPath is the projected ServiceAccount token (chat audience)
+	// the adapter authenticates to the relay with.
+	GchatTokenPath string
+	// GchatAllowedUsers is the ingress allowlist for the gchat backend —
+	// the same gate the legacy path enforces as GOOGLE_CHAT_ALLOWED_USERS.
+	// gchat has no mapping table (the Google-asserted email IS the
+	// principal), so the allowlist is the whole verification config.
+	GchatAllowedUsers []string
+	// GchatAllowAllUsers disables the allowlist, stated explicitly —
+	// mirroring the legacy GOOGLE_CHAT_ALLOW_ALL_USERS posture.
+	GchatAllowAllUsers bool
+
 	// DefaultAddressee is where every conversation's tasks route until a
 	// per-conversation override says otherwise. Retarget 8/26: the first
 	// shipped configuration routes everything to "platform" (the W7 bridge

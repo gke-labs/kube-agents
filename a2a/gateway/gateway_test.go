@@ -346,16 +346,22 @@ func TestNewTaskRoutesToPlatformWithMintedIdsAndAuthority(t *testing.T) {
 
 func TestUnmappedSenderIsDropped(t *testing.T) {
 	r := startRig(t)
-	r.adapter.inbox <- InboundMessage{
-		Conversation: "discord:g1/thread1", Kind: "group",
-		AuthorID: "9999", MessageID: "d-1", Text: "let me in",
+	for i := 0; i < 2; i++ {
+		r.adapter.inbox <- InboundMessage{
+			Conversation: fmt.Sprintf("discord:g1/thread%d", i), Kind: "group",
+			AuthorID: "9999", MessageID: fmt.Sprintf("d-%d", i), Text: "let me in",
+		}
 	}
 	time.Sleep(500 * time.Millisecond)
 	if envs := inSubjectEnvelopes(t, r.url, "platform"); len(envs) != 0 {
 		t.Fatalf("unverified sender reached the bus: %d envelopes", len(envs))
 	}
-	if posts := r.adapter.postTexts(); len(posts) != 0 {
-		t.Fatalf("unverified sender got a reply: %v", posts)
+	posts := r.adapter.postTexts()
+	if len(posts) != 1 {
+		t.Fatalf("drop must be visible exactly once per sender per conversation, got %d posts: %v", len(posts), posts)
+	}
+	if !strings.Contains(posts[0], "can't verify") {
+		t.Fatalf("drop notice missing: %q", posts[0])
 	}
 }
 

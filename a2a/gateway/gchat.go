@@ -1,0 +1,547 @@
+package gateway
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"os"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+)
+
+const (
+	// gchatRelayAPIPath is the credential proxy's Chat API passthrough — the
+	// same route the legacy chat caller uses, so the destructive-method
+	// denylist and error scrubbing hold for this adapter without new code.
+	gchatRelayAPIPath = "/v1/chat/api"
+	// gchatReplyOption makes a threaded create degrade to a new thread when
+	// the referenced thread cannot take replies, instead of failing the post.
+	gchatReplyOption = "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
+	// gchatMemberPageSize is one page of the members list; the roster is
+	// complete only when Chat reports no further page, same one-page posture
+	// as the Discord adapter.
+	gchatMemberPageSize = 100
+	// gchatRelayTimeout bounds one relay API round trip. The relay's own
+	// pull blocks up to ~20s server-side, so this must sit above that.
+	gchatRelayTimeout = 30 * time.Second
+	// gchatRelayEventsPath is the A2A-dedicated event route — its own
+	// GoogleChatRelay instance on its own subscription, so this consumer
+	// never splits deliveries with the legacy chat path.
+	gchatRelayEventsPath    = "/v1/chat/a2a/events"
+	gchatRelayEventsAckPath = "/v1/chat/a2a/events/ack"
+	// gchatPullRetryDelay paces re-polls after a pull error, so a relay
+	// outage logs a warning a second rather than a thousand.
+	gchatPullRetryDelay = 2 * time.Second
+)
+
+const (
+	// gchatBackend names the backend in authority blocks and config.
+	gchatBackend = "gchat"
+	// gchatVerifiedBy names what ingress verification actually checked: the
+	// event arrived from a subscription on the topic whose only permitted
+	// publishers are Google's Chat service accounts, and Google Chat
+	// asserted the sender email after authenticating the user's session.
+	// NOT a per-request signed token — none exists on the Pub/Sub shape
+	// (spec-chatops-gateway.md, "The Google Chat adapter").
+	gchatVerifiedBy = "chat-event-topic-iam"
+)
+
+// verifiedByFor names the mechanism that checked the requester at ingress
+// for one backend (authority.requester.verifiedBy).
+func verifiedByFor(backend string) string {
+	if backend == gchatBackend {
+		return gchatVerifiedBy
+	}
+	return "principal-map"
+}
+
+// unverifiedRemedyFor names what an admin edits to admit a sender — the
+// allowlist on gchat, the mapping table everywhere else.
+func unverifiedRemedyFor(backend string) string {
+	if backend == gchatBackend {
+		return "the allowed users list"
+	}
+	return "the principal map"
+}
+
+// gchatLinkRe rewrites markdown links to Chat's <url|text> form.
+var gchatLinkRe = regexp.MustCompile(`\[([^\]]+)\]\((https?://[^)\s]+)\)`)
+
+// gchatEvent is the Google Chat event JSON the Chat app publishes to the
+// Pub/Sub topic — the same payload the legacy path consumes
+// (tests/e2e/gchat_agent_test.py forges the canonical example). Only the
+// fields the adapter reads are declared.
+type gchatEvent struct {
+	Type  string `json:"type"`
+	Space struct {
+		Name string `json:"name"`
+		// Type is the legacy field ("ROOM"/"DM"); SpaceType its successor
+		// ("SPACE"/"GROUP_CHAT"/"DIRECT_MESSAGE"). Events have carried either
+		// depending on API vintage, so both are read.
+		Type                string `json:"type"`
+		SpaceType           string `json:"spaceType"`
+		SpaceThreadingState string `json:"spaceThreadingState"`
+	} `json:"space"`
+	Message struct {
+		Name string `json:"name"`
+		Text string `json:"text"`
+		// ArgumentText is the message text with the app mention stripped —
+		// Chat computes it, so there is no mention grammar to re-derive.
+		ArgumentText string `json:"argumentText"`
+		Thread       struct {
+			Name string `json:"name"`
+		} `json:"thread"`
+		Sender struct {
+			Name        string `json:"name"`
+			DisplayName string `json:"displayName"`
+			Email       string `json:"email"`
+			Type        string `json:"type"`
+		} `json:"sender"`
+	} `json:"message"`
+}
+
+// GoogleChatAdapter implements Adapter over the credential proxy's chat
+// relay: events arrive by long-polling the relay's A2A event routes, and
+// posts, edits, roster reads and openDirect ride its Chat API passthrough.
+// The adapter holds no cloud credential — it authenticates to the relay with
+// the pod's projected ServiceAccount token, and the one Chat credential in
+// the deployment stays in the credential proxy.
+type GoogleChatAdapter struct {
+	relayURL  string
+	tokenPath string
+	client    *http.Client
+	log       *slog.Logger
+
+	mu sync.Mutex
+	// seen dedupes inbound messages by resource name: Pub/Sub is
+	// at-least-once, and a redelivered event must not become a second turn.
+	seen map[string]bool
+}
+
+// NewGoogleChatAdapter builds the adapter against the credential proxy's
+// relay base URL. tokenPath is the pod's projected ServiceAccount token
+// (chat audience); it is read per request because the kubelet rotates it.
+func NewGoogleChatAdapter(relayURL, tokenPath string, log *slog.Logger) (*GoogleChatAdapter, error) {
+	if relayURL == "" {
+		return nil, fmt.Errorf("gchat: relay URL is required")
+	}
+	if tokenPath == "" {
+		return nil, fmt.Errorf("gchat: relay token path is required")
+	}
+	return &GoogleChatAdapter{
+		relayURL:  strings.TrimSuffix(relayURL, "/"),
+		tokenPath: tokenPath,
+		client:    &http.Client{Timeout: gchatRelayTimeout},
+		log:       log,
+		seen:      map[string]bool{},
+	}, nil
+}
+
+// apiCall runs one Chat API method through the relay passthrough and decodes
+// the response body into out when out is non-nil.
+func (a *GoogleChatAdapter) apiCall(resource []string, method string, arguments map[string]any, out any) error {
+	payload, err := json.Marshal(map[string]any{
+		"resource": resource, "method": method, "arguments": arguments,
+	})
+	if err != nil {
+		return fmt.Errorf("gchat: encoding %s.%s: %w", strings.Join(resource, "."), method, err)
+	}
+	resp, err := a.relayPost(gchatRelayAPIPath, payload)
+	if err != nil {
+		return err
+	}
+	var body struct {
+		Response json.RawMessage `json:"response"`
+	}
+	if err := json.Unmarshal(resp, &body); err != nil {
+		return fmt.Errorf("gchat: decoding relay response: %w", err)
+	}
+	if out != nil && len(body.Response) > 0 {
+		if err := json.Unmarshal(body.Response, out); err != nil {
+			return fmt.Errorf("gchat: decoding %s.%s response: %w", strings.Join(resource, "."), method, err)
+		}
+	}
+	return nil
+}
+
+// relayPost is one authenticated POST to the relay. The token is re-read on
+// every call: it is a projected ServiceAccount token the kubelet rotates.
+func (a *GoogleChatAdapter) relayPost(path string, payload []byte) ([]byte, error) {
+	token, err := os.ReadFile(a.tokenPath)
+	if err != nil {
+		return nil, fmt.Errorf("gchat: reading relay token: %w", err)
+	}
+	req, err := http.NewRequest(http.MethodPost, a.relayURL+path, bytes.NewReader(payload))
+	if err != nil {
+		return nil, fmt.Errorf("gchat: building relay request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("gchat: relay request: %w", err)
+	}
+	defer resp.Body.Close()
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(resp.Body); err != nil {
+		return nil, fmt.Errorf("gchat: reading relay response: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		// The relay scrubs Chat error bodies before they get here; carrying
+		// the status forward is enough to tell a refusal from an outage.
+		return nil, fmt.Errorf("gchat: relay %s answered %d", path, resp.StatusCode)
+	}
+	return buf.Bytes(), nil
+}
+
+// Post writes text to a conversation and returns the created message's
+// resource name (Adapter.Post).
+func (a *GoogleChatAdapter) Post(conversation, text string) (string, error) {
+	space, thread, ok := gchatSpaceThread(conversation)
+	if !ok {
+		return "", fmt.Errorf("gchat: not a gchat conversation: %q", conversation)
+	}
+	body := map[string]any{"text": toGchatText(text)}
+	arguments := map[string]any{"parent": space, "body": body}
+	if thread != "" {
+		body["thread"] = map[string]any{"name": thread}
+		arguments["messageReplyOption"] = gchatReplyOption
+	}
+	var created struct {
+		Name string `json:"name"`
+	}
+	if err := a.apiCall([]string{"spaces", "messages"}, "create", arguments, &created); err != nil {
+		return "", err
+	}
+	return created.Name, nil
+}
+
+// Edit replaces the text of a previously posted message (Adapter.Edit) — the
+// rolling progress line edits one message as artifacts arrive.
+func (a *GoogleChatAdapter) Edit(conversation, messageID, text string) error {
+	if _, _, ok := gchatSpaceThread(conversation); !ok {
+		return fmt.Errorf("gchat: not a gchat conversation: %q", conversation)
+	}
+	arguments := map[string]any{
+		"name":       messageID,
+		"updateMask": "text",
+		"body":       map[string]any{"text": toGchatText(text)},
+	}
+	return a.apiCall([]string{"spaces", "messages"}, "patch", arguments, nil)
+}
+
+// Roster returns one page of the space's membership (Adapter.Roster):
+// emails where the backend surfaced one — they resolve straight to
+// principals — the immutable users/ id where it did not, never the app
+// itself. Complete only when Chat reports no further page.
+func (a *GoogleChatAdapter) Roster(conversation string) ([]string, bool, error) {
+	space, _, ok := gchatSpaceThread(conversation)
+	if !ok {
+		return nil, false, fmt.Errorf("gchat: not a gchat conversation: %q", conversation)
+	}
+	var out struct {
+		Memberships []struct {
+			Member struct {
+				Name  string `json:"name"`
+				Email string `json:"email"`
+				Type  string `json:"type"`
+			} `json:"member"`
+		} `json:"memberships"`
+		NextPageToken string `json:"nextPageToken"`
+	}
+	arguments := map[string]any{"parent": space, "pageSize": gchatMemberPageSize}
+	if err := a.apiCall([]string{"spaces", "members"}, "list", arguments, &out); err != nil {
+		return nil, false, err
+	}
+	var ids []string
+	for _, m := range out.Memberships {
+		if m.Member.Type == "BOT" {
+			continue
+		}
+		id := m.Member.Email
+		if id == "" {
+			id = m.Member.Name
+		}
+		if id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids, out.NextPageToken == "", nil
+}
+
+// OpenDirect returns the DM conversation for a user (Adapter.OpenDirect).
+// userID is the Google-asserted email; the Chat API accepts the email alias
+// in user resource names.
+func (a *GoogleChatAdapter) OpenDirect(userID string) (string, error) {
+	user := map[string]any{"name": "users/" + userID}
+	var space struct {
+		Name string `json:"name"`
+	}
+	err := a.apiCall([]string{"spaces"}, "findDirectMessage", user, &space)
+	if err != nil {
+		// No DM space yet (or the lookup was refused): ask Chat to set one
+		// up between the app and the user.
+		setupErr := a.apiCall([]string{"spaces"}, "setup", map[string]any{
+			"body": map[string]any{
+				"space": map[string]any{"spaceType": "DIRECT_MESSAGE", "singleUserBotDm": true},
+				"memberships": []any{
+					map[string]any{"member": map[string]any{"name": "users/" + userID, "type": "HUMAN"}},
+				},
+			},
+		}, &space)
+		if setupErr != nil {
+			return "", fmt.Errorf("gchat: openDirect: find failed (%v) and setup failed: %w", err, setupErr)
+		}
+	}
+	if space.Name == "" {
+		return "", fmt.Errorf("gchat: openDirect returned no space")
+	}
+	return gchatDMKeyPrefix + space.Name, nil
+}
+
+// gchatEnvelope is one pulled event as the relay wraps it: an opaque receipt
+// for settling, and the Chat event JSON base64-encoded in data, the Pub/Sub
+// message shape.
+type gchatEnvelope struct {
+	Receipt   string `json:"receipt"`
+	Data      string `json:"data"`
+	MessageID string `json:"messageId"`
+}
+
+// Run long-polls the relay's A2A event route and delivers turns to handler
+// until ctx is done (Adapter.Run). Every pulled event is acked once its
+// disposition is known — including a payload that does not parse: the legacy
+// seam's recorded hole is a poison message that is never settled and
+// redelivers forever (tests/integration/test_seam_chat_ingress.py), and an
+// acked-away poison event beats an inbox wedged on one.
+func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage)) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		env, err := a.pullEvent(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			a.log.Warn("gchat event pull failed", "err", err)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(gchatPullRetryDelay):
+			}
+			continue
+		}
+		if env == nil {
+			continue // the relay long-polls server-side; an empty poll paces itself
+		}
+		ev, decodeErr := decodeGchatEvent(env.Data)
+		a.settle(env.Receipt)
+		if decodeErr != nil {
+			a.log.Warn("gchat event payload did not parse; acked away",
+				"pubsubMessageId", env.MessageID, "err", decodeErr)
+			continue
+		}
+		if msg, ok := a.inbound(ev); ok {
+			handler(msg)
+		}
+	}
+}
+
+// pullEvent asks the relay for one event; nil with no error means the poll
+// came back empty.
+func (a *GoogleChatAdapter) pullEvent(ctx context.Context) (*gchatEnvelope, error) {
+	token, err := os.ReadFile(a.tokenPath)
+	if err != nil {
+		return nil, fmt.Errorf("gchat: reading relay token: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.relayURL+gchatRelayEventsPath, nil)
+	if err != nil {
+		return nil, fmt.Errorf("gchat: building pull request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("gchat: event pull: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("gchat: event pull answered %d", resp.StatusCode)
+	}
+	var body struct {
+		Event *gchatEnvelope `json:"event"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, fmt.Errorf("gchat: decoding pulled event: %w", err)
+	}
+	return body.Event, nil
+}
+
+// settle acks one pulled event. Failing to ack only means a redelivery the
+// dedupe map absorbs, so the error is logged rather than returned.
+func (a *GoogleChatAdapter) settle(receipt string) {
+	payload, err := json.Marshal(map[string]string{"receipt": receipt})
+	if err != nil {
+		a.log.Warn("gchat ack encode failed", "err", err)
+		return
+	}
+	if _, err := a.relayPost(gchatRelayEventsAckPath, payload); err != nil {
+		a.log.Warn("gchat ack failed", "err", err)
+	}
+}
+
+// decodeGchatEvent unwraps the base64 Pub/Sub payload into the Chat event.
+func decodeGchatEvent(data string) (*gchatEvent, error) {
+	raw, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		return nil, fmt.Errorf("base64: %w", err)
+	}
+	var ev gchatEvent
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		return nil, fmt.Errorf("event json: %w", err)
+	}
+	return &ev, nil
+}
+
+// toGchatText translates executor markdown to Google Chat's text format and
+// defangs the one control sequence Chat parses out of message text: a
+// <users/…> mention, which a prompt-injected result could use to ping the
+// room. The defusing is a visible space, not an invisible character.
+func toGchatText(s string) string {
+	s = strings.ReplaceAll(s, "<users/", "< users/")
+	s = gchatLinkRe.ReplaceAllString(s, "<$2|$1>")
+	return strings.ReplaceAll(s, "**", "*")
+}
+
+// inbound normalizes one Chat event to an InboundMessage. The bool reports
+// whether the event is a turn at all: Google Chat itself gates delivery (an
+// app receives a space message only when mentioned, and every DM), so what
+// is owned here is the surface binding and the drops.
+func (a *GoogleChatAdapter) inbound(ev *gchatEvent) (InboundMessage, bool) {
+	if ev.Type != "MESSAGE" {
+		return InboundMessage{}, false
+	}
+	sender := ev.Message.Sender
+	if sender.Type != "HUMAN" || sender.Email == "" {
+		return InboundMessage{}, false
+	}
+	if ev.Space.Name == "" || ev.Message.Name == "" {
+		return InboundMessage{}, false
+	}
+	// ArgumentText is authoritative when Chat sent one: it is the text with
+	// the app mention stripped, and a bare mention leaves it blank — falling
+	// back to Text there would resurrect the mention as the ask.
+	text := strings.TrimSpace(ev.Message.Text)
+	if ev.Message.ArgumentText != "" {
+		text = strings.TrimSpace(ev.Message.ArgumentText)
+	}
+	if text == "" {
+		return InboundMessage{}, false
+	}
+
+	// A space misread as a DM would bind every thread in it to one session,
+	// so DM requires a positive signal; anything unclassifiable is a group.
+	kind := "group"
+	if ev.Space.SpaceType == "DIRECT_MESSAGE" || ev.Space.Type == "DM" {
+		kind = "dm"
+	}
+	thread := ev.Message.Thread.Name
+	if ev.Space.SpaceThreadingState == "UNTHREADED_MESSAGES" {
+		thread = ""
+	}
+
+	a.mu.Lock()
+	dup := a.seen[ev.Message.Name]
+	a.seen[ev.Message.Name] = true
+	a.mu.Unlock()
+	if dup {
+		return InboundMessage{}, false
+	}
+
+	return InboundMessage{
+		Conversation: gchatConversationID(ev.Space.Name, thread, kind),
+		Kind:         kind,
+		AuthorID:     sender.Email,
+		MessageID:    ev.Message.Name,
+		Text:         text,
+	}, true
+}
+
+// Conversation key prefixes for the Google Chat adapter. A space is not a
+// session; a conversation in it is — and what counts as the conversation
+// depends on the surface: a thread in a threaded space, the whole space in a
+// DM or in a space whose threading state does not support replies
+// (spec-chatops-gateway.md, "The Google Chat adapter").
+const (
+	gchatKeyPrefix      = "gchat:"
+	gchatDMKeyPrefix    = "gchat:dm/"
+	gchatSpaceKeyPrefix = "gchat:space/"
+	gchatSpacesToken    = "spaces/"
+	gchatThreadsToken   = "/threads/"
+)
+
+// resolvePrincipal establishes the requester's principal from the backend's
+// identity mechanism. On gchat the Google-asserted email IS the principal —
+// resolution is the identity function gated by the allowlist (the mapping
+// table other backends need is exactly what this backend exists to not
+// have). Everything else goes through the principal map. Empty means drop.
+func (g *Gateway) resolvePrincipal(authorID string) string {
+	if g.backend != gchatBackend {
+		return g.pm.Resolve(authorID)
+	}
+	if g.gchatAllowAll || g.gchatAllowed[strings.ToLower(authorID)] {
+		return authorID
+	}
+	return ""
+}
+
+// gchatConversationID mints the session key for one inbound message. space is
+// the Chat space resource name ("spaces/AAA"), thread the thread resource name
+// ("spaces/AAA/threads/BBB", empty when the surface has none), kind "dm" or
+// "group".
+func gchatConversationID(space, thread, kind string) string {
+	if kind == "dm" {
+		return gchatDMKeyPrefix + space
+	}
+	if thread == "" {
+		return gchatSpaceKeyPrefix + space
+	}
+	return gchatKeyPrefix + thread
+}
+
+// gchatSpaceThread inverts gchatConversationID: the space to post into and
+// the thread to reply on (empty when the conversation is the whole space).
+func gchatSpaceThread(conversation string) (space, thread string, ok bool) {
+	rest, found := strings.CutPrefix(conversation, gchatDMKeyPrefix)
+	if !found {
+		rest, found = strings.CutPrefix(conversation, gchatSpaceKeyPrefix)
+	}
+	if found {
+		if !gchatIsSpaceName(rest) {
+			return "", "", false
+		}
+		return rest, "", true
+	}
+	rest, found = strings.CutPrefix(conversation, gchatKeyPrefix)
+	if !found {
+		return "", "", false
+	}
+	space, threadID, hasThread := strings.Cut(rest, gchatThreadsToken)
+	if !hasThread || !gchatIsSpaceName(space) || threadID == "" || strings.Contains(threadID, "/") {
+		return "", "", false
+	}
+	return space, rest, true
+}
+
+// gchatIsSpaceName reports whether s is a bare space resource name
+// ("spaces/AAA", nothing nested under it).
+func gchatIsSpaceName(s string) bool {
+	id, found := strings.CutPrefix(s, gchatSpacesToken)
+	return found && id != "" && !strings.Contains(id, "/")
+}

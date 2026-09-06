@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -72,6 +73,13 @@ type Gateway struct {
 
 	// backend names the chat backend for authority blocks.
 	backend string
+	// gchatAllowed and gchatAllowAll gate the gchat backend's identity
+	// resolution (Config.GchatAllowedUsers, lowercased at build).
+	gchatAllowed  map[string]bool
+	gchatAllowAll bool
+	// droppedNotices records which unverifiable senders have been told so —
+	// the drop is visible once per sender, not once per message.
+	droppedNotices map[string]bool
 	// relayDurable is the event relay's durable name (Options.RelayDurable).
 	relayDurable string
 }
@@ -107,13 +115,24 @@ func New(o Options) (*Gateway, error) {
 	if err != nil {
 		return nil, err
 	}
-	if pm.Len() == 0 {
-		log.Warn("principal map is empty; every inbound message will be dropped at verification",
-			"path", o.Config.PrincipalMapPath)
-	}
 	backend := o.Backend
 	if backend == "" {
 		backend = "discord"
+	}
+	// gchat resolves identity from the Google-asserted email, not from the
+	// map — an empty map is only a lockout on the backends that use one.
+	if backend != gchatBackend && pm.Len() == 0 {
+		log.Warn("principal map is empty; every inbound message will be dropped at verification",
+			"path", o.Config.PrincipalMapPath)
+	}
+	gchatAllowed := map[string]bool{}
+	for _, u := range o.Config.GchatAllowedUsers {
+		if u = strings.TrimSpace(u); u != "" {
+			gchatAllowed[strings.ToLower(u)] = true
+		}
+	}
+	if backend == gchatBackend && len(gchatAllowed) == 0 && !o.Config.GchatAllowAllUsers {
+		log.Warn("gchat allowlist is empty and allow-all is off; every inbound message will be dropped at verification")
 	}
 	if o.RelayDurable == "" {
 		o.RelayDurable = relayDurable
@@ -130,19 +149,22 @@ func New(o Options) (*Gateway, error) {
 		o.Config.AskTTL = defaultAskTTL
 	}
 	g := &Gateway{
-		cfg:          o.Config,
-		client:       o.Client,
-		reg:          NewRegistry(o.Client),
-		adapter:      o.Adapter,
-		pm:           pm,
-		ps:           NewPseudonymizer(o.Config.AttributionSalt),
-		log:          log,
-		runCtx:       context.Background(),
-		sessionLocks: map[string]*sync.Mutex{},
-		taskSessions: map[string]string{},
-		relays:       map[string]*relayState{},
-		backend:      backend,
-		relayDurable: o.RelayDurable,
+		cfg:            o.Config,
+		client:         o.Client,
+		reg:            NewRegistry(o.Client),
+		adapter:        o.Adapter,
+		pm:             pm,
+		ps:             NewPseudonymizer(o.Config.AttributionSalt),
+		log:            log,
+		runCtx:         context.Background(),
+		sessionLocks:   map[string]*sync.Mutex{},
+		taskSessions:   map[string]string{},
+		relays:         map[string]*relayState{},
+		backend:        backend,
+		gchatAllowed:   gchatAllowed,
+		gchatAllowAll:  o.Config.GchatAllowAllUsers,
+		droppedNotices: map[string]bool{},
+		relayDurable:   o.RelayDurable,
 	}
 	g.inbox = newKeyedQueue(func(_ string, batch []InboundMessage) {
 		for _, msg := range batch {
@@ -206,13 +228,25 @@ func (g *Gateway) lockSession(key string) *sync.Mutex {
 // and route the message — status query by replay, stop, steer, or a new
 // task. Runs on the conversation's inbox worker, in arrival order.
 func (g *Gateway) handleInbound(msg InboundMessage) {
-	// Verify against the backend's identity mechanism — for Discord, the
-	// test mapping table — and drop the message if we can't (gateway design,
-	// turns-and-tasks step 1).
-	principal := g.pm.Resolve(msg.AuthorID)
+	// Verify against the backend's identity mechanism — the mapping table
+	// on Discord, the Google-asserted email gated by the allowlist on gchat
+	// — and drop the message if we can't (gateway design, turns-and-tasks
+	// step 1). The drop is visible once per sender: a silent drop of a real
+	// user is a support burden, and the notice names no caller-supplied
+	// value — a refusal that echoes what the caller sent is an oracle.
+	principal := g.resolvePrincipal(msg.AuthorID)
 	if principal == "" {
-		g.log.Warn("dropping message from unmapped sender",
+		g.log.Warn("dropping message from unverified sender",
 			"backend", g.backend, "author", msg.AuthorID, "conversation", msg.Conversation)
+		g.mu.Lock()
+		notified := g.droppedNotices[msg.AuthorID]
+		g.droppedNotices[msg.AuthorID] = true
+		g.mu.Unlock()
+		if !notified {
+			g.post(msg.Conversation, "⛔ I can't verify who you are on "+g.backend+
+				" (id "+msg.AuthorID+"), so I can't take asks from you yet — an admin has to add you to "+
+				unverifiedRemedyFor(g.backend)+".")
+		}
 		return
 	}
 
@@ -250,7 +284,7 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 		rosterIDs = append(rosterIDs, msg.AuthorID)
 	}
 	authority := BuildAuthority(g.ps, g.pm, principal, g.backend, msg.AuthorID,
-		"principal-map", msg.Conversation, rec.Kind, rosterIDs, rosterComplete)
+		verifiedByFor(g.backend), msg.Conversation, rec.Kind, rosterIDs, rosterComplete)
 	rec.Roster = hashRoster(g.ps, g.pm, rosterIDs)
 
 	// Heal a stale ActiveTask before routing: if the task is already
