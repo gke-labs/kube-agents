@@ -451,10 +451,13 @@ that's a bug in the interface, and better to learn it on the throwaway backend.
 ## The Google Chat adapter (added 9/5)
 
 The first real adapter, and the production ingress. What makes it that is the identity
-property above: the sender email Google Chat asserts is the cloud principal and the RBAC
-subject, so there is no mapping table and no impersonation surface in one. What it costs
-is inheriting the existing Chat integration's operational surface, and this section
-records how the adapter sits on it.
+property above: the sender email Google Chat asserts is the same string as the cloud
+principal and the RBAC subject, so there is no mapping table and no impersonation
+surface in one. Same string, not same enforcement yet: the email rides the authority block,
+which is advisory until publisher identity arms and A3 makes it decision-grade —
+nothing authorizes on it today, and when the requester does become enforceable, this
+adapter is already carrying the string that decision needs. What the adapter costs is inheriting the existing Chat
+integration's operational surface, and this section records how it sits on it.
 
 **Ingress topology: the existing app registration and topic, a dedicated A2A
 subscription, consumed through the credential proxy.** A Chat app configuration is

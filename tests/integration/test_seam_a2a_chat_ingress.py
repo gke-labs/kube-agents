@@ -119,6 +119,37 @@ class A2AChatIngressSeam(unittest.TestCase):
         status, _ = self._post("/v1/chat/a2a/events/ack", {"receipt": "X"})
         self.assertEqual(status, 503)
 
+    def test_a2a_routes_demand_the_chat_role(self):
+        """The new family's whole authentication is the /v1/chat/ prefix rule.
+
+        Nothing else pinned ROUTE_ROLES before this file, and the A2A gateway
+        is a third caller whose reachability depends on it: the sandbox's
+        shell role must be refused here (403, not 401 — the caller is known,
+        the route is not theirs), and the chat role admitted. The two
+        directions verify each other — a vacuous rule would fail the 403 half.
+        """
+        from credential_proxy import Principal
+
+        class RoleAuthenticator:
+            authenticates = True
+            role = "shell"
+
+            def authenticate(self, headers):
+                return Principal(workload="test-caller", role=self.role)
+
+        auth = RoleAuthenticator()
+        saved = self.handler.authenticator
+        self.handler.authenticator = auth
+        self.addCleanup(setattr, self.handler, "authenticator", saved)
+
+        status, body = self._get("/v1/chat/a2a/events")
+        self.assertEqual(status, 403)
+        self.assertEqual(body.get("code"), "CALLER_ROLE_FORBIDDEN")
+
+        auth.role = "chat"
+        status, body = self._get("/v1/chat/a2a/events")
+        self.assertEqual(status, 200)
+
     def test_api_passthrough_works_with_only_the_a2a_relay_armed(self):
         self.handler.chat_relay = None
         status, body = self._post(
