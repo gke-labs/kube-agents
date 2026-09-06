@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord adapter) - session spawning is dark behind `A2A_SPAWN_SESSIONS`, and the operator renders neither the gateway Deployment nor its env yet
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord and Google Chat adapters) - session spawning is dark behind `A2A_SPAWN_SESSIONS`; the operator renders the gateway Deployment and its env under `mode: next` (`platformagent_a2a_manifests.go`), but not yet the Google Chat adapter's env or its projected relay token
 
 ## Purpose
 
@@ -439,9 +439,8 @@ than a compromise: it keeps a toy backend structurally incapable of asserting a 
 principal.
 
 Google Chat stays the supported production ingress, for the trust-domain reason above -
-it is the first real adapter, built during stage 2 once the interface is proven against
-Discord. Slack follows when a customer asks, with the mapping table as a hard
-prerequisite.
+it is the first real adapter, specified in its own section below. Slack follows when a
+customer asks, with the mapping table as a hard prerequisite.
 
 The adapter interface is what makes the pick cheap: inbound message with verified sender,
 conversation and thread identity, roster read, post-to-conversation, `openDirect`. Five
@@ -454,9 +453,10 @@ The first real adapter, and the production ingress. What makes it that is the id
 property above: the sender email Google Chat asserts is the same string as the cloud
 principal and the RBAC subject, so there is no mapping table and no impersonation
 surface in one. Same string, not same enforcement yet: the email rides the authority block,
-which is advisory until publisher identity arms and A3 makes it decision-grade —
-nothing authorizes on it today, and when the requester does become enforceable, this
-adapter is already carrying the string that decision needs. What the adapter costs is inheriting the existing Chat
+which is advisory until publisher identity arms (the signed-claim-vs-subject-derived
+decision "Requester identity" above leaves with the deployment spec and the authority
+work) — nothing authorizes on it today, and when the requester does become
+enforceable, this adapter is already carrying the string that decision needs. What the adapter costs is inheriting the existing Chat
 integration's operational surface, and this section records how it sits on it.
 
 **Ingress topology: the existing app registration and topic, a dedicated A2A
@@ -469,19 +469,31 @@ second `GoogleChatRelay` instance in the credential proxy (routes
 `/v1/chat/a2a/events`, `/v1/chat/a2a/events/ack`, `/v1/chat/a2a/events/nack`), enabled
 only when `A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME` is set alongside the project id. The
 gateway pod stays cloud-credential-free: it authenticates to the proxy the way the
-legacy chat caller does — a projected ServiceAccount token with the chat audience,
-verified by TokenReview — and the one Chat credential in the deployment stays where
-#913 put it. Posting, editing, roster reads and `openDirect` ride the existing
-`/v1/chat/api` passthrough, which keeps the destructive-method denylist and the
-error-scrubbing in force for the new path without new code.
+legacy chat caller does — a projected ServiceAccount token verified by TokenReview —
+but with its OWN audience (`kubeagents-credential-proxy-a2a-chat`, conferring the
+`a2a-chat` role), because the legacy chat caller is the LLM-driven Hermes pod and a
+shared role would let a prompt-injected agent pull and ack the A2A gateway's events,
+silently consuming user asks. The event routes demand `a2a-chat`; `/v1/chat/api`
+admits both chat roles, since posting rides one shared app credential either way. The
+one Chat credential in the deployment stays where #913 put it, and the passthrough
+keeps the destructive-method denylist and the error-scrubbing in force for the new
+path without new code.
+
+Ingress is at-most-once, by decision rather than accident: the adapter acks each
+pulled event before handing it to the session manager. Acking after a durable publish
+would be at-least-once, but the redelivery dedupe is in-memory, so a redelivery
+racing a slow publish across a restart becomes a DUPLICATE task — a worse failure
+than a lost ask, which a user retries by typing again. It also matches the other
+backends' ingress semantics: the Discord and Slack websockets redeliver nothing.
 
 **Coexistence is by activation, not routing.** `mode: next` is additive, so a next
 install still runs the legacy chat consumer. A topic fans out to every subscription:
 an install that enables the A2A subscription while the legacy path is live will answer
-every message twice. The per-install choice of which brain consumes Chat is operator
-wiring (the mode switch's per-component seam), and it is not in this change — until it
-lands, the A2A relay instance is enabled only by explicit configuration, and enabling
-it beside the legacy path is the loud, stated way to get a double answer.
+every message twice. The per-install choice of which brain consumes Chat belongs to
+the operator's mode seam (the mode switch's per-component override sketch) and does
+not exist yet; the A2A relay instance arms only on explicit configuration
+(`A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME`), so arming it beside the legacy consumer is a
+stated choice, never a default.
 
 **`verifiedBy: "chat-event-topic-iam"`, and what was actually verified.** The gateway
 verified that the event arrived through the credential proxy from a subscription on the
@@ -524,11 +536,11 @@ regardless. Live validation must record what the members API actually returned, 
 what this paragraph hopes.
 
 **Display split.** The existing integration's `default` versus `debug` mode
-(`GoogleChatSpec.Mode`) is honoured by the relay: under `default` the rolling progress
-line is not edited turn-by-turn — placeholder, status-on-ask and terminal result only —
-and under `debug` the full rolling line runs. Carried as `A2A_CHAT_DISPLAY_MODE`, fed
-by the operator from the same CR field when the wiring PR lands. The split is the
-legacy field honoured in the new relay, not a new knob.
+(`GoogleChatSpec.Mode`) is honoured by the relay: under `default` the rolling line
+carries state transitions but never the turn-by-turn narration, with no-op edits
+deduplicated; under `debug` the full rolling line runs. Carried as
+`A2A_CHAT_DISPLAY_MODE`; the operator owns feeding it from the same CR field. The
+split is the legacy field honoured in the new relay, not a new knob.
 
 **openDirect.** `spaces.findDirectMessage` with `users/{email}` (the Chat API accepts
 the email alias in user resource names), falling back to `spaces.setup` when no DM
@@ -542,8 +554,9 @@ space exists yet. Ships as the primitive, unused, like the other backends.
 - The `authority` block, populated at ingress, advisory.
 - Roster tracking and the `openDirect` primitive.
 
-Not in stage 2: the classifier, the LCD permissions tool, the gchat and slack adapters,
-`grants`, and anything that makes `authority` decision-grade.
+Not in stage 2: the classifier, the LCD permissions tool, the slack adapter, `grants`,
+and anything that makes `authority` decision-grade. (The gchat adapter was on this
+list until 9/5; it now has its own section above.)
 
 ## Inherited from the kanban retirement (added 8/24)
 

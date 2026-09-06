@@ -38,6 +38,17 @@ const (
 	// gchatPullRetryDelay paces re-polls after a pull error, so a relay
 	// outage logs a warning a second rather than a thousand.
 	gchatPullRetryDelay = 2 * time.Second
+	// gchatPullIdleDelay paces re-polls after an EMPTY pull. The relay's
+	// server-side long poll usually paces for free, but a synchronous
+	// Pub/Sub pull may legitimately return nothing before its deadline, and
+	// each early-empty return would otherwise be an instant extra round
+	// trip through the proxy.
+	gchatPullIdleDelay = 500 * time.Millisecond
+	// gchatSeenCap bounds the redelivery-dedupe memory. Pub/Sub's
+	// redelivery window is bounded (ack deadline and retention), so an
+	// unbounded map would only ever be a leak, one entry per message for
+	// the pod's lifetime.
+	gchatSeenCap = 4096
 )
 
 const (
@@ -92,8 +103,11 @@ type gchatEvent struct {
 		Name string `json:"name"`
 		Text string `json:"text"`
 		// ArgumentText is the message text with the app mention stripped —
-		// Chat computes it, so there is no mention grammar to re-derive.
-		ArgumentText string `json:"argumentText"`
+		// Chat computes it, so there is no mention grammar to re-derive. A
+		// pointer because present-but-empty is meaningful: it is Google's
+		// documented shape for a mention-only message, and collapsing it
+		// into absent would resurrect the raw mention as the ask.
+		ArgumentText *string `json:"argumentText"`
 		Thread       struct {
 			Name string `json:"name"`
 		} `json:"thread"`
@@ -121,7 +135,9 @@ type GoogleChatAdapter struct {
 	mu sync.Mutex
 	// seen dedupes inbound messages by resource name: Pub/Sub is
 	// at-least-once, and a redelivered event must not become a second turn.
-	seen map[string]bool
+	// seenOrder is its eviction queue, bounded at gchatSeenCap.
+	seen      map[string]bool
+	seenOrder []string
 }
 
 // NewGoogleChatAdapter builds the adapter against the credential proxy's
@@ -279,7 +295,14 @@ func (a *GoogleChatAdapter) Roster(conversation string) ([]string, bool, error) 
 // userID is the Google-asserted email; the Chat API accepts the email alias
 // in user resource names.
 func (a *GoogleChatAdapter) OpenDirect(userID string) (string, error) {
-	user := map[string]any{"name": "users/" + userID}
+	name := userID
+	if !strings.HasPrefix(name, "users/") {
+		// This backend's own Roster may return either an email or a
+		// users/{id}; both are valid user resource names once prefixed
+		// exactly once.
+		name = "users/" + name
+	}
+	user := map[string]any{"name": name}
 	var space struct {
 		Name string `json:"name"`
 	}
@@ -339,9 +362,24 @@ func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage
 			continue
 		}
 		if env == nil {
-			continue // the relay long-polls server-side; an empty poll paces itself
+			// Usually the server-side long poll has already paced this;
+			// the delay only bites on an early-empty synchronous pull.
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(gchatPullIdleDelay):
+			}
+			continue
 		}
 		ev, decodeErr := decodeGchatEvent(env.Data)
+		// Acked before the handler runs, which makes ingress at-most-once —
+		// a deliberate, recorded decision, not an oversight. Acking after a
+		// durable publish would be at-least-once, but the dedupe map is
+		// in-memory, so a redelivery after a slow publish and a restart
+		// becomes a DUPLICATE task — a worse failure than a lost ask,
+		// which a user retries by typing again. It also matches every
+		// other backend's ingress semantics: Discord and Slack websockets
+		// redeliver nothing at all.
 		a.settle(env.Receipt)
 		if decodeErr != nil {
 			a.log.Warn("gchat event payload did not parse; acked away",
@@ -434,12 +472,14 @@ func (a *GoogleChatAdapter) inbound(ev *gchatEvent) (InboundMessage, bool) {
 	if ev.Space.Name == "" || ev.Message.Name == "" {
 		return InboundMessage{}, false
 	}
-	// ArgumentText is authoritative when Chat sent one: it is the text with
-	// the app mention stripped, and a bare mention leaves it blank — falling
-	// back to Text there would resurrect the mention as the ask.
+	// ArgumentText is authoritative whenever Chat sent the field: it is the
+	// text with the app mention stripped, and a bare mention leaves it
+	// EMPTY — Google's documented shape — so falling back to Text on empty
+	// would resurrect the mention as the ask. Only a message with no
+	// argumentText at all (a DM with no mention) reads Text.
 	text := strings.TrimSpace(ev.Message.Text)
-	if ev.Message.ArgumentText != "" {
-		text = strings.TrimSpace(ev.Message.ArgumentText)
+	if ev.Message.ArgumentText != nil {
+		text = strings.TrimSpace(*ev.Message.ArgumentText)
 	}
 	if text == "" {
 		return InboundMessage{}, false
@@ -451,14 +491,28 @@ func (a *GoogleChatAdapter) inbound(ev *gchatEvent) (InboundMessage, bool) {
 	if ev.Space.SpaceType == "DIRECT_MESSAGE" || ev.Space.Type == "DM" {
 		kind = "dm"
 	}
+	// A GROUP_CHAT surface never supports reply threading, whatever thread
+	// name the event carries — in an unthreaded space every message has its
+	// own thread resource, and binding those would fragment the group chat
+	// into one session per ask.
 	thread := ev.Message.Thread.Name
-	if ev.Space.SpaceThreadingState == "UNTHREADED_MESSAGES" {
+	if ev.Space.SpaceThreadingState == "UNTHREADED_MESSAGES" || ev.Space.SpaceType == "GROUP_CHAT" {
 		thread = ""
 	}
 
 	a.mu.Lock()
 	dup := a.seen[ev.Message.Name]
-	a.seen[ev.Message.Name] = true
+	if !dup {
+		a.seen[ev.Message.Name] = true
+		a.seenOrder = append(a.seenOrder, ev.Message.Name)
+		// Pub/Sub's redelivery window is bounded, so the dedupe memory is
+		// too: evict oldest-first at the cap rather than leaking one entry
+		// per message for the pod's lifetime.
+		if len(a.seenOrder) > gchatSeenCap {
+			delete(a.seen, a.seenOrder[0])
+			a.seenOrder = a.seenOrder[1:]
+		}
+	}
 	a.mu.Unlock()
 	if dup {
 		return InboundMessage{}, false
@@ -496,6 +550,11 @@ func (g *Gateway) resolvePrincipal(authorID string) string {
 		return g.pm.Resolve(authorID)
 	}
 	if g.gchatAllowAll || g.gchatAllowed[strings.ToLower(authorID)] {
+		// Returned case-preserved, deliberately: the audit join requires
+		// hashing the SAME string the shipped attribution path hashes (the
+		// delivered sender email, un-normalized). If Google ever varies the
+		// asserted email's case across events, both surfaces fork the same
+		// way — lowercasing here would fix nothing and break the join.
 		return authorID
 	}
 	return ""

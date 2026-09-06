@@ -119,14 +119,16 @@ class A2AChatIngressSeam(unittest.TestCase):
         status, _ = self._post("/v1/chat/a2a/events/ack", {"receipt": "X"})
         self.assertEqual(status, 503)
 
-    def test_a2a_routes_demand_the_chat_role(self):
-        """The new family's whole authentication is the /v1/chat/ prefix rule.
+    def test_a2a_event_routes_demand_the_a2a_chat_role(self):
+        """The A2A event routes are the third caller's alone.
 
-        Nothing else pinned ROUTE_ROLES before this file, and the A2A gateway
-        is a third caller whose reachability depends on it: the sandbox's
-        shell role must be refused here (403, not 401 — the caller is known,
-        the route is not theirs), and the chat role admitted. The two
-        directions verify each other — a vacuous rule would fail the 403 half.
+        The legacy chat caller is the LLM-driven Hermes pod — the injectable
+        adversary of this repo's standing threat model — and with only the
+        shared chat role it could pull and ack the A2A gateway's events,
+        silently consuming user asks (turn-stealing). So the event routes
+        demand the a2a-chat role: shell 403, chat 403, a2a-chat 200 (403,
+        not 401 — the caller is known, the route is not theirs). Nothing
+        pinned ROUTE_ROLES anywhere before this file.
         """
         from credential_proxy import Principal
 
@@ -142,13 +144,44 @@ class A2AChatIngressSeam(unittest.TestCase):
         self.handler.authenticator = auth
         self.addCleanup(setattr, self.handler, "authenticator", saved)
 
-        status, body = self._get("/v1/chat/a2a/events")
-        self.assertEqual(status, 403)
-        self.assertEqual(body.get("code"), "CALLER_ROLE_FORBIDDEN")
+        for refused in ("shell", "chat"):
+            auth.role = refused
+            status, body = self._get("/v1/chat/a2a/events")
+            self.assertEqual(status, 403, f"role {refused} must not reach a2a events")
+            self.assertEqual(body.get("code"), "CALLER_ROLE_FORBIDDEN")
+            status, body = self._post("/v1/chat/a2a/events/ack", {"receipt": "X"})
+            self.assertEqual(status, 403, f"role {refused} must not ack a2a events")
 
-        auth.role = "chat"
-        status, body = self._get("/v1/chat/a2a/events")
+        auth.role = "a2a-chat"
+        status, _ = self._get("/v1/chat/a2a/events")
         self.assertEqual(status, 200)
+
+    def test_the_api_passthrough_admits_both_chat_roles(self):
+        """Both consumers post through the same credential; neither may pull
+        the other's events, but /v1/chat/api belongs to both — and to
+        nobody else."""
+        from credential_proxy import Principal
+
+        class RoleAuthenticator:
+            authenticates = True
+            role = "chat"
+
+            def authenticate(self, headers):
+                return Principal(workload="test-caller", role=self.role)
+
+        auth = RoleAuthenticator()
+        saved = self.handler.authenticator
+        self.handler.authenticator = auth
+        self.addCleanup(setattr, self.handler, "authenticator", saved)
+
+        body = {"resource": ["spaces", "messages"], "method": "create", "arguments": {}}
+        for admitted in ("chat", "a2a-chat"):
+            auth.role = admitted
+            status, _ = self._post("/v1/chat/api", body)
+            self.assertEqual(status, 200, f"role {admitted} must reach the api passthrough")
+        auth.role = "shell"
+        status, _ = self._post("/v1/chat/api", body)
+        self.assertEqual(status, 403)
 
     def test_api_passthrough_works_with_only_the_a2a_relay_armed(self):
         self.handler.chat_relay = None

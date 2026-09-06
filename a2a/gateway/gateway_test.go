@@ -358,7 +358,7 @@ func TestUnmappedSenderIsDropped(t *testing.T) {
 	}
 	posts := r.adapter.postTexts()
 	if len(posts) != 1 {
-		t.Fatalf("drop must be visible exactly once per sender per conversation, got %d posts: %v", len(posts), posts)
+		t.Fatalf("drop must be visible exactly once per sender, got %d posts: %v", len(posts), posts)
 	}
 	if !strings.Contains(posts[0], "can't verify") {
 		t.Fatalf("drop notice missing: %q", posts[0])

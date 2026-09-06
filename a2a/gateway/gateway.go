@@ -232,8 +232,10 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	// on Discord, the Google-asserted email gated by the allowlist on gchat
 	// — and drop the message if we can't (gateway design, turns-and-tasks
 	// step 1). The drop is visible once per sender: a silent drop of a real
-	// user is a support burden, and the notice names no caller-supplied
-	// value — a refusal that echoes what the caller sent is an oracle.
+	// user is a support burden. The notice names the sender's own
+	// backend-asserted id — their own identity, in their own conversation,
+	// which is what the admin needs to add and is not an oracle over
+	// anything the sender does not already see.
 	principal := g.resolvePrincipal(msg.AuthorID)
 	if principal == "" {
 		g.log.Warn("dropping message from unverified sender",

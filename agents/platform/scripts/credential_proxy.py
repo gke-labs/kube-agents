@@ -180,9 +180,20 @@ DEFAULT_CREDENTIAL_PROXY_AUDIENCE = "kubeagents-credential-proxy"
 # split would have been a control on some clusters and a comment on the rest.
 DEFAULT_CREDENTIAL_PROXY_CHAT_AUDIENCE = "kubeagents-credential-proxy-chat"
 
+# The third audience: the A2A gateway. It posts through the same Chat API
+# passthrough as the legacy chat caller, but its event routes are its alone —
+# the legacy chat caller is the LLM-driven Hermes pod, and with a shared role
+# it could pull and ack the A2A gateway's events, silently consuming user
+# asks. Same upgrade story as the chat audience: unset means the role is
+# never conferred and the a2a routes are reachable by any authenticated
+# caller only where no roles are established at all (the NullAuthenticator
+# posture behind the socket).
+DEFAULT_CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE = "kubeagents-credential-proxy-a2a-chat"
+
 # The roles a caller can hold, named by which Pod holds them.
 CALLER_ROLE_SHELL = "shell"
 CALLER_ROLE_CHAT = "chat"
+CALLER_ROLE_A2A_CHAT = "a2a-chat"
 
 # Which role each route demands. Checked by prefix, so the trailing slash on
 # the three families is load-bearing: without it "/v1/chatter" would match
@@ -195,20 +206,26 @@ CALLER_ROLE_CHAT = "chat"
 # credential_proxy_client.workspaces_available detects an older broker by
 # asking, and a 403 there would read as "not permitted" rather than "not
 # supported".
-ROUTE_ROLES: tuple[tuple[str, str], ...] = (
-    ("/v1/chat/", CALLER_ROLE_CHAT),
-    ("/v1/exec", CALLER_ROLE_SHELL),
-    ("/v1/github/", CALLER_ROLE_SHELL),
-    ("/v1/workspace/", CALLER_ROLE_SHELL),
+ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # Order matters: the a2a family sits under the chat prefix and must be
+    # matched first. The api passthrough belongs to both chat consumers —
+    # one credential, two subscriptions — while each side's event routes
+    # stay its own.
+    ("/v1/chat/a2a/", (CALLER_ROLE_A2A_CHAT,)),
+    ("/v1/chat/api", (CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT)),
+    ("/v1/chat/", (CALLER_ROLE_CHAT,)),
+    ("/v1/exec", (CALLER_ROLE_SHELL,)),
+    ("/v1/github/", (CALLER_ROLE_SHELL,)),
+    ("/v1/workspace/", (CALLER_ROLE_SHELL,)),
 )
 
 
-def required_role(path: str) -> str:
-    """The caller role ``path`` demands, or "" if it demands none."""
-    for prefix, role in ROUTE_ROLES:
+def required_roles(path: str) -> tuple[str, ...]:
+    """The caller roles ``path`` admits, or () if it demands none."""
+    for prefix, roles in ROUTE_ROLES:
         if path.startswith(prefix):
-            return role
-    return ""
+            return roles
+    return ()
 
 
 # How long a managed-repository allowlist read is reused.
@@ -632,6 +649,12 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
             shell_audience: CALLER_ROLE_SHELL,
             chat_audience: CALLER_ROLE_CHAT,
         }
+        # The third audience only means anything once the split exists at
+        # all, so it nests here; read raw for the same unset-vs-default
+        # reason as the chat audience above.
+        a2a_audience = os.getenv("CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE", "").strip()
+        if a2a_audience and a2a_audience not in audience_roles:
+            audience_roles[a2a_audience] = CALLER_ROLE_A2A_CHAT
     else:
         audience_roles = {shell_audience: ""}
     return ServiceAccountAuthenticator(
@@ -2989,14 +3012,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         has not been upgraded to project a second audience yet; ``role`` is set
         only where the API server confirmed which audience it validated.
         """
-        needed = required_role(self.path)
-        if not needed or not principal.role or principal.role == needed:
+        needed = required_roles(self.path)
+        if not needed or not principal.role or principal.role in needed:
             return True
         LOGGER.warning(
             "refused a route this caller's role does not reach path=%s role=%s needed=%s",
             _sanitize_for_logging(self.path),
             principal.role,
-            needed,
+            "|".join(needed),
         )
         self._json(
             HTTPStatus.FORBIDDEN,

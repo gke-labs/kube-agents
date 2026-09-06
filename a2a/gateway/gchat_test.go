@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -59,7 +60,9 @@ func gchatMsg(spaceName, spaceType, threadingState, threadName, msgName, text, a
 	ev.Space.SpaceThreadingState = threadingState
 	ev.Message.Name = msgName
 	ev.Message.Text = text
-	ev.Message.ArgumentText = argumentText
+	if argumentText != "" {
+		ev.Message.ArgumentText = &argumentText
+	}
 	ev.Message.Thread.Name = threadName
 	ev.Message.Sender.Email = senderEmail
 	ev.Message.Sender.Type = senderType
@@ -118,6 +121,81 @@ func TestGchatInboundNormalization(t *testing.T) {
 			got.AuthorID != c.ev.Message.Sender.Email || got.MessageID != c.ev.Message.Name) {
 			t.Errorf("%s: got %+v", c.name, got)
 		}
+	}
+}
+
+// TestGchatBareMentionShapes: Google's documented shape for a mention-only
+// message is an EMPTY argumentText (stripping the mention leaves nothing),
+// which JSON cannot distinguish from the field being absent unless the
+// decoder keeps the difference. All three shapes — absent (DM, no mention),
+// present-empty and present-blank (bare mention) — must do the right thing,
+// or a bare @Kage becomes a task whose ask is the raw mention text.
+func TestGchatBareMentionShapes(t *testing.T) {
+	a := newTestGchatAdapter(t)
+
+	absent := gchatMsg("spaces/D1", "DIRECT_MESSAGE", "", "", "spaces/D1/messages/M20", "hi", "", "u1@example.com", "HUMAN")
+	if got, ok := a.inbound(absent); !ok || got.Text != "hi" {
+		t.Errorf("absent argumentText must fall back to text: %+v ok=%v", got, ok)
+	}
+
+	empty := gchatMsg("spaces/S1", "SPACE", "", "spaces/S1/threads/T9", "spaces/S1/messages/M21", "@Kage", "", "u2@example.com", "HUMAN")
+	emptyArg := ""
+	empty.Message.ArgumentText = &emptyArg
+	if _, ok := a.inbound(empty); ok {
+		t.Error("present-but-empty argumentText is a bare mention and must drop")
+	}
+
+	blank := gchatMsg("spaces/S1", "SPACE", "", "spaces/S1/threads/T9", "spaces/S1/messages/M22", "@Kage", " ", "u2@example.com", "HUMAN")
+	if _, ok := a.inbound(blank); ok {
+		t.Error("present-but-blank argumentText is a bare mention and must drop")
+	}
+}
+
+// A GROUP_CHAT surface never supports reply threading, whatever thread name
+// the event happens to carry (every message in an unthreaded space carries
+// its own thread resource) — binding those threads would fragment the group
+// chat into one session per ask.
+func TestGchatGroupChatBindsTheSpaceEvenWithAThreadName(t *testing.T) {
+	a := newTestGchatAdapter(t)
+	ev := gchatMsg("spaces/G1", "GROUP_CHAT", "", "spaces/G1/threads/perMsg", "spaces/G1/messages/M23", "go", "", "u2@example.com", "HUMAN")
+	got, ok := a.inbound(ev)
+	if !ok || got.Conversation != "gchat:space/spaces/G1" {
+		t.Errorf("GROUP_CHAT with a per-message thread bound %q, want the space", got.Conversation)
+	}
+}
+
+// The seen map dedupes Pub/Sub redelivery, whose window is bounded — the map
+// must be too, or a long-lived gateway leaks one entry per message forever.
+func TestGchatSeenMapIsBounded(t *testing.T) {
+	a := newTestGchatAdapter(t)
+	for i := 0; i <= gchatSeenCap; i++ {
+		ev := gchatMsg("spaces/D1", "DIRECT_MESSAGE", "", "", fmt.Sprintf("spaces/D1/messages/M%d", i), "x", "", "u1@example.com", "HUMAN")
+		if _, ok := a.inbound(ev); !ok {
+			t.Fatalf("message %d expected to deliver", i)
+		}
+	}
+	// The first message has been evicted: a redelivery of it is a (wrong but
+	// bounded) second turn, and the map holds no more than the cap.
+	first := gchatMsg("spaces/D1", "DIRECT_MESSAGE", "", "", "spaces/D1/messages/M0", "x", "", "u1@example.com", "HUMAN")
+	if _, ok := a.inbound(first); !ok {
+		t.Error("the oldest entry should have been evicted at the cap")
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.seen) > gchatSeenCap {
+		t.Errorf("seen holds %d entries, cap is %d", len(a.seen), gchatSeenCap)
+	}
+}
+
+func TestGchatOpenDirectAcceptsAPrefixedUserResource(t *testing.T) {
+	f := newFakeChatRelay(t)
+	f.responses["spaces/findDirectMessage"] = map[string]any{"name": "spaces/D9"}
+	a := newTestGchatAdapterWithRelay(t, f)
+	if _, err := a.OpenDirect("users/12345"); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.call(0).arguments["name"]; got != "users/12345" {
+		t.Errorf("findDirectMessage name = %v; a users/-prefixed id must not be double-prefixed", got)
 	}
 }
 
