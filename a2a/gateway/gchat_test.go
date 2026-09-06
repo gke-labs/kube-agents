@@ -487,7 +487,7 @@ func TestGchatRunDeliversAcksAndSwallowsPoison(t *testing.T) {
 // mapping table; identity resolution is the identity function gated by the
 // allowlist — on the embedded server, with the fake adapter standing in for
 // the Chat relay.
-func startGchatRig(t *testing.T, allowed []string, allowAll bool) *rig {
+func startGchatRig(t *testing.T, allowed []string, allowAll bool, opts ...func(*Config)) *rig {
 	t.Helper()
 	s := startServer(t)
 	url := s.ClientURL()
@@ -515,6 +515,9 @@ func startGchatRig(t *testing.T, allowed []string, allowAll bool) *rig {
 		AttributionSalt:    []byte("test-salt"),
 		GchatAllowedUsers:  allowed,
 		GchatAllowAllUsers: allowAll,
+	}
+	for _, o := range opts {
+		o(cfg)
 	}
 	g, err := New(Options{Client: client, Adapter: adapter, Config: cfg, Backend: "gchat"})
 	if err != nil {
@@ -599,6 +602,56 @@ func TestGchatAllowAllResolvesAnySender(t *testing.T) {
 	}
 	if auth.Requester.Principal != NewPseudonymizer([]byte("test-salt")).Hash("anyone@example.com") {
 		t.Errorf("requester = %+v", auth.Requester)
+	}
+}
+
+// TestGchatDefaultDisplayModeQuietsProgressNarration: the existing Chat
+// integration's default-vs-debug split (GoogleChatSpec.Mode), honoured by
+// this relay rather than reinvented. Under default the rolling line carries
+// the state but never the turn-by-turn narration; the result still posts.
+// Debug — the gateway's historical behaviour, and the zero value — is pinned
+// by TestReplyRelayAndRollingProgressLine.
+func TestGchatDefaultDisplayModeQuietsProgressNarration(t *testing.T) {
+	r := startGchatRig(t, nil, true, func(c *Config) { c.DisplayMode = "default" })
+	conv := "gchat:spaces/S1/threads/T2"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "u1@example.com", MessageID: "spaces/S1/messages/M1", Text: "do the thing"}
+
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactProgress, Parts: []lib.Part{{Kind: "text", Text: "reading the fleet"}}}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "state edit", func() bool {
+		for _, e := range r.adapter.editTexts() {
+			if strings.Contains(e, "working") {
+				return true
+			}
+		}
+		return false
+	})
+	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "the fleet is fine"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "result post", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if p == "the fleet is fine" {
+				return true
+			}
+		}
+		return false
+	})
+	for _, e := range r.adapter.editTexts() {
+		if strings.Contains(e, "reading the fleet") {
+			t.Fatalf("default mode leaked progress narration into the rolling line: %q", e)
+		}
 	}
 }
 

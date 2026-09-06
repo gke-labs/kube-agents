@@ -33,6 +33,10 @@ type relayState struct {
 	state    lib.TaskState
 	progress string
 	result   []lib.Part
+	// lastLine is the rolling line as last rendered, so a display mode that
+	// drops the narration does not burn a backend edit per progress artifact
+	// re-rendering an unchanged line.
+	lastLine string
 }
 
 // relayEvent routes one event to its conversation's queue. Runs on the
@@ -233,13 +237,25 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 	}
 }
 
-// updateRollingLine edits the task's single status message in place.
+// updateRollingLine edits the task's single status message in place. Under
+// the "default" display mode the line carries the state but never the
+// turn-by-turn narration — the existing Chat integration's default-vs-debug
+// split, honoured here rather than reinvented.
 func (g *Gateway) updateRollingLine(rec *SessionRecord, taskID string, rs *relayState) {
 	active := rec.ActiveTask
 	if active == nil || active.TaskID != taskID || active.StatusMsgID == "" {
 		return
 	}
-	g.editLine(rec.Key, active.StatusMsgID, statusLine(rs.state, rs.progress))
+	progress := rs.progress
+	if g.cfg.DisplayMode == displayModeDefault {
+		progress = ""
+	}
+	line := statusLine(rs.state, progress)
+	if line == rs.lastLine {
+		return
+	}
+	rs.lastLine = line
+	g.editLine(rec.Key, active.StatusMsgID, line)
 }
 
 func (g *Gateway) editLine(conversation, messageID, line string) {

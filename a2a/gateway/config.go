@@ -15,6 +15,16 @@ import (
 // comment carries the sizing rationale.
 const defaultMaxSessions = 10
 
+// defaultGchatTokenPath is where the operator projects the gateway's
+// relay-audience ServiceAccount token when the gchat backend is armed.
+const defaultGchatTokenPath = "/var/run/secrets/a2a-chat-relay/token"
+
+// The display-mode values, matching the GoogleChatSpec.Mode enum.
+const (
+	displayModeDefault = "default"
+	displayModeDebug   = "debug"
+)
+
 // defaultTaskDeadline is what TaskDeadline means when unset — the worker
 // adapter's own default (a2a/cmd/worker-adapter: A2A_TASK_DEADLINE_SECONDS,
 // 1800s), restated here because the two halves of one contract must agree.
@@ -50,6 +60,14 @@ type Config struct {
 	// GchatAllowAllUsers disables the allowlist, stated explicitly —
 	// mirroring the legacy GOOGLE_CHAT_ALLOW_ALL_USERS posture.
 	GchatAllowAllUsers bool
+
+	// DisplayMode is the existing Chat integration's default-vs-debug split
+	// (GoogleChatSpec.Mode), honoured by this relay rather than reinvented:
+	// under "default" the rolling line carries the state but never the
+	// turn-by-turn narration; "debug" is the gateway's historical verbose
+	// behaviour and the value an unset env resolves to, so installs that
+	// predate the knob render exactly as before.
+	DisplayMode string
 
 	// DefaultAddressee is where every conversation's tasks route until a
 	// per-conversation override says otherwise. Retarget 8/26: the first
@@ -144,6 +162,14 @@ type Config struct {
 	MaxSessions int
 }
 
+// Backend names the chat backend this config arms: "gchat" or "discord".
+func (c *Config) Backend() string {
+	if c.GchatRelayURL != "" {
+		return gchatBackend
+	}
+	return "discord"
+}
+
 // FromEnv loads the config from the environment.
 func FromEnv() (*Config, error) {
 	cfg := &Config{
@@ -158,11 +184,29 @@ func FromEnv() (*Config, error) {
 		WorkerImage:      envOr("A2A_WORKER_IMAGE", "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/worker-next:latest"),
 		NATSCredsSecret:  envOr("A2A_NATS_CREDS_SECRET", "platform-agent-a2a-nats-creds"),
 	}
+	cfg.GchatRelayURL = os.Getenv("A2A_GCHAT_RELAY_URL")
+	cfg.GchatTokenPath = envOr("A2A_GCHAT_TOKEN_PATH", defaultGchatTokenPath)
+	for _, u := range strings.Split(os.Getenv("A2A_GCHAT_ALLOWED_USERS"), ",") {
+		if u = strings.TrimSpace(u); u != "" {
+			cfg.GchatAllowedUsers = append(cfg.GchatAllowedUsers, u)
+		}
+	}
+	cfg.GchatAllowAllUsers = os.Getenv("A2A_GCHAT_ALLOW_ALL_USERS") == "true"
+	cfg.DisplayMode = envOr("A2A_CHAT_DISPLAY_MODE", displayModeDebug)
+	if cfg.DisplayMode != displayModeDefault && cfg.DisplayMode != displayModeDebug {
+		return nil, fmt.Errorf("A2A_CHAT_DISPLAY_MODE %q: want %q or %q", cfg.DisplayMode, displayModeDefault, displayModeDebug)
+	}
 	if cfg.NATSURL == "" {
 		return nil, fmt.Errorf("NATS_URL is required")
 	}
-	if cfg.DiscordToken == "" {
-		return nil, fmt.Errorf("DISCORD_TOKEN is required (W0's discord-bot Secret)")
+	// A silent default here would make a two-backend misconfiguration a
+	// working Discord gateway that quietly never consumes Chat — refuse
+	// both directions instead.
+	switch {
+	case cfg.GchatRelayURL != "" && cfg.DiscordToken != "":
+		return nil, fmt.Errorf("both DISCORD_TOKEN and A2A_GCHAT_RELAY_URL are set: one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend")
+	case cfg.GchatRelayURL == "" && cfg.DiscordToken == "":
+		return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret) or A2A_GCHAT_RELAY_URL (the credential proxy's chat relay)")
 	}
 	// The addressee is a subject token; validate at boot, not per-message.
 	// The "session" sentinel passes by construction; whether a spawner backs
