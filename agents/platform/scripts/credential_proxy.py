@@ -2926,6 +2926,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     slack_max_request_bytes: int
     enforce_read_only: bool = True
     chat_relay: GoogleChatRelay | None = None
+    # The A2A gateway's own relay instance, on its own subscription. Two
+    # consumers on one subscription split deliveries randomly, so the A2A
+    # routes never touch chat_relay and vice versa; only the /v1/chat/api
+    # passthrough is shared, because both instances hold the same app
+    # credential and an install may arm either one alone.
+    a2a_chat_relay: GoogleChatRelay | None = None
     slack_relay: SlackRelay | None = None
     # None unless CREDENTIAL_PROXY_CONTENT_WORKSPACE is on. While it is None the
     # /v1/workspace/* routes answer 404 — the same answer an older broker gives,
@@ -3065,6 +3071,17 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 self._json(
                     HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Slack event pull failed"}
                 )
+            return
+        if self.path.startswith("/v1/chat/a2a/events"):
+            if self.a2a_chat_relay is None:
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "a2a chat relay disabled"})
+                return
+            try:
+                event = self.a2a_chat_relay.pull()
+                self._json(HTTPStatus.OK, {"event": event})
+            except Exception as exc:
+                LOGGER.warning("a2a chat event pull failed: %s", type(exc).__name__)
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "a2a chat event pull failed"})
             return
         if self.path.startswith("/v1/chat/events"):
             if self.chat_relay is None:
@@ -3563,17 +3580,24 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         return payload
 
     def _handle_chat_post(self) -> None:
-        if self.chat_relay is None:
+        # The api passthrough is served by whichever instance is armed; the
+        # event settles are strictly per-instance.
+        api_relay = self.chat_relay or self.a2a_chat_relay
+        if api_relay is None:
             self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "chat relay disabled"})
             return
         try:
             payload = self._read_json_body()
-            if self.path == "/v1/chat/events/ack":
-                ok = self.chat_relay.settle(str(payload.get("receipt", "")), True)
-                self._json(HTTPStatus.OK if ok else HTTPStatus.NOT_FOUND, {"settled": ok})
-                return
-            if self.path == "/v1/chat/events/nack":
-                ok = self.chat_relay.settle(str(payload.get("receipt", "")), False)
+            if self.path in ("/v1/chat/a2a/events/ack", "/v1/chat/a2a/events/nack"):
+                if self.a2a_chat_relay is None:
+                    self._json(
+                        HTTPStatus.SERVICE_UNAVAILABLE, {"error": "a2a chat relay disabled"}
+                    )
+                    return
+                ok = self.a2a_chat_relay.settle(
+                    str(payload.get("receipt", "")),
+                    self.path.endswith("/ack"),
+                )
                 self._json(HTTPStatus.OK if ok else HTTPStatus.NOT_FOUND, {"settled": ok})
                 return
             if self.path == "/v1/chat/api":
@@ -3581,12 +3605,23 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 arguments = payload.get("arguments", {})
                 if not isinstance(resource, list) or not isinstance(arguments, dict):
                     raise ValueError("resource must be a list and arguments an object")
-                result = self.chat_relay.api_call(
+                result = api_relay.api_call(
                     resource,
                     str(payload.get("method", "")),
                     arguments,
                 )
                 self._json(HTTPStatus.OK, {"response": result})
+                return
+            if self.chat_relay is None:
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "chat relay disabled"})
+                return
+            if self.path == "/v1/chat/events/ack":
+                ok = self.chat_relay.settle(str(payload.get("receipt", "")), True)
+                self._json(HTTPStatus.OK if ok else HTTPStatus.NOT_FOUND, {"settled": ok})
+                return
+            if self.path == "/v1/chat/events/nack":
+                ok = self.chat_relay.settle(str(payload.get("receipt", "")), False)
+                self._json(HTTPStatus.OK if ok else HTTPStatus.NOT_FOUND, {"settled": ok})
                 return
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -3799,6 +3834,16 @@ def serve(args: argparse.Namespace) -> None:
             chat_project, chat_subscription
         )
         LOGGER.info("Google Chat relay enabled project=%s subscription=<redacted>", chat_project)
+    # The A2A gateway's own subscription on the same topic and credential;
+    # armed independently so an install can run either consumer alone.
+    a2a_subscription = os.getenv("A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME", "").strip()
+    if chat_project and a2a_subscription:
+        CredentialProxyHandler.a2a_chat_relay = GoogleChatRelay(
+            chat_project, a2a_subscription
+        )
+        LOGGER.info(
+            "A2A Google Chat relay enabled project=%s subscription=<redacted>", chat_project
+        )
     slack_bot_tokens = os.getenv("SLACK_BOT_TOKEN", "").strip()
     slack_app_token = os.getenv("SLACK_APP_TOKEN", "").strip()
     if slack_bot_tokens and slack_app_token:
