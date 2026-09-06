@@ -34,16 +34,22 @@ SPECIALIST_SOULS = (
 )
 CHAT_SOUL = REPO_ROOT / "agents/chat/SOUL.md"
 
-# The link every agent-facing file must carry, assembled independently from the
-# site config in test_short_link_matches_the_site_redirect.
+# The two links every agent-facing file must carry. The short link is assembled
+# independently from the site config in test_short_link_matches_the_site_redirect;
+# the tracker is the path for an account that can open an issue, and the
+# reference lists it first.
 SHORT_LINK = "https://gke-labs.github.io/kube-agents/feedback"
+TRACKER = "https://github.com/gke-labs/kube-agents/issues"
 
 # The redirect the site serves at that link, and the two pieces of the config
 # that place it: `site` inside defineConfig and the `BASE` constant above it.
+# Quoting is not asserted -- no CI job formats this .mjs, so a single-quote
+# pattern would turn a reformat into a failure about the wrong thing.
 FEEDBACK_REDIRECT_KEY = "/feedback"
-SITE_PATTERN = re.compile(r"^\s*site:\s*'([^']+)'", re.MULTILINE)
-BASE_PATTERN = re.compile(r"^const BASE = '([^']+)';", re.MULTILINE)
-REDIRECT_PATTERN = re.compile(r"^\s*'([^']+)':\s*FEEDBACK_FORM_URL,", re.MULTILINE)
+QUOTED = r"""['"]([^'"]+)['"]"""
+SITE_PATTERN = re.compile(rf"^\s*site:\s*{QUOTED}", re.MULTILINE)
+BASE_PATTERN = re.compile(rf"^const BASE = {QUOTED}", re.MULTILINE)
+REDIRECT_PATTERN = re.compile(rf"^\s*{QUOTED}:\s*FEEDBACK_FORM_URL\b", re.MULTILINE)
 
 # The form's own URL. Agent material names the short link instead, so that a
 # recreated form does not need a new agent image.
@@ -65,15 +71,18 @@ def _dockerfile_instructions() -> list[str]:
 
 
 class FeedbackReferenceTest(unittest.TestCase):
-    def test_reference_and_specialist_souls_carry_the_short_link(self) -> None:
+    def test_reference_and_specialist_souls_carry_both_links(self) -> None:
         for path in (REFERENCE, *SPECIALIST_SOULS):
-            with self.subTest(path=path.relative_to(REPO_ROOT)):
-                self.assertIn(
-                    SHORT_LINK,
-                    path.read_text(encoding="utf-8"),
-                    "a user asking either specialist how to report a kube-agents "
-                    "problem gets an answer only if the link is in this file",
-                )
+            text = path.read_text(encoding="utf-8")
+            for link in (SHORT_LINK, TRACKER):
+                with self.subTest(path=path.relative_to(REPO_ROOT), link=link):
+                    self.assertIn(
+                        link,
+                        text,
+                        "a user asking either specialist how to report a "
+                        "kube-agents problem gets an answer only if the link is "
+                        "in this file",
+                    )
 
     def test_short_link_matches_the_site_redirect(self) -> None:
         config = ASTRO_CONFIG.read_text(encoding="utf-8")

@@ -15,12 +15,17 @@ restriction on the target repository rather than on the account.
   Google account. Always give this short link, never the underlying Google Forms URL; the form can
   be recreated behind the same link.
 
-What a submission needs, either way:
+What a report needs, on either path. The form requires these three:
 
 - a one-line summary, which becomes the issue title;
-- what happened;
+- which kind of feedback it is — Bug, Feature request, Question, or Other — which is what applies
+  the `bug`, `enhancement` or `question` label;
+- what happened.
+
+Optional on the form, worth including anyway:
+
 - what was expected instead;
-- the kube-agents version in use.
+- the version and environment: chart or image tag, GKE version, model provider.
 
 A form submission becomes a public issue on `gke-labs/kube-agents`, opened by the `kube-agents-bot`
 account and labelled `external-feedback`. Tell the user that before they submit: everything they
