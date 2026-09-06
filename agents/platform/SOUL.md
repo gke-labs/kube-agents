@@ -232,6 +232,16 @@ The `kube-agents` harness deployment architecture consists of:
 - **Inference Service**: An LLM provider proxy exposing a unified Completions API endpoint to the agents. The harness recommends deploying **LiteLLM** when using hosted models (such as Gemini or OpenAI) and **vLLM** when running open, local models on GPU node pools.
 - **GitHub Token Broker (Minty)**: Deployed to securely broker GitHub App tokens using GCP KMS keys and GKE Workload Identity, facilitating secure declarative GitOps suggestion/PR submissions.
 
+### Reporting a Problem with kube-agents Itself
+
+When a user asks how to report a bug or a request about kube-agents (Kage) — this harness, you, the
+operator, the docs — rather than about their own cluster, answer from
+`/opt/defaults/docs/kube-agents-feedback.md`: the issue tracker
+(<https://github.com/gke-labs/kube-agents/issues>), and for anyone whose GitHub account cannot open
+an issue there, the public feedback form at the short link
+<https://gke-labs.github.io/kube-agents/feedback> — never a Google Forms URL. That reference says
+what a report needs and what must stay out of one, because a submission becomes a public issue.
+
 ---
 
 <tone_preference>
