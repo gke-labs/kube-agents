@@ -17,6 +17,12 @@ limitations under the License.
 package controller
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"sort"
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -32,9 +38,19 @@ import (
 // agent had created, so a proxied kubectl returned "kubeconfig is unreadable".
 // #913 removed both halves — the credential runtime is a pod of its own and no
 // longer opens the file — and this is what stops the split coming back
-// unnoticed: every pod the operator renders that mounts the agent's data claim
-// runs its containers as one uid, so the mode a home is created with never
+// unnoticed: every container the operator itself puts on a pod mounting the
+// agent's data claim runs as one uid, so the mode a home is created with never
 // decides whether another process can read it.
+//
+// "the operator itself" is the limit, and it is a real one. A container the CR
+// supplies under spec.deployment.sidecars or spec.deployment.initContainers is
+// appended to the gateway pod with its securityContext untouched
+// (buildPodTemplateSpec), and the data volume is pod-scoped. One that names no
+// runAsUser inherits the pod default and is covered; one that sets its own
+// mounts the claim under a second uid and reproduces #1244 on that install.
+// Nothing in the operator refuses it, no fixture here renders it, and this file
+// does not claim otherwise — refusing that field would be a behaviour change,
+// and what #1244 settled on was a test rather than a change of behaviour.
 
 const (
 	// The claim buildPVC lays down and buildDefaultVolumes mounts.
@@ -42,50 +58,55 @@ const (
 	// The workload the walk must reach, or it proves nothing: the gateway is
 	// the pod that mounts the claim today.
 	gatewayWorkloadSuffix = "-gateway"
+	// The walk itself, named for the source-level assertion below that every
+	// pod-bearing builder in the package appears inside it.
+	dataVolumeWalkFunc = "renderEveryWorkloadPod"
 )
 
-// renderedPodTemplate is one pod template with the workload it came from, so a
-// failure names something a reader can go and look at.
+// renderedPodTemplate is one pod template with the builder and workload it came
+// from, so a failure names something a reader can go and look at.
 type renderedPodTemplate struct {
+	builder  string
 	workload string
 	spec     corev1.PodSpec
 }
 
 // renderEveryWorkloadPod renders every pod-bearing workload the operator builds
-// for one CR.
+// for one CR. TestTheWalkCallsEveryPodBearingBuilder is what keeps that "every"
+// true as builders are added.
 //
 // The builders are called directly rather than through the reconciler's gates,
 // so a workload an install would not create today — the shell sandbox is
 // experimental, the A2A pods are dark outside mode next — is still walked. What
-// is being asserted is what the builder would render if the gate opened.
+// is being asserted is what the builder would render if the gate opened. Both
+// gateway shapes are rendered for the same reason: useStatefulSet picks one of
+// them per CR, and the one it did not pick is still a pod this operator build
+// can create.
 func renderEveryWorkloadPod(agent *agentv1alpha1.PlatformAgent) []renderedPodTemplate {
 	opts := renderOptions{imageVolumeSupported: true}
-	var pods []renderedPodTemplate
+	gatewayDeployment := buildDeployment(agent, "c", "f", "s", "p", nil, opts)
+	credentialProxy := buildCredentialProxyDeployment(agent, "p")
+	a2aGateway := buildA2AGatewayDeployment(agent)
+	gatewayStatefulSet := buildStatefulSet(agent, "c", "f", "s", "p", nil, opts)
+	sandbox := buildShellSandboxStatefulSet(agent, agent.Name+"-sandbox-keys", "http://credential-proxy:8080", "s")
+	nats := buildA2ANATSStatefulSet(agent, "c")
+	provision := buildA2AProvisionJob(agent)
 
-	// The gateway comes in one shape or the other, never both, and
-	// useStatefulSet is the reconciler's own choice between them.
-	if useStatefulSet(agent) {
-		gateway := buildStatefulSet(agent, "c", "f", "s", "p", nil, opts)
-		pods = append(pods, renderedPodTemplate{gateway.Name, gateway.Spec.Template.Spec})
-	} else {
-		gateway := buildDeployment(agent, "c", "f", "s", "p", nil, opts)
-		pods = append(pods, renderedPodTemplate{gateway.Name, gateway.Spec.Template.Spec})
+	pods := []renderedPodTemplate{
+		{"buildDeployment", gatewayDeployment.Name, gatewayDeployment.Spec.Template.Spec},
+		{"buildCredentialProxyDeployment", credentialProxy.Name, credentialProxy.Spec.Template.Spec},
+		{"buildA2AGatewayDeployment", a2aGateway.Name, a2aGateway.Spec.Template.Spec},
+		{"buildA2AProvisionJob", provision.Name, provision.Spec.Template.Spec},
 	}
-
-	for _, deployment := range []*appsv1.Deployment{
-		buildCredentialProxyDeployment(agent, "p"),
-		buildA2AGatewayDeployment(agent),
+	for builder, statefulSet := range map[string]*appsv1.StatefulSet{
+		"buildStatefulSet":             gatewayStatefulSet,
+		"buildShellSandboxStatefulSet": sandbox,
+		"buildA2ANATSStatefulSet":      nats,
 	} {
-		pods = append(pods, renderedPodTemplate{deployment.Name, deployment.Spec.Template.Spec})
+		pods = append(pods, renderedPodTemplate{builder, statefulSet.Name, statefulSet.Spec.Template.Spec})
 	}
-	for _, statefulSet := range []*appsv1.StatefulSet{
-		buildShellSandboxStatefulSet(agent, agent.Name+"-sandbox-keys", "http://credential-proxy:8080", "s"),
-		buildA2ANATSStatefulSet(agent, "c"),
-	} {
-		pods = append(pods, renderedPodTemplate{statefulSet.Name, statefulSet.Spec.Template.Spec})
-	}
-	job := buildA2AProvisionJob(agent)
-	return append(pods, renderedPodTemplate{job.Name, job.Spec.Template.Spec})
+	sort.Slice(pods, func(i, j int) bool { return pods[i].builder < pods[j].builder })
+	return pods
 }
 
 // volumesBackedByClaim names the pod's volumes that resolve to claimName.
@@ -108,7 +129,7 @@ func volumesBackedByClaim(spec corev1.PodSpec, claimName string) map[string]bool
 
 // effectiveRunAsUser is the uid the kubelet gives a container: its own override
 // where it has one, the pod default otherwise. nil means neither says, which
-// leaves the image to decide and is a failure here rather than a pass.
+// leaves the image to decide and is a failure wherever this is asserted on.
 func effectiveRunAsUser(spec corev1.PodSpec, container corev1.Container) *int64 {
 	if container.SecurityContext != nil && container.SecurityContext.RunAsUser != nil {
 		return container.SecurityContext.RunAsUser
@@ -125,10 +146,11 @@ func dataVolumeTestAgent() *agentv1alpha1.PlatformAgent {
 	}
 }
 
-// dataVolumeStatefulSetAgent is the other shape of the gateway workload: RWO
-// custom storage at more than one replica, which is what useStatefulSet keys
-// on, plus mode next and the shell sandbox so the walk renders every pod.
-func dataVolumeStatefulSetAgent() *agentv1alpha1.PlatformAgent {
+// dataVolumeEveryComponentAgent turns on what the default CR leaves off: mode
+// next for the A2A pods, the shell sandbox, and a second claim on the gateway
+// pod — RWO custom storage, which the walk must tell apart from the agent's own
+// claim.
+func dataVolumeEveryComponentAgent() *agentv1alpha1.PlatformAgent {
 	agent := dataVolumeTestAgent()
 	agent.Spec.Mode = ptr.To(string(ModeNext))
 	agent.Spec.Harness = &agentv1alpha1.HarnessSpec{
@@ -152,16 +174,18 @@ func dataVolumeStatefulSetAgent() *agentv1alpha1.PlatformAgent {
 // workloads and holds the agent's data volume to a single uid.
 //
 // Driven by the volume rather than by one pod template, which is what reaches
-// the pods that must *not* mount it — the shell sandbox at uid 1000, the A2A
-// pods at uid 1000, the credential runtime in its own pod. Any of them
-// acquiring the claim without also acquiring uid 10000 fails here.
+// the pods that must *not* mount it: the A2A pods at uid 1000, the credential
+// runtime in its own pod, and the shell sandbox, which sets no uid at all
+// because sshd forks as root and drops to its own unprivileged user in-process.
+// Any of them acquiring the claim fails here — the sandbox through the
+// no-runAsUser branch below, the others on the uid.
 func TestEveryPodMountingTheAgentDataClaimRunsAsOneUID(t *testing.T) {
 	shapes := []struct {
 		name  string
 		agent *agentv1alpha1.PlatformAgent
 	}{
 		{"default", dataVolumeTestAgent()},
-		{"statefulset shape, mode next", dataVolumeStatefulSetAgent()},
+		{"every component", dataVolumeEveryComponentAgent()},
 	}
 
 	for _, shape := range shapes {
@@ -184,7 +208,7 @@ func TestEveryPodMountingTheAgentDataClaimRunsAsOneUID(t *testing.T) {
 				// whichever uid wrote it and root's group.
 				podSC := pod.spec.SecurityContext
 				if podSC == nil || podSC.FSGroup == nil || *podSC.FSGroup != agentFSGroup {
-					t.Errorf("%s mounts %s but does not carry fsGroup %d: %#v", pod.workload, claim, agentFSGroup, podSC)
+					t.Errorf("%s (%s) mounts %s but does not carry fsGroup %d: %#v", pod.workload, pod.builder, claim, agentFSGroup, podSC)
 				}
 
 				// Init containers included: a native sidecar lives in
@@ -205,13 +229,13 @@ func TestEveryPodMountingTheAgentDataClaimRunsAsOneUID(t *testing.T) {
 
 					user := effectiveRunAsUser(pod.spec, container)
 					if user == nil {
-						t.Errorf("container %s in %s mounts %s with no runAsUser at either level, so the image picks the uid",
-							container.Name, pod.workload, claim)
+						t.Errorf("container %s in %s (%s) mounts %s with no runAsUser at either level, so the image picks the uid",
+							container.Name, pod.workload, pod.builder, claim)
 						continue
 					}
 					if *user != sandboxUID {
-						t.Errorf("container %s in %s mounts %s as uid %d; a second uid on this claim is #1244, which needs %d",
-							container.Name, pod.workload, claim, *user, sandboxUID)
+						t.Errorf("container %s in %s (%s) mounts %s as uid %d; a second uid on this claim is #1244, which needs %d",
+							container.Name, pod.workload, pod.builder, claim, *user, sandboxUID)
 					}
 				}
 			}
@@ -226,15 +250,113 @@ func TestEveryPodMountingTheAgentDataClaimRunsAsOneUID(t *testing.T) {
 	}
 }
 
-// TestTheStatefulSetShapeIsTheOneTheOperatorWouldPick keeps the two CR shapes
-// above apart. useStatefulSet is what picks the gateway workload, in the
-// reconciler and in the walk alike, so two shapes it answers the same way leave
-// one of buildDeployment and buildStatefulSet unwalked without failing.
-func TestTheStatefulSetShapeIsTheOneTheOperatorWouldPick(t *testing.T) {
-	if !useStatefulSet(dataVolumeStatefulSetAgent()) {
-		t.Error("dataVolumeStatefulSetAgent no longer selects the StatefulSet workload shape")
+// podBearingKinds are the workload kinds whose spec carries a pod template. A
+// builder returning one of these renders containers, and containers are what
+// the walk above is about.
+var podBearingKinds = map[string]bool{
+	"Pod":         true,
+	"Deployment":  true,
+	"StatefulSet": true,
+	"DaemonSet":   true,
+	"ReplicaSet":  true,
+	"Job":         true,
+	"CronJob":     true,
+}
+
+// TestTheWalkCallsEveryPodBearingBuilder ties renderEveryWorkloadPod's list to
+// the package, so the walk cannot narrow silently.
+//
+// Without it the list is seven names somebody typed: a builder added later
+// renders a pod nothing here reaches, and a new workload mounting the agent's
+// claim under its image's own uid ships green. This reads the package source
+// instead and requires every function returning a pod-bearing kind to be called
+// inside the walk. It sees this directory only — no pod template is built
+// anywhere else in k8s-operator/ today, and one built outside it would need
+// this assertion widened along with the walk.
+func TestTheWalkCallsEveryPodBearingBuilder(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("reading the package directory: %v", err)
 	}
-	if useStatefulSet(dataVolumeTestAgent()) {
-		t.Error("the default CR now selects the StatefulSet workload shape, so the two shapes above are one")
+
+	fset := token.NewFileSet()
+	builders := map[string]string{}
+	var walk *ast.FuncDecl
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", name, err)
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Recv != nil {
+				continue
+			}
+			if strings.HasSuffix(name, "_test.go") {
+				if fn.Name.Name == dataVolumeWalkFunc {
+					walk = fn
+				}
+				continue
+			}
+			if kind := podBearingResultKind(fn); kind != "" {
+				builders[fn.Name.Name] = kind
+			}
+		}
 	}
+
+	if walk == nil {
+		t.Fatalf("%s not found in this package; the assertion below has nothing to check", dataVolumeWalkFunc)
+	}
+	if len(builders) == 0 {
+		t.Fatal("no pod-bearing builder found in this package, so this assertion passed vacuously")
+	}
+
+	called := map[string]bool{}
+	ast.Inspect(walk, func(node ast.Node) bool {
+		if call, ok := node.(*ast.CallExpr); ok {
+			if ident, ok := call.Fun.(*ast.Ident); ok {
+				called[ident.Name] = true
+			}
+		}
+		return true
+	})
+
+	names := make([]string, 0, len(builders))
+	for builder := range builders {
+		names = append(names, builder)
+	}
+	sort.Strings(names)
+	for _, builder := range names {
+		if !called[builder] {
+			t.Errorf("%s renders a %s, and %s does not call it — its pod never reaches the uid assertion",
+				builder, builders[builder], dataVolumeWalkFunc)
+		}
+	}
+}
+
+// podBearingResultKind names the workload kind a function returns, or "" for a
+// function that returns none. Every result is considered, so a builder that
+// returns an error alongside its object still counts.
+func podBearingResultKind(fn *ast.FuncDecl) string {
+	if fn.Type.Results == nil {
+		return ""
+	}
+	for _, result := range fn.Type.Results.List {
+		star, ok := result.Type.(*ast.StarExpr)
+		if !ok {
+			continue
+		}
+		selector, ok := star.X.(*ast.SelectorExpr)
+		if !ok {
+			continue
+		}
+		if podBearingKinds[selector.Sel.Name] {
+			return selector.Sel.Name
+		}
+	}
+	return ""
 }
