@@ -1,5 +1,6 @@
 import email.message
 import io
+import json
 import os
 import sys
 import unittest
@@ -157,8 +158,120 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         run.assert_not_called()
         request = urlopen.call_args.args[0]
         self.assertEqual(
-            "http://127.0.0.1:8765/v1/github/refresh", request.full_url
+            "http://127.0.0.1:8765/v1/forge/refresh", request.full_url
         )
+        # The provider is a body field, not a path segment. A path per forge
+        # would mean the route table grows with the roster and an agent image
+        # has to know which routes its sidecar serves.
+        self.assertEqual("github", json.loads(request.data)["provider"])
+
+    @patch("github_token_refresh.subprocess.run")
+    @patch("github_token_refresh.urllib.request.urlopen")
+    def test_a_non_github_provider_is_refused_before_minty_is_asked(self, urlopen, run):
+        """This script is GitHub's token-acquisition strategy, not a pipeline
+        every forge is fitted into: Minty mints GitHub App installation tokens
+        from a signed JWT, and a GitLab access token needs no minting step at
+        all. Proceeding would ask Minty for a GitHub token in the name of a
+        repository that is not on GitHub, so a second forge gets its own
+        refresher and the sidecar dispatches between them.
+
+        The direct path, with `CREDENTIAL_PROXY_URL` cleared explicitly rather
+        than assumed absent from the runner's environment. That is the path the
+        guard governs: in the sandbox the script is a transport and the sidecar
+        is what refuses a provider it does not serve.
+        """
+        with patch.dict(os.environ, {"CREDENTIAL_PROXY_URL": ""}, clear=False):
+            with self.assertRaises(RuntimeError) as cm:
+                refresh_git_credentials("owner/repository", provider="gitlab")
+
+        self.assertIn("gitlab", str(cm.exception))
+        urlopen.assert_not_called()
+        run.assert_not_called()
+
+    @patch("github_token_refresh.subprocess.run")
+    @patch("github_token_refresh.urllib.request.urlopen")
+    def test_a_sidecar_without_the_new_route_is_retried_on_the_old_one(
+        self, urlopen, run
+    ):
+        """Skew in the direction the alias does not cover.
+
+        The sidecar serving `/v1/github/refresh` handles an old agent against a
+        new sidecar. This is the reverse — a new agent against a sidecar that
+        predates the rename, which the operator permits indefinitely because
+        `CREDENTIAL_PROXY_IMAGE` pins the sidecar independently of the agent
+        tag. Without the retry that pair loses every credential refresh, and so
+        every git write the agent makes.
+        """
+        ok = MagicMock()
+        ok.__enter__.return_value.status = 200
+        urlopen.side_effect = [
+            urllib.error.HTTPError(
+                "http://127.0.0.1:8765/v1/forge/refresh", 404, "Not Found", {}, None
+            ),
+            ok,
+        ]
+
+        with patch.dict(
+            os.environ,
+            {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765"},
+            clear=False,
+        ):
+            self.assertEqual("", refresh_git_credentials("owner/repository"))
+
+        self.assertEqual(
+            [
+                "http://127.0.0.1:8765/v1/forge/refresh",
+                "http://127.0.0.1:8765/v1/github/refresh",
+            ],
+            [call.args[0].full_url for call in urlopen.call_args_list],
+        )
+        run.assert_not_called()
+
+    @patch("github_token_refresh.subprocess.run")
+    @patch("github_token_refresh.urllib.request.urlopen")
+    def test_a_genuine_refusal_is_never_sent_twice(self, urlopen, run):
+        """The fallback is conditioned on 404 alone.
+
+        A sidecar that serves the route answers 200, 400 or 502, so retrying
+        anything but a 404 would put every real refusal — an unconfigured
+        provider, a malformed repository, a Minty outage — on the wire a second
+        time.
+        """
+        urlopen.side_effect = urllib.error.HTTPError(
+            "http://127.0.0.1:8765/v1/forge/refresh", 400, "Bad Request", {}, None
+        )
+
+        with patch.dict(
+            os.environ,
+            {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765"},
+            clear=False,
+        ):
+            with self.assertRaises(RuntimeError):
+                refresh_git_credentials("owner/repository")
+
+        self.assertEqual(1, urlopen.call_count)
+
+    @patch("github_token_refresh.subprocess.run")
+    @patch("github_token_refresh.urllib.request.urlopen")
+    def test_another_forge_is_never_retried_on_the_github_route(self, urlopen, run):
+        """A sidecar old enough to lack `/v1/forge/refresh` is old enough to
+        serve GitHub and nothing else, so retrying another provider there would
+        mint a GitHub credential in the name of a repository that is not on
+        GitHub. The 404 is the right answer for that pair.
+        """
+        urlopen.side_effect = urllib.error.HTTPError(
+            "http://127.0.0.1:8765/v1/forge/refresh", 404, "Not Found", {}, None
+        )
+
+        with patch.dict(
+            os.environ,
+            {"CREDENTIAL_PROXY_URL": "http://127.0.0.1:8765"},
+            clear=False,
+        ):
+            with self.assertRaises(RuntimeError):
+                refresh_git_credentials("owner/repository", provider="gitlab")
+
+        self.assertEqual(1, urlopen.call_count)
 
     @patch("github_token_refresh.wif_credentials.fetch_identity_token")
     @patch("github_token_refresh.subprocess.run")
@@ -290,7 +403,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
     def test_sandbox_fails_immediately_on_sidecar_502(self, urlopen, sleep):
         # The sidecar has already executed retries internally; client fails fast
         err_502 = urllib.error.HTTPError(
-            "http://127.0.0.1:8765/v1/github/refresh",
+            "http://127.0.0.1:8765/v1/forge/refresh",
             502,
             "Bad Gateway",
             email.message.Message(),
@@ -334,7 +447,7 @@ class GitHubTokenRefreshTest(unittest.TestCase):
     @patch("github_token_refresh.urllib.request.urlopen")
     def test_sandbox_fails_immediately_on_4xx_without_retry(self, urlopen, sleep):
         err_403 = urllib.error.HTTPError(
-            "http://127.0.0.1:8765/v1/github/refresh",
+            "http://127.0.0.1:8765/v1/forge/refresh",
             403,
             "Forbidden",
             email.message.Message(),

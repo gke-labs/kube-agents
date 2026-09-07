@@ -891,6 +891,8 @@ spec:
               value: /var/run/secrets/kubeagents/serviceaccount/token
             - name: TOKEN_BROKER_URL
               value: http://github-token-minter.kubeagents-system.svc.cluster.local:8080/token
+            - name: CREDENTIAL_PROXY_FORGE_PROVIDERS
+              value: github
             - name: GITOPS_STATE_CONFIGMAP
               value: platformagent-gitops-state
             - name: GITOPS_STATE_PATH
@@ -1191,6 +1193,8 @@ spec:
             - name: CREDENTIAL_PROXY_URL
             - name: CREDENTIAL_PROXY_TOKEN_FILE
               value: /var/run/secrets/kubeagents/credential-proxy/token
+            - name: CREDENTIAL_PROXY_FORGE_PROVIDERS
+              value: github
             - name: PATH
               value: /opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
             - name: PYTHONPATH

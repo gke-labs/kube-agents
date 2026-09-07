@@ -22,6 +22,7 @@ from pathlib import Path
 from unittest import mock
 
 import credential_proxy
+import forge_clis
 import gke_endpoint
 from credential_proxy import (
     MAX_REPOSITORY_LENGTH,
@@ -2060,7 +2061,7 @@ class RepositoryValidationTest(unittest.TestCase):
                 self.assertFalse(is_valid_repository(value))
 
 
-class GitHubRefreshHandlerTest(unittest.TestCase):
+class ForgeRefreshHandlerTest(unittest.TestCase):
     """A failed refresh splits its diagnosis: detail to the log, none to the reply.
 
     The reply crosses back into the agent sandbox and the caller renders the
@@ -2069,22 +2070,48 @@ class GitHubRefreshHandlerTest(unittest.TestCase):
     an operator has to read, so it has to reach the sidecar's own log.
     """
 
-    def _refresh(self, result):
+    def _call(self, result, **body_fields):
+        """Drive `_handle_forge_refresh` once; return its replies and argvs."""
         handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
         handler.max_request_bytes = 10 * 1024 * 1024
-        body = json.dumps({"repository": "gke-agentic/adamparco-infra"}).encode()
+        body = json.dumps(
+            {"repository": "gke-agentic/adamparco-infra", **body_fields}
+        ).encode()
         handler.headers = {"Content-Length": str(len(body))}
         handler.rfile = io.BytesIO(body)
-        handler.executor = types.SimpleNamespace(execute_internal=lambda argv: result)
+        argvs = []
+
+        def execute_internal(argv):
+            argvs.append(argv)
+            return result
+
+        handler.executor = types.SimpleNamespace(execute_internal=execute_internal)
         replies = []
         handler._json = lambda status, payload: replies.append((status, payload))
         # The managed-repository gate runs before the refresh does, and reading
         # the list needs the gitops-state ConfigMap. Answering it here keeps
         # these tests about what a failed refresh logs.
-        with mock.patch.object(credential_proxy, "repository_is_managed", return_value=True):
-            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
-                handler._handle_github_refresh()
+        with mock.patch.object(
+            credential_proxy, "repository_is_managed", return_value=True
+        ):
+            handler._handle_forge_refresh()
+        return replies, argvs
+
+    def _refresh(self, result, **body_fields):
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+            replies, _ = self._call(result, **body_fields)
         return replies, logs.output
+
+    @staticmethod
+    def _success():
+        return credential_proxy.ExecutionResult(
+            exit_code=0,
+            stdout="",
+            stderr="",
+            duration_ms=5,
+            truncated=False,
+            timed_out=False,
+        )
 
     @staticmethod
     def _failure(stderr):
@@ -2104,7 +2131,7 @@ class GitHubRefreshHandlerTest(unittest.TestCase):
         self.assertIn(refusal, "\n".join(logs))
         self.assertEqual(
             replies,
-            [(HTTPStatus.BAD_GATEWAY, {"error": "GitHub credential refresh failed"})],
+            [(HTTPStatus.BAD_GATEWAY, {"error": "forge credential refresh failed"})],
         )
         self.assertNotIn(refusal, json.dumps(replies[0][1]))
 
@@ -2114,13 +2141,13 @@ class GitHubRefreshHandlerTest(unittest.TestCase):
         # cron tick.
         _, logs = self._refresh(self._failure("x" * 5000))
 
-        detail = logs[0].split("GitHub credential refresh exited 1: ", 1)[1]
+        detail = logs[0].split("credential refresh exited provider=github code=1: ", 1)[1]
         self.assertEqual(detail, "x" * 1000)
 
     def test_omits_the_detail_when_stderr_is_empty(self):
         _, logs = self._refresh(self._failure("   \n"))
 
-        self.assertTrue(logs[0].endswith("GitHub credential refresh exited 1"))
+        self.assertTrue(logs[0].endswith("credential refresh exited provider=github code=1"))
 
     def test_redacts_token_shapes_out_of_the_detail(self):
         token = "ghs_" + "A" * 36
@@ -2137,6 +2164,133 @@ class GitHubRefreshHandlerTest(unittest.TestCase):
 
         self.assertNotIn("ghs_", logs[0])
         self.assertNotIn("B" * 20, logs[0])
+
+    def test_a_request_naming_no_provider_still_means_github(self):
+        """The legacy `/v1/github/refresh` path sends no provider field.
+
+        Both paths converge on this handler, so an agent image a release behind
+        its sidecar has to keep working — which is the only reason the old path
+        survives at all.
+        """
+        replies, argvs = self._call(self._success())
+
+        self.assertEqual(replies, [(HTTPStatus.OK, {"status": "refreshed"})])
+        self.assertEqual(argvs, [[credential_proxy.FORGE_REFRESHERS["github"],
+                                  "gke-agentic/adamparco-infra"]])
+
+    def test_an_unconfigured_provider_never_reaches_the_executor(self):
+        """A provider name is not a permission. Being in `FORGE_REFRESHERS` says
+        a refresher exists; being in the configured set says this install may run
+        it, and the second check is the one that stops an agent asking for a
+        forge the administrator never declared."""
+        replies, argvs = self._call(self._success(), provider="gitlab")
+
+        self.assertEqual(argvs, [])
+        self.assertEqual(replies[0][0], HTTPStatus.BAD_REQUEST)
+        self.assertIn("not configured", replies[0][1]["error"])
+
+    def test_the_provider_is_matched_case_insensitively(self):
+        replies, argvs = self._call(self._success(), provider="GitHub")
+
+        self.assertEqual(replies, [(HTTPStatus.OK, {"status": "refreshed"})])
+        self.assertEqual(len(argvs), 1)
+
+    def test_the_legacy_path_still_routes_to_the_forge_handler(self):
+        """The alias, exercised through `do_POST` rather than through the tuple.
+
+        Every other test here calls `_handle_forge_refresh` directly, so none of
+        them notices if `/v1/github/refresh` stops reaching it. Without this,
+        dropping the alias as apparently-dead leaves the suite green and breaks
+        every agent image older than its sidecar.
+
+        Both paths named rather than `FORGE_REFRESH_PATHS` iterated: a loop over
+        the tuple shortens with the tuple, so it asserts nothing about the alias
+        surviving.
+        """
+        for path in (
+            credential_proxy.FORGE_REFRESH_PATH,
+            credential_proxy.LEGACY_GITHUB_REFRESH_PATH,
+        ):
+            with self.subTest(path=path):
+                handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+                handler.path = path
+                handler.headers = {}
+                handler._authenticated = lambda: True
+                routed = []
+                handler._handle_forge_refresh = lambda: routed.append(path)
+                handler._json = lambda status, payload: None
+
+                credential_proxy.CredentialProxyHandler.do_POST(handler)
+
+                self.assertEqual([path], routed)
+
+
+class ConfiguredForgeWiringTest(unittest.TestCase):
+    """Where the derived allowlist is read, rather than how it is derived.
+
+    `test_forge_clis` covers the derivation as a pure function. These cover the
+    two readers, because both were revertible to a compiled-in GitHub set with
+    the whole suite still green: deleting the executor's per-instance binding,
+    and pointing the `/v1/exec` handler back at the class attribute.
+    """
+
+    def _executor(self, providers):
+        with mock.patch.dict(
+            os.environ, {forge_clis.FORGE_PROVIDERS_ENV: providers}
+        ):
+            return CommandExecutor(60, 1024, self.state_dir)
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.state_dir = self._tmp.name
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_an_install_serving_another_forge_does_not_get_the_github_tool(self):
+        executor = self._executor("gitlab")
+
+        self.assertNotIn("gh", executor.ALLOWED_EXECUTABLES)
+        # Resolution follows the allowlist: a name the install may not run is
+        # not looked up on PATH either, so `execute` cannot reach a binary that
+        # happens to be in the image.
+        self.assertNotIn("gh", executor.executables)
+        for name in forge_clis.BASE_EXECUTABLES:
+            self.assertIn(name, executor.ALLOWED_EXECUTABLES)
+
+    def test_the_configured_forge_keeps_its_tool(self):
+        self.assertIn("gh", self._executor("github").ALLOWED_EXECUTABLES)
+
+    def test_the_exec_route_refuses_a_tool_this_install_was_not_given(self):
+        """The handler reads the executor's list, not `CommandExecutor`'s.
+
+        Reading the class attribute would admit the command here and have the
+        executor refuse it one layer down, where the refusal carries no log line
+        naming the executable — so the check would still refuse, and the
+        operator would still be told nothing about what was refused.
+        """
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.executor = self._executor("gitlab")
+        replies = []
+        handler._json = lambda status, payload: replies.append((status, payload))
+
+        with self.assertLogs(credential_proxy.LOGGER, level="WARNING"):
+            refused = credential_proxy.CredentialProxyHandler._refuse_unsupported_executable(
+                handler, ["gh", "pr", "list"], "request-id"
+            )
+
+        self.assertTrue(refused)
+        self.assertEqual(HTTPStatus.FORBIDDEN, replies[0][0])
+        self.assertEqual("executable.allowlist", replies[0][1]["rule"])
+
+    def test_the_exec_route_admits_the_tool_this_install_was_given(self):
+        handler = CredentialProxyHandler.__new__(CredentialProxyHandler)
+        handler.executor = self._executor("github")
+        handler._json = lambda status, payload: self.fail("should not have replied")
+
+        self.assertFalse(
+            credential_proxy.CredentialProxyHandler._refuse_unsupported_executable(
+                handler, ["gh", "pr", "list"], "request-id"
+            )
+        )
 
 
 class RedactCredentialsTest(unittest.TestCase):
@@ -4619,9 +4773,18 @@ class AuthenticationOverTheSocketTest(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual([["kubectl", "get", "pods"]], self.executor.executed)
 
-    def test_the_github_refresh_route_is_authenticated_too(self):
-        status, _ = self._post(path="/v1/github/refresh")
-        self.assertEqual(401, status)
+    def test_the_forge_refresh_routes_are_authenticated_too(self):
+        # Both spellings: the legacy path is an alias kept so an agent image and
+        # a sidecar image can differ by one release, and an alias that skipped
+        # the caller check would be a way around it. Named rather than iterated
+        # off `FORGE_REFRESH_PATHS`, which would shorten with the tuple.
+        for path in (
+            credential_proxy.FORGE_REFRESH_PATH,
+            credential_proxy.LEGACY_GITHUB_REFRESH_PATH,
+        ):
+            with self.subTest(path=path):
+                status, _ = self._post(path=path)
+                self.assertEqual(401, status)
 
     def test_the_chat_relay_route_is_authenticated_too(self):
         status, _ = self._post(path="/v1/chat/events/ack")

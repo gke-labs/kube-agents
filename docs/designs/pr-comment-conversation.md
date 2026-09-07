@@ -261,9 +261,10 @@ rather than reimplements.
 ### What a second forge actually costs
 
 The provider protocol makes this feature portable. The stack under it is not — token brokering, the
-sidecar's executable allowlist, the git credential shape and the CRD each name GitHub, and none of
-that is caused by this design. [`multi-forge-support.md`](multi-forge-support.md) owns the full
-account and the order the layers have to be unwound in; this section records only what bears on the
+git credential shape, and the fact that only GitHub is a registered provider all still tie an
+install to GitHub, and none of that is caused by this design.
+[`multi-forge-support.md`](multi-forge-support.md) owns the full account, which layers have since
+been unwound, and the order the rest have to go in; this section records only what bears on the
 protocol above them.
 
 "Bitbucket" is two providers, which is the limit of how far one provider class stretches. Cloud

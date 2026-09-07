@@ -27,9 +27,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # Ship alongside this script in the same directory, which is sys.path[0] both
 # when the shell runs it and when the credential proxy execs it by absolute path.
+import forge_clis  # noqa: E402 — needs the sys.path lines above
 import repo_ref  # noqa: E402 — needs the sys.path lines above
 import wif_credentials  # noqa: E402 — needs the sys.path lines above
 from credential_proxy_client import authorization_headers  # noqa: E402
+
+#: Must match `credential_proxy.FORGE_REFRESH_PATH`. Not imported from it: that
+#: module runs in the credential sidecar and this one runs in the agent sandbox,
+#: and the point of the split is that the sandbox does not load the broker.
+FORGE_REFRESH_PATH = "/v1/forge/refresh"
+
+#: The route a sidecar built before the rename serves, and the only one it
+#: serves. Tried after the one above when that answers 404 — see the fallback in
+#: `refresh_git_credentials` for why that is safe and why it is GitHub-only.
+LEGACY_GITHUB_REFRESH_PATH = "/v1/github/refresh"
+
+#: The status an HTTP server returns for a route it does not have.
+HTTP_NOT_FOUND = 404
+
+#: The tool that both authenticates to GitHub and, via `auth setup-git`,
+#: installs itself as git's credential helper. Taken from the table the sidecar
+#: enforces so the binary this script shells is one the allowlist admits.
+GITHUB_CLI = forge_clis.FORGE_EXECUTABLES[forge_clis.GITHUB]
 
 
 def log(msg: str):
@@ -221,11 +240,18 @@ def get_current_git_repo(cwd: str | None = None) -> str | None:
 def refresh_git_credentials(
     target_repo: str | None = None,
     *,
+    provider: str = forge_clis.DEFAULT_FORGE_PROVIDER,
     max_attempts: int = 3,
     initial_delay: float = 0.5,
     backoff_factor: float = 2.0,
 ) -> str:
-    """Query local Minty, retrieve token, and cache inside git credentials."""
+    """Query local Minty, retrieve token, and cache inside git credentials.
+
+    `provider` names the forge. It travels to the sidecar in the request body
+    on the brokered path, and selects the credential helper on the direct one.
+    Defaulted rather than required because every existing caller means GitHub
+    and this script's own name says so.
+    """
     repository = target_repo.strip().strip("/") if target_repo else get_current_git_repo()
 
     # The slash count this replaced counted separators in whatever it was
@@ -244,33 +270,88 @@ def refresh_git_credentials(
         # The sidecar manages bounded retries against Minty internally.
         # The client uses a 60s timeout to allow the sidecar's retry budget
         # to finish, and fails fast on any error without re-triggering retries.
-        url = proxy_url.rstrip("/") + "/v1/github/refresh"
-        request = urllib.request.Request(
-            url,
-            data=json.dumps({"repository": repository}).encode("utf-8"),
-            # Empty in the sidecar deployment; carries the caller's projected
-            # ServiceAccount token when the broker runs in its own Pod.
-            headers={"Content-Type": "application/json", **authorization_headers()},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=60) as response:
-                if response.status == 200:
-                    log(
-                        f"GitHub credentials refreshed in credential sidecar for {repository}."
+        # `/v1/forge/refresh`, with the provider in the body.
+        #
+        # Both images are versioned independently — an operator may pin
+        # `CREDENTIAL_PROXY_IMAGE` to a mirrored digest while the agent tracks a
+        # tag — so each direction of skew has to survive on its own. The sidecar
+        # still serving `/v1/github/refresh` covers an old agent against a new
+        # sidecar; this fallback covers the reverse, where a sidecar that
+        # predates the rename has no route here and answers 404. Without it
+        # every git write path fails until the sidecar rolls.
+        #
+        # Strictly on 404, and strictly for GitHub. A sidecar that serves this
+        # route answers 200, 400 or 502 and never 404, so no genuine refusal is
+        # ever sent twice; and a sidecar old enough to lack the route is old
+        # enough to serve GitHub alone, so retrying another provider's refresh
+        # on the legacy path would mint a GitHub credential for a repository
+        # that is not on GitHub.
+        paths = [FORGE_REFRESH_PATH]
+        if provider == forge_clis.GITHUB:
+            paths.append(LEGACY_GITHUB_REFRESH_PATH)
+
+        last_error: Exception | None = None
+        for index, path in enumerate(paths):
+            request = urllib.request.Request(
+                proxy_url.rstrip("/") + path,
+                data=json.dumps(
+                    {"repository": repository, "provider": provider}
+                ).encode("utf-8"),
+                # Empty in the sidecar deployment; carries the caller's projected
+                # ServiceAccount token when the broker runs in its own Pod.
+                headers={"Content-Type": "application/json", **authorization_headers()},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    if response.status == 200:
+                        log(
+                            f"GitHub credentials refreshed in credential sidecar for {repository}."
+                        )
+                        return ""
+                    raise RuntimeError(
+                        f"Credential sidecar rejected refresh: HTTP {response.status}"
                     )
-                    return ""
-                raise RuntimeError(
-                    f"Credential sidecar rejected refresh: HTTP {response.status}"
+            except urllib.error.HTTPError as exc:
+                last_error = RuntimeError(
+                    f"Credential sidecar failed to refresh GitHub auth: HTTP {exc.code}"
                 )
-        except urllib.error.HTTPError as exc:
-            raise RuntimeError(
-                f"Credential sidecar failed to refresh GitHub auth: HTTP {exc.code}"
-            ) from exc
-        except Exception as exc:
-            raise RuntimeError(
-                f"Credential sidecar failed to refresh GitHub auth: {exc}"
-            ) from exc
+                last_error.__cause__ = exc
+                if exc.code == HTTP_NOT_FOUND and index + 1 < len(paths):
+                    log(
+                        f"Credential sidecar has no {path}; retrying on "
+                        f"{paths[index + 1]} for an older sidecar."
+                    )
+                    continue
+                raise last_error from exc
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Credential sidecar failed to refresh GitHub auth: {exc}"
+                ) from exc
+
+        raise last_error  # unreachable: the loop returns or raises on every path
+
+    # Past this point the script is GitHub's token-acquisition strategy and
+    # nothing else: Minty mints GitHub App installation tokens from a JWT signed
+    # by the App's private key, and `gh auth setup-git` is what makes git use
+    # them. A GitLab group access token needs no minting step, so it gets its own
+    # refresher rather than a branch through this one. Refuse rather than
+    # proceed: the alternative is asking Minty for a GitHub token in the name of
+    # a repository that is not on GitHub.
+    #
+    # This guards the direct path only, and deliberately. Above it the script is
+    # a transport — it forwards whatever provider it was given to the sidecar,
+    # which dispatches to that provider's refresher through
+    # `credential_proxy.FORGE_REFRESHERS` and refuses a provider the install is
+    # not configured for. So in the agent sandbox, where `CREDENTIAL_PROXY_URL`
+    # is always set, a non-GitHub provider is refused there rather than here.
+    # Here is the standalone/legacy deployment, which has no sidecar to dispatch
+    # and would otherwise fall straight into the Minty call below.
+    if provider != forge_clis.GITHUB:
+        raise RuntimeError(
+            f"{Path(__file__).name} refreshes {forge_clis.GITHUB} credentials only; "
+            f"asked for '{provider}'."
+        )
 
     # No CREDENTIAL_PROXY_URL, but a shell sandbox is configured: this is the
     # gateway pod, which holds nothing that can mint. Forward to the sandbox,
@@ -457,13 +538,17 @@ def refresh_git_credentials(
             ) from last_exc
         raise RuntimeError("Token received from Minty is empty")
 
-    # 3. Configure gh CLI authentication and Git credentials
+    # 3. Configure gh CLI authentication and Git credentials.
+    # `auth setup-git` writes `credential.helper = !gh auth git-credential`, so
+    # the credential helper here is a forge's CLI rather than a username and a
+    # URL template a provider could supply. That is why a forge with no CLI
+    # cannot reuse this and needs a helper written for it.
     try:
         env = os.environ.copy()
         env.pop("GITHUB_TOKEN", None)
         env.pop("GH_TOKEN", None)
         subprocess.run(
-            ["gh", "auth", "login", "--with-token"],
+            [GITHUB_CLI, "auth", "login", "--with-token"],
             input=token,
             text=True,
             check=True,
@@ -472,7 +557,7 @@ def refresh_git_credentials(
             env=env,
         )
         subprocess.run(
-            ["gh", "auth", "setup-git"],
+            [GITHUB_CLI, "auth", "setup-git"],
             check=True,
             capture_output=True,
             timeout=15,

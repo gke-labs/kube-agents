@@ -1,12 +1,15 @@
 # Supporting a Second Forge
 
-> **STATUS — design of record; steps 1 and 2 of §9 are in, step 3 is nearly in, the rest is not.** No
-> second forge works today. One provider exists (`GitHubProvider`), four consumers use it, one more
-> shells `gh` directly. Repository identity now runs on `repo_ref.py` in Python and `repo_ref.go` in Go, and the
-> CRD declares the forge in `spec.integration.git` with validation dispatched per provider — but
-> only GitHub is registered, and every layer beneath the declaration is still GitHub-shaped. This
-> document is the plan for the rest, and the order it has to happen in. Each section says what is
-> true on `main` now and what the design changes.
+> **STATUS — design of record; steps 1 and 2 of §9 are in, step 3 is nearly in, step 4 is in as far
+> as the broker's own surface, and the rest is not.** No second forge works today. One provider
+> exists (`GitHubProvider`), four consumers use it, one more shells `gh` directly. Repository
+> identity now runs on `repo_ref.py` in Python and `repo_ref.go` in Go; the CRD declares the forge in
+> `spec.integration.git` with validation dispatched per provider; and the broker's executable
+> allowlist and refresh route follow the declared provider rather than naming GitHub. But only
+> GitHub is registered, and the layers that remain GitHub-shaped are the egress allowlist, the
+> installer and Terraform inputs, and the prompts. This document is the plan for the rest, and the
+> order it has to happen in. Each section says what is true on `main` now and what the design
+> changes.
 
 **Scope:** What it would take for a kube-agents install to drive a forge that is not GitHub, and how
 to get there without a flag day. GitLab is the worked example throughout because it is the one asked
@@ -38,9 +41,11 @@ The coupling runs through five layers, each with a different owner and a differe
    `repo_ref.py` and `repo_ref.go` (§3) — and the CRD's admission check is one of the Go parser's
    callers.
 3. **The credential plane.** The sandbox may hold no token, so every forge call is brokered. The
-   broker's executable allowlist, its refresh route, the git credential shape it writes, and the
-   token-minting pipeline behind it are each written for GitHub specifically — as is the FQDN
-   network policy that decides where the pod may reach at all.
+   allowlist and the refresh route now follow the declared provider (§5): the executables an install
+   may run are derived from it, and `/v1/forge/refresh` dispatches to a per-provider refresher. What
+   is still written for GitHub specifically is the git credential shape the broker writes, the
+   token-minting pipeline behind it, and the FQDN network policy that decides where the pod may
+   reach at all.
 4. **The declarative surface.** The CRD now declares the forge — `spec.integration.git` carries a
    provider, validation dispatches on it, and the state ConfigMap records the declared provider
    rather than a constant — but only GitHub is registered, and the installer and Terraform
@@ -241,26 +246,59 @@ no ServiceAccount token either. Every forge call is therefore brokered by the cr
 which runs in a Pod of its own, and a second forge is a change to the broker before it is a change
 to the agent.
 
-Five things name GitHub: three inside the broker, the minting pipeline behind it, and the network
-policy that lets the pod out at all.
+Five things named GitHub: three inside the broker, the minting pipeline behind it, and the network
+policy that lets the pod out at all. The first two are done and the rest are not; each paragraph
+below says which it is.
 
-**The executable allowlist.** `ALLOWED_EXECUTABLES` is `("gcloud", "kubectl", "gh", "git")`, a class
-attribute of `CommandExecutor` read from three places — and `credential_proxy_client.py` carries the
-same set again as `SUPPORTED_EXECUTABLES`, so the step is two files, not one. GitLab has `glab`, so
-a GitLab install wants that entry and a GitHub install must not have it — an allowlist that is the
-union of every supported
-forge grants every install more than it uses. The allowlist becomes install-configuration derived
-from the configured providers rather than a constant, which is a change to how the executor is
-constructed and not a one-line edit to a tuple.
+**The executable allowlist.** `ALLOWED_EXECUTABLES` was `("gcloud", "kubectl", "gh", "git")`, a
+class attribute of `CommandExecutor` read from three places — and `credential_proxy_client.py`
+carried the same set again as `SUPPORTED_EXECUTABLES`, so the step was two files rather than one.
+GitLab has `glab`, so a GitLab install wants that entry and a GitHub install must not have it: an
+allowlist that is the union of every supported forge grants every install more than it uses.
+
+`agents/platform/scripts/forge_clis.py` now derives it. The base tools every install runs are
+constant; the forge tool is looked up per configured provider, and the operator renders
+`CREDENTIAL_PROXY_FORGE_PROVIDERS` from `spec.integration.git.provider`.
+
+Closing the two-files gap took both halves: the readers import the one module, and the operator
+renders the variable onto both containers. Sharing the module alone would not have done it. The two
+readers sit on opposite sides of the credential boundary and run in different containers, so a
+variable rendered into the sidecar alone leaves the shim deriving from an unset value — silently the
+GitHub set, which on a GitLab install is both failure modes at once: narrower than the enforcer, so
+it refuses `glab`, and wider, so it offers `gh`. A shim narrower than the enforcer refuses a tool
+the install is entitled to, and a wider one turns a clear local refusal into a confusing remote one.
+
+The variable is safe in the sandbox because it carries provider names and the name-to-binary table
+it selects from is compiled into the image, so the sandbox cannot widen its own allowlist by editing
+it — and the sidecar enforces against its own copy either way.
+
+The naive reading of "install configuration" would be to put the allowlist itself in the
+environment, and that would be a regression: anything able to set one variable on the sidecar could
+then run any binary on it. So the table of provider-name-to-executable is compiled in and the
+variable only selects from it. The operator configures provider names, never binaries, and
+`mergeCredentialProxyEnv` reserves the variable so a plugin cannot set it either.
 
 Not every forge has a CLI. Bitbucket Cloud has none, which is why `forge.py` was built with the
 `_call()` seam in the first place: a provider with no binary to shell needs a `/v1/<forge>/…` route
 on the sidecar and reaches it through that one method. Both shapes are supported and neither is
 preferred; the choice is a property of the forge.
 
-**The refresh route.** `/v1/github/refresh` is a path, not a parameter. It becomes
-`/v1/forge/refresh` with the provider in the body, and the old path stays as an alias so an agent
-image and a sidecar image can differ by one release without the refresher breaking.
+**The refresh route.** `/v1/github/refresh` was a path, not a parameter. It is now
+`/v1/forge/refresh` with the provider in the body. A request on the old path names no provider and
+means GitHub, so both converge on one handler rather than two. Being in the sidecar's refresher
+table is not permission to use it: the handler also checks the provider against the configured set,
+which is what stops an agent asking for a forge the administrator never declared.
+
+The two images are versioned independently — an operator may pin `CREDENTIAL_PROXY_IMAGE` to a
+mirrored digest while the agent tracks a tag — so a pair one release apart is a supported shape
+rather than a moment during a rollout, and each direction of the skew needs its own answer. The
+sidecar keeps serving the old path, which covers an old agent against a new sidecar. The client
+retries the old path on a 404, which covers the reverse; without it that pair loses every credential
+refresh, and so every git write the agent makes. The retry is conditioned on 404 alone, and only for
+GitHub: a sidecar that serves the route answers 200, 400 or 502 and never 404, so no genuine refusal
+is sent twice, and a sidecar old enough to lack the route is old enough to serve GitHub alone, so
+retrying another provider there would mint a GitHub credential for a repository that is not on
+GitHub.
 
 **Git credentials.** `refresh_git_credentials` writes no credential line of its own. It runs
 `gh auth login --with-token` and then `gh auth setup-git`, which installs the GitHub CLI itself as
@@ -270,6 +308,11 @@ forge's CLI. `glab` has an equivalent and would work the same way, but a forge w
 binary to install as a helper at all, so the sidecar has to serve one. That is the same split as the
 paragraph above: a CLI-backed provider configures a helper, a proxy-backed provider needs one
 written for it.
+
+That is why the dispatch is a refresher script per provider, chosen by the sidecar, rather than a
+provider branch inside one script. `github_token_refresh.py` is GitHub's strategy — Minty, a signed
+JWT, `gh auth setup-git` — and it refuses a provider it does not serve rather than proceeding, since
+proceeding would ask Minty for a GitHub token in the name of a repository that is not on GitHub.
 
 **Token acquisition, which is where the two forges genuinely diverge.** GitHub App installation
 tokens must be minted from a JWT signed by the App's private key and expire hourly, so the install
@@ -447,6 +490,10 @@ The resulting sequence:
 4. **The credential plane** (§5): route, executable allowlist and egress allowlist parameterised,
    and the git credential helper selected per provider — for a CLI-backed forge that is its own
    `setup-git` equivalent, for a proxy-backed one a helper the sidecar serves. Still one provider.
+   Splits by layer: the broker's own surface — the allowlist, the refresh route, the per-provider
+   refresher — has **landed**. The egress allowlist has not, and is the whole of what remains here.
+   The installer's and Terraform's GitHub App inputs are step 5's, with the provider that gives
+   their second branch a value to take.
 5. **`GitLabProvider`** (§4, §5): the first new forge, with a Secret-backed token. `install.sh` and
    `terraform/examples/full-install` become provider-conditional here, alongside the provider that
    gives their second branch a value to take.

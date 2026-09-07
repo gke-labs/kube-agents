@@ -25,11 +25,12 @@ package v1alpha1
 // it is stated as GitHub's rather than as every forge's, so there was nowhere
 // for a second forge's rules to go.
 //
-// A `GitProvider` states four things: which hosts are its own, what its default
-// host is, what a namespace may look like, and how deep a repository path may
-// be. Validation is then a lookup and a dispatch, and adding a forge is adding
-// a table entry rather than widening a shared check.
-// `docs/designs/multi-forge-support.md` §6 is the design.
+// A `GitProvider` states which hosts are its own, what its default host is,
+// what a namespace may look like, how deep a repository path may be, and which
+// command-line tool — if any — talks to it. Validation is then a lookup and a
+// dispatch, and adding a forge is adding a table entry rather than widening a
+// shared check. `docs/designs/multi-forge-support.md` §6 is the design, and §5
+// is the credential plane `CLI` feeds.
 //
 // Only GitHub is registered. The dispatch is what this file delivers; the
 // GitLab entry lands with the agent-side `GitLabProvider` it needs to be honest
@@ -64,6 +65,14 @@ const (
 
 	// githubPathDepth is GitHub's rule: a repository is exactly `owner/name`.
 	githubPathDepth = 2
+
+	// GitHubCLI is the tool that talks to GitHub, and the executable the
+	// credential sidecar is allowed to run on a GitHub install. The sidecar
+	// keeps its own copy of this name: it will not run a binary the operator
+	// asks for unless the name is one the sidecar itself recognises, so this
+	// selects an entry rather than defining one. See
+	// `agents/platform/scripts/forge_clis.py`'s `FORGE_EXECUTABLES`.
+	GitHubCLI = "gh"
 )
 
 // githubHosts is every spelling of GitHub that can appear in a remote this
@@ -100,6 +109,16 @@ type GitProvider struct {
 	// MaxPathDepth of 0 means unbounded, for a forge with nested groups.
 	MinPathDepth int
 	MaxPathDepth int
+	// CLI is the command-line tool that talks to this forge, and the entry the
+	// credential sidecar's executable allowlist gains when this provider is the
+	// configured one. Empty for a forge with no such tool — Bitbucket Cloud has
+	// none — which reaches the sidecar over a `/v1/<forge>/…` route instead and
+	// so adds nothing to the allowlist.
+	//
+	// Per provider rather than a union of every forge's, because an allowlist
+	// holding every tool the harness could ever use grants every install more
+	// than it uses: a GitHub install has no reason to be able to run `glab`.
+	CLI string
 }
 
 // gitProviders is the registry. Adding a forge is adding an entry here and the
@@ -113,6 +132,7 @@ var gitProviders = map[string]*GitProvider{
 		MaxNamespaceLength: MaxGitHubOrgLength,
 		MinPathDepth:       githubPathDepth,
 		MaxPathDepth:       githubPathDepth,
+		CLI:                GitHubCLI,
 	},
 }
 

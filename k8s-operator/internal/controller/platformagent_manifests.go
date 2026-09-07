@@ -2241,6 +2241,24 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Name:  "CREDENTIAL_PROXY_TOKEN_FILE",
 		Value: credentialProxyTokenMountPath + "/token",
 	})
+	// The same value the sidecar gets, because the shim in this container
+	// derives from it too. `credential_proxy_client.py` offers exactly the
+	// executables the sidecar will run, and both reach that list through
+	// `forge_clis.allowed_executables()` — so sharing the module closes the gap
+	// only if they also share the input. Rendered into the sidecar alone, this
+	// was unset here and the shim fell back to the GitHub set, which on a
+	// non-GitHub install both refuses the tool that install is entitled to and
+	// offers one it is not: the two failure modes `forge_clis` exists to stop,
+	// at once.
+	//
+	// Safe in the sandbox because it carries provider names and the
+	// name-to-binary table it selects from is compiled into the image. The
+	// sandbox cannot widen its own allowlist by editing it, and the sidecar
+	// enforces against its own copy either way.
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  credentialProxyForgeProvidersEnv,
+		Value: configuredForgeProviders(agent),
+	})
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "PATH",
 		Value: "/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -2976,6 +2994,54 @@ func sessionKVSaltSecretRef(agent *agentv1alpha1.PlatformAgent) *corev1.SecretKe
 	return defaultSecretRef(nil, defaultPlatformAgentSecrets, "SESSION_KV_SALT")
 }
 
+// credentialProxyForgeProvidersEnv names the forges this install serves. The
+// credential sidecar reads it to decide which command-line tools it will run
+// and which refresh requests it will honour;
+// `agents/platform/scripts/forge_clis.py` is the reader.
+//
+// Provider names, never binaries. The sidecar holds the name-to-executable
+// table itself and will not run a tool this variable asks for unless the name
+// is already in that table, so this selects entries rather than defining them.
+// An environment variable that could introduce a binary would let anything able
+// to set one variable on the sidecar run anything on it — precisely the
+// escalation mergeCredentialProxyEnv's reserved list exists to stop, and a
+// control resting on that list being complete is one omission away from
+// nothing. See docs/designs/multi-forge-support.md §5.
+const credentialProxyForgeProvidersEnv = "CREDENTIAL_PROXY_FORGE_PROVIDERS"
+
+// configuredForgeProviders renders the value of that variable: the provider
+// names this install is declared for, comma-separated.
+//
+// One name today, because `spec.integration.git` is a single declaration. It is
+// rendered as a list anyway so that widening the spec does not also change the
+// wire format the sidecar parses. Repositories registered in the gitops-state
+// ConfigMap do not widen it: that ConfigMap is administrator-writable and reaches
+// the agent without passing admission, so honouring a `type` from it would let a
+// ConfigMap edit add an executable to the sidecar's allowlist.
+//
+// An unresolvable declaration falls back to the default provider rather than
+// rendering nothing. Nothing would strip `gh` from an install whose CR merely
+// failed to parse, turning a validation fault into a credential outage; the
+// declaration has already been through admission by the time this runs, so the
+// fallback is for the paths admission does not cover.
+func configuredForgeProviders(agent *agentv1alpha1.PlatformAgent) string {
+	// The outer pointer, checked here rather than left to ResolveGit's own nil
+	// receiver. PlatformAgentIntegrationSpec embeds IntegrationSpec by value, so
+	// calling a promoted method on a nil *PlatformAgentIntegrationSpec takes the
+	// address of a field on nil and panics before ResolveGit is entered.
+	if agent.Spec.Integration == nil {
+		return agentv1alpha1.DefaultGitProvider
+	}
+	resolved, err := agent.Spec.Integration.ResolveGit()
+	if err != nil || resolved == nil || resolved.Provider == "" {
+		return agentv1alpha1.DefaultGitProvider
+	}
+	if _, err := resolved.GitProvider(); err != nil {
+		return agentv1alpha1.DefaultGitProvider
+	}
+	return resolved.Provider
+}
+
 func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
 	envVars := []corev1.EnvVar{
 		{Name: "PLATFORM_AGENT_HOME", Value: "/tmp/credential-proxy"},
@@ -2986,6 +3052,14 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		{Name: "KUBECONFIG", Value: "/var/run/event-watcher/watcher.config"},
 		{Name: "KSA_TOKEN_FILE", Value: "/var/run/secrets/kubeagents/serviceaccount/token"},
 		{Name: "TOKEN_BROKER_URL", Value: fmt.Sprintf("http://github-token-minter.%s.svc.cluster.local:8080/token", agent.Namespace)},
+		// Declared here rather than appended by the caller so
+		// mergeCredentialProxyEnv sees it in the managed set and reserves the
+		// name. What it decides is which executables this container will run,
+		// so a plugin that could set it could hand itself a forge CLI the
+		// install was never provisioned for.
+		{Name: credentialProxyForgeProvidersEnv, Value: configuredForgeProviders(agent)},
+		{Name: "GITOPS_STATE_CONFIGMAP", Value: agent.Name + "-gitops-state"},
+		{Name: "GITOPS_STATE_PATH", Value: path.Join(gitopsStateDir, "managed_repos")},
 		// Read by the k8s-event-watcher this container hosts, via --token-env.
 		// A non-secret loopback sentinel, not a credential; the real secret is
 		// API_SERVER_EXTERNAL_KEY below. Declared here rather than appended by
@@ -2993,8 +3067,6 @@ func buildCredentialProxyEnv(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar
 		// reserves the name — appending after that call would leave it
 		// protected only by its presence in SensitiveEnvVars, which is
 		// incidental and would not hold for a name not on that list.
-		{Name: "GITOPS_STATE_CONFIGMAP", Value: agent.Name + "-gitops-state"},
-		{Name: "GITOPS_STATE_PATH", Value: path.Join(gitopsStateDir, "managed_repos")},
 		{Name: "API_SERVER_KEY", Value: loopbackAgentAPIKey},
 	}
 	// Set in both directions, deliberately. The broker's own default is off, so
@@ -3128,6 +3200,15 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// through spec.deployment.env would take the credential proxy off the
 		// network and break every wrapped CLI in the sandbox.
 		"CREDENTIAL_PROXY_ENVOY_ADDRESS",
+		// Belt and braces with the `managed` loop above, which already reserves
+		// it on every render. Spelled out because of what it decides: this is
+		// the variable that selects which executables the sidecar will run, so a
+		// plugin that could set it could hand itself a forge CLI the install was
+		// never provisioned for. The name is a selector rather than a path, so
+		// the worst case is bounded by the sidecar's own table — but "bounded by
+		// a table in another repository's file" is not a reason to leave the
+		// door open.
+		credentialProxyForgeProvidersEnv,
 		"CREDENTIAL_PROXY_KUBE_CA_FILE",
 		"CREDENTIAL_PROXY_KUBE_TOKEN_FILE",
 		// The read-only kill switch. Unreserved, a one-line

@@ -262,6 +262,12 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          only and deliberately so — the sidecar imports it
 #                          across the credential boundary, so it may not reach
 #                          for anything that shells out
+#   forge_clis.py          the provider-name-to-binary table, imported by
+#                          credential_proxy_client and github_token_refresh so
+#                          the shim in this container offers exactly the
+#                          executables the sidecar will run. Stdlib only, for
+#                          the same reason repo_ref is: both ends of the
+#                          credential boundary import it
 #   forge.py               GitHub REST client, imported by pr_conversation
 #   pr_triggers.py         imported by pr_conversation, imports forge
 #   github_token_refresh.py  invoked directly by submit-suggestion Step 5
@@ -301,6 +307,7 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 # is actually true and exits non-zero.
 COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/repo_ref.py \
+     agents/platform/scripts/forge_clis.py \
      agents/platform/scripts/forge.py \
      agents/platform/scripts/pr_triggers.py \
      agents/platform/scripts/github_token_refresh.py \

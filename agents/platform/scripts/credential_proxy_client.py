@@ -16,8 +16,24 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+# Covers the copy of this file that sits beside `forge_clis.py` — the sidecar's,
+# and any direct invocation out of the scripts directory. It does not cover the
+# deployed shim: the Dockerfile COPYs this module alone to
+# /usr/local/bin/credential-proxy-exec and symlinks the wrappers to it, so
+# `__file__`'s parent there is /usr/local/bin, which holds no `forge_clis.py`.
+# What makes the import resolve in that shape is PYTHONPATH=/opt/defaults/scripts,
+# set on the agent container by the operator and unremovable through the sandbox
+# env allowlist. Both are load-bearing; neither is sufficient alone.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-SUPPORTED_EXECUTABLES = ("kubectl", "gcloud", "gh", "git")
+import forge_clis  # noqa: E402 — see the sys.path note above
+
+#: What this shim will forward, which is exactly what the sidecar will run.
+#: Read from `forge_clis` rather than written out again: the two lists are on
+#: opposite sides of the credential boundary, and a shim narrower than the
+#: enforcer refuses a tool the install is entitled to while a wider one turns a
+#: clear local refusal into a confusing remote one.
+SUPPORTED_EXECUTABLES = forge_clis.allowed_executables()
 
 # How long to wait to reach the broker. Bounds the connect only — see
 # BrokerConnection.
