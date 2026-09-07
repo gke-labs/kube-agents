@@ -468,11 +468,24 @@ class B4TheExecutorIsAGovernedPrincipal(unittest.TestCase):
                     # there), so the strict form keys on the credential.
                     if permissions.get("id-token") == "write":
                         saw_a_deploy = True
-                        self.assertIn(
-                            "workflow_run.conclusion == 'success'", condition
+                        chain_conditions = [condition]
+                        needs = (job or {}).get("needs")
+                        if isinstance(needs, str):
+                            needs = [needs]
+                        elif not needs:
+                            needs = []
+                        all_jobs = document.get("jobs") or {}
+                        for needed in needs:
+                            if needed in all_jobs:
+                                chain_conditions.append(str((all_jobs[needed] or {}).get("if", "")))
+
+                        self.assertTrue(
+                            any("workflow_run.conclusion == 'success'" in c for c in chain_conditions),
+                            f"{path.name}:{job_name} and its prerequisites must gate on workflow_run.conclusion == 'success'",
                         )
-                        self.assertIn(
-                            "workflow_run.head_branch == 'main'", condition
+                        self.assertTrue(
+                            any("workflow_run.head_branch == 'main'" in c for c in chain_conditions),
+                            f"{path.name}:{job_name} and its prerequisites must gate on workflow_run.head_branch == 'main'",
                         )
         self.assertTrue(
             saw_a_deploy,

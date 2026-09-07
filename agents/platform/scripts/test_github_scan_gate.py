@@ -169,6 +169,13 @@ class IssuesSweepTest(unittest.TestCase):
             result = gate.sweep_issues()
         self.assertIn("not a url", result.warnings[0])
 
+    def test_error_with_unreachable_repos_carries_unreachable_details(self):
+        with mock.patch("gitops_workspace.get_managed_github_repos", return_value=["org/r1", "org/r2"]):
+            with self._poll({"status": "ERROR", "reason": "PARTIAL_FAILURE", "unreachable_repos": ["org/r2"]}):
+                result = gate.sweep_issues()
+        self.assertEqual(result.cards, [])
+        self.assertIn("unreachable repositories: org/r2", result.warnings[0])
+
     def test_unrecognised_status_is_a_warning_not_silence(self):
         """A resolver that grows a new status must not be read as "nothing to do"."""
         with self._poll({"status": "SOMETHING_NEW"}):
@@ -415,6 +422,24 @@ class RunResolverPollTest(unittest.TestCase):
              ):
             with self.assertRaises(RuntimeError):
                 gate.run_resolver_poll()
+
+    def test_timeout_scales_linearly_with_managed_repositories(self):
+        payload = {"status": "NO_ISSUES"}
+        test_cases = [
+            ("single repo", ["org/r1"], 300),
+            ("multiple repos", ["org/r1", "org/r2", "org/r3"], 900),
+            ("empty repos defaults to 1", [], 300),
+        ]
+        for desc, repos, expected_timeout in test_cases:
+            with self.subTest(desc=desc):
+                with mock.patch.object(gate, "_resolver_path", return_value=Path(__file__)), \
+                     mock.patch("gitops_workspace.get_managed_github_repos", return_value=repos), \
+                     mock.patch.object(
+                         subprocess, "run", return_value=_completed(json.dumps(payload), 0)
+                     ) as mock_run:
+                    gate.run_resolver_poll()
+                    mock_run.assert_called_once()
+                    self.assertEqual(mock_run.call_args.kwargs.get("timeout"), expected_timeout)
 
 
 class MainTest(unittest.TestCase):

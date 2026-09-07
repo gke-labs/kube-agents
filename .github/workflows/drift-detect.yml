@@ -6,8 +6,8 @@ name: "Drift: Long-Lived Environments"
 #
 # Read-only. It runs `terraform plan`, never an apply, so it is safe on an
 # environment somebody is live-testing against and needs no lease. Closing the
-# drift it reports is `Shared: Reconcile Environment` with `mode: apply`, which
-# the nightly pipeline runs for both environments once its matrix is green.
+# drift it reports is `Shared: Reconcile Environment` with `mode: apply`, or
+# the atomic deploy workflows (`autopush-deploy.yml` and `staging-deploy.yml`).
 #
 # `rc` and `nightly` are deliberately absent: both are destroyed and rebuilt
 # from the composition on every pipeline run, so they cannot drift, and a plan

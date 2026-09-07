@@ -394,22 +394,30 @@ class ReconcileScriptTest(unittest.TestCase):
         """A separate "is it free?" read leaves a window before the apply."""
         self.assertRegex(self.text, r'live_test_lease\.py"?\s+acquire')
         self.assertIn("trap release_lease EXIT", self.text)
+        self.assertIn("trap 'release_lease; exit 130' INT", self.text)
+        self.assertIn("trap 'release_lease; exit 143' TERM", self.text)
+        self.assertIn("trap 'release_lease; exit 129' HUP", self.text)
 
-    def test_an_apply_waits_out_an_in_flight_redeploy(self):
-        """Both drive `helm upgrade` on the release the composition owns."""
-        self.assertIn("await_redeploys", self.text)
-        self.assertIn("redeploy-${component}.yml", self.text)
+    def test_signals_release_lease_and_exit_nonzero(self):
+        """SIGINT/SIGTERM/SIGHUP must terminate bash and not continue execution."""
+        snippet = """
+LEASE_HELD="true"
+release_lease() {
+  echo "RELEASED"
+  LEASE_HELD="false"
+}
+trap release_lease EXIT
+trap 'release_lease; exit 130' INT
+trap 'release_lease; exit 143' TERM
+trap 'release_lease; exit 129' HUP
 
-    def test_the_redeploy_wait_counts_queued_runs_too(self):
-        """Each redeploy has its own concurrency group, so one can sit queued.
-
-        autopush's redeploys start on every push to main. A queued one that
-        dequeues halfway through the apply is the collision the wait exists to
-        avoid, and an `--status in_progress` query cannot see it.
-        """
-        self.assertIn('select(.status == "in_progress"', self.text)
-        self.assertIn('"queued"', self.text)
-        self.assertIn('"waiting"', self.text)
+kill -TERM $$
+echo "UNREACHABLE_AFTER_SIGNAL"
+"""
+        proc = subprocess.run(["bash", "-c", snippet], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 143)
+        self.assertIn("RELEASED", proc.stdout)
+        self.assertNotIn("UNREACHABLE_AFTER_SIGNAL", proc.stdout)
 
     def test_credentials_are_fetched_before_the_lease_is_taken(self):
         """The lease is a ConfigMap read; without a kubeconfig it cannot be read.

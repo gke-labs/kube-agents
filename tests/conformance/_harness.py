@@ -205,7 +205,7 @@ SOURCES: dict[str, Source] = {
         ("/clusters/", "@your-org/"),
     ),
     "autopush_agent_workflow": Source(
-        ".github/workflows/autopush-redeploy-agent.yml",
+        ".github/workflows/autopush-deploy.yml",
         ("workflow_run", "head_branch"),
     ),
 }

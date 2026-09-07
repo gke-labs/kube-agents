@@ -46,9 +46,12 @@ def test_github_token_minting_and_connectivity(
     if not gke_cluster_name or not github_repo:
         pytest.fail("GKE cluster name and GITHUB_REPO are required for live GitHub connectivity probe.")
 
-    # Find running platform-agent pod with availability wait
+    # 1. Wait for running shell sandbox pod (StatefulSet app=<name>-shell, container: shell)
     deadline = time.time() + _POD_WAIT_TIMEOUT_SECONDS
     pod_name = ""
+    container_name = "shell"
+    agent_name = os.environ.get("AGENT_SERVICE_NAME", "platform-agent")
+
     while time.time() < deadline:
         proc_pod = subprocess.run(
             [
@@ -58,7 +61,7 @@ def test_github_token_minting_and_connectivity(
                 "-n",
                 agent_namespace,
                 "-l",
-                "kubeagents.x-k8s.io/has-credential-proxy=true",
+                f"app={agent_name}-shell",
                 "--field-selector=status.phase=Running",
                 "-o",
                 "jsonpath={.items[0].metadata.name}",
@@ -68,8 +71,13 @@ def test_github_token_minting_and_connectivity(
         )
         if proc_pod.returncode == 0 and proc_pod.stdout.strip():
             pod_name = proc_pod.stdout.strip()
+            container_name = "shell"
             break
-        proc_pod = subprocess.run(
+        time.sleep(_POD_POLL_INTERVAL_SECONDS)
+
+    # 2. Fallback for legacy single-pod layout: gateway pod with container platform-agent
+    if not pod_name:
+        proc_gw = subprocess.run(
             [
                 "kubectl",
                 "get",
@@ -77,7 +85,7 @@ def test_github_token_minting_and_connectivity(
                 "-n",
                 agent_namespace,
                 "-l",
-                "app=platform-agent-gateway",
+                f"app={agent_name}-gateway",
                 "--field-selector=status.phase=Running",
                 "-o",
                 "jsonpath={.items[0].metadata.name}",
@@ -85,36 +93,14 @@ def test_github_token_minting_and_connectivity(
             capture_output=True,
             text=True,
         )
-        if proc_pod.returncode == 0 and proc_pod.stdout.strip():
-            pod_name = proc_pod.stdout.strip()
-            break
-        # Fallback to checking any running pod in agent namespace with 'agent' or 'gateway' in name
-        proc_pod_all = subprocess.run(
-            [
-                "kubectl",
-                "get",
-                "pod",
-                "-n",
-                agent_namespace,
-                "--field-selector=status.phase=Running",
-                "-o",
-                "jsonpath={.items[*].metadata.name}",
-            ],
-            capture_output=True,
-            text=True,
-        )
-        if proc_pod_all.returncode == 0 and proc_pod_all.stdout.strip():
-            candidate_pods = [
-                p for p in proc_pod_all.stdout.split()
-                if ("agent" in p or "gateway" in p) and not any(k in p for k in ("minter", "minty", "operator", "hindsight"))
-            ]
-            if candidate_pods:
-                pod_name = candidate_pods[0]
-                break
-        time.sleep(_POD_POLL_INTERVAL_SECONDS)
+        if proc_gw.returncode == 0 and proc_gw.stdout.strip():
+            pod_name = proc_gw.stdout.strip()
+            container_name = "platform-agent"
 
     if not pod_name:
-        pytest.fail(f"No running platform-agent-gateway pod found in namespace '{agent_namespace}' within {_POD_WAIT_TIMEOUT_SECONDS}s.")
+        pytest.fail(
+            f"No running agent shell or legacy gateway pod found in namespace '{agent_namespace}' within {_POD_WAIT_TIMEOUT_SECONDS}s."
+        )
 
     # Refresh credentials via broker and query repository via read-only GET API
     script = f"""
@@ -132,6 +118,7 @@ if p_refresh.returncode == 0 and p_refresh.stdout.strip():
 # 2. Execute read-only GitHub API verification via Envoy proxy from workspace root
 env = os.environ.copy()
 env['PWD'] = '/opt/data'
+env['PATH'] = '/opt/credential-proxy/bin:' + env.get('PATH', '')
 cmd_gh = ['gh', 'api', f'repos/{github_repo}', '--jq', '.full_name']
 res_gh = subprocess.run(cmd_gh, cwd='/opt/data', env=env, capture_output=True, text=True)
 if res_gh.returncode != 0:
@@ -146,19 +133,21 @@ if full_name.lower() != '{github_repo}'.lower():
 print(f"Successfully authenticated and queried repository: {{full_name}}")
 """
 
-    cmd = [
+    base_exec = [
         "kubectl",
         "exec",
         "-n",
         agent_namespace,
         pod_name,
         "-c",
-        "platform-agent",
+        container_name,
         "--",
-        "python3",
-        "-c",
-        script,
     ]
+    if container_name == "shell":
+        cmd = base_exec + ["runuser", "-u", "agent", "--", "python3", "-c", script]
+    else:
+        cmd = base_exec + ["python3", "-c", script]
+
     try:
         proc_start = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
         assert proc_start.returncode == 0, (

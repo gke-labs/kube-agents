@@ -835,6 +835,13 @@ class TestResolveRepo(WorkspaceTestCase):
             self.assertEqual(gitops_workspace.get_managed_repo_entries(), [])
             mock_run.assert_not_called()
 
+    def test_get_managed_repo_entries_handles_malformed_json_list_in_file(self):
+        state_file = self.tmp_path / "managed_repos_malformed_list"
+        state_file.write_text("[invalid-json-content", encoding="utf-8")
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}), patch("subprocess.run") as mock_run:
+            self.assertEqual(gitops_workspace.get_managed_repo_entries(), [])
+            mock_run.assert_not_called()
+
     def test_get_managed_repo_entries_treats_a_mounted_dir_with_no_key_as_empty(self):
         mount = self.tmp_path / "gitops-mount"
         mount.mkdir()
@@ -870,6 +877,16 @@ class TestResolveRepo(WorkspaceTestCase):
                 mock_run.call_args.kwargs["timeout"],
                 gitops_workspace.GITOPS_STATE_READ_TIMEOUT_SECONDS,
             )
+
+    def test_validate_repo_org_matching_primary_org(self):
+        with patch.dict(os.environ, {"GITOPS_ORG": "gke-labs"}):
+            self.assertEqual(gitops_workspace.validate_repo_org("gke-labs/kube-agents"), "gke-labs/kube-agents")
+
+    def test_validate_repo_org_cross_org_raises_value_error(self):
+        with patch.dict(os.environ, {"GITOPS_ORG": "gke-labs"}):
+            with self.assertRaises(ValueError) as ctx:
+                gitops_workspace.validate_repo_org("other-org/kube-agents")
+            self.assertIn("Cross-org repository 'other-org/kube-agents' is not supported", str(ctx.exception))
 
     def test_get_managed_github_repos_filters_github_urls(self):
         fake_cm = CompletedProcess(

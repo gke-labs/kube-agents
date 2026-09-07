@@ -54,23 +54,12 @@ Three normalisations, and the forge that forced each
 
 On the repository parser
 ------------------------
-`_parse_repo` is a deliberate copy of `github-issue-resolver`'s
-`get_target_repo`, not a reference to it: a shared module must not import from a
-skill. Two copies can drift, so `test_forge.py` runs both parsers over one corpus
-and fails when they disagree. That test is the thing to delete — along with this
-copy — when `resolver.py` migrates onto this module, which
-`docs/designs/pr-comment-conversation.md` §7 keeps out of scope for now.
+`_parse_repo` validates and normalizes repository slugs (`owner/repo`). `test_forge.py` verifies repository slug resolution.
 
-The looser parser in `gitops_workspace.repo_from_settings` is deliberately not
-reused. It strips a `github.com/` prefix and otherwise takes the last two path
-segments, so `https://evil.com/github.com/attacker/repo` resolves to
-`attacker/repo`. That is out of scope here and noted rather than fixed.
-
-A third parser, `github_token_refresh.github_repo_from_remote`, reads the git
+A second parser, `github_token_refresh.github_repo_from_remote`, reads the git
 remote rather than a configured value and rejects a non-GitHub host outright.
 Its host set carries `ssh.github.com` — GitHub's SSH-over-443 endpoint, which
-appears in a clone URL but not in a `SETTINGS.md` repository line — so a remote
-of that form resolves there and not here.
+appears in a clone URL — so a remote of that form resolves there and not here.
 """
 
 from __future__ import annotations

@@ -49,6 +49,8 @@ kube-agents/
 │       │                                          report-prioritization SOPs
 │       └── skills/                                SKILL.md bundles + the
 │                                                  gke-compute-classes references
+├── a2a/docs/                                      design notes kept beside the A2A
+│                                                  bus Go module they describe
 ├── bench/                                         devops-bench evaluation harness README
 │                                                  + the task/harness authoring how-to
 ├── charts/                                        canonical Helm charts (kube-agents)
@@ -250,6 +252,7 @@ pull request:
 | `INSTALL.md` | Install guide | Self-contained, executable installation guide: automated GCP/GKE provisioning, manual Kubernetes deployment, local dev, declarative Terraform+Helm install (pointer to its canonical guide), teardown, troubleshooting. Commands only; explanation lives on the site. | Prerequisites, provisioning stages, integrations, teardown | Written to be runnable end-to-end by a human or an AI agent |
 | `AGENTS.md` | Contributor rules | Workspace instructions: repo layout, branching from a freshly fetched `main`, the pre-task scan of open pull requests and issues, skills guidelines, the engineering rules, the canonical-home documentation rules, generated-regions rule, PR hygiene, the live-validation requirement, and the automated pull-request review contract. States the rules; the commands that carry them out live in `docs/pull-request-workflow.md` and the mechanics that are prose in `.agents/rules/`. | Doc ownership table, engineering rules, `make docs-check`, fresh base, duplicate-work scan, Conventional Commits, fork PRs, bot review | AI coding agents and human contributors; owns the doc RULES; loaded into every session, so `make docs-check-context-budget` caps its size |
 | `CLAUDE.md` | Contributor rules | Imports `AGENTS.md` and points to it for commit authorship and PR attribution guidance. | Points to `AGENTS.md` rules | Claude Code sessions |
+| `a2a/docs/hermes-bridge.md` | Feature design | The Hermes bridge, a stand-in executor for `platform`-addressed A2A tasks until the dispatcher and worker adapter land: sidecar placement via `spec.deployment.sidecars`, what that deployment method costs (the mode-flip blocker, the unscreened sidecar env), bus user and grants, task lifecycle, and the startup sweep with CAS finalization. | Sidecar placement, flip blocker, bus grants, sweep, demolition date | Scaffolding design kept beside the `a2a/` module rather than in `docs/designs/` — it is deleted with the bridge when the dispatcher lands |
 | `admin_console/README.md` | Component README | Local setup and operating boundaries for the Kube Agents Console. | Connection, LLM gateway setup, chat, observability, integrations, validation | Console users and contributors |
 | `admin_console/CONNECTION_SECURITY.md` | Security reference | Security contract for the local console's persisted connection lease. | Stored metadata, filesystem controls, identity binding, revalidation, trust boundary | Console users and security reviewers |
 
