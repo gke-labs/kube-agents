@@ -19,7 +19,7 @@ when a request has already been answered, whether an existing pull request is a
 conflict or a resubmission — is harness policy that does not change between
 forges. The protocol grows one migrated consumer at a time rather than by
 copying an API surface; `docs/designs/multi-forge-support.md` §4 says why, and
-names the two consumers still to come (`audit_report.py`, `resolver.py`).
+names the one consumer still to come (`resolver.py`).
 
 Splitting the two here is what makes a second forge a new class rather than a
 second copy of the sweep. It is *not* a claim that a second forge is cheap:
@@ -174,6 +174,44 @@ _PR_EXISTS_MARKER = "already exists"
 #: a one-line operator-facing warning, so it is a line's worth and not a log.
 _DETAIL_CHARS = 200
 
+#: Reason code for a forge that refused a write the caller was entitled to make
+#: — a label that does not resolve, a comment the API rejected, a close the
+#: credential could not perform. Separate from `REPO_UNREACHABLE` for the reason
+#: `REASON_PULL_REQUEST_REFUSED` is: the caller has already read this repository
+#: over this credential, so "cannot reach it" is the one answer ruled out.
+REASON_WRITE_REFUSED = "FORGE_WRITE_REFUSED"
+
+#: How many changes `list_pull_requests` will accept before it refuses to answer.
+#: A truncated page is the worst possible reply — the changes past the ceiling
+#: read as "no change", so a caller re-opens fixes that already exist. Callers
+#: pass their own; this is the default for one that does not care.
+CHANGE_PAGE_LIMIT = 200
+
+#: The keys `list_pull_requests` puts on each row. They are the harness's
+#: vocabulary rather than GitHub's, even though GitHub is where the spellings
+#: came from: a second provider fills these in from whatever its own API calls
+#: them, and `audit_report.py` reads them without knowing which forge answered.
+#: Named here so the contract has one home — a provider implementing it and a
+#: caller reading it are otherwise agreeing by coincidence. Renaming them to
+#: something no forge already uses is deliberately not part of adding the second
+#: provider; see `docs/designs/multi-forge-support.md` §4.
+#: The keys `list_issues` projects, and so the fields `Issue` carries. Named
+#: for the reason `CHANGE_FIELDS` is named, and deliberately without `body`:
+#: `Issue` says why a listing must not carry one.
+ISSUE_FIELDS = ("number", "url", "title", "labels")
+
+CHANGE_FIELDS = (
+    "number",
+    "headRefName",
+    "state",
+    "mergedAt",
+    "closedAt",
+    "url",
+    "body",
+    "labels",
+)
+
+
 class ForgeError(Exception):
     """A fault with a machine-readable reason code.
 
@@ -310,15 +348,45 @@ class Commit:
     committed_at: str = ""
 
 
+@dataclass(frozen=True)
+class Issue:
+    """One issue, as the fleet audit's ledger needs to see it.
+
+    Exactly the fields `ISSUE_FIELDS` projects, and no body. A listing of
+    twenty ledger issues would carry twenty rendered audit reports, which is
+    both the largest thing the forge could send and the one thing no caller of
+    a listing wants; `issue_body` fetches one when one is needed.
+
+    Keeping the field off is not tidiness. It would be `""` on every row a
+    listing produced, and `""` is what a ledger with nothing in it looks like —
+    so a caller reading `issue.body` off a listing would conclude the ledger was
+    empty and announce every live finding as new. `issue_body` cannot make that
+    mistake: it raises rather than returning `""` when the read fails, because
+    "the ledger is empty" and "the ledger could not be read" lead to opposite
+    decisions.
+
+    Everything but `number` still defaults, so a forge that omits a field
+    produces a usable row rather than an exception.
+    """
+
+    number: int
+    url: str = ""
+    title: str = ""
+    labels: tuple[str, ...] = ()
+
+
 class ForgeProvider(Protocol):
     """The forge-shaped surface this harness needs.
 
-    Two groups. The first seven are the PR-conversation feature — reading a
-    review thread and answering it. The last three are opening a change, which
-    `submit-suggestion` needs and which is the first consumer migrated onto this
-    protocol from a private `gh` runner of its own. The list grows by migration,
-    not by copying a forge's API surface: see
-    `docs/designs/multi-forge-support.md` §4.
+    Three groups, in the order they were needed. The first seven are the
+    PR-conversation feature — reading a review thread and answering it. The next
+    three open a change, which `submit-suggestion` needs. The rest are the fleet
+    audit's ledger: issues, labels, and the bulk reads that let it work out which
+    of its own pull requests are still justified.
+
+    The list grows by migration, not by copying a forge's API surface: see
+    `docs/designs/multi-forge-support.md` §4. Every method here exists because a
+    caller in this repository had a `gh` invocation that had to stop being one.
     """
 
     #: False on a forge with no reaction API (Bitbucket Cloud), so a caller can
@@ -340,14 +408,136 @@ class ForgeProvider(Protocol):
     def list_commits(self, repo: str, pr: PullRequest) -> list[Commit]: ...
 
     def create_pull_request(
-        self, repo: str, *, head: str, base: str, title: str, body: str
+        self,
+        repo: str,
+        *,
+        head: str,
+        base: str,
+        title: str,
+        body: str,
+        labels: Sequence[str] = (),
     ) -> str: ...
 
     def update_pull_request(
-        self, repo: str, *, head: str, title: str, body: str
+        self,
+        repo: str,
+        *,
+        head: str = "",
+        number: int = 0,
+        title: str,
+        body: str,
     ) -> None: ...
 
     def pull_request_url(self, repo: str, *, head: str) -> str: ...
+
+    # -- the audit ledger ---------------------------------------------------- #
+    #
+    # `ensure_label` before anything that applies one: on GitHub a label has to
+    # exist on the repository before it can be attached, and the attach call
+    # reports a missing name as a failure of the whole edit rather than of the
+    # one label.
+
+    def ensure_label(
+        self, repo: str, *, name: str, color: str, description: str
+    ) -> None: ...
+
+    def list_issues(
+        self,
+        repo: str,
+        *,
+        labels: Sequence[str] = (),
+        state: str = "open",
+        limit: int = CHANGE_PAGE_LIMIT,
+    ) -> list[Issue]: ...
+
+    def issue_body(self, repo: str, number: int) -> str: ...
+
+    def issue_url(self, repo: str, number: int) -> str: ...
+
+    def issue_comments(self, repo: str, number: int) -> list[dict]: ...
+
+    def create_issue(
+        self, repo: str, *, title: str, body: str, labels: Sequence[str] = ()
+    ) -> str: ...
+
+    def update_issue(
+        self, repo: str, number: int, *, title: str = "", body: str
+    ) -> None: ...
+
+    def comment_on_issue(self, repo: str, number: int, *, body: str) -> None: ...
+
+    def close_issue(self, repo: str, number: int, *, reason: str = "") -> None: ...
+
+    def set_issue_labels(
+        self, repo: str, number: int, *, add: Sequence[str] = (), remove: Sequence[str] = ()
+    ) -> None: ...
+
+    def list_pull_requests(
+        self,
+        repo: str,
+        *,
+        labels: Sequence[str] = (),
+        state: str = "open",
+        limit: int = CHANGE_PAGE_LIMIT,
+    ) -> list[dict]: ...
+
+    def pull_request_comments(self, repo: str, number: int) -> list[dict]: ...
+
+    def comment_on_pull_request(
+        self, repo: str, number: int, *, body: str
+    ) -> None: ...
+
+    def set_pull_request_labels(
+        self,
+        repo: str,
+        change: int | str,
+        *,
+        add: Sequence[str] = (),
+        remove: Sequence[str] = (),
+    ) -> None: ...
+
+    def close_pull_request(self, repo: str, number: int) -> None: ...
+
+
+def _label_flags(flag: str, names: Sequence[str]) -> list[str]:
+    """`["--label", "a", "--label", "b"]` — one repeated flag per name.
+
+    Blank names are dropped rather than passed through. A caller assembling a
+    list from optional pieces otherwise sends `--label ""`, which GitHub answers
+    with a 422 that fails the *whole* call: the labels that were valid go on
+    nothing, and on a create path the change is not opened at all.
+    """
+    return [part for name in names if name for part in (flag, str(name))]
+
+
+def _last_line(text: Optional[str]) -> str:
+    """The last non-blank line, which is where a URL a forge printed will be.
+
+    Not the whole of stdout. `gh` puts a version notice, a credential-refresh
+    line, or a "Warning: … " on the same stream as the address it just created,
+    and a caller that stored all of it records a link nobody can follow — into
+    an issue body, where it outlives the run that wrote it.
+    """
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
+def _selector(*, head: str = "", number: int = 0) -> str:
+    """How `gh` is told which change to act on: a branch name or a number.
+
+    `gh` accepts either in the same argument position, so the choice is the
+    caller's and this only enforces that exactly one arrived. Both or neither is
+    a programming error rather than a forge failure, so it raises `ValueError`
+    and not `ForgeError` — a caller that catches the latter to log and continue
+    would otherwise swallow a bug into a warning.
+    """
+    if head and number:
+        raise ValueError("name the change by head or by number, not both")
+    if head:
+        return head
+    if number:
+        return str(number)
+    raise ValueError("name the change by head or by number")
 
 
 def normalise_login(login: str) -> str:
@@ -880,7 +1070,14 @@ class GitHubProvider:
 
     # -- opening a change --------------------------------------------------
     def create_pull_request(
-        self, repo: str, *, head: str, base: str, title: str, body: str
+        self,
+        repo: str,
+        *,
+        head: str,
+        base: str,
+        title: str,
+        body: str,
+        labels: Sequence[str] = (),
     ) -> str:
         """Open a pull request from `head` into `base`, returning its URL.
 
@@ -901,6 +1098,13 @@ class GitHubProvider:
         `gh` puts a protected-base rejection on stdout and the credential
         proxy's block message on stderr.
 
+        `labels` are applied in this call rather than a following one so a
+        pull request is never briefly visible without the labels that say what
+        it is — the fleet audit's close-semantics rule reads them, and a run
+        that crashed between the two calls would leave a change no later run
+        could classify. Every name must already exist on the repository;
+        `ensure_label` says why and what happens when one does not.
+
         The body travels on stdin, for the reason `post_comment` sets out: since
         #913 the caller, the sandbox and the broker are three containers with
         three filesystems, so `--body-file <path>` names a file that only one of
@@ -915,6 +1119,7 @@ class GitHubProvider:
                 "--head", head,
                 "--title", title,
                 "--body-file", BODY_STDIN,
+                *_label_flags("--label", labels),
             ],
             repo=repo,
             stdin=body,
@@ -928,7 +1133,7 @@ class GitHubProvider:
                 REASON_PULL_REQUEST_REFUSED,
                 f"exit {result.returncode}: {merged}"[:_DETAIL_CHARS],
             )
-        url = (result.stdout or "").strip()
+        url = _last_line(result.stdout)
         if url:
             return url
         # A `gh` that printed nothing still opened the pull request, so a failed
@@ -940,9 +1145,22 @@ class GitHubProvider:
             return ""
 
     def update_pull_request(
-        self, repo: str, *, head: str, title: str, body: str
+        self,
+        repo: str,
+        *,
+        head: str = "",
+        number: int = 0,
+        title: str,
+        body: str,
     ) -> None:
-        """Point the open pull request for `head` at the work just pushed.
+        """Point an open pull request at the work just pushed.
+
+        Named by `head` or by `number`, because the two callers hold different
+        halves. `submit-suggestion` has just pushed a branch and has never read
+        the pull request, so a branch name is all it can offer; the fleet audit
+        arrives from a listing and holds the number. Resolving both here rather
+        than making one caller look the other up keeps a round trip out of the
+        path that does not need it.
 
         Title and body as well as commits: a resubmission's description was
         written for the commits it is pushing now, and leaving the old one in
@@ -952,7 +1170,7 @@ class GitHubProvider:
         """
         self._call(
             [
-                "pr", "edit", head,
+                "pr", "edit", _selector(head=head, number=number),
                 "-R", repo,
                 "--title", title,
                 "--body-file", BODY_STDIN,
@@ -979,6 +1197,343 @@ class GitHubProvider:
         if not isinstance(row, dict):
             return ""
         return str(row.get("url") or "")
+
+    # -- the audit ledger ---------------------------------------------------
+    def _write(self, argv: Sequence[str], *, stdin: str | None = None) -> None:
+        """A call made for its effect, refusing with `FORGE_WRITE_REFUSED`.
+
+        Not `_call(expect_json=False)`, whose failure is `REPO_UNREACHABLE`.
+        Every caller of this has already read the repository over the same
+        credential in the same run, so unreachability is the one explanation
+        ruled out and naming it sends an operator to check the network when the
+        answer is a 422 about a label. The detail carries the exit code and both
+        streams for the reason `create_pull_request` gives: `gh` splits a policy
+        refusal and a proxy block across stdout and stderr.
+
+        `stdin` is how every body reaches `gh`, paired with `--body-file -`;
+        `create_pull_request` says why a path cannot be.
+        """
+        result = self._call(argv, check=False, stdin=stdin)
+        if result.returncode == 0:
+            return
+        merged = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
+        raise ForgeError(
+            REASON_WRITE_REFUSED, f"exit {result.returncode}: {merged}"[:_DETAIL_CHARS]
+        )
+
+    def _view(self, kind: str, number: int, repo: str, field: str) -> dict:
+        """One projected field off one issue or pull request.
+
+        `{}` for an answer that parsed but was not an object. A failed read
+        raises out of `_call` instead — the distinction matters to every caller
+        here, because "the forge sent something odd" and "the forge did not
+        answer" are the difference between degrading and stopping.
+        """
+        row = self._call([kind, "view", str(number), "-R", repo, "--json", field])
+        return row if isinstance(row, dict) else {}
+
+    def ensure_label(
+        self, repo: str, *, name: str, color: str, description: str
+    ) -> None:
+        """Create the label, or update it in place when it is already there.
+
+        Every label the harness applies has to be created first: a label that
+        does not exist on the repository is not created by the call that
+        attaches it, which resolves the name to an id and fails — and it fails
+        the *whole* edit, so one missing name loses the other five labels too.
+
+        `--force` makes this idempotent, which is what lets it run at the top of
+        every path rather than once at install time. It also repairs a colour or
+        description someone changed by hand, and that is load-bearing rather
+        than tidy: the description has a length ceiling, and a label whose
+        description exceeded it never came into existence at all while the calls
+        that applied it went on reporting success.
+        """
+        self._write(
+            [
+                "label", "create", name,
+                "-R", repo,
+                "--color", color,
+                "--description", description,
+                "--force",
+            ]
+        )
+
+    def list_issues(
+        self,
+        repo: str,
+        *,
+        labels: Sequence[str] = (),
+        state: str = "open",
+        limit: int = CHANGE_PAGE_LIMIT,
+    ) -> list[Issue]:
+        """Issues carrying every one of `labels`, lowest number first.
+
+        Sorted here so a caller choosing between duplicates does not have to
+        trust the forge's order. Which end of that list to take is the caller's
+        rule, not this one's — see `audit_report.find_existing_issue`.
+
+        `limit` truncates silently on GitHub, so a caller that cannot tolerate a
+        short answer compares the length against the ceiling it passed. This
+        does not do it for them: for the audit's ledger lookup a truncated page
+        is a warning about duplicates, and for its pull-request listing it is a
+        refusal to run at all.
+        """
+        rows = self._call(
+            [
+                "issue", "list",
+                "-R", repo,
+                *_label_flags("--label", labels),
+                "--state", state,
+                "--json", ",".join(ISSUE_FIELDS),
+                "--limit", str(limit),
+            ]
+        )
+        if not isinstance(rows, list):
+            return []
+        return sorted(
+            (_issue_from_row(row) for row in rows if isinstance(row, dict)),
+            key=lambda issue: issue.number,
+        )
+
+    def issue_body(self, repo: str, number: int) -> str:
+        """The issue's body text. `""` means empty, never unreadable.
+
+        A read that fails raises, because the fleet audit diffs this against the
+        findings it just gathered: an unreadable ledger read as an empty one
+        announces every live finding as new, every morning, to everyone watching
+        the repository.
+        """
+        return str(self._view("issue", number, repo, "body").get("body") or "")
+
+    def issue_url(self, repo: str, number: int) -> str:
+        return str(self._view("issue", number, repo, "url").get("url") or "")
+
+    def issue_comments(self, repo: str, number: int) -> list[dict]:
+        """Comments on the issue, as the forge sent them.
+
+        Dictionaries rather than `Comment`, and that is a gap rather than a
+        design. `Comment` does not carry `authorAssociation` or
+        `viewerDidAuthor`, and `audit_report.is_machine_author` needs both to
+        keep the automation from issuing itself a `/remediate` — a security
+        control, so widening the dataclass and moving this onto it is its own
+        change rather than a rider on this one. Until then a second provider has
+        to produce GitHub's comment shape here, which
+        `docs/designs/multi-forge-support.md` §4 records as outstanding.
+        """
+        rows = self._view("issue", number, repo, "comments").get("comments") or []
+        return [row for row in rows if isinstance(row, dict)]
+
+    def create_issue(
+        self, repo: str, *, title: str, body: str, labels: Sequence[str] = ()
+    ) -> str:
+        """Open an issue, returning its URL.
+
+        The URL is the last non-blank line `gh` printed rather than the whole of
+        stdout, because a credential refresh or a version notice arrives on the
+        same stream and a caller that stored all of it would record a link
+        nobody can follow.
+        """
+        result = self._call(
+            [
+                "issue", "create",
+                "-R", repo,
+                "--title", title,
+                "--body-file", BODY_STDIN,
+                *_label_flags("--label", labels),
+            ],
+            stdin=body,
+            check=False,
+        )
+        if result.returncode != 0:
+            merged = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
+            raise ForgeError(
+                REASON_WRITE_REFUSED,
+                f"exit {result.returncode}: {merged}"[:_DETAIL_CHARS],
+            )
+        return _last_line(result.stdout)
+
+    def update_issue(
+        self, repo: str, number: int, *, title: str = "", body: str
+    ) -> None:
+        """Rewrite the issue's body, and its title when one is given.
+
+        An empty `title` leaves the existing one alone rather than clearing it.
+        The audit needs both spellings: the run that rewrites the ledger sets a
+        title carrying the finding counts, and the second pass that re-links the
+        pull requests it has just opened must not touch it — those counts were
+        correct when they were written and re-deriving them from a body written
+        for a different purpose would be worse than leaving them.
+        """
+        self._write(
+            [
+                "issue", "edit", str(number),
+                "-R", repo,
+                *(["--title", title] if title else []),
+                "--body-file", BODY_STDIN,
+            ],
+            stdin=body,
+        )
+
+    def comment_on_issue(self, repo: str, number: int, *, body: str) -> None:
+        self._write(
+            ["issue", "comment", str(number), "-R", repo, "--body-file", BODY_STDIN],
+            stdin=body,
+        )
+
+    def close_issue(self, repo: str, number: int, *, reason: str = "") -> None:
+        """Close the issue, optionally saying why.
+
+        `reason` is passed through rather than interpreted. On GitHub the two
+        spellings are `completed` and `not planned`, and which one a close
+        carries is the caller's assertion about its own work: a closed audit
+        ledger means the fleet is clean, and "not planned" would say the report
+        was rejected.
+        """
+        self._write(
+            [
+                "issue", "close", str(number),
+                "-R", repo,
+                *(["--reason", reason] if reason else []),
+            ]
+        )
+
+    def set_issue_labels(
+        self,
+        repo: str,
+        number: int,
+        *,
+        add: Sequence[str] = (),
+        remove: Sequence[str] = (),
+    ) -> None:
+        """Add and remove labels in one call, or do nothing when given neither.
+
+        One call, so a name that does not resolve applies *none* of them. That
+        is the right trade against a half-labelled change — the audit reads
+        these labels as a set and a partial one is a state it has no rule for —
+        but it is only safe if the caller says something when it fails.
+
+        Removing a label the change does not carry is not an error on GitHub;
+        only a label the *repository* does not have is. So a caller can name the
+        full set it wants gone without first reading what is there.
+        """
+        flags = [*_label_flags("--add-label", add), *_label_flags("--remove-label", remove)]
+        if not flags:
+            return
+        self._write(["issue", "edit", str(number), "-R", repo, *flags])
+
+    def list_pull_requests(
+        self,
+        repo: str,
+        *,
+        labels: Sequence[str] = (),
+        state: str = "open",
+        limit: int = CHANGE_PAGE_LIMIT,
+    ) -> list[dict]:
+        """Pull requests carrying every one of `labels`, with `CHANGE_FIELDS`.
+
+        Dictionaries rather than `PullRequest`, because the caller reads
+        `mergedAt` and `closedAt` and a body it parses for a hidden block, none
+        of which that dataclass carries. `CHANGE_FIELDS` is the contract in the
+        meantime and says what a second provider owes.
+
+        `state` reaches the forge unread. `all` is what the audit passes and it
+        matters: a merged pull request whose finding still reproduces is a state
+        the report has to show, and a closed one is what stops the harness
+        re-opening a fix a human rejected.
+
+        Truncation is the caller's to detect, and it must: the pull requests
+        past the ceiling read as "no pull request", so the harness re-opens
+        fixes that already exist. Compare the length against the `limit` you
+        passed.
+        """
+        rows = self._call(
+            [
+                "pr", "list",
+                "-R", repo,
+                *_label_flags("--label", labels),
+                "--state", state,
+                "--json", ",".join(CHANGE_FIELDS),
+                "--limit", str(limit),
+            ]
+        )
+        if not isinstance(rows, list):
+            return []
+        return [row for row in rows if isinstance(row, dict)]
+
+    def pull_request_comments(self, repo: str, number: int) -> list[dict]:
+        """Comments on the pull request, as the forge sent them.
+
+        Dictionaries for the reason `issue_comments` gives.
+        """
+        rows = self._view("pr", number, repo, "comments").get("comments") or []
+        return [row for row in rows if isinstance(row, dict)]
+
+    def comment_on_pull_request(
+        self, repo: str, number: int, *, body: str
+    ) -> None:
+        """`post_comment` by number rather than by `PullRequest`.
+
+        The two exist side by side because their callers hold different things:
+        the conversation sweep has read the pull request and has the object, the
+        audit has a number off a listing and never builds one.
+        """
+        self._write(
+            ["pr", "comment", str(number), "-R", repo, "--body-file", BODY_STDIN],
+            stdin=body,
+        )
+
+    def set_pull_request_labels(
+        self,
+        repo: str,
+        change: int | str,
+        *,
+        add: Sequence[str] = (),
+        remove: Sequence[str] = (),
+    ) -> None:
+        """`set_issue_labels` against a pull request. The same rules apply.
+
+        `change` is a number or a head branch, the two things `gh pr edit`
+        accepts in that position — the same latitude `update_pull_request` has,
+        and for the same caller. A change adopted after `create_pull_request`
+        refused it is known by its branch and nothing else at that moment, and
+        labelling it is not optional: the fleet audit finds its own pull
+        requests by label, so one it opened and did not label is one no later
+        run can see.
+        """
+        flags = [*_label_flags("--add-label", add), *_label_flags("--remove-label", remove)]
+        if not flags:
+            return
+        self._write(["pr", "edit", str(change), "-R", repo, *flags])
+
+    def close_pull_request(self, repo: str, number: int) -> None:
+        """Close without deleting the branch.
+
+        Never `--delete-branch`. The audit closes a pull request when the
+        finding behind it stopped reproducing, and a finding that comes back is
+        pushed to the same branch again — deleting it turns a reopen into a
+        fresh pull request that has lost the review history.
+        """
+        self._write(["pr", "close", str(number), "-R", repo])
+
+
+def _issue_from_row(row: dict) -> Issue:
+    """One `gh issue list` row as an `Issue`.
+
+    Tolerant on the way in: a row missing `number` becomes 0 rather than
+    raising, because the alternative is one malformed entry costing the caller
+    the whole listing.
+    """
+    labels = row.get("labels") or []
+    return Issue(
+        number=int(row.get("number") or 0),
+        url=str(row.get("url") or ""),
+        title=str(row.get("title") or ""),
+        labels=tuple(
+            str(label.get("name") or "") if isinstance(label, dict) else str(label)
+            for label in labels
+        ),
+    )
 
 
 #: Host -> provider, keyed on the parsed host and matched exactly. One forge

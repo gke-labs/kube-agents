@@ -32,7 +32,7 @@ The rosters, with exact cron expressions, enabled state, and prompts, are genera
 
 ### The seven fleet audits
 
-Each audit reads its SOP, executes read-only checks against the fleet, writes a validated findings file, and hands it to the [`fleet-audit`](/kube-agents/skills/) skill's `audit_report.py` helper. The helper owns every git and `gh` operation and renders every body itself — the model never writes one.
+Each audit reads its SOP, executes read-only checks against the fleet, writes a validated findings file, and hands it to the [`fleet-audit`](/kube-agents/skills/) skill's `audit_report.py` helper. The helper owns every git operation and every forge call — issues, pull requests, labels, all of it through the provider in `agents/platform/scripts/forge.py` — and renders every body itself; the model never writes one.
 
 | Job                           | SOP                                  | Audits                                                                     |
 | ----------------------------- | ------------------------------------ | -------------------------------------------------------------------------- |

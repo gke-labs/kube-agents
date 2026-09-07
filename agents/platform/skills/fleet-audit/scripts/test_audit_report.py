@@ -418,11 +418,17 @@ class Recorder:
         self.cwds.append(None if cwd is None else str(cwd))
         self.bodies.append(self._read_body(cmd, stdin))
         joined = " ".join(cmd)
-        for key, code in self.failures.items():
-            if key in joined:
-                if check:
-                    raise CalledProcessError(code, cmd, "", "simulated failure")
-                return CompletedProcess(cmd, code, "", "simulated failure")
+        for key, failure in self.failures.items():
+            if key not in joined:
+                continue
+            # `(code, stderr)` as well as a bare code, because some refusals are
+            # only distinguishable by their text — `gh pr create` reports "a
+            # pull request already exists" with the same exit status as a
+            # protected base, and the caller branches on the wording.
+            code, stderr = failure if isinstance(failure, tuple) else (failure, "simulated failure")
+            if check:
+                raise CalledProcessError(code, cmd, "", stderr)
+            return CompletedProcess(cmd, code, "", stderr)
         if "diff --cached --quiet" in joined:
             return CompletedProcess(cmd, 1 if self.staged else 0, "", "")
         if cmd[:2] == ["git", "symbolic-ref"]:
@@ -4787,6 +4793,44 @@ class TestOpenRemediationPr(HarnessTestCase):
         self.assertEqual(self.harness.gh_calls("pr", "edit"), [])
         self.assertEqual(len(self.harness.gh_calls("pr", "create")), 1)
 
+    def adopt_it(self):
+        """Drive the path where `gh pr create` refuses because one is open.
+
+        Reached when a pull request exists on the branch but the label listing
+        did not return it — the case a reviewer creates by stripping
+        `audit:remediation`, which is on record as having happened to pull
+        requests 34, 35 and 36 in the reference installation.
+        """
+        self.harness.failures = {
+            "pr create": (1, "a pull request for branch already exists")
+        }
+        self.harness.replies = {"pr view": '{"url": "https://github.com/x/y/pull/8"}'}
+        return self.open_it()
+
+    def test_an_adopted_pr_is_labelled_so_a_later_run_can_find_it_again(self):
+        # The whole point of adopting. The audit finds its own pull requests by
+        # label, so one it adopted and did not label is one `list_remediation_prs`
+        # cannot return — and the next run then sees an unfixed finding, pushes
+        # the branch, is refused again, and rewrites the body again, for good,
+        # while reporting the URL each time as a fix it had just published.
+        self.adopt_it()
+        self.assertEqual(
+            self.flag_values("--add-label"),
+            {"agent:audit", f"audit:{AUDIT}", "audit:remediation", "severity:critical"},
+        )
+
+    def test_adoption_edits_the_body_and_returns_the_existing_url(self):
+        url = self.adopt_it()
+        self.assertEqual(url, "https://github.com/x/y/pull/8")
+        self.assertTrue(self.harness.bodies_for("pr", "edit"))
+
+    def test_adoption_names_the_change_by_branch_because_that_is_all_it_has(self):
+        # `create` was refused, so no number came back. Both the body edit and
+        # the label edit have to address the branch.
+        self.adopt_it()
+        for call in self.harness.gh_calls("pr", "edit"):
+            self.assertEqual(call[3], self.branch)
+
 
 class TestOpenRefreshIsUnreachable(BaseTestCase):
     """Why `sync_remediation_labels` alone could not have fixed anything.
@@ -5783,6 +5827,35 @@ class TestRemediateSubcommand(HarnessTestCase):
 # --------------------------------------------------------------------------- #
 
 
+class TestTheForgeSeam(HarnessTestCase):
+    """Every forge call goes through this module's own runner.
+
+    A provider left to build its own reaches `subprocess` directly, and
+    everything this module knows about its own I/O — the command log, the FAILED
+    line, the `cwd` handling, and this entire suite — hangs off `run_cmd`.
+    The failure mode is silent: the publish still works, and stops being
+    observable.
+    """
+
+    def test_the_provider_runs_through_run_cmd_rather_than_around_it(self):
+        forge_module = sys.modules["forge"]
+        with patch.object(forge_module, "run_gh") as never:
+            audit_report.forge_for("acme/fleet").close_issue("acme/fleet", 7)
+        never.assert_not_called()
+        self.assertEqual(
+            self.harness.gh_calls("issue", "close"),
+            [["gh", "issue", "close", "7", "-R", "acme/fleet"]],
+        )
+
+    def test_a_forge_refusal_is_raised_rather_than_returned_as_an_exit_code(self):
+        """`_forge_runner` passes `check=False` so `run_cmd` never raises
+        `CalledProcessError`; one condition with two exception types is what the
+        call sites below are not written for."""
+        self.harness.failures = {"issue close": 1}
+        with self.assertRaises(audit_report.forge.ForgeError):
+            audit_report.forge_for("acme/fleet").close_issue("acme/fleet", 7)
+
+
 class TestFailurePaths(HarnessTestCase):
     def test_a_failed_issue_create_is_fatal(self):
         self.harness.replies = {"issue list": "[]"}
@@ -5793,7 +5866,10 @@ class TestFailurePaths(HarnessTestCase):
 
         self.assertNotEqual(rc, 0)
         self.assertEqual(self.out, "")
-        self.assertIn("subprocess failed with exit code 1", self.err)
+        # The reason code and the exit code both, because they answer different
+        # questions: which layer refused, and what it said while refusing.
+        self.assertIn("FORGE_WRITE_REFUSED", self.err)
+        self.assertIn("exit 1", self.err)
 
     def test_a_failed_issue_edit_is_fatal(self):
         self.harness.replies = {"issue list": self.issue_list()}

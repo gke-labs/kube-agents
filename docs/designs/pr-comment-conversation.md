@@ -169,8 +169,9 @@ exceptions and is fail-open, so such a hook must catch internally and decide exp
 **Status: implemented** as `agents/platform/scripts/forge.py`.
 
 Seven operations are the complete set this feature needs from a forge. They are the original seven;
-`multi-forge-support.md` §4 has since added three more for opening a change, so the class below is
-the PR-conversation subset rather than the whole protocol:
+`multi-forge-support.md` §4 has since added two further groups — opening a change, and the fleet
+audit's issue ledger — so the class below is the PR-conversation subset rather than the whole
+protocol, and by now much the smaller part of it:
 
 ```python
 class ForgeProvider(Protocol):
@@ -705,8 +706,9 @@ Neither is implemented in this change. What is settled is which one this design 
   design owes.
 - **Migrating `resolver.py`, `audit_report.py` and `submit_suggestion.py` onto the forge module.**
   §2 changes the issue resolver's roster entry and adds a gate beside it; `resolver.py` itself is
-  untouched, and is the forge module's obvious next consumer. (`submit_suggestion.py` has since
-  migrated under `multi-forge-support.md` §4, which owns the remaining two.)
+  untouched, and is the forge module's obvious next consumer. (`submit_suggestion.py` and
+  `audit_report.py` have since migrated under `multi-forge-support.md` §4, which owns the one
+  remaining.)
 - **Gating the seven governance watchdogs.** They fire daily or weekly and do real work every time,
   so there is nothing to gate — the token argument does not apply to them.
 

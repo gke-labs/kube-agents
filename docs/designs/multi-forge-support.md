@@ -1,8 +1,8 @@
 # Supporting a Second Forge
 
-> **STATUS — design of record; steps 1 and 2 of §9 are in, step 3 is half in, the rest is not.** No
-> second forge works today. One provider exists (`GitHubProvider`), three consumers use it, two more
-> shell `gh` directly. Repository identity now runs on `repo_ref.py` in Python and `repo_ref.go` in Go, and the
+> **STATUS — design of record; steps 1 and 2 of §9 are in, step 3 is nearly in, the rest is not.** No
+> second forge works today. One provider exists (`GitHubProvider`), four consumers use it, one more
+> shells `gh` directly. Repository identity now runs on `repo_ref.py` in Python and `repo_ref.go` in Go, and the
 > CRD declares the forge in `spec.integration.git` with validation dispatched per provider — but
 > only GitHub is registered, and every layer beneath the declaration is still GitHub-shaped. This
 > document is the plan for the rest, and the order it has to happen in. Each section says what is
@@ -28,8 +28,8 @@ repository lives on GitLab cannot use any of it.
 
 The coupling runs through five layers, each with a different owner and a different cost to unwind:
 
-1. **The consumers.** Five scripts call the forge's API to get work done. Three go through a
-   provider abstraction; two shell `gh` directly, each behind a private runner of its own.
+1. **The consumers.** Five scripts call the forge's API to get work done. Four go through a
+   provider abstraction; `resolver.py` still shells `gh` behind a private runner of its own.
    (`github_token_refresh.py` and `credential_proxy.py` also run `gh`, but for credentials rather
    than for forge work; they are layer 3.)
 2. **Repository identity.** `owner/repo` — exactly two path segments — was asserted in seven places
@@ -61,12 +61,12 @@ forward ahead of layers 1 and 3.
 
 Two things exist and do not need designing again.
 
-**The provider protocol.** `agents/platform/scripts/forge.py` defines `ForgeProvider` as ten
-operations — the original seven that reading and answering a pull-request conversation needs, plus
-the three §4 added for opening one — normalises three GitHub-isms behind them (`can_write` as a boolean rather than
-`author_association`, `supports_acknowledge` as a capability rather than an assumption,
-`normalise_login` folding the spellings one account gets), and funnels every provider call through
-one `_call()` override point. `pr-comment-conversation.md` §3 explains each of those and why live
+**The provider protocol.** `agents/platform/scripts/forge.py` defines `ForgeProvider` in three
+groups — the original set that reading and answering a pull-request conversation needs, the ones §4
+added for opening a change, and the ones the fleet audit's ledger needs — normalises three
+GitHub-isms behind them (`can_write` as a boolean rather than `author_association`,
+`supports_acknowledge` as a capability rather than an assumption, `normalise_login` folding the
+spellings one account gets), and funnels every provider call through one `_call()` override point. `pr-comment-conversation.md` §3 explains each of those and why live
 validation forced two of them; this document does not restate it.
 
 **Provider selection.** `PROVIDERS` is a host-keyed table and `provider_for` reads it. Adding a
@@ -182,7 +182,7 @@ was reached only from tests.
 That was sound while there is one provider and a bare slug means GitHub. It stops being sound at the
 second, because the table becomes load-bearing at exactly the moment a caller starts passing hosts —
 and §4 adds three callers that resolve repositories their own way, of which `submit_suggestion.py`
-has since arrived. So selection parses
+and `audit_report.py` have since arrived. So selection parses
 the host now, an unparseable repository raises `RepoUnparseable`, and a host the table does not know
 raises `UnknownForgeHost` with a reason code, the way every other unresolvable input in this stack
 does. A repository with no host still selects GitHub, which is what the shorthand means until §6
@@ -197,11 +197,20 @@ own, and `submit_suggestion.py` did not even have that, shelling `["gh", …]` i
 sites. A second forge implemented against that `forge.py` therefore bought a reviewer conversation
 and no issue resolution and no audit ledger.
 
-`submit_suggestion.py` is now migrated: the protocol gained `create_pull_request`,
-`update_pull_request`, and `pull_request_url`, and opening a change is provider work. `resolver.py`
-and `audit_report.py` are the two still to move, and each is its own change: `audit_report.py` has
-twenty call sites spanning labels, issues, and pull requests, and `resolver.py`'s runner is under
+`submit_suggestion.py` migrated first: the protocol gained `create_pull_request`,
+`update_pull_request`, and `pull_request_url`, and opening a change became provider work.
+`audit_report.py` followed, moving twenty call sites and adding the ledger group — labels, issues,
+and the bulk pull-request reads the ledger reconciles against. It also
+settled how a provider is wired to a caller that has its own runner: `audit_report.py` injects
+`run_cmd`, so the command log, the FAILED line, and its test suite all keep seeing every forge
+call. `resolver.py` is the one left, and it is its own change because its runner is under
 active rewrite for unrelated reasons.
+
+One thing `audit_report.py` could not take with it. `is_machine_author` — the gate that stops the
+automation issuing itself a `/remediate` — reads `authorAssociation` and `viewerDidAuthor`, and
+`forge.Comment` carries neither, so `issue_comments` and `pull_request_comments` return the forge's
+own dictionaries. Until that dataclass widens, a second provider has to produce GitHub's comment
+shape there. Widening it is a change to a security control and belongs on its own.
 
 Migrating those onto the provider is the step that makes a forge a class rather than four
 rewrites. It is anticipated rather than planned:
@@ -212,11 +221,11 @@ happened by another route — `resolver.py` dropped its own repository parser an
 is about. This design puts the rest on a schedule, and §9 says why that schedule puts it before any
 GitLab code.
 
-The protocol grows to the union of what the four need. Opening a change, editing it, and reading it
-back have landed as the three methods above; what remains is listing and commenting on issues and
-setting labels. The precise list falls out of the migration rather than being guessed here; what
-matters to this design is that it is decided by the callers, not by GitHub's API surface, and that
-harness policy stays above the provider. The existing split is the precedent: the provider answers
+The protocol grows to the union of what the four need, and the list fell out of the migrations
+rather than being guessed: every method on it is there because a caller in this repository had a
+`gh` invocation that had to stop being one. What matters to this design is that it is decided by the
+callers, not by GitHub's API surface, and that harness policy stays above the provider. The existing
+split is the precedent: the provider answers
 "what is open" and the caller answers "which of those are mine", so the branch-prefix and
 `agent:ignore` rules are written once instead of once per forge.
 
@@ -344,8 +353,8 @@ behind a wrapper and the noun taken from configuration.
 The seven governance SOPs name `gh` only to forbid it — "never run `gh issue create`", "the helper
 owns every `git`/`gh` operation" — because `audit_report.py` owns their write path. A prohibition has
 no command to wrap, so the SOP work is smaller and different: the nouns ("pull request", "PR body")
-come from configuration, and the prohibitions get reworded once the helper they defer to is a
-provider rather than `gh`. §4 moves that helper; this step only follows it.
+come from configuration, and the prohibitions get reworded to match a helper that now reaches a
+provider rather than `gh`. §4 has already moved the helper; nothing here has been reworded yet.
 
 `github-issue-resolver`, the skill a reader would expect on the first list, is not on it: its prompt
 names no forge command — only its own `resolver.py` subcommands — and its coupling is entirely in
@@ -433,7 +442,8 @@ The resulting sequence:
    Terraform's actually conditional waits for step 5, for the reason §6 gives. **Landed.**
 3. **The consumer migration** (§4): protocol widened, the three remaining scripts moved onto it.
    Splits naturally by consumer, and does: `submit_suggestion.py` and the three pull-request
-   methods it needed have **landed**; `audit_report.py` and `resolver.py` have not.
+   methods it needed have **landed**, and so has `audit_report.py` with the ledger group.
+   `resolver.py` has not.
 4. **The credential plane** (§5): route, executable allowlist and egress allowlist parameterised,
    and the git credential helper selected per provider — for a CLI-backed forge that is its own
    `setup-git` equivalent, for a proxy-backed one a helper the sidecar serves. Still one provider.

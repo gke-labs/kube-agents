@@ -74,7 +74,7 @@ The cron watchdog invokes the SOP by prompting the agent to read `governance/<so
 - A **skill** is a reusable capability (how to onboard an app, how to submit a PR, how to open and close an audit run).
 - An **SOP** composes skills into a fleet-wide procedure with a policy for when to act.
 
-The division of labour in the seven audits is deliberate: **the SOP decides what is true, the skill decides what happens to it.** The model reasons, runs read-only commands, and emits evidence; `fleet-audit`'s helper owns every `git` and `gh` call and renders every body itself — the stream's ledger issue and the remediation PRs promoted from it. The SOPs forbid hand-writing any of those bodies or invoking git directly, which is what keeps the seven ledgers uniform and their run-to-run deltas computable.
+The division of labour in the seven audits is deliberate: **the SOP decides what is true, the skill decides what happens to it.** The model reasons, runs read-only commands, and emits evidence; `fleet-audit`'s helper owns every `git` call and every forge call — through the provider in `agents/platform/scripts/forge.py` — and renders every body itself — the stream's ledger issue and the remediation PRs promoted from it. The SOPs forbid hand-writing any of those bodies or invoking git directly, which is what keeps the seven ledgers uniform and their run-to-run deltas computable.
 
 The seven audit jobs preload the skill through their cron entry (`"skills": ["fleet-audit"]`). An SOP that needs no preloaded skill can omit the key or leave it empty — the run loads what it needs.
 

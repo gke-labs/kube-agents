@@ -69,6 +69,10 @@ sys.path.append("/opt/defaults/scripts")
 sys.path.append("/opt/data/scripts")
 sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
 
+# Eagerly, unlike the two above: every publish path reaches it, and a name
+# resolved at the top of the module is one a reader can follow.
+import forge  # noqa: E402 — the sys.path entries above are what make it findable
+
 # --------------------------------------------------------------------------- #
 # Constants
 # --------------------------------------------------------------------------- #
@@ -517,10 +521,22 @@ BODY_BUDGET = 60_000
 MAX_SCOPE_ROWS = 60
 MAX_DELTA_ROWS = 50
 
-# `gh pr list` takes a limit, not a cursor. A full page means the oldest
-# remediation branches fell off the end, and a branch that reads as "no pull
-# request exists" is one the harness will force-push over. Detect it and stop.
+# The forge's pull-request listing takes a limit, not a cursor. A full page
+# means the oldest remediation branches fell off the end, and a branch that
+# reads as "no pull request exists" is one the harness will force-push over.
+# Detect it and stop.
 MAX_PR_PAGE = 1000
+
+# How many open ledger issues one stream's label is allowed to match. A stream
+# should have exactly one; more than that is the duplicate case
+# `find_existing_issue` warns about, and this ceiling is high enough to see the
+# duplicates and low enough that a mislabelled repository does not page.
+MAX_LEDGER_PAGE = 20
+
+# Why a ledger the audit closes was closed. The alternative spelling is "not
+# planned", which would say the report was rejected — a closed ledger means the
+# fleet is clean.
+CLOSE_REASON_COMPLETED = "completed"
 
 # Auto-promotion ceiling per `finish` run (design §3.1). An explicit
 # `/remediate` bypasses it: a human asked for that one by name.
@@ -4269,6 +4285,41 @@ def detect_content_mode() -> bool:
             "publishing through the leased clone instead")
         return False
 
+def _forge_runner(
+    argv, *, repo: str | None = None, stdin: str | None = None
+) -> subprocess.CompletedProcess:
+    """Hand the provider's argv to this module's own runner.
+
+    A provider left to itself shells out through `forge.run_gh`, which reaches
+    `subprocess` directly. Everything this module knows about its own I/O hangs
+    off `run_cmd` instead — the command log, the FAILED line, the `cwd`
+    handling, and every test in `test_audit_report.py` — so a provider bypassing
+    it would take all of that with it. Injecting the runner keeps one seam where
+    there would otherwise be two.
+
+    Always `check=False`. The provider reads the exit code itself and raises
+    `forge.ForgeError`; letting `run_cmd` raise `CalledProcessError` first would
+    give one condition two exception types, and the call sites below are written
+    for one.
+
+    `stdin` is forwarded because every body the provider sends travels on fd 0
+    — `forge.BODY_STDIN` says why a path cannot cross the container boundary.
+    `repo` is accepted and dropped: it exists so `forge.run_gh` can name the
+    repository to a credential refresh, and this module refreshes its own.
+    """
+    return run_cmd(["gh"] + list(argv), check=False, stdin=stdin)
+
+
+def forge_for(repo: str) -> forge.ForgeProvider:
+    """The provider for `repo`, wired to this module's runner.
+
+    Built per call rather than cached. A provider holds no connection and no
+    token — `refresh_credentials` writes those into `gh`'s own store — so
+    caching one would save an object allocation and cost the ability to reason
+    about which repository a call went to.
+    """
+    return forge.provider_for(repo, run=_forge_runner)
+
 
 def refresh_credentials(repo: str | None = None) -> None:
     """Mint the short-lived repo-scoped GitHub App token into gh + the git credential store.
@@ -4397,12 +4448,12 @@ def ensure_labels(repo: str, audit_id: str) -> None:
             # Load-bearing, not decorative: `pr_closed_by_harness` reads this
             # label to tell a close the harness made from a close a human made,
             # and that is the whole of the close-semantics decision. It has to
-            # be *created* here because `gh pr edit --add-label` does not create
-            # a missing label — it resolves the name to an id and errors — and
-            # the call site closes with `check=False`. Leave it out and every
-            # harness close lands unlabelled, every close then reads as a human
-            # rejection, and no finding is ever re-proposed after its first
-            # quiet day.
+            # be *created* here because `set_pull_request_labels` does not
+            # create a missing label — the forge resolves the name to an id and
+            # errors — and the call site logs that refusal rather than raising.
+            # Leave it out and every harness close lands unlabelled, every close
+            # then reads as a human rejection, and no finding is ever
+            # re-proposed after its first quiet day.
             STALE_CLOSED_LABEL,
             "C5DEF5",
             # Keep this under GitHub's 100-character description limit. It was
@@ -4418,22 +4469,19 @@ def ensure_labels(repo: str, audit_id: str) -> None:
         ("severity:major", "D93F0B", "Highest audit finding severity: major"),
         ("severity:minor", "FBCA04", "Highest audit finding severity: minor"),
     ]
+    provider = forge_for(repo)
     for name, color, description in labels:
-        gh(
-            [
-                "label",
-                "create",
-                name,
-                "-R",
-                repo,
-                "--color",
-                color,
-                "--description",
-                description,
-                "--force",
-            ],
-            check=False,
-        )
+        try:
+            provider.ensure_label(
+                repo, name=name, color=color, description=description
+            )
+        except forge.ForgeError as exc:
+            # Per label rather than around the loop: a repository can refuse one
+            # name — a colour someone locked, a description over the ceiling —
+            # and the other five are still worth creating. The refusal is logged
+            # because the calls that apply these labels do not fail loudly when
+            # a name is missing; they lose the whole edit and say nothing.
+            log(f"WARNING: could not create or update label `{name}`: {exc.value}")
 
 
 class GitHubLookupError(RuntimeError):
@@ -4456,47 +4504,27 @@ def find_existing_issue(repo: str, audit_id: str) -> tuple[int | None, str | Non
     audit alternates between two ledgers indefinitely. Preferring the higher one
     settles on the ledger everything already points at.
     """
-    res = gh(
-        [
-            "issue",
-            "list",
-            "-R",
-            repo,
-            "--label",
-            f"audit:{audit_id}",
-            "--state",
-            "open",
-            "--json",
-            "number,url",
-            "--limit",
-            "20",
-        ],
-        check=False,
-    )
-    if res.returncode != 0:
+    try:
+        issues = forge_for(repo).list_issues(
+            repo, labels=[f"audit:{audit_id}"], state="open", limit=MAX_LEDGER_PAGE
+        )
+    except forge.ForgeError as exc:
         raise GitHubLookupError(
             f"could not list issues for audit:{audit_id} in {repo} "
-            f"(gh exited {res.returncode}): {(res.stderr or '').strip()[:200]}"
-        )
-    try:
-        issues = json.loads(res.stdout or "[]")
-    except json.JSONDecodeError as exc:
-        raise GitHubLookupError(
-            f"gh issue list returned output that is not JSON: {exc}"
+            f"[{exc.reason}]: {exc.value}"
         ) from exc
-    if not isinstance(issues, list) or not issues:
+    if not issues:
         return None, None
-    issues.sort(key=lambda p: int(p.get("number", 0)))
     chosen = issues[-1]
     if len(issues) > 1:
-        others = ", ".join(f"#{i.get('number')}" for i in issues[:-1])
+        others = ", ".join(f"#{i.number}" for i in issues[:-1])
         log(
             f"WARNING: {len(issues)} open issues carry label audit:{audit_id}; "
-            f"updating #{chosen.get('number')} and leaving {others} alone. "
+            f"updating #{chosen.number} and leaving {others} alone. "
             "Close the duplicates by hand — this harness will not close an issue "
             "it cannot prove it opened."
         )
-    return int(chosen["number"]), chosen.get("url")
+    return chosen.number, chosen.url or None
 
 
 def fetch_issue_body(repo: str, number: int) -> str | None:
@@ -4505,50 +4533,42 @@ def fetch_issue_body(repo: str, number: int) -> str | None:
     None and "" are different answers. An unreadable body means the delta is
     unknowable; treating it as empty would announce every live finding as new.
     """
-    res = gh(["issue", "view", str(number), "-R", repo, "--json", "body"], check=False)
-    if res.returncode != 0:
+    try:
+        return forge_for(repo).issue_body(repo, number)
+    except forge.ForgeError as exc:
+        # Both the unreachable and the unreadable case: either way the delta is
+        # unknowable, and `None` is how this function says so.
         log(
-            f"WARNING: could not read issue #{number} (gh exited {res.returncode}); "
+            f"WARNING: could not read issue #{number} [{exc.reason}]; "
             "skipping the delta comment rather than reporting every finding as new."
         )
-        return None
-    try:
-        return str(json.loads(res.stdout or "{}").get("body") or "")
-    except json.JSONDecodeError:
-        log(f"WARNING: issue #{number} body came back as non-JSON; skipping the delta.")
         return None
 
 
 def fetch_issue_url(repo: str, number: int) -> str | None:
-    res = gh(["issue", "view", str(number), "-R", repo, "--json", "url"], check=False)
-    if res.returncode != 0:
-        return None
     try:
-        return json.loads(res.stdout or "{}").get("url")
-    except json.JSONDecodeError:
+        return forge_for(repo).issue_url(repo, number) or None
+    except forge.ForgeError:
         return None
 
 
 def fetch_issue_comments(repo: str, number: int) -> list[dict]:
     """Comments on the ledger, for `/remediate` parsing. Empty on failure.
 
-    No sub-projection is possible or needed: `gh issue view --json comments`
-    returns a fixed comment struct that already carries `id`, `author`,
-    `authorAssociation`, and the `createdAt` the close-vs-request comparison
-    reads.
+    No sub-projection is possible or needed: the forge returns a fixed comment
+    struct that already carries `id`, `author`, `authorAssociation`, and the
+    `createdAt` the close-vs-request comparison reads. Dictionaries rather than
+    `forge.Comment` for the reason `forge.issue_comments` documents — the
+    machine-author gate reads two fields that dataclass does not carry.
     """
-    res = gh(
-        ["issue", "view", str(number), "-R", repo, "--json", "comments"], check=False
-    )
-    if res.returncode != 0:
-        log(f"WARNING: could not read comments on issue #{number}; treating as none.")
-        return []
     try:
-        comments = json.loads(res.stdout or "{}").get("comments") or []
-    except json.JSONDecodeError:
-        log(f"WARNING: comments on issue #{number} came back as non-JSON.")
+        return forge_for(repo).issue_comments(repo, number)
+    except forge.ForgeError as exc:
+        log(
+            f"WARNING: could not read comments on issue #{number} "
+            f"[{exc.reason}]; treating as none."
+        )
         return []
-    return [c for c in comments if isinstance(c, dict)]
 
 
 # Every `gh` flag below that used to name a file now names `-`, and the document
@@ -4573,19 +4593,18 @@ def apply_severity_label(repo: str, number: int, findings: list[dict]) -> None:
     highest = next((s for s in SEVERITIES if counts[s]), None)
     if highest is None:
         return
-    args = [
-        "issue",
-        "edit",
-        str(number),
-        "-R",
-        repo,
-        "--add-label",
-        f"severity:{highest}",
-    ]
-    for severity in SEVERITIES:
-        if severity != highest:
-            args += ["--remove-label", f"severity:{severity}"]
-    gh(args, check=False)
+    try:
+        forge_for(repo).set_issue_labels(
+            repo,
+            number,
+            add=[f"severity:{highest}"],
+            remove=[f"severity:{s}" for s in SEVERITIES if s != highest],
+        )
+    except forge.ForgeError as exc:
+        # A severity label is worth less than the ledger it sits on. Losing it
+        # costs triage a sort key for a day; aborting here would cost the run
+        # every step that follows.
+        log(f"WARNING: could not set the severity label on #{number}: {exc.value}")
 
 
 def post_comment(repo: str, number: int, text: str, *, what: str) -> None:
@@ -4595,33 +4614,23 @@ def post_comment(repo: str, number: int, text: str, *, what: str) -> None:
     close sat outside the try/finally. A comment is a courtesy; the state
     change is the point.
     """
-    res = gh(
-        # `--body-file` rather than the `-F` short form it replaces: the shim
-        # decides whether to forward fd 0 by matching the flag, and its list is
-        # deliberately short. A one-letter flag is the kind that means something
-        # else to another tool, so the long spelling is the one to widen it to.
-        ["issue", "comment", str(number), "-R", repo, "--body-file", BODY_STDIN],
-        check=False,
-        stdin=text,
-    )
-    if res.returncode != 0:
+    try:
+        forge_for(repo).comment_on_issue(repo, number, body=text)
+    except forge.ForgeError as exc:
         log(
             f"WARNING: could not post the {what} on #{number} "
-            f"(gh exited {res.returncode}); continuing."
+            f"[{exc.reason}]; continuing."
         )
 
 
 def post_pr_comment(repo: str, number: int, text: str, *, what: str) -> None:
-    """`gh pr comment`, with the same log-and-continue posture as post_comment."""
-    res = gh(
-        ["pr", "comment", str(number), "-R", repo, "--body-file", BODY_STDIN],
-        check=False,
-        stdin=text,
-    )
-    if res.returncode != 0:
+    """A comment on a pull request, with the same log-and-continue posture."""
+    try:
+        forge_for(repo).comment_on_pull_request(repo, number, body=text)
+    except forge.ForgeError as exc:
         log(
             f"WARNING: could not post the {what} on PR #{number} "
-            f"(gh exited {res.returncode}); continuing."
+            f"[{exc.reason}]; continuing."
         )
 
 
@@ -4637,44 +4646,25 @@ def list_remediation_prs(repo: str, audit_id: str) -> list[dict]:
     reproduces is a state the report has to be able to show, and a closed one
     is what stops the harness re-opening a fix a human rejected.
 
-    `labels` is in the projection because the close-semantics rule needs it —
+    Two of the fields `forge.CHANGE_FIELDS` projects are here for this function
+    in particular. `labels` carries the close-semantics rule —
     `audit:stale-closed` is what tells a close the harness made from a close a
-    human made, and asking for it here costs nothing over the request already
-    being sent. `closedAt` is there for the other half of the same rule: a
-    `/remediate` only overrules a human close if it was written after it, and
-    that comparison needs a time on both sides.
+    human made. `closedAt` is the other half of it: a `/remediate` only
+    overrules a human close if it was written after it, and that comparison
+    needs a time on both sides.
     """
-    res = gh(
-        [
-            "pr",
-            "list",
-            "-R",
+    try:
+        prs = forge_for(repo).list_pull_requests(
             repo,
-            "--label",
-            f"audit:{audit_id}",
-            "--label",
-            "audit:remediation",
-            "--state",
-            "all",
-            "--json",
-            "number,headRefName,state,mergedAt,closedAt,url,body,labels",
-            "--limit",
-            str(MAX_PR_PAGE),
-        ],
-        check=False,
-    )
-    if res.returncode != 0:
+            labels=[f"audit:{audit_id}", "audit:remediation"],
+            state="all",
+            limit=MAX_PR_PAGE,
+        )
+    except forge.ForgeError as exc:
         raise GitHubLookupError(
             f"could not list remediation pull requests for audit:{audit_id} in "
-            f"{repo} (gh exited {res.returncode}): {(res.stderr or '').strip()[:200]}"
-        )
-    try:
-        prs = json.loads(res.stdout or "[]")
-    except json.JSONDecodeError as exc:
-        raise GitHubLookupError(
-            f"gh pr list returned output that is not JSON: {exc}"
+            f"{repo} [{exc.reason}]: {exc.value}"
         ) from exc
-    prs = [p for p in prs if isinstance(p, dict)]
     if len(prs) >= MAX_PR_PAGE:
         # A silently truncated page is the worst possible answer here: the
         # missing pull requests read as "no pull request", so the harness
@@ -4726,9 +4716,16 @@ def snapshot_paths(root: Path, paths: list[str]) -> dict[str, bytes]:
 
 
 def sync_remediation_labels(
-    repo: str, number: str, audit_id: str, highest: str
+    repo: str, change: str, audit_id: str, highest: str
 ) -> None:
     """Re-assert the four labels on a remediation pull request that already exists.
+
+    `change` is a pull request number or the head branch, whichever the caller
+    holds — `gh pr edit` takes either. The adoption path in
+    `open_remediation_pr` only ever has the branch, and it is the path where
+    losing the labels does the most damage, because an unlabelled pull request
+    is one `list_remediation_prs` cannot return and therefore one every later
+    run re-adopts and re-pushes forever.
 
     `gh pr create` carries the labels for a *new* pull request, and until this
     function nothing carried them for an existing one — a later run reads that
@@ -4743,45 +4740,38 @@ def sync_remediation_labels(
     minor to critical otherwise keeps the label it was opened with — the one
     field triage sorts on, silently stale.
 
-    A second call rather than more flags on `open_remediation_pr`'s own
-    `gh pr edit`, and `check=False`, because a label is worth less than the body
-    it would otherwise take down with it: on a repository whose labels someone
-    deleted by hand, folding these into the first call would abort the entire
-    remediation half of the run. The `--remove-label` for the two severities
-    that do not apply resolves even when the pull request never carried them —
-    `ensure_labels` creates all three at the top of every path that reaches
-    here, and `gh` only objects to a label the *repository* does not have.
+    A second call rather than more flags on the edit `open_remediation_pr`
+    already makes, and a logged refusal rather than a raised one, because a
+    label is worth less than the body it would otherwise take down with it: on a
+    repository whose labels someone deleted by hand, folding these into the
+    first call would abort the entire remediation half of the run. Removing the
+    two severities that do not apply resolves even when the pull request never
+    carried them — `ensure_labels` creates all three at the top of every path
+    that reaches here, and the forge only objects to a label the *repository*
+    does not have.
 
-    One `gh` call sets all six, so a single unresolvable name applies *none* of
-    them. That is the right trade against a partly-labelled pull request, but it
-    is only safe if it is audible: a silent no-op here looks exactly like a
-    refresh that had nothing to change, and the labelling gap this function
-    exists to close went unnoticed for months for want of a line in the log.
+    One call sets all six, so a single unresolvable name applies *none* of them.
+    That is the right trade against a partly-labelled pull request, but it is
+    only safe if it is audible: a silent no-op here looks exactly like a refresh
+    that had nothing to change, and the labelling gap this function exists to
+    close went unnoticed for months for want of a line in the log.
     """
-    args = [
-        "pr",
-        "edit",
-        number,
-        "-R",
-        repo,
-        "--add-label",
-        "agent:audit",
-        "--add-label",
-        f"audit:{audit_id}",
-        "--add-label",
-        "audit:remediation",
-        "--add-label",
-        f"severity:{highest}",
-    ]
-    for severity in SEVERITIES:
-        if severity != highest:
-            args += ["--remove-label", f"severity:{severity}"]
-    res = gh(args, check=False)
-    if res.returncode != 0:
+    try:
+        forge_for(repo).set_pull_request_labels(
+            repo,
+            change,
+            add=[
+                "agent:audit",
+                f"audit:{audit_id}",
+                "audit:remediation",
+                f"severity:{highest}",
+            ],
+            remove=[f"severity:{s}" for s in SEVERITIES if s != highest],
+        )
+    except forge.ForgeError as exc:
         log(
-            f"#{number}: could not re-apply the audit labels "
-            f"(gh exited {res.returncode}): "
-            f"{(res.stderr or res.stdout or '').strip() or 'no output'}"
+            f"{change}: could not re-apply the audit labels "
+            f"[{exc.reason}]: {exc.value or 'no output'}"
         )
 
 
@@ -4816,7 +4806,7 @@ def sync_open_remediation_labels(
     deliberate promise — a reviewer's commits stay where they are — and
     re-labelling keeps it while still repairing the field triage sorts on. When
     the labels are already right the call is a no-op, so a steady fleet pays one
-    `gh` call per open remediation pull request per run and changes nothing.
+    forge call per open remediation pull request per run and changes nothing.
 
     One call per pull request rather than per finding, since a group's findings
     all resolve to the same one.
@@ -4999,52 +4989,50 @@ def open_remediation_pr(
     highest = next(
         (s for s in SEVERITIES if severity_counts(group)[s]), SEVERITIES[-1]
     )
+    provider = forge_for(repo)
     if existing and str(existing.get("state", "")).upper() == "OPEN":
         number = str(existing["number"])
-        gh(
-            [
-                "pr",
-                "edit",
-                number,
-                "-R",
-                repo,
-                "--title",
-                title,
-                "--body-file",
-                BODY_STDIN,
-            ],
-            stdin=body,
+        provider.update_pull_request(
+            repo, number=int(number), title=title, body=body
         )
         sync_remediation_labels(repo, number, audit_id, highest)
         return str(existing.get("url") or "")
-    res = gh(
-        [
-            "pr",
-            "create",
-            "-R",
+    try:
+        url = provider.create_pull_request(
             repo,
-            "--base",
-            base,
-            "--head",
-            branch,
-            "--title",
-            title,
-            "--body-file",
-            BODY_STDIN,
-            "--label",
-            "agent:audit",
-            "--label",
-            f"audit:{audit_id}",
-            "--label",
-            "audit:remediation",
-            "--label",
-            f"severity:{highest}",
-        ],
-        stdin=body,
-    )
+            head=branch,
+            base=base,
+            title=title,
+            body=body,
+            labels=[
+                "agent:audit",
+                f"audit:{audit_id}",
+                "audit:remediation",
+                f"severity:{highest}",
+            ],
+        )
+    except forge.PullRequestExists:
+        # The branch already has an open pull request the label listing did
+        # not return — someone stripped `audit:remediation`, or the listing
+        # ran before it was labelled. Adopt it rather than failing the run:
+        # the commits have just been pushed to that branch, so the pull
+        # request already describes this work whatever its labels say.
+        log(f"{branch}: a pull request is already open; updating it in place.")
+        provider.update_pull_request(
+            repo, head=branch, title=title, body=body
+        )
+        # Labelling it is what makes the adoption converge. `create` carries
+        # the labels for a pull request it opens; this branch reaches an
+        # existing one, and the reason it is here at all is usually that the
+        # labels are missing. Leaving them off would put the pull request
+        # back outside `list_remediation_prs`, so the next run would find the
+        # finding unfixed, force-push the branch, be refused again, and
+        # rewrite the body again — every run, for good, while reporting the
+        # URL as a fix it had just published.
+        sync_remediation_labels(repo, branch, audit_id, highest)
+        url = provider.pull_request_url(repo, head=branch)
 
-    lines = [ln for ln in (res.stdout or "").strip().splitlines() if ln.strip()]
-    return lines[-1] if lines else None
+    return url or None
 
 
 def close_stale_remediation_prs(
@@ -5080,6 +5068,7 @@ def close_stale_remediation_prs(
     announcement happened, not that the pull request shut.
     """
     closed: list[str] = []
+    provider = forge_for(repo)
     branch_by_finding = branch_by_finding or {}
     live_branches = set(branch_by_finding.values())
     for pr in prs:
@@ -5167,11 +5156,11 @@ def close_stale_remediation_prs(
         # A labelled pull request that is still open, by contrast, costs one
         # line of noise and is fixed on the next run.
         if STALE_CLOSED_LABEL not in pr_labels(pr):
-            res = gh(
-                ["pr", "edit", str(number), "-R", repo, "--add-label", STALE_CLOSED_LABEL],
-                check=False,
-            )
-            if res.returncode != 0:
+            try:
+                provider.set_pull_request_labels(
+                    repo, number, add=[STALE_CLOSED_LABEL]
+                )
+            except forge.ForgeError:
                 log(
                     f"WARNING: could not label PR #{number} as `{STALE_CLOSED_LABEL}`; "
                     "leaving it open. Closing it unlabelled would read as a human "
@@ -5193,9 +5182,10 @@ def close_stale_remediation_prs(
                 ),
                 what="stale-close comment",
             )
-        # Never --delete-branch: a returning finding pushes to this branch again.
-        res = gh(["pr", "close", str(number), "-R", repo], check=False)
-        if res.returncode != 0:
+        # The branch outlives the close; `close_pull_request` says why.
+        try:
+            provider.close_pull_request(repo, number)
+        except forge.ForgeError:
             # Reporting a close that did not happen is how a run's own summary
             # stops describing the repository.
             log(f"WARNING: could not close PR #{number}; it stays open.")
@@ -5242,15 +5232,11 @@ def comment_on_merged_but_persisting(
 
 
 def fetch_pr_comments(repo: str, number: int) -> list[dict]:
-    res = gh(["pr", "view", str(number), "-R", repo, "--json", "comments"], check=False)
-    if res.returncode != 0:
+    try:
+        return forge_for(repo).pull_request_comments(repo, number)
+    except forge.ForgeError:
         log(f"WARNING: could not read comments on PR #{number}; treating as none.")
         return []
-    try:
-        comments = json.loads(res.stdout or "{}").get("comments") or []
-    except json.JSONDecodeError:
-        return []
-    return [c for c in comments if isinstance(c, dict)]
 
 
 def reply_to_refusals(
@@ -5862,7 +5848,14 @@ def _open_promoted_prs(
                     existing=pr_by_finding.get(fid),
                     generated_at=generated_at,
                 )
-            except (subprocess.CalledProcessError, ValidationError) as exc:
+            except (
+                subprocess.CalledProcessError,
+                forge.ForgeError,
+                ValidationError,
+            ) as exc:
+                # `CalledProcessError` still, because the git half of
+                # `open_remediation_pr` — fetch, checkout, commit, push — is not
+                # a forge call and raises it. `ForgeError` is the other half.
                 log(f"WARNING: could not publish the fix for {fid}: {exc}")
                 continue
             if url:
@@ -6220,16 +6213,8 @@ def handle_finish(args: argparse.Namespace) -> None:
             )
             # Completed, not "not planned": a closed ledger means the fleet is
             # clean, never that the report was rejected.
-            gh(
-                [
-                    "issue",
-                    "close",
-                    str(existing_issue),
-                    "-R",
-                    repo,
-                    "--reason",
-                    "completed",
-                ]
+            forge_for(repo).close_issue(
+                repo, existing_issue, reason=CLOSE_REASON_COMPLETED
             )
             log(f"Audit {audit_id} is clean; closed issue #{existing_issue}.")
         elif gaps:
@@ -6243,25 +6228,15 @@ def handle_finish(args: argparse.Namespace) -> None:
             # before. Open one: an audit that cannot speak for the fleet has
             # something to say, and it must land somewhere durable.
             rendered = render_issue_body(data, generated_at=now, audit_id=audit_id)
-            res = gh(
-                [
-                    "issue",
-                    "create",
-                    "-R",
+            existing_url = (
+                forge_for(repo).create_issue(
                     repo,
-                    "--title",
-                    coverage_issue_title(audit_id, gaps),
-                    "--body-file",
-                    BODY_STDIN,
-                    "--label",
-                    "agent:audit",
-                    "--label",
-                    f"audit:{audit_id}",
-                ],
-                stdin=rendered.body,
+                    title=coverage_issue_title(audit_id, gaps),
+                    body=rendered.body,
+                    labels=["agent:audit", f"audit:{audit_id}"],
+                )
+                or None
             )
-            lines = [ln for ln in (res.stdout or "").strip().splitlines() if ln.strip()]
-            existing_url = lines[-1] if lines else None
             log(
                 f"Audit {audit_id} found nothing and had no ledger, but "
                 f"{len(gaps)} coverage gap(s) mean it cannot speak for the "
@@ -6353,46 +6328,24 @@ def handle_finish(args: argparse.Namespace) -> None:
     new_ids, resolved_ids = compute_delta(
         previous_ids, rendered.rendered_ids, current_ids
     )
+    provider = forge_for(repo)
     if existing_issue is None:
-        res = gh(
-            [
-                "issue",
-                "create",
-                "-R",
+        issue_url = (
+            provider.create_issue(
                 repo,
-                "--title",
-                title,
-                "--body-file",
-                BODY_STDIN,
-                "--label",
-                "agent:audit",
-                "--label",
-                f"audit:{audit_id}",
-            ],
-            stdin=rendered.body,
+                title=title,
+                body=rendered.body,
+                labels=["agent:audit", f"audit:{audit_id}"],
+            )
+            or None
         )
         status = "OPENED"
-        lines = [ln for ln in (res.stdout or "").strip().splitlines() if ln.strip()]
-        issue_url = lines[-1] if lines else None
         number = None
         if issue_url:
             tail = issue_url.rstrip("/").rsplit("/", 1)[-1]
             number = int(tail) if tail.isdigit() else None
     else:
-        gh(
-            [
-                "issue",
-                "edit",
-                str(existing_issue),
-                "-R",
-                repo,
-                "--title",
-                title,
-                "--body-file",
-                BODY_STDIN,
-            ],
-            stdin=rendered.body,
-        )
+        provider.update_issue(repo, existing_issue, title=title, body=rendered.body)
         status = "UPDATED"
         number = existing_issue
         issue_url = existing_url or fetch_issue_url(repo, existing_issue)
@@ -6464,11 +6417,17 @@ def handle_finish(args: argparse.Namespace) -> None:
                 pr_urls=pr_urls,
                 withheld=plan.withheld,
             ).body
-            gh(
-                ["issue", "edit", str(number), "-R", repo, "--body-file", BODY_STDIN],
-                stdin=relink,
-                check=False,
-            )
+            try:
+                # No title: the one already there carries this run's finding
+                # counts, and this pass only adds the pull-request links.
+                provider.update_issue(repo, number, body=relink)
+            except forge.ForgeError as exc:
+                # The ledger is already published and correct apart from the
+                # links; a reader gets them tomorrow rather than not at all.
+                log(
+                    "WARNING: could not re-link the pull requests on "
+                    f"#{number}: {exc.value}"
+                )
 
     # A command that succeeds silently is indistinguishable from one that was
     # never read, so every accepted `/remediate` gets an answer naming what it
@@ -6754,6 +6713,14 @@ def main(argv: list[str] | None = None) -> int:
     except ValidationError as exc:
         log(f"FINDINGS REJECTED: {exc}")
         return 2
+    except forge.ForgeError as exc:
+        # Ahead of the generic handler so the reason code survives. The value
+        # carries the exit code and both streams, which for a refused write is
+        # the whole diagnosis; `FATAL: {exc}` would print the class name.
+        log(f"FATAL: the forge refused the request [{exc.reason}]")
+        if exc.value:
+            log(f"Detail: {exc.value}")
+        return 1
     except subprocess.CalledProcessError as exc:
         log(f"FATAL: subprocess failed with exit code {exc.returncode}")
         return 1

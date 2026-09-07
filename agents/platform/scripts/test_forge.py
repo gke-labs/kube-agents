@@ -26,6 +26,7 @@ Four properties carry most of the weight:
   `test_repo_ref.py`'s subject, not this file's.
 """
 
+import dataclasses
 import importlib.util
 import json
 import os
@@ -1448,6 +1449,263 @@ class ProtocolConformanceTest(unittest.TestCase):
                 hasattr(forge.GitHubProvider, name),
                 f"ForgeProvider declares {name}, GitHubProvider does not have it",
             )
+
+
+class LabelFlagTest(unittest.TestCase):
+    def test_each_name_gets_its_own_flag(self):
+        self.assertEqual(
+            forge._label_flags("--label", ["a", "b"]),
+            ["--label", "a", "--label", "b"],
+        )
+
+    def test_a_blank_name_is_dropped_rather_than_sent_as_an_empty_label(self):
+        """`--label ""` is a 422 that fails the whole call, so the labels that
+        were valid go on nothing — and on a create path nothing is opened."""
+        self.assertEqual(
+            forge._label_flags("--label", ["a", "", None, "b"]),
+            ["--label", "a", "--label", "b"],
+        )
+
+    def test_no_names_means_no_flags(self):
+        self.assertEqual(forge._label_flags("--label", []), [])
+
+
+class SelectorTest(unittest.TestCase):
+    def test_a_head_is_passed_through(self):
+        self.assertEqual(forge._selector(head="topic"), "topic")
+
+    def test_a_number_becomes_its_string(self):
+        self.assertEqual(forge._selector(number=7), "7")
+
+    def test_naming_a_change_twice_is_a_programming_error_not_a_forge_one(self):
+        """`ValueError` rather than `ForgeError`: a caller catching the latter to
+        log and continue would swallow the bug into a warning."""
+        with self.assertRaises(ValueError):
+            forge._selector(head="topic", number=7)
+        with self.assertRaises(ValueError):
+            forge._selector()
+
+
+class LastLineTest(unittest.TestCase):
+    def test_a_notice_before_the_url_does_not_end_up_in_the_answer(self):
+        """`gh` puts version notices and credential-refresh lines on the same
+        stream as the address it just created."""
+        self.assertEqual(
+            forge._last_line("A new release of gh is available\nhttps://x/pull/1\n"),
+            "https://x/pull/1",
+        )
+
+    def test_no_output_is_the_empty_string(self):
+        self.assertEqual(forge._last_line(""), "")
+        self.assertEqual(forge._last_line(None), "")
+
+
+class LedgerReadTest(unittest.TestCase):
+    """The issue and pull-request reads the fleet audit runs on."""
+
+    def test_issues_come_back_lowest_number_first(self):
+        """Sorted here so a caller choosing between duplicates does not have to
+        trust the forge's order; `find_existing_issue` takes the last."""
+        gh = FakeGh(
+            default=(
+                0,
+                json.dumps(
+                    [
+                        {"number": 9, "url": "u9"},
+                        {"number": 2, "url": "u2"},
+                    ]
+                ),
+                "",
+            )
+        )
+        issues = forge.GitHubProvider(run=gh).list_issues("o/r", labels=["audit:x"])
+        self.assertEqual([i.number for i in issues], [2, 9])
+        self.assertEqual(issues[-1].url, "u9")
+
+    def test_each_label_is_its_own_flag_so_the_match_is_a_conjunction(self):
+        gh = FakeGh(default=(0, "[]", ""))
+        forge.GitHubProvider(run=gh).list_pull_requests(
+            "o/r", labels=["audit:x", "audit:remediation"], state="all"
+        )
+        argv = gh.argv_containing("pr list")
+        self.assertEqual(argv.count("--label"), 2)
+        self.assertIn("audit:remediation", argv)
+
+    def test_the_pull_request_projection_is_the_declared_contract(self):
+        """A provider and a caller agreeing on key names by coincidence is the
+        failure `CHANGE_FIELDS` exists to stop."""
+        gh = FakeGh(default=(0, "[]", ""))
+        forge.GitHubProvider(run=gh).list_pull_requests("o/r")
+        argv = gh.argv_containing("pr list")
+        self.assertEqual(argv[argv.index("--json") + 1], ",".join(forge.CHANGE_FIELDS))
+
+    def test_the_issue_projection_is_the_declared_contract(self):
+        gh = FakeGh(default=(0, "[]", ""))
+        forge.GitHubProvider(run=gh).list_issues("o/r")
+        argv = gh.argv_containing("issue list")
+        self.assertEqual(argv[argv.index("--json") + 1], ",".join(forge.ISSUE_FIELDS))
+
+    def test_a_listing_never_asks_for_bodies(self):
+        """Twenty rendered audit reports is the largest thing the forge could
+        send, and `""` for the one it did not is indistinguishable from a ledger
+        with nothing in it — which reads as "every finding is new"."""
+        self.assertNotIn("body", forge.ISSUE_FIELDS)
+        self.assertNotIn("body", {f.name for f in dataclasses.fields(forge.Issue)})
+
+    def test_a_row_that_is_not_an_object_is_dropped_rather_than_raising(self):
+        gh = FakeGh(default=(0, json.dumps([{"number": 1}, "junk"]), ""))
+        self.assertEqual(len(forge.GitHubProvider(run=gh).list_pull_requests("o/r")), 1)
+
+    def test_an_unreadable_body_raises_rather_than_reading_as_empty(self):
+        """"The ledger is empty" and "the ledger could not be read" lead to
+        opposite decisions: the first announces every finding as new."""
+        gh = FakeGh(default=(1, "", "boom"))
+        with self.assertRaises(forge.ForgeError):
+            forge.GitHubProvider(run=gh).issue_body("o/r", 4)
+
+    def test_an_empty_body_is_the_empty_string(self):
+        gh = FakeGh(default=(0, json.dumps({"body": ""}), ""))
+        self.assertEqual(forge.GitHubProvider(run=gh).issue_body("o/r", 4), "")
+
+    def test_comments_come_back_as_the_forge_sent_them(self):
+        """Dictionaries, not `Comment`: the machine-author gate reads
+        `authorAssociation` and `viewerDidAuthor`, which that dataclass lacks."""
+        row = {"author": {"login": "someone"}, "authorAssociation": "NONE"}
+        gh = FakeGh(default=(0, json.dumps({"comments": [row, 7]}), ""))
+        self.assertEqual(
+            forge.GitHubProvider(run=gh).issue_comments("o/r", 4), [row]
+        )
+
+
+class LedgerWriteTest(unittest.TestCase):
+    def test_a_refused_write_is_not_reported_as_an_unreachable_repository(self):
+        """Every caller has already read this repository over this credential in
+        this run, so unreachability is the one answer ruled out."""
+        gh = FakeGh(default=(1, "", "422 label description too long"))
+        with self.assertRaises(forge.ForgeError) as caught:
+            forge.GitHubProvider(run=gh).ensure_label(
+                "o/r", name="n", color="c", description="d"
+            )
+        self.assertEqual(caught.exception.reason, forge.REASON_WRITE_REFUSED)
+        self.assertIn("exit 1", caught.exception.value)
+
+    def test_labels_are_created_with_force_so_the_call_repairs_as_well_as_creates(self):
+        gh = FakeGh(default=(0, "", ""))
+        forge.GitHubProvider(run=gh).ensure_label(
+            "o/r", name="audit:x", color="C5DEF5", description="d"
+        )
+        self.assertIn("--force", gh.argv_containing("label create"))
+
+    def test_adds_and_removes_travel_in_one_call(self):
+        """One call, so a name that does not resolve applies none of them —
+        a half-labelled change is a state the audit has no rule for."""
+        gh = FakeGh(default=(0, "", ""))
+        forge.GitHubProvider(run=gh).set_pull_request_labels(
+            "o/r", 8, add=["severity:major"], remove=["severity:minor"]
+        )
+        self.assertEqual(len(gh.calls), 1)
+        argv = gh.calls[0]
+        self.assertIn("--add-label", argv)
+        self.assertIn("--remove-label", argv)
+
+    def test_a_change_can_be_labelled_by_branch_as_well_as_by_number(self):
+        """A pull request adopted after `create_pull_request` was refused is
+        known by its branch and nothing else, and labelling it is what lets a
+        later run find it again."""
+        gh = FakeGh(default=(0, "", ""))
+        forge.GitHubProvider(run=gh).set_pull_request_labels(
+            "o/r", "platform-agent/fix-x", add=["agent:audit"]
+        )
+        self.assertEqual(gh.calls[0][:3], ["pr", "edit", "platform-agent/fix-x"])
+
+    def test_setting_no_labels_reaches_the_forge_not_at_all(self):
+        """A bare `pr edit` with no flags is a call that can still fail, and
+        failing it would abort a close the labels were not blocking."""
+        gh = FakeGh(default=(0, "", ""))
+        forge.GitHubProvider(run=gh).set_issue_labels("o/r", 8)
+        self.assertEqual(gh.calls, [])
+
+    def test_an_issue_edit_without_a_title_leaves_the_existing_one_alone(self):
+        """The re-link pass must not touch a title carrying finding counts that
+        were correct when they were written."""
+        gh = FakeGh(default=(0, "", ""))
+        forge.GitHubProvider(run=gh).update_issue("o/r", 4, body="the body")
+        self.assertNotIn("--title", gh.argv_containing("issue edit"))
+
+    def test_a_close_carries_the_reason_it_was_given(self):
+        gh = FakeGh(default=(0, "", ""))
+        forge.GitHubProvider(run=gh).close_issue("o/r", 4, reason="completed")
+        argv = gh.argv_containing("issue close")
+        self.assertEqual(argv[argv.index("--reason") + 1], "completed")
+
+    def test_closing_a_pull_request_never_deletes_its_branch(self):
+        """A finding that comes back is pushed to the same branch; deleting it
+        turns a reopen into a fresh pull request with no review history."""
+        gh = FakeGh(default=(0, "", ""))
+        forge.GitHubProvider(run=gh).close_pull_request("o/r", 8)
+        self.assertNotIn("--delete-branch", gh.argv_containing("pr close"))
+
+    def test_creating_a_pull_request_applies_its_labels_in_the_same_call(self):
+        """Two calls would leave a change briefly visible without the labels the
+        close-semantics rule reads, and a crash between them permanently so."""
+        gh = FakeGh(default=(0, "https://x/pull/1", ""))
+        forge.GitHubProvider(run=gh).create_pull_request(
+            "o/r",
+            head="h",
+            base="main",
+            title="t",
+            body="the body",
+            labels=["agent:audit", "audit:remediation"],
+        )
+        self.assertEqual(len(gh.calls), 1)
+        self.assertEqual(gh.calls[0].count("--label"), 2)
+
+    def test_an_issue_url_survives_a_notice_printed_before_it(self):
+        gh = FakeGh(default=(0, "A new release of gh\nhttps://x/issues/7\n", ""))
+        self.assertEqual(
+            forge.GitHubProvider(run=gh).create_issue("o/r", title="t", body="the body"),
+            "https://x/issues/7",
+        )
+
+    def test_an_open_change_can_be_named_by_number_as_well_as_by_branch(self):
+        """The two callers hold different halves: a branch just pushed, or a
+        number off a listing."""
+        gh = FakeGh(default=(0, "", ""))
+        provider = forge.GitHubProvider(run=gh)
+        provider.update_pull_request("o/r", number=8, title="t", body="the body")
+        self.assertEqual(gh.calls[0][:3], ["pr", "edit", "8"])
+        provider.update_pull_request("o/r", head="topic", title="t", body="the body")
+        self.assertEqual(gh.calls[1][:3], ["pr", "edit", "topic"])
+
+    def test_every_ledger_body_travels_on_fd_zero(self):
+        """Never a path. The audit runs in the sandbox and `gh` runs in the
+        broker, two containers with two filesystems since #913, so a file this
+        process writes is not one the reader can open — and each of these calls
+        fails *after* the state change it was reporting on."""
+        for fragment, call in (
+            ("issue create", lambda p: p.create_issue("o/r", title="t", body="B")),
+            ("issue edit", lambda p: p.update_issue("o/r", 4, body="B")),
+            ("issue comment", lambda p: p.comment_on_issue("o/r", 4, body="B")),
+            ("pr comment", lambda p: p.comment_on_pull_request("o/r", 8, body="B")),
+            (
+                "pr create",
+                lambda p: p.create_pull_request(
+                    "o/r", head="h", base="main", title="t", body="B"
+                ),
+            ),
+            (
+                "pr edit",
+                lambda p: p.update_pull_request("o/r", number=8, title="t", body="B"),
+            ),
+        ):
+            with self.subTest(call=fragment):
+                gh = FakeGh(default=(0, "https://x/1", ""))
+                call(forge.GitHubProvider(run=gh))
+                argv = gh.argv_containing(fragment)
+                self.assertEqual(
+                    argv[argv.index("--body-file") + 1], forge.BODY_STDIN
+                )
+                self.assertEqual(gh.stdin_of(fragment), "B")
 
 
 if __name__ == "__main__":
