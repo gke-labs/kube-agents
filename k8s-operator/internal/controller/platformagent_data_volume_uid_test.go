@@ -147,9 +147,17 @@ func dataVolumeTestAgent() *agentv1alpha1.PlatformAgent {
 }
 
 // dataVolumeEveryComponentAgent turns on what the default CR leaves off: mode
-// next for the A2A pods, the shell sandbox, and a second claim on the gateway
-// pod — RWO custom storage, which the walk must tell apart from the agent's own
-// claim.
+// next for the A2A pods, the shell sandbox, and a third claim on the gateway
+// pod for the walk to tell apart from the agent's own.
+//
+// Two storages, because only one of them reaches the pod. Replicas above 1
+// beside RWO storage is what makes useStatefulSet true, and
+// buildCustomStorageVolumes then skips every RWO storage: the StatefulSet
+// reaches it through a volumeClaimTemplate, which is not a claim volume source
+// and so is invisible to volumesBackedByClaim. That skip is keyed on the CR
+// rather than on the calling builder, so it applies to the one pod template
+// both gateway builders share. `shared` is ReadWriteMany, is not skipped, and
+// is what actually puts a second claim name in front of the filter.
 func dataVolumeEveryComponentAgent() *agentv1alpha1.PlatformAgent {
 	agent := dataVolumeTestAgent()
 	agent.Spec.Mode = ptr.To(string(ModeNext))
@@ -160,12 +168,20 @@ func dataVolumeEveryComponentAgent() *agentv1alpha1.PlatformAgent {
 	}
 	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
 		Availability: &agentv1alpha1.AvailabilitySpec{Replicas: ptr.To(int32(2))},
-		Storages: []agentv1alpha1.StorageSpec{{
-			Name:        "scratch",
-			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
-			StorageSize: "5Gi",
-			MountPath:   "/scratch",
-		}},
+		Storages: []agentv1alpha1.StorageSpec{
+			{
+				Name:        "scratch",
+				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+				StorageSize: "5Gi",
+				MountPath:   "/scratch",
+			},
+			{
+				Name:        "shared",
+				AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
+				StorageSize: "5Gi",
+				MountPath:   "/shared",
+			},
+		},
 	}
 	return agent
 }
@@ -183,9 +199,16 @@ func TestEveryPodMountingTheAgentDataClaimRunsAsOneUID(t *testing.T) {
 	shapes := []struct {
 		name  string
 		agent *agentv1alpha1.PlatformAgent
+		// The claims other than the agent's own that the gateway pod must
+		// carry, asserted rather than assumed. What this walk does beyond
+		// reading a pod's security context is discriminate — reject a volume
+		// backed by some other claim, and every container that mounts only
+		// such a volume — and a fixture that quietly stops rendering a second
+		// claim leaves that discrimination unexercised with nothing saying so.
+		otherClaims []string
 	}{
-		{"default", dataVolumeTestAgent()},
-		{"every component", dataVolumeEveryComponentAgent()},
+		{"default", dataVolumeTestAgent(), []string{"system-metadata"}},
+		{"every component", dataVolumeEveryComponentAgent(), []string{"system-metadata", "shared"}},
 	}
 
 	for _, shape := range shapes {
@@ -193,14 +216,29 @@ func TestEveryPodMountingTheAgentDataClaimRunsAsOneUID(t *testing.T) {
 			claim := shape.agent.Name + agentDataClaimSuffix
 			gatewayReached := false
 			mountingContainers := 0
+			gatewayOtherClaims := map[string]bool{}
+			rejectedMounts := 0
 
 			for _, pod := range renderEveryWorkloadPod(shape.agent) {
 				volumes := volumesBackedByClaim(pod.spec, claim)
 				if len(volumes) == 0 {
 					continue
 				}
-				if pod.workload == shape.agent.Name+gatewayWorkloadSuffix {
+				isGateway := pod.workload == shape.agent.Name+gatewayWorkloadSuffix
+				if isGateway {
 					gatewayReached = true
+				}
+
+				otherVolumes := map[string]bool{}
+				for _, volume := range pod.spec.Volumes {
+					pvc := volume.PersistentVolumeClaim
+					if pvc == nil || pvc.ClaimName == claim {
+						continue
+					}
+					otherVolumes[volume.Name] = true
+					if isGateway {
+						gatewayOtherClaims[pvc.ClaimName] = true
+					}
 				}
 
 				// The fsGroup is what makes the claim's contents reachable to
@@ -219,6 +257,12 @@ func TestEveryPodMountingTheAgentDataClaimRunsAsOneUID(t *testing.T) {
 					for _, mount := range container.VolumeMounts {
 						if volumes[mount.Name] {
 							mountsClaim = true
+							break
+						}
+					}
+					for _, mount := range container.VolumeMounts {
+						if otherVolumes[mount.Name] {
+							rejectedMounts++
 							break
 						}
 					}
@@ -245,6 +289,14 @@ func TestEveryPodMountingTheAgentDataClaimRunsAsOneUID(t *testing.T) {
 			}
 			if mountingContainers == 0 {
 				t.Errorf("no container mounted %s, so this walk asserted nothing", claim)
+			}
+			for _, other := range shape.otherClaims {
+				if !gatewayOtherClaims[other] {
+					t.Errorf("the gateway pod carries no volume backed by the %s claim, so the walk was never handed a second claim to reject; it saw %v", other, gatewayOtherClaims)
+				}
+			}
+			if rejectedMounts == 0 {
+				t.Errorf("no container mounted a claim other than %s, so nothing here told the agent's claim apart from another one", claim)
 			}
 		})
 	}
