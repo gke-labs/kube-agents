@@ -4141,24 +4141,52 @@ class AudienceRoleTest(unittest.TestCase):
 
 
 class RequiredRoleTest(unittest.TestCase):
-    """Which side of the split each route belongs to."""
+    """Which side of the split each route belongs to.
+
+    Reads ``required_roles`` (plural) since this branch: a route can admit more
+    than one caller role, because the /v1/chat/api passthrough is shared by the
+    legacy chat relay and the A2A one — one credential, two subscriptions. The
+    singular ``required_role`` these tests were written against returned the
+    first match and could not express that.
+    """
 
     def test_the_shell_routes(self):
         for path in ("/v1/exec", "/v1/github/refresh", "/v1/workspace/open"):
             with self.subTest(path=path):
                 self.assertEqual(
-                    credential_proxy.CALLER_ROLE_SHELL, credential_proxy.required_role(path)
+                    (credential_proxy.CALLER_ROLE_SHELL,),
+                    credential_proxy.required_roles(path),
                 )
 
     def test_the_chat_routes(self):
         for path in ("/v1/chat/slack/events", "/v1/chat/google/api"):
             with self.subTest(path=path):
                 self.assertEqual(
-                    credential_proxy.CALLER_ROLE_CHAT, credential_proxy.required_role(path)
+                    (credential_proxy.CALLER_ROLE_CHAT,),
+                    credential_proxy.required_roles(path),
                 )
 
+    def test_the_shared_api_passthrough_admits_both_chat_callers(self):
+        """The case the plural exists for, and the reason a rename was not enough.
+
+        Both relays hold the same app credential and must reach the API
+        passthrough, while each side's event route stays its own. Under the
+        singular form this route resolved to whichever role matched first, so
+        one of the two consumers was refused a route it is entitled to.
+        """
+        self.assertEqual(
+            (credential_proxy.CALLER_ROLE_CHAT, credential_proxy.CALLER_ROLE_A2A_CHAT),
+            credential_proxy.required_roles("/v1/chat/api"),
+        )
+
+    def test_the_a2a_event_route_stays_its_own(self):
+        self.assertEqual(
+            (credential_proxy.CALLER_ROLE_A2A_CHAT,),
+            credential_proxy.required_roles("/v1/chat/a2a/events"),
+        )
+
     def test_a_route_belonging_to_neither(self):
-        self.assertEqual("", credential_proxy.required_role("/healthz"))
+        self.assertEqual((), credential_proxy.required_roles("/healthz"))
 
 
 class RolePermitsTest(unittest.TestCase):
