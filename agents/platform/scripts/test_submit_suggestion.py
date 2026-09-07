@@ -517,8 +517,10 @@ class TestSubmit(SubmitSuggestionTestCase):
     def test_a_gh_failure_that_is_not_an_existing_pr_still_raises(self):
         # The fallback must not swallow "not authenticated" or "base branch is
         # protected" — those are real failures and the run has to stop. The
-        # provider reports them as REPO_UNREACHABLE rather than as the one
-        # refusal the caller is allowed to treat as success.
+        # provider reports them as PULL_REQUEST_REFUSED rather than as the one
+        # refusal the caller is allowed to treat as success — and not as
+        # REPO_UNREACHABLE either, since the push to this repository over this
+        # credential succeeded moments earlier.
         payload = self.prepare()
         self.commit(payload["workspace"])
 
@@ -530,7 +532,7 @@ class TestSubmit(SubmitSuggestionTestCase):
 
         with self.assertRaises(forge.ForgeError) as caught:
             self.submit(payload["branch"], payload["workspace"])
-        self.assertEqual(caught.exception.reason, "REPO_UNREACHABLE")
+        self.assertEqual(caught.exception.reason, "PULL_REQUEST_REFUSED")
         self.assertNotIsInstance(caught.exception, forge.PullRequestExists)
 
     def test_submit_without_a_lease_or_a_session_says_what_to_pass(self):

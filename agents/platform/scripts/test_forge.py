@@ -31,7 +31,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1298,15 +1297,31 @@ class CreatePullRequestTest(unittest.TestCase):
         self.assertEqual(caught.exception.head, "platform-agent/x")
         self.assertIn("pull/7", caught.exception.value)
 
-    def test_every_other_refusal_stays_a_plain_forge_error(self):
+    def test_every_other_refusal_is_a_refusal_not_an_unreachable_repository(self):
+        """The push has already landed against this repository over this
+        credential, so `REPO_UNREACHABLE` would send an operator to check the
+        two things known to work."""
         gh = FakeGh(default=(1, "", "HTTP 403: Resource not accessible by integration"))
         with self.assertRaises(forge.ForgeError) as caught:
             self._provider(gh).create_pull_request(
                 "acme/fleet", head="platform-agent/x", base="main", title="t",
                 body="the description",
             )
-        self.assertEqual(caught.exception.reason, "REPO_UNREACHABLE")
+        self.assertEqual(caught.exception.reason, "PULL_REQUEST_REFUSED")
         self.assertNotIsInstance(caught.exception, forge.PullRequestExists)
+
+    def test_the_detail_carries_the_exit_code_and_both_streams(self):
+        """`gh` puts a protected-base rejection on stdout and the credential
+        proxy's block message on stderr, and the old handler logged both."""
+        gh = FakeGh(default=(2, "base branch is protected", "and the token cannot override it"))
+        with self.assertRaises(forge.ForgeError) as caught:
+            self._provider(gh).create_pull_request(
+                "acme/fleet", head="platform-agent/x", base="main", title="t",
+                body="the description",
+            )
+        self.assertIn("exit 2", caught.exception.value)
+        self.assertIn("base branch is protected", caught.exception.value)
+        self.assertIn("cannot override", caught.exception.value)
 
     def test_a_silent_success_is_read_back_rather_than_returned_empty(self):
         """`gh` prints the URL today. A version that did not would otherwise
@@ -1320,6 +1335,34 @@ class CreatePullRequestTest(unittest.TestCase):
             body="the description",
         )
         self.assertEqual(url, "https://x/pull/9")
+
+    def test_a_failed_read_back_does_not_turn_a_success_into_a_failure(self):
+        """The pull request was opened. Raising here would have the caller
+        re-push a branch whose change is already up."""
+        gh = FakeGh(responses={"pr view": (1, "", "not found")}, default=(0, "", ""))
+        url = self._provider(gh).create_pull_request(
+            "acme/fleet", head="platform-agent/x", base="main", title="t",
+            body="the description",
+        )
+        self.assertEqual(url, "")
+
+    def test_it_reaches_the_forge_through_the_one_overridable_seam(self):
+        """The module docstring's invariant: a provider that replaces `_call`
+        replaces every round trip. `create_pull_request` reads an exit code, so
+        it is the method most likely to grow a second path to the runner."""
+        calls = []
+
+        class Overridden(forge.GitHubProvider):
+            def _call(self, argv, **kwargs):
+                calls.append(list(argv))
+                return super()._call(argv, **kwargs)
+
+        Overridden(run=FakeGh(default=(0, "https://x/pull/1", ""))).create_pull_request(
+            "acme/fleet", head="platform-agent/x", base="main", title="t",
+            body="the description",
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:2], ["pr", "create"])
 
 
 class UpdatePullRequestTest(unittest.TestCase):

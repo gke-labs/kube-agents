@@ -157,12 +157,22 @@ REASON_HOST_UNSUPPORTED = "FORGE_HOST_UNSUPPORTED"
 #: resubmission. See `PullRequestExists`.
 REASON_PULL_REQUEST_EXISTS = "PULL_REQUEST_EXISTS"
 
+#: Reason code for a forge that refused to open a change for a reason that is
+#: not "one is already open". Distinct from `REPO_UNREACHABLE` because by the
+#: time this can be raised the branch has just been pushed to that repository
+#: over the same credential, so the reachability reading is provably wrong and
+#: sends an operator to check the two things already known to work.
+REASON_PULL_REQUEST_REFUSED = "PULL_REQUEST_REFUSED"
+
 #: What `gh pr create` says when the branch already has an open pull request,
 #: matched case-insensitively against the merged output. Recognising the phrase
 #: is GitHub-shaped and so belongs to `GitHubProvider`; deciding that it is not
 #: a failure is harness policy and belongs to the caller.
 _PR_EXISTS_MARKER = "already exists"
 
+#: How much of a forge's complaint a `ForgeError` carries. The detail lands in
+#: a one-line operator-facing warning, so it is a line's worth and not a log.
+_DETAIL_CHARS = 200
 
 class ForgeError(Exception):
     """A fault with a machine-readable reason code.
@@ -531,6 +541,7 @@ class GitHubProvider:
         expect_json: bool = True,
         retry_transient: bool = False,
         stdin: str | None = None,
+        check: bool = True,
     ):
         """Every forge round trip goes through here. See the module docstring.
 
@@ -549,6 +560,14 @@ class GitHubProvider:
 
         `stdin` carries a document to a command that names `-` as its input
         file; it reaches `gh` in the sandbox, which is the only pod that has one.
+
+        `check=False` hands the raw result back instead, for the one caller
+        where the exit code is an answer rather than a failure — see
+        `create_pull_request`. It is a parameter rather than a second path to
+        the runner because the module docstring's invariant is that a provider
+        talking to a `/v1/<forge>/…` route replaces this method and nothing
+        else; a method reaching `self._run` directly would silently keep
+        shelling `gh` under such a provider.
         """
         result = self._run(list(argv), repo=repo, stdin=stdin)
         if (
@@ -557,8 +576,10 @@ class GitHubProvider:
             and _should_retry_transient(result)
         ):
             result = self._run(list(argv), repo=repo, stdin=stdin)
+        if not check:
+            return result
         if result.returncode != 0:
-            raise ForgeError("REPO_UNREACHABLE", (result.stderr or "").strip()[:200])
+            raise ForgeError("REPO_UNREACHABLE", (result.stderr or "").strip()[:_DETAIL_CHARS])
         if not expect_json:
             return None
         text = (result.stdout or "").strip()
@@ -868,10 +889,17 @@ class GitHubProvider:
         able to tell it from a real failure — a protected base, a credential
         without permission — and only the text distinguishes them.
 
-        This is the one method that reads `self._run`'s result rather than going
-        through `_call`, because `_call`'s contract is to raise on any non-zero
-        exit and this is the case where the exit code is not the answer. Both
-        reach the forge the same way, so a test's injected runner still sees it.
+        This is the one caller of `_call(check=False)` — the exit code is an
+        answer here rather than a failure — but it still goes through `_call`,
+        so a provider that replaces that method replaces this one's transport
+        too.
+
+        Any other refusal raises `PULL_REQUEST_REFUSED` rather than
+        `REPO_UNREACHABLE`: the push has just succeeded against this repository
+        over this credential, so reachability is the one explanation already
+        ruled out. The detail carries the exit code and both streams, because
+        `gh` puts a protected-base rejection on stdout and the credential
+        proxy's block message on stderr.
 
         The body travels on stdin, for the reason `post_comment` sets out: since
         #913 the caller, the sandbox and the broker are three containers with
@@ -879,7 +907,7 @@ class GitHubProvider:
         them can open. `-R` is always passed, so the call does not depend on the
         process being inside a clone of `repo` either.
         """
-        result = self._run(
+        result = self._call(
             [
                 "pr", "create",
                 "-R", repo,
@@ -888,16 +916,28 @@ class GitHubProvider:
                 "--title", title,
                 "--body-file", BODY_STDIN,
             ],
+            repo=repo,
             stdin=body,
+            check=False,
         )
         if result.returncode != 0:
-            merged = f"{result.stdout or ''}\n{result.stderr or ''}"
+            merged = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
             if _PR_EXISTS_MARKER in merged.lower():
-                raise PullRequestExists(head, merged.strip()[:200])
-            raise ForgeError("REPO_UNREACHABLE", (result.stderr or "").strip()[:200])
-        # `gh` prints the URL, but a version that printed nothing would
-        # otherwise return "" as though the pull request had no address.
-        return (result.stdout or "").strip() or self.pull_request_url(repo, head=head)
+                raise PullRequestExists(head, merged[:_DETAIL_CHARS])
+            raise ForgeError(
+                REASON_PULL_REQUEST_REFUSED,
+                f"exit {result.returncode}: {merged}"[:_DETAIL_CHARS],
+            )
+        url = (result.stdout or "").strip()
+        if url:
+            return url
+        # A `gh` that printed nothing still opened the pull request, so a failed
+        # read-back must not turn that success into a reported failure. The
+        # caller re-pushing on a false failure is the wasted round this avoids.
+        try:
+            return self.pull_request_url(repo, head=head)
+        except ForgeError:
+            return ""
 
     def update_pull_request(
         self, repo: str, *, head: str, title: str, body: str
@@ -923,12 +963,17 @@ class GitHubProvider:
         )
 
     def pull_request_url(self, repo: str, *, head: str) -> str:
-        """The open pull request's address, or "" when it has none.
+        """The open pull request's address for `head`.
+
+        A branch with no open pull request is a `ForgeError`, not `""` — `gh pr
+        view` exits non-zero for it and `_call` raises. `""` is reserved for the
+        narrower case of an answer that parsed but carried no `url`, which is a
+        forge that replied strangely rather than a branch with nothing open.
 
         `--json url` rather than `--jq`: the projection is one field either way,
         and reading it here keeps the parse in Python where a malformed answer
         raises `FORGE_RESPONSE_UNREADABLE` instead of arriving as an empty
-        string that looks like "no pull request".
+        string.
         """
         row = self._call(["pr", "view", head, "-R", repo, "--json", "url"])
         if not isinstance(row, dict):

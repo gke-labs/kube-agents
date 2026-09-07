@@ -485,12 +485,19 @@ def create_pull_request(
     log(f"Submitting GitOps Pull Request for branch '{branch}'...")
     provider = forge.provider_for(repo)
     try:
-        return provider.create_pull_request(
+        url = provider.create_pull_request(
             repo, head=branch, base=base, title=title, body=body
         )
     except forge.PullRequestExists:
         log(f"A pull request for '{branch}' is already open; updating it in place.")
         return update_pull_request(branch, title, body, workspace, repo)
+    if not url:
+        raise RuntimeError(
+            f"the forge opened a pull request for '{branch}' but did not return its "
+            "address, and reading it back failed too. The push and the pull request "
+            "both landed; find it on the forge rather than resubmitting."
+        )
+    return url
 
 
 def update_pull_request(
@@ -623,6 +630,16 @@ def main():
         # The foreign-lease refusal. Distinct from the generic failure below
         # because it is the one an agent can act on without an operator.
         log(f"REFUSED: {e}")
+        sys.exit(1)
+    except forge.ForgeError as e:
+        # The forge refused, with a reason code naming which layer did. Kept
+        # ahead of the generic handler because `ForgeError` is not a
+        # `CalledProcessError` and would otherwise print as one bare line;
+        # `create_pull_request` folds the exit code and both streams into
+        # the error's value, and that is the whole diagnosis.
+        log(f"FATAL ERROR: the forge refused the request [{e.reason}]")
+        if e.value:
+            log(f"Detail:\n{e.value}")
         sys.exit(1)
     except subprocess.CalledProcessError as e:
         log("FATAL ERROR: GitOps subprocess execution failed!")
