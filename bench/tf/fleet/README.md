@@ -334,9 +334,10 @@ decision recorded with the scenario drafts. The silence case in particular must
 tolerate the declared background rows above.
 
 Rough standing cost: about $285 per month — the GKE management fee (three zonal
-clusters) is most of it, the five nodes (20 GB disks) and two 10 GB orphan disks the
-rest. Four of the nodes are e2-small; `seeded-a`'s default node is an e2-standard-2
-since #1278 (roughly $25 per month more than the e2-medium it replaced), because
+clusters) is most of it, the six nodes (20 GB disks) and two 10 GB orphan disks the
+rest. Four of the nodes are e2-small; `seeded-a`'s default pool is two e2-mediums
+since #1278 (roughly $25 per month more than the one it ran on), because a single
 e2-medium's 940m allocatable CPU is fully claimed by GKE system pods and the planted
 `payments-api` / `checkout-gateway` fixtures went Pending — the comment on
-`seeded_a_default` in `main.tf` has the numbers.
+`seeded_a_default` in `main.tf` has the numbers, and `hack/ci-eval-pr.sh` section 2c
+resizes a one-node pool back to two at lease time until every project is re-applied.

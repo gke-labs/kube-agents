@@ -13,6 +13,8 @@ tests/test_ci_deploy_release_guard.py):
   location, and the heal is announced;
 * a two-node (or larger) pool is left alone -- no resize call;
 * no slot-a cluster in the project is a no-op, not a failure;
+* a failed ``clusters list`` is the same no-op -- under ``set -euo pipefail``
+  the listing's assignment would otherwise kill the run;
 * an unreadable node count leaves the pool alone with a warning;
 * a failed resize warns and exits 0 -- the heal is never the reason a run
   dies;
@@ -45,7 +47,7 @@ def _heal_block():
 class SeededAHealTest(unittest.TestCase):
     maxDiff = None
 
-    def _run(self, clusters=_CLUSTERS, nodes="1", describe_exit=0, resize_exit=0, env_extra=None):
+    def _run(self, clusters=_CLUSTERS, nodes="1", list_exit=0, describe_exit=0, resize_exit=0, env_extra=None):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = pathlib.Path(tmp)
             bin_dir = tmp / "bin"
@@ -57,7 +59,7 @@ class SeededAHealTest(unittest.TestCase):
                 "#!/usr/bin/env bash\n"
                 f'echo "$*" >> "{calls}"\n'
                 'case "$*" in\n'
-                f'  *"clusters list"*) cat "{tmp / "clusters.txt"}" ;;\n'
+                f'  *"clusters list"*) [ {list_exit} -eq 0 ] && cat "{tmp / "clusters.txt"}"; exit {list_exit} ;;\n'
                 f'  *"node-pools describe"*) [ {describe_exit} -eq 0 ] && printf "%s\\n" "{nodes}"; exit {describe_exit} ;;\n'
                 f'  *"clusters resize"*) exit {resize_exit} ;;\n'
                 "esac\n",
@@ -88,6 +90,16 @@ class SeededAHealTest(unittest.TestCase):
 
     def test_no_slot_a_cluster_is_a_noop(self):
         proc, log = self._run(clusters="evals-2-seeded-b\tus-central1-a\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("node-pools describe", log)
+        self.assertNotIn("clusters resize", log)
+        self.assertIn("nothing to heal", proc.stdout)
+
+    def test_a_failed_cluster_list_is_a_noop_not_a_death(self):
+        # The block runs under `set -euo pipefail`; without the `|| true` on
+        # the listing, a non-zero `clusters list` trips errexit on the
+        # assignment and the run dies at 2c instead of warning.
+        proc, log = self._run(list_exit=1)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn("node-pools describe", log)
         self.assertNotIn("clusters resize", log)

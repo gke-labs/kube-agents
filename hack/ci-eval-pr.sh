@@ -459,9 +459,12 @@ readonly SEEDED_A_DEFAULT_POOL_NODES=2
 readonly SEEDED_A_DEFAULT_POOL_NAME="default-pool"
 if [ "${FLEET_HEAL_SEEDED_A:-1}" != "0" ]; then
   STEP_START=$SECONDS
+  # `|| true` as at the section-3b listing: under `set -euo pipefail` a
+  # failed `clusters list` (revoked credential, disabled API, a 5xx) would
+  # otherwise trip errexit on this assignment and kill the run at 2c.
   SEEDED_A_LINE="$(gcloud container clusters list --project "${PROJECT_ID}" \
     --filter='resourceLabels.environment=seeded AND resourceLabels.managed-by=kube-agents-seeded-fleet' \
-    --format='value(name,location)' 2>/dev/null | awk '$1 ~ /-a$/ {print; exit}')"
+    --format='value(name,location)' 2>/dev/null | awk '$1 ~ /-a$/ {print; exit}' || true)"
   if [ -z "${SEEDED_A_LINE}" ]; then
     echo "seeded-a heal: no slot-a seeded cluster found in ${PROJECT_ID}; nothing to heal"
   else
