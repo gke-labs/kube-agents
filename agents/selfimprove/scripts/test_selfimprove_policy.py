@@ -37,6 +37,9 @@ import unittest
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 TEMPLATE = REPO_ROOT / "charts/kube-agents/templates/self-improvement.yaml"
 FILING_SKILL = REPO_ROOT / "agents/selfimprove/skills/file-pull-request/SKILL.md"
+#: The operator's copy of the eight rules this policy started from, read by
+#: `OperatorParityTest` so the two cannot drift apart unnoticed.
+MANIFESTS_GO = REPO_ROOT / "k8s-operator/internal/controller/platformagent_manifests.go"
 
 sys.path.insert(0, str(REPO_ROOT / "agents" / "platform" / "scripts"))
 
@@ -644,6 +647,131 @@ class PolicyTest(unittest.TestCase):
                 self.assertTrue(
                     pattern.pattern.startswith("\\A"),
                     f"{rule_id}: pattern is not anchored: {pattern.pattern}",
+                )
+
+
+class OperatorParityTest(unittest.TestCase):
+    """That the eight rules copied from the operator are still that copy.
+
+    The block in the chart began as `credentialProxyPolicyJSON`, and the copy
+    guards the wider of the two credentials: a classic PAT with `repo` across
+    the robot account's whole reach, against the Platform Agent's
+    repository-scoped, hour-lived App token. Nothing kept the two in step --
+    unlike the CRD and RBAC copies, which `make chart-check` mirrors -- so
+    hardening the operator against a newly found exfiltration primitive left
+    the wider credential behind it, and no test anywhere said so.
+
+    Byte equality is not the relation, because the copy is deliberately not
+    byte-identical: every whitespace traversal is a token traversal here, and
+    every leading `\\b` is `\\A`. Both are mechanical, so this test undoes them
+    and compares what is left. That keeps the intended divergence and catches
+    the unintended kind, which is the whole point -- a rule the operator
+    tightens shows up as a mismatch in the id it was tightened under.
+    """
+
+    #: The token traversal the chart's copy uses, and the whitespace traversal
+    #: the operator's uses in its place. Substituting one back for the other is
+    #: what makes the two copies comparable at all; see the comment above
+    #: `policy.json` in the chart for why the chart needs the token form.
+    TOKEN_TRAVERSAL = "(?:\\s+(?:'[^']*'|\"[^\"]*\"|[^'\"\\s])+)*?"
+    WHITESPACE_TRAVERSAL = "(?:\\s+\\S+)*?"
+
+    #: Rules the chart states differently on purpose, and what the difference
+    #: is. Each entry is a substitution applied to the chart's pattern after
+    #: the two mechanical normalisations above and before the comparison, so a
+    #: divergence that grows past what is recorded here fails rather than
+    #: passing under a blanket exemption.
+    RECORDED_DIVERGENCES = {
+        # `gh auth status -t` is the documented shorthand for `--show-token`,
+        # which the operator's copy misses. `(?=\s|$)` rather than `\b` because
+        # `-t` is followed by a word boundary inside `-token` as well.
+        "github.token-disclosure": [("-t)(?=\\s|$)", "-t)\\b")],
+        # The operator's third alternative -- `gh alias|config set|import|
+        # delete` -- is dropped here because two stronger rules already cover
+        # it: `selfimprove.no-gh-alias` refuses every `gh ... alias`, and
+        # `selfimprove.unlisted-gh-subcommand` refuses `gh config` along with
+        # every other subcommand outside the six the loop is allowed.
+        "tool.self-modification": [
+            (
+                "\\bgh\\b(?:\\s+\\S+)*?\\s+extension\\b(?:\\s+\\S+)*?"
+                "\\s+(?:install|upgrade|remove)\\b",
+                "\\bgh\\b(?:\\s+\\S+)*?\\s+extension\\b(?:\\s+\\S+)*?"
+                "\\s+(?:install|upgrade|remove)\\b"
+                "|\\bgh\\b(?:\\s+\\S+)*?\\s+(?:alias|config)\\b(?:\\s+\\S+)*?"
+                "\\s+(?:set|import|delete)\\b",
+            )
+        ],
+    }
+
+    #: Operator rules the chart replaces rather than copies, and the rule that
+    #: replaces each. The self-improvement pod is refused far more than the
+    #: Platform Agent is, so these are narrower rules superseded by wider ones;
+    #: an operator rule that is in neither this map nor the chart is a rule
+    #: nobody decided about.
+    SUPERSEDED = {
+        "github.merge": "selfimprove.no-merge-or-approve",
+        "github.assent": "selfimprove.no-merge-or-approve",
+        "github.api-mutation": "selfimprove.no-raw-api",
+        "github.pipeline-trigger": "selfimprove.unlisted-gh-subcommand",
+        "github.repo-administration": "selfimprove.gh-repo-reads-only",
+    }
+
+    @classmethod
+    def setUpClass(cls):
+        source = MANIFESTS_GO.read_text(encoding="utf-8")
+        match = re.search(r"credentialProxyPolicyJSON = `(.*?)`", source, re.DOTALL)
+        if match is None:
+            raise AssertionError(
+                "credentialProxyPolicyJSON moved or was renamed in %s; this test "
+                "reads it to check the chart's copy is still a copy."
+                % MANIFESTS_GO.relative_to(REPO_ROOT)
+            )
+        cls.operator = {r["id"]: r["pattern"] for r in json.loads(match.group(1))["rules"]}
+        cls.chart = {rule["id"]: rule["pattern"] for rule in _load_rules()}
+
+    def test_every_operator_rule_is_copied_or_recorded_as_superseded(self):
+        unaccounted = set(self.operator) - set(self.chart) - set(self.SUPERSEDED)
+        self.assertEqual(
+            unaccounted,
+            set(),
+            "the operator's policy has rules the chart's copy neither carries nor "
+            "records as superseded: %s. Copy them into policy.json in "
+            "charts/kube-agents/templates/self-improvement.yaml, or add them to "
+            "SUPERSEDED naming the rule that already covers them."
+            % ", ".join(sorted(unaccounted)),
+        )
+
+    def test_the_superseding_rules_all_exist(self):
+        for operator_id, chart_id in sorted(self.SUPERSEDED.items()):
+            with self.subTest(rule=operator_id):
+                self.assertIn(chart_id, self.chart)
+
+    def test_each_copied_rule_matches_the_operator_modulo_the_traversal(self):
+        for rule_id in sorted(set(self.operator) & set(self.chart)):
+            with self.subTest(rule=rule_id):
+                pattern = (
+                    self.chart[rule_id]
+                    .replace(self.TOKEN_TRAVERSAL, self.WHITESPACE_TRAVERSAL)
+                    .replace("\\A", "\\b")
+                )
+                for spelling, operator_spelling in self.RECORDED_DIVERGENCES.get(
+                    rule_id, []
+                ):
+                    self.assertIn(
+                        spelling,
+                        pattern,
+                        "the recorded divergence for %s is no longer in the "
+                        "chart's pattern; delete the entry rather than leaving "
+                        "it to hide a real difference." % rule_id,
+                    )
+                    pattern = pattern.replace(spelling, operator_spelling)
+                self.assertEqual(
+                    pattern,
+                    self.operator[rule_id],
+                    "%s has drifted from the operator's copy in "
+                    "k8s-operator/internal/controller/platformagent_manifests.go. "
+                    "Re-derive the chart's rule from it, or record the difference "
+                    "in RECORDED_DIVERGENCES with why it is intended." % rule_id,
                 )
 
 

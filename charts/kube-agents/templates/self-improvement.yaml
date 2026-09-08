@@ -1440,7 +1440,7 @@ spec:
 # shape parses cleanly, yields zero rules, and blocks nothing -- which is what
 # this ConfigMap used to do while its comment claimed the opposite.
 #
-# The first eight of the nineteen started as the set the operator installs for the
+# The first eight of the twenty-two started as the set the operator installs for the
 # Platform Agent's own proxy (credentialProxyPolicyJSON in
 # k8s-operator/internal/controller/platformagent_manifests.go). They matter more
 # here than there: this proxy holds a GitHub token with write scope, and
@@ -1450,25 +1450,37 @@ spec:
 # purpose -- so these rules are the only thing standing between the model and
 # the credential.
 #
-# It is a copy, and nothing checks that it stays one -- unlike the CRD and RBAC
-# copies, which `make chart-check` mirrors. It diverges on purpose in two ways.
+# It is a copy, and `OperatorParityTest` in
+# `agents/selfimprove/scripts/test_selfimprove_policy.py` is what keeps it one:
+# it reads both copies, undoes the two mechanical differences below, and fails
+# on anything left over. An operator rule this block neither carries nor records
+# as superseded fails there too, so hardening `credentialProxyPolicyJSON`
+# against a new exfiltration primitive cannot leave the wider credential --
+# a classic PAT with `repo` -- behind the older rules unnoticed.
+#
+# It diverges on purpose in two ways, both recorded in that test.
 #
 # `github.token-disclosure` here also matches `gh auth status -t`, the
 # documented shorthand for `--show-token` that the operator's copy misses.
 #
 # Every rule here also walks whole argv tokens where the operator's copy walks
-# whitespace. `Policy.blocked_by` matches against `shlex.join(argv)`, so a token
-# containing spaces arrives single-quoted, and `(?:\s+\S+)*?` reads straight
-# through the quotes into its words. That is harmless for a Platform Agent whose
-# argv is mostly flags; it is not harmless here, because this pod's one write is
-# `gh pr create --title '<a sentence about a bug in kube-agents>'`. Titles of
-# that shape hit `no-merge-or-approve` on `close`, `secret`, `workflow` or
-# `release` and the operator's `github.token-disclosure` on any title pairing
-# `auth` with `token` -- the pull request the whole loop exists to open, refused
-# by its own guard rail, hourly, with a message about merging. So the traversal
-# is `(?:\s+(?:'[^']*'|"[^"]*"|[^'"\s])+)*?`: a quoted run is consumed whole and
-# cannot be read into, and `\A` stops a match beginning inside one. The rules
-# mean what they meant; they now mean it about argv rather than about characters.
+# whitespace. `Policy.blocked_by` matches against `policy_match_text(argv)`,
+# which is `shlex.join` of the argv after the values of `_FREE_TEXT_FLAGS` are
+# dropped and attached shorthands are split, so a *remaining* token containing
+# spaces arrives single-quoted and `(?:\s+\S+)*?` reads straight through the
+# quotes into its words. That is harmless for a Platform Agent whose argv is
+# mostly flags. It is not harmless here: `gh pr create --label 'ready to merge'`
+# hits `no-merge-or-approve` on the label's last word, and `gh pr create
+# --body-file '/tmp/pr notes/close secret.md'` hits it on the filename. So the
+# traversal is `(?:\s+(?:'[^']*'|"[^"]*"|[^'"\s])+)*?`: a quoted run is consumed
+# whole and cannot be read into, and `\A` stops a match beginning inside one.
+# The rules mean what they meant; they now mean it about argv rather than about
+# characters.
+#
+# What the traversal does *not* have to save is the pull request's own title and
+# body. `--title`, `-t`, `--body` and `-b` are in `_FREE_TEXT_FLAGS`, so their
+# values never reach the matcher at all; a rule written to catch a keyword
+# inside one can never fire, whatever the traversal does.
 #
 # Two things about that token unit are load-bearing.
 #
@@ -1488,7 +1500,7 @@ spec:
 # hang the model can ask for. Each branch consumes a fixed, unambiguous amount,
 # so a token has one parse and the walk stays linear.
 #
-# The last eleven are specific to this pod.
+# The last fourteen are specific to this pod.
 #
 #   - The runner has no cluster or project it is allowed to mutate, so kubectl
 #     and gcloud are refused outright rather than allow-listed down to nothing.
