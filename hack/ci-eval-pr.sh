@@ -959,6 +959,16 @@ TASKS=(
   # (#1175) lands.
   # "./tasks/gpu-stress-test-diagnosis/task.yaml"
   "./tasks/agent-kanban-smoke/task.yaml"
+  # Knowledge-grounding probe (#945): a pure GKE documentation question,
+  # graded on the persona's grounding contract — the answer names the
+  # compute-class nodeSelector key and concludes with the mandated
+  # `## Sources` section citing Developer Knowledge MCP or its web-search
+  # fallback. deployer: noop, no fixture, no cluster read: one delegation
+  # round trip plus one knowledge lookup, the agent-kanban-smoke cost shape
+  # (~100-300s). Activated without a budget raise on the headroom #1218
+  # freed by dropping the two tofu cases; runs unadmitted (the #1049
+  # precedent) while it earns a record.
+  "./tasks/knowledge-grounding-sources-probe/task.yaml"
   # Last, because it is the only entry that pays twice. Its stack plants an
   # OOM-killed workload on the host cluster and blocks until the event
   # watcher's leading-edge debounce clears and the incident opens (~1 minute,

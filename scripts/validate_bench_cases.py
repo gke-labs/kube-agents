@@ -71,6 +71,11 @@ KNOWN_NO_DOMAIN = {
         "a chat-prompted post-incident RCA, not the event-fired autoops triage "
         "that incident-triage names; no domains.yaml row describes it"
     ),
+    "knowledge-grounding-sources-probe": (
+        "a grounded-knowledge citation probe: a pure GKE documentation "
+        "question graded on the persona's Sources contract; it reads no "
+        "fleet and no domains.yaml row describes knowledge retrieval"
+    ),
 }
 
 # Cases graded by the judge alone. The OutcomeValidity >= 0.7 fallback in
