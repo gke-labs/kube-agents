@@ -26,6 +26,14 @@
 #      Reachable on a FIRST install too: configuring the Chat app in the Cloud
 #      console creates the topic before the installer ever runs. `adopt_pubsub`
 #      imports whichever of the two is already there before applying.
+#   6. When applying against an unmanaged cluster (create_cluster = false),
+#      residual cluster KMS resources left in state from an earlier attempt
+#      would be destroyed (count = 0). `forget_unmanaged_cluster_kms` removes
+#      them from state before apply and restores any scheduled key versions.
+#   7. Pre-existing Google Service Accounts (platform agent, token minter,
+#      litellm) make the create 409. `adopt_kms` imports them if already
+#      present, and `destroy` forgets only adopted accounts so pre-existing SAs
+#      are not deleted from GCP.
 #
 # Usage:
 #   ./lifecycle.sh apply    [extra terraform args...]
@@ -63,6 +71,10 @@ warn() { printf '\033[1;33m warn\033[0m %s\n' "$*" >&2; }
 # project do not collide. Without the variable nothing here runs and local
 # state behaves exactly as before.
 BACKEND_OVERRIDE_FILE="backend_override.tf"
+readonly DEFAULT_AGENT_GSA_NAME="kubeagents-platform-gsa"
+readonly DEFAULT_MINTER_GSA_NAME="kubeagents-github-minter-gsa"
+readonly DEFAULT_LITELLM_GSA_NAME="kubeagents-litellm-gsa"
+readonly ADOPTED_RESOURCES_FILE=".adopted_resources"
 
 #
 # One argument, "readonly", suppresses the bucket creation for `plan`. A plan
@@ -151,6 +163,17 @@ tfvar() {
   printf '%s\n' "$out" | tail -1 | tr -d '"'
 }
 
+# Reads an optional input variable. If undeclared in configuration or null,
+# outputs the provided default value without failing.
+tfvar_or_default() {
+  local var_name="$1" default_val="$2" out
+  if out=$(echo "var.$var_name" | terraform console 2>/dev/null) && [[ -n "$out" && "$out" != "null" ]]; then
+    printf '%s\n' "$out" | tail -1 | tr -d '"'
+  else
+    printf '%s\n' "$default_val"
+  fi
+}
+
 # The state list is read once and matched in memory. Piping it straight into
 # `grep -q` looks equivalent but is not: grep exits at the first match, terraform
 # dies of SIGPIPE, and `set -o pipefail` reports the whole pipeline as failed — so
@@ -212,6 +235,66 @@ restore_key_versions() {
   done <<<"$versions"
 }
 
+# Returns the GCS URI for .adopted_resources if remote state is enabled.
+get_adopted_resources_gcs_uri() {
+  [[ -n "${KUBE_AGENTS_STATE_BUCKET:-}" ]] || return 1
+  local project bucket prefix
+  project=$(tfvar project_id)
+  bucket="$KUBE_AGENTS_STATE_BUCKET"
+  [[ "$bucket" == "auto" ]] && bucket="${project}-kube-agents-tfstate"
+  prefix="${KUBE_AGENTS_STATE_PREFIX:-kube-agents/$(tfvar cluster_name)}"
+  printf 'gs://%s/%s/%s\n' "$bucket" "$prefix" "$ADOPTED_RESOURCES_FILE"
+}
+
+# Loads .adopted_resources from GCS if absent locally and remote state is active.
+load_adopted_resources() {
+  local gcs_uri
+  if [[ ! -f "$ADOPTED_RESOURCES_FILE" ]] && gcs_uri=$(get_adopted_resources_gcs_uri 2>/dev/null); then
+    gcloud storage cp "$gcs_uri" "$ADOPTED_RESOURCES_FILE" >/dev/null 2>&1 || true
+  fi
+}
+
+# Records an adopted resource address into .adopted_resources and syncs to GCS.
+record_adopted() {
+  local address="$1"
+  load_adopted_resources
+  if [[ -f "$ADOPTED_RESOURCES_FILE" ]]; then
+    if ! grep -Fxq "$address" "$ADOPTED_RESOURCES_FILE"; then
+      printf '%s\n' "$address" >>"$ADOPTED_RESOURCES_FILE"
+    fi
+  else
+    printf '%s\n' "$address" >"$ADOPTED_RESOURCES_FILE"
+  fi
+
+  local gcs_uri
+  if gcs_uri=$(get_adopted_resources_gcs_uri 2>/dev/null); then
+    gcloud storage cp "$ADOPTED_RESOURCES_FILE" "$gcs_uri" >/dev/null 2>&1 || true
+  fi
+}
+
+# Forgets only those service accounts that were adopted into state from outside,
+# so destroying the composition does not delete pre-existing service accounts.
+# Resources created by Terraform itself are not in .adopted_resources and are
+# destroyed normally by `terraform destroy`.
+forget_adopted_service_accounts() {
+  load_adopted_resources
+  [[ -f "$ADOPTED_RESOURCES_FILE" ]] || return 0
+  load_state
+  local address
+  while read -r address; do
+    [[ -n "$address" ]] || continue
+    in_state "$address" || continue
+    log "forgetting adopted service account $address (pre-existed; kept in GCP so destroy does not delete it)"
+    terraform state rm "$address" >/dev/null 2>&1 ||
+      warn "could not forget adopted service account $address"
+  done <"$ADOPTED_RESOURCES_FILE"
+  rm -f "$ADOPTED_RESOURCES_FILE"
+  local gcs_uri
+  if gcs_uri=$(get_adopted_resources_gcs_uri 2>/dev/null); then
+    gcloud storage rm "$gcs_uri" >/dev/null 2>&1 || true
+  fi
+}
+
 adopt_kms() {
   local project location keyring key
   load_state
@@ -239,7 +322,7 @@ adopt_kms() {
     local minter_keyring minter_key minter_gsa
     minter_keyring=$(tfvar github_minter_kms_keyring)
     minter_key=$(tfvar github_minter_kms_key)
-    minter_gsa="kubeagents-github-minter-gsa"
+    minter_gsa="$DEFAULT_MINTER_GSA_NAME"
     targets+=(
       "module.github_minter[0].google_kms_key_ring.minter	keyring	projects/$project/locations/$location/keyRings/$minter_keyring"
       "module.github_minter[0].google_kms_crypto_key.minter	key	projects/$project/locations/$location/keyRings/$minter_keyring/cryptoKeys/$minter_key"
@@ -263,13 +346,14 @@ adopt_kms() {
   fi
 
   if [[ "$(tfvar model_provider)" == "vertex_ai" ]]; then
-    local litellm_gsa="kubeagents-litellm-gsa"
+    local litellm_gsa="$DEFAULT_LITELLM_GSA_NAME"
     targets+=(
       "module.litellm_vertex_iam[0].google_service_account.agent	service_account	projects/$project/serviceAccounts/$litellm_gsa@$project.iam.gserviceaccount.com"
     )
   fi
 
-  local agent_gsa="kubeagents-platform-gsa"
+  local agent_gsa
+  agent_gsa=$(tfvar_or_default agent_service_account_id "$DEFAULT_AGENT_GSA_NAME")
   targets+=(
     "module.kube_agents_iam.google_service_account.agent	service_account	projects/$project/serviceAccounts/$agent_gsa@$project.iam.gserviceaccount.com"
   )
@@ -309,6 +393,8 @@ adopt_kms() {
       adopted=$((adopted + 1))
       if [[ "$kind" == "key" ]]; then
         restore_key_versions "$id" "$location" "$project"
+      elif [[ "$kind" == "service_account" ]]; then
+        record_adopted "$address"
       fi
     else
       warn "could not import $address ($id); the apply will fail with a 409"
@@ -646,6 +732,7 @@ case "${1:-}" in
     purge_backups
     disable_deletion_protection
     forget_kms
+    forget_adopted_service_accounts
     log "terraform destroy"
     # deletion_protection is passed again because destroy re-evaluates the config,
     # and the variable's default would otherwise reinstate the guard.
@@ -657,7 +744,7 @@ case "${1:-}" in
     # The line range is the header comment above, so it moves whenever that
     # comment grows. It ends at the blank comment line before `set -euo
     # pipefail`.
-    sed -n '2,46p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,54p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

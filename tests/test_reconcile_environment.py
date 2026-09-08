@@ -189,6 +189,24 @@ class LifecyclePlanTest(unittest.TestCase):
                                  re.MULTILINE | re.DOTALL).group(1)
         self.assertIn("adopt_pubsub", apply_branch)
 
+    def test_apply_forgets_unmanaged_cluster_kms_before_adopting(self):
+        """Residual cluster KMS must be dropped from state before adopting or applying."""
+        apply_branch = re.search(r"^  apply\)$(.*?)^  destroy\)$", self.text,
+                                 re.MULTILINE | re.DOTALL).group(1)
+        forget_pos = apply_branch.index("forget_unmanaged_cluster_kms")
+        adopt_pos = apply_branch.index("adopt_kms")
+        self.assertLess(forget_pos, adopt_pos)
+
+    def test_adopt_kms_describes_service_account_by_email_or_id(self):
+        """The service account describe command strips the projects/... prefix to pass the email/id."""
+        self.assertIn('service_account) gcloud iam service-accounts describe "${id##*/}"', self.text)
+
+    def test_destroy_forgets_adopted_service_accounts(self):
+        """Pre-existing SAs adopted into state must be forgotten before terraform destroy."""
+        destroy_branch = re.search(r"^  destroy\)$(.*?)^  \*\)$", self.text,
+                                   re.MULTILINE | re.DOTALL).group(1)
+        self.assertIn("forget_adopted_service_accounts", destroy_branch)
+
     def test_the_usage_range_still_covers_the_whole_header(self):
         """The fallback branch prints a fixed line range, so a longer header truncates it."""
         printed = re.search(r"sed -n '2,(\d+)p'", self.text)

@@ -44,6 +44,7 @@ coverage-go.xml
 *.tfvars
 !*.tfvars.example
 terraform.tfvars.json
+.adopted_resources
 
 # Terraform override files are environment-local by convention: lifecycle.sh
 # writes (and normally removes) providers_lifecycle_override.tf mid-import,

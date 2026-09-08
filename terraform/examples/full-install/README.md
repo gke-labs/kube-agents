@@ -519,13 +519,15 @@ What each one does that raw Terraform cannot:
 | A `BackupPlan` cannot be deleted while it owns backups                   | `tf-destroy` purges the plan's backups first                                                                                                 |
 | `deletion_protection = true` cannot be overridden by a destroy alone     | `tf-destroy` applies it as `false`, then destroys                                                                                            |
 | A Pub/Sub topic or subscription that already exists makes the create 409 | `tf-apply` imports it first (`adopt_pubsub`), so a topic created in the Cloud console while wiring up Google Chat does not block the install |
+| Applying against an existing cluster would destroy residual cluster KMS | `tf-apply` removes unmanaged cluster KMS from state first (`forget_unmanaged_cluster_kms`) and restores scheduled versions |
+| Pre-existing service accounts make the create 409 | `tf-apply` imports them (`adopt_kms`); `tf-destroy` forgets adopted accounts so pre-existing identities are preserved in GCP |
 
 The chart also carries a `pre-delete` hook that removes the CR and waits for
 its finalizer, so a plain `helm uninstall` is safe on its own; `tf-destroy`
 does it up front anyway, which turns the hook into a no-op. Disable it with
 `platformAgent.cleanupHook.enabled=false`.
 
-Running `terraform destroy` directly still works, but you own the four steps
+Running `terraform destroy` directly still works, but you own the steps
 above yourself — starting with `kubectl delete platformagent <name> -n
 kubeagents-system --wait` while the operator is still running, and setting
 `deletion_protection = false` and applying before the cluster can be removed.
