@@ -1515,11 +1515,23 @@ def summarise_for_prompt(ledger: Dict[str, Any], now: Optional[_dt.datetime] = N
     no longer depends on it. That is deliberate slack: a run that re-classifies
     a finding it is otherwise re-reporting faithfully should not lose its count
     over the label, and one live afternoon produced exactly that.
+
+    Which rows survive `limit` is the same argument again. Severity orders the
+    brief, and within a band the freshest row goes first: a row this run is
+    about to re-see is the one whose fingerprint and location the brief has to
+    carry, while a row last seen three weeks ago is heading for `prune`. Sorting
+    the band the other way spends the 40 slots on the stalest rows and hides
+    exactly the ones a re-sighting would match -- each of which then arrives as
+    a new finding at an invented location, with a fresh fingerprint and a count
+    that restarts at one. `evaluate_gate` ranks its own candidates by
+    `-occurrences_in_window` for the same reason.
     """
     now = now or utcnow()
-    entries = sorted(
-        ledger["findings"].values(),
-        key=lambda e: (SEVERITIES.index(e["severity"]) if e.get("severity") in SEVERITIES else len(SEVERITIES), e.get("last_seen", "")),
+    # Two stable passes rather than one key, because `last_seen` is an ISO
+    # string and descending on a string has no negation.
+    entries = sorted(ledger["findings"].values(), key=lambda e: e.get("last_seen", ""), reverse=True)
+    entries.sort(
+        key=lambda e: SEVERITIES.index(e["severity"]) if e.get("severity") in SEVERITIES else len(SEVERITIES)
     )
     if not entries:
         return "The ledger is empty: this is the first run, or nothing has been found yet."

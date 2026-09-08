@@ -1623,6 +1623,43 @@ class SummaryTests(unittest.TestCase):
         L.record_finding(ledger, finding(), "abc", NOW)
         self.assertIn(finding()["location"], L.summarise_for_prompt(ledger, NOW))
 
+    def test_severity_orders_the_brief_and_recency_orders_each_band(self):
+        ledger = L.empty_ledger()
+        for severity in ("low", "high"):
+            for age_hours in (1, 100):
+                L.record_finding(
+                    ledger,
+                    finding(severity=severity, title="%s seen %dh ago" % (severity, age_hours)),
+                    "abc",
+                    NOW - dt.timedelta(hours=age_hours),
+                )
+        titles = [line.split("] ")[1].split(" @ ")[0] for line in
+                  L.summarise_for_prompt(ledger, NOW).split("\n")]
+        self.assertEqual(
+            ["high seen 1h ago", "high seen 100h ago", "low seen 1h ago", "low seen 100h ago"],
+            titles,
+        )
+
+    def test_the_rows_the_limit_drops_are_the_stalest_ones(self):
+        """The brief is what hands the next run the fingerprint and location a
+        re-sighting has to match. Truncating to the stalest rows hides exactly
+        the ones this run is about to see again -- each then arrives as a new
+        finding at an invented location, with a count that restarts at one."""
+        ledger = L.empty_ledger()
+        for age_hours in range(6):
+            L.record_finding(
+                ledger,
+                finding(title="seen %dh ago" % age_hours),
+                "abc",
+                NOW - dt.timedelta(hours=age_hours),
+            )
+        text = L.summarise_for_prompt(ledger, NOW, limit=2)
+        for age_hours in (0, 1):
+            self.assertIn("seen %dh ago" % age_hours, text)
+        for age_hours in range(2, 6):
+            self.assertNotIn("seen %dh ago" % age_hours, text)
+        self.assertIn("and 4 more", text)
+
 
 class AgentGradedFieldTests(unittest.TestCase):
     """SOUL.md asks the agent for `confidence` and `user_impact`; both were
