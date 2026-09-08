@@ -25,7 +25,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -143,7 +143,8 @@ class SubmitSuggestionTestCase(unittest.TestCase):
 
         # `gh pr create` needs a GitHub. Record the call instead.
         self.gh_calls = []
-        self.patch_attr(submit_suggestion, "subprocess", _GhStub(self))
+        self.gh_stub = _GhStub(self)
+        self.patch_attr(submit_suggestion, "subprocess", self.gh_stub)
 
     def seed_origin(self) -> Path:
         origin = self.tmp_path / "origin.git"
@@ -1058,6 +1059,145 @@ class TestContentMode(SubmitSuggestionTestCase):
         self.assertIn("workspace", payload)
 
 
+# --------------------------------------------------------------------------- #
+# Telemetry metrics & SLA duration
+# --------------------------------------------------------------------------- #
+
+
+class TestTelemetryMetrics(SubmitSuggestionTestCase):
+    def test_no_telemetry_leaves_body_byte_identical(self):
+        payload = self.prepare()
+        self.commit(payload["workspace"])
+        original_body = "This is a clean suggestion body without metrics."
+        self.submit(payload["branch"], payload["workspace"], body=original_body)
+
+        create_calls = [c for c in self.gh_calls if c[0][1:3] == ["pr", "create"]]
+        self.assertEqual(len(create_calls), 1)
+        argv = create_calls[0][0]
+        self.assertIn("--body-file", argv)
+        self.assertEqual(self.gh_stub.bodies[payload["branch"]], original_body)
+
+    def test_explicit_telemetry_flags_embed_markdown_and_json_comment(self):
+        payload = self.prepare()
+        self.commit(payload["workspace"])
+        original_body = "Suggestion description."
+
+        args = [
+            "submit",
+            "--branch", payload["branch"],
+            "--title", "title",
+            "--body", original_body,
+            "--workspace", str(payload["workspace"]),
+            "--repo", "acme/fleet",
+            "--input-tokens", "14820",
+            "--output-tokens", "1240",
+            "--elapsed", "45s",
+            "--model", "gemini-3.5-flash",
+            "--steps", "4",
+            "--trace-id", "0af7651916cd43dd8448eb211c80319c",
+        ]
+        out = io.StringIO()
+        with redirect_stdout(out):
+            submit_suggestion.dispatch(args)
+
+        create_calls = [c for c in self.gh_calls if c[0][1:3] == ["pr", "create"]]
+        self.assertEqual(len(create_calls), 1)
+        submitted_body = self.gh_stub.bodies[payload["branch"]]
+
+        self.assertIn("### ⏱️ Telemetry & SLA Metrics", submitted_body)
+        self.assertIn("- **Discovery-to-PR Duration:** `45s`", submitted_body)
+        self.assertIn("- **Token Consumption:** `16,060 (14,820 input / 1,240 output)`", submitted_body)
+        self.assertIn("- **AI Model:** `gemini-3.5-flash`", submitted_body)
+        self.assertIn("- **Tool Call Executions:** `4`", submitted_body)
+        self.assertIn("- **OpenTelemetry Trace ID:** `0af7651916cd43dd8448eb211c80319c`", submitted_body)
+
+        # Extract and parse JSON comment
+        prefix = "<!-- kube-agents-telemetry: "
+        self.assertIn(prefix, submitted_body)
+        json_part = submitted_body.split(prefix, 1)[1].split(" -->", 1)[0]
+        meta = json.loads(json_part)
+        self.assertEqual(meta["input_tokens"], 14820)
+        self.assertEqual(meta["output_tokens"], 1240)
+        self.assertEqual(meta["total_tokens"], 16060)
+        self.assertEqual(meta["elapsed"], "45s")
+        self.assertEqual(meta["model"], "gemini-3.5-flash")
+        self.assertEqual(meta["steps"], 4)
+        self.assertEqual(meta["trace_id"], "0af7651916cd43dd8448eb211c80319c")
+
+    @patch("urllib.request.urlopen")
+    def test_fetch_hermes_session_tokens_urlopen_success(self, mock_urlopen):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({
+            "session": {
+                "input_tokens": 1000,
+                "output_tokens": 200,
+                "cache_read_tokens": 500,
+                "cache_write_tokens": 50,
+            }
+        }).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        with patch.dict(os.environ, {"PLATFORM_AGENT_TOKEN": "secret-token-xyz"}):
+            tokens = submit_suggestion.fetch_hermes_session_tokens("sess-123")
+
+        self.assertIsNotNone(tokens)
+        self.assertEqual(tokens["input_tokens"], 1000)
+        self.assertEqual(tokens["output_tokens"], 200)
+        self.assertEqual(tokens["cache_read_tokens"], 500)
+        self.assertEqual(tokens["cache_write_tokens"], 50)
+        self.assertEqual(tokens["total_tokens"], 1750)
+
+        req = mock_urlopen.call_args[0][0]
+        self.assertEqual(
+            req.full_url,
+            "http://platform-agent.kubeagents-system.svc.cluster.local:8642/api/sessions/sess-123",
+        )
+        self.assertEqual(req.headers.get("Authorization"), "Bearer secret-token-xyz")
+
+    @patch("urllib.request.urlopen", side_effect=OSError("connection refused"))
+    def test_fetch_hermes_session_tokens_network_error(self, mock_urlopen):
+        tokens = submit_suggestion.fetch_hermes_session_tokens("sess-123")
+        self.assertIsNone(tokens)
+
+    @patch("urllib.request.urlopen")
+    def test_hermes_session_tokens_auto_sourcing(self, mock_urlopen):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({
+            "session": {
+                "input_tokens": 5000,
+                "output_tokens": 250,
+                "cache_read_tokens": 1000,
+                "cache_write_tokens": 50,
+            }
+        }).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        payload = self.prepare()
+        self.commit(payload["workspace"])
+
+        with patch.dict(os.environ, {"HERMES_SESSION_ID": "sess-test-999"}):
+            self.submit(payload["branch"], payload["workspace"], body="Body text")
+
+        create_calls = [c for c in self.gh_calls if c[0][1:3] == ["pr", "create"]]
+        self.assertEqual(len(create_calls), 1)
+        submitted_body = self.gh_stub.bodies[payload["branch"]]
+
+        self.assertIn(
+            "- **Token Consumption:** `6,300 (5,000 input / 250 output / 1,050 cache)`",
+            submitted_body,
+        )
+        prefix = "<!-- kube-agents-telemetry: "
+        json_part = submitted_body.split(prefix, 1)[1].split(" -->", 1)[0]
+        meta = json.loads(json_part)
+        self.assertEqual(meta["input_tokens"], 5000)
+        self.assertEqual(meta["output_tokens"], 250)
+        self.assertEqual(meta["cache_read_tokens"], 1000)
+        self.assertEqual(meta["cache_write_tokens"], 50)
+        self.assertEqual(meta["total_tokens"], 6300)
+
+
 class _GhStub:
     """Stand in for the `subprocess` module inside submit_suggestion.
 
@@ -1076,6 +1216,7 @@ class _GhStub:
         self._test = test
         self.open_prs: dict[str, str] = {}
         self.titles: dict[str, str] = {}
+        self.bodies: dict[str, str] = {}
 
     def __getattr__(self, name):
         return getattr(subprocess, name)
@@ -1085,16 +1226,23 @@ class _GhStub:
         if argv[:1] != ["gh"]:
             return subprocess.run(cmd, **kwargs)
         self._test.gh_calls.append((argv, kwargs.get("cwd")))
+        body_input = kwargs.get("input")
         verb = argv[1:3]
         if verb == ["pr", "create"]:
-            return self._create(argv)
+            try:
+                return self._create(argv, body_input)
+            except TypeError:
+                return self._create(argv)
         if verb == ["pr", "edit"]:
-            return self._edit(argv)
+            try:
+                return self._edit(argv, body_input)
+            except TypeError:
+                return self._edit(argv)
         if verb == ["pr", "view"]:
             return self._view(argv)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    def _create(self, argv):
+    def _create(self, argv, body=None):
         branch = argv[argv.index("--head") + 1]
         if branch in self.open_prs:
             # Verbatim shape of the real refusal, because the code keys on it.
@@ -1106,13 +1254,16 @@ class _GhStub:
         url = f"https://github.com/acme/fleet/pull/{len(self.open_prs) + 1}"
         self.open_prs[branch] = url
         self.titles[branch] = argv[argv.index("--title") + 1]
+        self.bodies[branch] = body
         return subprocess.CompletedProcess(argv, 0, url + "\n", "")
 
-    def _edit(self, argv):
+    def _edit(self, argv, body=None):
         branch = argv[3]
         if branch not in self.open_prs:
             return subprocess.CompletedProcess(argv, 1, "", "no pull requests found\n")
         self.titles[branch] = argv[argv.index("--title") + 1]
+        if body is not None:
+            self.bodies[branch] = body
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     def _view(self, argv):
