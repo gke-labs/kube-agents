@@ -207,6 +207,65 @@ what the renderer does with them.
   today).
 - `domains_covered` — `domains_total − len(uncovered)`.
 
+## health.json (optional input)
+
+The CI health adjudicator writes `health.json` beside `data.json` in the
+bucket. The renderer reads a copy through `--health health.json` and the
+page polls the object next to `data.json` on the same 60-second cadence;
+it feeds the banner at the top of the page and nothing else. The fields
+the renderer reads:
+
+```json
+{
+  "state": "GREEN|DEGRADED|OUTAGE",
+  "since": "<iso8601>",
+  "cause": "one sentence",
+  "advice": "one sentence",
+  "failing_cases": ["<case name>"],
+  "generated_at": "<iso8601>",
+  "stale": false
+}
+```
+
+- An absent file, unparseable JSON, a non-object, or a `state` outside the
+  three words (compared case-insensitively) renders **no banner**, and the
+  rest of the page is exactly what it is without the file. `render.py`
+  never fails on this input.
+- Every other field is optional: a non-string `cause` or `advice` renders
+  nothing, a non-list `failing_cases` (or its non-string members) drops, an
+  unparseable `since` or `generated_at` reads as unknown. Keys the writer
+  adds (`evidence`, `metrics`, anything later) are ignored.
+- The banner shows the state as glyph + word + colour, `since` as an
+  absolute UTC stamp plus the duration up to `generated_at` (the verdict's
+  own clock, so the baked page and the client re-render agree), the cause,
+  the advice, and a `details ↓` link to `#gate` carrying `failing_cases`
+  and `since` as the parameters below. The client adds the wall-clock age
+  to the `checked HH:MM UTC` stamp and labels it `STALE` (past
+  `stale_after_s`, or `stale: true`) or `UNREACHABLE` (a poll failed; the
+  last verdict stays up) in words, as the freshness badge does.
+- `render.py` does not copy `health.json` into its out-dir: the adjudicator
+  owns that object, and republishing a copy would overwrite a fresher
+  verdict with the one the render happened to read.
+
+## Page URL parameters
+
+Deep links into the published page, the contract the health poster's Chat
+messages use. Query before fragment:
+`index.html?cases=a,b&since=2026-09-08T09:00:00Z&until=2026-09-08T12:00:00Z#gate`.
+
+| Parameter | Value                                                                                                                  | Effect                                                                                                                                                                                                          |
+| --------- | ---------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cases`   | comma-separated case names, each matching `[A-Za-z0-9][A-Za-z0-9._-]{0,79}`; the first 50 are read                    | matrix rows for those cases get a `linked` badge and an accent bar; the other rows dim but stay readable. A name that is not a case on record is ignored; when none matches, no row dims.                       |
+| `since`   | ISO 8601: `YYYY-MM-DD`, optionally `THH:MM[:SS[.ffffff]]` and `Z` or a `±HH:MM` offset; a timezone-naive stamp is UTC | runs whose `started` is at or after it get a window ring on their matrix column, and the failure-signature Pareto counts the reps of those runs instead of the rolling 7 days (run-level events stay excluded). |
+| `until`   | same shape; read only alongside `since`, and only when not before it                                                   | closes the window (inclusive). Absent, the window is open-ended.                                                                                                                                                |
+| fragment  | `#agent`, `#gate`, `#evidence` or `#release`, after the query                                                          | scrolls to that section (clear of the sticky bar) and selects its nav tab.                                                                                                                                      |
+
+Parsing is client-side only — the server render is the same page whatever
+the URL carries. A value that fails its grammar is dropped silently, every
+value reaches the DOM HTML-escaped, and the note under **The gate** names
+what is highlighted and the window in words, with a `clear` control that
+removes the parameters.
+
 ## Sources
 
 - `--pr-glob <gs glob>` (repeatable) — Prow build dirs, discovered with

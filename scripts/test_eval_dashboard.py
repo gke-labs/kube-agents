@@ -17,9 +17,13 @@ runner, and the local-path test uses a runner that fails the test if called.
 """
 
 import contextlib
+import html as html_lib
 import io
 import json
 import pathlib
+import re
+import shutil
+import subprocess
 import tempfile
 import unittest
 
@@ -27,6 +31,29 @@ from eval_dashboard import publish, render
 
 REPO_NOTES = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "case-notes.yaml"
 REPO_EVENTS = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "events.yaml"
+
+# A headless browser, when one is installed, runs the template's script for
+# real: the parity tests compare the baked page with its own JS re-render,
+# and the deep-link tests read the DOM a linked URL produces. Absent a
+# browser those tests skip; the string tripwires below are the floor.
+CHROME_CANDIDATES = (
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "google-chrome",
+    "google-chrome-stable",
+    "chromium",
+    "chromium-browser",
+)
+CHROME = next(
+    (
+        c
+        for c in (
+            (path if pathlib.Path(path).exists() else shutil.which(path))
+            for path in CHROME_CANDIDATES
+        )
+        if c
+    ),
+    None,
+)
 
 # A reason long enough to exercise the 60-char snippet fallback, carrying an
 # agent-classed keyword ("false finding").
@@ -169,10 +196,33 @@ def fixture_events_yaml():
     )
 
 
-def render_fixture(data, notes_path=None, events_path=None, events_yaml=None):
+def fixture_health(state="OUTAGE", **overrides):
+    """What the CI health adjudicator writes beside data.json: an OUTAGE
+    that began during run C's day, blaming two of the fixture's cases,
+    adjudicated at the data's generated_at. ``evidence`` and ``metrics``
+    are present because the writer emits them; the renderer ignores both."""
+    health = {
+        "state": state,
+        "since": "2026-08-31T10:00:00Z",
+        "cause": "shared fixture/environment break: case-a, case-e",
+        "failing_cases": ["case-a", "case-e"],
+        "evidence": ["case-a failed all graded reps on 2 runs from 2 PRs"],
+        "advice": "Don't retest yet; the failing cases share a cause.",
+        "metrics": {"green_share_24h": 0.4},
+        "generated_at": "2026-09-01T12:00:00Z",
+    }
+    health.update(overrides)
+    return health
+
+
+def render_fixture(
+    data, notes_path=None, events_path=None, events_yaml=None, health=None, health_text=None
+):
     """Run the real CLI against a temp dir; returns (html, out_dir, tmp).
-    Notes and events default to *absent* files so the repo's own annotation
-    files never leak into a test; pass events_yaml to write one inline."""
+    Notes, events and health default to *absent* files so the repo's own
+    annotation files never leak into a test; pass events_yaml to write one
+    inline, health (a dict) or health_text (raw bytes of the file) to add a
+    --health input."""
     tmp = tempfile.TemporaryDirectory()
     out_dir = pathlib.Path(tmp.name) / "out"
     data_path = pathlib.Path(tmp.name) / "data.json"
@@ -183,9 +233,81 @@ def render_fixture(data, notes_path=None, events_path=None, events_yaml=None):
     argv = ["--data", str(data_path), "--out-dir", str(out_dir)]
     argv += ["--notes", str(notes_path or pathlib.Path(tmp.name) / "no-notes.yaml")]
     argv += ["--events", str(events_path or pathlib.Path(tmp.name) / "no-events.yaml")]
+    if health is not None or health_text is not None:
+        health_path = pathlib.Path(tmp.name) / "health.json"
+        health_path.write_text(health_text if health_text is not None else json.dumps(health))
+        argv += ["--health", str(health_path)]
     with contextlib.redirect_stdout(io.StringIO()):
         render.main(argv)
     return (out_dir / "index.html").read_text(), out_dir, tmp
+
+
+def banner_of(app):
+    if 'id="healthbanner"' not in app:
+        raise AssertionError("no health banner rendered")
+    return app.split('<div id="health">', 1)[1].split("</section>", 1)[0]
+
+
+# --- the headless-browser harness ------------------------------------------
+
+# Injected around the shipped page: the first script captures #app as the
+# browser parsed the *baked* HTML; the last compares it with #app after the
+# template's own renderAll() replaced it. Both sides are the browser's
+# serialization of a parsed DOM, so the comparison is apples to apples. The
+# banner's "checked" span is normalized out: the script adds the wall-clock
+# age and a STALE/UNREACHABLE label to it by design, exactly as it does to
+# the freshness badge, and a separate assertion covers that label.
+PROBE_CAPTURE = '<script>window.__baked=document.getElementById("app").innerHTML;</script>'
+PROBE_COMPARE = """<script>(function(){
+  const strip = (s) => s.replace(/<span class="hfresh[^"]*" id="healthfresh">[^<]*<\\/span>/, "");
+  const baked = strip(window.__baked), live = strip(document.getElementById("app").innerHTML);
+  let at = 0;
+  while (at < baked.length && baked[at] === live[at]) at += 1;
+  document.title = JSON.stringify({parity: baked === live, at,
+    baked: baked.slice(Math.max(0, at - 80), at + 160), live: live.slice(Math.max(0, at - 80), at + 160)});
+})()</script>"""
+
+
+def browser_dom(html, out_dir, query="", fragment=""):
+    """The DOM after the page's script ran, as headless Chrome serializes
+    it, plus the parity verdict the probe wrote into <title>. ``query`` and
+    ``fragment`` are appended to the file:// URL verbatim (the browser
+    parses them exactly as it would on the published page)."""
+    probe = html.replace("<script>", PROBE_CAPTURE + "<script>", 1)
+    probe = probe.replace("</body>", PROBE_COMPARE + "</body>")
+    probe_path = out_dir / "probe.html"
+    probe_path.write_text(probe)
+    proc = subprocess.run(
+        [
+            CHROME,
+            "--headless",
+            "--disable-gpu",
+            "--no-sandbox",
+            "--virtual-time-budget=2000",
+            "--dump-dom",
+            probe_path.as_uri() + query + fragment,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=True,
+    )
+    dom = proc.stdout
+    title = html_lib.unescape(dom.split("<title>", 1)[1].split("</title>", 1)[0])
+    return dom, json.loads(title)
+
+
+def live_app(dom):
+    """#app as the script re-rendered it (the serialized DOM, not the baked
+    fragment -- attribute quoting and entities are the browser's)."""
+    return dom.split('<div id="app">', 1)[1].split("<script>", 1)[0]
+
+
+def live_mx_row_for(app, case_name):
+    rows = [r for r in re.split(r'<div class="mx-row(?: hl| dim)?">', app) if f">{case_name}</span>" in r]
+    if not rows:
+        raise AssertionError(f"no matrix row for {case_name}")
+    return rows[0].split('<div class="mx-ev">')[0].split('<div class="legend')[0]
 
 
 def baked_app(html):
@@ -365,6 +487,24 @@ class RenderGoldenTest(unittest.TestCase):
         self.assertIn(">IN PRESUBMIT</span>", self.app)
         self.assertIn(">NOT IN PRESUBMIT</span>", self.app)  # case-f
 
+    def test_section_anchors_exist_once_and_the_nav_uses_them(self):
+        # The deep-link contract names #agent, #gate and #evidence; each id
+        # must exist exactly once (a duplicate id makes the fragment land on
+        # whichever the browser finds first) and the nav tabs must point at
+        # them. #nightly was the evidence heading's old id.
+        for anchor in ("agent", "gate", "evidence", "release"):
+            self.assertEqual(self.app.count(f'<h2 id="{anchor}">'), 1, anchor)
+            self.assertEqual(self.app.count(f'id="{anchor}"'), 1, anchor)
+            self.assertIn(f'href="#{anchor}"', self.html)
+        self.assertNotIn('id="nightly"', self.html)
+        self.assertNotIn('href="#nightly"', self.html)
+
+    def test_no_banner_container_is_empty_without_health(self):
+        # The container always renders (the health poll re-renders it
+        # alone); without a verdict it is empty and sits first in #app.
+        self.assertTrue(self.app.lstrip().startswith('<div id="health"></div>'))
+        self.assertNotIn("healthbanner", self.app)
+
     def test_superseded_sections_are_gone(self):
         for marker in (
             "Latest run",  # hero tile
@@ -387,6 +527,168 @@ class RenderGoldenTest(unittest.TestCase):
     def test_data_json_copied_next_to_index(self):
         copied = json.loads((self.out_dir / "data.json").read_text())
         self.assertEqual(copied["generated_at"], "2026-09-01T12:00:00Z")
+
+
+class HealthBannerTest(unittest.TestCase):
+    """The gate-health banner rendered from health.json (--health)."""
+
+    def render(self, **kwargs):
+        html, _, tmp = render_fixture(fixture_data(), **kwargs)
+        self.addCleanup(tmp.cleanup)
+        return html, baked_app(html)
+
+    def test_banner_renders_for_each_state_above_the_hero(self):
+        for state, glyph, cls in (
+            ("GREEN", "🟢", "hs-green"),
+            ("DEGRADED", "🟡", "hs-amber"),
+            ("OUTAGE", "🔴", "hs-red"),
+        ):
+            _, app = self.render(health=fixture_health(state))
+            banner = banner_of(app)
+            # The very top of the page: before the hero's h1.
+            self.assertLess(app.index('id="healthbanner"'), app.index("<h1>"))
+            # Glyph, word and colour class together -- never colour alone.
+            self.assertIn(f'<span class="hpill">{glyph} {state}</span>', banner)
+            self.assertIn(f'<section class="health {cls}"', banner)
+            self.assertIn('role="status"', banner)
+
+    def test_banner_carries_since_cause_advice_and_the_details_link(self):
+        _, app = self.render(health=fixture_health())
+        banner = banner_of(app)
+        # Absolute UTC start plus the duration up to the verdict's own
+        # generated_at (09-01 12:00 - 08-31 10:00 = 26h), not the wall clock.
+        self.assertIn("since 2026-08-31 10:00 UTC · for 1d 2h", banner)
+        self.assertIn('<span class="hfresh" id="healthfresh">checked 12:00 UTC</span>', banner)
+        self.assertIn(
+            '<div class="hcause">shared fixture/environment break: case-a, case-e</div>', banner
+        )
+        self.assertIn("Don&#x27;t retest yet; the failing cases share a cause.", banner)
+        # The drill-down is the deep link: failing cases + since, then #gate.
+        self.assertIn(
+            '<a class="hdetails" href="?cases=case-a,case-e&amp;since=2026-08-31T10%3A00%3A00Z#gate">details ↓</a>',
+            banner,
+        )
+
+    def test_details_link_is_the_bare_anchor_without_cases_or_since(self):
+        _, app = self.render(health=fixture_health("GREEN", failing_cases=[], since=None))
+        banner = banner_of(app)
+        self.assertIn('href="#gate"', banner)
+        self.assertIn("since unknown", banner)
+
+    def test_duration_is_floored_and_never_negative(self):
+        # A verdict adjudicated before its own since (clock skew in the
+        # writer) shows the start but no duration rather than "-1h".
+        _, app = self.render(
+            health=fixture_health(since="2026-09-01T13:00:00Z", generated_at="2026-09-01T12:00:00Z")
+        )
+        self.assertIn("since 2026-09-01 13:00 UTC</span>", banner_of(app))
+        minute = render.MINUTE_MS
+        self.assertEqual(render.duration_text(-5 * minute), "0m")
+        self.assertEqual(render.duration_text(59 * minute + 59999), "59m")
+        self.assertEqual(render.duration_text((3 * 60 + 12) * minute), "3h 12m")
+        self.assertEqual(render.duration_text(26 * 60 * minute), "1d 2h")
+
+    def test_absent_health_means_no_banner_and_a_null_bootstrap(self):
+        html, app = self.render()
+        self.assertNotIn("healthbanner", app)
+        self.assertIn("health: null,", html)
+        self.assertIn("Case × run outcome matrix", app)
+
+    def test_malformed_health_means_no_banner_and_the_page_still_renders(self):
+        shapes = (
+            "{not json",
+            "[]",
+            '"OUTAGE"',
+            "{}",
+            '{"state": "PURPLE"}',
+            '{"state": 5, "cause": "x"}',
+            '{"state": null}',
+        )
+        for text in shapes:
+            html, app = self.render(health_text=text)
+            self.assertNotIn("healthbanner", app, text)
+            self.assertIn("health: null,", html, text)
+            self.assertIn("Case × run outcome matrix", app, text)
+        html, app = self.render(health_text="")
+        self.assertNotIn("healthbanner", app)
+
+    def test_off_shape_optional_fields_degrade_field_by_field(self):
+        # A recognised state with everything else wrong still renders the
+        # pill: strings that are not strings drop, cases that are not a list
+        # drop, an unparseable since reads "unknown".
+        _, app = self.render(
+            health={
+                "state": "outage",  # case-insensitive
+                "since": "yesterday",
+                "cause": ["a", "list"],
+                "advice": 7,
+                "failing_cases": "case-a",
+                "generated_at": "2026-09-01T12:00:00Z",
+            }
+        )
+        banner = banner_of(app)
+        self.assertIn("🔴 OUTAGE", banner)
+        self.assertIn("since unknown", banner)
+        self.assertIn('href="#gate"', banner)
+        self.assertNotIn("hcause", banner)
+        self.assertNotIn("hadvice", banner)
+        _, app = self.render(health=fixture_health(failing_cases=["case-a", 3, None, {"x": 1}]))
+        self.assertIn('href="?cases=case-a&amp;since=', banner_of(app))
+
+    def test_hostile_health_text_is_escaped_everywhere_it_lands(self):
+        html, app = self.render(
+            health=fixture_health(
+                cause='<img src=x onerror=alert(3)> "quoted"',
+                advice="</script><script>alert(4)</script>",
+                failing_cases=['"><script>alert(5)</script>', "case-a"],
+                since="2026-08-31T10:00:00Z",
+            )
+        )
+        banner = banner_of(app)
+        self.assertNotIn("<img src=x", banner)
+        self.assertNotIn("<script>", banner)
+        self.assertIn("&lt;img src=x onerror=alert(3)&gt; &quot;quoted&quot;", banner)
+        # The case id reaches the href percent-encoded and then HTML-escaped.
+        self.assertIn(
+            'href="?cases=%22%3E%3Cscript%3Ealert(5)%3C%2Fscript%3E,case-a&amp;since=', banner
+        )
+        # And the bootstrap copy carries no '<' at all.
+        self.assertNotIn("<script>alert(4)", html)
+        self.assertIn("\\u003c/script>\\u003cscript>alert(4)", html)
+
+    def test_banner_renders_on_the_empty_state_page_too(self):
+        data = {"schema_version": 1, "generated_at": "2026-08-28T14:02:11Z",
+                "source": "logs", "runs": [], "cases": []}
+        html, _, tmp = render_fixture(data, health=fixture_health("DEGRADED"))
+        self.addCleanup(tmp.cleanup)
+        app = baked_app(html)
+        self.assertIn("🟡 DEGRADED", banner_of(app))
+        self.assertIn('id="empty-state"', app)
+        self.assertLess(app.index('id="healthbanner"'), app.index('id="empty-state"'))
+
+    def test_health_json_is_not_copied_into_the_out_dir(self):
+        # The adjudicator owns that object in the bucket; publishing a copy
+        # from the render would overwrite a fresher verdict with this one.
+        _, out_dir, tmp = render_fixture(fixture_data(), health=fixture_health())
+        self.addCleanup(tmp.cleanup)
+        self.assertEqual(sorted(p.name for p in out_dir.iterdir()), ["data.json", "index.html"])
+
+    def test_load_health_direct(self):
+        self.assertIsNone(render.load_health(None))
+        self.assertIsNone(render.load_health(pathlib.Path("/nonexistent/health.json")))
+        normalized = render.normalize_health(fixture_health())
+        self.assertEqual(normalized["state"], "OUTAGE")
+        self.assertEqual(normalized["failing_cases"], ["case-a", "case-e"])
+        self.assertFalse(normalized["stale"])
+        self.assertNotIn("evidence", normalized)
+        self.assertTrue(render.normalize_health(fixture_health(stale=True))["stale"])
+
+    def test_uri_component_mirrors_encode_uri_component(self):
+        # encodeURIComponent's unreserved set, byte for byte.
+        self.assertEqual(render.uri_component("a-b_c.d~e!f*g'h(i)j"), "a-b_c.d~e!f*g'h(i)j")
+        self.assertEqual(render.uri_component("a b,c/d?e#f&g=h"), "a%20b%2Cc%2Fd%3Fe%23f%26g%3Dh")
+        self.assertEqual(render.uri_component("é"), "%C3%A9")
+        self.assertEqual(render.utc_iso(render.iso_ms("2026-08-31T10:00:00.5+02:00")), "2026-08-31T08:00:00Z")
 
 
 class ReasonSignatureTest(unittest.TestCase):
@@ -824,6 +1126,234 @@ class LiveReadSideTest(unittest.TestCase):
         # for a viewer outside UTC. Contract tripwire on the shipped
         # script, like the STALE/UNREACHABLE labels.
         self.assertIn('text += "Z"', script_source(self.html))
+
+    def test_health_travels_with_the_bootstrap(self):
+        html, _, tmp = render_fixture(fixture_data(), health=fixture_health(cause="<b>x</b>"))
+        self.addCleanup(tmp.cleanup)
+        self.assertIn('health: {"state":"OUTAGE","since":"2026-08-31T10:00:00Z"', html)
+        self.assertIn('"cause":"\\u003cb>x\\u003c/b>"', html)
+
+    def test_polls_health_json_beside_data_json_on_the_same_cadence(self):
+        js = script_source(self.html)
+        self.assertIn(f'healthFile: "{render.HEALTH_FILE}"', js)
+        self.assertIn('fetch(DASH.healthFile, { cache: "no-store" })', js)
+        self.assertIn("setInterval(refreshHealth, DASH.refreshMs)", js)
+        # A file:// preview never fetches, so the poll sits behind the same
+        # protocol guard as the data poll.
+        guard = js.split('if (location.protocol !== "file:")', 1)[1].split("}", 1)[0]
+        self.assertIn("refreshHealth();", guard)
+
+    def test_health_banner_stale_and_unreachable_states_carry_text_labels(self):
+        # Same tripwire as the freshness badge: the banner's "checked" stamp
+        # is labelled STALE / UNREACHABLE in words, not amber alone, and a
+        # failed poll keeps the last verdict rather than blanking the banner.
+        js = script_source(self.html)
+        self.assertEqual(js.count("`STALE · ${text}`"), 2)
+        self.assertEqual(js.count("`UNREACHABLE · ${text}`"), 2)
+        self.assertIn(".hfresh.stale", self.html)
+        self.assertIn("healthUnreachable = true;", js)
+        self.assertIn("health = next;", js)
+
+    def test_js_mirror_carries_the_health_and_deep_link_vocabulary(self):
+        # The banner is re-rendered client-side from the template's own
+        # mirror, so a state, glyph, class or parameter name that exists
+        # only in render.py is invisible on the live page (the #1184 lesson,
+        # test_the_js_mirror_carries_the_never_ran_signature).
+        js = script_source(self.html)
+        self.assertIn('healthStates: ["GREEN", "DEGRADED", "OUTAGE"]', js)
+        for state in render.HEALTH_STATES:
+            self.assertIn(f'{state}: "{render.HEALTH_GLYPHS[state]}"', js)
+            self.assertIn(f'{state}: "{render.HEALTH_CLASSES[state]}"', js)
+        self.assertIn(f'healthDetailsAnchor: "{render.HEALTH_DETAILS_ANCHOR}"', js)
+        self.assertIn(f'linkParamCases: "{render.LINK_PARAM_CASES}"', js)
+        self.assertIn(f'linkParamSince: "{render.LINK_PARAM_SINCE}"', js)
+        self.assertIn(f'linkParamUntil: "{render.LINK_PARAM_UNTIL}"', js)
+        # The server never reads the query string: deep links are parsed
+        # client-side only, and only from location.search.
+        self.assertIn("new URLSearchParams(location.search)", js)
+        self.assertNotIn("location.search", render.__doc__ or "")
+
+
+@unittest.skipUnless(CHROME, "no headless Chrome on this machine")
+class BrowserParityTest(unittest.TestCase):
+    """The template's script, run for real: renderAll() must reproduce the
+    baked page byte for byte (as parsed DOM), and a deep-linked URL must
+    produce the highlight, window and Pareto the contract promises."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.html, cls.out_dir, cls._tmp = render_fixture(
+            fixture_data(), events_yaml=fixture_events_yaml(), health=fixture_health()
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def dom(self, query="", fragment="", html=None, out_dir=None):
+        return browser_dom(html or self.html, out_dir or self.out_dir, query, fragment)
+
+    def assert_parity(self, verdict):
+        self.assertTrue(
+            verdict["parity"],
+            f"baked and live #app diverge at {verdict['at']}:\n"
+            f"  baked: {verdict['baked']!r}\n  live:  {verdict['live']!r}",
+        )
+
+    def test_js_rerender_matches_the_baked_page_with_a_banner(self):
+        dom, verdict = self.dom()
+        self.assert_parity(verdict)
+        # The one deliberate difference: the wall-clock label on "checked".
+        # The fixture's verdict is days old, so it must read STALE.
+        self.assertRegex(live_app(dom), r'id="healthfresh">STALE · checked 12:00 UTC · \d+m ago<')
+
+    def test_js_rerender_matches_the_baked_page_without_health(self):
+        html, out_dir, tmp = render_fixture(fixture_data(), events_yaml=fixture_events_yaml())
+        self.addCleanup(tmp.cleanup)
+        dom, verdict = self.dom(html=html, out_dir=out_dir)
+        self.assert_parity(verdict)
+        self.assertIn('<div id="health"></div>', live_app(dom))
+
+    def test_js_rerender_matches_the_baked_empty_state(self):
+        data = {"schema_version": 1, "generated_at": "2026-08-28T14:02:11Z",
+                "source": "logs", "runs": [], "cases": []}
+        html, out_dir, tmp = render_fixture(data, health=fixture_health("GREEN"))
+        self.addCleanup(tmp.cleanup)
+        _, verdict = self.dom(html=html, out_dir=out_dir)
+        self.assert_parity(verdict)
+
+    def test_deep_link_parameters_do_not_change_the_baked_page(self):
+        # The server render is parameter-blind: the probe's __baked capture
+        # is taken from the same page whatever the URL carries, so parity
+        # must fail (the live side highlighted) while the baked side is the
+        # plain page.
+        dom, verdict = self.dom(query="?cases=case-a")
+        self.assertFalse(verdict["parity"])
+        # The first divergence is the link note under the gate heading,
+        # which the baked side does not have; the highlight follows.
+        self.assertIn('id="linknote"', verdict["live"])
+        self.assertNotIn("linknote", verdict["baked"])
+        self.assertNotIn("linknote", baked_app(self.html))
+        self.assertIn('class="mx-row hl"', live_app(dom))
+
+    def test_linked_cases_highlight_and_the_rest_dim(self):
+        dom, _ = self.dom(query="?cases=case-a,case-e,nope", fragment="#gate")
+        app = live_app(dom)
+        self.assertEqual(app.count('class="mx-row hl"'), 2)
+        self.assertEqual(app.count('class="mx-row dim"'), 3)
+        self.assertIn('<em class="b-link">linked</em>', live_mx_row_for(app, "case-a"))
+        self.assertIn('<em class="b-link">linked</em>', live_mx_row_for(app, "case-e"))
+        self.assertNotIn("b-link", live_mx_row_for(app, "case-b"))
+        # The unknown id is ignored silently: not named, not rendered.
+        self.assertNotIn("nope", app)
+        self.assertIn("highlighting case-a, case-e", app)
+        self.assertIn(">clear</a>", app)
+        # No window: the Pareto keeps its rolling caption and no column is marked.
+        self.assertIn("Failure signatures · last 7 days", app)
+        self.assertNotIn(' win"', app)
+
+    def test_unknown_cases_alone_leave_the_matrix_untouched(self):
+        dom, _ = self.dom(query="?cases=nope,also-nope")
+        app = live_app(dom)
+        self.assertNotIn(' hl"', app)
+        self.assertNotIn(' dim"', app)
+        self.assertIn("no linked case is on record", app)
+
+    def test_window_marks_columns_and_filters_the_pareto(self):
+        # Fixture starts: C 08-31T09:00, D 08-31T11:00, E 09-01T08:00,
+        # F 09-01T09:00. [08-31T10:00, 09-01T08:30] holds exactly D and E.
+        dom, _ = self.dom(query="?since=2026-08-31T10:00:00Z&until=2026-09-01T08:30:00Z")
+        app = live_app(dom)
+        self.assertEqual(app.count('class="mx-col win"'), 2)
+        for case in ("case-a", "case-b", "case-c", "case-d", "case-e"):
+            self.assertEqual(live_mx_row_for(app, case).count(' win"'), 2, case)
+        self.assertIn("showing 2026-08-31 10:00 → 2026-09-01 08:30 UTC window", app)
+        # The Pareto now counts D and E only; D is a run-level event, so E
+        # alone: one kanban-columns miss (not the rolling window's three),
+        # the 429 group, and none of run C's reason-less infra reps.
+        self.assertIn("Failure signatures · linked window", app)
+        self.assertIn(
+            '<div class="pa-count">1</div><div class="pa-name">exact-check: kanban-columns</div>',
+            app,
+        )
+        self.assertIn("endpoint saturation (infra)", app)
+        self.assertNotIn("(infra, no reason recorded)", app)
+        self.assertNotIn("EVENT-ONLY-REASON", app)
+
+    def test_since_without_until_is_open_ended(self):
+        dom, _ = self.dom(query="?since=2026-09-01T08:30:00Z")
+        app = live_app(dom)
+        self.assertEqual(app.count('class="mx-col win"'), 1)  # run F only
+        self.assertIn("showing 2026-09-01 08:30 UTC → now window", app)
+
+    def test_same_day_window_is_written_once(self):
+        dom, _ = self.dom(query="?since=2026-09-01T08:30:00Z&until=2026-09-01T09:30:00Z")
+        self.assertIn("showing 2026-09-01 08:30–09:30 UTC window", live_app(dom))
+
+    def test_until_before_since_or_without_since_is_ignored(self):
+        dom, _ = self.dom(query="?since=2026-09-01T09:00:00Z&until=2026-08-01T00:00:00Z")
+        self.assertIn("UTC → now window", live_app(dom))
+        dom, _ = self.dom(query="?until=2026-09-01T09:00:00Z")
+        self.assertNotIn('id="linknote"', live_app(dom))
+
+    def test_the_banners_details_link_applies_the_deep_link(self):
+        href = html_lib.unescape(
+            banner_of(baked_app(self.html)).split('class="hdetails" href="', 1)[1].split('"', 1)[0]
+        )
+        query, fragment = href.split("#", 1)
+        dom, _ = self.dom(query=query, fragment="#" + fragment)
+        app = live_app(dom)
+        self.assertEqual(app.count('class="mx-row hl"'), 2)
+        # since 08-31T10:00 with no until: D, E and F are in the window.
+        self.assertEqual(app.count('class="mx-col win"'), 3)
+
+    def test_hostile_parameters_never_reach_the_dom_unescaped(self):
+        dom, _ = self.dom(
+            query=(
+                "?cases=%3Cscript%3Ealert(1)%3C%2Fscript%3E,case-a,%22%20onmouseover%3D%22x"
+                "&since=%3Cimg%20src%3Dx%20onerror%3Dalert(2)%3E"
+                "&until=2026-09-01T09:00:00Z"
+            ),
+            fragment="#%22%3E%3Cb%3Eboom",
+        )
+        app = live_app(dom)
+        self.assertNotIn("<script>alert(1)", dom)
+        self.assertNotIn("<img src=x", dom)
+        self.assertNotIn("onmouseover", app)
+        self.assertNotIn("<b>boom", dom)
+        # The one well-formed id still works; the malformed since is dropped
+        # (no window), so until is dropped with it.
+        self.assertEqual(app.count('class="mx-row hl"'), 1)
+        self.assertNotIn("window", app.split('id="linknote"', 1)[1].split("</div>", 1)[0])
+        self.assertNotIn(' win"', app)
+        # The clear link carries the path only: the fragment was not a bare
+        # section anchor.
+        note = app.split('id="linknote"', 1)[1].split("</div>", 1)[0]
+        self.assertRegex(note, r'<a href="[^"#<>]*probe\.html">clear</a>')
+
+    def test_case_id_grammar_bounds_length_and_count(self):
+        too_long = "x" * 81
+        many = ",".join(f"c{i}" for i in range(60)) + ",case-a"
+        dom, _ = self.dom(query=f"?cases={too_long},case-b")
+        self.assertEqual(live_app(dom).count('class="mx-row hl"'), 1)
+        # case-a sits past the 50-id cap and is not honoured.
+        dom, _ = self.dom(query=f"?cases={many}")
+        self.assertNotIn(' hl"', live_app(dom))
+
+    def test_nav_tab_follows_the_fragment(self):
+        # Attribute order in the serialized DOM is whatever the tag started
+        # with, so match the tab by its href rather than a literal tag.
+        def on_tabs(dom):
+            nav = dom.split('<nav class="nav">', 1)[1].split("</nav>", 1)[0]
+            return [t for t in re.findall(r"<a [^>]*>", nav) if 'class="on"' in t]
+
+        for fragment in ("#gate", "#evidence"):
+            tabs = on_tabs(self.dom(fragment=fragment)[0])
+            self.assertEqual(len(tabs), 1, fragment)
+            self.assertIn(f'href="{fragment}"', tabs[0])
+        tabs = on_tabs(self.dom()[0])
+        self.assertEqual(len(tabs), 1)
+        self.assertIn('href="#agent"', tabs[0])
 
 
 class PublishTest(unittest.TestCase):

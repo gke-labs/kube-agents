@@ -21,11 +21,14 @@ The page tells one story in two bands:
 Three rules shape everything here:
 
 * **Computed-only.** Every figure on the page is derived from data.json --
-  no hand-typed numbers can go stale in a template. The two optional extra
+  no hand-typed numbers can go stale in a template. The three optional extra
   inputs are ``case-notes.yaml`` (``--notes``: one-line annotations, issue
-  links and badges per case) and ``events.yaml`` (``--events``: dated event
-  markers plus the few human-judgment counts no log line carries). An absent
-  file degrades to "no annotation" -- never an error.
+  links and badges per case), ``events.yaml`` (``--events``: dated event
+  markers plus the few human-judgment counts no log line carries) and
+  ``health.json`` (``--health``: the gate-health verdict the CI health
+  adjudicator writes beside data.json, rendered as a banner above the hero).
+  An absent or malformed file degrades to "no annotation" / "no banner" --
+  never an error.
 * **INFRA is not failure.** A rep (or task) whose result is ``infra`` is
   excluded from every pass-fraction denominator, matching the suite's policy
   that infrastructure failures never count against a PR.
@@ -45,11 +48,14 @@ this renderer and the collector can ship independently. In particular
 yet; without them every task falls back to its single ``result`` and the
 merged-PR cohort is simply empty.
 
-The rendered page is also live: render.py bakes the data, notes and events
-into the template, whose script re-renders in place from a fresh
-``data.json`` fetch every 60 seconds and keeps a freshness badge honest (see
-the template's "Live read side" comment). The Python fragment builders here
-and the JS mirrors there are intentionally parallel -- change them together.
+The rendered page is also live: render.py bakes the data, notes, events and
+health verdict into the template, whose script re-renders in place from a
+fresh ``data.json`` (and ``health.json``) fetch every 60 seconds and keeps a
+freshness badge honest (see the template's "Live read side" comment). The
+same script is the only reader of the page's deep-link parameters
+(``?cases=&since=&until=``, SCHEMA.md "Page URL parameters"); the server
+render is parameter-blind. The Python fragment builders here and the JS
+mirrors there are intentionally parallel -- change them together.
 
 Only stdlib + PyYAML (already in requirements-test.txt) -- no build step.
 """
@@ -65,6 +71,7 @@ import pathlib
 import re
 import shutil
 import sys
+import urllib.parse
 
 import yaml
 
@@ -108,6 +115,31 @@ DAY_MS = 24 * 3600 * 1000
 REASON_SNIPPET_CHARS = 60
 # Prow's job verdict for a green run (SCHEMA.md: runs[].result).
 RUN_RESULT_GREEN = "SUCCESS"
+MINUTE_MS = 60 * 1000
+
+# --- health.json (SCHEMA.md, "health.json (optional input)") --------------
+# The gate-health verdict the CI health adjudicator writes beside data.json.
+# The page polls this object name next to data.json; render.py bakes the
+# copy passed as --health. The banner is the page's top element.
+HEALTH_FILE = "health.json"
+# The three states the adjudicator emits, with the glyph and CSS class each
+# renders as. The word always sits beside the glyph and the colour -- the
+# page's rule is that no state is announced by colour alone.
+HEALTH_STATES = ("GREEN", "DEGRADED", "OUTAGE")
+HEALTH_GLYPHS = {"GREEN": "🟢", "DEGRADED": "🟡", "OUTAGE": "🔴"}
+HEALTH_CLASSES = {"GREEN": "hs-green", "DEGRADED": "hs-amber", "OUTAGE": "hs-red"}
+# Where the banner's "details" link lands: the gate band, whose matrix and
+# Pareto are the evidence behind the verdict.
+HEALTH_DETAILS_ANCHOR = "#gate"
+# Query-string grammar of the page's deep links (SCHEMA.md, "Page URL
+# parameters"), shared with the health poster's Chat messages. The banner's
+# details link is built from them; the template's script reads them.
+LINK_PARAM_CASES = "cases"
+LINK_PARAM_SINCE = "since"
+LINK_PARAM_UNTIL = "until"
+# JS encodeURIComponent leaves these unescaped besides alphanumerics; quote()
+# always keeps "_.-~", so the two encoders agree on every input.
+URI_COMPONENT_SAFE = "-_.!~*'()"
 
 # --- failure-signature normalization -------------------------------------
 # Deliberately small and documented: a reason that matches nothing renders
@@ -244,6 +276,42 @@ def utc_day(value) -> str | None:
     join key. Mirrors the JS ``toISOString().slice(0, 10)``."""
     parsed = parse_iso(value)
     return f"{parsed:%Y-%m-%d}" if parsed else None
+
+
+def ms_to_utc(ms: float) -> datetime.datetime:
+    return datetime.datetime.fromtimestamp(ms / 1000, tz=datetime.timezone.utc)
+
+
+def utc_stamp(ms: float) -> str:
+    """'YYYY-MM-DD HH:MM'; mirrors the JS ``utcStamp``."""
+    return f"{ms_to_utc(ms):%Y-%m-%d %H:%M}"
+
+
+def utc_hhmm(ms: float) -> str:
+    return f"{ms_to_utc(ms):%H:%M}"
+
+
+def utc_iso(ms: float) -> str:
+    """Second-precision ISO 8601 with a Z suffix, the form the deep links
+    carry; mirrors the JS ``utcIso``."""
+    return f"{ms_to_utc(ms):%Y-%m-%dT%H:%M:%S}Z"
+
+
+def duration_text(ms: float) -> str:
+    """'3d 4h', '3h 12m' or '12m', floored; mirrors the JS ``durationText``."""
+    minutes = max(0, math.floor(ms / MINUTE_MS))
+    days, rem = divmod(minutes, 24 * 60)
+    hours, mins = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {mins}m"
+    return f"{mins}m"
+
+
+def uri_component(value: str) -> str:
+    """Mirrors the JS ``encodeURIComponent`` (see URI_COMPONENT_SAFE)."""
+    return urllib.parse.quote(value, safe=URI_COMPONENT_SAFE)
 
 
 def run_label(run: dict, index: int) -> str:
@@ -508,6 +576,96 @@ def load_events(path: pathlib.Path | None) -> dict:
         }
     out["false_reds_7d"] = raw.get("false_reds_7d")
     return out
+
+
+# --------------------------------------------------------------------------
+# health.json (optional; the gate-health banner)
+
+
+def load_health(path: pathlib.Path | None) -> dict | None:
+    """The banner's input, normalized: ``{"state", "since", "cause",
+    "advice", "failing_cases", "generated_at", "stale"}``. Absent file,
+    unparseable JSON, a non-object, or a state outside HEALTH_STATES all
+    degrade to None -- no banner, nothing else on the page changes. Every
+    other field is optional and defaults to empty. Mirrors the template's
+    ``normalizeHealth``, which applies the same rules to each poll."""
+    if path is None or not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return normalize_health(raw)
+
+
+def normalize_health(raw) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
+    state = str(raw.get("state") or "").upper()
+    if state not in HEALTH_STATES:
+        return None
+
+    def text(key: str) -> str:
+        value = raw.get(key)
+        return value if isinstance(value, str) else ""
+
+    raw_cases = raw.get("failing_cases")
+    cases = [str(c) for c in raw_cases if isinstance(c, str)] if isinstance(raw_cases, list) else []
+    return {
+        "state": state,
+        "since": text("since") if iso_ms(raw.get("since")) is not None else None,
+        "cause": text("cause"),
+        "advice": text("advice"),
+        "failing_cases": cases,
+        "generated_at": text("generated_at") if iso_ms(raw.get("generated_at")) is not None else None,
+        "stale": raw.get("stale") is True,
+    }
+
+
+def health_details_href(health: dict) -> str:
+    """The banner's drill-down: the gate anchor, carrying the failing cases
+    and the incident start as deep-link parameters when there are any."""
+    params = []
+    if health["failing_cases"]:
+        joined = ",".join(uri_component(c) for c in health["failing_cases"])
+        params.append(f"{LINK_PARAM_CASES}={joined}")
+    since = iso_ms(health["since"])
+    if since is not None:
+        params.append(f"{LINK_PARAM_SINCE}={uri_component(utc_iso(since))}")
+    query = "?" + "&".join(params) if params else ""
+    return query + HEALTH_DETAILS_ANCHOR
+
+
+def health_html(health: dict | None) -> str:
+    """The banner. Empty when there is no verdict. The "for Xh Ym" duration
+    is measured from the verdict's own generated_at, not the wall clock, so
+    the baked HTML and the JS re-render agree; the template's script adds
+    the wall-clock age and the STALE / UNREACHABLE labels next to the
+    "checked" stamp, as it does for the freshness badge."""
+    if not health:
+        return ""
+    state = health["state"]
+    since = iso_ms(health["since"])
+    checked = iso_ms(health["generated_at"])
+    since_text = f"since {utc_stamp(since)} UTC" if since is not None else "since unknown"
+    if since is not None and checked is not None and checked >= since:
+        since_text += f" · for {duration_text(checked - since)}"
+    checked_text = f"checked {utc_hhmm(checked)} UTC" if checked is not None else "checked —"
+    parts = [
+        f'<section class="health {HEALTH_CLASSES[state]}" id="healthbanner" role="status">',
+        '<div class="hrow">',
+        f'<span class="hpill">{HEALTH_GLYPHS[state]} {state}</span>',
+        f'<span class="hsince">{esc(since_text)}</span>',
+        f'<span class="hfresh" id="healthfresh">{esc(checked_text)}</span>',
+        f'<a class="hdetails" href="{esc(health_details_href(health))}">details ↓</a>',
+        "</div>",
+    ]
+    if health["cause"]:
+        parts.append(f'<div class="hcause">{esc(health["cause"])}</div>')
+    if health["advice"]:
+        parts.append(f'<div class="hadvice">{esc(health["advice"])}</div>')
+    parts.append("</section>")
+    return "".join(parts)
 
 
 # --------------------------------------------------------------------------
@@ -937,9 +1095,9 @@ def evidence_html(data: dict, notes: dict) -> str:
     if not rows:
         rows = '<tr><td colspan="3"><span class="cap">no cases on record yet</span></td></tr>'
     return f"""
-  <h2 id="nightly">Evidence on record</h2>
+  <h2 id="evidence">Evidence on record</h2>
   <div class="sub">Recorded task appearances per case (all collected runs, infra included), against the {SCREENING_WINDOW}-run yardstick · history depth, not admission progress — the screening window fills only from main-branch runs in the baseline store (bench/baselines/README.md) · annotations from case-notes.yaml</div>
-  <div class="card"><table id="evidence">
+  <div class="card"><table id="evidence-table">
     <thead><tr><th>Case</th><th>Evidence collected</th><th>In presubmit</th></tr></thead>
     <tbody>{rows}</tbody>
   </table></div>"""
@@ -995,11 +1153,15 @@ EMPTY_STATE_HTML = """
   </section>"""
 
 
-def app_html(data: dict, notes: dict, events: dict) -> str:
+def app_html(data: dict, notes: dict, events: dict, health: dict | None = None) -> str:
+    # The banner container is always present (empty without a verdict) so
+    # the template's health poll can re-render it alone.
+    banner = f'<div id="health">{health_html(health)}</div>'
     if not (data.get("runs") or data.get("cases")):
-        return EMPTY_STATE_HTML
+        return banner + EMPTY_STATE_HTML
     return (
-        HERO_HTML
+        banner
+        + HERO_HTML
         + band_agent_html(data, events)
         + band_gate_html(data, notes, events)
         + evidence_html(data, notes)
@@ -1031,17 +1193,18 @@ def bootstrap_json(value) -> str:
     return json.dumps(value, separators=(",", ":")).replace("<", "\\u003c")
 
 
-def render_page(data: dict, notes: dict, events: dict) -> str:
+def render_page(data: dict, notes: dict, events: dict, health: dict | None = None) -> str:
     page = TEMPLATE.read_text()
     values = {
         "__META__": meta_html(data),
         "__FRESHNESS__": freshness_html(data),
-        "__APP__": app_html(data, notes, events),
+        "__APP__": app_html(data, notes, events, health),
         # The live read side: the template's script re-renders from this
-        # baked copy on load, then polls data.json every 60s.
+        # baked copy on load, then polls data.json and health.json every 60s.
         "__DATA_JSON__": bootstrap_json(data),
         "__NOTES_JSON__": bootstrap_json(notes),
         "__EVENTS_JSON__": bootstrap_json(events),
+        "__HEALTH_JSON__": bootstrap_json(health),
     }
     for token in values:
         if token not in page:
@@ -1074,15 +1237,27 @@ def main(argv: list[str] | None = None) -> int:
         default=str(DEFAULT_EVENTS),
         help="events.yaml (optional markers and catch counts; absent file is fine)",
     )
+    parser.add_argument(
+        "--health",
+        default=None,
+        help=(
+            f"{HEALTH_FILE} from the CI health adjudicator (optional banner; "
+            "absent or malformed file renders no banner)"
+        ),
+    )
     args = parser.parse_args(argv)
 
     data = load_data(pathlib.Path(args.data))
     notes = load_notes(pathlib.Path(args.notes))
     events = load_events(pathlib.Path(args.events))
+    health = load_health(pathlib.Path(args.health)) if args.health else None
 
     out_dir = pathlib.Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "index.html").write_text(render_page(data, notes, events))
+    (out_dir / "index.html").write_text(render_page(data, notes, events, health))
+    # health.json is deliberately not copied beside index.html: the
+    # adjudicator owns that object in the bucket, and publishing a copy from
+    # here would overwrite a fresher verdict with the one this render read.
     shutil.copyfile(args.data, out_dir / "data.json")
     print(f"wrote {out_dir / 'index.html'}")
     return 0

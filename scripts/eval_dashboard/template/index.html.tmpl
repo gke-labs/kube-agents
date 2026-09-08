@@ -64,10 +64,45 @@
   .fresh.stale { background:var(--hl-soft); border:1px solid var(--hl);
     border-radius:6px; padding:2px 8px; color:var(--text-primary); font-weight:750; }
 
+  /* gate-health banner (health.json). The state is announced three ways at
+     once -- glyph, word, and colour -- so no reader depends on the colour. */
+  .health { margin-top:22px; background:var(--surface-1); border:1px solid var(--line);
+    border-left:5px solid var(--line-2); border-radius:12px; padding:14px 18px; box-shadow:var(--shadow); }
+  .hs-green { border-left-color:var(--good); }
+  .hs-amber { border-left-color:var(--warn); }
+  .hs-red { border-left-color:var(--crit); }
+  .hrow { display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+  .hpill { display:inline-flex; align-items:center; gap:6px; border-radius:6px; padding:3px 10px;
+    font-size:12px; font-weight:800; letter-spacing:.04em; }
+  .hs-green .hpill { background:var(--good-bg); color:var(--good-text); }
+  .hs-amber .hpill { background:var(--warn-bg); color:var(--warn-text); }
+  .hs-red .hpill { background:var(--crit-bg); color:var(--crit-text); }
+  .hsince, .hfresh { font-size:12.5px; color:var(--text-muted); font-weight:550; }
+  .hfresh.stale { background:var(--hl-soft); border:1px solid var(--hl);
+    border-radius:6px; padding:2px 8px; color:var(--text-primary); font-weight:750; }
+  .hdetails { margin-left:auto; font-size:12.5px; white-space:nowrap; }
+  .hcause { margin-top:8px; font-size:14px; font-weight:650; }
+  .hadvice { margin-top:3px; font-size:13px; color:var(--text-secondary); }
+
+  /* deep-link state (?cases=&since=&until=): linked rows carry a text badge
+     and an accent bar, the rest dim but stay readable; runs inside the
+     window get an accent ring, and the note under the band header names the
+     window in words with a "clear" control. */
+  .mx-row.hl .mx-name { box-shadow:inset 3px 0 0 var(--accent-link,var(--accent)); padding-left:8px; font-weight:750; }
+  .mx-row.dim { opacity:.5; }
+  .b-link { background:var(--accent-soft); color:var(--accent-link,var(--accent)); }
+  .cell.win { box-shadow:0 0 0 1.5px var(--accent-link,var(--accent)); }
+  .mx-head .mx-col.win { border-bottom:2px solid var(--accent-link,var(--accent)); }
+  .linknote { margin-top:10px; font-size:12.5px; font-weight:600; color:var(--text-primary);
+    background:var(--accent-soft); border-radius:8px; padding:6px 10px; display:flex; gap:12px; flex-wrap:wrap; }
+
   .eyebrow { font-size:11.5px; font-weight:750; letter-spacing:.08em; text-transform:uppercase; color:var(--accent-link,var(--accent)); }
   h1 { font-size:25px; font-weight:750; letter-spacing:-.02em; margin-top:6px; }
   .lede { color:var(--text-secondary); font-size:14px; margin-top:6px; max-width:76ch; }
   h2 { font-size:15px; font-weight:750; letter-spacing:-.01em; margin:40px 0 4px; }
+  /* A fragment (#gate from a deep link) lands below the sticky bar rather
+     than under it. */
+  h2[id] { scroll-margin-top:72px; }
   .sub { font-size:12.5px; color:var(--text-muted); margin-bottom:12px; }
 
   /* bands */
@@ -174,7 +209,7 @@
   <span class="brand"><span class="logo">ka</span>evals</span>
   <nav class="nav">
     <a class="on" href="#agent">The agent</a><a href="#gate">The gate</a>
-    <a href="#nightly">Evidence</a><a href="#release">Releases</a>
+    <a href="#evidence">Evidence</a><a href="#release">Releases</a>
   </nav>
   <span class="meta"><span id="headmeta">__META__</span> · <span id="freshness" class="fresh">__FRESHNESS__</span></span>
 </div></div>
@@ -194,18 +229,24 @@ document.addEventListener("mousemove",e=>{
 /* Live read side.
  *
  * render.py bakes the same data below that it rendered server-side; this
- * script re-renders #app from it on load, then refetches data.json every
- * 60 seconds and re-renders in place -- no full page reload, no build step.
- * It is a deliberate JS mirror of render.py's fragment builders (same
- * function names, same order); render.py owns the golden tests, this owns
- * the screen a viewer actually watches. Change them together.
+ * script re-renders #app from it on load, then refetches data.json (and
+ * health.json, the gate-health verdict) every 60 seconds and re-renders in
+ * place -- no full page reload, no build step. It is a deliberate JS mirror
+ * of render.py's fragment builders (same function names, same order);
+ * render.py owns the golden tests, this owns the screen a viewer actually
+ * watches. Change them together.
  *
- * States:
+ * States, for the data feed and the health banner alike:
  *  - fresh:       "updated HH:MM UTC · Nm ago"
  *  - stale:       generated_at older than data.json's stale_after_s
  *                 (default 7200s) -> amber badge labelled STALE
  *  - unreachable: a poll failed -> amber badge labelled UNREACHABLE, and
  *                 the last successfully rendered data stays on screen
+ *
+ * Deep links (SCHEMA.md, "Page URL parameters"): ?cases=a,b&since=<iso>
+ * &until=<iso> before the fragment. Parsed here only -- the server render
+ * ignores them -- and every value reaches the DOM through esc() or through
+ * a validator that rejects anything but a case id or an ISO stamp.
  */
 "use strict";
 
@@ -213,6 +254,23 @@ const DASH = {
   bootstrap: __DATA_JSON__,
   notes: __NOTES_JSON__,
   events: __EVENTS_JSON__,
+  health: __HEALTH_JSON__,
+  healthFile: "health.json",
+  healthStates: ["GREEN", "DEGRADED", "OUTAGE"],
+  healthGlyphs: { GREEN: "🟢", DEGRADED: "🟡", OUTAGE: "🔴" },
+  healthClasses: { GREEN: "hs-green", DEGRADED: "hs-amber", OUTAGE: "hs-red" },
+  healthDetailsAnchor: "#gate",
+  linkParamCases: "cases",
+  linkParamSince: "since",
+  linkParamUntil: "until",
+  // A case id is a bench/tasks/ directory name; anything else is dropped
+  // unread. At most this many ids are honoured from one link.
+  caseIdRe: /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/,
+  linkMaxCases: 50,
+  // The ISO 8601 shapes a deep link may carry; parseIso does the rest.
+  isoParamRe: /^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d{1,6})?)?)?([zZ]|[+-]\d{2}:?\d{2})?$/,
+  // Only a bare section anchor survives into the "clear" link.
+  fragmentRe: /^#[a-z]+$/,
   refreshMs: 60000,
   freshnessTickMs: 30000,
   staleDefaultS: 7200,
@@ -246,6 +304,8 @@ const DASH = {
 
 let current = DASH.bootstrap;
 let unreachable = false;
+let health = normalizeHealth(DASH.health);
+let healthUnreachable = false;
 
 const esc = (value) => String(value)
   .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -281,6 +341,18 @@ const utcDay = (value) => {
   return ms == null ? null : new Date(ms).toISOString().slice(0, 10);
 };
 const utcStamp = (ms) => new Date(ms).toISOString().slice(0, 16).replace("T", " ");
+const utcHhmm = (ms) => new Date(ms).toISOString().slice(11, 16);
+const utcIso = (ms) => new Date(ms).toISOString().slice(0, 19) + "Z";
+// '3d 4h', '3h 12m' or '12m', floored; mirrors render.py's duration_text.
+function durationText(ms) {
+  const minutes = Math.max(0, Math.floor(ms / 60000));
+  const days = Math.floor(minutes / (24 * 60));
+  const hours = Math.floor((minutes % (24 * 60)) / 60);
+  const mins = minutes % 60;
+  if (days) return `${days}d ${hours}h`;
+  if (hours) return `${hours}h ${mins}m`;
+  return `${mins}m`;
+}
 
 function runLabel(run, index) {
   if (run.pr !== undefined && run.pr !== null) return `#${run.pr}`;
@@ -422,6 +494,125 @@ function badgeHtml(entry) {
   return "";
 }
 
+/* ---- health.json: the gate-health banner (mirrors render.py) ---- */
+
+function normalizeHealth(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const state = String(raw.state || "").toUpperCase();
+  if (!DASH.healthStates.includes(state)) return null;
+  const text = (key) => (typeof raw[key] === "string" ? raw[key] : "");
+  const cases = Array.isArray(raw.failing_cases)
+    ? raw.failing_cases.filter((c) => typeof c === "string") : [];
+  return {
+    state,
+    since: parseIso(raw.since) != null ? text("since") : null,
+    cause: text("cause"),
+    advice: text("advice"),
+    failing_cases: cases,
+    generated_at: parseIso(raw.generated_at) != null ? text("generated_at") : null,
+    stale: raw.stale === true,
+  };
+}
+
+function healthDetailsHref(h) {
+  const params = [];
+  if (h.failing_cases.length) {
+    params.push(`${DASH.linkParamCases}=${h.failing_cases.map(encodeURIComponent).join(",")}`);
+  }
+  const since = parseIso(h.since);
+  if (since != null) params.push(`${DASH.linkParamSince}=${encodeURIComponent(utcIso(since))}`);
+  return (params.length ? "?" + params.join("&") : "") + DASH.healthDetailsAnchor;
+}
+
+function healthHtml(h) {
+  if (!h) return "";
+  const since = parseIso(h.since);
+  const checked = parseIso(h.generated_at);
+  let sinceText = since != null ? `since ${utcStamp(since)} UTC` : "since unknown";
+  if (since != null && checked != null && checked >= since) {
+    sinceText += ` · for ${durationText(checked - since)}`;
+  }
+  const checkedText = checked != null ? `checked ${utcHhmm(checked)} UTC` : "checked —";
+  const parts = [
+    `<section class="health ${DASH.healthClasses[h.state]}" id="healthbanner" role="status">`,
+    '<div class="hrow">',
+    `<span class="hpill">${DASH.healthGlyphs[h.state]} ${h.state}</span>`,
+    `<span class="hsince">${esc(sinceText)}</span>`,
+    `<span class="hfresh" id="healthfresh">${esc(checkedText)}</span>`,
+    `<a class="hdetails" href="${esc(healthDetailsHref(h))}">details ↓</a>`,
+    "</div>",
+  ];
+  if (h.cause) parts.push(`<div class="hcause">${esc(h.cause)}</div>`);
+  if (h.advice) parts.push(`<div class="hadvice">${esc(h.advice)}</div>`);
+  parts.push("</section>");
+  return parts.join("");
+}
+
+/* ---- deep links: ?cases=&since=&until= (client-side only) ---- */
+
+// No parameters: the shape every fragment builder gets by default, which
+// is what keeps the JS output identical to the server render.
+const NO_LINK = Object.freeze({ cases: new Set(), sinceMs: null, untilMs: null });
+
+function linkState() {
+  const out = { cases: new Set(), sinceMs: null, untilMs: null };
+  let params;
+  try { params = new URLSearchParams(location.search); } catch (err) { return out; }
+  const rawCases = params.get(DASH.linkParamCases) || "";
+  for (const id of rawCases.split(",").slice(0, DASH.linkMaxCases)) {
+    const trimmed = id.trim();
+    if (DASH.caseIdRe.test(trimmed)) out.cases.add(trimmed);
+  }
+  const since = params.get(DASH.linkParamSince) || "";
+  if (DASH.isoParamRe.test(since)) out.sinceMs = parseIso(since);
+  const until = params.get(DASH.linkParamUntil) || "";
+  if (out.sinceMs != null && DASH.isoParamRe.test(until)) {
+    const untilMs = parseIso(until);
+    if (untilMs != null && untilMs >= out.sinceMs) out.untilMs = untilMs;
+  }
+  return out;
+}
+
+const linkActive = (link) => link.cases.size > 0 || link.sinceMs != null;
+
+function runInWindow(run, link) {
+  if (link.sinceMs == null) return false;
+  const started = parseIso(run.started);
+  if (started == null || started < link.sinceMs) return false;
+  return link.untilMs == null || started <= link.untilMs;
+}
+
+function windowText(link) {
+  const from = utcStamp(link.sinceMs);
+  if (link.untilMs == null) return `${from} UTC → now`;
+  const to = utcStamp(link.untilMs);
+  // Same UTC day: "2026-09-08 09:00–12:00 UTC"; otherwise both stamps.
+  return from.slice(0, 10) === to.slice(0, 10)
+    ? `${from}–${to.slice(11)} UTC` : `${from} → ${to} UTC`;
+}
+
+// The same page without its query string; only a bare section fragment
+// is carried over (the hash is as attacker-controlled as the query).
+function clearHref() {
+  const hash = DASH.fragmentRe.test(location.hash) ? location.hash : "";
+  return location.pathname + hash;
+}
+
+function linkNoteHtml(link, data) {
+  if (!linkActive(link)) return "";
+  const parts = [];
+  if (link.cases.size) {
+    const known = (data.cases || []).filter((c) => c && typeof c === "object"
+      && link.cases.has(String(c.name))).map((c) => String(c.name));
+    parts.push(known.length
+      ? `<span>highlighting ${known.map(esc).join(", ")}</span>`
+      : "<span>no linked case is on record</span>");
+  }
+  if (link.sinceMs != null) parts.push(`<span>showing ${esc(windowText(link))} window</span>`);
+  parts.push(`<a href="${esc(clearHref())}">clear</a>`);
+  return `<div class="linknote" id="linknote">${parts.join(" · ")}</div>`;
+}
+
 /* ---- failure signatures (mirrors render.py) ---- */
 
 function reasonSignature(reason) {
@@ -449,12 +640,16 @@ function reasonClass(reason) {
   return "unknown";
 }
 
-function paretoGroups(data) {
+function paretoGroups(data, link = NO_LINK) {
   const anchor = referenceMs(data);
   const groups = new Map();
   for (const run of sortedRuns(data)) {
     const started = parseIso(run.started);
-    if (anchor != null) {
+    if (link.sinceMs != null) {
+      // A deep-linked window replaces the rolling one; the run-level
+      // event rule below still applies inside it.
+      if (!runInWindow(run, link)) continue;
+    } else if (anchor != null) {
       if (started == null) continue;
       if (started <= anchor - DASH.paretoWindowDays * DASH.dayMs || started > anchor) continue;
     }
@@ -607,7 +802,7 @@ const CELL_TITLES = {
   none: "not in run",
 };
 
-function matrixHtml(data, notes, events) {
+function matrixHtml(data, notes, events, link = NO_LINK) {
   const runs = measuredRuns(data).slice(-DASH.matrixRuns);
   const cases = (data.cases || []).filter((c) => c && typeof c === "object" && c.active !== false);
   if (!runs.length) {
@@ -621,11 +816,15 @@ function matrixHtml(data, notes, events) {
   for (const e of events.events || []) eventDays[e.date] = e.label;
   const runDays = runs.map((r) => utcDay(r.started));
   const runEvents = runs.map(isRunEvent);
+  const runWindowed = runs.map((r) => runInWindow(r, link));
   const taskMaps = runs.map((r) => {
     const map = new Map();
     for (const t of runTasks(r)) map.set(String(t.name), t);
     return map;
   });
+  // Rows dim only when at least one linked case is actually on the board;
+  // a link naming nothing we know leaves the matrix as it is.
+  const highlighting = cases.some((c) => link.cases.has(String(c.name)));
 
   const head = ['<div class="mx-row mx-head"><div class="mx-name"></div>'];
   runs.forEach((run, index) => {
@@ -634,7 +833,9 @@ function matrixHtml(data, notes, events) {
     let title = `${runLabel(run, index)} · ${day || "?"}`;
     if (day in eventDays) title += ` · ${eventDays[day]}`;
     if (runEvents[index]) title += " · run-level event";
-    head.push(`<div class="mx-col" title="${esc(title)}">${marker}</div>`);
+    if (runWindowed[index]) title += " · in linked window";
+    const cls = runWindowed[index] ? "mx-col win" : "mx-col";
+    head.push(`<div class="${cls}" title="${esc(title)}">${marker}</div>`);
   });
   head.push("</div>");
 
@@ -642,13 +843,17 @@ function matrixHtml(data, notes, events) {
   for (const kase of cases) {
     const name = String(kase.name || "?");
     const entry = notes[name];
-    const row = [`<div class="mx-row"><div class="mx-name"><span>${esc(name)}</span>${badgeHtml(entry)}</div>`];
+    const linked = link.cases.has(name);
+    const rowCls = highlighting ? (linked ? "mx-row hl" : "mx-row dim") : "mx-row";
+    const linkBadge = linked ? '<em class="b-link">linked</em>' : "";
+    const row = [`<div class="${rowCls}"><div class="mx-name"><span>${esc(name)}</span>${badgeHtml(entry)}${linkBadge}</div>`];
     runs.forEach((run, index) => {
       const task = taskMaps[index].get(name);
       const state = task ? cellState(task) : "none";
       let title = `${name} · ${runLabel(run, index)} · ${CELL_TITLES[state]}`;
       if (runEvents[index]) title += " · run-level event (charged to the run)";
-      row.push(`<div class="cell ${CELL_CLASSES[state]}" title="${esc(title)}"></div>`);
+      const cls = runWindowed[index] ? `cell ${CELL_CLASSES[state]} win` : `cell ${CELL_CLASSES[state]}`;
+      row.push(`<div class="${cls}" title="${esc(title)}"></div>`);
     });
     row.push("</div>");
     rows.push(row.join(""));
@@ -660,10 +865,11 @@ function matrixHtml(data, notes, events) {
   return `<div class="mx">${rows.join("")}</div>`;
 }
 
-function paretoHtml(data) {
-  const groups = paretoGroups(data);
+function paretoHtml(data, link = NO_LINK) {
+  const groups = paretoGroups(data, link);
   if (!groups.length) {
-    return `<div class="cap" style="margin-top:12px">no failing or infra reps in the last ${DASH.paretoWindowDays} days</div>`;
+    const span = link.sinceMs != null ? "the linked window" : `the last ${DASH.paretoWindowDays} days`;
+    return `<div class="cap" style="margin-top:12px">no failing or infra reps in ${span}</div>`;
   }
   const top = groups[0].count;
   return groups.map((g) =>
@@ -737,17 +943,18 @@ function bandAgentHtml(data, events) {
   </section>`;
 }
 
-function bandGateHtml(data, notes, events) {
+function bandGateHtml(data, notes, events, link = NO_LINK) {
   const matrixRuns = measuredRuns(data).slice(-DASH.matrixRuns).length;
+  const paretoSpan = link.sinceMs != null ? "linked window" : `last ${DASH.paretoWindowDays} days`;
   return `
   <section class="band">
     <div class="band-h"><h2 id="gate">The gate</h2><span class="cohort">cohort: all PR runs · ${DASH.runEventCaption}</span></div>
-    <div class="sub">Is the gate trustworthy — flake forensics, infra tax, and the cost of a run.</div>
+    <div class="sub">Is the gate trustworthy — flake forensics, infra tax, and the cost of a run.</div>${linkNoteHtml(link, data)}
     <div class="tiles">${gateTilesHtml(data, events)}</div>
     <div class="card pad">
       <div class="t">Case × run outcome matrix</div>
       <div class="s">one row per active case, one cell per run · last ${matrixRuns} measured runs · ▲ = events.yaml marker · ${DASH.runEventCaption}</div>
-      ${matrixHtml(data, notes, events)}
+      ${matrixHtml(data, notes, events, link)}
       <div class="legend mx-legend">
         <span><span class="cell c-g"></span>passed all reps</span>
         <span><span class="cell c-a"></span>partial</span>
@@ -757,9 +964,9 @@ function bandGateHtml(data, notes, events) {
       </div>
     </div>
     <div class="card pad">
-      <div class="t">Failure signatures · last ${DASH.paretoWindowDays} days</div>
+      <div class="t">Failure signatures · ${paretoSpan}</div>
       <div class="s">non-pass reps grouped by normalized reason · ${DASH.runEventCaption} · gray = infra, violet = check design, amber = agent behaviour, neutral = unclassified</div>
-      ${paretoHtml(data)}
+      ${paretoHtml(data, link)}
     </div>
   </section>`;
 }
@@ -790,9 +997,9 @@ function evidenceHtml(data) {
   const rows = cases.map(evidenceRow).join("")
     || '<tr><td colspan="3"><span class="cap">no cases on record yet</span></td></tr>';
   return `
-  <h2 id="nightly">Evidence on record</h2>
+  <h2 id="evidence">Evidence on record</h2>
   <div class="sub">Recorded task appearances per case (all collected runs, infra included), against the ${DASH.screeningWindow}-run yardstick · history depth, not admission progress — the screening window fills only from main-branch runs in the baseline store (bench/baselines/README.md) · annotations from case-notes.yaml</div>
-  <div class="card"><table id="evidence">
+  <div class="card"><table id="evidence-table">
     <thead><tr><th>Case</th><th>Evidence collected</th><th>In presubmit</th></tr></thead>
     <tbody>${rows}</tbody>
   </table></div>`;
@@ -840,9 +1047,13 @@ const EMPTY_STATE_HTML = `
     </div>
   </section>`;
 
-function appHtml(data) {
-  if (!((data.runs || []).length || (data.cases || []).length)) return EMPTY_STATE_HTML;
-  return HERO_HTML + bandAgentHtml(data, DASH.events) + bandGateHtml(data, DASH.notes, DASH.events)
+function appHtml(data, link = NO_LINK) {
+  // The banner container is always present (empty without a verdict) so
+  // the health poll can re-render it alone; mirrors render.py's app_html.
+  const banner = `<div id="health">${healthHtml(health)}</div>`;
+  if (!((data.runs || []).length || (data.cases || []).length)) return banner + EMPTY_STATE_HTML;
+  return banner + HERO_HTML + bandAgentHtml(data, DASH.events)
+    + bandGateHtml(data, DASH.notes, DASH.events, link)
     + evidenceHtml(data) + RELEASES_HTML + footHtml(data);
 }
 
@@ -873,10 +1084,48 @@ function renderFreshness() {
   el.className = stale ? "fresh stale" : "fresh";
 }
 
+// The banner's own "checked" stamp gets the same wall-clock treatment as
+// the freshness badge: age, then STALE (the verdict's generated_at is older
+// than data.json's stale_after_s, or the adjudicator flagged it) or
+// UNREACHABLE (a health.json poll failed; the last verdict stays up).
+function renderHealthFreshness() {
+  const el = document.getElementById("healthfresh");
+  if (!el || !health) return;
+  const checked = parseIso(health.generated_at);
+  const staleAfterMs = 1000 * (current && typeof current.stale_after_s === "number"
+    ? current.stale_after_s : DASH.staleDefaultS);
+  const ageMin = checked != null ? Math.max(0, Math.round((Date.now() - checked) / 60000)) : null;
+  let text = `checked ${checked != null ? utcHhmm(checked) : "—"} UTC`
+    + (ageMin != null ? ` · ${ageMin}m ago` : "");
+  let stale = false;
+  if (healthUnreachable) { text = `UNREACHABLE · ${text}`; stale = true; }
+  else if (health.stale || (checked != null && Date.now() - checked > staleAfterMs)) {
+    text = `STALE · ${text}`; stale = true;
+  }
+  el.textContent = text;
+  el.className = stale ? "hfresh stale" : "hfresh";
+}
+
+function renderHealth() {
+  const el = document.getElementById("health");
+  if (!el) return;
+  el.innerHTML = healthHtml(health);
+  renderHealthFreshness();
+}
+
+function renderNav() {
+  const hash = DASH.fragmentRe.test(location.hash) ? location.hash : "#agent";
+  for (const a of document.querySelectorAll(".nav a")) {
+    a.className = a.getAttribute("href") === hash ? "on" : "";
+  }
+}
+
 function renderAll() {
-  document.getElementById("app").innerHTML = appHtml(current || {});
+  document.getElementById("app").innerHTML = appHtml(current || {}, linkState());
   document.getElementById("headmeta").innerHTML = metaHtml(current || {});
   renderFreshness();
+  renderHealthFreshness();
+  renderNav();
 }
 
 async function refresh() {
@@ -893,14 +1142,34 @@ async function refresh() {
   }
 }
 
+async function refreshHealth() {
+  try {
+    const response = await fetch(DASH.healthFile, { cache: "no-store" });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const next = normalizeHealth(await response.json());
+    if (!next) throw new Error("malformed health.json");
+    health = next;
+    healthUnreachable = false;
+  } catch (err) {
+    // Keep the last verdict on screen (none, if there never was one); only
+    // its label changes. A missing health.json is the pre-adjudicator page.
+    healthUnreachable = true;
+  }
+  renderHealth();
+}
+
 renderAll();
+window.addEventListener("hashchange", renderNav);
 if (location.protocol !== "file:") {
   // A file:// preview of a rendered out-dir cannot fetch; it stays a static
   // render of the baked data instead of pretending the feed is down.
   refresh();
+  refreshHealth();
   setInterval(refresh, DASH.refreshMs);
+  setInterval(refreshHealth, DASH.refreshMs);
 }
 setInterval(renderFreshness, DASH.freshnessTickMs);
+setInterval(renderHealthFreshness, DASH.freshnessTickMs);
 </script>
 </body>
 </html>
