@@ -236,12 +236,14 @@ adopt_kms() {
   fi
 
   if [[ "$(tfvar enable_github_minter)" == "true" ]]; then
-    local minter_keyring minter_key
+    local minter_keyring minter_key minter_gsa
     minter_keyring=$(tfvar github_minter_kms_keyring)
     minter_key=$(tfvar github_minter_kms_key)
+    minter_gsa="kubeagents-github-minter-gsa"
     targets+=(
       "module.github_minter[0].google_kms_key_ring.minter	keyring	projects/$project/locations/$location/keyRings/$minter_keyring"
       "module.github_minter[0].google_kms_crypto_key.minter	key	projects/$project/locations/$location/keyRings/$minter_keyring/cryptoKeys/$minter_key"
+      "module.github_minter[0].google_service_account.minter	service_account	projects/$project/serviceAccounts/$minter_gsa@$project.iam.gserviceaccount.com"
     )
   fi
 
@@ -257,6 +259,13 @@ adopt_kms() {
       "google_pubsub_topic.stockout_alerts[0]	pubsub_topic	projects/$project/topics/$stockout_topic"
       "google_pubsub_subscription.stockout_alerts[0]	pubsub_sub	projects/$project/subscriptions/$stockout_sub"
       "google_logging_project_sink.stockout_alerts[0]	logging_sink	projects/$project/sinks/$stockout_sink"
+    )
+  fi
+
+  if [[ "$(tfvar model_provider)" == "vertex_ai" ]]; then
+    local litellm_gsa="kubeagents-litellm-gsa"
+    targets+=(
+      "module.litellm_vertex_iam[0].google_service_account.agent	service_account	projects/$project/serviceAccounts/$litellm_gsa@$project.iam.gserviceaccount.com"
     )
   fi
 
@@ -290,7 +299,7 @@ adopt_kms() {
                       --project "$project" >/dev/null 2>&1 || continue ;;
       logging_sink) gcloud logging sinks describe "${id##*/}" \
                       --project "$project" >/dev/null 2>&1 || continue ;;
-      service_account) gcloud iam service-accounts describe "$id" \
+      service_account) gcloud iam service-accounts describe "${id##*/}" \
                       --project "$project" >/dev/null 2>&1 || continue ;;
     esac
 
