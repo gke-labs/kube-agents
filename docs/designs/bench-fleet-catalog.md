@@ -236,12 +236,19 @@ The fleet is shared by every open pull request, and no case may mutate it. A cas
 writes to a fixture spoils it for someone else, non-deterministically, ten minutes later
 and in another pull request's logs.
 
-The checks are enforced; the agent is not. `bench/tf/fleet` provisions
-`seeded-fleet-reader@<project>` with `roles/container.viewer` and nothing else, and the
-per-role kubeconfigs the fleet safeguards read impersonate it, so a check cannot write
-what it grades.
+The checks are enforced in a project whose fleet has been re-applied. `bench/tf/fleet`
+provisions `seeded-fleet-reader@<project>` with `roles/container.viewer` and nothing
+else, and `fleet_reader_token_creators` defaults to the Prow runner, so an apply lets
+`hack/fleet-kubeconfigs.sh` write per-role kubeconfigs that impersonate the reader. A
+check on such a project cannot write what it grades.
 
-The agent under test still runs as `prowjob-default-sa@kube-agents-prow`, which holds
+No pool project is in that state yet. Every one had its fleet applied before that
+default landed, so the impersonation fails, `hack/fleet-kubeconfigs.sh` warns per
+cluster, and the safeguards read under the runner's own credential like everything else.
+gke-labs/kube-agents#903 tracks the per-project re-apply that closes it.
+
+The agent under test is not covered either way. It runs as
+`prowjob-default-sa@kube-agents-prow`, which holds
 `container.admin` and eleven other project roles in every pool project
 (`PROW_RUNNER_ROLES` in `scripts/verify_ci_pool_project.py`), with no RBAC narrowing it
 inside the clusters. For the agent, then, read-only is a rule cases obey rather than a
