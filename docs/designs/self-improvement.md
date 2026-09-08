@@ -100,8 +100,18 @@ replicas and endpoints but no image, tag, digest or version.
 
 The stamp is the only edit this feature makes to a _runtime_ path outside its own files. It sits at
 the end of the stage, so a changing sha rebuilds the one instruction that writes the file and
-nothing above it, and both publish workflows pass the argument — `GIT_SHA=${{ github.sha }}` in
-`docker-publish-ghcr.yml`, `_GIT_SHA` through Cloud Build in `docker-publish-gcp.yml`.
+nothing above it.
+
+> **No publish workflow passes it yet.** Two build paths do — `hack/ci-deploy.sh` through
+> `deploy/docker/cloudbuild-ci.yaml`, and `scripts/dev/dev_rebuild_agent.sh` — and neither
+> `.github/workflows/docker-publish-ghcr.yml` nor `docker-publish-gcp.yml` does, so a published
+> `platform-agent` image carries `{"revision":""}` and the loop refuses to run on it under the
+> shipped `allowUnstampedImage: false`. The refusal is correct and the message is not actionable
+> from a published image: an operator cannot rebuild it. Until the two workflows pass
+> `GIT_SHA` — `${{ github.sha }}` for the GHCR build, `_GIT_SHA` through Cloud Build for the GAR
+> one — the loop is usable only on an image built by one of those two paths. `IMAGE_SOURCE` is
+> passed by no build path at all, so `org.opencontainers.image.source` is empty on every image
+> today; nothing reads it, and the `ARG` is there for the build that will.
 
 **There is no registry-digest fallback.** The commit could instead be resolved by reading the
 runner's own image digest and taking the 40-hex tag that shares it, since release images are

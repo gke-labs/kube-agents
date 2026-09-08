@@ -52,7 +52,12 @@ The self-improvement loop is ON in {{ $siMode }} mode, on
 {{ .Values.selfImprovement.schedule | default "0 * * * *" }}. It investigates this installation and
 writes to the ConfigMap "{{ .Values.selfImprovement.ledgerConfigMap | default "kube-agents-selfimprove-ledger" }}".
 {{- if ne $siMode "report-only" }}
-It opens pull requests against {{ $siPrTarget }}, so the Secret
+WARNING: {{ $siMode }} mode renders but does not work. The filing turn reaches for
+git and gh at /opt/credential-proxy/bin, which are not in the agent image the
+runner runs, so every run investigates and then fails where it would file. Only
+report-only works today. See docs/designs/self-improvement.md section 11.
+
+It is meant to open pull requests against {{ $siPrTarget }}, so the Secret
 "{{ .Values.selfImprovement.github.patSecret }}" must exist in {{ .Release.Namespace }} with a
 "{{ .Values.selfImprovement.github.patSecretKey | default "token" }}" entry holding the robot account's personal access token. The
 chart checks that you named one, not that it is there. Getting it wrong is loud

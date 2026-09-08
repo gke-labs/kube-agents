@@ -125,6 +125,9 @@ The self-improvement loop
 (`selfImprovement.mode: fork` or `upstream`) authenticates to GitHub as a robot account holding a
 classic personal access token, mounted from a Kubernetes Secret you create by hand and named in
 `selfImprovement.github.patSecret`. It has no App, no rule file and no minter of its own.
+Neither of those two modes works today — the credential renders and the filing turn fails before
+it can use it; see [Security and IAM](/kube-agents/reference/security-and-iam/) for that status. What
+this page describes is the credential path as designed, which does not change with it.
 
 It cannot reach the minter above either, and the control is the network rather than configuration.
 The CronJob's own NetworkPolicy renders no egress rule to the minter's Service, and the minter's

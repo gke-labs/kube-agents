@@ -172,7 +172,11 @@ Hindsight store, GitHub minter, and self-improvement CronJob workloads). Two mod
 the composition, so an install that enables either applies that module itself: `drift-pubsub`,
 which is in the release tags and consumable by `?ref=`, and `kube-agents-selfimprove` — the Google
 half of the self-improvement loop — which is not yet in a tag and has to be pinned by commit SHA.
-Turning that loop's `fork` or `upstream` mode on also needs a GitHub token in a Secret you create
+Neither of that loop's `fork` and `upstream` modes works today — both render and then fail at the
+filing turn, because the `git` and `gh` the turn invokes are not in the agent image the runner
+runs. `report-only` is the only usable mode; the Terraform module is needed by all three, since it
+is what grants the loop's read roles.
+Turning `fork` or `upstream` on also needs a GitHub token in a Secret you create
 by hand; the chart fails the render without it, and
 [`terraform/modules/kube-agents-selfimprove/README.md`](terraform/modules/kube-agents-selfimprove/README.md)
 has the command and the scopes.

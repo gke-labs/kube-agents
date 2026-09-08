@@ -176,7 +176,10 @@ Bumping Hermes means editing `tags.env` and rebuilding both agent images: the pi
 
 ## Build-time provenance
 
-The agent image takes two more build args, both defaulting to empty:
+The `platform` and `credential-proxy` stages each take two more build args, both defaulting to
+empty. Only `platform` writes `/opt/build-info.json`; on `credential-proxy` the args set the two
+labels alone, which is what displaces the wrong revision the Hermes base image would otherwise
+leave on it.
 
 ```bash
 docker build --platform linux/amd64 --target platform \
@@ -202,6 +205,12 @@ image will run the loop should pass `GIT_SHA`; an install that cannot can set
 `main`, whose line numbers may belong to neither the running image nor its
 source. Nothing else in the product reads the file, and the args sit at the end
 of the stage so a changing SHA rebuilds only the instruction that writes it.
+
+Neither publish workflow passes either arg yet, so the images published to GHCR and Artifact
+Registry carry an empty `revision` and an empty `source`, and the loop refuses to run on them
+unless `allowUnstampedImage` is set. The two paths that do pass `GIT_SHA` are
+`hack/ci-deploy.sh` (through `deploy/docker/cloudbuild-ci.yaml`, on the `platform` target only)
+and `scripts/dev/dev_rebuild_agent.sh`; `IMAGE_SOURCE` is passed by none of them.
 
 ## Private / custom registry
 

@@ -151,9 +151,9 @@ records the principal; nothing reads it yet.
 
 - PlatformAgent, and, as a second independently-configured instance of this
   same sidecar script, the self-improvement loop's CronJob pod — that
-  instance's own scope, grants, and the behavior gated behind
-  `CREDENTIAL_PROXY_UNTRUSTED_WORKSPACE` are owned by
-  `docs/designs/self-improvement.md` §6, not by this document.
+  instance's own scope and grants are owned by
+  `docs/designs/self-improvement.md` §6, and the behavior gated behind
+  `CREDENTIAL_PROXY_UNTRUSTED_WORKSPACE` by its §11, not by this document.
 - Credentials managed by the operator.
 - CLI forwarding for `gcloud`, `kubectl`, `gh`, and `git`.
 - Slack and Google Chat credentialed relays.
