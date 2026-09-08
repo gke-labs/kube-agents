@@ -22,6 +22,17 @@ readonly GO_MOD=k8s-operator/go.mod
 readonly GOLANG_IMAGE_ARG=GOLANG_IMAGE
 readonly GOTOOLCHAIN_PIN='ENV GOTOOLCHAIN=local'
 MIRROR=registry.example.invalid/mirror
+
+# The env vars whose values are image references, matched on the variable's
+# name. Matching on the shape of the value instead — a quoted string with a
+# slash and a colon in it — cannot tell an image from any other reference-like
+# value: githubMinter's ISSUER_ALLOWLIST is two https:// URLs joined by a comma
+# and matches that shape exactly, so it was reported as an image rendered
+# outside the mirror (#1139). The chart emits three names the pattern below
+# catches: PLATFORM_AGENT_IMAGE, AGENT_SANDBOX_IMAGE and FLUENT_BIT_IMAGE.
+readonly IMAGE_ENV_NAME_RE='^[[:space:]]*-[[:space:]]+name:[[:space:]]*[A-Z0-9_]*_IMAGE[[:space:]]*$'
+readonly VALUE_FIELD_RE='^[[:space:]]*value:[[:space:]]*'
+
 status=0
 
 fail() {
@@ -195,9 +206,46 @@ REQUIRED_VALUES=(
   --set platformAgent.harness.projectId=ci-project
 )
 
-# Every image the chart renders, from `image:` fields and from the operator's
-# *_IMAGE env vars — the latter are what the operator later stamps onto agent
-# pods, so leaving them public half-mirrors the install.
+# The `image:` fields of a rendered manifest stream on stdin.
+image_field_refs() {
+  sed -n 's/^[[:space:]]*image:[[:space:]]*"\?\([^"]*\)"\?[[:space:]]*$/\1/p'
+}
+
+# The image references the *_IMAGE env vars carry, from the same stream. The
+# pass pairs a name line with the value line under it rather than matching the
+# value alone, because an env var's value is not an image by its shape, only by
+# which variable holds it — IMAGE_ENV_NAME_RE is that test. Anything between
+# the name and its value — a `valueFrom:`, the next list entry — drops the
+# pairing.
+image_env_refs() {
+  awk -v name_re="$IMAGE_ENV_NAME_RE" -v value_re="$VALUE_FIELD_RE" '
+    $0 ~ name_re { pending = 1; next }
+    pending && match($0, value_re) {
+      ref = substr($0, RLENGTH + 1)
+      sub(/[[:space:]]+$/, "", ref)
+      sub(/^"/, "", ref)
+      sub(/"$/, "", ref)
+      if (ref != "") print ref
+      pending = 0
+      next
+    }
+    { pending = 0 }
+  '
+}
+
+# Every image a rendered manifest stream on stdin pulls: the `image:` fields,
+# and the operator's *_IMAGE env vars — the latter are what the operator later
+# stamps onto agent pods, so leaving them public half-mirrors the install.
+image_refs() {
+  local rendered
+  rendered="$(cat)"
+  {
+    image_field_refs <<<"$rendered"
+    image_env_refs <<<"$rendered"
+  } | sort -u
+}
+
+# Every image the chart renders in one configuration.
 #
 # A render failure is fatal rather than an empty list: the loops below iterate
 # this output, and "no images" reads exactly like "no images to object to".
@@ -207,9 +255,7 @@ chart_images() {
     echo "ERROR: 'helm template' failed for the chart${*:+ with $*} — see the error above." >&2
     return 1
   }
-  sed -n -e 's/^[[:space:]]*image:[[:space:]]*"\?\([^"]*\)"\?[[:space:]]*$/\1/p' \
-    -e 's/^[[:space:]]*value:[[:space:]]*"\([^"]*\/[^"]*:[^"]*\)"[[:space:]]*$/\1/p' <<<"$rendered" |
-    sort -u
+  image_refs <<<"$rendered"
 }
 
 # Split a reference into repository and tag. The digest, if any, goes first;
@@ -241,7 +287,7 @@ split_ref() {
 
 default_images="$(chart_images)" || exit 1
 [ -n "$default_images" ] || {
-  echo "ERROR: the chart rendered no image references at all — the extraction patterns in chart_images no longer match the manifests, so checks 3a, 3b and 3c are inspecting nothing." >&2
+  echo "ERROR: the chart rendered no image references at all — the extraction patterns in image_refs no longer match the manifests, so checks 3a, 3b and 3c are inspecting nothing." >&2
   exit 1
 }
 mirrored_images="$(chart_images --set "global.imageRegistry=$MIRROR")" || exit 1
