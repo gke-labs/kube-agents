@@ -2463,6 +2463,12 @@ def patch_finding(finding_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
     return _findings_write(findings_queue.patch_finding, finding_id, body)
 
 
+@app.post("/v1/findings/expire-snoozes", dependencies=[Depends(verify_api_key)])
+def expire_finding_snoozes() -> Dict[str, Any]:
+    """Return every finding whose `snoozed_until` has lapsed to `surfaced` (§3.2)."""
+    return {"expired": _findings_write(findings_queue.expire_snoozes)}
+
+
 @app.post("/v1/findings/{finding_id}/verified", dependencies=[Depends(verify_api_key)])
 def record_finding_verification(finding_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
     """§7.4's three outcomes: still_failing, resolved, unverifiable."""

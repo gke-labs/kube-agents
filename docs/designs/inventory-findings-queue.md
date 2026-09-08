@@ -278,7 +278,7 @@ transition has exactly one actor.
 | ----------- | -------------------------------------------------------------- | ------------------------------------------------- | ------------------------------------------------------------- |
 | `queued`    | registration, for an id not already present                    | any source (§5)                                   | on the list, in score order                                   |
 | `surfaced`  | a nudge or an on-demand pull named it                          | the publisher, after send                         | stays on the list; `surface_count` records how often          |
-| `snoozed`   | the user said "not now" and gave or implied a date             | user, via a kanban card; the daily job returns it | off the list until `snoozed_until`, then back to `surfaced`   |
+| `snoozed`   | the user said "not now" and gave or implied a date             | user, via a kanban card; the nudge's daily run returns it | off the list until `snoozed_until`, then back to `surfaced`   |
 | `accepted`  | the user took it on — working it, or its PR is open            | user, via a kanban card                           | its own section of the list; still re-verified                |
 | `dismissed` | the user rejected it — won't fix, or not a real problem        | user, via a kanban card                           | off the list permanently; sticky against every automated path |
 | `resolved`  | re-verification found it no longer reproduces                  | the daily job                                     | off the list; kept as the record that it was fixed            |
@@ -670,12 +670,13 @@ gets the same treatment, for two reasons that are not stylistic:
 | `GET /v1/findings/ranked`                        | any publisher (§7)                | the open queue in the order below; the whole list, ordering in code                    |
 | `GET /v1/findings`                               | the `platform` worker             | the on-demand pull, filterable by cluster, state, severity                             |
 | `POST /v1/findings/{id}/surfaced`                | any publisher                     | after the send: `surface_count`, `surfaced_at`, `chat_id`, `thread_id`                 |
+| `POST /v1/findings/expire-snoozes`               | the nudge's daily run             | return every row whose `snoozed_until` has lapsed to `surfaced` (§3.2)                 |
 | `PATCH /v1/findings/{id}`                        | the `platform` worker             | the three human transitions (§3.2), plus `pr_url`/`pr_state` reconciliation            |
 | `POST /v1/findings/{id}/verified`                | the daily job                     | the three-outcome result of §7.4, with what was observed                               |
 | `GET`/`PUT /v1/findings/publication/{publisher}` | any publisher                     | read and write that publisher's row in `queue_publications` (§3.1)                     |
 
 **What `/ranked` means by "open", and what order it returns.** Open is `queued`, `surfaced`, and
-`accepted`; a `snoozed` row rejoins them when the daily job's expiry sweep returns it to `surfaced`
+`accepted`; a `snoozed` row rejoins them when the nudge's daily run expires its lapsed `snoozed_until`
 (§3.2), which is a stored transition rather than a predicate the query evaluates — otherwise the
 backlog shows a row that `GET /v1/findings` still reports as snoozed.
 

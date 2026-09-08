@@ -19,6 +19,10 @@ cannot be confused with a broken job. Here the gate applies only to a morning
 that names no critical the last sweep still saw: such a critical is repeated
 daily until it is fixed, which makes the weekly floor unnecessary for the case
 that would cost something to lose.
+
+One addition: this run also expires lapsed snoozes before reading the queue
+(§3.2). This job is the queue's only daily tick, so nothing else would return
+a snoozed row whose date has passed.
 """
 
 import hashlib
@@ -161,6 +165,14 @@ def _last_posted_hash(endpoint: str) -> str | None:
 
 def main(argv: list[str] | None = None) -> int:
     endpoint = (os.environ.get("SESSION_KV_ENDPOINT") or DEFAULT_ENDPOINT).rstrip("/")
+
+    # Before the read, so a snooze that lapsed overnight is back on the list
+    # this morning names. Best-effort: a failed expiry costs one morning of
+    # lateness for snoozed rows, not the message.
+    try:
+        _request(endpoint, "/v1/findings/expire-snoozes", {})
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        sys.stderr.write(f"findings_nudge: could not expire lapsed snoozes: {exc}\n")
 
     try:
         findings = _request(endpoint, "/v1/findings/ranked").get("findings") or []

@@ -859,6 +859,7 @@ class TestSessionKvServerAuth(unittest.TestCase):
         ("POST", "/v1/findings/f-1/surfaced", {}),
         ("PATCH", "/v1/findings/f-1", {"state": "accepted"}),
         ("POST", "/v1/findings/f-1/verified", {"outcome": "resolved"}),
+        ("POST", "/v1/findings/expire-snoozes", None),
         ("GET", "/v1/findings/publication/backlog", None),
         ("PUT", "/v1/findings/publication/backlog", {"target_kind": "chat"}),
     )
@@ -3006,7 +3007,7 @@ class TestRecentReportsIndex(unittest.TestCase):
 
 
 class TestFindingsQueueApi(unittest.TestCase):
-    """The seven /v1/findings routes. The rules they enforce are pinned in
+    """The eight /v1/findings routes. The rules they enforce are pinned in
     test_findings_queue.py; these tests are about the HTTP surface."""
 
     def setUp(self):
@@ -3044,6 +3045,21 @@ class TestFindingsQueueApi(unittest.TestCase):
         response = self.client.post("/v1/findings", json={"findings": list(findings), "scope": scope})
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()
+
+    def test_expire_snoozes_route_reports_the_count(self):
+        self._register(self._finding())
+        fid = self.client.get("/v1/findings/ranked").json()["findings"][0]["id"]
+        self.client.patch(
+            f"/v1/findings/{fid}", json={"state": "snoozed", "snoozed_until": "2000-01-01"}
+        )
+        self.assertEqual(self.client.get("/v1/findings/ranked").json()["findings"], [])
+
+        response = self.client.post("/v1/findings/expire-snoozes")
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"expired": 1})
+        ranked = self.client.get("/v1/findings/ranked").json()["findings"]
+        self.assertEqual([f["id"] for f in ranked], [fid])
 
     def test_register_then_rank(self):
         self._register(self._finding())

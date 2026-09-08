@@ -1039,9 +1039,9 @@ def update_finding(
 
     The user's three decisions are 'accepted' (they are working it), 'snoozed'
     (not now, with a date) and 'dismissed' (won't fix — permanent, and the next
-    sweep will not resurrect it). Use 'surfaced' to return a snooze that has
-    expired to the list. A finding that no longer reproduces is not set here:
-    that is a verification outcome.
+    sweep will not resurrect it). A lapsed snooze is returned to the list by
+    the nudge's daily run; use 'surfaced' only to end one early. A finding that
+    no longer reproduces is not set here: that is a verification outcome.
 
     Args:
         finding_id: The finding's id.

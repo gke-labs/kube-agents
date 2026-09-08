@@ -30,6 +30,7 @@ __all__ = [
     "list_findings",
     "mark_surfaced",
     "patch_finding",
+    "expire_snoozes",
     "record_verification",
     "get_publication",
     "put_publication",
@@ -705,6 +706,20 @@ def patch_finding(conn: sqlite3.Connection, finding_id: str, patch: Any) -> dict
 
     conn.execute(f"UPDATE findings SET {', '.join(assignments)} WHERE id = ?", (*values, finding_id))
     return get_finding(conn, finding_id)
+
+
+def expire_snoozes(conn: sqlite3.Connection) -> int:
+    """§3.2's snooze exit: a lapsed `snoozed_until` returns the row to `surfaced`.
+
+    The nudge's daily run calls this before composing its message, so "snoozed
+    until <date>" is a promise something keeps: without a caller, a lapsed
+    snooze stays hidden until someone thinks to query `state=snoozed`, and
+    the repeat-daily guarantee for a critical is silently off.
+    """
+    return conn.execute(
+        "UPDATE findings SET state = 'surfaced', snoozed_until = NULL "
+        "WHERE state = 'snoozed' AND snoozed_until <= datetime('now')"
+    ).rowcount
 
 
 def record_verification(

@@ -151,13 +151,17 @@ class NudgeHarness(unittest.TestCase):
         self.addCleanup(patch_out.stop)
         self.addCleanup(patch_err.stop)
 
-    def run_with(self, ranked, surfaced_error=None, last_hash=None, publication_error=None):
+    def run_with(self, ranked, surfaced_error=None, last_hash=None, publication_error=None, expire_error=None):
         """Drive `main` against a stubbed queue, recording every request made."""
         calls = []
         self.published = []
 
         def fake_request(endpoint, path, body=None, method=""):
             calls.append(path)
+            if path == "/v1/findings/expire-snoozes":
+                if expire_error:
+                    raise expire_error
+                return {"expired": 0}
             if path == "/v1/findings/ranked":
                 return {"findings": ranked}
             if path == f"/v1/findings/publication/{nudge.PUBLISHER}":
@@ -192,6 +196,9 @@ class MainTests(NudgeHarness):
         self.assertEqual(
             calls,
             [
+                # Expiry first, so a snooze that lapsed overnight is in the
+                # ranked list this same run reads.
+                "/v1/findings/expire-snoozes",
                 "/v1/findings/ranked",
                 # One call, not two: with a critical to name the gate is skipped,
                 # so only the PUT that records the hash happens.
@@ -200,6 +207,13 @@ class MainTests(NudgeHarness):
                 "/v1/findings/b/surfaced",
             ],
         )
+
+    def test_a_failed_expiry_costs_a_morning_of_snooze_lateness_not_the_message(self):
+        code, calls = self.run_with([finding(id="a")], expire_error=urllib.error.URLError("refused"))
+        self.assertEqual(code, 0)
+        self.assertIn("no readinessProbe on api", self.out.getvalue())
+        self.assertIn("could not expire lapsed snoozes", self.err.getvalue())
+        self.assertIn("/v1/findings/ranked", calls)
 
     def test_a_rolled_up_observation_is_not_marked_surfaced(self):
         _, calls = self.run_with(
@@ -232,7 +246,7 @@ class ChangeGateTests(NudgeHarness):
         code, calls = self.run_with([], last_hash=self._digest([]))
         self.assertEqual(code, 0)
         self.assertEqual(self.out.getvalue(), "")
-        self.assertNotIn(f"/v1/findings/publication/{nudge.PUBLISHER}", calls[2:])
+        self.assertNotIn(f"/v1/findings/publication/{nudge.PUBLISHER}", calls[3:])
 
     def test_an_unchanged_queue_with_no_criticals_says_nothing_either(self):
         ranked = [finding(id="a", severity="major")]

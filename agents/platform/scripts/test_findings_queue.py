@@ -540,6 +540,27 @@ class TestTransitions(QueueTestCase):
             row = fq.patch_finding(self.conn, self.fid, {"state": state})
             self.assertIsNone(row["snoozed_until"], f"{state} left a wake-up time behind")
 
+    def test_expiry_returns_a_lapsed_snooze_to_the_list(self):
+        fq.patch_finding(self.conn, self.fid, {"state": "snoozed", "snoozed_until": "2000-01-01"})
+        self.assertEqual(self.ids(), [])
+
+        self.assertEqual(fq.expire_snoozes(self.conn), 1)
+
+        row = fq.get_finding(self.conn, self.fid)
+        self.assertEqual(row["state"], "surfaced")
+        self.assertIsNone(row["snoozed_until"])
+        self.assertEqual(self.ids(), [self.fid])
+
+    def test_expiry_leaves_an_unlapsed_snooze_alone(self):
+        fq.patch_finding(self.conn, self.fid, {"state": "snoozed", "snoozed_until": "2999-01-01"})
+
+        self.assertEqual(fq.expire_snoozes(self.conn), 0)
+
+        row = fq.get_finding(self.conn, self.fid)
+        self.assertEqual(row["state"], "snoozed")
+        self.assertIsNotNone(row["snoozed_until"])
+        self.assertEqual(self.ids(), [])
+
     def test_a_snooze_deadline_must_be_a_real_timestamp(self):
         for bad in ("when hell freezes over", "2026-13-01", "next tuesday"):
             with self.assertRaises(fq.FindingError):
