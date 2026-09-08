@@ -441,6 +441,12 @@ profile_begin "config: env, platform-agent token fetch, prereqs"
 export BENCH_AGENT_TYPE="cli"
 export AGENT_TARGET="kubeagents"
 export BENCH_PARALLEL="false"
+# Opening-turn replay cache (bench: cached-response; harness.py
+# _post_opening_turn). EXPERIMENT (do not merge): armed by default for one
+# measured presubmit run — reps 2-3 replay rep 1's opening turn from the
+# pod-local cache, which measures the cache rather than run-to-run variance.
+# The mergeable default is empty: a graded run must stay live.
+export CACHED_RESPONSE_MODE="${EVAL_RESPONSE_CACHE:-testing}"
 export AGENT_CLUSTER_CONTEXT="gke_${PROJECT_ID}_${REGION}_${HOST_CLUSTER_NAME}"
 export AGENT_SERVICE_NAME="platform-agent"
 export AGENT_NAMESPACE="${TARGET_NAMESPACE}"
