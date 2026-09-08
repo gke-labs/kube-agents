@@ -28,13 +28,12 @@ MIRROR=registry.example.invalid/mirror
 readonly MINTER_ORG=ci-org
 readonly MINTER_REPO=ci-repo
 
-# Which render a check-3 failure came from. Each is written to be the subject
-# of the sentence the failure opens with, because "the chart renders X" is not
-# actionable when four configurations render.
+# Which render a check-3 failure came from. Each is the subject of the
+# sentence the failure opens with, because "the chart renders X" is not
+# actionable once more than one configuration renders; check_toggle extends
+# them with the toggle's name.
 readonly LABEL_DEFAULT="a default install"
-readonly LABEL_DEFAULT_MINTER="a default install with githubMinter enabled"
 readonly LABEL_MIRRORED="a mirrored install"
-readonly LABEL_MIRRORED_MINTER="a mirrored install with githubMinter enabled"
 
 # The env vars whose values are image references, matched on the variable's
 # name. Matching on the shape of the value instead — a quoted string with a
@@ -219,9 +218,7 @@ REQUIRED_VALUES=(
   --set platformAgent.harness.projectId=ci-project
 )
 
-# What turns the GitHub token minter on. It is off by default, so its image
-# reached no render at all and its pin sat behind every check below — the gap
-# any off-by-default toggle opens, and the one #1139 closes.
+# What turns the GitHub token minter on, passed to check_toggle below.
 MINTER_VALUES=(
   --set githubMinter.enabled=true
   --set "githubMinter.org=$MINTER_ORG"
@@ -282,10 +279,12 @@ image_refs() {
 # registry port (host:5000/name) is not mistaken for one. ref_pin keeps the
 # digest (tag@sha256:...), because that is the form images.json pins a tag and
 # a digest together with and what the chart's default render must match byte for
-# byte. Of the entries this function sees — the ones a chart render emits — that
-# is hindsight-api and hindsight-postgresql; images.json pins two more the same
-# way (busybox and, through tags.env, the Hermes base), but both are build-time
-# and never appear in a render.
+# byte. No render reaches that branch today: images.json pins four entries as
+# tag@digest — hindsight-api, hindsight-postgresql, busybox and, through
+# tags.env, the Hermes base — and the last two are build-time while the
+# Hindsight pair sits behind hindsight.enabled, which no render below turns on.
+# The branch is what keeps the comparison right when one of them does reach a
+# render.
 split_ref() {
   local ref=${1%%@*} digest=""
   case "$1" in
@@ -369,20 +368,50 @@ check_mirror_names() {
   done <<<"$images"
 }
 
-# Four renders, not two: the default and mirrored pair says nothing about an
-# image behind a chart toggle, because a toggle left off renders nothing to
-# check. The minter pair is that gap closed for githubMinter; Hindsight's
-# images, behind memory.provider, are still only covered by their values.yaml
-# pins.
+# The images in the first list that the second does not carry. Both come out
+# of image_refs, so both are sorted and deduplicated.
+added_images() {
+  grep -Fxv -f <(printf '%s\n' "$2") <<<"$1" || true
+}
+
+# An off-by-default chart toggle: rendered unmirrored and mirrored on top of
+# REQUIRED_VALUES, and checked against the default pair below. Without this the
+# toggle's images reach no render at all and their pins sit behind every check
+# — the gap #1139 was filed about.
+#
+# Only what the toggle adds is checked. Its render is a superset of the default
+# pair, so passing the whole list would report a drifted LiteLLM pin once per
+# configuration that renders LiteLLM, and the same message printed twice under
+# two labels reads as two problems.
+#
+# Adding nothing is fatal. A toggle that has stopped turning on — a renamed
+# value, a chart that now requires another key — takes its images back out of
+# every check with everything still green, which is the original failure
+# wearing a new coat.
+#
+# Adding the next toggle is one call. Hindsight, behind hindsight.enabled, is
+# the one still uncovered.
+check_toggle() {
+  local name=$1
+  shift
+  local rendered mirrored_rendered added mirrored_added
+  rendered="$(render_chart "$@")" || exit 1
+  mirrored_rendered="$(render_chart "$@" --set "global.imageRegistry=$MIRROR")" || exit 1
+  added="$(added_images "$(image_refs <<<"$rendered")" "$default_images")"
+  mirrored_added="$(added_images "$(image_refs <<<"$mirrored_rendered")" "$mirrored_images")"
+  [ -n "$added" ] || {
+    echo "ERROR: enabling $name added no image the default render already carried, so its renders exercise nothing the default and mirrored pair does not and whatever it guards is unchecked. Check that the values check_toggle passes for $name still turn it on." >&2
+    exit 1
+  }
+  check_inventory_pins "$LABEL_DEFAULT with $name enabled" "$added"
+  check_mirror_prefix "$LABEL_MIRRORED with $name enabled" "$mirrored_added"
+  check_mirror_names "$LABEL_MIRRORED with $name enabled" "$mirrored_added"
+}
+
 default_render="$(render_chart)" || exit 1
 mirrored_render="$(render_chart --set "global.imageRegistry=$MIRROR")" || exit 1
-minter_render="$(render_chart "${MINTER_VALUES[@]}")" || exit 1
-minter_mirrored_render="$(render_chart "${MINTER_VALUES[@]}" --set "global.imageRegistry=$MIRROR")" || exit 1
-
 default_images="$(image_refs <<<"$default_render")"
 mirrored_images="$(image_refs <<<"$mirrored_render")"
-minter_images="$(image_refs <<<"$minter_render")"
-minter_mirrored_images="$(image_refs <<<"$minter_mirrored_render")"
 
 [ -n "$default_images" ] || {
   echo "ERROR: the chart rendered no image references at all — the extraction patterns in image_refs no longer match the manifests, so checks 3a, 3b and 3c are inspecting nothing." >&2
@@ -392,20 +421,12 @@ minter_mirrored_images="$(image_refs <<<"$minter_mirrored_render")"
   echo "ERROR: the chart rendered no *_IMAGE env var that image_env_refs recognises, so the images the operator stamps onto agent pods are unchecked — and the 'image:' fields keep the list above non-empty, which is why the guard above does not catch it. Either the chart stopped emitting them or IMAGE_ENV_NAME_RE no longer matches the shape it emits." >&2
   exit 1
 }
-minter_only="$(grep -Fxv -f <(printf '%s\n' "$default_images") <<<"$minter_images" || true)"
-[ -n "$minter_only" ] || {
-  echo "ERROR: enabling githubMinter added no image the default render already carried, so the minter renders exercise nothing the default and mirrored pair does not — the coverage gap #1139 closed is open again. Check that MINTER_VALUES still turns the minter on." >&2
-  exit 1
-}
 
 check_inventory_pins "$LABEL_DEFAULT" "$default_images"
-check_inventory_pins "$LABEL_DEFAULT_MINTER" "$minter_images"
-
 check_mirror_prefix "$LABEL_MIRRORED" "$mirrored_images"
-check_mirror_prefix "$LABEL_MIRRORED_MINTER" "$minter_mirrored_images"
-
 check_mirror_names "$LABEL_MIRRORED" "$mirrored_images"
-check_mirror_names "$LABEL_MIRRORED_MINTER" "$minter_mirrored_images"
+
+check_toggle githubMinter "${MINTER_VALUES[@]}"
 
 # ---------------------------------------------------------------------------
 # 4. The example manifests. They are applied by hand rather than rendered by
