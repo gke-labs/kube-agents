@@ -642,7 +642,9 @@ try:
 except Exception:
     sys.exit(1)
 managed = any(
-    r.get("type") == "google_container_cluster" and r.get("mode") == "managed"
+    r.get("type") == "google_container_cluster"
+    and r.get("mode") == "managed"
+    and len(r.get("instances", [1])) > 0
     for r in doc.get("resources", [])
 )
 sys.exit(0 if managed else 1)

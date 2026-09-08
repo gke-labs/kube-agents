@@ -136,6 +136,18 @@ class InstallerCommonTest(unittest.TestCase):
         )
         self.assertIn("rc=1", proc.stdout, proc.stderr)
 
+    def test_empty_instances_managed_entry_is_not_ours(self):
+        # When a resource block exists in state with instances=[] (e.g. count=0),
+        # it has no live instances and must not be treated as managed.
+        empty_managed = _state_doc(
+            [{"mode": "managed", "type": "google_container_cluster", "name": "autopilot", "instances": []}]
+        )
+        proc = self._run(
+            'tf_state_has_cluster; echo "rc=$?"',
+            gcloud_stdout=empty_managed,
+        )
+        self.assertIn("rc=1", proc.stdout, proc.stderr)
+
     def test_unparseable_state_fails_safe(self):
         proc = self._run(
             'tf_state_has_cluster; echo "rc=$?"',

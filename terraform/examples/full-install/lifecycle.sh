@@ -260,6 +260,11 @@ adopt_kms() {
     )
   fi
 
+  local agent_gsa="kubeagents-platform-gsa"
+  targets+=(
+    "module.kube_agents_iam.google_service_account.agent	service_account	projects/$project/serviceAccounts/$agent_gsa@$project.iam.gserviceaccount.com"
+  )
+
   # Skipping both halves — cluster KMS (create_cluster or database encryption
   # off) and the minter — leaves targets empty, and macOS's bash 3.2 treats an
   # empty array expansion as unbound under `set -u`. The ${arr[@]+...} form
@@ -284,6 +289,8 @@ adopt_kms() {
       pubsub_sub)   gcloud pubsub subscriptions describe "${id##*/}" \
                       --project "$project" >/dev/null 2>&1 || continue ;;
       logging_sink) gcloud logging sinks describe "${id##*/}" \
+                      --project "$project" >/dev/null 2>&1 || continue ;;
+      service_account) gcloud iam service-accounts describe "$id" \
                       --project "$project" >/dev/null 2>&1 || continue ;;
     esac
 
