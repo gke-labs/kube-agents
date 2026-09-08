@@ -270,22 +270,23 @@ resource "google_container_node_pool" "seeded_a_default" {
   name       = "default-pool"
   location   = var.zone
   cluster    = google_container_cluster.seeded_a.name
-  node_count = 1
+  node_count = 2
 
   node_config {
-    # e2-standard-2, not e2-medium (2026-09-08, #1278): cluster A hosts the
-    # defect workloads (checkout-gateway, payments-api) alongside GKE's
-    # system pods, and the constraint is CPU *requests*, not memory.
+    # e2-medium, two of them (2026-09-08, #1278). Cluster A hosts the defect
+    # workloads (checkout-gateway, payments-api) alongside GKE's system pods,
+    # and the binding constraint is CPU *requests*, not memory: one
     # e2-medium's 940m allocatable is fully claimed by system pods alone
-    # (kube-proxy, kube-dns, metadata-server, fluentbit, konnectivity,
-    # ...), so the fixtures only ever ran because they were scheduled before
-    # the system set filled in. The weekend auto-upgrade recreated the node,
-    # system-critical pods scheduled first, and every fixture went Pending
-    # on all 30 pool projects. e2-standard-2 (~1930m allocatable) holds the
-    # system set (~1.3 vCPU incl. the second kube-dns) plus fixtures with
-    # ~550m headroom. Changing machine_type replaces the pool; the fixtures
-    # reschedule onto the new node on their own.
-    machine_type    = "e2-standard-2"
+    # (kube-proxy, kube-dns, metadata-server, fluentbit, konnectivity, ...).
+    # The fixtures only ever ran because they scheduled before the system
+    # set filled in; the weekend auto-upgrade rebuilt the node, system-
+    # critical pods scheduled first, and every fixture went Pending on all
+    # 30 pool projects. A second node holds the fixtures plus the Pending
+    # system deployments with ~600m to spare, and survives the next node
+    # rebuild (surge upgrades rotate one node at a time). Matches the live
+    # `gcloud container clusters resize` applied during the incident, so
+    # the next apply is a no-op, not a pool replacement.
+    machine_type    = "e2-medium"
     disk_size_gb    = 20
     resource_labels = local.fleet_labels
     service_account = google_service_account.fleet_nodes.email
