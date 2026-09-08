@@ -26,6 +26,10 @@
 #      Reachable on a FIRST install too: configuring the Chat app in the Cloud
 #      console creates the topic before the installer ever runs. `adopt_pubsub`
 #      imports whichever of the two is already there before applying.
+#   6. The agent GSA (account_id) is ForceNew. A lost agent_service_account_id
+#      override in install.env resolves back to the default name and plans a
+#      destructive replacement under -auto-approve. `guard_gsa_identity` refuses
+#      the apply before Terraform runs.
 #
 # Usage:
 #   ./lifecycle.sh apply    [extra terraform args...]
@@ -398,6 +402,42 @@ guard_cluster_ownership() {
   done
 }
 
+# account_id on google_service_account.agent is ForceNew, and the resource
+# carries neither create_before_destroy nor prevent_destroy. If a custom
+# override line in install.env goes missing, the next apply resolves
+# agent_service_account_id back to the module default (kubeagents-platform-gsa)
+# and plans the GSA's destruction and replacement under -auto-approve. If
+# install #1 in the same project already holds the default name, the apply
+# destroys install #2's GSA and then 409s creating the default name, leaving
+# install #2 with no identity.
+guard_gsa_identity() {
+  load_state
+  local addr="module.kube_agents_iam.google_service_account.agent"
+  in_state "$addr" || return 0
+
+  local recorded
+  recorded=$(terraform state show -no-color "$addr" 2>/dev/null |
+    sed -n 's/^ *account_id *= *"\([^"]*\)".*/\1/p' | head -1)
+  [[ -n "$recorded" ]] || return 0
+
+  local desired
+  if ! desired=$(tfvar agent_service_account_id 2>/dev/null); then
+    desired="kubeagents-platform-gsa"
+  fi
+  if [[ "$desired" == "null" || -z "$desired" ]]; then
+    desired="kubeagents-platform-gsa"
+  fi
+
+  if [[ "$recorded" != "$desired" ]]; then
+    warn "agent_service_account_id resolved to '$desired', but this state manages GSA '$recorded' ($addr)."
+    warn "Applying now would plan the service account's DESTRUCTION and recreation under -auto-approve."
+    warn "If this install uses a custom GSA name, preserve it in install.env via:"
+    warn "  TF_VAR_agent_service_account_id=\"$recorded\""
+    warn "or pass it explicitly in terraform.tfvars."
+    exit 1
+  fi
+}
+
 delete_agent_cr() {
   local namespace cluster location project names
   namespace=$(tfvar namespace)
@@ -527,6 +567,10 @@ forget_kms() {
   done
 }
 
+if [[ "${KUBE_AGENTS_SOURCE_ONLY:-false}" == "true" ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 case "${1:-}" in
   adopt-kms)
     shift
@@ -560,6 +604,7 @@ case "${1:-}" in
     shift
     ensure_init
     guard_cluster_ownership
+    guard_gsa_identity
     adopt_kms
     adopt_pubsub
     log "terraform apply"
