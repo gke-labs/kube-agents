@@ -1313,12 +1313,14 @@ print(m.group(1).strip('\'\"') if m else '')
 # nothing to main's side of the aggregate. Screening replaces it.
 #
 # This roster is what blocks a pull request once the Prow job stops being
-# optional. Ten of the eighteen active cases are admitted: the ones
+# optional. Seven of the eighteen active cases are admitted: the ones
 # whose recent record shows failures only on their own regressions or on
 # infra classes the harness already excludes from the verdict. The rest
 # cannot red one on a GRADED failure: four are held out below with named
-# exits, and the three obtainability activations (#1049) simply run
-# unadmitted while they earn a record. Held-out cases still run and
+# exits, the three obtainability activations (#1049) simply run
+# unadmitted while they earn a record, and the crashloop trio is demoted
+# pending the seeded-fleet repair (#1278, note above the export). Held-out
+# cases still run and
 # report on every pull request. The scope of that promise is rungs
 # 4 and 6: rungs 1-3 (a forbidden mutation, an erroring check, a record
 # that is not a real run) stay blocking for every case by design,
