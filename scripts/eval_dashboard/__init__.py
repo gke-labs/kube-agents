@@ -8,7 +8,7 @@ out-dir to its serving location. Everything measurable on the page is
 computed from data.json alone -- the three optional extra inputs are
 `case-notes.yaml` (human one-line annotations, issue links and badges per
 case), `events.yaml` (dated event markers plus the human-classified catch
-and false-red counts) and `health.json` (the gate-health verdict the CI
-health adjudicator writes beside data.json, shown as the page's top
-banner); render.py's docstring owns the details.
+and false-red counts) and `health.json` (a gate-health verdict a separate
+job writes beside data.json, shown as the banner above the page's hero);
+render.py's docstring owns the details.
 """

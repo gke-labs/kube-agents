@@ -1,7 +1,9 @@
 # data.json schema (version 1)
 
 `collect.py` writes this file; the dashboard renderer and the publisher are
-built against it **in parallel**. It is a contract: field names, types and
+built against it **in parallel**. The renderer's two page-side contracts —
+the optional `health.json` input and the page's URL parameters — follow the
+collector's Sources section. It is a contract: field names, types and
 derivation rules below are fixed. Changes must be additive optional fields
 only — anything that renames, removes or re-types a field bumps
 `schema_version` and lands together with both consumers.
@@ -207,65 +209,6 @@ what the renderer does with them.
   today).
 - `domains_covered` — `domains_total − len(uncovered)`.
 
-## health.json (optional input)
-
-The CI health adjudicator writes `health.json` beside `data.json` in the
-bucket. The renderer reads a copy through `--health health.json` and the
-page polls the object next to `data.json` on the same 60-second cadence;
-it feeds the banner at the top of the page and nothing else. The fields
-the renderer reads:
-
-```json
-{
-  "state": "GREEN|DEGRADED|OUTAGE",
-  "since": "<iso8601>",
-  "cause": "one sentence",
-  "advice": "one sentence",
-  "failing_cases": ["<case name>"],
-  "generated_at": "<iso8601>",
-  "stale": false
-}
-```
-
-- An absent file, unparseable JSON, a non-object, or a `state` outside the
-  three words (compared case-insensitively) renders **no banner**, and the
-  rest of the page is exactly what it is without the file. `render.py`
-  never fails on this input.
-- Every other field is optional: a non-string `cause` or `advice` renders
-  nothing, a non-list `failing_cases` (or its non-string members) drops, an
-  unparseable `since` or `generated_at` reads as unknown. Keys the writer
-  adds (`evidence`, `metrics`, anything later) are ignored.
-- The banner shows the state as glyph + word + colour, `since` as an
-  absolute UTC stamp plus the duration up to `generated_at` (the verdict's
-  own clock, so the baked page and the client re-render agree), the cause,
-  the advice, and a `details ↓` link to `#gate` carrying `failing_cases`
-  and `since` as the parameters below. The client adds the wall-clock age
-  to the `checked HH:MM UTC` stamp and labels it `STALE` (past
-  `stale_after_s`, or `stale: true`) or `UNREACHABLE` (a poll failed; the
-  last verdict stays up) in words, as the freshness badge does.
-- `render.py` does not copy `health.json` into its out-dir: the adjudicator
-  owns that object, and republishing a copy would overwrite a fresher
-  verdict with the one the render happened to read.
-
-## Page URL parameters
-
-Deep links into the published page, the contract the health poster's Chat
-messages use. Query before fragment:
-`index.html?cases=a,b&since=2026-09-08T09:00:00Z&until=2026-09-08T12:00:00Z#gate`.
-
-| Parameter | Value                                                                                                                  | Effect                                                                                                                                                                                                          |
-| --------- | ---------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `cases`   | comma-separated case names, each matching `[A-Za-z0-9][A-Za-z0-9._-]{0,79}`; the first 50 are read                    | matrix rows for those cases get a `linked` badge and an accent bar; the other rows dim but stay readable. A name that is not a case on record is ignored; when none matches, no row dims.                       |
-| `since`   | ISO 8601: `YYYY-MM-DD`, optionally `THH:MM[:SS[.ffffff]]` and `Z` or a `±HH:MM` offset; a timezone-naive stamp is UTC | runs whose `started` is at or after it get a window ring on their matrix column, and the failure-signature Pareto counts the reps of those runs instead of the rolling 7 days (run-level events stay excluded). |
-| `until`   | same shape; read only alongside `since`, and only when not before it                                                   | closes the window (inclusive). Absent, the window is open-ended.                                                                                                                                                |
-| fragment  | `#agent`, `#gate`, `#evidence` or `#release`, after the query                                                          | scrolls to that section (clear of the sticky bar) and selects its nav tab.                                                                                                                                      |
-
-Parsing is client-side only — the server render is the same page whatever
-the URL carries. A value that fails its grammar is dropped silently, every
-value reaches the DOM HTML-escaped, and the note under **The gate** names
-what is highlighted and the window in words, with a `clear` control that
-removes the parameters.
-
 ## Sources
 
 - `--pr-glob <gs glob>` (repeatable) — Prow build dirs, discovered with
@@ -301,6 +244,68 @@ removes the parameters.
 - `--stale-after-s <seconds>` — write `stale_after_s` (see Optional
   top-level fields) into the output. Omitted, the field is omitted and the
   renderer's default applies.
+
+## health.json (optional input)
+
+The renderer's second input: a gate-health verdict written beside
+`data.json` by a separate job (this directory holds no writer; the page
+renders without the file). `render.py` reads a copy through `--health
+health.json` and the page polls the object next to `data.json` on the same
+60-second cadence; it feeds the banner at the top of the page content,
+below the sticky bar, and nothing else. The fields the renderer reads:
+
+```json
+{
+  "state": "GREEN|DEGRADED|OUTAGE",
+  "since": "<iso8601>",
+  "cause": "one sentence",
+  "advice": "one sentence",
+  "failing_cases": ["<case name>"],
+  "generated_at": "<iso8601>",
+  "stale": false
+}
+```
+
+- An absent file, unparseable JSON, a non-object, or a `state` outside the
+  three words (compared case-insensitively) renders **no banner**, and the
+  rest of the page is exactly what it is without the file. `render.py`
+  never fails on this input.
+- Every other field is optional: a non-string `cause` or `advice` renders
+  nothing, a non-list `failing_cases` (or its non-string members) drops, an
+  unparseable `since` or `generated_at` reads as unknown. Any other key is
+  ignored.
+- The banner shows the state as glyph + word + colour; `since` as an
+  absolute UTC stamp, followed by the duration up to `generated_at` when
+  `generated_at` is not before it (the verdict's own clock, so the baked
+  page and the client re-render agree); the cause; the advice; and a
+  `details ↓` link to `#gate` carrying `failing_cases` and `since` as the
+  parameters below. The client adds the wall-clock age to the
+  `checked HH:MM UTC` stamp and labels it `STALE` (`generated_at` older
+  than `data.json`'s `stale_after_s`, or `stale: true`) or `UNREACHABLE`
+  (a poll failed or returned no usable verdict; the last verdict stays up)
+  in words, as the freshness badge does.
+- `render.py` does not copy `health.json` into its out-dir: the writer owns
+  that object, and republishing a copy would overwrite a fresher verdict
+  with the one the render happened to read.
+
+## Page URL parameters
+
+Deep links into the published page, for anything that points a reader at
+an incident. Query before fragment:
+`index.html?cases=a,b&since=2026-09-08T09:00:00Z&until=2026-09-08T12:00:00Z#gate`.
+
+| Parameter | Value                                                                                                                         | Effect                                                                                                                                                                                                                                  |
+| --------- | ----------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `cases`   | comma-separated case names, each matching `[A-Za-z0-9][A-Za-z0-9._-]{0,79}`; the first 50 are read                            | matrix rows for those cases get a `linked` badge and an accent bar; the other rows dim but stay readable. A name with no row in the matrix (not on record, or inactive) highlights nothing; when no linked name has a row, no row dims. |
+| `since`   | ISO 8601: `YYYY-MM-DD`, optionally `THH:MM[:SS[.ffffff]]` and `Z` or a `±HH:MM`/`±HHMM` offset; a timezone-naive stamp is UTC | runs whose `started` is at or after it get a window ring on their matrix column, and the failure-signature Pareto counts the reps of those runs instead of the rolling 7 days (run-level events stay excluded).                         |
+| `until`   | same shape; read only alongside `since`, and only when not before it                                                          | closes the window (inclusive). Absent, the window is open-ended.                                                                                                                                                                        |
+| fragment  | `#agent`, `#gate`, `#evidence` or `#release`, after the query                                                                 | scrolls to that section (clear of the sticky bar) and selects its nav tab.                                                                                                                                                              |
+
+Parsing is client-side only — the server render is the same page whatever
+the URL carries. A value that fails its grammar is dropped silently, every
+value reaches the DOM HTML-escaped, and the note under **The gate** names
+what is highlighted and the window in words, with a `clear` control that
+removes the parameters.
 
 ## Fixtures
 

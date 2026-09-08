@@ -17,14 +17,18 @@ runner, and the local-path test uses a runner that fails the test if called.
 """
 
 import contextlib
+import functools
 import html as html_lib
+import http.server
 import io
 import json
 import pathlib
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 
 from eval_dashboard import publish, render
@@ -54,6 +58,40 @@ CHROME = next(
     ),
     None,
 )
+# Every launch gets its own profile directory: the default one is shared
+# with a developer's running Chrome and with the other test processes the
+# Makefile runs in parallel. Not on macOS, where the branded build's
+# updater registers itself into a fresh profile and never returns
+# (chrome/updater/updater.cc in stderr); the default profile works there.
+CHROME_PROFILE = tempfile.TemporaryDirectory(prefix="eval-dashboard-chrome-")
+CHROME_FLAGS = (
+    "--headless",
+    "--disable-gpu",
+    "--no-sandbox",
+    *([] if sys.platform == "darwin" else [f"--user-data-dir={CHROME_PROFILE.name}"]),
+)
+
+
+def chrome_smoke() -> str | None:
+    """Why the browser tests must skip, or None when a launch works. A
+    Chrome that is installed but cannot start here (a missing library, a
+    sandbox rule) is an environment fact, reported as a skip reason rather
+    than as thirteen unrelated failures."""
+    if not CHROME:
+        return "no headless Chrome on this machine"
+    try:
+        proc = subprocess.run(
+            [CHROME, *CHROME_FLAGS, "--dump-dom", "about:blank"],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as err:
+        return f"headless Chrome did not launch: {err}"
+    if proc.returncode != 0 or "<html" not in proc.stdout:
+        return f"headless Chrome exited {proc.returncode}: {proc.stderr.strip()[-300:]}"
+    return None
+
+
+CHROME_SKIP_REASON = chrome_smoke()
 
 # A reason long enough to exercise the 60-char snippet fallback, carrying an
 # agent-classed keyword ("false finding").
@@ -268,32 +306,41 @@ PROBE_COMPARE = """<script>(function(){
 })()</script>"""
 
 
-def browser_dom(html, out_dir, query="", fragment=""):
+def probe_page(html):
+    """The shipped page with the parity probe spliced in: the capture goes
+    in front of the first script *after* #app (so it sees the baked
+    fragment and nothing else), the comparison at the end of the body."""
+    before, after = html.split('<div id="app">', 1)
+    after = after.replace("<script>", PROBE_CAPTURE + "<script>", 1)
+    return before + '<div id="app">' + after.replace("</body>", PROBE_COMPARE + "</body>")
+
+
+def chrome_dump(url):
     """The DOM after the page's script ran, as headless Chrome serializes
-    it, plus the parity verdict the probe wrote into <title>. ``query`` and
-    ``fragment`` are appended to the file:// URL verbatim (the browser
-    parses them exactly as it would on the published page)."""
-    probe = html.replace("<script>", PROBE_CAPTURE + "<script>", 1)
-    probe = probe.replace("</body>", PROBE_COMPARE + "</body>")
-    probe_path = out_dir / "probe.html"
-    probe_path.write_text(probe)
+    it. A launch failure reports Chrome's own stderr."""
     proc = subprocess.run(
-        [
-            CHROME,
-            "--headless",
-            "--disable-gpu",
-            "--no-sandbox",
-            "--virtual-time-budget=2000",
-            "--dump-dom",
-            probe_path.as_uri() + query + fragment,
-        ],
+        [CHROME, *CHROME_FLAGS, "--virtual-time-budget=3000", "--dump-dom", url],
         capture_output=True,
         text=True,
         timeout=120,
-        check=True,
+        check=False,
     )
-    dom = proc.stdout
+    if proc.returncode != 0:
+        raise AssertionError(f"chrome exited {proc.returncode} for {url}:\n{proc.stderr[-2000:]}")
+    return proc.stdout
+
+
+def browser_dom(html, out_dir, query="", fragment=""):
+    """The probed page's DOM plus the parity verdict the probe wrote into
+    <title>. ``query`` and ``fragment`` are appended to the file:// URL
+    verbatim (the browser parses them exactly as it would on the published
+    page)."""
+    probe_path = out_dir / "probe.html"
+    probe_path.write_text(probe_page(html))
+    dom = chrome_dump(probe_path.as_uri() + query + fragment)
     title = html_lib.unescape(dom.split("<title>", 1)[1].split("</title>", 1)[0])
+    if not title.startswith("{"):
+        raise AssertionError(f"the probe script did not run; title is {title!r}")
     return dom, json.loads(title)
 
 
@@ -655,6 +702,30 @@ class HealthBannerTest(unittest.TestCase):
         # And the bootstrap copy carries no '<' at all.
         self.assertNotIn("<script>alert(4)", html)
         self.assertIn("\\u003c/script>\\u003cscript>alert(4)", html)
+
+    def test_out_of_range_stamps_and_lone_surrogates_never_abort_the_render(self):
+        # Both crashed render.main before the adversarial pass: an offset
+        # that pushes year 9999 or year 1 out of datetime's range raised
+        # OverflowError past parse_iso's ValueError guard, and a lone
+        # surrogate (a surrogateescape'd log byte, json.dumps'd as \udc80)
+        # raised UnicodeEncodeError in quote() and in write_text().
+        _, app = self.render(
+            health=fixture_health(
+                since="9999-12-31T23:00:00-05:00",
+                generated_at="0001-01-01T00:00:00+05:00",
+                cause="a\udc80b",
+                failing_cases=["x\udc80", "case-a"],
+            )
+        )
+        banner = banner_of(app)
+        self.assertIn("since unknown", banner)
+        self.assertIn("checked —", banner)
+        self.assertIn('<div class="hcause">a�b</div>', banner)
+        self.assertIn('href="?cases=x%EF%BF%BD,case-a#gate"', banner)
+        self.assertIsNone(render.parse_iso("9999-12-31T23:00:00-05:00"))
+        # A real astral character is one code point in Python and a valid
+        # pair in JS; only the lone surrogate is replaced on either side.
+        self.assertEqual(render.well_formed("😀 \udc80"), "😀 �")
 
     def test_banner_renders_on_the_empty_state_page_too(self):
         data = {"schema_version": 1, "generated_at": "2026-08-28T14:02:11Z",
@@ -1168,13 +1239,11 @@ class LiveReadSideTest(unittest.TestCase):
         self.assertIn(f'linkParamCases: "{render.LINK_PARAM_CASES}"', js)
         self.assertIn(f'linkParamSince: "{render.LINK_PARAM_SINCE}"', js)
         self.assertIn(f'linkParamUntil: "{render.LINK_PARAM_UNTIL}"', js)
-        # The server never reads the query string: deep links are parsed
-        # client-side only, and only from location.search.
+        # Deep links are parsed client-side only, from location.search.
         self.assertIn("new URLSearchParams(location.search)", js)
-        self.assertNotIn("location.search", render.__doc__ or "")
 
 
-@unittest.skipUnless(CHROME, "no headless Chrome on this machine")
+@unittest.skipIf(CHROME_SKIP_REASON, CHROME_SKIP_REASON)
 class BrowserParityTest(unittest.TestCase):
     """The template's script, run for real: renderAll() must reproduce the
     baked page byte for byte (as parsed DOM), and a deep-linked URL must
@@ -1206,6 +1275,18 @@ class BrowserParityTest(unittest.TestCase):
         # The one deliberate difference: the wall-clock label on "checked".
         # The fixture's verdict is days old, so it must read STALE.
         self.assertRegex(live_app(dom), r'id="healthfresh">STALE · checked 12:00 UTC · \d+m ago<')
+
+    def test_js_rerender_matches_the_baked_page_with_a_space_separated_since(self):
+        # fromisoformat accepts "2026-08-31 10:00:00"; bare Date.parse would
+        # read that as local time (this machine is not on UTC in CI either
+        # way), so the mirror rewrites the space to "T" before the Z rule.
+        html, out_dir, tmp = render_fixture(
+            fixture_data(), health=fixture_health(since="2026-08-31 10:00:00")
+        )
+        self.addCleanup(tmp.cleanup)
+        _, verdict = self.dom(html=html, out_dir=out_dir)
+        self.assert_parity(verdict)
+        self.assertIn("since 2026-08-31 10:00 UTC · for 1d 2h", baked_app(html))
 
     def test_js_rerender_matches_the_baked_page_without_health(self):
         html, out_dir, tmp = render_fixture(fixture_data(), events_yaml=fixture_events_yaml())
@@ -1252,12 +1333,16 @@ class BrowserParityTest(unittest.TestCase):
         self.assertIn("Failure signatures · last 7 days", app)
         self.assertNotIn(' win"', app)
 
-    def test_unknown_cases_alone_leave_the_matrix_untouched(self):
-        dom, _ = self.dom(query="?cases=nope,also-nope")
-        app = live_app(dom)
-        self.assertNotIn(' hl"', app)
-        self.assertNotIn(' dim"', app)
-        self.assertIn("no linked case is on record", app)
+    def test_unknown_or_inactive_cases_alone_leave_the_matrix_untouched(self):
+        # case-f is on record but inactive: it has no matrix row, so the
+        # note must not claim to highlight it either.
+        for query in ("?cases=nope,also-nope", "?cases=case-f"):
+            dom, _ = self.dom(query=query)
+            app = live_app(dom)
+            self.assertNotIn(' hl"', app, query)
+            self.assertNotIn(' dim"', app, query)
+            self.assertNotIn("highlighting", app, query)
+            self.assertIn("no linked case has a row in the matrix", app, query)
 
     def test_window_marks_columns_and_filters_the_pareto(self):
         # Fixture starts: C 08-31T09:00, D 08-31T11:00, E 09-01T08:00,
@@ -1285,6 +1370,17 @@ class BrowserParityTest(unittest.TestCase):
         app = live_app(dom)
         self.assertEqual(app.count('class="mx-col win"'), 1)  # run F only
         self.assertIn("showing 2026-09-01 08:30 UTC → now window", app)
+
+    def test_window_bounds_are_inclusive_and_offsets_are_honoured(self):
+        # E starts 09-01T08:00Z and F 09:00Z exactly: both bounds inclusive.
+        dom, _ = self.dom(query="?since=2026-09-01T08:00:00Z&until=2026-09-01T09:00:00Z")
+        self.assertEqual(live_app(dom).count('class="mx-col win"'), 2)
+        # 10:00+02:00 is 08:00Z (E), a naive stamp is UTC, and the note
+        # shows the window in UTC whatever offset the link carried.
+        dom, _ = self.dom(query="?since=2026-09-01T10:00:00%2B02:00&until=2026-09-01T08:30")
+        app = live_app(dom)
+        self.assertEqual(app.count('class="mx-col win"'), 1)
+        self.assertIn("showing 2026-09-01 08:00–08:30 UTC window", app)
 
     def test_same_day_window_is_written_once(self):
         dom, _ = self.dom(query="?since=2026-09-01T08:30:00Z&until=2026-09-01T09:30:00Z")
@@ -1351,9 +1447,106 @@ class BrowserParityTest(unittest.TestCase):
             tabs = on_tabs(self.dom(fragment=fragment)[0])
             self.assertEqual(len(tabs), 1, fragment)
             self.assertIn(f'href="{fragment}"', tabs[0])
-        tabs = on_tabs(self.dom()[0])
-        self.assertEqual(len(tabs), 1)
-        self.assertIn('href="#agent"', tabs[0])
+        # No fragment, or one that names no tab: the first tab stays on
+        # rather than every tab going dark.
+        for fragment in ("", "#healthbanner"):
+            tabs = on_tabs(self.dom(fragment=fragment)[0])
+            self.assertEqual(len(tabs), 1, fragment)
+            self.assertIn('href="#agent"', tabs[0])
+
+
+@unittest.skipIf(CHROME_SKIP_REASON, CHROME_SKIP_REASON)
+class BrowserPollTest(unittest.TestCase):
+    """The 60 s health.json poll over a real HTTP server: the page is baked
+    with one verdict and the server answers with another (or nothing, or
+    garbage), and the banner must follow the fail-safe rules the string
+    tripwires above only pin as source text."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.html, cls.out_dir, cls._tmp = render_fixture(
+            fixture_data(), events_yaml=fixture_events_yaml(), health=fixture_health("GREEN")
+        )
+        cls.www = pathlib.Path(cls._tmp.name) / "www"
+        cls.www.mkdir()
+        shutil.copyfile(cls.out_dir / "index.html", cls.www / "index.html")
+        shutil.copyfile(cls.out_dir / "data.json", cls.www / "data.json")
+
+        class Quiet(http.server.SimpleHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+        handler = functools.partial(Quiet, directory=str(cls.www))
+        cls.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.base = f"http://127.0.0.1:{cls.server.server_address[1]}/"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls._tmp.cleanup()
+
+    def serve_health(self, text):
+        path = self.www / "health.json"
+        if text is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(text)
+        self.addCleanup(path.unlink, missing_ok=True)
+
+    def banner(self, dom):
+        app = live_app(dom)
+        return app.split('<div id="health">', 1)[1].split("</div>", 1)[0]
+
+    def freshness(self, dom):
+        return dom.split('id="freshness"', 1)[1].split("</span>", 1)[0]
+
+    def test_a_polled_verdict_replaces_the_baked_one(self):
+        self.serve_health(json.dumps(fixture_health("OUTAGE")))
+        dom = chrome_dump(self.base + "index.html")
+        banner = self.banner(dom)
+        self.assertIn("🔴 OUTAGE", banner)
+        self.assertNotIn("UNREACHABLE", banner)
+        self.assertIn("checked 12:00 UTC", banner)
+        # The data poll succeeded too: its badge is STALE (old fixture), not
+        # UNREACHABLE.
+        self.assertNotIn("UNREACHABLE", self.freshness(dom))
+        self.assertIn("STALE · updated 12:00 UTC", self.freshness(dom))
+
+    def test_a_missing_or_malformed_health_json_keeps_the_last_verdict(self):
+        for text in (None, '{"state": "PURPLE"}', "{not json"):
+            self.serve_health(text)
+            dom = chrome_dump(self.base + "index.html")
+            banner = self.banner(dom)
+            self.assertIn("🟢 GREEN", banner, text)
+            self.assertIn("UNREACHABLE · checked 12:00 UTC", banner, text)
+            self.assertNotIn("UNREACHABLE", self.freshness(dom), text)
+
+    def test_a_poisoned_verdict_is_not_committed_and_the_data_feed_stays_up(self):
+        # A lone surrogate in failing_cases made encodeURIComponent throw
+        # after the verdict had been committed; every later data re-render
+        # then threw too and the badge blamed data.json. The escaped form
+        # below is what json.dumps writes for such a string.
+        self.serve_health('{"state":"OUTAGE","failing_cases":["case-a","\\udc80"],'
+                          '"since":"2026-08-31T10:00:00Z","generated_at":"2026-09-01T12:00:00Z"}')
+        dom = chrome_dump(self.base + "index.html")
+        banner = self.banner(dom)
+        # wellFormed() now makes it renderable, so the verdict is taken...
+        self.assertIn("🔴 OUTAGE", banner)
+        self.assertIn("cases=case-a,%EF%BF%BD", banner)
+        self.assertNotIn("UNREACHABLE", banner)
+        # ...and the data feed's badge is untouched either way.
+        self.assertNotIn("UNREACHABLE", self.freshness(dom))
+        self.assertIn("Case × run outcome matrix", live_app(dom))
+
+    def test_stale_flag_from_the_writer_labels_the_banner(self):
+        self.serve_health(json.dumps(fixture_health("DEGRADED", stale=True)))
+        dom = chrome_dump(self.base + "index.html")
+        banner = self.banner(dom)
+        self.assertIn("🟡 DEGRADED", banner)
+        self.assertIn("STALE · checked 12:00 UTC", banner)
 
 
 class PublishTest(unittest.TestCase):

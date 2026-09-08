@@ -25,8 +25,8 @@ Three rules shape everything here:
   inputs are ``case-notes.yaml`` (``--notes``: one-line annotations, issue
   links and badges per case), ``events.yaml`` (``--events``: dated event
   markers plus the few human-judgment counts no log line carries) and
-  ``health.json`` (``--health``: the gate-health verdict the CI health
-  adjudicator writes beside data.json, rendered as a banner above the hero).
+  ``health.json`` (``--health``: a gate-health verdict a separate job writes
+  beside data.json, rendered as a banner above the hero).
   An absent or malformed file degrades to "no annotation" / "no banner" --
   never an error.
 * **INFRA is not failure.** A rep (or task) whose result is ``infra`` is
@@ -116,13 +116,17 @@ REASON_SNIPPET_CHARS = 60
 # Prow's job verdict for a green run (SCHEMA.md: runs[].result).
 RUN_RESULT_GREEN = "SUCCESS"
 MINUTE_MS = 60 * 1000
+MS_PER_S = 1000
+MINUTES_PER_HOUR = 60
+MINUTES_PER_DAY = 24 * MINUTES_PER_HOUR
 
 # --- health.json (SCHEMA.md, "health.json (optional input)") --------------
-# The gate-health verdict the CI health adjudicator writes beside data.json.
-# The page polls this object name next to data.json; render.py bakes the
-# copy passed as --health. The banner is the page's top element.
+# A gate-health verdict a separate job writes beside data.json (nothing in
+# this directory writes it). The page polls this object name next to
+# data.json; render.py bakes the copy passed as --health. The banner is the
+# first element of the page content, below the sticky bar.
 HEALTH_FILE = "health.json"
-# The three states the adjudicator emits, with the glyph and CSS class each
+# The three states the writer emits, with the glyph and CSS class each
 # renders as. The word always sits beside the glyph and the colour -- the
 # page's rule is that no state is announced by colour alone.
 HEALTH_STATES = ("GREEN", "DEGRADED", "OUTAGE")
@@ -140,6 +144,17 @@ LINK_PARAM_UNTIL = "until"
 # JS encodeURIComponent leaves these unescaped besides alphanumerics; quote()
 # always keeps "_.-~", so the two encoders agree on every input.
 URI_COMPONENT_SAFE = "-_.!~*'()"
+# A lone surrogate (what surrogateescape-decoding a log line leaves behind,
+# and what json.dumps writes as \udc80) can be neither UTF-8-encoded nor
+# percent-encoded, so it is replaced before the text goes anywhere -- with
+# U+FFFD, the code point the JS mirror's String.prototype.toWellFormed
+# writes, so the baked banner and the re-render agree.
+LONE_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+REPLACEMENT_CHAR = "\ufffd"
+# Banner text for a verdict without a parseable since / generated_at;
+# mirrored verbatim in the template.
+LABEL_SINCE_UNKNOWN = "since unknown"
+LABEL_CHECKED_UNKNOWN = "checked —"
 
 # --- failure-signature normalization -------------------------------------
 # Deliberately small and documented: a reason that matches nothing renders
@@ -258,11 +273,12 @@ def parse_iso(value) -> datetime.datetime | None:
         return None
     try:
         parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        return parsed.astimezone(datetime.timezone.utc)
+    except (ValueError, OverflowError):
+        # OverflowError: an offset that pushes year 1 or 9999 out of range.
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
-    return parsed.astimezone(datetime.timezone.utc)
 
 
 def iso_ms(value) -> float | None:
@@ -279,7 +295,7 @@ def utc_day(value) -> str | None:
 
 
 def ms_to_utc(ms: float) -> datetime.datetime:
-    return datetime.datetime.fromtimestamp(ms / 1000, tz=datetime.timezone.utc)
+    return datetime.datetime.fromtimestamp(ms / MS_PER_S, tz=datetime.timezone.utc)
 
 
 def utc_stamp(ms: float) -> str:
@@ -300,8 +316,8 @@ def utc_iso(ms: float) -> str:
 def duration_text(ms: float) -> str:
     """'3d 4h', '3h 12m' or '12m', floored; mirrors the JS ``durationText``."""
     minutes = max(0, math.floor(ms / MINUTE_MS))
-    days, rem = divmod(minutes, 24 * 60)
-    hours, mins = divmod(rem, 60)
+    days, rem = divmod(minutes, MINUTES_PER_DAY)
+    hours, mins = divmod(rem, MINUTES_PER_HOUR)
     if days:
         return f"{days}d {hours}h"
     if hours:
@@ -312,6 +328,12 @@ def duration_text(ms: float) -> str:
 def uri_component(value: str) -> str:
     """Mirrors the JS ``encodeURIComponent`` (see URI_COMPONENT_SAFE)."""
     return urllib.parse.quote(value, safe=URI_COMPONENT_SAFE)
+
+
+def well_formed(value: str) -> str:
+    """``value`` with every lone surrogate replaced (LONE_SURROGATE_RE);
+    mirrors the JS ``wellFormed``."""
+    return LONE_SURROGATE_RE.sub(REPLACEMENT_CHAR, value)
 
 
 def run_label(run: dict, index: int) -> str:
@@ -607,10 +629,14 @@ def normalize_health(raw) -> dict | None:
 
     def text(key: str) -> str:
         value = raw.get(key)
-        return value if isinstance(value, str) else ""
+        return well_formed(value) if isinstance(value, str) else ""
 
     raw_cases = raw.get("failing_cases")
-    cases = [str(c) for c in raw_cases if isinstance(c, str)] if isinstance(raw_cases, list) else []
+    cases = (
+        [well_formed(c) for c in raw_cases if isinstance(c, str)]
+        if isinstance(raw_cases, list)
+        else []
+    )
     return {
         "state": state,
         "since": text("since") if iso_ms(raw.get("since")) is not None else None,
@@ -647,10 +673,12 @@ def health_html(health: dict | None) -> str:
     state = health["state"]
     since = iso_ms(health["since"])
     checked = iso_ms(health["generated_at"])
-    since_text = f"since {utc_stamp(since)} UTC" if since is not None else "since unknown"
+    since_text = f"since {utc_stamp(since)} UTC" if since is not None else LABEL_SINCE_UNKNOWN
     if since is not None and checked is not None and checked >= since:
         since_text += f" · for {duration_text(checked - since)}"
-    checked_text = f"checked {utc_hhmm(checked)} UTC" if checked is not None else "checked —"
+    checked_text = (
+        f"checked {utc_hhmm(checked)} UTC" if checked is not None else LABEL_CHECKED_UNKNOWN
+    )
     parts = [
         f'<section class="health {HEALTH_CLASSES[state]}" id="healthbanner" role="status">',
         '<div class="hrow">',
@@ -1241,7 +1269,7 @@ def main(argv: list[str] | None = None) -> int:
         "--health",
         default=None,
         help=(
-            f"{HEALTH_FILE} from the CI health adjudicator (optional banner; "
+            f"{HEALTH_FILE} gate-health verdict (optional banner; "
             "absent or malformed file renders no banner)"
         ),
     )
@@ -1256,7 +1284,7 @@ def main(argv: list[str] | None = None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "index.html").write_text(render_page(data, notes, events, health))
     # health.json is deliberately not copied beside index.html: the
-    # adjudicator owns that object in the bucket, and publishing a copy from
+    # writer owns that object in the bucket, and publishing a copy from
     # here would overwrite a fresher verdict with the one this render read.
     shutil.copyfile(args.data, out_dir / "data.json")
     print(f"wrote {out_dir / 'index.html'}")

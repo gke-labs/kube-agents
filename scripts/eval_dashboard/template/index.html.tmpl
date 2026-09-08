@@ -236,12 +236,15 @@ document.addEventListener("mousemove",e=>{
  * render.py owns the golden tests, this owns the screen a viewer actually
  * watches. Change them together.
  *
- * States, for the data feed and the health banner alike:
- *  - fresh:       "updated HH:MM UTC · Nm ago"
+ * States, for the data feed's badge ("updated HH:MM UTC") and the health
+ * banner's stamp ("checked HH:MM UTC") alike:
+ *  - fresh:       "… HH:MM UTC · Nm ago"
  *  - stale:       generated_at older than data.json's stale_after_s
- *                 (default 7200s) -> amber badge labelled STALE
- *  - unreachable: a poll failed -> amber badge labelled UNREACHABLE, and
- *                 the last successfully rendered data stays on screen
+ *                 (default 7200s), or health.json's own stale: true
+ *                 -> amber badge labelled STALE
+ *  - unreachable: a poll failed or returned no usable verdict -> amber
+ *                 badge labelled UNREACHABLE, and the last successfully
+ *                 rendered data (or verdict) stays on screen
  *
  * Deep links (SCHEMA.md, "Page URL parameters"): ?cases=a,b&since=<iso>
  * &until=<iso> before the fragment. Parsed here only -- the server render
@@ -332,6 +335,9 @@ function parseIso(value) {
   // Date.parse would read one as *local* time and break baked-vs-live
   // parity for any viewer outside UTC.
   let text = value;
+  // fromisoformat also takes a space between date and time; Date.parse
+  // would read that form as local time (or, in Safari, not at all).
+  if (/^\d{4}-\d{2}-\d{2} \d/.test(text)) text = text.replace(" ", "T");
   if (text.includes("T") && !/(?:[zZ]|[+-]\d\d:?\d\d)$/.test(text)) text += "Z";
   const ms = Date.parse(text);
   return Number.isNaN(ms) ? null : ms;
@@ -496,13 +502,21 @@ function badgeHtml(entry) {
 
 /* ---- health.json: the gate-health banner (mirrors render.py) ---- */
 
+// A lone surrogate makes encodeURIComponent throw; replace it with U+FFFD,
+// as render.py's well_formed does, before the text goes anywhere. A
+// function declaration, not a const: normalizeHealth runs at script start
+// for the bootstrap, before any const below it is initialized.
+function wellFormed(s) {
+  return s.replace(/\p{Surrogate}/gu, "�");
+}
+
 function normalizeHealth(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const state = String(raw.state || "").toUpperCase();
   if (!DASH.healthStates.includes(state)) return null;
-  const text = (key) => (typeof raw[key] === "string" ? raw[key] : "");
+  const text = (key) => (typeof raw[key] === "string" ? wellFormed(raw[key]) : "");
   const cases = Array.isArray(raw.failing_cases)
-    ? raw.failing_cases.filter((c) => typeof c === "string") : [];
+    ? raw.failing_cases.filter((c) => typeof c === "string").map(wellFormed) : [];
   return {
     state,
     since: parseIso(raw.since) != null ? text("since") : null,
@@ -602,11 +616,13 @@ function linkNoteHtml(link, data) {
   if (!linkActive(link)) return "";
   const parts = [];
   if (link.cases.size) {
+    // The same rows the matrix draws (active cases), so the note never
+    // claims a highlight for an inactive case that has no row.
     const known = (data.cases || []).filter((c) => c && typeof c === "object"
-      && link.cases.has(String(c.name))).map((c) => String(c.name));
+      && c.active !== false && link.cases.has(String(c.name))).map((c) => String(c.name));
     parts.push(known.length
       ? `<span>highlighting ${known.map(esc).join(", ")}</span>`
-      : "<span>no linked case is on record</span>");
+      : "<span>no linked case has a row in the matrix</span>");
   }
   if (link.sinceMs != null) parts.push(`<span>showing ${esc(windowText(link))} window</span>`);
   parts.push(`<a href="${esc(clearHref())}">clear</a>`);
@@ -1047,10 +1063,16 @@ const EMPTY_STATE_HTML = `
     </div>
   </section>`;
 
+// The banner, or nothing: a verdict that cannot be rendered must not take
+// the data feed's re-render down with it.
+function safeHealthHtml() {
+  try { return healthHtml(health); } catch (err) { return ""; }
+}
+
 function appHtml(data, link = NO_LINK) {
   // The banner container is always present (empty without a verdict) so
   // the health poll can re-render it alone; mirrors render.py's app_html.
-  const banner = `<div id="health">${healthHtml(health)}</div>`;
+  const banner = `<div id="health">${safeHealthHtml()}</div>`;
   if (!((data.runs || []).length || (data.cases || []).length)) return banner + EMPTY_STATE_HTML;
   return banner + HERO_HTML + bandAgentHtml(data, DASH.events)
     + bandGateHtml(data, DASH.notes, DASH.events, link)
@@ -1086,7 +1108,7 @@ function renderFreshness() {
 
 // The banner's own "checked" stamp gets the same wall-clock treatment as
 // the freshness badge: age, then STALE (the verdict's generated_at is older
-// than data.json's stale_after_s, or the adjudicator flagged it) or
+// than data.json's stale_after_s, or the writer flagged it) or
 // UNREACHABLE (a health.json poll failed; the last verdict stays up).
 function renderHealthFreshness() {
   const el = document.getElementById("healthfresh");
@@ -1109,15 +1131,16 @@ function renderHealthFreshness() {
 function renderHealth() {
   const el = document.getElementById("health");
   if (!el) return;
-  el.innerHTML = healthHtml(health);
+  el.innerHTML = safeHealthHtml();
   renderHealthFreshness();
 }
 
 function renderNav() {
-  const hash = DASH.fragmentRe.test(location.hash) ? location.hash : "#agent";
-  for (const a of document.querySelectorAll(".nav a")) {
-    a.className = a.getAttribute("href") === hash ? "on" : "";
-  }
+  const tabs = [...document.querySelectorAll(".nav a")];
+  const hash = DASH.fragmentRe.test(location.hash) ? location.hash : "";
+  // A fragment that names no tab (#healthbanner) leaves the first tab on.
+  const on = tabs.find((a) => a.getAttribute("href") === hash) || tabs[0];
+  for (const a of tabs) a.className = a === on ? "on" : "";
 }
 
 function renderAll() {
@@ -1148,11 +1171,12 @@ async function refreshHealth() {
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const next = normalizeHealth(await response.json());
     if (!next) throw new Error("malformed health.json");
+    healthHtml(next); // a verdict that cannot render is never committed
     health = next;
     healthUnreachable = false;
   } catch (err) {
     // Keep the last verdict on screen (none, if there never was one); only
-    // its label changes. A missing health.json is the pre-adjudicator page.
+    // its label changes. A missing health.json is the page without a verdict.
     healthUnreachable = true;
   }
   renderHealth();
