@@ -33,6 +33,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -228,6 +229,33 @@ func main() {
 		}
 	}
 
+	// RBAC self-check: say at boot, in one line, whether the ClusterRole bound
+	// to this pod is behind the image it runs — the skew a floating tag plus a
+	// pod reschedule produces, which otherwise surfaces only as an unbounded
+	// `Reconciler error` loop (#1009). The checker then re-probes on its own
+	// ticker, off the reconcile worker, and the reconciler puts the last
+	// answer on every PlatformAgent's status; see
+	// internal/controller/rbac_selfcheck.go.
+	var rbacChecker *controller.RBACChecker
+	if clientset, err := kubernetes.NewForConfig(mgr.GetConfig()); err != nil {
+		setupLog.Error(err, "RBAC self-check disabled: could not build a clientset")
+	} else {
+		rbacChecker = controller.NewRBACChecker(clientset.AuthorizationV1().SelfSubjectAccessReviews())
+		denied, err := rbacChecker.Probe(context.Background())
+		if err != nil {
+			setupLog.Error(err, "RBAC self-check could not run; the controller retries it during reconciles")
+		} else if len(denied) > 0 {
+			setupLog.Error(nil, "RBAC self-check failed: "+controller.RBACIncompleteCause, "denied", denied)
+		} else {
+			setupLog.Info("RBAC self-check passed: every permission the controller's RBAC markers declare is granted")
+		}
+		// Re-probe on the checker's own ticker, off the reconcile worker.
+		if err := mgr.Add(rbacChecker); err != nil {
+			setupLog.Error(err, "Failed to add the RBAC self-check to the manager")
+			os.Exit(1)
+		}
+	}
+
 	apiHost := os.Getenv("KUBERNETES_SERVICE_HOST")
 	if mgr.GetConfig() != nil && mgr.GetConfig().Host != "" {
 		rawHost := mgr.GetConfig().Host
@@ -250,6 +278,7 @@ func main() {
 	if err := (&controller.PlatformAgentReconciler{
 		Client:                   mgr.GetClient(),
 		APIReader:                mgr.GetAPIReader(),
+		RBAC:                     rbacChecker,
 		Scheme:                   mgr.GetScheme(),
 		APIServerIP:              apiHost,
 		APIServerCIDROverride:    apiServerCIDR,

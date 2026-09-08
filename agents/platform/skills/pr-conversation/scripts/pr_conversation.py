@@ -57,7 +57,6 @@ import json
 import os
 import re
 import sys
-import tempfile
 from datetime import datetime
 
 # `$HERMES_HOME/scripts`, where the entrypoint's step 2b force-sync stages the
@@ -94,7 +93,7 @@ def _fail(message: str):
 
 def validate_repo(repo: str) -> str:
     """Ensure repo is formatted as owner/name and is in the managed repos allowlist if configured."""
-    from gitops_workspace import get_managed_github_repos, is_valid_repo_slug
+    from gitops_workspace import get_managed_github_repos, is_valid_repo_slug, validate_repo_org
     if not repo or not is_valid_repo_slug(repo):
         raise ValueError(f"Invalid repository format: {repo!r}. Expected 'owner/name'.")
     managed = get_managed_github_repos()
@@ -102,7 +101,7 @@ def validate_repo(repo: str) -> str:
         raise ValueError(
             f"Repository {repo!r} is not in the managed repositories list: {managed}"
         )
-    return repo
+    return validate_repo_org(repo)
 
 
 def _resolve_repo(args=None) -> str:
@@ -419,11 +418,6 @@ def handle_poll(args) -> int:
         return 0
 
     payload = {"status": "FOUND", "requests": found, "conversations": threads}
-    if over_budget:
-        payload["warnings"] = [
-            f"pr_conversation: {over_budget} untrusted request(s) not offered — "
-            "the per-pull-request refusal budget is exhausted"
-        ]
     print(json.dumps(payload))
     return 0
 
@@ -696,23 +690,16 @@ def _post(args, marker_kind: str) -> int:
         _fail(f"Reply body {args.body_file} is nothing but marker syntax.")
     stamped = f"{body}\n\n{pr_triggers.marker(args.comment_id, marker_kind)}\n"
 
-    # The stamped copy stays inside scratch: same confinement as the input, and
-    # the same directory the skill is already allowed to write.
-    os.makedirs(SCRATCH_DIR, exist_ok=True)
-    handle = tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", suffix=".md", dir=SCRATCH_DIR, delete=False
-    )
+    # The stamped copy is never written down. It used to go to a file in
+    # scratch, on the volume the credential sidecar also mounted; with the
+    # broker in its own pod there is no such volume, and `post_comment` takes
+    # the text. `_confined_body` above still governs where the *input* may come
+    # from — that confinement is about what the model is allowed to read, and is
+    # unaffected by how the result travels.
     try:
-        handle.write(stamped)
-        handle.close()
-        provider.post_comment(repo, pr, handle.name)
+        provider.post_comment(repo, pr, stamped)
     except forge.ForgeError as error:
         _fail(f"could not post to {repo}#{args.pr}: {error}")
-    finally:
-        try:
-            os.unlink(handle.name)
-        except OSError:
-            pass
 
     print(
         json.dumps(

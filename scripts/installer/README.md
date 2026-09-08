@@ -24,6 +24,7 @@ their own copies:
 | `DEFAULT_REGION`                         | GCP region (`us-central1`)                                                             |
 | `DEFAULT_CLUSTER_MODE`                   | Shape a fresh install creates (`autopilot`); a live cluster's probed shape always wins |
 | `DEFAULT_VERTEX_LOCATION`                | Vertex AI serving location (`global`)                                                  |
+| `DEFAULT_VERTEX_MANAGE_SERVING_PROJECT`  | Enable the API and grant the gateway's role in the serving project (`true`)            |
 | `DEFAULT_MODEL_PROVIDER`                 | Model provider (`gemini`)                                                              |
 | `DEFAULT_REGISTRY_PREFIX`                | Container registry prefix                                                              |
 | `default_model_for_provider <provider>`  | The default model for a provider                                                       |

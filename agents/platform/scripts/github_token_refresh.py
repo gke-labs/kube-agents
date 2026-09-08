@@ -1,4 +1,4 @@
-#!/opt/hermes/.venv/bin/python3
+#!/usr/bin/env python3
 """
 GKE Platform Agent — Secure GitHub Token Refresher (Broker Client)
 
@@ -26,7 +26,10 @@ sys.path.append("/opt/defaults/scripts")
 sys.path.append("/opt/data/scripts")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from credential_proxy_client import authorization_headers
+# Ships alongside this script in the same directory, which is sys.path[0] both
+# when the shell runs it and when the credential proxy execs it by absolute path.
+import wif_credentials  # noqa: E402 — needs the sys.path lines above
+from credential_proxy_client import authorization_headers  # noqa: E402
 
 
 def log(msg: str):
@@ -48,6 +51,16 @@ GH_MISSING_RC = 127
 #: command that ran for the full timeout may well have landed its write; see
 #: looks_like_auth_failure.
 GH_TIMEOUT_RC = 124
+
+#: Where this same script lands in the shell sandbox. deploy/sandbox/entrypoint.sh
+#: copies /opt/defaults/scripts into the machine home under /opt/data, so the path
+#: resolves there and is the one refresh_git_credentials forwards to.
+SANDBOX_REFRESH_SCRIPT = "/opt/data/scripts/github_token_refresh.py"
+
+#: Bounds the ssh hop around that forward. The broker's own retry budget bounds
+#: the work inside it; this is the 60s the in-pod HTTP branch allows plus room
+#: for the connection.
+SANDBOX_REFRESH_TIMEOUT_SECONDS = 90
 
 # What `gh` prints when the credential is the problem, as opposed to the
 # repository, the network, or the rate limit. Matched case-insensitively
@@ -296,39 +309,88 @@ def refresh_git_credentials(
                 f"Credential sidecar failed to refresh GitHub auth: {exc}"
             ) from exc
 
-    # 1. Retrieve Google OIDC identity token via gcloud external command
-    oidc_token = None
+    # No CREDENTIAL_PROXY_URL, but a shell sandbox is configured: this is the
+    # gateway pod, which holds nothing that can mint. Forward to the sandbox,
+    # which has the variable and a route to the broker's Service.
+    #
+    # The `no_agent` cron jobs are what need this. They run as a plain Python
+    # subprocess on the gateway rather than as a model turn, so they never touch
+    # the terminal backend and never reach the sandbox the way a skill does —
+    # and once the gateway holds no credential, both branches around this one
+    # are dead there: CREDENTIAL_PROXY_URL is unset, and the direct mint below
+    # ends at `No such file or directory: 'gcloud'`. Putting the variable back
+    # on the gateway would fix it by restoring a credential path to the pod the
+    # split exists to empty. Taking the route the model's shell already takes
+    # does not.
+    #
+    # The forwarded process re-enters this function in the sandbox, where
+    # CREDENTIAL_PROXY_URL is set, so it takes the branch above and stops.
+    # There is no way round that into a loop: sandbox_enabled() reads the
+    # gateway's managed Hermes config, which the sandbox image does not carry.
     try:
-        res = subprocess.run(
-            [
-                "gcloud",
-                "auth",
-                "print-identity-token",
-                f"--audiences={TOKEN_BROKER_URL}",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=5,
+        import sandbox_exec
+    except ImportError:
+        sandbox_exec = None
+    if sandbox_exec is not None and sandbox_exec.sandbox_enabled():
+        # SandboxUnavailable is a RuntimeError and is deliberately not caught:
+        # ssh failing to connect means the mint never ran, and this function's
+        # contract is that a failure raises rather than returning quietly.
+        completed = sandbox_exec.run(
+            ["python3", SANDBOX_REFRESH_SCRIPT, repository],
+            timeout=SANDBOX_REFRESH_TIMEOUT_SECONDS,
         )
-        oidc_token = res.stdout.strip()
-    except Exception:
+        if completed.returncode != 0:
+            raise RuntimeError(
+                f"the shell sandbox could not refresh GitHub auth for {repository} "
+                f"(exit {completed.returncode}): {(completed.stderr or '').strip()}"
+            )
+        log(f"GitHub credentials refreshed through the shell sandbox for {repository}.")
+        return ""
+
+    # 1. Retrieve Google OIDC identity token.
+    #
+    # Federation first, and only when the container is actually running on a
+    # federated credential -- fetch_identity_token returns None otherwise and
+    # this falls through to the metadata server via gcloud, which is what every
+    # placement other than the co-located sandbox proxy uses. The federated
+    # branch exists because gcloud refuses to mint an ID token from an
+    # external_account credential at all, so without it the co-located proxy can
+    # reach GCP but not GitHub.
+    oidc_token = wif_credentials.fetch_identity_token(TOKEN_BROKER_URL)
+    if oidc_token:
+        log("Minted the broker OIDC token through Workload Identity Federation.")
+    else:
         try:
             res = subprocess.run(
-                ["gcloud", "auth", "print-identity-token"],
+                [
+                    "gcloud",
+                    "auth",
+                    "print-identity-token",
+                    f"--audiences={TOKEN_BROKER_URL}",
+                ],
                 capture_output=True,
                 text=True,
                 check=True,
                 timeout=5,
             )
             oidc_token = res.stdout.strip()
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to retrieve Google OIDC token via gcloud: {e}"
-            ) from e
+        except Exception:
+            try:
+                res = subprocess.run(
+                    ["gcloud", "auth", "print-identity-token"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    timeout=5,
+                )
+                oidc_token = res.stdout.strip()
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to retrieve Google OIDC token via gcloud: {e}"
+                ) from e
 
-    if not oidc_token:
-        raise RuntimeError("Retrieved Google OIDC token via gcloud is empty.")
+        if not oidc_token:
+            raise RuntimeError("Retrieved Google OIDC token via gcloud is empty.")
 
     # 2. Query Minty Token Broker with bounded retries
     org_name, repo_name = repository.split("/", 1)

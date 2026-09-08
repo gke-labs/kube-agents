@@ -9,6 +9,19 @@
 #   envoy                 fronts the credential proxy on loopback
 #   k8s-event-watcher     watches cluster API servers and reports events
 #
+# CREDENTIAL_PROXY_ROLE selects which of them start, because they no longer all
+# run in the same pod. It is the same variable and the same three values
+# credential_proxy.py's resolve_role() reads; this script decides which
+# processes to launch and that function decides which halves of the runtime to
+# serve. `broker` is the credential pod: Envoy and the credential runtime, which
+# the sandbox reaches over a Service. `api-proxy` is what is left in the gateway
+# pod — the watcher, which posts to the Session KV server on that pod's
+# loopback, and the API authenticator, which forwards to the Hermes gateway on
+# the same loopback. Neither of those is a credential path the agent container
+# can drive, which is the point of the split. `combined` is the sidecar
+# arrangement and stays the default so an image paired with an older operator
+# behaves as it did.
+#
 # They differ in how their failure is treated. Envoy and the credential runtime
 # are the container's reason to exist: if either dies the agent loses every
 # credentialed command, so their exit ends the container and Kubernetes
@@ -27,6 +40,22 @@ set -euo pipefail
 # Credential state lives on this container's own emptyDir volumes, which nothing
 # else mounts, so the wider mode does not widen who can read a credential.
 umask 0002
+
+# Below the umask, and nothing goes above it: `tests/test_startup_umask.py`
+# asserts the umask is the first line here that could create a file, because one
+# sitting under a `mkdir` reads as the control while doing none of its job.
+#
+# Exported, not just assigned: the runtime reads the same variable, and an
+# unset one would otherwise reach it as its own default rather than as the one
+# defaulted here. Two defaults that have to agree is a way for them not to.
+export CREDENTIAL_PROXY_ROLE="${CREDENTIAL_PROXY_ROLE:-combined}"
+case "${CREDENTIAL_PROXY_ROLE}" in
+  combined | broker | api-proxy) ;;
+  *)
+    echo "start-services: unknown CREDENTIAL_PROXY_ROLE=${CREDENTIAL_PROXY_ROLE}" >&2
+    exit 1
+    ;;
+esac
 
 # Watcher restart policy. The watcher is retried in place rather than being
 # allowed to end the container, so these bound how hard a permanently broken
@@ -92,6 +121,14 @@ WATCHER_BACKOFF_MIN_COUNT="${WATCHER_BACKOFF_MIN_COUNT:-3}"
 # mirror will rarely see it apply at all. Set to 1 to disable.
 WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT="${WATCHER_IMAGEPULL_TRANSIENT_MIN_COUNT:-3}"
 
+# The agent image's interpreter. The credential-proxy image is built on
+# agent-base by way of proxy-tools, so this is the same venv the agent runs
+# from; the two proxy scripts import nothing outside the standard library, so
+# what is in it does not matter, only that it exists. Named once because a wrong
+# path here is a container that exits 127 with one line of output and no
+# indication of which of the two callers below asked for it.
+PROXY_PYTHON="${PROXY_PYTHON:-/opt/hermes/.venv/bin/python3}"
+
 runtime_pid=""
 envoy_pid=""
 watcher_pid=""
@@ -108,8 +145,22 @@ terminate() {
 }
 trap terminate EXIT INT TERM
 
+# Workload Identity Federation, when the proxy shares a pod with the shell
+# sandbox. It has to run before anything that authenticates to GCP: the
+# credential runtime's bootstrap command is `gcloud container clusters
+# get-credentials`, and gcloud reads CLOUDSDK_AUTH_CREDENTIAL_FILE_OVERRIDE at
+# invocation. A no-op in the standalone placement, where the metadata server
+# still answers. Not backgrounded and not tolerant of failure — a container that
+# comes up without an identity serves nothing but errors.
+write_wif_credentials() {
+  "${PROXY_PYTHON}" /opt/defaults/scripts/wif_credentials.py
+}
+
 start_credential_runtime() {
-  /opt/hermes/.venv/bin/python3 /opt/defaults/scripts/credential_proxy.py &
+  # The role reaches the runtime as the environment variable it already reads
+  # (resolve_role), not as a flag: one spelling, and a container that sets the
+  # variable without going through this script still gets the role it asked for.
+  "${PROXY_PYTHON}" /opt/defaults/scripts/credential_proxy.py &
   runtime_pid=$!
 }
 
@@ -261,10 +312,17 @@ start_event_watcher() {
   watcher_pid=$!
 }
 
+write_wif_credentials
 start_credential_runtime
-start_envoy
-start_event_watcher
+if [[ "${CREDENTIAL_PROXY_ROLE}" != "api-proxy" ]]; then
+  start_envoy
+fi
+if [[ "${CREDENTIAL_PROXY_ROLE}" != "broker" ]]; then
+  start_event_watcher
+fi
 
-# Only the two credential-path services are waited on. The watcher is absent
-# from this list deliberately — see the header.
-wait -n "${runtime_pid}" "${envoy_pid}"
+# Only the credential-path services are waited on. The watcher is absent from
+# this list deliberately — see the header. envoy_pid is empty in the api-proxy
+# role, and `wait -n` rejects an empty argument, so it is expanded unquoted.
+# shellcheck disable=SC2086
+wait -n "${runtime_pid}" ${envoy_pid}

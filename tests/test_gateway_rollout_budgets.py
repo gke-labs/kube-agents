@@ -1,7 +1,7 @@
 """Tests for the platform-agent-gateway rollout budgets.
 
-The companion to test_hindsight_probes.py, for the Deployment the redeploy
-workflows actually gate on -- and for scripts/release/wait_for_gke_readiness.sh,
+The companion to test_hindsight_probes.py, for the Deployment upgrade.sh
+actually gates on -- and for scripts/release/wait_for_gke_readiness.sh,
 which waits on the same Deployments after the RC environment is provisioned and
 is bound by the same rule. The same three numbers have to stay in the same
 order:
@@ -30,8 +30,7 @@ import unittest
 
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _MANIFESTS_GO = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_manifests.go"
-_AGENT_WORKFLOW = _ROOT / ".github" / "workflows" / "reusable-deploy-agent.yml"
-_INTEGRATIONS_WORKFLOW = _ROOT / ".github" / "workflows" / "reusable-deploy-integrations.yml"
+_UPGRADE_SCRIPT = _ROOT / "upgrade.sh"
 _READINESS_SCRIPT = _ROOT / "scripts" / "release" / "wait_for_gke_readiness.sh"
 
 # What the gate must have over the startupProbe budget, in seconds, for the
@@ -40,7 +39,7 @@ _READINESS_SCRIPT = _ROOT / "scripts" / "release" / "wait_for_gke_readiness.sh"
 _PULL_ALLOWANCE_SECONDS = 240
 
 # Kubernetes' default when a Deployment does not set progressDeadlineSeconds.
-# The integrations Deployments below rely on it rather than setting their own.
+# Deployments with no explicit progressDeadlineSeconds rely on this default.
 _DEFAULT_PROGRESS_DEADLINE_SECONDS = 600
 
 
@@ -90,7 +89,7 @@ class GatewayRolloutBudgetTest(unittest.TestCase):
 
     def setUp(self):
         self.startup = _gateway_startup_budget_seconds()
-        self.gate = _rollout_gate_seconds(_AGENT_WORKFLOW, "platform-agent-gateway")
+        self.gate = _rollout_gate_seconds(_UPGRADE_SCRIPT, "platform-agent-gateway")
         self.deadline = _gateway_progress_deadline_seconds()
 
     def test_the_gate_covers_the_startup_budget_and_the_image_pull(self):
@@ -208,20 +207,17 @@ class ReleaseReadinessGateTest(unittest.TestCase):
         )
 
 
-class IntegrationsRolloutGateTest(unittest.TestCase):
-    """The integrations gates rely on the default deadline, so they stay under it."""
+class UpgradeRolloutGateTest(unittest.TestCase):
+    """The upgrade.sh rollout gates stay under default progress deadlines."""
 
-    def test_gates_stay_under_the_default_progress_deadline(self):
-        for deployment in ("litellm", "github-token-minter"):
-            with self.subTest(deployment=deployment):
-                gate = _rollout_gate_seconds(_INTEGRATIONS_WORKFLOW, deployment)
-                self.assertLess(
-                    gate,
-                    _DEFAULT_PROGRESS_DEADLINE_SECONDS,
-                    f"{deployment} sets no progressDeadlineSeconds, so it runs on the "
-                    f"{_DEFAULT_PROGRESS_DEADLINE_SECONDS}s default; a {gate}s gate cannot "
-                    "run its full length. Set an explicit deadline first, as the gateway does",
-                )
+    def test_controller_gate_stays_under_the_default_progress_deadline(self):
+        gate = _rollout_gate_seconds(_UPGRADE_SCRIPT, "kube-agents-controller-manager")
+        self.assertLess(
+            gate,
+            _DEFAULT_PROGRESS_DEADLINE_SECONDS,
+            f"kube-agents-controller-manager runs on the {_DEFAULT_PROGRESS_DEADLINE_SECONDS}s default deadline; "
+            f"a {gate}s gate cannot run its full length.",
+        )
 
 
 if __name__ == "__main__":

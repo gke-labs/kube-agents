@@ -939,22 +939,69 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
         # spellings.
         for argv, desc in (
             (["gcloud", "compute", "networks", "list", "--project=p",
-              "--format=json"], "SOP:60 VPC inventory"),
+              "--format=json"], "SOP:66 VPC inventory"),
             (["gcloud", "compute", "networks", "subnets", "list",
-              "--format=json"], "SOP:26 subnet inventory"),
+              "--format=json"], "SOP:31 subnet inventory"),
             (["gcloud", "compute", "networks", "subnets", "list-usable",
-              "--project=p", "--format=json"], "SOP:38 usable ranges"),
+              "--project=p", "--format=json"], "SOP:43 usable ranges"),
             (["gcloud", "compute", "networks", "subnets", "describe",
-              "gke-pods-subnet", "--region=us-central1"], "SOP:164 subnet detail"),
+              "gke-pods-subnet", "--region=us-central1"], "SOP:170 subnet detail"),
+            (["gcloud", "compute", "routers", "list", "--project=p",
+              "--format=json"], "SOP:50 router discovery"),
             (["gcloud", "compute", "routers", "get-nat-mapping-info", "r",
-              "--region=us-central1", "--project=p"], "SOP:45 NAT mappings"),
+              "--region=us-central1", "--project=p"], "SOP:51 NAT mappings"),
             (["gcloud", "compute", "security-policies", "list", "--project=p",
-              "--format=json"], "SOP:68 Cloud Armor inventory"),
+              "--format=json"], "SOP:74 Cloud Armor inventory"),
             (["gcloud", "compute", "project-info", "describe"],
-             "stockout SOP:199 quota remediation read"),
+             "stockout SOP:204 quota remediation read"),
         ):
             with self.subTest(desc=desc):
                 self.assertTrue(evaluate(argv).allowed, desc)
+
+    def test_a_leaf_read_ships_with_the_discovery_read_that_binds_its_argument(self):
+        # The allowlist was derived from SOP command spellings, and a SOP
+        # spelling arrives with its arguments already bound: check 2.2 reads
+        # `get-nat-mapping-info $ROUTER`, so that verb was listed and `routers
+        # list` -- the only way to learn a router's name -- was not. The check
+        # never ran on a live install, and the model retried the refusal seven
+        # times in five minutes (#1126). The SOP now spells the discovery step,
+        # but the rule outlives the SOP text: do not remove a discovery read
+        # here because no SOP line contains it. `--regions` is the flag
+        # `routers list` scopes by; an entry whose flags are not in the arity
+        # table is refused as unreadable before the entry is consulted.
+        for argv, desc in (
+            (["gcloud", "compute", "routers", "list", "--regions=us-central1",
+              "--project=p", "--format=json"], "routers list by region"),
+            (["gcloud", "compute", "routers", "describe", "r",
+              "--region=us-central1", "--project=p"], "router NAT config"),
+            (["gcloud", "compute", "routers", "get-nat-mapping-info", "r",
+              "--region=us-central1", "--project=p"], "the leaf read"),
+            (["gcloud", "compute", "networks", "describe", "n", "--project=p"],
+             "network detail behind networks list"),
+            # Not SOP reads: refused on the live install in #1126 during a
+            # networking investigation, granted as read-only inventory.
+            (["gcloud", "compute", "firewall-rules", "list",
+              "--filter=network:default", "--project=p"], "firewall inventory"),
+            (["gcloud", "compute", "firewall-rules", "describe", "f",
+              "--project=p"], "firewall rule detail"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertTrue(evaluate(argv).allowed, desc)
+
+    def test_a_verb_gcloud_does_not_have_is_not_granted_by_a_neighbour(self):
+        # Two spellings the model guessed on the live install (#1126) are not
+        # gcloud commands at all: `routers list-usable` borrows the subnets
+        # verb, and `compute firewalls` is not a group in the SDK. Neither
+        # is listed, and neither may be reached through the prefix scan from
+        # an entry that is.
+        for argv, desc in (
+            (["gcloud", "compute", "routers", "list-usable", "--project=p"],
+             "routers list-usable"),
+            (["gcloud", "compute", "firewalls", "list", "--project=p"],
+             "firewalls list"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertFalse(evaluate(argv).allowed, desc)
 
     def test_the_stockout_sop_spellings_reach_their_allowlist_entries(self):
         # The capacity-history and machine-types entries were added for this
@@ -963,9 +1010,14 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
         # were consulted. These are the SOP's spellings (lines 73 and 220).
         for argv, desc in (
             (["gcloud", "beta", "compute", "advice", "capacity-history",
-              "--region=r", "--instance-selection-machine-types=g2-standard-4",
-              "--size=1", "--types=PREEMPTION,PRICE", "--format=json"],
-             "capacity forecast as the SOP spells it"),
+              "--region=r", "--provisioning-model=SPOT", "--machine-type=g2-standard-4",
+              "--types=PREEMPTION,PRICE", "--format=json"],
+             "capacity-history as the SOP spells it"),
+            (["gcloud", "beta", "compute", "advice", "capacity",
+              "--region=r", "--provisioning-model=SPOT", "--size=1",
+              "--instance-selection-machine-types=g2-standard-4",
+              "--target-distribution-shape=any", "--format=json"],
+             "capacity advice as the SOP spells it"),
             (["gcloud", "compute", "machine-types", "list", "--zones=z"],
              "machine-types with --zones (plural)"),
             (["gcloud", "billing", "budgets", "list", "--billing-account=A",
@@ -988,8 +1040,16 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
              "subnets expand-ip-range"),
             (["gcloud", "compute", "project-info", "add-metadata",
               "--metadata=k=v"], "project-info add-metadata"),
+            (["gcloud", "compute", "networks", "update", "n"], "networks update"),
             (["gcloud", "compute", "routers", "create", "r"], "routers create"),
             (["gcloud", "compute", "routers", "update", "r"], "routers update"),
+            (["gcloud", "compute", "routers", "delete", "r"], "routers delete"),
+            (["gcloud", "compute", "firewall-rules", "create", "f"],
+             "firewall-rules create"),
+            (["gcloud", "compute", "firewall-rules", "update", "f"],
+             "firewall-rules update"),
+            (["gcloud", "compute", "firewall-rules", "delete", "f"],
+             "firewall-rules delete"),
             (["gcloud", "compute", "security-policies", "create", "p"],
              "security-policies create"),
             (["gcloud", "billing", "budgets", "create", "--billing-account=A"],

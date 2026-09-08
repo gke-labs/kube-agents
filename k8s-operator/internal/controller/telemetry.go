@@ -39,7 +39,11 @@ const (
 	// resolves to otlpSourceNone instead, and this value is not used. The same endpoint
 	// is used by the LiteLLM integration, so agent traces and LLM-call telemetry land in
 	// the same place (Cloud Trace/Logging).
-	managedOTelEndpoint = "http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318"
+	managedOTelEndpoint = "http://opentelemetry-collector." + managedOTelCollectorNamespace + ".svc.cluster.local:4318"
+	// managedOTelCollectorNamespace is the namespace managedOTelEndpoint names; the
+	// egress rules fall back to it when there is no endpoint to read one from, and
+	// the endpoint is spelled from it so the two cannot drift apart.
+	managedOTelCollectorNamespace = "gke-managed-otel"
 
 	// otelEndpointEnvVar is the operator-level override, set on the controller-manager
 	// Deployment for installs whose collector is the same for every agent. Deliberately

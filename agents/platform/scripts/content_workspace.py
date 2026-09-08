@@ -56,14 +56,16 @@ read-then-act on a tree another verb may delete or reset underneath it.
 from __future__ import annotations
 
 import base64
+import bisect
 import logging
 import os
 import re
 import threading
-import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable
+
+import workspace_paths
 
 LOGGER = logging.getLogger("credential-proxy")
 
@@ -85,6 +87,14 @@ DEFAULT_MAX_CLONE_BYTES = 256 * 1024 * 1024
 DEFAULT_MAX_WORKSPACES = 8
 DEFAULT_MAX_ENTRIES = 256
 
+# Ceilings on a search rather than on a tree. A pattern that matches every line
+# of a vendored directory produces an answer that travels over the socket and
+# into a model's context, where it is both large and useless; the match count
+# and the per-line width are bounded separately because a thousand short hits
+# and one very long one are different failures.
+DEFAULT_MAX_MATCHES = 200
+DEFAULT_MAX_MATCH_CHARS = 400
+
 # Branch names the product refuses to author, mirroring
 # `submit_suggestion.PROTECTED_BRANCHES`. Named here as well rather than
 # imported: this is the enforcement point, and a control that depends on a skill
@@ -105,6 +115,7 @@ WORKSPACE_GIT_SUBCOMMANDS = frozenset(
         "push",
         "rev-parse",
         "diff",
+        "grep",
         "clean",
         "check-ref-format",
         "symbolic-ref",
@@ -118,7 +129,6 @@ _ANY_HANDLE_RE = re.compile(r"(?<![0-9a-f])[0-9a-f]{32}(?![0-9a-f])")
 # keeps it off the tail of a ref -- `origin/main` and `refs/heads/x` are not
 # paths and must survive, since they are most of what a git error is about.
 _ABSOLUTE_PATH_RE = re.compile(r"(?<![\w/])/(?:[\w.@+-]+/)*[\w.@+-]+")
-_GIT_SHORTNAME_RE = re.compile(r"\Agit~[0-9]+\Z", re.IGNORECASE)
 
 
 class ContentWorkspaceError(Exception):
@@ -131,6 +141,33 @@ class ContentWorkspaceError(Exception):
 class PathRefused(ContentWorkspaceError):
     status = 403
     code = "workspace.path.refused"
+
+
+class RepositoryNotManaged(ContentWorkspaceError):
+    """The caller named a repository this install has not registered.
+
+    Raised by the broker's `open` route rather than in here: the allowlist is
+    deployment state read from a mounted ConfigMap, and this module deliberately
+    knows nothing about how the process it runs in was deployed. The class lives
+    here so the status and code sit with every other refusal the workspace
+    routes can answer with.
+    """
+
+    status = 403
+    code = "workspace.repository.not-managed"
+
+
+class ManagedRepositoriesUnavailable(ContentWorkspaceError):
+    """The allowlist could not be read, so no repository can be cleared.
+
+    503 rather than 403: the caller may well have named a repository this
+    install manages, and telling it otherwise would send someone looking at a
+    ConfigMap that is correct. Retryable is also true -- the list is a mounted
+    file, so the usual cause is a mount that has not appeared yet.
+    """
+
+    status = 503
+    code = "workspace.repository.list-unavailable"
 
 
 class TooLarge(ContentWorkspaceError):
@@ -187,6 +224,14 @@ def max_workspaces() -> int:
     return _limit("CREDENTIAL_PROXY_MAX_WORKSPACES", DEFAULT_MAX_WORKSPACES)
 
 
+def max_matches() -> int:
+    return _limit("CREDENTIAL_PROXY_MAX_MATCHES", DEFAULT_MAX_MATCHES)
+
+
+def max_match_chars() -> int:
+    return _limit("CREDENTIAL_PROXY_MAX_MATCH_CHARS", DEFAULT_MAX_MATCH_CHARS)
+
+
 def _tree_bytes(path: Path) -> int:
     """What the clone actually cost on disk, `.git` included.
 
@@ -211,26 +256,11 @@ def _tree_bytes(path: Path) -> int:
 def _looks_like_dot_git(component: str) -> bool:
     """Every spelling git itself treats as `.git`, and a few it does not.
 
-    git refuses `.git` in a tree under several equivalences, because the
-    filesystems it runs on disagree about what a name is: NTFS strips trailing
-    dots and spaces and offers the 8.3 shortname `GIT~1`, HFS+ ignores a set of
-    zero-width codepoints inside a name. `is_ntfs_dotgit` and `is_hfs_dotgit` in
-    git's own source are the reference.
-
-    This is deliberately *stricter* than git. Refusing a manifest that happens
-    to be called `.git.` costs nothing — no such file exists in a GitOps
-    repository — while matching git's rule exactly would mean reimplementing two
-    of its parsers and betting they agree with the version in the image. That
-    bet is the one this project keeps losing.
+    `workspace_paths` owns the rule; this is the name the rest of this module
+    calls it by. See that module for why it is deliberately stricter than git's
+    own `is_ntfs_dotgit` / `is_hfs_dotgit`.
     """
-    stripped = "".join(
-        character
-        for character in component
-        # The HFS+ ignorable set git skips: zero-width and directionality marks.
-        if unicodedata.category(character) != "Cf"
-    )
-    stripped = stripped.rstrip(". ").casefold()
-    return stripped == ".git" or bool(_GIT_SHORTNAME_RE.match(stripped))
+    return workspace_paths.looks_like_dotgit(component)
 
 
 def repo_relative(path: str) -> PurePosixPath:
@@ -241,30 +271,19 @@ def repo_relative(path: str) -> PurePosixPath:
     is right, neither is allowed through. A checker that normalises is
     reimplementing another parser's edge cases and betting on the agreement,
     and that bet is the one defect class this codebase keeps producing.
+
+    The rule itself lives in `workspace_paths`, which the sandbox image also
+    carries, so the check the broker makes on a name and the check the reader
+    makes before that name becomes a write are the same code rather than two
+    implementations that could drift. Only the exception type is this module's:
+    `workspace_paths` answers with an HTTP status, and everything here is
+    written against `ContentWorkspaceError`.
     """
-    if not isinstance(path, str) or not path:
-        raise PathRefused("path must be a non-empty string")
-    if "\x00" in path:
-        raise PathRefused("path contains a NUL byte")
-    if "\\" in path:
-        # Windows separators are a component character on Linux and a separator
-        # to git's NTFS-aware checks. Two readings, so: neither.
-        raise PathRefused("path contains a backslash")
-    if path.startswith("/"):
-        raise PathRefused("path must be relative to the repository root")
-    components = path.split("/")
-    for component in components:
-        if component in ("", ".", ".."):
-            raise PathRefused(
-                f"path component {component!r} is not allowed; give a plain "
-                "relative path with no empty, '.' or '..' components"
-            )
-        if _looks_like_dot_git(component):
-            raise PathRefused(
-                "paths inside the git metadata directory are refused: the "
-                "repository's own configuration and hooks are not content"
-            )
-    return PurePosixPath(*components)
+    try:
+        validated = workspace_paths.validate_path(path)
+    except workspace_paths.WorkspaceError as exc:
+        raise PathRefused(str(exc)) from None
+    return PurePosixPath(*validated.split("/"))
 
 
 def _no_symlink_on_the_way(root: Path, relative: PurePosixPath) -> Path:
@@ -426,6 +445,36 @@ def check_branch_name(name: object) -> str:
     return branch
 
 
+def check_expected_sha(value: object, field: str) -> str:
+    """A caller-supplied commit id, or a refusal.
+
+    `expectedBaseSha` and `expectedBranchSha` reach a revision position in `git
+    diff <expected> <current> -- <paths>`, so a value starting with `-` is not a
+    revision at all — it is an option. `--output=<path>` is the sharp one: git
+    writes the diff to that path and prints nothing, so the caller's own guard
+    reads an empty result as "no overlap", the conflict it exists to catch never
+    raises, and the broker has written a file wherever it can write. The
+    workspace routes bypass `git_argument_violation` by design and
+    `execute_workspace_git` checks only the subcommand, so this is the check.
+
+    A full hex object id and nothing else. `--end-of-options` would stop the
+    option reading and still admit `HEAD~1` or a branch name, which the conflict
+    guard would compare against and answer wrongly rather than loudly; and it
+    needs a git new enough to have it, which this cannot assume of a workspace
+    image it does not build. Both SHA-1 and SHA-256 lengths, because a
+    repository can be either and the broker clones what it is pointed at.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ContentWorkspaceError(f"{field} must be a non-empty string")
+    sha = value.strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", sha):
+        raise ContentWorkspaceError(
+            f"{field} must be a full 40- or 64-character hex commit id; "
+            f"{sha!r} is not one"
+        )
+    return sha
+
+
 def check_branch(name: object) -> str:
     """A branch name the broker is willing to *author*.
 
@@ -444,6 +493,22 @@ def check_branch(name: object) -> str:
     return branch
 
 
+def check_depth(raw: object) -> int | None:
+    """A positive commit count, or `None` for the whole history.
+
+    `True` is an `int` in Python, so a caller that meant "yes, shallow" without
+    saying how shallow would otherwise reach git as `--depth 1` and get a
+    workspace it did not ask for. Refused rather than interpreted.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        raise ContentWorkspaceError(
+            "depth must be a positive integer number of commits"
+        )
+    return raw
+
+
 @dataclass
 class Workspace:
     """One broker-owned clone, named by an unguessable handle."""
@@ -455,6 +520,22 @@ class Workspace:
     base_sha: str
     branch: str | None = None
     head: str | None = None
+    # The branch this workspace was opened against, and `origin/<branch>` as it
+    # stood when something in this workspace last looked. Separate from `branch`
+    # above, which `push` reads as "a commit exists on this handle" and so must
+    # stay unset until one does. `commit` compares against `branch_sha` for the
+    # same reason it compares against `base_sha`: a maintainer's hand-edit to the
+    # pull request between `open` and `commit` is a change the payload was not
+    # written against, and overwriting it is silent because `--force-with-lease`
+    # compares against the very tip being overwritten.
+    opened_branch: str | None = None
+    branch_sha: str = ""
+    # What `read` and `list` are answering from. Reported to the caller because
+    # a workspace opened for a second round of review feedback is checked out on
+    # the pull request's branch rather than on the base, and a caller that
+    # assumed the base would silently rewrite the reviewed work.
+    started_from: str = ""
+    shallow: bool = False
     metadata: dict = field(default_factory=dict)
 
 
@@ -606,10 +687,43 @@ class ContentWorkspaceStore:
 
     # -- lifecycle -------------------------------------------------------
 
-    def open(self, repo: str, base: str | None = None) -> Workspace:
-        """Clone `repo` into a fresh tree and return its handle."""
+    def open(
+        self,
+        repo: str,
+        base: str | None = None,
+        branch: str | None = None,
+        depth: int | None = None,
+    ) -> Workspace:
+        """Clone `repo` into a fresh tree and return its handle.
+
+        `branch` names the branch this session will commit to, when the caller
+        already knows it. It decides what `read` and `list` answer with: a
+        branch that already exists on the remote — a second round of review
+        feedback — is checked out in place of the base, so a file read here is
+        the file as the pull request has it rather than as the base has it.
+        Left on the base, the second round would be written against a file that
+        does not carry the first, and the reviewed work would be silently
+        rewritten out of it.
+
+        `depth` opens a shallow single-branch clone, which is what reading an
+        unfamiliar repository wants: the history is not what is being analysed,
+        and a full clone of a large one does not fit the broker's volume. It is
+        read-only — `commit` refuses on it — and it is refused together with
+        `branch`, because a single-branch clone cannot see whether the working
+        branch exists on the remote and would answer from the base instead
+        while reporting that it had looked.
+        """
         if not isinstance(repo, str) or not is_owner_name(repo):
             raise ContentWorkspaceError("repo must be owner/name")
+        depth = check_depth(depth)
+        if depth is not None and branch is not None:
+            raise ContentWorkspaceError(
+                "depth and branch cannot be combined: a shallow clone fetches "
+                "one branch, so the check for whether the working branch "
+                "already exists on the remote would always answer no"
+            )
+        if branch is not None:
+            branch = check_branch_name(branch)
         # `base` names a branch exactly as the commit payload's does, so it goes
         # through the same check. Not reachable as an option today -- every use
         # of it is prefixed with `origin/` before it reaches an argv -- but a
@@ -638,7 +752,13 @@ class ContentWorkspaceStore:
             # container. Observed against a real install: a private repository with
             # no credential available left one directory per attempt.
             try:
-                self._git(tree, ["clone", "--quiet", url, str(tree / "repo")])
+                argv = ["clone", "--quiet"]
+                if depth is not None:
+                    argv += ["--depth", str(depth), "--single-branch"]
+                    if base is not None:
+                        argv += ["--branch", base]
+                argv += [url, str(tree / "repo")]
+                self._git(tree, argv)
                 # Measured after the clone, and the tree goes if it is over.
                 # A repository the broker cannot afford to hold is not one it
                 # should hold *badly*, half-cloned and still on the disk.
@@ -654,9 +774,23 @@ class ContentWorkspaceStore:
                     tree=tree / "repo",
                     base="",
                     base_sha="",
+                    shallow=depth is not None,
                 )
                 workspace.base = base or self._default_branch(workspace)
                 workspace.base_sha = self._sha(workspace, f"origin/{workspace.base}")
+                workspace.started_from = f"origin/{workspace.base}"
+                # Only when the caller named one, and only when it is really
+                # there. A checkout of a branch the remote does not have would
+                # fail the open outright, and "this pull request does not exist
+                # yet" is the ordinary first round rather than an error.
+                if branch is not None and self._remote_branch_exists(workspace, branch):
+                    self._git(
+                        workspace,
+                        ["checkout", "--force", "-B", branch, f"origin/{branch}"],
+                    )
+                    workspace.started_from = f"origin/{branch}"
+                    workspace.opened_branch = branch
+                    workspace.branch_sha = self._sha(workspace, f"origin/{branch}")
             except BaseException:
                 _remove_tree(tree)
                 raise
@@ -670,9 +804,32 @@ class ContentWorkspaceStore:
             check=False,
         )
         ref = self._out(result)
-        if getattr(result, "exit_code", 1) != 0 or not ref:
-            return "main"
-        return ref.split("/", 1)[1] if ref.startswith("origin/") else ref
+        if getattr(result, "exit_code", 1) == 0 and ref:
+            return ref.split("/", 1)[1] if ref.startswith("origin/") else ref
+        # `clone --single-branch` does not always leave `origin/HEAD` behind, and
+        # the branch it checked out is the remote's default by definition.
+        # Guessing `main` at a repository whose trunk is `master` fails later, at
+        # a `rev-parse` whose message is about a ref rather than about a default.
+        local = self._git(
+            workspace, ["symbolic-ref", "--quiet", "--short", "HEAD"], check=False
+        )
+        head = self._out(local)
+        if getattr(local, "exit_code", 1) == 0 and head:
+            return head
+        return "main"
+
+    def _remote_branch_exists(self, workspace: Workspace, branch: str) -> bool:
+        """Whether `origin/<branch>` is a ref this clone has.
+
+        Fully qualified under `refs/remotes/`, so a branch sharing a name with a
+        tag — or one called `HEAD` — cannot resolve to something else.
+        """
+        result = self._git(
+            workspace,
+            ["rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"],
+            check=False,
+        )
+        return getattr(result, "exit_code", 1) == 0
 
     def _sha(self, workspace: Workspace, ref: str) -> str:
         return self._out(self._git(workspace, ["rev-parse", "--verify", ref]))
@@ -695,7 +852,7 @@ class ContentWorkspaceStore:
     # -- reads -----------------------------------------------------------
 
     def read(self, handle: str, path: str) -> bytes:
-        """The content of one tracked file. A read returns bytes, never a path."""
+        """The content of one file in the checkout. A read returns bytes, never a path."""
         with self._lock:
             workspace = self.get(handle)
             relative = repo_relative(path)
@@ -712,19 +869,101 @@ class ContentWorkspaceStore:
                 )
             return target.read_bytes()
 
-    def list(self, handle: str, prefix: str | None = None) -> list[dict]:
-        """Tracked paths and their sizes. Names, not handles to the filesystem.
+    def read_many(self, handle: str, paths: object) -> dict:
+        """Several files in one round trip, and what did not fit.
+
+        Materialising a repository the agent wants to analyse is otherwise one
+        request per file, and a reader that pays a round trip per file reads
+        fewer files than it should. The response is a different shape from
+        `read` on purpose: a batch has to report what it did not return
+        alongside what it did, and folding that into the single-file shape would
+        mean either a 404 that carries content or content that carries a 404.
+
+        A file the caller cannot have is `skipped` rather than fatal — except
+        for a path that is not a path, which is refused for the whole request
+        before a byte is read, on the same principle as `parse_changes`. A
+        request naming `.git/config` in its hundredth entry does not get the
+        first ninety-nine answered.
+        """
+        if not isinstance(paths, list) or not paths:
+            raise ContentWorkspaceError("paths must be a non-empty list")
+        if len(paths) > max_entries():
+            raise TooLarge(
+                f"{len(paths)} paths is over the {max_entries()}-path limit for "
+                "one request"
+            )
+        with self._lock:
+            workspace = self.get(handle)
+            wanted = [repo_relative(entry) for entry in paths]
+            files: list[dict] = []
+            skipped: list[dict] = []
+            total = 0
+            exhausted = False
+            for relative in wanted:
+                name = str(relative)
+                if exhausted:
+                    skipped.append({"path": name, "reason": "requestBudget"})
+                    continue
+                try:
+                    target = _no_symlink_on_the_way(workspace.tree, relative)
+                except PathRefused:
+                    # Its own reason, because it is its own situation. The file
+                    # is there and the broker will not follow the link to it, so
+                    # a caller told `notAFile` looks for a name it already has
+                    # right -- and `list` handed it that name. `symlink` is the
+                    # one skip a caller can act on by naming the link's target.
+                    skipped.append({"path": name, "reason": "symlink"})
+                    continue
+                if not target.is_file():
+                    skipped.append({"path": name, "reason": "notAFile"})
+                    continue
+                size = target.stat().st_size
+                if size > max_file_bytes():
+                    skipped.append({"path": name, "reason": "tooLarge", "size": size})
+                    continue
+                if total + size > max_total_bytes():
+                    # Not an error. A caller asking for a directory's worth of
+                    # files cannot know the total in advance, and the answer it
+                    # can act on is "here is what fits, ask again for the rest"
+                    # — which is why the remainder is named rather than dropped.
+                    exhausted = True
+                    skipped.append({"path": name, "reason": "requestBudget"})
+                    continue
+                data = target.read_bytes()
+                total += len(data)
+                files.append(
+                    {
+                        "path": name,
+                        "contentBase64": base64.b64encode(data).decode("ascii"),
+                        "size": len(data),
+                    }
+                )
+            return {"files": files, "skipped": skipped}
+
+    def list(
+        self, handle: str, prefix: str | None = None, after: str | None = None
+    ) -> dict:
+        """The checkout's paths and their sizes, a page at a time.
 
         `prefix` names a directory, and it is matched component-wise. A plain
         string comparison would make `prefix="a"` return `ab/x` as well as
         `a/y`, which reads as a listing bug rather than as a filter and would
         have a caller paging through files it did not ask for.
+
+        `after` is a cursor: the last path of the previous page, and the next
+        page starts strictly after it in the same order this returns. Paging is
+        what makes a repository nobody here has seen readable at all. `total`
+        counts what is still in scope after the cursor rather than what fits, so
+        a listing that stopped at the ceiling says so instead of looking
+        complete — a caller that cannot tell the difference goes on to `read`
+        paths it invented.
         """
         with self._lock:
             workspace = self.get(handle)
             under = repo_relative(prefix).parts if prefix else ()
-            entries: list[dict] = []
-            for path in sorted(workspace.tree.rglob("*")):
+            cursor = str(repo_relative(after)) if after else ""
+            names: list[str] = []
+            for path in workspace.tree.rglob("*"):
                 if not path.is_file() or path.is_symlink():
                     continue
                 relative = path.relative_to(workspace.tree)
@@ -733,10 +972,104 @@ class ContentWorkspaceStore:
                     continue
                 if under and parts[: len(under)] != under:
                     continue
-                entries.append(
-                    {"path": str(PurePosixPath(*parts)), "size": path.stat().st_size}
+                names.append(str(PurePosixPath(*parts)))
+            # Sorted on the name this answers with rather than on the `Path`,
+            # because the cursor is compared against that name and an order the
+            # caller cannot reproduce is a cursor that skips or repeats a page.
+            names.sort()
+            # The cursor is located rather than scanned past, and only the
+            # page's own files are stat'd. Walking the tree again is what a
+            # page costs -- the repository can have changed between calls, so
+            # there is nothing here to cache -- but sizing every file in it and
+            # discarding all but a page's worth is a cost paid once per page,
+            # and a caller paging a large repository pays it on every one.
+            start = bisect.bisect_right(names, cursor) if cursor else 0
+            page = names[start : start + max_entries()]
+            entries = [
+                {"path": name, "size": (workspace.tree / name).stat().st_size}
+                for name in page
+            ]
+            total = len(names) - start
+            return {
+                "entries": entries,
+                "total": total,
+                "truncated": total > len(entries),
+            }
+
+    def grep(
+        self,
+        handle: str,
+        pattern: object,
+        prefix: str | None = None,
+        *,
+        regex: bool = False,
+        ignore_case: bool = False,
+    ) -> dict:
+        """`git grep` over the checked-out tree.
+
+        Reading a repository nobody here has seen before starts with a search,
+        and without one the alternatives are both bad: fetch files by guessing
+        at their names, or fetch the whole tree to search it locally. Neither
+        the pattern nor the prefix reaches outside the tree — `git grep`
+        searches tracked files, so `.git` is not in scope however the pattern is
+        written, and the pattern travels as the argument of `-e`, so one
+        starting with `-` is a pattern rather than an option.
+
+        Fixed-string unless the caller asks otherwise, which keeps a `.` in a
+        filename from quietly matching more than the caller meant and keeps a
+        pathological expression behind a deliberate choice.
+        """
+        if not isinstance(pattern, str) or not pattern.strip():
+            raise ContentWorkspaceError("pattern must be a non-empty string")
+        if any(character in pattern for character in ("\x00", "\n", "\r")):
+            raise ContentWorkspaceError(
+                "pattern must not contain control characters"
+            )
+        with self._lock:
+            workspace = self.get(handle)
+            # -I skips binary files, -n numbers the lines, -z puts a NUL after
+            # the name so a file whose name carries a colon cannot be misread.
+            argv = ["grep", "--no-color", "-I", "-n", "-z"]
+            argv.append("-E" if regex else "-F")
+            if ignore_case:
+                argv.append("-i")
+            argv += ["-e", pattern]
+            if prefix:
+                argv += ["--", str(repo_relative(prefix))]
+            result = self._git(workspace, argv, check=False)
+            exit_code = getattr(result, "exit_code", 1)
+            if exit_code not in (0, 1):
+                # 1 is "no match". Anything else is an expression git would not
+                # take, reachable only with `regex`; its stderr quotes the
+                # pattern back and is not returned, for the same reason no other
+                # git stderr in this module is.
+                raise ContentWorkspaceError(
+                    "git could not search for that pattern; check the expression"
                 )
-            return entries
+            matches: list[dict] = []
+            total = 0
+            width = max_match_chars()
+            for record in (getattr(result, "stdout", "") or "").split("\n"):
+                if not record:
+                    continue
+                path, _, remainder = record.partition("\0")
+                line, _, text = remainder.partition("\0")
+                total += 1
+                if len(matches) >= max_matches():
+                    continue
+                match: dict = {
+                    "path": path,
+                    "line": int(line) if line.isdigit() else 0,
+                    "text": text[:width],
+                }
+                if len(text) > width:
+                    match["truncated"] = True
+                matches.append(match)
+            return {
+                "matches": matches,
+                "total": total,
+                "truncated": total > len(matches),
+            }
 
     # -- writes ----------------------------------------------------------
 
@@ -747,28 +1080,77 @@ class ContentWorkspaceStore:
         message: str,
         changes: Iterable[Change],
         expected_base_sha: str | None = None,
+        expected_branch_sha: str | None = None,
     ) -> dict:
         """Apply the payload on a fresh branch off the base, and commit it."""
         with self._lock:
             workspace = self.get(handle)
+            if workspace.shallow:
+                # Refused here rather than left to fail at `push`. A shallow
+                # clone has no merge base with the remote branch, so the push
+                # either is rejected as unrelated or, on a remote configured to
+                # take it, lands a history that discards everything before the
+                # depth. Neither is a thing to discover after the commit.
+                raise ContentWorkspaceError(
+                    "this workspace was opened shallow, which makes it "
+                    "read-only; reopen it without a depth to author a change"
+                )
             branch = check_branch(branch)
             self._git(workspace, ["check-ref-format", "--branch", branch])
             if not isinstance(message, str) or not message.strip():
                 raise ContentWorkspaceError("message must be a non-empty string")
+            # Before either reaches a revision position below. See
+            # check_expected_sha for what a non-sha buys the caller.
+            if expected_base_sha is not None:
+                expected_base_sha = check_expected_sha(expected_base_sha, "expectedBaseSha")
+            if expected_branch_sha is not None:
+                expected_branch_sha = check_expected_sha(
+                    expected_branch_sha, "expectedBranchSha"
+                )
             changes = list(changes)
 
             self._git(workspace, ["fetch", "--quiet", "--prune", "origin"])
             current_base_sha = self._sha(workspace, f"origin/{workspace.base}")
             if expected_base_sha and expected_base_sha != current_base_sha:
-                self._raise_if_base_moved_under_us(
-                    workspace, expected_base_sha, current_base_sha, changes
+                self._raise_if_moved_under_us(
+                    workspace, "base", expected_base_sha, current_base_sha, changes
                 )
             workspace.base_sha = current_base_sha
 
-            self._git(
-                workspace,
-                ["checkout", "--force", "-B", branch, f"origin/{workspace.base}"],
+            # The same question about the branch, which the base check does not
+            # answer. Starting from `origin/<branch>` below keeps a maintainer's
+            # commit in the history; it does not keep their edit to a file this
+            # payload also writes, and nothing downstream objects — the push is
+            # a fast-forward, so `--force-with-lease` has nothing to refuse.
+            #
+            # The expectation defaults to what this workspace last saw rather
+            # than requiring the caller to carry it, because the broker owns the
+            # clone and the caller has no other way to learn the sha. A caller
+            # that read the branch elsewhere can override it.
+            branch_exists = self._remote_branch_exists(workspace, branch)
+            current_branch_sha = (
+                self._sha(workspace, f"origin/{branch}") if branch_exists else ""
             )
+            expected = expected_branch_sha
+            if not expected and workspace.opened_branch == branch:
+                expected = workspace.branch_sha
+            if expected and current_branch_sha and expected != current_branch_sha:
+                self._raise_if_moved_under_us(
+                    workspace, "'" + branch + "'", expected, current_branch_sha, changes
+                )
+            workspace.opened_branch = branch
+            workspace.branch_sha = current_branch_sha
+
+            # Continue the branch when the remote already has it; only cut a new
+            # one from the base when it does not. Always starting from the base
+            # is data loss this skill has already shipped once: a second round of
+            # review feedback would replace every reviewed commit with one commit
+            # that no longer contained them, and `--force-with-lease` cannot
+            # object because the fetch above moved the very ref it compares
+            # against. Resolved here rather than reused from `open`, because that
+            # fetch may have brought the branch into existence since.
+            start = f"origin/{branch}" if branch_exists else f"origin/{workspace.base}"
+            self._git(workspace, ["checkout", "--force", "-B", branch, start])
             # The tree is the broker's, so a leftover file from an earlier commit on
             # this handle is debris rather than someone's unsaved work. `-x` as well,
             # because nothing here is ignorable-but-wanted.
@@ -793,7 +1175,12 @@ class ContentWorkspaceStore:
             staged = self._git(workspace, ["diff", "--cached", "--quiet"], check=False)
             code = getattr(staged, "exit_code", 1)
             if code == 0:
-                return {"committed": False, "branch": branch, "base": workspace.base}
+                return {
+                    "committed": False,
+                    "branch": branch,
+                    "base": workspace.base,
+                    "branchSha": workspace.branch_sha,
+                }
             if code != 1:
                 # Anything other than 0 or 1 means the index could not be read, and
                 # "no difference" is then a guess. `audit_report` learned this the
@@ -811,21 +1198,30 @@ class ContentWorkspaceStore:
                 "branch": branch,
                 "base": workspace.base,
                 "baseSha": workspace.base_sha,
+                # What the commit was built on, not what it produced: this is
+                # the value a later `commit` on the same branch has to expect,
+                # and until the push lands the remote is still holding it.
+                "branchSha": workspace.branch_sha,
                 "commit": workspace.head,
             }
 
-    def _raise_if_base_moved_under_us(
+    def _raise_if_moved_under_us(
         self,
         workspace: Workspace,
+        label: str,
         expected: str,
         current: str,
         changes: list[Change],
     ) -> None:
-        """A moved base is only a conflict if it touched a path we are writing.
+        """A moved ref is only a conflict if it touched a path we are writing.
 
         Refusing every commit whose base advanced would mean a ten-minute audit
         fails behind any unrelated merge, which is most of them. Refusing only
-        when the same file moved is the answer a human reviewer would give.
+        when the same file moved is the answer a human reviewer would give. The
+        working branch gets the same treatment, so a maintainer pushing a
+        typo fix to an untouched file does not cost the agent its round.
+
+        `label` names the ref in the message — "base", or the branch in quotes.
         """
         touched = [str(change.path) for change in changes]
         diff = self._git(
@@ -839,13 +1235,13 @@ class ContentWorkspaceStore:
             # any reading, and guessing otherwise would overwrite whatever
             # happened.
             raise Conflict(
-                f"the base branch moved from {expected} to {current} and the two "
+                f"the {label} branch moved from {expected} to {current} and the two "
                 "could not be compared; re-read the files and submit again",
             )
         collided = [line for line in self._out(diff).splitlines() if line.strip()]
         if collided:
             raise Conflict(
-                f"the base branch moved from {expected} to {current} and it "
+                f"the {label} branch moved from {expected} to {current} and it "
                 f"changed {len(collided)} file(s) this commit also writes: "
                 f"{', '.join(collided[:10])}. Re-read them and submit again."
             )
@@ -880,7 +1276,16 @@ class ContentWorkspaceStore:
                 raise GitFailed(
                     f"push failed: {self._redact(getattr(result, 'stderr', ''))}"
                 )
-            return {"pushed": True, "branch": branch, "commit": workspace.head}
+            # The remote is now at what we pushed, so that is what the next
+            # `commit` on this handle must expect. Left at the pre-push value it
+            # would refuse the second round against our own work.
+            workspace.branch_sha = workspace.head or ""
+            return {
+                "pushed": True,
+                "branch": branch,
+                "commit": workspace.head,
+                "branchSha": workspace.branch_sha,
+            }
 
 
 def is_owner_name(value: str) -> bool:

@@ -168,6 +168,18 @@ class PackageReleaseBundleTest(unittest.TestCase):
             stamped_install = (bundle_root / "install.sh").read_text()
             self.assertIn(f'BAKED_RELEASE_VERSION="{MOCK_RELEASE_BUNDLE_VERSION}"', stamped_install)
 
+            # Verify Helm Chart.yaml stamping in bundle
+            chart_yaml = (bundle_root / "charts" / "kube-agents" / "Chart.yaml").read_text()
+            self.assertIn(f"version: {MOCK_RELEASE_BUNDLE_VERSION}", chart_yaml)
+            self.assertIn(f'appVersion: "{MOCK_RELEASE_BUNDLE_VERSION}"', chart_yaml)
+
+            # Verify Terraform variable stamping in bundle
+            stamped_vars = (bundle_root / "terraform" / "examples" / "full-install" / "variables.tf").read_text()
+            self.assertIn(f'default     = "{MOCK_RELEASE_BUNDLE_VERSION}"', stamped_vars)
+
+            stamped_tfvars = (bundle_root / "terraform" / "examples" / "full-install" / "terraform.tfvars.example").read_text()
+            self.assertIn(f'# image_tag = "{MOCK_RELEASE_BUNDLE_VERSION}"', stamped_tfvars)
+
             # Verify terraform/ directory exists in bundle and preserves tfvars examples
             self.assertTrue((bundle_root / "terraform").is_dir(), "terraform/ should be in bundle")
             self.assertTrue((bundle_root / "images.json").is_file(), "images.json should be in bundle")

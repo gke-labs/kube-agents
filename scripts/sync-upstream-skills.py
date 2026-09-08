@@ -12,10 +12,80 @@ UPSTREAM_SKILLS_PATH = os.path.join("skills", "cloud")
 SKILL_PREFIX = "gke-"
 
 # Target agents where upstream GKE skills should be synced.
+#
+# Upstream skills from google/skills (skills/cloud) target the Platform Agent (agents/platform/).
+# Cluster Agent skills (agents/cluster/skills/) are not synced from upstream: they are repo-native
+# templates tailored specifically for single-cluster runtime debugging and operations (see AGENTS.md),
+# with cluster-specific personas and diagnostic tooling that an upstream overwrite would wipe.
+# Consequently, DEFAULT_TARGET_AGENTS is ["platform"] and cluster skills are maintained independently
+# in this repository.
 DEFAULT_TARGET_AGENTS = ["platform"]
 SKILL_AGENT_OVERRIDES = {
-    # Per-skill target agent overrides if specific skills should go to multiple agents
-    # e.g., "gke-observability": ["platform", "cluster"],
+    # Per-skill target agent overrides if specific skills should go to additional/alternative agents.
+}
+
+SKILL_MD_FILENAME = "SKILL.md"
+UTF_8_ENCODING = "utf-8"
+SUBSTITUTION_COUNT = 1
+
+GKE_WORKLOAD_SECURITY_OLD_NETPOL_SNIPPET = """**Enable Network Policy Enforcement:**
+
+```bash
+gcloud container clusters update <cluster-name> \\
+    --update-addons=NetworkPolicy=ENABLED \\
+    --region <region>
+```
+
+> [!NOTE] If your cluster uses Dataplane V2 (`--enable-dataplane-v2`), Network
+> Policy enforcement is built-in and this step is not required (and may fail)."""
+
+GKE_WORKLOAD_SECURITY_NEW_NETPOL_SNIPPET = """**Check Network Policy Enforcement & Dataplane:**
+
+Before modifying cluster networking, inspect whether NetworkPolicy enforcement
+is already active or provided natively by Dataplane V2:
+
+```bash
+gcloud container clusters describe <cluster-name> \\
+    --location <location> \\
+    --format='value(networkConfig.datapathProvider,networkPolicy.enabled)'
+```
+
+- If `datapathProvider` is `ADVANCED_DATAPATH` (Dataplane V2), NetworkPolicy
+  enforcement is built-in natively via eBPF/Cilium from cluster creation. Calico
+  addons cannot be enabled and are not needed.
+- If `networkPolicy.enabled` is `True`, Calico enforcement is already enabled on nodes.
+- If neither is active, enable Calico network policy enforcement using the two-step
+  sequence below.
+
+**Enable Network Policy Enforcement (non-DPv2 clusters):**
+
+Enabling network policy enforcement on clusters without Dataplane V2 requires
+two sequential commands in this order: first enable the Calico addon on the
+control plane, then enable network policy enforcement on the nodes. GKE rejects
+`--enable-network-policy` with HTTP 400 until the addon is enabled, and `gcloud`
+rejects both flags in a single invocation.
+
+```bash
+# Step 1: Enable the NetworkPolicy addon on the control plane
+gcloud container clusters update <cluster-name> \\
+    --update-addons=NetworkPolicy=ENABLED \\
+    --region <region>
+
+# Step 2: Enable NetworkPolicy enforcement on the nodes (node pools may be recreated; this can take several minutes)
+gcloud container clusters update <cluster-name> \\
+    --enable-network-policy \\
+    --region <region>
+```"""
+
+# In-place content substitutions applied to freshly-synced skills to correct upstream defects
+# where an appended footer is insufficient (e.g. multi-step remediation commands).
+SKILL_SUBSTITUTIONS = {
+    "gke-workload-security": [
+        (
+            GKE_WORKLOAD_SECURITY_OLD_NETPOL_SNIPPET,
+            GKE_WORKLOAD_SECURITY_NEW_NETPOL_SNIPPET,
+        ),
+    ],
 }
 
 # Marker that identifies our auto-injected footer, so injection is idempotent and
@@ -94,6 +164,48 @@ enabling the setting, wait a moment before retrying rather than concluding it di
 }
 
 
+def apply_substitutions(dest_path, skill_name):
+    """Apply in-place string substitutions to a freshly-synced skill's SKILL.md.
+
+    Used when an upstream defect must be corrected in-place (such as a remediation
+    sequence where an appended footer would still leave the broken command in the
+    body of the skill).
+
+    Idempotent: if replacement text is already present, the substitution is skipped.
+    Returns True if at least one substitution was applied, else False.
+    """
+    substitutions = SKILL_SUBSTITUTIONS.get(skill_name)
+    if not substitutions:
+        return False
+
+    skill_md = os.path.join(dest_path, SKILL_MD_FILENAME)
+    if not os.path.isfile(skill_md):
+        print(f"Warning: {skill_md} not found; cannot apply substitutions.", file=sys.stderr)
+        return False
+
+    with open(skill_md, "r", encoding=UTF_8_ENCODING) as f:
+        content = f.read()
+
+    modified = False
+    for target, replacement in substitutions:
+        if replacement in content:
+            continue
+        if target in content:
+            content = content.replace(target, replacement, SUBSTITUTION_COUNT)
+            modified = True
+        else:
+            print(
+                f"Warning: target snippet for substitution not found in {skill_name}/{SKILL_MD_FILENAME}",
+                file=sys.stderr,
+            )
+
+    if modified:
+        with open(skill_md, "w", encoding=UTF_8_ENCODING) as f:
+            f.write(content)
+
+    return modified
+
+
 def inject_footer(dest_path, skill_name):
     """Append this repository's footer for a skill to its freshly-synced SKILL.md.
 
@@ -104,18 +216,18 @@ def inject_footer(dest_path, skill_name):
     if footer is None:
         return False
 
-    skill_md = os.path.join(dest_path, "SKILL.md")
+    skill_md = os.path.join(dest_path, SKILL_MD_FILENAME)
     if not os.path.isfile(skill_md):
         print(f"Warning: {skill_md} not found; cannot inject Cluster Agent footer.", file=sys.stderr)
         return False
 
-    with open(skill_md, "r", encoding="utf-8") as f:
+    with open(skill_md, "r", encoding=UTF_8_ENCODING) as f:
         existing = f.read()
     if FOOTER_MARKER in existing:
         return False
 
     separator = "" if existing.endswith("\n\n") else ("\n" if existing.endswith("\n") else "\n\n")
-    with open(skill_md, "a", encoding="utf-8") as f:
+    with open(skill_md, "a", encoding=UTF_8_ENCODING) as f:
         f.write(separator + footer)
     return True
 
@@ -191,9 +303,13 @@ def main():
                     # Copy from upstream src to dest
                     shutil.copytree(src_skill_path, dest_path)
 
+                    # Apply in-place substitutions to correct upstream defects.
+                    if apply_substitutions(dest_path, skill_name):
+                        print(f"  Applied substitutions to {skill_name}/{SKILL_MD_FILENAME}")
+
                     # Re-inject the Cluster Agent coupling footer (wiped by the copy above).
                     if inject_footer(dest_path, skill_name):
-                        print(f"  Injected kube-agents footer into {skill_name}/SKILL.md")
+                        print(f"  Injected kube-agents footer into {skill_name}/{SKILL_MD_FILENAME}")
 
             print("\nSynchronization complete!")
     except subprocess.CalledProcessError:

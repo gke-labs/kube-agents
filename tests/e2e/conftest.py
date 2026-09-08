@@ -220,7 +220,7 @@ def _resolve_github_org() -> Optional[str]:
 def _qualify_repo(repo: Optional[str]) -> Optional[str]:
     """Prefixes a bare repository name with the owner.
 
-    GH_REPO is bare by repository convention -- reusable-deploy-integrations.yml passes
+    GH_REPO is bare by repository convention -- the install configuration passes
     the org and the repo to the GitHub Token Minter as separate values -- while every
     consumer of this fixture wants 'owner/repo': test_github_target_repository_configuration
     asserts the shape, and github_token_refresh.py rejects anything else.
@@ -254,20 +254,23 @@ def github_repo(agent_namespace: str) -> Optional[str]:
     if val:
         return _qualify_repo(val)
 
-    # Try reading from platform-agent-settings in the cluster
+    # Try reading from platform-agent-gitops-state in the cluster
     try:
         cmd = [
-            "kubectl", "get", "cm", "platform-agent-settings",
+            "kubectl", "get", "cm", "platform-agent-gitops-state",
             "-n", agent_namespace,
-            "-o", "jsonpath={.data.SETTINGS\\.md}",
+            "-o", "jsonpath={.data.managed_repos}",
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-        if result.returncode == 0:
-            for line in result.stdout.splitlines():
-                if "Git Repo:" in line:
-                    repo_cand = line.split("Git Repo:", 1)[1].strip().strip("*` ")
-                    if repo_cand and repo_cand.lower() != "none":
-                        return _qualify_repo(repo_cand)
+        if result.returncode == 0 and result.stdout.strip():
+            try:
+                entries = json.loads(result.stdout)
+                if isinstance(entries, list):
+                    for item in entries:
+                        if isinstance(item, dict) and item.get("url"):
+                            return _qualify_repo(item["url"])
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -433,7 +436,7 @@ from exec_tunnel import TunnelConfig, serve_background  # noqa: E402
 # bench/kube_agents_bench/harness.py reads for the same value.
 _AGENT_NAME = os.environ.get("AGENT_SERVICE_NAME", "platform-agent")
 
-_PROXY_CONTAINER = "envoy-credential-proxy"
+_PROXY_CONTAINER = os.environ.get("AGENT_PROXY_CONTAINER", "agent-api-auth")
 _AGENT_CONTAINER = "platform-agent"
 
 # The interpreter the relay runs inside _PROXY_CONTAINER. Named here rather than
@@ -444,8 +447,8 @@ _AGENT_CONTAINER = "platform-agent"
 # with this same path.
 _PROXY_PYTHON = "/opt/hermes/.venv/bin/python3"
 
-# The credential-proxy sidecar's authenticated listener, and the Service's
-# targetPort for `api`.
+# The credential-proxy / agent-api-auth sidecar's authenticated listener, and
+# the Service's targetPort for `api`.
 _PROXY_API_PORT = 8643
 _HERMES_API_PORT = 8642
 
@@ -592,6 +595,46 @@ def _gateway_pod_selector(namespace: str, note: Callable[[str], None]) -> str:
     return ",".join(f"{key}={value}" for key, value in sorted(selector.items()))
 
 
+def _resolve_gateway_proxy_container(
+    namespace: str, selector: str, note: Callable[[str], None]
+) -> str:
+    """Resolves the container in the gateway pod listening on _PROXY_API_PORT.
+
+    In PR #913+ the gateway pod runs the native sidecar `agent-api-auth`.
+    For legacy single-pod deployments, it was `envoy-credential-proxy`.
+    """
+    configured = os.environ.get("AGENT_PROXY_CONTAINER")
+    if configured:
+        return configured
+    try:
+        res = subprocess.run(
+            [
+                "kubectl",
+                "get",
+                "pods",
+                "-n",
+                namespace,
+                "-l",
+                selector,
+                "--field-selector=status.phase=Running",
+                "-o",
+                "jsonpath={.items[0].spec.initContainers[*].name} {.items[0].spec.containers[*].name}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            containers = res.stdout.strip().split()
+            if "agent-api-auth" in containers:
+                return "agent-api-auth"
+            if "envoy-credential-proxy" in containers:
+                return "envoy-credential-proxy"
+    except Exception as exc:  # noqa: BLE001
+        note(f"failed to detect proxy container in {selector}: {exc}")
+    return _PROXY_CONTAINER
+
+
 def _diagnose_hermes(namespace: str) -> str:
     """Separates "the agent is down" from "the credential proxy is broken".
 
@@ -686,8 +729,11 @@ def port_forward_agent(
     selector = _gateway_pod_selector(
         agent_namespace, lambda message: diary.append(f"  {message}")
     )
+    proxy_container = _resolve_gateway_proxy_container(
+        agent_namespace, selector, lambda message: diary.append(f"  {message}")
+    )
     target = (
-        f"exec relay -> {_PROXY_CONTAINER}:{_PROXY_API_PORT} "
+        f"exec relay -> {proxy_container}:{_PROXY_API_PORT} "
         f"in a pod matching {selector}"
     )
 
@@ -697,7 +743,7 @@ def port_forward_agent(
             TunnelConfig(
                 namespace=agent_namespace,
                 selector=selector,
-                container=_PROXY_CONTAINER,
+                container=proxy_container,
                 remote_port=_PROXY_API_PORT,
                 python=_PROXY_PYTHON,
                 ready_timeout=budget,

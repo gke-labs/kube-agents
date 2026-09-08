@@ -154,7 +154,12 @@ class ReleasePublishWorkflowTest(unittest.TestCase):
         gated = [
             step
             for step in self.jobs[_PUBLISH_JOB]["steps"]
-            if step.get("name") not in ("Checkout repository", "Calculate Next Release Version", "Verify Release Eligibility")
+            if step.get("name") not in (
+                "Generate Release Bot Token",
+                "Checkout repository",
+                "Calculate Next Release Version",
+                "Verify Release Eligibility",
+            )
         ]
         self.assertTrue(gated, "publish job has no steps after eligibility")
         for step in gated:
@@ -163,6 +168,36 @@ class ReleasePublishWorkflowTest(unittest.TestCase):
                 step.get("if", ""),
                 f"step {step.get('name')!r} is not behind the eligibility skip",
             )
+
+    def test_the_release_is_published_with_the_release_bot_token(self):
+        """The release tag and assets must be pushed with the GitHub App release bot token."""
+        steps = self.jobs[_PUBLISH_JOB]["steps"]
+        token_step = next(
+            step
+            for step in steps
+            if str(step.get("uses", "")).startswith("actions/create-github-app-token@")
+        )
+        self.assertIn("RELEASE_BOT_APP_ID", token_step["with"]["app-id"])
+        self.assertIn("RELEASE_BOT_APP_PRIVATE_KEY", token_step["with"]["private-key"])
+        self.assertEqual(token_step["with"].get("permission-contents"), "write")
+        checkout = next(
+            step
+            for step in steps
+            if str(step.get("uses", "")).startswith("actions/checkout@")
+        )
+        self.assertIn(token_step.get("id", "release-token"), checkout["with"]["token"])
+
+    def test_the_helm_chart_is_published_with_github_token_packages_credential(self):
+        """Helm chart push to GHCR requires package write permissions, held by GITHUB_TOKEN."""
+        step = self._step(_PUBLISH_JOB, "Package, Publish and Sign Helm Chart")
+        self.assertEqual(step["env"]["GH_TOKEN"], "${{ secrets.GITHUB_TOKEN }}")
+
+    def test_the_release_tag_and_github_release_use_release_bot_token(self):
+        """Git tag and GitHub release creation require the release bot token to bypass rulesets."""
+        tag_step = self._step(_PUBLISH_JOB, "Create Git Tag")
+        self.assertIn("steps.release-token.outputs.token", tag_step["env"]["GH_TOKEN"])
+        release_step = self._step(_PUBLISH_JOB, "Publish GitHub Release")
+        self.assertIn("steps.release-token.outputs.token", release_step["env"]["GH_TOKEN"])
 
     def _step(self, job, name):
         for step in self.jobs[job]["steps"]:

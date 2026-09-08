@@ -10,6 +10,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
   - `chat/`: The Planning Agent front door — the `default` Hermes profile that receives chat ingress, plans the work, and delegates each piece to a specialist.
   - `platform/`: Configuration for the Platform Agent, scaffolded at pod startup into the `platform` profile.
   - `cluster/`: The Cluster Agent profile _template_ (persona, scoped config, and runtime-debugging skills). The Platform Agent scaffolds this into per-cluster Hermes profiles at runtime; it is not deployed directly.
+  - `contributor/`: The contributor-agent protocol: the claim/PR/review/escalation loop for external bots (e.g. Kyber, Codebot Robot) coordinating over GitHub alone. Not a runtime blueprint; not shipped in the images.
 - `.agents/skills/`: Repository-level skills, not shipped in the agent images — review skills (adversarial change review, security audits, docs-drift, skill quality) run against pull requests and clusters, with `review-preflight` running the pre-PR set of them in a context that did not write the change, plus the `install-kube-agents`/`uninstall-kube-agents`/`upgrade-kube-agents` lifecycle skills that drive the repository's installer scripts.
 - `.agents/rules/`: Repository-level rules an agent follows, one file per family and none shipped in the agent images — `core_engineering.md` for the code itself, `github_actions.md` for workflow authoring, `pre_pr_review.md` for the mechanics of the two pre-PR passes. This file states each rule and links there for the form it takes; the split keeps `AGENTS.md` inside the context budget `scripts/check_context_budget.py` enforces.
 - `a2a/`: Go module for the agent-to-agent bus — wire-protocol library and `a2a` topics CLI per `docs/designs/spec-a2a-payloads.md`, plus agent profiles. Nothing imports it yet.
@@ -33,7 +34,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
 
 ## Where Tests Go
 
-Tests live in ten places here, with different runners and different answers to "does this catch a
+Tests live in eleven places here, with different runners and different answers to "does this catch a
 regression before merge". Choosing the wrong one rarely fails loudly — the test runs somewhere you
 did not expect, or nowhere at all, and the suite reports green around it.
 
@@ -44,6 +45,8 @@ did not expect, or nowhere at all, and the suite reports green around it.
   `tests/integration/` when it spans two components — but in `bench/tests/` when one of those
   components is the bench harness, which `tests/integration/` cannot import.
   See [`tests/integration/README.md`](tests/integration/README.md).
+  One carve-out: **security and permissions invariants** go in `tests/conformance/`, whose own
+  README is the contract.
 - **Yes, and you plant the defect it has to find** — it is an eval, it belongs in
   `bench/tasks/<name>/task.yaml`, and it runs in the Prow presubmit, so adding one changes what
   every pull request reports. [`docs/designs/bench-case-format.md`](docs/designs/bench-case-format.md)
@@ -59,9 +62,10 @@ did not expect, or nowhere at all, and the suite reports green around it.
 
 One rule holds wherever it lands: a new test directory only runs if a `PYTHON_TEST_DIRS` glob in the
 `Makefile` reaches it, and a directory the globs miss fails nothing — it sits unexecuted while the
-suite reports green around it. Add the glob in the same change.
+suite reports green around it. Add the glob in the same change — `tests/conformance/` excepted,
+deliberately; its README says why.
 
-The ten homes, what runs each, and how far "runs on a pull request" is from "gates a merge" are in
+The eleven homes, what runs each, and how far "runs on a pull request" is from "gates a merge" are in
 [`docs/testing-map.md`](docs/testing-map.md).
 
 ## Agent Setup & Integration
@@ -77,18 +81,10 @@ To use these agents:
 
 ### Branch from a `main` you have just fetched
 
-`main` takes on the order of ten commits a day, so a checkout that has sat for a week is a
-different repository from the one you are about to describe to the user. Reading a stale working
-tree does not fail loudly — it answers your questions, just about code that no longer exists — and
-the plan you build on those answers can be wrong in a way no amount of care during the work will
-catch. A session planned an addition to `.github/workflows/auto_request_review.yml` from a
-checkout 42 commits behind, describing the third-party action that workflow used to run; #736 had
-since rewritten it to drive `scripts/request_reviewers.py`, whose `skip_reason` already did the
-thing the session was proposing to add. Nothing about the plan looked wrong until it came time to
-edit the file.
-
-So fetch first, and branch from the fetched ref rather than from whatever the working tree happens
-to be sitting on:
+`main` takes roughly ten commits a day, so a week-old checkout is a different
+repository. Reading a stale tree answers your questions about code that no
+longer exists, and the plan you build can be wrong in ways no care during the
+work will catch. Always fetch first, and branch from the fetched ref:
 
 ```bash
 # `upstream` here is whichever remote points at gke-labs/kube-agents; on a clone of
@@ -228,6 +224,14 @@ has an entry in the documentation
 map (`docs/README.md`), and this file plus `CLAUDE.md` stay inside the context budget
 (`scripts/check_context_budget.py`) — the same five checks CI runs.
 
+## Contributing as an agent
+
+Unattended agents (collaborating on issues and PRs without a human in the loop)
+must read [`agents/contributor/AGENTS.md`](agents/contributor/AGENTS.md). It
+defines the agent-to-agent loop (claims, escalations, and review tiers) and
+governs where unattended execution conflicts with "ask the user" clauses here.
+Agents with a user in the loop follow this file.
+
 ## Pull Request Hygiene
 
 - Keep changes scoped to the request.
@@ -351,11 +355,10 @@ map (`docs/README.md`), and this file plus `CLAUDE.md` stay inside the context b
 `pull-kube-agents-smoke-test` runs the eval matrix in `hack/ci-eval-pr.sh` — every active case,
 three repetitions each — and has been merge-blocking since 2026-09-02
 (GoogleCloudPlatform/oss-test-infra#2677). It is slow — recent green runs took 1.5 to 3.5 hours
-against a 360-minute ceiling — and a new push restarts it, so open the pull request early and
-batch changes rather than stacking pushes. Another pull request merging usually does not — the
+against a 360-minute ceiling — and a push restarts it unless only inert paths changed (step 0), so
+open the pull request early and batch changes. Another pull request merging usually does not — the
 green status is re-pinned to `main`'s new head
-([how a change merges](docs/pull-request-workflow.md#how-a-change-merges)); a push whose whole
-delta is inert paths (`REVALIDATION_INERT_PATHS`) reuses the prior green via step 0.
+([how a change merges](docs/pull-request-workflow.md#how-a-change-merges)).
 
 Two things red it. A case on the `BOOTSTRAP_ADMITTED` roster in `hack/ci-eval-pr.sh` fails **all**
 of its repetitions — one failed repetition out of three does nothing on its own. Or any case,
@@ -364,8 +367,7 @@ instead of running, or a record whose liveness signals are inconsistent (one sho
 all is excluded as infrastructure instead, #1184). Repetitions classified as
 infrastructure failures are excluded from the verdict automatically, unless every case hits one —
 a suite that evaluated nothing reds rather than reporting green. The roster is the source of truth
-for what is admitted, [`docs/eval-gate-roster.md`](docs/eval-gate-roster.md) for who is held out
-and how a flaky case is demoted, and
+for what is admitted, `docs/eval-gate-roster.md` for demotion, and
 [`docs/designs/testing-strategy.md`](docs/designs/testing-strategy.md) §4.2 for the full verdict
 ladder.
 

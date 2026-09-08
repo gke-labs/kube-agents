@@ -1,14 +1,15 @@
-"""Tests for the deferred relay-patch hook in sitecustomize.
+"""Tests for the deferred runtime-patch hook in sitecustomize.
 
 The contract these pin down is a performance one with a correctness tail. The
 operator puts this directory on ``PYTHONPATH`` for the agent container, so
 ``sitecustomize`` executes in every Python the pod starts — including the four
 interpreters Hermes' environment probe spawns per session and the fresh
-subprocess kanban spawns per card. Calling the relay ``install()`` hooks eagerly
-there dragged ``slack_bolt`` and its transitive dependencies into all of them.
-So: nothing heavy at startup, but the patch must still be in place before the
-gateway builds a Slack adapter, because the gateway holds no real bot token
-without it.
+subprocess kanban spawns per card. Calling the ``install()`` hooks eagerly there
+dragged ``slack_bolt`` and its transitive dependencies into all of them. So:
+nothing heavy at startup, but each patch must still be in place before the
+gateway reaches the thing it patches — a Slack adapter the gateway holds no real
+bot token without, and the card-delivery path that would otherwise drop every
+file the agent wrote inside the shell sandbox.
 """
 
 import importlib
@@ -46,29 +47,34 @@ _spec.loader.exec_module(sitecustomize)
 
 
 class InstallHookRegistrationTest(unittest.TestCase):
-    """``install_hook`` registers a finder only for relays that are configured."""
+    """``install_hook`` defers the configured relays' patches, and the rest."""
 
-    def test_no_relay_configured_registers_nothing(self):
+    def test_no_relay_configured_still_defers_the_unconditional_patches(self):
+        # These fix a gateway behaviour that has nothing to do with a relay, so
+        # a direct-token install needs them as much as a proxied one does.
         meta_path = []
-        self.assertIsNone(sitecustomize.install_hook(meta_path=meta_path, environ={}))
-        self.assertEqual(meta_path, [])
+        finder = sitecustomize.install_hook(meta_path=meta_path, environ={})
+        self.assertEqual(finder._module_names, sitecustomize.UNCONDITIONAL_PATCHES)
+        self.assertIs(meta_path[0], finder)
 
     def test_empty_relay_url_is_not_configured(self):
         meta_path = []
-        self.assertIsNone(
-            sitecustomize.install_hook(
-                meta_path=meta_path, environ={"SLACK_RELAY_URL": ""}
-            )
+        finder = sitecustomize.install_hook(
+            meta_path=meta_path, environ={"SLACK_RELAY_URL": ""}
         )
-        self.assertEqual(meta_path, [])
+        self.assertEqual(finder._module_names, sitecustomize.UNCONDITIONAL_PATCHES)
 
     def test_registers_only_the_configured_relay(self):
         meta_path = ["existing-finder"]
         finder = sitecustomize.install_hook(
             meta_path=meta_path, environ={"SLACK_RELAY_URL": "http://relay"}
         )
-        self.assertIsInstance(finder, sitecustomize.RelayPatchOnImport)
-        self.assertEqual(finder._module_names, ("slack_relay_patch",))
+        self.assertIsInstance(finder, sitecustomize.PatchOnImport)
+        self.assertEqual(
+            finder._module_names,
+            ("slack_relay_patch",) + sitecustomize.UNCONDITIONAL_PATCHES,
+        )
+        self.assertNotIn("google_chat_relay_patch", finder._module_names)
         # Ahead of the standard finders, so the loader wrap happens before the
         # module is handed to them.
         self.assertIs(meta_path[0], finder)
@@ -84,7 +90,8 @@ class InstallHookRegistrationTest(unittest.TestCase):
         )
         self.assertEqual(
             finder._module_names,
-            ("google_chat_relay_patch", "slack_relay_patch"),
+            ("google_chat_relay_patch", "slack_relay_patch")
+            + sitecustomize.UNCONDITIONAL_PATCHES,
         )
 
 
@@ -134,7 +141,7 @@ class DeferredInstallTest(unittest.TestCase):
         sys.modules["fake_relay_patch"] = fake_relay
         self.addCleanup(sys.modules.pop, "fake_relay_patch", None)
 
-        self.finder = sitecustomize.RelayPatchOnImport(["fake_relay_patch"])
+        self.finder = sitecustomize.PatchOnImport(["fake_relay_patch"])
         sys.meta_path.insert(0, self.finder)
         self.addCleanup(self._discard_finder)
         self.addCleanup(self._purge_gateway)
@@ -215,7 +222,8 @@ class StartupCostTest(unittest.TestCase):
                 "-c",
                 "import sys; print(sorted(m for m in sys.modules "
                 "if m.split('.')[0] in {'slack_relay_patch', "
-                "'google_chat_relay_patch', 'slack_bolt', 'slack_sdk', "
+                "'google_chat_relay_patch', 'sandbox_artifact_patch', "
+                "'sandbox_exec', 'yaml', 'slack_bolt', 'slack_sdk', "
                 "'aiohttp', 'gateway'}))",
             ],
             env=env,
@@ -242,7 +250,7 @@ class StartupCostTest(unittest.TestCase):
                 sys.executable,
                 "-c",
                 "import sys; f=[type(x).__name__ for x in sys.meta_path]; "
-                "print('RelayPatchOnImport' in f, 'sitecustomize' in sys.modules)",
+                "print('PatchOnImport' in f, 'sitecustomize' in sys.modules)",
             ],
             env=env,
             capture_output=True,

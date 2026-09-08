@@ -109,7 +109,7 @@ Look for infrastructure, volume, image, or scheduling alerts in GKE.
 ```bash
 kubectl get events -n {workload_namespace} --sort-by='.metadata.creationTimestamp'
 # Or query Cloud Logging for historical GKE events within the time window:
-gcloud logging read "resource.type=\"k8s_cluster\" AND logName=\"projects/{project_id}/logs/events\" AND jsonPayload.involvedObject.namespace=\"{workload_namespace}\"" --start-time="{start_time}" --end-time="{end_time}" --project="{project_id}"
+gcloud logging read "resource.type=\"k8s_cluster\" AND logName=\"projects/{project_id}/logs/events\" AND jsonPayload.involvedObject.namespace=\"{workload_namespace}\" AND timestamp>=\"{start_time}\" AND timestamp<=\"{end_time}\"" --project="{project_id}"
 ```
 
 *Note: Retrieve the sorted events list and manually inspect the event timestamps

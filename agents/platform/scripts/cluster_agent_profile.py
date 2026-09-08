@@ -25,6 +25,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import sandbox_exec
 from gke_endpoint import dns_endpoint_args
 from profile_scaffold import HERMES_BIN, ensure_profile, overlay_template
 
@@ -36,6 +37,16 @@ HERMES_HOME = Path(os.environ.get("HERMES_HOME", "/opt/data"))
 # has to pick them up itself (see create_profile steps 2c/2d).
 OVERLAY_DIR = Path(os.environ.get("PROFILE_OVERLAY_DIR", "/opt/agent-config"))
 PLUGIN_MOUNT_ROOT = Path(os.environ.get("PLUGIN_MOUNT_ROOT", "/opt/agent-plugins"))
+# deploy/shared/sandbox_mirror.py, which the image stages here alongside
+# profile_overlay.py and profile_plugins.py. Named by path rather than imported:
+# it is a CLI, the entrypoint runs it the same way, and step 2e wants its exit
+# code and its log line rather than a return value.
+SANDBOX_MIRROR = Path(
+    os.environ.get("SANDBOX_MIRROR_SCRIPT", "/opt/defaults/scripts/sandbox_mirror.py")
+)
+# Comfortably past the mirror's own `--wait 30` plus one SSH round trip per
+# cluster profile, so this timeout only fires when the mirror itself is stuck.
+SANDBOX_MIRROR_TIMEOUT_SECONDS = 120
 # Hermes stores each profile at $HERMES_HOME/profiles/<name> (persists on the data PVC).
 PROFILES_BASE = HERMES_HOME / "profiles"
 
@@ -48,13 +59,26 @@ MAX_NAME_LEN = 63
 # Agent itself (`platform`). Reconciliation must never touch these.
 RESERVED_PROFILES = frozenset({"default", "platform"})
 
+# How the scaffold checks that gcloud's kubeconfig exists on the side that will
+# read it. An absolute path because a builtin `test` would be the sandbox
+# shell's, and a round number of seconds because one stat over a multiplexed
+# connection either answers immediately or the connection is gone.
+KUBECONFIG_PROBE = "/usr/bin/test"
+KUBECONFIG_PROBE_TIMEOUT_SECONDS = 30
+
 
 def log(msg: str) -> None:
     print(f"[CLUSTER-PROFILE] {msg}", file=sys.stderr)
 
 
 def _run_env(extra: dict[str, str] | None = None) -> dict[str, str]:
-    """Env for subprocesses: HOME -> /tmp (writable creds) and HERMES_HOME pinned."""
+    """Env for agent-pod subprocesses: HOME -> /tmp and HERMES_HOME pinned.
+
+    Not for anything crossing into the sandbox. It carries the agent pod's whole
+    environment, `API_SERVER_KEY` included; `sandbox_exec.run` takes the handful
+    of variables a remote command needs through `remote_env` instead — paths and
+    names only, since that route renders them into the sandbox's process table.
+    """
     return {**os.environ, "HOME": "/tmp", "HERMES_HOME": str(HERMES_HOME), **(extra or {})}
 
 
@@ -172,6 +196,71 @@ def _pin_otel_endpoint(home: Path, name: str) -> None:
         log(f"{name}: pinning the OpenTelemetry endpoint failed ({e}); traces go to the image default")
 
 
+def kubeconfig_landed(kubeconfig: Path) -> bool:
+    """Whether the kubeconfig exists and is non-empty, wherever kubectl runs.
+
+    Which filesystem that is depends on the install: with a sandbox it is the
+    sandbox's volume and this pod cannot stat it, without one it is this pod's
+    own. Asked the same way the credential was fetched, so the answer describes
+    the same side.
+    """
+    if not sandbox_exec.sandbox_enabled():
+        return kubeconfig.is_file() and kubeconfig.stat().st_size > 0
+    try:
+        probe = sandbox_exec.run(
+            [KUBECONFIG_PROBE, "-s", str(kubeconfig)],
+            check=False,
+            timeout=KUBECONFIG_PROBE_TIMEOUT_SECONDS,
+        )
+    except (sandbox_exec.SandboxUnavailable, OSError, subprocess.TimeoutExpired):
+        # The question could not be asked. Reported as an unwritten kubeconfig
+        # rather than as a scaffold that finished, because a sandbox that has
+        # gone away since the fetch is the case this check is for.
+        return False
+    return probe.returncode == 0
+
+
+def _push_sandbox_layout(name: str) -> None:
+    """Run the mirror's skeleton pass so this profile exists in the sandbox.
+
+    The shell, the file tools and gcloud all run over SSH in the sandbox pod,
+    which mounts its own volume at the same absolute path as this one. It has
+    the machine home and nothing below it, and it cannot create the rest for
+    itself: the profile list is on this pod's PVC. The entrypoint pushes the
+    layout for every profile that exists at startup (step 5.7), and a profile
+    scaffolded here exists long after that -- including the kubeconfig directory
+    step 3 writes into.
+
+    The same pass delivers each cluster profile's USER.md
+    (sandbox_mirror.push_cluster_identities), which is why create_profile runs
+    it twice: at step 2e the directory has to exist before gcloud writes into
+    it, and at step 5 USER.md finally exists to deliver.
+
+    ``--skeleton-only``: the one-shot migration of the model's files is the
+    entrypoint's job and has a marker of its own. A brand new profile has no
+    files to move.
+
+    Never fatal. An install with no sandbox exits 0 from the script itself, and
+    a sandbox that is down leaves a profile whose shell starts in the machine
+    home -- which is where it starts anyway.
+    """
+    if not SANDBOX_MIRROR.is_file():
+        return
+    try:
+        subprocess.run(
+            [sys.executable, str(SANDBOX_MIRROR),
+             "--agent-home", str(HERMES_HOME), "--skeleton-only", "--wait", "30"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=SANDBOX_MIRROR_TIMEOUT_SECONDS,
+        )
+        log(f"{name}: pushed the profile layout into the shell sandbox")
+    except Exception as e:  # noqa: BLE001 - no sandbox, or a sandbox that is down
+        log(f"{name}: could not push the profile layout into the shell sandbox ({e}); "
+            "the next container start retries it")
+
+
 def create_profile(project: str, cluster: str, location: str) -> str:
     """Scaffold (idempotently) a Cluster Agent profile for a GKE cluster; return its name.
 
@@ -229,11 +318,32 @@ def create_profile(project: str, cluster: str, location: str) -> str:
     except Exception as e:  # noqa: BLE001 - a missing overlay dir must not fail the scaffold
         log(f"{name}: overlay sync failed ({e}); running on image defaults")
 
+    # 2e. Give this profile a home in the shell sandbox.
+    _push_sandbox_layout(name)
+
     # 3. Pin a kubeconfig scoped to the target cluster.
+    #
+    # The gcloud runs in the shell sandbox, so the file it writes lands there
+    # rather than in the agent pod — which is where it is needed, because every
+    # kubectl this profile goes on to run is a sandbox command too, reading the
+    # KUBECONFIG that step 3b pins. Step 2e is what makes the directory it
+    # writes into exist on that side; before that landed, this call named an
+    # agent-pod path with no counterpart in the sandbox and gcloud said so.
+    #
+    # As TERMINAL_PRINCIPAL, unlike every other call in this file. Step 2e
+    # mirrors the profile directory in as `agent:agent` 0755, so the default
+    # `hermes` login (uid 1001) cannot create a file in it and gcloud exits on
+    # EACCES. The alternative — making the directory group- or world-writable
+    # so uid 1001 could write into a tree uid 1000 owns — is a symlink-follow
+    # waiting to happen, and the file has to end up `agent`-readable regardless
+    # because the Cluster Agent's own kubectl reads current-context out of it.
+    # dns_endpoint_args below stays on the default login: it consumes gcloud's
+    # output as a fact about the cluster, which is what TERMINAL_PRINCIPAL is
+    # not for.
     kubeconfig = home / "kubeconfig.yaml"
     env = _run_env({"KUBECONFIG": str(kubeconfig)})
     try:
-        subprocess.run(
+        sandbox_exec.run(
             [
                 "gcloud", "container", "clusters", "get-credentials", cluster,
                 f"--location={location}", f"--project={project}",
@@ -242,18 +352,43 @@ def create_profile(project: str, cluster: str, location: str) -> str:
                 # external traffic. gke_endpoint reads which before deciding.
                 *dns_endpoint_args(project, cluster, location, env=env),
             ],
-            check=True, capture_output=True, text=True, timeout=60, env=env,
+            check=True, timeout=60,
+            remote_env={"KUBECONFIG": str(kubeconfig)},
+            local_env=env,
+            principal=sandbox_exec.TERMINAL_PRINCIPAL,
         )
     except subprocess.CalledProcessError as e:
         raise SystemExit(f"ERROR: failed to fetch credentials for '{cluster}': {e.stderr.strip()}")
     except subprocess.TimeoutExpired:
         raise SystemExit(f"ERROR: timed out fetching credentials for '{cluster}'.")
+    except sandbox_exec.SandboxUnavailable as e:
+        # The command never ran. Distinct from the cases above, which are gcloud
+        # answering: a scaffold that reports a credential failure here would send
+        # whoever reads it to IAM rather than to the sandbox pod.
+        raise SystemExit(f"ERROR: could not reach the shell sandbox to fetch credentials "
+                         f"for '{cluster}': {e}")
     except OSError as e:
-        # `gcloud` not on PATH or not executable — raised before the process exists,
-        # so neither handler above sees it. Same failure mode the `hermes` invocation
-        # in profile_scaffold.ensure_profile guards against; keep it to one
-        # actionable line instead of a traceback in the container log.
+        # `ssh` (or `gcloud`, unsandboxed) not on PATH or not executable — raised
+        # before the process exists, so neither handler above sees it. Same failure
+        # mode the `hermes` invocation in profile_scaffold.ensure_profile guards
+        # against; keep it to one actionable line instead of a traceback in the
+        # container log.
         raise SystemExit(f"ERROR: could not execute 'gcloud' to fetch credentials for '{cluster}': {e}")
+
+    # 3a. Check that the file exists on the side that will read it.
+    #
+    # gcloud exiting 0 is not the same statement. It writes the kubeconfig in
+    # the sandbox, and this pod cannot see that filesystem — so a step 2e that
+    # was skipped, a --wait that expired, or a gcloud that wrote somewhere else
+    # all leave a profile the scaffold calls finished and every later kubectl
+    # fails against, with an error naming the cluster rather than the scaffold
+    # that never gave it a credential.
+    if not kubeconfig_landed(kubeconfig):
+        raise SystemExit(
+            f"ERROR: gcloud reported success for '{cluster}' but no kubeconfig is "
+            f"at {kubeconfig} where kubectl will look for it. The profile is "
+            "scaffolded; re-run this command once the shell sandbox is up."
+        )
 
     # 3b. Pin KUBECONFIG for the dispatcher-spawned worker via the profile's .env.
     _pin_kubeconfig_env(home, kubeconfig)
@@ -282,6 +417,15 @@ def create_profile(project: str, cluster: str, location: str) -> str:
         "`cluster_agent_profile.py create` — do not hand-edit this file.\n",
         encoding="utf-8",
     )
+
+    # 5. Deliver that identity into the sandbox, where preflight reads it.
+    #
+    # cluster_preflight.sh runs over SSH like every other command this agent
+    # issues, so it reads USER.md on the sandbox's volume and not the copy
+    # written above. The mirror's skeleton pass is what carries it; step 2e ran
+    # before this file existed, so it has to run once more now. Cheap and
+    # idempotent -- the skeleton is mkdir -p and the identity write overwrites.
+    _push_sandbox_layout(name)
     return name
 
 
@@ -298,6 +442,8 @@ def delete_profile(name: str) -> None:
     """
     home = profile_home(name)
     try:
+        # Stays in the agent pod: `hermes` needs the profiles on the data PVC and
+        # the gateway on loopback, and the sandbox image does not carry it.
         subprocess.run(
             [HERMES_BIN, "profile", "delete", name, "-y"],
             check=True, capture_output=True, text=True, timeout=30, env=_run_env(),

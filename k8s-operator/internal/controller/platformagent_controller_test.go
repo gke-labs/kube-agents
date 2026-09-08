@@ -198,11 +198,19 @@ func TestPlatformAgentReconciler_Reconcile(t *testing.T) {
 			t.Errorf("expected Deployment to have container named 'platform-agent'")
 		}
 	}
-	proxyC, found := findContainer(dep.Spec.Template.Spec, "envoy-credential-proxy")
+	authC, found := findContainer(dep.Spec.Template.Spec, "agent-api-auth")
 	if !found {
-		t.Errorf("expected Deployment to contain Envoy credential sidecar")
-	} else if proxyC.RestartPolicy == nil || *proxyC.RestartPolicy != corev1.ContainerRestartPolicyAlways {
-		t.Errorf("credential proxy must be a native sidecar (restartPolicy: Always) so it binds its ports before the agent container starts")
+		t.Errorf("expected Deployment to contain the agent-API front door")
+	} else if authC.RestartPolicy == nil || *authC.RestartPolicy != corev1.ContainerRestartPolicyAlways {
+		t.Errorf("the front door must be a native sidecar (restartPolicy: Always) so it binds its ports before the agent container starts")
+	}
+
+	// The credential runtime is a Deployment of its own, reconciled alongside.
+	brokerDep := &appsv1.Deployment{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-credential-proxy", Namespace: "test-ns"}, brokerDep); err != nil {
+		t.Errorf("failed to get the credential broker Deployment: %v", err)
+	} else if _, found := findContainer(brokerDep.Spec.Template.Spec, "envoy-credential-proxy"); !found {
+		t.Errorf("the broker Deployment does not run the credential runtime")
 	}
 
 	// Service
@@ -295,6 +303,13 @@ func TestDeleteLegacyCredentialIsolationResources(t *testing.T) {
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
 		&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
 	}
+	// The credential proxy's own Deployment and Service carry these names again,
+	// so the cleanup has to leave them alone; deleting them tore down the pod the
+	// same reconcile had just applied.
+	live := []client.Object{
+		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-credential-proxy", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-credential-proxy", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}},
+	}
 	// The metadata-deny NetworkPolicy is a guardrail this controller does not
 	// create, so deleting it is out of bounds and it belongs on the survivor
 	// side of this test, not the deleted side. Owned here on purpose: an owner
@@ -303,7 +318,7 @@ func TestDeleteLegacyCredentialIsolationResources(t *testing.T) {
 	guardrail := &networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "test-agent-sandbox-metadata-deny", Namespace: "test-ns", OwnerReferences: []metav1.OwnerReference{ownerReference}}}
 
 	objects := append([]client.Object{agent, guardrail}, removed...)
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(append(objects, live...)...).Build()
 	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
 
 	if err := r.deleteLegacyCredentialIsolationResources(context.Background(), agent); err != nil {
@@ -313,6 +328,12 @@ func TestDeleteLegacyCredentialIsolationResources(t *testing.T) {
 		err := cl.Get(context.Background(), client.ObjectKeyFromObject(object), object)
 		if !errors.IsNotFound(err) {
 			t.Errorf("expected legacy %T to be deleted, got %v", object, err)
+		}
+	}
+	for _, object := range live {
+		if err := cl.Get(context.Background(), client.ObjectKeyFromObject(object), object); err != nil {
+			t.Errorf("expected credential proxy %T %s to survive the legacy cleanup, got %v",
+				object, object.GetName(), err)
 		}
 	}
 	surviving := &networkingv1.NetworkPolicy{}
@@ -606,7 +627,7 @@ func TestPlatformAgentReconciler_Reconcile_ExistingRuntimeClass(t *testing.T) {
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent, rc).
+		WithObjects(agent, shellSandboxKeysSecret(agent), rc).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -711,7 +732,7 @@ func TestPlatformAgentReconciler_Reconcile_PodUnschedulable(t *testing.T) {
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent, rc, pod).
+		WithObjects(agent, shellSandboxKeysSecret(agent), rc, pod).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -787,7 +808,7 @@ func TestPlatformAgentReconciler_Reconcile_InvalidGitRepo(t *testing.T) {
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -833,6 +854,81 @@ func TestPlatformAgentReconciler_Reconcile_InvalidGitRepo(t *testing.T) {
 	if degradedCond == nil || degradedCond.Status != metav1.ConditionTrue || degradedCond.Reason != "InvalidGitRepoURL" {
 		t.Errorf("expected Degraded condition True with reason InvalidGitRepoURL, got %v", degradedCond)
 	}
+	if !strings.Contains(degradedCond.Message, "Admission webhook will reject updates to this resource until corrected") {
+		t.Errorf("expected Degraded condition message to mention admission webhook rejection, got %q", degradedCond.Message)
+	}
+}
+
+func TestPlatformAgentReconciler_Reconcile_NonGitHubRepo(t *testing.T) {
+	scheme := setupScheme()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-nongithub-repo",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{
+						GitRepo: "https://gitlab.com/gke-labs/kube-agents.git",
+					},
+				},
+			},
+			Harness: &agentv1alpha1.HarnessSpec{
+				ProjectID:   "test-project",
+				Location:    "us-central1",
+				ClusterName: "test-cluster",
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{
+		Client: cl,
+		Scheme: scheme,
+	}
+
+	req := ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      "test-agent-nongithub-repo",
+			Namespace: "test-ns",
+		},
+	}
+	ctx := context.Background()
+
+	// 1st Reconcile: Adds finalizer
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 1 failed: %v", err)
+	}
+
+	// 2nd Reconcile: Updates status with Degraded condition due to non-GitHub repo
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 2 failed: %v", err)
+	}
+
+	updatedAgent := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updatedAgent); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+
+	if updatedAgent.Status.Phase != "Degraded" {
+		t.Errorf("expected Status.Phase Degraded when gitRepo host is non-GitHub, got %q", updatedAgent.Status.Phase)
+	}
+
+	degradedCond := meta.FindStatusCondition(updatedAgent.Status.Conditions, "Degraded")
+	if degradedCond == nil || degradedCond.Status != metav1.ConditionTrue || degradedCond.Reason != "InvalidGitRepoURL" {
+		t.Errorf("expected Degraded condition True with reason InvalidGitRepoURL, got %v", degradedCond)
+	}
+	if !strings.Contains(degradedCond.Message, "Admission webhook will reject updates to this resource until corrected") {
+		t.Errorf("expected Degraded condition message to mention admission webhook rejection, got %q", degradedCond.Message)
+	}
 }
 
 func TestPlatformAgentReconciler_Reconcile_InvalidGitHubOrg(t *testing.T) {
@@ -862,7 +958,7 @@ func TestPlatformAgentReconciler_Reconcile_InvalidGitHubOrg(t *testing.T) {
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -902,6 +998,120 @@ func TestPlatformAgentReconciler_Reconcile_InvalidGitHubOrg(t *testing.T) {
 	degradedCond := meta.FindStatusCondition(updatedAgent.Status.Conditions, "Degraded")
 	if degradedCond == nil || degradedCond.Status != metav1.ConditionTrue || degradedCond.Reason != "InvalidGitRepoURL" {
 		t.Errorf("expected Degraded condition True with reason InvalidGitRepoURL, got %v", degradedCond)
+	}
+}
+
+func TestPlatformAgentReconciler_Reconcile_CorruptManagedRepos(t *testing.T) {
+	scheme := setupScheme()
+
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-corrupt-repos",
+			Namespace: "test-ns",
+		},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{
+						GitRepo: "https://github.com/gke-labs/kube-agents.git",
+					},
+				},
+			},
+			Harness: &agentv1alpha1.HarnessSpec{
+				ProjectID:   "test-project",
+				Location:    "us-central1",
+				ClusterName: "test-cluster",
+			},
+		},
+	}
+
+	cm := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-corrupt-repos-gitops-state",
+			Namespace: "test-ns",
+		},
+		Data: map[string]string{
+			"managed_repos": `[{"type":"github","url":"https://github.com/foo/bar"},]`,
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, cm, shellSandboxKeysSecret(agent)).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{
+		Client: cl,
+		Scheme: scheme,
+	}
+
+	req := ctrl.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      "test-agent-corrupt-repos",
+			Namespace: "test-ns",
+		},
+	}
+	ctx := context.Background()
+
+	// 1st Reconcile: Adds finalizer
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 1 failed: %v", err)
+	}
+
+	// 2nd Reconcile: Updates status with Degraded condition due to corrupt managed_repos
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 2 failed: %v", err)
+	}
+
+	updatedAgent := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, updatedAgent); err != nil {
+		t.Fatalf("failed to get agent: %v", err)
+	}
+
+	if updatedAgent.Status.Phase != "Degraded" {
+		t.Errorf("expected Status.Phase Degraded when managed_repos is corrupt, got %q", updatedAgent.Status.Phase)
+	}
+
+	readyCond := meta.FindStatusCondition(updatedAgent.Status.Conditions, "Ready")
+	if readyCond == nil || readyCond.Status != metav1.ConditionFalse || readyCond.Reason != "CorruptManagedRepos" {
+		t.Errorf("expected Ready condition False with reason CorruptManagedRepos, got %v", readyCond)
+	}
+
+	degradedCond := meta.FindStatusCondition(updatedAgent.Status.Conditions, "Degraded")
+	if degradedCond == nil || degradedCond.Status != metav1.ConditionTrue || degradedCond.Reason != "CorruptManagedRepos" {
+		t.Errorf("expected Degraded condition True with reason CorruptManagedRepos, got %v", degradedCond)
+	}
+	if !strings.Contains(degradedCond.Message, "Corrupt managed_repos in ConfigMap") {
+		t.Errorf("expected Degraded condition message to mention corrupt managed_repos, got %q", degradedCond.Message)
+	}
+
+	// Verify recovery: correct the ConfigMap and reconcile again
+	cmToUpdate := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: cm.Name, Namespace: cm.Namespace}, cmToUpdate); err != nil {
+		t.Fatalf("failed to get cm: %v", err)
+	}
+	cmToUpdate.Data["managed_repos"] = `[{"type":"github","url":"https://github.com/foo/bar"}]`
+	if err := cl.Update(ctx, cmToUpdate); err != nil {
+		t.Fatalf("failed to update cm: %v", err)
+	}
+
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile after fix failed: %v", err)
+	}
+
+	recoveredAgent := &agentv1alpha1.PlatformAgent{}
+	if err := cl.Get(ctx, req.NamespacedName, recoveredAgent); err != nil {
+		t.Fatalf("failed to get recovered agent: %v", err)
+	}
+
+	if recoveredAgent.Status.Phase == "Degraded" {
+		t.Errorf("expected Status.Phase not to be Degraded after fixing managed_repos, got %q", recoveredAgent.Status.Phase)
+	}
+	recoveredDegradedCond := meta.FindStatusCondition(recoveredAgent.Status.Conditions, "Degraded")
+	if recoveredDegradedCond != nil {
+		t.Errorf("expected Degraded condition to be cleared, got %v", recoveredDegradedCond)
 	}
 }
 
@@ -961,8 +1171,8 @@ func TestBuildNetworkPolicy(t *testing.T) {
 	if len(netpol.Spec.Ingress[0].Ports) != 3 {
 		t.Errorf("expected 3 ports in agent namespace ingress rule when dashboard enabled, got %d", len(netpol.Spec.Ingress[0].Ports))
 	}
-	if len(netpol.Spec.Egress) != 10 {
-		t.Errorf("expected 10 Egress rules (DNS, GCP Metadata port 80, GCP Metadata port 988, LiteLLM Gateway, vLLM Gemma, K8s Control Plane, External HTTPS, GKE OTel Collector, GitHub Token Minter, Hindsight API), got %d", len(netpol.Spec.Egress))
+	if len(netpol.Spec.Egress) != 12 {
+		t.Errorf("expected 12 Egress rules (DNS, GCP Metadata port 80, GCP Metadata port 988, LiteLLM Gateway, vLLM Gemma, K8s Control Plane, External HTTPS, GKE OTel Collector, GitHub Token Minter, Hindsight API, shell sandbox sshd, credential broker), got %d", len(netpol.Spec.Egress))
 	}
 
 	findEgressRule := func(port int32, peerCheck func(networkingv1.NetworkPolicyPeer) bool) *networkingv1.NetworkPolicyEgressRule {
@@ -1088,7 +1298,7 @@ func TestBuildNetworkPolicy_FQDNEnabled(t *testing.T) {
 	}
 
 	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), true, "", false)
-	// Expected 9 Egress rules when FQDN is enabled (external HTTPS 0.0.0.0/0:443 is omitted):
+	// Expected 11 Egress rules when FQDN is enabled (external HTTPS 0.0.0.0/0:443 is omitted):
 	// 1. Cluster DNS (53)
 	// 2. GCP WI / Metadata server (80)
 	// 3. GKE WI Host Network Daemon (988)
@@ -1098,8 +1308,10 @@ func TestBuildNetworkPolicy_FQDNEnabled(t *testing.T) {
 	// 7. GKE Managed OpenTelemetry Collector (4317, 4318)
 	// 8. GitHub Token Minter (8080)
 	// 9. Hindsight memory API (8888)
-	if len(netpol.Spec.Egress) != 9 {
-		t.Errorf("expected 9 Egress rules when FQDN is enabled (external HTTPS omitted), got %d", len(netpol.Spec.Egress))
+	// 10. The shell sandbox's sshd (2222)
+	// 11. The credential broker, which hosts the chat relay (8765)
+	if len(netpol.Spec.Egress) != 11 {
+		t.Errorf("expected 11 Egress rules when FQDN is enabled (external HTTPS omitted), got %d", len(netpol.Spec.Egress))
 	}
 	for _, egress := range netpol.Spec.Egress {
 		for _, peer := range egress.To {
@@ -1637,7 +1849,7 @@ func TestPlatformAgentReconciler_Reconcile_EventWatcherDisabledCondition(t *test
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -1780,7 +1992,7 @@ func TestPlatformAgentReconciler_Reconcile_EventWatcherMessageIsRefreshed(t *tes
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -2890,15 +3102,15 @@ func TestReconcileGitopsStateConfigMap(t *testing.T) {
 		t.Errorf("expected ConfigMap to contain merged repos, but got %v", verifyCM.Data["managed_repos"])
 	}
 
-	// 5. Unparseable managed_repos in ConfigMap should return an error and preserve existing data without overwriting
+	// 5. Unparseable managed_repos in ConfigMap should log warning and degrade gracefully without erroring out
 	verifyCM.Data["managed_repos"] = `[invalid-json-text`
 	if err := fakeClient.Update(ctx, &verifyCM); err != nil {
 		t.Fatalf("failed to update ConfigMap with unparseable data: %v", err)
 	}
 
 	err = r.reconcileGitopsStateConfigMap(ctx, agent)
-	if err == nil {
-		t.Errorf("expected error when managed_repos contains unparseable JSON, got nil")
+	if err != nil {
+		t.Errorf("expected graceful degradation (nil error) when managed_repos contains unparseable JSON, got: %v", err)
 	}
 
 	var unparseableVerifyCM corev1.ConfigMap
@@ -3616,8 +3828,8 @@ func TestReconcileNetworkPolicy_FQDNCRDNotPresentFallback(t *testing.T) {
 		t.Fatalf("failed to get reconciled NetworkPolicy: %v", err)
 	}
 
-	if len(netpol.Spec.Egress) != 10 {
-		t.Errorf("expected 10 Egress rules when FQDN CRD is not present (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
+	if len(netpol.Spec.Egress) != 12 {
+		t.Errorf("expected 12 Egress rules when FQDN CRD is not present (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
 	}
 	foundBlanketHTTPS := false
 	for _, egress := range netpol.Spec.Egress {
@@ -3679,8 +3891,8 @@ func TestReconcileNetworkPolicy_FQDNCRDWrappedErrorFallback(t *testing.T) {
 		t.Fatalf("failed to get reconciled NetworkPolicy: %v", err)
 	}
 
-	if len(netpol.Spec.Egress) != 10 {
-		t.Errorf("expected 10 Egress rules when FQDN CRD returns wrapped restmapping error (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
+	if len(netpol.Spec.Egress) != 12 {
+		t.Errorf("expected 12 Egress rules when FQDN CRD returns wrapped restmapping error (fallback to blanket external HTTPS), got %d", len(netpol.Spec.Egress))
 	}
 }
 
@@ -4177,9 +4389,28 @@ func TestReconcileNetworkPolicy_StatusReporting(t *testing.T) {
 		},
 	}
 
+	// The other two workloads Ready depends on. This test is about what the
+	// NetworkPolicy status fields say, so it wants the phase to reach Ready — and
+	// since the credential-broker split that takes all three, because a gateway on
+	// its own is an agent that can run no command. readSplitWorkloads reads them.
+	shell := &appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-shell",
+			Namespace: "test-ns",
+		},
+		Status: appsv1.StatefulSetStatus{ReadyReplicas: 1},
+	}
+	broker := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-credential-proxy",
+			Namespace: "test-ns",
+		},
+		Status: appsv1.DeploymentStatus{ReadyReplicas: 1},
+	}
+
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent, dep).
+		WithObjects(agent, dep, shell, broker).
 		WithStatusSubresource(agent).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()
@@ -4539,6 +4770,61 @@ func TestSyncGithubTokenMinterConfigMap(t *testing.T) {
 	}
 }
 
+func TestSyncGithubTokenMinterConfigMap_AdoptsPreRenderedKeys(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{
+				IntegrationSpec: agentv1alpha1.IntegrationSpec{
+					GitHub: &agentv1alpha1.GitHubSpec{
+						Org: "test-org",
+					},
+				},
+			},
+		},
+	}
+
+	// Pre-rendered ConfigMap as shipped by Helm chart / Kustomize template: contains default.yaml AND repo-1.yaml
+	minterCM := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "github-token-minter-config",
+			Namespace: "test-ns",
+		},
+		Data: map[string]string{
+			"default.yaml": "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-1'\n",
+			"repo-1.yaml":  "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-1'\n",
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, minterCM).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	// Reconcile with managed_repos containing repo-1 and repo-2
+	err := r.syncGithubTokenMinterConfigMap(ctx, agent, `[{"type":"github","url":"https://github.com/test-org/repo-1"},{"type":"github","url":"https://github.com/test-org/repo-2"}]`)
+	if err != nil {
+		t.Fatalf("syncGithubTokenMinterConfigMap failed: %v", err)
+	}
+
+	updatedCM := &corev1.ConfigMap{}
+	if err := cl.Get(ctx, client.ObjectKey{Name: "github-token-minter-config", Namespace: "test-ns"}, updatedCM); err != nil {
+		t.Fatalf("failed to get updated ConfigMap: %v", err)
+	}
+
+	// Verify repo-1.yaml was adopted and updated to include both repos
+	expectedRepo1 := "version: 'minty.abcxyz.dev/v2'\nscope:\n  platform-agent-scope:\n    repositories:\n      - 'repo-1'\n      - 'repo-2'\n"
+	if updatedCM.Data["repo-1.yaml"] != expectedRepo1 {
+		t.Errorf("expected pre-rendered repo-1.yaml to be updated with all repos, got %q", updatedCM.Data["repo-1.yaml"])
+	}
+
+	// Verify managed keys annotation includes both repo-1.yaml and repo-2.yaml
+	expectedAnn := "repo-1.yaml,repo-2.yaml"
+	if ann := updatedCM.Annotations[AnnotationManagedMinterKeys]; ann != expectedAnn {
+		t.Errorf("expected annotation %q, got %q", expectedAnn, ann)
+	}
+}
+
 // An unrecognized spec.mode can only reach the reconciler through version skew
 // (enum validation rejects it at admission — the fake client, like a newer CRD
 // with an older binary, does not). The contract from the mode spec: Degraded
@@ -4553,7 +4839,7 @@ func TestPlatformAgentReconciler_Reconcile_UnrecognizedMode(t *testing.T) {
 
 	cl := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(agent).
+		WithObjects(agent, shellSandboxKeysSecret(agent)).
 		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
 		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
 		Build()

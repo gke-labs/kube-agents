@@ -25,12 +25,21 @@ reported and what sent the first investigation after the model rather than
 after the adapter.
 
 Nothing about it is rare. Native ``media.upload`` needs a *per-user* OAuth
-token, so the notice fires on every attachment until each user has run
+token, so this method is reached on every attachment until each user has run
 ``/setup-files`` in their own DM. On the staging install this was reported
 from, no user had: ``$HERMES_HOME/google_chat_user_tokens`` did not exist, so
 every card that attached a file took this path. Card ``t_e5e1ba5e`` delivered a
 9,867-byte report that way on 2026-08-18, and ``gateway.log`` carries the
 matching ``[Google_Chat] Failed to send media (.md)`` from 2026-08-11.
+
+Since #999 the notice is no longer what a user sees for all of those. On a
+relay install ``agents/platform/scripts/google_chat_relay_patch.py`` overrides
+this same method and pastes the deliverable into the thread instead, for a
+UTF-8 ``.md``/``.txt``/``.json``/``.yaml``/``.yml``/``.csv``/``.log`` under
+32 KiB — the ``t_e5e1ba5e`` report above is squarely one of those. What still
+arrives here is the residual: a format with no text form, a file over that
+ceiling, bytes that do not decode, a file that cannot be read, and any paste
+the API refuses partway through. The text below is written for that set.
 
 The second defect
 -----------------
@@ -77,9 +86,12 @@ lead for them even on a relay install, where the next thing they find is the
 stub refusing.
 
 Neither does this make attachments work. The file still only exists on the
-agent host, and the notice still says so; the user-facing fix for that is
-either per-user OAuth or having the notifier inline a report rather than
-attach it, and both are larger than a string.
+agent host, and the notice still says so. Of the two user-facing fixes for
+that, the second now exists: ``agents/platform/scripts/google_chat_relay_patch.py``
+inlines a report rather than attaching it, which is why this notice is now the
+residual path described above. Per-user OAuth — the fix that would produce a
+real attachment — remains unbuilt, and is what a format with no text form
+still needs.
 
 Upstream: not reported. Worth doing — nobody running Hermes in an English
 deployment wants this — but the branch above is kube-agents-specific and would
@@ -159,7 +171,9 @@ PATCHED = '''\
                 "which holds no user credentials."
             )
             lines.append(
-                "Ask me to paste the contents here if you need them in chat."
+                "This one could not be pasted into the thread either: it "
+                "has no text form, is too large to read here, could not "
+                "be read at all, or posting it failed partway through."
             )
         else:
             lines.extend([
@@ -168,7 +182,20 @@ PATCHED = '''\
                 "consent, done from this chat.",
                 "**To enable it:** send `/setup-files` and follow the steps.",
             ])
-        lines.append(f"The file is on the agent host at: `{path}`")
+        # A path under the system temp directory may be a copy this pod staged
+        # out of the shell sandbox, in which case it is deleted as soon as the
+        # delivery returns and naming it here describes nothing the user can
+        # act on. `original_path` gives back the path the agent actually wrote,
+        # and is the identity for every other path. The import is guarded
+        # because this patch also has to hold on an image built without the
+        # agent scripts on PYTHONPATH.
+        try:
+            import sandbox_artifact_patch as _sandbox_artifacts
+
+            reported = _sandbox_artifacts.original_path(path)
+        except Exception:
+            reported = path
+        lines.append(f"The file is on the agent host at: `{reported}`")
 '''
 
 

@@ -422,6 +422,17 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{isolated_install_sh}"
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("PUBSUB=true STOCKOUT=true", proc.stdout)
 
+    def test_parse_args_vertex_manage_serving_project_flag_is_read(self):
+        """--vertex-manage-serving-project=false reaches its PARAM_ unchanged;
+        normalisation to true/false happens where it is consumed."""
+        cmd = (
+            "parse_args --vertex-manage-serving-project=false; "
+            'echo "MANAGE=$PARAM_VERTEX_MANAGE_SERVING_PROJECT"'
+        )
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("MANAGE=false", proc.stdout)
+
     def test_parse_args_vertex_location_overrides_the_default(self):
         """An explicit --vertex-location still wins over DEFAULT_VERTEX_LOCATION."""
         cmd = (

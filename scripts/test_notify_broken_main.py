@@ -572,7 +572,7 @@ class ReconcileTest(unittest.TestCase):
         self.assertNotIn("Fixed by", api.actions[0][2], "this run is not the fix and must not claim to be")
 
     def test_another_workflows_issue_is_left_alone(self):
-        """Four workflows are watched and each breaks independently. Closing
+        """Several workflows are watched and each breaks independently. Closing
         another one's issue would hide a real breakage."""
         api = FakeAPI([issue(901, 88, 10)])
         self._reconcile(api, notifier.decide(run(12, "success"), [run(11, "failure")]))

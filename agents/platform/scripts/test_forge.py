@@ -58,10 +58,15 @@ class FakeGh:
         self.responses = responses or {}
         self.default = default if default is not None else (0, "[]", "")
         self.calls: list[list[str]] = []
+        # What each call put on fd 0, positionally aligned with `calls`. The
+        # body of a comment travels this way now, so a test that only inspects
+        # argv can no longer see what was posted.
+        self.stdins: list[str | None] = []
 
-    def __call__(self, argv, **_kwargs):
+    def __call__(self, argv, *, stdin=None, **_kwargs):
         argv = list(argv)
         self.calls.append(argv)
+        self.stdins.append(stdin)
         joined = " ".join(argv)
         for key, value in self.responses.items():
             if key in joined:
@@ -74,6 +79,12 @@ class FakeGh:
         for argv in self.calls:
             if fragment in " ".join(argv):
                 return argv
+        raise AssertionError(f"no gh call matched {fragment!r}; saw {self.calls}")
+
+    def stdin_of(self, fragment: str):
+        for argv, stdin in zip(self.calls, self.stdins):
+            if fragment in " ".join(argv):
+                return stdin
         raise AssertionError(f"no gh call matched {fragment!r}; saw {self.calls}")
 
 
@@ -274,6 +285,40 @@ class RunGhTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("404", result.stderr)
 
+    def test_the_call_goes_to_the_sandbox(self):
+        """The agent image holds no gh, and this module's cron consumer runs there.
+
+        The three tests above pass either way — `sandbox_exec.run` falls back to
+        `subprocess.run` when no sandbox is configured, which is what a test
+        machine looks like. So this is the one that would notice the routing
+        being reverted to a direct `subprocess.run(["gh", ...])`.
+        """
+        with mock.patch.object(
+            forge.sandbox_exec, "run",
+            return_value=_completed(["gh", "auth", "status"], 0, "ok", ""),
+        ) as ran:
+            result = forge.run_gh(["auth", "status"])
+        self.assertEqual(result.stdout, "ok")
+        self.assertEqual(ran.call_args.args[0], ["gh", "auth", "status"])
+
+    def test_stdin_reaches_the_sandbox(self):
+        """`--body-file -` is only half of it; the bytes have to be forwarded."""
+        with mock.patch.object(
+            forge.sandbox_exec, "run",
+            return_value=_completed(["gh", "pr", "comment"], 0, "", ""),
+        ) as ran:
+            forge.run_gh(["pr", "comment", "1", "--body-file", "-"], stdin="hello")
+        self.assertEqual(ran.call_args.kwargs["stdin"], "hello")
+
+    def test_an_unreachable_sandbox_is_not_a_quiet_repository(self):
+        """A transport failure has to reach the caller, not become an empty result."""
+        with mock.patch.object(
+            forge.sandbox_exec, "run",
+            side_effect=forge.sandbox_exec.SandboxUnavailable("no route"),
+        ):
+            with self.assertRaises(forge.sandbox_exec.SandboxUnavailable):
+                forge.run_gh(["issue", "list"])
+
     def test_auth_failure_retries_after_credential_refresh(self):
         github_token_refresh.reset_refresh_state()
         with mock.patch(
@@ -304,7 +349,7 @@ class RunGhTest(unittest.TestCase):
     def test_provider_passes_repo_to_call(self):
         calls = []
 
-        def fake_run(argv, repo=None):
+        def fake_run(argv, repo=None, *, stdin=None):
             calls.append((argv, repo))
             return _completed(argv, 0, "[]", "")
 
@@ -456,7 +501,7 @@ class CallSeamTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
     def test_type_error_in_runner_propagates(self):
-        def bad_runner(argv, repo=None):
+        def bad_runner(argv, repo=None, *, stdin=None):
             raise TypeError("something inside runner broke")
 
         provider = forge.GitHubProvider(run=bad_runner)
@@ -964,24 +1009,37 @@ class ListCommentsTest(unittest.TestCase):
 
 
 class PostCommentTest(unittest.TestCase):
-    def test_body_is_passed_as_a_file_never_on_the_command_line(self):
+    BODY = "Thanks — that is fixed in a1b2c3d.\n\n> your words back at you\n"
+
+    def _post(self, fake):
+        pr = forge.PullRequest(number=12, head_ref="platform-agent/x", author="bot")
+        forge.GitHubProvider(run=fake).post_comment("acme/toolkit", pr, self.BODY)
+
+    def test_body_travels_on_stdin_never_on_the_command_line(self):
         """A reviewer's words go back through a proxy and two shells' quoting."""
         fake = FakeGh(default=(0, "", ""))
-        pr = forge.PullRequest(number=12, head_ref="platform-agent/x", author="bot")
-        forge.GitHubProvider(run=fake).post_comment(
-            "acme/toolkit", pr, "/opt/data/scratch/pr_12.md"
-        )
+        self._post(fake)
         argv = fake.argv_containing("pr comment")
         self.assertIn("--body-file", argv)
         self.assertNotIn("--body", argv)
-        self.assertEqual(argv[argv.index("--body-file") + 1], "/opt/data/scratch/pr_12.md")
+        self.assertEqual(argv[argv.index("--body-file") + 1], "-")
         self.assertEqual(argv[argv.index("-R") + 1], "acme/toolkit")
+        self.assertEqual(fake.stdin_of("pr comment"), self.BODY)
+
+    def test_no_argument_names_a_path(self):
+        """The three processes in this call have three different filesystems.
+
+        A path would name a file in the agent pod; `gh` runs in the broker pod.
+        """
+        fake = FakeGh(default=(0, "", ""))
+        self._post(fake)
+        for arg in fake.argv_containing("pr comment"):
+            self.assertFalse(arg.startswith("/"), arg)
 
     def test_a_failed_post_is_not_swallowed(self):
         fake = FakeGh(default=(1, "", "HTTP 403"))
-        pr = forge.PullRequest(number=12, head_ref="platform-agent/x", author="bot")
         with self.assertRaises(forge.ForgeError):
-            forge.GitHubProvider(run=fake).post_comment("acme/toolkit", pr, "/tmp/x.md")
+            self._post(fake)
 
 
 class AcknowledgeTest(unittest.TestCase):

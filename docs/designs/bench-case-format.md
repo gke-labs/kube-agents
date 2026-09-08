@@ -175,7 +175,8 @@ never a pass and never a fail, and an errored check drops `VerificationCoverage`
 
 ## What actually reds a build
 
-`hack/ci-eval-pr.sh` runs one devops-bench invocation per entry in its `TASKS` array and
+`hack/ci-eval-pr.sh` runs one devops-bench invocation per entry in its task matrix — the
+`TASKS` array, plus `NIGHTLY_TASKS` when the job exports `EVAL_TIER=nightly` — and
 grades the resulting record. For a case that carries a `verification_spec`, three keys
 decide the merge:
 
@@ -262,16 +263,20 @@ reason and what would close it. An entry there is a debt with a name on it.
 
 ## Registration
 
-`hack/ci-eval-pr.sh` runs the tasks in its `TASKS` array and only those. Cases under
+`hack/ci-eval-pr.sh` runs the tasks in its `TASKS` array — plus, when the job exports
+`EVAL_TIER=nightly`, its `NIGHTLY_TASKS` array — and only those. Cases under
 `bench/tasks/` are not discovered. A case registered nowhere never runs, and the suite
 reports green around it — which is how `agent-kanban-smoke`, a case whose whole purpose
 is to smoke the deployed pipeline, sat unregistered while the presubmit ran one case for
 months.
 
-A commented-out entry counts as registered. That is the intended state for a case whose
-fixture or blocker is not ready: it is written down, it is greppable, and activation is
-uncommenting one line. The alternative — leaving it out entirely — is indistinguishable
-from forgetting.
+A commented-out `TASKS` entry counts as registered. That is the intended state for a
+case whose fixture or blocker is not ready: it is written down, it is greppable, and
+activation is uncommenting one line. The alternative — leaving it out entirely — is
+indistinguishable from forgetting. A `NIGHTLY_TASKS` entry counts too, and means more:
+the case runs every night, kept out of the presubmit for cost or because a cheaper probe
+holds its presubmit seat — never out of doubt about the case, which is what the
+commented-out state is for.
 
 ## The validator
 

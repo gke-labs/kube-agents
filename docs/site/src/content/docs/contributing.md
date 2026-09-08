@@ -163,4 +163,6 @@ AI agents working in this repository have a further obligation: after opening a 
 
 Bug reports, feature requests, and questions: [github.com/gke-labs/kube-agents/issues](https://github.com/gke-labs/kube-agents/issues).
 
+If your GitHub account cannot open an issue here, use the [feedback form](/kube-agents/feedback/) instead. It needs no account and files a public issue on your behalf, labelled `external-feedback`. The usual reason is an enterprise-managed GitHub account, which cannot interact with any repository outside its own enterprise; GitHub reports that as a restriction on this repository, but the repository itself is open. How the form works is in [`scripts/feedback_form/README.md`](https://github.com/gke-labs/kube-agents/blob/main/scripts/feedback_form/README.md).
+
 The [`github-repo-watcher` poller](/kube-agents/concepts/autonomous-watchdogs/#pollers-file-cards-watchdogs-deliver-reports) checks open issues every 10 minutes, and the agent may (within tight guardrails) triage or respond to one automatically. Human review still gates any resolution.

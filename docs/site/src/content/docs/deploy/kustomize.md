@@ -166,7 +166,7 @@ remains the source of truth for the CRDs and operator RBAC the chart copies
 from `k8s-operator/`:
 
 ```bash
-make deploy                     # operator
+make deploy IMG=<registry>/k8s-operator:$(git rev-parse HEAD)   # operator; refuses a floating tag
 make deploy-litellm             # inference gateway
 make deploy-github              # Minty
 make deploy-inference-replay    # replay proxy

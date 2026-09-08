@@ -72,9 +72,9 @@ curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash -s -- \
    kubectl get pods -n kubeagents-system
    ```
 
-   You should see one `PlatformAgent` resource plus pods for the operator (`kubeagents-controller-manager`), the Platform Agent gateway (`platform-agent-gateway`), and LiteLLM (`litellm`). The GitHub token minter (`github-token-minter`) also appears if you enabled the GitHub integration. When the Platform Agent gateway pod is `Running` and Google Chat is configured, DM your Chat app and it should reply.
+   You should see one `PlatformAgent` resource plus pods for the operator (`kubeagents-controller-manager`), LiteLLM (`litellm`), and three for the Platform Agent itself: the gateway (`platform-agent-gateway`), the shell sandbox (`platform-agent-shell`), and the credential broker (`platform-agent-credential-proxy`). The GitHub token minter (`github-token-minter`) also appears if you enabled the GitHub integration. When all three agent pods are `Running` and Google Chat is configured, DM your Chat app and it should reply.
 
-   The gateway logs errors while it starts up, and they do not mean the install failed. Repeated `Connection refused` from the Google Chat relay, and a one-off `slack connect timed out after 30s`, are ordering: both relays dial the credential-proxy sidecar on loopback before it is listening. They retry until it is, and on a fresh install the messages stopped on their own within about seven minutes. Treat them as a fault only if they are still arriving well after that, and inspect the `envoy-credential-proxy` container rather than the relay reporting the error.
+   The gateway logs errors while it starts up, and they do not mean the install failed. Repeated `Connection refused` from the Google Chat relay, and a one-off `slack connect timed out after 30s`, are ordering: both relays dial the credential broker before it is listening. They retry until it is, and on a fresh install the messages stopped on their own within about seven minutes. Treat them as a fault only if they are still arriving well after that, and inspect the `envoy-credential-proxy` container in the `platform-agent-credential-proxy` pod rather than the relay reporting the error.
 
 </Steps>
 

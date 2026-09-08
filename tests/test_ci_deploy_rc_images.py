@@ -18,7 +18,7 @@ The second is that the release-candidate path names only tags. The published
 operator image is `k8s-operator`; the one Artifact Registry carries is
 `kube-agents-operator`, so a repository override copied across from the
 presubmit path would 404. Dropping the override is also what carries the
-credential-proxy sidecar: it is not a chart value, the operator derives it from
+credential broker: its image is not a chart value, the operator derives it from
 the agent image (`resolveCredentialProxyImage`), so it follows whichever
 repository the agent uses only as long as nothing overrides that repository.
 
@@ -76,7 +76,7 @@ def fake_candidate_tree(tmp: str, images_exist: bool) -> tuple[pathlib.Path, str
     (release / "common.sh").write_text(
         textwrap.dedent(
             f"""\
-            export REQUIRED_RELEASE_IMAGES=(k8s-operator platform-agent credential-proxy)
+            export REQUIRED_RELEASE_IMAGES=(k8s-operator platform-agent credential-proxy agent-sandbox)
             get_registry_prefix() {{ echo "{_GHCR_PREFIX}"; }}
             check_commit_images_exist() {{ return {0 if images_exist else 1}; }}
             """
@@ -156,7 +156,7 @@ def image_args(result: subprocess.CompletedProcess) -> list[str]:
 class PresubmitPathUnchangedTest(unittest.TestCase):
     """RC_COMMIT_SHA unset is every pull request in the repository."""
 
-    def test_the_four_artifact_registry_flags_are_what_helm_gets(self) -> None:
+    def test_every_artifact_registry_flag_is_what_helm_gets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             fake_hack, _ = fake_candidate_tree(tmp, images_exist=True)
             result = run_image_source(fake_hack, rc_commit_sha="")
@@ -172,9 +172,14 @@ class PresubmitPathUnchangedTest(unittest.TestCase):
                 f"platformAgent.deployment.image.repository={_AR_REPO}/platform-agent",
                 "--set-string",
                 f"platformAgent.deployment.image.tag={_PRESUBMIT_TAG}",
+                "--set-string",
+                f"agentSandbox.image.repository={_AR_REPO}/agent-sandbox",
+                "--set-string",
+                f"agentSandbox.image.tag={_PRESUBMIT_TAG}",
             ],
-            "the presubmit's Helm image flags must be exactly what they were "
-            "before RC_COMMIT_SHA existed: every pull request runs this path.",
+            "the presubmit's Helm image flags must name every image the run "
+            "built: every pull request runs this path, and an image left off "
+            "installs whatever the chart defaults to instead of the build.",
         )
 
     def test_the_tag_and_image_exports_are_left_alone(self) -> None:
@@ -211,14 +216,16 @@ class ReleaseCandidatePathTest(unittest.TestCase):
                 f"operator.image.tag={rc_sha}",
                 "--set-string",
                 f"platformAgent.deployment.image.tag={rc_sha}",
+                "--set-string",
+                f"agentSandbox.image.tag={rc_sha}",
             ],
         )
 
     def test_no_flag_names_the_artifact_registry(self) -> None:
         """Stated separately from the equality above because this is the
-        property the credential-proxy sidecar rides on: the operator derives
-        the proxy image from the agent's repository, so overriding that
-        repository moves the proxy to a registry the candidate never
+        property the credential broker rides on: the operator derives the
+        broker's image from the agent's repository, so overriding that
+        repository moves the broker to a registry the candidate never
         published to."""
         with tempfile.TemporaryDirectory() as tmp:
             fake_hack, rc_sha = fake_candidate_tree(tmp, images_exist=True)

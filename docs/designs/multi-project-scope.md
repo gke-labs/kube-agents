@@ -63,7 +63,7 @@ closed on 2026-08-28 with a comment that `main` handles multi-project IAM and re
 natively through Terraform and Helm. It does not: the IAM module above takes one project, and no
 reconciler reads more than one. Epic #618 filed multi-project onboarding as its phase 3 and pointed it at #588.
 #953 (the agent cannot route a request that does not name a cluster) and #1126 (the broker's read
-allowlist withholds discovery reads a leaf read needs) are the same problem seen from the agent's
+allowlist withheld discovery reads a leaf read needs) are the same problem seen from the agent's
 side: the fleet it can enumerate is narrower than the fleet it is asked about.
 
 ## 2. What already generalises
@@ -80,7 +80,7 @@ Cluster Agent is named, stored, or driven:
   for a cluster in another project is verified against the right project today.
 - `create_profile()` fetches credentials with `--project=<P>` (`cluster_agent_profile.py:235-243`).
 - The credential broker passes `--project` through as a value-taking flag
-  (`agents/platform/scripts/command_policy.py:378`), takes the project from the kubeconfig context
+  (`agents/platform/scripts/command_policy.py:392`), takes the project from the kubeconfig context
   name (`credential_proxy.py:1168-1190`), and re-issues `get-credentials` with the target's project
   (`:2496`). It does not pin a project. Only IAM stops a cross-project call.
 - The scoped service account pool is already keyed on a per-row project. `scoped_clusters`
@@ -201,7 +201,7 @@ silently. An organisation policy that forbids the Asset API is an open question 
 path.
 
 The discovery verb is absent from the broker's read allowlist. `GCLOUD_READ_COMMANDS`
-(`command_policy.py:277-363`) admits `container clusters list` and `projects list` but no `asset`
+(`command_policy.py:277-377`) admits `container clusters list` and `projects list` but no `asset`
 command. This is the class of gap #1126 describes: a discovery read the leaf reads depend on,
 refused fail-closed with no signal. Adding `("asset", "search-all-resources")` is part of phase 2, with the resolver that needs it,
 and so is adding `--scope` and `--asset-types` to `_GCLOUD_FLAGS_WITH_VALUE`: the broker refuses a
@@ -447,6 +447,31 @@ account pool's authority (`scoped_pool.tf`, currently granting nothing) before o
 one cluster regardless of how wide discovery is. Until then the design recommends `projects` and
 `folders` for a fleet an operator would be comfortable reading with one account, and documents
 `organizations` as available but wide.
+
+### A scope is one trust domain, by operator assertion
+
+The widening above is about what a credential may read. The scope change also decides what
+happens to what it has read, and the design's answer is that declaring a scope is the
+operator asserting these projects may share findings.
+
+Cross-project reach is not itself new: the broker never pinned a project (§2), the
+`manage-cluster` skill takes `--project` today (§7), and §5's own snapshot example carries
+a profile in another project. What the stock IAM grant did was make an operator arrange
+each one deliberately. A scope makes reading across projects the supported default, and
+the aggregation stage is where that lands — the sweep fans out per cluster, so each Cluster
+Agent's context holds one, but the roll-up in the Platform Agent holds all of them and
+nothing there keeps them apart. For the case this document motivates, one organisation and
+several of its own projects, that is what the operator wants. For a scope drawn across
+projects whose findings should not meet, it is not.
+
+The check is one sentence: _every project in this scope may see every other project's
+findings._ An install that cannot say yes wants two Platform Agents with disjoint scopes,
+which is where §11's cardinality question also points — though disjointness is a
+declaration too, and nothing prevents two installs from declaring overlapping scopes.
+
+Nothing in `spec.scope` verifies any of this. The platform enforces the scope; the trust
+boundary is the operator's claim that the scope is drawn where the trust is. Where those
+diverge, the divergence is silent.
 
 ## 10. Implementation order
 

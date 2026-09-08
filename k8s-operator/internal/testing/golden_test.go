@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -54,6 +55,9 @@ func newTestScheme() *runtime.Scheme {
 	_ = agentv1alpha1.AddToScheme(s)
 	_ = corev1.AddToScheme(s)
 	_ = appsv1.AddToScheme(s)
+	// batchv1: the mode gate's cleanup path lists Jobs on every today-mode
+	// reconcile, which is every golden case.
+	_ = batchv1.AddToScheme(s)
 	_ = networkingv1.AddToScheme(s)
 	_ = policyv1.AddToScheme(s)
 	_ = rbacv1.AddToScheme(s)
@@ -98,18 +102,6 @@ func TestAgentsGolden(t *testing.T) {
 			},
 		},
 		{
-			// The gate on. Diff this against platformagent-tagged.yaml to see
-			// exactly what splitting the credential broker into its own Pod
-			// changes, and nothing else.
-			name:         "PlatformAgentSplitCredentialBroker",
-			inputPath:    filepath.Join("testdata", "platform", "platformagent-split-broker.yaml"),
-			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-split-broker.yaml"),
-			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
-			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
-				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}
-			},
-		},
-		{
 			// The scoped service account pool on. Diff this against
 			// platformagent-tagged.yaml and the whole of what
 			// spec.security.scopedServiceAccounts renders is a ConfigMap key,
@@ -128,7 +120,7 @@ func TestAgentsGolden(t *testing.T) {
 		},
 		{
 			// The egress policy on. Diff this against
-			// platformagent-split-broker.yaml and the whole of what
+			// platformagent-tagged.yaml and the whole of what
 			// spec.security.egressPolicy renders is one NetworkPolicy —
 			// which is the object that has to be read carefully, since an
 			// egress allowlist that is subtly wrong either breaks the agent

@@ -9,11 +9,18 @@
 #   2. A new image appears with no inventory entry. Nothing copies it, and the
 #      air-gapped install fails at pull time on a registry nobody approved.
 #
+# And one that has not happened yet: the Go builder pin matches the inventory
+# but no longer satisfies k8s-operator/go.mod, so the image build fails, or a
+# base without GOTOOLCHAIN=local builds with a toolchain nobody pinned.
+#
 # Run via `make images-check`; CI runs it in validate.yml.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 INVENTORY=images.json
+readonly GO_MOD=k8s-operator/go.mod
+readonly GOLANG_IMAGE_ARG=GOLANG_IMAGE
+readonly GOTOOLCHAIN_PIN='ENV GOTOOLCHAIN=local'
 MIRROR=registry.example.invalid/mirror
 status=0
 
@@ -101,6 +108,52 @@ check_base_image golang deploy/docker/Dockerfile GOLANG_IMAGE GOLANG_VERSION
 check_base_image golang k8s-operator/Dockerfile GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static k8s-operator/Dockerfile DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image python examples/inference-replay/replay-proxy/Dockerfile PYTHON_IMAGE PYTHON_VERSION
+check_base_image python deploy/sandbox/Dockerfile PYTHON_IMAGE PYTHON_VERSION
+
+# The Go builder and k8s-operator/go.mod's `go` directive must name the same
+# major.minor: a builder behind the directive fails the image build (the
+# official golang image sets GOTOOLCHAIN=local, and the Dockerfiles repeat it so
+# a substituted base cannot quietly download a newer toolchain instead, #1138),
+# and a builder ahead of it ships a compiler the directive does not name. A tag
+# that names only a major.minor (`1.27-alpine`) pulls the newest patch from
+# Docker Hub, so equality is the whole check; a mirror populated by
+# `make mirror-images` freezes whichever patch it copied, and a patch-pinned tag
+# (`1.27.3-alpine`) is the answer when the directive outruns that copy. A tag
+# that names a patch or pre-release must also sit at or above the directive.
+# The ENV line is checked too, between the FROM that opens the Go stage and its
+# first RUN: it is the only guard left once a mirror has frozen the patch, and
+# nothing else would notice a reshuffle moving it out of that stage or below the
+# `go build` it has to precede.
+check_go_directive() {
+  local dockerfile=$1 version_arg=$2
+  local builder_tag directive builder_ver builder_mm directive_mm
+  awk -v img="\${$GOLANG_IMAGE_ARG}" '/^FROM / { in_stage = index($0, img) > 0; next } /^RUN / { in_stage = 0 } in_stage' "$dockerfile" |
+    grep -qx "$GOTOOLCHAIN_PIN" ||
+    fail "$dockerfile: no line exactly '$GOTOOLCHAIN_PIN' between the FROM \${$GOLANG_IMAGE_ARG} line and that stage's first RUN, so a substituted $GOLANG_IMAGE_ARG without that default downloads a toolchain the pin does not name instead of failing."
+  builder_tag="$(arg_default "$dockerfile" "$version_arg")"
+  directive="$(sed -n 's/^go[[:space:]][[:space:]]*\([0-9][0-9A-Za-z.]*\).*$/\1/p' "$GO_MOD" | head -n1)"
+  [ -n "$directive" ] || {
+    fail "$GO_MOD has no 'go' directive, so nothing pins the toolchain the operator builds with."
+    return
+  }
+  builder_ver="$(sed -n 's/^\([0-9][0-9A-Za-z.]*\).*$/\1/p' <<<"$builder_tag")"
+  builder_mm="$(sed -n 's/^\([0-9][0-9]*\.[0-9][0-9]*\).*$/\1/p' <<<"$builder_ver")"
+  directive_mm="$(sed -n 's/^\([0-9][0-9]*\.[0-9][0-9]*\).*$/\1/p' <<<"$directive")"
+  [ -n "$builder_mm" ] || {
+    fail "$dockerfile: ARG $version_arg defaults to '${builder_tag:-<unset>}', which does not name a Go major.minor, so nothing ties the builder to the 'go $directive' directive in $GO_MOD."
+    return
+  }
+  [ "$builder_mm" = "$directive_mm" ] || {
+    fail "$dockerfile: ARG $version_arg defaults to '$builder_tag' (Go $builder_mm), but $GO_MOD says 'go $directive' (Go $directive_mm). Move both together: a go.mod ahead of the builder fails the image build, a builder ahead of go.mod ships a compiler the directive does not name."
+    return
+  }
+  [ "$builder_ver" = "$builder_mm" ] ||
+    [ "$(printf '%s\n%s\n' "$directive" "$builder_ver" | sort -V | head -n1)" = "$directive" ] ||
+    fail "$dockerfile: ARG $version_arg defaults to '$builder_tag' (Go $builder_ver), below the 'go $directive' floor in $GO_MOD, so the image build fails under $GOTOOLCHAIN_PIN."
+}
+
+check_go_directive deploy/docker/Dockerfile GOLANG_VERSION
+check_go_directive k8s-operator/Dockerfile GOLANG_VERSION
 
 # hermes-agent is the one base image whose tag lives outside the Dockerfile —
 # the release workflows read tags.env — so the inventory points at that file
@@ -307,6 +360,6 @@ while IFS=$'\t' read -r file line image; do
 done <<<"$integration_refs"
 
 if [ "$status" -eq 0 ]; then
-  echo "Image inventory check passed: $INVENTORY matches every pin, and the chart mirrors cleanly."
+  echo "Image inventory check passed: $INVENTORY matches every pin, the Go builder pin matches $GO_MOD, and the chart mirrors cleanly."
 fi
 exit "$status"

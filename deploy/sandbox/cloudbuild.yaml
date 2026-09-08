@@ -1,0 +1,42 @@
+# Cloud Build for the agent shell sandbox image.
+#
+# Separate from deploy/docker/cloudbuild.yaml rather than a substitution on it:
+# that file hard-codes `--target $_TARGET` and passes HERMES_AGENT_TAG, and the
+# sandbox is a single-stage build from a different Dockerfile that declares
+# neither. Threading both through as optional substitutions would mean an empty
+# `--target ""`, which docker build rejects outright.
+steps:
+  - name: "gcr.io/cloud-builders/docker"
+    entrypoint: "bash"
+    args:
+      - "-c"
+      - "docker pull $_IMAGE_URI_LATEST || true"
+  - name: "gcr.io/cloud-builders/docker"
+    env:
+      - "DOCKER_BUILDKIT=1"
+    args:
+      - "build"
+      # Deployment targets are always amd64 GKE nodes; the multi-arch base
+      # otherwise resolves to the build host (#560).
+      - "--platform"
+      - "linux/amd64"
+      - "-t"
+      - "$_IMAGE_URI"
+      - "-t"
+      - "$_IMAGE_URI_LATEST"
+      - "--cache-from"
+      - "$_IMAGE_URI_LATEST"
+      - "-f"
+      - "deploy/sandbox/Dockerfile"
+      - "--build-arg"
+      - "BUILDKIT_INLINE_CACHE=1"
+      # Context is the repository root: the image ships the credential-proxy
+      # client from agents/platform/scripts/ and the PATH script from
+      # deploy/shared/, which a deploy/sandbox context could not reach.
+      - "."
+images:
+  - "$_IMAGE_URI"
+  - "$_IMAGE_URI_LATEST"
+substitutions:
+  _IMAGE_URI: ""
+  _IMAGE_URI_LATEST: ""

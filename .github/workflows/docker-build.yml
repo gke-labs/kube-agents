@@ -193,3 +193,25 @@ jobs:
           context: examples/inference-replay/replay-proxy
           push: false
           tags: replay-proxy:latest
+
+      # Context is the repository root: the sandbox ships the same
+      # credential-proxy client the agent image does, from its own location.
+      # load: true because the next step runs the image, not just builds it.
+      - name: Build Agent Sandbox
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: deploy/sandbox/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: agent-sandbox:latest
+
+      # A build cannot tell you whether sshd starts, whether the agent's key is
+      # accepted, or whether CREDENTIAL_PROXY_URL reaches the shell — the last
+      # of which depends on sshd's config parser and the session type, and was
+      # wrong in the first version of this image while every static check
+      # passed. The script starts the container and connects to it the way the
+      # agent pod does.
+      - name: Smoke-test Agent Sandbox
+        run: deploy/sandbox/smoke-test.sh agent-sandbox:latest

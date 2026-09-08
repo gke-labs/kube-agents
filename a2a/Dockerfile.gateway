@@ -1,0 +1,24 @@
+# The a2a chatops gateway image.
+#
+# PLAYGROUND POSTURE: static per-component NATS users instead of the auth
+# callout, bot token as a plain Secret, no exporter, no breaker, gateway
+# sweep as the only janitor. Each of these has a decided design in
+# docs/designs/spec-nats-deployment.md and spec-chatops-gateway.md; the auth
+# callout is the product path and stage 2 work. Static creds are the
+# playground, not the product.
+#
+# Build from the a2a/ module root:
+#   docker build -f Dockerfile.gateway -t <registry>/gateway:<tag> .
+
+FROM golang:1.27 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -o /out/gateway ./cmd/gateway
+
+# Distroless nonroot matches the Deployment's runAsNonRoot/runAsUser posture.
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /out/gateway /gateway
+USER nonroot
+ENTRYPOINT ["/gateway"]

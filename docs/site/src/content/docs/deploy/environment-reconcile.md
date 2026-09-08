@@ -20,14 +20,14 @@ running, and people live-test pull requests against them. `rc` and `nightly` are
 the opposite — every pipeline run destroys them and builds them again from
 `terraform/examples/full-install`, so they always run today's composition.
 
-The redeploy workflows that move them are `helm upgrade` on a pre-existing
-release and nothing more, so on their own they carry images and no
-infrastructure: IAM bindings, Pub/Sub topics, node pools, cluster settings and
-the chart values the composition renders all stay where the last apply left
-them. A green redeploy says the images rolled, which reads as "main is
-deployed" and is only half of it.
+Automated deployments to long-lived environments do not use isolated `helm upgrade`
+shortcuts. Instead, `Autopush: Deploy` (`autopush-deploy.yml`) and `Staging: Deploy`
+(`staging-deploy.yml`) drive unified, atomic reconciliations via `reconcile-environment.yml`
+(`upgrade.sh --upgrade-mode=full`). Each deployment updates the Terraform composition,
+IAM bindings, Pub/Sub topics, and Helm release together from the candidate commit, and
+records the deployed image tag directly in Terraform state.
 
-Three things close that gap.
+Three mechanisms keep these environments aligned, verified, and manageable:
 
 ## The scheduled drift report
 
@@ -43,40 +43,30 @@ is open exactly as it is — a failure is not evidence either way, and the red j
 is the signal.
 
 The plan pins no image tag. It holds the tag at whatever the last apply
-recorded, read out of Terraform state, so the report is about infrastructure
-rather than about images being a few commits behind between redeploys.
+recorded, read out of Terraform state (`image_tag: ""`), so the daily report
+detects genuine infrastructure drift (IAM policies, Pub/Sub resources, node pool
+settings, or module inputs) rather than flagging transient container image
+differences between candidate promotion cycles.
 
-State rather than the cluster, and the difference matters: the redeploy
-workflows move the running tag with `helm upgrade` and never run Terraform, so
-planning at the tag the cluster is _serving_ would show every redeploy since the
-last apply as a pending change to `helm_release.kube_agents` — a drift issue
-opening on image lag every day `main` has moved, which never reaches the clean
-plan that would close it. An install whose state predates this (it is published
-as an `image_tag` output) falls back to the running tag and says so in the job
-log; the first reconcile records it and later plans are clean.
+Reading the expected tag from Terraform state rather than live cluster introspection
+ensures the drift report focuses on out-of-band changes to infrastructure.
+An install whose state predates this capability (it is published as an `image_tag`
+Terraform output) falls back to the running cluster tag and notes this in the job log;
+the first subsequent atomic reconcile records the tag into state, after which all plans
+are clean.
 
-## The nightly reconcile
+## Deploying and reconciling long-lived environments
 
-The nightly pipeline applies the composition to both environments once its E2E
-matrix is green — steps 4 and 6 of `nightly-pipeline.yml`. The ordering is the
-point: a composition that has not been proved to build an install from nothing
-does not get applied to an environment people work in.
+Long-lived environments are reconciled and deployed atomically using `./upgrade.sh --upgrade-mode=full`:
 
-The two are reconciled differently, and the difference is deliberate:
+- **staging** is deployed by `Staging: Deploy` (`staging-deploy.yml`), which triggers when the nightly pipeline pushes a `staging_*` tag after its full E2E test matrix passes on a fresh nightly cluster. The workflow reconciles the Terraform composition, Helm release, and container images together atomically from that validated candidate commit.
+- **autopush** is deployed by `Autopush: Deploy` (`autopush-deploy.yml`), which triggers whenever candidate container images are successfully published to GHCR from `main`.
 
-- **staging** is reconciled to the candidate the pipeline is promoting, and
-  **before** the `staging_*` tag is pushed. That tag starts three
-  `helm upgrade`s on the same release `helm_release.kube_agents` owns, so
-  applying afterwards would race them.
-- **autopush** is reconciled with no image tag at all. It tracks `main`'s tip
-  through GHCR publishes, and the pipeline's candidate is older than that;
-  pinning it would roll autopush's images backwards.
-
-A reconcile takes the live-test lease before it applies anything (see
-[`docs/designs/live-test-lease.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/live-test-lease.md)),
-and defers to the next night if somebody else holds it. It
-also waits out any redeploy already in flight, for the same release-lock reason
-as the ordering above.
+A deploy takes the live-test lease before it applies anything (see
+[`docs/designs/live-test-lease.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/live-test-lease.md)).
+Because automated release deploys must not silently drop candidate releases or report
+success on an unapplied commit, lease contention fails loudly (`lease_policy: fail`)
+rather than deferring silently.
 
 Run one by hand with `Shared: Reconcile Environment` (`mode: apply`), or locally
 against your own install with `./upgrade.sh --plan` to see what a reconcile
@@ -118,7 +108,7 @@ takes the gVisor node pool, the Hindsight database, or the Pub/Sub topic behind
 Google Chat with it.
 
 Required for a **plan** as much as for an apply: the reconcile renders `--strict`
-before it branches on the mode, so until an environment carries all ten the daily
+before it branches on the mode, so until an environment carries all twelve the daily
 drift report goes red on it rather than reporting no drift.
 
 | GitHub variable                 | install.env key                 | Notes                                                       |
@@ -133,6 +123,8 @@ drift report goes red on it rather than reporting no drift.
 | `MEMORY_PROVIDER`               | `MEMORY`                        | Absent destroys the Hindsight API and its Postgres          |
 | `USER_PROFILE_ENABLED`          | `USER_PROFILE_ENABLED`          | Absent resets it                                            |
 | `ENABLE_GKE_BACKUP_PLAN`        | `ENABLE_GKE_BACKUP_PLAN`        | Absent destroys the backup plan                             |
+| `ENABLE_PUBSUB_PLATFORM`        | `ENABLE_PUBSUB_PLATFORM`        | Absent destroys Pub/Sub topic, subscription, and IAM grants |
+| `ENABLE_STOCKOUT_INVESTIGATOR`  | `ENABLE_STOCKOUT_INVESTIGATOR`  | Absent destroys log sink and stockout alerts topic/sub      |
 
 Required when the integration they belong to is switched on, because an empty
 allowlist is not "no opinion" — the operator reads an absent list as allow-all,
@@ -191,7 +183,7 @@ destruction stops the apply instead of taking the minter with it.
 
 ## What a rebuild does not preserve
 
-Only relevant to `Shared: Deploy Environment`; the nightly reconcile keeps the
+Only relevant to `Shared: Deploy Environment`; an in-place reconcile keeps the
 cluster and everything on it.
 
 - **KMS key rings survive.** GCP cannot delete them, and `lifecycle.sh adopt-kms`

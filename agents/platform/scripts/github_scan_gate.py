@@ -62,7 +62,6 @@ import re
 import shlex
 import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -70,6 +69,7 @@ from pathlib import Path
 # Siblings in `$HERMES_HOME/scripts`, which is this script's own directory and
 # therefore already `sys.path[0]` when the scheduler runs it.
 import forge
+import gitops_workspace
 import pr_triggers
 
 # Which sweeps run, and in what order, is `SWEEP_ORDER` — derived from the
@@ -88,12 +88,9 @@ RESOLVER_REL = "skills/github-issue-resolver/scripts/resolver.py"
 PLATFORM_PROFILE_DIR = "profiles/platform"
 PLATFORM_TEMPLATE_DIR = "/opt/platform-template"
 
-# The one filesystem both this container and the credential sidecar can see.
-# `resolver.py` and `audit_report.py` pin the same path for the same reason.
-SCRATCH_DIR = "/opt/data/scratch"
-
-# `resolver.py poll` sweeps stale issues before it queries, so it is not a
-# read-only call and its runtime is not bounded by a single request.
+# `resolver.py poll` sweeps stale issues before querying for each repository,
+# so its runtime is not bounded by a single request. Budgeted per managed repository
+# (at least one) so multi-repository sweeps have adequate budget to finish.
 RESOLVER_TIMEOUT_S = 300
 
 # Most worker cards — and most refusals — one tick will produce. A reviewer who
@@ -226,11 +223,17 @@ def run_resolver_poll() -> dict:
     if not script.is_file():
         raise FileNotFoundError(f"resolver not found at {script}")
 
+    try:
+        managed_count = len(gitops_workspace.get_managed_github_repos())
+    except Exception:
+        managed_count = 1
+    timeout = max(1, managed_count) * RESOLVER_TIMEOUT_S
+
     proc = subprocess.run(
         [sys.executable, str(script), "poll"],
         capture_output=True,
         text=True,
-        timeout=RESOLVER_TIMEOUT_S,
+        timeout=timeout,
     )
     # Deliberately not `check=True`: the resolver reports its faults as JSON on
     # stdout, and a non-zero exit with parseable output is still an answer. Only
@@ -336,28 +339,35 @@ def sweep_issues(dry_run: bool = False) -> SweepResult:
         )
     payload = run_resolver_poll()
     status = payload.get("status")
+    unreachable_repos = payload.get("unreachable_repos") or []
+    unreachable_warnings = [
+        f"⚠️ **GitHub issue resolver:** repository unreachable: `{r}`"
+        for r in unreachable_repos
+    ]
 
     if status in ("NO_ISSUES", "NOT_CONFIGURED"):
         # NOT_CONFIGURED is a supported deployment, not a fault: a install with
         # no target repository has nothing to watch and should stay silent.
-        return SweepResult()
+        return SweepResult(warnings=unreachable_warnings)
 
     if status == "FOUND":
-        return SweepResult(cards=[_issue_card(payload)])
+        return SweepResult(cards=[_issue_card(payload)], warnings=unreachable_warnings)
 
     if status == "ERROR":
         reason = payload.get("reason", "unknown")
-        value = payload.get("value")
-        detail = f"{reason}" + (f" ({value})" if value else "")
+        error_val = payload.get("error") or payload.get("value")
+        if not error_val and unreachable_repos:
+            error_val = f"unreachable repositories: {', '.join(unreachable_repos)}"
+        detail = f"{reason}" + (f" ({error_val})" if error_val else "")
         return SweepResult(
-            warnings=[f"⚠️ **GitHub issue resolver is not running:** {detail}"]
+            warnings=[f"⚠️ **GitHub issue resolver is not running:** {detail}"] + unreachable_warnings
         )
 
     return SweepResult(
         warnings=[
             f"⚠️ **GitHub repo watcher:** resolver poll returned an unrecognised "
             f"status `{status}`."
-        ]
+        ] + unreachable_warnings
     )
 
 
@@ -414,53 +424,24 @@ def _max_refusals_per_pr() -> int:
 
 
 def _post_body(provider, repo: str, pr, body: str) -> None:
-    """Post `body` as a comment, via a temp file.
+    """Post `body` as a comment.
 
-    `post_comment` takes a path rather than a string on purpose — see its
-    docstring — so the caller owns the file. Deleted on the way out whether or
-    not the post succeeded; the content is a copy of what is now on GitHub.
+    A one-line delegation, kept as a named function because what it does not do
+    is the point. It used to stage the body in a file on a volume the credential
+    sidecar also mounted, and every part of that was a way to fail: `/tmp` is a
+    per-container emptyDir, so a `--body-file /tmp/…` path named a file the
+    other container could not open (observed live); the shared scratch
+    directory fixed that but then needed an `fchmod` 0o664 because #955 gave the
+    two containers different uids; and when the volume was absent the fallback
+    to the system temp directory turned a fixable mount problem into a
+    guaranteed failure that read as a graceful degrade (#1030).
 
-    The file goes in the shared scratch directory, **not** `/tmp`. `gh` here is
-    a shim that POSTs argv to the credential sidecar, which runs the real `gh`
-    in its own filesystem; `/tmp` is a per-container emptyDir, so a
-    `--body-file /tmp/…` path names a file the other container cannot open. The
-    refusal then fails with "no such file" — observed live before this moved.
-    `audit_report._write_temp` documents the same trap, and a second one: since
-    #955 the sandbox (uid 10000) and the sidecar (uid 10001) are different
-    users, so the 0600 file `NamedTemporaryFile` creates must be `fchmod`ed
-    group-readable or the sidecar cannot open it even on the shared volume.
-
-    NO fallback to the system temp directory when the volume is absent: the
-    sidecar can never see this container's private tmp, so in-cluster that
-    fallback turned a fixable mount problem into a guaranteed failure that read
-    as a graceful degrade (#1030). Raise instead — the per-sweep try in `main`
-    turns it into a warning the room sees. Tests patch SCRATCH_DIR.
+    None of it survives the split into separate pods. There is no volume both
+    sides mount, so `post_comment` takes the text and sends it on fd 0, which
+    is the one channel that crosses a pod boundary. `audit_report.BODY_STDIN`
+    took the same exit from the other side.
     """
-    try:
-        Path(SCRATCH_DIR).mkdir(parents=True, exist_ok=True)
-        handle = tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", suffix=".md", delete=False, dir=SCRATCH_DIR
-        )
-    except OSError as exc:
-        raise RuntimeError(
-            "publish path broken: cannot stage a body file in the shared "
-            f"scratch directory {SCRATCH_DIR} (uid {os.getuid()}): {exc}. "
-            "The credential sidecar resolves body-file paths in its own "
-            "filesystem, so a container-private temp file can never work — "
-            "fix the shared mount/permissions (see gke-labs/kube-agents#1030)."
-        ) from exc
-    try:
-        # Group-readable across the #955 uid split; owner-only is unreadable
-        # to the sidecar that actually runs `gh`.
-        os.fchmod(handle.fileno(), 0o664)
-        handle.write(body)
-        handle.close()
-        provider.post_comment(repo, pr, handle.name)
-    finally:
-        try:
-            os.unlink(handle.name)
-        except OSError:
-            pass
+    provider.post_comment(repo, pr, body)
 
 
 def _pr_card(pr, triggers: list, repo: str, now: datetime | None = None) -> Card:

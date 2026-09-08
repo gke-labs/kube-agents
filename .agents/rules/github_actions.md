@@ -20,7 +20,7 @@ mails the fork owner. Put the guard on each job rather than trusting the skip to
 `needs`; an `always()` added later removes the implicit `success()` and the job runs anyway.
 
 Two classes need no guard: a workflow reachable only through `workflow_call` is gated by its caller
-(`reusable-deploy-*.yml`), and a `workflow_dispatch`-only one runs only when someone deliberately
+(`reconcile-environment.yml`, `teardown-environment.yml`), and a `workflow_dispatch`-only one runs only when someone deliberately
 starts it (`rc-create-tag.yml`, `deploy-environment.yml`, `rc-tag-validated.yml`,
 `e2e-gchat-test.yml`). `docs-deploy.yml` is push-triggered and deliberately unguarded, so a fork
 can publish its own Pages site.

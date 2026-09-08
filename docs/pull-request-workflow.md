@@ -10,8 +10,8 @@ review passes, live-test the change, resolve every thread — is stated in
 out. When the two disagree, `AGENTS.md` is right and this page needs fixing.
 
 A rule about how to run a command correctly can sit here rather than in `AGENTS.md`, because it
-means nothing until you have the command in front of you — that a contributor on a fork cannot
-self-assign an issue is the example. The test is when a rule has to fire, though, not how
+means nothing until you have the command in front of you — that self-assigning an issue needs
+`triage` access is the example. The test is when a rule has to fire, though, not how
 procedural it sounds: that a draft is not in the review queue reads like mechanics, but it has to
 reach an agent before it decides to wait, so `AGENTS.md` states it and only the measurement behind
 it is here. `AGENTS.md` is loaded into every session and this page is not, so anything that has to
@@ -58,8 +58,8 @@ gh issue edit <number> --repo gke-labs/kube-agents --add-assignee @me
 ```
 
 `@me` is the account whose token you hold, and `AGENTS.md` is explicit that this makes it a person
-you are volunteering. A contributor working from a fork without write access cannot self-assign at
-all; offer a comment instead.
+you are volunteering. A contributor without `triage` access cannot self-assign; offer a comment
+instead.
 
 ## Measure how far a branch has drifted from `main`
 
@@ -211,7 +211,10 @@ gh api repos/gke-labs/kube-agents/pulls/<number>/comments/<comment-id>/replies \
 ## Resolving conversations
 
 Reply first — `AGENTS.md` says why — naming what changed and the commit that changed it. Then
-resolve:
+resolve. A pull request carrying both `lgtm` and `approved` with a thread still open also carries
+the `do-not-merge` label,
+applied by a workflow so that Tide does not spend the queue retrying a merge GitHub will refuse;
+resolving the last thread is what removes it ([how a change merges](#how-a-change-merges)).
 
 ```bash
 # Every unresolved thread, with both ids you need: resolveReviewThread takes the
@@ -294,7 +297,15 @@ Prow's jobs, not the GitHub Actions checks, so a pull request can look fully gre
 waiting on it.
 
 `/hold` parks an otherwise-mergeable pull request without withdrawing anything else, and
-`/hold cancel` releases it — #1045 held that way for a smoke test. `/override <context>`, which only
+`/hold cancel` releases it — #1045 held that way for a smoke test. The bare `do-not-merge` label is
+a different thing: [`hold-unresolved-threads.yml`](../.github/workflows/hold-unresolved-threads.yml)
+puts it on any pull request in the pool whose review threads are not all resolved, and takes it off
+at the next five-minute sweep after the last resolution. Tide does not read the
+conversation-resolution rule, so without the label it picks such a pull request, fails the merge,
+and retries it every ~85 seconds ahead of everyone else — #608 and #1197 held the queue that way
+for an hour on 2026-09-05. `/hold cancel` does not remove this label; resolving the threads does.
+A person who applies the same label by hand keeps it: the workflow removes only what it added.
+`/override <context>`, which only
 a repository admin can use, forces a required check that cannot pass on its own — and expires: the
 forced status embeds the base SHA at override time, so the next merge to `main` invalidates it,
 Tide re-runs the job, and the override has to be repeated if `main` moves before Tide merges
@@ -357,7 +368,7 @@ on the querying user. #1065 read `BLOCKED` while carrying both labels and while 
 merge attempt that failed — an unresolved review thread, most often — is retried every ~85
 seconds and recorded only in the `err` field of
 [tide-history](https://oss.gprow.dev/tide-history); #1122 sat approved for 5h46m and 231
-attempts that way.
+attempts that way — the case the `do-not-merge` label above now keeps out of the pool.
 
 ```bash
 # Why Tide has not merged it: its own reason first, then the labels it wants.

@@ -129,12 +129,20 @@ jobs:
       packages: write
       id-token: write
     steps:
+      - name: Generate Release Bot Token
+        id: release-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_APP_PRIVATE_KEY }}
+          permission-contents: write
+
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: refs/heads/main
           fetch-depth: 0
-          token: ${{ secrets.RELEASE_BOT_TOKEN }}
+          token: ${{ steps.release-token.outputs.token }}
 
       - name: Calculate Next Release Version
         id: calculate-version
@@ -163,7 +171,7 @@ jobs:
           RC_CANDIDATE_COMMIT: ${{ steps.calculate-version.outputs.rc_candidate_commit }}
           SKIP_STAGING_VALIDATION: ${{ inputs.skip_staging_validation }}
           EMERGENCY_OVERRIDE_REASON: ${{ inputs.emergency_override_reason }}
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
         run: ./scripts/release/verify_release_eligibility.sh
 
       - name: Create Git Tag
@@ -171,7 +179,7 @@ jobs:
         env:
           RELEASE_VERSION: ${{ steps.calculate-version.outputs.release_version }}
           RC_CANDIDATE_COMMIT: ${{ steps.calculate-version.outputs.rc_candidate_commit }}
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
         run: ./scripts/release/tag_ga_release.sh
 
       - name: Set up Docker Buildx
@@ -212,13 +220,13 @@ jobs:
         if: steps.verify-eligibility.outputs.skip_release != 'true'
         env:
           RELEASE_VERSION: ${{ steps.calculate-version.outputs.release_version }}
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_USER: ${{ github.actor }}
         run: ./scripts/release/publish_helm_chart.sh
 
       - name: Install Syft
         if: steps.verify-eligibility.outputs.skip_release != 'true'
-        uses: anchore/sbom-action/download-syft@f325610c9f50a54015d37c8d16cb3b0e2c8f4de0 # v0.18.0
+        uses: anchore/sbom-action/download-syft@aa80c8c5bd439a416a62804f2151ab38c671a638 # v0.24.1
         with:
           syft-version: "v1.51.1"
 
@@ -238,5 +246,5 @@ jobs:
         if: steps.verify-eligibility.outputs.skip_release != 'true'
         env:
           RELEASE_VERSION: ${{ steps.calculate-version.outputs.release_version }}
-          GH_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
         run: ./scripts/release/publish_github_release.sh

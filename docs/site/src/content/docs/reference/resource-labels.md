@@ -14,6 +14,12 @@ kubectl get all,configmap,pvc,serviceaccount,secret -A \
   -l app.kubernetes.io/part-of=kube-agents
 ```
 
+One deliberate carve-out: controller output rendered under the unsupported `mode: next` dev
+toggle carries `part-of: a2a-next` instead, plus a `kubeagents.x-k8s.io/a2a-component` label,
+so the A2A stack is one query of its own
+(`-l app.kubernetes.io/part-of=a2a-next`) and the query above keeps meaning "the supported
+install" exactly.
+
 ## The label contract
 
 Every install path sets `name`, `instance`, `part-of`, and `managed-by`:
@@ -36,6 +42,15 @@ apart. Its objects carry `app.kubernetes.io/component: api` or `postgresql`, and
 load-bearing rather than decorative: the Deployment and StatefulSet selectors, the `NetworkPolicy`
 that lets only the API reach port 5432, and the `PodMonitoring` that must scrape the API and not the
 database are all built from them. Do not add `component` anywhere else on the strength of this.
+
+One more source exists in the tree but is dark by default: the a2a chatops gateway
+(`a2a/gateway/spawn.go`) stamps `app.kubernetes.io/component: a2a-session` and
+`app.kubernetes.io/part-of: a2a-next` on the session pods it spawns — and it spawns none until
+`A2A_SPAWN_SESSIONS` is set, which nothing renders yet. The values are load-bearing the same way
+Hindsight's are: the gateway's session cap counts pods and its sweeper lists them by exactly this
+pair. `part-of` is deliberately not `kube-agents`: a session pod is spawned per conversation at
+runtime rather than installed, so it stays out of the footprint query above and is reaped by its
+ownerReference to the gateway Deployment, not by uninstall.
 
 `version` is set only by the Helm chart, which fills it from `Chart.AppVersion` — a chart release
 is pinned to exactly one application release, so there is a correct value to write. See

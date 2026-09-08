@@ -230,6 +230,23 @@ class PersistStateVarTest(unittest.TestCase):
                     f"Enclosing blocks were: {enclosing[:3]}",
                 )
 
+    def test_health_verification_covers_the_pods_that_run_the_commands(self):
+        """A healthy gateway is not a working install.
+
+        The agent executes nothing in its own pod: shell commands go to the
+        sandbox StatefulSet over ssh and credentialed ones through the proxy.
+        Step 5 verified the gateway alone, so an upgrade that left either of
+        those unready still printed "verified healthy" -- and the symptom
+        arrives later, as an agent that cannot run kubectl.
+        """
+        source = _UPGRADE_SH.read_text()
+        for target in (
+            "statefulset/platform-agent-shell",
+            "deployment/platform-agent-credential-proxy",
+        ):
+            with self.subTest(target=target):
+                self.assertIn(f"kubectl rollout status {target}", source)
+
     def test_an_install_env_only_install_still_records_the_override(self):
         """The guard must not lose the override, only the file write: the
         exports right after are what the rest of the run reads."""
@@ -383,6 +400,22 @@ class InteractiveImageTagPromptTest(unittest.TestCase):
         for forbidden in ("get-credentials", "terraform", "helm"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, out)
+
+    def test_upgrade_invokes_ensure_clean_helm_release(self):
+        text = (_REPO_ROOT / "upgrade.sh").read_text()
+        self.assertIn('ensure_clean_helm_release kube-agents "$target_namespace"', text)
+
+    def test_upgrade_confirms_agent_image_before_rollout_status(self):
+        text = (_REPO_ROOT / "upgrade.sh").read_text()
+        confirm_idx = text.index('confirm_agent_image.sh" "$target_namespace" platform-agent-gateway')
+        rollout_idx = text.index('rollout status deployment/platform-agent-gateway')
+        self.assertLess(confirm_idx, rollout_idx)
+
+    def test_upgrade_confirms_agent_image_scoped_to_harness_and_full_modes(self):
+        text = (_REPO_ROOT / "upgrade.sh").read_text()
+        self.assertIn('[ "$PARAM_UPGRADE_MODE" = "harness" ] || [ "$PARAM_UPGRADE_MODE" = "full" ]', text)
+        self.assertIn('kubectl get deployment platform-agent-gateway -n "$target_namespace"', text)
+
 
 
 if __name__ == "__main__":

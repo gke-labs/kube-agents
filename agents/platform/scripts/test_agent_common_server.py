@@ -170,12 +170,12 @@ class TestResolveAgentCredentials(unittest.TestCase):
 class TestRunEnvInheritanceContract(unittest.TestCase):
     """`_run_env` hands a child the caller's whole environment.
 
-    Sound only while the sandbox container holds no credentials worth passing
+    Sound only while the agent container holds no credentials worth passing
     on. The canonical statement of why that holds is
     docs/credential-isolation-design.md, "The loopback-only exception".
 
     The Go side already guards the obvious version of this: TestBuildDeployment
-    in platformagent_manifests_test.go walks the sandbox container's `env` and
+    in platformagent_manifests_test.go walks the agent container's `env` and
     fails on any entry whose `valueFrom` names a secretKeyRef outside the
     two-name allowlist, and TestAgentsGolden fails alongside it. This is not a
     substitute for either. It buys two narrower things:
@@ -184,7 +184,7 @@ class TestRunEnvInheritanceContract(unittest.TestCase):
       loop, which only walks `env`. TestAgentsGolden does catch the render
       diff -- but as a golden mismatch, which `go test ./internal/testing
       -update` absorbs. Add one line to the operator, regenerate, and every key
-      of platform-agent-secrets is in the sandbox with the whole Go suite green.
+      of platform-agent-secrets is on the agent with the whole Go suite green.
       That is the hole checked below.
     - When someone does widen the allowlist deliberately -- change the
       operator, update the Go list, regenerate the golden with
@@ -201,19 +201,28 @@ class TestRunEnvInheritanceContract(unittest.TestCase):
     # chat identities, which has to be here because the hashing is here.
     # Neither grants access to any external system.
     EXPECTED = {"SESSION_KV_API_KEY", "SESSION_KV_SALT"}
-    SANDBOX_CONTAINER = "platform-agent"
+    # The container `_run_env` itself runs in. It is not the shell sandbox --
+    # that is a StatefulSet of its own and holds no Secret at all -- but it is
+    # the process that spawns children with the whole environment, so it is the
+    # one whose Secret-backed env this class is about.
+    AGENT_DEPLOYMENT = "platformagent-gateway"
+    AGENT_CONTAINER = "platform-agent"
+    # A Deployment of its own, always. The pod is the smallest unit that has an
+    # IP and an IP is what GKE resolves Workload Identity by, so a proxy sharing
+    # the gateway Pod would share the agent's identity along with it.
+    PROXY_DEPLOYMENT = "platformagent-credential-proxy"
     PROXY_CONTAINER = "envoy-credential-proxy"
-    # A credential the proxy holds and the sandbox must never see. Named
-    # rather than counted: SESSION_KV_API_KEY is on both containers, so
-    # "the proxy has some Secret-backed env" is satisfied by a pod-scoped
-    # value and would stay true after the last real credential left.
-    PROXY_CREDENTIAL = "API_SERVER_EXTERNAL_KEY"
+    # What the proxy holds that the agent must never reach: the ServiceAccount
+    # token it authenticates to Google with, and the state dir it writes minted
+    # tokens and regenerated kubeconfigs into. Named rather than counted,
+    # because the proxy also mounts volumes the agent legitimately shares.
+    PROXY_ONLY_VOLUMES = {"credential-proxy-ksa-token", "credential-proxy-state"}
     GOLDEN = (
         Path(__file__).resolve().parents[3]
         / "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml"
     )
 
-    def _container(self, name):
+    def _containers(self, deployment):
         if not self.GOLDEN.exists():
             self.fail(
                 f"golden manifest not found at {self.GOLDEN}. This test reads the "
@@ -221,19 +230,29 @@ class TestRunEnvInheritanceContract(unittest.TestCase):
                 "— do not delete this test.")
         with self.GOLDEN.open() as handle:
             docs = [d for d in yaml.safe_load_all(handle) if d]
-        deployments = [d for d in docs if d.get("kind") == "Deployment"]
+        deployments = [
+            d for d in docs
+            if d.get("kind") == "Deployment" and d["metadata"]["name"] == deployment
+        ]
         self.assertEqual(
             len(deployments), 1,
-            f"expected one Deployment in {self.GOLDEN.name}, found {len(deployments)}")
+            f"expected one Deployment named {deployment!r} in {self.GOLDEN.name}, "
+            f"found {len(deployments)}; the golden holds "
+            f"{[d['metadata']['name'] for d in docs if d.get('kind') == 'Deployment']}. "
+            "If it was renamed, update the constant on this class — do not delete "
+            "this test.")
         pod = deployments[0]["spec"]["template"]["spec"]
-        # Both lists: the credential proxy is a native sidecar, so it lives in
-        # initContainers with restartPolicy: Always rather than in containers.
-        containers = pod.get("containers", []) + pod.get("initContainers", [])
+        # Both lists, because a native sidecar lives in initContainers with
+        # restartPolicy: Always rather than in containers.
+        return pod.get("containers", []) + pod.get("initContainers", [])
+
+    def _container(self, deployment, name):
+        containers = self._containers(deployment)
         for container in containers:
             if container.get("name") == name:
                 return container
         self.fail(
-            f"no container named {name!r} in the golden; found "
+            f"no container named {name!r} in {deployment}; found "
             f"{[c.get('name') for c in containers]}. If it was renamed, update the "
             "constant on this class — do not delete this test.")
 
@@ -245,11 +264,16 @@ class TestRunEnvInheritanceContract(unittest.TestCase):
             if (env.get("valueFrom") or {}).get("secretKeyRef")
         }
 
-    def test_the_sandbox_holds_only_the_two_pod_scoped_secrets(self):
+    @staticmethod
+    def _mounts(container):
+        return {mount["name"] for mount in container.get("volumeMounts", [])}
+
+    def test_the_agent_holds_only_the_two_pod_scoped_secrets(self):
         self.assertEqual(
-            self._secret_backed(self._container(self.SANDBOX_CONTAINER)),
+            self._secret_backed(
+                self._container(self.AGENT_DEPLOYMENT, self.AGENT_CONTAINER)),
             self.EXPECTED,
-            "The sandbox container's Secret-backed environment changed. "
+            "The agent container's Secret-backed environment changed. "
             "_run_env in agent_common_server.py passes the whole environment to "
             "every gcloud/kubectl/hermes child it spawns, and its docstring "
             "cites this exact set as the reason that is safe. If the new "
@@ -258,17 +282,18 @@ class TestRunEnvInheritanceContract(unittest.TestCase):
             "credential, it belongs in the credential-proxy container, or "
             "_run_env's call sites need an explicit allowlist.")
 
-    def test_the_sandbox_bulk_mounts_no_secret(self):
+    def test_the_agent_bulk_mounts_no_secret(self):
         # The half the Go allowlist loop cannot see: it walks `env` only, so an
         # `envFrom.secretRef` puts every key of a Secret into this container
         # with TestBuildDeployment still green.
+        agent = self._container(self.AGENT_DEPLOYMENT, self.AGENT_CONTAINER)
         bulk = [
-            source for source in self._container(self.SANDBOX_CONTAINER).get("envFrom", [])
+            source for source in agent.get("envFrom", [])
             if source.get("secretRef")
         ]
         self.assertEqual(
             bulk, [],
-            "The sandbox container bulk-mounts a Secret through envFrom, which "
+            "The agent container bulk-mounts a Secret through envFrom, which "
             "puts every key in it into the environment _run_env hands to each "
             "child. Name the variables individually under `env` so the allowlist "
             "above and the Go one both see them.")
@@ -276,15 +301,30 @@ class TestRunEnvInheritanceContract(unittest.TestCase):
     def test_the_credential_proxy_is_where_real_credentials_live(self):
         # Keeps the test above from passing for the wrong reason. If a refactor
         # moved credentials out of the proxy, the next question is whether they
-        # landed in the sandbox, and the sandbox assertion alone reads the same
+        # landed on the agent, and the agent assertion alone reads the same
         # either way.
-        secret_backed = self._secret_backed(self._container(self.PROXY_CONTAINER))
-        self.assertIn(
-            self.PROXY_CREDENTIAL, secret_backed,
-            f"{self.PROXY_CREDENTIAL} is no longer Secret-backed on the "
-            f"{self.PROXY_CONTAINER} container (found {sorted(secret_backed)}). "
-            "If credentials moved, they must not have moved into the sandbox; "
-            "update PROXY_CREDENTIAL to whichever one now anchors this.")
+        proxy = self._mounts(self._container(self.PROXY_DEPLOYMENT, self.PROXY_CONTAINER))
+        self.assertEqual(
+            self.PROXY_ONLY_VOLUMES, self.PROXY_ONLY_VOLUMES & proxy,
+            f"the {self.PROXY_CONTAINER} container no longer mounts "
+            f"{sorted(self.PROXY_ONLY_VOLUMES - proxy)} (it mounts {sorted(proxy)}). "
+            "If credentials moved, they must not have moved onto the agent; "
+            "update PROXY_ONLY_VOLUMES to whichever volumes now carry them.")
+
+    def test_no_container_in_the_gateway_pod_mounts_what_the_proxy_holds(self):
+        # The proxy is in a Pod of its own, so the volumes it holds credentials
+        # on are unreachable from here — but "unreachable" is one `volumeMounts`
+        # entry away from being untrue, and a Secret projected into the gateway
+        # Pod is readable by `_run_env`'s children whatever the network policy
+        # says.
+        for container in self._containers(self.AGENT_DEPLOYMENT):
+            with self.subTest(container=container["name"]):
+                shared = self.PROXY_ONLY_VOLUMES & self._mounts(container)
+                self.assertEqual(
+                    set(), shared,
+                    f"{container['name']} in {self.AGENT_DEPLOYMENT} mounts "
+                    f"{sorted(shared)}, which is where the credential proxy keeps "
+                    "what the agent must never read.")
 
 
 if __name__ == "__main__":
