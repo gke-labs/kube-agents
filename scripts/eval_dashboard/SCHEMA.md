@@ -266,3 +266,18 @@ token observed in the wild (`pass`, `fail`, `infra`, `blocked`):
 | 2094432646640701440 | PR 1057 — parallel fan-out, green, one infra rep |
 | 2094467976156680192 | PR 1075 — serial markers, aborted mid-task       |
 | 2094714569262895104 | PR 1089 — blocked/infra-heavy, >300-char reasons |
+
+`testdata_health/data.json.gz` is a **real** published `data.json` reduced by
+`health.py --trim` (and gzip-compressed, which `health.py --data` reads by
+suffix) to the runs that finished in [2026-09-01, 2026-09-09) — the last of
+them on 2026-09-08 — and the fields the health adjudicator reads (`build_id`,
+`pr`, `started`, `finished`, `result`, `duration_s`, and per task `name`,
+`result`, `reps[].result` and the first 96 characters of `reps[].reason`);
+its `trimmed` key records the source and the cut. Six of its zero-task runs
+carry `result: "failure"` in lowercase, as Prow wrote them on 2026-09-05 —
+the one departure from the `result` vocabulary above seen in the wild, so
+consumers compare it case-insensitively. `testdata_health/roster-history.json` is the
+`BOOTSTRAP_ADMITTED` roster per era over the same week, taken from the
+commits that changed it. Together they are the replay fixture
+`scripts/test_eval_dashboard_health.py` asserts the week's incident
+timeline against.

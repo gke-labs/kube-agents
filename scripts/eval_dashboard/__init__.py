@@ -9,4 +9,9 @@ computed from data.json alone -- the two optional extra inputs are
 `case-notes.yaml` (human one-line annotations, issue links and badges per
 case) and `events.yaml` (dated event markers plus the human-classified
 catch and false-red counts); render.py's docstring owns the details.
+
+Two more readers of the same data.json live here: `health.py` decides
+whether the presubmit gate is GREEN / DEGRADED / OUTAGE and why, and
+`post_health.py` tells a Google Chat space when that changes.
+docs/ci-health.md is the page for both.
 """

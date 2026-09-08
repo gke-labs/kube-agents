@@ -1,0 +1,79 @@
+[
+  {
+    "since": "2026-08-28T16:02:36+00:00",
+    "commit": "f1908801 feat(bench): the scoring engine (#925)",
+    "admitted": [
+      "gpu-stress-test-diagnosis"
+    ]
+  },
+  {
+    "since": "2026-09-01T21:41:58+00:00",
+    "commit": "6cae20df feat(gate): admit the thirteen cases whose record earned blocking (#1096)",
+    "admitted": [
+      "reliability-pdb-probe",
+      "security-overgrant-probe",
+      "upgrades-lagging-master-probe",
+      "consistency-authorized-networks-probe",
+      "cost-idle-pool-probe",
+      "obtainability-remediation-proposal",
+      "rca-remediation-pr",
+      "compliance-rbac-overgrant",
+      "cluster-agent-crashloop-debug",
+      "cluster-agent-crashloop-misleading-symptom",
+      "cluster-agent-crashloop-evidence-chain",
+      "gpu-stress-test-diagnosis",
+      "agent-kanban-smoke"
+    ]
+  },
+  {
+    "since": "2026-09-02T18:51:48+00:00",
+    "commit": "33d2abf3 ci(gate): demote compliance-rbac-overgrant (#1171) (#1173)",
+    "admitted": [
+      "reliability-pdb-probe",
+      "security-overgrant-probe",
+      "upgrades-lagging-master-probe",
+      "consistency-authorized-networks-probe",
+      "cost-idle-pool-probe",
+      "obtainability-remediation-proposal",
+      "rca-remediation-pr",
+      "cluster-agent-crashloop-debug",
+      "cluster-agent-crashloop-misleading-symptom",
+      "cluster-agent-crashloop-evidence-chain",
+      "gpu-stress-test-diagnosis",
+      "agent-kanban-smoke"
+    ]
+  },
+  {
+    "since": "2026-09-02T21:40:59+00:00",
+    "commit": "6850bcf6 fix(gate): demote rca-remediation-pr (#1189) (#1190)",
+    "admitted": [
+      "reliability-pdb-probe",
+      "security-overgrant-probe",
+      "upgrades-lagging-master-probe",
+      "consistency-authorized-networks-probe",
+      "cost-idle-pool-probe",
+      "obtainability-remediation-proposal",
+      "cluster-agent-crashloop-debug",
+      "cluster-agent-crashloop-misleading-symptom",
+      "cluster-agent-crashloop-evidence-chain",
+      "gpu-stress-test-diagnosis",
+      "agent-kanban-smoke"
+    ]
+  },
+  {
+    "since": "2026-09-04T13:53:35+00:00",
+    "commit": "077e206b perf(ci): drop the two tofu cases from presubmit (#1218)",
+    "admitted": [
+      "reliability-pdb-probe",
+      "security-overgrant-probe",
+      "upgrades-lagging-master-probe",
+      "consistency-authorized-networks-probe",
+      "cost-idle-pool-probe",
+      "obtainability-remediation-proposal",
+      "cluster-agent-crashloop-debug",
+      "cluster-agent-crashloop-misleading-symptom",
+      "cluster-agent-crashloop-evidence-chain",
+      "agent-kanban-smoke"
+    ]
+  }
+]
