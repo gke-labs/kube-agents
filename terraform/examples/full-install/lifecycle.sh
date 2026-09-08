@@ -543,10 +543,43 @@ forget_kms() {
   done
 }
 
+# When create_cluster = false, the gke-cluster module manages no cluster KMS
+# resources (local.manage_kms = false), giving them count = 0. If a prior
+# attempt created the KMS key and keyring before failing, or if an apply was
+# interrupted, those resources remain in state. Applying with create_cluster=false
+# would therefore plan their destruction, scheduling the key versions for
+# destruction in Cloud KMS and corrupting the live cluster's etcd encryption.
+# Forgetting these keeps them untouched in GCP, and restore_key_versions recovers
+# any version already pending destruction.
+forget_unmanaged_cluster_kms() {
+  [[ "$(tfvar create_cluster)" == "false" ]] || return 0
+  load_state
+  local address
+  for address in \
+    "module.gke_cluster.google_kms_crypto_key.gke_key[0]" \
+    "module.gke_cluster.google_kms_key_ring.gke_keyring[0]" \
+    "module.gke_cluster.google_kms_crypto_key_iam_member.gke_kms_binding[0]" \
+    "module.gke_cluster.google_project_service_identity.gke_service_agent[0]"; do
+    in_state "$address" || continue
+    log "forgetting $address (create_cluster=false; kept in GCP so apply does not destroy it)"
+    terraform state rm "$address" >/dev/null 2>&1 ||
+      warn "could not forget $address; its key versions may be scheduled for destruction"
+  done
+
+  local project location keyring key id
+  project=$(tfvar project_id)
+  location=$(sed -E 's/-[a-z]$//' <<<"$(tfvar location)")
+  keyring=$(tfvar kms_keyring_name)
+  key=$(tfvar kms_key_name)
+  id="projects/$project/locations/$location/keyRings/$keyring/cryptoKeys/$key"
+  restore_key_versions "$id" "$location" "$project"
+}
+
 case "${1:-}" in
   adopt-kms)
     shift
     ensure_init
+    forget_unmanaged_cluster_kms
     adopt_kms
     ;;
   plan)
@@ -576,6 +609,7 @@ case "${1:-}" in
     shift
     ensure_init
     guard_cluster_ownership
+    forget_unmanaged_cluster_kms
     adopt_kms
     adopt_pubsub
     log "terraform apply"

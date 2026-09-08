@@ -1626,9 +1626,31 @@ ensure_existing_cluster_cmek() {
   local key_resource="projects/${project_id}/locations/${kms_location}/keyRings/${keyring}/cryptoKeys/${key}"
   print_info "Enabling CMEK database encryption on existing cluster '$cluster_name' (key: $key_resource)..."
   gcloud services enable cloudkms.googleapis.com --project="$project_id"
-  gcloud kms keyrings create "$keyring" --location="$kms_location" --project="$project_id" 2>/dev/null || true
-  gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
-    --purpose="encryption" --project="$project_id" 2>/dev/null || true
+  if ! gcloud kms keyrings describe "$keyring" --location="$kms_location" --project="$project_id" >/dev/null 2>&1; then
+    local kr_attempt=0
+    while [ "$kr_attempt" -lt 5 ]; do
+      if gcloud kms keyrings create "$keyring" --location="$kms_location" --project="$project_id" 2>/dev/null; then
+        break
+      fi
+      kr_attempt=$((kr_attempt + 1))
+      sleep 2
+    done
+  fi
+  if ! gcloud kms keys describe "$key" --keyring="$keyring" --location="$kms_location" --project="$project_id" >/dev/null 2>&1; then
+    local k_attempt=0
+    while [ "$k_attempt" -lt 5 ]; do
+      if gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
+        --purpose="encryption" --project="$project_id" 2>/dev/null; then
+        break
+      fi
+      k_attempt=$((k_attempt + 1))
+      sleep 2
+    done
+  fi
+  if ! gcloud kms keys describe "$key" --keyring="$keyring" --location="$kms_location" --project="$project_id" >/dev/null 2>&1; then
+    print_error "Failed to create or verify Cloud KMS key: $key_resource"
+    return 1
+  fi
   local project_number service_agent
   project_number=$(gcloud projects describe "$project_id" --format="value(projectNumber)")
   service_agent="service-${project_number}@container-engine-robot.iam.gserviceaccount.com"
