@@ -16,6 +16,10 @@ dependencies = [
     # this harness requires, plus #47's deterministic verification -- the
     # `resource_property` verifier the upstream tasks score with.
     "devops-bench @ git+https://github.com/kubernetes-sigs/devops-bench@4670d76dcc497e8f515d51c2bb6bad6ced7100b6",
+    # Opt-in disk replay of the opening agent turn (harness.py
+    # _post_opening_turn); inert until CACHED_RESPONSE_MODE is set, and a
+    # graded run must never set it.
+    "cached-response>=0.1",
     # Runtime, not test-only, since `bench-gate` landed: the gate parses
     # task.yaml itself (kube_agents_bench/cases.py) to decide a case's
     # deployer, whether it declares checks, and whether it is expected-fail.

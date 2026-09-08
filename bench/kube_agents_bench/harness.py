@@ -43,6 +43,7 @@ Environment:
 from __future__ import annotations
 
 import atexit
+import contextvars
 import http.client
 import json
 import logging
@@ -60,6 +61,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from cached_response import cached_llm_response
 from devops_bench.agents import AgentHarness, AgentResult
 
 from kube_agents_bench import transcript
@@ -425,6 +427,12 @@ _POLL_PROMPT = (
     "include its complete result in your reply."
 )
 
+# What _post_turn recognizes a status turn by: every poll is built from
+# _POLL_PROMPT verbatim, so its literal prefix (up to the first placeholder)
+# is deterministic. A task prompt that happened to share it would merely run
+# uncached — the safe direction.
+_STATUS_TURN_PREFIX = _POLL_PROMPT.split("{", 1)[0]
+
 # Ceiling on cards awaited at once. The card list grows the poll prompt and the
 # run record on every turn, so an agent looping on kanban_create would inflate
 # both without bound. Far above any real fan-out.
@@ -677,17 +685,10 @@ def _connection_dropped(exc: BaseException) -> bool:
     return isinstance(exc, ConnectionError | http.client.IncompleteRead)
 
 
-def _post_turn(
+def _exchange(
     url: str, body: dict[str, Any], headers: dict[str, str], timeout: float
-) -> tuple[AgentResult, str]:
-    """POST one turn and parse the reply, for the opening prompt and every poll.
-
-    Returns:
-        The parsed result and the session id header (``""`` when absent).
-
-    Raises:
-        _TransportError: The request failed or the reply was not a JSON object.
-    """
+) -> tuple[Any, str]:
+    """POST one turn and return the raw JSON payload and session id header."""
     request = urllib.request.Request(
         url, data=json.dumps(body).encode("utf-8"), headers=headers, method="POST"
     )
@@ -706,6 +707,53 @@ def _post_turn(
         raise _TransportError(
             f"{type(exc).__name__}: {exc}", retryable=_connection_dropped(exc)
         ) from exc
+    return payload, session_id
+
+
+# The live request _cached_exchange sends, carried beside the cache key rather
+# than inside it: headers hold a token that rotates hourly and body holds the
+# per-run ``conversation`` id, and keying on either makes every run a miss.
+_EXCHANGE_REQUEST: contextvars.ContextVar[tuple[dict[str, Any], dict[str, str], float]] = (
+    contextvars.ContextVar("exchange_request")
+)
+
+
+# min_words=1 because the default (100) silently exempts this suite's 40-90
+# word task prompts. Inert until CACHED_RESPONSE_MODE is set; never set it on
+# a run whose grades you intend to trust — a cached reply grades the cache,
+# not the agent.
+@cached_llm_response(min_words=1)
+def _cached_exchange(url: str, cache_key: str) -> tuple[Any, str]:
+    return _exchange(url, *_EXCHANGE_REQUEST.get())
+
+
+def _post_turn(
+    url: str, body: dict[str, Any], headers: dict[str, str], timeout: float
+) -> tuple[AgentResult, str]:
+    """POST one turn and parse the reply, for the opening prompt and every poll.
+
+    Returns:
+        The parsed result and the session id header (``""`` when absent).
+
+    Raises:
+        _TransportError: The request failed or the reply was not a JSON object.
+    """
+    if str(body.get("input", "")).startswith(_STATUS_TURN_PREFIX):
+        # Status turns are never cached, whatever CACHED_RESPONSE_MODE says:
+        # they must read the real board, both so a replayed opening turn's
+        # delegated cards resolve to their recorded results and because a
+        # replayed board reading re-reports the same call ids, which the wait
+        # loop counts as silent turns and abandons.
+        payload, session_id = _exchange(url, body, headers, timeout)
+    else:
+        cache_key = json.dumps(
+            {k: v for k, v in body.items() if k != "conversation"}, sort_keys=True
+        )
+        token = _EXCHANGE_REQUEST.set((body, headers, timeout))
+        try:
+            payload, session_id = _cached_exchange(url, cache_key)
+        finally:
+            _EXCHANGE_REQUEST.reset(token)
 
     if not isinstance(payload, dict):
         raise _TransportError(f"agent endpoint returned non-object JSON: {type(payload).__name__}")
