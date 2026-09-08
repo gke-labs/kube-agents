@@ -199,11 +199,22 @@ fixture; that fallback was activation blocker A5 in `bench/tasks/DRAFTS.md`. See
 for the spec side, including how the verifier keeps "the fixture is gone" (a fail)
 apart from "the cluster was unreachable" (an error).
 
-## The second consumer: the presubmit's log-fixture subject
+## The presubmit's two consumers outside the role catalog
 
-`hack/ci-eval-pr.sh` §3b is the one consumer of this fleet outside the role catalog's
-chain, and `fixtures.json`'s description names it as the exception. On every presubmit
-in a fleet-carrying project it discovers **slot c** by the same two labels, verifies
+`hack/ci-eval-pr.sh` addresses this fleet directly in two places, both discovering by
+the same two labels and the trailing `-<slot>` name segment, and `fixtures.json`'s
+description names both as the sanctioned exceptions to its rule.
+
+**§2c, the slot-a heal (#1278),** is the only consumer that mutates the fleet. On every
+presubmit it reads **slot a**'s `default-pool` node count and resizes it to two when it
+finds fewer -- the standing state `main.tf` declares, so a later `tofu apply` is a
+no-op. It touches nothing else: not the fixtures, not `node_config`, not the state
+file; a project with no seeded fleet, an unreadable count, or a failed resize each
+produce a warning and nothing more, and `FLEET_HEAL_SEEDED_A=0` turns it off. The cost
+paragraph at the end of this README says why the pool is two nodes.
+
+**§3b, the log-fixture subject,** mutates nothing in-cluster. On every presubmit in a
+fleet-carrying project it discovers **slot c** by the same two labels, verifies
 its `default` namespace is empty, runs `get-credentials` against it, and hands its
 name to the gpu-stress-test stack, which then creates no per-run cluster: the task's
 synthetic `hypercomputer-agent`/`hpa-controller` Cloud Logging entries name the slot-c

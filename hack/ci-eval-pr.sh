@@ -761,9 +761,10 @@ EVAL_DEFAULT_LOCATION="${GCP_LOCATION}"
 # the run pays neither the ~6-minute provision nor the ~8-minute teardown.
 # The discovery filter is the fleet's documented address (both labels from
 # `local.cluster_labels` in bench/tf/fleet/main.tf), the same one
-# hack/fleet-kubeconfigs.sh uses. This block is the one sanctioned addresser
-# of a seeded cluster outside that catalog chain, and the catalog's own
-# description (bench/tf/fleet/fixtures.json) names it as the exception.
+# hack/fleet-kubeconfigs.sh uses. This block and section 2c's seeded-a heal
+# are the two sanctioned addressers of a seeded cluster outside that catalog
+# chain, and the catalog's own description (bench/tf/fleet/fixtures.json)
+# names both as the exceptions; 2c is the only one that mutates anything.
 #
 # ONLY slot c, never another slot. Slot a carries the planted namespace
 # defects -- including a real, live HPA at max replicas (fixture
