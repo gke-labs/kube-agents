@@ -2107,6 +2107,7 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(json.dumps({"bindings": []})),
                 _ok(self._project_policy()),
                 _ok(self._both_build_identities()),
+                _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
@@ -2123,6 +2124,7 @@ class IamGrantsTest(unittest.TestCase):
                       "service account."),
                 _ok(self._project_policy()),
                 _ok(self._both_build_identities()),
+                _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
@@ -2141,6 +2143,7 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy(litellm_roles=set())),
                 _ok(self._both_build_identities()),
+                _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
@@ -2159,6 +2162,7 @@ class IamGrantsTest(unittest.TestCase):
                 _ok(self._project_policy(
                     litellm_roles=checker.LITELLM_GSA_ROLES | {"roles/container.viewer"})),
                 _ok(self._both_build_identities()),
+                _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
         self.assertFalse(result.passed)
@@ -2177,6 +2181,7 @@ class IamGrantsTest(unittest.TestCase):
                       "iam.serviceAccounts.getIamPolicy is required to perform this operation"),
                 _ok(self._project_policy("kube-agents-evals-6")),
                 _ok(self._both_build_identities()),
+                _ok(self._fleet_reader_policy()),
             ]
             result = checker.check_iam_and_service_accounts("kube-agents-evals-6", "123456")
         self.assertTrue(result.passed, result.details)
@@ -2393,6 +2398,7 @@ class IamGrantsTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy()),
                 _ok(self._both_build_identities()),
                 _ok(self._fleet_reader_policy()),
@@ -2413,6 +2419,7 @@ class IamGrantsTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy()),
                 _ok(self._both_build_identities()),
                 _ok(self._fleet_reader_policy(members=[])),
@@ -2431,6 +2438,7 @@ class IamGrantsTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy()),
                 _ok(self._both_build_identities()),
                 _fail("ERROR: (gcloud.iam.service-accounts.get-iam-policy) NOT_FOUND: Unknown "
@@ -2447,6 +2455,7 @@ class IamGrantsTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy()),
                 _ok(self._both_build_identities()),
                 _ok("Updates are available for some Google Cloud CLI components."),
@@ -2461,6 +2470,7 @@ class IamGrantsTest(unittest.TestCase):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
                 _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._litellm_wi_policy("kube-agents-evals-3")),
                 _ok(self._project_policy()),
                 _ok(self._both_build_identities()),
                 _fail("ERROR: (gcloud.iam.service-accounts.get-iam-policy) PERMISSION_DENIED: "
