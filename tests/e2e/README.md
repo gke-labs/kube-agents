@@ -243,7 +243,7 @@ On a host without a Docker daemon, add `IMAGE_BUILDER=crane`.
 
 ### 17-Step Verification Workflow:
 
-1. **Rebuild & Deploy Operator**: Compiles `k8s-operator` binary, builds the container image, pushes to registry, applies CRDs, and deploys `kubeagents-controller-manager`.
+1. **Rebuild & Deploy Operator**: Compiles `k8s-operator` binary, builds the container image, pushes to registry, applies CRDs, and deploys `kube-agents-controller-manager` (or `kubeagents-controller-manager` under Kustomize).
 2. **Verify Operator Version**: Confirms controller manager pod image tag matches the newly pushed build.
 3. **Build & Push OCI Plugin Image**: Packages example plugin assets into an OCI container image with a unique build ID.
 4. **Deploy AgentPlugin CR**: Deploys targeted `AgentPlugin` CR with `agentRef: "platform-agent"`, allowed `approvals` configuration subtree, disallowed config keys, and `imagePullPolicy: Always`.

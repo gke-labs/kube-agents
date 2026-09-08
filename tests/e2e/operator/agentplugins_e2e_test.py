@@ -111,7 +111,20 @@ PLUGIN_BASE_IMAGE: str = "alpine:3.19"
 # GKE nodes are linux/amd64; a mismatch here yields a CrashLoopBackOff, not a build error.
 TARGET_PLATFORM: str = os.environ.get("TARGET_PLATFORM", "linux/amd64")
 
-OPERATOR_DEPLOYMENT: str = "kubeagents-controller-manager"
+# Operator Deployment name: Helm release prefixes with release name ('kube-agents-controller-manager');
+OPERATOR_DEPLOYMENT_HELM: str = "kube-agents-controller-manager"
+OPERATOR_DEPLOYMENT_KUSTOMIZE: str = "kubeagents-controller-manager"
+OPERATOR_POD_SELECTOR_HELM: str = "app.kubernetes.io/name=kube-agents-operator"
+OPERATOR_POD_SELECTOR_KUSTOMIZE: str = "control-plane=controller-manager"
+OPERATOR_DEPLOYMENT: str = OPERATOR_DEPLOYMENT_HELM
+OPERATOR_CONTAINER_NAME: str = "manager"
+OPERATOR_RESOLUTION_TIMEOUT_SEC: int = 30
+OPERATOR_POD_POLL_TIMEOUT_SEC: int = 30
+OPERATOR_PROBE_TIMEOUT_SEC: int = 15
+DEFAULT_ROLLOUT_TIMEOUT_SEC: int = 180
+ROLLOUT_RETRY_INTERVAL_SEC: int = 3
+API_POLL_INTERVAL_SEC: int = 2
+MIN_ROLLOUT_TIMEOUT_SEC: int = 5
 GATEWAY_DEPLOYMENT: str = "platform-agent-gateway"
 # AgentPlugin names are restricted to ^[a-z][a-z0-9]*$ by the CRD: the name doubles as
 # the plugin directory and the module identifier Hermes imports.
@@ -550,9 +563,65 @@ def poll_pod_logs(
     return pod_name, logs
 
 
-def wait_deployment_rollout(deployment_name: str, timeout: str = "180s") -> None:
-    """Wait for deployment rollout status to succeed."""
-    run_kubectl(["rollout", "status", f"deployment/{deployment_name}", "-n", NAMESPACE, f"--timeout={timeout}"])
+def get_operator_deployment(timeout_sec: int = OPERATOR_RESOLUTION_TIMEOUT_SEC) -> str:
+    """Resolve active operator deployment name across Helm and Kustomize installations."""
+    env_override = os.environ.get("OPERATOR_DEPLOYMENT")
+    if env_override:
+        return env_override
+
+    candidates = [OPERATOR_DEPLOYMENT_HELM, OPERATOR_DEPLOYMENT_KUSTOMIZE]
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        for name in candidates:
+            res = run_kubectl(["get", "deployment", name, "-n", NAMESPACE], check=False, capture_output=True)
+            if res.returncode == 0:
+                return name
+        time.sleep(API_POLL_INTERVAL_SEC)
+    return OPERATOR_DEPLOYMENT_HELM
+
+
+def poll_operator_pod(expected_image: str = "", timeout_sec: int = OPERATOR_POD_POLL_TIMEOUT_SEC) -> str:
+    """Poll Kubernetes API for running operator pod matching Helm or Kustomize label selectors."""
+    selectors = [OPERATOR_POD_SELECTOR_HELM, OPERATOR_POD_SELECTOR_KUSTOMIZE]
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        for sel in selectors:
+            pod_name = poll_pod_with_image(sel, OPERATOR_CONTAINER_NAME, expected_image=expected_image, timeout_sec=API_POLL_INTERVAL_SEC)
+            if pod_name:
+                return pod_name
+        time.sleep(1)
+    return ""
+
+
+def wait_deployment_rollout(deployment_name: str, timeout: str = f"{DEFAULT_ROLLOUT_TIMEOUT_SEC}s") -> None:
+    """Wait for deployment object to exist in API server and its rollout status to succeed."""
+    timeout_sec = DEFAULT_ROLLOUT_TIMEOUT_SEC
+    if timeout.endswith("s") and timeout[:-1].isdigit():
+        timeout_sec = int(timeout[:-1])
+
+    deadline = time.time() + timeout_sec
+    # 1. Wait for deployment object to appear in API server
+    while time.time() < deadline:
+        res = run_kubectl(["get", "deployment", deployment_name, "-n", NAMESPACE], check=False, capture_output=True)
+        if res.returncode == 0:
+            break
+        time.sleep(API_POLL_INTERVAL_SEC)
+
+    # 2. Run rollout status with retry until deadline
+    last_err: Exception | None = None
+    while time.time() < deadline:
+        remaining_sec = max(MIN_ROLLOUT_TIMEOUT_SEC, int(deadline - time.time()))
+        try:
+            run_kubectl(["rollout", "status", f"deployment/{deployment_name}", "-n", NAMESPACE, f"--timeout={remaining_sec}s"])
+            return
+        except subprocess.CalledProcessError as err:
+            last_err = err
+            if time.time() < deadline - MIN_ROLLOUT_TIMEOUT_SEC:
+                time.sleep(ROLLOUT_RETRY_INTERVAL_SEC)
+                continue
+            raise
+    if last_err:
+        raise last_err
 
 
 def get_platform_configmap_yaml() -> str:
@@ -572,11 +641,12 @@ def get_platform_configmap_yaml() -> str:
 
 def step1_verify_existing_operator_healthy() -> None:
     """Step 1 (Default): Verify existing k8s-operator and PlatformAgent deployments are healthy without mutating or rebuilding."""
-    log(f"STEP 1: Verifying existing k8s-operator deployment '{OPERATOR_DEPLOYMENT}' in namespace '{NAMESPACE}'...")
-    wait_deployment_rollout(OPERATOR_DEPLOYMENT)
+    op_deployment = get_operator_deployment()
+    log(f"STEP 1: Verifying existing k8s-operator deployment '{op_deployment}' in namespace '{NAMESPACE}'...")
+    wait_deployment_rollout(op_deployment)
 
-    pod_name = poll_pod_with_image("control-plane=controller-manager", "manager", timeout_sec=30)
-    assert pod_name != "", f"No running operator pod found for deployment '{OPERATOR_DEPLOYMENT}'"
+    pod_name = poll_operator_pod()
+    assert pod_name != "", f"No running operator pod found for deployment '{op_deployment}'"
     pod_image = get_pod_image(pod_name, "manager")
     log(f"Running operator pod name:  {pod_name}")
     log(f"Running operator pod image: {pod_image}")
@@ -587,6 +657,7 @@ def step1_verify_existing_operator_healthy() -> None:
 
 def step1_rebuild_and_deploy_operator(operator_image: str, operator_tag: str) -> None:
     """Step 1 (Opt-in Rebuild): Rebuild k8s-operator Go binary and container image from scratch, push, apply CRDs, update deployment."""
+    op_deployment = get_operator_deployment()
     log(f"STEP 1 (Opt-in Rebuild): Rebuilding and deploying k8s-operator from scratch with tag '{operator_tag}'...")
     operator_dir = REPO_ROOT / "k8s-operator"
 
@@ -600,22 +671,23 @@ def step1_rebuild_and_deploy_operator(operator_image: str, operator_tag: str) ->
     build_and_push_operator_image(operator_image, operator_dir)
     apply_crd_manifests(operator_dir / "config" / "crd" / "bases")
 
-    run_kubectl(["set", "image", f"deployment/{OPERATOR_DEPLOYMENT}", f"manager={operator_image}", "-n", NAMESPACE])
-    wait_deployment_rollout(OPERATOR_DEPLOYMENT)
+    run_kubectl(["set", "image", f"deployment/{op_deployment}", f"manager={operator_image}", "-n", NAMESPACE])
+    wait_deployment_rollout(op_deployment)
     log("STEP 1 (Opt-in Rebuild) SUCCESS: k8s-operator built, pushed, and deployed.")
 
 
 def step2_verify_operator_version(operator_image: str) -> None:
     """Step 2 (Opt-in Rebuild): Verify deployed image tag in deployment spec and active running pod."""
     log("STEP 2 (Opt-in Rebuild): Verifying deployed version by image tag...")
+    op_deployment = get_operator_deployment()
     deployed_image = get_kubectl_output([
-        "get", "deployment", OPERATOR_DEPLOYMENT, "-n", NAMESPACE,
+        "get", "deployment", op_deployment, "-n", NAMESPACE,
         "-o", "jsonpath={.spec.template.spec.containers[?(@.name==\"manager\")].image}"
     ])
     log(f"Deployment spec image: {deployed_image}")
     assert deployed_image == operator_image, f"Spec image '{deployed_image}' != expected '{operator_image}'"
 
-    pod_name = poll_pod_with_image("control-plane=controller-manager", "manager", operator_image, timeout_sec=30)
+    pod_name = poll_operator_pod(expected_image=operator_image)
     assert pod_name != "", f"No running operator pod found with image '{operator_image}'"
 
     pod_image = get_pod_image(pod_name, "manager")
@@ -666,9 +738,10 @@ def step3_build_and_push_plugin_image(plugin_image: str, unique_str: str) -> Non
 
 def check_operator_error_log(search_str: str) -> bool:
     """Fetch logs from controller manager and check for expected error message."""
+    op_deployment = get_operator_deployment()
     try:
         output = get_kubectl_output([
-            "logs", "deployment/kubeagents-controller-manager", "-n", NAMESPACE, "-c", "manager", "--tail=5000"
+            "logs", f"deployment/{op_deployment}", "-n", NAMESPACE, "-c", "manager", "--tail=5000"
         ])
         return search_str in output
     except Exception:
@@ -1065,11 +1138,12 @@ def step12_verify_missing_crd_decoupled_dependency_safeguard() -> None:
         wait_deployment_generation_change(GATEWAY_DEPLOYMENT, min_gen=gen_before + 1)
         wait_deployment_rollout(GATEWAY_DEPLOYMENT)
 
+        op_deployment = get_operator_deployment()
         op_image = get_kubectl_output([
-            "get", "deployment", OPERATOR_DEPLOYMENT, "-n", NAMESPACE,
+            "get", "deployment", op_deployment, "-n", NAMESPACE,
             "-o", "jsonpath={.spec.template.spec.containers[?(@.name==\"manager\")].image}"
         ])
-        op_pod = poll_pod_with_image("control-plane=controller-manager", "manager", op_image, timeout_sec=15)
+        op_pod = poll_operator_pod(expected_image=op_image, timeout_sec=OPERATOR_PROBE_TIMEOUT_SEC)
         crd_missing_logged = (
             check_operator_error_log("the server could not find the requested resource") or
             check_operator_error_log("AgentPlugin CRD is not installed on cluster")
@@ -1089,8 +1163,8 @@ def step12_verify_missing_crd_decoupled_dependency_safeguard() -> None:
         # exponential backoff / stops watching the missing resource until the controller process
         # or deployment is restarted. Restarting the operator forces a fresh informer cache sync.
         log("Restarting operator to rebuild the AgentPlugin watch...")
-        run_kubectl(["rollout", "restart", f"deployment/{OPERATOR_DEPLOYMENT}", "-n", NAMESPACE])
-        run_kubectl(["rollout", "status", f"deployment/{OPERATOR_DEPLOYMENT}", "-n", NAMESPACE, "--timeout=180s"])
+        run_kubectl(["rollout", "restart", f"deployment/{op_deployment}", "-n", NAMESPACE])
+        wait_deployment_rollout(op_deployment, timeout="180s")
         wait_deployment_rollout(GATEWAY_DEPLOYMENT)
 
     log("STEP 12 (Opt-in Destructive) SUCCESS: Missing AgentPlugin CRD decoupled dependency safeguard verified.")
