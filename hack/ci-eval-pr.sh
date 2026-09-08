@@ -1376,7 +1376,14 @@ print(m.group(1).strip('\'\"') if m else '')
 # agent-kanban-smoke earned its seat back after the 08-27 redesign (a real
 # SRE question graded on kanban_create plus cluster names); the reds that
 # once argued for un-arming it belonged to the old vocabulary check.
-export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,cluster-agent-crashloop-debug,cluster-agent-crashloop-misleading-symptom,cluster-agent-crashloop-evidence-chain,agent-kanban-smoke}"
+# The crashloop trio (cluster-agent-crashloop-debug, -misleading-symptom,
+# -evidence-chain) is demoted 2026-09-08 pending the seeded-fleet repair in
+# #1278: seeded-a's default-pool node is 100% CPU-requested by GKE system
+# pods after the weekend node upgrade, so the planted payments-api pod is
+# Pending on all 30 pool projects and no run can find an OOM. Re-admit the
+# three the moment the fleet is re-applied -- their records are the suite's
+# best; the fixture broke, not the cases.
+export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,agent-kanban-smoke}"
 
 # Where the evidence itself lives. Unset means bench/baselines/ in the
 # checkout: hermetic, no credential, no network -- and no way for this job to
