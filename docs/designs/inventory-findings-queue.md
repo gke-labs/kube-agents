@@ -3,7 +3,7 @@
 > **STATUS — partly implemented.** §12 items 1–6 ship in
 > `agents/platform/scripts/findings_queue.py`, `inventory_findings.py` and the Session KV server:
 > the two tables and their indexes (§3.1), the rubric and the severity it derives (§4), the upsert
-> rules (§5.2), the seven endpoints and MCP tools (§6.1), and the inventory sweep's registration
+> rules (§5.2), the eight endpoints and MCP tools (§6.1), and the inventory sweep's registration
 > path (§5). Item 7 does not ship — nothing registers findings from `k8s-event-watcher`. Items 8 and
 > 10 ship in part: `agents/platform/scripts/findings_nudge.py` and the `findings-morning-nudge`
 > entry in `jobs.json` post §7.2's message behind item 10's `content_hash` change gate. The gate is
@@ -263,7 +263,7 @@ The indexes follow the queries the publishers actually run:
 ```sql
 CREATE INDEX IF NOT EXISTS findings_ranked ON findings(state, rank_score DESC);
 CREATE INDEX IF NOT EXISTS findings_urgent ON findings(likelihood, blast_radius, alarmed_at);
-CREATE INDEX IF NOT EXISTS findings_object ON findings(cluster, namespace, object);
+CREATE INDEX IF NOT EXISTS findings_object ON findings(project, cluster, namespace, object);
 CREATE INDEX IF NOT EXISTS findings_pr     ON findings(pr_state) WHERE pr_state IS NOT NULL;
 ```
 
@@ -602,6 +602,10 @@ says this), and C = 1.0, because the fault was observed directly — and leaves 
 to a default per reason in the same map. Those are the two measures an event cannot see, and a
 default that is sometimes wrong is a re-rank (§4.6), not a wrong identity.
 
+The map does not cover `project`, which registration also requires: the watcher watches the
+cluster it is deployed beside, so its project is deploy-time configuration, not something an event
+carries.
+
 Reasons outside the map register nothing. The watcher keeps doing what it does today — open a
 troubleshooting session — and the queue stays out of it, which is better than a row whose check slug
 was invented to fill the column.
@@ -758,7 +762,7 @@ that killed that version.
 One document per install, holding every open finding — id, score, severity, object, the one-line
 recommendation, `last_verified`, and the pull request link where there is one. This publisher is
 where grouping happens: it takes `/ranked`'s flat score order and gathers each
-`(cluster, namespace, object)` together, ordering the groups by their highest-scoring member,
+`(project, cluster, namespace, object)` together, ordering the groups by their highest-scoring member,
 because findings cluster hard on objects and a workload's five problems are one visit to one
 manifest. Rewritten in place after each run rather than appended to, so what a reader sees is the
 queue as it is now.
@@ -1191,7 +1195,7 @@ Each item names the section that specifies it; nothing here is new.
 | --- | ----------------------------------------------------------------------------------------------------- | ----- |
 | 1   | `findings` and `queue_publications` tables, indexes, and exemption from `cleanup_old_records`         | §3.1  |
 | 2   | Upsert rules per existing state, including sticky `dismissed`, and the absence-lowers-confidence rule | §5.2  |
-| 3   | The seven HTTP endpoints, with the ordering as a tested Python function rather than a prompt          | §6.1  |
+| 3   | The eight HTTP endpoints, with the ordering as a tested Python function rather than a prompt          | §6.1  |
 | 4   | Thin MCP tools over those endpoints on `platform_mcp_server.py`                                       | §6.1  |
 
 **The writers.**

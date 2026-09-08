@@ -2461,7 +2461,7 @@ def mark_finding_surfaced(finding_id: str, body: Dict[str, Any] | None = None) -
 
 @app.patch("/v1/findings/{finding_id}", dependencies=[Depends(verify_api_key)])
 def patch_finding(finding_id: str, body: Dict[str, Any]) -> Dict[str, Any]:
-    """The three human transitions (§3.2), the snooze expiry, and PR reconciliation."""
+    """The three human transitions (§3.2), the early end of a snooze, and PR reconciliation."""
     return _findings_write(findings_queue.patch_finding, finding_id, body)
 
 

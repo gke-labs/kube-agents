@@ -255,6 +255,17 @@ class RegisterTests(unittest.TestCase):
         self.assertIsNone(scopes["dev"])
         self.assertEqual(scopes["prod"], {"project": "acme", "cluster": "prod", "complete": True})
 
+    def test_an_unmatched_complete_clusters_entry_is_warned_about(self):
+        # The likely shape is the old bare cluster name; matching nothing must
+        # not be silent, because the absence rule quietly not running is what
+        # keeps a fixed critical nagging forever.
+        self.extract()
+        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = self.register({"complete_clusters": ["prod"], "scores": {"f001": SCORE, "f002": SCORE}})
+        self.assertEqual(code, 0)
+        self.assertIn("complete_clusters entry 'prod' matched no registered batch", out.getvalue())
+        self.assertTrue(all(s[2] is None for s in self.sent))
+
     def test_a_malformed_scores_file_is_a_listed_error_not_a_traceback(self):
         self.extract()
         self.scores.write_text('{"scores": {"f001": {},}}', encoding="utf-8")

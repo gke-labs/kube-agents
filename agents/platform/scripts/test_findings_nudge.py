@@ -81,6 +81,13 @@ class ComposeTests(unittest.TestCase):
         message = nudge.compose([finding(project="acme-prod")])
         self.assertIn("acme-prod/prod/payments/api", message)
 
+    def test_a_cluster_scoped_finding_with_a_project_still_names_the_cluster_once(self):
+        message = nudge.compose([finding(project="acme-prod", namespace="", object="prod", title="WI disabled")])
+        # The whole location line, so a regression to `acme-prod/prod/prod`
+        # cannot hide inside a substring match.
+        self.assertIn("\n   acme-prod/prod\n", message)
+        self.assertNotIn("acme-prod/prod/prod", message)
+
     def test_a_namespaced_finding_keeps_all_three_segments(self):
         message = nudge.compose([finding()])
         self.assertIn("prod/payments/api", message)
@@ -266,8 +273,11 @@ class ChangeGateTests(NudgeHarness):
         self.assertEqual(code, 0)
         self.assertIn("no readinessProbe on api", self.out.getvalue())
         # The gate is not consulted at all, so a delivery that fails silently
-        # gets another go tomorrow rather than being suppressed forever.
-        self.assertNotIn(f"/v1/findings/publication/{nudge.PUBLISHER}", calls[:1])
+        # gets another go tomorrow rather than being suppressed forever. One
+        # publication call means the PUT alone: consulting the gate would add
+        # a GET on the same path first.
+        self.assertEqual(calls.count(f"/v1/findings/publication/{nudge.PUBLISHER}"), 1)
+        self.assertEqual(self.published, [{"target_kind": "chat", "content_hash": self._digest(ranked)}])
 
     def test_a_critical_the_nudge_may_not_name_does_not_defeat_the_gate(self):
         ranked = [observation(id="a", severity="critical"), finding(id="b", severity="major")]

@@ -237,6 +237,30 @@ class QueueTestCase(unittest.TestCase):
 
 
 class TestSchema(QueueTestCase):
+    def test_a_pre_release_table_without_project_is_rebuilt(self):
+        # A dev-install DB created before the key change would otherwise fail
+        # every INSERT with `no such column: project`, surfaced as a 503 that
+        # reads as retryable. No released writer ever filled the table, so the
+        # old shape carries nothing worth migrating.
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.execute("CREATE TABLE findings (id TEXT PRIMARY KEY, cluster TEXT NOT NULL)")
+        conn.execute("INSERT INTO findings VALUES ('stale-row', 'prod')")
+
+        fq.init_findings_schema(conn)
+        result = fq.register_findings(conn, [sample()])
+
+        self.assertEqual(result["results"][0]["outcome"], "created")
+        ids = [row[0] for row in conn.execute("SELECT id FROM findings")]
+        self.assertNotIn("stale-row", ids)
+
+    def test_a_current_table_survives_reinit_with_its_rows(self):
+        self.register(sample())
+        fid = self.ids()[0]
+        fq.init_findings_schema(self.conn)
+        self.assertEqual(self.ids(), [fid])
+
+
     def test_generated_columns_track_the_rubric(self):
         self.register(sample())
         fid = fq.validate_finding(sample())["id"]

@@ -62,8 +62,9 @@ STICKY_STATES = ("dismissed",)
 RECURRENCE_STATES = ("resolved", "stale")
 
 # `resolved` and `stale` are the daily job's to write, through
-# `record_verification`; `queued` is registration's. What is left is the three
-# human transitions plus the snooze expiry the daily job runs (§3.2, §6.1).
+# `record_verification`; `queued` is registration's; a lapsed snooze is
+# `expire_snoozes`'s. What is left is the three human transitions plus
+# `surfaced`, which ends a snooze early (§3.2, §6.1).
 PATCHABLE_STATES = ("accepted", "dismissed", "snoozed", "surfaced")
 
 VERIFY_OUTCOMES = ("still_failing", "resolved", "unverifiable")
@@ -340,6 +341,17 @@ _SELECT = f"SELECT {', '.join(_COLUMNS)} FROM findings"
 
 
 def init_findings_schema(conn: sqlite3.Connection) -> None:
+    # `project` joined the primary key before any release shipped this table,
+    # so the only databases without the column are pre-release dev installs.
+    # CREATE IF NOT EXISTS would keep the old shape there, and every INSERT
+    # would then raise `no such column: project` — which the HTTP layer maps
+    # to a retryable-looking 503, on every registration, forever. Dropping is
+    # safe precisely because no released writer ever filled the table, and
+    # self-healing beats the manual `DROP TABLE` note `intercepted_events`
+    # ships with because this failure never surfaces as its own error.
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(findings)")}
+    if columns and "project" not in columns:
+        conn.execute("DROP TABLE findings")
     conn.execute(FINDINGS_SCHEMA)
     conn.execute(PUBLICATIONS_SCHEMA)
     for statement in FINDINGS_INDEXES:
@@ -676,7 +688,7 @@ def mark_surfaced(conn: sqlite3.Connection, finding_id: str, chat_id: str = "", 
 
 
 def patch_finding(conn: sqlite3.Connection, finding_id: str, patch: Any) -> dict:
-    """The three human transitions, the snooze expiry, and PR reconciliation."""
+    """The three human transitions, the early end of a snooze, and PR reconciliation."""
     if not isinstance(patch, dict):
         raise FindingError("patch must be an object")
     current = get_finding(conn, finding_id)

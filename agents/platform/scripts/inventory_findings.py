@@ -365,6 +365,15 @@ def cmd_register(args: argparse.Namespace) -> int:
             if entry.get("outcome") == "suppressed":
                 print(f"  suppressed (do not report or count): {entry.get('id')}")
 
+    # An unmatched entry is a silent no-op with a real cost: the absence rule
+    # never runs, so a fixed critical keeps its floor severity and the nudge
+    # nags about it every morning with no exit.
+    for entry in sorted(complete - {f"{p}/{c}" for p, c in by_cluster}):
+        print(
+            f"warning: complete_clusters entry {entry!r} matched no registered batch; "
+            "entries are '<project>/<cluster>' and the absence rule did not run for it"
+        )
+
     print(f"registered {sent} of {len(items)} extracted findings")
     if failures:
         raise Failure(
