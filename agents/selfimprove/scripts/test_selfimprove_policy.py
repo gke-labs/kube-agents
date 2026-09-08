@@ -628,18 +628,35 @@ class PolicyTest(unittest.TestCase):
         expensive case -- a match short-circuits. The bound is loose enough to
         survive a loaded CI machine and still four orders of magnitude below the
         regression it exists to catch.
+
+        The payload has to ride in tokens `policy_match_text` keeps. A long
+        `--title` is the obvious carrier and the wrong one: free-text flag
+        values are dropped, so `gh pr create --title <60 words>` reaches the
+        rules as the 20 characters `gh pr create --title` and the timing says
+        nothing about the pattern. Repeated bare tokens survive, and they are
+        also the reachable shape -- an argv the executor accepts can carry
+        arbitrarily many positional arguments. Both tools are exercised because
+        every rule is anchored at `\\A` on its own tool name, so a `git` argv
+        never enters a `gh` rule's traversal and vice versa.
         """
-        argv = ["gh", "pr", "create", "--title", "fix: " + " ".join(
-            "unmatchedword%d" % i for i in range(60)
-        )]
-        start = time.perf_counter()
-        self.assertIsNone(blocked_by(argv))
-        elapsed = time.perf_counter() - start
-        self.assertLess(
-            elapsed, 1.0,
-            "the rule set took %.1fms on a 60-word title; a rule is backtracking"
-            % (elapsed * 1000),
-        )
+        for tool, subcommand in (("git", "log"), ("gh", "pr")):
+            argv = [tool, subcommand] + [
+                "unmatchedword%d" % i for i in range(60)
+            ]
+            with self.subTest(tool=tool):
+                self.assertIn(
+                    argv[-1], policy_match_text(argv),
+                    "the payload was normalised away before the rules saw it; "
+                    "this measures nothing",
+                )
+                start = time.perf_counter()
+                self.assertIsNone(blocked_by(argv))
+                elapsed = time.perf_counter() - start
+                self.assertLess(
+                    elapsed, 1.0,
+                    "the rule set took %.1fms on a 60-token argv; a rule is "
+                    "backtracking" % (elapsed * 1000),
+                )
 
     def test_every_rule_is_anchored_at_argv_zero(self):
         for rule_id, pattern in RULES:
