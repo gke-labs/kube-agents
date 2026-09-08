@@ -256,8 +256,16 @@ func (r *PlatformAgentReconciler) ensureA2ACredsSecret(ctx context.Context, agen
 // and a2aConfigRolloutHash with one that returns placeholders. One template
 // and two lookups is what lets the rollout digest cover every non-secret byte
 // without covering a credential — a password interpolated here by any route
-// other than pw is back in the digest, which is what
-// TestA2ARenderedObjectsCarryNoPasswordDigest exists to catch.
+// other than pw is back in the digest.
+//
+// TestA2AConfigRolloutHashOmitsCredentialsAndTracksRotation is the guard for
+// that: it hashes two creds Secrets that differ only in their password bytes
+// and requires the digests to be equal, so any route by which a credential
+// re-enters the hashed input reds it.
+// TestA2ARenderedObjectsCarryNoPasswordDigest is the wider but shallower one —
+// it catches a digest of a password, or of the real conf, reaching a rendered
+// name, label or annotation, and it cannot see a credential folded into the
+// hashed bytes as a third string.
 func renderA2ANATSConf(agent *agentv1alpha1.PlatformAgent, pw func(key string) string) string {
 	return a2aPostureComment + `
 
@@ -530,6 +538,25 @@ func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.
 // rolls the bus, and the resourceVersion tracks a credential rotation, which
 // ensureA2ACredsSecret performs as an Update on the existing Secret — the UID
 // would not move, which is why this is the resourceVersion.
+//
+// Two things that costs, both accepted rather than overlooked:
+//
+// The hash is no longer content-addressed. resourceVersion moves on ANY
+// accepted write to the creds Secret, so labelling it by hand, a policy
+// controller stamping the namespace, or a restore that renumbers the namespace
+// rolls the single-replica bus once with nothing the server reads having
+// changed — clients reconnect, and JetStream state lives on the PV. The
+// alternative that ignores metadata churn is a digest of the password bytes,
+// which is the alert this function exists to close, so the spurious roll is
+// the price of not hashing the credential.
+//
+// And the rotation it notices rolls the bus, not the bus's clients. This hash
+// rides the NATS pod template alone; the gateway Deployment and the provision
+// Job take their passwords through valueFrom.secretKeyRef, which a running pod
+// does not re-read, so a repaired credential leaves the gateway holding the old
+// one until something else restarts it. That gap predates this function — the
+// conf digest rolled only the StatefulSet too — and closing it means deciding
+// what a rotation should restart, which is not this function's call.
 func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret) string {
 	redacted := renderA2ANATSConf(agent, func(key string) string {
 		return fmt.Sprintf(a2aConfigHashPlaceholder, key)

@@ -1348,10 +1348,12 @@ func TestA2AConfigRolloutHashOmitsCredentialsAndTracksRotation(t *testing.T) {
 // readable by anything that can list the namespace, so a digest there is an
 // offline target; the passwords belong in Secret data and nowhere else.
 //
-// This is also what catches the drift the placeholder indirection invites: a
-// password interpolated into the conf by any route other than renderA2ANATSConf's
-// pw lookup lands back in the hashed bytes, and the pod-template annotation is
-// where it would surface.
+// What it does NOT cover, because its needles are digests of known strings: a
+// credential folded into the hashed input as part of some third string, which
+// produces an annotation that matches no needle here and leaves this test
+// green. TestA2AConfigRolloutHashOmitsCredentialsAndTracksRotation is the
+// guard for that shape — it varies only the password bytes and requires the
+// hash not to move. The two are complementary and neither subsumes the other.
 func TestA2ARenderedObjectsCarryNoPasswordDigest(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()
