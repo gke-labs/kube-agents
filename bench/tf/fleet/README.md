@@ -333,6 +333,10 @@ silence-on-a-clean-fleet case needs a clean view, which is an open fleet-design
 decision recorded with the scenario drafts. The silence case in particular must
 tolerate the declared background rows above.
 
-Rough standing cost: about $260 per month — the GKE management fee (three zonal
-clusters) is most of it, the five small nodes (20 GB disks) and two 10 GB orphan disks
-the rest.
+Rough standing cost: about $285 per month — the GKE management fee (three zonal
+clusters) is most of it, the five nodes (20 GB disks) and two 10 GB orphan disks the
+rest. Four of the nodes are e2-small; `seeded-a`'s default node is an e2-standard-2
+since #1278 (roughly $25 per month more than the e2-medium it replaced), because
+e2-medium's 940m allocatable CPU is fully claimed by GKE system pods and the planted
+`payments-api` / `checkout-gateway` fixtures went Pending — the comment on
+`seeded_a_default` in `main.tf` has the numbers.
