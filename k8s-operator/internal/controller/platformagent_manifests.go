@@ -691,7 +691,7 @@ const clusterProfileClassKey = "profileclass-cluster" + profileOverlaySuffix
 // can be compared against it, and so the two files can be kept in step. The one place it
 // IS rendered is frontDoorKanban, where there is no image copy to defer to: the platform
 // profile's config declares no `kanban` key at all.
-const defaultKanbanMaxInProgress = 2
+const defaultKanbanMaxInProgress = 1
 
 // defaultProfileLimits, platformProfileLimits and clusterProfileLimits read
 // spec.harness.tuning, tolerating every level being nil.

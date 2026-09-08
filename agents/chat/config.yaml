@@ -205,7 +205,7 @@ kanban:
   # operator writes into profile-default.overlay.yaml and the entrypoint merges
   # over this key at startup — so keep this value in step with
   # defaultKanbanMaxInProgress in platformagent_manifests.go.
-  max_in_progress: 2
+  max_in_progress: 1
 
 # Denylist applied last for every platform key — the authoritative guarantee that
 # the front door cannot touch the system. Everything except the delegation
