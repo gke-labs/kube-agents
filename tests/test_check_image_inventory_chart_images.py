@@ -1,10 +1,10 @@
 """`image_refs` in hack/check-image-inventory.sh extracts image references and
-nothing else (#1139).
+nothing else, and check 3 renders the chart with githubMinter on (#1139).
 
 The extraction used to key on the shape of an env var's value -- a quoted
-string with a slash and a colon in it -- which githubMinter's ISSUER_ALLOWLIST
-matches, so rendering the chart with the minter on reported the allowlist as an
-image outside the mirror. It now keys on the variable's name. CI only ever runs the script on a
+string with a slash and a colon in it -- which the minter's ISSUER_ALLOWLIST
+matches, so enabling the minter reported the allowlist as an image outside the
+mirror. It now keys on the variable's name. CI only ever runs the script on a
 tree where the check passes, so nothing else exercises the discrimination: the
 functions are lifted from the script's own text and run under bash against
 synthetic rendered YAML, so the assertions are against the code that ships
@@ -31,6 +31,31 @@ _LIFTED_CONSTANTS = ("IMAGE_ENV_NAME_RE", "VALUE_FIELD_RE")
 # one of them: a name it misses is an image the operator stamps onto agent pods
 # that no check sees.
 _IMAGE_ENV_NAMES = ("PLATFORM_AGENT_IMAGE", "AGENT_SANDBOX_IMAGE", "FLUENT_BIT_IMAGE")
+
+# The call sites, asserted present because a check that is defined and never
+# called keeps every gate green -- and because the minter renders are the whole
+# point of #1139.
+_CALL_SITES = (
+    'minter_render="$(render_chart "${MINTER_VALUES[@]}")"',
+    'minter_mirrored_render="$(render_chart "${MINTER_VALUES[@]}" '
+    '--set "global.imageRegistry=$MIRROR")"',
+    'check_inventory_pins "$LABEL_DEFAULT" "$default_images"',
+    'check_inventory_pins "$LABEL_DEFAULT_MINTER" "$minter_images"',
+    'check_mirror_prefix "$LABEL_MIRRORED" "$mirrored_images"',
+    'check_mirror_prefix "$LABEL_MIRRORED_MINTER" "$minter_mirrored_images"',
+    'check_mirror_names "$LABEL_MIRRORED" "$mirrored_images"',
+    'check_mirror_names "$LABEL_MIRRORED_MINTER" "$minter_mirrored_images"',
+    "--set githubMinter.enabled=true",
+)
+
+# The three guards that keep a silently-matching-nothing extraction from
+# reading as a clean run. Each is identified by the variable the guard tests,
+# so rewording the message does not break the test.
+_GUARDS = (
+    '[ -n "$default_images" ] || {',
+    '[ -n "$(image_env_refs <<<"$default_render")" ] || {',
+    '[ -n "$minter_only" ] || {',
+)
 
 # A rendered manifest carrying every shape the chart emits: a bare and a quoted
 # `image:`, the three image env vars, an env var whose value is an image only
@@ -148,6 +173,18 @@ class ImageRefsTest(unittest.TestCase):
             _extract("image_field_refs", fields),
             ["example.invalid/bare:v1", "example.invalid/quoted:v1"],
         )
+
+
+class CheckThreeCoverageTest(unittest.TestCase):
+    def test_script_renders_and_checks_the_minter_configurations(self):
+        text = _SCRIPT.read_text()
+        for call in _CALL_SITES:
+            self.assertIn(call, text)
+
+    def test_script_guards_against_an_extraction_that_matches_nothing(self):
+        text = _SCRIPT.read_text()
+        for guard in _GUARDS:
+            self.assertIn(guard, text)
 
 
 if __name__ == "__main__":
