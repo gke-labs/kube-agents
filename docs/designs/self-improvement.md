@@ -1632,12 +1632,15 @@ opt-in and why §7's gate is per-install configuration rather than a constant.
   reach a credential, which is the second pod the "filing turn holds the write path in the same
   pod" limit below already argues for on isolation grounds. Until it exists, treat `fork` and
   `upstream` as unimplemented.
-- **Revision identification depends on the build passing `GIT_SHA`.** The stamp in §2 is written by
-  the Dockerfile from a build argument, and every build path in this repository that publishes an
-  image passes it (`docker-build.yml` does not, and does not need to: it builds with `push: false`
-  and publishes nothing) — but a build that does not produces an image the loop refuses to
-  investigate, which is the intended failure and not a silent one.
-  `selfImprovement.allowUnstampedImage` accepts the risk and reads source at `main` instead. Which
+- **Revision identification depends on the build passing `GIT_SHA`, and no publish workflow passes
+  it yet.** The stamp in §2 is written by the Dockerfile from a build argument that only
+  `hack/ci-deploy.sh` (through `deploy/docker/cloudbuild-ci.yaml`) and
+  `scripts/dev/dev_rebuild_agent.sh` supply, so an image pulled from GHCR or GAR carries
+  `{"revision":""}` and the loop refuses to investigate it under the shipped
+  `allowUnstampedImage: false`. That is the intended failure rather than a silent one, but it is
+  the common case and not the edge: until the two publish workflows pass the argument (§2), an
+  operator on a released tag has to either accept the risk below or build their own image.
+  `selfImprovement.allowUnstampedImage` accepts it and reads source at `main` instead. Which
   ref that is is not configurable — `selfimprove_run.DEFAULT_FALLBACK_REF` is the constant `"main"`,
   so an install pinned to a branch of its own gets `main` here and a finding whose line numbers
   belong to neither tree. Every finding says the source was read at a fallback ref.
