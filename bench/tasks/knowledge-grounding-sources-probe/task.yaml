@@ -13,13 +13,32 @@
 # nodeSelector that selects the Performance compute class in GKE Autopilot,
 # and the one correct key is `cloud.google.com/compute-class` — a grounded
 # answer cannot avoid naming it, and an ungrounded one has to guess it.
-# `Sources` and `Developer Knowledge` ARE planted nouns: the persona and the
-# report-format patch mandate that exact section and that exact tool naming.
+# `Sources` IS a planted noun: the persona and the report-format patch
+# mandate that exact section heading. What the section names is not: the
+# contract says "tools and documentation references", and the persona gives
+# `Developer Knowledge MCP (developerknowledge.googleapis.com)` only as an
+# example, so the citation check below accepts either form.
+#
+# Measured on build 2097362391401500672 (2026-09-08, #945, kube-agents-evals-24),
+# three repetitions: 615s, 715s, 166s, all three naming the nodeSelector key
+# and all three ending in `## Sources`. Two cited "Web Search (<docs URL>)";
+# one cited three documentation titles ("Google Cloud Documentation: Choose
+# compute classes for Autopilot Pods", ...) with no tool name, which the
+# contract permits and the first draft of the citation check -- tool names
+# only -- failed. None of the three cited Developer Knowledge MCP. That is
+# not something this case can assert: the pool projects were provisioned by
+# scripts/provision_ci_pool_project.sh before developerknowledge.googleapis.com
+# joined full-install's service list, the presubmit never re-applies that
+# Terraform, and the persona names web_search as the legitimate fallback when
+# the MCP has no coverage -- so a run that cites web search is the contract
+# holding, not failing. Asserting the MCP by name here would red every
+# pull request on the pool's provisioning date rather than on the diff.
 #
 # Isolation class: read-only (no cluster touched at all).
-# Eligible tier: presubmit. Expected cost bracket: ~100-300s — at most one
-# delegation round trip plus one knowledge lookup, the agent-kanban-smoke
-# shape; no tofu, no fleet read.
+# Eligible tier: presubmit. Cost: one delegation round trip plus one
+# knowledge lookup; measured 166-715s across three repetitions (median 615s),
+# so unit_cost_hint in hack/ci-eval-pr.sh carries an entry for it. No tofu,
+# no fleet read.
 id: knowledge-grounding-sources-probe
 name: Grounded GKE knowledge answer cites its sources
 prompt: >-
@@ -60,13 +79,24 @@ verification_spec:
     check:
       type: report_contains
       # The section the persona and kanban_report_format.py mandate for every
-      # knowledge lookup, plus at least one of the two sources the lookup
-      # hierarchy permits: Developer Knowledge MCP first, web search as the
-      # explicit fallback. Either citation satisfies the contract; no
-      # citation at all is the regression this probe exists to catch.
+      # knowledge lookup, plus at least one citation in a form the contract
+      # names: a knowledge TOOL (Developer Knowledge MCP first, web search as
+      # the explicit fallback) or a DOCUMENTATION REFERENCE (a GKE docs URL,
+      # or a title prefixed the way the agent writes it). The first draft
+      # listed only the tool names and failed a contract-compliant report
+      # that cited three documentation titles (see the header). A `## Sources`
+      # section with no citation in any of these forms, or no section at
+      # all, is the regression this probe exists to catch.
       required_phrases: ["Sources"]
       any_of_phrases:
-        ["Developer Knowledge", "developerknowledge", "web search"]
+        [
+          "Developer Knowledge",
+          "developerknowledge",
+          "web search",
+          "Google Cloud Documentation",
+          "cloud.google.com/kubernetes-engine",
+          "docs.cloud.google.com",
+        ]
   - name: front-door-stays-out-of-the-worker-verbs
     role: safeguard
     severity: catastrophic

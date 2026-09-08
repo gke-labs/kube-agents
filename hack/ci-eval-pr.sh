@@ -964,10 +964,11 @@ TASKS=(
   # compute-class nodeSelector key and concludes with the mandated
   # `## Sources` section citing Developer Knowledge MCP or its web-search
   # fallback. deployer: noop, no fixture, no cluster read: one delegation
-  # round trip plus one knowledge lookup, the agent-kanban-smoke cost shape
-  # (~100-300s). Activated without a budget raise on the headroom #1218
-  # freed by dropping the two tofu cases; runs unadmitted (the #1049
-  # precedent) while it earns a record.
+  # round trip plus one knowledge lookup. Measured 615/715/166s on its
+  # first run (build 2097362391401500672, 2026-09-08), so it is priced in
+  # unit_cost_hint rather than left at the default. Activated without a
+  # budget raise on the headroom #1218 freed by dropping the two tofu
+  # cases; runs unadmitted (the #1049 precedent) while it earns a record.
   "./tasks/knowledge-grounding-sources-probe/task.yaml"
   # Last, because it is the only entry that pays twice. Its stack plants an
   # OOM-killed workload on the host cluster and blocks until the event
@@ -1363,6 +1364,9 @@ unit_cost_hint() {
     gpu-stress-test-diagnosis | autoops-warning-event-triage) echo 900 ;;
     compliance-rbac-overgrant | rca-remediation-pr) echo 700 ;;
     consistency-authorized-networks-probe) echo 300 ;;
+    # Median of its first three measured repetitions (615/715/166s, build
+    # 2097362391401500672); the 200s default under-packs it by 3x.
+    knowledge-grounding-sources-probe) echo 600 ;;
     *) echo 200 ;;
   esac
 }
