@@ -229,12 +229,14 @@ the project and nothing else, and grants `roles/iam.serviceAccountTokenCreator` 
 account to the members in `var.fleet_reader_token_creators` — which defaults to
 `prowjob-default-sa@kube-agents-prow.iam.gserviceaccount.com`, the identity every
 presubmit runs as. `hack/ci-eval-pr.sh` exports `FLEET_READONLY_SA` pointing at the
-account, and `hack/fleet-kubeconfigs.sh` mints a token for it and writes each kubeconfig
-with that token as its only credential.
+account, and `hack/fleet-kubeconfigs.sh` writes each kubeconfig with an `exec:` credential
+naming `hack/fleet-reader-credential.sh`, which mints a token as that account whenever
+`kubectl` asks for one.
 
 Without the grant the script warns loudly on every run and the kubeconfigs carry the
-runner's own identity, which is `roles/container.admin` and four more write roles that
-`scripts/provision_ci_pool_project.sh` grants at onboarding — measured, not assumed:
+runner's own identity, which holds `roles/container.admin` among the twelve project roles
+`scripts/provision_ci_pool_project.sh` grants at onboarding (`PROW_RUNNER_ROLES` in
+`scripts/verify_ci_pool_project.py` is the list) — measured, not assumed:
 `kubectl auth can-i delete deployments -n seeded-debug` answers yes. There are zero
 ClusterRoleBindings or RoleBindings on these clusters naming any `*.gserviceaccount.com`
 subject; authorization comes entirely from the GKE IAM webhook, so there is nothing to
@@ -255,14 +257,16 @@ Three things about this are worth stating rather than assuming:
 - **Impersonation must be a minted token, not a flag on `get-credentials`.**
   `gke-gcloud-auth-plugin` has no impersonation option, so the exec credential a
   `get-credentials --impersonate-service-account` writes still resolves to the caller's
-  own identity at `kubectl` time. Only replacing the user entry with a minted access
-  token actually binds it.
+  own identity at `kubectl` time. Only a token minted by impersonation actually binds it.
+- **The token cannot be baked into the kubeconfig.** It lives one hour; these files are
+  written before the image build and read hours later (recorded whole-job times in
+  `hack/ci-eval-pr.sh`: 180 to 222 minutes). An expired credential makes every fleet check
+  report `status: "error"`, which reds the presubmit. Hence the `exec:` block, minting
+  against the clock of the check. `hack/fleet-reader-credential.sh` caches on disk because
+  `kubectl`'s own exec cache is per-process and every check is a separate invocation.
 - **`roles/container.viewer` was verified, not assumed.** Its permission set contains no
   `container.secrets.*` and no create/update/delete/patch verb; the single non-get/list
-  entry is `container.tokenReviews.create`. The bound worth remembering is lifetime: a
-  minted access token lives one hour, which bounds a run, not a fleet. The script mints
-  once, at the start; a run longer than the lifetime sees its fleet checks start
-  erroring, which is loud and correct but is a real operational limit.
+  entry is `container.tokenReviews.create`.
 - **Never fold gcloud's stderr into the token.** On the _success_ path
   `gcloud auth print-access-token --impersonate-service-account=...` prints
   `WARNING: This command is using service account impersonation...` to stderr. Capturing

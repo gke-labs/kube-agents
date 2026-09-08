@@ -80,6 +80,14 @@ _FLEET_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # from deleting something that matters.
 _FLEET_MARKER=".kube-agents-fleet-kubeconfigs"
 
+# The exec-credential plugin each rewritten kubeconfig points at, and the
+# schema its reply speaks. Absolute, because kubectl resolves `command`
+# relative to its own working directory and the checks that read these files
+# run from wherever the harness happens to be. The two constants are paired:
+# the plugin prints this same apiVersion back, and kubectl rejects a mismatch.
+_FLEET_CREDENTIAL_HELPER="${_FLEET_SCRIPT_DIR}/fleet-reader-credential.sh"
+_FLEET_CRED_API_VERSION="client.authentication.k8s.io/v1"
+
 # Roles the catalog declares, one per line:
 #
 #   <role> <cluster_slot> <namespace-or--> [<probe> ...]
@@ -242,10 +250,15 @@ _fleet_discover_clusters() {
 # metadata and nothing about who kubectl later talks to the API server as. A
 # minted access token is the only form that actually binds.
 #
-# The token is static and expires (one hour, unless the organization allows
-# extended lifetimes). A run longer than the lifetime sees its fleet checks
-# start erroring, which is loud and correct but is a real operational bound --
-# re-run this script rather than lengthening a run past it.
+# The token is NOT written into the file. It expires in an hour and the checks
+# that read these kubeconfigs start hours after this runs, so a baked token
+# would be expired for most of them; the file carries an exec entry pointing at
+# fleet-reader-credential.sh instead, which mints against the clock of the check
+# and caches between them. The mint below still happens, and is still what
+# decides whether the file is rewritten at all: it proves the caller can
+# actually impersonate $2 before the credential is committed to, so a project
+# missing the token-creator binding warns here and keeps its own credential
+# rather than producing a kubeconfig that fails later, one check at a time.
 #
 # The replacement file is composed from scratch and moved into place, so a
 # failure at any step leaves the gcloud-written credential intact rather than a
@@ -300,7 +313,15 @@ _fleet_use_readonly_token() {
       echo "users:"
       echo "  - name: fleet-reader"
       echo "    user:"
-      echo "      token: ${token}"
+      echo "      exec:"
+      echo "        apiVersion: ${_FLEET_CRED_API_VERSION}"
+      echo "        command: ${_FLEET_CREDENTIAL_HELPER}"
+      echo "        args:"
+      echo "          - ${sa}"
+      # Required in client.authentication.k8s.io/v1, and Never is the only
+      # honest value: nothing here can prompt, and kubectl runs under a
+      # presubmit with no terminal attached.
+      echo "        interactiveMode: Never"
     } >"$staged"
   ) || {
     rm -f "$staged"

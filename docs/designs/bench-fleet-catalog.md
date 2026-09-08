@@ -236,23 +236,20 @@ The fleet is shared by every open pull request, and no case may mutate it. A cas
 writes to a fixture spoils it for someone else, non-deterministically, ten minutes later
 and in another pull request's logs.
 
-Nothing enforces it today. The presubmit runs as `prowjob-default-sa@kube-agents-prow`,
-which holds `container.admin`, `container.developer`, `storage.admin` and
-`resourcemanager.projectIamAdmin` in every pool project (`gcloud projects
-get-iam-policy` on each, filtered to that member — and `scripts/provision_ci_pool_project.sh`
-now grants that set at onboarding, so a new project is no exception), no RBAC narrows it inside the clusters, and
-`kubectl auth can-i delete deployments -n seeded-debug` answers yes. So read-only is a
-rule cases obey, not a property of the credential, and it should not be read as a
-guarantee anywhere: an agent that decides remediation is helpful can delete the fixture
-every other pull request depends on, and the first evidence will be somebody else's case
-going red.
+The checks are enforced; the agent is not. `bench/tf/fleet` provisions
+`seeded-fleet-reader@<project>` with `roles/container.viewer` and nothing else, and the
+per-role kubeconfigs the fleet safeguards read impersonate it, so a check cannot write
+what it grades.
 
-Making it a guarantee means a second, narrower credential for fleet-dependent runs. Most
-of the drafted cases already need a GitOps-repo write path — the six audit scenarios and
-both remediation cases — which is contained by pinning
-it to a throwaway repository per eval project rather than by asking the agent not to; the
-cluster credential wants the same treatment. Until then, a case author's assertion that
-their case is read-only is the only control there is.
+The agent under test still runs as `prowjob-default-sa@kube-agents-prow`, which holds
+`container.admin` and eleven other project roles in every pool project
+(`PROW_RUNNER_ROLES` in `scripts/verify_ci_pool_project.py`), with no RBAC narrowing it
+inside the clusters. For the agent, then, read-only is a rule cases obey rather than a
+property of the credential: one that decides remediation is helpful can delete a fixture
+every other pull request depends on, and the first evidence will be somebody else's case
+going red. Most drafted cases already need a GitOps-repo write path — the six audit
+scenarios and both remediation cases — contained by pinning it to a throwaway repository
+per eval project; the agent's cluster credential wants the same treatment.
 
 Asserting read-only from inside a case is a state check against the fixture — "the
 planted defect survived the run" — and not `tool_called`, which sees only the delegating

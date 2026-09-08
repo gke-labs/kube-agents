@@ -130,11 +130,11 @@ resource "google_project_iam_member" "fleet_reader_container_viewer" {
   member  = "serviceAccount:${google_service_account.fleet_reader.email}"
 }
 
-# Who may mint a token AS the reader. Empty by default: an eval project with no
-# entry here still gets the account, and its runs fall back to the runner's own
-# credential with a loud warning from fleet-kubeconfigs.sh, rather than failing
-# to read the fleet at all. Populate it with the project's Prow runner identity
-# to actually close the write path.
+# Who may mint a token AS the reader. Defaults to the pool's Prow runner, which
+# is what closes the write path -- see variables.tf for why the default lives
+# there rather than in the caller. A project with no entry still gets the
+# account; its runs just fall back to the runner's own credential with a loud
+# warning from fleet-kubeconfigs.sh, rather than failing to read the fleet.
 resource "google_service_account_iam_member" "fleet_reader_token_creators" {
   for_each           = toset(var.fleet_reader_token_creators)
   service_account_id = google_service_account.fleet_reader.name

@@ -2440,6 +2440,23 @@ class IamGrantsTest(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertTrue(any("bench/tf/fleet" in d for d in result.details), result.details)
 
+    def test_unparseable_fleet_reader_policy_fails(self):
+        # gcloud exiting 0 with something that is not a policy is not an
+        # absence of the binding; reporting it as one would send an operator to
+        # re-apply Terraform that is already correct.
+        with mock.patch.object(checker, "run_cmd") as run:
+            run.side_effect = [
+                _ok(self._wi_policy("kube-agents-evals-3")),
+                _ok(self._project_policy()),
+                _ok(self._both_build_identities()),
+                _ok("Updates are available for some Google Cloud CLI components."),
+            ]
+            result = checker.check_iam_and_service_accounts("kube-agents-evals-3", "123456")
+        self.assertFalse(result.passed)
+        self.assertTrue(
+            any("Failed parsing policy" in d for d in result.details), result.details
+        )
+
     def test_denied_fleet_reader_policy_is_unverified(self):
         with mock.patch.object(checker, "run_cmd") as run:
             run.side_effect = [
@@ -2533,6 +2550,27 @@ class ProwRunnerRolesMatchGrantersTest(unittest.TestCase):
         ).read_text()
         documented = self._loop_roles(page, "deploy/ci-pool-projects.md")
         self.assertEqual(documented, checker.PROW_RUNNER_ROLES)
+
+
+class FleetReaderGranteeMatchesTerraformTest(unittest.TestCase):
+    """PROW_RUNNER_MEMBER must equal bench/tf/fleet's token-creator default.
+
+    The verifier asserts one member holds the grant and Terraform grants it to
+    another, and neither reads the other. Rename the runner in one place and the
+    verifier fails every correctly-applied project -- or, worse round, passes a
+    project whose grant went to an account that no longer runs anything.
+    """
+
+    def test_matches_the_variable_default(self):
+        variables = (checker._ROOT / "bench" / "tf" / "fleet" / "variables.tf").read_text()
+        block = re.search(
+            r'variable "fleet_reader_token_creators".*?\n\}', variables, re.S
+        )
+        self.assertIsNotNone(block, "fleet_reader_token_creators is gone from variables.tf")
+        default = re.search(r"default\s*=\s*\[(.*?)\]", block.group(0), re.S)
+        self.assertIsNotNone(default, "fleet_reader_token_creators has no default")
+        members = re.findall(r'"([^"]+)"', default.group(1))
+        self.assertEqual(members, [checker.PROW_RUNNER_MEMBER])
 
 
 class ExitStatusTest(unittest.TestCase):

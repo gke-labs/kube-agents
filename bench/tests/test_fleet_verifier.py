@@ -1459,19 +1459,63 @@ def _kubeconfig_stub(path: Path) -> None:
     )
 
 
-def test_the_readonly_rewrite_replaces_the_exec_plugin_with_a_token(shell, tmp_path):
+def test_the_readonly_rewrite_replaces_the_exec_plugin_with_the_credential_helper(
+    shell, tmp_path
+):
     target = tmp_path / "slot.kubeconfig"
     _kubeconfig_stub(target)
     done = shell(f'_fleet_use_readonly_token "{target}" reader@x.iam.gserviceaccount.com')
     assert done.returncode == 0, done.stderr
     written = target.read_text()
-    assert "token: ya29.a0AfB_byTOKEN" in written
+    assert "command: " in written and "fleet-reader-credential.sh" in written
+    assert "- reader@x.iam.gserviceaccount.com" in written
+    assert "apiVersion: client.authentication.k8s.io/v1" in written
+    assert "interactiveMode: Never" in written
     assert "gke-gcloud-auth-plugin" not in written
     assert "server: https://10.0.0.1" in written
     assert "certificate-authority-data: Y2E=" in written
 
 
-def test_the_impersonation_warning_does_not_end_up_inside_the_token(shell, tmp_path):
+def test_the_kubeconfig_carries_no_baked_token(shell, tmp_path):
+    """The whole point of the exec entry.
+
+    An impersonated token lives one hour; ci-eval-pr.sh writes these files once,
+    before the image build, and the fan-out that reads them starts hours later
+    -- 197.9, ~180 and 221.7 recorded whole-job minutes. A token written in here
+    is expired for most of the checks that use it, and an expired credential
+    makes every one of them report status="error", which is an absolute rung
+    that reds the presubmit for any case.
+    """
+    target = tmp_path / "slot.kubeconfig"
+    _kubeconfig_stub(target)
+    done = shell(f'_fleet_use_readonly_token "{target}" reader@x.iam.gserviceaccount.com')
+    assert done.returncode == 0, done.stderr
+    body = target.read_text()
+    assert "ya29.a0AfB_byTOKEN" not in body
+    assert "token:" not in body
+
+
+def test_the_mint_still_gates_the_rewrite(shell, tmp_path):
+    """The write-time mint survives the move to an exec entry, on purpose.
+
+    Nothing in the composed file needs the token any more, so the mint exists
+    only to prove the caller can impersonate the account before the credential
+    is committed to. Without it a project missing the token-creator binding
+    would get a well-formed kubeconfig that fails later, one check at a time,
+    instead of the warning and the fallback it gets today.
+    """
+    target = tmp_path / "slot.kubeconfig"
+    _kubeconfig_stub(target)
+    done = shell(
+        f'_fleet_use_readonly_token "{target}" reader@x.iam.gserviceaccount.com',
+        STUB_TOKEN="ERROR: (gcloud.auth) Permission denied",
+    )
+    assert done.returncode != 0
+    assert "gke-gcloud-auth-plugin" in target.read_text()
+    assert "fleet-reader-credential.sh" not in target.read_text()
+
+
+def test_the_impersonation_warning_does_not_break_the_mint_probe(shell, tmp_path):
     """A regression test for a bug this had.
 
     `gcloud auth print-access-token --impersonate-service-account=...` prints
@@ -1479,7 +1523,9 @@ def test_the_impersonation_warning_does_not_end_up_inside_the_token(shell, tmp_p
     on the SUCCESS path. Capturing it with `2>&1` made $token a multi-line blob
     that kubectl still accepted, so every API call 401'd while the script
     reported success -- a silent read-only rollout that authenticated as
-    nobody.
+    nobody. The token no longer reaches the file, but it still decides whether
+    the file is rewritten, so folding stderr in would now reject a mint that
+    succeeded.
     """
     target = tmp_path / "slot.kubeconfig"
     _kubeconfig_stub(target)
@@ -1488,7 +1534,7 @@ def test_the_impersonation_warning_does_not_end_up_inside_the_token(shell, tmp_p
         STUB_TOKEN_WARNING="WARNING: This command is using service account impersonation.",
     )
     assert done.returncode == 0, done.stderr
-    assert "token: ya29.a0AfB_byTOKEN\n" in target.read_text()
+    assert "fleet-reader-credential.sh" in target.read_text()
     assert "WARNING" not in target.read_text()
 
 
@@ -1537,7 +1583,7 @@ def test_a_cluster_with_no_ca_data_omits_the_key_rather_than_writing_it_empty(
     assert done.returncode == 0, done.stderr
     body = target.read_text()
     assert "certificate-authority-data" not in body
-    assert "token: ya29.a0AfB_byTOKEN\n" in body
+    assert "fleet-reader-credential.sh" in body
 
 
 def _provision(shell, tmp_path, **env) -> Path:
@@ -1595,7 +1641,8 @@ def test_a_read_only_service_account_reaches_every_role_file(shell, tmp_path):
     assert "the runner's own credential" not in done.stderr
     for path in out.glob("*.kubeconfig"):
         body = path.read_text()
-        assert "token: ya29.a0AfB_byTOKEN" in body, path
+        assert "fleet-reader-credential.sh" in body, path
+        assert "ya29.a0AfB_byTOKEN" not in body, path
         assert "gke-gcloud-auth-plugin" not in body, path
     call = next(
         line

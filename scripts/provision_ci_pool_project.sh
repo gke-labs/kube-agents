@@ -451,9 +451,8 @@ if [ "${SKIP_FLEET}" != "true" ]; then
       -backend-config="bucket=${STATE_BUCKET}" \
       -backend-config="prefix=seeded-fleet"
     # fleet_reader_token_creators defaults to the Prow runner, so this apply also
-    # grants it impersonation on seeded-fleet-reader. Do not pass it here: see the
-    # comment on the variable for why an apply that omits the value deletes the
-    # binding rather than leaving it alone.
+    # grants it impersonation on seeded-fleet-reader. Do not pass it with -var;
+    # variables.tf says why every apply has to carry the same value.
     tofu apply -auto-approve -var="project_id=${PROJECT_ID}"
   )
 else
