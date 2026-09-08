@@ -1,5 +1,6 @@
 """post_health.py posts on a transition, stays silent otherwise, digests once a
-day, and never lets the token, the space or the webhook URL reach a log.
+day, renders the five approved message shapes, and never lets the token, the
+space or the webhook URL reach a log.
 
 The HTTP layer is a recording fake handed in as `opener`; nothing here opens
 a socket or touches a bucket (the gs:// state path is exercised through a
@@ -20,27 +21,38 @@ from eval_dashboard import post_health
 SPACE = "spaces/AAAAtestspace"
 TOKEN = "ya29.super-secret-token-value"
 WEBHOOK = "https://chat.googleapis.com/v1/spaces/AAAA/messages?key=SECRETKEY&token=SECRETTOKEN"
+URL = post_health.DASHBOARD_URL
 
 T0 = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
 
+TRIO = ["cluster-agent-crashloop-debug", "cluster-agent-crashloop-evidence-chain", "cluster-agent-crashloop-misleading-symptom"]
+CONDITION = {"GREEN": None, "DEGRADED": "storm", "OUTAGE": "shared_break"}
 
-def health(state="GREEN", cause="", cases=(), since="2026-09-04T03:30:00+00:00", advice="", evidence=()):
+
+def health(state="GREEN", cause="", cases=(), since="2026-09-04T03:30:00+00:00", condition=None, prs=(), runs=0, window=(None, None), issues=()):
     return {
         "schema_version": 1,
         "state": state,
-        "condition": None if state == "GREEN" else "shared_break",
+        "condition": condition or CONDITION[state],
         "since": since,
         "cause": cause,
         "failing_cases": list(cases),
-        "evidence": list(evidence),
-        "advice": advice,
+        "tracking_issues": list(issues),
+        "incident": None
+        if state == "GREEN"
+        else {"prs": list(prs), "runs": runs, "window_start": window[0], "window_end": window[1]},
+        "evidence": [],
+        "advice": "",
         "recovering": False,
+        "stale": False,
         "metrics": {
             "window_hours": 24,
             "full_runs": 31,
             "prs": 19,
             "green_runs": 26,
             "red_runs": 5,
+            "pr_caused_reds": 2,
+            "infra_reds": 5,
             "green_rate": 0.839,
             "aborted_runs": 40,
             "setup_deaths": 2,
@@ -48,10 +60,21 @@ def health(state="GREEN", cause="", cases=(), since="2026-09-04T03:30:00+00:00",
             "infra_reps": 110,
             "wall_clock_p50_s": 7500,
             "wall_clock_p90_s": 16200,
-            "fixtures": {"healed": 28, "broken": 2, "projects": 30},
         },
         "generated_at": "2026-09-04T12:00:00+00:00",
     }
+
+
+def outage(cases=TRIO, since="2026-09-08T09:00:00+00:00", prs=(1246, 1238, 608, 1150, 1226, 1275), issues=()):
+    return health("OUTAGE", "shared fixture/environment break: " + ", ".join(cases), cases, since=since, prs=prs, runs=len(prs), issues=issues)
+
+
+def storm(since="2026-09-03T18:30:00+00:00", window=("2026-09-03T17:15:00+00:00", "2026-09-03T18:25:00+00:00"), prs=(1182, 1167, 1188)):
+    return health("DEGRADED", "quota storm window 17:15–18:25 UTC", since=since, condition="storm", prs=prs, runs=len(prs), window=window)
+
+
+def deaths(since="2026-09-05T13:00:00+00:00", prs=(965, 1121, 1186, 1199)):
+    return health("DEGRADED", "setup/clone failures on 4 runs", since=since, condition="setup_deaths", prs=prs, runs=4)
 
 
 class FakeResponse:
@@ -83,6 +106,10 @@ class FakeOpener:
     def bodies(self):
         return [json.loads(req.data.decode("utf-8")) for req in self.requests]
 
+    @property
+    def texts(self):
+        return [body["text"] for body in self.bodies]
+
 
 class RunHarness(unittest.TestCase):
     """Drives `main` end to end against a temp state file and a fake opener."""
@@ -109,99 +136,157 @@ class RunHarness(unittest.TestCase):
             )
         return rc, err.getvalue()
 
+    def recorded(self):
+        return json.loads(self.state.read_text())
+
+
+# --------------------------------------------------------------------------- #
+# The five shapes
+# --------------------------------------------------------------------------- #
+
+
+class Shapes(RunHarness):
+    def test_outage(self):
+        self.tick(outage(issues=["#1278"]), T0)
+        self.assertEqual(
+            self.opener.texts[0],
+            "🔴 *Smoke gate: broken* — the 3 crashloop tests fail on every PR since 09:00 UTC (6 PRs so far). Shared test fixture, not your code.\n"
+            "Don't retest yet. Tracking #1278.\n"
+            f"{URL}?cases=cluster-agent-crashloop-debug,cluster-agent-crashloop-evidence-chain,cluster-agent-crashloop-misleading-symptom&since=2026-09-08T09:00:00Z#gate",
+        )
+
+    def test_outage_without_an_issue_says_so(self):
+        self.tick(outage(cases=["cost-idle-pool-probe"], prs=(1, 2, 3)), T0)
+        lines = self.opener.texts[0].split("\n")
+        self.assertEqual(lines[0], "🔴 *Smoke gate: broken* — cost-idle-pool-probe fail on every PR since 09:00 UTC (3 PRs so far). Shared test fixture, not your code.")
+        self.assertEqual(lines[1], "Don't retest yet. Tracking no issue yet — file one with the presubmit-gate label.")
+
+    def test_storm(self):
+        self.tick(storm(), T0)
+        self.assertEqual(
+            self.opener.texts[0],
+            "🟡 *Smoke gate: flaky* — quota storm 17:15–18:25 UTC hit 3 PRs.  Passing runs still count; if yours went red, retest after 18:55 UTC.\n"
+            f"{URL}?since=2026-09-03T18:30:00Z#gate",
+        )
+
+    def test_setup_deaths(self):
+        self.tick(deaths(), T0)
+        self.assertEqual(
+            self.opener.texts[0],
+            "🟡 *Smoke gate: flaky* — 4 runs on 4 PRs died during setup since 13:00 UTC.  Passing runs still count; if yours died before any test ran, retest.\n"
+            f"{URL}?since=2026-09-05T13:00:00Z#gate",
+        )
+
+    def test_recovery(self):
+        self.tick(outage(cases=TRIO, since="2026-09-07T14:00:00+00:00", issues=["#1269"]), T0.replace(day=7, hour=14))
+        self.tick(health(since="2026-09-08T01:00:00+00:00"), T0.replace(day=8, hour=1))
+        self.assertEqual(
+            self.opener.texts[1],
+            "🟢 *Smoke gate: healthy again* — fixed after 11h (the 3 crashloop tests were failing, #1269).\n"
+            f"{URL}?cases=cluster-agent-crashloop-debug,cluster-agent-crashloop-evidence-chain,cluster-agent-crashloop-misleading-symptom&since=2026-09-07T14:00:00Z&until=2026-09-08T01:00:00Z#gate",
+        )
+
+    def test_recovery_from_a_storm(self):
+        self.tick(storm(since="2026-09-04T09:47:00+00:00"), T0)
+        self.tick(health(), T0.replace(hour=15, minute=30))
+        self.assertEqual(self.opener.texts[1].split("\n")[0], "🟢 *Smoke gate: healthy again* — fixed after 5h 43m (quota storm).")
+
+    def test_digest(self):
+        self.tick(health(), T0.replace(hour=8, minute=5))
+        self.assertEqual(
+            self.opener.texts[0],
+            f"📊 *Smoke gate, last 24h:* 31 runs · 26 green · 2 PR-caused red · 5 infra · typical run 125 min\n{URL}?since=2026-09-04T03:30:00Z#agent",
+        )
+
+    def test_stale_and_fresh_again(self):
+        doc = health()
+        doc["stale"] = True
+        doc["generated_at"] = "2026-09-04T05:55:40+00:00"
+        self.tick(doc, T0)
+        self.assertEqual(self.opener.texts[0], "⚪ *Smoke gate: no fresh data since 05:55 UTC* — the health bot can't see recent runs. Someone check the refresh job.")
+        self.tick(health(), T0.replace(minute=15))
+        self.assertEqual(self.opener.texts[1], "⚪ *Smoke gate: fresh data again* — refreshed 12:00 UTC; the gate reads GREEN.")
+
+    def test_case_descriptions(self):
+        d = post_health.describe_cases
+        self.assertEqual(d(TRIO), "the 3 crashloop tests")
+        self.assertEqual(d(["cost-idle-pool-probe"]), "cost-idle-pool-probe")
+        self.assertEqual(d(["cost-idle-pool-probe", "security-overgrant-probe"]), "cost-idle-pool-probe and security-overgrant-probe")
+        self.assertEqual(d(["a-probe", "b-probe", "c-probe", "d-probe"]), "4 tests (a-probe, b-probe, c-probe and 1 more)")
+        self.assertEqual(d(["obtainability-remediation-proposal", "obtainability-fleet-exposure-sweep"]), "the 2 obtainability tests")
+        self.assertEqual(d([]), "tests")
+
+
+# --------------------------------------------------------------------------- #
+# When a message goes out
+# --------------------------------------------------------------------------- #
+
 
 class TransitionPosting(RunHarness):
     def test_first_green_tick_posts_nothing_but_records_state(self):
         rc, err = self.tick(health(), T0)
         self.assertEqual(rc, 0)
         self.assertEqual(self.opener.requests, [])
-        self.assertEqual(json.loads(self.state.read_text())["state"], "GREEN")
+        self.assertEqual(self.recorded()["state"], "GREEN")
         self.assertIn("posted nothing", err)
 
     def test_first_tick_in_trouble_posts_the_state(self):
-        rc, _ = self.tick(health("DEGRADED", "quota storm window 18:23–19:58 UTC", advice="Retest after 20:28 UTC."), T0)
+        rc, _ = self.tick(storm(), T0)
         self.assertEqual(rc, 0)
         self.assertEqual(len(self.opener.requests), 1)
-        text = self.opener.bodies[0]["text"]
-        self.assertTrue(text.startswith("*CI health: DEGRADED* — quota storm"))
-        self.assertIn("Advice: Retest after 20:28 UTC.", text)
-        self.assertIn(post_health.DASHBOARD_URL, text)
+        self.assertTrue(self.opener.texts[0].startswith("🟡 *Smoke gate: flaky*"))
 
     def test_posts_on_transition_and_stays_silent_without_one(self):
         self.tick(health(), T0)
         self.tick(health(), T0.replace(minute=15))
         self.assertEqual(self.opener.requests, [], "no change, no post")
-        outage = health(
-            "OUTAGE",
-            "shared fixture/environment break: cluster-agent-crashloop-debug",
-            ["cluster-agent-crashloop-debug"],
-            since="2026-09-04T12:30:00+00:00",
-            advice="Don't retest yet; the failing cases share a cause. Tracking: #1278",
-            evidence=["cluster-agent-crashloop-debug failed all graded reps on 6 runs from 6 PRs (#1, #2, #3, #4, #5, #6)"],
-        )
-        self.tick(outage, T0.replace(minute=30))
+        doc = outage(since="2026-09-04T12:30:00+00:00")
+        self.tick(doc, T0.replace(minute=30))
         self.assertEqual(len(self.opener.requests), 1)
-        text = self.opener.bodies[0]["text"]
-        self.assertIn("*CI health: OUTAGE* (was GREEN)", text)
-        self.assertIn("• cluster-agent-crashloop-debug failed all graded reps", text)
-        self.assertIn("Tracking: #1278", text)
-        self.tick(outage, T0.replace(minute=45))
-        self.assertEqual(len(self.opener.requests), 1, "same outage, same cause: silent")
+        self.assertTrue(self.opener.texts[0].startswith("🔴 *Smoke gate: broken*"))
+        self.tick(doc, T0.replace(minute=45))
+        self.assertEqual(len(self.opener.requests), 1, "same outage, same cases: silent")
 
     def test_outage_reposts_only_when_a_new_case_joins_and_not_within_the_interval(self):
-        one = health("OUTAGE", "break: a", ["a"], since="2026-09-04T12:00:00+00:00")
-        two = health("OUTAGE", "break: a, b", ["a", "b"], since="2026-09-04T12:00:00+00:00")
+        one = outage(cases=["a"], since="2026-09-04T12:00:00+00:00", prs=(1, 2, 3))
+        two = outage(cases=["a", "b"], since="2026-09-04T12:00:00+00:00", prs=(1, 2, 3, 4))
         self.tick(one, T0)
         self.tick(two, T0.replace(minute=30))
         self.assertEqual(len(self.opener.requests), 1, "a new case inside the interval waits")
         self.tick(two, T0.replace(hour=14, minute=15))
         self.assertEqual(len(self.opener.requests), 2, "past the interval the grown list goes out")
+        self.assertIn("a and b fail on every PR since 12:00 UTC (4 PRs so far)", self.opener.texts[1])
         self.tick(one, T0.replace(hour=17))
         self.assertEqual(len(self.opener.requests), 2, "a case dropping off is not news")
 
-    def test_recovery_names_the_duration_and_the_cause(self):
-        self.tick(health("DEGRADED", "quota storm window 18:23–19:58 UTC", since="2026-09-04T09:47:00+00:00"), T0)
-        self.tick(health(), T0.replace(hour=15, minute=30))
-        self.assertEqual(len(self.opener.requests), 2)
-        text = self.opener.bodies[1]["text"]
-        self.assertIn("*CI health: GREEN* — recovered after 5h 43m of DEGRADED (quota storm window 18:23–19:58 UTC)", text)
-        self.assertIn(post_health.DASHBOARD_URL, text)
-
     def test_a_condition_change_inside_degraded_is_posted(self):
-        storm = health("DEGRADED", "quota storm window 18:23–19:58 UTC")
-        storm["condition"] = "storm"
-        deaths = health("DEGRADED", "setup/clone failures on 3 runs (#1, #2)")
-        deaths["condition"] = "setup_deaths"
-        self.tick(storm, T0)
-        self.tick(deaths, T0.replace(minute=15))
+        self.tick(storm(), T0)
+        self.tick(deaths(), T0.replace(minute=15))
         self.assertEqual(len(self.opener.requests), 2)
-        self.assertIn("*CI health: DEGRADED* — setup/clone failures", self.opener.bodies[1]["text"])
+        self.assertIn("died during setup", self.opener.texts[1])
 
     def test_staleness_is_posted_once_each_way(self):
         doc = health()
         doc["stale"] = True
-        doc["metrics"]["data_age_s"] = 4 * 24 * 3600
         doc["generated_at"] = "2026-09-04T05:55:40+00:00"
         self.tick(doc, T0)
         self.tick(doc, T0.replace(minute=15))
         self.assertEqual(len(self.opener.requests), 1)
-        text = self.opener.bodies[0]["text"]
-        self.assertTrue(text.startswith("*CI health: data is stale* — data.json last refreshed 2026-09-04T05:55:40+00:00 (96h ago)"), text)
         self.tick(health(), T0.replace(minute=30))
         self.assertEqual(len(self.opener.requests), 2)
-        self.assertTrue(self.opener.bodies[1]["text"].startswith("*CI health: data is fresh again*"))
+        self.assertTrue(self.opener.texts[1].startswith("⚪ *Smoke gate: fresh data again*"))
 
     def test_a_failed_digest_beside_a_posted_change_does_not_repeat_the_change(self):
         self.tick(health(), T0)
         partial = FakeOpener(statuses=[200, 500])
-        rc, err = self.tick(health("DEGRADED", "quota storm window 07:10–07:40 UTC"), T0.replace(hour=7, minute=50), opener=partial)
+        rc, err = self.tick(storm(), T0.replace(hour=7, minute=50), opener=partial)
         self.assertEqual(rc, 1)
         self.assertIn("failed to post: digest", err)
-        self.assertEqual([body["text"].split("\n")[0][:24] for body in partial.bodies], ["*CI health: DEGRADED* (w", "*CI health daily digest "])
-        rc, _ = self.tick(health("DEGRADED", "quota storm window 07:10–07:40 UTC"), T0.replace(hour=8, minute=5))
+        self.assertEqual([text.split(" ")[0] for text in partial.texts], ["🟡", "📊"])
+        rc, _ = self.tick(storm(), T0.replace(hour=8, minute=5))
         self.assertEqual(rc, 0)
         self.assertEqual(len(self.opener.requests), 1, "only the digest is retried")
-        self.assertTrue(self.opener.bodies[0]["text"].startswith("*CI health daily digest"))
+        self.assertTrue(self.opener.texts[0].startswith("📊"))
 
     def test_a_change_that_fails_beside_a_stale_notice_that_succeeds_is_posted_next_tick(self):
         # The dashboard refresh resumes after a stall and the fresh data
@@ -209,50 +294,56 @@ class TransitionPosting(RunHarness):
         # change's POST fails, the state file must not record the OUTAGE as
         # told on the strength of the stale notice.
         self.tick(health(), T0)
-        outage = health("OUTAGE", "break: a", ["a"], since="2026-09-04T12:15:00+00:00")
-        outage["stale"] = True
-        outage["metrics"]["data_age_s"] = 7200
+        doc = outage(cases=["a"], since="2026-09-04T12:15:00+00:00", prs=(1, 2, 3))
+        doc["stale"] = True
         partial = FakeOpener(statuses=[500, 200])
-        rc, err = self.tick(outage, T0.replace(minute=15), opener=partial)
+        rc, err = self.tick(doc, T0.replace(minute=15), opener=partial)
         self.assertEqual(rc, 1)
         self.assertIn("failed to post: change", err)
-        recorded = json.loads(self.state.read_text())
+        recorded = self.recorded()
         self.assertEqual((recorded["state"], recorded["failing_cases"], recorded["stale"]), ("GREEN", [], True))
-        rc, _ = self.tick(outage, T0.replace(minute=30))
+        rc, _ = self.tick(doc, T0.replace(minute=30))
         self.assertEqual(rc, 0)
         self.assertEqual(len(self.opener.requests), 1, "the change alone is retried")
-        self.assertTrue(self.opener.bodies[0]["text"].startswith("*CI health: OUTAGE* (was GREEN)"))
+        self.assertTrue(self.opener.texts[0].startswith("🔴 *Smoke gate: broken*"))
         # The mirror: change succeeds, stale fails -> stale retried alone.
-        fresh = health("OUTAGE", "break: a", ["a"], since="2026-09-04T12:15:00+00:00")
+        fresh = outage(cases=["a"], since="2026-09-04T12:15:00+00:00", prs=(1, 2, 3))
         partial = FakeOpener(statuses=[500])
         self.tick(fresh, T0.replace(minute=45), opener=partial)  # stale flips back to False; the post fails
-        self.assertTrue(json.loads(self.state.read_text())["stale"], "still told as stale")
+        self.assertTrue(self.recorded()["stale"], "still told as stale")
         self.tick(fresh, T0.replace(hour=13))
-        self.assertTrue(self.opener.bodies[-1]["text"].startswith("*CI health: data is fresh again*"))
+        self.assertTrue(self.opener.texts[-1].startswith("⚪ *Smoke gate: fresh data again*"))
 
     def test_a_stale_notice_mid_outage_does_not_swallow_a_case_that_joined_inside_the_interval(self):
-        one = health("OUTAGE", "break: a", ["a"], since="2026-09-04T12:00:00+00:00")
-        two = health("OUTAGE", "break: a, b", ["a", "b"], since="2026-09-04T12:00:00+00:00")
+        one = outage(cases=["a"], since="2026-09-04T12:00:00+00:00", prs=(1, 2, 3))
+        two = outage(cases=["a", "b"], since="2026-09-04T12:00:00+00:00", prs=(1, 2, 3))
         two["stale"] = True
-        two["metrics"]["data_age_s"] = 7200
         self.tick(one, T0)
         self.tick(two, T0.replace(minute=30))
         self.assertEqual(len(self.opener.requests), 2, "the stale notice went out; b is inside the interval")
-        self.assertEqual(json.loads(self.state.read_text())["failing_cases"], ["a"], "b is not recorded as told")
+        self.assertEqual(self.recorded()["failing_cases"], ["a"], "b is not recorded as told")
         self.tick(two, T0.replace(hour=14, minute=15))
         self.assertEqual(len(self.opener.requests), 3)
-        self.assertIn("break: a, b", self.opener.bodies[-1]["text"])
+        self.assertIn("a and b fail on every PR", self.opener.texts[-1])
 
     def test_a_failed_post_leaves_the_state_untouched_so_the_next_tick_retries(self):
         self.tick(health(), T0)
         failing = FakeOpener(statuses=[500])
-        rc, err = self.tick(health("DEGRADED", "setup/clone failures on 3 runs (#1, #2)"), T0.replace(minute=15), opener=failing)
+        rc, err = self.tick(deaths(), T0.replace(minute=15), opener=failing)
         self.assertEqual(rc, 1)
         self.assertIn("HTTP 500", err)
-        self.assertEqual(json.loads(self.state.read_text())["state"], "GREEN")
-        rc, _ = self.tick(health("DEGRADED", "setup/clone failures on 3 runs (#1, #2)"), T0.replace(minute=30))
+        self.assertEqual(self.recorded()["state"], "GREEN")
+        rc, _ = self.tick(deaths(), T0.replace(minute=30))
         self.assertEqual(rc, 0)
         self.assertEqual(len(self.opener.requests), 1, "retried on the next tick")
+
+    def test_the_recovery_cites_what_the_space_was_told(self):
+        # The tracking issue and cases recorded at the change are what the
+        # recovery names, even if health.json has since dropped them.
+        self.tick(outage(cases=["a"], prs=(1, 2, 3), issues=["#1"]), T0)
+        self.assertEqual(self.recorded()["tracking_issues"], ["#1"])
+        self.tick(health(), T0.replace(hour=15))
+        self.assertIn("(a were failing, #1)", self.opener.texts[1])
 
 
 class Digest(RunHarness):
@@ -261,67 +352,69 @@ class Digest(RunHarness):
         self.assertEqual(self.opener.requests, [], "outside the window")
         self.tick(health(), T0.replace(hour=7, minute=45))
         self.assertEqual(len(self.opener.requests), 1)
-        text = self.opener.bodies[0]["text"]
-        self.assertTrue(text.startswith("*CI health daily digest (2026-09-04)* — GREEN since 03:30 UTC"))
-        self.assertIn("31 full runs on 19 PRs, 26 green (84%)", text)
-        self.assertIn("wall clock p50 2h 05m / p90 4h 30m", text)
-        self.assertIn("infra reps 6%", text)
-        self.assertIn("setup failures 2", text)
-        self.assertIn("Fixtures: 28 healed, 2 broken, across 30 projects", text)
-        self.assertIn(post_health.DASHBOARD_URL, text)
+        self.assertTrue(self.opener.texts[0].startswith("📊 *Smoke gate, last 24h:* 31 runs · 26 green"))
         self.tick(health(), T0.replace(hour=8, minute=0))
         self.tick(health(), T0.replace(hour=8, minute=15))
         self.assertEqual(len(self.opener.requests), 1, "one digest per day")
         self.tick(health(), T0.replace(day=5, hour=8, minute=5))
         self.assertEqual(len(self.opener.requests), 2, "the next day gets its own")
 
-    def test_digest_hour_is_configurable_and_carries_the_cause_when_not_green(self):
-        doc = health("OUTAGE", "shared fixture/environment break: x", ["x"], advice="Don't retest yet; the failing cases share a cause. Tracking: #1278")
-        self.tick(doc, T0.replace(hour=13, minute=50), digest_hour=14)
-        kinds = [body["text"].split("\n")[0] for body in self.opener.bodies]
-        self.assertEqual(len(kinds), 2, "the first tick posts the state and the digest")
-        self.assertTrue(any(line.startswith("*CI health daily digest (2026-09-04)* — OUTAGE since 03:30 UTC: shared fixture") for line in kinds))
-        self.assertIn("Advice: Don't retest yet", self.opener.bodies[1]["text"])
+    def test_digest_hour_is_configurable_and_goes_out_beside_a_change(self):
+        self.tick(outage(), T0.replace(hour=13, minute=50), digest_hour=14)
+        self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["🔴", "📊"])
+
+    def test_digest_without_a_p50_says_so(self):
+        doc = health()
+        doc["metrics"]["wall_clock_p50_s"] = None
+        self.tick(doc, T0.replace(hour=8, minute=5))
+        self.assertIn("typical run n/a", self.opener.texts[0])
+
+
+# --------------------------------------------------------------------------- #
+# Deep links
+# --------------------------------------------------------------------------- #
 
 
 class DeepLinks(RunHarness):
-    """Every message ends with the dashboard deep link the dashboard
-    understands: query before fragment, literal commas and colons, #gate for
-    an incident, #agent for the digest."""
+    """Every message but the stale notice ends with the dashboard deep link the
+    dashboard understands: query before fragment, literal commas and colons,
+    #gate for an incident, #agent for the digest."""
 
     def last_line(self, index=-1):
-        return self.opener.bodies[index]["text"].split("\n")[-1]
+        return self.opener.texts[index].split("\n")[-1]
 
     def test_a_state_change_links_the_cases_and_the_start(self):
-        self.tick(health("OUTAGE", "break", ["cluster-agent-crashloop-debug", "cluster-agent-crashloop-evidence-chain"], since="2026-09-08T03:08:00+00:00"), T0)
-        self.assertEqual(
-            self.last_line(),
-            "https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html?cases=cluster-agent-crashloop-debug,cluster-agent-crashloop-evidence-chain&since=2026-09-08T03:08:00Z#gate",
-        )
+        self.tick(outage(cases=["cluster-agent-crashloop-debug", "cluster-agent-crashloop-evidence-chain"], since="2026-09-08T03:08:00+00:00"), T0)
+        self.assertEqual(self.last_line(), f"{URL}?cases=cluster-agent-crashloop-debug,cluster-agent-crashloop-evidence-chain&since=2026-09-08T03:08:00Z#gate")
 
     def test_a_storm_links_the_start_without_cases(self):
-        self.tick(health("DEGRADED", "quota storm window 18:23–19:58 UTC", since="2026-09-04T18:30:00+00:00"), T0)
-        self.assertEqual(self.last_line(), f"{post_health.DASHBOARD_URL}?since=2026-09-04T18:30:00Z#gate")
+        self.tick(storm(since="2026-09-04T18:30:00+00:00"), T0)
+        self.assertEqual(self.last_line(), f"{URL}?since=2026-09-04T18:30:00Z#gate")
 
     def test_a_recovery_closes_the_incident_with_until(self):
-        self.tick(health("OUTAGE", "break", ["x-probe"], since="2026-09-04T03:08:00+00:00"), T0)
+        self.tick(outage(cases=["x-probe"], since="2026-09-04T03:08:00+00:00", prs=(1, 2, 3)), T0)
         self.tick(health(since="2026-09-04T14:00:00+00:00"), T0.replace(hour=14))
-        self.assertEqual(self.last_line(), f"{post_health.DASHBOARD_URL}?cases=x-probe&since=2026-09-04T03:08:00Z&until=2026-09-04T14:00:00Z#gate")
+        self.assertEqual(self.last_line(), f"{URL}?cases=x-probe&since=2026-09-04T03:08:00Z&until=2026-09-04T14:00:00Z#gate")
 
     def test_the_digest_links_the_agent_section(self):
         self.tick(health(since="2026-09-04T03:30:00+00:00"), T0.replace(hour=8, minute=5))
-        self.assertEqual(self.last_line(), f"{post_health.DASHBOARD_URL}?since=2026-09-04T03:30:00Z#agent")
+        self.assertEqual(self.last_line(), f"{URL}?since=2026-09-04T03:30:00Z#agent")
 
     def test_the_link_is_the_whole_last_line(self):
-        self.tick(health("DEGRADED", "x", since="2026-09-04T18:30:00+00:00"), T0)
-        text = self.opener.bodies[0]["text"]
+        self.tick(storm(since="2026-09-04T18:30:00+00:00"), T0)
+        text = self.opener.texts[0]
         self.assertTrue(text.split("\n")[-1].startswith("https://"))
         self.assertNotIn("Dashboard:", text)
 
 
+# --------------------------------------------------------------------------- #
+# Secrets and transport
+# --------------------------------------------------------------------------- #
+
+
 class Secrecy(RunHarness):
     def test_the_chat_api_request_shape(self):
-        self.tick(health("DEGRADED", "quota storm window 18:23–19:58 UTC"), T0)
+        self.tick(storm(), T0)
         request = self.opener.requests[0]
         self.assertEqual(request.full_url, "https://chat.googleapis.com/v1/spaces/AAAAtestspace/messages")
         self.assertEqual(request.get_method(), "POST")
@@ -331,30 +424,30 @@ class Secrecy(RunHarness):
 
     def test_a_bare_space_id_is_normalized(self):
         environ = {post_health.SPACE_ENV: "AAAAtestspace", post_health.TOKEN_ENV: TOKEN}
-        self.tick(health("DEGRADED", "x"), T0, environ=environ)
+        self.tick(storm(), T0, environ=environ)
         self.assertTrue(self.opener.requests[0].full_url.endswith("/spaces/AAAAtestspace/messages"))
 
     def test_webhook_is_the_alternative_when_no_space_is_set(self):
         environ = {post_health.WEBHOOK_ENV: WEBHOOK}
-        self.tick(health("DEGRADED", "x"), T0, environ=environ)
+        self.tick(storm(), T0, environ=environ)
         request = self.opener.requests[0]
         self.assertEqual(request.full_url, WEBHOOK)
         self.assertIsNone(request.get_header("Authorization"))
         self.assertEqual(set(self.opener.bodies[0]), {"text"})
 
     def test_nothing_configured_exits_zero_and_posts_nothing(self):
-        rc, err = self.tick(health("OUTAGE", "x", ["x"]), T0, environ={})
+        rc, err = self.tick(outage(), T0, environ={})
         self.assertEqual(rc, 0)
         self.assertEqual(self.opener.requests, [])
         self.assertIn("webhook not configured", err)
         self.assertFalse(self.state.exists(), "no state is recorded for a post that never happened")
 
     def test_no_secret_reaches_the_log_on_success_or_failure(self):
-        _, ok_err = self.tick(health("DEGRADED", "x"), T0)
+        _, ok_err = self.tick(storm(), T0)
         failing = FakeOpener(statuses=[403])
-        _, fail_err = self.tick(health("OUTAGE", "y", ["y"]), T0.replace(minute=15), opener=failing)
+        _, fail_err = self.tick(outage(), T0.replace(minute=15), opener=failing)
         environ = {post_health.WEBHOOK_ENV: WEBHOOK}
-        _, hook_err = self.tick(health("GREEN"), T0.replace(minute=30), environ=environ, opener=FakeOpener(statuses=[404]))
+        _, hook_err = self.tick(health(), T0.replace(minute=30), environ=environ, opener=FakeOpener(statuses=[404]))
         for text in (ok_err, fail_err, hook_err):
             self.assertNotIn(TOKEN, text)
             self.assertNotIn("SECRETKEY", text)
@@ -364,12 +457,12 @@ class Secrecy(RunHarness):
         self.assertIn("HTTP 404", hook_err)
 
     def test_dry_run_prints_the_message_and_still_records_state(self):
-        rc, err = self.tick(health("DEGRADED", "quota storm window 18:23–19:58 UTC"), T0, environ={}, dry_run=True)
+        rc, err = self.tick(storm(), T0, environ={}, dry_run=True)
         self.assertEqual(rc, 0)
         self.assertIn("--dry-run: would post [change]", err)
-        self.assertIn("*CI health: DEGRADED*", err)
+        self.assertIn("🟡 *Smoke gate: flaky*", err)
         self.assertEqual(self.opener.requests, [])
-        self.assertEqual(json.loads(self.state.read_text())["state"], "DEGRADED")
+        self.assertEqual(self.recorded()["state"], "DEGRADED")
 
 
 class BucketState(unittest.TestCase):

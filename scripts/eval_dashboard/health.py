@@ -493,6 +493,8 @@ def shared_break(full_runs, now: datetime, roster: Roster) -> dict:
         "evidence": evidence,
         "pr_caused": pr_caused,
         "signature_runs": {run.build_id for run in covered},
+        "prs": _prs(covered),
+        "runs": len(covered),
     }
 
 
@@ -519,6 +521,7 @@ def storm(full_runs, now: datetime) -> dict:
         "end": end,
         "evidence": evidence if fires else [],
         "signature_runs": {run.build_id for run in hit if run.storm_reps >= STORM_RUN_SIGNATURE_REPS},
+        "runs": len(hit),
     }
 
 
@@ -545,7 +548,27 @@ def percentile(values: list[float], pct: int) -> float | None:
     return ordered[index]
 
 
-def metrics(runs, now: datetime, fixtures: dict | None) -> dict:
+def pr_caused_reds(full_runs, roster: Roster) -> int:
+    """Rule 4 over a set of runs: red runs whose every collapsed admitted case
+    collapsed on no other pull request among them. A red with no admitted
+    collapse (an absolute rung, an empty record) is not this: it is the
+    environment's, and the digest counts it on the infra side."""
+    prs_by_case: dict[str, set] = {}
+    for run in full_runs:
+        admitted = roster.at(run.started or run.finished)
+        for case in run.collapsed_cases() & admitted:
+            prs_by_case.setdefault(case, set()).add(run.pr)
+    count = 0
+    for run in full_runs:
+        if run.result != RUN_FAILURE:
+            continue
+        mine = run.collapsed_cases() & roster.at(run.started or run.finished)
+        if mine and all(prs_by_case[case] == {run.pr} for case in mine):
+            count += 1
+    return count
+
+
+def metrics(runs, now: datetime, fixtures: dict | None, roster: Roster) -> dict:
     """Rule 5: what a GREEN report and the daily digest carry."""
     window = _in_window(runs, now, METRICS_WINDOW)
     full = [run for run in window if run.full]
@@ -554,15 +577,23 @@ def metrics(runs, now: datetime, fixtures: dict | None) -> dict:
     walls = [run.wall_clock.total_seconds() for run in concluded if run.wall_clock]
     reps = sum(run.total_reps for run in full)
     storm_reps = sum(run.storm_reps for run in full)
+    reds = len(concluded) - len(green)
+    own = pr_caused_reds(full, roster)
+    deaths = sum(1 for run in window if run.setup_death)
     out = {
         "window_hours": int(METRICS_WINDOW.total_seconds() // 3600),
         "full_runs": len(full),
         "prs": len(_prs(full)),
         "green_runs": len(green),
-        "red_runs": len(concluded) - len(green),
+        "red_runs": reds,
+        # The digest's split of the reds: the pull request's own, and
+        # everything else (shared breaks, storms, empty records, setup
+        # deaths) as "infra".
+        "pr_caused_reds": own,
+        "infra_reds": reds - own + deaths,
         "green_rate": round(len(green) / len(concluded), 3) if concluded else None,
         "aborted_runs": sum(1 for run in window if run.result not in (RUN_SUCCESS, RUN_FAILURE)),
-        "setup_deaths": sum(1 for run in window if run.setup_death),
+        "setup_deaths": deaths,
         "infra_rep_rate": round(storm_reps / reps, 3) if reps else None,
         "infra_reps": storm_reps,
     }
@@ -672,6 +703,17 @@ def assess(runs, now: datetime, roster: Roster) -> dict:
     else:
         signature = set()
     current = condition == SETUP_DEATHS or any(run.build_id in signature for run in recent)
+    # The numbers behind the cause, for the one-sentence message: which
+    # pull requests the firing condition touched, how many runs, and the
+    # storm's window.
+    if condition == SHARED_BREAK:
+        incident = {"prs": r1["prs"], "runs": r1["runs"], "window_start": None, "window_end": None}
+    elif condition == STORM:
+        incident = {"prs": r2["prs"], "runs": r2["runs"], "window_start": iso(r2["start"]), "window_end": iso(r2["end"])}
+    elif condition == SETUP_DEATHS:
+        incident = {"prs": r3["prs"], "runs": len(r3["deaths"]), "window_start": None, "window_end": None}
+    else:
+        incident = None
     return {
         "state": state,
         "condition": condition,
@@ -679,6 +721,7 @@ def assess(runs, now: datetime, roster: Roster) -> dict:
         "failing_cases": r1["cases"] if r1["fires"] else [],
         "evidence": evidence,
         "storm_end": r2["end"] if r2["fires"] else None,
+        "incident": incident,
         "current": current,
         "full_runs": full_runs,
         "last_setup_death": max((run.finished for run in visible if run.setup_death), default=None),
@@ -803,6 +846,10 @@ def adjudicate(
         note = ADVICE_STALE.format(generated_at=iso(now), age=f"{int(age.total_seconds() // 3600)}h")
         evidence.append(note)
         advice = f"{note} {advice}".strip()
+    # A held state (recovering, or a worse condition not yet current) keeps
+    # the previous tick's numbers: the assessment's incident describes the
+    # raw state, not the one being reported.
+    incident = assessed["incident"] if decided["state"] == assessed["state"] else (prev or {}).get("incident")
     out = {
         "schema_version": HEALTH_SCHEMA_VERSION,
         "state": decided["state"],
@@ -810,11 +857,13 @@ def adjudicate(
         "since": iso(decided["since"]),
         "cause": decided["cause"],
         "failing_cases": decided["failing_cases"],
+        "tracking_issues": tracking_issues(decided["failing_cases"], notes or {}),
+        "incident": incident,
         "evidence": evidence,
         "advice": advice,
         "recovering": decided["recovering"],
         "stale": stale,
-        "metrics": metrics([run for run in runs if run.finished <= now], now, fixtures),
+        "metrics": metrics([run for run in runs if run.finished <= now], now, fixtures, roster),
         "dashboard_url": DASHBOARD_URL,
         "generated_at": iso(now),
     }

@@ -101,6 +101,17 @@ DASHBOARD_URL = "https://storage.cloud.google.com/kube-agents-dashboards/evals/i
 DASHBOARD_SECTION_GATE = "gate"
 DASHBOARD_SECTION_AGENT = "agent"
 
+# The message wording. One sentence of cause, one of what to do, then the
+# link; the details live behind the link. Case names are read by a human
+# deciding "is it me?": a family of cases is named by its family word, the
+# prefix tokens below being too generic to be one.
+GENERIC_TOKENS = frozenset({"cluster", "agent", "the", "a"})
+CASES_NAMED_IN_FULL = 3
+NO_ISSUE_TEXT = "no issue yet — file one with the presubmit-gate label"
+# Mirrors health.py's STORM_COOLDOWN: a run started the minute the last
+# storm-hit run finished still overlaps its tail.
+STORM_COOLDOWN = timedelta(minutes=30)
+
 # gsutil is how the state object is read and written; publish.py uses the
 # same header so a reader never gets an hour-stale copy.
 GSUTIL = "gsutil"
@@ -261,37 +272,97 @@ def incident_link(health: dict, until: datetime | None = None) -> str:
     return dashboard_link(DASHBOARD_SECTION_GATE, health.get("failing_cases") or [], parse_iso(health.get("since")), until)
 
 
+def describe_cases(cases) -> str:
+    """The failing cases in the words a reader scans: one case by name, a
+    family by its family word ("the 3 crashloop tests"), up to three by
+    name, more as a count with the first three."""
+    cases = list(cases)
+    if not cases:
+        return "tests"
+    if len(cases) == 1:
+        return cases[0]
+    tokens = [case.split("-") for case in cases]
+    shared = 0
+    while all(len(t) > shared + 1 and t[shared] == tokens[0][shared] for t in tokens):
+        shared += 1
+    family = [t for t in tokens[0][:shared] if t not in GENERIC_TOKENS]
+    if family:
+        return f"the {len(cases)} {family[-1]} tests"
+    if len(cases) <= CASES_NAMED_IN_FULL:
+        return ", ".join(cases[:-1]) + " and " + cases[-1]
+    return f"{len(cases)} tests ({', '.join(cases[:CASES_NAMED_IN_FULL])} and {len(cases) - CASES_NAMED_IN_FULL} more)"
+
+
+def tracking_text(issues) -> str:
+    issues = list(issues or [])
+    return ", ".join(issues) if issues else NO_ISSUE_TEXT
+
+
+def cause_sentence(health: dict) -> str:
+    """One sentence a reader can answer "is it me?" from."""
+    incident = health.get("incident") or {}
+    prs = len(incident.get("prs") or [])
+    since = hhmm(parse_iso(health.get("since")))
+    condition = health.get("condition")
+    if condition == "shared_break":
+        return (
+            f"{describe_cases(health.get('failing_cases'))} fail on every PR since {since} UTC"
+            f" ({prs} PRs so far). Shared test fixture, not your code."
+        )
+    if condition == "storm":
+        start, end = parse_iso(incident.get("window_start")), parse_iso(incident.get("window_end"))
+        window = f"{hhmm(start)}–{hhmm(end)} UTC" if start and end else f"since {since} UTC"
+        return f"quota storm {window} hit {prs} PRs."
+    if condition == "setup_deaths":
+        return f"{incident.get('runs', 0)} runs on {prs} PRs died during setup since {since} UTC."
+    return health.get("cause") or "no single cause"
+
+
 def render_change(health: dict, prev: dict | None) -> str:
-    was = f" (was {prev['state']})" if prev and prev.get("state") and prev["state"] != health["state"] else ""
-    lines = [f"*CI health: {health['state']}*{was} — {health.get('cause') or 'no single cause'}"]
-    for line in health.get("evidence") or []:
-        lines.append(f"• {line}")
-    if health.get("advice"):
-        lines.append(f"Advice: {health['advice']}")
+    condition = health.get("condition")
+    if health.get("state") == OUTAGE:
+        lines = [
+            f"🔴 *Smoke gate: broken* — {cause_sentence(health)}",
+            f"Don't retest yet. Tracking {tracking_text(health.get('tracking_issues'))}.",
+        ]
+    elif condition == "storm":
+        end = parse_iso((health.get("incident") or {}).get("window_end"))
+        when = f"after {hhmm(end + STORM_COOLDOWN)} UTC" if end else "once the storm has passed"
+        lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)}  Passing runs still count; if yours went red, retest {when}."]
+    else:
+        lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)}  Passing runs still count; if yours died before any test ran, retest."]
     lines.append(incident_link(health))
     return "\n".join(lines)
 
 
 def render_stale(health: dict) -> str:
-    metrics = health.get("metrics") or {}
-    age = metrics.get("data_age_s")
+    refreshed = hhmm(parse_iso(health.get("generated_at")))
     if health.get("stale"):
-        head = (
-            f"*CI health: data is stale* — data.json last refreshed {health.get('generated_at', '?')}"
-            f" ({seconds_text(age)} ago); the dashboard refresh job has stalled,"
-            f" so the {health.get('state', '?')} above it is that old."
-        )
-    else:
-        head = f"*CI health: data is fresh again* — data.json refreshed {health.get('generated_at', '?')}; state {health.get('state', '?')}."
-    return "\n".join([head, incident_link(health)])
+        return f"⚪ *Smoke gate: no fresh data since {refreshed} UTC* — the health bot can't see recent runs. Someone check the refresh job."
+    return f"⚪ *Smoke gate: fresh data again* — refreshed {refreshed} UTC; the gate reads {health.get('state', '?')}."
+
+
+def short_cause(prev: dict) -> str:
+    condition = prev.get("condition")
+    if condition == "shared_break":
+        return f"{describe_cases(prev.get('failing_cases'))} were failing"
+    if condition == "storm":
+        return "quota storm"
+    if condition == "setup_deaths":
+        return "setup failures"
+    return prev.get("cause") or "unknown cause"
 
 
 def render_recovery(health: dict, prev: dict, now: datetime) -> str:
     since = parse_iso(prev.get("since"))
-    lasted = f" after {duration_text(now - since)}" if since else ""
-    cause = f" ({prev['cause']})" if prev.get("cause") else ""
+    lasted = duration_text(now - since) if since else "a while"
+    parts = [short_cause(prev)]
+    issues = prev.get("tracking_issues") or []
+    if issues:
+        parts.append(", ".join(issues))
+    # No "retests running" clause: this job queues none.
     lines = [
-        f"*CI health: GREEN* — recovered{lasted} of {prev.get('state', 'trouble')}{cause}",
+        f"🟢 *Smoke gate: healthy again* — fixed after {lasted} ({', '.join(parts)}).",
         # The closed incident: the cases and start the space was told, and
         # now as its end.
         dashboard_link(DASHBOARD_SECTION_GATE, prev.get("failing_cases") or [], since, now),
@@ -301,41 +372,15 @@ def render_recovery(health: dict, prev: dict, now: datetime) -> str:
 
 def render_digest(health: dict, now: datetime) -> str:
     metrics = health.get("metrics") or {}
-    since = parse_iso(health.get("since"))
-    headline = f"*CI health daily digest ({now.date().isoformat()})* — {health.get('state', '?')} since {hhmm(since)} UTC"
-    if health.get("cause"):
-        headline += f": {health['cause']}"
-    lines = [headline]
-    if health.get("stale"):
-        lines.append(f"Data is stale: data.json last refreshed {health.get('generated_at', '?')} ({seconds_text(metrics.get('data_age_s'))} ago).")
-    hours = metrics.get("window_hours", DEFAULT_WINDOW_HOURS)
-    lines.append(
-        f"Last {hours}h: {metrics.get('full_runs', 0)} full runs on {metrics.get('prs', 0)} PRs,"
-        f" {metrics.get('green_runs', 0)} green ({percent(metrics.get('green_rate'))}),"
-        f" wall clock p50 {seconds_text(metrics.get('wall_clock_p50_s'))}"
-        f" / p90 {seconds_text(metrics.get('wall_clock_p90_s'))},"
-        f" infra reps {percent(metrics.get('infra_rep_rate'))},"
-        f" setup failures {metrics.get('setup_deaths', 0)},"
-        f" aborted {metrics.get('aborted_runs', 0)}"
+    p50 = metrics.get("wall_clock_p50_s")
+    typical = f"{int(p50 // 60)} min" if p50 is not None else "n/a"
+    headline = (
+        f"📊 *Smoke gate, last {metrics.get('window_hours', DEFAULT_WINDOW_HOURS)}h:*"
+        f" {metrics.get('full_runs', 0)} runs · {metrics.get('green_runs', 0)} green"
+        f" · {metrics.get('pr_caused_reds', 0)} PR-caused red · {metrics.get('infra_reds', 0)} infra"
+        f" · typical run {typical}"
     )
-    fixtures = metrics.get("fixtures")
-    if isinstance(fixtures, dict):
-        healed = fixtures.get("healed")
-        broken = fixtures.get("broken")
-        projects = fixtures.get("projects")
-        parts = []
-        if healed is not None:
-            parts.append(f"{healed} healed")
-        if broken is not None:
-            parts.append(f"{broken} broken")
-        if projects is not None:
-            parts.append(f"across {projects} projects")
-        if parts:
-            lines.append("Fixtures: " + ", ".join(parts))
-    if health.get("advice"):
-        lines.append(f"Advice: {health['advice']}")
-    lines.append(dashboard_link(DASHBOARD_SECTION_AGENT, health.get("failing_cases") or [], since))
-    return "\n".join(lines)
+    return "\n".join([headline, dashboard_link(DASHBOARD_SECTION_AGENT, health.get("failing_cases") or [], parse_iso(health.get("since")))])
 
 
 def render(kind: str, health: dict, prev: dict | None, now: datetime) -> str:
@@ -454,6 +499,7 @@ def run(health: dict, prev: dict | None, now: datetime, digest_hour: int, sender
         "condition": source.get("condition"),
         "cause": source.get("cause"),
         "failing_cases": source.get("failing_cases") or [],
+        "tracking_issues": source.get("tracking_issues") or [],
         "since": source.get("since"),
         "stale": bool(health.get("stale")) if told_stale else bool(before.get("stale")),
         "posted_at": before.get("posted_at"),
