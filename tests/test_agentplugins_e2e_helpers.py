@@ -136,6 +136,14 @@ class AgentPluginsE2EHelpersTest(unittest.TestCase):
 
         self.assertEqual(call_count["count"], 2)
 
+    def test_wait_deployment_rollout_raises_on_missing_deployment(self):
+        """When deployment never appears in API server, wait_deployment_rollout raises TimeoutError."""
+        mock_res = MagicMock(returncode=1)
+        with patch.object(e2e, "run_kubectl", return_value=mock_res), \
+             patch("time.sleep", return_value=None):
+            with self.assertRaises(TimeoutError):
+                e2e.wait_deployment_rollout("nonexistent-deployment", timeout="5s")
+
 
 if __name__ == "__main__":
     unittest.main()

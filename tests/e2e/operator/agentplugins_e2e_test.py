@@ -601,11 +601,16 @@ def wait_deployment_rollout(deployment_name: str, timeout: str = f"{DEFAULT_ROLL
 
     deadline = time.time() + timeout_sec
     # 1. Wait for deployment object to appear in API server
+    deployment_found = False
     while time.time() < deadline:
         res = run_kubectl(["get", "deployment", deployment_name, "-n", NAMESPACE], check=False, capture_output=True)
         if res.returncode == 0:
+            deployment_found = True
             break
         time.sleep(API_POLL_INTERVAL_SEC)
+
+    if not deployment_found:
+        raise TimeoutError(f"Deployment '{deployment_name}' did not appear in namespace '{NAMESPACE}' within {timeout_sec}s")
 
     # 2. Run rollout status with retry until deadline
     last_err: Exception | None = None
@@ -622,6 +627,7 @@ def wait_deployment_rollout(deployment_name: str, timeout: str = f"{DEFAULT_ROLL
             raise
     if last_err:
         raise last_err
+    raise TimeoutError(f"Deployment '{deployment_name}' rollout timed out after {timeout_sec}s")
 
 
 def get_platform_configmap_yaml() -> str:
@@ -1123,6 +1129,7 @@ def step12_verify_missing_crd_decoupled_dependency_safeguard() -> None:
     """
     log("STEP 12 (Opt-in Destructive): Testing missing AgentPlugin CRD decoupled dependency safeguard...")
     crd_dir = REPO_ROOT / "k8s-operator" / "config" / "crd" / "bases"
+    op_deployment = get_operator_deployment()
 
     try:
         log("Deleting AgentPlugin CRD from cluster...")
@@ -1138,7 +1145,6 @@ def step12_verify_missing_crd_decoupled_dependency_safeguard() -> None:
         wait_deployment_generation_change(GATEWAY_DEPLOYMENT, min_gen=gen_before + 1)
         wait_deployment_rollout(GATEWAY_DEPLOYMENT)
 
-        op_deployment = get_operator_deployment()
         op_image = get_kubectl_output([
             "get", "deployment", op_deployment, "-n", NAMESPACE,
             "-o", "jsonpath={.spec.template.spec.containers[?(@.name==\"manager\")].image}"
