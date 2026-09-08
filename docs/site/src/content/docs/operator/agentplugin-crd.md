@@ -73,27 +73,27 @@ spec:
 
 ## Requirements & Compatibility Gating
 
-- **Kubernetes Version**: Native `ImageVolumeSource` support requires **Kubernetes 1.35+** (where the feature gate is enabled by default; it is beta but off by default in 1.33 and 1.34).
-- **Older Cluster Guard**: On clusters running Kubernetes < 1.35 where OCI image volumes are unsupported, the operator skips OCI volume attachment to prevent Pod spec validation failures. The plugin status is updated to `Phase: Degraded` with condition `Reason: ImageVolumeUnsupported`.
-- **Fail-closed capability probe**: The operator resolves the cluster's ImageVolume capability once, from the API server version. If that probe fails or the version cannot be parsed, image volumes are treated as **unsupported** — attaching one the cluster cannot honour would make the API server reject the entire agent Deployment, which is a worse failure than leaving plugins unloaded.
-- **Annotation Override**: Image volume support can be explicitly toggled via the `kubeagents.x-k8s.io/enable-image-volumes="true"|"false"` annotation on the `PlatformAgent` resource. The annotation wins over the version probe in both directions, so a 1.33 or 1.34 cluster that has the `ImageVolume` feature gate enabled manually can opt back in.
+- **Kubernetes Version & Staging Fallback**: Native `ImageVolumeSource` support requires **Kubernetes 1.35+** (where the feature gate is enabled by default; it is beta but off by default in 1.33 and 1.34). On clusters where OCI image volumes are unsupported or restricted (such as GKE Autopilot where Warden blocks `ImageVolumeSource`, or GKE Standard < 1.35), the operator automatically falls back to init container staging: an `emptyDir` volume is mounted and a `stage-<plugin>` init container extracts the plugin files into it. The plugin status is updated to `Phase: Ready` with condition `Reason: Applied` and a message noting that the plugin was staged via init container.
+- **Custom Plugin Image Shell Requirement**: When running on clusters using init container staging (GKE Autopilot or Kubernetes < 1.35), custom plugin images must contain a minimal shell (`/bin/sh`, e.g. based on `busybox:musl` or `alpine`) to execute the staging script. A `FROM scratch` image lacking a shell will fail during init container execution (`CrashLoopBackOff`), causing the main Platform Agent pod to fail to start. Built-in plugins are built on `busybox:musl`.
+- **Fail-closed capability probe**: The operator resolves the cluster's ImageVolume capability once, from the API server version. If that probe fails or the version cannot be parsed, image volumes are treated as **unsupported** and the operator safely falls back to init container staging.
+- **Annotation Override**: Image volume support can be explicitly toggled via the `kubeagents.x-k8s.io/enable-image-volumes="true"|"false"` annotation on the `PlatformAgent` resource. Setting `"false"` forces init container staging; setting `"true"` opts into native `ImageVolumeSource` (useful on 1.33 or 1.34 clusters with the feature gate enabled).
 - **Decoupled Dependency**: The operator reconciles `PlatformAgent` workloads gracefully even if the `AgentPlugin` CRD is not installed on the cluster.
 - **Restart the operator after installing the CRD**: the `AgentPlugin` watch is registered at operator startup only. If the CRD is installed into a running cluster afterwards, restart the controller manager so it picks the watch up.
 - **Plugin changes restart the agent**: adding, changing, or removing an `AgentPlugin` alters the agent's `config.yaml` and pod spec, so the agent pod is rolled. Hermes loads plugins at startup and does not hot-reload them.
-- **A bad plugin image takes the agent down**: the OCI volume lives in the agent's pod spec, so an image that cannot be pulled keeps the whole agent pod from starting — not just that plugin from loading. Prefer immutable digests over mutable tags, and check plugin status after any image change.
+- **A bad plugin image takes the agent down**: the plugin volume (or staging init container) lives in the agent's pod spec, so an image that cannot be pulled keeps the whole agent pod from starting — not just that plugin from loading. Prefer immutable digests over mutable tags, and check plugin status after any image change.
 
 ## Status
 
 `status.phase` is `Ready` or `Degraded`, with the detail on the `Ready` condition:
 
-| `Reason`                 | Meaning                                                                                                     |
-| ------------------------ | ----------------------------------------------------------------------------------------------------------- |
-| `Applied`                | Mounted and registered. Any config keys dropped by the allowlist are named in the message.                  |
-| `AgentNotFound`          | `spec.agentRef` names no `PlatformAgent` in this namespace — usually a typo. The plugin is applied nowhere. |
-| `InvalidPluginName`      | `metadata.name` breaks the naming rule (only reachable for objects created before the rule existed).        |
-| `DuplicatePluginName`    | The name collides with a built-in Hermes plugin, or with another plugin, after separators are stripped.     |
-| `ImageVolumeUnsupported` | The cluster cannot mount OCI image volumes, so the volume was omitted.                                      |
-| `ImagePullFailed`        | `spec.image` could not be pulled. The agent pod is blocked from starting until this is fixed.               |
+| `Reason`              | Meaning                                                                                                             |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `Applied`             | Mounted natively or staged via init container. Any config keys dropped by the allowlist are named in the message.   |
+| `AgentNotFound`       | `spec.agentRef` names no `PlatformAgent` in this namespace — usually a typo. The plugin is applied nowhere.         |
+| `InvalidPluginName`   | `metadata.name` breaks the naming rule (only reachable for objects created before the rule existed).                |
+| `DuplicatePluginName` | The name collides with a built-in Hermes plugin, or with another plugin, after separators are stripped.             |
+| `ImagePullFailed`     | `spec.image` could not be pulled. The agent pod is blocked from starting until this is fixed.                       |
+| `StagingFailed`       | The staging init container failed or crashed (e.g. image lacks `/bin/sh` or is outdated). The agent pod is blocked. |
 
 `status.observedGeneration` records the `metadata.generation` the status was computed
 from, so a stale condition is distinguishable from a current one.

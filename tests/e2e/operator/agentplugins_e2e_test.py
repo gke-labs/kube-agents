@@ -920,8 +920,8 @@ def step8_verify_config_cleanup(unique_str: str) -> None:
 
 
 def step9_verify_enable_image_volumes_false_annotation_safeguard(plugin_image: str, unique_str: str) -> None:
-    """Step 9: Verify image volume disable annotation guard and status update to Degraded/ImageVolumeUnsupported."""
-    log("STEP 9: Testing 'kubeagents.x-k8s.io/enable-image-volumes=false' annotation safeguard...")
+    """Step 9: Verify image volume disable annotation fallback to emptyDir/initContainer staging."""
+    log("STEP 9: Testing 'kubeagents.x-k8s.io/enable-image-volumes=false' annotation fallback to staging...")
 
     # 9a. Annotate PlatformAgent to force enable-image-volumes=false
     run_kubectl([
@@ -945,33 +945,55 @@ def step9_verify_enable_image_volumes_false_annotation_safeguard(plugin_image: s
         wait_deployment_generation_change(GATEWAY_DEPLOYMENT, min_gen=gen_before + 1)
         wait_deployment_rollout(GATEWAY_DEPLOYMENT)
 
-        # 9d. Verify OCI volume was NOT attached to gateway deployment
-        vols = get_kubectl_output([
+        # 9d. Verify volume is attached as emptyDir (not OCI image volume)
+        dep_raw = get_kubectl_output([
             "get", "deployment", GATEWAY_DEPLOYMENT, "-n", NAMESPACE,
-            "-o", f"jsonpath={{.spec.template.spec.volumes[?(@.name==\"plugin-{PLUGIN_CR_NAME}\")].name}}"
+            "-o", "json"
         ])
-        assert vols == "", f"Volume 'plugin-{PLUGIN_CR_NAME}' should NOT be attached when enable-image-volumes=false, got '{vols}'"
-        log("Verified OCI volume attachment was skipped when enable-image-volumes=false.")
+        dep_spec = json.loads(dep_raw).get("spec", {}).get("template", {}).get("spec", {})
+        plugin_vols = [v for v in dep_spec.get("volumes", []) if v.get("name") == f"plugin-{PLUGIN_CR_NAME}"]
+        assert len(plugin_vols) == 1, (
+            f"Expected exactly 1 volume for 'plugin-{PLUGIN_CR_NAME}', got {len(plugin_vols)}"
+        )
+        assert "emptyDir" in plugin_vols[0], (
+            f"Expected emptyDir volume source for 'plugin-{PLUGIN_CR_NAME}' when enable-image-volumes=false, got {plugin_vols[0]}"
+        )
+        assert "image" not in plugin_vols[0], (
+            f"Did not expect image volume source for 'plugin-{PLUGIN_CR_NAME}' when enable-image-volumes=false"
+        )
+        log("Verified plugin volume is attached as emptyDir when enable-image-volumes=false.")
 
-        # 9e. Verify AgentPlugin status condition Reason == ImageVolumeUnsupported and Phase == Degraded
+        # 9e. Verify staging init container is injected
+        init_containers = dep_spec.get("initContainers", [])
+        stage_inits = [c for c in init_containers if c.get("name") == f"stage-{PLUGIN_CR_NAME}"]
+        assert len(stage_inits) == 1, (
+            f"Expected init container 'stage-{PLUGIN_CR_NAME}' to be present when enable-image-volumes=false, got {stage_inits}"
+        )
+        log(f"Verified staging init container 'stage-{PLUGIN_CR_NAME}' is present.")
+
+        # 9f. Verify AgentPlugin status condition Reason == Applied, Phase == Ready, and message mentions staging
         status_phase = get_kubectl_output([
             "get", "agentplugin", PLUGIN_CR_NAME, "-n", NAMESPACE,
             "-o", "jsonpath={.status.phase}"
         ])
-        assert status_phase == "Degraded", f"Expected AgentPlugin status.phase 'Degraded', got '{status_phase}'"
+        assert status_phase == "Ready", f"Expected AgentPlugin status.phase 'Ready', got '{status_phase}'"
         log(f"Verified AgentPlugin status phase is '{status_phase}'.")
 
         cond_reason = get_kubectl_output([
             "get", "agentplugin", PLUGIN_CR_NAME, "-n", NAMESPACE,
             "-o", "jsonpath={.status.conditions[?(@.type==\"Ready\")].reason}"
         ])
-        assert cond_reason == "ImageVolumeUnsupported", f"Expected condition reason 'ImageVolumeUnsupported', got '{cond_reason}'"
+        assert cond_reason == "Applied", f"Expected condition reason 'Applied', got '{cond_reason}'"
         log(f"Verified AgentPlugin condition reason is '{cond_reason}'.")
 
-        # 9f. Verify operator logged error message for skipped OCI volume attachment
-        err_logged = check_operator_error_log("skipping plugin OCI image volume mount")
-        assert err_logged, "Expected operator to log 'skipping plugin OCI image volume mount'"
-        log("Verified operator logged manifestsLog error for skipped OCI image volume attachment.")
+        cond_msg = get_kubectl_output([
+            "get", "agentplugin", PLUGIN_CR_NAME, "-n", NAMESPACE,
+            "-o", "jsonpath={.status.conditions[?(@.type==\"Ready\")].message}"
+        ])
+        assert "staged via init container" in cond_msg, (
+            f"Expected condition message to mention 'staged via init container', got '{cond_msg}'"
+        )
+        log(f"Verified AgentPlugin condition message notes staging: '{cond_msg}'.")
 
     finally:
         # 9g. Cleanup Step 9 resources

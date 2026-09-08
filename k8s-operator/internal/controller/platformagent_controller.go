@@ -100,12 +100,13 @@ const (
 	AnnotationEnableFQDNNetworkPolicy = "kubeagents.x-k8s.io/enable-fqdn-network-policy"
 	AnnotationManagedMinterKeys       = "kubeagents.x-k8s.io/managed-minter-keys"
 
-	// GKE Autopilot API groups used to detect Autopilot clusters where Warden restricts Image volumes.
-	gkeAutopilotAPIGroup = "auto.gke.io"
-	gkeWardenAPIGroup    = "warden.gke.io"
+	// GKE Autopilot API groups and resources used to detect Autopilot clusters where Warden restricts Image volumes.
+	gkeAutopilotAPIGroup                     = "auto.gke.io"
+	gkeAutopilotAllowlistedWorkloadsResource = "allowlistedworkloads"
 
 	pluginFailureReasonImagePull = "ImagePullFailed"
 	pluginFailureReasonStaging   = "StagingFailed"
+	exitCodeCommandNotFound      = int32(127)
 
 	// The condition reporting that cluster event ingestion has been switched off
 	// on the spec. It is written only in that state — see updateStatusReady.
@@ -2449,6 +2450,28 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 				phase = "Degraded"
 				reason = cs.State.Waiting.Reason
 				message = fmt.Sprintf("Container '%s' in pod %s is waiting: %s - %s", cs.Name, pod.Name, cs.State.Waiting.Reason, cs.State.Waiting.Message)
+				if strings.HasPrefix(cs.Name, "stage-") {
+					if cs.LastTerminationState.Terminated != nil {
+						term := cs.LastTerminationState.Terminated
+						if term.ExitCode == exitCodeCommandNotFound || strings.Contains(term.Message, "/bin/sh") || strings.Contains(term.Message, "no such file or directory") {
+							message = fmt.Sprintf("Container '%s' in pod %s is waiting: %s - staging failed (exit code %d): plugin image may be outdated or missing /bin/sh (init container staging requires a minimal shell such as busybox:musl or alpine)", cs.Name, pod.Name, cs.State.Waiting.Reason, term.ExitCode)
+						}
+					} else if strings.Contains(cs.State.Waiting.Message, "/bin/sh") || strings.Contains(cs.State.Waiting.Message, "no such file or directory") {
+						message = fmt.Sprintf("Container '%s' in pod %s is waiting: %s - staging failed: plugin image may be outdated or missing /bin/sh (init container staging requires a minimal shell such as busybox:musl or alpine)", cs.Name, pod.Name, cs.State.Waiting.Reason)
+					}
+				}
+				return phase, reason, message
+			}
+			if cs.State.Terminated != nil && cs.State.Terminated.ExitCode != 0 {
+				phase = "Degraded"
+				reason = cs.State.Terminated.Reason
+				if reason == "" {
+					reason = "Error"
+				}
+				message = fmt.Sprintf("Container '%s' in pod %s terminated with exit code %d: %s", cs.Name, pod.Name, cs.State.Terminated.ExitCode, cs.State.Terminated.Message)
+				if strings.HasPrefix(cs.Name, "stage-") && (cs.State.Terminated.ExitCode == exitCodeCommandNotFound || strings.Contains(cs.State.Terminated.Message, "/bin/sh") || strings.Contains(cs.State.Terminated.Message, "no such file or directory")) {
+					message = fmt.Sprintf("Container '%s' in pod %s failed to stage plugin (exit code %d): plugin image may be outdated or missing /bin/sh (init container staging requires a minimal shell such as busybox:musl or alpine)", cs.Name, pod.Name, cs.State.Terminated.ExitCode)
+				}
 				return phase, reason, message
 			}
 		}
@@ -2743,7 +2766,7 @@ func isImageVolumeSupported(dc discovery.DiscoveryInterface, agent *agentv1alpha
 	return supported
 }
 
-// isGKEAutopilot probes the API server for GKE Autopilot specific API groups.
+// isGKEAutopilot probes the API server for GKE Autopilot specific API resources.
 func isGKEAutopilot(dc discovery.DiscoveryInterface) bool {
 	if dc == nil {
 		return false
@@ -2751,12 +2774,12 @@ func isGKEAutopilot(dc discovery.DiscoveryInterface) bool {
 	defer func() {
 		_ = recover()
 	}()
-	groups, err := dc.ServerGroups()
-	if err != nil || groups == nil {
+	resList, err := dc.ServerResourcesForGroupVersion(gkeAutopilotAPIGroup + "/v1")
+	if err != nil || resList == nil {
 		return false
 	}
-	for _, g := range groups.Groups {
-		if g.Name == gkeAutopilotAPIGroup || g.Name == gkeWardenAPIGroup {
+	for _, r := range resList.APIResources {
+		if r.Name == gkeAutopilotAllowlistedWorkloadsResource {
 			return true
 		}
 	}
@@ -2969,15 +2992,15 @@ func (r *PlatformAgentReconciler) detectPluginFailures(ctx context.Context, agen
 							reason:  pluginFailureReasonImagePull,
 							message: w.Message,
 						}
-					} else if w.Reason == "CrashLoopBackOff" {
+					} else if w.Reason != "ContainerCreating" && w.Reason != "PodInitializing" {
 						msg := w.Message
 						if cs.LastTerminationState.Terminated != nil && cs.LastTerminationState.Terminated.ExitCode != 0 {
-							msg = fmt.Sprintf("staging init container exited with code %d", cs.LastTerminationState.Terminated.ExitCode)
-							if cs.LastTerminationState.Terminated.Message != "" {
-								msg = fmt.Sprintf("%s: %s", msg, cs.LastTerminationState.Terminated.Message)
-							}
+							term := cs.LastTerminationState.Terminated
+							msg = formatStagingFailureMessage(term.ExitCode, term.Message, plugin.Spec.Image)
+						} else if strings.Contains(w.Message, "/bin/sh") || strings.Contains(w.Message, "no such file or directory") {
+							msg = fmt.Sprintf("staging init container failed (%s): plugin image '%s' may be outdated or missing /bin/sh (init container staging requires a minimal shell such as busybox:musl or alpine)", w.Reason, plugin.Spec.Image)
 						} else if msg == "" {
-							msg = "staging init container crashed"
+							msg = fmt.Sprintf("staging init container failed: %s", w.Reason)
 						}
 						failures[plugin.Name] = pluginFailure{
 							reason:  pluginFailureReasonStaging,
@@ -2985,13 +3008,9 @@ func (r *PlatformAgentReconciler) detectPluginFailures(ctx context.Context, agen
 						}
 					}
 				} else if t := cs.State.Terminated; t != nil && t.ExitCode != 0 {
-					msg := fmt.Sprintf("staging init container exited with code %d", t.ExitCode)
-					if t.Message != "" {
-						msg = fmt.Sprintf("%s: %s", msg, t.Message)
-					}
 					failures[plugin.Name] = pluginFailure{
 						reason:  pluginFailureReasonStaging,
-						message: msg,
+						message: formatStagingFailureMessage(t.ExitCode, t.Message, plugin.Spec.Image),
 					}
 				}
 			}
@@ -3014,6 +3033,20 @@ func (r *PlatformAgentReconciler) detectPluginFailures(ctx context.Context, agen
 		}
 	}
 	return failures
+}
+
+// formatStagingFailureMessage constructs an informative error message when a staging init container fails.
+// If the container exited with code 127 or the failure indicates a missing shell, it clarifies that
+// the plugin image may be outdated or missing /bin/sh (required on clusters using init container staging).
+func formatStagingFailureMessage(exitCode int32, termMsg string, pluginImage string) string {
+	baseMsg := fmt.Sprintf("staging init container exited with code %d", exitCode)
+	if termMsg != "" {
+		baseMsg = fmt.Sprintf("%s (%s)", baseMsg, termMsg)
+	}
+	if exitCode == exitCodeCommandNotFound || strings.Contains(termMsg, "/bin/sh") || strings.Contains(termMsg, "no such file or directory") || strings.Contains(termMsg, "executable file not found") {
+		return fmt.Sprintf("%s: plugin image '%s' may be outdated or missing /bin/sh (init container staging requires a minimal shell such as busybox:musl or alpine)", baseMsg, pluginImage)
+	}
+	return baseMsg
 }
 
 // detectPluginImageFailures maps plugin name to the kubelet's message when the agent's

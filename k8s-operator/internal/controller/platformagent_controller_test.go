@@ -2233,8 +2233,9 @@ func TestUpdatePluginStatuses_DuplicatePluginName(t *testing.T) {
 
 type fakeVersionDiscovery struct {
 	discovery.DiscoveryInterface
-	ver    *version.Info
-	groups *metav1.APIGroupList
+	ver       *version.Info
+	groups    *metav1.APIGroupList
+	resources map[string]*metav1.APIResourceList
 }
 
 func (f *fakeVersionDiscovery) ServerVersion() (*version.Info, error) {
@@ -2246,6 +2247,15 @@ func (f *fakeVersionDiscovery) ServerGroups() (*metav1.APIGroupList, error) {
 		return f.groups, nil
 	}
 	return &metav1.APIGroupList{}, nil
+}
+
+func (f *fakeVersionDiscovery) ServerResourcesForGroupVersion(groupVersion string) (*metav1.APIResourceList, error) {
+	if f.resources != nil {
+		if rl, ok := f.resources[groupVersion]; ok {
+			return rl, nil
+		}
+	}
+	return &metav1.APIResourceList{GroupVersion: groupVersion}, nil
 }
 
 func TestIsImageVolumeSupported_DiscoveryVersion(t *testing.T) {
@@ -2299,8 +2309,16 @@ func TestIsImageVolumeSupported_DiscoveryVersion(t *testing.T) {
 		t.Errorf("expected annotation override 'false' to force isImageVolumeSupported to false even on K8s 1.35")
 	}
 
-	// 5. Server version >= 1.35 on GKE Standard returns true (natively supported)
-	dcGKEStandard := &fakeVersionDiscovery{ver: &version.Info{Major: "1", Minor: "35", GitVersion: "v1.35.7-gke.1027000"}}
+	// 5. Server version >= 1.35 on GKE Standard returns true (natively supported even with auto.gke.io allowlists)
+	dcGKEStandard := &fakeVersionDiscovery{
+		ver: &version.Info{Major: "1", Minor: "35", GitVersion: "v1.35.7-gke.1027000"},
+		resources: map[string]*metav1.APIResourceList{
+			"auto.gke.io/v1": {
+				GroupVersion: "auto.gke.io/v1",
+				APIResources: []metav1.APIResource{{Name: "workloadallowlists"}},
+			},
+		},
+	}
 	if !isImageVolumeSupported(dcGKEStandard, agent) {
 		t.Errorf("expected isImageVolumeSupported to return true on GKE Standard >= 1.35")
 	}
@@ -2308,8 +2326,11 @@ func TestIsImageVolumeSupported_DiscoveryVersion(t *testing.T) {
 	// 6. GKE Autopilot returns false (falls back to initContainer staging)
 	dcGKEAutopilot := &fakeVersionDiscovery{
 		ver: &version.Info{Major: "1", Minor: "35", GitVersion: "v1.35.7-gke.1027000"},
-		groups: &metav1.APIGroupList{
-			Groups: []metav1.APIGroup{{Name: "auto.gke.io"}},
+		resources: map[string]*metav1.APIResourceList{
+			"auto.gke.io/v1": {
+				GroupVersion: "auto.gke.io/v1",
+				APIResources: []metav1.APIResource{{Name: "allowlistedworkloads"}},
+			},
 		},
 	}
 	if isImageVolumeSupported(dcGKEAutopilot, agent) {
@@ -2815,6 +2836,134 @@ func TestUpdatePluginStatuses_StagingFailureIsReported(t *testing.T) {
 	}
 	if good.Status.Phase != "Ready" {
 		t.Errorf("expected healthy staging plugin Phase 'Ready', got %q", good.Status.Phase)
+	}
+}
+
+func TestUpdatePluginStatuses_StagingFailure_MissingShell(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "target-agent", Namespace: "test-ns"},
+	}
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "scratchplugin", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "target-agent", Image: "example.com/scratch:v1"},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "target-agent-gateway-abc",
+			Namespace: "test-ns",
+			Labels:    map[string]string{"app": "target-agent-gateway"},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+			InitContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: buildPluginStagingContainerName(plugin.Name),
+					State: corev1.ContainerState{
+						Waiting: &corev1.ContainerStateWaiting{
+							Reason:  "CrashLoopBackOff",
+							Message: "back-off 10s restarting failed container",
+						},
+					},
+					LastTerminationState: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{
+							ExitCode: 127,
+							Reason:   "ContainerCannotRun",
+							Message:  "OCI runtime exec failed: exec: \"/bin/sh\": stat /bin/sh: no such file or directory",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(plugin, pod).
+		WithStatusSubresource(plugin).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	r.updatePluginStatuses(ctx, agent, []*agentv1alpha1.AgentPlugin{plugin}, false)
+
+	var result agentv1alpha1.AgentPlugin
+	if err := cl.Get(ctx, types.NamespacedName{Name: plugin.Name, Namespace: plugin.Namespace}, &result); err != nil {
+		t.Fatalf("get plugin: %v", err)
+	}
+
+	if result.Status.Phase != "Degraded" {
+		t.Errorf("expected Status.Phase 'Degraded', got %q", result.Status.Phase)
+	}
+	cond := meta.FindStatusCondition(result.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "StagingFailed" {
+		t.Fatalf("expected Reason 'StagingFailed', got %+v", cond)
+	}
+	if !strings.Contains(cond.Message, "may be outdated or missing /bin/sh") {
+		t.Errorf("expected diagnostic message indicating missing /bin/sh, got %q", cond.Message)
+	}
+}
+
+func TestUpdatePluginStatuses_StagingFailure_RunContainerError_MissingShell(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "target-agent", Namespace: "test-ns"},
+	}
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "badplugin", Namespace: "test-ns"},
+		Spec: agentv1alpha1.AgentPluginSpec{
+			AgentRef: "target-agent",
+			Image:    "registry.k8s.io/pause:3.9",
+		},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "target-agent-gateway-xyz",
+			Namespace: "test-ns",
+			Labels:    map[string]string{"app": "target-agent-gateway"},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+			InitContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: buildPluginStagingContainerName(plugin.Name),
+					State: corev1.ContainerState{
+						Waiting: &corev1.ContainerStateWaiting{
+							Reason:  "RunContainerError",
+							Message: "OCI runtime start failed: starting container: creating process: failed to load /bin/sh: no such file or directory",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(plugin, pod).
+		WithStatusSubresource(plugin).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	r.updatePluginStatuses(ctx, agent, []*agentv1alpha1.AgentPlugin{plugin}, false)
+
+	var result agentv1alpha1.AgentPlugin
+	if err := cl.Get(ctx, types.NamespacedName{Name: plugin.Name, Namespace: plugin.Namespace}, &result); err != nil {
+		t.Fatalf("get plugin: %v", err)
+	}
+
+	if result.Status.Phase != "Degraded" {
+		t.Errorf("expected Status.Phase 'Degraded', got %q", result.Status.Phase)
+	}
+	cond := meta.FindStatusCondition(result.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "StagingFailed" {
+		t.Fatalf("expected Reason 'StagingFailed', got %+v", cond)
+	}
+	if !strings.Contains(cond.Message, "may be outdated or missing /bin/sh") {
+		t.Errorf("expected diagnostic message indicating missing /bin/sh, got %q", cond.Message)
 	}
 }
 
@@ -4613,6 +4762,56 @@ func TestABrokenNativeSidecarIsReportedDegraded(t *testing.T) {
 	}
 	if !strings.Contains(message, "envoy-credential-proxy") {
 		t.Errorf("message does not name the failing container: %q", message)
+	}
+}
+
+func TestInitContainerPluginStagingFailureReportsDegraded(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-gateway-abc",
+			Namespace: "test-ns",
+			Labels:    map[string]string{"app": "test-agent-gateway"},
+		},
+		Status: corev1.PodStatus{
+			InitContainerStatuses: []corev1.ContainerStatus{{
+				Name: "stage-custom-plugin",
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+					Reason:  "CrashLoopBackOff",
+					Message: "back-off 10s restarting failed container=stage-custom-plugin",
+				}},
+				LastTerminationState: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						ExitCode: 127,
+						Message:  "exec /bin/sh: no such file or directory",
+					},
+				},
+			}},
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name:  "platform-agent",
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}},
+			}},
+			Conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue}},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent)
+
+	if phase != "Degraded" {
+		t.Errorf("phase = %q, want Degraded", phase)
+	}
+	if reason != "CrashLoopBackOff" {
+		t.Errorf("reason = %q, want CrashLoopBackOff", reason)
+	}
+	if !strings.Contains(message, "stage-custom-plugin") || !strings.Contains(message, "missing /bin/sh") {
+		t.Errorf("message does not diagnose missing /bin/sh: %q", message)
 	}
 }
 
