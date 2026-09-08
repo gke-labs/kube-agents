@@ -255,6 +255,51 @@ KMS signing key come from `terraform/modules/github-minter`, and the App
 private key must be imported into that key (see the module README) before the
 Deployment passes its readiness probe.
 
+### Self-improvement loop
+
+`selfImprovement.*` renders an hourly CronJob that investigates kube-agents
+itself — its source, its harness, and the installation it runs in — plus the
+ServiceAccount, Role and two RoleBindings it reads with, a ledger ConfigMap it
+counts findings in, its profile ConfigMap, and a NetworkPolicy. Eight objects in
+`report-only`; `fork` and `upstream` add a ninth, the ConfigMap holding the
+credential proxy's deny policy. `selfImprovement.networkPolicy: false` drops the
+NetworkPolicy and takes one off either count. All of them sit behind
+`selfImprovement.enabled`, which defaults to false: off renders nothing at all
+rather than something idle.
+
+One object outlives that switch. The ledger ConfigMap carries
+`helm.sh/resource-policy: keep`, so turning the loop off — or uninstalling the
+release — leaves it in the namespace with its findings and promotion records
+intact. Delete it by hand if you want the history gone.
+
+`mode` decides how far its output travels. `report-only` (the default) writes
+findings to the ledger ConfigMap and stops — no GitHub credential, no
+credential-proxy sidecar, and no `git` or `gh` on the runner's `PATH`. `fork`
+and `upstream` additionally give the CronJob a credential-proxy sidecar and
+mount a personal access token into it, held by a robot account that is not the
+agent's identity. `github.patSecret` names the Secret and `github.forkRepo` the
+repository branches are pushed to; the render fails with a named message when
+either is missing. The Secret itself is created out of band — the chart never
+sees the token — and nothing in the install mints, rotates or expires it. Sec. 6
+of the design says what that trades away against the GitHub App this design
+considered and rejected.
+
+`fork` and `upstream` do not work on this chart. Both render, and the runner
+then fails at its filing turn: it reaches for the credential-proxy shims at
+`/opt/credential-proxy/bin`, and #913 moved every shim out of the agent image
+into the sandbox image, with a build assertion in `deploy/docker/Dockerfile`
+that fails if any of them returns. The runner is the agent image, so there is
+nothing on its `PATH` to file with. `report-only` is unaffected — it renders no
+proxy and asks for no shim. Restoring the other two needs a runner that can
+reach a credential, which is a design change and not a value; see Sec. 5 of the
+design.
+
+The Google half is one investigator GSA and its Workload Identity binding, from
+`terraform/modules/kube-agents-selfimprove`, which is not yet part of
+`terraform/examples/full-install`. The design of record, and the list of where
+the implementation diverged from it, is
+[`docs/designs/self-improvement.md`](../../docs/designs/self-improvement.md).
+
 ### Telemetry
 
 `telemetry.otlpEndpoint` (default `""`) is the OTLP/HTTP collector base URL.

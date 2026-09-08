@@ -114,6 +114,7 @@ DISCOVERY_FILE_PATTERNS: tuple[str, ...] = (
 STATIC_NETWORK_POLICIES: tuple[str, ...] = (
     "charts/kube-agents/templates/litellm.yaml",
     "charts/kube-agents/templates/github-minter.yaml",
+    "charts/kube-agents/templates/self-improvement.yaml",
     "deploy/kustomize/platform/networkpolicy-core-egress.yaml",
     "examples/litellm-chatgpt-subscription/networkpolicy.yaml",
     "examples/litellm-gemini/networkpolicy.yaml",

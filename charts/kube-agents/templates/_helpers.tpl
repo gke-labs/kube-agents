@@ -143,6 +143,45 @@ them here would not suit every caller.
 {{- end }}
 
 {{/*
+The credential-proxy sidecar's repository, derived from the agent's the way
+resolveCredentialProxyImage does it in
+k8s-operator/internal/controller/platformagent_manifests.go: a trailing
+`platform-agent` becomes `credential-proxy`, and any other name gains a
+`-credential-proxy` suffix.
+
+Two rules rather than one because the second is what a fork hits. Replacing the
+suffix `/platform-agent` looks equivalent and is not: an install whose image is
+`ghcr.io/acme/ka-platform-agent` has no such suffix, so the replacement returns
+the string unchanged and the sidecar is handed the *agent* image. That container
+starts, runs the agent entrypoint, never serves the proxy's port, and the pod
+sits un-ready with no event naming the image -- so the failure reads as a
+credential problem rather than a rendering one.
+
+Takes the agent repository. Returns a repository, not a reference: the tag is
+the caller's and has to be the agent's own, so the two can never diverge.
+Compose with kube-agents.imageRepository above, in that order, to place the
+result on a mirror registry.
+
+A `:tag` or `@sha256:` in the repository value is not supported by this chart
+anywhere -- the tag has its own key -- but it is normalised away here rather
+than passed through, because passing it through is the one outcome that is
+worse than either supporting or refusing it. `ghcr.io/acme/platform-agent:v1`
+would otherwise miss the `platform-agent` comparison, be suffixed as
+`platform-agent:v1-credential-proxy`, and then take the caller's `:tag` on top:
+a reference no registry can parse, produced from a value that renders the agent
+itself perfectly well. Dropping the embedded tag yields the reference the
+chart's own model says the operator asked for, and the agent container next to
+it will have done the same thing with the same value.
+*/}}
+{{- define "kube-agents.credentialProxyRepository" -}}
+{{- $repository := . | trimSuffix "/" -}}
+{{- $name := $repository | splitList "/" | last | splitList "@" | first | splitList ":" | first -}}
+{{- $proxy := ternary "credential-proxy" (printf "%s-credential-proxy" $name) (eq $name "platform-agent") -}}
+{{- $prefix := $repository | splitList "/" | initial | join "/" -}}
+{{- if $prefix -}}{{- printf "%s/%s" $prefix $proxy -}}{{- else -}}{{- $proxy -}}{{- end -}}
+{{- end }}
+
+{{/*
 A complete third-party image reference, reproducing third_party_image() from
 scripts/installer/common.sh: mirrored installs pull <prefix>/<name>:<tag>
 with any @sha256 digest dropped — `make mirror-images` pushes by tag, and the

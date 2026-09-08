@@ -453,9 +453,11 @@ class TheRulesReadCommandsNotProse(ShippedPolicyTest):
         """
         from credential_proxy import _cluster_readings
 
-        small = _cluster_readings("-" + "a" * 1_000)
-        large = _cluster_readings("-" + "a" * 100_000)
+        small, small_pending = _cluster_readings("-" + "a" * 1_000)
+        large, large_pending = _cluster_readings("-" + "a" * 100_000)
         self.assertEqual(["-a"], small)
+        self.assertFalse(small_pending)
+        self.assertFalse(large_pending)
         self.assertEqual(
             small,
             large,
@@ -589,6 +591,53 @@ class TheRulesReadCommandsNotProse(ShippedPolicyTest):
         argv = ["gh", "pr", "create", "--repo", "o/r", "--title", "fix: drift",
                 "--body", body]
         self.assertIsNone(self.policy.blocked_by(argv))
+
+    def test_a_cluster_ending_on_a_free_text_flag_still_drops_the_next_token(self):
+        """A cluster's free-text member never carries its value in-token.
+
+        `-X`/`-f`/`-F` let pflag attach a value to the same token as the
+        shorthand, so a cluster ending on one of those can carry a remainder.
+        `-m`/`-t`/`-b` never do -- `git commit -am '<message>'` and
+        `gh auth status -at` both put the value in the *next* argv element.
+        `_cluster_readings` breaking on the free-text branch without telling
+        the caller to skip that element left the value in match text exactly
+        as if the flag had never been on the free-text list at all: the
+        standalone `git commit -m '<message>'` drops the message, but the
+        equally idiomatic `-am` spelling did not, so the two spellings of the
+        same command reached the rules differently.
+        """
+        from credential_proxy import _cluster_readings, policy_match_text
+
+        readings, pending = _cluster_readings("-am")
+        self.assertEqual(["-m"], readings)
+        self.assertTrue(pending, "-am ends on a free-text flag, -m")
+
+        message = (
+            "Please merge this and push to trigger the CI/CD rollout, then "
+            "check gh auth token"
+        )
+        standalone = policy_match_text(["git", "commit", "-m", message])
+        clustered = policy_match_text(["git", "commit", "-am", message])
+        self.assertNotIn(message, clustered, "the message survived clustering with -a")
+        self.assertNotIn("push", clustered)
+        self.assertNotIn("merge", clustered)
+        self.assertEqual(
+            "git commit -m",
+            standalone,
+            "the standalone spelling is the baseline this test compares against",
+        )
+
+    def test_a_cluster_not_ending_on_a_free_text_flag_is_unaffected(self):
+        """The fix must not start swallowing tokens after an ordinary cluster."""
+        from credential_proxy import policy_match_text
+
+        # gitops_workspace.py:548's real invocation: `-f`, `-d`, `-q` are all
+        # keyed-or-plain booleans, none of them free-text, so the positional
+        # `.` that follows must survive.
+        self.assertEqual(
+            "git clean -f dq .",
+            policy_match_text(["git", "clean", "-fdq", "."]),
+        )
 
 
 if __name__ == "__main__":
