@@ -76,9 +76,11 @@ type Config struct {
 	// posture for installs without that Secret, and the derived one
 	// (HKDF-SHA-256 over the bus password) is a recorded deviation on two
 	// counts: the broken join, and a de-anonymization key handed to whoever
-	// holds the bus password. HKDF answers a third — a bare digest of a
-	// credential is brute-forceable at one hash per guess — and answers
-	// neither of the first two.
+	// holds the bus password. HKDF is the construction a credential is
+	// permitted to pass through, and that is all it is: it answers neither
+	// count, and it is not a password hash — no work factor, so it does not
+	// make a weak hand-set NATS_PASSWORD any harder to guess from a leaked
+	// salt. Provisioning the Secret is what fixes that.
 	AttributionSalt []byte
 
 	// TaskDeadline mirrors the worker adapter's task deadline — the SAME
@@ -231,14 +233,16 @@ func FromEnv() (*Config, error) {
 		if cfg.NATSPassword == "" {
 			return nil, fmt.Errorf("SESSION_KV_SALT or A2A_ATTRIBUTION_SALT is required when NATS_PASSWORD is empty: the derived fallback would be a public constant")
 		}
-		// HKDF, not a bare digest of the password (CodeQL
-		// go/weak-sensitive-data-hashing, alert 25): one SHA-256 over a
-		// credential is a single cheap guess per candidate password, so a
-		// leaked salt hands back the bus password at dictionary speed. The
-		// extract-and-expand construction is what a credential is allowed
-		// to go through; it does not make the fallback a good salt — see
-		// the AttributionSalt field comment for why the provisioned Secret
-		// is still the answer.
+		// HKDF, not a bare digest of the password: a credential reaching a
+		// plain hash is what CodeQL's go/weak-sensitive-data-hashing
+		// refuses, and extract-and-expand under a fixed info string is the
+		// construction one is allowed to go through. It buys no resistance
+		// to offline guessing — HKDF has no work factor, and at a nil salt
+		// the cost per candidate password is a handful of SHA-256
+		// compressions either way. What keeps this fallback from being a
+		// de-anonymization key is the password's own entropy (the operator
+		// mints 128 bits of it) and, properly, the provisioned Secret; see
+		// the AttributionSalt field comment.
 		derived, err := hkdf.Key(sha256.New, []byte(cfg.NATSPassword), nil, attributionSaltInfo, attributionSaltLen)
 		if err != nil {
 			return nil, fmt.Errorf("deriving the attribution salt from NATS_PASSWORD: %w", err)

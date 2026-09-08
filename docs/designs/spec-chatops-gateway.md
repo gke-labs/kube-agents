@@ -334,7 +334,14 @@ install, read by every gateway replica from that Secret. Deriving a salt from
 another credential - the stage 1 gateway derives from the bus password when none is
 configured - is a deviation on two counts, the broken join and a de-anonymization
 key handed to whoever holds that credential over an identifier space (chat emails, a
-room roster) small enough to enumerate.
+room roster) small enough to enumerate. That derivation is HKDF-SHA-256 over the
+password under a fixed info string rather than a digest of it, which is what a
+credential is permitted to pass through and nothing more: it leaves both counts
+where they are, and HKDF has no work factor, so a hand-set weak password is no
+harder to recover from a leaked salt than it was. Changing the derivation at all
+re-salts every pseudonym on an install running the fallback - the never-rewritten
+property above is a property of the provisioned Secret, not of a value computed from
+a credential.
 
 **The rule covers identifiers, not content (stated explicitly 8/31; it was always the
 design, never written down).** Task content cannot be pseudonymized without destroying
