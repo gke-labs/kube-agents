@@ -1,17 +1,20 @@
 """A running install can tell a user where to report a problem with kube-agents.
 
 The fact only reaches a user if three things hold at once, and none of them fails
-loudly on its own: the runtime reference exists and is baked into the image, both
-specialist personas point at it, and the link they carry is the docs-site short
+loudly on its own: both specialist personas carry the two paths, they carry the
+part a user has to be told before submitting (what a report needs, and that a
+submission becomes public), and the link they hand out is the docs-site short
 link rather than the Google Forms URL behind it. The short link is what makes a
 recreated form a one-line change to `docs/site/astro.config.mjs` instead of an
 agent release, so these tests tie the link in the agent material to the redirect
 that serves it.
 
-Not asserted here: that the persona citation `/opt/defaults/docs/...` resolves at
-runtime, and that the Dockerfile COPY and `OPT_DEFAULTS` in
-`scripts/check_prompt_assets.py` agree. Those are `check_prompt_assets.py` and
-`scripts/test_check_prompt_assets.py::test_opt_defaults_matches_the_dockerfile`.
+The content is in the persona bodies rather than in a runtime reference under
+`/opt/defaults/docs/` because the personas are read into the prompt in the agent
+pod, while a file tool is a shell command in the sandbox pod, which is not given
+that directory (`deploy/sandbox/Dockerfile` stages `skills/`, `governance/` and
+an allowlisted `scripts/`; `deploy/shared/sandbox_mirror.py` withholds `docs`).
+A citation there would be a path the reader cannot open.
 
 Run:
   python3 -m unittest discover -s tests -p 'test_feedback_reference.py' -v
@@ -26,8 +29,6 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 ASTRO_CONFIG = REPO_ROOT / "docs/site/astro.config.mjs"
-DOCKERFILE = REPO_ROOT / "deploy/docker/Dockerfile"
-REFERENCE = REPO_ROOT / "agents/platform/docs/kube-agents-feedback.md"
 SPECIALIST_SOULS = (
     REPO_ROOT / "agents/platform/SOUL.md",
     REPO_ROOT / "agents/cluster/SOUL.md",
@@ -36,8 +37,7 @@ CHAT_SOUL = REPO_ROOT / "agents/chat/SOUL.md"
 
 # The two links every agent-facing file must carry. The short link is assembled
 # independently from the site config in test_short_link_matches_the_site_redirect;
-# the tracker is the path for an account that can open an issue, and the
-# reference lists it first.
+# the tracker is the path for an account that can open an issue.
 SHORT_LINK = "https://gke-labs.github.io/kube-agents/feedback"
 TRACKER = "https://github.com/gke-labs/kube-agents/issues"
 
@@ -55,9 +55,13 @@ REDIRECT_PATTERN = re.compile(rf"^\s*{QUOTED}:\s*FEEDBACK_FORM_URL\b", re.MULTIL
 # recreated form does not need a new agent image.
 FORMS_URL = re.compile(r"docs\.google\.com/forms")
 
-# Where the Dockerfile bakes the shared runtime references.
-OPT_DEFAULTS_DOCS = "/opt/defaults/docs/"
-CONTINUED_LINE = re.compile(r"\\\n\s*")
+# The persona bullet, and the two things it has to say beyond the links: what a
+# submission needs, and that filing one publishes it. Matched on the bullet's
+# own paragraph so a stray "public" elsewhere in a persona cannot stand in.
+BULLET_MARKER = "**Reporting a Problem with kube-agents Itself:**"
+SUBMISSION_REQUIREMENTS = ("summary", "Bug", "Feature request", "Question")
+PUBLIC_WARNING = re.compile(r"becomes a public issue")
+REDACTION_RULE = re.compile(r"read from a Secret")
 
 # Chat routing: the request and the specialist that answers it have to appear on
 # one row of the persona's quick-reference table.
@@ -65,14 +69,17 @@ ROUTING_REQUEST = "report a bug in kube-agents"
 ROUTING_TARGET = "`platform`"
 
 
-def _dockerfile_instructions() -> list[str]:
-    """The Dockerfile's instructions, each with its continuation lines folded in."""
-    return CONTINUED_LINE.sub(" ", DOCKERFILE.read_text(encoding="utf-8")).splitlines()
+def _feedback_bullet(path: Path) -> str:
+    """The one persona bullet that answers the question, or "" if there is none."""
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if BULLET_MARKER in line:
+            return line
+    return ""
 
 
 class FeedbackReferenceTest(unittest.TestCase):
-    def test_reference_and_specialist_souls_carry_both_links(self) -> None:
-        for path in (REFERENCE, *SPECIALIST_SOULS):
+    def test_specialist_souls_carry_both_links(self) -> None:
+        for path in SPECIALIST_SOULS:
             text = path.read_text(encoding="utf-8")
             for link in (SHORT_LINK, TRACKER):
                 with self.subTest(path=path.relative_to(REPO_ROOT), link=link):
@@ -83,6 +90,35 @@ class FeedbackReferenceTest(unittest.TestCase):
                         "kube-agents problem gets an answer only if the link is "
                         "in this file",
                     )
+
+    def test_specialist_souls_carry_the_submission_rules(self) -> None:
+        for path in SPECIALIST_SOULS:
+            bullet = _feedback_bullet(path)
+            with self.subTest(path=path.relative_to(REPO_ROOT)):
+                self.assertTrue(
+                    bullet,
+                    f"no {BULLET_MARKER} bullet in {path}; the persona is the only "
+                    "delivery path, since the sandbox has no /opt/defaults/docs",
+                )
+                for phrase in SUBMISSION_REQUIREMENTS:
+                    self.assertIn(
+                        phrase,
+                        bullet,
+                        "the bullet has to say what a submission needs; a user "
+                        "cannot be sent to the form without it",
+                    )
+                self.assertRegex(
+                    bullet,
+                    PUBLIC_WARNING,
+                    "a submission is published, and the user has to be told "
+                    "before they write one",
+                )
+                self.assertRegex(
+                    bullet,
+                    REDACTION_RULE,
+                    "the agent must not help draft a public report carrying "
+                    "cluster identifiers or Secret values",
+                )
 
     def test_short_link_matches_the_site_redirect(self) -> None:
         config = ASTRO_CONFIG.read_text(encoding="utf-8")
@@ -114,19 +150,6 @@ class FeedbackReferenceTest(unittest.TestCase):
                     "agent material names the short link, not the form URL, so a "
                     "recreated form needs no agent release",
                 )
-
-    def test_the_reference_is_baked_into_the_image(self) -> None:
-        baked = [
-            line
-            for line in _dockerfile_instructions()
-            if line.startswith("COPY") and OPT_DEFAULTS_DOCS in line
-        ]
-        self.assertTrue(baked, f"no COPY to {OPT_DEFAULTS_DOCS} in {DOCKERFILE}")
-        self.assertTrue(
-            any(str(REFERENCE.relative_to(REPO_ROOT)) in line for line in baked),
-            f"the reference is not copied to {OPT_DEFAULTS_DOCS}, so the path both "
-            "specialist personas cite does not exist in the image",
-        )
 
     def test_chat_persona_routes_the_request_to_the_platform_specialist(self) -> None:
         rows = [

@@ -112,7 +112,6 @@ OPT_DEFAULTS: tuple[tuple[str, str], ...] = (
     ("", "deploy/shared/defaults"),
     ("docs/glossary.md", "agents/platform/docs/glossary.md"),
     ("docs/gcp-console-links.md", "agents/platform/docs/gcp-console-links.md"),
-    ("docs/kube-agents-feedback.md", "agents/platform/docs/kube-agents-feedback.md"),
     ("", "agents/chat/defaults"),
     ("SOUL.md", "agents/chat/SOUL.md"),
     ("AGENTS.md", "agents/chat/AGENTS.md"),

@@ -1233,7 +1233,6 @@ RUN STDLIB="$(/opt/hermes/.venv/bin/python3 -c 'import sysconfig; print(sysconfi
 # them every docs edit re-ran the plugin install, purge and bytecode pass.
 COPY --chown=hermes:hermes agents/platform/docs/glossary.md \
      agents/platform/docs/gcp-console-links.md \
-     agents/platform/docs/kube-agents-feedback.md \
      /opt/defaults/docs/
 
 # 5.8. Copy custom agent startup script

@@ -44,8 +44,7 @@ kube-agents/
 │   └── platform/                                  Platform Agent profile
 │       ├── AGENTS.md, SOUL.md, CAPABILITIES.md    persona and workspace docs
 │       ├── docs/                                  runtime references (glossary,
-│       │                                          console links, feedback) +
-│       │                                          design docs
+│       │                                          console links) + design docs
 │       ├── governance/                            cron-run SOP playbooks + the
 │       │                                          first-run inventory-scan and
 │       │                                          report-prioritization SOPs
@@ -215,9 +214,8 @@ code, first check which era it belongs to:
   record, not yet implemented; `audit-logging-user-attribution.md` is a draft
   with an implemented/planned split per plane;
   `gchat-session-metadata-data-flow.md` documents implemented behavior.
-- **Runtime assets that are NOT human docs:** `agents/platform/docs/glossary.md`,
-  `agents/platform/docs/gcp-console-links.md` and
-  `agents/platform/docs/kube-agents-feedback.md` are baked into the agent
+- **Runtime assets that are NOT human docs:** `agents/platform/docs/glossary.md`
+  and `agents/platform/docs/gcp-console-links.md` are baked into the agent
   image at `/opt/defaults/docs/` by `deploy/docker/Dockerfile` and are read by
   the agent at runtime. Similarly, every `SOUL.md`, `AGENTS.md`,
   `CAPABILITIES.md`, `SKILL.md`, and governance SOP under `agents/` is agent
@@ -284,7 +282,6 @@ pull request:
 | `agents/platform/cron/README.md` | Component README | Editing rules for the Platform Agent's own cron store, kept beside `jobs.json` rather than inside it because `cron/jobs.py::_save_jobs_unlocked` rewrites the file to exactly `jobs` and `updated_at` and destroys any top-level comment on the first tick. Covers what actually fires this roster (`profile-cron-tick`, not the gateway thread), why no id may appear on both rosters, why no job sets `deliver: "local"` and what `deliver: "chat"` does instead, why `schedule.display` must mirror `expr`, and the two-release sequence for retiring a watchdog given that `merge_cron_store` never prunes. | Roster ownership, duplicate-id hazard, delivery targets, `--cron-retire` | Contributors editing `agents/platform/cron/jobs.json`; the tests it relies on live in the `fleet-audit` skill |
 | `agents/platform/docs/glossary.md` | Runtime reference | Glossary of agentic terms (agent platforms, runtimes, Chat vs Platform agents, Hermes profiles, kanban coordination) that the agents consult at session start. | Terminology | Baked to `/opt/defaults/docs/`; NOT the human glossary (see site `reference/glossary.md`) |
 | `agents/platform/docs/gcp-console-links.md` | Runtime reference | GCP Console URL templates (Logs/Trace/Metrics Explorer, GKE Workloads) that agents fill with `{project_id}` to give users clickable links. | Console deep links | Baked to `/opt/defaults/docs/` |
-| `agents/platform/docs/kube-agents-feedback.md` | Runtime reference | Where a user reports a problem with kube-agents itself: the issue tracker, the short link to the public feedback form for accounts that cannot open an issue, what a submission needs, and what must stay out of one because it becomes a public issue. | Feedback paths, submission contents | Baked to `/opt/defaults/docs/` |
 | `agents/platform/docs/autoops-architecture.md` | Design doc | The AutoOps extension architecture: one fixed path from an operational signal to an approved GitOps pull request, plus the five contracts (ingestion, session and state, judgment, context reach, remediation) a new operational domain implements to ride that path. Records what ships today on the GKE-events path and what a second domain has to supply. | Inject envelope and `kind`, `_build_agent_query()`, cross-domain CUJs | Human design doc; not baked into the image despite its location |
 | `agents/platform/docs/session_management.md` | Design doc | Architecture of alert-to-session routing: GKE warning events flow through a stateful REST bridge into persistent diagnostic agent sessions, with SQLite schemas and troubleshooting commands. | Event dedup, chat-thread resolution, `incident_context` plugin, verification | Human design/ops doc; not baked into the image despite its location |
 | `agents/platform/governance/*.md` | SOP playbook | Uniform cron-run governance playbooks, each with a purpose line and an execution checklist. The live ones are fleet audits: each emits a validated findings file and routes it through the `fleet-audit` skill, which publishes it as the stream's ledger issue. The rest are retained on disk but unscheduled — their watchdogs shipped disabled and were then retired from the cron roster. Three are first-run onboarding SOPs run by bootstrap kanban cards rather than by cron: `inventory.md` (environment discovery, fans the workload audit out to the Cluster Agents and aggregates what they return into `INVENTORY.raw.md`), `cluster_inventory_audit_sop.md` (the per-cluster half, run by one Cluster Agent against the cluster it is pinned to) and `inventory_prioritize_sop.md` (ranks those findings into the short `INVENTORY.md` the user is sent). The k8s-event-watcher daily recap is the one entry that documents a `no_agent` script rather than instructing an agent. | Fleet audits, drift reconciliation, cost, capacity, upgrades, first-run inventory, event-watcher recap | Runtime playbooks fired by the cron watchdogs (inventory: by the bootstrap cards; event-watcher recap: by a `no_agent` script tick); the site's governance-sops page names them and says which are live |
