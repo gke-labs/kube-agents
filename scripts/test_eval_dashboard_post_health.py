@@ -363,6 +363,21 @@ class Digest(RunHarness):
         self.tick(outage(), T0.replace(hour=13, minute=50), digest_hour=14)
         self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["🔴", "📊"])
 
+    def test_digest_carries_the_stale_note_every_day_while_the_stall_lasts(self):
+        doc = health()
+        doc["stale"] = True
+        doc["generated_at"] = "2026-09-04T05:55:40+00:00"
+        self.tick(doc, T0.replace(hour=7, minute=0))  # the flip: the stale notice alone
+        self.assertEqual(len(self.opener.requests), 1)
+        for day in (4, 5):
+            self.tick(doc, T0.replace(day=day, hour=8, minute=5))
+        digests = [text for text in self.opener.texts if text.startswith("📊")]
+        self.assertEqual(len(digests), 2)
+        for text in digests:
+            self.assertEqual(text.split("\n")[1], "⚪ No fresh data since 05:55 UTC — these numbers stop there. Someone check the refresh job.")
+        self.tick(health(), T0.replace(day=6, hour=8, minute=5))
+        self.assertNotIn("No fresh data", self.opener.texts[-1])
+
     def test_digest_without_a_p50_says_so(self):
         doc = health()
         doc["metrics"]["wall_clock_p50_s"] = None

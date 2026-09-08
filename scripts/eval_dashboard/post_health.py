@@ -380,7 +380,13 @@ def render_digest(health: dict, now: datetime) -> str:
         f" · {metrics.get('pr_caused_reds', 0)} PR-caused red · {metrics.get('infra_reds', 0)} infra"
         f" · typical run {typical}"
     )
-    return "\n".join([headline, dashboard_link(DASHBOARD_SECTION_AGENT, health.get("failing_cases") or [], parse_iso(health.get("since")))])
+    lines = [headline]
+    if health.get("stale"):
+        # The window is measured from the data's horizon, so during a stall
+        # these are the same numbers every morning; say so every morning.
+        lines.append(f"⚪ No fresh data since {hhmm(parse_iso(health.get('generated_at')))} UTC — these numbers stop there. Someone check the refresh job.")
+    lines.append(dashboard_link(DASHBOARD_SECTION_AGENT, health.get("failing_cases") or [], parse_iso(health.get("since"))))
+    return "\n".join(lines)
 
 
 def render(kind: str, health: dict, prev: dict | None, now: datetime) -> str:
