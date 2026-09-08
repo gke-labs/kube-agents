@@ -60,11 +60,13 @@ def _request(endpoint: str, path: str, body: dict | None = None, method: str = "
 
 def _where(finding: dict) -> str:
     cluster = finding.get("cluster") or ""
+    # The project leads: a cluster name alone is ambiguous once two projects
+    # are in scope, and this line is where the reader goes to look.
     # A cluster-scoped finding names the cluster as its object, and reading
     # `prod/prod` back is a puzzle rather than a location.
-    parts = [cluster, finding.get("namespace") or "", finding.get("object") or ""]
-    if parts[2] == cluster:
-        parts = parts[:2]
+    parts = [finding.get("project") or "", cluster, finding.get("namespace") or "", finding.get("object") or ""]
+    if parts[3] == cluster:
+        parts = parts[:3]
     return "/".join(part for part in parts if part)
 
 

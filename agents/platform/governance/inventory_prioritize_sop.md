@@ -103,7 +103,7 @@ python3 /opt/data/scripts/inventory_findings.py extract
 ```
 
 It reads the raw file's ```findings block and prints a numbered list — `f001`, `f002`, … — with each
-finding's check, cluster, namespace, object and title. **That list is the complete set, and it is the
+finding's check, project, cluster, namespace, object and title. **That list is the complete set, and it is the
 only set.** Do not add an item you noticed in the prose and the block missed, do not drop one that
 reads like a duplicate, and do not merge two into one. The block's lines were written per affected
 object on purpose: a missing `readinessProbe` on three Deployments is three rows in the queue,
@@ -249,7 +249,7 @@ the script:
 
 ```json
 {
-  "complete_clusters": ["prod-eu"],
+  "complete_clusters": ["acme-prod/prod-eu"],
   "scores": {
     "f001": {
       "rubric": { "B": 3, "L": 6, "detect": 3, "recover": 2, "C": 1.0 },
@@ -286,11 +286,12 @@ Sending is per cluster, so it is not all-or-nothing on the wire. If one cluster'
 others stay registered, the script names which failed, and `registered N of M` will genuinely differ.
 Treat that as what it says — some of it landed — and follow the exit 13 branch below.
 
-The identity of a row is `check` + `cluster` + `namespace` + `object`, which the script takes from
-the extracted item — you cannot set them, and a re-run of this card updates the same rows instead of
-duplicating them.
+The identity of a row is `check` + `project` + `cluster` + `namespace` + `object`, which the script
+takes from the extracted item — you cannot set them, and a re-run of this card updates the same rows
+instead of duplicating them.
 
-`complete_clusters` lists the clusters the raw file says were scanned in full. Leave a cluster out
+`complete_clusters` lists the clusters the raw file says were scanned in full, each as
+`<project>/<cluster>` — the same pair the register output prints per batch. Leave a cluster out
 when the file records a gap, a skipped category, a failed credential mint, or a cluster in `ERROR`.
 Being listed lowers the confidence of queued rows this run did not re-report, which re-ranks them
 down; a sweep that died halfway produces the same silence as a fleet that got healthier overnight,

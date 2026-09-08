@@ -3028,6 +3028,7 @@ class TestFindingsQueueApi(unittest.TestCase):
         finding = {
             "source": "inventory",
             "check": "probes-readiness",
+            "project": "acme-prod",
             "cluster": "prod-eu",
             "namespace": "payments",
             "object": "Deployment/checkout",
@@ -3172,6 +3173,8 @@ class TestFindingsQueueApi(unittest.TestCase):
         )
         self.assertEqual(len(self.client.get("/v1/findings?cluster=prod-eu").json()["findings"]), 1)
         self.assertEqual(len(self.client.get("/v1/findings?severity=major").json()["findings"]), 2)
+        self.assertEqual(len(self.client.get("/v1/findings?project=acme-prod").json()["findings"]), 2)
+        self.assertEqual(len(self.client.get("/v1/findings?project=acme-staging").json()["findings"]), 0)
         self.assertEqual(self.client.get("/v1/findings?state=pending").status_code, 400)
 
     def test_publication_round_trip(self):

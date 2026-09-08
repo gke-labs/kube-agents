@@ -45,6 +45,7 @@ def sample(**overrides) -> dict:
     finding = {
         "source": "inventory",
         "check": "probes-readiness",
+        "project": "acme-prod",
         "cluster": "prod-eu",
         "namespace": "payments",
         "object": "Deployment/checkout",
@@ -68,55 +69,69 @@ def sample(**overrides) -> dict:
 
 
 class TestIdentity(unittest.TestCase):
-    def test_id_is_the_four_field_tuple(self):
+    def test_id_is_the_five_field_tuple(self):
         self.assertEqual(
-            fq.derive_finding_id("probes-readiness", "prod-eu", "payments", "Deployment/checkout"),
-            "probes-readiness.prod-eu.payments.deployment-checkout",
+            fq.derive_finding_id("probes-readiness", "acme-prod", "prod-eu", "payments", "Deployment/checkout"),
+            "probes-readiness.acme-prod.prod-eu.payments.deployment-checkout",
         )
 
     def test_cluster_scoped_uses_the_empty_sentinel(self):
         self.assertEqual(
-            fq.derive_finding_id("public-control-plane", "prod-eu", "", "cluster"),
-            "public-control-plane.prod-eu._.cluster",
+            fq.derive_finding_id("public-control-plane", "acme-prod", "prod-eu", "", "cluster"),
+            "public-control-plane.acme-prod.prod-eu._.cluster",
         )
 
     def test_a_value_cannot_manufacture_a_segment_boundary(self):
         self.assertEqual(
-            fq.derive_finding_id("x", "c", "n", "widgets.example.com").count("."),
-            3,
+            fq.derive_finding_id("x", "p", "c", "n", "widgets.example.com").count("."),
+            4,
         )
 
     def test_two_sources_naming_one_problem_derive_one_id(self):
         self.assertEqual(
-            fq.derive_finding_id("workload-crashloop", "prod-eu", "payments", "Deployment/checkout"),
-            fq.derive_finding_id("workload-crashloop", "prod-eu", "payments", "deployment/checkout"),
+            fq.derive_finding_id("workload-crashloop", "acme-prod", "prod-eu", "payments", "Deployment/checkout"),
+            fq.derive_finding_id("workload-crashloop", "acme-prod", "prod-eu", "payments", "deployment/checkout"),
+        )
+
+    def test_the_same_cluster_name_in_two_projects_is_two_identities(self):
+        # The collision the project segment exists to prevent: without it the
+        # second `prod` overwrites the first's row while keeping its state.
+        self.assertNotEqual(
+            fq.derive_finding_id("workload-identity-off", "acme-prod", "prod", "", "prod"),
+            fq.derive_finding_id("workload-identity-off", "acme-staging", "prod", "", "prod"),
         )
 
     def test_long_ids_are_shortened_injectively(self):
         long_ns = "a" * 80
-        first = fq.derive_finding_id("probes-readiness", "prod-eu", long_ns, "Deployment/frontend-api")
-        second = fq.derive_finding_id("probes-readiness", "prod-eu", long_ns, "Deployment/frontend-web")
+        first = fq.derive_finding_id("probes-readiness", "acme-prod", "prod-eu", long_ns, "Deployment/frontend-api")
+        second = fq.derive_finding_id("probes-readiness", "acme-prod", "prod-eu", long_ns, "Deployment/frontend-web")
         self.assertLessEqual(len(first), fq.MAX_FINDING_ID)
         self.assertNotEqual(first, second)
 
     @unittest.skipIf(AUDIT_REPORT is None, "audit_report.py not importable here")
-    def test_id_matches_audit_report(self):
+    def test_id_matches_audit_report_with_the_project_segment_spliced_in(self):
+        # The queue's derivation is the audit's plus a project segment after
+        # the check, so segment-level parity is the contract: for ids short
+        # enough that neither side shortens, splicing `_id_segment(project)`
+        # into the audit's id reproduces the queue's exactly. The shortening
+        # budgets differ once a fifth segment exists, so the long-id cases are
+        # covered by the queue-local tests above instead.
         cases = [
-            ("probes-readiness", "prod-eu", "payments", "Deployment/checkout"),
-            ("public-control-plane", "prod-eu", "", "cluster"),
-            ("x", "c", "n", "widgets.example.com"),
-            ("workload-crashloop", "Prod_EU", "kube-system", "DaemonSet//fluentbit"),
-            ("podsecurity-gaps", "c" * 60, "n" * 60, "o" * 60),
-            ("probes-readiness", "prod-eu", "a" * 80, "Deployment/frontend-api"),
-            ("probes-readiness", "prod-eu", "a" * 80, "Deployment/frontend-web"),
+            ("probes-readiness", "acme-prod", "prod-eu", "payments", "Deployment/checkout"),
+            ("public-control-plane", "acme-prod", "prod-eu", "", "cluster"),
+            ("x", "p", "c", "n", "widgets.example.com"),
+            ("workload-crashloop", "Acme_Prod", "Prod_EU", "kube-system", "DaemonSet//fluentbit"),
         ]
-        for check, cluster, namespace, obj in cases:
-            expected = AUDIT_REPORT._shorten_id(
+        for check, project, cluster, namespace, obj in cases:
+            audit = AUDIT_REPORT._shorten_id(
                 AUDIT_REPORT.derive_finding_id(
                     {"check": check, "cluster": cluster, "namespace": namespace, "object": obj}
                 )
             )
-            self.assertEqual(fq.derive_finding_id(check, cluster, namespace, obj), expected)
+            head, tail = audit.split(".", 1)
+            expected = f"{head}.{fq._id_segment(project)}.{tail}"
+            self.assertLessEqual(len(expected), fq.MAX_FINDING_ID, "case long enough to shorten; move it")
+            self.assertEqual(fq.derive_finding_id(check, project, cluster, namespace, obj), expected)
 
 
 class TestRubric(unittest.TestCase):
@@ -304,12 +319,60 @@ class TestRegistration(QueueTestCase):
         self.assertEqual(row["surface_count"], 0)
         self.assertIsNone(row["alarmed_at"])
 
+    def test_the_same_cluster_name_in_two_projects_is_two_rows(self):
+        # The key collision this column exists to prevent: without project in
+        # the identity, the staging registration lands as an *update* of the
+        # prod row — its title and detail overwrite prod's, and because the
+        # sticky-state handling keeps the existing state, an acknowledged prod
+        # finding silently re-points at staging's object while still reading
+        # as acknowledged.
+        prod = sample(project="acme-prod", cluster="prod", object="prod", namespace="", title="WI off in acme-prod")
+        staging = sample(project="acme-staging", cluster="prod", object="prod", namespace="", title="WI off in acme-staging")
+        self.register(prod)
+        fq.patch_finding(self.conn, fq.validate_finding(prod)["id"], {"state": "accepted"})
+
+        result = self.register(staging)
+
+        self.assertEqual(result["results"][0]["outcome"], "created")
+        rows = fq.list_findings(self.conn, cluster="prod")
+        self.assertEqual(len(rows), 2)
+        by_project = {row["project"]: row for row in rows}
+        self.assertEqual(by_project["acme-prod"]["title"], "WI off in acme-prod")
+        self.assertEqual(by_project["acme-prod"]["state"], "accepted")
+        self.assertEqual(by_project["acme-staging"]["state"], "queued")
+        self.assertEqual(fq.list_findings(self.conn, cluster="prod", project="acme-staging"), [by_project["acme-staging"]])
+
+    def test_a_finding_without_a_project_is_refused(self):
+        payload = sample()
+        del payload["project"]
+        with self.assertRaisesRegex(fq.FindingError, "project is required"):
+            self.register(payload)
+
+    def test_a_complete_scope_without_a_project_is_refused(self):
+        # The absence rule has the same ambiguity as the key: "complete for
+        # cluster prod" must say which prod, or it downgrades another
+        # project's rows.
+        with self.assertRaisesRegex(fq.FindingError, "scope.project is required"):
+            self.register(sample(), scope={"cluster": "prod-eu", "complete": True})
+
+    def test_a_complete_run_does_not_reach_another_projects_same_named_cluster(self):
+        other_project = sample(project="acme-staging", title="the staging copy")
+        self.register(sample(), other_project)
+
+        result = self.register(
+            sample(), scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True}
+        )
+
+        self.assertEqual(result["downgraded"], 0)
+        row = fq.get_finding(self.conn, fq.validate_finding(other_project)["id"])
+        self.assertEqual(row["rubric"]["C"], 1.0)
+
     def test_a_complete_run_lowers_confidence_on_what_it_did_not_report(self):
         other = sample(object="Deployment/ledger", detail="also missing")
         self.register(sample(), other)
         absent_id = fq.validate_finding(other)["id"]
 
-        result = self.register(sample(), scope={"cluster": "prod-eu", "complete": True})
+        result = self.register(sample(), scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True})
 
         self.assertEqual(result["downgraded"], 1)
         row = fq.get_finding(self.conn, absent_id)
@@ -325,7 +388,7 @@ class TestRegistration(QueueTestCase):
         absent_id = fq.validate_finding(other)["id"]
         fq.mark_surfaced(self.conn, absent_id)
 
-        result = self.register(sample(), scope={"cluster": "prod-eu", "complete": True})
+        result = self.register(sample(), scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True})
 
         self.assertEqual(result["downgraded"], 1)
         self.assertEqual(fq.get_finding(self.conn, absent_id)["rubric"]["C"], 0.6)
@@ -345,7 +408,7 @@ class TestRegistration(QueueTestCase):
         self.register(sample(), elsewhere)
         elsewhere_id = fq.validate_finding(elsewhere)["id"]
 
-        self.register(sample(), scope={"cluster": "prod-eu", "complete": True})
+        self.register(sample(), scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True})
 
         self.assertEqual(fq.get_finding(self.conn, elsewhere_id)["rubric"]["C"], 1.0)
 
@@ -355,7 +418,7 @@ class TestRegistration(QueueTestCase):
         accepted_id = fq.validate_finding(accepted)["id"]
         fq.patch_finding(self.conn, accepted_id, {"state": "accepted"})
 
-        self.register(sample(), scope={"cluster": "prod-eu", "complete": True})
+        self.register(sample(), scope={"project": "acme-prod", "cluster": "prod-eu", "complete": True})
 
         self.assertEqual(fq.get_finding(self.conn, accepted_id)["rubric"]["C"], 1.0)
 
@@ -365,7 +428,7 @@ class TestRegistration(QueueTestCase):
         other = sample(object="Deployment/ledger")
         self.register(sample(), other)
 
-        result = self.register(sample(), scope={"cluster": "Prod-EU", "complete": True})
+        result = self.register(sample(), scope={"project": "Acme-Prod", "cluster": "Prod-EU", "complete": True})
 
         self.assertEqual(result["downgraded"], 1)
         self.assertEqual(fq.get_finding(self.conn, fq.validate_finding(other)["id"])["rubric"]["C"], 0.6)
@@ -884,6 +947,7 @@ class SopRubricParityTests(unittest.TestCase):
                 {
                     "source": inv.SOURCE,
                     "check": "probes-readiness",
+                    "project": "acme-prod",
                     "cluster": "prod",
                     "object": "api",
                     "title": "t",

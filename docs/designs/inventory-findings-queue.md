@@ -125,7 +125,7 @@ Grain is one problem: one check, at one object, on one cluster.
 | `id`                                         | identity; primary key. Derived, never written by a model — see below                                                                                                                                                       |
 | `source`                                     | `inventory` \| `event-watcher` \| `audit`                                                                                                                                                                                  |
 | `check`                                      | the check slug; the same vocabulary the audit streams use (§10)                                                                                                                                                            |
-| `cluster`, `namespace`, `object`             | `namespace` empty for cluster-scoped objects                                                                                                                                                                               |
+| `project`, `cluster`, `namespace`, `object`  | the GCP project qualifies the cluster — a cluster name is only unique within one (a second project's `prod` must not overwrite the first's rows); `namespace` empty for cluster-scoped objects                             |
 | `severity`                                   | `critical` \| `major` \| `minor`. Derived from `rank_score`, not judged separately, with one floor for findings that are failing now (§4.2)                                                                                |
 | `rank_score`                                 | the ordering key. Every row has one, gated or not (§4.4). Written at registration, changed only by a named re-rank event                                                                                                   |
 | `rubric`                                     | the per-measure vector behind `rank_score` (§4), stored so the rank is auditable and so §4.2's floor stays a predicate over it rather than a column                                                                        |
@@ -143,8 +143,13 @@ Grain is one problem: one check, at one object, on one cluster.
 | `chat_id`, `thread_id`                       | null until surfaced; written _after_ the send. The join to `incidents`, and not a delivery input (§8)                                                                                                                      |
 
 **`id` is derived from the finding's own fields**, by the rule `audit_report.py` already implements
-in `derive_finding_id`: the dotted concatenation of `(check, cluster, namespace, object)`, each
-segment reduced to `[a-z0-9-]` by `_id_segment` so a value can never manufacture a segment boundary.
+in `derive_finding_id` — extended with the project: the dotted concatenation of
+`(check, project, cluster, namespace, object)`, each segment reduced to `[a-z0-9-]` by
+`_id_segment` so a value can never manufacture a segment boundary. The project segment is the
+queue's own addition: the audit's ledger lives inside one project and its four-field id is unique
+there, but this table spans whatever the agent can see, and two clusters named `prod` in different
+projects must be two rows — with the four-field key the second registration silently overwrote the
+first's descriptive columns while keeping its workflow state.
 Reuse it rather than inventing a second scheme, for the reason that function's docstring gives at
 length — an identity an LLM re-derives from prose every morning is not an identity. It records two
 separate costs: the identity had been written five different ways by five SOPs, and on 2026-08-03 a
@@ -165,6 +170,7 @@ CREATE TABLE IF NOT EXISTS findings (
     id               TEXT PRIMARY KEY,
     source           TEXT NOT NULL,               -- inventory | event-watcher | audit
     check_slug       TEXT NOT NULL,
+    project          TEXT NOT NULL,               -- the GCP project id; qualifies cluster
     cluster          TEXT NOT NULL,
     namespace        TEXT NOT NULL DEFAULT '',    -- '' for cluster-scoped, matching derive_finding_id
     object           TEXT NOT NULL,
@@ -274,15 +280,15 @@ ledger is rendered fresh each time. A queue cannot do that: `snoozed` and `dismi
 person made once and nothing in the cluster records them. So state here is stored, and every
 transition has exactly one actor.
 
-| state       | entered when                                                   | by                                                | effect on publishing                                          |
-| ----------- | -------------------------------------------------------------- | ------------------------------------------------- | ------------------------------------------------------------- |
-| `queued`    | registration, for an id not already present                    | any source (§5)                                   | on the list, in score order                                   |
-| `surfaced`  | a nudge or an on-demand pull named it                          | the publisher, after send                         | stays on the list; `surface_count` records how often          |
+| state       | entered when                                                   | by                                                        | effect on publishing                                          |
+| ----------- | -------------------------------------------------------------- | --------------------------------------------------------- | ------------------------------------------------------------- |
+| `queued`    | registration, for an id not already present                    | any source (§5)                                           | on the list, in score order                                   |
+| `surfaced`  | a nudge or an on-demand pull named it                          | the publisher, after send                                 | stays on the list; `surface_count` records how often          |
 | `snoozed`   | the user said "not now" and gave or implied a date             | user, via a kanban card; the nudge's daily run returns it | off the list until `snoozed_until`, then back to `surfaced`   |
-| `accepted`  | the user took it on — working it, or its PR is open            | user, via a kanban card                           | its own section of the list; still re-verified                |
-| `dismissed` | the user rejected it — won't fix, or not a real problem        | user, via a kanban card                           | off the list permanently; sticky against every automated path |
-| `resolved`  | re-verification found it no longer reproduces                  | the daily job                                     | off the list; kept as the record that it was fixed            |
-| `stale`     | the object it names no longer exists, so it cannot be verified | the daily job                                     | off the list; distinct from `resolved` on purpose             |
+| `accepted`  | the user took it on — working it, or its PR is open            | user, via a kanban card                                   | its own section of the list; still re-verified                |
+| `dismissed` | the user rejected it — won't fix, or not a real problem        | user, via a kanban card                                   | off the list permanently; sticky against every automated path |
+| `resolved`  | re-verification found it no longer reproduces                  | the daily job                                             | off the list; kept as the record that it was fixed            |
+| `stale`     | the object it names no longer exists, so it cannot be verified | the daily job                                             | off the list; distinct from `resolved` on purpose             |
 
 **`dismissed` is a sink, and the leak out of it is two steps long.** §5.2 blocks the obvious
 revival — the next sweep re-registering what the user rejected — but verification is a second
@@ -563,7 +569,7 @@ window — the watcher's
 `WATCHER_DEDUP_WINDOW` override — and it answers "should this event open a troubleshooting
 session?" A pod UID changes on every recreate, so
 a CrashLoopBackOff that is rescheduled ten times is ten dedup keys. `derive_finding_id` is
-`(check, cluster, namespace, object)` and answers "is this the same problem?", which across ten
+`(check, project, cluster, namespace, object)` and answers "is this the same problem?", which across ten
 recreations of the same Deployment's pod it is. The watcher keeps its cache for session suppression;
 the queue keys on the finding id and updates the existing row.
 
@@ -668,7 +674,7 @@ gets the same treatment, for two reasons that are not stylistic:
 | ------------------------------------------------ | --------------------------------- | -------------------------------------------------------------------------------------- |
 | `POST /v1/findings`                              | prioritize worker, watcher, audit | upsert a batch under §5.2's per-state rules; returns created/updated/suppressed per id |
 | `GET /v1/findings/ranked`                        | any publisher (§7)                | the open queue in the order below; the whole list, ordering in code                    |
-| `GET /v1/findings`                               | the `platform` worker             | the on-demand pull, filterable by cluster, state, severity                             |
+| `GET /v1/findings`                               | the `platform` worker             | the on-demand pull, filterable by project, cluster, state, severity                    |
 | `POST /v1/findings/{id}/surfaced`                | any publisher                     | after the send: `surface_count`, `surfaced_at`, `chat_id`, `thread_id`                 |
 | `POST /v1/findings/expire-snoozes`               | the nudge's daily run             | return every row whose `snoozed_until` has lapsed to `surfaced` (§3.2)                 |
 | `PATCH /v1/findings/{id}`                        | the `platform` worker             | the three human transitions (§3.2), plus `pr_url`/`pr_state` reconciliation            |
@@ -680,7 +686,7 @@ gets the same treatment, for two reasons that are not stylistic:
 (§3.2), which is a stored transition rather than a predicate the query evaluates — otherwise the
 backlog shows a row that `GET /v1/findings` still reports as snoozed.
 
-The order is `actionable` descending, then `rank_score` descending, then cluster, namespace, object,
+The order is `actionable` descending, then `rank_score` descending, then project, cluster, namespace, object,
 title and id ascending — §4.4's gate, then the rubric, then a deterministic tie-break. It is one
 function, `findings_queue.ranked_sort_key`, which is also what `GET /v1/findings` sorts by before it
 applies `limit`, so a capped list returns the worst rows rather than whichever ones SQLite reached
@@ -1098,7 +1104,9 @@ vocabulary.**
 
 The first question is what happens when both sources report the same problem. If the sweep emits
 `probes-readiness` on the object `obtainability-audit` also emits it on, `derive_finding_id` yields
-the same string for both, so they are one row rather than two findings to reconcile. Whichever
+the same string for both, so they are one row rather than two findings to reconcile. (That holds
+because the queue derives the id itself from the registration payload — a source never sends one —
+and the payload's required `project` is the same GCP project either way.) Whichever
 arrives first creates it; the other updates `last_verified` and, if the rubric vector moved, triggers
 a re-rank. The user is told once. The queue's computed severity governs the row and the stream's
 stated severity governs the ledger issue, and they can differ on the same finding — they are answers

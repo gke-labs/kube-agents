@@ -45,7 +45,7 @@ BLOCK_RE = re.compile(
     re.MULTILINE | re.DOTALL,
 )
 
-ITEM_REQUIRED = ("check", "cluster", "object", "title")
+ITEM_REQUIRED = ("check", "project", "cluster", "object", "title")
 ITEM_OPTIONAL = ("namespace", "detail", "severity_hint", "provider_managed")
 ITEM_STRINGS = ITEM_REQUIRED + ("namespace", "detail", "severity_hint")
 
@@ -164,7 +164,7 @@ def _clean_item(raw: dict, lineno: int, errors: list[str]) -> dict | None:
 def describe_items(items: list[dict]) -> str:
     lines = []
     for item in items:
-        where = "/".join(x for x in (item["cluster"], item.get("namespace"), item["object"]) if x)
+        where = "/".join(x for x in (item["project"], item["cluster"], item.get("namespace"), item["object"]) if x)
         hint = f" [{item['severity_hint']}]" if item.get("severity_hint") else ""
         lines.append(f"  {item['id']}  {item['check']}  {where}{hint}\n        {item['title']}")
     return "\n".join(lines)
@@ -251,6 +251,7 @@ def build_payloads(items: list[dict], scores: dict) -> list[dict]:
         payload = {
             "source": SOURCE,
             "check": item["check"],
+            "project": item["project"],
             "cluster": item["cluster"],
             "namespace": item.get("namespace", ""),
             "object": item["object"],
@@ -334,23 +335,24 @@ def cmd_register(args: argparse.Namespace) -> int:
         print("nothing to register: the sweep extracted no findings")
         return 0
 
-    by_cluster: dict[str, list[dict]] = {}
+    by_cluster: dict[tuple[str, str], list[dict]] = {}
     for payload in payloads:
-        by_cluster.setdefault(payload["cluster"], []).append(payload)
+        by_cluster.setdefault((payload["project"], payload["cluster"]), []).append(payload)
 
     sent = 0
     failures: list[str] = []
-    for cluster, batch in sorted(by_cluster.items()):
-        scope = {"cluster": cluster, "complete": True} if cluster in complete else None
+    for (project, cluster), batch in sorted(by_cluster.items()):
+        where = f"{project}/{cluster}"
+        scope = {"project": project, "cluster": cluster, "complete": True} if where in complete else None
         if args.dry_run:
-            print(f"{cluster}: {len(batch)} finding(s), scope={'complete' if scope else 'omitted'} (dry run)")
+            print(f"{where}: {len(batch)} finding(s), scope={'complete' if scope else 'omitted'} (dry run)")
             sent += len(batch)
             continue
         try:
             result = post_batch(args.endpoint, batch, scope)
         except (urllib.error.URLError, OSError, ValueError) as exc:
             detail = exc.read().decode("utf-8", "replace") if isinstance(exc, urllib.error.HTTPError) else str(exc)
-            failures.append(f"{cluster}: {detail}")
+            failures.append(f"{where}: {detail}")
             continue
         outcomes = result.get("results") or []
         sent += len(outcomes)
@@ -358,7 +360,7 @@ def cmd_register(args: argparse.Namespace) -> int:
         for entry in outcomes:
             tally[entry.get("outcome", "?")] = tally.get(entry.get("outcome", "?"), 0) + 1
         summary = ", ".join(f"{count} {name}" for name, count in sorted(tally.items()))
-        print(f"{cluster}: {summary}, scope={'complete' if scope else 'omitted'}")
+        print(f"{where}: {summary}, scope={'complete' if scope else 'omitted'}")
         for entry in outcomes:
             if entry.get("outcome") == "suppressed":
                 print(f"  suppressed (do not report or count): {entry.get('id')}")
@@ -392,7 +394,9 @@ def cmd_ranked(args: argparse.Namespace) -> int:
 
     for index, finding in enumerate(ranked, 1):
         where = "/".join(
-            x for x in (finding.get("cluster"), finding.get("namespace"), finding.get("object")) if x
+            x
+            for x in (finding.get("project"), finding.get("cluster"), finding.get("namespace"), finding.get("object"))
+            if x
         )
         flags = []
         if finding.get("provider_managed"):

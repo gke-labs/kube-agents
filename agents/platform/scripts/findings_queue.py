@@ -80,11 +80,16 @@ PUBLICATION_TARGET_KINDS = ("github-issue", "repo-file", "chat")
 # agents/platform/skills/fleet-audit/scripts/audit_report.py rather than
 # imported: that module is a 3000-line CLI that shells out to git and gh, it
 # ships in the skills tree rather than on this server's PYTHONPATH, and the
-# derivation is a pure function of four fields. `test_findings_queue.py`
-# asserts byte-equality against it over a corpus so the two cannot drift.
+# derivation is a pure function of the finding's fields. One deliberate
+# extension: the queue's key carries `project` as a second segment, which the
+# audit's single-project ledger does not. Cluster names are only unique within
+# a project, so without it two clusters named `prod` in different projects
+# derive one id and the second silently overwrites the first — while keeping
+# the first's workflow state. `test_findings_queue.py` asserts segment-level
+# parity against the audit's derivation so the shared logic cannot drift.
 
 ID_EMPTY_SEGMENT = "_"
-ID_SEGMENTS = 4
+ID_SEGMENTS = 5
 MAX_FINDING_ID = 100
 ID_DIGEST_CHARS = 6
 FINDING_ID_RE = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,98}[a-z0-9])?\Z")
@@ -109,15 +114,18 @@ def _shorten_id(fid: str) -> str:
     return f"{'.'.join(parts)[:budget].rstrip('.-')}-{digest}"
 
 
-def derive_finding_id(check: str, cluster: str, namespace: str, object_name: str) -> str:
-    """`(check, cluster, namespace, object)`, the identity an audit finding gets.
+def derive_finding_id(check: str, project: str, cluster: str, namespace: str, object_name: str) -> str:
+    """`(check, project, cluster, namespace, object)`, the finding's identity.
 
     Same string for the same problem whichever source found it, which is what
-    §10's cross-source collision depends on.
+    §10's cross-source collision depends on — so every source supplies the
+    same project, and a source that cannot name one has no business writing
+    to the queue.
     """
     full = ".".join(
         (
             _id_segment(check),
+            _id_segment(project) if project.strip() else ID_EMPTY_SEGMENT,
             _id_segment(cluster),
             _id_segment(namespace) if namespace.strip() else ID_EMPTY_SEGMENT,
             _id_segment(object_name),
@@ -253,6 +261,7 @@ def ranked_sort_key(finding: dict) -> tuple:
         # rubric scores the same are not equally useful to surface — the one
         # with a manifest to change can be handed over today as a diff.
         0 if remediation.get("kind") == "manifest" else 1,
+        str(finding.get("project") or ""),
         str(finding.get("cluster") or ""),
         str(finding.get("namespace") or ""),
         str(finding.get("object") or ""),
@@ -270,6 +279,7 @@ CREATE TABLE IF NOT EXISTS findings (
     id                TEXT PRIMARY KEY,
     source            TEXT NOT NULL,
     check_slug        TEXT NOT NULL,
+    project           TEXT NOT NULL,
     cluster           TEXT NOT NULL,
     namespace         TEXT NOT NULL DEFAULT '',
     object            TEXT NOT NULL,
@@ -314,12 +324,12 @@ CREATE TABLE IF NOT EXISTS queue_publications (
 FINDINGS_INDEXES = (
     "CREATE INDEX IF NOT EXISTS findings_ranked ON findings(state, rank_score DESC)",
     "CREATE INDEX IF NOT EXISTS findings_urgent ON findings(likelihood, blast_radius, alarmed_at)",
-    "CREATE INDEX IF NOT EXISTS findings_object ON findings(cluster, namespace, object)",
+    "CREATE INDEX IF NOT EXISTS findings_object ON findings(project, cluster, namespace, object)",
     "CREATE INDEX IF NOT EXISTS findings_pr     ON findings(pr_state) WHERE pr_state IS NOT NULL",
 )
 
 _COLUMNS = (
-    "id", "source", "check_slug", "cluster", "namespace", "object", "title", "detail",
+    "id", "source", "check_slug", "project", "cluster", "namespace", "object", "title", "detail",
     "root_cause", "severity", "rank_score", "rubric", "provider_managed", "actionable",
     "recommendation", "remediation", "verification", "pr_url", "pr_state", "state",
     "first_seen", "last_verified", "last_verification", "surfaced_at", "surface_count",
@@ -405,6 +415,10 @@ def validate_finding(raw: Any) -> dict:
         raise FindingError(f"source is {_brief(source)}; must be one of {list(SOURCES)}")
 
     check = _text(raw.get("check") if raw.get("check") is not None else raw.get("check_slug"), "check")
+    # Required, not defaulted: cluster names are only unique within a project,
+    # so a finding that omits its project is one key collision away from
+    # silently overwriting another cluster's row (and keeping its state).
+    project = _text(raw.get("project"), "project")
     cluster = _text(raw.get("cluster"), "cluster")
     namespace = _text(raw.get("namespace"), "namespace", required=False)
     object_name = _text(raw.get("object"), "object")
@@ -412,12 +426,12 @@ def validate_finding(raw: Any) -> dict:
     rubric = validate_rubric(raw.get("rubric"))
     score = rank_score(rubric)
 
-    finding_id = derive_finding_id(check, cluster, namespace, object_name)
+    finding_id = derive_finding_id(check, project, cluster, namespace, object_name)
     if not FINDING_ID_RE.match(finding_id):
         # Reachable only when a field is entirely outside `[a-z0-9]`, which
         # `_id_segment` collapses to the empty-segment sentinel.
         raise FindingError(
-            f"check/cluster/namespace/object derive the unusable id {finding_id!r}; "
+            f"check/project/cluster/namespace/object derive the unusable id {finding_id!r}; "
             "each must carry at least one alphanumeric character"
         )
 
@@ -425,6 +439,7 @@ def validate_finding(raw: Any) -> dict:
         "id": finding_id,
         "source": source,
         "check_slug": check,
+        "project": project,
         "cluster": cluster,
         "namespace": namespace,
         "object": object_name,
@@ -483,8 +498,12 @@ def list_findings(
     state: str = "",
     severity: str = "",
     limit: int = 200,
+    project: str = "",
 ) -> list[dict]:
     clauses, params = [], []
+    if project:
+        clauses.append("project = ?")
+        params.append(project)
     if cluster:
         clauses.append("cluster = ?")
         params.append(cluster)
@@ -516,7 +535,7 @@ def get_finding(conn: sqlite3.Connection, finding_id: str) -> dict | None:
 # --------------------------------------------------------------------------
 
 _DESCRIPTIVE = (
-    "source", "check_slug", "cluster", "namespace", "object", "title", "detail",
+    "source", "check_slug", "project", "cluster", "namespace", "object", "title", "detail",
     "root_cause", "severity", "rank_score", "rubric", "provider_managed",
     "actionable", "recommendation", "remediation", "verification",
 )
@@ -569,7 +588,7 @@ def _register_one(conn: sqlite3.Connection, finding: dict) -> str:
     return "updated"
 
 
-def _downgrade_absent(conn: sqlite3.Connection, cluster: str, seen: set[str]) -> int:
+def _downgrade_absent(conn: sqlite3.Connection, project: str, cluster: str, seen: set[str]) -> int:
     """§5.2's reciprocal case: absence lowers confidence, it does not resolve.
 
     A sweep that died halfway produces the same silence as a fleet that got
@@ -584,9 +603,9 @@ def _downgrade_absent(conn: sqlite3.Connection, cluster: str, seen: set[str]) ->
     # row, which says nothing about whether the problem is still there. Exempting
     # it would make the rows the nudge names the only ones absence never reaches.
     rows = conn.execute(
-        "SELECT id, rubric FROM findings WHERE cluster = ? COLLATE NOCASE "
-        "AND state IN ('queued', 'surfaced')",
-        (cluster,),
+        "SELECT id, rubric FROM findings WHERE project = ? COLLATE NOCASE "
+        "AND cluster = ? COLLATE NOCASE AND state IN ('queued', 'surfaced')",
+        (project, cluster),
     ).fetchall()
     downgraded = 0
     for finding_id, raw in rows:
@@ -630,8 +649,9 @@ def register_findings(conn: sqlite3.Connection, findings: Any, scope: Any = None
 
     downgraded = 0
     if isinstance(scope, dict) and scope.get("complete"):
+        project = _text(scope.get("project"), "scope.project")
         cluster = _text(scope.get("cluster"), "scope.cluster")
-        downgraded = _downgrade_absent(conn, cluster, seen)
+        downgraded = _downgrade_absent(conn, project, cluster, seen)
 
     return {"results": results, "downgraded": downgraded}
 

@@ -954,14 +954,16 @@ def register_findings(findings: list, scope: dict | None = None) -> str:
     """
     Register findings in the durable queue, or update ones already there.
 
-    Identity is derived from (check, cluster, namespace, object), so registering
-    the same problem twice updates one row rather than creating two. A finding
-    the user dismissed stays dismissed and is reported back as 'suppressed'.
+    Identity is derived from (check, project, cluster, namespace, object), so
+    registering the same problem twice updates one row rather than creating
+    two. project is the GCP project the cluster lives in — required, because a
+    cluster name alone is ambiguous across projects. A finding the user
+    dismissed stays dismissed and is reported back as 'suppressed'.
 
     Each finding needs: source ('inventory' | 'event-watcher' | 'audit'), check
-    (the audit stream's own slug), cluster, namespace (omit for cluster-scoped),
-    object, title, rubric, recommendation {action, rationale, risk},
-    remediation {kind, path, note} and verification {kind, command,
+    (the audit stream's own slug), project, cluster, namespace (omit for
+    cluster-scoped), object, title, rubric, recommendation {action, rationale,
+    risk}, remediation {kind, path, note} and verification {kind, command,
     still_failing_when}. Optional: detail, root_cause, actionable,
     provider_managed.
 
@@ -972,9 +974,10 @@ def register_findings(findings: list, scope: dict | None = None) -> str:
 
     Args:
         findings: The findings to register.
-        scope: Pass {'cluster': '<name>', 'complete': true} only when this run
-            covered that cluster in full. It lowers the confidence of queued
-            rows the run did not re-report. Omit it for a partial or failed run.
+        scope: Pass {'project': '<id>', 'cluster': '<name>', 'complete': true}
+            only when this run covered that cluster in full. It lowers the
+            confidence of queued rows the run did not re-report. Omit it for a
+            partial or failed run.
     """
     return _findings_call("POST", "/v1/findings", {"findings": findings, "scope": scope})
 
@@ -992,18 +995,32 @@ def get_ranked_findings() -> str:
 
 
 @mcp.tool()
-def get_findings(cluster: str = "", state: str = "", severity: str = "", limit: int = 200) -> str:
+def get_findings(
+    cluster: str = "", state: str = "", severity: str = "", limit: int = 200, project: str = ""
+) -> str:
     """
-    Look up findings by cluster, state or severity — the on-demand pull.
+    Look up findings by project, cluster, state or severity — the on-demand pull.
 
     Args:
-        cluster: Restrict to one cluster.
+        cluster: Restrict to one cluster. Pair with project when two projects
+            have clusters of the same name.
         state: One of queued, surfaced, snoozed, accepted, dismissed, resolved, stale.
         severity: One of critical, major, minor.
         limit: Maximum rows to return (default 200).
+        project: Restrict to one GCP project.
     """
     query = urllib.parse.urlencode(
-        {k: v for k, v in (("cluster", cluster), ("state", state), ("severity", severity), ("limit", limit)) if v}
+        {
+            k: v
+            for k, v in (
+                ("project", project),
+                ("cluster", cluster),
+                ("state", state),
+                ("severity", severity),
+                ("limit", limit),
+            )
+            if v
+        }
     )
     return _findings_call("GET", f"/v1/findings?{query}" if query else "/v1/findings")
 

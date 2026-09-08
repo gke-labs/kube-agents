@@ -27,6 +27,7 @@ def raw_file(*lines: str) -> str:
 def item_line(**overrides) -> str:
     item = {
         "check": "probes-readiness",
+        "project": "acme",
         "cluster": "prod",
         "namespace": "payments",
         "object": "api",
@@ -73,8 +74,8 @@ class ParseBlockTests(unittest.TestCase):
             inv.parse_block(
                 raw_file(
                     "{not json",
-                    json.dumps({"check": "x", "cluster": "prod"}),
-                    json.dumps({"check": "x", "cluster": "p", "object": "o", "title": "t", "sev": "hi"}),
+                    json.dumps({"check": "x", "project": "acme", "cluster": "prod"}),
+                    json.dumps({"check": "x", "project": "acme", "cluster": "p", "object": "o", "title": "t", "sev": "hi"}),
                 )
             )
         self.assertEqual(caught.exception.code, inv.EXIT_BAD_BLOCK)
@@ -111,6 +112,15 @@ class ParseBlockTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as caught:
                 inv.main(["register", "--items", "x.json"])
         self.assertEqual(caught.exception.code, 2)
+
+    def test_a_line_without_a_project_is_a_bad_line(self):
+        # The queue keys on it; catching the omission here costs one edit,
+        # catching it at register costs the whole batch a round trip.
+        line = dict(json.loads(item_line()))
+        del line["project"]
+        with self.assertRaises(inv.Failure) as caught:
+            inv.parse_block(raw_file(json.dumps(line)))
+        self.assertIn("missing project", " ".join(caught.exception.errors))
 
     def test_a_non_string_identity_field_is_a_bad_line_not_a_stringified_one(self):
         with self.assertRaises(inv.Failure) as caught:
@@ -230,7 +240,9 @@ class RegisterTests(unittest.TestCase):
     def test_extract_then_register_sends_one_batch_per_cluster(self):
         self.assertEqual(self.extract(), 0)
         self.assertEqual(json.loads(self.items.read_text())["total"], 2)
-        code = self.register({"complete_clusters": ["prod", "dev"], "scores": {"f001": SCORE, "f002": SCORE}})
+        code = self.register(
+            {"complete_clusters": ["acme/prod", "acme/dev"], "scores": {"f001": SCORE, "f002": SCORE}}
+        )
         self.assertEqual(code, 0)
         self.assertEqual(len(self.sent), 2)
         self.assertEqual({s[2]["cluster"] for s in self.sent}, {"prod", "dev"})
@@ -238,10 +250,10 @@ class RegisterTests(unittest.TestCase):
 
     def test_scope_is_omitted_for_a_cluster_not_declared_complete(self):
         self.extract()
-        self.register({"complete_clusters": ["prod"], "scores": {"f001": SCORE, "f002": SCORE}})
+        self.register({"complete_clusters": ["acme/prod"], "scores": {"f001": SCORE, "f002": SCORE}})
         scopes = {s[1][0]["cluster"]: s[2] for s in self.sent}
         self.assertIsNone(scopes["dev"])
-        self.assertEqual(scopes["prod"], {"cluster": "prod", "complete": True})
+        self.assertEqual(scopes["prod"], {"project": "acme", "cluster": "prod", "complete": True})
 
     def test_a_malformed_scores_file_is_a_listed_error_not_a_traceback(self):
         self.extract()
@@ -292,7 +304,7 @@ class RegisterTests(unittest.TestCase):
         (self.dir / "raw.md").write_text("# Report\n\n```findings\n```\n", encoding="utf-8")
         self.assertEqual(self.extract(), 0)
         self.assertEqual(json.loads(self.items.read_text())["total"], 0)
-        self.assertEqual(self.register({"complete_clusters": ["prod"], "scores": {}}), 0)
+        self.assertEqual(self.register({"complete_clusters": ["acme/prod"], "scores": {}}), 0)
         self.assertEqual(self.sent, [])
 
     def test_a_missing_raw_file_exits_rather_than_traces(self):
@@ -330,6 +342,7 @@ class RankedTests(unittest.TestCase):
                 "rank_score": 90,
                 "severity": "major",
                 "check": "probes-readiness",
+                "project": "acme",
                 "cluster": "prod",
                 "namespace": "payments",
                 "object": "api",
@@ -340,7 +353,7 @@ class RankedTests(unittest.TestCase):
         with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as out:
             self.assertEqual(inv.main(["ranked"]), 0)
         self.assertIn("total: 1", out.getvalue())
-        self.assertIn("prod/payments/api", out.getvalue())
+        self.assertIn("acme/prod/payments/api", out.getvalue())
 
     def test_the_flags_the_report_rules_key_off_are_shown(self):
         inv.fetch_ranked = lambda endpoint: [
@@ -348,6 +361,7 @@ class RankedTests(unittest.TestCase):
                 "rank_score": 3,
                 "severity": "minor",
                 "check": "no-memory-limit",
+                "project": "acme",
                 "cluster": "prod",
                 "namespace": "kube-system",
                 "object": "kube-dns",

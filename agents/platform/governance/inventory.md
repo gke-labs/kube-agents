@@ -176,8 +176,8 @@ Structure the file in this order:
 
    ````
    ```findings
-   {"check": "probes-readiness", "cluster": "prod-eu", "namespace": "payments", "object": "checkout", "title": "checkout Deployment has no readinessProbe", "detail": "3 replicas, no readinessProbe on any container", "severity_hint": "high"}
-   {"check": "workload-identity-off", "cluster": "prod-eu", "object": "prod-eu", "title": "Workload Identity is not enabled on the cluster", "severity_hint": "high"}
+   {"check": "probes-readiness", "project": "acme-prod", "cluster": "prod-eu", "namespace": "payments", "object": "checkout", "title": "checkout Deployment has no readinessProbe", "detail": "3 replicas, no readinessProbe on any container", "severity_hint": "high"}
+   {"check": "workload-identity-off", "project": "acme-prod", "cluster": "prod-eu", "object": "prod-eu", "title": "Workload Identity is not enabled on the cluster", "severity_hint": "high"}
    ```
    ````
 
@@ -185,13 +185,15 @@ Structure the file in this order:
    needs a line here, and every line here needs to be a real finding.** The two are the same set said
    twice: the prose for a person, the block for the next stage.
 
-   - `check`, `cluster`, `object` and `title` are required. `namespace` is omitted for a
-     cluster-scoped finding; `object` is then the cluster's own name.
+   - `check`, `project`, `cluster`, `object` and `title` are required. `project` is the GCP
+     project id the cluster lives in — the queue keys on it because a cluster name alone is
+     ambiguous across projects. `namespace` is omitted for a cluster-scoped finding; `object` is
+     then the cluster's own name.
    - **One line per affected object, not per condition.** A missing `readinessProbe` on three
      Deployments is three lines. Each has its own manifest to change and gets fixed on its own
-     schedule, and `check` + `cluster` + `namespace` + `object` is the finding's identity in the
-     queue — collapsing them here loses two of the three permanently. The report gathers them back
-     into one line.
+     schedule, and `check` + `project` + `cluster` + `namespace` + `object` is the finding's
+     identity in the queue — collapsing them here loses two of the three permanently. The report
+     gathers them back into one line.
    - `check` is a lowercase hyphenated slug naming the condition, stable across sweeps. Use the
      vocabulary below where one fits.
    - Optional: `detail` (what was observed, including how you know — a command's output, an absent

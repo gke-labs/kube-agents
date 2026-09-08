@@ -75,6 +75,12 @@ class ComposeTests(unittest.TestCase):
         self.assertIn("\n   prod\n", message)
         self.assertNotIn("prod/prod", message)
 
+    def test_a_finding_with_a_project_leads_with_it(self):
+        # Two projects can each have a `prod`; the location line is where the
+        # reader disambiguates.
+        message = nudge.compose([finding(project="acme-prod")])
+        self.assertIn("acme-prod/prod/payments/api", message)
+
     def test_a_namespaced_finding_keeps_all_three_segments(self):
         message = nudge.compose([finding()])
         self.assertIn("prod/payments/api", message)
