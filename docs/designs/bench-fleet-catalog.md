@@ -247,16 +247,23 @@ default landed, so the impersonation fails, `hack/fleet-kubeconfigs.sh` warns pe
 cluster, and the safeguards read under the runner's own credential like everything else.
 gke-labs/kube-agents#903 tracks the per-project re-apply that closes it.
 
-The agent under test is not covered either way. It runs as
-`prowjob-default-sa@kube-agents-prow`, which holds
-`container.admin` and eleven other project roles in every pool project
-(`PROW_RUNNER_ROLES` in `scripts/verify_ci_pool_project.py`), with no RBAC narrowing it
-inside the clusters. For the agent, then, read-only is a rule cases obey rather than a
-property of the credential: one that decides remediation is helpful can delete a fixture
-every other pull request depends on, and the first evidence will be somebody else's case
-going red. Most drafted cases already need a GitOps-repo write path — the six audit
-scenarios and both remediation cases — contained by pinning it to a throwaway repository
-per eval project; the agent's cluster credential wants the same treatment.
+What is not narrowed is the harness. `hack/ci-eval-pr.sh` runs as
+`prowjob-default-sa@kube-agents-prow`, which holds `container.admin` and eleven other
+project roles in every pool project (`PROW_RUNNER_ROLES` in
+`scripts/verify_ci_pool_project.py`), with no RBAC narrowing it inside the clusters. That
+is the credential the reader replaces, and until the re-apply it is the one every fleet
+check reads under.
+
+The agent under test is a different identity, and it is already narrow.
+`kubeagents-platform-gsa@<project>` holds the eight read-only roles in
+`PLATFORM_GSA_ROLES` and no `container.admin`. #961 narrowed it, every pool project was
+swapped on 2026-08-26, and the verifier fails extras as well as absences because this is
+the identity being graded.
+
+What the agent keeps is reach. It sees every cluster in the leased project, and the
+single-cluster boundary is a persona rule rather than a credential one. Most drafted cases
+also need a GitOps-repo write path — the six audit scenarios and both remediation cases —
+contained by pinning it to a throwaway repository per eval project.
 
 Asserting read-only from inside a case is a state check against the fixture — "the
 planted defect survived the run" — and not `tool_called`, which sees only the delegating
