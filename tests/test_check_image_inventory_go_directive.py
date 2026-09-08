@@ -9,12 +9,17 @@ that ships rather than a copy (the approach of tests/test_ci_teardown_sweep.py).
 """
 
 import pathlib
-import re
 import subprocess
+import sys
 import tempfile
 import unittest
 
-_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+_HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE))
+
+from _lift_shell import lift_function  # noqa: E402
+
+_REPO_ROOT = _HERE.parent
 _SCRIPT = _REPO_ROOT / "hack" / "check-image-inventory.sh"
 
 # The three functions the check needs, each lifted by name. A rename fails
@@ -58,20 +63,13 @@ _CASES = (
 )
 
 
-def _lift(name: str, text: str) -> str:
-    match = re.search(rf"^{re.escape(name)}\(\) \{{\n.*?^\}}\n", text, re.S | re.M)
-    if match is None:
-        raise AssertionError(f"{_SCRIPT} no longer defines {name}()")
-    return match.group(0)
-
-
 def _dockerfile(tag: str) -> str:
     return f"ARG GOLANG_VERSION={tag}\n{_BUILDER_FROM}\n{_TOOLCHAIN_PIN}\nFROM scratch\n"
 
 
 def _run_check(go_mod: str, dockerfile: str) -> subprocess.CompletedProcess:
     text = _SCRIPT.read_text()
-    functions = "".join(_lift(name, text) for name in _LIFTED_FUNCTIONS)
+    functions = "".join(lift_function(name, text, _SCRIPT) for name in _LIFTED_FUNCTIONS)
     with tempfile.TemporaryDirectory() as tmp:
         root = pathlib.Path(tmp)
         (root / "go.mod").write_text(go_mod)
