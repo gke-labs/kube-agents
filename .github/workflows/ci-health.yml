@@ -1,35 +1,68 @@
-name: CI Health (presubmit gate adjudicator)
+name: CI Health (dashboard refresh + presubmit gate adjudicator)
 
-# Every 15 minutes: read the eval dashboard's data.json, decide whether the
-# presubmit gate is GREEN / DEGRADED / OUTAGE and why
-# (scripts/eval_dashboard/health.py), and tell #kube-agents-ci-health on
-# Google Chat -- only when the state changes, plus one digest a day
-# (scripts/eval_dashboard/post_health.py). docs/ci-health.md explains the
-# states, the rules and the advice each one carries.
+# Every 15 minutes, and on demand: refresh the live eval dashboard
+# (incremental collect -> render -> publish, the pipeline
+# hack/ci-dashboard-refresh.sh runs), read the data.json just published,
+# decide whether the presubmit gate is GREEN / DEGRADED / OUTAGE and why
+# (scripts/eval_dashboard/health.py), tell #kube-agents-ci-health on Google
+# Chat only when that changes plus one digest a day
+# (scripts/eval_dashboard/post_health.py), and publish health.json next to
+# data.json. docs/ci-health.md explains the states, the rules and the advice
+# each one carries. The data and the verdict are fresh together, with no
+# dependency on a Prow periodic.
 #
-# One identity does both halves. The bucket steps (read data.json and the
-# last-posted state, upload health.json) run as this repository's GitHub
-# Actions deploy account (github-actions@kube-agents-prow, the one
-# docker-publish-gcp.yml uses), which holds roles/storage.objectUser on
-# gs://kube-agents-dashboards. That keeps hack/ci-eval-pr.sh's boundary
-# intact: the dashboard's writers are a Prow periodic's dedicated publisher
-# and this Actions identity, never anything a presubmit can run as. The Chat
-# app ("Smoke Health", project kube-agents-prow) is bound to the same
-# account, so the Chat token is minted under it too -- `gcloud auth
-# print-access-token --scopes=chat.bot`, because the auth action's default
-# access token does not carry that scope. CI_HEALTH_CHAT_SA /
-# CI_HEALTH_CHAT_WIF_PROVIDER stay parameterised for the day the app moves
-# to its own identity; the switch-and-switch-back steps only run when they
-# differ from the bucket account. The target space (CI_HEALTH_CHAT_SPACE,
-# `spaces/AAQAlcuDUJI`, the "kube-agents-ci-health" space) is not a secret
-# and defaults here; a repository variable overrides it. An incoming-webhook
-# URL is the optional alternative, read from Secret Manager
-# (ci-health-chat-webhook in kube-agents-prow) when a version exists.
+# Two identities, each least-privilege for its half, which is why the
+# refresh script is not invoked as one unit here: it couples collect and
+# publish in a single invocation, and the two halves need different accounts.
 #
-# Nothing here fails when the destination is missing: with the space
-# variable set empty and no webhook version, post_health.py prints "webhook
-# not configured" and exits 0, the health.json upload still happens, and the
-# run stays green.
+#   A. Collect runs as github-actions@kube-agents-prow. It is the only
+#      account with a read grant on gs://kube-agents-prow (the OSS Prow
+#      project's bucket; the grant cannot be copied from here). It reads the
+#      archive and the prior data.json and writes the merged data.json to
+#      the runner's disk. It writes nothing to any bucket. A read grant for
+#      the dedicated publisher has been requested from the OSS Prow owners;
+#      once it lands, this step switches account and the job is
+#      single-identity.
+#   B. Everything else runs as eval-dashboard-publisher@kube-agents-prow --
+#      the dedicated publisher hack/ci-eval-pr.sh names for this bucket. It
+#      holds roles/storage.objectUser on gs://kube-agents-dashboards and is
+#      the identity of the Chat app "Smoke Health" (same project), so the
+#      Chat token is minted under it too: `gcloud auth print-access-token
+#      --scopes=chat.bot`, because the auth action's default access token
+#      does not carry that scope.
+#
+# Nothing a presubmit can run as ever holds a write on the bucket; the
+# guards protect that boundary: a schedule runs the default branch's
+# workflow file, and a workflow_dispatch from any other ref no-ops on the
+# `github.ref` guard -- `ref: main` on a checkout alone would not do that,
+# since a dispatch executes the workflow file of the ref it is dispatched
+# against (#1251's review). The fork guard covers the other axis.
+#
+# Budget: the bucket already holds data.json, so the normal collect is the
+# incremental path (seconds past the listing). The 1500s ceiling leaves room
+# for a cold sweep should the prior document ever be lost, under the job's
+# 30 minutes. A collect that could not list or read the archive is not
+# published: collect.py degrades a failed listing to "nothing new" with a
+# fresh generated_at, which would republish yesterday's runs as today's and
+# hide the stall from health.py's staleness check. Step A greps its own log
+# for that and skips publishing; the adjudicator then reads whatever the
+# bucket holds, flags it stale once it is old enough, the space hears about
+# the stall, and the last step fails the run so the red is visible.
+#
+# The target space (CI_HEALTH_CHAT_SPACE, `spaces/AAQAlcuDUJI`, the
+# "kube-agents-ci-health" space) is not a secret and defaults here; a
+# repository variable overrides it. The off switch is a separate variable,
+# CI_HEALTH_MUTE=true: no token is minted, the poster finds nothing to post
+# with and exits 0 ("webhook not configured"), and the refresh, the verdict
+# and the health.json upload carry on. (An empty CI_HEALTH_CHAT_SPACE could
+# not be that switch: `vars.X || 'default'` yields the default for an empty
+# string too.) An incoming-webhook URL is the optional alternative, read
+# from Secret Manager (ci-health-chat-webhook in kube-agents-prow) when a
+# version exists.
+#
+# health.json is uploaded before anything is posted: it is the --prev the
+# next tick reads, so a Chat fault must not cost the adjudicator its memory.
+# A post failure still fails the run, in the last step, so the red shows.
 
 on:
   schedule:
@@ -41,59 +74,116 @@ permissions:
   id-token: write
 
 # One tick at a time. A slow tick overlapping the next would race on the
-# last-posted state object and could post the same transition twice.
+# published data.json and the last-posted state object.
 concurrency:
   group: ci-health
   cancel-in-progress: false
 
 env:
   DASHBOARD_BUCKET: gs://kube-agents-dashboards/evals
-  BUCKET_SA: github-actions@kube-agents-prow.iam.gserviceaccount.com
-  BUCKET_WIF_PROVIDER: projects/125393897113/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
-  # The Chat app identity and target. Repository variables override the
-  # defaults; set CI_HEALTH_CHAT_SPACE to an empty string to silence the
-  # poster without touching the workflow.
-  CI_HEALTH_CHAT_SA: ${{ vars.CI_HEALTH_CHAT_SA || 'github-actions@kube-agents-prow.iam.gserviceaccount.com' }}
-  CI_HEALTH_CHAT_WIF_PROVIDER: ${{ vars.CI_HEALTH_CHAT_WIF_PROVIDER || 'projects/125393897113/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider' }}
+  WIF_PROVIDER: projects/125393897113/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
+  # Step A's identity: the Prow-archive reader (see the header).
+  COLLECT_SA: github-actions@kube-agents-prow.iam.gserviceaccount.com
+  # Step B's identity: the dedicated publisher and Chat app; a repository
+  # variable overrides it.
+  CI_HEALTH_SA: ${{ vars.CI_HEALTH_SA || 'eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com' }}
   CI_HEALTH_CHAT_SPACE: ${{ vars.CI_HEALTH_CHAT_SPACE || 'spaces/AAQAlcuDUJI' }}
+  CI_HEALTH_MUTE: ${{ vars.CI_HEALTH_MUTE || 'false' }}
+  # collect.py's inputs, the same values hack/ci-dashboard-refresh.sh uses:
+  # the smoke-test presubmit's archive, the sweep bound when no prior
+  # document exists, and the freshness-badge threshold written into
+  # data.json (this job's 15m cadence with slack for ~2 missed ticks).
+  PR_GLOB: gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*
+  SINCE_DAYS: "14"
+  STALE_AFTER_S: "2400"
+  COLLECT_TIMEOUT_S: "1500"
   WEBHOOK_SECRET: ci-health-chat-webhook
   WEBHOOK_SECRET_PROJECT: kube-agents-prow
 
 jobs:
-  adjudicate:
-    # Credentialed, schedule-triggered: never run on forks
-    # (.agents/rules/github_actions.md).
-    if: github.repository == 'gke-labs/kube-agents'
+  refresh-and-adjudicate:
+    # Credentialed and schedule-triggered: never on a fork, never from a ref
+    # other than main (.agents/rules/github_actions.md, and the guard
+    # rationale in the header).
+    if: github.repository == 'gke-labs/kube-agents' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     steps:
-      - name: Checkout main
+      - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: main
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version-file: ".python-version"
 
-      # health.py reads case-notes.yaml for the tracking issue an OUTAGE
-      # message cites; without pyyaml it warns and cites none.
+      # render.py imports yaml; health.py reads case-notes.yaml for the
+      # tracking issue an OUTAGE message cites (without pyyaml it warns and
+      # cites none).
       - name: Install pyyaml
         run: python -m pip install --disable-pip-version-check pyyaml
-
-      - name: Authenticate to Google Cloud (bucket)
-        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
-        with:
-          workload_identity_provider: ${{ env.BUCKET_WIF_PROVIDER }}
-          service_account: ${{ env.BUCKET_SA }}
 
       - name: Set up Cloud SDK
         uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
 
+      # ---- A. collect, as the Prow-archive reader; no bucket writes ----------
+      - name: Authenticate to Google Cloud (Prow-archive reader)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.COLLECT_SA }}
+
+      - name: Collect (incremental, onto the published data.json)
+        id: collect
+        continue-on-error: true
+        env:
+          # collect.py resolves runs[].pr_merged through `gh pr view`,
+          # best-effort; the workflow token is enough to read a public PR.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p work
+          # No prior document is the cold-start case: collect.py bounds the
+          # sweep to SINCE_DAYS on its own.
+          gsutil -q cp "$DASHBOARD_BUCKET/data.json" work/prior-data.json || echo "no published data.json; cold sweep bounded to $SINCE_DAYS days"
+          timeout "$COLLECT_TIMEOUT_S" python3 scripts/eval_dashboard/collect.py \
+            --pr-glob "$PR_GLOB" \
+            --merge-with work/prior-data.json \
+            --since-days "$SINCE_DAYS" \
+            --stale-after-s "$STALE_AFTER_S" \
+            --out work/data.json 2>&1 | tee work/collect.log
+          test "${PIPESTATUS[0]}" -eq 0
+          # collect.py degrades a failed listing or read to a warning and a
+          # document with nothing new; publishing that would stamp old runs
+          # with a fresh generated_at. Refuse, so the stall stays visible.
+          if grep -Eq "warning: gsutil (ls|cat) .*(failed|timed out)" work/collect.log; then
+            echo "::error::collect.py could not list or read the Prow archive; not publishing"
+            exit 1
+          fi
+          python3 -c '
+          import json, sys
+          if not json.load(open("work/data.json")).get("runs"):
+              sys.exit("collected zero runs: refusing to publish an empty dashboard over a good one")
+          '
+
+      # ---- B. everything that writes or posts, as the dedicated publisher --
+      - name: Authenticate to Google Cloud (dashboard publisher and Chat app)
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.CI_HEALTH_SA }}
+
+      - name: Render and publish the dashboard
+        if: steps.collect.outcome == 'success'
+        run: |
+          python3 scripts/eval_dashboard/render.py --data work/data.json --out-dir work/site
+          python3 scripts/eval_dashboard/publish.py --out-dir work/site --target "$DASHBOARD_BUCKET/"
+
       - name: Fetch data.json and the last-posted state
         run: |
           mkdir -p work
+          # After a successful publish this is the document just written;
+          # after a failed collect it is whatever the bucket holds, which the
+          # adjudicator ages against the clock.
           gsutil -q cp "$DASHBOARD_BUCKET/data.json" work/data.json
           # No state yet is the first tick, not an error.
           gsutil -q cp "$DASHBOARD_BUCKET/health-state.json" work/health-state.json || true
@@ -105,14 +195,18 @@ jobs:
             --data work/data.json \
             --prev work/health-prev.json \
             --out work/health.json
-          python3 -c 'import json; h = json.load(open("work/health.json")); print(h["state"], "-", h["cause"] or "no cause")'
+          python3 -c 'import json; h = json.load(open("work/health.json")); print(h["state"], "-", h["cause"] or "no cause", "- stale" if h["stale"] else "")'
+
+      - name: Upload health.json next to data.json
+        run: |
+          gsutil -q -h "Cache-Control: no-cache" cp work/health.json "$DASHBOARD_BUCKET/health.json"
 
       - name: Fetch the webhook URL (optional alternative to the Chat API)
+        if: env.CI_HEALTH_MUTE != 'true'
         run: |
-          # No version yet means the space is still being set up; the
-          # poster then reports "webhook not configured" and exits 0. Any
-          # other failure (a permission denial, most likely) is said out
-          # loud rather than read as "not configured".
+          # No version means the webhook path is unused; the Chat API is the
+          # primary path. Any other failure (a permission denial, most
+          # likely) is said out loud rather than read as "not configured".
           set +e
           url="$(gcloud secrets versions access latest --secret="$WEBHOOK_SECRET" --project="$WEBHOOK_SECRET_PROJECT" 2>gcloud.err)"
           rc=$?
@@ -121,42 +215,26 @@ jobs:
             echo "::add-mask::$url"
             echo "CI_HEALTH_CHAT_WEBHOOK=$url" >> "$GITHUB_ENV"
           elif grep -q "NOT_FOUND" gcloud.err; then
-            echo "no webhook version in $WEBHOOK_SECRET; relying on CI_HEALTH_CHAT_SPACE"
+            echo "no webhook version in $WEBHOOK_SECRET; using the Chat API"
           else
-            echo "::warning::could not read $WEBHOOK_SECRET as $BUCKET_SA (not a NOT_FOUND):"
+            echo "::warning::could not read $WEBHOOK_SECRET as $CI_HEALTH_SA (not a NOT_FOUND):"
             cat gcloud.err
           fi
           rm -f gcloud.err
 
-      # The Chat token is minted as the app's service account and handed to
-      # the poster step alone, as a masked step output rather than through
-      # GITHUB_ENV, so no later step sees it. When the app has an identity of
-      # its own, the two auth steps around the mint switch to it and back, so
-      # the poster's read and write of health-state.json still run as the
-      # account that has objectUser on the bucket.
-      - name: Authenticate to Google Cloud (Chat app, when it is a different account)
-        if: env.CI_HEALTH_CHAT_SPACE != '' && env.CI_HEALTH_CHAT_SA != env.BUCKET_SA
-        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
-        with:
-          workload_identity_provider: ${{ env.CI_HEALTH_CHAT_WIF_PROVIDER }}
-          service_account: ${{ env.CI_HEALTH_CHAT_SA }}
-
+      # The token goes to the poster step alone, as a masked step output
+      # rather than through GITHUB_ENV, so no later step sees it.
       - name: Mint a Chat token
         id: chat_token
-        if: env.CI_HEALTH_CHAT_SPACE != ''
+        if: env.CI_HEALTH_MUTE != 'true'
         run: |
           token="$(gcloud auth print-access-token --scopes=https://www.googleapis.com/auth/chat.bot)"
           echo "::add-mask::$token"
           echo "token=$token" >> "$GITHUB_OUTPUT"
 
-      - name: Authenticate to Google Cloud (bucket again, after a different Chat account)
-        if: env.CI_HEALTH_CHAT_SPACE != '' && env.CI_HEALTH_CHAT_SA != env.BUCKET_SA
-        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
-        with:
-          workload_identity_provider: ${{ env.BUCKET_WIF_PROVIDER }}
-          service_account: ${{ env.BUCKET_SA }}
-
       - name: Post on state change or digest
+        id: post
+        continue-on-error: true
         env:
           CI_HEALTH_CHAT_TOKEN: ${{ steps.chat_token.outputs.token }}
         run: |
@@ -165,6 +243,16 @@ jobs:
             --state "$DASHBOARD_BUCKET/health-state.json" \
             --digest-hour 8
 
-      - name: Upload health.json
+      - name: Fail the run if the collect or the post failed
+        if: steps.collect.outcome == 'failure' || steps.post.outcome == 'failure'
+        env:
+          COLLECT_OUTCOME: ${{ steps.collect.outcome }}
+          POST_OUTCOME: ${{ steps.post.outcome }}
         run: |
-          gsutil -q -h "Cache-Control: no-cache" cp work/health.json "$DASHBOARD_BUCKET/health.json"
+          if [ "$COLLECT_OUTCOME" = "failure" ]; then
+            echo "::error::the collect failed (see its step); nothing was published and the verdict above was taken on the previously published data.json"
+          fi
+          if [ "$POST_OUTCOME" = "failure" ]; then
+            echo "::error::the Chat post failed (see its step); health.json was still published and the message is retried next tick"
+          fi
+          exit 1

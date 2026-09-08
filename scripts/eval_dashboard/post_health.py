@@ -93,6 +93,13 @@ DIGEST_WINDOW = timedelta(minutes=20)
 OUTAGE_REPOST_INTERVAL = timedelta(hours=2)
 
 DASHBOARD_URL = "https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html"
+# Every message ends with a deep link into the dashboard, on a line of its
+# own so Chat auto-links it. The shape is a contract with the dashboard:
+# `?cases=<comma-separated case ids>&since=<ISO 8601 UTC>[&until=<ISO 8601
+# UTC>]` before the fragment, then `#gate` for an incident message and
+# `#agent` for the digest. Commas and colons stay literal.
+DASHBOARD_SECTION_GATE = "gate"
+DASHBOARD_SECTION_AGENT = "agent"
 
 # gsutil is how the state object is read and written; publish.py uses the
 # same header so a reader never gets an hour-stale copy.
@@ -231,6 +238,29 @@ def hhmm(value: datetime | None) -> str:
     return value.astimezone(UTC).strftime("%H:%M") if value else "?"
 
 
+def iso_z(value: datetime | None) -> str | None:
+    return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ") if value else None
+
+
+def dashboard_link(section: str, cases=(), since: datetime | None = None, until: datetime | None = None) -> str:
+    """The deep link (see DASHBOARD_SECTION_*): query before fragment, empty
+    parameters omitted, nothing percent-encoded -- case ids are slugs and
+    the timestamps are the `Z` form."""
+    params = []
+    if cases:
+        params.append("cases=" + ",".join(cases))
+    if since:
+        params.append(f"since={iso_z(since)}")
+    if until:
+        params.append(f"until={iso_z(until)}")
+    query = "?" + "&".join(params) if params else ""
+    return f"{DASHBOARD_URL}{query}#{section}"
+
+
+def incident_link(health: dict, until: datetime | None = None) -> str:
+    return dashboard_link(DASHBOARD_SECTION_GATE, health.get("failing_cases") or [], parse_iso(health.get("since")), until)
+
+
 def render_change(health: dict, prev: dict | None) -> str:
     was = f" (was {prev['state']})" if prev and prev.get("state") and prev["state"] != health["state"] else ""
     lines = [f"*CI health: {health['state']}*{was} — {health.get('cause') or 'no single cause'}"]
@@ -238,7 +268,7 @@ def render_change(health: dict, prev: dict | None) -> str:
         lines.append(f"• {line}")
     if health.get("advice"):
         lines.append(f"Advice: {health['advice']}")
-    lines.append(f"Dashboard: {DASHBOARD_URL}")
+    lines.append(incident_link(health))
     return "\n".join(lines)
 
 
@@ -253,7 +283,7 @@ def render_stale(health: dict) -> str:
         )
     else:
         head = f"*CI health: data is fresh again* — data.json refreshed {health.get('generated_at', '?')}; state {health.get('state', '?')}."
-    return "\n".join([head, f"Dashboard: {DASHBOARD_URL}"])
+    return "\n".join([head, incident_link(health)])
 
 
 def render_recovery(health: dict, prev: dict, now: datetime) -> str:
@@ -262,7 +292,9 @@ def render_recovery(health: dict, prev: dict, now: datetime) -> str:
     cause = f" ({prev['cause']})" if prev.get("cause") else ""
     lines = [
         f"*CI health: GREEN* — recovered{lasted} of {prev.get('state', 'trouble')}{cause}",
-        f"Dashboard: {DASHBOARD_URL}",
+        # The closed incident: the cases and start the space was told, and
+        # now as its end.
+        dashboard_link(DASHBOARD_SECTION_GATE, prev.get("failing_cases") or [], since, now),
     ]
     return "\n".join(lines)
 
@@ -302,7 +334,7 @@ def render_digest(health: dict, now: datetime) -> str:
             lines.append("Fixtures: " + ", ".join(parts))
     if health.get("advice"):
         lines.append(f"Advice: {health['advice']}")
-    lines.append(f"Dashboard: {DASHBOARD_URL}")
+    lines.append(dashboard_link(DASHBOARD_SECTION_AGENT, health.get("failing_cases") or [], since))
     return "\n".join(lines)
 
 
@@ -397,28 +429,38 @@ def run(health: dict, prev: dict | None, now: datetime, digest_hour: int, sender
             failed.append(kind)
     sent = [kind for kind in kinds if kind not in failed]
 
-    # The state file records what the space was last TOLD, not what is
-    # currently true, so the next tick asks its questions -- did the state
-    # change, did a new case join, did staleness flip -- against what the
-    # readers have. A change that failed to post therefore leaves the told
-    # state where it was and the next tick posts it again; a digest that
-    # failed beside a change that succeeded does not make the change repeat.
-    told_now = any(kind in TOLD_KINDS for kind in sent)
-    due_but_failed = any(kind in TOLD_KINDS for kind in failed)
-    told = health if told_now or (prev is None and not due_but_failed) else (prev or {})
+    # The state file records what the space was last TOLD, kind by kind,
+    # so the next tick asks its questions -- did the state change, did a new
+    # case join, did staleness flip -- against what the readers have. A sent
+    # change or recovery advances the state, condition, cause and case list;
+    # a sent stale notice advances the stale bit; a sent digest advances the
+    # digest date; nothing else moves. A kind that failed, or was not due,
+    # leaves its part where it was, so the next tick re-asks exactly that
+    # question: a change that failed beside a stale notice that succeeded is
+    # posted next tick, and a stale flip posted mid-OUTAGE does not swallow a
+    # case that joined inside OUTAGE_REPOST_INTERVAL.
+    before = prev or {}
+    told_state = KIND_CHANGE in sent or KIND_RECOVERY in sent
+    told_stale = KIND_STALE in sent
+    if prev is None:
+        # First tick: whatever was not due is recorded as told, so a green,
+        # fresh start is not announced later as a change.
+        told_state = told_state or (KIND_CHANGE not in kinds and KIND_RECOVERY not in kinds)
+        told_stale = told_stale or KIND_STALE not in kinds
+    source = health if told_state else before
     state = {
         "schema_version": STATE_SCHEMA_VERSION,
-        "state": told.get("state"),
-        "condition": told.get("condition"),
-        "cause": told.get("cause"),
-        "failing_cases": told.get("failing_cases") or [],
-        "stale": bool(told.get("stale")),
-        "since": told.get("since"),
-        "posted_at": (prev or {}).get("posted_at"),
-        "last_digest_date": (prev or {}).get("last_digest_date"),
+        "state": source.get("state"),
+        "condition": source.get("condition"),
+        "cause": source.get("cause"),
+        "failing_cases": source.get("failing_cases") or [],
+        "since": source.get("since"),
+        "stale": bool(health.get("stale")) if told_stale else bool(before.get("stale")),
+        "posted_at": before.get("posted_at"),
+        "last_digest_date": before.get("last_digest_date"),
         "updated_at": now.isoformat(timespec="seconds"),
     }
-    if told_now:
+    if KIND_CHANGE in sent or KIND_RECOVERY in sent:
         state["posted_at"] = now.isoformat(timespec="seconds")
     if KIND_DIGEST in sent:
         state["last_digest_date"] = now.date().isoformat()
@@ -455,6 +497,9 @@ def main(argv=None, environ=os.environ, opener=urllib.request.urlopen, runner=su
         # state worth recording, and the next tick starts from scratch.
         log("not recording state: every post failed on the first tick")
         return 1
+    # Always written past this point, even after a partial failure: the
+    # parts that were told are recorded and the failed kind is re-asked next
+    # tick from the same file.
     write_state(args.state, state, runner)
     sent = ", ".join(kind for kind, _ in messages if kind not in failed) or "nothing"
     log(f"{health.get('state')} via {sender.describe()}: posted {sent}")

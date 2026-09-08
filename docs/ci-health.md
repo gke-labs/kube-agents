@@ -1,11 +1,19 @@
 # CI health: the presubmit gate adjudicator
 
-`scripts/eval_dashboard/health.py` reads the eval dashboard's `data.json` every
-15 minutes (`.github/workflows/ci-health.yml`), decides whether
-`pull-kube-agents-smoke-test` is **GREEN**, **DEGRADED** or **OUTAGE** and why,
-and writes `health.json` next to the dashboard.
+Every 15 minutes `.github/workflows/ci-health.yml` refreshes the eval dashboard
+(the incremental collect → render → publish that `hack/ci-dashboard-refresh.sh`
+runs, split across two identities: `github-actions@kube-agents-prow` reads the
+Prow archive, `eval-dashboard-publisher@kube-agents-prow` writes the bucket),
+then `scripts/eval_dashboard/health.py` reads the `data.json` just published,
+decides whether `pull-kube-agents-smoke-test` is **GREEN**, **DEGRADED** or
+**OUTAGE** and why, and writes `health.json` next to it.
 `scripts/eval_dashboard/post_health.py` tells `#kube-agents-ci-health` on Google
-Chat — only when the state changes, plus one digest a day at 08:00 UTC.
+Chat — only when the state changes, plus one digest a day at 08:00 UTC. A
+`workflow_dispatch` of the same workflow is the on-demand refresh button.
+
+Every message ends with a deep link into the dashboard:
+`index.html?cases=<comma-separated case ids>&since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>]#gate`
+for an incident (`until` on the recovery message), `#agent` for the digest.
 
 The rules are the procedure the eval crew ran by hand through the week of
 2026-09-01, written down as constants in `health.py`; each one cites the
@@ -80,14 +88,14 @@ Chat app: `POST https://chat.googleapis.com/v1/{space}/messages` with a token
 bearing the `chat.bot` scope, minted in the workflow with
 `gcloud auth print-access-token --scopes=…` for the service account bound to
 the app. The app ("Smoke Health", project `kube-agents-prow`) is bound to the
-repository's GitHub Actions deploy account, `github-actions@kube-agents-prow`,
-the same identity the bucket steps run as; the space is
+dashboard publisher, `eval-dashboard-publisher@kube-agents-prow`, the identity
+the publish, adjudicate and post steps run as; the space is
 `#kube-agents-ci-health` (`spaces/AAQAlcuDUJI`). Both are defaults in the
-workflow's `env`; the repository variables `CI_HEALTH_CHAT_SPACE`,
-`CI_HEALTH_CHAT_SA` and `CI_HEALTH_CHAT_WIF_PROVIDER` override them, and an
-empty space silences the poster: the job still runs, uploads `health.json`,
-and logs "webhook not configured" without failing. An incoming-webhook URL in
-Secret Manager (`ci-health-chat-webhook`, `kube-agents-prow`) is the optional
-alternative.
+workflow's `env`; the repository variables `CI_HEALTH_CHAT_SPACE` and
+`CI_HEALTH_SA` override them. The off switch is the repository variable
+`CI_HEALTH_MUTE=true`: no token is minted, the poster logs "webhook not
+configured" and exits 0, and the refresh, the verdict and the `health.json`
+upload carry on. An incoming-webhook URL in Secret Manager
+(`ci-health-chat-webhook`, `kube-agents-prow`) is the optional alternative.
 
 `post_health.py --dry-run` prints the messages instead of posting them.

@@ -203,6 +203,46 @@ class TransitionPosting(RunHarness):
         self.assertEqual(len(self.opener.requests), 1, "only the digest is retried")
         self.assertTrue(self.opener.bodies[0]["text"].startswith("*CI health daily digest"))
 
+    def test_a_change_that_fails_beside_a_stale_notice_that_succeeds_is_posted_next_tick(self):
+        # The dashboard refresh resumes after a stall and the fresh data
+        # shows a break: decide emits change + stale in one tick. If the
+        # change's POST fails, the state file must not record the OUTAGE as
+        # told on the strength of the stale notice.
+        self.tick(health(), T0)
+        outage = health("OUTAGE", "break: a", ["a"], since="2026-09-04T12:15:00+00:00")
+        outage["stale"] = True
+        outage["metrics"]["data_age_s"] = 7200
+        partial = FakeOpener(statuses=[500, 200])
+        rc, err = self.tick(outage, T0.replace(minute=15), opener=partial)
+        self.assertEqual(rc, 1)
+        self.assertIn("failed to post: change", err)
+        recorded = json.loads(self.state.read_text())
+        self.assertEqual((recorded["state"], recorded["failing_cases"], recorded["stale"]), ("GREEN", [], True))
+        rc, _ = self.tick(outage, T0.replace(minute=30))
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.opener.requests), 1, "the change alone is retried")
+        self.assertTrue(self.opener.bodies[0]["text"].startswith("*CI health: OUTAGE* (was GREEN)"))
+        # The mirror: change succeeds, stale fails -> stale retried alone.
+        fresh = health("OUTAGE", "break: a", ["a"], since="2026-09-04T12:15:00+00:00")
+        partial = FakeOpener(statuses=[500])
+        self.tick(fresh, T0.replace(minute=45), opener=partial)  # stale flips back to False; the post fails
+        self.assertTrue(json.loads(self.state.read_text())["stale"], "still told as stale")
+        self.tick(fresh, T0.replace(hour=13))
+        self.assertTrue(self.opener.bodies[-1]["text"].startswith("*CI health: data is fresh again*"))
+
+    def test_a_stale_notice_mid_outage_does_not_swallow_a_case_that_joined_inside_the_interval(self):
+        one = health("OUTAGE", "break: a", ["a"], since="2026-09-04T12:00:00+00:00")
+        two = health("OUTAGE", "break: a, b", ["a", "b"], since="2026-09-04T12:00:00+00:00")
+        two["stale"] = True
+        two["metrics"]["data_age_s"] = 7200
+        self.tick(one, T0)
+        self.tick(two, T0.replace(minute=30))
+        self.assertEqual(len(self.opener.requests), 2, "the stale notice went out; b is inside the interval")
+        self.assertEqual(json.loads(self.state.read_text())["failing_cases"], ["a"], "b is not recorded as told")
+        self.tick(two, T0.replace(hour=14, minute=15))
+        self.assertEqual(len(self.opener.requests), 3)
+        self.assertIn("break: a, b", self.opener.bodies[-1]["text"])
+
     def test_a_failed_post_leaves_the_state_untouched_so_the_next_tick_retries(self):
         self.tick(health(), T0)
         failing = FakeOpener(statuses=[500])
@@ -242,6 +282,41 @@ class Digest(RunHarness):
         self.assertEqual(len(kinds), 2, "the first tick posts the state and the digest")
         self.assertTrue(any(line.startswith("*CI health daily digest (2026-09-04)* — OUTAGE since 03:30 UTC: shared fixture") for line in kinds))
         self.assertIn("Advice: Don't retest yet", self.opener.bodies[1]["text"])
+
+
+class DeepLinks(RunHarness):
+    """Every message ends with the dashboard deep link the dashboard
+    understands: query before fragment, literal commas and colons, #gate for
+    an incident, #agent for the digest."""
+
+    def last_line(self, index=-1):
+        return self.opener.bodies[index]["text"].split("\n")[-1]
+
+    def test_a_state_change_links_the_cases_and_the_start(self):
+        self.tick(health("OUTAGE", "break", ["cluster-agent-crashloop-debug", "cluster-agent-crashloop-evidence-chain"], since="2026-09-08T03:08:00+00:00"), T0)
+        self.assertEqual(
+            self.last_line(),
+            "https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html?cases=cluster-agent-crashloop-debug,cluster-agent-crashloop-evidence-chain&since=2026-09-08T03:08:00Z#gate",
+        )
+
+    def test_a_storm_links_the_start_without_cases(self):
+        self.tick(health("DEGRADED", "quota storm window 18:23–19:58 UTC", since="2026-09-04T18:30:00+00:00"), T0)
+        self.assertEqual(self.last_line(), f"{post_health.DASHBOARD_URL}?since=2026-09-04T18:30:00Z#gate")
+
+    def test_a_recovery_closes_the_incident_with_until(self):
+        self.tick(health("OUTAGE", "break", ["x-probe"], since="2026-09-04T03:08:00+00:00"), T0)
+        self.tick(health(since="2026-09-04T14:00:00+00:00"), T0.replace(hour=14))
+        self.assertEqual(self.last_line(), f"{post_health.DASHBOARD_URL}?cases=x-probe&since=2026-09-04T03:08:00Z&until=2026-09-04T14:00:00Z#gate")
+
+    def test_the_digest_links_the_agent_section(self):
+        self.tick(health(since="2026-09-04T03:30:00+00:00"), T0.replace(hour=8, minute=5))
+        self.assertEqual(self.last_line(), f"{post_health.DASHBOARD_URL}?since=2026-09-04T03:30:00Z#agent")
+
+    def test_the_link_is_the_whole_last_line(self):
+        self.tick(health("DEGRADED", "x", since="2026-09-04T18:30:00+00:00"), T0)
+        text = self.opener.bodies[0]["text"]
+        self.assertTrue(text.split("\n")[-1].startswith("https://"))
+        self.assertNotIn("Dashboard:", text)
 
 
 class Secrecy(RunHarness):

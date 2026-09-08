@@ -225,9 +225,11 @@ source "${SCRIPT_DIR}/ci-env.sh"
 #      overwrites the same object paths, so any workable role carries
 #      storage.objects.delete; the boundary is the identity, not the role:
 #      no account a presubmit can run as ever holds a write on this bucket.
-#      (The one other writer, .github/workflows/ci-health.yml's health.json
-#      and health-state.json, runs as the repository's GitHub Actions
-#      identity -- also not one a presubmit can run as.)
+#      (.github/workflows/ci-health.yml publishes the same dashboard, plus
+#      health.json and health-state.json, as this same publisher identity
+#      reached through GitHub Actions' Workload Identity -- so "bound to
+#      that periodic alone" now reads "to that periodic and that workflow",
+#      still nothing a presubmit can run as.)
 #      The same identity also needs READ on the sweep's source --
 #      roles/storage.objectViewer on gs://kube-agents-prow -- unless that
 #      bucket's existing public read already covers it; without it the first
