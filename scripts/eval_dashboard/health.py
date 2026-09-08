@@ -725,10 +725,11 @@ def assess(runs, now: datetime, roster: Roster) -> dict:
         "current": current,
         "full_runs": full_runs,
         "last_setup_death": max((run.finished for run in visible if run.setup_death), default=None),
+        "roster": roster,
     }
 
 
-def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime | None) -> bool:
+def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime | None, roster: Roster) -> bool:
     """Rule 6's exit: the last RECOVERY_GREEN_RUNS full runs are green, on
     distinct pull requests, all finished after the incident began, and none
     carries the signature of the condition being left -- a collapse of one
@@ -745,9 +746,13 @@ def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime
     if len(_prs(recent)) < RECOVERY_GREEN_RUNS:
         return False
     condition = prev.get("condition")
+    # The cases the incident named, but only while they are still admitted:
+    # demoting the broken case is the documented fix for a rung-4 shared
+    # break (hack/ci-eval-pr.sh), and once it is a hold-out its collapses
+    # red nobody, so they cannot hold the gate in OUTAGE either.
     cases = set(prev.get("failing_cases") or [])
     carries = {
-        SHARED_BREAK: lambda run: bool(run.collapsed_cases() & cases),
+        SHARED_BREAK: lambda run: bool(run.collapsed_cases() & cases & roster.at(run.started or run.finished)),
         STORM: lambda run: run.storm_reps >= STORM_RUN_SIGNATURE_REPS,
         SETUP_DEATHS: lambda run: last_setup_death is not None and run.finished <= last_setup_death,
     }.get(condition, lambda run: False)
@@ -789,7 +794,7 @@ def transition(prev: dict | None, assessed: dict, now: datetime) -> dict:
     if raw_state != GREEN:
         return _keep(raw_state, assessed["condition"], assessed["cause"], assessed["failing_cases"], now, recovering=False)
     prev_condition = prev.get("condition")
-    if recovered(assessed["full_runs"], prev, since, assessed["last_setup_death"]):
+    if recovered(assessed["full_runs"], prev, since, assessed["last_setup_death"], assessed["roster"]):
         return _keep(GREEN, None, "", [], now, recovering=False)
     return _keep(prev_state, prev_condition, prev.get("cause") or "", prev.get("failing_cases") or [], since, recovering=True)
 

@@ -38,16 +38,22 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # since a dispatch executes the workflow file of the ref it is dispatched
 # against (#1251's review). The fork guard covers the other axis.
 #
-# Budget: the bucket already holds data.json, so the normal collect is the
-# incremental path (seconds past the listing). The 1500s ceiling leaves room
-# for a cold sweep should the prior document ever be lost, under the job's
-# 30 minutes. A collect that could not list or read the archive is not
-# published: collect.py degrades a failed listing to "nothing new" with a
-# fresh generated_at, which would republish yesterday's runs as today's and
-# hide the stall from health.py's staleness check. Step A greps its own log
-# for that and skips publishing; the adjudicator then reads whatever the
-# bucket holds, flags it stale once it is old enough, the space hears about
-# the stall, and the last step fails the run so the red is visible.
+# Budget: this job runs the INCREMENTAL path only -- the bucket holds
+# data.json, and collect.py's watermark makes a tick cost the archive
+# listing plus the new builds (seconds to a few minutes). A cold sweep does
+# not fit here and is not attempted: hack/ci-dashboard-refresh.sh prices it
+# at 30-45 minutes, past the 30-minute job, and retrying it every 15 minutes
+# would burn a red run per tick without ever publishing. So a tick that finds
+# no published data.json fails fast and says how to seed the bucket once, by
+# hand. The 1500s ceiling is for the incremental path's own worst case (a
+# slow listing, a burst of new builds), not for a sweep. A collect that could
+# not list or read the archive is not published: collect.py degrades a failed
+# listing to "nothing new" with a fresh generated_at, which would republish
+# yesterday's runs as today's and hide the stall from health.py's staleness
+# check. Step A greps its own log for that and skips publishing; the
+# adjudicator then reads whatever the bucket holds, flags it stale once it is
+# old enough, the space hears about the stall, and the last step fails the
+# run so the red is visible.
 #
 # The target space (CI_HEALTH_CHAT_SPACE, `spaces/AAQAlcuDUJI`, the
 # "kube-agents-ci-health" space) is not a secret and defaults here; a
@@ -90,8 +96,9 @@ env:
   CI_HEALTH_CHAT_SPACE: ${{ vars.CI_HEALTH_CHAT_SPACE || 'spaces/AAQAlcuDUJI' }}
   CI_HEALTH_MUTE: ${{ vars.CI_HEALTH_MUTE || 'false' }}
   # collect.py's inputs, the same values hack/ci-dashboard-refresh.sh uses:
-  # the smoke-test presubmit's archive, the sweep bound when no prior
-  # document exists, and the freshness-badge threshold written into
+  # the smoke-test presubmit's archive, the bound collect.py applies to a
+  # prior it finds unusable (a corrupt download; a missing one stops the step
+  # before collect.py runs), and the freshness-badge threshold written into
   # data.json (this job's 15m cadence with slack for ~2 missed ticks).
   PR_GLOB: gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*
   SINCE_DAYS: "14"
@@ -142,9 +149,13 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p work
-          # No prior document is the cold-start case: collect.py bounds the
-          # sweep to SINCE_DAYS on its own.
-          gsutil -q cp "$DASHBOARD_BUCKET/data.json" work/prior-data.json || echo "no published data.json; cold sweep bounded to $SINCE_DAYS days"
+          # No prior document means a cold sweep, which this job does not
+          # attempt (header). Seed once by hand and the next tick is
+          # incremental.
+          if ! gsutil -q cp "$DASHBOARD_BUCKET/data.json" work/prior-data.json; then
+            echo "::error::no published data.json at $DASHBOARD_BUCKET/data.json; this job runs the incremental path only. Seed the bucket once with: EVAL_DASHBOARD_TARGET=$DASHBOARD_BUCKET/ JOB_TYPE=periodic EVAL_DASHBOARD_TIMEOUT=3600 ./hack/ci-dashboard-refresh.sh (from a machine whose account can read gs://kube-agents-prow and write the bucket)"
+            exit 1
+          fi
           timeout "$COLLECT_TIMEOUT_S" python3 scripts/eval_dashboard/collect.py \
             --pr-glob "$PR_GLOB" \
             --merge-with work/prior-data.json \

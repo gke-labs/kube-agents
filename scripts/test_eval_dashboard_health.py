@@ -387,6 +387,27 @@ class Hysteresis(unittest.TestCase):
         doc["runs"] += [run(300 + i, 30 + i, later - timedelta(minutes=10 * i), result="SUCCESS", tasks=tasks) for i in range(3)]
         self.assertEqual(adjudicate(doc, later, prev)["state"], "OUTAGE")
 
+    def test_demoting_the_broken_case_lets_the_gate_recover(self):
+        # The documented fix for a rung-4 shared break is to demote the case
+        # (hack/ci-eval-pr.sh). Once it is a hold-out its collapses red
+        # nobody, so three greens that still carry it are a recovery.
+        doc = self.outage_doc()
+        prev = adjudicate(doc, T0)
+        self.assertEqual(prev["failing_cases"], ["agent-kanban-smoke"])
+        later = T0 + timedelta(hours=7)
+        demoted = later - timedelta(hours=1)
+        roster = health.Roster.from_history(
+            [
+                {"since": (T0 - timedelta(days=1)).isoformat(), "admitted": sorted(ADMITTED)},
+                {"since": demoted.isoformat(), "admitted": sorted(ADMITTED - {"agent-kanban-smoke"})},
+            ]
+        )
+        still_failing = broken_tasks({"agent-kanban-smoke"})
+        doc["runs"] += [run(300 + i, 30 + i, later - timedelta(minutes=10 * i), minutes=30, result="SUCCESS", tasks=still_failing) for i in range(3)]
+        self.assertEqual(adjudicate(doc, later, prev)["state"], "OUTAGE", "with the case still admitted the greens carry the break")
+        result = adjudicate(doc, later, prev, roster)
+        self.assertEqual(result["state"], "GREEN", "with the case demoted before those runs started, they recover it")
+
     def test_leaving_outage_for_a_live_storm_is_immediate(self):
         doc = self.outage_doc()
         prev = adjudicate(doc, T0 - timedelta(hours=2))
