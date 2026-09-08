@@ -226,6 +226,7 @@ PLATFORM_GSA_ROLES = {
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",
     "roles/mcp.toolUser",
+    "roles/serviceusage.serviceUsageConsumer",
 }
 
 

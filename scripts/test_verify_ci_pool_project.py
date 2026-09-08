@@ -2261,7 +2261,7 @@ class IamGrantsTest(unittest.TestCase):
 class PlatformGsaRolesMatchTerraformTest(unittest.TestCase):
     """PLATFORM_GSA_ROLES must equal the roles the install actually grants.
 
-    Hardcoding the eight roles is what lets this check run without a Terraform
+    Hardcoding the nine roles is what lets this check run without a Terraform
     toolchain, and it is also how the two drift apart. Without this test,
     narrowing the granted set would leave every correctly-provisioned project
     failing verification weeks later, with nothing pointing at Terraform as the
