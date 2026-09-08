@@ -273,10 +273,19 @@ resource "google_container_node_pool" "seeded_a_default" {
   node_count = 1
 
   node_config {
-    # e2-medium rather than e2-small: cluster A hosts the defect workloads
-    # (checkout-gateway, payments-api) alongside system pods, and e2-small's
-    # ~1.5 GiB allocatable cannot fit them all.
-    machine_type    = "e2-medium"
+    # e2-standard-2, not e2-medium (2026-09-08, #1278): cluster A hosts the
+    # defect workloads (checkout-gateway, payments-api) alongside GKE's
+    # system pods, and the constraint is CPU *requests*, not memory.
+    # e2-medium's 940m allocatable is fully claimed by system pods alone
+    # (kube-proxy, kube-dns, metadata-server, fluentbit, konnectivity,
+    # ...), so the fixtures only ever ran because they were scheduled before
+    # the system set filled in. The weekend auto-upgrade recreated the node,
+    # system-critical pods scheduled first, and every fixture went Pending
+    # on all 30 pool projects. e2-standard-2 (~1930m allocatable) holds the
+    # system set (~1.3 vCPU incl. the second kube-dns) plus fixtures with
+    # ~550m headroom. Changing machine_type replaces the pool; the fixtures
+    # reschedule onto the new node on their own.
+    machine_type    = "e2-standard-2"
     disk_size_gb    = 20
     resource_labels = local.fleet_labels
     service_account = google_service_account.fleet_nodes.email
