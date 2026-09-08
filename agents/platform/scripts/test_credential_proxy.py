@@ -1547,6 +1547,37 @@ class UntrustedWorkspaceTest(unittest.TestCase):
             )
         )
 
+    def test_a_clustered_free_text_flag_exempts_the_message_after_it(self):
+        # `git commit -am <message>` and `gh pr create -dt <title>` hide the
+        # free-text flag behind a boolean, so a flat scan sees `-am`, finds
+        # nothing in `_FREE_TEXT_FLAGS`, and tests the message as a path. The
+        # detached and attached spellings of the same message were allowed,
+        # which made the refusal depend on how the filing turn happened to
+        # write the command. `policy_match_text` already decodes the cluster;
+        # this check now reads it the same way.
+        executor = self.executor()
+        cwd = executor.workspace_dir / "src"
+        cwd.mkdir(parents=True)
+        message = "fix: path traversal via " + "../" * 8 + "etc/passwd in the loader"
+        for argv in (
+            ["git", "commit", "-m", message],
+            ["git", "commit", "-a", "-m", message],
+            ["git", "commit", "-am", message],
+            ["gh", "pr", "create", "-dt", message],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(executor.argv_path_violation(argv, str(cwd)))
+        # The exemption is still the existence test, not a blanket pass: a
+        # cluster cannot smuggle a file that is there.
+        outside = Path(self.temp_dir.name) / "sidecar-state"
+        outside.mkdir(parents=True)
+        (outside / "token").write_text("DECOY-NOT-A-REAL-TOKEN\n")
+        self.assertIsNotNone(
+            executor.argv_path_violation(
+                ["git", "commit", "-am", str(outside / "token")], str(cwd)
+            )
+        )
+
     def test_a_glued_flag_value_is_split_before_it_is_resolved(self):
         # `--body-file=..` is a single literal component, so resolving the whole
         # token both absorbs one `..` and adds a directory level: the check

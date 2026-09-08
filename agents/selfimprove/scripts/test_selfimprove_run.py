@@ -23,6 +23,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 
@@ -1322,6 +1323,51 @@ class _Response:
 
     def __exit__(self, *_exc):
         return False
+
+
+class FetchSourceTests(unittest.TestCase):
+    """What `fetch_source` reports when the tarball arrives but carries nothing.
+
+    A 200 whose body is a well-formed empty gzip -- a repository mid-migration,
+    a proxy serving a truncated cached response -- is the case that reads as
+    success and is not one. The empty top-level name joined to `dest` is `dest`,
+    which is a directory, so the function returned a path and the brief told the
+    agent the checkout was there. It then found an empty tree, reported nothing,
+    and the ledger recorded the row the runner itself calls the worst one:
+    `outcome=ok findings=0`, indistinguishable from a healthy install.
+    """
+
+    def _serve(self, payload):
+        """Stand in for codeload, returning `payload` as the response body."""
+
+        class _Body(_Response):
+            def read(self_inner):
+                return payload
+
+        original = R.urllib.request.urlopen
+        R.urllib.request.urlopen = lambda url, timeout=None: _Body(200)
+        self.addCleanup(lambda: setattr(R.urllib.request, "urlopen", original))
+
+    def _targz(self, names):
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            for name in names:
+                info = tarfile.TarInfo(name)
+                info.type = tarfile.DIRTYPE
+                tar.addfile(info)
+        return buf.getvalue()
+
+    def test_an_empty_archive_is_a_failed_fetch_not_an_empty_checkout(self):
+        self._serve(self._targz([]))
+        with tempfile.TemporaryDirectory() as dest:
+            self.assertIsNone(R.fetch_source("o/r", "main", dest, 30, ""))
+
+    def test_a_populated_archive_still_resolves_to_its_top_level_directory(self):
+        self._serve(self._targz(["r-main", "r-main/README.md"]))
+        with tempfile.TemporaryDirectory() as dest:
+            root = R.fetch_source("o/r", "main", dest, 30, "")
+            self.assertEqual(root, os.path.join(dest, "r-main"))
+            self.assertTrue(os.path.isdir(root))
 
 
 class ForgeCredentialTests(unittest.TestCase):

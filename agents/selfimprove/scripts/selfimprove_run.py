@@ -964,6 +964,16 @@ def fetch_source(
             # The archive is one top-level directory, <repo>-<ref>.
             members = tar.getmembers()
             top = members[0].name.split("/")[0] if members else ""
+            if not top:
+                # An empty archive -- a well-formed gzip with no members, which
+                # a proxy serving a truncated cached response returns under a
+                # 200 -- used to leave `top` empty, so `os.path.join(dest, "")`
+                # was `dest`, `isdir` passed, and the brief told the agent the
+                # repository was checked out at a directory with nothing in it.
+                # The run then reported no findings and the ledger recorded
+                # `outcome=ok findings=0`, which reads as evidence the install
+                # is healthy. Raising puts it on the honest path below.
+                raise RuntimeError("the archive names no top-level directory")
             _safe_extract(tar, dest)
     except Exception as exc:  # noqa: BLE001 - see the comment above
         log("could not fetch %s: %s: %s" % (url, type(exc).__name__, exc))

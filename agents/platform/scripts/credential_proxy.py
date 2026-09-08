@@ -2655,9 +2655,16 @@ class CommandExecutor:
         via` that is not there, so the stat fails on it and the sentence is
         allowed -- even though resolving the same string lands on
         `/etc/passwd`. A value that resolves outside the workspace *and*
-        exists is refused whatever flag introduced it. Attached shorthand
-        (`-mfix: ...`) is read the way `policy_match_text` reads it, so a
-        message written without the separating space is prose here too.
+        exists is refused whatever flag introduced it. Shorthand is read the
+        way `policy_match_text` reads it, in both spellings that hide a
+        free-text flag from a flat scan: attached (`-mfix: ...`), where the
+        prose is the rest of the token, and clustered (`git commit -am`,
+        `gh pr create -dt`), where `_cluster_readings` finds the `-m` or `-t`
+        after the first letter and the prose is the next argv element. Without
+        the cluster reading the flag token passes and the message behind it is
+        tested as a path, so `git commit -am 'fix: ../../../etc/passwd
+        traversal'` was refused while the identical detached spelling was
+        allowed -- the outcome the paragraph above says this must not have.
 
         What existence does not close is the gap between checking and running,
         and nothing here ever did: a token naming nothing yet is allowed, the
@@ -2687,6 +2694,15 @@ class CommandExecutor:
                     and token[:2] in _FREE_TEXT_FLAGS
                 ):
                     value, prose = token[2:], True
+                elif (
+                    len(token) > 2
+                    and token.startswith("-")
+                    and not token.startswith("--")
+                    and _cluster_readings(token)[1]
+                ):
+                    following = argv[index + 1] if index + 1 < len(argv) else ""
+                    prose_next = not following.startswith("-")
+                    continue
                 elif token.startswith("-") and separator:
                     value = attached
             try:
