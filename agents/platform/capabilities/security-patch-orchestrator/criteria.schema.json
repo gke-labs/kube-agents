@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Upgrade & Patch Readiness Audit criteria",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "pool_skew_critical_minors": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10,
+      "default": 3,
+      "description": "Check 3.2: a node pool this many minors or more behind its control plane is critical. GKE's documented skew ceiling is two, so the shipped default flags the first version past it."
+    },
+    "fleet_spread_min_minors": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 10,
+      "default": 2,
+      "description": "Check 3.3: emit the fleet-spread finding when the newest and oldest control-plane minors differ by at least this many."
+    },
+    "blocking_exclusion_min_days": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 365,
+      "default": 30,
+      "description": "Check 3.8: an upgrade-blocking maintenance exclusion that ends further out than this many days is flagged even on a cluster with no outstanding version finding."
+    },
+    "deprecated_image_types": {
+      "type": "array",
+      "items": { "type": "string", "maxLength": 64 },
+      "maxItems": 32,
+      "default": ["COS", "UBUNTU", "WINDOWS_SAC"],
+      "description": "Check 3.9: node image types flagged as deprecated regardless of whether the location still offers them. Compared case-insensitively."
+    },
+    "excluded_clusters": {
+      "type": "array",
+      "items": { "type": "string", "maxLength": 128 },
+      "maxItems": 256,
+      "default": [],
+      "description": "Cluster names this audit leaves out of scope entirely. Each is recorded in scope.skipped with the reason 'excluded by criteria' so the ledger says the omission was chosen."
+    }
+  }
+}
