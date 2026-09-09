@@ -949,8 +949,10 @@ fi
 # volume — hermes_otel's live.db and the rest — is not in the source tree and
 # survives. Targeted plugin volumes are linked in afterwards by step 2.65.
 #
-# cron/jobs.json is the one entry that is merged rather than replaced, inside
-# profile_scaffold.py. It is image-owned and runtime state in the same file: the
+# cron/jobs.json and capabilities/*/criteria.json are the entries that are
+# merged rather than replaced, inside profile_scaffold.py — in opposite
+# directions: the image wins the roster's keys, the volume wins the criteria's
+# (VOLUME_WINS_GLOBS there says why). It is image-owned and runtime state in the same file: the
 # schedules, prompts and `enabled` flags ship in the image, but the scheduler
 # writes each job's run history back into it and the operator can add jobs of
 # its own. Copying it wholesale erased both on every pod restart, losing the
@@ -1023,9 +1025,10 @@ platform_is_front_door() {
 # the running agent writes to it — `/sethome` persists the home channel there and the
 # monitoring policy mints monitoring.install_id — so a force-sync discards both on
 # every restart. It comes off the list and step 2.6b back-fills the file instead, the
-# way step 2d does for the default profile. Nothing else on the list is written at
-# runtime, so nothing else moves either way; the one entry is derived rather than a
-# second list so the two answers cannot drift apart.
+# way step 2d does for the default profile. The only other runtime-written entry is
+# capabilities/, and the scaffolder merges that one rather than replacing it; the
+# config.yaml entry is derived rather than a second list so the two answers cannot
+# drift apart.
 platform_sync_items() {
     _items="SOUL.md AGENTS.md CAPABILITIES.md cron skills governance hindsight capabilities"
     platform_is_front_door || _items="config.yaml $_items"

@@ -30,7 +30,7 @@ platform/
 ├── skills/                  # SKILL.md bundles
 ├── governance/              # SOPs the scheduled governance jobs point at
 ├── capabilities/            # per-capability criteria defaults the agent tunes at runtime
-├── cron/jobs.json           # empty — the schedules live on the Planning Agent
+├── cron/jobs.json           # the governance watchdog roster (fired by the Planning Agent's profile-cron-tick)
 ├── plugins/                 # in-tree Hermes plugins (incident_context, memory)
 ├── docs/                    # workspace docs (glossary, console-link templates)
 └── scripts/                 # in-pod Python MCP servers + kanban helpers

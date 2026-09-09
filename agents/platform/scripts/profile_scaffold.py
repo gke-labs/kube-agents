@@ -25,16 +25,18 @@ from pathlib import Path
 # configuration, and so must be merged rather than replaced. Relative to the
 # profile home, POSIX-separated; each one needs a merge rule below.
 MERGE_PATHS: tuple[str, ...] = ("cron/jobs.json",)
-# The files a capability's criteria live in (see capability_store.py). The
-# agent edits these at runtime, so across a pod start the rule is the inverse
-# of MERGE_PATHS: the volume wins every key it holds and the image adds only
-# the keys the volume is silent about. Globs relative to the profile home,
+# The file a capability's criteria live in (see capability_store.py). The
+# agent edits it at runtime, so across a pod start the rule is the inverse of
+# MERGE_PATHS: the volume wins every key it holds and the image adds only the
+# keys the volume is silent about. A glob relative to the profile home,
 # resolved against the volume, because the capability names are not fixed.
-VOLUME_WINS_GLOBS: tuple[str, ...] = (
-    "capabilities/*/criteria.json",
-    "capabilities/*/learning.json",
-)
+# The schema and learning.json beside it are image-owned and simply replaced:
+# a policy the volume could keep is a policy a release could never tighten.
+VOLUME_WINS_GLOBS: tuple[str, ...] = ("capabilities/*/criteria.json",)
 DEFAULT_LEGACY_CRON_RISK: str = "low"
+# Atomic rewrites go through a sibling scratch file and os.replace; a torn
+# jobs.json is a profile with no cron roster, and this runs during start-up
+# on a volume that may be mid-restart.
 SCRATCH_SUFFIX: str = ".tmp"
 
 
@@ -160,6 +162,13 @@ def read_json(path: Path) -> object | None:
         return None
 
 
+def write_json_atomic(path: Path, payload: object, *, sort_keys: bool = False) -> None:
+    """Write `payload` as JSON to `path` via a scratch sibling and os.replace."""
+    scratch = path.with_name(path.name + SCRATCH_SUFFIX)
+    scratch.write_text(json.dumps(payload, indent=2, sort_keys=sort_keys) + "\n", encoding="utf-8")
+    os.replace(scratch, path)
+
+
 def merge_cron_store(
     image: object, live: object, only_ids: tuple[str, ...] | None = None
 ) -> object:
@@ -283,9 +292,7 @@ def backfill_cron_file(path: Path) -> bool:
     if backfilled == data:
         return False
     try:
-        scratch = path.with_name(path.name + ".tmp")
-        scratch.write_text(json.dumps(backfilled, indent=2) + "\n", encoding="utf-8")
-        os.replace(scratch, path)
+        write_json_atomic(path, backfilled)
         return True
     except OSError as exc:
         log(f"WARN: could not backfill cron store {path}: {exc}")
@@ -360,12 +367,7 @@ def _merge_after_overlay(
         )
         destination = home.joinpath(*parts)
         try:
-            # Temp file and os.replace, not a plain write: a torn jobs.json is
-            # a profile with no cron roster at all, and this runs during
-            # start-up on a volume that may be mid-restart.
-            scratch = destination.with_name(destination.name + ".tmp")
-            scratch.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
-            os.replace(scratch, destination)
+            write_json_atomic(destination, merged)
         except OSError as exc:
             # The image's copy is already in place, so the profile still runs;
             # what is lost is the run history. Say so rather than fail the
@@ -417,9 +419,7 @@ def _restore_volume_wins(
         destination = home.joinpath(*parts)
         merged = merge_volume_wins(read_json(source), previous)
         try:
-            scratch = destination.with_name(destination.name + SCRATCH_SUFFIX)
-            scratch.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-            os.replace(scratch, destination)
+            write_json_atomic(destination, merged, sort_keys=True)
         except OSError as exc:
             # The image's defaults are in place, so the capability still runs;
             # what is lost is the operator's tuning, which is worth a line.

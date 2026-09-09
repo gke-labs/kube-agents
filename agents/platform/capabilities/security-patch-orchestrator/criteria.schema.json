@@ -6,14 +6,14 @@
   "properties": {
     "pool_skew_critical_minors": {
       "type": "integer",
-      "minimum": 1,
+      "minimum": 3,
       "maximum": 10,
       "default": 3,
-      "description": "Check 3.2: a node pool this many minors or more behind its control plane is critical. GKE's documented skew ceiling is two, so the shipped default flags the first version past it."
+      "description": "Check 3.2: a node pool this many minors or more behind its control plane is critical; from two minors up to it is major. GKE's documented skew ceiling is two, which is why the minimum is three: below that the critical rung would overlap the fixed two-minor and one-minor rungs."
     },
     "fleet_spread_min_minors": {
       "type": "integer",
-      "minimum": 1,
+      "minimum": 2,
       "maximum": 10,
       "default": 2,
       "description": "Check 3.3: emit the fleet-spread finding when the newest and oldest control-plane minors differ by at least this many."

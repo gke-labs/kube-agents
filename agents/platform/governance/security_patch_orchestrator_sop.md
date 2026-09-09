@@ -25,6 +25,8 @@ Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/
 
 ### 1. Enumerate the target fleet
 
+**Tunable criteria first.** Before enumerating anything, call `capability_criteria(action="get", capability="security-patch-orchestrator")` once and keep the result. Several checks in §3 read a value from it — named beside the check as `criteria.<key>`, with the shipped default in parentheses — and the operator may have changed any of them since this SOP was written, so the tool's value wins over the number on the page. Record the revision the tool returned in the run's summary. If the tool errors, say so in the summary and use the defaults printed here.
+
 1. Resolve the project scope: `gcloud config get-value project`. If `gcloud projects list --format="value(projectId)"` succeeds, include every additional project where `gcloud container clusters list` returns at least one cluster.
 2. Snapshot each project once — `clusters list` returns the **full** Cluster resources, node pools included, so one call is the whole inventory:
    ```bash
@@ -61,6 +63,7 @@ Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/
    - `status` is `PROVISIONING`, `STOPPING`, or `ERROR` — the object is mid-flight or broken; version data is meaningless.
    - `enableKubernetesAlpha: true` — alpha clusters cannot be upgraded and auto-expire by design.
    - A project that errors on list (permission, API disabled). Record it as `{"cluster": "<project>/*", "reason": "…"}`.
+   - Named in `criteria.excluded_clusters` (default empty). Record it with the reason `excluded by criteria` and run nothing against it; the ledger then says the omission was chosen, not missed.
 6. Record every cluster you **could** read but could not fully check in `scope.clusters`, with the gap in its `limitations`. Autopilot (`autopilot.enabled: true`) is the standard case and is **never** skipped: Google manages those node pools, so run 3.1, 3.3, 3.4, 3.7, 3.8, 3.10 there and declare the four node-pool checks inapplicable rather than missing —
 
    ```json
@@ -104,8 +107,6 @@ Use `channels[]` (each entry: `channel`, `defaultVersion`, `validVersions[]`, an
 
 **Version comparison rule (use this everywhere, no exceptions).** Parse `MAJOR.MINOR.PATCH-gke.BUILD` into the integer 4-tuple `(MAJOR, MINOR, PATCH, BUILD)`; a version with no `-gke.N` suffix gets `BUILD = 0` (`1.30.5-gke.1355000` → `(1,30,5,1355000)`). Compare tuples element-wise as integers. **Never string-compare GKE versions** — lexically `"1.30.9" > "1.30.10"`, which is wrong — and never compare `-gke.BUILD` across different patch levels. `minor(v) = (MAJOR, MINOR)`; "N minors behind" is the difference in the second element when the first elements match, and any difference in the first element is unbounded skew.
 
-**Tunable criteria.** Before the first check, call `capability_criteria(action="get", capability="security-patch-orchestrator")` once and keep the result. Four checks below read a value from it — named beside the check as `criteria.<key>`, with the shipped default in parentheses — and the operator may have changed any of them since this SOP was written, so the tool's value wins over the number on the page. `criteria.excluded_clusters` (default empty) names clusters this audit leaves out: put each in `scope.skipped` with the reason `excluded by criteria` and run nothing against it. Record the revision the tool returned in the run's summary. If the tool errors, say so in the summary and use the defaults printed here.
-
 **Universal suppression gates.** Before emitting _any_ version-drift finding (3.1, 3.2, 3.3), drop it if the cluster `status` is `RECONCILING` or the node pool `status` is `RECONCILING`/`PROVISIONING` — that is an upgrade in progress, and reporting it is noise. Policy checks (3.4–3.10) read stable configuration and still run against a `RECONCILING` cluster.
 
 **Confirm before you emit.** The `clusters list` snapshot finds candidates; it does not justify them. For every finding, re-run a targeted, copy-pasteable command that isolates the offending field, and record _that literal command_ in `evidence.command` with its output in `evidence.excerpt`, trimmed to the 40 lines / 2000 characters the helper keeps and centred on the value that triggered the flag. **A finding you cannot reproduce is dropped, not softened.** Prefer gcloud's own `--format` projections over shell post-processing; do not assume `jq` is installed.
@@ -132,9 +133,9 @@ The project is deliberately not part of the identity. Two clusters sharing a nam
 #### 3.2 Node-pool version skew against the control plane (`pool-skew`)
 
 - **Command:** `gcloud container node-pools describe <pool> --cluster=<cluster> --location=<loc> --project=<p> --format="value(version,status)"`
-- **Flag when:** compare each `nodePools[].version` against `currentMasterVersion`. Major versions differ or the pool is **≥ `criteria.pool_skew_critical_minors` (3) minors** behind; the pool is exactly **2 minors** behind; the pool is exactly **1 minor** behind; the pool is on the same minor but an older `(PATCH, BUILD)`. Separately, flag a pool whose version is **ahead of** the control plane — GKE never produces that state, so it signals a broken or hand-edited pool.
+- **Flag when:** compare each `nodePools[].version` against `currentMasterVersion`. Major versions differ or the pool is **at or beyond `criteria.pool_skew_critical_minors` (3) minors** behind; the pool is **2 or more minors behind but below that threshold**; the pool is exactly **1 minor** behind; the pool is on the same minor but an older `(PATCH, BUILD)`. Separately, flag a pool whose version is **ahead of** the control plane — GKE never produces that state, so it signals a broken or hand-edited pool.
 - **Do NOT flag:** Autopilot clusters (Google owns those pools; step 1 records that in `checks_not_applicable`, never in `limitations`, and the cluster is still in `scope.clusters`); a pool `RECONCILING`/`PROVISIONING`, or a cluster `RECONCILING`; a pool one patch behind the control plane while the cluster is mid-rollout. GKE upgrades the control plane first and drains pools afterwards, so transient one-patch lag is normal operation.
-- **Severity:** ≥ `criteria.pool_skew_critical_minors` minors or major mismatch → **critical** (outside GKE's documented skew policy: nodes may be no more than two minor versions behind the control plane). Exactly 2 minors → **major** (at the ceiling — the next control-plane minor upgrade is blocked until the pool moves). Exactly 1 minor → **major** if `management.autoUpgrade` is `false`, else **minor**. Patch-only drift → **minor**. Pool ahead of control plane → **major**.
+- **Severity:** at or beyond `criteria.pool_skew_critical_minors` minors, or a major mismatch → **critical** (outside GKE's documented skew policy: nodes may be no more than two minor versions behind the control plane). From 2 minors up to but below that threshold → **major** (at the ceiling — the next control-plane minor upgrade is blocked until the pool moves). The threshold cannot be set below 3, so no pool matches two of these rungs. Exactly 1 minor → **major** if `management.autoUpgrade` is `false`, else **minor**. Patch-only drift → **minor**. Pool ahead of control plane → **major**.
 - **Impact:** "Node pool `<pool>` runs `<v>`, `<n>` minor versions behind control plane `<m>` — at or beyond GKE's two-minor skew ceiling, which blocks the cluster's next control-plane upgrade."
 - **Remediation:** `kind: gcloud` — `gcloud container clusters upgrade <cluster> --location=<loc> --project=<p> --node-pool=<pool> --cluster-version=<currentMasterVersion>`.
 
@@ -142,7 +143,7 @@ The project is deliberately not part of the identity. Two clusters sharing a nam
 
 - **Command:** `gcloud container clusters list --project=<p> --format="table(name,location,currentMasterVersion,releaseChannel.channel)"`
 - **Flag when:** the set of distinct `minor(currentMasterVersion)` across all audited clusters spans **≥ `criteria.fleet_spread_min_minors` (2) minors** (newest minor minus oldest minor at or above that value). Emit exactly **one** finding, attached to the single most out-of-date cluster, with `object: "Cluster/<laggard>"`; name the full spread in the title and impact.
-- **Do NOT flag:** a one-minor spread (normal for a fleet split across RAPID/REGULAR/STABLE); spread caused only by clusters already skipped in step 1; a second finding per laggard cluster — one fleet finding, always.
+- **Do NOT flag:** a spread narrower than `criteria.fleet_spread_min_minors` (a one-minor spread is normal for a fleet split across RAPID/REGULAR/STABLE); spread caused only by clusters already skipped in step 1; a second finding per laggard cluster — one fleet finding, always.
 - **Severity:** **minor** — this is a fleet-consistency signal, and each individual laggard is already reported by 3.1.
 - **Impact:** "The fleet spans `<oldest>`–`<newest>`, `<n>` minor versions wide; API-compatibility testing and rollout playbooks must cover every one of them."
 - **Remediation:** `kind: manual` — note which clusters sit on the oldest minor and that consolidating them onto one channel narrows the spread.

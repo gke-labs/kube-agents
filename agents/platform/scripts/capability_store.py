@@ -6,41 +6,54 @@ replaced on every pod start. The thresholds, exclusions and scopes that
 procedure reads are not: they live here, under
 ``$HERMES_HOME/capabilities/<name>/``, seeded from the image template and merged
 across starts by ``profile_scaffold.py`` so a value the operator tuned survives
-a restart and an upgrade. See docs/designs/capability-delivery-vehicle.md.
+a restart and an upgrade.
 
-Three files per capability:
+Each capability directory holds:
 
   criteria.json         the tunable values; the only file the agent edits
   criteria.schema.json  image-owned; what keys exist, their types and defaults
-  learning.json         per-key policy for edits the agent makes on its own
-
-plus ``changelog.jsonl``, one line per accepted change, which nothing rewrites.
+  learning.json         image-owned; per-key policy for what the agent may
+                        change with and without an operator's confirmation
+  changelog.jsonl       one line per accepted change; nothing rewrites it
 
 Every write goes through ``apply_changes`` so the policy is enforced in code
-rather than in a prompt: a key marked ``never`` cannot be changed here at all,
-a key marked ``propose`` needs an operator's confirmation on the call, and a key
-marked ``autonomous`` needs only a reason. The validator is a deliberately small
-subset of JSON Schema (type, enum, minimum, maximum, items.type,
-additionalProperties) so this module stays on the standard library like the
-scaffolder that seeds it.
+rather than in a prompt. What the code can enforce: a key marked ``never``
+cannot be changed here at all, and a key marked ``propose`` is refused unless
+the call names who confirmed it. What it cannot: that the named person actually
+saw the before/after — that round-trip is the agent's instruction
+(agents/platform/AGENTS.md), and the changelog records the name so a reader can
+ask. The validator is a deliberately small subset of JSON Schema (type, enum,
+minimum, maximum, items.type, additionalProperties) so this module stays on the
+standard library like the scaffolder that seeds it.
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from profile_scaffold import write_json_atomic  # noqa: E402
 
 CAPABILITIES_DIR_ENV = "KUBE_AGENTS_CAPABILITIES_DIR"
+HERMES_HOME_ENV = "HERMES_HOME"
+DEFAULT_HERMES_HOME = "/opt/data"
 CAPABILITIES_DIRNAME = "capabilities"
 CRITERIA_FILENAME = "criteria.json"
 SCHEMA_FILENAME = "criteria.schema.json"
 LEARNING_FILENAME = "learning.json"
 CHANGELOG_FILENAME = "changelog.jsonl"
+# Held for the whole read -> validate -> write of one change. A cron child and
+# a kanban worker each run their own platform_control process against the same
+# volume, so without it two simultaneous sets would lose one update.
+LOCK_FILENAME = ".lock"
 
 # Keys the store maintains itself. The validator ignores them and the policy
 # never applies to them; the merge treats them as volume state.
@@ -59,13 +72,17 @@ DEFAULT_POLICY = POLICY_PROPOSE
 MODE_CONFIRMED = "confirmed"
 MODE_AUTONOMOUS = POLICY_AUTONOMOUS
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
-SCRATCH_SUFFIX = ".tmp"
 
 # Bounds on what one call may carry, so a runaway model cannot fill the volume
 # through this path.
 MAX_CHANGES_PER_CALL = 32
 MAX_REASON_CHARS = 2000
 MAX_HISTORY_ENTRIES = 50
+
+# What the operator CLI at the bottom of this file accepts. Read-only on
+# purpose: writes go through the MCP tool so every one carries a policy check
+# and a changelog line.
+CLI_ACTIONS = ("list", "get", "history")
 
 # JSON Schema type names this validator understands, mapped to Python.
 SCHEMA_TYPES: dict[str, tuple[type, ...]] = {
@@ -101,11 +118,19 @@ class Capability:
         default = self.learning.get("default")
         return default if isinstance(default, str) else DEFAULT_POLICY
 
-    def defaults(self) -> dict[str, Any]:
+    def properties(self) -> dict[str, Any]:
         props = self.schema.get("properties")
-        if not isinstance(props, dict):
-            return {}
-        return {k: v["default"] for k, v in props.items() if isinstance(v, dict) and "default" in v}
+        return props if isinstance(props, dict) else {}
+
+    def defaults(self) -> dict[str, Any]:
+        return {
+            k: v["default"]
+            for k, v in self.properties().items()
+            if isinstance(v, dict) and "default" in v
+        }
+
+    def is_closed(self) -> bool:
+        return self.schema.get("additionalProperties") is False
 
 
 def capabilities_root(hermes_home: Path | str | None = None) -> Path:
@@ -118,7 +143,7 @@ def capabilities_root(hermes_home: Path | str | None = None) -> Path:
     override = os.environ.get(CAPABILITIES_DIR_ENV)
     if override:
         return Path(override)
-    home = Path(hermes_home) if hermes_home else Path(os.environ.get("HERMES_HOME", "/opt/data"))
+    home = Path(hermes_home) if hermes_home else Path(os.environ.get(HERMES_HOME_ENV, DEFAULT_HERMES_HOME))
     return home / CAPABILITIES_DIRNAME
 
 
@@ -131,10 +156,14 @@ def _read_json(path: Path) -> Any:
         raise CapabilityError(f"{path.name} is unreadable or not JSON: {exc}") from exc
 
 
-def _write_json_atomic(path: Path, payload: Any) -> None:
-    scratch = path.with_name(path.name + SCRATCH_SUFFIX)
-    scratch.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    os.replace(scratch, path)
+@contextmanager
+def _locked(directory: Path) -> Iterator[None]:
+    with (directory / LOCK_FILENAME).open("a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
 
 
 def list_capabilities(root: Path) -> list[str]:
@@ -223,17 +252,30 @@ def _validate_value(spec: dict[str, Any], value: Any) -> list[str]:
     return errors
 
 
+def stale_keys(cap: Capability) -> list[str]:
+    """Stored keys the image-owned schema no longer defines.
+
+    The volume-wins merge keeps a key across an upgrade that dropped it, so the
+    schema is what says it is gone. `set` prunes them rather than refusing every
+    later write over a key nobody can name any more.
+    """
+    if not cap.is_closed():
+        return []
+    props = cap.properties()
+    return sorted(k for k in cap.criteria if k not in props and k not in STATE_KEYS)
+
+
 def effective_criteria(cap: Capability) -> dict[str, Any]:
-    """Schema defaults with the stored values over them, state keys excluded."""
+    """Schema defaults with the stored values over them; state and stale keys excluded."""
     out = dict(cap.defaults())
-    out.update({k: v for k, v in cap.criteria.items() if k not in STATE_KEYS})
+    stale = set(stale_keys(cap))
+    out.update({k: v for k, v in cap.criteria.items() if k not in STATE_KEYS and k not in stale})
     return out
 
 
 def describe(cap: Capability) -> dict[str, Any]:
     """What `get` returns: values, revision, and per-key policy and description."""
-    props = cap.schema.get("properties")
-    props = props if isinstance(props, dict) else {}
+    props = cap.properties()
     values = effective_criteria(cap)
     keys = {}
     for key in sorted(set(values) | set(props)):
@@ -251,6 +293,7 @@ def describe(cap: Capability) -> dict[str, Any]:
         "criteria": values,
         "keys": keys,
         "policy_default": cap.learning.get("default", DEFAULT_POLICY),
+        "stale_keys": stale_keys(cap),
     }
 
 
@@ -269,7 +312,7 @@ def apply_changes(
     a message the caller can relay verbatim when anything is refused; nothing is
     written in that case.
     """
-    cap = load(root, name)
+    name = _validate_name(name)
     if not isinstance(changes, dict) or not changes:
         raise CapabilityError("changes must be a non-empty object of key -> new value")
     if len(changes) > MAX_CHANGES_PER_CALL:
@@ -281,10 +324,23 @@ def apply_changes(
         raise CapabilityError(f"reason must be at most {MAX_REASON_CHARS} characters")
     confirmed_by = (confirmed_by or "").strip()
 
+    directory = root / name
+    if not directory.is_dir():
+        # Same message load() gives, before we try to create a lock file in a
+        # directory that does not exist.
+        load(root, name)
+    with _locked(directory):
+        cap = load(root, name)
+        return _apply_locked(cap, changes, reason, confirmed_by, actor)
+
+
+def _apply_locked(
+    cap: Capability, changes: dict[str, Any], reason: str, confirmed_by: str, actor: str
+) -> dict[str, Any]:
+    props = cap.properties()
     # Unknown keys first, so a typo is reported as a typo rather than as a
     # policy refusal on a key that does not exist.
-    props = cap.schema.get("properties")
-    if cap.schema.get("additionalProperties") is False and isinstance(props, dict):
+    if cap.is_closed():
         unknown = [k for k in changes if k not in props and k not in STATE_KEYS]
         if unknown:
             raise CapabilityError(
@@ -311,7 +367,8 @@ def apply_changes(
         raise CapabilityError("refused: " + "; ".join(refused))
 
     before = effective_criteria(cap)
-    candidate = {k: v for k, v in cap.criteria.items() if k not in STATE_KEYS}
+    pruned = stale_keys(cap)
+    candidate = {k: v for k, v in cap.criteria.items() if k not in STATE_KEYS and k not in pruned}
     candidate.update(changes)
     errors = validate(cap.schema, candidate)
     if errors:
@@ -333,10 +390,10 @@ def apply_changes(
         "confirmed_by": confirmed_by,
         "reason": reason,
         "changes": {k: {"before": before.get(k), "after": v} for k, v in changes.items()},
+        "pruned": {k: cap.criteria[k] for k in pruned},
     }
-    directory = cap.directory
-    _write_json_atomic(directory / CRITERIA_FILENAME, stored)
-    with (directory / CHANGELOG_FILENAME).open("a", encoding="utf-8") as fh:
+    write_json_atomic(cap.directory / CRITERIA_FILENAME, stored, sort_keys=True)
+    with (cap.directory / CHANGELOG_FILENAME).open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(entry, sort_keys=True) + "\n")
     return entry
 
@@ -359,10 +416,10 @@ def history(root: Path, name: str, limit: int = MAX_HISTORY_ENTRIES) -> list[dic
 
 
 def main(argv: list[str]) -> int:
-    """Tiny CLI for an operator on the gateway: list, get, history."""
+    """Tiny read-only CLI for an operator on the gateway."""
     root = capabilities_root()
-    if len(argv) < 2 or argv[1] not in ("list", "get", "history"):
-        print("usage: capability_store.py list | get <name> | history <name>", file=sys.stderr)
+    if len(argv) < 2 or argv[1] not in CLI_ACTIONS:
+        print(f"usage: capability_store.py {' | '.join(CLI_ACTIONS)} [<name>]", file=sys.stderr)
         return 2
     try:
         if argv[1] == "list":
