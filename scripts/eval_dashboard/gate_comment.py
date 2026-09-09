@@ -25,9 +25,7 @@ truncated log, and says so.
 Which words: classify.py's `classify_run` -- the same rules the dashboard's
 run.html and the incident brief use -- decides per case whether it is
 `shared` (the gate's), `only-this-pr` (yours), `storm` or unexplained; this
-module only phrases it. When classify.py is not on the checkout, the
-fallback here applies the same shape with health.json's failing cases and
-the other pull requests' runs in the window.
+module only phrases it.
 
 One comment per pull request, found by a hidden marker and edited in place
 on later runs; a build already commented on is never commented on twice.
@@ -43,21 +41,15 @@ from __future__ import annotations
 
 import argparse
 import pathlib
-import re
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 
 try:
-    from eval_dashboard import ghcli, health, post_health
+    from eval_dashboard import classify, ghcli, health, post_health
 except ImportError:  # run as a script: scripts/eval_dashboard/gate_comment.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-    from eval_dashboard import ghcli, health, post_health
-
-try:
-    from eval_dashboard.classify import classify_run as CLASSIFY_RUN
-except ImportError:
-    CLASSIFY_RUN = None
+    from eval_dashboard import classify, ghcli, health, post_health
 
 STATE_SCHEMA_VERSION = 1
 # The hidden first line every comment starts with; how the next tick finds
@@ -74,24 +66,17 @@ STATE_RETENTION = timedelta(days=14)
 # before that run's finish.
 RETRY_BACKOFF = timedelta(seconds=1)
 
-# classify.py's vocabulary (its module constants; restated so this module
-# reads the same words whether or not classify.py is on the checkout).
-CLS_SHARED = "shared"
-CLS_ONLY_THIS_PR = "only-this-pr"
-CLS_STORM = "storm"
-OUTCOME_PASSED = "passed"
-OUTCOME_PARTIAL = "partial"
-OUTCOME_FAILED = "failed"
-OUTCOME_INFRA = "infra"
-# The fallback classifier's windows, the same as classify.py's.
-SHARED_WINDOW_BEFORE = timedelta(hours=6)
-SHARED_MIN_OTHER_PRS = 2
-ONLY_PR_WINDOW = timedelta(hours=24)
-STORM_RUN_SIGNATURE_REPS = 5
+# classify.py's vocabulary, by name so a rename there is a NameError here.
+CLS_SHARED = classify.CLS_SHARED
+CLS_ONLY_THIS_PR = classify.CLS_ONLY_THIS_PR
+CLS_STORM = classify.CLS_STORM
+OUTCOME_PASSED = classify.OUTCOME_PASSED
+OUTCOME_PARTIAL = classify.OUTCOME_PARTIAL
+OUTCOME_FAILED = classify.OUTCOME_FAILED
+# "passed on the last N runs from other PRs" counts inside classify.py's
+# only-this-PR window.
+ONLY_PR_WINDOW = classify.ONLY_PR_WINDOW
 EXCERPT_CHARS = 160
-# The grader prefixes every reason with its score; the reader wants the
-# check name and what was missing (classify.py's REASON_SCORE_PREFIX_RE).
-REASON_SCORE_PREFIX_RE = re.compile(r"^VerificationCorrectness=\S+ \(floor [^)]*\) -- ")
 
 # Links. The run page and the brief are the dashboard's (post_health owns
 # the brief's contract); the build log is Prow's Deck for this job.
@@ -140,95 +125,6 @@ def log(message: str) -> None:
 
 def plural(count: int, one: str, many: str | None = None) -> str:
     return one if count == 1 else (many or one + "s")
-
-
-# --------------------------------------------------------------------------- #
-# Fallback classifier (classify.py's contract, the minimum of its rules)
-# --------------------------------------------------------------------------- #
-
-
-def _counts(task: dict) -> dict:
-    parsed = health.Task(task)
-    return {"pass": parsed.passes, "fail": parsed.fails, "infra": parsed.storms}
-
-
-def _outcome(counts: dict) -> str | None:
-    if counts["pass"] and counts["fail"]:
-        return OUTCOME_PARTIAL
-    if counts["fail"]:
-        return OUTCOME_FAILED
-    if counts["pass"]:
-        return OUTCOME_PASSED
-    if counts["infra"]:
-        return OUTCOME_INFRA
-    return None
-
-
-def _first_reason(task: dict) -> str:
-    """The first graded failure's reason, without the grader's score prefix
-    (classify.py's clean_reason)."""
-    for rep in task.get("reps") or []:
-        if health.rep_kind(rep) == health.REP_FAIL and rep.get("reason"):
-            return REASON_SCORE_PREFIX_RE.sub("", str(rep["reason"])).strip()
-    return ""
-
-
-def fallback_classify(run: dict, runs: list[dict], health_at: dict | None = None, now: datetime | None = None, admitted=None) -> dict:
-    """classify.py's `classify_run` shape from the data alone: a case is
-    `shared` when health.json names it or it collapsed on other PRs in the
-    window, `storm` when the run lost STORM_RUN_SIGNATURE_REPS repetitions,
-    `only-this-pr` when it passed on another PR's run in the last day and
-    collapsed on no other, else unexplained (None)."""
-    named = set((health_at or {}).get("failing_cases") or []) if (health_at or {}).get("state") not in (None, health.GREEN) else set()
-    condition = (health_at or {}).get("condition")
-    me = health.Run(run)
-    others = [health.Run(other) for other in runs if other.get("build_id") != run.get("build_id") and other.get("pr") != run.get("pr")]
-    others = [other for other in others if other.finished and other.full]
-    start = me.started or me.finished
-    finish = me.finished or now or datetime.now(UTC)
-    in_shared = [o for o in others if start and start - SHARED_WINDOW_BEFORE <= o.finished <= finish]
-    in_day = [o for o in others if finish - ONLY_PR_WINDOW <= o.finished <= finish]
-    run_storm = me.storm_reps >= STORM_RUN_SIGNATURE_REPS
-    cases = []
-    for task in run.get("tasks") or []:
-        name = str(task.get("name"))
-        counts = _counts(task)
-        outcome = _outcome(counts)
-        if outcome is None:
-            continue
-        cls = None
-        also = 0
-        if outcome == OUTCOME_FAILED:
-            also = len({o.pr for o in in_shared if name in o.collapsed_cases()})
-            if name in named or also >= SHARED_MIN_OTHER_PRS:
-                cls = CLS_SHARED
-            elif run_storm or condition == health.STORM:
-                cls = CLS_STORM
-            elif also == 0 and any(name in o.passing_cases() for o in in_day):
-                cls = CLS_ONLY_THIS_PR
-        elif outcome == OUTCOME_INFRA and (run_storm or condition == health.STORM):
-            cls = CLS_STORM
-        cases.append(
-            {
-                "case": name,
-                "outcome": outcome,
-                "cls": cls,
-                "also_failing_prs": also,
-                "pass_rate_30d": None,
-                "reason": _first_reason(task) if outcome in (OUTCOME_FAILED, OUTCOME_PARTIAL) else "",
-                "excerpt": None,
-                "do": "",
-                "admitted": admitted is None or name in admitted,
-                "reps": counts,
-            }
-        )
-    failed = {c["case"] for c in cases if c["outcome"] == OUTCOME_FAILED and c["admitted"]}
-    matches = bool(failed & named) if condition == health.SHARED_BREAK else (run_storm if condition == health.STORM else False)
-    return {"build": me.build_id, "pr": me.pr, "headline": "", "verdict": "red" if failed else "infra", "cases": cases, "matches_incident": matches}
-
-
-CLASSIFIER = CLASSIFY_RUN or fallback_classify
-CLASSIFIER_NAME = "classify.py" if CLASSIFY_RUN else "fallback"
 
 
 # --------------------------------------------------------------------------- #
@@ -466,9 +362,8 @@ def post(gh: ghcli.Gh, pr: int, body: str, known_id: int | None) -> int | None:
 # --------------------------------------------------------------------------- #
 
 
-def tick(data: dict, health_doc: dict, state: dict | None, now: datetime, roster: health.Roster, gh: ghcli.Gh, classifier=None) -> tuple[dict, list[tuple[int, str, str]]]:
+def tick(data: dict, health_doc: dict, state: dict | None, now: datetime, roster: health.Roster, gh: ghcli.Gh) -> tuple[dict, list[tuple[int, str, str]]]:
     """Returns (new state, [(pr, build_id, body)] rendered this tick)."""
-    classifier = classifier or CLASSIFIER
     before = state or {}
     since = post_health.parse_iso(before.get("last_comment_tick")) or (now - FIRST_TICK_LOOKBACK)
     comments = dict(before.get("comments") or {})
@@ -481,10 +376,7 @@ def tick(data: dict, health_doc: dict, state: dict | None, now: datetime, roster
         if comments.get(key, {}).get("build_id") == run.build_id:
             continue  # never twice for the same build
         admitted = roster.at(run.started or run.finished)
-        try:
-            verdict = classifier(raw, runs, health_doc, now, admitted=admitted)
-        except TypeError:
-            verdict = classifier(raw, runs, health_doc, now)
+        verdict = classify.classify_run(raw, runs, health_doc, now, admitted=admitted)
         red = Red(raw, verdict, admitted)
         body = render_comment(red, health_doc, runs)
         rendered.append((run.pr, run.build_id, body))
@@ -533,7 +425,7 @@ def main(argv=None, runner=subprocess.run, gh_runner=None) -> int:
     new_state, rendered = tick(data, health_doc, state, now, roster, gh)
     for pr, build_id, body in rendered:
         if args.dry_run:
-            log(f"--dry-run: would comment on #{pr} (build {build_id}, classifier: {CLASSIFIER_NAME})\n{body}")
+            log(f"--dry-run: would comment on #{pr} (build {build_id})\n{body}")
     post_health.write_state(args.state, new_state, runner)
     log(f"gate comments: {len(rendered)} red {plural(len(rendered), 'run')} since {state.get('last_comment_tick') if state else 'the first tick'}")
     return 0

@@ -109,9 +109,6 @@ when there are several):
 Which class a case gets — `shared`, `only-this-pr`, `storm`, unexplained — is
 `scripts/eval_dashboard/classify.py`'s `classify_run`, the same rules the
 dashboard's run page and the incident brief use; the comment only phrases it.
-When that module is not on the checkout the script's built-in fallback applies
-the same shape from `health.json`'s failing cases and the other pull requests'
-runs in the window.
 
 The comment starts with a hidden marker (`<!-- smoke-gate-comment -->`); a
 later red on the same pull request edits it in place, and a build already

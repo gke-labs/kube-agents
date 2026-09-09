@@ -5,9 +5,7 @@ run; an edit rather than a second comment; and a post failure that is a
 warning and a retry, never a failed job.
 
 GitHub is a recording fake `gh` runner; the state file is a temp path. The
-classifier is whichever gate_comment resolved at import -- classify.py when
-it is on the checkout, its fallback otherwise -- and `CLASSIFIER_NAME` says
-which ran.
+per-case classes come from the real classify.py.
 """
 
 import contextlib
@@ -296,8 +294,11 @@ class WhenItComments(Harness):
         self.assertIn("### ❌ Smoke gate: failed · 3 of 7 cases", err)
         self.assertIn("--dry-run: would POST repos/gke-labs/kube-agents/issues/1300/comments", err)
 
-    def test_the_classifier_in_use_is_named(self):
-        self.assertIn(gate_comment.CLASSIFIER_NAME, ("classify.py", "fallback"))
+    def test_the_class_vocabulary_is_classify_pys(self):
+        from eval_dashboard import classify
+
+        self.assertEqual((gate_comment.CLS_SHARED, gate_comment.CLS_ONLY_THIS_PR, gate_comment.CLS_STORM), (classify.CLS_SHARED, classify.CLS_ONLY_THIS_PR, classify.CLS_STORM))
+        self.assertEqual(gate_comment.ONLY_PR_WINDOW, classify.ONLY_PR_WINDOW)
 
 
 if __name__ == "__main__":
