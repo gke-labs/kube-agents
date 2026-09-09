@@ -94,8 +94,8 @@ finding, because a grep that returns one case for a role has to mean one case us
 `owner` is who answers for the case when it flakes: a GitHub login written without the at
 sign, or the literal `maintainers` for a case the repository's `OWNERS` approvers own. It is
 the field the demotion mechanic in `docs/eval-gate-roster.md` addresses its issue to, and
-`bench/CONTRIBUTING.md` is where the commitment is spelled out. Bare, because a `task.yaml`
-is quoted into issues and comments, where a leading at sign is a page rather than a name.
+`bench/CONTRIBUTING.md` is where the commitment, and the reason the login is bare, are
+spelled out.
 
 `verification_spec` is the exact half of the grade, and the rest of this document is
 mostly about it.
@@ -297,18 +297,14 @@ also applies the entry vocabulary above — role, the severity pairing, the reje
 mode, a positive weight — which devops-bench enforces too, at spec-load time, after the
 lease.
 
-It also scans what the case brings with it. Every text file under `bench/tasks/` and
-`bench/tf/prebuilt/` — the case directory and the stack `bench/CUSTOM-TASKS.md` puts beside
-it — is read line by line, and a line fails that carries an IPv4 literal outside the RFC 5737
-documentation ranges (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`) or a
-credential-shaped string matching one of `AuditRedactor`'s token patterns, imported from
-`agents/chat/defaults/plugins/common/redactor.py` rather than copied. Dot-prefixed paths,
-`*.tfstate*` and `*.tfvars` are skipped. The escape is per line: `sanitizer: allow` followed
-by a reason, on the line that carries the value; a marker with no reason is itself a
-finding. `bench/CONTRIBUTING.md` carries the rule and what review covers that the scan
-cannot. The scan is tree-level rather than per case, like the fixture-catalogue drift check,
-so `validate_all()` does not carry it; the lint asserts on `sanitization_findings()` in its
-own right.
+It also scans what the case brings with it: every text file under `bench/tasks/` and
+`bench/tf/prebuilt/`, for an IPv4 literal outside the RFC 5737 documentation ranges or a
+string matching the token-shaped subset of `AuditRedactor`'s patterns, with
+`sanitizer: allow <reason>` as the per-line escape. `bench/CONTRIBUTING.md` is the home of
+that rule — the ranges, the shapes, the skip list, the marker, and what review covers that
+the scan cannot. The scan is tree-level rather than per case, like the fixture-catalogue
+drift check, so `validate_all()` does not carry it; the lint asserts on
+`sanitization_findings()` in its own right.
 
 `scripts/test_task_registration.py` calls the same module in CI and asserts that it
 returned no findings at all, so the fast local check and the gating lint cannot disagree.

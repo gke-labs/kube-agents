@@ -216,6 +216,10 @@ registered commented-out leaves its domain honestly uncovered until it activates
 activating it forces the allowlist edit in `domains.yaml` in the same change. devops-bench
 ignores the extra key (`extra: "ignore"` on its task model), so the field is free to carry.
 
+Every task also carries a top-level `owner:` — a GitHub login without the at sign, or
+`maintainers` — naming who answers when the case flakes. The validator rejects a task without
+one; [CONTRIBUTING.md](CONTRIBUTING.md) says what the owner commits to.
+
 A task may also carry a top-level `expected_fail: true`, which inverts the presubmit's verdict for
 it: failing is the declared outcome, and _passing_ every repetition is what reports. That is the
 eval-driven-development marker — write the case for a gap before the fix exists, land it
@@ -249,6 +253,7 @@ fails if it reported anything, so a case that passes locally passes there too.
 id: my-provisioned-task
 name: Human-readable name
 domain: capacity # required; a slug from docs/designs/domains.yaml
+owner: maintainers # required; a GitHub login without the at sign, or maintainers -- see CONTRIBUTING.md
 fixtures: [] # required when the spec reads cluster state; seeded-fleet roles, or [] for none
 prompt: >-
   The evaluation cluster {{CLUSTER_NAME}} has just been provisioned.

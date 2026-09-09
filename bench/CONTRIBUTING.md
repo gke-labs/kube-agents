@@ -15,7 +15,7 @@ repositories that CI pulls from.
 1. Write the case under `bench/tasks/<name>/task.yaml`, and its OpenTofu stack, if it has
    one, under `bench/tf/prebuilt/<name>/`. Both directories are what the rules below scan.
 2. Run `make bench-case-check`. It applies every rule on this page that a machine can, in
-   about a second, without a cluster or the `bench/` virtualenv.
+   about a second, with PyYAML alone: no cluster, no `bench/` virtualenv.
 3. Register the case in `hack/ci-eval-pr.sh`: an active `TASKS` entry, a commented-out one
    for a case whose fixture is not ready, or a `NIGHTLY_TASKS` entry for a case too slow for
    the presubmit. The format document's "Registration" section says which and why.
@@ -61,11 +61,13 @@ directories and fail on a line that carries either:
 - an IPv4 literal outside the three documentation ranges. That covers every RFC 1918
   address, every public address, and also loopback and `0.0.0.0`, which take the marker
   below when a fixture needs them;
-- a credential-shaped string: a private-key block, a `AIza` API key, a `ya29.` OAuth token,
-  a `gh*_` or `github_pat_` GitHub token, an `xox*-` Slack token, or a JWT. The patterns
-  are `AuditRedactor`'s, imported from
-  `agents/chat/defaults/plugins/common/redactor.py`, so the scan and the audit log agree on
-  what a credential looks like.
+- a credential-shaped string: the token-shaped subset of `AuditRedactor`'s patterns,
+  imported from `agents/chat/defaults/plugins/common/redactor.py` so the scan and the audit
+  log agree on what a credential looks like. `CREDENTIAL_SHAPES` in
+  `scripts/validate_bench_cases.py` is the list of record; today it is private-key blocks
+  and the `AIza`, `ya29.`, `gh*_`, `github_pat_`, `xox*-`, `sk-` and JWT shapes. The
+  redactor's bearer, key/value and e-mail patterns are left out because each matches
+  ordinary prose in a prompt.
 
 Paths with a component beginning with a dot, `*.tfstate*` and `*.tfvars` are skipped, so a
 local `tofu apply` cannot red the check.
@@ -101,11 +103,9 @@ discards the key, so it is a repository-lint field like `domain`.
 sign, or one that is not a login.
 
 What the owner is on the hook for is the demotion mechanic in
-[`docs/eval-gate-roster.md`](../docs/eval-gate-roster.md). An admitted case that reds a pull
-request its diff cannot explain is demoted the same day and gets a hold-out entry naming an
-issue; that issue goes to the owner, who investigates and either fixes the case or proposes
-retiring it. A case whose owner does not answer stays demoted. The bar is the same for a
-contributed case and an in-house one.
+[`docs/eval-gate-roster.md`](../docs/eval-gate-roster.md): the issue a demotion files goes
+to the owner, who fixes the case or proposes retiring it, and a case whose owner does not
+answer stays demoted. The bar there is the same for a contributed case and an in-house one.
 
 ## Roster admission
 
