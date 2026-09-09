@@ -57,7 +57,7 @@ or enabling it; state the missing piece and stop.
 
 1. **The CRDs are installed on a cluster your kubeconfig reaches.** The
    check is `kubectl get crd <kind-plural>.<group>.cnrm.cloud.google.com`
-   (Step 2). No CRD means no schema to validate against and no controller to
+   (Step 1). No CRD means no schema to validate against and no controller to
    reconcile the manifest. Stop with: "Config Connector is not installed on
    `<context>`; this change needs a KCC-enabled cluster before I can author
    it."
@@ -80,12 +80,21 @@ or enabling it; state the missing piece and stop.
 
 ## Workflow
 
-### Step 1: Find the target path and its conventions
+### Step 1: Check for Config Connector, then open the repository
 
-Open the repository with **submit-suggestion** `prepare` (its Step 1). It
-needs the branch name up front, and the convention for this skill is
-`platform-agent/kcc-<kind>-<name>`, the same branch Step 5 submits on. Then
-list what is already under `provisioning/`:
+The CRD check comes first because it needs no repository and is the stop
+you hit most often:
+
+```bash
+kubectl get crd containernodepools.container.cnrm.cloud.google.com
+```
+
+Not found is prerequisite 1 unmet: stop with the message there, before
+anything is opened. With the CRD present, open the repository with
+**submit-suggestion** `prepare` (its Step 1). It needs the branch name up
+front, and the convention for this skill is `platform-agent/kcc-<kind>-<name>`,
+the same branch Step 5 submits on. Then list what is already under
+`provisioning/`:
 
 ```bash
 S="$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py
@@ -101,6 +110,23 @@ the label conventions, and one file per resource or one per kind. A manifest
 for the resource you were asked to change may already be there; then the
 change is an edit to that file, and Step 2's answer is "edit".
 
+**Close the handle on every stop before Step 5.** In content mode `prepare`
+cloned the repository on the credential broker, which holds at most eight
+open workspaces, releases one only when `submit` runs against it, and never
+times one out; eight abandoned runs and no skill on the install can `prepare`
+until the broker restarts. `submit_suggestion.py` has no `close`, so use the
+inspect-repository script's, which releases any handle:
+
+```bash
+python3 "$HERMES_HOME"/skills/inspect-repository/scripts/inspect_repository.py close --handle "<handle>"
+```
+
+Run it before you report Terraform HCL under `provisioning/`, a stop or a
+question from Step 2's table, an immutable field in Step 3, or a CRD Step 4
+finds missing. When the user answers and the work resumes, `prepare` again.
+Directory mode has no handle to close; an abandoned lease is reaped after its
+TTL.
+
 ### Step 2: Decide create, acquire, or edit — read-only
 
 Config Connector acquires an existing Google Cloud resource when a new
@@ -114,7 +140,6 @@ Check permission before the object read, so a `Forbidden` is reported as
 such rather than mistaken for "not there":
 
 ```bash
-kubectl get crd containernodepools.container.cnrm.cloud.google.com
 kubectl auth can-i get containernodepools.container.cnrm.cloud.google.com -n <namespace>
 kubectl get containernodepool <name> -n <namespace> -o yaml
 ```
@@ -228,6 +253,8 @@ Record the PR URL for the user. Addressing review feedback follows
   from the repository, the cluster, or the user.
 - Never propose enabling Config Connector, granting its IAM, or creating a
   `ConfigConnectorContext`.
+- Never leave a content-mode handle open when you stop; Step 1 says how to
+  close it.
 
 ## References
 
