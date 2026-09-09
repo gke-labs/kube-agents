@@ -93,10 +93,15 @@ DOCUMENTATION_NETWORKS: tuple[ipaddress.IPv4Network, ...] = (
     ipaddress.IPv4Network("198.51.100.0/24"),
     ipaddress.IPv4Network("203.0.113.0/24"),
 )
-# A dotted quad with nothing word-like on either side, so `v1.2.3.4` and
-# `1.2.3.4.5` do not match; octets over 255 are dropped by the IPv4Address
-# parse rather than by the pattern.
-IPV4_LITERAL = re.compile(r"(?<![\w.])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![\w.])")
+# A dotted quad that is not part of a longer word or a longer dotted number,
+# so `v1.2.3.4` and `1.2.3.4.5` do not match while `at 10.1.2.3.` -- an
+# address ending a sentence in a prompt -- does. Octets over 255 are dropped
+# by the parse in _non_documentation_addresses rather than by the pattern.
+IPV4_LITERAL = re.compile(r"(?<!\w)(?<![0-9]\.)(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?!\w)(?!\.[0-9])")
+# Characters that do not count as a reason after the marker: whitespace, a
+# carriage return on a CRLF line, and the dash or colon an author might put
+# between the marker and the reason.
+SANITIZER_REASON_STRIP = " \t\r-:"
 # The credential shapes, imported from the audit redactor rather than copied
 # so an extension there reaches this check without a second edit. Bearer,
 # key/value and e-mail patterns are deliberately absent: each matches ordinary
@@ -105,6 +110,9 @@ IPV4_LITERAL = re.compile(r"(?<![\w.])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![\w.])")
 # by reflex. The value is the reader-facing name for the finding.
 REDACTOR_FILE = REPO_ROOT / "agents" / "chat" / "defaults" / "plugins" / "common" / "redactor.py"
 REDACTOR_CLASS = "AuditRedactor"
+# The name the redactor module is registered under when loaded from its file;
+# distinct from anything a package import would use, so the two cannot collide.
+REDACTOR_MODULE_NAME = "kube_agents_audit_redactor"
 CREDENTIAL_SHAPES: dict[str, str] = {
     "PRIVATE_KEY_PATTERN": "a private-key block",
     "GCP_API_KEY_PATTERN": "a GCP API key",
@@ -113,6 +121,7 @@ CREDENTIAL_SHAPES: dict[str, str] = {
     "GITHUB_PAT_PATTERN": "a GitHub fine-grained token",
     "SLACK_TOKEN_PATTERN": "a Slack token",
     "JWT_PATTERN": "a JWT",
+    "OPENAI_TOKEN_PATTERN": "an sk- API key",
 }
 
 # Cases that are neither in TASKS nor nightly-tiered, on purpose, for now.
@@ -690,7 +699,7 @@ def credential_patterns() -> dict[str, re.Pattern[str]]:
     and nothing else. A shape named in CREDENTIAL_SHAPES that the class no
     longer defines is a CaseError rather than a silently narrower scan.
     """
-    spec = importlib.util.spec_from_file_location("kube_agents_audit_redactor", REDACTOR_FILE)
+    spec = importlib.util.spec_from_file_location(REDACTOR_MODULE_NAME, REDACTOR_FILE)
     if spec is None or spec.loader is None:
         raise CaseError(f"{REDACTOR_FILE}: could not be loaded")
     module = importlib.util.module_from_spec(spec)
@@ -739,11 +748,17 @@ def _display(path: pathlib.Path) -> str:
 
 
 def _non_documentation_addresses(text: str) -> list[tuple[int, str]]:
-    """(offset, literal) for every IPv4 literal outside the RFC 5737 ranges."""
+    """(offset, literal) for every IPv4 literal outside the RFC 5737 ranges.
+
+    Octets are parsed as integers before the address is built: IPv4Address
+    rejects a leading zero (`010.001.002.003`) as ambiguous, and an author
+    writing one is still writing an address.
+    """
     found = []
     for match in IPV4_LITERAL.finditer(text):
+        octets = [int(octet) for octet in match.group(0).split(".")]
         try:
-            address = ipaddress.IPv4Address(match.group(0))
+            address = ipaddress.IPv4Address(".".join(str(octet) for octet in octets))
         except ValueError:
             continue
         if not any(address in network for network in DOCUMENTATION_NETWORKS):
@@ -781,7 +796,7 @@ def sanitization_findings(roots: tuple[pathlib.Path, ...] = SANITIZED_ROOTS) -> 
             marker = SANITIZER_ALLOW_RE.search(line)
             if marker is None:
                 continue
-            if marker.group(1).strip(" \t-:"):
+            if marker.group(1).strip(SANITIZER_REASON_STRIP):
                 allowed.add(number)
             else:
                 in_file.append(

@@ -752,6 +752,16 @@ class TestTheSanitizer(unittest.TestCase):
     def test_a_public_literal_is_rejected(self):
         self._only("IPv4 literal 8.8.8.8", {"case/task.yaml": "dns: 8.8.8.8\n"})
 
+    def test_an_address_ending_a_sentence_is_rejected(self):
+        # Where an address sits in a prompt: followed by the full stop, not
+        # by a fifth octet.
+        for text in ("the node at 10.1.2.3.\n", "reach 10.1.2.3.\nThen stop.\n", "(10.1.2.3).\n"):
+            with self.subTest(text=text):
+                self._only("IPv4 literal 10.1.2.3", {"case/task.yaml": text})
+
+    def test_leading_zero_octets_are_still_an_address(self):
+        self._only("IPv4 literal 010.001.002.003", {"case/task.yaml": "host: 010.001.002.003\n"})
+
     def test_loopback_and_unspecified_take_the_marker(self):
         for literal in ("127.0.0.1", "0.0.0.0"):
             with self.subTest(literal=literal):
@@ -776,6 +786,7 @@ class TestTheSanitizer(unittest.TestCase):
             "a GitHub fine-grained token": "github_pat_" + "a" * 20,
             "a Slack token": "xoxb-" + "0" * 10,
             "a JWT": "eyJ" + "a" * 10 + "." + "b" * 10 + "." + "c" * 10,
+            "an sk- API key": "sk-" + "a" * 20,
         }
         for label, value in shapes.items():
             with self.subTest(shape=label):
@@ -813,6 +824,12 @@ class TestTheSanitizer(unittest.TestCase):
         self.assertEqual(len(findings), 2, findings)
         self.assertIn("with no reason after it", findings[0])
         self.assertIn("IPv4 literal 10.0.0.1", findings[1])
+
+    def test_a_bare_marker_on_a_crlf_line_is_still_bare(self):
+        # The carriage return is not a reason.
+        findings = self._findings({"case/task.yaml": "a: 10.0.0.1 # sanitizer: allow\r\nb: 1\r\n"})
+        self.assertEqual(len(findings), 2, findings)
+        self.assertIn("with no reason after it", findings[0])
 
     def test_a_bare_marker_on_a_clean_line_is_still_rejected(self):
         self._only("with no reason after it", {"case/task.yaml": "# sanitizer: allow\n"})
