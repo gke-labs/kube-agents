@@ -1284,7 +1284,21 @@ class CountWaitingOnChildrenTest(unittest.TestCase):
     def test_a_broken_connection_reads_as_no_waiters(self):
         conn = sqlite3.connect(":memory:")
         conn.close()
-        self.assertEqual(count_waiting_on_children(conn), 0)
+        with self.assertLogs("kanban_scheduling", level="WARNING") as logs:
+            self.assertEqual(count_waiting_on_children(conn), 0)
+        self.assertIn("no discount applied this tick", logs.output[0])
+
+    def test_a_board_with_no_attribution_table_reads_as_no_waiters_quietly(self):
+        """The pre-upgrade state, which recurs every tick until the writer lands.
+
+        Warning on it would drown the drift the warning above exists to surface.
+        """
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE tasks (id TEXT, status TEXT)")
+        with self.assertLogs("kanban_scheduling", level="DEBUG") as logs:
+            self.assertEqual(count_waiting_on_children(conn), 0)
+        self.assertEqual([r.levelname for r in logs.records], ["DEBUG"])
+        conn.close()
 
 
 class ChildrenTableAgreementTest(unittest.TestCase):
@@ -1324,10 +1338,11 @@ class ChildrenTableAgreementTest(unittest.TestCase):
     def _applier_exit(self, mutate):
         """Run the applier in a copied patch dir with one constant rewritten.
 
-        A subprocess, because the reconciliation runs at import time and this
-        process has already imported it. Asserting on the applier's own source
-        text — which is what this test did first — keeps passing when the check
-        is rewritten to compare the wrong attributes, so it proved nothing.
+        A subprocess, because the mutation has to be read by a fresh import of
+        both modules and this process has already imported them. Asserting on the
+        applier's own source text — which is what this test did first — keeps
+        passing when the check is rewritten to compare the wrong attributes, so
+        it proved nothing.
         """
         with tempfile.TemporaryDirectory() as tmp:
             stage = Path(tmp) / "patches"
@@ -1572,7 +1587,7 @@ class ApplierTest(unittest.TestCase):
                 self.assertEqual(source.count(anchor), 1)
         ast.parse(source)
 
-    def test_all_six_edits_land_and_the_result_parses(self):
+    def test_all_seven_edits_land_and_the_result_parses(self):
         out = self._applied()
         self.assertIn("_kanban_repair_inverted_deps(conn, task_id, reason)", out)
         self.assertIn(
@@ -1589,6 +1604,7 @@ class ApplierTest(unittest.TestCase):
             out,
         )
         self.assertIn(BUILD_MARKER, out)
+        self.assertIn(apply_kanban_scheduling.WAITING_BUILD_MARKER, out)
         ast.parse(out)
 
     def test_one_trailer_imports_everything_the_edits_call(self):
@@ -1598,6 +1614,7 @@ class ApplierTest(unittest.TestCase):
         for name in (
             "_kanban_charge_reclaimed_cards",
             "_kanban_claim_is_self",
+            "_kanban_count_waiting_on_children",
             "_kanban_release_dead_foreign_claims",
             "_kanban_repair_inverted_deps",
         ):

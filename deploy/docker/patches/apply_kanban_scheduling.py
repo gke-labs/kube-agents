@@ -165,75 +165,86 @@ import patchlib  # noqa: E402
 
 # Edit 7 reads a table another patch owns. Both modules declare its name and the
 # settled-status set independently — importing across them would put hermes_cli
-# on tools/ — so they are reconciled here, at import time, and a rename in either
-# fails the build instead of silently making the discount a constant zero.
+# on tools/ — so they are reconciled below and a rename in either fails the build
+# instead of silently making the discount a constant zero.
+import sqlite3  # noqa: E402
+
 import kanban_children_settled as _children  # noqa: E402
 import kanban_scheduling as _scheduling  # noqa: E402
 
-if _scheduling.CHILDREN_TABLE != _children.CHILDREN_TABLE:
-    raise SystemExit(
-        "apply_kanban_scheduling: CHILDREN_TABLE disagrees between "
-        f"kanban_scheduling ({_scheduling.CHILDREN_TABLE!r}) and "
-        f"kanban_children_settled ({_children.CHILDREN_TABLE!r}). "
-        "Edit 7 would count nothing. Reconcile them before building."
-    )
-if tuple(_scheduling.CHILD_SETTLED_STATUSES) != tuple(_children.SETTLED_STATUSES):
-    raise SystemExit(
-        "apply_kanban_scheduling: the settled-status set disagrees between "
-        f"kanban_scheduling ({_scheduling.CHILD_SETTLED_STATUSES!r}) and "
-        f"kanban_children_settled ({_children.SETTLED_STATUSES!r}). Edit 7 and "
-        "the completion gate would disagree about whether a card is waiting."
-    )
 
-# The table name is not the only way the two can drift. Edit 7's SQL also names
-# two of its columns, and a rename there raises inside count_waiting_on_children,
-# is swallowed by its fail-open, and leaves the discount a constant zero -- the
-# same silent failure, through a door the name check does not cover.
-#
-# The writer's DDL is executed rather than searched, because searching it is the
-# check that looks right and is not: renaming the column in the CREATE TABLE
-# leaves the name behind in the CREATE INDEX, and a substring test waves that
-# through. sqlite answers the question exactly and costs a millisecond.
-import sqlite3  # noqa: E402
+def _reconcile_with_the_writer() -> None:
+    """Fail the build when edit 7 and the attribution writer have drifted apart.
 
-_probe = sqlite3.connect(":memory:")
-try:
-    for _ddl in _children._TABLE_DDL:
-        _probe.execute(_ddl)
-except sqlite3.Error as _exc:
-    raise SystemExit(
-        "apply_kanban_scheduling: kanban_children_settled._TABLE_DDL does not "
-        f"execute ({_exc}). Edit 7 reads the table it creates."
-    ) from _exc
-_WRITER_COLUMNS = {
-    row[1] for row in _probe.execute(f"PRAGMA table_info({_children.CHILDREN_TABLE})")
-}
-_probe.close()
-
-for _column in _scheduling.CHILD_COLUMNS:
-    if _column not in _WRITER_COLUMNS:
+    Called from ``apply`` rather than run at import. A raise at import time takes
+    the whole test module down with it — including the agreement tests written
+    for exactly this drift, which then never execute to report it.
+    """
+    if _scheduling.CHILDREN_TABLE != _children.CHILDREN_TABLE:
         raise SystemExit(
-            f"apply_kanban_scheduling: edit 7 reads column {_column!r}, which "
-            f"kanban_children_settled._TABLE_DDL does not create (it makes "
-            f"{sorted(_WRITER_COLUMNS)}). The discount would fail open to zero "
-            "on every board."
+            "apply_kanban_scheduling: CHILDREN_TABLE disagrees between "
+            f"kanban_scheduling ({_scheduling.CHILDREN_TABLE!r}) and "
+            f"kanban_children_settled ({_children.CHILDREN_TABLE!r}). "
+            "Edit 7 would count nothing. Reconcile them before building."
         )
-    if _column not in _scheduling._WAITING_ON_CHILDREN_SQL:
+    if tuple(_scheduling.CHILD_SETTLED_STATUSES) != tuple(_children.SETTLED_STATUSES):
         raise SystemExit(
-            f"apply_kanban_scheduling: CHILD_COLUMNS names {_column!r} but edit "
-            "7's SQL does not use it, so this check is guarding nothing."
+            "apply_kanban_scheduling: the settled-status set disagrees between "
+            f"kanban_scheduling ({_scheduling.CHILD_SETTLED_STATUSES!r}) and "
+            f"kanban_children_settled ({_children.SETTLED_STATUSES!r}). Edit 7 and "
+            "the completion gate would disagree about whether a card is waiting."
         )
 
-# kanban_scheduling declares the settled set twice -- once as this tuple and once
-# as the SQL fragment part 2 interpolates. Only the tuple is reconciled above, so
-# tie the fragment to it here rather than leaving one of the three copies loose.
-_EXPECTED_SETTLED_SQL = "(" + ", ".join(repr(s) for s in _scheduling.CHILD_SETTLED_STATUSES) + ")"
-if _scheduling.SETTLED != _EXPECTED_SETTLED_SQL:
-    raise SystemExit(
-        f"apply_kanban_scheduling: kanban_scheduling.SETTLED ({_scheduling.SETTLED!r}) "
-        f"no longer spells CHILD_SETTLED_STATUSES ({_EXPECTED_SETTLED_SQL!r}). "
-        "The two halves of the file would disagree about what 'settled' means."
+    # The table name is not the only way the two can drift. Edit 7's SQL also names
+    # two of its columns, and a rename there raises inside count_waiting_on_children,
+    # is swallowed by its fail-open, and leaves the discount a constant zero -- the
+    # same silent failure, through a door the name check does not cover.
+    #
+    # The writer's DDL is executed rather than searched, because searching it is the
+    # check that looks right and is not: renaming the column in the CREATE TABLE
+    # leaves the name behind in the CREATE INDEX, and a substring test waves that
+    # through. sqlite answers the question exactly and costs a millisecond.
+    probe = sqlite3.connect(":memory:")
+    try:
+        for ddl in _children._TABLE_DDL:
+            probe.execute(ddl)
+    except sqlite3.Error as exc:
+        raise SystemExit(
+            "apply_kanban_scheduling: kanban_children_settled._TABLE_DDL does not "
+            f"execute ({exc}). Edit 7 reads the table it creates."
+        ) from exc
+    writer_columns = {
+        row[1]
+        for row in probe.execute(f"PRAGMA table_info({_children.CHILDREN_TABLE})")
+    }
+    probe.close()
+
+    for column in _scheduling.CHILD_COLUMNS:
+        if column not in writer_columns:
+            raise SystemExit(
+                f"apply_kanban_scheduling: edit 7 reads column {column!r}, which "
+                f"kanban_children_settled._TABLE_DDL does not create (it makes "
+                f"{sorted(writer_columns)}). The discount would fail open to zero "
+                "on every board."
+            )
+        if column not in _scheduling._WAITING_ON_CHILDREN_SQL:
+            raise SystemExit(
+                f"apply_kanban_scheduling: CHILD_COLUMNS names {column!r} but edit "
+                "7's SQL does not use it, so this check is guarding nothing."
+            )
+
+    # kanban_scheduling declares the settled set twice -- once as this tuple and once
+    # as the SQL fragment part 2 interpolates. Only the tuple is reconciled above, so
+    # tie the fragment to it here rather than leaving one of the three copies loose.
+    expected_settled_sql = (
+        "(" + ", ".join(repr(s) for s in _scheduling.CHILD_SETTLED_STATUSES) + ")"
     )
+    if _scheduling.SETTLED != expected_settled_sql:
+        raise SystemExit(
+            f"apply_kanban_scheduling: kanban_scheduling.SETTLED ({_scheduling.SETTLED!r}) "
+            f"no longer spells CHILD_SETTLED_STATUSES ({expected_settled_sql!r}). "
+            "The two halves of the file would disagree about what 'settled' means."
+        )
 
 RELATIVE = "hermes_cli/kanban_db.py"
 
@@ -486,6 +497,7 @@ def apply(root: Path) -> None:
     result parses, so a Hermes bump that moves one anchor leaves the file
     untouched rather than half-patched.
     """
+    _reconcile_with_the_writer()
     patch = patchlib.Patch(root, RELATIVE, prefix="kanban-scheduling")
     patch.refuse_if_patched(*ALREADY_PATCHED)
     for label, anchor, patched in EDITS:

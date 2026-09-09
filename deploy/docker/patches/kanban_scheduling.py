@@ -422,23 +422,27 @@ cannot start until it completes.
 
 Patched at the counter rather than its two call sites because
 ``count_running_tasks_other_boards`` calls it per board, and the cap is
-host-level (OOF-30). The attribution table is created on first write, so the read
+host-level. The attribution table is created on first write, so the read
 fails open to zero — no attribution, no waiters, upstream's count. That is the
 state during the build, which verifies this patch stages before installing the
 writer.
 
 Cost: real process count becomes ``cap + waiting coordinators``, unbounded. A cap
 that counts waiters does not bound memory either — it deadlocks, and the wedged
-coordinator stays resident. The backstop is ``dispatch_once``'s memory-pressure
-guard (OOF-30/OOF-77), reactive where the cap is preventive.
+coordinator stays resident. The backstop is upstream's ``_memory_pressure_level``
+check in the dispatch tick, reactive where the cap is preventive. It lives in
+Hermes rather than this repository, so nothing here pins it.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from typing import NamedTuple, Optional
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Part 1: inverted fan-out dependency edges
@@ -929,11 +933,28 @@ def count_waiting_on_children(conn) -> int:
     Fails open to 0, including for a board whose attribution table was never
     written. Zero is upstream's count, so an error here narrows dispatch rather
     than unbounding it.
+
+    A fail-open that says nothing hides its own cause, so anything but the
+    missing table warns. The missing table is the documented pre-upgrade state
+    and recurs every tick until the writer installs, so it stays at debug.
     """
     try:
         row = conn.execute(
             _WAITING_ON_CHILDREN_SQL, CHILD_SETTLED_STATUSES
         ).fetchone()
         return int(row[0]) if row else 0
-    except Exception:
+    except Exception as exc:  # noqa: BLE001 — never break the dispatch tick
+        # Matched on the message rather than the type because the table is
+        # missing rather than empty, which sqlite reports as OperationalError —
+        # the same type a renamed column raises, and that one is drift.
+        if "no such table" in str(exc):
+            logger.debug(
+                "kanban_scheduling: no attribution table yet, no discount: %r", exc
+            )
+        else:
+            logger.warning(
+                "kanban_scheduling: counting waiting coordinators failed, "
+                "no discount applied this tick: %r",
+                exc,
+            )
         return 0
