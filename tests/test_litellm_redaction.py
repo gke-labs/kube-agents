@@ -198,8 +198,36 @@ class TestCallback(unittest.TestCase):
         self.assertEqual(self._run(data), data)
 
     def test_a_bad_rule_file_fails_the_import_rather_than_the_request(self) -> None:
-        with self.assertRaises(ValueError):
-            _load_callback_module({"rules": [{"name": "x", "pattern": "("}]})
+        for config in (
+            {"rules": [{"name": "x", "pattern": "("}]},
+            {"rules": [{"name": "x", "literal": ""}]},
+            {"ip": {"action": False}},
+        ):
+            with self.subTest(config=config):
+                with self.assertRaises(ValueError):
+                    _load_callback_module(config)
+
+    def test_the_count_line_reaches_a_stream_handler_at_info(self) -> None:
+        # The proxy leaves the root logger at WARNING and installs no handler
+        # for this logger, so the module has to carry its own or the one
+        # operator-visible signal that a rule fired never reaches the pod log.
+        logger = self.module.logger
+        self.assertLessEqual(logger.level, self.module.logging.INFO)
+        self.assertFalse(logger.propagate)
+        streams = [
+            h.stream
+            for h in logger.handlers
+            if isinstance(h, self.module.logging.StreamHandler)
+        ]
+        self.assertIn(sys.stderr, streams)
+
+    def test_the_redactor_is_loaded_by_path_without_touching_sys_path(self) -> None:
+        self.assertNotIn(str(_CHART_FILES), sys.path)
+        self.assertIn(self.module.REDACTOR_MODULE_NAME, sys.modules)
+        self.assertEqual(
+            pathlib.Path(sys.modules[self.module.REDACTOR_MODULE_NAME].__file__).resolve(),
+            _CHART_REDACTOR.resolve(),
+        )
 
     def test_a_missing_config_variable_fails_the_import(self) -> None:
         _stub_litellm()
@@ -286,12 +314,58 @@ class TestChartRender(unittest.TestCase):
             ("litellm.redaction.ip.action=reverse", "litellm.redaction.ip.action"),
             ("litellm.redaction.rules[0].action=hash", "litellm.redaction.rules[0]"),
             ("litellm.redaction.rules[1].literal=x", "exactly one of pattern or literal"),
+            ("litellm.redaction.rules[1].name=-project", "must start with a letter or digit"),
         ):
             with self.subTest(override=override):
                 proc = self._render(
                     {"litellm": {"redaction": {"enabled": True, **_RULES_CONFIG}}},
                     ["--set", override],
                 )
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn(needle, proc.stderr)
+
+    def test_a_values_file_may_turn_ip_redaction_off_only_with_a_quoted_string(self) -> None:
+        # YAML 1.1 reads a bare `off` as boolean false, which `default` would
+        # have turned into pseudonym without a word said. The values file is
+        # written as text so the bare spelling reaches Helm's loader unquoted.
+        def render_action(spelling: str):
+            with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as handle:
+                handle.write(
+                    "litellm:\n  redaction:\n    enabled: true\n    ip:\n"
+                    f"      action: {spelling}\n"
+                )
+                values_path = handle.name
+            try:
+                return subprocess.run(
+                    _HELM_BASE_ARGS + ["-f", values_path],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            finally:
+                os.unlink(values_path)
+
+        bare = render_action("off")
+        self.assertNotEqual(bare.returncode, 0)
+        self.assertIn('quote it: action: "off"', bare.stderr)
+
+        quoted = render_action('"off"')
+        self.assertEqual(quoted.returncode, 0, quoted.stderr)
+        configmap = next(
+            d for d in yaml.safe_load_all(quoted.stdout) if d and d["kind"] == "ConfigMap"
+        )
+        self.assertEqual(yaml.safe_load(configmap["data"]["redaction.yaml"])["ip"]["action"], "off")
+
+    def test_a_rule_source_that_is_not_a_non_empty_string_fails_the_render(self) -> None:
+        for rule, needle in (
+            ({"name": "x", "literal": ""}, "must be a non-empty string"),
+            ({"name": "x", "literal": True}, "must be a non-empty string"),
+            ({"name": "x", "pattern": None}, "must be a non-empty string"),
+            ({"name": "x", "literal": 1.1}, "must be a non-empty string"),
+            ({"name": "x", "literal": "a", "action": False}, "action must be a string"),
+        ):
+            with self.subTest(rule=rule):
+                proc = self._render({"litellm": {"redaction": {"enabled": True, "rules": [rule]}}})
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertIn(needle, proc.stderr)
 

@@ -303,16 +303,21 @@ litellm:
     # IPv4 and IPv6 literals. action: pseudonym replaces each with a stable
     # [ip:<12 hex>] token salted from SESSION_KV_SALT in the credentials
     # Secret (a missing salt still redacts, with a per-pod salt); mask
-    # replaces each with [REDACTED_IP]; off leaves IP literals alone.
-    # allowCidrs lists networks the model must still see, in CIDR form.
+    # replaces each with [REDACTED_IP]; "off" leaves IP literals alone. Quote
+    # off: YAML reads the bare word as a boolean, and the chart refuses that
+    # rather than guessing. allowCidrs lists networks the model must still
+    # see, in CIDR form.
     ip:
       action: pseudonym
       allowCidrs: []
     # Operator rules, applied in order after the IP rules. Each has a name
-    # (letters, digits, `_`, `.`, `-`), exactly one of `pattern` (a Python
-    # regular expression) or `literal` (an exact string), and an action of
-    # mask (default) or pseudonym. A pattern that does not compile stops the
-    # gateway pod at startup rather than forwarding requests unredacted.
+    # (starting with a letter or digit, then letters, digits, `_`, `.`, `-`),
+    # exactly one of `pattern` (a Python regular expression) or `literal` (an
+    # exact string), both non-empty text, and an action of mask (default,
+    # [REDACTED_<NAME>] with the name upper-cased and punctuation folded to
+    # `_`) or pseudonym ([<name>:<12 hex>]). The render fails on a name,
+    # action or source it cannot accept; a pattern that does not compile stops
+    # the gateway pod at startup rather than forwarding requests unredacted.
     #   - name: cluster-name
     #     literal: prod-eu-1
     #     action: pseudonym

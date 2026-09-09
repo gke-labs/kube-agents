@@ -456,9 +456,12 @@ kubectl create secret generic platform-agent-secrets \
 
 The last two are generated, not chosen: `SESSION_KV_API_KEY` is the bearer token
 for the pod-local Session KV server, and `SESSION_KV_SALT` is the HMAC salt that
-pseudonymises chat identities before they are written to disk. Keep the salt:
+pseudonymises chat identities before they are written to disk, and, when the
+chart's `litellm.redaction` is on, also keys the `[ip:…]` and `[<rule>:…]`
+pseudonyms the gateway substitutes into provider requests. Keep the salt:
 rotating it re-anonymises every user, severing their past sessions from their
-future ones.
+future ones, and gives every pseudonymised identifier a new token the model
+cannot correlate with the old one.
 
 Both are optional in the sense that the pod still starts without them, but
 `SESSION_KV_API_KEY` is not optional in practice: the in-pod `k8s-event-watcher`

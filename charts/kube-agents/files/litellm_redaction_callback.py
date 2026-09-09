@@ -27,6 +27,7 @@ never the payload.
 
 from __future__ import annotations
 
+import importlib.util
 import logging
 import os
 import sys
@@ -36,19 +37,21 @@ from typing import Any, Dict, List, Optional
 import yaml
 from litellm.integrations.custom_logger import CustomLogger
 
-# `redactor.py` is mounted beside this file, and LiteLLM loads this module by
-# path rather than as a package, so its directory is not on sys.path unless
-# this puts it there.
-_HERE = str(Path(__file__).resolve().parent)
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
-
-from redactor import AuditRedactor, RedactionRule  # noqa: E402
-
 logger = logging.getLogger("kube_agents.litellm_redaction")
 
 # The rendered redaction.yaml; the chart sets this on the gateway container.
 CONFIG_PATH_ENV_VAR = "KUBE_AGENTS_REDACTION_CONFIG"
+# `redactor.py` is mounted beside this file. It is loaded by path under a name
+# of its own rather than by putting the config directory on sys.path: that
+# directory is LiteLLM's working directory in the image, and a sys.path entry
+# there would change name resolution for the whole proxy process.
+REDACTOR_FILE_NAME = "redactor.py"
+REDACTOR_MODULE_NAME = "kube_agents_litellm_redactor"
+# The proxy leaves the root logger at WARNING and this logger has no handler
+# of its own, so without these the per-request count line never reaches the
+# pod log. The line is the one operator-visible signal that a rule fired.
+LOG_LEVEL = logging.INFO
+LOG_FORMAT = "%(asctime)s %(name)s %(levelname)s %(message)s"
 # Request fields the redactor walks. `messages` is the chat shape the agents
 # send; `input` is embeddings; `prompt` is the legacy text-completion shape.
 MESSAGES_KEY = "messages"
@@ -57,6 +60,35 @@ TEXT_PART_TYPE = "text"
 TEXT_KEY = "text"
 PART_TYPE_KEY = "type"
 SCALAR_INPUT_KEYS = ("input", "prompt")
+
+
+def _load_redactor():
+    """Import the sibling redactor module by path, as LiteLLM imports this one."""
+    path = Path(__file__).resolve().with_name(REDACTOR_FILE_NAME)
+    spec = importlib.util.spec_from_file_location(REDACTOR_MODULE_NAME, path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load the gateway redactor from {path}")
+    module = importlib.util.module_from_spec(spec)
+    # Registered before execution, as the import system does: the module
+    # declares a dataclass, which resolves its defining module via sys.modules.
+    sys.modules[REDACTOR_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _configure_logger() -> None:
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter(LOG_FORMAT))
+        logger.addHandler(handler)
+    logger.setLevel(LOG_LEVEL)
+    logger.propagate = False
+
+
+_redactor = _load_redactor()
+AuditRedactor = _redactor.AuditRedactor
+RedactionRule = _redactor.RedactionRule
+_configure_logger()
 
 
 def load_rules(config_path: str) -> List[RedactionRule]:

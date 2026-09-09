@@ -40,7 +40,7 @@ import re
 import secrets
 import threading
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger("hermes.plugin.common.redactor")
 
@@ -63,9 +63,19 @@ PSEUDONYM_HEX_LENGTH = 12
 # A rule name ends up inside the replacement token and in a log line keyed by
 # it, so it is kept to the characters that survive both unambiguously.
 RULE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]*$")
+# A mask marker is the rule name upper-cased with every run of characters
+# outside [A-Za-z0-9] folded to one underscore: `cluster-name` masks as
+# `[REDACTED_CLUSTER_NAME]`. Names that differ only in punctuation share a
+# marker, though their counts stay distinct.
+MASK_MARKER_FORMAT = "[REDACTED_{}]"
+MASK_NAME_FOLD_PATTERN = re.compile(r"[^A-Za-z0-9]+")
 # The keys a configured rule may carry. `pattern` is a regular expression,
 # `literal` an exact string; a rule names exactly one of the two.
 RULE_CONFIG_KEYS = frozenset({"name", "pattern", "literal", "action"})
+RULE_CONFIG_KEY_NAME = "name"
+RULE_CONFIG_KEY_PATTERN = "pattern"
+RULE_CONFIG_KEY_LITERAL = "literal"
+RULE_CONFIG_KEY_ACTION = "action"
 CONFIG_KEY_IP = "ip"
 CONFIG_KEY_IP_ACTION = "action"
 CONFIG_KEY_IP_ALLOW_CIDRS = "allowCidrs"
@@ -149,7 +159,7 @@ class RedactionRule:
 
     @property
     def mask(self) -> str:
-        return "[REDACTED_" + re.sub(r"[^A-Za-z0-9]+", "_", self.name).upper() + "]"
+        return MASK_MARKER_FORMAT.format(MASK_NAME_FOLD_PATTERN.sub("_", self.name).upper())
 
 
 class AuditRedactor:
@@ -270,7 +280,7 @@ class AuditRedactor:
         return "\n".join(out)
 
     @classmethod
-    def redact_text(cls, text: str, rules: Optional[Iterable[RedactionRule]] = None) -> str:
+    def redact_text(cls, text: str, rules: Optional[Sequence[RedactionRule]] = None) -> str:
         if not text:
             return text
         text = cls._redact_credentials(text)
@@ -280,7 +290,7 @@ class AuditRedactor:
 
     @classmethod
     def redact_text_counted(
-        cls, text: str, rules: Optional[Iterable[RedactionRule]] = None
+        cls, text: str, rules: Optional[Sequence[RedactionRule]] = None
     ) -> Tuple[str, Dict[str, int]]:
         """:meth:`redact_text`, plus how many substitutions each layer made.
 
@@ -308,9 +318,16 @@ class AuditRedactor:
 
     @classmethod
     def apply_rules(
-        cls, text: str, rules: Iterable[RedactionRule]
+        cls, text: str, rules: Sequence[RedactionRule]
     ) -> Tuple[str, Dict[str, int]]:
-        """Apply configured rules in order; return the text and a count per rule name."""
+        """Apply configured rules in order; return the text and a count per rule name.
+
+        ``rules`` is a sequence, not a one-shot iterable: :meth:`redact` hands
+        the same object to this method once per string it finds, so a
+        generator would be spent after the first one and the rest of the
+        structure would go out unredacted. ``redact`` materialises what it is
+        given for that reason; this method reads ``rules`` once and trusts it.
+        """
         counts: Dict[str, int] = {}
         if not text:
             return text, counts
@@ -400,22 +417,40 @@ class AuditRedactor:
             unknown = set(entry) - RULE_CONFIG_KEYS
             if unknown:
                 raise ValueError(f"redaction rule #{index}: unknown keys {sorted(unknown)}")
-            if ("pattern" in entry) == ("literal" in entry):
+            has_pattern = RULE_CONFIG_KEY_PATTERN in entry
+            if has_pattern == (RULE_CONFIG_KEY_LITERAL in entry):
                 raise ValueError(
                     f"redaction rule #{index}: give exactly one of `pattern` or `literal`"
                 )
-            source = entry.get("pattern")
-            if source is None:
-                source = re.escape(str(entry["literal"]))
+            # Strings only, and never empty. YAML turns a bare `yes`, a blank
+            # value or `1.10` into something else, and `str()` of that would
+            # quietly build a rule for a value the operator never wrote; an
+            # empty source, or a pattern that matches the empty string, would
+            # put a marker between every character of every request.
+            source_key = RULE_CONFIG_KEY_PATTERN if has_pattern else RULE_CONFIG_KEY_LITERAL
+            source = entry[source_key]
+            if not isinstance(source, str) or not source:
+                raise ValueError(
+                    f"redaction rule #{index}: `{source_key}` must be a non-empty string, "
+                    f"got {source!r}"
+                )
             try:
-                pattern = re.compile(str(source))
+                pattern = re.compile(source if has_pattern else re.escape(source))
             except re.error as error:
                 raise ValueError(f"redaction rule #{index}: bad pattern: {error}") from error
-            rules.append(
-                RedactionRule(
-                    str(entry.get("name", "")), pattern, entry.get("action", RULE_ACTION_MASK)
+            if pattern.match(""):
+                raise ValueError(
+                    f"redaction rule #{index}: `{source_key}` {source!r} matches the empty "
+                    f"string, which would mark every position of every request"
                 )
-            )
+            name = entry.get(RULE_CONFIG_KEY_NAME)
+            action = entry.get(RULE_CONFIG_KEY_ACTION, RULE_ACTION_MASK)
+            for key, value in ((RULE_CONFIG_KEY_NAME, name), (RULE_CONFIG_KEY_ACTION, action)):
+                if not isinstance(value, str):
+                    raise ValueError(
+                        f"redaction rule #{index}: `{key}` must be a string, got {value!r}"
+                    )
+            rules.append(RedactionRule(name, pattern, action))
         return rules
 
     @classmethod
@@ -437,6 +472,10 @@ class AuditRedactor:
     @classmethod
     def redact(cls, value: Any, rules: Optional[Iterable[RedactionRule]] = None) -> Any:
         """Recursively redact a value, keying off mapping keys where present."""
+        if rules is not None and not isinstance(rules, (list, tuple)):
+            # Materialised once here, because every string below receives the
+            # same object and a generator would be spent after the first.
+            rules = tuple(rules)
         if isinstance(value, bytes):
             return cls.redact_text(value.decode("utf-8", errors="replace"), rules).encode("utf-8")
         if isinstance(value, str):

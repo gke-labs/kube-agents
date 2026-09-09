@@ -39,14 +39,28 @@
 {{- $redactionCallbackSource := "" }}
 {{- if $redactionEnabled }}
 {{- $ip := $redaction.ip | default dict }}
+{{- /*
+  Strings only, checked before `default`: YAML 1.1 reads a bare `off`, `yes`
+  or `no` as a boolean, `default` treats false as empty, and the operator's
+  `action: off` would otherwise render as pseudonym without a word said.
+*/}}
+{{- if and (hasKey $ip "action") (not (kindIs "string" $ip.action)) }}
+{{- fail (printf "litellm.redaction.ip.action must be a string, got %v; YAML reads a bare off/yes/no as a boolean, so quote it: action: \"off\"" $ip.action) }}
+{{- end }}
 {{- $ipAction := $ip.action | default "pseudonym" }}
 {{- if not (has $ipAction (list "mask" "pseudonym" "off")) }}
 {{- fail (printf "litellm.redaction.ip.action %q is not one of mask, pseudonym, off" $ipAction) }}
 {{- end }}
 {{- $rules := $redaction.rules | default list }}
 {{- range $index, $rule := $rules }}
-{{- if not $rule.name }}
-{{- fail (printf "litellm.redaction.rules[%d] has no name" $index) }}
+{{- if not (kindIs "string" $rule.name) }}
+{{- fail (printf "litellm.redaction.rules[%d] needs a string name, got %v" $index $rule.name) }}
+{{- end }}
+{{- if not (regexMatch `^[A-Za-z0-9][A-Za-z0-9_.\-]*$` $rule.name) }}
+{{- fail (printf "litellm.redaction.rules[%d]: name %q must start with a letter or digit and use only letters, digits, _ . -" $index $rule.name) }}
+{{- end }}
+{{- if and (hasKey $rule "action") (not (kindIs "string" $rule.action)) }}
+{{- fail (printf "litellm.redaction.rules[%d] (%s): action must be a string, got %v; quote a bare yes/no/off" $index $rule.name $rule.action) }}
 {{- end }}
 {{- $ruleAction := $rule.action | default "mask" }}
 {{- if not (has $ruleAction (list "mask" "pseudonym")) }}
@@ -54,6 +68,11 @@
 {{- end }}
 {{- if eq (hasKey $rule "pattern") (hasKey $rule "literal") }}
 {{- fail (printf "litellm.redaction.rules[%d] (%s): give exactly one of pattern or literal" $index $rule.name) }}
+{{- end }}
+{{- $sourceKey := ternary "pattern" "literal" (hasKey $rule "pattern") }}
+{{- $source := get $rule $sourceKey }}
+{{- if or (not (kindIs "string" $source)) (empty $source) }}
+{{- fail (printf "litellm.redaction.rules[%d] (%s): %s must be a non-empty string, got %v; an empty rule would mark every position of every request, and YAML reads a bare yes/no/on/off or a number as something other than text" $index $rule.name $sourceKey $source) }}
 {{- end }}
 {{- end }}
 {{- $redactionConfig = toYaml (dict "ip" (dict "action" $ipAction "allowCidrs" ($ip.allowCidrs | default list)) "rules" $rules) }}

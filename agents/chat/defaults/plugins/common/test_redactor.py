@@ -423,10 +423,40 @@ class TestRedactionRules(unittest.TestCase):
             {"rules": [{"name": "x", "regex": "a"}]},
             {"rules": ["x"]},
             {"extra": {}},
+            # Empty, or matching the empty string: either would put a marker
+            # between every character of every request.
+            {"rules": [{"name": "x", "literal": ""}]},
+            {"rules": [{"name": "x", "pattern": ""}]},
+            {"rules": [{"name": "x", "pattern": "a*"}]},
+            {"rules": [{"name": "x", "pattern": "(?:)"}]},
+            # What YAML makes of a blank value, a bare `yes` and `1.10`; each
+            # would otherwise become a rule for a word the operator never wrote.
+            {"rules": [{"name": "x", "literal": None}]},
+            {"rules": [{"name": "x", "pattern": None}]},
+            {"rules": [{"name": "x", "literal": True}]},
+            {"rules": [{"name": "x", "literal": 1.1}]},
+            {"rules": [{"name": 7, "literal": "a"}]},
+            {"rules": [{"name": "x", "literal": "a", "action": False}]},
+            {"ip": {"action": False}},
         ):
             with self.subTest(config=config):
                 with self.assertRaises(ValueError):
                     AuditRedactor.rules_from_config(config)
+
+    def test_a_mask_marker_folds_the_name_to_one_spelling(self):
+        import re
+
+        for name in ("cluster-name", "cluster.name", "cluster_name", "cluster--name"):
+            with self.subTest(name=name):
+                rule = RedactionRule(name, re.compile("x"), "mask")
+                self.assertEqual(rule.mask, "[REDACTED_CLUSTER_NAME]")
+
+    def test_a_generator_of_rules_is_not_spent_after_the_first_string(self):
+        rules = (rule for rule in AuditRedactor.ip_rules("mask"))
+        self.assertEqual(
+            AuditRedactor.redact({"a": "10.0.0.5", "b": ["10.0.0.6", {"c": "10.0.0.7"}]}, rules),
+            {"a": "[REDACTED_IP]", "b": ["[REDACTED_IP]", {"c": "[REDACTED_IP]"}]},
+        )
 
     def test_a_rule_with_an_unknown_action_is_refused_at_construction(self):
         import re
