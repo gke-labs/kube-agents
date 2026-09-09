@@ -42,6 +42,21 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 KUBECTL = "kubectl"
+# The kubectl vocabulary this script uses. --show-managed-fields matters: kubectl
+# strips managedFields from -o json by default, and the generation-lag and
+# dangling-reference ages are read from them.
+KUBECTL_GET = "get"
+KUBECTL_API_RESOURCES_ARGS = ("api-resources", "--namespaced=true", "--verbs=list")
+NAMESPACE_FLAG = "-n"
+OUTPUT_FLAG = "-o"
+OUTPUT_JSON = "json"
+OUTPUT_NAME = "name"
+SHOW_MANAGED_FIELDS_FLAG = "--show-managed-fields"
+EVENTS_RESOURCE = "events"
+# kubectl accepts `kind/name`; a --kind carrying one returns a single object
+# rather than a List.
+RESOURCE_NAME_SEPARATOR = "/"
+WARNING_PREFIX = "warning: "
 
 # How long an object may sit without progress before it is a stall. One default
 # for every kind, with per-kind overrides where the API itself names a horizon:
@@ -75,8 +90,16 @@ REPEATING_EVENT_MIN_COUNT = 3
 
 # managedFields operations that write spec. "Update" also covers status writes
 # by controllers, so an entry only counts when its fieldsV1 touches f:spec.
-SPEC_WRITE_OPERATIONS = frozenset({"Apply", "Update", "Create"})
+SPEC_WRITE_OPERATIONS = frozenset({"Apply", "Update"})
 SPEC_FIELD_KEY = "f:spec"
+# A Deployment with spec.paused set is not progressing on purpose, so its
+# progress conditions are not read.
+PAUSED_SPEC_KEY = "paused"
+# How a list item under status is labelled in a condition row: its own name
+# (Gateway listeners) or the name of the parent it reports on (HTTPRoute
+# status.parents[].parentRef), falling back to its index.
+LIST_ITEM_NAME_KEY = "name"
+LIST_ITEM_PARENT_REF_KEY = "parentRef"
 
 # Resources a whole-namespace scan skips. Events are read separately for the
 # repeating-warnings heuristic; Secrets are never fetched as objects (their
@@ -104,14 +127,16 @@ VOLUME_REFERENCE_KEYS: dict[str, tuple[str, str]] = {
     "persistentVolumeClaim": ("PersistentVolumeClaim", "claimName"),
 }
 # The kubectl resource name each referent kind resolves through. A reference
-# to a kind not listed here is left alone rather than reported missing.
+# to a kind not listed here is left alone rather than reported missing, and so
+# is a kind the identity cannot list: on the default read-only permission set
+# the Cluster Agent cannot list Secrets, so Secret-typed references go
+# unchecked there and a warning says so.
 REFERENT_RESOURCES: dict[str, str] = {
     "Secret": "secrets",
     "ConfigMap": "configmaps",
     "Service": "services",
     "Gateway": "gateways.gateway.networking.k8s.io",
     "PersistentVolumeClaim": "persistentvolumeclaims",
-    "ServiceAccount": "serviceaccounts",
 }
 
 # Object kinds a scan never evaluates: Secrets are never fetched as objects
@@ -132,6 +157,10 @@ SECONDS_PER_MINUTE = 60
 SECONDS_PER_HOUR = 3600
 SECONDS_PER_DAY = 86400
 
+ZULU_SUFFIX = "Z"
+UTC_OFFSET = "+00:00"
+UNKNOWN_LABEL = "?"
+
 EXIT_OK = 0
 EXIT_ERROR = 2
 
@@ -150,6 +179,12 @@ def run_kubectl(args: list[str]) -> tuple[int, str, str]:
     return res.returncode, res.stdout, res.stderr
 
 
+def warn_lines(stderr: str) -> None:
+    for line in stderr.splitlines():
+        if line.strip():
+            sys.stderr.write(f"{WARNING_PREFIX}{line}\n")
+
+
 def kubectl_json(args: list[str]) -> dict:
     """Run `kubectl ... -o json` and parse it.
 
@@ -157,10 +192,8 @@ def kubectl_json(args: list[str]) -> dict:
     could read when one of them fails, exiting non-zero. Parseable output wins
     and the failure is a warning; only unparseable output is an error.
     """
-    rc, stdout, stderr = run_kubectl([*args, "-o", "json"])
-    for line in stderr.splitlines():
-        if line.strip():
-            sys.stderr.write(f"warning: {line}\n")
+    rc, stdout, stderr = run_kubectl([*args, OUTPUT_FLAG, OUTPUT_JSON])
+    warn_lines(stderr)
     if not stdout.strip():
         if rc != 0:
             raise RuntimeError(f"kubectl {' '.join(args)} failed ({rc}): {stderr.strip()}")
@@ -177,19 +210,30 @@ def kubectl_names(resource: str, namespace: str) -> set[str] | None:
     `-o name` carries no object bodies, which is what keeps Secret contents
     out of this script.
     """
-    rc, stdout, stderr = run_kubectl(["get", resource, "-n", namespace, "-o", "name"])
+    rc, stdout, stderr = run_kubectl(
+        [KUBECTL_GET, resource, NAMESPACE_FLAG, namespace, OUTPUT_FLAG, OUTPUT_NAME]
+    )
     if rc != 0:
-        sys.stderr.write(f"warning: cannot list {resource} in {namespace}: {stderr.strip()}\n")
+        sys.stderr.write(
+            f"{WARNING_PREFIX}cannot list {resource} in {namespace}; references to "
+            f"{resource} are not checked: {stderr.strip()}\n"
+        )
         return None
-    return {line.split("/", 1)[-1] for line in stdout.splitlines() if line.strip()}
+    return {
+        line.split(RESOURCE_NAME_SEPARATOR, 1)[-1] for line in stdout.splitlines() if line.strip()
+    }
 
 
 def namespaced_resources() -> list[str]:
-    """Every listable namespaced resource, minus the scan exclusions."""
-    rc, stdout, stderr = run_kubectl(
-        ["api-resources", "--namespaced=true", "--verbs=list", "-o", "name"]
-    )
-    if rc != 0:
+    """Every listable namespaced resource, minus the scan exclusions.
+
+    kubectl api-resources prints the full list and still exits non-zero when
+    one aggregated API is unavailable; that is a warning, and only an empty
+    listing is an error.
+    """
+    rc, stdout, stderr = run_kubectl([*KUBECTL_API_RESOURCES_ARGS, OUTPUT_FLAG, OUTPUT_NAME])
+    warn_lines(stderr)
+    if not stdout.strip():
         raise RuntimeError(f"kubectl api-resources failed ({rc}): {stderr.strip()}")
     resources = []
     for line in stdout.splitlines():
@@ -233,7 +277,7 @@ def parse_time(value) -> datetime | None:
     """Parse a Kubernetes RFC 3339 timestamp; None when absent or malformed."""
     if not value or not isinstance(value, str):
         return None
-    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    text = value[:-1] + UTC_OFFSET if value.endswith(ZULU_SUFFIX) else value
     try:
         parsed = datetime.fromisoformat(text)
     except ValueError:
@@ -288,7 +332,9 @@ def threshold_for(kind: str, override_minutes: int | None) -> timedelta:
 
 
 def object_label(obj: dict) -> str:
-    return f"{obj.get('kind', '?')}/{(obj.get('metadata') or {}).get('name', '?')}"
+    kind = obj.get("kind", UNKNOWN_LABEL)
+    name = (obj.get("metadata") or {}).get("name", UNKNOWN_LABEL)
+    return f"{kind}{RESOURCE_NAME_SEPARATOR}{name}"
 
 
 def finding(obj: dict, heuristic: str, detail: str, stalled: timedelta) -> dict:
@@ -337,16 +383,26 @@ def iter_conditions(node, path: str = ""):
                 yield from iter_conditions(value, f"{path}.{key}" if path else key)
     elif isinstance(node, list):
         for index, item in enumerate(node):
-            name = item.get("name") if isinstance(item, dict) else None
-            label = f"{path}[{name if name else index}]"
-            yield from iter_conditions(item, label)
+            yield from iter_conditions(item, f"{path}[{list_item_label(item, index)}]")
+
+
+def list_item_label(item, index: int) -> str:
+    if isinstance(item, dict):
+        parent = item.get(LIST_ITEM_PARENT_REF_KEY)
+        name = item.get(LIST_ITEM_NAME_KEY) or (
+            parent.get(LIST_ITEM_NAME_KEY) if isinstance(parent, dict) else None
+        )
+        if name:
+            return str(name)
+    return str(index)
 
 
 def check_stale_conditions(obj: dict, now: datetime, threshold: timedelta) -> list[dict]:
     status = obj.get("status")
     if not isinstance(status, dict):
         return []
-    if obj.get("kind") == "Pod" and status.get("phase") in TERMINAL_POD_PHASES:
+    spec = obj.get("spec")
+    if isinstance(spec, dict) and spec.get(PAUSED_SPEC_KEY):
         return []
     findings = []
     for path, cond in iter_conditions(status):
@@ -385,7 +441,7 @@ def event_span(event: dict) -> tuple[datetime | None, datetime | None]:
 def index_events(events: list[dict]) -> dict[tuple[str, str], list[dict]]:
     by_object: dict[tuple[str, str], list[dict]] = {}
     for event in events:
-        involved = event.get("involvedObject") or event.get("regarding") or {}
+        involved = event.get("involvedObject") or {}
         key = (involved.get("kind", ""), involved.get("name", ""))
         by_object.setdefault(key, []).append(event)
     return by_object
@@ -470,6 +526,15 @@ def check_dangling_references(
     return findings
 
 
+def is_terminal_pod(obj: dict) -> bool:
+    status = obj.get("status")
+    return (
+        obj.get("kind") == "Pod"
+        and isinstance(status, dict)
+        and status.get("phase") in TERMINAL_POD_PHASES
+    )
+
+
 def analyze(
     objects: list[dict],
     events: list[dict],
@@ -482,7 +547,7 @@ def analyze(
     findings: list[dict] = []
     for obj in objects:
         kind = obj.get("kind", "")
-        if kind in SKIPPED_OBJECT_KINDS:
+        if kind in SKIPPED_OBJECT_KINDS or is_terminal_pod(obj):
             continue
         name = (obj.get("metadata") or {}).get("name", "")
         threshold = threshold_for(kind, override_minutes)
@@ -521,13 +586,12 @@ def collect(namespace: str, kinds: str | None) -> tuple[list[dict], list[dict]]:
     if not resources:
         return [], []
     listing = kubectl_json(
-        ["get", ",".join(resources), "-n", namespace, "--show-managed-fields"]
+        [KUBECTL_GET, ",".join(resources), NAMESPACE_FLAG, namespace, SHOW_MANAGED_FIELDS_FLAG]
     )
-    objects = listing.get("items") or []
-    if not isinstance(objects, list):
-        objects = [listing]
-    events = kubectl_json(["get", "events", "-n", namespace]).get("items") or []
-    return objects, events
+    # A `kind/name` in --kind returns the one object rather than a List.
+    objects = listing.get("items") if "items" in listing else [listing]
+    events = kubectl_json([KUBECTL_GET, EVENTS_RESOURCE, NAMESPACE_FLAG, namespace]).get("items")
+    return list(objects or []), list(events or [])
 
 
 def main(argv: list[str] | None = None) -> int:
