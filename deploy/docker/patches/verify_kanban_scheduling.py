@@ -1034,44 +1034,53 @@ conn.close()
 # cards it was asked to launch and starts nothing.
 #
 # Two things have to be arranged that the image cannot supply at this stage.
-# ``tools/kanban_children_settled.py`` installs several stages later, so the
-# attribution table has no writer yet and these boards create and fill it
-# themselves — the same DDL and the same column direction, asserted against that
-# module by ``test_kanban_scheduling.py``. And no Hermes profile is real inside
-# the build, so every ready card would be dropped as non-spawnable before the cap
-# was ever consulted; ``profile_exists`` is stubbed for the one assignee in use.
-# Without that stub the cap checks pass while asserting nothing, which is how the
-# first draft of this section read green against the unpatched engine.
+#
+# ``tools/kanban_children_settled.py`` installs several stages later, so nothing
+# has written the attribution table yet. Rather than hand-copy its schema, these
+# boards call its own ``record_worker_child`` — the module is beside this script
+# in the build stage's directory, so importing it here costs nothing and makes
+# this the one place the real writer is driven against the real reader. A
+# hand-copied fixture would agree with itself while the two modules drifted.
+#
+# And no Hermes profile is real inside the build, so every ready card would be
+# dropped as non-spawnable before the cap was ever consulted; ``profile_exists``
+# is stubbed for the assignee ``new_card`` uses. Without that stub the cap checks
+# pass while asserting nothing, which is how the first draft of this section read
+# green against the unpatched engine.
 print()
 print("waiting-coordinator discount:")
 
+import kanban_children_settled as _children  # noqa: E402
+
 from hermes_cli import profiles as _profiles  # noqa: E402
 
-_profiles.profile_exists = lambda name: name == "platform"
+# The assignee new_card hard-codes. Read from it rather than repeated, because a
+# stub that stops matching silently empties every board of spawnable cards.
+WAITING_ASSIGNEE = K.get_task(
+    (_probe := fresh()), new_card(_probe, "profile probe")
+).assignee
+_profiles.profile_exists = lambda name: name == WAITING_ASSIGNEE
 
-WAITING_ASSIGNEE = "platform"
 FAKE_PID = 424242
 
 
 def waiting_board():
+    """A board whose attribution table is created by the module that owns it."""
     conn = fresh()
-    conn.execute(
-        f"CREATE TABLE IF NOT EXISTS {KS.CHILDREN_TABLE} ("
-        " child_id TEXT PRIMARY KEY, creator_id TEXT NOT NULL,"
-        " created_at INTEGER NOT NULL)"
-    )
+    for ddl in _children._TABLE_DDL:
+        conn.execute(ddl)
+    conn.commit()
     return conn
 
 
 def fan_out(conn, creator, title, parents=()):
-    """A child card, attributed to ``creator`` the way a worker's create is."""
+    """A child card, attributed through the writer the worker tool calls."""
     child = new_card(conn, title, parents=parents)
-    conn.execute(
-        f"INSERT OR IGNORE INTO {KS.CHILDREN_TABLE}"
-        " (child_id, creator_id, created_at) VALUES (?, ?, ?)",
-        (child, creator, int(time.time())),
-    )
-    conn.commit()
+    if not _children.record_worker_child(conn, child, creator):
+        raise SystemExit(
+            "verify_kanban_scheduling: record_worker_child refused to attribute "
+            f"{child} to {creator}; section E would assert on an empty table."
+        )
     return child
 
 
@@ -1137,11 +1146,17 @@ check(
 # E4. A continuation is not a wait. The child is gated behind the coordinator,
 # so freeing a slot for it would free it for a card that still cannot run --
 # the same exemption kanban_children_settled applies to the completion gate.
+#
+# The unrelated card is what gives this check teeth. Without it the board holds
+# only the coordinator and a card recompute_ready cannot promote, so nothing is
+# ready to spawn and `asked == []` however the cap arithmetic came out: deleting
+# the exemption from count_waiting_on_children left all six E checks green.
 conn = waiting_board()
 coord = new_card(conn, "Fan-out with a continuation")
 K.recompute_ready(conn)
 K.claim_task(conn, coord)
 fan_out(conn, coord, "Follow-up", parents=[coord])
+new_card(conn, "Unrelated work")
 K.recompute_ready(conn)
 asked = spawns(conn, cap=1)
 check(

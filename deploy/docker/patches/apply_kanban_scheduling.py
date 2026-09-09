@@ -143,7 +143,7 @@ surfaces the protocol-violation case.
 COMPATIBILITY WITH ``apply_kanban_wake_nudge``
 
 That patch edits this same file, at ``create_task``, ``complete_task`` and
-``unblock_task``, and runs after this one. None of the six anchors here fall in
+``unblock_task``, and runs after this one. None of the seven anchors here fall in
 those functions and none of the replacement text contains any of its three
 anchor strings, so this applier neither consumes nor invalidates them.
 ``test_kanban_scheduling.py`` asserts that rather than leaving it to inspection,
@@ -170,14 +170,13 @@ import patchlib  # noqa: E402
 import kanban_children_settled as _children  # noqa: E402
 import kanban_scheduling as _scheduling  # noqa: E402
 
-for _name in ("CHILDREN_TABLE",):
-    if getattr(_scheduling, _name) != getattr(_children, _name):
-        raise SystemExit(
-            f"apply_kanban_scheduling: {_name} disagrees between "
-            f"kanban_scheduling ({getattr(_scheduling, _name)!r}) and "
-            f"kanban_children_settled ({getattr(_children, _name)!r}). "
-            "Edit 7 would count nothing. Reconcile them before building."
-        )
+if _scheduling.CHILDREN_TABLE != _children.CHILDREN_TABLE:
+    raise SystemExit(
+        "apply_kanban_scheduling: CHILDREN_TABLE disagrees between "
+        f"kanban_scheduling ({_scheduling.CHILDREN_TABLE!r}) and "
+        f"kanban_children_settled ({_children.CHILDREN_TABLE!r}). "
+        "Edit 7 would count nothing. Reconcile them before building."
+    )
 if tuple(_scheduling.CHILD_SETTLED_STATUSES) != tuple(_children.SETTLED_STATUSES):
     raise SystemExit(
         "apply_kanban_scheduling: the settled-status set disagrees between "
@@ -186,13 +185,71 @@ if tuple(_scheduling.CHILD_SETTLED_STATUSES) != tuple(_children.SETTLED_STATUSES
         "the completion gate would disagree about whether a card is waiting."
     )
 
+# The table name is not the only way the two can drift. Edit 7's SQL also names
+# two of its columns, and a rename there raises inside count_waiting_on_children,
+# is swallowed by its fail-open, and leaves the discount a constant zero -- the
+# same silent failure, through a door the name check does not cover.
+#
+# The writer's DDL is executed rather than searched, because searching it is the
+# check that looks right and is not: renaming the column in the CREATE TABLE
+# leaves the name behind in the CREATE INDEX, and a substring test waves that
+# through. sqlite answers the question exactly and costs a millisecond.
+import sqlite3  # noqa: E402
+
+_probe = sqlite3.connect(":memory:")
+try:
+    for _ddl in _children._TABLE_DDL:
+        _probe.execute(_ddl)
+except sqlite3.Error as _exc:
+    raise SystemExit(
+        "apply_kanban_scheduling: kanban_children_settled._TABLE_DDL does not "
+        f"execute ({_exc}). Edit 7 reads the table it creates."
+    ) from _exc
+_WRITER_COLUMNS = {
+    row[1] for row in _probe.execute(f"PRAGMA table_info({_children.CHILDREN_TABLE})")
+}
+_probe.close()
+
+for _column in _scheduling.CHILD_COLUMNS:
+    if _column not in _WRITER_COLUMNS:
+        raise SystemExit(
+            f"apply_kanban_scheduling: edit 7 reads column {_column!r}, which "
+            f"kanban_children_settled._TABLE_DDL does not create (it makes "
+            f"{sorted(_WRITER_COLUMNS)}). The discount would fail open to zero "
+            "on every board."
+        )
+    if _column not in _scheduling._WAITING_ON_CHILDREN_SQL:
+        raise SystemExit(
+            f"apply_kanban_scheduling: CHILD_COLUMNS names {_column!r} but edit "
+            "7's SQL does not use it, so this check is guarding nothing."
+        )
+
+# kanban_scheduling declares the settled set twice -- once as this tuple and once
+# as the SQL fragment part 2 interpolates. Only the tuple is reconciled above, so
+# tie the fragment to it here rather than leaving one of the three copies loose.
+_EXPECTED_SETTLED_SQL = "(" + ", ".join(repr(s) for s in _scheduling.CHILD_SETTLED_STATUSES) + ")"
+if _scheduling.SETTLED != _EXPECTED_SETTLED_SQL:
+    raise SystemExit(
+        f"apply_kanban_scheduling: kanban_scheduling.SETTLED ({_scheduling.SETTLED!r}) "
+        f"no longer spells CHILD_SETTLED_STATUSES ({_EXPECTED_SETTLED_SQL!r}). "
+        "The two halves of the file would disagree about what 'settled' means."
+    )
+
 RELATIVE = "hermes_cli/kanban_db.py"
 
 # Build marker the Dockerfile greps for after the breaker edits.
 BUILD_MARKER = "persisted_failures = max(failures, effective_limit)"
 
+# The same, for edit 7. Named rather than left as a literal in two places: the
+# Dockerfile greps for this exact text, and editing WAITING_PATCHED without it
+# breaks that grep with no signal in this file. test_kanban_scheduling asserts
+# the Dockerfile still greps for it.
+WAITING_BUILD_MARKER = (
+    "return max(0, running - _kanban_count_waiting_on_children(conn))"
+)
+
 # Written by every successful apply and by nothing else. Checked before any
-# edit, because three of the six anchors survive their own replacement (the
+# edit, because three of the seven anchors survive their own replacement (the
 # patched text keeps the anchor and inserts around it), so counting alone waves
 # a re-run straight through: replayed against the running gateway's kanban_db.py
 # the unguarded dependency applier exited 0 three times and left three copies of
@@ -397,7 +454,7 @@ WAITING_PATCHED = (
     "    # call sites: count_running_tasks_other_boards calls this per board and\n"
     "    # the cap is host-level. Fails open to no discount.\n"
     "    # See hermes_cli/kanban_scheduling.py (issue #1252).\n"
-    "    return max(0, running - _kanban_count_waiting_on_children(conn))\n"
+    f"    {WAITING_BUILD_MARKER}\n"
 )
 
 TRAILER = (

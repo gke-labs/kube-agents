@@ -893,10 +893,13 @@ def charge_reclaimed_cards(conn, task_ids, record_failure) -> list[str]:
 
 # Owned by ``tools/kanban_children_settled.py``, which installs several build
 # stages later. Duplicated rather than imported to keep ``hermes_cli`` off
-# ``tools``; ``apply_kanban_scheduling`` asserts both names against it at import
-# time, so a rename there fails the build instead of zeroing this count.
+# ``tools``; ``apply_kanban_scheduling`` reconciles all three names against it at
+# import time, so a rename there fails the build instead of zeroing this count.
+# The columns are listed because the SQL below names them and a rename would be
+# swallowed by the fail-open, which is the one drift the table name misses.
 CHILDREN_TABLE = "kanban_worker_children"
 CHILD_SETTLED_STATUSES = ("done", "archived")
+CHILD_COLUMNS = ("child_id", "creator_id")
 
 _WAITING_ON_CHILDREN_SQL = (
     "SELECT COUNT(*) FROM tasks t"

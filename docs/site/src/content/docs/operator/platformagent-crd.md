@@ -234,8 +234,10 @@ Sizing notes: `maxTurns` is consumed mostly by repository exploration, so scale 
 the agent has to read rather than how complex the request is. `apiMaxRetries` exists because
 Hermes' default of `3` assumes an interactive session where a human retries; a background worker
 has nobody to retry it, so a transient burst of upstream 429s or 503s simply ends the run. Raising
-`maxTurns` interacts with `maxInProgress`: a long-running worker holds its slot for the whole task
-and there are only `maxInProgress` of them, so raising one is a reason to reconsider the other.
+`maxTurns` interacts with `maxInProgress`: a worker doing the work holds its slot for the whole
+task and there are only `maxInProgress` of them, so raising one is a reason to reconsider the other.
+A coordinator waiting on work it fanned out is the exception — see
+[why dispatch is capped](#why-dispatch-is-capped-by-default).
 
 #### Why dispatch is capped by default
 

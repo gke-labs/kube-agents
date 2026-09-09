@@ -2,13 +2,15 @@
 
 Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t deploy/docker/patches
 
-Three faults in ``hermes_cli/kanban_db.py``, one quartet, one test file:
+Four faults in ``hermes_cli/kanban_db.py``, one quartet, one test file:
 
   * the self-parenting dependency deadlock (``repair_inverted_dependencies``),
   * claims fenced to a process life, and the discriminator that decides which
     reclaims cost a retry (``release_dead_foreign_claims``),
   * the breaker counter, which is a pure source rewrite and so is tested
-    through the applier alone.
+    through the applier alone,
+  * the waiting-coordinator discount (``count_waiting_on_children``), which is
+    SQL over a table another patch owns, so it is tested against a board.
 
 The dependency tests run against a miniature of the real schema and, crucially,
 against a copy of the *real* gating predicate that ``claim_task`` and
@@ -44,7 +46,10 @@ import itertools
 import json
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -73,6 +78,7 @@ import apply_kanban_scheduling
 import kanban_children_settled as children_settled
 from kanban_scheduling import (
     CHILDREN_TABLE,
+    CHILD_COLUMNS,
     CHILD_SETTLED_STATUSES,
     CLAIM_TIME_UNKNOWN,
     CONCURRENT_OWNER,
@@ -81,6 +87,7 @@ from kanban_scheduling import (
     PROCESS_DIED_IN_PLACE,
     RECLAIM_ERROR,
     RECLAIM_EVENT_KIND,
+    SETTLED,
     Reclaimed,
     charge_reclaimed_cards,
     count_waiting_on_children,
@@ -89,6 +96,7 @@ from kanban_scheduling import (
     classify_reclaim,
     find_deadlocked_children,
     process_start_time,
+    _WAITING_ON_CHILDREN_SQL,
     read_proc_start_time,
     release_dead_foreign_claims,
     repair_inverted_dependencies,
@@ -1167,7 +1175,8 @@ class FingerprintTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Part 4: the waiting-coordinator discount
+# Part 3: the waiting-coordinator discount (part 4 of kanban_scheduling.py --
+# these banners number this file's sections, not that module's)
 # ---------------------------------------------------------------------------
 
 
@@ -1290,15 +1299,126 @@ class ChildrenTableAgreementTest(unittest.TestCase):
             tuple(CHILD_SETTLED_STATUSES), tuple(children_settled.SETTLED_STATUSES)
         )
 
-    def test_the_applier_refuses_to_build_when_they_disagree(self):
-        """The check that turns a rename into a failed build, exercised for real."""
-        source = Path(apply_kanban_scheduling.__file__).read_text()
-        self.assertIn("Reconcile them before building.", source)
-        self.assertIn("CHILD_SETTLED_STATUSES", source)
+    def test_the_columns_match_the_table_the_patch_creates(self):
+        """The drift the table name misses: a rename here fails open to zero."""
+        probe = sqlite3.connect(":memory:")
+        for ddl in children_settled._TABLE_DDL:
+            probe.execute(ddl)
+        created = {
+            row[1]
+            for row in probe.execute(
+                f"PRAGMA table_info({children_settled.CHILDREN_TABLE})"
+            )
+        }
+        probe.close()
+        for column in CHILD_COLUMNS:
+            self.assertIn(column, created)
+            self.assertIn(column, _WAITING_ON_CHILDREN_SQL)
+
+    def test_the_settled_sql_fragment_spells_the_settled_tuple(self):
+        """Part 2 interpolates a third copy of the set; tie it to the other two."""
+        self.assertEqual(
+            SETTLED, "(" + ", ".join(repr(s) for s in CHILD_SETTLED_STATUSES) + ")"
+        )
+
+    def _applier_exit(self, mutate):
+        """Run the applier in a copied patch dir with one constant rewritten.
+
+        A subprocess, because the reconciliation runs at import time and this
+        process has already imported it. Asserting on the applier's own source
+        text — which is what this test did first — keeps passing when the check
+        is rewritten to compare the wrong attributes, so it proved nothing.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = Path(tmp) / "patches"
+            stage.mkdir()
+            here = Path(apply_kanban_scheduling.__file__).parent
+            for name in (
+                "apply_kanban_scheduling.py",
+                "kanban_scheduling.py",
+                "kanban_children_settled.py",
+                "patchlib.py",
+            ):
+                shutil.copy(here / name, stage / name)
+            mutate(stage)
+            target = Path(tmp) / "tree" / "hermes_cli"
+            target.mkdir(parents=True)
+            (target / "kanban_db.py").write_text(pristine())
+            return subprocess.run(
+                [sys.executable, str(stage / "apply_kanban_scheduling.py"),
+                 str(Path(tmp) / "tree")],
+                capture_output=True,
+                text=True,
+            )
+
+    def test_the_dockerfile_greps_for_the_markers_this_file_defines(self):
+        """The grep strings live in two files and nothing else ties them.
+
+        Edit 7's marker especially: the Dockerfile's copy is a literal duplicate
+        of a line inside WAITING_PATCHED, so editing the patch text silently
+        stops the build gate checking anything.
+        """
+        dockerfile = Path(apply_kanban_scheduling.__file__).parents[1] / "Dockerfile"
+        if not dockerfile.exists():  # running from an installed copy, not the repo
+            self.skipTest("Dockerfile not beside the patches")
+        text = dockerfile.read_text()
+        self.assertIn(BUILD_MARKER, text)
+        self.assertIn(apply_kanban_scheduling.WAITING_BUILD_MARKER, text)
+
+    def test_the_edit_count_matches_what_the_prose_claims(self):
+        """Seven is written into ten comments and asserted nowhere else."""
+        self.assertEqual(len(apply_kanban_scheduling.EDITS), 7)
+
+    def test_the_unmutated_applier_succeeds(self):
+        """The control. Without it the three refusals below prove nothing: an
+        applier that failed for any unrelated reason would pass all of them."""
+        result = self._applier_exit(lambda stage: None)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_the_applier_refuses_to_build_on_a_table_rename(self):
+        def rename(stage):
+            path = stage / "kanban_scheduling.py"
+            path.write_text(
+                path.read_text().replace(
+                    f'CHILDREN_TABLE = "{CHILDREN_TABLE}"',
+                    'CHILDREN_TABLE = "kanban_worker_kids"',
+                    1,
+                )
+            )
+
+        result = self._applier_exit(rename)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("CHILDREN_TABLE disagrees", result.stdout + result.stderr)
+
+    def test_the_applier_refuses_to_build_on_a_column_rename(self):
+        def rename(stage):
+            path = stage / "kanban_children_settled.py"
+            path.write_text(
+                path.read_text().replace("creator_id TEXT NOT NULL", "owner_id TEXT NOT NULL", 1)
+            )
+
+        result = self._applier_exit(rename)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("_TABLE_DDL does not execute", result.stdout + result.stderr)
+
+    def test_the_applier_refuses_to_build_on_a_settled_status_change(self):
+        def rename(stage):
+            path = stage / "kanban_children_settled.py"
+            path.write_text(
+                path.read_text().replace(
+                    'SETTLED_STATUSES = ("done", "archived")',
+                    'SETTLED_STATUSES = ("done",)',
+                    1,
+                )
+            )
+
+        result = self._applier_exit(rename)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("settled-status set disagrees", result.stdout + result.stderr)
 
 
 # ---------------------------------------------------------------------------
-# Part 3: the applier
+# Part 4: the applier
 # ---------------------------------------------------------------------------
 
 # A stand-in for block_task's dependency branch with the same indentation as
@@ -1603,7 +1723,7 @@ class WakeNudgeCompatibilityTest(unittest.TestCase):
     """``apply_kanban_wake_nudge`` rewrites the same file, immediately after.
 
     Its three ``kanban_db.py`` anchors sit in ``create_task``,
-    ``complete_task`` and ``unblock_task`` — functions none of the six edits
+    ``complete_task`` and ``unblock_task`` — functions none of the seven edits
     here touch. The coupling is invisible from either applier alone, so it is
     asserted rather than left to inspection: a future edit that widens an anchor
     into one of those functions fails here instead of in the image build.
@@ -1667,7 +1787,7 @@ class WakeNudgeCompatibilityTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Part 4: the verifier's own fixture
+# Part 5: the verifier's own fixture
 # ---------------------------------------------------------------------------
 
 VERIFIER = Path(__file__).with_name("verify_kanban_scheduling.py")
