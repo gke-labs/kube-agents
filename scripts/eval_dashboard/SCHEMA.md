@@ -249,11 +249,11 @@ what the renderer does with them.
 first two is America/Toronto ("ET"), formatted in the browser with
 `Intl.DateTimeFormat`; URL parameters stay ISO 8601 UTC.
 
-| Page          | What it is                                                                                                                                                                                                                                                              |
-| ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `index.html`  | **The Brief**: the gate's state and why, what the agent saw, what changed right before, what is being done, and the runs in the window. Healthy: the last 24 hours in numbers and the last incident.                                                                   |
+| Page          | What it is                                                                                                                                                                                                                                                         |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `index.html`  | **The Brief**: the gate's state and why, what the agent saw, what changed right before, what is being done, and the runs in the window. Healthy: the last 24 hours in numbers and the last incident.                                                               |
 | `run.html`    | **The PR view**, `run.html?build=<prow build id>`: one run, each failed gate case tagged `failing on N other PRs` / `only your PR` / `quota storm` / `unexplained` with its check reason, 30-day pass rate, transcript link and a one-line Do; a "what to do" box. |
-| `legacy.html` | The two-band page (agent trend, gate matrix, Pareto, evidence table).                                                                                                                                                                                                   |
+| `legacy.html` | The two-band page (agent trend, gate matrix, Pareto, evidence table).                                                                                                                                                                                              |
 
 The Brief and the PR view render in the browser from `brief.json` (below)
 and refetch it and `health.json` every 60 seconds. `classify.py` is the one
