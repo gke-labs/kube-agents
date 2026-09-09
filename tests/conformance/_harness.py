@@ -58,6 +58,11 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import command_policy  # noqa: E402
 import credential_proxy  # noqa: E402
 
+# The name the gateway redactor is registered under in sys.modules when a test
+# imports it by path. Distinct from the callback's own registration name so
+# the two copies never shadow each other inside one interpreter.
+GATEWAY_REDACTOR_MODULE_NAME = "kube_agents_gateway_redactor"
+
 
 @dataclass(frozen=True)
 class Source:
@@ -338,13 +343,12 @@ def gateway_redactor_module():
     import importlib.util
 
     path = path_of("gateway_redactor")
-    name = "kube_agents_gateway_redactor"
-    spec = importlib.util.spec_from_file_location(name, path)
+    spec = importlib.util.spec_from_file_location(GATEWAY_REDACTOR_MODULE_NAME, path)
     module = importlib.util.module_from_spec(spec)
     # Registered before execution, as the import system does: the module
     # declares a dataclass, and dataclasses resolve the defining module through
     # sys.modules while the class body is being processed.
-    sys.modules[name] = module
+    sys.modules[GATEWAY_REDACTOR_MODULE_NAME] = module
     spec.loader.exec_module(module)
     return module
 
