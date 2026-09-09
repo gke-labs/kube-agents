@@ -26,6 +26,14 @@ gitops-repo/
 - **Review gate:** PRs touching `**/provisioning/**`, `**/agents/**`, `**/namespaces/**`,
   `**/policy/**` require human review (see `CODEOWNERS.example` — copy to `CODEOWNERS` and fill in real
   teams when forking) + the security review gate (06 §7).
+- **Declared intent:** the `obtainability-audit` stream reads `clusters/<cluster>/provisioning/`
+  and `knowledge/` before it reports a fixed replica count, a pinned HPA or a missing
+  PodDisruptionBudget as a finding (`agents/platform/governance/obtainability_audit_sop.md` §4a).
+  A choice HCL cannot express — a workload meant to run one replica — goes in `knowledge/` as a
+  note naming `<namespace>/<Kind>/<name>` and the check slug (`single-replica`); the ledger then
+  lists it under _Declared intent_ with the file's path instead of reporting it. A Terraform
+  repository that is not this one is registered under the `context_repos` key of the agent's
+  `gitops-state` ConfigMap and is read the same way, never written to.
 - **Version pins:** kube-agents artifacts referenced from this repo are pinned to immutable SemVer
   releases — Terraform modules via
   `git::https://github.com/gke-labs/kube-agents.git//terraform/modules/<name>?ref=1.2.0`, the Helm

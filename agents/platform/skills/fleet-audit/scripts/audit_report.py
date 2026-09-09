@@ -516,6 +516,17 @@ MAX_BODY_CHARS = 65_536
 BODY_BUDGET = 60_000
 MAX_SCOPE_ROWS = 60
 MAX_DELTA_ROWS = 50
+# Rows in the ledger's `## Declared intent` table: postures a check would have
+# flagged that a linked repository declares on purpose. The table is measured
+# against the body before the findings are, so it is capped the way the delta
+# rows are — a fleet with hundreds of declared postures still publishes its
+# findings, and says how many rows it left out.
+MAX_DECLARED_ROWS = 50
+# What a `declared[]` entry must point at. A declared posture with nothing to
+# point at is a finding the worker chose not to write, so all three are
+# required: the repository and path a reviewer opens, and the lines that pin
+# the flagged property so the claim can be read off the row.
+DECLARATION_FIELDS = ("repo", "path", "excerpt")
 
 # `gh pr list` takes a limit, not a cursor. A full page means the oldest
 # remediation branches fell off the end, and a branch that reads as "no pull
@@ -1791,6 +1802,95 @@ def validate_findings(data: object, audit_id: str) -> dict:
         _require_str(
             remediation.get("note", ""), f"findings[{i}].remediation.note"
         )
+
+    # Postures a check would have flagged and a linked repository declares on
+    # purpose. Optional: a document without the key is the shape every stream
+    # wrote before declarations existed, and it validates unchanged. An entry
+    # carries a finding's four identity fields and the declaration that
+    # justifies the posture — no severity, no remediation, no id — because it
+    # is not a finding: it never enters the delta block, is never announced as
+    # new or resolved, and never becomes a pull request.
+    declared = data.get("declared")
+    if declared is not None:
+        if not isinstance(declared, list):
+            raise ValidationError(
+                "declared: must be a list when present — one entry per posture a "
+                "repository declaration justified, or omit the key"
+            )
+        seen_declared: dict[str, int] = {}
+        for i, entry in enumerate(declared):
+            where = f"declared[{i}]"
+            if not isinstance(entry, dict):
+                raise ValidationError(f"{where}: expected an object")
+            _require_str(entry.get("check"), f"{where}.check", allow_empty=False)
+            check = str(entry["check"])
+            if check not in finding_check_set:
+                # No roster, for the reason `findings[].check` gives none.
+                raise ValidationError(
+                    f"{where}.check: {check!r} is not a check in the {audit_id} "
+                    "SOP. Name checks by the backticked slug in their `####` "
+                    f"heading. {_sop_pointer(audit_id)}"
+                )
+            _require_str(entry.get("title"), f"{where}.title", allow_empty=False)
+            _require_str(entry.get("cluster"), f"{where}.cluster", allow_empty=False)
+            cluster = str(entry["cluster"])
+            if cluster not in audited_names:
+                raise ValidationError(
+                    f"{where}.cluster: {cluster!r} is not in scope.clusters. A "
+                    "declaration justifies a posture this run observed, so the "
+                    "cluster it was observed on must be one this run read"
+                )
+            _require_str(entry.get("namespace", ""), f"{where}.namespace")
+            _require_str(entry.get("object"), f"{where}.object", allow_empty=False)
+            for field in ("cluster", "object"):
+                if _id_segment(str(entry[field])) == ID_EMPTY_SEGMENT:
+                    raise ValidationError(
+                        f"{where}.{field}: {entry[field]!r} has no letter or digit "
+                        "in it, so it names nothing"
+                    )
+            declaration = entry.get("declaration")
+            if not isinstance(declaration, dict):
+                raise ValidationError(
+                    f"{where}.declaration: required object with "
+                    f"{', '.join(repr(f) for f in DECLARATION_FIELDS)} — a posture "
+                    "with no declaration to point at is a finding, not a declaration"
+                )
+            repo = declaration.get("repo")
+            if not isinstance(repo, str) or not BARE_REPO_RE.match(repo):
+                raise ValidationError(
+                    f"{where}.declaration.repo: must name the repository as "
+                    f"owner/name, got {repo!r}"
+                )
+            # Same rules as a remediation path: it is a pointer a reviewer
+            # follows into a repository, so it is repo-relative, one literal
+            # file, and nowhere near `..` or `.git`.
+            declaration["path"] = _require_repo_relative(
+                declaration.get("path"), f"{where}.declaration.path"
+            )
+            _require_str(
+                declaration.get("excerpt"),
+                f"{where}.declaration.excerpt",
+                allow_empty=False,
+            )
+            # Identity, on the same four fields as a finding, so that one
+            # posture cannot be both. A worker that writes the finding *and*
+            # the declaration has not decided, and the ledger would report the
+            # object as broken in one section and intended in the next.
+            full_id = derive_finding_id(entry)
+            if full_id in seen_ids:
+                raise ValidationError(
+                    f"{where}: same identity as findings[{seen_ids[full_id]}] — "
+                    f"check {check!r} against {entry['object']!r} in "
+                    f"{cluster!r}/{entry.get('namespace') or '(cluster)'} is "
+                    "listed as a finding and as declared. A posture is one or "
+                    "the other: if the declaration covers it, drop the finding; "
+                    "if it does not, drop the declaration"
+                )
+            if full_id in seen_declared:
+                raise ValidationError(
+                    f"{where}: same identity as declared[{seen_declared[full_id]}]"
+                )
+            seen_declared[full_id] = i
 
     return data
 
@@ -3564,6 +3664,65 @@ def _render_withheld(withheld: list[str], findings: list[dict]) -> list[str]:
     return out
 
 
+def _declared_pointer(entry: dict) -> tuple[str, str]:
+    """`(object, repo:path)` for one `declared[]` entry, ready for a code span.
+
+    Shared by the ledger table and the clean-run comment so the two never
+    name the same declaration two different ways.
+    """
+    declaration = entry.get("declaration") or {}
+    where = f"{declaration.get('repo', '')}:{declaration.get('path', '')}"
+    namespace = str(entry.get("namespace") or "").strip()
+    obj = str(entry.get("object", ""))
+    if namespace:
+        obj = f"{namespace}/{obj}"
+    return _cell(obj), _cell(where)
+
+
+def _render_declared(declared: list[dict]) -> list[str]:
+    """The postures a check would have flagged and a linked repository declares.
+
+    A section of its own rather than a fourth severity, because a finding has
+    an identity, a severity and a slot in the hidden delta block, and a
+    declared posture must have none of those: it is not news when it appears,
+    not a fix when it goes, and never a candidate for a pull request. What it
+    owes the reader is the pointer — `repo:path` and the lines that pin the
+    property — so the claim that this was intended can be checked, and
+    refuted by editing the declaration.
+    """
+    if not declared:
+        return []
+    out = [
+        "",
+        "## Declared intent",
+        "",
+        f"{len(declared)} posture(s) a check would have flagged are declared on "
+        "purpose in a linked repository, so they are not findings. Each row "
+        "names the declaration; a reviewer who disagrees with one changes or "
+        "removes the declaration, and the posture returns as a finding on the "
+        "next run.",
+        "",
+        "| Check | Cluster | Object | Declared at | Declaration |",
+        "| ----- | ------- | ------ | ----------- | ----------- |",
+    ]
+    for entry in declared[:MAX_DECLARED_ROWS]:
+        obj, where = _declared_pointer(entry)
+        excerpt = _cell(str((entry.get("declaration") or {}).get("excerpt", "")))
+        what = _cell(str(entry.get("title", "")))
+        if excerpt:
+            what = f"{what}: `{excerpt}`"
+        out.append(
+            f"| `{_cell(str(entry.get('check', '')))}` "
+            f"| `{_cell(str(entry.get('cluster', '')))}` "
+            f"| `{obj}` | `{where}` | {what} |"
+        )
+    if len(declared) > MAX_DECLARED_ROWS:
+        out.append(
+            f"| _…and {len(declared) - MAX_DECLARED_ROWS} more_ |  |  |  |  |"
+        )
+    return out
+
+
 class RenderedIssue(NamedTuple):
     """A ledger body together with what it actually managed to say.
 
@@ -3695,10 +3854,15 @@ def render_issue_body(
     fixed: list[str] = _render_header(audit_id)
     fixed += _render_scope(clusters, skipped, generated_at, audit_id)
     withheld_section = _render_withheld(list(withheld or []), findings)
+    # Measured with the fixed sections, not against what the findings leave:
+    # the table is row-capped and says what it saw, and a declaration that
+    # silently fell off the body would put the posture back in the reader's
+    # mind as unexplained.
+    declared_section = _render_declared(list(data.get("declared") or []))
 
     # Measure the footer with an empty delta block: each finding is separately
     # charged for its own id slot inside select_rendered_findings.
-    overhead = len("\n".join(fixed + withheld_section))
+    overhead = len("\n".join(fixed + declared_section + withheld_section))
     overhead += len("\n".join(_render_footer(audit_id, generated_at, [])))
     overhead += len("\n".join(["", "## Findings", "", ""])) + 400  # section chrome
     if states:
@@ -3720,11 +3884,13 @@ def render_issue_body(
     # Whatever the findings did not need. The evidence appendix is the last
     # claim on the budget, never a competitor for it — a run with 400 findings
     # publishes the findings and drops the appendix, not the reverse.
-    spent = len("\n".join(fixed + findings_lines + withheld_section + footer))
+    spent = len(
+        "\n".join(fixed + findings_lines + declared_section + withheld_section + footer)
+    )
     evidence = _render_check_evidence(clusters, audit_id, max(BODY_BUDGET - spent, 0))
 
     body = "\n".join(
-        fixed + findings_lines + withheld_section + evidence + footer
+        fixed + findings_lines + declared_section + withheld_section + evidence + footer
     )
     if len(body) > MAX_BODY_CHARS:
         raise BodyTooLargeError(
@@ -3874,6 +4040,28 @@ def render_clean_comment(
         out += [f"- {_cell(gap)}" for gap in gaps[:MAX_SCOPE_ROWS]]
         if len(gaps) > MAX_SCOPE_ROWS:
             out.append(f"- _…and {len(gaps) - MAX_SCOPE_ROWS} more_")
+
+    # A clean run closes the ledger without rewriting it, so this comment is
+    # the only place a declared posture from this run is ever published. Say
+    # what was seen and where it is declared; "0 findings" over a fleet with
+    # pinned replicas the operator never hears about is a quieter claim than
+    # the run can back.
+    declared = list(data.get("declared") or [])
+    if declared:
+        out += [
+            "",
+            f"{len(declared)} posture(s) a check would have flagged are declared "
+            "on purpose in a linked repository and were not reported as findings:",
+            "",
+        ]
+        for entry in declared[:MAX_DECLARED_ROWS]:
+            obj, where = _declared_pointer(entry)
+            out.append(
+                f"- `{_cell(str(entry.get('check', '')))}` on `{obj}` in "
+                f"`{_cell(str(entry.get('cluster', '')))}` — declared at `{where}`"
+            )
+        if len(declared) > MAX_DECLARED_ROWS:
+            out.append(f"- _…and {len(declared) - MAX_DECLARED_ROWS} more_")
     return _clip_comment("\n".join(out))
 
 
@@ -5466,6 +5654,28 @@ def _workspace_runner(
     return run_cmd(cmd, cwd=cwd, check=check)
 
 
+def context_repos() -> list[str]:
+    """The `context_repos` slugs, or an empty list when the key cannot be read.
+
+    Unreadable is not fatal at `start`: the declared-intent step is a
+    pre-report filter over an optional list, and a run that cannot read it
+    searches the GitOps clone alone and reports every unmatched posture as a
+    finding — the same outcome an install with no context repositories gets.
+    The warning is what keeps that from being silent.
+    """
+    import gitops_workspace
+
+    try:
+        return list(gitops_workspace.get_context_github_repos())
+    except Exception as exc:
+        log(
+            "WARNING: could not read context_repos from the gitops-state "
+            f"ConfigMap ({exc}); the declared-intent step searches the GitOps "
+            "clone only this run."
+        )
+        return []
+
+
 def handle_start(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
 
@@ -5517,6 +5727,15 @@ def handle_start(args: argparse.Namespace) -> None:
                 "workspace": str(root),
                 "findings_path": findings_path,
                 "pending_remediation_requests": pending,
+                # The repositories the SOP's declared-intent step reads —
+                # `context_repos` in the gitops-state ConfigMap, `owner/name`
+                # slugs. Printed here so the worker never runs `kubectl get
+                # configmap` for it, and so the list it searched is the list
+                # the harness read. Read-only by construction: this key is
+                # never merged into `managed_repos`, so nothing here can be
+                # pushed to or swept. The GitOps clone is searched regardless
+                # and is not repeated in this list unless it was registered.
+                "context_repos": context_repos(),
                 # The roster, handed over rather than left to be discovered.
                 #
                 # It is in the SOP, and the SOP is required reading, but "the
@@ -5724,6 +5943,13 @@ def _handle_finish_dry_run(audit_id: str, data: dict, now: datetime, repo: str |
     gaps = coverage_gaps(data)
     for gap in gaps:
         log(f"COVERAGE GAP: {gap}")
+
+    declared = list(data.get("declared") or [])
+    if declared:
+        log(
+            f"DECLARED: {len(declared)} posture(s) justified by a repository "
+            "declaration and not reported as findings."
+        )
 
     if not findings:
         if gaps:
