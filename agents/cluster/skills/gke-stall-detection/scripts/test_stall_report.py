@@ -5,7 +5,7 @@ import io
 import os
 import sys
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -165,9 +165,37 @@ class StaleConditions(unittest.TestCase):
         details = {r["heuristic"]: r["detail"] for r in rows}
         self.assertEqual(details["stale-condition"], "listeners[https] ResolvedRefs=False InvalidCertificateRef")
 
-    def test_finished_pod_is_skipped(self):
-        pod = obj("Pod", "job-x", status={"phase": "Succeeded", "conditions": [condition("Ready", "False", 900, "PodCompleted")]})
-        self.assertEqual(analyze([pod]), [])
+    def test_finished_pod_is_skipped_by_every_heuristic(self):
+        for phase in ("Succeeded", "Failed"):
+            pod = obj(
+                "Pod",
+                "job-x",
+                spec={"volumes": [{"name": "cfg", "configMap": {"name": "gone"}}]},
+                status={"phase": phase, "observedGeneration": 0, "conditions": [condition("Ready", "False", 900, "PodCompleted")]},
+                managed_fields=[managed(900)],
+            )
+            pod["metadata"]["generation"] = 1
+            events = [warning("Pod", "job-x", 9, first_ago=800, last_ago=1)]
+            self.assertEqual(analyze([pod], events=events, existing={("configmaps", NAMESPACE): set()}), [], phase)
+
+    def test_paused_deployment_is_not_a_stall(self):
+        dep = healthy_deployment()
+        dep["spec"]["paused"] = True
+        dep["status"]["conditions"] = [condition("Progressing", "Unknown", 600, "DeploymentPaused")]
+        self.assertEqual(analyze([dep]), [])
+
+    def test_route_parent_condition_names_the_gateway(self):
+        route = obj(
+            "HTTPRoute",
+            "web",
+            spec={},
+            status={"parents": [
+                {"parentRef": {"name": "edge"}, "conditions": [condition("Accepted", "True", 100)]},
+                {"parentRef": {"name": "shared", "namespace": "infra"}, "conditions": [condition("Accepted", "False", 100, "NotAllowedByListeners")]},
+            ]},
+        )
+        rows = analyze([route])
+        self.assertEqual([r["detail"] for r in rows], ["parents[shared] Accepted=False NotAllowedByListeners"])
 
 
 class RepeatingWarnings(unittest.TestCase):
@@ -199,7 +227,7 @@ class RepeatingWarnings(unittest.TestCase):
             "message": "m",
             "eventTime": stamp(40),
             "series": {"count": 12, "lastObservedTime": stamp(2)},
-            "regarding": {"kind": "Gateway", "name": "edge"},
+            "involvedObject": {"kind": "Gateway", "name": "edge"},
         }
         rows = analyze([gw], events=[event])
         self.assertEqual(len(rows), 1)
@@ -329,6 +357,16 @@ class Helpers(unittest.TestCase):
         with patch.object(stall_report, "run_kubectl", return_value=(0, listing, "")):
             self.assertEqual(stall_report.namespaced_resources(), ["deployments.apps", "gateways.gateway.networking.k8s.io"])
 
+    def test_namespaced_resources_keeps_a_partial_listing(self):
+        stderr = "error: unable to retrieve the complete list of server APIs: external.metrics.k8s.io/v1beta1: the server is currently unable to handle the request"
+        with patch.object(stall_report, "run_kubectl", return_value=(1, "deployments.apps\npods\n", stderr)):
+            with redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(stall_report.namespaced_resources(), ["deployments.apps", "pods"])
+        self.assertIn("warning: error: unable to retrieve", err.getvalue())
+        with patch.object(stall_report, "run_kubectl", return_value=(1, "", "forbidden")):
+            with self.assertRaises(RuntimeError):
+                stall_report.namespaced_resources()
+
     def test_kubectl_json_keeps_partial_output(self):
         partial = '{"kind":"List","items":[{"kind":"Deployment"}]}'
         with patch.object(stall_report, "run_kubectl", return_value=(1, partial, "error: the server could not find the requested resource")):
@@ -373,6 +411,13 @@ class Main(unittest.TestCase):
         with patch.object(stall_report, "collect", side_effect=RuntimeError("no cluster")):
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(stall_report.main(["--namespace", NAMESPACE]), 2)
+
+    def test_collect_wraps_a_single_object(self):
+        single = {"kind": "Deployment", "metadata": {"name": "foo"}}
+        with patch.object(stall_report, "kubectl_json", side_effect=[single, {"items": []}]):
+            objects, events = stall_report.collect(NAMESPACE, "deployments/foo")
+        self.assertEqual(objects, [single])
+        self.assertEqual(events, [])
 
     def test_collect_passes_kinds_and_managed_fields(self):
         calls = []
