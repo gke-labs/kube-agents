@@ -97,6 +97,18 @@ def render_to(tmp, data, health=None, history=None, extra_args=()):
     return root / "out"
 
 
+def strict_date_parse_page(page: pathlib.Path) -> pathlib.Path:
+    """A copy of the rendered page whose Date.parse rejects a no-colon
+    ±HHMM offset. V8 (Chrome, the only engine these tests drive) accepts
+    one; ECMA-262's date-time format does not, and the engines that follow
+    it return NaN. The copy stands in for those engines."""
+    shim = ('<script>(() => { const native = Date.parse; '
+            'Date.parse = (text) => (/[+-]\\d{4}$/.test(String(text)) ? NaN : native(text)); })();</script>')
+    copy = page.with_name(page.stem + "-strict" + page.suffix)
+    copy.write_text(page.read_text().replace("<head>", "<head>" + shim, 1))
+    return copy
+
+
 def dom_text(page: pathlib.Path, query: str = "", fragment: str = "") -> str:
     """The page's #app innerHTML after the script ran, via headless Chrome."""
     url = page.as_uri() + (f"?{query}" if query else "") + fragment
@@ -446,6 +458,18 @@ class BrowserTest(unittest.TestCase):
         query = urllib.parse.urlencode({"cases": "cluster-agent-crashloop-debug", "since": "2026-09-07 14:00:00", "until": "2026-09-08 01:00:00"})
         app = dom_text(self.index, query=query)
         self.assertIn("Mon 10:00 AM – 9:00 PM ET", app)
+
+    def test_a_no_colon_offset_in_since_scopes_the_brief_like_the_colon_form(self):
+        # 16:00+02:00 is 14:00Z and 03:00+02:00 the next day is 01:00Z: the
+        # same past window test_a_space_separated_since_is_read_as_utc opens.
+        with_colon = urllib.parse.urlencode({"cases": "cluster-agent-crashloop-debug", "since": "2026-09-07T16:00:00+02:00", "until": "2026-09-08T03:00:00+02:00"})
+        without = urllib.parse.urlencode({"cases": "cluster-agent-crashloop-debug", "since": "2026-09-07T16:00:00+0200", "until": "2026-09-08T03:00:00+0200"})
+        expected = dom_text(self.index, query=with_colon)
+        self.assertIn("Mon 10:00 AM – 9:00 PM ET", expected)
+        self.assertEqual(dom_text(self.index, query=without), expected, "in V8, which reads ±HHMM on its own")
+        strict = dom_text(strict_date_parse_page(self.index), query=without)
+        self.assertNotIn("OUTAGE · since Tue 5:00 AM ET", strict, "the parameter was dropped and the live brief rendered instead")
+        self.assertEqual(strict, expected, "in an engine that rejects ±HHMM, so parseIso must normalise it")
 
     def test_the_current_outage_opened_through_its_own_link_is_still_live(self):
         query = urllib.parse.urlencode({"cases": ",".join(CRASHLOOP_TRIO), "since": "2026-09-08T09:00:00Z"})

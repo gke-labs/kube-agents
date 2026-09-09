@@ -67,7 +67,11 @@ function parseIso(value) {
   let text = value;
   // ISO 8601 with a space separator is what fromisoformat reads as UTC too.
   if (/^\d{4}-\d{2}-\d{2} \d/.test(text)) text = text.replace(" ", "T");
-  if (text.includes("T") && !/(?:[zZ]|[+-]\d\d:?\d\d)$/.test(text)) text += "Z";
+  // ECMA-262's date-time format wants the colon in the offset; a bare
+  // ±HHMM (which isoParamRe and fromisoformat both admit) parses in V8
+  // and not elsewhere, so it is normalised before Date.parse sees it.
+  if (text.includes("T")) text = text.replace(/([+-]\d\d)(\d\d)$/, "$1:$2");
+  if (text.includes("T") && !/(?:[zZ]|[+-]\d\d:\d\d)$/.test(text)) text += "Z";
   const ms = Date.parse(text);
   return Number.isNaN(ms) ? null : ms;
 }
