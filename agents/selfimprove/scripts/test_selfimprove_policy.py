@@ -188,6 +188,14 @@ REFUSED = [
     (["gh", "pr", "lock", "123"], "selfimprove.no-merge-or-approve"),
     (["gh", "pr", "unlock", "123"], "selfimprove.no-merge-or-approve"),
     (["gh", "pr", "merge", "--repo", "gke-labs/kube-agents", "1"], "selfimprove.no-merge-or-approve"),
+    # The same commands behind a flag cluster. Cobra's command lookup never
+    # consumes the element after a token of three or more characters, so `pr
+    # merge` is found behind `-dm` and runs with `--delete-branch --merge`.
+    # `policy_match_text` used to drop the word after the cluster's `-m` as
+    # prose, and the text this rule read had no `pr`, or no `merge`, in it.
+    (["gh", "-dm", "pr", "merge", "1"], "selfimprove.no-merge-or-approve"),
+    (["gh", "pr", "-dm", "merge", "1"], "selfimprove.no-merge-or-approve"),
+    (["gh", "-dt", "release", "create", "v1.2.3"], "selfimprove.no-merge-or-approve"),
     (["gh", "release", "create", "v1.2.3"], "selfimprove.no-merge-or-approve"),
     (["gh", "secret", "set", "TOKEN"], "selfimprove.no-merge-or-approve"),
     (["gh", "variable", "set", "X"], "selfimprove.no-merge-or-approve"),
@@ -452,6 +460,11 @@ PERMITTED = [
     ["git", "switch", "-c", "selfimprove/errors-close-handle"],
     ["git", "commit", "-m", "fix: the credential fill path never closes"],
     ["git", "commit", "-m", "fix(auth): gh auth token is printed to stdout"],
+    # The clustered spelling of the same commit. The message after `-am` is
+    # prose and is dropped before the rules read it, the same as after `-m`;
+    # keeping a single word after a cluster (the `-dm` cases in REFUSED) must
+    # not start refusing a message with `gh pr merge` in it.
+    ["git", "commit", "-am", "fix: refuse gh pr merge behind a flag cluster"],
     ["git", "push", "-u", "fork", "HEAD"],
     ["git", "diff", "--stat"],
     # The allow-list has to leave the loop's own gh surface alone, including the

@@ -1267,10 +1267,13 @@ def _cluster_readings(token: str) -> tuple[list[str], bool]:
     flag. A cluster's free-text member never carries its value in the same
     token -- unlike `-X`/`-f`/`-F`, which pflag lets share a token with their
     value, `git commit -am` and `gh auth status -at` both put the value in the
-    next argv element -- so the caller still has to skip it there, the same
-    way it already does for the detached spelling. Returning it separately
-    rather than folding it into `readings` keeps that element out of match
-    text instead of re-adding it as a bare word.
+    next argv element -- so it is the caller that deals with that element.
+    `policy_match_text` drops it when it is prose and keeps it when it is a
+    single word, since after a cluster that word can be a subcommand (the
+    reasoning is at the call site); `argv_path_violation` tests it under the
+    free-text exemption. Returning it separately rather than folding it into
+    `readings` is what lets the callers do that instead of re-adding the
+    element as a bare word.
     """
     readings: list[str] = []
     seen: set[str] = set()
@@ -1416,10 +1419,28 @@ def policy_match_text(argv: list[str]) -> str:
             if free_text_pending:
                 # The cluster's free-text member -- e.g. the `-m` in
                 # `git commit -am` -- carries its value in the next argv
-                # element, never in this token. Same guard as the detached
-                # spelling: don't swallow something that looks like a flag.
+                # element, never in this token. Two guards. The detached
+                # spelling's: don't swallow something that looks like a flag.
+                # And one the detached spelling does not need: don't swallow
+                # a single word, because after a cluster that word can be a
+                # subcommand. Cobra finds the command path with `stripFlags`
+                # (spf13/cobra, command.go), which treats a lone shorthand it
+                # does not know as value-taking and drops the element after
+                # it -- so `gh -m pr merge 1` never reaches `pr merge` -- but
+                # never a token of three or more characters. `gh -dm pr merge
+                # 1` therefore finds `pr merge`, which reads `-dm` as
+                # `--delete-branch --merge` and merges, and dropping `pr` here
+                # hid that from github.merge; `gh pr -dm merge 1` lost `merge`
+                # the same way. Prose is what this drop exists for, and the
+                # prose that trips a rule -- a body closing with "merge this
+                # PR", a commit message naming `gh auth token` -- has spaces
+                # in it; a subcommand never does. A one-word title after a
+                # cluster stays in the text and can at worst cause a visible
+                # refusal, the trade the flag guard above already makes.
                 following = argv[index + 1] if index + 1 < len(argv) else ""
-                skip_next = not following.startswith("-")
+                skip_next = not following.startswith("-") and any(
+                    char.isspace() for char in following
+                )
             continue
         tokens.append(token)
     return shlex.join(tokens)

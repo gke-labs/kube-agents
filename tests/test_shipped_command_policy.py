@@ -639,6 +639,56 @@ class TheRulesReadCommandsNotProse(ShippedPolicyTest):
             policy_match_text(["git", "clean", "-fdq", "."]),
         )
 
+    def test_a_cluster_before_a_subcommand_cannot_hide_it(self):
+        """The element after a cluster can be a subcommand, so a word stays.
+
+        Cobra finds the command path with `stripFlags` (spf13/cobra,
+        command.go), which drops the element after a lone shorthand it does
+        not know -- `gh -m pr merge 1` never reaches `pr merge` -- and never
+        the element after a token of three or more characters. So `gh -dm pr
+        merge 1` finds `pr merge`, which reads `-dm` as `--delete-branch
+        --merge` and merges. Dropping `pr` as the value of the cluster's `-m`
+        hid that from github.merge: the match text read `gh -d m -m merge 1`,
+        and nothing downstream reads a `gh` argv again.
+
+        Prose has spaces and a subcommand does not, so that is the line: a
+        multi-word value after a cluster is still dropped (the test two
+        above), a single word survives. The cost is a one-word title such as
+        `gh pr create -dt merge`, refused visibly rather than merged silently.
+        """
+        from credential_proxy import policy_match_text
+
+        for argv, expected, desc in (
+            (["gh", "-dm", "pr", "merge", "1"],
+             "github.merge", "cluster before the noun"),
+            (["gh", "pr", "-dm", "merge", "1"],
+             "github.merge", "cluster between noun and verb"),
+            (["gh", "-dt", "release", "create", "v1", "v1"],
+             "github.pipeline-trigger", "cluster hiding `release`"),
+        ):
+            with self.subTest(desc=desc):
+                rule = self.policy.blocked_by(argv)
+                self.assertIsNotNone(rule, f"{desc} slipped past: {argv}")
+                self.assertEqual(expected, rule.rule_id, desc)
+
+        self.assertEqual(
+            "gh -d m -m pr merge 1",
+            policy_match_text(["gh", "-dm", "pr", "merge", "1"]),
+        )
+        # A one-word value stays for the same reason, wherever the cluster
+        # sits -- including a cluster that is really a value, whose letters
+        # happen to spell a free-text shorthand.
+        self.assertEqual(
+            "git commit -a m -m wip",
+            policy_match_text(["git", "commit", "-am", "wip"]),
+        )
+        self.assertTrue(
+            policy_match_text(
+                ["kubectl", "get", "pods", "-nkube-system", "foo"]
+            ).endswith(" foo"),
+            "the positional after `-nkube-system` was swallowed",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
