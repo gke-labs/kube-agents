@@ -111,14 +111,10 @@ spec:
   direction: INGRESS
   sourceRanges:
     - 198.51.100.0/24
-  targetTags:
-    - ssh-bastion
-  allow:
-    - protocol: tcp
-      ports:
-        - "22"
 ```
 
-`allow` and `targetTags` are restated even though they do not change: they
-are list fields, and stating them keeps the rule's intent readable in one
-file. `priority` is omitted and stays externally managed.
+`direction` is stated as the immutable guard and `sourceRanges` is the
+change. `allow`, `targetTags` and `priority` are omitted and stay externally
+managed, so an edit a human makes to them between the `describe` and the
+merge is not overwritten. The PR body quotes the `describe` output so the
+reviewer still sees the whole rule.

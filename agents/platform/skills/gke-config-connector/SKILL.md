@@ -43,7 +43,7 @@ command policy refuses the verbs that would.
   the `gke-cluster-creation` skill.
 - **A repository whose `provisioning/` holds Terraform HCL** rather than KCC
   YAML: say so and stop. This skill authors KRM only.
-- **Kinds outside the three families in `references/`.** Other Config
+- **Kinds outside the families catalogued in `references/`.** Other Config
   Connector kinds follow the same annotations and workflow, but their
   immutable fields are not catalogued here; validate every field with
   `kubectl explain` and say in the PR body that the kind is outside the
@@ -69,20 +69,28 @@ or enabling it; state the missing piece and stop.
    `cnrm.cloud.google.com/project-id` annotation on each resource or on the
    namespace (`ConfigConnectorContext`). Copy what the siblings do.
 4. **Read access to the `cnrm.cloud.google.com` API groups** for the
-   create-versus-acquire check. The read-only ClusterRole this install ships
-   grants none, so `kubectl auth can-i` may say `no`; that is a fact to
-   report, not an absence to infer from.
+   create-versus-acquire check. Which identity answers depends on where the
+   KCC objects live: on the management cluster reached in-cluster, the
+   read-only ClusterRole the operator ships grants none of those groups, so
+   `kubectl auth can-i` says `no`; on a separate hub reached through
+   `get-credentials`, the Google service account's IAM permission set
+   decides, and the default `read-only` set's cluster-viewer role does read
+   custom resources. Either way a `no` is a fact to report, not an absence
+   to infer from.
 
 ## Workflow
 
 ### Step 1: Find the target path and its conventions
 
-Open the repository with **submit-suggestion** `prepare` (its Step 1) and
+Open the repository with **submit-suggestion** `prepare` (its Step 1). It
+needs the branch name up front, and the convention for this skill is
+`platform-agent/kcc-<kind>-<name>`, the same branch Step 5 submits on. Then
 list what is already under `provisioning/`:
 
 ```bash
 S="$HERMES_HOME"/skills/submit-suggestion/scripts/submit_suggestion.py
 SCRATCH=$(mktemp -d)
+"$S" prepare --repo "<owner>/<repo>" --branch "platform-agent/kcc-<kind>-<name>"
 "$S" list --handle "<handle>" --prefix clusters/<cluster>/provisioning
 "$S" fetch --handle "<handle>" --path clusters/<cluster>/provisioning/<sibling>.yaml --to "$SCRATCH"
 ```
@@ -123,6 +131,7 @@ gcloud compute firewall-rules describe <rule> --project <project> --format=json
 | ---------------- | --------------------- | ------------------------ | ------------------------------------------------------------------------ |
 | yes              | any                   | any                      | **Edit** that file. Touch only the fields the request needs.             |
 | no               | yes                   | yes                      | **Stop.** Something outside the repo manages it; report the object.      |
+| no               | yes                   | no                       | **Stop.** A failed or in-flight create; report its `status.conditions`.  |
 | no               | no                    | yes                      | **Acquire.** `references/acquisition.md`.                                |
 | no               | no                    | no                       | **Create.**                                                              |
 | no               | forbidden / no KCC    | unknown                  | Report what you could not read. Ask the user which it is; do not assume. |

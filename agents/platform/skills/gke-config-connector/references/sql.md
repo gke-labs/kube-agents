@@ -126,6 +126,10 @@ spec:
       pointInTimeRecoveryEnabled: true
 ```
 
-`region`, `databaseVersion`, `tier` and `diskType` are stated so a
-mismatch fails the object rather than adopting the wrong instance; the rest
-of the live configuration stays externally managed.
+`region` and `diskType` are immutable, so a mismatch fails the object
+instead of adopting the wrong instance. `databaseVersion` and `tier` are
+not: a wrong value there is enforced on the acquired instance (a
+major-version upgrade attempt, a resize with a restart), which is why both
+are copied verbatim from the user's confirmation and named in the PR body
+for the reviewer to check against the console. The rest of the live
+configuration stays externally managed.

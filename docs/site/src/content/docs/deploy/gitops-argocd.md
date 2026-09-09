@@ -161,7 +161,7 @@ The Platform Agent authors KCC manifests for this path through its [`gke-config-
 
 - **The KCC CRDs are installed on a cluster the agent's kubeconfig reaches.** Its only pre-PR validation is `kubectl explain` against those CRDs; there is no bundled schema, and the agent cannot run `kubectl apply --dry-run=server` (write RBAC it does not hold, and a verb its command policy refuses). That dry-run is the reviewer's or CI's step, and the agent says so in every PR body.
 - **The namespace it writes into is bound to a project** — through `ConfigConnectorContext` or a `cnrm.cloud.google.com/project-id` annotation on the sibling manifests, which it copies rather than choosing.
-- **Read access to the `cnrm.cloud.google.com` API groups** decides create versus acquire. The read-only ClusterRole the operator ships grants none of those groups; without them the agent reports the `Forbidden` and asks whether the resource exists instead of guessing.
+- **Read access to the `cnrm.cloud.google.com` API groups** decides create versus acquire. On the management cluster reached in-cluster, the Kubernetes ClusterRole bounds that read and grants none of those groups; on a separate hub reached through `gcloud container clusters get-credentials`, the Google service account's permission set decides instead. [Security &amp; IAM](/kube-agents/reference/security-and-iam/) is canonical for both. Where the read is refused, the agent reports the `Forbidden` and asks whether the resource exists instead of guessing.
 
 ## Make deletion hard on purpose
 
@@ -174,7 +174,7 @@ Two independent brakes give you a safe default:
 
 Together, destroying a cluster takes two deliberate acts that cannot happen by accident: a reviewed PR flipping the annotation to `delete`, and then a confirmed prune. Leave workload Applications on plain auto-prune; reserve the brakes for the path that touches cloud resources.
 
-One related note on the KCC annotation `cnrm.cloud.google.com/state-into-spec`. Under `merge`, Config Connector writes the live values of every field a manifest omits back into the object's `spec`; ArgoCD then sees an object that no longer matches git, reverts it, KCC rewrites it, and the two fight. Set it to `absent` on every KCC resource, acquired or created, so omitted fields stay externally managed and the file stays the source of truth. It is immutable once set, so it goes on the first commit; the agent's skill writes it on every manifest it authors.
+One related note on the KCC annotation `cnrm.cloud.google.com/state-into-spec`. Under `merge`, Config Connector writes the live values of every field a manifest omits back into the object's `spec`; ArgoCD then sees an object that no longer matches git and reports the Application out of sync for as long as the annotation stands, and with self-heal on it re-applies against KCC's writes. Set it to `absent` on every KCC resource, acquired or created, so omitted fields stay externally managed and the file stays the source of truth. It is immutable once set, so it goes on the first commit; the agent's skill writes it on every manifest it authors.
 
 ## Auto-merge and this pipeline
 
