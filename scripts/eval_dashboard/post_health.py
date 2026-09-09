@@ -20,6 +20,18 @@ data.json itself has stopped refreshing (`stale`), the space is told once,
 and once more when it resumes -- a silent stall would otherwise freeze the
 state and keep the digest reporting old numbers as current.
 
+Every time a reader sees is on the reader's clock: America/Toronto, written
+"7:30 AM ET", never UTC (the deep links and the state file keep ISO UTC).
+The digest hour is a Toronto hour too, and "once a day" is a Toronto day.
+
+One side effect beyond posting: on a new OUTAGE with no tracking issue --
+none in case-notes.yaml, none open under the `presubmit-gate` label naming
+the same cases -- gate_issue.py files one with the workflow's GitHub token
+(`gh api`, GH_TOKEN), the "broken" message says "Tracking #NNN", and the
+recovery comments on it. It never closes an issue. A GitHub failure is a
+warning: the message goes out with "no issue yet" and the next change asks
+again.
+
 Delivery is the Google Chat REST API with the job's service account acting
 as a Chat app: POST https://chat.googleapis.com/v1/{space}/messages with an
 OAuth token bearing the chat.bot scope (the workflow mints one with `gcloud
@@ -48,8 +60,23 @@ import tempfile
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+try:
+    from eval_dashboard import gate_issue, ghcli
+except ImportError:  # run as a script: scripts/eval_dashboard/post_health.py
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+    from eval_dashboard import gate_issue, ghcli
 
 STATE_SCHEMA_VERSION = 1
+
+# The reader's clock. Every time rendered into a message is converted here
+# and written "7:30 AM ET"; DST is zoneinfo's problem, not ours.
+DEFAULT_TZ = "America/Toronto"
+TZ_LABEL = "ET"
+LOCAL_TZ = ZoneInfo(DEFAULT_TZ)
+AM, PM = "AM", "PM"
+NOON = 12
 
 # health.json's vocabulary (scripts/eval_dashboard/health.py owns it).
 GREEN = "GREEN"
@@ -78,11 +105,12 @@ NOT_CONFIGURED = "webhook not configured: set CI_HEALTH_CHAT_SPACE (+ CI_HEALTH_
 REQUEST_TIMEOUT_S = 30
 USER_AGENT = "kube-agents-ci-health"
 
-# The digest goes out once per UTC day, on the first tick inside
-# [digest_hour:00 - window, digest_hour:00 + window]. The job runs every 15
-# minutes, so a 20-minute window always contains at least one tick and the
-# per-day marker in the state file stops the second one from repeating it.
-DEFAULT_DIGEST_HOUR = 8
+# The digest goes out once per local day (`--digest-tz`, Toronto by
+# default), on the first tick inside [digest_hour:00 - window, digest_hour:00
+# + window] local time. The job runs every 15 minutes, so a 20-minute window
+# always contains at least one tick and the per-day marker in the state file
+# (the local date) stops the second one from repeating it.
+DEFAULT_DIGEST_HOUR = 9
 DIGEST_WINDOW = timedelta(minutes=20)
 
 # Inside an OUTAGE the cause grows as more cases collapse. Each growth is
@@ -180,12 +208,18 @@ def parse_iso(value) -> datetime | None:
     return parsed.astimezone(UTC)
 
 
-def in_digest_window(now: datetime, digest_hour: int) -> bool:
-    anchor = now.replace(hour=digest_hour, minute=0, second=0, microsecond=0)
-    return anchor - DIGEST_WINDOW <= now <= anchor + DIGEST_WINDOW
+def local_date(now: datetime, tz=LOCAL_TZ) -> str:
+    """The per-day digest marker: the date on the reader's clock."""
+    return now.astimezone(tz).date().isoformat()
 
 
-def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int) -> list[str]:
+def in_digest_window(now: datetime, digest_hour: int, tz=LOCAL_TZ) -> bool:
+    local = now.astimezone(tz)
+    anchor = local.replace(hour=digest_hour, minute=0, second=0, microsecond=0)
+    return anchor - DIGEST_WINDOW <= local <= anchor + DIGEST_WINDOW
+
+
+def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=LOCAL_TZ) -> list[str]:
     """Which message kinds go out this tick.
 
     A change is a new state, a new condition within the same state (a storm
@@ -214,8 +248,7 @@ def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int) -> 
     if bool(health.get("stale")) != bool((prev or {}).get("stale")):
         kinds.append(KIND_STALE)
 
-    today = now.date().isoformat()
-    if in_digest_window(now, digest_hour) and (prev or {}).get("last_digest_date") != today:
+    if in_digest_window(now, digest_hour, tz) and (prev or {}).get("last_digest_date") != local_date(now, tz):
         kinds.append(KIND_DIGEST)
     return kinds
 
@@ -245,8 +278,21 @@ def percent(value) -> str:
     return "n/a" if value is None else f"{round(value * 100)}%"
 
 
-def hhmm(value: datetime | None) -> str:
-    return value.astimezone(UTC).strftime("%H:%M") if value else "?"
+def clock(value: datetime | None, weekday: bool = False, label: bool = True) -> str:
+    """A time on the reader's clock: "7:30 AM ET", "Sun 7:30 AM ET" with
+    `weekday`, and without the zone label when it ends a range whose second
+    half carries it ("1:15 PM–2:25 PM ET")."""
+    if not value:
+        return "?"
+    local = value.astimezone(LOCAL_TZ)
+    text = f"{local.hour % NOON or NOON}:{local.minute:02d} {AM if local.hour < NOON else PM}"
+    if weekday:
+        text = f"{local.strftime('%a')} {text}"
+    return f"{text} {TZ_LABEL}" if label else text
+
+
+def clock_range(start: datetime | None, end: datetime | None) -> str:
+    return f"{clock(start, label=False)}–{clock(end)}"
 
 
 def iso_z(value: datetime | None) -> str | None:
@@ -293,8 +339,17 @@ def describe_cases(cases) -> str:
     return f"{len(cases)} tests ({', '.join(cases[:CASES_NAMED_IN_FULL])} and {len(cases) - CASES_NAMED_IN_FULL} more)"
 
 
-def tracking_text(issues) -> str:
+def issue_tag(issue) -> str | None:
+    """"#1278" for an {number, url} the bot filed or found; None otherwise."""
+    number = (issue or {}).get("number") if isinstance(issue, dict) else None
+    return f"#{number}" if number else None
+
+
+def tracking_text(issues, issue=None) -> str:
     issues = list(issues or [])
+    tag = issue_tag(issue)
+    if tag and tag not in issues:
+        issues.append(tag)
     return ", ".join(issues) if issues else NO_ISSUE_TEXT
 
 
@@ -302,32 +357,32 @@ def cause_sentence(health: dict) -> str:
     """One sentence a reader can answer "is it me?" from."""
     incident = health.get("incident") or {}
     prs = len(incident.get("prs") or [])
-    since = hhmm(parse_iso(health.get("since")))
+    since = clock(parse_iso(health.get("since")))
     condition = health.get("condition")
     if condition == "shared_break":
         return (
-            f"{describe_cases(health.get('failing_cases'))} fail on every PR since {since} UTC"
+            f"{describe_cases(health.get('failing_cases'))} fail on every PR since {since}"
             f" ({prs} PRs so far). Shared test fixture, not your code."
         )
     if condition == "storm":
         start, end = parse_iso(incident.get("window_start")), parse_iso(incident.get("window_end"))
-        window = f"{hhmm(start)}–{hhmm(end)} UTC" if start and end else f"since {since} UTC"
+        window = clock_range(start, end) if start and end else f"since {since}"
         return f"quota storm {window} hit {prs} PRs."
     if condition == "setup_deaths":
-        return f"{incident.get('runs', 0)} runs on {prs} PRs died during setup since {since} UTC."
+        return f"{incident.get('runs', 0)} runs on {prs} PRs died during setup since {since}."
     return health.get("cause") or "no single cause"
 
 
-def render_change(health: dict, prev: dict | None) -> str:
+def render_change(health: dict, prev: dict | None, issue: dict | None = None) -> str:
     condition = health.get("condition")
     if health.get("state") == OUTAGE:
         lines = [
             f"🔴 *Smoke gate: broken* — {cause_sentence(health)}",
-            f"Don't retest yet. Tracking {tracking_text(health.get('tracking_issues'))}.",
+            f"Don't retest yet. Tracking {tracking_text(health.get('tracking_issues'), issue)}.",
         ]
     elif condition == "storm":
         end = parse_iso((health.get("incident") or {}).get("window_end"))
-        when = f"after {hhmm(end + STORM_COOLDOWN)} UTC" if end else "once the storm has passed"
+        when = f"after {clock(end + STORM_COOLDOWN)}" if end else "once the storm has passed"
         lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)}  Passing runs still count; if yours went red, retest {when}."]
     else:
         lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)}  Passing runs still count; if yours died before any test ran, retest."]
@@ -336,10 +391,10 @@ def render_change(health: dict, prev: dict | None) -> str:
 
 
 def render_stale(health: dict) -> str:
-    refreshed = hhmm(parse_iso(health.get("generated_at")))
+    refreshed = clock(parse_iso(health.get("generated_at")))
     if health.get("stale"):
-        return f"⚪ *Smoke gate: no fresh data since {refreshed} UTC* — the health bot can't see recent runs. Someone check the refresh job."
-    return f"⚪ *Smoke gate: fresh data again* — refreshed {refreshed} UTC; the gate reads {health.get('state', '?')}."
+        return f"⚪ *Smoke gate: no fresh data since {refreshed}* — the health bot can't see recent runs. Someone check the refresh job."
+    return f"⚪ *Smoke gate: fresh data again* — refreshed {refreshed}; the gate reads {health.get('state', '?')}."
 
 
 def short_cause(prev: dict) -> str:
@@ -357,7 +412,10 @@ def render_recovery(health: dict, prev: dict, now: datetime) -> str:
     since = parse_iso(prev.get("since"))
     lasted = duration_text(now - since) if since else "a while"
     parts = [short_cause(prev)]
-    issues = prev.get("tracking_issues") or []
+    issues = list(prev.get("tracking_issues") or [])
+    tag = issue_tag(prev.get("issue"))
+    if tag and tag not in issues:
+        issues.append(tag)
     if issues:
         parts.append(", ".join(issues))
     # No "retests running" clause: this job queues none.
@@ -384,19 +442,19 @@ def render_digest(health: dict, now: datetime) -> str:
     if health.get("stale"):
         # The window is measured from the data's horizon, so during a stall
         # these are the same numbers every morning; say so every morning.
-        lines.append(f"⚪ No fresh data since {hhmm(parse_iso(health.get('generated_at')))} UTC — these numbers stop there. Someone check the refresh job.")
+        lines.append(f"⚪ No fresh data since {clock(parse_iso(health.get('generated_at')))} — these numbers stop there. Someone check the refresh job.")
     lines.append(dashboard_link(DASHBOARD_SECTION_AGENT, health.get("failing_cases") or [], parse_iso(health.get("since"))))
     return "\n".join(lines)
 
 
-def render(kind: str, health: dict, prev: dict | None, now: datetime) -> str:
+def render(kind: str, health: dict, prev: dict | None, now: datetime, issue: dict | None = None) -> str:
     if kind == KIND_RECOVERY:
         return render_recovery(health, prev or {}, now)
     if kind == KIND_DIGEST:
         return render_digest(health, now)
     if kind == KIND_STALE:
         return render_stale(health)
-    return render_change(health, prev)
+    return render_change(health, prev, issue)
 
 
 # --------------------------------------------------------------------------- #
@@ -468,10 +526,29 @@ class Sender:
 # --------------------------------------------------------------------------- #
 
 
-def run(health: dict, prev: dict | None, now: datetime, digest_hour: int, sender: Sender, dry_run: bool) -> tuple[dict, list[tuple[str, str]], list[str]]:
-    """Decide, render, send. Returns (new state, [(kind, text)], kinds that failed)."""
-    kinds = decide(health, prev, now, digest_hour)
-    messages = [(kind, render(kind, health, prev, now)) for kind in kinds]
+def run(
+    health: dict,
+    prev: dict | None,
+    now: datetime,
+    digest_hour: int,
+    sender: Sender,
+    dry_run: bool,
+    tz=LOCAL_TZ,
+    tracker: gate_issue.Tracker | None = None,
+) -> tuple[dict, list[tuple[str, str]], list[str]]:
+    """Decide, render, send. Returns (new state, [(kind, text)], kinds that failed).
+
+    `tracker`, when given, files the tracking issue a new OUTAGE lacks
+    before the "broken" message is rendered (so it can say "Tracking #NNN")
+    and comments on it after a recovery goes out."""
+    kinds = decide(health, prev, now, digest_hour, tz)
+    before = prev or {}
+    issue = health.get("issue") or before.get("issue")
+    wants_issue = KIND_CHANGE in kinds and health.get("state") == OUTAGE and not issue and not health.get("tracking_issues")
+    if tracker is not None and wants_issue:
+        since = parse_iso(health.get("since"))
+        issue = tracker.ensure(health, now, clock(since, weekday=True), incident_link(health))
+    messages = [(kind, render(kind, health, prev, now, issue)) for kind in kinds]
     failed = []
     for kind, text in messages:
         if dry_run:
@@ -479,6 +556,9 @@ def run(health: dict, prev: dict | None, now: datetime, digest_hour: int, sender
         elif not sender.send(text):
             failed.append(kind)
     sent = [kind for kind in kinds if kind not in failed]
+    if tracker is not None and KIND_RECOVERY in sent and before.get("issue"):
+        began = parse_iso(before.get("since"))
+        tracker.recovered(before["issue"], duration_text(now - began) if began else "a while")
 
     # The state file records what the space was last TOLD, kind by kind,
     # so the next tick asks its questions -- did the state change, did a new
@@ -489,8 +569,10 @@ def run(health: dict, prev: dict | None, now: datetime, digest_hour: int, sender
     # leaves its part where it was, so the next tick re-asks exactly that
     # question: a change that failed beside a stale notice that succeeded is
     # posted next tick, and a stale flip posted mid-OUTAGE does not swallow a
-    # case that joined inside OUTAGE_REPOST_INTERVAL.
-    before = prev or {}
+    # case that joined inside OUTAGE_REPOST_INTERVAL. The tracking issue
+    # rides along while the recorded state is not GREEN and is dropped by
+    # the recovery; health.py reads it back from here (`--posted-state`)
+    # into the next health.json.
     told_state = KIND_CHANGE in sent or KIND_RECOVERY in sent
     told_stale = KIND_STALE in sent
     if prev is None:
@@ -507,6 +589,7 @@ def run(health: dict, prev: dict | None, now: datetime, digest_hour: int, sender
         "failing_cases": source.get("failing_cases") or [],
         "tracking_issues": source.get("tracking_issues") or [],
         "since": source.get("since"),
+        "issue": issue if source.get("state") not in (None, GREEN) else None,
         "stale": bool(health.get("stale")) if told_stale else bool(before.get("stale")),
         "posted_at": before.get("posted_at"),
         "last_digest_date": before.get("last_digest_date"),
@@ -515,21 +598,30 @@ def run(health: dict, prev: dict | None, now: datetime, digest_hour: int, sender
     if KIND_CHANGE in sent or KIND_RECOVERY in sent:
         state["posted_at"] = now.isoformat(timespec="seconds")
     if KIND_DIGEST in sent:
-        state["last_digest_date"] = now.date().isoformat()
+        state["last_digest_date"] = local_date(now, tz)
     return state, messages, failed
+
+
+def parse_tz(name: str):
+    try:
+        return ZoneInfo(name)
+    except (KeyError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(f"unknown time zone {name!r}") from exc
 
 
 def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--health", type=pathlib.Path, required=True, help="the health.json health.py wrote")
     parser.add_argument("--state", required=True, help="last-posted state: local path or gs:// object (this script's only write)")
-    parser.add_argument("--digest-hour", type=int, default=DEFAULT_DIGEST_HOUR, help="UTC hour of the daily digest")
+    parser.add_argument("--digest-hour", type=int, default=DEFAULT_DIGEST_HOUR, help="hour of the daily digest, in --digest-tz")
+    parser.add_argument("--digest-tz", type=parse_tz, default=LOCAL_TZ, help=f"IANA zone the digest hour and day are read in (default {DEFAULT_TZ})")
+    parser.add_argument("--repo", default=ghcli.DEFAULT_REPO, help="owner/repo the tracking issue is filed in")
     parser.add_argument("--now", help="evaluate as of this ISO 8601 time (default: now)")
-    parser.add_argument("--dry-run", action="store_true", help="print the messages instead of posting; still updates --state")
+    parser.add_argument("--dry-run", action="store_true", help="print the messages (and the issue) instead of posting; still updates --state")
     return parser.parse_args(argv)
 
 
-def main(argv=None, environ=os.environ, opener=urllib.request.urlopen, runner=subprocess.run) -> int:
+def main(argv=None, environ=os.environ, opener=urllib.request.urlopen, runner=subprocess.run, gh_runner=None) -> int:
     args = parse_args(argv)
     try:
         health = json.loads(args.health.read_text())
@@ -541,9 +633,14 @@ def main(argv=None, environ=os.environ, opener=urllib.request.urlopen, runner=su
     if not sender.configured and not args.dry_run:
         log(NOT_CONFIGURED)
         return 0
+    # The issue is filed with the workflow's token; without one (a laptop
+    # dry run, a muted job) nothing is filed and the message says so.
+    tracker = None
+    if environ.get(ghcli.TOKEN_ENV) or args.dry_run:
+        tracker = gate_issue.Tracker(ghcli.Gh(args.repo, gh_runner or runner, dry_run=args.dry_run))
 
     prev = read_state(args.state, runner)
-    state, messages, failed = run(health, prev, now, args.digest_hour, sender, args.dry_run)
+    state, messages, failed = run(health, prev, now, args.digest_hour, sender, args.dry_run, args.digest_tz, tracker)
     if prev is None and failed and len(failed) == len(messages):
         # Nothing has ever been told and nothing got through: there is no
         # state worth recording, and the next tick starts from scratch.
