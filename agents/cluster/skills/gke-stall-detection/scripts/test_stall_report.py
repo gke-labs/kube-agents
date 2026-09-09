@@ -165,6 +165,15 @@ class StaleConditions(unittest.TestCase):
         details = {r["heuristic"]: r["detail"] for r in rows}
         self.assertEqual(details["stale-condition"], "listeners[https] ResolvedRefs=False InvalidCertificateRef")
 
+    def test_epoch_transition_time_is_clamped_to_creation(self):
+        gw = obj("Gateway", "edge", spec={}, status={"conditions": [
+            {"type": "Accepted", "status": "Unknown", "reason": "Pending", "lastTransitionTime": "1970-01-01T00:00:00Z"},
+        ]}, created_minutes_ago=5)
+        self.assertEqual(analyze([gw]), [])
+        gw["metadata"]["creationTimestamp"] = stamp(40)
+        rows = analyze([gw])
+        self.assertEqual([r["stalled_for"] for r in rows], ["40m"])
+
     def test_finished_pod_is_skipped_by_every_heuristic(self):
         for phase in ("Succeeded", "Failed"):
             pod = obj(
@@ -353,7 +362,7 @@ class Helpers(unittest.TestCase):
         self.assertIsNone(stall_report.parse_time("yesterday"))
 
     def test_namespaced_resources_filters_exclusions(self):
-        listing = "deployments.apps\nevents\nevents.events.k8s.io\nsecrets\npods.metrics.k8s.io\ngateways.gateway.networking.k8s.io\n"
+        listing = "deployments.apps\nevents\nevents.events.k8s.io\nsecrets\nendpoints\npods.metrics.k8s.io\ngateways.gateway.networking.k8s.io\n"
         with patch.object(stall_report, "run_kubectl", return_value=(0, listing, "")):
             self.assertEqual(stall_report.namespaced_resources(), ["deployments.apps", "gateways.gateway.networking.k8s.io"])
 

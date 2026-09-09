@@ -104,8 +104,9 @@ LIST_ITEM_PARENT_REF_KEY = "parentRef"
 # Resources a whole-namespace scan skips. Events are read separately for the
 # repeating-warnings heuristic; Secrets are never fetched as objects (their
 # names come from `-o name` when a reference needs resolving); metrics are
-# samples, not reconciled objects.
-SCAN_EXCLUDED_RESOURCES = frozenset({"events", "events.events.k8s.io", "secrets"})
+# samples, not reconciled objects. Endpoints carry no conditions and kubectl
+# prints a deprecation warning for every read of them.
+SCAN_EXCLUDED_RESOURCES = frozenset({"events", "events.events.k8s.io", "secrets", "endpoints"})
 SCAN_EXCLUDED_GROUPS = frozenset({"metrics.k8s.io"})
 
 # Spec keys that carry a reference to another object, with the kind a reference
@@ -404,6 +405,10 @@ def check_stale_conditions(obj: dict, now: datetime, threshold: timedelta) -> li
     spec = obj.get("spec")
     if isinstance(spec, dict) and spec.get(PAUSED_SPEC_KEY):
         return []
+    # A condition cannot have transitioned before the object existed. Gateway
+    # API objects are born with Accepted/Programmed=Unknown conditions stamped
+    # with the Unix epoch, so an unclamped age would read as decades.
+    created = parse_time((obj.get("metadata") or {}).get("creationTimestamp"))
     findings = []
     for path, cond in iter_conditions(status):
         ctype = cond.get("type")
@@ -412,6 +417,8 @@ def check_stale_conditions(obj: dict, now: datetime, threshold: timedelta) -> li
         since = parse_time(cond.get("lastTransitionTime"))
         if since is None:
             continue
+        if created is not None and since < created:
+            since = created
         age = now - since
         if age < threshold:
             continue
