@@ -11,11 +11,11 @@ The shipping install path targets GKE. You'll need one working GCP project plus 
 - **`gke-gcloud-auth-plugin`** — required for `kubectl` to authenticate to GKE clusters (`gcloud components install gke-gcloud-auth-plugin` or your OS package manager). Pre-flighted by the installer (`install.sh`).
 - **Terraform** — the install engine is the [`terraform/examples/full-install`](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install) composition; the installer (`install.sh`) pre-flights `terraform` and offers to install it from HashiCorp's tap (Homebrew) or apt repository. It is equally the _teardown_ engine, and `./uninstall.sh` installs nothing on your behalf — with an install to tear down and no terraform, it refuses with exit 1, so a machine that has only ever run the installer's auto-install cannot tear the install down. (Against a target with no Terraform state there is nothing to destroy, so it exits 3 without needing terraform at all.)
 - **`kubectl`** — [install](https://kubernetes.io/docs/tasks/tools/). The installer points it at the GKE cluster it creates.
-- **Docker or Podman** — required only by the operator dev workflow (`make docker-build`, `make dev-rebuild-agent`) if you rebuild container images locally. Not required for a stock install.
+- **Docker or Podman** — required for manual deployments that build images (`make -C k8s-operator docker-build`, Method 2) and the local development workflow (`make dev-rebuild-agent`, Method 3). Not required for stock installs (Methods 0 & 1).
 - **Go** — required only for development workflows (running tests, building binaries, bootstrapping `controller-gen`/`kustomize` for Method 2). Not required for stock installs.
 - **Bash** — the installer scripts are bash (including the `/bin/bash` macOS ships).
 - **`jq`, `gh`, `helm`, `git`** — the rest of the CLI set the installer pre-flights up front and offers to install when missing.
-- **`gcloud beta` component** — required only when configuring Google Chat integration (`gcloud beta services identity create`).
+- **`gcloud beta` component** — required when adopting an existing unencrypted cluster for CMEK (`gcloud beta services identity create`) or purging backup plans during teardown (`gcloud beta container backup-restore`). Not required for standard fresh installs.
 - **`envsubst`** — only for the development Kustomize path (`make -C k8s-operator deploy-*`); usually shipped with `gettext`.
 
 ## GCP project

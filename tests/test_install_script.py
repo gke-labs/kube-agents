@@ -18,6 +18,7 @@ from tests.testing.common import (
     INVALID_IMMUTABLE_REFS,
     MOCK_GOOGLE_CHAT_MODE,
     VALID_IMMUTABLE_REFS,
+    create_minimal_tools_bin,
     create_mock_git_repo,
     get_isolated_test_env,
 )
@@ -2111,6 +2112,153 @@ class PrerequisiteToolsListTest(unittest.TestCase):
             r"for tool in [^\n]*gke-gcloud-auth-plugin",
             "install.sh must pre-flight gke-gcloud-auth-plugin in its prerequisite tool check loop",
         )
+
+
+class AutoInstallToolTest(unittest.TestCase):
+    """Verifies that install.sh auto_install_tool handles various tool installation paths and flags."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self._empty_install_env = pathlib.Path(tmp.name) / "install.env"
+        self._empty_install_env.write_text("")
+
+    def _run_func(self, func_call, env=None, bin_dir=None, strict_path=False):
+        setup = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
+{func_call}
+"""
+        overrides = {"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}
+        overrides.update(env or {})
+        full_env = get_isolated_test_env(overrides=overrides, bin_dir=bin_dir)
+        if strict_path and bin_dir:
+            full_env["PATH"] = str(bin_dir)
+        return subprocess.run(
+            ["bash", "-c", setup],
+            capture_output=True,
+            text=True,
+            env=full_env,
+            cwd=str(_REPO_ROOT),
+        )
+
+    def test_dry_run_refuses_auto_install(self):
+        proc = self._run_func(
+            "PARAM_DRY_RUN=true auto_install_tool gke-gcloud-auth-plugin"
+        )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("Dry-run validation will not install missing tools", proc.stderr + proc.stdout)
+
+    def test_auto_install_via_brew_runs_gcloud_component_install(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            bin_dir = create_minimal_tools_bin(tmp_path)
+            log_file = tmp_path / "calls.log"
+
+            brew_bin = bin_dir / "brew"
+            brew_bin.write_text(f"#!/bin/bash\nprintf 'brew %s\\n' \"$*\" >> '{log_file}'\nexit 0\n")
+            brew_bin.chmod(brew_bin.stat().st_mode | stat.S_IEXEC)
+
+            plugin_path = bin_dir / "gke-gcloud-auth-plugin"
+            gcloud_bin = bin_dir / "gcloud"
+            gcloud_bin.write_text(
+                f"#!/bin/bash\n"
+                f"printf 'gcloud %s\\n' \"$*\" >> '{log_file}'\n"
+                f"if [ \"$1\" = \"components\" ] && [ \"$2\" = \"install\" ] && [ \"$3\" = \"gke-gcloud-auth-plugin\" ]; then\n"
+                f"  printf '#!/bin/bash\\nexit 0\\n' > '{plugin_path}'\n"
+                f"  chmod +x '{plugin_path}'\n"
+                f"fi\n"
+                f"exit 0\n"
+            )
+            gcloud_bin.chmod(gcloud_bin.stat().st_mode | stat.S_IEXEC)
+
+            proc = self._run_func(
+                "PARAM_NON_INTERACTIVE=true auto_install_tool gke-gcloud-auth-plugin",
+                bin_dir=str(bin_dir),
+                strict_path=True,
+            )
+            self.assertEqual(proc.returncode, 0, f"Failed: {proc.stdout}\n{proc.stderr}")
+            self.assertIn("installed successfully", proc.stdout)
+            logged = log_file.read_text()
+            self.assertIn("gcloud components install gke-gcloud-auth-plugin -q", logged)
+
+    def test_auto_install_via_apt_installs_package(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            bin_dir = create_minimal_tools_bin(tmp_path)
+            log_file = tmp_path / "calls.log"
+
+            plugin_path = bin_dir / "gke-gcloud-auth-plugin"
+            apt_bin = bin_dir / "apt-get"
+            apt_bin.write_text(
+                f"#!/bin/bash\n"
+                f"printf 'apt-get %s\\n' \"$*\" >> '{log_file}'\n"
+                f"if [ \"$1\" = \"install\" ] && [ \"$2\" = \"-y\" ] && [ \"$3\" = \"google-cloud-cli-gke-gcloud-auth-plugin\" ]; then\n"
+                f"  printf '#!/bin/bash\\nexit 0\\n' > '{plugin_path}'\n"
+                f"  chmod +x '{plugin_path}'\n"
+                f"fi\n"
+                f"exit 0\n"
+            )
+            apt_bin.chmod(apt_bin.stat().st_mode | stat.S_IEXEC)
+
+            sudo_bin = bin_dir / "sudo"
+            sudo_bin.write_text('#!/bin/bash\nexec "$@"\n')
+            sudo_bin.chmod(sudo_bin.stat().st_mode | stat.S_IEXEC)
+
+            proc = self._run_func(
+                "PARAM_NON_INTERACTIVE=true auto_install_tool gke-gcloud-auth-plugin",
+                bin_dir=str(bin_dir),
+                strict_path=True,
+            )
+            self.assertEqual(proc.returncode, 0, f"Failed: {proc.stdout}\n{proc.stderr}")
+            self.assertIn("installed successfully", proc.stdout)
+            logged = log_file.read_text()
+            self.assertIn("apt-get install -y google-cloud-cli-gke-gcloud-auth-plugin", logged)
+
+    def test_auto_install_bare_gcloud_installs_component(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            bin_dir = create_minimal_tools_bin(tmp_path)
+            log_file = tmp_path / "calls.log"
+
+            plugin_path = bin_dir / "gke-gcloud-auth-plugin"
+            gcloud_bin = bin_dir / "gcloud"
+            gcloud_bin.write_text(
+                f"#!/bin/bash\n"
+                f"printf 'gcloud %s\\n' \"$*\" >> '{log_file}'\n"
+                f"if [ \"$1\" = \"components\" ] && [ \"$2\" = \"install\" ] && [ \"$3\" = \"gke-gcloud-auth-plugin\" ]; then\n"
+                f"  printf '#!/bin/bash\\nexit 0\\n' > '{plugin_path}'\n"
+                f"  chmod +x '{plugin_path}'\n"
+                f"fi\n"
+                f"exit 0\n"
+            )
+            gcloud_bin.chmod(gcloud_bin.stat().st_mode | stat.S_IEXEC)
+
+            proc = self._run_func(
+                "PARAM_NON_INTERACTIVE=true auto_install_tool gke-gcloud-auth-plugin",
+                bin_dir=str(bin_dir),
+                strict_path=True,
+            )
+            self.assertEqual(proc.returncode, 0, f"Failed: {proc.stdout}\n{proc.stderr}")
+            self.assertIn("installed successfully", proc.stdout)
+            logged = log_file.read_text()
+            self.assertIn("gcloud components install gke-gcloud-auth-plugin -q", logged)
+
+    def test_auto_install_fails_when_tool_remains_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            bin_dir = create_minimal_tools_bin(tmp_path)
+
+            gcloud_bin = bin_dir / "gcloud"
+            gcloud_bin.write_text("#!/bin/bash\nexit 0\n")
+            gcloud_bin.chmod(gcloud_bin.stat().st_mode | stat.S_IEXEC)
+
+            proc = self._run_func(
+                "PARAM_NON_INTERACTIVE=true auto_install_tool gke-gcloud-auth-plugin",
+                bin_dir=str(bin_dir),
+                strict_path=True,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("Tool 'gke-gcloud-auth-plugin' is still missing", proc.stderr + proc.stdout)
 
 
 if __name__ == "__main__":

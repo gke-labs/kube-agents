@@ -95,7 +95,7 @@ jobs:
           esac
           EOF
           chmod +x "$RUNNER_TEMP/kube-agents-test-bin/gcloud"
-          for tool in kubectl gh helm; do
+          for tool in kubectl gh helm gke-gcloud-auth-plugin; do
             printf '#!/usr/bin/env bash\nexit 0\n' > "$RUNNER_TEMP/kube-agents-test-bin/$tool"
             chmod +x "$RUNNER_TEMP/kube-agents-test-bin/$tool"
           done
