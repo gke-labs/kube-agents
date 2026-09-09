@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import unittest.mock
 import urllib.parse
 from datetime import timezone
 
@@ -486,6 +487,28 @@ class BrowserTest(unittest.TestCase):
         run_app = dom_text(render_to(pathlib.Path(self.tmp.name) / "nohist-live", self.data, health=health_doc()) / "run.html", query="build=2097282860221206528")
         self.assertIn("index.html?cases=cluster-agent-crashloop-debug", run_app)
         self.assertIn("since=2026-09-08T09%3A00%3A00Z", run_app)
+
+    def test_an_incident_without_a_start_or_a_red_run_dates_nothing_from_1969(self):
+        # normalizeHealth keeps a non-GREEN state whose `since` will not
+        # parse, and a case that never failed in the window leaves no first
+        # red run: with no anchor the merge lines are dropped, not dated
+        # from epoch zero (Dec 31, 1969 ET).
+        merges = [{"sha": "abc1234", "at": "2026-09-08T08:10:00+00:00", "title": "fix(ci): the thing", "pr": 1280}]
+        with unittest.mock.patch.object(render, "recent_merges", return_value=merges):
+            out = render_to(pathlib.Path(self.tmp.name) / "nosince", self.data, health=health_doc(since="not a time", failing_cases=["never-failed-here"]))
+            control = render_to(pathlib.Path(self.tmp.name) / "withsince", self.data, health=health_doc())
+        app = dom_text(out / "index.html")
+        self.assertIn("OUTAGE · since unknown time", app)
+        self.assertIn("What changed right before", app)
+        self.assertNotIn("Nothing merged", app)
+        self.assertNotIn("Dec 31", app)
+        self.assertNotIn("1969", app)
+        self.assertIn("no start time on record", app)
+        # The normal case still anchors on the first red run.
+        control_app = dom_text(control / "index.html")
+        self.assertIn("What changed right before", control_app)
+        self.assertNotIn("no start time on record", control_app)
+        self.assertNotIn("Dec 31", control_app)
 
     def test_the_incident_link_carries_only_what_the_parser_reads(self):
         # Sixty failing cases, one of them outside the id grammar: the

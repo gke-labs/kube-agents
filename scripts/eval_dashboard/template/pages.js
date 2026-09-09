@@ -348,6 +348,9 @@ function mergesFact(inc, inWindow) {
   if (!Array.isArray(brief.merges)) return null;
   const firstRed = inWindow.find((r) => gateFailures(r).some((c) => inc.cases.includes(c)));
   const firstRedMs = firstRed ? runFinish(firstRed) : inc.sinceMs;
+  // No red run in the window and no parseable `since`: nothing anchors
+  // "before", so the line is dropped rather than dated from epoch zero.
+  if (firstRedMs == null) return null;
   const greensBefore = runs().filter((r) => isGreen(r) && measured(r) && runFinish(r) < firstRedMs).sort((a, b) => runFinish(a) - runFinish(b));
   const fromMs = greensBefore.length ? runFinish(greensBefore[greensBefore.length - 1]) : firstRedMs - PAGE.mergesLookbackMs;
   const merges = brief.merges.filter((m) => { const at = parseIso(m.at); return at != null && at >= fromMs && at <= firstRedMs; });
@@ -460,6 +463,10 @@ function changedBeforeHtml(inc, inWindow) {
   if (!Array.isArray(brief.merges)) return "";
   const firstRed = inWindow.find((r) => isBreak(inc) ? gateFailures(r).some((c) => inc.cases.includes(c)) : (inc.condition === "setup_deaths" ? r.setup_death : (r.storm_reps || 0) > 0));
   const firstRedMs = firstRed ? runFinish(firstRed) : inc.sinceMs;
+  if (firstRedMs == null) {
+    // Same anchor as mergesFact: without it there is no "before" to show.
+    return `<div class="sec"><h2>What changed right before</h2><p class="mut">The incident has no start time on record and no red run in this window, so the merges before it cannot be picked out.</p></div>`;
+  }
   const fromMs = firstRedMs - PAGE.mergesLookbackMs;
   const merges = brief.merges.filter((m) => { const at = parseIso(m.at); return at != null && at >= fromMs && at <= firstRedMs; });
   const body = merges.length
