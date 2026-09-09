@@ -30,24 +30,21 @@ also a hand-pushable redeploy trigger.
 
 ## Release cadence
 
-Two of the three steps above the candidate build run on a schedule; the GA release is started by
-hand. This is `main` as it runs today. Open pull request
-[#1325](https://github.com/gke-labs/kube-agents/pull/1325) adds a weekly cron for the GA step; when
-it merges, this section changes with it.
+The RC pipeline and the nightly staging promotion run on a schedule; the GA release is started by
+hand. This is `main` as it runs today.
 
-| Step                        | When it runs                                                                                                                 | Workflow                                                                                                                          |
-| :-------------------------- | :--------------------------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------- |
-| RC selection and validation | Every three hours (`17 */3 * * *`, UTC). Dispatches nothing when the newest candidate has already been tried.                | `rc-scheduler.yml` starts `rc-release-pipeline.yml`, which pushes the `rc_*` and `rc_*_validated` tags.                           |
-| Staging promotion           | Daily at 02:17 UTC (`17 2 * * *`), against the newest validated candidate. One already promoted is re-tested, not re-tagged. | `nightly-scheduler.yml` starts `nightly-pipeline.yml`, which pushes the `staging_<ts>_<sha>` tag when the full E2E matrix passes. |
-| GA release                  | When a maintainer dispatches it. `release-publish.yml` has no `schedule:`.                                                   | `release-publish.yml`, run as described under [Cutting a GA release](#cutting-a-ga-release).                                      |
+| Step                        | When it runs                                                                                                  | Workflow                                                                                                                          |
+| :-------------------------- | :------------------------------------------------------------------------------------------------------------ | :-------------------------------------------------------------------------------------------------------------------------------- |
+| RC selection and validation | Every three hours, at 17 minutes past. Dispatches nothing when the newest candidate has already been tried.   | `rc-scheduler.yml` starts `rc-release-pipeline.yml`, which pushes the `rc_*` and `rc_*_validated` tags.                           |
+| Staging promotion           | Daily at 02:17 UTC, against the newest validated candidate. One already promoted is re-tested, not re-tagged. | `nightly-scheduler.yml` starts `nightly-pipeline.yml`, which pushes the `staging_<ts>_<sha>` tag when the full E2E matrix passes. |
+| GA release                  | When a maintainer dispatches it; `release-publish.yml` has no `schedule:`.                                    | `release-publish.yml`, run as described under [Cutting a GA release](#cutting-a-ga-release).                                      |
 
 Scheduled runs start when GitHub's scheduler picks them up, so the minute is a floor, not a
-promise. Nothing on `main` today publishes a GA release unattended: one ships when a maintainer
-dispatches the workflow, and by default it releases the newest staging-promoted commit. The latest
-GA tag is `0.4.0`, cut from a staging-promoted commit. The gate that decides whether a dispatch
-publishes, and that a cron tick will run through once #1325 lands, is described in
+promise. A GA release ships when a maintainer dispatches the workflow, and by default it releases
+the newest staging-promoted commit. The gate that decides whether a dispatch publishes, and how
+the two schedulers pick a candidate, are described in
 [`scripts/release/README.md`](https://github.com/gke-labs/kube-agents/tree/main/scripts/release),
-which is canonical for it.
+which is canonical for both.
 
 ### What the next release contains
 
@@ -57,12 +54,14 @@ Every GA release is created with `gh release create --generate-notes`
 (`scripts/release/publish_github_release.sh`), so GitHub writes the notes from the pull requests
 merged between the previous release tag and the new one, grouped under the label categories in
 `.github/release.yml`: features, bug fixes, security, documentation, infrastructure, and a
-catch-all for anything else, with Dependabot's pull requests left out. Read them on
+catch-all for anything else. Dependabot's pull requests, and any labelled `duplicate`, `invalid`
+or `wontfix`, are left out. Read them on
 [the releases page](https://github.com/gke-labs/kube-agents/releases) once the release exists.
 
-Before it exists, the next release is whatever has merged since the latest GA tag:
+Before it exists, the next release is whatever has merged since the latest GA tag, which
+[the latest release](https://github.com/gke-labs/kube-agents/releases/latest) names:
 
-- [`0.4.0...main`](https://github.com/gke-labs/kube-agents/compare/0.4.0...main) lists every pull
+- `https://github.com/gke-labs/kube-agents/compare/<LATEST_GA_TAG>...main` lists every pull
   request the next release will contain if it is cut from the tip of `main`. The GA tag sits on a
   stamped commit whose parent is the released candidate, so the three-dot compare starts from that
   candidate.
@@ -129,7 +128,7 @@ ship — behind a `schedule_gate` input that defaults to `bypass`, so a dispatch
 it did before. `dry-run` reports the verdict in the job summary and publishes nothing; `evaluate`
 acts on it, as a cron tick would.
 [`scripts/release/README.md`](https://github.com/gke-labs/kube-agents/tree/main/scripts/release) is
-canonical for that gate and for the cadence.
+canonical for that gate; [Release cadence](#release-cadence) above states when each step runs.
 
 ## Emergency hotfix runbook
 
