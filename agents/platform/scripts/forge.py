@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
-"""forge.py — the five forge operations this harness needs, behind one seam.
+"""forge.py — the forge operations this harness needs, behind one seam.
 
 Staged into `$HERMES_HOME/scripts` by the entrypoint's step 2b force-sync, so
 every skill script on the Platform Agent's `sys.path` can import it.
 
 What this is for
 ----------------
-Reading and answering a pull-request conversation needs exactly five things from
-a code-hosting service: who am I, which pull requests are open, what has been
-said on one, say something back, and acknowledge that a request was seen. Those
-five are the whole forge-shaped surface of the feature; everything above them —
-what counts as addressing the agent, who is allowed to, when a request has
-already been answered — is harness policy that does not change between forges.
+Reading and answering a pull-request conversation needs a handful of things from
+a code-hosting service, and the first seven methods of `ForgeProvider` below are
+the whole list: can I reach it, who am I, which pull requests are open, what has
+been said on one, what has landed on one, say something back, and acknowledge
+that a request was seen. Opening a change adds three more — create, update, and
+read back the pull request for a branch — which `submit-suggestion` needs and
+used to get by shelling `gh` itself at three call sites.
+
+Everything above those — what counts as addressing the agent, who is allowed to,
+when a request has already been answered, whether an existing pull request is a
+conflict or a resubmission — is harness policy that does not change between
+forges. The protocol grows one migrated consumer at a time rather than by
+copying an API surface; `docs/designs/multi-forge-support.md` §4 says why, and
+names the two consumers still to come (`audit_report.py`, `resolver.py`).
 
 Splitting the two here is what makes a second forge a new class rather than a
 second copy of the sweep. It is *not* a claim that a second forge is cheap:
@@ -27,7 +35,7 @@ no GitHub token: `gh` is proxied to the credential sidecar, which is also why
 `ALLOWED_EXECUTABLES` is a closed list. Bitbucket has no comparable CLI, so a
 Bitbucket provider cannot shell anything at all — it needs a `/v1/<forge>/…`
 route on that sidecar. Funnelling every call through one override point means
-that provider replaces one method instead of reimplementing five.
+that provider replaces one method instead of reimplementing all of them.
 
 Three normalisations, and the forge that forced each
 ----------------------------------------------------
@@ -54,12 +62,18 @@ Three normalisations, and the forge that forced each
 
 On the repository parser
 ------------------------
-`_parse_repo` validates and normalizes repository slugs (`owner/repo`). `test_forge.py` verifies repository slug resolution.
+There is no longer one here. `repo_ref.py` parses every repository value this
+harness sees, and this module is one of its callers — see `provider_for`. The
+copy that used to live here read a configured `SETTINGS.md` line, which #504
+removed; it outlived its caller by a release, along with the parity test that
+held it level with a `resolver.py` function that is also gone.
 
-A second parser, `github_token_refresh.github_repo_from_remote`, reads the git
-remote rather than a configured value and rejects a non-GitHub host outright.
-Its host set carries `ssh.github.com` — GitHub's SSH-over-443 endpoint, which
-appears in a clone URL — so a remote of that form resolves there and not here.
+`github_token_refresh.github_repo_from_remote` reads the git remote rather than
+a configured value, and it now asks `repo_ref` the same question this module
+does. What separates the two is the host set each accepts, both declared in
+`repo_ref`: a remote may carry any of `GITHUB_HOSTS`, including
+`ssh.github.com`, GitHub's SSH-over-443 endpoint, which appears in a clone URL
+and nowhere a repository is configured.
 """
 
 from __future__ import annotations
@@ -72,6 +86,7 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional, Protocol, Sequence
 
+import repo_ref
 import sandbox_exec
 from github_token_refresh import (
     GH_MISSING_RC,
@@ -82,8 +97,6 @@ from github_token_refresh import (
 )
 
 LOGGER = logging.getLogger(__name__)
-
-SETTINGS_PATH = "/opt/data/SETTINGS.md"
 
 #: How long any single `gh` call may take. A hung proxy must not hold the cron
 #: tick's per-job lock open indefinitely.
@@ -113,20 +126,6 @@ AGENT_BRANCH_PREFIX = "platform-agent/"
 #: `github-issue-resolver` already honours on issues.
 IGNORE_LABEL = "agent:ignore"
 
-#: The operator writes this literal when no GitOps repo is configured
-#: (`buildSettingsConfigMap` in `platformagent_manifests.go`). It means absent,
-#: not malformed — a distinction the two callers branch on differently.
-SETTINGS_REPO_UNSET = "none"
-
-# Host must sit at the *start* of the value, after an optional scheme and
-# optional userinfo. Copied from resolver.py, whose comment explains why the
-# obvious spellings admit `https://evil.com/github.com/attacker/repo`.
-REPO_URL_RE = re.compile(
-    r"^(?:(?:https?|git|ssh)://)?(?:[^/@]+@)?(?:www\.)?github\.com[/:]"
-    r"([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)"
-)
-BARE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-
 #: `permission` values from `repos/{repo}/collaborators/{user}/permission` that
 #: carry the standing to direct the agent. GitHub collapses the `maintain` and
 #: `triage` roles into this legacy field, so `maintain` arrives as `write` and
@@ -147,6 +146,33 @@ VIEWER_RE = re.compile(r"Logged in to \S+ account (\S+)")
 #: retried even for read-only queries.
 DEFINITIVE_HTTP_STATUS_RE = re.compile(r"HTTP (?:401|403|404)\b", re.IGNORECASE)
 
+#: Reason code for a repository whose host has no provider registered. Named
+#: here beside the other operator-facing strings rather than inline in
+#: `UnknownForgeHost`, the way `RepoUnparseable` takes
+#: `repo_ref.REASON_UNPARSEABLE`. `_forge_warning` renders it verbatim.
+REASON_HOST_UNSUPPORTED = "FORGE_HOST_UNSUPPORTED"
+
+#: Reason code for "this branch already has an open change". Not an error to
+#: every caller: `submit-suggestion` treats it as the success case of a
+#: resubmission. See `PullRequestExists`.
+REASON_PULL_REQUEST_EXISTS = "PULL_REQUEST_EXISTS"
+
+#: Reason code for a forge that refused to open a change for a reason that is
+#: not "one is already open". Distinct from `REPO_UNREACHABLE` because by the
+#: time this can be raised the branch has just been pushed to that repository
+#: over the same credential, so the reachability reading is provably wrong and
+#: sends an operator to check the two things already known to work.
+REASON_PULL_REQUEST_REFUSED = "PULL_REQUEST_REFUSED"
+
+#: What `gh pr create` says when the branch already has an open pull request,
+#: matched case-insensitively against the merged output. Recognising the phrase
+#: is GitHub-shaped and so belongs to `GitHubProvider`; deciding that it is not
+#: a failure is harness policy and belongs to the caller.
+_PR_EXISTS_MARKER = "already exists"
+
+#: How much of a forge's complaint a `ForgeError` carries. The detail lands in
+#: a one-line operator-facing warning, so it is a line's worth and not a log.
+_DETAIL_CHARS = 200
 
 class ForgeError(Exception):
     """A fault with a machine-readable reason code.
@@ -164,15 +190,51 @@ class ForgeError(Exception):
 
 
 class RepoUnparseable(ForgeError):
-    """SETTINGS.md names a repository that could not be understood.
+    """A registered repository value that could not be understood.
 
     Distinct from absent on purpose. Configuring nothing is a supported install
     with no work to do; configuring something unreadable is a fault, and
     silence there means the watcher stops working and nobody finds out.
+
+    The parse itself lives in `repo_ref`, which raises a plain `ValueError`
+    because the credential sidecar imports it and must not import this module.
+    This is where that becomes a reason code an operator sees.
     """
 
     def __init__(self, value: str):
-        super().__init__("GIT_REPO_UNPARSEABLE", value)
+        super().__init__(repo_ref.REASON_UNPARSEABLE, value)
+
+
+class UnknownForgeHost(ForgeError):
+    """A repository on a host this harness has no provider for.
+
+    Raised rather than falling back to GitHub. The fallback is what would send
+    `gh` at a same-named GitHub repository on behalf of a GitLab URL, which is
+    a different repository belonging to somebody else.
+    """
+
+    def __init__(self, host: str):
+        super().__init__(REASON_HOST_UNSUPPORTED, host)
+
+
+class PullRequestExists(ForgeError):
+    """The head branch already has an open change.
+
+    A distinct type because it is the one forge refusal whose right handling
+    differs per caller. `submit-suggestion` gets here on every second round of
+    review feedback — the push has already landed by then, and reporting the
+    submission as failed is how the skill shipped exiting 1 for every card that
+    came back. Something opening a change for the first time would treat it as
+    a real conflict. The provider therefore reports the fact and says nothing
+    about what to do with it.
+
+    `value` is the refusal text, which for GitHub names the existing pull
+    request's URL.
+    """
+
+    def __init__(self, head: str, detail: str = ""):
+        super().__init__(REASON_PULL_REQUEST_EXISTS, detail or head)
+        self.head = head
 
 
 @dataclass(frozen=True)
@@ -249,7 +311,15 @@ class Commit:
 
 
 class ForgeProvider(Protocol):
-    """The complete forge-shaped surface of the PR-conversation feature."""
+    """The forge-shaped surface this harness needs.
+
+    Two groups. The first seven are the PR-conversation feature — reading a
+    review thread and answering it. The last three are opening a change, which
+    `submit-suggestion` needs and which is the first consumer migrated onto this
+    protocol from a private `gh` runner of its own. The list grows by migration,
+    not by copying a forge's API surface: see
+    `docs/designs/multi-forge-support.md` §4.
+    """
 
     #: False on a forge with no reaction API (Bitbucket Cloud), so a caller can
     #: skip the acknowledgement rather than discover it fails.
@@ -268,6 +338,16 @@ class ForgeProvider(Protocol):
     def acknowledge(self, repo: str, comment: Comment) -> bool: ...
 
     def list_commits(self, repo: str, pr: PullRequest) -> list[Commit]: ...
+
+    def create_pull_request(
+        self, repo: str, *, head: str, base: str, title: str, body: str
+    ) -> str: ...
+
+    def update_pull_request(
+        self, repo: str, *, head: str, title: str, body: str
+    ) -> None: ...
+
+    def pull_request_url(self, repo: str, *, head: str) -> str: ...
 
 
 def normalise_login(login: str) -> str:
@@ -328,35 +408,6 @@ def is_agent_pull_request(pr: PullRequest, repo: str, viewer: str) -> bool:
         and pr.head_ref.startswith(AGENT_BRANCH_PREFIX)
         and pr.head_repo.lower() == repo.lower()
     )
-
-
-def _valid_repo_component(part: str) -> bool:
-    """Reject path components unsafe to hand to `gh -R`.
-
-    The slug pattern permits "." and "-", so it happily produces "../..", and a
-    leading dash is parsed by `gh` as a flag. Neither is a shape the regex can
-    express.
-    """
-    return bool(part) and part not in (".", "..") and not part.startswith("-")
-
-
-def _parse_repo(configured: str) -> str:
-    """`owner/name` from a configured value, or raise `RepoUnparseable`."""
-    match = REPO_URL_RE.search(configured)
-    if match:
-        repo = match.group(1)
-    elif BARE_REPO_RE.match(configured):
-        repo = configured
-    else:
-        raise RepoUnparseable(configured)
-
-    repo = re.sub(r"\.git$", "", repo)
-    owner, _, name = repo.partition("/")
-    # After the shorthand branch, not instead of it: "../.." satisfies
-    # BARE_REPO_RE, so this is what rejects it.
-    if not _valid_repo_component(owner) or not _valid_repo_component(name):
-        raise RepoUnparseable(configured)
-    return repo
 
 
 def _should_retry_transient(result: subprocess.CompletedProcess) -> bool:
@@ -490,6 +541,7 @@ class GitHubProvider:
         expect_json: bool = True,
         retry_transient: bool = False,
         stdin: str | None = None,
+        check: bool = True,
     ):
         """Every forge round trip goes through here. See the module docstring.
 
@@ -508,6 +560,14 @@ class GitHubProvider:
 
         `stdin` carries a document to a command that names `-` as its input
         file; it reaches `gh` in the sandbox, which is the only pod that has one.
+
+        `check=False` hands the raw result back instead, for the one caller
+        where the exit code is an answer rather than a failure — see
+        `create_pull_request`. It is a parameter rather than a second path to
+        the runner because the module docstring's invariant is that a provider
+        talking to a `/v1/<forge>/…` route replaces this method and nothing
+        else; a method reaching `self._run` directly would silently keep
+        shelling `gh` under such a provider.
         """
         result = self._run(list(argv), repo=repo, stdin=stdin)
         if (
@@ -516,8 +576,10 @@ class GitHubProvider:
             and _should_retry_transient(result)
         ):
             result = self._run(list(argv), repo=repo, stdin=stdin)
+        if not check:
+            return result
         if result.returncode != 0:
-            raise ForgeError("REPO_UNREACHABLE", (result.stderr or "").strip()[:200])
+            raise ForgeError("REPO_UNREACHABLE", (result.stderr or "").strip()[:_DETAIL_CHARS])
         if not expect_json:
             return None
         text = (result.stdout or "").strip()
@@ -816,21 +878,137 @@ class GitHubProvider:
             commits.append(Commit(sha=sha, committed_at=str(committer.get("date", ""))))
         return commits
 
+    # -- opening a change --------------------------------------------------
+    def create_pull_request(
+        self, repo: str, *, head: str, base: str, title: str, body: str
+    ) -> str:
+        """Open a pull request from `head` into `base`, returning its URL.
 
-#: Host substring -> provider. One entry today; the point of the table is that
-#: adding a second is a registration rather than a branch in the sweep.
-PROVIDERS: dict[str, type] = {"github.com": GitHubProvider}
+        Raises `PullRequestExists` when the branch already has an open one. That
+        refusal arrives *after* the push has landed, so the caller has to be
+        able to tell it from a real failure — a protected base, a credential
+        without permission — and only the text distinguishes them.
+
+        This is the one caller of `_call(check=False)` — the exit code is an
+        answer here rather than a failure — but it still goes through `_call`,
+        so a provider that replaces that method replaces this one's transport
+        too.
+
+        Any other refusal raises `PULL_REQUEST_REFUSED` rather than
+        `REPO_UNREACHABLE`: the push has just succeeded against this repository
+        over this credential, so reachability is the one explanation already
+        ruled out. The detail carries the exit code and both streams, because
+        `gh` puts a protected-base rejection on stdout and the credential
+        proxy's block message on stderr.
+
+        The body travels on stdin, for the reason `post_comment` sets out: since
+        #913 the caller, the sandbox and the broker are three containers with
+        three filesystems, so `--body-file <path>` names a file that only one of
+        them can open. `-R` is always passed, so the call does not depend on the
+        process being inside a clone of `repo` either.
+        """
+        result = self._call(
+            [
+                "pr", "create",
+                "-R", repo,
+                "--base", base,
+                "--head", head,
+                "--title", title,
+                "--body-file", BODY_STDIN,
+            ],
+            repo=repo,
+            stdin=body,
+            check=False,
+        )
+        if result.returncode != 0:
+            merged = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
+            if _PR_EXISTS_MARKER in merged.lower():
+                raise PullRequestExists(head, merged[:_DETAIL_CHARS])
+            raise ForgeError(
+                REASON_PULL_REQUEST_REFUSED,
+                f"exit {result.returncode}: {merged}"[:_DETAIL_CHARS],
+            )
+        url = (result.stdout or "").strip()
+        if url:
+            return url
+        # A `gh` that printed nothing still opened the pull request, so a failed
+        # read-back must not turn that success into a reported failure. The
+        # caller re-pushing on a false failure is the wasted round this avoids.
+        try:
+            return self.pull_request_url(repo, head=head)
+        except ForgeError:
+            return ""
+
+    def update_pull_request(
+        self, repo: str, *, head: str, title: str, body: str
+    ) -> None:
+        """Point the open pull request for `head` at the work just pushed.
+
+        Title and body as well as commits: a resubmission's description was
+        written for the commits it is pushing now, and leaving the old one in
+        place describes work the branch no longer contains.
+
+        On stdin, for the reason `create_pull_request` gives.
+        """
+        self._call(
+            [
+                "pr", "edit", head,
+                "-R", repo,
+                "--title", title,
+                "--body-file", BODY_STDIN,
+            ],
+            repo=repo,
+            expect_json=False,
+            stdin=body,
+        )
+
+    def pull_request_url(self, repo: str, *, head: str) -> str:
+        """The open pull request's address for `head`.
+
+        A branch with no open pull request is a `ForgeError`, not `""` — `gh pr
+        view` exits non-zero for it and `_call` raises. `""` is reserved for the
+        narrower case of an answer that parsed but carried no `url`, which is a
+        forge that replied strangely rather than a branch with nothing open.
+
+        `--json url` rather than `--jq`: the projection is one field either way,
+        and reading it here keeps the parse in Python where a malformed answer
+        raises `FORGE_RESPONSE_UNREADABLE` instead of arriving as an empty
+        string.
+        """
+        row = self._call(["pr", "view", head, "-R", repo, "--json", "url"])
+        if not isinstance(row, dict):
+            return ""
+        return str(row.get("url") or "")
+
+
+#: Host -> provider, keyed on the parsed host and matched exactly. One forge
+#: today; the point of the table is that adding a second is a registration
+#: rather than a branch in the sweep.
+PROVIDERS: dict[str, type] = {host: GitHubProvider for host in repo_ref.GITHUB_HOSTS}
 
 
 def provider_for(repo: Optional[str] = None, **kwargs) -> ForgeProvider:
-    """Pick a provider from the host in repo or default to GitHub.
+    """Pick a provider from the host in `repo`, or GitHub when it names none.
 
     A bare `owner/repo` — which the operator accepts and writes through
     verbatim — names no host, so it means GitHub: that shorthand is `gh -R`'s
-    own form and no other forge shares it.
+    own form and no other forge shares it. A host this harness does not have a
+    provider for raises rather than falling back, because the fallback is what
+    turns a GitLab URL into GitHub calls against a same-named repository.
+
+    The host is compared after parsing, never searched for: the substring test
+    this replaced selected `GitHubProvider` for
+    `https://example.invalid/github.com/o/r`.
     """
-    lowered = (repo or "").lower()
-    for host, cls in PROVIDERS.items():
-        if host in lowered:
-            return cls(**kwargs)
-    return GitHubProvider(**kwargs)
+    if not repo:
+        return GitHubProvider(**kwargs)
+    try:
+        ref = repo_ref.parse(repo)
+    except repo_ref.RepoRefError as error:
+        raise RepoUnparseable(str(repo)) from error
+    if not ref.host:
+        return GitHubProvider(**kwargs)
+    provider = PROVIDERS.get(ref.host)
+    if provider is None:
+        raise UnknownForgeHost(ref.host)
+    return provider(**kwargs)

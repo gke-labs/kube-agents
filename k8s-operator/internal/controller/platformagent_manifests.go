@@ -1252,22 +1252,26 @@ func filterValidAgentPlugins(agentPlugins []*agentv1alpha1.AgentPlugin) []*agent
 func buildGitopsStateConfigMap(agent *agentv1alpha1.PlatformAgent) *corev1.ConfigMap {
 	data := map[string]string{}
 
-	// Extract primary repository from CR Spec if provided
-	if agent.Spec.Integration != nil && agent.Spec.Integration.GitHub != nil {
-		gitRepo := strings.TrimSpace(agent.Spec.Integration.GitHub.GitRepo)
-		org := strings.TrimSpace(agent.Spec.Integration.GitHub.Org)
-		if gitRepo != "" && gitRepo != "None" {
-			if err := agentv1alpha1.ValidateGitRepoURLWithOrg(gitRepo, org); err == nil {
-				if cleanedURL, err := agentv1alpha1.CleanRepoURLWithOrg(gitRepo, org); err == nil {
-					entries := []agentv1alpha1.ManagedRepoEntry{
-						{Type: "github", URL: cleanedURL},
-					}
-					if jsonBytes, err := json.Marshal(entries); err == nil {
-						data["managed_repos"] = string(jsonBytes)
-					}
-				}
-			} else {
-				manifestsLog.Info("Skipping initial configmap seed due to unparseable or invalid GitRepo", "raw", gitRepo, "error", err)
+	// Seed the primary repository from the CR spec, if one was declared. The
+	// entry's `type` is the declared provider, which is how the discriminator
+	// reaches the agent — written down rather than inferred from the URL's text.
+	if agent.Spec.Integration != nil {
+		resolved, err := agent.Spec.Integration.ResolveGit()
+		switch {
+		case err != nil:
+			manifestsLog.Info("Skipping initial configmap seed due to conflicting git integration", "error", err)
+		case resolved.HasRepository():
+			ref, err := resolved.Resolve()
+			if err != nil {
+				manifestsLog.Info("Skipping initial configmap seed due to unparseable or invalid repository",
+					"raw", resolved.Repository, "provider", resolved.Provider, "error", err)
+				break
+			}
+			entries := []agentv1alpha1.ManagedRepoEntry{
+				{Type: resolved.Provider, URL: ref.URL()},
+			}
+			if jsonBytes, err := json.Marshal(entries); err == nil {
+				data["managed_repos"] = string(jsonBytes)
 			}
 		}
 	}
@@ -2088,17 +2092,13 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 				})
 			}
 		}
-		if github := integration.GitHub; github != nil {
-			org := strings.TrimSpace(github.Org)
-			if org == "" && github.GitRepo != "" {
-				if cleaned, err := agentv1alpha1.CleanRepoSlug(github.GitRepo); err == nil {
-					parts := strings.SplitN(cleaned, "/", 2)
-					if len(parts) == 2 {
-						org = parts[0]
-					}
-				}
-			}
-			if org != "" {
+		// GITHUB_ORG still names GitHub because that is what the agent reads it
+		// as; §7 of docs/designs/multi-forge-support.md renames the vocabulary,
+		// and doing it here would rename a variable the pod's scripts still spell
+		// the old way. Until then it is set only for a GitHub declaration.
+		if resolved, err := integration.ResolveGit(); err == nil && resolved != nil &&
+			resolved.Provider == agentv1alpha1.GitProviderGitHub {
+			if org := resolved.EffectiveNamespace(); org != "" {
 				envVars = append(envVars, corev1.EnvVar{
 					Name:  "GITHUB_ORG",
 					Value: org,

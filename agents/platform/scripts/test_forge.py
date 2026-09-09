@@ -20,9 +20,10 @@ Four properties carry most of the weight:
 * **An unknown permission is not a "no".** A 404 from the collaborator endpoint
   means no write access; a proxy fault means nothing at all, and the sweep turns
   a "no" into a public refusal that is never retried.
-* **The repository parser agrees with `resolver.py`'s.** They are two copies of
-  one hardened parser, and `ParserAgreementTest` is what stops them drifting
-  until `resolver.py` migrates onto this module.
+* **An unsupported host raises rather than falling back to GitHub.** Falling
+  back is what would point `gh` at a same-named GitHub repository on behalf of
+  a URL naming somebody else's forge. The parse behind that decision is
+  `test_repo_ref.py`'s subject, not this file's.
 """
 
 import importlib.util
@@ -30,7 +31,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -88,62 +88,47 @@ class FakeGh:
         raise AssertionError(f"no gh call matched {fragment!r}; saw {self.calls}")
 
 
-def write_settings(tmpdir: str, value: str) -> str:
-    path = os.path.join(tmpdir, "SETTINGS.md")
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(f"# Settings\n\n- **Git Repo:** {value}\n")
-    return path
+class ProviderSelectionTest(unittest.TestCase):
+    """`provider_for`. The parse itself is `test_repo_ref.py`'s subject."""
 
+    def test_no_repository_means_github(self):
+        """What the sweep passes: it discovers repositories after choosing."""
+        self.assertIsInstance(forge.provider_for(), forge.GitHubProvider)
 
-class ParseRepoTest(unittest.TestCase):
-    def _resolve(self, value):
-        return forge._parse_repo(value)
+    def test_bare_shorthand_means_github(self):
+        self.assertIsInstance(forge.provider_for("acme/toolkit"), forge.GitHubProvider)
 
-    def test_bare_shorthand(self):
-        self.assertEqual(self._resolve("acme/toolkit"), "acme/toolkit")
+    def test_github_url_selects_github(self):
+        for value in (
+            "https://github.com/acme/toolkit",
+            "git@github.com:acme/toolkit.git",
+            "https://www.github.com/acme/toolkit",
+        ):
+            with self.subTest(value=value):
+                self.assertIsInstance(
+                    forge.provider_for(value), forge.GitHubProvider
+                )
 
-    def test_https_url(self):
-        self.assertEqual(
-            self._resolve("https://github.com/acme/toolkit"), "acme/toolkit"
-        )
+    def test_a_host_with_no_provider_raises_rather_than_falling_back(self):
+        """The fallback is what would run `gh` against a same-named GitHub repo."""
+        with self.assertRaises(forge.UnknownForgeHost) as ctx:
+            forge.provider_for("git@gitlab.com:group/project")
+        self.assertEqual(ctx.exception.reason, "FORGE_HOST_UNSUPPORTED")
 
-    def test_scp_form_ssh_remote(self):
-        self.assertEqual(
-            self._resolve("git@github.com:acme/toolkit.git"), "acme/toolkit"
-        )
+    def test_github_com_inside_another_host_no_longer_selects_github(self):
+        """The substring test this replaced selected `GitHubProvider` here."""
+        with self.assertRaises(forge.UnknownForgeHost):
+            forge.provider_for("https://example.invalid/github.com/o/r")
 
-    def test_www_prefix(self):
-        self.assertEqual(
-            self._resolve("https://www.github.com/acme/toolkit"), "acme/toolkit"
-        )
+    def test_an_unparseable_value_carries_the_operator_facing_reason_code(self):
+        with self.assertRaises(forge.RepoUnparseable) as ctx:
+            forge.provider_for("../..")
+        self.assertEqual(ctx.exception.reason, "GIT_REPO_UNPARSEABLE")
 
-    def test_git_suffix_is_stripped(self):
-        self.assertEqual(self._resolve("acme/toolkit.git"), "acme/toolkit")
-
-    def test_github_com_as_a_path_segment_on_another_host_is_rejected(self):
-        """The confused-deputy shape the anchored regex exists for."""
-        with self.assertRaises(forge.RepoUnparseable):
-            self._resolve("https://evil.com/github.com/attacker/repo")
-
-    def test_userinfo_cannot_smuggle_the_host(self):
-        with self.assertRaises(forge.RepoUnparseable):
-            self._resolve("https://user@evil.com/github.com/attacker/repo")
-
-    def test_lookalike_host_is_rejected(self):
-        with self.assertRaises(forge.RepoUnparseable):
-            self._resolve("https://evilgithub.com/attacker/repo")
-
-    def test_traversal_satisfies_the_shorthand_pattern_and_is_still_rejected(self):
-        """`BARE_REPO_RE` admits "../.." — the component check is what stops it."""
-        self.assertTrue(forge.BARE_REPO_RE.match("../.."))
-        with self.assertRaises(forge.RepoUnparseable):
-            self._resolve("../..")
-
-    def test_leading_dash_would_be_parsed_as_a_flag(self):
-        with self.assertRaises(forge.RepoUnparseable):
-            self._resolve("-oops/repo")
-
-
+    def test_the_run_seam_is_forwarded_to_the_provider(self):
+        fake = FakeGh()
+        provider = forge.provider_for(repo="acme/toolkit", run=fake)
+        self.assertIs(provider._run, fake)
 
 
 class NormaliseLoginTest(unittest.TestCase):
@@ -1258,21 +1243,176 @@ class PermissionUnknownTest(unittest.TestCase):
         self.assertTrue(comments[0].can_write)
 
 
-class ProviderForTest(unittest.TestCase):
-    def test_github_host_selects_the_github_provider(self):
-        self.assertIsInstance(forge.provider_for(repo="https://github.com/acme/toolkit"), forge.GitHubProvider)
+class CreatePullRequestTest(unittest.TestCase):
+    """Opening a change, and the one refusal that is not a failure."""
 
-    def test_bare_shorthand_means_github(self):
-        """The operator writes `owner/repo` through verbatim; it is `gh -R`'s own form."""
-        self.assertIsInstance(forge.provider_for(repo="acme/toolkit"), forge.GitHubProvider)
+    def _provider(self, gh):
+        return forge.GitHubProvider(run=gh)
 
-    def test_omitted_repo_defaults_to_github_provider(self):
-        self.assertIsInstance(forge.provider_for(), forge.GitHubProvider)
+    def test_it_names_the_repository_and_sends_the_body_on_stdin(self):
+        gh = FakeGh(default=(0, "https://github.com/acme/fleet/pull/7\n", ""))
+        url = self._provider(gh).create_pull_request(
+            "acme/fleet",
+            head="platform-agent/x",
+            base="main",
+            title="t",
+            body="the description",
+        )
+        self.assertEqual(url, "https://github.com/acme/fleet/pull/7")
+        argv = gh.argv_containing("pr create")
+        # `-R` is what makes the call independent of the process's directory,
+        # which is the whole reason the caller no longer has to be in a clone.
+        self.assertEqual(argv[argv.index("-R") + 1], "acme/fleet")
+        self.assertEqual(argv[argv.index("--head") + 1], "platform-agent/x")
+        self.assertEqual(argv[argv.index("--base") + 1], "main")
+        # `-`, never a path: the caller, the sandbox and the broker are three
+        # containers with three filesystems, so a file this process writes is
+        # not one `gh` can open. The body has to be on fd 0.
+        self.assertEqual(argv[argv.index("--body-file") + 1], forge.BODY_STDIN)
+        self.assertEqual(gh.stdin_of("pr create"), "the description")
+        self.assertNotIn("--body", argv)
 
-    def test_the_run_seam_is_forwarded_to_the_provider(self):
-        fake = FakeGh()
-        provider = forge.provider_for(repo="acme/toolkit", run=fake)
-        self.assertIs(provider._run, fake)
+    def test_an_existing_pull_request_is_its_own_error_type(self):
+        """Distinct from a failure, because the caller decides which it is.
+
+        A resubmission gets here after the push has already landed. Reported as
+        REPO_UNREACHABLE it is indistinguishable from a credential that cannot
+        reach the repository at all, and the skill's answer to those two is
+        opposite.
+        """
+        gh = FakeGh(
+            default=(
+                1,
+                "",
+                'a pull request for branch "platform-agent/x" into branch "main" '
+                "already exists:\nhttps://github.com/acme/fleet/pull/7\n",
+            )
+        )
+        with self.assertRaises(forge.PullRequestExists) as caught:
+            self._provider(gh).create_pull_request(
+                "acme/fleet", head="platform-agent/x", base="main", title="t",
+                body="the description",
+            )
+        self.assertEqual(caught.exception.reason, forge.REASON_PULL_REQUEST_EXISTS)
+        self.assertEqual(caught.exception.head, "platform-agent/x")
+        self.assertIn("pull/7", caught.exception.value)
+
+    def test_every_other_refusal_is_a_refusal_not_an_unreachable_repository(self):
+        """The push has already landed against this repository over this
+        credential, so `REPO_UNREACHABLE` would send an operator to check the
+        two things known to work."""
+        gh = FakeGh(default=(1, "", "HTTP 403: Resource not accessible by integration"))
+        with self.assertRaises(forge.ForgeError) as caught:
+            self._provider(gh).create_pull_request(
+                "acme/fleet", head="platform-agent/x", base="main", title="t",
+                body="the description",
+            )
+        self.assertEqual(caught.exception.reason, "PULL_REQUEST_REFUSED")
+        self.assertNotIsInstance(caught.exception, forge.PullRequestExists)
+
+    def test_the_detail_carries_the_exit_code_and_both_streams(self):
+        """`gh` puts a protected-base rejection on stdout and the credential
+        proxy's block message on stderr, and the old handler logged both."""
+        gh = FakeGh(default=(2, "base branch is protected", "and the token cannot override it"))
+        with self.assertRaises(forge.ForgeError) as caught:
+            self._provider(gh).create_pull_request(
+                "acme/fleet", head="platform-agent/x", base="main", title="t",
+                body="the description",
+            )
+        self.assertIn("exit 2", caught.exception.value)
+        self.assertIn("base branch is protected", caught.exception.value)
+        self.assertIn("cannot override", caught.exception.value)
+
+    def test_a_silent_success_is_read_back_rather_than_returned_empty(self):
+        """`gh` prints the URL today. A version that did not would otherwise
+        return "" — a pull request that exists, reported as having no address."""
+        gh = FakeGh(
+            responses={"pr view": (0, json.dumps({"url": "https://x/pull/9"}), "")},
+            default=(0, "", ""),
+        )
+        url = self._provider(gh).create_pull_request(
+            "acme/fleet", head="platform-agent/x", base="main", title="t",
+            body="the description",
+        )
+        self.assertEqual(url, "https://x/pull/9")
+
+    def test_a_failed_read_back_does_not_turn_a_success_into_a_failure(self):
+        """The pull request was opened. Raising here would have the caller
+        re-push a branch whose change is already up."""
+        gh = FakeGh(responses={"pr view": (1, "", "not found")}, default=(0, "", ""))
+        url = self._provider(gh).create_pull_request(
+            "acme/fleet", head="platform-agent/x", base="main", title="t",
+            body="the description",
+        )
+        self.assertEqual(url, "")
+
+    def test_it_reaches_the_forge_through_the_one_overridable_seam(self):
+        """The module docstring's invariant: a provider that replaces `_call`
+        replaces every round trip. `create_pull_request` reads an exit code, so
+        it is the method most likely to grow a second path to the runner."""
+        calls = []
+
+        class Overridden(forge.GitHubProvider):
+            def _call(self, argv, **kwargs):
+                calls.append(list(argv))
+                return super()._call(argv, **kwargs)
+
+        Overridden(run=FakeGh(default=(0, "https://x/pull/1", ""))).create_pull_request(
+            "acme/fleet", head="platform-agent/x", base="main", title="t",
+            body="the description",
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:2], ["pr", "create"])
+
+
+class UpdatePullRequestTest(unittest.TestCase):
+    def test_it_edits_the_title_and_the_body(self):
+        gh = FakeGh(default=(0, "", ""))
+        forge.GitHubProvider(run=gh).update_pull_request(
+            "acme/fleet", head="platform-agent/x", title="round two",
+            body="the description",
+        )
+        argv = gh.argv_containing("pr edit")
+        self.assertEqual(argv[2], "platform-agent/x")
+        self.assertEqual(argv[argv.index("-R") + 1], "acme/fleet")
+        self.assertEqual(argv[argv.index("--title") + 1], "round two")
+        self.assertEqual(argv[argv.index("--body-file") + 1], forge.BODY_STDIN)
+        self.assertEqual(gh.stdin_of("pr edit"), "the description")
+
+    def test_a_failed_edit_raises_rather_than_reporting_success(self):
+        gh = FakeGh(default=(1, "", "no pull requests found"))
+        with self.assertRaises(forge.ForgeError):
+            forge.GitHubProvider(run=gh).update_pull_request(
+                "acme/fleet", head="platform-agent/x", title="t",
+                body="the description",
+            )
+
+
+class PullRequestUrlTest(unittest.TestCase):
+    def test_it_reads_the_url_out_of_the_json_projection(self):
+        gh = FakeGh(default=(0, json.dumps({"url": "https://x/pull/3"}), ""))
+        self.assertEqual(
+            forge.GitHubProvider(run=gh).pull_request_url(
+                "acme/fleet", head="platform-agent/x"
+            ),
+            "https://x/pull/3",
+        )
+        argv = gh.argv_containing("pr view")
+        self.assertEqual(argv[argv.index("--json") + 1], "url")
+
+    def test_an_answer_without_a_url_is_empty_not_a_crash(self):
+        gh = FakeGh(default=(0, json.dumps({}), ""))
+        self.assertEqual(
+            forge.GitHubProvider(run=gh).pull_request_url("acme/fleet", head="x"), ""
+        )
+
+    def test_a_non_json_answer_is_reported_rather_than_read_as_absent(self):
+        """"" means "no pull request" to every caller, so an unreadable answer
+        must not arrive spelled the same way."""
+        gh = FakeGh(default=(0, "<html>proxy error</html>", ""))
+        with self.assertRaises(forge.ForgeError) as caught:
+            forge.GitHubProvider(run=gh).pull_request_url("acme/fleet", head="x")
+        self.assertEqual(caught.exception.reason, "FORGE_RESPONSE_UNREADABLE")
 
 
 class ProtocolConformanceTest(unittest.TestCase):
@@ -1284,9 +1424,30 @@ class ProtocolConformanceTest(unittest.TestCase):
             "list_comments",
             "post_comment",
             "acknowledge",
+            "list_commits",
+            "create_pull_request",
+            "update_pull_request",
+            "pull_request_url",
         ):
             self.assertTrue(callable(getattr(provider, name)), name)
         self.assertTrue(provider.supports_acknowledge)
+
+    def test_the_protocol_names_nothing_the_provider_lacks(self):
+        """The Protocol is the contract a second forge implements, so a method
+        declared there and absent here would only fail at the first GitLab
+        install rather than in this suite."""
+        declared = {
+            name
+            for name, value in vars(forge.ForgeProvider).items()
+            if callable(value) and not name.startswith("_")
+        } | set(getattr(forge.ForgeProvider, "__annotations__", {}))
+        self.assertIn("create_pull_request", declared)
+        self.assertIn("supports_acknowledge", declared)
+        for name in sorted(declared):
+            self.assertTrue(
+                hasattr(forge.GitHubProvider, name),
+                f"ForgeProvider declares {name}, GitHubProvider does not have it",
+            )
 
 
 if __name__ == "__main__":

@@ -42,7 +42,7 @@ else. Each concurrent operation gets its own clone, keyed by a lease it owns.
 ├── .lock                                  # short root flock: reap + mkdir + write .lease
 ├── compliance-audit/
 │   ├── .lease                             # {"lease","owner","repo","created_at","refreshed_at","pid"}
-│   └── acme__fleet/                       # the clone; every git and gh call runs here
+│   └── acme__fleet/                       # the clone; every git call runs here
 ├── t_751ffb70/                            # a kanban worker's submit-suggestion lease
 │   ├── .lease
 │   └── acme__fleet/
@@ -129,8 +129,10 @@ cuts the branch off the repository's default branch — `origin/HEAD`, overridab
 exists, so a second round of review feedback builds on the open pull request rather than replacing
 it. It prints `{"workspace", "lease", "branch", "repo"}`; the agent
 works inside the printed `workspace`. `submit --workspace <path> --branch --title --body` asserts
-ownership first, verifies HEAD is on the named branch, then pushes and opens the pull request with
-`cwd` set on every subprocess. The pre-`prepare` bare-flag call shape is still accepted as an alias
+ownership first, verifies HEAD is on the named branch, then pushes with `cwd` set on every `git`
+subprocess and opens the pull request through the forge provider. The provider names the repository
+with `-R`, so its calls carry no `cwd` and never consult the clone; only `git` is lease-gated, which
+is what the section above says. The pre-`prepare` bare-flag call shape is still accepted as an alias
 for `submit`, so a session already in flight does not die on "invalid choice".
 
 `git push -f` becomes `git push --force-with-lease`. The force was there for a real reason — a card
