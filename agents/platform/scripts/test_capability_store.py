@@ -161,9 +161,17 @@ class StoreTest(unittest.TestCase):
         entry = cs.apply_changes(self.root, "demo", {"names": ["b"]}, reason="r", confirmed_by="ops")
         self.assertEqual(entry["reset"]["threshold"]["value"], 1)
         self.assertNotIn("threshold", cs.load(self.root, "demo").criteria)
-        # Setting the invalid key itself is an ordinary set, not a reset.
         entry = cs.apply_changes(self.root, "demo", {"threshold": 5}, reason="r", confirmed_by="ops")
-        self.assertEqual(entry["reset"], {})
+        self.assertEqual(entry["reset"], {}, "nothing invalid was left to record")
+        self.assertEqual(cs.load(self.root, "demo").criteria["threshold"], 5)
+
+    def test_setting_an_invalid_key_itself_still_records_the_raw_value_it_replaced(self):
+        tighter = json.loads(json.dumps(SCHEMA))
+        tighter["properties"]["threshold"]["minimum"] = 2
+        seed(self.root, criteria={"threshold": 1}, schema=tighter)
+        entry = cs.apply_changes(self.root, "demo", {"threshold": 5}, reason="r", confirmed_by="ops")
+        self.assertEqual(entry["changes"], {"threshold": {"before": 3, "after": 5}}, "before is what was in effect")
+        self.assertEqual(entry["reset"]["threshold"]["value"], 1, "the raw value is not lost")
         self.assertEqual(cs.load(self.root, "demo").criteria["threshold"], 5)
 
     def test_changes_may_arrive_json_encoded(self):

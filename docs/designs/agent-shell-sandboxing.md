@@ -1501,8 +1501,8 @@ against different volumes, but a directory the agent pod created still does not 
 here, which is the subject of the section above. What neither closes is content: a script
 that expects to _read_ something the agent pod put at `/opt/data` still finds nothing.
 
-Enumerating what the sandbox legitimately needs sorts the references into seven classes
-with four delivery mechanisms.
+Enumerating what the sandbox legitimately needs sorts the references into the classes below,
+each with its delivery mechanism.
 
 | What                                         | Where it comes from                                | Why                                                                           |
 | -------------------------------------------- | -------------------------------------------------- | ----------------------------------------------------------------------------- |
