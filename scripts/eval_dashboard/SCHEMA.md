@@ -269,9 +269,13 @@ place the "is this red mine?" rule lives; the pages read its answer through
   `health-history.jsonl`; without history the parameters describe it.
 - `#agent` shows the last 24 hours in numbers; `#gate` lands on the
   "why we think" block. No parameters: the current state from `health.json`.
-- Case ids match `[A-Za-z0-9][A-Za-z0-9._-]{0,79}`; the first 50 that do
-  are read, and a link the pages write carries at most those 50. A value
-  that fails its grammar is dropped and everything reaches the DOM escaped.
+- Case ids match `[A-Za-z0-9][A-Za-z0-9._-]{0,79}`; the first 50
+  (`maxLinkCases`) that do are read, and a link the pages write carries at
+  most those 50. A value that fails its grammar is dropped and everything
+  reaches the DOM escaped.
+- `since` and `until` are read with a `Z`, a space separator, or a UTC
+  offset written `+02:00` or `+0200`, and converted; the pages themselves
+  write `Z`.
 - `run.html?build=<digits>`; an id not in `brief.json` shows a
   not-found page naming the window (`RUN_VIEW_DAYS`, 14 days).
 
