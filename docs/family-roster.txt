@@ -91,6 +91,7 @@ agents/platform/skills/*/SKILL.md
   agents/platform/skills/gke-workload-security/SKILL.md
   agents/platform/skills/gke-workload-troubleshooting/SKILL.md
   agents/platform/skills/inspect-repository/SKILL.md
+  agents/platform/skills/kube-agents-feedback/SKILL.md
   agents/platform/skills/kube-agents-observability/SKILL.md
   agents/platform/skills/manage-cluster/SKILL.md
   agents/platform/skills/pr-conversation/SKILL.md

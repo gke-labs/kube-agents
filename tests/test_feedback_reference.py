@@ -68,6 +68,14 @@ REDACTION_RULE = re.compile(r"read from a Secret")
 ROUTING_REQUEST = "report a bug in kube-agents"
 ROUTING_TARGET = "`platform`"
 
+# Filing on the user's behalf: the platform persona must hand the job to the
+# skill rather than improvise a form POST (a hand-rolled one double-filed,
+# gke-labs/kube-agents#1345/#1346), and the chat persona must promise the
+# confirmation marker that same skill refuses to file without.
+FILING_SKILL = REPO_ROOT / "agents/platform/skills/kube-agents-feedback/SKILL.md"
+FILING_SKILL_NAME = "kube-agents-feedback"
+CONFIRMATION_MARKER = "user-confirmed: yes"
+
 
 def _feedback_bullet(path: Path) -> str:
     """The one persona bullet that answers the question, or "" if there is none."""
@@ -149,6 +157,28 @@ class FeedbackReferenceTest(unittest.TestCase):
                     FORMS_URL.search(path.read_text(encoding="utf-8")),
                     "agent material names the short link, not the form URL, so a "
                     "recreated form needs no agent release",
+                )
+
+    def test_filing_on_behalf_is_the_skill_behind_the_confirmation_marker(self) -> None:
+        self.assertTrue(
+            FILING_SKILL.exists(),
+            "both personas point filing at this skill; without it the platform "
+            "agent improvises the POST",
+        )
+        platform_bullet = _feedback_bullet(SPECIALIST_SOULS[0])
+        self.assertIn(
+            FILING_SKILL_NAME,
+            platform_bullet,
+            "the platform persona must name the skill that files on the user's "
+            "behalf, or the agent hand-rolls the submission",
+        )
+        for path, owner in ((CHAT_SOUL, "chat"), (FILING_SKILL, "skill")):
+            with self.subTest(owner=owner):
+                self.assertIn(
+                    CONFIRMATION_MARKER,
+                    path.read_text(encoding="utf-8"),
+                    "the front door promises this marker and the skill refuses a "
+                    "card without it; both sides have to name the same line",
                 )
 
     def test_chat_persona_routes_the_request_to_the_platform_specialist(self) -> None:
