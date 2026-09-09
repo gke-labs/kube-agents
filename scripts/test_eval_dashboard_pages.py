@@ -449,11 +449,17 @@ class BrowserTest(unittest.TestCase):
 
     def test_the_current_outage_opened_through_its_own_link_is_still_live(self):
         query = urllib.parse.urlencode({"cases": ",".join(CRASHLOOP_TRIO), "since": "2026-09-08T09:00:00Z"})
-        app = dom_text(self.index, query=query, fragment="#gate")
-        self.assertIn("OUTAGE · since Tue 5:00 AM ET", app)
-        self.assertNotIn("PAST OUTAGE", app)
-        self.assertNotIn("This incident is over", app)
-        self.assertIn("What's being done", app)
+        for label, page in (("with history", self.index), ("without history", render_to(pathlib.Path(self.tmp.name) / "nohist-live", self.data, health=health_doc()) / "index.html")):
+            app = dom_text(page, query=query, fragment="#gate")
+            self.assertIn("OUTAGE · since Tue 5:00 AM ET", app, label)
+            self.assertNotIn("PAST", app, label)
+            self.assertNotIn("This incident is over", app, label)
+            self.assertIn("What's being done", app, label)
+            self.assertIn("issues/1278", app, label)
+        # The PR view's own banner link, followed, lands on the live brief.
+        run_app = dom_text(render_to(pathlib.Path(self.tmp.name) / "nohist-live", self.data, health=health_doc()) / "run.html", query="build=2097282860221206528")
+        self.assertIn("index.html?cases=cluster-agent-crashloop-debug", run_app)
+        self.assertIn("since=2026-09-08T09%3A00%3A00Z", run_app)
 
     def test_pr_view_outage_run(self):
         app = dom_text(self.run_page, query="build=2097282860221206528")

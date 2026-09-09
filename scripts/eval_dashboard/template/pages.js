@@ -230,6 +230,13 @@ function incidentFromHistory(entry) {
 function resolveIncident(link) {
   if (link.sinceMs != null) {
     const slack = PAGE.hourMs;
+    // The link names the current verdict's own start (a PR-view banner, a
+    // Chat message): that is the live incident, with or without history.
+    if (health && health.state !== "GREEN" && parseIso(health.since) != null && Math.abs(parseIso(health.since) - link.sinceMs) <= slack && link.untilMs == null) {
+      const live = incidentFromHealth(health);
+      if (link.cases.size) live.cases = [...link.cases];
+      return live;
+    }
     const hit = historyIncidents().map(incidentFromHistory).find((inc) => inc.sinceMs != null
       && link.sinceMs >= inc.sinceMs - slack && link.sinceMs <= (inc.untilMs ?? Infinity));
     if (hit) {
