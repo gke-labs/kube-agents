@@ -155,12 +155,13 @@ class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStre
 
 DEFAULT_CREDENTIAL_PROXY_AUDIENCE = "kubeagents-credential-proxy"
 
-# The second audience, and the whole of the per-caller split.
+# The second audience, and the per-caller split it introduced (the third
+# audience below extends it).
 #
-# Two Pods call this broker and ``Principal.workload`` cannot tell them apart.
-# It is per-ServiceAccount, and the two ServiceAccounts are both on
+# The Pods that call this broker cannot be told apart by ``Principal.workload``.
+# It is per-ServiceAccount, and every calling ServiceAccount is on
 # CREDENTIAL_PROXY_ALLOWED_CALLERS, so knowing which one called says only that
-# the caller was one of the two Pods entitled to. What *can* separate them is
+# the caller was one of the Pods entitled to. What *can* separate them is
 # the audience their token was projected with: the operator chooses it per Pod,
 # and the API server refuses to validate a token against an audience it was not
 # minted for. So the gateway's token is minted for the chat audience and the
@@ -211,6 +212,8 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # one credential, two subscriptions — while each side's event routes
     # stay its own.
     ("/v1/chat/a2a/", (CALLER_ROLE_A2A_CHAT,)),
+    # No trailing slash: the passthrough is one exact path, and the handler
+    # 404s anything else under it, so the prefix admits nothing extra today.
     ("/v1/chat/api", (CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT)),
     ("/v1/chat/", (CALLER_ROLE_CHAT,)),
     ("/v1/exec", (CALLER_ROLE_SHELL,)),
@@ -3654,12 +3657,11 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             if self.chat_relay is None:
                 self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "chat relay disabled"})
                 return
-            if self.path == "/v1/chat/events/ack":
-                ok = self.chat_relay.settle(str(payload.get("receipt", "")), True)
-                self._json(HTTPStatus.OK if ok else HTTPStatus.NOT_FOUND, {"settled": ok})
-                return
-            if self.path == "/v1/chat/events/nack":
-                ok = self.chat_relay.settle(str(payload.get("receipt", "")), False)
+            if self.path in ("/v1/chat/events/ack", "/v1/chat/events/nack"):
+                ok = self.chat_relay.settle(
+                    str(payload.get("receipt", "")),
+                    self.path.endswith("/ack"),
+                )
                 self._json(HTTPStatus.OK if ok else HTTPStatus.NOT_FOUND, {"settled": ok})
                 return
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})

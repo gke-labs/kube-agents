@@ -263,18 +263,26 @@ func (a *GoogleChatAdapter) apiCall(resource []string, method string, arguments 
 	return nil
 }
 
-// relayPost is one authenticated POST to the relay. The token is re-read on
-// every call: it is a projected ServiceAccount token the kubelet rotates.
-func (a *GoogleChatAdapter) relayPost(path string, payload []byte) ([]byte, error) {
+// authorize sets the relay bearer token on one request. The token is re-read
+// on every call: it is a projected ServiceAccount token the kubelet rotates.
+func (a *GoogleChatAdapter) authorize(req *http.Request) error {
 	token, err := os.ReadFile(a.tokenPath)
 	if err != nil {
-		return nil, fmt.Errorf("gchat: reading relay token: %w", err)
+		return fmt.Errorf("gchat: reading relay token: %w", err)
 	}
+	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
+	return nil
+}
+
+// relayPost is one authenticated POST to the relay.
+func (a *GoogleChatAdapter) relayPost(path string, payload []byte) ([]byte, error) {
 	req, err := http.NewRequest(http.MethodPost, a.relayURL+path, bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("gchat: building relay request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
+	if err := a.authorize(req); err != nil {
+		return nil, err
+	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := a.client.Do(req)
 	if err != nil {
@@ -499,15 +507,13 @@ func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage
 // pullEvent asks the relay for one event; nil with no error means the poll
 // came back empty.
 func (a *GoogleChatAdapter) pullEvent(ctx context.Context) (*gchatEnvelope, error) {
-	token, err := os.ReadFile(a.tokenPath)
-	if err != nil {
-		return nil, fmt.Errorf("gchat: reading relay token: %w", err)
-	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.relayURL+gchatRelayEventsPath, nil)
 	if err != nil {
 		return nil, fmt.Errorf("gchat: building pull request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
+	if err := a.authorize(req); err != nil {
+		return nil, err
+	}
 	resp, err := a.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("gchat: event pull: %w", err)

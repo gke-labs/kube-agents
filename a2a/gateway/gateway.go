@@ -117,7 +117,10 @@ func New(o Options) (*Gateway, error) {
 	}
 	backend := o.Backend
 	if backend == "" {
-		backend = "discord"
+		// Derived from the same config that selects the adapter, so a
+		// caller that sets one and not the other cannot pair a gchat
+		// relay with principal-map resolution.
+		backend = o.Config.Backend()
 	}
 	// gchat resolves identity from the Google-asserted email, not from the
 	// map — an empty map is only a lockout on the backends that use one.

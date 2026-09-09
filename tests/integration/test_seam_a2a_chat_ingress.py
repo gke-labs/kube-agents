@@ -192,6 +192,17 @@ class A2AChatIngressSeam(unittest.TestCase):
         status, _ = self._post("/v1/chat/api", body)
         self.assertEqual(status, 403)
 
+    def test_legacy_settles_refuse_when_only_the_a2a_relay_is_armed(self):
+        """The a2a instance never settles a legacy receipt, even when it is
+        the only relay standing: the shared-instance rule covers the api
+        passthrough alone."""
+        self.handler.chat_relay = None
+        status, _ = self._post("/v1/chat/events/ack", {"receipt": "L9"})
+        self.assertEqual(status, 503)
+        status, _ = self._post("/v1/chat/events/nack", {"receipt": "L9"})
+        self.assertEqual(status, 503)
+        self.assertEqual(self.a2a.settled, [], "a legacy settle must never reach the a2a receipts")
+
     def test_api_passthrough_works_with_only_the_a2a_relay_armed(self):
         self.handler.chat_relay = None
         status, body = self._post(

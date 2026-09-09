@@ -3,6 +3,7 @@ package gateway
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -87,6 +88,9 @@ type fakeAdapter struct {
 	complete bool
 	nextID   int
 	inbox    chan InboundMessage
+	// failEdits makes the next N Edit calls fail (and go unrecorded), for
+	// pinning what the relay does when a Chat edit does not land.
+	failEdits int
 }
 
 func newFakeAdapter() *fakeAdapter {
@@ -116,6 +120,10 @@ func (a *fakeAdapter) Post(conversation, text string) (string, error) {
 func (a *fakeAdapter) Edit(conversation, messageID, text string) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.failEdits > 0 {
+		a.failEdits--
+		return errors.New("fake edit failure")
+	}
 	a.edits = append(a.edits, fakePost{conversation, messageID, text})
 	return nil
 }

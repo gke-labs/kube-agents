@@ -1123,3 +1123,47 @@ func TestGchatRunAcksBeforeTheHandlerRuns(t *testing.T) {
 		t.Fatalf("Run returned %v", err)
 	}
 }
+
+// An add-on event whose message.sender omits the email is filled from
+// chat.user, which names the same person.
+func TestGchatAddonSenderEmailFallsBackToChatUser(t *testing.T) {
+	a := newTestGchatAdapter(t)
+	raw := `{"chat":{"user":{"name":"users/1","email":"u1@example.com","type":"HUMAN"},"eventTime":"2026-09-09T15:00:00Z","messagePayload":{"space":{"name":"spaces/D1","spaceType":"DIRECT_MESSAGE"},"message":{"name":"spaces/D1/messages/M1","text":"hi","argumentText":"hi","thread":{"name":"spaces/D1/threads/M1"},"sender":{"name":"users/1","type":"HUMAN"}}}}}`
+	ev, err := decodeGchatEvent(base64.StdEncoding.EncodeToString([]byte(raw)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, reason := a.classify(ev)
+	if reason != "" || msg.AuthorID != "u1@example.com" {
+		t.Errorf("classify = %+v %q; the sender email must come from chat.user when message.sender lacks it", msg, reason)
+	}
+}
+
+// A failed state edit must not be remembered as sent: under default mode
+// every later artifact renders the same line, so the next one is the retry.
+func TestGchatDefaultDisplayModeRetriesAFailedStateEdit(t *testing.T) {
+	r := startGchatRig(t, nil, true, func(c *Config) { c.DisplayMode = "default" })
+	conv := "gchat:spaces/S1/threads/T5"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "u1@example.com", MessageID: "spaces/S1/messages/M4", Text: "do the thing"}
+
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	r.adapter.mu.Lock()
+	r.adapter.failEdits = 1
+	r.adapter.mu.Unlock()
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactProgress, Parts: []lib.Part{{Kind: "text", Text: "step"}}}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the working line to land on the retry", func() bool {
+		for _, e := range r.adapter.editTexts() {
+			if strings.Contains(e, "working") {
+				return true
+			}
+		}
+		return false
+	})
+}

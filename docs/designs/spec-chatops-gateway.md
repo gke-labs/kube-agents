@@ -296,7 +296,7 @@ verified how, in front of whom:
   "requester": {
     "principal": "hmac:9f4c21…",
     "backend": "gchat",
-    "subject": "hmac:b8813a…",
+    "subject": "hmac:9f4c21…",
     "verifiedBy": "chat-event-topic-iam"
   },
   "audience": {
@@ -362,8 +362,10 @@ until the pod-level deadline ships) is a case where this justification does not 
 and the record needs the independent bound named there.
 
 - `requester.principal` is the pseudonymized identity in _our_ trust domain; the gateway
-  resolves it to the RBAC string at the boundary that needs one. `subject` is the
-  backend-native immutable id, hashed likewise, kept for audit joins. `verifiedBy`
+  resolves it to the RBAC string at the boundary that needs one. `subject` is the sender
+  id in the backend's own vocabulary, hashed likewise, kept for audit joins — Discord's
+  immutable snowflake; on Google Chat the asserted email, which is also the principal, so
+  the two hashes are equal there (as in the example above). `verifiedBy`
   names the mechanism that checked it at ingress.
 - `audience` is a snapshot of the room at the moment of the ask (see group chats below).
 - `grants` is reserved for the attenuating capability token when the authority work
@@ -478,7 +480,7 @@ only when `A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME` is set alongside the project id. T
 gateway pod stays cloud-credential-free: it authenticates to the proxy the way the
 legacy chat caller does — a projected ServiceAccount token verified by TokenReview —
 but with its OWN audience — whatever `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE` names on the
-proxy, `kubeagents-credential-proxy-a2a-chat` once the operator projects it — conferring
+proxy; nothing in-tree fixes the string yet, the operator wiring will — conferring
 the `a2a-chat` role, because the legacy chat caller is the LLM-driven Hermes pod and a
 shared role would let a prompt-injected agent pull and ack the A2A gateway's events,
 silently consuming user asks. The event routes demand `a2a-chat`; `/v1/chat/api`

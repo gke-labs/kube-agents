@@ -260,14 +260,22 @@ func (g *Gateway) updateRollingLine(rec *SessionRecord, taskID string, rs *relay
 	if line == rs.lastLine {
 		return
 	}
-	rs.lastLine = line
-	g.editLine(rec.Key, active.StatusMsgID, line)
+	// Recorded only once the edit landed: under default mode every later
+	// artifact renders this same line, so a failed edit recorded as sent
+	// would never be retried and the line would sit at the previous state
+	// until the terminal.
+	if g.editLine(rec.Key, active.StatusMsgID, line) {
+		rs.lastLine = line
+	}
 }
 
-func (g *Gateway) editLine(conversation, messageID, line string) {
+// editLine edits one status message and reports whether the edit landed.
+func (g *Gateway) editLine(conversation, messageID, line string) bool {
 	if err := g.adapter.Edit(conversation, messageID, truncateRunes(line, discordChunk)); err != nil {
 		g.log.Warn("rolling line edit failed", "conversation", conversation, "err", err)
+		return false
 	}
+	return true
 }
 
 func statusLine(state lib.TaskState, progress string) string {
