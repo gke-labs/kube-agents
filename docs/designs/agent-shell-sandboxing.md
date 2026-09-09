@@ -2194,7 +2194,7 @@ credential a `no_agent` job actually asks for; it does not decide that.
 ### Caller authentication
 
 Every caller is now remote, so nothing on the exec path is protected by being on loopback.
-The broker listens on `0.0.0.0` behind a ClusterIP, and both the sandbox and the gateway
+The broker listens on `0.0.0.0` behind a ClusterIP, and the sandbox, the gateway and any other caller
 dial the Service by name.
 
 What replaced the loopback listener and the `0600` socket is a projected ServiceAccount
