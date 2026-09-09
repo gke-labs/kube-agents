@@ -208,9 +208,13 @@ of the stage so a changing SHA rebuilds only the instruction that writes it.
 
 Neither publish workflow passes either arg yet, so the images published to GHCR and Artifact
 Registry carry an empty `revision` and an empty `source`, and the loop refuses to run on them
-unless `allowUnstampedImage` is set. The two paths that do pass `GIT_SHA` are
-`hack/ci-deploy.sh` (through `deploy/docker/cloudbuild-ci.yaml`, on the `platform` target only)
-and `scripts/dev/dev_rebuild_agent.sh`; `IMAGE_SOURCE` is passed by none of them.
+unless `allowUnstampedImage` is set. Three build paths do pass `GIT_SHA`: `make docker-build-platform`
+and `make docker-build-credential-proxy` (and so `make docker-push`, which builds through them),
+which read it from `scripts/git_revision_stamp.sh`; `scripts/dev/dev_rebuild_agent.sh`, which reads
+the same helper; and `hack/ci-deploy.sh` (through `deploy/docker/cloudbuild-ci.yaml`, on the
+`platform` target only). `IMAGE_SOURCE` is passed by the `make` targets alone, and only when it is
+set on the command line — `make docker-push IMAGE_SOURCE=https://github.com/<owner>/<repo>`; every
+other build leaves the `source` label empty.
 
 ## Private / custom registry
 

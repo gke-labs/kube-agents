@@ -102,16 +102,20 @@ The stamp is the only edit this feature makes to a _runtime_ path outside its ow
 the end of the stage, so a changing sha rebuilds the one instruction that writes the file and
 nothing above it.
 
-> **No publish workflow passes it yet.** Two build paths do — `hack/ci-deploy.sh` through
-> `deploy/docker/cloudbuild-ci.yaml`, and `scripts/dev/dev_rebuild_agent.sh` — and neither
-> `.github/workflows/docker-publish-ghcr.yml` nor `docker-publish-gcp.yml` does, so a published
-> `platform-agent` image carries `{"revision":""}` and the loop refuses to run on it under the
-> shipped `allowUnstampedImage: false`. The refusal is correct and the message is not actionable
-> from a published image: an operator cannot rebuild it. Until the two workflows pass
-> `GIT_SHA` — `${{ github.sha }}` for the GHCR build, `_GIT_SHA` through Cloud Build for the GAR
-> one — the loop is usable only on an image built by one of those two paths. `IMAGE_SOURCE` is
-> passed by no build path at all, so `org.opencontainers.image.source` is empty on every image
-> today; nothing reads it, and the `ARG` is there for the build that will.
+> **No publish workflow passes it yet.** Three build paths do — the `Makefile`'s
+> `docker-build-platform` and `docker-build-credential-proxy` targets (and `docker-push`, which
+> builds through them), reading it from `scripts/git_revision_stamp.sh`;
+> `scripts/dev/dev_rebuild_agent.sh`, reading the same helper; and `hack/ci-deploy.sh` through
+> `deploy/docker/cloudbuild-ci.yaml` — and neither `.github/workflows/docker-publish-ghcr.yml` nor
+> `docker-publish-gcp.yml` does, so a published `platform-agent` image carries `{"revision":""}`
+> and the loop refuses to run on it under the shipped `allowUnstampedImage: false`. The refusal is
+> correct and the message is not actionable from a published image: an operator cannot rebuild it.
+> Until the two workflows pass `GIT_SHA` — `${{ github.sha }}` for the GHCR build, `_GIT_SHA`
+> through Cloud Build for the GAR one — the loop is usable only on an image built by one of those
+> three paths. `IMAGE_SOURCE` is passed only by the `make` targets, and only when it is set on the
+> command line (`make docker-push IMAGE_SOURCE=https://github.com/<owner>/<repo>`), so
+> `org.opencontainers.image.source` is empty on every published image and on every other build;
+> nothing reads it.
 
 **There is no registry-digest fallback.** The commit could instead be resolved by reading the
 runner's own image digest and taking the 40-hex tag that shares it, since release images are
@@ -594,10 +598,17 @@ no egress rule to that Service, and the platform minter's ingress policy admits 
 `kubeagents.x-k8s.io/has-credential-proxy: "true"`, which this pod deliberately does not carry
 (§5.3). So nothing the loop runs can obtain an App token for a repository an operator never granted,
 and leaving the variable unset is a signpost rather than the control.
-[`github_token_refresh.py`](../../agents/platform/scripts/github_token_refresh.py) and
-[`credential_proxy.py`](../../agents/platform/scripts/credential_proxy.py) are unmodified by this
-feature, and so is the operator — the isolation is that the loop's credential path is entirely in
-its own chart template and its own runner.
+[`github_token_refresh.py`](../../agents/platform/scripts/github_token_refresh.py) is unmodified by
+this feature, and so is the operator — the isolation is that the loop's credential path is entirely
+in its own chart template and its own runner.
+[`credential_proxy.py`](../../agents/platform/scripts/credential_proxy.py) is modified, and the
+changes ship in every install's sidecar image whether or not the loop is enabled. Two of them only
+run when `CREDENTIAL_PROXY_UNTRUSTED_WORKSPACE` is on, which only the loop's sidecar sets:
+`HARDENED_GIT_CONFIG` with the `gh` credential-helper re-arm in `gh_credential_helpers`, and the
+`argv_path_violation` containment check. Two run on every install: `-R` joining
+`_VALUE_TAKING_SHORTHANDS`, and `policy_match_text` reading a free-text shorthand buried in a flag
+cluster. §11 has each. None of that changes where a credential comes from or which pod can obtain
+one; it changes what the sidecar lets a command do once it holds one.
 
 ### 6.3 Proving the token before the turn is paid for
 
@@ -1633,9 +1644,10 @@ opt-in and why §7's gate is per-install configuration rather than a constant.
   pod" limit below already argues for on isolation grounds. Until it exists, treat `fork` and
   `upstream` as unimplemented.
 - **Revision identification depends on the build passing `GIT_SHA`, and no publish workflow passes
-  it yet.** The stamp in §2 is written by the Dockerfile from a build argument that only
-  `hack/ci-deploy.sh` (through `deploy/docker/cloudbuild-ci.yaml`) and
-  `scripts/dev/dev_rebuild_agent.sh` supply, so an image pulled from GHCR or GAR carries
+  it yet.** The stamp in §2 is written by the Dockerfile from a build argument that only the
+  `make docker-build-*` and `docker-push` targets, `scripts/dev/dev_rebuild_agent.sh` and
+  `hack/ci-deploy.sh` (through `deploy/docker/cloudbuild-ci.yaml`) supply, so an image pulled from
+  GHCR or GAR carries
   `{"revision":""}` and the loop refuses to investigate it under the shipped
   `allowUnstampedImage: false`. That is the intended failure rather than a silent one, but it is
   the common case and not the edge: until the two publish workflows pass the argument (§2), an
