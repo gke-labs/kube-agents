@@ -1574,8 +1574,8 @@ agent-side servers and their tests — `platform_mcp_server.py`, `session_kv_ser
 wholesale would put a file named `credential_proxy.py` inside the sandbox, which is the
 wrong thing for a reviewer to find even though it is inert there. So the image gets an
 explicit allowlist: `sandbox_exec.py`, `forge.py`, `pr_triggers.py`,
-`github_token_refresh.py`, `gitops_workspace.py`, `gke_endpoint.py` and
-`cluster_preflight.sh` — the entry points an agent is told to run, plus the transitive
+`github_token_refresh.py`, `gitops_workspace.py`, `gke_endpoint.py`, `cluster_preflight.sh`
+and `stall_report.py` — the entry points an agent is told to run, plus the transitive
 closure of what they import.
 
 **The test for whether a script qualifies is what it needs, not how it is called.** An

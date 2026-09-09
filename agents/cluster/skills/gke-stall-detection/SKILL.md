@@ -15,7 +15,7 @@ Use this skill when a controller has gone quiet rather than red: a Gateway that 
 
 ## Heuristics and thresholds
 
-`scripts/stall_report.py` applies four heuristics to every object it reads. Each is gated by an age threshold, so a controller that is merely slow is not reported.
+`/opt/data/scripts/stall_report.py` applies four heuristics to every object it reads. Each is gated by an age threshold, so a controller that is merely slow is not reported.
 
 | Heuristic             | Fires when                                                                                                                                                                                                | Age measured from                                             |
 | --------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
@@ -34,13 +34,13 @@ A single run reads one snapshot, so `repeating-warnings` cannot watch a count mo
 gcloud container clusters get-credentials <cluster_name> --region <cluster_location>
 
 # Every namespaced kind in one namespace (kubectl api-resources decides which):
-python3 scripts/stall_report.py --namespace <namespace>
+python3 /opt/data/scripts/stall_report.py --namespace <namespace>
 
 # One or more kinds, as kubectl names them:
-python3 scripts/stall_report.py --namespace <namespace> --kind gateways.gateway.networking.k8s.io,httproutes.gateway.networking.k8s.io
+python3 /opt/data/scripts/stall_report.py --namespace <namespace> --kind gateways.gateway.networking.k8s.io,httproutes.gateway.networking.k8s.io
 
 # A different horizon, or machine-readable output:
-python3 scripts/stall_report.py --namespace <namespace> --threshold-minutes 60 --json
+python3 /opt/data/scripts/stall_report.py --namespace <namespace> --threshold-minutes 60 --json
 ```
 
 The table has one row per object and heuristic — `OBJECT`, `HEURISTIC`, `DETAIL`, `STALLED_FOR` — and always ends with `stalled resources: <count>`, the number of distinct objects with at least one row. A healthy namespace prints the header and `stalled resources: 0`. Lines beginning `warning:` on stderr name an API the script could not read; a kind it cannot list is left out of the scan, and a referent kind it cannot list is never reported missing.
@@ -50,7 +50,7 @@ The table has one row per object and heuristic — `OBJECT`, `HEURISTIC`, `DETAI
 A Gateway whose HTTPS listener names a TLS Secret that certificate automation was never going to create stays `Accepted=True` forever. The GKE Gateway controller sets `Programmed=False Invalid` on the Gateway and `ResolvedRefs=False InvalidCertificateRef` on the listener, emits a `Warning SYNC` event naming the Secret every few minutes, and never assigns an address; the HTTPRoutes behind it are accepted and never programmed, and nothing goes red. (Rows abridged: the `Ready=False NotReady` conditions on the Gateway and the listener, and the listener's own `Programmed=False`, appear too.)
 
 ```
-$ python3 scripts/stall_report.py --namespace edge --kind gateways.gateway.networking.k8s.io
+$ python3 /opt/data/scripts/stall_report.py --namespace edge --kind gateways.gateway.networking.k8s.io
 OBJECT        HEURISTIC           DETAIL                                                                                          STALLED_FOR
 Gateway/edge  dangling-reference  listeners[0].tls.certificateRefs -> Secret/edge-tls not found                                   6h12m
 Gateway/edge  stale-condition     Programmed=False Invalid                                                                        6h11m
