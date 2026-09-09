@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """stall_report.py -- find controllers that stopped making progress without erroring.
 
-Reads one namespace (or one kind in it) through ``kubectl get -o json`` and
-applies four heuristics, each gated by an age threshold so that a controller
+Reads one namespace (or one kind in it) through ``kubectl get -o json``, one
+kind per call, and applies four heuristics, each gated by an age threshold so that a controller
 that is merely slow is not reported:
 
 ``generation-lag``
@@ -52,6 +52,7 @@ OUTPUT_FLAG = "-o"
 OUTPUT_JSON = "json"
 OUTPUT_NAME = "name"
 SHOW_MANAGED_FIELDS_FLAG = "--show-managed-fields"
+FIELD_SELECTOR_FLAG = "--field-selector"
 EVENTS_RESOURCE = "events"
 # kubectl accepts `kind/name`; a --kind carrying one returns a single object
 # rather than a List.
@@ -87,6 +88,8 @@ TERMINAL_POD_PHASES = frozenset({"Succeeded", "Failed"})
 # the recency together are the closest a single read gets.
 WARNING_EVENT_TYPE = "Warning"
 REPEATING_EVENT_MIN_COUNT = 3
+# Only Warning events feed the heuristic, so only they are fetched.
+WARNING_EVENTS_SELECTOR = f"type={WARNING_EVENT_TYPE}"
 
 # managedFields operations that write spec. "Update" also covers status writes
 # by controllers, so an entry only counts when its fieldsV1 touches f:spec.
@@ -105,8 +108,23 @@ LIST_ITEM_PARENT_REF_KEY = "parentRef"
 # repeating-warnings heuristic; Secrets are never fetched as objects (their
 # names come from `-o name` when a reference needs resolving); metrics are
 # samples, not reconciled objects. Endpoints carry no conditions and kubectl
-# prints a deprecation warning for every read of them.
-SCAN_EXCLUDED_RESOURCES = frozenset({"events", "events.events.k8s.io", "secrets", "endpoints"})
+# prints a deprecation warning for every read of them. ConfigMaps,
+# ControllerRevisions, EndpointSlices and Leases carry no conditions and no
+# spec references, so no heuristic can report one, and they are the bulk of a
+# busy namespace: ConfigMap bodies, a pod template per revision, an endpoint
+# per Pod.
+SCAN_EXCLUDED_RESOURCES = frozenset(
+    {
+        "events",
+        "events.events.k8s.io",
+        "secrets",
+        "endpoints",
+        "configmaps",
+        "controllerrevisions.apps",
+        "endpointslices.discovery.k8s.io",
+        "leases.coordination.k8s.io",
+    }
+)
 SCAN_EXCLUDED_GROUPS = frozenset({"metrics.k8s.io"})
 
 # Spec keys that carry a reference to another object, with the kind a reference
@@ -605,16 +623,55 @@ def render_table(findings: list[dict]) -> str:
 
 
 def collect(namespace: str, kinds: str | None) -> tuple[list[dict], list[dict]]:
-    resources = kinds.split(",") if kinds else namespaced_resources()
+    """Objects of every requested kind in the namespace, and its Warning events.
+
+    One kubectl call per kind, not one for the namespace. In the Cluster
+    Agent's shell, kubectl is the credential-proxy shim: the broker cuts a
+    reply at its output cap (CREDENTIAL_PROXY_MAX_OUTPUT_BYTES, 4 MiB by
+    default) and hands back the prefix with kubectl's own exit code, so a busy
+    namespace read in one call arrives as JSON cut mid-string. Read per kind,
+    an overflow costs that one kind, and a warning names it; only a scan that
+    could read no kind at all is an error.
+    """
+    resources = [r for r in (kinds.split(",") if kinds else namespaced_resources()) if r]
     if not resources:
         return [], []
-    listing = kubectl_json(
-        [KUBECTL_GET, ",".join(resources), NAMESPACE_FLAG, namespace, SHOW_MANAGED_FIELDS_FLAG]
-    )
-    # A `kind/name` in --kind returns the one object rather than a List.
-    objects = listing.get("items") if "items" in listing else [listing]
-    events = kubectl_json([KUBECTL_GET, EVENTS_RESOURCE, NAMESPACE_FLAG, namespace]).get("items")
-    return list(objects or []), list(events or [])
+    objects: list[dict] = []
+    unread: list[str] = []
+    for resource in resources:
+        try:
+            listing = kubectl_json(
+                [KUBECTL_GET, resource, NAMESPACE_FLAG, namespace, SHOW_MANAGED_FIELDS_FLAG]
+            )
+        except RuntimeError as exc:
+            unread.append(resource)
+            sys.stderr.write(
+                f"{WARNING_PREFIX}{resource} in {namespace} not scanned; its objects are "
+                f"missing from the count: {exc}\n"
+            )
+            continue
+        # A `kind/name` in --kind returns the one object rather than a List.
+        objects.extend((listing.get("items") or []) if "items" in listing else [listing])
+    if len(unread) == len(resources):
+        raise RuntimeError(f"no kind could be read in {namespace}: {', '.join(unread)}")
+    try:
+        events = kubectl_json(
+            [
+                KUBECTL_GET,
+                EVENTS_RESOURCE,
+                NAMESPACE_FLAG,
+                namespace,
+                FIELD_SELECTOR_FLAG,
+                WARNING_EVENTS_SELECTOR,
+            ]
+        ).get("items")
+    except RuntimeError as exc:
+        sys.stderr.write(
+            f"{WARNING_PREFIX}events in {namespace} not read; {HEURISTIC_EVENTS} is not "
+            f"checked: {exc}\n"
+        )
+        events = []
+    return objects, list(events or [])
 
 
 def main(argv: list[str] | None = None) -> int:

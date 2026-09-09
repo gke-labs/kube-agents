@@ -43,7 +43,7 @@ python3 /opt/data/scripts/stall_report.py --namespace <namespace> --kind gateway
 python3 /opt/data/scripts/stall_report.py --namespace <namespace> --threshold-minutes 60 --json
 ```
 
-The table has one row per object and heuristic — `OBJECT`, `HEURISTIC`, `DETAIL`, `STALLED_FOR` — and always ends with `stalled resources: <count>`, the number of distinct objects with at least one row. A healthy namespace prints the header and `stalled resources: 0`. Lines beginning `warning:` on stderr name an API the script could not read; a kind it cannot list is left out of the scan, and a referent kind it cannot list is never reported missing.
+The table has one row per object and heuristic — `OBJECT`, `HEURISTIC`, `DETAIL`, `STALLED_FOR` — and always ends with `stalled resources: <count>`, the number of distinct objects with at least one row. A healthy namespace prints the header and `stalled resources: 0`. The scan reads one kind per `kubectl get`, so a kind whose listing is too large for the shell's output cap or that the identity cannot list is left out on its own: a `warning:` line on stderr names it and says its objects are missing from the count. A `warning:` line also names a referent kind the identity cannot list; references to it are then never reported missing. Only a scan that could read no kind at all exits non-zero.
 
 ## Worked example: a Gateway waiting for a Secret that will never exist
 

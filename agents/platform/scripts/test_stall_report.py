@@ -387,7 +387,11 @@ class Helpers(unittest.TestCase):
         self.assertIsNone(stall_report.parse_time("yesterday"))
 
     def test_namespaced_resources_filters_exclusions(self):
-        listing = "deployments.apps\nevents\nevents.events.k8s.io\nsecrets\nendpoints\npods.metrics.k8s.io\ngateways.gateway.networking.k8s.io\n"
+        listing = (
+            "deployments.apps\nevents\nevents.events.k8s.io\nsecrets\nendpoints\npods.metrics.k8s.io\n"
+            "configmaps\ncontrollerrevisions.apps\nendpointslices.discovery.k8s.io\nleases.coordination.k8s.io\n"
+            "gateways.gateway.networking.k8s.io\n"
+        )
         with patch.object(stall_report, "run_kubectl", return_value=(0, listing, "")):
             self.assertEqual(stall_report.namespaced_resources(), ["deployments.apps", "gateways.gateway.networking.k8s.io"])
 
@@ -453,17 +457,64 @@ class Main(unittest.TestCase):
         self.assertEqual(objects, [single])
         self.assertEqual(events, [])
 
-    def test_collect_passes_kinds_and_managed_fields(self):
+    def test_collect_reads_one_kind_per_call_and_only_warning_events(self):
         calls = []
 
         def fake_json(args):
             calls.append(args)
-            return {"items": []}
+            return {"items": [{"kind": args[1]}]}
 
         with patch.object(stall_report, "kubectl_json", side_effect=fake_json):
-            stall_report.collect(NAMESPACE, "deployments,gateways")
-        self.assertEqual(calls[0], ["get", "deployments,gateways", "-n", NAMESPACE, "--show-managed-fields"])
-        self.assertEqual(calls[1], ["get", "events", "-n", NAMESPACE])
+            objects, events = stall_report.collect(NAMESPACE, "deployments,gateways,")
+        self.assertEqual(calls[0], ["get", "deployments", "-n", NAMESPACE, "--show-managed-fields"])
+        self.assertEqual(calls[1], ["get", "gateways", "-n", NAMESPACE, "--show-managed-fields"])
+        self.assertEqual(calls[2], ["get", "events", "-n", NAMESPACE, "--field-selector", "type=Warning"])
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([o["kind"] for o in objects], ["deployments", "gateways"])
+        self.assertEqual(events, [{"kind": "events"}])
+
+    def test_collect_keeps_the_other_kinds_when_one_listing_is_cut(self):
+        """The sandbox's kubectl is the credential-proxy shim, which returns the
+        prefix of an over-cap reply with exit 0 and a stderr note."""
+        cut = '{"apiVersion":"v1","kind":"List","items":[{"kind":"Pod","metadata":{"name":"a'
+
+        def fake_kubectl(args):
+            if args[1] == "pods":
+                return 0, cut, "credential proxy output truncated\n"
+            if args[1] == "events":
+                return 0, '{"items":[]}', ""
+            return 0, '{"items":[{"kind":"Deployment","metadata":{"name":"web"}}]}', ""
+
+        with patch.object(stall_report, "run_kubectl", side_effect=fake_kubectl):
+            with redirect_stderr(io.StringIO()) as err:
+                objects, events = stall_report.collect(NAMESPACE, "deployments,pods,replicasets")
+        self.assertEqual([o["metadata"]["name"] for o in objects], ["web", "web"])
+        self.assertEqual(events, [])
+        self.assertIn("warning: credential proxy output truncated", err.getvalue())
+        self.assertIn(f"warning: pods in {NAMESPACE} not scanned; its objects are missing from the count", err.getvalue())
+        self.assertNotIn("deployments in", err.getvalue())
+
+    def test_collect_errors_only_when_no_kind_could_be_read(self):
+        with patch.object(stall_report, "run_kubectl", return_value=(1, "", "Unable to connect to the server")):
+            with redirect_stderr(io.StringIO()) as err:
+                with self.assertRaises(RuntimeError) as raised:
+                    stall_report.collect(NAMESPACE, "deployments,pods")
+        self.assertIn("no kind could be read", str(raised.exception))
+        self.assertIn("deployments, pods", str(raised.exception))
+        self.assertIn("warning: pods in", err.getvalue())
+
+    def test_collect_scans_without_events_when_they_cannot_be_read(self):
+        def fake_kubectl(args):
+            if args[1] == "events":
+                return 0, '{"items":[{"kind":"Event","metadata":{"name":"x', "credential proxy output truncated\n"
+            return 0, '{"items":[{"kind":"Deployment","metadata":{"name":"web"}}]}', ""
+
+        with patch.object(stall_report, "run_kubectl", side_effect=fake_kubectl):
+            with redirect_stderr(io.StringIO()) as err:
+                objects, events = stall_report.collect(NAMESPACE, "deployments")
+        self.assertEqual(len(objects), 1)
+        self.assertEqual(events, [])
+        self.assertIn(f"warning: events in {NAMESPACE} not read; repeating-warnings is not checked", err.getvalue())
 
 
 if __name__ == "__main__":
