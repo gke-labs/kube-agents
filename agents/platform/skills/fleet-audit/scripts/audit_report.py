@@ -3676,7 +3676,12 @@ def _declared_pointer(entry: dict) -> tuple[str, str]:
     obj = str(entry.get("object", ""))
     if namespace:
         obj = f"{namespace}/{obj}"
-    return _cell(obj), _cell(where)
+    # The pointer is the one cell a reader follows rather than reads, so it
+    # gets the identifier ceiling instead of the cell one: a `repo:path`
+    # clipped at 120 characters renders as a path that does not exist, in a
+    # code span that says it does. 320 clears any slug plus a deep path and
+    # still bounds a hostile value, the same trade `_ident` makes.
+    return _cell(obj), _cell(where, limit=MAX_IDENT_CHARS)
 
 
 def _render_declared(declared: list[dict]) -> list[str]:
@@ -4042,10 +4047,13 @@ def render_clean_comment(
             out.append(f"- _…and {len(gaps) - MAX_SCOPE_ROWS} more_")
 
     # A clean run closes the ledger without rewriting it, so this comment is
-    # the only place a declared posture from this run is ever published. Say
-    # what was seen and where it is declared; "0 findings" over a fleet with
-    # pinned replicas the operator never hears about is a quieter claim than
-    # the run can back.
+    # the last place a declared posture is published on the issue tracker:
+    # once the ledger is closed, a clean run with declarations opens nothing
+    # (see the CLEAN branch of `handle_finish`), and the record is the
+    # declaration itself in the repository plus the `declared` count on the
+    # `finish` line. Say what was seen and where it is declared; "0 findings"
+    # over a fleet with pinned replicas the operator never hears about is a
+    # quieter claim than the run can back.
     declared = list(data.get("declared") or [])
     if declared:
         out += [
@@ -6336,6 +6344,7 @@ def handle_finish(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
     data = load_findings(args.findings_file, audit_id)
     findings = list(data["findings"])
+    declared = list(data.get("declared") or [])
     now = datetime.now(timezone.utc)
     opt_repo = getattr(args, "repo", None)
 
@@ -6493,6 +6502,16 @@ def handle_finish(args: argparse.Namespace) -> None:
                 f"{len(gaps)} coverage gap(s) mean it cannot speak for the "
                 f"fleet; opened {existing_url or 'a coverage ledger'}."
             )
+        elif declared:
+            # Nothing to open and nothing to close, but not nothing to say:
+            # the run deferred to a declaration, and with no ledger the only
+            # trace is this line and the count on the JSON line below. The
+            # declaration in the repository is the durable record.
+            log(
+                f"Audit {audit_id} is clean and has no open ledger; "
+                f"{len(declared)} declared posture(s) were not reported as "
+                "findings — the declarations in the repository are the record."
+            )
         else:
             log(f"Audit {audit_id} is clean and has no open ledger; nothing to do.")
         # No `stale_scheme` guard here on purpose. This branch is not a join —
@@ -6518,6 +6537,12 @@ def handle_finish(args: argparse.Namespace) -> None:
                     "silent_ok": not (clean_resolved or gaps or prs_closed),
                     "partial": bool(gaps),
                     "coverage_gaps": gaps,
+                    # How many postures a declaration kept off the ledger.
+                    # Not a silence term: a standing declaration is the same
+                    # every morning, and a count that woke the channel daily
+                    # would be muted within a week. An on-demand run reports
+                    # it because on-demand runs report everything.
+                    "declared": len(declared),
                 }
             )
         )
@@ -6793,6 +6818,8 @@ def handle_finish(args: argparse.Namespace) -> None:
                 # WARNING in the run log.
                 "partial": bool(gaps),
                 "coverage_gaps": gaps,
+                # Same field as the CLEAN branch; see the note there.
+                "declared": len(declared),
             }
         )
     )

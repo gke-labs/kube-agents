@@ -366,12 +366,24 @@ stream's open ledger issue, and returns the scratch path for `findings.json`. Em
   "repo": "acme/fleet",
   "workspace": "/opt/data/gitops/compliance-audit/acme__fleet",
   "findings_path": "/opt/data/scratch/findings_compliance-audit.json",
-  "pending_remediation_requests": ["netpol-missing-payments"]
+  "pending_remediation_requests": ["netpol-missing-payments"],
+  "context_repos": ["acme/terraform-live"]
 }
 ```
 
 `pending_remediation_requests` is the parsed set of `/remediate` targets from the issue's comments,
 surfaced early so the agent knows which findings need a manifest written during inspection.
+
+`context_repos` is the `context_repos` key of the same ConfigMap: repositories an SOP's
+declared-intent step reads before it reports a posture as a finding (#1341). It is a separate key
+from `managed_repos` because the managed list feeds the broker's push gate, the repository resolver
+and the minter policy, and a `role: context` marker inside it would have been flattened into a
+writable entry by the shared parser; a key nothing downstream reads is read-only by construction.
+The document may carry a `declared` list beside `findings` — a finding's four identity fields plus
+the `repo`, `path` and `excerpt` of the declaration — validated for roster, scope and a
+non-overlapping identity, and never given an id, so it enters no delta and no pull request. The
+obtainability SOP (§4a) is the pilot; the schema and the ledger section it renders to are stated in
+the skill file, and `finish` reports the list's length as `declared`.
 
 `workspace` is the clone, and it is not decoration. The audit cron starts in the agent's profile
 directory, which is not a working tree — so there is nothing to `git add` into and nothing for
@@ -442,13 +454,13 @@ was probably never a command is a bot picking an argument. A `/remediate` the ha
 into a comment is always inside a code span, and inline code is stripped before the mention search
 runs — otherwise the ledger reads its own replies back on the next run and answers itself forever.
 
-Exit contract — nine keys, always all nine:
+Exit contract — ten keys, always all ten:
 
-- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false}`
-- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false}`
-- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false}`
-- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":true,"coverage_gaps":["prod-eu-1: API server unreachable"],"silent_ok":false}`
-- `{"status":"UPDATED","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":true}`
+- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0}`
+- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0}`
+- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0}`
+- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":true,"coverage_gaps":["prod-eu-1: API server unreachable"],"silent_ok":false,"declared":0}`
+- `{"status":"UPDATED","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":true,"declared":0}`
 
 `--dry-run` renders the issue body and every PR body it _would_ open to stdout with zero git or gh
 **side effects**: nothing is cloned, staged, committed, pushed, created, edited, commented, or
@@ -573,6 +585,12 @@ headroom for the trailing marker and for anything a later section appends.
   body; the index needs no separate ordering rule because the body is already severity-first.
 - The clean-close comment is measured against the same budget, for the same reason: a clean run on a
   fleet with 900 skipped clusters must still be postable.
+- **The _Declared intent_ table** (the `declared` list, #1341) is measured with the fixed sections,
+  before the findings claim what is left, and capped at 50 rows with a trailing "…and N more" row:
+  a declaration that silently fell off the body would leave the posture unexplained, and a
+  row-capped table bounds what the findings can lose to it. Its `repo:path` pointer is clipped at
+  the 320-character identifier ceiling rather than the 120-character cell one, because it is
+  followed rather than read.
 
 ### 7.2 Scope, skipped, and limitations
 

@@ -2652,6 +2652,7 @@ class TestFinishWithFindings(HarnessTestCase):
                 "silent_ok": False,
                 "partial": False,
                 "coverage_gaps": [],
+                "declared": 0,
             },
         )
 
@@ -2710,6 +2711,7 @@ class TestFinishWithFindings(HarnessTestCase):
                 "silent_ok": False,
                 "partial": False,
                 "coverage_gaps": [],
+                "declared": 0,
             },
         )
 
@@ -2928,6 +2930,30 @@ class TestPublishedBodies(HarnessTestCase):
 
 
 class TestFinishClean(HarnessTestCase):
+    def test_a_clean_run_with_no_ledger_still_counts_what_was_declared(self):
+        # Nothing to open and nothing to close, so the JSON line and the log
+        # are the only trace that the run deferred to a declaration.
+        self.harness.replies = {"issue list": "[]"}
+        doc = make_doc(findings=[])
+        doc["declared"] = [make_declared()]
+        self.assertEqual(self.run_finish(doc), 0)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "CLEAN")
+        self.assertEqual(payload["declared"], 1)
+        # A standing declaration is the same every morning; it must not wake
+        # the channel.
+        self.assertTrue(payload["silent_ok"])
+        self.assertIn("1 declared posture(s)", self.err)
+        self.assertFalse(self.harness.gh_calls("issue", "create"))
+        self.assertFalse(self.harness.gh_calls("issue", "comment"))
+
+    def test_the_findings_branch_reports_the_declared_count_too(self):
+        self.harness.replies = {"issue list": "[]"}
+        doc = make_doc()
+        doc["declared"] = [make_declared(), make_declared(obj="Deployment/web")]
+        self.assertEqual(self.run_finish(doc), 0)
+        self.assertEqual(self.stdout_json()["declared"], 2)
+
     def test_clean_run_closes_the_open_ledger_as_completed(self):
         previous_body = published_body(
             make_doc(findings=[make_finding(fid="a"), make_finding(fid="b")]),
@@ -2964,6 +2990,7 @@ class TestFinishClean(HarnessTestCase):
                 "silent_ok": False,
                 "partial": False,
                 "coverage_gaps": [],
+                "declared": 0,
             },
         )
 
@@ -2995,6 +3022,7 @@ class TestFinishClean(HarnessTestCase):
                 "silent_ok": True,
                 "partial": False,
                 "coverage_gaps": [],
+                "declared": 0,
             },
         )
 
@@ -3638,6 +3666,23 @@ class TestDeclaredIntent(BaseTestCase):
     def test_the_clean_comment_is_unchanged_without_declarations(self):
         comment = audit_report.render_clean_comment(AUDIT, make_doc(findings=[]), NOW)
         self.assertNotIn("posture(s)", comment)
+
+    def test_the_pointer_is_not_clipped_to_a_cell(self):
+        # `repo:path` is followed, not read: a 120-character clip renders a
+        # path that does not exist inside a code span that says it does.
+        repo = "acme/terraform-live-infrastructure-repository"
+        path = (
+            "clusters/prod-us-east-1/workloads/payments/checkout-gateway/"
+            "deployment-and-scaling-policy.tf"
+        )
+        self.assertGreater(len(f"{repo}:{path}"), audit_report.MAX_CELL_CHARS)
+        doc = make_doc()
+        doc["declared"] = [make_declared(repo=repo, path=path)]
+        validated = self.validate(doc)
+        body = render_body(validated, generated_at=NOW)
+        self.assertIn(f"`{repo}:{path}`", body)
+        comment = audit_report.render_clean_comment(AUDIT, validated, NOW)
+        self.assertIn(f"`{repo}:{path}`", comment)
 
     # -- the CLI --------------------------------------------------------------
 

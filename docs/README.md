@@ -176,6 +176,7 @@ identifier appears, add its source here.
 | GKE host-discovery label | `scripts/installer/common.sh` |
 | GitOps clone layout (`/opt/data/gitops/...`) and leases | `agents/platform/scripts/gitops_workspace.py` |
 | Repository-identity rules: accepted GitHub hostnames, path depth, segment grammar, length bound, and the `GIT_REPO_UNPARSEABLE` reason | `agents/platform/scripts/repo_ref.py` |
+| The gitops-state ConfigMap's keys (`managed_repos`, `context_repos`) and which one each consumer reads | `agents/platform/scripts/gitops_workspace.py` (readers) and `reconcileGitopsStateConfigMap` in `k8s-operator/internal/controller/platformagent_controller.go` (the `managed_repos` seed) |
 | Chat platforms an install posts to, the order, and the fallback | `agents/platform/scripts/chat_platforms.py` |
 | Which deliverables a Google Chat thread gets pasted inline, the size ceiling, and the per-message budget | `agents/platform/scripts/google_chat_relay_patch.py` |
 | Staging a sandbox-written artifact out for delivery: the per-file, per-card and total ceilings, the deadline, and the denied prefixes | `agents/platform/scripts/sandbox_artifact_patch.py` |
