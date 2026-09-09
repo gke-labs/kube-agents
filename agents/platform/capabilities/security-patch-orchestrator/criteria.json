@@ -1,7 +1,6 @@
 {
   "blocking_exclusion_min_days": 30,
   "deprecated_image_types": ["COS", "UBUNTU", "WINDOWS_SAC"],
-  "excluded_clusters": [],
   "fleet_spread_min_minors": 2,
   "pool_skew_critical_minors": 3
 }

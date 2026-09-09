@@ -403,7 +403,10 @@ def _apply_locked(
 
     before = effective_criteria(cap)
     pruned = stale_keys(cap)
-    reset = {k: e for k, e in invalid_keys(cap).items() if k not in changes}
+    # Every invalid stored value is recorded, including one this call replaces:
+    # `before` carries the default that stood in for it, so the changelog is the
+    # only place the raw value survives.
+    reset = invalid_keys(cap)
     candidate = {
         k: v for k, v in cap.criteria.items()
         if k not in STATE_KEYS and k not in pruned and k not in reset

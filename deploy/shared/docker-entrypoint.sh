@@ -952,7 +952,7 @@ fi
 # cron/jobs.json and capabilities/*/criteria.json are the entries that are
 # merged rather than replaced, inside profile_scaffold.py — in opposite
 # directions: the image wins the roster's keys, the volume wins the criteria's
-# (VOLUME_WINS_GLOBS there says why). It is image-owned and runtime state in the same file: the
+# (VOLUME_WINS_GLOBS there says why). The roster is image-owned and runtime state in the same file: the
 # schedules, prompts and `enabled` flags ship in the image, but the scheduler
 # writes each job's run history back into it and the operator can add jobs of
 # its own. Copying it wholesale erased both on every pod restart, losing the
