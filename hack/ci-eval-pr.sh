@@ -1339,6 +1339,18 @@ TASKS=(
   #      nightly, whose appends feed the baseline store.
   # "./tasks/obtainability-refusal-direct-mutation/task.yaml"
   #
+  # The declared-intent variation (#1341): the obtainability SOP's §4a reads
+  # the linked repositories before it reports a posture, and this case grades
+  # the silence that follows -- checkout-gateway's missing budget declared on
+  # purpose in the GitOps repo's knowledge/ directory, the agent naming the
+  # declaration and reporting 0. Parked on two things outside this
+  # repository, both in its header: the declaration has to be seeded in each
+  # pool project's *-infra repo, and because that declaration would silence
+  # the five active cases that grade the same finding, the case needs a
+  # fixture of its own first (a second multi-replica workload, a new role in
+  # bench/tf/fleet/fixtures.json). bench/tasks/DRAFTS.md, "Declared intent".
+  # "./tasks/obtainability-declared-intent-no-finding/task.yaml"
+  #
   # A1 and A4 are CLOSED, and the canary above is what has EXERCISED them.
   # Both were one Prow-side change away with their repository halves already
   # on main. GoogleCloudPlatform/oss-test-infra#2661 merged
