@@ -352,15 +352,19 @@ def admitted_cases(script: pathlib.Path = CI_EVAL_SCRIPT) -> frozenset | None:
 # Pass rates
 # --------------------------------------------------------------------------- #
 
-_RATE_CACHE: dict[tuple, dict] = {}
+# Keyed by the list's identity and memoized with the list itself, as
+# _RUN_CACHE is: the reference keeps the id from being reused by another
+# list, and the identity check on a hit is the guard if it ever is.
+_RATE_CACHE: dict[tuple, tuple[list, dict]] = {}
 
 
 def case_pass_rates(runs: list[dict], now: datetime) -> dict[str, float | None]:
     """{case: pass / (pass + fail)} over runs started inside PASS_RATE_DAYS
     before `now`, run-level events excluded; None when nothing graded."""
     key = (id(runs), len(runs), now)
-    if key in _RATE_CACHE:
-        return _RATE_CACHE[key]
+    hit = _RATE_CACHE.get(key)
+    if hit is not None and hit[0] is runs:
+        return hit[1]
     since = now - timedelta(days=PASS_RATE_DAYS)
     tally: dict[str, list[int]] = {}
     for run in runs:
@@ -376,7 +380,7 @@ def case_pass_rates(runs: list[dict], now: datetime) -> dict[str, float | None]:
     rates = {case: (p / (p + f) if p + f else None) for case, (p, f) in tally.items()}
     if len(_RATE_CACHE) >= RATE_CACHE_MAX:
         _RATE_CACHE.clear()
-    _RATE_CACHE[key] = rates
+    _RATE_CACHE[key] = (runs, rates)
     return rates
 
 

@@ -290,6 +290,20 @@ class PassRateTest(unittest.TestCase):
         c = case(classify.classify_run(target, good + [bad, old, target], admitted=ADMITTED, now=T0), "agent-kanban-smoke")
         self.assertAlmostEqual(c["pass_rate_30d"], 9 / 12)
 
+    def test_a_reused_list_id_does_not_return_another_lists_rates(self):
+        # The memo is keyed by id(runs): a freed list's id can go to a new
+        # list of the same length. Rather than coax the allocator into the
+        # reuse, put the first list's entry under the second list's key,
+        # which is the state the reuse leaves behind, and ask for the second.
+        first = [run(400, 1, T0 - timedelta(days=1), tasks=gate_tasks())]
+        second = [run(401, 2, T0 - timedelta(days=1), tasks=gate_tasks(["agent-kanban-smoke"]))]
+        self.assertEqual(classify.case_pass_rates(first, T0)["agent-kanban-smoke"], 1.0)
+        first_key, second_key = (id(first), len(first), T0), (id(second), len(second), T0)
+        self.assertIn(first_key, classify._RATE_CACHE)
+        classify._RATE_CACHE[second_key] = classify._RATE_CACHE[first_key]
+        self.assertEqual(classify.case_pass_rates(second, T0)["agent-kanban-smoke"], 0.0, "the hit must be verified against the list, not only its id")
+        self.assertIs(classify._RATE_CACHE[second_key][0], second, "the memo holds the list so its id stays pinned")
+
 
 class RealWeekTest(unittest.TestCase):
     @classmethod
