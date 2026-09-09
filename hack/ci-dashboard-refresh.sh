@@ -139,6 +139,22 @@ case "${EVAL_DASHBOARD_TARGET}" in
     ;;
 esac
 
+# The adjudicator's verdict and its history, when the target has them, so the
+# rendered Brief bakes the current state instead of waiting for the page's
+# first poll. Missing is the normal case until the adjudicator has run.
+HEALTH_PRIOR="${WORK}/health.json"
+HISTORY_PRIOR="${WORK}/health-history.jsonl"
+case "${EVAL_DASHBOARD_TARGET}" in
+  gs://*)
+    gsutil cp "${EVAL_DASHBOARD_TARGET%/}/health.json" "${HEALTH_PRIOR}" >>"${REFRESH_LOG}" 2>&1 || rm -f "${HEALTH_PRIOR}"
+    gsutil cp "${EVAL_DASHBOARD_TARGET%/}/health-history.jsonl" "${HISTORY_PRIOR}" >>"${REFRESH_LOG}" 2>&1 || rm -f "${HISTORY_PRIOR}"
+    ;;
+  *)
+    [ -f "${EVAL_DASHBOARD_TARGET%/}/health.json" ] && cp "${EVAL_DASHBOARD_TARGET%/}/health.json" "${HEALTH_PRIOR}"
+    [ -f "${EVAL_DASHBOARD_TARGET%/}/health-history.jsonl" ] && cp "${EVAL_DASHBOARD_TARGET%/}/health-history.jsonl" "${HISTORY_PRIOR}"
+    ;;
+esac
+
 # ─── Steps 2-5: collect (incremental) -> floor -> render -> publish ─────────
 # One timeout over the whole pipeline so a hung gsutil cannot eat the job.
 # The budget must stay LARGER than the 300s collect.py grants each individual
@@ -173,7 +189,10 @@ import json, sys
 if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
     sys.exit(\"collected zero runs: source unreadable or empty; refusing to publish an empty dashboard over a good one\")
 " "$2/data.json"
-  python3 "$1/render.py" --data "$2/data.json" --out-dir "$2/site"
+  render_args=()
+  [ -f "$2/health.json" ] && render_args+=(--health "$2/health.json")
+  [ -f "$2/health-history.jsonl" ] && render_args+=(--health-history "$2/health-history.jsonl")
+  python3 "$1/render.py" --data "$2/data.json" --out-dir "$2/site" "${render_args[@]}"
   python3 "$1/publish.py" --out-dir "$2/site" --target "$3"
 ' _ "${DASH_SRC}" "${WORK}" "${EVAL_DASHBOARD_TARGET}" "${EVAL_DASHBOARD_PR_GLOB}" \
   "${EVAL_DASHBOARD_SINCE_DAYS}" "${EVAL_DASHBOARD_FROM_DIR:-}" \

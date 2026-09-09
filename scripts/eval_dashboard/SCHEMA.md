@@ -1,7 +1,6 @@
-# data.json schema (version 1)
+# Eval dashboard contracts: `data.json`, `brief.json`, the pages
 
-`collect.py` writes this file; the dashboard renderer and the publisher are
-built against it **in parallel**. It is a contract: field names, types and
+`collect.py` writes `data.json`; the renderer and the publisher read it. It is a contract: field names, types and
 derivation rules below are fixed. Changes must be additive optional fields
 only — anything that renames, removes or re-types a field bumps
 `schema_version` and lands together with both consumers.
@@ -244,6 +243,73 @@ what the renderer does with them.
   top-level fields) into the output. Omitted, the field is omitted and the
   renderer's default applies.
 
+## The rendered pages
+
+`render.py` writes three pages beside `data.json`. Every time shown on the
+first two is America/Toronto ("ET"), formatted in the browser with
+`Intl.DateTimeFormat`; URL parameters stay ISO 8601 UTC.
+
+| Page          | What it is                                                                                                                                                                                                                                                              |
+| ------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `index.html`  | **The Brief**: the gate's state and why, what the agent saw, what changed right before, what is being done, and the runs in the window. Healthy: the last 24 hours in numbers and the last incident.                                                                   |
+| `run.html`    | **The PR view**, `run.html?build=<prow build id>`: one run, each failed gate case tagged `failing on N other PRs` / `only your PR` / `quota storm` / `unexplained` with its check reason, 30-day pass rate, transcript link and a one-line Do; a "what to do" box. |
+| `legacy.html` | The two-band page (agent trend, gate matrix, Pareto, evidence table).                                                                                                                                                                                                   |
+
+The Brief and the PR view render in the browser from `brief.json` (below)
+and refetch it and `health.json` every 60 seconds. `classify.py` is the one
+place the "is this red mine?" rule lives; the pages read its answer through
+`brief.json`, and anything else that answers the question imports it.
+
+### URL contract
+
+`index.html?cases=a,b&since=<ISO 8601 UTC>&until=<ISO 8601 UTC>#gate|#agent`
+
+- `cases`, `since`, `until` scope the Brief to that incident (a past one
+  when `until` is given). `since` is matched to an incident in
+  `health-history.jsonl`; without history the parameters describe it.
+- `#agent` shows the last 24 hours in numbers; `#gate` lands on the
+  "why we think" block. No parameters: the current state from `health.json`.
+- Case ids match `[A-Za-z0-9][A-Za-z0-9._-]{0,79}` (first 50 read); a value
+  that fails its grammar is dropped and everything reaches the DOM escaped.
+- `run.html?build=<digits>`; an id not in `brief.json` shows a
+  not-found page naming the window (`RUN_VIEW_DAYS`, 14 days).
+
+### `brief.json` (written by `render.py`)
+
+`{schema_version, generated_at, stale_after_s, run_days, admitted[],
+health, history, merges, cases{}, runs[]}`. `runs[]` is the last
+`run_days` of `data.json`, oldest first, each carrying its identity and
+timing plus `classify.classify_run(...)`: `verdict` (`red` = looks like
+the PR, `green`, `infra` = the gate's), `headline`, `lede`,
+`matches_incident`, `setup_death`, `storm_reps`, `do`, `cases[]`
+(`{case, outcome, cls, also_failing_prs, pass_rate_30d, reason, excerpt,
+do, admitted, reps}`) and `health_at` (the verdict in force when it
+finished, from history; `null` without history). `health` is the current
+verdict, `history` the ticks and the incidents derived from them, `merges`
+the recent first-parent commits of the checkout (`null` when the checkout
+is shallow or has no git, and the page omits "what changed right before").
+
+### `health.json` and `health-history.jsonl` (optional inputs)
+
+`health.json` is the CI health adjudicator's verdict, published beside
+`data.json` (nothing in this directory writes it); the fields read are
+`state` (`GREEN|DEGRADED|OUTAGE`), `condition`
+(`shared_break|storm|setup_deaths`), `since`, `cause`, `advice`,
+`failing_cases`, `tracking_issues`, `incident`, `recovering`, `stale`,
+`generated_at`, `tick`. Any other state, or an unreadable file, means no
+verdict: the Brief says no verdict is published and shows the last 24
+hours in numbers and the runs, the PR view classifies from the runs alone
+and shows no gate banner. Only a `GREEN` verdict reads as healthy.
+
+`health-history.jsonl` is one JSON object per line, each the full
+`health.json` document as published at that tick plus
+`"tick": "<ISO 8601 UTC>"`, oldest first (the reader sorts anyway and
+skips a malformed line). A run of non-GREEN ticks is one incident, from
+its first tick's `since` to the first GREEN tick after it; that is what
+the Brief's past-incident view and the PR view's "gate state at the time"
+banner read. Absent, the pages show the current verdict only. Neither
+file is copied into the out-dir: the adjudicator owns both.
+
 ## Fixtures
 
 `testdata/` holds three **real** `pull-kube-agents-smoke-test` builds
@@ -267,3 +333,9 @@ token observed in the wild (`pass`, `fail`, `infra`, `blocked`):
 | 2094432646640701440 | PR 1057 — parallel fan-out, green, one infra rep |
 | 2094467976156680192 | PR 1075 — serial markers, aborted mid-task       |
 | 2094714569262895104 | PR 1089 — blocked/infra-heavy, >300-char reasons |
+
+`testdata_classify/incidents.json.gz` holds a published `data.json`'s runs
+for two windows of the week of 2026-09-01 (PR #913's last runs on 09-04/05;
+the crashloop outage of 09-07/08 with PR #608's 15-case red inside it),
+trimmed to the fields `classify.py` reads, for `test_eval_dashboard_classify.py`
+and the page tests.
