@@ -1157,6 +1157,20 @@ func TestARefusalDoesNotSuspendTheGatewayNetworkPolicy(t *testing.T) {
 				}
 			},
 		},
+		{
+			name:    "RuntimeClassNotFound",
+			reason:  reasonRuntimeClassNotFound,
+			guarded: true,
+			mutate: func(a *agentv1alpha1.PlatformAgent) {
+				if a.Spec.Deployment == nil {
+					a.Spec.Deployment = &agentv1alpha1.DeploymentSpec{}
+				}
+				if a.Spec.Deployment.Availability == nil {
+					a.Spec.Deployment.Availability = &agentv1alpha1.AvailabilitySpec{}
+				}
+				a.Spec.Deployment.Availability.RuntimeClassName = ptr.To("nonexistent-runtime-class")
+			},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			scheme := setupScheme()
