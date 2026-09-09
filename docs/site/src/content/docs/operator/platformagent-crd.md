@@ -256,6 +256,12 @@ delays a delegated task, too high loses it silently. Raise it once you know your
 and your model quota — that quota is the other shared resource, and for most deployments it binds
 before memory does.
 
+The cap counts running cards, not resident processes, and one case makes those differ: a coordinator
+waiting on work it fanned out is discounted, or it would hold the slot its own children need
+([`kanban_scheduling.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/kanban_scheduling.py)).
+Peak memory is therefore the cap plus however many coordinators are waiting, held down by the
+dispatcher's memory-pressure guard rather than by this number.
+
 ### `spec.harness.experimental`
 
 Opt-in switches with no compatibility promise. A field here may change meaning, change its default,

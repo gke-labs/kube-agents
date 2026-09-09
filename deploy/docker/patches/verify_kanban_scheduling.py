@@ -2,9 +2,9 @@
 """Build gate for the kanban scheduling patches.
 
 Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes`` after
-``apply_kanban_scheduling.py``. The applier only proves six anchors matched
-exactly once. That says nothing about whether the engine those six edits produce
-actually schedules correctly, and all three faults they fix were emergent
+``apply_kanban_scheduling.py``. The applier only proves seven anchors matched
+exactly once. That says nothing about whether the engine those seven edits
+produce actually schedules correctly, and every fault they fix was emergent
 scheduling behaviour rather than a bad string — so every case below is driven
 against the real patched ``hermes_cli.kanban_db`` on a real board, through the
 real ``create_task`` / ``claim_task`` / ``block_task`` / ``detect_crashed_workers``
@@ -43,6 +43,13 @@ calls them.
      rejected version passed every anchor check and silently pinned reassigned
      cards in ``blocked`` forever. 4b is the one case the patch deliberately
      DOES change, pinned here so it stays a decision rather than a surprise.
+  E. The waiting-coordinator discount (issue #1252). A card waiting on the work
+     it fanned out is still ``running``, so it held a ``max_in_progress`` slot
+     its own children needed, and two waiters wedge the shipped cap of 2. Driven
+     through the real ``dispatch_once`` because the fault is in what that
+     function counts. Three of the six are controls: an ordinary worker still
+     holds its slot, a settled fan-out gives it back, and a gated continuation
+     is not a wait.
 
 Sections B and D overlap on purpose: the fence decides which cards reach the
 breaker and the charge loop is a caller of the very function D exercises, so a
@@ -1015,6 +1022,166 @@ check(
     "8. a worker kanban_block is still sticky",
     state(conn, "sticky")[0] == "blocked",
     f"state {state(conn, 'sticky')}, promoted {promoted}",
+)
+
+conn.close()
+
+
+# --- E. A waiting coordinator must not hold its children's slot -------------
+#
+# Driven through the real ``dispatch_once``, because the bug is in what that
+# function counts and nothing smaller can show it. ``spawn_fn`` records the
+# cards it was asked to launch and starts nothing.
+#
+# Two things have to be arranged that the image cannot supply at this stage.
+# ``tools/kanban_children_settled.py`` installs several stages later, so the
+# attribution table has no writer yet and these boards create and fill it
+# themselves — the same DDL and the same column direction, asserted against that
+# module by ``test_kanban_scheduling.py``. And no Hermes profile is real inside
+# the build, so every ready card would be dropped as non-spawnable before the cap
+# was ever consulted; ``profile_exists`` is stubbed for the one assignee in use.
+# Without that stub the cap checks pass while asserting nothing, which is how the
+# first draft of this section read green against the unpatched engine.
+print()
+print("waiting-coordinator discount:")
+
+from hermes_cli import profiles as _profiles  # noqa: E402
+
+_profiles.profile_exists = lambda name: name == "platform"
+
+WAITING_ASSIGNEE = "platform"
+FAKE_PID = 424242
+
+
+def waiting_board():
+    conn = fresh()
+    conn.execute(
+        f"CREATE TABLE IF NOT EXISTS {KS.CHILDREN_TABLE} ("
+        " child_id TEXT PRIMARY KEY, creator_id TEXT NOT NULL,"
+        " created_at INTEGER NOT NULL)"
+    )
+    return conn
+
+
+def fan_out(conn, creator, title, parents=()):
+    """A child card, attributed to ``creator`` the way a worker's create is."""
+    child = new_card(conn, title, parents=parents)
+    conn.execute(
+        f"INSERT OR IGNORE INTO {KS.CHILDREN_TABLE}"
+        " (child_id, creator_id, created_at) VALUES (?, ?, ?)",
+        (child, creator, int(time.time())),
+    )
+    conn.commit()
+    return child
+
+
+def spawns(conn, cap):
+    """One real dispatcher tick. Returns the ids it tried to launch."""
+    asked = []
+
+    def spawn_fn(*args, **kwargs):
+        task = kwargs.get("task") or kwargs.get("task_id") or (args[0] if args else None)
+        asked.append(getattr(task, "id", task))
+        return FAKE_PID
+
+    K.dispatch_once(conn, spawn_fn=spawn_fn, max_in_progress=cap)
+    return asked
+
+
+# E1. The reported wedge, at the cap the operator actually ships.
+conn = waiting_board()
+coord = new_card(conn, "Investigate the fleet")
+K.recompute_ready(conn)
+K.claim_task(conn, coord)
+child = fan_out(conn, coord, "Investigate cluster A")
+K.recompute_ready(conn)
+asked = spawns(conn, cap=1)
+check(
+    "E1. a waiting coordinator does not hold its child's slot at cap 1",
+    asked == [child],
+    f"spawned {asked}, wanted [{child}]",
+)
+
+# E2. The control the discount must not break: an ordinary worker still counts.
+conn = waiting_board()
+busy = new_card(conn, "Ordinary long job")
+K.recompute_ready(conn)
+K.claim_task(conn, busy)
+new_card(conn, "Unrelated work")
+K.recompute_ready(conn)
+asked = spawns(conn, cap=1)
+check(
+    "E2. a running card with no children still holds the slot",
+    asked == [],
+    f"spawned {asked}",
+)
+
+# E3. The wait ends when the children do, and the slot goes back.
+conn = waiting_board()
+coord = new_card(conn, "Fan-out")
+K.recompute_ready(conn)
+K.claim_task(conn, coord)
+child = fan_out(conn, coord, "helper")
+K.recompute_ready(conn)
+K.claim_task(conn, child)
+K.complete_task(conn, child, result="done")
+new_card(conn, "Someone else's work")
+K.recompute_ready(conn)
+asked = spawns(conn, cap=1)
+check(
+    "E3. a coordinator whose children are settled counts again",
+    asked == [],
+    f"spawned {asked}",
+)
+
+# E4. A continuation is not a wait. The child is gated behind the coordinator,
+# so freeing a slot for it would free it for a card that still cannot run --
+# the same exemption kanban_children_settled applies to the completion gate.
+conn = waiting_board()
+coord = new_card(conn, "Fan-out with a continuation")
+K.recompute_ready(conn)
+K.claim_task(conn, coord)
+fan_out(conn, coord, "Follow-up", parents=[coord])
+K.recompute_ready(conn)
+asked = spawns(conn, cap=1)
+check(
+    "E4. a gated continuation child does not free the slot",
+    asked == [],
+    f"spawned {asked}",
+)
+
+# E5. Two waiters, cap 2: the whole board used to stop. Both are discounted, so
+# the two slots go to children rather than to the cards waiting for them.
+conn = waiting_board()
+first = new_card(conn, "Fan-out one")
+second = new_card(conn, "Fan-out two")
+K.recompute_ready(conn)
+K.claim_task(conn, first)
+K.claim_task(conn, second)
+helpers = [
+    fan_out(conn, first if n < 3 else second, f"helper {n}") for n in range(5)
+]
+K.recompute_ready(conn)
+asked = spawns(conn, cap=2)
+check(
+    "E5. two waiting coordinators release both slots",
+    len(asked) == 2 and set(asked) <= set(helpers),
+    f"spawned {asked}",
+)
+
+# E6. A board that predates the attribution table gets upstream's count, not an
+# exception. This is every board in an installation upgrading onto the patch.
+conn = fresh()
+coord = new_card(conn, "Fan-out on a pre-patch board")
+K.recompute_ready(conn)
+K.claim_task(conn, coord)
+new_card(conn, "helper")
+K.recompute_ready(conn)
+asked = spawns(conn, cap=1)
+check(
+    "E6. no attribution table means no discount and no error",
+    asked == [],
+    f"spawned {asked}",
 )
 
 conn.close()

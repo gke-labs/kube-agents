@@ -843,7 +843,17 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_report_format.
 #     raise `kanban.failure_limit` above 2 and systemic trips become revertible
 #     again, above 3 and protocol trips follow.
 #
-# All three are emergent scheduling behaviour rather than a bad string, so the
+#   * A coordinator waiting on the work it fanned out is still `running`, so it
+#     holds a `max_in_progress` slot its own children need, and two waiters
+#     wedge the shipped cap of 2. Neither exit from `running` is open to it:
+#     `kanban_complete` is refused by the children-settled guard and SOUL.md
+#     forbids the dependency block. The patch discounts those cards inside
+#     `count_running_tasks`, using the same settled test the guard uses so the
+#     two never disagree. It reads a table a later build stage writes, so the
+#     read fails open and the applier reconciles both names at import time
+#     (issue #1252).
+#
+# All four are emergent scheduling behaviour rather than a bad string, so the
 # anchors alone prove nothing: verify_kanban_scheduling.py replays every
 # incident against a real board through the patched engine, and -- the part that
 # actually earns its runtime -- asserts that `assign_task`, `unblock_task`,
@@ -860,14 +870,20 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_report_format.
 # shorter text would have matched neither shape reliably.
 #
 # Must stay ahead of the kanban_wake_nudge block below, which anchors on
-# `create_task`, `complete_task` and `unblock_task` in the same file. The six
+# `create_task`, `complete_task` and `unblock_task` in the same file. The seven
 # anchors here touch none of those three, and test_kanban_scheduling.py asserts
 # that rather than leaving it to a reader.
 # See the module docstring in deploy/docker/patches/kanban_scheduling.py and the
 # applier docstring in deploy/docker/patches/apply_kanban_scheduling.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_scheduling.py /opt/hermes/hermes_cli/kanban_scheduling.py
+# kanban_scheduling.py and kanban_children_settled.py are here as the applier's
+# import-time cross-check reads them, not to be installed from here. The former
+# lands in hermes_cli/ via the COPY above; the latter is installed by the
+# kanban-children-settled stage further down and is only read here.
 COPY deploy/docker/patches/apply_kanban_scheduling.py \
      deploy/docker/patches/verify_kanban_scheduling.py \
+     deploy/docker/patches/kanban_scheduling.py \
+     deploy/docker/patches/kanban_children_settled.py \
      deploy/docker/patches/patchlib.py \
      /tmp/kanban-scheduling/
 RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling.py /opt/hermes && \
@@ -876,6 +892,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling
     grep -q "_kanban_claim_is_self(lock, _kanban_claimer)" /opt/hermes/hermes_cli/kanban_db.py && \
     grep -q "conn, _kanban_reclaimed.chargeable, _record_task_failure" /opt/hermes/hermes_cli/kanban_db.py && \
     grep -q "persisted_failures = max(failures, effective_limit)" /opt/hermes/hermes_cli/kanban_db.py && \
+    grep -q "return max(0, running - _kanban_count_waiting_on_children(conn))" /opt/hermes/hermes_cli/kanban_db.py && \
     test "$(grep -c 'lock.startswith(host_prefix)' /opt/hermes/hermes_cli/kanban_db.py)" = "2" && \
     test "$(grep -c '(persisted_failures, error\[:500\], task_id),' /opt/hermes/hermes_cli/kanban_db.py)" = "2" && \
     test "$(grep -c '(failures, error\[:500\], task_id),' /opt/hermes/hermes_cli/kanban_db.py)" = "1" && \

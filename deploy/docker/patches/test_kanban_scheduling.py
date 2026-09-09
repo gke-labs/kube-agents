@@ -61,6 +61,7 @@ from apply_kanban_scheduling import (
     RELATIVE,
     SPAWN_BIND_ANCHOR,
     TRIP_ANCHOR,
+    WAITING_ANCHOR,
     apply,
 )
 from apply_kanban_wake_nudge import (
@@ -68,7 +69,11 @@ from apply_kanban_wake_nudge import (
     CREATE_ANCHOR as WAKE_CREATE_ANCHOR,
     UNBLOCK_ANCHOR as WAKE_UNBLOCK_ANCHOR,
 )
+import apply_kanban_scheduling
+import kanban_children_settled as children_settled
 from kanban_scheduling import (
+    CHILDREN_TABLE,
+    CHILD_SETTLED_STATUSES,
     CLAIM_TIME_UNKNOWN,
     CONCURRENT_OWNER,
     DEPENDENCY_EVENT_KIND,
@@ -78,6 +83,7 @@ from kanban_scheduling import (
     RECLAIM_EVENT_KIND,
     Reclaimed,
     charge_reclaimed_cards,
+    count_waiting_on_children,
     claim_host,
     claim_is_self,
     classify_reclaim,
@@ -1161,6 +1167,137 @@ class FingerprintTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Part 4: the waiting-coordinator discount
+# ---------------------------------------------------------------------------
+
+
+def waiting_board(tasks, children=(), links=()):
+    """A board plus the attribution table ``tools/kanban_children_settled`` owns.
+
+    ``children`` is ``(child_id, creator_id)``, the direction that table stores.
+    Built here rather than imported so the test pins the schema edit 7 reads
+    against, not whatever the other patch happens to write today.
+    """
+    conn = board(tasks, links=links)
+    conn.execute(
+        f"CREATE TABLE {CHILDREN_TABLE} ("
+        " child_id TEXT PRIMARY KEY, creator_id TEXT NOT NULL,"
+        " created_at INTEGER NOT NULL)"
+    )
+    for child, creator in children:
+        conn.execute(
+            f"INSERT INTO {CHILDREN_TABLE} (child_id, creator_id, created_at)"
+            " VALUES (?, ?, 0)",
+            (child, creator),
+        )
+    return conn
+
+
+class CountWaitingOnChildrenTest(unittest.TestCase):
+    """What the discount counts, and the four things it must not."""
+
+    def test_a_coordinator_with_a_live_child_is_waiting(self):
+        conn = waiting_board(
+            {"coord": "running", "kid": "ready"}, children=[("kid", "coord")]
+        )
+        self.assertEqual(count_waiting_on_children(conn), 1)
+
+    def test_a_running_card_with_no_children_is_not_waiting(self):
+        """The control. An ordinary worker must keep holding its slot."""
+        conn = waiting_board({"busy": "running"})
+        self.assertEqual(count_waiting_on_children(conn), 0)
+
+    def test_every_child_settled_means_the_wait_is_over(self):
+        conn = waiting_board(
+            {"coord": "running", "a": "done", "b": "archived"},
+            children=[("a", "coord"), ("b", "coord")],
+        )
+        self.assertEqual(count_waiting_on_children(conn), 0)
+
+    def test_one_live_child_among_settled_ones_still_counts(self):
+        conn = waiting_board(
+            {"coord": "running", "a": "done", "b": "running"},
+            children=[("a", "coord"), ("b", "coord")],
+        )
+        self.assertEqual(count_waiting_on_children(conn), 1)
+
+    def test_a_gated_continuation_child_does_not_free_the_slot(self):
+        """It cannot start until this card completes, so the slot buys nothing.
+
+        The same exemption ``kanban_children_settled`` applies before refusing a
+        completion, and it has to be the same one: a card whose only children are
+        continuations is not waiting, it is finishing.
+        """
+        conn = waiting_board(
+            {"coord": "running", "next": "todo"},
+            children=[("next", "coord")],
+            links=[("coord", "next")],
+        )
+        self.assertEqual(count_waiting_on_children(conn), 0)
+
+    def test_a_coordinator_that_is_not_running_is_not_counted(self):
+        """Only ``running`` cards occupy a slot, so only they can be discounted."""
+        for state in ("ready", "todo", "blocked", "review", "done"):
+            with self.subTest(status=state):
+                conn = waiting_board(
+                    {"coord": state, "kid": "ready"}, children=[("kid", "coord")]
+                )
+                self.assertEqual(count_waiting_on_children(conn), 0)
+
+    def test_each_waiting_card_is_counted_once_however_many_children(self):
+        conn = waiting_board(
+            {"coord": "running", "a": "ready", "b": "ready", "c": "ready"},
+            children=[("a", "coord"), ("b", "coord"), ("c", "coord")],
+        )
+        self.assertEqual(count_waiting_on_children(conn), 1)
+
+    def test_two_waiting_coordinators_count_two(self):
+        conn = waiting_board(
+            {"c1": "running", "c2": "running", "a": "ready", "b": "ready"},
+            children=[("a", "c1"), ("b", "c2")],
+        )
+        self.assertEqual(count_waiting_on_children(conn), 2)
+
+    def test_a_board_with_no_attribution_table_reads_as_no_waiters(self):
+        """Boards predate this table, and the build applies edit 7 before its writer.
+
+        Zero is upstream's count, so failing open here narrows dispatch back to
+        the old behaviour rather than unbounding it.
+        """
+        conn = board({"coord": "running", "kid": "ready"})
+        self.assertEqual(count_waiting_on_children(conn), 0)
+
+    def test_an_attributed_child_that_no_longer_exists_is_not_a_wait(self):
+        """The JOIN drops it. A deleted card cannot be waited on."""
+        conn = waiting_board({"coord": "running"}, children=[("ghost", "coord")])
+        self.assertEqual(count_waiting_on_children(conn), 0)
+
+    def test_a_broken_connection_reads_as_no_waiters(self):
+        conn = sqlite3.connect(":memory:")
+        conn.close()
+        self.assertEqual(count_waiting_on_children(conn), 0)
+
+
+class ChildrenTableAgreementTest(unittest.TestCase):
+    """Edit 7 reads a table another patch owns, and neither imports the other."""
+
+    def test_the_table_name_matches_the_patch_that_writes_it(self):
+        self.assertEqual(CHILDREN_TABLE, children_settled.CHILDREN_TABLE)
+
+    def test_the_settled_statuses_match_the_completion_gate(self):
+        """Disagree and the two differ on whether a card is done waiting."""
+        self.assertEqual(
+            tuple(CHILD_SETTLED_STATUSES), tuple(children_settled.SETTLED_STATUSES)
+        )
+
+    def test_the_applier_refuses_to_build_when_they_disagree(self):
+        """The check that turns a rename into a failed build, exercised for real."""
+        source = Path(apply_kanban_scheduling.__file__).read_text()
+        self.assertIn("Reconcile them before building.", source)
+        self.assertIn("CHILD_SETTLED_STATUSES", source)
+
+
+# ---------------------------------------------------------------------------
 # Part 3: the applier
 # ---------------------------------------------------------------------------
 
@@ -1265,8 +1402,15 @@ def _record_task_failure(conn, task_id, error, *, outcome, failure_limit=None,
 '''
 
 
+# Upstream's ``count_running_tasks``, verbatim around the anchor edit 7 replaces.
+COUNT_RUNNING_PREAMBLE = '''\
+def count_running_tasks(conn):
+    """Return the number of tasks currently in ``status='running'``."""
+'''
+
+
 def pristine():
-    """A fake ``kanban_db.py`` carrying exactly one of each of the six anchors."""
+    """A fake ``kanban_db.py`` carrying exactly one of each of the seven anchors."""
     return (
         "import re\n\n"
         + BLOCK_TASK_PREAMBLE
@@ -1278,6 +1422,9 @@ def pristine():
         + CHARGE_ANCHOR
         + DETECT_CRASHED_EPILOGUE
         + RECORD_FAILURE_FIXTURE
+        + COUNT_RUNNING_PREAMBLE
+        + WAITING_ANCHOR
+        + "\n\n"
         + UPSTREAM_FINGERPRINT_SOURCE
     )
 

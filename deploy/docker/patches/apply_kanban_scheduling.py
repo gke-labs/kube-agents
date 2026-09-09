@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Wire the kanban scheduling repairs into ``hermes_cli/kanban_db.py``.
 
-Six anchored edits in one file plus a single import trailer. All six used to be
-three separate appliers (``apply_kanban_dependency_repair``,
+Seven anchored edits in one file plus a single import trailer. Most of them used
+to be three separate appliers (``apply_kanban_dependency_repair``,
 ``apply_kanban_claim_fencing``, ``apply_kanban_breaker_counter``) rewriting the
 same source in sequence, each with its own idempotency story and two of them
 with their own trailer. They are merged because the file is the unit of risk: an
 anchor invalidated by a Hermes bump has to be re-derived against whatever the
-other five edits left behind, and that is only checkable when they are applied
+other six edits left behind, and that is only checkable when they are applied
 together and gated together. Behaviour is unchanged by the merge itself; the
-discriminator in edit 2 is the one deliberate behaviour change, and it is
-documented in ``kanban_scheduling.py``.
+discriminator in edit 2 and the discount in edit 7 are the deliberate behaviour
+changes, and both are documented in ``kanban_scheduling.py``.
 
     1. ``block_task`` dependency branch — call ``repair_inverted_dependencies``
        immediately before the ``dependency_wait`` event. That point is only
@@ -29,11 +29,16 @@ documented in ``kanban_scheduling.py``.
        rather than the raw attempt count.
     5. ``_record_task_failure`` spawn-path bind — use the floored value.
     6. ``_record_task_failure`` crash-path bind — use the floored value.
+    7. ``count_running_tasks`` — discount the ``running`` cards that are only
+       waiting for work they fanned out, so a coordinator does not hold the slot
+       its own children need (issue #1252). At the counter rather than its two
+       call sites because ``count_running_tasks_other_boards`` calls it per
+       board and the cap is host-level.
 
 Edits 2 and 3 must stay ordered before 4-6 for reading rather than for
 correctness: the fence decides which cards reach the breaker at all, and the
-charge it adds is a caller of the very function 4-6 rewrite. The anchors do not
-overlap.
+charge it adds is a caller of the very function 4-6 rewrite. Edit 7 is
+independent of all of them. The anchors do not overlap.
 
 ``_error_fingerprint`` IS NOT PATCHED, and that is a decision rather than an
 omission. An earlier version replaced upstream's
@@ -154,7 +159,32 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-import patchlib
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import patchlib  # noqa: E402
+
+# Edit 7 reads a table another patch owns. Both modules declare its name and the
+# settled-status set independently — importing across them would put hermes_cli
+# on tools/ — so they are reconciled here, at import time, and a rename in either
+# fails the build instead of silently making the discount a constant zero.
+import kanban_children_settled as _children  # noqa: E402
+import kanban_scheduling as _scheduling  # noqa: E402
+
+for _name in ("CHILDREN_TABLE",):
+    if getattr(_scheduling, _name) != getattr(_children, _name):
+        raise SystemExit(
+            f"apply_kanban_scheduling: {_name} disagrees between "
+            f"kanban_scheduling ({getattr(_scheduling, _name)!r}) and "
+            f"kanban_children_settled ({getattr(_children, _name)!r}). "
+            "Edit 7 would count nothing. Reconcile them before building."
+        )
+if tuple(_scheduling.CHILD_SETTLED_STATUSES) != tuple(_children.SETTLED_STATUSES):
+    raise SystemExit(
+        "apply_kanban_scheduling: the settled-status set disagrees between "
+        f"kanban_scheduling ({_scheduling.CHILD_SETTLED_STATUSES!r}) and "
+        f"kanban_children_settled ({_children.SETTLED_STATUSES!r}). Edit 7 and "
+        "the completion gate would disagree about whether a card is waiting."
+    )
 
 RELATIVE = "hermes_cli/kanban_db.py"
 
@@ -336,11 +366,46 @@ CRASH_BIND_PATCHED = (
     "                    (persisted_failures, error[:500], task_id),\n"
 )
 
+# --- 7. count_running_tasks: a waiter is not occupying a slot -----------------
+#
+# The whole body, so the replacement cannot land twice and so a Hermes bump that
+# rewrites the query fails here rather than leaving the discount applied to a
+# count that no longer means what it did.
+WAITING_ANCHOR = (
+    "    try:\n"
+    "        return int(\n"
+    "            conn.execute(\n"
+    "                \"SELECT COUNT(*) FROM tasks WHERE status = 'running'\"\n"
+    "            ).fetchone()[0]\n"
+    "        )\n"
+    "    except Exception:\n"
+    "        return 0\n"
+)
+
+WAITING_PATCHED = (
+    "    try:\n"
+    "        running = int(\n"
+    "            conn.execute(\n"
+    "                \"SELECT COUNT(*) FROM tasks WHERE status = 'running'\"\n"
+    "            ).fetchone()[0]\n"
+    "        )\n"
+    "    except Exception:\n"
+    "        return 0\n"
+    "    # kube-agents patch: a card waiting on the work it fanned out is still\n"
+    "    # 'running', so it holds a max_in_progress slot its own children need --\n"
+    "    # two waiters wedge the shipped cap of 2. Discounted here and not at the\n"
+    "    # call sites: count_running_tasks_other_boards calls this per board and\n"
+    "    # the cap is host-level. Fails open to no discount.\n"
+    "    # See hermes_cli/kanban_scheduling.py (issue #1252).\n"
+    "    return max(0, running - _kanban_count_waiting_on_children(conn))\n"
+)
+
 TRAILER = (
     "\n\n# kube-agents patch: see hermes_cli/kanban_scheduling.py\n"
     "from hermes_cli.kanban_scheduling import (  # noqa: E402\n"
     "    charge_reclaimed_cards as _kanban_charge_reclaimed_cards,\n"
     "    claim_is_self as _kanban_claim_is_self,\n"
+    "    count_waiting_on_children as _kanban_count_waiting_on_children,\n"
     "    release_dead_foreign_claims as _kanban_release_dead_foreign_claims,\n"
     "    repair_inverted_dependencies as _kanban_repair_inverted_deps,\n"
     ")\n"
@@ -353,11 +418,12 @@ EDITS = (
     ("_record_task_failure trip floor", TRIP_ANCHOR, TRIP_PATCHED),
     ("spawn-path blocked bind", SPAWN_BIND_ANCHOR, SPAWN_BIND_PATCHED),
     ("crash-path blocked bind", CRASH_BIND_ANCHOR, CRASH_BIND_PATCHED),
+    ("waiting-coordinator discount", WAITING_ANCHOR, WAITING_PATCHED),
 )
 
 
 def apply(root: Path) -> None:
-    """Apply all six edits under ``root``, or raise SystemExit with the reason.
+    """Apply all seven edits under ``root``, or raise SystemExit with the reason.
 
     Nothing is written until every anchor has matched exactly once and the
     result parses, so a Hermes bump that moves one anchor leaves the file
