@@ -1448,7 +1448,74 @@ GIT_LEASE_MARKER = ".lease"
 # directory inside another agent's lease. Both are leased today by every caller
 # that issues them — `ensure_workspace` writes the marker before it clones, at
 # the lease root the clone runs in — so requiring the lease costs nothing and
-# closes the two remaining ways one agent reaches another's tree.
+# The closed set of subcommands the product and its skills issue. Any
+# unrecognised or custom subcommand (including custom aliases) is refused
+# outright, failing closed rather than relying solely on denylists.
+ALLOWED_GIT_SUBCOMMANDS = frozenset(
+    {
+        "add",
+        "am",
+        "apply",
+        "branch",
+        "cat-file",
+        "check-ref-format",
+        "checkout",
+        "cherry-pick",
+        "clean",
+        "clone",
+        "commit",
+        "config",
+        "diff",
+        "fetch",
+        "grep",
+        "init",
+        "log",
+        "ls-files",
+        "ls-remote",
+        "merge",
+        "mv",
+        "pull",
+        "push",
+        "rebase",
+        "remote",
+        "reset",
+        "restore",
+        "revert",
+        "rev-parse",
+        "rm",
+        "show",
+        "sparse-checkout",
+        "stash",
+        "status",
+        "submodule",
+        "switch",
+        "symbolic-ref",
+        "tag",
+        "update-ref",
+        "version",
+        "worktree",
+    }
+)
+
+# Keys permitted to be written via repository-local `git config`. Only committer
+# identity configuration is needed by GitOps workspace setup; writing aliases,
+# filters, or execution hooks is refused.
+ALLOWED_GIT_CONFIG_KEYS = frozenset({"user.name", "user.email"})
+
+# Query options that make a `git config` invocation read-only.
+ALLOWED_GIT_CONFIG_QUERY_FLAGS = frozenset(
+    {
+        "--get",
+        "--get-all",
+        "--get-regexp",
+        "--get-urlmatch",
+        "--list",
+        "-l",
+        "--show-origin",
+        "--show-scope",
+    }
+)
+
 GIT_MUTATING_SUBCOMMANDS = frozenset(
     {
         "add", "am", "apply", "branch", "checkout", "cherry-pick", "clean",
@@ -1892,6 +1959,43 @@ def git_argument_violation(argv: list[str]) -> str | None:
                 "ask an operator for anything that has to change the proxy's own "
                 "configuration."
             )
+    subcommand, _ = _git_plan(argv)
+    if subcommand is not None and subcommand not in ALLOWED_GIT_SUBCOMMANDS:
+        return f"`git {subcommand}` is refused: subcommand is not supported by the credential proxy."
+    if subcommand == "config":
+        config_violation = _git_config_violation(argv)
+        if config_violation is not None:
+            return config_violation
+    return None
+
+
+def _git_config_violation(argv: list[str]) -> str | None:
+    """Why this git config argv may not run, or None if it may.
+
+    Queries (--get, --list, etc.) are non-mutating reads and are allowed.
+    Configuration writes are restricted to author identity (user.name, user.email)
+    which GitOps and workspace setup require. Any attempt to write aliases, filters,
+    drivers, or other configuration keys is refused.
+    """
+    if "config" not in argv:
+        return None
+    for arg in argv:
+        flag = arg.split("=", 1)[0]
+        if flag in ALLOWED_GIT_CONFIG_QUERY_FLAGS:
+            return None
+    try:
+        config_index = argv.index("config")
+    except ValueError:
+        return None
+    for token in argv[config_index + 1:]:
+        if token.startswith("-"):
+            continue
+        if token not in ALLOWED_GIT_CONFIG_KEYS:
+            return (
+                f"`git config {token}` is refused: only author identity configuration "
+                "(user.name, user.email) and query options are permitted."
+            )
+        return None
     return None
 
 
@@ -2730,7 +2834,11 @@ class CommandExecutor:
             command_cwd = requested_cwd
         command_environment = self.environment.copy()
         if argv and Path(argv[0]).name == "git":
+            command_environment.pop("KUBECONFIG", None)
+            command_environment.pop("CLOUDSDK_CONFIG", None)
             command_environment.update(self.git_identity)
+        elif argv and Path(argv[0]).name == "kubectl":
+            command_environment.pop("GH_CONFIG_DIR", None)
         if kubeconfig_path is not None:
             command_environment["KUBECONFIG"] = str(kubeconfig_path)
         process = subprocess.Popen(
