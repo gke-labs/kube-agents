@@ -1,0 +1,87 @@
+name: "Nightly: Scheduler"
+
+# Holds the nightly pipeline's cron one level up, so a daily tick with nothing
+# to promote produces no pipeline run at all.
+#
+# The pipeline used to make that decision itself, and a run that skipped every
+# job concluded success — skipped jobs do not fail a run. Gating at the trigger
+# leaves the pipeline with no skip path, so its conclusion means what it says.
+#
+# This job's own conclusion does not: it is green when it dispatched and green
+# when it decided not to. What it decided is in the job summary.
+
+permissions:
+  contents: read
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  # Dispatchable so the decision can be exercised by hand without waiting for a
+  # tick. It takes no inputs: the whole job is "work out whether there is
+  # anything to do", and a manual run that overrode that would be testing
+  # something else. To force a specific candidate through, dispatch
+  # nightly-pipeline.yml directly — it still accepts rc_tag.
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-scheduler
+  cancel-in-progress: false
+
+jobs:
+  dispatch-if-there-is-work:
+    name: Dispatch the nightly pipeline if a promotion is needed
+    # A fork inherits the cron but none of the credentials. The guard is on the
+    # job rather than trusted to cascade, matching every other scheduled
+    # workflow here.
+    if: github.repository == 'gke-labs/kube-agents'
+    runs-on: ubuntu-latest
+    # `nightly` for GH_ORG and GH_REPO (used by release_fetch_tags to query the
+    # target repository's tag graph), matching the scope the pipeline runs in.
+    environment: nightly
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # For the dispatch step below. `workflow_dispatch` is one of the two events
+      # GitHub exempts from the recursion suppression that would otherwise stop
+      # the default token starting another run.
+      actions: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The resolver reads the tag graph to decide whether this commit has
+          # already been promoted, so a shallow clone would answer "no such tag"
+          # and re-run a candidate every day.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The same script, with the same inputs, that nightly-pipeline.yml runs. That
+      # is the point: the skip decision has one implementation, so the gate that
+      # starts the pipeline and the gate inside it cannot drift into disagreeing
+      # about what a new candidate is.
+      - name: Resolve the newest candidate and decide whether to run
+        id: resolve
+        env:
+          GH_ORG: ${{ vars.GH_ORG }}
+          GH_REPO: ${{ vars.GH_REPO }}
+        run: ./scripts/release/resolve_promotion_candidate.sh
+
+      - name: Record that there is nothing to do
+        if: steps.resolve.outputs.skip_pipeline == 'true'
+        env:
+          COMMIT_SHA: ${{ steps.resolve.outputs.commit_sha }}
+          RC_TAG: ${{ steps.resolve.outputs.rc_tag }}
+          SKIP_REASON: ${{ steps.resolve.outputs.skip_reason }}
+        run: ./scripts/release/record_nightly_scheduler_skip.sh
+
+      # GITHUB_TOKEN rather than the PAT or App token the promotion step needs.
+      # This step is the only thing that starts the nightly pipeline on schedule,
+      # so whatever it depends on is a single point of failure, and the default token
+      # needs no secret to be present and cannot expire.
+      - name: Dispatch the nightly pipeline
+        if: steps.resolve.outputs.skip_pipeline != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_SHA: ${{ steps.resolve.outputs.commit_sha }}
+          RC_TAG: ${{ steps.resolve.outputs.rc_tag }}
+        run: ./scripts/release/dispatch_nightly_pipeline.sh

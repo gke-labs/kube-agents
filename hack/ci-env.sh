@@ -119,8 +119,9 @@ dump_prow_artifacts_on_failure() {
     # is visible only in this pod's log -- the gateway just relays the text.
     kubectl logs deployment/litellm -n "${ns}" --tail=1000 > "${artifact_dir}/litellm.log" 2>&1 || true
     # The gateway capture above reads the pod's default container (platform-agent);
-    # a dropped port-forward stream is only visible from the envoy sidecar's side.
-    kubectl logs deployment/platform-agent-gateway -c envoy-credential-proxy -n "${ns}" --tail=2000 > "${artifact_dir}/envoy-credential-proxy.log" 2>&1 || true
+    # a dropped port-forward stream is only visible from the auth sidecar's side.
+    kubectl logs deployment/platform-agent-gateway -c agent-api-auth -n "${ns}" --tail=2000 > "${artifact_dir}/agent-api-auth.log" 2>&1 || true
+    kubectl logs deployment/platform-agent-credential-proxy -c envoy-credential-proxy -n "${ns}" --tail=2000 > "${artifact_dir}/envoy-credential-proxy.log" 2>&1 || true
     # Konnectivity/tunnel churn shows up as kube-system events, not in "${ns}".
     kubectl get events -n kube-system --sort-by=.lastTimestamp 2>&1 | tail -100 > "${artifact_dir}/kube-system-events.txt" 2>&1 || true
 

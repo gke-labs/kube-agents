@@ -93,16 +93,43 @@ access Google Cloud APIs.
 Control traffic flow between Pods using Network Policies. By default, all
 traffic is allowed.
 
-**Enable Network Policy Enforcement:**
+**Check Network Policy Enforcement & Dataplane:**
+
+Before modifying cluster networking, inspect whether NetworkPolicy enforcement
+is already active or provided natively by Dataplane V2:
 
 ```bash
+gcloud container clusters describe <cluster-name> \
+    --location <location> \
+    --format='value(networkConfig.datapathProvider,networkPolicy.enabled)'
+```
+
+- If `datapathProvider` is `ADVANCED_DATAPATH` (Dataplane V2), NetworkPolicy
+  enforcement is built-in natively via eBPF/Cilium from cluster creation. Calico
+  addons cannot be enabled and are not needed.
+- If `networkPolicy.enabled` is `True`, Calico enforcement is already enabled on nodes.
+- If neither is active, enable Calico network policy enforcement using the two-step
+  sequence below.
+
+**Enable Network Policy Enforcement (non-DPv2 clusters):**
+
+Enabling network policy enforcement on clusters without Dataplane V2 requires
+two sequential commands in this order: first enable the Calico addon on the
+control plane, then enable network policy enforcement on the nodes. GKE rejects
+`--enable-network-policy` with HTTP 400 until the addon is enabled, and `gcloud`
+rejects both flags in a single invocation.
+
+```bash
+# Step 1: Enable the NetworkPolicy addon on the control plane
 gcloud container clusters update <cluster-name> \
     --update-addons=NetworkPolicy=ENABLED \
     --region <region>
-```
 
-> [!NOTE] If your cluster uses Dataplane V2 (`--enable-dataplane-v2`), Network
-> Policy enforcement is built-in and this step is not required (and may fail).
+# Step 2: Enable NetworkPolicy enforcement on the nodes (node pools may be recreated; this can take several minutes)
+gcloud container clusters update <cluster-name> \
+    --enable-network-policy \
+    --region <region>
+```
 
 **Apply Default Deny Policy:** Isolate namespaces by denying all ingress and
 egress traffic by default.

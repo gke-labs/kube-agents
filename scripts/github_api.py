@@ -2,7 +2,9 @@
 
 Combines bounded retries on transient errors (5xx, 429, secondary rate limit 403)
 with automatic list endpoint pagination (`get_all`), so callers neither drop
-writes on transient blips nor silently truncate multi-page lists.
+writes on transient blips nor silently truncate multi-page lists. `graphql()`
+goes through the same retries and raises on an `errors` body, so a partial
+answer is never mistaken for a whole one.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ import urllib.request
 
 API_ROOT = "https://api.github.com"
 API_VERSION = "2022-11-28"
+GRAPHQL_PATH = "/graphql"
 DEFAULT_USER_AGENT = "kube-agents-scripts"
 
 REQUEST_ATTEMPTS = 3
@@ -138,3 +141,16 @@ class GitHubAPI:
 
     def delete(self, path: str, tolerate=()):
         return self.request("DELETE", path, tolerate=tolerate)
+
+    def graphql(self, query: str, variables=None):
+        """One GraphQL call. Errors in the body are raised, not returned.
+
+        GraphQL answers 200 to a query that failed and puts the failure under
+        `errors`, so a caller reading `data` alone would take a partial answer
+        for a whole one.
+        """
+        result = self.post(GRAPHQL_PATH, {"query": query, "variables": variables or {}})
+        errors = (result or {}).get("errors")
+        if errors:
+            raise RuntimeError(f"GraphQL: {errors}")
+        return result["data"]

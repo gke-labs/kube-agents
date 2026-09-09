@@ -32,6 +32,16 @@ metadata:
     app.kubernetes.io/component: api
 spec:
   replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Why maxUnavailable is 0 here: a cold roll pulls 1.4 GB before the
+      # container starts and spends up to 5 minutes loading models.
+      # At replicas: 1, maxUnavailable: 1 terminates the old Pod immediately,
+      # taking the long-term memory API offline for minutes during rollouts.
+      # maxUnavailable: 0 ensures the old Pod serves until the replacement is Ready.
+      maxUnavailable: 0
+      maxSurge: 1
   # 15 minutes, above the default 600s, because this pod's own budget is not
   # the whole story: a cold roll pulls 1.4 GB before the container starts and
   # only then spends the startupProbe budget below loading models. At the

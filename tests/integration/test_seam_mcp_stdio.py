@@ -43,6 +43,13 @@ EXPECTED_TOOLS = {
     "audit_log_searcher",
     "send_notification",
     "report_to_chat",
+    "register_findings",
+    "get_findings",
+    "get_ranked_findings",
+    "update_finding",
+    "mark_finding_surfaced",
+    "record_finding_verification",
+    "findings_publication",
 }
 
 

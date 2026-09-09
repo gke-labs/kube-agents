@@ -5,6 +5,15 @@ metadata:
   namespace: kubeagents-system
 spec:
   replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Why maxUnavailable is 0 here: pulling and loading Gemma model weights
+      # takes minutes (with a 10-minute startupProbe budget). At replicas: 1,
+      # maxUnavailable: 1 terminates the serving Pod immediately, causing minutes
+      # of inference outage during rollouts. maxUnavailable: 0 ensures continuous serving.
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app: gemma-server

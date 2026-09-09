@@ -18,6 +18,8 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"reflect"
@@ -32,6 +34,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
@@ -1260,5 +1263,290 @@ func TestCleanupA2ACostsThreeReadsWhenThereIsNothingToClean(t *testing.T) {
 	}
 	if lists != 0 {
 		t.Errorf("Lists = %d, want 0; the provision-Job sweep is still running on a no-op", lists)
+	}
+}
+
+// a2aFullCreds is a creds Secret carrying every key in the shape
+// randomA2APassword emits, at a known resourceVersion. The rollout-hash tests
+// need all five — a2aTestCreds omits sys-password — and they need the values
+// to be real 32-hex passwords, because what they assert is that a digest of
+// one appears nowhere in the render.
+func a2aFullCreds(nibble string, resourceVersion string) *corev1.Secret {
+	data := map[string][]byte{}
+	for i, key := range a2aCredsKeys {
+		data[key] = []byte(strings.Repeat(nibble, 31) + fmt.Sprintf("%x", i))
+	}
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "test-agent-a2a-nats-creds",
+			Namespace:       "test-ns",
+			ResourceVersion: resourceVersion,
+		},
+		Data: data,
+	}
+}
+
+// a2aPasswordDigestNeedles returns, for one password, every form of it that
+// must not reach a rendered name, label or annotation: the value itself, its
+// SHA-256, and that digest truncated the two ways this file truncates digests
+// (8 characters for the provision Job's name, 16 for the pod-template hash).
+func a2aPasswordDigestNeedles(password string) []string {
+	sum := sha256.Sum256([]byte(password))
+	digest := hex.EncodeToString(sum[:])
+	return []string{password, digest, digest[:8], digest[:16]}
+}
+
+// The pod-template hash rolls the bus when the config changes, and it used to
+// do that by hashing the rendered nats.conf — which carries all five NATS
+// passwords, putting a truncated digest of the credentials in an annotation
+// anyone who can get the StatefulSet can read (CodeQL alert 27,
+// go/weak-sensitive-data-hashing). The hash now covers the placeholder render
+// plus the creds Secret's resourceVersion, and all three properties below have
+// to hold at once: changing only the passwords must NOT move it, while a
+// config change and an in-place rotation must both still move it.
+func TestA2AConfigRolloutHashOmitsCredentialsAndTracksRotation(t *testing.T) {
+	agent := a2aTestAgent()
+	const rv = "4711"
+	credsA := a2aFullCreds("a", rv)
+	credsB := a2aFullCreds("b", rv)
+
+	// Guard against an inert test: if the two creds rendered the same conf,
+	// an equal hash below would prove nothing.
+	confA := string(buildA2ANATSConfigSecret(agent, credsA).Data["nats.conf"])
+	confB := string(buildA2ANATSConfigSecret(agent, credsB).Data["nats.conf"])
+	if confA == confB {
+		t.Fatal("the two creds Secrets render the same nats.conf; the omission check below is inert")
+	}
+
+	hashA := a2aConfigRolloutHash(agent, credsA)
+	if len(hashA) != a2aConfigHashLength {
+		t.Errorf("rollout hash is %d characters, want %d", len(hashA), a2aConfigHashLength)
+	}
+	if hashB := a2aConfigRolloutHash(agent, credsB); hashA != hashB {
+		t.Errorf("the rollout hash still tracks the password bytes: %q vs %q", hashA, hashB)
+	}
+
+	// An in-place rotation: ensureA2ACredsSecret repairs credentials with an
+	// Update on the same Secret, so the UID does not move and the
+	// resourceVersion is the only thing that says a credential changed.
+	rotated := a2aFullCreds("b", "4712")
+	if hashRotated := a2aConfigRolloutHash(agent, rotated); hashA == hashRotated {
+		t.Error("a credential rotation does not roll the bus: the hash ignores resourceVersion")
+	}
+
+	// A config change: the agent's name is rendered into server_name.
+	other := a2aTestAgent()
+	other.Name = "other-agent"
+	if hashOther := a2aConfigRolloutHash(other, credsA); hashA == hashOther {
+		t.Error("a config change does not roll the bus: the hash ignores the render")
+	}
+}
+
+// The negative half of the same property, taken across the whole render
+// rather than one function: no raw password, and no digest of one, may appear
+// in any rendered object's name, label or annotation. Names and labels are
+// readable by anything that can list the namespace, so a digest there is an
+// offline target; the passwords belong in Secret data and nowhere else.
+//
+// What it does NOT cover, because its needles are digests of known strings: a
+// credential folded into the hashed input as part of some third string, which
+// produces an annotation that matches no needle here and leaves this test
+// green. TestA2AConfigRolloutHashOmitsCredentialsAndTracksRotation is the
+// guard for that shape — it varies only the password bytes and requires the
+// hash not to move. The two are complementary and neither subsumes the other.
+func TestA2ARenderedObjectsCarryNoPasswordDigest(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+	creds := a2aFullCreds("c", "")
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, creds).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-agent", Namespace: "test-ns"}}
+	ctx := context.Background()
+
+	// finalizer pass, then the real one
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 1 failed: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 2 failed: %v", err)
+	}
+
+	stored := &corev1.Secret{}
+	if err := cl.Get(ctx, client.ObjectKeyFromObject(creds), stored); err != nil {
+		t.Fatalf("creds Secret missing after reconcile: %v", err)
+	}
+	forbidden := map[string]string{}
+	for _, key := range a2aCredsKeys {
+		password := string(stored.Data[key])
+		if !a2aCredsValueRe.MatchString(password) {
+			t.Fatalf("seeded creds key %q was re-rolled into an unexpected shape: %q", key, password)
+		}
+		for _, needle := range a2aPasswordDigestNeedles(password) {
+			forbidden[needle] = key
+		}
+	}
+
+	// The exact regression: a digest of the rendered nats.conf, which is a
+	// digest of the five passwords inside it.
+	config := &corev1.Secret{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-nats-config", Namespace: "test-ns"}, config); err != nil {
+		t.Fatalf("config Secret missing after reconcile: %v", err)
+	}
+	confSum := sha256.Sum256(config.Data["nats.conf"])
+	confDigest := hex.EncodeToString(confSum[:])
+	for _, needle := range []string{confDigest, confDigest[:8], confDigest[:16]} {
+		forbidden[needle] = "nats.conf"
+	}
+
+	check := func(t *testing.T, kind, where, value string) {
+		t.Helper()
+		for needle, source := range forbidden {
+			if strings.Contains(value, needle) {
+				t.Errorf("%s %s carries a digest of %s: %q", kind, where, source, value)
+			}
+		}
+	}
+
+	lists := []client.ObjectList{
+		&corev1.SecretList{},
+		&corev1.ServiceList{},
+		&corev1.ServiceAccountList{},
+		&corev1.ConfigMapList{},
+		&corev1.ResourceQuotaList{},
+		&corev1.PersistentVolumeClaimList{},
+		&appsv1.StatefulSetList{},
+		&appsv1.DeploymentList{},
+		&batchv1.JobList{},
+		&networkingv1.NetworkPolicyList{},
+		&rbacv1.RoleList{},
+		&rbacv1.RoleBindingList{},
+	}
+	walked := 0
+	for _, list := range lists {
+		if err := cl.List(ctx, list); err != nil {
+			t.Fatalf("listing %T: %v", list, err)
+		}
+		items, err := apimeta.ExtractList(list)
+		if err != nil {
+			t.Fatalf("extracting %T: %v", list, err)
+		}
+		for _, item := range items {
+			obj, ok := item.(client.Object)
+			if !ok {
+				t.Fatalf("%T is not a client.Object", item)
+			}
+			walked++
+			kind := fmt.Sprintf("%T %s", obj, obj.GetName())
+			check(t, kind, "name", obj.GetName())
+			for key, value := range obj.GetLabels() {
+				check(t, kind, "label "+key, value)
+			}
+			for key, value := range obj.GetAnnotations() {
+				check(t, kind, "annotation "+key, value)
+			}
+			// The pod template is a second metadata surface, and the one the
+			// rollout hash actually rides.
+			var podMeta *metav1.ObjectMeta
+			switch typed := obj.(type) {
+			case *appsv1.StatefulSet:
+				podMeta = &typed.Spec.Template.ObjectMeta
+			case *appsv1.Deployment:
+				podMeta = &typed.Spec.Template.ObjectMeta
+			case *batchv1.Job:
+				podMeta = &typed.Spec.Template.ObjectMeta
+			}
+			if podMeta == nil {
+				continue
+			}
+			for key, value := range podMeta.Labels {
+				check(t, kind, "pod-template label "+key, value)
+			}
+			for key, value := range podMeta.Annotations {
+				check(t, kind, "pod-template annotation "+key, value)
+			}
+		}
+	}
+	if walked == 0 {
+		t.Fatal("walked no rendered objects; the check is inert")
+	}
+}
+
+// The other half of the rotation property, end to end: ensureA2ACredsSecret
+// repairs a damaged credential with an Update on the existing Secret, and the
+// StatefulSet the same reconcile renders must come out with a different
+// pod-template hash — otherwise the bus keeps serving the old password.
+func TestA2AConfigHashRollsOnCredentialRepair(t *testing.T) {
+	scheme := setupScheme()
+	agent := a2aTestAgent()
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent, a2aFullCreds("d", "")).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(fakeServerSideApplyInterceptors()).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "test-agent", Namespace: "test-ns"}}
+	ctx := context.Background()
+	stsKey := types.NamespacedName{Name: "test-agent-a2a-nats", Namespace: "test-ns"}
+
+	hashNow := func(t *testing.T) string {
+		t.Helper()
+		sts := &appsv1.StatefulSet{}
+		if err := cl.Get(ctx, stsKey, sts); err != nil {
+			t.Fatalf("NATS StatefulSet missing: %v", err)
+		}
+		return sts.Spec.Template.Annotations["kubeagents.x-k8s.io/a2a-config-hash"]
+	}
+
+	// finalizer pass, then the real one
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 1 failed: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 2 failed: %v", err)
+	}
+	before := hashNow(t)
+	if before == "" {
+		t.Fatal("pod template carries no config hash")
+	}
+
+	// A reconcile that changes nothing must not roll the bus.
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 3 failed: %v", err)
+	}
+	if steady := hashNow(t); steady != before {
+		t.Errorf("an idle reconcile rolled the bus: %q then %q", before, steady)
+	}
+
+	// Damage one credential; ensureA2ACredsSecret re-rolls it in place.
+	creds := &corev1.Secret{}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-nats-creds", Namespace: "test-ns"}, creds); err != nil {
+		t.Fatalf("creds Secret missing: %v", err)
+	}
+	damaged := string(creds.Data["gateway-password"])
+	creds.Data["gateway-password"] = []byte("")
+	if err := cl.Update(ctx, creds); err != nil {
+		t.Fatalf("failed to damage the creds Secret: %v", err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("Reconcile 4 failed: %v", err)
+	}
+	if err := cl.Get(ctx, types.NamespacedName{Name: "test-agent-a2a-nats-creds", Namespace: "test-ns"}, creds); err != nil {
+		t.Fatalf("creds Secret missing after repair: %v", err)
+	}
+	if repaired := string(creds.Data["gateway-password"]); repaired == damaged || !a2aCredsValueRe.MatchString(repaired) {
+		t.Fatalf("the credential was not rotated in place: %q", repaired)
+	}
+	if after := hashNow(t); after == before {
+		t.Errorf("a credential rotation did not roll the bus: hash stayed %q", before)
 	}
 }

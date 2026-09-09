@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"crypto/hkdf"
 	"crypto/sha256"
 	"fmt"
 	"os"
@@ -10,6 +11,18 @@ import (
 
 	"github.com/gke-labs/kube-agents/a2a/lib"
 )
+
+// attributionSaltInfo is the HKDF info string that binds the derived
+// fallback salt to this one use of the bus password, so the same password
+// expanded for any other purpose yields unrelated bytes. It is a wire
+// constant in the sense that changing it re-salts every pseudonym on an
+// install running the fallback; do not edit it to tidy the string.
+const attributionSaltInfo = "a2a-attribution-salt"
+
+// attributionSaltLen is how many bytes the derived fallback salt gets: one
+// SHA-256 output, the length the digest it replaces produced, so the HMAC
+// keying in principal.go sees the same shape it always did.
+const attributionSaltLen = 32
 
 // defaultMaxSessions is what MaxSessions means when unset; the field's
 // comment carries the sizing rationale.
@@ -93,9 +106,14 @@ type Config struct {
 	// with anything else silently breaks the cross-surface audit join this
 	// pseudonym exists to preserve — one human, one value, on the bus and
 	// in session metadata. The env-var fallbacks below are playground
-	// posture for installs without that Secret, and the derived one is a
-	// recorded deviation on two counts: the broken join, and a
-	// de-anonymization key handed to whoever holds the bus password.
+	// posture for installs without that Secret, and the derived one
+	// (HKDF-SHA-256 over the bus password) is a recorded deviation on two
+	// counts: the broken join, and a de-anonymization key handed to whoever
+	// holds the bus password. HKDF is the construction a credential is
+	// permitted to pass through, and that is all it is: it answers neither
+	// count, and it is not a password hash — no work factor, so it does not
+	// make a weak hand-set NATS_PASSWORD any harder to guess from a leaked
+	// salt. Provisioning the Secret is what fixes that.
 	AttributionSalt []byte
 
 	// TaskDeadline mirrors the worker adapter's task deadline — the SAME
@@ -274,8 +292,21 @@ func FromEnv() (*Config, error) {
 		if cfg.NATSPassword == "" {
 			return nil, fmt.Errorf("SESSION_KV_SALT or A2A_ATTRIBUTION_SALT is required when NATS_PASSWORD is empty: the derived fallback would be a public constant")
 		}
-		derived := sha256.Sum256([]byte("a2a-attribution-salt:" + cfg.NATSPassword))
-		cfg.AttributionSalt = derived[:]
+		// HKDF, not a bare digest of the password: a credential reaching a
+		// plain hash is what CodeQL's go/weak-sensitive-data-hashing
+		// refuses, and extract-and-expand under a fixed info string is the
+		// construction one is allowed to go through. It buys no resistance
+		// to offline guessing — HKDF has no work factor, and at a nil salt
+		// the cost per candidate password is a handful of SHA-256
+		// compressions either way. What keeps this fallback from being a
+		// de-anonymization key is the password's own entropy (the operator
+		// mints 128 bits of it) and, properly, the provisioned Secret; see
+		// the AttributionSalt field comment.
+		derived, err := hkdf.Key(sha256.New, []byte(cfg.NATSPassword), nil, attributionSaltInfo, attributionSaltLen)
+		if err != nil {
+			return nil, fmt.Errorf("deriving the attribution salt from NATS_PASSWORD: %w", err)
+		}
+		cfg.AttributionSalt = derived
 	}
 	return cfg, nil
 }

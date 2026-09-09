@@ -1327,9 +1327,12 @@ func TestBuildPodTemplateSpecHoldsNoCredentialRuntime(t *testing.T) {
 		if container.Name == "envoy-credential-proxy" {
 			t.Error("the credential runtime is back in the gateway Pod, where the agent shares its network namespace")
 		}
-		user := podSC.RunAsUser
-		if container.SecurityContext != nil && container.SecurityContext.RunAsUser != nil {
-			user = container.SecurityContext.RunAsUser
+		// The pod default unless the container overrides it, which is the
+		// kubelet's own rule; see effectiveRunAsUser.
+		user := effectiveRunAsUser(spec, container)
+		if user == nil {
+			t.Errorf("expected container %s to run as the sandbox UID %d, got no runAsUser at either level", container.Name, sandboxUID)
+			continue
 		}
 		if *user != sandboxUID {
 			t.Errorf("expected container %s to run as the sandbox UID %d, got %d", container.Name, sandboxUID, *user)

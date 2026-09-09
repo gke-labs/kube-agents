@@ -39,16 +39,12 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
 Run the interactive one-liner installer directly in **Google Cloud Shell** or any authenticated bash terminal:
 
 ```bash
-curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash
-```
-
-_To pin to a specific official release, substitute `<RELEASE_VERSION>` with the desired version tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases):_
-
-```bash
 curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash
 ```
 
-When running the release-pinned installer (`<RELEASE_VERSION>/install.sh`), the baked release version is offered as the default, so pressing Enter accepts it; `--non-interactive` uses it without prompting at all. When running the generic installer (`gke-labs.github.io/kube-agents/install.sh`), the interactive prompt asks you to enter the target SemVer release tag or full 40-character commit SHA (from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases)), and `--non-interactive` requires `--image-tag`. The installer rejects mutable refs such as `latest` and `main` to ensure install sources and container images stay strictly aligned.
+_Substitute `<RELEASE_VERSION>` with the desired release tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases) (for example, `0.4.0`)._
+
+When running the official release installer (`<RELEASE_VERSION>/install.sh`) or executing inside an official release checkout or unpacked release archive, the release version is baked in and used automatically without prompting.
 
 ### What `install.sh` Automatically Handles:
 
@@ -74,10 +70,7 @@ one place; see
 
 Three behaviours worth knowing before the first run:
 
-- **The image/source ref defaults to the checkout's `HEAD`** and must be a SemVer release tag or a
-  full 40-character commit SHA. Provisioning refuses to start from a dirty or mismatched checkout so
-  the scripts and the container image stay on one revision; pass `--allow-unverified-source` to
-  override that while iterating on the installer itself.
+- **The image/source ref defaults to the release version (in release checkouts and bundles) or the checkout's `HEAD` commit SHA (on `main`)**, and must be a SemVer release tag or a full 40-character commit SHA. Provisioning refuses to start from a dirty or mismatched checkout so the scripts and the container image stay on one revision; pass `--allow-unverified-source` to override that while iterating on the installer itself. Do not install from a `main` checkout when targeting an official release: manifests and CRD schemas on `main` diverge from older releases, and `verify_local_source_ref` blocks mismatched revisions to prevent broken installations.
 - **The agent's GCP IAM permission set defaults to `read-only`**, matching the provisioner. It
   controls cloud-plane writes only — Kubernetes RBAC is read-only in every set, and the GitOps
   pull-request path works in every set. See the site's
@@ -91,14 +84,16 @@ Three behaviours worth knowing before the first run:
 
 ### Non-Interactive & AI Agent Execution Mode
 
-AI Agent harnesses and automated CI scripts can execute `install.sh` without interactive prompts:
+For human operators, running the official release installer interactively (Method 0 above, or `./install.sh` inside an official release checkout or bundle) is strongly recommended on initial setup: it detects sensible defaults from your active `gcloud` session, prompts for mandatory cloud project and LLM provider credentials, and records configuration to `install.env`.
+
+For headless environments, automated CI scripts, and AI Agent harnesses where no interactive TTY is available, execute the release-pinned installer non-interactively by supplying explicit CLI flags:
 
 ```bash
-curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
   --non-interactive \
   --project-id="my-gcp-project" \
   --cluster-name="platform-agent-host" \
-  --image-tag="<SEMVER_TAG_OR_FULL_COMMIT_SHA>" \
+  --region="us-central1" \
   --model-provider="gemini" \
   --permission-set="read-only"
 ```
@@ -109,10 +104,13 @@ validates the Terraform configuration, and previews the full resource plan when 
 Default Credentials are available:
 
 ```bash
-./install.sh --dry-run --non-interactive \
-  --project-id="my-gcp-project" \
-  --image-tag="<SEMVER_TAG_OR_FULL_COMMIT_SHA>"
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
+  --dry-run \
+  --non-interactive \
+  --project-id="my-gcp-project"
 ```
+
+_Guidance for AI Agents:_ For production deployments, deploy or test from an official release using the release installer (`<RELEASE_VERSION>/install.sh`), the published release tarball (`kube-agents-<RELEASE_VERSION>.tar.gz` from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases), e.g. `0.4.0`), or `git clone --branch <RELEASE_VERSION>` if a Git checkout is specifically needed. Do not deploy from a `main` checkout: manifests and CRD schemas on `main` diverge from released versions, and `verify_local_source_ref` blocks mismatched revisions.
 
 ---
 
@@ -167,14 +165,32 @@ and GitHub minter workloads).
   you do **not** need to install it yourself on this path. (You do for
   [Method 2](#method-2-manual-kubernetes-cluster-deployment).)
 - The manual Chat/Slack registrations in
-  [Step 4 of this method](#step-4-enable-google-chat--slack-integrations-manual-required-steps)
+  [Step 5 of this method](#step-5-enable-google-chat--slack-integrations-manual-required-steps)
   apply however the engine is driven.
-- Until the first `X.Y.Z` release tag exists, keep the default `image_tag = "latest"`
-  (see the guide's image-tag note).
+- The Terraform composition defaults `image_tag` to `"latest"` on `main` (in CI/CD pipelines it is passed explicitly with the test build commit SHA, and on release checkouts or unpacked release bundles it is automatically stamped with the released SemVer version; see the [composition README](terraform/examples/full-install/README.md#the-image_tag-rule)).
 
 ### Step-by-Step Execution
 
-#### Step 1: Authenticate with Google Cloud
+#### Step 1: Obtain the Release Sources
+
+Download and extract the self-contained release archive from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases) (recommended):
+
+```bash
+curl -fsSL https://github.com/gke-labs/kube-agents/releases/download/<RELEASE_VERSION>/kube-agents-<RELEASE_VERSION>.tar.gz | tar -xz
+cd kube-agents-<RELEASE_VERSION>
+```
+
+Alternatively, if you require a Git repository checkout, clone pinned to an official release tag (for example, `0.4.0`):
+
+```bash
+git clone --branch <RELEASE_VERSION> https://github.com/gke-labs/kube-agents.git
+cd kube-agents
+```
+
+> [!CAUTION]
+> Do not clone `main` to deploy an official release: manifests and CRD schemas on `main` diverge from released container images. A mismatched checkout will fail `verify_local_source_ref` to prevent broken deployments.
+
+#### Step 2: Authenticate with Google Cloud
 
 Authenticate your `gcloud` CLI and set Application Default Credentials:
 
@@ -183,9 +199,9 @@ gcloud auth login
 gcloud auth application-default login
 ```
 
-#### Step 2: Apply the Composition
+#### Step 3: Apply the Composition
 
-The interactive way is `./install.sh` from the repository root (Method 0), which writes the
+The interactive way is running the official release installer (Method 0 above, or `./install.sh` from this release checkout or unpacked bundle), which writes the
 `terraform.tfvars` for you. Hand-driven:
 
 ```bash
@@ -204,8 +220,9 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
   keep the value the file records rather than reverting to a default, so bumping `--image-tag`
   alone changes only the image tag. To change configuration, edit `install.env` (copy
   `install.env.example` and `chmod 600` it if the first install has not written one yet — the
-  example is tracked world-readable and the file it becomes holds your API keys) and re-run, use
-  `./install.sh --menu` (Save & Apply re-applies through the same engine), or edit your
+  example is tracked world-readable and the file it becomes holds your API keys) and re-run, run
+  the installer with `--menu` (e.g. `./install.sh --menu` or `$HOME/kube-agents/install.sh --menu`)
+  where Save & Apply re-applies through the same engine, or edit your
   hand-written tfvars and re-apply.
 
 - **Private Container Registry**: If your GKE clusters may only pull from an approved registry, see
@@ -217,8 +234,11 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
 
 - **Dry-run check**: To preview actions without modifying cloud infrastructure:
   ```bash
-  ./install.sh --dry-run -y --project-id=<PROJECT> --image-tag=<TAG>   # validate + terraform plan
-  # or, hand-driven, plain:  terraform plan
+  curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
+    --dry-run \
+    --non-interactive \
+    --project-id="my-gcp-project"
+  # or, hand-driven from repo, plain:  terraform plan
   ```
 
 #### Security & CMEK Encryption
@@ -236,12 +256,13 @@ If your clusters may only pull from an approved registry, copy every image the i
 there first, then export both registry prefixes before provisioning:
 
 ```bash
-# Exported before the mirror step so the mirror and the install use one tag.
-export IMAGE_TAG=v0.1.0
+# Set to the target release tag (e.g. 0.4.0) matching your release installation
+export IMAGE_TAG="<RELEASE_VERSION>"
 
 make mirror-images MIRROR_PREFIX=registry.example.com/kube-agents
 
-./install.sh -y --image-tag=v0.1.0 \
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
+  -y \
   --registry-prefix=registry.example.com/kube-agents \
   --third-party-registry-prefix=registry.example.com/kube-agents
 ```
@@ -249,12 +270,7 @@ make mirror-images MIRROR_PREFIX=registry.example.com/kube-agents
 `make mirror-images` reads `images.json` at the repository root — the inventory of every image
 an install pulls — and copies each one, keeping the trailing image name only.
 
-`IMAGE_TAG` is not optional here. The mirror holds only the tag it was told to copy — `latest`
-if it was told nothing — while the install asks for whatever `--image-tag` says. Set the two to
-different values and the four first-party images name a reference the mirror was never given:
-the apply reports success and the pods sit in ImagePullBackOff, after the cluster and
-cert-manager already exist. Export it once, as above, so the mirror and the install cannot
-disagree.
+When using the official release installer (`<RELEASE_VERSION>/install.sh`), the image tag is baked in and matches the release version automatically. Ensure `IMAGE_TAG` used during mirroring matches that exact release version so the mirrored images and install sources stay aligned.
 
 The two flags are separate because the images fall into two groups. `--registry-prefix`
 (`image_registry` in tfvars) replaces `ghcr.io/gke-labs/kube-agents` for the images this project
@@ -270,7 +286,7 @@ See the [Docker images guide](docs/site/src/content/docs/deploy/docker-images.md
 inventory, the mirror script's options, the Helm and Terraform equivalents, and how to rebuild
 from mirrored base images rather than copying.
 
-#### Step 3: Verify Running Components
+#### Step 4: Verify Running Components
 
 Verify that the operator, LiteLLM gateway, and custom resources are healthy:
 
@@ -280,7 +296,7 @@ kubectl get pods -n kubeagents-system
 kubectl get platformagents --all-namespaces
 ```
 
-#### Step 4: Enable Google Chat & Slack Integrations (Manual Required Steps)
+#### Step 5: Enable Google Chat & Slack Integrations (Manual Required Steps)
 
 If you enabled Google Chat or Slack during the install, perform the following required manual steps after the apply completes:
 
@@ -353,7 +369,7 @@ builds one, and Autopilot ships the `gvisor` RuntimeClass with no pool to manage
 run on the node's standard runtime.
 
 Set it on a new install by adding this to `terraform.tfvars` before the first apply
-([Method 1](#method-1-the-install-engine--terraform--helm), Step 2):
+([Method 1](#method-1-the-install-engine--terraform--helm), Step 3):
 
 ```hcl
 cluster_mode            = "standard" # omit both lines on Autopilot, which

@@ -135,6 +135,7 @@ past 4000 characters across messages:
   keep it to a few short columns and never let the table be the only place a
   fact lives — Google Chat drops it.
 - Wrap raw values — ids, paths, epochs, durations, counts — in backticks.
+- When knowledge or documentation lookups (e.g. Developer Knowledge MCP or web search) are used, conclude with a `## Sources` section citing the tools and documentation sources used.
 - Do not use `=== Title ===`, `1. SECTION`, or hand-aligned columns. Slack
   renders those as flat text.\
 """

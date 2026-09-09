@@ -17,9 +17,9 @@ name: "Nightly: Pipeline"
 # three-hourly RC pipeline. Step 1 binds `nightly` for its variables without
 # taking the lock; the promotion only pushes a Git tag, so it does neither.
 #
-# Dispatch-only on purpose: turning the schedule on is its own decision and its
-# own reviewable change. Exercise it by hand against the nightly project until it
-# is boring, then add `cron: "0 2 * * *"`.
+# Dispatch-only on purpose: scheduled execution is owned by nightly-scheduler.yml
+# so that a daily tick with nothing to promote produces no pipeline run at all.
+# Candidate overrides (`rc_tag`) are accepted for manual dispatches.
 
 permissions:
   contents: read
@@ -217,10 +217,9 @@ jobs:
     # `step-4-create-staging-tag` is deliberately absent from the list. Its only
     # failure modes are credential ones — an invalid GitHub App key or ID, a rejected
     # push — which leave nothing on the cluster worth looking at, and depending on
-    # it would strand a GKE cluster that nothing else reclaims: this pipeline has
-    # no schedule, so there is no next run to clean up after it. Running the two
-    # concurrently is safe, because step 4 touches no GCP resource and this job
-    # holds the nightly-environment lock.
+    # it would needlessly strand a GKE cluster until the next run reclaims it:
+    # running the two concurrently is safe, because step 4 touches no GCP resource
+    # and this job holds the nightly-environment lock.
     needs: [step-1-resolve-candidate, step-2-deploy-env, step-3-run-e2e-matrix]
     if: |
       github.repository == 'gke-labs/kube-agents' &&

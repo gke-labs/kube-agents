@@ -123,6 +123,15 @@ statically - rendered credentials, deny-by-default grants in `nats.conf`. The ca
 is the design of record, and the residues named in this section as "closed by the
 callout" are open until it arms.
 
+Those credentials belong in Secret data and nowhere else in the render: no rendered
+object name, label, or annotation may carry a password or a digest of one, truncated or
+not. Names and labels are readable by anything that can list the namespace, so a digest
+there is an offline target the day a password is hand-set. That binds every renderer of
+this stack, not one function - the rollout hash on the NATS pod template is over the
+config rendered with placeholders in the passwords' place plus the credentials Secret's
+`resourceVersion`, which is what lets a config change and a rotation both roll the bus
+without a credential reaching the digest.
+
 Layout:
 
 - **`$SYS`** - human operators and monitoring only. No agent ever authenticates into it.

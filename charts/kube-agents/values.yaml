@@ -84,6 +84,21 @@ operator:
     tag: "" # defaults to Chart.appVersion
     pullPolicy: IfNotPresent
   replicaCount: 1
+  # Rollout strategy for the operator Deployment.
+  #
+  # maxUnavailable: 0 is the zero-downtime admission shape: it holds the old
+  # operator Pod (which serves the admission webhook on :10250) until the
+  # replacement passes readiness checks, preventing webhook admission outages
+  # during upgrades when failurePolicy is set to Fail. This makes the surge Pod
+  # mandatory.
+  #
+  # Set maxUnavailable to 1 on an install with strict namespace ResourceQuota
+  # that has no room for a surge Pod, accepting that PlatformAgent writes will
+  # be rejected (under failurePolicy: Fail) or unvalidated (under
+  # failurePolicy: Ignore) during the rollout.
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
   podDisruptionBudget:
     # Renders maxUnavailable: 1 at any replicaCount. The budget is deliberately
     # not configurable: minAvailable is the shape that deadlocks node drains,
@@ -295,6 +310,19 @@ hindsight:
       repository: ghcr.io/vectorize-io/hindsight-api
       tag: "0.9.2@sha256:7b14a1f4062252992d0176758753615e0a2071d9a269995be007be223ab01812"
       pullPolicy: IfNotPresent
+    # Rollout strategy for the hindsight-api Deployment.
+    #
+    # maxUnavailable: 0 is the zero-downtime shape: it holds the existing Pod
+    # until the replacement passes readiness checks (which includes model loading
+    # and can take up to the 5-minute startupProbe budget). This makes the surge
+    # Pod mandatory.
+    #
+    # Set maxUnavailable to 1 on installs with strict namespace ResourceQuota
+    # that lack room for a surge Pod, accepting that long-term memory recall
+    # will be offline during the rollout.
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
     # Recall is CPU-bound on the in-process cross-encoder reranker; see the
     # template before raising these — more CPU has been measured to buy
     # nothing on e2-standard-4, and a request of 4 CPUs never schedules there.
