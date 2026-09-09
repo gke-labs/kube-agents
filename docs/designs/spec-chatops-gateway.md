@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord and Google Chat adapters) - session spawning is dark behind `A2A_SPAWN_SESSIONS`; the operator renders the gateway Deployment and its env under `mode: next` (`platformagent_a2a_manifests.go`), but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, and the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`), or the A2A subscription and its IAM (the composition still provisions one Chat subscription)
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord and Google Chat adapters) - session spawning is dark behind `A2A_SPAWN_SESSIONS`; the operator renders the gateway Deployment and its env under `mode: next` (`platformagent_a2a_manifests.go`), but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`, and the broker NetworkPolicy admitting the A2A gateway pod), or the A2A subscription and its IAM (the composition still provisions one Chat subscription)
 
 ## Purpose
 
@@ -485,7 +485,7 @@ the `a2a-chat` role, because the legacy chat caller is the LLM-driven Hermes pod
 shared role would let a prompt-injected agent pull and ack the A2A gateway's events,
 silently consuming user asks. The event routes demand `a2a-chat`; `/v1/chat/api`
 admits both chat roles, since posting rides one shared app credential either way. The
-one Chat credential in the deployment stays where #913 put it, and the passthrough
+one Chat credential in the deployment stays in the broker, where the relay moved it, and the passthrough
 keeps the destructive-method denylist and the error-scrubbing in force for the new
 path without new code.
 
@@ -554,8 +554,10 @@ annotation — a typed `@app` there is plain text to Chat, and is delivered verb
 space — the canonical example above. `gchat:dm/spaces/AAA` for a DM space, whole space
 one session — and, because a DM space is threaded, replies render in the thread of the
 latest ask (measured: without that, an answer to a question asked inside a DM thread
-landed top-level). Presentation only; the key and the session do not move. A space whose threading state does not support replies binds the whole
-space as one conversation, `gchat:space/spaces/AAA` — the honest reading of "a space is
+landed top-level). Presentation only; the key and the session do not move. A space whose threading state does not support replies (`UNTHREADED_MESSAGES`), or a
+`GROUP_CHAT`, binds the whole space as one conversation, `gchat:space/spaces/AAA`;
+anything that is not positively a DM is read as a group, since a space misread as a DM
+would bind every thread in it to one session — the honest reading of "a space is
 not a session, a conversation in it is" on a surface where the space is the only
 conversation there is.
 
@@ -575,7 +577,9 @@ always present in the snapshot regardless.
 (`GoogleChatSpec.Mode`) is honoured by the relay: under `default` the rolling line
 carries state transitions but never the turn-by-turn narration, with no-op edits
 deduplicated; under `debug` the full rolling line runs. Carried as
-`A2A_CHAT_DISPLAY_MODE`; the operator owns feeding it from the same CR field. The
+`A2A_CHAT_DISPLAY_MODE`; the operator owns feeding it from the same CR field, and unset
+resolves to `debug` (the historical rendering, so Discord installs are unchanged) while
+the CR field's own default is `default` — the render is what makes the two agree. The
 split is the legacy field honoured in the new relay, not a new knob.
 
 **openDirect.** `spaces.findDirectMessage` by user resource name, falling back to

@@ -3121,6 +3121,13 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// audience would collapse the two roles into one, which is how the
 		// broker spells "no split".
 		"CREDENTIAL_PROXY_CHAT_AUDIENCE",
+		// The A2A gateway's audience and subscription are reserved before the
+		// operator renders them, for the same reason: one that could set the
+		// audience would decide who holds the a2a-chat role, and one that
+		// could set the subscription would arm a second Chat consumer on
+		// whatever the broker's credential can pull.
+		"CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE",
+		"A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME",
 		"CREDENTIAL_PROXY_BOOTSTRAP_COMMAND",
 		// The listen address is reserved for the placements as well as for the
 		// authentication: it is appended after this merge in every container

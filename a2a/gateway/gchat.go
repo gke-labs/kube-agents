@@ -69,6 +69,45 @@ const (
 	gchatVerifiedBy = "chat-event-topic-iam"
 )
 
+const (
+	gchatShapeLegacy = "legacy"
+	gchatShapeAddon  = "addon"
+	// gchatAddonMessageKey is the chat.* payload key that marks a message
+	// interaction in the add-on event object.
+	gchatAddonMessageKey = "messagePayload"
+	// gchatAddonUserKey is the interacting user in the add-on event object,
+	// alongside message.sender; both name the same person.
+	gchatAddonUserKey      = "user"
+	gchatAddonEventTimeKey = "eventTime"
+)
+
+// Conversation key prefixes for the Google Chat adapter. A space is not a
+// session; a conversation in it is — and what counts as the conversation
+// depends on the surface: a thread in a threaded space, the whole space in a
+// DM or in a space whose threading state does not support replies
+// (spec-chatops-gateway.md, "The Google Chat adapter").
+const (
+	gchatKeyPrefix      = "gchat:"
+	gchatDMKeyPrefix    = "gchat:dm/"
+	gchatSpaceKeyPrefix = "gchat:space/"
+	gchatSpacesToken    = "spaces/"
+	gchatThreadsToken   = "/threads/"
+	// gchatUsersToken prefixes a user resource name ("users/{id}").
+	gchatUsersToken = "users/"
+)
+
+// Google Chat's own vocabulary, as it appears in event payloads and API
+// responses.
+const (
+	gchatEventTypeMessage    = "MESSAGE"
+	gchatSenderHuman         = "HUMAN"
+	gchatSenderBot           = "BOT"
+	gchatSpaceTypeDM         = "DIRECT_MESSAGE"
+	gchatLegacySpaceTypeDM   = "DM"
+	gchatSpaceTypeGroupChat  = "GROUP_CHAT"
+	gchatThreadingUnthreaded = "UNTHREADED_MESSAGES"
+)
+
 // verifiedByFor names the mechanism that checked the requester at ingress
 // for one backend (authority.requester.verifiedBy).
 func verifiedByFor(backend string) string {
@@ -164,18 +203,6 @@ type gchatAddonMessagePayload struct {
 	Space   gchatSpace   `json:"space"`
 	Message gchatMessage `json:"message"`
 }
-
-const (
-	gchatShapeLegacy = "legacy"
-	gchatShapeAddon  = "addon"
-	// gchatAddonMessageKey is the chat.* payload key that marks a message
-	// interaction in the add-on event object.
-	gchatAddonMessageKey = "messagePayload"
-	// gchatAddonUserKey is the interacting user in the add-on event object,
-	// alongside message.sender; both name the same person.
-	gchatAddonUserKey      = "user"
-	gchatAddonEventTimeKey = "eventTime"
-)
 
 // GoogleChatAdapter implements Adapter over the credential proxy's chat
 // relay: events arrive by long-polling the relay's A2A event routes, and
@@ -369,7 +396,7 @@ func (a *GoogleChatAdapter) Roster(conversation string) ([]string, bool, error) 
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for _, m := range out.Memberships {
-		if m.Member.Type == "BOT" {
+		if m.Member.Type == gchatSenderBot {
 			continue
 		}
 		id := m.Member.Email
@@ -420,9 +447,9 @@ func (a *GoogleChatAdapter) OpenDirect(userID string) (string, error) {
 		// up between the app and the user.
 		setupErr := a.apiCall([]string{"spaces"}, "setup", map[string]any{
 			"body": map[string]any{
-				"space": map[string]any{"spaceType": "DIRECT_MESSAGE", "singleUserBotDm": true},
+				"space": map[string]any{"spaceType": gchatSpaceTypeDM, "singleUserBotDm": true},
 				"memberships": []any{
-					map[string]any{"member": map[string]any{"name": name, "type": "HUMAN"}},
+					map[string]any{"member": map[string]any{"name": name, "type": gchatSenderHuman}},
 				},
 			},
 		}, &space)
@@ -563,7 +590,7 @@ func decodeGchatEvent(data string) (*gchatEvent, error) {
 		if err := json.Unmarshal(payload, &mp); err != nil {
 			return nil, fmt.Errorf("chat.messagePayload: %w", err)
 		}
-		ev := &gchatEvent{Type: "MESSAGE", Space: mp.Space, Message: mp.Message, shape: gchatShapeAddon}
+		ev := &gchatEvent{Type: gchatEventTypeMessage, Space: mp.Space, Message: mp.Message, shape: gchatShapeAddon}
 		if ev.Message.Sender.Email == "" {
 			// chat.user and message.sender name the same person; the
 			// sender is what the legacy layout reads, so fill it from the
@@ -605,11 +632,11 @@ func toGchatText(s string) string {
 // is indistinguishable from one that receives none — which is exactly how
 // the add-on wire shape went unnoticed until live traffic.
 func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
-	if ev.Type != "MESSAGE" {
+	if ev.Type != gchatEventTypeMessage {
 		return InboundMessage{}, "not a message event (shape " + ev.shape + ", type " + strconv.Quote(ev.Type) + ")"
 	}
 	sender := ev.Message.Sender
-	if sender.Type != "HUMAN" {
+	if sender.Type != gchatSenderHuman {
 		return InboundMessage{}, "sender is not HUMAN (" + sender.Type + ")"
 	}
 	if sender.Email == "" {
@@ -634,7 +661,7 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 	// A space misread as a DM would bind every thread in it to one session,
 	// so DM requires a positive signal; anything unclassifiable is a group.
 	kind := "group"
-	if ev.Space.SpaceType == "DIRECT_MESSAGE" || ev.Space.Type == "DM" {
+	if ev.Space.SpaceType == gchatSpaceTypeDM || ev.Space.Type == gchatLegacySpaceTypeDM {
 		kind = "dm"
 	}
 	// A GROUP_CHAT surface never supports reply threading, whatever thread
@@ -642,7 +669,7 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 	// own thread resource, and binding those would fragment the group chat
 	// into one session per ask.
 	thread := ev.Message.Thread.Name
-	if ev.Space.SpaceThreadingState == "UNTHREADED_MESSAGES" || ev.Space.SpaceType == "GROUP_CHAT" {
+	if ev.Space.SpaceThreadingState == gchatThreadingUnthreaded || ev.Space.SpaceType == gchatSpaceTypeGroupChat {
 		thread = ""
 	}
 
@@ -688,21 +715,6 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 		Text:         text,
 	}, ""
 }
-
-// Conversation key prefixes for the Google Chat adapter. A space is not a
-// session; a conversation in it is — and what counts as the conversation
-// depends on the surface: a thread in a threaded space, the whole space in a
-// DM or in a space whose threading state does not support replies
-// (spec-chatops-gateway.md, "The Google Chat adapter").
-const (
-	gchatKeyPrefix      = "gchat:"
-	gchatDMKeyPrefix    = "gchat:dm/"
-	gchatSpaceKeyPrefix = "gchat:space/"
-	gchatSpacesToken    = "spaces/"
-	gchatThreadsToken   = "/threads/"
-	// gchatUsersToken prefixes a user resource name ("users/{id}").
-	gchatUsersToken = "users/"
-)
 
 // resolvePrincipal establishes the requester's principal from the backend's
 // identity mechanism. On gchat the Google-asserted email IS the principal —

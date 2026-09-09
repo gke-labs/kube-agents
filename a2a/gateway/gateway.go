@@ -28,6 +28,9 @@ const relayDurable = "gateway-relay"
 // ids are wider than task and message ids: they outlive one task and join
 // records across surfaces, so a collision costs more.
 const (
+	// droppedNoticesCap bounds the once-per-sender drop-notice memory; one
+	// entry per unverified sender, evicted wholesale rather than leaked.
+	droppedNoticesCap     = 4096
 	taskIDHexWidth        = 8
 	messageIDHexWidth     = 8
 	contextIDHexWidth     = 12
@@ -243,9 +246,16 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	if principal == "" {
 		g.log.Warn("dropping message from unverified sender",
 			"backend", g.backend, "author", msg.AuthorID, "conversation", msg.Conversation)
+		// Keyed case-folded (an asserted address that varies in case is one
+		// person) and bounded the way the adapters bound their own maps:
+		// wholesale eviction at the cap, which at worst repeats a notice.
+		key := strings.ToLower(msg.AuthorID)
 		g.mu.Lock()
-		notified := g.droppedNotices[msg.AuthorID]
-		g.droppedNotices[msg.AuthorID] = true
+		if len(g.droppedNotices) >= droppedNoticesCap {
+			g.droppedNotices = map[string]bool{}
+		}
+		notified := g.droppedNotices[key]
+		g.droppedNotices[key] = true
 		g.mu.Unlock()
 		if !notified {
 			g.post(msg.Conversation, "⛔ I can't verify who you are on "+g.backend+
