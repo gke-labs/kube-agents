@@ -142,7 +142,7 @@ identifier appears, add its source here.
 | Go toolchain version | `k8s-operator/go.mod` (and `a2a/go.mod`, kept in step) |
 | A2A wire constants: protocol version, stream names, size thresholds, token grammar | `a2a/lib/envelope.go` and `a2a/lib/topics.go` |
 | The A2A gateway process's env (backend selection, gchat relay and allowlist, display mode, addressee) | `a2a/gateway/config.go` (`FromEnv`) |
-| Credential-proxy relay env vars, audiences, and route roles | `agents/platform/scripts/credential_proxy.py` (`serve`, `build_authenticator`, `ROUTE_ROLES`) |
+| Credential-proxy relay env vars, audiences, and route roles | reader `agents/platform/scripts/credential_proxy.py` (`serve`, `build_authenticator`, `ROUTE_ROLES`); the audience values are written by `k8s-operator/internal/controller/platformagent_broker_split.go` |
 | Minimum supported tool versions (`gcloud`) | `scripts/installer/min_versions.sh` |
 | Toolsets, plugins, and MCP servers of an agent profile | that profile's `config.yaml` (`agents/platform/`, `agents/chat/`, `agents/cluster/`) |
 | Cron job rosters and schedules | `agents/chat/defaults/cron/jobs.json` and `agents/platform/cron/jobs.json` |

@@ -2208,7 +2208,7 @@ the broker exactly one verb, `create` on `tokenreviews`, to do it.
 
 **The audience is per Pod, and it is what separates the callers.** The sandbox's token is
 minted for `kubeagents-credential-proxy`, the gateway's for
-`kubeagents-credential-proxy-chat`, the A2A gateway's for whatever
+`kubeagents-credential-proxy-chat`, the A2A gateway's, once rendered, for whatever
 `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE` names, and the `TokenReview` response echoes which
 audience it validated. A username cannot do this job: the gateway shares its ServiceAccount with the
 broker because the Workload Identity binding names it, so the two Pods are one identity at
