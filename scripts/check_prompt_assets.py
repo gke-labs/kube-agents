@@ -156,6 +156,7 @@ PROFILE_HOME_ITEMS: dict[str, frozenset[str]] = {
             "skills",
             "governance",
             "hindsight",
+            "capabilities",
             "scripts",
         }
     ),

@@ -1,0 +1,221 @@
+"""Unit tests for capability_store: the runtime-owned criteria behind the delivery vehicle.
+
+Run: python3 -m unittest agents.platform.scripts.test_capability_store
+"""
+
+import json
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import capability_store as cs  # noqa: E402
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+SHIPPED = REPO_ROOT / "agents" / "platform" / "capabilities"
+
+SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "threshold": {"type": "integer", "minimum": 1, "maximum": 10, "default": 3},
+        "names": {"type": "array", "items": {"type": "string"}, "maxItems": 3, "default": []},
+        "mode": {"type": "string", "enum": ["quiet", "loud"], "default": "quiet"},
+    },
+}
+
+
+def seed(root: Path, name: str = "demo", criteria=None, learning=None, schema=SCHEMA) -> Path:
+    d = root / name
+    d.mkdir(parents=True)
+    (d / cs.CRITERIA_FILENAME).write_text(json.dumps(criteria if criteria is not None else {"threshold": 3}))
+    (d / cs.SCHEMA_FILENAME).write_text(json.dumps(schema))
+    if learning is not None:
+        (d / cs.LEARNING_FILENAME).write_text(json.dumps(learning))
+    return d
+
+
+class StoreTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_get_merges_schema_defaults_under_stored_values(self):
+        seed(self.root, criteria={"threshold": 5})
+        got = cs.describe(cs.load(self.root, "demo"))
+        self.assertEqual(got["criteria"], {"threshold": 5, "names": [], "mode": "quiet"})
+        self.assertEqual(got["revision"], 0)
+        self.assertEqual(got["keys"]["threshold"]["policy"], cs.POLICY_PROPOSE)
+
+    def test_a_propose_key_needs_a_confirmer(self):
+        seed(self.root)
+        with self.assertRaises(cs.CapabilityError) as ctx:
+            cs.apply_changes(self.root, "demo", {"threshold": 4}, reason="too noisy")
+        self.assertIn("propose", str(ctx.exception))
+        # Nothing was written: no revision, no changelog.
+        self.assertEqual(cs.load(self.root, "demo").criteria, {"threshold": 3})
+        self.assertFalse((self.root / "demo" / cs.CHANGELOG_FILENAME).exists())
+
+    def test_a_confirmed_change_is_written_atomically_with_a_changelog_line(self):
+        seed(self.root)
+        entry = cs.apply_changes(
+            self.root, "demo", {"threshold": 4}, reason="too noisy", confirmed_by="ops@example"
+        )
+        cap = cs.load(self.root, "demo")
+        self.assertEqual(cap.criteria["threshold"], 4)
+        self.assertEqual(cap.criteria[cs.REVISION_KEY], 1)
+        self.assertIn(cs.UPDATED_AT_KEY, cap.criteria)
+        self.assertEqual(entry["changes"], {"threshold": {"before": 3, "after": 4}})
+        self.assertEqual(entry["mode"], "confirmed")
+        self.assertEqual(cs.history(self.root, "demo"), [entry])
+        self.assertFalse((self.root / "demo" / (cs.CRITERIA_FILENAME + ".tmp")).exists())
+
+    def test_an_autonomous_key_needs_only_a_reason(self):
+        seed(self.root, learning={"default": "propose", "keys": {"names": "autonomous"}})
+        entry = cs.apply_changes(self.root, "demo", {"names": ["a"]}, reason="operator asked twice")
+        self.assertEqual(entry["mode"], cs.POLICY_AUTONOMOUS)
+        self.assertEqual(cs.load(self.root, "demo").criteria["names"], ["a"])
+
+    def test_a_never_key_is_refused_even_when_confirmed(self):
+        seed(self.root, learning={"keys": {"threshold": "never"}})
+        with self.assertRaises(cs.CapabilityError) as ctx:
+            cs.apply_changes(self.root, "demo", {"threshold": 9}, reason="x", confirmed_by="ops")
+        self.assertIn("never", str(ctx.exception))
+
+    def test_the_whole_call_is_refused_if_any_key_is(self):
+        seed(self.root, learning={"keys": {"names": "autonomous", "threshold": "never"}})
+        with self.assertRaises(cs.CapabilityError):
+            cs.apply_changes(self.root, "demo", {"names": ["a"], "threshold": 9}, reason="x", confirmed_by="ops")
+        self.assertEqual(cs.load(self.root, "demo").criteria, {"threshold": 3})
+
+    def test_schema_violations_are_named_and_nothing_is_written(self):
+        seed(self.root)
+        cases = {
+            "type": {"threshold": "four"},
+            "bool_is_not_integer": {"threshold": True},
+            "minimum": {"threshold": 0},
+            "maximum": {"threshold": 11},
+            "enum": {"mode": "shout"},
+            "item_type": {"names": [1]},
+            "max_items": {"names": ["a", "b", "c", "d"]},
+            "unknown_key": {"colour": "red"},
+        }
+        for label, change in cases.items():
+            with self.subTest(label):
+                with self.assertRaises(cs.CapabilityError) as ctx:
+                    cs.apply_changes(self.root, "demo", change, reason="x", confirmed_by="ops")
+                self.assertIn("invalid", str(ctx.exception))
+        self.assertEqual(cs.load(self.root, "demo").criteria, {"threshold": 3})
+
+    def test_an_unknown_key_is_reported_as_unknown_not_as_a_policy_refusal(self):
+        seed(self.root)
+        with self.assertRaises(cs.CapabilityError) as ctx:
+            cs.apply_changes(self.root, "demo", {"treshold": 4}, reason="typo")
+        msg = str(ctx.exception)
+        self.assertIn("treshold", msg)
+        self.assertIn("defined keys", msg)
+        self.assertNotIn("propose", msg)
+
+    def test_state_keys_cannot_be_set_and_a_reason_is_required(self):
+        seed(self.root)
+        with self.assertRaises(cs.CapabilityError):
+            cs.apply_changes(self.root, "demo", {cs.REVISION_KEY: 99}, reason="x", confirmed_by="ops")
+        with self.assertRaises(cs.CapabilityError):
+            cs.apply_changes(self.root, "demo", {"threshold": 4}, reason="  ", confirmed_by="ops")
+
+    def test_unknown_capability_and_bad_names_are_refused(self):
+        seed(self.root)
+        with self.assertRaises(cs.CapabilityError) as ctx:
+            cs.load(self.root, "nope")
+        self.assertIn("demo", str(ctx.exception))
+        for bad in ("", "../demo", "a/b", ".hidden"):
+            with self.subTest(bad):
+                with self.assertRaises(cs.CapabilityError):
+                    cs.load(self.root, bad)
+
+    def test_list_names_only_directories_holding_criteria(self):
+        seed(self.root, "b")
+        seed(self.root, "a")
+        (self.root / "not-one").mkdir()
+        self.assertEqual(cs.list_capabilities(self.root), ["a", "b"])
+        self.assertEqual(cs.list_capabilities(self.root / "missing"), [])
+
+    def test_revision_counts_up_across_calls(self):
+        seed(self.root)
+        for n in (1, 2, 3):
+            cs.apply_changes(self.root, "demo", {"threshold": n + 3}, reason="r", confirmed_by="ops")
+        self.assertEqual(cs.load(self.root, "demo").criteria[cs.REVISION_KEY], 3)
+        self.assertEqual([e["revision"] for e in cs.history(self.root, "demo")], [1, 2, 3])
+
+    def test_root_resolution_prefers_the_env_override(self):
+        with unittest.mock_patch_env({cs.CAPABILITIES_DIR_ENV: "/x/y"}):
+            self.assertEqual(cs.capabilities_root(), Path("/x/y"))
+        with unittest.mock_patch_env({cs.CAPABILITIES_DIR_ENV: None, "HERMES_HOME": "/opt/data/profiles/platform"}):
+            self.assertEqual(cs.capabilities_root(), Path("/opt/data/profiles/platform/capabilities"))
+
+
+class _EnvPatch:
+    """Set/unset environment variables for a block; None removes a variable."""
+
+    def __init__(self, values):
+        self.values = values
+        self.saved = {}
+
+    def __enter__(self):
+        for k, v in self.values.items():
+            self.saved[k] = os.environ.get(k)
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def __exit__(self, *exc):
+        for k, v in self.saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+unittest.mock_patch_env = _EnvPatch
+
+
+class ShippedTemplatesTest(unittest.TestCase):
+    """Every directory under agents/platform/capabilities/ has to be loadable and valid on day one."""
+
+    def test_every_shipped_capability_validates_against_its_schema(self):
+        names = cs.list_capabilities(SHIPPED)
+        self.assertTrue(names, f"no capability templates found under {SHIPPED}")
+        for name in names:
+            with self.subTest(name):
+                cap = cs.load(SHIPPED, name)
+                self.assertTrue(cap.schema, f"{name} ships no {cs.SCHEMA_FILENAME}")
+                self.assertEqual(cs.validate(cap.schema, cap.criteria), [])
+                self.assertEqual(cap.learning.get("default"), cs.POLICY_PROPOSE)
+                for key, policy in (cap.learning.get("keys") or {}).items():
+                    self.assertIn(policy, cs.POLICIES, f"{name}: {key}")
+                    self.assertIn(key, cap.schema["properties"], f"{name}: policy for undefined key {key}")
+                self.assertFalse(any(k in cs.STATE_KEYS for k in cap.criteria), f"{name}: template carries state")
+
+    def test_shipped_defaults_equal_the_schema_defaults(self):
+        # The template is the day-one value and the schema's `default` is what a
+        # reset returns to; the two saying different things is a trap for both.
+        for name in cs.list_capabilities(SHIPPED):
+            with self.subTest(name):
+                cap = cs.load(SHIPPED, name)
+                self.assertEqual(cap.criteria, cap.defaults())
+
+    def test_every_shipped_capability_is_a_cron_job_on_the_platform_roster(self):
+        roster = json.loads((REPO_ROOT / "agents" / "platform" / "cron" / "jobs.json").read_text())
+        ids = {j["id"] for j in roster["jobs"]}
+        for name in cs.list_capabilities(SHIPPED):
+            with self.subTest(name):
+                self.assertIn(name, ids, "a capability is named after the job that runs it")
+
+
+if __name__ == "__main__":
+    unittest.main()
