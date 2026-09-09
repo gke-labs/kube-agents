@@ -228,6 +228,21 @@ class RepeatingWarnings(unittest.TestCase):
         gw = obj("Gateway", "edge", spec={}, status={})
         self.assertEqual(analyze([gw], events=[warning("Gateway", "other", 27, 40, 1)]), [])
 
+    def test_long_sync_message_keeps_the_secret_name(self):
+        # The GKE Gateway controller's SYNC event names the missing Secret last,
+        # and on the default read-only identity this row is what names it.
+        gw = obj("Gateway", "checkout-gateway", spec={}, status={})
+        event = warning("Gateway", "checkout-gateway", 4, first_ago=40, last_ago=1)
+        event["message"] = (
+            'failed to translate Gateway "seeded-reliability/checkout-gateway": '
+            "Error GWCER102: Secret seeded-reliability/checkout-tls not found."
+        )
+        rows = analyze([gw], events=[event])
+        self.assertEqual(len(rows), 1)
+        self.assertGreater(len(rows[0]["detail"]), 100)
+        self.assertTrue(rows[0]["detail"].endswith("Secret seeded-reliability/checkout-tls not found."))
+        self.assertIn("Secret seeded-reliability/checkout-tls not found.", stall_report.render_table(rows))
+
     def test_events_v1_series_shape_is_read(self):
         gw = obj("Gateway", "edge", spec={}, status={})
         event = {
@@ -339,6 +354,16 @@ class HealthyNamespace(unittest.TestCase):
         self.assertEqual(rows, [])
         self.assertEqual(stall_report.stalled_object_count(rows), 0)
         self.assertEqual(stall_report.render_table(rows), "OBJECT  HEURISTIC  DETAIL  STALLED_FOR")
+
+    def test_table_caps_the_detail_column_but_the_finding_keeps_it(self):
+        gw = obj("Gateway", "edge", spec={}, status={})
+        event = warning("Gateway", "edge", 9, first_ago=40, last_ago=1)
+        event["message"] = "x" * (stall_report.TABLE_DETAIL_MAX_CHARS + 50)
+        rows = analyze([gw], events=[event])
+        self.assertEqual(len(rows[0]["detail"]), len("SYNC x9: ") + stall_report.TABLE_DETAIL_MAX_CHARS + 50)
+        cell = stall_report.render_table(rows).split("\n")[1].split("  ")[2]
+        self.assertEqual(len(cell), stall_report.TABLE_DETAIL_MAX_CHARS)
+        self.assertTrue(cell.endswith(stall_report.TRUNCATION_MARKER))
 
     def test_count_is_per_object_not_per_row(self):
         dep = healthy_deployment()
