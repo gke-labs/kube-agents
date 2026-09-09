@@ -4,7 +4,7 @@
 
 **Purpose:** Report whether every GKE cluster in the fleet runs a version its release channel still offers, and whether it is configured to _stay_ current on its own. This audit is **read-only and reports readiness**. It never upgrades anything: upgrading is a human decision, and the audit's job is to make that decision cheap, evidence-backed, and repeatable week over week.
 
-**Data sources:** `gcloud container ...`, read-only `kubectl`, the `gke` MCP server, and the `platform_control` MCP tools (`list_cc_pods`, `get_cc_pod_diagnostics`, `list_cc_healthchecks`, `get_cc_operator_status`, `audit_log_searcher`). **Nothing else.** No BigQuery, no Prometheus, no Container Analysis or Artifact Registry vulnerability scanning, no Security Command Center, no external blueprint or CVE feed, and no delegation to Cluster Agents via kanban. **You have no vulnerability feed, so you never enumerate CVEs** — every finding here is version currency or upgrade-policy hygiene, and must be worded that way.
+**Data sources:** `gcloud container ...`, read-only `kubectl`, the `gke` MCP server, and the `platform_control` MCP tools (`list_cc_pods`, `get_cc_pod_diagnostics`, `list_cc_healthchecks`, `get_cc_operator_status`, `audit_log_searcher`, and `capability_criteria`, which supplies the thresholds §1 reads first). **Nothing else.** No BigQuery, no Prometheus, no Container Analysis or Artifact Registry vulnerability scanning, no Security Command Center, no external blueprint or CVE feed, and no delegation to Cluster Agents via kanban. **You have no vulnerability feed, so you never enumerate CVEs** — every finding here is version currency or upgrade-policy hygiene, and must be worded that way.
 
 ---
 
@@ -26,8 +26,6 @@ Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/
 ### 1. Enumerate the target fleet
 
 **Tunable criteria first.** Before enumerating anything, call `capability_criteria(action="get", capability="security-patch-orchestrator")` once and keep the result. Several checks in §3 read a value from it — named beside the check as `criteria.<key>`, with the shipped default in parentheses — and the operator may have changed any of them since this SOP was written, so the tool's value wins over the number on the page. Name the revision the tool returned in the one-line report §6 produces (a `[SILENT]` run carries nothing). If the tool errors, say so in that line and use the defaults printed here.
-
-`criteria.excluded_clusters` (default empty) names clusters this audit does not audit at all. Drop them from the inventory before step 3 and put them in **neither** scope list — a `scope.skipped` entry would mark every run partial (§6), which is not what an exclusion means — and name the count in the §6 line (`2 excluded by criteria`). The criteria changelog, not the ledger, is the record of who chose the exclusion.
 
 1. Resolve the project scope: `gcloud config get-value project`. If `gcloud projects list --format="value(projectId)"` succeeds, include every additional project where `gcloud container clusters list` returns at least one cluster.
 2. Snapshot each project once — `clusters list` returns the **full** Cluster resources, node pools included, so one call is the whole inventory:
@@ -279,7 +277,7 @@ What to report in each case:
 - `silent_ok: true` → `[SILENT]` on a scheduled run, nothing else and no preamble. On `CLEAN` the helper commented, closed the ledger issue **as completed**, and closed every open remediation PR for this stream; on `UPDATED` the ledger was rewritten but nothing moved. Dispatched on demand, say which of those happened in one line and give the issue URL.
 - `status: "CLEAN"` with `resolved: > 0` → the fleet is fully patched and no longer behind its channel. Report the issue URL and how many findings closed with it. On a patch audit this is the sentence someone has been waiting for, and silence would bury it.
 - `status: "CLEAN"` with `partial: true` → nothing reproduced, but the ledger and its PRs stay open on incomplete coverage. One line reporting the clean result and the `coverage_gaps`, then the issue URL.
-- Any other outcome → one line, then the issue URL. For example: `Upgrade & patch readiness: 3 new findings (1 critical), 2 resolved, across 11 clusters — <issue_url>`. Name any remediation PRs opened or closed in the same line.
+- Any other outcome → one line, then the issue URL. For example: `Upgrade & patch readiness: 3 new findings (1 critical), 2 resolved, across 11 clusters, criteria revision 4 — <issue_url>`. Name any remediation PRs opened or closed in the same line.
 
 ## Red Lines
 
