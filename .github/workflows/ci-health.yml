@@ -2,14 +2,19 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 
 # Every 15 minutes, and on demand: refresh the live eval dashboard
 # (incremental collect -> render -> publish, the pipeline
-# hack/ci-dashboard-refresh.sh runs), read the data.json just published,
-# decide whether the presubmit gate is GREEN / DEGRADED / OUTAGE and why
-# (scripts/eval_dashboard/health.py), tell #kube-agents-ci-health on Google
-# Chat only when that changes plus one digest a day
-# (scripts/eval_dashboard/post_health.py), and publish health.json next to
-# data.json. docs/ci-health.md explains the states, the rules and the advice
-# each one carries. The data and the verdict are fresh together, with no
-# dependency on a Prow periodic.
+# hack/ci-dashboard-refresh.sh runs), decide from the data.json just
+# collected whether the presubmit gate is GREEN / DEGRADED / OUTAGE and why
+# (scripts/eval_dashboard/health.py), publish health.json next to data.json,
+# render the dashboard with that verdict and its history baked into the
+# Brief (render.py --health / --health-history, the same flags the refresh
+# script passes), and tell #kube-agents-ci-health on Google Chat only when
+# the state changes plus one digest a day (scripts/eval_dashboard/
+# post_health.py). docs/ci-health.md explains the states, the rules and the
+# advice each one carries. The data and the verdict are fresh together, with
+# no dependency on a Prow periodic. The order inside a tick is adjudicate ->
+# upload health.json -> append history -> render -> publish -> post ->
+# comment, so the Brief a reader opens from a message already shows the
+# verdict the message names.
 #
 # Two identities, each least-privilege for its half, which is why the
 # refresh script is not invoked as one unit here: it couples collect and
@@ -137,6 +142,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # render.py's "what changed right before" block reads the last
+          # three days of first-parent history and omits itself when
+          # `git rev-parse --is-shallow-repository` is not "false"; any
+          # positive depth is still shallow, so the full history it is.
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -202,19 +213,17 @@ jobs:
           workload_identity_provider: ${{ env.WIF_PROVIDER }}
           service_account: ${{ env.CI_HEALTH_SA }}
 
-      - name: Render and publish the dashboard
-        if: steps.collect.outcome == 'success'
-        run: |
-          python3 scripts/eval_dashboard/render.py --data work/data.json --out-dir work/site
-          python3 scripts/eval_dashboard/publish.py --out-dir work/site --target "$DASHBOARD_BUCKET/"
-
-      - name: Fetch data.json and the last-posted state
+      - name: Fetch data.json (after a failed collect) and the last-posted state
+        env:
+          COLLECT_OUTCOME: ${{ steps.collect.outcome }}
         run: |
           mkdir -p work
-          # After a successful publish this is the document just written;
-          # after a failed collect it is whatever the bucket holds, which the
-          # adjudicator ages against the clock.
-          gsutil -q cp "$DASHBOARD_BUCKET/data.json" work/data.json
+          # After a successful collect work/data.json is the document about
+          # to be published; after a failed one it is whatever the bucket
+          # holds, which the adjudicator ages against the clock.
+          if [ "$COLLECT_OUTCOME" != "success" ]; then
+            gsutil -q cp "$DASHBOARD_BUCKET/data.json" work/data.json
+          fi
           # No state yet is the first tick, not an error.
           gsutil -q cp "$DASHBOARD_BUCKET/health-state.json" work/health-state.json || true
           gsutil -q cp "$DASHBOARD_BUCKET/health.json" work/health-prev.json || true
@@ -250,6 +259,30 @@ jobs:
             echo "::warning::health-history.jsonl was not updated this tick"
             exit 1
           fi
+
+      # Render with the verdict just taken and its history, the way
+      # hack/ci-dashboard-refresh.sh does (`--health`, `--health-history`,
+      # each passed only when the file exists). health.json is always there
+      # by now; the history file is missing only when the step above failed
+      # before downloading, and the Brief then shows the current state alone.
+      # The flags are passed only when this checkout's render.py advertises
+      # them, so the tick stays green whichever of the dashboard change and
+      # this one lands first. Still gated on the collect: publishing
+      # re-renders data.json too, and a failed collect has nothing new that
+      # is safe to publish (header).
+      - name: Render and publish the dashboard
+        if: steps.collect.outcome == 'success'
+        run: |
+          render_args=()
+          if python3 scripts/eval_dashboard/render.py --help 2>/dev/null | grep -q -- '--health-history'; then
+            [ -f work/health.json ] && render_args+=(--health work/health.json)
+            [ -f work/health-history.jsonl ] && render_args+=(--health-history work/health-history.jsonl)
+            [ -f work/health-history.jsonl ] || echo "::warning::no health-history.jsonl this tick; the Brief renders the current verdict only"
+          else
+            echo "::warning::render.py has no --health/--health-history yet; rendering without the verdict"
+          fi
+          python3 scripts/eval_dashboard/render.py --data work/data.json --out-dir work/site "${render_args[@]}"
+          python3 scripts/eval_dashboard/publish.py --out-dir work/site --target "$DASHBOARD_BUCKET/"
 
       - name: Fetch the webhook URL (optional alternative to the Chat API)
         if: env.CI_HEALTH_MUTE != 'true'

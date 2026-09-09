@@ -4,9 +4,12 @@ Every 15 minutes `.github/workflows/ci-health.yml` refreshes the eval dashboard
 (the incremental collect → render → publish that `hack/ci-dashboard-refresh.sh`
 runs, split across two identities: `github-actions@kube-agents-prow` reads the
 Prow archive, `eval-dashboard-publisher@kube-agents-prow` writes the bucket),
-then `scripts/eval_dashboard/health.py` reads the `data.json` just published,
+then `scripts/eval_dashboard/health.py` reads the `data.json` just collected,
 decides whether `pull-kube-agents-smoke-test` is **GREEN**, **DEGRADED** or
-**OUTAGE** and why, and writes `health.json` next to it.
+**OUTAGE** and why, and writes `health.json` next to it — before the render, so
+the dashboard's Brief bakes that verdict and its history (`render.py --health`,
+`--health-history`; the checkout is fetched with full history for the Brief's
+"what changed right before" block).
 `scripts/eval_dashboard/post_health.py` tells `#kube-agents-ci-health` on Google
 Chat — only when the state changes, plus one digest a day at 9 AM Toronto time.
 The same tick comments on each pull request whose run went red
