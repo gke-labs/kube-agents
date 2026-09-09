@@ -88,6 +88,37 @@ The system prompt takes the 1h tier because it is the largest static span, every
 
 Nothing here is provider-specific. Non-Anthropic backends drop the markers in their provider transforms — Gemini and Gemma routes answer normally with unchanged token counts — and Gemini's own implicit caching, which needs no markers at all, is unaffected. Leaving the block in place on a Gemini install costs nothing and means switching to `MODEL_PROVIDER=anthropic` doesn't quietly switch caching off.
 
+### Redaction at the gateway
+
+Everything the agent observes on a cluster goes up in the next request: pod IPs, cluster and project names, and whatever credential material a command printed. The gateway is the one point every provider request transits, so it is where redaction runs. `litellm.redaction.enabled=true` in the chart values mounts the shared redactor module (a copy of the chat plugins' `AuditRedactor`, kept identical by a test) and a LiteLLM pre-call hook beside `config.yaml`, and the hook rewrites `messages[].content` (strings and `text` parts), embeddings `input` and completion `prompt` before LiteLLM calls the provider. The rendered default config does not change while the value is off.
+
+Three layers run, in this order:
+
+1. **The built-in credential patterns**, always on: GCP API keys and OAuth tokens, PEM private keys, bearer and basic auth values, GitHub, OpenAI and Slack tokens, JWTs, secret-shaped key/value pairs, Kubernetes Secret `data:` blocks, and e-mail addresses other than service-account principals. These are masked (`[REDACTED_SECRET]`, `[REDACTED_PRIVATE_KEY]`, `[REDACTED_EMAIL]`).
+2. **IP literals**, IPv4 and IPv6, under `litellm.redaction.ip`. `action: pseudonym` (the default) replaces each with `[ip:<12 hex>]`; `mask` replaces each with `[REDACTED_IP]`; `off` leaves them alone. `allowCidrs` lists the networks the model must still see, such as `127.0.0.0/8` or a service range.
+3. **Operator rules** under `litellm.redaction.rules`, each a `name`, exactly one of `literal` (an exact string) or `pattern` (a Python regular expression), and an `action` of `mask` (default, `[REDACTED_<NAME>]`) or `pseudonym` (`[<name>:<12 hex>]`).
+
+```yaml
+litellm:
+  redaction:
+    enabled: true
+    ip:
+      action: pseudonym
+      allowCidrs: ["127.0.0.0/8"]
+    rules:
+      - name: cluster-name
+        literal: prod-eu-1
+        action: pseudonym
+      - name: project
+        pattern: "my-proj-[0-9]+"
+```
+
+A pseudonym is the first twelve hex characters of an HMAC-SHA256 over the value, keyed by `SESSION_KV_SALT` from the credentials Secret (the same mechanism that pseudonymises chat identities). The same value maps to the same token in every request while the salt holds, so the model can still tell two pods apart and correlate an address across turns; nothing maps a token back. Without the salt the gateway still redacts, with a per-pod salt the redactor warns about, so tokens stop matching across replicas and restarts.
+
+**Pseudonymisation is not reversible, and that limits what the agent can do with a pseudonymised value.** The model never sees `10.0.0.5`; it sees `[ip:3fa9c2d1e0b4]`, and a `kubectl` command or a chat answer it writes from that token names an address that does not exist, so the tool call fails or the answer is useless. Pseudonymise identifiers the agent only needs to reason _about_; keep the ones it must act on in `allowCidrs`, use `off`, or accept that those tasks degrade. Masking has the same limit without the correlation.
+
+What this covers is the request body on its way to the provider. It does not touch responses, so an identifier the model already knows from an earlier, unredacted turn can still come back. It does not touch what the agent writes to disk: kanban transcripts, conversation logs and the terminal cache still carry tool output verbatim (the follow-up tracked from [#603](https://github.com/gke-labs/kube-agents/issues/603)). And it does not touch chat egress. A rule that fails to load stops the gateway pod at startup rather than forwarding requests unredacted, and the render fails on an action it does not know; an exception inside the hook fails that request. Each redacted request logs one line of substitution counts by rule name, never the payload.
+
 ### Vertex AI and Model Garden
 
 `MODEL_PROVIDER=vertex_ai` routes `model-default` to Vertex AI in your own GCP project — the same first-party Gemini models, plus every Model Garden publisher model your project has access to (Anthropic Claude, Llama, Mistral, and the rest). Requests stay inside your project's billing and data boundary, and no model API key exists anywhere in the cluster. That boundary is a project, not a geography: the default location is the global endpoint, which makes no promise about the region a request is processed in — see the location bullet below.
