@@ -12,7 +12,7 @@ A **Cluster Agent** is a read-only SRE scoped to exactly one GKE cluster. It is 
 Each profile is stamped from the [`agents/cluster/`](https://github.com/gke-labs/kube-agents/tree/main/agents/cluster) template (baked into the image at `/opt/cluster-template`) by [`cluster_agent_profile.py`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/scripts/cluster_agent_profile.py):
 
 - **One cluster only.** A `KUBECONFIG` pinned to the target cluster is written into the profile's `.env`, and the cluster's project/name/location are recorded as a `cluster_identity` block in its config.
-- **Read-only toolset.** The template config exposes only the `gke` and `developer_knowledge` MCP servers — no `platform_control` (provisioning), no GitOps write path. A Cluster Agent diagnoses; it never mutates cluster state and never opens pull requests.
+- **Read-only toolset.** The template config exposes only the `gke` and `developer_knowledge` MCP servers — no `platform_control` (provisioning), no GitOps write path. A Cluster Agent diagnoses; it never mutates cluster state and never opens pull requests. For GKE facts and error codes, it consults `developer_knowledge` first, falling back to DuckDuckGo web search only for third-party or open-source signatures.
 - **Its own skills.** Six single-cluster runtime-debugging skills ship in [`agents/cluster/skills/`](https://github.com/gke-labs/kube-agents/tree/main/agents/cluster/skills) (observability, reliability, storage, workload scaling, workload security, workload troubleshooting) — listed under their own heading in the [skill catalog](/kube-agents/skills/).
 
 ## Lifecycle

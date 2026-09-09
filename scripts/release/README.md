@@ -41,6 +41,8 @@ page under "Why there is no `gke-admin` set".
 - `record_nightly_candidate_summary.sh`: Renders step 1 of the nightly pipeline into the job summary — which candidate the run picked, and whether a green matrix will move staging. Keeps the two skips distinct: `SKIP_PIPELINE` means no run at all and carries `SKIP_REASON` to say which of its two causes applied, `SKIP_PROMOTION` means the matrix runs against a commit that already carries a staging tag and a pass pushes nothing.
 - `dispatch_rc_pipeline.sh`: Starts `rc-release-pipeline.yml` for a candidate `rc-scheduler.yml` resolved. Since the scheduler is the only thing that starts the pipeline, a failure here means no candidate is being tested at all, so it raises an `::error` annotation saying so before exiting non-zero, rather than leaving a bare exit code for the reader to interpret. The default `GITHUB_TOKEN` is enough: GitHub's recursion suppression exempts `workflow_dispatch`, which is why the staging tag push needs a PAT and this does not.
 - `record_rc_scheduler_skip.sh`: Records a quiet three-hourly tick. Because such a tick deliberately leaves no pipeline run behind, this summary is its only trace, and it says outright that a green scheduler reports nothing about the last pipeline run's result.
+- `dispatch_nightly_pipeline.sh`: Starts `nightly-pipeline.yml` for a candidate `nightly-scheduler.yml` resolved. Since the scheduler is the only scheduled mechanism that starts the pipeline, a failure here raises an `::error` annotation saying so before exiting non-zero, rather than leaving a bare exit code for the reader to interpret.
+- `record_nightly_scheduler_skip.sh`: Records a quiet nightly tick in the scheduler's job summary when no candidate requires staging promotion, leaving no pipeline run behind.
 - `run_optional_e2e_suites.sh`: Runs `e2e-run.yml`'s `optional_suites` list one suite at a time. Every suite runs regardless of what the ones before it did — a failure that short-circuited the loop would silently drop the coverage behind it — and the script exits non-zero if any failed, which the `continue-on-error` step turns into a red-but-tolerated result with the failing suites named in the job summary. The list is comma-separated because `workflow_call` has no list input type.
 - `tag_staging_promotion.sh`: Pushes the `staging_<ts>_<sha>` tag that `staging-deploy.yml` deploys on. It derives the tag from the candidate rather than trusting one passed in, and refuses anything outside the `staging_` namespace — the tag is a live deploy trigger. It must be pushed with the dedicated GitHub App token (`kube-agents-release-bot`, configured via `RELEASE_BOT_APP_ID` and `RELEASE_BOT_APP_PRIVATE_KEY`); a tag pushed with the default `GITHUB_TOKEN` triggers no workflow, so the promotion would go green having deployed nothing.
 - `peel_tag_commit.sh`: Resolves the ref a push event fired on to the commit it points at and writes it to `GITHUB_OUTPUT` as `commit_sha`. `staging-deploy.yml` runs it because `ensure_git_tag` creates annotated tags: a push event's `github.sha` is the new value of the ref, which for an annotated tag is the tag object's SHA, and passing that to container image tags names a GHCR image that was never published. Peeling a lightweight tag or a branch head returns the same SHA, so a caller need not know which it got.
@@ -51,7 +53,7 @@ page under "Why there is no `gke-admin` set".
 - `render_install_env.sh`: The one mapping from a GitHub environment's `vars.*`/`secrets.*` to the installer's `install.env`. A runner is ephemeral and has no hand-authored one, so every job that drives the installer renders one and points `KUBE_AGENTS_INSTALL_ENV` at it. `--strict` additionally requires every setting whose absence would _remove_ something from an install that already exists — the gVisor node pool, Hindsight, the backup plan, the Chat topic — and names all the missing ones in one annotation rather than one per run. That distinction is the whole difference between the two families of environment: `rc` and `nightly` are rebuilt every run, so an omitted setting costs a feature; `autopush` and `staging` have been up for weeks, so the same omission is a `terraform apply` that plans a destroy. A key with no value is omitted from the file rather than written empty, because `KEY=` beats `install.defaults.env` and means "explicitly nothing".
 - `reconcile_environment.sh`: Applies `terraform/examples/full-install` to a long-lived environment, or reports what applying it would change. Renders the configuration strictly, waits out any `*-redeploy-*` run already in flight (both drive `helm upgrade` on the release `helm_release.kube_agents` owns), takes the live-test lease for an apply, and then runs `upgrade.sh --plan` or `upgrade.sh --upgrade-mode=full`. `LEASE_POLICY` picks what a held lease means: `defer` for the scheduled path, `fail` for a manual one. A plan takes no lease and holds no lock, because it changes nothing. Called by `reconcile-environment.yml`.
 - `report_drift.py`: Turns a non-empty plan into one tracked issue per environment, labelled `infra-drift`, edited in place while the drift lasts and closed by the first clean plan. Found again by a marker in the body rather than by title, so retitling one does not orphan it. A plan that failed to run leaves whatever is open exactly as it is: a failure is evidence of nothing either way. Called by `drift-detect.yml`.
-- `teardown_environment.sh`: Destroys the environment after a run that passed end to end, so the cluster exists only for the length of a run rather than idling between them. A failure here is always fatal and `TEARDOWN_STRICT` does not apply: nothing runs afterwards, so the alternative to a red job is a GKE cluster billing under a green pipeline. It runs only when every earlier step succeeded, which is what leaves a failed run's environment standing to be examined live — until the next scheduled run reclaims it on the RC, three hours at most, and indefinitely on the nightly, which has no schedule to reclaim anything.
+- `teardown_environment.sh`: Destroys the environment after a run that passed end to end, so the cluster exists only for the length of a run rather than idling between them. A failure here is always fatal and `TEARDOWN_STRICT` does not apply: nothing runs afterwards, so the alternative to a red job is a GKE cluster billing under a green pipeline. It runs only when every earlier step succeeded, which is what leaves a failed run's environment standing to be examined live — until the next scheduled run reclaims it (up to three hours later on the RC, and on the next daily run for the nightly).
 - `wait_for_gke_readiness.sh`: Connects `kubectl` to the target cluster, configures Artifact Registry credentials, optionally verifies the gateway is running the candidate commit's image — delegated to `scripts/confirm_agent_image.sh`, which the agent redeploy workflow runs for the same purpose — and waits for `litellm` and `platform-agent-gateway` to report ready.
 - `tag_validated_release.sh`: Attaches the `rc_*_validated` marker to a candidate commit upon 100% test pass, by appending `_validated` to its `rc_*` tag.
 - `resolve_scheduled_release.sh`: Decides whether an unattended run of `release-publish.yml` should publish. Three conditions — a candidate carries a shape-valid `staging_<ts>_<sha>` tag, commits exist between the newest GA tag and that candidate, and nothing in the range is a breaking change — emitted as `should_release`, `release_commit`, `gate_tag` and `skip_reason`. The first two failing are skips with exit 0; a breaking change is not a skip, because it recurs until somebody publishes by hand, so it raises an `::error` and exits non-zero. A repository with no GA tag yet skips both remaining conditions rather than evaluating them against all of history, matching what `calculate_next_version.sh` does in that state — checking would halt on some long-shipped `feat!:` with no range left to shrink, permanently. There is no weekday or elapsed-time check in it — the cron is the cadence — and no "already released?" condition either, because a GA tag on the gated commit empties the range and the second condition covers it. It takes the candidate lookup (`get_latest_staging_tag`), the commit-range read (`release_read_commit_range`) and the breaking-change definition (`commit_messages_have_breaking_change`) from `common.sh` rather than re-implementing any of them: the first keeps it agreeing with `verify_release_eligibility.sh` about which candidate has been promoted, and the other two keep it agreeing with `calculate_next_version.sh` about which commits are in the range and which of them count as breaking. See "The weekly GA release" below for what the gate is actually buying over the publishing path's own behaviour.
@@ -76,8 +78,12 @@ The end-to-end pipeline (`.github/workflows/rc-release-pipeline.yml`) is dispatc
   - **Redundant Run Skipping**: If the latest candidate commit already carries an `rc_*_validated` tag or was previously attempted, the scheduler dispatches nothing and records why in its job summary. The pipeline gets no run at all, which is the point — a skipped pipeline run concluded `success` and painted over the last run that failed.
   - Dispatches with the default `GITHUB_TOKEN` and `actions: write` on the job. `workflow_dispatch` and `repository_dispatch` are the two events GitHub exempts from the rule that suppresses runs triggered by that token, so no PAT is needed here — unlike a tag push, where the suppression is real and the release bot GitHub App token is required.
   - _Note_: Scheduled runs are scheduled at minute `17` to avoid GitHub Actions peak top-of-the-hour queue congestion; actual start times are best-effort based on GitHub scheduler availability.
+- **Nightly Scheduled Cadence (`nightly-scheduler.yml`, daily at `17 2 * * *`, best-effort)**:
+  - Automatically resolves the latest validated candidate (`rc_*_validated`) using `resolve_promotion_candidate.sh`.
+  - **Redundant Run Skipping**: If no eligible validated candidate exists, the scheduler dispatches nothing and records the reason in its job summary via `record_nightly_scheduler_skip.sh`.
+  - Dispatches `nightly-pipeline.yml` using `dispatch_nightly_pipeline.sh` with the default `GITHUB_TOKEN` and `actions: write`.
 - **Manual Trigger (`workflow_dispatch`)**:
-  - Requires an explicit `commit_sha` input to rigorously test a specific target commit.
+  - Both schedulers and pipelines support manual trigger via `workflow_dispatch`. For manual dispatches, the RC pipeline requires `commit_sha` (mandatory), whereas the nightly pipeline accepts an optional `rc_tag` candidate override (defaulting to the newest eligible validated candidate when omitted).
 
 ## What Happens to the RC Cluster
 
@@ -143,10 +149,11 @@ and `nightly` yields `nightly-environment` and the two pipelines never contend f
 input is required and has no default, because a nightly caller that omitted it would tear down and
 rebuild the RC.
 
-It ships without a `schedule:`. A cron and a `workflow_dispatch` button only exist once the file is
-on the default branch, so the first real run is necessarily after merge; a dispatch-only workflow
-cannot affect anything running today. Add `cron: "0 2 * * *"` as its own change once the pipeline
-has run by hand.
+It is scheduled via a decoupled trigger workflow (`nightly-scheduler.yml`, daily at `17 2 * * *`),
+which resolves the newest validated candidate and dispatches this pipeline only when promotion is needed.
+Unlike the RC pipeline (which marks attempted candidates to avoid repeating failing runs), the nightly
+scheduler retries nightly until a candidate passes the E2E matrix and receives a `staging_*` tag or a newer
+validated candidate arrives.
 
 ### What has to exist before it can run
 
@@ -290,13 +297,14 @@ override for hotfixes rather than a way to cut an ordinary release.
 ### Turning it on
 
 **It ships without a `schedule:`, and the reason is one rung down the ladder.** The gate reads the
-staging tag; `nightly-pipeline.yml` is the only thing that pushes one, and it is dispatch-only too.
+staging tag; `nightly-pipeline.yml` (dispatched by `nightly-scheduler.yml`) is the only thing that pushes one.
 A weekly cron over a tag family nothing produces on a schedule would skip green every Thursday and
 demonstrate nothing about the gate. So, in order:
 
-1. **Get `nightly-pipeline.yml` green.** Dispatch it against a validated candidate and let it push
-   a real `staging_<ts>_<sha>` tag. Everything below is unreachable until one exists, and so is a
-   GA release. Its own cron goes on once that is boring.
+1. **Nightly promotion is green and scheduled.** `nightly-pipeline.yml` has successfully promoted
+   candidates (producing real `staging_<ts>_<sha>` tags), and its automated daily dispatch is
+   established via `nightly-scheduler.yml` (`17 2 * * *`). Everything below is reachable now that
+   staging tags exist.
 2. `workflow_dispatch` on `release-publish.yml` with `schedule_gate: dry-run` — the resolver runs
    against the real tag graph and reports what a cron tick would decide. Nothing is published. Note
    that a dry run still goes **red** if the verdict is a halt: it reports what the cron would do,
@@ -314,10 +322,11 @@ demonstrate nothing about the gate. So, in order:
 
 4. Add `schedule: - cron: "17 5 * * 4"` to the workflow. Thursday leaves a working day to react to
    a bad release, which Friday does not. 05:17 UTC is meant to sit after the nightly pipeline has
-   finished, but that is an estimate rather than a measured margin — its proposed 02:00 start gives
-   a little over three hours for a run that budgets 60 minutes on the deploy alone. Being wrong
-   about it costs latency and never correctness, because the gate is a poll: a candidate promoted
-   later is simply picked up the following week. Pick a later slot if the two turn out to overlap.
+   finished, but that is an estimate rather than a measured margin — its 02:17 start gives three
+   hours for a run that budgets 60 minutes on the deploy plus `timeout_minutes: 120` on the
+   matrix. Being wrong about it costs latency and never correctness, because the gate is a poll: a
+   candidate promoted later is simply picked up the following week. Pick a later slot if the two
+   turn out to overlap.
 
 Two things to know about a weekly cadence, neither of them a reason to change it. A Thursday that
 produces nothing costs a full week, because there is no rate limiter inside the resolver to buy the
@@ -343,6 +352,7 @@ These modular scripts back the corresponding child workflows in `.github/workflo
 | `teardown-environment.yml`  | Step 5 - Tear Down Environment              | `resolve_rc_tag.sh`, `teardown_environment.sh`                                                                                                                                                                                                           |
 | `nightly-pipeline.yml`      | Nightly promotion to staging                | `resolve_promotion_candidate.sh`, `verify_candidate_images.sh`, `record_nightly_candidate_summary.sh`, `tag_staging_promotion.sh`, plus the shared workflows listed elsewhere in this table                                                              |
 | `rc-scheduler.yml`          | Three-hourly RC trigger                     | `resolve_rc_tag.sh`, `record_rc_scheduler_skip.sh`, `dispatch_rc_pipeline.sh`                                                                                                                                                                            |
+| `nightly-scheduler.yml`     | Daily nightly promotion trigger             | `resolve_promotion_candidate.sh`, `record_nightly_scheduler_skip.sh`, `dispatch_nightly_pipeline.sh`                                                                                                                                                     |
 | `staging-deploy.yml`        | Staging deploy on a promotion tag           | `peel_tag_commit.sh`, `reconcile-environment.yml`                                                                                                                                                                                                        |
 | `reconcile-environment.yml` | Reconcile a long-lived environment in place | `render_install_env.sh`, `reconcile_environment.sh`                                                                                                                                                                                                      |
 | `drift-detect.yml`          | Daily drift report on `autopush`/`staging`  | `render_install_env.sh`, `reconcile_environment.sh`, `report_drift.py`                                                                                                                                                                                   |

@@ -39,6 +39,7 @@ spec:
       port: 8888
       targetPort: http
 ---
+{{- $rollingUpdate := include "kube-agents.rollingUpdateFenceposts" (dict "rollingUpdate" .Values.hindsight.api.rollingUpdate "defaultSurge" 1 "defaultUnavailable" 0 "scope" "hindsight.api.rollingUpdate") | fromYaml }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -50,6 +51,11 @@ metadata:
     {{- include "kube-agents.labels" . | nindent 4 }}
 spec:
   replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: {{ $rollingUpdate.maxSurge }}
+      maxUnavailable: {{ $rollingUpdate.maxUnavailable }}
   # 15 minutes, above the default 600s: a cold roll pulls 1.4 GB before the
   # container starts and only then spends the startupProbe budget loading
   # models. k8s-operator/config/integrations/hindsight/api.yaml carries the

@@ -43,7 +43,7 @@ A personal-account App is created as "Only on this account", which cannot instal
 
 ### Install variables
 
-`./install.sh` collects these in its GitOps interview and saves them to `install.env`:
+The installer (`install.sh`) collects these in its GitOps interview and saves them to `install.env`:
 
 - `GITHUB_APP_ID` — numeric App ID.
 - `GITOPS_ORG` — the organization hosting the repo. A username will not work; see above.

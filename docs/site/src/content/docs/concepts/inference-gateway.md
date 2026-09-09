@@ -53,7 +53,7 @@ The two substituted values come from the install (`MODEL_PROVIDER` and `MODEL_DE
 
 Any model string the chosen provider accepts is valid — there is no allow-list in the harness. For example, [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) pins `gemini-3.1-flash-lite`.
 
-To change the default on an installed system, re-run `./install.sh` (or its `--menu` panel's model-provider entry followed by **Save & Apply**) — one `terraform apply` rewrites the LiteLLM `ConfigMap` and rolls the gateway. On a dev cluster, set the variables and redeploy the dev copy:
+To change the default on an installed system, re-run the installer with `--menu` (e.g. `./install.sh --menu` or `$HOME/kube-agents/install.sh --menu`) and use the model-provider entry followed by **Save & Apply** — one `terraform apply` rewrites the LiteLLM `ConfigMap` and rolls the gateway. On a dev cluster, set the variables and redeploy the dev copy:
 
 ```bash
 export MODEL_PROVIDER=gemini
@@ -101,7 +101,7 @@ Two things differ from the API-key providers:
 `MODEL_DEFAULT_NAME` is the Vertex **publisher model ID**, which is not always the same string the provider's own API uses — Model Garden Claude models, for instance, carry an `@`-suffixed version (`claude-sonnet-4-5@20250929`). Check the model's Model Garden card for the exact ID; a wrong one surfaces as a 404 from the gateway rather than a provisioning error.
 
 ```bash
-./install.sh \
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
   --model-provider=vertex_ai \
   --model-default-name=gemini-3.5-flash \
   --vertex-project-id=my-gcp-project \

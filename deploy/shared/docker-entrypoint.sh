@@ -1209,6 +1209,13 @@ if [ -d "$CLUSTER_TEMPLATE" ]; then
             "$INSTALL_DIR/.venv/bin/python3" -c "import os, sys, yaml, pathlib; p = pathlib.Path(sys.argv[1]); c = yaml.safe_load(p.read_text()) or {}; m = c.get('memory'); sys.exit(0) if not isinstance(m, dict) or 'provider' not in m else None; m.pop('provider'); t = p.with_name(p.name + '.tmp'); t.write_text(yaml.safe_dump(c)); os.replace(t, p)" "$d/config.yaml" \
                 || echo "WARN: failed to strip memory.provider from $d/config.yaml; this cluster agent keeps an inert provider" >&2
         fi
+        # Backfill default legacy risk onto any unannotated jobs in this cluster profile's
+        # cron store if one exists on the PVC.
+        if [ -f "$d/cron/jobs.json" ] && [ -w "$d/cron/jobs.json" ] && [ -f "$SCAFFOLD" ]; then
+            HOME=/tmp HERMES_HOME="$TARGET_DIR" "$INSTALL_DIR/.venv/bin/python3" \
+                "$SCAFFOLD" --backfill-cron "$d/cron/jobs.json" \
+                || echo "WARN: failed to backfill risk tier in $d/cron/jobs.json" >&2
+        fi
     done
 fi
 

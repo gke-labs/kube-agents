@@ -95,7 +95,7 @@ The last two states are the same event seen from opposite sides: a fix PR that i
 
 Three properties follow from the script owning the artefacts rather than the model:
 
-- **One ledger per audit stream.** The `--audit` id is checked against a fixed allowlist, and the branch and label names are derived from it rather than passed in, so a typo cannot open a seventh stream. The agent never calls `gh issue create` itself.
+- **One ledger per audit stream.** The `--audit` id is checked against a fixed allowlist, and the branch and label names are derived from it rather than passed in, so a typo cannot open an unregistered stream. The agent never calls `gh issue create` itself.
 - **A computable delta.** The issue body carries a hidden `<!-- audit-findings: [...] -->` block; the next run diffs finding ids against it. Stability is not asked of the model: the id is derived in code from `(check, cluster, namespace, object)` and any `id` in the findings file is discarded, so the same problem keeps the same id without anyone remembering to make it so. A second hidden line stamps which identity scheme minted the ids, and a run that reads a block from a different scheme withholds `resolved` for one run rather than reporting a renamed finding as a fixed one.
 - **No invented output.** The model never writes the title, body, commit message, or any timestamp — so two runs against an unchanged fleet produce an unchanged ledger.
 

@@ -24,7 +24,7 @@ The loop ends at the repo, not in chat. A watchdog's findings reach you as the l
 
 ## What runs on its own
 
-Six fleet audits run enabled, each on its own schedule and each maintaining a single GitHub issue as its standing report:
+Nine fleet audits run enabled, each on its own schedule and each maintaining a single GitHub issue as its standing report:
 
 - **Security & RBAC posture** (daily) — privileged and host-namespace containers, over-privileged RBAC bindings, namespaces with no `NetworkPolicy`, Workload Identity and metadata-concealment gaps.
 - **Workload reliability** (daily) — missing resource requests, drain-blocking or absent PodDisruptionBudgets, unscalable Deployments, zone-pinned scheduling, missing probes.
@@ -32,12 +32,15 @@ Six fleet audits run enabled, each on its own schedule and each maintaining a si
 - **Fleet waste** (weekly) — over-provisioned requests, orphaned PersistentVolumes and disks, idle reserved IPs, near-empty node pools. Reported in resource units, not dollars: there is no billing export to price against.
 - **Fleet consistency drift** (weekly) — clusters that diverge from the rest of the fleet on release channel, Workload Identity, Shielded Nodes, logging config and similar facets. The baseline is derived from the fleet itself, so it needs no blueprint to compare against.
 - **AI workload security** (daily) — inference endpoints on external load balancers, model repositories trusted to execute their own code, weights mounted writable under the serving process, unpinned model artifact sources, registry credentials in plaintext environment variables, model-server images on floating tags. It scopes itself to workloads running a known inference runtime or holding a GPU or TPU, and evaluates the deployment, never the model.
+- **Capacity & stockout prevention** (daily) — capacity obtainability, ComputeClass resilience, and single-zone stockouts.
+- **GCP networking fabric** (daily) — subnet IP exhaustion, Cloud NAT, PSC, MTU, Cloud Armor.
+- **GCE compute fleet** (daily) — Compute Engine VMs and MIGs: startup scripts, autoscaler, Ops Agent, sole-tenant, snapshots.
 
 Alongside them, `github-repo-watcher` polls the target repo every 10 minutes and hands what it finds to one of two skills. An unaddressed open issue goes to `github-issue-resolver`, which triages it within tight guardrails — audit ledgers, which carry `agent:audit`, are excluded from the poll. A review request on one of the agent's own pull requests — a comment that _begins_ with `/agent` or with an @-mention, from someone with write access — goes to [`pr-conversation`](/kube-agents/concepts/declarative-workflow/#answering-a-reviewer-on-the-pr), which answers in the thread or amends the branch under review. The poll itself runs no model: a tick with nothing to do costs an API call and no tokens.
 
 Each audit calls the [`fleet-audit`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills/fleet-audit) skill, whose helper owns every git and `gh` operation and renders every body from a validated findings file. The stream's ledger issue is rewritten in place each run; findings with a mergeable manifest are promoted into narrow remediation PRs that link back to it — automatically for critical ones, on request for the rest ([Declarative workflow](/kube-agents/concepts/declarative-workflow/#the-fleet-audit-skill) has the mechanism). A finding with no reproducible command is dropped, not softened; a clean run closes the ledger as completed and says nothing at all — unless it could not read the whole fleet, in which case it leaves the ledger open and reports the gaps rather than passing a partial look off as an all-clear, or it resolved findings on the way there, in which case it reports what closed rather than letting the good news be the only thing it swallows.
 
-Those seven are the whole roster; five further watchdogs shipped disabled for a time and have since been [retired](/kube-agents/concepts/autonomous-watchdogs/#the-retired-jobs). [Reference → Cron jobs](/kube-agents/reference/cron-jobs/) has the full table, generated from `jobs.json`, with exact cron expressions and prompts.
+Those nine are the whole roster; five further watchdogs shipped disabled for a time and have since been [retired](/kube-agents/concepts/autonomous-watchdogs/#the-retired-jobs). [Reference → Cron jobs](/kube-agents/reference/cron-jobs/) has the full table, generated from `jobs.json`, with exact cron expressions and prompts.
 
 ## Why this matters
 

@@ -84,6 +84,23 @@ const (
 	// override all three via the env vars until then.
 	defaultA2AGatewayImage = "northamerica-northeast1-docker.pkg.dev/bnaylor-kagents-dev/a2a-demo/gateway:latest"
 
+	// a2aConfigHashPlaceholder is the stand-in a2aConfigRolloutHash puts where
+	// each password goes when it re-renders nats.conf for hashing. It carries
+	// the key name so moving a credential from one user to another is still a
+	// changed render, and it is the reason the digest in the pod template is
+	// not a digest of the credentials.
+	a2aConfigHashPlaceholder = "{{a2a-credential:%s}}"
+
+	// a2aConfigHashRotationSeparator joins that render to the creds Secret's
+	// resourceVersion, which is what makes an in-place credential rotation
+	// roll the bus. A NUL byte cannot appear in the render, so no config text
+	// can forge the boundary and pass itself off as a resourceVersion.
+	a2aConfigHashRotationSeparator = "\x00resourceVersion="
+
+	// a2aConfigHashLength is how much of the hex digest rides the pod-template
+	// annotation. The annotation is a change detector, not an identifier.
+	a2aConfigHashLength = 16
+
 	// a2aPostureComment travels on every rendered config and script so the
 	// posture cannot be mistaken for the product when read on the cluster.
 	a2aPostureComment = `# PLAYGROUND POSTURE (stage 1): static per-component NATS users instead of
@@ -225,7 +242,7 @@ func (r *PlatformAgentReconciler) ensureA2ACredsSecret(ctx context.Context, agen
 	return secret, nil
 }
 
-// buildA2ANATSConfigSecret renders nats.conf with the static account layout.
+// renderA2ANATSConf renders nats.conf, taking every password from pw.
 //
 // The property being preserved, verbatim from the deployment spec: the bus
 // decides who may say what before a message is read. Deny-by-default — a
@@ -233,10 +250,24 @@ func (r *PlatformAgentReconciler) ensureA2ACredsSecret(ctx context.Context, agen
 // _INBOX prefixes so the reply path cannot leak what the subject grants
 // withheld. $JS.API.> on every app user is playground posture; production
 // narrows it to the per-stream API subjects when the callout arms.
-func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret) *corev1.Secret {
-	pw := func(key string) string { return string(creds.Data[key]) }
-
-	conf := a2aPostureComment + `
+//
+// pw is a parameter rather than a closure over the creds Secret because two
+// callers walk this template: buildA2ANATSConfigSecret with the real lookup,
+// and a2aConfigRolloutHash with one that returns placeholders. One template
+// and two lookups is what lets the rollout digest cover every non-secret byte
+// without covering a credential — a password interpolated here by any route
+// other than pw is back in the digest.
+//
+// TestA2AConfigRolloutHashOmitsCredentialsAndTracksRotation is the guard for
+// that: it hashes two creds Secrets that differ only in their password bytes
+// and requires the digests to be equal, so any route by which a credential
+// re-enters the hashed input reds it.
+// TestA2ARenderedObjectsCarryNoPasswordDigest is the wider but shallower one —
+// it catches a digest of a password, or of the real conf, reaching a rendered
+// name, label or annotation, and it cannot see a credential folded into the
+// hashed bytes as a third string.
+func renderA2ANATSConf(agent *agentv1alpha1.PlatformAgent, pw func(key string) string) string {
+	return a2aPostureComment + `
 
 server_name: ` + a2aNATSName(agent) + `
 port: 4222
@@ -352,7 +383,23 @@ accounts {
             "a2a.topics.agent.platform.upgrade-readiness",
             "a2a.topics.shared.blueprint",
             "a2a.topics.shared.annotations",
-            "a2a.agents.>",
+            # No a2a.agents.> publish. The directory is the identity plane:
+            # a2a.agents.{profile} is last-value, so one publish REPLACES a
+            # profile's card, and an agent-closed tombstone retires it. The
+            # payload spec says cards are "published by the profile's owner
+            # (the operator once profiles are CRs), not by workers", and
+            # nothing in the tree publishes one today — this grant had no
+            # caller and let the least-trusted principal in the deployment
+            # forge any profile's card. The gateway keeps SUBSCRIBE on the
+            # same subjects, which is the read discovery actually needs.
+            #
+            # This closes forgery, not reach: $JS.API.> below still covers
+            # STREAM.PURGE.DIRECTORY, STREAM.UPDATE.DIRECTORY and
+            # STREAM.DELETE.DIRECTORY, so worker can still erase the whole
+            # directory in one call. Scoping that wildcard the way #1306
+            # scopes seed's is gke-labs/kube-agents#1316, and it is a
+            # separate change: the worker's JetStream use is TASKS and the
+            # KV bucket, and narrowing to those wants its own live proof.
             "agents.hb.>",
             "$KV.runtime-state.>",
             "$JS.API.>",
@@ -472,6 +519,13 @@ accounts {
 }
 system_account: SYS
 `
+}
+
+// buildA2ANATSConfigSecret renders nats.conf with the real credentials from
+// the creds Secret. This Secret's Data is the one place the passwords are
+// meant to appear; a2aConfigRolloutHash covers the rest of the render.
+func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret) *corev1.Secret {
+	conf := renderA2ANATSConf(agent, func(key string) string { return string(creds.Data[key]) })
 
 	return &corev1.Secret{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
@@ -484,11 +538,53 @@ system_account: SYS
 	}
 }
 
-// buildA2ANATSStatefulSet renders the bus. confHash is a digest of the
-// rendered nats.conf: the config Secret updates in place but the nats
-// container only reads it at boot, so the hash rides the pod template — the
-// agent Deployment's config-hash mechanism — and a changed render rolls the
-// server instead of silently diverging from it.
+// a2aConfigRolloutHash is the digest that rides the StatefulSet pod template
+// so a changed bus config reaches a running server: the config Secret updates
+// in place, but the nats container only reads it at boot.
+//
+// It is deliberately NOT a digest of the rendered nats.conf. That file carries
+// all five NATS passwords, so hashing it put a truncated digest of the
+// credentials in an annotation anyone who can get the StatefulSet can read —
+// harmless against 32 random hex characters, an offline target the day a
+// password is hand-set, and CodeQL alert 27 (go/weak-sensitive-data-hashing).
+//
+// Instead it covers the conf rendered with a placeholder in each password's
+// place, plus the creds Secret's resourceVersion. Both halves are load-bearing:
+// the placeholder render tracks every non-secret byte, so a config change still
+// rolls the bus, and the resourceVersion tracks a credential rotation, which
+// ensureA2ACredsSecret performs as an Update on the existing Secret — the UID
+// would not move, which is why this is the resourceVersion.
+//
+// Two things that costs, both accepted rather than overlooked:
+//
+// The hash is no longer content-addressed. resourceVersion moves on ANY
+// accepted write to the creds Secret, so labelling it by hand, a policy
+// controller stamping the namespace, or a restore that renumbers the namespace
+// rolls the single-replica bus once with nothing the server reads having
+// changed — clients reconnect, and JetStream state lives on the PV. The
+// alternative that ignores metadata churn is a digest of the password bytes,
+// which is the alert this function exists to close, so the spurious roll is
+// the price of not hashing the credential.
+//
+// And the rotation it notices rolls the bus, not the bus's clients. This hash
+// rides the NATS pod template alone; the gateway Deployment and the provision
+// Job take their passwords through valueFrom.secretKeyRef, which a running pod
+// does not re-read, so a repaired credential leaves the gateway holding the old
+// one until something else restarts it. That gap predates this function — the
+// conf digest rolled only the StatefulSet too — and closing it means deciding
+// what a rotation should restart, which is not this function's call.
+func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret) string {
+	redacted := renderA2ANATSConf(agent, func(key string) string {
+		return fmt.Sprintf(a2aConfigHashPlaceholder, key)
+	})
+	sum := sha256.Sum256([]byte(redacted + a2aConfigHashRotationSeparator + creds.ResourceVersion))
+	return hex.EncodeToString(sum[:])[:a2aConfigHashLength]
+}
+
+// buildA2ANATSStatefulSet renders the bus. confHash comes from
+// a2aConfigRolloutHash and rides the pod template — the agent Deployment's
+// config-hash mechanism — so a changed render rolls the server instead of
+// silently diverging from it.
 // a2aNATSDataClaim is the StatefulSet's volumeClaimTemplate name. The claim the
 // controller stamps out is "<this>-<sts>-0", which handleDeletion reaps by name --
 // so a rename here that is not matched there turns the reap into a silent no-op
@@ -1049,8 +1145,7 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		return state, fmt.Errorf("failed to apply A2A NATS config: %w", err)
 	}
 
-	confSum := sha256.Sum256(config.Data["nats.conf"])
-	sts := buildA2ANATSStatefulSet(agent, hex.EncodeToString(confSum[:])[:16])
+	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds))
 	if err := ctrl.SetControllerReference(agent, sts, r.Scheme); err != nil {
 		return state, err
 	}

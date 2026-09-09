@@ -1327,9 +1327,12 @@ func TestBuildPodTemplateSpecHoldsNoCredentialRuntime(t *testing.T) {
 		if container.Name == "envoy-credential-proxy" {
 			t.Error("the credential runtime is back in the gateway Pod, where the agent shares its network namespace")
 		}
-		user := podSC.RunAsUser
-		if container.SecurityContext != nil && container.SecurityContext.RunAsUser != nil {
-			user = container.SecurityContext.RunAsUser
+		// The pod default unless the container overrides it, which is the
+		// kubelet's own rule; see effectiveRunAsUser.
+		user := effectiveRunAsUser(spec, container)
+		if user == nil {
+			t.Errorf("expected container %s to run as the sandbox UID %d, got no runAsUser at either level", container.Name, sandboxUID)
+			continue
 		}
 		if *user != sandboxUID {
 			t.Errorf("expected container %s to run as the sandbox UID %d, got %d", container.Name, sandboxUID, *user)
@@ -3299,8 +3302,10 @@ func TestBuildPlatformLeaderRole(t *testing.T) {
 	if role.Name != "kubeagents:leader:test-ns:test-agent" || role.Namespace != "test-ns" {
 		t.Errorf("expected role name kubeagents:leader:test-ns:test-agent and namespace test-ns, got name %s ns %s", role.Name, role.Namespace)
 	}
-	if len(role.Rules) != 2 || role.Rules[0].Resources[0] != "leases" || role.Rules[1].Resources[0] != "pods" {
-		t.Errorf("expected rules for leases and pods, got %v", role.Rules)
+	// This agent names no Deployment, so it resolves to one replica and leader
+	// election never runs. Leases only -- see TestLeaderRolePodsRuleTracksLeaderElectionArming.
+	if len(role.Rules) != 1 || role.Rules[0].Resources[0] != "leases" {
+		t.Errorf("expected a leases-only rule set at one replica, got %v", role.Rules)
 	}
 
 	rb := buildLeaderRoleBinding(agent, role.Name, role.Name)
@@ -6023,5 +6028,75 @@ func TestManagedEnvValuesCannotSmuggleALine(t *testing.T) {
 	}
 	if modeLines != 1 {
 		t.Errorf("expected exactly one KUBEAGENTS_MODE line, got %d:\n%s", modeLines, rendered)
+	}
+}
+
+// TestLeaderRolePodsRuleTracksLeaderElectionArming pins the grant to its consumer.
+//
+// pods get/patch on the agent's ServiceAccount exists for one caller:
+// leader_elect.py's update_pod_label, which labels its own pod so the Service
+// selector finds the leader. That wrapper is armed by LEADER_ELECTION_LEASE_NAME
+// in the pod template, and only above one replica -- so the Role and the env have
+// to agree, and this asserts it directly rather than restating the condition.
+//
+// The failure it prevents is silent in the direction that matters: change the
+// arming condition and leave the Role alone, and every single-replica install
+// carries namespace-wide pods:patch on the identity that also holds the agent's
+// Workload Identity annotation. Nothing breaks, nothing logs, and the grant is
+// only found by someone auditing RBAC.
+func TestLeaderRolePodsRuleTracksLeaderElectionArming(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		replicas    *int32
+		scaleToZero *bool
+	}{
+		{name: "unset (defaults to one)"},
+		{name: "explicitly one", replicas: ptr.To(int32(1))},
+		{name: "three", replicas: ptr.To(int32(3))},
+		{name: "three but scaled to zero", replicas: ptr.To(int32(3)), scaleToZero: ptr.To(true)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := newTestPlatformAgent()
+			if agent.Spec.Deployment == nil {
+				agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{}
+			}
+			if tc.replicas != nil {
+				agent.Spec.Deployment.Availability = &agentv1alpha1.AvailabilitySpec{Replicas: tc.replicas}
+			}
+			agent.Spec.Deployment.ScaleToZero = tc.scaleToZero
+
+			var hasPods bool
+			for _, r := range buildPlatformLeaderRole(agent).Rules {
+				if !slices.Contains(r.Resources, "pods") {
+					continue
+				}
+				hasPods = true
+				// The verbs, not just the resource. update_pod_label reads its
+				// own pod and patches one label, so get and patch is the whole
+				// requirement -- and this is the agent identity's only write
+				// grant on workloads, so a verb added here is worth a red test
+				// rather than a quiet golden update.
+				if !slices.Equal(r.Verbs, []string{"get", "patch"}) {
+					t.Errorf("leader Role pods rule grants %v, want [get patch]", r.Verbs)
+				}
+				if !slices.Equal(r.Resources, []string{"pods"}) {
+					t.Errorf("leader Role pods rule reaches %v, want [pods]", r.Resources)
+				}
+			}
+
+			var armed bool
+			for _, c := range buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{}).Spec.Containers {
+				for _, e := range c.Env {
+					if e.Name == "LEADER_ELECTION_LEASE_NAME" {
+						armed = true
+					}
+				}
+			}
+
+			if hasPods != armed {
+				t.Errorf("leader Role grants pods=%v but leader election armed=%v; the grant and its "+
+					"only caller disagree", hasPods, armed)
+			}
+		})
 	}
 }

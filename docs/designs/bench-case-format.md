@@ -274,9 +274,13 @@ A commented-out `TASKS` entry counts as registered. That is the intended state f
 case whose fixture or blocker is not ready: it is written down, it is greppable, and
 activation is uncommenting one line. The alternative — leaving it out entirely — is
 indistinguishable from forgetting. A `NIGHTLY_TASKS` entry counts too, and means more:
-the case runs every night, kept out of the presubmit for cost or because a cheaper probe
-holds its presubmit seat — never out of doubt about the case, which is what the
-commented-out state is for.
+the case runs every night, kept out of the presubmit for cost, because a cheaper probe
+holds its presubmit seat, or because what it grades is not one of the core journeys the
+presubmit gate is for — never out of doubt about the case, which is what the
+commented-out state is for. The core journeys are the `journey:` rows of
+`docs/designs/domains.yaml`; a case that claims no domain there is outside them by
+construction. This paragraph is the one statement of the rule; `bench/CUSTOM-TASKS.md`
+and `docs/designs/testing-strategy.md` restate it and defer here.
 
 ## The validator
 

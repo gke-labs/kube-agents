@@ -5,7 +5,7 @@ description: Bootstrap a GKE cluster, the kube-agents operator, and the Platform
 
 import { Aside, Steps } from "@astrojs/starlight/components";
 
-The `./install.sh` installer bootstraps everything you need for a running Platform Agent on GKE: cluster, CRDs, IAM, secrets, Chat integration, inference gateway, and the token minter. It is a front door, not a second provisioner — the engine underneath is the Terraform composition [`terraform/examples/full-install`](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install), which owns every GCP resource and installs the [`kube-agents` Helm chart](https://github.com/gke-labs/kube-agents/tree/main/charts/kube-agents), which owns every Kubernetes resource.
+The installer (`install.sh`) bootstraps everything you need for a running Platform Agent on GKE: cluster, CRDs, IAM, secrets, Chat integration, inference gateway, and the token minter. It is a front door, not a second provisioner — the engine underneath is the Terraform composition [`terraform/examples/full-install`](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install), which owns every GCP resource and installs the [`kube-agents` Helm chart](https://github.com/gke-labs/kube-agents/tree/main/charts/kube-agents), which owns every Kubernetes resource.
 
 Prefer declarative IaC over the interview? Apply the same composition by hand with your own `terraform.tfvars` — see [the composition README](https://github.com/gke-labs/kube-agents/tree/main/terraform/examples/full-install) for the hand-driven path. Both paths run the same Terraform, so they create the same resources.
 
@@ -21,26 +21,28 @@ Prefer declarative IaC over the interview? Apply the same composition by hand wi
 
 <Aside type="tip">
   You can bootstrap `kube-agents` directly from any Linux terminal, Cloud Shell,
-  or AI Agent without cloning the repository manually!
+  or AI Agent without cloning the repository manually.
 </Aside>
 
+Run the release-pinned installer (substituting `<RELEASE_VERSION>` with the desired release tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases), for example `0.4.0`):
+
 ```bash
-curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash
 ```
 
-The installer asks for an immutable image/source revision. Enter a SemVer release tag or the full
-40-character commit SHA behind a validated RC tag; mutable refs such as `latest` and `main` are
-rejected so the Terraform configuration and container images stay on the same revision.
+The interactive installer is strongly recommended for initial installation: it detects context from your `gcloud` session and guides you through project selection, cluster options, and model provider credentials with minimal typing.
 
-For non-interactive AI Agent or CI/CD automated deployments:
+When running the release-pinned installer, the baked release version is used automatically.
+
+For headless environments, AI Agents, or CI/CD automated deployments where an interactive TTY is unavailable, use `--non-interactive` with parameter flags:
 
 ```bash
-curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
   --non-interactive \
   --project-id="my-gcp-project" \
   --cluster-name="platform-agent-host" \
   --region="us-central1" \
-  --image-tag="<SEMVER_TAG_OR_FULL_COMMIT_SHA>" \
+  --model-provider="gemini" \
   --permission-set="read-only"
 ```
 
@@ -48,10 +50,19 @@ curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash -s -- \
 
 <Steps>
 
-1. **Clone the repo.**
+1. **Obtain the release sources.**
+
+   Download and extract the self-contained release archive from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases) (recommended):
 
    ```bash
-   git clone https://github.com/gke-labs/kube-agents.git
+   curl -fsSL https://github.com/gke-labs/kube-agents/releases/download/<RELEASE_VERSION>/kube-agents-<RELEASE_VERSION>.tar.gz | tar -xz
+   cd kube-agents-<RELEASE_VERSION>
+   ```
+
+   Alternatively, if you require a Git checkout, clone pinned to an official release tag (for example, `0.4.0`):
+
+   ```bash
+   git clone --branch <RELEASE_VERSION> https://github.com/gke-labs/kube-agents.git
    cd kube-agents
    ```
 
@@ -61,7 +72,18 @@ curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash -s -- \
    ./install.sh
    ```
 
-   The run is interactive: it prompts for the values it needs (project ID, region, new or existing cluster, the new cluster's shape, image tag, chat integrations, model provider and API key, GitOps repo, agent permission set, gVisor, web UI, and memory). Answers are saved to `install.env` (git-ignored, `chmod 600`), the install's configuration; `terraform/examples/full-install/terraform.tfvars` is regenerated from it on every run, so the two stay in step. A re-run loads `install.env` first, so a flag you omit keeps the value it records instead of reverting to a default. The installer then runs the composition's `lifecycle.sh apply`, and a re-run reconciles every change through one `terraform apply` — safe to Ctrl-C and run again.
+   The run is interactive: it prompts for the values it needs (project ID, region, new or existing cluster, the new cluster's shape, chat integrations, model provider and API key, GitOps repo, agent permission set, gVisor, web UI, and memory). When run from an official release checkout or bundle, `install.sh` automatically uses that release version and verifies that local files match the container images. Answers are saved to `install.env` (git-ignored, `chmod 600`), the install's configuration; `terraform/examples/full-install/terraform.tfvars` is regenerated from it on every run, so the two stay in step. A re-run loads `install.env` first, so a flag you omit keeps the value it records instead of reverting to a default. The installer then runs the composition's `lifecycle.sh apply`, and a re-run reconciles every change through one `terraform apply` — safe to Ctrl-C and run again.
+
+   <Aside type="caution">
+     **Working on `main` (Developers only):** If you clone the repository from
+     `main` without `--branch`, `install.sh` defaults to your local `HEAD`
+     commit SHA and requires candidate images built from that commit in GHCR. Do
+     not install an older release from a `main` checkout: manifests and CRD
+     schemas on `main` evolve continuously and are incompatible with older
+     release images. The installer's `verify_local_source_ref` checks revision
+     alignment and blocks mismatched combinations. For local script development
+     with uncommitted or unverified changes, pass `--allow-unverified-source`.
+   </Aside>
 
 3. **Configure Google Chat** (only if you enabled the Google Chat integration). In the [Chat API console](https://console.cloud.google.com/apis/api/chat.googleapis.com), point the bot's Pub/Sub connection at the created topic (`projects/<PROJECT_ID>/topics/<CHAT_TOPIC_NAME>`). The installer prints the exact topic name and step-by-step instructions when it finishes.
 
@@ -80,11 +102,11 @@ curl -fsSL https://gke-labs.github.io/kube-agents/install.sh | bash -s -- \
 
 ## What just happened
 
-`./install.sh` collected your answers, wrote `install.env` and `terraform.tfvars`, and ran one `terraform apply` through the composition's [`lifecycle.sh`](https://github.com/gke-labs/kube-agents/blob/main/terraform/examples/full-install/lifecycle.sh) — GCP APIs, the GKE cluster (CMEK, Workload Identity, the host-discovery label), IAM and Workload Identity bindings, cert-manager, and the Helm chart carrying the operator, the `PlatformAgent` CR, the credentials Secret, and the LiteLLM gateway. Terraform state lives in a versioned GCS bucket (`<project>-kube-agents-tfstate`, prefix `kube-agents/<cluster>`), so `uninstall.sh` and `upgrade.sh` can find the install from a fresh clone.
+The installer collected your answers, wrote `install.env` and `terraform.tfvars`, and ran one `terraform apply` through the composition's [`lifecycle.sh`](https://github.com/gke-labs/kube-agents/blob/main/terraform/examples/full-install/lifecycle.sh) — GCP APIs, the GKE cluster (CMEK, Workload Identity, the host-discovery label), IAM and Workload Identity bindings, cert-manager, and the Helm chart carrying the operator, the `PlatformAgent` CR, the credentials Secret, and the LiteLLM gateway. Terraform state lives in a versioned GCS bucket (`<project>-kube-agents-tfstate`, prefix `kube-agents/<cluster>`), so `uninstall.sh` and `upgrade.sh` can find the install from a fresh clone.
 
 Two steps stay `gcloud` calls because Terraform cannot express them: the managed OpenTelemetry collection scope, and CMEK on a cluster that already existed before the install. The one-shot GitHub App key import into KMS also runs outside Terraform, so the PEM never enters state.
 
-Changing your mind later is the same engine: `./install.sh --menu` opens a Day-2 control panel whose **Save & Apply** regenerates `terraform.tfvars` and re-applies.
+Changing your mind later is the same engine: running the installer with `--menu` (e.g. `./install.sh --menu` or `$HOME/kube-agents/install.sh --menu`) opens a Day-2 control panel whose **Save & Apply** regenerates `terraform.tfvars` and re-applies.
 
 ## Common flags and toggles
 
@@ -94,7 +116,7 @@ Changing your mind later is the same engine: `./install.sh --menu` opens a Day-2
 - `--enable-google-chat` — provisions the Google Chat Pub/Sub backend and enables the CR's `googleChat` integration.
 - `--memory=file|hindsight|off` — the agent's long-term memory store; `hindsight` deploys the Hindsight API and Postgres into the cluster.
 
-Run `./install.sh --help` for the full list.
+Run the installer with `--help` (e.g. `./install.sh --help`) for the full list.
 
 ## Uninstall
 

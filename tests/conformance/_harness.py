@@ -192,6 +192,16 @@ SOURCES: dict[str, Source] = {
         "platformagent-tagged.yaml",
         ("kind: Deployment",),
     ),
+    # The above-one-replica shape. Its anchor is the leader Role's pods rule,
+    # because that rule is the only reason the fixture is registered here:
+    # every other golden is single-replica and renders it away, so without
+    # this key group C bounds the leader Role only in the shape where it holds
+    # no write verb on pods at all.
+    "golden_ha": Source(
+        "k8s-operator/internal/testing/testdata/platform/expected/"
+        "platformagent-ha.yaml",
+        ("kind: Deployment", "kubeagents:leader:", "- pods"),
+    ),
     # --- supply chain -----------------------------------------------------
     "skill_sync": Source(
         "scripts/sync-upstream-skills.py",
@@ -215,6 +225,7 @@ _GOLDEN_KEYS = (
     "golden_tagged",
     "golden_scoped_sa",
     "golden_egress_allowlist",
+    "golden_ha",
 )
 
 
@@ -275,10 +286,11 @@ def yaml_documents(name: str) -> tuple[dict, ...]:
 def golden_documents() -> dict[str, tuple[dict, ...]]:
     """The rendered PlatformAgent object sets, keyed by fixture name.
 
-    Four fixtures cover four spec shapes the operator renders: the default
+    Five fixtures cover five spec shapes the operator renders: the default
     layout, the same with a pinned image tag, the scoped service-account pool,
-    and the egress allowlist. An invariant about the rendered output has to hold
-    on all four or it is a property of one configuration.
+    the egress allowlist, and the above-one-replica deployment. An invariant
+    about the rendered output has to hold on all five or it is a property of
+    one configuration.
 
     The split-broker fixture was the third of these until #913 deleted it: the
     broker is its own Deployment unconditionally now, so the layout it covered

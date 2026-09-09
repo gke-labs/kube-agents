@@ -27,7 +27,7 @@ from pathlib import Path
 
 import sandbox_exec
 from gke_endpoint import dns_endpoint_args
-from profile_scaffold import HERMES_BIN, ensure_profile, overlay_template
+from profile_scaffold import HERMES_BIN, backfill_cron_file, ensure_profile, overlay_template
 
 TEMPLATE_DIR = Path(os.environ.get("CLUSTER_TEMPLATE_DIR", "/opt/cluster-template"))
 SHARED_PLUGINS_DIR = Path(os.environ.get("SHARED_PLUGINS_DIR", "/opt/defaults/plugins"))
@@ -280,6 +280,12 @@ def create_profile(project: str, cluster: str, location: str) -> str:
 
     # 2. Overlay the Cluster Agent persona, scoped config, and skills (+ shared plugins).
     overlay_template(home, TEMPLATE_DIR, SHARED_PLUGINS_DIR, items=OVERLAY_ITEMS)
+
+    # 2-bis. Backfill default legacy risk onto any unannotated jobs in the profile's
+    # cron store if one exists on the volume (e.g. on profile re-scaffold).
+    cluster_cron = home / "cron" / "jobs.json"
+    if cluster_cron.is_file():
+        backfill_cron_file(cluster_cron)
 
     # 2a. Repoint the plugin copy the overlay just made at the resolved collector.
     _pin_otel_endpoint(home, name)

@@ -1,6 +1,14 @@
 package gateway
 
 import (
+	"bytes"
+	"crypto/hkdf"
+	"crypto/sha256"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -75,6 +83,144 @@ func TestFromEnvSaltPrecedence(t *testing.T) {
 	if _, err := FromEnv(); err == nil {
 		t.Fatal("empty password with no salt accepted")
 	}
+}
+
+// TestFromEnvDerivedSaltIsHKDF: with no salt provisioned and no override,
+// the fallback expands the bus password through HKDF-SHA-256 under a fixed
+// info string — not a bare digest of the credential (CodeQL
+// go/weak-sensitive-data-hashing). The old derivation is pinned as a
+// negative so reintroducing it fails here and not only in a scanner.
+func TestFromEnvDerivedSaltIsHKDF(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("NATS_PASSWORD", "bus-password")
+
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.AttributionSalt) != 32 {
+		t.Fatalf("derived salt is %d bytes, want 32", len(cfg.AttributionSalt))
+	}
+	if string(cfg.AttributionSalt) == "bus-password" {
+		t.Fatal("derived salt is the bus password verbatim")
+	}
+
+	// The info string is a wire constant: spelled out here rather than read
+	// from the package, so editing it in config.go fails this test.
+	want, err := hkdf.Key(sha256.New, []byte("bus-password"), nil, "a2a-attribution-salt", 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(cfg.AttributionSalt, want) {
+		t.Fatalf("derived salt = %x, want HKDF-SHA-256(password, info=%q) = %x", cfg.AttributionSalt, "a2a-attribution-salt", want)
+	}
+
+	old := sha256.Sum256([]byte("a2a-attribution-salt:bus-password"))
+	if bytes.Equal(cfg.AttributionSalt, old[:]) {
+		t.Fatal("derived salt is the pre-HKDF sha256(\"a2a-attribution-salt:\"+password)")
+	}
+
+	// Deterministic for one password — every gateway replica reading the
+	// same Secret must produce the same pseudonyms — and different for
+	// another, so the salt is not a constant with the password decorating it.
+	again, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(cfg.AttributionSalt, again.AttributionSalt) {
+		t.Fatal("derived salt is not deterministic for one password")
+	}
+	t.Setenv("NATS_PASSWORD", "other-password")
+	other, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(cfg.AttributionSalt, other.AttributionSalt) {
+		t.Fatal("two passwords derived the same salt")
+	}
+}
+
+// TestConfigSourceHashesOnlyThroughHKDF: config.go is the file that handles
+// the bus password, so no bare hash may appear in it — the hash packages it
+// imports may be reached only as the constructor argument to hkdf.Key. A
+// behavioural test cannot tell a digest of the password from a digest of
+// something harmless; this can, and it holds for sha256.Sum256, for the
+// streaming h := sha256.New(); h.Write(password) spelling, for an aliased
+// import, and for a switch to sha512.
+//
+// Two limits, stated rather than papered over: it is scoped to this one
+// file, because registry.go hashes a session key legitimately, so moving the
+// derivation into another file of the package escapes it — the required
+// hkdf.Key call below turns that into a failure here rather than a silent
+// pass. And a repo-wide ban on this pattern belongs in
+// .github/semgrep-security-audit.yml, which this test does not replace.
+func TestConfigSourceHashesOnlyThroughHKDF(t *testing.T) {
+	const src = "config.go"
+	file, err := parser.ParseFile(token.NewFileSet(), src, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Local names of the bare-hash packages and of crypto/hkdf, read from
+	// the import block so an alias renames nothing out of the test's sight.
+	hashPkgs := map[string]bool{}
+	hkdfPkg := ""
+	for _, imp := range file.Imports {
+		path, err := strconv.Unquote(imp.Path.Value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		name := path[strings.LastIndex(path, "/")+1:]
+		if imp.Name != nil {
+			name = imp.Name.Name
+		}
+		switch path {
+		case "crypto/md5", "crypto/sha1", "crypto/sha256", "crypto/sha512":
+			hashPkgs[name] = true
+		case "crypto/hkdf":
+			hkdfPkg = name
+		}
+	}
+	if hkdfPkg == "" {
+		t.Fatalf("%s does not import crypto/hkdf: the salt derivation moved or changed, and this guard no longer covers it", src)
+	}
+
+	// The one permitted reference: the hash constructor handed to hkdf.Key.
+	permitted := map[ast.Expr]bool{}
+	derivations := 0
+	ast.Inspect(file, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		fn, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		pkg, ok := fn.X.(*ast.Ident)
+		if !ok || pkg.Name != hkdfPkg || fn.Sel.Name != "Key" || len(call.Args) == 0 {
+			return true
+		}
+		derivations++
+		permitted[call.Args[0]] = true
+		return true
+	})
+	if derivations == 0 {
+		t.Fatalf("%s imports crypto/hkdf but calls no hkdf.Key: the salt derivation moved or changed", src)
+	}
+
+	ast.Inspect(file, func(n ast.Node) bool {
+		sel, ok := n.(*ast.SelectorExpr)
+		if !ok {
+			return true
+		}
+		pkg, ok := sel.X.(*ast.Ident)
+		if !ok || !hashPkgs[pkg.Name] || permitted[sel] {
+			return true
+		}
+		t.Errorf("%s reaches %s.%s outside hkdf.Key: the only secret in this file is NATS_PASSWORD, and a credential may not go through a bare hash", src, pkg.Name, sel.Sel.Name)
+		return true
+	})
 }
 
 // TestFromEnvTaskDeadline: the env contract shared with the worker adapter

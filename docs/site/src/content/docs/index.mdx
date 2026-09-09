@@ -122,10 +122,26 @@ Full walkthrough on the [Architecture](/kube-agents/overview/architecture/) page
 
 ## Install
 
-The working install path is GKE via the installer.
+The fastest way to install `kube-agents` is from an official release:
 
 ```bash
-git clone https://github.com/gke-labs/kube-agents.git
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash
+```
+
+_Substitute `<RELEASE_VERSION>` with the desired version tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases) (for example, `0.4.0`)._
+
+To install from an unpacked release archive (recommended):
+
+```bash
+curl -fsSL https://github.com/gke-labs/kube-agents/releases/download/<RELEASE_VERSION>/kube-agents-<RELEASE_VERSION>.tar.gz | tar -xz
+cd kube-agents-<RELEASE_VERSION>
+./install.sh
+```
+
+Alternatively, if you require a Git checkout, clone pinned to an official release tag:
+
+```bash
+git clone --branch <RELEASE_VERSION> https://github.com/gke-labs/kube-agents.git
 cd kube-agents
 ./install.sh
 ```

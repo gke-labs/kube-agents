@@ -150,6 +150,18 @@ class GitHubAPITest(unittest.TestCase):
         self.assertIsNone(delete_res)
         self.assertEqual(calls[1].get_method(), "DELETE")
 
+    def test_graphql_returns_data(self):
+        api, calls = self._api([{"data": {"viewer": {"login": "x"}}}])
+        self.assertEqual(api.graphql("query { viewer { login } }", {"a": 1}), {"viewer": {"login": "x"}})
+        self.assertEqual(calls[0].full_url, "https://api.github.com/graphql")
+        self.assertEqual(json.loads(calls[0].data)["variables"], {"a": 1})
+
+    def test_graphql_raises_on_an_errors_body(self):
+        """GraphQL answers 200 to a failed query; the failure is in the body, not the status."""
+        api, _ = self._api([{"data": None, "errors": [{"message": "Could not resolve to a PullRequest"}]}])
+        with self.assertRaises(RuntimeError):
+            api.graphql("query { nothing }")
+
     def test_url_error_is_retried(self):
         url_error = urllib.error.URLError("Connection refused")
         api, calls = self._api([url_error, {"status": "ok"}])

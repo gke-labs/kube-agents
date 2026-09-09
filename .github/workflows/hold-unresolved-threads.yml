@@ -1,0 +1,86 @@
+name: Hold Unresolved Threads
+
+# Keep a pull request with unresolved review threads out of Tide's merge pool.
+#
+# `main` requires every conversation resolved before a merge, and Tide does
+# not read that rule: it picks the lowest-numbered `lgtm`+`approved` pull
+# request, GitHub refuses the merge, and Tide retries the same one every ~85
+# seconds while every other pull request in the pool waits behind it. #608
+# and #1197 held the queue that way for an hour on 2026-09-05.
+#
+# `scripts/hold_unresolved_threads.py` mirrors thread state onto the bare
+# `do-not-merge` label, which Tide's query for this repository excludes and no
+# Prow plugin writes: on while any thread is unresolved (with one comment
+# saying so), off once they all are -- unless a person applied it, in which
+# case it is theirs. The script's docstring is the reference.
+#
+# Two triggers. The schedule is the guarantee: thread resolution fires
+# `pull_request_review_thread`, but from a fork -- where every pull request
+# here comes from -- that event hands the workflow a read-only token, so it
+# cannot be the mechanism. The `labeled` fast path closes the window that
+# matters most: the moment `lgtm` or `approved` lands is the moment Tide would
+# otherwise start retrying, and `pull_request_target` carries a write token
+# whatever the head's origin. Nothing from the pull request is checked out or
+# read as code on either path.
+on:
+  schedule:
+    - cron: "*/5 * * * *" # SWEEP_MINUTES in the script quotes this to the author
+  #checkov:skip=CKV_GHA_7:One boolean, dry-run, which decides whether the sweep writes; nothing is built and no input reaches a shell
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Log what would change and change nothing
+        type: boolean
+        default: false
+  # zizmor: ignore[dangerous-triggers] - the job checks out the default
+  # branch only (the script) and reads pull-request state through the API;
+  # no pull-request content reaches the write token's context.
+  pull_request_target:
+    types: [labeled]
+    branches: [main]
+
+permissions: {}
+
+# Sweeps reconcile the same state; two at once would race each other's reads.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    name: Mirror unresolved threads onto the do-not-merge label
+    # The repository guard is required of any credentialed workflow that
+    # starts on its own (AGENTS.md, Pull Request Hygiene). The label filter
+    # keeps every other label event -- size, risk, lgtm removed -- off a
+    # runner; the schedule covers anything it misses.
+    if: >-
+      github.repository == 'gke-labs/kube-agents' &&
+      (github.event_name != 'pull_request_target' ||
+        github.event.label.name == 'lgtm' ||
+        github.event.label.name == 'approved')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # check out the default branch: the script
+      pull-requests: write # add and remove the label, post the comment
+      issues: write # create the label the first time
+    steps:
+      # The default branch, never a pull request head: this job holds a
+      # writable token and must not run code from a fork. `ref:` is explicit
+      # because on `pull_request_target` the fallback is the pull request's
+      # base branch.
+      - name: Checkout the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      # The runner's own python3; the script is stdlib-only. Every sweep is
+      # the same whole-repository reconcile, whichever trigger started it, so
+      # the event carries nothing the script needs.
+      - name: Sweep the merge pool
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = "true" ]; then set -- --dry-run; fi
+          python3 scripts/hold_unresolved_threads.py "$@"

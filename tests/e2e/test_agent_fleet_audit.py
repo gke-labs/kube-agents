@@ -18,7 +18,7 @@ _AUDIT_REPORT_SCRIPT = (
 _POD_WAIT_TIMEOUT_SECONDS = 120
 _POD_POLL_INTERVAL_SECONDS = 5
 
-# All 7 Registered Audit Streams and their human titles
+# All Registered Audit Streams and their human titles
 AUDIT_STREAMS: List[Tuple[str, str]] = [
     ("compliance-audit", "Security & RBAC Posture Audit"),
     ("security-patch-orchestrator", "Upgrade & Patch Readiness Audit"),
@@ -27,6 +27,8 @@ AUDIT_STREAMS: List[Tuple[str, str]] = [
     ("fleet-consistency-drift", "Fleet Consistency Drift Audit"),
     ("ai-security-audit", "AI Workload Security Audit"),
     ("stockout-prevention", "Fleet Stockout Prevention & Capacity Audit"),
+    ("gcp-networking-fabric-audit", "GCP Networking Fabric & VPC IPAM Audit"),
+    ("gce-compute-fleet-audit", "GCE Compute Engine and MIG Fleet Audit"),
 ]
 
 
@@ -304,20 +306,32 @@ def test_audit_report_ledger_dryrun_all_streams(
     cluster = gke_cluster_name or "test-cluster"
     project = gcp_project_id or "test-project"
 
-    # Retrieve first valid check slug for the audit stream
-    valid_check = "sample-check"
-    try:
-        import sys
-        script_dir_str = str(_AUDIT_REPORT_SCRIPT.parent)
-        if script_dir_str not in sys.path:
-            sys.path.insert(0, script_dir_str)
-        from audit_report import AUDITS
-        if audit_id in AUDITS and AUDITS[audit_id].checks:
-            valid_check = AUDITS[audit_id].checks[0]
-    except Exception:
-        pass
+    # Retrieve first valid check slug for checks_run and a distinct second check slug for checks_not_applicable.
+    # audit_report.py rejects any document where the same check slug appears in both checks_run and checks_not_applicable.
+    import sys
+    script_dir_str = str(_AUDIT_REPORT_SCRIPT.parent)
+    if script_dir_str not in sys.path:
+        sys.path.insert(0, script_dir_str)
+    platform_scripts_dir = str(_REPO_ROOT / "agents" / "platform" / "scripts")
+    if platform_scripts_dir not in sys.path:
+        sys.path.insert(0, platform_scripts_dir)
 
-    # Construct clean findings document for the audit stream
+    from audit_report import AUDITS
+
+    assert audit_id in AUDITS, f"Audit stream '{audit_id}' not found in audit_report.AUDITS"
+    roster = AUDITS[audit_id].checks
+    assert len(roster) >= 2, f"Audit stream '{audit_id}' has {len(roster)} checks, expected at least 2"
+    valid_check = roster[0]
+    na_check = roster[1]
+    na_reason = "GKE Autopilot: Google owns this resource; check is not applicable on Autopilot clusters."
+    checks_not_applicable = [
+        {
+            "check": na_check,
+            "reason": na_reason,
+        }
+    ]
+
+    # Construct findings document for the audit stream
     mock_findings = {
         "audit": audit_id,
         "scope": {
@@ -332,12 +346,35 @@ def test_audit_report_ledger_dryrun_all_streams(
                             "command": f"kubectl --context={cluster} get pods -A",
                         }
                     ],
-                    "checks_not_applicable": [],
+                    "checks_not_applicable": checks_not_applicable,
                 }
             ],
             "skipped": [],
         },
-        "findings": [],
+        "findings": [
+            {
+                "check": valid_check,
+                "severity": "major",
+                "title": f"Sample finding for {human_name}",
+                "cluster": cluster,
+                "namespace": "default",
+                "object": "Deployment/sample-app",
+                "evidence": {
+                    "command": f"kubectl --context={cluster} get pods -A",
+                    "excerpt": "sample evidence excerpt",
+                },
+                "impact": "Sample impact description for audit finding.",
+                "recommendation": {
+                    "action": "Take recommended remediation step.",
+                    "rationale": "Rationale explaining why this change was chosen.",
+                    "risk": "Risk evaluation for this specific recommendation.",
+                },
+                "remediation": {
+                    "kind": "manual",
+                    "note": f"kubectl --context={cluster} edit deployment/sample-app",
+                },
+            }
+        ],
     }
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
@@ -361,6 +398,18 @@ def test_audit_report_ledger_dryrun_all_streams(
         assert proc.returncode == 0, (
             f"Audit stream '{audit_id}' ({human_name}) dry-run validation failed (exit code {proc.returncode}):\n"
             f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+        )
+        assert "Not applicable (1)" in proc.stdout, (
+            f"Audit stream '{audit_id}' ({human_name}) dry-run output missing 'Not applicable (1)' section:\n"
+            f"STDOUT:\n{proc.stdout}"
+        )
+        assert f"`{na_check}`" in proc.stdout, (
+            f"Audit stream '{audit_id}' ({human_name}) dry-run output missing check slug '{na_check}' under Not applicable:\n"
+            f"STDOUT:\n{proc.stdout}"
+        )
+        assert na_reason in proc.stdout, (
+            f"Audit stream '{audit_id}' ({human_name}) dry-run output missing reason '{na_reason}' under Not applicable:\n"
+            f"STDOUT:\n{proc.stdout}"
         )
     finally:
         if os.path.exists(temp_path):

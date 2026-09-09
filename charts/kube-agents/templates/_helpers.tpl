@@ -354,3 +354,55 @@ wrong Service.
 {{- define "kube-agents.webhookConfigurationPrefix" -}}
 {{ .Release.Name }}-{{ .Release.Namespace }}
 {{- end }}
+
+{{/*
+Validates and resolves a Deployment's rollingUpdate fenceposts, returning a
+YAML map with `maxSurge` and `maxUnavailable`. Callers parse the output with
+`| fromYaml`.
+
+Both fenceposts at zero leaves the Deployment no way to make progress and
+the API server rejects it ("may not be 0 when maxSurge is 0"), so fail
+the render rather than the apply. See values.yaml's rollingUpdate blocks.
+
+A fencepost with no usable value takes the given default (defaultSurge,
+defaultUnavailable) and renders explicitly. "No usable value" has to mean
+the empty string as well as nil/invalid: `--set <scope>.maxUnavailable=` and
+a values file's `maxUnavailable: ""` both reach here as an empty string,
+which is a perfectly good `kind` and so survives a nil test. Rendering
+either through would emit `maxUnavailable:` with nothing after it, and
+Kubernetes then applies its own 25% default.
+
+Both fields are IntOrString, which is what makes the zero test awkward:
+`int` is cast.ToInt and reads "25%" as 0, so it would refuse a pair of
+perfectly good percentages, while a list of literal spellings misses
+"0.0". Compare numerically with the percent sign stripped — "0%"
+resolves to 0 on the cluster, so it is the same misconfiguration spelled
+differently. `float64` is cast.ToFloat64, which reports anything it
+cannot parse as 0, so the numeric test is gated on both values actually
+being numeric: without that, `maxSurge: abc` is refused as a zero and
+the message names the wrong problem. Non-numeric input is left to the
+API server, which is where it was rejected before this guard existed.
+
+Takes a dict: {rollingUpdate, defaultSurge, defaultUnavailable, scope}.
+*/}}
+{{- define "kube-agents.rollingUpdateFenceposts" -}}
+{{- $ru := .rollingUpdate | default dict -}}
+{{- $surge := $ru.maxSurge -}}
+{{- $unavail := $ru.maxUnavailable -}}
+{{- $defaultSurge := .defaultSurge -}}
+{{- if kindIs "invalid" $defaultSurge }}{{- $defaultSurge = 1 }}{{- end -}}
+{{- $defaultUnavail := .defaultUnavailable -}}
+{{- if kindIs "invalid" $defaultUnavail }}{{- $defaultUnavail = 0 }}{{- end -}}
+{{- if or (kindIs "invalid" $surge) (eq (toString $surge) "") }}{{- $surge = $defaultSurge }}{{- end -}}
+{{- if or (kindIs "invalid" $unavail) (eq (toString $unavail) "") }}{{- $unavail = $defaultUnavail }}{{- end -}}
+{{- $surgeNum := trimSuffix "%" (trim (toString $surge)) -}}
+{{- $unavailNum := trimSuffix "%" (trim (toString $unavail)) -}}
+{{- $numeric := "^[0-9]+(\\.[0-9]+)?$" -}}
+{{- if and (regexMatch $numeric $surgeNum) (regexMatch $numeric $unavailNum) -}}
+{{- if and (eq (float64 $surgeNum) 0.0) (eq (float64 $unavailNum) 0.0) -}}
+{{- fail (printf "%s: maxSurge (%v) and maxUnavailable (%v) may not both be zero — the Deployment would have no way to make progress, and the API server rejects it." .scope $surge $unavail) -}}
+{{- end -}}
+{{- end -}}
+maxSurge: {{ $surge }}
+maxUnavailable: {{ $unavail }}
+{{- end }}

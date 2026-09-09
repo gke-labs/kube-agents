@@ -26,6 +26,10 @@
 #      Reachable on a FIRST install too: configuring the Chat app in the Cloud
 #      console creates the topic before the installer ever runs. `adopt_pubsub`
 #      imports whichever of the two is already there before applying.
+#   6. The agent GSA (account_id) is ForceNew. A lost agent_service_account_id
+#      override in install.env resolves back to the default name and plans a
+#      destructive replacement under -auto-approve. `guard_gsa_identity` refuses
+#      the apply before Terraform runs.
 #
 # Usage:
 #   ./lifecycle.sh apply    [extra terraform args...]
@@ -141,14 +145,23 @@ ensure_init() {
 # failing console left an empty value, `set -e` killed the script on the
 # assignment, and the run ended with no output whatsoever — which is exactly what
 # an uninitialised module did before ensure_init existed.
+# A variable nobody set and whose default is null -- agent_service_account_id
+# in a hand-written tfvars -- prints as `tostring(null)` (a typed null; older
+# releases print `null`). Callers want "unset", not that spelling: read as a
+# name, it made guard_gsa_identity refuse every apply whose tfvars left the
+# variable alone, which is what broke the autopush deploys after #1309.
 tfvar() {
-  local out
+  local out value
   if ! out=$(echo "var.$1" | terraform console 2>&1); then
     printf '%s\n' "$out" >&2
     warn "could not evaluate var.$1 (see the terraform error above)"
     exit 1
   fi
-  printf '%s\n' "$out" | tail -1 | tr -d '"'
+  value=$(printf '%s\n' "$out" | tail -1 | tr -d '"')
+  case "$value" in
+    null | "tostring(null)") value="" ;;
+  esac
+  printf '%s\n' "$value"
 }
 
 # The state list is read once and matched in memory. Piping it straight into
@@ -398,6 +411,42 @@ guard_cluster_ownership() {
   done
 }
 
+# account_id on google_service_account.agent is ForceNew, and the resource
+# carries neither create_before_destroy nor prevent_destroy. If a custom
+# override line in install.env goes missing, the next apply resolves
+# agent_service_account_id back to the module default (kubeagents-platform-gsa)
+# and plans the GSA's destruction and replacement under -auto-approve. If
+# install #1 in the same project already holds the default name, the apply
+# destroys install #2's GSA and then 409s creating the default name, leaving
+# install #2 with no identity.
+guard_gsa_identity() {
+  load_state
+  local addr="module.kube_agents_iam.google_service_account.agent"
+  in_state "$addr" || return 0
+
+  local recorded
+  recorded=$(terraform state show -no-color "$addr" 2>/dev/null |
+    sed -n 's/^ *account_id *= *"\([^"]*\)".*/\1/p' | head -1)
+  [[ -n "$recorded" ]] || return 0
+
+  local desired
+  if ! desired=$(tfvar agent_service_account_id 2>/dev/null); then
+    desired="kubeagents-platform-gsa"
+  fi
+  if [[ "$desired" == "null" || "$desired" == "tostring(null)" || -z "$desired" ]]; then
+    desired="kubeagents-platform-gsa"
+  fi
+
+  if [[ "$recorded" != "$desired" ]]; then
+    warn "agent_service_account_id resolved to '$desired', but this state manages GSA '$recorded' ($addr)."
+    warn "Applying now would plan the service account's DESTRUCTION and recreation under -auto-approve."
+    warn "If this install uses a custom GSA name, preserve it in install.env via:"
+    warn "  TF_VAR_agent_service_account_id=\"$recorded\""
+    warn "or pass it explicitly in terraform.tfvars."
+    exit 1
+  fi
+}
+
 delete_agent_cr() {
   local namespace cluster location project names
   namespace=$(tfvar namespace)
@@ -527,6 +576,10 @@ forget_kms() {
   done
 }
 
+if [[ "${KUBE_AGENTS_SOURCE_ONLY:-false}" == "true" ]]; then
+  return 0 2>/dev/null || exit 0
+fi
+
 case "${1:-}" in
   adopt-kms)
     shift
@@ -560,6 +613,7 @@ case "${1:-}" in
     shift
     ensure_init
     guard_cluster_ownership
+    guard_gsa_identity
     adopt_kms
     adopt_pubsub
     log "terraform apply"
@@ -607,7 +661,7 @@ case "${1:-}" in
     # The line range is the header comment above, so it moves whenever that
     # comment grows. It ends at the blank comment line before `set -euo
     # pipefail`.
-    sed -n '2,46p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,50p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

@@ -41,10 +41,11 @@ A plugin image is built on `busybox:musl` (pinned by immutable multi-arch digest
 plus a COPY of the plugin files. The `busybox:musl` base provides a minimal userland (`/bin/sh`,
 `cp`, `ls`) required by the staging init container on clusters where native `ImageVolumeSource`
 is unsupported (such as GKE Autopilot, where GKE Warden restricts raw image volume mounts). The
-build is a single tar layer that [`lib/plugin_image.sh`](lib/plugin_image.sh) — shared by both
-installers — can produce locally using either Docker or crane. Nothing here submits a Cloud
-Build: that needs the API, the billing and a credential Cloud Build will accept for quota, none
-of which a laptop reliably has, and the installers have to work there.
+builder (Docker, or crane appending the plugin directory layer onto `busybox:musl` to create a
+dual-layer image) is driven locally by [`lib/plugin_image.sh`](lib/plugin_image.sh) — shared by both
+installers. Nothing here submits a Cloud Build: that needs the API, the billing and a credential
+Cloud Build will accept for quota, none of which a laptop reliably has, and the installers have to
+work there.
 
 | Variable           | Default                                                    | What it changes                                       |
 | ------------------ | ---------------------------------------------------------- | ----------------------------------------------------- |

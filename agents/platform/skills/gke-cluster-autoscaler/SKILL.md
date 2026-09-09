@@ -21,7 +21,7 @@ description: >-
 ## Provisioning Enablement
 - **Modern GKE (1.33.3+):** Use ComputeClasses (`spec.nodePoolAutoCreation.enabled: true`). Cluster-level Node Auto Provisioning not required.
 - **Older GKE:** `gcloud container clusters update <C> --enable-autoprovisioning --max-cpu=200 --max-memory=800`
-- **Manual Pools:** `gcloud container node-pools update <P> --enable-autoscaling --min-nodes=1 --max-nodes=10`
+- **Manual Pools (Standard clusters only):** `gcloud container node-pools update <P> --enable-autoscaling --min-nodes=1 --max-nodes=10`
 
 ## Optimization & Tuning
 - **Fast Scale-Down / Consolidation:** Switch cluster profile (`gcloud container clusters update <C> --autoscaling-profile=optimize-utilization`) AND reduce delay in ComputeClass (`spec.autoscalingPolicy.consolidationDelayMinutes: 5`).

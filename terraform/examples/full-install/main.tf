@@ -12,6 +12,7 @@ locals {
     # enabled whether or not a BackupPlan follows, and the addon cannot be
     # enabled without the API.
     "gkebackup.googleapis.com",
+    "developerknowledge.googleapis.com",
   ]
   pubsub_apis = (var.enable_google_chat || var.enable_pubsub_platform || var.enable_stockout_investigator) ? [
     "pubsub.googleapis.com",
@@ -66,6 +67,7 @@ locals {
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",
     "roles/mcp.toolUser",
+    "roles/serviceusage.serviceUsageConsumer",
   ]
 
   # An explicit project_roles list always wins, so an existing configuration
@@ -253,10 +255,11 @@ locals {
 module "kube_agents_iam" {
   source = "../../modules/kube-agents-iam"
 
-  project_id      = var.project_id
-  namespace       = var.namespace
-  project_roles   = local.agent_project_roles
-  scoped_clusters = var.scoped_clusters
+  project_id         = var.project_id
+  namespace          = var.namespace
+  project_roles      = local.agent_project_roles
+  scoped_clusters    = var.scoped_clusters
+  service_account_id = var.agent_service_account_id
 
   # module.gke_cluster, and not only the API enablements, because the module's
   # workload_identity binding names the pool as an interpolated string
@@ -638,6 +641,11 @@ resource "helm_release" "kube_agents" {
       org     = local.github_org
       repo    = local.github_repo_name
       appId   = var.github_app_id
+      # The minty rule's only gate on platform-agent-scope is assertion.email
+      # against this value; left unset the chart falls back to the fixed
+      # kubeagents-platform-gsa name, so an install that overrides
+      # agent_service_account_id would annotate one GSA and allowlist another.
+      allowedServiceAccount = module.kube_agents_iam.service_account_email
       kms = {
         keyring = var.github_minter_kms_keyring
         key     = var.github_minter_kms_key
