@@ -1301,6 +1301,45 @@ def _cluster_readings(token: str) -> tuple[list[str], bool]:
     return readings, False
 
 
+def _attached_shorthand_values(token: str) -> list[str]:
+    """The values a single-dash token carries with no separator at all.
+
+    pflag and git's parse-options both let a value-taking shorthand share its
+    token with the value: `-F<path>` is `-F <path>`, and so is `-dF<path>`,
+    where pflag consumes the boolean `-d` and re-enters the cluster at `F`.
+    `argv_path_violation` tests each token as the path the command would
+    open, and a token in this spelling is not that path -- `-F/var/run/
+    secrets/x` joined onto the workspace is a relative path inside it, while
+    `gh` opens the absolute one after the `F`.
+
+    Two remainders at most. The rest of the token after the first shorthand,
+    unconditionally, the way `policy_match_text` splits it: for a boolean
+    cluster that is a bare word that resolves inside the workspace and costs
+    nothing. And the rest after the first `_VALUE_TAKING_SHORTHANDS` member
+    further in, which is where pflag takes the value from in a cluster. Two
+    slices rather than one per letter, because a million-letter token is a
+    valid argv and a path resolution per letter is the quadratic
+    `_cluster_readings` was rewritten to lose. What the table leaves open is a
+    value-taking shorthand outside it, buried behind a boolean; `-F` and `-f`,
+    the two through which `gh` and `git` read a file into something they
+    print, are in it.
+    """
+    values: list[str] = []
+    first = token[2:].lstrip("=")
+    if first:
+        values.append(first)
+    for position in range(2, len(token)):
+        letter = token[position]
+        if not letter.isalpha():
+            break
+        if f"-{letter}" in _VALUE_TAKING_SHORTHANDS:
+            remainder = token[position + 1 :].lstrip("=")
+            if remainder and remainder != first:
+                values.append(remainder)
+            break
+    return values
+
+
 def policy_match_text(argv: list[str]) -> str:
     """The command as the policy rules should read it.
 
@@ -2620,6 +2659,16 @@ class CommandExecutor:
         `--body-file=../../../var/run/secrets/...` resolve to a path inside the
         workspace while `gh` read the mounted credential.
 
+        A shorthand hides its value the same way with no separator at all.
+        pflag and parse-options read `-F<path>` as `-F <path>`, and `-dF<path>`
+        too, consuming the boolean and re-entering the cluster at the next
+        letter. The whole token joined onto `cwd` is a relative path *inside*
+        the workspace, so testing it passed `gh pr create -F/var/run/secrets/
+        .../token`, which publishes the mounted credential as the pull-request
+        body, while the detached and `=` spellings of the same flag were
+        refused. `_attached_shorthand_values` returns the remainders that
+        spelling hides, and each is tested as a path beside the token itself.
+
         Every token is then resolved against `cwd` and refused if it lands
         outside, rather than only the tokens that look like paths. Resolving
         settles the two relative spellings together: `_execute` contains `cwd`
@@ -2676,54 +2725,69 @@ class CommandExecutor:
         base = Path(cwd) if cwd else self.workspace_dir
         prose_next = False
         for index, token in enumerate(argv[1:], start=1):
-            value, prose = token, prose_next
+            prose = prose_next
             prose_next = False
+            # What this token may open, each with whether a free-text flag
+            # introduced it. One token can carry more than one: `-dF<path>`
+            # is the token and the path after the `F`.
+            candidates: list[tuple[str, bool]] = [(token, prose)]
             if not prose:
                 name, separator, attached = token.partition("=")
+                shorthand = (
+                    len(token) > 2
+                    and token.startswith("-")
+                    and not token.startswith("--")
+                )
                 if name in _FREE_TEXT_FLAGS:
                     if separator:
-                        value, prose = attached, True
+                        candidates = [(attached, True)]
                     else:
                         following = argv[index + 1] if index + 1 < len(argv) else ""
                         prose_next = not following.startswith("-")
                         continue
-                elif (
-                    len(token) > 2
-                    and token.startswith("-")
-                    and not token.startswith("--")
-                    and token[:2] in _FREE_TEXT_FLAGS
-                ):
-                    value, prose = token[2:], True
-                elif (
-                    len(token) > 2
-                    and token.startswith("-")
-                    and not token.startswith("--")
-                    and _cluster_readings(token)[1]
-                ):
+                elif shorthand and token[:2] in _FREE_TEXT_FLAGS:
+                    candidates = [(token[2:], True)]
+                elif shorthand and _cluster_readings(token)[1]:
                     following = argv[index + 1] if index + 1 < len(argv) else ""
                     prose_next = not following.startswith("-")
                     continue
+                elif shorthand:
+                    candidates.extend(
+                        (value, False) for value in _attached_shorthand_values(token)
+                    )
                 elif token.startswith("-") and separator:
-                    value = attached
-            try:
-                candidate = (base / value).resolve()
-            except (OSError, ValueError):
-                return "the path %s could not be resolved" % value
-            if self._within_workspace(candidate):
-                continue
-            if prose:
-                try:
-                    names_a_file = (base / value).exists()
-                except (OSError, ValueError):
-                    names_a_file = False
-                if not names_a_file:
-                    continue
-            return (
-                "%s is outside the workspace %s. Commands run here may only "
-                "read and write the checkout; the rest of this container is "
-                "the credential proxy's own state." % (value, self.workspace_dir)
-            )
+                    candidates = [(attached, False)]
+            for value, prose in candidates:
+                violation = self._path_value_violation(base, value, prose)
+                if violation is not None:
+                    return violation
         return None
+
+    def _path_value_violation(self, base: Path, value: str, prose: bool) -> str | None:
+        """Why `value`, opened relative to `base`, may not be, or None.
+
+        `prose` is the free-text exemption `argv_path_violation` describes:
+        a value a free-text flag introduced is refused only when it names a
+        file that is there.
+        """
+        try:
+            candidate = (base / value).resolve()
+        except (OSError, ValueError):
+            return "the path %s could not be resolved" % value
+        if self._within_workspace(candidate):
+            return None
+        if prose:
+            try:
+                names_a_file = (base / value).exists()
+            except (OSError, ValueError):
+                names_a_file = False
+            if not names_a_file:
+                return None
+        return (
+            "%s is outside the workspace %s. Commands run here may only "
+            "read and write the checkout; the rest of this container is "
+            "the credential proxy's own state." % (value, self.workspace_dir)
+        )
 
     def git_lease_violation(self, argv: list[str], cwd: str | None) -> str | None:
         """Why this git command may not run here, or None if it may.

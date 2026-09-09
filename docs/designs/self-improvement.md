@@ -1691,7 +1691,7 @@ opt-in and why §7's gate is per-install configuration rather than a constant.
 - **Path containment reads argv conservatively, and can refuse a legitimate command.** With
   `CREDENTIAL_PROXY_UNTRUSTED_WORKSPACE` on, the proxy resolves _every_ argv token against the
   working directory and refuses the command if any of them lands outside the workspace, splitting a
-  flag's value off first so that `--body-file=<path>` is tested as the path it opens. Resolving
+  flag's value off first so that `--body-file=<path>` and the attached shorthand `-F<path>` are tested as the path they open. Resolving
   everything rather than the tokens that look like paths is what catches a token with no `..` and
   no leading `/` that reaches out through a symlink — and the runner can plant one, since both
   containers mount the same checkout. It costs nothing in false refusals that a shape test avoided,
