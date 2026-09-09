@@ -58,6 +58,7 @@ agents/platform/governance/*.md
 agents/platform/skills/*/SKILL.md
   agents/platform/skills/cluster-agent-lifecycle/SKILL.md
   agents/platform/skills/fleet-audit/SKILL.md
+  agents/platform/skills/fleet-upgrade-verification/SKILL.md
   agents/platform/skills/gce-compute-fleet-audit/SKILL.md
   agents/platform/skills/gcp-networking-fabric-audit/SKILL.md
   agents/platform/skills/github-issue-resolver/SKILL.md

@@ -60,6 +60,22 @@ class InjectFooterTest(unittest.TestCase):
         d = Path(tempfile.mkdtemp())  # no SKILL.md
         self.assertFalse(sync.inject_footer(str(d), "gke-cluster-creation"))
 
+    def test_upgrades_footer_names_the_verification_skill(self):
+        d = self._skill_dir()
+        self.assertTrue(sync.inject_footer(str(d), "gke-upgrades"))
+        text = self._read(d)
+        self.assertIn(sync.FOOTER_MARKER, text)
+        self.assertIn("fleet-upgrade-verification", text)
+        self.assertIn("scripts/fleet_upgrade_report.py", text)
+        self.assertIn("--target-version", text)
+
+    def test_repo_upgrades_skill_carries_the_footer(self):
+        repo_root = Path(__file__).resolve().parent.parent
+        skill_md = repo_root / "agents" / "platform" / "skills" / "gke-upgrades" / "SKILL.md"
+        content = skill_md.read_text(encoding="utf-8")
+        self.assertTrue(content.rstrip("\n").endswith(sync.SKILL_FOOTERS["gke-upgrades"].rstrip("\n")))
+        self.assertEqual(content.count(sync.FOOTER_MARKER), 1)
+
 
 class ApplySubstitutionsTest(unittest.TestCase):
     def _skill_dir(self, body=""):
