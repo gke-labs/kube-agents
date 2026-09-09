@@ -50,7 +50,15 @@ func TestGchatConversationIDRoundTrip(t *testing.T) {
 
 func newTestGchatAdapter(t *testing.T) *GoogleChatAdapter {
 	t.Helper()
-	return &GoogleChatAdapter{log: slog.Default(), seen: map[string]bool{}}
+	tokenPath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenPath, []byte("tok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a, err := NewGoogleChatAdapter("http://relay.invalid", tokenPath, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a
 }
 
 // inbound is classify with the reason collapsed to a bool — the shape most
@@ -1024,5 +1032,94 @@ func TestGchatDefaultDisplayModeDoesNotReEditAnUnchangedLine(t *testing.T) {
 	}
 	if working != 1 {
 		t.Fatalf("the unchanged working line was edited %d times; three progress artifacts must not re-send it", working)
+	}
+}
+
+// The terminal edit is gated the same way as the rolling line: under default
+// a canceled or failed task ends on its state, not on the last narration.
+func TestGchatDefaultDisplayModeQuietsTheTerminalLineToo(t *testing.T) {
+	r := startGchatRig(t, nil, true, func(c *Config) { c.DisplayMode = "default" })
+	conv := "gchat:spaces/S1/threads/T4"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "u1@example.com", MessageID: "spaces/S1/messages/M3", Text: "do the thing"}
+
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactProgress, Parts: []lib.Part{{Kind: "text", Text: "SECRET-NARRATION"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateCanceled, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "terminal edit", func() bool {
+		for _, e := range r.adapter.editTexts() {
+			if strings.Contains(e, "canceled") {
+				return true
+			}
+		}
+		return false
+	})
+	for _, e := range r.adapter.editTexts() {
+		if strings.Contains(e, "SECRET-NARRATION") {
+			t.Fatalf("default mode leaked narration into the terminal line: %q", e)
+		}
+	}
+}
+
+// The allowlist is matched case-insensitively on the asserted address in
+// both directions: entries are folded at build time, and the author is
+// folded at lookup, so Google varying the case of an email never drops a
+// listed sender. (The principal itself stays case-preserved; see
+// resolvePrincipal.)
+func TestGchatAllowlistFoldsTheAuthorCase(t *testing.T) {
+	r := startGchatRig(t, []string{"user@example.com"}, false)
+	r.adapter.inbox <- InboundMessage{Conversation: "gchat:dm/spaces/D5", Kind: "dm", AuthorID: "User@Example.com", MessageID: "spaces/D5/messages/M1", Text: "hello"}
+	origin := r.awaitTask(t, "platform")
+	var auth Authority
+	if err := json.Unmarshal(origin.Authority, &auth); err != nil {
+		t.Fatal(err)
+	}
+	if auth.Requester.Principal != NewPseudonymizer([]byte("test-salt")).Hash("User@Example.com") {
+		t.Errorf("principal must be the asserted address as delivered, case preserved: %+v", auth.Requester)
+	}
+}
+
+// Ingress is at-most-once by recorded decision: the event is acked BEFORE
+// the handler runs. A well-meaning "ack after the durable publish" would
+// flip this to at-least-once with an in-memory dedupe, and a redelivery
+// across a restart would become a duplicate task.
+func TestGchatRunAcksBeforeTheHandlerRuns(t *testing.T) {
+	f := newFakeChatRelay(t)
+	turn := gchatMsg("spaces/D1", "DIRECT_MESSAGE", "", "", "spaces/D1/messages/M1", "hi", "", "u1@example.com", "HUMAN")
+	acked, _ := f.serveEvents([]map[string]any{
+		{"receipt": "r1", "data": b64GchatEvent(t, turn), "messageId": "1"},
+	})
+	a := newTestGchatAdapterWithRelay(t, f)
+
+	ackedWhenHandled := make(chan int, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- a.Run(ctx, func(m InboundMessage) {
+			f.mu.Lock()
+			n := len(*acked)
+			f.mu.Unlock()
+			ackedWhenHandled <- n
+		})
+	}()
+	select {
+	case n := <-ackedWhenHandled:
+		if n != 1 {
+			t.Fatalf("handler ran with %d acks recorded; the event must be settled before the handler sees it", n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler never ran")
+	}
+	cancel()
+	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned %v", err)
 	}
 }

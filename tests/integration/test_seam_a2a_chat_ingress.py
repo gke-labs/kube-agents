@@ -156,6 +156,15 @@ class A2AChatIngressSeam(unittest.TestCase):
         status, _ = self._get("/v1/chat/a2a/events")
         self.assertEqual(status, 200)
 
+        # And the other direction: the A2A gateway may not pull or settle
+        # the legacy consumer's events either — that is the route it would
+        # use to steal the Hermes pod's turns.
+        status, body = self._get("/v1/chat/events")
+        self.assertEqual(status, 403, "a2a-chat must not reach the legacy events")
+        self.assertEqual(body.get("code"), "CALLER_ROLE_FORBIDDEN")
+        status, _ = self._post("/v1/chat/events/ack", {"receipt": "L1"})
+        self.assertEqual(status, 403, "a2a-chat must not ack the legacy events")
+
     def test_the_api_passthrough_admits_both_chat_roles(self):
         """Both consumers post through the same credential; neither may pull
         the other's events, but /v1/chat/api belongs to both — and to

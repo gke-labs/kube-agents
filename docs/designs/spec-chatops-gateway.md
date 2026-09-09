@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord and Google Chat adapters) - session spawning is dark behind `A2A_SPAWN_SESSIONS`; the operator renders the gateway Deployment and its env under `mode: next` (`platformagent_a2a_manifests.go`), but not yet the Google Chat adapter's env, its projected relay token, or the A2A subscription and its IAM (the composition still provisions one Chat subscription)
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord and Google Chat adapters) - session spawning is dark behind `A2A_SPAWN_SESSIONS`; the operator renders the gateway Deployment and its env under `mode: next` (`platformagent_a2a_manifests.go`), but not yet the Google Chat adapter's env, its projected relay token, the broker's side of it (`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE`, and the gateway's ServiceAccount on `CREDENTIAL_PROXY_ALLOWED_CALLERS`), or the A2A subscription and its IAM (the composition still provisions one Chat subscription)
 
 ## Purpose
 

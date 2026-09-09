@@ -1,4 +1,4 @@
-// The a2a chatops gateway: Discord in, tasks on the bus out.
+// The a2a chatops gateway: chat (Discord or Google Chat) in, tasks on the bus out.
 //
 // PLAYGROUND POSTURE: static per-component NATS users instead of the auth
 // callout, bot token as a plain Secret, no exporter, no breaker, gateway

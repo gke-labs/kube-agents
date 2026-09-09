@@ -4320,6 +4320,20 @@ class BuildAuthenticatorTest(unittest.TestCase):
         )
         self.assertTrue(any("CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE" in line for line in logs.output))
 
+    def test_an_a2a_chat_audience_equal_to_the_chat_audience_is_refused_with_a_warning(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE": "aud-chat",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                authenticator = credential_proxy.build_authenticator()
+        self.assertNotIn(credential_proxy.CALLER_ROLE_A2A_CHAT, authenticator.audience_roles.values())
+        self.assertTrue(any("CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE" in line for line in logs.output))
+
     def test_the_default_is_the_null_authenticator(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertIsInstance(
@@ -5467,9 +5481,6 @@ class ScopedServiceAccountOverTheSocketTest(unittest.TestCase):
         self.assertEqual([self.EMAIL], self.minted)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class ChatRelaySubscriptionsTest(unittest.TestCase):
     def test_two_relays_on_one_subscription_are_refused_at_startup(self):
@@ -5479,7 +5490,7 @@ class ChatRelaySubscriptionsTest(unittest.TestCase):
         }
         with mock.patch.dict(os.environ, environment, clear=True):
             with self.assertRaises(RuntimeError):
-                credential_proxy.chat_relay_subscriptions()
+                credential_proxy.chat_relay_subscriptions("p")
 
     def test_distinct_or_single_subscriptions_pass_through(self):
         with mock.patch.dict(
@@ -5487,6 +5498,24 @@ class ChatRelaySubscriptionsTest(unittest.TestCase):
             {"GOOGLE_CHAT_SUBSCRIPTION_NAME": "a", "A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME": "b"},
             clear=True,
         ):
-            self.assertEqual(credential_proxy.chat_relay_subscriptions(), ("a", "b"))
+            self.assertEqual(credential_proxy.chat_relay_subscriptions("p"), ("a", "b"))
         with mock.patch.dict(os.environ, {"A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME": "b"}, clear=True):
-            self.assertEqual(credential_proxy.chat_relay_subscriptions(), ("", "b"))
+            self.assertEqual(credential_proxy.chat_relay_subscriptions("p"), ("", "b"))
+
+    def test_a_short_name_and_its_qualified_spelling_are_one_subscription(self):
+        environment = {
+            "GOOGLE_CHAT_SUBSCRIPTION_NAME": "chat-sub",
+            "A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME": "projects/p/subscriptions/chat-sub",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertRaises(RuntimeError):
+                credential_proxy.chat_relay_subscriptions("p")
+        # Same short name in another project is a different subscription.
+        with mock.patch.dict(os.environ, environment, clear=True):
+            self.assertEqual(
+                credential_proxy.chat_relay_subscriptions("q"),
+                ("chat-sub", "projects/p/subscriptions/chat-sub"),
+            )
+
+if __name__ == "__main__":
+    unittest.main()

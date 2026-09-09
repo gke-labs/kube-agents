@@ -220,7 +220,13 @@ func (g *Gateway) relayTerminal(ctx context.Context, rec *SessionRecord, rs *rel
 
 	if active := rec.ActiveTask; active != nil && active.TaskID == taskID {
 		if active.StatusMsgID != "" {
-			g.editLine(rec.Key, active.StatusMsgID, terminalLine(s.Status.State, rs.progress))
+			// The same display gate as the rolling line: under default the
+			// terminal edit carries the state and never the narration.
+			progress := rs.progress
+			if g.cfg.DisplayMode == displayModeDefault {
+				progress = ""
+			}
+			g.editLine(rec.Key, active.StatusMsgID, terminalLine(s.Status.State, progress))
 		}
 		rec.ActiveTask = nil
 	}

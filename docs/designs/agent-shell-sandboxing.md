@@ -2215,12 +2215,13 @@ the `TokenReview` layer. The audience is chosen by the operator, per Pod, and th
 will not validate a token against an audience it was not minted for, so it is a claim the
 caller cannot restate. `ROUTE_ROLES` in `credential_proxy.py` is the table it feeds: the
 sandbox, where every model-authored command runs, cannot reach `/v1/chat/**` at all, and the
-gateway cannot reach `/v1/exec`, `/v1/github/**` or `/v1/workspace/**`. The same table
-carries a third role, `a2a-chat`, for the A2A gateway's own event routes under
-`/v1/chat/a2a/`; [the chatops gateway design](spec-chatops-gateway.md) ("The Google Chat
-adapter") owns why that caller is kept apart from the legacy chat one. Neither ever needed
-the other's routes, so this enforces a separation the deployment already had and nothing
-checked. A `NetworkPolicy` would have expressed the same thing and is not the mechanism
+gateway cannot reach `/v1/exec`, `/v1/github/**` or `/v1/workspace/**`. Neither of those
+two ever needed the other's routes, so this enforces a separation the deployment already
+had and nothing checked. The same table carries a third role, `a2a-chat`, for the A2A
+gateway: `/v1/chat/a2a/**` is that role's alone, `/v1/chat/api` it shares with the chat
+role, and the legacy event routes it cannot reach; [the chatops gateway
+design](spec-chatops-gateway.md) ("The Google Chat adapter") owns why that caller is kept
+apart from the legacy chat one. A `NetworkPolicy` would have expressed the same thing and is not the mechanism
 chosen, because it does nothing at all on a CNI that does not implement `NetworkPolicy` and
 `TokenReview` is answered by the API server on every cluster.
 

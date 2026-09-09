@@ -652,7 +652,16 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
         # all, so it nests here; read raw for the same unset-vs-default
         # reason as the chat audience above.
         a2a_audience = os.getenv("CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE", "").strip()
-        if a2a_audience and a2a_audience not in audience_roles:
+        if a2a_audience and a2a_audience in audience_roles:
+            # A copy-pasted audience would make every a2a-chat caller the
+            # chat (or shell) role and 403 on its own routes with nothing
+            # naming the env; say so once, at startup.
+            LOGGER.warning(
+                "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE equals the %s audience; the a2a-chat "
+                "role needs an audience of its own, so it is not conferred",
+                audience_roles[a2a_audience] or CALLER_ROLE_SHELL,
+            )
+        elif a2a_audience:
             audience_roles[a2a_audience] = CALLER_ROLE_A2A_CHAT
     else:
         audience_roles = {shell_audience: ""}
@@ -3817,17 +3826,25 @@ def resolve_role() -> str:
     return role
 
 
-def chat_relay_subscriptions() -> tuple[str, str]:
+def chat_relay_subscriptions(project_id: str) -> tuple[str, str]:
     """Return the legacy and A2A Chat subscription names, refusing one shared.
 
     Two relay instances pulling one subscription split its deliveries between
     them at random — the exact failure the A2A path's own subscription exists
-    to prevent — so pointing both env vars at the same name is refused at
-    startup rather than discovered as every other ask going missing.
+    to prevent — so pointing both env vars at the same subscription is refused
+    at startup rather than discovered as every other ask going missing. The
+    comparison is on the fully qualified name, the way GoogleChatRelay
+    resolves it: a short name and its projects/… spelling are one subscription.
     """
     chat_subscription = os.getenv("GOOGLE_CHAT_SUBSCRIPTION_NAME", "").strip()
     a2a_subscription = os.getenv("A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME", "").strip()
-    if chat_subscription and chat_subscription == a2a_subscription:
+
+    def qualified(name: str) -> str:
+        if not name or name.startswith("projects/"):
+            return name
+        return f"projects/{project_id}/subscriptions/{name}"
+
+    if chat_subscription and qualified(chat_subscription) == qualified(a2a_subscription):
         raise RuntimeError(
             "A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME names the same subscription as "
             "GOOGLE_CHAT_SUBSCRIPTION_NAME; two relay instances on one subscription "
@@ -3877,7 +3894,7 @@ def serve(args: argparse.Namespace) -> None:
         os.getenv("SLACK_RELAY_MAX_REQUEST_BYTES", str(28 * 1024 * 1024))
     )
     chat_project = os.getenv("GOOGLE_CHAT_PROJECT_ID", "").strip()
-    chat_subscription, a2a_subscription = chat_relay_subscriptions()
+    chat_subscription, a2a_subscription = chat_relay_subscriptions(chat_project)
     if chat_project and chat_subscription:
         CredentialProxyHandler.chat_relay = GoogleChatRelay(
             chat_project, chat_subscription

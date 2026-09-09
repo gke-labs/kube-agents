@@ -32,6 +32,7 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("A2A_GCHAT_TOKEN_PATH", "")
 	t.Setenv("A2A_GCHAT_ALLOWED_USERS", "")
 	t.Setenv("A2A_GCHAT_ALLOW_ALL_USERS", "")
+	t.Setenv("A2A_CHAT_DISPLAY_MODE", "")
 }
 
 // TestFromEnvSaltPrecedence: the salt is SESSION_KV_SALT, the one the

@@ -29,9 +29,13 @@ const (
 	// complete only when Chat reports no further page, same one-page posture
 	// as the Discord adapter.
 	gchatMemberPageSize = 100
-	// gchatRelayTimeout bounds one relay API round trip. The relay's own
-	// pull blocks up to ~20s server-side, so this must sit above that.
-	gchatRelayTimeout = 30 * time.Second
+	// gchatRelayTimeout bounds one relay round trip. The relay's pull runs
+	// a Pub/Sub pull with a 20s retry deadline whose worst case overruns
+	// it, and the legacy client allows 35s for the same call; a client that
+	// gives up before the relay answers strands a pulled message behind a
+	// receipt nobody holds until the ack deadline redelivers it, so this
+	// sits well above both.
+	gchatRelayTimeout = 45 * time.Second
 	// gchatRelayEventsPath is the A2A-dedicated event route — its own
 	// GoogleChatRelay instance on its own subscription, so this consumer
 	// never splits deliveries with the legacy chat path.
@@ -212,7 +216,7 @@ type GoogleChatAdapter struct {
 
 // NewGoogleChatAdapter builds the adapter against the credential proxy's
 // relay base URL. tokenPath is the pod's projected ServiceAccount token
-// (chat audience); it is read per request because the kubelet rotates it.
+// (a2a-chat audience); it is read per request because the kubelet rotates it.
 func NewGoogleChatAdapter(relayURL, tokenPath string, log *slog.Logger) (*GoogleChatAdapter, error) {
 	if relayURL == "" {
 		return nil, fmt.Errorf("gchat: relay URL is required")
@@ -638,7 +642,7 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 
 	a.mu.Lock()
 	if kind == "dm" && ev.Message.Thread.Name != "" {
-		if a.dmThreads == nil || len(a.dmThreads) >= gchatSeenCap {
+		if len(a.dmThreads) >= gchatSeenCap {
 			a.dmThreads = map[string]string{}
 		}
 		a.dmThreads[ev.Space.Name] = ev.Message.Thread.Name
@@ -646,7 +650,7 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 	if strings.HasPrefix(sender.Name, gchatUsersToken) {
 		// Bounded by the same cap as the dedupe memory: one entry per
 		// human who has spoken, evicted wholesale rather than leaked.
-		if a.userIDs == nil || len(a.userIDs) >= gchatSeenCap {
+		if len(a.userIDs) >= gchatSeenCap {
 			a.userIDs = map[string]string{}
 			a.userEmails = map[string]string{}
 		}

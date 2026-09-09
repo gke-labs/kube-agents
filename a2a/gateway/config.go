@@ -62,7 +62,7 @@ type Config struct {
 	// GchatRelayURL is the credential proxy's relay base URL — the gchat
 	// backend's transport. Setting it selects the Google Chat adapter.
 	GchatRelayURL string
-	// GchatTokenPath is the projected ServiceAccount token (chat audience)
+	// GchatTokenPath is the projected ServiceAccount token (a2a-chat audience)
 	// the adapter authenticates to the relay with.
 	GchatTokenPath string
 	// GchatAllowedUsers is the ingress allowlist for the gchat backend —
