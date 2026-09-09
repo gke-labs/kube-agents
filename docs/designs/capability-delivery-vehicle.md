@@ -41,22 +41,32 @@ and maintenance.
 
 ## What a capability provides
 
-A capability plugs in as one directory under `agents/platform/skills/<name>/` plus one roster
-entry:
+A capability plugs in as a procedure, a criteria directory, and a roster entry, all under
+`agents/platform/`:
 
-| Part                   | What it carries                                                                                                                                                                              |
-| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `SKILL.md`             | The procedure: how to enumerate scope, which commands to run, how output becomes findings, and the red lines the run may never cross. Image-owned.                                           |
-| `criteria.yaml`        | The tunable part: thresholds, scopes, exclusions, severities, extra checks, report grouping. Read by the procedure. Operator- and agent-owned; this is what customization and learning edit. |
-| `learning.yaml`        | What the agent may change on its own, what needs confirmation, and what it may never touch. Shipped with conservative defaults; operator-owned after that.                                   |
-| `cron/jobs.json` entry | The schedule, the skill to preload, and `deliver: "chat"`. Fires the procedure unattended ([autonomous watchdogs](../site/src/content/docs/concepts/autonomous-watchdogs.md)).               |
+| Part                                                   | What it carries                                                                                                                                                                                                  |
+| ------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `skills/<name>/SKILL.md` or `governance/<name>_sop.md` | The procedure: how to enumerate scope, which commands to run, how output becomes findings, and the red lines the run may never cross. Image-owned.                                                               |
+| `capabilities/<name>/criteria.json`                    | The tunable part: thresholds, scopes, exclusions, severities, report grouping. Read by the procedure through the `capability_criteria` tool. Operator-owned via the agent; what customization and learning edit. |
+| `capabilities/<name>/criteria.schema.json`             | Which keys exist, their types, bounds, defaults and descriptions. Image-owned.                                                                                                                                   |
+| `capabilities/<name>/learning.json`                    | Per-key policy: what the agent may change on its own (`autonomous`), what needs an operator's confirmation (`propose`), what it may never touch here (`never`). Image-owned, shipped all-`propose`.              |
+| `cron/jobs.json` entry                                 | The schedule, the skill to preload, and `deliver: "chat"`. Fires the procedure unattended ([autonomous watchdogs](../site/src/content/docs/concepts/autonomous-watchdogs.md)).                                   |
 
-The split between `SKILL.md` and `criteria.yaml` is what makes properties 4 and 5 safe. The
+The split between the procedure and `criteria.json` is what makes properties 4 and 5 safe. The
 procedure and its red lines stay image-owned, so an upgrade can fix how a check runs and no
-customization or learned change can remove a safety rule. The criteria are owned outside the
-image, so a tuned threshold survives an upgrade and an upgrade never resets it. Existing
-governance audits express criteria inline in an SOP; moving onto the vehicle means lifting those
-into `criteria.yaml` and leaving the SOP as procedure.
+customization or learned change can remove a safety rule. The criteria live outside every
+image-owned tree, so a tuned threshold survives an upgrade and an upgrade never resets it.
+`learning.json` is image-owned for the opposite reason: a policy the volume could keep is a
+policy a release could never tighten. Existing governance audits express criteria inline in an
+SOP; moving onto the vehicle means lifting those into `criteria.json` and leaving the SOP as
+procedure, with the shipped default still printed beside each check.
+
+The criteria cannot live under `skills/`. The agent pod replaces that tree wholesale on every
+start, and the shell sandbox — where the agent's shell reads files — carries its own image copy
+that the mirror refuses to overwrite. So the store sits at `profiles/platform/capabilities/`, and
+the agent reads and writes it through `capability_criteria`, an in-process tool on the
+`platform_control` MCP server, never through the shell. `agents/platform/capabilities/README.md`
+is the contributor's reference; `capability_store.py` beside the server is the implementation.
 
 Findings leave every run the same way regardless of how it was triggered: the `fleet-audit`
 skill's ledger issue per stream, remediation pull requests for findings that are a file change,
@@ -65,9 +75,9 @@ does not build its own reporting.
 
 ## Pre-defined
 
-The skill, its default `criteria.yaml` and `learning.yaml`, and its roster entry ship in the
-image. The profile scaffold installs them on first start and refreshes the image-owned parts on
-every start after that, so a new install has every capability working with defaults and an
+The procedure, the criteria directory with its shipped defaults, and the roster entry ship in
+the image. The profile scaffold installs them on first start and refreshes the image-owned parts
+on every start after that, so a new install has every capability working with defaults and an
 upgraded install picks up procedure fixes without losing what the operator tuned. The default
 criteria are chosen to be quiet rather than thorough: a capability's first weeks on a new fleet
 are for tuning, and a report nobody can read is worse than a short one.
@@ -113,20 +123,25 @@ Hermes' skill system is built to be edited by the agent that uses it: the `skill
 creates and patches files in the profile's `skills/` directory, and upstream describes the
 intended loop as autonomous skill creation after complex tasks with skills improving during use.
 The Platform Agent has that toolset; the Chat Agent has it disabled on purpose, so every edit is
-made by the profile that runs the procedure.
+made by the profile that runs the procedure. On the vehicle that tool is for the procedure, and a
+procedural edit goes through the reviewed tier below; the criteria have their own write path,
+`capability_criteria`, which enforces the learning policy in code and appends every accepted
+change to the capability's changelog with who confirmed it and why.
 
 Explicit customization is a conversation, not a silent self-edit:
 
 1. **The operator describes the change** in chat, usually in reply to a report: "zonal skew under
    15% is noise for the batch family", "also flag PDBs with `minAvailable` equal to replicas",
    "group the cost report by region, not by cluster".
-2. **The agent proposes the revision.** It reads the current `criteria.yaml` (and `SKILL.md` if
-   the change is procedural), drafts the exact edit, and shows it: what will be flagged that was
+2. **The agent proposes the revision.** It reads the current criteria with
+   `capability_criteria(action="get")` (and the procedure, if the change is procedural), drafts
+   the exact edit, and shows it: what will be flagged that was
    not before, what will stop being flagged, and which scheduled runs it affects.
 3. **The two align.** The operator confirms, narrows, or rejects. Nothing is written before this
    step.
-4. **The agent writes it** with `skill_manage` and records the decision and its reason in shared
-   memory (`scope:shared`, through the Chat Agent's Hindsight provider), so a later conversation
+4. **The agent writes it** with `capability_criteria(action="set")`, naming who agreed in
+   `confirmed_by` — the store refuses a `propose`-policy key without that — and records the
+   decision and its reason in shared memory (`scope:shared`, through the Chat Agent's Hindsight provider), so a later conversation
    can answer "why is the batch family excluded?" without re-deriving it.
 5. **Every later invocation uses the revision** — the next scheduled tick, the next on-request
    run, and any runtime-created job that names the skill.
@@ -139,8 +154,9 @@ on it: which findings the operator called noise, which it acted on, which it ask
 what scope it kept narrowing to, what it asked for that the report did not have. Hermes already
 nudges the agent to persist what it learned; the vehicle gives that nudge a place to land.
 
-What the reflection produces is graded by `learning.yaml`, which every capability ships with the
-same conservative defaults:
+What the reflection produces is graded by `learning.json`. Today it carries one policy per key,
+and every capability ships all of them as `propose`; the target is the grading by class of change
+below, which the reflection step applies on top of the per-key policy:
 
 | Class of change                                                                            | Default       |
 | ------------------------------------------------------------------------------------------ | ------------- |
@@ -149,7 +165,7 @@ same conservative defaults:
 | Narrows what is flagged: raises a threshold, adds an exclusion, lowers a severity          | Propose only  |
 | Changes the procedure or a red line in `SKILL.md`                                          | Never         |
 
-"Apply, report" writes the change to `criteria.yaml` and says so in the capability's next report
+"Apply, report" writes the change through `capability_criteria` under an `autonomous` policy and says so in the capability's next report
 — what changed, why the agent thinks so, and how to revert it — so nothing moves silently.
 "Propose only" queues the change and raises it the next time the operator is in the thread, which
 turns into the explicit loop above. A finding suppressed without a human seeing it is the failure
@@ -168,19 +184,20 @@ image template over the Platform Agent's profile on every pod start, `skills/` a
 included, so a file patched with `skill_manage` reverts at the next restart and a skill directory
 the image does not ship is removed with it. That is deliberate — an upgraded pod must run the
 image's skills, and the skill provenance check at boot exists to say so — and it is exactly what a
-customization or a learned change has to survive. Hence the file split: `criteria.yaml` and
-`learning.yaml` are the runtime-owned files, and the scaffold treats them the way it already
-treats `cron/jobs.json` — a `MERGE_PATHS` entry read before the copy and restored after it, with
-the image contributing keys it ships defaults for and the volume keeping everything the operator
-or the agent set.
+customization or a learned change has to survive. Hence the store: `capabilities/<name>/criteria.json`
+is the one runtime-owned file, and the scaffold merges it across a start the way it already
+merges `cron/jobs.json` but in the opposite direction (`VOLUME_WINS_GLOBS` in
+`profile_scaffold.py`): the volume wins every key it holds and the image adds only the keys a
+new release ships. The schema and `learning.json` beside it are replaced from the image, and a
+key the schema no longer defines is pruned on the next write and noted in the changelog.
 
 Three tiers of durability follow, and the agent says which one a change landed in:
 
-| Tier     | Where the change lives                                                        | Survives            | When                                                                 |
-| -------- | ----------------------------------------------------------------------------- | ------------------- | -------------------------------------------------------------------- |
-| Session  | The scope and thresholds named in one on-request run                          | That run            | Trying a criterion once before adopting it                           |
-| Runtime  | `criteria.yaml` / `learning.yaml` on the profile volume, merged across starts | Restart and upgrade | The normal outcome of customization and of applied learning          |
-| Reviewed | A pull request to the operator's configuration repository                     | Everything          | A change the operator wants reviewed, or any change to the procedure |
+| Tier     | Where the change lives                                                          | Survives            | When                                                                 |
+| -------- | ------------------------------------------------------------------------------- | ------------------- | -------------------------------------------------------------------- |
+| Session  | The scope and thresholds named in one on-request run                            | That run            | Trying a criterion once before adopting it                           |
+| Runtime  | `capabilities/<name>/criteria.json` on the profile volume, merged across starts | Restart and upgrade | The normal outcome of customization and of applied learning          |
+| Reviewed | A pull request to the operator's configuration repository                       | Everything          | A change the operator wants reviewed, or any change to the procedure |
 
 The reviewed tier reuses what the remediation path already has: the `fleet-audit` skill opens a
 narrow pull request carrying one file, and a criteria or procedure change is one file. An operator
@@ -198,24 +215,27 @@ the `fleet-audit` ledger and remediation pull requests, on-request delegation th
 runtime-created cron jobs that survive restarts, the `skill_manage` tool on the Platform Agent,
 Hermes' persist-what-you-learned nudge, and shared memory written through the Chat Agent.
 
-The vehicle adds: the `criteria.yaml` and `learning.yaml` conventions and their `MERGE_PATHS`
-entries in `profile_scaffold.py`; a skill template that reads criteria from the file, states the
-alignment step before any `skill_manage` write, and runs the post-conversation reflection against
-`learning.yaml`; the "what I changed" paragraph in the report relay; the optional ConfigMap overlay
-for reviewed overrides; and, per capability, the lift of inline SOP thresholds into criteria. The
+The vehicle adds: the `capabilities/<name>/` store, its volume-wins merge in
+`profile_scaffold.py`, and the `capability_criteria` tool; a procedure template that reads
+criteria through the tool, states the alignment step before any write, and runs the
+post-conversation reflection against `learning.json`; the "what I changed" paragraph in the
+report relay; the optional ConfigMap overlay for reviewed overrides; and, per capability, the lift
+of inline SOP thresholds into criteria. The
 on-demand `hermes cron run` gap is tracked in `agent-shell-sandboxing.md` and is not part of this
 design.
 
 ## The first two capabilities on the vehicle
 
-- **Upgrade readiness** ships as a weekly job. Its `criteria.yaml` holds the per-family target
+- **Upgrade readiness** ships as a weekly job — today's `security-patch-orchestrator` audit is
+  the first capability moved onto the store, with its skew, spread, exclusion-window and image-type
+  thresholds and a cluster exclusion list in `criteria.json`. As the checks grow, the file also holds the per-family target
   version and date, the add-on compatibility matrix, the PDB and surge rules, and which
   deprecation insight subtypes are blocking. On request it runs for one family ahead of that
   family's upgrade window; the post-upgrade diff is the same skill run against a cluster the
   operator names. Learning will mostly widen it — add-ons the operator asked about that the
   matrix did not cover.
 - **Fleet anomaly detection** ships as three jobs — guardrails daily, usage daily, costs weekly —
-  sharing one skill and one `criteria.yaml` with a section per stream. The family grouping, the
+  sharing one skill and one `criteria.json` with a section per stream. The family grouping, the
   skew and quota thresholds, and the exclusions are what customization and learning will mostly
   touch, and most of what they touch narrows, so the first weeks of a pilot are expected to spend
   more turns on proposals than on findings.
