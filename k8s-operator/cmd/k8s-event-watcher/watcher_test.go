@@ -32,6 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 )
@@ -266,5 +267,50 @@ func TestHandleWatchError_RecognisesForbiddenThroughWrapping(t *testing.T) {
 	w.handleWatchError(context.Background(), nil, fmt.Errorf("failed to list *v1.Event: %w", forbiddenListErr))
 	if !strings.Contains(logs.String(), "[held] events forbidden, holding 1ms") {
 		t.Errorf("wrapped 403 was not recognised:\n%s", logs.String())
+	}
+}
+
+// A 403 that arrives after the initial list succeeded — the watch refused for an
+// identity that may list but not watch, or a permission revoked mid-run — is
+// not held. The informer has synced and cluster_up reads 1, which the hold
+// cannot lower, so the reflector keeps the default backoff and relists within
+// seconds rather than leaving a cluster reported as watched with events up to
+// the hold stale.
+func TestRun_ForbiddenWatchAfterSyncKeepsTheDefaultBackoff(t *testing.T) {
+	logs := captureLog(t)
+	client := fake.NewClientset()
+	var watchAttempts atomic.Int64
+	client.PrependWatchReactor("events", func(k8stesting.Action) (bool, watch.Interface, error) {
+		watchAttempts.Add(1)
+		return true, nil, forbiddenListErr
+	})
+	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "list-only"}, 0)
+	w.forbiddenHold = time.Hour
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	var synced atomic.Bool
+	go func() { done <- w.Run(ctx, func() { synced.Store(true) }) }()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for watchAttempts.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !synced.Load() {
+		t.Error("the list succeeded, so the informer should have synced")
+	}
+	if got := watchAttempts.Load(); got < 2 {
+		t.Errorf("want the default backoff to retry a forbidden watch within 10s once synced, got %d attempt(s)", got)
+	}
+	if strings.Contains(logs.String(), "forbidden, holding") {
+		t.Errorf("a 403 after sync must not be held:\n%s", logs.String())
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return within 2s of cancellation")
 	}
 }

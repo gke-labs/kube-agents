@@ -31,16 +31,18 @@ import (
 )
 
 const (
-	// forbiddenRetryInterval is how long an informer whose Event list the API
-	// server refused with 403 Forbidden waits before trying again. A 403 is a
-	// permission the identity does not hold, and permissions change on the
-	// order of minutes when someone edits an IAM binding or a RoleBinding —
-	// not on the sub-second cadence the reflector's default backoff assumes
-	// for a flapping connection. That backoff caps at 30 seconds, so a fleet
-	// where every cluster refuses the list is a list request and three log
-	// lines per cluster every few seconds, for the life of the process. The
-	// informer is kept, not stopped: a cluster whose permission is granted
-	// during the hold is picked up on the next attempt, with no restart.
+	// forbiddenRetryInterval is how long an informer whose initial Event list
+	// the API server refused with 403 Forbidden waits before trying again. A
+	// 403 is a permission the identity does not hold, and permissions change
+	// on the order of minutes when someone edits an IAM binding or a
+	// RoleBinding — not on the cadence the reflector's default backoff
+	// assumes for a flapping connection. That backoff settles at 30 to 60
+	// seconds between attempts (a 30-second cap with full jitter), so a fleet
+	// where every cluster refuses the list is a refused request, logged twice,
+	// from one cluster or another every second or two, for the life of the
+	// process. The informer is kept, not stopped: a cluster whose permission
+	// is granted during the hold is picked up on the next attempt, with no
+	// restart.
 	forbiddenRetryInterval = 10 * time.Minute
 )
 
@@ -171,20 +173,39 @@ func (w *watcher) Run(ctx context.Context, onSynced func()) error {
 // it synchronously from its retry loop, after a list or watch failed and
 // before the backoff that precedes the next attempt, so time spent in here is
 // added to the retry interval. That is the lever this uses: a 403 Forbidden
-// holds the reflector for forbiddenHold, or until the informer is stopped,
-// whichever comes first, and every other error goes to the default handler
-// unchanged and retries on the default backoff. The reflector wraps the list
-// error with %w, so apierrors.IsForbidden sees the StatusError through it; a
-// client-go that stopped wrapping would fall back to the default path, which
-// is the pre-hold behaviour rather than a new failure.
+// on a cluster whose initial list has never completed holds the reflector for
+// forbiddenHold, or until the informer is stopped, whichever comes first.
+// Every other error, and a 403 on a cluster that has already synced, goes to
+// the default handler unchanged and retries on the default backoff. The
+// reflector wraps the list error with %w, so apierrors.IsForbidden sees the
+// StatusError through it; a client-go that stopped wrapping would fall back to
+// the default path, which is the pre-hold behaviour rather than a new failure.
 //
-// One log line per attempt, and the default handler is skipped for the 403 so
-// klog's "Failed to watch" and the runtime.ErrorHandlers echo of it stay quiet
-// too. Nothing else changes: the informer never syncs during the hold, so
-// cluster_up stays 0 and WaitForCacheSync in Run stays blocked, and the
-// no-cluster-synced exit in main.go still fires when every cluster is held.
+// The hold is gated on the informer not having synced because once it has,
+// cluster_up is 1 and stays 1 for as long as Run is blocked in <-ctx.Done():
+// nothing here can lower it. The reflector also surfaces a 403 from the watch
+// request after a successful list (an identity with list but not watch, or a
+// permission revoked mid-run), and holding there would leave a cluster
+// reported as watched with events up to forbiddenHold stale. On the default
+// backoff that cluster relists within a minute, as it did before the hold
+// existed, which is the honest state for cluster_up=1 to describe.
+//
+// "Has synced" is read off the reflector, not the informer: the reflector
+// records the resource version of every completed list or watch-list on its
+// own goroutine before it opens the watch, so it is set by the time a refused
+// watch reaches this handler. The informer's HasSynced closes on a separate
+// goroutine and loses that race to a watch the server refuses at once. An
+// API server always stamps a list with a resource version, so empty means no
+// list has ever completed.
+//
+// One log line per attempt, and the default handler is skipped for the held
+// 403 so klog's "Failed to watch" and the runtime.ErrorHandlers echo of it
+// stay quiet too. Nothing else changes: the informer never syncs during the
+// hold, so cluster_up stays 0 and WaitForCacheSync in Run stays blocked, and
+// the no-cluster-synced exit in main.go still fires when every cluster is held.
 func (w *watcher) handleWatchError(ctx context.Context, r *cache.Reflector, err error) {
-	if !apierrors.IsForbidden(err) {
+	synced := r != nil && r.LastSyncResourceVersion() != ""
+	if !apierrors.IsForbidden(err) || synced {
 		cache.DefaultWatchErrorHandler(ctx, r, err)
 		return
 	}
