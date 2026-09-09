@@ -203,15 +203,6 @@
       "description": "Runtime base for the operator image."
     },
     {
-      "name": "node",
-      "origin": "build-time",
-      "repository": "docker.io/library/node",
-      "tag": "22-slim",
-      "buildArg": "NODE_IMAGE",
-      "pulledBy": "a2a/Dockerfile.worker runtime stage.",
-      "description": "Runtime base for the A2A session worker image."
-    },
-    {
       "name": "busybox",
       "origin": "build-time",
       "repository": "docker.io/library/busybox",

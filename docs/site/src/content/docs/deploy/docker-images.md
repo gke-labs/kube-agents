@@ -74,7 +74,6 @@ Needed only to rebuild the images above from source, not to run an install. Each
 | `golang` | `docker.io/library/golang` | `1.27-alpine` | `GOLANG_IMAGE` | deploy/docker/Dockerfile, k8s-operator/Dockerfile and a2a/Dockerfile.gateway builder stages. |
 | `python` | `docker.io/library/python` | `3.14-slim` | `PYTHON_IMAGE` | examples/inference-replay/replay-proxy/Dockerfile and deploy/sandbox/Dockerfile. |
 | `distroless-static` | `gcr.io/distroless/static` | `nonroot` | `DISTROLESS_IMAGE` | k8s-operator/Dockerfile and a2a/Dockerfile.gateway runtime stages. |
-| `node` | `docker.io/library/node` | `22-slim` | `NODE_IMAGE` | a2a/Dockerfile.worker runtime stage. |
 | `busybox` | `docker.io/library/busybox` | `musl@sha256:32b5cdad7cce41dfd53d0ae06baebcf8357a147ee7694dc706911c373bc30c37` | — | agentplugins/*/Dockerfile base images. |
 
 <!-- prettier-ignore-end -->

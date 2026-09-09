@@ -112,16 +112,6 @@ check_base_image python deploy/sandbox/Dockerfile PYTHON_IMAGE PYTHON_VERSION
 check_base_image golang a2a/Dockerfile.gateway GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static a2a/Dockerfile.gateway DISTROLESS_IMAGE DISTROLESS_VERSION
 
-if [ -f a2a/Dockerfile.authcallout ]; then
-  check_base_image golang a2a/Dockerfile.authcallout GOLANG_IMAGE GOLANG_VERSION
-  check_base_image distroless-static a2a/Dockerfile.authcallout DISTROLESS_IMAGE DISTROLESS_VERSION
-fi
-
-if [ -f a2a/Dockerfile.worker ]; then
-  check_base_image golang a2a/Dockerfile.worker GOLANG_IMAGE GOLANG_VERSION
-  check_base_image node a2a/Dockerfile.worker NODE_IMAGE NODE_VERSION
-fi
-
 # The Go builder and k8s-operator/go.mod's `go` directive must name the same
 # major.minor: a builder behind the directive fails the image build (the
 # official golang image sets GOTOOLCHAIN=local, and the Dockerfiles repeat it so
@@ -171,14 +161,6 @@ check_go_directive() {
 check_go_directive deploy/docker/Dockerfile GOLANG_VERSION
 check_go_directive k8s-operator/Dockerfile GOLANG_VERSION
 check_go_directive a2a/Dockerfile.gateway GOLANG_VERSION a2a/go.mod
-
-if [ -f a2a/Dockerfile.authcallout ]; then
-  check_go_directive a2a/Dockerfile.authcallout GOLANG_VERSION a2a/go.mod
-fi
-
-if [ -f a2a/Dockerfile.worker ]; then
-  check_go_directive a2a/Dockerfile.worker GOLANG_VERSION a2a/go.mod
-fi
 
 # hermes-agent is the one base image whose tag lives outside the Dockerfile —
 # the release workflows read tags.env — so the inventory points at that file
