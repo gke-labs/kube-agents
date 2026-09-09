@@ -132,6 +132,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
         "gke-upgrades",
     ],
     "Manifests and remediation": [
+        "gke-config-connector",
         "gke-manifest-generation",
         "submit-suggestion",
     ],

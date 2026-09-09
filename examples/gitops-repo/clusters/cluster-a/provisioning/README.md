@@ -23,3 +23,8 @@ The same pin applies to the other modules (`kube-agents-iam`, `chat-pubsub`, `gi
 canonical single-apply composition of all but `drift-pubsub`, and the
 [release versioning & promotion guide](../../../../../docs/site/src/content/docs/deploy/release-versioning.md)
 owns the pinning rules.
+
+The Platform Agent authors the KCC YAML here through its
+[`gke-config-connector` skill](../../../../../agents/platform/skills/gke-config-connector/SKILL.md):
+one pull request per change, create or acquire decided read-only beforehand,
+`cnrm.cloud.google.com/deletion-policy: abandon` on every resource, and no apply from the agent.

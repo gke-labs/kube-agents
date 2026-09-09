@@ -71,6 +71,7 @@ agents/platform/skills/*/SKILL.md
   agents/platform/skills/gke-cluster-autoscaler/SKILL.md
   agents/platform/skills/gke-cluster-creation/SKILL.md
   agents/platform/skills/gke-compute-classes/SKILL.md
+  agents/platform/skills/gke-config-connector/SKILL.md
   agents/platform/skills/gke-cost-analysis/SKILL.md
   agents/platform/skills/gke-cost-optimization/SKILL.md
   agents/platform/skills/gke-golden-path/SKILL.md
@@ -120,6 +121,10 @@ agents/platform/skills/*/references/*.md
   agents/platform/skills/gke-compute-classes/references/compute-class-lifecycle.md
   agents/platform/skills/gke-compute-classes/references/compute-class-prioritization.md
   agents/platform/skills/gke-compute-classes/references/compute-class-provisioning-methods.md
+  agents/platform/skills/gke-config-connector/references/acquisition.md
+  agents/platform/skills/gke-config-connector/references/compute-firewall.md
+  agents/platform/skills/gke-config-connector/references/container.md
+  agents/platform/skills/gke-config-connector/references/sql.md
   agents/platform/skills/gke-manifest-generation/references/ai-inference.md
   agents/platform/skills/gke-manifest-generation/references/basic-workload.md
   agents/platform/skills/gke-manifest-generation/references/gateway-api.md
