@@ -408,6 +408,13 @@ def _restore_volume_wins(
 
     A file the template does not ship — a capability the image dropped, or one
     an operator added by hand — was never touched by the copy and needs nothing.
+
+    Known limit: this runs outside the store's per-capability lock, so at
+    availability.replicas > 1 on one RWX volume a `set` committed by a running
+    replica between a starting replica's snapshot and its restore is lost (the
+    changelog line survives). Same class as the roster's documented
+    multi-replica window in docker-entrypoint.sh; single-replica installs are
+    unaffected.
     """
     for relative, previous in prior.items():
         parts = relative.split("/")
