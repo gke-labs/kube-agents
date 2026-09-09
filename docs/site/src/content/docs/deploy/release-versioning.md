@@ -1,6 +1,6 @@
 ---
 title: Release lifecycle, versioning & operations
-description: How Kube-Agents automates SemVer 2.0 releases, validates release candidates on live GKE clusters, and publishes immutable artifacts.
+description: The release cadence, and how Kube-Agents automates SemVer 2.0 releases, validates release candidates on live GKE clusters, and publishes immutable artifacts.
 sidebar:
   order: 4
 ---
@@ -27,6 +27,51 @@ pushes after the full matrix passes
 ([`scripts/release/README.md`](https://github.com/gke-labs/kube-agents/tree/main/scripts/release)).
 The gate matches that tag's shape rather than the bare `staging_` prefix, because the prefix is
 also a hand-pushable redeploy trigger.
+
+## Release cadence
+
+Two of the three steps above the candidate build run on a schedule; the GA release is started by
+hand. This is `main` as it runs today. Open pull request
+[#1325](https://github.com/gke-labs/kube-agents/pull/1325) adds a weekly cron for the GA step; when
+it merges, this section changes with it.
+
+| Step                        | When it runs                                                                                                                 | Workflow                                                                                                                          |
+| :-------------------------- | :--------------------------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------- |
+| RC selection and validation | Every three hours (`17 */3 * * *`, UTC). Dispatches nothing when the newest candidate has already been tried.                | `rc-scheduler.yml` starts `rc-release-pipeline.yml`, which pushes the `rc_*` and `rc_*_validated` tags.                           |
+| Staging promotion           | Daily at 02:17 UTC (`17 2 * * *`), against the newest validated candidate. One already promoted is re-tested, not re-tagged. | `nightly-scheduler.yml` starts `nightly-pipeline.yml`, which pushes the `staging_<ts>_<sha>` tag when the full E2E matrix passes. |
+| GA release                  | When a maintainer dispatches it. `release-publish.yml` has no `schedule:`.                                                   | `release-publish.yml`, run as described under [Cutting a GA release](#cutting-a-ga-release).                                      |
+
+Scheduled runs start when GitHub's scheduler picks them up, so the minute is a floor, not a
+promise. Nothing on `main` today publishes a GA release unattended: one ships when a maintainer
+dispatches the workflow, and by default it releases the newest staging-promoted commit. The latest
+GA tag is `0.4.0`, cut from a staging-promoted commit. The gate that decides whether a dispatch
+publishes, and that a cron tick will run through once #1325 lands, is described in
+[`scripts/release/README.md`](https://github.com/gke-labs/kube-agents/tree/main/scripts/release),
+which is canonical for it.
+
+### What the next release contains
+
+Generated release notes are the tracking mechanism. GitHub milestones are unused.
+
+Every GA release is created with `gh release create --generate-notes`
+(`scripts/release/publish_github_release.sh`), so GitHub writes the notes from the pull requests
+merged between the previous release tag and the new one, grouped under the label categories in
+`.github/release.yml`: features, bug fixes, security, documentation, infrastructure, and a
+catch-all for anything else, with Dependabot's pull requests left out. Read them on
+[the releases page](https://github.com/gke-labs/kube-agents/releases) once the release exists.
+
+Before it exists, the next release is whatever has merged since the latest GA tag:
+
+- [`0.4.0...main`](https://github.com/gke-labs/kube-agents/compare/0.4.0...main) lists every pull
+  request the next release will contain if it is cut from the tip of `main`. The GA tag sits on a
+  stamped commit whose parent is the released candidate, so the three-dot compare starts from that
+  candidate.
+- Replace `main` with the newest `staging_<ts>_<sha>` tag to see what is releasable now; that is
+  the commit an ordinary dispatch releases.
+
+`auto-assign-milestone.yml` still runs after every merge to `main`, but it exits without assigning
+anything when the repository has no open milestone, and none is kept, so a milestone is not where
+to look.
 
 ## Automated SemVer 2.0 calculation
 
