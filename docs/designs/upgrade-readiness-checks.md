@@ -15,14 +15,16 @@ and never upgrades a cluster.
 
 ## How it is delivered
 
-The checks ship as one skill with a pre-defined cron job, so they run on a schedule without being
-asked; the same skill can be triggered from chat at any time, for the whole fleet or for one
-family ahead of its upgrade window; and the criteria below — target versions, compatibility
-matrix, drain-safety rules, blocking insight types — are held apart from the procedure so the
-operator can revise them after deployment by describing the change to the agent, agreeing the
-revision, and having the agent write it for every later run. The mechanics, and what a
-customization does and does not survive, are in
-[`customizable-scheduled-skills.md`](customizable-scheduled-skills.md).
+The checks are one capability on the shared
+[capability delivery vehicle](capability-delivery-vehicle.md), which gives them five properties
+without any of them being built here: they ship **pre-defined** with the agent; they run
+**scheduled** as a weekly cron job; they are **triggerable** from chat at any time, for the whole
+fleet or for one family ahead of its upgrade window; they are **customizable**, in that the
+criteria below — target versions, compatibility matrix, drain-safety rules, blocking insight
+types — are held apart from the procedure so the operator can revise them by describing the change
+to the agent and agreeing the edit; and they are **self-learning**, in that the agent revises those
+criteria on its own after reflecting on conversations, within the limits the vehicle sets. This
+document lists only the checks.
 
 ## Version posture
 
