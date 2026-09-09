@@ -246,27 +246,12 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 		}
 	}
 
-	// 4. Validate GitHub Integration (both Org and GitRepo are optional)
-	if platformAgent.Spec.Integration != nil && platformAgent.Spec.Integration.GitHub != nil {
-		if platformAgent.Spec.Integration.GitHub.Org != "" {
-			if err := agentv1alpha1.ValidateGitHubOrg(platformAgent.Spec.Integration.GitHub.Org); err != nil {
-				allErrs = append(allErrs, field.Invalid(
-					field.NewPath("spec", "integration", "github", "org"),
-					platformAgent.Spec.Integration.GitHub.Org,
-					err.Error(),
-				))
-			}
-		}
-		if platformAgent.Spec.Integration.GitHub.GitRepo != "" {
-			if err := agentv1alpha1.ValidateGitRepoURLWithOrg(platformAgent.Spec.Integration.GitHub.GitRepo, platformAgent.Spec.Integration.GitHub.Org); err != nil {
-				allErrs = append(allErrs, field.Invalid(
-					field.NewPath("spec", "integration", "github", "gitRepo"),
-					platformAgent.Spec.Integration.GitHub.GitRepo,
-					err.Error(),
-				))
-			}
-		}
-	}
+	// 4. Validate the forge integration. Provider, host, namespace and repository
+	// are all optional; each is checked by the declared provider's own rules
+	// rather than by GitHub's applied to everyone. `spec.integration.github` is a
+	// deprecated alias that resolves to the same declaration, so the field paths
+	// below are rendered in whichever spelling was written.
+	allErrs = append(allErrs, validateGitIntegration(platformAgent.Spec.Integration)...)
 
 	if len(allErrs) > 0 {
 		return nil, apierrors.NewInvalid(
@@ -277,6 +262,78 @@ func (v *PlatformAgentCustomValidator) validatePlatformAgent(ctx context.Context
 	}
 
 	return nil, nil
+}
+
+// integrationFieldRoot is the spec path the forge declaration hangs off; the
+// leaf under it depends on which of the two spellings was written, which
+// ResolvedGit.FieldPath decides.
+var integrationFieldRoot = []string{"spec", "integration"}
+
+// gitDeclarationParts pairs each part of a forge declaration with the check
+// that applies to it, so admission reports one error per field rather than
+// stopping at the first.
+type gitDeclarationPart struct {
+	name  string
+	value func(*agentv1alpha1.ResolvedGit) string
+	check func(*agentv1alpha1.ResolvedGit) error
+}
+
+var gitDeclarationParts = []gitDeclarationPart{
+	{
+		name:  "host",
+		value: func(r *agentv1alpha1.ResolvedGit) string { return r.Host },
+		check: (*agentv1alpha1.ResolvedGit).ValidateHost,
+	},
+	{
+		name:  "namespace",
+		value: func(r *agentv1alpha1.ResolvedGit) string { return r.Namespace },
+		check: (*agentv1alpha1.ResolvedGit).ValidateNamespace,
+	},
+	{
+		name:  "repository",
+		value: func(r *agentv1alpha1.ResolvedGit) string { return r.Repository },
+		check: (*agentv1alpha1.ResolvedGit).ValidateRepository,
+	},
+}
+
+// validateGitIntegration checks the forge declaration against the rules of the
+// provider it names.
+func validateGitIntegration(integration *agentv1alpha1.PlatformAgentIntegrationSpec) field.ErrorList {
+	var errs field.ErrorList
+	if integration == nil {
+		return errs
+	}
+	root := field.NewPath(integrationFieldRoot[0], integrationFieldRoot[1:]...)
+
+	resolved, err := integration.ResolveGit()
+	if err != nil {
+		// Both spellings set. Neither field is at fault on its own, so the error
+		// hangs off the integration itself.
+		return append(errs, field.Invalid(root, "", err.Error()))
+	}
+	if resolved == nil {
+		return errs
+	}
+	if _, err := resolved.GitProvider(); err != nil {
+		return append(errs, field.Invalid(
+			childPath(root, resolved.FieldPath("provider")), resolved.Provider, err.Error()))
+	}
+	for _, part := range gitDeclarationParts {
+		if err := part.check(resolved); err != nil {
+			errs = append(errs, field.Invalid(
+				childPath(root, resolved.FieldPath(part.name)), part.value(resolved), err.Error()))
+		}
+	}
+	return errs
+}
+
+// childPath descends a field.Path by a slice, which its variadic Child cannot
+// take directly.
+func childPath(root *field.Path, parts []string) *field.Path {
+	if len(parts) == 0 {
+		return root
+	}
+	return root.Child(parts[0], parts[1:]...)
 }
 
 func validateContainerSecurity(sc *corev1.SecurityContext, path *field.Path) field.ErrorList {

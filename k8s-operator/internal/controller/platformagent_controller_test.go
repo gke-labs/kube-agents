@@ -4903,3 +4903,47 @@ func TestPlatformAgentReconciler_Reconcile_UnrecognizedMode(t *testing.T) {
 		t.Errorf("expected Degraded to clear once the mode is valid, still %q", updated.Status.Phase)
 	}
 }
+
+// TestSameManagedRepoComparesIdentityNotSpelling covers the dedup that decides
+// whether the seeded GitOps repository is already in the state ConfigMap. A
+// string comparison made `https://www.github.com/gke-labs/kube-agents` and
+// `git@github.com:gke-labs/kube-agents.git` two entries for one repository, and
+// the agent then held two write locks on the same remote.
+func TestSameManagedRepoComparesIdentityNotSpelling(t *testing.T) {
+	seeded := agentv1alpha1.ManagedRepoEntry{
+		Type: agentv1alpha1.GitProviderGitHub,
+		URL:  "https://github.com/gke-labs/kube-agents",
+	}
+	same := []string{
+		"https://github.com/gke-labs/kube-agents",
+		"https://github.com/gke-labs/kube-agents.git",
+		"https://www.github.com/gke-labs/kube-agents",
+		"git@github.com:gke-labs/kube-agents.git",
+		"ssh://git@github.com/gke-labs/kube-agents",
+		"http://github.com/gke-labs/kube-agents",
+	}
+	for _, url := range same {
+		t.Run(url, func(t *testing.T) {
+			existing := agentv1alpha1.ManagedRepoEntry{Type: agentv1alpha1.GitProviderGitHub, URL: url}
+			if !sameManagedRepo(existing, seeded) {
+				t.Errorf("sameManagedRepo(%q, %q) = false, expected true", url, seeded.URL)
+			}
+		})
+	}
+
+	different := []agentv1alpha1.ManagedRepoEntry{
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://github.com/gke-labs/other"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "https://github.com/other/kube-agents"},
+		// A different forge is a different repository however the paths line up,
+		// and an unresolvable spelling must not collapse into the seeded entry.
+		{Type: "gitlab", URL: "https://gitlab.com/gke-labs/kube-agents"},
+		{Type: agentv1alpha1.GitProviderGitHub, URL: "not a url at all"},
+	}
+	for _, existing := range different {
+		t.Run(existing.Type+" "+existing.URL, func(t *testing.T) {
+			if sameManagedRepo(existing, seeded) {
+				t.Errorf("sameManagedRepo(%+v, %q) = true, expected false", existing, seeded.URL)
+			}
+		})
+	}
+}

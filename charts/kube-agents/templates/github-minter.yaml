@@ -9,6 +9,23 @@ imported into that key outside the chart (install.sh runs the import, or see
 the module README for the manual command).
 */}}
 {{- if .Values.githubMinter.enabled }}
+{{- /*
+  minty mints GitHub App installation tokens and nothing else, so enabling it
+  while declaring a different forge is a contradiction rather than a
+  combination. Failing here names it at `helm install`; rendering the minter
+  anyway would surface as the credential proxy handing the agent a token no
+  forge it talks to accepts. An install that declares no forge at all still
+  renders the minter, which is what every existing values file relies on.
+
+  With `github` the only registered provider, kube-agents.gitProvider refuses
+  anything else before this can fire. This guard is what keeps that true when
+  the registry widens, which is the same change that gives a non-GitHub install
+  a credential path of its own -- see docs/designs/multi-forge-support.md §6.
+*/}}
+{{- $provider := include "kube-agents.gitProvider" . }}
+{{- if and $provider (ne $provider "github") }}
+{{- fail (printf "githubMinter.enabled is set but platformAgent.integration declares provider %q; the GitHub token minter issues GitHub App tokens only" $provider) }}
+{{- end }}
 {{- $m := .Values.githubMinter }}
 {{- $org := required "githubMinter.org is required when githubMinter.enabled" $m.org }}
 {{- $rawRepo := required "githubMinter.repo is required when githubMinter.enabled" $m.repo }}

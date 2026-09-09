@@ -354,3 +354,45 @@ wrong Service.
 {{- define "kube-agents.webhookConfigurationPrefix" -}}
 {{ .Release.Name }}-{{ .Release.Namespace }}
 {{- end }}
+
+{{- /*
+The forge the install declares, folding the deprecated `integration.github`
+alias into `integration.git`. Two spellings of one setting is how a values file
+ends up declaring one forge and provisioning another's credentials, so nothing
+reads either block directly — everything that needs to know which forge this is
+calls this, and the minter guard below is the reason it has to be one answer.
+
+Renders the empty string when no forge is declared at all, which is a valid
+install: repositories can be registered in the gitops-state ConfigMap later.
+
+`gitRepo: None` is the sentinel for "no repository", so it does not count as a
+declaration -- reading it as one would make it collide with a `git` block that
+declares the forge properly, which is the migration every install has to make.
+
+The provider list mirrors the CRD's enum in
+k8s-operator/api/v1alpha1/common_types.go. Checking it here is what turns an
+unregistered provider into a `helm install` failure naming the values key,
+rather than an API-server enum rejection at apply time.
+*/}}
+{{- define "kube-agents.gitProvider" -}}
+{{- $providers := list "github" -}}
+{{- $sentinel := "None" -}}
+{{- $integ := .Values.platformAgent.integration -}}
+{{- $git := $integ.git | default dict -}}
+{{- $github := $integ.github | default dict -}}
+{{- $gitRepo := $github.gitRepo | default "" -}}
+{{- $gitSet := or $git.provider $git.host $git.repository $git.namespace -}}
+{{- $githubSet := or $github.org (and $gitRepo (ne $gitRepo $sentinel)) -}}
+{{- if and $gitSet $githubSet -}}
+{{- fail "set platformAgent.integration.git or platformAgent.integration.github, not both; github is a deprecated alias for git with provider: github" -}}
+{{- end -}}
+{{- if $gitSet -}}
+{{- $provider := $git.provider | default "github" -}}
+{{- if not (has $provider $providers) -}}
+{{- fail (printf "platformAgent.integration.git.provider is %q; must be one of %s" $provider (join ", " $providers)) -}}
+{{- end -}}
+{{ $provider }}
+{{- else if $githubSet -}}
+github
+{{- end -}}
+{{- end }}

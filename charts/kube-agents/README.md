@@ -343,9 +343,18 @@ Use `telemetry.otlpEndpoint` instead when you do have a collector to point at.
   `tenantId`, and user authorization is configured via `allowedUsers` (or
   `allowAllUsers: true`). Supports Microsoft Adaptive Cards v1.5 with markdown
   fallback.
-- **GitHub** — `platformAgent.integration.github.org` sets the GitHub
-  Organization where the GitHub App is installed, and optional
-  `platformAgent.integration.github.gitRepo` sets the initial GitOps repository.
+- **Git forge** — `platformAgent.integration.git.namespace` sets the
+  organisation, user, or group owning the repositories (on GitHub, where the
+  GitHub App is installed), and optional
+  `platformAgent.integration.git.repository` sets the initial GitOps
+  repository. `provider` selects the forge and defaults to `github`, which is
+  the only one registered today; `host` overrides the provider's default host.
+  `platformAgent.integration.github.org` / `.gitRepo` remain as a deprecated
+  alias for the same two fields — set one block or the other, not both. The
+  alias is still what `install.sh` and the `full-install` Terraform composition
+  write, so an install driven by either arrives with `github.*` set.
+  Enabling `githubMinter` alongside a non-GitHub provider fails the render,
+  since minty issues GitHub App tokens only.
   GitOps repositories can also be registered in the ConfigMap by cluster administrators.
 
 Chat, Slack, and Teams each need a one-time manual registration that no install
