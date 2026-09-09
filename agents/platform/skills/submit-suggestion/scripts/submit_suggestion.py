@@ -39,7 +39,6 @@ flag, so a session that started under one does not finish under the other.
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -51,10 +50,10 @@ sys.path.append("/opt/data/scripts")
 sys.path.append(str(Path(__file__).resolve().parents[3] / "scripts"))
 
 import credential_proxy_client
+import forge
 import gitops_workspace
 from github_token_refresh import refresh_git_credentials, log
 
-BARE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 # Branches a suggestion may never target. `main` and `master` are the GitOps
 # rollout branches; `production` is the convention some fleets use instead.
@@ -462,13 +461,15 @@ def create_pull_request(
 ) -> str:
     """Open the pull request — or refresh the one that is already open.
 
-    `gh pr create` fails with "a pull request for branch … already exists"
-    every time a card comes back for a second round, and it fails *after* the
-    push has landed. Read as an error that is the worst possible shape: the
-    branch was updated and the reviewer will see the new commits, but the skill
-    reports the whole submission as failed, so the agent retries, pushes again,
-    and fails again — for as many rounds of feedback as the pull request gets.
-    An existing pull request is the success case for a resubmission.
+    Opening one fails with "a pull request for branch … already exists" every
+    time a card comes back for a second round, and it fails *after* the push has
+    landed. Read as an error that is the worst possible shape: the branch was
+    updated and the reviewer will see the new commits, but the skill reports the
+    whole submission as failed, so the agent retries, pushes again, and fails
+    again — for as many rounds of feedback as the pull request gets. An existing
+    pull request is the success case for a resubmission, and that judgement is
+    made here rather than in the provider: another caller opening a change for
+    the first time would read the same refusal as a genuine conflict.
 
     It is refreshed rather than merely located. Step 5 of the SKILL hands this
     function a title and body written for the commits it just pushed; leaving
@@ -476,58 +477,41 @@ def create_pull_request(
     contains. `audit_report.open_remediation_pr` edits its own pull requests
     for the same reason.
 
-    `workspace` is None in content mode, where there is no directory to run in.
-    Nothing here needs one: every call names `--repo` explicitly.
+    `workspace` is unused and kept only so the signature does not move: the
+    provider passes `-R <repo>`, so the call need not run inside a clone, and
+    the body travels on stdin rather than through a file, so there is no
+    directory to write one into. It is None in content mode for that reason.
     """
     log(f"Submitting GitOps Pull Request for branch '{branch}'...")
-
-    # `--body-file -` rather than `--body`. A pull-request body is the one
-    # argument here that carries agent-authored prose of unbounded length, and
-    # argv is not where that belongs: it used to be written to the shared volume
-    # so the proxy's `gh` could open the path, which is one of the two remaining
-    # reasons the two containers need a filesystem in common at all.
-    cmd = [
-        "gh", "pr", "create",
-        "--repo", repo,
-        "--title", title,
-        "--body-file", "-",
-        "--base", base,
-        "--head", branch
-    ]
-
-    res = subprocess.run(
-        cmd, cwd=workspace, input=body, capture_output=True, text=True, check=False
-    )
-    if res.returncode == 0:
-        return res.stdout.strip()
-
-    if "already exists" not in f"{res.stdout}\n{res.stderr}".lower():
-        # Anything else — no permission, a protected base, gh not authenticated
-        # — is a real failure and keeps the shape `main` already handles.
-        raise subprocess.CalledProcessError(res.returncode, cmd, res.stdout, res.stderr)
-
-    log(f"A pull request for '{branch}' is already open; updating it in place.")
-    return update_pull_request(branch, title, body, workspace, repo)
+    provider = forge.provider_for(repo)
+    try:
+        url = provider.create_pull_request(
+            repo, head=branch, base=base, title=title, body=body
+        )
+    except forge.PullRequestExists:
+        log(f"A pull request for '{branch}' is already open; updating it in place.")
+        return update_pull_request(branch, title, body, workspace, repo)
+    if not url:
+        raise RuntimeError(
+            f"the forge opened a pull request for '{branch}' but did not return its "
+            "address, and reading it back failed too. The push and the pull request "
+            "both landed; find it on the forge rather than resubmitting."
+        )
+    return url
 
 
 def update_pull_request(
     branch: str, title: str, body: str, workspace: str, repo: str
 ) -> str:
     """Point the existing pull request for `branch` at the work just pushed."""
-    subprocess.run(
-        ["gh", "pr", "edit", branch, "--repo", repo, "--title", title, "--body-file", "-"],
-        cwd=workspace, input=body, capture_output=True, text=True, check=True,
-    )
-    res = subprocess.run(
-        ["gh", "pr", "view", branch, "--repo", repo, "--json", "url", "--jq", ".url"],
-        cwd=workspace, capture_output=True, text=True, check=True,
-    )
-    url = res.stdout.strip()
+    provider = forge.provider_for(repo)
+    provider.update_pull_request(repo, head=branch, title=title, body=body)
+    url = provider.pull_request_url(repo, head=branch)
     if not url:
         raise RuntimeError(
-            f"`gh pr view {branch}` returned no URL for the pull request it just "
-            "reported as already existing. The push landed; find the pull request "
-            "on GitHub rather than resubmitting."
+            f"the forge returned no URL for the pull request on '{branch}' that it "
+            "had just reported as already existing. The push landed; find the pull "
+            "request on the forge rather than resubmitting."
         )
     return url
 
@@ -646,6 +630,16 @@ def main():
         # The foreign-lease refusal. Distinct from the generic failure below
         # because it is the one an agent can act on without an operator.
         log(f"REFUSED: {e}")
+        sys.exit(1)
+    except forge.ForgeError as e:
+        # The forge refused, with a reason code naming which layer did. Kept
+        # ahead of the generic handler because `ForgeError` is not a
+        # `CalledProcessError` and would otherwise print as one bare line;
+        # `create_pull_request` folds the exit code and both streams into
+        # the error's value, and that is the whole diagnosis.
+        log(f"FATAL ERROR: the forge refused the request [{e.reason}]")
+        if e.value:
+            log(f"Detail:\n{e.value}")
         sys.exit(1)
     except subprocess.CalledProcessError as e:
         log("FATAL ERROR: GitOps subprocess execution failed!")

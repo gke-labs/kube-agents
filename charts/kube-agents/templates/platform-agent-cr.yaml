@@ -166,9 +166,26 @@ spec:
     {{- toYaml . | nindent 4 }}
   {{- end }}
   {{- $integ := .Values.platformAgent.integration }}
-  {{- if or (and $integ.github (or $integ.github.org $integ.github.gitRepo)) $integ.googleChat.enabled $integ.slack.enabled $integ.teams.enabled }}
+  {{- $git := $integ.git | default dict }}
+  {{- $gitSet := or $git.provider $git.host $git.repository $git.namespace }}
+  {{- $githubSet := and $integ.github (or $integ.github.org $integ.github.gitRepo) }}
+  {{- /* Renders the fail when both blocks are set, before either is written. */}}
+  {{- $_ := include "kube-agents.gitProvider" . }}
+  {{- if or $gitSet $githubSet $integ.googleChat.enabled $integ.slack.enabled $integ.teams.enabled }}
   integration:
-    {{- if and $integ.github (or $integ.github.org $integ.github.gitRepo) }}
+    {{- if $gitSet }}
+    git:
+      provider: {{ $git.provider | default "github" | quote }}
+      {{- if $git.host }}
+      host: {{ $git.host | quote }}
+      {{- end }}
+      {{- if $git.repository }}
+      repository: {{ $git.repository | quote }}
+      {{- end }}
+      {{- if $git.namespace }}
+      namespace: {{ $git.namespace | quote }}
+      {{- end }}
+    {{- else if $githubSet }}
     github:
       {{- if $integ.github.org }}
       org: {{ $integ.github.org | quote }}

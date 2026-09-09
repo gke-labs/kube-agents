@@ -882,7 +882,7 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 		for _, se := range specEntries {
 			present := false
 			for _, ee := range existingEntries {
-				if ee.URL == se.URL {
+				if sameManagedRepo(ee, se) {
 					present = true
 					break
 				}
@@ -904,6 +904,45 @@ func (r *PlatformAgentReconciler) reconcileGitopsStateConfigMap(ctx context.Cont
 	}
 
 	return r.syncGithubTokenMinterConfigMap(ctx, agent, found.Data["managed_repos"])
+}
+
+// sameManagedRepo reports whether two managed_repos URLs name one repository.
+//
+// A string comparison is not enough across an upgrade. The operator used to
+// write an http(s) repository into this ConfigMap verbatim, so an install
+// configured with "https://www.github.com/o/r", an uppercase host, or a URL
+// carrying userinfo has that spelling on disk while the operator now seeds the
+// canonical "https://github.com/o/r". Comparing the strings would append a
+// second entry for the same repository: the agent would sweep it twice, and the
+// old spelling — credentials and all — would stay, since removal is
+// administrator-driven by design.
+//
+// Canonicalisation goes through the provider both entries name, so alternative
+// spellings of one host ("www.github.com") fold together. Entries of different
+// types, an unregistered type, and values the provider cannot resolve all fall
+// back to the string comparison rather than being treated as equal: this
+// ConfigMap is administrator-writable, so a value the operator does not
+// understand is one it must leave alone.
+func sameManagedRepo(existing, seeded agentv1alpha1.ManagedRepoEntry) bool {
+	if existing.URL == seeded.URL {
+		return true
+	}
+	if !strings.EqualFold(existing.Type, seeded.Type) {
+		return false
+	}
+	provider, err := agentv1alpha1.LookupGitProvider(seeded.Type)
+	if err != nil {
+		return false
+	}
+	existingRef, err := provider.Resolve("", existing.URL, "")
+	if err != nil {
+		return false
+	}
+	seededRef, err := provider.Resolve("", seeded.URL, "")
+	if err != nil {
+		return false
+	}
+	return existingRef == seededRef
 }
 
 func parseManagedKeysAnnotation(ann string) map[string]struct{} {
@@ -1005,16 +1044,13 @@ func (r *PlatformAgentReconciler) syncGithubTokenMinterConfigMap(ctx context.Con
 	}
 
 	primaryOrg := ""
-	if agent.Spec.Integration != nil && agent.Spec.Integration.GitHub != nil {
-		github := agent.Spec.Integration.GitHub
-		primaryOrg = strings.TrimSpace(github.Org)
-		if primaryOrg == "" && github.GitRepo != "" {
-			if cleaned, err := agentv1alpha1.CleanRepoSlug(github.GitRepo); err == nil {
-				parts := strings.SplitN(cleaned, "/", 2)
-				if len(parts) == 2 {
-					primaryOrg = parts[0]
-				}
-			}
+	if agent.Spec.Integration != nil {
+		// A declaration this cannot resolve leaves primaryOrg empty, which is the
+		// same outcome the per-field reads had for an unparseable GitRepo.
+		// Admission and the reconcile-status check both report it; the minter
+		// policy sync is not the place to surface it a third time.
+		if resolved, err := agent.Spec.Integration.ResolveGit(); err == nil {
+			primaryOrg = resolved.EffectiveNamespace()
 		}
 	}
 
@@ -2225,12 +2261,8 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	}
 
 	gitRepoErr := error(nil)
-	if agent.Spec.Integration != nil && agent.Spec.Integration.GitHub != nil {
-		if err := agentv1alpha1.ValidateGitHubOrg(agent.Spec.Integration.GitHub.Org); err != nil {
-			gitRepoErr = err
-		} else if err := agentv1alpha1.ValidateGitRepoURLWithOrg(agent.Spec.Integration.GitHub.GitRepo, agent.Spec.Integration.GitHub.Org); err != nil {
-			gitRepoErr = err
-		}
+	if agent.Spec.Integration != nil {
+		gitRepoErr = agent.Spec.Integration.ValidateGit()
 	}
 
 	managedReposErr := error(nil)
@@ -2251,9 +2283,13 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	if gitRepoErr != nil {
 		newPhase = "Degraded"
 		condStatus = metav1.ConditionFalse
+		// The reason string stays InvalidGitRepoURL: it is on the status of
+		// running resources and in tests, and renaming it would be a second,
+		// unrelated break. The message names the declaration rather than the
+		// two fields only the deprecated alias has.
 		condReason = conditionReasonInvalidGitRepoURL
 		degradedReason = conditionReasonInvalidGitRepoURL
-		condMsg = fmt.Sprintf("Invalid gitRepo URL or org (%s); GitOps disabled in config. Admission webhook will reject updates to this resource until corrected", gitRepoErr.Error())
+		condMsg = fmt.Sprintf("Invalid git integration (%s); GitOps disabled in config. Admission webhook will reject updates to this resource until corrected", gitRepoErr.Error())
 		degradedStatus = metav1.ConditionTrue
 	} else if managedReposErr != nil {
 		newPhase = "Degraded"

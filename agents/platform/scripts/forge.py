@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
-"""forge.py — the five forge operations this harness needs, behind one seam.
+"""forge.py — the forge operations this harness needs, behind one seam.
 
 Staged into `$HERMES_HOME/scripts` by the entrypoint's step 2b force-sync, so
 every skill script on the Platform Agent's `sys.path` can import it.
 
 What this is for
 ----------------
-Reading and answering a pull-request conversation needs exactly five things from
-a code-hosting service: who am I, which pull requests are open, what has been
-said on one, say something back, and acknowledge that a request was seen. Those
-five are the whole forge-shaped surface of the feature; everything above them —
-what counts as addressing the agent, who is allowed to, when a request has
-already been answered — is harness policy that does not change between forges.
+Reading and answering a pull-request conversation needs a handful of things from
+a code-hosting service, and the first seven methods of `ForgeProvider` below are
+the whole list: can I reach it, who am I, which pull requests are open, what has
+been said on one, what has landed on one, say something back, and acknowledge
+that a request was seen. Opening a change adds three more — create, update, and
+read back the pull request for a branch — which `submit-suggestion` needs and
+used to get by shelling `gh` itself at three call sites.
+
+Everything above those — what counts as addressing the agent, who is allowed to,
+when a request has already been answered, whether an existing pull request is a
+conflict or a resubmission — is harness policy that does not change between
+forges. The protocol grows one migrated consumer at a time rather than by
+copying an API surface; `docs/designs/multi-forge-support.md` §4 says why, and
+names the one consumer still to come (`resolver.py`).
 
 Splitting the two here is what makes a second forge a new class rather than a
 second copy of the sweep. It is *not* a claim that a second forge is cheap:
@@ -27,7 +35,7 @@ no GitHub token: `gh` is proxied to the credential sidecar, which is also why
 `ALLOWED_EXECUTABLES` is a closed list. Bitbucket has no comparable CLI, so a
 Bitbucket provider cannot shell anything at all — it needs a `/v1/<forge>/…`
 route on that sidecar. Funnelling every call through one override point means
-that provider replaces one method instead of reimplementing five.
+that provider replaces one method instead of reimplementing all of them.
 
 Three normalisations, and the forge that forced each
 ----------------------------------------------------
@@ -54,12 +62,18 @@ Three normalisations, and the forge that forced each
 
 On the repository parser
 ------------------------
-`_parse_repo` validates and normalizes repository slugs (`owner/repo`). `test_forge.py` verifies repository slug resolution.
+There is no longer one here. `repo_ref.py` parses every repository value this
+harness sees, and this module is one of its callers — see `provider_for`. The
+copy that used to live here read a configured `SETTINGS.md` line, which #504
+removed; it outlived its caller by a release, along with the parity test that
+held it level with a `resolver.py` function that is also gone.
 
-A second parser, `github_token_refresh.github_repo_from_remote`, reads the git
-remote rather than a configured value and rejects a non-GitHub host outright.
-Its host set carries `ssh.github.com` — GitHub's SSH-over-443 endpoint, which
-appears in a clone URL — so a remote of that form resolves there and not here.
+`github_token_refresh.github_repo_from_remote` reads the git remote rather than
+a configured value, and it now asks `repo_ref` the same question this module
+does. What separates the two is the host set each accepts, both declared in
+`repo_ref`: a remote may carry any of `GITHUB_HOSTS`, including
+`ssh.github.com`, GitHub's SSH-over-443 endpoint, which appears in a clone URL
+and nowhere a repository is configured.
 """
 
 from __future__ import annotations
@@ -72,6 +86,7 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional, Protocol, Sequence
 
+import repo_ref
 import sandbox_exec
 from github_token_refresh import (
     GH_MISSING_RC,
@@ -82,8 +97,6 @@ from github_token_refresh import (
 )
 
 LOGGER = logging.getLogger(__name__)
-
-SETTINGS_PATH = "/opt/data/SETTINGS.md"
 
 #: How long any single `gh` call may take. A hung proxy must not hold the cron
 #: tick's per-job lock open indefinitely.
@@ -113,20 +126,6 @@ AGENT_BRANCH_PREFIX = "platform-agent/"
 #: `github-issue-resolver` already honours on issues.
 IGNORE_LABEL = "agent:ignore"
 
-#: The operator writes this literal when no GitOps repo is configured
-#: (`buildSettingsConfigMap` in `platformagent_manifests.go`). It means absent,
-#: not malformed — a distinction the two callers branch on differently.
-SETTINGS_REPO_UNSET = "none"
-
-# Host must sit at the *start* of the value, after an optional scheme and
-# optional userinfo. Copied from resolver.py, whose comment explains why the
-# obvious spellings admit `https://evil.com/github.com/attacker/repo`.
-REPO_URL_RE = re.compile(
-    r"^(?:(?:https?|git|ssh)://)?(?:[^/@]+@)?(?:www\.)?github\.com[/:]"
-    r"([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)"
-)
-BARE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-
 #: `permission` values from `repos/{repo}/collaborators/{user}/permission` that
 #: carry the standing to direct the agent. GitHub collapses the `maintain` and
 #: `triage` roles into this legacy field, so `maintain` arrives as `write` and
@@ -147,6 +146,71 @@ VIEWER_RE = re.compile(r"Logged in to \S+ account (\S+)")
 #: retried even for read-only queries.
 DEFINITIVE_HTTP_STATUS_RE = re.compile(r"HTTP (?:401|403|404)\b", re.IGNORECASE)
 
+#: Reason code for a repository whose host has no provider registered. Named
+#: here beside the other operator-facing strings rather than inline in
+#: `UnknownForgeHost`, the way `RepoUnparseable` takes
+#: `repo_ref.REASON_UNPARSEABLE`. `_forge_warning` renders it verbatim.
+REASON_HOST_UNSUPPORTED = "FORGE_HOST_UNSUPPORTED"
+
+#: Reason code for "this branch already has an open change". Not an error to
+#: every caller: `submit-suggestion` treats it as the success case of a
+#: resubmission. See `PullRequestExists`.
+REASON_PULL_REQUEST_EXISTS = "PULL_REQUEST_EXISTS"
+
+#: Reason code for a forge that refused to open a change for a reason that is
+#: not "one is already open". Distinct from `REPO_UNREACHABLE` because by the
+#: time this can be raised the branch has just been pushed to that repository
+#: over the same credential, so the reachability reading is provably wrong and
+#: sends an operator to check the two things already known to work.
+REASON_PULL_REQUEST_REFUSED = "PULL_REQUEST_REFUSED"
+
+#: What `gh pr create` says when the branch already has an open pull request,
+#: matched case-insensitively against the merged output. Recognising the phrase
+#: is GitHub-shaped and so belongs to `GitHubProvider`; deciding that it is not
+#: a failure is harness policy and belongs to the caller.
+_PR_EXISTS_MARKER = "already exists"
+
+#: How much of a forge's complaint a `ForgeError` carries. The detail lands in
+#: a one-line operator-facing warning, so it is a line's worth and not a log.
+_DETAIL_CHARS = 200
+
+#: Reason code for a forge that refused a write the caller was entitled to make
+#: — a label that does not resolve, a comment the API rejected, a close the
+#: credential could not perform. Separate from `REPO_UNREACHABLE` for the reason
+#: `REASON_PULL_REQUEST_REFUSED` is: the caller has already read this repository
+#: over this credential, so "cannot reach it" is the one answer ruled out.
+REASON_WRITE_REFUSED = "FORGE_WRITE_REFUSED"
+
+#: How many changes `list_pull_requests` will accept before it refuses to answer.
+#: A truncated page is the worst possible reply — the changes past the ceiling
+#: read as "no change", so a caller re-opens fixes that already exist. Callers
+#: pass their own; this is the default for one that does not care.
+CHANGE_PAGE_LIMIT = 200
+
+#: The keys `list_pull_requests` puts on each row. They are the harness's
+#: vocabulary rather than GitHub's, even though GitHub is where the spellings
+#: came from: a second provider fills these in from whatever its own API calls
+#: them, and `audit_report.py` reads them without knowing which forge answered.
+#: Named here so the contract has one home — a provider implementing it and a
+#: caller reading it are otherwise agreeing by coincidence. Renaming them to
+#: something no forge already uses is deliberately not part of adding the second
+#: provider; see `docs/designs/multi-forge-support.md` §4.
+#: The keys `list_issues` projects, and so the fields `Issue` carries. Named
+#: for the reason `CHANGE_FIELDS` is named, and deliberately without `body`:
+#: `Issue` says why a listing must not carry one.
+ISSUE_FIELDS = ("number", "url", "title", "labels")
+
+CHANGE_FIELDS = (
+    "number",
+    "headRefName",
+    "state",
+    "mergedAt",
+    "closedAt",
+    "url",
+    "body",
+    "labels",
+)
+
 
 class ForgeError(Exception):
     """A fault with a machine-readable reason code.
@@ -164,15 +228,51 @@ class ForgeError(Exception):
 
 
 class RepoUnparseable(ForgeError):
-    """SETTINGS.md names a repository that could not be understood.
+    """A registered repository value that could not be understood.
 
     Distinct from absent on purpose. Configuring nothing is a supported install
     with no work to do; configuring something unreadable is a fault, and
     silence there means the watcher stops working and nobody finds out.
+
+    The parse itself lives in `repo_ref`, which raises a plain `ValueError`
+    because the credential sidecar imports it and must not import this module.
+    This is where that becomes a reason code an operator sees.
     """
 
     def __init__(self, value: str):
-        super().__init__("GIT_REPO_UNPARSEABLE", value)
+        super().__init__(repo_ref.REASON_UNPARSEABLE, value)
+
+
+class UnknownForgeHost(ForgeError):
+    """A repository on a host this harness has no provider for.
+
+    Raised rather than falling back to GitHub. The fallback is what would send
+    `gh` at a same-named GitHub repository on behalf of a GitLab URL, which is
+    a different repository belonging to somebody else.
+    """
+
+    def __init__(self, host: str):
+        super().__init__(REASON_HOST_UNSUPPORTED, host)
+
+
+class PullRequestExists(ForgeError):
+    """The head branch already has an open change.
+
+    A distinct type because it is the one forge refusal whose right handling
+    differs per caller. `submit-suggestion` gets here on every second round of
+    review feedback — the push has already landed by then, and reporting the
+    submission as failed is how the skill shipped exiting 1 for every card that
+    came back. Something opening a change for the first time would treat it as
+    a real conflict. The provider therefore reports the fact and says nothing
+    about what to do with it.
+
+    `value` is the refusal text, which for GitHub names the existing pull
+    request's URL.
+    """
+
+    def __init__(self, head: str, detail: str = ""):
+        super().__init__(REASON_PULL_REQUEST_EXISTS, detail or head)
+        self.head = head
 
 
 @dataclass(frozen=True)
@@ -248,8 +348,46 @@ class Commit:
     committed_at: str = ""
 
 
+@dataclass(frozen=True)
+class Issue:
+    """One issue, as the fleet audit's ledger needs to see it.
+
+    Exactly the fields `ISSUE_FIELDS` projects, and no body. A listing of
+    twenty ledger issues would carry twenty rendered audit reports, which is
+    both the largest thing the forge could send and the one thing no caller of
+    a listing wants; `issue_body` fetches one when one is needed.
+
+    Keeping the field off is not tidiness. It would be `""` on every row a
+    listing produced, and `""` is what a ledger with nothing in it looks like —
+    so a caller reading `issue.body` off a listing would conclude the ledger was
+    empty and announce every live finding as new. `issue_body` cannot make that
+    mistake: it raises rather than returning `""` when the read fails, because
+    "the ledger is empty" and "the ledger could not be read" lead to opposite
+    decisions.
+
+    Everything but `number` still defaults, so a forge that omits a field
+    produces a usable row rather than an exception.
+    """
+
+    number: int
+    url: str = ""
+    title: str = ""
+    labels: tuple[str, ...] = ()
+
+
 class ForgeProvider(Protocol):
-    """The complete forge-shaped surface of the PR-conversation feature."""
+    """The forge-shaped surface this harness needs.
+
+    Three groups, in the order they were needed. The first seven are the
+    PR-conversation feature — reading a review thread and answering it. The next
+    three open a change, which `submit-suggestion` needs. The rest are the fleet
+    audit's ledger: issues, labels, and the bulk reads that let it work out which
+    of its own pull requests are still justified.
+
+    The list grows by migration, not by copying a forge's API surface: see
+    `docs/designs/multi-forge-support.md` §4. Every method here exists because a
+    caller in this repository had a `gh` invocation that had to stop being one.
+    """
 
     #: False on a forge with no reaction API (Bitbucket Cloud), so a caller can
     #: skip the acknowledgement rather than discover it fails.
@@ -268,6 +406,138 @@ class ForgeProvider(Protocol):
     def acknowledge(self, repo: str, comment: Comment) -> bool: ...
 
     def list_commits(self, repo: str, pr: PullRequest) -> list[Commit]: ...
+
+    def create_pull_request(
+        self,
+        repo: str,
+        *,
+        head: str,
+        base: str,
+        title: str,
+        body: str,
+        labels: Sequence[str] = (),
+    ) -> str: ...
+
+    def update_pull_request(
+        self,
+        repo: str,
+        *,
+        head: str = "",
+        number: int = 0,
+        title: str,
+        body: str,
+    ) -> None: ...
+
+    def pull_request_url(self, repo: str, *, head: str) -> str: ...
+
+    # -- the audit ledger ---------------------------------------------------- #
+    #
+    # `ensure_label` before anything that applies one: on GitHub a label has to
+    # exist on the repository before it can be attached, and the attach call
+    # reports a missing name as a failure of the whole edit rather than of the
+    # one label.
+
+    def ensure_label(
+        self, repo: str, *, name: str, color: str, description: str
+    ) -> None: ...
+
+    def list_issues(
+        self,
+        repo: str,
+        *,
+        labels: Sequence[str] = (),
+        state: str = "open",
+        limit: int = CHANGE_PAGE_LIMIT,
+    ) -> list[Issue]: ...
+
+    def issue_body(self, repo: str, number: int) -> str: ...
+
+    def issue_url(self, repo: str, number: int) -> str: ...
+
+    def issue_comments(self, repo: str, number: int) -> list[dict]: ...
+
+    def create_issue(
+        self, repo: str, *, title: str, body: str, labels: Sequence[str] = ()
+    ) -> str: ...
+
+    def update_issue(
+        self, repo: str, number: int, *, title: str = "", body: str
+    ) -> None: ...
+
+    def comment_on_issue(self, repo: str, number: int, *, body: str) -> None: ...
+
+    def close_issue(self, repo: str, number: int, *, reason: str = "") -> None: ...
+
+    def set_issue_labels(
+        self, repo: str, number: int, *, add: Sequence[str] = (), remove: Sequence[str] = ()
+    ) -> None: ...
+
+    def list_pull_requests(
+        self,
+        repo: str,
+        *,
+        labels: Sequence[str] = (),
+        state: str = "open",
+        limit: int = CHANGE_PAGE_LIMIT,
+    ) -> list[dict]: ...
+
+    def pull_request_comments(self, repo: str, number: int) -> list[dict]: ...
+
+    def comment_on_pull_request(
+        self, repo: str, number: int, *, body: str
+    ) -> None: ...
+
+    def set_pull_request_labels(
+        self,
+        repo: str,
+        change: int | str,
+        *,
+        add: Sequence[str] = (),
+        remove: Sequence[str] = (),
+    ) -> None: ...
+
+    def close_pull_request(self, repo: str, number: int) -> None: ...
+
+
+def _label_flags(flag: str, names: Sequence[str]) -> list[str]:
+    """`["--label", "a", "--label", "b"]` — one repeated flag per name.
+
+    Blank names are dropped rather than passed through. A caller assembling a
+    list from optional pieces otherwise sends `--label ""`, which GitHub answers
+    with a 422 that fails the *whole* call: the labels that were valid go on
+    nothing, and on a create path the change is not opened at all.
+    """
+    return [part for name in names if name for part in (flag, str(name))]
+
+
+def _last_line(text: Optional[str]) -> str:
+    """The last non-blank line, which is where a URL a forge printed will be.
+
+    Not the whole of stdout. `gh` puts a version notice, a credential-refresh
+    line, or a "Warning: … " on the same stream as the address it just created,
+    and a caller that stored all of it records a link nobody can follow — into
+    an issue body, where it outlives the run that wrote it.
+    """
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    return lines[-1] if lines else ""
+
+
+def _selector(*, head: str = "", number: int = 0) -> str:
+    """How `gh` is told which change to act on: a branch name or a number.
+
+    `gh` accepts either in the same argument position, so the choice is the
+    caller's and this only enforces that exactly one arrived. Both or neither is
+    a programming error rather than a forge failure, so it raises `ValueError`
+    and not `ForgeError` — a caller that catches the latter to log and continue
+    would otherwise swallow a bug into a warning.
+    """
+    if head and number:
+        raise ValueError("name the change by head or by number, not both")
+    if head:
+        return head
+    if number:
+        return str(number)
+    raise ValueError("name the change by head or by number")
 
 
 def normalise_login(login: str) -> str:
@@ -328,35 +598,6 @@ def is_agent_pull_request(pr: PullRequest, repo: str, viewer: str) -> bool:
         and pr.head_ref.startswith(AGENT_BRANCH_PREFIX)
         and pr.head_repo.lower() == repo.lower()
     )
-
-
-def _valid_repo_component(part: str) -> bool:
-    """Reject path components unsafe to hand to `gh -R`.
-
-    The slug pattern permits "." and "-", so it happily produces "../..", and a
-    leading dash is parsed by `gh` as a flag. Neither is a shape the regex can
-    express.
-    """
-    return bool(part) and part not in (".", "..") and not part.startswith("-")
-
-
-def _parse_repo(configured: str) -> str:
-    """`owner/name` from a configured value, or raise `RepoUnparseable`."""
-    match = REPO_URL_RE.search(configured)
-    if match:
-        repo = match.group(1)
-    elif BARE_REPO_RE.match(configured):
-        repo = configured
-    else:
-        raise RepoUnparseable(configured)
-
-    repo = re.sub(r"\.git$", "", repo)
-    owner, _, name = repo.partition("/")
-    # After the shorthand branch, not instead of it: "../.." satisfies
-    # BARE_REPO_RE, so this is what rejects it.
-    if not _valid_repo_component(owner) or not _valid_repo_component(name):
-        raise RepoUnparseable(configured)
-    return repo
 
 
 def _should_retry_transient(result: subprocess.CompletedProcess) -> bool:
@@ -490,6 +731,7 @@ class GitHubProvider:
         expect_json: bool = True,
         retry_transient: bool = False,
         stdin: str | None = None,
+        check: bool = True,
     ):
         """Every forge round trip goes through here. See the module docstring.
 
@@ -508,6 +750,14 @@ class GitHubProvider:
 
         `stdin` carries a document to a command that names `-` as its input
         file; it reaches `gh` in the sandbox, which is the only pod that has one.
+
+        `check=False` hands the raw result back instead, for the one caller
+        where the exit code is an answer rather than a failure — see
+        `create_pull_request`. It is a parameter rather than a second path to
+        the runner because the module docstring's invariant is that a provider
+        talking to a `/v1/<forge>/…` route replaces this method and nothing
+        else; a method reaching `self._run` directly would silently keep
+        shelling `gh` under such a provider.
         """
         result = self._run(list(argv), repo=repo, stdin=stdin)
         if (
@@ -516,8 +766,10 @@ class GitHubProvider:
             and _should_retry_transient(result)
         ):
             result = self._run(list(argv), repo=repo, stdin=stdin)
+        if not check:
+            return result
         if result.returncode != 0:
-            raise ForgeError("REPO_UNREACHABLE", (result.stderr or "").strip()[:200])
+            raise ForgeError("REPO_UNREACHABLE", (result.stderr or "").strip()[:_DETAIL_CHARS])
         if not expect_json:
             return None
         text = (result.stdout or "").strip()
@@ -816,21 +1068,502 @@ class GitHubProvider:
             commits.append(Commit(sha=sha, committed_at=str(committer.get("date", ""))))
         return commits
 
+    # -- opening a change --------------------------------------------------
+    def create_pull_request(
+        self,
+        repo: str,
+        *,
+        head: str,
+        base: str,
+        title: str,
+        body: str,
+        labels: Sequence[str] = (),
+    ) -> str:
+        """Open a pull request from `head` into `base`, returning its URL.
 
-#: Host substring -> provider. One entry today; the point of the table is that
-#: adding a second is a registration rather than a branch in the sweep.
-PROVIDERS: dict[str, type] = {"github.com": GitHubProvider}
+        Raises `PullRequestExists` when the branch already has an open one. That
+        refusal arrives *after* the push has landed, so the caller has to be
+        able to tell it from a real failure — a protected base, a credential
+        without permission — and only the text distinguishes them.
+
+        This is the one caller of `_call(check=False)` — the exit code is an
+        answer here rather than a failure — but it still goes through `_call`,
+        so a provider that replaces that method replaces this one's transport
+        too.
+
+        Any other refusal raises `PULL_REQUEST_REFUSED` rather than
+        `REPO_UNREACHABLE`: the push has just succeeded against this repository
+        over this credential, so reachability is the one explanation already
+        ruled out. The detail carries the exit code and both streams, because
+        `gh` puts a protected-base rejection on stdout and the credential
+        proxy's block message on stderr.
+
+        `labels` are applied in this call rather than a following one so a
+        pull request is never briefly visible without the labels that say what
+        it is — the fleet audit's close-semantics rule reads them, and a run
+        that crashed between the two calls would leave a change no later run
+        could classify. Every name must already exist on the repository;
+        `ensure_label` says why and what happens when one does not.
+
+        The body travels on stdin, for the reason `post_comment` sets out: since
+        #913 the caller, the sandbox and the broker are three containers with
+        three filesystems, so `--body-file <path>` names a file that only one of
+        them can open. `-R` is always passed, so the call does not depend on the
+        process being inside a clone of `repo` either.
+        """
+        result = self._call(
+            [
+                "pr", "create",
+                "-R", repo,
+                "--base", base,
+                "--head", head,
+                "--title", title,
+                "--body-file", BODY_STDIN,
+                *_label_flags("--label", labels),
+            ],
+            repo=repo,
+            stdin=body,
+            check=False,
+        )
+        if result.returncode != 0:
+            merged = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
+            if _PR_EXISTS_MARKER in merged.lower():
+                raise PullRequestExists(head, merged[:_DETAIL_CHARS])
+            raise ForgeError(
+                REASON_PULL_REQUEST_REFUSED,
+                f"exit {result.returncode}: {merged}"[:_DETAIL_CHARS],
+            )
+        url = _last_line(result.stdout)
+        if url:
+            return url
+        # A `gh` that printed nothing still opened the pull request, so a failed
+        # read-back must not turn that success into a reported failure. The
+        # caller re-pushing on a false failure is the wasted round this avoids.
+        try:
+            return self.pull_request_url(repo, head=head)
+        except ForgeError:
+            return ""
+
+    def update_pull_request(
+        self,
+        repo: str,
+        *,
+        head: str = "",
+        number: int = 0,
+        title: str,
+        body: str,
+    ) -> None:
+        """Point an open pull request at the work just pushed.
+
+        Named by `head` or by `number`, because the two callers hold different
+        halves. `submit-suggestion` has just pushed a branch and has never read
+        the pull request, so a branch name is all it can offer; the fleet audit
+        arrives from a listing and holds the number. Resolving both here rather
+        than making one caller look the other up keeps a round trip out of the
+        path that does not need it.
+
+        Title and body as well as commits: a resubmission's description was
+        written for the commits it is pushing now, and leaving the old one in
+        place describes work the branch no longer contains.
+
+        On stdin, for the reason `create_pull_request` gives.
+        """
+        self._call(
+            [
+                "pr", "edit", _selector(head=head, number=number),
+                "-R", repo,
+                "--title", title,
+                "--body-file", BODY_STDIN,
+            ],
+            repo=repo,
+            expect_json=False,
+            stdin=body,
+        )
+
+    def pull_request_url(self, repo: str, *, head: str) -> str:
+        """The open pull request's address for `head`.
+
+        A branch with no open pull request is a `ForgeError`, not `""` — `gh pr
+        view` exits non-zero for it and `_call` raises. `""` is reserved for the
+        narrower case of an answer that parsed but carried no `url`, which is a
+        forge that replied strangely rather than a branch with nothing open.
+
+        `--json url` rather than `--jq`: the projection is one field either way,
+        and reading it here keeps the parse in Python where a malformed answer
+        raises `FORGE_RESPONSE_UNREADABLE` instead of arriving as an empty
+        string.
+        """
+        row = self._call(["pr", "view", head, "-R", repo, "--json", "url"])
+        if not isinstance(row, dict):
+            return ""
+        return str(row.get("url") or "")
+
+    # -- the audit ledger ---------------------------------------------------
+    def _write(self, argv: Sequence[str], *, stdin: str | None = None) -> None:
+        """A call made for its effect, refusing with `FORGE_WRITE_REFUSED`.
+
+        Not `_call(expect_json=False)`, whose failure is `REPO_UNREACHABLE`.
+        Every caller of this has already read the repository over the same
+        credential in the same run, so unreachability is the one explanation
+        ruled out and naming it sends an operator to check the network when the
+        answer is a 422 about a label. The detail carries the exit code and both
+        streams for the reason `create_pull_request` gives: `gh` splits a policy
+        refusal and a proxy block across stdout and stderr.
+
+        `stdin` is how every body reaches `gh`, paired with `--body-file -`;
+        `create_pull_request` says why a path cannot be.
+        """
+        result = self._call(argv, check=False, stdin=stdin)
+        if result.returncode == 0:
+            return
+        merged = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
+        raise ForgeError(
+            REASON_WRITE_REFUSED, f"exit {result.returncode}: {merged}"[:_DETAIL_CHARS]
+        )
+
+    def _view(self, kind: str, number: int, repo: str, field: str) -> dict:
+        """One projected field off one issue or pull request.
+
+        `{}` for an answer that parsed but was not an object. A failed read
+        raises out of `_call` instead — the distinction matters to every caller
+        here, because "the forge sent something odd" and "the forge did not
+        answer" are the difference between degrading and stopping.
+        """
+        row = self._call([kind, "view", str(number), "-R", repo, "--json", field])
+        return row if isinstance(row, dict) else {}
+
+    def ensure_label(
+        self, repo: str, *, name: str, color: str, description: str
+    ) -> None:
+        """Create the label, or update it in place when it is already there.
+
+        Every label the harness applies has to be created first: a label that
+        does not exist on the repository is not created by the call that
+        attaches it, which resolves the name to an id and fails — and it fails
+        the *whole* edit, so one missing name loses the other five labels too.
+
+        `--force` makes this idempotent, which is what lets it run at the top of
+        every path rather than once at install time. It also repairs a colour or
+        description someone changed by hand, and that is load-bearing rather
+        than tidy: the description has a length ceiling, and a label whose
+        description exceeded it never came into existence at all while the calls
+        that applied it went on reporting success.
+        """
+        self._write(
+            [
+                "label", "create", name,
+                "-R", repo,
+                "--color", color,
+                "--description", description,
+                "--force",
+            ]
+        )
+
+    def list_issues(
+        self,
+        repo: str,
+        *,
+        labels: Sequence[str] = (),
+        state: str = "open",
+        limit: int = CHANGE_PAGE_LIMIT,
+    ) -> list[Issue]:
+        """Issues carrying every one of `labels`, lowest number first.
+
+        Sorted here so a caller choosing between duplicates does not have to
+        trust the forge's order. Which end of that list to take is the caller's
+        rule, not this one's — see `audit_report.find_existing_issue`.
+
+        `limit` truncates silently on GitHub, so a caller that cannot tolerate a
+        short answer compares the length against the ceiling it passed. This
+        does not do it for them: for the audit's ledger lookup a truncated page
+        is a warning about duplicates, and for its pull-request listing it is a
+        refusal to run at all.
+        """
+        rows = self._call(
+            [
+                "issue", "list",
+                "-R", repo,
+                *_label_flags("--label", labels),
+                "--state", state,
+                "--json", ",".join(ISSUE_FIELDS),
+                "--limit", str(limit),
+            ]
+        )
+        if not isinstance(rows, list):
+            return []
+        return sorted(
+            (_issue_from_row(row) for row in rows if isinstance(row, dict)),
+            key=lambda issue: issue.number,
+        )
+
+    def issue_body(self, repo: str, number: int) -> str:
+        """The issue's body text. `""` means empty, never unreadable.
+
+        A read that fails raises, because the fleet audit diffs this against the
+        findings it just gathered: an unreadable ledger read as an empty one
+        announces every live finding as new, every morning, to everyone watching
+        the repository.
+        """
+        return str(self._view("issue", number, repo, "body").get("body") or "")
+
+    def issue_url(self, repo: str, number: int) -> str:
+        return str(self._view("issue", number, repo, "url").get("url") or "")
+
+    def issue_comments(self, repo: str, number: int) -> list[dict]:
+        """Comments on the issue, as the forge sent them.
+
+        Dictionaries rather than `Comment`, and that is a gap rather than a
+        design. `Comment` does not carry `authorAssociation` or
+        `viewerDidAuthor`, and `audit_report.is_machine_author` needs both to
+        keep the automation from issuing itself a `/remediate` — a security
+        control, so widening the dataclass and moving this onto it is its own
+        change rather than a rider on this one. Until then a second provider has
+        to produce GitHub's comment shape here, which
+        `docs/designs/multi-forge-support.md` §4 records as outstanding.
+        """
+        rows = self._view("issue", number, repo, "comments").get("comments") or []
+        return [row for row in rows if isinstance(row, dict)]
+
+    def create_issue(
+        self, repo: str, *, title: str, body: str, labels: Sequence[str] = ()
+    ) -> str:
+        """Open an issue, returning its URL.
+
+        The URL is the last non-blank line `gh` printed rather than the whole of
+        stdout, because a credential refresh or a version notice arrives on the
+        same stream and a caller that stored all of it would record a link
+        nobody can follow.
+        """
+        result = self._call(
+            [
+                "issue", "create",
+                "-R", repo,
+                "--title", title,
+                "--body-file", BODY_STDIN,
+                *_label_flags("--label", labels),
+            ],
+            stdin=body,
+            check=False,
+        )
+        if result.returncode != 0:
+            merged = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
+            raise ForgeError(
+                REASON_WRITE_REFUSED,
+                f"exit {result.returncode}: {merged}"[:_DETAIL_CHARS],
+            )
+        return _last_line(result.stdout)
+
+    def update_issue(
+        self, repo: str, number: int, *, title: str = "", body: str
+    ) -> None:
+        """Rewrite the issue's body, and its title when one is given.
+
+        An empty `title` leaves the existing one alone rather than clearing it.
+        The audit needs both spellings: the run that rewrites the ledger sets a
+        title carrying the finding counts, and the second pass that re-links the
+        pull requests it has just opened must not touch it — those counts were
+        correct when they were written and re-deriving them from a body written
+        for a different purpose would be worse than leaving them.
+        """
+        self._write(
+            [
+                "issue", "edit", str(number),
+                "-R", repo,
+                *(["--title", title] if title else []),
+                "--body-file", BODY_STDIN,
+            ],
+            stdin=body,
+        )
+
+    def comment_on_issue(self, repo: str, number: int, *, body: str) -> None:
+        self._write(
+            ["issue", "comment", str(number), "-R", repo, "--body-file", BODY_STDIN],
+            stdin=body,
+        )
+
+    def close_issue(self, repo: str, number: int, *, reason: str = "") -> None:
+        """Close the issue, optionally saying why.
+
+        `reason` is passed through rather than interpreted. On GitHub the two
+        spellings are `completed` and `not planned`, and which one a close
+        carries is the caller's assertion about its own work: a closed audit
+        ledger means the fleet is clean, and "not planned" would say the report
+        was rejected.
+        """
+        self._write(
+            [
+                "issue", "close", str(number),
+                "-R", repo,
+                *(["--reason", reason] if reason else []),
+            ]
+        )
+
+    def set_issue_labels(
+        self,
+        repo: str,
+        number: int,
+        *,
+        add: Sequence[str] = (),
+        remove: Sequence[str] = (),
+    ) -> None:
+        """Add and remove labels in one call, or do nothing when given neither.
+
+        One call, so a name that does not resolve applies *none* of them. That
+        is the right trade against a half-labelled change — the audit reads
+        these labels as a set and a partial one is a state it has no rule for —
+        but it is only safe if the caller says something when it fails.
+
+        Removing a label the change does not carry is not an error on GitHub;
+        only a label the *repository* does not have is. So a caller can name the
+        full set it wants gone without first reading what is there.
+        """
+        flags = [*_label_flags("--add-label", add), *_label_flags("--remove-label", remove)]
+        if not flags:
+            return
+        self._write(["issue", "edit", str(number), "-R", repo, *flags])
+
+    def list_pull_requests(
+        self,
+        repo: str,
+        *,
+        labels: Sequence[str] = (),
+        state: str = "open",
+        limit: int = CHANGE_PAGE_LIMIT,
+    ) -> list[dict]:
+        """Pull requests carrying every one of `labels`, with `CHANGE_FIELDS`.
+
+        Dictionaries rather than `PullRequest`, because the caller reads
+        `mergedAt` and `closedAt` and a body it parses for a hidden block, none
+        of which that dataclass carries. `CHANGE_FIELDS` is the contract in the
+        meantime and says what a second provider owes.
+
+        `state` reaches the forge unread. `all` is what the audit passes and it
+        matters: a merged pull request whose finding still reproduces is a state
+        the report has to show, and a closed one is what stops the harness
+        re-opening a fix a human rejected.
+
+        Truncation is the caller's to detect, and it must: the pull requests
+        past the ceiling read as "no pull request", so the harness re-opens
+        fixes that already exist. Compare the length against the `limit` you
+        passed.
+        """
+        rows = self._call(
+            [
+                "pr", "list",
+                "-R", repo,
+                *_label_flags("--label", labels),
+                "--state", state,
+                "--json", ",".join(CHANGE_FIELDS),
+                "--limit", str(limit),
+            ]
+        )
+        if not isinstance(rows, list):
+            return []
+        return [row for row in rows if isinstance(row, dict)]
+
+    def pull_request_comments(self, repo: str, number: int) -> list[dict]:
+        """Comments on the pull request, as the forge sent them.
+
+        Dictionaries for the reason `issue_comments` gives.
+        """
+        rows = self._view("pr", number, repo, "comments").get("comments") or []
+        return [row for row in rows if isinstance(row, dict)]
+
+    def comment_on_pull_request(
+        self, repo: str, number: int, *, body: str
+    ) -> None:
+        """`post_comment` by number rather than by `PullRequest`.
+
+        The two exist side by side because their callers hold different things:
+        the conversation sweep has read the pull request and has the object, the
+        audit has a number off a listing and never builds one.
+        """
+        self._write(
+            ["pr", "comment", str(number), "-R", repo, "--body-file", BODY_STDIN],
+            stdin=body,
+        )
+
+    def set_pull_request_labels(
+        self,
+        repo: str,
+        change: int | str,
+        *,
+        add: Sequence[str] = (),
+        remove: Sequence[str] = (),
+    ) -> None:
+        """`set_issue_labels` against a pull request. The same rules apply.
+
+        `change` is a number or a head branch, the two things `gh pr edit`
+        accepts in that position — the same latitude `update_pull_request` has,
+        and for the same caller. A change adopted after `create_pull_request`
+        refused it is known by its branch and nothing else at that moment, and
+        labelling it is not optional: the fleet audit finds its own pull
+        requests by label, so one it opened and did not label is one no later
+        run can see.
+        """
+        flags = [*_label_flags("--add-label", add), *_label_flags("--remove-label", remove)]
+        if not flags:
+            return
+        self._write(["pr", "edit", str(change), "-R", repo, *flags])
+
+    def close_pull_request(self, repo: str, number: int) -> None:
+        """Close without deleting the branch.
+
+        Never `--delete-branch`. The audit closes a pull request when the
+        finding behind it stopped reproducing, and a finding that comes back is
+        pushed to the same branch again — deleting it turns a reopen into a
+        fresh pull request that has lost the review history.
+        """
+        self._write(["pr", "close", str(number), "-R", repo])
+
+
+def _issue_from_row(row: dict) -> Issue:
+    """One `gh issue list` row as an `Issue`.
+
+    Tolerant on the way in: a row missing `number` becomes 0 rather than
+    raising, because the alternative is one malformed entry costing the caller
+    the whole listing.
+    """
+    labels = row.get("labels") or []
+    return Issue(
+        number=int(row.get("number") or 0),
+        url=str(row.get("url") or ""),
+        title=str(row.get("title") or ""),
+        labels=tuple(
+            str(label.get("name") or "") if isinstance(label, dict) else str(label)
+            for label in labels
+        ),
+    )
+
+
+#: Host -> provider, keyed on the parsed host and matched exactly. One forge
+#: today; the point of the table is that adding a second is a registration
+#: rather than a branch in the sweep.
+PROVIDERS: dict[str, type] = {host: GitHubProvider for host in repo_ref.GITHUB_HOSTS}
 
 
 def provider_for(repo: Optional[str] = None, **kwargs) -> ForgeProvider:
-    """Pick a provider from the host in repo or default to GitHub.
+    """Pick a provider from the host in `repo`, or GitHub when it names none.
 
     A bare `owner/repo` — which the operator accepts and writes through
     verbatim — names no host, so it means GitHub: that shorthand is `gh -R`'s
-    own form and no other forge shares it.
+    own form and no other forge shares it. A host this harness does not have a
+    provider for raises rather than falling back, because the fallback is what
+    turns a GitLab URL into GitHub calls against a same-named repository.
+
+    The host is compared after parsing, never searched for: the substring test
+    this replaced selected `GitHubProvider` for
+    `https://example.invalid/github.com/o/r`.
     """
-    lowered = (repo or "").lower()
-    for host, cls in PROVIDERS.items():
-        if host in lowered:
-            return cls(**kwargs)
-    return GitHubProvider(**kwargs)
+    if not repo:
+        return GitHubProvider(**kwargs)
+    try:
+        ref = repo_ref.parse(repo)
+    except repo_ref.RepoRefError as error:
+        raise RepoUnparseable(str(repo)) from error
+    if not ref.host:
+        return GitHubProvider(**kwargs)
+    provider = PROVIDERS.get(ref.host)
+    if provider is None:
+        raise UnknownForgeHost(ref.host)
+    return provider(**kwargs)

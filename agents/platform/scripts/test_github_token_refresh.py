@@ -109,6 +109,36 @@ class GitHubTokenRefreshTest(unittest.TestCase):
             refresh_git_credentials("invalid-repo-no-slash")
         self.assertIn("Could not identify target repository", str(cm.exception))
 
+    def test_refresh_git_credentials_refuses_a_host_shaped_repository(self):
+        """The slug gate, not a slash count.
+
+        The check this replaced counted separators, so every value here passed
+        it and reached the Minty branch below, which splits on the first slash
+        and posts the left half as an org name: `github.com/acme` would have
+        been minted for an org called `github.com`. Nothing downstream of that
+        branch validates, so these have to fail here or not at all.
+
+        `" acme/toolkit "` is deliberately absent: the line above the gate
+        strips whitespace and slashes and it is the *stripped* value that goes
+        on to the broker, so normalising it there is safe. What is not safe is
+        normalising and then posting the original, which is why
+        `credential_proxy` gets the strict predicate.
+        """
+        for repository in (
+            "github.com/acme",
+            "www.github.com/acme",
+            "ssh.github.com/acme",
+            "acme/..",
+            "acme/-toolkit",
+            "acme/toolkit.git",
+        ):
+            with self.subTest(repository=repository):
+                with self.assertRaises(RuntimeError) as cm:
+                    refresh_git_credentials(repository)
+                self.assertIn(
+                    "Could not identify target repository", str(cm.exception)
+                )
+
     @patch("github_token_refresh.subprocess.run")
     @patch("github_token_refresh.urllib.request.urlopen")
     def test_sandbox_delegates_without_receiving_token(self, urlopen, run):
