@@ -22,11 +22,26 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/cache"
+)
+
+const (
+	// forbiddenRetryInterval is how long an informer whose Event list the API
+	// server refused with 403 Forbidden waits before trying again. A 403 is a
+	// permission the identity does not hold, and permissions change on the
+	// order of minutes when someone edits an IAM binding or a RoleBinding —
+	// not on the sub-second cadence the reflector's default backoff assumes
+	// for a flapping connection. That backoff caps at 30 seconds, so a fleet
+	// where every cluster refuses the list is a list request and three log
+	// lines per cluster every few seconds, for the life of the process. The
+	// informer is kept, not stopped: a cluster whose permission is granted
+	// during the hold is picked up on the next attempt, with no restart.
+	forbiddenRetryInterval = 10 * time.Minute
 )
 
 // eventDispatcher represents the callback target for processed events.
@@ -50,6 +65,9 @@ type watcher struct {
 	dispatcher   eventDispatcher
 	cluster      targetCluster
 	resyncPeriod time.Duration
+	// forbiddenHold is the wait applied by handleWatchError after a 403; it is
+	// forbiddenRetryInterval everywhere except tests, which shorten it.
+	forbiddenHold time.Duration
 }
 
 // newWatcher constructs a watcher. resyncPeriod == 0 disables the
@@ -58,10 +76,11 @@ type watcher struct {
 // cadence — usually not what you want, so default 0 in main.go.
 func newWatcher(client kubernetes.Interface, dispatcher eventDispatcher, cluster targetCluster, resyncPeriod time.Duration) *watcher {
 	return &watcher{
-		client:       client,
-		dispatcher:   dispatcher,
-		cluster:      cluster,
-		resyncPeriod: resyncPeriod,
+		client:        client,
+		dispatcher:    dispatcher,
+		cluster:       cluster,
+		resyncPeriod:  resyncPeriod,
+		forbiddenHold: forbiddenRetryInterval,
 	}
 }
 
@@ -104,6 +123,11 @@ func (w *watcher) Run(ctx context.Context, onSynced func()) error {
 	if err != nil {
 		return fmt.Errorf("watcher: register event handler: %w", err)
 	}
+	// Must be registered before factory.Start: the informer refuses a handler
+	// once it is running.
+	if err := eventInformer.SetWatchErrorHandlerWithContext(w.handleWatchError); err != nil {
+		return fmt.Errorf("watcher: register watch error handler: %w", err)
+	}
 	// Report client-go's internal errors ("unknown object type in
 	// cache" on shutdown, where cache.HandleCrash trips over
 	// ctx.Done races) through our logger too. Note this appends to
@@ -141,6 +165,36 @@ func (w *watcher) Run(ctx context.Context, onSynced func()) error {
 	}
 	<-ctx.Done()
 	return nil
+}
+
+// handleWatchError is the informer's watch error handler. The reflector calls
+// it synchronously from its retry loop, after a list or watch failed and
+// before the backoff that precedes the next attempt, so time spent in here is
+// added to the retry interval. That is the lever this uses: a 403 Forbidden
+// holds the reflector for forbiddenHold, or until the informer is stopped,
+// whichever comes first, and every other error goes to the default handler
+// unchanged and retries on the default backoff. The reflector wraps the list
+// error with %w, so apierrors.IsForbidden sees the StatusError through it; a
+// client-go that stopped wrapping would fall back to the default path, which
+// is the pre-hold behaviour rather than a new failure.
+//
+// One log line per attempt, and the default handler is skipped for the 403 so
+// klog's "Failed to watch" and the runtime.ErrorHandlers echo of it stay quiet
+// too. Nothing else changes: the informer never syncs during the hold, so
+// cluster_up stays 0 and WaitForCacheSync in Run stays blocked, and the
+// no-cluster-synced exit in main.go still fires when every cluster is held.
+func (w *watcher) handleWatchError(ctx context.Context, r *cache.Reflector, err error) {
+	if !apierrors.IsForbidden(err) {
+		cache.DefaultWatchErrorHandler(ctx, r, err)
+		return
+	}
+	log.Printf("watcher: [%s] events forbidden, holding %s before the next attempt: %v", w.cluster.Name, w.forbiddenHold, err)
+	hold := time.NewTimer(w.forbiddenHold)
+	defer hold.Stop()
+	select {
+	case <-ctx.Done():
+	case <-hold.C:
+	}
 }
 
 // dispatch converts a *corev1.Event to the internal TriageEvent
