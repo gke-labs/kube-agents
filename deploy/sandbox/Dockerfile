@@ -287,6 +287,12 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          to read; stdlib only, and nothing in it is agent-pod-bound
 #   cluster_preflight.sh   the Cluster Agent's first command on every kanban task
 #                          (agents/cluster/SOUL.md); its kubectl is a proxy wrapper
+#   stall_report.py        the Cluster Agent's gke-stall-detection detector; stdlib
+#                          only, and its kubectl reads go through the same wrapper.
+#                          Here rather than in the skill bundle because the cluster
+#                          skill trees are not staged in this image (see
+#                          deploy/sandbox/entrypoint.sh: everything agents/cluster
+#                          names is under /opt/data/scripts)
 #
 # agents/platform/scripts/test_sandbox_delivery.py holds this list to the agents'
 # instructions: a skill that starts calling a shared script the sandbox does not
@@ -310,6 +316,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/workspace_paths.py \
      agents/platform/scripts/gke_endpoint.py \
      agents/platform/scripts/cluster_preflight.sh \
+     agents/platform/scripts/stall_report.py \
      /opt/defaults/scripts/
 COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/cluster_agent_profile.py
 COPY --chmod=0755 deploy/sandbox/agent-pod-only-stub.py /opt/defaults/scripts/cluster_agent_reconcile.py
