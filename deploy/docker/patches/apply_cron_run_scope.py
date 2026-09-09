@@ -2,7 +2,7 @@
 """Wire tools/cron_run_scope.py into the Hermes source tree.
 
 Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. Two AST locators
-and ten anchored string replacements across three files is past the point
+and fifteen anchored string replacements across four files is past the point
 where an inline ``python3 -c`` stays readable, so the edits live here — but the
 guarantee is the same as the other patches in the Dockerfile: every anchor must
 be found the number of times expected, every edited file must still parse, and
@@ -68,6 +68,47 @@ SCHEDULER_DELEGATE_PATCHED = SCHEDULER_DELEGATE + "                outcome=outco
 #: from one this has already run against, and a second pass would append a
 #: second ``outcome=None``.
 SCHEDULER_PATCHED_MARKER = 'outcome["response"] = final_response'
+
+SCHEDULER_RUN_JOB = (
+    "        _deferred_agents: list = []\n"
+    "        try:\n"
+    "            if fire_claim_lost is None:\n"
+    "                success, output, final_response, error = run_job(\n"
+    "                    job,\n"
+    "                    defer_agent_teardown=_deferred_agents,\n"
+    "                    extra_prompt=extra_prompt,\n"
+    "                )\n"
+    "            else:\n"
+    "                success, output, final_response, error = run_job(\n"
+    "                    job,\n"
+    "                    defer_agent_teardown=_deferred_agents,\n"
+    "                    extra_prompt=extra_prompt,\n"
+    "                    cancel_event=fire_claim_lost,\n"
+    "                )\n"
+)
+
+SCHEDULER_RUN_JOB_PATCHED = (
+    "        _deferred_agents: list = []\n"
+    "        try:\n"
+    "            # kube-agents patch: enter cron run & risk scope so scheduled runs\n"
+    "            # enforce risk-keyed approval gates and execute_code blocks.\n"
+    "            # See tools/cron_run_scope.py and tools/cron_risk_gate.py.\n"
+    "            from tools.cron_run_scope import cron_run_scope\n"
+    '            with cron_run_scope(job["id"], risk=str(job.get("risk") or "high")):\n'
+    "                if fire_claim_lost is None:\n"
+    "                    success, output, final_response, error = run_job(\n"
+    "                        job,\n"
+    "                        defer_agent_teardown=_deferred_agents,\n"
+    "                        extra_prompt=extra_prompt,\n"
+    "                    )\n"
+    "                else:\n"
+    "                    success, output, final_response, error = run_job(\n"
+    "                        job,\n"
+    "                        defer_agent_teardown=_deferred_agents,\n"
+    "                        extra_prompt=extra_prompt,\n"
+    "                        cancel_event=fire_claim_lost,\n"
+    "                    )\n"
+)
 
 SCHEDULER_SAVE_OUTPUT = '            output_file = save_job_output(job["id"], output)\n'
 
@@ -149,7 +190,7 @@ CRONJOB_EXECUTE_PATCHED = (
     "            # it away.\n"
     "            outcome: Dict[str, Any] = {}\n"
     "            try:\n"
-    "                with cron_run_scope(job_id):\n"
+    '                with cron_run_scope(job_id, risk=str(job.get("risk") or "high")):\n'
     "                    processed = run_one_job(\n"
     "                        job, adapters=adapters, loop=gateway_loop,\n"
     "                        extra_prompt=extra_prompt, outcome=outcome,\n"
@@ -202,6 +243,75 @@ CRONJOB_RESULT_PATCHED = (
     '            if exec_result.get("delivery_error"):\n'
     '                result["delivery_error"] = str(exec_result["delivery_error"])\n'
     '            return json.dumps({"success": True, "job": result}, indent=2)\n'
+)
+
+# Allow runtime cronjob create to accept an explicit or default risk tier.
+CRONJOB_CREATE_PARAM_ANCHOR = (
+    "    reasoning_effort: Optional[str] = None,\n"
+    "    task_id: str = None,\n"
+)
+
+CRONJOB_CREATE_PARAM_PATCHED = (
+    "    reasoning_effort: Optional[str] = None,\n"
+    "    risk: Optional[str] = None,\n"
+    "    task_id: str = None,\n"
+)
+
+CRONJOB_CREATE_CALL_ANCHOR = (
+    "                    reasoning_effort=reasoning_effort,\n"
+    "                )\n"
+)
+
+CRONJOB_CREATE_CALL_PATCHED = (
+    "                    reasoning_effort=reasoning_effort,\n"
+    "                    risk=risk,\n"
+    "                )\n"
+)
+
+# --- cron/jobs.py: stamp default risk on newly created jobs -----------------
+
+JOBS_DEF_ANCHOR = (
+    "    monitor_url: Optional[str] = None,\n"
+    "    reasoning_effort: Optional[str] = None,\n"
+    ") -> Dict[str, Any]:\n"
+)
+
+JOBS_DEF_PATCHED = (
+    "    monitor_url: Optional[str] = None,\n"
+    "    reasoning_effort: Optional[str] = None,\n"
+    "    risk: Optional[str] = None,\n"
+    ") -> Dict[str, Any]:\n"
+)
+
+JOBS_APPEND_ANCHOR = (
+    "    with _jobs_lock():\n"
+    "        jobs = load_jobs()\n"
+    "        jobs.append(job)\n"
+    "        save_jobs(jobs)\n"
+)
+
+JOBS_APPEND_PATCHED = (
+    "    # kube-agents patch: stamp risk tier on newly created cron jobs\n"
+    "    # so runtime-created jobs run consistently across pod restarts.\n"
+    "    # Clamp to high if created from inside a high-risk cron run (no privilege escalation).\n"
+    "    try:\n"
+    "        try:\n"
+    "            from tools.cron_run_scope import current_cron_job, current_cron_risk\n"
+    "        except ImportError:\n"
+    "            from cron_run_scope import current_cron_job, current_cron_risk\n"
+    '        _in_high_cron = bool(current_cron_job() and current_cron_risk() == "high")\n'
+    "    except Exception:\n"
+    "        _in_high_cron = False\n"
+    '    _raw_risk = str(risk).strip().lower() if risk is not None else "low"\n'
+    '    _eff_risk = _raw_risk if _raw_risk in ("low", "high") else "high"\n'
+    "    if _in_high_cron:\n"
+    '        _eff_risk = "high"\n'
+    '    job["risk"] = _eff_risk\n'
+    "\n"
+    "    with _jobs_lock():\n"
+    "        jobs = load_jobs()\n"
+    "        jobs.append(job)\n"
+    "        save_jobs(jobs)\n"
 )
 
 # --- tools/kanban_tools.py: a cron run owns no card -------------------------
@@ -278,10 +388,13 @@ def apply(root: Path) -> None:
         SCHEDULER_DELEGATE, SCHEDULER_DELEGATE_PATCHED, label="body delegation"
     )
     scheduler.substitute(
+        SCHEDULER_RUN_JOB, SCHEDULER_RUN_JOB_PATCHED, label="scoped run_job"
+    )
+    scheduler.substitute(
         SCHEDULER_SAVE_OUTPUT, SCHEDULER_SAVE_OUTPUT_PATCHED, label="saved output"
     )
     scheduler.substitute(SCHEDULER_TAIL, SCHEDULER_TAIL_PATCHED, label="run tail")
-    scheduler.commit("2 locators, 3 anchors")
+    scheduler.commit("2 locators, 4 anchors")
 
     cronjob = patchlib.Patch(root, "tools/cronjob_tools.py", prefix=PREFIX)
     cronjob.substitute(
@@ -290,7 +403,30 @@ def apply(root: Path) -> None:
     cronjob.substitute(CRONJOB_EXECUTE, CRONJOB_EXECUTE_PATCHED, label="scoped run")
     cronjob.substitute(CRONJOB_RETURN, CRONJOB_RETURN_PATCHED, label="run report")
     cronjob.substitute(CRONJOB_RESULT, CRONJOB_RESULT_PATCHED, label="tool result")
-    cronjob.commit("4 anchors")
+    cronjob.substitute(
+        CRONJOB_CREATE_PARAM_ANCHOR,
+        CRONJOB_CREATE_PARAM_PATCHED,
+        label="create param",
+    )
+    cronjob.substitute(
+        CRONJOB_CREATE_CALL_ANCHOR,
+        CRONJOB_CREATE_CALL_PATCHED,
+        label="create call",
+    )
+    cronjob.commit("6 anchors")
+
+    jobs = patchlib.Patch(root, "cron/jobs.py", prefix=PREFIX)
+    jobs.substitute(
+        JOBS_DEF_ANCHOR,
+        JOBS_DEF_PATCHED,
+        label="create_job def risk param",
+    )
+    jobs.substitute(
+        JOBS_APPEND_ANCHOR,
+        JOBS_APPEND_PATCHED,
+        label="create_job stamp default risk",
+    )
+    jobs.commit("2 anchors")
 
     kanban = patchlib.Patch(root, "tools/kanban_tools.py", prefix=PREFIX)
     kanban.substitute(

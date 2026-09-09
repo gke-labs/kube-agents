@@ -195,14 +195,15 @@ This test suite performs a 17-step end-to-end verification of the `AgentPlugin` 
 
 ### Environment variables:
 
-| Variable          | Required | Purpose                                                                              |
-| ----------------- | -------- | ------------------------------------------------------------------------------------ |
-| `KUBE_CONTEXT`    | Yes      | `kubectl` context of the target cluster.                                             |
-| `NAMESPACE`       | Yes      | Namespace holding the operator and `PlatformAgent`.                                  |
-| `REGISTRY`        | Yes      | Registry prefix for the operator and plugin images.                                  |
-| `IMAGE_BUILDER`   | No       | `docker` (default) or `crane`. See below.                                            |
-| `CRANE_BIN`       | No       | Path to the `crane` binary. Only used by `IMAGE_BUILDER=crane`. Defaults to `crane`. |
-| `TARGET_PLATFORM` | No       | Platform for `crane` builds. Defaults to `linux/amd64`, matching GKE nodes.          |
+| Variable              | Required | Purpose                                                                                                               |
+| --------------------- | -------- | --------------------------------------------------------------------------------------------------------------------- |
+| `KUBE_CONTEXT`        | Yes      | `kubectl` context of the target cluster.                                                                              |
+| `NAMESPACE`           | Yes      | Namespace holding the operator and `PlatformAgent`.                                                                   |
+| `REGISTRY`            | Yes      | Registry prefix for the operator and plugin images.                                                                   |
+| `IMAGE_BUILDER`       | No       | `docker` (default) or `crane`. See below.                                                                             |
+| `CRANE_BIN`           | No       | Path to the `crane` binary. Only used by `IMAGE_BUILDER=crane`. Defaults to `crane`.                                  |
+| `TARGET_PLATFORM`     | No       | Platform for `crane` builds. Defaults to `linux/amd64`, matching GKE nodes.                                           |
+| `OPERATOR_DEPLOYMENT` | No       | Deployment name for the operator. Defaults to auto-discovery via label `app.kubernetes.io/name=kube-agents-operator`. |
 
 ### Choosing an image builder
 
@@ -243,7 +244,7 @@ On a host without a Docker daemon, add `IMAGE_BUILDER=crane`.
 
 ### 17-Step Verification Workflow:
 
-1. **Rebuild & Deploy Operator**: Compiles `k8s-operator` binary, builds the container image, pushes to registry, applies CRDs, and deploys `kubeagents-controller-manager`.
+1. **Rebuild & Deploy Operator**: Compiles `k8s-operator` binary, builds the container image, pushes to registry, applies CRDs, and deploys the operator Deployment (discovered via label `app.kubernetes.io/name=kube-agents-operator`, or overridden with `OPERATOR_DEPLOYMENT`).
 2. **Verify Operator Version**: Confirms controller manager pod image tag matches the newly pushed build.
 3. **Build & Push OCI Plugin Image**: Packages example plugin assets into an OCI container image with a unique build ID.
 4. **Deploy AgentPlugin CR**: Deploys targeted `AgentPlugin` CR with `agentRef: "platform-agent"`, allowed `approvals` configuration subtree, disallowed config keys, and `imagePullPolicy: Always`.
@@ -251,7 +252,7 @@ On a host without a Docker daemon, add `IMAGE_BUILDER=crane`.
 6. **Remove AgentPlugin CR**: Deletes the `AgentPlugin` CR and waits for rollout.
 7. **Verify Log Silence**: Confirms unique plugin log output stops appearing in replacement pod logs.
 8. **Verify ConfigMap Cleanup**: Confirms plugin entry is removed from `plugins.enabled` in `config.yaml`.
-9. **ImageVolume Disable Safeguard**: Annotates `PlatformAgent` with `enable-image-volumes=false`. Verifies OCI volume attachment is skipped, `AgentPlugin.status.phase` updates to `Degraded`, condition `Ready` sets `Reason: ImageVolumeUnsupported`, and operator logs `skipping plugin OCI image volume mount`.
+9. **ImageVolume Disable Safeguard**: Annotates `PlatformAgent` with `enable-image-volumes=false`. Verifies OCI volume attachment is skipped in favor of `emptyDir` volume and `stage-<plugin>` init-container staging, `AgentPlugin.status.phase` remains `Ready`, and condition `Ready` sets `Reason: Applied` with message noting staging via init container.
 10. **Orphaned `agentRef` Reporting**: Creates an `AgentPlugin` whose `agentRef` names no `PlatformAgent`. Verifies `status.phase` becomes `Degraded` with `Reason: AgentNotFound`, and that the plugin still never reaches `plugins.enabled`.
 11. **Image Pull Failure Reporting**: Creates an `AgentPlugin` referencing an image that does not exist, which blocks the agent pod from starting. Verifies `status.phase` becomes `Degraded` with `Reason: ImagePullFailed` and the failing reference in the message, then that the agent recovers once the plugin is removed.
 12. **Missing CRD Decoupled Dependency Safeguard**: Temporarily deletes `AgentPlugin` CRD from cluster. Verifies `PlatformAgent` reconciliation succeeds without controller crashes, and verifies reflector error log. Restores CRD per-file **and restarts the operator** — re-applying the CRD alone does not revive the informer, which keeps retrying with growing backoff, so later steps would race that recovery. Runs late because deleting the CRD stops the operator watching `AgentPlugin` until it restarts.

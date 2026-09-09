@@ -195,3 +195,31 @@ in production. Run it after touching anything in `../governance/`.
 No prompt is quoted here on purpose. A copy in prose is one more place for the
 same numbers to go stale, and the test above checks the roster against the SOPs
 — not this file against the roster.
+
+## `risk` tier contract
+
+Every job entry across both rosters declares an explicit `"risk": "low" | "high"`.
+The field is validated by `scripts/check_prompt_assets.py` (`check_cron_risk`) and enforced
+across pod restarts by `profile_scaffold.py::merge_cron_store` (an image-owned key).
+Runtime-created jobs (`cron.jobs::create_job` and `tools.cronjob_tools::cronjob`) stamp
+`"risk": "low"` at creation time unless an explicit `risk` is provided. Existing unannotated
+legacy jobs are backfilled to `"risk": "low"` across all profiles:
+Platform Agent roster during scaffold merge (`profile_scaffold.py::merge_cron_store`),
+Chat Agent roster during reconciliation (`cron_jobs_sync.py`), and cluster profiles both at
+profile creation (`cluster_agent_profile.py`) and pod startup (`docker-entrypoint.sh` via
+`profile_scaffold.py --backfill-cron`). Unannotated in-flight executions or dispatches with no
+tier default fail-closed to `"high"` under `cron_run_scope.py` and `cron_risk_gate.py`.
+
+- `"low"`: Read-only governance watchdogs, audits, and internal scheduler plumbing. Runs under
+  the configured `cron_mode` (typically `approve`), protected by the denylist floor (hardline +
+  `approvals.deny` + Tirith POSIX shell content scan), terminal escape rejection, lookalike TLD
+  blocks, and `execute_code` blocks.
+- `"high"`: Workloads with broad operational authority or untrusted input sources (such as
+  `github-repo-watcher`), as well as unannotated dispatches. For agentic (prompt-driven) jobs,
+  this applies a fail-closed read-only command policy (`cron_command_policy_block`): every command
+  segment must be an allowlisted inspection command (`kubectl get/describe/logs/top`, `gcloud … list/describe`,
+  read-only text utilities, `--dry-run` validations); mutating, unknown, or unanalyzable commands
+  are refused while the run continues. For `no_agent: true` jobs like `github-repo-watcher`, there is
+  no agent loop and therefore no tool-approval surface to gate; `"high"` is a threat classification of
+  the untrusted input the subprocess ingests (runtime isolation is tracked in #913; today the tier is
+  metadata only for those jobs).

@@ -1266,6 +1266,92 @@ func TestCleanupA2ACostsThreeReadsWhenThereIsNothingToClean(t *testing.T) {
 	}
 }
 
+// TestNoWorkerCanPublishToTheDirectory pins the identity plane against its least
+// trusted principal.
+//
+// a2a.agents.{profile} is last-value, so a single publish REPLACES a profile's
+// card and an agent-closed tombstone retires it. The payload spec assigns that to
+// the profile's owner explicitly -- "not by workers" -- and nothing in the tree
+// publishes a card at all today, so the grant this removes had no caller.
+//
+// Asserted against the worker's publish list specifically rather than the whole
+// config: the gateway keeps SUBSCRIBE on the same subjects, which is the read
+// discovery needs, and a test that just greps the file for "a2a.agents" would
+// fail on that legitimate line.
+// a2aGrantSubjects returns the subjects in one user's publish or subscribe
+// allow-list, parsed the way the server reads them.
+//
+// Parsed rather than grepped, for two reasons this test hit directly. A
+// rationale comment left in place of a removed grant names the subject it
+// removes, so raw text reports the comment as the grant -- which it did, on
+// the first run. And the reverse: commenting a grant out is the house style
+// for disabling one here, so a control asserting a grant is present has to
+// see the comment marker too, or it passes against a config that lost the
+// grant.
+func a2aGrantSubjects(t *testing.T, conf, user, section string) []string {
+	t.Helper()
+
+	start := strings.Index(conf, "user: "+user)
+	if start < 0 {
+		t.Fatalf("no %s user in the rendered config", user)
+	}
+	entry := conf[start:]
+	if next := strings.Index(entry[1:], "user: "); next >= 0 {
+		entry = entry[:next+1]
+	}
+	openIdx := strings.Index(entry, section+" { allow = [")
+	if openIdx < 0 {
+		t.Fatalf("%s has no %s allow-list", user, section)
+	}
+	closeIdx := strings.Index(entry[openIdx:], "] }")
+	if closeIdx < 0 {
+		t.Fatalf("%s's %s allow-list is unterminated", user, section)
+	}
+
+	var subjects []string
+	for _, line := range strings.Split(entry[openIdx:openIdx+closeIdx], "\n") {
+		line = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(line), ","))
+		if !strings.HasPrefix(line, `"`) {
+			continue
+		}
+		subjects = append(subjects, strings.Trim(line, `"`))
+	}
+	if len(subjects) == 0 {
+		t.Fatalf("%s's %s allow-list parsed empty", user, section)
+	}
+	return subjects
+}
+
+func TestNoWorkerCanPublishToTheDirectory(t *testing.T) {
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds()).Data["nats.conf"])
+
+	// Asked as the server would ask it, not as a substring scan would. A grant
+	// need not spell the subject to authorize it: "a2a.*.*" covers
+	// a2a.agents.platform and contains no "a2a.agents" to grep for, and
+	// consolidating the worker's three exact topic grants into one wildcard is
+	// the plausible way that arrives.
+	const card = "a2a.agents.platform"
+	for _, grant := range a2aGrantSubjects(t, conf, "worker", "publish") {
+		if subjectMatches(grant, card) {
+			t.Errorf("worker can publish %s via grant %q; one publish replaces a profile's "+
+				"card, and the payload spec assigns cards to the profile owner, not workers",
+				card, grant)
+		}
+	}
+
+	// The control: the gateway's READ of the directory must survive, or this
+	// test would pass just as well against a config that broke discovery.
+	var gatewayReads bool
+	for _, grant := range a2aGrantSubjects(t, conf, "gateway", "subscribe") {
+		if subjectMatches(grant, card) {
+			gatewayReads = true
+		}
+	}
+	if !gatewayReads {
+		t.Error("the gateway lost subscribe on the directory; discovery reads it")
+	}
+}
+
 // a2aFullCreds is a creds Secret carrying every key in the shape
 // randomA2APassword emits, at a known resourceVersion. The rollout-hash tests
 // need all five — a2aTestCreds omits sys-password — and they need the values

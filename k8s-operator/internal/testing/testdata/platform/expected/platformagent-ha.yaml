@@ -216,6 +216,13 @@ rules:
       - update
       - patch
       - delete
+  - apiGroups:
+      - ""
+    resources:
+      - pods
+    verbs:
+      - get
+      - patch
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -262,10 +269,11 @@ metadata:
       uid: ""
 spec:
   accessModes:
-    - ReadWriteOnce
+    - ReadWriteMany
   resources:
     requests:
       storage: 10Gi
+  storageClassName: standard-rwx
 status: {}
 ---
 apiVersion: v1
@@ -287,10 +295,11 @@ metadata:
       uid: ""
 spec:
   accessModes:
-    - ReadWriteOnce
+    - ReadWriteMany
   resources:
     requests:
       storage: 1Gi
+  storageClassName: standard-rwx
 status: {}
 ---
 apiVersion: v1
@@ -1094,12 +1103,15 @@ metadata:
       uid: ""
 spec:
   progressDeadlineSeconds: 1200
-  replicas: 1
+  replicas: 3
   selector:
     matchLabels:
       app: platformagent-gateway
   strategy:
-    type: Recreate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 1
+    type: RollingUpdate
   template:
     metadata:
       annotations:
@@ -1116,7 +1128,10 @@ spec:
     spec:
       automountServiceAccountToken: false
       containers:
-        - env:
+        - args:
+            - /opt/hermes/.venv/bin/python3
+            - /opt/data/leader_elect.py
+          env:
             - name: PLATFORM_AGENT_HOME
               value: /opt/data
             - name: HOME
@@ -1175,6 +1190,12 @@ spec:
             - name: GOOGLE_CHAT_HOME_CHANNEL
             - name: GOOGLE_CHAT_ALLOW_ALL_USERS
               value: "true"
+            - name: ENABLE_LEADER_ELECTION
+              value: "true"
+            - name: LEADER_ELECTION_LEASE_NAME
+              value: platformagent-leader
+            - name: LEADER_ELECTION_NAMESPACE
+              value: kubeagents-system
             - name: HERMES_MANAGED_DIR
               value: /etc/hermes
             - name: HERMES_WRITE_SAFE_ROOT
@@ -1624,6 +1645,7 @@ spec:
       targetPort: dashboard
   selector:
     app: platformagent-gateway
+    kubeagents.io/is-leader: "true"
 status:
   loadBalancer: {}
 ---

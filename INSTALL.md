@@ -59,10 +59,13 @@ When running the official release installer (`<RELEASE_VERSION>/install.sh`) or 
 
 The installer's engine is [Method 1](#method-1-the-install-engine--terraform--helm): the
 [`terraform/examples/full-install`](terraform/examples/full-install/README.md) composition, which is
-the canonical description of what gets created. Three things stay outside Terraform, run by the
-installer itself: CMEK database encryption on a **pre-existing** cluster (a `gcloud` pre-step), the
-managed-OTel collection scope (no Terraform field exists), and the GitHub App private-key import
-into KMS (the PEM must not enter Terraform state). The installer sources
+the canonical description of what gets created. What stays outside Terraform, the installer runs
+itself: on a **pre-existing** cluster, the `gcloud` pre-steps a data source cannot express (CMEK
+database encryption, the Workload Identity pool and node-pool metadata mode, and NetworkPolicy
+enforcement; see the site's
+[cluster requirements](docs/site/src/content/docs/install/prerequisites.md#cluster-requirements)),
+the managed-OTel collection scope on a cluster it created (no Terraform field exists), and the
+GitHub App private-key import into KMS (the PEM must not enter Terraform state). The installer sources
 `scripts/installer/installer_common.sh`, which reads `install.defaults.env`, so its defaults
 (region, cluster name, model provider, registry prefix) and its accepted values live in exactly
 one place; see
@@ -139,6 +142,10 @@ Before beginning installation, ensure your environment meets the following requi
 | **Helm**                        | `3.10+`                                         | `helm version`             | `upgrade.sh`'s fast paths and the manual chart install; the engine itself uses the Terraform Helm provider. |
 | **gettext (`envsubst`)**        | Standard                                        | `envsubst --version`       | Used by the kustomize deployment targets (Method 2) for template substitution.                              |
 | **`jq`**                        | `1.6+`                                          | `jq --version`             | Reads `images.json`; the kustomize deploy targets resolve image references from it.                         |
+
+A cluster you bring yourself, rather than one the installer creates, also needs Workload Identity,
+NetworkPolicy enforcement, and the rest of the site's
+[cluster requirements](docs/site/src/content/docs/install/prerequisites.md#cluster-requirements).
 
 ---
 

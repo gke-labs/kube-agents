@@ -116,6 +116,62 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 0, f"unexpected failure: {proc.stderr}")
         self.assertEqual(proc.stderr, "")
 
+    def test_guard_gsa_identity_reads_a_typed_null_as_the_default(self):
+        """terraform console prints an unset nullable variable as tostring(null).
+        Read as a name, it disagreed with every state and refused every apply
+        whose tfvars left the variable alone -- the autopush deploys after #1309."""
+        state_list = "module.kube_agents_iam.google_service_account.agent"
+        state_show = """# module.kube_agents_iam.google_service_account.agent:
+resource "google_service_account" "agent" {
+    account_id   = "kubeagents-platform-gsa"
+    project      = "test-proj"
+}
+"""
+        proc = self._run_guard(
+            "guard_gsa_identity",
+            state_list=state_list,
+            state_show=state_show,
+            tfvar_agent_sa="tostring(null)",
+        )
+        self.assertEqual(proc.returncode, 0, f"unexpected failure: {proc.stderr}")
+        self.assertEqual(proc.stderr, "")
+
+    def test_a_typed_null_still_refuses_a_lost_override(self):
+        """When state has an override GSA but variable resolves to a typed null,
+        the fallback default name still disagrees with state and refuses destruction."""
+        state_list = "module.kube_agents_iam.google_service_account.agent"
+        state_show = """resource "google_service_account" "agent" {
+    account_id   = "kubeagents-platform-gsa-2"
+}
+"""
+        proc = self._run_guard(
+            "guard_gsa_identity",
+            state_list=state_list,
+            state_show=state_show,
+            tfvar_agent_sa="tostring(null)",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("agent_service_account_id resolved to 'kubeagents-platform-gsa', but this state manages GSA 'kubeagents-platform-gsa-2'", proc.stderr)
+        self.assertIn("Applying now would plan the service account's DESTRUCTION and recreation under -auto-approve.", proc.stderr)
+
+    def test_tfvar_reads_a_typed_null_as_empty(self):
+        """tfvar should normalize typed nulls (tostring(null)) to empty string."""
+        proc = self._run_guard(
+            'printf "[%s]" "$(tfvar agent_service_account_id)"',
+            tfvar_agent_sa="tostring(null)",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "[]")
+
+    def test_tfvar_reads_bare_null_as_empty(self):
+        """tfvar should normalize bare null to empty string."""
+        proc = self._run_guard(
+            'printf "[%s]" "$(tfvar agent_service_account_id)"',
+            tfvar_agent_sa="null",
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "[]")
+
     def test_guard_gsa_identity_refuses_when_override_lost_and_resolves_to_default(self):
         """When state has override GSA but variable resolves to default, apply refuses before terraform runs."""
         state_list = "module.kube_agents_iam.google_service_account.agent"

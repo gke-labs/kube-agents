@@ -12,11 +12,14 @@ install without the interview.
   destroy), including the Cloud KMS API for GKE database encryption and the Chat
   API when Google Chat is enabled.
 - A GKE cluster ([`gke-cluster`](../../modules/gke-cluster) module) — Autopilot
-  by default, `cluster_mode = "standard"` for an e2-standard-4 node pool
-  (with an optional gVisor node pool), or `create_cluster = false` to
-  install onto an existing one — with Workload Identity, Cloud KMS database
-  encryption (CMEK), the Backup for GKE agent enabled, and the
-  `kube-agents-host=true` discovery label applied.
+  by default, or `cluster_mode = "standard"` for an e2-standard-4 node pool
+  (with an optional gVisor node pool) — with Workload Identity, Cloud KMS
+  database encryption (CMEK), the Backup for GKE agent enabled, and the
+  `kube-agents-host=true` discovery label applied. Setting
+  `create_cluster = false` instead makes the module read an existing cluster:
+  it enables none of those, and its postconditions refuse the plan unless the
+  cluster already has Workload Identity and NetworkPolicy enforcement (see
+  [Prerequisites](#prerequisites)).
 - Optionally (`enable_gke_backup_plan = true`) a scheduled
   [`gke-backup-plan`](../../modules/gke-backup-plan) for the release namespace.
 - The agent's GCP identity ([`kube-agents-iam`](../../modules/kube-agents-iam)
@@ -89,6 +92,14 @@ install without the interview.
 
 - A GCP project you can administer.
 - Terraform `~> 1.5`.
+- With `create_cluster = false`, a cluster that meets the
+  [cluster requirements](../../../docs/site/src/content/docs/install/prerequisites.md#cluster-requirements):
+  GKE 1.29+, Workload Identity with `GKE_METADATA` on every node pool,
+  NetworkPolicy enforcement, a control plane reachable from here, and cert-manager
+  either present (`enable_cert_manager = false`) or absent. The module refuses the
+  plan on two of these, the Workload Identity pool and NetworkPolicy enforcement,
+  and checks none of the others; `install.sh` changes an adopted cluster to meet
+  those two instead, and this composition on its own never does.
 - Application Default Credentials for the Google, Kubernetes, and Helm
   providers:
 

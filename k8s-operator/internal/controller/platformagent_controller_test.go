@@ -2233,8 +2233,9 @@ func TestUpdatePluginStatuses_DuplicatePluginName(t *testing.T) {
 
 type fakeVersionDiscovery struct {
 	discovery.DiscoveryInterface
-	ver    *version.Info
-	groups *metav1.APIGroupList
+	ver       *version.Info
+	groups    *metav1.APIGroupList
+	resources map[string]*metav1.APIResourceList
 }
 
 func (f *fakeVersionDiscovery) ServerVersion() (*version.Info, error) {
@@ -2245,7 +2246,39 @@ func (f *fakeVersionDiscovery) ServerGroups() (*metav1.APIGroupList, error) {
 	if f.groups != nil {
 		return f.groups, nil
 	}
+	if f.resources != nil {
+		groupsMap := make(map[string][]metav1.GroupVersionForDiscovery)
+		for gvStr := range f.resources {
+			parts := strings.Split(gvStr, "/")
+			if len(parts) == 2 {
+				group := parts[0]
+				version := parts[1]
+				groupsMap[group] = append(groupsMap[group], metav1.GroupVersionForDiscovery{
+					GroupVersion: gvStr,
+					Version:      version,
+				})
+			}
+		}
+		var groups []metav1.APIGroup
+		for gName, gvList := range groupsMap {
+			groups = append(groups, metav1.APIGroup{
+				Name:             gName,
+				Versions:         gvList,
+				PreferredVersion: gvList[0],
+			})
+		}
+		return &metav1.APIGroupList{Groups: groups}, nil
+	}
 	return &metav1.APIGroupList{}, nil
+}
+
+func (f *fakeVersionDiscovery) ServerResourcesForGroupVersion(groupVersion string) (*metav1.APIResourceList, error) {
+	if f.resources != nil {
+		if rl, ok := f.resources[groupVersion]; ok {
+			return rl, nil
+		}
+	}
+	return &metav1.APIResourceList{GroupVersion: groupVersion}, nil
 }
 
 func TestIsImageVolumeSupported_DiscoveryVersion(t *testing.T) {
@@ -2299,8 +2332,16 @@ func TestIsImageVolumeSupported_DiscoveryVersion(t *testing.T) {
 		t.Errorf("expected annotation override 'false' to force isImageVolumeSupported to false even on K8s 1.35")
 	}
 
-	// 5. Server version >= 1.35 on GKE Standard returns true (natively supported)
-	dcGKEStandard := &fakeVersionDiscovery{ver: &version.Info{Major: "1", Minor: "35", GitVersion: "v1.35.7-gke.1027000"}}
+	// 5. Server version >= 1.35 on GKE Standard returns true (natively supported even with auto.gke.io allowlists)
+	dcGKEStandard := &fakeVersionDiscovery{
+		ver: &version.Info{Major: "1", Minor: "35", GitVersion: "v1.35.7-gke.1027000"},
+		resources: map[string]*metav1.APIResourceList{
+			"auto.gke.io/v1": {
+				GroupVersion: "auto.gke.io/v1",
+				APIResources: []metav1.APIResource{{Name: "workloadallowlists"}},
+			},
+		},
+	}
 	if !isImageVolumeSupported(dcGKEStandard, agent) {
 		t.Errorf("expected isImageVolumeSupported to return true on GKE Standard >= 1.35")
 	}
@@ -2308,8 +2349,11 @@ func TestIsImageVolumeSupported_DiscoveryVersion(t *testing.T) {
 	// 6. GKE Autopilot returns false (falls back to initContainer staging)
 	dcGKEAutopilot := &fakeVersionDiscovery{
 		ver: &version.Info{Major: "1", Minor: "35", GitVersion: "v1.35.7-gke.1027000"},
-		groups: &metav1.APIGroupList{
-			Groups: []metav1.APIGroup{{Name: "auto.gke.io"}},
+		resources: map[string]*metav1.APIResourceList{
+			"auto.gke.io/v1": {
+				GroupVersion: "auto.gke.io/v1",
+				APIResources: []metav1.APIResource{{Name: "allowlistedworkloads"}},
+			},
 		},
 	}
 	if isImageVolumeSupported(dcGKEAutopilot, agent) {
@@ -2420,6 +2464,10 @@ type countingDiscovery struct {
 func (c *countingDiscovery) ServerVersion() (*version.Info, error) {
 	c.calls++
 	return &version.Info{Major: "1", Minor: "35"}, nil
+}
+
+func (c *countingDiscovery) ServerGroups() (*metav1.APIGroupList, error) {
+	return &metav1.APIGroupList{}, nil
 }
 
 func TestImageVolumeSupported_CachesDiscovery(t *testing.T) {
@@ -2637,6 +2685,10 @@ func (f *flakyDiscovery) ServerVersion() (*version.Info, error) {
 	return &version.Info{Major: "1", Minor: "35"}, nil
 }
 
+func (f *flakyDiscovery) ServerGroups() (*metav1.APIGroupList, error) {
+	return &metav1.APIGroupList{}, nil
+}
+
 func TestImageVolumeSupported_TransientFailureIsNotCached(t *testing.T) {
 	// A discovery error means "unknown", and unknown fails closed for that pass. It must
 	// not be remembered: caching it would pin every plugin to Degraded until the operator
@@ -2815,6 +2867,134 @@ func TestUpdatePluginStatuses_StagingFailureIsReported(t *testing.T) {
 	}
 	if good.Status.Phase != "Ready" {
 		t.Errorf("expected healthy staging plugin Phase 'Ready', got %q", good.Status.Phase)
+	}
+}
+
+func TestUpdatePluginStatuses_StagingFailure_MissingShell(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "target-agent", Namespace: "test-ns"},
+	}
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "scratchplugin", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.AgentPluginSpec{AgentRef: "target-agent", Image: "example.com/scratch:v1"},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "target-agent-gateway-abc",
+			Namespace: "test-ns",
+			Labels:    map[string]string{"app": "target-agent-gateway"},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+			InitContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: buildPluginStagingContainerName(plugin.Name),
+					State: corev1.ContainerState{
+						Waiting: &corev1.ContainerStateWaiting{
+							Reason:  "CrashLoopBackOff",
+							Message: "back-off 10s restarting failed container",
+						},
+					},
+					LastTerminationState: corev1.ContainerState{
+						Terminated: &corev1.ContainerStateTerminated{
+							ExitCode: 127,
+							Reason:   "ContainerCannotRun",
+							Message:  "OCI runtime exec failed: exec: \"/bin/sh\": stat /bin/sh: no such file or directory",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(plugin, pod).
+		WithStatusSubresource(plugin).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	r.updatePluginStatuses(ctx, agent, []*agentv1alpha1.AgentPlugin{plugin}, false)
+
+	var result agentv1alpha1.AgentPlugin
+	if err := cl.Get(ctx, types.NamespacedName{Name: plugin.Name, Namespace: plugin.Namespace}, &result); err != nil {
+		t.Fatalf("get plugin: %v", err)
+	}
+
+	if result.Status.Phase != "Degraded" {
+		t.Errorf("expected Status.Phase 'Degraded', got %q", result.Status.Phase)
+	}
+	cond := meta.FindStatusCondition(result.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "StagingFailed" {
+		t.Fatalf("expected Reason 'StagingFailed', got %+v", cond)
+	}
+	if !strings.Contains(cond.Message, "may be outdated or missing /bin/sh") {
+		t.Errorf("expected diagnostic message indicating missing /bin/sh, got %q", cond.Message)
+	}
+}
+
+func TestUpdatePluginStatuses_StagingFailure_RunContainerError_MissingShell(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "target-agent", Namespace: "test-ns"},
+	}
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "badplugin", Namespace: "test-ns"},
+		Spec: agentv1alpha1.AgentPluginSpec{
+			AgentRef: "target-agent",
+			Image:    "registry.k8s.io/pause:3.9",
+		},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "target-agent-gateway-xyz",
+			Namespace: "test-ns",
+			Labels:    map[string]string{"app": "target-agent-gateway"},
+		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+			InitContainerStatuses: []corev1.ContainerStatus{
+				{
+					Name: buildPluginStagingContainerName(plugin.Name),
+					State: corev1.ContainerState{
+						Waiting: &corev1.ContainerStateWaiting{
+							Reason:  "RunContainerError",
+							Message: "OCI runtime start failed: starting container: creating process: failed to load /bin/sh: no such file or directory",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(plugin, pod).
+		WithStatusSubresource(plugin).
+		Build()
+
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+	r.updatePluginStatuses(ctx, agent, []*agentv1alpha1.AgentPlugin{plugin}, false)
+
+	var result agentv1alpha1.AgentPlugin
+	if err := cl.Get(ctx, types.NamespacedName{Name: plugin.Name, Namespace: plugin.Namespace}, &result); err != nil {
+		t.Fatalf("get plugin: %v", err)
+	}
+
+	if result.Status.Phase != "Degraded" {
+		t.Errorf("expected Status.Phase 'Degraded', got %q", result.Status.Phase)
+	}
+	cond := meta.FindStatusCondition(result.Status.Conditions, "Ready")
+	if cond == nil || cond.Reason != "StagingFailed" {
+		t.Fatalf("expected Reason 'StagingFailed', got %+v", cond)
+	}
+	if !strings.Contains(cond.Message, "may be outdated or missing /bin/sh") {
+		t.Errorf("expected diagnostic message indicating missing /bin/sh, got %q", cond.Message)
 	}
 }
 
@@ -4616,6 +4796,56 @@ func TestABrokenNativeSidecarIsReportedDegraded(t *testing.T) {
 	}
 }
 
+func TestInitContainerPluginStagingFailureReportsDegraded(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-gateway-abc",
+			Namespace: "test-ns",
+			Labels:    map[string]string{"app": "test-agent-gateway"},
+		},
+		Status: corev1.PodStatus{
+			InitContainerStatuses: []corev1.ContainerStatus{{
+				Name: "stage-custom-plugin",
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
+					Reason:  "CrashLoopBackOff",
+					Message: "back-off 10s restarting failed container=stage-custom-plugin",
+				}},
+				LastTerminationState: corev1.ContainerState{
+					Terminated: &corev1.ContainerStateTerminated{
+						ExitCode: 127,
+						Message:  "exec /bin/sh: no such file or directory",
+					},
+				},
+			}},
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name:  "platform-agent",
+				State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: "PodInitializing"}},
+			}},
+			Conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue}},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent)
+
+	if phase != "Degraded" {
+		t.Errorf("phase = %q, want Degraded", phase)
+	}
+	if reason != "CrashLoopBackOff" {
+		t.Errorf("reason = %q, want CrashLoopBackOff", reason)
+	}
+	if !strings.Contains(message, "stage-custom-plugin") || !strings.Contains(message, "missing /bin/sh") {
+		t.Errorf("message does not diagnose missing /bin/sh: %q", message)
+	}
+}
+
 func TestSyncGithubTokenMinterConfigMap(t *testing.T) {
 	scheme := setupScheme()
 	agent := &agentv1alpha1.PlatformAgent{
@@ -4901,5 +5131,349 @@ func TestPlatformAgentReconciler_Reconcile_UnrecognizedMode(t *testing.T) {
 	}
 	if updated.Status.Phase == "Degraded" {
 		t.Errorf("expected Degraded to clear once the mode is valid, still %q", updated.Status.Phase)
+	}
+}
+
+type mockAutopilotDiscovery struct {
+	discovery.DiscoveryInterface
+	serverVersionErr  error
+	serverVersionInfo *version.Info
+	serverGroupsErr   error
+	serverGroupsList  *metav1.APIGroupList
+	resourcesErr      map[string]error
+	resourcesList     map[string]*metav1.APIResourceList
+}
+
+func (m *mockAutopilotDiscovery) ServerVersion() (*version.Info, error) {
+	if m.serverVersionErr != nil {
+		return nil, m.serverVersionErr
+	}
+	if m.serverVersionInfo != nil {
+		return m.serverVersionInfo, nil
+	}
+	return &version.Info{Major: "1", Minor: "35"}, nil
+}
+
+func (m *mockAutopilotDiscovery) ServerGroups() (*metav1.APIGroupList, error) {
+	if m.serverGroupsErr != nil {
+		return nil, m.serverGroupsErr
+	}
+	if m.serverGroupsList != nil {
+		return m.serverGroupsList, nil
+	}
+	return &metav1.APIGroupList{}, nil
+}
+
+func (m *mockAutopilotDiscovery) ServerResourcesForGroupVersion(groupVersion string) (*metav1.APIResourceList, error) {
+	if m.resourcesErr != nil {
+		if err, ok := m.resourcesErr[groupVersion]; ok {
+			return nil, err
+		}
+	}
+	if m.resourcesList != nil {
+		if rl, ok := m.resourcesList[groupVersion]; ok {
+			return rl, nil
+		}
+	}
+	return nil, errors.NewNotFound(schema.GroupResource{Group: "auto.gke.io", Resource: "resource"}, groupVersion)
+}
+
+func TestIsGKEAutopilot(t *testing.T) {
+	tests := []struct {
+		name            string
+		dc              discovery.DiscoveryInterface
+		wantIsAutopilot bool
+		wantDetermined  bool
+	}{
+		{
+			name:            "nil discovery client",
+			dc:              nil,
+			wantIsAutopilot: false,
+			wantDetermined:  false,
+		},
+		{
+			name: "transient error on ServerGroups",
+			dc: &mockAutopilotDiscovery{
+				serverGroupsErr: fmt.Errorf("connection refused"),
+			},
+			wantIsAutopilot: false,
+			wantDetermined:  false,
+		},
+		{
+			name: "non-autopilot cluster without auto.gke.io",
+			dc: &mockAutopilotDiscovery{
+				serverGroupsList: &metav1.APIGroupList{
+					Groups: []metav1.APIGroup{
+						{Name: "apps", Versions: []metav1.GroupVersionForDiscovery{{GroupVersion: "apps/v1", Version: "v1"}}},
+					},
+				},
+			},
+			wantIsAutopilot: false,
+			wantDetermined:  true,
+		},
+		{
+			name: "autopilot cluster with v1beta1 allowlistedworkloads",
+			dc: &mockAutopilotDiscovery{
+				serverGroupsList: &metav1.APIGroupList{
+					Groups: []metav1.APIGroup{
+						{
+							Name: "auto.gke.io",
+							Versions: []metav1.GroupVersionForDiscovery{
+								{GroupVersion: "auto.gke.io/v1beta1", Version: "v1beta1"},
+							},
+						},
+					},
+				},
+				resourcesList: map[string]*metav1.APIResourceList{
+					"auto.gke.io/v1beta1": {
+						GroupVersion: "auto.gke.io/v1beta1",
+						APIResources: []metav1.APIResource{{Name: "allowlistedworkloads"}},
+					},
+				},
+			},
+			wantIsAutopilot: true,
+			wantDetermined:  true,
+		},
+		{
+			name: "autopilot cluster with v1 allowlistedworkloads",
+			dc: &mockAutopilotDiscovery{
+				serverGroupsList: &metav1.APIGroupList{
+					Groups: []metav1.APIGroup{
+						{
+							Name: "auto.gke.io",
+							Versions: []metav1.GroupVersionForDiscovery{
+								{GroupVersion: "auto.gke.io/v1", Version: "v1"},
+							},
+						},
+					},
+				},
+				resourcesList: map[string]*metav1.APIResourceList{
+					"auto.gke.io/v1": {
+						GroupVersion: "auto.gke.io/v1",
+						APIResources: []metav1.APIResource{{Name: "allowlistedworkloads"}},
+					},
+				},
+			},
+			wantIsAutopilot: true,
+			wantDetermined:  true,
+		},
+		{
+			name: "gke standard with auto.gke.io but lacking allowlistedworkloads",
+			dc: &mockAutopilotDiscovery{
+				serverGroupsList: &metav1.APIGroupList{
+					Groups: []metav1.APIGroup{
+						{
+							Name: "auto.gke.io",
+							Versions: []metav1.GroupVersionForDiscovery{
+								{GroupVersion: "auto.gke.io/v1", Version: "v1"},
+							},
+						},
+					},
+				},
+				resourcesList: map[string]*metav1.APIResourceList{
+					"auto.gke.io/v1": {
+						GroupVersion: "auto.gke.io/v1",
+						APIResources: []metav1.APIResource{{Name: "workloadallowlists"}},
+					},
+				},
+			},
+			wantIsAutopilot: false,
+			wantDetermined:  true,
+		},
+		{
+			name: "transient error on ServerResourcesForGroupVersion propagates undetermined",
+			dc: &mockAutopilotDiscovery{
+				serverGroupsList: &metav1.APIGroupList{
+					Groups: []metav1.APIGroup{
+						{
+							Name: "auto.gke.io",
+							Versions: []metav1.GroupVersionForDiscovery{
+								{GroupVersion: "auto.gke.io/v1", Version: "v1"},
+							},
+						},
+					},
+				},
+				resourcesErr: map[string]error{
+					"auto.gke.io/v1": fmt.Errorf("503 Service Unavailable"),
+				},
+			},
+			wantIsAutopilot: false,
+			wantDetermined:  false,
+		},
+		{
+			name: "not found on first version falls back to next version",
+			dc: &mockAutopilotDiscovery{
+				serverGroupsList: &metav1.APIGroupList{
+					Groups: []metav1.APIGroup{
+						{
+							Name: "auto.gke.io",
+							Versions: []metav1.GroupVersionForDiscovery{
+								{GroupVersion: "auto.gke.io/v1", Version: "v1"},
+								{GroupVersion: "auto.gke.io/v2", Version: "v2"},
+							},
+						},
+					},
+				},
+				resourcesErr: map[string]error{
+					"auto.gke.io/v1": errors.NewNotFound(schema.GroupResource{Group: "auto.gke.io", Resource: "resource"}, "v1"),
+				},
+				resourcesList: map[string]*metav1.APIResourceList{
+					"auto.gke.io/v2": {
+						GroupVersion: "auto.gke.io/v2",
+						APIResources: []metav1.APIResource{{Name: "allowlistedworkloads"}},
+					},
+				},
+			},
+			wantIsAutopilot: true,
+			wantDetermined:  true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gotIsAutopilot, gotDetermined := isGKEAutopilot(tc.dc)
+			if gotIsAutopilot != tc.wantIsAutopilot || gotDetermined != tc.wantDetermined {
+				t.Errorf("isGKEAutopilot() = (%v, %v), want (%v, %v)",
+					gotIsAutopilot, gotDetermined, tc.wantIsAutopilot, tc.wantDetermined)
+			}
+		})
+	}
+}
+
+func TestClusterImageVolumeSupport_TransientFailureFailsClosedWithoutCaching(t *testing.T) {
+	// When K8s >= 1.35 but isGKEAutopilot suffers a transient error, clusterImageVolumeSupport
+	// must return supported=false, determined=false (fails closed and not cached).
+	dc := &mockAutopilotDiscovery{
+		serverVersionInfo: &version.Info{Major: "1", Minor: "35"},
+		serverGroupsList: &metav1.APIGroupList{
+			Groups: []metav1.APIGroup{
+				{
+					Name:     "auto.gke.io",
+					Versions: []metav1.GroupVersionForDiscovery{{GroupVersion: "auto.gke.io/v1", Version: "v1"}},
+				},
+			},
+		},
+		resourcesErr: map[string]error{
+			"auto.gke.io/v1": fmt.Errorf("timeout"),
+		},
+	}
+
+	supported, determined := clusterImageVolumeSupport(dc)
+	if supported || determined {
+		t.Errorf("clusterImageVolumeSupport() = (%v, %v), want (false, false) on transient discovery failure", supported, determined)
+	}
+}
+
+func TestGetDeploymentStatusDetails_TerminatingPodSkipped(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+
+	now := metav1.Now()
+	// Terminating pod with exit code 143 (SIGTERM)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "test-agent-gateway-old",
+			Namespace:         "test-ns",
+			Labels:            map[string]string{"app": "test-agent-gateway"},
+			DeletionTimestamp: &now,
+			Finalizers:        []string{"kubernetes.io/dummy"},
+		},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name: "platform-agent",
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					ExitCode: 143,
+					Reason:   "Error",
+				}},
+			}},
+			Conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue}},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	phase, _, _ := r.getDeploymentStatusDetails(context.Background(), agent)
+	// Terminating pod must be skipped, leaving default phase Provisioning.
+	if phase == "Degraded" {
+		t.Errorf("getDeploymentStatusDetails returned Degraded for a terminating pod")
+	}
+}
+
+func TestGetDeploymentStatusDetails_NonStagingTerminatedIgnored(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+
+	// Active pod with non-staging container terminated (not yet restarted into waiting)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-gateway-xyz",
+			Namespace: "test-ns",
+			Labels:    map[string]string{"app": "test-agent-gateway"},
+		},
+		Status: corev1.PodStatus{
+			ContainerStatuses: []corev1.ContainerStatus{{
+				Name: "platform-agent",
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					ExitCode: 143,
+					Reason:   "Error",
+				}},
+			}},
+			Conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue}},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	phase, _, _ := r.getDeploymentStatusDetails(context.Background(), agent)
+	// Non-staging container terminated should not trigger Degraded in getDeploymentStatusDetails.
+	if phase == "Degraded" {
+		t.Errorf("getDeploymentStatusDetails returned Degraded for non-staging terminated container")
+	}
+}
+
+func TestGetDeploymentStatusDetails_StagingInitTerminatedReportsDegraded(t *testing.T) {
+	scheme := setupScheme()
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+
+	// Active pod where stage-custom-plugin init container terminated with code 127
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-agent-gateway-xyz",
+			Namespace: "test-ns",
+			Labels:    map[string]string{"app": "test-agent-gateway"},
+		},
+		Status: corev1.PodStatus{
+			InitContainerStatuses: []corev1.ContainerStatus{{
+				Name: "stage-custom-plugin",
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					ExitCode: 127,
+					Reason:   "Error",
+					Message:  "exec /bin/sh: no such file or directory",
+				}},
+			}},
+			Conditions: []corev1.PodCondition{{Type: corev1.PodScheduled, Status: corev1.ConditionTrue}},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(agent, pod).Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+
+	phase, reason, message := r.getDeploymentStatusDetails(context.Background(), agent)
+	if phase != "Degraded" {
+		t.Errorf("expected phase Degraded, got %q", phase)
+	}
+	if reason != "Error" {
+		t.Errorf("expected reason Error, got %q", reason)
+	}
+	if !strings.Contains(message, "stage-custom-plugin") || !strings.Contains(message, "missing /bin/sh") {
+		t.Errorf("expected message diagnosing missing /bin/sh, got %q", message)
 	}
 }

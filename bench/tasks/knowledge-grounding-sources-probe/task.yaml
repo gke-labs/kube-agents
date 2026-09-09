@@ -35,10 +35,16 @@
 # pull request on the pool's provisioning date rather than on the diff.
 #
 # Isolation class: read-only (no cluster touched at all).
-# Eligible tier: presubmit. Cost: one delegation round trip plus one
-# knowledge lookup; measured 166-715s across three repetitions (median 615s),
-# so unit_cost_hint in hack/ci-eval-pr.sh carries an entry for it. No tofu,
-# no fleet read.
+# Tier: nightly -- registered in hack/ci-eval-pr.sh NIGHTLY_TASKS since
+# 2026-09-09, after one presubmit cycle in TASKS (#945: 2/3 on the build
+# above, then 3/3 on build 2097414338968031232 once the citation check was
+# widened). Held out of presubmit deliberately, not for cost or flake:
+# knowledge grounding is a cross-cutting persona behavior rather than one of
+# the core kube-agents journeys the presubmit gate exists for, so it earns
+# its record in the nightly's full catalog. Cost: one delegation round trip
+# plus one knowledge lookup; measured 166-1602s across six repetitions
+# (median ~600s), so unit_cost_hint in hack/ci-eval-pr.sh carries an entry
+# for it. No tofu, no fleet read.
 id: knowledge-grounding-sources-probe
 name: Grounded GKE knowledge answer cites its sources
 prompt: >-

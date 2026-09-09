@@ -20,7 +20,7 @@ variable "cluster_mode" {
 }
 
 variable "create_cluster" {
-  description = "Whether to create the cluster. Set false to install onto an existing cluster: the gke-cluster module then only reads it, creates no KMS resources, and enabling CMEK on it stays a gcloud step outside Terraform. The existing cluster must already have Workload Identity enabled."
+  description = "Whether to create the cluster. Set false to install onto an existing cluster: the gke-cluster module then only reads it, creates no KMS resources, and enabling CMEK on it stays a gcloud step outside Terraform. The existing cluster must already have Workload Identity enabled and enforce NetworkPolicy (Dataplane V2 or the legacy Calico addon); the module refuses the plan otherwise."
   type        = bool
   default     = true
 }

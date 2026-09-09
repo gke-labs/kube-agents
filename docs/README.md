@@ -370,7 +370,7 @@ only what the title does not say.
 | `concepts/inference-gateway.md` | Site page | Model access as a config toggle: LiteLLM for hosted models, vLLM for local, optional replay caching. | Provider choice, replay modes | — |
 | `concepts/observability.md` | Site page | OTel traces, Prometheus metrics, and Cloud Logging routing for agent and gateway. | Exports per component, console links, tool-call audit | — |
 | `install/quickstart-gke.mdx` | Site page | One-command bootstrap of cluster, operator, and Platform Agent; what just happened; common flags. | `install.sh`, toggles, uninstall pointer | — |
-| `install/prerequisites.md` | Site page | What must be in place before provisioning: tooling, GCP project, cert-manager, chat platform, LLM credentials. | Prerequisites | — |
+| `install/prerequisites.md` | Site page | What must be in place before provisioning: tooling, GCP project, what a pre-existing cluster must already have, cert-manager, chat platform, LLM credentials. | Prerequisites | — |
 | `install/manual.md` | Site page | Installing the Platform Agent workspace into an existing Hermes-compatible harness by hand. | Copy workspace, register, wire infra | — |
 | `install/helm-and-kind.md` | Site page | Points to the canonical Helm chart and Terraform modules in `main` (published from the first `X.Y.Z` tag) and states Kind is unsupported. | Chart/module pointers, no Kind | — |
 | `install/uninstall.md` | Site page | Removing the agent, operator, and provisioned GCP resources; agent-only vs full teardown. | Teardown | — |

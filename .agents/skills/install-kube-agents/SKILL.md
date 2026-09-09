@@ -27,8 +27,9 @@ Order of operations: resolve the image/source ref → check CLI prerequisites (i
 verify it against that ref → load `install.env` → interview for what is missing → generate
 `terraform.tfvars` → run
 `lifecycle.sh apply`. The source check happens **before** the interview, so a bad ref fails in
-seconds rather than after a dozen answers. Two steps stay `gcloud` calls after the apply — the
-managed-OTel scope and CMEK on a pre-existing cluster — and the GitHub App PEM import runs through
+seconds rather than after a dozen answers. Some steps stay `gcloud` calls outside the apply — before
+it, CMEK, the Workload Identity pool and NetworkPolicy enforcement on a pre-existing cluster; after
+it, the managed-OTel scope on a cluster it created — and the GitHub App PEM import runs through
 the Minty CLI so the key never enters Terraform state. Re-running the installer (or its `--menu`
 Day-2 panel's Save & Apply) reconciles every change through one `terraform apply`.
 

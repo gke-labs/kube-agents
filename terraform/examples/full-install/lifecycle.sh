@@ -145,14 +145,23 @@ ensure_init() {
 # failing console left an empty value, `set -e` killed the script on the
 # assignment, and the run ended with no output whatsoever — which is exactly what
 # an uninitialised module did before ensure_init existed.
+# A variable nobody set and whose default is null -- agent_service_account_id
+# in a hand-written tfvars -- prints as `tostring(null)` (a typed null; older
+# releases print `null`). Callers want "unset", not that spelling: read as a
+# name, it made guard_gsa_identity refuse every apply whose tfvars left the
+# variable alone, which is what broke the autopush deploys after #1309.
 tfvar() {
-  local out
+  local out value
   if ! out=$(echo "var.$1" | terraform console 2>&1); then
     printf '%s\n' "$out" >&2
     warn "could not evaluate var.$1 (see the terraform error above)"
     exit 1
   fi
-  printf '%s\n' "$out" | tail -1 | tr -d '"'
+  value=$(printf '%s\n' "$out" | tail -1 | tr -d '"')
+  case "$value" in
+    null | "tostring(null)") value="" ;;
+  esac
+  printf '%s\n' "$value"
 }
 
 # The state list is read once and matched in memory. Piping it straight into
@@ -424,7 +433,7 @@ guard_gsa_identity() {
   if ! desired=$(tfvar agent_service_account_id 2>/dev/null); then
     desired="kubeagents-platform-gsa"
   fi
-  if [[ "$desired" == "null" || -z "$desired" ]]; then
+  if [[ "$desired" == "null" || "$desired" == "tostring(null)" || -z "$desired" ]]; then
     desired="kubeagents-platform-gsa"
   fi
 

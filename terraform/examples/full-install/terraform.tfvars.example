@@ -36,8 +36,9 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # Cluster topology. "autopilot" (default) or "standard" — standard builds an
 # e2-standard-4 node pool with Dataplane V2, and is the only mode
 # that can carry the gVisor node pool. Set create_cluster = false to install
-# onto an existing cluster (it must already have Workload Identity; CMEK on it
-# stays a gcloud step outside Terraform).
+# onto an existing cluster (it must already have Workload Identity and enforce
+# NetworkPolicy, or the plan is refused; CMEK on it stays a gcloud step outside
+# Terraform).
 # cluster_mode            = "standard"
 # create_cluster          = false
 # enable_gvisor_node_pool = true
