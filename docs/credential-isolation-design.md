@@ -87,8 +87,9 @@ The operator does not place managed credentials in the sandbox Pod's:
   metadata server has nothing to give it.
 
 Two containers mount a projected ServiceAccount token on purpose, and both projections
-carry the broker's audience rather than the Kubernetes API's: the gateway's
-`platform-agent` container and the sandbox's `shell` container. Each presents it to the
+carry a broker audience rather than the Kubernetes API's (one per pod, so the broker can
+tell the two apart): the gateway's `platform-agent` container and the sandbox's `shell`
+container. Each presents it to the
 broker to be let past the listener's authentication, which is what
 `CREDENTIAL_PROXY_TOKEN_FILE` names. The API server rejects a token minted for another
 audience, so neither is a Kubernetes credential and neither undoes the Pod's
@@ -273,13 +274,14 @@ to a per-process random salt with one warning.
 The projected token uses the audience `kubeagents-credential-proxy`, expires
 after one hour, and is mounted at
 `/var/run/secrets/kubeagents/serviceaccount/token` in the credential runtime. A token
-with the same audience is also mounted read-only in the `platform-agent` container,
-because that is how the agent authenticates to a broker that is not on loopback.
-The event watcher has a separate one-hour token with the Kubernetes API's
-default audience, plus the cluster CA and Pod namespace, mounted at the
-conventional in-cluster path in `agent-api-auth`. Two differently
-audienced tokens therefore sit side by side in the gateway Pod: the broker-audience one,
-which the Kubernetes API will not accept, and the watcher's, which it will. Neither is
+for the gateway's own broker audience, `kubeagents-credential-proxy-chat`, is mounted
+read-only in the `platform-agent` container, because that is how the agent
+authenticates to a broker that is not on loopback and how the broker knows it is the
+gateway calling. The event watcher has a separate one-hour token with the Kubernetes
+API's default audience, plus the cluster CA and Pod namespace, mounted at the
+conventional in-cluster path in `agent-api-auth`. Two differently audienced tokens
+therefore sit side by side in the gateway Pod: the broker-audience one, which the
+Kubernetes API will not accept, and the watcher's, which it will. Neither is
 shared with the sandbox or dashboard.
 Deleting a default token during startup is intentionally not used: projected
 tokens rotate, and mount-time exclusion is reliable.
