@@ -245,6 +245,33 @@ class TestEveryTaskIsValid(unittest.TestCase):
             with self.subTest(rule=needle):
                 self._assert_none(needle, guidance)
 
+    def test_every_task_names_an_owner(self):
+        for needle, guidance in (
+            (
+                "declares no 'owner:'",
+                "These cases name nobody to answer when they flake -- see "
+                "bench/CONTRIBUTING.md:",
+            ),
+            ("leading at sign", "These cases write the owner as a mention:"),
+            ("neither a GitHub login", "These cases carry an owner that is not a login:"),
+        ):
+            with self.subTest(rule=needle):
+                self._assert_none(needle, guidance)
+
+    def test_no_fixture_carries_a_real_address_or_credential(self):
+        # The sanitization scan is tree-level rather than per case, like the
+        # fixture-catalogue drift check, so validate_all() does not carry it
+        # and this is the assertion that gates it.
+        findings = validator.sanitization_findings()
+        self.assertEqual(
+            findings,
+            [],
+            "\n\nThese fixture lines carry an IPv4 literal outside the RFC 5737 "
+            "documentation ranges or a credential-shaped string. Replace the "
+            "value, or append 'sanitizer: allow <reason>' to the line -- see "
+            "bench/CONTRIBUTING.md:\n  " + "\n  ".join(findings),
+        )
+
     def test_every_named_fixture_role_exists(self):
         self._assert_none(
             "neither bench/tf/fleet/fixtures.json",
@@ -393,6 +420,7 @@ class TestTheValidatorItself(unittest.TestCase):
             "id": "made-up-case",
             "name": "A case",
             "domain": "security",
+            "owner": "maintainers",
             "fixtures": ["rbac-overgrant"],
             "verification_spec": [
                 {
@@ -442,6 +470,7 @@ class TestTheRulesReject(unittest.TestCase):
         "id": "made-up-case",
         "name": "A case",
         "domain": "security",
+        "owner": "maintainers",
         "fixtures": ["rbac-overgrant"],
         "verification_spec": [
             {
@@ -495,6 +524,25 @@ class TestTheRulesReject(unittest.TestCase):
         # Membership of a set of slugs raises TypeError on an unhashable
         # value, which would be a traceback instead of a finding.
         self._only("is not a slug string", domain=["security", "cost"])
+
+    def test_a_missing_owner_is_rejected(self):
+        self._only("declares no 'owner:'", owner=DELETE)
+
+    def test_an_owner_with_a_leading_at_sign_is_rejected(self):
+        self._only("leading at sign", owner="@someone")
+
+    def test_a_malformed_owner_is_rejected(self):
+        # An e-mail address, a display name and a doubled hyphen are the three
+        # shapes a contributor is likely to write; GitHub accepts none of them.
+        for owner in ("someone@example.com", "Some One", "some--one", "-someone"):
+            with self.subTest(owner=owner):
+                self._only("neither a GitHub login", owner=owner)
+
+    def test_an_owner_that_is_not_a_string_is_rejected(self):
+        self._only("is not a GitHub login string", owner=["a", "b"])
+
+    def test_a_login_owner_passes(self):
+        self.assertEqual(self._validate(owner="some-one1"), [])
 
     def test_an_unknown_fixture_role_is_rejected(self):
         # Deliberately not a plausible-looking slug: `hpa-saturated` used to
@@ -557,6 +605,7 @@ class TestTheRulesReject(unittest.TestCase):
             text=(
                 "id: made-up-case\n"
                 "domain: security\n"
+                "owner: maintainers\n"
                 "verification_spec: [{name: n, role: objective, "
                 "check: {type: report_contains, required_phrases: [x]}}]\n"
             ),
@@ -658,6 +707,175 @@ class TestTheRulesReject(unittest.TestCase):
                 }
             ),
         )
+
+
+class TestTheSanitizer(unittest.TestCase):
+    """The fixture scan, against a tree built to trip exactly one rule at a time.
+
+    Every credential here is assembled from a prefix and a run of one
+    character, so it has the shape the redactor matches and nothing else:
+    no real token's checksum, nothing a secret scanner would page anyone for.
+    """
+
+    def _findings(self, files, roots=None):
+        """Findings for a temporary tree holding `files` ({relative path: text})."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            for relative, content in files.items():
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if isinstance(content, bytes):
+                    path.write_bytes(content)
+                else:
+                    path.write_text(content)
+            found = validator.sanitization_findings(
+                tuple(root / r for r in roots) if roots else (root,)
+            )
+            return [f.replace(tmp + "/", "") for f in found]
+
+    def _only(self, needle, files):
+        findings = self._findings(files)
+        self.assertEqual(len(findings), 1, f"expected one finding, got {findings}")
+        self.assertIn(needle, findings[0])
+        return findings[0]
+
+    def test_a_clean_tree_has_no_findings(self):
+        self.assertEqual(self._findings({"case/task.yaml": "prompt: nothing to see\n"}), [])
+
+    def test_each_rfc1918_range_is_rejected(self):
+        for literal in ("10.1.2.3", "172.16.5.5", "172.31.255.1", "192.168.0.1"):
+            with self.subTest(literal=literal):
+                found = self._only("IPv4 literal", {"case/task.yaml": f"host: {literal}\n"})
+                self.assertIn(literal, found)
+                self.assertTrue(found.startswith("case/task.yaml:1:"), found)
+
+    def test_a_public_literal_is_rejected(self):
+        self._only("IPv4 literal 8.8.8.8", {"case/task.yaml": "dns: 8.8.8.8\n"})
+
+    def test_loopback_and_unspecified_take_the_marker(self):
+        for literal in ("127.0.0.1", "0.0.0.0"):
+            with self.subTest(literal=literal):
+                self._only("IPv4 literal", {"case/x.yaml": f"bind: {literal}\n"})
+
+    def test_each_documentation_range_passes(self):
+        for literal in ("192.0.2.1", "198.51.100.200", "203.0.113.255"):
+            with self.subTest(literal=literal):
+                self.assertEqual(self._findings({"case/task.yaml": f"host: {literal}\n"}), [])
+
+    def test_a_dotted_quad_that_is_not_an_address_passes(self):
+        # A version tag, a five-part number and an octet over 255 are not
+        # addresses, whatever they look like.
+        text = "image: v1.2.3.4\nchain: 1.2.3.4.5\nbad: 300.1.1.1\n"
+        self.assertEqual(self._findings({"case/task.yaml": text}), [])
+
+    def test_each_credential_shape_is_rejected(self):
+        shapes = {
+            "a GCP API key": "AIza" + "0" * 35,
+            "a GCP OAuth token": "ya29." + "a" * 20,
+            "a GitHub token": "ghp_" + "a" * 20,
+            "a GitHub fine-grained token": "github_pat_" + "a" * 20,
+            "a Slack token": "xoxb-" + "0" * 10,
+            "a JWT": "eyJ" + "a" * 10 + "." + "b" * 10 + "." + "c" * 10,
+        }
+        for label, value in shapes.items():
+            with self.subTest(shape=label):
+                self._only(label, {"case/task.yaml": f"value: {value}\n"})
+
+    def test_a_private_key_block_is_rejected_at_its_first_line(self):
+        pem = "-----BEGIN PRIVATE KEY-----\n" + "a" * 16 + "\n-----END PRIVATE KEY-----\n"
+        found = self._only("a private-key block", {"case/key.pem": "# header\n" + pem})
+        self.assertTrue(found.startswith("case/key.pem:2:"), found)
+
+    def test_the_marker_with_a_reason_exempts_its_line(self):
+        text = "bind: 127.0.0.1 # sanitizer: allow the kube-proxy default, not a host\n"
+        self.assertEqual(self._findings({"case/task.yaml": text}), [])
+
+    def test_the_marker_exempts_only_its_own_line(self):
+        text = (
+            "a: 127.0.0.1 # sanitizer: allow loopback\n"
+            "b: 10.0.0.1\n"
+        )
+        found = self._only("IPv4 literal 10.0.0.1", {"case/task.yaml": text})
+        self.assertTrue(found.startswith("case/task.yaml:2:"), found)
+
+    def test_the_marker_on_the_first_line_exempts_a_key_block(self):
+        pem = (
+            "-----BEGIN PRIVATE KEY----- # sanitizer: allow a fixture key with no bits in it\n"
+            + "a" * 16
+            + "\n-----END PRIVATE KEY-----\n"
+        )
+        self.assertEqual(self._findings({"case/key.pem": pem}), [])
+
+    def test_a_bare_marker_is_rejected(self):
+        # Both the marker and the value it failed to exempt are reported: the
+        # exemption is not applied without a reason.
+        findings = self._findings({"case/task.yaml": "a: 10.0.0.1 # sanitizer: allow\n"})
+        self.assertEqual(len(findings), 2, findings)
+        self.assertIn("with no reason after it", findings[0])
+        self.assertIn("IPv4 literal 10.0.0.1", findings[1])
+
+    def test_a_bare_marker_on_a_clean_line_is_still_rejected(self):
+        self._only("with no reason after it", {"case/task.yaml": "# sanitizer: allow\n"})
+
+    def test_a_prebuilt_stack_file_is_scanned(self):
+        found = self._only(
+            "IPv4 literal 10.0.0.1",
+            {
+                "tasks/case/task.yaml": "ok: 192.0.2.1\n",
+                "tf/prebuilt/stack/main.tf": 'ip = "10.0.0.1"\n',
+            },
+        )
+        self.assertTrue(found.startswith("tf/prebuilt/stack/main.tf:1:"), found)
+
+    def test_dot_directories_and_local_tofu_artefacts_are_skipped(self):
+        files = {
+            "stack/.terraform/x.txt": "10.0.0.1\n",
+            "stack/.terraform.lock.hcl": "10.0.0.2\n",
+            "stack/terraform.tfstate": "10.0.0.3\n",
+            "stack/terraform.tfstate.backup": "10.0.0.4\n",
+            "stack/terraform.tfvars": "10.0.0.5\n",
+            "stack/prod.auto.tfvars": "10.0.0.6\n",
+        }
+        self.assertEqual(self._findings(files), [])
+
+    def test_a_binary_file_is_skipped(self):
+        self.assertEqual(self._findings({"case/blob.bin": b"x\0y 10.0.0.1"}), [])
+
+    def test_only_the_named_roots_are_scanned(self):
+        files = {"tasks/case/task.yaml": "a: 10.0.0.1\n", "elsewhere/x.txt": "b: 10.0.0.2\n"}
+        findings = self._findings(files, roots=("tasks",))
+        self.assertEqual(len(findings), 1, findings)
+        self.assertIn("10.0.0.1", findings[0])
+
+    def test_the_shapes_are_the_redactors_own(self):
+        # Imported, not copied: an extension of AuditRedactor reaches this
+        # scan without a second edit, and a shape named here that the class
+        # stops defining is a loud failure rather than a narrower scan.
+        patterns = validator.credential_patterns()
+        self.assertEqual(set(patterns), set(validator.CREDENTIAL_SHAPES.values()))
+        with unittest.mock.patch.dict(
+            validator.CREDENTIAL_SHAPES, {"NO_SUCH_PATTERN": "nothing"}, clear=False
+        ):
+            with self.assertRaises(validator.CaseError):
+                validator.credential_patterns()
+
+    def test_main_exits_non_zero_on_a_sanitization_finding(self):
+        # main() scans the named case's directory, so a scratch draft is
+        # checked with the fixtures beside it, and a finding reds the exit
+        # code the way a rejected case does.
+        spec = {**TestTheRulesReject.VALID}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "made-up-case" / "task.yaml"
+            path.parent.mkdir()
+            path.write_text(yaml.safe_dump(spec))
+            (path.parent / "values.yaml").write_text("upstream: 192.0.2.53\n")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(validator.main([str(path)]), 0)
+            (path.parent / "values.yaml").write_text("upstream: 10.0.0.53\n")
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(validator.main([str(path)]), 1)
+            self.assertIn("unsanitized fixture", out.getvalue())
+            self.assertIn("10.0.0.53", out.getvalue())
 
 
 class TestTheAllowlistsAndTheSweep(unittest.TestCase):

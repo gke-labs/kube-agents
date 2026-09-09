@@ -43,6 +43,9 @@ validated: false
 # Slug per docs/designs/domains.yaml: the front door's routing journey.
 domain: chat-and-routing
 
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
 # Exact checks. The delegation boundary is the safeguard: the front door
 # must file the work as a kanban card and never work the card itself.
 verification_spec:

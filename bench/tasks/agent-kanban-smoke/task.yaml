@@ -59,6 +59,9 @@ validated: false
 # the worker's delivered answer back into the thread.
 domain: chat-and-routing
 
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
 # The answer is graded, not the receipt. The three seeded names are planted
 # facts we chose (see the header's rendering contract), so an exact match is
 # fair, and required_phrases is substring-AND: extra clusters in the answer

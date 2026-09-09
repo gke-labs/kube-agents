@@ -58,6 +58,9 @@ validated: false
 # Slug per docs/designs/domains.yaml.
 domain: incident-triage
 
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
 # The board read, not the diagnosis. The triage was produced minutes earlier by
 # a different session -- the one k8s-event-watcher opened, worked by a cluster-*
 # agent -- and the thing under test is whether that pipeline delivered. The

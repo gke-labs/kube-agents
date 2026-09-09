@@ -6,8 +6,10 @@ run the agent, score, read the log. Most of the mistakes are static. A domain
 slug that matches no row in `docs/designs/domains.yaml` counts as coverage of
 nothing; a fixture role the seeded fleet does not define is a case addressing
 a defect that was never planted; a check with no assertion is a check that
-cannot fail; a case in no `TASKS` entry never runs at all. None of those needs
-a cluster to find.
+cannot fail; a case in no `TASKS` entry never runs at all; a case with no
+`owner:` has nobody to answer when it flakes; a fixture carrying a real
+address or a credential is a leak the moment it merges. None of those needs a
+cluster to find.
 
 This module is both the library the CI lint calls
 (`scripts/test_task_registration.py`) and the CLI `make bench-case-check`
@@ -18,8 +20,10 @@ valid case is. A rule added here therefore gates the day it is written, with
 no second edit anywhere. The CLI runs in no workflow; the lint is what reds a
 pull request.
 
-`docs/designs/bench-case-format.md` is the contract these rules enforce, and
-`docs/designs/bench-fleet-catalog.md` the fixture half of it.
+`docs/designs/bench-case-format.md` is the contract these rules enforce,
+`docs/designs/bench-fleet-catalog.md` the fixture half of it, and
+`bench/CONTRIBUTING.md` the submission path the `owner:` and sanitization rules
+come from.
 
 Usage::
 
@@ -30,6 +34,9 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import fnmatch
+import importlib.util
+import ipaddress
 import json
 import pathlib
 import re
@@ -48,6 +55,65 @@ FIXTURES_FILE = REPO_ROOT / "docs" / "designs" / "fleet-fixtures.yaml"
 # the day-N gates and the project-scoped fixtures on top of it; it does not get
 # to name a role differently, which fixture_catalog_disagreements() enforces.
 ROLE_CATALOG = REPO_ROOT / "bench" / "tf" / "fleet" / "fixtures.json"
+
+# The `owner:` field, from bench/CONTRIBUTING.md. A GitHub login, bare, or
+# this literal for a case the OWNERS approvers answer for. Bare because the
+# field is a name to look up, not a mention: a task.yaml is quoted into
+# issues and pull-request comments, where a leading at sign pages someone.
+OWNER_MAINTAINERS = "maintainers"
+# GitHub's own login rule: alphanumerics and single interior hyphens, at most
+# 39 characters, so a stray e-mail address or a display name is rejected
+# before a reviewer has to spot it.
+GITHUB_LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}")
+
+# The fixture sanitization scan, from bench/CONTRIBUTING.md. Everything a
+# contributed case brings with it lives in one of these two trees -- the case
+# directory, and the OpenTofu stack bench/CUSTOM-TASKS.md tells the author to
+# put under bench/tf/prebuilt/<stack>/. Nothing else under bench/tf/ is
+# scanned: the shared modules and the seeded fleet are in-house and carry
+# in-house addresses on purpose.
+PREBUILT_DIR = REPO_ROOT / "bench" / "tf" / "prebuilt"
+SANITIZED_ROOTS: tuple[pathlib.Path, ...] = (TASKS_DIR, PREBUILT_DIR)
+# Local artefacts of running a stack, never committed and full of real
+# addresses by construction. A path component beginning with a dot
+# (.terraform/, .terraform.lock.hcl) is skipped for the same reason.
+SANITIZER_SKIP_GLOBS: tuple[str, ...] = ("*.tfstate*", "*.tfvars")
+# The per-line escape hatch: the marker, then the reason, on the line that
+# carries the value. A marker with no reason is itself a finding, so the
+# exemption cannot be applied by reflex.
+SANITIZER_ALLOW_MARKER = "sanitizer: allow"
+SANITIZER_ALLOW_RE = re.compile(re.escape(SANITIZER_ALLOW_MARKER) + r"\b(.*)$")
+# The three RFC 5737 documentation ranges are the only IPv4 literals a fixture
+# may carry unescaped. Everything else -- RFC 1918, public, loopback,
+# 0.0.0.0 -- takes the marker, because the check cannot tell a customer's
+# address plan from a fictional one and the marker's reason is where the
+# author says which.
+DOCUMENTATION_NETWORKS: tuple[ipaddress.IPv4Network, ...] = (
+    ipaddress.IPv4Network("192.0.2.0/24"),
+    ipaddress.IPv4Network("198.51.100.0/24"),
+    ipaddress.IPv4Network("203.0.113.0/24"),
+)
+# A dotted quad with nothing word-like on either side, so `v1.2.3.4` and
+# `1.2.3.4.5` do not match; octets over 255 are dropped by the IPv4Address
+# parse rather than by the pattern.
+IPV4_LITERAL = re.compile(r"(?<![\w.])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![\w.])")
+# The credential shapes, imported from the audit redactor rather than copied
+# so an extension there reaches this check without a second edit. Bearer,
+# key/value and e-mail patterns are deliberately absent: each matches ordinary
+# prose in a prompt ("the token the workload presents", an address in an
+# expected_output), and a check that reds prose is a check that gets escaped
+# by reflex. The value is the reader-facing name for the finding.
+REDACTOR_FILE = REPO_ROOT / "agents" / "chat" / "defaults" / "plugins" / "common" / "redactor.py"
+REDACTOR_CLASS = "AuditRedactor"
+CREDENTIAL_SHAPES: dict[str, str] = {
+    "PRIVATE_KEY_PATTERN": "a private-key block",
+    "GCP_API_KEY_PATTERN": "a GCP API key",
+    "GCP_OAUTH_TOKEN_PATTERN": "a GCP OAuth token",
+    "GITHUB_TOKEN_PATTERN": "a GitHub token",
+    "GITHUB_PAT_PATTERN": "a GitHub fine-grained token",
+    "SLACK_TOKEN_PATTERN": "a Slack token",
+    "JWT_PATTERN": "a JWT",
+}
 
 # Cases that are neither in TASKS nor nightly-tiered, on purpose, for now.
 # Every entry carries its reason; an entry without one should not survive
@@ -434,6 +500,31 @@ def validate_case(name: str, path: pathlib.Path, *, registered: set[str] | None)
             "not define"
         )
 
+    # The owner. Demotion (docs/eval-gate-roster.md) files an issue against a
+    # flaking case, and this field is who that issue goes to. devops-bench
+    # discards the key, so like `domain` it is enforced here or nowhere.
+    owner = spec.get("owner")
+    if owner is None:
+        problems.append(
+            "declares no 'owner:'. Name the GitHub login (without the at sign) "
+            f"that answers when this case flakes, or {OWNER_MAINTAINERS!r} for "
+            "a case the OWNERS approvers own -- see bench/CONTRIBUTING.md"
+        )
+    elif not isinstance(owner, str) or not owner:
+        problems.append(f"'owner:' {owner!r} is not a GitHub login string")
+    elif owner.startswith("@"):
+        problems.append(
+            f"owner {owner!r} carries a leading at sign; write the login bare, "
+            "so a task.yaml quoted into an issue names someone rather than "
+            "paging them"
+        )
+    elif owner != OWNER_MAINTAINERS and not GITHUB_LOGIN.fullmatch(owner):
+        problems.append(
+            f"owner {owner!r} is neither a GitHub login (letters, digits and "
+            "single hyphens, at most 39 characters) nor the literal "
+            f"{OWNER_MAINTAINERS!r}"
+        )
+
     # Fixture roles. Cases address the seeded fleet by role, never by cluster
     # name or project id -- see docs/designs/bench-fleet-catalog.md.
     fixtures = spec.get("fixtures")
@@ -590,6 +681,142 @@ def validate_all() -> dict[str, list[str]]:
     return results
 
 
+def credential_patterns() -> dict[str, re.Pattern[str]]:
+    """The AuditRedactor token shapes this scan applies, by reader-facing name.
+
+    Loaded from the file rather than imported as a package: the redactor sits
+    inside a Hermes plugin tree that is not on sys.path here, and it depends on
+    the standard library alone, so `make bench-case-check` still needs PyYAML
+    and nothing else. A shape named in CREDENTIAL_SHAPES that the class no
+    longer defines is a CaseError rather than a silently narrower scan.
+    """
+    spec = importlib.util.spec_from_file_location("kube_agents_audit_redactor", REDACTOR_FILE)
+    if spec is None or spec.loader is None:
+        raise CaseError(f"{REDACTOR_FILE}: could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:  # any import failure is the finding, whatever its class
+        raise CaseError(f"{REDACTOR_FILE}: could not be imported: {exc}") from exc
+    redactor = getattr(module, REDACTOR_CLASS, None)
+    patterns: dict[str, re.Pattern[str]] = {}
+    for attribute, label in CREDENTIAL_SHAPES.items():
+        pattern = getattr(redactor, attribute, None)
+        if not isinstance(pattern, re.Pattern):
+            raise CaseError(
+                f"{REDACTOR_FILE}: {REDACTOR_CLASS}.{attribute} is not a compiled "
+                "pattern; CREDENTIAL_SHAPES in scripts/validate_bench_cases.py "
+                "names a shape the redactor no longer defines"
+            )
+        patterns[label] = pattern
+    return patterns
+
+
+def _sanitized_files(roots: tuple[pathlib.Path, ...]) -> list[pathlib.Path]:
+    """Every text file the scan reads, in a stable order."""
+    files: list[pathlib.Path] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(root)
+            if any(part.startswith(".") for part in relative.parts):
+                continue
+            if any(fnmatch.fnmatch(path.name, glob) for glob in SANITIZER_SKIP_GLOBS):
+                continue
+            files.append(path)
+    return files
+
+
+def _display(path: pathlib.Path) -> str:
+    """Repository-relative when the path is in the tree, absolute otherwise."""
+    try:
+        return str(path.relative_to(REPO_ROOT))
+    except ValueError:
+        return str(path)
+
+
+def _non_documentation_addresses(text: str) -> list[tuple[int, str]]:
+    """(offset, literal) for every IPv4 literal outside the RFC 5737 ranges."""
+    found = []
+    for match in IPV4_LITERAL.finditer(text):
+        try:
+            address = ipaddress.IPv4Address(match.group(0))
+        except ValueError:
+            continue
+        if not any(address in network for network in DOCUMENTATION_NETWORKS):
+            found.append((match.start(), match.group(0)))
+    return found
+
+
+def sanitization_findings(roots: tuple[pathlib.Path, ...] = SANITIZED_ROOTS) -> list[str]:
+    """Lines under `roots` that carry a real-looking address or a credential.
+
+    Every finding is one line of one file: the IPv4 literal outside the
+    documentation ranges, or the credential shape, and the line that holds it.
+    The escape is SANITIZER_ALLOW_MARKER on that same line with a reason after
+    it; the marker alone is reported, whether or not the line matched anything,
+    so the exemption is never applied without saying why. A multi-line match --
+    a private-key block -- is exempted by the marker on its first line.
+
+    Files that do not decode as text are skipped: the scan reads prose and
+    configuration, and a binary fixture is a review question rather than a
+    line to report.
+    """
+    patterns = credential_patterns()
+    findings: list[str] = []
+    for path in _sanitized_files(roots):
+        raw = path.read_bytes()
+        if b"\0" in raw:
+            continue
+        text = raw.decode("utf-8", errors="replace")
+        lines = text.split("\n")
+        allowed: set[int] = set()
+        # (line, message) so a file's findings read top to bottom whatever
+        # order the patterns found them in.
+        in_file: list[tuple[int, str]] = []
+        for number, line in enumerate(lines, start=1):
+            marker = SANITIZER_ALLOW_RE.search(line)
+            if marker is None:
+                continue
+            if marker.group(1).strip(" \t-:"):
+                allowed.add(number)
+            else:
+                in_file.append(
+                    (
+                        number,
+                        f"'{SANITIZER_ALLOW_MARKER}' with no reason after it; say "
+                        "what the value is and why it is safe to keep",
+                    )
+                )
+        hits: list[tuple[int, str]] = [
+            (offset, f"IPv4 literal {literal} outside the RFC 5737 documentation ranges")
+            for offset, literal in _non_documentation_addresses(text)
+        ]
+        # The credential itself is not echoed: the line number locates it,
+        # and a check that prints what it found would copy a real token into
+        # a CI log.
+        for label, pattern in patterns.items():
+            hits += [(match.start(), label) for match in pattern.finditer(text)]
+        for offset, description in hits:
+            number = text.count("\n", 0, offset) + 1
+            if number in allowed:
+                continue
+            in_file.append(
+                (
+                    number,
+                    f"{description}. A fixture carries no real address or "
+                    "credential; use a documentation-range address or a "
+                    f"placeholder, or append '{SANITIZER_ALLOW_MARKER} <reason>' "
+                    "to the line -- see bench/CONTRIBUTING.md",
+                )
+            )
+        findings += [f"{_display(path)}:{number}: {message}" for number, message in sorted(in_file)]
+    return findings
+
+
 def stale_allowlist_entries() -> list[str]:
     """Allowlist entries naming a case that no longer exists."""
     existing = bench_cases()
@@ -620,6 +847,14 @@ def main(argv: list[str] | None = None) -> int:
         # case that names a drifted role is rejected above, but the drift
         # itself is worth reporting even when no case has hit it yet.
         drift = fixture_catalog_disagreements()
+        # Over the named cases' own directories when a subset was given, so a
+        # scratch draft outside the tree is scanned with the fixtures beside
+        # it; over both trees otherwise.
+        unsanitized = sanitization_findings(
+            tuple(dict.fromkeys(p.resolve().parent for p in args.paths))
+            if args.paths
+            else SANITIZED_ROOTS
+        )
     except CaseError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -641,6 +876,10 @@ def main(argv: list[str] | None = None) -> int:
     for entry in drift:
         failed += 1
         print(f"fixture catalogue drift: {entry}")
+
+    for entry in unsanitized:
+        failed += 1
+        print(f"unsanitized fixture: {entry}")
 
     if failed:
         print(f"\n{failed} case(s) rejected out of {len(results)} checked.")

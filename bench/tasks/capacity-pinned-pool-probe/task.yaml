@@ -50,6 +50,9 @@ validated: false
 # Slug per docs/designs/domains.yaml.
 domain: capacity
 
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
 # The seeded-fleet defects this scenario asserts on, named by ROLE rather than
 # by cluster: each eval project carries its own trio and this case has to run
 # unchanged against all of them. Roles are defined in

@@ -19,6 +19,9 @@
 id: "gpu-stress-test-diagnosis"
 name: "gpu-stress-test-diagnosis"
 
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
 # No seeded-fleet dependency: this case brings its own cluster up through the
 # prebuilt/gpu-stress-test stack below and asserts on what it planted there.
 # The empty list is the declaration, not an omission -- see
