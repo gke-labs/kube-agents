@@ -1,0 +1,77 @@
+{
+  "commonEventObject": {
+    "userLocale": "en",
+    "hostApp": "CHAT",
+    "platform": "WEB",
+    "timeZone": {
+      "id": "America/Toronto",
+      "offset": -14400000
+    }
+  },
+  "chat": {
+    "user": {
+      "name": "users/101853009193837280452",
+      "displayName": "Test Sender",
+      "avatarUrl": "https://lh3.googleusercontent.com/a/REDACTED\u003dk-no",
+      "email": "sender@example.com",
+      "type": "HUMAN",
+      "domainId": "REDACTED"
+    },
+    "eventTime": "2026-09-09T15:38:18.393391Z",
+    "messagePayload": {
+      "space": {
+        "name": "spaces/_ia8wqAAAAE",
+        "type": "DM",
+        "singleUserBotDm": true,
+        "spaceThreadingState": "THREADED_MESSAGES",
+        "spaceType": "DIRECT_MESSAGE",
+        "spaceHistoryState": "HISTORY_ON",
+        "lastActiveTime": "2026-09-09T15:38:18.393391Z",
+        "membershipCount": {
+          "joinedDirectHumanUserCount": 1
+        },
+        "spaceUri": "https://chat.google.com/dm/_ia8wqAAAAE?cls\u003d11"
+      },
+      "message": {
+        "name": "spaces/_ia8wqAAAAE/messages/wh-7cP8oL1U.wh-7cP8oL1U",
+        "sender": {
+          "name": "users/101853009193837280452",
+          "displayName": "Test Sender",
+          "avatarUrl": "https://lh3.googleusercontent.com/a/REDACTED\u003dk-no",
+          "email": "sender@example.com",
+          "type": "HUMAN",
+          "domainId": "REDACTED"
+        },
+        "createTime": "2026-09-09T15:38:18.393391Z",
+        "text": "hello",
+        "thread": {
+          "name": "spaces/_ia8wqAAAAE/threads/wh-7cP8oL1U",
+          "retentionSettings": {
+            "state": "PERMANENT"
+          }
+        },
+        "space": {
+          "name": "spaces/_ia8wqAAAAE",
+          "type": "DM",
+          "singleUserBotDm": true,
+          "spaceThreadingState": "THREADED_MESSAGES",
+          "spaceType": "DIRECT_MESSAGE",
+          "spaceHistoryState": "HISTORY_ON",
+          "lastActiveTime": "2026-09-09T15:38:18.393391Z",
+          "membershipCount": {
+            "joinedDirectHumanUserCount": 1
+          },
+          "spaceUri": "https://chat.google.com/dm/_ia8wqAAAAE?cls\u003d11"
+        },
+        "argumentText": "hello",
+        "retentionSettings": {
+          "state": "PERMANENT"
+        },
+        "messageHistoryState": "HISTORY_ON",
+        "formattedText": "hello",
+        "markupSyntax": "MARKUP_SYNTAX_CHAT"
+      },
+      "configCompleteRedirectUri": "https://dynamite-preprod.sandbox.google.com/api/bot_config_complete?token\u003dREDACTED"
+    }
+  }
+}

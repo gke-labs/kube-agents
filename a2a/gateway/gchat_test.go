@@ -749,3 +749,220 @@ func TestGchatKeySurvivesKVKeyTokenization(t *testing.T) {
 		t.Errorf("distinct gchat keys collide after sanitization")
 	}
 }
+
+// Under app credentials Chat withholds member emails from
+// spaces.members.list and refuses the email alias in user resource names —
+// both measured live on 2026-09-09 against a real DM space. The adapter
+// bridges the two identities from what it does see: every inbound event
+// carries the sender's immutable users/{id} AND the asserted email.
+func TestGchatRosterResolvesLearnedIDsToEmails(t *testing.T) {
+	f := newFakeChatRelay(t)
+	// The shape Chat actually returned: name and type, no email.
+	f.responses["spaces.members/list"] = map[string]any{
+		"memberships": []any{
+			map[string]any{"member": map[string]any{"name": "users/101853009193837280452", "displayName": "Brian Naylor", "type": "HUMAN"}},
+			map[string]any{"member": map[string]any{"name": "users/2", "type": "HUMAN"}},
+		},
+	}
+	a := newTestGchatAdapterWithRelay(t, f)
+
+	ev := gchatMsg("spaces/D1", "DIRECT_MESSAGE", "THREADED_MESSAGES", "spaces/D1/threads/T1", "spaces/D1/messages/M1", "hi", "", "bnaylor@example.com", "HUMAN")
+	ev.Message.Sender.Name = "users/101853009193837280452"
+	if _, ok := a.inbound(ev); !ok {
+		t.Fatal("inbound expected")
+	}
+	ids, complete, err := a.Roster("gchat:dm/spaces/D1")
+	if err != nil || !complete {
+		t.Fatalf("roster: %v complete=%v", err, complete)
+	}
+	if len(ids) != 2 || ids[0] != "bnaylor@example.com" || ids[1] != "users/2" {
+		t.Errorf("roster = %v; a member who has spoken must resolve to the email the requester was verified as, the rest stay ids", ids)
+	}
+}
+
+func TestGchatOpenDirectUsesTheLearnedIDForAKnownEmail(t *testing.T) {
+	f := newFakeChatRelay(t)
+	f.responses["spaces/findDirectMessage"] = map[string]any{"name": "spaces/D9"}
+	a := newTestGchatAdapterWithRelay(t, f)
+
+	ev := gchatMsg("spaces/S1", "SPACE", "THREADED_MESSAGES", "spaces/S1/threads/T1", "spaces/S1/messages/M1", "@Kage hi", " hi", "U1@example.com", "HUMAN")
+	ev.Message.Sender.Name = "users/777"
+	if _, ok := a.inbound(ev); !ok {
+		t.Fatal("inbound expected")
+	}
+	// Case-insensitive on the email: the lookup key is not the principal.
+	conv, err := a.OpenDirect("u1@example.com")
+	if err != nil || conv != "gchat:dm/spaces/D9" {
+		t.Fatalf("openDirect = %q, %v", conv, err)
+	}
+	if f.call(0).arguments["name"] != "users/777" {
+		t.Errorf("findDirectMessage must use the immutable id Chat accepts under app auth, got %+v", f.call(0).arguments)
+	}
+}
+
+// realGchatFixture loads one captured payload from testdata/gchat and
+// base64-encodes it the way the relay hands events over. Every file there
+// is real traffic from the Chat app in bnaylor-kagents-dev (2026-09-09),
+// scrubbed only of identity fields and the one-time redirect token; field
+// set, key order and every other byte are as Chat published them.
+func realGchatFixture(t *testing.T, name string) (raw []byte, b64 string) {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("testdata", "gchat", name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw, base64.StdEncoding.EncodeToString(raw)
+}
+
+// TestGchatRealAddonPayloads pins the wire shape Chat actually publishes for
+// an app configured through the Workspace add-on surface: no top-level
+// type, the message under chat.messagePayload. The first build of this
+// adapter read only the legacy layout and acked every one of these away
+// without a log line — the test exists so that cannot recur.
+func TestGchatRealAddonPayloads(t *testing.T) {
+	cases := []struct {
+		file    string
+		text    string
+		msgName string
+	}{
+		{"addon-dm-plain.json", "Hi, here's some traffic", "spaces/_ia8wqAAAAE/messages/BP9QzqU063c.BP9QzqU063c"},
+		// In a DM a typed "@app" is plain text to Chat: argumentText equals
+		// text, nothing is stripped and no mention annotation is attached,
+		// so it is delivered verbatim rather than treated as a bare mention.
+		{"addon-dm-bare-mention-text.json", "@bkd-test", "spaces/_ia8wqAAAAE/messages/-IovU-AWTYU.-IovU-AWTYU"},
+		{"addon-dm-mention-with-text.json", "@bkd-test what is your name", "spaces/_ia8wqAAAAE/messages/jhqZwM-35cA.jhqZwM-35cA"},
+		{"addon-dm-hello.json", "hello", "spaces/_ia8wqAAAAE/messages/wh-7cP8oL1U.wh-7cP8oL1U"},
+		// A reply inside a DM thread: threadReply true, the parent's thread
+		// name. A DM binds the whole space, so it lands in the same session.
+		{"addon-dm-thread-reply.json", "@bkd-test thread reply", "spaces/_ia8wqAAAAE/messages/jhqZwM-35cA.iuosuA3Wo-0"},
+	}
+	for _, c := range cases {
+		t.Run(c.file, func(t *testing.T) {
+			a := newTestGchatAdapter(t)
+			_, b64 := realGchatFixture(t, c.file)
+			ev, err := decodeGchatEvent(b64)
+			if err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if ev.shape != gchatShapeAddon || ev.Type != "MESSAGE" {
+				t.Fatalf("shape=%q type=%q", ev.shape, ev.Type)
+			}
+			msg, reason := a.classify(ev)
+			if reason != "" {
+				t.Fatalf("dropped: %s", reason)
+			}
+			if msg.Conversation != "gchat:dm/spaces/_ia8wqAAAAE" || msg.Kind != "dm" ||
+				msg.AuthorID != "sender@example.com" || msg.MessageID != c.msgName || msg.Text != c.text {
+				t.Errorf("normalized = %+v", msg)
+			}
+			// The learned id↔email pair comes from the same event.
+			if a.userIDs["users/101853009193837280452"] != "sender@example.com" {
+				t.Errorf("userIDs = %v", a.userIDs)
+			}
+			// A conversation key minted from a real space name survives
+			// KV tokenization (the id starts with an underscore).
+			if tok := kvKey(msg.Conversation); strings.ContainsAny(tok[len("sessions."):], "./: ") {
+				t.Errorf("kvKey(%q) = %q leaks non-token characters", msg.Conversation, tok)
+			}
+		})
+	}
+}
+
+// An add-on event that is not a message — a membership change, a button —
+// decodes, is not a turn, and the reason names the payload that arrived.
+func TestGchatAddonNonMessagePayloadDropsWithReason(t *testing.T) {
+	a := newTestGchatAdapter(t)
+	raw := `{"commonEventObject":{"hostApp":"CHAT"},"chat":{"user":{"name":"users/1","email":"u1@example.com","type":"HUMAN"},"eventTime":"2026-09-09T15:00:00Z","addedToSpacePayload":{"space":{"name":"spaces/S1","spaceType":"SPACE"},"interactionAdd":true}}}`
+	ev, err := decodeGchatEvent(base64.StdEncoding.EncodeToString([]byte(raw)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, reason := a.classify(ev); !strings.Contains(reason, "addedToSpacePayload") {
+		t.Errorf("reason = %q; must name the payload that arrived", reason)
+	}
+}
+
+// Both wire shapes through Run: a legacy event and a real add-on event are
+// each delivered exactly once and acked.
+func TestGchatRunDeliversBothWireShapes(t *testing.T) {
+	f := newFakeChatRelay(t)
+	legacy := gchatMsg("spaces/D1", "DIRECT_MESSAGE", "", "", "spaces/D1/messages/M1", "legacy hi", "", "u1@example.com", "HUMAN")
+	_, addon := realGchatFixture(t, "addon-dm-hello.json")
+	acked, _ := f.serveEvents([]map[string]any{
+		{"receipt": "r1", "data": b64GchatEvent(t, legacy), "messageId": "1"},
+		{"receipt": "r2", "data": addon, "messageId": "2"},
+	})
+	a := newTestGchatAdapterWithRelay(t, f)
+
+	var mu sync.Mutex
+	var got []InboundMessage
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- a.Run(ctx, func(m InboundMessage) {
+			mu.Lock()
+			got = append(got, m)
+			mu.Unlock()
+		})
+	}()
+	deadline := time.After(5 * time.Second)
+	for {
+		f.mu.Lock()
+		settled := len(*acked)
+		f.mu.Unlock()
+		if settled == 2 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("acks = %v after 5s", *acked)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	cancel()
+	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run returned %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 2 || got[0].Text != "legacy hi" || got[1].Text != "hello" || got[1].Conversation != "gchat:dm/spaces/_ia8wqAAAAE" {
+		t.Errorf("delivered = %+v", got)
+	}
+}
+
+// A DM space is threaded, and a reply belongs in the thread the ask was made
+// in — measured live: an answer to a question asked inside a DM thread landed
+// top-level. The session stays the whole space (the key carries no thread);
+// only where the reply renders follows the latest inbound message.
+func TestGchatDMRepliesFollowTheLatestAskThread(t *testing.T) {
+	f := newFakeChatRelay(t)
+	f.responses["spaces.messages/create"] = map[string]any{"name": "spaces/_ia8wqAAAAE/messages/R1"}
+	a := newTestGchatAdapterWithRelay(t, f)
+
+	// Nothing seen yet: a DM post is top-level.
+	if _, err := a.Post("gchat:dm/spaces/_ia8wqAAAAE", "hello"); err != nil {
+		t.Fatal(err)
+	}
+	if body := f.call(0).arguments["body"].(map[string]any); body["thread"] != nil {
+		t.Errorf("first post threaded with nothing seen: %+v", body)
+	}
+
+	_, b64 := realGchatFixture(t, "addon-dm-thread-reply.json")
+	ev, err := decodeGchatEvent(b64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, reason := a.classify(ev)
+	if reason != "" || msg.Conversation != "gchat:dm/spaces/_ia8wqAAAAE" {
+		t.Fatalf("classify: %+v %q", msg, reason)
+	}
+	if _, err := a.Post(msg.Conversation, "answer"); err != nil {
+		t.Fatal(err)
+	}
+	c := f.call(1)
+	body := c.arguments["body"].(map[string]any)
+	thread, _ := body["thread"].(map[string]any)
+	if thread["name"] != "spaces/_ia8wqAAAAE/threads/jhqZwM-35cA" || c.arguments["messageReplyOption"] != gchatReplyOption {
+		t.Errorf("reply must follow the ask's thread: %+v", c.arguments)
+	}
+}

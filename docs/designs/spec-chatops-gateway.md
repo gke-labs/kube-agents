@@ -486,6 +486,23 @@ one Chat credential in the deployment stays where #913 put it, and the passthrou
 keeps the destructive-method denylist and the error-scrubbing in force for the new
 path without new code.
 
+**Two wire shapes, one decoder.** A Chat app publishes one of two event layouts to its
+topic, and which one is a property of how the app was registered, not of the message.
+The Chat-API registration sends `{"type":"MESSAGE","space":…,"message":…}` — the layout
+`tests/e2e/gchat_agent_test.py` forges. An app configured through the Google Workspace
+add-on surface sends the add-on event object: `{"commonEventObject":…,"chat":{"user":…,
+"eventTime":…,"messagePayload":{"space":…,"message":…}}}`, with no top-level type at
+all — the interaction kind is which `chat.*` payload key is present
+(`messagePayload`, `addedToSpacePayload`, `removedFromSpacePayload`, `buttonClickedPayload`,
+`appCommandPayload`, `widgetUpdatedPayload`). Measured 2026-09-09: every event from the
+app in `bnaylor-kagents-dev` arrived in the add-on layout, and a decoder that read only
+the legacy one acked all of them away. The adapter decodes both into one normalized
+event, and every event that is not a turn is acked WITH a log line naming why
+(`gchat event is not a turn`): an adapter that acks silently is indistinguishable from
+one that receives nothing, which is how the second layout went unnoticed until live
+traffic. The captured payloads live in `a2a/gateway/testdata/gchat/`, scrubbed of
+identity only, and the tests run against them.
+
 Ingress is at-most-once, by decision rather than accident: the adapter acks each
 pulled event before handing it to the session manager. Acking after a durable publish
 would be at-least-once, but the redelivery dedupe is in-memory, so a redelivery
@@ -524,23 +541,31 @@ path already enforces, carried as environment (`A2A_GCHAT_ALLOWED_USERS`, or
 `A2A_GCHAT_ALLOW_ALL_USERS` stated explicitly), because environment is what the agent
 cannot rewrite. An unlisted sender is dropped with a visible once-per-sender notice in
 the conversation, not silently. Messages whose sender is not `HUMAN` or carries no
-email are dropped at the adapter.
+email are dropped at the adapter. `argumentText` is read as Chat computes it: in a
+space it is the text with the app mention stripped, so a bare mention is an empty ask
+and drops; in a DM (measured) it equals `text` with nothing stripped and no mention
+annotation — a typed `@app` there is plain text to Chat, and is delivered verbatim.
 
 **Conversation keys.** `gchat:spaces/AAA/threads/BBB` for a message in a threaded
 space — the canonical example above. `gchat:dm/spaces/AAA` for a DM space, whole space
-one session. A space whose threading state does not support replies binds the whole
+one session — and, because a DM space is threaded, replies render in the thread of the
+latest ask (measured: without that, an answer to a question asked inside a DM thread
+landed top-level). Presentation only; the key and the session do not move. A space whose threading state does not support replies binds the whole
 space as one conversation, `gchat:space/spaces/AAA` — the honest reading of "a space is
 not a session, a conversation in it is" on a surface where the space is the only
 conversation there is.
 
 **Roster.** `spaces.members.list` through the API passthrough, first page, complete
-only when the page says so — same one-page posture as Discord threads. The membership
-resource names users as `users/{id}` and does not reliably carry an email, so roster
-entries resolve to principals only where the backend surfaces the email; entries that
-stay `users/{id}` are hashed as backend subjects, exactly what the roster rules above
-say happens where no mapping exists. The requester is always present in the snapshot
-regardless. Live validation must record what the members API actually returned, not
-what this paragraph hopes.
+only when the page says so — same one-page posture as Discord threads. Measured
+2026-09-09: under the app credential the membership resource carries `users/{id}`,
+`displayName` and `type` and NO email, so nothing in the response joins a member to the
+principal the requester was verified as. The bridge is the event itself, which carries
+both `sender.name` (`users/{id}`) and `sender.email`: the adapter remembers the pair
+for every sender it has seen and substitutes the email at roster time, so a member who
+has spoken hashes to the same pseudonym as the requester and the audience snapshot
+holds one entry per human. A member who has never spoken stays `users/{id}`, hashed as
+a backend subject — the roster rules above, where no mapping exists. The requester is
+always present in the snapshot regardless.
 
 **Display split.** The existing integration's `default` versus `debug` mode
 (`GoogleChatSpec.Mode`) is honoured by the relay: under `default` the rolling line
@@ -549,9 +574,14 @@ deduplicated; under `debug` the full rolling line runs. Carried as
 `A2A_CHAT_DISPLAY_MODE`; the operator owns feeding it from the same CR field. The
 split is the legacy field honoured in the new relay, not a new knob.
 
-**openDirect.** `spaces.findDirectMessage` with `users/{email}` (the Chat API accepts
-the email alias in user resource names), falling back to `spaces.setup` when no DM
-space exists yet. Ships as the primitive, unused, like the other backends.
+**openDirect.** `spaces.findDirectMessage` by user resource name, falling back to
+`spaces.setup` when no DM space exists yet. The email alias in `users/{…}` is accepted
+only under a user credential; the app credential the relay holds answers it 403
+(measured), and `spaces.setup` under the app credential needs `chat.app.spaces.create`
+plus admin approval, so the fallback is refused too. The adapter therefore resolves an
+email to the immutable `users/{id}` it learned from that person's own event, which
+`findDirectMessage` does accept; a person who has never spoken cannot be opened. Ships
+as the primitive, unused, like the other backends.
 
 ## What stage 2 builds from this doc
 

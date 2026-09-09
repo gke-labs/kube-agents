@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -84,41 +86,92 @@ func unverifiedRemedyFor(backend string) string {
 // gchatLinkRe rewrites markdown links to Chat's <url|text> form.
 var gchatLinkRe = regexp.MustCompile(`\[([^\]]+)\]\((https?://[^)\s]+)\)`)
 
-// gchatEvent is the Google Chat event JSON the Chat app publishes to the
-// Pub/Sub topic — the same payload the legacy path consumes
-// (tests/e2e/gchat_agent_test.py forges the canonical example). Only the
-// fields the adapter reads are declared.
-type gchatEvent struct {
-	Type  string `json:"type"`
-	Space struct {
-		Name string `json:"name"`
-		// Type is the legacy field ("ROOM"/"DM"); SpaceType its successor
-		// ("SPACE"/"GROUP_CHAT"/"DIRECT_MESSAGE"). Events have carried either
-		// depending on API vintage, so both are read.
-		Type                string `json:"type"`
-		SpaceType           string `json:"spaceType"`
-		SpaceThreadingState string `json:"spaceThreadingState"`
-	} `json:"space"`
-	Message struct {
-		Name string `json:"name"`
-		Text string `json:"text"`
-		// ArgumentText is the message text with the app mention stripped —
-		// Chat computes it, so there is no mention grammar to re-derive. A
-		// pointer because present-but-empty is meaningful: it is Google's
-		// documented shape for a mention-only message, and collapsing it
-		// into absent would resurrect the raw mention as the ask.
-		ArgumentText *string `json:"argumentText"`
-		Thread       struct {
-			Name string `json:"name"`
-		} `json:"thread"`
-		Sender struct {
-			Name        string `json:"name"`
-			DisplayName string `json:"displayName"`
-			Email       string `json:"email"`
-			Type        string `json:"type"`
-		} `json:"sender"`
-	} `json:"message"`
+// gchatSpace, gchatSender and gchatMessage are the Chat resources both event
+// shapes carry; only the fields the adapter reads are declared.
+type gchatSpace struct {
+	Name string `json:"name"`
+	// Type is the legacy field ("ROOM"/"DM"); SpaceType its successor
+	// ("SPACE"/"GROUP_CHAT"/"DIRECT_MESSAGE"). Events have carried either
+	// depending on API vintage, so both are read.
+	Type                string `json:"type"`
+	SpaceType           string `json:"spaceType"`
+	SpaceThreadingState string `json:"spaceThreadingState"`
 }
+
+type gchatSender struct {
+	Name        string `json:"name"`
+	DisplayName string `json:"displayName"`
+	Email       string `json:"email"`
+	Type        string `json:"type"`
+}
+
+type gchatMessage struct {
+	Name string `json:"name"`
+	Text string `json:"text"`
+	// ArgumentText is the message text with the app mention stripped —
+	// Chat computes it, so there is no mention grammar to re-derive. A
+	// pointer because present-but-empty is meaningful: it is Google's
+	// documented shape for a mention-only message in a space, and
+	// collapsing it into absent would resurrect the raw mention as the
+	// ask. (In a DM, measured live, Chat sends argumentText equal to text
+	// with nothing stripped — a typed "@app" there is plain text to Chat
+	// too, with no mention annotation.)
+	ArgumentText *string `json:"argumentText"`
+	Thread       struct {
+		Name string `json:"name"`
+	} `json:"thread"`
+	Sender gchatSender `json:"sender"`
+}
+
+// gchatEvent is one Chat event normalized to the legacy field layout: Type
+// is "MESSAGE" for a turn, Space and Message are the resources. Two wire
+// shapes decode into it (decodeGchatEvent):
+//
+//   - the legacy Chat-API event, {"type":"MESSAGE","space":…,"message":…} —
+//     what tests/e2e/gchat_agent_test.py forges and what the docs called
+//     DeprecatedEvent;
+//   - the Google Workspace add-on event object, {"commonEventObject":…,
+//     "chat":{"user":…,"eventTime":…,"messagePayload":{"space":…,
+//     "message":…}}} — what a Chat app configured through the add-on
+//     surface publishes. It has no top-level type at all; the interaction
+//     kind is which payload key is present. Measured live 2026-09-09: every
+//     event from the app in bnaylor-kagents-dev arrived in this shape, and
+//     an adapter reading only the legacy one acked all of them away.
+type gchatEvent struct {
+	Type    string
+	Space   gchatSpace
+	Message gchatMessage
+	// shape names what was decoded, for the drop log: "legacy", "addon",
+	// or, for an add-on event carrying some other payload, that payload's
+	// key(s).
+	shape string
+}
+
+// gchatWireEvent is the union of both wire shapes as JSON sees them.
+type gchatWireEvent struct {
+	Type    string                     `json:"type"`
+	Space   gchatSpace                 `json:"space"`
+	Message gchatMessage               `json:"message"`
+	Chat    map[string]json.RawMessage `json:"chat"`
+}
+
+// gchatAddonMessagePayload is chat.messagePayload of the add-on event object.
+type gchatAddonMessagePayload struct {
+	Space   gchatSpace   `json:"space"`
+	Message gchatMessage `json:"message"`
+}
+
+const (
+	gchatShapeLegacy = "legacy"
+	gchatShapeAddon  = "addon"
+	// gchatAddonMessageKey is the chat.* payload key that marks a message
+	// interaction in the add-on event object.
+	gchatAddonMessageKey = "messagePayload"
+	// gchatAddonUserKey is the interacting user in the add-on event object,
+	// alongside message.sender; both name the same person.
+	gchatAddonUserKey      = "user"
+	gchatAddonEventTimeKey = "eventTime"
+)
 
 // GoogleChatAdapter implements Adapter over the credential proxy's chat
 // relay: events arrive by long-polling the relay's A2A event routes, and
@@ -138,6 +191,23 @@ type GoogleChatAdapter struct {
 	// seenOrder is its eviction queue, bounded at gchatSeenCap.
 	seen      map[string]bool
 	seenOrder []string
+	// userIDs maps a sender's immutable users/{id} resource name to the
+	// email Chat asserted for them, learned from inbound events. Under app
+	// credentials Chat withholds member emails from spaces.members.list
+	// and refuses the email alias in user resource names (measured live,
+	// 2026-09-09), so this is the only bridge between the roster's ids and
+	// the principal the requester was verified as. userEmails is the
+	// inverse, for OpenDirect.
+	userIDs    map[string]string
+	userEmails map[string]string
+	// dmThreads remembers, per DM space, the thread of the latest inbound
+	// message. A DM is one session for the whole space (the key never
+	// carries a thread), but a DM space is threaded and a reply belongs
+	// where the ask was made — measured live: without this the answer to
+	// a question asked inside a thread lands top-level in the DM. This is
+	// presentation, not identity: the conversation key and the session
+	// are unchanged by it.
+	dmThreads map[string]string
 }
 
 // NewGoogleChatAdapter builds the adapter against the credential proxy's
@@ -151,11 +221,14 @@ func NewGoogleChatAdapter(relayURL, tokenPath string, log *slog.Logger) (*Google
 		return nil, fmt.Errorf("gchat: relay token path is required")
 	}
 	return &GoogleChatAdapter{
-		relayURL:  strings.TrimSuffix(relayURL, "/"),
-		tokenPath: tokenPath,
-		client:    &http.Client{Timeout: gchatRelayTimeout},
-		log:       log,
-		seen:      map[string]bool{},
+		relayURL:   strings.TrimSuffix(relayURL, "/"),
+		tokenPath:  tokenPath,
+		client:     &http.Client{Timeout: gchatRelayTimeout},
+		log:        log,
+		seen:       map[string]bool{},
+		userIDs:    map[string]string{},
+		userEmails: map[string]string{},
+		dmThreads:  map[string]string{},
 	}, nil
 }
 
@@ -225,6 +298,11 @@ func (a *GoogleChatAdapter) Post(conversation, text string) (string, error) {
 	}
 	body := map[string]any{"text": toGchatText(text)}
 	arguments := map[string]any{"parent": space, "body": body}
+	if thread == "" && strings.HasPrefix(conversation, gchatDMKeyPrefix) {
+		a.mu.Lock()
+		thread = a.dmThreads[space]
+		a.mu.Unlock()
+	}
 	if thread != "" {
 		body["thread"] = map[string]any{"name": thread}
 		arguments["messageReplyOption"] = gchatReplyOption
@@ -276,11 +354,21 @@ func (a *GoogleChatAdapter) Roster(conversation string) ([]string, bool, error) 
 		return nil, false, err
 	}
 	var ids []string
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	for _, m := range out.Memberships {
 		if m.Member.Type == "BOT" {
 			continue
 		}
 		id := m.Member.Email
+		if id == "" {
+			// App credentials get no email here (measured live), so a
+			// member who has spoken in any conversation resolves through
+			// the id learned from their event — the same string the
+			// requester was verified as, so the audience hash joins the
+			// requester hash. A member who has never spoken stays an id.
+			id = a.userIDs[m.Member.Name]
+		}
 		if id == "" {
 			id = m.Member.Name
 		}
@@ -297,10 +385,18 @@ func (a *GoogleChatAdapter) Roster(conversation string) ([]string, bool, error) 
 func (a *GoogleChatAdapter) OpenDirect(userID string) (string, error) {
 	name := userID
 	if !strings.HasPrefix(name, "users/") {
-		// This backend's own Roster may return either an email or a
-		// users/{id}; both are valid user resource names once prefixed
-		// exactly once.
-		name = "users/" + name
+		// The email alias in a user resource name is accepted only under
+		// user credentials; app credentials, which is what the relay
+		// holds, answer it 403 (measured live). A sender whose event has
+		// been seen resolves to the immutable id Chat does accept; anyone
+		// else is tried by alias, and the error says which was refused.
+		a.mu.Lock()
+		if id, ok := a.userEmails[strings.ToLower(userID)]; ok {
+			name = id
+		} else {
+			name = "users/" + userID
+		}
+		a.mu.Unlock()
 	}
 	user := map[string]any{"name": name}
 	var space struct {
@@ -314,7 +410,7 @@ func (a *GoogleChatAdapter) OpenDirect(userID string) (string, error) {
 			"body": map[string]any{
 				"space": map[string]any{"spaceType": "DIRECT_MESSAGE", "singleUserBotDm": true},
 				"memberships": []any{
-					map[string]any{"member": map[string]any{"name": "users/" + userID, "type": "HUMAN"}},
+					map[string]any{"member": map[string]any{"name": name, "type": "HUMAN"}},
 				},
 			},
 		}, &space)
@@ -386,9 +482,13 @@ func (a *GoogleChatAdapter) Run(ctx context.Context, handler func(InboundMessage
 				"pubsubMessageId", env.MessageID, "err", decodeErr)
 			continue
 		}
-		if msg, ok := a.inbound(ev); ok {
-			handler(msg)
+		msg, reason := a.classify(ev)
+		if reason != "" {
+			a.log.Info("gchat event is not a turn; acked",
+				"pubsubMessageId", env.MessageID, "reason", reason)
+			continue
 		}
+		handler(msg)
 	}
 }
 
@@ -434,17 +534,46 @@ func (a *GoogleChatAdapter) settle(receipt string) {
 	}
 }
 
-// decodeGchatEvent unwraps the base64 Pub/Sub payload into the Chat event.
+// decodeGchatEvent unwraps the base64 Pub/Sub payload into the Chat event,
+// accepting either wire shape (gchatEvent).
 func decodeGchatEvent(data string) (*gchatEvent, error) {
 	raw, err := base64.StdEncoding.DecodeString(data)
 	if err != nil {
 		return nil, fmt.Errorf("base64: %w", err)
 	}
-	var ev gchatEvent
-	if err := json.Unmarshal(raw, &ev); err != nil {
+	var wire gchatWireEvent
+	if err := json.Unmarshal(raw, &wire); err != nil {
 		return nil, fmt.Errorf("event json: %w", err)
 	}
-	return &ev, nil
+	if wire.Chat == nil {
+		return &gchatEvent{Type: wire.Type, Space: wire.Space, Message: wire.Message, shape: gchatShapeLegacy}, nil
+	}
+	if payload, ok := wire.Chat[gchatAddonMessageKey]; ok {
+		var mp gchatAddonMessagePayload
+		if err := json.Unmarshal(payload, &mp); err != nil {
+			return nil, fmt.Errorf("chat.messagePayload: %w", err)
+		}
+		ev := &gchatEvent{Type: "MESSAGE", Space: mp.Space, Message: mp.Message, shape: gchatShapeAddon}
+		if ev.Message.Sender.Email == "" {
+			// chat.user and message.sender name the same person; the
+			// sender is what the legacy layout reads, so fill it from the
+			// user only when the payload omitted it.
+			if user, ok := wire.Chat[gchatAddonUserKey]; ok {
+				_ = json.Unmarshal(user, &ev.Message.Sender)
+			}
+		}
+		return ev, nil
+	}
+	// An add-on event carrying some other interaction: name its payload
+	// keys so the drop log says what arrived rather than "not a MESSAGE".
+	keys := make([]string, 0, len(wire.Chat))
+	for k := range wire.Chat {
+		if k != gchatAddonUserKey && k != gchatAddonEventTimeKey {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	return &gchatEvent{shape: gchatShapeAddon + ":" + strings.Join(keys, ",")}, nil
 }
 
 // toGchatText translates executor markdown to Google Chat's text format and
@@ -462,15 +591,28 @@ func toGchatText(s string) string {
 // app receives a space message only when mentioned, and every DM), so what
 // is owned here is the surface binding and the drops.
 func (a *GoogleChatAdapter) inbound(ev *gchatEvent) (InboundMessage, bool) {
+	msg, reason := a.classify(ev)
+	return msg, reason == ""
+}
+
+// classify is inbound with the drop reason spelled out. A non-turn is
+// ordinary (a membership event, a bot's own message, a redelivery) but it
+// must never be silent: an adapter that acks every event and says nothing
+// is indistinguishable from one that receives none — which is exactly how
+// the add-on wire shape went unnoticed until live traffic.
+func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 	if ev.Type != "MESSAGE" {
-		return InboundMessage{}, false
+		return InboundMessage{}, "not a message event (shape " + ev.shape + ", type " + strconv.Quote(ev.Type) + ")"
 	}
 	sender := ev.Message.Sender
-	if sender.Type != "HUMAN" || sender.Email == "" {
-		return InboundMessage{}, false
+	if sender.Type != "HUMAN" {
+		return InboundMessage{}, "sender is not HUMAN (" + sender.Type + ")"
+	}
+	if sender.Email == "" {
+		return InboundMessage{}, "sender has no email"
 	}
 	if ev.Space.Name == "" || ev.Message.Name == "" {
-		return InboundMessage{}, false
+		return InboundMessage{}, "event names no space or no message"
 	}
 	// ArgumentText is authoritative whenever Chat sent the field: it is the
 	// text with the app mention stripped, and a bare mention leaves it
@@ -482,7 +624,7 @@ func (a *GoogleChatAdapter) inbound(ev *gchatEvent) (InboundMessage, bool) {
 		text = strings.TrimSpace(*ev.Message.ArgumentText)
 	}
 	if text == "" {
-		return InboundMessage{}, false
+		return InboundMessage{}, "empty ask (bare mention)"
 	}
 
 	// A space misread as a DM would bind every thread in it to one session,
@@ -501,6 +643,22 @@ func (a *GoogleChatAdapter) inbound(ev *gchatEvent) (InboundMessage, bool) {
 	}
 
 	a.mu.Lock()
+	if kind == "dm" && ev.Message.Thread.Name != "" {
+		if a.dmThreads == nil || len(a.dmThreads) >= gchatSeenCap {
+			a.dmThreads = map[string]string{}
+		}
+		a.dmThreads[ev.Space.Name] = ev.Message.Thread.Name
+	}
+	if strings.HasPrefix(sender.Name, "users/") {
+		// Bounded by the same cap as the dedupe memory: one entry per
+		// human who has spoken, evicted wholesale rather than leaked.
+		if a.userIDs == nil || len(a.userIDs) >= gchatSeenCap {
+			a.userIDs = map[string]string{}
+			a.userEmails = map[string]string{}
+		}
+		a.userIDs[sender.Name] = sender.Email
+		a.userEmails[strings.ToLower(sender.Email)] = sender.Name
+	}
 	dup := a.seen[ev.Message.Name]
 	if !dup {
 		a.seen[ev.Message.Name] = true
@@ -515,7 +673,7 @@ func (a *GoogleChatAdapter) inbound(ev *gchatEvent) (InboundMessage, bool) {
 	}
 	a.mu.Unlock()
 	if dup {
-		return InboundMessage{}, false
+		return InboundMessage{}, "duplicate delivery of " + ev.Message.Name
 	}
 
 	return InboundMessage{
@@ -524,7 +682,7 @@ func (a *GoogleChatAdapter) inbound(ev *gchatEvent) (InboundMessage, bool) {
 		AuthorID:     sender.Email,
 		MessageID:    ev.Message.Name,
 		Text:         text,
-	}, true
+	}, ""
 }
 
 // Conversation key prefixes for the Google Chat adapter. A space is not a
