@@ -2,29 +2,29 @@
 
 ## In short
 
-Many of the things the agent can do for a fleet share one lifecycle. The capability comes
-pre-built with the agent, so it starts working on day one. It runs on its own on a schedule and
-reports what it found. If you want it right now, or just for one part of the fleet, you ask for
-it in chat and get the result in the same conversation. When the result is not quite what you
-need — a check is too noisy, a threshold is wrong for one group of clusters, something is
-missing — you tell the agent, it proposes a change, you agree on it together, and from then on
-it runs the new way. And between those conversations the agent keeps learning on its own: after
-a conversation it reflects on what you corrected, what you ignored, and what you asked for
-twice, and folds that into how it does the job next time. Nothing in that lifecycle requires a
-code change or a redeploy.
+Build the lifecycle once, plug capabilities in. Every capability on the vehicle is:
+
+1. **Pre-defined** — ships with the agent, works on day one.
+2. **Scheduled** — runs on a cron schedule.
+3. **Triggerable** — runs from chat, any time, any scope.
+4. **Customizable** — you describe a change in chat, agree it with the agent, and it sticks.
+5. **Self-learning** — the agent refines it from your conversations, within limits you set.
+
+## The idea in plain terms
+
+A capability comes pre-built with the agent, so it starts working on day one. It runs on its own
+on a schedule and reports what it found. If you want it right now, or just for one part of the
+fleet, you ask for it in chat and get the result in the same conversation. When the result is not
+quite what you need — a check is too noisy, a threshold is wrong for one group of clusters,
+something is missing — you tell the agent, it proposes a change, you agree on it together, and
+from then on it runs the new way. And between those conversations the agent keeps learning on its
+own: after a conversation it reflects on what you corrected, what you ignored, and what you asked
+for twice, and folds that into how it does the job next time. Nothing in that lifecycle requires
+a code change or a redeploy.
 
 Rather than building that lifecycle into each capability, this design builds it once, as a
 delivery vehicle, and every capability plugs into it. A capability is then just the domain
-knowledge — what to check, how, and what counts as a finding — and gets the five properties for
-free:
-
-1. **Pre-defined.** It ships in the image with sensible defaults and works without setup.
-2. **Scheduled.** It fires on a cron schedule without anyone asking.
-3. **Triggerable.** It can be run from chat at any time, for the whole fleet or a narrower scope.
-4. **Customizable.** The operator changes what it does by describing the change in chat; the
-   agent proposes the edit, they align, and the agent writes it for every later run.
-5. **Self-learning.** The agent revises the capability on its own after reflecting on
-   conversations, within limits the operator sets, and says what it changed.
+knowledge — what to check, how, and what counts as a finding.
 
 The first capabilities on the vehicle are the [upgrade readiness checks](upgrade-readiness-checks.md)
 and the [fleet anomaly detection checks](fleet-anomaly-detection-checks.md). The obtainability
@@ -44,12 +44,12 @@ and maintenance.
 A capability plugs in as one directory under `agents/platform/skills/<name>/` plus one roster
 entry:
 
-| Part                     | What it carries                                                                                                                                                                              |
-| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `SKILL.md`               | The procedure: how to enumerate scope, which commands to run, how output becomes findings, and the red lines the run may never cross. Image-owned.                                           |
-| `criteria.yaml`          | The tunable part: thresholds, scopes, exclusions, severities, extra checks, report grouping. Read by the procedure. Operator- and agent-owned; this is what customization and learning edit. |
-| `learning.yaml`          | What the agent may change on its own, what needs confirmation, and what it may never touch. Shipped with conservative defaults; operator-owned after that.                                   |
-| `cron/jobs.json` entry   | The schedule, the skill to preload, and `deliver: "chat"`. Fires the procedure unattended ([autonomous watchdogs](../site/src/content/docs/concepts/autonomous-watchdogs.md)).              |
+| Part                   | What it carries                                                                                                                                                                              |
+| ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SKILL.md`             | The procedure: how to enumerate scope, which commands to run, how output becomes findings, and the red lines the run may never cross. Image-owned.                                           |
+| `criteria.yaml`        | The tunable part: thresholds, scopes, exclusions, severities, extra checks, report grouping. Read by the procedure. Operator- and agent-owned; this is what customization and learning edit. |
+| `learning.yaml`        | What the agent may change on its own, what needs confirmation, and what it may never touch. Shipped with conservative defaults; operator-owned after that.                                   |
+| `cron/jobs.json` entry | The schedule, the skill to preload, and `deliver: "chat"`. Fires the procedure unattended ([autonomous watchdogs](../site/src/content/docs/concepts/autonomous-watchdogs.md)).               |
 
 The split between `SKILL.md` and `criteria.yaml` is what makes properties 4 and 5 safe. The
 procedure and its red lines stay image-owned, so an upgrade can fix how a check runs and no
@@ -142,12 +142,12 @@ nudges the agent to persist what it learned; the vehicle gives that nudge a plac
 What the reflection produces is graded by `learning.yaml`, which every capability ships with the
 same conservative defaults:
 
-| Class of change                                                                                  | Default        |
-| ------------------------------------------------------------------------------------------------ | -------------- |
-| Adds context: a better explanation of a finding, a link to the runbook the operator pasted       | Apply, report  |
-| Widens what is checked: a new check the operator asked for, a scope the report was missing       | Apply, report  |
-| Narrows what is flagged: raises a threshold, adds an exclusion, lowers a severity                 | Propose only   |
-| Changes the procedure or a red line in `SKILL.md`                                                | Never          |
+| Class of change                                                                            | Default       |
+| ------------------------------------------------------------------------------------------ | ------------- |
+| Adds context: a better explanation of a finding, a link to the runbook the operator pasted | Apply, report |
+| Widens what is checked: a new check the operator asked for, a scope the report was missing | Apply, report |
+| Narrows what is flagged: raises a threshold, adds an exclusion, lowers a severity          | Propose only  |
+| Changes the procedure or a red line in `SKILL.md`                                          | Never         |
 
 "Apply, report" writes the change to `criteria.yaml` and says so in the capability's next report
 — what changed, why the agent thinks so, and how to revert it — so nothing moves silently.
@@ -176,11 +176,11 @@ or the agent set.
 
 Three tiers of durability follow, and the agent says which one a change landed in:
 
-| Tier     | Where the change lives                                                          | Survives            | When                                                                    |
-| -------- | ------------------------------------------------------------------------------- | ------------------- | ----------------------------------------------------------------------- |
-| Session  | The scope and thresholds named in one on-request run                            | That run            | Trying a criterion once before adopting it                              |
-| Runtime  | `criteria.yaml` / `learning.yaml` on the profile volume, merged across starts   | Restart and upgrade | The normal outcome of customization and of applied learning             |
-| Reviewed | A pull request to the operator's configuration repository                       | Everything          | A change the operator wants reviewed, or any change to the procedure    |
+| Tier     | Where the change lives                                                        | Survives            | When                                                                 |
+| -------- | ----------------------------------------------------------------------------- | ------------------- | -------------------------------------------------------------------- |
+| Session  | The scope and thresholds named in one on-request run                          | That run            | Trying a criterion once before adopting it                           |
+| Runtime  | `criteria.yaml` / `learning.yaml` on the profile volume, merged across starts | Restart and upgrade | The normal outcome of customization and of applied learning          |
+| Reviewed | A pull request to the operator's configuration repository                     | Everything          | A change the operator wants reviewed, or any change to the procedure |
 
 The reviewed tier reuses what the remediation path already has: the `fleet-audit` skill opens a
 narrow pull request carrying one file, and a criteria or procedure change is one file. An operator
