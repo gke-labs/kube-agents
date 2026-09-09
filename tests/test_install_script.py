@@ -2100,5 +2100,18 @@ class TfvarsTempFileIsCleanedUpTest(unittest.TestCase):
                 )
 
 
+class PrerequisiteToolsListTest(unittest.TestCase):
+    """Verifies that install.sh pre-flights all required tools including gke-gcloud-auth-plugin."""
+
+    def test_install_script_checks_gke_gcloud_auth_plugin(self):
+        source = _INSTALL_SH.read_text()
+        self.assertIn("gke-gcloud-auth-plugin", source)
+        self.assertRegex(
+            source,
+            r"for tool in [^\n]*gke-gcloud-auth-plugin",
+            "install.sh must pre-flight gke-gcloud-auth-plugin in its prerequisite tool check loop",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

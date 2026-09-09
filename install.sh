@@ -1561,6 +1561,10 @@ auto_install_tool() {
         # homebrew-core disabled the terraform formula after the licence
         # change; HashiCorp's tap is the supported source.
         brew install hashicorp/tap/terraform || true
+      elif [ "$tool" = "gke-gcloud-auth-plugin" ]; then
+        if command -v gcloud >/dev/null 2>&1; then
+          gcloud components install gke-gcloud-auth-plugin -q || true
+        fi
       else
         brew install "$tool" || true
       fi
@@ -1582,10 +1586,17 @@ auto_install_tool() {
         sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
         echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
         sudo apt-get install gh -y || true
+      elif [ "$tool" = "gke-gcloud-auth-plugin" ]; then
+        sudo apt-get update >/dev/null 2>&1 || true
+        sudo apt-get install -y google-cloud-cli-gke-gcloud-auth-plugin 2>/dev/null || \
+          sudo apt-get install -y gke-gcloud-auth-plugin 2>/dev/null || \
+          (command -v gcloud >/dev/null 2>&1 && gcloud components install gke-gcloud-auth-plugin -q) || true
       else
         sudo apt-get update >/dev/null 2>&1 || true
         sudo apt-get install -y "$tool" || true
       fi
+    elif command -v gcloud >/dev/null 2>&1 && [ "$tool" = "gke-gcloud-auth-plugin" ]; then
+      gcloud components install gke-gcloud-auth-plugin -q || true
     else
       print_error "Could not auto-install $tool. Package manager not recognized."
     fi
@@ -2241,9 +2252,10 @@ main() {
   # terraform is the install engine (terraform/examples/full-install through
   # lifecycle.sh); kubectl is used by lifecycle.sh and the health checks; helm
   # serves upgrade.sh's fast path; jq and gh remain for the surrounding
-  # tooling. Everything is checked up front rather than discovered halfway
-  # through with the cluster already created.
-  for tool in git gcloud kubectl gh helm jq terraform; do
+  # tooling; gke-gcloud-auth-plugin allows kubectl to authenticate to GKE.
+  # Everything is checked up front rather than discovered halfway through with
+  # the cluster already created.
+  for tool in git gcloud kubectl gh helm jq terraform gke-gcloud-auth-plugin; do
     if command -v "$tool" >/dev/null 2>&1; then
       print_success "Found CLI tool: $tool"
     else

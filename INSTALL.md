@@ -126,19 +126,27 @@ The Kubernetes Agentic Harness manages Kubernetes operations via an autonomous *
 
 ## Prerequisites & Tooling Matrix
 
-Before beginning installation, ensure your environment meets the following requirements:
+Before beginning installation, ensure your environment meets the requirements for your chosen installation method:
 
-| CLI Tool / Utility              | Required Version                                | Verification Command       | Description                                                                                                 |
-| :------------------------------ | :---------------------------------------------- | :------------------------- | :---------------------------------------------------------------------------------------------------------- |
-| **Go**                          | `1.27+`                                         | `go version`               | Required for building operator binaries and running tests.                                                  |
-| **Docker / Podman**             | `20.10+`                                        | `docker --version`         | Required to build container images for the operator.                                                        |
-| **kubectl**                     | `1.28+`                                         | `kubectl version --client` | Communicates with your target Kubernetes or GKE cluster.                                                    |
-| **Kubernetes Cluster**          | `1.29+` (`1.35+` for `AgentPlugin` OCI volumes) | `kubectl version`          | Target Kubernetes or GKE cluster (`AgentPlugin` OCI volumes require K8s 1.35+ `ImageVolume` gate).          |
-| **Google Cloud SDK (`gcloud`)** | `576.0.0+`                                      | `gcloud version`           | GKE cluster access, IAM, and Artifact Registry. `576.0.0` is where `--managed-otel-scope` reached GA.       |
-| **Terraform**                   | `~> 1.5`                                        | `terraform version`        | The install engine. `install.sh` offers to install it (Homebrew tap / HashiCorp apt repo) when missing.     |
-| **Helm**                        | `3.10+`                                         | `helm version`             | `upgrade.sh`'s fast paths and the manual chart install; the engine itself uses the Terraform Helm provider. |
-| **gettext (`envsubst`)**        | Standard                                        | `envsubst --version`       | Used by the kustomize deployment targets (Method 2) for template substitution.                              |
-| **`jq`**                        | `1.6+`                                          | `jq --version`             | Reads `images.json`; the kustomize deploy targets resolve image references from it.                         |
+- **Method 0 (Interactive One-Liner)** & **Method 1 (IaC via Terraform + Helm)**: Standard automated deployment using prebuilt container images.
+- **Method 2 (Manual Kubernetes / Kustomize)**: Advanced manual manifest deployment.
+- **Method 3 (Local Development & Testing)**: Building and running operator binaries and container images locally.
+
+| CLI Tool / Utility              | Required Version                                | Verification Command              | Description                                                                                                                   | Applies To                 |
+| :------------------------------ | :---------------------------------------------- | :-------------------------------- | :---------------------------------------------------------------------------------------------------------------------------- | :------------------------- |
+| **Google Cloud SDK (`gcloud`)** | `576.0.0+`                                      | `gcloud version`                  | GKE cluster access, IAM, and Artifact Registry. `576.0.0` is where `--managed-otel-scope` reached GA.                         | **All Methods**            |
+| **`gke-gcloud-auth-plugin`**    | Standard                                        | `gke-gcloud-auth-plugin --version`| Required for `kubectl` to authenticate to GKE clusters (`gcloud components install gke-gcloud-auth-plugin`).                  | **All Methods** (GKE)      |
+| **`kubectl`**                   | `1.28+`                                         | `kubectl version --client`        | Communicates with your target Kubernetes or GKE cluster.                                                                      | **All Methods**            |
+| **Terraform**                   | `~> 1.5`                                        | `terraform version`               | The install and lifecycle engine. `install.sh` offers to install it when missing.                                             | **Methods 0 & 1**          |
+| **Helm**                        | `3.10+`                                         | `helm version`                    | `upgrade.sh`'s fast path and standalone chart install; the engine itself uses the Terraform Helm provider.                     | **Methods 0, 1, & 2**      |
+| **`jq`**                        | `1.6+`                                          | `jq --version`                    | JSON parsing utility used by `install.sh` and deploy scripts to read `images.json`.                                           | **All Methods**            |
+| **GitHub CLI (`gh`)**           | `2.0+`                                          | `gh --version`                    | GitOps repository discovery, token management, and PR automation.                                                             | **Methods 0 & 1**          |
+| **`git`**                       | `2.20+`                                         | `git --version`                   | Clones configuration templates and resolves release tags.                                                                     | **All Methods**            |
+| **Kubernetes Cluster**          | `1.29+` (`1.35+` for `AgentPlugin` OCI volumes) | `kubectl version`                 | Target Kubernetes or GKE cluster (`AgentPlugin` OCI volumes require K8s 1.35+ `ImageVolume` gate).                            | **All Methods**            |
+| **`gcloud beta` component**     | Standard                                        | `gcloud beta --version`           | Required only when configuring Google Chat integration (`gcloud beta services identity create`).                              | **Optional** (Google Chat) |
+| **gettext (`envsubst`)**        | Standard                                        | `envsubst --version`              | Template substitution in development Kustomize deployment targets (`make -C k8s-operator deploy-*`).                          | **Method 2 only**          |
+| **Go**                          | `1.27+`                                         | `go version`                      | Required for bootstrapping development tooling (`controller-gen`, `kustomize`), running tests, or building operator binaries. | **Methods 2 & 3 only**     |
+| **Docker / Podman**             | `20.10+`                                        | `docker --version`                | Required only when building or rebuilding container images locally (`make docker-build`, `make dev-rebuild-agent`).           | **Method 3 only**          |
 
 ---
 
@@ -590,7 +598,7 @@ kubectl get platformagents -A
 
 ## Method 3: Local Development & Fast Iteration
 
-For developer testing on a workstation against a local cluster (e.g., Kind) or remote GKE cluster without building container images:
+For developer testing on a workstation against a local cluster (e.g., Kind) or fast remote iteration against a GKE cluster:
 
 1. **Set your active Kubernetes context**:
    ```bash
