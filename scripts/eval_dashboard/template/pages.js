@@ -414,6 +414,8 @@ function briefHeadline(inc, inWindow) {
 }
 
 function recoveryProgress(inc) {
+  // No start on record: nothing is "after" the incident, so no run counts.
+  if (inc.sinceMs == null) return 0;
   const later = runs().filter((r) => measured(r) && concluded(r) && runFinish(r) > inc.sinceMs).sort((a, b) => runFinish(b) - runFinish(a));
   const prs = new Set();
   let count = 0;
@@ -465,7 +467,7 @@ function changedBeforeHtml(inc, inWindow) {
   const firstRedMs = firstRed ? runFinish(firstRed) : inc.sinceMs;
   if (firstRedMs == null) {
     // Same anchor as mergesFact: without it there is no "before" to show.
-    return `<div class="sec"><h2>What changed right before</h2><p class="mut">The incident has no start time on record and no red run in this window, so the merges before it cannot be picked out.</p></div>`;
+    return `<div class="sec"><h2>What changed right before</h2><p class="mut">The incident has no start time on record and no run in this window anchors it, so the merges before it cannot be picked out.</p></div>`;
   }
   const fromMs = firstRedMs - PAGE.mergesLookbackMs;
   const merges = brief.merges.filter((m) => { const at = parseIso(m.at); return at != null && at >= fromMs && at <= firstRedMs; });

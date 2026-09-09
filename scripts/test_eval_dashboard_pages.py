@@ -495,15 +495,16 @@ class BrowserTest(unittest.TestCase):
         # from epoch zero (Dec 31, 1969 ET).
         merges = [{"sha": "abc1234", "at": "2026-09-08T08:10:00+00:00", "title": "fix(ci): the thing", "pr": 1280}]
         with unittest.mock.patch.object(render, "recent_merges", return_value=merges):
-            out = render_to(pathlib.Path(self.tmp.name) / "nosince", self.data, health=health_doc(since="not a time", failing_cases=["never-failed-here"]))
+            out = render_to(pathlib.Path(self.tmp.name) / "nosince", self.data, health=health_doc(since="not a time", failing_cases=["never-failed-here"], recovering=True))
             control = render_to(pathlib.Path(self.tmp.name) / "withsince", self.data, health=health_doc())
         app = dom_text(out / "index.html")
-        self.assertIn("OUTAGE · since unknown time", app)
+        self.assertIn("RECOVERING · since unknown time", app)
         self.assertIn("What changed right before", app)
         self.assertNotIn("Nothing merged", app)
+        # et() prints no year, so the epoch shows as "Dec 31" in ET.
         self.assertNotIn("Dec 31", app)
-        self.assertNotIn("1969", app)
         self.assertIn("no start time on record", app)
+        self.assertIn("0 of 3 clean runs", app, "with no start there is nothing after the incident to count as recovery")
         # The normal case still anchors on the first red run.
         control_app = dom_text(control / "index.html")
         self.assertIn("What changed right before", control_app)
@@ -526,6 +527,12 @@ class BrowserTest(unittest.TestCase):
         self.assertNotIn("bad case!", query)
         # And the parser reads that link back whole: 50 ids, not 49.
         self.assertIn("50 gate cases fail", dom_text(out / "index.html", query=query))
+        # A hand-written link with more entries than the cap and an
+        # off-grammar one inside the first 50 still yields 50 in-grammar ids:
+        # the parser filters before it caps, as the writer does. (`since`
+        # names the live incident; without it the link's cases are not read.)
+        hand_written = urllib.parse.urlencode({"cases": ",".join(sixty[:51]), "since": OUTAGE_SINCE})
+        self.assertIn("50 gate cases fail", dom_text(out / "index.html", query=hand_written))
 
     def test_pr_view_outage_run(self):
         app = dom_text(self.run_page, query="build=2097282860221206528")
