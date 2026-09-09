@@ -12,9 +12,11 @@ America/Toronto.
 
 import contextlib
 import gzip
+import html
 import io
 import json
 import pathlib
+import re
 import shutil
 import subprocess
 import tempfile
@@ -484,6 +486,23 @@ class BrowserTest(unittest.TestCase):
         run_app = dom_text(render_to(pathlib.Path(self.tmp.name) / "nohist-live", self.data, health=health_doc()) / "run.html", query="build=2097282860221206528")
         self.assertIn("index.html?cases=cluster-agent-crashloop-debug", run_app)
         self.assertIn("since=2026-09-08T09%3A00%3A00Z", run_app)
+
+    def test_the_incident_link_carries_only_what_the_parser_reads(self):
+        # Sixty failing cases, one of them outside the id grammar: the
+        # banner's link must carry the first 50 in-grammar ids and nothing
+        # else, so following it scopes the Brief to exactly what it shows.
+        sixty = [f"case-{i:02d}" for i in range(59)]
+        sixty.insert(3, "bad case!")
+        out = render_to(pathlib.Path(self.tmp.name) / "sixty", self.data, health=health_doc(failing_cases=sixty))
+        app = dom_text(out / "run.html", query="build=2097282860221206528")
+        hrefs = re.findall(r'href="(index\.html\?cases=[^"]*)"', app)
+        self.assertEqual(len(hrefs), 1, app[:300])
+        query = urllib.parse.urlparse(html.unescape(hrefs[0])).query
+        cases = urllib.parse.parse_qs(query)["cases"][0].split(",")
+        self.assertEqual(cases, [f"case-{i:02d}" for i in range(50)])
+        self.assertNotIn("bad case!", query)
+        # And the parser reads that link back whole: 50 ids, not 49.
+        self.assertIn("50 gate cases fail", dom_text(out / "index.html", query=query))
 
     def test_pr_view_outage_run(self):
         app = dom_text(self.run_page, query="build=2097282860221206528")

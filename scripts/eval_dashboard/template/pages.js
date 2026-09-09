@@ -145,14 +145,18 @@ function normalizeHealth(raw) {
 
 /* ---- URL contract ---- */
 
+// The `cases` grammar, shared by the parser and the writer so a link the
+// pages build is one the pages read whole: in-grammar ids, the first
+// maxLinkCases of them.
+function linkCaseIds(values) {
+  return values.map((v) => String(v).trim()).filter((id) => PAGE.caseIdRe.test(id)).slice(0, PAGE.maxLinkCases);
+}
+
 function linkState() {
   const out = { cases: new Set(), sinceMs: null, untilMs: null, build: null, hash: "" };
   let params;
   try { params = new URLSearchParams(location.search); } catch (err) { return out; }
-  for (const id of (params.get("cases") || "").split(",").slice(0, PAGE.maxLinkCases)) {
-    const trimmed = id.trim();
-    if (PAGE.caseIdRe.test(trimmed)) out.cases.add(trimmed);
-  }
+  for (const id of linkCaseIds((params.get("cases") || "").split(","))) out.cases.add(id);
   const since = params.get("since") || "";
   if (PAGE.isoParamRe.test(since)) out.sinceMs = parseIso(since);
   const until = params.get("until") || "";
@@ -168,7 +172,8 @@ function linkState() {
 
 function incidentHref(inc) {
   const params = [];
-  if (inc.cases.length) params.push(`cases=${inc.cases.map(encodeURIComponent).join(",")}`);
+  const cases = linkCaseIds(inc.cases);
+  if (cases.length) params.push(`cases=${cases.map(encodeURIComponent).join(",")}`);
   if (inc.sinceMs != null) params.push(`since=${encodeURIComponent(utcIso(inc.sinceMs))}`);
   if (inc.untilMs != null) params.push(`until=${encodeURIComponent(utcIso(inc.untilMs))}`);
   return "index.html" + (params.length ? `?${params.join("&")}` : "") + "#gate";
