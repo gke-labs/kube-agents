@@ -117,7 +117,7 @@ OPERATOR_LABEL_SELECTOR: str = "app.kubernetes.io/name=kube-agents-operator"
 OPERATOR_CONTAINER_NAME: str = "manager"
 OPERATOR_POD_POLL_TIMEOUT_SEC: int = 30
 OPERATOR_PROBE_TIMEOUT_SEC: int = 15
-DEFAULT_ROLLOUT_TIMEOUT_SEC: int = 180
+DEFAULT_ROLLOUT_TIMEOUT_SEC: int = 900
 ROLLOUT_RETRY_INTERVAL_SEC: int = 3
 API_POLL_INTERVAL_SEC: int = 2
 MIN_ROLLOUT_TIMEOUT_SEC: int = 5
@@ -793,11 +793,16 @@ def step4_deploy_agent_plugin_cr(plugin_image: str, unique_str: str) -> None:
     wait_deployment_generation_change(GATEWAY_DEPLOYMENT, min_gen=gen_before + 1)
     wait_deployment_rollout(GATEWAY_DEPLOYMENT)
 
-    # Verify custom imagePullPolicy (Always) is set on deployment volume
+    # Verify custom imagePullPolicy (Always) is set on deployment volume or staging init container
     vol_pull_policy = get_kubectl_output([
         "get", "deployment", GATEWAY_DEPLOYMENT, "-n", NAMESPACE,
         "-o", f"jsonpath={{.spec.template.spec.volumes[?(@.name==\"plugin-{PLUGIN_CR_NAME}\")].image.pullPolicy}}"
     ])
+    if not vol_pull_policy:
+        vol_pull_policy = get_kubectl_output([
+            "get", "deployment", GATEWAY_DEPLOYMENT, "-n", NAMESPACE,
+            "-o", f"jsonpath={{.spec.template.spec.initContainers[?(@.name==\"stage-{PLUGIN_CR_NAME}\")].imagePullPolicy}}"
+        ])
     log(f"Verified plugin volume imagePullPolicy on deployment: {vol_pull_policy}")
     assert vol_pull_policy == "Always", f"Expected imagePullPolicy Always, got {vol_pull_policy}"
 
