@@ -477,6 +477,8 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/1275/pull-kube-agents-smoke-test/2097282860221206528", app)
         self.assertIn("Nothing right now.", app)
         self.assertIn("held out", app)
+        self.assertIn('href="legacy.html#gate">this case&#x27;s history</a>'.replace("&#x27;", "'"), app)
+        self.assertNotIn("grid", app.lower(), "there is no Grid page; the legacy matrix is the case history")
 
     def test_pr_view_run_with_an_unexplained_failure(self):
         app = dom_text(self.run_page, query="build=2097253644305960960")

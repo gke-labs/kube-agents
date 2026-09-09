@@ -635,7 +635,7 @@ function caseCard(run, c) {
     (c.reason ? `<div class="reason">${esc(c.reason)}</div>` : "") +
     (c.excerpt ? `<div class="quote">“${esc(c.excerpt)}”</div>` : "") +
     (c.do ? `<div class="do"><b>Do:</b> ${esc(c.do)}</div>` : "") +
-    `<div class="links">${url ? `<a href="${esc(url)}">transcript (rep 1)</a>` : ""}${log ? `<a href="${esc(log)}">build log</a>` : ""}<a href="legacy.html#gate">this case on the grid</a></div></div>`;
+    `<div class="links">${url ? `<a href="${esc(url)}">transcript (rep 1)</a>` : ""}${log ? `<a href="${esc(log)}">build log</a>` : ""}<a href="legacy.html#gate">this case's history</a></div></div>`;
 }
 
 function whatToDoHtml(run) {
