@@ -927,3 +927,27 @@ func TestApplyMemoryLimit_SetsTheRuntimeSoftLimit(t *testing.T) {
 		t.Errorf("runtime soft limit = %d with GOMEMLIMIT set, want it untouched at %d", got, prev)
 	}
 }
+
+// The process applies the limit, not just the helper: realMain has to reach
+// applyMemoryLimit before anything that can fail. A kubeconfig that does not
+// parse stops the run right after it, and the runtime's limit shows whether
+// the call happened.
+func TestRealMain_AppliesTheMemoryLimitBeforeStarting(t *testing.T) {
+	prev := debug.SetMemoryLimit(-1)
+	t.Cleanup(func() { debug.SetMemoryLimit(prev) })
+	t.Setenv("GOMEMLIMIT", "")
+	t.Setenv("EVENT_WATCHER_MEMORY_LIMIT_BYTES", "2147483648")
+
+	badKubeconfig := filepath.Join(t.TempDir(), "kubeconfig")
+	if err := os.WriteFile(badKubeconfig, []byte("not: [a kubeconfig"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err := realMain([]string{"--dry-run", "--kubeconfig", badKubeconfig, "--cluster-name", "x"})
+	if err == nil || !strings.Contains(err.Error(), "kubeconfig") {
+		t.Fatalf("want realMain to stop on the unparseable kubeconfig, got err=%v", err)
+	}
+	if got := debug.SetMemoryLimit(-1); got != 1073741824 {
+		t.Errorf("runtime soft limit after realMain = %d, want 1073741824", got)
+	}
+}

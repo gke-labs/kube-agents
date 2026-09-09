@@ -856,8 +856,8 @@ func applyMemoryLimit() {
 		return
 	}
 	debug.SetMemoryLimit(limitBytes)
-	log.Printf("k8s-event-watcher: Go soft memory limit set to %d bytes (%.0f%% of %s=%s)",
-		limitBytes, memoryLimitFraction*100, memoryLimitEnv, os.Getenv(memoryLimitEnv))
+	log.Printf("k8s-event-watcher: Go soft memory limit set to %d bytes (%s=%s × %g)",
+		limitBytes, memoryLimitEnv, os.Getenv(memoryLimitEnv), memoryLimitFraction)
 }
 
 func main() {

@@ -99,6 +99,9 @@ const (
 	// in bytes, so it can set the Go runtime's soft limit to a share of it. The
 	// watcher reads it under the same name (cmd/k8s-event-watcher/main.go).
 	eventWatcherMemoryLimitEnv = "EVENT_WATCHER_MEMORY_LIMIT_BYTES"
+	// containerMemoryLimitResource is the Downward API resource selector for
+	// a container's own memory limit.
+	containerMemoryLimitResource = "limits.memory"
 )
 
 // Shared-state ownership. Step 1.5 of deploy/shared/docker-entrypoint.sh reads this
@@ -2896,7 +2899,7 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 		Name: eventWatcherMemoryLimitEnv,
 		ValueFrom: &corev1.EnvVarSource{ResourceFieldRef: &corev1.ResourceFieldSelector{
 			ContainerName: agentAPIAuthContainerName,
-			Resource:      "limits.memory",
+			Resource:      containerMemoryLimitResource,
 			Divisor:       resource.MustParse("1"),
 		}},
 	})
