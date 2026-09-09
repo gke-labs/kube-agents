@@ -103,6 +103,7 @@ const (
 	// GKE Autopilot API groups and resources used to detect Autopilot clusters where Warden restricts Image volumes.
 	gkeAutopilotAPIGroup                     = "auto.gke.io"
 	gkeAutopilotAllowlistedWorkloadsResource = "allowlistedworkloads"
+	gkeAutopilotDefaultGroupVersion          = "auto.gke.io/v1"
 
 	pluginFailureReasonImagePull = "ImagePullFailed"
 	pluginFailureReasonStaging   = "StagingFailed"
@@ -2425,6 +2426,10 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 	}
 
 	for _, pod := range pods {
+		if !pod.DeletionTimestamp.IsZero() {
+			continue
+		}
+
 		// 1. Check container waiting states (CrashLoopBackOff, ImagePullBackOff, ErrImagePull, etc.)
 		//
 		// Init statuses first, and PodInitializing filtered out with
@@ -2462,14 +2467,14 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 				}
 				return phase, reason, message
 			}
-			if cs.State.Terminated != nil && cs.State.Terminated.ExitCode != 0 {
+			if strings.HasPrefix(cs.Name, "stage-") && cs.State.Terminated != nil && cs.State.Terminated.ExitCode != 0 {
 				phase = "Degraded"
 				reason = cs.State.Terminated.Reason
 				if reason == "" {
 					reason = "Error"
 				}
 				message = fmt.Sprintf("Container '%s' in pod %s terminated with exit code %d: %s", cs.Name, pod.Name, cs.State.Terminated.ExitCode, cs.State.Terminated.Message)
-				if strings.HasPrefix(cs.Name, "stage-") && (cs.State.Terminated.ExitCode == exitCodeCommandNotFound || strings.Contains(cs.State.Terminated.Message, "/bin/sh") || strings.Contains(cs.State.Terminated.Message, "no such file or directory")) {
+				if cs.State.Terminated.ExitCode == exitCodeCommandNotFound || strings.Contains(cs.State.Terminated.Message, "/bin/sh") || strings.Contains(cs.State.Terminated.Message, "no such file or directory") {
 					message = fmt.Sprintf("Container '%s' in pod %s failed to stage plugin (exit code %d): plugin image may be outdated or missing /bin/sh (init container staging requires a minimal shell such as busybox:musl or alpine)", cs.Name, pod.Name, cs.State.Terminated.ExitCode)
 				}
 				return phase, reason, message
@@ -2767,31 +2772,85 @@ func isImageVolumeSupported(dc discovery.DiscoveryInterface, agent *agentv1alpha
 }
 
 // isGKEAutopilot probes the API server for GKE Autopilot specific API resources.
-func isGKEAutopilot(dc discovery.DiscoveryInterface) bool {
+// It returns:
+//   - isAutopilot: true if allowlistedworkloads is found under the auto.gke.io API group.
+//   - determined: true if the determination is authoritative. Returns false if transient
+//     discovery errors (network failures, 503, timeouts) prevented establishing cluster type.
+func isGKEAutopilot(dc discovery.DiscoveryInterface) (isAutopilot bool, determined bool) {
 	if dc == nil {
-		return false
+		return false, false
 	}
 	defer func() {
-		_ = recover()
+		if r := recover(); r != nil {
+			isAutopilot = false
+			determined = false
+		}
 	}()
-	resList, err := dc.ServerResourcesForGroupVersion(gkeAutopilotAPIGroup + "/v1")
-	if err != nil || resList == nil {
-		return false
+
+	groups, err := dc.ServerGroups()
+	if err != nil || groups == nil {
+		return false, false
 	}
-	for _, r := range resList.APIResources {
-		if r.Name == gkeAutopilotAllowlistedWorkloadsResource {
-			return true
+
+	var autoGroup *metav1.APIGroup
+	for i := range groups.Groups {
+		if groups.Groups[i].Name == gkeAutopilotAPIGroup {
+			autoGroup = &groups.Groups[i]
+			break
 		}
 	}
-	return false
+	if autoGroup == nil {
+		// The API server responded with its API groups and auto.gke.io is absent:
+		// authoritatively not an Autopilot cluster.
+		return false, true
+	}
+
+	// Collect versions to probe, checking PreferredVersion first if available.
+	versionsToCheck := make([]string, 0, len(autoGroup.Versions)+1)
+	if autoGroup.PreferredVersion.GroupVersion != "" {
+		versionsToCheck = append(versionsToCheck, autoGroup.PreferredVersion.GroupVersion)
+	}
+	for _, gv := range autoGroup.Versions {
+		if gv.GroupVersion != "" && !slices.Contains(versionsToCheck, gv.GroupVersion) {
+			versionsToCheck = append(versionsToCheck, gv.GroupVersion)
+		}
+	}
+	if len(versionsToCheck) == 0 {
+		versionsToCheck = append(versionsToCheck, gkeAutopilotDefaultGroupVersion)
+	}
+
+	hasTransientError := false
+	for _, gv := range versionsToCheck {
+		resList, err := dc.ServerResourcesForGroupVersion(gv)
+		if err != nil {
+			if !errors.IsNotFound(err) {
+				hasTransientError = true
+			}
+			continue
+		}
+		if resList == nil {
+			continue
+		}
+		for _, r := range resList.APIResources {
+			if r.Name == gkeAutopilotAllowlistedWorkloadsResource {
+				return true, true
+			}
+		}
+	}
+
+	if hasTransientError {
+		return false, false
+	}
+	return false, true
 }
 
 // clusterImageVolumeSupport probes the API server for ImageVolume support.
 //
 // determined reports whether the answer is authoritative. When the capability cannot be
-// established — no discovery client, an unreachable API server, an unparseable version —
-// supported is false and determined is false: the caller must fail closed for this pass
-// but must not remember the answer, because the next probe may succeed.
+// established — no discovery client, an unreachable API server, an unparseable version,
+// or a transient discovery failure probing Autopilot resources — supported is false and
+// determined is false: the caller must fail closed for this pass but must not remember
+// the answer, because the next probe may succeed.
 func clusterImageVolumeSupport(dc discovery.DiscoveryInterface) (supported bool, determined bool) {
 	log := logf.Log.WithName("platformagent-controller")
 	const override = "Set the kubeagents.x-k8s.io/enable-image-volumes annotation to override."
@@ -2815,18 +2874,25 @@ func clusterImageVolumeSupport(dc discovery.DiscoveryInterface) (supported bool,
 		return false, false
 	}
 
+	// Kubernetes < 1.35 does not support native ImageVolumeSource on any cluster type.
+	if major < 1 || (major == 1 && minor < 35) {
+		return false, true
+	}
+
 	// GKE Autopilot clusters enforce GKE Warden admission policies (autopilot-volume-type-limitation)
 	// that reject the Image volume type. On Autopilot, fall back to initContainer/emptyDir staging.
 	// On GKE Standard (and non-GKE clusters), ImageVolumeSource is supported natively on Kubernetes 1.35+.
-	if isGKEAutopilot(dc) {
+	autopilot, determined := isGKEAutopilot(dc)
+	if !determined {
+		log.Info("Could not determine whether cluster is GKE Autopilot due to discovery failure; assuming unsupported. " + override)
+		return false, false
+	}
+	if autopilot {
 		log.Info("GKE Autopilot cluster detected; using initContainer plugin staging fallback. " + override)
 		return false, true
 	}
 
-	if major > 1 {
-		return true, true
-	}
-	return major == 1 && minor >= 35, true
+	return true, true
 }
 
 // imageVolumeSupported resolves the cluster ImageVolume capability and reuses it for
@@ -2980,6 +3046,9 @@ func (r *PlatformAgentReconciler) detectPluginFailures(ctx context.Context, agen
 	}
 
 	for _, pod := range podList.Items {
+		if !pod.DeletionTimestamp.IsZero() {
+			continue
+		}
 		// 1. Check init container statuses for staging failures or image pull issues
 		for _, cs := range pod.Status.InitContainerStatuses {
 			for _, plugin := range plugins {
