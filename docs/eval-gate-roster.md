@@ -43,7 +43,7 @@ The variable is comma- or whitespace-separated task ids; `_bootstrap_admitted()`
 
 ## The admission bar, and who clears it
 
-Ten of the eighteen active cases are admitted (recount the uncommented entries in the
+Ten of the twenty active cases are admitted (recount the uncommented entries in the
 script's `TASKS` array rather than trusting this sentence — an earlier copy of it
 miscounted twice): the ones whose recent record shows failures only on their own
 regressions or on infra classes the harness already excludes from the verdict.
