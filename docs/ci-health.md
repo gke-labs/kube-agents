@@ -8,12 +8,24 @@ then `scripts/eval_dashboard/health.py` reads the `data.json` just published,
 decides whether `pull-kube-agents-smoke-test` is **GREEN**, **DEGRADED** or
 **OUTAGE** and why, and writes `health.json` next to it.
 `scripts/eval_dashboard/post_health.py` tells `#kube-agents-ci-health` on Google
-Chat — only when the state changes, plus one digest a day at 08:00 UTC. A
+Chat — only when the state changes, plus one digest a day at 9 AM Toronto time.
+The same tick comments on each pull request whose run went red
+(`gate_comment.py`), files the tracking issue a new OUTAGE lacks
+(`gate_issue.py`), and appends `health.json` to a history feed. A
 `workflow_dispatch` of the same workflow is the on-demand refresh button.
 
 Every message ends with a deep link into the dashboard:
 `index.html?cases=<comma-separated case ids>&since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>]#gate`
 for an incident (`until` on the recovery message), `#agent` for the digest.
+
+## Times
+
+Every time a person reads — in a Chat message, the gate comment, the issue
+title — is America/Toronto, written `7:30 AM ET` (`Sun 7:30 AM ET` where the
+day matters), DST included. URL parameters, `health.json`, the state files and
+the history feed stay ISO 8601 UTC. The digest hour is a Toronto hour
+(`--digest-hour 9`, `--digest-tz America/Toronto` by default) and "once a day"
+is a Toronto day: the state file's `last_digest_date` is the local date.
 
 The rules are the procedure the eval crew ran by hand through the week of
 2026-09-01, written down as constants in `health.py`; each one cites the
@@ -66,6 +78,79 @@ four days in the week of 2026-09-04 — `health.json` keeps the last state,
 flags it `stale` once the data is older than its own `stale_after_s` (2 hours
 by default), and the poster says so once, and once more when the data is fresh
 again. The digest carries the same note while it lasts.
+
+## The comment on a red pull request
+
+Each tick, `scripts/eval_dashboard/gate_comment.py` finds the
+`pull-kube-agents-smoke-test` runs in `data.json` that finished since its last
+tick and concluded `FAILURE` with at least one graded repetition — not aborted
+runs, not setup deaths, not a suite that lost every repetition to a storm — and
+leaves one comment on each pull request (the newest red run per pull request
+when there are several):
+
+- a heading, `❌ Smoke gate: failed · 3 of 14 cases`, or `· hard failure` when
+  the run failed with no gate case failing all of its repetitions (an absolute
+  check, or a truncated log);
+- a health box: during an OUTAGE or DEGRADED state whose signature the run
+  carries, that the red is not the author's code and not to retest yet; when
+  the gate is healthy and the failed case passes on other pull requests' recent
+  runs, that it looks specific to this pull request; a mix says both, with
+  counts;
+- a table of the failed cases — result as `passed / total reps`, and how many
+  other pull requests the case is failing on right now;
+- the check's reason for a case that looks like the pull request's;
+- how many cases passed, the run's wall clock and pool project, and links: the
+  build log, `run.html?build=<build id>` on the dashboard, and the incident
+  brief when there is an incident.
+
+Which class a case gets — `shared`, `only-this-pr`, `storm`, unexplained — is
+`scripts/eval_dashboard/classify.py`'s `classify_run`, the same rules the
+dashboard's run page and the incident brief use; the comment only phrases it.
+When that module is not on the checkout the script's built-in fallback applies
+the same shape from `health.json`'s failing cases and the other pull requests'
+runs in the window.
+
+The comment starts with a hidden marker (`<!-- smoke-gate-comment -->`); a
+later red on the same pull request edits it in place, and a build already
+commented on is never commented on twice. The watermark and the comment ids
+live in `gate-comment-state.json` beside `health.json`; a first tick with no
+state looks back one hour. Posting uses the workflow's own `GITHUB_TOKEN`
+through `gh api` (the job holds `pull-requests: write` and `issues: write` for
+this and the tracking issue). A failure to post is a warning; the run is
+retried next tick and the job never reds for it. `--dry-run` prints the
+comments instead.
+
+## The tracking issue
+
+When the state becomes OUTAGE and no issue tracks it — `case-notes.yaml` names
+none for the failing cases, and no open issue labelled `presubmit-gate` names
+every failing case in its title or body — the poster files one, labelled
+`presubmit-gate`: `Smoke gate outage: 3 cases failing on every PR since Sun
+7:30 AM ET`, with the cases, the window, the class, the incident brief link,
+and the line "Filed automatically by the smoke health bot; edit freely. Fix
+PRs: reference this issue." A human's issue that already names the cases is
+adopted instead. The Chat message then reads `Tracking #NNN`, the issue rides
+in `health-state.json` and in `health.json`'s `issue` field (`{number, url}`,
+`null` outside an incident; `health.py` reads it back through
+`--posted-state`), and the recovery comments on it: "Healthy again after Xh;
+bot will not close it." The bot never closes an issue. A GitHub failure leaves
+the message at "no issue yet — file one with the presubmit-gate label" and the
+next change asks again.
+
+## The history feed
+
+After `health.json` is uploaded, the same object is appended as one line to
+`gs://kube-agents-dashboards/evals/health-history.jsonl` (JSON Lines, one
+record per tick, oldest first, nothing trimmed). Each record is the
+`health.json` document verbatim — `schema_version`, `state`, `condition`,
+`since`, `cause`, `failing_cases`, `tracking_issues`, `issue`, `incident`,
+`evidence`, `advice`, `recovering`, `stale`, `metrics`, `dashboard_url`,
+`generated_at` — plus `tick`, the ISO 8601 UTC time the line was appended.
+`generated_at` is the data's horizon and `tick` the wall clock, so a stalled
+refresh shows as many ticks sharing one `generated_at`. GCS has no append: the
+workflow downloads the object (a missing one is the first tick), appends with
+`scripts/eval_dashboard/health_history.py`, and uploads; a failure there is a
+warning, not a failed tick. The incident brief reads this feed.
 
 ## Replaying history
 
