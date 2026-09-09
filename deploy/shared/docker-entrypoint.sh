@@ -1027,7 +1027,7 @@ platform_is_front_door() {
 # runtime, so nothing else moves either way; the one entry is derived rather than a
 # second list so the two answers cannot drift apart.
 platform_sync_items() {
-    _items="SOUL.md AGENTS.md CAPABILITIES.md cron skills governance hindsight"
+    _items="SOUL.md AGENTS.md CAPABILITIES.md cron skills governance hindsight capabilities"
     platform_is_front_door || _items="config.yaml $_items"
     echo "$_items"
 }

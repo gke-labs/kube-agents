@@ -25,7 +25,17 @@ from pathlib import Path
 # configuration, and so must be merged rather than replaced. Relative to the
 # profile home, POSIX-separated; each one needs a merge rule below.
 MERGE_PATHS: tuple[str, ...] = ("cron/jobs.json",)
+# The files a capability's criteria live in (see capability_store.py). The
+# agent edits these at runtime, so across a pod start the rule is the inverse
+# of MERGE_PATHS: the volume wins every key it holds and the image adds only
+# the keys the volume is silent about. Globs relative to the profile home,
+# resolved against the volume, because the capability names are not fixed.
+VOLUME_WINS_GLOBS: tuple[str, ...] = (
+    "capabilities/*/criteria.json",
+    "capabilities/*/learning.json",
+)
 DEFAULT_LEGACY_CRON_RISK: str = "low"
+SCRATCH_SUFFIX: str = ".tmp"
 
 
 
@@ -363,6 +373,59 @@ def _merge_after_overlay(
             log(f"WARN: could not merge {relative}; image copy stands ({exc})")
 
 
+def merge_volume_wins(image: object, live: object) -> object:
+    """The rule for every VOLUME_WINS_GLOBS file across a pod start.
+
+    The volume wins every key it holds; the image contributes only the keys the
+    volume is silent about. A threshold the operator tuned through the agent
+    therefore survives an upgrade, and a key a new release adds arrives with
+    its shipped default. A key the image stops shipping stays on the volume —
+    the image-owned schema beside it is what says the key is no longer defined.
+    """
+    if not isinstance(image, dict):
+        return live if isinstance(live, dict) else image
+    if not isinstance(live, dict):
+        return image
+    return {**image, **live}
+
+
+def _snapshot_volume_wins(home: Path) -> dict[str, object]:
+    prior: dict[str, object] = {}
+    for pattern in VOLUME_WINS_GLOBS:
+        for path in home.glob(pattern):
+            contents = read_json(path)
+            if contents is not None:
+                prior[path.relative_to(home).as_posix()] = contents
+    return prior
+
+
+def _restore_volume_wins(
+    home: Path, template_dir: Path, names: tuple[str, ...], prior: dict[str, object]
+) -> None:
+    """Rewrite each VOLUME_WINS_GLOBS file the copy just replaced as volume-over-image.
+
+    A file the template does not ship — a capability the image dropped, or one
+    an operator added by hand — was never touched by the copy and needs nothing.
+    """
+    for relative, previous in prior.items():
+        parts = relative.split("/")
+        if parts[0] not in names:
+            continue
+        source = template_dir.joinpath(*parts)
+        if not source.is_file():
+            continue
+        destination = home.joinpath(*parts)
+        merged = merge_volume_wins(read_json(source), previous)
+        try:
+            scratch = destination.with_name(destination.name + SCRATCH_SUFFIX)
+            scratch.write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            os.replace(scratch, destination)
+        except OSError as exc:
+            # The image's defaults are in place, so the capability still runs;
+            # what is lost is the operator's tuning, which is worth a line.
+            log(f"WARN: could not merge {relative}; image defaults stand ({exc})")
+
+
 def overlay_template(
     home: Path,
     template_dir: Path,
@@ -381,7 +444,8 @@ def overlay_template(
     overwritten with the rest, and then rewritten as a merge of the two. See
     `merge_cron_store` for why a file can be both image-owned and runtime state,
     and what `cron_job_ids` narrows that merge to; `cron_retire_ids` names the
-    ids to delete from the volume outright (see `retire_cron_jobs`).
+    ids to delete from the volume outright (see `retire_cron_jobs`). The
+    `VOLUME_WINS_GLOBS` files get the opposite merge (see `merge_volume_wins`).
     """
     if not template_dir.is_dir():
         raise SystemExit(f"ERROR: template dir not found: {template_dir}")
@@ -391,6 +455,7 @@ def overlay_template(
         for relative in MERGE_PATHS
         if (contents := read_json(home.joinpath(*relative.split("/")))) is not None
     }
+    prior_volume_wins = _snapshot_volume_wins(home)
     for item_name in names:
         src = template_dir / item_name
         if not src.exists():
@@ -401,6 +466,7 @@ def overlay_template(
         else:
             shutil.copy2(src, dest)
     _merge_after_overlay(home, template_dir, names, prior, cron_job_ids, cron_retire_ids)
+    _restore_volume_wins(home, template_dir, names, prior_volume_wins)
     if plugins_dir and plugins_dir.is_dir():
         try:
             shutil.copytree(plugins_dir, home / "plugins", dirs_exist_ok=True)

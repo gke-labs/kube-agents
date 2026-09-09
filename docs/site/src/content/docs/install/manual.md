@@ -29,6 +29,7 @@ platform/
 ├── config.yaml              # MCP servers, toolsets, plugins
 ├── skills/                  # SKILL.md bundles
 ├── governance/              # SOPs the scheduled governance jobs point at
+├── capabilities/            # per-capability criteria defaults the agent tunes at runtime
 ├── cron/jobs.json           # empty — the schedules live on the Planning Agent
 ├── plugins/                 # in-tree Hermes plugins (incident_context, memory)
 ├── docs/                    # workspace docs (glossary, console-link templates)

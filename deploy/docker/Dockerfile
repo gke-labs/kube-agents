@@ -1383,6 +1383,10 @@ COPY --chown=hermes:hermes agents/platform/SOUL.md \
 COPY --chown=hermes:hermes agents/platform/skills/ /opt/platform-template/skills/
 COPY --chown=hermes:hermes agents/platform/cron/ /opt/platform-template/cron/
 COPY --chown=hermes:hermes agents/platform/governance/ /opt/platform-template/governance/
+# Per-capability criteria defaults (agents/platform/capabilities/README.md). The
+# entrypoint seeds them like the roster and profile_scaffold.py merges them the
+# other way round: the volume's tuned values win, the image adds new keys.
+COPY --chown=hermes:hermes agents/platform/capabilities/ /opt/platform-template/capabilities/
 # The specialist's Hindsight connection file. Profile-scoped: a kanban worker
 # runs with HERMES_HOME pointed at profiles/platform, and the plugin resolves
 # $HERMES_HOME/hindsight/config.json, so the default profile's copy is not
