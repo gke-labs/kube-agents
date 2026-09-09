@@ -36,8 +36,9 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # Cluster topology. "autopilot" (default) or "standard" — standard builds an
 # e2-standard-4 node pool with Dataplane V2, and is the only mode
 # that can carry the gVisor node pool. Set create_cluster = false to install
-# onto an existing cluster (it must already have Workload Identity; CMEK on it
-# stays a gcloud step outside Terraform).
+# onto an existing cluster (it must already have Workload Identity and enforce
+# NetworkPolicy, or the plan is refused; CMEK on it stays a gcloud step outside
+# Terraform).
 # cluster_mode            = "standard"
 # create_cluster          = false
 # enable_gvisor_node_pool = true
@@ -46,6 +47,16 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # Sandboxing on Autopilot, which has the gvisor RuntimeClass built in and no
 # node pool to provision. enable_gvisor_node_pool must stay false there.
 # agent_runtime_class = "gvisor"
+
+# A second install in this project: the agent GSA's default name is one fixed
+# name per project, so give each install after the first its own. Two caveats:
+# the installer front doors regenerate this file on every run, so through
+# install.sh/upgrade.sh put TF_VAR_agent_service_account_id=... in install.env
+# (sourced and exported by every front door) instead of editing here; and a
+# distinct name un-collides creation, not
+# identity - both installs still bind one Workload Identity principal (see the
+# variable description in variables.tf).
+# agent_service_account_id = "kubeagents-platform-gsa-2"
 
 # Cluster tuning
 # deletion_protection = true

@@ -1747,6 +1747,7 @@ class TestAuditCatalogue(unittest.TestCase):
                 "github-repo-watcher",
                 "eod-event-watcher-daily-report",
                 "kanban-workspace-gc",
+                "findings-morning-nudge",
             },
             set(live) - prompted,
             "the platform roster's `no_agent` entries are not the expected "
@@ -2283,6 +2284,134 @@ class TestAuditCatalogue(unittest.TestCase):
                     "back up; it belongs in the SOP's closing section, where "
                     "it is stated in full",
                 )
+
+    def test_node_pools_data_sources_qualify_for_standard_or_autopilot(self):
+        """Every node-pools data-collection query must carry an Autopilot qualification.
+
+        Running `node-pools list` or `describe` on an Autopilot cluster errors or
+        returns empty. SOPs that collect node-pool state must qualify the command
+        for Standard clusters only or instruct skipping on Autopilot.
+        """
+        sop_dir = self.sop_dir()
+        node_pools_cmd = re.compile(r"node-pools\s+(list|describe|list[/|]describe)")
+        qualifier = re.compile(r"Standard|Autopilot")
+        for audit_id in (
+            "fleet-wide-cost-analysis",
+            "fleet-consistency-drift",
+            "ai-security-audit",
+        ):
+            sop = sop_dir / audit_report.AUDITS[audit_id].sop
+            # Scope to data sources / Step 2 collection before individual checks (section 3)
+            data_section = sop.read_text(encoding="utf-8").split("\n### 3")[0]
+            lines = [
+                (n, line)
+                for n, line in enumerate(data_section.splitlines(), start=1)
+                if node_pools_cmd.search(line)
+            ]
+            self.assertTrue(lines, f"{sop.name} has no node-pools query lines in data sources")
+            for n, line in lines:
+                with self.subTest(audit=audit_id, line=n):
+                    self.assertRegex(
+                        line,
+                        qualifier,
+                        f"{sop.name}:{n} runs node-pools query without qualifying "
+                        "for Standard/Autopilot",
+                    )
+
+    def test_cost_sop_check_3_8_handles_autopilot_when_3_7_skipped(self):
+        """Check 3.8 must specify evaluation for Autopilot where 3.7 is skipped."""
+        sop = self.sop_dir() / audit_report.AUDITS["fleet-wide-cost-analysis"].sop
+        text = sop.read_text(encoding="utf-8")
+        self.assertIn("Autopilot clusters where 3.7 is skipped", text)
+
+    def test_drift_sop_declares_autopilot_non_configurable_facets_inapplicable(self):
+        """Drift SOP must instruct declaring non-configurable facets in checks_not_applicable."""
+        sop = self.sop_dir() / audit_report.AUDITS["fleet-consistency-drift"].sop
+        text = sop.read_text(encoding="utf-8")
+        self.assertIn("eleven §4 facets marked _Standard cohorts only_", text)
+        self.assertIn("reads as complete at eight of eight", text)
+        self.assertIn("logging-components", text)
+        self.assertIn("monitoring-components", text)
+        self.assertIn("intra-node-visibility", text)
+        self.assertIn("managed-prometheus", text)
+
+    def test_gke_sops_declare_autopilot_inapplicable_checks(self):
+        """Every GKE SOP whose checks cannot run on Autopilot must declare them in checks_not_applicable.
+
+        Guards against regression of Autopilot inapplicability clauses across the GKE streams.
+        """
+        sop_dir = self.sop_dir()
+        expected_na_checks = {
+            "compliance-audit": [
+                "privileged-container",
+                "host-namespace",
+                "hostpath-mount",
+                "legacy-metadata",
+            ],
+            "security-patch-orchestrator": [
+                "pool-skew",
+                "no-autoupgrade",
+                "no-autorepair",
+                "stale-image-type",
+            ],
+            "stockout-prevention": [
+                "single-zone-nodepool",
+            ],
+            "fleet-wide-cost-analysis": [
+                "idle-nodepool",
+            ],
+            "fleet-consistency-drift": [
+                "secure-boot",
+                "integrity-monitoring",
+                "pool-autoscaling",
+                "node-autoprovisioning",
+                "image-type",
+                "shielded-nodes",
+                "datapath-provider",
+                "intra-node-visibility",
+                "managed-prometheus",
+                "logging-components",
+                "monitoring-components",
+            ],
+        }
+        for audit_id, checks in expected_na_checks.items():
+            sop = sop_dir / audit_report.AUDITS[audit_id].sop
+            text = sop.read_text(encoding="utf-8")
+            self.assertIn(
+                "checks_not_applicable",
+                text,
+                f"{sop.name} missing checks_not_applicable specification",
+            )
+            for check in checks:
+                with self.subTest(audit=audit_id, check=check):
+                    if audit_id == "fleet-consistency-drift":
+                        # Must be declared in the Autopilot inapplicability list in scope/suppression
+                        self.assertTrue(
+                            re.search(rf"checks_not_applicable[^\n]*?`{re.escape(check)}`", text) or
+                            re.search(rf"`{re.escape(check)}`[^\n]*?checks_not_applicable", text),
+                            f"{sop.name} does not declare {check!r} in its Autopilot checks_not_applicable list",
+                        )
+                        # And facet section in §4 must contain 'Standard cohorts only' or 'checks_not_applicable'
+                        pattern = rf"###+\s+[^\n]*`{re.escape(check)}`[^\n]*\n(.*?)(?=\n###|\Z)"
+                        m = re.search(pattern, text, re.DOTALL)
+                        self.assertIsNotNone(m, f"{sop.name} missing section for check {check!r}")
+                        sec = m.group(1)
+                        has_clause = bool(re.search(r"Standard cohorts only|checks_not_applicable", sec))
+                        self.assertTrue(
+                            has_clause,
+                            f"{sop.name} section for {check!r} missing Standard-only / checks_not_applicable clause",
+                        )
+                    else:
+                        # Must appear as a JSON entry or explicit checks_not_applicable declaration
+                        self.assertTrue(
+                            re.search(rf'["`]?check["`]?\s*:\s*["`]{re.escape(check)}["`]', text),
+                            f"{sop.name} missing checks_not_applicable entry for {check!r}",
+                        )
+                        self.assertTrue(
+                            re.search(rf'["`]{re.escape(check)}["`].*?Autopilot', text, re.DOTALL) or
+                            re.search(rf'Autopilot.*?["`]{re.escape(check)}["`]', text, re.DOTALL),
+                            f"{sop.name} does not associate {check!r} with Autopilot inapplicability",
+                        )
 
 
 # --------------------------------------------------------------------------- #

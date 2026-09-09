@@ -37,11 +37,8 @@ The gateway Deployment reaches the same trap through a percentage that rounds
 down; that side is the operator's and is covered by the Go table test in
 `k8s-operator/internal/controller/manifest_helpers_test.go`.
 
-Scope this suite does NOT cover, deliberately: every other Deployment the
-install ships omits `strategy` entirely and runs at one replica, which resolves
-to the same maxUnavailable 0 and stalls the same way — the operator's own
-controller-manager among them. That is a wider change than this one and is
-tracked in #975; do not read a green run here as the install being clear of it.
+Scope this suite covers specifically: the LiteLLM Deployment family. Other
+Deployments the install ships are tested by `test_deployments_rollout_quota.py`.
 """
 
 import math
@@ -54,6 +51,7 @@ import yaml
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _VALUES = _ROOT / "charts" / "kube-agents" / "values.yaml"
 _CHART_TEMPLATE = _ROOT / "charts" / "kube-agents" / "templates" / "litellm.yaml"
+_HELPERS = _ROOT / "charts" / "kube-agents" / "templates" / "_helpers.tpl"
 _KUSTOMIZE_BASE = (
     _ROOT / "k8s-operator" / "config" / "integrations" / "litellm" / "base" / "deployment.yaml"
 )
@@ -135,51 +133,6 @@ def _max_unavailable(path):
     return _resolve_max_unavailable(doc)
 
 
-def _template_expression_for(template, field):
-    """The Go-template expression a `<field>: {{ ... }}` line renders, or None.
-
-    None means the field is absent or rendered as a literal; either way the
-    caller's assertion is what should report it, not an exception here. The
-    match is anchored to the start of an indented line so it cannot pick up a
-    `<field>:` appearing inside a comment or a longer key.
-    """
-    match = re.search(
-        rf"^ +{re.escape(field)}:[ \t]*\{{\{{(.+?)\}}\}}", template, re.MULTILINE
-    )
-    return match.group(1).strip() if match else None
-
-
-def _substitute_template_variables(template, expression, hops=4):
-    """Replace each `$var` in `expression` with the RHS of its declaration.
-
-    Substitution, not accumulation: appending every RHS instead would let any
-    expression that merely *mentions* a variable inherit that variable's
-    provenance, so a fencepost rendering the wrong value still looked as though
-    it traced back to the right one. Only `:=` declarations are followed —
-    a later `=` reassignment is what `_unconditional_reassignments` checks, and
-    treating it as a definition here would hide exactly the case it looks for.
-
-    The hop limit only stops a self-referential declaration spinning; the
-    template needs two hops ($unavail through $ru).
-    """
-    if expression is None:
-        return ""
-    declarations = dict(
-        re.findall(r"\{\{-?\s*(\$[A-Za-z_]\w*)\s*:=\s*(.+?)\s*\}\}", template)
-    )
-    resolved = expression
-    for _ in range(hops):
-        expanded = re.sub(
-            r"\$[A-Za-z_]\w*",
-            lambda m: f"({declarations[m.group(0)]})"
-            if m.group(0) in declarations
-            else m.group(0),
-            resolved,
-        )
-        if expanded == resolved:
-            break
-        resolved = expanded
-    return resolved
 
 
 def _unconditional_reassignments(template, variable):
@@ -215,50 +168,52 @@ class LiteLLMRolloutSurvivesAFullQuota(unittest.TestCase):
         # The default above is only load-bearing if the template wires it
         # through. Rendering with helm would test the property directly, but
         # nothing else in tests/ shells out to helm and the python-tests job
-        # does not install it, so this matches the template text instead —
-        # loosely enough that a pipeline (`| int`, `| default 1`) or extra
-        # whitespace, neither of which changes what renders, does not fail it.
+        # does not install it, so this matches the template text instead.
         #
-        # The strategy block renders through a variable rather than naming the
-        # values path inline, because an unset fencepost has to pick up the
-        # chart default before the both-zero guard reads it. So follow one hop
-        # of assignment: matching only the inline form would fail on a template
-        # that is correct, and matching any `{{ ... }}` at all would pass one
-        # that renders a hard-coded variable.
+        # The strategy block delegates to kube-agents.rollingUpdateFenceposts, passing
+        # .Values.litellm.rollingUpdate.
         template = _CHART_TEMPLATE.read_text()
-        source = _template_expression_for(template, "maxUnavailable")
-        self.assertIsNotNone(
-            source,
-            "charts/kube-agents/templates/litellm.yaml must render maxUnavailable from a "
-            "template expression, not a literal",
+        self.assertIn(
+            ".Values.litellm.rollingUpdate",
+            template,
+            "charts/kube-agents/templates/litellm.yaml must wire "
+            ".Values.litellm.rollingUpdate to the rollingUpdate helper",
         )
-        resolved = _substitute_template_variables(template, source)
-        # Both halves, because either alone passes on a broken template: the
-        # values path alone is also satisfied by the maxSurge fencepost, and
-        # the field name alone by an expression reaching some other block.
-        for expected in (".Values.litellm.rollingUpdate", ".maxUnavailable"):
-            self.assertIn(
-                expected,
-                resolved,
-                "charts/kube-agents/templates/litellm.yaml must render maxUnavailable from "
-                f"litellm.rollingUpdate.maxUnavailable, so an install can choose its own "
-                f"value; it renders {source!r}, which resolves to {resolved!r} and does not "
-                f"mention {expected}",
-            )
-        for variable in re.findall(r"\$[A-Za-z_]\w*", source):
-            self.assertEqual(
-                [],
-                _unconditional_reassignments(template, variable),
-                f"charts/kube-agents/templates/litellm.yaml reassigns {variable} outside a "
-                "conditional, which pins maxUnavailable for every install regardless of "
-                "values.yaml — the substitution of a default has to stay guarded",
-            )
+        self.assertIn(
+            'include "kube-agents.rollingUpdateFenceposts"',
+            template,
+            "charts/kube-agents/templates/litellm.yaml must use the shared "
+            "kube-agents.rollingUpdateFenceposts helper",
+        )
+        self.assertIn(
+            "maxSurge: {{ $rollingUpdate.maxSurge }}",
+            template,
+        )
+        self.assertIn(
+            "maxUnavailable: {{ $rollingUpdate.maxUnavailable }}",
+            template,
+        )
         self.assertNotRegex(
             template,
             r"maxUnavailable:\s*\d",
             "charts/kube-agents/templates/litellm.yaml must not hardcode maxUnavailable; "
             "a literal would pin every install regardless of its quota",
         )
+
+    def test_rolling_update_helper_guards_zero_and_pins(self):
+        helpers = _HELPERS.read_text()
+        self.assertIn('define "kube-agents.rollingUpdateFenceposts"', helpers)
+        self.assertIn(
+            "maxSurge (%v) and maxUnavailable (%v) may not both be zero", helpers
+        )
+        for variable in ("$surge", "$unavail"):
+            self.assertEqual(
+                [],
+                _unconditional_reassignments(helpers, variable),
+                f"charts/kube-agents/templates/_helpers.tpl reassigns {variable} outside a "
+                "conditional, which pins the fencepost for every install regardless of "
+                "values.yaml — the substitution of a default has to stay guarded",
+            )
 
     # The next two overlap the sweep below, which visits both files. They are
     # kept because a failure that names the file and why it matters reads

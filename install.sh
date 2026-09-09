@@ -3,11 +3,11 @@
 # 🤖 Kubernetes Agentic Harness (kube-agents) Zero-Friction Installer
 # ==============================================================================
 # Usage (Interactive):
-#   curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash
 #
 # Usage (AI Agents & Non-Interactive Automation):
-#   curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/main/install.sh | bash -s -- \
-#     --non-interactive --project-id="my-gcp-project" --cluster-name="platform-agent"
+#   curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
+#     --non-interactive --project-id="my-gcp-project" --cluster-name="platform-agent-host"
 #
 # Designed for Google Cloud Shell, Linux, macOS, and AI Agent harnesses.
 # ==============================================================================
@@ -43,12 +43,12 @@ define_print_helpers() {
 define_print_helpers
 
 # ─── Process Lock File & Error Trap Handling ────────────────────────────────
-LOCK_FILE="/tmp/kube-agents-install.lock"
+LOCK_FILE="${KUBE_AGENTS_LOCK_FILE:-/tmp/kube-agents-install.lock}"
 # The gateway's service account id when the kustomize path's LITELLM_GSA_NAME is
 # not in the environment; must agree with module.litellm_vertex_iam in
 # terraform/examples/full-install/main.tf.
 LITELLM_GSA_DEFAULT_NAME="kubeagents-litellm-gsa"
-if command -v flock >/dev/null 2>&1; then
+if [ "${KUBE_AGENTS_SOURCE_ONLY:-false}" != "true" ] && command -v flock >/dev/null 2>&1; then
   if ( : >"$LOCK_FILE" ) 2>/dev/null && exec 200>"$LOCK_FILE"; then
     if ! flock -n 200 2>/dev/null; then
       echo -e "  \033[93m⚠ Another instance of kube-agents installer is currently running. Exiting.\033[0m" >&2
@@ -454,8 +454,10 @@ Flags for AI Agents & Automation:
                                             and a Postgres database into the cluster.
                                   off       nothing is retained between sessions. No memory
                                             provider, and no database to run.
-  --image-tag=TAG               Validated immutable release tag or full commit SHA
-                                (default: this checkout's HEAD; required via curl | bash)
+  --image-tag=TAG               Validated immutable release tag or full commit SHA.
+                                Developer and CI/CD testing only; end users should use
+                                official release installations where image tags are baked in
+                                (default: inferred from baked release, release bundle, or local HEAD)
   --registry-prefix=PATH        Container registry path without a URL scheme, for the images
                                 this project builds (operator, agent, credential proxy, replay
                                 proxy)
@@ -726,6 +728,54 @@ default_image_tag_label() {
   else
     printf 'local HEAD checkout %s' "${tag:0:7}"
   fi
+}
+
+# Resolves the image tag to use: honors explicit requested tag first, falls back
+# to the checkout/bundle default without prompting if found, or prompts interactively.
+# Stores the resolved tag in the variable named by $1 rather than echoing it:
+# callers run without a subshell, which prevents ERR trap firing on validation errors
+# and keeps informational diagnostics on standard output.
+resolve_effective_image_tag() {
+  local dest_var="$1"
+  local repo_dir="${2:-}"
+  local requested_tag="${3:-}"
+  printf -v "$dest_var" '%s' ""
+  if [ -n "$requested_tag" ]; then
+    if ! validate_immutable_ref "$requested_tag"; then
+      return 1
+    fi
+    printf -v "$dest_var" '%s' "$requested_tag"
+    return 0
+  fi
+  if [ -z "$repo_dir" ] || [ "$repo_dir" = "." ]; then
+    if [ -f "${repo_dir:-.}/scripts/installer/installer_common.sh" ]; then
+      repo_dir="${repo_dir:-.}"
+    elif [ -n "${_state_repo_dir:-}" ]; then
+      repo_dir="$_state_repo_dir"
+    else
+      repo_dir="$(_resolve_repo_dir_for_state)"
+    fi
+  fi
+  local default_tag=""
+  default_tag="$(default_image_tag "$repo_dir")"
+  if [ -n "$default_tag" ]; then
+    print_info "Using container image tag ($(default_image_tag_label "$repo_dir")): ${C_BOLD}${default_tag}${C_RESET}"
+    printf -v "$dest_var" '%s' "$default_tag"
+    return 0
+  fi
+  if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
+    print_error "--image-tag is required; use a validated release tag or full commit SHA."
+    return 1
+  fi
+  local prompted_tag=""
+  while true; do
+    prompt_read "Container image tag (validated release tag or full commit SHA)" \
+      prompted_tag "" false ""
+    if validate_immutable_ref "$prompted_tag"; then
+      break
+    fi
+  done
+  printf -v "$dest_var" '%s' "$prompted_tag"
 }
 
 json_escape() {
@@ -1107,7 +1157,15 @@ verify_local_source_ref() {
 
   SOURCE_REF_VERIFIED="${repo_dir}@${expected_ref}"
   if [ "$unverified" = "true" ]; then
-    print_warning "Continuing with unverified install sources: the cluster will get this checkout's configuration plus the image built from ${expected_ref}."
+    if [ "$PARAM_DRY_RUN" = "true" ]; then
+      if [ "$PARAM_ALLOW_UNVERIFIED_SOURCE" = "true" ]; then
+        print_warning "Continuing dry run with unverified install sources: preview is continuing (--allow-unverified-source active)."
+      else
+        print_warning "Continuing dry run with unverified install sources: a real installation would refuse this checkout, but preview is continuing."
+      fi
+    else
+      print_warning "Continuing with unverified install sources: the cluster will get this checkout's configuration plus the image built from ${expected_ref}."
+    fi
     return 0
   fi
   print_success "Verified install sources and image ref resolve to commit ${expected_commit}."
@@ -1963,7 +2021,7 @@ run_menu_system() {
   local kms_keyring="${KMS_KEYRING:-}"
   local kms_key="${KMS_KEY:-}"
   local github_pem_path="${GITHUB_PEM_PATH:-}"
-  local image_tag="${IMAGE_TAG:-}"
+  local image_tag="${PARAM_IMAGE_TAG:-}"
 
   while true; do
     echo -e "\n${C_CYAN}${C_BOLD}"
@@ -2085,11 +2143,8 @@ run_menu_system() {
         ;;
       6)
         print_step "Saving & Re-applying Configuration State"
-        if [ -z "$image_tag" ]; then
-          prompt_read "Container image tag (validated release tag or full commit SHA)" \
-            image_tag "$(default_image_tag "$repo_dir")" false "$(default_image_tag_label "$repo_dir")"
-        fi
-        validate_immutable_ref "$image_tag"
+        resolve_effective_image_tag image_tag "$repo_dir" "$image_tag" || return 1
+        validate_immutable_ref "$image_tag" || return 1
         verify_local_source_ref "$repo_dir" "$image_tag"
         export PARAM_PROJECT_ID="$project_id" PARAM_CLUSTER_NAME="$cluster_name" PARAM_REGION="$region"
         export PARAM_ENABLE_WEBUI="$enable_webui" PARAM_MODEL_PROVIDER="$model_provider"
@@ -2177,23 +2232,9 @@ main() {
     print_info "Execution Mode: ${C_BOLD}Non-Interactive / AI Agent Automated Mode${C_RESET} 🤖"
   fi
 
-  local image_tag="${PARAM_IMAGE_TAG:-}"
-  if [ -z "$image_tag" ]; then
-    local head_sha=""
-    head_sha="$(default_image_tag)"
-    if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
-      if [ -z "$head_sha" ]; then
-        print_error "--image-tag is required; use a validated release tag or full commit SHA."
-        exit 1
-      fi
-      image_tag="$head_sha"
-      print_info "Defaulting image tag to $(default_image_tag_label): ${C_BOLD}${image_tag}${C_RESET}"
-    else
-      prompt_read "Container image tag (validated release tag or full commit SHA)" \
-        image_tag "$head_sha" false "$(default_image_tag_label)"
-    fi
-  fi
-  validate_immutable_ref "$image_tag"
+  local image_tag=""
+  resolve_effective_image_tag image_tag "." "${PARAM_IMAGE_TAG:-}" || exit 1
+  validate_immutable_ref "$image_tag" || exit 1
 
   # 2. Prerequisite CLI Tools Check & Auto-Installation
   print_step "1. Checking Prerequisites & Installing Missing Tools"

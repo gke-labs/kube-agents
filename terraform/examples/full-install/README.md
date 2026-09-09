@@ -12,17 +12,21 @@ install without the interview.
   destroy), including the Cloud KMS API for GKE database encryption and the Chat
   API when Google Chat is enabled.
 - A GKE cluster ([`gke-cluster`](../../modules/gke-cluster) module) — Autopilot
-  by default, `cluster_mode = "standard"` for an e2-standard-4 node pool
-  (with an optional gVisor node pool), or `create_cluster = false` to
-  install onto an existing one — with Workload Identity, Cloud KMS database
-  encryption (CMEK), the Backup for GKE agent enabled, and the
-  `kube-agents-host=true` discovery label applied.
+  by default, or `cluster_mode = "standard"` for an e2-standard-4 node pool
+  (with an optional gVisor node pool) — with Workload Identity, Cloud KMS
+  database encryption (CMEK), the Backup for GKE agent enabled, and the
+  `kube-agents-host=true` discovery label applied. Setting
+  `create_cluster = false` instead makes the module read an existing cluster:
+  it enables none of those, and its postconditions refuse the plan unless the
+  cluster already has Workload Identity and NetworkPolicy enforcement (see
+  [Prerequisites](#prerequisites)).
 - Optionally (`enable_gke_backup_plan = true`) a scheduled
   [`gke-backup-plan`](../../modules/gke-backup-plan) for the release namespace.
 - The agent's GCP identity ([`kube-agents-iam`](../../modules/kube-agents-iam)
-  module): the `kubeagents-platform-gsa` service account, its read-only
-  project roles, and the Workload Identity binding to the
-  `kubeagents-platform-agent` KSA (see
+  module): a service account (`kubeagents-platform-gsa` by default; a second
+  install in the same project sets `agent_service_account_id` to avoid the
+  name collision), its read-only project roles, and the Workload Identity
+  binding to the `kubeagents-platform-agent` KSA (see
   [IAM roles](#iam-roles-permission_set-and-project_roles) below).
 - Optionally (`enable_google_chat = true`) the Google Chat backend
   ([`chat-pubsub`](../../modules/chat-pubsub) module): Pub/Sub topic,
@@ -88,6 +92,14 @@ install without the interview.
 
 - A GCP project you can administer.
 - Terraform `~> 1.5`.
+- With `create_cluster = false`, a cluster that meets the
+  [cluster requirements](../../../docs/site/src/content/docs/install/prerequisites.md#cluster-requirements):
+  GKE 1.29+, Workload Identity with `GKE_METADATA` on every node pool,
+  NetworkPolicy enforcement, a control plane reachable from here, and cert-manager
+  either present (`enable_cert_manager = false`) or absent. The module refuses the
+  plan on two of these, the Workload Identity pool and NetworkPolicy enforcement,
+  and checks none of the others; `install.sh` changes an adopted cluster to meet
+  those two instead, and this composition on its own never does.
 - Application Default Credentials for the Google, Kubernetes, and Helm
   providers:
 
@@ -130,7 +142,24 @@ plans the whole composition as new and reads as total drift. A gitignored
 `backend_override.tf` points Terraform at
 `gs://<bucket>/<prefix>`, where the prefix defaults to
 `kube-agents/<cluster_name>` (override with `KUBE_AGENTS_STATE_PREFIX`) so two
-installs in one project keep separate state. Versioning is the recovery story:
+installs in one project keep separate state. State is only half of the
+second-install story: set `agent_service_account_id` too, or the installs
+collide on the agent GSA's fixed default name halfway through the second
+install's first apply. Through the installer front doors that means a
+`TF_VAR_agent_service_account_id=...` line in `install.env` - every front
+door sources it with `set -a`, so the line persists and exports on each
+run. Do not rely on a shell `export` instead: it dies with the shell, and
+the next front-door run resolves the variable back to the default name and
+plans the GSA's destroy-and-recreate under `-auto-approve`. And do not
+hand-edit `terraform.tfvars`: install.sh, upgrade.sh and uninstall.sh
+regenerate it on every run, silently dropping the line (Terraform reads
+`TF_VAR_*` only where the file is silent, and on this key it stays silent).
+And a distinct name un-collides creation, not identity: the Workload
+Identity principal names a namespace and KSA project-wide, no cluster, so
+both installs bind the same principal and each agent can mint the other's
+GSA tokens. The `agent_service_account_id` description in `variables.tf`
+carries the limits to read before relying on this. Versioning is the
+recovery story:
 a corrupted or mistakenly-overwritten state file can be rolled back to a prior
 generation by copying it over the live object (`gcloud storage ls -a` lists the
 generations; `gcloud storage restore` is for soft-deleted objects, which is a
@@ -276,12 +305,15 @@ neither means what it looks like:
 
 ### The `image_tag` rule
 
-`image_tag` (default `latest`) overrides both the operator and platform-agent
-image tags. It exists because the chart is installed from this checkout, and a
-checkout's `Chart.yaml` carries an `appVersion` placeholder that never matches
-a published image tag — so the chart's usual tag defaulting cannot work here
-(see the [chart README](../../../charts/kube-agents/README.md)). `latest` is
-fine for evaluation; pin an `X.Y.Z` release tag for production.
+`image_tag` (default `latest` on `main`) overrides both the operator and platform-agent
+image tags. In CI/CD pipelines and automated testing, it is passed explicitly with the
+commit SHA on which container images were built for testing, ensuring the deployment pulls
+the exact matching artifacts. In official release bundles and release-tag checkouts, release
+automation stamps this default directly with the released SemVer version (e.g. `0.4.0`).
+It exists because the chart is installed from this checkout, and a checkout's `Chart.yaml`
+carries an `appVersion` placeholder that never matches a published image tag — so the
+chart's usual tag defaulting cannot work here (see the [chart README](../../../charts/kube-agents/README.md)).
+For production, always pin a validated numeric SemVer release tag or full commit SHA.
 
 ### Installing from a mirrored registry
 
@@ -463,7 +495,7 @@ uninstall its standalone release before setting these variables (`helm uninstall
 (`meta.helm.sh/release-name`) and refuses to adopt existing resources owned by another release.
 
 **Manual steps that no IaC can perform** — canonical walkthrough:
-[INSTALL.md § Enable Google Chat & Slack Integrations](../../../INSTALL.md#step-4-enable-google-chat--slack-integrations-manual-required-steps):
+[INSTALL.md § Enable Google Chat & Slack Integrations](../../../INSTALL.md#step-5-enable-google-chat--slack-integrations-manual-required-steps):
 
 - **Google Chat:** register the Chat app on the Chat API configuration page —
   select Cloud Pub/Sub and enter the created topic (the `chat_topic_name`

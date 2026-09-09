@@ -135,6 +135,7 @@ from pathlib import Path
 RUNTIME_WINS = ("deliver",)
 
 DEFAULT_LEDGER_NAME = ".cron_jobs_installed"
+DEFAULT_LEGACY_CRON_RISK = "low"
 
 
 def log(msg: str) -> None:
@@ -248,7 +249,10 @@ def reconcile(
             continue
         job_id = job.get("id")
         if job_id not in seen:
-            result.append(job)
+            if "risk" not in job:
+                result.append({**job, "risk": DEFAULT_LEGACY_CRON_RISK})
+            else:
+                result.append(job)
 
     return result, ledger | {j.get("id") for j in image_jobs if j.get("id")}, summary
 

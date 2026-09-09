@@ -22,6 +22,17 @@ spec:
       control-plane: controller-manager
       app.kubernetes.io/name: kube-agents-operator
   replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Why maxUnavailable is 0 here: this Pod is the admission webhook backend
+      # (ENABLE_WEBHOOKS: "true", containerPort: 10250) and config/webhook uses
+      # failurePolicy: Fail. At replicas: 1, maxUnavailable: 1 sets minAvailable: 0,
+      # terminating the old Pod before the replacement is Ready and causing an
+      # admission outage. maxUnavailable: 0 ensures the old Pod serves until the
+      # replacement passes readiness checks.
+      maxUnavailable: 0
+      maxSurge: 1
   template:
     metadata:
       annotations:

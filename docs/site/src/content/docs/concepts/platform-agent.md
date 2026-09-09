@@ -15,6 +15,7 @@ It runs as the `platform` Hermes profile in the agent pod, scaffolded at pod sta
 - **Dynamic multi-repository resolution.** On startup, the agent reads the configured GitOps repo URLs from the ConfigMap specified in `$GITOPS_STATE_CONFIGMAP`. No hardcoded single-repo assumptions.
 - **Dynamic project resolution.** The agent reads its GCP project, location, and cluster from `$GKE_PROJECT_ID` / `$GKE_LOCATION` / `$GKE_CLUSTER_NAME`, which the operator injects from the `PlatformAgent` resource. No hardcoded project IDs — and never `-` in the project segment of a resource path, which GKE accepts only as the location wildcard.
 - **Continuous expertise.** The agent pulls the latest GitOps repo contents and maintains an expert-level understanding of every declarative definition in the fleet.
+- **Grounded, current knowledge.** Resolves GKE and Kubernetes specifics (APIs, schemas, versions, deprecations, configuration semantics) against `mcp-developer_knowledge` before relying on memory or web search.
 - **Security through strict separation.** Tenant isolation is non-negotiable — namespaces, RBAC, `NetworkPolicy`, `ResourceQuota`. A workload is physically constrained to its allocated namespace.
 - **Least privilege.** The agent's Kubernetes identity is read-only and cannot read Secrets. Its GCP identity is governed by an install-time permission set (`read-only` by default; widening it means choosing `custom` and naming every role) — see [Security &amp; IAM](/kube-agents/reference/security-and-iam/#what-the-agent-can-and-cannot-do) for exactly what is enforced on which plane.
 - **Autonomous recovery.** Retries transient auth/IAM/identity failures via a bounded ladder (5 iterations or ~10 minutes per distinct blocker) before escalating to a human.
@@ -27,10 +28,11 @@ The persona runs inside the Platform Agent Deployment on top of the [Hermes runt
 
 ### MCP servers
 
-| Server             | Where                                                    | Purpose                                                                          |
-| ------------------ | -------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| `platform_control` | In-pod, `agents/platform/scripts/platform_mcp_server.py` | Session and agent-internal ops (chat ingress now lives with the Planning Agent). |
-| `gke`              | Remote via `mcp-remote` → `container.googleapis.com/mcp` | Kubernetes/GKE cluster access (read-scoped by default).                          |
+| Server                | Where                                                             | Purpose                                                                            |
+| --------------------- | ----------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| `platform_control`    | In-pod, `agents/platform/scripts/platform_mcp_server.py`          | Session and agent-internal ops (chat ingress now lives with the Planning Agent).   |
+| `developer_knowledge` | Remote via `mcp-remote` → `developerknowledge.googleapis.com/mcp` | Authoritative Google Cloud and GKE documentation, API schemas, and best practices. |
+| `gke`                 | Remote via `mcp-remote` → `container.googleapis.com/mcp`          | Kubernetes/GKE cluster access (read-scoped by default).                            |
 
 The `gke` MCP server proxies to Google's remote MCP endpoint for GKE, so cluster reads/writes go through a first-class MCP interface rather than shelling out to `kubectl` or `gcloud`.
 

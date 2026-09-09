@@ -355,8 +355,8 @@ Agents with a user in the loop follow this file.
 `pull-kube-agents-smoke-test` runs the eval matrix in `hack/ci-eval-pr.sh` — every active case,
 three repetitions each — and has been merge-blocking since 2026-09-02
 (GoogleCloudPlatform/oss-test-infra#2677). It is slow — recent green runs took 1.5 to 3.5 hours
-against a 360-minute ceiling — and a new push restarts it, so open the pull request early and
-batch changes rather than stacking pushes. Another pull request merging usually does not — the
+against a 360-minute ceiling — and a push restarts it unless only inert paths changed (step 0), so
+open the pull request early and batch changes. Another pull request merging usually does not — the
 green status is re-pinned to `main`'s new head
 ([how a change merges](docs/pull-request-workflow.md#how-a-change-merges)).
 
@@ -367,7 +367,7 @@ instead of running, or a record whose liveness signals are inconsistent (one sho
 all is excluded as infrastructure instead, #1184). Repetitions classified as
 infrastructure failures are excluded from the verdict automatically, unless every case hits one —
 a suite that evaluated nothing reds rather than reporting green. The roster is the source of truth
-for what is admitted, the comment above it for how a flaky case is demoted, and
+for what is admitted, `docs/eval-gate-roster.md` for demotion, and
 [`docs/designs/testing-strategy.md`](docs/designs/testing-strategy.md) §4.2 for the full verdict
 ladder.
 

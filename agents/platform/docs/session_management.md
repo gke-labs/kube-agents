@@ -326,7 +326,9 @@ CREATE TABLE alert_quota(
 );
 ```
 
-Rows age out with everything else after `SESSION_KV_CLEANUP_TTL_DAYS`, so roughly two weeks of history is available to answer "what did we drop last week".
+Rows age out after `SESSION_KV_CLEANUP_TTL_DAYS`, along with `session_metadata` and `incidents`, so roughly two weeks of history is available to answer "what did we drop last week".
+
+The same database also holds `findings` and `queue_publications`, the findings queue's tables. They are exempt from the TTL sweep — a backlog item disappears when its state says it is finished, not when it gets old. [`docs/designs/inventory-findings-queue.md`](../../../docs/designs/inventory-findings-queue.md) §3.1 is the canonical description of both.
 
 ---
 

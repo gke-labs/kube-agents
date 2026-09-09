@@ -237,6 +237,13 @@ image pins mirror `images.json`; `hindsight.postgresql.storage` sizes the
 volumeClaimTemplate (immutable once the StatefulSet exists), and the PVC —
 which **is** the memory — survives uninstall.
 
+`hindsight.api.rollingUpdate.maxUnavailable` defaults to `0` to keep the
+existing Pod serving while the replacement pulls its image and loads models (up
+to the 5-minute `startupProbe` budget). Set it to `1` on installs with strict
+namespace `ResourceQuota` that lack room for a surge Pod, accepting that memory
+recall will be offline during the rollout. `values.yaml` states the trade-off in
+full.
+
 ### GitHub token minter
 
 `githubMinter.*` renders the minty Deployment, Service, NetworkPolicy,
@@ -560,6 +567,12 @@ helm uninstall kube-agents -n kubeagents-system
     cluster-wide. Two releases with webhooks on therefore both intercept every
     PlatformAgent in the cluster; under `Fail` an outage of either one blocks
     writes for both. Run webhooks from one release.
+  - **`operator.rollingUpdate.maxUnavailable` defaults to `0`** to hold the
+    existing operator Pod until the replacement passes readiness checks on
+    `:10250`, preventing admission webhook outages during upgrades when
+    `failurePolicy` is `Fail`. Setting it to `1` replaces in place under a tight
+    `ResourceQuota`, but PlatformAgent writes will be rejected (under `Fail`) or
+    unvalidated (under `Ignore`) until the new Pod is ready.
 
 - **CRDs** live in `crds/` and are installed by Helm on first install but never
   upgraded (a Helm limitation) — apply `k8s-operator/config/crd/bases/`

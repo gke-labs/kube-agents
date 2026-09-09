@@ -399,6 +399,38 @@ class PublishHelmChartScriptTest(unittest.TestCase):
         finally:
             temp_dir.cleanup()
 
+    def test_mock_helm_registry_login_reads_the_password_from_stdin(self):
+        """The mock must consume --password-stdin the way real helm does.
+
+        publish_helm_chart.sh runs `printf token | helm registry login
+        --password-stdin` under `set -o pipefail`. A mock that exits without
+        reading stdin races the writer: when helm wins, printf takes SIGPIPE and
+        the pipeline reports failure. That was an intermittent CI red in the
+        CI-mode tests above. The sleep makes the race deterministic -- helm has
+        certainly exited before the write unless it is waiting on stdin.
+        """
+        temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        try:
+            bin_dir = pathlib.Path(temp_dir.name) / "bin"
+            helm_path, _ = create_mock_helm_binary(bin_dir)
+            proc = subprocess.run(
+                [
+                    "bash",
+                    "-o",
+                    "pipefail",
+                    "-c",
+                    '(sleep 0.5; printf "%s" "$1") | "$2" registry login ghcr.io -u user --password-stdin',
+                    "_",
+                    MOCK_GH_TOKEN,
+                    str(helm_path),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        finally:
+            temp_dir.cleanup()
+
 
 if __name__ == "__main__":
     unittest.main()

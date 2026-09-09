@@ -1,4 +1,5 @@
 {{- if .Values.operator.enabled }}
+{{- $rollingUpdate := include "kube-agents.rollingUpdateFenceposts" (dict "rollingUpdate" .Values.operator.rollingUpdate "defaultSurge" 1 "defaultUnavailable" 0 "scope" "operator.rollingUpdate") | fromYaml }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -9,6 +10,11 @@ metadata:
     {{- include "kube-agents.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.operator.replicaCount }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: {{ $rollingUpdate.maxSurge }}
+      maxUnavailable: {{ $rollingUpdate.maxUnavailable }}
   selector:
     matchLabels:
       {{- include "kube-agents.operatorSelectorLabels" . | nindent 6 }}

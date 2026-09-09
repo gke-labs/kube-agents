@@ -15,12 +15,14 @@ from pathlib import Path
 import apply_cron_run_scope
 from cron_run_scope import (
     CRON_RESPONSE_LIMIT,
+    CRON_RISK_ENV,
     CRON_RUN_ENV,
     WORKER_TASK_ENV,
     clip_cron_response,
     cron_ownership_violation,
     cron_run_scope,
     current_cron_job,
+    current_cron_risk,
     missing_task_id_error,
 )
 
@@ -37,13 +39,22 @@ class CronRunScopeTest(unittest.TestCase):
 
     def setUp(self):
         self.addCleanup(os.environ.pop, CRON_RUN_ENV, None)
+        self.addCleanup(os.environ.pop, CRON_RISK_ENV, None)
         os.environ.pop(CRON_RUN_ENV, None)
+        os.environ.pop(CRON_RISK_ENV, None)
 
     def test_the_marker_is_set_during_the_run_and_cleared_after(self):
         self.assertEqual(current_cron_job(), "")
-        with cron_run_scope(JOB_ID):
+        self.assertEqual(current_cron_risk(), "high")
+        with cron_run_scope(JOB_ID, risk="low"):
             self.assertEqual(current_cron_job(), JOB_ID)
+            self.assertEqual(current_cron_risk(), "low")
         self.assertEqual(current_cron_job(), "")
+        self.assertEqual(current_cron_risk(), "high")
+
+    def test_default_risk_is_high(self):
+        with cron_run_scope(JOB_ID):
+            self.assertEqual(current_cron_risk(), "high")
 
     def test_the_marker_is_cleared_when_the_run_raises(self):
         with self.assertRaises(RuntimeError):
@@ -296,7 +307,23 @@ def _run_one_job_body(
     execution_token=None,
 ) -> bool:
     try:
-        output = execute_job(job)
+        _deferred_agents: list = []
+        try:
+            if fire_claim_lost is None:
+                success, output, final_response, error = run_job(
+                    job,
+                    defer_agent_teardown=_deferred_agents,
+                    extra_prompt=extra_prompt,
+                )
+            else:
+                success, output, final_response, error = run_job(
+                    job,
+                    defer_agent_teardown=_deferred_agents,
+                    extra_prompt=extra_prompt,
+                    cancel_event=fire_claim_lost,
+                )
+        finally:
+            pass
         if output:
             output_file = save_job_output(job["id"], output)
         finish_execution(
@@ -312,7 +339,7 @@ def _run_one_job_body(
 '''
 
 CRONJOB_STUB = '''import json
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 
 def _notify_provider_jobs_changed_safe() -> None:
@@ -340,7 +367,21 @@ def _run_claimed_job(job, job_id, adapters, gateway_loop, extra_prompt):
         }
 
 
-def cronjob(action, result, exec_result):
+def cronjob(
+    action: str,
+    result: Optional[dict] = None,
+    exec_result: Optional[dict] = None,
+    reasoning_effort: Optional[str] = None,
+    task_id: str = None,
+):
+    if action == "create":
+        if True:
+            try:
+                create_job_with_scheduler_registration(
+                    reasoning_effort=reasoning_effort,
+                )
+            except Exception:
+                pass
     if action == "run":
         if exec_result is not None:
             if exec_result.get("skipped"):
@@ -348,6 +389,24 @@ def cronjob(action, result, exec_result):
             elif exec_result.get("error"):
                 result["execution_error"] = exec_result["error"]
             return json.dumps({"success": True, "job": result}, indent=2)
+'''
+
+JOBS_STUB = '''from typing import Any, Dict, Optional
+
+
+def create_job(
+    name: str,
+    schedule: str,
+    prompt: str,
+    monitor_url: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
+) -> Dict[str, Any]:
+    job = {"name": name, "schedule": schedule, "prompt": prompt}
+    with _jobs_lock():
+        jobs = load_jobs()
+        jobs.append(job)
+        save_jobs(jobs)
+    return job
 '''
 
 KANBAN_STUB = '''import os
@@ -377,15 +436,19 @@ def kanban_block(task_id=None):
 class ApplierTest(unittest.TestCase):
     """The applier against the v2026.8.19 wrapper/body shape."""
 
-    def _apply(self):
+    def _apply_all(self) -> Path:
         root = Path(tempfile.mkdtemp())
         (root / "cron").mkdir()
         (root / "tools").mkdir()
         (root / "cron" / "scheduler.py").write_text(SCHEDULER_STUB)
+        (root / "cron" / "jobs.py").write_text(JOBS_STUB)
         (root / "tools" / "cronjob_tools.py").write_text(CRONJOB_STUB)
         (root / "tools" / "kanban_tools.py").write_text(KANBAN_STUB)
         apply_cron_run_scope.apply(root)
-        return (root / "cron" / "scheduler.py").read_text()
+        return root
+
+    def _apply(self) -> str:
+        return (self._apply_all() / "cron" / "scheduler.py").read_text()
 
     @staticmethod
     def _keyword_only(source, name):
@@ -419,6 +482,65 @@ class ApplierTest(unittest.TestCase):
         self.assertIn('outcome["response"] = final_response', body)
         self.assertIn('outcome["output_file"] = str(output_file)', body)
 
+    def test_the_scoped_run_job_lands_in_the_body(self):
+        scheduler = self._apply()
+        body = scheduler[scheduler.index("def _run_one_job_body(") :]
+        self.assertIn('with cron_run_scope(job["id"], risk=str(job.get("risk") or "high")):', body)
+
+    def test_cronjob_create_accepts_risk_param(self):
+        root = self._apply_all()
+        cronjob = (root / "tools" / "cronjob_tools.py").read_text()
+        ast.parse(cronjob)
+        self.assertIn("risk: Optional[str] = None,", cronjob)
+        self.assertIn("risk=risk,", cronjob)
+
+    def test_jobs_create_job_stamps_default_risk(self):
+        root = self._apply_all()
+        jobs = (root / "cron" / "jobs.py").read_text()
+        ast.parse(jobs)
+        self.assertIn("risk: Optional[str] = None,", jobs)
+        self.assertIn('job["risk"] = _eff_risk', jobs)
+
+    def test_jobs_create_job_clamps_and_validates_risk(self):
+        import contextlib
+        from typing import Any, Dict, Optional
+        root = self._apply_all()
+        jobs_code = (root / "cron" / "jobs.py").read_text()
+        stored_jobs = []
+        ns = {
+            "load_jobs": lambda: stored_jobs,
+            "save_jobs": lambda js: None,
+            "_jobs_lock": contextlib.nullcontext,
+            "Optional": Optional,
+            "Dict": Dict,
+            "Any": Any,
+        }
+        exec(jobs_code, ns)
+        create_job = ns["create_job"]
+
+        # Default is low
+        j1 = create_job("test1", "* * * * *", "echo 1")
+        self.assertEqual(j1["risk"], "low")
+
+        # Explicit low is low
+        j2 = create_job("test2", "* * * * *", "echo 2", risk="low")
+        self.assertEqual(j2["risk"], "low")
+
+        # Explicit high is high
+        j3 = create_job("test3", "* * * * *", "echo 3", risk="high")
+        self.assertEqual(j3["risk"], "high")
+
+        # Invalid string fails closed to high
+        j4 = create_job("test4", "* * * * *", "echo 4", risk="banana")
+        self.assertEqual(j4["risk"], "high")
+
+        # Inside high-risk cron run, low and invalid risk are clamped to high
+        with cron_run_scope("watchdog-1", risk="high"):
+            j5 = create_job("test5", "* * * * *", "echo 5", risk="low")
+            self.assertEqual(j5["risk"], "high")
+            j6 = create_job("test6", "* * * * *", "echo 6", risk="banana")
+            self.assertEqual(j6["risk"], "high")
+
     def test_a_wrapper_that_stopped_delegating_is_fatal_not_silent(self):
         """The shape that shipped the NameError: no lambda to forward through."""
         root = Path(tempfile.mkdtemp())
@@ -429,6 +551,7 @@ class ApplierTest(unittest.TestCase):
                 "lambda lost_ownership: _run_one_job_body(", "_run_one_job_body("
             )
         )
+        (root / "cron" / "jobs.py").write_text(JOBS_STUB)
         (root / "tools" / "cronjob_tools.py").write_text(CRONJOB_STUB)
         (root / "tools" / "kanban_tools.py").write_text(KANBAN_STUB)
         with self.assertRaises(SystemExit) as ctx:
@@ -442,6 +565,7 @@ class ApplierTest(unittest.TestCase):
         (root / "cron").mkdir()
         (root / "tools").mkdir()
         (root / "cron" / "scheduler.py").write_text(SCHEDULER_STUB)
+        (root / "cron" / "jobs.py").write_text(JOBS_STUB)
         (root / "tools" / "cronjob_tools.py").write_text(CRONJOB_STUB)
         (root / "tools" / "kanban_tools.py").write_text(KANBAN_STUB)
         apply_cron_run_scope.apply(root)

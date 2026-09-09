@@ -221,6 +221,9 @@ FRONTMATTER_DESCRIPTION = re.compile(
     re.MULTILINE,
 )
 
+# The valid risk tiers a cron job can declare (SKILL-002).
+ALLOWED_CRON_RISK = frozenset({"low", "high"})
+
 
 @dataclass(frozen=True)
 class Finding:
@@ -706,6 +709,31 @@ def check_cron_assets() -> list[Finding]:
     return findings
 
 
+def check_cron_risk() -> list[Finding]:
+    """Every cron job must declare a valid risk tier (SKILL-002).
+
+    A cron job with no declared risk runs at the global cron_mode with nothing
+    keyed off it. The runtime approval gate requires a declared risk tier to
+    determine whether to enforce the fail-closed read-only command policy.
+    """
+    findings = []
+    for path, jobs in cron_rosters():
+        rel = path.relative_to(REPO)
+        for job in jobs:
+            risk = job.get("risk")
+            if risk not in ALLOWED_CRON_RISK:
+                findings.append(
+                    Finding(
+                        "cron-risk",
+                        str(rel),
+                        f"job {job['id']!r} has risk={risk!r}; must be one of "
+                        f"{sorted(ALLOWED_CRON_RISK)} — a cron job with no declared risk "
+                        "runs at the global cron_mode with nothing keyed off it",
+                    )
+                )
+    return findings
+
+
 def _nearest(name: str, owned: dict[str, Path]) -> str | None:
     """The closest real skill name, for the common single-character slips."""
     matches = difflib.get_close_matches(name, sorted(owned), n=1, cutoff=0.85)
@@ -760,6 +788,7 @@ def main(argv: list[str] | None = None) -> int:
         + check_skill_refs(files, skills)
         + check_skill_manifests(skills)
         + check_cron_assets()
+        + check_cron_risk()
     )
     if findings:
         print(

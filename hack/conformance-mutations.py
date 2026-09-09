@@ -320,7 +320,10 @@ Mutation(
     ),
     Mutation(
         "B4-workflow-run-gate",
-        ".github/workflows/autopush-redeploy-agent.yml",
+        # Renamed from autopush-redeploy-agent.yml by #1199. The old path made
+        # the whole harness crash rather than report one stale mutation, which
+        # is why the missing-file case is handled below.
+        ".github/workflows/autopush-deploy.yml",
         ("github.event.workflow_run.head_branch == 'main'", "true"),
         "test_B4_every_workflow_run_deploy_gates",
         "drop the branch predicate while debugging a deploy, which is when it "
@@ -740,7 +743,10 @@ Mutation(
     ),
     Mutation(
         "C5-leader-reaches-configmaps",
-        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        # platformagent-ha.yaml, not platformagent.yaml: the leader Role's pods
+        # rule renders only above one replica, and the HA fixture is the only
+        # golden that sets it.
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-ha.yaml",
         ("    resources:\n      - pods\n    verbs:\n      - get\n      - patch\n",
          "    resources:\n      - configmaps\n      - pods\n    verbs:\n      - get\n      - patch\n"),
         "test_C5_the_leader_role_stays_confined_to_coordination",
@@ -1037,6 +1043,10 @@ def main() -> int:
     verdicts = []
     for mutation in selected:
         path = REPO / mutation.path
+        if not path.exists():
+            verdicts.append((mutation, "STALE", []))
+            print(f"STALE    {mutation.id}: {mutation.path} does not exist")
+            continue
         original = path.read_text()
         old, new = mutation.edit
         if old not in original:

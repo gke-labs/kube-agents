@@ -236,23 +236,34 @@ The fleet is shared by every open pull request, and no case may mutate it. A cas
 writes to a fixture spoils it for someone else, non-deterministically, ten minutes later
 and in another pull request's logs.
 
-Nothing enforces it today. The presubmit runs as `prowjob-default-sa@kube-agents-prow`,
-which holds `container.admin`, `container.developer`, `storage.admin` and
-`resourcemanager.projectIamAdmin` in every pool project (`gcloud projects
-get-iam-policy` on each, filtered to that member — and `scripts/provision_ci_pool_project.sh`
-now grants that set at onboarding, so a new project is no exception), no RBAC narrows it inside the clusters, and
-`kubectl auth can-i delete deployments -n seeded-debug` answers yes. So read-only is a
-rule cases obey, not a property of the credential, and it should not be read as a
-guarantee anywhere: an agent that decides remediation is helpful can delete the fixture
-every other pull request depends on, and the first evidence will be somebody else's case
-going red.
+The checks are enforced in a project whose fleet has been re-applied. `bench/tf/fleet`
+provisions `seeded-fleet-reader@<project>` with `roles/container.viewer` and nothing
+else, and `fleet_reader_token_creators` defaults to the Prow runner, so an apply lets
+`hack/fleet-kubeconfigs.sh` write per-role kubeconfigs that impersonate the reader. A
+check on such a project cannot write what it grades.
 
-Making it a guarantee means a second, narrower credential for fleet-dependent runs. Most
-of the drafted cases already need a GitOps-repo write path — the six audit scenarios and
-both remediation cases — which is contained by pinning
-it to a throwaway repository per eval project rather than by asking the agent not to; the
-cluster credential wants the same treatment. Until then, a case author's assertion that
-their case is read-only is the only control there is.
+No pool project is in that state yet. Every one had its fleet applied before that
+default landed, so the impersonation fails, `hack/fleet-kubeconfigs.sh` warns per
+cluster, and the safeguards read under the runner's own credential like everything else.
+gke-labs/kube-agents#903 tracks the per-project re-apply that closes it.
+
+What is not narrowed is the harness. `hack/ci-eval-pr.sh` runs as
+`prowjob-default-sa@kube-agents-prow`, which holds `container.admin` and eleven other
+project roles in every pool project (`PROW_RUNNER_ROLES` in
+`scripts/verify_ci_pool_project.py`), with no RBAC narrowing it inside the clusters. That
+is the credential the reader replaces, and until the re-apply it is the one every fleet
+check reads under.
+
+The agent under test is a different identity, and it is already narrow.
+`kubeagents-platform-gsa@<project>` holds the eight read-only roles in
+`PLATFORM_GSA_ROLES` and no `container.admin`. #961 narrowed it, every pool project was
+swapped on 2026-08-26, and the verifier fails extras as well as absences because this is
+the identity being graded.
+
+What the agent keeps is reach. It sees every cluster in the leased project, and the
+single-cluster boundary is a persona rule rather than a credential one. Most drafted cases
+also need a GitOps-repo write path — the six audit scenarios and both remediation cases —
+contained by pinning it to a throwaway repository per eval project.
 
 Asserting read-only from inside a case is a state check against the fixture — "the
 planted defect survived the run" — and not `tool_called`, which sees only the delegating

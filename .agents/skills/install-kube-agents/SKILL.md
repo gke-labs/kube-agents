@@ -27,44 +27,63 @@ Order of operations: resolve the image/source ref → check CLI prerequisites (i
 verify it against that ref → load `install.env` → interview for what is missing → generate
 `terraform.tfvars` → run
 `lifecycle.sh apply`. The source check happens **before** the interview, so a bad ref fails in
-seconds rather than after a dozen answers. Two steps stay `gcloud` calls after the apply — the
-managed-OTel scope and CMEK on a pre-existing cluster — and the GitHub App PEM import runs through
+seconds rather than after a dozen answers. Some steps stay `gcloud` calls outside the apply — before
+it, CMEK, the Workload Identity pool and NetworkPolicy enforcement on a pre-existing cluster; after
+it, the managed-OTel scope on a cluster it created — and the GitHub App PEM import runs through
 the Minty CLI so the key never enters Terraform state. Re-running the installer (or its `--menu`
 Day-2 panel's Save & Apply) reconciles every change through one `terraform apply`.
 
 ## Quick Execution for AI Agents
 
-To run the installer non-interactively in automated subagent execution, pass `--non-interactive` along with explicit configuration flags:
+For production installations, AI Agents and automated pipelines must target an official release version. When recommending commands to users or executing deployments, AI Agents must resolve the latest stable release tag from [GitHub Releases](https://github.com/gke-labs/kube-agents/releases) (e.g. `0.4.0`) and provide executable commands with that exact release version substituted, rather than leaving an unrendered `<RELEASE_VERSION>` placeholder:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/main/install.sh | bash -s -- \
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
   --non-interactive \
   --project-id="YOUR_GCP_PROJECT_ID" \
   --cluster-name="platform-agent-host" \
   --region="us-central1" \
-  --image-tag="<SEMVER_TAG_OR_FULL_COMMIT_SHA>" \
   --model-provider="gemini" \
   --permission-set="read-only"
 ```
 
-`--image-tag` accepts a SemVer release tag or a full 40-character commit SHA; mutable refs
-(`latest`, `main`, `master`, `HEAD`) are rejected. When the installer runs from a kube-agents
-checkout it defaults to that checkout's `HEAD`; anywhere else — including the `curl | bash` path —
-the flag is required. Pass it explicitly unless a container image exists for that exact commit: CI
-publishes one per `main` commit and per release tag, so an unmerged local commit will pass
-validation and then fail at image pull.
+If deploying from local sources instead of piping the script via curl, AI Agents should unpack the official release bundle (recommended):
+
+```bash
+curl -fsSL https://github.com/gke-labs/kube-agents/releases/download/<RELEASE_VERSION>/kube-agents-<RELEASE_VERSION>.tar.gz | tar -xz
+cd kube-agents-<RELEASE_VERSION>
+./install.sh --non-interactive \
+  --project-id="YOUR_GCP_PROJECT_ID" \
+  --cluster-name="platform-agent-host" \
+  --region="us-central1" \
+  --model-provider="gemini" \
+  --permission-set="read-only"
+```
+
+Alternatively, if a Git checkout is specifically required, clone pinned to the target release tag:
+
+```bash
+git clone --branch <RELEASE_VERSION> https://github.com/gke-labs/kube-agents.git
+cd kube-agents
+./install.sh --non-interactive \
+  --project-id="YOUR_GCP_PROJECT_ID" \
+  --cluster-name="platform-agent-host" \
+  --region="us-central1" \
+  --model-provider="gemini" \
+  --permission-set="read-only"
+```
+
+Do not clone `main` to deploy an official release: manifests and CRD schemas on `main` evolve continuously and diverge from released container images. Running install scripts against a mismatched checkout will fail `verify_local_source_ref` to prevent deploying incompatible manifests.
 
 ## Dry-Run Inspection
 
-To validate prerequisites and preview the install without creating GCP resources, use `--dry-run`.
-It always runs `terraform validate` against the generated configuration, and adds a full
-`terraform plan` when Application Default Credentials exist — on local state, so it never creates
-the state bucket:
+To validate prerequisites and preview the install without creating GCP resources, AI Agents must use `--dry-run` with the official release installer (substituting `<RELEASE_VERSION>` with the resolved release version):
 
 ```bash
-./install.sh --dry-run --non-interactive \
-  --project-id="YOUR_GCP_PROJECT_ID" \
-  --image-tag="<SEMVER_TAG_OR_FULL_COMMIT_SHA>"
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
+  --dry-run \
+  --non-interactive \
+  --project-id="YOUR_GCP_PROJECT_ID"
 ```
 
 A dry run regenerates `terraform.tfvars`, so back that up first if a real deployment's copy is
@@ -114,30 +133,31 @@ Defaults marked "`installer_common.sh`" reach the installer through
 `scripts/installer/installer_common.sh`; the values themselves are listed in
 `install.defaults.env` at the repository root, not here. Run `./install.sh --help` for the authoritative list.
 
-| Flag                                 | Description                                                                                                                                                                                                                                            | Default                                         |
-| :----------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :---------------------------------------------- |
-| `-y, --non-interactive`              | Run without blocking on `/dev/tty` prompts                                                                                                                                                                                                             | `false`                                         |
-| `--dry-run`                          | Output plan and `terraform.tfvars` without creating resources                                                                                                                                                                                          | `false`                                         |
-| `--menu, --config`                   | Launch the Day-2 control panel instead of installing                                                                                                                                                                                                   | `false`                                         |
-| `--project-id=ID`                    | Target GCP Project ID                                                                                                                                                                                                                                  | Active `gcloud` project                         |
-| `--region=REGION`                    | Target GCP Region                                                                                                                                                                                                                                      | `installer_common.sh` `DEFAULT_REGION`          |
-| `--cluster-name=NAME`                | GKE Cluster Name                                                                                                                                                                                                                                       | `installer_common.sh` `DEFAULT_CLUSTER_NAME`    |
-| `--cluster-mode=MODE`                | Shape of a cluster this run creates: `autopilot` \| `standard`. Autopilot is regional: unset at a zonal `--region` builds `standard`, explicit `autopilot` there is an error. No bearing on an existing cluster, whose live shape the generator probes | `autopilot`                                     |
-| `--image-tag=TAG`                    | SemVer release tag or full 40-character commit SHA                                                                                                                                                                                                     | Checkout `HEAD`; required via `curl \| bash`    |
-| `--registry-prefix=PATH`             | Registry path (no URL scheme) for the four images this project builds                                                                                                                                                                                  | `installer_common.sh` `DEFAULT_REGISTRY_PREFIX` |
-| `--third-party-registry-prefix=PATH` | Registry path holding the mirrored third-party images (cert-manager, LiteLLM, fluent-bit, token minter, Hindsight). Not implied by `--registry-prefix`                                                                                                 | _unset_ — upstream registries                   |
-| `--allow-unverified-source`          | Provision from a dirty or mismatched checkout                                                                                                                                                                                                          | `false`                                         |
-| `--model-provider=NAME`              | `gemini` \| `vertex_ai` \| `anthropic` \| `openai`                                                                                                                                                                                                     | `installer_common.sh` `DEFAULT_MODEL_PROVIDER`  |
-| `--vertex-location=LOCATION`         | Vertex AI serving location, a region or `global`. The global endpoint gives no in-region ML processing guarantee                                                                                                                                       | `installer_common.sh` `DEFAULT_VERTEX_LOCATION` |
-| `--gemini-api-key=KEY`               | Gemini API key                                                                                                                                                                                                                                         | Looked up in Secret Manager                     |
-| `--openai-api-key=KEY`               | OpenAI API key                                                                                                                                                                                                                                         | _unset_                                         |
-| `--anthropic-api-key=KEY`            | Anthropic API key                                                                                                                                                                                                                                      | _unset_                                         |
-| `--permission-set=SET`               | Agent GCP IAM set: `read-only` \| `custom`                                                                                                                                                                                                             | `read-only`                                     |
-| `--custom-roles=ROLES`               | Roles for `--permission-set=custom` (space- or comma-separated)                                                                                                                                                                                        | _unset_                                         |
-| `--gitops-org=ORG`                   | GitHub org/user for the GitOps IaC repository                                                                                                                                                                                                          | _unset_                                         |
-| `--gitops-repo=REPO`                 | GitOps IaC repository name                                                                                                                                                                                                                             | `gke-fleet-iac`                                 |
-| `--enable-google-chat`               | Enable the Google Chat integration                                                                                                                                                                                                                     | `false`                                         |
-| `--gvisor=true\|false`               | Enable GKE Sandbox (gVisor) runtime isolation                                                                                                                                                                                                          | `true`                                          |
-| `--enable-web-ui=true\|false`        | Enable the Hermes Web UI on port 9119                                                                                                                                                                                                                  | `false`                                         |
-| `--allowed-users=EMAILS`             | Comma-separated chat users allowed to reach the agent; empty allows everyone                                                                                                                                                                           | _unset_                                         |
-| `-h, --help, -?`                     | Output CLI usage banner and parameter details                                                                                                                                                                                                          | `N/A`                                           |
+| Flag                                 | Description                                                                                                                                                                                                                                            | Default                                                                                                                                            |
+| :----------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `-y, --non-interactive`              | Run without blocking on `/dev/tty` prompts                                                                                                                                                                                                             | `false`                                                                                                                                            |
+| `--dry-run`                          | Output plan and `terraform.tfvars` without creating resources                                                                                                                                                                                          | `false`                                                                                                                                            |
+| `--menu, --config`                   | Launch the Day-2 control panel instead of installing                                                                                                                                                                                                   | `false`                                                                                                                                            |
+| `--project-id=ID`                    | Target GCP Project ID                                                                                                                                                                                                                                  | Active `gcloud` project                                                                                                                            |
+| `--region=REGION`                    | Target GCP Region                                                                                                                                                                                                                                      | `installer_common.sh` `DEFAULT_REGION`                                                                                                             |
+| `--cluster-name=NAME`                | GKE Cluster Name                                                                                                                                                                                                                                       | `installer_common.sh` `DEFAULT_CLUSTER_NAME`                                                                                                       |
+| `--cluster-mode=MODE`                | Shape of a cluster this run creates: `autopilot` \| `standard`. Autopilot is regional: unset at a zonal `--region` builds `standard`, explicit `autopilot` there is an error. No bearing on an existing cluster, whose live shape the generator probes | `autopilot`                                                                                                                                        |
+| `--image-tag=TAG`                    | Validated immutable release tag or full commit SHA (developer/CI only)                                                                                                                                                                                 | Developer and CI/CD testing only; end users must use official release installations. Default: inferred from baked release, bundle, or local `HEAD` |
+| `--registry-prefix=PATH`             | Registry path (no URL scheme) for the first-party images this project builds                                                                                                                                                                           | `installer_common.sh` `DEFAULT_REGISTRY_PREFIX`                                                                                                    |
+| `--third-party-registry-prefix=PATH` | Registry path holding the mirrored third-party images (cert-manager, LiteLLM, fluent-bit, token minter, Hindsight). Not implied by `--registry-prefix`                                                                                                 | _unset_ — upstream registries                                                                                                                      |
+| `--allow-unverified-source`          | Provision from a dirty or mismatched checkout                                                                                                                                                                                                          | `false`                                                                                                                                            |
+| `--model-provider=NAME`              | `gemini` \| `vertex_ai` \| `anthropic` \| `openai`                                                                                                                                                                                                     | `installer_common.sh` `DEFAULT_MODEL_PROVIDER`                                                                                                     |
+| `--vertex-location=LOCATION`         | Vertex AI serving location, a region or `global`. The global endpoint gives no in-region ML processing guarantee                                                                                                                                       | `installer_common.sh` `DEFAULT_VERTEX_LOCATION`                                                                                                    |
+| `--gemini-api-key=KEY`               | Gemini API key                                                                                                                                                                                                                                         | Looked up in Secret Manager                                                                                                                        |
+| `--openai-api-key=KEY`               | OpenAI API key                                                                                                                                                                                                                                         | _unset_                                                                                                                                            |
+| `--anthropic-api-key=KEY`            | Anthropic API key                                                                                                                                                                                                                                      | _unset_                                                                                                                                            |
+| `--permission-set=SET`               | Agent GCP IAM set: `read-only` \| `custom`                                                                                                                                                                                                             | `read-only`                                                                                                                                        |
+| `--custom-roles=ROLES`               | Roles for `--permission-set=custom` (space- or comma-separated)                                                                                                                                                                                        | _unset_                                                                                                                                            |
+| `--gitops-org=ORG`                   | GitHub org/user for the GitOps IaC repository                                                                                                                                                                                                          | _unset_                                                                                                                                            |
+| `--gitops-repo=REPO`                 | GitOps IaC repository name                                                                                                                                                                                                                             | `gke-fleet-iac`                                                                                                                                    |
+| `--enable-google-chat`               | Enable the Google Chat integration                                                                                                                                                                                                                     | `false`                                                                                                                                            |
+| `--gvisor=true\|false`               | Enable GKE Sandbox (gVisor) runtime isolation                                                                                                                                                                                                          | `true`                                                                                                                                             |
+| `--enable-web-ui=true\|false`        | Enable the Hermes Web UI on port 9119                                                                                                                                                                                                                  | `false`                                                                                                                                            |
+| `--allowed-users=EMAILS`             | Comma-separated chat users allowed to reach the agent; empty allows everyone                                                                                                                                                                           | _unset_                                                                                                                                            |
+| `--memory=MODE`                      | Long-term agent memory engine: `file` \| `hindsight` \| `off`                                                                                                                                                                                          | `file`                                                                                                                                             |
+| `-h, --help, -?`                     | Output CLI usage banner and parameter details                                                                                                                                                                                                          | `N/A`                                                                                                                                              |

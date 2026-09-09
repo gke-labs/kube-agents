@@ -267,7 +267,7 @@ exit 1
 
 
 def create_mock_helm_binary(bin_dir, log_file=None, fail_lint=False, fail_package=False, fail_push=False):
-    """Creates a mock helm CLI supporting lint, package, and push commands."""
+    """Creates a mock helm CLI supporting lint, package, push, and registry login commands."""
     bin_path = pathlib.Path(bin_dir)
     bin_path.mkdir(parents=True, exist_ok=True)
     helm_path = bin_path / "helm"
@@ -279,6 +279,18 @@ def create_mock_helm_binary(bin_dir, log_file=None, fail_lint=False, fail_packag
 
     content = f"""#!/bin/sh
 echo "mock helm: $@" >> "{log_path}"
+if [ "$1" = "registry" ] && [ "$2" = "login" ]; then
+  # The real helm reads the password from stdin when --password-stdin is
+  # given. A mock that exits without reading it races the writer: under
+  # `set -o pipefail`, a `printf token | helm registry login` whose helm exits
+  # first kills printf with SIGPIPE and the pipeline reports failure.
+  for arg in "$@"; do
+    if [ "$arg" = "--password-stdin" ]; then
+      cat >/dev/null
+    fi
+  done
+  exit 0
+fi
 if [ "$1" = "lint" ]; then
   {lint_exit}
 fi

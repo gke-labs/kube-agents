@@ -338,6 +338,11 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
         - risk_classify: `pull_request_target` with `permissions: {}` at the
           top, the grant job-scoped, checkout pinned to the default branch,
           and its one write is swapping the `risk:*` label.
+        - hold-unresolved-threads: `schedule` plus `pull_request_target:
+          labeled`, `permissions: {}` at the top, the grant job-scoped,
+          checkout pinned to the default branch, and its writes are the
+          `do-not-merge` label and one comment on pull requests with
+          unresolved review threads. It withholds a merge; it cannot grant one.
 
         The list is an allowlist of holders, not of intents: the permission is
         a capability, and this asserts membership rather than absence so a
@@ -360,6 +365,7 @@ class B2AssentIsHumanOrPolicy(unittest.TestCase):
                 "auto-assign-milestone.yml",
                 "auto_request_review.yml",
                 "coverage-comment.yml",
+                "hold-unresolved-threads.yml",
                 "risk_classify.yml",
             ],
             sorted(set(holders)),

@@ -41,7 +41,7 @@ The Platform Agent talks to an LLM through a **Completions API** proxy so provid
 
 Short-lived GitHub App installation tokens signed via GCP KMS and delivered through Workload Identity. This lets the `submit-suggestion` skill (and the `github-issue-resolver` watchdog) open pull requests against your GitOps repo without a long-lived PAT. Source: [`k8s-operator/config/integrations/github/`](https://github.com/gke-labs/kube-agents/tree/main/k8s-operator/config/integrations/github).
 
-## What actually runs after `./install.sh`
+## What actually runs after installation
 
 Once the [installer](/kube-agents/install/quickstart-gke/) finishes, you have:
 
@@ -63,4 +63,4 @@ Once the [installer](/kube-agents/install/quickstart-gke/) finishes, you have:
 
 - [Proactive autonomy](/kube-agents/overview/proactive-autonomy/) — the background watchdogs and how they close loops.
 - [Architecture](/kube-agents/overview/architecture/) — how requests and cron ticks flow through the components.
-- [Quick start (GKE)](/kube-agents/install/quickstart-gke/) — run `./install.sh` end-to-end.
+- [Quick start (GKE)](/kube-agents/install/quickstart-gke/) — run the installer end-to-end.

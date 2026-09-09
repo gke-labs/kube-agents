@@ -450,11 +450,9 @@ if [ "${SKIP_FLEET}" != "true" ]; then
     tofu init -reconfigure \
       -backend-config="bucket=${STATE_BUCKET}" \
       -backend-config="prefix=seeded-fleet"
-    # fleet_reader_token_creators is left at its empty default: the member is the
-    # Prow runner identity, and hack/fleet-kubeconfigs.sh only uses the reader
-    # account when FLEET_READONLY_SA is exported (see bench/tf/fleet/README.md,
-    # "A read-only credential for evaluations"). Until then the binding grants
-    # nothing that gets used, and seeded-fleet-reader sits unimpersonated.
+    # fleet_reader_token_creators defaults to the Prow runner, so this apply also
+    # grants it impersonation on seeded-fleet-reader. Do not pass it with -var;
+    # variables.tf says why every apply has to carry the same value.
     tofu apply -auto-approve -var="project_id=${PROJECT_ID}"
   )
 else

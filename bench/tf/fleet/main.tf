@@ -130,11 +130,11 @@ resource "google_project_iam_member" "fleet_reader_container_viewer" {
   member  = "serviceAccount:${google_service_account.fleet_reader.email}"
 }
 
-# Who may mint a token AS the reader. Empty by default: an eval project with no
-# entry here still gets the account, and its runs fall back to the runner's own
-# credential with a loud warning from fleet-kubeconfigs.sh, rather than failing
-# to read the fleet at all. Populate it with the project's Prow runner identity
-# to actually close the write path.
+# Who may mint a token AS the reader. Defaults to the pool's Prow runner, which
+# is what closes the write path -- see variables.tf for why the default lives
+# there rather than in the caller. A project with no entry still gets the
+# account; its runs just fall back to the runner's own credential with a loud
+# warning from fleet-kubeconfigs.sh, rather than failing to read the fleet.
 resource "google_service_account_iam_member" "fleet_reader_token_creators" {
   for_each           = toset(var.fleet_reader_token_creators)
   service_account_id = google_service_account.fleet_reader.name
@@ -270,12 +270,22 @@ resource "google_container_node_pool" "seeded_a_default" {
   name       = "default-pool"
   location   = var.zone
   cluster    = google_container_cluster.seeded_a.name
-  node_count = 1
+  node_count = 2
 
   node_config {
-    # e2-medium rather than e2-small: cluster A hosts the defect workloads
-    # (checkout-gateway, payments-api) alongside system pods, and e2-small's
-    # ~1.5 GiB allocatable cannot fit them all.
+    # e2-medium, two of them (2026-09-08, #1278). Cluster A hosts the defect
+    # workloads (checkout-gateway, payments-api) alongside GKE's system pods,
+    # and the binding constraint is CPU *requests*, not memory: one
+    # e2-medium's 940m allocatable is fully claimed by system pods alone
+    # (kube-proxy, kube-dns, metadata-server, fluentbit, konnectivity, ...).
+    # The fixtures only ever ran because they scheduled before the system
+    # set filled in; the weekend auto-upgrade rebuilt the node, system-
+    # critical pods scheduled first, and every fixture went Pending on all
+    # 30 pool projects. A second node holds the fixtures plus the Pending
+    # system deployments with ~600m to spare, and survives the next node
+    # rebuild (surge upgrades rotate one node at a time). Matches the live
+    # `gcloud container clusters resize` applied during the incident, so
+    # the next apply is a no-op, not a pool replacement.
     machine_type    = "e2-medium"
     disk_size_gb    = 20
     resource_labels = local.fleet_labels

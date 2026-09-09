@@ -11,6 +11,7 @@
       "prompt": "",
       "no_agent": true,
       "script": "profile_cron_tick.py",
+      "risk": "low",
       "enabled": true,
       "deliver": "local"
     },
@@ -25,6 +26,7 @@
       "prompt": "",
       "no_agent": true,
       "script": "cluster_agent_reconcile.py",
+      "risk": "low",
       "enabled": true,
       "deliver": "local"
     },
@@ -39,6 +41,7 @@
       "prompt": "",
       "no_agent": true,
       "script": "bootstrap_scan_gate.py",
+      "risk": "low",
       "enabled": true,
       "deliver": "local"
     },
@@ -53,6 +56,7 @@
       "prompt": "",
       "no_agent": true,
       "script": "bootstrap_delivery.py",
+      "risk": "low",
       "enabled": true,
       "deliver": "local"
     }

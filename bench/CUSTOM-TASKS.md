@@ -226,9 +226,11 @@ A new task must also be registered: the presubmit runs only what the `TASKS` arr
 the job exports `EVAL_TIER=nightly`), and `scripts/test_task_registration.py` fails the
 build for a task that appears in neither. A commented-out `TASKS` entry counts as
 registered, pending activation — that is how scenarios wait for infrastructure that does
-not exist yet; a `NIGHTLY_TASKS` entry is for a validated case too slow or too redundant
-for a presubmit seat — and a task that deliberately must not run needs a reviewed entry
-in `scripts/validate_bench_cases.py`'s `KNOWN_UNREGISTERED` with the reason.
+not exist yet; a `NIGHTLY_TASKS` entry is for a validated case too slow, too redundant,
+or outside the core journeys the presubmit gate is for (the rule's one statement is
+`docs/designs/bench-case-format.md` §Registration) — and a task that deliberately must
+not run needs a reviewed entry in `scripts/validate_bench_cases.py`'s
+`KNOWN_UNREGISTERED` with the reason.
 
 A task whose verification reads live cluster state also carries `fixtures:`, a list of
 seeded-fleet role slugs from `bench/tf/fleet/fixtures.json`, or `fixtures: []` if it

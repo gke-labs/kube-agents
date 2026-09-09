@@ -195,14 +195,15 @@ This test suite performs a 17-step end-to-end verification of the `AgentPlugin` 
 
 ### Environment variables:
 
-| Variable          | Required | Purpose                                                                              |
-| ----------------- | -------- | ------------------------------------------------------------------------------------ |
-| `KUBE_CONTEXT`    | Yes      | `kubectl` context of the target cluster.                                             |
-| `NAMESPACE`       | Yes      | Namespace holding the operator and `PlatformAgent`.                                  |
-| `REGISTRY`        | Yes      | Registry prefix for the operator and plugin images.                                  |
-| `IMAGE_BUILDER`   | No       | `docker` (default) or `crane`. See below.                                            |
-| `CRANE_BIN`       | No       | Path to the `crane` binary. Only used by `IMAGE_BUILDER=crane`. Defaults to `crane`. |
-| `TARGET_PLATFORM` | No       | Platform for `crane` builds. Defaults to `linux/amd64`, matching GKE nodes.          |
+| Variable              | Required | Purpose                                                                                                               |
+| --------------------- | -------- | --------------------------------------------------------------------------------------------------------------------- |
+| `KUBE_CONTEXT`        | Yes      | `kubectl` context of the target cluster.                                                                              |
+| `NAMESPACE`           | Yes      | Namespace holding the operator and `PlatformAgent`.                                                                   |
+| `REGISTRY`            | Yes      | Registry prefix for the operator and plugin images.                                                                   |
+| `IMAGE_BUILDER`       | No       | `docker` (default) or `crane`. See below.                                                                             |
+| `CRANE_BIN`           | No       | Path to the `crane` binary. Only used by `IMAGE_BUILDER=crane`. Defaults to `crane`.                                  |
+| `TARGET_PLATFORM`     | No       | Platform for `crane` builds. Defaults to `linux/amd64`, matching GKE nodes.                                           |
+| `OPERATOR_DEPLOYMENT` | No       | Deployment name for the operator. Defaults to auto-discovery via label `app.kubernetes.io/name=kube-agents-operator`. |
 
 ### Choosing an image builder
 
@@ -243,7 +244,7 @@ On a host without a Docker daemon, add `IMAGE_BUILDER=crane`.
 
 ### 17-Step Verification Workflow:
 
-1. **Rebuild & Deploy Operator**: Compiles `k8s-operator` binary, builds the container image, pushes to registry, applies CRDs, and deploys `kubeagents-controller-manager`.
+1. **Rebuild & Deploy Operator**: Compiles `k8s-operator` binary, builds the container image, pushes to registry, applies CRDs, and deploys the operator Deployment (discovered via label `app.kubernetes.io/name=kube-agents-operator`, or overridden with `OPERATOR_DEPLOYMENT`).
 2. **Verify Operator Version**: Confirms controller manager pod image tag matches the newly pushed build.
 3. **Build & Push OCI Plugin Image**: Packages example plugin assets into an OCI container image with a unique build ID.
 4. **Deploy AgentPlugin CR**: Deploys targeted `AgentPlugin` CR with `agentRef: "platform-agent"`, allowed `approvals` configuration subtree, disallowed config keys, and `imagePullPolicy: Always`.
@@ -251,7 +252,7 @@ On a host without a Docker daemon, add `IMAGE_BUILDER=crane`.
 6. **Remove AgentPlugin CR**: Deletes the `AgentPlugin` CR and waits for rollout.
 7. **Verify Log Silence**: Confirms unique plugin log output stops appearing in replacement pod logs.
 8. **Verify ConfigMap Cleanup**: Confirms plugin entry is removed from `plugins.enabled` in `config.yaml`.
-9. **ImageVolume Disable Safeguard**: Annotates `PlatformAgent` with `enable-image-volumes=false`. Verifies OCI volume attachment is skipped, `AgentPlugin.status.phase` updates to `Degraded`, condition `Ready` sets `Reason: ImageVolumeUnsupported`, and operator logs `skipping plugin OCI image volume mount`.
+9. **ImageVolume Disable Safeguard**: Annotates `PlatformAgent` with `enable-image-volumes=false`. Verifies OCI volume attachment is skipped in favor of `emptyDir` volume and `stage-<plugin>` init-container staging, `AgentPlugin.status.phase` remains `Ready`, and condition `Ready` sets `Reason: Applied` with message noting staging via init container.
 10. **Orphaned `agentRef` Reporting**: Creates an `AgentPlugin` whose `agentRef` names no `PlatformAgent`. Verifies `status.phase` becomes `Degraded` with `Reason: AgentNotFound`, and that the plugin still never reaches `plugins.enabled`.
 11. **Image Pull Failure Reporting**: Creates an `AgentPlugin` referencing an image that does not exist, which blocks the agent pod from starting. Verifies `status.phase` becomes `Degraded` with `Reason: ImagePullFailed` and the failing reference in the message, then that the agent recovers once the plugin is removed.
 12. **Missing CRD Decoupled Dependency Safeguard**: Temporarily deletes `AgentPlugin` CRD from cluster. Verifies `PlatformAgent` reconciliation succeeds without controller crashes, and verifies reflector error log. Restores CRD per-file **and restarts the operator** — re-applying the CRD alone does not revive the informer, which keeps retrying with growing backoff, so later steps would race that recovery. Runs late because deleting the CRD stops the operator watching `AgentPlugin` until it restarts.
@@ -302,7 +303,7 @@ python3 tests/e2e/operator/credential_isolation_e2e_test.py
 
 ## 🤖 Running in GitHub Actions (CI)
 
-Three workflows run this suite. [`.github/workflows/e2e-gchat-test.yml`](../../.github/workflows/e2e-gchat-test.yml) and [`.github/workflows/e2e-manual-runner.yml`](../../.github/workflows/e2e-manual-runner.yml) are triggered by hand via `workflow_dispatch` (or via GitHub CLI / Web UI). The third is [`.github/workflows/e2e-run.yml`](../../.github/workflows/e2e-run.yml), which runs nothing on its own — it is the reusable job that calls `scripts/release/execute_e2e_tests.sh`, and both pipelines delegate to it. [`.github/workflows/rc-release-pipeline.yml`](../../.github/workflows/rc-release-pipeline.yml) calls it unattended and `step-4-tag-validated` depends on the result, so a break here stops the release-candidate tag within three hours. That pipeline carries no schedule of its own: [`.github/workflows/rc-scheduler.yml`](../../.github/workflows/rc-scheduler.yml) runs three-hourly and dispatches it only when there is a new candidate, so a tick with nothing to do leaves no run behind to be mistaken for a passing one. [`.github/workflows/nightly-pipeline.yml`](../../.github/workflows/nightly-pipeline.yml) calls it too, gating the staging promotion — that one is `workflow_dispatch`-only for now, so it runs when somebody starts it.
+Three workflows run this suite. [`.github/workflows/e2e-gchat-test.yml`](../../.github/workflows/e2e-gchat-test.yml) and [`.github/workflows/e2e-manual-runner.yml`](../../.github/workflows/e2e-manual-runner.yml) are triggered by hand via `workflow_dispatch` (or via GitHub CLI / Web UI). The third is [`.github/workflows/e2e-run.yml`](../../.github/workflows/e2e-run.yml), which runs nothing on its own — it is the reusable job that calls `scripts/release/execute_e2e_tests.sh`, and both pipelines delegate to it. [`.github/workflows/rc-release-pipeline.yml`](../../.github/workflows/rc-release-pipeline.yml) calls it unattended and `step-4-tag-validated` depends on the result, so a break here stops the release-candidate tag within three hours. That pipeline carries no schedule of its own: [`.github/workflows/rc-scheduler.yml`](../../.github/workflows/rc-scheduler.yml) runs three-hourly and dispatches it only when there is a new candidate, so a tick with nothing to do leaves no run behind to be mistaken for a passing one. [`.github/workflows/nightly-pipeline.yml`](../../.github/workflows/nightly-pipeline.yml) calls it too, gating the staging promotion — dispatched daily by [`.github/workflows/nightly-scheduler.yml`](../../.github/workflows/nightly-scheduler.yml) when unpromoted candidates exist, or run manually via `workflow_dispatch`.
 
 Each caller splits its suites into a gate and tolerated coverage. `blocking_suite` fails the run; `optional_suites`, a comma-separated list run by `scripts/release/run_optional_e2e_suites.sh`, reports and does not. The split is evidence rather than preference: a suite gates a promotion once it has passed on a real cluster, and runs as optional coverage until then. The RC pipeline gates on `gchat` and tolerates `rc`; the nightly pipeline gates on `rc` — the subset the RC pipeline exercises every three hours — and tolerates `agent-plugin`, `gchat` and `stockout-full`, which between them cover every file the `nightly` suite adds. Per-suite filters such as `STOCKOUT_SCENARIOS` are declared in the suite's `env_vars` in `e2e_config.yaml`, not passed from the workflow, because one workflow input cannot carry a different value for each suite in a list.
 

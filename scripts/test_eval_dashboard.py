@@ -185,7 +185,9 @@ def render_fixture(data, notes_path=None, events_path=None, events_yaml=None):
     argv += ["--events", str(events_path or pathlib.Path(tmp.name) / "no-events.yaml")]
     with contextlib.redirect_stdout(io.StringIO()):
         render.main(argv)
-    return (out_dir / "index.html").read_text(), out_dir, tmp
+    # The two-band page these golden tests pin is published as legacy.html;
+    # index.html is the Brief (test_eval_dashboard_pages.py).
+    return (out_dir / "legacy.html").read_text(), out_dir, tmp
 
 
 def baked_app(html):

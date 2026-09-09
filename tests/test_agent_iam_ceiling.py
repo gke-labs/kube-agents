@@ -57,6 +57,7 @@ READ_ONLY_ROLES = [
     "roles/iam.serviceAccountUser",
     "roles/iam.securityReviewer",
     "roles/mcp.toolUser",
+    "roles/serviceusage.serviceUsageConsumer",
 ]
 
 # Roles no built-in permission set may grant the agent GSA. The first two are the

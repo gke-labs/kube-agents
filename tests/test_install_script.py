@@ -96,11 +96,15 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
     def test_piped_stdin_executes_main(self):
         """Ensures piped curl | bash invocations execute main and do not exit early."""
         install_script_content = _INSTALL_SH.read_text()
+        test_env = get_isolated_test_env(
+            overrides={"KUBE_AGENTS_LOCK_FILE": str(self._empty_install_env.parent / "test.lock")}
+        )
         proc = subprocess.run(
             ["bash", "-s", "--", "--help"],
             input=install_script_content,
             capture_output=True,
             text=True,
+            env=test_env,
             cwd=str(_REPO_ROOT),
         )
         self.assertEqual(proc.returncode, 0, f"Piped execution failed: {proc.stderr}")
@@ -193,6 +197,42 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{isolated_install_sh}"
             self.assertIn(f"RESOLVED={repo_dir}", proc.stdout)
         finally:
             temp_dir.cleanup()
+
+    def test_verify_local_source_ref_dry_run_warning_does_not_claim_cluster_mutation(self):
+        """Under --dry-run, an unverified mismatched checkout warns about dry-run continuing without claiming cluster mutation."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repo_dir = pathlib.Path(temp_dir) / "repo"
+            repo_dir.mkdir()
+            subprocess.run(["git", "init"], cwd=str(repo_dir), check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo_dir), check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo_dir), check=True)
+            (repo_dir / "file.txt").write_text("initial\n")
+            subprocess.run(["git", "add", "file.txt"], cwd=str(repo_dir), check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo_dir), check=True)
+            head_commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo_dir), check=True, capture_output=True, text=True).stdout.strip()
+            (repo_dir / "file.txt").write_text("second\n")
+            subprocess.run(["git", "commit", "-am", "second"], cwd=str(repo_dir), check=True)
+            subprocess.run(["git", "tag", "0.2.0"], cwd=str(repo_dir), check=True)
+            subprocess.run(["git", "checkout", head_commit], cwd=str(repo_dir), check=True, capture_output=True)
+
+            cmd = f'PARAM_DRY_RUN=true verify_local_source_ref "{repo_dir}" "0.2.0"'
+            proc = self._run_install_func(cmd)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("Continuing dry run with unverified install sources", proc.stdout)
+            self.assertIn("preview is continuing", proc.stdout)
+            self.assertNotIn("the cluster will get", proc.stdout)
+
+            cmd_dry_allow = f'PARAM_DRY_RUN=true PARAM_ALLOW_UNVERIFIED_SOURCE=true verify_local_source_ref "{repo_dir}" "0.2.0"'
+            proc_dry_allow = self._run_install_func(cmd_dry_allow)
+            self.assertEqual(proc_dry_allow.returncode, 0, proc_dry_allow.stderr)
+            self.assertIn("Continuing dry run with unverified install sources", proc_dry_allow.stdout)
+            self.assertIn("--allow-unverified-source active", proc_dry_allow.stdout)
+
+            cmd_real = f'PARAM_DRY_RUN=false PARAM_ALLOW_UNVERIFIED_SOURCE=true verify_local_source_ref "{repo_dir}" "0.2.0"'
+            proc_real = self._run_install_func(cmd_real)
+            self.assertEqual(proc_real.returncode, 0, proc_real.stderr)
+            self.assertIn("Continuing with unverified install sources", proc_real.stdout)
+            self.assertIn("the cluster will get this checkout's configuration", proc_real.stdout)
 
     def test_parse_args_google_chat_mode(self):
         """Verifies parse_args captures --google-chat-mode."""
@@ -540,6 +580,165 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{isolated_install_sh}"
             proc = self._run_install_func(cmd, cwd=archive_dir)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(proc.stdout.strip(), "0.2.0")
+
+    def test_resolve_effective_image_tag_adopts_baked_release_without_prompt(self):
+        """Verifies resolve_effective_image_tag adopts baked release version without prompting."""
+        cmd = 'BAKED_RELEASE_VERSION="0.4.0"; resolve_effective_image_tag tag "." ""; echo "TAG=$tag"'
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("TAG=0.4.0", proc.stdout)
+        self.assertIn("Using container image tag (official release 0.4.0)", proc.stdout)
+
+    def test_resolve_effective_image_tag_preserves_explicit_requested_tag(self):
+        """Verifies resolve_effective_image_tag honors explicitly passed tag over default."""
+        cmd = 'BAKED_RELEASE_VERSION="0.4.0"; resolve_effective_image_tag tag "." "0.3.0"; echo "TAG=$tag"'
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("TAG=0.3.0", proc.stdout)
+
+    def test_resolve_effective_image_tag_rejects_invalid_requested_tag(self):
+        """Verifies resolve_effective_image_tag validates explicit tag and rejects mutable ref cleanly."""
+        cmd = 'resolve_effective_image_tag tag "." "latest" || rc=$?; echo "RC=${rc:-0} TAG=$tag"'
+        proc = self._run_install_func(cmd)
+        self.assertIn("RC=1 TAG=", proc.stdout)
+        self.assertIn("Mutable image/source ref 'latest' is not supported", proc.stdout)
+
+    def test_resolve_effective_image_tag_fails_when_non_interactive_and_no_default(self):
+        """Verifies resolve_effective_image_tag errors when non-interactive and no default tag exists."""
+        with tempfile.TemporaryDirectory() as empty_dir:
+            cmd = f'BAKED_RELEASE_VERSION=""; PARAM_NON_INTERACTIVE="true"; resolve_effective_image_tag tag "{empty_dir}" ""'
+            proc = self._run_install_func(cmd)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("--image-tag is required", proc.stdout)
+
+    def test_resolve_effective_image_tag_fails_headless_without_tty_and_no_default(self):
+        """Verifies resolve_effective_image_tag errors cleanly in headless environments without TTY."""
+        with tempfile.TemporaryDirectory() as empty_dir:
+            cmd = f'BAKED_RELEASE_VERSION=""; PARAM_NON_INTERACTIVE="false"; has_controlling_tty() {{ return 1; }}; resolve_effective_image_tag tag "{empty_dir}" "" || rc=$?; echo "RC=$rc TAG=$tag"'
+            proc = self._run_install_func(cmd)
+            self.assertIn("RC=1 TAG=", proc.stdout)
+            self.assertIn("--image-tag is required", proc.stdout)
+
+    def test_resolve_effective_image_tag_resolves_from_external_cwd(self):
+        """Verifies resolve_effective_image_tag discovers repo root even when cwd is external."""
+        with tempfile.TemporaryDirectory() as outside_dir:
+            cmd = 'BAKED_RELEASE_VERSION=""; resolve_effective_image_tag tag "" ""; echo "TAG=$tag"'
+            proc = self._run_install_func(cmd, cwd=outside_dir)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertRegex(
+                proc.stdout.strip(),
+                r"TAG=([0-9a-fA-F]{40}|[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?)$",
+            )
+
+    def test_resolve_effective_image_tag_discovers_home_kube_agents_repo(self):
+        """Verifies resolve_effective_image_tag adopts tag from HOME/kube-agents when standalone."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = pathlib.Path(temp_dir)
+            home_dir = temp_path / "home"
+            repo_dir = home_dir / "kube-agents"
+            scripts_dir = repo_dir / "scripts" / "installer"
+            scripts_dir.mkdir(parents=True)
+            (scripts_dir / "installer_common.sh").write_text("# marker\n")
+
+            subprocess.run(["git", "init", "-b", "main"], cwd=str(repo_dir), check=True, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo_dir), check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo_dir), check=True)
+            (repo_dir / "file.txt").write_text("initial\n")
+            subprocess.run(["git", "add", "."], cwd=str(repo_dir), check=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo_dir), check=True)
+            subprocess.run(["git", "tag", "0.4.0"], cwd=str(repo_dir), check=True)
+
+            outside_dir = temp_path / "outside"
+            outside_dir.mkdir()
+            isolated_install_sh = outside_dir / "install.sh"
+            isolated_install_sh.write_text(_INSTALL_SH.read_text())
+
+            cmd = 'BAKED_RELEASE_VERSION=""; resolve_effective_image_tag tag "." ""; echo "TAG=$tag"'
+            setup = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{isolated_install_sh}"
+{cmd}
+"""
+            full_env = get_isolated_test_env(overrides={"HOME": str(home_dir), "KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)})
+            proc = subprocess.run(
+                ["bash", "-c", setup],
+                capture_output=True,
+                text=True,
+                env=full_env,
+                cwd=str(outside_dir),
+            )
+            self.assertEqual(proc.returncode, 0, f"Failed: {proc.stderr}")
+            self.assertIn("TAG=0.4.0", proc.stdout)
+            self.assertIn("Using container image tag (release tag 0.4.0)", proc.stdout)
+
+    def test_resolve_effective_image_tag_prompts_and_retries_on_invalid_ref(self):
+        """Verifies resolve_effective_image_tag prompts interactively and loops until valid ref is entered."""
+        with tempfile.TemporaryDirectory() as empty_dir:
+            count_file = pathlib.Path(empty_dir) / "calls.txt"
+            cmd = (
+                'BAKED_RELEASE_VERSION=""; PARAM_NON_INTERACTIVE="false"; '
+                'has_controlling_tty() { return 0; }; '
+                f'CALL_FILE="{count_file}"; '
+                'prompt_read() { '
+                '  echo 1 >> "$CALL_FILE"; '
+                '  local count; count="$(wc -l < "$CALL_FILE" | tr -d "[:space:]")"; '
+                '  if [ "$count" -eq 1 ]; then printf -v "$2" "%s" "invalid_tag"; '
+                '  else printf -v "$2" "%s" "0.4.0"; fi; '
+                '}; '
+                f'resolve_effective_image_tag tag "{empty_dir}" ""; '
+                'echo "TAG=$tag CALLS=$(wc -l < "$CALL_FILE" | tr -d "[:space:]")"'
+            )
+            proc = self._run_install_func(cmd)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("TAG=0.4.0 CALLS=2", proc.stdout)
+            self.assertIn("Image/source ref must be a full 40-character commit SHA", proc.stdout)
+
+    def test_resolve_effective_image_tag_does_not_fire_err_trap_or_clobber_report(self):
+        """Verifies failure in resolve_effective_image_tag does not trigger ERR trap or overwrite install report."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_file = pathlib.Path(temp_dir) / "install-report.json"
+            report_file.write_text('{"status": "PREVIOUS_SUCCESS"}\n')
+            cmd = f'''
+set -Eeuo pipefail
+REPORT_FILE="{report_file}"
+write_json_report() {{
+  echo "{{\\"status\\": \\"$1\\"}}" > "$REPORT_FILE"
+}}
+on_error() {{
+  echo "INTERNAL_ERR_TRAP_FIRED" >&2
+  write_json_report "FAILED"
+}}
+trap 'on_error' ERR
+BAKED_RELEASE_VERSION=""
+PARAM_NON_INTERACTIVE="true"
+local_tag=""
+resolve_effective_image_tag local_tag "{temp_dir}" "" || rc=$?
+echo "RC=$rc"
+'''
+            proc = self._run_install_func(cmd)
+            self.assertIn("RC=1", proc.stdout)
+            self.assertNotIn("INTERNAL_ERR_TRAP_FIRED", proc.stderr)
+            self.assertIn("--image-tag is required", proc.stdout)
+            self.assertEqual(report_file.read_text(), '{"status": "PREVIOUS_SUCCESS"}\n')
+
+    def test_run_menu_system_binds_param_image_tag_to_save_and_apply(self):
+        """Verifies run_menu_system passes PARAM_IMAGE_TAG into option 6 (Save & Apply)."""
+        cmd = """
+has_controlling_tty() { return 0; }
+prompt_menu() {
+  local var="${!#}"
+  printf -v "$var" "%s" "6"
+}
+verify_local_source_ref() {
+  echo "VERIFIED_IMAGE_TAG=$2"
+  exit 0
+}
+PROJECT_ID="test-project"
+PARAM_IMAGE_TAG="0.4.0"
+run_menu_system "."
+"""
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, f"Failed: {proc.stderr}")
+        self.assertIn("VERIFIED_IMAGE_TAG=0.4.0", proc.stdout)
 
     def test_verify_local_source_ref_accepts_baked_release_in_non_git_dir(self):
         """Verifies verify_local_source_ref succeeds for unpacked release archive without Git repository."""
