@@ -26,6 +26,7 @@ _LIFTED_FUNCTIONS = ("fail", "arg_default", "check_go_directive")
 _CALL_SITES = (
     "check_go_directive deploy/docker/Dockerfile GOLANG_VERSION",
     "check_go_directive k8s-operator/Dockerfile GOLANG_VERSION",
+    "check_go_directive a2a/Dockerfile.gateway GOLANG_VERSION a2a/go.mod",
 )
 
 # What the check requires of the builder stage besides the ARG default, and
@@ -152,10 +153,30 @@ class CheckGoDirectiveTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_script_calls_the_check_for_both_dockerfiles(self):
+    def test_script_calls_the_check_for_dockerfiles(self):
         text = _SCRIPT.read_text()
         for call in _CALL_SITES:
             self.assertIn(call, text)
+
+    def test_custom_go_mod_path_respected(self):
+        text = _SCRIPT.read_text()
+        functions = "".join(_lift(name, text) for name in _LIFTED_FUNCTIONS)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "custom.mod").write_text("module example.com/y\n\ngo 1.27.0\n")
+            (root / "go.mod").write_text("module example.com/x\n\ngo 1.28.0\n")
+            (root / "Dockerfile").write_text(_dockerfile("1.27-alpine"))
+            script = (
+                "set -u\nstatus=0\nGO_MOD=go.mod\nGOLANG_IMAGE_ARG=GOLANG_IMAGE\n"
+                f"GOTOOLCHAIN_PIN='{_TOOLCHAIN_PIN}'\n"
+                + functions
+                + "check_go_directive Dockerfile GOLANG_VERSION custom.mod\nexit $status\n"
+            )
+            result = subprocess.run(
+                ["bash", "-c", script], cwd=root, capture_output=True, text=True, check=False
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "")
 
 
 if __name__ == "__main__":

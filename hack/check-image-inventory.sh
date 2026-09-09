@@ -109,6 +109,18 @@ check_base_image golang k8s-operator/Dockerfile GOLANG_IMAGE GOLANG_VERSION
 check_base_image distroless-static k8s-operator/Dockerfile DISTROLESS_IMAGE DISTROLESS_VERSION
 check_base_image python examples/inference-replay/replay-proxy/Dockerfile PYTHON_IMAGE PYTHON_VERSION
 check_base_image python deploy/sandbox/Dockerfile PYTHON_IMAGE PYTHON_VERSION
+check_base_image golang a2a/Dockerfile.gateway GOLANG_IMAGE GOLANG_VERSION
+check_base_image distroless-static a2a/Dockerfile.gateway DISTROLESS_IMAGE DISTROLESS_VERSION
+
+if [ -f a2a/Dockerfile.authcallout ]; then
+  check_base_image golang a2a/Dockerfile.authcallout GOLANG_IMAGE GOLANG_VERSION
+  check_base_image distroless-static a2a/Dockerfile.authcallout DISTROLESS_IMAGE DISTROLESS_VERSION
+fi
+
+if [ -f a2a/Dockerfile.worker ]; then
+  check_base_image golang a2a/Dockerfile.worker GOLANG_IMAGE GOLANG_VERSION
+  check_base_image node a2a/Dockerfile.worker NODE_IMAGE NODE_VERSION
+fi
 
 # The Go builder and k8s-operator/go.mod's `go` directive must name the same
 # major.minor: a builder behind the directive fails the image build (the
@@ -124,36 +136,49 @@ check_base_image python deploy/sandbox/Dockerfile PYTHON_IMAGE PYTHON_VERSION
 # first RUN: it is the only guard left once a mirror has frozen the patch, and
 # nothing else would notice a reshuffle moving it out of that stage or below the
 # `go build` it has to precede.
+# The third argument is the module whose `go` directive the builder is tied to.
+# It defaults to the operator's because that was the only Go image here for a
+# long time; a2a/ is a second module with its own go.mod, and pinning its
+# builder against the operator's directive would pass while the two drift.
 check_go_directive() {
-  local dockerfile=$1 version_arg=$2
+  local dockerfile=$1 version_arg=$2 go_mod=${3:-$GO_MOD}
   local builder_tag directive builder_ver builder_mm directive_mm
   awk -v img="\${$GOLANG_IMAGE_ARG}" '/^FROM / { in_stage = index($0, img) > 0; next } /^RUN / { in_stage = 0 } in_stage' "$dockerfile" |
     grep -qx "$GOTOOLCHAIN_PIN" ||
     fail "$dockerfile: no line exactly '$GOTOOLCHAIN_PIN' between the FROM \${$GOLANG_IMAGE_ARG} line and that stage's first RUN, so a substituted $GOLANG_IMAGE_ARG without that default downloads a toolchain the pin does not name instead of failing."
   builder_tag="$(arg_default "$dockerfile" "$version_arg")"
-  directive="$(sed -n 's/^go[[:space:]][[:space:]]*\([0-9][0-9A-Za-z.]*\).*$/\1/p' "$GO_MOD" | head -n1)"
+  directive="$(sed -n 's/^go[[:space:]][[:space:]]*\([0-9][0-9A-Za-z.]*\).*$/\1/p' "$go_mod" | head -n1)"
   [ -n "$directive" ] || {
-    fail "$GO_MOD has no 'go' directive, so nothing pins the toolchain the operator builds with."
+    fail "$go_mod has no 'go' directive, so nothing pins the toolchain that module builds with."
     return
   }
   builder_ver="$(sed -n 's/^\([0-9][0-9A-Za-z.]*\).*$/\1/p' <<<"$builder_tag")"
   builder_mm="$(sed -n 's/^\([0-9][0-9]*\.[0-9][0-9]*\).*$/\1/p' <<<"$builder_ver")"
   directive_mm="$(sed -n 's/^\([0-9][0-9]*\.[0-9][0-9]*\).*$/\1/p' <<<"$directive")"
   [ -n "$builder_mm" ] || {
-    fail "$dockerfile: ARG $version_arg defaults to '${builder_tag:-<unset>}', which does not name a Go major.minor, so nothing ties the builder to the 'go $directive' directive in $GO_MOD."
+    fail "$dockerfile: ARG $version_arg defaults to '${builder_tag:-<unset>}', which does not name a Go major.minor, so nothing ties the builder to the 'go $directive' directive in $go_mod."
     return
   }
   [ "$builder_mm" = "$directive_mm" ] || {
-    fail "$dockerfile: ARG $version_arg defaults to '$builder_tag' (Go $builder_mm), but $GO_MOD says 'go $directive' (Go $directive_mm). Move both together: a go.mod ahead of the builder fails the image build, a builder ahead of go.mod ships a compiler the directive does not name."
+    fail "$dockerfile: ARG $version_arg defaults to '$builder_tag' (Go $builder_mm), but $go_mod says 'go $directive' (Go $directive_mm). Move both together: a go.mod ahead of the builder fails the image build, a builder ahead of go.mod ships a compiler the directive does not name."
     return
   }
   [ "$builder_ver" = "$builder_mm" ] ||
     [ "$(printf '%s\n%s\n' "$directive" "$builder_ver" | sort -V | head -n1)" = "$directive" ] ||
-    fail "$dockerfile: ARG $version_arg defaults to '$builder_tag' (Go $builder_ver), below the 'go $directive' floor in $GO_MOD, so the image build fails under $GOTOOLCHAIN_PIN."
+    fail "$dockerfile: ARG $version_arg defaults to '$builder_tag' (Go $builder_ver), below the 'go $directive' floor in $go_mod, so the image build fails under $GOTOOLCHAIN_PIN."
 }
 
 check_go_directive deploy/docker/Dockerfile GOLANG_VERSION
 check_go_directive k8s-operator/Dockerfile GOLANG_VERSION
+check_go_directive a2a/Dockerfile.gateway GOLANG_VERSION a2a/go.mod
+
+if [ -f a2a/Dockerfile.authcallout ]; then
+  check_go_directive a2a/Dockerfile.authcallout GOLANG_VERSION a2a/go.mod
+fi
+
+if [ -f a2a/Dockerfile.worker ]; then
+  check_go_directive a2a/Dockerfile.worker GOLANG_VERSION a2a/go.mod
+fi
 
 # hermes-agent is the one base image whose tag lives outside the Dockerfile —
 # the release workflows read tags.env — so the inventory points at that file
