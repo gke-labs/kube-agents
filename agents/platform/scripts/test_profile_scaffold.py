@@ -530,6 +530,16 @@ class CapabilityCriteriaMergeTest(unittest.TestCase):
         self.overlay()
         self.assertEqual(self.read("criteria.json"), {"threshold": 3, "new_key": "shipped"})
 
+    def test_a_crash_before_the_merge_leaves_the_tuned_file_untouched(self):
+        # The copy must not put image defaults on the volume ahead of the merge:
+        # a container killed in between would come back with the tuning gone.
+        write(self.home / self.CAP / "criteria.json", json.dumps({"threshold": 7}))
+        with unittest.mock.patch.object(ps, "_restore_volume_wins", side_effect=RuntimeError("killed")):
+            with self.assertRaises(RuntimeError):
+                self.overlay()
+        self.assertEqual(self.read("criteria.json"), {"threshold": 7})
+        self.assertEqual(self.read("criteria.schema.json"), {"v": 2}, "the rest of the copy still landed")
+
     def test_the_rule_is_the_inverse_of_the_cron_rule(self):
         image = {"a": 1, "b": 2}
         live = {"b": 9, "c": 3}

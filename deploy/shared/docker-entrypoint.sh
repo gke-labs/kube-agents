@@ -933,7 +933,7 @@ fi
 # (USER.md, memory/, sessions/) is likewise left untouched.
 #
 # The sync goes through profile_scaffold.py --items rather than a `cp -f` loop
-# because the list is no longer files-only: cron/, skills/, and governance/ carry
+# because the list is no longer files-only: cron/, skills/, governance/, hindsight/ and capabilities/ carry
 # the machinery CAPABILITIES.md advertises. `[ -f ]` is false for a directory, so
 # naming them in a shell loop would be a silent no-op — an upgraded install would
 # take the new CAPABILITIES.md and none of what it describes. --items copies each

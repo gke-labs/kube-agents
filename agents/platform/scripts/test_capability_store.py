@@ -191,6 +191,13 @@ class StoreTest(unittest.TestCase):
         with patch.dict(os.environ, {cs.HERMES_HOME_ENV: str(machine_home)}, clear=True):
             self.assertEqual(cs.cli_root(), machine_home / cs.CAPABILITIES_DIRNAME, "an existing home store wins")
 
+    def test_confirmed_by_is_a_name_not_a_transcript(self):
+        seed(self.root)
+        with self.assertRaises(cs.CapabilityError) as ctx:
+            cs.apply_changes(self.root, "demo", {"threshold": 4}, reason="r", confirmed_by="x" * 201)
+        self.assertIn("confirmed_by", str(ctx.exception))
+        self.assertFalse((self.root / "demo" / cs.CHANGELOG_FILENAME).exists())
+
     def test_state_keys_cannot_be_set_and_a_reason_is_required(self):
         seed(self.root)
         with self.assertRaises(cs.CapabilityError):

@@ -81,6 +81,8 @@ TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # through this path.
 MAX_CHANGES_PER_CALL = 32
 MAX_REASON_CHARS = 2000
+# A name or handle, not a transcript pasted as evidence of who agreed.
+MAX_CONFIRMED_BY_CHARS = 200
 MAX_HISTORY_ENTRIES = 50
 
 # What the operator CLI at the bottom of this file accepts. Read-only on
@@ -358,6 +360,8 @@ def apply_changes(
     if len(reason) > MAX_REASON_CHARS:
         raise CapabilityError(f"reason must be at most {MAX_REASON_CHARS} characters")
     confirmed_by = (confirmed_by or "").strip()
+    if len(confirmed_by) > MAX_CONFIRMED_BY_CHARS:
+        raise CapabilityError(f"confirmed_by must be at most {MAX_CONFIRMED_BY_CHARS} characters: a name, not a transcript")
 
     directory = root / name
     if not directory.is_dir():

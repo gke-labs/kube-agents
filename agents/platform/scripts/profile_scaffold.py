@@ -404,10 +404,11 @@ def _snapshot_volume_wins(home: Path) -> dict[str, object]:
 def _restore_volume_wins(
     home: Path, template_dir: Path, names: tuple[str, ...], prior: dict[str, object]
 ) -> None:
-    """Rewrite each VOLUME_WINS_GLOBS file the copy just replaced as volume-over-image.
+    """Write each VOLUME_WINS_GLOBS file the volume held as volume-over-image.
 
-    A file the template does not ship — a capability the image dropped, or one
-    an operator added by hand — was never touched by the copy and needs nothing.
+    The copy skipped these files (see overlay_template), so this is their only
+    write on this start. A file the template does not ship — a capability the
+    image dropped, or one an operator added by hand — needs nothing.
 
     Known limit: this runs outside the store's per-capability lock, so at
     availability.replicas > 1 on one RWX volume a `set` committed by a running
@@ -463,13 +464,24 @@ def overlay_template(
         if (contents := read_json(home.joinpath(*relative.split("/")))) is not None
     }
     prior_volume_wins = _snapshot_volume_wins(home)
+    # A volume-wins file the volume already holds is left out of the copy, so
+    # the merged rewrite below is the only write it sees. Copying it first and
+    # restoring after would leave the tuned values only in memory between the
+    # two steps, and a container killed in that window starts next time from
+    # image defaults. Files the volume lacks are copied as normal.
+    held = {home.joinpath(*relative.split("/")) for relative in prior_volume_wins}
+
+    def _skip_held(src_dir: str, names_in_dir: list[str]) -> list[str]:
+        dest_dir = home / Path(src_dir).relative_to(template_dir)
+        return [n for n in names_in_dir if dest_dir / n in held]
+
     for item_name in names:
         src = template_dir / item_name
         if not src.exists():
             continue
         dest = home / item_name
         if src.is_dir():
-            shutil.copytree(src, dest, dirs_exist_ok=True)
+            shutil.copytree(src, dest, dirs_exist_ok=True, ignore=_skip_held)
         else:
             shutil.copy2(src, dest)
     _merge_after_overlay(home, template_dir, names, prior, cron_job_ids, cron_retire_ids)
