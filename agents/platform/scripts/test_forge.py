@@ -20,17 +20,18 @@ Four properties carry most of the weight:
 * **An unknown permission is not a "no".** A 404 from the collaborator endpoint
   means no write access; a proxy fault means nothing at all, and the sweep turns
   a "no" into a public refusal that is never retried.
-* **The repository parser agrees with `resolver.py`'s.** They are two copies of
-  one hardened parser, and `ParserAgreementTest` is what stops them drifting
-  until `resolver.py` migrates onto this module.
+* **An unsupported host raises rather than falling back to GitHub.** Falling
+  back is what would point `gh` at a same-named GitHub repository on behalf of
+  a URL naming somebody else's forge. The parse behind that decision is
+  `test_repo_ref.py`'s subject, not this file's.
 """
 
+import dataclasses
 import importlib.util
 import json
 import os
 import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -88,62 +89,47 @@ class FakeGh:
         raise AssertionError(f"no gh call matched {fragment!r}; saw {self.calls}")
 
 
-def write_settings(tmpdir: str, value: str) -> str:
-    path = os.path.join(tmpdir, "SETTINGS.md")
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(f"# Settings\n\n- **Git Repo:** {value}\n")
-    return path
+class ProviderSelectionTest(unittest.TestCase):
+    """`provider_for`. The parse itself is `test_repo_ref.py`'s subject."""
 
+    def test_no_repository_means_github(self):
+        """What the sweep passes: it discovers repositories after choosing."""
+        self.assertIsInstance(forge.provider_for(), forge.GitHubProvider)
 
-class ParseRepoTest(unittest.TestCase):
-    def _resolve(self, value):
-        return forge._parse_repo(value)
+    def test_bare_shorthand_means_github(self):
+        self.assertIsInstance(forge.provider_for("acme/toolkit"), forge.GitHubProvider)
 
-    def test_bare_shorthand(self):
-        self.assertEqual(self._resolve("acme/toolkit"), "acme/toolkit")
+    def test_github_url_selects_github(self):
+        for value in (
+            "https://github.com/acme/toolkit",
+            "git@github.com:acme/toolkit.git",
+            "https://www.github.com/acme/toolkit",
+        ):
+            with self.subTest(value=value):
+                self.assertIsInstance(
+                    forge.provider_for(value), forge.GitHubProvider
+                )
 
-    def test_https_url(self):
-        self.assertEqual(
-            self._resolve("https://github.com/acme/toolkit"), "acme/toolkit"
-        )
+    def test_a_host_with_no_provider_raises_rather_than_falling_back(self):
+        """The fallback is what would run `gh` against a same-named GitHub repo."""
+        with self.assertRaises(forge.UnknownForgeHost) as ctx:
+            forge.provider_for("git@gitlab.com:group/project")
+        self.assertEqual(ctx.exception.reason, "FORGE_HOST_UNSUPPORTED")
 
-    def test_scp_form_ssh_remote(self):
-        self.assertEqual(
-            self._resolve("git@github.com:acme/toolkit.git"), "acme/toolkit"
-        )
+    def test_github_com_inside_another_host_no_longer_selects_github(self):
+        """The substring test this replaced selected `GitHubProvider` here."""
+        with self.assertRaises(forge.UnknownForgeHost):
+            forge.provider_for("https://example.invalid/github.com/o/r")
 
-    def test_www_prefix(self):
-        self.assertEqual(
-            self._resolve("https://www.github.com/acme/toolkit"), "acme/toolkit"
-        )
+    def test_an_unparseable_value_carries_the_operator_facing_reason_code(self):
+        with self.assertRaises(forge.RepoUnparseable) as ctx:
+            forge.provider_for("../..")
+        self.assertEqual(ctx.exception.reason, "GIT_REPO_UNPARSEABLE")
 
-    def test_git_suffix_is_stripped(self):
-        self.assertEqual(self._resolve("acme/toolkit.git"), "acme/toolkit")
-
-    def test_github_com_as_a_path_segment_on_another_host_is_rejected(self):
-        """The confused-deputy shape the anchored regex exists for."""
-        with self.assertRaises(forge.RepoUnparseable):
-            self._resolve("https://evil.com/github.com/attacker/repo")
-
-    def test_userinfo_cannot_smuggle_the_host(self):
-        with self.assertRaises(forge.RepoUnparseable):
-            self._resolve("https://user@evil.com/github.com/attacker/repo")
-
-    def test_lookalike_host_is_rejected(self):
-        with self.assertRaises(forge.RepoUnparseable):
-            self._resolve("https://evilgithub.com/attacker/repo")
-
-    def test_traversal_satisfies_the_shorthand_pattern_and_is_still_rejected(self):
-        """`BARE_REPO_RE` admits "../.." — the component check is what stops it."""
-        self.assertTrue(forge.BARE_REPO_RE.match("../.."))
-        with self.assertRaises(forge.RepoUnparseable):
-            self._resolve("../..")
-
-    def test_leading_dash_would_be_parsed_as_a_flag(self):
-        with self.assertRaises(forge.RepoUnparseable):
-            self._resolve("-oops/repo")
-
-
+    def test_the_run_seam_is_forwarded_to_the_provider(self):
+        fake = FakeGh()
+        provider = forge.provider_for(repo="acme/toolkit", run=fake)
+        self.assertIs(provider._run, fake)
 
 
 class NormaliseLoginTest(unittest.TestCase):
@@ -1258,21 +1244,176 @@ class PermissionUnknownTest(unittest.TestCase):
         self.assertTrue(comments[0].can_write)
 
 
-class ProviderForTest(unittest.TestCase):
-    def test_github_host_selects_the_github_provider(self):
-        self.assertIsInstance(forge.provider_for(repo="https://github.com/acme/toolkit"), forge.GitHubProvider)
+class CreatePullRequestTest(unittest.TestCase):
+    """Opening a change, and the one refusal that is not a failure."""
 
-    def test_bare_shorthand_means_github(self):
-        """The operator writes `owner/repo` through verbatim; it is `gh -R`'s own form."""
-        self.assertIsInstance(forge.provider_for(repo="acme/toolkit"), forge.GitHubProvider)
+    def _provider(self, gh):
+        return forge.GitHubProvider(run=gh)
 
-    def test_omitted_repo_defaults_to_github_provider(self):
-        self.assertIsInstance(forge.provider_for(), forge.GitHubProvider)
+    def test_it_names_the_repository_and_sends_the_body_on_stdin(self):
+        gh = FakeGh(default=(0, "https://github.com/acme/fleet/pull/7\n", ""))
+        url = self._provider(gh).create_pull_request(
+            "acme/fleet",
+            head="platform-agent/x",
+            base="main",
+            title="t",
+            body="the description",
+        )
+        self.assertEqual(url, "https://github.com/acme/fleet/pull/7")
+        argv = gh.argv_containing("pr create")
+        # `-R` is what makes the call independent of the process's directory,
+        # which is the whole reason the caller no longer has to be in a clone.
+        self.assertEqual(argv[argv.index("-R") + 1], "acme/fleet")
+        self.assertEqual(argv[argv.index("--head") + 1], "platform-agent/x")
+        self.assertEqual(argv[argv.index("--base") + 1], "main")
+        # `-`, never a path: the caller, the sandbox and the broker are three
+        # containers with three filesystems, so a file this process writes is
+        # not one `gh` can open. The body has to be on fd 0.
+        self.assertEqual(argv[argv.index("--body-file") + 1], forge.BODY_STDIN)
+        self.assertEqual(gh.stdin_of("pr create"), "the description")
+        self.assertNotIn("--body", argv)
 
-    def test_the_run_seam_is_forwarded_to_the_provider(self):
-        fake = FakeGh()
-        provider = forge.provider_for(repo="acme/toolkit", run=fake)
-        self.assertIs(provider._run, fake)
+    def test_an_existing_pull_request_is_its_own_error_type(self):
+        """Distinct from a failure, because the caller decides which it is.
+
+        A resubmission gets here after the push has already landed. Reported as
+        REPO_UNREACHABLE it is indistinguishable from a credential that cannot
+        reach the repository at all, and the skill's answer to those two is
+        opposite.
+        """
+        gh = FakeGh(
+            default=(
+                1,
+                "",
+                'a pull request for branch "platform-agent/x" into branch "main" '
+                "already exists:\nhttps://github.com/acme/fleet/pull/7\n",
+            )
+        )
+        with self.assertRaises(forge.PullRequestExists) as caught:
+            self._provider(gh).create_pull_request(
+                "acme/fleet", head="platform-agent/x", base="main", title="t",
+                body="the description",
+            )
+        self.assertEqual(caught.exception.reason, forge.REASON_PULL_REQUEST_EXISTS)
+        self.assertEqual(caught.exception.head, "platform-agent/x")
+        self.assertIn("pull/7", caught.exception.value)
+
+    def test_every_other_refusal_is_a_refusal_not_an_unreachable_repository(self):
+        """The push has already landed against this repository over this
+        credential, so `REPO_UNREACHABLE` would send an operator to check the
+        two things known to work."""
+        gh = FakeGh(default=(1, "", "HTTP 403: Resource not accessible by integration"))
+        with self.assertRaises(forge.ForgeError) as caught:
+            self._provider(gh).create_pull_request(
+                "acme/fleet", head="platform-agent/x", base="main", title="t",
+                body="the description",
+            )
+        self.assertEqual(caught.exception.reason, "PULL_REQUEST_REFUSED")
+        self.assertNotIsInstance(caught.exception, forge.PullRequestExists)
+
+    def test_the_detail_carries_the_exit_code_and_both_streams(self):
+        """`gh` puts a protected-base rejection on stdout and the credential
+        proxy's block message on stderr, and the old handler logged both."""
+        gh = FakeGh(default=(2, "base branch is protected", "and the token cannot override it"))
+        with self.assertRaises(forge.ForgeError) as caught:
+            self._provider(gh).create_pull_request(
+                "acme/fleet", head="platform-agent/x", base="main", title="t",
+                body="the description",
+            )
+        self.assertIn("exit 2", caught.exception.value)
+        self.assertIn("base branch is protected", caught.exception.value)
+        self.assertIn("cannot override", caught.exception.value)
+
+    def test_a_silent_success_is_read_back_rather_than_returned_empty(self):
+        """`gh` prints the URL today. A version that did not would otherwise
+        return "" — a pull request that exists, reported as having no address."""
+        gh = FakeGh(
+            responses={"pr view": (0, json.dumps({"url": "https://x/pull/9"}), "")},
+            default=(0, "", ""),
+        )
+        url = self._provider(gh).create_pull_request(
+            "acme/fleet", head="platform-agent/x", base="main", title="t",
+            body="the description",
+        )
+        self.assertEqual(url, "https://x/pull/9")
+
+    def test_a_failed_read_back_does_not_turn_a_success_into_a_failure(self):
+        """The pull request was opened. Raising here would have the caller
+        re-push a branch whose change is already up."""
+        gh = FakeGh(responses={"pr view": (1, "", "not found")}, default=(0, "", ""))
+        url = self._provider(gh).create_pull_request(
+            "acme/fleet", head="platform-agent/x", base="main", title="t",
+            body="the description",
+        )
+        self.assertEqual(url, "")
+
+    def test_it_reaches_the_forge_through_the_one_overridable_seam(self):
+        """The module docstring's invariant: a provider that replaces `_call`
+        replaces every round trip. `create_pull_request` reads an exit code, so
+        it is the method most likely to grow a second path to the runner."""
+        calls = []
+
+        class Overridden(forge.GitHubProvider):
+            def _call(self, argv, **kwargs):
+                calls.append(list(argv))
+                return super()._call(argv, **kwargs)
+
+        Overridden(run=FakeGh(default=(0, "https://x/pull/1", ""))).create_pull_request(
+            "acme/fleet", head="platform-agent/x", base="main", title="t",
+            body="the description",
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:2], ["pr", "create"])
+
+
+class UpdatePullRequestTest(unittest.TestCase):
+    def test_it_edits_the_title_and_the_body(self):
+        gh = FakeGh(default=(0, "", ""))
+        forge.GitHubProvider(run=gh).update_pull_request(
+            "acme/fleet", head="platform-agent/x", title="round two",
+            body="the description",
+        )
+        argv = gh.argv_containing("pr edit")
+        self.assertEqual(argv[2], "platform-agent/x")
+        self.assertEqual(argv[argv.index("-R") + 1], "acme/fleet")
+        self.assertEqual(argv[argv.index("--title") + 1], "round two")
+        self.assertEqual(argv[argv.index("--body-file") + 1], forge.BODY_STDIN)
+        self.assertEqual(gh.stdin_of("pr edit"), "the description")
+
+    def test_a_failed_edit_raises_rather_than_reporting_success(self):
+        gh = FakeGh(default=(1, "", "no pull requests found"))
+        with self.assertRaises(forge.ForgeError):
+            forge.GitHubProvider(run=gh).update_pull_request(
+                "acme/fleet", head="platform-agent/x", title="t",
+                body="the description",
+            )
+
+
+class PullRequestUrlTest(unittest.TestCase):
+    def test_it_reads_the_url_out_of_the_json_projection(self):
+        gh = FakeGh(default=(0, json.dumps({"url": "https://x/pull/3"}), ""))
+        self.assertEqual(
+            forge.GitHubProvider(run=gh).pull_request_url(
+                "acme/fleet", head="platform-agent/x"
+            ),
+            "https://x/pull/3",
+        )
+        argv = gh.argv_containing("pr view")
+        self.assertEqual(argv[argv.index("--json") + 1], "url")
+
+    def test_an_answer_without_a_url_is_empty_not_a_crash(self):
+        gh = FakeGh(default=(0, json.dumps({}), ""))
+        self.assertEqual(
+            forge.GitHubProvider(run=gh).pull_request_url("acme/fleet", head="x"), ""
+        )
+
+    def test_a_non_json_answer_is_reported_rather_than_read_as_absent(self):
+        """"" means "no pull request" to every caller, so an unreadable answer
+        must not arrive spelled the same way."""
+        gh = FakeGh(default=(0, "<html>proxy error</html>", ""))
+        with self.assertRaises(forge.ForgeError) as caught:
+            forge.GitHubProvider(run=gh).pull_request_url("acme/fleet", head="x")
+        self.assertEqual(caught.exception.reason, "FORGE_RESPONSE_UNREADABLE")
 
 
 class ProtocolConformanceTest(unittest.TestCase):
@@ -1284,9 +1425,287 @@ class ProtocolConformanceTest(unittest.TestCase):
             "list_comments",
             "post_comment",
             "acknowledge",
+            "list_commits",
+            "create_pull_request",
+            "update_pull_request",
+            "pull_request_url",
         ):
             self.assertTrue(callable(getattr(provider, name)), name)
         self.assertTrue(provider.supports_acknowledge)
+
+    def test_the_protocol_names_nothing_the_provider_lacks(self):
+        """The Protocol is the contract a second forge implements, so a method
+        declared there and absent here would only fail at the first GitLab
+        install rather than in this suite."""
+        declared = {
+            name
+            for name, value in vars(forge.ForgeProvider).items()
+            if callable(value) and not name.startswith("_")
+        } | set(getattr(forge.ForgeProvider, "__annotations__", {}))
+        self.assertIn("create_pull_request", declared)
+        self.assertIn("supports_acknowledge", declared)
+        for name in sorted(declared):
+            self.assertTrue(
+                hasattr(forge.GitHubProvider, name),
+                f"ForgeProvider declares {name}, GitHubProvider does not have it",
+            )
+
+
+class LabelFlagTest(unittest.TestCase):
+    def test_each_name_gets_its_own_flag(self):
+        self.assertEqual(
+            forge._label_flags("--label", ["a", "b"]),
+            ["--label", "a", "--label", "b"],
+        )
+
+    def test_a_blank_name_is_dropped_rather_than_sent_as_an_empty_label(self):
+        """`--label ""` is a 422 that fails the whole call, so the labels that
+        were valid go on nothing — and on a create path nothing is opened."""
+        self.assertEqual(
+            forge._label_flags("--label", ["a", "", None, "b"]),
+            ["--label", "a", "--label", "b"],
+        )
+
+    def test_no_names_means_no_flags(self):
+        self.assertEqual(forge._label_flags("--label", []), [])
+
+
+class SelectorTest(unittest.TestCase):
+    def test_a_head_is_passed_through(self):
+        self.assertEqual(forge._selector(head="topic"), "topic")
+
+    def test_a_number_becomes_its_string(self):
+        self.assertEqual(forge._selector(number=7), "7")
+
+    def test_naming_a_change_twice_is_a_programming_error_not_a_forge_one(self):
+        """`ValueError` rather than `ForgeError`: a caller catching the latter to
+        log and continue would swallow the bug into a warning."""
+        with self.assertRaises(ValueError):
+            forge._selector(head="topic", number=7)
+        with self.assertRaises(ValueError):
+            forge._selector()
+
+
+class LastLineTest(unittest.TestCase):
+    def test_a_notice_before_the_url_does_not_end_up_in_the_answer(self):
+        """`gh` puts version notices and credential-refresh lines on the same
+        stream as the address it just created."""
+        self.assertEqual(
+            forge._last_line("A new release of gh is available\nhttps://x/pull/1\n"),
+            "https://x/pull/1",
+        )
+
+    def test_no_output_is_the_empty_string(self):
+        self.assertEqual(forge._last_line(""), "")
+        self.assertEqual(forge._last_line(None), "")
+
+
+class LedgerReadTest(unittest.TestCase):
+    """The issue and pull-request reads the fleet audit runs on."""
+
+    def test_issues_come_back_lowest_number_first(self):
+        """Sorted here so a caller choosing between duplicates does not have to
+        trust the forge's order; `find_existing_issue` takes the last."""
+        gh = FakeGh(
+            default=(
+                0,
+                json.dumps(
+                    [
+                        {"number": 9, "url": "u9"},
+                        {"number": 2, "url": "u2"},
+                    ]
+                ),
+                "",
+            )
+        )
+        issues = forge.GitHubProvider(run=gh).list_issues("o/r", labels=["audit:x"])
+        self.assertEqual([i.number for i in issues], [2, 9])
+        self.assertEqual(issues[-1].url, "u9")
+
+    def test_each_label_is_its_own_flag_so_the_match_is_a_conjunction(self):
+        gh = FakeGh(default=(0, "[]", ""))
+        forge.GitHubProvider(run=gh).list_pull_requests(
+            "o/r", labels=["audit:x", "audit:remediation"], state="all"
+        )
+        argv = gh.argv_containing("pr list")
+        self.assertEqual(argv.count("--label"), 2)
+        self.assertIn("audit:remediation", argv)
+
+    def test_the_pull_request_projection_is_the_declared_contract(self):
+        """A provider and a caller agreeing on key names by coincidence is the
+        failure `CHANGE_FIELDS` exists to stop."""
+        gh = FakeGh(default=(0, "[]", ""))
+        forge.GitHubProvider(run=gh).list_pull_requests("o/r")
+        argv = gh.argv_containing("pr list")
+        self.assertEqual(argv[argv.index("--json") + 1], ",".join(forge.CHANGE_FIELDS))
+
+    def test_the_issue_projection_is_the_declared_contract(self):
+        gh = FakeGh(default=(0, "[]", ""))
+        forge.GitHubProvider(run=gh).list_issues("o/r")
+        argv = gh.argv_containing("issue list")
+        self.assertEqual(argv[argv.index("--json") + 1], ",".join(forge.ISSUE_FIELDS))
+
+    def test_a_listing_never_asks_for_bodies(self):
+        """Twenty rendered audit reports is the largest thing the forge could
+        send, and `""` for the one it did not is indistinguishable from a ledger
+        with nothing in it — which reads as "every finding is new"."""
+        self.assertNotIn("body", forge.ISSUE_FIELDS)
+        self.assertNotIn("body", {f.name for f in dataclasses.fields(forge.Issue)})
+
+    def test_a_row_that_is_not_an_object_is_dropped_rather_than_raising(self):
+        gh = FakeGh(default=(0, json.dumps([{"number": 1}, "junk"]), ""))
+        self.assertEqual(len(forge.GitHubProvider(run=gh).list_pull_requests("o/r")), 1)
+
+    def test_an_unreadable_body_raises_rather_than_reading_as_empty(self):
+        """"The ledger is empty" and "the ledger could not be read" lead to
+        opposite decisions: the first announces every finding as new."""
+        gh = FakeGh(default=(1, "", "boom"))
+        with self.assertRaises(forge.ForgeError):
+            forge.GitHubProvider(run=gh).issue_body("o/r", 4)
+
+    def test_an_empty_body_is_the_empty_string(self):
+        gh = FakeGh(default=(0, json.dumps({"body": ""}), ""))
+        self.assertEqual(forge.GitHubProvider(run=gh).issue_body("o/r", 4), "")
+
+    def test_comments_come_back_as_the_forge_sent_them(self):
+        """Dictionaries, not `Comment`: the machine-author gate reads
+        `authorAssociation` and `viewerDidAuthor`, which that dataclass lacks."""
+        row = {"author": {"login": "someone"}, "authorAssociation": "NONE"}
+        gh = FakeGh(default=(0, json.dumps({"comments": [row, 7]}), ""))
+        self.assertEqual(
+            forge.GitHubProvider(run=gh).issue_comments("o/r", 4), [row]
+        )
+
+
+class LedgerWriteTest(unittest.TestCase):
+    def test_a_refused_write_is_not_reported_as_an_unreachable_repository(self):
+        """Every caller has already read this repository over this credential in
+        this run, so unreachability is the one answer ruled out."""
+        gh = FakeGh(default=(1, "", "422 label description too long"))
+        with self.assertRaises(forge.ForgeError) as caught:
+            forge.GitHubProvider(run=gh).ensure_label(
+                "o/r", name="n", color="c", description="d"
+            )
+        self.assertEqual(caught.exception.reason, forge.REASON_WRITE_REFUSED)
+        self.assertIn("exit 1", caught.exception.value)
+
+    def test_labels_are_created_with_force_so_the_call_repairs_as_well_as_creates(self):
+        gh = FakeGh(default=(0, "", ""))
+        forge.GitHubProvider(run=gh).ensure_label(
+            "o/r", name="audit:x", color="C5DEF5", description="d"
+        )
+        self.assertIn("--force", gh.argv_containing("label create"))
+
+    def test_adds_and_removes_travel_in_one_call(self):
+        """One call, so a name that does not resolve applies none of them —
+        a half-labelled change is a state the audit has no rule for."""
+        gh = FakeGh(default=(0, "", ""))
+        forge.GitHubProvider(run=gh).set_pull_request_labels(
+            "o/r", 8, add=["severity:major"], remove=["severity:minor"]
+        )
+        self.assertEqual(len(gh.calls), 1)
+        argv = gh.calls[0]
+        self.assertIn("--add-label", argv)
+        self.assertIn("--remove-label", argv)
+
+    def test_a_change_can_be_labelled_by_branch_as_well_as_by_number(self):
+        """A pull request adopted after `create_pull_request` was refused is
+        known by its branch and nothing else, and labelling it is what lets a
+        later run find it again."""
+        gh = FakeGh(default=(0, "", ""))
+        forge.GitHubProvider(run=gh).set_pull_request_labels(
+            "o/r", "platform-agent/fix-x", add=["agent:audit"]
+        )
+        self.assertEqual(gh.calls[0][:3], ["pr", "edit", "platform-agent/fix-x"])
+
+    def test_setting_no_labels_reaches_the_forge_not_at_all(self):
+        """A bare `pr edit` with no flags is a call that can still fail, and
+        failing it would abort a close the labels were not blocking."""
+        gh = FakeGh(default=(0, "", ""))
+        forge.GitHubProvider(run=gh).set_issue_labels("o/r", 8)
+        self.assertEqual(gh.calls, [])
+
+    def test_an_issue_edit_without_a_title_leaves_the_existing_one_alone(self):
+        """The re-link pass must not touch a title carrying finding counts that
+        were correct when they were written."""
+        gh = FakeGh(default=(0, "", ""))
+        forge.GitHubProvider(run=gh).update_issue("o/r", 4, body="the body")
+        self.assertNotIn("--title", gh.argv_containing("issue edit"))
+
+    def test_a_close_carries_the_reason_it_was_given(self):
+        gh = FakeGh(default=(0, "", ""))
+        forge.GitHubProvider(run=gh).close_issue("o/r", 4, reason="completed")
+        argv = gh.argv_containing("issue close")
+        self.assertEqual(argv[argv.index("--reason") + 1], "completed")
+
+    def test_closing_a_pull_request_never_deletes_its_branch(self):
+        """A finding that comes back is pushed to the same branch; deleting it
+        turns a reopen into a fresh pull request with no review history."""
+        gh = FakeGh(default=(0, "", ""))
+        forge.GitHubProvider(run=gh).close_pull_request("o/r", 8)
+        self.assertNotIn("--delete-branch", gh.argv_containing("pr close"))
+
+    def test_creating_a_pull_request_applies_its_labels_in_the_same_call(self):
+        """Two calls would leave a change briefly visible without the labels the
+        close-semantics rule reads, and a crash between them permanently so."""
+        gh = FakeGh(default=(0, "https://x/pull/1", ""))
+        forge.GitHubProvider(run=gh).create_pull_request(
+            "o/r",
+            head="h",
+            base="main",
+            title="t",
+            body="the body",
+            labels=["agent:audit", "audit:remediation"],
+        )
+        self.assertEqual(len(gh.calls), 1)
+        self.assertEqual(gh.calls[0].count("--label"), 2)
+
+    def test_an_issue_url_survives_a_notice_printed_before_it(self):
+        gh = FakeGh(default=(0, "A new release of gh\nhttps://x/issues/7\n", ""))
+        self.assertEqual(
+            forge.GitHubProvider(run=gh).create_issue("o/r", title="t", body="the body"),
+            "https://x/issues/7",
+        )
+
+    def test_an_open_change_can_be_named_by_number_as_well_as_by_branch(self):
+        """The two callers hold different halves: a branch just pushed, or a
+        number off a listing."""
+        gh = FakeGh(default=(0, "", ""))
+        provider = forge.GitHubProvider(run=gh)
+        provider.update_pull_request("o/r", number=8, title="t", body="the body")
+        self.assertEqual(gh.calls[0][:3], ["pr", "edit", "8"])
+        provider.update_pull_request("o/r", head="topic", title="t", body="the body")
+        self.assertEqual(gh.calls[1][:3], ["pr", "edit", "topic"])
+
+    def test_every_ledger_body_travels_on_fd_zero(self):
+        """Never a path. The audit runs in the sandbox and `gh` runs in the
+        broker, two containers with two filesystems since #913, so a file this
+        process writes is not one the reader can open — and each of these calls
+        fails *after* the state change it was reporting on."""
+        for fragment, call in (
+            ("issue create", lambda p: p.create_issue("o/r", title="t", body="B")),
+            ("issue edit", lambda p: p.update_issue("o/r", 4, body="B")),
+            ("issue comment", lambda p: p.comment_on_issue("o/r", 4, body="B")),
+            ("pr comment", lambda p: p.comment_on_pull_request("o/r", 8, body="B")),
+            (
+                "pr create",
+                lambda p: p.create_pull_request(
+                    "o/r", head="h", base="main", title="t", body="B"
+                ),
+            ),
+            (
+                "pr edit",
+                lambda p: p.update_pull_request("o/r", number=8, title="t", body="B"),
+            ),
+        ):
+            with self.subTest(call=fragment):
+                gh = FakeGh(default=(0, "https://x/1", ""))
+                call(forge.GitHubProvider(run=gh))
+                argv = gh.argv_containing(fragment)
+                self.assertEqual(
+                    argv[argv.index("--body-file") + 1], forge.BODY_STDIN
+                )
+                self.assertEqual(gh.stdin_of(fragment), "B")
 
 
 if __name__ == "__main__":

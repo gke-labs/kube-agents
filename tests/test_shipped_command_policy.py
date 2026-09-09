@@ -324,11 +324,12 @@ class TheRulesReadCommandsNotProse(ShippedPolicyTest):
 
     def test_the_agents_own_pull_request_is_not_refused(self):
         # submit-suggestion/SKILL.md tells the agent to close every body with
-        # this sentence, and submit_suggestion.py passes it to `gh pr create`
-        # inline. Before the fix the joined string held a `pr` token and a
-        # later `merge` token, so github.merge refused every GitOps suggestion
+        # this sentence. Before the fix the joined string held a `pr` token and
+        # a later `merge` token, so github.merge refused every GitOps suggestion
         # the product exists to raise -- the denylist taking the product down
-        # rather than an attacker.
+        # rather than an attacker. `submit_suggestion.py` now sends the body as
+        # `--body-file`, so it no longer reaches this rule; the normalisation
+        # still guards every caller that puts free text on argv.
         body = (
             "Automated suggestion from the Platform Agent.\n\n"
             "Please review the code diffs and merge this PR to trigger the "

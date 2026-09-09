@@ -34,6 +34,8 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import command_policy
+import forge_clis
+import repo_ref
 import scoped_sa_pool
 
 # Re-exported, not re-implemented. The shim owns kubeconfig parsing because the
@@ -50,27 +52,52 @@ LOGGER = logging.getLogger("credential-proxy")
 SLACK_EVENT_QUEUE_MAXSIZE = 1000
 SLACK_ERROR_DIAGNOSTIC_FIELDS = ("ok", "error", "needed", "provided")
 
-# GitHub "owner/name" slug validation. Each segment is matched with a single,
-# unambiguous character class rather than two adjacent "+" groups around the
-# "/" separator, so the match is linear-time and cannot be forced into
-# polynomial backtracking (ReDoS). The length guard bounds untrusted input as
-# defense-in-depth; 256 is far above real GitHub owner/name limits, so valid
-# input is never rejected.
-MAX_REPOSITORY_LENGTH = 256
-_REPOSITORY_SEGMENT = re.compile(r"[A-Za-z0-9_.-]+")
+# GitHub "owner/name" slug validation, shared with the agent-side callers via
+# `repo_ref` — which imports nothing but the standard library precisely so this
+# process, the one holding the credentials, can use it. The linear-time segment
+# match and the length guard both live there, at the same 256 this module
+# enforced before; the alias keeps the name this module's own tests use.
+MAX_REPOSITORY_LENGTH = repo_ref.MAX_REPO_LENGTH
+
+#: Where a credential refresh is asked for. `/v1/forge/refresh` is the name that
+#: survives a second forge; `/v1/github/refresh` is what agent images before it
+#: post to and stays served for exactly that reason. An agent image and a
+#: sidecar image are separately versioned and an install routinely runs a pair
+#: one release apart, so a rename that dropped the old path would break every
+#: refresh in that window — which is every git operation the agent makes.
+FORGE_REFRESH_PATH = "/v1/forge/refresh"
+LEGACY_GITHUB_REFRESH_PATH = "/v1/github/refresh"
+FORGE_REFRESH_PATHS = (FORGE_REFRESH_PATH, LEGACY_GITHUB_REFRESH_PATH)
+
+#: Which helper mints and installs credentials for which forge. Compiled in for
+#: the reason `forge_clis.FORGE_EXECUTABLES` is: the request names a provider,
+#: never a path, so a caller cannot ask the sidecar to run a script of its
+#: choosing as the credential-holding user.
+#:
+#: A provider absent here has no refresher in this image. That is a real state
+#: rather than an error in the request — a forge whose token is a long-lived
+#: string mounted from a Secret has nothing to refresh — so it is refused with
+#: the provider named, not with a 500.
+FORGE_REFRESHERS = {
+    forge_clis.GITHUB: "/opt/defaults/scripts/github_token_refresh.py"
+}
 
 
 def is_valid_repository(repository: Any) -> bool:
-    """Return True if ``repository`` is a well-formed ``owner/name`` slug."""
-    if not isinstance(repository, str) or len(repository) > MAX_REPOSITORY_LENGTH:
-        return False
-    owner, slash, name = repository.partition("/")
-    if not slash:
-        return False
-    return (
-        _REPOSITORY_SEGMENT.fullmatch(owner) is not None
-        and _REPOSITORY_SEGMENT.fullmatch(name) is not None
-    )
+    """Return True if ``repository`` is a well-formed ``owner/name`` slug.
+
+    Strictly narrower than the local copy this replaced. It additionally
+    refuses the traversal and leading-dash shapes — `acme/..`, `acme/-x` —
+    which every other validator in the tree already rejected, and `github.com/o`,
+    which is a host and a one-segment path rather than a slug.
+
+    Nothing is admitted that was not admitted before. That matters here more
+    than elsewhere: the caller passes the *original* string on to
+    `github_token_refresh.py`, so a value this accepts after normalising it
+    would reach Minty in its unnormalised form. `repo_ref.is_github_slug`
+    requires the value to already be the slug for that reason.
+    """
+    return repo_ref.is_github_slug(repository)
 
 
 # Two shapes, because two are what the GitHub refresh helper handles: the
@@ -1952,7 +1979,17 @@ def content_workspace_enabled() -> bool:
 
 
 class CommandExecutor:
-    ALLOWED_EXECUTABLES = ("gcloud", "kubectl", "gh", "git")
+    #: What an install with no forge configuration runs, which
+    #: `forge_clis.DEFAULT_FORGE_PROVIDER` makes the GitHub set.
+    #:
+    #: `__init__` rebinds this per instance from the environment, shadowing the
+    #: class attribute. One name rather than two on purpose: two readers check
+    #: this list — `execute` and the `/v1/exec` handler — and if the handler read
+    #: an instance attribute while a stand-in executor only declared the class
+    #: one, the handler would refuse or crash on an executor that would have run
+    #: the command. The class attribute stays as the value for an executor built
+    #: without going through `__init__`, which is every stand-in in the tests.
+    ALLOWED_EXECUTABLES = forge_clis.allowed_executables("")
 
     def __init__(
         self,
@@ -2048,6 +2085,12 @@ class CommandExecutor:
         # bookkeeping needed to make it per-cluster.
         self._kubeconfig_lock = threading.Lock()
         trusted_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        # Shadows the class attribute per instance, because it is now install
+        # configuration: which forge tool this install may run follows from the
+        # providers the operator configured. Same name deliberately — see the
+        # class attribute's note on why two spellings would let the handler and
+        # the executor disagree.
+        self.ALLOWED_EXECUTABLES = forge_clis.allowed_executables()
         self.executables = {
             name: shutil.which(name, path=trusted_path)
             for name in self.ALLOWED_EXECUTABLES
@@ -3082,6 +3125,38 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
         self._json(HTTPStatus.OK, {"status": "ok"})
 
+    def _refuse_unsupported_executable(self, argv: list, request_id: str) -> bool:
+        """Reply 403 and return True when this install may not run ``argv[0]``.
+
+        Read off the executor rather than off `CommandExecutor`: the allowlist
+        is install configuration now, and a handler reading the class default
+        would admit a forge tool this install was not configured for, then have
+        the executor refuse it one layer down — a refusal with no log line
+        naming the executable, which is the line an operator needs.
+
+        A method rather than a block inside the exec route so that it can be
+        driven with an executor built for a given forge. Inlined, the check was
+        revertible to the class attribute with the whole suite still green,
+        because reaching it otherwise means standing up the socket and a policy.
+        """
+        if argv[0] in self.executor.ALLOWED_EXECUTABLES:
+            return False
+        LOGGER.warning(
+            "executable blocked request_id=%s executable=%s",
+            request_id,
+            _sanitize_for_logging(argv[0]),
+        )
+        self._json(
+            HTTPStatus.FORBIDDEN,
+            {
+                "status": "blocked",
+                "code": "SECURITY_POLICY_BLOCKED",
+                "rule": "executable.allowlist",
+                "message": "Executable is not supported by the credential proxy.",
+            },
+        )
+        return True
+
     def do_POST(self) -> None:  # noqa: N802
         principal = self._authenticated()
         if principal is None:
@@ -3092,8 +3167,8 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/v1/chat/"):
             self._handle_chat_post()
             return
-        if self.path == "/v1/github/refresh":
-            self._handle_github_refresh()
+        if self.path in FORGE_REFRESH_PATHS:
+            self._handle_forge_refresh()
             return
         if self.path.startswith("/v1/workspace/"):
             self._handle_workspace_post()
@@ -3170,21 +3245,7 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # arbitrary caller text and gets the same treatment as request_id.
             _sanitize_for_logging(argv[0]),
         )
-        if argv[0] not in CommandExecutor.ALLOWED_EXECUTABLES:
-            LOGGER.warning(
-                "executable blocked request_id=%s executable=%s",
-                request_id,
-                _sanitize_for_logging(argv[0]),
-            )
-            self._json(
-                HTTPStatus.FORBIDDEN,
-                {
-                    "status": "blocked",
-                    "code": "SECURITY_POLICY_BLOCKED",
-                    "rule": "executable.allowlist",
-                    "message": "Executable is not supported by the credential proxy.",
-                },
-            )
+        if self._refuse_unsupported_executable(argv, request_id):
             return
         rule = self.policy.blocked_by(argv)
         if rule is not None:
@@ -3497,7 +3558,16 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return {"closed": True}
         return None
 
-    def _handle_github_refresh(self) -> None:
+    def _handle_forge_refresh(self) -> None:
+        """Refresh the credential for one repository on one forge.
+
+        The provider is a body field with a default, not a path segment, which
+        is the whole reason `/v1/forge/refresh` replaces `/v1/github/refresh`:
+        a path per forge means the route table grows with the roster and an
+        agent image has to know which routes its sidecar serves. A request
+        arriving on the legacy path names no provider and means GitHub, so the
+        two paths converge here rather than being two handlers.
+        """
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
             if content_length <= 0 or content_length > self.max_request_bytes:
@@ -3506,6 +3576,18 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             repository = payload["repository"]
             if not is_valid_repository(repository):
                 raise ValueError("repository must be owner/name")
+            provider = str(payload.get("provider") or forge_clis.DEFAULT_FORGE_PROVIDER)
+            provider = provider.strip().lower()
+            if provider not in forge_clis.configured_providers():
+                # Named in the reply, unlike every other failure here. This one
+                # is a misconfiguration rather than a broker fault: the agent
+                # asked for a forge this install does not serve, and the caller
+                # is the only place that can be fixed. It reveals nothing the
+                # caller did not just send.
+                raise ValueError(f"provider {provider!r} is not configured")
+            refresher = FORGE_REFRESHERS.get(provider)
+            if not refresher:
+                raise ValueError(f"provider {provider!r} has no credential refresher")
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
             return
@@ -3514,13 +3596,15 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            result = self.executor.execute_internal(
-                ["/opt/defaults/scripts/github_token_refresh.py", repository]
-            )
+            result = self.executor.execute_internal([refresher, repository])
         except Exception as exc:
-            LOGGER.warning("GitHub credential refresh failed: %s", type(exc).__name__)
+            LOGGER.warning(
+                "credential refresh failed provider=%s error=%s",
+                _sanitize_for_logging(provider),
+                type(exc).__name__,
+            )
             self._json(
-                HTTPStatus.BAD_GATEWAY, {"error": "GitHub credential refresh failed"}
+                HTTPStatus.BAD_GATEWAY, {"error": "forge credential refresh failed"}
             )
             return
         if result.exit_code != 0:
@@ -3541,12 +3625,13 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
             # in half by the slice is not what survives.
             detail = redact_credentials(result.stderr.strip())
             LOGGER.warning(
-                "GitHub credential refresh exited %d%s",
+                "credential refresh exited provider=%s code=%d%s",
+                _sanitize_for_logging(provider),
                 result.exit_code,
                 f": {detail[:1000]}" if detail else "",
             )
             self._json(
-                HTTPStatus.BAD_GATEWAY, {"error": "GitHub credential refresh failed"}
+                HTTPStatus.BAD_GATEWAY, {"error": "forge credential refresh failed"}
             )
             return
         self._json(HTTPStatus.OK, {"status": "refreshed"})

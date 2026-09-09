@@ -6025,3 +6025,82 @@ func TestManagedEnvValuesCannotSmuggleALine(t *testing.T) {
 		t.Errorf("expected exactly one KUBEAGENTS_MODE line, got %d:\n%s", modeLines, rendered)
 	}
 }
+
+// TestBuildGitopsStateConfigMapCarriesTheDeclaredProvider covers the state
+// ConfigMap half of docs/designs/multi-forge-support.md §6: the entry's `type`
+// is the provider that was declared, and a repository on a host the provider
+// does not serve seeds nothing rather than being rewritten onto a host it does.
+func TestBuildGitopsStateConfigMapCarriesTheDeclaredProvider(t *testing.T) {
+	const githubEntry = `[{"type":"github","url":"https://github.com/gke-labs/kube-agents"}]`
+
+	cases := []struct {
+		name string
+		spec agentv1alpha1.IntegrationSpec
+		want string
+	}{
+		{
+			name: "git spelling",
+			spec: agentv1alpha1.IntegrationSpec{Git: &agentv1alpha1.GitSpec{
+				Provider: "github", Namespace: "gke-labs", Repository: "kube-agents"}},
+			want: githubEntry,
+		},
+		{
+			name: "git spelling with the provider defaulted",
+			spec: agentv1alpha1.IntegrationSpec{Git: &agentv1alpha1.GitSpec{
+				Repository: "https://github.com/gke-labs/kube-agents.git"}},
+			want: githubEntry,
+		},
+		{
+			// The two spellings must seed the identical entry, or the deprecated
+			// alias is a second code path rather than an alias.
+			name: "deprecated github alias",
+			spec: agentv1alpha1.IntegrationSpec{GitHub: &agentv1alpha1.GitHubSpec{
+				Org: "gke-labs", GitRepo: "kube-agents"}},
+			want: githubEntry,
+		},
+		{
+			// Before this change the operator wrote
+			// {"type":"github","url":"https://github.com/group/project"} here: the
+			// host was discarded, the two remaining slashes passed the shape check,
+			// and the URL was rebuilt against github.com. The agent then had a
+			// registered repository nobody had declared.
+			name: "an scp remote on another forge seeds nothing",
+			spec: agentv1alpha1.IntegrationSpec{Git: &agentv1alpha1.GitSpec{
+				Repository: "git@gitlab.com:group/project.git"}},
+		},
+		{
+			// The other half of the same defect: CleanRepoURLWithOrg returned an
+			// https URL verbatim, so this seeded a gitlab.com URL under
+			// "type":"github" — an entry whose two fields named different forges.
+			name: "an https URL on another forge seeds nothing",
+			spec: agentv1alpha1.IntegrationSpec{Git: &agentv1alpha1.GitSpec{
+				Repository: "https://gitlab.com/group/project"}},
+		},
+		{
+			name: "both spellings at once seed nothing",
+			spec: agentv1alpha1.IntegrationSpec{
+				Git:    &agentv1alpha1.GitSpec{Repository: "gke-labs/kube-agents"},
+				GitHub: &agentv1alpha1.GitHubSpec{GitRepo: "other-org/other-repo"},
+			},
+		},
+		{
+			name: "the no-repository sentinel seeds nothing",
+			spec: agentv1alpha1.IntegrationSpec{Git: &agentv1alpha1.GitSpec{
+				Repository: agentv1alpha1.NoRepositorySentinel}},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &agentv1alpha1.PlatformAgent{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+				Spec: agentv1alpha1.PlatformAgentSpec{
+					Integration: &agentv1alpha1.PlatformAgentIntegrationSpec{IntegrationSpec: tc.spec},
+				},
+			}
+			if got := buildGitopsStateConfigMap(agent).Data["managed_repos"]; got != tc.want {
+				t.Errorf("managed_repos = %q, expected %q", got, tc.want)
+			}
+		})
+	}
+}

@@ -168,7 +168,10 @@ exceptions and is fail-open, so such a hook must catch internally and decide exp
 
 **Status: implemented** as `agents/platform/scripts/forge.py`.
 
-Seven operations are the complete set this feature needs from a forge:
+Seven operations are the complete set this feature needs from a forge. They are the original seven;
+`multi-forge-support.md` §4 has since added two further groups — opening a change, and the fleet
+audit's issue ledger — so the class below is the PR-conversation subset rather than the whole
+protocol, and by now much the smaller part of it:
 
 ```python
 class ForgeProvider(Protocol):
@@ -191,8 +194,11 @@ the claim check enforces — see step 4 of the worker skill below.
 
 `GitHubProvider` implements it over the proxied `gh`, merging GitHub's three comment endpoints
 (`issues/N/comments`, `pulls/N/comments`, `pulls/N/reviews`) into one normalised list. Selection
-dispatches on the host in `SETTINGS.md`'s `Git Repo:` line. Every provider call goes through one
-`_call()` seam, so a `ProxyForgeProvider` speaking to a future sidecar route drops in without
+dispatches on the host `repo_ref.parse` reads out of the repository value the caller passes: a host
+with no provider registered raises rather than falling back, while a value naming no host at all —
+the bare `owner/name` every caller here passes today, or no repository at all — still selects
+GitHub. `multi-forge-support.md` §3 owns that rule. Every provider call goes through
+one `_call()` seam, so a `ProxyForgeProvider` speaking to a future sidecar route drops in without
 touching anything above it.
 
 Three shapes exist because of a forge that is not GitHub:
@@ -223,9 +229,10 @@ Three shapes exist because of a forge that is not GitHub:
   therefore permanent. The collaborator endpoint's 404 is an answer; any other failure is not, so
   the provider reports it as unknown and the sweep holds the trigger for a tick rather than guessing.
 
-The module also owns the plumbing that would otherwise become a third copy: the `gh` runner, the
-`gh auth status` preflight, and the `Git Repo:` parsing that turns `SETTINGS.md` into an
-`owner/repo`.
+The module also owns the plumbing that would otherwise become a third copy: the `gh` runner and the
+`gh auth status` preflight. Repository parsing was the third such thing until #504 removed the
+`SETTINGS.md` path that fed it; what remains of it lives in `repo_ref.py`, which `forge.py` calls
+rather than reimplements.
 
 ### Five departures from this section, and why
 
@@ -254,9 +261,10 @@ The module also owns the plumbing that would otherwise become a third copy: the 
 ### What a second forge actually costs
 
 The provider protocol makes this feature portable. The stack under it is not — token brokering, the
-sidecar's executable allowlist, the git credential shape and the CRD each name GitHub, and none of
-that is caused by this design. [`multi-forge-support.md`](multi-forge-support.md) owns the full
-account and the order the layers have to be unwound in; this section records only what bears on the
+git credential shape, and the fact that only GitHub is a registered provider all still tie an
+install to GitHub, and none of that is caused by this design.
+[`multi-forge-support.md`](multi-forge-support.md) owns the full account, which layers have since
+been unwound, and the order the rest have to go in; this section records only what bears on the
 protocol above them.
 
 "Bitbucket" is two providers, which is the limit of how far one provider class stretches. Cloud
@@ -392,11 +400,11 @@ marker format, and `handled_node_ids`. Both consumers must agree on all of it ex
 is a plausible owner. Three layers, then: `forge.py` is mechanism, `pr_triggers.py` is policy, the
 gate and the skill are consumers.
 
-One function in it is a deliberate **copy** rather than an import, pinned by an agreement test that
-fails if the original moves: `forge._parse_repo`, from the issue resolver's `resolver.py`. The
-original lives inside a skill, and a module shared by every skill must not import from one. The copy
-and its test are deletable in one move on the day the resolver migrates onto the shared modules,
-which §7 already names as out of scope here.
+One function in it began as a deliberate **copy** rather than an import — `forge._parse_repo`, from
+the issue resolver's `resolver.py` — because the original lived inside a skill and a module shared
+by every skill must not import from one. Both copies and the agreement test that pinned them are
+gone: repository parsing lives in `repo_ref.py`. `forge.py` calls it directly; the skill scripts
+reach it through `gitops_workspace`'s wrappers, which is the same import direction as before.
 
 ### Why the trigger is anchored to the start of the comment
 
@@ -699,7 +707,9 @@ Neither is implemented in this change. What is settled is which one this design 
   design owes.
 - **Migrating `resolver.py`, `audit_report.py` and `submit_suggestion.py` onto the forge module.**
   §2 changes the issue resolver's roster entry and adds a gate beside it; `resolver.py` itself is
-  untouched, and is the forge module's obvious next consumer.
+  untouched, and is the forge module's obvious next consumer. (`submit_suggestion.py` and
+  `audit_report.py` have since migrated under `multi-forge-support.md` §4, which owns the one
+  remaining.)
 - **Gating the seven governance watchdogs.** They fire daily or weekly and do real work every time,
   so there is nothing to gate — the token argument does not apply to them.
 

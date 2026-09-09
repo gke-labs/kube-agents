@@ -19,17 +19,36 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Sequence
-from urllib.parse import urlsplit
 
 # Add scripts directory so gitops_workspace is importable
 sys.path.append("/opt/defaults/scripts")
 sys.path.append("/opt/data/scripts")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-# Ships alongside this script in the same directory, which is sys.path[0] both
+# Ship alongside this script in the same directory, which is sys.path[0] both
 # when the shell runs it and when the credential proxy execs it by absolute path.
+import forge_clis  # noqa: E402 — needs the sys.path lines above
+import repo_ref  # noqa: E402 — needs the sys.path lines above
 import wif_credentials  # noqa: E402 — needs the sys.path lines above
 from credential_proxy_client import authorization_headers  # noqa: E402
+
+#: Must match `credential_proxy.FORGE_REFRESH_PATH`. Not imported from it: that
+#: module runs in the credential sidecar and this one runs in the agent sandbox,
+#: and the point of the split is that the sandbox does not load the broker.
+FORGE_REFRESH_PATH = "/v1/forge/refresh"
+
+#: The route a sidecar built before the rename serves, and the only one it
+#: serves. Tried after the one above when that answers 404 — see the fallback in
+#: `refresh_git_credentials` for why that is safe and why it is GitHub-only.
+LEGACY_GITHUB_REFRESH_PATH = "/v1/github/refresh"
+
+#: The status an HTTP server returns for a route it does not have.
+HTTP_NOT_FOUND = 404
+
+#: The tool that both authenticates to GitHub and, via `auth setup-git`,
+#: installs itself as git's credential helper. Taken from the table the sidecar
+#: enforces so the binary this script shells is one the allowlist admits.
+GITHUB_CLI = forge_clis.FORGE_EXECUTABLES[forge_clis.GITHUB]
 
 
 def log(msg: str):
@@ -171,77 +190,35 @@ def refresh_credentials_once(
     return True
 
 
-# Hosts this refresher will mint a token for. `ssh.github.com` is GitHub's
-# SSH-over-443 endpoint and `www.github.com` is the redirecting alias `git
-# clone` accepts, both naming the same repositories as `github.com`. An
-# enterprise host is deliberately absent: Minty issues tokens for github.com
-# installations only.
-GITHUB_HOSTS = frozenset({"github.com", "www.github.com", "ssh.github.com"})
-
-# scp-like remote syntax — `[user@]host:path` — which is not a URL and so has
-# to be split before the host can be compared.
-_SCP_REMOTE = re.compile(r"^(?:[^/@]+@)?(?P<host>[^/:]+):(?P<path>.+)$")
-
-# One `owner/name` slug, the shape `credential_proxy.is_valid_repository`
-# accepts on the sidecar path. Checked here because the other path — direct to
-# Minty, for the standalone deployments the module docstring names — has no
-# validator downstream, so a deep link's extra segments would be posted as a
-# repository name.
-_REPOSITORY_SEGMENT = re.compile(r"[A-Za-z0-9_.-]+")
-
-
 def github_repo_from_remote(url: str) -> str | None:
     """Return `owner/repo` when `url` is a GitHub remote, else None.
 
-    The host is compared against `GITHUB_HOSTS` after parsing rather than
-    searched for in the raw string: `https://evil.example/github.com/o/r.git`
-    and `https://github.com.evil.example/o/r.git` both contain `github.com`,
-    and a substring check would hand a token request for someone else's
-    repository to Minty.
+    A remote always names a host, so the bare shorthand is refused here even
+    though `repo_ref` parses it: git cannot produce an `origin` of `acme/repo`,
+    and accepting one would let a stray config value stand in for a clone URL.
+
+    The host is compared after parsing rather than searched for in the raw
+    string — `https://evil.example/github.com/o/r.git` and
+    `https://github.com.evil.example/o/r.git` both contain `github.com`, and a
+    substring check would hand a token request for someone else's repository to
+    Minty. `repo_ref` is where that happens now; the log lines here are what
+    keeps a refusal from surfacing only as the caller's "Could not identify
+    target repository 'None'".
     """
-    if "://" in url:
-        parts = urlsplit(url)
-        host, path = parts.hostname, parts.path
-    else:
-        match = _SCP_REMOTE.match(url)
-        if not match:
-            return None
-        host, path = match.group("host"), match.group("path")
-
-    if not host:
+    ref = repo_ref.try_parse(url)
+    if ref is None:
+        log(f"Ignoring git remote: '{url}' is not a repository URL.")
         return None
-    if host.lower() not in GITHUB_HOSTS:
-        # The host, never the URL: a remote can carry `user:token@` in front of
-        # it. Without this an operator whose clone uses an SSH host alias sees
-        # only the caller's "Could not identify target repository 'None'".
-        log(f"Ignoring git remote: host '{host}' is not a GitHub host.")
+    if not ref.host:
+        log(f"Ignoring git remote: '{url}' names no host.")
         return None
-
-    path = path.strip("/")
-    if path.endswith(".git"):
-        path = path[:-4]
-    owner, slash, name = path.partition("/")
-    if (
-        not slash
-        or not _valid_repository_segment(owner)
-        or not _valid_repository_segment(name)
-    ):
-        log(f"Ignoring git remote: path '{path}' is not an owner/repo slug.")
+    if not ref.is_github:
+        log(f"Ignoring git remote: host '{ref.host}' is not a GitHub host.")
         return None
-    return f"{owner}/{name}"
-
-
-def _valid_repository_segment(segment: str) -> bool:
-    """One half of an `owner/name` slug, with the traversal shapes rejected.
-
-    The character class permits `.` and `-`, so it matches `..` and a leading
-    dash as happily as a real name; neither is a repository.
-    """
-    return (
-        _REPOSITORY_SEGMENT.fullmatch(segment) is not None
-        and segment not in (".", "..")
-        and not segment.startswith("-")
-    )
+    if len(ref.segments) != repo_ref.GITHUB_PATH_DEPTH:
+        log(f"Ignoring git remote: path '{ref.path}' is not an owner/repo slug.")
+        return None
+    return ref.path
 
 
 def get_current_git_repo(cwd: str | None = None) -> str | None:
@@ -263,14 +240,26 @@ def get_current_git_repo(cwd: str | None = None) -> str | None:
 def refresh_git_credentials(
     target_repo: str | None = None,
     *,
+    provider: str = forge_clis.DEFAULT_FORGE_PROVIDER,
     max_attempts: int = 3,
     initial_delay: float = 0.5,
     backoff_factor: float = 2.0,
 ) -> str:
-    """Query local Minty, retrieve token, and cache inside git credentials."""
+    """Query local Minty, retrieve token, and cache inside git credentials.
+
+    `provider` names the forge. It travels to the sidecar in the request body
+    on the brokered path, and selects the credential helper on the direct one.
+    Defaulted rather than required because every existing caller means GitHub
+    and this script's own name says so.
+    """
     repository = target_repo.strip().strip("/") if target_repo else get_current_git_repo()
 
-    if not repository or repository.count("/") != 1:
+    # The slash count this replaced counted separators in whatever it was
+    # handed, so `github.com/acme` passed it. The other path out of here —
+    # direct to Minty, for the standalone deployments the module docstring
+    # names — has no validator downstream, so this is the last check before a
+    # value is posted as a repository name.
+    if not repo_ref.is_github_slug(repository):
         raise RuntimeError(
             f"Could not identify target repository '{repository}'. Must be in 'owner/repo' format."
         )
@@ -281,33 +270,88 @@ def refresh_git_credentials(
         # The sidecar manages bounded retries against Minty internally.
         # The client uses a 60s timeout to allow the sidecar's retry budget
         # to finish, and fails fast on any error without re-triggering retries.
-        url = proxy_url.rstrip("/") + "/v1/github/refresh"
-        request = urllib.request.Request(
-            url,
-            data=json.dumps({"repository": repository}).encode("utf-8"),
-            # Empty in the sidecar deployment; carries the caller's projected
-            # ServiceAccount token when the broker runs in its own Pod.
-            headers={"Content-Type": "application/json", **authorization_headers()},
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=60) as response:
-                if response.status == 200:
-                    log(
-                        f"GitHub credentials refreshed in credential sidecar for {repository}."
+        # `/v1/forge/refresh`, with the provider in the body.
+        #
+        # Both images are versioned independently — an operator may pin
+        # `CREDENTIAL_PROXY_IMAGE` to a mirrored digest while the agent tracks a
+        # tag — so each direction of skew has to survive on its own. The sidecar
+        # still serving `/v1/github/refresh` covers an old agent against a new
+        # sidecar; this fallback covers the reverse, where a sidecar that
+        # predates the rename has no route here and answers 404. Without it
+        # every git write path fails until the sidecar rolls.
+        #
+        # Strictly on 404, and strictly for GitHub. A sidecar that serves this
+        # route answers 200, 400 or 502 and never 404, so no genuine refusal is
+        # ever sent twice; and a sidecar old enough to lack the route is old
+        # enough to serve GitHub alone, so retrying another provider's refresh
+        # on the legacy path would mint a GitHub credential for a repository
+        # that is not on GitHub.
+        paths = [FORGE_REFRESH_PATH]
+        if provider == forge_clis.GITHUB:
+            paths.append(LEGACY_GITHUB_REFRESH_PATH)
+
+        last_error: Exception | None = None
+        for index, path in enumerate(paths):
+            request = urllib.request.Request(
+                proxy_url.rstrip("/") + path,
+                data=json.dumps(
+                    {"repository": repository, "provider": provider}
+                ).encode("utf-8"),
+                # Empty in the sidecar deployment; carries the caller's projected
+                # ServiceAccount token when the broker runs in its own Pod.
+                headers={"Content-Type": "application/json", **authorization_headers()},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    if response.status == 200:
+                        log(
+                            f"GitHub credentials refreshed in credential sidecar for {repository}."
+                        )
+                        return ""
+                    raise RuntimeError(
+                        f"Credential sidecar rejected refresh: HTTP {response.status}"
                     )
-                    return ""
-                raise RuntimeError(
-                    f"Credential sidecar rejected refresh: HTTP {response.status}"
+            except urllib.error.HTTPError as exc:
+                last_error = RuntimeError(
+                    f"Credential sidecar failed to refresh GitHub auth: HTTP {exc.code}"
                 )
-        except urllib.error.HTTPError as exc:
-            raise RuntimeError(
-                f"Credential sidecar failed to refresh GitHub auth: HTTP {exc.code}"
-            ) from exc
-        except Exception as exc:
-            raise RuntimeError(
-                f"Credential sidecar failed to refresh GitHub auth: {exc}"
-            ) from exc
+                last_error.__cause__ = exc
+                if exc.code == HTTP_NOT_FOUND and index + 1 < len(paths):
+                    log(
+                        f"Credential sidecar has no {path}; retrying on "
+                        f"{paths[index + 1]} for an older sidecar."
+                    )
+                    continue
+                raise last_error from exc
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Credential sidecar failed to refresh GitHub auth: {exc}"
+                ) from exc
+
+        raise last_error  # unreachable: the loop returns or raises on every path
+
+    # Past this point the script is GitHub's token-acquisition strategy and
+    # nothing else: Minty mints GitHub App installation tokens from a JWT signed
+    # by the App's private key, and `gh auth setup-git` is what makes git use
+    # them. A GitLab group access token needs no minting step, so it gets its own
+    # refresher rather than a branch through this one. Refuse rather than
+    # proceed: the alternative is asking Minty for a GitHub token in the name of
+    # a repository that is not on GitHub.
+    #
+    # This guards the direct path only, and deliberately. Above it the script is
+    # a transport — it forwards whatever provider it was given to the sidecar,
+    # which dispatches to that provider's refresher through
+    # `credential_proxy.FORGE_REFRESHERS` and refuses a provider the install is
+    # not configured for. So in the agent sandbox, where `CREDENTIAL_PROXY_URL`
+    # is always set, a non-GitHub provider is refused there rather than here.
+    # Here is the standalone/legacy deployment, which has no sidecar to dispatch
+    # and would otherwise fall straight into the Minty call below.
+    if provider != forge_clis.GITHUB:
+        raise RuntimeError(
+            f"{Path(__file__).name} refreshes {forge_clis.GITHUB} credentials only; "
+            f"asked for '{provider}'."
+        )
 
     # No CREDENTIAL_PROXY_URL, but a shell sandbox is configured: this is the
     # gateway pod, which holds nothing that can mint. Forward to the sandbox,
@@ -494,13 +538,17 @@ def refresh_git_credentials(
             ) from last_exc
         raise RuntimeError("Token received from Minty is empty")
 
-    # 3. Configure gh CLI authentication and Git credentials
+    # 3. Configure gh CLI authentication and Git credentials.
+    # `auth setup-git` writes `credential.helper = !gh auth git-credential`, so
+    # the credential helper here is a forge's CLI rather than a username and a
+    # URL template a provider could supply. That is why a forge with no CLI
+    # cannot reuse this and needs a helper written for it.
     try:
         env = os.environ.copy()
         env.pop("GITHUB_TOKEN", None)
         env.pop("GH_TOKEN", None)
         subprocess.run(
-            ["gh", "auth", "login", "--with-token"],
+            [GITHUB_CLI, "auth", "login", "--with-token"],
             input=token,
             text=True,
             check=True,
@@ -509,7 +557,7 @@ def refresh_git_credentials(
             env=env,
         )
         subprocess.run(
-            ["gh", "auth", "setup-git"],
+            [GITHUB_CLI, "auth", "setup-git"],
             check=True,
             capture_output=True,
             timeout=15,
