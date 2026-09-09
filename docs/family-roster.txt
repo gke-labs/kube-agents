@@ -30,6 +30,7 @@ agents/cluster/*.md
 agents/cluster/skills/*/SKILL.md
   agents/cluster/skills/gke-observability/SKILL.md
   agents/cluster/skills/gke-reliability/SKILL.md
+  agents/cluster/skills/gke-stall-detection/SKILL.md
   agents/cluster/skills/gke-storage/SKILL.md
   agents/cluster/skills/gke-workload-scaling/SKILL.md
   agents/cluster/skills/gke-workload-security/SKILL.md
