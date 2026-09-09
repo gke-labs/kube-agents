@@ -5,6 +5,7 @@ Run: python3 -m unittest agents.platform.scripts.test_capability_store
 
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -148,6 +149,40 @@ class StoreTest(unittest.TestCase):
             "a set creates the changelog and the lock file and nothing else",
         )
 
+    def test_a_stored_value_the_schema_now_rejects_is_reported_and_reset_not_effective(self):
+        # A release tightened `minimum` after the volume stored 1. The merge kept
+        # the value; it must not run silently, and it must not wedge later sets.
+        tighter = json.loads(json.dumps(SCHEMA))
+        tighter["properties"]["threshold"]["minimum"] = 2
+        seed(self.root, criteria={"threshold": 1, "names": ["a"]}, schema=tighter)
+        got = cs.describe(cs.load(self.root, "demo"))
+        self.assertEqual(got["criteria"]["threshold"], 3, "the schema default stands in")
+        self.assertIn("threshold", got["invalid_keys"])
+        entry = cs.apply_changes(self.root, "demo", {"names": ["b"]}, reason="r", confirmed_by="ops")
+        self.assertEqual(entry["reset"]["threshold"]["value"], 1)
+        self.assertNotIn("threshold", cs.load(self.root, "demo").criteria)
+        # Setting the invalid key itself is an ordinary set, not a reset.
+        entry = cs.apply_changes(self.root, "demo", {"threshold": 5}, reason="r", confirmed_by="ops")
+        self.assertEqual(entry["reset"], {})
+        self.assertEqual(cs.load(self.root, "demo").criteria["threshold"], 5)
+
+    def test_changes_may_arrive_json_encoded(self):
+        seed(self.root)
+        entry = cs.apply_changes(self.root, "demo", '{"threshold": 4}', reason="r", confirmed_by="ops")
+        self.assertEqual(entry["changes"], {"threshold": {"before": 3, "after": 4}})
+        with self.assertRaises(cs.CapabilityError):
+            cs.apply_changes(self.root, "demo", "{not json", reason="r", confirmed_by="ops")
+
+    def test_the_cli_falls_back_to_the_platform_profiles_store(self):
+        machine_home = self.root / "home"
+        store = machine_home / cs.PLATFORM_PROFILE_SUBDIR / cs.CAPABILITIES_DIRNAME
+        seed(store)
+        with patch.dict(os.environ, {cs.HERMES_HOME_ENV: str(machine_home)}, clear=True):
+            self.assertEqual(cs.cli_root(), store)
+        (machine_home / cs.CAPABILITIES_DIRNAME).mkdir()
+        with patch.dict(os.environ, {cs.HERMES_HOME_ENV: str(machine_home)}, clear=True):
+            self.assertEqual(cs.cli_root(), machine_home / cs.CAPABILITIES_DIRNAME, "an existing home store wins")
+
     def test_state_keys_cannot_be_set_and_a_reason_is_required(self):
         seed(self.root)
         with self.assertRaises(cs.CapabilityError):
@@ -204,6 +239,21 @@ class ShippedTemplatesTest(unittest.TestCase):
                     self.assertIn(policy, cs.POLICIES, f"{name}: {key}")
                     self.assertIn(key, cap.schema["properties"], f"{name}: policy for undefined key {key}")
                 self.assertFalse(any(k in cs.STATE_KEYS for k in cap.criteria), f"{name}: template carries state")
+
+    def test_the_procedure_and_the_schema_name_the_same_keys(self):
+        # The SOP reads `criteria.<key>`; a token the schema does not define means
+        # the run silently falls back to the number printed on the page, and a
+        # schema key the SOP never reads is a knob that turns nothing.
+        governance = REPO_ROOT / "agents" / "platform" / "governance"
+        token = re.compile(r"`criteria\.([a-z0-9_]+)`")
+        for name in cs.list_capabilities(SHIPPED):
+            sop = governance / (name.replace("-", "_") + "_sop.md")
+            if not sop.is_file():
+                continue
+            with self.subTest(name):
+                cited = set(token.findall(sop.read_text(encoding="utf-8")))
+                defined = set(cs.load(SHIPPED, name).properties())
+                self.assertEqual(cited, defined)
 
     def test_shipped_defaults_equal_the_schema_defaults(self):
         # The template is the day-one value and the schema's `default` is what a

@@ -23,8 +23,8 @@ the call names who confirmed it. What it cannot: that the named person actually
 saw the before/after — that round-trip is the agent's instruction
 (agents/platform/AGENTS.md), and the changelog records the name so a reader can
 ask. The validator is a deliberately small subset of JSON Schema (type, enum,
-minimum, maximum, items.type, additionalProperties) so this module stays on the
-standard library like the scaffolder that seeds it.
+minimum, maximum, maxLength, items, maxItems, required, additionalProperties) so
+this module stays on the standard library like the scaffolder that seeds it.
 """
 
 from __future__ import annotations
@@ -45,6 +45,10 @@ from profile_scaffold import write_json_atomic  # noqa: E402
 CAPABILITIES_DIR_ENV = "KUBE_AGENTS_CAPABILITIES_DIR"
 HERMES_HOME_ENV = "HERMES_HOME"
 DEFAULT_HERMES_HOME = "/opt/data"
+# Where the Platform Agent's store sits relative to the machine home. The tool
+# runs with HERMES_HOME already at the profile home; the operator CLI usually
+# does not, so it looks here when the bare home holds no capabilities.
+PLATFORM_PROFILE_SUBDIR = "profiles/platform"
 CAPABILITIES_DIRNAME = "capabilities"
 CRITERIA_FILENAME = "criteria.json"
 SCHEMA_FILENAME = "criteria.schema.json"
@@ -84,7 +88,11 @@ MAX_HISTORY_ENTRIES = 50
 # and a changelog line.
 CLI_ACTIONS = ("list", "get", "history")
 
+# The `actor` a changelog entry records when the caller names none.
+DEFAULT_ACTOR = "agent"
+
 # JSON Schema type names this validator understands, mapped to Python.
+NUMERIC_TYPES = ("integer", "number")
 SCHEMA_TYPES: dict[str, tuple[type, ...]] = {
     "string": (str,),
     "integer": (int,),
@@ -228,7 +236,7 @@ def _validate_value(spec: dict[str, Any], value: Any) -> list[str]:
     if isinstance(expected, str) and expected in SCHEMA_TYPES:
         ok = isinstance(value, SCHEMA_TYPES[expected])
         # bool is an int in Python; a schema asking for an integer did not ask for a flag.
-        if expected in ("integer", "number") and isinstance(value, bool):
+        if expected in NUMERIC_TYPES and isinstance(value, bool):
             ok = False
         if not ok:
             return [f"expected {expected}, got {type(value).__name__}"]
@@ -265,11 +273,31 @@ def stale_keys(cap: Capability) -> list[str]:
     return sorted(k for k in cap.criteria if k not in props and k not in STATE_KEYS)
 
 
+def invalid_keys(cap: Capability) -> dict[str, str]:
+    """Stored values the image-owned schema now rejects, by key.
+
+    A release may tighten a bound after the volume stored a value inside the old
+    one. The merge keeps the value; this is what notices. Such a value is not
+    effective — the schema default stands in for it — and the next `set` resets
+    it and says so, rather than refusing every later write on its account.
+    """
+    props = cap.properties()
+    out: dict[str, str] = {}
+    for key, value in cap.criteria.items():
+        spec = props.get(key)
+        if key in STATE_KEYS or not isinstance(spec, dict):
+            continue
+        errors = _validate_value(spec, value)
+        if errors:
+            out[key] = "; ".join(errors)
+    return out
+
+
 def effective_criteria(cap: Capability) -> dict[str, Any]:
-    """Schema defaults with the stored values over them; state and stale keys excluded."""
+    """Schema defaults with the stored values over them; state, stale and invalid keys excluded."""
     out = dict(cap.defaults())
-    stale = set(stale_keys(cap))
-    out.update({k: v for k, v in cap.criteria.items() if k not in STATE_KEYS and k not in stale})
+    excluded = set(stale_keys(cap)) | set(invalid_keys(cap))
+    out.update({k: v for k, v in cap.criteria.items() if k not in STATE_KEYS and k not in excluded})
     return out
 
 
@@ -294,6 +322,7 @@ def describe(cap: Capability) -> dict[str, Any]:
         "keys": keys,
         "policy_default": cap.learning.get("default", DEFAULT_POLICY),
         "stale_keys": stale_keys(cap),
+        "invalid_keys": invalid_keys(cap),
     }
 
 
@@ -304,15 +333,21 @@ def apply_changes(
     *,
     reason: str,
     confirmed_by: str = "",
-    actor: str = "agent",
+    actor: str = DEFAULT_ACTOR,
 ) -> dict[str, Any]:
     """Validate, authorise, and write `changes` onto a capability's criteria.
 
     Returns the changelog entry that was appended. Raises CapabilityError with
     a message the caller can relay verbatim when anything is refused; nothing is
-    written in that case.
+    written in that case. `changes` may arrive JSON-encoded; a model that
+    serialises the object as a string should not lose a turn over it.
     """
     name = _validate_name(name)
+    if isinstance(changes, str):
+        try:
+            changes = json.loads(changes)
+        except ValueError:
+            raise CapabilityError("changes is a string that is not JSON; pass an object of key -> new value")
     if not isinstance(changes, dict) or not changes:
         raise CapabilityError("changes must be a non-empty object of key -> new value")
     if len(changes) > MAX_CHANGES_PER_CALL:
@@ -368,7 +403,11 @@ def _apply_locked(
 
     before = effective_criteria(cap)
     pruned = stale_keys(cap)
-    candidate = {k: v for k, v in cap.criteria.items() if k not in STATE_KEYS and k not in pruned}
+    reset = {k: e for k, e in invalid_keys(cap).items() if k not in changes}
+    candidate = {
+        k: v for k, v in cap.criteria.items()
+        if k not in STATE_KEYS and k not in pruned and k not in reset
+    }
     candidate.update(changes)
     errors = validate(cap.schema, candidate)
     if errors:
@@ -391,6 +430,7 @@ def _apply_locked(
         "reason": reason,
         "changes": {k: {"before": before.get(k), "after": v} for k, v in changes.items()},
         "pruned": {k: cap.criteria[k] for k in pruned},
+        "reset": {k: {"value": cap.criteria[k], "error": e} for k, e in reset.items()},
     }
     write_json_atomic(cap.directory / CRITERIA_FILENAME, stored, sort_keys=True)
     with (cap.directory / CHANGELOG_FILENAME).open("a", encoding="utf-8") as fh:
@@ -415,9 +455,22 @@ def history(root: Path, name: str, limit: int = MAX_HISTORY_ENTRIES) -> list[dic
     return entries[-limit:]
 
 
+def cli_root() -> Path:
+    """The store the CLI reads: the env override, else HERMES_HOME's, else the platform profile's.
+
+    On the gateway HERMES_HOME is the machine home, whose own `capabilities/`
+    does not exist; the Platform Agent's store is one profile down.
+    """
+    root = capabilities_root()
+    if os.environ.get(CAPABILITIES_DIR_ENV) or root.is_dir():
+        return root
+    fallback = root.parent / PLATFORM_PROFILE_SUBDIR / CAPABILITIES_DIRNAME
+    return fallback if fallback.is_dir() else root
+
+
 def main(argv: list[str]) -> int:
     """Tiny read-only CLI for an operator on the gateway."""
-    root = capabilities_root()
+    root = cli_root()
     if len(argv) < 2 or argv[1] not in CLI_ACTIONS:
         print(f"usage: capability_store.py {' | '.join(CLI_ACTIONS)} [<name>]", file=sys.stderr)
         return 2

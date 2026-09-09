@@ -27,8 +27,8 @@ DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
 # What `capability_criteria` accepts as `action`. Kept as a tuple so the tool's
 # error names every option rather than the one the caller mistyped.
 CAPABILITY_ACTIONS = ("list", "get", "set", "history")
-# Recorded as `actor` on every criteria change this server writes, so the
-# changelog can tell the agent's writes from an operator's CLI edits.
+# Recorded as `actor` on every criteria change this server writes, so a
+# changelog reader can tell them from a write by any other caller of the store.
 CAPABILITY_ACTOR = "platform-agent"
 
 # How long `report_to_chat` waits on /v1/cron-reports. That route relays

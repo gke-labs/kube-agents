@@ -37,7 +37,7 @@
       "items": { "type": "string", "maxLength": 128 },
       "maxItems": 256,
       "default": [],
-      "description": "Cluster names this audit leaves out of scope entirely. Each is recorded in scope.skipped with the reason 'excluded by criteria' so the ledger says the omission was chosen."
+      "description": "Cluster names this audit does not audit at all. They appear in neither scope list (a scope.skipped entry would mark every run partial) and the run's report line names how many were excluded; the criteria changelog records who chose it."
     }
   }
 }
