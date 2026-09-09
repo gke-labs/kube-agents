@@ -111,14 +111,10 @@ PLUGIN_BASE_IMAGE: str = "alpine:3.19"
 # GKE nodes are linux/amd64; a mismatch here yields a CrashLoopBackOff, not a build error.
 TARGET_PLATFORM: str = os.environ.get("TARGET_PLATFORM", "linux/amd64")
 
-# Operator Deployment name: Helm release prefixes with release name ('kube-agents-controller-manager');
-OPERATOR_DEPLOYMENT_HELM: str = "kube-agents-controller-manager"
-OPERATOR_DEPLOYMENT_KUSTOMIZE: str = "kubeagents-controller-manager"
-OPERATOR_POD_SELECTOR_HELM: str = "app.kubernetes.io/name=kube-agents-operator"
-OPERATOR_POD_SELECTOR_KUSTOMIZE: str = "control-plane=controller-manager"
-OPERATOR_DEPLOYMENT: str = OPERATOR_DEPLOYMENT_HELM
+# Operator label contract: both Helm and Kustomize label the operator Deployment
+# and its pod template with 'app.kubernetes.io/name=kube-agents-operator'.
+OPERATOR_LABEL_SELECTOR: str = "app.kubernetes.io/name=kube-agents-operator"
 OPERATOR_CONTAINER_NAME: str = "manager"
-OPERATOR_RESOLUTION_TIMEOUT_SEC: int = 30
 OPERATOR_POD_POLL_TIMEOUT_SEC: int = 30
 OPERATOR_PROBE_TIMEOUT_SEC: int = 15
 DEFAULT_ROLLOUT_TIMEOUT_SEC: int = 180
@@ -563,34 +559,32 @@ def poll_pod_logs(
     return pod_name, logs
 
 
-def get_operator_deployment(timeout_sec: int = OPERATOR_RESOLUTION_TIMEOUT_SEC) -> str:
+def get_operator_deployment() -> str:
     """Resolve active operator deployment name across Helm and Kustomize installations."""
     env_override = os.environ.get("OPERATOR_DEPLOYMENT")
     if env_override:
         return env_override
 
-    candidates = [OPERATOR_DEPLOYMENT_HELM, OPERATOR_DEPLOYMENT_KUSTOMIZE]
-    deadline = time.time() + timeout_sec
-    while time.time() < deadline:
-        for name in candidates:
-            res = run_kubectl(["get", "deployment", name, "-n", NAMESPACE], check=False, capture_output=True)
-            if res.returncode == 0:
-                return name
-        time.sleep(API_POLL_INTERVAL_SEC)
-    return OPERATOR_DEPLOYMENT_HELM
+    name = get_kubectl_output([
+        "get", "deployment", "-n", NAMESPACE,
+        "-l", OPERATOR_LABEL_SELECTOR,
+        "-o", "jsonpath={.items[0].metadata.name}",
+    ]).strip()
+    if name:
+        return name
+    raise AssertionError(
+        f"No operator deployment with label '{OPERATOR_LABEL_SELECTOR}' found in namespace '{NAMESPACE}'"
+    )
 
 
 def poll_operator_pod(expected_image: str = "", timeout_sec: int = OPERATOR_POD_POLL_TIMEOUT_SEC) -> str:
-    """Poll Kubernetes API for running operator pod matching Helm or Kustomize label selectors."""
-    selectors = [OPERATOR_POD_SELECTOR_HELM, OPERATOR_POD_SELECTOR_KUSTOMIZE]
-    deadline = time.time() + timeout_sec
-    while time.time() < deadline:
-        for sel in selectors:
-            pod_name = poll_pod_with_image(sel, OPERATOR_CONTAINER_NAME, expected_image=expected_image, timeout_sec=API_POLL_INTERVAL_SEC)
-            if pod_name:
-                return pod_name
-        time.sleep(1)
-    return ""
+    """Poll Kubernetes API for running operator pod matching the operator label selector."""
+    return poll_pod_with_image(
+        OPERATOR_LABEL_SELECTOR,
+        OPERATOR_CONTAINER_NAME,
+        expected_image=expected_image,
+        timeout_sec=timeout_sec,
+    )
 
 
 def wait_deployment_rollout(deployment_name: str, timeout: str = f"{DEFAULT_ROLLOUT_TIMEOUT_SEC}s") -> None:

@@ -18,85 +18,52 @@ class AgentPluginsE2EHelpersTest(unittest.TestCase):
     def test_get_operator_deployment_honors_env_override(self):
         """When OPERATOR_DEPLOYMENT env var is set, return it directly without kubectl."""
         with patch.dict(os.environ, {"OPERATOR_DEPLOYMENT": "custom-operator-manager"}):
-            with patch.object(e2e, "run_kubectl") as mock_kubectl:
-                name = e2e.get_operator_deployment(timeout_sec=5)
+            with patch.object(e2e, "get_kubectl_output") as mock_kubectl:
+                name = e2e.get_operator_deployment()
                 self.assertEqual(name, "custom-operator-manager")
                 mock_kubectl.assert_not_called()
 
-    def test_get_operator_deployment_resolves_helm_first(self):
-        """When Helm deployment exists, resolve to Helm deployment name."""
+    def test_get_operator_deployment_resolves_via_label(self):
+        """When OPERATOR_DEPLOYMENT is not set, resolve via operator label selector."""
         with patch.dict(os.environ, {}, clear=True):
             if "OPERATOR_DEPLOYMENT" in os.environ:
                 del os.environ["OPERATOR_DEPLOYMENT"]
 
-            def mock_run_kubectl(cmd, check=True, capture_output=False):
-                mock_res = MagicMock()
-                if cmd[2] == e2e.OPERATOR_DEPLOYMENT_HELM:
-                    mock_res.returncode = 0
-                else:
-                    mock_res.returncode = 1
-                return mock_res
+            with patch.object(e2e, "get_kubectl_output", return_value="kube-agents-controller-manager\n") as mock_out:
+                name = e2e.get_operator_deployment()
+                self.assertEqual(name, "kube-agents-controller-manager")
+                mock_out.assert_called_once_with([
+                    "get", "deployment", "-n", e2e.NAMESPACE,
+                    "-l", e2e.OPERATOR_LABEL_SELECTOR,
+                    "-o", "jsonpath={.items[0].metadata.name}",
+                ])
 
-            with patch.object(e2e, "run_kubectl", side_effect=mock_run_kubectl):
-                name = e2e.get_operator_deployment(timeout_sec=5)
-                self.assertEqual(name, e2e.OPERATOR_DEPLOYMENT_HELM)
-
-    def test_get_operator_deployment_resolves_kustomize_fallback(self):
-        """When Helm deployment does not exist but Kustomize does, resolve to Kustomize."""
+    def test_get_operator_deployment_raises_when_not_found(self):
+        """When no deployment matches the label selector, raise AssertionError."""
         with patch.dict(os.environ, {}, clear=True):
             if "OPERATOR_DEPLOYMENT" in os.environ:
                 del os.environ["OPERATOR_DEPLOYMENT"]
 
-            def mock_run_kubectl(cmd, check=True, capture_output=False):
-                mock_res = MagicMock()
-                if cmd[2] == e2e.OPERATOR_DEPLOYMENT_KUSTOMIZE:
-                    mock_res.returncode = 0
-                else:
-                    mock_res.returncode = 1
-                return mock_res
+            with patch.object(e2e, "get_kubectl_output", return_value=""):
+                with self.assertRaises(AssertionError) as ctx:
+                    e2e.get_operator_deployment()
+                self.assertIn("No operator deployment with label", str(ctx.exception))
 
-            with patch.object(e2e, "run_kubectl", side_effect=mock_run_kubectl):
-                name = e2e.get_operator_deployment(timeout_sec=5)
-                self.assertEqual(name, e2e.OPERATOR_DEPLOYMENT_KUSTOMIZE)
-
-    def test_get_operator_deployment_timeout_defaults_to_helm(self):
-        """When neither deployment is found before timeout, default to Helm name."""
-        with patch.dict(os.environ, {}, clear=True):
-            if "OPERATOR_DEPLOYMENT" in os.environ:
-                del os.environ["OPERATOR_DEPLOYMENT"]
-
-            mock_res = MagicMock(returncode=1)
-            with patch.object(e2e, "run_kubectl", return_value=mock_res), \
-                 patch("time.sleep", return_value=None):
-                name = e2e.get_operator_deployment(timeout_sec=0)
-                self.assertEqual(name, e2e.OPERATOR_DEPLOYMENT_HELM)
-
-    def test_poll_operator_pod_matches_helm_selector(self):
-        """When Helm pod selector matches, return the pod name."""
-        def mock_poll_pod(selector, container, expected_image="", timeout_sec=2):
-            if selector == e2e.OPERATOR_POD_SELECTOR_HELM:
-                return "kube-agents-controller-manager-abc-123"
-            return ""
-
-        with patch.object(e2e, "poll_pod_with_image", side_effect=mock_poll_pod):
+    def test_poll_operator_pod_matches_operator_label_selector(self):
+        """poll_operator_pod polls pod matching OPERATOR_LABEL_SELECTOR."""
+        with patch.object(e2e, "poll_pod_with_image", return_value="kube-agents-controller-manager-abc-123") as mock_poll:
             pod = e2e.poll_operator_pod(timeout_sec=5)
             self.assertEqual(pod, "kube-agents-controller-manager-abc-123")
-
-    def test_poll_operator_pod_matches_kustomize_selector_fallback(self):
-        """When Helm selector does not match but Kustomize selector does, return the pod name."""
-        def mock_poll_pod(selector, container, expected_image="", timeout_sec=2):
-            if selector == e2e.OPERATOR_POD_SELECTOR_KUSTOMIZE:
-                return "kubeagents-controller-manager-xyz-456"
-            return ""
-
-        with patch.object(e2e, "poll_pod_with_image", side_effect=mock_poll_pod):
-            pod = e2e.poll_operator_pod(timeout_sec=5)
-            self.assertEqual(pod, "kubeagents-controller-manager-xyz-456")
+            mock_poll.assert_called_once_with(
+                e2e.OPERATOR_LABEL_SELECTOR,
+                e2e.OPERATOR_CONTAINER_NAME,
+                expected_image="",
+                timeout_sec=5,
+            )
 
     def test_poll_operator_pod_timeout_returns_empty(self):
-        """When no operator pod matches any selector, return empty string on timeout."""
-        with patch.object(e2e, "poll_pod_with_image", return_value=""), \
-             patch("time.sleep", return_value=None):
+        """When no operator pod matches the selector, return empty string on timeout."""
+        with patch.object(e2e, "poll_pod_with_image", return_value=""):
             pod = e2e.poll_operator_pod(timeout_sec=0)
             self.assertEqual(pod, "")
 

@@ -195,14 +195,15 @@ This test suite performs a 17-step end-to-end verification of the `AgentPlugin` 
 
 ### Environment variables:
 
-| Variable          | Required | Purpose                                                                              |
-| ----------------- | -------- | ------------------------------------------------------------------------------------ |
-| `KUBE_CONTEXT`    | Yes      | `kubectl` context of the target cluster.                                             |
-| `NAMESPACE`       | Yes      | Namespace holding the operator and `PlatformAgent`.                                  |
-| `REGISTRY`        | Yes      | Registry prefix for the operator and plugin images.                                  |
-| `IMAGE_BUILDER`   | No       | `docker` (default) or `crane`. See below.                                            |
-| `CRANE_BIN`       | No       | Path to the `crane` binary. Only used by `IMAGE_BUILDER=crane`. Defaults to `crane`. |
-| `TARGET_PLATFORM` | No       | Platform for `crane` builds. Defaults to `linux/amd64`, matching GKE nodes.          |
+| Variable              | Required | Purpose                                                                                                               |
+| --------------------- | -------- | --------------------------------------------------------------------------------------------------------------------- |
+| `KUBE_CONTEXT`        | Yes      | `kubectl` context of the target cluster.                                                                              |
+| `NAMESPACE`           | Yes      | Namespace holding the operator and `PlatformAgent`.                                                                   |
+| `REGISTRY`            | Yes      | Registry prefix for the operator and plugin images.                                                                   |
+| `IMAGE_BUILDER`       | No       | `docker` (default) or `crane`. See below.                                                                             |
+| `CRANE_BIN`           | No       | Path to the `crane` binary. Only used by `IMAGE_BUILDER=crane`. Defaults to `crane`.                                  |
+| `TARGET_PLATFORM`     | No       | Platform for `crane` builds. Defaults to `linux/amd64`, matching GKE nodes.                                           |
+| `OPERATOR_DEPLOYMENT` | No       | Deployment name for the operator. Defaults to auto-discovery via label `app.kubernetes.io/name=kube-agents-operator`. |
 
 ### Choosing an image builder
 
@@ -243,7 +244,7 @@ On a host without a Docker daemon, add `IMAGE_BUILDER=crane`.
 
 ### 17-Step Verification Workflow:
 
-1. **Rebuild & Deploy Operator**: Compiles `k8s-operator` binary, builds the container image, pushes to registry, applies CRDs, and deploys `kube-agents-controller-manager` (or `kubeagents-controller-manager` under Kustomize).
+1. **Rebuild & Deploy Operator**: Compiles `k8s-operator` binary, builds the container image, pushes to registry, applies CRDs, and deploys the operator Deployment (discovered via label `app.kubernetes.io/name=kube-agents-operator`, or overridden with `OPERATOR_DEPLOYMENT`).
 2. **Verify Operator Version**: Confirms controller manager pod image tag matches the newly pushed build.
 3. **Build & Push OCI Plugin Image**: Packages example plugin assets into an OCI container image with a unique build ID.
 4. **Deploy AgentPlugin CR**: Deploys targeted `AgentPlugin` CR with `agentRef: "platform-agent"`, allowed `approvals` configuration subtree, disallowed config keys, and `imagePullPolicy: Always`.
