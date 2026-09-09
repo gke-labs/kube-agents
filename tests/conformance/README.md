@@ -244,9 +244,9 @@ python3 hack/conformance-mutations.py --list
 python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 ```
 
-80 mutations: 61 KILLED, 17 NOISY, two `must_survive` controls (one on the
+82 mutations: 63 KILLED, 17 NOISY, two `must_survive` controls (one on the
 harness itself, one pinning a deliberate redundancy in the shorthand
-handling), zero genuine survivors, zero stale — measured 2026-09-08 against
+handling), zero genuine survivors, zero stale — measured 2026-09-09 against
 `main`; re-run the harness rather than trusting these numbers, which is the
 sentence this paragraph exists to make cheap. Each names the control
 it removes, the test that must notice, and the plausible bad change it
