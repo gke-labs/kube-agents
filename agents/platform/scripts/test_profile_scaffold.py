@@ -501,12 +501,12 @@ class CapabilityCriteriaMergeTest(unittest.TestCase):
         self.overlay()
         self.assertEqual(self.read("criteria.json"), {"threshold": 7, "_revision": 4, "new_key": "shipped"})
 
-    def test_learning_policy_follows_the_same_rule(self):
+    def test_the_learning_policy_is_the_images_to_tighten(self):
+        # A volume-wins learning.json would let a loosened policy outlive every
+        # release that tried to tighten it; the image replaces it outright.
         write(self.home / self.CAP / "learning.json", json.dumps({"keys": {"threshold": "autonomous"}}))
         self.overlay()
-        self.assertEqual(
-            self.read("learning.json"), {"default": "propose", "keys": {"threshold": "autonomous"}}
-        )
+        self.assertEqual(self.read("learning.json"), {"default": "propose", "keys": {}})
 
     def test_the_schema_and_the_changelog_are_left_to_their_owners(self):
         write(self.home / self.CAP / "criteria.schema.json", json.dumps({"v": 1}))

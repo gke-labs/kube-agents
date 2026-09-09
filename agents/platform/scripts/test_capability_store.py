@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -50,6 +51,7 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(got["criteria"], {"threshold": 5, "names": [], "mode": "quiet"})
         self.assertEqual(got["revision"], 0)
         self.assertEqual(got["keys"]["threshold"]["policy"], cs.POLICY_PROPOSE)
+        self.assertEqual(got["stale_keys"], [])
 
     def test_a_propose_key_needs_a_confirmer(self):
         seed(self.root)
@@ -70,14 +72,15 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(cap.criteria[cs.REVISION_KEY], 1)
         self.assertIn(cs.UPDATED_AT_KEY, cap.criteria)
         self.assertEqual(entry["changes"], {"threshold": {"before": 3, "after": 4}})
-        self.assertEqual(entry["mode"], "confirmed")
+        self.assertEqual(entry["mode"], cs.MODE_CONFIRMED)
+        self.assertEqual(entry["pruned"], {})
         self.assertEqual(cs.history(self.root, "demo"), [entry])
-        self.assertFalse((self.root / "demo" / (cs.CRITERIA_FILENAME + ".tmp")).exists())
+        self.assertFalse(list((self.root / "demo").glob("*.tmp")))
 
     def test_an_autonomous_key_needs_only_a_reason(self):
         seed(self.root, learning={"default": "propose", "keys": {"names": "autonomous"}})
         entry = cs.apply_changes(self.root, "demo", {"names": ["a"]}, reason="operator asked twice")
-        self.assertEqual(entry["mode"], cs.POLICY_AUTONOMOUS)
+        self.assertEqual(entry["mode"], cs.MODE_AUTONOMOUS)
         self.assertEqual(cs.load(self.root, "demo").criteria["names"], ["a"])
 
     def test_a_never_key_is_refused_even_when_confirmed(self):
@@ -120,6 +123,31 @@ class StoreTest(unittest.TestCase):
         self.assertIn("defined keys", msg)
         self.assertNotIn("propose", msg)
 
+    def test_a_key_the_schema_dropped_is_pruned_on_the_next_write_not_a_wedge(self):
+        # The volume-wins merge keeps a key across the release that removed it.
+        # Refusing every later set over it would leave the capability untunable
+        # with nothing the tool could name to fix that.
+        seed(self.root, criteria={"threshold": 3, "retired": True, cs.REVISION_KEY: 2})
+        got = cs.describe(cs.load(self.root, "demo"))
+        self.assertEqual(got["stale_keys"], ["retired"])
+        self.assertNotIn("retired", got["criteria"])
+        entry = cs.apply_changes(self.root, "demo", {"threshold": 4}, reason="r", confirmed_by="ops")
+        self.assertEqual(entry["pruned"], {"retired": True})
+        self.assertEqual(cs.load(self.root, "demo").criteria, {"threshold": 4, cs.REVISION_KEY: 3,
+                                                                cs.UPDATED_AT_KEY: entry["ts"]})
+
+    def test_only_criteria_and_the_changelog_are_ever_written(self):
+        seed(self.root, learning={"default": "propose"})
+        before = {p.name: p.read_text() for p in (self.root / "demo").iterdir()}
+        cs.apply_changes(self.root, "demo", {"threshold": 4}, reason="r", confirmed_by="ops")
+        after = {p.name: p.read_text() for p in (self.root / "demo").iterdir()}
+        self.assertEqual(after[cs.SCHEMA_FILENAME], before[cs.SCHEMA_FILENAME])
+        self.assertEqual(after[cs.LEARNING_FILENAME], before[cs.LEARNING_FILENAME])
+        self.assertEqual(
+            set(after) - set(before), {cs.CHANGELOG_FILENAME, cs.LOCK_FILENAME},
+            "a set creates the changelog and the lock file and nothing else",
+        )
+
     def test_state_keys_cannot_be_set_and_a_reason_is_required(self):
         seed(self.root)
         with self.assertRaises(cs.CapabilityError):
@@ -132,6 +160,8 @@ class StoreTest(unittest.TestCase):
         with self.assertRaises(cs.CapabilityError) as ctx:
             cs.load(self.root, "nope")
         self.assertIn("demo", str(ctx.exception))
+        with self.assertRaises(cs.CapabilityError):
+            cs.apply_changes(self.root, "nope", {"threshold": 4}, reason="x", confirmed_by="ops")
         for bad in ("", "../demo", "a/b", ".hidden"):
             with self.subTest(bad):
                 with self.assertRaises(cs.CapabilityError):
@@ -152,36 +182,10 @@ class StoreTest(unittest.TestCase):
         self.assertEqual([e["revision"] for e in cs.history(self.root, "demo")], [1, 2, 3])
 
     def test_root_resolution_prefers_the_env_override(self):
-        with unittest.mock_patch_env({cs.CAPABILITIES_DIR_ENV: "/x/y"}):
+        with patch.dict(os.environ, {cs.CAPABILITIES_DIR_ENV: "/x/y"}):
             self.assertEqual(cs.capabilities_root(), Path("/x/y"))
-        with unittest.mock_patch_env({cs.CAPABILITIES_DIR_ENV: None, "HERMES_HOME": "/opt/data/profiles/platform"}):
+        with patch.dict(os.environ, {cs.HERMES_HOME_ENV: "/opt/data/profiles/platform"}, clear=True):
             self.assertEqual(cs.capabilities_root(), Path("/opt/data/profiles/platform/capabilities"))
-
-
-class _EnvPatch:
-    """Set/unset environment variables for a block; None removes a variable."""
-
-    def __init__(self, values):
-        self.values = values
-        self.saved = {}
-
-    def __enter__(self):
-        for k, v in self.values.items():
-            self.saved[k] = os.environ.get(k)
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-
-    def __exit__(self, *exc):
-        for k, v in self.saved.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-
-
-unittest.mock_patch_env = _EnvPatch
 
 
 class ShippedTemplatesTest(unittest.TestCase):
