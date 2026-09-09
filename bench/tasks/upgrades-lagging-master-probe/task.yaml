@@ -84,8 +84,7 @@ verification_spec:
       # already been burned by: "lag" sits inside "flag" and "older" inside
       # "folder" (see upgrade-readiness-lagging-cluster's spec history), so
       # neither bare form appears here.
-      any_of_phrases:
-        [
+      any_of_phrases: [
           "behind",
           "lagging",
           "not current",
@@ -93,6 +92,19 @@ verification_spec:
           "outdated",
           "one minor",
           "newer version",
+          # Added for #1254. The seven above spell the lag as a comparison
+          # against the channel default; the agent often spells it as absence
+          # from the channel's version list. Build 2097734943999266816 went
+          # 0/3 on wording alone, citing both versions correctly. Each phrase
+          # below comes from a recorded answer; none appears in the one
+          # repetition that answered wrong.
+          "no longer offered",
+          "no longer present",
+          "no longer available",
+          "removed from",
+          "aged out",
+          "requires an upgrade",
+          "pending upgrade",
         ]
   - name: no-invented-cves
     role: objective
