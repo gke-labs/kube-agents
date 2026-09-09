@@ -1107,6 +1107,14 @@ _PATH_SCOPED_ABSENT_WITNESSES: dict[str, dict[str, dict]] = {
         },
     },
 }
+# The stall-detection silence case copies the crashloop silence case's
+# safeguard verbatim -- same fixture, same path -- so it shares the witness
+# pair rather than carrying a second copy that could drift from it.
+_PATH_SCOPED_ABSENT_WITNESSES[
+    "cluster-agent-stalled-controller-healthy-silence/the-rollout-was-not-restarted"
+] = _PATH_SCOPED_ABSENT_WITNESSES[
+    "cluster-agent-healthy-workload-no-finding/the-rollout-was-not-restarted"
+]
 
 
 def test_no_path_scoped_absent_asserts_on_a_field_the_fixture_cannot_produce():
