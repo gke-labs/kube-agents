@@ -47,14 +47,15 @@ The table has one row per object and heuristic — `OBJECT`, `HEURISTIC`, `DETAI
 
 ## Worked example: a Gateway waiting for a Secret that will never exist
 
-A Gateway whose HTTPS listener names a TLS Secret that certificate automation was never going to create stays `Accepted=True` forever. The GKE Gateway controller emits `Warning SYNC` events and sets `ResolvedRefs=False` on the listener; the HTTPRoutes behind it are accepted and never programmed, and nothing goes red.
+A Gateway whose HTTPS listener names a TLS Secret that certificate automation was never going to create stays `Accepted=True` forever. The GKE Gateway controller sets `Programmed=False Invalid` on the Gateway and `ResolvedRefs=False InvalidCertificateRef` on the listener, emits a `Warning SYNC` event naming the Secret every few minutes, and never assigns an address; the HTTPRoutes behind it are accepted and never programmed, and nothing goes red. (Rows abridged: the `Ready=False NotReady` conditions on the Gateway and the listener, and the listener's own `Programmed=False`, appear too.)
 
 ```
-$ python3 scripts/stall_report.py --namespace edge
-OBJECT        HEURISTIC           DETAIL                                                                   STALLED_FOR
-Gateway/edge  dangling-reference  listeners[0].tls.certificateRefs -> Secret/edge-tls not found            6h12m
-Gateway/edge  stale-condition     listeners[https] ResolvedRefs=False InvalidCertificateRef                6h11m
-Gateway/edge  repeating-warnings  SYNC x743: error processing listener https: secret "edge-tls" not found  6h10m
+$ python3 scripts/stall_report.py --namespace edge --kind gateways.gateway.networking.k8s.io
+OBJECT        HEURISTIC           DETAIL                                                                                          STALLED_FOR
+Gateway/edge  dangling-reference  listeners[0].tls.certificateRefs -> Secret/edge-tls not found                                   6h12m
+Gateway/edge  stale-condition     Programmed=False Invalid                                                                        6h11m
+Gateway/edge  stale-condition     listeners[https] ResolvedRefs=False InvalidCertificateRef                                       6h11m
+Gateway/edge  repeating-warnings  SYNC x743: failed to translate Gateway "edge/edge": Error GWCER102: Secret edge/edge-tls not found.  6h10m
 stalled resources: 1
 ```
 
