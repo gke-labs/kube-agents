@@ -14,6 +14,9 @@
 
 set -Eeuo pipefail
 
+readonly CMEK_RETRY_ATTEMPTS=6
+readonly CMEK_RETRY_DELAY_SECONDS=5
+
 # ─── ANSI Colors & Terminal Responsive Helpers ─────────────────────────────────
 # A function because scripts/installer/common.sh defines the same variables
 # unconditionally: sourcing it would re-enable colour under NO_COLOR or in a pipe,
@@ -1627,11 +1630,13 @@ ensure_existing_cluster_cmek() {
   print_info "Enabling CMEK database encryption on existing cluster '$cluster_name' (key: $key_resource)..."
   gcloud services enable cloudkms.googleapis.com --project="$project_id"
   if ! gcloud kms keyrings describe "$keyring" --location="$kms_location" --project="$project_id" >/dev/null 2>&1; then
-    retry 6 5 gcloud kms keyrings create "$keyring" --location="$kms_location" --project="$project_id" 2>/dev/null || true
+    retry "$CMEK_RETRY_ATTEMPTS" "$CMEK_RETRY_DELAY_SECONDS" \
+      gcloud kms keyrings create "$keyring" --location="$kms_location" --project="$project_id" 2>/dev/null || true
   fi
   if ! gcloud kms keys describe "$key" --keyring="$keyring" --location="$kms_location" --project="$project_id" >/dev/null 2>&1; then
-    retry 6 5 gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
-      --purpose="encryption" --project="$project_id" 2>/dev/null || true
+    retry "$CMEK_RETRY_ATTEMPTS" "$CMEK_RETRY_DELAY_SECONDS" \
+      gcloud kms keys create "$key" --keyring="$keyring" --location="$kms_location" \
+        --purpose="encryption" --project="$project_id" 2>/dev/null || true
   fi
   if ! gcloud kms keys describe "$key" --keyring="$keyring" --location="$kms_location" --project="$project_id" >/dev/null 2>&1; then
     print_error "Failed to create or verify Cloud KMS key: $key_resource"

@@ -160,7 +160,7 @@ and GitHub minter workloads).
 - **Canonical guide (self-contained):** [`terraform/examples/full-install/README.md`](terraform/examples/full-install/README.md)
 - Drive it through [`lifecycle.sh`](terraform/examples/full-install/lifecycle.sh) rather than bare
   `terraform` commands: `apply` adopts the Cloud KMS resources GCP refuses to delete and any Pub/Sub
-  topic or subscription that already exists, `destroy` handles the four teardown asymmetries a bare
+  topic or subscription that already exists, `destroy` handles the teardown asymmetries a bare
   `terraform destroy` trips over, and `plan` reports what an apply would change while creating
   nothing.
 - The composition installs `cert-manager` automatically (`enable_cert_manager`, default true), so
@@ -620,11 +620,12 @@ cd terraform/examples/full-install
 KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh destroy
 ```
 
-`destroy` handles the four asymmetries a bare `terraform destroy` trips over: it deletes the
+`destroy` handles the teardown asymmetries a bare `terraform destroy` trips over: it deletes the
 PlatformAgent CR up front (force-clearing a wedged finalizer), purges the backups a BackupPlan
-still owns, clears the cluster's deletion protection, and forgets the undeletable Cloud KMS
-resources from state so their key versions are never scheduled for destruction — the next
-`lifecycle.sh apply` adopts them back automatically.
+still owns, clears the cluster's deletion protection, forgets adopted pre-existing service accounts
+from state so their identities are preserved in GCP, and forgets the undeletable Cloud KMS resources
+from state so their key versions are never scheduled for destruction — the next `lifecycle.sh apply`
+adopts them back automatically.
 
 With **no Terraform state** (none in the GCS bucket, none locally), `uninstall.sh` says so and
 stops with exit **3**, touching nothing. Either nothing is installed against those coordinates,
