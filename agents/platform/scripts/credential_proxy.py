@@ -1274,7 +1274,21 @@ def _cluster_readings(token: str) -> tuple[list[str], bool]:
     free-text exemption. Returning it separately rather than folding it into
     `readings` is what lets the callers do that instead of re-adding the
     element as a bare word.
+
+    A token whose *first* shorthand takes a value has no cluster to read.
+    pflag and parse-options hand everything after `-F` to `-F`, so the
+    letters of `-Fbody.md` are a file name and not `-b`, and the letters of
+    `-fmerge_method=squash` are a field and not `-m`. Walking them anyway
+    reported a free-text member for any value beginning with `b`, `m` or
+    `t`, and `argv_path_violation` then skipped the token without testing
+    the value as the path it opens -- `gh pr create -Fbody.md`, with
+    `body.md` a symlink the runner planted to the mounted credential,
+    published it. Both callers already hold that value without any reading
+    from here: `policy_match_text` has split it off as `token[2:]`, and
+    `_attached_shorthand_values` returns it.
     """
+    if token[:2] in _VALUE_TAKING_SHORTHANDS:
+        return [], False
     readings: list[str] = []
     seen: set[str] = set()
     # From 2: `token[0]` is the dash and `token[1]` is the shorthand the caller
@@ -2735,6 +2749,10 @@ class CommandExecutor:
         tested as a path, so `git commit -am 'fix: ../../../etc/passwd
         traversal'` was refused while the identical detached spelling was
         allowed -- the outcome the paragraph above says this must not have.
+        The cluster reading stops short of a token whose first shorthand
+        takes a value: `-Fbody.md` is `-F body.md`, not `-F -b ody.md`, and
+        reading it as a cluster skipped the token -- and the path after the
+        `F` -- whenever the value happened to begin with a free-text letter.
 
         What existence does not close is the gap between checking and running,
         and nothing here ever did: a token naming nothing yet is allowed, the

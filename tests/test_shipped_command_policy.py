@@ -639,6 +639,37 @@ class TheRulesReadCommandsNotProse(ShippedPolicyTest):
             policy_match_text(["git", "clean", "-fdq", "."]),
         )
 
+    def test_a_value_taking_first_shorthand_has_no_cluster_to_read(self):
+        """Everything after `-F`, `-f`, `-X` or `-R` is that flag's value.
+
+        pflag hands the rest of the token to a value-taking shorthand, so the
+        letters of `-fmerge_method=squash` are a field and not `-m`, and the
+        letters of `-Rtoken-org/repo` are a slug and not `-t`. Walking them
+        as a cluster put a free-text flag into the match text that the argv
+        never carried, and then dropped the multi-word element after it as
+        that flag's prose. `argv_path_violation` reads the same walk and
+        skipped the whole token on it -- that half is covered in the proxy's
+        own suite; this one pins the match text.
+        """
+        from credential_proxy import _cluster_readings, policy_match_text
+
+        for token in ("-fmerge_method=squash", "-Fbody.md", "-Rtoken-org/repo", "-Xput"):
+            with self.subTest(token=token):
+                self.assertEqual(([], False), _cluster_readings(token))
+        self.assertEqual(
+            "gh api repos/o/r/pulls/1/merge -f merge_method=squash 'two words'",
+            policy_match_text(
+                ["gh", "api", "repos/o/r/pulls/1/merge", "-fmerge_method=squash", "two words"]
+            ),
+        )
+        self.assertEqual(
+            "gh pr list -R token-org/repo",
+            policy_match_text(["gh", "pr", "list", "-Rtoken-org/repo"]),
+        )
+        # A cluster whose *later* member takes a value is still read: the
+        # boolean in front is consumed and pflag re-enters at the `F`.
+        self.assertEqual((["-F", "body.md"], False), _cluster_readings("-dFbody.md"))
+
     def test_a_cluster_before_a_subcommand_cannot_hide_it(self):
         """The element after a cluster can be a subcommand, so a word stays.
 

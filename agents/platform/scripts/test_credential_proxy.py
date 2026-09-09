@@ -1658,6 +1658,57 @@ class UntrustedWorkspaceTest(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.assertIsNone(executor.argv_path_violation(argv, str(cwd)))
 
+    def test_a_value_taking_first_shorthand_is_not_read_as_a_cluster(self):
+        # `-Fbody.md` is `-F body.md`: pflag hands everything after a
+        # value-taking shorthand to it. `_cluster_readings` walked those
+        # letters as though they were more shorthands, found `-b` in
+        # `_FREE_TEXT_FLAGS`, and `argv_path_violation` skipped the token
+        # without testing the value as the path it opens -- for any value
+        # beginning with `b`, `m` or `t`. The runner writes the workspace, so
+        # `ln -s <credential> body.md && gh pr create -Fbody.md` published the
+        # mounted credential while `-F/var/run/...` and `-Fescape/token` were
+        # refused, which is why the earlier test did not see it.
+        executor = self.executor()
+        cwd = executor.workspace_dir / "src"
+        cwd.mkdir(parents=True)
+        outside = Path(self.temp_dir.name) / "sidecar-state"
+        outside.mkdir(parents=True)
+        (outside / "token").write_text("DECOY-NOT-A-REAL-TOKEN\n")
+        (cwd / "escape").symlink_to(outside)
+        for name in ("body.md", "token", "main"):
+            (cwd / name).symlink_to(outside / "token")
+        climb = "main/../" + "../" * 8 + "var/run/secrets/selfimprove-github/token"
+        for argv in (
+            ["gh", "pr", "create", "--title", "x", "-Fbody.md"],
+            ["gh", "pr", "comment", "1", "-Ftoken"],
+            ["gh", "pr", "create", "--title", "x", "-Fmain"],
+            ["git", "commit", "--allow-empty", "-Fbody.md"],
+            ["git", "commit", "--allow-empty", "-fmain"],
+            ["gh", "pr", "create", "--title", "x", "-F" + climb],
+            ["gh", "pr", "create", "--title", "x", "-Fbody/../escape/token"],
+        ):
+            with self.subTest(argv=argv):
+                violation = executor.argv_path_violation(argv, str(cwd))
+                self.assertIsNotNone(violation)
+                self.assertIn("outside the workspace", violation)
+        # The element after such a token is not prose either: it is tested as
+        # the path it is, the same as after `-F/var/...`.
+        self.assertIsNotNone(
+            executor.argv_path_violation(
+                ["git", "diff", "--no-index", "-Fbody.md", "escape/token"], str(cwd)
+            )
+        )
+        # A real file inside the workspace in the same spelling is what the
+        # loop writes, and stays allowed.
+        (cwd / "notes.md").write_text("body\n")
+        for argv in (
+            ["gh", "pr", "create", "-Fnotes.md"],
+            ["gh", "pr", "create", "-Ftitle-and-body.md"],
+            ["git", "commit", "-Fmessage.txt"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(executor.argv_path_violation(argv, str(cwd)))
+
     def test_a_planted_symlink_cannot_walk_out_of_the_workspace(self):
         # The runner writes the workspace emptyDir and the sidecar mounts the
         # same one, so a symlink in the checkout is attacker-supplied. It needs
