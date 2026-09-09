@@ -26,6 +26,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -39,6 +41,25 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"sigs.k8s.io/yaml"
+)
+
+const (
+	// memoryLimitEnv carries the container's memory limit in bytes. The
+	// operator sets it through the Downward API from the agent-api-auth
+	// container's limits.memory (see buildAgentAPIAuthSidecar), so the watcher
+	// learns the ceiling it shares without a flag that could drift from it.
+	memoryLimitEnv = "EVENT_WATCHER_MEMORY_LIMIT_BYTES"
+	// goMemLimitEnv is the Go runtime's own soft-limit variable. When it is
+	// set the runtime has already applied it before main runs, and it is an
+	// explicit choice that this process does not second-guess.
+	goMemLimitEnv = "GOMEMLIMIT"
+	// memoryLimitFraction is the share of the container limit the watcher
+	// claims as its soft limit. The Python API authenticator lives in the same
+	// container, so the whole limit is not the watcher's to spend; half leaves
+	// the collector working well before the kernel's OOM killer is the only
+	// thing enforcing the ceiling. A soft limit makes GC more aggressive as
+	// the heap approaches it; it does not cap live heap.
+	memoryLimitFraction = 0.5
 )
 
 // flags holds the CLI-based configurations parsed once during startup.
@@ -801,6 +822,44 @@ func (d *dispatcher) Dispatch(ctx context.Context, ev TriageEvent) {
 		ev.Key.Reason, ev.Namespace, ev.Name, sid, d.mode)
 }
 
+// deriveMemoryLimit decides the Go soft memory limit from the two variables
+// that can set it. It returns the limit in bytes and true when
+// memoryLimitEnv should be applied, or zero, false and the reason when the
+// runtime's own setting should stand: GOMEMLIMIT already set (the runtime
+// applied it and it wins), the container limit absent (running outside the
+// operator's Deployment), or unparseable or non-positive (the value is not a
+// byte count, so nothing is derived from it).
+func deriveMemoryLimit(goMemLimit, containerLimit string) (int64, bool, string) {
+	if goMemLimit != "" {
+		return 0, false, fmt.Sprintf("%s=%s is set and takes precedence", goMemLimitEnv, goMemLimit)
+	}
+	if containerLimit == "" {
+		return 0, false, fmt.Sprintf("%s is not set; the runtime default applies", memoryLimitEnv)
+	}
+	limitBytes, err := strconv.ParseInt(containerLimit, 10, 64)
+	if err != nil || limitBytes <= 0 {
+		return 0, false, fmt.Sprintf("%s=%q is not a positive byte count; the runtime default applies", memoryLimitEnv, containerLimit)
+	}
+	return int64(float64(limitBytes) * memoryLimitFraction), true, ""
+}
+
+// applyMemoryLimit sets the Go runtime's soft memory limit to
+// memoryLimitFraction of the container's, when the operator has told the
+// watcher what that is and nothing else has set a limit. debug.SetMemoryLimit
+// is the same knob GOMEMLIMIT turns; doing it here rather than in the
+// entrypoint keeps the derivation under test. One line either way, so the
+// startup log says which limit the process is running under.
+func applyMemoryLimit() {
+	limitBytes, apply, reason := deriveMemoryLimit(os.Getenv(goMemLimitEnv), os.Getenv(memoryLimitEnv))
+	if !apply {
+		log.Printf("k8s-event-watcher: memory limit not derived: %s", reason)
+		return
+	}
+	debug.SetMemoryLimit(limitBytes)
+	log.Printf("k8s-event-watcher: Go soft memory limit set to %d bytes (%.0f%% of %s=%s)",
+		limitBytes, memoryLimitFraction*100, memoryLimitEnv, os.Getenv(memoryLimitEnv))
+}
+
 func main() {
 	if err := realMain(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "k8s-event-watcher:", err)
@@ -819,6 +878,8 @@ func realMain(argv []string) error {
 	if err := f.validate(); err != nil {
 		return err
 	}
+
+	applyMemoryLimit()
 
 	// Resolve bearer token from env (unless dry-run).
 	var token string

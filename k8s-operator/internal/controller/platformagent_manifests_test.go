@@ -5015,6 +5015,63 @@ func TestDeploymentEnvCannotDuplicateTheEventWatcherClusterName(t *testing.T) {
 	}
 }
 
+// The watcher derives its Go soft memory limit from this variable, so it has to
+// be the container's own limits.memory read through the Downward API — not a
+// copy of the number, which would drift the first time the limit changed — and
+// as a plain byte count, which is what divisor 1 yields.
+func TestAgentAPIAuthSidecarReportsItsMemoryLimitToTheWatcher(t *testing.T) {
+	sidecar := buildAgentAPIAuthSidecar(newTestPlatformAgent(), "/opt/data")
+
+	var found []corev1.EnvVar
+	for _, e := range sidecar.Env {
+		if e.Name == "EVENT_WATCHER_MEMORY_LIMIT_BYTES" {
+			found = append(found, e)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("want exactly one EVENT_WATCHER_MEMORY_LIMIT_BYTES entry, got %d (%#v)", len(found), found)
+	}
+	ref := found[0].ValueFrom
+	if ref == nil || ref.ResourceFieldRef == nil {
+		t.Fatalf("EVENT_WATCHER_MEMORY_LIMIT_BYTES must come from a resourceFieldRef, got %#v", found[0])
+	}
+	if ref.ResourceFieldRef.ContainerName != sidecar.Name {
+		t.Errorf("resourceFieldRef names container %q, want the sidecar's own %q", ref.ResourceFieldRef.ContainerName, sidecar.Name)
+	}
+	if ref.ResourceFieldRef.Resource != "limits.memory" {
+		t.Errorf("resourceFieldRef reads %q, want limits.memory", ref.ResourceFieldRef.Resource)
+	}
+	if ref.ResourceFieldRef.Divisor.Cmp(resource.MustParse("1")) != 0 {
+		t.Errorf("resourceFieldRef divisor is %s, want 1 so the value is a byte count", ref.ResourceFieldRef.Divisor.String())
+	}
+	if _, ok := sidecar.Resources.Limits[corev1.ResourceMemory]; !ok {
+		t.Error("the sidecar has no memory limit for the resourceFieldRef to read")
+	}
+}
+
+// Same hole as the two variables beside it: appended after the merge, so a
+// same-named spec.deployment.env entry would sit alongside it and server-side
+// apply would reject the Deployment.
+func TestDeploymentEnvCannotDuplicateTheEventWatcherMemoryLimit(t *testing.T) {
+	agent := newTestPlatformAgent()
+	agent.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Env: []corev1.EnvVar{{Name: "EVENT_WATCHER_MEMORY_LIMIT_BYTES", Value: "1"}},
+	}
+
+	var found []corev1.EnvVar
+	for _, e := range buildAgentAPIAuthSidecar(agent, "/opt/data").Env {
+		if e.Name == "EVENT_WATCHER_MEMORY_LIMIT_BYTES" {
+			found = append(found, e)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("want exactly one EVENT_WATCHER_MEMORY_LIMIT_BYTES entry, got %d (%#v)", len(found), found)
+	}
+	if found[0].ValueFrom == nil || found[0].Value == "1" {
+		t.Errorf("spec.deployment.env overrode the operator's memory limit reference, got %#v", found[0])
+	}
+}
+
 // Turning the watcher off must not disturb the wiring around it. The volumes, the
 // token projection, and the kubeconfig path are shared with the credential proxy or
 // needed the moment the switch goes back on, so the stop is a decision about one
