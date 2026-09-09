@@ -140,10 +140,12 @@ an auditable object rather than a control until that gateway policy is narrowed.
 in any case do nothing on a cluster whose CNI does not enforce NetworkPolicy. See
 [Denying the sandbox the metadata server](site/src/content/docs/reference/credential-isolation.md#denying-the-sandbox-the-metadata-server).
 
-Nothing tells the gateway from the sandbox. The broker authenticates every caller with a
-`TokenReview` over an audience-bound projected token, but `CREDENTIAL_PROXY_ALLOWED_CALLERS`
-names both ServiceAccounts and no policy varies on which one presented it. The broker
-records the principal; nothing reads it yet.
+The ServiceAccount does not tell the gateway from the sandbox. The broker authenticates
+every caller with a `TokenReview` over an audience-bound projected token, and
+`CREDENTIAL_PROXY_ALLOWED_CALLERS` names every calling ServiceAccount without varying on
+which one presented it; what does vary the policy is the audience the token was minted for
+and the route table it feeds
+([Caller authentication](designs/agent-shell-sandboxing.md#caller-authentication)).
 
 ## Scope
 
@@ -197,12 +199,14 @@ Envoy is the only listener for credentialed tool and chat requests. The
 credential runtime listens on a Unix socket mounted only in its own Pod, so no
 caller can bypass Envoy by reaching the runtime directly. Envoy authenticates
 every caller that is not asking for `/healthz`: the caller presents an
-audience-bound projected ServiceAccount token (audience
-`kubeagents-credential-proxy`, one hour) as a bearer header, and the runtime
-verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLERS`. That
-list names the gateway's ServiceAccount and the sandbox's, and no policy varies
-on which one presented the token, so the check keeps other workloads out rather
-than telling those two apart. The token crosses the cluster network in cleartext;
+audience-bound projected ServiceAccount token (one hour; the audience is per
+pod, `kubeagents-credential-proxy` for the sandbox and
+`kubeagents-credential-proxy-chat` for the gateway) as a bearer header, and the
+runtime verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLERS`.
+That list names the gateway's ServiceAccount and the sandbox's and does not vary
+on which one presented the token — the audience and the route table it feeds do —
+so the allowlist itself keeps other workloads out rather than telling those two
+apart. The token crosses the cluster network in cleartext;
 a NetworkPolicy is what keeps it off the wire elsewhere.
 
 The `agent-api-auth` sidecar authenticates the existing PlatformAgent API on port

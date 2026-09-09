@@ -1167,3 +1167,34 @@ func TestGchatDefaultDisplayModeRetriesAFailedStateEdit(t *testing.T) {
 		return false
 	})
 }
+
+// A caller that arms the gchat relay in the Config but leaves Options.Backend
+// unset must not get principal-map resolution against a Chat adapter: New
+// derives the backend from the same config that selects the adapter.
+func TestNewDerivesTheBackendFromTheConfig(t *testing.T) {
+	s := startServer(t)
+	url := s.ClientURL()
+	provision(t, url)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	client, err := lib.Connect(ctx, url, lib.WithName("gateway-test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(client.Close)
+	cfg := &Config{
+		NATSURL:            url,
+		DefaultAddressee:   "platform",
+		IdleTTL:            30 * time.Minute,
+		AttributionSalt:    []byte("test-salt"),
+		GchatRelayURL:      "http://relay.invalid",
+		GchatAllowAllUsers: true,
+	}
+	g, err := New(Options{Client: client, Adapter: newFakeAdapter(), Config: cfg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.backend != gchatBackend {
+		t.Fatalf("backend = %q; a gchat-armed config must select the gchat identity path", g.backend)
+	}
+}

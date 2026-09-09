@@ -2246,7 +2246,8 @@ no new ingress rule for either.
 It needs an egress one, which is a different sentence and was the easier half to miss. A
 loopback call crosses no NetworkPolicy; this one does, so rule 12 of `buildNetworkPolicy`
 reaches the broker's pod selector on `credentialProxyPort` and
-`buildCredentialProxyNetworkPolicy` admits the gateway there. Written one-sided, both
+`buildCredentialProxyNetworkPolicy` admits the gateway there (the legacy gateway; the A2A
+gateway's admission is on the chatops gateway design's not-yet-rendered list). Written one-sided, both
 policies still read as though they permitted the call and an enforcing dataplane drops
 every chat pull while the pods stay Running and the CR reads Ready — which is rule 11's
 lesson about the sandbox's sshd, arriving a second time by the same route.
@@ -2525,9 +2526,11 @@ its own and take the annotation off the gateway's. Neither ships today.
 
 **The ServiceAccount does not tell the gateway from the sandbox.** The broker authenticates
 its callers, but `CREDENTIAL_PROXY_ALLOWED_CALLERS` names every calling ServiceAccount and
-nothing varies on which one presented the token; what does vary the policy is the audience
-and the role table it feeds, see [Caller authentication](#caller-authentication).
-Federation does not fix this one.
+nothing varies on which one presented the token. What separates them is the audience and
+the role table it feeds ([Caller authentication](#caller-authentication)), and that rests
+entirely on the operator projecting a distinct audience per Pod: an install whose broker
+has no `CREDENTIAL_PROXY_CHAT_AUDIENCE` is back to one role for every caller. Federation
+does not fix this one.
 
 ---
 
