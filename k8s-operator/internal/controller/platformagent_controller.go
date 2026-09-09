@@ -108,6 +108,11 @@ const (
 	pluginFailureReasonImagePull = "ImagePullFailed"
 	pluginFailureReasonStaging   = "StagingFailed"
 	exitCodeCommandNotFound      = int32(127)
+	pluginStagingContainerPrefix = "stage-"
+
+	reasonContainerCreating = "ContainerCreating"
+	reasonPodInitializing   = "PodInitializing"
+	reasonContainerError    = "Error"
 
 	// The condition reporting that cluster event ingestion has been switched off
 	// on the spec. It is written only in that state — see updateStatusReady.
@@ -126,6 +131,12 @@ const (
 	gitopsStateConfigMapSuffix         = "-gitops-state"
 	managedReposConfigMapKey           = "managed_repos"
 )
+
+var missingShellMessageMarkers = []string{
+	"/bin/sh",
+	"no such file or directory",
+	"executable file not found",
+}
 
 // PlatformAgentReconciler reconciles a PlatformAgent object
 type PlatformAgentReconciler struct {
@@ -2451,30 +2462,30 @@ func (r *PlatformAgentReconciler) getDeploymentStatusDetails(ctx context.Context
 		initThenApp = append(initThenApp, pod.Status.ContainerStatuses...)
 		for _, cs := range initThenApp {
 			if cs.State.Waiting != nil && cs.State.Waiting.Reason != "" &&
-				cs.State.Waiting.Reason != "ContainerCreating" && cs.State.Waiting.Reason != "PodInitializing" {
+				cs.State.Waiting.Reason != reasonContainerCreating && cs.State.Waiting.Reason != reasonPodInitializing {
 				phase = "Degraded"
 				reason = cs.State.Waiting.Reason
 				message = fmt.Sprintf("Container '%s' in pod %s is waiting: %s - %s", cs.Name, pod.Name, cs.State.Waiting.Reason, cs.State.Waiting.Message)
-				if strings.HasPrefix(cs.Name, "stage-") {
+				if isPluginStagingContainer(cs.Name) {
 					if cs.LastTerminationState.Terminated != nil {
 						term := cs.LastTerminationState.Terminated
-						if term.ExitCode == exitCodeCommandNotFound || strings.Contains(term.Message, "/bin/sh") || strings.Contains(term.Message, "no such file or directory") {
+						if isMissingShellFailure(term.ExitCode, term.Message) {
 							message = fmt.Sprintf("Container '%s' in pod %s is waiting: %s - staging failed (exit code %d): plugin image may be outdated or missing /bin/sh (init container staging requires a minimal shell such as busybox:musl or alpine)", cs.Name, pod.Name, cs.State.Waiting.Reason, term.ExitCode)
 						}
-					} else if strings.Contains(cs.State.Waiting.Message, "/bin/sh") || strings.Contains(cs.State.Waiting.Message, "no such file or directory") {
+					} else if isMissingShellFailure(0, cs.State.Waiting.Message) {
 						message = fmt.Sprintf("Container '%s' in pod %s is waiting: %s - staging failed: plugin image may be outdated or missing /bin/sh (init container staging requires a minimal shell such as busybox:musl or alpine)", cs.Name, pod.Name, cs.State.Waiting.Reason)
 					}
 				}
 				return phase, reason, message
 			}
-			if strings.HasPrefix(cs.Name, "stage-") && cs.State.Terminated != nil && cs.State.Terminated.ExitCode != 0 {
+			if isPluginStagingContainer(cs.Name) && cs.State.Terminated != nil && cs.State.Terminated.ExitCode != 0 {
 				phase = "Degraded"
 				reason = cs.State.Terminated.Reason
 				if reason == "" {
-					reason = "Error"
+					reason = reasonContainerError
 				}
 				message = fmt.Sprintf("Container '%s' in pod %s terminated with exit code %d: %s", cs.Name, pod.Name, cs.State.Terminated.ExitCode, cs.State.Terminated.Message)
-				if cs.State.Terminated.ExitCode == exitCodeCommandNotFound || strings.Contains(cs.State.Terminated.Message, "/bin/sh") || strings.Contains(cs.State.Terminated.Message, "no such file or directory") {
+				if isMissingShellFailure(cs.State.Terminated.ExitCode, cs.State.Terminated.Message) {
 					message = fmt.Sprintf("Container '%s' in pod %s failed to stage plugin (exit code %d): plugin image may be outdated or missing /bin/sh (init container staging requires a minimal shell such as busybox:musl or alpine)", cs.Name, pod.Name, cs.State.Terminated.ExitCode)
 				}
 				return phase, reason, message
@@ -3061,12 +3072,12 @@ func (r *PlatformAgentReconciler) detectPluginFailures(ctx context.Context, agen
 							reason:  pluginFailureReasonImagePull,
 							message: w.Message,
 						}
-					} else if w.Reason != "ContainerCreating" && w.Reason != "PodInitializing" {
+					} else if w.Reason != reasonContainerCreating && w.Reason != reasonPodInitializing {
 						msg := w.Message
 						if cs.LastTerminationState.Terminated != nil && cs.LastTerminationState.Terminated.ExitCode != 0 {
 							term := cs.LastTerminationState.Terminated
 							msg = formatStagingFailureMessage(term.ExitCode, term.Message, plugin.Spec.Image)
-						} else if strings.Contains(w.Message, "/bin/sh") || strings.Contains(w.Message, "no such file or directory") {
+						} else if isMissingShellFailure(0, w.Message) {
 							msg = fmt.Sprintf("staging init container failed (%s): plugin image '%s' may be outdated or missing /bin/sh (init container staging requires a minimal shell such as busybox:musl or alpine)", w.Reason, plugin.Spec.Image)
 						} else if msg == "" {
 							msg = fmt.Sprintf("staging init container failed: %s", w.Reason)
@@ -3104,6 +3115,22 @@ func (r *PlatformAgentReconciler) detectPluginFailures(ctx context.Context, agen
 	return failures
 }
 
+func isPluginStagingContainer(name string) bool {
+	return strings.HasPrefix(name, pluginStagingContainerPrefix)
+}
+
+func isMissingShellFailure(exitCode int32, msg string) bool {
+	if exitCode == exitCodeCommandNotFound {
+		return true
+	}
+	for _, marker := range missingShellMessageMarkers {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // formatStagingFailureMessage constructs an informative error message when a staging init container fails.
 // If the container exited with code 127 or the failure indicates a missing shell, it clarifies that
 // the plugin image may be outdated or missing /bin/sh (required on clusters using init container staging).
@@ -3112,7 +3139,7 @@ func formatStagingFailureMessage(exitCode int32, termMsg string, pluginImage str
 	if termMsg != "" {
 		baseMsg = fmt.Sprintf("%s (%s)", baseMsg, termMsg)
 	}
-	if exitCode == exitCodeCommandNotFound || strings.Contains(termMsg, "/bin/sh") || strings.Contains(termMsg, "no such file or directory") || strings.Contains(termMsg, "executable file not found") {
+	if isMissingShellFailure(exitCode, termMsg) {
 		return fmt.Sprintf("%s: plugin image '%s' may be outdated or missing /bin/sh (init container staging requires a minimal shell such as busybox:musl or alpine)", baseMsg, pluginImage)
 	}
 	return baseMsg
