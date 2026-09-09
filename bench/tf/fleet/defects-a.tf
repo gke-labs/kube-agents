@@ -69,6 +69,9 @@ resource "kubernetes_namespace_v1" "seeded_capacity" {
 # additionally asserts the container image and the absence of a
 # rollout-restart annotation, so it is not only the replica count and the
 # missing budget that are load-bearing here now.
+# cluster-agent-stalled-controller-healthy-silence asserts the same four
+# facts for the same reason, with a reconciliation stall as the invented
+# symptom instead of a crashloop.
 resource "kubernetes_deployment_v1" "checkout_gateway" {
   metadata {
     name      = "checkout-gateway"

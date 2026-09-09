@@ -24,6 +24,8 @@ notes:
     badge: held-out
   cluster-agent-healthy-workload-no-finding:
     badge: held-out
+  cluster-agent-stalled-controller-healthy-silence:
+    badge: new
   compliance-rbac-overgrant:
     issues: ["#998", "#985", "#1171"]
     badge: held-out
