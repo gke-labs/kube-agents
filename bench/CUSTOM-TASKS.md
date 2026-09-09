@@ -14,7 +14,9 @@ benchmark. That is what `bench/` in this repository is: tasks and the `kubeagent
 here, devops-bench ships separately. The same shape works for anything you cannot make public.
 
 For running the evals that already exist here, see [README.md](README.md). This page is about
-adding new ones.
+adding new ones. For getting one you wrote into this repository's presubmit — the review bar,
+the fixture-sanitization check, the `owner` field and roster admission — see
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Prerequisites
 
