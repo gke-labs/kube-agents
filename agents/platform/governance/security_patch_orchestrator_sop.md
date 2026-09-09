@@ -25,7 +25,9 @@ Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/
 
 ### 1. Enumerate the target fleet
 
-**Tunable criteria first.** Before enumerating anything, call `capability_criteria(action="get", capability="security-patch-orchestrator")` once and keep the result. Several checks in §3 read a value from it — named beside the check as `criteria.<key>`, with the shipped default in parentheses — and the operator may have changed any of them since this SOP was written, so the tool's value wins over the number on the page. Record the revision the tool returned in the run's summary. If the tool errors, say so in the summary and use the defaults printed here.
+**Tunable criteria first.** Before enumerating anything, call `capability_criteria(action="get", capability="security-patch-orchestrator")` once and keep the result. Several checks in §3 read a value from it — named beside the check as `criteria.<key>`, with the shipped default in parentheses — and the operator may have changed any of them since this SOP was written, so the tool's value wins over the number on the page. Name the revision the tool returned in the one-line report §6 produces (a `[SILENT]` run carries nothing). If the tool errors, say so in that line and use the defaults printed here.
+
+`criteria.excluded_clusters` (default empty) names clusters this audit does not audit at all. Drop them from the inventory before step 3 and put them in **neither** scope list — a `scope.skipped` entry would mark every run partial (§6), which is not what an exclusion means — and name the count in the §6 line (`2 excluded by criteria`). The criteria changelog, not the ledger, is the record of who chose the exclusion.
 
 1. Resolve the project scope: `gcloud config get-value project`. If `gcloud projects list --format="value(projectId)"` succeeds, include every additional project where `gcloud container clusters list` returns at least one cluster.
 2. Snapshot each project once — `clusters list` returns the **full** Cluster resources, node pools included, so one call is the whole inventory:
@@ -63,7 +65,6 @@ Returns `{"issue": <int|null>, "repo":"org/repo", "workspace":"/opt/data/gitops/
    - `status` is `PROVISIONING`, `STOPPING`, or `ERROR` — the object is mid-flight or broken; version data is meaningless.
    - `enableKubernetesAlpha: true` — alpha clusters cannot be upgraded and auto-expire by design.
    - A project that errors on list (permission, API disabled). Record it as `{"cluster": "<project>/*", "reason": "…"}`.
-   - Named in `criteria.excluded_clusters` (default empty). Record it with the reason `excluded by criteria` and run nothing against it; the ledger then says the omission was chosen, not missed.
 6. Record every cluster you **could** read but could not fully check in `scope.clusters`, with the gap in its `limitations`. Autopilot (`autopilot.enabled: true`) is the standard case and is **never** skipped: Google manages those node pools, so run 3.1, 3.3, 3.4, 3.7, 3.8, 3.10 there and declare the four node-pool checks inapplicable rather than missing —
 
    ```json

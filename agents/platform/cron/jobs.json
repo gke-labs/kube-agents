@@ -36,7 +36,7 @@
         "expr": "20 7 * * 1",
         "display": "20 7 * * 1"
       },
-      "prompt": "Run the weekly GKE upgrade and patch readiness audit. Read the SOP at 'governance/security_patch_orchestrator_sop.md' in your profile home — all 292 lines of it, before you run anything. Its ten checks are section 3, lines 122-226, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run. This audit is read-only: never upgrade a cluster.",
+      "prompt": "Run the weekly GKE upgrade and patch readiness audit. Read the SOP at 'governance/security_patch_orchestrator_sop.md' in your profile home — all 293 lines of it, before you run anything. Its ten checks are section 3, lines 123-227, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run. This audit is read-only: never upgrade a cluster.",
       "skills": ["fleet-audit"],
       "risk": "low",
       "enabled": true,

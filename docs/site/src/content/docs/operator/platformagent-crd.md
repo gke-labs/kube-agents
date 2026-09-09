@@ -652,8 +652,9 @@ that file is now the one `/sethome` and the monitoring policy write to. It leave
 list and is back-filled from the image template instead, on exactly the terms `default` gets — keys
 the template declares and the live file has lost are restored, keys it already holds are left
 alone. Its overlay merges after that back-fill as it always did. Everything else the image owns in
-that profile — the persona files, `cron/`, `skills/`, `governance/`, `hindsight/` — still
-force-syncs either way.
+that profile — the persona files, `cron/`, `skills/`, `governance/`, `hindsight/`,
+`capabilities/` — still force-syncs either way (`cron/` and `capabilities/` as merges: the image
+wins the roster's keys, the volume wins the criteria's).
 
 **Merge semantics.** These differ between the two mechanisms, which is the easiest thing to get
 wrong here. In a startup **overlay** — every profile including `default` — maps merge recursively,
