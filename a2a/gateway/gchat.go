@@ -384,7 +384,7 @@ func (a *GoogleChatAdapter) Roster(conversation string) ([]string, bool, error) 
 // in user resource names.
 func (a *GoogleChatAdapter) OpenDirect(userID string) (string, error) {
 	name := userID
-	if !strings.HasPrefix(name, "users/") {
+	if !strings.HasPrefix(name, gchatUsersToken) {
 		// The email alias in a user resource name is accepted only under
 		// user credentials; app credentials, which is what the relay
 		// holds, answer it 403 (measured live). A sender whose event has
@@ -394,7 +394,7 @@ func (a *GoogleChatAdapter) OpenDirect(userID string) (string, error) {
 		if id, ok := a.userEmails[strings.ToLower(userID)]; ok {
 			name = id
 		} else {
-			name = "users/" + userID
+			name = gchatUsersToken + userID
 		}
 		a.mu.Unlock()
 	}
@@ -586,16 +586,10 @@ func toGchatText(s string) string {
 	return strings.ReplaceAll(s, "**", "*")
 }
 
-// inbound normalizes one Chat event to an InboundMessage. The bool reports
-// whether the event is a turn at all: Google Chat itself gates delivery (an
-// app receives a space message only when mentioned, and every DM), so what
-// is owned here is the surface binding and the drops.
-func (a *GoogleChatAdapter) inbound(ev *gchatEvent) (InboundMessage, bool) {
-	msg, reason := a.classify(ev)
-	return msg, reason == ""
-}
-
-// classify is inbound with the drop reason spelled out. A non-turn is
+// classify normalizes one Chat event to an InboundMessage, or names why it
+// is not a turn. Google Chat itself gates delivery (an app receives a space
+// message only when mentioned, and every DM), so what is owned here is the
+// surface binding and the drops. A non-turn is
 // ordinary (a membership event, a bot's own message, a redelivery) but it
 // must never be silent: an adapter that acks every event and says nothing
 // is indistinguishable from one that receives none — which is exactly how
@@ -649,7 +643,7 @@ func (a *GoogleChatAdapter) classify(ev *gchatEvent) (InboundMessage, string) {
 		}
 		a.dmThreads[ev.Space.Name] = ev.Message.Thread.Name
 	}
-	if strings.HasPrefix(sender.Name, "users/") {
+	if strings.HasPrefix(sender.Name, gchatUsersToken) {
 		// Bounded by the same cap as the dedupe memory: one entry per
 		// human who has spoken, evicted wholesale rather than leaked.
 		if a.userIDs == nil || len(a.userIDs) >= gchatSeenCap {
@@ -696,6 +690,8 @@ const (
 	gchatSpaceKeyPrefix = "gchat:space/"
 	gchatSpacesToken    = "spaces/"
 	gchatThreadsToken   = "/threads/"
+	// gchatUsersToken prefixes a user resource name ("users/{id}").
+	gchatUsersToken = "users/"
 )
 
 // resolvePrincipal establishes the requester's principal from the backend's

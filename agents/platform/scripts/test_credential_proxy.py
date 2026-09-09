@@ -4284,6 +4284,42 @@ class ManagedRepositoryGateTest(unittest.TestCase):
 
 
 class BuildAuthenticatorTest(unittest.TestCase):
+    def test_the_a2a_chat_audience_confers_its_own_role(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE": "aud-a2a",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(
+            authenticator.audience_roles,
+            {
+                credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE: credential_proxy.CALLER_ROLE_SHELL,
+                "aud-chat": credential_proxy.CALLER_ROLE_CHAT,
+                "aud-a2a": credential_proxy.CALLER_ROLE_A2A_CHAT,
+            },
+        )
+
+    def test_the_a2a_chat_audience_means_nothing_without_the_chat_split(self):
+        # And says so: a gateway presenting that audience would otherwise 401
+        # with "audience not known" and nothing naming the env.
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE": "aud-a2a",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(
+            authenticator.audience_roles, {credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE: ""}
+        )
+        self.assertTrue(any("CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE" in line for line in logs.output))
+
     def test_the_default_is_the_null_authenticator(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertIsInstance(
@@ -5433,3 +5469,24 @@ class ScopedServiceAccountOverTheSocketTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ChatRelaySubscriptionsTest(unittest.TestCase):
+    def test_two_relays_on_one_subscription_are_refused_at_startup(self):
+        environment = {
+            "GOOGLE_CHAT_SUBSCRIPTION_NAME": "projects/p/subscriptions/one",
+            "A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME": "projects/p/subscriptions/one",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertRaises(RuntimeError):
+                credential_proxy.chat_relay_subscriptions()
+
+    def test_distinct_or_single_subscriptions_pass_through(self):
+        with mock.patch.dict(
+            os.environ,
+            {"GOOGLE_CHAT_SUBSCRIPTION_NAME": "a", "A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME": "b"},
+            clear=True,
+        ):
+            self.assertEqual(credential_proxy.chat_relay_subscriptions(), ("a", "b"))
+        with mock.patch.dict(os.environ, {"A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME": "b"}, clear=True):
+            self.assertEqual(credential_proxy.chat_relay_subscriptions(), ("", "b"))

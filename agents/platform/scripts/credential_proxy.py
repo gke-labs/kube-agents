@@ -188,7 +188,6 @@ DEFAULT_CREDENTIAL_PROXY_CHAT_AUDIENCE = "kubeagents-credential-proxy-chat"
 # never conferred and the a2a routes are reachable by any authenticated
 # caller only where no roles are established at all (the NullAuthenticator
 # posture behind the socket).
-DEFAULT_CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE = "kubeagents-credential-proxy-a2a-chat"
 
 # The roles a caller can hold, named by which Pod holds them.
 CALLER_ROLE_SHELL = "shell"
@@ -657,6 +656,14 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
             audience_roles[a2a_audience] = CALLER_ROLE_A2A_CHAT
     else:
         audience_roles = {shell_audience: ""}
+        if os.getenv("CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE", "").strip():
+            # Say so, rather than letting every a2a-chat caller 401 with
+            # "audience not known" and nothing pointing at the env.
+            LOGGER.warning(
+                "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE is set but CREDENTIAL_PROXY_CHAT_AUDIENCE "
+                "is not; the a2a-chat role only exists once the chat audience split does, "
+                "so the a2a audience is ignored"
+            )
     return ServiceAccountAuthenticator(
         audience_roles=audience_roles,
         allowed_callers=allowed,
@@ -3810,6 +3817,25 @@ def resolve_role() -> str:
     return role
 
 
+def chat_relay_subscriptions() -> tuple[str, str]:
+    """Return the legacy and A2A Chat subscription names, refusing one shared.
+
+    Two relay instances pulling one subscription split its deliveries between
+    them at random — the exact failure the A2A path's own subscription exists
+    to prevent — so pointing both env vars at the same name is refused at
+    startup rather than discovered as every other ask going missing.
+    """
+    chat_subscription = os.getenv("GOOGLE_CHAT_SUBSCRIPTION_NAME", "").strip()
+    a2a_subscription = os.getenv("A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME", "").strip()
+    if chat_subscription and chat_subscription == a2a_subscription:
+        raise RuntimeError(
+            "A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME names the same subscription as "
+            "GOOGLE_CHAT_SUBSCRIPTION_NAME; two relay instances on one subscription "
+            "split its deliveries, so the A2A consumer needs its own"
+        )
+    return chat_subscription, a2a_subscription
+
+
 def serve(args: argparse.Namespace) -> None:
     role = resolve_role()
     if role == "api-proxy":
@@ -3851,7 +3877,7 @@ def serve(args: argparse.Namespace) -> None:
         os.getenv("SLACK_RELAY_MAX_REQUEST_BYTES", str(28 * 1024 * 1024))
     )
     chat_project = os.getenv("GOOGLE_CHAT_PROJECT_ID", "").strip()
-    chat_subscription = os.getenv("GOOGLE_CHAT_SUBSCRIPTION_NAME", "").strip()
+    chat_subscription, a2a_subscription = chat_relay_subscriptions()
     if chat_project and chat_subscription:
         CredentialProxyHandler.chat_relay = GoogleChatRelay(
             chat_project, chat_subscription
@@ -3859,7 +3885,6 @@ def serve(args: argparse.Namespace) -> None:
         LOGGER.info("Google Chat relay enabled project=%s subscription=<redacted>", chat_project)
     # The A2A gateway's own subscription on the same topic and credential;
     # armed independently so an install can run either consumer alone.
-    a2a_subscription = os.getenv("A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME", "").strip()
     if chat_project and a2a_subscription:
         CredentialProxyHandler.a2a_chat_relay = GoogleChatRelay(
             chat_project, a2a_subscription

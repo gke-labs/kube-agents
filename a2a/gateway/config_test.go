@@ -360,3 +360,17 @@ func TestFromEnvOneBackendPerProcess(t *testing.T) {
 		t.Fatal("no backend at all must refuse")
 	}
 }
+
+// A typo in the display mode must be refused, not silently rendered as
+// debug (the relay branches on != default).
+func TestFromEnvRefusesAnUnknownDisplayMode(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("A2A_CHAT_DISPLAY_MODE", "verbose")
+	if _, err := FromEnv(); err == nil || !strings.Contains(err.Error(), "A2A_CHAT_DISPLAY_MODE") {
+		t.Fatalf("FromEnv() error = %v; want a refusal naming A2A_CHAT_DISPLAY_MODE", err)
+	}
+	t.Setenv("A2A_CHAT_DISPLAY_MODE", "default")
+	if cfg, err := FromEnv(); err != nil || cfg.DisplayMode != "default" {
+		t.Fatalf("FromEnv() = %+v, %v", cfg, err)
+	}
+}

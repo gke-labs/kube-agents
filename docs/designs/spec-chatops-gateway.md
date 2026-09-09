@@ -2,7 +2,7 @@
 
 - **Author:** [@bnaylor]
 - **Date:** 2026-08-24
-- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord and Google Chat adapters) - session spawning is dark behind `A2A_SPAWN_SESSIONS`; the operator renders the gateway Deployment and its env under `mode: next` (`platformagent_a2a_manifests.go`), but not yet the Google Chat adapter's env or its projected relay token
+- **Status:** merged design of record; the gateway program is implemented (`a2a/gateway`: session registry, authority block, interceptors, supervisor duties, Discord and Google Chat adapters) - session spawning is dark behind `A2A_SPAWN_SESSIONS`; the operator renders the gateway Deployment and its env under `mode: next` (`platformagent_a2a_manifests.go`), but not yet the Google Chat adapter's env, its projected relay token, or the A2A subscription and its IAM (the composition still provisions one Chat subscription)
 
 ## Purpose
 
@@ -477,8 +477,9 @@ second `GoogleChatRelay` instance in the credential proxy (routes
 only when `A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME` is set alongside the project id. The
 gateway pod stays cloud-credential-free: it authenticates to the proxy the way the
 legacy chat caller does — a projected ServiceAccount token verified by TokenReview —
-but with its OWN audience (`kubeagents-credential-proxy-a2a-chat`, conferring the
-`a2a-chat` role), because the legacy chat caller is the LLM-driven Hermes pod and a
+but with its OWN audience — whatever `CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE` names on the
+proxy, `kubeagents-credential-proxy-a2a-chat` once the operator projects it — conferring
+the `a2a-chat` role, because the legacy chat caller is the LLM-driven Hermes pod and a
 shared role would let a prompt-injected agent pull and ack the A2A gateway's events,
 silently consuming user asks. The event routes demand `a2a-chat`; `/v1/chat/api`
 admits both chat roles, since posting rides one shared app credential either way. The
@@ -500,8 +501,9 @@ the legacy one acked all of them away. The adapter decodes both into one normali
 event, and every event that is not a turn is acked WITH a log line naming why
 (`gchat event is not a turn`): an adapter that acks silently is indistinguishable from
 one that receives nothing, which is how the second layout went unnoticed until live
-traffic. The captured payloads live in `a2a/gateway/testdata/gchat/`, scrubbed of
-identity only, and the tests run against them.
+traffic. The captured payloads live in `a2a/gateway/testdata/gchat/` — email, display name,
+user id, space id, avatar, domain and the one-time redirect token replaced, every other
+byte as published — and the tests run against them.
 
 Ingress is at-most-once, by decision rather than accident: the adapter acks each
 pulled event before handing it to the session manager. Acking after a durable publish
@@ -585,7 +587,7 @@ as the primitive, unused, like the other backends.
 
 ## What stage 2 builds from this doc
 
-- The gateway: Discord adapter, session manager (spawn / stream / reap / rehydrate /
+- The gateway: Discord and Google Chat adapters, session manager (spawn / stream / reap / rehydrate /
   sweep), bus client, KV session registry.
 - The session pod shim: bus-to-stream-json bridge, event mapping.
 - The `authority` block, populated at ingress, advisory.

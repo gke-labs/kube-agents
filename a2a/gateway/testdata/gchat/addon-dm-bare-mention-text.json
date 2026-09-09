@@ -10,7 +10,7 @@
   },
   "chat": {
     "user": {
-      "name": "users/101853009193837280452",
+      "name": "users/100000000000000000042",
       "displayName": "Test Sender",
       "avatarUrl": "https://lh3.googleusercontent.com/a/REDACTED\u003dk-no",
       "email": "sender@example.com",
@@ -20,7 +20,7 @@
     "eventTime": "2026-09-09T15:37:53.478959Z",
     "messagePayload": {
       "space": {
-        "name": "spaces/_ia8wqAAAAE",
+        "name": "spaces/_c2fixtureAA",
         "type": "DM",
         "singleUserBotDm": true,
         "spaceThreadingState": "THREADED_MESSAGES",
@@ -30,12 +30,12 @@
         "membershipCount": {
           "joinedDirectHumanUserCount": 1
         },
-        "spaceUri": "https://chat.google.com/dm/_ia8wqAAAAE?cls\u003d11"
+        "spaceUri": "https://chat.google.com/dm/_c2fixtureAA?cls\u003d11"
       },
       "message": {
-        "name": "spaces/_ia8wqAAAAE/messages/-IovU-AWTYU.-IovU-AWTYU",
+        "name": "spaces/_c2fixtureAA/messages/-IovU-AWTYU.-IovU-AWTYU",
         "sender": {
-          "name": "users/101853009193837280452",
+          "name": "users/100000000000000000042",
           "displayName": "Test Sender",
           "avatarUrl": "https://lh3.googleusercontent.com/a/REDACTED\u003dk-no",
           "email": "sender@example.com",
@@ -45,13 +45,13 @@
         "createTime": "2026-09-09T15:37:53.478959Z",
         "text": "@bkd-test",
         "thread": {
-          "name": "spaces/_ia8wqAAAAE/threads/-IovU-AWTYU",
+          "name": "spaces/_c2fixtureAA/threads/-IovU-AWTYU",
           "retentionSettings": {
             "state": "PERMANENT"
           }
         },
         "space": {
-          "name": "spaces/_ia8wqAAAAE",
+          "name": "spaces/_c2fixtureAA",
           "type": "DM",
           "singleUserBotDm": true,
           "spaceThreadingState": "THREADED_MESSAGES",
@@ -61,7 +61,7 @@
           "membershipCount": {
             "joinedDirectHumanUserCount": 1
           },
-          "spaceUri": "https://chat.google.com/dm/_ia8wqAAAAE?cls\u003d11"
+          "spaceUri": "https://chat.google.com/dm/_c2fixtureAA?cls\u003d11"
         },
         "argumentText": "@bkd-test",
         "retentionSettings": {

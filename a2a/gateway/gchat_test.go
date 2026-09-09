@@ -53,6 +53,13 @@ func newTestGchatAdapter(t *testing.T) *GoogleChatAdapter {
 	return &GoogleChatAdapter{log: slog.Default(), seen: map[string]bool{}}
 }
 
+// inbound is classify with the reason collapsed to a bool — the shape most
+// of the table tests below want.
+func (a *GoogleChatAdapter) inbound(ev *gchatEvent) (InboundMessage, bool) {
+	msg, reason := a.classify(ev)
+	return msg, reason == ""
+}
+
 func gchatMsg(spaceName, spaceType, threadingState, threadName, msgName, text, argumentText, senderEmail, senderType string) *gchatEvent {
 	ev := &gchatEvent{Type: "MESSAGE"}
 	ev.Space.Name = spaceName
@@ -760,14 +767,14 @@ func TestGchatRosterResolvesLearnedIDsToEmails(t *testing.T) {
 	// The shape Chat actually returned: name and type, no email.
 	f.responses["spaces.members/list"] = map[string]any{
 		"memberships": []any{
-			map[string]any{"member": map[string]any{"name": "users/101853009193837280452", "displayName": "Brian Naylor", "type": "HUMAN"}},
+			map[string]any{"member": map[string]any{"name": "users/100000000000000000042", "displayName": "Brian Naylor", "type": "HUMAN"}},
 			map[string]any{"member": map[string]any{"name": "users/2", "type": "HUMAN"}},
 		},
 	}
 	a := newTestGchatAdapterWithRelay(t, f)
 
 	ev := gchatMsg("spaces/D1", "DIRECT_MESSAGE", "THREADED_MESSAGES", "spaces/D1/threads/T1", "spaces/D1/messages/M1", "hi", "", "bnaylor@example.com", "HUMAN")
-	ev.Message.Sender.Name = "users/101853009193837280452"
+	ev.Message.Sender.Name = "users/100000000000000000042"
 	if _, ok := a.inbound(ev); !ok {
 		t.Fatal("inbound expected")
 	}
@@ -825,16 +832,16 @@ func TestGchatRealAddonPayloads(t *testing.T) {
 		text    string
 		msgName string
 	}{
-		{"addon-dm-plain.json", "Hi, here's some traffic", "spaces/_ia8wqAAAAE/messages/BP9QzqU063c.BP9QzqU063c"},
+		{"addon-dm-plain.json", "Hi, here's some traffic", "spaces/_c2fixtureAA/messages/BP9QzqU063c.BP9QzqU063c"},
 		// In a DM a typed "@app" is plain text to Chat: argumentText equals
 		// text, nothing is stripped and no mention annotation is attached,
 		// so it is delivered verbatim rather than treated as a bare mention.
-		{"addon-dm-bare-mention-text.json", "@bkd-test", "spaces/_ia8wqAAAAE/messages/-IovU-AWTYU.-IovU-AWTYU"},
-		{"addon-dm-mention-with-text.json", "@bkd-test what is your name", "spaces/_ia8wqAAAAE/messages/jhqZwM-35cA.jhqZwM-35cA"},
-		{"addon-dm-hello.json", "hello", "spaces/_ia8wqAAAAE/messages/wh-7cP8oL1U.wh-7cP8oL1U"},
+		{"addon-dm-bare-mention-text.json", "@bkd-test", "spaces/_c2fixtureAA/messages/-IovU-AWTYU.-IovU-AWTYU"},
+		{"addon-dm-mention-with-text.json", "@bkd-test what is your name", "spaces/_c2fixtureAA/messages/jhqZwM-35cA.jhqZwM-35cA"},
+		{"addon-dm-hello.json", "hello", "spaces/_c2fixtureAA/messages/wh-7cP8oL1U.wh-7cP8oL1U"},
 		// A reply inside a DM thread: threadReply true, the parent's thread
 		// name. A DM binds the whole space, so it lands in the same session.
-		{"addon-dm-thread-reply.json", "@bkd-test thread reply", "spaces/_ia8wqAAAAE/messages/jhqZwM-35cA.iuosuA3Wo-0"},
+		{"addon-dm-thread-reply.json", "@bkd-test thread reply", "spaces/_c2fixtureAA/messages/jhqZwM-35cA.iuosuA3Wo-0"},
 	}
 	for _, c := range cases {
 		t.Run(c.file, func(t *testing.T) {
@@ -851,12 +858,12 @@ func TestGchatRealAddonPayloads(t *testing.T) {
 			if reason != "" {
 				t.Fatalf("dropped: %s", reason)
 			}
-			if msg.Conversation != "gchat:dm/spaces/_ia8wqAAAAE" || msg.Kind != "dm" ||
+			if msg.Conversation != "gchat:dm/spaces/_c2fixtureAA" || msg.Kind != "dm" ||
 				msg.AuthorID != "sender@example.com" || msg.MessageID != c.msgName || msg.Text != c.text {
 				t.Errorf("normalized = %+v", msg)
 			}
 			// The learned id↔email pair comes from the same event.
-			if a.userIDs["users/101853009193837280452"] != "sender@example.com" {
+			if a.userIDs["users/100000000000000000042"] != "sender@example.com" {
 				t.Errorf("userIDs = %v", a.userIDs)
 			}
 			// A conversation key minted from a real space name survives
@@ -925,7 +932,7 @@ func TestGchatRunDeliversBothWireShapes(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(got) != 2 || got[0].Text != "legacy hi" || got[1].Text != "hello" || got[1].Conversation != "gchat:dm/spaces/_ia8wqAAAAE" {
+	if len(got) != 2 || got[0].Text != "legacy hi" || got[1].Text != "hello" || got[1].Conversation != "gchat:dm/spaces/_c2fixtureAA" {
 		t.Errorf("delivered = %+v", got)
 	}
 }
@@ -936,11 +943,11 @@ func TestGchatRunDeliversBothWireShapes(t *testing.T) {
 // only where the reply renders follows the latest inbound message.
 func TestGchatDMRepliesFollowTheLatestAskThread(t *testing.T) {
 	f := newFakeChatRelay(t)
-	f.responses["spaces.messages/create"] = map[string]any{"name": "spaces/_ia8wqAAAAE/messages/R1"}
+	f.responses["spaces.messages/create"] = map[string]any{"name": "spaces/_c2fixtureAA/messages/R1"}
 	a := newTestGchatAdapterWithRelay(t, f)
 
 	// Nothing seen yet: a DM post is top-level.
-	if _, err := a.Post("gchat:dm/spaces/_ia8wqAAAAE", "hello"); err != nil {
+	if _, err := a.Post("gchat:dm/spaces/_c2fixtureAA", "hello"); err != nil {
 		t.Fatal(err)
 	}
 	if body := f.call(0).arguments["body"].(map[string]any); body["thread"] != nil {
@@ -953,7 +960,7 @@ func TestGchatDMRepliesFollowTheLatestAskThread(t *testing.T) {
 		t.Fatal(err)
 	}
 	msg, reason := a.classify(ev)
-	if reason != "" || msg.Conversation != "gchat:dm/spaces/_ia8wqAAAAE" {
+	if reason != "" || msg.Conversation != "gchat:dm/spaces/_c2fixtureAA" {
 		t.Fatalf("classify: %+v %q", msg, reason)
 	}
 	if _, err := a.Post(msg.Conversation, "answer"); err != nil {
@@ -962,7 +969,60 @@ func TestGchatDMRepliesFollowTheLatestAskThread(t *testing.T) {
 	c := f.call(1)
 	body := c.arguments["body"].(map[string]any)
 	thread, _ := body["thread"].(map[string]any)
-	if thread["name"] != "spaces/_ia8wqAAAAE/threads/jhqZwM-35cA" || c.arguments["messageReplyOption"] != gchatReplyOption {
+	if thread["name"] != "spaces/_c2fixtureAA/threads/jhqZwM-35cA" || c.arguments["messageReplyOption"] != gchatReplyOption {
 		t.Errorf("reply must follow the ask's thread: %+v", c.arguments)
+	}
+}
+
+// Under default mode a progress artifact changes nothing on the rolling line,
+// and an unchanged line must not be re-edited: each edit is a Chat
+// messages.patch, and re-sending the same line per artifact is the
+// rate-limit stampede the relay's coalescing exists to avoid.
+func TestGchatDefaultDisplayModeDoesNotReEditAnUnchangedLine(t *testing.T) {
+	r := startGchatRig(t, nil, true, func(c *Config) { c.DisplayMode = "default" })
+	conv := "gchat:spaces/S1/threads/T3"
+	r.adapter.inbox <- InboundMessage{Conversation: conv, Kind: "group", AuthorID: "u1@example.com", MessageID: "spaces/S1/messages/M2", Text: "do the thing"}
+
+	origin := r.awaitTask(t, "platform")
+	exec := r.execFor(t, origin, "platform")
+	ctx := context.Background()
+	if err := exec.PublishStatus(ctx, lib.StateWorking, false); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "state edit", func() bool {
+		for _, e := range r.adapter.editTexts() {
+			if strings.Contains(e, "working") {
+				return true
+			}
+		}
+		return false
+	})
+	for _, step := range []string{"step one", "step two", "step three"} {
+		if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactProgress, Parts: []lib.Part{{Kind: "text", Text: step}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := exec.PublishArtifact(ctx, lib.Artifact{Name: lib.ArtifactResult, Parts: []lib.Part{{Kind: "text", Text: "done"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.PublishStatus(ctx, lib.StateCompleted, true); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "result post", func() bool {
+		for _, p := range r.adapter.postTexts() {
+			if p == "done" {
+				return true
+			}
+		}
+		return false
+	})
+	working := 0
+	for _, e := range r.adapter.editTexts() {
+		if strings.Contains(e, "working") {
+			working++
+		}
+	}
+	if working != 1 {
+		t.Fatalf("the unchanged working line was edited %d times; three progress artifacts must not re-send it", working)
 	}
 }
