@@ -153,7 +153,14 @@ HEURISTIC_REFERENCE = "dangling-reference"
 
 TABLE_COLUMNS = ("OBJECT", "HEURISTIC", "DETAIL", "STALLED_FOR")
 SUMMARY_LINE = "stalled resources: {count}"
-MAX_DETAIL_CHARS = 100
+# The table's DETAIL column is capped, with a marker, so one event message
+# cannot push a row off the screen; the finding dict behind it, and so --json,
+# keeps the whole string. The cap is sized for the message that names the
+# referent last: the GKE Gateway controller's SYNC event carries the namespace
+# twice and the Gateway and Secret names once each, about 330 characters when
+# all four run to the 63-character maximum.
+TABLE_DETAIL_MAX_CHARS = 400
+TRUNCATION_MARKER = "..."
 SECONDS_PER_MINUTE = 60
 SECONDS_PER_HOUR = 3600
 SECONDS_PER_DAY = 86400
@@ -344,7 +351,7 @@ def finding(obj: dict, heuristic: str, detail: str, stalled: timedelta) -> dict:
         "object": object_label(obj),
         "namespace": (obj.get("metadata") or {}).get("namespace", ""),
         "heuristic": heuristic,
-        "detail": detail[:MAX_DETAIL_CHARS],
+        "detail": detail,
         "stalled_for": format_duration(seconds),
         "stalled_seconds": seconds,
     }
@@ -577,8 +584,17 @@ def stalled_object_count(findings: list[dict]) -> int:
 # --------------------------------------------------------------------------
 
 
+def table_detail(detail: str) -> str:
+    if len(detail) <= TABLE_DETAIL_MAX_CHARS:
+        return detail
+    return detail[: TABLE_DETAIL_MAX_CHARS - len(TRUNCATION_MARKER)] + TRUNCATION_MARKER
+
+
 def render_table(findings: list[dict]) -> str:
-    rows = [[f["object"], f["heuristic"], f["detail"], f["stalled_for"]] for f in findings]
+    rows = [
+        [f["object"], f["heuristic"], table_detail(f["detail"]), f["stalled_for"]]
+        for f in findings
+    ]
     widths = [len(col) for col in TABLE_COLUMNS]
     for row in rows:
         widths = [max(w, len(cell)) for w, cell in zip(widths, row)]
