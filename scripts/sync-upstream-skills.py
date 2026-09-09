@@ -166,8 +166,9 @@ enabling the setting, wait a moment before retrying rather than concluding it di
 
 ## Executed version checks: the fleet-upgrade-verification skill
 
-This skill advises; it does not read the fleet. When the question is which clusters lag a target
-version, by how many minors, and whether the control plane or a node pool is the laggard, run the
+This skill plans one upgrade at a time; its references read one cluster at a time. When the
+question is which clusters in a fleet lag a target version, by how many minors, and whether the
+control plane or a node pool is the laggard, run the
 [fleet-upgrade-verification](../fleet-upgrade-verification/SKILL.md) skill's script and paste its
 table rather than reasoning from memory:
 

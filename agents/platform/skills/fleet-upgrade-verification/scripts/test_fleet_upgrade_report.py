@@ -115,11 +115,61 @@ class ExplicitTargetTest(unittest.TestCase):
         self.assertEqual(m["status"], report.STATUS_AHEAD)
         self.assertEqual(m["gap_minors"], -1)
 
-    def test_patch_behind_on_same_minor_is_lagging_with_zero_gap(self):
+    def test_patch_behind_on_same_minor_is_not_lagging(self):
         m = self._member([cluster("a", "us-central1", "1.31.2-gke.1", [("default-pool", "1.31.2-gke.1")])])
-        self.assertEqual(m["status"], report.STATUS_LAGGING)
+        self.assertEqual(m["status"], report.STATUS_PATCH_BEHIND)
         self.assertEqual(m["gap_minors"], 0)
-        self.assertIn("patch or build behind", m["note"])
+        self.assertEqual(m["note"], "")
+
+    def test_build_behind_on_same_patch_is_patch_behind(self):
+        m = self._member([cluster("a", "us-central1", "1.31.4-gke.1027000", [("default-pool", "1.31.4-gke.1027000")])])
+        self.assertEqual(m["status"], report.STATUS_PATCH_BEHIND)
+        self.assertEqual(m["gap_minors"], 0)
+
+    def test_minor_behind_pool_beats_patch_behind_control_plane(self):
+        m = self._member([cluster("a", "us-central1", "1.31.2-gke.1", [("old", "1.30.9-gke.1")])])
+        self.assertEqual(m["status"], report.STATUS_LAGGING)
+        self.assertEqual(m["gap_minors"], 1)
+
+    def test_control_plane_ahead_with_pool_lagging_is_lagging(self):
+        m = self._member([cluster("a", "us-central1", "1.32.0-gke.1", [("old", "1.30.0-gke.1")])])
+        self.assertEqual(m["status"], report.STATUS_LAGGING)
+        self.assertEqual(m["gap_minors"], 1)
+
+    def test_control_plane_ahead_with_pool_current_is_ahead_with_zero_gap(self):
+        m = self._member([cluster("a", "us-central1", "1.32.0-gke.1", [("p", self.TARGET)])])
+        self.assertEqual(m["status"], report.STATUS_AHEAD)
+        self.assertEqual(m["gap_minors"], 0)
+
+    def test_pool_ahead_with_control_plane_current_is_ahead_with_zero_gap(self):
+        m = self._member([cluster("a", "us-central1", self.TARGET, [("p", "1.32.0-gke.1")])])
+        self.assertEqual(m["status"], report.STATUS_AHEAD)
+        self.assertEqual(m["gap_minors"], 0)
+
+    def test_major_behind_is_lagging_with_undefined_gap(self):
+        m = self._member([cluster("a", "us-central1", "0.99.0-gke.1", [("p", "0.99.0-gke.1")])])
+        self.assertEqual(m["status"], report.STATUS_LAGGING)
+        self.assertIsNone(m["gap_minors"])
+        self.assertIn("major version differs", m["note"])
+
+    def test_major_ahead_is_ahead_with_undefined_gap(self):
+        m = self._member([cluster("a", "us-central1", "2.0.0-gke.1", [("p", "2.0.0-gke.1")])])
+        self.assertEqual(m["status"], report.STATUS_AHEAD)
+        self.assertIsNone(m["gap_minors"])
+        self.assertIn("major version differs", m["note"])
+
+    def test_unparsable_pool_is_skipped_not_masking(self):
+        m = self._member([cluster("a", "us-central1", self.TARGET, [("good", "1.28.0-gke.1"), ("bad", "weird")])])
+        self.assertEqual(m["status"], report.STATUS_LAGGING)
+        self.assertEqual(m["gap_minors"], 3)
+        self.assertEqual(m["lowest_node_pool"]["name"], "good")
+        self.assertIn("bad ('weird')", m["note"])
+
+    def test_no_parsable_pool_is_unknown(self):
+        m = self._member([cluster("a", "us-central1", self.TARGET, [("bad", "weird")])])
+        self.assertEqual(m["status"], report.STATUS_UNKNOWN)
+        self.assertIsNone(m["lowest_node_pool"])
+        self.assertIn("skipped: bad", m["note"])
 
     def test_unparsable_master_is_unknown(self):
         m = self._member([cluster("a", "us-central1", "weird", [("default-pool", self.TARGET)])])
@@ -137,6 +187,13 @@ class ExplicitTargetTest(unittest.TestCase):
     def test_reconciling_cluster_is_noted(self):
         m = self._member([cluster("a", "us-central1", self.TARGET, [("default-pool", "1.30.1-gke.1")], status="RECONCILING")])
         self.assertEqual(m["status"], report.STATUS_LAGGING)
+        self.assertIn("in flight", m["note"])
+
+    def test_reconciling_pool_is_noted(self):
+        record = cluster("a", "us-central1", self.TARGET, [("default-pool", self.TARGET)])
+        record["nodePools"][0]["status"] = "RECONCILING"
+        m = self._member([record])
+        self.assertEqual(m["status"], report.STATUS_CURRENT)
         self.assertIn("in flight", m["note"])
 
 
@@ -165,7 +222,7 @@ class ChannelFallbackTest(unittest.TestCase):
         self.assertEqual(by_name["stable-c"]["status"], report.STATUS_CURRENT)
         self.assertEqual(by_name["stable-c"]["target_source"], "channel default (STABLE)")
         self.assertIsNone(result["target_version"])
-        self.assertEqual(result["summary"], {"lagging": 1, "current": 2, "ahead": 0, "unknown": 0})
+        self.assertEqual(result["summary"], {"lagging": 1, "patch-behind": 0, "current": 2, "ahead": 0, "unknown": 0})
 
     def test_server_config_fetched_once_per_location(self):
         clusters = [
@@ -210,6 +267,33 @@ class ChannelFallbackTest(unittest.TestCase):
             m = report.build_report(["p1"], None)["members"][0]
         self.assertEqual(m["status"], report.STATUS_UNKNOWN)
         self.assertIn("EXTENDED", m["note"])
+
+
+class RunCmdTest(unittest.TestCase):
+    def test_timeout_is_a_failed_read(self):
+        import subprocess
+
+        def hang(*args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=args[0], timeout=kwargs["timeout"])
+
+        with patch.object(report.subprocess, "run", hang):
+            rc, out, err = report.run_cmd(["gcloud", "container", "clusters", "list"])
+        self.assertEqual(rc, -1)
+        self.assertEqual(out, "")
+        self.assertIn(f"timed out after {report.GCLOUD_TIMEOUT_SECONDS} seconds", err)
+
+    def test_timeout_is_passed_to_subprocess(self):
+        seen = {}
+
+        def record(*args, **kwargs):
+            seen.update(kwargs)
+            raise FileNotFoundError("gcloud")
+
+        with patch.object(report.subprocess, "run", record):
+            rc, _, err = report.run_cmd(["gcloud"])
+        self.assertEqual(seen.get("timeout"), report.GCLOUD_TIMEOUT_SECONDS)
+        self.assertEqual(rc, -1)
+        self.assertIn("gcloud", err)
 
 
 class ProjectFailureTest(unittest.TestCase):
@@ -265,7 +349,7 @@ class OutputShapeTest(unittest.TestCase):
         self.assertTrue(set(lines[1]) <= set("|- "))
         self.assertIn("| p1 | seeded-a | us-central1 | REGULAR | 1.31.0-gke.1 | 1.31.0-gke.1 (default-pool) | 1.31.0-gke.1 | 0 | current | - |", lines)
         self.assertIn("| p1 | seeded-b | us-central1 | REGULAR | 1.30.2-gke.1 | 1.30.2-gke.1 (default-pool) | 1.31.0-gke.1 | 1 | lagging | - |", lines)
-        self.assertIn("2 member(s) across 1 project(s): 1 lagging, 1 current, 0 ahead, 0 unknown; target 1.31.0-gke.1", text)
+        self.assertIn("2 member(s) across 1 project(s): 1 lagging, 0 patch-behind, 1 current, 0 ahead, 0 unknown; target 1.31.0-gke.1", text)
 
     def test_channel_default_label_in_target_column(self):
         fake = FakeGcloud({"p1": [cluster("a", "us-central1", "1.30.2-gke.1", [("p", "1.30.2-gke.1")])]}, {"us-central1": server_config(REGULAR="1.31.0-gke.1")})
@@ -296,6 +380,13 @@ class OutputShapeTest(unittest.TestCase):
         fake = FakeGcloud({}, {}, failing_projects=["p1"])
         with patch.object(report, "run_cmd", fake), redirect_stdout(io.StringIO()):
             rc = report.main(["--project", "p1", "--target-version", self.target])
+        self.assertEqual(rc, report.EXIT_PARTIAL)
+
+    def test_main_returns_partial_when_output_cannot_be_written(self):
+        out_dir = tempfile.mkdtemp()
+        # A directory where the file should go: open() fails with IsADirectoryError, an OSError.
+        with patch.object(report, "run_cmd", self.fake), redirect_stdout(io.StringIO()):
+            rc = report.main(["--project", "p1", "--target-version", self.target, "--output", out_dir])
         self.assertEqual(rc, report.EXIT_PARTIAL)
 
     def test_bad_target_version_is_usage_error(self):

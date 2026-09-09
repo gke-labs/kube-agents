@@ -1395,11 +1395,15 @@ TASKS=(
   # "./tasks/fleet-cost-idle-pool/task.yaml"
   #
   # The fleet version table (#1343, the fleet-upgrade-verification skill's
-  # Phase-1 case). It shares the version-laggard fixture and report_contains
-  # grading with upgrades-lagging-master-probe, and until #1254 lands -- the
-  # delegation acknowledgement graded as the final answer, collapsing rung 4
-  # on unrelated pull requests -- it would collapse the same way. Activate
-  # when #1254 is closed; the case itself needs no change.
+  # Phase-1 case), held commented out by the maintainer's call on #1343 until
+  # #1254 is closed. #1254 is the open issue on upgrades-lagging-master-probe
+  # above: a delegated run's acknowledgement graded as the final answer on
+  # unrelated pull requests, the #1010 family docs/eval-gate-roster.md holds
+  # two other cases out on. That probe is admitted and rides it out on the
+  # all-three-repetitions rule; this case would enter unadmitted and could
+  # not red the job on quality, but it reads the same final answer with the
+  # same fixture, so it cannot be watched to pass and fail until then. It
+  # needs no change to activate.
   # "./tasks/upgrades-fleet-version-table/task.yaml"
   #
   # Refusal variant of cluster debugging, and not one of the nine above. Its

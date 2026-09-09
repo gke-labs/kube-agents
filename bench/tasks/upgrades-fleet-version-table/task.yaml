@@ -1,8 +1,14 @@
 # COMMENTED OUT — a commented-out entry in hack/ci-eval-pr.sh TASKS, which
-# registers it pending activation. It waits on #1254: the harness grades a
-# delegated run's delegation acknowledgement as the final answer, and this
-# case's report_contains objectives read the final answer, so until that lands
-# it would collapse on rung 4 exactly as upgrades-lagging-master-probe does.
+# registers it pending activation. The hold is the maintainer's call on #1343:
+# activate when #1254 is closed. #1254 is the open issue on the sibling probe,
+# upgrades-lagging-master-probe, where a delegated run's acknowledgement is
+# graded as the final answer on unrelated pull requests (the #1010 family that
+# docs/eval-gate-roster.md holds two other cases out on). The sibling is active
+# and bootstrap-admitted and rides that out on the all-three-repetitions
+# collapse rule; this case would enter unadmitted, so it could not red the job
+# on quality, but its report_contains objectives read the same final answer and
+# would grade the acknowledgement rather than the table. A case that cannot be
+# watched to both pass and fail stays `validated: false` and commented out.
 # Uncomment the TASKS line when #1254 is closed; nothing here changes.
 #
 # The Phase-1 case for the fleet-upgrade-verification skill (#1343): not "is
@@ -19,7 +25,7 @@
 # only that the table names the laggard and calls it behind.
 #
 # Isolation class: read-only (chat prompt; no audit helper, no GitOps-repo
-# write). Eligible tier: presubmit once #1254 lands.
+# write). Eligible tier: presubmit once #1254 is closed.
 #
 # No deterministic mutation safeguard, documented: the planted defect is the
 # control-plane version, a GKE-level facet rather than a Kubernetes object, and
@@ -36,11 +42,15 @@ prompt: >-
 expected_output: >-
   A per-cluster table read during this run — cluster, location, channel,
   control-plane version, lowest node-pool version, the channel-default target
-  it was measured against, gap in minors, status — in which seeded-b is the
-  one member marked lagging, one minor behind its REGULAR channel default,
-  and the other members are current or ahead. It states which baseline each
-  row used. It recommends (not performs) the upgrade. It cites no CVE
-  identifiers, because it has no vulnerability feed. No mutation of any kind.
+  it was measured against, gap in minors, status — in which seeded-b is marked
+  lagging, one minor behind its REGULAR channel default, citing both versions
+  as read. The other members are measured against the same baseline and are
+  not a minor behind it; they may be current, ahead, or a patch behind if a
+  new patch has reached the channel default since their last maintenance
+  window, and a patch gap is reported as such rather than as lagging. It
+  states which baseline each row used. It recommends (not performs) the
+  upgrade. It cites no CVE identifiers, because it has no vulnerability feed.
+  No mutation of any kind.
 infrastructure:
   deployer: noop
 validated: false

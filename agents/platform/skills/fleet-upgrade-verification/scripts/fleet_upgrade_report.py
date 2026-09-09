@@ -26,19 +26,27 @@ MONITORED_PROJECTS_ENV = "MONITORED_PROJECT_IDS"
 PROJECT_ENV_VARS = ("GCP_PROJECT_ID", "GKE_PROJECT_ID", "PROJECT_ID")
 GCLOUD = "gcloud"
 JSON_FORMAT_FLAG = "--format=json"
+# A stalled API call is reported as a failed read for its project or location rather
+# than blocking the agent turn; the same budget compute_fleet_audit.py gives gcloud.
+GCLOUD_TIMEOUT_SECONDS = 60
 
 # `MAJOR.MINOR.PATCH-gke.BUILD`; the `-gke.BUILD` suffix is optional, and a version
 # without it gets BUILD 0, as the security-patch-orchestrator SOP's comparison rule
 # says. Anything else is unparsable and degrades its row to `unknown`.
 VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)(?:-gke\.(\d+))?$")
 
-# Per-member verdicts. `ahead` is reported and never flagged: channel rollout waves
-# are staged, so a member newer than its channel default is routine.
+# Per-member verdicts. `lagging` is a minor (or major) behind the target on the control
+# plane or a pool; `patch-behind` is the same minor with a lower patch or gke build,
+# kept apart because a new patch reaches a channel default before any rollout wave has
+# applied it, so a whole fleet is routinely patch-behind the morning after. `ahead` is
+# reported and never flagged for the mirror-image reason. The SOP grades the same split
+# as major versus minor severity.
 STATUS_LAGGING = "lagging"
+STATUS_PATCH_BEHIND = "patch-behind"
 STATUS_CURRENT = "current"
 STATUS_AHEAD = "ahead"
 STATUS_UNKNOWN = "unknown"
-STATUS_ORDER = (STATUS_LAGGING, STATUS_CURRENT, STATUS_AHEAD, STATUS_UNKNOWN)
+STATUS_ORDER = (STATUS_LAGGING, STATUS_PATCH_BEHIND, STATUS_CURRENT, STATUS_AHEAD, STATUS_UNKNOWN)
 
 # `releaseChannel.channel` values that mean "no channel"; such a member has no
 # channel default to measure against and needs an explicit --target-version.
@@ -54,11 +62,14 @@ CHANNEL_DEFAULT_LABEL = "channel default ({channel})"
 # the SOP does before it suppresses a version finding.
 IN_FLIGHT_STATUSES = ("RECONCILING", "PROVISIONING")
 
-# Table rendering: the empty-cell placeholder, the header separator cell, and the
-# separator between the reasons a row's note carries.
+# Table rendering: the empty-cell placeholder, the header separator cell, the
+# separator between the reasons a row's note carries, and the name shown for a pool
+# record that has none.
 EMPTY_CELL = "-"
 TABLE_SEPARATOR_CELL = "---"
 NOTE_SEPARATOR = "; "
+UNNAMED_POOL = "?"
+JSON_INDENT = 2
 TABLE_COLUMNS = (
     "project",
     "cluster",
@@ -79,11 +90,13 @@ EXIT_PARTIAL = 1
 EXIT_USAGE = 2
 
 
-def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
+def run_cmd(cmd: list[str], timeout: int = GCLOUD_TIMEOUT_SECONDS) -> tuple[int, str, str]:
     """Runs a command and returns (rc, stdout, stderr); never raises."""
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        res = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=timeout)
         return res.returncode, res.stdout, res.stderr
+    except subprocess.TimeoutExpired:
+        return -1, "", f"timed out after {timeout} seconds"
     except Exception as e:  # noqa: BLE001 - a missing binary is a report, not a crash
         return -1, "", str(e)
 
@@ -150,18 +163,29 @@ def compare(target: tuple[int, int, int, int], member: tuple[int, int, int, int]
 
 
 def lowest_node_pool(node_pools: list[dict]) -> tuple[dict | None, str | None]:
-    """The pool with the lowest parsable version, or (None, reason) when there is none."""
+    """The pool with the lowest parsable version, and a note naming any pool skipped.
+
+    A pool whose version does not parse is skipped and named, not allowed to hide a real
+    lag on the pools that do parse; the result is None only when no pool parses.
+    """
     if not isinstance(node_pools, list) or not node_pools:
         return None, "no nodePools in the cluster record"
     parsed = []
+    skipped = []
     for pool in node_pools:
-        version = parse_version(pool.get("version")) if isinstance(pool, dict) else None
+        if not isinstance(pool, dict):
+            skipped.append(UNNAMED_POOL)
+            continue
+        version = parse_version(pool.get("version"))
         if version is None:
-            name = pool.get("name", "?") if isinstance(pool, dict) else "?"
-            return None, f"node pool {name} has an unparsable version {pool.get('version')!r}"
+            skipped.append(f"{pool.get('name') or UNNAMED_POOL} ({pool.get('version')!r})")
+            continue
         parsed.append((version, pool))
+    note = f"node pool version unparsable, skipped: {', '.join(skipped)}" if skipped else None
+    if not parsed:
+        return None, note
     version, pool = min(parsed, key=lambda item: item[0])
-    return {"name": pool.get("name", ""), "version": pool.get("version"), "status": pool.get("status", "")}, None
+    return {"name": pool.get("name", ""), "version": pool.get("version"), "status": pool.get("status", "")}, note
 
 
 class ServerConfigCache:
@@ -242,7 +266,7 @@ def grade_member(cluster: dict, project: str, explicit_target: str | None, cache
     target = parse_version(target_text) if target_text else None
     if master is None:
         notes.append(f"control plane version unparsable: {master_text!r}")
-    if lowest is None:
+    if pool_reason:
         notes.append(pool_reason)
     if target_text is None:
         notes.append(target_reason)
@@ -255,18 +279,19 @@ def grade_member(cluster: dict, project: str, explicit_target: str | None, cache
 
     if master is not None and lowest is not None and target is not None:
         pool_version = parse_version(lowest["version"])
+        lowest_component = min(master, pool_version)
         verdicts = {compare(target, master), compare(target, pool_version)}
+        member["gap_minors"] = minor_gap(target, lowest_component)
         if STATUS_LAGGING in verdicts:
-            member["status"] = STATUS_LAGGING
+            # Below the target somewhere: a minor or major behind is lagging; the same
+            # minor with a lower patch or build is patch-behind.
+            member["status"] = STATUS_LAGGING if member["gap_minors"] != 0 else STATUS_PATCH_BEHIND
         elif verdicts == {STATUS_CURRENT}:
             member["status"] = STATUS_CURRENT
         else:
             member["status"] = STATUS_AHEAD
-        member["gap_minors"] = minor_gap(target, min(master, pool_version))
         if member["gap_minors"] is None:
             notes.append("major version differs from the target; minor gap undefined")
-        elif member["status"] == STATUS_LAGGING and member["gap_minors"] == 0:
-            notes.append("same minor, patch or build behind")
 
     member["note"] = NOTE_SEPARATOR.join(n for n in notes if n)
     return member
@@ -368,7 +393,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
             with open(args.output, "w", encoding="utf-8") as f:
-                json.dump(report, f, indent=2)
+                json.dump(report, f, indent=JSON_INDENT)
             print(f"\nWrote {len(report['members'])} member(s) to {args.output}")
         except OSError as e:
             sys.stderr.write(f"failed to write {args.output}: {e}\n")
