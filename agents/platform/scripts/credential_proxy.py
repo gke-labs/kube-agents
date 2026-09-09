@@ -1502,8 +1502,9 @@ ALLOWED_GIT_SUBCOMMANDS = frozenset(
 # filters, or execution hooks is refused.
 ALLOWED_GIT_CONFIG_KEYS = frozenset({"user.name", "user.email"})
 
-# Query options that make a `git config` invocation read-only.
-ALLOWED_GIT_CONFIG_QUERY_FLAGS = frozenset(
+# Actions that make a `git config` invocation a read-only query.
+# Must appear in option position (before the first positional argument).
+GIT_CONFIG_QUERY_ACTIONS = frozenset(
     {
         "--get",
         "--get-all",
@@ -1511,9 +1512,26 @@ ALLOWED_GIT_CONFIG_QUERY_FLAGS = frozenset(
         "--get-urlmatch",
         "--list",
         "-l",
-        "--show-origin",
-        "--show-scope",
+        "--get-color",
+        "--get-colorbool",
     }
+)
+
+# Mutation actions that write or unset configuration keys.
+GIT_CONFIG_WRITE_ACTIONS = frozenset(
+    {
+        "--add",
+        "--replace-all",
+        "--unset",
+        "--unset-all",
+        "--rename-section",
+        "--remove-section",
+    }
+)
+
+# Options that take a separate argument before positional parameters.
+GIT_CONFIG_OPTIONS_WITH_VALUE = frozenset(
+    {"--default", "--type", "--comment"}
 )
 
 GIT_MUTATING_SUBCOMMANDS = frozenset(
@@ -1529,7 +1547,18 @@ GIT_MUTATING_SUBCOMMANDS = frozenset(
 # Needed to find the subcommand in `git --literal-pathspecs add …` (which
 # audit_report issues) without mistaking a flag for a verb.
 _GIT_GLOBAL_WITH_VALUE = frozenset(
-    {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix"}
+    {
+        "-C",
+        "-c",
+        "--attr-source",
+        "--config-env",
+        "--exec-path",
+        "--git-dir",
+        "--namespace",
+        "--shallow-file",
+        "--super-prefix",
+        "--work-tree",
+    }
 )
 
 # Directory `core.hooksPath` is pinned to. It lives under the state dir, which
@@ -1657,6 +1686,8 @@ _GIT_REFUSED_ARGUMENTS = {
     "--exec-path": "chooses where git looks for the program to run",
     "--git-dir": "points git at a repository outside the shared workspace",
     "--work-tree": "points git at a tree outside the shared workspace",
+    "--attr-source": "reads gitattributes from a tree-ish which can select caller-named filters or diff drivers",
+    "--shallow-file": "points git at a shallow file outside the shared workspace",
     # `git config --global` writes the very file GIT_CONFIG_GLOBAL pins, and
     # `config` is not a mutating verb so it needs no lease. Demonstrated: the
     # agent writes `alias.zz = !<payload>` into the broker's own global config
@@ -1962,7 +1993,7 @@ def git_argument_violation(argv: list[str]) -> str | None:
     subcommand, _ = _git_plan(argv)
     if subcommand is not None and subcommand not in ALLOWED_GIT_SUBCOMMANDS:
         return f"`git {subcommand}` is refused: subcommand is not supported by the credential proxy."
-    if subcommand == "config":
+    if subcommand == "config" or "config" in argv:
         config_violation = _git_config_violation(argv)
         if config_violation is not None:
             return config_violation
@@ -1972,30 +2003,54 @@ def git_argument_violation(argv: list[str]) -> str | None:
 def _git_config_violation(argv: list[str]) -> str | None:
     """Why this git config argv may not run, or None if it may.
 
-    Queries (--get, --list, etc.) are non-mutating reads and are allowed.
-    Configuration writes are restricted to author identity (user.name, user.email)
-    which GitOps and workspace setup require. Any attempt to write aliases, filters,
-    drivers, or other configuration keys is refused.
+    Git parses `git config` options using PARSE_OPT_STOP_AT_NON_OPTION: options
+    must precede the first positional argument.
+
+    Query actions (--get, --list, etc.) are non-mutating reads and are allowed.
+    Configuration writes (implicit set with >= 2 positionals, or write actions like
+    --add, --replace-all, --unset) are restricted to author identity keys (user.name,
+    user.email). Any attempt to write or unset other keys is refused.
     """
     if "config" not in argv:
         return None
-    for arg in argv:
-        flag = arg.split("=", 1)[0]
-        if flag in ALLOWED_GIT_CONFIG_QUERY_FLAGS:
-            return None
     try:
         config_index = argv.index("config")
     except ValueError:
         return None
-    for token in argv[config_index + 1:]:
-        if token.startswith("-"):
-            continue
-        if token not in ALLOWED_GIT_CONFIG_KEYS:
+
+    config_args = argv[config_index + 1:]
+    actions: set[str] = set()
+    positionals: list[str] = []
+    idx = 0
+    while idx < len(config_args):
+        arg = config_args[idx]
+        if not arg.startswith("-") or arg == "--":
+            if arg == "--":
+                idx += 1
+            positionals = config_args[idx:]
+            break
+        name = arg.split("=", 1)[0]
+        if name in GIT_CONFIG_QUERY_ACTIONS:
+            actions.add(name)
+        elif name in GIT_CONFIG_WRITE_ACTIONS:
+            actions.add(name)
+        if name in GIT_CONFIG_OPTIONS_WITH_VALUE and "=" not in arg:
+            idx += 1
+        idx += 1
+
+    if actions and not (actions & GIT_CONFIG_WRITE_ACTIONS) and (actions & GIT_CONFIG_QUERY_ACTIONS):
+        return None
+
+    is_write = bool(actions & GIT_CONFIG_WRITE_ACTIONS) or len(positionals) >= 2
+    if is_write:
+        if not positionals:
+            return "`git config` write is refused: missing configuration key."
+        target_key = positionals[0]
+        if target_key not in ALLOWED_GIT_CONFIG_KEYS:
             return (
-                f"`git config {token}` is refused: only author identity configuration "
+                f"`git config {target_key}` is refused: only author identity configuration "
                 "(user.name, user.email) and query options are permitted."
             )
-        return None
     return None
 
 

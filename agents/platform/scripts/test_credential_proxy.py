@@ -1068,7 +1068,7 @@ class GitHardeningTest(unittest.TestCase):
         # Scanning every token cannot disagree with git about where the
         # subcommand is.
         self.assertEqual(
-            _git_plan(["git", "--attr-source", "HEAD", "help", "-m", "git"])[0], "HEAD"
+            _git_plan(["git", "--attr-source", "HEAD", "help", "-m", "git"])[0], "help"
         )
         self.assertIsNotNone(
             git_argument_violation(["git", "--attr-source", "HEAD", "help", "-m", "git"])
@@ -1138,12 +1138,53 @@ class GitHardeningTest(unittest.TestCase):
         self.assertIsNone(
             git_argument_violation(["git", "config", "--get", "remote.origin.url"])
         )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "--list"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "-l"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "--show-origin", "--get", "remote.origin.url"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "--add", "user.name", "bot"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "--unset", "user.email"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "user.name"])
+        )
         # Writing unapproved keys repo-locally is also refused.
         self.assertIsNotNone(
             git_argument_violation(["git", "config", "alias.zz", "!sh"])
         )
         self.assertIsNotNone(
             git_argument_violation(["git", "config", "core.pager", "sh"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--add", "alias.foo", "bar"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--unset", "core.pager"])
+        )
+        # Trailing query flags after positional arguments do not bypass write restrictions.
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "alias.zz", "!sh", "--get"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "diff.external", "payload", "--get"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--show-origin", "core.pager", "sh"])
+        )
+        # --attr-source cannot bypass the subcommand allowlist or config gate.
+        self.assertIsNotNone(
+            git_argument_violation(["git", "--attr-source", "status", "difftool"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "--attr-source", "status", "config", "alias.zz", "!sh"])
         )
 
     def test_unsupported_git_subcommands_are_refused(self):
