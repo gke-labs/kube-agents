@@ -105,9 +105,9 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 
 #### Why `--generate-only` on Existing Infrastructure:
 
-- **Longer Terraform Operations**: On existing infrastructure with numerous cloud resources, Terraform lifecycle commands (`init`, `validate`, and provider schema inspection) take longer than on greenfield deployments.
+- **Operator Review Before Live Mutation**: Adopting existing infrastructure means `terraform apply` touches resources you did not create, so generating the inputs and reviewing them before the apply keeps that decision with the operator.
 - **Operator Review & Control**: Adopting existing infrastructure benefits from inspecting generated inputs (`terraform.tfvars`, `install.env`) and manual execution of prerequisites before applying Terraform changes.
-- **Out-of-Terraform Prerequisites & Operator Handoff**: The installer auto-detects existing cluster parameters (Workload Identity pool, CMEK database encryption, NetworkPolicy status, OTel collection scope, and KMS token-minter keys), runs pre-apply validations without mutating GCP resources, and prints the exact shell commands needed before and after Terraform apply.
+- **Out-of-Terraform Prerequisites & Operator Handoff**: The installer probes the target cluster, runs pre-apply validations without mutating GCP resources, and prints a checklist of the steps Terraform cannot perform (CMEK database encryption, the Workload Identity pool, NetworkPolicy enforcement, the GitHub App private key import, and the managed-OTel scope) for you to apply as they pertain to your cluster.
 
 #### What `--generate-only` Does:
 
@@ -120,7 +120,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
      cd terraform/examples/full-install
      KUBE_AGENTS_STATE_BUCKET="<project>-kube-agents-tfstate" KUBE_AGENTS_STATE_PREFIX="kube-agents/<cluster>" ./lifecycle.sh apply
      ```
-   - **Post-apply steps** (managed-OTel collection scope and Slack socket registration if configured).
+   - **Post-apply steps** (managed-OTel collection scope, on a cluster this install created).
 4. Exits with code `0` and writes `{"status": "GENERATE_ONLY_SUCCESS", ...}` to `/tmp/kube-agents-install-report.json`.
 
 ### Non-Interactive & AI Agent Execution Mode

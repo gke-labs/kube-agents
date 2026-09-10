@@ -30,17 +30,18 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    tfvar_kms_key='"k8s-secret-encryption-key"',
                    tfvar_cluster_name="null",
                    tfvar_enable_minter="false",
-                   gcloud_key_version=""):
+                   gcloud_key_version="",
+                   gcloud_kms_fail=False):
         """Run a lifecycle.sh function against stubbed terraform and gcloud commands."""
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
             bin_dir.mkdir()
             gcloud = bin_dir / "gcloud"
+            kms_behavior = "echo 'ERROR: permission denied' >&2; exit 1" if gcloud_kms_fail else f"echo '{gcloud_key_version}'; exit 0"
             gcloud.write_text(f"""#!/usr/bin/env bash
 set -e
 if [[ "$*" == *"kms keys versions list"* ]]; then
-    echo '{gcloud_key_version}'
-    exit 0
+    {kms_behavior}
 fi
 {gcloud_stub}
 """)
@@ -462,6 +463,17 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 1)
         self.assertIn("enable_github_minter is true, but KMS signing key 'us-central1/github-token-minter-keyring/github-token-minter-key' has no ENABLED version.", proc.stderr)
         self.assertIn("Applying now would deploy the minter and wedge waiting on its readiness probe.", proc.stderr)
+
+    def test_guard_minter_key_warns_and_proceeds_when_gcloud_fails(self):
+        """When enable_github_minter is true but gcloud command fails, guard_minter_key logs warning and allows apply."""
+        proc = self._run_guard(
+            "guard_minter_key",
+            tfvar_enable_minter='"true"',
+            gcloud_kms_fail=True,
+        )
+        self.assertEqual(proc.returncode, 0, f"unexpected failure: {proc.stderr}")
+        self.assertIn("could not verify Cloud KMS signing key 'us-central1/github-token-minter-keyring/github-token-minter-key' for GitHub minter", proc.stderr)
+        self.assertIn("Proceeding with apply", proc.stderr)
 
 
 if __name__ == "__main__":

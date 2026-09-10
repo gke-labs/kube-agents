@@ -981,6 +981,7 @@ print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-cent
         # Out-of-Terraform prerequisites
         self.assertIn("CMEK Database Encryption (pre-existing cluster without CMEK):", out)
         self.assertIn("gcloud services enable cloudkms.googleapis.com --project=test-proj", out)
+        self.assertIn("gcloud beta services identity create --service=container.googleapis.com --project=test-proj", out)
         self.assertIn("gcloud container clusters update test-cluster --location us-central1 --database-encryption-key=", out)
         self.assertIn("Workload Identity Pool (pre-existing Standard cluster):", out)
         self.assertIn("gcloud container clusters update test-cluster --location us-central1 --project test-proj --workload-pool=test-proj.svc.id.goog", out)
