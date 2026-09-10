@@ -806,6 +806,8 @@ openshift:
   route:
     enabled: false
     host: ""
+    # Backend service port to target (defaults to api / 8642).
+    targetPort: api
     tls:
       termination: edge
 
