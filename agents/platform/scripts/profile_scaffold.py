@@ -25,7 +25,19 @@ from pathlib import Path
 # configuration, and so must be merged rather than replaced. Relative to the
 # profile home, POSIX-separated; each one needs a merge rule below.
 MERGE_PATHS: tuple[str, ...] = ("cron/jobs.json",)
+# The file a capability's criteria live in (see capability_store.py). The
+# agent edits it at runtime, so across a pod start the rule is the inverse of
+# MERGE_PATHS: the volume wins every key it holds and the image adds only the
+# keys the volume is silent about. A glob relative to the profile home,
+# resolved against the volume, because the capability names are not fixed.
+# The schema and learning.json beside it are image-owned and simply replaced:
+# a policy the volume could keep is a policy a release could never tighten.
+VOLUME_WINS_GLOBS: tuple[str, ...] = ("capabilities/*/criteria.json",)
 DEFAULT_LEGACY_CRON_RISK: str = "low"
+# Atomic rewrites go through a sibling scratch file and os.replace; a torn
+# jobs.json is a profile with no cron roster, and this runs during start-up
+# on a volume that may be mid-restart.
+SCRATCH_SUFFIX: str = ".tmp"
 
 
 
@@ -148,6 +160,13 @@ def read_json(path: Path) -> object | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+
+
+def write_json_atomic(path: Path, payload: object, *, sort_keys: bool = False) -> None:
+    """Write `payload` as JSON to `path` via a scratch sibling and os.replace."""
+    scratch = path.with_name(path.name + SCRATCH_SUFFIX)
+    scratch.write_text(json.dumps(payload, indent=2, sort_keys=sort_keys) + "\n", encoding="utf-8")
+    os.replace(scratch, path)
 
 
 def merge_cron_store(
@@ -273,9 +292,7 @@ def backfill_cron_file(path: Path) -> bool:
     if backfilled == data:
         return False
     try:
-        scratch = path.with_name(path.name + ".tmp")
-        scratch.write_text(json.dumps(backfilled, indent=2) + "\n", encoding="utf-8")
-        os.replace(scratch, path)
+        write_json_atomic(path, backfilled)
         return True
     except OSError as exc:
         log(f"WARN: could not backfill cron store {path}: {exc}")
@@ -350,17 +367,71 @@ def _merge_after_overlay(
         )
         destination = home.joinpath(*parts)
         try:
-            # Temp file and os.replace, not a plain write: a torn jobs.json is
-            # a profile with no cron roster at all, and this runs during
-            # start-up on a volume that may be mid-restart.
-            scratch = destination.with_name(destination.name + ".tmp")
-            scratch.write_text(json.dumps(merged, indent=2) + "\n", encoding="utf-8")
-            os.replace(scratch, destination)
+            write_json_atomic(destination, merged)
         except OSError as exc:
             # The image's copy is already in place, so the profile still runs;
             # what is lost is the run history. Say so rather than fail the
             # whole start-up over it.
             log(f"WARN: could not merge {relative}; image copy stands ({exc})")
+
+
+def merge_volume_wins(image: object, live: object) -> object:
+    """The rule for every VOLUME_WINS_GLOBS file across a pod start.
+
+    The volume wins every key it holds; the image contributes only the keys the
+    volume is silent about. A threshold the operator tuned through the agent
+    therefore survives an upgrade, and a key a new release adds arrives with
+    its shipped default. A key the image stops shipping stays on the volume —
+    the image-owned schema beside it is what says the key is no longer defined.
+    """
+    if not isinstance(image, dict):
+        return live if isinstance(live, dict) else image
+    if not isinstance(live, dict):
+        return image
+    return {**image, **live}
+
+
+def _snapshot_volume_wins(home: Path) -> dict[str, object]:
+    prior: dict[str, object] = {}
+    for pattern in VOLUME_WINS_GLOBS:
+        for path in home.glob(pattern):
+            contents = read_json(path)
+            if contents is not None:
+                prior[path.relative_to(home).as_posix()] = contents
+    return prior
+
+
+def _restore_volume_wins(
+    home: Path, template_dir: Path, names: tuple[str, ...], prior: dict[str, object]
+) -> None:
+    """Write each VOLUME_WINS_GLOBS file the volume held as volume-over-image.
+
+    The copy skipped these files (see overlay_template), so this is their only
+    write on this start. A file the template does not ship — a capability the
+    image dropped, or one an operator added by hand — needs nothing.
+
+    Known limit: this runs outside the store's per-capability lock, so at
+    availability.replicas > 1 on one RWX volume a `set` committed by a running
+    replica between a starting replica's snapshot and its restore is lost (the
+    changelog line survives). Same class as the roster's documented
+    multi-replica window in docker-entrypoint.sh; single-replica installs are
+    unaffected.
+    """
+    for relative, previous in prior.items():
+        parts = relative.split("/")
+        if parts[0] not in names:
+            continue
+        source = template_dir.joinpath(*parts)
+        if not source.is_file():
+            continue
+        destination = home.joinpath(*parts)
+        merged = merge_volume_wins(read_json(source), previous)
+        try:
+            write_json_atomic(destination, merged, sort_keys=True)
+        except OSError as exc:
+            # The image's defaults are in place, so the capability still runs;
+            # what is lost is the operator's tuning, which is worth a line.
+            log(f"WARN: could not merge {relative}; image defaults stand ({exc})")
 
 
 def overlay_template(
@@ -381,7 +452,8 @@ def overlay_template(
     overwritten with the rest, and then rewritten as a merge of the two. See
     `merge_cron_store` for why a file can be both image-owned and runtime state,
     and what `cron_job_ids` narrows that merge to; `cron_retire_ids` names the
-    ids to delete from the volume outright (see `retire_cron_jobs`).
+    ids to delete from the volume outright (see `retire_cron_jobs`). The
+    `VOLUME_WINS_GLOBS` files get the opposite merge (see `merge_volume_wins`).
     """
     if not template_dir.is_dir():
         raise SystemExit(f"ERROR: template dir not found: {template_dir}")
@@ -391,16 +463,29 @@ def overlay_template(
         for relative in MERGE_PATHS
         if (contents := read_json(home.joinpath(*relative.split("/")))) is not None
     }
+    prior_volume_wins = _snapshot_volume_wins(home)
+    # A volume-wins file the volume already holds is left out of the copy, so
+    # the merged rewrite below is the only write it sees. Copying it first and
+    # restoring after would leave the tuned values only in memory between the
+    # two steps, and a container killed in that window starts next time from
+    # image defaults. Files the volume lacks are copied as normal.
+    held = {home.joinpath(*relative.split("/")) for relative in prior_volume_wins}
+
+    def _skip_held(src_dir: str, names_in_dir: list[str]) -> list[str]:
+        dest_dir = home / Path(src_dir).relative_to(template_dir)
+        return [n for n in names_in_dir if dest_dir / n in held]
+
     for item_name in names:
         src = template_dir / item_name
         if not src.exists():
             continue
         dest = home / item_name
         if src.is_dir():
-            shutil.copytree(src, dest, dirs_exist_ok=True)
+            shutil.copytree(src, dest, dirs_exist_ok=True, ignore=_skip_held)
         else:
             shutil.copy2(src, dest)
     _merge_after_overlay(home, template_dir, names, prior, cron_job_ids, cron_retire_ids)
+    _restore_volume_wins(home, template_dir, names, prior_volume_wins)
     if plugins_dir and plugins_dir.is_dir():
         try:
             shutil.copytree(plugins_dir, home / "plugins", dirs_exist_ok=True)

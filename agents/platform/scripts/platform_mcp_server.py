@@ -20,8 +20,16 @@ from mcp.server import MCPServer
 import sandbox_exec
 from agent_common_server import _run_env, CONFIG_PATH
 from gke_endpoint import dns_endpoint_args
+import capability_store
 
 DEFAULT_SESSION_KV_DB_PATH = "/var/lib/kube-agents/session/session_kv.db"
+
+# What `capability_criteria` accepts as `action`. Kept as a tuple so the tool's
+# error names every option rather than the one the caller mistyped.
+CAPABILITY_ACTIONS = ("list", "get", "set", "history")
+# Recorded as `actor` on every criteria change this server writes, so a
+# changelog reader can tell them from a write by any other caller of the store.
+CAPABILITY_ACTOR = "platform-agent"
 
 # How long `report_to_chat` waits on /v1/cron-reports. That route relays
 # synchronously — it creates the session, runs a whole Chat Agent turn (its own
@@ -1157,6 +1165,68 @@ def findings_publication(
     return _findings_call(
         "PUT", f"/v1/findings/publication/{urllib.parse.quote(publisher, safe='')}", body
     )
+
+
+@mcp.tool()
+def capability_criteria(
+    action: str,
+    capability: str = "",
+    changes: dict | None = None,
+    reason: str = "",
+    confirmed_by: str = "",
+) -> str:
+    """Read or change the tunable criteria of a capability on the delivery vehicle.
+
+    A capability's procedure (its governance SOP or SKILL.md) is fixed by the
+    image; the thresholds, exclusions and scopes it reads are not. This tool is
+    the only way to read or change them, and it is what makes a change survive
+    a pod restart and an upgrade.
+
+    Actions:
+      list                       -> the capability names this profile carries.
+      get      capability        -> current values, schema defaults, and the
+                                    per-key policy ("autonomous" | "propose" |
+                                    "never"). Call this at the START of a run
+                                    and use the values it returns in place of
+                                    any number the procedure quotes.
+      set      capability changes reason [confirmed_by]
+                                 -> write new values. `changes` maps key -> new
+                                    value; `reason` says what prompted it. A key
+                                    whose policy is "propose" is refused unless
+                                    `confirmed_by` names the operator who agreed
+                                    — show them the before/after first, then
+                                    call again with their name. A "never" key is
+                                    refused outright: it changes through review.
+      history  capability        -> the last accepted changes, newest last.
+
+    Every accepted change is appended to the capability's changelog with who
+    confirmed it and why, and bumps its revision. State the revision you ran
+    with in the report so a reader knows which criteria produced it.
+    """
+    action = (action or "").strip().lower()
+    if action not in CAPABILITY_ACTIONS:
+        return f"ERROR: action must be one of {list(CAPABILITY_ACTIONS)}, got {action!r}."
+    root = capability_store.capabilities_root(get_hermes_home())
+    try:
+        if action == "list":
+            return json.dumps({"capabilities": capability_store.list_capabilities(root)})
+        if action == "get":
+            return json.dumps(capability_store.describe(capability_store.load(root, capability)), sort_keys=True)
+        if action == "history":
+            return json.dumps({"capability": capability, "history": capability_store.history(root, capability)})
+        entry = capability_store.apply_changes(
+            root,
+            capability,
+            changes or {},
+            reason=reason,
+            confirmed_by=confirmed_by,
+            actor=CAPABILITY_ACTOR,
+        )
+        return json.dumps({"ok": True, "applied": entry}, sort_keys=True)
+    except capability_store.CapabilityError as exc:
+        return f"ERROR: {exc}"
+    except OSError as exc:
+        return f"ERROR: could not access the capability store at {root}: {exc}"
 
 
 def start_session_kv_server() -> None:

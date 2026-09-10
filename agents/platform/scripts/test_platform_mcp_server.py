@@ -544,6 +544,54 @@ class TestSandboxRouting(unittest.TestCase):
         self.assertNotIn("Failed to switch kube context", err)
 
 
+class TestCapabilityCriteriaTool(unittest.TestCase):
+    """The tool is a thin door onto capability_store; what it owes is routing and honest errors."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        cap = root / "demo"
+        cap.mkdir()
+        (cap / "criteria.json").write_text(json.dumps({"threshold": 3}))
+        (cap / "criteria.schema.json").write_text(
+            json.dumps({"type": "object", "additionalProperties": False,
+                        "properties": {"threshold": {"type": "integer", "minimum": 1, "default": 3}}})
+        )
+        (cap / "learning.json").write_text(json.dumps({"default": "propose"}))
+        self.env = patch.dict(os.environ, {"KUBE_AGENTS_CAPABILITIES_DIR": str(root)})
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def call(self, **kw):
+        return platform_mcp_server.capability_criteria(**kw)
+
+    def test_list_and_get_round_trip(self):
+        self.assertEqual(json.loads(self.call(action="list")), {"capabilities": ["demo"]})
+        got = json.loads(self.call(action="get", capability="demo"))
+        self.assertEqual(got["criteria"], {"threshold": 3})
+        self.assertEqual(got["keys"]["threshold"]["policy"], "propose")
+
+    def test_an_unconfirmed_set_on_a_propose_key_is_refused_with_the_reason(self):
+        out = self.call(action="set", capability="demo", changes={"threshold": 5}, reason="noisy")
+        self.assertTrue(out.startswith("ERROR:"), out)
+        self.assertIn("confirmed_by", out)
+        self.assertEqual(json.loads(self.call(action="get", capability="demo"))["criteria"], {"threshold": 3})
+
+    def test_a_confirmed_set_is_applied_and_shows_in_history(self):
+        out = json.loads(self.call(action="set", capability="demo", changes={"threshold": 5},
+                                   reason="noisy", confirmed_by="ops@example"))
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["applied"]["changes"], {"threshold": {"before": 3, "after": 5}})
+        self.assertEqual(out["applied"]["actor"], "platform-agent")
+        hist = json.loads(self.call(action="history", capability="demo"))["history"]
+        self.assertEqual([h["revision"] for h in hist], [1])
+
+    def test_bad_action_and_unknown_capability_are_errors_not_exceptions(self):
+        self.assertIn("action must be one of", self.call(action="frobnicate"))
+        self.assertIn("unknown capability", self.call(action="get", capability="nope"))
+
+
 class TestContextSwitchFailurePropagation(unittest.TestCase):
 
     @patch('platform_mcp_server.switch_kube_context')

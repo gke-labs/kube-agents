@@ -464,5 +464,89 @@ class BackfillCronStoreTest(unittest.TestCase):
         self.assertFalse(ps.backfill_cron_file(self.root / "absent.json"))
 
 
+class CapabilityCriteriaMergeTest(unittest.TestCase):
+    """capabilities/*/criteria.json is the one tree where the VOLUME wins.
+
+    The agent edits these through the capability_criteria tool, so a force-sync
+    that let the image win would undo every threshold an operator tuned on
+    every pod start — the failure the design doc calls out. The schema beside
+    each file stays image-owned, so the tree is both at once, like cron/.
+    """
+
+    CAP = "capabilities/demo"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.template = Path(self.tmp.name) / "template"
+        self.home = Path(self.tmp.name) / "home"
+        self.home.mkdir()
+        write(self.template / self.CAP / "criteria.json", json.dumps({"threshold": 3, "new_key": "shipped"}))
+        write(self.template / self.CAP / "learning.json", json.dumps({"default": "propose", "keys": {}}))
+        write(self.template / self.CAP / "criteria.schema.json", json.dumps({"v": 2}))
+
+    def overlay(self, items=("capabilities",)):
+        ps.overlay_template(self.home, self.template, items=tuple(items))
+
+    def read(self, name):
+        return json.loads((self.home / self.CAP / name).read_text())
+
+    def test_a_first_scaffold_takes_the_shipped_defaults(self):
+        self.overlay()
+        self.assertEqual(self.read("criteria.json"), {"threshold": 3, "new_key": "shipped"})
+        self.assertEqual(self.read("criteria.schema.json"), {"v": 2})
+
+    def test_a_tuned_value_survives_the_upgrade_and_a_new_key_arrives(self):
+        write(self.home / self.CAP / "criteria.json", json.dumps({"threshold": 7, "_revision": 4}))
+        self.overlay()
+        self.assertEqual(self.read("criteria.json"), {"threshold": 7, "_revision": 4, "new_key": "shipped"})
+
+    def test_the_learning_policy_is_the_images_to_tighten(self):
+        # A volume-wins learning.json would let a loosened policy outlive every
+        # release that tried to tighten it; the image replaces it outright.
+        write(self.home / self.CAP / "learning.json", json.dumps({"keys": {"threshold": "autonomous"}}))
+        self.overlay()
+        self.assertEqual(self.read("learning.json"), {"default": "propose", "keys": {}})
+
+    def test_the_schema_and_the_changelog_are_left_to_their_owners(self):
+        write(self.home / self.CAP / "criteria.schema.json", json.dumps({"v": 1}))
+        write(self.home / self.CAP / "changelog.jsonl", '{"revision": 1}\n')
+        self.overlay()
+        self.assertEqual(self.read("criteria.schema.json"), {"v": 2}, "the image owns the schema")
+        self.assertEqual((self.home / self.CAP / "changelog.jsonl").read_text(), '{"revision": 1}\n')
+
+    def test_a_capability_the_image_no_longer_ships_is_left_alone(self):
+        write(self.home / "capabilities/retired/criteria.json", json.dumps({"k": 1}))
+        self.overlay()
+        self.assertEqual(json.loads((self.home / "capabilities/retired/criteria.json").read_text()), {"k": 1})
+
+    def test_the_merge_is_skipped_when_capabilities_are_not_being_overlaid(self):
+        write(self.home / self.CAP / "criteria.json", json.dumps({"threshold": 7}))
+        self.overlay(items=("cron",))
+        self.assertEqual(self.read("criteria.json"), {"threshold": 7})
+
+    def test_an_unreadable_volume_copy_lets_the_image_defaults_stand(self):
+        write(self.home / self.CAP / "criteria.json", "{not json")
+        self.overlay()
+        self.assertEqual(self.read("criteria.json"), {"threshold": 3, "new_key": "shipped"})
+
+    def test_a_crash_before_the_merge_leaves_the_tuned_file_untouched(self):
+        # The copy must not put image defaults on the volume ahead of the merge:
+        # a container killed in between would come back with the tuning gone.
+        write(self.home / self.CAP / "criteria.json", json.dumps({"threshold": 7}))
+        with unittest.mock.patch.object(ps, "_restore_volume_wins", side_effect=RuntimeError("killed")):
+            with self.assertRaises(RuntimeError):
+                self.overlay()
+        self.assertEqual(self.read("criteria.json"), {"threshold": 7})
+        self.assertEqual(self.read("criteria.schema.json"), {"v": 2}, "the rest of the copy still landed")
+
+    def test_the_rule_is_the_inverse_of_the_cron_rule(self):
+        image = {"a": 1, "b": 2}
+        live = {"b": 9, "c": 3}
+        self.assertEqual(ps.merge_volume_wins(image, live), {"a": 1, "b": 9, "c": 3})
+        self.assertEqual(ps.merge_volume_wins(image, None), image)
+        self.assertEqual(ps.merge_volume_wins(None, live), live)
+
+
 if __name__ == "__main__":
     unittest.main()

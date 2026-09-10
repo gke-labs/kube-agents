@@ -29,8 +29,10 @@ platform/
 ├── config.yaml              # MCP servers, toolsets, plugins
 ├── skills/                  # SKILL.md bundles
 ├── governance/              # SOPs the scheduled governance jobs point at
-├── cron/jobs.json           # empty — the schedules live on the Planning Agent
-├── plugins/                 # in-tree Hermes plugins (incident_context, memory)
+├── capabilities/            # per-capability criteria defaults the agent tunes at runtime
+├── hindsight/               # the specialist's Hindsight (shared memory) connection file
+├── cron/jobs.json           # the governance watchdog roster (in the operator pod, ticked by the Planning Agent)
+├── plugins/                 # in-tree Hermes plugins (incident_context)
 ├── docs/                    # workspace docs (glossary, console-link templates)
 └── scripts/                 # in-pod Python MCP servers + kanban helpers
 ```
