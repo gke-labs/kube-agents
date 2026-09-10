@@ -538,6 +538,10 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{isolated_install_sh}"
             ('hosted_vllm m http://s.ns.svc.cluster.local/v1 ""', missing),
             ('hosted_vllm m http://s.ns.svc.cluster.local/v1 http', not_a_port),
             ('hosted_vllm m http://s.ns.svc.cluster.local/v1 8000/TCP', not_a_port),
+            ('hosted_vllm m http://s.ns.svc.cluster.local/v1 80000', "between 1 and 65535"),
+            ('hosted_vllm m http://10.8.0.12:8000/v1 8000', "in-cluster Service URL"),
+            ('hosted_vllm m https://models.example.com/v1 8000', "in-cluster Service URL"),
+            ('hosted_vllm m s.ns.svc.cluster.local/v1 8000', "in-cluster Service URL"),
         ):
             with self.subTest(args=args):
                 proc = self._run_install_func(f"validate_hosted_vllm_inputs {args}")
@@ -547,6 +551,8 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{isolated_install_sh}"
     def test_validate_hosted_vllm_inputs_accepts_the_three_and_ignores_other_providers(self):
         for args in (
             'hosted_vllm m http://s.ns.svc.cluster.local/v1 8000',
+            'hosted_vllm m http://llm-service/v1 8000',
+            'hosted_vllm m http://llm-service.kubeagents-system:80/v1 8000',
             'gemini "" "" ""',
         ):
             with self.subTest(args=args):

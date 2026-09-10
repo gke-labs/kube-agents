@@ -285,7 +285,9 @@ OpenAI-compatible base URL including `/v1`, naming an in-cluster Service such as
 `http://llm-service.kubeagents-system.svc.cluster.local/v1`), and
 `litellm.hostedVllm.targetPort` (the server pod's port, which the gateway's egress
 rule names). The rule admits the namespace read from `apiBase` on that port and
-nothing else. `examples/vllm-gemma/` is a server sized for the agent:
+nothing else (a bare `<svc>` means the release namespace). A server in another
+namespace also needs its own NetworkPolicy to admit the gateway's namespace on
+that port; `examples/vllm-gemma/`'s admits only its own. `examples/vllm-gemma/` is a server sized for the agent:
 [Concepts → Inference gateway](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#vllm-local-models).
 
 #### Vertex AI (`litellm.modelProvider=vertex_ai`)

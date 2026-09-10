@@ -102,6 +102,13 @@ class ChartRenderTest(unittest.TestCase):
         rules = _same_namespace_rules(_litellm_objects(proc.stdout)[("NetworkPolicy", "litellm-policy")])
         self.assertEqual(rules[0]["to"], [{"namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "inference"}}}])
 
+    def test_a_bare_service_name_means_the_release_namespace(self):
+        values = [v for v in _HOSTED_ARGS if v != "--set" and not v.startswith("litellm.hostedVllm.apiBase=")]
+        proc = _render(*sum([["--set", v] for v in values], []), "--set", "litellm.hostedVllm.apiBase=http://llm-service/v1", "--namespace", "agents")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rules = _same_namespace_rules(_litellm_objects(proc.stdout)[("NetworkPolicy", "litellm-policy")])
+        self.assertEqual(rules[0]["to"][0]["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"], "agents")
+
     def test_other_providers_render_none_of_it(self):
         for provider in ("gemini", "anthropic", "openai", "vertex_ai"):
             with self.subTest(provider=provider):

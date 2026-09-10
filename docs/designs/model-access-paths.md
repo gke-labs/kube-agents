@@ -55,7 +55,9 @@ model-specific code, which is the line the #608 review drew.
 | `examples/litellm-hosted-vllm/` | `examples/litellm-gemini/` with the Gemini key replaced by the provider line and the env var: the gateway half of the pair with `examples/vllm-gemma/`.                                                                                                                 |
 
 Left out on purpose, to keep the change small: a kustomize overlay for the dev path and a
-`providers.json` row for the admin console. Both are the `vertex_ai` shape again and can follow.
+`providers.json` row for the admin console, whose LLM-gateway page therefore shows a `hosted_vllm`
+install's provider and model as Unknown until the row lands. Both are the `vertex_ai` shape again
+and can follow.
 
 The model server is `examples/vllm-gemma/`, applied by hand on a GPU node pool the user provides,
 as the site's inference-gateway page already describes. Automating the node pool and the server

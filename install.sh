@@ -2166,6 +2166,24 @@ validate_hosted_vllm_inputs() {
   case "$target_port" in
     *[!0-9]*) print_error "--hosted-vllm-target-port must be a port number, got '${target_port}'."; return 1 ;;
   esac
+  if [ "$target_port" -lt 1 ] || [ "$target_port" -gt 65535 ]; then
+    print_error "--hosted-vllm-target-port must be between 1 and 65535, got '${target_port}'."
+    return 1
+  fi
+  # The same shapes the chart accepts: an in-cluster Service as <svc>,
+  # <svc>.<namespace>, or <svc>.<namespace>.svc[...]. Anything else (an IP,
+  # a public name) fails the render, so fail here first.
+  local host="${api_base#http://}"; host="${host#https://}"; host="${host%%/*}"; host="${host%%:*}"
+  case "$api_base" in http://*|https://*) ;; *) host="" ;; esac
+  case "$host" in
+    ""|*[!a-zA-Z0-9.-]*) host="" ;;
+    *.*.svc|*.*.svc.*) ;;
+    *.*.*) host="" ;;
+  esac
+  if [ -z "$host" ]; then
+    print_error "--hosted-vllm-api-base must be an in-cluster Service URL, http://<svc>.<namespace>.svc.cluster.local/v1, got '${api_base}'."
+    return 1
+  fi
 }
 
 validate_existing_cluster_opt_in_flags() {
@@ -3102,6 +3120,12 @@ main() {
   local model_default_name="${PARAM_MODEL_DEFAULT_NAME:-${MODEL_DEFAULT_NAME:-}}"
   if [ -z "$model_default_name" ]; then
     model_default_name="$(default_model_for_provider "$model_provider")"
+  fi
+  # A model pinned for another provider is not a hosted_vllm model. On a
+  # provider switch with no --model-default-name, start empty so the check
+  # below stops the run instead of rendering hosted_vllm/<the old model>.
+  if [ "$model_provider" = "hosted_vllm" ] && [ "${MODEL_PROVIDER:-}" != "hosted_vllm" ] && [ -z "${PARAM_MODEL_DEFAULT_NAME:-}" ]; then
+    model_default_name=""
   fi
 
   # Vertex authenticates with Workload Identity rather than an API key, so these
