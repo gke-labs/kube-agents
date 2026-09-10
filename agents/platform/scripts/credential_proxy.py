@@ -50,6 +50,15 @@ LOGGER = logging.getLogger("credential-proxy")
 SLACK_EVENT_QUEUE_MAXSIZE = 1000
 SLACK_ERROR_DIAGNOSTIC_FIELDS = ("ok", "error", "needed", "provided")
 
+# How long `gh_credential_helpers` waits for `git config --get-regexp` to list
+# the global credential helpers. The command reads one file and touches no
+# network, so it returns in milliseconds; the bound only stops a wedged git
+# (a stuck lock on the global config, a hung filesystem) from holding the git
+# command that asked. Ten seconds is generous for the read, and a read that
+# hits it reports no helpers -- the same degradation as a bootstrap that never
+# wrote one, which `credential_helper_rearm` already handles by re-reading.
+GIT_CONFIG_QUERY_TIMEOUT_SECONDS = 10
+
 # GitHub "owner/name" slug validation. Each segment is matched with a single,
 # unambiguous character class rather than two adjacent "+" groups around the
 # "/" separator, so the match is linear-time and cannot be forced into
@@ -1212,20 +1221,26 @@ _FREE_TEXT_FLAGS = frozenset(
 # buried in a cluster, so this is the whole table rather than pflag's arity for
 # four upstream CLIs.
 #
-# `github.api-mutation` is the only rule that reads a value: `-X PUT` has to be
-# adjacent. Everything else keys on the flag being present at all, which is why
-# the split is worth making -- see `_cluster_readings`, where it is the
-# difference between one remainder and one per letter.
+# Two rules read a value beside the flag. `github.api-mutation` needs `-X PUT`
+# adjacent, and `selfimprove.gh-target-allowlist` reads the repository slug
+# after `-R` -- so the cluster has to carry the remainder out with the flag, or
+# `gh pr create -dR attacker/kube-agents` reaches that rule as a bare word `R`
+# and the loop's credential is pointed at a repository nobody configured.
+# Everything else keys on the flag being present at all, which is why the split
+# is worth making -- see `_cluster_readings`, where it is the difference
+# between one remainder and one per letter.
 #
 # It is a copy of something that lives in the operator, so it is pinned:
 # `test_every_shorthand_a_rule_keys_on_is_covered` reads the shipped policy and
 # fails if a rule keys on a shorthand missing here. Add the rule, run the
-# tests, and that test tells you to come back.
-_VALUE_TAKING_SHORTHANDS = frozenset({"-X", "-f", "-F"})
+# tests, and that test tells you to come back. It reads the operator's policy
+# and only that one, though, so it never saw `-R`: the rule that keys on it is
+# rendered by the chart, and `test_selfimprove_policy.py` is what covers it.
+_VALUE_TAKING_SHORTHANDS = frozenset({"-X", "-f", "-F", "-R"})
 _KEYED_SHORTHANDS = _VALUE_TAKING_SHORTHANDS | frozenset({"-t", "-a"})
 
 
-def _cluster_readings(token: str) -> list[str]:
+def _cluster_readings(token: str) -> tuple[list[str], bool]:
     """The keyed shorthands buried inside a single-dash cluster, re-dashed.
 
     pflag accepts a boolean shorthand and a value-taking one in the same token:
@@ -1256,7 +1271,33 @@ def _cluster_readings(token: str) -> list[str]:
     `["gh", "-" + "a" * 1000000]` fits inside `max_request_bytes`, reaches here
     because `gh` is an allowed executable, and exhausted the container's 2Gi on
     a single request. This walk allocates one slice, at the break.
+
+    Returns the re-dashed readings and whether the walk broke on a free-text
+    flag. A cluster's free-text member never carries its value in the same
+    token -- unlike `-X`/`-f`/`-F`, which pflag lets share a token with their
+    value, `git commit -am` and `gh auth status -at` both put the value in the
+    next argv element -- so it is the caller that deals with that element.
+    `policy_match_text` drops it when it is prose and keeps it when it is a
+    single word, since after a cluster that word can be a subcommand (the
+    reasoning is at the call site); `argv_path_violation` tests it under the
+    free-text exemption. Returning it separately rather than folding it into
+    `readings` is what lets the callers do that instead of re-adding the
+    element as a bare word.
+
+    A token whose *first* shorthand takes a value has no cluster to read.
+    pflag and parse-options hand everything after `-F` to `-F`, so the
+    letters of `-Fbody.md` are a file name and not `-b`, and the letters of
+    `-fmerge_method=squash` are a field and not `-m`. Walking them anyway
+    reported a free-text member for any value beginning with `b`, `m` or
+    `t`, and `argv_path_violation` then skipped the token without testing
+    the value as the path it opens -- `gh pr create -Fbody.md`, with
+    `body.md` a symlink the runner planted to the mounted credential,
+    published it. Both callers already hold that value without any reading
+    from here: `policy_match_text` has split it off as `token[2:]`, and
+    `_attached_shorthand_values` returns it.
     """
+    if token[:2] in _VALUE_TAKING_SHORTHANDS:
+        return [], False
     readings: list[str] = []
     seen: set[str] = set()
     # From 2: `token[0]` is the dash and `token[1]` is the shorthand the caller
@@ -1268,10 +1309,11 @@ def _cluster_readings(token: str) -> list[str]:
             break
         flag = f"-{letter}"
         if flag in _FREE_TEXT_FLAGS:
-            # Prose from here on, dropped as the detached spelling drops it.
+            # Prose from here on lives in the next argv element -- the caller
+            # skips it once told to, the same as the detached spelling.
             if flag not in seen:
                 readings.append(flag)
-            break
+            return readings, True
         if flag not in _KEYED_SHORTHANDS:
             continue
         if flag not in seen:
@@ -1282,7 +1324,46 @@ def _cluster_readings(token: str) -> list[str]:
             if remainder:
                 readings.append(remainder)
             break
-    return readings
+    return readings, False
+
+
+def _attached_shorthand_values(token: str) -> list[str]:
+    """The values a single-dash token carries with no separator at all.
+
+    pflag and git's parse-options both let a value-taking shorthand share its
+    token with the value: `-F<path>` is `-F <path>`, and so is `-dF<path>`,
+    where pflag consumes the boolean `-d` and re-enters the cluster at `F`.
+    `argv_path_violation` tests each token as the path the command would
+    open, and a token in this spelling is not that path -- `-F/var/run/
+    secrets/x` joined onto the workspace is a relative path inside it, while
+    `gh` opens the absolute one after the `F`.
+
+    Two remainders at most. The rest of the token after the first shorthand,
+    unconditionally, the way `policy_match_text` splits it: for a boolean
+    cluster that is a bare word that resolves inside the workspace and costs
+    nothing. And the rest after the first `_VALUE_TAKING_SHORTHANDS` member
+    further in, which is where pflag takes the value from in a cluster. Two
+    slices rather than one per letter, because a million-letter token is a
+    valid argv and a path resolution per letter is the quadratic
+    `_cluster_readings` was rewritten to lose. What the table leaves open is a
+    value-taking shorthand outside it, buried behind a boolean; `-F` and `-f`,
+    the two through which `gh` and `git` read a file into something they
+    print, are in it.
+    """
+    values: list[str] = []
+    first = token[2:].lstrip("=")
+    if first:
+        values.append(first)
+    for position in range(2, len(token)):
+        letter = token[position]
+        if not letter.isalpha():
+            break
+        if f"-{letter}" in _VALUE_TAKING_SHORTHANDS:
+            remainder = token[position + 1 :].lstrip("=")
+            if remainder and remainder != first:
+                values.append(remainder)
+            break
+    return values
 
 
 def policy_match_text(argv: list[str]) -> str:
@@ -1356,7 +1437,33 @@ def policy_match_text(argv: list[str]) -> str:
                 tokens.append(token[:2])
                 continue
             tokens.extend([token[:2], token[2:].lstrip("=")])
-            tokens.extend(_cluster_readings(token))
+            readings, free_text_pending = _cluster_readings(token)
+            tokens.extend(readings)
+            if free_text_pending:
+                # The cluster's free-text member -- e.g. the `-m` in
+                # `git commit -am` -- carries its value in the next argv
+                # element, never in this token. Two guards. The detached
+                # spelling's: don't swallow something that looks like a flag.
+                # And one the detached spelling does not need: don't swallow
+                # a single word, because after a cluster that word can be a
+                # subcommand. Cobra finds the command path with `stripFlags`
+                # (spf13/cobra, command.go), which treats a lone shorthand it
+                # does not know as value-taking and drops the element after
+                # it -- so `gh -m pr merge 1` never reaches `pr merge` -- but
+                # never a token of three or more characters. `gh -dm pr merge
+                # 1` therefore finds `pr merge`, which reads `-dm` as
+                # `--delete-branch --merge` and merges, and dropping `pr` here
+                # hid that from github.merge; `gh pr -dm merge 1` lost `merge`
+                # the same way. Prose is what this drop exists for, and the
+                # prose that trips a rule -- a body closing with "merge this
+                # PR", a commit message naming `gh auth token` -- has spaces
+                # in it; a subcommand never does. A one-word title after a
+                # cluster stays in the text and can at worst cause a visible
+                # refusal, the trade the flag guard above already makes.
+                following = argv[index + 1] if index + 1 < len(argv) else ""
+                skip_next = not following.startswith("-") and any(
+                    char.isspace() for char in following
+                )
             continue
         tokens.append(token)
     return shlex.join(tokens)
@@ -1457,6 +1564,143 @@ GIT_MUTATING_SUBCOMMANDS = frozenset(
         "submodule", "switch", "tag", "update-ref", "worktree",
     }
 )
+
+# Config git reads out of the repository it is pointed at, and then runs as a
+# command. A denylist on argv cannot reach any of it: the agent does not pass
+# these as flags, it writes them into `.git/config` -- or drops an executable at
+# `.git/hooks/pre-commit` -- with the ordinary file access it has in the
+# workspace, and the next `git commit` the *sidecar* runs executes them there,
+# next to the credential.
+#
+# Injected per invocation the way `-c` is, which outranks repo-local config;
+# there is no environment variable that turns repo-local config off. The empty
+# `credential.helper` is a reset rather than a value: it clears the helpers the
+# repository asked for. It clears gh's too -- see `gh_credential_helpers`, which
+# puts those back.
+#
+# This is a list of the settings that are worth pinning, not a proof that the
+# rest are safe. Git has no switch that turns repo-local config off, so what is
+# left is enumeration, and enumeration over a surface this size does not finish.
+# The residue is written up in the design's Limits section rather than implied
+# by this tuple's length: a repo-local `credential.<url>.helper` shares a key
+# with gh's own and cannot be reset without resetting that too, and
+# `.gitattributes` can name a `filter.*` or `diff.*.textconv` driver that
+# repo-local config then defines. Both need the tree to stop being writable by
+# the turn that asks for the commit, which is a second pod.
+HARDENED_GIT_CONFIG = (
+    ("core.hooksPath", "/dev/null"),
+    ("core.fsmonitor", ""),
+    ("core.pager", "cat"),
+    ("core.editor", "false"),
+    ("sequence.editor", "false"),
+    # Not `diff.external`: pinning it to "" was tried and reverted (see the
+    # comment above `GIT_FORCED_CONFIG`) -- git executes the empty string as
+    # the external diff program rather than reading it as "off", so every
+    # `git diff` died with `fatal: external diff died`. There is no value
+    # that turns it off, so it stays open the same way `alias.*` does.
+    ("protocol.ext.allow", "never"),
+    ("credential.helper", ""),
+    # The push is https through gh's credential helper and nothing here speaks
+    # ssh, so pinning these two costs nothing and closes two more programs the
+    # repository could otherwise name. `url.<x>.insteadOf` can rewrite an https
+    # remote to an ssh one, which is what puts `core.sshCommand` in reach at
+    # all; `commit.gpgsign` is what puts `gpg.program` in reach.
+    ("core.sshCommand", "false"),
+    ("commit.gpgsign", "false"),
+)
+
+
+def gh_credential_helpers(
+    environment: dict[str, str], git_executable: str | None = None
+) -> tuple[tuple[str, str], ...]:
+    """The credential helpers `gh auth setup-git` left in the global config.
+
+    Appended after `HARDENED_GIT_CONFIG` so they land after its empty
+    `credential.helper`, because that reset clears the whole accumulated helper
+    list and not only the repository's share of it. Config is read
+    system-global-local-env, so gh's host-scoped `credential.https://github.com
+    .helper` is already on the list when the injected reset arrives and empties
+    it; the push then fails with `could not read Username for
+    'https://github.com'`, on a terminal that does not exist. Order is what
+    makes the pair work: reset first, so a repository's own helper goes with
+    everything else, then re-add, so the one that authenticates the push is the
+    only one left.
+
+    Read back rather than named, because the value holds gh's absolute path and
+    the host it was pointed at, and a constant here would be a second place for
+    those to be wrong. Reading it is safe for the same reason the reset is
+    needed: the global config is under the sidecar-only state emptyDir, which
+    the agent container cannot write and `argv_path_violation` will not let it
+    name, so the only writer is the chart's bootstrap command.
+
+    `environment` is the one commands run under, which is what makes "the global
+    config" the same file here as it was for `gh auth setup-git`: git resolves
+    that path from `HOME` and `XDG_CONFIG_HOME`, and both are set there and not
+    in the sidecar's own environment.
+
+    `-z` because a helper is a shell fragment and holds spaces and newlines,
+    which leaves NUL as the only separator its value cannot contain. The
+    numbered `GIT_CONFIG_COUNT` layer is dropped so this reads the file rather
+    than an injection from whatever called us. `GIT_CONFIG_GLOBAL` and
+    `GIT_CONFIG_NOSYSTEM` are kept, and the distinction matters: they are what
+    names the file this reads and what keeps the machine's system config out of
+    the answer, so dropping them along with the numbered keys would have
+    `--global` fall back to whatever `HOME` resolves to and fold a system-wide
+    `credential.helper` into the re-arm. A failure returns nothing and is not
+    raised: git is then invoked with the reset and no helper, which fails the
+    push with a message naming the credential, rather than failing every git
+    command including the ones that would diagnose it. `errors="replace"` keeps
+    that promise for a config holding a non-UTF-8 byte: decoding strictly
+    raises `UnicodeDecodeError`, which is a `ValueError` and so escaped both
+    clauses above, and `do_POST` renders a `ValueError` as HTTP 400 -- one
+    accented byte in `user.name` failed every git command in the run.
+    `ValueError` is caught alongside them for whatever else `subprocess` raises
+    under that name.
+
+    The subsection in the pattern is optional because `credential.helper`
+    without one is what `git config --global credential.helper <program>`
+    writes, and the reset this re-arms against empties the whole list rather
+    than the host-scoped share of it. Matching only the host-scoped form left a
+    config that had a working helper with none.
+    """
+    environment = {
+        name: value
+        for name, value in environment.items()
+        if not (
+            name == "GIT_CONFIG_COUNT"
+            or name.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+        )
+    }
+    try:
+        completed = subprocess.run(
+            [
+                git_executable or "git",
+                "config",
+                "--global",
+                "-z",
+                "--get-regexp",
+                r"^credential\.(.*\.)?helper$",
+            ],
+            capture_output=True,
+            text=True,
+            errors="replace",
+            env=environment,
+            timeout=GIT_CONFIG_QUERY_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ()
+    if completed.returncode != 0:
+        return ()
+    helpers: list[tuple[str, str]] = []
+    for record in completed.stdout.split("\0"):
+        if not record:
+            continue
+        key, _, value = record.partition("\n")
+        # gh writes its own reset ahead of its helper, and re-adding that would
+        # empty the list a second time -- after the entry we are restoring.
+        if value:
+            helpers.append((key, value))
+    return tuple(helpers)
 
 # git's own global options, split by whether they consume the next argument.
 # Needed to find the subcommand in `git --literal-pathspecs add …` (which
@@ -1582,8 +1826,8 @@ def _git_forced_config_environment(pairs: tuple[tuple[str, str], ...]) -> dict[s
 # every `-C`, but neither looks at `--git-dir`, so `git --git-dir=<elsewhere>
 # --work-tree=<elsewhere> commit` runs against a repository on the sidecar's
 # own filesystem from inside a perfectly valid lease. Verified: it reads and it
-# writes. `-C` stays allowed — the containment check already follows it, and
-# the skills use it.
+# writes. `-C` stays allowed — both containment checks follow it through
+# `_git_global_prefix`, and the skills use it.
 _GIT_REFUSED_ARGUMENTS = {
     "-c": "sets configuration that outranks the proxy's own",
     "--config-env": "sets configuration that outranks the proxy's own",
@@ -1895,30 +2139,46 @@ def git_argument_violation(argv: list[str]) -> str | None:
     return None
 
 
-def _git_plan(argv: list[str]) -> tuple[str | None, list[str]]:
-    """The subcommand in `argv`, plus every directory its `-C` flags select.
+def _git_global_prefix(argv: list[str]) -> tuple[int, dict[int, str]]:
+    """Where git's global options end, and the `-C` directories among them.
 
-    `-C` is returned rather than ignored because git applies it cumulatively
-    before running the subcommand: `git -C /elsewhere commit` executes nowhere
-    near the working directory the caller reported, so a containment check that
-    only looked at `cwd` would be checking the wrong path.
+    Returns the index of the subcommand -- `len(argv)` when there is none --
+    and a map from the index of each `-C` token before it to the directory it
+    names. The scope stops at the subcommand because the same two characters
+    mean something else after it: `git diff -C` is `--find-copies`, and
+    takes no directory.
+
+    `-C` is reported rather than skipped because git applies it cumulatively
+    before running the subcommand, each one relative to the last: `git -C
+    /elsewhere commit` executes nowhere near the working directory the caller
+    reported, and every relative path the subcommand is handed resolves from
+    where the last `-C` landed. Both containment checks -- `git_lease_violation`
+    for the directory a mutating verb runs in, `argv_path_violation` for the
+    paths a command opens -- read `-C` from here, so the two cannot disagree
+    about where git is.
     """
-    directories: list[str] = []
+    directories: dict[int, str] = {}
     index = 1
     while index < len(argv):
         token = argv[index]
         if not token.startswith("-"):
-            return token, directories
+            return index, directories
         name, sep, inline = token.partition("=")
         if name == "-C":
             if sep:
-                directories.append(inline)
+                directories[index] = inline
             elif index + 1 < len(argv):
-                directories.append(argv[index + 1])
+                directories[index] = argv[index + 1]
         if name in _GIT_GLOBAL_WITH_VALUE and not sep:
             index += 1
         index += 1
-    return None, directories
+    return len(argv), directories
+
+
+def _git_plan(argv: list[str]) -> tuple[str | None, list[str]]:
+    """The subcommand in `argv`, plus every directory its `-C` flags select."""
+    end, directories = _git_global_prefix(argv)
+    return (argv[end] if end < len(argv) else None), list(directories.values())
 
 
 # Distinguishes "the caller said None" from "the caller said nothing" for
@@ -1974,6 +2234,19 @@ class CommandExecutor:
         self.require_git_lease = os.getenv(
             "CREDENTIAL_PROXY_REQUIRE_GIT_LEASE", "1"
         ).strip().lower() not in {"0", "false", "no", "off"}
+        # Off by default, and deliberately: it changes what argv the proxy will
+        # accept, and every existing caller was written against the current
+        # rules. The self-improvement loop turns it on because its threat model
+        # is the one this was written for -- an agent turn writes the tree, and
+        # then asks the sidecar to run git in it. See `argv_path_violation` and
+        # `HARDENED_GIT_CONFIG`.
+        self.untrusted_workspace = os.getenv(
+            "CREDENTIAL_PROXY_UNTRUSTED_WORKSPACE", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        # Resolved on the first git command rather than here: the bootstrap
+        # command that runs `gh auth setup-git` has not run yet at construction,
+        # so reading now would cache an empty answer for the process's life.
+        self._credential_helper_rearm: tuple[tuple[str, str], ...] | None = None
         self.tmp_dir = self.state_dir / "tmp"
         self.config_dir = self.home_dir / ".config"
         self.cache_dir = self.home_dir / ".cache"
@@ -2052,6 +2325,19 @@ class CommandExecutor:
             name: shutil.which(name, path=trusted_path)
             for name in self.ALLOWED_EXECUTABLES
         }
+        # The forced-config layer as one sequence, because two places render it
+        # -- `self.environment` just below, and the untrusted-workspace branch
+        # of `_execute` -- and `GIT_CONFIG_COUNT` is a single number covering
+        # the whole numbered set. A second renderer that builds its own list
+        # therefore replaces this one rather than adding to it, and does it
+        # silently in both directions: a longer list overwrites every key it
+        # reaches, and a shorter one leaves the tail in the environment with the
+        # count no longer reaching it. Both renderers building from this
+        # attribute is what keeps that from happening.
+        self.forced_git_config: tuple[tuple[str, str], ...] = (
+            ("core.hooksPath", str(self.git_hooks_dir)),
+            *GIT_FORCED_CONFIG,
+        )
         self.environment = {
             "PATH": trusted_path,
             "HOME": str(self.home_dir),
@@ -2119,9 +2405,7 @@ class CommandExecutor:
             # editor could never have succeeded.
             "GIT_EDITOR": "false",
             "GIT_SEQUENCE_EDITOR": "false",
-            **_git_forced_config_environment(
-                (("core.hooksPath", str(self.git_hooks_dir)), *GIT_FORCED_CONFIG)
-            ),
+            **_git_forced_config_environment(self.forced_git_config),
         }
         # Forward only variables required by supported credential clients. Chat
         # tokens and proxy control variables must never enter an agent-selected
@@ -2316,6 +2600,36 @@ class CommandExecutor:
         """Run a trusted, operator-defined helper that is not agent selectable."""
         return self._execute(argv, cwd=cwd)
 
+    def credential_helper_rearm(self) -> tuple[tuple[str, str], ...]:
+        """`gh_credential_helpers`, read once a helper exists and kept after.
+
+        Cached because it runs a subprocess and every git command the filing
+        turn issues would otherwise pay for it. An empty answer is *not* cached,
+        because "no helper yet" is not the same fact as "no helper": on this
+        sidecar the bootstrap command writes the global config before any git
+        command arrives, but a bootstrap that fails still exits zero -- the
+        chart's `|| echo ...; true` -- so caching its empty read would fail
+        every push for the rest of the run with no way back. It is also not
+        true on the Platform Agent's proxy, where `gh auth setup-git` runs at
+        request time from `/v1/github/refresh` rather than at startup, so the
+        first git command legitimately arrives before the helper exists.
+        Re-reading costs one subprocess per git command only while the answer
+        is empty, which is the case where something is already wrong.
+        """
+        if not self._credential_helper_rearm:
+            self._credential_helper_rearm = gh_credential_helpers(
+                self.environment, self.executables.get("git")
+            )
+            if not self._credential_helper_rearm:
+                # The push will fail an hour later with `could not read
+                # Username`, and a missing file, a malformed one and a git that
+                # would not run are indistinguishable from that message alone.
+                LOGGER.warning(
+                    "no credential helper found in the global config; "
+                    "git commands needing a credential will fail"
+                )
+        return self._credential_helper_rearm
+
     def execute_workspace_git(self, argv: list[str], cwd: Path) -> ExecutionResult:
         """git the broker issues on its own behalf, in a tree the agent cannot name.
 
@@ -2376,6 +2690,199 @@ class CommandExecutor:
             except OSError:
                 break
         return None
+
+    def argv_path_violation(self, argv: list[str], cwd: str | None) -> str | None:
+        """Why a path in this argv may not be opened, or None.
+
+        The deny rules say which *subcommands* may run. They say nothing about
+        which *files* those subcommands touch, and several of the permitted ones
+        take a path and print it back: `git diff --no-index /dev/null <path>`
+        emits the file as added lines, `git hash-object -w <path>` stores it,
+        `gh pr comment --body-file <path>` publishes it. The sidecar is the one
+        container that mounts the credential, and `/v1/exec` returns stdout to
+        the caller unredacted, so a permitted read is a credential read.
+
+        Containment rather than a denylist of the flags that take a path,
+        because the flags are the part that keeps growing. A path outside the
+        workspace has no legitimate use here: the workspace is where the
+        checkout is, `HERMES_HOME` points into it, and everything else in this
+        container is the proxy's own state -- gh's `hosts.yml` and the mounted
+        credential included.
+
+        A flag that carries its value in the same token -- `--body-file=<path>`
+        -- opens the half after the `=`, so that half is what gets tested. The
+        split happens *before* the shape tests rather than only for values
+        starting with `/`, because testing the whole token resolves the wrong
+        path: `--body-file=..` is a single literal component, which both absorbs
+        one `..` and adds a directory level, so the check lands two levels
+        shallower than the file the command opens. That gap made
+        `--body-file=../../../var/run/secrets/...` resolve to a path inside the
+        workspace while `gh` read the mounted credential.
+
+        A shorthand hides its value the same way with no separator at all.
+        pflag and parse-options read `-F<path>` as `-F <path>`, and `-dF<path>`
+        too, consuming the boolean and re-entering the cluster at the next
+        letter. The whole token joined onto `cwd` is a relative path *inside*
+        the workspace, so testing it passed `gh pr create -F/var/run/secrets/
+        .../token`, which publishes the mounted credential as the pull-request
+        body, while the detached and `=` spellings of the same flag were
+        refused. `_attached_shorthand_values` returns the remainders that
+        spelling hides, and each is tested as a path beside the token itself.
+
+        Every token is then resolved against `cwd` and refused if it lands
+        outside, rather than only the tokens that look like paths. Resolving
+        settles the two relative spellings together: `_execute` contains `cwd`
+        but not argv, so `--no-index ../../../var/run/secrets/...` walks out of
+        a contained directory, and a token with no `..` at all walks out just as
+        far through a symlink. Both containers mount the workspace emptyDir, so
+        the runner can plant `escape -> /var/lib/credential-proxy` and read the
+        credential with `--no-index escape/token empty`.
+
+        Testing shape first is what left that second spelling open, and it was
+        never buying anything: a relative token can only resolve outside the
+        workspace by traversing a symlink, which prose does not do. What it
+        does do is contain `/`: `pathlib` parses a joined-on string for the
+        separator exactly as it would a literal path, so `-m 'fix: path
+        traversal via ../../../etc/passwd'` resolves to a candidate outside
+        the workspace the same way an actual `../../../etc/passwd` argument
+        would, and a finding describing that exact vulnerability -- the class
+        this loop exists to report -- is refused reporting it.
+
+        Free-text flags -- a commit message, a PR title, a `gh` comment body --
+        are exempted, but only for a value that does not name a file that is
+        there. `_FREE_TEXT_FLAGS` is matched without knowing the subcommand,
+        and one short flag means different things to different ones: `-b` is
+        `gh pr create`'s body, and `git diff`'s `--ignore-space-change`, which
+        takes no value at all. Skipping the token after it therefore walked
+        `git diff --no-index -b /var/run/secrets/... ./empty` straight past
+        this check and printed the credential.
+
+        Testing existence separates the two without a table of which flag
+        carries prose for which subcommand. Reading a mounted credential needs
+        a file that exists, and prose does not name one: `-m 'fix: traversal
+        via ../../../etc/passwd'` joins to a first component `fix: traversal
+        via` that is not there, so the stat fails on it and the sentence is
+        allowed -- even though resolving the same string lands on
+        `/etc/passwd`. A value that resolves outside the workspace *and*
+        exists is refused whatever flag introduced it. Shorthand is read the
+        way `policy_match_text` reads it, in both spellings that hide a
+        free-text flag from a flat scan: attached (`-mfix: ...`), where the
+        prose is the rest of the token, and clustered (`git commit -am`,
+        `gh pr create -dt`), where `_cluster_readings` finds the `-m` or `-t`
+        after the first letter and the prose is the next argv element. Without
+        the cluster reading the flag token passes and the message behind it is
+        tested as a path, so `git commit -am 'fix: ../../../etc/passwd
+        traversal'` was refused while the identical detached spelling was
+        allowed -- the outcome the paragraph above says this must not have.
+        The cluster reading stops short of a token whose first shorthand
+        takes a value: `-Fbody.md` is `-F body.md`, not `-F -b ody.md`, and
+        reading it as a cluster skipped the token -- and the path after the
+        `F` -- whenever the value happened to begin with a free-text letter.
+
+        `cwd` is the base only until git's own `-C` moves it. git applies each
+        `-C` in its global-option prefix before it opens anything, so a
+        relative path after the subcommand resolves from where the last `-C`
+        landed, and `git_lease_violation` already followed it there through
+        `_git_plan`. This check did not: from a `cwd` two levels below the
+        workspace root, `git -C ../.. diff --no-index ../../var/run/secrets/
+        <token> empty` resolved every token inside the workspace here, while
+        git, already back at the root, opened the mounted credential. Each
+        `-C` directory is now tested where it stands -- relative to the one
+        before it, the way git reads them -- and then becomes the base for
+        every token after it. Only the prefix counts: after the subcommand
+        the same letters are `git diff -C`, find-copies, and move nothing.
+
+        What existence does not close is the gap between checking and running,
+        and nothing here ever did: a token naming nothing yet is allowed, the
+        same way an ordinary token resolving inside the workspace is, so a
+        symlink planted between the two escapes both.
+        """
+        if not self.untrusted_workspace:
+            return None
+        base = Path(cwd) if cwd else self.workspace_dir
+        redirects: dict[int, str] = {}
+        if argv and Path(argv[0]).name == "git":
+            _, redirects = _git_global_prefix(argv)
+        skip_redirect_value = False
+        prose_next = False
+        for index, token in enumerate(argv[1:], start=1):
+            if skip_redirect_value:
+                skip_redirect_value = False
+                continue
+            prose = prose_next
+            prose_next = False
+            if index in redirects:
+                # Tested where git reads it -- relative to the base the
+                # previous `-C` left -- and refused outside the workspace
+                # like any other path; inside, it is the base from here on.
+                directory = redirects[index]
+                violation = self._path_value_violation(base, directory, False)
+                if violation is not None:
+                    return violation
+                base = (base / directory).resolve()
+                skip_redirect_value = token == "-C"
+                continue
+            # What this token may open, each with whether a free-text flag
+            # introduced it. One token can carry more than one: `-dF<path>`
+            # is the token and the path after the `F`.
+            candidates: list[tuple[str, bool]] = [(token, prose)]
+            if not prose:
+                name, separator, attached = token.partition("=")
+                shorthand = (
+                    len(token) > 2
+                    and token.startswith("-")
+                    and not token.startswith("--")
+                )
+                if name in _FREE_TEXT_FLAGS:
+                    if separator:
+                        candidates = [(attached, True)]
+                    else:
+                        following = argv[index + 1] if index + 1 < len(argv) else ""
+                        prose_next = not following.startswith("-")
+                        continue
+                elif shorthand and token[:2] in _FREE_TEXT_FLAGS:
+                    candidates = [(token[2:], True)]
+                elif shorthand and _cluster_readings(token)[1]:
+                    following = argv[index + 1] if index + 1 < len(argv) else ""
+                    prose_next = not following.startswith("-")
+                    continue
+                elif shorthand:
+                    candidates.extend(
+                        (value, False) for value in _attached_shorthand_values(token)
+                    )
+                elif token.startswith("-") and separator:
+                    candidates = [(attached, False)]
+            for value, prose in candidates:
+                violation = self._path_value_violation(base, value, prose)
+                if violation is not None:
+                    return violation
+        return None
+
+    def _path_value_violation(self, base: Path, value: str, prose: bool) -> str | None:
+        """Why `value`, opened relative to `base`, may not be, or None.
+
+        `prose` is the free-text exemption `argv_path_violation` describes:
+        a value a free-text flag introduced is refused only when it names a
+        file that is there.
+        """
+        try:
+            candidate = (base / value).resolve()
+        except (OSError, ValueError):
+            return "the path %s could not be resolved" % value
+        if self._within_workspace(candidate):
+            return None
+        if prose:
+            try:
+                names_a_file = (base / value).exists()
+            except (OSError, ValueError):
+                names_a_file = False
+            if not names_a_file:
+                return None
+        return (
+            "%s is outside the workspace %s. Commands run here may only "
+            "read and write the checkout; the rest of this container is "
+            "the credential proxy's own state." % (value, self.workspace_dir)
+        )
 
     def git_lease_violation(self, argv: list[str], cwd: str | None) -> str | None:
         """Why this git command may not run here, or None if it may.
@@ -2731,6 +3238,33 @@ class CommandExecutor:
         command_environment = self.environment.copy()
         if argv and Path(argv[0]).name == "git":
             command_environment.update(self.git_identity)
+            if self.untrusted_workspace:
+                # `GIT_CONFIG_COUNT` and its numbered keys are read exactly as
+                # `-c` is, so these outrank the repository's own config rather
+                # than merging under it. Injected here instead of prepended to
+                # argv so the deny rules -- one of which refuses `-c key=value`
+                # outright -- still read the argv the caller actually sent.
+                #
+                # `forced_git_config` is re-rendered here rather than left to
+                # the copy of `self.environment`: this is a whole replacement of
+                # the numbered set, not an addition to it, for the reason given
+                # where that attribute is built. Including it keeps the rendered
+                # count at or above the base one, so no key from the base layer
+                # can survive as an orphan above the new count.
+                #
+                # Order is the resolution of the two overlaps. `core.hooksPath`
+                # and `core.fsmonitor` are in both lists, and `forced_git_config`
+                # goes second so its values win: its hooks path names a real
+                # empty directory the agent cannot write, which is a stronger
+                # claim than `/dev/null`, a path that merely does not exist. The
+                # re-arm goes last of all, after the `credential.helper` reset
+                # it exists to undo.
+                pinned = (
+                    HARDENED_GIT_CONFIG
+                    + self.forced_git_config
+                    + self.credential_helper_rearm()
+                )
+                command_environment.update(_git_forced_config_environment(pinned))
         if kubeconfig_path is not None:
             command_environment["KUBECONFIG"] = str(kubeconfig_path)
         process = subprocess.Popen(
@@ -3216,6 +3750,28 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                     "status": "blocked",
                     "code": "SECURITY_POLICY_BLOCKED",
                     "rule": "git.argument.refused",
+                    "message": violation,
+                },
+            )
+            return
+
+        # Not a policy rule either: the policy is a denylist of spellings, and
+        # the set of flags that take a path is the part of it that keeps
+        # growing. Containment is the invariant instead, and it is configuration
+        # rather than policy -- off unless the caller declared the workspace
+        # untrusted. It runs after the argument check above because containment
+        # is relative to the working directory, which that check does not need.
+        violation = self.executor.argv_path_violation(argv, cwd)
+        if violation is not None:
+            LOGGER.warning(
+                "path outside workspace refused request_id=%s", request_id
+            )
+            self._json(
+                HTTPStatus.FORBIDDEN,
+                {
+                    "status": "blocked",
+                    "code": "SECURITY_POLICY_BLOCKED",
+                    "rule": "workspace.path-containment",
                     "message": violation,
                 },
             )

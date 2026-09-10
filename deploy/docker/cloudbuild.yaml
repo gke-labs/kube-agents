@@ -27,6 +27,23 @@ steps:
       - "BUILDKIT_INLINE_CACHE=1"
       - "--build-arg"
       - "HERMES_AGENT_TAG=$_HERMES_AGENT_TAG"
+      # The revision stamp. deploy/docker/Dockerfile writes this into
+      # /opt/build-info.json, which is how a running pod can say which commit it
+      # is. Empty is a legal value and means "unknown" -- the self-improvement
+      # runner refuses to investigate an unstamped image rather than guess at
+      # `main`, so a build that omits it produces an image the loop declines to
+      # work on. Pass the full 40-character sha: the runner fetches the source
+      # at this revision with `git fetch --depth 1`, which GitHub refuses for an
+      # abbreviation. The ARG sits at the very end of the Dockerfile, so a
+      # changing SHA invalidates one ~100-byte layer and nothing above it.
+      - "--build-arg"
+      - "GIT_SHA=$_GIT_SHA"
+      # The repository this image's source lives in, for the OCI
+      # org.opencontainers.image.source label. Empty unless passed, because that
+      # label is what ghcr package linking and provenance scanners follow and a
+      # guess sends them to the wrong repository.
+      - "--build-arg"
+      - "IMAGE_SOURCE=$_IMAGE_SOURCE"
       # Baked into the image as an env var and sent as the User-Agent on every
       # remote MCP call. Callers pass the tag they are publishing under; the
       # default below keeps a build that omits it well-formed rather than
@@ -80,5 +97,7 @@ substitutions:
   _IMAGE_URI_LATEST: ""
   _TARGET: ""
   _HERMES_AGENT_TAG: ""
+  _GIT_SHA: ""
+  _IMAGE_SOURCE: ""
   _BUILDCACHE_URI: ""
   _KUBE_AGENTS_VERSION: "dev"

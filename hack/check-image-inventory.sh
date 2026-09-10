@@ -232,6 +232,21 @@ MINTER_VALUES=(
   --set "githubMinter.repo=$MINTER_REPO"
 )
 
+# What turns the self-improvement loop on, in the mode that pulls the most. The
+# runner reuses the agent image the default render already carries, but fork
+# and upstream modes add the credential proxy as a native sidecar, and
+# templates/self-improvement.yaml is the only chart template that emits that
+# image at all -- the platform agent's own proxy sidecar is rendered by the
+# operator, not by the chart. Without this render nothing notices it drifting
+# off its images.json pin, rendering outside the mirror prefix, or landing on a
+# path `make mirror-images` never pushed to.
+SELFIMPROVE_VALUES=(
+  --set selfImprovement.enabled=true
+  --set selfImprovement.mode=upstream
+  --set selfImprovement.github.patSecret=ci-pat
+  --set selfImprovement.github.forkRepo=ci-fork/kube-agents
+)
+
 # The rendered manifests for one configuration. A render failure is fatal
 # rather than an empty list: the checks below iterate what comes out of it, and
 # "no images" reads exactly like "no images to object to".
@@ -434,6 +449,7 @@ check_mirror_prefix "$LABEL_MIRRORED" "$mirrored_images"
 check_mirror_names "$LABEL_MIRRORED" "$mirrored_images"
 
 check_toggle githubMinter "${MINTER_VALUES[@]}"
+check_toggle selfImprovement "${SELFIMPROVE_VALUES[@]}"
 
 # ---------------------------------------------------------------------------
 # 4. The example manifests. They are applied by hand rather than rendered by

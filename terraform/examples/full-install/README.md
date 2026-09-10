@@ -34,6 +34,11 @@ install without the interview.
 - Optionally (`enable_github_minter = true`) the GitHub token minter backend
   ([`github-minter`](../../modules/github-minter) module): minter service
   account plus a KMS key ring and signing key.
+- **Not** the self-improvement loop's Google identity
+  ([`kube-agents-selfimprove`](../../modules/kube-agents-selfimprove)), the same
+  way `drift-pubsub` is not composed here. An install that sets
+  `selfImprovement.enabled` applies that module itself, and it is not yet in a
+  release tag, so it has to be pinned by commit SHA rather than by `?ref=`.
 - Unless `enable_cert_manager = false`, [cert-manager](https://cert-manager.io)
   via `helm_release`, pinned in `cert_manager_version`.
   It issues the serving certificate for the operator's admission

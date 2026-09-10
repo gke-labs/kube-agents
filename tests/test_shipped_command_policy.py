@@ -453,9 +453,11 @@ class TheRulesReadCommandsNotProse(ShippedPolicyTest):
         """
         from credential_proxy import _cluster_readings
 
-        small = _cluster_readings("-" + "a" * 1_000)
-        large = _cluster_readings("-" + "a" * 100_000)
+        small, small_pending = _cluster_readings("-" + "a" * 1_000)
+        large, large_pending = _cluster_readings("-" + "a" * 100_000)
         self.assertEqual(["-a"], small)
+        self.assertFalse(small_pending)
+        self.assertFalse(large_pending)
         self.assertEqual(
             small,
             large,
@@ -589,6 +591,134 @@ class TheRulesReadCommandsNotProse(ShippedPolicyTest):
         argv = ["gh", "pr", "create", "--repo", "o/r", "--title", "fix: drift",
                 "--body", body]
         self.assertIsNone(self.policy.blocked_by(argv))
+
+    def test_a_cluster_ending_on_a_free_text_flag_still_drops_the_next_token(self):
+        """A cluster's free-text member never carries its value in-token.
+
+        `-X`/`-f`/`-F` let pflag attach a value to the same token as the
+        shorthand, so a cluster ending on one of those can carry a remainder.
+        `-m`/`-t`/`-b` never do -- `git commit -am '<message>'` and
+        `gh auth status -at` both put the value in the *next* argv element.
+        `_cluster_readings` breaking on the free-text branch without telling
+        the caller to skip that element left the value in match text exactly
+        as if the flag had never been on the free-text list at all: the
+        standalone `git commit -m '<message>'` drops the message, but the
+        equally idiomatic `-am` spelling did not, so the two spellings of the
+        same command reached the rules differently.
+        """
+        from credential_proxy import _cluster_readings, policy_match_text
+
+        readings, pending = _cluster_readings("-am")
+        self.assertEqual(["-m"], readings)
+        self.assertTrue(pending, "-am ends on a free-text flag, -m")
+
+        message = (
+            "Please merge this and push to trigger the CI/CD rollout, then "
+            "check gh auth token"
+        )
+        standalone = policy_match_text(["git", "commit", "-m", message])
+        clustered = policy_match_text(["git", "commit", "-am", message])
+        self.assertNotIn(message, clustered, "the message survived clustering with -a")
+        self.assertNotIn("push", clustered)
+        self.assertNotIn("merge", clustered)
+        self.assertEqual(
+            "git commit -m",
+            standalone,
+            "the standalone spelling is the baseline this test compares against",
+        )
+
+    def test_a_cluster_not_ending_on_a_free_text_flag_is_unaffected(self):
+        """The fix must not start swallowing tokens after an ordinary cluster."""
+        from credential_proxy import policy_match_text
+
+        # gitops_workspace.py:548's real invocation: `-f`, `-d`, `-q` are all
+        # keyed-or-plain booleans, none of them free-text, so the positional
+        # `.` that follows must survive.
+        self.assertEqual(
+            "git clean -f dq .",
+            policy_match_text(["git", "clean", "-fdq", "."]),
+        )
+
+    def test_a_value_taking_first_shorthand_has_no_cluster_to_read(self):
+        """Everything after `-F`, `-f`, `-X` or `-R` is that flag's value.
+
+        pflag hands the rest of the token to a value-taking shorthand, so the
+        letters of `-fmerge_method=squash` are a field and not `-m`, and the
+        letters of `-Rtoken-org/repo` are a slug and not `-t`. Walking them
+        as a cluster put a free-text flag into the match text that the argv
+        never carried, and then dropped the multi-word element after it as
+        that flag's prose. `argv_path_violation` reads the same walk and
+        skipped the whole token on it -- that half is covered in the proxy's
+        own suite; this one pins the match text.
+        """
+        from credential_proxy import _cluster_readings, policy_match_text
+
+        for token in ("-fmerge_method=squash", "-Fbody.md", "-Rtoken-org/repo", "-Xput"):
+            with self.subTest(token=token):
+                self.assertEqual(([], False), _cluster_readings(token))
+        self.assertEqual(
+            "gh api repos/o/r/pulls/1/merge -f merge_method=squash 'two words'",
+            policy_match_text(
+                ["gh", "api", "repos/o/r/pulls/1/merge", "-fmerge_method=squash", "two words"]
+            ),
+        )
+        self.assertEqual(
+            "gh pr list -R token-org/repo",
+            policy_match_text(["gh", "pr", "list", "-Rtoken-org/repo"]),
+        )
+        # A cluster whose *later* member takes a value is still read: the
+        # boolean in front is consumed and pflag re-enters at the `F`.
+        self.assertEqual((["-F", "body.md"], False), _cluster_readings("-dFbody.md"))
+
+    def test_a_cluster_before_a_subcommand_cannot_hide_it(self):
+        """The element after a cluster can be a subcommand, so a word stays.
+
+        Cobra finds the command path with `stripFlags` (spf13/cobra,
+        command.go), which drops the element after a lone shorthand it does
+        not know -- `gh -m pr merge 1` never reaches `pr merge` -- and never
+        the element after a token of three or more characters. So `gh -dm pr
+        merge 1` finds `pr merge`, which reads `-dm` as `--delete-branch
+        --merge` and merges. Dropping `pr` as the value of the cluster's `-m`
+        hid that from github.merge: the match text read `gh -d m -m merge 1`,
+        and nothing downstream reads a `gh` argv again.
+
+        Prose has spaces and a subcommand does not, so that is the line: a
+        multi-word value after a cluster is still dropped (the test two
+        above), a single word survives. The cost is a one-word title such as
+        `gh pr create -dt merge`, refused visibly rather than merged silently.
+        """
+        from credential_proxy import policy_match_text
+
+        for argv, expected, desc in (
+            (["gh", "-dm", "pr", "merge", "1"],
+             "github.merge", "cluster before the noun"),
+            (["gh", "pr", "-dm", "merge", "1"],
+             "github.merge", "cluster between noun and verb"),
+            (["gh", "-dt", "release", "create", "v1", "v1"],
+             "github.pipeline-trigger", "cluster hiding `release`"),
+        ):
+            with self.subTest(desc=desc):
+                rule = self.policy.blocked_by(argv)
+                self.assertIsNotNone(rule, f"{desc} slipped past: {argv}")
+                self.assertEqual(expected, rule.rule_id, desc)
+
+        self.assertEqual(
+            "gh -d m -m pr merge 1",
+            policy_match_text(["gh", "-dm", "pr", "merge", "1"]),
+        )
+        # A one-word value stays for the same reason, wherever the cluster
+        # sits -- including a cluster that is really a value, whose letters
+        # happen to spell a free-text shorthand.
+        self.assertEqual(
+            "git commit -a m -m wip",
+            policy_match_text(["git", "commit", "-am", "wip"]),
+        )
+        self.assertTrue(
+            policy_match_text(
+                ["kubectl", "get", "pods", "-nkube-system", "foo"]
+            ).endswith(" foo"),
+            "the positional after `-nkube-system` was swallowed",
+        )
 
 
 if __name__ == "__main__":

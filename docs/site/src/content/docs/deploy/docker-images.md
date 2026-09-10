@@ -39,8 +39,8 @@ Tagged with the release version; `:latest` on every push to `main`.
 
 | Image | Upstream reference | Pin | Override | Pulled by |
 | ----- | ------------------ | --- | -------- | --------- |
-| `platform-agent` | `ghcr.io/gke-labs/kube-agents/platform-agent` | release tag | `PLATFORM_AGENT_IMAGE` | The agent Deployment the operator renders, and its sandbox init container. |
-| `credential-proxy` | `ghcr.io/gke-labs/kube-agents/credential-proxy` | release tag | `CREDENTIAL_PROXY_IMAGE` | The credential-proxy Deployment, and the agent-api-auth sidecar in the agent pod. |
+| `platform-agent` | `ghcr.io/gke-labs/kube-agents/platform-agent` | release tag | `PLATFORM_AGENT_IMAGE` | The agent Deployment the operator renders, its sandbox init container, and the optional self-improvement CronJob. |
+| `credential-proxy` | `ghcr.io/gke-labs/kube-agents/credential-proxy` | release tag | `CREDENTIAL_PROXY_IMAGE` | The credential-proxy Deployment, the agent-api-auth sidecar in the agent pod, and the self-improvement CronJob's pod under its fork and upstream modes. |
 | `agent-sandbox` | `ghcr.io/gke-labs/kube-agents/agent-sandbox` | release tag | `AGENT_SANDBOX_IMAGE` | The shell sandbox StatefulSet the operator renders beside every agent pod. |
 | `k8s-operator` | `ghcr.io/gke-labs/kube-agents/k8s-operator` | release tag | `OPERATOR_IMAGE` | The controller-manager Deployment. |
 | `replay-proxy` | `ghcr.io/gke-labs/kube-agents/replay-proxy` | release tag | `REPLAY_IMAGE` | The optional inference-replay integration. |
@@ -87,7 +87,7 @@ Built and published via GitHub Actions workflows on push to `main` (tagged with 
 
 ### `platform-agent`
 
-The agent Deployment image. Built from the `platform` target of [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile) on top of `nousresearch/hermes-agent`. It lays down the Planning Agent workspace at `/opt/defaults` (the `default` profile) plus two profile templates: the Platform Agent at `/opt/platform-template`, scaffolded into the `platform` profile at startup by the entrypoint, and the Cluster Agent at `/opt/cluster-template`, scaffolded into per-cluster `cluster-*` profiles at runtime by `cluster_agent_profile.py`.
+The agent Deployment image. Built from the `platform` target of [`deploy/docker/Dockerfile`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/Dockerfile) on top of `nousresearch/hermes-agent`. It lays down the Planning Agent workspace at `/opt/defaults` (the `default` profile) plus three profile templates: the Platform Agent at `/opt/platform-template`, scaffolded into the `platform` profile at startup by the entrypoint; the Cluster Agent at `/opt/cluster-template`, scaffolded into per-cluster `cluster-*` profiles at runtime by `cluster_agent_profile.py`; and the self-improvement investigator at `/opt/selfimprove`, which `selfimprove_run.py` copies onto an emptyDir at the start of each run. The same image runs the self-improvement CronJob, and carries the build stamp the loop reads to learn which revision the agent is running before fetching that source from GitHub.
 
 - **Published by**: [`.github/workflows/docker-publish-ghcr.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-ghcr.yml)
 - **Also to GAR**: [`docker-publish-gcp.yml`](https://github.com/gke-labs/kube-agents/blob/main/.github/workflows/docker-publish-gcp.yml)
@@ -173,6 +173,48 @@ FROM ${HERMES_AGENT_IMAGE}:${HERMES_AGENT_TAG} AS agent-base
 The `ARG` has no default, so every build path has to pass it — the image-build workflows, `make docker-build-platform` and `make docker-build-credential-proxy`, and `dev_rebuild_agent.sh` all read it from `tags.env`. A build that omits it fails rather than falling back to `latest`.
 
 Bumping Hermes means editing `tags.env` and rebuilding both agent images: the pin is a build-time base, so nothing changes in a cluster until `platform-agent` and `credential-proxy` are rebuilt and rolled out.
+
+## Build-time provenance
+
+The `platform` and `credential-proxy` stages each take two more build args, both defaulting to
+empty. Only `platform` writes `/opt/build-info.json`; on `credential-proxy` the args set the two
+labels alone, which is what displaces the wrong revision the Hermes base image would otherwise
+leave on it.
+
+```bash
+docker build --platform linux/amd64 --target platform \
+  --build-arg GIT_SHA="$(git rev-parse HEAD)" \
+  --build-arg IMAGE_SOURCE=https://github.com/<owner>/kube-agents \
+  -f deploy/docker/Dockerfile .
+```
+
+`--target platform` is not optional. The Dockerfile's last stage is a test stage, so a build
+without it produces something other than the agent image.
+
+`GIT_SHA` sets the OCI `org.opencontainers.image.revision` label and is written to
+`/opt/build-info.json` inside the image, whose whole content is `{"revision":"<sha>"}`.
+`IMAGE_SOURCE` sets `org.opencontainers.image.source` and is not written to the file; it is what
+ghcr package linking and provenance scanners follow, which is why it defaults to empty rather than
+to the upstream URL — a fork's image would otherwise point at a repository that does not hold its
+code. The
+[self-improvement loop](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/self-improvement.md)
+reads `/opt/build-info.json` to decide which source revision it is auditing. An empty
+`revision` makes it refuse the run by default rather than guess, so a build whose
+image will run the loop should pass `GIT_SHA`; an install that cannot can set
+`selfImprovement.allowUnstampedImage: true` and get an investigation against
+`main`, whose line numbers may belong to neither the running image nor its
+source. Nothing else in the product reads the file, and the args sit at the end
+of the stage so a changing SHA rebuilds only the instruction that writes it.
+
+Neither publish workflow passes either arg yet, so the images published to GHCR and Artifact
+Registry carry an empty `revision` and an empty `source`, and the loop refuses to run on them
+unless `allowUnstampedImage` is set. Three build paths do pass `GIT_SHA`: `make docker-build-platform`
+and `make docker-build-credential-proxy` (and so `make docker-push`, which builds through them),
+which read it from `scripts/git_revision_stamp.sh`; `scripts/dev/dev_rebuild_agent.sh`, which reads
+the same helper; and `hack/ci-deploy.sh` (through `deploy/docker/cloudbuild-ci.yaml`, on the
+`platform` target only). `IMAGE_SOURCE` is passed by the `make` targets alone, and only when it is
+set on the command line — `make docker-push IMAGE_SOURCE=https://github.com/<owner>/<repo>`; every
+other build leaves the `source` label empty.
 
 ## Private / custom registry
 
