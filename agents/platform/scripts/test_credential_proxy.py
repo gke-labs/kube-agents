@@ -4189,6 +4189,68 @@ class RequiredRoleTest(unittest.TestCase):
         self.assertEqual((), credential_proxy.required_roles("/healthz"))
 
 
+class RouteRolesTableTest(unittest.TestCase):
+    """The shape checks that keep ROUTE_ROLES able to enforce what it says.
+
+    Three ways this table can be mis-edited into admitting a caller it should
+    refuse, none of which any linter here would catch and none of which shows
+    up as a failing route. ``_validate_route_roles`` runs at import, so a
+    mis-shaped table fails every test module rather than shipping; these pin
+    that it still does, and name the escalation each one prevents.
+    """
+
+    def test_the_shipped_table_is_valid(self):
+        credential_proxy._validate_route_roles(credential_proxy.ROUTE_ROLES)
+
+    def test_a_bare_string_entry_is_refused(self):
+        """The old (prefix, role) shape, which turns membership into substring.
+
+        ``principal.role in "a2a-chat"`` is true for the legacy chat role, so
+        this entry would hand the chat relay the A2A event routes.
+        """
+        self.assertIn(
+            credential_proxy.CALLER_ROLE_CHAT, credential_proxy.CALLER_ROLE_A2A_CHAT
+        )
+        with self.assertRaises(TypeError):
+            credential_proxy._validate_route_roles(
+                (("/v1/chat/a2a/", credential_proxy.CALLER_ROLE_A2A_CHAT),)
+            )
+
+    def test_a_role_that_is_not_a_role_is_refused(self):
+        with self.assertRaises(ValueError):
+            credential_proxy._validate_route_roles((("/v1/chat/a2a/", ("a2a_chat",)),))
+
+    def test_an_empty_prefix_is_refused(self):
+        """An empty prefix matches every path and shadows the whole table."""
+        with self.assertRaises(ValueError):
+            credential_proxy._validate_route_roles(
+                (("", (credential_proxy.CALLER_ROLE_SHELL,)),)
+            )
+
+    def test_sorting_the_table_is_refused(self):
+        """The escalation a tidying edit reaches without mistyping anything.
+
+        "/v1/chat/" sorts ahead of "/v1/chat/a2a/", so an alphabetized table
+        answers the A2A event routes with the chat role and the legacy relay
+        walks in. Sorted output is checked rather than a hand-written pair, so
+        this stays true as routes are added.
+        """
+        table = tuple(sorted(credential_proxy.ROUTE_ROLES))
+        self.assertNotEqual(credential_proxy.ROUTE_ROLES, table)
+        with self.assertRaises(ValueError):
+            credential_proxy._validate_route_roles(table)
+
+    def test_a_duplicate_prefix_is_refused(self):
+        """The second entry is dead, so its roles are a comment, not a rule."""
+        with self.assertRaises(ValueError):
+            credential_proxy._validate_route_roles(
+                (
+                    ("/v1/chat/", (credential_proxy.CALLER_ROLE_CHAT,)),
+                    ("/v1/chat/", (credential_proxy.CALLER_ROLE_A2A_CHAT,)),
+                )
+            )
+
+
 class RolePermitsTest(unittest.TestCase):
     """The 403 that keeps each caller on its own routes."""
 

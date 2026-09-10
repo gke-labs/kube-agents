@@ -195,6 +195,11 @@ CALLER_ROLE_SHELL = "shell"
 CALLER_ROLE_CHAT = "chat"
 CALLER_ROLE_A2A_CHAT = "a2a-chat"
 
+# Every role that exists, for the table check below. Note that two of them
+# nest: "chat" is a substring of "a2a-chat". Nothing here may compare roles in
+# a way that cannot tell those two apart.
+CALLER_ROLES = (CALLER_ROLE_SHELL, CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT)
+
 # Which role each route demands. Checked by prefix, so the trailing slash on
 # the three families is load-bearing: without it "/v1/chatter" would match
 # "/v1/chat" and inherit its rule.
@@ -210,7 +215,8 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # Order matters: the a2a family sits under the chat prefix and must be
     # matched first. The api passthrough belongs to both chat consumers —
     # one credential, two subscriptions — while each side's event routes
-    # stay its own.
+    # stay its own. _validate_route_roles below enforces that order, and the
+    # shape of every entry, at import; do not sort this table.
     ("/v1/chat/a2a/", (CALLER_ROLE_A2A_CHAT,)),
     # No trailing slash: the passthrough is one exact path, and the handler
     # 404s anything else under it, so the prefix admits nothing extra today.
@@ -220,6 +226,61 @@ ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("/v1/github/", (CALLER_ROLE_SHELL,)),
     ("/v1/workspace/", (CALLER_ROLE_SHELL,)),
 )
+
+
+def _validate_route_roles(table: tuple[tuple[str, tuple[str, ...]], ...]) -> None:
+    """Refuse a ``ROUTE_ROLES`` that cannot enforce what it appears to say.
+
+    Three invariants this table has carried in comments only. Each fails
+    towards admitting a caller rather than refusing one, each is silent, and no
+    linter here would catch any of them -- there is no mypy, ruff or pyright in
+    the Makefile or the workflows.
+
+    *Roles must be a tuple.* ``_role_permits`` decides with ``principal.role in
+    needed``, and a bare string is also a container, so a single entry left in
+    the older ``(prefix, role)`` shape turns that membership test into a
+    substring test. Because the role names nest, ``("/v1/chat/a2a/",
+    CALLER_ROLE_A2A_CHAT)`` would then admit the legacy chat relay to the A2A
+    event routes, which is the turn-stealing the split exists to prevent.
+
+    *Roles must be roles.* A typo confers nothing, so the route it guards
+    refuses every caller -- which reads as policy rather than as a mistake.
+
+    *No prefix may shadow a later entry.* Matching is first-wins, so an entry
+    whose prefix extends an earlier one is unreachable. Sorting this table
+    alphabetically does exactly that: "/v1/chat/" sorts ahead of
+    "/v1/chat/a2a/" and takes its routes, handing them to the chat role. That
+    is the same escalation as the bare string, reachable by a tidying edit
+    rather than a mistyped one.
+
+    Raising at import is the point. A broker that will not start is a red test
+    on the pull request that mis-shaped the table -- every test module imports
+    this one -- rather than an escalation that ships quietly.
+    """
+    for index, (prefix, roles) in enumerate(table):
+        if not isinstance(prefix, str) or not prefix:
+            raise ValueError(f"ROUTE_ROLES[{index}]: the prefix must be a non-empty str")
+        if not isinstance(roles, tuple):
+            raise TypeError(
+                f"ROUTE_ROLES[{index}] ({prefix}): the roles must be a tuple, not "
+                f"{type(roles).__name__}; a bare string makes the role check a "
+                f"substring test"
+            )
+        for role in roles:
+            if role not in CALLER_ROLES:
+                raise ValueError(
+                    f"ROUTE_ROLES[{index}] ({prefix}): {role!r} is not a caller role"
+                )
+    for index, (prefix, _) in enumerate(table):
+        for later, (shadowed, _) in enumerate(table[index + 1 :], start=index + 1):
+            if shadowed.startswith(prefix):
+                raise ValueError(
+                    f"ROUTE_ROLES[{later}] ({shadowed}) is unreachable: "
+                    f"ROUTE_ROLES[{index}] ({prefix}) matches first"
+                )
+
+
+_validate_route_roles(ROUTE_ROLES)
 
 
 def required_roles(path: str) -> tuple[str, ...]:
