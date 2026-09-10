@@ -5,6 +5,7 @@ apiVersion: route.openshift.io/v1
 kind: Route
 metadata:
   name: {{ .Release.Name }}-gateway
+  namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/name: {{ .Chart.Name }}
     {{- include "kube-agents.labels" . | nindent 4 }}

@@ -5,13 +5,14 @@ apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: {{ .Release.Name }}-ingress-router
+  namespace: {{ .Release.Namespace }}
   labels:
     app.kubernetes.io/name: {{ .Chart.Name }}
     {{- include "kube-agents.labels" . | nindent 4 }}
 spec:
   podSelector:
     matchLabels:
-      app.kubernetes.io/name: {{ default "platform-agent" .Values.platformAgent.name }}
+      app: {{ default "platform-agent" .Values.platformAgent.name }}-gateway
   policyTypes:
     - Ingress
   ingress:

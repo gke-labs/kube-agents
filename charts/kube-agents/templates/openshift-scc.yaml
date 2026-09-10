@@ -8,6 +8,7 @@ metadata:
   labels:
     app.kubernetes.io/name: {{ .Chart.Name }}
     {{- include "kube-agents.labels" . | nindent 4 }}
+priority: 10
 allowHostDirVolumePlugin: false
 allowHostIPC: false
 allowHostNetwork: false
