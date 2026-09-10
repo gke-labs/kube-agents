@@ -159,6 +159,8 @@ when kubectl's current context is this install's cluster). `API_SERVER_KEY` is g
 once, when the configuration carries none and none can be recovered — not on every run,
 which used to replace the Secret and restart every pod holding it.
 
+### Cluster adoption and component toggles
+
 `SKIP_CERT_MANAGER=true` makes the generator emit `enable_cert_manager = false`, for a
 cluster whose cert-manager comes from somewhere else. Without it, the generator probes an
 existing cluster for a `cert-manager` Deployment and emits `false` when it finds one that
@@ -174,6 +176,19 @@ still in use". When the cluster already exists, `install.sh` uninstalls exactly 
 release before the apply (`clear_failed_initial_helm_release`), and only while kubectl's
 current context is that cluster's; a failed release that served before, one the state
 manages, or one whose state cannot be read is left as it is.
+
+`MIGRATE_NODE_POOLS=true` (or `--migrate-node-pools`) authorizes migrating existing node pools
+using the legacy GCE metadata server to `GKE_METADATA`, which recreates the pool's nodes and restarts
+workloads. Without opt-in, the install aborts before making any cluster changes because kube-agents
+requires Workload Identity (`GKE_METADATA`).
+
+`ENABLE_NETWORK_POLICY=true` (or `--enable-network-policy`) authorizes enabling the legacy Calico
+NetworkPolicy addon and enforcement on pre-existing GKE Standard clusters lacking Dataplane V2.
+Enabling Calico may recreate nodes and restart workloads. Without opt-in, the install aborts before
+making any cluster changes because kube-agents requires NetworkPolicy enforcement.
+
+`ALLOW_UNENCRYPTED_SECRETS=true` skips the out-of-band Cloud KMS CMEK database encryption on
+pre-existing clusters (testing environments only).
 
 ### The predecessor: `vars.sh`
 

@@ -59,13 +59,17 @@ When running the official release installer (`<RELEASE_VERSION>/install.sh`) or 
 
 The installer's engine is [Method 1](#method-1-the-install-engine--terraform--helm): the
 [`terraform/examples/full-install`](terraform/examples/full-install/README.md) composition, which is
-the canonical description of what gets created. What stays outside Terraform, the installer runs
-itself: on a **pre-existing** cluster, the `gcloud` pre-steps a data source cannot express (CMEK
-database encryption, the Workload Identity pool and node-pool metadata mode, and NetworkPolicy
-enforcement; see the site's
-[cluster requirements](docs/site/src/content/docs/install/prerequisites.md#cluster-requirements)),
-the managed-OTel collection scope on a cluster it created (no Terraform field exists), and the
-GitHub App private-key import into KMS (the PEM must not enter Terraform state). The installer sources
+the canonical description of what gets created. When adopting a **pre-existing** cluster, four mutations
+are checked out-of-band by `install.sh` before the apply: CMEK database encryption (a control-plane
+update), Workload Identity pool enablement, node-pool migration to `GKE_METADATA` (recreates nodes;
+requires `--migrate-node-pools` or `MIGRATE_NODE_POOLS=true`), and legacy Calico NetworkPolicy
+enforcement (may recreate nodes; requires `--enable-network-policy` or `ENABLE_NETWORK_POLICY=true`);
+see the site's
+[cluster requirements](docs/site/src/content/docs/install/prerequisites.md#cluster-requirements).
+On Standard clusters, Terraform also adds a `gvisor-pool` node pool unless `--gvisor=false`.
+Outside cluster adoption, two tasks stay outside Terraform: setting the managed-OTel collection scope
+on freshly created clusters (no Terraform field exists) and the GitHub App private-key import into KMS
+(the PEM must not enter Terraform state). The installer sources
 `scripts/installer/installer_common.sh`, which reads `install.defaults.env`, so its defaults
 (region, cluster name, model provider, registry prefix) and its accepted values live in exactly
 one place; see
@@ -178,7 +182,10 @@ and GitHub minter workloads).
   nothing.
 - The composition installs `cert-manager` automatically (`enable_cert_manager`, default true), so
   you do **not** need to install it yourself on this path. (You do for
-  [Method 2](#method-2-manual-kubernetes-cluster-deployment).)
+  [Method 2](#method-2-manual-kubernetes-cluster-deployment).) If your pre-existing cluster already
+  has `cert-manager` installed, export `SKIP_CERT_MANAGER=true` before running `install.sh` (or set
+  `enable_cert_manager = false` in `terraform.tfvars`) so the install does not fail colliding on
+  existing CRDs.
 - The manual Chat/Slack registrations in
   [Step 5 of this method](#step-5-enable-google-chat--slack-integrations-manual-required-steps)
   apply however the engine is driven.
@@ -261,8 +268,10 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
 The automated installer includes local state hardening and Cloud KMS (CMEK) etcd database encryption:
 
 - **Local State Security**: The `install.env` configuration — and the `terraform.tfvars` generated from it — is protected with strict file permissions (`umask 077`, `chmod 600`). An `install.env` the installer wrote is 0600 from the start; one you created by copying `install.env.example` is whatever your umask made it, so `chmod 600` it yourself. `install.sh` tightens a group- or world-readable one when it loads it and prints what it did. The Terraform **state** additionally holds every secret in plaintext; it lives in the versioned GCS state bucket, whose IAM is its protection.
-- **GKE Database Encryption (CMEK)**: GKE etcd database encryption is configured automatically using Cloud KMS (`kms_keyring_name` / `kms_key_name`, default `platform-agent-keyring` / `k8s-secret-encryption-key`; `GKE_DB_KMS_KEYRING` / `GKE_DB_KMS_KEY` in `install.env` set both). On a **pre-existing** cluster Terraform cannot enable it, so `install.sh` does that as a `gcloud` pre-step before the apply, reading the same two keys.
+- **GKE Database Encryption (CMEK)**: GKE etcd database encryption is configured automatically using Cloud KMS (`kms_keyring_name` / `kms_key_name`, default `platform-agent-keyring` / `k8s-secret-encryption-key`; `GKE_DB_KMS_KEYRING` / `GKE_DB_KMS_KEY` in `install.env` set both). On a **pre-existing** cluster Terraform cannot enable it, so `install.sh` enables Cloud KMS encryption on the control plane as a `gcloud` pre-step before the apply (a permanent, non-revertible cluster update), reading the same two keys.
 - **`ALLOW_UNENCRYPTED_SECRETS`**: Set `ALLOW_UNENCRYPTED_SECRETS=true` before running `install.sh` against an existing unencrypted cluster to skip that CMEK pre-step (testing environments only).
+- **`MIGRATE_NODE_POOLS`**: kube-agents requires Workload Identity (`GKE_METADATA`) to authenticate agent and operator pods. On existing clusters, migrating legacy node pools to `GKE_METADATA` can recreate nodes and restart workloads. Pass `--migrate-node-pools` / `MIGRATE_NODE_POOLS=true` to authorize migration; without opt-in, `install.sh` aborts before making any cluster changes (`REFUSED_MISSING_NODE_POOL_MIGRATION`).
+- **`ENABLE_NETWORK_POLICY`**: kube-agents requires NetworkPolicy enforcement for agent sandbox isolation. On an existing GKE Standard cluster lacking Dataplane V2 and Calico, enabling Calico can recreate nodes and restart workloads. Pass `--enable-network-policy` / `ENABLE_NETWORK_POLICY=true` to authorize enablement; without opt-in, `install.sh` aborts before making any cluster changes (`REFUSED_MISSING_NETWORK_POLICY`).
 - **`PERSIST_SECRETS_ON_DISK`**: By default (`PERSIST_SECRETS_ON_DISK=true`), credentials (API keys, Slack tokens) are saved to `install.env`. Set `PERSIST_SECRETS_ON_DISK=false` to keep them out of every file the installer writes; they travel to Terraform as `TF_VAR_*` and later runs recover them from the live `platform-agent-secrets` Secret.
 
 #### Private container registry
