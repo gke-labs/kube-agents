@@ -1739,6 +1739,8 @@ run_openshift_helm_install() {
       --set "openshift.enabled=true"
       --set "openshift.scc.enabled=true"
       --set "openshift.route.enabled=true"
+      --set "litellm.podMonitoring=false"
+      --set "hindsight.podMonitoring=false"
       --set-string "platformAgent.harness.clusterName=${CLUSTER_NAME}"
       --set-string "platformAgent.harness.location=${REGION}"
       --set-string "platformAgent.harness.projectId=${PROJECT_ID}"
@@ -1764,14 +1766,10 @@ run_openshift_helm_install() {
     if is_truthy "${HERMES_DASHBOARD_ENABLED:-false}"; then
       helm_cmd+=(--set "platformAgent.harness.hermes.dashboardEnabled=true")
     fi
-    if [ -n "${MEMORY:-}" ] || is_truthy "${MEMORY_ENABLED:-false}"; then
-      local mem_provider="${MEMORY_PROVIDER:-hindsight}"
-      if [ "${MEMORY:-}" = "multiuser_memory" ]; then
-        mem_provider="file"
-      fi
+    if [ -n "${MEMORY_PROVIDER:-}" ]; then
       helm_cmd+=(
-        --set "platformAgent.harness.memory.enabled=true"
-        --set-string "platformAgent.harness.memory.provider=${mem_provider}"
+        --set "platformAgent.harness.memory.enabled=${MEMORY_ENABLED:-false}"
+        --set-string "platformAgent.harness.memory.provider=${MEMORY_PROVIDER}"
         --set "platformAgent.harness.memory.userProfileEnabled=${USER_PROFILE_ENABLED:-true}"
       )
     fi
@@ -1828,11 +1826,11 @@ run_openshift_helm_install() {
         --set-string "agentSandbox.image.tag=${image_tag}"
       )
     fi
-    if [ -n "${image_registry:-}" ]; then
-      helm_cmd+=(--set-string "global.imageRegistry=${image_registry}")
+    if [ -n "${REGISTRY_PREFIX:-}" ] && [ "${REGISTRY_PREFIX%/}" != "$DEFAULT_REGISTRY_PREFIX" ]; then
+      helm_cmd+=(--set-string "global.imageRegistry=${REGISTRY_PREFIX%/}")
     fi
-    if [ -n "${THIRD_PARTY_IMAGE_REGISTRY:-}" ]; then
-      helm_cmd+=(--set-string "global.thirdPartyImageRegistry=${THIRD_PARTY_IMAGE_REGISTRY}")
+    if [ -n "${THIRD_PARTY_REGISTRY_PREFIX:-}" ]; then
+      helm_cmd+=(--set-string "global.thirdPartyImageRegistry=${THIRD_PARTY_REGISTRY_PREFIX}")
     fi
 
     "${helm_cmd[@]}" "${sandbox_key_args[@]}"
@@ -3435,6 +3433,8 @@ main() {
         --set "openshift.enabled=true" \
         --set "openshift.scc.enabled=true" \
         --set "openshift.route.enabled=true" \
+        --set "litellm.podMonitoring=false" \
+        --set "hindsight.podMonitoring=false" \
         --set-string "platformAgent.harness.clusterName=${cluster_name}" \
         --set-string "platformAgent.harness.location=${region}" \
         --set-string "platformAgent.harness.projectId=${project_id}" \

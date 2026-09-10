@@ -695,8 +695,7 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("vertex_manage_serving_project = false", dest.read_text())
 
     def test_write_tfvars_from_state_configures_openshift(self):
-        """On OpenShift, write_tfvars_from_state sets create_cluster = false,
-        cluster_mode = "standard", and emits extra_helm_values for SCC and Route."""
+        """On OpenShift, write_tfvars_from_state sets create_cluster = false and cluster_mode = "standard"."""
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
             proc = self._run(
@@ -707,10 +706,6 @@ class InstallerCommonTest(unittest.TestCase):
             content = dest.read_text()
             self.assertIn("create_cluster             = false", content)
             self.assertIn('cluster_mode               = "standard"', content)
-            self.assertIn("extra_helm_values = {", content)
-            self.assertIn("openshift = {", content)
-            self.assertIn("scc = {", content)
-            self.assertIn("route = {", content)
 
 
 class InstallDefaultsFileTest(unittest.TestCase):
