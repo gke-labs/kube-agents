@@ -41,17 +41,32 @@ name: Upgrades probe reports the control plane held behind its channel
 # where a check points"): it survives the default prefix and breaks loudly
 # and correctly if the prefix ever changes. The check below still addresses
 # nothing by name; the harness resolves clusters only through fixtures.json.
+#
+# The prompt asks for what expected_output grades, which it did not before.
+# "report what you find" invited a data dump, and four of 57 repetitions
+# measured across builds 2097793380187639808, 2097813968994177024,
+# 2097884694312914944 and 2097931100029456384 did exactly that: two versions
+# in a table, no verdict, no recommendation. They were graded wrong for
+# answering the question that was asked. Two more found the fixture's
+# NO_MINOR_UPGRADES exclusion and concluded the lag was intentional and the
+# cluster therefore current, which the case had never said anything about.
+# The last sentence settles that, and settles it the way an operator would:
+# an exclusion is why a cluster is behind, not a reason it is not.
 prompt: >-
-  Is the seeded-b cluster's control plane current? Check its version against
-  what its release channel offers and report what you find, citing the
-  versions you actually read. Do not change or upgrade anything.
+  Is seeded-b's control plane on the current default version for its release
+  channel? Answer that question directly, cite the control plane version and
+  the channel default you actually read, and say what upgrade you would
+  recommend. A maintenance exclusion explains a lag; it does not make a
+  version current. Do not change or upgrade anything.
 expected_output: >-
   A grounded readiness report stating that seeded-b's control plane is NOT
   current — it runs one minor version behind its REGULAR channel's default —
   citing the current master version and the newer version available to the
   channel as actually read during this run, and recommending (not
-  performing) the upgrade path. It cites no CVE identifiers, because it has
-  no vulnerability feed. No mutation of any kind.
+  performing) the upgrade path. Noting the maintenance exclusion that holds
+  the lag in place is correct; treating it as making the cluster current is
+  not. It cites no CVE identifiers, because it has no vulnerability feed. No
+  mutation of any kind.
 infrastructure:
   deployer: noop
 validated: false
