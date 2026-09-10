@@ -14,8 +14,9 @@ tick, for the runs that finished since the last tick:
     11 cases passed. Run 132 min on evals-23 · build log
 
 Which runs: pull-kube-agents-smoke-test builds in data.json that finished
-after the state file's `last_comment_tick`, concluded FAILURE, and graded at
-least one repetition -- so an aborted run, a setup death, or a suite that
+after the state file's `last_comment_tick` (data.json's horizon at the last
+tick, minus a short overlap), concluded FAILURE, and graded at least one
+repetition -- so an aborted run, a setup death, or a suite that
 lost every repetition to a storm gets no comment (the Chat space and the
 dashboard carry those). A red is either a gate case failing every graded
 repetition, or a hard failure: FAILURE with no such case, which is an
@@ -59,12 +60,22 @@ JOB_NAME = "pull-kube-agents-smoke-test"
 # The first tick ever has no `last_comment_tick`; it looks back this far
 # rather than commenting on two weeks of history.
 FIRST_TICK_LOOKBACK = timedelta(hours=1)
+# `now` is data.json's horizon (its generated_at, the collect time), as in
+# health.py, and the watermark is that horizon -- a run whose finished.json
+# landed during collect -> render -> publish would otherwise sit below the
+# next tick's `since` forever. The scan still starts this far before the
+# watermark, for the same reason; the recorded build id per pull request
+# keeps the overlap idempotent.
+SCAN_OVERLAP = timedelta(minutes=30)
 # How long a pull request's entry stays in the state file after its last
 # comment; data.json itself keeps 14 days.
 STATE_RETENTION = timedelta(days=14)
 # A failed post is retried next tick by moving the watermark back to just
-# before that run's finish.
+# before that run's finish -- this many times. A pull request that cannot be
+# commented on at all (locked, a 403 that never clears) is then given up on
+# for that build, rather than pinning the watermark for 14 days.
 RETRY_BACKOFF = timedelta(seconds=1)
+MAX_POST_FAILURES = 3
 
 # classify.py's vocabulary, by name so a rename there is a NameError here.
 CLS_SHARED = classify.CLS_SHARED
@@ -338,18 +349,25 @@ def find_comment(gh: ghcli.Gh, pr: int) -> int | None:
 
 def post(gh: ghcli.Gh, pr: int, body: str, known_id: int | None) -> int | None:
     """Edit the marked comment (the one remembered, else the one found), or
-    post a new one. Returns the comment id, None when nothing landed."""
+    post a new one. Returns the comment id, None when nothing landed.
+
+    A marked comment that exists but could not be edited is never followed
+    by a second one: an edit that fails while the search still finds the
+    same comment is a transient, and the answer is None (retry next tick),
+    not a duplicate. Only a remembered id the search no longer finds --
+    the comment was deleted -- falls through to a new post."""
     comment_id = known_id or find_comment(gh, pr)
     if comment_id:
         edited = gh.call("PATCH", gh.path(f"issues/comments/{comment_id}"), {"body": body})
         if edited is not None:
             return comment_id
-        if known_id:
-            # The remembered comment is gone (deleted, or a stale id): the
-            # search is the fallback before posting anew.
-            found = find_comment(gh, pr)
-            if found and found != known_id and gh.call("PATCH", gh.path(f"issues/comments/{found}"), {"body": body}) is not None:
-                return found
+        if not known_id:
+            return None
+        found = find_comment(gh, pr)
+        if found == known_id:
+            return None
+        if found:
+            return found if gh.call("PATCH", gh.path(f"issues/comments/{found}"), {"body": body}) is not None else None
     if gh.dry_run:
         gh.call("POST", gh.path(f"issues/{pr}/comments"), {"body": body})
         return None
@@ -365,7 +383,8 @@ def post(gh: ghcli.Gh, pr: int, body: str, known_id: int | None) -> int | None:
 def tick(data: dict, health_doc: dict, state: dict | None, now: datetime, roster: health.Roster, gh: ghcli.Gh) -> tuple[dict, list[tuple[int, str, str]]]:
     """Returns (new state, [(pr, build_id, body)] rendered this tick)."""
     before = state or {}
-    since = post_health.parse_iso(before.get("last_comment_tick")) or (now - FIRST_TICK_LOOKBACK)
+    watermark_in = post_health.parse_iso(before.get("last_comment_tick")) or (now - FIRST_TICK_LOOKBACK)
+    since = watermark_in - SCAN_OVERLAP
     comments = dict(before.get("comments") or {})
     runs = [r for r in data.get("runs") or [] if isinstance(r, dict)]
     rendered = []
@@ -373,18 +392,25 @@ def tick(data: dict, health_doc: dict, state: dict | None, now: datetime, roster
     for raw in newest_red_per_pr(data, since, now):
         run = health.Run(raw)
         key = str(run.pr)
-        if comments.get(key, {}).get("build_id") == run.build_id:
-            continue  # never twice for the same build
+        entry = comments.get(key, {})
+        if entry.get("build_id") == run.build_id:
+            continue  # never twice for the same build (nor after giving up on it)
         admitted = roster.at(run.started or run.finished)
         verdict = classify.classify_run(raw, runs, health_doc, now, admitted=admitted)
         red = Red(raw, verdict, admitted)
         body = render_comment(red, health_doc, runs)
         rendered.append((run.pr, run.build_id, body))
-        known = comments.get(key, {}).get("comment_id")
+        known = entry.get("comment_id")
         comment_id = post(gh, run.pr, body, known)
         if comment_id is None and not gh.dry_run:
-            log(f"warning: no comment landed on #{run.pr} for build {run.build_id}; retried next tick")
-            retry_from = min(retry_from or run.finished, run.finished)
+            failures = int(entry.get("failures") or 0) + 1
+            if failures >= MAX_POST_FAILURES:
+                log(f"warning: no comment landed on #{run.pr} for build {run.build_id} after {failures} attempts; giving up on this build")
+                comments[key] = {"comment_id": known, "build_id": run.build_id, "failures": failures, "at": health.iso(now)}
+            else:
+                log(f"warning: no comment landed on #{run.pr} for build {run.build_id} (attempt {failures}); retried next tick")
+                comments[key] = {**entry, "failures": failures, "at": health.iso(now)}
+                retry_from = min(retry_from or run.finished, run.finished)
             continue
         comments[key] = {"comment_id": comment_id or known, "build_id": run.build_id, "at": health.iso(now)}
     cutoff = now - STATE_RETENTION
@@ -404,7 +430,7 @@ def parse_args(argv):
     parser.add_argument("--health", type=pathlib.Path, required=True, help="the health.json health.py wrote this tick")
     parser.add_argument("--state", required=True, help="this script's state: local path or gs:// object")
     parser.add_argument("--repo", default=ghcli.DEFAULT_REPO, help="owner/repo the pull requests live in")
-    parser.add_argument("--now", type=health.parse_when, help="evaluate as of this ISO 8601 time (default: now)")
+    parser.add_argument("--now", type=health.parse_when, help="evaluate as of this ISO 8601 time (default: data.json's generated_at, else the wall clock)")
     parser.add_argument("--admitted", help="comma-separated admitted roster (default: BOOTSTRAP_ADMITTED in hack/ci-eval-pr.sh)")
     parser.add_argument("--ci-eval-script", type=pathlib.Path, default=health.CI_EVAL_SCRIPT, help=argparse.SUPPRESS)
     parser.add_argument("--dry-run", action="store_true", help="print the comments instead of posting; still updates --state")
@@ -419,7 +445,7 @@ def main(argv=None, runner=subprocess.run, gh_runner=None) -> int:
         log(f"ERROR: {args.data} and {args.health} must both be readable JSON objects")
         return 1
     roster = health.Roster.fixed(name for name in args.admitted.split(",") if name) if args.admitted else health.Roster.from_script(args.ci_eval_script)
-    now = args.now or datetime.now(UTC)
+    now = args.now or health.parse_iso(data.get("generated_at")) or datetime.now(UTC)
     gh = ghcli.Gh(args.repo, gh_runner or runner, dry_run=args.dry_run)
     state = post_health.read_state(args.state, runner)
     new_state, rendered = tick(data, health_doc, state, now, roster, gh)

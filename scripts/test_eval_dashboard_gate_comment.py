@@ -56,8 +56,8 @@ def run(build, pr, finished, failing=(), result=None, minutes=132, tasks=None, p
     }
 
 
-def data(*runs):
-    return {"schema_version": 1, "generated_at": NOW.isoformat(), "runs": list(runs)}
+def data(*runs, generated_at=NOW):
+    return {"schema_version": 1, "generated_at": generated_at.isoformat(), "runs": list(runs)}
 
 
 def green_health():
@@ -77,9 +77,9 @@ def outage_health(cases=TRIO, prs=(1246, 1238, 608, 1150, 1226, 1275, 1290)):
 
 def other_runs(failing=TRIO, count=7, start_pr=2000):
     """`count` other PRs' runs over the last few hours, each collapsing
-    `failing`; all older than the first tick's one-hour lookback so they
-    are context, not runs to comment on."""
-    return [run(9000 + i, start_pr + i, NOW - timedelta(minutes=70 + 20 * i), failing=failing) for i in range(count)]
+    `failing`; all older than the first tick's one-hour lookback plus the
+    30-minute scan overlap, so they are context, not runs to comment on."""
+    return [run(9000 + i, start_pr + i, NOW - timedelta(minutes=100 + 20 * i), failing=failing) for i in range(count)]
 
 
 def green_others(count=9, start_pr=3000):
@@ -128,9 +128,12 @@ class Harness(unittest.TestCase):
         self.gh = FakeGh()
 
     def tick(self, doc, health_doc, now=NOW, gh=None, dry_run=False):
+        """`now=None` leaves --now off, so data.json's generated_at is the clock."""
         (self.dir / "data.json").write_text(json.dumps(doc))
         (self.dir / "health.json").write_text(json.dumps(health_doc))
-        argv = ["--data", str(self.dir / "data.json"), "--health", str(self.dir / "health.json"), "--state", str(self.state), "--now", now.isoformat(), "--admitted", ",".join(sorted(ADMITTED))]
+        argv = ["--data", str(self.dir / "data.json"), "--health", str(self.dir / "health.json"), "--state", str(self.state), "--admitted", ",".join(sorted(ADMITTED))]
+        if now is not None:
+            argv += ["--now", now.isoformat()]
         if dry_run:
             argv.append("--dry-run")
         err = io.StringIO()
@@ -279,11 +282,74 @@ class WhenItComments(Harness):
         self.assertIn("warning: gh api POST", err)
         self.assertIn("warning: no comment landed on #1300", err)
         recorded = self.recorded()
-        self.assertNotIn("1300", recorded["comments"])
+        self.assertNotIn("build_id", recorded["comments"]["1300"], "the build is not recorded as commented")
+        self.assertEqual(recorded["comments"]["1300"]["failures"], 1)
         self.assertEqual(recorded["last_comment_tick"], (NOW - timedelta(minutes=5, seconds=1)).isoformat())
         # Next tick, GitHub is back: the same build is commented on once.
         self.tick(data(mine, *other_runs()), outage_health(), now=NOW + timedelta(minutes=15))
         self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/1300/comments")])
+
+    def test_the_clock_is_data_jsons_horizon_so_a_run_finishing_during_the_tick_is_not_lost(self):
+        # Tick 1: data.json collected at NOW (its generated_at); no --now, so
+        # the watermark is NOW, not the later wall clock of the comment step.
+        self.tick(data(*other_runs(), generated_at=NOW), outage_health(), now=None)
+        self.assertEqual(self.recorded()["last_comment_tick"], NOW.isoformat())
+        # A run finished 2 minutes after that collect, while the tick was
+        # still rendering and publishing; the next collect (15 minutes on)
+        # is the first data.json that carries it.
+        late = run(100, 1300, NOW + timedelta(minutes=2), failing=TRIO)
+        self.tick(data(late, *other_runs(), generated_at=NOW + timedelta(minutes=15)), outage_health(), now=None)
+        self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/1300/comments")])
+        self.assertEqual(self.recorded()["last_comment_tick"], (NOW + timedelta(minutes=15)).isoformat())
+        # The overlap re-scans the last half hour every tick and never
+        # re-comments a recorded build.
+        self.tick(data(late, *other_runs(), generated_at=NOW + timedelta(minutes=30)), outage_health(), now=None)
+        self.tick(data(late, *other_runs(), generated_at=NOW + timedelta(minutes=45)), outage_health(), now=None)
+        self.assertEqual(len(self.gh.writes()), 1)
+        self.assertEqual(gate_comment.SCAN_OVERLAP, timedelta(minutes=30))
+
+    def test_a_transient_edit_failure_never_leaves_a_second_marked_comment(self):
+        first = run(100, 1300, NOW - timedelta(minutes=30), failing=TRIO)
+        self.tick(data(first, *other_runs()), outage_health())
+        self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/1300/comments")])
+        # The remembered comment 501 still exists (the search finds it) but
+        # the PATCH fails: no POST, retried next tick.
+        flaky = FakeGh(existing={1300: [{"id": 501, "body": gate_comment.MARKER + "\n### old"}]}, fail_writes=True)
+        later = NOW + timedelta(hours=1)
+        second = run(101, 1300, later - timedelta(minutes=5), failing=["agent-kanban-smoke"])
+        rc, err = self.tick(data(first, second, *green_others()), green_health(), now=later, gh=flaky)
+        self.assertEqual(rc, 0)
+        self.assertEqual(flaky.writes(), [("PATCH", "repos/gke-labs/kube-agents/issues/comments/501")])
+        self.assertIn("retried next tick", err)
+        self.assertEqual(self.recorded()["comments"]["1300"]["build_id"], "100", "the new build is not recorded as commented")
+        # A comment found by search whose edit fails is the same: no POST.
+        found_only = FakeGh(existing={1301: [{"id": 77, "body": gate_comment.MARKER + "\n### old"}]}, fail_writes=True)
+        self.state.unlink()
+        self.tick(data(run(200, 1301, NOW - timedelta(minutes=5), failing=TRIO), *other_runs()), outage_health(), gh=found_only)
+        self.assertEqual(found_only.writes(), [("PATCH", "repos/gke-labs/kube-agents/issues/comments/77")])
+
+    def test_a_pull_request_that_cannot_be_commented_on_is_given_up_after_three_attempts(self):
+        failing = FakeGh(fail_writes=True)
+        mine = run(100, 1300, NOW - timedelta(minutes=5), failing=TRIO)
+        for attempt in range(1, 4):
+            rc, err = self.tick(data(mine, *other_runs()), outage_health(), now=NOW + timedelta(minutes=15 * attempt), gh=failing)
+            self.assertEqual(rc, 0)
+        posts = [p for m, p in failing.writes() if m == "POST"]
+        self.assertEqual(len(posts), 3)
+        self.assertIn("after 3 attempts; giving up on this build", err)
+        recorded = self.recorded()
+        self.assertEqual((recorded["comments"]["1300"]["build_id"], recorded["comments"]["1300"]["failures"]), ("100", 3))
+        self.assertEqual(recorded["last_comment_tick"], (NOW + timedelta(minutes=45)).isoformat(), "the watermark is no longer pinned")
+        # A fourth tick asks GitHub nothing for that build.
+        self.tick(data(mine, *other_runs()), outage_health(), now=NOW + timedelta(minutes=60), gh=failing)
+        self.assertEqual(len(failing.writes()), 3)
+        # Before the third failure the watermark was pinned to the run.
+        # (Checked on a fresh state: one failure, watermark just before it.)
+        self.state.unlink()
+        once = FakeGh(fail_writes=True)
+        self.tick(data(mine, *other_runs()), outage_health(), gh=once)
+        self.assertEqual(self.recorded()["last_comment_tick"], (NOW - timedelta(minutes=5, seconds=1)).isoformat())
+        self.assertEqual(self.recorded()["comments"]["1300"]["failures"], 1)
 
     def test_dry_run_prints_and_posts_nothing(self):
         mine = run(100, 1300, NOW - timedelta(minutes=5), failing=TRIO)
