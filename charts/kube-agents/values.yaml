@@ -202,9 +202,10 @@ litellm:
   # the managed collector exists; the NetworkPolicy already allows the egress.
   otel: false
   # model-default routes to <modelProvider>/<modelDefaultName>. Providers:
-  # gemini, anthropic, openai, vertex_ai. The provider's API key must exist in
-  # the credentials Secret — except vertex_ai, which authenticates with
-  # Workload Identity instead.
+  # gemini, anthropic, openai, vertex_ai, hosted_vllm. The provider's API key
+  # must exist in the credentials Secret — except vertex_ai, which
+  # authenticates with Workload Identity, and hosted_vllm, whose in-cluster
+  # server checks no key.
   modelProvider: gemini
   # Empty selects the per-provider default (mirrors common.sh).
   modelDefaultName: ""
@@ -226,9 +227,11 @@ litellm:
     location: ""
   # modelProvider: hosted_vllm only, and both required with it (as is
   # modelDefaultName: the server's model has no default). apiBase is the
-  # server's OpenAI-compatible base URL (LiteLLM reads it as
-  # HOSTED_VLLM_API_BASE); targetPort is the server pod's port, not the
-  # Service port, because the egress rule matches after Service translation.
+  # server's OpenAI-compatible base URL including the /v1 path, naming an
+  # in-cluster Service (<svc>.<namespace>.svc.cluster.local): LiteLLM reads
+  # it as HOSTED_VLLM_API_BASE, and the egress rule reads the namespace from
+  # it. targetPort is the server pod's port, not the Service port, because
+  # the rule matches after Service translation.
   hostedVllm:
     apiBase: ""
     targetPort: null

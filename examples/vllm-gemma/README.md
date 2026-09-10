@@ -4,7 +4,7 @@ This directory contains an example of deploying vLLM configured to serve Google'
 
 ## Prerequisites
 
-- A Kubernetes cluster with an NVIDIA L4 node (GKE Standard: a node pool with `nvidia-l4` and the latest driver; GKE Autopilot: nothing, the `nodeSelector` is enough).
+- A Kubernetes cluster with an NVIDIA L4 node: on GKE Standard a node pool of `g2-standard-8` or larger with `nvidia-l4` and the latest driver (the 16Gi memory request does not fit a `g2-standard-4`); on GKE Autopilot nothing, the `nodeSelector` is enough.
 - For an online pull, a Hugging Face token with access to the gated Gemma models.
 
 ## Sizing
@@ -16,7 +16,7 @@ The Deployment serves `google/gemma-4-E4B-it` on one L4 with a 131072-token cont
 ### Option A: pre-staged weights (air-gapped)
 
 1. Copy the checkpoint onto a `PersistentVolumeClaim` (for example from `gs://vertex-model-garden-public-us/gemma4/gemma-4-E4B-it/`, which needs no token).
-2. Uncomment the `model-weights` volume and its mount in `deployment.yaml`, and set `MODEL_ID` to the mount path.
+2. Uncomment the `model-weights` volume and its `volumeMounts` entry in `deployment.yaml`, and set `MODEL_ID` to the directory under the mount. That path is then the model id the server answers to, so use the same value as the gateway's model name (`MODEL_DEFAULT_NAME`, or the model line in [`examples/litellm-hosted-vllm/`](../litellm-hosted-vllm/)).
 3. Apply:
 
    ```bash

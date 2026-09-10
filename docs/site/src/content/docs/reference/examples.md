@@ -53,7 +53,7 @@ vLLM serving Gemma 4 (`google/gemma-4-E4B-it`) on one GKE L4 node, based on GKE'
 
 ## Layering
 
-Both LiteLLM examples and `vllm-gemma` speak OpenAI-compatible Completions. You can layer LiteLLM in front of vLLM to get routing and observability across a mix of hosted and local models — that's the pattern for "one config for many providers".
+The LiteLLM examples and `vllm-gemma` speak OpenAI-compatible Completions. You can layer LiteLLM in front of vLLM to get routing and observability across a mix of hosted and local models — that's the pattern for "one config for many providers", and `litellm-hosted-vllm` is that pattern shipped.
 
 ## Not shipped as examples (but reference-worthy)
 

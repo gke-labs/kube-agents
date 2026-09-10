@@ -1,10 +1,9 @@
 # Hosting the model in your cluster
 
-> **STATUS: in progress, #1433.** Real today: the hosted-provider path (`gemini`, `anthropic`,
+> **STATUS: design of record; implemented.** The `hosted_vllm` provider ships alongside the hosted-provider path (`gemini`, `anthropic`,
 > `openai`, `vertex_ai`) and the ChatGPT-subscription path (`chatgpt`), each a row in
 > `k8s-operator/config/integrations/litellm/providers.json`, and a hand-applied vLLM recipe under
-> `examples/vllm-gemma/`. This document is the design of the `hosted_vllm` provider that joins
-> them. Tracking issue: #1418. It supersedes #608.
+> `examples/vllm-gemma/`. Tracking issue: #1418.
 
 ## 1. Goal
 
@@ -25,8 +24,8 @@ HOSTED_VLLM_TARGET_PORT=<the server pod's port>
 The agent is untouched. It speaks the OpenAI wire to `model-default` at the gateway, and only the
 gateway's `model_list` knows where that alias goes
 ([inference gateway](../site/src/content/docs/concepts/inference-gateway.md)). The end-state
-architecture already names the split: "LiteLLM proxy for hosted models, vLLM for local GPU
-models" ([05-system-architecture](../architecture/05-system-architecture.md) §5, C5).
+architecture already names the split: "LiteLLM proxy for hosted models (Gemini/OpenAI), vLLM for
+local GPU models" ([05-system-architecture](../architecture/05-system-architecture.md) §5, C5).
 
 ## 2. Two facts that shape the design
 
@@ -66,32 +65,35 @@ the provider is useful without it.
 
 ## 4. Egress
 
-The gateway's NetworkPolicy allows 443 to public addresses and nothing to private ones. The new
-rule admits pods in the gateway's own namespace on the server pod's port, 8000. Not every pod in
-the cluster, and not the Service port: NetworkPolicy matches after Service translation.
+The gateway's NetworkPolicy has no general private-address egress: DNS, the metadata server, the
+OTLP collector, and 443 to public addresses. The `hosted_vllm` rule admits one namespace, read from
+the Service name in `apiBase` the way the collector's is read from `telemetry.otlpEndpoint`, on the
+configured `targetPort` (8000 in the example). Not every pod in the cluster, and the pod port
+rather than the Service port, because the policy is evaluated after the Service's translation.
 
 ## 5. Testing
 
 - **Unit, every PR** (`tests/test_hosted_vllm_provider.py`): the chart render for `hosted_vllm`
   carries the provider line, the env var, and exactly one same-namespace egress rule on the
   configured port; each missing value fails the render naming it; the other providers render none
-  of it; the example's manifests carry the same provider line, env var, and egress rule.
-- **Manual:** the live run recorded in the pull request. CI has no GPU.
+  of it; a URL outside the cluster fails; the rule names the namespace in the URL; the installer
+  accepts the provider with no default model and emits both tfvars; the gateway example points at
+  the server example's Service and port.
+- **Manual:** a live run on a GPU node, recorded in the pull request that lands a change. CI has no GPU.
 - **No new eval cases.** The agent's behaviour does not change.
 
-## 6. What the live run found
+## 6. Sizing the server for the agent
 
-On a 2×L4 node (`g2-standard-24`), `examples/vllm-gemma/` as #608 left it does not fit a 31B model:
-with FP8 weights at 16.5 GiB per GPU, `--max-model-len 32768` plus multimodal profiling fails
-engine initialization with `CUDA error: out of memory`; two sequences and vision profiling
-disabled fit.
+The agent requests 65536 output tokens on every call. At the pinned Hermes that is the `custom`
+provider's floor when `model.max_tokens` is unset, and the agent's rendered config leaves it unset;
+vLLM rejects any request whose output budget exceeds `--max-model-len`. Two consequences:
 
-The agent then failed every turn with an HTTP 500 whatever the context, because it requests
-65536 output tokens on each call (the Hermes `custom` provider default; the agent's config sets
-no override) and vLLM rejects a request whose output budget exceeds `--max-model-len`. The
-server's context therefore has to exceed 65536 plus the agent's ~20k-token prompt. That is why
-the example now serves `google/gemma-4-E4B-it` at 131072 on one L4, the configuration under
-which the gateway request and a full agent turn with a tool call succeeded, and why the larger
-Gemma 4 checkpoints are out of reach on L4-class hardware. A harness-side cap would be a
-`max_tokens` knob in the agent's rendered config; the review of #608 asked for the operator to
-stay untouched, so the requirement is documented in the example instead.
+- A server has to hold that budget plus the agent's ~20k-token prompt, so `examples/vllm-gemma/`
+  serves `google/gemma-4-E4B-it` at a 131072-token context on one L4, the configuration under
+  which a gateway request and a full agent turn with a tool call succeeded. A 31B checkpoint with
+  FP8 weights holds 32k on two L4s and no more, and failed every turn.
+- The cap could live in the agent's config instead: `model.max_tokens` in the profile config is a
+  per-leaf override the operator's managed scope does not pin, so it needs no Go change, but it
+  would apply to every provider, which is what the review of #608 declined. Upstream Hermes has
+  since removed the floor, so a Hermes bump makes the example's context a tuning choice again.
+  Until then the requirement is stated where the server is sized.

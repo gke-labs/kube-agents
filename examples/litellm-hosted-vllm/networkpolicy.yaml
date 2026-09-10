@@ -95,7 +95,9 @@ spec:
         - port: 8000
           protocol: TCP
       to:
-        - podSelector: {}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kubeagents-system
   ingress:
     - from:
         - podSelector: {}

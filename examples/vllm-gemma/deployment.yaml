@@ -5,6 +5,15 @@ metadata:
   namespace: kubeagents-system
 spec:
   replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # Why maxUnavailable is 0 here: pulling and loading Gemma model weights
+      # takes minutes (with a 10-minute startupProbe budget). At replicas: 1,
+      # maxUnavailable: 1 terminates the serving Pod immediately, causing minutes
+      # of inference outage during rollouts. maxUnavailable: 0 ensures continuous serving.
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app: gemma-server
@@ -103,6 +112,11 @@ spec:
           volumeMounts:
             - mountPath: /dev/shm
               name: dshm
+            # For option A in the README: the PVC with pre-staged weights. Set MODEL_ID
+            # to this path, and keep the gateway's model name equal to it, because the
+            # path is then the model id the server answers to.
+            # - mountPath: /mnt/models
+            #   name: model-weights
       terminationGracePeriodSeconds: 60
       volumes:
         - name: dshm

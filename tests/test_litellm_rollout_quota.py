@@ -16,7 +16,7 @@ nothing in this repository creates or sizes that quota, so the harness cannot
 assume headroom exists. `maxUnavailable` of at least 1 is what lets the rollout
 fall back to replacing in place.
 
-LiteLLM's Deployment exists in four files, and the value has to hold in the
+LiteLLM's Deployment exists in five files, and the value has to hold in the
 three that roll. Only two are the pair `AGENTS.md` keeps in step on purpose:
 
     charts/kube-agents/templates/litellm.yaml   (via values.yaml, configurable)

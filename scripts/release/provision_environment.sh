@@ -207,6 +207,14 @@ if [ -n "${MODEL_DEFAULT_NAME:-}" ]; then
   INSTALL_ARGS+=(--model-default-name="${MODEL_DEFAULT_NAME}")
 fi
 
+if [ -n "${HOSTED_VLLM_API_BASE:-}" ]; then
+  INSTALL_ARGS+=(--hosted-vllm-api-base="${HOSTED_VLLM_API_BASE}")
+fi
+
+if [ -n "${HOSTED_VLLM_TARGET_PORT:-}" ]; then
+  INSTALL_ARGS+=(--hosted-vllm-target-port="${HOSTED_VLLM_TARGET_PORT}")
+fi
+
 if [ -n "${ENABLE_GVISOR:-}" ]; then
   INSTALL_ARGS+=(--gvisor="${ENABLE_GVISOR}")
 fi

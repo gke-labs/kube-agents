@@ -213,6 +213,27 @@ with a green install. With litellm.otel off (the default) there is no LiteLLM ex
 the policy to block, so failing the whole install over an egress rule nothing uses would
 punish a user who only meant to repoint the agents.
 */}}
+{{- /*
+The namespace of the hosted_vllm server, read from litellm.hostedVllm.apiBase the way
+otlpCollectorNamespace reads the collector's: only <svc>.<ns> and <svc>.<ns>.svc[...] are
+in-cluster Services, and the egress rule names that namespace rather than every pod in
+the release's. A URL of any other shape is not a server in this cluster, which is the
+whole of what the provider is for, so it fails the render instead of rendering a policy
+that drops every call.
+*/}}
+{{- define "kube-agents.hostedVllmNamespace" -}}
+{{- $url := ((.Values.litellm.hostedVllm | default dict).apiBase) | default "" -}}
+{{- $host := $url | trimPrefix "https://" | trimPrefix "http://" -}}
+{{- $host = (splitList "/" $host | first) -}}
+{{- $host = (splitList ":" $host | first) -}}
+{{- $parts := splitList "." $host -}}
+{{- if or (eq (len $parts) 2) (and (ge (len $parts) 3) (eq (index $parts 2) "svc")) -}}
+{{- index $parts 1 -}}
+{{- else -}}
+{{- fail (printf "litellm.hostedVllm.apiBase %q does not name an in-cluster Service (<svc>.<namespace>.svc.cluster.local), so the gateway's NetworkPolicy cannot tell which namespace to allow egress to." $url) -}}
+{{- end -}}
+{{- end }}
+
 {{- define "kube-agents.otlpCollectorNamespace" -}}
 {{- if .Values.telemetry.collectorNamespace -}}
 {{- .Values.telemetry.collectorNamespace -}}

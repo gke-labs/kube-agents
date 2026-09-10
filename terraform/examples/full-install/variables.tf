@@ -213,7 +213,7 @@ variable "model_provider" {
 }
 
 variable "hosted_vllm_api_base" {
-  description = "OpenAI-compatible base URL of the vLLM server when model_provider = \"hosted_vllm\" (required with it; the chart refuses to render without it). LiteLLM reads it as HOSTED_VLLM_API_BASE."
+  description = "OpenAI-compatible base URL of the vLLM server when model_provider = \"hosted_vllm\" (required with it; the chart refuses to render without it), including the /v1 path and naming an in-cluster Service, e.g. http://llm-service.kubeagents-system.svc.cluster.local/v1. LiteLLM reads it as HOSTED_VLLM_API_BASE; the gateway's egress rule reads the namespace from it."
   type        = string
   default     = ""
 }
@@ -222,6 +222,11 @@ variable "hosted_vllm_target_port" {
   description = "The vLLM server pod's port when model_provider = \"hosted_vllm\" (required with it): the gateway's egress rule names the pod port, not the Service port."
   type        = string
   default     = ""
+
+  validation {
+    condition     = var.hosted_vllm_target_port == "" || can(regex("^[0-9]+$", var.hosted_vllm_target_port))
+    error_message = "hosted_vllm_target_port must be a port number."
+  }
 }
 
 variable "vertex_project_id" {
@@ -243,7 +248,7 @@ variable "vertex_manage_serving_project" {
 }
 
 variable "model_default_name" {
-  description = "Model name behind model-default. Empty selects the chart's per-provider default (which mirrors the provisioning scripts)."
+  description = "Model name behind model-default. Empty selects the chart's per-provider default (which mirrors the provisioning scripts); hosted_vllm has no default and requires it."
   type        = string
   default     = ""
 }

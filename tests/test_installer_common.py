@@ -1080,6 +1080,28 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertIn("vertex_manage_serving_project = false", dest.read_text())
 
+    def test_tfvars_generation_carries_the_hosted_vllm_pair(self):
+        # Both reach Terraform verbatim; the chart refuses to render a
+        # hosted_vllm install without them, so a dropped line would surface
+        # only at helm_release.
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={
+                    "API_SERVER_KEY": "k",
+                    "MODEL_PROVIDER": "hosted_vllm",
+                    "MODEL_DEFAULT_NAME": "some-org/some-model",
+                    "HOSTED_VLLM_API_BASE": "http://s.ns.svc.cluster.local/v1",
+                    "HOSTED_VLLM_TARGET_PORT": "8000",
+                },
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            content = dest.read_text()
+            self.assertIn('model_provider     = "hosted_vllm"', content)
+            self.assertIn('hosted_vllm_api_base = "http://s.ns.svc.cluster.local/v1"', content)
+            self.assertIn('hosted_vllm_target_port = "8000"', content)
+
 
 class InstallDefaultsFileTest(unittest.TestCase):
     """install.defaults.env holds every default, and only defaults.

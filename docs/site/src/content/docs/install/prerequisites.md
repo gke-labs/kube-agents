@@ -151,6 +151,8 @@ Pick one at least:
 
 Or route one of these keys through a self-hosted LiteLLM gateway — see [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) for a Gemini API-key template.
 
+Two paths need no key: `MODEL_PROVIDER=vertex_ai` (Workload Identity in your GCP project) and `MODEL_PROVIDER=hosted_vllm`, a vLLM server in the cluster, which needs a GPU node and the server instead — see [Inference gateway](../concepts/inference-gateway.md#vllm-local-models).
+
 ## GitOps repo (for `submit-suggestion`)
 
 The declarative workflow needs a GitHub repo to file PRs against.

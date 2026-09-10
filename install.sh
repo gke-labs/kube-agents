@@ -338,6 +338,8 @@ PARAM_CLUSTER_MODE="${CLUSTER_MODE:-}"
 PARAM_MODEL_PROVIDER="${MODEL_PROVIDER:-}"
 PARAM_VERTEX_PROJECT_ID="${VERTEX_PROJECT_ID:-}"
 PARAM_VERTEX_LOCATION="${VERTEX_LOCATION:-}"
+PARAM_HOSTED_VLLM_API_BASE="${HOSTED_VLLM_API_BASE:-}"
+PARAM_HOSTED_VLLM_TARGET_PORT="${HOSTED_VLLM_TARGET_PORT:-}"
 PARAM_VERTEX_MANAGE_SERVING_PROJECT="${VERTEX_MANAGE_SERVING_PROJECT:-}"
 PARAM_GEMINI_API_KEY="${GEMINI_API_KEY:-}"
 PARAM_OPENAI_API_KEY="${OPENAI_API_KEY:-}"
@@ -451,6 +453,10 @@ Flags for AI Agents & Automation:
                                 that project is one you cannot administer, and enable
                                 the API and make the grant by hand
                                 (default: DEFAULT_VERTEX_MANAGE_SERVING_PROJECT, currently true)
+  --hosted-vllm-api-base=URL    hosted_vllm only: the in-cluster vLLM server's OpenAI-compatible
+                                base URL including /v1 (http://<svc>.<namespace>.svc.cluster.local/v1)
+  --hosted-vllm-target-port=N   hosted_vllm only: the server pod's port, named by the gateway's
+                                egress rule (not the Service port)
   --gemini-api-key=KEY          Gemini API Key
   --openai-api-key=KEY          OpenAI API Key
   --anthropic-api-key=KEY       Anthropic API Key
@@ -545,6 +551,8 @@ parse_args() {
       --vertex-project-id=*) PARAM_VERTEX_PROJECT_ID="${1#*=}"; shift ;;
       --vertex-location=*) PARAM_VERTEX_LOCATION="${1#*=}"; shift ;;
       --vertex-manage-serving-project=*) PARAM_VERTEX_MANAGE_SERVING_PROJECT="${1#*=}"; shift ;;
+      --hosted-vllm-api-base=*) PARAM_HOSTED_VLLM_API_BASE="${1#*=}"; shift ;;
+      --hosted-vllm-target-port=*) PARAM_HOSTED_VLLM_TARGET_PORT="${1#*=}"; shift ;;
       --gemini-api-key=*) PARAM_GEMINI_API_KEY="${1#*=}"; shift ;;
       --openai-api-key=*) PARAM_OPENAI_API_KEY="${1#*=}"; shift ;;
       --anthropic-api-key=*) PARAM_ANTHROPIC_API_KEY="${1#*=}"; shift ;;
@@ -1000,7 +1008,7 @@ warn_unrecorded_interview_answers() {
   local key recorded current drifted=""
   for key in GOOGLE_CHAT_ENABLED GOOGLE_CHAT_HOME_CHANNEL SLACK_ENABLED ALLOWED_USERS SLACK_ALLOWED_USERS \
     SLACK_BOT_TOKEN SLACK_APP_TOKEN SLACK_HOME_CHANNEL SLACK_HOME_CHANNEL_NAME \
-    CHAT_TOPIC_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME PLATFORM_AGENT_PERMISSION_SET \
+    CHAT_TOPIC_NAME MODEL_PROVIDER MODEL_DEFAULT_NAME HOSTED_VLLM_API_BASE HOSTED_VLLM_TARGET_PORT PLATFORM_AGENT_PERMISSION_SET \
     PLATFORM_AGENT_CUSTOM_ROLES ENABLE_GVISOR HERMES_DASHBOARD_ENABLED MEMORY \
     USER_PROFILE_ENABLED GITOPS_ORG GITOPS_REPO GITHUB_APP_ID GITHUB_PEM_PATH; do
     grep -qE "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" 2>/dev/null || continue
@@ -2554,10 +2562,13 @@ run_menu_system() {
             prompt_read "Anthropic API Key" anthropic_api_key "$anthropic_api_key" true
             ;;
           5)
+            # A model pinned for another provider is not valid here, so the
+            # prompt starts empty on a switch, as main() does.
+            [ "$model_provider" = "hosted_vllm" ] || model_default_name=""
             model_provider="hosted_vllm"
             prompt_read "Model ID the vLLM server was started with" model_default_name "$model_default_name"
-            prompt_read "Server base URL (LiteLLM's HOSTED_VLLM_API_BASE)" HOSTED_VLLM_API_BASE "${HOSTED_VLLM_API_BASE:-}"
-            prompt_read "Server pod port (for the gateway's egress rule)" HOSTED_VLLM_TARGET_PORT "${HOSTED_VLLM_TARGET_PORT:-}"
+            prompt_read "Server base URL including /v1 (http://<svc>.<namespace>.svc.cluster.local/v1)" HOSTED_VLLM_API_BASE "${HOSTED_VLLM_API_BASE:-}"
+            prompt_read "Server pod port (the gateway's egress rule names it, not the Service port)" HOSTED_VLLM_TARGET_PORT "${HOSTED_VLLM_TARGET_PORT:-}"
             ;;
         esac
         ;;
@@ -3097,6 +3108,9 @@ main() {
   local gemini_api_key="${detected_gemini_key:-}"
   local openai_api_key="${PARAM_OPENAI_API_KEY:-}"
   local anthropic_api_key="${PARAM_ANTHROPIC_API_KEY:-}"
+  # Flags win over install.env, as --vertex-location does over VERTEX_LOCATION.
+  HOSTED_VLLM_API_BASE="${PARAM_HOSTED_VLLM_API_BASE:-${HOSTED_VLLM_API_BASE:-}}"
+  HOSTED_VLLM_TARGET_PORT="${PARAM_HOSTED_VLLM_TARGET_PORT:-${HOSTED_VLLM_TARGET_PORT:-}}"
 
   if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
     # Pre-set to the provider already configured, so pressing enter keeps it.
@@ -3165,8 +3179,8 @@ main() {
       5)
         model_provider="hosted_vllm"
         prompt_read "Model ID the vLLM server was started with" model_default_name "$([ "$model_provider_was" = "hosted_vllm" ] && echo "$model_name_was" || echo "")"
-        prompt_read "Server base URL (LiteLLM's HOSTED_VLLM_API_BASE)" HOSTED_VLLM_API_BASE "${HOSTED_VLLM_API_BASE:-}"
-        prompt_read "Server pod port (for the gateway's egress rule)" HOSTED_VLLM_TARGET_PORT "${HOSTED_VLLM_TARGET_PORT:-}"
+        prompt_read "Server base URL including /v1 (http://<svc>.<namespace>.svc.cluster.local/v1)" HOSTED_VLLM_API_BASE "${HOSTED_VLLM_API_BASE:-}"
+        prompt_read "Server pod port (the gateway's egress rule names it, not the Service port)" HOSTED_VLLM_TARGET_PORT "${HOSTED_VLLM_TARGET_PORT:-}"
         ;;
     esac
   fi
@@ -3203,9 +3217,17 @@ main() {
       [ -n "$anthropic_api_key" ] || print_warning "No Anthropic API key was provided; the agent will require a credential update before model calls can succeed."
       ;;
     hosted_vllm)
+      # Loud, unlike the API-key cases above: a keyless install still deploys
+      # and fails at the first model call, while the chart refuses to render
+      # without these three, which would surface at helm_release after the
+      # cluster and IAM had been built.
       if [ -z "$model_default_name" ] || [ -z "${HOSTED_VLLM_API_BASE:-}" ] || [ -z "${HOSTED_VLLM_TARGET_PORT:-}" ]; then
-        print_warning "hosted_vllm needs MODEL_DEFAULT_NAME, HOSTED_VLLM_API_BASE and HOSTED_VLLM_TARGET_PORT; the chart refuses to render without them."
+        print_error "hosted_vllm needs --model-default-name, --hosted-vllm-api-base (including /v1) and --hosted-vllm-target-port (the server pod's port), or the same keys in install.env."
+        exit 1
       fi
+      case "${HOSTED_VLLM_TARGET_PORT}" in
+        *[!0-9]*|"") print_error "--hosted-vllm-target-port must be a port number, got '${HOSTED_VLLM_TARGET_PORT}'."; exit 1 ;;
+      esac
       ;;
   esac
 

@@ -20,14 +20,14 @@ The Platform Agent talks to an LLM through a **Completions API** proxy so provid
 
 ## LiteLLM (hosted models)
 
-[LiteLLM](https://litellm.ai) is an OpenAI-Completions-compatible proxy in front of every major model provider. The `kube-agents` Helm chart deploys it with the API key you provide (the dev copy is `make -C k8s-operator deploy-litellm`).
+[LiteLLM](https://litellm.ai) is an OpenAI-Completions-compatible proxy in front of every major model provider. The `kube-agents` Helm chart deploys it with the credential the provider needs — an API key, Workload Identity for Vertex AI, nothing for a vLLM server in the cluster (the dev copy is `make -C k8s-operator deploy-litellm`).
 
 ### What ships
 
 - [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) — Gemini-only default. Uses `GEMINI_API_KEY`.
 - [`examples/litellm-chatgpt-subscription/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-chatgpt-subscription) — proxies to a personal ChatGPT subscription via OAuth device flow. Useful for demos where you don't want a per-token cost.
 
-To switch providers, edit the LiteLLM `config.yaml` (mounted from a `ConfigMap`) and set the corresponding API key secret. The Platform Agent config doesn't change — it always talks to a Service named `litellm`.
+To switch providers, edit the LiteLLM `config.yaml` (mounted from a `ConfigMap`) and set the corresponding API key secret, if the provider takes one. The Platform Agent config doesn't change — it always talks to a Service named `litellm`.
 
 ### Setting the default model
 
@@ -121,7 +121,7 @@ A re-run against an existing install reconciles the switch in one `terraform app
 
 vLLM speaks OpenAI-compatible Completions, so LiteLLM can be layered on top (or in front) for routing and observability.
 
-`MODEL_PROVIDER=hosted_vllm` does that layering: LiteLLM's own provider for a vLLM server, so the gateway's config is the same `hosted_vllm/<model>` line the other providers get and the server's address travels as `HOSTED_VLLM_API_BASE`. It has no defaults: set `MODEL_DEFAULT_NAME` to the model the server was started with, `HOSTED_VLLM_API_BASE` to its base URL, and `HOSTED_VLLM_TARGET_PORT` to the server pod's port, which the gateway's new egress rule names (in the chart: `litellm.modelDefaultName`, `litellm.hostedVllm.apiBase`, `litellm.hostedVllm.targetPort`). Nothing else changes: the agent keeps asking for `model-default`. The provider itself is LiteLLM's; its [vLLM provider page](https://docs.litellm.ai/docs/providers/vllm) is the reference for the model prefix and the environment variables. [`examples/litellm-hosted-vllm/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-hosted-vllm) is the hand-applied gateway, pointed at the example server above.
+`MODEL_PROVIDER=hosted_vllm` does that layering: LiteLLM's own provider for a vLLM server, so the gateway's config is the same `hosted_vllm/<model>` line the other providers get and the server's address travels as `HOSTED_VLLM_API_BASE`. It has no defaults: set `MODEL_DEFAULT_NAME` to the model the server was started with, `HOSTED_VLLM_API_BASE` to its base URL, and `HOSTED_VLLM_TARGET_PORT` to the server pod's port, which the gateway's egress rule names (in the chart: `litellm.modelDefaultName`, `litellm.hostedVllm.apiBase`, `litellm.hostedVllm.targetPort`). Nothing else changes: the agent keeps asking for `model-default`. The provider itself is LiteLLM's; its [vLLM provider page](https://docs.litellm.ai/docs/providers/vllm) is the reference for the model prefix and the environment variables. [`examples/litellm-hosted-vllm/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-hosted-vllm) is the hand-applied gateway, pointed at the example server above.
 
 ## Inference replay
 

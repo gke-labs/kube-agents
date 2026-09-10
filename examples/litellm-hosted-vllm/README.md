@@ -4,8 +4,8 @@ This directory contains an example of deploying a LiteLLM proxy configured to ro
 
 ## Prerequisites
 
-- A Kubernetes cluster with GPU nodes.
-- A vLLM server reachable as `llm-service` in `kubeagents-system`. [`examples/vllm-gemma/`](../vllm-gemma/) deploys one serving `google/gemma-4-E4B-it`; to use another server or model, change `HOSTED_VLLM_API_BASE` in `deployment.yaml` and the model line in `configmap.yaml`.
+- A Kubernetes cluster. The gateway itself needs no GPU; the server it points at does.
+- A vLLM server reachable as `llm-service` in `kubeagents-system`. [`examples/vllm-gemma/`](../vllm-gemma/) deploys one serving `google/gemma-4-E4B-it`; to use another server or model, change `HOSTED_VLLM_API_BASE` in `deployment.yaml` (keep the `/v1` path), the model line in `configmap.yaml`, and the egress port in `networkpolicy.yaml`, which is the server pod's port.
 
 ## Setup
 

@@ -47,6 +47,8 @@
 {{- if empty $hostedVllmTargetPort }}
 {{- fail "litellm.modelProvider 'hosted_vllm' needs litellm.hostedVllm.targetPort: the server pod's port, which the gateway's egress rule names." }}
 {{- end }}
+{{- /* Resolved here so a URL that is not an in-cluster Service fails with the other three. */}}
+{{- $hostedVllmNamespace := include "kube-agents.hostedVllmNamespace" . }}
 {{- end }}
 {{- $callbacks := ternary `["otel", "prometheus"]` `["prometheus"]` .Values.litellm.otel }}
 {{- /*
@@ -326,13 +328,18 @@ spec:
             matchLabels:
               kubernetes.io/metadata.name: {{ include "kube-agents.otlpCollectorNamespace" . }}
     {{- if eq $provider "hosted_vllm" }}
-    # The in-cluster model server: pods in this namespace on the server's own
-    # port. Not every pod in the cluster, and not the Service port.
+    # The in-cluster model server: the namespace its Service lives in (read
+    # from apiBase), on the server pod's own port. Not every pod in the
+    # cluster, and the pod port rather than the Service port: for a pod-backed
+    # Service the policy is evaluated after the Service's DNAT, unlike the
+    # kube-dns VIP case above.
     - ports:
         - port: {{ $hostedVllmTargetPort }}
           protocol: TCP
       to:
-        - podSelector: {}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ include "kube-agents.hostedVllmNamespace" . }}
     {{- end }}
   ingress:
     - from:
