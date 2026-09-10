@@ -84,4 +84,5 @@ Clean up stuck `Machine` objects that block cluster autoscaler progress only wit
 # Operator confirmation required:
 oc delete machine <STUCK_MACHINE_NAME> -n openshift-machine-api
 ```
+
 Do not execute destructive machine deletion commands unattended.
