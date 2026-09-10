@@ -49,6 +49,12 @@ import re
 import sys
 from datetime import datetime, timedelta, timezone
 
+try:
+    from . import tiers
+except ImportError:  # run as a script: python3 scripts/eval_dashboard/health.py
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import tiers
+
 HEALTH_SCHEMA_VERSION = 1
 
 # Severity order. Index is severity: a transition "up" is towards OUTAGE.
@@ -360,8 +366,14 @@ class Run:
 
 
 def load_runs(data: dict) -> list[Run]:
-    """Every run with a finish time, oldest finish first."""
-    runs = [Run(run) for run in data.get("runs") or []]
+    """Every presubmit run with a finish time, oldest finish first.
+
+    The nightly periodic's runs (SCHEMA.md: runs[].tier) never reach a rule
+    or a metric here: the gate is the presubmit, a nightly has no pull
+    request to count towards a distinct-PR floor, and a nightly collapsing
+    is a case's record, not a gate incident.
+    """
+    runs = [Run(run) for run in tiers.presubmit_runs(data.get("runs"))]
     return sorted((run for run in runs if run.finished), key=lambda run: run.finished)
 
 
@@ -965,17 +977,20 @@ def trim(data: dict, start: datetime, end: datetime, source: str) -> dict:
                     for rep in task["reps"]
                 ]
             tasks.append(trimmed)
-        runs.append(
-            {
-                "build_id": run.get("build_id"),
-                "pr": run.get("pr"),
-                "started": run.get("started"),
-                "finished": run.get("finished"),
-                "result": run.get("result"),
-                "duration_s": run.get("duration_s"),
-                "tasks": tasks,
-            }
-        )
+        entry = {
+            "build_id": run.get("build_id"),
+            "pr": run.get("pr"),
+            "started": run.get("started"),
+            "finished": run.get("finished"),
+            "result": run.get("result"),
+            "duration_s": run.get("duration_s"),
+            "tasks": tasks,
+        }
+        if tiers.TIER_KEY in run:
+            # Kept as written so a fixture cut from a two-tier data.json
+            # replays the same filter the live tick applies.
+            entry[tiers.TIER_KEY] = run[tiers.TIER_KEY]
+        runs.append(entry)
     runs.sort(key=lambda run: run["finished"])
     return {
         "schema_version": data.get("schema_version"),

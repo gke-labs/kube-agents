@@ -106,6 +106,7 @@
   .p-fail { background:var(--crit-bg); color:var(--crit-text); }
   .p-infra { background:var(--ser-bg); color:var(--ser-text); }
   .p-fix { background:var(--accent-soft); color:var(--accent-link,var(--accent)); }
+  .p-night { background:var(--hl-soft); color:var(--warn-text); }
 
   /* evidence table */
   table { border-collapse:collapse; width:100%; }
@@ -224,6 +225,15 @@ const DASH = {
   paretoWindowDays: 7,
   paretoMaxRows: 8,
   runEventFailFraction: 0.8,
+  // Tiers (SCHEMA.md: runs[].tier; a run without one is the presubmit) and
+  // the evidence table's per-tier pass-rate windows; mirrors tiers.py and
+  // render.py's TIER_RATE_WINDOWS_DAYS.
+  tiers: ["presubmit", "nightly"],
+  tierPresubmit: "presubmit",
+  tierNightly: "nightly",
+  tierRateWindowsDays: [7, 30],
+  // The evidence table's columns that are not a rate: Case, Evidence, Tier.
+  evidenceFixedColumns: 3,
   weekMs: 7 * 24 * 3600 * 1000,
   dayMs: 24 * 3600 * 1000,
   reasonSnippetChars: 60,
@@ -262,10 +272,18 @@ function sortedRuns(data) {
   return runs;
 }
 const runTasks = (run) => (run ? (run.tasks || []).filter((t) => t && typeof t === "object") : []);
-// Runs that measured anything: at least one task row. An aborted build
+// The tier of a run (mirrors tiers.py): its `tier` as written, else the
+// presubmit when absent -- the only tier that existed before the field did.
+// An unknown value matches neither filter below, so it is never the gate's.
+const runTier = (run) => (run && typeof run.tier === "string" && run.tier ? run.tier : DASH.tierPresubmit);
+// The presubmit's runs: what the gate band, the matrix, the Pareto and the
+// wall-clock tile are about. Mirrors render.py's gate_runs / nightly_runs.
+const gateRuns = (data) => sortedRuns(data).filter((r) => runTier(r) === DASH.tierPresubmit);
+const nightlyRuns = (data) => sortedRuns(data).filter((r) => runTier(r) === DASH.tierNightly);
+// Gate runs that measured anything: at least one task row. An aborted build
 // parses to zero tasks; giving one a matrix column or a trend point would
 // chart a run that measured nothing. Mirrors render.py's measured_runs.
-const measuredRuns = (data) => sortedRuns(data).filter((r) => runTasks(r).length);
+const measuredRuns = (data) => gateRuns(data).filter((r) => runTasks(r).length);
 
 function parseIso(value) {
   if (typeof value !== "string") return null;
@@ -401,6 +419,34 @@ function dayPoints(data) {
   return points.slice(-DASH.trendDays);
 }
 
+// {case: [passed reps, failed reps]} over the runs of `tier` started inside
+// the last `days`, run-level events excluded. Mirrors render.py's
+// tier_pass_rates.
+function tierPassRates(data, tier, days) {
+  const anchor = referenceMs(data);
+  const runs = tier === DASH.tierPresubmit ? gateRuns(data) : nightlyRuns(data);
+  const tally = new Map();
+  for (const run of runs) {
+    const started = parseIso(run.started);
+    if (anchor != null && (started == null || started <= anchor - days * DASH.dayMs || started > anchor)) continue;
+    if (isRunEvent(run)) continue;
+    for (const task of runTasks(run)) {
+      const [p, f] = repCounts(taskReps(task));
+      const name = String(task.name);
+      if (!tally.has(name)) tally.set(name, [0, 0]);
+      tally.get(name)[0] += p;
+      tally.get(name)[1] += f;
+    }
+  }
+  return tally;
+}
+
+function rateCell(counts) {
+  if (!counts || counts[0] + counts[1] === 0) return '<span class="cap">—</span>';
+  const [passed, failed] = counts;
+  return `<span class="num">${(100 * passed / (passed + failed)).toFixed(0)}%</span> <span class="cap">(${passed + failed})</span>`;
+}
+
 /* ---- notes, badges, events ---- */
 
 function noteHtml(entry) {
@@ -453,7 +499,7 @@ function reasonClass(reason) {
 function paretoGroups(data) {
   const anchor = referenceMs(data);
   const groups = new Map();
-  for (const run of sortedRuns(data)) {
+  for (const run of gateRuns(data)) {
     const started = parseIso(run.started);
     if (anchor != null) {
       if (started == null) continue;
@@ -575,7 +621,7 @@ function gateTilesHtml(data, events) {
     tiles.push(tile("Infra-rep rate", "—", "", "no measured runs yet"));
   }
 
-  const runs = sortedRuns(data);
+  const runs = gateRuns(data);
   let green = null, greenIndex = -1;
   for (let i = runs.length - 1; i >= 0; i -= 1) {
     if (String(runs[i].result || "") === DASH.runResultGreen && runTasks(runs[i]).length
@@ -765,18 +811,30 @@ function bandGateHtml(data, notes, events) {
   </section>`;
 }
 
-function evidenceRow(kase) {
+// Which matrix runs the case (mirrors render.py's tier_pill).
+function tierPill(kase) {
+  if (kase.active) return '<span class="pill p-pass">IN PRESUBMIT</span>';
+  if (kase.nightly_active) return '<span class="pill p-night">NIGHTLY ONLY</span>';
+  return '<span class="pill p-fix">NOT IN PRESUBMIT</span>';
+}
+
+function evidenceRow(kase, rates) {
   const name = String(kase.name || "?");
   const have = isCount(kase.runs_on_record) ? kase.runs_on_record : 0;
   const width = Math.min(100, (100 * have) / DASH.screeningWindow);
-  const presubmit = kase.active
-    ? '<span class="pill p-pass">IN PRESUBMIT</span>'
-    : '<span class="pill p-fix">NOT IN PRESUBMIT</span>';
+  const nightly = kase.nightly && typeof kase.nightly === "object" ? kase.nightly : {};
+  const nights = isCount(nightly.runs_on_record) ? nightly.runs_on_record : 0;
+  let cells = "";
+  for (const tier of DASH.tiers) {
+    for (const days of DASH.tierRateWindowsDays) cells += `<td>${rateCell(rates.get(`${tier}:${days}`).get(name))}</td>`;
+  }
   return `<tr><td><div class="tname">${esc(name)}</div>${noteHtml(DASH.notes[name])}</td>` +
     `<td><div style="display:flex;align-items:center;gap:10px">` +
     `<div class="prog"><i style="width:${width.toFixed(0)}%"></i></div>` +
-    `<span class="cap">${have} of ${DASH.screeningWindow}</span></div></td>` +
-    `<td>${presubmit}</td></tr>`;
+    `<span class="cap">${have} of ${DASH.screeningWindow}</span></div>` +
+    `<div class="cap">${nights} nightly</div></td>` +
+    cells +
+    `<td>${tierPill(kase)}</td></tr>`;
 }
 
 function evidenceHtml(data) {
@@ -788,13 +846,22 @@ function evidenceHtml(data) {
   };
   const cases = (data.cases || []).filter((c) => c && typeof c === "object")
     .sort((a, b) => (depth(b) - depth(a)) || byName(a, b));
-  const rows = cases.map(evidenceRow).join("")
-    || '<tr><td colspan="3"><span class="cap">no cases on record yet</span></td></tr>';
+  const rates = new Map();
+  let heads = "";
+  for (const tier of DASH.tiers) {
+    for (const days of DASH.tierRateWindowsDays) {
+      rates.set(`${tier}:${days}`, tierPassRates(data, tier, days));
+      heads += `<th>${esc(tier)} · ${days}d</th>`;
+    }
+  }
+  const columns = DASH.evidenceFixedColumns + DASH.tiers.length * DASH.tierRateWindowsDays.length;
+  const rows = cases.map((c) => evidenceRow(c, rates)).join("")
+    || `<tr><td colspan="${columns}"><span class="cap">no cases on record yet</span></td></tr>`;
   return `
   <h2 id="nightly">Evidence on record</h2>
-  <div class="sub">Recorded task appearances per case (all collected runs, infra included), against the ${DASH.screeningWindow}-run yardstick · history depth, not admission progress — the screening window fills only from main-branch runs in the baseline store (bench/baselines/README.md) · annotations from case-notes.yaml</div>
+  <div class="sub">Recorded task appearances per case (presubmit runs, infra included), against the ${DASH.screeningWindow}-run yardstick, with the nightly's count beside it · history depth, not admission progress — the screening window fills only from main-branch runs in the baseline store (bench/baselines/README.md) · pass rates are pass / (pass + fail) over reps in the window, per tier, never pooled · ${DASH.runEventCaption} · annotations from case-notes.yaml</div>
   <div class="card"><table id="evidence">
-    <thead><tr><th>Case</th><th>Evidence collected</th><th>In presubmit</th></tr></thead>
+    <thead><tr><th>Case</th><th>Evidence collected</th>${heads}<th>Tier</th></tr></thead>
     <tbody>${rows}</tbody>
   </table></div>`;
 }
@@ -820,11 +887,13 @@ const HERO_HTML = `
 function footHtml(data) {
   const generated = parseIso(data.generated_at);
   const runs = (data.runs || []).length;
+  const nightly = nightlyRuns(data).length;
   const threshold = Math.round(DASH.runEventFailFraction * 100);
   return `<div class="foot" id="foot">Every number on this page is computed from ` +
     `<code>data.json</code> (source: ${esc(String(data.source || "?"))}, ` +
     `generated ${generated != null ? utcStamp(generated) + " UTC" : "unknown time"}, ` +
-    `${runs} run${runs !== 1 ? "s" : ""} on record). ` +
+    `${runs} run${runs !== 1 ? "s" : ""} on record, ` +
+    `${nightly} of them nightly; the agent and gate bands read presubmit runs only). ` +
     `Run-level event rule: a run where ≥${threshold}% of its graded tasks failed is ` +
     `charged to the run, not the cases. Event markers and catch counts come from ` +
     `<code>events.yaml</code>; row annotations and badges from ` +

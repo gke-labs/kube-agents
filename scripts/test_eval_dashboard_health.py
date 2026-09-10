@@ -452,6 +452,65 @@ class Hysteresis(unittest.TestCase):
 # --------------------------------------------------------------------------- #
 
 
+class NightlyTier(unittest.TestCase):
+    """A nightly run (SCHEMA.md: runs[].tier) is never the gate's evidence:
+    not for a rule, not for the recovery bar, not in the digest's numbers."""
+
+    def nightly(self, run_doc):
+        return dict(run_doc, tier="nightly", pr=None)
+
+    def test_a_shared_break_made_of_nightly_runs_is_not_an_outage(self):
+        broken = broken_tasks({"cluster-agent-crashloop-debug"})
+        runs = [run(100 + i, i, T0 - timedelta(minutes=60 * (3 - i)), tasks=broken) for i in range(3)]
+        self.assertEqual(assess(data(*runs), T0)["state"], "OUTAGE", "as presubmit runs, the same three fire")
+        doc = data(*(self.nightly(r) for r in runs))
+        result = assess(doc, T0)
+        self.assertEqual(result["state"], "GREEN")
+        self.assertEqual(result["evidence"], [])
+
+    def test_nightly_storm_reps_and_setup_deaths_do_not_count(self):
+        stormy = [task(f"case-{k}", "eee") for k in range(2)] + [task(n, "ppp") for n in sorted(ADMITTED)]
+        storm_runs = [self.nightly(run(100 + i, None, T0 - timedelta(minutes=20 * i), result="SUCCESS", tasks=stormy)) for i in range(3)]
+        self.assertEqual(assess(data(*storm_runs), T0)["state"], "GREEN")
+        deaths = [self.nightly(run(200 + i, None, T0 - timedelta(minutes=10 * i), minutes=1, result="FAILURE")) for i in range(3)]
+        self.assertEqual(assess(data(*deaths), T0)["state"], "GREEN")
+
+    def test_nightly_runs_change_nothing_about_a_presubmit_verdict(self):
+        presubmit = [run(100 + i, i, T0 - timedelta(hours=i), tasks=broken_tasks({"agent-kanban-smoke"})) for i in range(1, 5)]
+        baseline = adjudicate(data(*presubmit), T0)
+        self.assertEqual(baseline["state"], "OUTAGE")
+        nightly_green = self.nightly(run(900, None, T0 - timedelta(minutes=5), tasks=broken_tasks(set())))
+        nightly_red = self.nightly(run(901, None, T0 - timedelta(minutes=3), tasks=broken_tasks({"reliability-pdb-probe"})))
+        with_nightly = adjudicate(data(*presubmit, nightly_green, nightly_red), T0)
+        for key in ("state", "condition", "cause", "failing_cases", "evidence", "incident"):
+            self.assertEqual(with_nightly[key], baseline[key], key)
+        self.assertEqual(with_nightly["metrics"], baseline["metrics"], "the digest's 24h numbers are the presubmit's")
+
+    def test_nightly_greens_do_not_recover_an_incident(self):
+        presubmit = [run(100 + i, i, T0 - timedelta(hours=5) + timedelta(minutes=30 * i), tasks=broken_tasks({"agent-kanban-smoke"})) for i in range(4)]
+        doc = data(*presubmit)
+        prev = adjudicate(doc, T0)
+        later = T0 + timedelta(hours=7)
+        doc["runs"] += [self.nightly(run(300 + i, None, later - timedelta(minutes=10 * i), tasks=broken_tasks(set()))) for i in range(3)]
+        held = adjudicate(doc, later, prev)
+        self.assertEqual((held["state"], held["recovering"]), ("OUTAGE", True))
+
+    def test_a_run_without_a_tier_is_the_presubmit(self):
+        doc = data(run(1, 1, T0 - timedelta(hours=1), tasks=broken_tasks(set())))
+        self.assertEqual(adjudicate(doc, T0)["metrics"]["full_runs"], 1)
+        doc["runs"][0]["tier"] = "nightly"
+        self.assertEqual(adjudicate(doc, T0)["metrics"]["full_runs"], 0)
+        doc["runs"][0]["tier"] = "rc"
+        self.assertEqual(adjudicate(doc, T0)["metrics"]["full_runs"], 0, "an unknown tier is never the gate's by default")
+
+    def test_trim_keeps_the_tier_so_a_fixture_replays_the_same_filter(self):
+        doc = data(run(1, 1, T0, tasks=[task("x", "ppp")]), self.nightly(run(2, None, T0, tasks=[task("x", "fff")])))
+        trimmed = health.trim(doc, T0 - timedelta(days=1), T0 + timedelta(days=1), "test")
+        self.assertNotIn("tier", trimmed["runs"][0])
+        self.assertEqual(trimmed["runs"][1]["tier"], "nightly")
+        self.assertEqual(len(health.load_runs(trimmed)), 1)
+
+
 class Metrics(unittest.TestCase):
     def test_green_report_metrics(self):
         doc = data(

@@ -92,10 +92,11 @@ import sys
 import yaml
 
 try:
-    from . import classify
+    from . import classify, tiers
 except ImportError:  # run as a script: python3 scripts/eval_dashboard/render.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     import classify
+    import tiers
 
 HERE = pathlib.Path(__file__).resolve().parent
 TEMPLATE = HERE / "template" / "index.html.tmpl"
@@ -170,6 +171,15 @@ DAY_MS = 24 * 3600 * 1000
 REASON_SNIPPET_CHARS = 60
 # Prow's job verdict for a green run (SCHEMA.md: runs[].result).
 RUN_RESULT_GREEN = "SUCCESS"
+# The evidence table's per-tier pass rates: rep-level pass / (pass + fail)
+# over the runs started inside each of these windows before the reference
+# time, run-level events excluded as everywhere on this page. Two tiers,
+# two numbers, never pooled: the presubmit's is the gate's own history, the
+# nightly's is the readable view of a case's record on main (what that
+# record is for: docs/eval-gate-roster.md).
+TIER_RATE_WINDOWS_DAYS = (7, 30)
+# The evidence table's columns that are not a rate: Case, Evidence, Tier.
+EVIDENCE_FIXED_COLUMNS = 3
 
 # --- failure-signature normalization -------------------------------------
 # Deliberately small and documented: a reason that matches nothing renders
@@ -275,12 +285,23 @@ def run_tasks(run: dict | None) -> list[dict]:
     return [t for t in run.get("tasks") or [] if isinstance(t, dict)]
 
 
+def gate_runs(data: dict) -> list[dict]:
+    """The presubmit's runs, chronological: what the gate band, the matrix,
+    the Pareto and the Brief are about (SCHEMA.md: runs[].tier; a run with
+    no tier predates the field and is the presubmit)."""
+    return tiers.presubmit_runs(sorted_runs(data))
+
+
+def nightly_runs(data: dict) -> list[dict]:
+    return tiers.nightly_runs(sorted_runs(data))
+
+
 def measured_runs(data: dict) -> list[dict]:
-    """Runs that measured anything: at least one task row. An aborted or
-    deadline-truncated build parses to zero tasks; giving one a matrix
+    """Gate runs that measured anything: at least one task row. An aborted
+    or deadline-truncated build parses to zero tasks; giving one a matrix
     column or a trend point would chart a run that measured nothing. The
     header sha deliberately stays on sorted_runs."""
-    return [r for r in sorted_runs(data) if run_tasks(r)]
+    return [r for r in gate_runs(data) if run_tasks(r)]
 
 
 def parse_iso(value) -> datetime.datetime | None:
@@ -472,6 +493,39 @@ def day_points(data: dict) -> list[tuple[str, float]]:
         if counts[0] + counts[1]
     ]
     return points[-TREND_DAYS:]
+
+
+def tier_pass_rates(data: dict, tier: str, days: int) -> dict[str, tuple[int, int]]:
+    """{case: (passed reps, failed reps)} over the runs of `tier` started
+    inside the last `days` before the reference time, run-level events
+    excluded and infra reps uncounted. A data.json with no time anchor
+    counts every run of the tier; a run without a start time is skipped
+    when there is one."""
+    anchor = reference_ms(data)
+    runs = gate_runs(data) if tier == tiers.TIER_PRESUBMIT else nightly_runs(data)
+    tally: dict[str, list[int]] = {}
+    for run in runs:
+        started = iso_ms(run.get("started"))
+        if anchor is not None and (
+            started is None or started <= anchor - days * DAY_MS or started > anchor
+        ):
+            continue
+        if is_run_event(run):
+            continue
+        for task in run_tasks(run):
+            p, f, _ = rep_counts(task_reps(task))
+            bucket = tally.setdefault(str(task.get("name")), [0, 0])
+            bucket[0] += p
+            bucket[1] += f
+    return {name: (p, f) for name, (p, f) in tally.items()}
+
+
+def rate_cell(counts: tuple[int, int] | None) -> str:
+    """One pass-rate cell: 'NN% (n)' over n graded reps, or a dash."""
+    if not counts or counts[0] + counts[1] == 0:
+        return '<span class="cap">—</span>'
+    passed, failed = counts
+    return f'<span class="num">{fmt(100 * passed / (passed + failed))}%</span> <span class="cap">({passed + failed})</span>'
 
 
 # --------------------------------------------------------------------------
@@ -819,16 +873,19 @@ def compact_run(run: dict, verdict: dict, at: dict | None) -> dict:
 
 
 def brief_document(data: dict, health: dict | None, history: list[dict] | None, merges: list[dict] | None) -> dict:
-    """The document both new pages read. Runs are the last RUN_VIEW_DAYS
-    of data.json, oldest first, each classified against every run on
-    record with the verdict in force when it finished."""
+    """The document both new pages read. Runs are the presubmit's last
+    RUN_VIEW_DAYS of data.json, oldest first, each classified against every
+    run on record with the verdict in force when it finished. The nightly's
+    runs are not listed -- they are nobody's pull request and the Brief is
+    the gate's -- but they travel into the classification, which reads them
+    for each case's nightly_failed_recent note."""
     anchor = reference_ms(data)
     runs = [r for r in data.get("runs") or [] if isinstance(r, dict)]
     now = ms_to_utc(anchor) if anchor is not None else None
     incidents = history_incidents(history) if history else []
     admitted = classify.admitted_cases()
     out_runs = []
-    for run in sorted_runs(data):
+    for run in gate_runs(data):
         started = iso_ms(run.get("started"))
         if anchor is not None and started is not None and started < anchor - RUN_VIEW_DAYS * DAY_MS:
             continue
@@ -847,7 +904,11 @@ def brief_document(data: dict, health: dict | None, history: list[dict] | None, 
     for case in data.get("cases") or []:
         if isinstance(case, dict) and case.get("name") is not None:
             name = str(case["name"])
-            cases[name] = {"active": case.get("active") is True, "admitted": admitted is None or name in admitted}
+            cases[name] = {
+                "active": case.get("active") is True,
+                "nightly_active": case.get("nightly_active") is True,
+                "admitted": admitted is None or name in admitted,
+            }
     return {
         "schema_version": 1,
         "generated_at": data.get("generated_at") if iso_ms(data.get("generated_at")) is not None else None,
@@ -937,7 +998,7 @@ def pareto_groups(data: dict) -> list[dict]:
     the data has no time anchor at all."""
     anchor = reference_ms(data)
     groups: dict[str, dict] = {}
-    for run in sorted_runs(data):
+    for run in gate_runs(data):
         started = iso_ms(run.get("started"))
         if anchor is not None:
             if started is None:
@@ -1085,7 +1146,7 @@ def gate_tiles_html(data: dict, events: dict) -> str:
         tiles.append(tile("Infra-rep rate", "—", "", "no measured runs yet"))
 
     # Wall clock of the latest green full run.
-    runs = sorted_runs(data)
+    runs = gate_runs(data)
     green = None
     green_index = -1
     for index in range(len(runs) - 1, -1, -1):
@@ -1285,22 +1346,37 @@ def band_gate_html(data: dict, notes: dict, events: dict) -> str:
   </section>"""
 
 
-def evidence_row(case: dict, notes: dict) -> str:
+def tier_pill(case: dict) -> str:
+    """Which matrix runs the case: the presubmit's (and so the nightly's,
+    its superset), the nightly's alone, or neither on this checkout."""
+    if case.get("active"):
+        return '<span class="pill p-pass">IN PRESUBMIT</span>'
+    if case.get("nightly_active"):
+        return '<span class="pill p-night">NIGHTLY ONLY</span>'
+    return '<span class="pill p-fix">NOT IN PRESUBMIT</span>'
+
+
+def evidence_row(case: dict, notes: dict, rates: dict) -> str:
     name = str(case.get("name") or "?")
     have = case.get("runs_on_record")
     have = int(have) if is_count(have) else 0
     width = min(100.0, 100.0 * have / SCREENING_WINDOW)
-    presubmit = (
-        '<span class="pill p-pass">IN PRESUBMIT</span>'
-        if case.get("active")
-        else '<span class="pill p-fix">NOT IN PRESUBMIT</span>'
+    nightly = case.get("nightly") if isinstance(case.get("nightly"), dict) else {}
+    nights = nightly.get("runs_on_record")
+    nights = int(nights) if is_count(nights) else 0
+    cells = "".join(
+        f"<td>{rate_cell(rates[(tier, days)].get(name))}</td>"
+        for tier in tiers.TIERS
+        for days in TIER_RATE_WINDOWS_DAYS
     )
     return (
         f'<tr><td><div class="tname">{esc(name)}</div>{note_html(notes.get(name))}</td>'
         f'<td><div style="display:flex;align-items:center;gap:10px">'
         f'<div class="prog"><i style="width:{fmt(width)}%"></i></div>'
-        f'<span class="cap">{have} of {SCREENING_WINDOW}</span></div></td>'
-        f"<td>{presubmit}</td></tr>"
+        f'<span class="cap">{have} of {SCREENING_WINDOW}</span></div>'
+        f'<div class="cap">{nights} nightly</div></td>'
+        f"{cells}"
+        f"<td>{tier_pill(case)}</td></tr>"
     )
 
 
@@ -1312,14 +1388,23 @@ def evidence_html(data: dict, notes: dict) -> str:
             str(c.get("name") or ""),
         ),
     )
-    rows = "".join(evidence_row(c, notes) for c in cases)
+    rates = {
+        (tier, days): tier_pass_rates(data, tier, days)
+        for tier in tiers.TIERS
+        for days in TIER_RATE_WINDOWS_DAYS
+    }
+    rows = "".join(evidence_row(c, notes, rates) for c in cases)
+    columns = EVIDENCE_FIXED_COLUMNS + len(tiers.TIERS) * len(TIER_RATE_WINDOWS_DAYS)
     if not rows:
-        rows = '<tr><td colspan="3"><span class="cap">no cases on record yet</span></td></tr>'
+        rows = f'<tr><td colspan="{columns}"><span class="cap">no cases on record yet</span></td></tr>'
+    heads = "".join(
+        f"<th>{esc(tier)} · {days}d</th>" for tier in tiers.TIERS for days in TIER_RATE_WINDOWS_DAYS
+    )
     return f"""
   <h2 id="nightly">Evidence on record</h2>
-  <div class="sub">Recorded task appearances per case (all collected runs, infra included), against the {SCREENING_WINDOW}-run yardstick · history depth, not admission progress — the screening window fills only from main-branch runs in the baseline store (bench/baselines/README.md) · annotations from case-notes.yaml</div>
+  <div class="sub">Recorded task appearances per case (presubmit runs, infra included), against the {SCREENING_WINDOW}-run yardstick, with the nightly's count beside it · history depth, not admission progress — the screening window fills only from main-branch runs in the baseline store (bench/baselines/README.md) · pass rates are pass / (pass + fail) over reps in the window, per tier, never pooled · {RUN_EVENT_CAPTION} · annotations from case-notes.yaml</div>
   <div class="card"><table id="evidence">
-    <thead><tr><th>Case</th><th>Evidence collected</th><th>In presubmit</th></tr></thead>
+    <thead><tr><th>Case</th><th>Evidence collected</th>{heads}<th>Tier</th></tr></thead>
     <tbody>{rows}</tbody>
   </table></div>"""
 
@@ -1351,11 +1436,13 @@ def foot_html(data: dict) -> str:
     generated = parse_iso(data.get("generated_at"))
     generated_text = f"{generated:%Y-%m-%d %H:%M} UTC" if generated else "unknown time"
     runs = len(data.get("runs") or [])
+    nightly = len(nightly_runs(data))
     threshold = fmt(RUN_EVENT_FAIL_FRACTION * 100)
     return (
         f'<div class="foot" id="foot">Every number on this page is computed from '
         f"<code>data.json</code> (source: {esc(str(data.get('source') or '?'))}, "
-        f"generated {generated_text}, {runs} run{'s' if runs != 1 else ''} on record). "
+        f"generated {generated_text}, {runs} run{'s' if runs != 1 else ''} on record, "
+        f"{nightly} of them nightly; the agent and gate bands read presubmit runs only). "
         f"Run-level event rule: a run where ≥{threshold}% of its graded tasks failed is "
         f"charged to the run, not the cases. Event markers and catch counts come from "
         f"<code>events.yaml</code>; row annotations and badges from "

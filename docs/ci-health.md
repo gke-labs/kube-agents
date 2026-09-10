@@ -43,6 +43,12 @@ infra-rep rate and the setup-death count over the last 24 hours.
 A case failing on exactly one pull request while passing elsewhere is that pull
 request's problem and moves no state; the message lists it as "PR-caused".
 
+Only presubmit runs reach these rules and the digest's numbers. `data.json`
+also carries the nightly periodic's runs (`runs[].tier`, see
+`scripts/eval_dashboard/SCHEMA.md`); a nightly has no pull request to count
+towards a distinct-PR floor, and a nightly collapsing is a case's record on
+`main`, not a gate incident.
+
 ## Hysteresis
 
 A single bad tick does not change the state, and a single lucky green does not

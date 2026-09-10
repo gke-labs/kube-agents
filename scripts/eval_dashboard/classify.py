@@ -45,14 +45,31 @@ Per failed admitted case, in priority order:
 ``setup`` is a run-level class: no tasks, a FAILURE verdict, under
 SETUP_DEATH_MAX_DURATION (#1172). Such a run has no cases to classify.
 
-Only stdlib.
+``runs`` may carry the nightly periodic's runs beside the presubmit's
+(SCHEMA.md: ``runs[].tier``; ``tiers.py``). Every rule above reads the
+presubmit only: a nightly has no pull request, so it is never "another PR"
+for the shared rule, never one of the passes the only-this-PR rule needs,
+and never in the 30-day pass rate. What it is good for is separate and
+additive: ``nightly_failed_recent`` per case says whether the newest
+nightly run inside NIGHTLY_RECENT_WINDOW of this run also failed the case
+outright -- evidence the case is broken on main, which is the reader's
+next question after "is this mine?".
+
+Only stdlib, plus the sibling ``tiers`` module.
 """
 
 from __future__ import annotations
 
 import pathlib
 import re
+import sys
 from datetime import datetime, timedelta, timezone
+
+try:
+    from . import tiers
+except ImportError:  # imported by path (render.py run as a script)
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import tiers
 
 # --- Shared break (#1269, #1278; #1171 a week earlier) -----------------------
 # Other pull requests' runs are looked at when they finished inside this
@@ -106,6 +123,12 @@ REP_RESULTS = ("pass", "fail", "infra")
 # Memo bounds for the per-run derivations and the 30-day pass rates.
 RUN_CACHE_MAX = 4096
 RATE_CACHE_MAX = 8
+
+# --- The nightly beside the verdict ---------------------------------------------
+# The newest nightly run that graded the case and finished within this long
+# of the run being classified, on either side: a night is one build, so two
+# days always covers the nearest one when the periodic is running at all.
+NIGHTLY_RECENT_WINDOW = timedelta(days=2)
 
 # --- Vocabulary shared with health.json ---------------------------------------
 STATE_GREEN = "GREEN"
@@ -384,6 +407,49 @@ def case_pass_rates(runs: list[dict], now: datetime) -> dict[str, float | None]:
     return rates
 
 
+# The tier split of a runs list, memoized like _RATE_CACHE: the filtered
+# lists have to be the SAME objects from one classify_run to the next, or
+# the pass-rate memo keyed on their identity misses on every run of a
+# whole data.json.
+_TIER_CACHE: dict[tuple, tuple[list, list, list]] = {}
+
+
+def split_tiers(runs: list[dict]) -> tuple[list[dict], list[dict]]:
+    """(presubmit runs, nightly runs) of `runs`, stable across calls."""
+    key = (id(runs), len(runs))
+    hit = _TIER_CACHE.get(key)
+    if hit is not None and hit[0] is runs:
+        return hit[1], hit[2]
+    gate = tiers.presubmit_runs(runs)
+    nightly = tiers.nightly_runs(runs)
+    if len(_TIER_CACHE) >= RATE_CACHE_MAX:
+        _TIER_CACHE.clear()
+    _TIER_CACHE[key] = (runs, gate, nightly)
+    return gate, nightly
+
+
+def nightly_failed_recent(case: str, run: dict, nightly: list[dict]) -> bool | None:
+    """Whether the newest nightly run within NIGHTLY_RECENT_WINDOW of `run`
+    that graded `case` failed it on every graded repetition. None when no
+    nightly graded it in the window (or the run has no finish time). A night
+    that was a run-level event -- nearly everything failed -- says nothing
+    about one case and is skipped, as the pages skip it in per-case rates."""
+    finish = run_finish(run)
+    if finish is None:
+        return None
+    newest = None
+    for other in nightly:
+        when = run_finish(other)
+        if when is None or abs(when - finish) > NIGHTLY_RECENT_WINDOW or is_run_event(other):
+            continue
+        outcome = _run_facts(other)["outcomes"].get(case)
+        if outcome not in (OUTCOME_PASSED, OUTCOME_PARTIAL, OUTCOME_FAILED):
+            continue
+        if newest is None or when > newest[0]:
+            newest = (when, outcome)
+    return None if newest is None else newest[1] == OUTCOME_FAILED
+
+
 # --------------------------------------------------------------------------- #
 # The rules
 # --------------------------------------------------------------------------- #
@@ -447,7 +513,7 @@ def _health_fields(health_at: dict | None) -> tuple[str | None, str | None, set]
     return state, condition, named
 
 
-def classify_case(task: dict, run: dict, others: list[dict], admitted: frozenset | None, health_at: dict | None, rates: dict, run_storm: bool) -> dict:
+def classify_case(task: dict, run: dict, others: list[dict], admitted: frozenset | None, health_at: dict | None, rates: dict, run_storm: bool, nightly: list[dict] = ()) -> dict:
     name = str(task.get("name"))
     counts = rep_counts(task)
     outcome = outcome_of(counts)
@@ -484,6 +550,7 @@ def classify_case(task: dict, run: dict, others: list[dict], admitted: frozenset
         # Additive detail the pages show; the keys above are the contract.
         "admitted": is_admitted,
         "reps": counts,
+        "nightly_failed_recent": nightly_failed_recent(name, run, nightly),
     }
 
 
@@ -616,10 +683,13 @@ def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now
             do="Read the build log; the failure is before the eval loop.",
         )
 
-    others = _other_pr_runs(run, runs)
-    rates = case_pass_rates(runs, anchor)
+    # The gate's runs are what every rule compares against; the nightly's
+    # only feed the per-case nightly_failed_recent note.
+    gate, nightly = split_tiers(runs)
+    others = _other_pr_runs(run, gate)
+    rates = case_pass_rates(gate, anchor)
     run_storm = storm_reps(run) >= STORM_RUN_SIGNATURE_REPS
-    cases = [classify_case(t, run, others, admitted, health_at, rates, run_storm) for t in tasks]
+    cases = [classify_case(t, run, others, admitted, health_at, rates, run_storm, nightly) for t in tasks]
     cases = [c for c in cases if c["outcome"] is not None]
 
     failed_names = {c["case"] for c in cases if c["outcome"] == OUTCOME_FAILED and c["admitted"]}

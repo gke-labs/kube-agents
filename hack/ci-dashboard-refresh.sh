@@ -42,10 +42,16 @@
 #                              dormant. (Live: gs://kube-agents-dashboards/evals/)
 #   EVAL_DASHBOARD_PR_GLOB     Prow build-dir glob(s) for collect.py; default
 #                              below is the smoke-test presubmit's archive.
+#   EVAL_DASHBOARD_NIGHTLY_PREFIX  the nightly periodic's Prow log prefix,
+#                              collected beside the presubmit as tier
+#                              "nightly" (default below: the live job's).
+#                              Empty disables the nightly scan. Not used on
+#                              the EVAL_DASHBOARD_FROM_DIR path, which is
+#                              offline by definition.
 #   EVAL_DASHBOARD_SINCE_DAYS  sweep bound when no usable prior data exists
+#                              (default 14).
 #   EVAL_DASHBOARD_STALE_AFTER_S  freshness-badge threshold written into
 #                              data.json (default 2400 = 15m cadence x ~2.5)
-#                              (default 14).
 #   EVAL_DASHBOARD_TIMEOUT     whole-pipeline budget in seconds (default 900).
 #   EVAL_DASHBOARD_FROM_DIR    local build-dir source instead of the GCS glob
 #                              -- the offline path the unit tests use.
@@ -109,6 +115,7 @@ trap cleanup EXIT
 trap 'exit 143' TERM INT
 
 EVAL_DASHBOARD_PR_GLOB="${EVAL_DASHBOARD_PR_GLOB:-gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*}"
+EVAL_DASHBOARD_NIGHTLY_PREFIX="${EVAL_DASHBOARD_NIGHTLY_PREFIX-gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly/}"
 EVAL_DASHBOARD_SINCE_DAYS="${EVAL_DASHBOARD_SINCE_DAYS:-14}"
 # Freshness contract with the rendered page: the badge turns amber this many
 # seconds after generated_at. Sized to the periodic's 15m cadence with slack
@@ -166,10 +173,11 @@ BUDGET="${EVAL_DASHBOARD_TIMEOUT:-900}"
 TIMEOUT_CMD=(timeout "${BUDGET}")
 command -v timeout >/dev/null 2>&1 || TIMEOUT_CMD=()
 
-# Single quotes on purpose: $1..$7 are the child bash's own positionals, so
+# Single quotes on purpose: $1..$8 are the child bash's own positionals, so
 # no value ever meets an outer expansion. --merge-with always points at the
 # prior path; when the download above left nothing there, collect.py treats
-# it as a first run and bounds the sweep itself.
+# it as a first run and bounds the sweep itself. The nightly prefix rides
+# only with the GCS source: the from-dir path is the offline one.
 rc=0
 # shellcheck disable=SC2016
 ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} bash -c '
@@ -178,6 +186,7 @@ ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} bash -c '
     src_args=(--from-dir "$6")
   else
     src_args=(--pr-glob "$4")
+    [ -n "$8" ] && src_args+=(--nightly-prefix "$8")
   fi
   python3 "$1/collect.py" "${src_args[@]}" \
     --merge-with "$2/prior-data.json" \
@@ -196,7 +205,7 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
   python3 "$1/publish.py" --out-dir "$2/site" --target "$3"
 ' _ "${DASH_SRC}" "${WORK}" "${EVAL_DASHBOARD_TARGET}" "${EVAL_DASHBOARD_PR_GLOB}" \
   "${EVAL_DASHBOARD_SINCE_DAYS}" "${EVAL_DASHBOARD_FROM_DIR:-}" \
-  "${EVAL_DASHBOARD_STALE_AFTER_S}" \
+  "${EVAL_DASHBOARD_STALE_AFTER_S}" "${EVAL_DASHBOARD_NIGHTLY_PREFIX}" \
   >>"${REFRESH_LOG}" 2>&1 || rc=$?
 
 # The full stage log always goes to stdout too: on a periodic, the build log

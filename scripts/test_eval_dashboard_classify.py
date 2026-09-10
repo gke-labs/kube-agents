@@ -305,6 +305,72 @@ class PassRateTest(unittest.TestCase):
         self.assertIs(classify._RATE_CACHE[second_key][0], second, "the memo holds the list so its id stays pinned")
 
 
+class NightlyTierTest(unittest.TestCase):
+    """The nightly periodic's runs (runs[].tier) are not other PRs: they
+    never make a case shared, never supply the passes only-this-PR needs,
+    and never enter the 30-day rate. What they add is nightly_failed_recent."""
+
+    @staticmethod
+    def nightly(run_doc):
+        return dict(run_doc, tier="nightly", pr=None)
+
+    def test_nightly_failures_are_not_other_prs_for_the_shared_rule(self):
+        target = run(1, 1275, T0, tasks=gate_tasks(["cluster-agent-crashloop-debug"]))
+        others = [run(100 + i, None, T0 - timedelta(minutes=60 * (i + 1)), tasks=gate_tasks(["cluster-agent-crashloop-debug"])) for i in range(2)]
+        # Two runs with pr None but no tier are still other-PR runs (the
+        # pre-tier reading of an unknown PR) and count as ONE phantom PR;
+        # tagged nightly they count as none. A third such run would have
+        # been the difference between "unexplained" and "shared".
+        c = case(classify_run(target, [target] + others), "cluster-agent-crashloop-debug")
+        self.assertEqual((c["cls"], c["also_failing_prs"]), (None, 1))
+        c = case(classify_run(target, [target] + [self.nightly(o) for o in others]), "cluster-agent-crashloop-debug")
+        self.assertEqual((c["cls"], c["also_failing_prs"]), (None, 0))
+        with_one_pr = others + [run(300, 1246, T0 - timedelta(minutes=30), tasks=gate_tasks(["cluster-agent-crashloop-debug"]))]
+        self.assertEqual(case(classify_run(target, [target] + with_one_pr), "cluster-agent-crashloop-debug")["cls"], "shared", "untagged: the phantom PR plus #1246 clear the two-PR floor")
+        self.assertIsNone(case(classify_run(target, [target] + [self.nightly(o) for o in others] + with_one_pr[-1:]), "cluster-agent-crashloop-debug")["cls"], "tagged: #1246 alone does not")
+        self.assertTrue(c["nightly_failed_recent"], "but the nightly's collapse is reported beside the verdict")
+
+    def test_nightly_passes_do_not_make_a_failure_only_this_prs(self):
+        target = run(1, 913, T0, tasks=gate_tasks(["security-overgrant-probe"]))
+        passing = [run(200 + i, 500 + i, T0 - timedelta(minutes=60 * (i + 1)), tasks=gate_tasks()) for i in range(3)]
+        self.assertEqual(case(classify_run(target, [target] + passing), "security-overgrant-probe")["cls"], "only-this-pr")
+        c = case(classify_run(target, [target] + [self.nightly(p) for p in passing]), "security-overgrant-probe")
+        self.assertIsNone(c["cls"])
+        self.assertIs(c["nightly_failed_recent"], False, "the latest nightly passed it")
+
+    def test_the_30_day_rate_is_the_presubmits_alone(self):
+        good = [run(300 + i, 1, T0 - timedelta(days=i + 1), tasks=gate_tasks()) for i in range(3)]
+        nightly_bad = [self.nightly(run(400 + i, None, T0 - timedelta(days=i + 1), tasks=gate_tasks(["agent-kanban-smoke"]))) for i in range(3)]
+        target = run(1, 9, T0, tasks=gate_tasks(["agent-kanban-smoke"]))
+        c = case(classify.classify_run(target, good + nightly_bad + [target], admitted=ADMITTED, now=T0), "agent-kanban-smoke")
+        self.assertAlmostEqual(c["pass_rate_30d"], 9 / 12, msg="9 presubmit passes, this run's 3 fails; the nightly's 9 fails not counted")
+
+    def test_nightly_failed_recent_is_the_newest_night_within_two_days_or_none(self):
+        target = run(1, 9, T0, tasks=gate_tasks(["agent-kanban-smoke"]))
+        old_fail = self.nightly(run(500, None, T0 - timedelta(days=3), tasks=gate_tasks(["agent-kanban-smoke"])))
+        self.assertIsNone(case(classify_run(target, [target, old_fail]), "agent-kanban-smoke")["nightly_failed_recent"], "outside the window")
+        newer_pass = self.nightly(run(501, None, T0 - timedelta(hours=20), tasks=gate_tasks()))
+        older_fail = self.nightly(run(502, None, T0 - timedelta(hours=44), tasks=gate_tasks(["agent-kanban-smoke"])))
+        self.assertIs(case(classify_run(target, [target, older_fail, newer_pass]), "agent-kanban-smoke")["nightly_failed_recent"], False, "the newest night wins")
+        after = self.nightly(run(503, None, T0 + timedelta(hours=6), tasks=gate_tasks(["agent-kanban-smoke"])))
+        self.assertIs(case(classify_run(target, [target, newer_pass, after]), "agent-kanban-smoke")["nightly_failed_recent"], True, "a night after the run counts too")
+        ungraded = self.nightly(run(504, None, T0 - timedelta(hours=1), tasks=[task("agent-kanban-smoke", "iii")]))
+        self.assertIsNone(case(classify_run(target, [target, ungraded]), "agent-kanban-smoke")["nightly_failed_recent"], "infra grades nothing")
+        whole_night_red = self.nightly(run(505, None, T0 - timedelta(hours=2), tasks=gate_tasks(sorted(ADMITTED))))
+        self.assertIsNone(case(classify_run(target, [target, whole_night_red]), "agent-kanban-smoke")["nightly_failed_recent"], "a run-level-event night says nothing about one case")
+        self.assertIs(case(classify_run(target, [target, whole_night_red, older_fail]), "agent-kanban-smoke")["nightly_failed_recent"], True, "the newest night that counts is the one before it")
+        # A passing case on the target still gets the note; a case the
+        # nightly never ran gets None.
+        verdict = classify_run(target, [target, after])
+        self.assertIs(case(verdict, "reliability-pdb-probe")["nightly_failed_recent"], False)
+
+    def test_the_tier_split_is_stable_across_calls(self):
+        runs = [run(1, 1, T0, tasks=gate_tasks()), self.nightly(run(2, None, T0, tasks=gate_tasks()))]
+        gate, nightly = classify.split_tiers(runs)
+        self.assertEqual(([r["build_id"] for r in gate], [r["build_id"] for r in nightly]), (["1"], ["2"]))
+        self.assertIs(classify.split_tiers(runs)[0], gate, "the same list object, so the rate memo keyed on it hits")
+
+
 class RealWeekTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -394,6 +460,7 @@ class RealWeekTest(unittest.TestCase):
             self.assertIn(verdict["verdict"], ("red", "green", "infra"))
             for c in verdict["cases"]:
                 self.assertEqual(set(c) >= {"case", "outcome", "cls", "also_failing_prs", "pass_rate_30d", "reason", "excerpt", "do"}, True)
+                self.assertIsNone(c["nightly_failed_recent"], "no nightly in the fixture week")
                 self.assertIn(c["outcome"], ("failed", "partial", "passed", "infra"))
                 self.assertIn(c["cls"], ("shared", "only-this-pr", "storm", "setup", None))
 
