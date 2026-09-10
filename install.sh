@@ -1757,11 +1757,11 @@ print_generate_only_handoff() {
   local kms_loc key_resource keyring key minter_keyring minter_key state_bkt state_pfx
 
   kms_loc="$(derive_kms_location "$region")"
-  keyring="${GKE_DB_KMS_KEYRING:-${DEFAULT_GKE_DB_KMS_KEYRING:-platform-agent-keyring}}"
-  key="${GKE_DB_KMS_KEY:-${DEFAULT_GKE_DB_KMS_KEY:-k8s-secret-encryption-key}}"
+  keyring="${GKE_DB_KMS_KEYRING:-$DEFAULT_GKE_DB_KMS_KEYRING}"
+  key="${GKE_DB_KMS_KEY:-$DEFAULT_GKE_DB_KMS_KEY}"
   key_resource="projects/${project_id}/locations/${kms_loc}/keyRings/${keyring}/cryptoKeys/${key}"
-  minter_keyring="${KMS_KEYRING:-${DEFAULT_KMS_KEYRING:-github-token-minter-keyring}}"
-  minter_key="${KMS_KEY:-${DEFAULT_KMS_KEY:-github-token-minter-key}}"
+  minter_keyring="${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}"
+  minter_key="${KMS_KEY:-$DEFAULT_KMS_KEY}"
   state_bkt="$(tf_state_bucket)"
   state_pfx="$(tf_state_prefix)"
 
@@ -1780,8 +1780,8 @@ print_generate_only_handoff() {
   echo -e "    gcloud kms keys create ${key} --keyring=${keyring} --location=${kms_loc} --purpose=encryption --project=${project_id} 2>/dev/null || true"
   echo -e "    gcloud beta services identity create --service=container.googleapis.com --project=${project_id} 2>/dev/null || true"
   echo -e "    gcloud kms keys add-iam-policy-binding ${key} --keyring=${keyring} --location=${kms_loc} \\\\"
-  echo -e "      --member=\\\"serviceAccount:service-\$(gcloud projects describe ${project_id} --format='value(projectNumber)')@container-engine-robot.iam.gserviceaccount.com\\\" \\\\"
-  echo -e "      --role=\\\"roles/cloudkms.cryptoKeyEncrypterDecrypter\\\" --project=${project_id} --quiet"
+  echo -e "      --member=\"serviceAccount:service-\$(gcloud projects describe ${project_id} --format='value(projectNumber)')@container-engine-robot.iam.gserviceaccount.com\" \\\\"
+  echo -e "      --role=\"roles/cloudkms.cryptoKeyEncrypterDecrypter\" --project=${project_id} --quiet"
   echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --database-encryption-key=${key_resource} --project ${project_id}"
   echo ""
   echo -e "  • ${C_CYAN}Workload Identity Pool (pre-existing Standard cluster):${C_RESET}"
