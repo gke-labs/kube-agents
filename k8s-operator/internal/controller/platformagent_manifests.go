@@ -4526,6 +4526,18 @@ func clusterDNSPeers(dnsIPs []string) []networkingv1.NetworkPolicyPeer {
 			},
 		},
 		{
+			NamespaceSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"kubernetes.io/metadata.name": openShiftDNSNamespace,
+				},
+			},
+			PodSelector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					openShiftDNSDaemonSetLabelKey: openShiftDNSDaemonSetLabelVal,
+				},
+			},
+		},
+		{
 			IPBlock: &networkingv1.IPBlock{
 				CIDR: nodeLocalDNSCacheIP,
 			},

@@ -52,6 +52,13 @@ const (
 	metadataDaemonPortName    = "metadata-server"
 	metadataDaemonDefaultPort int32 = 988
 
+	// openShiftDNSNamespace and openShiftDNSServiceName locate the OpenShift CoreDNS Service
+	// when kube-system/kube-dns is absent.
+	openShiftDNSNamespace         = "openshift-dns"
+	openShiftDNSServiceName       = "dns-default"
+	openShiftDNSDaemonSetLabelKey = "dns.operator.openshift.io/daemonset-dns"
+	openShiftDNSDaemonSetLabelVal = "default"
+
 	// Source constants reporting how the network policy values were chosen.
 	netpolSourceSpec        = "Spec"
 	netpolSourceAnnotation  = "Annotation"
@@ -159,7 +166,7 @@ func (r *PlatformAgentReconciler) resolveNetpolProfile(ctx context.Context, agen
 	// 4a. In-cluster discovery from OpenShift openshift-dns/dns-default Service
 	if len(p.DNSClusterIPs) == 0 {
 		var ocpSvc corev1.Service
-		if err := r.Get(ctx, types.NamespacedName{Namespace: "openshift-dns", Name: "dns-default"}, &ocpSvc); err == nil {
+		if err := r.Get(ctx, types.NamespacedName{Namespace: openShiftDNSNamespace, Name: openShiftDNSServiceName}, &ocpSvc); err == nil {
 			var discovered []string
 			if len(ocpSvc.Spec.ClusterIPs) > 0 {
 				for _, ip := range ocpSvc.Spec.ClusterIPs {
