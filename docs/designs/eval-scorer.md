@@ -324,14 +324,12 @@ one lease is not where the next run looks.
 `objectViewer`/`objectCreator` split is a real boundary.
 
 **2. The two jobs must run as different service accounts.** They do not: the presubmit and the
-nightly in [oss-test-infra#2682](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2682)
-both declare `serviceAccountName: prowjob-default-sa`. One identity cannot hold `objectCreator` for
-one job and withhold it from the other, so the split is unimplementable until the nightly gets a
-dedicated account. That is not a reviewer's preference; it is what the guard is made of — which is
-why creating `eval-baseline-recorder` is step 2 of [Provisioning it](#provisioning-it) rather than
-a follow-up, and why the change that arms the store
-([oss-test-infra#2698](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2698)) names it
-on the periodic.
+nightly as proposed both declare `serviceAccountName: prowjob-default-sa`. One identity cannot hold
+`objectCreator` for one job and withhold it from the other, so the split is unimplementable until
+the nightly gets a dedicated account. That is not a reviewer's preference; it is what the guard is
+made of — which is why creating `eval-baseline-recorder` is step 2 of
+[Provisioning it](#provisioning-it) rather than a follow-up, and why the change that arms the store
+must name it on the periodic in the same diff.
 
 **Who can grant this.** `kube-agents-prow` has a single `roles/owner`, who is also one of its two
 `storage.admin` holders, so the bucket, the service account and all three grants are one person's
@@ -765,14 +763,10 @@ More repetitions on the recording side is strictly better evidence.
 
 #### The job definition
 
-It exists as pull requests against `oss-test-infra`, adding to
-`prow/prowjobs/gke-labs/kube-agents/kube-agents-periodics.yaml`:
-[#2682](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2682) is the writer
-(`ci-kube-agents-eval-nightly`, `EVAL_TIER=nightly`, the store export commented out until the bucket
-exists), [#2698](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2698) arms the store on
-it and on the presubmit, and
-[#2665](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2665) carries the provisioning
-runbook and the TestGrid alert. The YAML is not reproduced here — a
+It is `ci-kube-agents-eval-nightly` in
+`prow/prowjobs/gke-labs/kube-agents/kube-agents-periodics.yaml` of `oss-test-infra`, open there as
+pull requests; [gke-labs/kube-agents#1448](https://github.com/gke-labs/kube-agents/issues/1448)
+tracks them, the provisioning they wait on, and the merge order. The YAML is not reproduced here — a
 copy in a second repository is a copy that goes stale, and the shape below is the part that matters.
 
 **Its script body is the presubmit's, byte-for-byte, plus its exports** — `EVAL_TIER` to select
@@ -814,8 +808,8 @@ all. `serviceAccountName: eval-baseline-recorder` is a required edit before the 
 uncommented on the periodic — see
 [Two conditions](#two-conditions-that-guard-depends-on-neither-of-which-holds-today).
 
-The shape, with the harness elided. The open pull request reads its runs through the eval dashboard
-and creates no TestGrid tab, so the alert row in the table above is still owed:
+The shape, with the harness elided (the alert row in the table above is a requirement the job as
+proposed does not yet meet — it is read through the eval dashboard instead):
 
 ```yaml
 # GoogleCloudPlatform/oss-test-infra:
@@ -1233,17 +1227,14 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   finds nothing admitted, and reports a **legitimate green** with rung 4, rung 6 and the aggregate
   all inert — the rate-based half of this design, silently absent, with no signal that it is
   missing. The absolute rungs (1, 2, 3, 5) and the correctness floor still block, so the failure
-  looks like a working gate. Neither export exists on `master` yet;
-  [oss-test-infra#2698](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2698) adds both
-  and waits on the bucket.
+  looks like a working gate. Neither export exists on `master` yet; both wait on the bucket.
 - No Prow job yet appends for `hack/ci-eval-pr.sh` (job config lives in
   `GoogleCloudPlatform/oss-test-infra`). Without one, nothing ever appends and no case is ever
-  admitted. The writer is
-  [oss-test-infra#2682](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2682), see
-  [The job that writes it](#the-job-that-writes-it); it runs the script's default repetitions and
-  the presubmit's `360m`, both starting points to tune from the first real nights, and it still
-  says `serviceAccountName: prowjob-default-sa` — #2698 changes that to `eval-baseline-recorder`,
-  which must exist before either arms.
+  admitted. The job is written — see [The job that writes it](#the-job-that-writes-it) — and runs
+  the script's default repetitions and the presubmit's `360m`, both starting points to tune from
+  the first real nights; `serviceAccountName: eval-baseline-recorder` must exist before the store
+  export arms. [gke-labs/kube-agents#1448](https://github.com/gke-labs/kube-agents/issues/1448)
+  carries the pull requests and their order.
 - A lint that a behaviour change bumped `fleet` or `verifiers`.
 - The GCS listing is unbounded while the fetch is capped. The reader lists the whole prefix and
   filters afterwards, because `BaselineStore.load` does not know which key it is about to be asked
