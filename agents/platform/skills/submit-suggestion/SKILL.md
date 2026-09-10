@@ -204,9 +204,7 @@ Please review the code diffs and merge this PR to trigger the GitOps CI/CD rollo
 
 #### Optional Telemetry & SLA Flags
 
-When `HERMES_SESSION_ID` is present in the environment (automatically injected by the runtime harness), `submit_suggestion.py` queries token consumption directly from the Hermes API server (`GET /api/sessions/<id>`) and appends verified usage counts and machine-readable JSON metadata into the PR description.
-
-Other telemetry attributes (`--elapsed`, `--model`, `--steps`, `--trace-id`, or explicit `--input-tokens` / `--output-tokens` overrides) are agent-supplied flags. Pass them only if exact, verified measurements are known:
+Telemetry attributes (`--input-tokens`, `--output-tokens`, `--elapsed`, `--model`, `--steps`, `--trace-id`) are agent-supplied flags. Pass them only if exact, verified measurements are known:
 
 ```bash
   --input-tokens 14820 \

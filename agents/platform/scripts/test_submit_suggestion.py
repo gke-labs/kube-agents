@@ -1124,78 +1124,25 @@ class TestTelemetryMetrics(SubmitSuggestionTestCase):
         self.assertEqual(meta["steps"], 4)
         self.assertEqual(meta["trace_id"], "0af7651916cd43dd8448eb211c80319c")
 
-    @patch("urllib.request.urlopen")
-    def test_fetch_hermes_session_tokens_urlopen_success(self, mock_urlopen):
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = json.dumps({
-            "session": {
-                "input_tokens": 1000,
-                "output_tokens": 200,
-                "cache_read_tokens": 500,
-                "cache_write_tokens": 50,
-            }
-        }).encode("utf-8")
-        mock_resp.__enter__.return_value = mock_resp
-        mock_urlopen.return_value = mock_resp
-
-        with patch.dict(os.environ, {"PLATFORM_AGENT_TOKEN": "secret-token-xyz"}):
-            tokens = submit_suggestion.fetch_hermes_session_tokens("sess-123")
-
-        self.assertIsNotNone(tokens)
-        self.assertEqual(tokens["input_tokens"], 1000)
-        self.assertEqual(tokens["output_tokens"], 200)
-        self.assertEqual(tokens["cache_read_tokens"], 500)
-        self.assertEqual(tokens["cache_write_tokens"], 50)
-        self.assertEqual(tokens["total_tokens"], 1750)
-
-        req = mock_urlopen.call_args[0][0]
-        self.assertEqual(
-            req.full_url,
-            "http://platform-agent.kubeagents-system.svc.cluster.local:8642/api/sessions/sess-123",
-        )
-        self.assertEqual(req.headers.get("Authorization"), "Bearer secret-token-xyz")
-
-    @patch("urllib.request.urlopen", side_effect=OSError("connection refused"))
-    def test_fetch_hermes_session_tokens_network_error(self, mock_urlopen):
-        tokens = submit_suggestion.fetch_hermes_session_tokens("sess-123")
-        self.assertIsNone(tokens)
-
-    @patch("urllib.request.urlopen")
-    def test_hermes_session_tokens_auto_sourcing(self, mock_urlopen):
-        mock_resp = MagicMock()
-        mock_resp.read.return_value = json.dumps({
-            "session": {
-                "input_tokens": 5000,
-                "output_tokens": 250,
-                "cache_read_tokens": 1000,
-                "cache_write_tokens": 50,
-            }
-        }).encode("utf-8")
-        mock_resp.__enter__.return_value = mock_resp
-        mock_urlopen.return_value = mock_resp
-
+    def test_render_body_without_telemetry_flags(self):
         payload = self.prepare()
         self.commit(payload["workspace"])
 
-        with patch.dict(os.environ, {"HERMES_SESSION_ID": "sess-test-999"}):
-            self.submit(payload["branch"], payload["workspace"], body="Body text")
+        args = [
+            "submit",
+            "--branch", payload["branch"],
+            "--title", "Clean PR",
+            "--body", "Body text without telemetry",
+            "--workspace", str(payload["workspace"]),
+            "--repo", "acme/fleet",
+        ]
+        out = io.StringIO()
+        with redirect_stdout(out):
+            submit_suggestion.dispatch(args)
 
-        create_calls = [c for c in self.gh_calls if c[0][1:3] == ["pr", "create"]]
-        self.assertEqual(len(create_calls), 1)
         submitted_body = self.gh_stub.bodies[payload["branch"]]
-
-        self.assertIn(
-            "- **Token Consumption:** `6,300 (5,000 input / 250 output / 1,050 cache)`",
-            submitted_body,
-        )
-        prefix = "<!-- kube-agents-telemetry: "
-        json_part = submitted_body.split(prefix, 1)[1].split(" -->", 1)[0]
-        meta = json.loads(json_part)
-        self.assertEqual(meta["input_tokens"], 5000)
-        self.assertEqual(meta["output_tokens"], 250)
-        self.assertEqual(meta["cache_read_tokens"], 1000)
-        self.assertEqual(meta["cache_write_tokens"], 50)
-        self.assertEqual(meta["total_tokens"], 6300)
+        self.assertNotIn("### ⏱️ Telemetry & SLA Metrics", submitted_body)
+        self.assertNotIn("<!-- kube-agents-telemetry:", submitted_body)
 
 
 class _GhStub:
