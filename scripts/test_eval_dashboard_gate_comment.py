@@ -158,7 +158,7 @@ class Shapes(Harness):
         self.assertEqual(
             lines[3],
             "> 🔴 **Gate outage in progress** since Sun 7:30 AM ET. The 3 crashloop tests fail on every PR (7 PRs so far)."
-            " **Your 3 failures are exactly those 3, so this red is not your code.** Don't retest yet; you'll be retested automatically once the fix is confirmed."
+            " **Your 3 failures are exactly those 3, so this red is not your code.** Don't retest yet; run `/retest` once #kube-agents-ci-health says the gate is healthy again."
             " [Why this run failed →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html?build=100)"
             " · [Incident brief →](https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html?cases=cluster-agent-crashloop-debug,cluster-agent-crashloop-evidence-chain,cluster-agent-crashloop-misleading-symptom&since=2026-09-06T11:30:00Z#gate)",
         )
