@@ -182,8 +182,9 @@ That is the whole log-access story for an isolated runner: it queries Cloud Logg
 `roles/logging.viewer`, filtered to the install's namespace on every query and to
 `jsonPayload.log_source="agent-file"` when `--agent-files` asks for the agent's own files. It never
 mounts the data volume, never execs into the pod, and gets the operator's and the credential
-proxy's container logs from the same place. The sidecar is already deployed on every agent
-pod, so no change to the observed system is needed to make its logs readable.
+proxy's container logs from the same place. The credential proxy already runs in every install, in
+a Pod of its own beside the gateway, so no change to the observed system is needed to make its logs
+readable.
 
 ### 3.2 Traces and metrics
 
@@ -452,8 +453,10 @@ to one from a chart that never had the feature.
 
 **One label must not be copied.** The platform minter's ingress policy admits pods carrying
 `kubeagents.x-k8s.io/has-credential-proxy: "true"`
-([`github-minter.yaml:199-206`](../../charts/kube-agents/templates/github-minter.yaml)), and the
-operator stamps that label on agent pods (`platformagent_manifests.go:2045,2109`). The runner pod runs a
+([`github-minter.yaml:213-220`](../../charts/kube-agents/templates/github-minter.yaml)), and the
+operator stamps that label on the agent's credential-proxy pod (`credential_proxy_manifests.go:174`)
+and deliberately not on the gateway pod (`platformagent_manifests.go:2419`), because the credential
+runtime is the minter's only caller and runs in a Pod of its own. The runner pod runs a
 credential proxy and so invites the label by analogy — and carrying it would let the runner reach
 the platform minter and mint tokens for the customer's GitOps repository, silently undoing §6.
 The runner is labelled `kubeagents.x-k8s.io/selfimprove: "true"` instead, which that policy does not

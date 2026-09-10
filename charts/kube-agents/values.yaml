@@ -418,11 +418,11 @@ githubMinter:
       memory: 256Mi
   # networkPolicy renders the minter's own policy, and its ingress rule is the
   # thing keeping the minter to one caller: port 8080 from pods labelled
-  # `kubeagents.x-k8s.io/has-credential-proxy: "true"`, which is the agent and
-  # not the self-improvement loop. Turning it off on a cluster with no
-  # default-deny makes the token endpoint reachable from every pod in the
-  # namespace. Egress is DNS, the GKE metadata server, and 443 to anywhere --
-  # KMS and GitHub are not addressable as CIDRs.
+  # `kubeagents.x-k8s.io/has-credential-proxy: "true"`, which is the agent's
+  # credential-proxy pod and not the self-improvement loop. Turning it off on a
+  # cluster with no default-deny makes the token endpoint reachable from every
+  # pod in the namespace. Egress is DNS, the GKE metadata server, and 443 to
+  # anywhere -- KMS and GitHub are not addressable as CIDRs.
   networkPolicy: true
   podDisruptionBudget:
     # Renders maxUnavailable: 1 at any replicaCount. Deliberately not

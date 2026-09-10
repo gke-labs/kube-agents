@@ -100,9 +100,14 @@ kubectl run debug-box --rm -it \
 
 The label is required and is the one the policy actually selects on: `github-token-minter-policy`
 admits ingress from pods carrying `kubeagents.x-k8s.io/has-credential-proxy: "true"`, which the
-operator stamps on the agent pod. A debug pod without it is dropped by the NetworkPolicy before
-Minty sees the request, which looks like a timeout rather than a refusal. The self-improvement
-loop's pod carries a different label and is dropped the same way — see below.
+operator stamps on the agent's credential-proxy pod (`<agent-name>-credential-proxy`) and
+deliberately not on the gateway pod: the credential runtime is the minter's only caller and runs
+in a Pod of its own, so `kubectl get pod --show-labels` shows the label on that pod alone. The
+service account in the recipe is still the right one — the credential-proxy pod runs as the same
+`security.serviceAccountName` the gateway does, and that is the KSA whose Workload Identity binding
+the minter trusts. A debug pod without the label is dropped by the NetworkPolicy before Minty sees
+the request, which looks like a timeout rather than a refusal. The self-improvement loop's pod
+carries a different label and is dropped the same way — see below.
 
 From inside the pod (the OIDC `audience` must match the Minty service URL, and the token is passed in the `X-OIDC-Token` header — not `Authorization`):
 
