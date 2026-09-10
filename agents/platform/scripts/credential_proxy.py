@@ -1826,8 +1826,8 @@ def _git_forced_config_environment(pairs: tuple[tuple[str, str], ...]) -> dict[s
 # every `-C`, but neither looks at `--git-dir`, so `git --git-dir=<elsewhere>
 # --work-tree=<elsewhere> commit` runs against a repository on the sidecar's
 # own filesystem from inside a perfectly valid lease. Verified: it reads and it
-# writes. `-C` stays allowed — the containment check already follows it, and
-# the skills use it.
+# writes. `-C` stays allowed — both containment checks follow it through
+# `_git_global_prefix`, and the skills use it.
 _GIT_REFUSED_ARGUMENTS = {
     "-c": "sets configuration that outranks the proxy's own",
     "--config-env": "sets configuration that outranks the proxy's own",
@@ -2139,30 +2139,46 @@ def git_argument_violation(argv: list[str]) -> str | None:
     return None
 
 
-def _git_plan(argv: list[str]) -> tuple[str | None, list[str]]:
-    """The subcommand in `argv`, plus every directory its `-C` flags select.
+def _git_global_prefix(argv: list[str]) -> tuple[int, dict[int, str]]:
+    """Where git's global options end, and the `-C` directories among them.
 
-    `-C` is returned rather than ignored because git applies it cumulatively
-    before running the subcommand: `git -C /elsewhere commit` executes nowhere
-    near the working directory the caller reported, so a containment check that
-    only looked at `cwd` would be checking the wrong path.
+    Returns the index of the subcommand -- `len(argv)` when there is none --
+    and a map from the index of each `-C` token before it to the directory it
+    names. The scope stops at the subcommand because the same two characters
+    mean something else after it: `git diff -C` is `--find-copies`, and
+    takes no directory.
+
+    `-C` is reported rather than skipped because git applies it cumulatively
+    before running the subcommand, each one relative to the last: `git -C
+    /elsewhere commit` executes nowhere near the working directory the caller
+    reported, and every relative path the subcommand is handed resolves from
+    where the last `-C` landed. Both containment checks -- `git_lease_violation`
+    for the directory a mutating verb runs in, `argv_path_violation` for the
+    paths a command opens -- read `-C` from here, so the two cannot disagree
+    about where git is.
     """
-    directories: list[str] = []
+    directories: dict[int, str] = {}
     index = 1
     while index < len(argv):
         token = argv[index]
         if not token.startswith("-"):
-            return token, directories
+            return index, directories
         name, sep, inline = token.partition("=")
         if name == "-C":
             if sep:
-                directories.append(inline)
+                directories[index] = inline
             elif index + 1 < len(argv):
-                directories.append(argv[index + 1])
+                directories[index] = argv[index + 1]
         if name in _GIT_GLOBAL_WITH_VALUE and not sep:
             index += 1
         index += 1
-    return None, directories
+    return len(argv), directories
+
+
+def _git_plan(argv: list[str]) -> tuple[str | None, list[str]]:
+    """The subcommand in `argv`, plus every directory its `-C` flags select."""
+    end, directories = _git_global_prefix(argv)
+    return (argv[end] if end < len(argv) else None), list(directories.values())
 
 
 # Distinguishes "the caller said None" from "the caller said nothing" for
@@ -2763,6 +2779,19 @@ class CommandExecutor:
         reading it as a cluster skipped the token -- and the path after the
         `F` -- whenever the value happened to begin with a free-text letter.
 
+        `cwd` is the base only until git's own `-C` moves it. git applies each
+        `-C` in its global-option prefix before it opens anything, so a
+        relative path after the subcommand resolves from where the last `-C`
+        landed, and `git_lease_violation` already followed it there through
+        `_git_plan`. This check did not: from a `cwd` two levels below the
+        workspace root, `git -C ../.. diff --no-index ../../var/run/secrets/
+        <token> empty` resolved every token inside the workspace here, while
+        git, already back at the root, opened the mounted credential. Each
+        `-C` directory is now tested where it stands -- relative to the one
+        before it, the way git reads them -- and then becomes the base for
+        every token after it. Only the prefix counts: after the subcommand
+        the same letters are `git diff -C`, find-copies, and move nothing.
+
         What existence does not close is the gap between checking and running,
         and nothing here ever did: a token naming nothing yet is allowed, the
         same way an ordinary token resolving inside the workspace is, so a
@@ -2771,10 +2800,28 @@ class CommandExecutor:
         if not self.untrusted_workspace:
             return None
         base = Path(cwd) if cwd else self.workspace_dir
+        redirects: dict[int, str] = {}
+        if argv and Path(argv[0]).name == "git":
+            _, redirects = _git_global_prefix(argv)
+        skip_redirect_value = False
         prose_next = False
         for index, token in enumerate(argv[1:], start=1):
+            if skip_redirect_value:
+                skip_redirect_value = False
+                continue
             prose = prose_next
             prose_next = False
+            if index in redirects:
+                # Tested where git reads it -- relative to the base the
+                # previous `-C` left -- and refused outside the workspace
+                # like any other path; inside, it is the base from here on.
+                directory = redirects[index]
+                violation = self._path_value_violation(base, directory, False)
+                if violation is not None:
+                    return violation
+                base = (base / directory).resolve()
+                skip_redirect_value = token == "-C"
+                continue
             # What this token may open, each with whether a free-text flag
             # introduced it. One token can carry more than one: `-dF<path>`
             # is the token and the path after the `F`.

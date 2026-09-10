@@ -1462,6 +1462,54 @@ class UntrustedWorkspaceTest(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.assertIsNotNone(executor.argv_path_violation(argv, str(deep)))
 
+    def test_a_git_redirect_moves_the_base_for_every_path_after_it(self):
+        # git applies each `-C` in its global-option prefix before it opens
+        # anything, so a relative path after the subcommand resolves from
+        # where the last `-C` landed, not from `cwd`. Resolving against `cwd`
+        # passed the reviewer's argv: from two levels below the root, `-C
+        # ../..` puts git at the root, and `../../var/run/...` -- inside the
+        # workspace when joined onto `cwd` -- is the mounted credential when
+        # git opens it. `git_lease_violation` already followed `-C` through
+        # `_git_plan`; this check has to as well, or `-C` is its one bypass.
+        executor = self.executor()
+        root = executor.workspace_dir
+        cwd = root / "a" / "b"
+        cwd.mkdir(parents=True)
+        (root / "empty").touch()
+        token = "../../var/run/secrets/selfimprove-github/token"
+        redirected = ["git", "-C", "../..", "diff", "--no-index", token, "empty"]
+        # The same read spelled from where git ends up was always refused;
+        # the redirect is what made it reachable.
+        self.assertIsNotNone(
+            executor.argv_path_violation(redirected[:1] + redirected[3:], str(root))
+        )
+        for argv in (
+            redirected,
+            # Cumulative: the second `-C` is relative to the first.
+            ["git", "-C", "..", "-C", "..", "diff", "--no-index", token, "empty"],
+            # A redirect that itself leaves the workspace, from wherever it
+            # stands.
+            ["git", "-C", "../../..", "status"],
+            ["git", "-C", "..", "-C", "../../..", "status"],
+        ):
+            with self.subTest(argv=argv):
+                violation = executor.argv_path_violation(argv, str(cwd))
+                self.assertIsNotNone(violation)
+                self.assertIn("outside the workspace", violation)
+        # A redirect that stays inside carries what follows it. After the
+        # subcommand the same two letters are `git diff -C`, find-copies, and
+        # move nothing: the path after it still resolves from `cwd`, where
+        # `../../var/x` is inside the workspace.
+        for argv in (
+            ["git", "-C", "../..", "status"],
+            ["git", "-C", "../..", "diff", "--no-index", "empty", "a/b/x"],
+            ["git", "-C", "..", "-C", "..", "-C", "a", "status"],
+            ["git", "-C", str(root), "commit", "-m", "fix: the loader resolves ../x wrongly"],
+            ["git", "diff", "-C", "../..", "../../var/x"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(executor.argv_path_violation(argv, str(cwd)))
+
     def test_a_free_text_value_describing_traversal_is_not_a_path(self):
         # `pathlib` parses a joined-on string for `/` exactly as it would a
         # literal path, so a commit message or PR title describing the exact
