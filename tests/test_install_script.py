@@ -527,6 +527,39 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{isolated_install_sh}"
         self.assertNotEqual(proc4.returncode, 0)
         self.assertIn("--migrate-node-pools must be either true or false.", proc4.stderr + proc4.stdout)
 
+    def test_validate_hosted_vllm_inputs_rejects_a_missing_value_or_a_bad_port(self):
+        # The chart cannot render hosted_vllm without the three, so the
+        # installer stops before the cluster is built.
+        missing = "hosted_vllm needs --model-default-name"
+        not_a_port = "--hosted-vllm-target-port must be a port number"
+        for args, message in (
+            ('hosted_vllm "" http://s.ns.svc.cluster.local/v1 8000', missing),
+            ('hosted_vllm m "" 8000', missing),
+            ('hosted_vllm m http://s.ns.svc.cluster.local/v1 ""', missing),
+            ('hosted_vllm m http://s.ns.svc.cluster.local/v1 http', not_a_port),
+            ('hosted_vllm m http://s.ns.svc.cluster.local/v1 8000/TCP', not_a_port),
+            ('hosted_vllm m http://s.ns.svc.cluster.local/v1 80000', "between 1 and 65535"),
+            ('hosted_vllm m http://10.8.0.12:8000/v1 8000', "in-cluster Service URL"),
+            ('hosted_vllm m https://models.example.com/v1 8000', "in-cluster Service URL"),
+            ('hosted_vllm m s.ns.svc.cluster.local/v1 8000', "in-cluster Service URL"),
+        ):
+            with self.subTest(args=args):
+                proc = self._run_install_func(f"validate_hosted_vllm_inputs {args}")
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertIn(message, proc.stderr + proc.stdout)
+
+    def test_validate_hosted_vllm_inputs_accepts_the_three_and_ignores_other_providers(self):
+        for args in (
+            'hosted_vllm m http://s.ns.svc.cluster.local/v1 8000',
+            'hosted_vllm m http://llm-service/v1 8000',
+            'hosted_vllm m http://llm-service.kubeagents-system:80/v1 8000',
+            'gemini "" "" ""',
+        ):
+            with self.subTest(args=args):
+                proc = self._run_install_func(f"validate_hosted_vllm_inputs {args}; echo rc=$?")
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("rc=0", proc.stdout)
+
     def test_validate_existing_cluster_opt_in_flags_accepts_valid_values(self):
         cmd = 'parse_args --enable-network-policy=true --migrate-node-pools=false; validate_existing_cluster_opt_in_flags'
         proc = self._run_install_func(cmd)

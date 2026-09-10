@@ -60,6 +60,12 @@ install without the interview.
   backend and `AgentPlugin/gkestockoutinvestigator`: Pub/Sub topic (`stockout_pubsub_topic`),
   subscription (`stockout_pubsub_subscription`), Cloud Logging project sink
   (`stockout_pubsub_sink`), and publisher IAM binding.
+- Optionally (`model_provider = "hosted_vllm"`) a vLLM server already running in the
+  cluster, through LiteLLM's own provider: `hosted_vllm_api_base` (the server's
+  OpenAI-compatible base URL including `/v1`, naming an in-cluster Service) and
+  `hosted_vllm_target_port` (the server pod's port, which the gateway's egress rule
+  names), plus `model_default_name`, which has no default for it. No `*_api_key`
+  variable applies; the chart refuses to render without the three.
 - Optionally (`model_provider = "vertex_ai"`) the Vertex AI / Model Garden path:
   a second [`kube-agents-iam`](../../modules/kube-agents-iam) instantiation for
   the gateway's service account, `roles/aiplatform.user` on

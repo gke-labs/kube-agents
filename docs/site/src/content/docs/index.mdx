@@ -34,7 +34,7 @@ It ships as a small set of components:
 
 - A **Kubernetes operator** (`k8s-operator`, Go / Kubebuilder) that reconciles a `PlatformAgent` custom resource.
 - An **agent Deployment** (running the [Hermes runtime](https://github.com/NousResearch/hermes-agent), `nousresearch/hermes-agent`) hosting co-located profiles: the Planning Agent (chat ingress, planning, and delegation), the Platform Agent (an opinionated persona, an MCP-based Kubernetes toolset, and a library of skills), and per-cluster Cluster Agents scaffolded on demand.
-- An **inference gateway** — [LiteLLM](https://litellm.ai) for hosted models (Gemini, Anthropic, OpenAI) or [vLLM](https://vllm.ai) for local models on GPU nodes.
+- An **inference gateway** — [LiteLLM](https://litellm.ai) in front of a hosted model (Gemini, Vertex AI, Anthropic, OpenAI) or of a [vLLM](https://vllm.ai) server on the cluster's own GPU nodes.
 
 <Aside type="note">
   Today's shipping skills, install path, and MCP integrations target GKE. The

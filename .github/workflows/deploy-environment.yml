@@ -349,6 +349,8 @@ jobs:
           CLUSTER_MODE: ${{ vars.CLUSTER_MODE }}
           VERTEX_PROJECT_ID: ${{ vars.VERTEX_PROJECT_ID }}
           VERTEX_LOCATION: ${{ vars.VERTEX_LOCATION }}
+          HOSTED_VLLM_API_BASE: ${{ vars.HOSTED_VLLM_API_BASE }}
+          HOSTED_VLLM_TARGET_PORT: ${{ vars.HOSTED_VLLM_TARGET_PORT }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           CHAT_SUB_NAME: ${{ vars.CHAT_SUB_NAME }}

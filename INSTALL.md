@@ -53,7 +53,7 @@ When running the official release installer (`<RELEASE_VERSION>/install.sh`) or 
 - **Install Sources**: Puts the Terraform configuration and chart on disk (this checkout, or a clone at the requested revision) and verifies they match the image ref _before_ the interview starts.
 - **GKE Cluster Setup**: Provisions an Autopilot or Standard cluster (`--cluster-mode`, Autopilot by default) or connects to an existing one. Autopilot is regional, so a zonal `--region` with no explicit `--cluster-mode` builds Standard instead of failing; asking for `--cluster-mode=autopilot` at a zone is still an error.
 - **Chat Integrations**: Configures Google Chat and/or Slack when selected.
-- **AI Model Credentials**: Prompts for Gemini, OpenAI, or Anthropic credentials, or selects Vertex AI (no key — Workload Identity).
+- **AI Model Credentials**: Prompts for Gemini, OpenAI, or Anthropic credentials, or selects Vertex AI (no key — Workload Identity) or a vLLM server in the cluster (`hosted_vllm`: no key; the model id, `--hosted-vllm-api-base` and `--hosted-vllm-target-port` instead).
 - **Long-Term Memory**: Asks whether the agents should remember anything between conversations, and if so which store (`--memory=file|hindsight|off`, default `file`). The default is **on**, and it is the store this repository shipped before the searchable one existed, so an upgrade that says nothing about memory keeps what it already has: per-user Markdown inside the pod (`multiuser_memory`), no extra services, suited to **small or personal** deployments — but the whole store is loaded into the model's context every turn, so it stops scaling past a few pages. Pick `hindsight` for **enterprise** deployments — ranked recall that stays affordable as the store grows, at the cost of an API server and a Postgres database in the cluster; it selects the `kube_agents_memory` provider. Pick `off` to retain nothing and run no database. The measurements behind that split, and how to change it later, are in [`docs/designs/memory.md`](docs/designs/memory.md).
 - **Automated Engine Execution**: Generates `terraform/examples/full-install/terraform.tfvars` from the loaded configuration, records that configuration in `install.env` when a first install has none, and launches `lifecycle.sh apply` — a single `terraform apply` that provisions every GCP resource and installs the Helm chart, with the Terraform state kept in a versioned GCS bucket (`<project>-kube-agents-tfstate`).
 
@@ -127,7 +127,7 @@ The Kubernetes Agentic Harness manages Kubernetes operations via an autonomous *
 
 - **Agent Configuration (`agents/platform`)**: Contains the system prompt and persona identity (`SOUL.md`), workspace instructions (`AGENTS.md`), runtime configuration (`config.yaml`), operational playbooks (`governance/`) that the scheduled governance jobs point at, their schedules (`cron/jobs.json`), and reusable skills (`skills/`).
 - **Kubernetes Operator (`k8s-operator`)**: A Kubebuilder-powered Go operator that manages Custom Resource Definitions (`PlatformAgent`) and reconciles cluster lifecycle state.
-- **Integrations**: Supports LiteLLM Gateway for LLM provider routing (Gemini, Vertex AI, OpenAI, Anthropic) and enterprise messaging bridges (Google Chat, Slack).
+- **Integrations**: Supports LiteLLM Gateway for LLM provider routing (Gemini, Vertex AI, OpenAI, Anthropic, or a vLLM server in the cluster) and enterprise messaging bridges (Google Chat, Slack).
 
 ---
 
@@ -501,8 +501,10 @@ kubectl patch secret platform-agent-secrets -n kubeagents-system --type=merge \
 kubectl rollout restart deployment/platform-agent-gateway -n kubeagents-system
 ```
 
-Vertex AI needs no entry here: `MODEL_PROVIDER=vertex` authenticates with Workload Identity
+Vertex AI needs no entry here: `MODEL_PROVIDER=vertex_ai` authenticates with Workload Identity
 (see [Inference gateway](docs/site/src/content/docs/concepts/inference-gateway.md#vertex-ai-and-model-garden)).
+Neither does `MODEL_PROVIDER=hosted_vllm`: the in-cluster server checks no key
+(see [vLLM](docs/site/src/content/docs/concepts/inference-gateway.md#vllm-local-models)).
 
 ### Step 3: Build & Push the Operator Image
 

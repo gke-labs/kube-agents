@@ -22,7 +22,8 @@ Canonical GKE-oriented Helm chart for deploying the Kube-Agents Kubernetes Opera
   `platformAgent.credentials.secretName`, default `platform-agent-secrets`),
   holding `API_SERVER_KEY` plus your model-provider key (`ANTHROPIC_API_KEY`,
   `GEMINI_API_KEY`, or `OPENAI_API_KEY` — `vertex_ai` needs none, it authenticates
-  with Workload Identity) and optional `SLACK_BOT_TOKEN` /
+  with Workload Identity, and `hosted_vllm` needs none, its in-cluster server
+  checks no key) and optional `SLACK_BOT_TOKEN` /
   `SLACK_APP_TOKEN`. For dev installs the chart can create it from values
   (`platformAgent.credentials.create=true` + `platformAgent.credentials.data`).
 
@@ -205,9 +206,10 @@ The agent's baked default model endpoint is
 `http://litellm.<namespace>.svc.cluster.local/v1`, so the chart deploys the
 LiteLLM gateway by default (`litellm.enabled=true`), mirroring
 `k8s-operator/config/integrations/litellm/base`. `litellm.modelProvider`
-(gemini/anthropic/openai/vertex_ai) picks which provider `model-default` routes to
-— the matching API key must be in the credentials Secret, except `vertex_ai`, which
-uses Workload Identity (below); `litellm.modelDefaultName`
+(gemini/anthropic/openai/vertex_ai/hosted_vllm) picks which provider `model-default`
+routes to — the matching API key must be in the credentials Secret, except
+`vertex_ai`, which uses Workload Identity, and `hosted_vllm`, a vLLM server in the
+cluster (both below); `litellm.modelDefaultName`
 overrides the per-provider default model. Set `litellm.enabled=false`
 only if you operate your own gateway at that address. LLM-call telemetry is
 opt-in (`litellm.otel=true`) — enable it only on clusters that run a reachable
@@ -272,6 +274,21 @@ fails the render, so set `telemetry.collectorNamespace` (or
 `litellm.networkPolicy=false`); with the callback off the rule keeps
 `gke-managed-otel`, since nothing exports through it. Full precedence
 ladder and discovery rules: [Deploy → Telemetry](https://gke-labs.github.io/kube-agents/deploy/telemetry/#pointing-at-your-own-collector).
+
+#### Hosted vLLM (`litellm.modelProvider=hosted_vllm`)
+
+A vLLM server running in the cluster, reached through LiteLLM's own `hosted_vllm`
+provider; no API key. Three values are required and the render fails naming the
+missing one: `litellm.modelDefaultName` (the model id the server was started
+with; there is no default), `litellm.hostedVllm.apiBase` (the server's
+OpenAI-compatible base URL including `/v1`, naming an in-cluster Service such as
+`http://llm-service.kubeagents-system.svc.cluster.local/v1`), and
+`litellm.hostedVllm.targetPort` (the server pod's port, which the gateway's egress
+rule names). The rule admits the namespace read from `apiBase` on that port and
+nothing else (a bare `<svc>` means the release namespace). A server in another
+namespace also needs its own NetworkPolicy to admit the gateway's namespace on
+that port; `examples/vllm-gemma/`'s admits only its own. `examples/vllm-gemma/` is a server sized for the agent:
+[Concepts → Inference gateway](https://gke-labs.github.io/kube-agents/concepts/inference-gateway/#vllm-local-models).
 
 #### Vertex AI (`litellm.modelProvider=vertex_ai`)
 

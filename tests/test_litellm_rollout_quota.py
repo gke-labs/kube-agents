@@ -16,13 +16,15 @@ nothing in this repository creates or sizes that quota, so the harness cannot
 assume headroom exists. `maxUnavailable` of at least 1 is what lets the rollout
 fall back to replacing in place.
 
-LiteLLM's Deployment exists in four files, and the value has to hold in the
-three that roll. Only two are the pair `AGENTS.md` keeps in step on purpose:
+LiteLLM's Deployment exists in five files, and the value has to hold in the
+four that roll. Only two are the pair `AGENTS.md` keeps in step on purpose:
 
     charts/kube-agents/templates/litellm.yaml   (via values.yaml, configurable)
     k8s-operator/config/integrations/litellm/base/deployment.yaml  (dev path)
     examples/litellm-gemini/deployment.yaml     (starting template, reached
                                                  from four docs-site pages)
+    examples/litellm-hosted-vllm/deployment.yaml (the gateway half of the
+                                                 in-cluster pair; same shape)
     examples/litellm-chatgpt-subscription/deployment.yaml  (Recreate, so it
                                                  takes no surge Pod and cannot
                                                  hit this at all — exempt by

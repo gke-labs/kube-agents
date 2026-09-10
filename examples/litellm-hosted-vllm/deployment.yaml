@@ -1,0 +1,101 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: litellm
+  namespace: kubeagents-system
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # maxUnavailable is 1, not 0, for the reason values.yaml's
+      # litellm.rollingUpdate block in charts/kube-agents states in full: at 0
+      # the surge Pod is mandatory, so a namespace ResourceQuota with no room
+      # for one more Pod stalls the rollout on FailedCreate instead of
+      # replacing in place (#749). In a copy taken out of this repository, 0
+      # buys a zero-downtime rollout where the quota has headroom; in the file
+      # here it stays 1, which tests/test_litellm_rollout_quota.py enforces.
+      maxSurge: 1
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: litellm
+  template:
+    metadata:
+      labels:
+        app: litellm
+    spec:
+      containers:
+        - name: litellm-container
+          image: ghcr.io/berriai/litellm:v1.98.0
+          args: ["--config", "/app/config.yaml", "--port", "8080"]
+          env:
+            # The vLLM server: llm-service is what examples/vllm-gemma creates.
+            - name: HOSTED_VLLM_API_BASE
+              value: http://llm-service.kubeagents-system.svc.cluster.local/v1
+            - name: LITELLM_OTEL_V2
+              value: "true"
+            - name: LITELLM_OTEL_INTEGRATION_ENABLE_METRICS
+              value: "true"
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://opentelemetry-collector.gke-managed-otel.svc.cluster.local:4318
+            - name: OTEL_EXPORTER_OTLP_PROTOCOL
+              value: http/protobuf
+            - name: OTEL_SERVICE_NAME
+              value: litellm
+          ports:
+            - containerPort: 8080
+          # Without these the Service publishes an endpoint the instant the
+          # container process starts, ~50s before uvicorn binds :8080, and the
+          # agent's first call after a cold boot dies on `Connection refused`.
+          # Endpoint names are LiteLLM's own and unauthenticated (`liveliness`
+          # is spelled that way upstream). Kept in step with
+          # charts/kube-agents/templates/litellm.yaml, which is canonical.
+          startupProbe:
+            httpGet:
+              path: /health/liveliness
+              port: 8080
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 36
+          readinessProbe:
+            httpGet:
+              path: /health/readiness
+              port: 8080
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health/liveliness
+              port: 8080
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: config-volume
+              mountPath: /app/config.yaml
+              subPath: config.yaml
+      volumes:
+        - name: config-volume
+          configMap:
+            name: litellm-config
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: litellm
+  namespace: kubeagents-system
+spec:
+  # maxUnavailable, never minAvailable, at any replica count: §3.3 of
+  # agents/platform/governance/obtainability_audit_sop.md requires this shape
+  # because minAvailable is the one that deadlocks drains. Here the replica
+  # count is static in the Deployment beside it, so a minAvailable: 1 would be
+  # safe as written and become `blocking-pdb` (§3.4) the first time someone
+  # scaled to one replica — the budget is not reconciled when they do.
+  maxUnavailable: 1
+  # Copied from the Deployment's own spec.selector: a PDB is matched to its
+  # workload by selector, never by name.
+  selector:
+    matchLabels:
+      app: litellm

@@ -349,11 +349,11 @@ init_var_kms_location() {
 }
 
 init_var_model_provider() {
-  init_var "MODEL_PROVIDER" "$DEFAULT_MODEL_PROVIDER" "Enter Model Provider (gemini, vertex_ai, anthropic, openai)"
+  init_var "MODEL_PROVIDER" "$DEFAULT_MODEL_PROVIDER" "Enter Model Provider (gemini, vertex_ai, anthropic, openai, hosted_vllm)"
 
   MODEL_PROVIDER=$(echo "$MODEL_PROVIDER" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
   if ! is_valid_model_provider "$MODEL_PROVIDER"; then
-    print_error "Invalid Model Provider '$MODEL_PROVIDER'. Must be one of: gemini, vertex_ai, anthropic, openai."
+    print_error "Invalid Model Provider '$MODEL_PROVIDER'. Must be one of: gemini, vertex_ai, anthropic, openai, hosted_vllm."
     exit 1
   fi
 

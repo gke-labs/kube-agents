@@ -27,6 +27,14 @@ LiteLLM Deployment + Service + `ConfigMap` fronting Gemini, plus a `Secret`, `Po
 
 **When to use:** the default install path; anything except explicit local-inference or subscription-based demos.
 
+## `litellm-hosted-vllm`
+
+[`examples/litellm-hosted-vllm/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-hosted-vllm)
+
+LiteLLM Deployment + Service + `ConfigMap` routing to a vLLM server in the cluster through LiteLLM's `hosted_vllm` provider, plus `PodDisruptionBudget`, `NetworkPolicy`, and `PodMonitoring`. No Secret: the server checks no key. Pairs with `vllm-gemma` below, which is the server it points at. The install path's equivalent is `MODEL_PROVIDER=hosted_vllm`.
+
+**When to use:** air-gapped or policy-restricted clusters, or any hand-applied setup with an in-cluster model server.
+
 ## `litellm-chatgpt-subscription`
 
 [`examples/litellm-chatgpt-subscription/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-chatgpt-subscription)
@@ -39,13 +47,13 @@ LiteLLM configured to proxy a personal ChatGPT subscription via OAuth device flo
 
 [`examples/vllm-gemma/`](https://github.com/gke-labs/kube-agents/tree/main/examples/vllm-gemma)
 
-vLLM serving Gemma (`gemma-4-e2b-it`) on GKE GPU nodes, based on GKE's official inference tutorial. Ships the vLLM Deployment, Service, `PodDisruptionBudget`, `NetworkPolicy`, and `PodMonitoring`. It does not include a node pool spec or GPU driver installer — a cluster with GPU nodes is a prerequisite.
+vLLM serving Gemma 4 (`google/gemma-4-E4B-it`) on one GKE L4 node, based on GKE's official inference tutorial, at the 128k context the agent's requests need. Ships the vLLM Deployment, Service, `PodDisruptionBudget`, `NetworkPolicy`, and `PodMonitoring`. It does not include a node pool spec or GPU driver installer — a cluster with GPU nodes is a prerequisite. Pairs with `litellm-hosted-vllm` above.
 
 **When to use:** data-locality, air-gapped, or open-model requirements. Provision a GPU node pool first (or use the `gke-compute-classes` skill to spec one).
 
 ## Layering
 
-Both LiteLLM examples and `vllm-gemma` speak OpenAI-compatible Completions. You can layer LiteLLM in front of vLLM to get routing and observability across a mix of hosted and local models — that's the pattern for "one config for many providers".
+The LiteLLM examples and `vllm-gemma` speak OpenAI-compatible Completions. You can layer LiteLLM in front of vLLM to get routing and observability across a mix of hosted and local models — that's the pattern for "one config for many providers", and `litellm-hosted-vllm` is that pattern shipped.
 
 ## Not shipped as examples (but reference-worthy)
 

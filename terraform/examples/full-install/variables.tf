@@ -202,13 +202,35 @@ variable "third_party_image_registry" {
 }
 
 variable "model_provider" {
-  description = "Model provider the LiteLLM gateway routes model-default to (gemini, anthropic, openai, or vertex_ai). Set the matching *_api_key variable; vertex_ai takes no key and authenticates with Workload Identity instead."
+  description = "Model provider the LiteLLM gateway routes model-default to (gemini, anthropic, openai, vertex_ai, or hosted_vllm). Set the matching *_api_key variable; vertex_ai takes no key and authenticates with Workload Identity instead; hosted_vllm takes no key and routes to hosted_vllm_api_base."
   type        = string
   default     = "gemini"
 
   validation {
-    condition     = contains(["gemini", "anthropic", "openai", "vertex_ai"], var.model_provider)
-    error_message = "model_provider must be one of gemini, anthropic, openai, or vertex_ai."
+    condition     = contains(["gemini", "anthropic", "openai", "vertex_ai", "hosted_vllm"], var.model_provider)
+    error_message = "model_provider must be one of gemini, anthropic, openai, vertex_ai, or hosted_vllm."
+  }
+}
+
+variable "hosted_vllm_api_base" {
+  description = "OpenAI-compatible base URL of the vLLM server when model_provider = \"hosted_vllm\" (required with it; the chart refuses to render without it), including the /v1 path and naming an in-cluster Service, e.g. http://llm-service.kubeagents-system.svc.cluster.local/v1. LiteLLM reads it as HOSTED_VLLM_API_BASE; the gateway's egress rule reads the namespace from it."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.hosted_vllm_api_base == "" || can(regex("^https?://[A-Za-z0-9-]+(\\.[A-Za-z0-9-]+(\\.svc(\\.[A-Za-z0-9.-]*)?)?)?(:[0-9]+)?(/.*)?$", var.hosted_vllm_api_base))
+    error_message = "hosted_vllm_api_base must be an in-cluster Service URL: http://<svc>, http://<svc>.<namespace>, or http://<svc>.<namespace>.svc.cluster.local, with the /v1 path."
+  }
+}
+
+variable "hosted_vllm_target_port" {
+  description = "The vLLM server pod's port when model_provider = \"hosted_vllm\" (required with it): the gateway's egress rule names the pod port, not the Service port."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.hosted_vllm_target_port == "" || (can(regex("^[0-9]+$", var.hosted_vllm_target_port)) && tonumber(var.hosted_vllm_target_port) >= 1 && tonumber(var.hosted_vllm_target_port) <= 65535)
+    error_message = "hosted_vllm_target_port must be a port number between 1 and 65535."
   }
 }
 
@@ -231,7 +253,7 @@ variable "vertex_manage_serving_project" {
 }
 
 variable "model_default_name" {
-  description = "Model name behind model-default. Empty selects the chart's per-provider default (which mirrors the provisioning scripts)."
+  description = "Model name behind model-default. Empty selects the chart's per-provider default (which mirrors the provisioning scripts); hosted_vllm has no default and requires it."
   type        = string
   default     = ""
 }

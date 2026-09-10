@@ -219,22 +219,54 @@ punish a user who only meant to repoint the agents.
 {{- else if not .Values.telemetry.otlpEndpoint -}}
 gke-managed-otel
 {{- else -}}
-{{- $host := .Values.telemetry.otlpEndpoint | trimPrefix "https://" | trimPrefix "http://" -}}
-{{- $host = (splitList "/" $host | first) -}}
-{{- $host = (splitList ":" $host | first) -}}
-{{- $parts := splitList "." $host -}}
-{{- /*
-  Only two shapes are an in-cluster Service: exactly <svc>.<ns>, or <svc>.<ns>.svc[...].
-  Anything with a third label that is not "svc" is a public DNS name, and reading its
-  second label as a namespace would quietly open egress to a namespace named "vendor".
-*/ -}}
-{{- if or (eq (len $parts) 2) (and (ge (len $parts) 3) (eq (index $parts 2) "svc")) -}}
-{{- index $parts 1 -}}
+{{- $ns := include "kube-agents.serviceNamespaceFromURL" (dict "url" .Values.telemetry.otlpEndpoint) -}}
+{{- if $ns -}}
+{{- $ns -}}
 {{- else if not .Values.litellm.otel -}}
 gke-managed-otel
 {{- else -}}
 {{- fail (printf "telemetry.otlpEndpoint %q does not name an in-cluster Service, so the LiteLLM NetworkPolicy cannot tell which namespace to allow egress to. Set telemetry.collectorNamespace, or set litellm.networkPolicy=false if the policy is managed elsewhere." .Values.telemetry.otlpEndpoint) -}}
 {{- end -}}
+{{- end -}}
+{{- end }}
+
+{{- /*
+The namespace of the hosted_vllm server, read from litellm.hostedVllm.apiBase the way
+otlpCollectorNamespace reads the collector's: only <svc>.<ns> and <svc>.<ns>.svc[...] are
+in-cluster Services, and the egress rule names that namespace rather than every pod in
+the release's. A URL of any other shape is not a server in this cluster, which is the
+whole of what the provider is for, so it fails the render instead of rendering a policy
+that drops every call.
+*/}}
+{{- define "kube-agents.hostedVllmNamespace" -}}
+{{- $url := ((.Values.litellm.hostedVllm | default dict).apiBase) | default "" -}}
+{{- /* A bare <svc> is the release's own namespace, the way kubectl prints it. */ -}}
+{{- $ns := include "kube-agents.serviceNamespaceFromURL" (dict "url" $url "sameNamespace" .Release.Namespace) -}}
+{{- if $ns -}}
+{{- $ns -}}
+{{- else -}}
+{{- fail (printf "litellm.hostedVllm.apiBase %q does not name an in-cluster Service (<svc>, <svc>.<namespace>, or <svc>.<namespace>.svc.cluster.local), so the gateway's NetworkPolicy cannot tell which namespace to allow egress to." $url) -}}
+{{- end -}}
+{{- end }}
+
+{{- /*
+The namespace of the in-cluster Service a URL names, or "" when the URL does not
+name one. Takes a dict: "url", and optionally "sameNamespace", returned for a
+one-label host (a bare <svc>) by callers that accept that shape. Two other host
+shapes are an in-cluster Service: exactly <svc>.<ns>, or <svc>.<ns>.svc[...].
+Anything with a third label that is not "svc" is a public DNS name, and reading
+its second label as a namespace would quietly open egress to a namespace named
+"vendor". Shared by the OTLP collector and hosted_vllm lookups.
+*/}}
+{{- define "kube-agents.serviceNamespaceFromURL" -}}
+{{- $host := .url | trimPrefix "https://" | trimPrefix "http://" -}}
+{{- $host = (splitList "/" $host | first) -}}
+{{- $host = (splitList ":" $host | first) -}}
+{{- $parts := splitList "." $host -}}
+{{- if or (eq (len $parts) 2) (and (ge (len $parts) 3) (eq (index $parts 2) "svc")) -}}
+{{- index $parts 1 -}}
+{{- else if and (eq (len $parts) 1) (ne $host "") (.sameNamespace | default "") -}}
+{{- .sameNamespace -}}
 {{- end -}}
 {{- end }}
 
