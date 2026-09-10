@@ -54,6 +54,14 @@ class _StubFailure(Exception):
     """What the stubbed pytest.fail and pytest.skip raise."""
 
 
+class _StubSkip(_StubFailure):
+    """Raised when pytest.skip is called."""
+
+
+class _StubFail(_StubFailure):
+    """Raised when pytest.fail is called."""
+
+
 def _pytest_stub() -> types.ModuleType:
     """A stand-in for pytest, which no unit-test job installs.
 
@@ -74,10 +82,10 @@ def _pytest_stub() -> types.ModuleType:
     stub.mark = mark
 
     def _fail(msg="", pytrace=True):
-        raise _StubFailure(msg)
+        raise _StubFail(msg)
 
     def _skip(msg="", **kwargs):
-        raise _StubFailure(msg)
+        raise _StubSkip(msg)
 
     stub.fail = _fail
     stub.skip = _skip
@@ -709,6 +717,90 @@ class CleanStaleTasksScriptTest(unittest.TestCase):
 
         self.assertEqual(count, 1)
         self.assertTrue(any("warning" in str(call) for call in fake_stderr.call_args_list))
+
+
+class EnsurePluginInstalledTest(unittest.TestCase):
+    """Verifies that ensure_stockout_plugin_installed skips when absent and proceeds when present."""
+
+    def test_skips_when_crd_is_absent(self):
+        def fake_kubectl(*args, **kwargs):
+            if "crd" in args:
+                return _completed(returncode=1, stderr="crd not found")
+            return _completed(returncode=0)
+
+        with mock.patch.object(sof, "_kubectl", side_effect=fake_kubectl):
+            with self.assertRaises(_StubSkip) as caught:
+                sof.ensure_stockout_plugin_installed(
+                    "proj", "cluster", "us-central1", "kubeagents-system"
+                )
+        self.assertIn("AgentPlugin CRD", str(caught.exception))
+        self.assertIn("not found on cluster", str(caught.exception))
+
+    def test_skips_when_plugin_cr_is_absent(self):
+        def fake_kubectl(*args, **kwargs):
+            if "crd" in args:
+                return _completed(returncode=0)
+            if "agentplugins" in args:
+                return _completed(returncode=1, stderr="NotFound")
+            return _completed(returncode=0)
+
+        with mock.patch.object(sof, "_kubectl", side_effect=fake_kubectl):
+            with self.assertRaises(_StubSkip) as caught:
+                sof.ensure_stockout_plugin_installed(
+                    "proj", "cluster", "us-central1", "kubeagents-system"
+                )
+        self.assertIn("is not installed", str(caught.exception))
+        self.assertIn("gkestockoutinvestigator", str(caught.exception))
+
+    def test_fails_when_plugin_cr_is_absent_and_expected(self):
+        def fake_kubectl(*args, **kwargs):
+            if "crd" in args:
+                return _completed(returncode=0)
+            if "agentplugins" in args:
+                return _completed(returncode=1, stderr="NotFound")
+            return _completed(returncode=0)
+
+        with mock.patch.object(sof, "_kubectl", side_effect=fake_kubectl), \
+                mock.patch.dict(sof.os.environ, {"ENABLE_STOCKOUT_INVESTIGATOR": "true"}):
+            with self.assertRaises(_StubFail) as caught:
+                sof.ensure_stockout_plugin_installed(
+                    "proj", "cluster", "us-central1", "kubeagents-system"
+                )
+        self.assertIn("was expected on this environment", str(caught.exception))
+        self.assertIn("ENABLE_STOCKOUT_INVESTIGATOR=true", str(caught.exception))
+
+
+class PluginReadyStatusTest(unittest.TestCase):
+    """Verifies that _wait_for_plugin_ready returns Ready object or fails immediately on Degraded."""
+
+    def test_ready_plugin_returns_object(self):
+        obj = {
+            "metadata": {"generation": 3},
+            "status": {"phase": "Ready", "observedGeneration": 3},
+        }
+        with mock.patch.object(sof, "_kubectl", return_value=_completed(stdout=json.dumps(obj))):
+            res = sof._wait_for_plugin_ready("ns", time.time() + 60)
+        self.assertEqual(res["status"]["phase"], "Ready")
+
+    def test_degraded_plugin_fails_immediately_with_reason(self):
+        obj = {
+            "metadata": {"generation": 2},
+            "status": {
+                "phase": "Degraded",
+                "observedGeneration": 2,
+                "conditions": [
+                    {"type": "Ready", "status": "False", "reason": "ImagePullFailed", "message": "Failed to pull image xyz"}
+                ],
+            },
+        }
+        with mock.patch.object(sof, "_kubectl", return_value=_completed(stdout=json.dumps(obj))):
+            with self.assertRaises(_StubFail) as caught:
+                sof._wait_for_plugin_ready("ns", time.time() + 60)
+        msg = str(caught.exception)
+        self.assertIn("installation failed", msg)
+        self.assertIn("phase is 'Degraded'", msg)
+        self.assertIn("ImagePullFailed", msg)
+        self.assertIn("Failed to pull image xyz", msg)
 
 
 if __name__ == "__main__":
