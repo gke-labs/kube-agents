@@ -50,6 +50,15 @@ LOGGER = logging.getLogger("credential-proxy")
 SLACK_EVENT_QUEUE_MAXSIZE = 1000
 SLACK_ERROR_DIAGNOSTIC_FIELDS = ("ok", "error", "needed", "provided")
 
+# How long `gh_credential_helpers` waits for `git config --get-regexp` to list
+# the global credential helpers. The command reads one file and touches no
+# network, so it returns in milliseconds; the bound only stops a wedged git
+# (a stuck lock on the global config, a hung filesystem) from holding the git
+# command that asked. Ten seconds is generous for the read, and a read that
+# hits it reports no helpers -- the same degradation as a bootstrap that never
+# wrote one, which `credential_helper_rearm` already handles by re-reading.
+GIT_CONFIG_QUERY_TIMEOUT_SECONDS = 10
+
 # GitHub "owner/name" slug validation. Each segment is matched with a single,
 # unambiguous character class rather than two adjacent "+" groups around the
 # "/" separator, so the match is linear-time and cannot be forced into
@@ -1676,7 +1685,7 @@ def gh_credential_helpers(
             text=True,
             errors="replace",
             env=environment,
-            timeout=10,
+            timeout=GIT_CONFIG_QUERY_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError, ValueError):
         return ()
