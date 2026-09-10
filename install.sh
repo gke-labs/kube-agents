@@ -48,6 +48,8 @@ LOCK_FILE="${KUBE_AGENTS_LOCK_FILE:-/tmp/kube-agents-install.lock}"
 # not in the environment; must agree with module.litellm_vertex_iam in
 # terraform/examples/full-install/main.tf.
 LITELLM_GSA_DEFAULT_NAME="kubeagents-litellm-gsa"
+PLATFORM_GKE="gke"
+PLATFORM_OPENSHIFT="openshift"
 if [ "${KUBE_AGENTS_SOURCE_ONLY:-false}" != "true" ] && command -v flock >/dev/null 2>&1; then
   if ( : >"$LOCK_FILE" ) 2>/dev/null && exec 200>"$LOCK_FILE"; then
     if ! flock -n 200 2>/dev/null; then
@@ -283,6 +285,10 @@ bootstrap_install_env() {
 # Scanned here rather than in parse_args because the loads run at source time,
 # before it. An exact match only: --help-me is not --help, and a value that
 # merely contains the word (--project-id=help-desk) is not the flag.
+is_valid_platform() {
+  [[ "${1:-}" =~ ^(gke|openshift)$ ]]
+}
+
 wants_help_only() {
   local arg
   for arg in "$@"; do
@@ -301,6 +307,7 @@ fi
 # ─── Agentic & Automation Parameter States ────────────────────────────────────
 PARAM_NON_INTERACTIVE="${NONINTERACTIVE:-false}"
 PARAM_DRY_RUN="${DRY_RUN:-false}"
+PARAM_PLATFORM="${PLATFORM:-}"
 PARAM_PROJECT_ID="${PROJECT_ID:-}"
 PARAM_REGION="${REGION:-}"
 PARAM_CLUSTER_NAME="${CLUSTER_NAME:-}"
@@ -397,6 +404,9 @@ Usage:
 Flags for AI Agents & Automation:
   -y, --yes, --non-interactive  Run in non-interactive mode (use flags/defaults)
   --dry-run                     Validate prerequisites & output config/plan without creating resources
+  --platform=PLATFORM           Kubernetes platform target: gke | openshift
+                                (default: DEFAULT_PLATFORM, currently gke;
+                                auto-detected if omitted and cluster is reachable)
   --project-id=ID               Target GCP Project ID
   --region=REGION               Target GCP Region (default: install.defaults.env
                                 DEFAULT_REGION, currently us-central1)
@@ -499,6 +509,7 @@ parse_args() {
       -y|--yes|--non-interactive) PARAM_NON_INTERACTIVE="true"; shift ;;
       --dry-run) PARAM_DRY_RUN="true"; shift ;;
       --menu|--config|--configure|menu|config) PARAM_MENU_MODE="true"; shift ;;
+      --platform=*) PARAM_PLATFORM="${1#*=}"; shift ;;
       --project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
       --region=*) PARAM_REGION="${1#*=}"; shift ;;
       --cluster-name=*) PARAM_CLUSTER_NAME="${1#*=}"; shift ;;
@@ -1242,8 +1253,37 @@ source_provisioning_helpers() {
 # living next to the code that reads it, and two copies drift. It also reads
 # as though the value might legitimately be unset at that point, which it
 # cannot be: this runs in step 2, before the interview.
+detect_platform() {
+  if [ -n "${PARAM_PLATFORM:-}" ]; then
+    if ! is_valid_platform "$PARAM_PLATFORM"; then
+      print_error "--platform must be either '$PLATFORM_GKE' or '$PLATFORM_OPENSHIFT' (received '$PARAM_PLATFORM')."
+      exit 1
+    fi
+    return 0
+  fi
+
+  if command -v oc >/dev/null 2>&1 && oc whoami >/dev/null 2>&1; then
+    PARAM_PLATFORM="$PLATFORM_OPENSHIFT"
+    return 0
+  fi
+  if command -v kubectl >/dev/null 2>&1 && kubectl get clusterversion >/dev/null 2>&1; then
+    PARAM_PLATFORM="$PLATFORM_OPENSHIFT"
+    return 0
+  fi
+
+  PARAM_PLATFORM="${DEFAULT_PLATFORM:-$PLATFORM_GKE}"
+}
+
 resolve_shared_defaults() {
   normalize_gitops_repo_vars
+  detect_platform
+  PARAM_PLATFORM="${PARAM_PLATFORM:-${DEFAULT_PLATFORM:-$PLATFORM_GKE}}"
+  export PLATFORM="$PARAM_PLATFORM"
+  if [ "$PARAM_PLATFORM" = "$PLATFORM_OPENSHIFT" ]; then
+    if [ -z "${ENABLE_GVISOR+x}" ]; then
+      PARAM_ENABLE_GVISOR="false"
+    fi
+  fi
   PARAM_MODEL_PROVIDER="${PARAM_MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}"
   PARAM_REGISTRY_PREFIX="${PARAM_REGISTRY_PREFIX:-$DEFAULT_REGISTRY_PREFIX}"
   PARAM_PERMISSION_SET="${PARAM_PERMISSION_SET:-$DEFAULT_PERMISSION_SET}"
@@ -1668,6 +1708,79 @@ run_lifecycle_apply() {
   ) 2>&1 | tee "$log_file"
 }
 
+# Deploys kube-agents onto OpenShift via Helm directly, using the active kubeconfig
+# context and OpenShift templates (SCC, Route). Bypasses the GKE Terraform composition.
+run_openshift_helm_install() {
+  local repo_dir="$1"
+  local log_file="$2"
+  local namespace="kubeagents-system"
+
+  {
+    echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Starting OpenShift Helm deployment ==="
+    kubectl create namespace "$namespace" --dry-run=client -o yaml | kubectl apply -f -
+
+    local key_dir=""
+    local sandbox_key_args=()
+    local existing_priv=""
+    existing_priv="$(kubectl get secret platform-agent-secrets -n "$namespace" -o jsonpath='{.data.SANDBOX_SSH_PRIVATE_KEY}' 2>/dev/null || echo "")"
+    if [ -z "$existing_priv" ]; then
+      key_dir="$(mktemp -d)"
+      chmod 700 "$key_dir"
+      ssh-keygen -q -t ed25519 -N '' -C "kube-agents-shell-sandbox" -f "$key_dir/id_ed25519"
+      sandbox_key_args=(
+        --set-file "platformAgent.credentials.data.SANDBOX_SSH_PRIVATE_KEY=${key_dir}/id_ed25519"
+        --set-file "platformAgent.credentials.data.SANDBOX_SSH_PUBLIC_KEY=${key_dir}/id_ed25519.pub"
+      )
+    fi
+
+    local helm_cmd=(
+      helm upgrade --install kube-agents "${repo_dir}/charts/kube-agents"
+      --namespace "$namespace"
+      --set "openshift.enabled=true"
+      --set "openshift.scc.enabled=true"
+      --set "openshift.route.enabled=true"
+      --set-string "platformAgent.harness.clusterName=${CLUSTER_NAME}"
+      --set-string "platformAgent.harness.location=${REGION}"
+      --set-string "platformAgent.harness.projectId=${PROJECT_ID}"
+      --set "platformAgent.deployment.availability.runtimeClassName="
+      --set "platformAgent.credentials.create=true"
+      --set-string "platformAgent.credentials.data.API_SERVER_KEY=${API_SERVER_KEY}"
+    )
+    if [ -n "${GEMINI_API_KEY:-}" ]; then
+      helm_cmd+=(--set-string "platformAgent.credentials.data.GEMINI_API_KEY=${GEMINI_API_KEY}")
+    fi
+    if [ -n "${OPENAI_API_KEY:-}" ]; then
+      helm_cmd+=(--set-string "platformAgent.credentials.data.OPENAI_API_KEY=${OPENAI_API_KEY}")
+    fi
+    if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+      helm_cmd+=(--set-string "platformAgent.credentials.data.ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}")
+    fi
+    if [ -n "${MODEL_PROVIDER:-}" ]; then
+      helm_cmd+=(--set-string "litellm.modelProvider=${MODEL_PROVIDER}")
+    fi
+    if [ -n "${MODEL_DEFAULT_NAME:-}" ]; then
+      helm_cmd+=(--set-string "litellm.modelDefaultName=${MODEL_DEFAULT_NAME}")
+    fi
+    if [ -n "${image_tag:-}" ]; then
+      helm_cmd+=(
+        --set-string "platformAgent.deployment.image.tag=${image_tag}"
+        --set-string "operator.image.tag=${image_tag}"
+        --set-string "credentialProxy.deployment.image.tag=${image_tag}"
+      )
+    fi
+    if [ -n "${image_registry:-}" ]; then
+      helm_cmd+=(--set-string "global.imageRegistry=${image_registry}")
+    fi
+
+    "${helm_cmd[@]}" "${sandbox_key_args[@]}"
+
+    if [ -n "$key_dir" ]; then
+      rm -rf "$key_dir"
+    fi
+    echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] OpenShift Helm deployment complete ==="
+  } 2>&1 | tee "$log_file"
+}
+
 # CMEK on a pre-existing cluster is the one create-path behaviour Terraform
 # cannot express: a data source cannot mutate the cluster it reads. Ensures
 # the keyring/key and the GKE service agent's binding, then updates the
@@ -1675,6 +1788,9 @@ run_lifecycle_apply() {
 # not exist yet (Terraform creates those encrypted), or where the operator
 # explicitly allowed unencrypted secrets.
 ensure_existing_cluster_cmek() {
+  if [ "${PARAM_PLATFORM:-${PLATFORM:-$DEFAULT_PLATFORM}}" = "$PLATFORM_OPENSHIFT" ]; then
+    return 0
+  fi
   local project_id="$1" cluster_name="$2" region="$3"
   local enc_state
   enc_state=$(gcloud container clusters describe "$cluster_name" \
@@ -1718,6 +1834,9 @@ ensure_existing_cluster_cmek() {
 # Terraform creates those with the pool on. The gke-cluster module's
 # postcondition backstops installs driven through bare Terraform.
 ensure_existing_cluster_workload_identity() {
+  if [ "${PARAM_PLATFORM:-${PLATFORM:-$DEFAULT_PLATFORM}}" = "$PLATFORM_OPENSHIFT" ]; then
+    return 0
+  fi
   local project_id="$1" cluster_name="$2" region="$3"
   local pool is_autopilot
 
@@ -1771,6 +1890,9 @@ ensure_existing_cluster_workload_identity() {
 # legacy addon enabled here. The gke-cluster module's postcondition backstops
 # bare-Terraform installs.
 ensure_existing_cluster_network_policy() {
+  if [ "${PARAM_PLATFORM:-${PLATFORM:-$DEFAULT_PLATFORM}}" = "$PLATFORM_OPENSHIFT" ]; then
+    return 0
+  fi
   local project_id="$1" cluster_name="$2" region="$3"
   local dp_provider
   # trap - ERR: same bash-3.2 subshell-trap suppression as the Workload
@@ -1827,6 +1949,9 @@ ensure_existing_cluster_network_policy() {
 # update surface lacks the flag, the install is
 # still complete — only managed OpenTelemetry collection needs a manual step.
 apply_managed_otel_scope() {
+  if [ "${PARAM_PLATFORM:-${PLATFORM:-$DEFAULT_PLATFORM}}" = "$PLATFORM_OPENSHIFT" ]; then
+    return 0
+  fi
   local project_id="$1" cluster_name="$2" region="$3"
   if gcloud container clusters update "$cluster_name" --location "$region" --project "$project_id" \
     --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS --quiet >/dev/null 2>&1; then
@@ -2000,6 +2125,7 @@ run_menu_system() {
   local project_number="${PROJECT_NUMBER:-}"
   local cluster_name="${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}"
   local region="${REGION:-$DEFAULT_REGION}"
+  local platform="${PARAM_PLATFORM:-${PLATFORM:-$DEFAULT_PLATFORM}}"
   local model_provider="${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}"
   local model_default_name="${MODEL_DEFAULT_NAME:-$(default_model_for_provider "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}")}"
   local vertex_project_id="${VERTEX_PROJECT_ID:-$project_id}"
@@ -2041,8 +2167,9 @@ run_menu_system() {
     draw_separator
     echo -e "${C_RESET}"
     echo -e "${C_BOLD}Active Configuration State:${C_RESET}"
+    echo -e "  • ${C_CYAN}Target Platform:${C_RESET} ${platform}"
     echo -e "  • ${C_CYAN}GCP Project ID:${C_RESET} ${project_id:-Not Set}"
-    echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${cluster_name:-Not Set} (${region:-$DEFAULT_REGION})"
+    echo -e "  • ${C_CYAN}Cluster:${C_RESET} ${cluster_name:-Not Set} (${region:-$DEFAULT_REGION})"
     echo -e "  • ${C_CYAN}Hermes Web UI (Port 9119):${C_RESET} $([ "$enable_webui" = "true" ] && echo -e "${C_GREEN}ENABLED${C_RESET}" || echo -e "${C_YELLOW}DISABLED${C_RESET}")"
     echo -e "  • ${C_CYAN}Chat Integrations:${C_RESET} Google Chat: $([ "$google_chat_enabled" = "true" ] && echo -e "${C_GREEN}ON${C_RESET}" || echo "OFF"), Slack: $([ "$slack_enabled" = "true" ] && echo -e "${C_GREEN}ON${C_RESET}" || echo "OFF")"
     echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})$([ "$model_provider" = "vertex_ai" ] && echo " @ ${vertex_project_id}/${vertex_location}" || echo "")"
@@ -2170,6 +2297,7 @@ run_menu_system() {
         # PROJECT_NUMBER, KMS_LOCATION and NO_CONFIRM are deliberately not
         # written. The first two are derived wherever they are used, and the third
         # describes an invocation rather than the install.
+        save_env_var PLATFORM "$platform"
         save_env_var PROJECT_ID "$project_id"
         save_env_var CLUSTER_NAME "$cluster_name"
         save_env_var REGION "$region"
@@ -2223,6 +2351,7 @@ run_menu_system() {
 # ─── Main Installer Procedure ──────────────────────────────────────────────────
 main() {
   parse_args "$@"
+  detect_platform
   print_banner
 
   if [ "${PARAM_MENU_MODE:-false}" = "true" ]; then
@@ -2237,6 +2366,12 @@ main() {
     print_success "Environment Detected: ${C_BOLD}Google Cloud Shell${C_RESET} ☁️"
   else
     print_info "Environment Detected: ${C_BOLD}Standard Workstation / Linux Terminal${C_RESET} 💻"
+  fi
+
+  if [ "$PARAM_PLATFORM" = "$PLATFORM_OPENSHIFT" ]; then
+    print_info "Platform Target: ${C_BOLD}Red Hat OpenShift on Google Cloud (GCE)${C_RESET} 🔴"
+  else
+    print_info "Platform Target: ${C_BOLD}Google Kubernetes Engine (GKE)${C_RESET} ☸️"
   fi
 
   if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
@@ -2256,14 +2391,22 @@ main() {
   # Everything is checked up front rather than discovered halfway through with
   # the cluster already created.
   for tool in git gcloud kubectl gh helm jq terraform gke-gcloud-auth-plugin; do
+    if [ "$tool" = "gke-gcloud-auth-plugin" ] && [ "$PARAM_PLATFORM" = "$PLATFORM_OPENSHIFT" ]; then
+      continue
+    fi
     if command -v "$tool" >/dev/null 2>&1; then
       print_success "Found CLI tool: $tool"
     else
       auto_install_tool "$tool"
     fi
   done
-  require_min_gcloud_version || exit 1
-  require_min_terraform_version || exit 1
+  if [ "$PARAM_PLATFORM" = "$PLATFORM_OPENSHIFT" ] && command -v oc >/dev/null 2>&1; then
+    print_success "Found CLI tool: oc"
+  fi
+  if [ "$PARAM_PLATFORM" != "$PLATFORM_OPENSHIFT" ]; then
+    require_min_gcloud_version || exit 1
+    require_min_terraform_version || exit 1
+  fi
 
   # 3. Provisioning Sources & Shared Defaults
   print_step "2. Setting up Workspace Repository"
@@ -2344,29 +2487,51 @@ main() {
   local cluster_mode="${PARAM_CLUSTER_MODE:-}"
   [ -z "$cluster_mode" ] || require_creatable_cluster_mode "$cluster_mode" "$region"
 
-  # 5. GKE Cluster Selection & Provisioning Strategy
-  print_step "5. GKE Cluster Topology & Capacity Setup"
+  # 5. Cluster Topology & Capacity Setup
   local cluster_choice=""
-  if [ "$PARAM_NON_INTERACTIVE" = "true" ] || [ -n "$PARAM_CLUSTER_NAME" ]; then
+  local cluster_name="${PARAM_CLUSTER_NAME:-}"
+  local ask_cluster_shape="false"
+  if [ "$PARAM_PLATFORM" = "$PLATFORM_OPENSHIFT" ]; then
+    print_step "5. OpenShift Cluster Connection Setup"
+    cluster_choice="2"
+    if [ -z "$cluster_name" ]; then
+      local oc_cluster=""
+      if command -v oc >/dev/null 2>&1; then
+        oc_cluster=$(trap - ERR; oc config current-context 2>/dev/null || echo "")
+      fi
+      if [ -z "$oc_cluster" ] && command -v kubectl >/dev/null 2>&1; then
+        oc_cluster=$(trap - ERR; kubectl config current-context 2>/dev/null || echo "")
+      fi
+      if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
+        cluster_name="${oc_cluster:-$DEFAULT_CLUSTER_NAME}"
+      else
+        prompt_read "Target OpenShift Cluster / Context" cluster_name "${oc_cluster:-$DEFAULT_CLUSTER_NAME}"
+      fi
+    fi
+    cluster_mode="standard"
+    ask_cluster_shape="false"
+  elif [ "$PARAM_NON_INTERACTIVE" = "true" ] || [ -n "$PARAM_CLUSTER_NAME" ]; then
+    print_step "5. GKE Cluster Topology & Capacity Setup"
     if [ -n "$PARAM_CLUSTER_NAME" ]; then
       cluster_choice="2"
     else
       cluster_choice="1"
     fi
   else
+    print_step "5. GKE Cluster Topology & Capacity Setup"
     prompt_menu "How would you like to handle the GKE Cluster?" \
       "Provision a NEW GKE Cluster from scratch (Recommended)" \
       "Use an EXISTING GKE Cluster" \
       cluster_choice
   fi
 
-  local cluster_name="${PARAM_CLUSTER_NAME:-}"
   # Set on the branches where the user has demonstrably asked for a cluster
   # that does not exist yet, which is the only case --cluster-mode decides.
   # Picking one out of the discovered list, or naming one with --cluster-name,
   # does not qualify: the generator probes those and the live shape wins.
-  local ask_cluster_shape="false"
-  if [ "$cluster_choice" = "1" ]; then
+  if [ "$PARAM_PLATFORM" = "$PLATFORM_OPENSHIFT" ]; then
+    : # already handled above
+  elif [ "$cluster_choice" = "1" ]; then
     if [ -z "$cluster_name" ]; then
       prompt_read "New GKE Cluster Name" cluster_name "$DEFAULT_CLUSTER_NAME"
     fi
@@ -3172,9 +3337,11 @@ main() {
   draw_separator
   echo -e "${C_RESET}${C_BOLD}Please review your selections before provisioning begins:${C_RESET}"
   echo -e "  • ${C_CYAN}GCP Target Project:${C_RESET} ${C_BOLD}${project_id}${C_RESET} (Project Number: ${project_number:-unknown})"
-  # The generator's answer, not the interview's: on an existing cluster it
-  # probed the live shape and the flag had no say.
-  echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${C_BOLD}${cluster_name}${C_RESET} (${region}, GKE $(cluster_mode_label "${TFVARS_CLUSTER_MODE:-$cluster_mode}"))"
+  if [ "${PARAM_PLATFORM:-${PLATFORM:-$DEFAULT_PLATFORM}}" = "$PLATFORM_OPENSHIFT" ]; then
+    echo -e "  • ${C_CYAN}OpenShift Cluster:${C_RESET} ${C_BOLD}${cluster_name}${C_RESET} (${region}, Red Hat OpenShift)"
+  else
+    echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${C_BOLD}${cluster_name}${C_RESET} (${region}, GKE $(cluster_mode_label "${TFVARS_CLUSTER_MODE:-$cluster_mode}"))"
+  fi
   echo -e "  • ${C_CYAN}gVisor Sandbox Isolation:${C_RESET} ${enable_gvisor}"
   echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
   if [ "$model_provider" = "vertex_ai" ]; then
@@ -3198,25 +3365,40 @@ main() {
   echo -e "${C_RESET}"
 
   if [ "$PARAM_DRY_RUN" = "true" ]; then
-    # A real resource preview, not just a config write: validate always, and
-    # plan when Application Default Credentials exist. Local state only —
-    # a dry run must not create the state bucket.
-    print_info "Dry-run: validating the Terraform configuration (local state; nothing is created)."
-    (
-      cd "$(tf_compose_dir "$repo_dir")"
-      terraform init -backend=false -input=false >/dev/null
-      terraform validate >/dev/null
-    )
-    print_success "Terraform configuration is valid."
-    if gcloud auth application-default print-access-token >/dev/null 2>&1; then
-      print_info "Previewing the resources a real run would create (terraform plan)..."
+    if [ "${PARAM_PLATFORM:-${PLATFORM:-$DEFAULT_PLATFORM}}" = "$PLATFORM_OPENSHIFT" ]; then
+      print_info "Dry-run: validating Helm chart templates for OpenShift (nothing is created)."
+      helm template kube-agents "${repo_dir}/charts/kube-agents" \
+        --namespace kubeagents-system \
+        --set "openshift.enabled=true" \
+        --set "openshift.scc.enabled=true" \
+        --set "openshift.route.enabled=true" \
+        --set-string "platformAgent.harness.clusterName=${cluster_name}" \
+        --set-string "platformAgent.harness.location=${region}" \
+        --set-string "platformAgent.harness.projectId=${project_id}" \
+        --set "platformAgent.credentials.create=true" \
+        --set-string "platformAgent.credentials.data.API_SERVER_KEY=${API_SERVER_KEY:-dry-run-key}" >/dev/null
+      print_success "Helm chart template validation for OpenShift succeeded."
+    else
+      # A real resource preview, not just a config write: validate always, and
+      # plan when Application Default Credentials exist. Local state only —
+      # a dry run must not create the state bucket.
+      print_info "Dry-run: validating the Terraform configuration (local state; nothing is created)."
       (
         cd "$(tf_compose_dir "$repo_dir")"
-        terraform plan -input=false -lock=false
+        terraform init -backend=false -input=false >/dev/null
+        terraform validate >/dev/null
       )
-    else
-      print_warning "No Application Default Credentials; skipping the resource preview (terraform plan)."
-      print_info "Run 'gcloud auth application-default login' for a full dry-run preview."
+      print_success "Terraform configuration is valid."
+      if gcloud auth application-default print-access-token >/dev/null 2>&1; then
+        print_info "Previewing the resources a real run would create (terraform plan)..."
+        (
+          cd "$(tf_compose_dir "$repo_dir")"
+          terraform plan -input=false -lock=false
+        )
+      else
+        print_warning "No Application Default Credentials; skipping the resource preview (terraform plan)."
+        print_info "Run 'gcloud auth application-default login' for a full dry-run preview."
+      fi
     fi
     print_success "Dry-run execution complete! Configuration generated without touching cloud resources."
     write_json_report "DRY_RUN_SUCCESS"
@@ -3234,9 +3416,14 @@ main() {
     fi
   fi
 
-  # 12. Execute the Terraform Engine
-  print_step "12. Applying the Install (Terraform + Helm)"
-  print_info "Provisioning GCP APIs, GKE Cluster, cert-manager, Operator, LiteLLM gateway, and Platform Agent..."
+  # 12. Execute the Provisioning Engine
+  if [ "${PARAM_PLATFORM:-${PLATFORM:-$DEFAULT_PLATFORM}}" = "$PLATFORM_OPENSHIFT" ]; then
+    print_step "12. Applying the Install (Helm on OpenShift)"
+    print_info "Deploying Operator, LiteLLM gateway, and Platform Agent to OpenShift cluster..."
+  else
+    print_step "12. Applying the Install (Terraform + Helm)"
+    print_info "Provisioning GCP APIs, GKE Cluster, cert-manager, Operator, LiteLLM gateway, and Platform Agent..."
+  fi
 
   # Re-validate the GitOps org before spending an apply on it. The interview
   # already settled it interactively; this catches an install.env edited by hand
@@ -3274,7 +3461,11 @@ main() {
   local provisioning_log
   provisioning_log="/tmp/kube-agents-provision-$(date -u +%Y%m%dT%H%M%SZ).log"
   print_info "Provisioning output is also being saved to: ${C_BOLD}${provisioning_log}${C_RESET}"
-  run_lifecycle_apply "$repo_dir" "$provisioning_log"
+  if [ "${PARAM_PLATFORM:-${PLATFORM:-$DEFAULT_PLATFORM}}" = "$PLATFORM_OPENSHIFT" ]; then
+    run_openshift_helm_install "$repo_dir" "$provisioning_log"
+  else
+    run_lifecycle_apply "$repo_dir" "$provisioning_log"
+  fi
 
   # The one post-apply step Terraform cannot carry: the managed-OTel scope
   # (no provider field; the GitHub App key import runs BEFORE the apply,
@@ -3291,11 +3482,15 @@ main() {
   # 12. Workload & Pod Health Verification Checkpoint
   print_step "13. Verifying Workload & Pod Health"
   print_info "Verifying deployment rollouts in namespace 'kubeagents-system'..."
-  GKE_DNS_ENDPOINT_FLAG=""
-  gke_dns_endpoint_flag "$cluster_name" "$region" "$project_id" || true
-  # shellcheck disable=SC2086
-  gcloud container clusters get-credentials "$cluster_name" --location "$region" \
-    --project "$project_id" $GKE_DNS_ENDPOINT_FLAG >/dev/null
+  if [ "$PARAM_PLATFORM" != "$PLATFORM_OPENSHIFT" ]; then
+    GKE_DNS_ENDPOINT_FLAG=""
+    gke_dns_endpoint_flag "$cluster_name" "$region" "$project_id" || true
+    # shellcheck disable=SC2086
+    gcloud container clusters get-credentials "$cluster_name" --location "$region" \
+      --project "$project_id" $GKE_DNS_ENDPOINT_FLAG >/dev/null
+  else
+    print_info "OpenShift cluster: using active kubeconfig context (skipping gcloud get-credentials)."
+  fi
   if ! kubectl get ns kubeagents-system >/dev/null 2>&1; then
     print_error "Namespace 'kubeagents-system' was not created. Installation is incomplete."
     exit 1
@@ -3346,7 +3541,11 @@ main() {
 
   echo -e "${C_BOLD}Component Status Summary:${C_RESET}"
   echo -e "  • ${C_CYAN}GCP Project:${C_RESET} ${project_id} (Project Number: ${project_number})"
-  echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${cluster_name} (${region}, GKE $(cluster_mode_label "${TFVARS_CLUSTER_MODE:-$cluster_mode}"))"
+  if [ "${PARAM_PLATFORM:-${PLATFORM:-$DEFAULT_PLATFORM}}" = "$PLATFORM_OPENSHIFT" ]; then
+    echo -e "  • ${C_CYAN}OpenShift Cluster:${C_RESET} ${cluster_name} (${region}, Red Hat OpenShift)"
+  else
+    echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${cluster_name} (${region}, GKE $(cluster_mode_label "${TFVARS_CLUSTER_MODE:-$cluster_mode}"))"
+  fi
   echo -e "  • ${C_CYAN}Runtime Isolation:${C_RESET} ${enable_gvisor:-false} (gVisor Sandbox)"
   echo -e "  • ${C_CYAN}Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
   echo -e "  • ${C_CYAN}Permission Mode:${C_RESET} ${permission_set}"

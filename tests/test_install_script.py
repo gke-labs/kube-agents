@@ -249,6 +249,61 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{isolated_install_sh}"
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("MODE=autopilot", proc.stdout)
 
+    def test_parse_args_platform(self):
+        """Verifies parse_args captures --platform."""
+        for platform in ("gke", "openshift"):
+            with self.subTest(platform=platform):
+                cmd = f'parse_args --platform={platform}; echo "PLATFORM=$PARAM_PLATFORM"'
+                proc = self._run_install_func(cmd)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn(f"PLATFORM={platform}", proc.stdout)
+
+    def test_is_valid_platform(self):
+        """Verifies is_valid_platform accepts gke and openshift, rejecting others."""
+        for valid in ("gke", "openshift"):
+            proc = self._run_install_func(f'is_valid_platform "{valid}"')
+            self.assertEqual(proc.returncode, 0, f"Expected {valid} to be valid: {proc.stderr}")
+
+        for invalid in ("eks", "aks", "k8s", "invalid", ""):
+            proc = self._run_install_func(f'is_valid_platform "{invalid}"')
+            self.assertNotEqual(proc.returncode, 0, f"Expected {invalid} to be invalid")
+
+    def test_detect_platform_defaults_to_gke(self):
+        """detect_platform falls back to DEFAULT_PLATFORM (gke) when no cluster tools succeed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            bin_dir = tmp_path / "bin"
+            bin_dir.mkdir()
+            for tool in ("oc", "kubectl"):
+                script = bin_dir / tool
+                script.write_text("#!/bin/bash\nexit 1\n")
+                script.chmod(script.stat().st_mode | stat.S_IEXEC)
+            cmd = 'detect_platform; echo "PLATFORM=$PARAM_PLATFORM"'
+            proc = self._run_install_func(cmd, bin_dir=str(bin_dir))
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("PLATFORM=gke", proc.stdout)
+
+    def test_detect_platform_auto_detects_openshift_via_oc(self):
+        """detect_platform auto-detects openshift when oc whoami succeeds."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            bin_dir = tmp_path / "bin"
+            bin_dir.mkdir()
+            oc_script = bin_dir / "oc"
+            oc_script.write_text("#!/bin/bash\nexit 0\n")
+            oc_script.chmod(oc_script.stat().st_mode | stat.S_IEXEC)
+            cmd = 'detect_platform; echo "PLATFORM=$PARAM_PLATFORM"'
+            proc = self._run_install_func(cmd, bin_dir=str(bin_dir))
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("PLATFORM=openshift", proc.stdout)
+
+    def test_detect_platform_accepts_explicit_flag(self):
+        """detect_platform honours PARAM_PLATFORM when explicitly passed."""
+        cmd = 'PARAM_PLATFORM="openshift"; detect_platform; echo "PLATFORM=$PARAM_PLATFORM"'
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("PLATFORM=openshift", proc.stdout)
+
     def test_cluster_mode_defaults_to_unset(self):
         """An unpassed --cluster-mode leaves the interview free to ask."""
         proc = self._run_install_func('echo "MODE=[$PARAM_CLUSTER_MODE]"')

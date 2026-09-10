@@ -44,6 +44,11 @@ else
   return 1 2>/dev/null || exit 1
 fi
 
+# ─── Target Platform Constants ────────────────────────────────────────────────
+PLATFORM_GKE="gke"
+PLATFORM_OPENSHIFT="openshift"
+: "${DEFAULT_PLATFORM:=${PLATFORM_GKE}}"
+
 # ─── Helm Release Management Defaults ─────────────────────────────────────────
 # Operation timeout for an in-flight Helm install/upgrade across deploy workflows (10m).
 readonly HELM_OPERATION_TIMEOUT_DEFAULT=600
@@ -209,6 +214,10 @@ location_is_region() {
 
 is_valid_cluster_mode() {
   [[ "${1:-}" =~ ^(autopilot|standard)$ ]]
+}
+
+is_valid_platform() {
+  [[ "${1:-}" =~ ^(gke|openshift)$ ]]
 }
 
 # ─── Boolean Parsing ──────────────────────────────────────────────────────────
@@ -1003,13 +1012,19 @@ write_tfvars_from_state() {
   # The initialiser is never the answer: both probe branches below assign, and
   # the fresh-create branch assigns from CLUSTER_MODE. It tracks
   # DEFAULT_CLUSTER_MODE only so the default has one spelling.
+  local platform="${PLATFORM:-$DEFAULT_PLATFORM}"
   local create_cluster="true" cluster_mode="${DEFAULT_CLUSTER_MODE}" autopilot_enabled=""
   local cluster_exists="false"
+  if [ "$platform" = "$PLATFORM_OPENSHIFT" ]; then
+    cluster_exists="true"
+    create_cluster="false"
+    cluster_mode="standard"
+    print_info "Platform '${PLATFORM_OPENSHIFT}' active: installing onto existing OpenShift cluster '${CLUSTER_NAME}' (create_cluster = false, cluster_mode = \"standard\")."
   # `trap - ERR` inside the substitution: under bash 3.2 (macOS's default)
   # the caller's inherited ERR trap fires in this subshell even though the
   # failure is the tested condition, printing an abort banner and writing a
   # FAILED report for a probe whose miss is the normal fresh-install path.
-  if autopilot_enabled=$(trap - ERR; gcloud container clusters describe "${CLUSTER_NAME}" \
+  elif autopilot_enabled=$(trap - ERR; gcloud container clusters describe "${CLUSTER_NAME}" \
       --location "${REGION}" --project "${PROJECT_ID}" \
       --format="value(autopilot.enabled)" 2>/dev/null); then
     cluster_exists="true"
@@ -1070,7 +1085,7 @@ write_tfvars_from_state() {
   # recovery loop below — adoption is exactly the case where the credentials
   # live only in that cluster's Secret (a fresh clone has no install.env values),
   # and recovery is gated on the kubectl context actually being this cluster.
-  if [ "$create_cluster" = "false" ] && command -v kubectl >/dev/null 2>&1; then
+  if [ "$create_cluster" = "false" ] && [ "$platform" != "$PLATFORM_OPENSHIFT" ] && command -v kubectl >/dev/null 2>&1; then
     gcloud container clusters get-credentials "${CLUSTER_NAME}" --location "${REGION}" \
       --project "${PROJECT_ID}" >/dev/null 2>&1 || true
   fi
@@ -1090,8 +1105,15 @@ write_tfvars_from_state() {
   # credentials to this one.
   local secret_key secret_val
   local expected_ctx="gke_${PROJECT_ID}_${REGION}_${CLUSTER_NAME}"
-  if command -v kubectl >/dev/null 2>&1 &&
-    [ "$(kubectl config current-context 2>/dev/null || true)" = "$expected_ctx" ]; then
+  local current_ctx
+  current_ctx="$(kubectl config current-context 2>/dev/null || true)"
+  local ctx_matches="false"
+  if [ "$platform" = "$PLATFORM_OPENSHIFT" ]; then
+    [ -n "$current_ctx" ] && ctx_matches="true"
+  elif [ "$current_ctx" = "$expected_ctx" ]; then
+    ctx_matches="true"
+  fi
+  if command -v kubectl >/dev/null 2>&1 && [ "$ctx_matches" = "true" ]; then
     for secret_key in API_SERVER_KEY GEMINI_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY SLACK_BOT_TOKEN SLACK_APP_TOKEN SESSION_KV_API_KEY SESSION_KV_SALT; do
       [ -z "${!secret_key:-}" ] || continue
       # Every stage exits 0 on its own (|| true inside the substitution):
@@ -1356,6 +1378,21 @@ write_tfvars_from_state() {
     echo "# Optional AgentPlugins"
     echo "enable_pubsub_platform       = $(hcl_bool "${ENABLE_PUBSUB_PLATFORM:-false}")"
     echo "enable_stockout_investigator = $(hcl_bool "${ENABLE_STOCKOUT_INVESTIGATOR:-false}")"
+    if [ "$platform" = "$PLATFORM_OPENSHIFT" ]; then
+      echo ""
+      echo "# OpenShift on GCE: enable SecurityContextConstraints and Route ingress"
+      echo "extra_helm_values = {"
+      echo "  openshift = {"
+      echo "    enabled = true"
+      echo "    scc = {"
+      echo "      enabled = true"
+      echo "    }"
+      echo "    route = {"
+      echo "      enabled = true"
+      echo "    }"
+      echo "  }"
+      echo "}"
+    fi
   } > "${dest}.tmp"
   chmod 600 "${dest}.tmp"
   mv -f -- "${dest}.tmp" "$dest"
