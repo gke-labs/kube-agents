@@ -158,7 +158,7 @@ class CheckGoDirectiveTest(unittest.TestCase):
 
     def test_custom_go_mod_path_respected(self):
         text = _SCRIPT.read_text()
-        functions = "".join(_lift(name, text) for name in _LIFTED_FUNCTIONS)
+        functions = "".join(lift_function(name, text, _SCRIPT) for name in _LIFTED_FUNCTIONS)
         with tempfile.TemporaryDirectory() as tmp:
             root = pathlib.Path(tmp)
             (root / "custom.mod").write_text("module example.com/y\n\ngo 1.27.0\n")
