@@ -4,17 +4,17 @@
 > `vertex_ai`) and the ChatGPT-subscription path (`chatgpt`, dev overlay plus example), each a row
 > in `k8s-operator/config/integrations/litellm/providers.json`; and a hand-applied vLLM recipe
 > under `examples/vllm-gemma/`. Everything else here is the plan. It supersedes the installer,
-> chart, and Terraform half of #608 and keeps that PR's example.
+> chart, and Terraform half of #608 and keeps that PR's example. Tracking issue: #1418.
 
 ## 1. Goal
 
 A third way for a kube-agents user to give the agent a model, beside an API key and a
-subscription: **the install hosts the model itself**, on GPUs in the same cluster, with Gemma 4 as
-the default and any model the server can load allowed. One `install.env` line selects it:
+subscription: **the install hosts the model itself**, on GPUs in the same cluster, with an open
+model as the default and any model the server can load allowed. One `install.env` line selects it:
 
 ```bash
 MODEL_PROVIDER=hosted_vllm
-# MODEL_DEFAULT_NAME=google/gemma-4-31B-it   # the default; any vLLM-loadable id works
+# MODEL_DEFAULT_NAME=<any id the server can load>; the default lives in install.defaults.env
 ```
 
 The agent is untouched. It speaks the OpenAI wire to `model-default` at the gateway, and only the
@@ -27,144 +27,186 @@ models" ([05-system-architecture](../architecture/05-system-architecture.md) §5
 
 **LiteLLM routes; it does not run a model.** It has no inference engine, so a GPU on the LiteLLM
 pod does nothing unless a model server shares the pod. LiteLLM's own provider for a vLLM server
-is `hosted_vllm/<model>` plus an `api_base`; it needs no key and reads `HOSTED_VLLM_API_BASE`
-from the environment. That provider name is the one this design adds, exactly as `vertex_ai` is
-a provider name today.
+is `hosted_vllm/<model>`; it needs no key, and it reads the server address from the
+`HOSTED_VLLM_API_BASE` environment variable when the config carries no `api_base`. That last
+point is what keeps the gateway change small: the base config already renders
+`${MODEL_PROVIDER}/${MODEL_DEFAULT_NAME}`, so `hosted_vllm/<model>` comes out of the template
+that exists, and the address travels as one environment variable, the way `VERTEXAI_PROJECT` does.
 
 **The model server is its own workload, not a sidecar.** The gateway runs two replicas behind a
 PodDisruptionBudget at 100m CPU; a sidecar would mean two GPUs and two copies of the weights for
-one model's throughput, and every gateway rollout would reload the model for minutes. A separate
-Deployment is what Hindsight already is: a third-party service the chart renders when a provider
-setting asks for it.
+one model's throughput, and every gateway rollout would reload the model for minutes.
 
-## 3. Fit to the existing structure
+## 3. Constraint: minimal insertion
 
-Everything below is a copy of a pattern already in the tree. The left column is what exists; the
-right column is the new file or edit.
+Every piece below reuses something in the tree or upstream rather than adding a copy. The
+budget is stated per file so a reviewer can hold the change to it. Three reuse decisions do most
+of the work:
 
-### 3.1 The provider: mirror `vertex_ai`
+1. **No new LiteLLM config file.** The provider rides the existing base `config.yaml` and one
+   environment variable. #608 added a 30-line config overlay and a 30-line chart helper branch for
+   the same outcome.
+2. **No in-tree model-server manifests beyond the example that already exists.** The kustomize
+   dev path builds `examples/vllm-gemma/` as a base and patches two fields; the Terraform install
+   runs the vLLM project's own chart as a second `helm_release`, exactly as cert-manager is
+   installed today. Nothing is copied into `charts/kube-agents/templates/`.
+3. **No node pool resource.** GPU capacity on Standard comes from GKE node auto-provisioning, a
+   block on the cluster resource the module already owns; Autopilot needs nothing. #608 carried a
+   300-line node pool script; the gvisor pool pattern would be about 60 lines of Terraform.
 
-| Exists today                                                         | Add for `hosted_vllm`                                                                                                                                                                                                                                                   |
-| -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `providers.json` row `vertex_ai` with `overlay` and `settings`       | Row `hosted_vllm`: `label` "vLLM in this cluster", `defaultModel`, `overlay: hosted_vllm`, `authentication.type: none`. The admin console's LLM gateway page reads this file and needs nothing else.                                                                    |
-| `litellm/overlays/vertex_ai/` (kustomization, deployment patch, KSA) | `litellm/overlays/hosted_vllm/`: a `config.yaml` whose entries are `hosted_vllm/${MODEL_DEFAULT_NAME}` with `api_base: http://vllm.${NAMESPACE}.svc.cluster.local:8000/v1`, and a NetworkPolicy patch adding one egress rule to the vLLM pods on 8000 by `podSelector`. |
-| `litellm.yaml` `$defaultModels` and the `vertex_ai` render branch    | `hosted_vllm` in the table and in the `fail` message; the config helper takes an `apiBase` and renders it; the egress rule selects the chart's own vLLM pods, not every pod in the cluster.                                                                             |
-| `install.defaults.env` `DEFAULT_MODEL_GEMINI/OPENAI/ANTHROPIC`       | `DEFAULT_MODEL_VLLM`; `tests/test_installer_common.py` already pins the chart table equal to these.                                                                                                                                                                     |
-| `default_model_for_provider`, `is_valid_model_provider`              | One `case` arm and one alternation each.                                                                                                                                                                                                                                |
-| `install.sh` provider menus (Day-1 wizard and Day-2 control panel)   | A fifth entry, "Host the model in this cluster (vLLM on a GPU node pool)"; it prompts for the model id and the weights source (§3.3) and nothing else.                                                                                                                  |
-| `variables.tf` `model_provider` validation                           | `hosted_vllm` in the `contains` list.                                                                                                                                                                                                                                   |
-| `k8s-operator/Makefile` `deploy-litellm` `vertex_ai` branch          | A `hosted_vllm` branch building the overlay with `LITELLM_VARS`.                                                                                                                                                                                                        |
+## 4. Build plan
 
-No `custom` pseudo-provider, no default endpoint URL: the `api_base` is the Service the chart
-renders in §3.2, and the model id is whatever the server was started with.
+### PR 1: the `hosted_vllm` provider at the gateway (about 90 lines, plus tests)
 
-### 3.2 The model server: mirror Hindsight
+Mirrors `vertex_ai` file for file. The address of the server is one value,
+`litellm.hostedVllm.apiBase`, required when the provider is `hosted_vllm` and rejected at render
+time otherwise, the way `vertex.projectId` is.
 
-| Exists today                                                                                          | Add for vLLM                                                                                                                                                                                                                                                                                      |
-| ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `k8s-operator/config/integrations/hindsight/` (api, postgres, netpol, pdb, podmonitoring, README)     | `k8s-operator/config/integrations/vllm/`: `deployment.yaml`, `service.yaml`, `networkpolicy.yaml`, `pdb.yaml`, `podmonitoring.yaml`, `kustomization.yaml`, `README.md`. Promoted from `examples/vllm-gemma/`, with `${VLLM_IMAGE}`, `${MODEL_DEFAULT_NAME}`, and `${VLLM_GPU_COUNT}` substituted. |
-| `charts/kube-agents/templates/hindsight.yaml`, "mirroring k8s-operator/config/integrations/hindsight" | `charts/kube-agents/templates/vllm.yaml`, the same objects from values.                                                                                                                                                                                                                           |
-| `kube-agents.hindsightEnabled`: `hindsight.enabled: null` follows the memory provider                 | `kube-agents.vllmEnabled`: `vllm.enabled: null` follows `litellm.modelProvider == "hosted_vllm"`; `true` or `false` overrides, so a user can host the server for another consumer or point the provider at their own.                                                                             |
-| `values.yaml` `hindsight:` block                                                                      | `vllm:` block: `image`, `model`, `gpu.accelerator`, `gpu.count`, `tensorParallelSize`, `quantization`, `maxModelLen`, `weights` (§3.3), `resources`, `rollingUpdate` (surge-first, per `tests/test_deployments_rollout_quota.py`).                                                                |
-| `images.json` `hindsight-api`, `hindsight-postgresql`                                                 | `vllm`, third-party, digest-pinned. See §3.4 for the mirror-size question.                                                                                                                                                                                                                        |
-| `deploy-hindsight` / `undeploy-hindsight`                                                             | `deploy-vllm` / `undeploy-vllm`, `VLLM_VARS`, `require-var VLLM_IMAGE`.                                                                                                                                                                                                                           |
-| `STATIC_NETWORK_POLICIES` roster in `scripts/check_iac_parity.py`                                     | The two new NetworkPolicy copies (chart template and kustomize dir); the example's is already there.                                                                                                                                                                                              |
-| `examples/vllm-gemma/`                                                                                | Stays as the hand-applied reference, its README pointing at the integration for the managed path. Same relationship as `examples/litellm-chatgpt-subscription/` to `overlays/chatgpt/`.                                                                                                           |
+| File                                                      | Change                                                                                                                                                                                    | Lines |
+| --------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
+| `k8s-operator/config/integrations/litellm/providers.json` | One row: `id: hosted_vllm`, `overlay: hosted_vllm`, `authentication.type: none`, one setting `api_base` bound to `HOSTED_VLLM_API_BASE`. The admin console reads it.                      | 12    |
+| `…/litellm/overlays/hosted_vllm/kustomization.yaml`       | `resources: [../../base]`, two patches, the label block the other overlays carry.                                                                                                         | 14    |
+| `…/litellm/overlays/hosted_vllm/deployment-patch.yaml`    | `env: HOSTED_VLLM_API_BASE=${HOSTED_VLLM_API_BASE}` on `litellm-container`. Same shape as the `vertex_ai` patch.                                                                          | 12    |
+| `…/litellm/overlays/hosted_vllm/networkpolicy-patch.yaml` | One egress rule: `podSelector: {}` in the release namespace, port `${HOSTED_VLLM_PORT}`. Not every pod in the cluster.                                                                    | 12    |
+| `charts/kube-agents/templates/litellm.yaml`               | `hosted_vllm` in `$defaultModels` and the `fail` text; a `fail` when `hostedVllm.apiBase` is empty; the env var beside `VERTEXAI_PROJECT`; the egress rule with the port from `urlParse`. | 20    |
+| `charts/kube-agents/values.yaml`                          | `litellm.hostedVllm.apiBase: ""` with a two-line comment.                                                                                                                                 | 4     |
+| `k8s-operator/Makefile`                                   | `LITELLM_HOSTED_VLLM_VARS`; one `elif` arm in `deploy-litellm` and in `undeploy-litellm`.                                                                                                 | 9     |
+| `install.defaults.env`                                    | `DEFAULT_MODEL_VLLM`.                                                                                                                                                                     | 1     |
+| `scripts/installer/installer_common.sh`                   | One `case` arm in `default_model_for_provider`, one alternation in `is_valid_model_provider`, `hosted_vllm_api_base` in `write_tfvars_from_state`.                                        | 4     |
+| `install.sh`                                              | Fifth menu entry and `case` arm in the Day-1 wizard and the Day-2 panel; the summary line.                                                                                                | 16    |
+| `terraform/examples/full-install/variables.tf`, `main.tf` | `hosted_vllm` in the `model_provider` validation; `hosted_vllm_api_base` variable; one entry in the `litellm` values merge.                                                               | 10    |
+| `install.env.example`, `terraform.tfvars.example`         | A commented block each.                                                                                                                                                                   | 8     |
 
-The server's NetworkPolicy admits ingress on 8000 from the gateway's pods and `gke-gmp-system`
-only. The agent never reaches it directly.
+Tests, all on every pull request: the chart render for `hosted_vllm` (env var present, egress rule
+present with the URL's port, `gemini` byte-identical to `main`, empty `apiBase` fails with a
+message naming the value), following `tests/test_vertex_location_defaults.py`; `hosted_vllm` added
+to the loop in `tests/test_installer_common.py`, whose pin against `install.defaults.env` then
+covers the default; the provider added to the tuple in `tests/test_operator_makefile.py` so the
+overlay builds and the recipe parses.
 
-### 3.3 Weights
+Live: the gateway on the dev cluster re-rendered with `hosted_vllm` against the vLLM pod from
+`examples/vllm-gemma/`, one chat completion through it, one agent turn.
 
-Gemma is gated on Hugging Face, so an online pull needs a token; an air-gapped cluster has no
-Hugging Face at all. `vllm.weights` takes one of:
+### PR 2: the model server (about 110 lines, plus `images.json`)
 
-- `hfTokenSecret`: a Secret holding `HF_TOKEN`, created by the composition from a new `HF_TOKEN`
-  install key handled like the provider keys (`write_secret_env_var`, `PERSIST_SECRETS_ON_DISK`).
-  vLLM pulls from the Hub into an emptyDir sized for the model.
-- `gcsPath`: a `gs://` prefix an init container copies onto the volume before vLLM starts. Model
-  Garden publishes Gemma 4 at `gs://vertex-model-garden-public-us/gemma4/<model>/`, readable
-  without a token, and a private bucket is the natural store for an air-gapped GCP project's own
-  copy. The default on GCP.
+**Dev path: build the example.** `examples/vllm-gemma/` gains a `kustomization.yaml` listing its
+four files, which changes nothing about applying it by hand. A new
+`k8s-operator/config/integrations/vllm/kustomization.yaml` names the example as its base (a
+kustomize base may live outside the kustomization's directory; only raw files may not) and
+patches two fields so the copy people paste from keeps its literal values while the dev path gets
+`${VLLM_IMAGE}` and `${MODEL_DEFAULT_NAME}`. `deploy-vllm` and `undeploy-vllm` in the Makefile
+follow `deploy-hindsight`.
 
-Either way the volume is sized from the model: a 31B bf16 checkpoint is 62 GB, which is why
-#608's 50Gi ephemeral-storage limit could not have loaded the model it named.
+| File                                                        | Change                                                                                        | Lines |
+| ----------------------------------------------------------- | --------------------------------------------------------------------------------------------- | ----- |
+| `examples/vllm-gemma/kustomization.yaml`                    | The resource list.                                                                            | 7     |
+| `k8s-operator/config/integrations/vllm/kustomization.yaml`  | Base plus two JSON patches (container image, `MODEL_ID` env).                                 | 22    |
+| `k8s-operator/config/integrations/vllm/README.md`           | Ten lines: what it is, the two variables, the example it builds.                              | 10    |
+| `k8s-operator/Makefile`                                     | `VLLM_VARS`, `deploy-vllm`, `undeploy-vllm`.                                                  | 10    |
+| `images.json`                                               | The vLLM image the example already pins, with `override: VLLM_IMAGE` and `mirrorGroup: vllm`. | 9     |
+| `scripts/mirror_images.sh`, `hack/check-image-inventory.sh` | `mirrorGroup`: skipped unless named in `INCLUDE_GROUPS`; recognised as a key.                 | 14    |
 
-### 3.4 Capacity: mirror the gvisor node pool
+**Install path: the vLLM project's chart.** `terraform/examples/full-install/main.tf` gains a
+`helm_release` of `vllm-stack` from `https://vllm-project.github.io/production-stack`, shaped
+like `helm_release.cert_manager`: `count` on `var.model_provider == "hosted_vllm" &&
+var.host_model_server`, `depends_on` the cluster, mirrored image values from the same local
+cert-manager uses. Its values are the chart's own keys, filled from ours:
+`servingEngineSpec.modelSpec[0]` with `modelURL = var.model_default_name`, `requestGPU`,
+`vllmConfig.tensorParallelSize`, `vllmConfig.extraArgs` for quantization and max model length,
+`nodeSelectorTerms` on `cloud.google.com/gke-accelerator`, `hf_token` from a secret when given,
+`pvcStorage` sized from a variable; `routerSpec.enableRouter = true` so the Service is the
+router's on port 80. `hosted_vllm_api_base` then defaults to that Service's cluster address and
+PR 1's gateway change needs nothing new.
 
-| Exists today                                                                                   | Add                                                                                                                                                                                                                                                                                                               |
-| ---------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `gke-cluster` module `enable_gvisor_node_pool`, `gvisor_pool_name`, Standard-only precondition | `enable_gpu_node_pool`, `gpu_pool_name`, `gpu_accelerator_type`, `gpu_accelerator_count`, `gpu_machine_type`, `gpu_spot`, `gpu_disk_size_gb`, `gpu_node_locations`. Same precondition: Autopilot fails the plan, because there the server's `nodeSelector` on `cloud.google.com/gke-accelerator` is all it takes. |
-| `full-install` passes `enable_gvisor_node_pool` through; installer derives `ENABLE_GVISOR`     | `enable_gpu_node_pool` defaults to `model_provider == "hosted_vllm" && cluster is Standard`; the installer writes the `gpu_*` tfvars from `GPU_ACCELERATOR`, `GPU_COUNT`, `GPU_SPOT` install keys with defaults in `install.defaults.env`.                                                                        |
+| File                                                  | Change                                                                                                                                                                    | Lines |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
+| `terraform/examples/full-install/main.tf`             | The `helm_release`; the `hosted_vllm_api_base` default local.                                                                                                             | 40    |
+| `terraform/examples/full-install/variables.tf`        | `host_model_server`, `vllm_chart_version`, `gpu_accelerator`, `gpu_count`, `vllm_quantization`, `vllm_max_model_len`, `hf_token` (sensitive), `model_weights_storage_gb`. | 40    |
+| `scripts/installer/installer_common.sh`, `install.sh` | Write the new tfvars; prompt for the weights source when the provider is `hosted_vllm`.                                                                                   | 14    |
+| `install.defaults.env`                                | Defaults for the five knobs.                                                                                                                                              | 5     |
+| `images.json`                                         | The chart's engine and router images, `mirrorGroup: vllm`, so an air-gapped mirror can opt in.                                                                            | 16    |
 
-L4 is zonal, and spot L4 stocks out (both `us-central1` zones did on 2026-09-10), so
-`gpu_node_locations` is explicit and `gpu_spot` defaults to `false`.
+Weights: `hf_token` set means the chart pulls from the Hub; unset, the install expects the model
+on the PVC, and the README shows the one `gcloud storage cp` from a bucket (Model Garden publishes
+the default there, readable without a token) or from the user's own bucket in an air-gapped
+project. No init container of ours; the chart's `initContainer` value carries it when wanted.
 
-**Image size.** The vLLM image is about 11 GB and `scripts/mirror_images.sh` selects by `origin`
-alone, so a plain third-party entry makes it mandatory in every mirror, the point #608's review
-raised. The fix is one optional field, `mirrorGroup: "vllm"`, honoured by `mirror_images.sh` as an
-`INCLUDE_GROUPS` filter defaulting to none, and by `hack/check-image-inventory.sh` as a recognised
-key. Small, and it gives the next large optional image somewhere to go.
+Tests: `terraform validate`; a render test that `hosted_vllm` with `host_model_server = false`
+emits no release; kustomize build of the integration; `tests/test_deployments_rollout_quota.py`
+already names the example's Deployment. The chart's images join the inventory check, which
+renders every toggle.
 
-### 3.5 Defaults
+Live: `terraform apply` on the dev cluster with the provider set, the router Service answering,
+the agent turn from PR 1 repeated through the install's own gateway.
 
-Model ids must exist. #608 defaulted to `google/gemma-4-27B-it`, which does not; the Gemma 4
-instruction-tuned family is `E2B`, `E4B`, `12B`, `26B-A4B`, and `31B`. Proposed defaults:
+### PR 3: GPU capacity by node auto-provisioning (about 35 lines)
 
-| Value                             | Default                   | Why                                                                                             |
-| --------------------------------- | ------------------------- | ----------------------------------------------------------------------------------------------- |
-| `DEFAULT_MODEL_VLLM`              | `google/gemma-4-31B-it`   | The tier the agent's tool use needs; open question 1 is whether a cheaper one passes the bench. |
-| `gpu.accelerator`                 | `nvidia-l4`               | Widest GKE availability with native bf16 and FP8.                                               |
-| `gpu.count`, `tensorParallelSize` | `2`                       | 31B fits 2×L4 (48 GB) with FP8 and not without it.                                              |
-| `quantization`                    | `fp8`                     | Same reason; `""` for a card with room for bf16.                                                |
-| `gpu_machine_type`                | `g2-standard-24`          | The 2×L4 shape.                                                                                 |
-| `weights`                         | `gcsPath` to Model Garden | No token, works air-gapped from a private copy.                                                 |
+On Standard, the `gke-cluster` module's `google_container_cluster.standard` gains a
+`cluster_autoscaling` block behind `enable_gpu_autoprovisioning`: `resource_limits` for CPU,
+memory, and the accelerator type, and `auto_provisioning_defaults` carrying the module's existing
+OAuth scopes and `GKE_METADATA`. GKE then creates and removes GPU nodes from the model server's
+own `nvidia.com/gpu` request and accelerator selector, picks the machine shape, and needs no zone
+list, machine type, or pool name from us. Autopilot already does this. The installer sets the
+variable from `MODEL_PROVIDER=hosted_vllm` on a Standard cluster it created; for an adopted
+cluster it prints the one `gcloud container clusters update --enable-autoprovisioning` line, as it
+does for other adopted-cluster prerequisites.
 
-## 4. Testing
+| File                                                      | Change                                                             | Lines |
+| --------------------------------------------------------- | ------------------------------------------------------------------ | ----- |
+| `terraform/modules/gke-cluster/variables.tf`              | `enable_gpu_autoprovisioning`, `gpu_autoprovisioning_accelerator`. | 12    |
+| `terraform/modules/gke-cluster/main.tf`                   | The `cluster_autoscaling` block, `dynamic` on the variable.        | 18    |
+| `terraform/examples/full-install/main.tf`, `variables.tf` | Pass-through and derivation.                                       | 6     |
+| `scripts/installer/installer_common.sh`                   | The tfvar line; the adopted-cluster hint.                          | 4     |
 
-- **Unit, every PR:** chart renders for `hosted_vllm` (config, egress, the vLLM objects present)
-  and for `gemini` byte-identical to today; `vllm.enabled` override both ways; the default-model
-  pin test covers the new row; kustomize builds of the overlay and the integration; the rollout
-  test's expectations for the new Deployment; `terraform validate` for the pool variables.
-- **Integration:** `deploy-litellm MODEL_PROVIDER=hosted_vllm` against a stub OpenAI server in
-  kind, asserting the alias routes and the ConfigMap carries no key.
-- **CUJ, manual:** a `bench/cuj/` journey for the hosted path, because it needs a GPU and CI has
-  none: load time, first token, one agent turn.
-- **No new eval cases.** The agent's behaviour is not what changes.
+Spot capacity stocks out (both `us-central1` zones did on 2026-09-10), so the default asks for
+on-demand and the knob to prefer spot is a later addition if wanted.
 
-## 5. Delivery, three pull requests
+### PR 4: the example and the journey (copies by design)
 
-| PR  | Contents                                                                                                                                  | Testable how                                                                              |
-| --- | ----------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
-| 1   | §3.2 and §3.3: the `vllm` integration and chart template, opt-in via `vllm.enabled: true`, `images.json` with `mirrorGroup`, roster, docs | Live on a GPU node with `helm upgrade --set vllm.enabled=true`; no provider change needed |
-| 2   | §3.1: the `hosted_vllm` provider end to end, `vllm.enabled: null` derivation, installer menus, defaults                                   | Chart render tests; live agent turn through the gateway                                   |
-| 3   | §3.4: the GPU node pool and its installer derivation                                                                                      | `terraform validate`; a fresh Standard install                                            |
+`examples/litellm-hosted-vllm/` is `examples/litellm-gemini/` with two edits: the ConfigMap's
+model line reads `hosted_vllm/<model>` and the Deployment carries `HOSTED_VLLM_API_BASE`. Six
+files, the same README sections as the subscription example (prerequisites, numbered `kubectl
+apply` steps, verification with one `curl` through the gateway, when to use), its NetworkPolicy on
+the `check_iac_parity.py` roster, a row in the site's examples page, one line in `docs/README.md`.
+`examples/vllm-gemma/`'s README links to it as the gateway half of the pair.
 
-PR 1 first because it is the half that can be exercised on the GPU node already provisioned for
-this design, and because it stands alone: a user with a GPU pool can turn it on today and point
-`examples/litellm-gemini`-style config at it by hand.
+`bench/cuj/` gains one journey for the hosted path, manual because CI has no GPU: server Ready,
+one completion through the gateway, one agent turn that calls a tool, and three numbers (load
+time, first token, VRAM headroom at the default max model length). PRs 1 and 2 each run it.
+
+### Documentation, across the PRs
+
+The site's inference-gateway page: one row in "Choosing a provider" and the `MODEL_PROVIDER`
+table, and the "vLLM (local models)" section gains the install-path paragraph. `INSTALL.md`
+Method 1 gets the `install.env` lines, Method 2 the `deploy-vllm` line. No new page.
+
+## 5. Testing summary
+
+- **Unit, every PR:** chart renders (provider, egress, byte-identical `gemini`, the empty-value
+  failure), the default-model pin, kustomize builds and recipe syntax, Terraform validation, the
+  inventory and parity checks.
+- **Integration, every PR:** `deploy-litellm MODEL_PROVIDER=hosted_vllm` in kind against a stub
+  OpenAI-compatible server, asserting `model-default` routes to it and the ConfigMap carries no
+  key. Home: `tests/integration/`.
+- **Manual:** the `bench/cuj/` journey against a real GPU node, recorded in each PR's Live
+  validation.
+- **No new eval cases.** The agent's behaviour does not change.
 
 ## 6. On the #608 review
 
-The reviewer asked that the operator not be "in the business of deploying models and model
-servers". This design does put a vLLM Deployment in the chart, deliberately, and the difference
-from #608 is the terms: it is rendered only when a provider setting asks for it, exactly as the
-Hindsight store is; it is a copy of an upstream recipe, not a fork of vLLM; it carries no model
-in the image and no model-specific code; and the model id is a value with a default, not a
-constant. The alternative, a second `helm_release` of the vLLM production-stack chart the way
-cert-manager is installed, was considered and set aside for now: it brings a router and
-observability stack this install already has, and it would be the first component whose
-manifests this repository cannot read. It remains the fallback if the in-tree copy proves costly
-to keep current.
+The reviewer asked that the operator not deploy models or model servers. This plan keeps that
+line: the chart renders no model server; the composition installs the vLLM project's own chart on
+request, as it installs cert-manager; the dev path builds the example that already exists; and
+nothing in the harness names a model except a default value in `install.defaults.env`.
 
 ## 7. Open questions
 
-1. **Default tier versus cost.** `31B` FP8 on 2×L4 against `26B-A4B` or `12B` on one L4; the bench
-   harness can say which passes the presubmit cases.
-2. **Autopilot defaults.** Whether the chart should pick an accelerator class or leave
-   `nodeSelector` to values.
-3. **`examples/vllm-gemma/` after PR 1.** Reference kept, or reduced to a pointer.
-4. **#608.** Keep its example half open against `examples/`, close the rest in favour of PR 2.
+1. **Default tier versus cost.** The bench harness can say which model tier passes the presubmit
+   cases on one L4 versus two.
+2. **The upstream chart's pace.** `vllm-stack` moves quickly; the version is pinned in a variable
+   and the inventory check will flag image drift, but someone owns the bump.
+3. **`examples/vllm-gemma/` naming.** The model-server half of the pair is named for a model; a
+   rename to `examples/vllm/` is cheap now and dearer later.
 
-<!-- Live-test results from the 2026-09-10 run (2×L4, gemma-4-31B-it, FP8, TP 2): fill in load
-     time, VRAM headroom at max-model-len 32768, and the agent-turn outcome once the node lands. -->
+<!-- Live-test results from the 2026-09-10 run (2×L4, FP8, TP 2): fill in load time, VRAM
+     headroom at max-model-len 32768, and the agent-turn outcome once the node lands. -->
