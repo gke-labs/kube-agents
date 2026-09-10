@@ -70,6 +70,10 @@ OTLP collector, and 443 to public addresses. The `hosted_vllm` rule admits one n
 the Service name in `apiBase` the way the collector's is read from `telemetry.otlpEndpoint`, on the
 configured `targetPort` (8000 in the example). Not every pod in the cluster, and the pod port
 rather than the Service port, because the policy is evaluated after the Service's translation.
+The gateway's existing 443 rule to public addresses stays under `hosted_vllm`: it is the
+gateway's policy, not the provider's, the same Deployment serves whichever provider the install
+selects next, and LiteLLM fetches its model-cost map over it at startup. An air-gapped install
+that wants it gone has `litellm.networkPolicy` and the policy it manages itself.
 
 ## 5. Testing
 

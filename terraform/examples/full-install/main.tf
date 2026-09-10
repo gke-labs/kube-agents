@@ -728,5 +728,12 @@ resource "helm_release" "kube_agents" {
       condition     = !var.enable_github_minter || (local.github_org != "" && local.github_repo_name != "")
       error_message = "enable_github_minter requires github_repo in owner/repo (or github.com URL) form — the minty rule ConfigMap is scoped to that repository."
     }
+    # The chart refuses to render hosted_vllm without these three, and a
+    # render failure inside helm_release arrives after the cluster and IAM
+    # have been built; a precondition fails the plan instead.
+    precondition {
+      condition     = var.model_provider != "hosted_vllm" || (var.model_default_name != "" && var.hosted_vllm_api_base != "" && var.hosted_vllm_target_port != "")
+      error_message = "model_provider = \"hosted_vllm\" requires model_default_name, hosted_vllm_api_base and hosted_vllm_target_port; the provider has no defaults."
+    }
   }
 }

@@ -223,14 +223,28 @@ that drops every call.
 */}}
 {{- define "kube-agents.hostedVllmNamespace" -}}
 {{- $url := ((.Values.litellm.hostedVllm | default dict).apiBase) | default "" -}}
-{{- $host := $url | trimPrefix "https://" | trimPrefix "http://" -}}
+{{- $ns := include "kube-agents.serviceNamespaceFromURL" $url -}}
+{{- if $ns -}}
+{{- $ns -}}
+{{- else -}}
+{{- fail (printf "litellm.hostedVllm.apiBase %q does not name an in-cluster Service (<svc>.<namespace>.svc.cluster.local), so the gateway's NetworkPolicy cannot tell which namespace to allow egress to." $url) -}}
+{{- end -}}
+{{- end }}
+
+{{- /*
+The namespace of the in-cluster Service a URL names, or "" when the URL does not
+name one. Only two host shapes are an in-cluster Service: exactly <svc>.<ns>, or
+<svc>.<ns>.svc[...]. Anything with a third label that is not "svc" is a public DNS
+name, and reading its second label as a namespace would quietly open egress to a
+namespace named "vendor". Shared by the OTLP collector and hosted_vllm lookups.
+*/}}
+{{- define "kube-agents.serviceNamespaceFromURL" -}}
+{{- $host := . | trimPrefix "https://" | trimPrefix "http://" -}}
 {{- $host = (splitList "/" $host | first) -}}
 {{- $host = (splitList ":" $host | first) -}}
 {{- $parts := splitList "." $host -}}
 {{- if or (eq (len $parts) 2) (and (ge (len $parts) 3) (eq (index $parts 2) "svc")) -}}
 {{- index $parts 1 -}}
-{{- else -}}
-{{- fail (printf "litellm.hostedVllm.apiBase %q does not name an in-cluster Service (<svc>.<namespace>.svc.cluster.local), so the gateway's NetworkPolicy cannot tell which namespace to allow egress to." $url) -}}
 {{- end -}}
 {{- end }}
 
@@ -240,17 +254,9 @@ that drops every call.
 {{- else if not .Values.telemetry.otlpEndpoint -}}
 gke-managed-otel
 {{- else -}}
-{{- $host := .Values.telemetry.otlpEndpoint | trimPrefix "https://" | trimPrefix "http://" -}}
-{{- $host = (splitList "/" $host | first) -}}
-{{- $host = (splitList ":" $host | first) -}}
-{{- $parts := splitList "." $host -}}
-{{- /*
-  Only two shapes are an in-cluster Service: exactly <svc>.<ns>, or <svc>.<ns>.svc[...].
-  Anything with a third label that is not "svc" is a public DNS name, and reading its
-  second label as a namespace would quietly open egress to a namespace named "vendor".
-*/ -}}
-{{- if or (eq (len $parts) 2) (and (ge (len $parts) 3) (eq (index $parts 2) "svc")) -}}
-{{- index $parts 1 -}}
+{{- $ns := include "kube-agents.serviceNamespaceFromURL" .Values.telemetry.otlpEndpoint -}}
+{{- if $ns -}}
+{{- $ns -}}
 {{- else if not .Values.litellm.otel -}}
 gke-managed-otel
 {{- else -}}

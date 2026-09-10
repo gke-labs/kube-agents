@@ -2152,6 +2152,22 @@ check_existing_cluster_network_policy_preflight() {
 }
 
 # Validates explicit values for existing-cluster opt-in flags (loud like --gvisor)
+# hosted_vllm has no defaults and the chart refuses to render without its three
+# values, so stop before the cluster and IAM are built rather than at
+# helm_release. Loud, unlike the API-key cases in main(): a keyless install
+# still deploys and fails at the first model call; this one cannot render.
+validate_hosted_vllm_inputs() {
+  local provider="$1" model_name="$2" api_base="$3" target_port="$4"
+  [ "$provider" = "hosted_vllm" ] || return 0
+  if [ -z "$model_name" ] || [ -z "$api_base" ] || [ -z "$target_port" ]; then
+    print_error "hosted_vllm needs --model-default-name, --hosted-vllm-api-base (including /v1) and --hosted-vllm-target-port (the server pod's port), or the same keys in install.env."
+    return 1
+  fi
+  case "$target_port" in
+    *[!0-9]*) print_error "--hosted-vllm-target-port must be a port number, got '${target_port}'."; return 1 ;;
+  esac
+}
+
 validate_existing_cluster_opt_in_flags() {
   if { [ "${PARAM_MIGRATE_NODE_POOLS_PASSED:-false}" = "true" ] || [ -n "${PARAM_MIGRATE_NODE_POOLS:-}" ]; } && \
      [[ ! "$PARAM_MIGRATE_NODE_POOLS" =~ ^(true|false)$ ]]; then
@@ -2604,6 +2620,9 @@ run_menu_system() {
         export PARAM_ENABLE_WEBUI="$enable_webui" PARAM_MODEL_PROVIDER="$model_provider"
         export PARAM_PERMISSION_SET="$permission_set" PARAM_ENABLE_GVISOR="$enable_gvisor"
         export GOOGLE_CHAT_ENABLED="$google_chat_enabled" SLACK_ENABLED="$slack_enabled"
+
+        # The same check main() makes before an apply; back to the menu on failure.
+        validate_hosted_vllm_inputs "$model_provider" "$model_default_name" "${HOSTED_VLLM_API_BASE:-}" "${HOSTED_VLLM_TARGET_PORT:-}" || continue
 
         # Into install.env, one key at a time, leaving the operator's comments
         # and ordering alone. This panel is the one place allowed to write
@@ -3217,17 +3236,7 @@ main() {
       [ -n "$anthropic_api_key" ] || print_warning "No Anthropic API key was provided; the agent will require a credential update before model calls can succeed."
       ;;
     hosted_vllm)
-      # Loud, unlike the API-key cases above: a keyless install still deploys
-      # and fails at the first model call, while the chart refuses to render
-      # without these three, which would surface at helm_release after the
-      # cluster and IAM had been built.
-      if [ -z "$model_default_name" ] || [ -z "${HOSTED_VLLM_API_BASE:-}" ] || [ -z "${HOSTED_VLLM_TARGET_PORT:-}" ]; then
-        print_error "hosted_vllm needs --model-default-name, --hosted-vllm-api-base (including /v1) and --hosted-vllm-target-port (the server pod's port), or the same keys in install.env."
-        exit 1
-      fi
-      case "${HOSTED_VLLM_TARGET_PORT}" in
-        *[!0-9]*|"") print_error "--hosted-vllm-target-port must be a port number, got '${HOSTED_VLLM_TARGET_PORT}'."; exit 1 ;;
-      esac
+      validate_hosted_vllm_inputs "$model_provider" "$model_default_name" "${HOSTED_VLLM_API_BASE:-}" "${HOSTED_VLLM_TARGET_PORT:-}" || exit 1
       ;;
   esac
 
