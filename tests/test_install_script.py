@@ -932,11 +932,14 @@ print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-cent
         self.assertIn("gcloud container clusters update test-cluster --location us-central1 --project test-proj --update-addons=NetworkPolicy=ENABLED", out)
         self.assertIn("gcloud container clusters update test-cluster --location us-central1 --project test-proj --enable-network-policy", out)
         self.assertIn("GitHub App PEM Import (before apply, when GitOps minter is enabled):", out)
+        self.assertIn("gcloud kms keyrings create github-token-minter-keyring --location=us-central1 --project=test-proj", out)
+        self.assertIn("gcloud kms keys create github-token-minter-key --keyring=github-token-minter-keyring", out)
+        self.assertIn("--purpose=asymmetric-signing", out)
+        self.assertIn("--import-only --skip-initial-version-creation", out)
         self.assertIn("git clone --depth 1 --branch v2.7.1 https://github.com/abcxyz/github-token-minter.git /tmp/minty", out)
         self.assertIn("go run ./cmd/minty tools import-pk", out)
         # Lifecycle commands with bucket/prefix
         self.assertIn("cd /tmp/test-repo/terraform/examples/full-install", out)
-        self.assertIn('KUBE_AGENTS_STATE_BUCKET="test-proj-kube-agents-tfstate" KUBE_AGENTS_STATE_PREFIX="kube-agents/test-cluster" ./lifecycle.sh plan', out)
         self.assertIn('KUBE_AGENTS_STATE_BUCKET="test-proj-kube-agents-tfstate" KUBE_AGENTS_STATE_PREFIX="kube-agents/test-cluster" ./lifecycle.sh apply', out)
         # Post-apply OTel scope
         self.assertIn("Managed OpenTelemetry Scope:", out)

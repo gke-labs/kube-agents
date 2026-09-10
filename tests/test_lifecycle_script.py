@@ -28,19 +28,22 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    tfvar_namespace='"kubeagents-system"',
                    tfvar_kms_keyring='"platform-agent-keyring"',
                    tfvar_kms_key='"k8s-secret-encryption-key"',
-                   tfvar_cluster_name="null"):
-        """Run a lifecycle.sh function against stubbed terraform and gcloud commands.
-
-        `gcloud_stub` answers every gcloud call; the default says the cluster
-        does not exist, so no test ever reaches a real gcloud on PATH. The
-        console stub answers a typed null the way terraform does, as
-        `tostring(null)`, when a test passes that spelling.
-        """
+                   tfvar_cluster_name="null",
+                   tfvar_enable_minter="false",
+                   gcloud_key_version=""):
+        """Run a lifecycle.sh function against stubbed terraform and gcloud commands."""
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
             bin_dir.mkdir()
             gcloud = bin_dir / "gcloud"
-            gcloud.write_text(f"#!/usr/bin/env bash\n{gcloud_stub}\n")
+            gcloud.write_text(f"""#!/usr/bin/env bash
+set -e
+if [[ "$*" == *"kms keys versions list"* ]]; then
+    echo '{gcloud_key_version}'
+    exit 0
+fi
+{gcloud_stub}
+""")
             gcloud.chmod(0o755)
 
             # Stub terraform CLI to return configured state list, state show, and console outputs
@@ -79,6 +82,21 @@ elif [[ "$cmd" == "console" ]]; then
         exit 0
     elif [[ "$expr" == *"cluster_name"* ]]; then
         echo '{tfvar_cluster_name}'
+        exit 0
+    elif [[ "$expr" == *"enable_github_minter"* ]]; then
+        echo '{tfvar_enable_minter}'
+        exit 0
+    elif [[ "$expr" == *"github_minter_kms_keyring"* ]]; then
+        echo '"github-token-minter-keyring"'
+        exit 0
+    elif [[ "$expr" == *"github_minter_kms_key"* ]]; then
+        echo '"github-token-minter-key"'
+        exit 0
+    elif [[ "$expr" == *"project_id"* ]]; then
+        echo '"test-project"'
+        exit 0
+    elif [[ "$expr" == *"location"* ]]; then
+        echo '"us-central1-c"'
         exit 0
     fi
     echo 'null'
@@ -414,6 +432,36 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 1)
         self.assertIn("namespace resolved to 'agents-two', but this state's release runs in 'kubeagents-system'", proc.stderr)
         self.assertIn('NAMESPACE="kubeagents-system"', proc.stderr)
+
+    def test_guard_minter_key_no_op_when_minter_disabled(self):
+        """When enable_github_minter is false, guard_minter_key passes cleanly."""
+        proc = self._run_guard(
+            "guard_minter_key",
+            tfvar_enable_minter='"false"',
+        )
+        self.assertEqual(proc.returncode, 0, f"unexpected failure: {proc.stderr}")
+        self.assertEqual(proc.stderr, "")
+
+    def test_guard_minter_key_passes_when_key_version_enabled(self):
+        """When enable_github_minter is true and key version exists in ENABLED state, apply proceeds."""
+        proc = self._run_guard(
+            "guard_minter_key",
+            tfvar_enable_minter='"true"',
+            gcloud_key_version="projects/test-project/locations/us-central1/keyRings/github-token-minter-keyring/cryptoKeys/github-token-minter-key/cryptoKeyVersions/1",
+        )
+        self.assertEqual(proc.returncode, 0, f"unexpected failure: {proc.stderr}")
+        self.assertEqual(proc.stderr, "")
+
+    def test_guard_minter_key_refuses_when_no_enabled_key_version(self):
+        """When enable_github_minter is true but key has no ENABLED version, apply refuses to prevent wedged helm wait."""
+        proc = self._run_guard(
+            "guard_minter_key",
+            tfvar_enable_minter='"true"',
+            gcloud_key_version="",
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("enable_github_minter is true, but KMS signing key 'us-central1/github-token-minter-keyring/github-token-minter-key' has no ENABLED version.", proc.stderr)
+        self.assertIn("Applying now would deploy the minter and wedge waiting on its readiness probe.", proc.stderr)
 
 
 if __name__ == "__main__":

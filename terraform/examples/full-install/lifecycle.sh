@@ -623,7 +623,7 @@ guard_kms_identity() {
   )
   local check addr variable key recorded desired
   for check in "${checks[@]}"; do
-    IFS=$'\t' read -r addr variable key <<<"$check"
+    IFS=$'	' read -r addr variable key <<<"$check"
     in_state "$addr" || continue
     recorded=$(state_attr "$addr" name)
     [[ -n "$recorded" ]] || continue
@@ -668,6 +668,34 @@ forget_unmanaged_cluster_kms() {
   restore_key_versions \
     "projects/$project/locations/$location/keyRings/$(tfvar kms_keyring_name)/cryptoKeys/$(tfvar kms_key_name)" \
     "$location" "$project"
+}
+
+# When enable_github_minter is true, the minter Deployment cannot pass readiness
+# probes without an ENABLED private key version in KMS. Terraform creates the key
+# with skip_initial_version_creation = true (import-only), and the helm release
+# waits on every Deployment (wait = true), so applying without an imported key
+# wedges the apply with the cluster already built. Refuse early if minter is enabled
+# but the key has no ENABLED version.
+guard_minter_key() {
+  [[ "$(tfvar enable_github_minter 2>/dev/null || echo "false")" == "true" ]] || return 0
+  local project location keyring key version
+  project=$(tfvar project_id)
+  location=$(sed -E 's/-[a-z]$//' <<<"$(tfvar location)")
+  keyring=$(tfvar github_minter_kms_keyring 2>/dev/null || echo "")
+  [[ -n "$keyring" ]] || keyring="github-token-minter-keyring"
+  key=$(tfvar github_minter_kms_key 2>/dev/null || echo "")
+  [[ -n "$key" ]] || key="github-token-minter-key"
+
+  version=$({ gcloud kms keys versions list --key "$key" --keyring "$keyring" \
+    --location "$location" --project "$project" \
+    --filter='state=ENABLED' --format='value(name)' 2>/dev/null || true; } | head -1)
+  if [[ -z "$version" ]]; then
+    warn "enable_github_minter is true, but KMS signing key '$location/$keyring/$key' has no ENABLED version."
+    warn "Applying now would deploy the minter and wedge waiting on its readiness probe."
+    warn "Import the GitHub App private key before applying (see k8s-operator/config/integrations/github/README.md),"
+    warn "or set enable_github_minter = false in terraform.tfvars."
+    exit 1
+  fi
 }
 
 delete_agent_cr() {
@@ -846,6 +874,7 @@ case "${1:-}" in
     guard_kms_identity
     guard_release_namespace
     forget_unmanaged_cluster_kms
+    guard_minter_key
     adopt_kms
     adopt_pubsub
     log "terraform apply"
