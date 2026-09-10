@@ -242,8 +242,9 @@ class ChannelFallbackTest(unittest.TestCase):
             with patch.object(report, "run_cmd", fake):
                 m = report.build_report(["p1"], None)["members"][0]
             self.assertEqual(m["status"], report.STATUS_UNKNOWN, channel)
-            self.assertIn("--target-version", m["note"])
+            self.assertEqual(m["note"], "no release channel; pass --target-version", channel)
             self.assertIsNone(m["target_version"])
+            self.assertEqual(m["target_source"], report.EMPTY_CELL, channel)
 
     def test_server_config_failure_marks_that_location_unknown(self):
         clusters = [
