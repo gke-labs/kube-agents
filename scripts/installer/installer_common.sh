@@ -165,12 +165,13 @@ default_model_for_provider() {
   case "${1:-}" in
     openai) echo "$DEFAULT_MODEL_OPENAI" ;;
     anthropic) echo "$DEFAULT_MODEL_ANTHROPIC" ;;
+    custom) echo "$DEFAULT_MODEL_CUSTOM" ;;
     *) echo "$DEFAULT_MODEL_GEMINI" ;;
   esac
 }
 
 is_valid_model_provider() {
-  [[ "${1:-}" =~ ^(gemini|vertex_ai|anthropic|openai)$ ]]
+  [[ "${1:-}" =~ ^(gemini|vertex_ai|anthropic|openai|custom)$ ]]
 }
 
 # The GCP IAM role bundles the install knows how to grant. Kubernetes RBAC is
@@ -1680,12 +1681,18 @@ write_tfvars_from_state() {
     echo "vertex_project_id  = $(hcl_str "${VERTEX_PROJECT_ID:-}")"
     echo "vertex_location    = $(hcl_str "${VERTEX_LOCATION:-}")"
     echo "vertex_manage_serving_project = $(hcl_bool "${VERTEX_MANAGE_SERVING_PROJECT:-$DEFAULT_VERTEX_MANAGE_SERVING_PROJECT}")"
+    if [ "${MODEL_PROVIDER:-}" = "custom" ]; then
+      echo "custom_api_base    = $(hcl_str "${CUSTOM_API_BASE:-}")"
+    fi
     echo ""
     if is_truthy "${PERSIST_SECRETS_ON_DISK:-$DEFAULT_PERSIST_SECRETS_ON_DISK}"; then
       echo "api_server_key    = $(hcl_str "${API_SERVER_KEY:-}")"
       echo "gemini_api_key    = $(hcl_str "${GEMINI_API_KEY:-}")"
       echo "openai_api_key    = $(hcl_str "${OPENAI_API_KEY:-}")"
       echo "anthropic_api_key = $(hcl_str "${ANTHROPIC_API_KEY:-}")"
+      if [ "${MODEL_PROVIDER:-}" = "custom" ]; then
+        echo "custom_api_key    = $(hcl_str "${CUSTOM_API_KEY:-none}")"
+      fi
       if [ -n "${SESSION_KV_API_KEY:-}" ] || [ -n "${SESSION_KV_SALT:-}" ]; then
         echo "# Recovered from the live Secret: an adoption re-install must keep the"
         echo "# salt, or every chat identity re-pseudonymises."
@@ -1763,6 +1770,8 @@ write_tfvars_from_state() {
   export TF_VAR_gemini_api_key="${GEMINI_API_KEY:-}"
   export TF_VAR_openai_api_key="${OPENAI_API_KEY:-}"
   export TF_VAR_anthropic_api_key="${ANTHROPIC_API_KEY:-}"
+  export TF_VAR_custom_api_key="${CUSTOM_API_KEY:-none}"
+  export TF_VAR_custom_api_base="${CUSTOM_API_BASE:-}"
   export TF_VAR_slack_bot_token="${SLACK_BOT_TOKEN:-}"
   export TF_VAR_slack_app_token="${SLACK_APP_TOKEN:-}"
   export TF_VAR_session_kv_api_key="${SESSION_KV_API_KEY:-}"

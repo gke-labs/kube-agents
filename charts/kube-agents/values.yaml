@@ -202,7 +202,7 @@ litellm:
   # the managed collector exists; the NetworkPolicy already allows the egress.
   otel: false
   # model-default routes to <modelProvider>/<modelDefaultName>. Providers:
-  # gemini, anthropic, openai, vertex_ai. The provider's API key must exist in
+  # gemini, anthropic, openai, vertex_ai, custom. The provider's API key must exist in
   # the credentials Secret — except vertex_ai, which authenticates with
   # Workload Identity instead.
   modelProvider: gemini
@@ -224,6 +224,10 @@ litellm:
     # region here for either reason.
     projectId: ""
     location: ""
+  # modelProvider: custom only.
+  custom:
+    # Base URL of the OpenAI-compatible endpoint (e.g. http://vllm-gemma.kubeagents-system.svc.cluster.local:8000/v1)
+    apiBase: ""
   # Keep in step with the kustomize base
   # (k8s-operator/config/integrations/litellm/base/deployment.yaml), which is
   # the dev copy of this gateway.
