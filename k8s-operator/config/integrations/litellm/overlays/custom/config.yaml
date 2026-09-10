@@ -1,0 +1,30 @@
+model_list:
+  - model_name: model-default
+    litellm_params:
+      model: openai/${MODEL_DEFAULT_NAME}
+      api_base: ${CUSTOM_API_BASE}
+      api_key: ${CUSTOM_API_KEY}
+  - model_name: hermes-agent
+    litellm_params:
+      model: openai/${MODEL_DEFAULT_NAME}
+      api_base: ${CUSTOM_API_BASE}
+      api_key: ${CUSTOM_API_KEY}
+  - model_name: ${MODEL_DEFAULT_NAME}
+    litellm_params:
+      model: openai/${MODEL_DEFAULT_NAME}
+      api_base: ${CUSTOM_API_BASE}
+      api_key: ${CUSTOM_API_KEY}
+litellm_settings:
+  callbacks: ["otel", "prometheus"]
+router_settings:
+  default_litellm_params:
+    cache_control_injection_points:
+      - location: message
+        role: system
+        control:
+          type: ephemeral
+          ttl: 1h
+      - location: message
+        index: -3
+      - location: message
+        index: -1

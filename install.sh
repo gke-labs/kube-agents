@@ -339,6 +339,8 @@ PARAM_MODEL_PROVIDER="${MODEL_PROVIDER:-}"
 PARAM_VERTEX_PROJECT_ID="${VERTEX_PROJECT_ID:-}"
 PARAM_VERTEX_LOCATION="${VERTEX_LOCATION:-}"
 PARAM_VERTEX_MANAGE_SERVING_PROJECT="${VERTEX_MANAGE_SERVING_PROJECT:-}"
+PARAM_CUSTOM_API_BASE="${CUSTOM_API_BASE:-}"
+PARAM_CUSTOM_API_KEY="${CUSTOM_API_KEY:-}"
 PARAM_GEMINI_API_KEY="${GEMINI_API_KEY:-}"
 PARAM_OPENAI_API_KEY="${OPENAI_API_KEY:-}"
 PARAM_ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
@@ -438,7 +440,7 @@ Flags for AI Agents & Automation:
                                 unset at a zonal --region builds Standard instead.
                                 Ignored when installing onto a cluster that already
                                 exists — its live shape wins.
-  --model-provider=PROVIDER     Model provider: gemini | vertex_ai | anthropic | openai
+  --model-provider=PROVIDER     Model provider: gemini | vertex_ai | anthropic | openai | custom
                                 (default: DEFAULT_MODEL_PROVIDER, currently gemini)
   --model-default-name=NAME     Default model name for the provider
   --vertex-project-id=ID        GCP project serving Vertex AI models (default: --project-id)
@@ -451,6 +453,8 @@ Flags for AI Agents & Automation:
                                 that project is one you cannot administer, and enable
                                 the API and make the grant by hand
                                 (default: DEFAULT_VERTEX_MANAGE_SERVING_PROJECT, currently true)
+  --custom-api-base=URL         Base URL for custom OpenAI-compatible endpoint (e.g. vLLM)
+  --custom-api-key=KEY          API key for custom endpoint (default: none)
   --gemini-api-key=KEY          Gemini API Key
   --openai-api-key=KEY          OpenAI API Key
   --anthropic-api-key=KEY       Anthropic API Key
@@ -545,6 +549,8 @@ parse_args() {
       --vertex-project-id=*) PARAM_VERTEX_PROJECT_ID="${1#*=}"; shift ;;
       --vertex-location=*) PARAM_VERTEX_LOCATION="${1#*=}"; shift ;;
       --vertex-manage-serving-project=*) PARAM_VERTEX_MANAGE_SERVING_PROJECT="${1#*=}"; shift ;;
+      --custom-api-base=*) PARAM_CUSTOM_API_BASE="${1#*=}"; shift ;;
+      --custom-api-key=*) PARAM_CUSTOM_API_KEY="${1#*=}"; shift ;;
       --gemini-api-key=*) PARAM_GEMINI_API_KEY="${1#*=}"; shift ;;
       --openai-api-key=*) PARAM_OPENAI_API_KEY="${1#*=}"; shift ;;
       --anthropic-api-key=*) PARAM_ANTHROPIC_API_KEY="${1#*=}"; shift ;;
@@ -1073,9 +1079,11 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" VERTEX_PROJECT_ID "${VERTEX_PROJECT_ID:-}"
   write_env_var "$tmp" VERTEX_LOCATION "${VERTEX_LOCATION:-}"
   write_env_var "$tmp" VERTEX_MANAGE_SERVING_PROJECT "${VERTEX_MANAGE_SERVING_PROJECT:-}"
+  write_env_var "$tmp" CUSTOM_API_BASE "${CUSTOM_API_BASE:-}"
   write_secret_env_var "$tmp" GEMINI_API_KEY "${GEMINI_API_KEY:-}"
   write_secret_env_var "$tmp" OPENAI_API_KEY "${OPENAI_API_KEY:-}"
   write_secret_env_var "$tmp" ANTHROPIC_API_KEY "${ANTHROPIC_API_KEY:-}"
+  write_secret_env_var "$tmp" CUSTOM_API_KEY "${CUSTOM_API_KEY:-}"
   write_env_var "$tmp" ALLOWED_USERS "${ALLOWED_USERS:-}"
   write_env_var "$tmp" CHAT_TOPIC_NAME "${CHAT_TOPIC_NAME:-}"
   write_env_var "$tmp" CHAT_SUB_NAME "${CHAT_SUB_NAME:-}"
@@ -2424,6 +2432,8 @@ run_menu_system() {
   local model_default_name="${MODEL_DEFAULT_NAME:-$(default_model_for_provider "${MODEL_PROVIDER:-$DEFAULT_MODEL_PROVIDER}")}"
   local vertex_project_id="${VERTEX_PROJECT_ID:-$project_id}"
   local vertex_location="${VERTEX_LOCATION:-$DEFAULT_VERTEX_LOCATION}"
+  local custom_api_base="${CUSTOM_API_BASE:-$DEFAULT_CUSTOM_API_BASE}"
+  local custom_api_key="${CUSTOM_API_KEY:-$DEFAULT_CUSTOM_API_KEY}"
   local gemini_api_key="${GEMINI_API_KEY:-}"
   local openai_api_key="${OPENAI_API_KEY:-}"
   local anthropic_api_key="${ANTHROPIC_API_KEY:-}"
@@ -2466,7 +2476,7 @@ run_menu_system() {
     echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${cluster_name:-Not Set} (${region:-$DEFAULT_REGION})"
     echo -e "  • ${C_CYAN}Hermes Web UI (Port 9119):${C_RESET} $([ "$enable_webui" = "true" ] && echo -e "${C_GREEN}ENABLED${C_RESET}" || echo -e "${C_YELLOW}DISABLED${C_RESET}")"
     echo -e "  • ${C_CYAN}Chat Integrations:${C_RESET} Google Chat: $([ "$google_chat_enabled" = "true" ] && echo -e "${C_GREEN}ON${C_RESET}" || echo "OFF"), Slack: $([ "$slack_enabled" = "true" ] && echo -e "${C_GREEN}ON${C_RESET}" || echo "OFF")"
-    echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})$([ "$model_provider" = "vertex_ai" ] && echo " @ ${vertex_project_id}/${vertex_location}" || echo "")"
+    echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})$([ "$model_provider" = "vertex_ai" ] && echo " @ ${vertex_project_id}/${vertex_location}" || echo "")$([ "$model_provider" = "custom" ] && echo " @ ${custom_api_base}" || echo "")"
     echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
     echo -e "  • ${C_CYAN}Runtime Isolation:${C_RESET} $([ "$enable_gvisor" = "true" ] && echo -e "${C_GREEN}gVisor Sandbox${C_RESET}" || echo "Standard")"
 
@@ -2474,7 +2484,7 @@ run_menu_system() {
     prompt_menu "Select configuration task:" \
       "🌐 Toggle Hermes Web UI (Port 9119 Dashboard)" \
       "💬 Manage Chat & Messaging Integrations (Google Chat / Slack)" \
-      "🔑 Manage AI Model Provider & Credentials (Gemini / Vertex / OpenAI)" \
+      "🔑 Manage AI Model Provider & Credentials (Gemini / Vertex / OpenAI / Custom)" \
       "🛡️ Modify Security & Permission Boundaries (gVisor / SRE vs Read-Only)" \
       "🗄️ Manage GitOps Repository & GitHub Auth (${DEFAULT_GITOPS_REPO})" \
       "🚀 Save & Apply Configuration Changes (~15s update)" \
@@ -2521,6 +2531,7 @@ run_menu_system() {
           "Google Vertex AI / Model Garden (no API key — Workload Identity)" \
           "OpenAI ($(default_model_for_provider openai))" \
           "Anthropic ($(default_model_for_provider anthropic))" \
+          "Custom OpenAI-Compatible Endpoint (Private / Air-Gapped; e.g. self-hosted Gemma 4-27B/31B)" \
           m_opt
         case "$m_opt" in
           1)
@@ -2549,6 +2560,13 @@ run_menu_system() {
             model_provider="anthropic"
             model_default_name="$(default_model_for_provider anthropic)"
             prompt_read "Anthropic API Key" anthropic_api_key "$anthropic_api_key" true
+            ;;
+          5)
+            model_provider="custom"
+            model_default_name="$(default_model_for_provider custom)"
+            prompt_read "Custom Model Name (e.g. google/gemma-4-27B-it or google/gemma-4-31B-it)" model_default_name "$model_default_name"
+            prompt_read "Custom API Base URL" custom_api_base "${custom_api_base:-http://vllm-gemma.kubeagents-system.svc.cluster.local:8000/v1}"
+            prompt_read "Custom API Key (or 'none' if unauthenticated)" custom_api_key "${custom_api_key:-none}" true
             ;;
         esac
         ;;
@@ -2582,6 +2600,7 @@ run_menu_system() {
         verify_local_source_ref "$repo_dir" "$image_tag"
         export PARAM_PROJECT_ID="$project_id" PARAM_CLUSTER_NAME="$cluster_name" PARAM_REGION="$region"
         export PARAM_ENABLE_WEBUI="$enable_webui" PARAM_MODEL_PROVIDER="$model_provider"
+        export PARAM_CUSTOM_API_BASE="$custom_api_base" PARAM_CUSTOM_API_KEY="$custom_api_key"
         export PARAM_PERMISSION_SET="$permission_set" PARAM_ENABLE_GVISOR="$enable_gvisor"
         export GOOGLE_CHAT_ENABLED="$google_chat_enabled" SLACK_ENABLED="$slack_enabled"
 
@@ -2601,9 +2620,11 @@ run_menu_system() {
         save_env_var VERTEX_PROJECT_ID "$vertex_project_id"
         save_env_var VERTEX_LOCATION "$vertex_location"
         save_env_var VERTEX_MANAGE_SERVING_PROJECT "${VERTEX_MANAGE_SERVING_PROJECT:-$DEFAULT_VERTEX_MANAGE_SERVING_PROJECT}"
+        save_env_var CUSTOM_API_BASE "$custom_api_base"
         save_secret_env_var GEMINI_API_KEY "$gemini_api_key"
         save_secret_env_var OPENAI_API_KEY "$openai_api_key"
         save_secret_env_var ANTHROPIC_API_KEY "$anthropic_api_key"
+        save_secret_env_var CUSTOM_API_KEY "$custom_api_key"
         save_env_var ALLOWED_USERS "$allowed_users"
         save_env_var CHAT_TOPIC_NAME "$chat_topic_name"
         save_env_var CHAT_SUB_NAME "$chat_sub_name"
@@ -3055,7 +3076,7 @@ main() {
   print_step "7. AI Model Provider Credentials"
   local model_provider="$PARAM_MODEL_PROVIDER"
   if ! is_valid_model_provider "$model_provider"; then
-    print_error "Unsupported model provider '$model_provider'. Use gemini, vertex_ai, anthropic, or openai."
+    print_error "Unsupported model provider '$model_provider'. Use gemini, vertex_ai, anthropic, openai, or custom."
     exit 1
   fi
   local model_default_name="${PARAM_MODEL_DEFAULT_NAME:-${MODEL_DEFAULT_NAME:-}}"
@@ -3086,6 +3107,8 @@ main() {
   local gemini_api_key="${detected_gemini_key:-}"
   local openai_api_key="${PARAM_OPENAI_API_KEY:-}"
   local anthropic_api_key="${PARAM_ANTHROPIC_API_KEY:-}"
+  local custom_api_base="${PARAM_CUSTOM_API_BASE:-${CUSTOM_API_BASE:-$DEFAULT_CUSTOM_API_BASE}}"
+  local custom_api_key="${PARAM_CUSTOM_API_KEY:-${CUSTOM_API_KEY:-$DEFAULT_CUSTOM_API_KEY}}"
 
   if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
     # Pre-set to the provider already configured, so pressing enter keeps it.
@@ -3097,12 +3120,14 @@ main() {
       vertex_ai) model_choice="2" ;;
       openai) model_choice="3" ;;
       anthropic) model_choice="4" ;;
+      custom) model_choice="5" ;;
     esac
     prompt_menu "Select Model Provider for the Platform Agent:" \
       "Google Gemini (Recommended: $(default_model_for_provider gemini) / Gemini API)" \
       "Google Vertex AI / Model Garden (no API key — Workload Identity)" \
       "OpenAI ($(default_model_for_provider openai) / OpenAI API)" \
       "Anthropic ($(default_model_for_provider anthropic) / Anthropic API)" \
+      "Custom OpenAI-Compatible Endpoint (Private / Air-Gapped; e.g. self-hosted Gemma 4-27B/31B)" \
       model_choice
 
     # A model the install already pins survives a re-run that leaves the
@@ -3149,6 +3174,15 @@ main() {
         fi
         prompt_read "Anthropic API Key" anthropic_api_key "${ANTHROPIC_API_KEY:-}" true
         ;;
+      5)
+        model_provider="custom"
+        if [ "$model_provider_was" != "custom" ] || [ -z "$model_name_was" ]; then
+          model_default_name="$(default_model_for_provider custom)"
+        fi
+        prompt_read "Custom Model Name (e.g. google/gemma-4-27B-it or google/gemma-4-31B-it)" model_default_name "$model_default_name"
+        prompt_read "Custom API Base URL" custom_api_base "${custom_api_base:-http://vllm-gemma.kubeagents-system.svc.cluster.local:8000/v1}"
+        prompt_read "Custom API Key (or 'none' if unauthenticated)" custom_api_key "${custom_api_key:-none}" true
+        ;;
     esac
   fi
 
@@ -3182,6 +3216,10 @@ main() {
       ;;
     anthropic)
       [ -n "$anthropic_api_key" ] || print_warning "No Anthropic API key was provided; the agent will require a credential update before model calls can succeed."
+      ;;
+    custom)
+      [ -n "$custom_api_base" ] || print_warning "No custom API base URL provided; the agent requires an accessible OpenAI-compatible endpoint."
+      print_info "Using OpenAI-compatible endpoint: ${custom_api_base} with model ${model_default_name}"
       ;;
   esac
 
@@ -3540,6 +3578,8 @@ main() {
   export GEMINI_API_KEY="$gemini_api_key"
   export OPENAI_API_KEY="$openai_api_key"
   export ANTHROPIC_API_KEY="$anthropic_api_key"
+  export CUSTOM_API_BASE="$custom_api_base"
+  export CUSTOM_API_KEY="$custom_api_key"
   export ALLOWED_USERS="$allowed_users"
   export CHAT_TOPIC_NAME="$chat_topic_name"
   export CHAT_SUB_NAME="$chat_sub_name"
@@ -3628,6 +3668,8 @@ main() {
   echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
   if [ "$model_provider" = "vertex_ai" ]; then
     echo -e "  • ${C_CYAN}Vertex AI Endpoint:${C_RESET} projects/${vertex_project_id}/locations/${vertex_location}"
+  elif [ "$model_provider" = "custom" ]; then
+    echo -e "  • ${C_CYAN}Custom API Base:${C_RESET} ${custom_api_base}"
   fi
   echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
   echo -e "  • ${C_CYAN}Long-Term Memory:${C_RESET} ${memory_mode}"

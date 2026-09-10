@@ -44,12 +44,13 @@ Two things have to name that alias, not one. The profile config covers Chat, whi
 
 The two substituted values come from the install (`MODEL_PROVIDER` and `MODEL_DEFAULT_NAME`, saved in `install.env` and carried into the chart values). Supported providers and their shipping defaults:
 
-| `MODEL_PROVIDER`   | Default `MODEL_DEFAULT_NAME` | Notes                                      |
-| ------------------ | ---------------------------- | ------------------------------------------ |
-| `gemini` (default) | `gemini-3.5-flash`           | Uses `GEMINI_API_KEY`.                     |
-| `anthropic`        | `claude-opus-5`              | Uses `ANTHROPIC_API_KEY`.                  |
-| `openai`           | `gpt-5.4`                    | Uses `OPENAI_API_KEY`.                     |
-| `vertex_ai`        | `gemini-3.5-flash`           | No API key — Workload Identity. See below. |
+| `MODEL_PROVIDER`   | Default `MODEL_DEFAULT_NAME` | Notes                                                                          |
+| ------------------ | ---------------------------- | ------------------------------------------------------------------------------ |
+| `gemini` (default) | `gemini-3.5-flash`           | Uses `GEMINI_API_KEY`.                                                         |
+| `anthropic`        | `claude-opus-5`              | Uses `ANTHROPIC_API_KEY`.                                                      |
+| `openai`           | `gpt-5.4`                    | Uses `OPENAI_API_KEY`.                                                         |
+| `vertex_ai`        | `gemini-3.5-flash`           | No API key — Workload Identity. See below.                                     |
+| `custom`           | `google/gemma-4-27B-it`      | Generic OpenAI-compatible endpoint (`CUSTOM_API_BASE`, e.g. self-hosted vLLM). |
 
 Any model string the chosen provider accepts is valid — there is no allow-list in the harness. For example, [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) pins `gemini-3.1-flash-lite`.
 
@@ -116,9 +117,37 @@ A re-run against an existing install reconciles the switch in one `terraform app
 
 ### What ships
 
-- [`examples/vllm-gemma/`](https://github.com/gke-labs/kube-agents/tree/main/examples/vllm-gemma) — Gemma via GKE's official inference tutorial. Requires an accelerator node pool (see `gke-compute-classes` skill).
+- [`examples/vllm-gemma/`](https://github.com/gke-labs/kube-agents/tree/main/examples/vllm-gemma) — standalone reference recipe for Gemma 4 (27B or 31B) served via vLLM on GKE.
 
-vLLM speaks OpenAI-compatible Completions, so LiteLLM can be layered on top (or in front) for routing and observability.
+vLLM speaks OpenAI-compatible Completions, so LiteLLM can be layered in front using `MODEL_PROVIDER=custom` and `CUSTOM_API_BASE=http://vllm-gemma.kubeagents-system.svc.cluster.local:8000/v1` for routing and observability.
+
+### Hardware requirements & GPU selection
+
+Gemma 4 model architecture and modern vLLM attention kernels (e.g. FlashInfer) require hardware-accelerated `bfloat16` and allocate >99 KB of shared memory per Streaming Multiprocessor (SM). NVIDIA Tesla T4 (Turing `sm_75`) hardware caps SM shared memory at 64 KB and lacks native bfloat16 (emulating in FP32), causing kernel compilation failures (`CUDA error: out of shared memory`). Ada Lovelace (L4, 100 KB SRAM) or Ampere (A100, 164 KB SRAM) GPUs are required.
+
+- **NVIDIA L4 (24 GB)**: Deploy with 2x L4 (`g2-standard-24`, 48 GB total VRAM) for FP8/AWQ quantization, or 4x L4 (`g2-standard-48`, 96 GB total VRAM) for native `bfloat16` (`--tensor-parallel-size=2` or `4`).
+- **NVIDIA A100 (80 GB)**: 1x or 2x A100 (`a2-ultragpu-1g` / `a2-highgpu-2g`) for native `bfloat16`.
+
+### Node pool provisioning
+
+On GKE Standard, create an L4 accelerator node pool:
+
+```bash
+gcloud container node-pools create l4-inference-pool \
+  --cluster=<CLUSTER_NAME> \
+  --region=<REGION> \
+  --machine-type=g2-standard-24 \
+  --accelerator=type=nvidia-l4,count=2,gpu-driver-version=DEFAULT \
+  --node-taints=nvidia.com/gpu=present:NoSchedule
+```
+
+To delete the pool:
+
+```bash
+gcloud container node-pools delete l4-inference-pool \
+  --cluster=<CLUSTER_NAME> \
+  --region=<REGION> --quiet
+```
 
 ## Inference replay
 

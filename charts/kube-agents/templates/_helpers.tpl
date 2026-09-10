@@ -284,13 +284,31 @@ Takes a dict of provider, model, callbacks.
 model_list:
   - model_name: model-default
     litellm_params:
+      {{- if eq .provider "custom" }}
+      model: {{ printf "openai/%s" .model }}
+      api_base: {{ .apiBase }}
+      api_key: {{ .apiKey | default "none" }}
+      {{- else }}
       model: {{ printf "%s/%s" .provider .model }}
+      {{- end }}
   - model_name: hermes-agent
     litellm_params:
+      {{- if eq .provider "custom" }}
+      model: {{ printf "openai/%s" .model }}
+      api_base: {{ .apiBase }}
+      api_key: {{ .apiKey | default "none" }}
+      {{- else }}
       model: {{ printf "%s/%s" .provider .model }}
+      {{- end }}
   - model_name: {{ .model }}
     litellm_params:
+      {{- if eq .provider "custom" }}
+      model: {{ printf "openai/%s" .model }}
+      api_base: {{ .apiBase }}
+      api_key: {{ .apiKey | default "none" }}
+      {{- else }}
       model: {{ printf "%s/%s" .provider .model }}
+      {{- end }}
 litellm_settings:
   callbacks: {{ .callbacks }}
 {{- /*

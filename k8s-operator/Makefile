@@ -193,6 +193,7 @@ export HINDSIGHT_POSTGRES_IMAGE
 
 LITELLM_VARS = $$NAMESPACE $$MODEL_PROVIDER $$MODEL_DEFAULT_NAME $$LITELLM_IMAGE
 LITELLM_VERTEX_VARS = $(LITELLM_VARS) $$PROJECT_ID $$LITELLM_KSA_NAME $$LITELLM_GSA_NAME $$VERTEX_PROJECT_ID $$VERTEX_LOCATION
+LITELLM_CUSTOM_VARS = $(LITELLM_VARS) $$CUSTOM_API_BASE $$CUSTOM_API_KEY
 # Hindsight's manifests need no other substitution: the namespace comes from
 # `kubectl apply -n`, and every in-cluster address is a short service name.
 HINDSIGHT_VARS = $$HINDSIGHT_API_IMAGE $$HINDSIGHT_POSTGRES_IMAGE
@@ -202,6 +203,11 @@ deploy-litellm: kustomize ## Deploy LiteLLM integration.
 	$(call require-var,LITELLM_IMAGE,images.json)
 	@if [ "$$MODEL_PROVIDER" = "vertex_ai" ]; then \
 		$(KUSTOMIZE) build config/integrations/litellm/overlays/vertex_ai | envsubst '$(LITELLM_VERTEX_VARS)' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -; \
+	elif [ "$$MODEL_PROVIDER" = "custom" ] || [ "$$MODEL_PROVIDER" = "openai_compatible" ]; then \
+		export MODEL_DEFAULT_NAME="$${MODEL_DEFAULT_NAME:-custom-model}"; \
+		export CUSTOM_API_BASE="$${CUSTOM_API_BASE:-http://vllm-gemma:8000/v1}"; \
+		export CUSTOM_API_KEY="$${CUSTOM_API_KEY:-none}"; \
+		$(KUSTOMIZE) build config/integrations/litellm/overlays/custom | envsubst '$(LITELLM_CUSTOM_VARS)' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -; \
 	else \
 		$(KUSTOMIZE) build config/integrations/litellm/base | envsubst '$(LITELLM_VARS)' | kubectl apply -n $${NAMESPACE:-kubeagents-system} -f -; \
 	fi
@@ -210,6 +216,11 @@ deploy-litellm: kustomize ## Deploy LiteLLM integration.
 undeploy-litellm: kustomize ## Undeploy LiteLLM integration.
 	@if [ "$$MODEL_PROVIDER" = "vertex_ai" ]; then \
 		$(KUSTOMIZE) build config/integrations/litellm/overlays/vertex_ai | envsubst '$(LITELLM_VERTEX_VARS)' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -; \
+	elif [ "$$MODEL_PROVIDER" = "custom" ] || [ "$$MODEL_PROVIDER" = "openai_compatible" ]; then \
+		export MODEL_DEFAULT_NAME="$${MODEL_DEFAULT_NAME:-custom-model}"; \
+		export CUSTOM_API_BASE="$${CUSTOM_API_BASE:-http://vllm-gemma:8000/v1}"; \
+		export CUSTOM_API_KEY="$${CUSTOM_API_KEY:-none}"; \
+		$(KUSTOMIZE) build config/integrations/litellm/overlays/custom | envsubst '$(LITELLM_CUSTOM_VARS)' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -; \
 	else \
 		$(KUSTOMIZE) build config/integrations/litellm/base | envsubst '$(LITELLM_VARS)' | kubectl delete --ignore-not-found=$(ignore-not-found) -n $${NAMESPACE:-kubeagents-system} -f -; \
 	fi

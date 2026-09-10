@@ -21,31 +21,30 @@ spec:
     metadata:
       labels:
         app: gemma-server
-        ai.gke.io/model: gemma-4-e2b-it
+        ai.gke.io/model: gemma-4-27b-it
         ai.gke.io/inference-server: vllm
         examples.ai.gke.io/source: user-guide
     spec:
       containers:
         - name: inference-server
-          image: us-docker.pkg.dev/vertex-ai/vertex-vision-model-garden-dockers/pytorch-vllm-serve:gemma4
+          image: us-docker.pkg.dev/vertex-ai/vertex-vision-model-garden-dockers/pytorch-vllm-serve:gemma4@sha256:3fbc0e08c46e7736145c9effbcc8839682c80b15b413335146f4428fc3523c8a
           resources:
             requests:
-              cpu: "2"
-              memory: "10Gi"
-              ephemeral-storage: "10Gi"
-              nvidia.com/gpu: "1"
+              cpu: "4"
+              memory: "24Gi"
+              ephemeral-storage: "30Gi"
+              nvidia.com/gpu: "2"
             limits:
-              cpu: "2"
-              memory: "10Gi"
-              ephemeral-storage: "10Gi"
-              nvidia.com/gpu: "1"
-          command: ["python3", "-m", "vllm.entrypoints.api_server"]
+              cpu: "8"
+              memory: "48Gi"
+              ephemeral-storage: "50Gi"
+              nvidia.com/gpu: "2"
+          command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]
           args:
             - --model=$(MODEL_ID)
             - --host=0.0.0.0
             - --port=8000
-            - --tensor-parallel-size=1
-            - --enable-log-requests
+            - --tensor-parallel-size=2
             - --enable-chunked-prefill
             - --enable-prefix-caching
             - --enable-auto-tool-choice
@@ -56,16 +55,20 @@ spec:
             - --max-model-len=32768
             - --gpu-memory-utilization=0.95
             - --reasoning-parser=gemma4
-            - --trust-remote-code
             - --otlp-traces-endpoint=opentelemetry-collector.gke-managed-otel.svc.cluster.local:4317
           env:
             - name: LD_LIBRARY_PATH
-              value: ${LD_LIBRARY_PATH}:/usr/local/nvidia/lib64
+              value: /usr/local/nvidia/lib64
             - name: MODEL_ID
-              value: google/gemma-4-E2B-it
+              value: google/gemma-4-27B-it
             - name: OTEL_SERVICE_NAME
               value: vllm-gemma
 
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           # /health is vLLM's own endpoint and answers only once the model is
           # resident on the GPU. That is the whole point here: pulling and
           # loading Gemma takes minutes, and without a readinessProbe the
@@ -90,12 +93,18 @@ spec:
           volumeMounts:
             - mountPath: /dev/shm
               name: dshm
+      terminationGracePeriodSeconds: 60
       volumes:
         - name: dshm
           emptyDir:
             medium: Memory
+            sizeLimit: 16Gi
+        # For offline / air-gapped deployments with pre-staged weights on a PVC:
+        # - name: model-weights
+        #   persistentVolumeClaim:
+        #     claimName: gemma4-weights-pvc
       nodeSelector:
-        cloud.google.com/gke-accelerator: nvidia-rtx-pro-6000
+        cloud.google.com/gke-accelerator: nvidia-l4
         cloud.google.com/gke-gpu-driver-version: latest
 ---
 apiVersion: policy/v1

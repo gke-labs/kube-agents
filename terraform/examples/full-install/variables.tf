@@ -202,13 +202,13 @@ variable "third_party_image_registry" {
 }
 
 variable "model_provider" {
-  description = "Model provider the LiteLLM gateway routes model-default to (gemini, anthropic, openai, or vertex_ai). Set the matching *_api_key variable; vertex_ai takes no key and authenticates with Workload Identity instead."
+  description = "Model provider the LiteLLM gateway routes model-default to (gemini, anthropic, openai, vertex_ai, or custom). Set the matching *_api_key variable; vertex_ai takes no key and authenticates with Workload Identity instead; custom routes to custom_api_base."
   type        = string
   default     = "gemini"
 
   validation {
-    condition     = contains(["gemini", "anthropic", "openai", "vertex_ai"], var.model_provider)
-    error_message = "model_provider must be one of gemini, anthropic, openai, or vertex_ai."
+    condition     = contains(["gemini", "anthropic", "openai", "vertex_ai", "custom"], var.model_provider)
+    error_message = "model_provider must be one of gemini, anthropic, openai, vertex_ai, or custom."
   }
 }
 
@@ -265,6 +265,19 @@ variable "gemini_api_key" {
 
 variable "openai_api_key" {
   description = "OPENAI_API_KEY model-provider credential (optional; omitted from the Secret when empty)"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+
+variable "custom_api_base" {
+  description = "Base URL of the OpenAI-compatible endpoint when model_provider = \"custom\" (e.g. http://vllm-gemma.kubeagents-system.svc.cluster.local:8000/v1)."
+  type        = string
+  default     = ""
+}
+
+variable "custom_api_key" {
+  description = "CUSTOM_API_KEY model-provider credential when model_provider = \"custom\" (optional; defaults to \"none\" if unauthenticated)"
   type        = string
   sensitive   = true
   default     = ""

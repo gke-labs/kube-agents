@@ -349,11 +349,11 @@ init_var_kms_location() {
 }
 
 init_var_model_provider() {
-  init_var "MODEL_PROVIDER" "$DEFAULT_MODEL_PROVIDER" "Enter Model Provider (gemini, vertex_ai, anthropic, openai)"
+  init_var "MODEL_PROVIDER" "$DEFAULT_MODEL_PROVIDER" "Enter Model Provider (gemini, vertex_ai, anthropic, openai, custom)"
 
   MODEL_PROVIDER=$(echo "$MODEL_PROVIDER" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
   if ! is_valid_model_provider "$MODEL_PROVIDER"; then
-    print_error "Invalid Model Provider '$MODEL_PROVIDER'. Must be one of: gemini, vertex_ai, anthropic, openai."
+    print_error "Invalid Model Provider '$MODEL_PROVIDER'. Must be one of: gemini, vertex_ai, anthropic, openai, custom."
     exit 1
   fi
 
@@ -368,6 +368,9 @@ init_var_model_provider() {
   if [ "$MODEL_PROVIDER" = "vertex_ai" ]; then
     init_var "VERTEX_PROJECT_ID" "${PROJECT_ID:-}" "Enter Vertex AI Project ID"
     init_var "VERTEX_LOCATION" "$DEFAULT_VERTEX_LOCATION" "Enter Vertex AI Location"
+  elif [ "$MODEL_PROVIDER" = "custom" ]; then
+    init_var "CUSTOM_API_BASE" "${DEFAULT_CUSTOM_API_BASE:-http://vllm-gemma.kubeagents-system.svc.cluster.local:8000/v1}" "Enter Custom OpenAI-Compatible API Base URL"
+    init_var "CUSTOM_API_KEY" "${DEFAULT_CUSTOM_API_KEY:-none}" "Enter Custom API Key (or 'none' if unauthenticated)"
   fi
 }
 

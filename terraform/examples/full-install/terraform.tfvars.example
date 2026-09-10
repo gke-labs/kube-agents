@@ -96,6 +96,12 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # API and grant the gateway's service account roles/aiplatform.user by hand.
 # vertex_manage_serving_project = true
 
+# Custom OpenAI-compatible endpoint (e.g. self-hosted Gemma 4-27B/31B on vLLM, air-gapped / disconnected):
+# model_provider     = "custom"
+# model_default_name = "google/gemma-4-27B-it"
+# custom_api_base    = "http://vllm-gemma.kubeagents-system.svc.cluster.local:8000/v1"
+# custom_api_key     = "none"
+
 
 # Optional GitHub integration and token minter backend (GSA + KMS signing key).
 # enable_github_minter = true

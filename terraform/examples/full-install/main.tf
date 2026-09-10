@@ -99,6 +99,7 @@ locals {
       ANTHROPIC_API_KEY       = var.anthropic_api_key
       GEMINI_API_KEY          = var.gemini_api_key
       OPENAI_API_KEY          = var.openai_api_key
+      CUSTOM_API_KEY          = var.custom_api_key
     } : key => value if value != ""
   }
 
@@ -548,6 +549,11 @@ resource "helm_release" "kube_agents" {
           }
           projectId = local.vertex_project
           location  = local.vertex_location
+        }
+      } : {},
+      var.model_provider == "custom" ? {
+        custom = {
+          apiBase = var.custom_api_base
         }
       } : {}
     )
