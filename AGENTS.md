@@ -12,7 +12,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
   - `cluster/`: The Cluster Agent profile _template_ (persona, scoped config, and runtime-debugging skills). The Platform Agent scaffolds this into per-cluster Hermes profiles at runtime; it is not deployed directly.
   - `contributor/`: The contributor-agent protocol: the claim/PR/review/escalation loop for external bots (e.g. Kyber, Codebot Robot) coordinating over GitHub alone. Not a runtime blueprint; not shipped in the images.
 - `.agents/skills/`: Repository-level skills, not shipped in the agent images — review skills (adversarial change review, security audits, docs-drift, skill quality) run against pull requests and clusters, with `review-preflight` running the pre-PR set of them in a context that did not write the change, plus the `install-kube-agents`/`uninstall-kube-agents`/`upgrade-kube-agents` lifecycle skills that drive the repository's installer scripts.
-- `.agents/rules/`: Repository-level rules an agent follows, one file per family and none shipped in the agent images — `core_engineering.md` for the code itself, `github_actions.md` for workflow authoring, `pre_pr_review.md` for the mechanics of the two pre-PR passes. This file states each rule and links there for the form it takes; the split keeps `AGENTS.md` inside the context budget `scripts/check_context_budget.py` enforces.
+- `.agents/rules/`: Repository-level rules an agent follows, one file per family: the code (`core_engineering.md`), workflows (`github_actions.md`), the pre-PR passes (`pre_pr_review.md`), eval-driven development (`eval_driven_development.md`). This file states each rule and links there; the split keeps `AGENTS.md` inside the budget `scripts/check_context_budget.py` enforces.
 - `a2a/`: Go module for the agent-to-agent bus — wire-protocol library and `a2a` topics CLI per `docs/designs/spec-a2a-payloads.md`, plus agent profiles. Nothing imports it yet.
 - `charts/`: Canonical Helm charts (`kube-agents`) for deploying the Kube-Agents operator and profiles.
 - `terraform/`: Companion reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `chat-pubsub`, `github-minter`, `gke-backup-plan`, `drift-pubsub`) for infrastructure provisioning, plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top. `drift-pubsub` is not yet part of that composition.
@@ -48,10 +48,11 @@ did not expect, or nowhere at all, and the suite reports green around it.
   One carve-out: **security and permissions invariants** go in `tests/conformance/`, whose own
   README is the contract.
 - **Yes, and you plant the defect it has to find** — it is an eval, it belongs in
-  `bench/tasks/<name>/task.yaml`, and it runs in the Prow presubmit, so adding one changes what
-  every pull request reports. [`docs/designs/bench-case-format.md`](docs/designs/bench-case-format.md)
-  is the contract for what that file must carry; `make bench-case-check` checks it locally
-  and `scripts/test_task_registration.py` gates it.
+  `bench/tasks/<name>/task.yaml`, and it runs in CI, so adding one changes what every pull
+  request or nightly reports. [`docs/designs/bench-case-format.md`](docs/designs/bench-case-format.md)
+  is the contract; `make bench-case-check` checks it, `scripts/test_task_registration.py` gates it.
+  **A change to agent behaviour starts from one:** red locally, implement, green three times,
+  registered in the nightly — [`.agents/rules/eval_driven_development.md`](.agents/rules/eval_driven_development.md).
 - **Yes, and it checks an install you already have** — it is a critical user journey, and it goes in
   `bench/cuj/`. **This tier is manual by design**, not pending automation: it needs a real
   deployment to point at and CI has none, so no job runs it and adding one changes nothing about
@@ -154,10 +155,8 @@ the assignee is the claim; do not apply `status:` labels to issues in this repos
 
 ## Engineering Rules
 
-Rules an agent follows live in [`.agents/rules/`](.agents/rules/), one file per family — the code
-itself here, [workflow authoring](.agents/rules/github_actions.md) and
-[the pre-PR passes](.agents/rules/pre_pr_review.md) under Pull Request Hygiene below. Read the file
-that covers what you are writing before you write it.
+Rules live in [`.agents/rules/`](.agents/rules/), one file per family (listed under Repository
+Layout). Read the file that covers what you are writing before you write it.
 
 - **No magic constants.** Every hardcoded value — number, string, duration, path, limit — gets a
   name declared at the top of the file, after the imports and before the first function. It binds
@@ -184,7 +183,7 @@ adding a paragraph, check whether the topic already has an owner:
 | The commands behind this file's pull-request rules       | `docs/pull-request-workflow.md`              |
 | What the agent is and is not permitted to do             | the site's `reference/security-and-iam.md`   |
 | How to develop a specific directory                      | that directory's `README.md` (keep it short) |
-| Rules an agent follows, by family (code, CI, pre-PR)     | `.agents/rules/`                             |
+| Rules an agent follows, by family (code, CI, pre-PR, evals) | `.agents/rules/`                          |
 
 Rules:
 

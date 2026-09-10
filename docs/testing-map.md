@@ -25,7 +25,7 @@ Some of those rows carry a footnote that matters more than the row.
 **`bench/tasks/` and `bench/cuj/` both drive an agent, and they are the two most confusable rows.**
 The difference is who supplies the failure and who owns the environment.
 
-A `bench/tasks/` case is an **eval, and it runs in the Prow presubmit**. It plants a defect and the
+A `bench/tasks/` case is an **eval, and it runs in CI**, in the Prow presubmit or the nightly tier. It plants a defect and the
 run owns the environment the defect sits in: the case's `infrastructure.deployer` decides where,
 with `tofu` provisioning a stack for the run and tearing it down after, and `noop` grading against
 the cluster the deploy already stood up. The agent is pointed at it and its diagnosis is graded

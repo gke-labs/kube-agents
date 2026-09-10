@@ -34,6 +34,19 @@ file matters.
 
 -
 
+### Eval evidence
+
+<!--
+Required when the change alters what an agent does (prompt, SOP, skill, tool, runtime path, or a
+fix for agent behaviour): the case id; the red run against `main` (install, failing check and
+reason, one line of the agent's report); the three green runs against this branch; where the case
+is registered. Exempt changes (docs, CI, pool/fleet/Prow infrastructure, the bench harness under
+`bench/kube_agents_bench/`) say so in one line. An empty section is not an answer, and neither is
+"no cluster": every contributor has a dev project. Mechanics: .agents/rules/eval_driven_development.md
+-->
+
+-
+
 ### Live validation
 
 <!--

@@ -39,7 +39,7 @@ PLATFORM_AGENT_TOKEN=$(kubectl get secret platform-agent-secrets -n <namespace> 
   uv run devops-bench ./tasks --no-infra --agent-type kubeagents
 ```
 
-This is the stock `devops-bench` CLI — there is no wrapper command. `source` is positional. Drop `--no-infra` for tasks that provision infrastructure, and see `--help` for the rest.
+This is the stock `devops-bench` CLI — there is no wrapper command. `source` is positional. `--no-infra` is a smoke of the agent path only: it skips the deterministic checks, so the run can neither pass nor fail the gate. To grade a case the way the presubmit does, drop the flag and export what `hack/ci-eval-pr.sh` exports (`PROJECT_ID`, `CLUSTER_NAME`, `AGENT_CLUSTER_CONTEXT`, `BENCH_TF_ROOT=./tf`, and `BENCH_FLEET_KUBECONFIG_DIR` from `hack/fleet-kubeconfigs.sh` for a case with `fixtures:`); [`.agents/rules/eval_driven_development.md`](../.agents/rules/eval_driven_development.md) is the loop that uses it. See `--help` for the rest.
 
 ## The gate
 
