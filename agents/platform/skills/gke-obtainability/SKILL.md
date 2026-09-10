@@ -27,7 +27,9 @@ manifest, opens a Pull Request, or mutates cloud or Kubernetes state.
 ## How to use it
 
 Loaded from a design, planning, or capacity-check request — for example the
-[gke-cluster-creation](../gke-cluster-creation/SKILL.md) preflight:
+[gke-cluster-creation](../gke-cluster-creation/SKILL.md) preflight.
+
+### Run the checks
 
 - Run every check under **Diagnostics** below: quota, reservations, usage,
   and capacity advice.
@@ -45,109 +47,121 @@ Loaded from a design, planning, or capacity-check request — for example the
   the word "guarantee" about capacity, allocations, or scheduling anywhere
   in the report** — not even for reservations or ProvisioningRequests;
   write "reserves", "holds", or "provides once scheduled" instead.
-- **Record what you executed as typed evidence** with the `record_evidence`
-  tool — one record per check, built from the real command output, never
-  from memory:
-  - after the quota check: `type: quota_check` with the metric, limit,
-    usage, and whether the request fits in `analysis`;
-  - after the capacity advice calls: `type: advice_service_capacity` with
-    `api_method: compute.beta.AdviceService.Capacity`. Use **exactly** these
-    key names and shapes for `request` and `analysis` — do not rename keys,
-    do not replace object entries with bare strings, fill the values from
-    the real responses (probe at least two zones, with per-zone queries if
-    one call returns fewer):
 
-    ```json
-    {
-      "request": {
-        "region": "us-central1",
-        "acceleratorType": "nvidia-a100",
-        "acceleratorCount": 32
-      },
-      "analysis": {
-        "availableQuantity": 32,
-        "zones": [
-          {"zone": "us-central1-f", "obtainability": 0.9},
-          {"zone": "us-central1-a", "obtainability": 0.5}
-        ],
-        "provisioningModels": {
-          "SPOT": {"obtainability": 0.9, "zone": "us-central1-f"},
-          "FLEX_START": {"status": "probed", "notes": "..."},
-          "ON_DEMAND": {"source": "quota+reservations", "notes": "..."}
-        }
-      }
+### Record what you executed as typed evidence
+
+Use the `record_evidence` tool — one record per check, built from the real
+command output, never from memory:
+
+- after the quota check: `type: quota_check` with the metric, limit, usage,
+  and whether the request fits in `analysis`;
+- after the capacity advice calls: `type: advice_service_capacity` with
+  `api_method: compute.beta.AdviceService.Capacity`, shaped exactly as below;
+- after a server-side dry run of a generated ComputeClass
+  (`kubectl apply --dry-run=server`): `type: computeclass_server_dry_run`.
+
+For `advice_service_capacity`, use **exactly** these key names and shapes for
+`request` and `analysis` — do not rename keys, do not replace object entries
+with bare strings, fill the values from the real responses (probe at least two
+zones, with per-zone queries if one call returns fewer):
+
+```json
+{
+  "request": {
+    "region": "us-central1",
+    "acceleratorType": "nvidia-a100",
+    "acceleratorCount": 32
+  },
+  "analysis": {
+    "availableQuantity": 32,
+    "zones": [
+      {"zone": "us-central1-f", "obtainability": 0.9},
+      {"zone": "us-central1-a", "obtainability": 0.5}
+    ],
+    "provisioningModels": {
+      "SPOT": {"obtainability": 0.9, "zone": "us-central1-f"},
+      "FLEX_START": {"status": "probed", "notes": "..."},
+      "ON_DEMAND": {"source": "quota+reservations", "notes": "..."}
     }
-    ```
+  }
+}
+```
 
-  - after a server-side dry run of a generated ComputeClass
-    (`kubectl apply --dry-run=server`): `type: computeclass_server_dry_run`.
-- **Attach generated manifests as structured artifacts** with the
-  `attach_artifact` tool — the parsed object, not YAML text:
-  `type: computeclass` for a ComputeClass, `type: node_auto_provisioning`
-  for a NAP specification; use one shared `pair_id` for a design's set.
-- **Your final report must carry this section, with all three paths named**
-  — a path you analyzed but never mentioned does not exist for the reader,
-  and a probe that failed is a finding, not a gap to leave silent:
+### Attach generated manifests as structured artifacts
 
-  ```markdown
-  ## Provisioning paths
+Use the `attach_artifact` tool — the parsed object, not YAML text:
+`type: computeclass` for a ComputeClass, `type: node_auto_provisioning` for a
+NAP specification; use one shared `pair_id` for a design's set.
 
-  - **On-Demand** — <quota headroom and reservations; no advance
-    obtainability signal exists for this path>
-  - **Spot** — <obtainability score and zone, and the preemption trade-off>
-  - **Flex-Start** — <obtainability for the run duration, or, if the probe
-    failed, what failed and what you relied on instead>
-  ```
-- **Generated manifests must use the real schemas.** Do not invent API
-  versions or fields; start from these shapes and adjust values only:
+### Name all three provisioning paths in the report
 
-  A GKE ComputeClass is `cloud.google.com/v1` (never `autopilot.gke.io/*`),
-  `machineFamily` takes a family (`a2`), not a machine type, and GPU
-  fallback tiers select accelerators via `gpu.type`:
+Your final report must carry this section, with all three paths named — a
+path you analyzed but never mentioned does not exist for the reader, and a
+probe that failed is a finding, not a gap to leave silent:
 
-  ```yaml
-  apiVersion: cloud.google.com/v1
-  kind: ComputeClass
-  metadata:
-    name: <design>-cc
-  spec:
-    priorities:
-      - machineFamily: a2          # primary: the requested accelerator family
-        spot: true
-      - gpu:                       # fallback tier: smaller accelerator
-          type: nvidia-l4
-          count: 1
-      - gpu:                       # last-resort tier
-          type: nvidia-tesla-t4
-          count: 1
-    nodePoolAutoCreation:
-      enabled: true
-  ```
+```markdown
+## Provisioning paths
 
-  Call out explicitly that the L4/T4 fallback tiers change the workload's
-  GPU class and interconnect characteristics.
+- **On-Demand** — <quota headroom and reservations; no advance
+  obtainability signal exists for this path>
+- **Spot** — <obtainability score and zone, and the preemption trade-off>
+- **Flex-Start** — <obtainability for the run duration, or, if the probe
+  failed, what failed and what you relied on instead>
+```
 
-  A Node Auto-Provisioning alternative constrains machine families through
-  node affinity, and its location policy lives under `location`:
+### Generated manifests must use the real schemas
 
-  ```yaml
-  kind: NodeAutoProvisioningSpec
-  spec:
-    nodeAffinity:
-      requiredDuringSchedulingIgnoredDuringExecution:
-        nodeSelectorTerms:
-          - matchExpressions:
-              - key: cloud.google.com/machine-family
-                operator: In
-                values: [n2, n2d, c2d]
-    location:
-      locationPolicy: ANY
-  ```
+Do not invent API versions or fields; start from these shapes and adjust
+values only.
 
-- **Validate before attaching**: run `kubectl apply --dry-run=server -f` on
-  the generated ComputeClass and record the outcome with
-  `record_evidence(type: computeclass_server_dry_run)`; a manifest the API
-  server rejects is a finding, not a deliverable.
+A GKE ComputeClass is `cloud.google.com/v1` (never `autopilot.gke.io/*`),
+`machineFamily` takes a family (`a2`), not a machine type, and GPU fallback
+tiers select accelerators via `gpu.type`:
+
+```yaml
+apiVersion: cloud.google.com/v1
+kind: ComputeClass
+metadata:
+  name: <design>-cc
+spec:
+  priorities:
+    - machineFamily: a2          # primary: the requested accelerator family
+      spot: true
+    - gpu:                       # fallback tier: smaller accelerator
+        type: nvidia-l4
+        count: 1
+    - gpu:                       # last-resort tier
+        type: nvidia-tesla-t4
+        count: 1
+  nodePoolAutoCreation:
+    enabled: true
+```
+
+Call out explicitly that the L4/T4 fallback tiers change the workload's GPU
+class and interconnect characteristics.
+
+A Node Auto-Provisioning alternative constrains machine families through node
+affinity, and its location policy lives under `location`:
+
+```yaml
+kind: NodeAutoProvisioningSpec
+spec:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: cloud.google.com/machine-family
+              operator: In
+              values: [n2, n2d, c2d]
+  location:
+    locationPolicy: ANY
+```
+
+### Validate before attaching
+
+Run `kubectl apply --dry-run=server -f` on the generated ComputeClass and
+record the outcome with `record_evidence(type: computeclass_server_dry_run)`;
+a manifest the API server rejects is a finding, not a deliverable.
 
 ## Diagnostics
 
@@ -187,27 +201,30 @@ kubectl top pod -n <namespace>
 
 #### D. Spot VM Availability and Pricing Advice
 
-If configuring fallback Spot instances or diagnosing GPU stockouts, use the Spot advice APIs to check obtainability and preemption risk across target zones:
+If configuring fallback Spot instances or diagnosing GPU stockouts, use the Spot advice APIs to check obtainability and preemption risk across target zones.
 
-1. **VM & GPU Availability Advice**:
-   ```bash
-   gcloud beta compute advice capacity \
-       --provisioning-model=SPOT \
-       --instance-selection-machine-types="g2-standard-4,g2-standard-12,n1-standard-4" \
-       --target-distribution-shape=ANY \
-       --size=1 \
-       --region=us-central1 \
-       --format="json"
-   ```
-2. **Preemption Rate and Price History**:
-   ```bash
-   gcloud beta compute advice capacity-history \
-       --provisioning-model=SPOT \
-       --machine-type=g2-standard-4 \
-       --types=PREEMPTION,PRICE \
-       --region=us-central1 \
-       --format="json"
-   ```
+**VM & GPU Availability Advice**:
+
+```bash
+gcloud beta compute advice capacity \
+    --provisioning-model=SPOT \
+    --instance-selection-machine-types="g2-standard-4,g2-standard-12,n1-standard-4" \
+    --target-distribution-shape=ANY \
+    --size=1 \
+    --region=us-central1 \
+    --format="json"
+```
+
+**Preemption Rate and Price History**:
+
+```bash
+gcloud beta compute advice capacity-history \
+    --provisioning-model=SPOT \
+    --machine-type=g2-standard-4 \
+    --types=PREEMPTION,PRICE \
+    --region=us-central1 \
+    --format="json"
+```
 
 _MANDATE_: You MUST actually execute the quota check (`gcloud compute regions
 describe`), the capacity advice (`gcloud beta compute advice capacity`), and,
