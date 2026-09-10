@@ -18,6 +18,8 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
 1. [Architecture & Overview](#architecture--overview)
 2. [Prerequisites & Tooling Matrix](#prerequisites--tooling-matrix)
 3. [Method 0: Zero-Friction One-Liner Installation (Fastest)](#method-0-zero-friction-one-liner-installation-fastest)
+   - [Generate-Only Mode (Recommended for Existing Infrastructure)](#generate-only-mode-recommended-for-existing-infrastructure)
+   - [Non-Interactive & AI Agent Execution Mode](#non-interactive--ai-agent-execution-mode)
 4. [Method 1: The Install Engine — Terraform + Helm](#method-1-the-install-engine--terraform--helm)
    - [Step-by-Step Execution](#step-by-step-execution)
 5. [The Shell Sandbox](#the-shell-sandbox)
@@ -84,6 +86,39 @@ Three behaviours worth knowing before the first run:
   on — so the sandbox costs nothing there. On a Standard cluster it provisions a `gvisor-pool`
   node pool of one `e2-standard-4` per zone. Pass `--gvisor=false` to run on the standard
   container runtime.
+
+### Generate-Only Mode (Recommended for Existing Infrastructure)
+
+When deploying `kube-agents` onto **pre-existing infrastructure** (an existing GKE cluster, shared VPC, or existing GCP project), running with `--generate-only` (or answering `g` at the installer's final confirmation prompt) is the **recommended approach**:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
+  --generate-only \
+  --project-id="my-gcp-project" \
+  --cluster-name="existing-cluster-name" \
+  --region="us-central1"
+```
+
+#### Why `--generate-only` on Existing Infrastructure:
+
+- **Longer Terraform Operations**: On existing infrastructure with numerous cloud resources, Terraform lifecycle commands (`init`, `validate`, and provider schema inspection) take longer than on greenfield deployments.
+- **Mandatory Plan Analysis**: Adopting existing infrastructure requires careful inspection of `terraform plan` outputs before mutating cloud state to verify that existing subnets, IAM bindings, or cluster configurations are not unintentionally altered or replaced.
+- **Out-of-Terraform Prerequisites & Operator Handoff**: The installer auto-detects existing cluster parameters (Workload Identity pool, CMEK database encryption, NetworkPolicy status, OTel collection scope, and KMS token-minter keys), runs pre-apply validations without mutating GCP resources, and prints the exact shell commands needed before and after Terraform apply.
+
+#### What `--generate-only` Does:
+
+1. Probes cluster parameters and writes the complete configuration to `install.env` (if absent) and `terraform/examples/full-install/terraform.tfvars`.
+2. Runs pre-flight checks and configuration validations without creating or modifying GCP resources.
+3. Prints the exact step-by-step manual execution recipe:
+   - **Out-of-Terraform prerequisites** for existing clusters (CMEK database encryption enablement, node-pool `GKE_METADATA` workload identity update, NetworkPolicy enablement, and Cloud KMS key creation for GitHub App private key signing).
+   - **Terraform Plan & Apply execution** with remote state management via `lifecycle.sh`:
+     ```bash
+     cd terraform/examples/full-install
+     KUBE_AGENTS_STATE_BUCKET="<project>-kube-agents-tfstate" KUBE_AGENTS_STATE_PREFIX="kube-agents/<cluster>" ./lifecycle.sh plan
+     KUBE_AGENTS_STATE_BUCKET="<project>-kube-agents-tfstate" KUBE_AGENTS_STATE_PREFIX="kube-agents/<cluster>" ./lifecycle.sh apply
+     ```
+   - **Post-apply steps** (managed-OTel collection scope and Slack socket registration if configured).
+4. Exits with code `0` and writes `{"status": "GENERATE_ONLY_SUCCESS", ...}` to `/tmp/kube-agents-install-report.json`.
 
 ### Non-Interactive & AI Agent Execution Mode
 
@@ -239,6 +274,8 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
   the installer with `--menu` (e.g. `./install.sh --menu` or `$HOME/kube-agents/install.sh --menu`)
   where Save & Apply re-applies through the same engine, or edit your
   hand-written tfvars and re-apply.
+
+- **Existing Infrastructure Recommendation**: When installing on pre-existing infrastructure (such as an existing GKE cluster or shared VPC), using `./install.sh --generate-only` (see [Generate-Only Mode](#generate-only-mode-recommended-for-existing-infrastructure)) is recommended to auto-generate `terraform.tfvars`, run pre-apply validation checks, and inspect `lifecycle.sh plan` thoroughly before applying.
 
 - **Private Container Registry**: If your GKE clusters may only pull from an approved registry, see
   [Private container registry](#private-container-registry) below for the full recipe. Mirroring
