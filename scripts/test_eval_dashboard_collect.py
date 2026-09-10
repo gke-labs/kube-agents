@@ -797,8 +797,11 @@ class TestIndexDiscovery(_MergeBase):
         }.items():
             with self.subTest(label):
                 log.write_text("")
+                # Pinned: the fixture build finished 2026-08-27 and the
+                # default --since-days window would age it out.
                 merged, _ = self.quiet_collect(
-                    pr_globs=[FAKE_GLOB], gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX, **kwargs
+                    pr_globs=[FAKE_GLOB], gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX,
+                    now=datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc), **kwargs
                 )
                 self.assertEqual([run["build_id"] for run in merged["runs"]], [BUILD_998_FULL])
                 listings = [c for c in log.read_text().splitlines() if c.startswith("ls ")]
