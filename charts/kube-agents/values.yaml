@@ -186,6 +186,24 @@ litellm:
   # the otel callback's DNS failure aborts every LLM request. Enable it once
   # the managed collector exists; the NetworkPolicy already allows the egress.
   otel: false
+  # A cached-response passthrough sidecar in front of the LiteLLM container
+  # (files/response-cache-proxy.py): completion requests the pod has already
+  # answered are served from its disk cache, with the package's id/timestamp
+  # normalization, task-id aliasing, and caller-declared metadata rules — no
+  # model-verified learning; the proxy pins learning off. The value is the
+  # CACHED_RESPONSE_MODE for the sidecar and must be "conservative",
+  # "testing", or "risky" (the template refuses anything else — the package
+  # would silently coerce a typo to disabled and report 0% hits); empty
+  # deploys no sidecar and changes nothing. Requires replicaCount 1: the
+  # cache and its signed-tool-call bindings are pod-local, and a second
+  # replica answering mid-conversation 500s on signed turns it never
+  # recorded. Off everywhere real: a cached completion measures the cache,
+  # not the model, so this exists for eval-cost experiments only.
+  responseCache: ""
+  # Where the sidecar's package comes from, pinned to an immutable snapshot.
+  # A runtime pull images.json cannot inventory, which is acceptable only
+  # because the sidecar is off by default and experiment-scoped.
+  responseCachePackage: "https://github.com/haoxuw/cached-response/archive/0ffd7e73b9b9f901b753079fed8f740bd169cc12.tar.gz"
   # model-default routes to <modelProvider>/<modelDefaultName>. Providers:
   # gemini, anthropic, openai, vertex_ai. The provider's API key must exist in
   # the credentials Secret — except vertex_ai, which authenticates with
