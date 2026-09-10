@@ -1761,15 +1761,78 @@ run_openshift_helm_install() {
     if [ -n "${MODEL_DEFAULT_NAME:-}" ]; then
       helm_cmd+=(--set-string "litellm.modelDefaultName=${MODEL_DEFAULT_NAME}")
     fi
+    if is_truthy "${HERMES_DASHBOARD_ENABLED:-false}"; then
+      helm_cmd+=(--set "platformAgent.harness.hermes.dashboardEnabled=true")
+    fi
+    if [ -n "${MEMORY:-}" ] || is_truthy "${MEMORY_ENABLED:-false}"; then
+      local mem_provider="${MEMORY_PROVIDER:-hindsight}"
+      if [ "${MEMORY:-}" = "multiuser_memory" ]; then
+        mem_provider="file"
+      fi
+      helm_cmd+=(
+        --set "platformAgent.harness.memory.enabled=true"
+        --set-string "platformAgent.harness.memory.provider=${mem_provider}"
+        --set "platformAgent.harness.memory.userProfileEnabled=${USER_PROFILE_ENABLED:-true}"
+      )
+    fi
+    if is_truthy "${SLACK_ENABLED:-false}"; then
+      helm_cmd+=(--set "platformAgent.integration.slack.enabled=true")
+      if [ -n "${SLACK_HOME_CHANNEL:-}" ]; then
+        helm_cmd+=(--set-string "platformAgent.integration.slack.homeChannel=${SLACK_HOME_CHANNEL}")
+      fi
+      if [ -n "${SLACK_HOME_CHANNEL_NAME:-}" ]; then
+        helm_cmd+=(--set-string "platformAgent.integration.slack.homeChannelName=${SLACK_HOME_CHANNEL_NAME}")
+      fi
+      if [ -n "${SLACK_BOT_TOKEN:-}" ]; then
+        helm_cmd+=(--set-string "platformAgent.credentials.data.SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN}")
+      fi
+      if [ -n "${SLACK_APP_TOKEN:-}" ]; then
+        helm_cmd+=(--set-string "platformAgent.credentials.data.SLACK_APP_TOKEN=${SLACK_APP_TOKEN}")
+      fi
+      if [ -n "${SLACK_ALLOWED_USERS:-${ALLOWED_USERS:-}}" ]; then
+        local slack_users
+        slack_users="$(echo "${SLACK_ALLOWED_USERS:-$ALLOWED_USERS}" | tr ' ' ',')"
+        helm_cmd+=(--set "platformAgent.integration.slack.allowedUsers={${slack_users}}")
+      fi
+    fi
+    if is_truthy "${GOOGLE_CHAT_ENABLED:-false}"; then
+      helm_cmd+=(
+        --set "platformAgent.integration.googleChat.enabled=true"
+        --set-string "platformAgent.integration.googleChat.mode=${GOOGLE_CHAT_MODE:-default}"
+      )
+      if [ -n "${CHAT_TOPIC_NAME:-}" ]; then
+        helm_cmd+=(--set-string "platformAgent.integration.googleChat.topicName=${CHAT_TOPIC_NAME}")
+      fi
+      if [ -n "${CHAT_SUB_NAME:-}" ]; then
+        helm_cmd+=(--set-string "platformAgent.integration.googleChat.subscriptionName=${CHAT_SUB_NAME}")
+      fi
+      if [ -n "${ALLOWED_USERS:-}" ]; then
+        local gchat_users
+        gchat_users="$(echo "$ALLOWED_USERS" | tr ' ' ',')"
+        helm_cmd+=(--set "platformAgent.integration.googleChat.allowedUsers={${gchat_users}}")
+      fi
+    fi
+    if [ -n "${GITOPS_ORG:-}" ]; then
+      helm_cmd+=(--set-string "platformAgent.integration.github.org=${GITOPS_ORG}")
+    fi
+    if [ -n "${GITOPS_REPO:-}" ]; then
+      helm_cmd+=(--set-string "platformAgent.integration.github.gitRepo=${GITOPS_REPO}")
+    fi
+    if is_truthy "${ENABLE_GITHUB_MINTER:-false}"; then
+      helm_cmd+=(--set "githubMinter.enabled=true")
+    fi
     if [ -n "${image_tag:-}" ]; then
       helm_cmd+=(
         --set-string "platformAgent.deployment.image.tag=${image_tag}"
         --set-string "operator.image.tag=${image_tag}"
-        --set-string "credentialProxy.deployment.image.tag=${image_tag}"
+        --set-string "agentSandbox.image.tag=${image_tag}"
       )
     fi
     if [ -n "${image_registry:-}" ]; then
       helm_cmd+=(--set-string "global.imageRegistry=${image_registry}")
+    fi
+    if [ -n "${THIRD_PARTY_IMAGE_REGISTRY:-}" ]; then
+      helm_cmd+=(--set-string "global.thirdPartyImageRegistry=${THIRD_PARTY_IMAGE_REGISTRY}")
     fi
 
     "${helm_cmd[@]}" "${sandbox_key_args[@]}"
