@@ -242,6 +242,20 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{isolated_install_sh}"
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn(f"MODE={MOCK_GOOGLE_CHAT_MODE}", proc.stdout)
 
+    def test_parse_args_generate_only(self):
+        """Verifies parse_args captures --generate-only."""
+        cmd = 'parse_args --generate-only; echo "GEN=$PARAM_GENERATE_ONLY"'
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("GEN=true", proc.stdout)
+
+    def test_main_generate_only_and_dry_run_cannot_be_combined(self):
+        """Verifies that combining --dry-run and --generate-only fails."""
+        cmd = 'main --dry-run --generate-only || rc=$?; echo "RC=$rc"'
+        proc = self._run_install_func(cmd)
+        self.assertIn("RC=2", proc.stdout)
+        self.assertIn("--dry-run and --generate-only are different modes and cannot be combined", proc.stdout)
+
     def test_parse_args_cluster_mode(self):
         """Verifies parse_args captures --cluster-mode."""
         cmd = 'parse_args --cluster-mode=autopilot; echo "MODE=$PARAM_CLUSTER_MODE"'
@@ -895,6 +909,53 @@ run_menu_system "."
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("RC=1", proc.stdout)
+
+    def test_print_generate_only_handoff_renders_required_commands(self):
+        """Verifies print_generate_only_handoff prints all out-of-Terraform and lifecycle commands."""
+        cmd = f"""
+{_SOURCE_INSTALLER_COMMON}
+PROJECT_ID="test-proj"
+CLUSTER_NAME="test-cluster"
+INSTALL_ENV_FILE="/tmp/test/install.env"
+print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-central1" "/tmp/test-repo/terraform/examples/full-install/terraform.tfvars"
+"""
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = proc.stdout
+        # Out-of-Terraform prerequisites
+        self.assertIn("CMEK Database Encryption (pre-existing cluster without CMEK):", out)
+        self.assertIn("gcloud services enable cloudkms.googleapis.com --project=test-proj", out)
+        self.assertIn("gcloud container clusters update test-cluster --location us-central1 --database-encryption-key=", out)
+        self.assertIn("Workload Identity Pool (pre-existing Standard cluster):", out)
+        self.assertIn("gcloud container clusters update test-cluster --location us-central1 --project test-proj --workload-pool=test-proj.svc.id.goog", out)
+        self.assertIn("NetworkPolicy Enforcement (pre-existing cluster without Dataplane V2):", out)
+        self.assertIn("gcloud container clusters update test-cluster --location us-central1 --project test-proj --update-addons=NetworkPolicyConfig=ENABLED", out)
+        self.assertIn("gcloud container clusters update test-cluster --location us-central1 --project test-proj --enable-network-policy", out)
+        self.assertIn("GitHub App PEM Import (before apply, when GitOps minter is enabled):", out)
+        self.assertIn("git clone --depth 1 --branch v2.7.1 https://github.com/abcxyz/github-token-minter.git /tmp/minty", out)
+        self.assertIn("go run ./cmd/minty tools import-pk", out)
+        # Lifecycle commands with bucket/prefix
+        self.assertIn("cd /tmp/test-repo/terraform/examples/full-install", out)
+        self.assertIn('KUBE_AGENTS_STATE_BUCKET="test-proj-kube-agents-tfstate" KUBE_AGENTS_STATE_PREFIX="kube-agents/test-cluster" ./lifecycle.sh plan', out)
+        self.assertIn('KUBE_AGENTS_STATE_BUCKET="test-proj-kube-agents-tfstate" KUBE_AGENTS_STATE_PREFIX="kube-agents/test-cluster" ./lifecycle.sh apply', out)
+        # Post-apply OTel scope
+        self.assertIn("Managed OpenTelemetry Scope:", out)
+        self.assertIn("gcloud container clusters update test-cluster --location us-central1 --project test-proj --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS", out)
+
+    def test_write_json_report_includes_generate_only(self):
+        """Verifies write_json_report outputs generate_only boolean."""
+        cmd = """
+PARAM_DRY_RUN="false"
+PARAM_GENERATE_ONLY="true"
+PARAM_NON_INTERACTIVE="true"
+INSTALL_ENV_FILE="/tmp/install.env"
+write_json_report "GENERATE_ONLY_SUCCESS" >/dev/null
+cat /tmp/kube-agents-install-report.json
+"""
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn('"status": "GENERATE_ONLY_SUCCESS"', proc.stdout)
+        self.assertIn('"generate_only": true', proc.stdout)
 
 
 class InstallEnvInputTest(unittest.TestCase):
