@@ -1262,11 +1262,11 @@ detect_platform() {
     return 0
   fi
 
-  if command -v oc >/dev/null 2>&1 && oc whoami >/dev/null 2>&1; then
+  if command -v oc >/dev/null 2>&1 && [ -n "$(oc whoami 2>/dev/null)" ]; then
     PARAM_PLATFORM="$PLATFORM_OPENSHIFT"
     return 0
   fi
-  if command -v kubectl >/dev/null 2>&1 && kubectl get clusterversion >/dev/null 2>&1; then
+  if command -v kubectl >/dev/null 2>&1 && [ -n "$(kubectl get clusterversion version -o jsonpath='{.status.desired.version}' 2>/dev/null)" ]; then
     PARAM_PLATFORM="$PLATFORM_OPENSHIFT"
     return 0
   fi
