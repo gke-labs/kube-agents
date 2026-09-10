@@ -794,3 +794,18 @@ plugins:
       sink: gke-stockout-alerts-sink
       thresholdCount: 1
       thresholdWindowSeconds: 300
+
+# OpenShift on GCE compatibility settings.
+openshift:
+  # Enable OpenShift-specific resources and configurations (e.g. SCC, Route).
+  enabled: false
+  # SecurityContextConstraints (SCC) configuration.
+  scc:
+    create: true
+  # OpenShift Route configuration for external access.
+  route:
+    enabled: false
+    host: ""
+    tls:
+      termination: edge
+
