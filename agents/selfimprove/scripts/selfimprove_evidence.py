@@ -51,6 +51,43 @@ METADATA_TOKEN_URL = (
 #: queries by default.
 SELF_SERVICE_NAME = "kube-agents-selfimprove"
 
+#: Namespace the Kubernetes reads default to when neither the chart's
+#: KUBE_DEFAULT_NAMESPACE nor the downward-API POD_NAMESPACE is set; the
+#: chart's default install namespace.
+DEFAULT_NAMESPACE = "kubeagents-system"
+
+#: The three Google APIs this tool reads. Cloud Logging takes the project in
+#: the body; Cloud Trace and Cloud Monitoring take it in the path, with the
+#: query string appended, hence the two placeholders.
+LOGGING_ENTRIES_URL = "https://logging.googleapis.com/v2/entries:list"
+TRACES_URL = "https://cloudtrace.googleapis.com/v1/projects/%s/traces?%s"
+TIME_SERIES_URL = "https://monitoring.googleapis.com/v3/projects/%s/timeSeries?%s"
+
+#: The metadata server answers from the node, so a slow answer means Workload
+#: Identity is misconfigured rather than a network in trouble; fail fast.
+METADATA_TOKEN_TIMEOUT_SECONDS = 15
+#: A single Logging, Trace or Monitoring call. A page of a thousand entries
+#: over a wide filter can take tens of seconds; two minutes bounds it below
+#: the run's wall-clock budget without cutting off a legitimately slow page.
+GOOGLE_API_TIMEOUT_SECONDS = 120
+#: How much of an HTTP error body reaches the failure message. The APIs put
+#: the reason in the first few hundred bytes; the rest is the request echoed
+#: back, which the log line has no room for.
+HTTP_ERROR_DETAIL_LIMIT = 2000
+#: Cloud Logging's documented ceiling for `pageSize` on `entries:list`; the
+#: trace listing is capped to the same number so `--limit` means one thing.
+PAGE_SIZE_MAX = 1000
+#: Time series per Monitoring page. `metrics` reads one page and does not
+#: follow `nextPageToken`, so this is also the most series it returns; each
+#: carries every point in the window, which is why it is smaller than the
+#: logs and traces cap.
+METRICS_PAGE_SIZE = 200
+
+#: The operator's API group and version, for the two custom resources `k8s`
+#: lists.
+KUBE_AGENTS_API_GROUP = "kubeagents.x-k8s.io"
+KUBE_AGENTS_API_VERSION = "v1alpha1"
+
 _TOKEN_CACHE: Dict[str, Any] = {}
 
 
@@ -840,7 +877,7 @@ def access_token() -> str:
         return _TOKEN_CACHE["token"]
     request = urllib.request.Request(METADATA_TOKEN_URL, headers={"Metadata-Flavor": "Google"})
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
+        with urllib.request.urlopen(request, timeout=METADATA_TOKEN_TIMEOUT_SECONDS) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except urllib.error.URLError as exc:
         _fail(
@@ -867,10 +904,10 @@ def _google_api(url: str, body: Optional[Dict[str, Any]] = None, method: str = "
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=120) as response:
+        with urllib.request.urlopen(request, timeout=GOOGLE_API_TIMEOUT_SECONDS) as response:
             return json.loads(response.read().decode("utf-8") or "{}")
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace")[:2000]
+        detail = exc.read().decode("utf-8", "replace")[:HTTP_ERROR_DETAIL_LIMIT]
         _fail("%s %s: %s" % (exc.code, exc.reason, detail))
     except urllib.error.URLError as exc:
         _fail("could not reach %s: %s" % (url, exc))
@@ -885,7 +922,7 @@ def _project() -> str:
 
 
 def _namespace() -> str:
-    return os.environ.get("KUBE_DEFAULT_NAMESPACE") or os.environ.get("POD_NAMESPACE") or "kubeagents-system"
+    return os.environ.get("KUBE_DEFAULT_NAMESPACE") or os.environ.get("POD_NAMESPACE") or DEFAULT_NAMESPACE
 
 
 # --------------------------------------------------------------------------
@@ -962,9 +999,9 @@ def cmd_logs(args: argparse.Namespace) -> int:
         "resourceNames": ["projects/%s" % _project()],
         "filter": _logs_filter(args),
         "orderBy": "timestamp desc",
-        "pageSize": min(args.limit, 1000),
+        "pageSize": min(args.limit, PAGE_SIZE_MAX),
     }
-    payload = _google_api("https://logging.googleapis.com/v2/entries:list", body)
+    payload = _google_api(LOGGING_ENTRIES_URL, body)
     entries = payload.get("entries", [])[: args.limit]
     if args.raw:
         emit(entries)
@@ -1019,14 +1056,14 @@ def cmd_logs_count(args: argparse.Namespace) -> int:
         "resourceNames": ["projects/%s" % _project()],
         "filter": _logs_filter(args),
         "orderBy": "timestamp desc",
-        "pageSize": 1000,
+        "pageSize": PAGE_SIZE_MAX,
     }
     page_token = None
     pages = 0
     while pages < args.max_pages:
         if page_token:
             body["pageToken"] = page_token
-        payload = _google_api("https://logging.googleapis.com/v2/entries:list", body)
+        payload = _google_api(LOGGING_ENTRIES_URL, body)
         entries = payload.get("entries", [])
         total += len(entries)
         for entry in entries:
@@ -1188,7 +1225,7 @@ def cmd_traces(args: argparse.Namespace) -> int:
     """
     params = {
         "startTime": _rfc3339_hours_ago(args.hours),
-        "pageSize": str(min(args.limit, 1000)),
+        "pageSize": str(min(args.limit, PAGE_SIZE_MAX)),
         "view": "ROOTSPAN" if not args.full else "COMPLETE",
     }
     filters = []
@@ -1202,7 +1239,7 @@ def cmd_traces(args: argparse.Namespace) -> int:
         filters.append("+root:%s" % args.service)
     if filters:
         params["filter"] = " ".join(filters)
-    url = "https://cloudtrace.googleapis.com/v1/projects/%s/traces?%s" % (
+    url = TRACES_URL % (
         _project(),
         urllib.parse.urlencode(params),
     )
@@ -1319,9 +1356,9 @@ def cmd_metrics(args: argparse.Namespace) -> int:
         "interval.startTime": _rfc3339_hours_ago(args.hours),
         "interval.endTime": _rfc3339_hours_ago(0),
         "view": "FULL",
-        "pageSize": "200",
+        "pageSize": str(METRICS_PAGE_SIZE),
     }
-    url = "https://monitoring.googleapis.com/v3/projects/%s/timeSeries?%s" % (
+    url = TIME_SERIES_URL % (
         _project(),
         urllib.parse.urlencode(params),
     )
@@ -1578,16 +1615,16 @@ def cmd_k8s(args: argparse.Namespace) -> int:
         # object these two return belongs to the agent under observation, which
         # is the thing a finding is about.
         out = custom.list_namespaced_custom_object(
-            group="kubeagents.x-k8s.io",
-            version="v1alpha1",
+            group=KUBE_AGENTS_API_GROUP,
+            version=KUBE_AGENTS_API_VERSION,
             namespace=ns,
             plural="platformagents",
             _request_timeout=API_TIMEOUT,
         ).get("items", [])
     elif args.what == "agentplugins":
         out = custom.list_namespaced_custom_object(
-            group="kubeagents.x-k8s.io",
-            version="v1alpha1",
+            group=KUBE_AGENTS_API_GROUP,
+            version=KUBE_AGENTS_API_VERSION,
             namespace=ns,
             plural="agentplugins",
             _request_timeout=API_TIMEOUT,
