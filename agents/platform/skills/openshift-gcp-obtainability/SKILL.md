@@ -40,12 +40,48 @@ Common error signatures:
 - `QUOTA_EXCEEDED`: The GCP project has reached its regional vCPU or GPU quota.
 - `RESOURCE_NOT_FOUND`: The requested machine family is not available in that zone.
 
-### Step 2: Query GCE Capacity Advice
+### Step 2: Query Google Cloud Spot & Flex Obtainability APIs
 
-When a stockout is detected, query the GCE Advice API (`compute.alpha.AdviceService.Capacity` or `GeneralCapacityRecommendation`) for available alternative zones and machine families:
+When detecting a stockout, scaling Spot pools, or qualifying MachineSet machine types, query the GCE Advice APIs via `gcloud` (available directly or via the credential proxy) or REST:
 
-- Primary shape constrained: e.g. `n4-standard-8` in `us-central1-a`.
-- Recommendation: Switch to `n2-standard-8` in `us-central1-a`, or shift `n4-standard-8` to `us-central1-b` or `us-central1-f`.
+1. **Spot / Flex Capacity Advice:**
+   Query obtainability score (0.0–1.0) and recommended zones across candidate machine shapes:
+
+   ```bash
+   gcloud beta compute advice capacity \
+     --project="<PROJECT_ID>" \
+     --region="<REGION>" \
+     --provisioning-model=SPOT \
+     --size=1 \
+     --instance-selection-machine-types="n2-standard-4,n4-standard-4,c2d-standard-4" \
+     --target-distribution-shape=any \
+     --format=json
+   ```
+
+   Parse `.recommendations[].scores.obtainability` and `.recommendations[].shards[]` for optimal zone and machine family. For Flex-start workloads, specify `--provisioning-model=FLEX_START`.
+
+2. **Spot Preemption & Price History:**
+   Evaluate preemption volatility before provisioning Spot MachineSets:
+
+   ```bash
+   gcloud beta compute advice capacity-history \
+     --project="<PROJECT_ID>" \
+     --region="<REGION>" \
+     --provisioning-model=SPOT \
+     --machine-type="<MACHINE_TYPE>" \
+     --types=PREEMPTION,PRICE \
+     --format=json
+   ```
+
+   Flag recent `.preemptionHistory[].preemptionRate > 0.15` as elevated risk requiring multi-zone spread or on-demand tiering.
+
+3. **REST API Equivalent (via Credential Proxy):**
+   ```bash
+   curl -s -H "Authorization: Bearer $(cat ${CREDENTIAL_PROXY_TOKEN_FILE:-/var/run/secrets/kubeagents/credential-proxy/token})" \
+     -H "Content-Type: application/json" \
+     "https://compute.googleapis.com/compute/beta/projects/<PROJECT_ID>/regions/<REGION>/advice/capacity" \
+     -d '{"distributionPolicy":{"targetShape":"ANY"},"instanceFlexibilityPolicy":{"instanceSelections":{"selection-1":{"machineTypes":["n2-standard-4","n4-standard-4"]}}},"instanceProperties":{"scheduling":{"provisioningModel":"SPOT"}},"size":1}'
+   ```
 
 ---
 
@@ -69,14 +105,23 @@ OpenShift `MachineSet`s are zonal. When `us-central1-a` is exhausted:
 3. Propose the fallback `MachineSet` and `MachineAutoscaler` manifests via a GitOps pull request or `submit-suggestion`.
 4. Scale down or pause the stocked-out `MachineSet` via GitOps to halt autoscaler backoff thrashing.
 
-### Pattern 2: Machine Family Tiering (e.g. N4 -> N2 / C2D)
+### Pattern 2: Spot/Flex Qualification & Resilient MachineSet Sizing
+
+Before provisioning OpenShift Spot MachineSets (`spec.template.spec.providerSpec.value.preemptible: true`):
+
+1. Run Step 2's capacity advice query across candidate machine types and zones.
+2. Select the zone and machine family with `.scores.obtainability >= 0.8` and `.preemptionRate <= 0.15`.
+3. If obtainability in the primary zone is `< 0.5`, failover to the API-recommended secondary zone.
+4. If Spot obtainability is constrained across all shapes, propose an on-demand fallback MachineSet with matching labels and taints.
+
+### Pattern 3: Machine Family Tiering (e.g. N4 -> N2 / C2D)
 
 If an entire region is constrained for newer machine families (e.g. N4, C3, or A2 GPUs):
 
 1. Create a secondary `MachineSet` utilizing established, widely available machine types (e.g. `n2-standard-8` or `c2d-standard-8`).
 2. Ensure the worker node labels and taints match the primary pool so pending pods can schedule without requiring pod specification modifications.
 
-### Pattern 3: Automated Machine Cleanup
+### Pattern 4: Automated Machine Cleanup
 
 Clean up stuck `Machine` objects that block cluster autoscaler progress only with operator confirmation or via GitOps:
 
