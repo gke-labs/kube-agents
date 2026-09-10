@@ -20,6 +20,7 @@ import io
 import json
 import os
 import pathlib
+import re
 import shutil
 import stat
 import tempfile
@@ -219,12 +220,19 @@ class TestResilience(unittest.TestCase):
 # A stand-in gsutil for the incremental-scan tests: serves the fixture builds
 # from a local tree laid out like the Prow bucket and appends every argv to a
 # log file, so a test can assert exactly which objects a sweep paid for.
+# FAKE_GSUTIL_SLEEP (optional JSON {argv substring: seconds}) delays a
+# matching call, which is how a test stages a hung listing or reads that
+# finish out of order.
 _FAKE_GSUTIL = r"""#!/usr/bin/env python3
-import os, pathlib, sys
+import json, os, pathlib, sys, time
 
 root = pathlib.Path(os.environ["FAKE_GSUTIL_ROOT"])
+argv = " ".join(sys.argv[1:])
 with open(os.environ["FAKE_GSUTIL_LOG"], "a") as fh:
-    fh.write(" ".join(sys.argv[1:]) + "\n")
+    fh.write(argv + "\n")
+for needle, seconds in json.loads(os.environ.get("FAKE_GSUTIL_SLEEP", "{}")).items():
+    if needle in argv:
+        time.sleep(seconds)
 BUCKET = "gs://fake-prow/"
 
 def local(url):
@@ -235,8 +243,8 @@ if sys.argv[1] == "ls":
     if not base.is_dir():
         sys.exit(1)
     for p in sorted(base.iterdir()):
-        if p.is_dir():
-            print(BUCKET + p.relative_to(root).as_posix() + "/")
+        rel = BUCKET + p.relative_to(root).as_posix()
+        print(rel + "/" if p.is_dir() else rel)
     sys.exit(0)
 if sys.argv[1] == "cat":
     try:
@@ -247,7 +255,11 @@ if sys.argv[1] == "cat":
 sys.exit(2)
 """
 
-FAKE_GLOB = "gs://fake-prow/pull/gke-labs_kube-agents/998/pull-kube-agents-smoke-test/*"
+FAKE_BUCKET = "gs://fake-prow/"
+FAKE_GLOB = FAKE_BUCKET + "pull/gke-labs_kube-agents/998/pull-kube-agents-smoke-test/*"
+# Prow's per-job directory index for the fake bucket, laid out like the real
+# one: <prefix>/<build_id>.txt holding the build directory's gs:// path.
+FAKE_INDEX_PREFIX = FAKE_BUCKET + "pr-logs/directory/pull-kube-agents-smoke-test/"
 
 
 class _MergeBase(unittest.TestCase):
@@ -260,12 +272,20 @@ class _MergeBase(unittest.TestCase):
         path.write_text(json.dumps(data))
         return str(path)
 
-    def fake_gsutil(self, builds) -> tuple[str, pathlib.Path]:
-        """A gsutil serving `builds` (fixture ids) plus the call log's path."""
+    def fake_gsutil(self, builds, pr=998) -> tuple[str, pathlib.Path]:
+        """A gsutil serving `builds` (fixture ids) plus the call log's path.
+
+        Each build is placed under PR `pr`'s directory and gets an index
+        pointer, so a test can discover it either by glob or by index; the
+        pointer holds the directory path without a trailing slash, as Prow
+        writes it. The index also carries a latest-build.txt.
+        """
         root = self.tmp / "bucket"
         for build in builds:
-            dst = root / FAKE_GLOB[len("gs://fake-prow/"):].rstrip("*") / build
-            shutil.copytree(TESTDATA / build, dst)
+            self.place_build(root, build, pr)
+        index = root / FAKE_INDEX_PREFIX[len(FAKE_BUCKET):]
+        index.mkdir(parents=True, exist_ok=True)
+        (index / "latest-build.txt").write_text(max(builds, key=int) + "\n" if builds else "")
         gsutil = self.tmp / "fake-gsutil"
         gsutil.write_text(_FAKE_GSUTIL)
         gsutil.chmod(gsutil.stat().st_mode | stat.S_IXUSR)
@@ -275,7 +295,34 @@ class _MergeBase(unittest.TestCase):
         os.environ["FAKE_GSUTIL_LOG"] = str(log)
         self.addCleanup(os.environ.pop, "FAKE_GSUTIL_ROOT", None)
         self.addCleanup(os.environ.pop, "FAKE_GSUTIL_LOG", None)
+        self.addCleanup(os.environ.pop, "FAKE_GSUTIL_SLEEP", None)
         return str(gsutil), log
+
+    @staticmethod
+    def build_url(build, pr=998) -> str:
+        """The build directory's gs:// URL under PR `pr`, no trailing slash."""
+        return f"{FAKE_BUCKET}pull/gke-labs_kube-agents/{pr}/pull-kube-agents-smoke-test/{build}"
+
+    def place_build(self, root, build, pr=998) -> pathlib.Path:
+        """Copy fixture `build` under PR `pr` and write its index pointer."""
+        url = self.build_url(build, pr)
+        dst = root / url[len(FAKE_BUCKET):]
+        shutil.copytree(TESTDATA / build, dst)
+        index = root / FAKE_INDEX_PREFIX[len(FAKE_BUCKET):]
+        index.mkdir(parents=True, exist_ok=True)
+        (index / f"{build}.txt").write_text(url + "\n")
+        return dst
+
+    @staticmethod
+    def bucket_root() -> pathlib.Path:
+        return pathlib.Path(os.environ["FAKE_GSUTIL_ROOT"])
+
+    def prior_with(self, builds) -> str:
+        """A prior data.json holding exactly the fixture `builds`."""
+        with tempfile.TemporaryDirectory() as sub:
+            for build in builds:
+                shutil.copytree(TESTDATA / build, pathlib.Path(sub) / build)
+            return self.write_prior(collect.collect(from_dir=pathlib.Path(sub)))
 
     @staticmethod
     def quiet_collect(**kwargs):
@@ -564,6 +611,235 @@ class TestIncrementalGcsScan(_MergeBase):
         local.write_text(json.dumps(prior_data))
         runs = collect.load_prior_runs("gs://fake-prow/dash/data.json", gsutil=gsutil)
         self.assertEqual([r["build_id"] for r in runs], [r["build_id"] for r in prior_data["runs"]])
+
+
+# The refresh workflow's publish gate, verbatim from .github/workflows/
+# ci-health.yml: a collect whose log matches this is not published. The
+# tests below pin that a failed index listing or pointer read still trips it.
+WORKFLOW_REFUSAL = re.compile(r"warning: gsutil (ls|cat) .*(failed|timed out)")
+
+
+class TestIndexDiscovery(_MergeBase):
+    """Incremental discovery through Prow's per-job directory index.
+
+    With a watermark the collector must list the index prefix instead of the
+    whole-archive glob (which no longer fits the per-call timeout), read only
+    the pointers above the watermark, and follow each pointer to wherever
+    the build lives. The fallbacks and the refusal semantics are pinned too:
+    no watermark means the glob, a failed listing means the workflow's
+    refusal line and nothing new.
+    """
+
+    ALL = (BUILD_956_TRUNCATED, BUILD_998_INFRA, BUILD_998_FULL)
+
+    def test_index_is_listed_instead_of_the_glob_and_only_new_pointers_are_read(self):
+        gsutil, log = self.fake_gsutil(self.ALL)
+        prior = self.prior_with([BUILD_956_TRUNCATED, BUILD_998_INFRA])
+        merged, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], merge_with=prior, gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX
+        )
+        self.assertEqual([run["build_id"] for run in merged["runs"]], list(self.ALL))
+        calls = log.read_text().splitlines()
+        self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {FAKE_INDEX_PREFIX}"])
+        pointers = [c for c in calls if c.startswith(f"cat {FAKE_INDEX_PREFIX}")]
+        self.assertEqual(pointers, [f"cat {FAKE_INDEX_PREFIX}{BUILD_998_FULL}.txt"])
+        self.assertNotIn("latest-build.txt", "\n".join(calls))
+        # The one new build was read through the path its pointer named.
+        self.assertIn(f"cat {self.build_url(BUILD_998_FULL)}/finished.json", calls)
+        self.assertNotIn(BUILD_998_INFRA + "/finished.json", "\n".join(calls))
+        self.assertIn("merged 2 prior runs with 1 newly collected", stderr)
+        self.assertIn("via the directory index", stderr)
+        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
+
+    def test_index_build_ids_skip_latest_build_and_junk(self):
+        listing = (
+            f"{FAKE_INDEX_PREFIX}latest-build.txt\n"
+            f"{FAKE_INDEX_PREFIX}200.txt\n"
+            f"{FAKE_INDEX_PREFIX}100.txt\n"
+            f"{FAKE_INDEX_PREFIX}notes.md\n"
+            f"{FAKE_INDEX_PREFIX}subdir/\n"
+            "\n"
+        )
+        self.assertEqual(collect._index_build_ids(listing), ["200", "100"])
+
+    def test_pointer_to_a_build_under_another_pr_is_followed(self):
+        """The glob names one PR; the index names every build the job ran.
+        A pointer into a different PR's directory is read where it points,
+        and that path is the PR hint when started.json carries none."""
+        gsutil, log = self.fake_gsutil([BUILD_998_INFRA])
+        other = self.place_build(self.bucket_root(), BUILD_998_FULL, pr=1234)
+        started = json.loads((other / "started.json").read_text())
+        del started["pull"]
+        (other / "started.json").write_text(json.dumps(started))
+        prior = self.prior_with([BUILD_998_INFRA])
+        merged, _ = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], merge_with=prior, gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX
+        )
+        by_id = {run["build_id"]: run for run in merged["runs"]}
+        self.assertEqual(by_id[BUILD_998_FULL]["pr"], 1234)
+        self.assertEqual(len(by_id[BUILD_998_FULL]["tasks"]), 14)
+        self.assertIn(f"cat {self.build_url(BUILD_998_FULL, 1234)}/build-log.txt", log.read_text())
+
+    def test_pending_build_below_the_watermark_is_reread_through_the_index(self):
+        gsutil, log = self.fake_gsutil(self.ALL)
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_FULL])).read_text())
+        prior_data["pending_builds"] = [
+            {"build_id": BUILD_998_INFRA, "first_seen": datetime.now(timezone.utc).isoformat()}
+        ]
+        prior = self.write_prior(prior_data)
+        merged, _ = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], merge_with=prior, gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX
+        )
+        self.assertEqual(
+            [run["build_id"] for run in merged["runs"]], [BUILD_998_INFRA, BUILD_998_FULL]
+        )
+        self.assertNotIn("pending_builds", merged)
+        calls = log.read_text()
+        self.assertIn(f"{FAKE_INDEX_PREFIX}{BUILD_998_INFRA}.txt", calls)
+        self.assertNotIn(f"{FAKE_INDEX_PREFIX}{BUILD_956_TRUNCATED}.txt", calls)  # zero reads
+
+    def test_unfinished_build_found_through_the_index_lands_on_pending(self):
+        gsutil, _ = self.fake_gsutil(self.ALL)
+        (self.bucket_root() / self.build_url(BUILD_998_FULL)[len(FAKE_BUCKET):] / "finished.json").unlink()
+        prior = self.prior_with([BUILD_956_TRUNCATED, BUILD_998_INFRA])
+        now = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+        merged, _ = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], merge_with=prior, gsutil=gsutil,
+            index_prefix=FAKE_INDEX_PREFIX, now=now,
+        )
+        self.assertEqual(len(merged["runs"]), 2)
+        self.assertEqual(
+            merged["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat()}]
+        )
+
+    def test_listing_timeout_or_failure_trips_the_refusal_line_and_adds_nothing(self):
+        gsutil, log = self.fake_gsutil(self.ALL)
+        prior = self.prior_with([BUILD_956_TRUNCATED, BUILD_998_INFRA])
+        stages = {
+            "timed out": {"FAKE_GSUTIL_SLEEP": json.dumps({f"ls {FAKE_INDEX_PREFIX}": 3})},
+            "failed": {"FAKE_GSUTIL_ROOT": str(self.tmp / "no-such-bucket")},
+        }
+        original_timeout = collect.GSUTIL_TIMEOUT_S
+        self.addCleanup(setattr, collect, "GSUTIL_TIMEOUT_S", original_timeout)
+        for label, env in stages.items():
+            with self.subTest(label):
+                collect.GSUTIL_TIMEOUT_S = 1
+                saved = {k: os.environ.get(k) for k in env}
+                os.environ.update(env)
+                try:
+                    log.write_text("")
+                    merged, stderr = self.quiet_collect(
+                        pr_globs=[FAKE_GLOB], merge_with=prior, gsutil=gsutil,
+                        index_prefix=FAKE_INDEX_PREFIX,
+                    )
+                finally:
+                    for k, v in saved.items():
+                        if v is None:
+                            os.environ.pop(k, None)
+                        else:
+                            os.environ[k] = v
+                # Nothing new, the prior carried over, and the exact line the
+                # workflow greps for -- so this document is never published.
+                self.assertEqual(len(merged["runs"]), 2)
+                self.assertRegex(stderr, WORKFLOW_REFUSAL)
+                self.assertIn("merged 2 prior runs with 0 newly collected", stderr)
+                self.assertNotIn("cat ", log.read_text())  # no reads without a listing
+                self.assertNotIn(f"ls {FAKE_GLOB}", log.read_text())  # and no glob fallback
+
+    def test_unreadable_pointer_trips_the_refusal_line_and_defers_the_build(self):
+        gsutil, _ = self.fake_gsutil(self.ALL)
+        pointer = self.bucket_root() / FAKE_INDEX_PREFIX[len(FAKE_BUCKET):] / f"{BUILD_998_FULL}.txt"
+        pointer.chmod(0)
+        self.addCleanup(pointer.chmod, stat.S_IRUSR | stat.S_IWUSR)
+        prior = self.prior_with([BUILD_956_TRUNCATED, BUILD_998_INFRA])
+        now = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+        merged, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], merge_with=prior, gsutil=gsutil,
+            index_prefix=FAKE_INDEX_PREFIX, now=now,
+        )
+        self.assertEqual(len(merged["runs"]), 2)
+        self.assertRegex(stderr, WORKFLOW_REFUSAL)
+        self.assertEqual(
+            merged["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat()}]
+        )
+
+    def test_pointer_without_a_gs_path_is_skipped_with_a_plain_warning(self):
+        gsutil, _ = self.fake_gsutil(self.ALL)
+        pointer = self.bucket_root() / FAKE_INDEX_PREFIX[len(FAKE_BUCKET):] / f"{BUILD_998_FULL}.txt"
+        pointer.write_text("http://not-a-bucket/somewhere\n")
+        prior = self.prior_with([BUILD_956_TRUNCATED, BUILD_998_INFRA])
+        merged, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], merge_with=prior, gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX
+        )
+        self.assertEqual(len(merged["runs"]), 2)
+        self.assertNotIn("pending_builds", merged)
+        self.assertIn("does not hold a gs:// path", stderr)
+        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))  # not a stall: no refusal
+
+    def test_without_a_watermark_the_glob_is_listed_not_the_index(self):
+        """The cold sweep: no prior (or a prior with no numeric watermark)
+        still discovers through --pr-glob, index or no index."""
+        gsutil, log = self.fake_gsutil([BUILD_998_FULL])
+        for label, kwargs in {
+            "no prior": {},
+            "prior without a watermark": {
+                "merge_with": self.write_prior({"schema_version": 1, "runs": []})
+            },
+        }.items():
+            with self.subTest(label):
+                log.write_text("")
+                merged, _ = self.quiet_collect(
+                    pr_globs=[FAKE_GLOB], gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX, **kwargs
+                )
+                self.assertEqual([run["build_id"] for run in merged["runs"]], [BUILD_998_FULL])
+                listings = [c for c in log.read_text().splitlines() if c.startswith("ls ")]
+                self.assertEqual(listings, [f"ls {FAKE_GLOB}"])
+
+    def test_merge_with_alone_still_touches_no_bucket(self):
+        """--merge-with without --pr-glob recomputes; the index is how a
+        glob scan discovers builds, not a scan of its own."""
+        gsutil, log = self.fake_gsutil(self.ALL)
+        prior = self.prior_with([BUILD_956_TRUNCATED])
+        merged, _ = self.quiet_collect(merge_with=prior, gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX)
+        self.assertEqual(len(merged["runs"]), 1)
+        self.assertEqual(log.read_text(), "")
+
+    def test_reads_come_back_in_build_id_order_whatever_finishes_first(self):
+        """Eight concurrent readers; the oldest build is made the slowest so
+        completion order is the reverse of id order, and runs[] must still
+        come out ascending -- two collects over one archive write the same
+        document."""
+        gsutil, _ = self.fake_gsutil(self.ALL)
+        os.environ["FAKE_GSUTIL_SLEEP"] = json.dumps(
+            {BUILD_956_TRUNCATED + "/": 0.4, BUILD_998_INFRA + "/": 0.2}
+        )
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            runs = collect.runs_from_index(FAKE_INDEX_PREFIX, gsutil=gsutil)
+        self.assertEqual([run["build_id"] for run in runs], list(self.ALL))
+
+    def test_cli_flag_reaches_the_scan_and_an_empty_value_disables_it(self):
+        gsutil, log = self.fake_gsutil(self.ALL)
+        prior = self.prior_with([BUILD_956_TRUNCATED, BUILD_998_INFRA])
+        out = self.tmp / "out.json"
+        common = ["--pr-glob", FAKE_GLOB, "--merge-with", prior, "--gsutil", gsutil, "--gh", "", "--out", str(out)]
+        for label, extra, expected_listing in (
+            ("index", ["--index-prefix", FAKE_INDEX_PREFIX], f"ls {FAKE_INDEX_PREFIX}"),
+            ("disabled", ["--index-prefix", ""], f"ls {FAKE_GLOB}"),
+        ):
+            with self.subTest(label):
+                log.write_text("")
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(collect.main([*common, *extra]), 0)
+                self.assertEqual(len(json.loads(out.read_text())["runs"]), 3)
+                listings = [c for c in log.read_text().splitlines() if c.startswith("ls ")]
+                self.assertEqual(listings, [expected_listing])
+
+    def test_default_index_prefix_is_the_smoke_test_job_index(self):
+        self.assertEqual(
+            collect.DEFAULT_INDEX_PREFIX,
+            "gs://kube-agents-prow/pr-logs/directory/pull-kube-agents-smoke-test/",
+        )
 
 
 class TestRepoDerivedFacts(unittest.TestCase):

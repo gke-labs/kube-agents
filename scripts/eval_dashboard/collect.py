@@ -17,26 +17,43 @@ grading detail, present only when the log carries `rep N:` grading lines) and
 resolved best-effort through `gh`).
 
 Sources:
+  --index-prefix  Prow's per-job directory index, gs://<bucket>/pr-logs/
+              directory/<job>/: one small `<build_id>.txt` object per build
+              holding the gs:// path of that build's directory (plus a
+              `latest-build.txt` this collector ignores). One `gsutil ls`
+              of the prefix names every build the job ever ran in seconds,
+              however many PRs the archive spans, so this is how an
+              incremental scan discovers what is new: list the index once,
+              keep the ids above the watermark, read those pointers, then
+              read the builds. Defaults to the smoke-test presubmit's index;
+              an empty string disables it. It changes how a --pr-glob scan
+              discovers builds, not whether one happens: --pr-glob is still
+              what asks for a GCS scan, and --merge-with alone still
+              recomputes without touching the bucket.
   --pr-glob   gsutil glob(s) of Prow build directories (read-only; requires
-              gsutil on PATH). Repeatable.
+              gsutil on PATH). Repeatable. One `gsutil ls` of a whole-archive
+              glob walks every PR directory and grows with the archive (past
+              the per-call timeout at ~1700 builds), so the glob itself is
+              listed only for a cold sweep -- no watermark; with a watermark
+              the index above is listed instead.
   --from-dir  a local directory whose immediate subdirectories each hold a
               build's build-log.txt / started.json / finished.json -- the
               offline path the unit tests use.
 
-Incremental mode (what the hourly refresh job runs):
+Incremental mode (what the 15-minute refresh job runs):
   --merge-with  a previously written data.json (local path or gs:// URL).
               Its runs are carried over verbatim, the GCS scan skips every
               build at or below the newest build id already on record, and
               cases/coverage are recomputed from the merged run list. The
-              cold sweep is ~3 serial gsutil calls per archived build --
-              tens of minutes over two weeks of history -- so an hourly
-              job MUST ride this watermark. Prow build ids are monotonic in
-              START order, not finish order, so a build still in flight
-              when a later, shorter build gets recorded would sit below the
-              watermark forever; the prior file's pending_builds list is
-              how those get back in: every listed-but-unrecorded build
-              rides it and is re-read on the next scan regardless of the
-              watermark, until it finishes or PENDING_RETRY_DAYS passes.
+              cold sweep is ~3 gsutil calls per archived build (READ_WORKERS
+              at a time) -- tens of minutes over two weeks of history -- so
+              a periodic job MUST ride this watermark. Prow build ids are
+              monotonic in START order, not finish order, so a build still
+              in flight when a later, shorter build gets recorded would sit
+              below the watermark forever; the prior file's pending_builds
+              list is how those get back in: every listed-but-unrecorded
+              build rides it and is re-read on the next scan regardless of
+              the watermark, until it finishes or PENDING_RETRY_DAYS passes.
               A missing, unreadable or implausible prior file is a warning
               that degrades to a fresh sweep bounded by --since-days
               (default 14 in that case), never a crash: the first armed
@@ -44,6 +61,11 @@ Incremental mode (what the hourly refresh job runs):
   --since-days  skip GCS builds whose started.json is older than N days.
               Costs one probe read per candidate build and saves the other
               two; the watermark filter above is free and runs first.
+
+A failed or timed-out listing -- index or glob -- is a `warning: gsutil ls
+... failed` line and an otherwise well-formed document with nothing new;
+the refresh workflow greps for that line and refuses to publish, so a
+stalled archive is never republished under a fresh generated_at.
 
 Builds with no finished.json are still running (or never finished uploading)
 and are skipped. Everything else is parsed best-effort: a truncated log
@@ -61,9 +83,39 @@ import re
 import statistics
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 SCHEMA_VERSION = 1
+
+# The Prow job whose archive this collector reads, and the bucket Prow
+# archives it to. The default --index-prefix is derived from them; the
+# --pr-glob defaults in the CI scripts name the same job.
+PROW_JOB_NAME = "pull-kube-agents-smoke-test"
+PROW_BUCKET = "gs://kube-agents-prow"
+
+# Prow's per-job directory index: one `<build_id>.txt` object per build
+# under this prefix, each holding the gs:// path of that build's directory.
+# Listing it is one flat prefix (~3 s at 1700 builds) where the whole-archive
+# --pr-glob is a walk of every PR directory (past 300 s at the same size).
+DEFAULT_INDEX_PREFIX = f"{PROW_BUCKET}/pr-logs/directory/{PROW_JOB_NAME}/"
+
+# The suffix of a per-build pointer in the index. `latest-build.txt` shares
+# it and is skipped because its stem is not a build id.
+INDEX_POINTER_SUFFIX = ".txt"
+
+# Ceiling on one gsutil call. A listing or read past it is reported as timed
+# out and the sweep carries on without it; the refresh workflow's budget must
+# stay larger than this.
+GSUTIL_TIMEOUT_S = 300
+
+# Concurrent gsutil reads while resolving index pointers and reading builds.
+# One build is ~3 sequential reads of a second or two each, so eight workers
+# bring a 150-build catch-up from ~10 minutes to well under two, within the
+# refresh workflow's collect budget, without hammering the bucket. Output
+# order does not depend on completion order: results come back in build-id
+# order.
+READ_WORKERS = 8
 
 # Cap on the free-text reason kept from a per-repetition grading line. Fail
 # reasons quote whole grader checklists and run past 1000 chars; the dashboard
@@ -551,7 +603,11 @@ def annotate_pr_merged(runs: list[dict], gh: str, now: datetime | None = None) -
 def _gsutil(args: list[str], gsutil: str = "gsutil") -> str | None:
     try:
         proc = subprocess.run(
-            [gsutil, *args], capture_output=True, text=True, timeout=300, check=False
+            [gsutil, *args],
+            capture_output=True,
+            text=True,
+            timeout=GSUTIL_TIMEOUT_S,
+            check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         print(f"warning: {gsutil} {' '.join(args)}: {exc}", file=sys.stderr)
@@ -562,6 +618,10 @@ def _gsutil(args: list[str], gsutil: str = "gsutil") -> str | None:
 
 
 _PR_IN_PATH = re.compile(r"/pull/[^/]+/(\d+)/")
+
+# What one build read came back as; _read_builds turns UNFINISHED into a
+# pending_builds entry and FILTERED (older than --since-days) into nothing.
+_RECORDED, _UNFINISHED, _FILTERED = "recorded", "unfinished", "filtered"
 
 
 def _started_at(started_text: str | None) -> datetime | None:
@@ -575,6 +635,178 @@ def _started_at(started_text: str | None) -> datetime | None:
         return None
 
 
+def _admitted(build_id: str, after_build: int | None, retry_builds: frozenset[str]) -> bool:
+    """The incremental watermark: whether a listed build is worth reading.
+
+    Prow build ids are monotonic in START order, so a build at or below the
+    newest RECORDED id may still be in flight (started earlier, outlived the
+    build the watermark came from) -- skipping on the id alone would drop it
+    from the dashboard permanently once the watermark climbs past it.
+    retry_builds carries exactly those ids (the prior file's pending_builds)
+    back through the filter; everything else at or below the watermark is
+    already on record and costs zero reads.
+    """
+    return after_build is None or int(build_id) > after_build or build_id in retry_builds
+
+
+def _read_build(
+    build_id: str, base: str, gsutil: str, since_cutoff: datetime | None
+) -> tuple[str, dict | None, str]:
+    """One build's reads: (build_id, run or None, _RECORDED/_UNFINISHED/_FILTERED).
+
+    `base` is the build directory's gs:// URL with its trailing slash. Runs
+    on a worker thread, so it touches nothing shared: every outcome travels
+    back in the return value.
+    """
+    m = _PR_IN_PATH.search(base)
+    pr_hint = int(m.group(1)) if m else None
+    cache: dict[str, str | None] = {}
+
+    def reader(name: str) -> str | None:
+        if name not in cache:
+            cache[name] = _gsutil(["cat", base + name], gsutil)
+        return cache[name]
+
+    if since_cutoff is not None:
+        # One probe read decides whether to pay the other two. An
+        # unparseable started.json keeps the build: build_run makes the
+        # final call, and a build with no readable metadata is skipped
+        # there anyway.
+        started_at = _started_at(reader("started.json"))
+        if started_at is not None and started_at < since_cutoff:
+            return build_id, None, _FILTERED
+    try:
+        run = build_run(build_id, reader, pr_hint)
+    except Exception as exc:  # noqa: BLE001 -- one bad build must not kill the sweep
+        print(f"warning: build {build_id}: {exc}; skipping", file=sys.stderr)
+        return build_id, None, _UNFINISHED
+    if run is None:
+        print(f"note: build {build_id}: no finished.json; skipping", file=sys.stderr)
+        return build_id, None, _UNFINISHED
+    return build_id, run, _RECORDED
+
+
+def _read_builds(
+    candidates: list[tuple[str, str]],
+    gsutil: str,
+    since_cutoff: datetime | None,
+    unfinished: set[str] | None,
+) -> list[dict]:
+    """Read `(build_id, base_url)` candidates READ_WORKERS at a time.
+
+    The result is in ascending build-id order whatever order the reads
+    finish in: candidates are sorted first and the pool's map keeps input
+    order, so two collects over the same archive write the same runs[].
+    """
+    candidates = sorted(candidates, key=lambda c: int(c[0]))
+    runs = []
+    with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
+        results = pool.map(
+            lambda c: _read_build(c[0], c[1], gsutil, since_cutoff), candidates
+        )
+        for build_id, run, status in results:
+            if status == _RECORDED:
+                runs.append(run)
+            elif status == _UNFINISHED and unfinished is not None:
+                unfinished.add(build_id)
+    return runs
+
+
+def _index_build_ids(listing: str) -> list[str]:
+    """The build ids named by a `gsutil ls` of the directory index.
+
+    Every `<digits>.txt` object is a build; `latest-build.txt` and anything
+    else under the prefix is not.
+    """
+    ids = []
+    for line in listing.splitlines():
+        name = line.strip().rsplit("/", 1)[-1]
+        if not name.endswith(INDEX_POINTER_SUFFIX):
+            continue
+        build_id = name[: -len(INDEX_POINTER_SUFFIX)]
+        if build_id.isdigit():
+            ids.append(build_id)
+    return ids
+
+
+def _resolve_pointer(
+    prefix: str, build_id: str, gsutil: str
+) -> tuple[str, str | None, bool]:
+    """(build_id, build directory URL with trailing slash, retry) from one pointer.
+
+    The pointer is a one-line object holding the build directory's gs://
+    path; the build id comes from the pointer's NAME, so the index decides
+    which build this is and the pointer only says where it lives (a PR
+    directory the collector never has to guess). The URL is None when the
+    pointer cannot be read (retry: the build goes on pending_builds) or does
+    not hold a gs:// path (no retry: re-reading it would not change it).
+    """
+    pointer = f"{prefix}{build_id}{INDEX_POINTER_SUFFIX}"
+    text = _gsutil(["cat", pointer], gsutil)
+    if text is None:
+        # The object was in the listing a moment ago, so this is a read
+        # failure, not a missing build. Said in the shape the refresh
+        # workflow refuses to publish on; the build lands on pending_builds
+        # and is re-read next scan.
+        print(
+            f"warning: gsutil cat failed for {pointer}; build {build_id}"
+            " deferred to the next scan",
+            file=sys.stderr,
+        )
+        return build_id, None, True
+    path = text.strip()
+    if not path.startswith("gs://"):
+        print(
+            f"warning: build {build_id}: index pointer {pointer} does not hold a"
+            f" gs:// path ({path[:80]!r}); skipping",
+            file=sys.stderr,
+        )
+        return build_id, None, False
+    return build_id, path.rstrip("/") + "/", False
+
+
+def runs_from_index(
+    index_prefix: str,
+    gsutil: str = "gsutil",
+    after_build: int | None = None,
+    since_cutoff: datetime | None = None,
+    retry_builds: frozenset[str] = frozenset(),
+    unfinished: set[str] | None = None,
+) -> list[dict]:
+    """Discover builds through Prow's per-job directory index, then read them.
+
+    One `gsutil ls` of the index prefix, the watermark filter on the ids it
+    names, one pointer read per admitted build (concurrent), then the same
+    per-build reads as the glob path. A failed listing is a warning and an
+    empty result -- the refresh workflow greps for that warning and refuses
+    to publish, so a stall never republishes old runs as fresh.
+    """
+    prefix = index_prefix.rstrip("/") + "/"
+    listing = _gsutil(["ls", prefix], gsutil)
+    if listing is None:
+        print(f"warning: gsutil ls failed for {prefix}; nothing new this scan", file=sys.stderr)
+        return []
+    wanted = sorted(
+        (b for b in _index_build_ids(listing) if _admitted(b, after_build, retry_builds)),
+        key=int,
+    )
+    print(
+        f"note: directory index {prefix}: {len(wanted)} build(s) to read"
+        f" (watermark {after_build}, {len(retry_builds)} pending)",
+        file=sys.stderr,
+    )
+    candidates: list[tuple[str, str]] = []
+    with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
+        for build_id, base, retry in pool.map(
+            lambda b: _resolve_pointer(prefix, b, gsutil), wanted
+        ):
+            if base is not None:
+                candidates.append((build_id, base))
+            elif retry and unfinished is not None:
+                unfinished.add(build_id)
+    return _read_builds(candidates, gsutil, since_cutoff, unfinished)
+
+
 def runs_from_gcs(
     pr_globs: list[str],
     gsutil: str = "gsutil",
@@ -583,12 +815,19 @@ def runs_from_gcs(
     retry_builds: frozenset[str] = frozenset(),
     unfinished: set[str] | None = None,
 ) -> list[dict]:
+    """Discover builds by listing the build-directory glob(s), then read them.
+
+    The whole-archive listing grows with the archive and times out past
+    ~1700 builds, so this is the cold-sweep path; an incremental scan goes
+    through runs_from_index.
+    """
     runs = []
     for glob in pr_globs:
         listing = _gsutil(["ls", glob], gsutil)
         if listing is None:
             print(f"warning: gsutil ls failed for {glob}; skipping", file=sys.stderr)
             continue
+        candidates: list[tuple[str, str]] = []
         seen = set()
         for line in listing.splitlines():
             line = line.strip()
@@ -601,53 +840,9 @@ def runs_from_gcs(
                 continue  # latest-build.txt, per-object lines, duplicates
             seen.add(line)
             build_id = line.rstrip("/").rsplit("/", 1)[-1]
-            if not build_id.isdigit():
-                continue
-            # The incremental watermark. Prow build ids are monotonic in
-            # START order, so a build at or below the newest RECORDED id may
-            # still be in flight (started earlier, outlived the build the
-            # watermark came from) -- skipping on the id alone would drop it
-            # from the dashboard permanently once the watermark climbs past
-            # it. retry_builds carries exactly those ids (the prior file's
-            # pending_builds) back through the filter; everything else at or
-            # below the watermark is already on record and costs zero reads.
-            if (
-                after_build is not None
-                and int(build_id) <= after_build
-                and build_id not in retry_builds
-            ):
-                continue
-            m = _PR_IN_PATH.search(line)
-            pr_hint = int(m.group(1)) if m else None
-
-            cache: dict[str, str | None] = {}
-
-            def reader(name: str, base: str = line, cache: dict = cache) -> str | None:
-                if name not in cache:
-                    cache[name] = _gsutil(["cat", base + name], gsutil)
-                return cache[name]
-
-            if since_cutoff is not None:
-                # One probe read decides whether to pay the other two. An
-                # unparseable started.json keeps the build: build_run makes
-                # the final call, and a build with no readable metadata is
-                # skipped there anyway.
-                started_at = _started_at(reader("started.json"))
-                if started_at is not None and started_at < since_cutoff:
-                    continue
-            try:
-                run = build_run(build_id, reader, pr_hint)
-            except Exception as exc:  # noqa: BLE001 -- one bad build must not kill the sweep
-                print(f"warning: build {build_id}: {exc}; skipping", file=sys.stderr)
-                if unfinished is not None:
-                    unfinished.add(build_id)
-                continue
-            if run is None:
-                print(f"note: build {build_id}: no finished.json; skipping", file=sys.stderr)
-                if unfinished is not None:
-                    unfinished.add(build_id)
-                continue
-            runs.append(run)
+            if build_id.isdigit() and _admitted(build_id, after_build, retry_builds):
+                candidates.append((build_id, line))
+        runs.extend(_read_builds(candidates, gsutil, since_cutoff, unfinished))
     return runs
 
 
@@ -848,12 +1043,16 @@ def collect(
     since_days: float | None = None,
     now: datetime | None = None,
     stale_after_s: int | None = None,
+    index_prefix: str | None = None,
 ) -> dict:
     # gh=None skips pr_merged resolution entirely (runs carry no key), which
     # keeps library callers and unit tests hermetic; the CLI passes its --gh
     # default so a normal collect resolves best-effort. `now` anchors the
     # pr_merged resolution window and the pending-build/--since-days clocks
-    # (tests pin it; the CLI leaves it None).
+    # (tests pin it; the CLI leaves it None). index_prefix=None means a
+    # --pr-glob scan discovers builds through the glob alone (library
+    # callers and the glob tests); the CLI passes DEFAULT_INDEX_PREFIX
+    # unless told otherwise.
     now_dt = now or datetime.now(timezone.utc)
     prior: list[dict] = []
     retry: dict[str, str] = {}  # build_id -> first_seen, still worth re-reading
@@ -893,7 +1092,25 @@ def collect(
     unfinished: set[str] = set()
     if from_dir is not None:
         fresh.extend(runs_from_dir(from_dir))
-    if pr_globs:
+    # GCS discovery. --pr-glob is still what asks for a GCS scan at all
+    # (--merge-with alone recomputes without touching the bucket); the index
+    # decides HOW that scan finds builds once there is a watermark to resume
+    # above: one flat listing, then only the new builds. Without a watermark
+    # -- a cold sweep -- the glob is listed as before. Never both: they name
+    # the same builds.
+    use_index = bool(pr_globs) and index_prefix is not None and after_build is not None
+    if use_index:
+        fresh.extend(
+            runs_from_index(
+                index_prefix,
+                gsutil,
+                after_build=after_build,
+                since_cutoff=since_cutoff,
+                retry_builds=frozenset(retry),
+                unfinished=unfinished,
+            )
+        )
+    elif pr_globs:
         fresh.extend(
             runs_from_gcs(
                 pr_globs,
@@ -907,7 +1124,8 @@ def collect(
     if merge_with is not None:
         print(
             f"note: merged {len(prior)} prior runs with {len(fresh)} newly"
-            f" collected (GCS scan resumed above build {after_build},"
+            f" collected (GCS scan resumed above build {after_build}"
+            f" via {'the directory index' if use_index else 'the build-dir glob'},"
             f" retrying {len(retry)} pending)",
             file=sys.stderr,
         )
@@ -957,7 +1175,18 @@ def main(argv: list[str] | None = None) -> int:
         metavar="GS_GLOB",
         help="gsutil glob of Prow build dirs, e.g. gs://kube-agents-prow/"
         "pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*"
-        " (repeatable)",
+        " (repeatable). Discovers builds only for a cold sweep (no watermark"
+        " from --merge-with); with a watermark, --index-prefix is listed"
+        " instead",
+    )
+    parser.add_argument(
+        "--index-prefix",
+        default=DEFAULT_INDEX_PREFIX,
+        metavar="GS_PREFIX",
+        help="Prow's per-job directory index (one <build_id>.txt pointer per"
+        " build), listed once to find the builds above the watermark instead"
+        " of walking every PR directory. Pass an empty string to disable it"
+        f" (default: {DEFAULT_INDEX_PREFIX})",
     )
     parser.add_argument(
         "--from-dir",
@@ -1020,6 +1249,7 @@ def main(argv: list[str] | None = None) -> int:
         merge_with=args.merge_with,
         since_days=args.since_days,
         stale_after_s=args.stale_after_s,
+        index_prefix=args.index_prefix or None,
     )
     args.out.write_text(json.dumps(data, indent=2) + "\n")
     print(
