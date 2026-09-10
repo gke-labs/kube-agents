@@ -1,0 +1,29 @@
+{{- $openshift := .Values.openshift | default dict }}
+{{- $route := $openshift.route | default dict }}
+{{- if and $openshift.enabled $route.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-ingress-router
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    {{- include "kube-agents.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ default "platform-agent" .Values.platformAgent.name }}
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              network.openshift.io/policy-group: ingress
+      ports:
+        - protocol: TCP
+          port: 8642
+        - protocol: TCP
+          port: 8643
+        - protocol: TCP
+          port: 9119
+{{- end }}

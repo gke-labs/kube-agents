@@ -18,16 +18,11 @@ allowedCapabilities: []
 defaultAddCapabilities: []
 readOnlyRootFilesystem: false
 runAsUser:
-  type: MustRunAsRange
-  uidRangeMin: 1000
-  uidRangeMax: 65535
+  type: RunAsAny
 seLinuxContext:
   type: MustRunAs
 fsGroup:
-  type: MustRunAs
-  ranges:
-    - min: 1000
-      max: 65535
+  type: RunAsAny
 supplementalGroups:
   type: RunAsAny
 seccompProfiles:
