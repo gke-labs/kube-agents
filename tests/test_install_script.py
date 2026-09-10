@@ -929,7 +929,7 @@ print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-cent
         self.assertIn("Workload Identity Pool (pre-existing Standard cluster):", out)
         self.assertIn("gcloud container clusters update test-cluster --location us-central1 --project test-proj --workload-pool=test-proj.svc.id.goog", out)
         self.assertIn("NetworkPolicy Enforcement (pre-existing cluster without Dataplane V2):", out)
-        self.assertIn("gcloud container clusters update test-cluster --location us-central1 --project test-proj --update-addons=NetworkPolicyConfig=ENABLED", out)
+        self.assertIn("gcloud container clusters update test-cluster --location us-central1 --project test-proj --update-addons=NetworkPolicy=ENABLED", out)
         self.assertIn("gcloud container clusters update test-cluster --location us-central1 --project test-proj --enable-network-policy", out)
         self.assertIn("GitHub App PEM Import (before apply, when GitOps minter is enabled):", out)
         self.assertIn("git clone --depth 1 --branch v2.7.1 https://github.com/abcxyz/github-token-minter.git /tmp/minty", out)

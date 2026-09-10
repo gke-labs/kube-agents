@@ -1758,7 +1758,7 @@ print_generate_only_handoff() {
   echo -e "    gcloud container node-pools update <node-pool> --cluster=${cluster_name} --location=${region} --project=${project_id} --workload-metadata=GKE_METADATA"
   echo ""
   echo -e "  • ${C_CYAN}NetworkPolicy Enforcement (pre-existing cluster without Dataplane V2):${C_RESET}"
-  echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --update-addons=NetworkPolicyConfig=ENABLED"
+  echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --update-addons=NetworkPolicy=ENABLED"
   echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --enable-network-policy"
   echo ""
   echo -e "  • ${C_CYAN}GitHub App PEM Import (before apply, when GitOps minter is enabled):${C_RESET}"
