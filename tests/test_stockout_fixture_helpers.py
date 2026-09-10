@@ -477,7 +477,7 @@ class BudgetTest(unittest.TestCase):
         )
 
     def test_every_wait_is_capped_by_the_budget(self):
-        for name in ("_INSTALL_TIMEOUT_SECONDS", "_ROLLOUT_TIMEOUT_SECONDS",
+        for name in ("_ROLLOUT_TIMEOUT_SECONDS",
                      "_PLUGIN_READY_TIMEOUT_SECONDS", "_SKILL_MOUNT_TIMEOUT_SECONDS",
                      "_GENERATION_STABLE_SECONDS", "_AGENT_AVAILABILITY_TIMEOUT_SECONDS"):
             with self.subTest(constant=name):
@@ -768,6 +768,21 @@ class EnsurePluginInstalledTest(unittest.TestCase):
                 )
         self.assertIn("was expected on this environment", str(caught.exception))
         self.assertIn("ENABLE_STOCKOUT_INVESTIGATOR=true", str(caught.exception))
+
+    def test_proceeds_when_present(self):
+        def fake_kubectl(*args, **kwargs):
+            return _completed(returncode=0)
+
+        with mock.patch.object(sof, "_kubectl", side_effect=fake_kubectl), \
+                mock.patch("subprocess.run", return_value=_completed(returncode=0)), \
+                mock.patch.object(sof, "_wait_for_plugin_ready", return_value={"spec": {"targetProfile": "platform"}}), \
+                mock.patch.object(sof, "_wait_for_gateway_rollout", return_value=("deployment/platform-agent-gateway", "settled")), \
+                mock.patch.object(sof, "_verify_skill_mounted", return_value="pod-gateway-xyz"), \
+                mock.patch.object(sof, "_clean_stale_kanban_tasks"):
+            # Proceeds cleanly through setup without skipping or failing
+            sof.ensure_stockout_plugin_installed(
+                "proj", "cluster", "us-central1", "kubeagents-system"
+            )
 
 
 class PluginReadyStatusTest(unittest.TestCase):

@@ -13,7 +13,6 @@ import pytest
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 _PLUGIN_DIR = _REPO_ROOT / "agentplugins" / "gke-stockout-investigator"
 _SCENARIOS_DIR = _PLUGIN_DIR / "scenarios"
-_INSTALL_SCRIPT = _PLUGIN_DIR / "install.sh"
 _CLEAN_KANBAN_SCRIPT = _SCENARIOS_DIR / "lib" / "clean_stale_kanban_tasks.py"
 
 # AgentPlugin object name, Helm release, and Hermes plugin module — one identifier, fixed
@@ -40,12 +39,6 @@ _CRD_NAME = "agentplugins.kubeagents.x-k8s.io"
 # minutes. Sum of the individual caps exceeds it deliberately — each is the honest
 # ceiling for its own step, and the budget is what binds when several go long at once.
 _FIXTURE_BUDGET_SECONDS = 600
-# Only reachable when the AgentPlugin is absent, which on the RC means the environment was
-# never provisioned rather than that the plugin drifted. Bounded because install.sh builds
-# and pushes an image on that path: before this, a hung gcloud or docker burned the whole
-# job timeout with no output. The fixture budget above binds first, and that is the
-# intended ceiling — a plugin missing outright is a finding, not something to wait out.
-_INSTALL_TIMEOUT_SECONDS = 600
 # How long the gateway's generation has to hold still before its spec counts as settled.
 #
 # Step 2 provisions the environment immediately before this suite runs, and a `helm
@@ -305,6 +298,9 @@ def _wait_for_plugin_ready(namespace: str, budget_deadline: float) -> Dict[str, 
                 status = obj.get("status", {})
                 phase = status.get("phase")
                 observed = status.get("observedGeneration")
+                detail = (
+                    f"phase={phase!r}, observedGeneration={observed}, generation={generation}"
+                )
                 if phase == "Ready" and observed == generation:
                     return obj
                 if phase == "Degraded" and observed == generation:
@@ -312,7 +308,7 @@ def _wait_for_plugin_ready(namespace: str, budget_deadline: float) -> Dict[str, 
                     reason = ""
                     message = ""
                     for cond in conditions:
-                        if cond.get("reason"):
+                        if cond.get("status") == "False" or cond.get("reason"):
                             reason = cond.get("reason", "")
                             message = cond.get("message", "")
                             break
@@ -320,9 +316,6 @@ def _wait_for_plugin_ready(namespace: str, budget_deadline: float) -> Dict[str, 
                         f"AgentPlugin '{_PLUGIN_NAME}' in '{namespace}' installation failed: "
                         f"phase is 'Degraded' (reason: {reason or 'Unknown'}): {message or detail}"
                     )
-                detail = (
-                    f"phase={phase!r}, observedGeneration={observed}, generation={generation}"
-                )
         else:
             detail = res.stderr.strip() or f"kubectl exited {res.returncode}"
         if time.time() >= deadline:
@@ -816,28 +809,6 @@ def test_stockout_ingress_alert_smoke(
         pytest.fail(f"Stockout verify script missing at '{verify_script}'.")
     if not gcp_project_id or not gke_cluster_name:
         pytest.fail("GCP_PROJECT_ID and GKE_CLUSTER_NAME are required for stockout smoke test.")
-
-    # Check if the stockout plugin is active in the cluster
-    res_plugin = subprocess.run(
-        ["kubectl", "get", "agentplugins", "gkestockoutinvestigator", "-n", agent_namespace],
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
-    if res_plugin.returncode != 0:
-        expected = (
-            os.environ.get("ENABLE_STOCKOUT_INVESTIGATOR", "").lower() == "true"
-            or os.environ.get("E2E_SUITE") in ("rc", "nightly", "stockout-full", "investigations")
-        )
-        if expected:
-            pytest.fail(
-                f"gkestockoutinvestigator AgentPlugin was expected on this environment, but is not active "
-                f"in namespace '{agent_namespace}'."
-            )
-        pytest.skip(
-            f"gkestockoutinvestigator AgentPlugin is not installed in namespace '{agent_namespace}'; "
-            "skipping ingress smoke test."
-        )
 
     agent_ref = os.environ.get("AGENT_REF") or _DEFAULT_AGENT_REF
     ready_pod = _wait_for_agent_available(agent_ref, agent_namespace)
