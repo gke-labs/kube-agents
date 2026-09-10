@@ -102,7 +102,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 #### Why `--generate-only` on Existing Infrastructure:
 
 - **Longer Terraform Operations**: On existing infrastructure with numerous cloud resources, Terraform lifecycle commands (`init`, `validate`, and provider schema inspection) take longer than on greenfield deployments.
-- **Mandatory Plan Analysis**: Adopting existing infrastructure requires careful inspection of `terraform plan` outputs before mutating cloud state to verify that existing subnets, IAM bindings, or cluster configurations are not unintentionally altered or replaced.
+- **Operator Review & Control**: Adopting existing infrastructure benefits from inspecting generated inputs (`terraform.tfvars`, `install.env`) and manual execution of prerequisites before applying Terraform changes.
 - **Out-of-Terraform Prerequisites & Operator Handoff**: The installer auto-detects existing cluster parameters (Workload Identity pool, CMEK database encryption, NetworkPolicy status, OTel collection scope, and KMS token-minter keys), runs pre-apply validations without mutating GCP resources, and prints the exact shell commands needed before and after Terraform apply.
 
 #### What `--generate-only` Does:
@@ -111,10 +111,9 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 2. Runs pre-flight checks and configuration validations without creating or modifying GCP resources.
 3. Prints the exact step-by-step manual execution recipe:
    - **Out-of-Terraform prerequisites** for existing clusters (CMEK database encryption enablement, node-pool `GKE_METADATA` workload identity update, NetworkPolicy enablement, and Cloud KMS key creation for GitHub App private key signing).
-   - **Terraform Plan & Apply execution** with remote state management via `lifecycle.sh`:
+   - **Terraform Apply execution** with remote state management via `lifecycle.sh`:
      ```bash
      cd terraform/examples/full-install
-     KUBE_AGENTS_STATE_BUCKET="<project>-kube-agents-tfstate" KUBE_AGENTS_STATE_PREFIX="kube-agents/<cluster>" ./lifecycle.sh plan
      KUBE_AGENTS_STATE_BUCKET="<project>-kube-agents-tfstate" KUBE_AGENTS_STATE_PREFIX="kube-agents/<cluster>" ./lifecycle.sh apply
      ```
    - **Post-apply steps** (managed-OTel collection scope and Slack socket registration if configured).
@@ -275,7 +274,7 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
   where Save & Apply re-applies through the same engine, or edit your
   hand-written tfvars and re-apply.
 
-- **Existing Infrastructure Recommendation**: When installing on pre-existing infrastructure (such as an existing GKE cluster or shared VPC), using `./install.sh --generate-only` (see [Generate-Only Mode](#generate-only-mode-recommended-for-existing-infrastructure)) is recommended to auto-generate `terraform.tfvars`, run pre-apply validation checks, and inspect `lifecycle.sh plan` thoroughly before applying.
+- **Existing Infrastructure Recommendation**: When installing on pre-existing infrastructure (such as an existing GKE cluster or shared VPC), using `./install.sh --generate-only` (see [Generate-Only Mode](#generate-only-mode-recommended-for-existing-infrastructure)) is recommended to auto-generate `terraform.tfvars`, run pre-apply validation checks, and review prerequisites before applying.
 
 - **Private Container Registry**: If your GKE clusters may only pull from an approved registry, see
   [Private container registry](#private-container-registry) below for the full recipe. Mirroring
