@@ -387,10 +387,11 @@ and say which clusters were not covered. See [The clean run](#the-clean-run) for
 }
 ```
 
-(The `declared` entry is illustrative and crosses streams: `no-hpa` is an obtainability check and
-would be rejected inside a real compliance document, because `declared[].check` is validated against
-the same roster as `findings[].check`. Today only the `obtainability-audit` SOP has a step that
-writes the list; the validator accepts the key on every stream.)
+(The `declared` entry is illustrative and crosses streams: a real compliance document would be
+rejected for carrying it. `declared[].check` is validated against the stream's `declarable` set in
+`AUDITS` — its posture checks, a subset of the roster — and only `obtainability-audit` has one
+today, because only its SOP has a step that writes the list. A non-empty `declared` on any other
+stream exits 2; `[]` validates everywhere.)
 
 Field rules the validator enforces — a violation exits 2 naming the offending finding index and
 field, and publishes nothing:
@@ -473,7 +474,9 @@ field, and publishes nothing:
   slug, whose `path` follows the remediation-path rules, and whose `excerpt` is the non-empty lines
   that pin the property. No `severity`, no `remediation`, no `id`. The document is rejected when an
   entry's four identity fields match a finding's — a posture is reported or declared, never both —
-  or when its `cluster` is not in `scope.clusters`. A document without the key validates as before.
+  when its `cluster` is not in `scope.clusters`, or when its `check` is not one of the stream's
+  declarable posture checks (a declared fault is a declared bug, and a stream with no
+  declared-intent step has none). A document without the key validates as before.
 - **A `path` is discovered, never invented.** Editing an object means writing over its existing
   declaration. Creating one means writing beside a sibling already applied to the same cluster and
   namespace — search the repository for `namespace: <namespace>`, then **open the hits and confirm
@@ -562,9 +565,10 @@ What the shape enforces:
   and the ledger renders both, so a reviewer who disagrees changes or removes the declaration and
   the posture returns as a finding on the next run. A declaration the worker did not read is not
   one it may cite.
-- **It justifies posture, never a fault.** Which checks may move here is the SOP's call, not the
-  validator's; the pilot limits it to four. A drain-blocking budget declared in a repository is a
-  declared bug and stays a finding.
+- **It justifies posture, never a fault.** Which checks may move here is the stream's `declarable`
+  set in `AUDITS`, four for the pilot, and the validator rejects any other check with exit 2. A
+  drain-blocking budget declared in a repository is a declared bug and stays a finding, and a
+  document that lists it under `declared` publishes nothing.
 
 ## Evidence rules
 

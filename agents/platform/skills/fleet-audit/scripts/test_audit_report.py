@@ -51,6 +51,9 @@ class GitResult:
 
 
 AUDIT = "compliance-audit"
+# The one stream whose SOP has a declared-intent step, so the one stream on
+# which a `declared` list validates. Every other stream rejects the list.
+DECLARING_AUDIT = "obtainability-audit"
 NOW = datetime(2026, 8, 1, 9, 30, tzinfo=timezone.utc)
 
 # Which SOP owns each stream's check roster. Spelled out rather than derived
@@ -1967,6 +1970,24 @@ class TestAuditCatalogue(unittest.TestCase):
                     f"{jobs[audit_id]['name']!r}",
                 )
 
+    def test_declarable_checks_are_posture_checks_on_the_roster(self):
+        """`declarable` is a subset of the roster: no derived slug, no duplicate.
+
+        The validator holds `declared[].check` to this set, so a slug listed
+        here but not on the roster would admit a declared posture no check can
+        produce, and a derived slug here would let a meta-finding be declared
+        away.
+        """
+        for audit_id, spec in audit_report.AUDITS.items():
+            with self.subTest(audit=audit_id):
+                self.assertEqual(len(spec.declarable), len(set(spec.declarable)))
+                self.assertLessEqual(set(spec.declarable), set(spec.checks))
+                self.assertFalse(set(spec.declarable) & set(spec.derived))
+                self.assertEqual(
+                    audit_report.audit_declarable_checks(audit_id),
+                    frozenset(spec.declarable),
+                )
+
     def test_check_rosters_match_the_sops(self):
         """The roster is the SOP's check list, or it is a lie the validator tells.
 
@@ -2934,9 +2955,9 @@ class TestFinishClean(HarnessTestCase):
         # Nothing to open and nothing to close, so the JSON line and the log
         # are the only trace that the run deferred to a declaration.
         self.harness.replies = {"issue list": "[]"}
-        doc = make_doc(findings=[])
+        doc = make_doc(audit=DECLARING_AUDIT, findings=[])
         doc["declared"] = [make_declared()]
-        self.assertEqual(self.run_finish(doc), 0)
+        self.assertEqual(self.run_finish(doc, audit=DECLARING_AUDIT), 0)
         payload = self.stdout_json()
         self.assertEqual(payload["status"], "CLEAN")
         self.assertEqual(payload["declared"], 1)
@@ -2949,9 +2970,9 @@ class TestFinishClean(HarnessTestCase):
 
     def test_the_findings_branch_reports_the_declared_count_too(self):
         self.harness.replies = {"issue list": "[]"}
-        doc = make_doc()
+        doc = make_doc(audit=DECLARING_AUDIT, findings=[make_finding(check="no-pdb")])
         doc["declared"] = [make_declared(), make_declared(obj="Deployment/web")]
-        self.assertEqual(self.run_finish(doc), 0)
+        self.assertEqual(self.run_finish(doc, audit=DECLARING_AUDIT), 0)
         self.assertEqual(self.stdout_json()["declared"], 2)
 
     def test_clean_run_closes_the_open_ledger_as_completed(self):
@@ -3409,7 +3430,7 @@ class TestDryRun(BaseTestCase):
 
 
 def make_declared(
-    check="netpol-missing",
+    check="no-hpa",
     cluster="prod-us-east",
     namespace="payments",
     obj="Deployment/api",
@@ -3429,6 +3450,13 @@ def make_declared(
     }
 
 
+def declaring_doc(findings=None, **kwargs):
+    """A document on the declaring stream, carrying one posture finding by default."""
+    if findings is None:
+        findings = [make_finding(check="no-pdb")]
+    return make_doc(findings=findings, audit=DECLARING_AUDIT, **kwargs)
+
+
 class TestDeclaredIntent(BaseTestCase):
     """The `declared` list: seen, declared on purpose, and therefore not a finding.
 
@@ -3441,7 +3469,7 @@ class TestDeclaredIntent(BaseTestCase):
     """
 
     def validate(self, doc):
-        return audit_report.validate_findings(copy.deepcopy(doc), AUDIT)
+        return audit_report.validate_findings(copy.deepcopy(doc), DECLARING_AUDIT)
 
     def rejects(self, doc, *fragments):
         with self.assertRaises(audit_report.ValidationError) as caught:
@@ -3453,38 +3481,87 @@ class TestDeclaredIntent(BaseTestCase):
     # -- validation ---------------------------------------------------------
 
     def test_a_document_without_the_key_validates_as_before(self):
-        doc = make_doc()
+        doc = declaring_doc()
         self.assertNotIn("declared", doc)
         self.validate(doc)
 
     def test_a_well_formed_entry_is_accepted_and_gets_no_id(self):
-        doc = make_doc(findings=[])
+        doc = declaring_doc(findings=[])
         doc["declared"] = [make_declared()]
         validated = self.validate(doc)
         self.assertNotIn("id", validated["declared"][0])
         self.assertNotIn("severity", validated["declared"][0])
 
     def test_the_key_must_be_a_list(self):
-        doc = make_doc()
-        doc["declared"] = {"check": "netpol-missing"}
+        doc = declaring_doc()
+        doc["declared"] = {"check": "no-hpa"}
         self.rejects(doc, "declared: must be a list")
 
     def test_the_check_must_be_on_the_roster_and_the_roster_is_not_printed(self):
-        doc = make_doc()
+        doc = declaring_doc()
         doc["declared"] = [make_declared(check="pinned-replicas")]
         exc = self.rejects(doc, "declared[0].check", "'pinned-replicas'")
-        for slug in audit_report.audit_checks(AUDIT):
+        for slug in audit_report.audit_checks(DECLARING_AUDIT):
             self.assertNotIn(slug, str(exc))
 
+    def test_a_fault_check_is_rejected_and_the_declarable_set_is_not_printed(self):
+        # The red line "a declaration justifies posture, never a fault" is an
+        # exit 2, not a sentence: `blocking-pdb` is the SOP's own example of a
+        # declared bug, and `no-requests` is the fault a declaration most
+        # plausibly names by accident. Both are on the roster; neither moves.
+        for fault in ("blocking-pdb", "no-requests", "rigid-scheduling"):
+            with self.subTest(check=fault):
+                doc = declaring_doc()
+                doc["declared"] = [make_declared(check=fault)]
+                exc = self.rejects(
+                    doc, "declared[0].check", repr(fault), "fault, not a posture"
+                )
+                for slug in audit_report.audit_declarable_checks(DECLARING_AUDIT):
+                    self.assertNotIn(slug, str(exc))
+
+    def test_every_posture_check_may_be_declared(self):
+        for posture in audit_report.audit_declarable_checks(DECLARING_AUDIT):
+            with self.subTest(check=posture):
+                doc = declaring_doc(findings=[])
+                doc["declared"] = [make_declared(check=posture)]
+                self.validate(doc)
+
+    def test_a_stream_without_a_declared_intent_step_rejects_the_list(self):
+        # Eight streams have no §4a. A worker on one of them that writes a
+        # `declared` list has misread a step that does not exist for it, and a
+        # hostile document has found a stream with no rule to break; both are
+        # rejected whole rather than admitted because the check is on the
+        # roster. `[]` still validates everywhere: it says what an absent key
+        # says.
+        silent = [
+            audit_id
+            for audit_id, spec in audit_report.AUDITS.items()
+            if not spec.declarable
+        ]
+        self.assertIn(AUDIT, silent)
+        self.assertEqual(len(silent), len(audit_report.AUDITS) - 1)
+        for audit_id in silent:
+            with self.subTest(audit=audit_id):
+                doc = make_doc(audit=audit_id, findings=[])
+                doc["declared"] = []
+                audit_report.validate_findings(copy.deepcopy(doc), audit_id)
+                doc["declared"] = [
+                    make_declared(check=audit_report.audit_checks(audit_id)[0])
+                ]
+                with self.assertRaises(audit_report.ValidationError) as caught:
+                    audit_report.validate_findings(copy.deepcopy(doc), audit_id)
+                self.assertIn("declared[0]", str(caught.exception))
+                self.assertIn("no declared-intent step", str(caught.exception))
+
     def test_the_cluster_must_be_one_this_run_read(self):
-        doc = make_doc(skipped=[{"cluster": "dr-west", "reason": "unreachable"}])
+        doc = declaring_doc(skipped=[{"cluster": "dr-west", "reason": "unreachable"}])
         doc["declared"] = [make_declared(cluster="dr-west")]
         self.rejects(doc, "declared[0].cluster", "not in scope.clusters")
         doc["declared"] = [make_declared(cluster="never-heard-of")]
         self.rejects(doc, "declared[0].cluster", "not in scope.clusters")
 
     def test_the_declaration_is_required_and_complete(self):
-        doc = make_doc()
+        doc = declaring_doc()
         entry = make_declared()
         del entry["declaration"]
         doc["declared"] = [entry]
@@ -3497,14 +3574,14 @@ class TestDeclaredIntent(BaseTestCase):
                 self.rejects(doc, f"declared[0].declaration.{field}")
 
     def test_the_repository_is_a_slug(self):
-        doc = make_doc()
+        doc = declaring_doc()
         for bad in ("https://github.com/acme/terraform-live", "acme", "", None, 7):
             with self.subTest(repo=bad):
                 doc["declared"] = [make_declared(repo=bad)]
                 self.rejects(doc, "declared[0].declaration.repo", "owner/name")
 
     def test_the_path_follows_the_remediation_path_rules(self):
-        doc = make_doc()
+        doc = declaring_doc()
         for bad in ("/etc/passwd", "../../secrets.tf", "clusters/*.tf", "a/.git/config"):
             with self.subTest(path=bad):
                 doc["declared"] = [make_declared(path=bad)]
@@ -3516,23 +3593,23 @@ class TestDeclaredIntent(BaseTestCase):
         )
 
     def test_the_excerpt_must_carry_the_lines_that_pin_the_property(self):
-        doc = make_doc()
+        doc = declaring_doc()
         doc["declared"] = [make_declared(excerpt="   ")]
         self.rejects(doc, "declared[0].declaration.excerpt", "non-empty")
 
     def test_a_title_is_required(self):
-        doc = make_doc()
+        doc = declaring_doc()
         doc["declared"] = [make_declared(title="")]
         self.rejects(doc, "declared[0].title")
 
     def test_identity_fields_must_name_something(self):
-        doc = make_doc()
+        doc = declaring_doc()
         doc["declared"] = [make_declared(obj="///")]
         self.rejects(doc, "declared[0].object", "names nothing")
 
     def test_a_posture_cannot_be_both_a_finding_and_declared(self):
-        finding = make_finding(obj="Deployment/api", namespace="payments")
-        doc = make_doc(findings=[finding])
+        finding = make_finding(check="no-pdb", obj="Deployment/api", namespace="payments")
+        doc = declaring_doc(findings=[finding])
         doc["declared"] = [
             make_declared(
                 check=finding["check"],
@@ -3549,7 +3626,7 @@ class TestDeclaredIntent(BaseTestCase):
         )
 
     def test_two_declared_entries_cannot_share_an_identity(self):
-        doc = make_doc()
+        doc = declaring_doc()
         doc["declared"] = [make_declared(), make_declared(title="said twice")]
         self.rejects(doc, "declared[1]", "same identity as declared[0]")
 
@@ -3557,17 +3634,17 @@ class TestDeclaredIntent(BaseTestCase):
         # Identity is the finding's identity: check is part of it, so a
         # workload whose replica count and missing budget are both declared
         # is two entries, not a collision.
-        doc = make_doc()
+        doc = declaring_doc()
         doc["declared"] = [
-            make_declared(check="netpol-missing"),
-            make_declared(check="default-sa-automount"),
+            make_declared(check="no-hpa"),
+            make_declared(check="no-pdb"),
         ]
         self.validate(doc)
 
     # -- rendering ----------------------------------------------------------
 
     def test_the_ledger_renders_a_declared_intent_section_after_the_findings(self):
-        doc = make_doc()
+        doc = declaring_doc()
         doc["declared"] = [make_declared()]
         body = render_body(self.validate(doc), generated_at=NOW)
         self.assertIn("## Declared intent", body)
@@ -3579,8 +3656,10 @@ class TestDeclaredIntent(BaseTestCase):
         self.assertIn("min_replicas = 3 max_replicas = 3", body)
 
     def test_no_section_renders_when_nothing_is_declared(self):
-        self.assertNotIn("## Declared intent", render_body(make_doc(), generated_at=NOW))
-        doc = make_doc()
+        self.assertNotIn(
+            "## Declared intent", render_body(declaring_doc(), generated_at=NOW)
+        )
+        doc = declaring_doc()
         doc["declared"] = []
         self.assertNotIn("## Declared intent", render_body(doc, generated_at=NOW))
 
@@ -3588,7 +3667,7 @@ class TestDeclaredIntent(BaseTestCase):
         # The whole point of a separate list. In the delta block the entry
         # would be announced as new today and as resolved the day the
         # declaration is removed — the opposite of what happened.
-        doc = make_doc(findings=[make_finding(fid="real")])
+        doc = declaring_doc(findings=[make_finding(check="no-pdb", fid="real")])
         doc["declared"] = [make_declared()]
         validated = self.validate(doc)
         rendered = audit_report.render_issue_body(validated, generated_at=NOW)
@@ -3600,14 +3679,16 @@ class TestDeclaredIntent(BaseTestCase):
     def test_a_declared_posture_renders_on_a_ledger_with_no_findings(self):
         # Coverage gap plus zero findings opens a ledger; the declared section
         # still says what was seen and where it is declared.
-        doc = make_doc(findings=[], skipped=[{"cluster": "dr-west", "reason": "down"}])
+        doc = declaring_doc(
+            findings=[], skipped=[{"cluster": "dr-west", "reason": "down"}]
+        )
         doc["declared"] = [make_declared()]
         body = render_body(self.validate(doc), generated_at=NOW)
         self.assertIn("No findings", body)
         self.assertIn("## Declared intent", body)
 
     def test_cells_are_escaped_and_clipped(self):
-        doc = make_doc()
+        doc = declaring_doc()
         doc["declared"] = [
             make_declared(
                 title="pipe | and `tick` in the title",
@@ -3620,7 +3701,7 @@ class TestDeclaredIntent(BaseTestCase):
         self.assertNotIn("x" * (audit_report.MAX_CELL_CHARS + 1), row)
 
     def test_the_table_is_row_capped_and_says_so(self):
-        doc = make_doc()
+        doc = declaring_doc()
         doc["declared"] = [
             make_declared(obj=f"Deployment/api-{n}")
             for n in range(audit_report.MAX_DECLARED_ROWS + 5)
@@ -3635,11 +3716,11 @@ class TestDeclaredIntent(BaseTestCase):
     def test_the_section_is_charged_against_the_body_budget(self):
         # Findings yield to the declared table, not the other way round: with
         # the table present, fewer findings fit and the body stays legal.
-        findings = bulk_findings(400)
+        findings = bulk_findings(400, check="no-pdb")
         plain = audit_report.render_issue_body(
-            self.validate(make_doc(findings=findings)), generated_at=NOW
+            self.validate(declaring_doc(findings=findings)), generated_at=NOW
         )
-        doc = make_doc(findings=findings)
+        doc = declaring_doc(findings=findings)
         doc["declared"] = [
             make_declared(obj=f"Deployment/api-{n}")
             for n in range(audit_report.MAX_DECLARED_ROWS)
@@ -3655,16 +3736,20 @@ class TestDeclaredIntent(BaseTestCase):
     # -- the clean run --------------------------------------------------------
 
     def test_the_clean_comment_says_what_was_declared(self):
-        doc = make_doc(findings=[])
+        doc = declaring_doc(findings=[])
         doc["declared"] = [make_declared()]
-        comment = audit_report.render_clean_comment(AUDIT, self.validate(doc), NOW)
+        comment = audit_report.render_clean_comment(
+            DECLARING_AUDIT, self.validate(doc), NOW
+        )
         self.assertIn("is now clean", comment)
         self.assertIn("1 posture(s)", comment)
         self.assertIn("`acme/terraform-live:clusters/prod-us-east/payments.tf`", comment)
         self.assertIn("`payments/Deployment/api`", comment)
 
     def test_the_clean_comment_is_unchanged_without_declarations(self):
-        comment = audit_report.render_clean_comment(AUDIT, make_doc(findings=[]), NOW)
+        comment = audit_report.render_clean_comment(
+            DECLARING_AUDIT, declaring_doc(findings=[]), NOW
+        )
         self.assertNotIn("posture(s)", comment)
 
     def test_the_pointer_is_not_clipped_to_a_cell(self):
@@ -3676,12 +3761,12 @@ class TestDeclaredIntent(BaseTestCase):
             "deployment-and-scaling-policy.tf"
         )
         self.assertGreater(len(f"{repo}:{path}"), audit_report.MAX_CELL_CHARS)
-        doc = make_doc()
+        doc = declaring_doc()
         doc["declared"] = [make_declared(repo=repo, path=path)]
         validated = self.validate(doc)
         body = render_body(validated, generated_at=NOW)
         self.assertIn(f"`{repo}:{path}`", body)
-        comment = audit_report.render_clean_comment(AUDIT, validated, NOW)
+        comment = audit_report.render_clean_comment(DECLARING_AUDIT, validated, NOW)
         self.assertIn(f"`{repo}:{path}`", comment)
 
     # -- the CLI --------------------------------------------------------------
@@ -3689,22 +3774,24 @@ class TestDeclaredIntent(BaseTestCase):
     def test_a_dry_run_prints_the_section_and_counts_it(self):
         self.patch_attr("run_cmd", Recorder())
         self.patch_attr("repo_root_best_effort", lambda: self.tmp_path)
-        doc = make_doc()
+        doc = declaring_doc()
         doc["declared"] = [make_declared()]
-        self.assertEqual(self.run_finish(doc, argv_extra=("--dry-run",)), 0)
+        rc = self.run_finish(doc, audit=DECLARING_AUDIT, argv_extra=("--dry-run",))
+        self.assertEqual(rc, 0)
         self.assertIn("## Declared intent", self.out)
         self.assertIn("DECLARED: 1 posture(s)", self.err)
 
     def test_a_dry_run_rejects_a_posture_listed_twice(self):
         self.patch_attr("run_cmd", Recorder())
-        finding = make_finding()
-        doc = make_doc(findings=[finding])
+        finding = make_finding(check="no-pdb")
+        doc = declaring_doc(findings=[finding])
         doc["declared"] = [
             make_declared(
                 check=finding["check"], namespace=finding["namespace"], obj=finding["object"]
             )
         ]
-        self.assertEqual(self.run_finish(doc, argv_extra=("--dry-run",)), 2)
+        rc = self.run_finish(doc, audit=DECLARING_AUDIT, argv_extra=("--dry-run",))
+        self.assertEqual(rc, 2)
         self.assertIn("listed as a finding and as declared", self.err)
         self.assertNotIn("## Findings", self.out)
 
@@ -3877,12 +3964,13 @@ class TestAiSecurityAuditStream(BaseTestCase):
 # --------------------------------------------------------------------------- #
 
 
-def bulk_findings(count, severity="minor", prefix="f"):
+def bulk_findings(count, severity="minor", prefix="f", check="netpol-missing"):
     """`count` findings with distinct ids and SOP-shaped prose."""
     return [
         make_finding(
             fid=f"{prefix}-{i:04d}",
             severity=severity,
+            check=check,
             title=f"Finding {i}: workload deviates from the baseline",
             namespace=f"ns-{i:04d}",
             obj=f"Deployment/app-{i:04d}",

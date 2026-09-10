@@ -101,12 +101,24 @@ class AuditSpec(NamedTuple):
     ledger open forever. `fleet-consistency-drift`'s split-cluster guard is the
     standing example: it fires when a cluster is an outlier on six or more
     facets, which is not something you can run against a cluster in isolation.
+
+    `declarable` names the checks a repository declaration may move out of
+    `findings` into `declared`: the stream's *posture* checks, the ones whose
+    flagged shape an owner can have chosen on purpose. Empty for a stream whose
+    SOP has no declared-intent step, and empty is what it means: the validator
+    rejects any `declared[]` entry whose check is not in it, so "a declaration
+    justifies posture, never a fault" is an exit 2 rather than a sentence in the
+    SOP. A findings document that moves `blocking-pdb` — a declared bug — into
+    `declared` fails validation instead of publishing a silenced fault as
+    intended. Never a superset of `checks`, never a `derived` slug;
+    `test_declarable_checks_are_posture_checks_on_the_roster` holds both.
     """
 
     title: str
     sop: str
     checks: tuple[str, ...]
     derived: tuple[str, ...] = ()
+    declarable: tuple[str, ...] = ()
 
 
 # The audit streams allowed to own a ledger. An id not listed here is rejected
@@ -166,6 +178,12 @@ AUDITS: dict[str, AuditSpec] = {
             "probes-liveness",
             "single-replica",
         ),
+        # §4a of the SOP: the four checks that judge a posture rather than a
+        # fault, and so the only four a repository declaration may keep off the
+        # ledger. `hpa-cannot-scale` is declarable only in its `min == max`
+        # shape; the validator cannot tell the shapes apart from the slug, and
+        # the SOP's step carries that distinction.
+        declarable=("no-pdb", "no-hpa", "hpa-cannot-scale", "single-replica"),
     ),
     "fleet-wide-cost-analysis": AuditSpec(
         "Fleet Waste Audit",
@@ -960,6 +978,16 @@ def audit_finding_checks(audit_id: str) -> frozenset[str]:
     """Every slug a `finding.check` may cite: the roster plus the derived ones."""
     spec = AUDITS.get(audit_id)
     return frozenset(spec.checks + spec.derived) if spec else frozenset()
+
+
+def audit_declarable_checks(audit_id: str) -> frozenset[str]:
+    """The slugs a `declared[].check` may cite: the stream's posture checks.
+
+    Empty for every stream whose SOP has no declared-intent step, and an empty
+    set rejects every entry — see `AuditSpec.declarable`.
+    """
+    spec = AUDITS.get(audit_id)
+    return frozenset(spec.declarable) if spec else frozenset()
 
 
 def audit_sop(audit_id: str) -> str:
@@ -1810,6 +1838,12 @@ def validate_findings(data: object, audit_id: str) -> dict:
     # justifies the posture — no severity, no remediation, no id — because it
     # is not a finding: it never enters the delta block, is never announced as
     # new or resolved, and never becomes a pull request.
+    #
+    # The check is held to the stream's `declarable` set, not to the roster: a
+    # declaration justifies a posture, never a fault, and the set is where that
+    # rule stops being prose. A stream with no declared-intent step has an
+    # empty set, so a non-empty list on it is rejected whole; `[]` is accepted
+    # everywhere because it says the same thing as an absent key.
     declared = data.get("declared")
     if declared is not None:
         if not isinstance(declared, list):
@@ -1817,11 +1851,18 @@ def validate_findings(data: object, audit_id: str) -> dict:
                 "declared: must be a list when present — one entry per posture a "
                 "repository declaration justified, or omit the key"
             )
+        declarable = audit_declarable_checks(audit_id)
         seen_declared: dict[str, int] = {}
         for i, entry in enumerate(declared):
             where = f"declared[{i}]"
             if not isinstance(entry, dict):
                 raise ValidationError(f"{where}: expected an object")
+            if not declarable:
+                raise ValidationError(
+                    f"{where}: the {audit_id} SOP has no declared-intent step, so "
+                    "no check in it may be moved to `declared` — every candidate "
+                    "is a finding. Drop the entry, or omit the key"
+                )
             _require_str(entry.get("check"), f"{where}.check", allow_empty=False)
             check = str(entry["check"])
             if check not in finding_check_set:
@@ -1830,6 +1871,16 @@ def validate_findings(data: object, audit_id: str) -> dict:
                     f"{where}.check: {check!r} is not a check in the {audit_id} "
                     "SOP. Name checks by the backticked slug in their `####` "
                     f"heading. {_sop_pointer(audit_id)}"
+                )
+            if check not in declarable:
+                # The declarable set is not printed either: it is a subset of
+                # the roster, and the SOP step that writes this list names it.
+                raise ValidationError(
+                    f"{where}.check: {check!r} judges a fault, not a posture, so "
+                    "no repository declaration justifies it — a declared fault is "
+                    "a declared bug and stays a finding. The declared-intent step "
+                    f"of governance/{audit_sop(audit_id)} names the checks it may "
+                    "move; write this one under `findings`"
                 )
             _require_str(entry.get("title"), f"{where}.title", allow_empty=False)
             _require_str(entry.get("cluster"), f"{where}.cluster", allow_empty=False)

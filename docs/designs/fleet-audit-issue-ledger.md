@@ -380,10 +380,12 @@ from `managed_repos` because the managed list feeds the broker's push gate, the 
 and the minter policy, and a `role: context` marker inside it would have been flattened into a
 writable entry by the shared parser; a key nothing downstream reads is read-only by construction.
 The document may carry a `declared` list beside `findings` — a finding's four identity fields plus
-the `repo`, `path` and `excerpt` of the declaration — validated for roster, scope and a
-non-overlapping identity, and never given an id, so it enters no delta and no pull request. The
-obtainability SOP (§4a) is the pilot; the schema and the ledger section it renders to are stated in
-the skill file, and `finish` reports the list's length as `declared`.
+the `repo`, `path` and `excerpt` of the declaration — validated for scope, a non-overlapping
+identity, and a `check` in the stream's `declarable` set (its posture checks, held in `AUDITS`
+beside the roster; a fault check or a stream with no declared-intent step is rejected), and never
+given an id, so it enters no delta and no pull request. The obtainability SOP (§4a) is the pilot;
+the schema and the ledger section it renders to are stated in the skill file, and `finish` reports
+the list's length as `declared`.
 
 `workspace` is the clone, and it is not decoration. The audit cron starts in the agent's profile
 directory, which is not a working tree — so there is nothing to `git add` into and nothing for
