@@ -5,7 +5,7 @@ presubmit's rules read it: collapse (rung 4), which may only red a case that
 has proved it passes reliably; judged regression (rung 6), which compares this
 pull request's judge scores against main's at the same version key; and the
 suite aggregate, which compares pass rates and reports the result — it reds
-the job only once `EVAL_AGGREGATE_ARMED` is set to `1`.
+the job only once `EVAL_AGGREGATE_ARMED` is set to `1` (or `true`/`yes`).
 
 **This store ships empty, and it fills itself.** Every nightly run on `main`
 appends what it measured (`bench-gate record`), and a case is admitted once its

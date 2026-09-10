@@ -1661,8 +1661,9 @@ print(m.group(1).strip('\'\"') if m else '')
 
 # The transition bridge: cases named here keep the old blocking behaviour
 # until the store holds a full window for them -- EVAL_ADMISSION_MIN_RUNS
-# runs at the current version key -- arming rung 4 and leaving rung 6 quiet
-# meanwhile. Once the window is full the record decides, either way: a name
+# runs at the current version key -- arming rung 4 meanwhile, and leaving
+# rung 6 quiet only while the store holds nothing for them at that key.
+# Once the window is full the record decides, either way: a name
 # here cannot keep a case the record turned away, and a case the record
 # admits blocks without being named. docs/eval-gate-roster.md has the
 # switch-over criteria for deleting this list. Comma- or whitespace-separated
@@ -2022,8 +2023,8 @@ fi
 # The suite roll-up: blocking cases, the admitted-case aggregate, and the
 # all-infrastructure check. Exit 0 green, 1 red. --baseline-rate is not passed:
 # the rate is computed from the store, per admitted case at its own version
-# key. While the store holds nothing, and until EVAL_AGGREGATE_ARMED is set,
-# the aggregate stays advisory and the markdown says so, rather than implying
+# key. While the store holds nothing, and until EVAL_AGGREGATE_ARMED is set
+# to 1, the aggregate stays advisory and the markdown says so, rather than implying
 # a comparison that did not happen or a rule that was armed.
 TOTAL_DURATION=$((SECONDS - START_TIME))
 if (cd "${BENCH_DIR}" && uv run bench-gate suite \

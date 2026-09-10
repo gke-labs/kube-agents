@@ -126,7 +126,8 @@ the state everything ships in.
 
 **The suite aggregate** covers admitted cases only, excludes infra repetitions, and reds when
 `pr_rate < main_rate - margin` **over at least `EVAL_AGGREGATE_MIN_SCORED` scored repetitions**
-(default 30) — and only once `EVAL_AGGREGATE_ARMED` is set to `1` in the job's environment. Unarmed,
+(default 30) — and only once `EVAL_AGGREGATE_ARMED` is set to `1` (or `true`/`yes`) in the job's
+environment. Unarmed,
 which is the default, a rate below the margin over a full sample is written into the verdict as a
 note rather than a reason: the flat margin has not been measured against how much an unchanged
 pull request moves the aggregate on `main`, and arming it is a decision for after the store holds
@@ -713,15 +714,15 @@ This is the piece that is written but not landed, and nothing appends until it l
 `hack/ci-env.sh`'s reference to `oss-test-infra#2655` — not to this repo, which is why no amount of
 work here can close the loop. What it has to be:
 
-| Requirement                                                   | Why                                                                                                                                                                                                                                    |
-| ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| A **nightly periodic** on `main`, not a postsubmit            | Cost, and it is not close — see below. The evidence stays attributable: `extra_refs` checks out `main`'s head and `record` stamps each line with the SHA it ran on, so a periodic identifies its commit exactly as a postsubmit would. |
-| `JOB_TYPE` in {`periodic`, `postsubmit`}, `PULL_NUMBER` unset | Both guards key on this. The empty `PULL_NUMBER` is the one doing the real work — neither job type is a pull request.                                                                                                                  |
-| Sets `EVAL_BASELINE_STORE` to the bucket                      | Unset, the append lands in the git checkout and dies with the workspace. This is what closes the loop.                                                                                                                                 |
-| Sets `PULL_PULL_SHA` from the checkout                        | A periodic has none, and `hack/ci-deploy.sh` falls back to the literal `latest`, so every night would tag its build `pr-local-latest` and lose which commit produced the evidence.                                                     |
-| Runs as an SA with `objectCreator` **and** `objectViewer`     | It appends, and it reads the store to compute its own verdict. Creator alone cannot read back.                                                                                                                                         |
-| Alerts on failure; `optional` must not appear                 | A periodic gates nothing, so nothing downstream notices it break. `optional` is a presubmit-only Tide field.                                                                                                                           |
-| `EVAL_REPETITIONS` need not match the presubmit's             | See "why the counts may differ" below. What must match is how a single run is produced, not how many were taken; the nights to admission are `ceil(20 / EVAL_REPETITIONS)`.                                                            |
+| Requirement                                                   | Why                                                                                                                                                                                                                                                                                       |
+| ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A **nightly periodic** on `main`, not a postsubmit            | Cost, and it is not close — see below. The evidence stays attributable: `extra_refs` checks out `main`'s head and `record` stamps each line with the SHA it ran on, so a periodic identifies its commit exactly as a postsubmit would.                                                    |
+| `JOB_TYPE` in {`periodic`, `postsubmit`}, `PULL_NUMBER` unset | Both guards key on this. The empty `PULL_NUMBER` is the one doing the real work — neither job type is a pull request.                                                                                                                                                                     |
+| Sets `EVAL_BASELINE_STORE` to the bucket                      | Unset, the append lands in the git checkout and dies with the workspace. This is what closes the loop.                                                                                                                                                                                    |
+| Sets `PULL_PULL_SHA` from the checkout                        | A periodic has none, and `hack/ci-deploy.sh` falls back to the literal `latest`, so every night tags its build `pr-local-latest`. The evidence's own `commit` does not depend on it: `hack/ci-eval-pr.sh` stamps `record` with the checkout's HEAD when Prow supplies no `PULL_BASE_SHA`. |
+| Runs as an SA with `objectCreator` **and** `objectViewer`     | It appends, and it reads the store to compute its own verdict. Creator alone cannot read back.                                                                                                                                                                                            |
+| Alerts on failure; `optional` must not appear                 | A periodic gates nothing, so nothing downstream notices it break. `optional` is a presubmit-only Tide field.                                                                                                                                                                              |
+| `EVAL_REPETITIONS` need not match the presubmit's             | See "why the counts may differ" below. What must match is how a single run is produced, not how many were taken; the nights to admission are `ceil(20 / EVAL_REPETITIONS)`.                                                                                                               |
 
 **Why nightly and not per-merge.** This was specified as a postsubmit and the arithmetic overturned
 it. `main` takes about ten merges a day — 310 in the thirty days to 2026-08-26 — and the job
@@ -807,23 +808,23 @@ default 3 unless the job sets `EVAL_REPETITIONS`) and the timeout. The binding c
 `gpu-stress-test-diagnosis` re-applies its OpenTofu GPU stack on **every** repetition, so the cost
 per repetition is not the ~90s of agent time the fixtures show. Tune them from the first few runs.
 
-The `TODO` in that file about whether the shared `prowjob-default-sa` or a dedicated identity should
-hold the bucket grants is not open: it has to be a dedicated one, or the read/write split cannot be
-expressed at all. `serviceAccountName: eval-baseline-recorder` is a required edit before the
-periodic leaves draft — see
+Whether the shared `prowjob-default-sa` or a dedicated identity should hold the bucket grants is
+not an open question: it has to be a dedicated one, or the read/write split cannot be expressed at
+all. `serviceAccountName: eval-baseline-recorder` is a required edit before the store export is
+uncommented on the periodic — see
 [Two conditions](#two-conditions-that-guard-depends-on-neither-of-which-holds-today).
 
-The shape, with the harness elided:
+The shape, with the harness elided. The open pull request reads its runs through the eval dashboard
+and creates no TestGrid tab, so the alert row in the table above is still owed:
 
 ```yaml
 # GoogleCloudPlatform/oss-test-infra:
 #   prow/prowjobs/gke-labs/kube-agents/kube-agents-periodics.yaml
 periodics:
-  - name: periodic-kube-agents-eval-baseline
-    # 07:00 UTC is 03:00 Toronto on daylight time, 02:00 on standard time --
-    # overnight year-round without a second entry, and clear of the repo's
-    # 02:00 UTC GitHub Actions nightly.
-    cron: "0 7 * * *"
+  - name: ci-kube-agents-eval-nightly
+    # 08:00 UTC: the pool's low-traffic hour, clear of the working day's
+    # presubmit herd and of the repo's 02:00 UTC GitHub Actions nightly.
+    cron: "0 8 * * *"
     # A periodic has no ref of its own. base_ref is a branch, not a pin: Prow
     # resolves it at trigger time, so every run is main's latest commit.
     extra_refs:
@@ -841,9 +842,10 @@ periodics:
     cluster: build-kube-agents
     decorate: true
     decoration_config:
-      # Both this and EVAL_REPETITIONS are starting points; tune from real runs.
-      timeout: 4h
-      grace_period: 10m
+      # The presubmit's budget for a bigger matrix: a starting point, like the
+      # repetition count; tune both from real nights.
+      timeout: 360m
+      grace_period: 5m
     spec:
       # NOT prowjob-default-sa, which is what the presubmit runs as. The
       # read/write split is only expressible across two identities.
@@ -856,10 +858,15 @@ periodics:
               # ... the presubmit's Boskos lease / heartbeat / cleanup
               # harness and run_step ladder, lifted verbatim ...
 
+              # The tier switch: hack/ci-eval-pr.sh appends NIGHTLY_TASKS to
+              # the presubmit matrix on this value. Without it the job records
+              # the presubmit matrix only.
+              export EVAL_TIER="nightly"
               # A periodic has no PULL_PULL_SHA, and ci-deploy.sh falls back to
               # the literal "latest", so every night would tag its build
-              # pr-local-latest and no line would record the commit it measured.
-              # extra_refs has already checked out main's head.
+              # pr-local-latest. extra_refs has already checked out main's
+              # head. (The evidence's commit does not depend on this: the
+              # script stamps record with HEAD when PULL_BASE_SHA is absent.)
               export PULL_PULL_SHA="$(git rev-parse HEAD)"
               # The one line that makes this job a baseline recorder.
               # Unset, bench-gate record appends into the git checkout and
@@ -891,9 +898,8 @@ account, it does not exist.
 The cost is real: a new GSA, a new KSA in whichever namespace `build-kube-agents` runs these pods
 in, and the Workload Identity binding between them — infrastructure this repository does not own,
 so all of it is the `kube-agents-prow` owner's to create. Until it does exist, "a pull request never
-writes" rests on the two guards in the code, `JOB_TYPE` and `PULL_NUMBER`, and the periodic must
-stay in draft rather than merge pointed at the shared account. The `TODO` in the YAML marks the
-spot.
+writes" rests on the two guards in the code, `JOB_TYPE` and `PULL_NUMBER`, and the store export
+must stay commented out on the periodic rather than arm it pointed at the shared account.
 
 ### The four pre-admission states
 
@@ -907,8 +913,9 @@ Reported distinctly, because only one of them is a problem with the case:
 | At the bar, below rate  | `screened at 17/21 …, below the bar of 95% over 20` |
 
 The middle two are the store filling up, which is the ordinary state of a new case and of every
-case after a version bump. During that window nothing is admitted, so rung 4 cannot fire and rung 6
-is silent — a legitimate green, not a broken gate.
+case after a version bump. During that window nothing is admitted on evidence, so for an unlisted
+case rung 4 cannot fire and rung 6 is silent — a legitimate green, not a broken gate. A listed case
+rides the bridge meanwhile; [Bootstrap](#bootstrap) below says what that arms.
 
 ## Resetting a baseline
 
@@ -990,8 +997,8 @@ If either side is missing the metric, it is skipped — omitted is not zero on e
 
 **Step 4 — the gates on the rung itself.** It only runs when the case is **admitted**, is not
 `expected_fail`, has **complete** evidence (every repetition scored), and main actually has judged
-evidence at this key. A bootstrap-admitted case therefore never trips it, because it has no
-measured baseline by construction.
+evidence at this key. A bootstrap-admitted case with nothing at the current key therefore never
+trips it; once the nightly has appended a partial window for it, it can.
 
 ### Why the margin is 0.5
 

@@ -298,8 +298,8 @@ def _cmd_case(args: argparse.Namespace) -> int:
     payload = verdict.to_dict()
     payload["admission_reason"] = admission_reason
     # Who decided: record, bootstrap or neither. The suite renders it per case
-    # once a store is configured, so a reader can tell a case the evidence
-    # admitted from one still riding the bridge.
+    # once a store is configured or the record decided any case, so a reader
+    # can tell a case the evidence admitted from one still riding the bridge.
     payload["admission_source"] = decision.source
     payload["version_key"] = key.to_dict() if key else None
     payload["baseline_judged"] = baseline_judged

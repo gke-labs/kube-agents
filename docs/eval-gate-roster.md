@@ -13,7 +13,8 @@ roster-comment edits used to cost.
 ## What the roster is
 
 The roster is a transition bridge, not a destination. `bench/baselines/` ships empty and,
-while the evidence store is unarmed, no case is admitted by measured evidence and
+while the evidence store is unarmed and nothing has been landed there by hand, no case is
+admitted by measured evidence and
 nothing could reach the collapse rung — the presubmit would block on nothing for as long
 as screening takes. Cases named in `BOOTSTRAP_ADMITTED` keep their old blocking behaviour
 meanwhile: a bootstrap-admitted case arms rung 4 by fiat, and while the store holds nothing

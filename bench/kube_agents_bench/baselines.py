@@ -42,7 +42,7 @@ read only the newest line could never admit anything the routine job produced
 — the store would ship empty and stay empty. :meth:`BaselineStore.evidence_for`
 therefore pools the NEWEST lines at the current key until it holds ``min_runs``
 runs. One deliberate twenty-run screening campaign satisfies that in a single
-line; seven ordinary merges to ``main`` satisfy it in seven. Pooling stops at
+line; seven ordinary nightlies on ``main`` satisfy it in seven. Pooling stops at
 the bar rather than reading the whole file, which is what gives recency for
 free: a case that starts failing has its old passing lines pushed out of the
 window by the new failing ones, and de-admits itself without anyone editing
@@ -55,6 +55,11 @@ cannot self-admit their own case in the same diff that makes it pass; bumping
 any version de-admits everything until it is re-screened; and a key with no
 record is reported STALE rather than silently compared against a baseline
 measured on different software.
+
+THE BOOTSTRAP LIST IS A FALLBACK, NOT AN OVERRIDE. ``BOOTSTRAP_ADMITTED``
+admits a named case only while the store cannot judge it -- nothing at the
+key, a superseded key, or fewer than ``min_runs`` runs. Once a full window
+exists the record decides either way; see :meth:`BaselineStore.admission`.
 
 THE VERSION KEY, AND WHY IT IS MOSTLY NOT OURS. Three of its five components
 are produced by devops-bench and read off the run: ``setupId`` from
@@ -118,7 +123,8 @@ DEFAULT_ADMISSION_MIN_RUNS = 20
 #: Who decided a case's admission. ``record``: the store held a full window
 #: at the current key and its rate decided, either way. ``bootstrap``: the
 #: store had no full window, so ``BOOTSTRAP_ADMITTED`` decided. ``neither``:
-#: no full window and not on the list -- the four pre-admission states.
+#: no full window and not on the list -- the first three pre-admission
+#: states; a full window below the bar is the record's refusal.
 ADMITTED_BY_RECORD = "record"
 ADMITTED_BY_BOOTSTRAP = "bootstrap"
 ADMITTED_BY_NEITHER = "neither"
