@@ -126,8 +126,19 @@ func unverifiedRemedyFor(backend string) string {
 	return "the principal map"
 }
 
-// gchatLinkRe rewrites markdown links to Chat's <url|text> form.
-var gchatLinkRe = regexp.MustCompile(`\[([^\]]+)\]\((https?://[^)\s]+)\)`)
+// gchatLinkRe rewrites markdown links to Chat's <url|text> form. The URL class
+// excludes `<`, `>` and `|` so a crafted markdown link cannot close the
+// generated sequence early and pick its own display text; none of the three is
+// legal in a URL unencoded, so refusing them costs nothing real.
+var gchatLinkRe = regexp.MustCompile(`\[([^\]]+)\]\((https?://[^)\s<>|]+)\)`)
+
+// gchatPipeRe matches Chat's other in-text control sequence, the <url|text>
+// link. The segment before the pipe must be non-empty and space-free, which is
+// the shape Chat linkifies; prose like `a < b | c >` is left alone. Where the
+// two readings are ambiguous this errs towards defanging: the cost of that
+// error is one visible space, and the cost of the other is a link whose
+// visible text names a host it does not open.
+var gchatPipeRe = regexp.MustCompile(`<[^\s<>|]+\|[^>]*>`)
 
 // gchatSpace, gchatSender and gchatMessage are the Chat resources both event
 // shapes carry; only the fields the adapter reads are declared.
@@ -614,13 +625,38 @@ func decodeGchatEvent(data string) (*gchatEvent, error) {
 }
 
 // toGchatText translates executor markdown to Google Chat's text format and
-// defangs the one control sequence Chat parses out of message text: a
+// defangs both control sequences Chat parses out of message text: a
 // <users/…> mention, which a prompt-injected result could use to ping the
-// room. The defusing is a visible space, not an invisible character.
+// room, and a <url|text> link, whose visible text can name a host other than
+// the one it opens. The defusing is a visible space, not an invisible
+// character.
+//
+// Only the <url|text> this function generates from a markdown link reaches
+// Chat live. Every other span is defanged, including a link's own display
+// text, so the sequence survives exactly where the adapter authored it and
+// nowhere the executor did — which is the distinction the <users/…> defang
+// already drew, applied to the sequence next to it.
 func toGchatText(s string) string {
+	var b strings.Builder
+	end := 0
+	for _, m := range gchatLinkRe.FindAllStringSubmatchIndex(s, -1) {
+		b.WriteString(defangGchatControls(s[end:m[0]]))
+		b.WriteString("<" + s[m[4]:m[5]] + "|" + defangGchatControls(s[m[2]:m[3]]) + ">")
+		end = m[1]
+	}
+	b.WriteString(defangGchatControls(s[end:]))
+	return strings.ReplaceAll(b.String(), "**", "*")
+}
+
+// defangGchatControls neutralizes Chat's in-text control sequences in a span
+// the adapter did not author, so the text renders as itself. The mention pass
+// runs first: it is unconditional, and running it first also splits any
+// angle pair that wraps a mention so the link pass sees both.
+func defangGchatControls(s string) string {
 	s = strings.ReplaceAll(s, "<users/", "< users/")
-	s = gchatLinkRe.ReplaceAllString(s, "<$2|$1>")
-	return strings.ReplaceAll(s, "**", "*")
+	return gchatPipeRe.ReplaceAllStringFunc(s, func(m string) string {
+		return "< " + m[1:]
+	})
 }
 
 // classify normalizes one Chat event to an InboundMessage, or names why it

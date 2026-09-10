@@ -461,6 +461,28 @@ func TestToGchatText(t *testing.T) {
 		// visibly, not with invisible characters.
 		"<users/all> deploy done": "< users/all> deploy done",
 		"ping <users/123> now":    "ping < users/123> now",
+		// The other sequence Chat parses out of message text. The live run
+		// observed Chat rendering <url|text> from a message the app posted,
+		// so one already present in executor output would publish a link
+		// whose visible text names a host it does not open.
+		"<https://attacker.example/login|https://github.com/gke-labs/kube-agents>": "< https://attacker.example/login|https://github.com/gke-labs/kube-agents>",
+		"see <https://evil.example|the doc>":                                       "see < https://evil.example|the doc>",
+		// A generated link and an injected one in the same message: the
+		// adapter's own survives, the executor's does not.
+		"[real](https://x.example/p) vs <https://evil.example|real>": "<https://x.example/p|real> vs < https://evil.example|real>",
+		// A mention or an angle pair inside a markdown link's display text
+		// is inside the sequence the adapter generates, so it is defanged
+		// there too rather than riding out on the exemption.
+		"[<users/all>](https://x.example/p)":               "<https://x.example/p|< users/all>>",
+		"[<https://evil.example|hi>](https://x.example/p)": "<https://x.example/p|< https://evil.example|hi>>",
+		// A `|` or an angle bracket in the URL would let a crafted link close
+		// the generated sequence early and choose its own display text. The
+		// URL class refuses them, so the markdown is left as written instead.
+		"[trusted](https://evil.example|https://github.com)": "[trusted](https://evil.example|https://github.com)",
+		// Prose is not a control sequence: a spaced angle pair is not the
+		// shape Chat linkifies, and defanging it would mangle ordinary text.
+		"latency < 5 | p99 > ok": "latency < 5 | p99 > ok",
+		"if a < b then":          "if a < b then",
 	}
 	for in, want := range cases {
 		if got := toGchatText(in); got != want {
