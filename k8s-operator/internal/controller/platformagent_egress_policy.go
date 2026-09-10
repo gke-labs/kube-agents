@@ -285,6 +285,7 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 	dnsPeers := []networkingv1.NetworkPolicyPeer{
 		namespacedPodPeer("kube-system", map[string]string{"k8s-app": "kube-dns"}),
 		namespacedPodPeer("kube-system", map[string]string{"k8s-app": "node-local-dns"}),
+		namespacedPodPeer("openshift-dns", map[string]string{"dns.operator.openshift.io/daemonset-dns": "default"}),
 		{IPBlock: &networkingv1.IPBlock{CIDR: nodeLocalDNSCacheIP}},
 		{IPBlock: &networkingv1.IPBlock{CIDR: metadataResolverCIDR}},
 	}
