@@ -549,6 +549,12 @@ resource "helm_release" "kube_agents" {
           projectId = local.vertex_project
           location  = local.vertex_location
         }
+      } : {},
+      var.model_provider == "hosted_vllm" ? {
+        hostedVllm = {
+          apiBase    = var.hosted_vllm_api_base
+          targetPort = var.hosted_vllm_target_port
+        }
       } : {}
     )
     platformAgent = {

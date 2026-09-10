@@ -27,6 +27,14 @@ LiteLLM Deployment + Service + `ConfigMap` fronting Gemini, plus a `Secret`, `Po
 
 **When to use:** the default install path; anything except explicit local-inference or subscription-based demos.
 
+## `litellm-hosted-vllm`
+
+[`examples/litellm-hosted-vllm/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-hosted-vllm)
+
+LiteLLM Deployment + Service + `ConfigMap` routing to a vLLM server in the cluster through LiteLLM's `hosted_vllm` provider, plus `PodDisruptionBudget`, `NetworkPolicy`, and `PodMonitoring`. No Secret: the server checks no key. Pairs with `vllm-gemma` below, which is the server it points at. The install path's equivalent is `MODEL_PROVIDER=hosted_vllm`.
+
+**When to use:** air-gapped or policy-restricted clusters, or any hand-applied setup with an in-cluster model server.
+
 ## `litellm-chatgpt-subscription`
 
 [`examples/litellm-chatgpt-subscription/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-chatgpt-subscription)

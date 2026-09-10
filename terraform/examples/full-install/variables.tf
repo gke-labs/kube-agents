@@ -202,14 +202,26 @@ variable "third_party_image_registry" {
 }
 
 variable "model_provider" {
-  description = "Model provider the LiteLLM gateway routes model-default to (gemini, anthropic, openai, or vertex_ai). Set the matching *_api_key variable; vertex_ai takes no key and authenticates with Workload Identity instead."
+  description = "Model provider the LiteLLM gateway routes model-default to (gemini, anthropic, openai, vertex_ai, or hosted_vllm). Set the matching *_api_key variable; vertex_ai takes no key and authenticates with Workload Identity instead; hosted_vllm takes no key and routes to hosted_vllm_api_base."
   type        = string
   default     = "gemini"
 
   validation {
-    condition     = contains(["gemini", "anthropic", "openai", "vertex_ai"], var.model_provider)
-    error_message = "model_provider must be one of gemini, anthropic, openai, or vertex_ai."
+    condition     = contains(["gemini", "anthropic", "openai", "vertex_ai", "hosted_vllm"], var.model_provider)
+    error_message = "model_provider must be one of gemini, anthropic, openai, vertex_ai, or hosted_vllm."
   }
+}
+
+variable "hosted_vllm_api_base" {
+  description = "OpenAI-compatible base URL of the vLLM server when model_provider = \"hosted_vllm\" (required with it; the chart refuses to render without it). LiteLLM reads it as HOSTED_VLLM_API_BASE."
+  type        = string
+  default     = ""
+}
+
+variable "hosted_vllm_target_port" {
+  description = "The vLLM server pod's port when model_provider = \"hosted_vllm\" (required with it): the gateway's egress rule names the pod port, not the Service port."
+  type        = string
+  default     = ""
 }
 
 variable "vertex_project_id" {

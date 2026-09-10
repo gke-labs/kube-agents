@@ -224,6 +224,14 @@ litellm:
     # region here for either reason.
     projectId: ""
     location: ""
+  # modelProvider: hosted_vllm only, and both required with it (as is
+  # modelDefaultName: the server's model has no default). apiBase is the
+  # server's OpenAI-compatible base URL (LiteLLM reads it as
+  # HOSTED_VLLM_API_BASE); targetPort is the server pod's port, not the
+  # Service port, because the egress rule matches after Service translation.
+  hostedVllm:
+    apiBase: ""
+    targetPort: null
   # Keep in step with the kustomize base
   # (k8s-operator/config/integrations/litellm/base/deployment.yaml), which is
   # the dev copy of this gateway.

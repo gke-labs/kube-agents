@@ -117,6 +117,7 @@ STATIC_NETWORK_POLICIES: tuple[str, ...] = (
     "deploy/kustomize/platform/networkpolicy-core-egress.yaml",
     "examples/litellm-chatgpt-subscription/networkpolicy.yaml",
     "examples/litellm-gemini/networkpolicy.yaml",
+    "examples/litellm-hosted-vllm/networkpolicy.yaml",
     "examples/vllm-gemma/networkpolicy.yaml",
     "k8s-operator/config/integrations/github/deployment.yaml.template",
     "k8s-operator/config/integrations/litellm/base/networkpolicy.yaml",

@@ -44,12 +44,13 @@ Two things have to name that alias, not one. The profile config covers Chat, whi
 
 The two substituted values come from the install (`MODEL_PROVIDER` and `MODEL_DEFAULT_NAME`, saved in `install.env` and carried into the chart values). Supported providers and their shipping defaults:
 
-| `MODEL_PROVIDER`   | Default `MODEL_DEFAULT_NAME` | Notes                                      |
-| ------------------ | ---------------------------- | ------------------------------------------ |
-| `gemini` (default) | `gemini-3.5-flash`           | Uses `GEMINI_API_KEY`.                     |
-| `anthropic`        | `claude-opus-5`              | Uses `ANTHROPIC_API_KEY`.                  |
-| `openai`           | `gpt-5.4`                    | Uses `OPENAI_API_KEY`.                     |
-| `vertex_ai`        | `gemini-3.5-flash`           | No API key — Workload Identity. See below. |
+| `MODEL_PROVIDER`   | Default `MODEL_DEFAULT_NAME` | Notes                                                                                                                                                                   |
+| ------------------ | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `gemini` (default) | `gemini-3.5-flash`           | Uses `GEMINI_API_KEY`.                                                                                                                                                  |
+| `anthropic`        | `claude-opus-5`              | Uses `ANTHROPIC_API_KEY`.                                                                                                                                               |
+| `openai`           | `gpt-5.4`                    | Uses `OPENAI_API_KEY`.                                                                                                                                                  |
+| `vertex_ai`        | `gemini-3.5-flash`           | No API key — Workload Identity. See below.                                                                                                                              |
+| `hosted_vllm`      | none; required               | No API key — a vLLM server in the cluster. `MODEL_DEFAULT_NAME`, `HOSTED_VLLM_API_BASE` and `HOSTED_VLLM_TARGET_PORT` are all required. See [vLLM](#vllm-local-models). |
 
 Any model string the chosen provider accepts is valid — there is no allow-list in the harness. For example, [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) pins `gemini-3.1-flash-lite`.
 
@@ -119,6 +120,8 @@ A re-run against an existing install reconciles the switch in one `terraform app
 - [`examples/vllm-gemma/`](https://github.com/gke-labs/kube-agents/tree/main/examples/vllm-gemma) — Gemma via GKE's official inference tutorial. Requires an accelerator node pool (see `gke-compute-classes` skill).
 
 vLLM speaks OpenAI-compatible Completions, so LiteLLM can be layered on top (or in front) for routing and observability.
+
+`MODEL_PROVIDER=hosted_vllm` does that layering: LiteLLM's own provider for a vLLM server, so the gateway's config is the same `hosted_vllm/<model>` line the other providers get and the server's address travels as `HOSTED_VLLM_API_BASE`. It has no defaults: set `MODEL_DEFAULT_NAME` to the model the server was started with, `HOSTED_VLLM_API_BASE` to its base URL, and `HOSTED_VLLM_TARGET_PORT` to the server pod's port, which the gateway's new egress rule names (in the chart: `litellm.modelDefaultName`, `litellm.hostedVllm.apiBase`, `litellm.hostedVllm.targetPort`). Nothing else changes: the agent keeps asking for `model-default`. The provider itself is LiteLLM's; its [vLLM provider page](https://docs.litellm.ai/docs/providers/vllm) is the reference for the model prefix and the environment variables. [`examples/litellm-hosted-vllm/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-hosted-vllm) is the hand-applied gateway, pointed at the example server above.
 
 ## Inference replay
 

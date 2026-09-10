@@ -1,0 +1,111 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: litellm-policy
+  namespace: kubeagents-system
+spec:
+  podSelector:
+    matchLabels:
+      app: litellm
+  policyTypes:
+    - Ingress
+    - Egress
+  egress:
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: node-local-dns
+        - ipBlock:
+            cidr: 169.254.20.10/32
+        - ipBlock:
+            cidr: 169.254.169.254/32
+        # Cluster DNS answers on the kube-dns Service ClusterIP, which a static
+        # manifest cannot know: it is 10.96.0.10 on some GKE clusters and
+        # 34.118.224.10 on others. NetworkPolicy matches that VIP, not the pods
+        # behind it, so the selectors above never fire for it. The two peers
+        # below cover both shapes: the literal handles the classic service
+        # range, and the excepted block handles any VIP outside private space
+        # (34.118.224.0/20 today, whatever GKE allocates next). The except list
+        # mirrors the 443 rule, so port 53 reaches nothing internal that the
+        # 443 rule does not already deny.
+        - ipBlock:
+            cidr: 10.96.0.10/32
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+    - ports:
+        - port: 443
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+    - ports:
+        - port: 80
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 169.254.169.254/32
+    # GKE Workload Identity host-network daemon (port 988). On Dataplane V1 (iptables),
+    # the node DNATs 169.254.169.254:80 to 169.254.169.252:988 before NetworkPolicy
+    # is evaluated, so this rule admits the post-DNAT token fetch. On Dataplane V2 (eBPF),
+    # policy is evaluated pre-NAT at the socket layer and matched by the port-80 rule above.
+    # Port 987 (ALTS) is deliberately omitted because standard OAuth2/REST token fetches do not use DirectPath.
+    - ports:
+        - port: 988
+          protocol: TCP
+      to:
+        - ipBlock:
+            cidr: 169.254.169.252/32
+        - ipBlock:
+            cidr: 169.254.169.254/32
+    - ports:
+        - port: 4317
+          protocol: TCP
+        - port: 4318
+          protocol: TCP
+      to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-managed-otel
+
+    # The vLLM server: pods in this namespace on the server pod's port (not
+    # the Service port; NetworkPolicy matches after Service translation).
+    - ports:
+        - port: 8000
+          protocol: TCP
+      to:
+        - podSelector: {}
+  ingress:
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 8080
+          protocol: TCP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: gke-gmp-system
+      ports:
+        - port: 8080
+          protocol: TCP

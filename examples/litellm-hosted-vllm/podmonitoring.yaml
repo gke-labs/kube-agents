@@ -1,0 +1,13 @@
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: litellm-monitoring
+  namespace: kubeagents-system
+spec:
+  selector:
+    matchLabels:
+      app: litellm
+  endpoints:
+    - port: 8080
+      path: /metrics
+      interval: 30s

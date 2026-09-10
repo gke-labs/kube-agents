@@ -6,8 +6,8 @@
 {{- /* Per-provider default model names mirror install.defaults.env (DEFAULT_MODEL_*);
        a chart cannot source that file, and tests/test_installer_common.py pins the two equal. */}}
 {{- $defaultModels := dict "gemini" "gemini-3.5-flash" "anthropic" "claude-opus-5" "openai" "gpt-5.4" "vertex_ai" "gemini-3.5-flash" }}
-{{- if not (hasKey $defaultModels $provider) }}
-{{- fail (printf "litellm.modelProvider %q is not one of gemini, anthropic, openai, vertex_ai — a typo here would otherwise fail only at runtime" $provider) }}
+{{- if and (not (hasKey $defaultModels $provider)) (ne $provider "hosted_vllm") }}
+{{- fail (printf "litellm.modelProvider %q is not one of gemini, anthropic, openai, vertex_ai, hosted_vllm — a typo here would otherwise fail only at runtime" $provider) }}
 {{- end }}
 {{- $rollingUpdate := include "kube-agents.rollingUpdateFenceposts" (dict "rollingUpdate" .Values.litellm.rollingUpdate "defaultSurge" 1 "defaultUnavailable" 1 "scope" "litellm.rollingUpdate") | fromYaml }}
 {{- $model := .Values.litellm.modelDefaultName | default (get $defaultModels $provider) }}
@@ -24,6 +24,28 @@
 {{- if eq $provider "vertex_ai" }}
 {{- if empty $vertexProject }}
 {{- fail "litellm.modelProvider 'vertex_ai' needs litellm.vertex.projectId (or platformAgent.harness.projectId): Vertex AI is addressed as projects/<project>/locations/<location> and the project has no usable default." }}
+{{- end }}
+{{- end }}
+{{- /*
+  hosted_vllm is LiteLLM's own provider for a vLLM server. It has no default
+  model (the name is whatever the server was started with) and no default
+  address: all three values are required. The config needs no api_base --
+  LiteLLM reads HOSTED_VLLM_API_BASE from the environment, so the address is
+  one env var below, the way VERTEXAI_PROJECT is. targetPort is the server
+  pod's port, which is what the egress rule has to name.
+*/}}
+{{- $hostedVllm := .Values.litellm.hostedVllm | default dict }}
+{{- $hostedVllmApiBase := $hostedVllm.apiBase | default "" }}
+{{- $hostedVllmTargetPort := $hostedVllm.targetPort }}
+{{- if eq $provider "hosted_vllm" }}
+{{- if empty $model }}
+{{- fail "litellm.modelProvider 'hosted_vllm' needs litellm.modelDefaultName: the model id the vLLM server was started with." }}
+{{- end }}
+{{- if empty $hostedVllmApiBase }}
+{{- fail "litellm.modelProvider 'hosted_vllm' needs litellm.hostedVllm.apiBase: the server's OpenAI-compatible base URL (LiteLLM reads it as HOSTED_VLLM_API_BASE)." }}
+{{- end }}
+{{- if empty $hostedVllmTargetPort }}
+{{- fail "litellm.modelProvider 'hosted_vllm' needs litellm.hostedVllm.targetPort: the server pod's port, which the gateway's egress rule names." }}
 {{- end }}
 {{- end }}
 {{- $callbacks := ternary `["otel", "prometheus"]` `["prometheus"]` .Values.litellm.otel }}
@@ -117,6 +139,10 @@ spec:
               value: {{ $vertexProject | quote }}
             - name: VERTEXAI_LOCATION
               value: {{ $vertexLocation | quote }}
+            {{- end }}
+            {{- if eq $provider "hosted_vllm" }}
+            - name: HOSTED_VLLM_API_BASE
+              value: {{ $hostedVllmApiBase | quote }}
             {{- end }}
             - name: GEMINI_API_KEY
               valueFrom:
@@ -299,6 +325,15 @@ spec:
         - namespaceSelector:
             matchLabels:
               kubernetes.io/metadata.name: {{ include "kube-agents.otlpCollectorNamespace" . }}
+    {{- if eq $provider "hosted_vllm" }}
+    # The in-cluster model server: pods in this namespace on the server's own
+    # port. Not every pod in the cluster, and not the Service port.
+    - ports:
+        - port: {{ $hostedVllmTargetPort }}
+          protocol: TCP
+      to:
+        - podSelector: {}
+    {{- end }}
   ingress:
     - from:
         - podSelector: {}

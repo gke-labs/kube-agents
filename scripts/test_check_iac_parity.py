@@ -1551,7 +1551,7 @@ spec:
         with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
             rc = main(["-v"])
         self.assertEqual(rc, 0)
-        self.assertIn("All 8 static policy copies passed", buf_out.getvalue())
+        self.assertIn(f"All {len(STATIC_NETWORK_POLICIES)} static policy copies passed", buf_out.getvalue())
 
     def test_main_failure(self):
         manifest = """apiVersion: networking.k8s.io/v1

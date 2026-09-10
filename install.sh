@@ -434,7 +434,7 @@ Flags for AI Agents & Automation:
                                 unset at a zonal --region builds Standard instead.
                                 Ignored when installing onto a cluster that already
                                 exists — its live shape wins.
-  --model-provider=PROVIDER     Model provider: gemini | vertex_ai | anthropic | openai
+  --model-provider=PROVIDER     Model provider: gemini | vertex_ai | anthropic | openai | hosted_vllm
                                 (default: DEFAULT_MODEL_PROVIDER, currently gemini)
   --model-default-name=NAME     Default model name for the provider
   --vertex-project-id=ID        GCP project serving Vertex AI models (default: --project-id)
@@ -1043,6 +1043,8 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" VERTEX_PROJECT_ID "${VERTEX_PROJECT_ID:-}"
   write_env_var "$tmp" VERTEX_LOCATION "${VERTEX_LOCATION:-}"
   write_env_var "$tmp" VERTEX_MANAGE_SERVING_PROJECT "${VERTEX_MANAGE_SERVING_PROJECT:-}"
+  write_env_var "$tmp" HOSTED_VLLM_API_BASE "${HOSTED_VLLM_API_BASE:-}"
+  write_env_var "$tmp" HOSTED_VLLM_TARGET_PORT "${HOSTED_VLLM_TARGET_PORT:-}"
   write_secret_env_var "$tmp" GEMINI_API_KEY "${GEMINI_API_KEY:-}"
   write_secret_env_var "$tmp" OPENAI_API_KEY "${OPENAI_API_KEY:-}"
   write_secret_env_var "$tmp" ANTHROPIC_API_KEY "${ANTHROPIC_API_KEY:-}"
@@ -2114,7 +2116,7 @@ run_menu_system() {
     echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${cluster_name:-Not Set} (${region:-$DEFAULT_REGION})"
     echo -e "  • ${C_CYAN}Hermes Web UI (Port 9119):${C_RESET} $([ "$enable_webui" = "true" ] && echo -e "${C_GREEN}ENABLED${C_RESET}" || echo -e "${C_YELLOW}DISABLED${C_RESET}")"
     echo -e "  • ${C_CYAN}Chat Integrations:${C_RESET} Google Chat: $([ "$google_chat_enabled" = "true" ] && echo -e "${C_GREEN}ON${C_RESET}" || echo "OFF"), Slack: $([ "$slack_enabled" = "true" ] && echo -e "${C_GREEN}ON${C_RESET}" || echo "OFF")"
-    echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})$([ "$model_provider" = "vertex_ai" ] && echo " @ ${vertex_project_id}/${vertex_location}" || echo "")"
+    echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})$([ "$model_provider" = "vertex_ai" ] && echo " @ ${vertex_project_id}/${vertex_location}" || echo "")$([ "$model_provider" = "hosted_vllm" ] && echo " @ in-cluster vLLM" || echo "")"
     echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
     echo -e "  • ${C_CYAN}Runtime Isolation:${C_RESET} $([ "$enable_gvisor" = "true" ] && echo -e "${C_GREEN}gVisor Sandbox${C_RESET}" || echo "Standard")"
 
@@ -2122,7 +2124,7 @@ run_menu_system() {
     prompt_menu "Select configuration task:" \
       "🌐 Toggle Hermes Web UI (Port 9119 Dashboard)" \
       "💬 Manage Chat & Messaging Integrations (Google Chat / Slack)" \
-      "🔑 Manage AI Model Provider & Credentials (Gemini / Vertex / OpenAI)" \
+      "🔑 Manage AI Model Provider & Credentials (Gemini / Vertex / OpenAI / in-cluster vLLM)" \
       "🛡️ Modify Security & Permission Boundaries (gVisor / SRE vs Read-Only)" \
       "🗄️ Manage GitOps Repository & GitHub Auth (${DEFAULT_GITOPS_REPO})" \
       "🚀 Save & Apply Configuration Changes (~15s update)" \
@@ -2169,6 +2171,7 @@ run_menu_system() {
           "Google Vertex AI / Model Garden (no API key — Workload Identity)" \
           "OpenAI ($(default_model_for_provider openai))" \
           "Anthropic ($(default_model_for_provider anthropic))" \
+          "vLLM server in this cluster (no API key)" \
           m_opt
         case "$m_opt" in
           1)
@@ -2197,6 +2200,12 @@ run_menu_system() {
             model_provider="anthropic"
             model_default_name="$(default_model_for_provider anthropic)"
             prompt_read "Anthropic API Key" anthropic_api_key "$anthropic_api_key" true
+            ;;
+          5)
+            model_provider="hosted_vllm"
+            prompt_read "Model ID the vLLM server was started with" model_default_name "$model_default_name"
+            prompt_read "Server base URL (LiteLLM's HOSTED_VLLM_API_BASE)" HOSTED_VLLM_API_BASE "${HOSTED_VLLM_API_BASE:-}"
+            prompt_read "Server pod port (for the gateway's egress rule)" HOSTED_VLLM_TARGET_PORT "${HOSTED_VLLM_TARGET_PORT:-}"
             ;;
         esac
         ;;
@@ -2249,6 +2258,8 @@ run_menu_system() {
         save_env_var VERTEX_PROJECT_ID "$vertex_project_id"
         save_env_var VERTEX_LOCATION "$vertex_location"
         save_env_var VERTEX_MANAGE_SERVING_PROJECT "${VERTEX_MANAGE_SERVING_PROJECT:-$DEFAULT_VERTEX_MANAGE_SERVING_PROJECT}"
+        save_env_var HOSTED_VLLM_API_BASE "${HOSTED_VLLM_API_BASE:-}"
+        save_env_var HOSTED_VLLM_TARGET_PORT "${HOSTED_VLLM_TARGET_PORT:-}"
         save_secret_env_var GEMINI_API_KEY "$gemini_api_key"
         save_secret_env_var OPENAI_API_KEY "$openai_api_key"
         save_secret_env_var ANTHROPIC_API_KEY "$anthropic_api_key"
@@ -2702,7 +2713,7 @@ main() {
   print_step "7. AI Model Provider Credentials"
   local model_provider="$PARAM_MODEL_PROVIDER"
   if ! is_valid_model_provider "$model_provider"; then
-    print_error "Unsupported model provider '$model_provider'. Use gemini, vertex_ai, anthropic, or openai."
+    print_error "Unsupported model provider '$model_provider'. Use gemini, vertex_ai, anthropic, openai, or hosted_vllm."
     exit 1
   fi
   local model_default_name="${PARAM_MODEL_DEFAULT_NAME:-${MODEL_DEFAULT_NAME:-}}"
@@ -2744,12 +2755,14 @@ main() {
       vertex_ai) model_choice="2" ;;
       openai) model_choice="3" ;;
       anthropic) model_choice="4" ;;
+      hosted_vllm) model_choice="5" ;;
     esac
     prompt_menu "Select Model Provider for the Platform Agent:" \
       "Google Gemini (Recommended: $(default_model_for_provider gemini) / Gemini API)" \
       "Google Vertex AI / Model Garden (no API key — Workload Identity)" \
       "OpenAI ($(default_model_for_provider openai) / OpenAI API)" \
       "Anthropic ($(default_model_for_provider anthropic) / Anthropic API)" \
+      "vLLM server in this cluster (no API key)" \
       model_choice
 
     # A model the install already pins survives a re-run that leaves the
@@ -2796,6 +2809,12 @@ main() {
         fi
         prompt_read "Anthropic API Key" anthropic_api_key "${ANTHROPIC_API_KEY:-}" true
         ;;
+      5)
+        model_provider="hosted_vllm"
+        prompt_read "Model ID the vLLM server was started with" model_default_name "$([ "$model_provider_was" = "hosted_vllm" ] && echo "$model_name_was" || echo "")"
+        prompt_read "Server base URL (LiteLLM's HOSTED_VLLM_API_BASE)" HOSTED_VLLM_API_BASE "${HOSTED_VLLM_API_BASE:-}"
+        prompt_read "Server pod port (for the gateway's egress rule)" HOSTED_VLLM_TARGET_PORT "${HOSTED_VLLM_TARGET_PORT:-}"
+        ;;
     esac
   fi
 
@@ -2829,6 +2848,9 @@ main() {
       ;;
     anthropic)
       [ -n "$anthropic_api_key" ] || print_warning "No Anthropic API key was provided; the agent will require a credential update before model calls can succeed."
+      ;;
+    hosted_vllm)
+      [ -n "$model_default_name" ] && [ -n "${HOSTED_VLLM_API_BASE:-}" ] && [ -n "${HOSTED_VLLM_TARGET_PORT:-}" ] || print_warning "hosted_vllm needs MODEL_DEFAULT_NAME, HOSTED_VLLM_API_BASE and HOSTED_VLLM_TARGET_PORT; the chart refuses to render without them."
       ;;
   esac
 
@@ -3183,6 +3205,8 @@ main() {
   export VERTEX_PROJECT_ID="$vertex_project_id"
   export VERTEX_LOCATION="$vertex_location"
   export VERTEX_MANAGE_SERVING_PROJECT="$vertex_manage_serving_project"
+  export HOSTED_VLLM_API_BASE="${HOSTED_VLLM_API_BASE:-}"
+  export HOSTED_VLLM_TARGET_PORT="${HOSTED_VLLM_TARGET_PORT:-}"
   export GEMINI_API_KEY="$gemini_api_key"
   export OPENAI_API_KEY="$openai_api_key"
   export ANTHROPIC_API_KEY="$anthropic_api_key"
@@ -3265,6 +3289,8 @@ main() {
   echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
   if [ "$model_provider" = "vertex_ai" ]; then
     echo -e "  • ${C_CYAN}Vertex AI Endpoint:${C_RESET} projects/${vertex_project_id}/locations/${vertex_location}"
+  elif [ "$model_provider" = "hosted_vllm" ]; then
+    echo -e "  • ${C_CYAN}vLLM server:${C_RESET} ${HOSTED_VLLM_API_BASE:-unset}"
   fi
   echo -e "  • ${C_CYAN}Permission Boundary:${C_RESET} ${permission_set}"
   echo -e "  • ${C_CYAN}Long-Term Memory:${C_RESET} ${memory_mode}"

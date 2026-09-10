@@ -96,6 +96,12 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # API and grant the gateway's service account roles/aiplatform.user by hand.
 # vertex_manage_serving_project = true
 
+# A vLLM server in the cluster, no API key. All three are required with it.
+# model_provider          = "hosted_vllm"
+# model_default_name      = ""
+# hosted_vllm_api_base    = ""
+# hosted_vllm_target_port = ""
+
 
 # Optional GitHub integration and token minter backend (GSA + KMS signing key).
 # enable_github_minter = true
