@@ -1722,6 +1722,11 @@ CASE_RESULTS=()
 # a queue: a loser can keep losing. Builds 2097793380187639808 and
 # 2097813968994177024 lost reps 6, and 3 and 4, to the 1800s deadline that way.
 # At 1 there is no contention and all 15 repetitions grade.
+# Sample so far: 2097793380187639808 evals-9 13/14, 2097813968994177024
+# evals-12 10/13, 2097884694312914944 evals-3 9/15. Build 2097912147194417152
+# measured nothing -- Step 0 revalidated it against the green run 3 on this
+# same commit, so a fourth sample needs a non-inert push, which is what this
+# comment is.
 EVAL_TASK_PARALLELISM="${EVAL_TASK_PARALLELISM:-1}"
 if ! [ "${EVAL_TASK_PARALLELISM}" -ge 1 ] 2>/dev/null; then
   echo "ERROR: EVAL_TASK_PARALLELISM must be a positive integer, got '${EVAL_TASK_PARALLELISM}'." >&2
