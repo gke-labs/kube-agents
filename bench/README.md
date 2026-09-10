@@ -33,13 +33,15 @@ All eleven are covered and the allowlist is empty, which is Phase 2's exit crite
 ```bash
 cd bench
 uv sync
+export PROJECT_ID=<gcp project> CLUSTER_NAME=<cluster> AGENT_CLUSTER_CONTEXT=<kubectl context>
+export BENCH_TF_ROOT=./tf
 PLATFORM_AGENT_TOKEN=$(kubectl get secret platform-agent-secrets -n <namespace> \
   -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode) \
   JUDGE_PROVIDER=<provider> JUDGE_MODEL=<model> \
-  uv run devops-bench ./tasks --no-infra --agent-type kubeagents
+  uv run devops-bench ./tasks/<id> --agent-type kubeagents
 ```
 
-This is the stock `devops-bench` CLI — there is no wrapper command. `source` is positional. `--no-infra` is a smoke of the agent path only: it skips the deterministic checks, so the run can neither pass nor fail the gate. To grade a case the way the presubmit does, drop the flag and export what `hack/ci-eval-pr.sh` exports (`PROJECT_ID`, `CLUSTER_NAME`, `AGENT_CLUSTER_CONTEXT`, `BENCH_TF_ROOT=./tf`, and `BENCH_FLEET_KUBECONFIG_DIR` from `hack/fleet-kubeconfigs.sh` for a case with `fixtures:`); [`.agents/rules/eval_driven_development.md`](../.agents/rules/eval_driven_development.md) is the loop that uses it. See `--help` for the rest.
+This is the stock `devops-bench` CLI — there is no wrapper command. `source` is positional, and `./tasks` runs every case. The exports are what `hack/ci-eval-pr.sh` sets, so a local run grades the way the presubmit does; a case with `fixtures:` also needs `BENCH_FLEET_KUBECONFIG_DIR` from `hack/fleet-kubeconfigs.sh`. `--no-infra` smokes the agent path only: it skips the deterministic checks, so such a run can neither pass nor fail the gate. [`.agents/rules/eval_driven_development.md`](../.agents/rules/eval_driven_development.md) is the loop that uses this. See `--help` for the rest.
 
 ## The gate
 

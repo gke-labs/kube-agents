@@ -52,7 +52,7 @@ did not expect, or nowhere at all, and the suite reports green around it.
   request or nightly reports. [`docs/designs/bench-case-format.md`](docs/designs/bench-case-format.md)
   is the contract; `make bench-case-check` checks it, `scripts/test_task_registration.py` gates it.
   **A change to agent behaviour starts from one:** red locally, implement, green three times,
-  registered in the nightly — [`.agents/rules/eval_driven_development.md`](.agents/rules/eval_driven_development.md).
+  registered — [`.agents/rules/eval_driven_development.md`](.agents/rules/eval_driven_development.md).
 - **Yes, and it checks an install you already have** — it is a critical user journey, and it goes in
   `bench/cuj/`. **This tier is manual by design**, not pending automation: it needs a real
   deployment to point at and CI has none, so no job runs it and adding one changes nothing about
