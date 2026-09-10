@@ -126,7 +126,11 @@ the state everything ships in.
 
 **The suite aggregate** covers admitted cases only, excludes infra repetitions, and reds when
 `pr_rate < main_rate - margin` **over at least `EVAL_AGGREGATE_MIN_SCORED` scored repetitions**
-(default 30). Two job-level rules sit alongside it: any blocking case reds the job, and _all_ cases
+(default 30) — and only once `EVAL_AGGREGATE_ARMED` is set in the job's environment. Unarmed,
+which is the default, a rate below the margin over a full sample is written into the verdict as a
+note rather than a reason: the flat margin has not been measured against how much an unchanged
+pull request moves the aggregate on `main`, and arming it is a decision for after the store holds
+enough nights to say. Two job-level rules sit alongside it: any blocking case reds the job, and _all_ cases
 failing on infrastructure reds it too — individually that is weather, but all at once means the
 eval infrastructure is down and a green would be a lie about coverage.
 
@@ -152,7 +156,7 @@ movement.
 ## What is stored
 
 One JSON object per line, one line per **batch of runs** — a deliberate screening campaign, or the
-ten repetitions an ordinary nightly produced.
+three repetitions an ordinary nightly produced.
 
 ```json
 {
@@ -663,9 +667,12 @@ returning a different answer once the file crossed a threshold.
 
 **Runs, not lines.** #899 specifies "20 runs against `main`, at least 19 passing", and it fixes the
 unit elsewhere in the same table: "an admitted case that fails **all three of its runs**". A run is
-one execution. Ten repetitions a night therefore means **two nights** from empty to admitted, not
-twenty. That ratio is the whole reason the recorder went nightly: at the presubmit's three
-repetitions it would have been seven merges, and a version-key bump de-admits every case at once.
+one execution. The nights from empty to admitted are therefore `ceil(20 / EVAL_REPETITIONS)`:
+**seven** at the three repetitions the nightly runs today (the pool takes whole lines, so it lands
+on 21), two at ten. The ratio is the reason the recorder went nightly rather than per-merge: a
+merge buys three samples for a whole job's setup, and a version-key bump de-admits every case at
+once. Raising the nightly's repetitions shortens the refill and is a Prow-config change to make on
+measured wall clock, not on this arithmetic.
 
 **Whole lines only.** Pooling overshoots to 21 runs rather than trimming a line to land on 20
 exactly, because trimming would invent a sub-record nobody measured.
@@ -723,8 +730,8 @@ serialised at `max_concurrency: 1`, which queues weekday bursts for hours.
 
 A nightly run amortises one setup over every repetition. It is cheaper per sample, and faster where
 it matters: admission needs twenty runs at the current version key, so a model or fleet bump
-de-admits every case at once, and refilling that window takes a night or two rather than a week of
-merges.
+de-admits every case at once, and refilling that window takes seven nights at the nightly's three
+repetitions — fewer as the count rises — without paying a job's setup per sample.
 
 This is the lever this section already named — "repetitions or a cron-style sampling of merges" —
 and not the one it ruled out. Filtering merges by changed path stays ruled out: it would bias the
@@ -899,8 +906,8 @@ is silent — a legitimate green, not a broken gate.
 Three resets, all of which happen without deleting anything.
 
 **Version bump (automatic).** Any of the five components changing means zero lines match the
-current key, so every case drops to unadmitted and re-screens itself over the next two nights. Old
-lines stay — they are still true about the software they were measured on.
+current key, so every case drops to unadmitted and re-screens itself over the next seven nights at
+three repetitions. Old lines stay — they are still true about the software they were measured on.
 
 **Degradation (automatic).** A case that starts failing has its passing lines pushed out of the
 20-run window by the new failing ones, and de-admits itself. Nobody edits the store, no line is
@@ -916,9 +923,20 @@ inconvenient.
 
 ### Bootstrap
 
-`BOOTSTRAP_ADMITTED` names cases that keep blocking before any screening exists. It is a bridge,
-not a destination: a bootstrap-admitted case has no measured evidence, so it arms rung 4 but leaves
-rung 6 quiet and contributes nothing to `main`'s side of the aggregate.
+`BOOTSTRAP_ADMITTED` names cases that keep blocking before screening exists for them. It is a
+bridge, not a destination: a bootstrap-admitted case has no measured evidence at the current key, so
+it arms rung 4 but leaves rung 6 quiet and contributes nothing to `main`'s side of the aggregate.
+
+**The record governs once it holds a full window.** `BaselineStore.admission()` consults the store
+before the list: with at least `EVAL_ADMISSION_MIN_RUNS` runs at the current key, the pooled rate
+decides either way, and a listed case screened at 12/21 is turned away with a reason that says the
+record overrides the list. The list is consulted only in the first three pre-admission states
+below (nothing at this key, stale, collecting), and while a listed case rides the bridge the
+store's own state is appended to its reason, so the log says how far it is from being judged on
+evidence. Every verdict carries `admission_source` — `record`, `bootstrap` or `neither` — and the
+markdown renders it per case once a store is configured; with the store unset the output is
+unchanged, which `bench/tests/test_store_unset_golden.py` pins. The switch-over criteria for
+deleting the list are in [`docs/eval-gate-roster.md`](../eval-gate-roster.md).
 
 **A name in it that matches no graded case is reported, loudly.** It is a free-text environment
 variable holding case ids, and its whole job is to keep something blocking — so a typo, or a rename
@@ -1225,6 +1243,8 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   advisory on small runs and says so in the verdict. Two things to watch when it is replaced: `30`
   is not load-bearing except as "enough to tolerate two failed repetitions", and the advisory note
   must keep reporting when the rate fell below the margin, or a rule that never fires goes
-  unnoticed.
+  unnoticed. The rule is also unarmed by default above the floor (`EVAL_AGGREGATE_ARMED`), for
+  the same reason: until the store shows how much an unchanged pull request moves the aggregate,
+  a flat margin is a guess, and the note is how anyone watches it fire before arming it.
 - Every threshold here is a starting point. The way to tune them is to run the suite against `main`
   a few dozen times, see how much it moves when nothing changed, and set the bars above that.

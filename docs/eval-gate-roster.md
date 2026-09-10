@@ -12,12 +12,24 @@ roster-comment edits used to cost.
 
 ## What the roster is
 
-The roster is a transition bridge, not a destination. `bench/baselines/` ships empty, so
-no case is admitted by measured evidence and nothing can reach the collapse rung — which
-would mean the presubmit blocks on nothing for as long as screening takes. Cases named in
-`BOOTSTRAP_ADMITTED` keep their old blocking behaviour meanwhile: a bootstrap-admitted
-case arms rung 4 but leaves rung 6 quiet and contributes nothing to main's side of the
-aggregate, because it has no measured evidence to contribute. Screening replaces it — see
+The roster is a transition bridge, not a destination. `bench/baselines/` ships empty and
+the evidence store is not armed yet, so no case is admitted by measured evidence and
+nothing could reach the collapse rung — the presubmit would block on nothing for as long
+as screening takes. Cases named in `BOOTSTRAP_ADMITTED` keep their old blocking behaviour
+meanwhile: a bootstrap-admitted case arms rung 4 but leaves rung 6 quiet and contributes
+nothing to main's side of the aggregate, because it has no measured evidence to
+contribute.
+
+**The record wins once it exists.** `BaselineStore.admission()` in
+`bench/kube_agents_bench/baselines.py` consults the store before the list. When the store
+holds a full window — `EVAL_ADMISSION_MIN_RUNS` runs, default 20, at the current version
+key — that pooled rate decides, either way: a case at 21/21 is admitted whether or not it
+is named here, and a case at 12/21 is turned away even if it is. The list is consulted
+only for a case the record cannot judge yet: no evidence, evidence only at a superseded key
+(`stale`), or fewer than the minimum runs at this one (`collecting`). Once a store is
+configured the verdict markdown names the decider per case in an **Admitted by** column —
+`record`, `bootstrap`, `record: not admitted`, or `none`; with `EVAL_BASELINE_STORE` unset
+the column is absent and the presubmit's output is what it was before. See
 [`docs/designs/eval-scorer.md`](designs/eval-scorer.md) for computed admission and
 [`docs/designs/testing-strategy.md`](designs/testing-strategy.md) §4.2 for the verdict
 ladder the rungs below refer to.
@@ -104,9 +116,43 @@ erroring verifier, an empty record on a task that provisions nothing — a recor
 deployer died before any agent ran grades INFRA and reds nobody) does not stop when its
 case leaves the list.
 
+It is also the lever only while the list decides the case. Once the store holds a full
+window for it at the current key, the record decides and the edit changes nothing — in
+either direction. A case the record admits at 21/21 blocks whether or not it is named, and
+demoting it by hand means waiting for the record: one night of three failures on `main`
+against a 21/21 window reads 18/21, below the bar, and the case is turned away on the next
+presubmit. That is the de-admission window once the record governs — one nightly. Until the
+store is armed and has filled for a case, it is the seven nights of collecting plus however
+long the case has been failing, which is why the manual edit stays the fast lever for now.
+
 A demoted case keeps running and reporting; give it a hold-out entry above with the issue
 that names its re-admission condition. That issue goes to the case's `owner:` in its
 `task.yaml` — a GitHub login, or `maintainers` for the approvers in the root `OWNERS` file —
 who investigates and either fixes the case or proposes retiring it. A case whose owner does
 not answer stays demoted. The bar is the same for a contributed case and an in-house one;
 [`bench/CONTRIBUTING.md`](../bench/CONTRIBUTING.md) is what a contributor signs up to.
+
+## Switching over: when the list is deleted
+
+The list comes out of `hack/ci-eval-pr.sh` in one pull request when all of the following
+hold, and not before:
+
+1. The evidence store is armed on both jobs: the nightly appends to it and the presubmit
+   reads it (`EVAL_BASELINE_STORE` exported in both Prow jobs — the two-export contract is
+   the comment above that variable in the script).
+2. Every case on the list has a full window at the current version key, so the record
+   already decides it and the list is inert for it: each shows `record` or
+   `record: not admitted` in the nightly verdict's **Admitted by** column. At the nightly's
+   three repetitions that is seven nights from an empty store, and seven nights again after
+   any version-key bump (a new agent or judge model, a `fleet` or `verifiers` bump).
+3. Those seven nights completed for every listed case. A nightly killed at its deadline
+   records only the units that finished, so a case queued late can fall behind the count
+   the calendar suggests; read the column rather than counting nights.
+4. The eval dashboard's `admission_state` view and the verdict's column agree on which
+   cases are live.
+
+Deleting the list before 2 holds silently un-arms every case still riding the bridge — the
+gate goes green with rung 4 inert for them, which is the failure the list exists to
+prevent. Deleting it after 2 holds changes no verdict, and that is the test that it is time.
+Hold-out entries above stay as history on their issues; the mechanism that keeps a flaky
+case from redding pull requests is then the record, not this page.

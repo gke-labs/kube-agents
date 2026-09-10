@@ -979,10 +979,20 @@ def test_the_aggregate_covers_admitted_cases_only():
 
 def test_the_aggregate_reds_when_it_falls_below_main_by_more_than_the_margin():
     verdict = grade_suite(
-        [_case(passes=50, scored=100)], baseline_rate=0.9, margin=0.05
+        [_case(passes=50, scored=100)], baseline_rate=0.9, margin=0.05, armed=True
     )
     assert verdict.green is False
     assert any("below main's" in r for r in verdict.reasons)
+
+
+def test_the_aggregate_is_advisory_unless_armed():
+    """The default. The same finding is computed and reported in full, as a
+    note rather than a reason, so an unarmed rule is still one somebody can
+    watch fire before deciding to arm it."""
+    verdict = grade_suite([_case(passes=50, scored=100)], baseline_rate=0.9, margin=0.05)
+    assert verdict.green is True
+    assert verdict.reasons == []
+    assert any("below main's 0.900" in n and "not armed" in n for n in verdict.notes)
 
 
 def test_the_aggregate_tolerates_movement_inside_the_margin():
@@ -997,7 +1007,11 @@ def test_the_margin_rule_is_separable_from_the_sample_floor():
     same input is green for a reason that has nothing to do with the margin.
     """
     verdict = grade_suite(
-        [_case(passes=5, scored=10)], baseline_rate=0.9, margin=0.05, min_scored=1
+        [_case(passes=5, scored=10)],
+        baseline_rate=0.9,
+        margin=0.05,
+        min_scored=1,
+        armed=True,
     )
     assert verdict.green is False
     assert any("below main's" in r for r in verdict.reasons)
@@ -1042,10 +1056,18 @@ def test_an_advisory_aggregate_still_says_it_fell_below():
 def test_the_sample_floor_stops_applying_at_the_floor():
     """At exactly `min_scored` the comparison blocks again."""
     below = grade_suite(
-        [_case(passes=26, scored=29)], baseline_rate=0.95, margin=0.05, min_scored=30
+        [_case(passes=26, scored=29)],
+        baseline_rate=0.95,
+        margin=0.05,
+        min_scored=30,
+        armed=True,
     )
     at = grade_suite(
-        [_case(passes=26, scored=30)], baseline_rate=0.95, margin=0.05, min_scored=30
+        [_case(passes=26, scored=30)],
+        baseline_rate=0.95,
+        margin=0.05,
+        min_scored=30,
+        armed=True,
     )
     assert below.green is True
     assert at.green is False

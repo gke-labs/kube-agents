@@ -1633,6 +1633,15 @@ fi
 # variable metric, not a smaller number here.
 export EVAL_JUDGED_MARGIN="${EVAL_JUDGED_MARGIN:-0.5}"
 
+# Whether the suite aggregate -- admitted-case pass rate against main's, over
+# at least EVAL_AGGREGATE_MIN_SCORED repetitions -- may red the job. Unset,
+# the default, it is computed and written into the verdict but cannot block:
+# the 0.05 margin has never been measured against how much an unchanged pull
+# request moves the aggregate on main, and arming a flat margin before the
+# store can say is arming a guess. Set it to 1 in the Prow job config, not
+# here, once the store holds enough nights to size it.
+export EVAL_AGGREGATE_ARMED="${EVAL_AGGREGATE_ARMED:-}"
+
 # Reads infrastructure.stack out of a task file. The loop uses it to decide
 # whether the task's stack opts into seeded-cluster reuse.
 #
@@ -1651,9 +1660,13 @@ print(m.group(1).strip('\'\"') if m else '')
 }
 
 # The transition bridge: cases named here keep the old blocking behaviour
-# while bench/baselines/ ships empty -- they arm rung 4, leave rung 6 quiet,
-# and screening replaces them. Comma- or whitespace-separated task ids;
-# bench-gate's _bootstrap_admitted() accepts either.
+# until the store holds a full window for them -- EVAL_ADMISSION_MIN_RUNS
+# runs at the current version key -- arming rung 4 and leaving rung 6 quiet
+# meanwhile. Once the window is full the record decides, either way: a name
+# here cannot keep a case the record turned away, and a case the record
+# admits blocks without being named. docs/eval-gate-roster.md has the
+# switch-over criteria for deleting this list. Comma- or whitespace-separated
+# task ids; bench-gate's _bootstrap_admitted() accepts either.
 #
 # The prose about this roster -- the admission bar, who is held out and on
 # which issue, the rung scoping, the demotion protocol -- lives in
@@ -1961,8 +1974,9 @@ profile_begin "record + final gate"
 # provisioning for three samples of each case, and provisioning -- not the eval
 # -- is what the job spends its time on. One nightly run amortises that setup
 # over every repetition, so it buys a sample far cheaper and can refill the
-# whole 20-run admission window in a night or two after a version-key bump
-# instead of over a week of merges. Neither job type is a pull request, which
+# whole 20-run admission window in seven nights at its three repetitions
+# after a version-key bump, fewer once the count is raised on measured wall
+# clock. Neither job type is a pull request, which
 # is the property that actually matters here; PULL_NUMBER below is what
 # enforces it. See docs/designs/eval-scorer.md#the-job-that-writes-it.
 #
@@ -2003,8 +2017,9 @@ fi
 # The suite roll-up: blocking cases, the admitted-case aggregate, and the
 # all-infrastructure check. Exit 0 green, 1 red. --baseline-rate is not passed:
 # the rate is computed from the store, per admitted case at its own version
-# key. While the store holds nothing the aggregate stays advisory and the
-# markdown says so, rather than implying a comparison that did not happen.
+# key. While the store holds nothing, and until EVAL_AGGREGATE_ARMED is set,
+# the aggregate stays advisory and the markdown says so, rather than implying
+# a comparison that did not happen or a rule that was armed.
 TOTAL_DURATION=$((SECONDS - START_TIME))
 if (cd "${BENCH_DIR}" && uv run bench-gate suite \
   "${CASE_RESULTS[@]}" \

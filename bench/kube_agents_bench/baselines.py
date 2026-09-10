@@ -95,6 +95,10 @@ __all__ = [
 ]
 
 __all__ = [
+    "ADMITTED_BY_BOOTSTRAP",
+    "ADMITTED_BY_NEITHER",
+    "ADMITTED_BY_RECORD",
+    "Admission",
     "AdmissionBar",
     "BaselineEvidence",
     "BaselineRecord",
@@ -114,6 +118,14 @@ DEFAULT_ADMISSION_RATE = 0.95
 #: rule against every future pull request.
 DEFAULT_ADMISSION_MIN_RUNS = 20
 
+#: Who decided a case's admission. ``record``: the store held a full window
+#: at the current key and its rate decided, either way. ``bootstrap``: the
+#: store had no full window, so ``BOOTSTRAP_ADMITTED`` decided. ``neither``:
+#: no full window and not on the list -- the four pre-admission states.
+ADMITTED_BY_RECORD = "record"
+ADMITTED_BY_BOOTSTRAP = "bootstrap"
+ADMITTED_BY_NEITHER = "neither"
+
 
 @dataclass(frozen=True)
 class AdmissionBar:
@@ -129,6 +141,22 @@ class AdmissionBar:
             rate=float(src.get("EVAL_ADMISSION_RATE", DEFAULT_ADMISSION_RATE)),
             min_runs=int(src.get("EVAL_ADMISSION_MIN_RUNS", DEFAULT_ADMISSION_MIN_RUNS)),
         )
+
+
+@dataclass(frozen=True)
+class Admission:
+    """Whether a case may reach rungs 4 and 6, the one-line why, and who said so.
+
+    ``source`` is one of :data:`ADMITTED_BY_RECORD`,
+    :data:`ADMITTED_BY_BOOTSTRAP` or :data:`ADMITTED_BY_NEITHER`. It is
+    reported per case so a verdict says which authority admitted a case, and
+    a case the record turned away despite its name being on the bootstrap
+    list is visibly the record's decision rather than a missing name.
+    """
+
+    admitted: bool
+    reason: str
+    source: str
 
 
 @dataclass(frozen=True)
@@ -523,46 +551,107 @@ class BaselineStore:
     ) -> tuple[bool, str]:
         """Whether the case may reach rung 4, and the one-line why.
 
-        ``bootstrap`` is the transition bridge. The store ships empty, so
-        without it every case would stop blocking on the day this lands and
-        the presubmit would grade nothing for as long as screening takes.
-        Named cases keep their old blocking behaviour meanwhile. It is
-        deliberately an environment list in the shell rather than a field in
-        the store: a bridge that is inconvenient to extend is a bridge people
-        take down.
+        :meth:`admission` with the source dropped, for callers that only need
+        the boolean and the sentence.
         """
-        if case_id in bootstrap:
-            return True, "admitted by BOOTSTRAP_ADMITTED (transition bridge)"
+        decision = self.admission(case_id, key, bar=bar, bootstrap=bootstrap)
+        return decision.admitted, decision.reason
+
+    def _pre_admission_state(
+        self, case_id: str, key: VersionKey | None, evidence: BaselineEvidence | None, bar: AdmissionBar
+    ) -> str:
+        """The four states short of admission, in the store's own words.
+
+        Distinct on purpose: only the last is a problem with the case, and a
+        build log has to tell "we have not measured this yet" from "we
+        measured it and it is not reliable enough", which are the same boolean
+        and completely different problems.
+        """
         if key is None:
-            return False, "the run carries no version key, so no baseline matches it"
-        evidence = self.evidence_for(case_id, key, min_runs=bar.min_runs)
+            return "the run carries no version key, so no baseline matches it"
         if evidence is None:
             known = len(self._records.get(case_id, []))
             if known:
-                return False, (
+                return (
                     f"stale: {known} baseline record(s) exist for this case but "
                     f"none at the current key ({key.setup_id}, judge "
                     f"{key.judge_model}, fleet {key.fleet}, verifiers "
                     f"{key.verifiers}) -- re-screen before this case can collapse"
                 )
-            return False, "no screening evidence for this case yet"
+            return "no screening evidence for this case yet"
         span = f"{evidence.lines} recorded run(s)"
-        if evidence.admits(bar):
-            return True, (
-                f"admitted on {evidence.passes}/{evidence.runs} screening runs "
-                f"across {span} (bar {bar.rate:.0%} over {bar.min_runs})"
-            )
         if evidence.runs < bar.min_runs:
-            # Not a failure -- this is the store filling up. Said in its own
-            # words so a build log distinguishes "we have not measured this
-            # yet" from "we measured it and it is not reliable enough", which
-            # are the same boolean and completely different problems.
-            return False, (
+            return (
                 f"collecting: {evidence.passes}/{evidence.runs} runs recorded at "
                 f"this key across {span}, {bar.min_runs - evidence.runs} more "
                 f"needed before this case can collapse"
             )
-        return False, (
+        return (
             f"screened at {evidence.passes}/{evidence.runs} across {span}, below "
             f"the bar of {bar.rate:.0%} over {bar.min_runs} runs"
+        )
+
+    def admission(
+        self,
+        case_id: str,
+        key: VersionKey | None,
+        *,
+        bar: AdmissionBar,
+        bootstrap: frozenset[str] = frozenset(),
+    ) -> Admission:
+        """Who admits the case -- the record, the bootstrap list, or nobody.
+
+        THE RECORD GOVERNS ONCE IT HOLDS A FULL WINDOW. When the store has at
+        least ``bar.min_runs`` runs for this case at the current key, that
+        pooled rate decides, and it decides either way: a case at 12/20 is
+        turned away even if ``bootstrap`` names it. Screening was always meant
+        to replace the list, and a list that could overrule the evidence it
+        was bridging toward would never be safe to delete.
+
+        ``bootstrap`` is the fallback for a case the record cannot yet judge:
+        no evidence at all, evidence only at a superseded key, or fewer than
+        ``bar.min_runs`` runs at this one. The store ships empty, so without
+        it every case would stop blocking on the day the gate landed and the
+        presubmit would grade nothing for as long as screening takes. It is
+        deliberately an environment list in the shell rather than a field in
+        the store: a bridge that is inconvenient to extend is a bridge people
+        take down. While a named case rides the bridge, the store's own state
+        is appended to the reason so the log says how far it is from being
+        judged on evidence -- except when the store holds nothing for it,
+        where the sentence is the one the list has always produced.
+        """
+        evidence = (
+            self.evidence_for(case_id, key, min_runs=bar.min_runs)
+            if key is not None
+            else None
+        )
+        if evidence is not None and evidence.runs >= bar.min_runs:
+            span = f"{evidence.lines} recorded run(s)"
+            if evidence.admits(bar):
+                return Admission(
+                    True,
+                    f"admitted on {evidence.passes}/{evidence.runs} screening runs "
+                    f"across {span} (bar {bar.rate:.0%} over {bar.min_runs})",
+                    ADMITTED_BY_RECORD,
+                )
+            reason = self._pre_admission_state(case_id, key, evidence, bar)
+            if case_id in bootstrap:
+                reason += (
+                    " -- the record overrides BOOTSTRAP_ADMITTED, which still names "
+                    "this case"
+                )
+            return Admission(False, reason, ADMITTED_BY_RECORD)
+
+        if case_id in bootstrap:
+            reason = "admitted by BOOTSTRAP_ADMITTED (transition bridge)"
+            if self._records.get(case_id):
+                reason += "; the record cannot judge it yet: " + self._pre_admission_state(
+                    case_id, key, evidence, bar
+                )
+            return Admission(True, reason, ADMITTED_BY_BOOTSTRAP)
+
+        return Admission(
+            False,
+            self._pre_admission_state(case_id, key, evidence, bar),
+            ADMITTED_BY_NEITHER,
         )

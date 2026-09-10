@@ -4,7 +4,8 @@ Screening evidence for how each case behaves on `main`. Three of the
 presubmit's rules read it: collapse (rung 4), which may only red a case that
 has proved it passes reliably; judged regression (rung 6), which compares this
 pull request's judge scores against main's at the same version key; and the
-suite aggregate, which compares pass rates.
+suite aggregate, which compares pass rates and reports the result — it reds
+the job only once `EVAL_AGGREGATE_ARMED` is set.
 
 **This store ships empty, and it fills itself.** Every nightly run on `main`
 appends what it measured (`bench-gate record`), and a case is admitted once its
@@ -12,7 +13,9 @@ accumulated evidence clears the bar. Until then nothing is admitted: rung 4
 cannot fire, rung 6 has nothing to compare against, and the aggregate is
 advisory. That is a legitimate green, not a broken gate — it is the gate
 collecting. `BOOTSTRAP_ADMITTED` in `hack/ci-eval-pr.sh` names the cases that
-keep blocking meanwhile.
+keep blocking meanwhile — until the store holds a full window for a case at
+the current key, at which point the record decides either way and the list is
+not consulted for it; `docs/eval-gate-roster.md` has the switch-over.
 
 ## Layout
 
@@ -22,7 +25,7 @@ keep blocking meanwhile.
 | `<case-id>.jsonl` | One file per case, named for its `bench/tasks/` directory |
 
 Each line of `<case-id>.jsonl` is **one batch of runs** — a deliberate 20-run
-screening campaign, or the ten repetitions an ordinary nightly produced —
+screening campaign, or the three repetitions an ordinary nightly produced —
 filed under the version key it was measured at. Newlines are shown here for the
 page's sake; in the file a record is one line.
 
@@ -71,7 +74,8 @@ is a handful of repetitions, so a rule that read only the newest line could
 never admit anything the routine job produces — the store would ship empty and
 stay empty. Instead the reader walks the lines at the current key newest-first
 and pools them until it holds 20 runs. One 20-run campaign is therefore one
-line, two ordinary nightlies at 10 repetitions are two, and both admit.
+line, seven ordinary nightlies at three repetitions are seven (21 runs), and
+both admit.
 
 Whole lines only: pooling overshoots to 21 rather than trimming a line to land
 on 20 exactly, because trimming would invent a sub-record nobody measured.
@@ -227,6 +231,14 @@ Only the last is a problem with the case. The middle two are the store filling
 up, which is the ordinary state of a new case and of every case after a version
 bump.
 
+A case named in `BOOTSTRAP_ADMITTED` is admitted through the first three states
+by the list rather than the store, and its reason says which state the store is
+in. In the fourth — and whenever the store holds at least the minimum runs at
+the current key — the record decides and the list is not consulted: a named
+case screened at 12/21 is turned away, and the reason says the record overrides
+the list. Every verdict carries `admission_source` (`record`, `bootstrap` or
+`neither`), and the markdown renders it per case once a store is configured.
+
 Admission is computed here, never declared in `task.yaml`. A pull request
 author therefore cannot self-admit a case in the same diff that makes it pass.
 
@@ -240,7 +252,8 @@ measured on — and a new one is appended once re-screened.
 ## Regenerating
 
 Ordinarily nobody does: the nightly appends a line every time it runs on
-`main`, and 20 runs of evidence arrive after two nights. To fill the store
+`main`, and 20 runs of evidence arrive after seven nights at its three
+repetitions. To fill the store
 faster — a new case, or every case after a version bump — run the suite N times
 on a `main` checkout and record each one:
 
