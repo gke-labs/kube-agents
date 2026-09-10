@@ -87,6 +87,9 @@ validated: false
 # Slug per docs/designs/domains.yaml.
 domain: cluster-debugging
 
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
 # Fixture roles from bench/tf/fleet/fixtures.json; the design is in
 # docs/designs/bench-fleet-catalog.md. Named by role, never by cluster name or
 # project id.

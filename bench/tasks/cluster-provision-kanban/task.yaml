@@ -27,6 +27,9 @@ validated: false
 # agent-kanban-smoke, on a freshly provisioned kind cluster.
 domain: chat-and-routing
 
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
 # The title's cluster half is a {{CLUSTER_NAME}} template in the prompt, so the
 # exact check pins the invariant prefix we chose rather than the rendered name.
 verification_spec:

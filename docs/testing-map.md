@@ -93,7 +93,8 @@ journey, [`tests/integration/README.md`](../tests/integration/README.md) for the
 
 For an eval case, [`bench-case-format.md`](designs/bench-case-format.md) is the contract and this
 page does not restate it. It rules on what a `task.yaml` must carry — the `id`, the mandatory
-`domain:` slug and `verification_spec`, the exact-versus-judged line, and which keys red a build —
+`domain:` slug, `owner:` and `verification_spec`, the exact-versus-judged line, and which keys red
+a build —
 and `make bench-case-check` checks it in about a second before you push. The target itself
 runs in no workflow: `scripts/test_task_registration.py` calls the same validator and
 asserts it returned no findings, and that lint is what gates, through `PYTHON_TEST_DIRS`
