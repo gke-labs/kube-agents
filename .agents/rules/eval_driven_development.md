@@ -11,7 +11,7 @@ path an agent takes, or a fix for something an agent did wrong. A chart, operato
 configuration change that alters agent behaviour counts; "infrastructure" here means the pool
 projects, the seeded fleet, Prow and the workflows. Exempt: docs, CI, that infrastructure, and the
 bench harness itself (`bench/kube_agents_bench/`, `hack/ci-eval-pr.sh`). An exempt change says so
-in one line under **Eval evidence** in the pull request body.
+in one line under **Live validation** in the pull request body.
 
 The loop needs a dev project with kube-agents installed ([`INSTALL.md`](../../INSTALL.md)) and,
 for cases with `fixtures:`, the seeded fleet applied to it once
@@ -72,7 +72,8 @@ to the blocking roster is earned on the case's record afterwards
 
 ## What the pull request records
 
-Under **Testing**, the template's **Eval evidence** section:
+Under **Testing → Live validation** in the template, which for a change to agent behaviour
+is this loop and nothing less:
 
 - the case id, and whether it is new or existing;
 - red: the install and the `main` commit it ran against, the failing check and its reason, one
