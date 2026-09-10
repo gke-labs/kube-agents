@@ -27,6 +27,12 @@ export TARGET_NAMESPACE="kubeagents-system"
 export NAMESPACE="${TARGET_NAMESPACE}"
 export PR_ID="${PULL_NUMBER:-local}"
 
+# EXPERIMENT (do not merge): the one switch for the response-cache sidecar
+# measurement. ci-deploy.sh deploys the sidecar in this mode and ci-eval-pr.sh
+# archives its counters when non-empty; both read this and nothing else, so
+# the deploy and the measurement cannot disagree.
+export EVAL_RESPONSE_CACHE="${EVAL_RESPONSE_CACHE:-testing}"
+
 # ─── Helm Bootstrap ──────────────────────────────────────────────────────────
 # The Prow job image carries gcloud, kubectl, and go, but no helm — and
 # ci-deploy.sh / ci-teardown.sh drive the kube-agents chart with it. Install a
