@@ -170,10 +170,11 @@ Additive, optional, and safe to omit — consumers must default them.
 
 - `stale_after_s` — seconds after `generated_at` beyond which the rendered
   page labels itself `STALE`. Emitted only when the collector is invoked
-  with `--stale-after-s` (the hourly refresh job passes its cadence plus
+  with `--stale-after-s` (the 15-minute refresh job passes its cadence plus
   slack); the renderer defaults to `7200` when it is absent.
 - `pending_builds` — builds the GCS scan listed but could not record: no
-  readable `finished.json` yet (still running, or the upload failed), so
+  readable `finished.json` yet (still running, or the upload failed), or an
+  index pointer that could not be read this scan, so
   they are not in `runs[]` and do not raise the watermark. Entries are
   `{"build_id": "<id>", "first_seen": "<iso8601>"}`, lowest id first;
   `first_seen` is when the collector first listed the build. The next
@@ -213,21 +214,23 @@ what the renderer does with them.
   `gsutil cat`. **Read-only.** How they are discovered depends on whether
   there is a watermark (below): a cold sweep lists the glob itself with
   `gsutil ls`, a walk of every PR directory that grows with the archive and
-  passes the 300 s per-call timeout at ~1700 builds; an incremental scan
-  lists `--index-prefix` instead.
+  passes the collector's per-call timeout (`GSUTIL_TIMEOUT_S`) at ~1700
+  builds; an incremental scan lists the job's directory index instead.
 - `--index-prefix <gs prefix>` — Prow's per-job directory index,
   `gs://<bucket>/pr-logs/directory/<job>/`: one `<build_id>.txt` object per
   build holding the `gs://` path of that build's directory (its
   `latest-build.txt` is ignored). One `gsutil ls` of the prefix names every
   build in seconds; the ids above the watermark (plus `pending_builds`) are
-  the only pointers read, and only those builds are then read, eight at a
-  time. Defaults to the smoke-test presubmit's index; an empty string
-  disables it and the glob is listed even with a watermark. It changes how
-  a `--pr-glob` scan finds builds, not whether one happens: `--merge-with`
-  alone still recomputes without touching the bucket. A listing or pointer
-  read that fails or times out is a `warning: gsutil ls|cat ... failed`
-  line and nothing new — the refresh workflow greps for that line and does
-  not publish, so a stall is never republished under a fresh
+  the only pointers read, and only those builds are then read,
+  `READ_WORKERS` at a time. Defaults to the index derived from each
+  `--pr-glob`'s bucket and job; an empty string disables it and the glob is
+  listed even with a watermark. It changes how a `--pr-glob` scan finds
+  builds, not whether one happens: `--merge-with` alone still recomputes
+  without touching the bucket. A listing that fails or times out is a
+  `warning: gsutil ls ... failed` line and nothing new; a pointer that
+  cannot be read is a `warning: gsutil cat ... failed` line and that one
+  build deferred to `pending_builds`. The refresh workflow greps for either
+  line and does not publish, so a stall is never republished under a fresh
   `generated_at`.
 - `--from-dir <dir>` — local `<build_id>/` subdirectories with the same
   three files; the offline/testing path.

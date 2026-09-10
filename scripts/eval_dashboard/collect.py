@@ -25,11 +25,12 @@ Sources:
               however many PRs the archive spans, so this is how an
               incremental scan discovers what is new: list the index once,
               keep the ids above the watermark, read those pointers, then
-              read the builds. Defaults to the smoke-test presubmit's index;
-              an empty string disables it. It changes how a --pr-glob scan
-              discovers builds, not whether one happens: --pr-glob is still
-              what asks for a GCS scan, and --merge-with alone still
-              recomputes without touching the bucket.
+              read the builds. Defaults to the index derived from each
+              --pr-glob's bucket and job; an empty string disables it. It
+              changes how a --pr-glob scan discovers builds, not whether
+              one happens: --pr-glob is still what asks for a GCS scan, and
+              --merge-with alone still recomputes without touching the
+              bucket.
   --pr-glob   gsutil glob(s) of Prow build directories (read-only; requires
               gsutil on PATH). Repeatable. One `gsutil ls` of a whole-archive
               glob walks every PR directory and grows with the archive (past
@@ -88,21 +89,26 @@ from datetime import datetime, timedelta, timezone
 
 SCHEMA_VERSION = 1
 
-# The Prow job whose archive this collector reads, and the bucket Prow
-# archives it to. The default --index-prefix is derived from them; the
-# --pr-glob defaults in the CI scripts name the same job.
-PROW_JOB_NAME = "pull-kube-agents-smoke-test"
-PROW_BUCKET = "gs://kube-agents-prow"
-
-# Prow's per-job directory index: one `<build_id>.txt` object per build
-# under this prefix, each holding the gs:// path of that build's directory.
-# Listing it is one flat prefix (~3 s at 1700 builds) where the whole-archive
-# --pr-glob is a walk of every PR directory (past 300 s at the same size).
-DEFAULT_INDEX_PREFIX = f"{PROW_BUCKET}/pr-logs/directory/{PROW_JOB_NAME}/"
+# The shape of a Prow presubmit build-directory glob,
+# gs://<bucket>/pr-logs/pull/<org_repo>/<pr or *>/<job>/*, from which the
+# job's directory index is derived: <root>/directory/<job>/. Prow keeps that
+# index as one `<build_id>.txt` object per build holding the gs:// path of
+# the build's directory. Listing it is one flat prefix (~3 s at 1700 builds)
+# where the glob is a walk of every PR directory (past GSUTIL_TIMEOUT_S at
+# the same size).
+_PR_GLOB_SHAPE = re.compile(
+    r"^(?P<root>gs://[^/]+/pr-logs)/pull/[^/]+/[^/]+/(?P<job>[^/*]+)/\*$"
+)
+INDEX_DIRECTORY_SEGMENT = "directory"
 
 # The suffix of a per-build pointer in the index. `latest-build.txt` shares
 # it and is skipped because its stem is not a build id.
 INDEX_POINTER_SUFFIX = ".txt"
+
+# What a pointer must start with to be followed, and how much of one that
+# does not is quoted in the warning.
+GS_SCHEME = "gs://"
+POINTER_EXCERPT_CHARS = 80
 
 # Ceiling on one gsutil call. A listing or read past it is reported as timed
 # out and the sweep carries on without it; the refresh workflow's budget must
@@ -153,7 +159,7 @@ DEGRADED_SINCE_DAYS = 14.0
 
 # How long a listed-but-unfinished build stays on pending_builds before the
 # scan stops re-reading it. Prow's job deadline caps a real run at a few
-# hours, and 2 days of hourly retries also rides out a transiently unreadable
+# hours, and 2 days of retries also rides out a transiently unreadable
 # finished.json; a build still unfinished after that is a pod that died
 # without uploading, and dropping it is what keeps the retry list -- and the
 # reads it costs every sweep -- bounded.
@@ -755,14 +761,36 @@ def _resolve_pointer(
         )
         return build_id, None, True
     path = text.strip()
-    if not path.startswith("gs://"):
+    if not path.startswith(GS_SCHEME):
         print(
             f"warning: build {build_id}: index pointer {pointer} does not hold a"
-            f" gs:// path ({path[:80]!r}); skipping",
+            f" {GS_SCHEME} path ({path[:POINTER_EXCERPT_CHARS]!r}); skipping",
             file=sys.stderr,
         )
         return build_id, None, False
     return build_id, path.rstrip("/") + "/", False
+
+
+def discovery_index(glob: str, index_prefix: str | None) -> str | None:
+    """The index prefix an incremental scan of `glob` lists, or None.
+
+    An explicit --index-prefix wins; the default (None) derives the job's
+    index from the glob's bucket and job name; an empty string disables the
+    index, and so does a glob whose shape names no job -- both list the
+    glob itself, as a cold sweep does.
+    """
+    if index_prefix == "":
+        return None
+    if index_prefix is not None:
+        return index_prefix.rstrip("/") + "/"
+    m = _PR_GLOB_SHAPE.match(glob)
+    if m is None:
+        print(
+            f"note: no directory index derivable from {glob}; listing the glob itself",
+            file=sys.stderr,
+        )
+        return None
+    return f"{m.group('root')}/{INDEX_DIRECTORY_SEGMENT}/{m.group('job')}/"
 
 
 def runs_from_index(
@@ -1049,10 +1077,9 @@ def collect(
     # keeps library callers and unit tests hermetic; the CLI passes its --gh
     # default so a normal collect resolves best-effort. `now` anchors the
     # pr_merged resolution window and the pending-build/--since-days clocks
-    # (tests pin it; the CLI leaves it None). index_prefix=None means a
-    # --pr-glob scan discovers builds through the glob alone (library
-    # callers and the glob tests); the CLI passes DEFAULT_INDEX_PREFIX
-    # unless told otherwise.
+    # (tests pin it; the CLI leaves it None). index_prefix is the
+    # --index-prefix tri-state: None derives each glob's job index, "" turns
+    # the index off, anything else is listed as given.
     now_dt = now or datetime.now(timezone.utc)
     prior: list[dict] = []
     retry: dict[str, str] = {}  # build_id -> first_seen, still worth re-reading
@@ -1074,8 +1101,8 @@ def collect(
                     retry[build_id] = first_seen
         # No usable prior -- or a prior that yields no numeric watermark --
         # means the incremental scan cannot resume, and an unbounded cold
-        # sweep is ~3 serial gsutil calls per archived build. Bound the
-        # recovery unless the caller already did.
+        # sweep is ~3 gsutil calls per archived build. Bound the recovery
+        # unless the caller already did.
         if after_build is None and since_days is None:
             since_days = DEGRADED_SINCE_DAYS
             print(
@@ -1095,14 +1122,23 @@ def collect(
     # GCS discovery. --pr-glob is still what asks for a GCS scan at all
     # (--merge-with alone recomputes without touching the bucket); the index
     # decides HOW that scan finds builds once there is a watermark to resume
-    # above: one flat listing, then only the new builds. Without a watermark
-    # -- a cold sweep -- the glob is listed as before. Never both: they name
-    # the same builds.
-    use_index = bool(pr_globs) and index_prefix is not None and after_build is not None
-    if use_index:
+    # above: one flat listing of the glob's job index, then only the new
+    # builds. Without a watermark -- a cold sweep -- or with the index
+    # disabled or underivable, the glob is listed as before. A job's index
+    # is listed once however many globs name it, and a build is never read
+    # through both paths.
+    indexes: list[str] = []
+    glob_only: list[str] = []
+    for glob in pr_globs or []:
+        prefix = discovery_index(glob, index_prefix) if after_build is not None else None
+        if prefix is None:
+            glob_only.append(glob)
+        elif prefix not in indexes:
+            indexes.append(prefix)
+    for prefix in indexes:
         fresh.extend(
             runs_from_index(
-                index_prefix,
+                prefix,
                 gsutil,
                 after_build=after_build,
                 since_cutoff=since_cutoff,
@@ -1110,10 +1146,10 @@ def collect(
                 unfinished=unfinished,
             )
         )
-    elif pr_globs:
+    if glob_only:
         fresh.extend(
             runs_from_gcs(
-                pr_globs,
+                glob_only,
                 gsutil,
                 after_build=after_build,
                 since_cutoff=since_cutoff,
@@ -1125,7 +1161,7 @@ def collect(
         print(
             f"note: merged {len(prior)} prior runs with {len(fresh)} newly"
             f" collected (GCS scan resumed above build {after_build}"
-            f" via {'the directory index' if use_index else 'the build-dir glob'},"
+            f" via {'the directory index' if indexes else 'the build-dir glob'},"
             f" retrying {len(retry)} pending)",
             file=sys.stderr,
         )
@@ -1181,12 +1217,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--index-prefix",
-        default=DEFAULT_INDEX_PREFIX,
+        default=None,
         metavar="GS_PREFIX",
         help="Prow's per-job directory index (one <build_id>.txt pointer per"
         " build), listed once to find the builds above the watermark instead"
-        " of walking every PR directory. Pass an empty string to disable it"
-        f" (default: {DEFAULT_INDEX_PREFIX})",
+        " of walking every PR directory. Default: derived from each --pr-glob"
+        " as gs://<bucket>/pr-logs/directory/<job>/. Pass an empty string to"
+        " disable it and list the glob even with a watermark",
     )
     parser.add_argument(
         "--from-dir",
@@ -1249,7 +1286,7 @@ def main(argv: list[str] | None = None) -> int:
         merge_with=args.merge_with,
         since_days=args.since_days,
         stale_after_s=args.stale_after_s,
-        index_prefix=args.index_prefix or None,
+        index_prefix=args.index_prefix,
     )
     args.out.write_text(json.dumps(data, indent=2) + "\n")
     print(

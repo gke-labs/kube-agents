@@ -551,9 +551,10 @@ publish_eval_dashboard() {
   #
   # The budget must be LARGER than the 300s collect.py grants each individual
   # gsutil call, or the one hung call the collector is willing to wait out
-  # kills the whole pipeline instead -- and the sweep is serial over every
-  # archived build (1 + 3N gsutil processes), so it needs real headroom on
-  # top. 900s covers both and only ever taxes the nightly's tail (the gate
+  # kills the whole pipeline instead -- and the sweep is 1 + 3N gsutil
+  # processes over every archived build (READ_WORKERS at a time), so it
+  # needs real headroom on top. 900s covers both and only ever taxes the
+  # nightly's tail (the gate
   # above keeps presubmits out entirely); EVAL_DASHBOARD_TIMEOUT overrides it
   # from the job config without a code change. Bounding the sweep itself
   # (--since/--limit) is collect.py's follow-up, not this hook's.

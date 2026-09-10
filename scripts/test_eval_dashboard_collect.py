@@ -613,10 +613,13 @@ class TestIncrementalGcsScan(_MergeBase):
         self.assertEqual([r["build_id"] for r in runs], [r["build_id"] for r in prior_data["runs"]])
 
 
-# The refresh workflow's publish gate, verbatim from .github/workflows/
-# ci-health.yml: a collect whose log matches this is not published. The
-# tests below pin that a failed index listing or pointer read still trips it.
-WORKFLOW_REFUSAL = re.compile(r"warning: gsutil (ls|cat) .*(failed|timed out)")
+# The refresh workflow's publish gate, read from .github/workflows/
+# ci-health.yml rather than copied, so the tests below pin that a failed
+# index listing or pointer read trips the grep the workflow actually runs.
+_WORKFLOW = pathlib.Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci-health.yml"
+_REFUSAL_GREP = re.search(r'grep -Eq "([^"]+)" work/collect\.log', _WORKFLOW.read_text())
+assert _REFUSAL_GREP, f"{_WORKFLOW} no longer greps collect.log; update this test's gate"
+WORKFLOW_REFUSAL = re.compile(_REFUSAL_GREP.group(1))
 
 
 class TestIndexDiscovery(_MergeBase):
@@ -703,7 +706,7 @@ class TestIndexDiscovery(_MergeBase):
         (self.bucket_root() / self.build_url(BUILD_998_FULL)[len(FAKE_BUCKET):] / "finished.json").unlink()
         prior = self.prior_with([BUILD_956_TRUNCATED, BUILD_998_INFRA])
         now = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
-        merged, _ = self.quiet_collect(
+        merged, stderr = self.quiet_collect(
             pr_globs=[FAKE_GLOB], merge_with=prior, gsutil=gsutil,
             index_prefix=FAKE_INDEX_PREFIX, now=now,
         )
@@ -711,6 +714,8 @@ class TestIndexDiscovery(_MergeBase):
         self.assertEqual(
             merged["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat()}]
         )
+        # An in-flight build is the ordinary case, not a stall: publishable.
+        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
 
     def test_listing_timeout_or_failure_trips_the_refusal_line_and_adds_nothing(self):
         gsutil, log = self.fake_gsutil(self.ALL)
@@ -747,10 +752,14 @@ class TestIndexDiscovery(_MergeBase):
                 self.assertNotIn(f"ls {FAKE_GLOB}", log.read_text())  # and no glob fallback
 
     def test_unreadable_pointer_trips_the_refusal_line_and_defers_the_build(self):
+        """One pointer read hangs past the per-call timeout (a mode-bit trick
+        would not survive running as root); the other builds still read."""
         gsutil, _ = self.fake_gsutil(self.ALL)
-        pointer = self.bucket_root() / FAKE_INDEX_PREFIX[len(FAKE_BUCKET):] / f"{BUILD_998_FULL}.txt"
-        pointer.chmod(0)
-        self.addCleanup(pointer.chmod, stat.S_IRUSR | stat.S_IWUSR)
+        os.environ["FAKE_GSUTIL_SLEEP"] = json.dumps(
+            {f"cat {FAKE_INDEX_PREFIX}{BUILD_998_FULL}.txt": 3}
+        )
+        self.addCleanup(setattr, collect, "GSUTIL_TIMEOUT_S", collect.GSUTIL_TIMEOUT_S)
+        collect.GSUTIL_TIMEOUT_S = 1
         prior = self.prior_with([BUILD_956_TRUNCATED, BUILD_998_INFRA])
         now = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
         merged, stderr = self.quiet_collect(
@@ -835,11 +844,25 @@ class TestIndexDiscovery(_MergeBase):
                 listings = [c for c in log.read_text().splitlines() if c.startswith("ls ")]
                 self.assertEqual(listings, [expected_listing])
 
-    def test_default_index_prefix_is_the_smoke_test_job_index(self):
+    def test_default_index_is_derived_from_the_globs_bucket_and_job(self):
+        """The refresh workflow's PR_GLOB (ci-health.yml) resolves to the
+        smoke-test job's index without any flag; an explicit prefix wins; an
+        empty string, or a glob of another shape, means no index."""
+        workflow_glob = (
+            "gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*"
+        )
         self.assertEqual(
-            collect.DEFAULT_INDEX_PREFIX,
+            collect.discovery_index(workflow_glob, None),
             "gs://kube-agents-prow/pr-logs/directory/pull-kube-agents-smoke-test/",
         )
+        self.assertEqual(
+            collect.discovery_index("gs://other/pr-logs/pull/o_r/1234/some-job/*", None),
+            "gs://other/pr-logs/directory/some-job/",
+        )
+        self.assertEqual(collect.discovery_index(workflow_glob, "gs://x/idx"), "gs://x/idx/")
+        self.assertIsNone(collect.discovery_index(workflow_glob, ""))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertIsNone(collect.discovery_index(FAKE_GLOB, None))  # no pr-logs/, no job
 
 
 class TestRepoDerivedFacts(unittest.TestCase):
