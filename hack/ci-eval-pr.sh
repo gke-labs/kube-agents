@@ -1898,6 +1898,35 @@ ${UNIT_QUEUE}
 EOF_UNIT_QUEUE
 wait
 
+# EXPERIMENT (do not merge): archive the response-cache sidecar's hit/miss
+# counters beside the case artifacts, so the measurement is reviewable after
+# the pool project is released. Counters only: the endpoint's recent-miss
+# excerpts, though redacted, describe prompt structure and stay out of the
+# public Prow bucket. Gated on the same ci-env.sh switch that deployed the
+# sidecar, so the deploy and the measurement cannot disagree.
+# Deliberately clear of the fan-out's AGENT_LOCAL_PORT range (28642 + seq,
+# so 28642-28695 at 54 units): this runs after `wait`, when those tunnels are
+# gone, but a leaked port-forward or a future move of this block earlier
+# would otherwise collide with a unit's tunnel and forward to the wrong thing.
+RESPONSE_CACHE_STATS_PORT=29500
+RESPONSE_CACHE_STATS_WAIT_SECONDS=3
+RESPONSE_CACHE_STATS_TIMEOUT_SECONDS=10
+if [ -n "${EVAL_RESPONSE_CACHE:-}" ]; then
+  (
+    kubectl -n "${TARGET_NAMESPACE}" port-forward svc/litellm \
+      "${RESPONSE_CACHE_STATS_PORT}:80" >/dev/null 2>&1 &
+    CACHE_STATS_PF=$!
+    sleep "${RESPONSE_CACHE_STATS_WAIT_SECONDS}"
+    curl -s --max-time "${RESPONSE_CACHE_STATS_TIMEOUT_SECONDS}" \
+      "http://127.0.0.1:${RESPONSE_CACHE_STATS_PORT}/__cache_stats" \
+      > "${ARTIFACT_DIR}/response-cache-stats.json" || true
+    kill "${CACHE_STATS_PF}" 2>/dev/null
+    if [ ! -s "${ARTIFACT_DIR}/response-cache-stats.json" ]; then
+      echo "WARNING: response-cache stats archival produced an empty file; the measurement is not reviewable" >&2
+    fi
+  ) || true
+fi
+
 # ─── Per-case verdicts, in the order TASKS declares ───────────────────────────
 profile_begin "per-repetition breakdowns + case verdicts"
 i=0

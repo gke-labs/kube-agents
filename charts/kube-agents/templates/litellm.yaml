@@ -35,6 +35,19 @@
   concrete model gets routed rather than a 404 from the gateway.
 */}}
 {{- $config := include "kube-agents.litellmConfig" (dict "provider" $provider "model" $model "callbacks" $callbacks) }}
+{{- /* With the response-cache sidecar, the sidecar owns 8080 (the port
+     every NetworkPolicy — including the operator-synthesized agent egress
+     policy — already admits) and the gateway container retreats to 4000,
+     LiteLLM's upstream default, reached only over localhost. */}}
+{{- $gatewayPort := ternary 4000 8080 (not (empty .Values.litellm.responseCache)) }}
+{{- if .Values.litellm.responseCache }}
+{{- if not (has .Values.litellm.responseCache (list "conservative" "testing" "risky")) }}
+{{- fail (printf "litellm.responseCache %q is not one of conservative, testing, risky — the package coerces unknown modes to disabled, which would deploy a sidecar that caches nothing and reports 0%% hits with no error" .Values.litellm.responseCache) }}
+{{- end }}
+{{- if gt (int .Values.litellm.replicaCount) 1 }}
+{{- fail "litellm.responseCache needs litellm.replicaCount=1: the cache and its signed-tool-call bindings are pod-local, and a second replica answering mid-conversation fails signed turns it never recorded" }}
+{{- end }}
+{{- end }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -46,6 +59,20 @@ metadata:
 data:
   config.yaml: |
     {{- $config | nindent 4 }}
+{{- if .Values.litellm.responseCache }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: litellm-response-cache
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: litellm
+    {{- include "kube-agents.labels" . | nindent 4 }}
+data:
+  proxy.py: |
+    {{- .Files.Get "files/response-cache-proxy.py" | nindent 4 }}
+{{- end }}
 {{- if eq $provider "vertex_ai" }}
 ---
 {{- /* Nothing else creates this one. The Platform Agent's KSA can be left to
@@ -97,6 +124,9 @@ spec:
         # from: an edit to the config template has to roll the pods too, and
         # the subPath mount below means nothing else will deliver it.
         checksum/config: {{ $config | sha256sum }}
+        {{- if .Values.litellm.responseCache }}
+        checksum/response-cache: {{ .Files.Get "files/response-cache-proxy.py" | sha256sum }}
+        {{- end }}
     spec:
       {{- if eq $provider "vertex_ai" }}
       serviceAccountName: {{ $vertexSA | quote }}
@@ -108,7 +138,7 @@ spec:
         - name: litellm-container
           image: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.litellm.image.repository "registry" (include "kube-agents.thirdPartyImageRegistry" .)) }}:{{ .Values.litellm.image.tag }}"
           imagePullPolicy: {{ .Values.litellm.image.pullPolicy }}
-          args: ["--config", "/app/config.yaml", "--port", "8080"]
+          args: ["--config", "/app/config.yaml", "--port", "{{ $gatewayPort }}"]
           resources:
             {{- toYaml .Values.litellm.resources | nindent 12 }}
           env:
@@ -149,7 +179,7 @@ spec:
               value: litellm
             {{- end }}
           ports:
-            - containerPort: 8080
+            - containerPort: {{ $gatewayPort }}
           # Without these the Service publishes an endpoint the instant the
           # container process starts, ~50s before uvicorn binds :8080. The agent's
           # very first task after a cold boot then dies on repeated
@@ -164,21 +194,21 @@ spec:
           startupProbe:
             httpGet:
               path: /health/liveliness
-              port: 8080
+              port: {{ $gatewayPort }}
             periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 36
           readinessProbe:
             httpGet:
               path: /health/readiness
-              port: 8080
+              port: {{ $gatewayPort }}
             periodSeconds: 10
             timeoutSeconds: 3
             failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /health/liveliness
-              port: 8080
+              port: {{ $gatewayPort }}
             periodSeconds: 20
             timeoutSeconds: 5
             failureThreshold: 3
@@ -186,10 +216,61 @@ spec:
             - name: config-volume
               mountPath: /app/config.yaml
               subPath: config.yaml
+        {{- if .Values.litellm.responseCache }}
+        # The cached-response passthrough the Service targets when
+        # litellm.responseCache is set (values.yaml owns the contract). Same
+        # image as the gateway so no new registry entry: it already ships
+        # fastapi, uvicorn and httpx, and cached-response itself is pure
+        # python, installed at boot into /tmp beside its cache.
+        - name: response-cache
+          image: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.litellm.image.repository "registry" (include "kube-agents.thirdPartyImageRegistry" .)) }}:{{ .Values.litellm.image.tag }}"
+          imagePullPolicy: {{ .Values.litellm.image.pullPolicy }}
+          # The image's default python is a uv-built venv with no pip, so the
+          # bootstrap uses the system interpreter: ensurepip, then a --target
+          # install (the four packages and their deps, ~15s), then the proxy.
+          command:
+            - sh
+            - -c
+            - >-
+              /usr/bin/python3 -m ensurepip --user &&
+              /usr/bin/python3 -m pip install --quiet --disable-pip-version-check
+              --target /tmp/response-cache-lib
+              {{ .Values.litellm.responseCachePackage }}
+              fastapi==0.141.1 uvicorn==0.52.4 httpx==0.28.1 &&
+              PYTHONPATH=/tmp/response-cache-lib /usr/bin/python3 /response-cache/proxy.py
+          env:
+            - name: CACHED_RESPONSE_MODE
+              value: {{ .Values.litellm.responseCache | quote }}
+            - name: CACHED_RESPONSE_PATH
+              value: /tmp/response-cache-store
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            # Generous: readiness begins only after the boot-time pip install.
+            failureThreshold: 60
+          volumeMounts:
+            - name: response-cache-proxy
+              mountPath: /response-cache
+        {{- end }}
       volumes:
         - name: config-volume
           configMap:
             name: litellm-config
+        {{- if .Values.litellm.responseCache }}
+        - name: response-cache-proxy
+          configMap:
+            name: litellm-response-cache
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service
