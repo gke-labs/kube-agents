@@ -121,6 +121,7 @@ DEFAULT_ROLLOUT_TIMEOUT_SEC: int = 900
 ROLLOUT_RETRY_INTERVAL_SEC: int = 3
 API_POLL_INTERVAL_SEC: int = 2
 MIN_ROLLOUT_TIMEOUT_SEC: int = 5
+DEFAULT_GENERATION_TIMEOUT_SEC: int = 180
 GATEWAY_DEPLOYMENT: str = "platform-agent-gateway"
 # AgentPlugin names are restricted to ^[a-z][a-z0-9]*$ by the CRD: the name doubles as
 # the plugin directory and the module identifier Hermes imports.
@@ -444,8 +445,15 @@ def get_latest_pod_template_hash(deployment_name: str) -> str:
     return lines[-1] if lines else ""
 
 
-def wait_deployment_generation_change(deployment_name: str, min_gen: int, timeout_sec: int = 20) -> None:
-    """Wait for operator reconciliation to update deployment metadata.generation."""
+def wait_deployment_generation_change(
+    deployment_name: str, min_gen: int, timeout_sec: int = DEFAULT_GENERATION_TIMEOUT_SEC
+) -> None:
+    """Wait for operator reconciliation to update deployment metadata.generation.
+
+    Raises TimeoutError if the deployment generation does not reach min_gen within
+    timeout_sec, preventing subsequent rollout and spec checks from validating a stale
+    revision.
+    """
     end_time = time.time() + timeout_sec
     while time.time() < end_time:
         try:
@@ -456,7 +464,9 @@ def wait_deployment_generation_change(deployment_name: str, min_gen: int, timeou
         except (subprocess.CalledProcessError, ValueError):
             pass
         time.sleep(1)
-    log(f"Warning: Deployment '{deployment_name}' generation did not reach {min_gen} within {timeout_sec}s")
+    raise TimeoutError(
+        f"Deployment '{deployment_name}' generation did not reach {min_gen} within {timeout_sec}s"
+    )
 
 
 def poll_running_pod_name(label_selector: str, pod_template_hash: str | None = None, timeout_sec: int = 30) -> str:
