@@ -28,9 +28,9 @@ The result is an ordinary cron run: its own process, homed at the Platform Agent
 
 ## The shipping jobs
 
-The rosters, with exact cron expressions, enabled state, and prompts, are generated from the two `jobs.json` files on [Reference → Cron jobs](/kube-agents/reference/cron-jobs/). Nine governance jobs ship, all enabled on the Platform Agent's roster — the fleet audits below. Three further entries share that roster without being watchdogs, all `no_agent` and none running a model: `github-repo-watcher`, a poller described under [Pollers file cards](#pollers-file-cards-watchdogs-deliver-reports); `eod-event-watcher-daily-report`, a weekday script that renders the k8s-event-watcher recap from the session ledger; and `findings-morning-nudge`, which names the findings queue's top critical items. It repeats those every morning for as long as the sweep still reports them; a morning that names no such critical posts only when the message would differ from the last one sent.
+The rosters, with exact cron expressions, enabled state, and prompts, are generated from the two `jobs.json` files on [Reference → Cron jobs](/kube-agents/reference/cron-jobs/). Ten governance jobs ship, all enabled on the Platform Agent's roster — the fleet audits below. Three further entries share that roster without being watchdogs, all `no_agent` and none running a model: `github-repo-watcher`, a poller described under [Pollers file cards](#pollers-file-cards-watchdogs-deliver-reports); `eod-event-watcher-daily-report`, a weekday script that renders the k8s-event-watcher recap from the session ledger; and `findings-morning-nudge`, which names the findings queue's top critical items. It repeats those every morning for as long as the sweep still reports them; a morning that names no such critical posts only when the message would differ from the last one sent.
 
-### The nine fleet audits
+### The ten fleet audits
 
 Each audit reads its SOP, executes read-only checks against the fleet, writes a validated findings file, and hands it to the [`fleet-audit`](/kube-agents/skills/) skill's `audit_report.py` helper. The helper owns every git and `gh` operation and renders every body itself — the model never writes one.
 
@@ -45,6 +45,7 @@ Each audit reads its SOP, executes read-only checks against the fleet, writes a 
 | `stockout-prevention`         | `stockout_prevention_sop.md`         | Capacity obtainability, ComputeClass resilience, and single-zone stockouts                       |
 | `gcp-networking-fabric-audit` | `gcp_networking_fabric_sop.md`       | GCP networking fabric: subnet IP exhaustion, Cloud NAT, PSC, MTU, Cloud Armor                    |
 | `gce-compute-fleet-audit`     | `gce_compute_fleet_sop.md`           | GCE Compute Engine and MIG fleet: startup scripts, autoscaler, Ops Agent, sole-tenant, snapshots |
+| `gke-runtime-telemetry-audit` | `gke_runtime_telemetry_sop.md`       | Container runtime health: CFS quota, conntrack saturation, preStop drain hooks                   |
 
 Two properties matter more than the check lists:
 
@@ -147,7 +148,7 @@ The `cronjob` tool is not a route to either roster: it is denied to the Planning
 
 Keep the schedule realistic — LLM inference on every tick has cost. Hourly or daily is the sweet spot for most SOPs; sub-15-minute cadences should have a clear justification. Stagger start minutes so two audits never contend for the same session.
 
-Budget the run as well as the schedule. Every job shares one per-turn tool-calling budget, `agent.max_turns` in the profile's `config.yaml` — 250 for the Platform Agent, against a Hermes default of 90 the fleet audits outgrew. A run that exhausts it is stopped mid-flight and recorded as a `timed_out` event, which reads misleadingly: no clock expired, the agent simply took more steps than it was allotted, and raising any of the `HERMES_*_TIMEOUT` values will not help. The nine shipping audits finish well inside 250, but an SOP that gains checks and a fleet that gains clusters both spend against it. There is no per-job override: the scheduler honours a per-job `model` but not a per-job turn budget, so the profile-wide value is the only lever.
+Budget the run as well as the schedule. Every job shares one per-turn tool-calling budget, `agent.max_turns` in the profile's `config.yaml` — 250 for the Platform Agent, against a Hermes default of 90 the fleet audits outgrew. A run that exhausts it is stopped mid-flight and recorded as a `timed_out` event, which reads misleadingly: no clock expired, the agent simply took more steps than it was allotted, and raising any of the `HERMES_*_TIMEOUT` values will not help. The ten shipping audits finish well inside 250, but an SOP that gains checks and a fleet that gains clusters both spend against it. There is no per-job override: the scheduler honours a per-job `model` but not a per-job turn budget, so the profile-wide value is the only lever.
 
 ## Where to go next
 
