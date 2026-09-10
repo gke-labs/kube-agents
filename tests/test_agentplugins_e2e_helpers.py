@@ -133,12 +133,14 @@ class AgentPluginsE2EHelpersTest(unittest.TestCase):
         self.assertEqual(len(generations), 0)
 
     def test_wait_deployment_generation_change_raises_timeout_error(self):
-        """When generation never reaches min_gen, raise TimeoutError."""
-        with patch.object(e2e, "get_deployment_generation", return_value=1), \
+        """When generation never reaches min_gen, poll until timeout and raise TimeoutError."""
+        with patch.object(e2e, "get_deployment_generation", return_value=1) as mock_get_gen, \
+             patch("time.time", side_effect=[100.0, 100.0, 103.0]), \
              patch("time.sleep", return_value=None):
             with self.assertRaises(TimeoutError) as ctx:
-                e2e.wait_deployment_generation_change("platform-agent-gateway", min_gen=2, timeout_sec=0)
+                e2e.wait_deployment_generation_change("platform-agent-gateway", min_gen=2, timeout_sec=2)
             self.assertIn("generation did not reach 2", str(ctx.exception))
+            mock_get_gen.assert_called_once_with("platform-agent-gateway")
 
 
 if __name__ == "__main__":

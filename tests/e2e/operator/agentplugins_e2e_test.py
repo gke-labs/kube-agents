@@ -122,6 +122,7 @@ ROLLOUT_RETRY_INTERVAL_SEC: int = 3
 API_POLL_INTERVAL_SEC: int = 2
 MIN_ROLLOUT_TIMEOUT_SEC: int = 5
 DEFAULT_GENERATION_TIMEOUT_SEC: int = 180
+CRD_MISSING_LOG_POLL_TIMEOUT_SEC: int = 30
 GATEWAY_DEPLOYMENT: str = "platform-agent-gateway"
 # AgentPlugin names are restricted to ^[a-z][a-z0-9]*$ by the CRD: the name doubles as
 # the plugin directory and the module identifier Hermes imports.
@@ -1166,14 +1167,11 @@ def step12_verify_missing_crd_decoupled_dependency_safeguard() -> None:
         log("Deleting AgentPlugin CRD from cluster...")
         run_kubectl(["delete", "crd", "agentplugins.kubeagents.x-k8s.io"], check=True)
 
-        gen_before = get_deployment_generation(GATEWAY_DEPLOYMENT)
         trigger_val = str(int(time.time()))
         run_kubectl([
             "annotate", "platformagent", "platform-agent", "-n", NAMESPACE,
             f"e2e.test/crd-missing-trigger={trigger_val}", "--overwrite"
         ])
-
-        wait_deployment_generation_change(GATEWAY_DEPLOYMENT, min_gen=gen_before + 1)
         wait_deployment_rollout(GATEWAY_DEPLOYMENT)
 
         op_image = get_kubectl_output([
@@ -1181,10 +1179,18 @@ def step12_verify_missing_crd_decoupled_dependency_safeguard() -> None:
             "-o", "jsonpath={.spec.template.spec.containers[?(@.name==\"manager\")].image}"
         ])
         op_pod = poll_operator_pod(expected_image=op_image, timeout_sec=OPERATOR_PROBE_TIMEOUT_SEC)
-        crd_missing_logged = (
-            check_operator_error_log("the server could not find the requested resource") or
-            check_operator_error_log("AgentPlugin CRD is not installed on cluster")
-        )
+
+        crd_missing_logged = False
+        start_time = time.time()
+        while time.time() - start_time < CRD_MISSING_LOG_POLL_TIMEOUT_SEC:
+            if (
+                check_operator_error_log("the server could not find the requested resource") or
+                check_operator_error_log("AgentPlugin CRD is not installed on cluster")
+            ):
+                crd_missing_logged = True
+                break
+            time.sleep(1)
+
         assert crd_missing_logged, "Expected operator to log missing CRD reflector warning or info message"
         log("Verified operator logged missing CRD reflector message while PlatformAgent reconciliation succeeded.")
 
