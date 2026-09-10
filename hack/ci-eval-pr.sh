@@ -1716,7 +1716,13 @@ CASE_RESULTS=()
 # (profiled 2026-08-28), so the matrix is embarrassingly parallel. The cap
 # bounds concurrent load on the one gateway, LiteLLM and the judge quota;
 # 1 reproduces serial behaviour through the same code path.
-EVAL_TASK_PARALLELISM="${EVAL_TASK_PARALLELISM:-4}"
+# MEASUREMENT SCAFFOLDING FOR #1254 -- DO NOT MERGE. Was 4. With one task in
+# the matrix every repetition contends on the same per-task lock, so three of
+# four lanes only ever sleep on it, and lock_acquire is a 3s retry rather than
+# a queue: a loser can keep losing. Builds 2097793380187639808 and
+# 2097813968994177024 lost reps 6, and 3 and 4, to the 1800s deadline that way.
+# At 1 there is no contention and all 15 repetitions grade.
+EVAL_TASK_PARALLELISM="${EVAL_TASK_PARALLELISM:-1}"
 if ! [ "${EVAL_TASK_PARALLELISM}" -ge 1 ] 2>/dev/null; then
   echo "ERROR: EVAL_TASK_PARALLELISM must be a positive integer, got '${EVAL_TASK_PARALLELISM}'." >&2
   exit 1
