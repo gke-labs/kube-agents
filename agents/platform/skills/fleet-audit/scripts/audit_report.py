@@ -265,6 +265,14 @@ AUDITS: dict[str, AuditSpec] = {
             "orphaned-snapshots",
         ),
     ),
+    "gcp-recommender-audit": AuditSpec(
+        "GCP Recommender & Advisory Ingest",
+        "gcp_recommender_sop.md",
+        (
+            "gke-webhook-readiness",
+            "gke-security-posture-cve",
+        ),
+    ),
 }
 
 SEVERITIES = ("critical", "major", "minor")

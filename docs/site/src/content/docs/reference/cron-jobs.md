@@ -36,6 +36,7 @@ Generated from [`agents/chat/defaults/cron/jobs.json`](https://github.com/gke-la
 | `stockout-prevention` | Platform Agent | `20 9 * * *` | Daily 09:20 | yes | Run the daily fleet stockout prevention and capacity audit. Read the SOP at 'governance/stockout_prevention... |
 | `gcp-networking-fabric-audit` | Platform Agent | `0 8 * * *` | — | yes | Run the daily GCP networking fabric and VPC IPAM audit. Read the SOP at 'governance/gcp_networking_fabric_s... |
 | `gce-compute-fleet-audit` | Platform Agent | `45 7 * * *` | — | yes | Run the daily GCE Compute Engine and MIG fleet audit. Read the SOP at 'governance/gce_compute_fleet_sop.md'... |
+| `gcp-recommender-audit` | Platform Agent | `10 8 * * *` | Daily 08:10 | yes | Run the daily GCP Recommender and GKE diagnosis audit. Read the SOP at 'governance/gcp_recommender_sop.md'... |
 | `findings-morning-nudge` | Platform Agent | `0 12 * * *` | Daily 12:00 | yes | `findings_nudge.py` |
 | `github-repo-watcher` | Platform Agent | `*/10 * * * *` | Every 10 minutes | yes | `github_scan_gate.py` |
 | `kanban-workspace-gc` | Platform Agent | `40 5 * * *` | Daily 05:40 | yes | `kanban_workspace_gc.py` |
