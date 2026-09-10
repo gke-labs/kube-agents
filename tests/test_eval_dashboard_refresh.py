@@ -162,7 +162,11 @@ class RefreshScriptTest(unittest.TestCase):
         self.assertIn("1 releases", proc.stdout + proc.stderr)
         data = json.loads((self.target / "data.json").read_text())
         self.assertEqual([r["rc_tag"] for r in data["releases"]], ["staging_2609092307_5b5ad10"])
-        self.assertIn("staging_2609092307_5b5ad10", (self.target / "index.html").read_text())
+        # The Releases table is on the two-band page, which the Brief links
+        # to as "Legacy view" -- not on index.html, which renders from
+        # brief.json and carries no release records at all.
+        self.assertIn("staging_2609092307_5b5ad10", (self.target / "legacy.html").read_text())
+        self.assertNotIn("staging_2609092307_5b5ad10", (self.target / "index.html").read_text())
 
     def test_second_run_merges_with_the_published_prior(self):
         env = {

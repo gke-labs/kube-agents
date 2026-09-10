@@ -101,6 +101,9 @@ env:
   # before collect.py runs), and the freshness-badge threshold written into
   # data.json (this job's 15m cadence with slack for ~2 missed ticks).
   PR_GLOB: gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*
+  # The release-candidate lane's archive. A postsubmit, so logs/ rather than
+  # pr-logs/. Bounded by --rc-limit rather than by the presubmit watermark.
+  RC_GLOB: gs://kube-agents-prow/logs/post-kube-agents-eval-rc/*
   SINCE_DAYS: "14"
   STALE_AFTER_S: "2400"
   COLLECT_TIMEOUT_S: "1500"
@@ -173,6 +176,7 @@ jobs:
           fi
           timeout "$COLLECT_TIMEOUT_S" python3 scripts/eval_dashboard/collect.py \
             --pr-glob "$PR_GLOB" \
+            --rc-glob "$RC_GLOB" \
             --merge-with work/prior-data.json \
             --since-days "$SINCE_DAYS" \
             --stale-after-s "$STALE_AFTER_S" \
@@ -181,7 +185,16 @@ jobs:
           # collect.py degrades a failed listing or read to a warning and a
           # document with nothing new; publishing that would stamp old runs
           # with a fresh generated_at. Refuse, so the stall stays visible.
-          if grep -Eq "warning: gsutil (ls|cat) .*(failed|timed out)" work/collect.log; then
+          #
+          # The RC glob is excluded on purpose. This lane is advisory and must
+          # not be able to stall the dashboard: an RC listing that fails leaves
+          # releases[] carried forward from the prior and stales nothing, and
+          # `gsutil ls` exits non-zero on a prefix with no objects, so a week
+          # with no release candidate would otherwise stop every publish. Both
+          # RC warning shapes (the ls failure and the timeout) name the glob,
+          # so dropping lines that mention the job name drops exactly those.
+          if grep -v "post-kube-agents-eval-rc" work/collect.log \
+            | grep -Eq "warning: gsutil (ls|cat) .*(failed|timed out)"; then
             echo "::error::collect.py could not list or read the Prow archive; not publishing"
             exit 1
           fi

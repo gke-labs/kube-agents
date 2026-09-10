@@ -19,7 +19,11 @@ runner, and the local-path test uses a runner that fails the test if called.
 import contextlib
 import io
 import json
+import os
 import pathlib
+import re
+import shutil
+import subprocess
 import tempfile
 import unittest
 
@@ -452,6 +456,44 @@ def releases_section(app):
     return app.split('<h2 id="release">', 1)[1]
 
 
+# The template is a page, not a module: its mirror lives in the second
+# <script> block and ends with top-level calls that touch the DOM. To call one
+# function out of it, take that block, blank the placeholders render.py fills
+# (they are not valid JS until then), and give the top-level tail just enough
+# of a browser to run against.
+_JS_BLOCK = re.compile(r"<script>\n(/\* Live read side\..*?)</script>", re.S)
+_JS_PLACEHOLDER = re.compile(r"__[A-Z_]+__")
+_JS_BROWSER_STUB = """
+const noop = () => {};
+const el = new Proxy({}, {get: (t, k) => (k === "style" || k === "dataset"
+  ? new Proxy({}, {get: noop, set: () => true}) : (k === "textContent"
+  || k === "innerHTML" ? "" : noop)), set: () => true});
+globalThis.document = new Proxy({}, {get: () => (() => el)});
+globalThis.location = {protocol: "file:"};
+globalThis.setInterval = noop;
+globalThis.fetch = () => Promise.reject(new Error("no network in the parity harness"));
+"""
+
+
+def js_releases_html(data: dict) -> str:
+    """`releasesHtml(data)` as the template's own JS computes it."""
+    tmpl = (
+        pathlib.Path(__file__).resolve().parent
+        / "eval_dashboard" / "template" / "index.html.tmpl"
+    ).read_text()
+    match = _JS_BLOCK.search(tmpl)
+    assert match, "could not find the live-read <script> block in the template"
+    script = _JS_PLACEHOLDER.sub("null", match.group(1))
+    driver = 'process.stdout.write(releasesHtml(JSON.parse(process.env.PARITY_DATA)));'
+    proc = subprocess.run(
+        ["node", "-e", _JS_BROWSER_STUB + script + "\n" + driver],
+        capture_output=True, text=True,
+        env={**os.environ, "PARITY_DATA": json.dumps(data)},
+    )
+    assert proc.returncode == 0, f"node failed: {proc.stderr}"
+    return proc.stdout
+
+
 class ReleasesSectionTest(unittest.TestCase):
     """The Releases band: releases[] is optional and additive, so every state
     a real data.json can reach has to render -- absent, populated, and the
@@ -477,8 +519,11 @@ class ReleasesSectionTest(unittest.TestCase):
         self.assertNotIn('id="releases"', app)
 
     def test_a_release_alone_is_enough_to_render_the_page(self):
-        """runs[] and releases[] are swept independently, so an armed RC glob
-        with an empty presubmit window must not read as "no data yet"."""
+        """A data.json carrying only release records renders their table
+        rather than "no data yet". No publish pipeline produces one -- both
+        refuse an empty runs[] before render, deliberately (see app_html) --
+        so this pins the renderer's behaviour for a hand-run render, not a
+        path CI can take."""
         app = self.render_with([RC_RELEASE], runs=[])
         self.assertNotIn('id="empty-state"', app)
         self.assertIn("staging_2609092307_5b5ad10", releases_section(app))
@@ -562,8 +607,57 @@ class ReleasesSectionTest(unittest.TestCase):
         self.assertIn("evidenceHtml(data) + releasesHtml(data)", tmpl)
         self.assertIn(f"releasesMaxRows: {render.RELEASES_MAX_ROWS}", tmpl)
         self.assertIn(f'releaseUrlScheme: "{render.RELEASE_URL_SCHEME}"', tmpl)
+        # Not `assertIn(cls, tmpl)`: p-pass/p-fail/p-infra are CSS class names
+        # the stylesheet already defines, so that assertion passes even when
+        # the mirror's map is empty. Pin the pairs inside the map literal.
+        mirror = [ln for ln in tmpl.splitlines() if "releaseVerdictClass:" in ln]
+        self.assertEqual(len(mirror), 1, "expected one releaseVerdictClass literal")
         for verdict, cls in render.RELEASE_VERDICT_CLASS.items():
-            self.assertIn(cls, tmpl, f"{verdict} class missing from the JS mirror")
+            # JS bare keys where the verdict is an identifier, quoted otherwise.
+            key = verdict if verdict.isidentifier() else f'"{verdict}"'
+            self.assertIn(f'{key}: "{cls}"', mirror[0],
+                          f"{verdict} -> {cls} missing from the JS mirror's map")
+
+    def test_the_brief_links_to_the_releases_section(self):
+        """The table renders on the legacy page only, so without this deep
+        link the landing page offers no route to it at all."""
+        page = (
+            pathlib.Path(__file__).resolve().parent
+            / "eval_dashboard" / "template" / "page.html.tmpl"
+        ).read_text()
+        self.assertIn(f'<a href="{render.LEGACY_PAGE}#release">Releases</a>', page)
+
+    @unittest.skipUnless(shutil.which("node"), "needs node to run the JS mirror")
+    def test_the_js_mirror_renders_byte_identical_html(self):
+        """The structural check above proves the mirror exists; this proves it
+        agrees. Runs the template's own releasesHtml under node and diffs it
+        against render.py's, over the shapes most likely to diverge: a real
+        record, a negative margin, a missing banner, a hostile URL, entries
+        that are not dicts, and more releases than the row cap.
+
+        Skipped where node is absent, so a green run without it has not
+        checked parity -- the structural test is the floor, this is the proof.
+        """
+        cap = render.RELEASES_MAX_ROWS
+        shapes = {
+            "real": [RC_RELEASE],
+            "red_with_margin": [{**RC_RELEASE, "verdict": "RED", "pass_rate": 0.62,
+                                 "baseline_rate": 0.81, "margin": -0.19}],
+            "no_banner": [{**RC_RELEASE, "rc_tag": None, "tier": None,
+                           "verdict": None, "artifacts_url": None}],
+            "hostile_url": [{**RC_RELEASE, "artifacts_url": "javascript:alert(1)"}],
+            "malformed": ["nonsense", 7, None, {"build_id": "3"}],
+            "over_cap": [{**RC_RELEASE, "build_id": str(i), "started": f"2026-09-{i:02d}"}
+                         for i in range(1, cap + 4)],
+            "empty": [],
+        }
+        for name, releases in shapes.items():
+            with self.subTest(shape=name):
+                data = {"schema_version": 1, "releases": releases}
+                self.assertEqual(
+                    js_releases_html(data), render.releases_html(data),
+                    f"render.py and the JS mirror disagree on the {name} shape",
+                )
 
 
 class RenderToleranceTest(unittest.TestCase):

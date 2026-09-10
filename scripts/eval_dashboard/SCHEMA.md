@@ -185,11 +185,12 @@ Additive, optional, and safe to omit — consumers must default them.
 - `releases[]` — release-candidate eval runs, **newest first**, at most 20
   (`RC_RELEASES_MAX`). Omitted when there are none. Collected from
   `--rc-glob` / `--rc-from-dir`, which point at `post-kube-agents-eval-rc`:
-  the postsubmit that runs the same `hack/ci-eval-pr.sh` against a staging
-  tag's own images. **They are never in `runs[]`**, because `runs[]` feeds
-  `cases[]` and a candidate is judged against main's window rather than
-  added to it (`hack/ci-eval-rc.sh`: "the baseline store is read, never
-  written").
+  the postsubmit that runs the same `hack/ci-eval-pr.sh` against a release
+  candidate's own images. **They are never in `runs[]`**, because `runs[]`
+  feeds `cases[]` and a candidate is judged against main's window rather
+  than added to it (`hack/ci-eval-pr.sh:1998`: "the baseline store is read,
+  never written"). The renderer shows the newest 10 of them
+  (`RELEASES_MAX_ROWS`), so the store holds twice what the page displays.
 
 ```json
 {
@@ -212,13 +213,19 @@ Additive, optional, and safe to omit — consumers must default them.
 ```
 
 - `rc_tag`, `commit`, `tier`, `verdict`, `artifacts_url` — from the banner
-  `hack/ci-eval-rc.sh` prints once per run. All `null` when the banner is
-  absent, which means the driver exited on one of its early guards and
-  measured nothing; the entry is still emitted, because a resolver broken
-  for a month must not read as a month with no releases. `artifacts_url` is
-  additionally `null` for a run outside Prow.
+  `hack/ci-eval-rc.sh` prints once per run. A missing banner means the
+  driver exited on one of its early guards and measured nothing; the entry
+  is still emitted, because a resolver broken for a month must not read as
+  a month with no releases. `rc_tag`, `tier`, `verdict`, and
+  `artifacts_url` are then `null` — but `commit` is not, when Prow recorded
+  a `revision`: it falls back to that ref's first 7 characters, which for a
+  tag-push postsubmit is the same commit the banner would have named.
+  `artifacts_url` is additionally `null` for a run outside Prow.
 - `verdict` — the eval's, which is **not** the job's: the lane is advisory,
-  so a `RED` candidate still leaves a `SUCCESS` in `result`. `NOT RUN` is
+  so a `RED` candidate still leaves a `SUCCESS` in `result`. That is the job
+  config's doing — it runs the driver under `|| true` — not the driver's, so
+  a future config that drops the `|| true` would make the two agree without
+  anything here changing. `NOT RUN` is
   the deploy-failed path — nothing was measured, so it is not a judgement
   on the candidate.
 - `pass_rate` / `baseline_rate` / `margin` — fractions in `0..1` (`margin`
@@ -267,7 +274,7 @@ what the renderer does with them.
   than `runs[]`. `--rc-limit <n>` (default 20) bounds how many builds per
   glob are read, newest first.
 
-### Incremental collection (the output stays schema v1; it may add the optional `pending_builds`)
+### Incremental collection (the output stays schema v1; it may add the optional `pending_builds` and `releases`)
 
 - `--merge-with <data.json | gs:// URL>` — load a previously written
   data.json, carry its `runs[]` over (verbatim except `pr_merged`, which
@@ -399,6 +406,13 @@ release-candidate job, which is a postsubmit, so its `started.json` carries no
 | build               | why it is here                                        |
 | ------------------- | ----------------------------------------------------- |
 | 2097891568546484224 | `staging_2609092307_5b5ad10` — GREEN, no baseline yet |
+
+Captured from
+`https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/2097891568546484224`
+— which is also where the job name the collector globs for is verifiable, since
+nothing in this repository declares it (the job lives in
+`GoogleCloudPlatform/oss-test-infra`). A wrong name degrades to an empty
+`releases[]` rather than an error, so check the path before changing it.
 
 It is the fixture for `releases[]`, and it keeps both banners the driver
 prints: `resolve-rc-target.sh`'s `RELEASE CANDIDATE EVAL TARGET` near the top

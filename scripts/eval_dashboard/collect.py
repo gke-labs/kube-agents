@@ -20,8 +20,8 @@ runs, below).
 Release candidates are collected separately and land in `releases[]`, never
 in `runs[]`. post-kube-agents-eval-rc drives the same hack/ci-eval-pr.sh, so
 its build log parses identically -- but a candidate is judged against main's
-window rather than added to it (hack/ci-eval-rc.sh: "the baseline store is
-read, never written"), and folding an RC into runs[] would feed it to
+window rather than added to it (hack/ci-eval-pr.sh:1998: "the baseline store
+is read, never written"), and folding an RC into runs[] would feed it to
 build_cases and move the pass rates the candidate is being measured against.
 
 Sources:
@@ -850,12 +850,18 @@ def runs_from_dir(root: pathlib.Path) -> list[dict]:
 
 
 def _release_sort_key(release: dict):
-    """Newest first: started time, then build id for same-second ties."""
+    """Newest first: started time, then build id for same-second ties.
+
+    Both halves are coerced rather than trusted. A carried-forward release
+    comes from a prior data.json that only had its `build_id` validated, so
+    a hand-edited file can put an int in `started` -- and comparing that to
+    another entry's str raises TypeError mid-sort, losing the whole merge.
+    """
     try:
         build_num = int(release["build_id"])
     except (ValueError, TypeError, KeyError):
         build_num = 0
-    return (release.get("started") or "", build_num)
+    return (str(release.get("started") or ""), build_num)
 
 
 def releases_from_gcs(

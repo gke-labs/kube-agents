@@ -160,6 +160,9 @@ RELEASES_MAX_ROWS = 10
 RELEASE_VERDICT_CLASS = {"GREEN": "p-pass", "RED": "p-fail", "NOT RUN": "p-infra"}
 # The only URL scheme a collected artifacts link may carry into an href.
 RELEASE_URL_SCHEME = "https://"
+# releases[].duration_s is seconds; the cell renders it as `4h16m`.
+SECONDS_PER_HOUR = 3600
+SECONDS_PER_MINUTE = 60
 
 # Matrix window: the last N runs that measured at least one task. 30 columns
 # is about two weeks of PR traffic and still fits one screen at 22px cells.
@@ -1373,7 +1376,7 @@ def release_duration(seconds) -> str:
     if not is_count(seconds) or seconds <= 0:
         return ""
     total = int(seconds)
-    hours, minutes = total // 3600, (total % 3600) // 60
+    hours, minutes = total // SECONDS_PER_HOUR, (total % SECONDS_PER_HOUR) // SECONDS_PER_MINUTE
     return f"{hours}h{minutes:02d}m" if hours else f"{minutes}m"
 
 
@@ -1403,7 +1406,7 @@ def release_rate_cell(release: dict) -> str:
 def release_cases_cell(release: dict) -> str:
     """Graded outcomes for the run: passes over graded, infra called out
     separately because an infra rep is excluded rather than failed."""
-    tasks = [t for t in release.get("tasks") or [] if isinstance(t, dict)]
+    tasks = run_tasks(release)
     passed = sum(1 for t in tasks if t.get("result") == "pass")
     infra = sum(1 for t in tasks if t.get("result") == "infra")
     graded = len(tasks) - infra
@@ -1526,10 +1529,13 @@ EMPTY_STATE_HTML = """
 
 
 def app_html(data: dict, notes: dict, events: dict) -> str:
-    # releases[] counts as data: the RC sweep is bounded by its own limit
-    # rather than by the presubmit watermark, so it can be populated on a
-    # collect whose runs[] window came back empty. Falling through to the
-    # "no evaluation data yet" page there would hide a real RC result.
+    # releases[] counts as data, so a file carrying only RC records renders
+    # its table instead of "no evaluation data yet". Neither publish pipeline
+    # can reach this: both refuse to publish a data.json with an empty runs[]
+    # before render is called, and deliberately so -- a run whose presubmit
+    # sweep came back empty must not overwrite a good dashboard with a
+    # releases-only page. This is for the hand-run render sorted_releases
+    # already documents, and for whoever next reads a bare data.json.
     if not (data.get("runs") or data.get("cases") or sorted_releases(data)):
         return EMPTY_STATE_HTML
     return (

@@ -758,6 +758,23 @@ class TestReleaseCollection(_MergeBase):
         )
         self.assertEqual([r["build_id"] for r in data["releases"]], ["10", "5"])
 
+    def test_a_retyped_prior_started_sorts_instead_of_crashing(self):
+        """The prior filter validates `build_id` and nothing else, so a
+        hand-edited data.json can carry a non-string `started`. Sorting that
+        against a real entry's string raised TypeError and lost the whole
+        merge; both halves of the key are coerced now."""
+        prior = self.write_release_prior(
+            [{"build_id": "5", "started": 20260101},
+             {"build_id": "6", "started": None},
+             {"build_id": "7", "started": {"nested": "nonsense"}}]
+        )
+        data, _ = self.quiet_collect(
+            from_dir=TESTDATA, rc_from_dir=self._rc_dir(["10"]), merge_with=prior
+        )
+        self.assertEqual(
+            sorted(r["build_id"] for r in data["releases"]), ["10", "5", "6", "7"]
+        )
+
     def test_corrupt_prior_releases_are_discarded_not_fatal(self):
         prior = self.write_release_prior([{"no_build_id": True}, "nonsense", 7])
         data, _ = self.quiet_collect(
