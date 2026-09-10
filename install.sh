@@ -2850,7 +2850,9 @@ main() {
       [ -n "$anthropic_api_key" ] || print_warning "No Anthropic API key was provided; the agent will require a credential update before model calls can succeed."
       ;;
     hosted_vllm)
-      [ -n "$model_default_name" ] && [ -n "${HOSTED_VLLM_API_BASE:-}" ] && [ -n "${HOSTED_VLLM_TARGET_PORT:-}" ] || print_warning "hosted_vllm needs MODEL_DEFAULT_NAME, HOSTED_VLLM_API_BASE and HOSTED_VLLM_TARGET_PORT; the chart refuses to render without them."
+      if [ -z "$model_default_name" ] || [ -z "${HOSTED_VLLM_API_BASE:-}" ] || [ -z "${HOSTED_VLLM_TARGET_PORT:-}" ]; then
+        print_warning "hosted_vllm needs MODEL_DEFAULT_NAME, HOSTED_VLLM_API_BASE and HOSTED_VLLM_TARGET_PORT; the chart refuses to render without them."
+      fi
       ;;
   esac
 
