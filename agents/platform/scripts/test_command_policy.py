@@ -1057,47 +1057,28 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
             with self.subTest(desc=desc):
                 self.assertTrue(evaluate(argv).allowed, desc)
 
-    def test_apply_is_allowed_only_as_an_explicit_dry_run(self):
-        # The obtainability skill validates a generated ComputeClass with a
-        # server-side dry run before attaching it as evidence. The explicit
-        # =-attached spellings pass; anything that could persist stays refused,
-        # including the bare flag whose default varies by kubectl release.
-        for argv, allowed, desc in (
+    def test_apply_stays_refused_even_as_an_explicit_dry_run(self):
+        # A carve-out for `apply --dry-run=server|client` was tried and
+        # withdrawn: server-side dry run needs the same RBAC as the write, so
+        # it fails under the read-only grant the agent ships with, and the
+        # last-wins parse it needs is one misjudged flag arity away from
+        # admitting a real apply (`--dry-run=server --server-side
+        # --dry-run=none` was allowed by the first attempt). The verb is
+        # refused whole, including the spellings that would not persist.
+        for argv, desc in (
             (["kubectl", "apply", "--dry-run=server", "-f", "cc.yaml"],
-             True, "server dry run"),
-            (["kubectl", "apply", "-f", "cc.yaml", "--dry-run=client"],
-             True, "client dry run, flag last"),
-            (["kubectl", "apply", "-f", "cc.yaml"], False, "plain apply"),
-            (["kubectl", "apply", "--dry-run=none", "-f", "cc.yaml"],
-             False, "explicit none"),
-            (["kubectl", "apply", "--dry-run", "server", "-f", "cc.yaml"],
-             False, "space-separated value"),
-            # kubectl resolves repeated flags last-wins: the trailing token is
-            # the one that decides whether the command writes.
+             "server dry run"),
+            (["kubectl", "apply", "--dry-run=client", "-f", "cc.yaml"],
+             "client dry run"),
             (["kubectl", "apply", "-f", "cc.yaml", "--dry-run=server",
-              "--dry-run=none"], False, "server then none"),
-            (["kubectl", "apply", "-f", "cc.yaml", "--dry-run=none",
-              "--dry-run=server"], True, "none then server"),
-            # The allowed spelling is being consumed as --field-manager's
-            # value here, so the apply itself has no dry-run at all.
-            (["kubectl", "apply", "-f", "cc.yaml", "--field-manager",
-              "--dry-run=server"], False, "swallowed by a value flag"),
-            # Writes that share apply's first word must not inherit the
-            # carve-out.
-            (["kubectl", "apply", "set-last-applied", "--dry-run=server",
-              "-f", "cc.yaml"], False, "apply set-last-applied"),
-            # edit-last-applied spawns $KUBE_EDITOR; the carve-out exists for
-            # the plain apply the obtainability skill runs, so the whole
-            # subcommand family stays out of it.
-            (["kubectl", "apply", "edit-last-applied", "--dry-run=client",
-              "-f", "cc.yaml"], False, "apply edit-last-applied"),
-            # kubectl rejects an invalid value only when it is the last one,
-            # so the ordering that reaches the API decides here too.
-            (["kubectl", "apply", "--dry-run=bogus", "--dry-run=server",
-              "-f", "cc.yaml"], True, "last flag decides, invalid first"),
+              "--server-side", "--dry-run=none"],
+             "boolean flag before a trailing none"),
+            (["kubectl", "apply", "-f", "cc.yaml"], "plain apply"),
         ):
             with self.subTest(desc=desc):
-                self.assertEqual(evaluate(argv).allowed, allowed, desc)
+                decision = evaluate(argv)
+                self.assertFalse(decision.allowed, desc)
+                self.assertEqual(decision.rule_id, "kubernetes.read-only", desc)
 
     def test_the_writes_one_word_from_the_new_reads_stay_refused(self):
         # Each new entry has a mutating sibling that shares all but the last
