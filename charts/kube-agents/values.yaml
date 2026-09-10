@@ -810,4 +810,3 @@ openshift:
     targetPort: api
     tls:
       termination: edge
-
