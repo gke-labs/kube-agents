@@ -2003,9 +2003,17 @@ if [ -n "${RC_COMMIT_SHA:-}" ]; then
 fi
 if [ "${EVAL_IS_MAIN_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then
   echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Recording baseline evidence from main <<<"
+  # The commit each line is stamped with. A postsubmit carries it as
+  # PULL_BASE_SHA; a periodic carries neither that nor PULL_PULL_SHA (Prow's
+  # EnvForSpec returns before setting them for JOB_TYPE=periodic), so
+  # `bench-gate record`'s own default would leave the nightly's evidence
+  # unattributed. extra_refs has checked out main's head, so HEAD is the
+  # commit the run measured.
+  EVAL_RECORD_COMMIT="${PULL_BASE_SHA:-$(git -C "${SCRIPT_DIR}/.." rev-parse HEAD 2>/dev/null || true)}"
   # Never fatal. Bookkeeping must not be the reason a merge to main reds.
   (cd "${BENCH_DIR}" && uv run bench-gate record \
     "${CASE_RESULTS[@]}" \
+    ${EVAL_RECORD_COMMIT:+--commit "${EVAL_RECORD_COMMIT}"} \
     --lines-out "${ARTIFACT_DIR}/baseline-append.jsonl") || \
     echo "WARNING: recording baseline evidence failed; the verdict below is unaffected."
 elif [ -n "${RC_COMMIT_SHA:-}" ]; then
