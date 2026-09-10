@@ -84,11 +84,13 @@ _DEFAULT_BASELINE_DIR = "baselines"
 AGGREGATE_ARMED_ENV = "EVAL_AGGREGATE_ARMED"
 _TRUTHY = frozenset({"1", "true", "yes"})
 
-#: The verdict table's admission column, shown only once a store is
-#: configured. With EVAL_BASELINE_STORE unset the shipped directory is empty,
-#: so the column could only ever read "bootstrap" or "none" -- exactly what
-#: the BOOTSTRAP_ADMITTED list already says -- and leaving it out keeps the
-#: store-unset verdict byte-identical to what the presubmit produced before.
+#: The verdict table's admission column, shown once a store is configured OR
+#: the record decided any case this run -- which covers evidence landed by
+#: hand into the checked-in directory with no store configured. With an empty
+#: store the column could only ever read "bootstrap" or "none" -- exactly
+#: what the BOOTSTRAP_ADMITTED list already says -- and leaving it out then
+#: keeps the store-unset verdict byte-identical to what the presubmit
+#: produced before.
 ADMISSION_COLUMN = "Admitted by"
 ADMISSION_CELL_NONE = "none"
 ADMISSION_CELL_RECORD_REFUSED = "record: not admitted"
@@ -150,6 +152,11 @@ def _store_configured(args: argparse.Namespace) -> bool:
 def _aggregate_armed() -> bool:
     """Whether the suite aggregate may red the job. See :data:`AGGREGATE_ARMED_ENV`."""
     return os.environ.get(AGGREGATE_ARMED_ENV, "").strip().lower() in _TRUTHY
+
+
+def _record_decided(cases: list[dict[str, Any]]) -> bool:
+    """Whether the evidence store admitted or refused any case this run."""
+    return any(c.get("admission_source") == ADMITTED_BY_RECORD for c in cases)
 
 
 def _load_store(location: str) -> tuple[BaselineStore | None, str | None, str | None]:
@@ -266,10 +273,13 @@ def _cmd_case(args: argparse.Namespace) -> int:
     )
     admitted, admission_reason = decision.admitted, decision.reason
 
-    # Rung 6's comparator. None whenever the store has nothing at this key --
-    # including for a BOOTSTRAP_ADMITTED case, which is admitted by fiat and
-    # therefore has no measured judged mean to be compared against. Admitted
-    # without evidence still means the judged rung stays quiet.
+    # Rung 6's comparator. None whenever the store has nothing at this key,
+    # which is every BOOTSTRAP_ADMITTED case until the nightly has appended
+    # something for it: admitted by fiat with no measured judged mean to be
+    # compared against, so the judged rung stays quiet. A listed case with a
+    # partial window (`collecting`) does have a mean at the key, and rung 6
+    # compares against it -- fewer runs behind it than a full window, but
+    # measured on main, which is what the rung asks for.
     evidence = store.evidence_for(spec.case_id, key, min_runs=bar.min_runs)
     baseline_judged = evidence.judged_means if evidence else None
 
@@ -404,10 +414,11 @@ def _baseline_rate(
     difference between them means anything.
 
     Only cases with evidence at their own version key contribute. A case
-    admitted by ``BOOTSTRAP_ADMITTED`` has none by construction, so it counts
-    toward the pull request's rate and not toward main's; that skews the
-    comparison, and the honest fix is to screen the case rather than to invent
-    a baseline for it.
+    admitted by ``BOOTSTRAP_ADMITTED`` with nothing at the key counts toward
+    the pull request's rate and not toward main's; that skews the comparison,
+    and the honest fix is to screen the case rather than to invent a baseline
+    for it. A listed case with a partial window (``collecting``) contributes
+    what it has: fewer runs, weighted accordingly, but measured on main.
 
     Returns None when no admitted case has any evidence, which makes the
     aggregate advisory and says so.
@@ -477,7 +488,11 @@ def _cmd_suite(args: argparse.Namespace) -> int:
     # times in the banner is how a reader learns to skip banners.
     case_notes = sorted({n for c in cases for n in (c.get("notes") or [])})
 
-    text = _markdown(verdict, cases, admission_column=_store_configured(args))
+    text = _markdown(
+        verdict,
+        cases,
+        admission_column=_store_configured(args) or _record_decided(cases),
+    )
     # The banner goes in the markdown, not only in the log. A degraded read
     # silently loosens the gate, and the one thing that must not happen is a
     # green nobody knows was measured against nothing.

@@ -668,11 +668,12 @@ returning a different answer once the file crossed a threshold.
 **Runs, not lines.** #899 specifies "20 runs against `main`, at least 19 passing", and it fixes the
 unit elsewhere in the same table: "an admitted case that fails **all three of its runs**". A run is
 one execution. The nights from empty to admitted are therefore `ceil(20 / EVAL_REPETITIONS)`:
-**seven** at the three repetitions the nightly runs today (the pool takes whole lines, so it lands
-on 21), two at ten. The ratio is the reason the recorder went nightly rather than per-merge: a
-merge buys three samples for a whole job's setup, and a version-key bump de-admits every case at
-once. Raising the nightly's repetitions shortens the refill and is a Prow-config change to make on
-measured wall clock, not on this arithmetic.
+**seven** at `EVAL_REPETITIONS=3`, the script's default, which the nightly inherits unless its Prow
+config sets another value (the pool takes whole lines, so it lands on 21); two at ten. The ratio is
+the reason the recorder went nightly rather than per-merge: a merge buys three samples for a whole
+job's setup, and a version-key bump de-admits every case at once. Raising the nightly's repetitions
+shortens the refill and is a Prow-config change to make on measured wall clock, not on this
+arithmetic.
 
 **Whole lines only.** Pooling overshoots to 21 runs rather than trimming a line to land on 20
 exactly, because trimming would invent a sub-record nobody measured.
@@ -719,7 +720,7 @@ work here can close the loop. What it has to be:
 | Sets `PULL_PULL_SHA` from the checkout                        | A periodic has none, and `hack/ci-deploy.sh` falls back to the literal `latest`, so every night would tag its build `pr-local-latest` and lose which commit produced the evidence.                                                     |
 | Runs as an SA with `objectCreator` **and** `objectViewer`     | It appends, and it reads the store to compute its own verdict. Creator alone cannot read back.                                                                                                                                         |
 | Alerts on failure; `optional` must not appear                 | A periodic gates nothing, so nothing downstream notices it break. `optional` is a presubmit-only Tide field.                                                                                                                           |
-| **Not** the same `EVAL_REPETITIONS` as the presubmit          | See "why the counts may differ" below. What must match is how a single run is produced, not how many were taken.                                                                                                                       |
+| `EVAL_REPETITIONS` need not match the presubmit's             | See "why the counts may differ" below. What must match is how a single run is produced, not how many were taken; the nights to admission are `ceil(20 / EVAL_REPETITIONS)`.                                                            |
 
 **Why nightly and not per-merge.** This was specified as a postsubmit and the arithmetic overturned
 it. `main` takes about ten merges a day — 310 in the thirty days to 2026-08-26 — and the job
@@ -730,7 +731,7 @@ serialised at `max_concurrency: 1`, which queues weekday bursts for hours.
 
 A nightly run amortises one setup over every repetition. It is cheaper per sample, and faster where
 it matters: admission needs twenty runs at the current version key, so a model or fleet bump
-de-admits every case at once, and refilling that window takes seven nights at the nightly's three
+de-admits every case at once, and refilling that window takes seven nights at the default three
 repetitions — fewer as the count rises — without paying a job's setup per sample.
 
 This is the lever this section already named — "repetitions or a cron-style sampling of merges" —
@@ -762,10 +763,14 @@ More repetitions on the recording side is strictly better evidence.
 
 #### The job definition
 
-It exists, as a draft:
-[`GoogleCloudPlatform/oss-test-infra#2665`](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2665),
-adding `prow/prowjobs/gke-labs/kube-agents/kube-agents-periodics.yaml`. It is held draft until this
-pull request merges and the bucket and its two IAM grants exist. The YAML is not reproduced here — a
+It exists as pull requests against `oss-test-infra`, adding to
+`prow/prowjobs/gke-labs/kube-agents/kube-agents-periodics.yaml`:
+[#2682](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2682) is the writer
+(`ci-kube-agents-eval-nightly`, `EVAL_TIER=nightly`, the store export commented out until the bucket
+exists), [#2698](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2698) arms the store on
+it and on the presubmit, and
+[#2665](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2665) carries the provisioning
+runbook and the TestGrid alert. The YAML is not reproduced here — a
 copy in a second repository is a copy that goes stale, and the shape below is the part that matters.
 
 **Its script body is the presubmit's, byte-for-byte, plus three exports** — `EVAL_BASELINE_STORE`,
@@ -794,8 +799,8 @@ merge-rate data:
   are mounted volumes rather than presets, and `PROJECT_ID` is not static — Boskos supplies it per
   run.
 
-Two numbers in it are starting points rather than measurements, and both are flagged in the file:
-`EVAL_REPETITIONS: 10` and `timeout: 4h`. The binding constraint on both is that
+Two numbers in it are starting points rather than measurements: the repetition count (the script's
+default 3 unless the job sets `EVAL_REPETITIONS`) and the timeout. The binding constraint on both is that
 `gpu-stress-test-diagnosis` re-applies its OpenTofu GPU stack on **every** repetition, so the cost
 per repetition is not the ~90s of agent time the fixtures show. Tune them from the first few runs.
 
@@ -858,8 +863,9 @@ periodics:
               # the append dies with the workspace -- which is exactly what
               # happens on the presubmit, and why the store never filled.
               export EVAL_BASELINE_STORE="gs://kube-agents-evals-bench/evidence"
-              # Deliberately not the presubmit's 3 -- see above.
-              export EVAL_REPETITIONS="10"
+              # EVAL_REPETITIONS is the script's default (3) unless set here;
+              # it need not match the presubmit's -- see above -- and is
+              # raised on measured wall clock, not arithmetic.
 ```
 
 `JOB_TYPE=periodic` and an unset `PULL_NUMBER` are supplied by Prow itself, which is why neither
@@ -907,7 +913,8 @@ Three resets, all of which happen without deleting anything.
 
 **Version bump (automatic).** Any of the five components changing means zero lines match the
 current key, so every case drops to unadmitted and re-screens itself over the next seven nights at
-three repetitions. Old lines stay — they are still true about the software they were measured on.
+the default three repetitions. Old lines stay — they are still true about the software they were
+measured on.
 
 **Degradation (automatic).** A case that starts failing has its passing lines pushed out of the
 20-run window by the new failing ones, and de-admits itself. Nobody edits the store, no line is
@@ -924,19 +931,23 @@ inconvenient.
 ### Bootstrap
 
 `BOOTSTRAP_ADMITTED` names cases that keep blocking before screening exists for them. It is a
-bridge, not a destination: a bootstrap-admitted case has no measured evidence at the current key, so
-it arms rung 4 but leaves rung 6 quiet and contributes nothing to `main`'s side of the aggregate.
+bridge, not a destination: a bootstrap-admitted case has no full window at the current key, so it
+arms rung 4 by fiat. While the store holds nothing for it at that key it also leaves rung 6 quiet
+and contributes nothing to `main`'s side of the aggregate; once the nightly has appended a partial
+window (`collecting`), that evidence feeds both, and the list still decides admission until the
+window is full.
 
 **The record governs once it holds a full window.** `BaselineStore.admission()` consults the store
 before the list: with at least `EVAL_ADMISSION_MIN_RUNS` runs at the current key, the pooled rate
 decides either way, and a listed case screened at 12/21 is turned away with a reason that says the
 record overrides the list. The list is consulted only in the first three pre-admission states
-below (nothing at this key, stale, collecting), and while a listed case rides the bridge the
-store's own state is appended to its reason, so the log says how far it is from being judged on
+below (nothing at this key, stale, collecting), and when the store holds anything for a listed
+case its state is appended to the reason, so the log says how far it is from being judged on
 evidence. Every verdict carries `admission_source` — `record`, `bootstrap` or `neither` — and the
-markdown renders it per case once a store is configured; with the store unset the output is
-unchanged, which `bench/tests/test_store_unset_golden.py` pins. The switch-over criteria for
-deleting the list are in [`docs/eval-gate-roster.md`](../eval-gate-roster.md).
+markdown renders it per case once a store is configured or the record has decided any case; with
+the store unset what the shell displays is unchanged (the per-case JSON gains that one key), which
+`bench/tests/test_store_unset_golden.py` pins. The switch-over criteria for deleting the list are in
+[`docs/eval-gate-roster.md`](../eval-gate-roster.md).
 
 **A name in it that matches no graded case is reported, loudly.** It is a free-text environment
 variable holding case ids, and its whole job is to keep something blocking — so a typo, or a rename
@@ -1212,19 +1223,17 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   finds nothing admitted, and reports a **legitimate green** with rung 4, rung 6 and the aggregate
   all inert — the rate-based half of this design, silently absent, with no signal that it is
   missing. The absolute rungs (1, 2, 3, 5) and the correctness floor still block, so the failure
-  looks like a working gate. Neither export exists yet: the presubmit sets nothing, and
-  [oss-test-infra#2665](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2665) adds it to
-  the nightly only. Both wait on the bucket.
+  looks like a working gate. Neither export exists on `master` yet;
+  [oss-test-infra#2698](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2698) adds both
+  and waits on the bucket.
 - No Prow job yet appends for `hack/ci-eval-pr.sh` (job config lives in
   `GoogleCloudPlatform/oss-test-infra`). Without one, nothing ever appends and no case is ever
-  admitted. It is written and open as a draft —
-  [oss-test-infra#2665](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2665), see
-  [The job that writes it](#the-job-that-writes-it) — held until this pull request merges and the
-  bucket exists. Three things are open on it: `EVAL_REPETITIONS: 10` and `timeout: 4h` are
-  starting points rather than measurements and want tuning from the first real runs; the
-  `testgrid-alert-email` is a placeholder that must not merge as-is; and it still says
-  `serviceAccountName: prowjob-default-sa`, which must become `eval-baseline-recorder` before it
-  leaves draft — its `TODO` reads as a preference and is not one.
+  admitted. The writer is
+  [oss-test-infra#2682](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2682), see
+  [The job that writes it](#the-job-that-writes-it); it runs the script's default repetitions and
+  the presubmit's `360m`, both starting points to tune from the first real nights, and it still
+  says `serviceAccountName: prowjob-default-sa` — #2698 changes that to `eval-baseline-recorder`,
+  which must exist before either arms.
 - A lint that a behaviour change bumped `fleet` or `verifiers`.
 - The GCS listing is unbounded while the fetch is capped. The reader lists the whole prefix and
   filters afterwards, because `BaselineStore.load` does not know which key it is about to be asked

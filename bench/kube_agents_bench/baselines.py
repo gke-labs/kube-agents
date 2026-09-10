@@ -90,11 +90,6 @@ from typing import Any
 from .evidence_store import EvidenceSource, StoreUnreachable, is_gcs, open_backend
 
 __all__ = [
-    "StoreUnreachable",
-    "is_gcs",
-]
-
-__all__ = [
     "ADMITTED_BY_BOOTSTRAP",
     "ADMITTED_BY_NEITHER",
     "ADMITTED_BY_RECORD",
@@ -103,9 +98,11 @@ __all__ = [
     "BaselineEvidence",
     "BaselineRecord",
     "BaselineStore",
+    "StoreUnreachable",
     "VersionKey",
     "Versions",
     "append_record",
+    "is_gcs",
     "load_versions",
     "utc_now",
 ]
@@ -125,6 +122,17 @@ DEFAULT_ADMISSION_MIN_RUNS = 20
 ADMITTED_BY_RECORD = "record"
 ADMITTED_BY_BOOTSTRAP = "bootstrap"
 ADMITTED_BY_NEITHER = "neither"
+
+#: The reason a listed case has always been given. Byte-identical to what the
+#: list produced before the record could overrule it, and pinned by the
+#: store-unset golden; the store's own state is appended after it only when
+#: the store holds something for the case.
+BOOTSTRAP_REASON = "admitted by BOOTSTRAP_ADMITTED (transition bridge)"
+BOOTSTRAP_STATE_PREFIX = "; the record cannot judge it yet: "
+#: Appended when the record turns away a case the list still names.
+RECORD_OVERRIDES_SUFFIX = (
+    " -- the record overrides BOOTSTRAP_ADMITTED, which still names this case"
+)
 
 
 @dataclass(frozen=True)
@@ -636,16 +644,13 @@ class BaselineStore:
                 )
             reason = self._pre_admission_state(case_id, key, evidence, bar)
             if case_id in bootstrap:
-                reason += (
-                    " -- the record overrides BOOTSTRAP_ADMITTED, which still names "
-                    "this case"
-                )
+                reason += RECORD_OVERRIDES_SUFFIX
             return Admission(False, reason, ADMITTED_BY_RECORD)
 
         if case_id in bootstrap:
-            reason = "admitted by BOOTSTRAP_ADMITTED (transition bridge)"
+            reason = BOOTSTRAP_REASON
             if self._records.get(case_id):
-                reason += "; the record cannot judge it yet: " + self._pre_admission_state(
+                reason += BOOTSTRAP_STATE_PREFIX + self._pre_admission_state(
                     case_id, key, evidence, bar
                 )
             return Admission(True, reason, ADMITTED_BY_BOOTSTRAP)

@@ -16,9 +16,10 @@ The roster is a transition bridge, not a destination. `bench/baselines/` ships e
 the evidence store is not armed yet, so no case is admitted by measured evidence and
 nothing could reach the collapse rung — the presubmit would block on nothing for as long
 as screening takes. Cases named in `BOOTSTRAP_ADMITTED` keep their old blocking behaviour
-meanwhile: a bootstrap-admitted case arms rung 4 but leaves rung 6 quiet and contributes
-nothing to main's side of the aggregate, because it has no measured evidence to
-contribute.
+meanwhile: a bootstrap-admitted case arms rung 4 by fiat, and while the store holds nothing
+for it at the current key it leaves rung 6 quiet and contributes nothing to main's side of
+the aggregate. Once the nightly has appended a partial window for it (`collecting`), that
+evidence feeds both; the list still decides admission until the window is full.
 
 **The record wins once it exists.** `BaselineStore.admission()` in
 `bench/kube_agents_bench/baselines.py` consults the store before the list. When the store
@@ -122,8 +123,8 @@ either direction. A case the record admits at 21/21 blocks whether or not it is 
 demoting it by hand means waiting for the record: one night of three failures on `main`
 against a 21/21 window reads 18/21, below the bar, and the case is turned away on the next
 presubmit. That is the de-admission window once the record governs — one nightly. Until the
-store is armed and has filled for a case, it is the seven nights of collecting plus however
-long the case has been failing, which is why the manual edit stays the fast lever for now.
+record holds a full window for a case, nothing automatic de-admits a listed one, which is
+why the manual edit stays the fast lever for now.
 
 A demoted case keeps running and reporting; give it a hold-out entry above with the issue
 that names its re-admission condition. That issue goes to the case's `owner:` in its
@@ -142,14 +143,16 @@ hold, and not before:
    the comment above that variable in the script).
 2. Every case on the list has a full window at the current version key, so the record
    already decides it and the list is inert for it: each shows `record` or
-   `record: not admitted` in the nightly verdict's **Admitted by** column. At the nightly's
-   three repetitions that is seven nights from an empty store, and seven nights again after
-   any version-key bump (a new agent or judge model, a `fleet` or `verifiers` bump).
+   `record: not admitted` in the nightly verdict's **Admitted by** column. At
+   `EVAL_REPETITIONS=3`, the script's default the nightly inherits, that is seven nights from
+   an empty store, and seven nights again after any version-key bump (a new agent or judge
+   model, a `fleet` or `verifiers` bump).
 3. Those seven nights completed for every listed case. A nightly killed at its deadline
    records only the units that finished, so a case queued late can fall behind the count
    the calendar suggests; read the column rather than counting nights.
 4. The eval dashboard's `admission_state` view and the verdict's column agree on which
-   cases are live.
+   cases are live. The view knows nothing of the list, so it can only agree once 2 holds —
+   which is the point of checking it.
 
 Deleting the list before 2 holds silently un-arms every case still riding the bridge — the
 gate goes green with rung 4 inert for them, which is the failure the list exists to

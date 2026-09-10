@@ -16,13 +16,20 @@
 
 ``fixtures/golden/store-unset/`` was captured from ``main`` BEFORE the
 record-governs-admission change, by running this same file with
-``BENCH_UPDATE_GOLDEN=1`` against the shipped, empty ``bench/baselines/``
-directory -- which is exactly what the presubmit reads today. The test
-replays the same three cases and two suites and compares every artifact the
-shell would keep: the per-case JSON hand-off, the suite markdown, the suite
-JSON, and what was printed. So a change to admission, the aggregate or the
-verdict markdown can only alter the store-unset presubmit by also altering
-these files in the same diff, where a reviewer sees it.
+``BENCH_UPDATE_GOLDEN=1`` against an empty store carrying the shipped
+version pins -- which is exactly what the presubmit reads today from
+``bench/baselines/``. The test replays the same three cases and two suites
+and compares every artifact the shell would keep: the per-case JSON
+hand-off, the suite markdown, the suite JSON, and what was printed. So a
+change to admission, the aggregate or the verdict markdown can only alter
+the store-unset presubmit by also altering these files in the same diff,
+where a reviewer sees it.
+
+The empty store is built in ``tmp_path`` rather than read from the live
+``bench/baselines/`` on purpose: a ``VERSIONS.json`` bump, or an evidence
+line landed there by hand, would otherwise fail this test and invite a
+regeneration -- after which the golden would pin whatever HEAD does and the
+"captured before the change" claim above would be false.
 
 Two things are normalised, and nothing else: the absolute fixture path inside
 ``run_dir`` (the checkout moves; the record does not), and the additive
@@ -44,8 +51,9 @@ from conftest import FIXTURE_RUNS, GREEN_RUNS, RED_RUNS
 from kube_agents_bench.gate import main
 
 GOLDEN = Path(__file__).parent / "fixtures" / "golden" / "store-unset"
-#: The shipped store, empty of evidence: what an unset EVAL_BASELINE_STORE reads.
-SHIPPED_BASELINES = Path(__file__).resolve().parents[1] / "baselines"
+#: The version pins the golden was captured under. Written into an empty
+#: directory per test rather than read from the live ``bench/baselines/``.
+SHIPPED_VERSIONS = {"fleet": 1, "verifiers": 1}
 JUDGE = "gemini-3.1-pro-preview"
 PATH_TOKEN = "<FIXTURE_RUNS>"
 #: Additive since the golden was captured; popped before comparing.
@@ -107,6 +115,10 @@ def replay(kanban_task: Path, tmp_path: Path, monkeypatch, capsys) -> dict[str, 
     artifacts: dict[str, str] = {}
     reds = [FIXTURE_RUNS / n for n in RED_RUNS]
     greens = [FIXTURE_RUNS / n for n in GREEN_RUNS + GREEN_RUNS[:1]]
+    # The shipped store: VERSIONS.json and no evidence.
+    shipped = tmp_path / "baselines"
+    shipped.mkdir()
+    (shipped / "VERSIONS.json").write_text(json.dumps(SHIPPED_VERSIONS), encoding="utf-8")
 
     def case(name: str, runs: list[Path], bootstrap: str | None) -> Path:
         if bootstrap is None:
@@ -114,7 +126,7 @@ def replay(kanban_task: Path, tmp_path: Path, monkeypatch, capsys) -> dict[str, 
         else:
             monkeypatch.setenv("BOOTSTRAP_ADMITTED", bootstrap)
         out = tmp_path / f"case-{name}.json"
-        argv = ["case", "--task", str(kanban_task), "--baseline-dir", str(SHIPPED_BASELINES)]
+        argv = ["case", "--task", str(kanban_task), "--baseline-dir", str(shipped)]
         for run in runs:
             argv += ["--result", str(run)]
         rc = main([*argv, "--json-out", str(out)])
@@ -128,7 +140,7 @@ def replay(kanban_task: Path, tmp_path: Path, monkeypatch, capsys) -> dict[str, 
         else:
             monkeypatch.setenv("BOOTSTRAP_ADMITTED", bootstrap)
         md, js = tmp_path / f"{name}.md", tmp_path / f"{name}.json"
-        argv = ["suite", "--baseline-dir", str(SHIPPED_BASELINES)]
+        argv = ["suite", "--baseline-dir", str(shipped)]
         for path in cases:
             argv += ["--case-result", str(path)]
         rc = main([*argv, "--markdown-out", str(md), "--json-out", str(js)])

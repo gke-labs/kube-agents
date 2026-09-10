@@ -1974,9 +1974,9 @@ profile_begin "record + final gate"
 # provisioning for three samples of each case, and provisioning -- not the eval
 # -- is what the job spends its time on. One nightly run amortises that setup
 # over every repetition, so it buys a sample far cheaper and can refill the
-# whole 20-run admission window in seven nights at its three repetitions
-# after a version-key bump, fewer once the count is raised on measured wall
-# clock. Neither job type is a pull request, which
+# whole 20-run admission window in seven nights at the default three
+# repetitions after a version-key bump, fewer once the count is raised on
+# measured wall clock. Neither job type is a pull request, which
 # is the property that actually matters here; PULL_NUMBER below is what
 # enforces it. See docs/designs/eval-scorer.md#the-job-that-writes-it.
 #
