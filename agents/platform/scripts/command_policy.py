@@ -58,9 +58,9 @@ class Decision:
 
 _ALLOWED = Decision(allowed=True, rule_id="", message="")
 
-# Only these two reach a cluster or a cloud project. Everything else the proxy
+# Only these reach a cluster or a cloud project. Everything else the proxy
 # executes is governed elsewhere.
-_GOVERNED_TOOLS = frozenset({"kubectl", "gcloud"})
+_GOVERNED_TOOLS = frozenset({"kubectl", "gcloud", "oc"})
 
 # Verb sequences that only read. Tuples rather than bare strings so a verb whose
 # effect depends on its subcommand can say which subcommand it meant: `rollout
@@ -90,9 +90,12 @@ KUBECTL_READ_VERBS: frozenset[tuple[str, ...]] = frozenset(
         ("explain",),
         ("get",),
         ("logs",),
+        ("project",),
+        ("status",),
         ("top",),
         ("version",),
         ("wait",),
+        ("whoami",),
         ("auth", "can-i"),
         ("auth", "whoami"),
         ("config", "current-context"),
@@ -818,7 +821,7 @@ def evaluate(argv: list[str]) -> Decision:
             offending_flag=impersonation_flag,
         )
 
-    if argv[0] == "kubectl":
+    if argv[0] in ("kubectl", "oc"):
         # Ordered before the identity check, the same way gcloud checks
         # --flags-file before _GCLOUD_IDENTITY_FLAGS: the refusal a caller sees
         # should name the file-of-flags problem rather than the identity one it

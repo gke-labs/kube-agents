@@ -258,6 +258,8 @@ class ShippedPolicyTest(unittest.TestCase):
             (["gcloud", "config", "config-helper"], "gcp.config-helper-disclosure"),
             (["kubectl", "config", "view", "--raw"], "kubernetes.token-disclosure"),
             (["kubectl", "create", "token", "default"], "kubernetes.token-disclosure"),
+            (["oc", "config", "view", "--raw"], "kubernetes.token-disclosure"),
+            (["oc", "create", "token", "default"], "kubernetes.token-disclosure"),
             (["git", "credential", "fill"], "git.credential-disclosure"),
             (["gcloud", "auth", "login"], "gcp.credential-replacement"),
             (
@@ -291,6 +293,10 @@ class ShippedPolicyTest(unittest.TestCase):
             ["gh", "api", "repos/o/r/pulls/1/comments"],
             ["gh", "auth", "status"],
             ["kubectl", "get", "pods"],
+            ["oc", "get", "pods"],
+            ["oc", "project"],
+            ["oc", "whoami"],
+            ["oc", "status"],
         ):
             with self.subTest(argv=argv):
                 self.assertAllowed(argv)
@@ -590,6 +596,25 @@ class TheRulesReadCommandsNotProse(ShippedPolicyTest):
                 "--body", body]
         self.assertIsNone(self.policy.blocked_by(argv))
 
+    def test_oc_command_policy_governance(self):
+        """Verifies that oc is governed by command_policy.evaluate just like kubectl."""
+        import command_policy
+
+        # Read verbs allowed
+        self.assertTrue(command_policy.evaluate(["oc", "get", "pods"]).allowed)
+        self.assertTrue(command_policy.evaluate(["oc", "project"]).allowed)
+        self.assertTrue(command_policy.evaluate(["oc", "whoami"]).allowed)
+        self.assertTrue(command_policy.evaluate(["oc", "status"]).allowed)
+
+        # Mutating verbs blocked as read-only violations
+        self.assertFalse(command_policy.evaluate(["oc", "apply", "-f", "pod.yaml"]).allowed)
+        self.assertFalse(command_policy.evaluate(["oc", "delete", "pod", "test"]).allowed)
+        self.assertFalse(command_policy.evaluate(["oc", "create", "route", "edge"]).allowed)
+
+        # Impersonation flags blocked
+        self.assertFalse(command_policy.evaluate(["oc", "get", "pods", "--as=system:admin"]).allowed)
+
 
 if __name__ == "__main__":
     unittest.main()
+

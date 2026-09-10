@@ -81,7 +81,7 @@ See [Google Chat Session Metadata Data Flow](designs/gchat-session-metadata-data
 - Provider access uses workload identity or short-lived credentials rather than static keys in the sandbox.
 - GitHub access uses short-lived, repository-scoped installation tokens.
 - Chat and source-control credentials remain behind explicitly configured relay or command interfaces.
-- The current command proxy supports `gcloud`, `kubectl`, `gh`, and `git`. Additional CLIs require explicit proxy support.
+- The current command proxy supports `gcloud`, `kubectl`, `oc`, `gh`, and `git`. Additional CLIs require explicit proxy support.
 - A configuration file the sandbox supplies to a credentialed command selects a target; it does not supply content. The proxy must not run a credentialed command against a document the sandbox authored, because such a document can direct execution, redirect the minted token, or name a file to disclose — none of which the argument-vector deny policy can see. Kubeconfigs are regenerated in the broker for this reason.
 
 The sandbox and the credential runtime must not share a process namespace, and must not run as the

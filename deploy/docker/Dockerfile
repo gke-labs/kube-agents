@@ -1779,6 +1779,9 @@ RUN curl -sSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dear
     curl -fL -o /tmp/gh.deb "https://github.com/cli/cli/releases/download/v2.92.0/gh_2.92.0_linux_${ARCH}.deb" && \
     dpkg -i /tmp/gh.deb && \
     rm -f /tmp/gh.deb && \
+    OC_ARCH=$([ "$ARCH" = "amd64" ] && echo "x86_64" || echo "aarch64") && \
+    curl -fL "https://mirror.openshift.com/pub/openshift-v4/${OC_ARCH}/clients/ocp/stable/openshift-client-linux.tar.gz" | tar -xz -C /usr/local/bin oc && \
+    chmod 0755 /usr/local/bin/oc && \
     rm -rf /var/lib/apt/lists/* && \
     mkdir -p /etc/envoy
 

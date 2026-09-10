@@ -209,7 +209,7 @@ to the agent.
 Five things name GitHub: three inside the broker, the minting pipeline behind it, and the network
 policy that lets the pod out at all.
 
-**The executable allowlist.** `ALLOWED_EXECUTABLES` is `("gcloud", "kubectl", "gh", "git")`, a class
+**The executable allowlist.** `ALLOWED_EXECUTABLES` is `("gcloud", "kubectl", "oc", "gh", "git")`, a class
 attribute of `CommandExecutor` read from three places — and `credential_proxy_client.py` carries the
 same set again as `SUPPORTED_EXECUTABLES`, so the step is two files, not one. GitLab has `glab`, so
 a GitLab install wants that entry and a GitHub install must not have it — an allowlist that is the
