@@ -11,6 +11,6 @@ data:
           # LiteLLM's provider for a self-hosted vLLM server. No api_key: the
           # server checks none, and the address is HOSTED_VLLM_API_BASE on the
           # Deployment rather than an api_base here.
-          model: hosted_vllm/google/gemma-4-E2B-it
+          model: hosted_vllm/google/gemma-4-E4B-it
     litellm_settings:
       callbacks: ["otel", "prometheus"]

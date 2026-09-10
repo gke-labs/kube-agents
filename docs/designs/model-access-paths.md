@@ -81,7 +81,17 @@ the cluster, and not the Service port: NetworkPolicy matches after Service trans
 
 ## 6. What the live run found
 
-On a 2×L4 node (`g2-standard-24`), `examples/vllm-gemma/`'s arguments do not fit a 31B model:
+On a 2×L4 node (`g2-standard-24`), `examples/vllm-gemma/` as #608 left it does not fit a 31B model:
 with FP8 weights at 16.5 GiB per GPU, `--max-model-len 32768` plus multimodal profiling fails
-engine initialization with `CUDA error: out of memory`. A 16k context, 8 sequences, and vision
-profiling disabled fit. The example's own model, `google/gemma-4-E2B-it` on one L4, is not affected.
+engine initialization with `CUDA error: out of memory`; two sequences and vision profiling
+disabled fit.
+
+The agent then failed every turn with an HTTP 500 whatever the context, because it requests
+65536 output tokens on each call (the Hermes `custom` provider default; the agent's config sets
+no override) and vLLM rejects a request whose output budget exceeds `--max-model-len`. The
+server's context therefore has to exceed 65536 plus the agent's ~20k-token prompt. That is why
+the example now serves `google/gemma-4-E4B-it` at 131072 on one L4, the configuration under
+which the gateway request and a full agent turn with a tool call succeeded, and why the larger
+Gemma 4 checkpoints are out of reach on L4-class hardware. A harness-side cap would be a
+`max_tokens` knob in the agent's rendered config; the review of #608 asked for the operator to
+stay untouched, so the requirement is documented in the example instead.

@@ -47,7 +47,7 @@ LiteLLM configured to proxy a personal ChatGPT subscription via OAuth device flo
 
 [`examples/vllm-gemma/`](https://github.com/gke-labs/kube-agents/tree/main/examples/vllm-gemma)
 
-vLLM serving Gemma (`gemma-4-e2b-it`) on GKE GPU nodes, based on GKE's official inference tutorial. Ships the vLLM Deployment, Service, `PodDisruptionBudget`, `NetworkPolicy`, and `PodMonitoring`. It does not include a node pool spec or GPU driver installer — a cluster with GPU nodes is a prerequisite.
+vLLM serving Gemma 4 (`google/gemma-4-E4B-it`) on one GKE L4 node, based on GKE's official inference tutorial, at the 128k context the agent's requests need. Ships the vLLM Deployment, Service, `PodDisruptionBudget`, `NetworkPolicy`, and `PodMonitoring`. It does not include a node pool spec or GPU driver installer — a cluster with GPU nodes is a prerequisite. Pairs with `litellm-hosted-vllm` above.
 
 **When to use:** data-locality, air-gapped, or open-model requirements. Provision a GPU node pool first (or use the `gke-compute-classes` skill to spec one).
 

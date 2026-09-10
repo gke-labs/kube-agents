@@ -5,15 +5,6 @@ metadata:
   namespace: kubeagents-system
 spec:
   replicas: 1
-  strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      # Why maxUnavailable is 0 here: pulling and loading Gemma model weights
-      # takes minutes (with a 10-minute startupProbe budget). At replicas: 1,
-      # maxUnavailable: 1 terminates the serving Pod immediately, causing minutes
-      # of inference outage during rollouts. maxUnavailable: 0 ensures continuous serving.
-      maxUnavailable: 0
-      maxSurge: 1
   selector:
     matchLabels:
       app: gemma-server
@@ -21,51 +12,73 @@ spec:
     metadata:
       labels:
         app: gemma-server
-        ai.gke.io/model: gemma-4-e2b-it
+        ai.gke.io/model: gemma-4-e4b-it
         ai.gke.io/inference-server: vllm
         examples.ai.gke.io/source: user-guide
     spec:
       containers:
         - name: inference-server
-          image: us-docker.pkg.dev/vertex-ai/vertex-vision-model-garden-dockers/pytorch-vllm-serve:gemma4
+          image: us-docker.pkg.dev/vertex-ai/vertex-vision-model-garden-dockers/pytorch-vllm-serve:gemma4@sha256:3fbc0e08c46e7736145c9effbcc8839682c80b15b413335146f4428fc3523c8a
+          # One L4. ephemeral-storage holds the Hugging Face download (the
+          # E4B checkpoint is about 8 GB) plus the image's own scratch;
+          # memory covers the same checkpoint while it is being loaded.
           resources:
             requests:
               cpu: "2"
-              memory: "10Gi"
-              ephemeral-storage: "10Gi"
+              memory: "16Gi"
+              ephemeral-storage: "30Gi"
               nvidia.com/gpu: "1"
             limits:
               cpu: "2"
-              memory: "10Gi"
-              ephemeral-storage: "10Gi"
+              memory: "16Gi"
+              ephemeral-storage: "30Gi"
               nvidia.com/gpu: "1"
-          command: ["python3", "-m", "vllm.entrypoints.api_server"]
+          command: ["python3", "-m", "vllm.entrypoints.openai.api_server"]
           args:
             - --model=$(MODEL_ID)
             - --host=0.0.0.0
             - --port=8000
             - --tensor-parallel-size=1
-            - --enable-log-requests
             - --enable-chunked-prefill
             - --enable-prefix-caching
             - --enable-auto-tool-choice
             - --generation-config=auto
             - --tool-call-parser=gemma4
             - --dtype=bfloat16
-            - --max-num-seqs=16
-            - --max-model-len=32768
+            # The agent asks for 65536 output tokens on every request (the
+            # Hermes custom-provider default) and vLLM rejects a request whose
+            # output budget exceeds the context, so the context has to hold
+            # that plus the agent's ~20k-token prompt. 32768 fails every turn.
+            - --max-num-seqs=4
+            - --max-model-len=131072
+            # The agent sends text only; skipping the multimodal encoder's
+            # memory reservation leaves it for context.
+            - --limit-mm-per-prompt={"image":0,"video":0}
             - --gpu-memory-utilization=0.95
             - --reasoning-parser=gemma4
-            - --trust-remote-code
             - --otlp-traces-endpoint=opentelemetry-collector.gke-managed-otel.svc.cluster.local:4317
           env:
             - name: LD_LIBRARY_PATH
-              value: ${LD_LIBRARY_PATH}:/usr/local/nvidia/lib64
+              value: /usr/local/nvidia/lib64
             - name: MODEL_ID
-              value: google/gemma-4-E2B-it
+              value: google/gemma-4-E4B-it
+            # Gemma is gated on Hugging Face: an online pull needs a token
+            # (README, option B). Optional so the air-gapped path (option A)
+            # needs no Secret.
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-secret
+                  key: token
+                  optional: true
             - name: OTEL_SERVICE_NAME
               value: vllm-gemma
 
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           # /health is vLLM's own endpoint and answers only once the model is
           # resident on the GPU. That is the whole point here: pulling and
           # loading Gemma takes minutes, and without a readinessProbe the
@@ -90,12 +103,19 @@ spec:
           volumeMounts:
             - mountPath: /dev/shm
               name: dshm
+      terminationGracePeriodSeconds: 60
       volumes:
         - name: dshm
           emptyDir:
             medium: Memory
+            # Counts against the memory limit; a single GPU needs little.
+            sizeLimit: 2Gi
+        # For offline / air-gapped deployments with pre-staged weights on a PVC:
+        # - name: model-weights
+        #   persistentVolumeClaim:
+        #     claimName: gemma4-weights-pvc
       nodeSelector:
-        cloud.google.com/gke-accelerator: nvidia-rtx-pro-6000
+        cloud.google.com/gke-accelerator: nvidia-l4
         cloud.google.com/gke-gpu-driver-version: latest
 ---
 apiVersion: policy/v1
