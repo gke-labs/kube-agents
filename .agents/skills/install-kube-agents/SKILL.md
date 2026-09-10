@@ -90,6 +90,7 @@ curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSI
 ```
 
 In `--generate-only` mode, the installer:
+
 1. Writes `install.env` (if absent) and `terraform/examples/full-install/terraform.tfvars`.
 2. Runs pre-apply validation checks (e.g., verifying the GitOps organization).
 3. Prints the exact out-of-Terraform commands (CMEK, Workload Identity, NetworkPolicy, GitHub App PEM import, and OTel scope) and the `lifecycle.sh plan` / `apply` commands with remote state variables (`KUBE_AGENTS_STATE_BUCKET` and `KUBE_AGENTS_STATE_PREFIX`).
