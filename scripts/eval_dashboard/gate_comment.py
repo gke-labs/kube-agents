@@ -96,6 +96,12 @@ RUN_URL = DASHBOARD_ROOT + "/run.html?build={build_id}"
 BUILD_LOG_URL = "https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{pr}/" + JOB_NAME + "/{build_id}"
 # "kube-agents-evals-23" reads as "evals-23".
 PROJECT_PREFIX = "kube-agents-"
+# GitHub REST paths, relative to the repository (`gh.path` prefixes it), and
+# the page size the comment search reads; the marker search needs every
+# comment on the pull request, so it paginates from the largest page.
+COMMENTS_PATH = "issues/{pr}/comments"
+COMMENT_PATH = "issues/comments/{comment_id}"
+COMMENTS_PAGE_SIZE = 100
 UNKNOWN_PROJECT = "an unknown project"
 
 # Wording. Plain words for whoever is deciding whether to type /retest.
@@ -340,7 +346,7 @@ def render_comment(red: Red, health_doc: dict, runs: list[dict]) -> str:
 
 
 def find_comment(gh: ghcli.Gh, pr: int) -> int | None:
-    comments = gh.call("GET", gh.path(f"issues/{pr}/comments?per_page=100"), paginate=True)
+    comments = gh.call("GET", gh.path(f"{COMMENTS_PATH.format(pr=pr)}?per_page={COMMENTS_PAGE_SIZE}"), paginate=True)
     for comment in comments or []:
         if isinstance(comment, dict) and str(comment.get("body") or "").startswith(MARKER):
             return comment.get("id")
@@ -358,7 +364,7 @@ def post(gh: ghcli.Gh, pr: int, body: str, known_id: int | None) -> int | None:
     the comment was deleted -- falls through to a new post."""
     comment_id = known_id or find_comment(gh, pr)
     if comment_id:
-        edited = gh.call("PATCH", gh.path(f"issues/comments/{comment_id}"), {"body": body})
+        edited = gh.call("PATCH", gh.path(COMMENT_PATH.format(comment_id=comment_id)), {"body": body})
         if edited is not None:
             return comment_id
         if not known_id:
@@ -367,11 +373,11 @@ def post(gh: ghcli.Gh, pr: int, body: str, known_id: int | None) -> int | None:
         if found == known_id:
             return None
         if found:
-            return found if gh.call("PATCH", gh.path(f"issues/comments/{found}"), {"body": body}) is not None else None
+            return found if gh.call("PATCH", gh.path(COMMENT_PATH.format(comment_id=found)), {"body": body}) is not None else None
     if gh.dry_run:
-        gh.call("POST", gh.path(f"issues/{pr}/comments"), {"body": body})
+        gh.call("POST", gh.path(COMMENTS_PATH.format(pr=pr)), {"body": body})
         return None
-    created = gh.call("POST", gh.path(f"issues/{pr}/comments"), {"body": body})
+    created = gh.call("POST", gh.path(COMMENTS_PATH.format(pr=pr)), {"body": body})
     return created.get("id") if isinstance(created, dict) else None
 
 
