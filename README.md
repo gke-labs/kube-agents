@@ -121,7 +121,7 @@ flowchart TB
     end
 
     subgraph integration["🔀 Integration & Routing Layer"]
-        LLM["LiteLLM Gateway<br/>Gemini · Vertex AI · OpenAI · Anthropic"]
+        LLM["LiteLLM Gateway<br/>Gemini · Vertex AI · OpenAI · Anthropic · vLLM in-cluster"]
         CHAT["Messaging bridges<br/>Google Chat (Pub/Sub) · Slack (Socket Mode)"]
         GH["Minty — GitHub App<br/>token minter (KMS)"]
     end

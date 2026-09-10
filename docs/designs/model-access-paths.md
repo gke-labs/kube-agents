@@ -1,6 +1,6 @@
 # Hosting the model in your cluster
 
-> **STATUS: design of record; implemented.** The `hosted_vllm` provider ships alongside the hosted-provider path (`gemini`, `anthropic`,
+> **STATUS: design of record; implemented.** The `hosted_vllm` provider (no `providers.json` row yet; see §3) ships alongside the hosted-provider path (`gemini`, `anthropic`,
 > `openai`, `vertex_ai`) and the ChatGPT-subscription path (`chatgpt`), each a row in
 > `k8s-operator/config/integrations/litellm/providers.json`, and a hand-applied vLLM recipe under
 > `examples/vllm-gemma/`. Tracking issue: #1418.
@@ -77,8 +77,8 @@ rather than the Service port, because the policy is evaluated after the Service'
   carries the provider line, the env var, and exactly one same-namespace egress rule on the
   configured port; each missing value fails the render naming it; the other providers render none
   of it; a URL outside the cluster fails; the rule names the namespace in the URL; the installer
-  accepts the provider with no default model and emits both tfvars; the gateway example points at
-  the server example's Service and port.
+  accepts the provider with no default model; the gateway example points at the server example's
+  Service and port. `tests/test_installer_common.py` pins the two tfvars lines beside the Vertex ones.
 - **Manual:** a live run on a GPU node, recorded in the pull request that lands a change. CI has no GPU.
 - **No new eval cases.** The agent's behaviour does not change.
 

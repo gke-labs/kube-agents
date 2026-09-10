@@ -9,14 +9,14 @@ The Platform Agent talks to an LLM through a **Completions API** proxy so provid
 
 ## Choosing a provider
 
-| You want                                            | Use                                                    | Why                                                                                                                                      |
-| --------------------------------------------------- | ------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| Fastest path with a hosted frontier model           | **LiteLLM → Gemini** (default)                         | One API key, no GPU node pool, no cluster egress beyond the LiteLLM pod.                                                                 |
-| Provider redundancy or A/B                          | **LiteLLM → Gemini + Anthropic + OpenAI**              | LiteLLM handles the router config; agent config is unchanged.                                                                            |
-| Inference billed to your own GCP project            | **LiteLLM → Vertex AI / Model Garden**                 | Workload Identity instead of an API key; Gemini plus Model Garden publishers. See [below](#vertex-ai-and-model-garden).                  |
-| Free local prototyping with a consumer subscription | **LiteLLM → ChatGPT subscription** (OAuth device flow) | See [`examples/litellm-chatgpt-subscription/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-chatgpt-subscription). |
-| Data-locality or air-gapped inference               | **vLLM → Gemma / Llama / Qwen**                        | Runs on a GKE GPU node pool. Higher setup cost, no egress to a hosted provider.                                                          |
-| Deterministic demos / cheap tests                   | **Any of the above + inference-replay proxy**          | Caches responses in a PVC; replays on cache hit.                                                                                         |
+| You want                                            | Use                                                              | Why                                                                                                                                      |
+| --------------------------------------------------- | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| Fastest path with a hosted frontier model           | **LiteLLM → Gemini** (default)                                   | One API key, no GPU node pool, no cluster egress beyond the LiteLLM pod.                                                                 |
+| Provider redundancy or A/B                          | **LiteLLM → Gemini + Anthropic + OpenAI**                        | LiteLLM handles the router config; agent config is unchanged.                                                                            |
+| Inference billed to your own GCP project            | **LiteLLM → Vertex AI / Model Garden**                           | Workload Identity instead of an API key; Gemini plus Model Garden publishers. See [below](#vertex-ai-and-model-garden).                  |
+| Free local prototyping with a consumer subscription | **LiteLLM → ChatGPT subscription** (OAuth device flow)           | See [`examples/litellm-chatgpt-subscription/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-chatgpt-subscription). |
+| Data-locality or air-gapped inference               | **LiteLLM → vLLM in the cluster** (`MODEL_PROVIDER=hosted_vllm`) | Runs on a GKE GPU node pool. Higher setup cost, no egress to a hosted provider. See [below](#vllm-local-models).                         |
+| Deterministic demos / cheap tests                   | **Any of the above + inference-replay proxy**                    | Caches responses in a PVC; replays on cache hit.                                                                                         |
 
 ## LiteLLM (hosted models)
 
@@ -26,6 +26,7 @@ The Platform Agent talks to an LLM through a **Completions API** proxy so provid
 
 - [`examples/litellm-gemini/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-gemini) — Gemini-only default. Uses `GEMINI_API_KEY`.
 - [`examples/litellm-chatgpt-subscription/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-chatgpt-subscription) — proxies to a personal ChatGPT subscription via OAuth device flow. Useful for demos where you don't want a per-token cost.
+- [`examples/litellm-hosted-vllm/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-hosted-vllm) — routes to a vLLM server in the cluster through LiteLLM's `hosted_vllm` provider. No key. See [vLLM](#vllm-local-models).
 
 To switch providers, edit the LiteLLM `config.yaml` (mounted from a `ConfigMap`) and set the corresponding API key secret, if the provider takes one. The Platform Agent config doesn't change — it always talks to a Service named `litellm`.
 
@@ -121,7 +122,7 @@ A re-run against an existing install reconciles the switch in one `terraform app
 
 vLLM speaks OpenAI-compatible Completions, so LiteLLM can be layered on top (or in front) for routing and observability.
 
-`MODEL_PROVIDER=hosted_vllm` does that layering: LiteLLM's own provider for a vLLM server, so the gateway's config is the same `hosted_vllm/<model>` line the other providers get and the server's address travels as `HOSTED_VLLM_API_BASE`. It has no defaults: set `MODEL_DEFAULT_NAME` to the model the server was started with, `HOSTED_VLLM_API_BASE` to its base URL, and `HOSTED_VLLM_TARGET_PORT` to the server pod's port, which the gateway's egress rule names (in the chart: `litellm.modelDefaultName`, `litellm.hostedVllm.apiBase`, `litellm.hostedVllm.targetPort`). Nothing else changes: the agent keeps asking for `model-default`. The provider itself is LiteLLM's; its [vLLM provider page](https://docs.litellm.ai/docs/providers/vllm) is the reference for the model prefix and the environment variables. [`examples/litellm-hosted-vllm/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-hosted-vllm) is the hand-applied gateway, pointed at the example server above.
+`MODEL_PROVIDER=hosted_vllm` does that layering: LiteLLM's own provider for a vLLM server, so the gateway's config is the same `hosted_vllm/<model>` line the other providers get and the server's address travels as `HOSTED_VLLM_API_BASE`. It has no defaults: set `MODEL_DEFAULT_NAME` to the model the server was started with, `HOSTED_VLLM_API_BASE` to its base URL, and `HOSTED_VLLM_TARGET_PORT` to the server pod's port, which the gateway's egress rule names (in the chart: `litellm.modelDefaultName`, `litellm.hostedVllm.apiBase`, `litellm.hostedVllm.targetPort`). Nothing else changes: the agent keeps asking for `model-default`. The install path and the chart carry it; the kustomize dev copy (`make -C k8s-operator deploy-litellm`) does not yet, so it renders the provider line without the address or the egress rule. The provider itself is LiteLLM's; its [vLLM provider page](https://docs.litellm.ai/docs/providers/vllm) is the reference for the model prefix and the environment variables. [`examples/litellm-hosted-vllm/`](https://github.com/gke-labs/kube-agents/tree/main/examples/litellm-hosted-vllm) is the hand-applied gateway, pointed at the example server above.
 
 ## Inference replay
 
