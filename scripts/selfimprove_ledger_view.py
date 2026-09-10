@@ -63,6 +63,41 @@ LEDGER_KEY = "ledger.json"
 FALLBACK_MAX_BYTES = 768 * 1024
 SEVERITY_ORDER = ("critical", "high", "medium", "low")
 
+#: Report width when `--width` is not given and the terminal cannot be
+#: measured (a pipe, a CI log), and the range the measured or given width is
+#: clamped to. Below 60 columns the tables no longer wrap into anything
+#: readable; above 200 the location column runs longer than a line of code,
+#: and a wider terminal gains nothing from filling it.
+FALLBACK_TERMINAL_SIZE = (120, 40)
+MIN_WIDTH = 60
+MAX_WIDTH = 200
+#: Characters of a finding's location shown in the findings table. Enough for
+#: a `path:line` with a deep directory; the prose locations that run to 400
+#: characters are cut here and shown whole under `--detail`.
+LOCATION_CLIP = 110
+#: The ledger-size meter turns yellow, then red, at these fractions of the
+#: ledger's byte cap.
+SIZE_WARN_FRACTION = 0.7
+SIZE_ALERT_FRACTION = 0.9
+#: Cells in the size meter -- one block per cell, so eighteen resolves to
+#: about five percent, and the meter fits beside its caption at MIN_WIDTH.
+METER_CELLS = 18
+#: Git's customary abbreviated revision, the length `git log --oneline` shows.
+SHORT_REV_LENGTH = 7
+#: `compact_count` abbreviates at a thousand (`6.4k`) and a million (`2.5M`).
+COMPACT_THOUSAND = 1000
+COMPACT_MILLION = 1000000
+#: Subprocess bounds. A `kubectl get` of one ConfigMap or CronJob against a
+#: reachable cluster returns in seconds; thirty covers a cold credential
+#: exchange. `kubectl config current-context` reads a local file and the
+#: GitHub CLI's `api` call reads one small object, and either failing only
+#: degrades the report, so they get less.
+KUBECTL_TIMEOUT_SECONDS = 30
+CONTEXT_TIMEOUT_SECONDS = 10
+GH_API_TIMEOUT_SECONDS = 10
+#: How much of a non-JSON kubectl reply is quoted in the error.
+KUBECTL_OUTPUT_EXCERPT = 200
+
 
 # --------------------------------------------------------------------------
 # Colour
@@ -582,7 +617,7 @@ def filed_pull_requests(ledger: Dict[str, Any]) -> frozenset:
     return frozenset(filed)
 
 
-def fork_parent(repo: str, timeout: int = 10) -> str:
+def fork_parent(repo: str, timeout: int = GH_API_TIMEOUT_SECONDS) -> str:
     """The root of `repo`'s fork network, or "" when it is not a fork.
 
     Which repository numbers the pull requests a finding's prose cites. The
@@ -974,11 +1009,11 @@ def stamp(when: Optional[_dt.datetime], utc: bool) -> str:
 
 
 def compact_count(value: int) -> str:
-    if value < 1000:
+    if value < COMPACT_THOUSAND:
         return str(value)
-    if value < 1000000:
-        return "%.1fk" % (value / 1000.0)
-    return "%.1fM" % (value / 1000000.0)
+    if value < COMPACT_MILLION:
+        return "%.1fk" % (value / float(COMPACT_THOUSAND))
+    return "%.1fM" % (value / float(COMPACT_MILLION))
 
 
 def clip(text: str, limit: int) -> str:
@@ -986,7 +1021,7 @@ def clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: max(0, limit - 1)].rstrip() + "…"
 
 
-def meter(fraction: float, cells: int = 18) -> str:
+def meter(fraction: float, cells: int = METER_CELLS) -> str:
     fraction = min(max(fraction, 0.0), 1.0)
     filled = int(round(fraction * cells))
     return "█" * filled + "░" * (cells - filled)
@@ -994,7 +1029,7 @@ def meter(fraction: float, cells: int = 18) -> str:
 
 def short_rev(revision: Any) -> str:
     text = str(revision or "").strip()
-    return text[:7] if text else "-"
+    return text[:SHORT_REV_LENGTH] if text else "-"
 
 
 # --------------------------------------------------------------------------
@@ -1006,7 +1041,9 @@ class LoadError(RuntimeError):
     pass
 
 
-def kubectl_json(args: Sequence[str], context: Optional[str], timeout: int = 30) -> Dict[str, Any]:
+def kubectl_json(
+    args: Sequence[str], context: Optional[str], timeout: int = KUBECTL_TIMEOUT_SECONDS
+) -> Dict[str, Any]:
     cmd = ["kubectl"]
     if context:
         cmd += ["--context", context]
@@ -1022,7 +1059,9 @@ def kubectl_json(args: Sequence[str], context: Optional[str], timeout: int = 30)
     try:
         return json.loads(proc.stdout)
     except ValueError as exc:
-        raise LoadError("kubectl returned output that is not JSON: %s" % proc.stdout[:200]) from exc
+        raise LoadError(
+            "kubectl returned output that is not JSON: %s" % proc.stdout[:KUBECTL_OUTPUT_EXCERPT]
+        ) from exc
 
 
 def current_context(context: Optional[str]) -> str:
@@ -1030,7 +1069,10 @@ def current_context(context: Optional[str]) -> str:
         return context
     try:
         proc = subprocess.run(
-            ["kubectl", "config", "current-context"], capture_output=True, text=True, timeout=10
+            ["kubectl", "config", "current-context"],
+            capture_output=True,
+            text=True,
+            timeout=CONTEXT_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.TimeoutExpired):
         return "-"
@@ -1395,7 +1437,11 @@ def render_header(
     cap = ledger_mod.LEDGER_MAX_BYTES if ledger_mod else FALLBACK_MAX_BYTES
     size = len(raw.encode("utf-8"))
     fraction = size / float(cap)
-    size_style = "red" if fraction > 0.9 else ("yellow" if fraction > 0.7 else "dim")
+    size_style = (
+        "red"
+        if fraction > SIZE_ALERT_FRACTION
+        else ("yellow" if fraction > SIZE_WARN_FRACTION else "dim")
+    )
     lines.append(
         field(
             "size",
@@ -1515,7 +1561,7 @@ def render_findings(
         para_urls: Dict[int, str] = {}
         location = str(entry.get("location") or "")
         if location:
-            shown = clip(location.split(" and ")[0], 110)
+            shown = clip(location.split(" and ")[0], LOCATION_CLIP)
             parts.append((shown, "cyan"))
             # The paragraph is linked as a whole, to the first file the shown
             # text names -- not to the first one the whole location names, which
@@ -1893,8 +1939,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     palette = Palette(want_colour(args.color))
     box = BOX_ASCII if args.ascii else BOX_UNICODE
-    width = args.width or shutil.get_terminal_size((120, 40)).columns
-    width = max(60, min(width, 200))
+    width = args.width or shutil.get_terminal_size(FALLBACK_TERMINAL_SIZE).columns
+    width = max(MIN_WIDTH, min(width, MAX_WIDTH))
     now = _dt.datetime.now(_dt.timezone.utc)
 
     env = cronjob_env(cronjob)
