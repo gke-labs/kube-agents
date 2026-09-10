@@ -56,9 +56,7 @@ command output, never from memory:
 - after the quota check: `type: quota_check` with the metric, limit, usage,
   and whether the request fits in `analysis`;
 - after the capacity advice calls: `type: advice_service_capacity` with
-  `api_method: compute.beta.AdviceService.Capacity`, shaped exactly as below;
-- after a server-side dry run of a generated ComputeClass
-  (`kubectl apply --dry-run=server`): `type: computeclass_server_dry_run`.
+  `api_method: compute.beta.AdviceService.Capacity`, shaped exactly as below.
 
 For `advice_service_capacity`, use **exactly** these key names and shapes for
 `request` and `analysis` — do not rename keys, do not replace object entries
@@ -112,7 +110,9 @@ probe that failed is a finding, not a gap to leave silent:
 ### Generated manifests must use the real schemas
 
 Do not invent API versions or fields; start from these shapes and adjust
-values only.
+values only. There is no cluster to validate against on a Day-0 design, and
+the agent's Kubernetes grant is read-only, so the shapes below are the check:
+a manifest that departs from them is a finding, not a deliverable.
 
 A GKE ComputeClass is `cloud.google.com/v1` (never `autopilot.gke.io/*`),
 `machineFamily` takes a family (`a2`), not a machine type, and GPU fallback
@@ -156,12 +156,6 @@ spec:
   location:
     locationPolicy: ANY
 ```
-
-### Validate before attaching
-
-Run `kubectl apply --dry-run=server -f` on the generated ComputeClass and
-record the outcome with `record_evidence(type: computeclass_server_dry_run)`;
-a manifest the API server rejects is a finding, not a deliverable.
 
 ## Diagnostics
 

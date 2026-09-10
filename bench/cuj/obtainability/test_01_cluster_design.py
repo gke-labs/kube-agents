@@ -124,13 +124,6 @@ MILESTONES = (
         ("m4-specialist-completes",),
     ),
     Milestone(
-        "m8-computeclass-validates",
-        "The recommended resilient topology must include a ComputeClass "
-        "fallback manifest that passes server-side dry-run validation.",
-        "completed computeclass_server_dry_run evidence",
-        ("m4-specialist-completes",),
-    ),
-    Milestone(
         "m9-design-remains-read-only",
         "The Day-0 journey is design-only and must not create a cluster, "
         "apply manifests, open a pull request, or mutate infrastructure.",
@@ -617,12 +610,6 @@ def evaluate_kage_milestones(interaction: dict[str, Any]) -> MilestoneSuite:
         blocked_by=()
         if final_output_available
         else ("portal interaction projection omits output",),
-    )
-    suite.record(
-        "m8-computeclass-validates",
-        "computeclass_server_dry_run" in completed,
-        sorted(completed),
-        blocked_by=evidence_blocker,
     )
     mutations = sorted(FORBIDDEN_OPERATIONS.intersection(operations))
     suite.record(
