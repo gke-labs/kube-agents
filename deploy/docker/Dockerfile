@@ -1425,8 +1425,8 @@ COPY --chown=hermes:hermes agents/platform/hindsight/ /opt/platform-template/hin
 # with the platform config. It checks the relay patches copied to
 # /opt/defaults/scripts above against the Hermes tree they monkeypatch, which
 # is why it cannot run in CI: this is the `platform` chain that
-# `scripts/check_image_layers.py` measures, and it sits at 113 of the 120 layers
-# that check allows, so a COPY/RUN pair of its own spends two of the seven that
+# `scripts/check_image_layers.py` measures, and it sits at 117 of the 120 layers
+# that check allows, so a COPY/RUN pair of its own spends two of the three that
 # are left. See the module docstring for what a failure here means.
 COPY deploy/shared/defaults/config.yaml /tmp/platform-config/base.yaml
 COPY agents/platform/config.yaml \
