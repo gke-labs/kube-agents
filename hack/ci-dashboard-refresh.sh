@@ -48,7 +48,15 @@
 #                              (default 14).
 #   EVAL_DASHBOARD_TIMEOUT     whole-pipeline budget in seconds (default 900).
 #   EVAL_DASHBOARD_FROM_DIR    local build-dir source instead of the GCS glob
-#                              -- the offline path the unit tests use.
+#                              -- the offline path the unit tests use. It also
+#                              disarms EVAL_DASHBOARD_RC_GLOB, so a from-dir
+#                              run reaches no bucket at all.
+#   EVAL_DASHBOARD_RC_GLOB     release-candidate build-dir glob, feeding the
+#                              page's Releases section; default below is
+#                              post-kube-agents-eval-rc's archive. Empty =
+#                              leave releases[] to the prior data.json.
+#   EVAL_DASHBOARD_RC_FROM_DIR local release-candidate source, the offline
+#                              counterpart; wins over the glob when set.
 #   JOB_TYPE / PULL_NUMBER     Prow's; gate bucket writes as above.
 #   ARTIFACTS                  when set, receives eval-dashboard-refresh.log.
 #
@@ -109,6 +117,11 @@ trap cleanup EXIT
 trap 'exit 143' TERM INT
 
 EVAL_DASHBOARD_PR_GLOB="${EVAL_DASHBOARD_PR_GLOB:-gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*}"
+# The release-candidate archive, which feeds the page's Releases section.
+# post-kube-agents-eval-rc is a postsubmit, so its builds land under logs/
+# rather than pr-logs/. Set to the empty string to leave the section on its
+# placeholder; a sweep that finds nothing does the same thing.
+EVAL_DASHBOARD_RC_GLOB="${EVAL_DASHBOARD_RC_GLOB-gs://kube-agents-prow/logs/post-kube-agents-eval-rc/*}"
 EVAL_DASHBOARD_SINCE_DAYS="${EVAL_DASHBOARD_SINCE_DAYS:-14}"
 # Freshness contract with the rendered page: the badge turns amber this many
 # seconds after generated_at. Sized to the periodic's 15m cadence with slack
@@ -179,6 +192,15 @@ ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} bash -c '
   else
     src_args=(--pr-glob "$4")
   fi
+  # The RC source. $9 is the offline one and wins outright; the bucket glob
+  # in $8 is only armed on the bucket path, so EVAL_DASHBOARD_FROM_DIR stays
+  # what it says it is -- a run that reaches no bucket at all. Neither set
+  # leaves releases[] to whatever --merge-with carried forward.
+  if [ -n "$9" ]; then
+    src_args+=(--rc-from-dir "$9")
+  elif [ -n "$8" ] && [ -z "$6" ]; then
+    src_args+=(--rc-glob "$8")
+  fi
   python3 "$1/collect.py" "${src_args[@]}" \
     --merge-with "$2/prior-data.json" \
     --since-days "$5" \
@@ -196,7 +218,8 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
   python3 "$1/publish.py" --out-dir "$2/site" --target "$3"
 ' _ "${DASH_SRC}" "${WORK}" "${EVAL_DASHBOARD_TARGET}" "${EVAL_DASHBOARD_PR_GLOB}" \
   "${EVAL_DASHBOARD_SINCE_DAYS}" "${EVAL_DASHBOARD_FROM_DIR:-}" \
-  "${EVAL_DASHBOARD_STALE_AFTER_S}" \
+  "${EVAL_DASHBOARD_STALE_AFTER_S}" "${EVAL_DASHBOARD_RC_GLOB}" \
+  "${EVAL_DASHBOARD_RC_FROM_DIR:-}" \
   >>"${REFRESH_LOG}" 2>&1 || rc=$?
 
 # The full stage log always goes to stdout too: on a periodic, the build log

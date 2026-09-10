@@ -1,0 +1,240 @@
+=== [2026-09-10T03:35:40Z] Connectivity Smoke Test Passed (Duration: 5s) ===
+=== [2026-09-10T03:35:40Z] Resolving the release candidate to measure ===
+ℹ️ Note: staging_2609092307_5b5ad10 (5b5ad10) already carries a validation marker; measuring it again.
+======================================================================
+🏷️ RELEASE CANDIDATE EVAL TARGET
+Release Tag:    staging_2609092307_5b5ad10
+Commit SHA:     5b5ad10163cf10c73871b279518c7165c098bec9
+Images:         ghcr.io/gke-labs/kube-agents/<image>:5b5ad10163cf10c73871b279518c7165c098bec9
+======================================================================
+=== [2026-09-10T03:35:49Z] Checking out staging_2609092307_5b5ad10 (5b5ad10); this tree was heads/staging_2609092307_5b5ad10 ===
+HEAD is now at 5b5ad10 fix(dashboard): the four hardenings from the #1335 review (#1369)
+=== [2026-09-10T03:35:49Z] Deploying release candidate 5b5ad10 ===
+Installed helm v3.21.4 (amd64) to /tmp/kube-agents-helm-v3.21.4-amd64
+heartbeat sent for resource "kube-agents-evals-10"
+✓ Successfully leased project: kube-agents-evals-10
+EVAL_TIER=nightly: 8 nightly-only task(s) join the matrix, 26 tasks total
+>>> [2026-09-10T07:49:37Z] Grading Task: reliability-pdb-probe (./tasks/reliability-pdb-probe/task.yaml) x3 <<<
+Task reliability-pdb-probe Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: admitted by BOOTSTRAP_ADMITTED (transition bridge)
+>>> [2026-09-10T07:49:37Z] Grading Task: capacity-pinned-pool-probe (./tasks/capacity-pinned-pool-probe/task.yaml) x3 <<<
+Task capacity-pinned-pool-probe Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.8 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2026-09-10T07:49:37Z] Grading Task: security-overgrant-probe (./tasks/security-overgrant-probe/task.yaml) x3 <<<
+Task security-overgrant-probe Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.3 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.8 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: admitted by BOOTSTRAP_ADMITTED (transition bridge)
+>>> [2026-09-10T07:49:38Z] Grading Task: upgrades-lagging-master-probe (./tasks/upgrades-lagging-master-probe/task.yaml) x3 <<<
+Task upgrades-lagging-master-probe Result: [UNSTABLE] passed 2 of 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.9 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.6 ToolInvocation=0.0]
+  rep 3: fail -- VerificationCorrectness=0.5 (floor 1.0) -- the-probe-identifies-the-version-lag: none of the alternative phrasings present: ['behind', 'lagging', 'not current', 'out of date', 'outdated', 'one minor', 'newer version'] [OutcomeScore=0.5 OutcomeValidity=0.4 ToolInvocation=0.0]
+  admission: admitted by BOOTSTRAP_ADMITTED (transition bridge)
+>>> [2026-09-10T07:49:38Z] Grading Task: consistency-authorized-networks-probe (./tasks/consistency-authorized-networks-probe/task.yaml) x3 <<<
+Task consistency-authorized-networks-probe Result: [UNSTABLE] passed 2 of 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: fail -- VerificationCorrectness=0.0 (floor 1.0) -- the-probe-names-the-missing-config: none of the alternative phrasings present: ['authorized network', 'authorizednetworks'] [OutcomeScore=0.0 OutcomeValidity=0.4 ToolInvocation=0.0]
+  admission: admitted by BOOTSTRAP_ADMITTED (transition bridge)
+>>> [2026-09-10T07:49:38Z] Grading Task: cost-idle-pool-probe (./tasks/cost-idle-pool-probe/task.yaml) x3 <<<
+Task cost-idle-pool-probe Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.8 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.8 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.8 ToolInvocation=0.0]
+  admission: admitted by BOOTSTRAP_ADMITTED (transition bridge)
+>>> [2026-09-10T07:49:38Z] Grading Task: security-overgrant-remediation-proposal (./tasks/security-overgrant-remediation-proposal/task.yaml) x3 <<<
+Task security-overgrant-remediation-proposal Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.8 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.8 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.8 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2026-09-10T07:49:39Z] Grading Task: obtainability-pdb-semantics (./tasks/obtainability-pdb-semantics/task.yaml) x3 <<<
+Task obtainability-pdb-semantics Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2026-09-10T07:49:39Z] Grading Task: obtainability-fleet-exposure-sweep (./tasks/obtainability-fleet-exposure-sweep/task.yaml) x3 <<<
+Task obtainability-fleet-exposure-sweep Result: [UNSTABLE] passed 1 of 3 repetitions (not admitted, so it cannot collapse)
+  deployer: noop
+  rep 1: fail -- VerificationCorrectness=0.0 (floor 1.0) -- the-sweep-names-the-workload-it-was-not-told: required phrases absent from the report: ['checkout-gateway']; none of the alternative phrasings present: ['PodDisruptionBudget', 'PDB']; the-sweep-locates-the-finding: required phrases absent from the report: ['seeded-reliability'] [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: fail -- VerificationCorrectness=0.0 (floor 1.0) -- the-sweep-names-the-workload-it-was-not-told: required phrases absent from the report: ['checkout-gateway']; none of the alternative phrasings present: ['PodDisruptionBudget', 'PDB']; the-sweep-locates-the-finding: required phrases absent from the report: ['seeded-reliability'] [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2026-09-10T07:49:39Z] Grading Task: obtainability-healthy-namespace-silence (./tasks/obtainability-healthy-namespace-silence/task.yaml) x3 <<<
+Task obtainability-healthy-namespace-silence Result: [UNSTABLE] passed 0 of 3 repetitions (not admitted, so it cannot collapse)
+  deployer: noop
+  rep 1: fail -- VerificationCorrectness=0.0 (floor 1.0) -- report-confirms-no-missing-pdb-findings: required phrases absent from the report: ['missing-PDB findings: 0'] [OutcomeScore=0.0 OutcomeValidity=0.3 ToolInvocation=0.0]
+  rep 2: fail -- VerificationCorrectness=0.0 (floor 1.0) -- report-confirms-no-missing-pdb-findings: required phrases absent from the report: ['missing-PDB findings: 0'] [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  rep 3: fail -- VerificationCorrectness=0.0 (floor 1.0) -- report-confirms-no-missing-pdb-findings: required phrases absent from the report: ['missing-PDB findings: 0'] [OutcomeScore=0.0 OutcomeValidity=0.2 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2026-09-10T07:49:39Z] Grading Task: obtainability-remediation-proposal (./tasks/obtainability-remediation-proposal/task.yaml) x3 <<<
+Task obtainability-remediation-proposal Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: admitted by BOOTSTRAP_ADMITTED (transition bridge)
+>>> [2026-09-10T07:49:40Z] Grading Task: rca-remediation-pr (./tasks/rca-remediation-pr/task.yaml) x3 <<<
+Task rca-remediation-pr Result: [UNSTABLE] passed 1 of 3 repetitions (not admitted, so it cannot collapse)
+  deployer: noop
+  rep 1: fail -- VerificationCorrectness=0.0 (floor 1.0) -- a-pull-request-was-opened-and-linked: required phrases absent from the report: ['github.com/', '/pull/']; rca-names-the-planted-cause: required phrases absent from the report: ['OOMKilled'] [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: fail -- VerificationCorrectness=0.0 (floor 1.0) -- a-pull-request-was-opened-and-linked: required phrases absent from the report: ['github.com/', '/pull/']; rca-names-the-planted-cause: required phrases absent from the report: ['payments-api', 'OOMKilled'] [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2026-09-10T07:49:40Z] Grading Task: compliance-rbac-overgrant (./tasks/compliance-rbac-overgrant/task.yaml) x3 <<<
+Task compliance-rbac-overgrant Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.5 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.2 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.6 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2026-09-10T07:49:40Z] Grading Task: cluster-agent-crashloop-debug (./tasks/cluster-agent-crashloop-debug/task.yaml) x3 <<<
+Task cluster-agent-crashloop-debug Result: [UNSTABLE] passed 2 of 3 repetitions
+  deployer: noop
+  rep 1: fail -- VerificationCorrectness=0.0 (floor 1.0) -- rca-names-the-oom: required phrases absent from the report: ['payments-api', 'OOMKilled'] [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: admitted by BOOTSTRAP_ADMITTED (transition bridge)
+>>> [2026-09-10T07:49:41Z] Grading Task: cluster-agent-crashloop-misleading-symptom (./tasks/cluster-agent-crashloop-misleading-symptom/task.yaml) x3 <<<
+Task cluster-agent-crashloop-misleading-symptom Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: admitted by BOOTSTRAP_ADMITTED (transition bridge)
+>>> [2026-09-10T07:49:41Z] Grading Task: cluster-agent-crashloop-evidence-chain (./tasks/cluster-agent-crashloop-evidence-chain/task.yaml) x3 <<<
+Task cluster-agent-crashloop-evidence-chain Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: admitted by BOOTSTRAP_ADMITTED (transition bridge)
+>>> [2026-09-10T07:49:41Z] Grading Task: cluster-agent-healthy-workload-no-finding (./tasks/cluster-agent-healthy-workload-no-finding/task.yaml) x3 <<<
+Task cluster-agent-healthy-workload-no-finding Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2026-09-10T07:49:41Z] Grading Task: agent-kanban-smoke (./tasks/agent-kanban-smoke/task.yaml) x3 <<<
+Task agent-kanban-smoke Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.5]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.5]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.5]
+  admission: admitted by BOOTSTRAP_ADMITTED (transition bridge)
+>>> [2026-09-10T07:49:42Z] Grading Task: obtainability-planted-pdb (./tasks/obtainability-planted-pdb/task.yaml) x3 <<<
+Task obtainability-planted-pdb Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.2 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.3 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.2 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2026-09-10T07:49:42Z] Grading Task: stockout-pinned-pool (./tasks/stockout-pinned-pool/task.yaml) x3 <<<
+Task stockout-pinned-pool Result: [UNSTABLE] passed 0 of 3 repetitions (not admitted, so it cannot collapse)
+  deployer: noop
+  rep 1: fail -- VerificationCorrectness=0.5 (floor 1.0) -- a-finding-was-filed-against-the-planted-pool: required phrases absent from the 5 finding id(s) on gke-agentic/kube-agents-evals-10-infra#14: ['pinned-inference-pool'] [OutcomeScore=0.5 OutcomeValidity=0.0 ToolInvocation=0.0]
+  rep 2: fail -- VerificationCorrectness=0.5 (floor 1.0) -- ledger-names-the-live-backlog: none of the alternative phrasings present in the body of gke-agentic/kube-agents-evals-10-infra#14: ['unschedulable', 'pending pod', 'pods pending', 'are pending', 'in pending'] [OutcomeScore=0.5 OutcomeValidity=0.0 ToolInvocation=0.0]
+  rep 3: fail -- VerificationCorrectness=0.0 (floor 1.0) -- a-finding-was-filed-against-the-planted-pool: the run's report names no github.com issue URL, so no ledger was published (or the audit did not report the one it wrote); every non-silent fleet-audit report must carry issue_url in full; ledger-names-the-live-backlog: the run's report names no github.com issue URL, so no ledger was published (or the audit did not report the one it wrote); every non-silent fleet-audit report must carry issue_url in full [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2026-09-10T07:49:42Z] Grading Task: upgrade-readiness-lagging-cluster (./tasks/upgrade-readiness-lagging-cluster/task.yaml) x3 <<<
+Task upgrade-readiness-lagging-cluster Result: [UNSTABLE] passed 2 of 3 repetitions (not admitted, so it cannot collapse)
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.8 ToolInvocation=0.0]
+  rep 2: fail -- VerificationCorrectness=0.6666666666666666 (floor 1.0) -- a-master-behind-finding-was-filed: required phrases absent from the 5 finding id(s) on gke-agentic/kube-agents-evals-10-infra#29: ['master-behind'] [OutcomeScore=0.6666666666666666 OutcomeValidity=0.3 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.7 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2026-09-10T07:49:43Z] Grading Task: consistency-drift-outlier (./tasks/consistency-drift-outlier/task.yaml) x3 <<<
+Task consistency-drift-outlier Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.3 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.8 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=0.5 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2026-09-10T07:49:43Z] Grading Task: obtainability-direct-query (./tasks/obtainability-direct-query/task.yaml) x3 <<<
+Task obtainability-direct-query Result: [UNSTABLE] passed 2 of 3 repetitions (not admitted, so it cannot collapse)
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: fail -- VerificationCorrectness=0.0 (floor 1.0) -- report-identifies-missing-pdb: required phrases absent from the report: ['checkout-gateway']; none of the alternative phrasings present: ['PodDisruptionBudget', 'PDB', 'disruption budget']; report-explains-drain-risk: none of the alternative phrasings present: ['drain', 'voluntary disruption', 'eviction', 'downtime'] [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2026-09-10T07:49:43Z] Grading Task: gpu-stress-test-diagnosis (./tasks/gpu-stress-test-diagnosis/task.yaml) x3 <<<
+Task gpu-stress-test-diagnosis Result: [UNSTABLE] passed 2 of 3 repetitions (not admitted, so it cannot collapse)
+  deployer: tofu
+  rep 1: fail -- VerificationCorrectness=0.0 (floor 1.0) -- report-names-the-storage-bottleneck: none of the alternative phrasings present: ['gcs fuse', 'gcsfuse']; report-names-the-autoscaling-limit: none of the alternative phrasings present: ['HPA', 'HorizontalPodAutoscaler'] [OutcomeScore=0.0 OutcomeValidity=0.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+>>> [2026-09-10T07:49:43Z] Grading Task: autoops-warning-event-triage (./tasks/autoops-warning-event-triage/task.yaml) x3 <<<
+Task autoops-warning-event-triage Result: [RESOURCE_PREPARATION_FAILED] all 3 repetition(s) failed on infrastructure before the case could be evaluated
+  deployer: tofu
+  rep 1: infra -- the run died provisioning, before any agent ran (command failed with exit code 1: tofu apply -auto-approve -input=false -var incident_namespace=eval-autoops-incident -var workload_name=eval-incident-workload -var memory_limit_mib=64 -var allocate_mib=96 -var project_id=kube-agents-evals-10); deployer=tofu had infrastructure to fail on, so this is resource preparation, not the pull request
+  rep 2: infra -- the run died provisioning, before any agent ran (command failed with exit code 1: tofu apply -auto-approve -input=false -var incident_namespace=eval-autoops-incident -var workload_name=eval-incident-workload -var memory_limit_mib=64 -var allocate_mib=96 -var project_id=kube-agents-evals-10); deployer=tofu had infrastructure to fail on, so this is resource preparation, not the pull request
+  rep 3: infra -- the run died provisioning, before any agent ran (command failed with exit code 1: tofu apply -auto-approve -input=false -var incident_namespace=eval-autoops-incident -var workload_name=eval-incident-workload -var memory_limit_mib=64 -var allocate_mib=96 -var project_id=kube-agents-evals-10); deployer=tofu had infrastructure to fail on, so this is resource preparation, not the pull request
+  admission: the run carries no version key, so no baseline matches it
+>>> [2026-09-10T07:49:44Z] Grading Task: knowledge-grounding-sources-probe (./tasks/knowledge-grounding-sources-probe/task.yaml) x3 <<<
+Task knowledge-grounding-sources-probe Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.0]
+  admission: no screening evidence for this case yet
+Release-candidate run (RC_COMMIT_SHA=5b5ad10163cf10c73871b279518c7165c098bec9): the baseline store is read, never written — the candidate is judged against main's window, not added to it.
+## Evaluation verdict
+**GREEN**
+Admitted-case pass rate: 90.0% (no baseline at the current version key -- advisory)
+| Case | Domain | Verdict | Passes | Detail |
+| --- | --- | --- | --- | --- |
+| `reliability-pdb-probe` | reliability | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `capacity-pinned-pool-probe` | capacity | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `security-overgrant-probe` | security | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `upgrades-lagging-master-probe` | upgrades | UNSTABLE (rung 7) | 2/3 | passed 2 of 3 repetitions |
+| `consistency-authorized-networks-probe` | consistency | UNSTABLE (rung 7) | 2/3 | passed 2 of 3 repetitions |
+| `cost-idle-pool-probe` | cost | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `security-overgrant-remediation-proposal` | security | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `obtainability-pdb-semantics` | reliability | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `obtainability-fleet-exposure-sweep` | reliability | UNSTABLE (rung 7) | 1/3 | passed 1 of 3 repetitions (not admitted, so it cannot collapse) |
+| `obtainability-healthy-namespace-silence` | reliability | UNSTABLE (rung 7) | 0/3 | passed 0 of 3 repetitions (not admitted, so it cannot collapse) |
+| `obtainability-remediation-proposal` | reliability | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `rca-remediation-pr` | remediation | UNSTABLE (rung 7) | 1/3 | passed 1 of 3 repetitions (not admitted, so it cannot collapse) |
+| `compliance-rbac-overgrant` | fleet-audits | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `cluster-agent-crashloop-debug` | cluster-debugging | UNSTABLE (rung 7) | 2/3 | passed 2 of 3 repetitions |
+| `cluster-agent-crashloop-misleading-symptom` | cluster-debugging | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `cluster-agent-crashloop-evidence-chain` | cluster-debugging | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `cluster-agent-healthy-workload-no-finding` | cluster-debugging | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `agent-kanban-smoke` | chat-and-routing | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `obtainability-planted-pdb` | reliability | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `stockout-pinned-pool` | capacity | UNSTABLE (rung 7) | 0/3 | passed 0 of 3 repetitions (not admitted, so it cannot collapse) |
+| `upgrade-readiness-lagging-cluster` | upgrades | UNSTABLE (rung 7) | 2/3 | passed 2 of 3 repetitions (not admitted, so it cannot collapse) |
+| `consistency-drift-outlier` | consistency | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+| `obtainability-direct-query` | reliability | UNSTABLE (rung 7) | 2/3 | passed 2 of 3 repetitions (not admitted, so it cannot collapse) |
+| `gpu-stress-test-diagnosis` | -- | UNSTABLE (rung 7) | 2/3 | passed 2 of 3 repetitions (not admitted, so it cannot collapse) |
+| `autoops-warning-event-triage` | incident-triage | RESOURCE_PREPARATION_FAILED (rung 99) | 0/0 | all 3 repetition(s) failed on infrastructure before the case could be evaluated |
+| `knowledge-grounding-sources-probe` | -- | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+=== [2026-09-10T07:49:44Z] PR Smoke Test Evaluation Succeeded (Total Duration: 15006s) ===
+eval-dashboard publish skipped: RC_COMMIT_SHA=5b5ad10163cf10c73871b279518c7165c098bec9 is set: a release-candidate run measures a candidate, it does not report main's history
+======================================================================
+🏷️ RELEASE CANDIDATE EVAL
+Candidate:   staging_2609092307_5b5ad10 (5b5ad10163cf10c73871b279518c7165c098bec9)
+Tier:        nightly
+Verdict:     GREEN (advisory: this lane gates nothing)
+Artifacts:   https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/2097891568546484224
+======================================================================
+rc eval summary: /logs/artifacts/rc-eval-summary.md

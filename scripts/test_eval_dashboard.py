@@ -423,6 +423,149 @@ class ReasonSignatureTest(unittest.TestCase):
         self.assertIn(f'"{render.SIG_NEVER_RAN}"]', tmpl)
 
 
+RC_TASKS = [{"name": f"case-{n}", "result": "pass" if n < 15 else "fail"} for n in range(25)]
+RC_TASKS.append({"name": "case-infra", "result": "infra"})
+
+# The real post-kube-agents-eval-rc build the collector fixture is built from
+# (scripts/eval_dashboard/testdata_rc/), reduced to the releases[] record.
+RC_RELEASE = {
+    "build_id": "2097891568546484224",
+    "rc_tag": "staging_2609092307_5b5ad10",
+    "commit": "5b5ad10",
+    "tier": "nightly",
+    "verdict": "GREEN",
+    "result": "SUCCESS",
+    "started": "2026-09-10T03:35:01+00:00",
+    "finished": "2026-09-10T07:51:10+00:00",
+    "duration_s": 15006,
+    "project": "kube-agents-evals-10",
+    "artifacts_url": "https://oss.gprow.dev/view/gs/kube-agents-prow/logs/"
+                     "post-kube-agents-eval-rc/2097891568546484224",
+    "pass_rate": 0.9,
+    "baseline_rate": None,
+    "margin": None,
+    "tasks": RC_TASKS,
+}
+
+
+def releases_section(app):
+    return app.split('<h2 id="release">', 1)[1]
+
+
+class ReleasesSectionTest(unittest.TestCase):
+    """The Releases band: releases[] is optional and additive, so every state
+    a real data.json can reach has to render -- absent, populated, and the
+    half-parsed record a driver that died before its banner leaves behind."""
+
+    def render_with(self, releases, runs=None):
+        data = {
+            "schema_version": 1, "generated_at": "2026-09-10T12:00:00Z",
+            "source": "logs", "cases": [], "releases": releases,
+            # One run so the page is not the global "no evaluation data yet"
+            # state, which owns the whole <div id="app"> and has no bands.
+            "runs": [{"build_id": "b1", "pr": 1, "started": "2026-09-01T10:00:00Z",
+                      "finished": "2026-09-01T11:00:00Z", "result": "SUCCESS",
+                      "duration_s": 3600, "tasks": []}] if runs is None else runs,
+        }
+        html, _, tmp = render_fixture(data)
+        self.addCleanup(tmp.cleanup)
+        return baked_app(html)
+
+    def test_absent_releases_keeps_the_empty_state(self):
+        app = self.render_with([])
+        self.assertIn("No RC in the gate window", app)
+        self.assertNotIn('id="releases"', app)
+
+    def test_a_release_alone_is_enough_to_render_the_page(self):
+        """runs[] and releases[] are swept independently, so an armed RC glob
+        with an empty presubmit window must not read as "no data yet"."""
+        app = self.render_with([RC_RELEASE], runs=[])
+        self.assertNotIn('id="empty-state"', app)
+        self.assertIn("staging_2609092307_5b5ad10", releases_section(app))
+
+    def test_neither_runs_nor_releases_is_still_the_global_empty_state(self):
+        app = self.render_with([], runs=[])
+        self.assertIn('id="empty-state"', app)
+        self.assertNotIn('<h2 id="release">', app)
+
+    def test_real_rc_row(self):
+        section = releases_section(self.render_with([RC_RELEASE]))
+        self.assertNotIn("No RC in the gate window", section)
+        self.assertIn(f'href="{RC_RELEASE["artifacts_url"]}"', section)
+        self.assertIn("staging_2609092307_5b5ad10", section)
+        self.assertIn("5b5ad10 · build 2097891568546484224", section)
+        self.assertIn(">nightly<", section)
+        self.assertIn('<span class="pill p-pass">GREEN</span>', section)
+        self.assertIn("90.0%", section)
+        self.assertIn("baselines maturing", section)
+        self.assertIn("15/25", section)  # infra case excluded from the denominator
+        self.assertIn("1 infra excluded", section)
+        self.assertIn("2026-09-10 03:35 UTC", section)
+        self.assertIn("4h10m", section)  # the eval's own duration, not the pod's
+
+    def test_a_measured_baseline_renders_the_margin_with_its_sign(self):
+        red = dict(RC_RELEASE, verdict="RED", pass_rate=0.885,
+                   baseline_rate=0.91, margin=-0.025)
+        section = releases_section(self.render_with([red]))
+        self.assertIn('<span class="pill p-fail">RED</span>', section)
+        self.assertIn("88.5%", section)
+        self.assertIn("main 91.0%", section)
+        self.assertIn("margin −2.5pt", section)
+        self.assertNotIn("baselines maturing", section)
+
+    def test_a_run_with_no_banner_says_so_rather_than_implying_a_pass(self):
+        blank = {"build_id": "42", "rc_tag": None, "commit": None, "tier": None,
+                 "verdict": None, "result": "FAILURE",
+                 "started": "2026-09-10T03:35:01+00:00", "finished": None,
+                 "duration_s": None, "project": None, "artifacts_url": None,
+                 "pass_rate": None, "baseline_rate": None, "margin": None, "tasks": []}
+        section = releases_section(self.render_with([blank]))
+        self.assertIn("unknown candidate", section)
+        self.assertIn("no eval banner · job FAILURE", section)
+        self.assertIn('<span class="pill p-infra">NO VERDICT</span>', section)
+        self.assertNotIn("p-pass", section)
+
+    def test_a_non_https_artifacts_url_never_becomes_a_link(self):
+        """The URL is scraped out of a build log, so it is untrusted input."""
+        hostile = dict(RC_RELEASE, artifacts_url="javascript:alert(1)")
+        section = releases_section(self.render_with([hostile]))
+        self.assertNotIn("<a ", section)
+        self.assertNotIn("javascript:", section)
+
+    def test_the_table_is_capped_at_the_shared_row_limit(self):
+        many = [dict(RC_RELEASE, build_id=str(2000 + n),
+                     started=f"2026-09-{n + 1:02d}T03:35:01+00:00")
+                for n in range(render.RELEASES_MAX_ROWS + 4)]
+        section = releases_section(self.render_with(many))
+        self.assertEqual(section.count("<tr><td"), render.RELEASES_MAX_ROWS)
+        # Newest first: the last-started build survives the cap, the first does not.
+        self.assertIn(f"build {many[-1]['build_id']}<", section)
+        self.assertNotIn(f"build {many[0]['build_id']}<", section)
+
+    def test_malformed_releases_degrade_instead_of_aborting_the_render(self):
+        app = self.render_with(["nonsense", 7, None, {"build_id": "9"}])
+        self.assertIn('id="releases"', app)
+        self.assertIn("unknown candidate", app)
+
+    def test_a_retyped_releases_field_falls_back_to_the_empty_state(self):
+        self.assertIn("No RC in the gate window", self.render_with("soon"))
+
+    def test_the_js_mirror_carries_the_releases_renderer(self):
+        # Same trap as the Pareto signatures above: the page re-renders from
+        # data.json every 60s, so a Releases section that exists only in
+        # render.py reverts to the placeholder on the first poll.
+        tmpl = (
+            pathlib.Path(__file__).resolve().parent
+            / "eval_dashboard" / "template" / "index.html.tmpl"
+        ).read_text()
+        self.assertIn("function releasesHtml(", tmpl)
+        self.assertIn("evidenceHtml(data) + releasesHtml(data)", tmpl)
+        self.assertIn(f"releasesMaxRows: {render.RELEASES_MAX_ROWS}", tmpl)
+        self.assertIn(f'releaseUrlScheme: "{render.RELEASE_URL_SCHEME}"', tmpl)
+        for verdict, cls in render.RELEASE_VERDICT_CLASS.items():
+            self.assertIn(cls, tmpl, f"{verdict} class missing from the JS mirror")
+
+
 class RenderToleranceTest(unittest.TestCase):
     def test_empty_data_renders_designed_empty_state(self):
         data = {"schema_version": 1, "generated_at": "2026-08-28T14:02:11Z",

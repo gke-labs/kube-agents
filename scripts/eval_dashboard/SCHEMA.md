@@ -182,6 +182,55 @@ Additive, optional, and safe to omit — consumers must default them.
   `first_seen` is more than 2 days old (`PENDING_RETRY_DAYS` — a build
   unfinished that long is a pod that died without uploading). Omitted when
   empty; a malformed value is ignored with a warning, never a crash.
+- `releases[]` — release-candidate eval runs, **newest first**, at most 20
+  (`RC_RELEASES_MAX`). Omitted when there are none. Collected from
+  `--rc-glob` / `--rc-from-dir`, which point at `post-kube-agents-eval-rc`:
+  the postsubmit that runs the same `hack/ci-eval-pr.sh` against a staging
+  tag's own images. **They are never in `runs[]`**, because `runs[]` feeds
+  `cases[]` and a candidate is judged against main's window rather than
+  added to it (`hack/ci-eval-rc.sh`: "the baseline store is read, never
+  written").
+
+```json
+{
+  "build_id": "2097891568546484224",
+  "rc_tag": "staging_2609092307_5b5ad10",
+  "commit": "5b5ad10",
+  "tier": "nightly",
+  "verdict": "GREEN|RED|NOT RUN|null",
+  "result": "SUCCESS|FAILURE|ABORTED",
+  "started": "<iso8601>",
+  "finished": "<iso8601>",
+  "duration_s": 15006,
+  "project": "kube-agents-evals-10",
+  "artifacts_url": "https://oss.gprow.dev/view/gs/...",
+  "pass_rate": 0.9,
+  "baseline_rate": null,
+  "margin": null,
+  "tasks": []
+}
+```
+
+- `rc_tag`, `commit`, `tier`, `verdict`, `artifacts_url` — from the banner
+  `hack/ci-eval-rc.sh` prints once per run. All `null` when the banner is
+  absent, which means the driver exited on one of its early guards and
+  measured nothing; the entry is still emitted, because a resolver broken
+  for a month must not read as a month with no releases. `artifacts_url` is
+  additionally `null` for a run outside Prow.
+- `verdict` — the eval's, which is **not** the job's: the lane is advisory,
+  so a `RED` candidate still leaves a `SUCCESS` in `result`. `NOT RUN` is
+  the deploy-failed path — nothing was measured, so it is not a judgement
+  on the candidate.
+- `pass_rate` / `baseline_rate` / `margin` — fractions in `0..1` (`margin`
+  may be negative), from `bench-gate suite`'s `Admitted-case pass rate:`
+  line. `baseline_rate` and `margin` are `null` while the baseline store
+  holds nothing at the candidate's version key, which is what makes the
+  non-inferiority number advisory; the renderer labels it so.
+- `tasks` — the same shape as `runs[].tasks`, parsed by the same code.
+- Collection is bounded by build id, not by a watermark: the newest
+  `--rc-limit` (default 20) ids are read, minus any the `--merge-with`
+  prior already covers. A recorded release is final, so a carried-forward
+  entry is never re-read.
 
 ### Optional run and task fields
 
@@ -213,6 +262,10 @@ what the renderer does with them.
   `gsutil ls`, read with `gsutil cat`. **Read-only.**
 - `--from-dir <dir>` — local `<build_id>/` subdirectories with the same
   three files; the offline/testing path.
+- `--rc-glob <gs glob>` (repeatable) / `--rc-from-dir <dir>` — the same two
+  shapes for `post-kube-agents-eval-rc`, collected into `releases[]` rather
+  than `runs[]`. `--rc-limit <n>` (default 20) bounds how many builds per
+  glob are read, newest first.
 
 ### Incremental collection (the output stays schema v1; it may add the optional `pending_builds`)
 
@@ -338,6 +391,19 @@ token observed in the wild (`pass`, `fail`, `infra`, `blocked`):
 | 2094432646640701440 | PR 1057 — parallel fan-out, green, one infra rep |
 | 2094467976156680192 | PR 1075 — serial markers, aborted mid-task       |
 | 2094714569262895104 | PR 1089 — blocked/infra-heavy, >300-char reasons |
+
+`testdata_rc/` holds one **real** `post-kube-agents-eval-rc` build — the
+release-candidate job, which is a postsubmit, so its `started.json` carries no
+`pull` key and its log carries no PR number:
+
+| build               | why it is here                                        |
+| ------------------- | ----------------------------------------------------- |
+| 2097891568546484224 | `staging_2609092307_5b5ad10` — GREEN, no baseline yet |
+
+It is the fixture for `releases[]`, and it keeps both banners the driver
+prints: `resolve-rc-target.sh`'s `RELEASE CANDIDATE EVAL TARGET` near the top
+and `ci-eval-rc.sh`'s `RELEASE CANDIDATE EVAL` at the end. A substring match
+opens the parse on the first one, so the decoy stays in the fixture.
 
 `testdata_health/data.json.gz` is a **real** published `data.json` reduced by
 `health.py --trim` (and gzip-compressed, which `health.py --data` reads by
