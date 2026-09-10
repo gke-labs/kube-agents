@@ -13,8 +13,14 @@ projects, the seeded fleet, Prow and the workflows. Exempt: docs, CI, that infra
 bench harness itself (`bench/kube_agents_bench/`, `hack/ci-eval-pr.sh`). An exempt change says so
 in one line under **Live validation** in the pull request body.
 
-The loop needs a dev project with kube-agents installed ([`INSTALL.md`](../../INSTALL.md)) and,
-for cases with `fixtures:`, the seeded fleet applied to it once
+The loop needs a dev project with kube-agents installed ([`INSTALL.md`](../../INSTALL.md)),
+refreshed to the commit under test: build the images with `deploy/docker/cloudbuild-ci.yaml`
+(`gcloud builds submit` in your project, as `hack/ci-deploy.sh` does), then point the install at
+them (`make -C k8s-operator install` and `deploy IMG=...`, then the `PlatformAgent` CR's image
+and tag, as [`scripts/dev/dev_rebuild_agent.sh`](../../scripts/dev/dev_rebuild_agent.sh) does;
+INSTALL.md "Method 3" is the local-iteration path). `hack/ci-deploy.sh` itself is the presubmit's path and assumes its
+secrets. For cases that read the seeded fleet, whether through `fixtures:` or by naming
+`seeded-a`/`-b`/`-c` directly, the fleet must be applied to the dev project once
 ([`bench/tf/fleet/README.md`](../../bench/tf/fleet/README.md)). Every contributor, human or
 agent, is expected to have one. There is no path around the loop: a pull request that changes
 agent behaviour without eval evidence is not ready for review.
@@ -25,23 +31,28 @@ agent behaviour without eval evidence is not ready for review.
 `bench/tasks/<id>/task.yaml`, or a new one written to the case format
 ([`bench/CONTRIBUTING.md`](../../bench/CONTRIBUTING.md),
 [`docs/designs/bench-case-format.md`](../../docs/designs/bench-case-format.md),
-`make bench-case-check`). Run it against an install of current `main` the way the presubmit does
-(`hack/ci-eval-pr.sh`), without `--no-infra`, which skips the deterministic checks and can produce
-neither a red nor a green:
+`make bench-case-check`). Run it against your dev install of current `main` with the exports the
+presubmit uses (`hack/ci-eval-pr.sh`), without `--no-infra`, which skips the deterministic checks
+and can produce neither a red nor a green:
 
 ```bash
 cd bench && uv sync
 export PROJECT_ID=<gcp project> CLUSTER_NAME=<cluster> AGENT_CLUSTER_CONTEXT=<kubectl context>
 export BENCH_TF_ROOT=./tf
-PLATFORM_AGENT_TOKEN=$(kubectl get secret platform-agent-secrets -n <namespace> \
-  -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode) \
-  JUDGE_PROVIDER=<provider> JUDGE_MODEL=<model> \
+export GCP_PROJECT_ID="$PROJECT_ID"   # the judge: Vertex AI through your gcloud ADC, as in CI
+PLATFORM_AGENT_TOKEN=$(kubectl --context "$AGENT_CLUSTER_CONTEXT" get secret platform-agent-secrets \
+  -n kubeagents-system -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode) \
+  JUDGE_PROVIDER=google JUDGE_MODEL=gemini-3.1-pro-preview \
   uv run devops-bench ./tasks/<id> --agent-type kubeagents
 ```
 
-A case with `fixtures:` reads the seeded fleet: with the fleet applied in your dev project, run
+Without `GCP_PROJECT_ID` the judge fails to construct (`No API key was provided`); the eval
+still needs the judge even though only the deterministic checks decide.
+
+A case that reads the seeded fleet needs it in your dev project: run
 [`hack/fleet-kubeconfigs.sh`](../../hack/fleet-kubeconfigs.sh) and export
-`BENCH_FLEET_KUBECONFIG_DIR` first, or its fleet checks report `error`, which is broken, not red.
+`BENCH_FLEET_KUBECONFIG_DIR` first. Without the fleet the case fails every time with the fleet
+phrases absent, which is broken, not red.
 
 It must fail, and fail for the reason your change addresses. Keep the failing entry from
 `verification_report[]` in the run's `results.json` (its `status` and `reason`) and the line of the
