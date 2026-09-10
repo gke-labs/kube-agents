@@ -9,6 +9,15 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+# The human-readable transcript written beside the JSONL record.
+TRANSCRIPT_FILENAME = "conversation.txt"
+# Column width of the transcript's rules and message boxes.
+TRANSCRIPT_WIDTH = 78
+# Longest rendering of one evidence request/analysis or artifact manifest;
+# the JSONL beside the transcript holds the untruncated value.
+EVIDENCE_PREVIEW_LINES = 40
+ARTIFACT_PREVIEW_LINES = 60
+
 
 @dataclass
 class EvidenceLog:
@@ -44,10 +53,11 @@ class EvidenceLog:
 
         def block(role: str, subtitle: str, body: str) -> list[str]:
             head = f"{role}" + (f"  ({subtitle})" if subtitle else "")
+            top = f"┌─ {head} "
             return [
-                f"┌─ {head} " + "─" * max(0, 74 - len(head)),
+                top + "─" * max(0, TRANSCRIPT_WIDTH - len(top)),
                 *[f"│ {line}" for line in (body or "(empty)").splitlines()],
-                "└" + "─" * 77,
+                "└" + "─" * (TRANSCRIPT_WIDTH - 1),
                 "",
             ]
 
@@ -56,7 +66,7 @@ class EvidenceLog:
         status = str(interaction.get("status") or "unknown")
         lines = [
             "CHAT",
-            "=" * 78,
+            "=" * TRANSCRIPT_WIDTH,
             "",
             *block("USER", str(interaction.get("sessionId") or ""), request.strip()),
             *block(
@@ -69,7 +79,7 @@ class EvidenceLog:
 
         tasks = [t for t in interaction.get("tasks") or [] if isinstance(t, dict)]
         if tasks:
-            lines += ["AGENT WORK", "=" * 78, ""]
+            lines += ["AGENT WORK", "=" * TRANSCRIPT_WIDTH, ""]
         for task in tasks:
             lines.append(
                 f"  {task.get('assignee', 'unassigned')} · {task.get('status')}"
@@ -93,13 +103,19 @@ class EvidenceLog:
                     rendered = json.dumps(value or {}, indent=2, sort_keys=True)
                     lines += [
                         f"        {label}:",
-                        *[f"        {row}" for row in rendered.splitlines()[:40]],
+                        *[
+                            f"        {row}"
+                            for row in rendered.splitlines()[:EVIDENCE_PREVIEW_LINES]
+                        ],
                     ]
             for item in task.get("artifacts") or []:
                 manifest = item.get("manifest") or {}
                 rendered = json.dumps(manifest, indent=2, sort_keys=True)
                 lines.append(f"    · artifact {item.get('type')}")
-                lines += [f"        {row}" for row in rendered.splitlines()[:60]]
+                lines += [
+                    f"        {row}"
+                    for row in rendered.splitlines()[:ARTIFACT_PREVIEW_LINES]
+                ]
             if task.get("result"):
                 lines += [
                     "    · report delivered to the user (also folded into the "
@@ -107,7 +123,7 @@ class EvidenceLog:
                 ]
             lines.append("")
 
-        path = self.root / "conversation.txt"
+        path = self.root / TRANSCRIPT_FILENAME
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return path
 
