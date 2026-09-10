@@ -172,18 +172,18 @@ Layout). Read the file that covers what you are writing before you write it.
 Every fact has one home. Duplicating documentation across files is how it goes stale, so before
 adding a paragraph, check whether the topic already has an owner:
 
-| Content                                                  | Canonical home                               |
-| -------------------------------------------------------- | -------------------------------------------- |
-| User-facing narrative, how-to, and reference             | `docs/site/src/content/docs/`                |
-| End-state architecture                                   | `docs/architecture/`                         |
-| Per-feature design rationale                             | `docs/designs/`                              |
-| Shared installer defaults and the `install.env` model    | `scripts/installer/README.md`                |
-| Which container images an install pulls, and their pins  | `images.json`                                |
-| The install procedure (self-contained, agent-executable) | `INSTALL.md`                                 |
-| The commands behind this file's pull-request rules       | `docs/pull-request-workflow.md`              |
-| What the agent is and is not permitted to do             | the site's `reference/security-and-iam.md`   |
-| How to develop a specific directory                      | that directory's `README.md` (keep it short) |
-| Rules an agent follows, by family (code, CI, pre-PR, evals) | `.agents/rules/`                          |
+| Content                                                     | Canonical home                               |
+| ----------------------------------------------------------- | -------------------------------------------- |
+| User-facing narrative, how-to, and reference                | `docs/site/src/content/docs/`                |
+| End-state architecture                                      | `docs/architecture/`                         |
+| Per-feature design rationale                                | `docs/designs/`                              |
+| Shared installer defaults and the `install.env` model       | `scripts/installer/README.md`                |
+| Which container images an install pulls, and their pins     | `images.json`                                |
+| The install procedure (self-contained, agent-executable)    | `INSTALL.md`                                 |
+| The commands behind this file's pull-request rules          | `docs/pull-request-workflow.md`              |
+| What the agent is and is not permitted to do                | the site's `reference/security-and-iam.md`   |
+| How to develop a specific directory                         | that directory's `README.md` (keep it short) |
+| Rules an agent follows, by family (code, CI, pre-PR, evals) | `.agents/rules/`                             |
 
 Rules:
 
