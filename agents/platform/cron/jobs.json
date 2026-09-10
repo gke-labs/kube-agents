@@ -127,6 +127,20 @@
       "deliver": "all"
     },
     {
+      "id": "gcp-recommender-audit",
+      "name": "GCP Recommender & Advisory Ingest",
+      "schedule": {
+        "kind": "cron",
+        "expr": "10 8 * * *",
+        "display": "10 8 * * *"
+      },
+      "prompt": "Run the daily GCP Recommender and GKE diagnosis audit. Read the SOP at 'governance/gcp_recommender_sop.md' in your profile home — all 135 lines of it, before you run anything. Its two checks are section 2, lines 31-50, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
+      "skills": ["fleet-audit"],
+      "risk": "low",
+      "enabled": true,
+      "deliver": "all"
+    },
+    {
       "id": "findings-morning-nudge",
       "name": "Findings Queue Morning Nudge",
       "schedule": {

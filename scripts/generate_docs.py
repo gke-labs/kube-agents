@@ -123,6 +123,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
         "gke-tpu-metrics-monitoring",
     ],
     "Observability": [
+        "gcp-recommender-ingest",
         "gke-basics",
         "gke-observability",
         "kube-agents-observability",
@@ -153,6 +154,7 @@ CRON_CADENCE = {
     "40 5 * * *": "Daily 05:40",
     "20 6 * * *": "Daily 06:20",
     "50 6 * * *": "Daily 06:50",
+    "10 8 * * *": "Daily 08:10",
     "50 8 * * *": "Daily 08:50",
     "0 9 * * *": "Daily 09:00",
     "20 9 * * *": "Daily 09:20",
