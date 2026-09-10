@@ -3553,6 +3553,13 @@ class TestDeclaredIntent(BaseTestCase):
                 self.assertIn("declared[0]", str(caught.exception))
                 self.assertIn("no declared-intent step", str(caught.exception))
 
+    def test_an_entry_must_be_an_object(self):
+        doc = declaring_doc()
+        for bad in ("no-hpa", ["no-hpa"], None, 7):
+            with self.subTest(entry=bad):
+                doc["declared"] = [bad]
+                self.rejects(doc, "declared[0]: expected an object")
+
     def test_the_cluster_must_be_one_this_run_read(self):
         doc = declaring_doc(skipped=[{"cluster": "dr-west", "reason": "unreachable"}])
         doc["declared"] = [make_declared(cluster="dr-west")]
@@ -3745,6 +3752,21 @@ class TestDeclaredIntent(BaseTestCase):
         self.assertIn("1 posture(s)", comment)
         self.assertIn("`acme/terraform-live:clusters/prod-us-east/payments.tf`", comment)
         self.assertIn("`payments/Deployment/api`", comment)
+
+    def test_the_clean_comment_is_row_capped_and_says_so(self):
+        doc = declaring_doc(findings=[])
+        doc["declared"] = [
+            make_declared(obj=f"Deployment/api-{n}")
+            for n in range(audit_report.MAX_DECLARED_ROWS + 5)
+        ]
+        comment = audit_report.render_clean_comment(
+            DECLARING_AUDIT, self.validate(doc), NOW
+        )
+        rows = [line for line in comment.splitlines() if "acme/terraform-live" in line]
+        self.assertEqual(len(rows), audit_report.MAX_DECLARED_ROWS)
+        self.assertIn("…and 5 more", comment)
+        self.assertIn(f"{audit_report.MAX_DECLARED_ROWS + 5} posture(s)", comment)
+        self.assertNotIn("comment truncated", comment)
 
     def test_the_clean_comment_is_unchanged_without_declarations(self):
         comment = audit_report.render_clean_comment(
