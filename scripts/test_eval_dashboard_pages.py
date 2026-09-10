@@ -12,13 +12,16 @@ America/Toronto.
 
 import contextlib
 import gzip
+import html
 import io
 import json
 import pathlib
+import re
 import shutil
 import subprocess
 import tempfile
 import unittest
+import unittest.mock
 import urllib.parse
 from datetime import timezone
 
@@ -95,6 +98,18 @@ def render_to(tmp, data, health=None, history=None, extra_args=()):
     with contextlib.redirect_stdout(io.StringIO()):
         render.main(argv)
     return root / "out"
+
+
+def strict_date_parse_page(page: pathlib.Path) -> pathlib.Path:
+    """A copy of the rendered page whose Date.parse rejects a no-colon
+    ±HHMM offset. V8 (Chrome, the only engine these tests drive) accepts
+    one; ECMA-262's date-time format does not, and the engines that follow
+    it return NaN. The copy stands in for those engines."""
+    shim = ('<script>(() => { const native = Date.parse; '
+            'Date.parse = (text) => (/[+-]\\d{4}$/.test(String(text)) ? NaN : native(text)); })();</script>')
+    copy = page.with_name(page.stem + "-strict" + page.suffix)
+    copy.write_text(page.read_text().replace("<head>", "<head>" + shim, 1))
+    return copy
 
 
 def dom_text(page: pathlib.Path, query: str = "", fragment: str = "") -> str:
@@ -447,6 +462,18 @@ class BrowserTest(unittest.TestCase):
         app = dom_text(self.index, query=query)
         self.assertIn("Mon 10:00 AM – 9:00 PM ET", app)
 
+    def test_a_no_colon_offset_in_since_scopes_the_brief_like_the_colon_form(self):
+        # 16:00+02:00 is 14:00Z and 03:00+02:00 the next day is 01:00Z: the
+        # same past window test_a_space_separated_since_is_read_as_utc opens.
+        with_colon = urllib.parse.urlencode({"cases": "cluster-agent-crashloop-debug", "since": "2026-09-07T16:00:00+02:00", "until": "2026-09-08T03:00:00+02:00"})
+        without = urllib.parse.urlencode({"cases": "cluster-agent-crashloop-debug", "since": "2026-09-07T16:00:00+0200", "until": "2026-09-08T03:00:00+0200"})
+        expected = dom_text(self.index, query=with_colon)
+        self.assertIn("Mon 10:00 AM – 9:00 PM ET", expected)
+        self.assertEqual(dom_text(self.index, query=without), expected, "in V8, which reads ±HHMM on its own")
+        strict = dom_text(strict_date_parse_page(self.index), query=without)
+        self.assertNotIn("OUTAGE · since Tue 5:00 AM ET", strict, "the parameter was dropped and the live brief rendered instead")
+        self.assertEqual(strict, expected, "in an engine that rejects ±HHMM, so parseIso must normalise it")
+
     def test_the_current_outage_opened_through_its_own_link_is_still_live(self):
         query = urllib.parse.urlencode({"cases": ",".join(CRASHLOOP_TRIO), "since": "2026-09-08T09:00:00Z"})
         for label, page in (("with history", self.index), ("without history", render_to(pathlib.Path(self.tmp.name) / "nohist-live", self.data, health=health_doc()) / "index.html")):
@@ -460,6 +487,52 @@ class BrowserTest(unittest.TestCase):
         run_app = dom_text(render_to(pathlib.Path(self.tmp.name) / "nohist-live", self.data, health=health_doc()) / "run.html", query="build=2097282860221206528")
         self.assertIn("index.html?cases=cluster-agent-crashloop-debug", run_app)
         self.assertIn("since=2026-09-08T09%3A00%3A00Z", run_app)
+
+    def test_an_incident_without_a_start_or_a_red_run_dates_nothing_from_1969(self):
+        # normalizeHealth keeps a non-GREEN state whose `since` will not
+        # parse, and a case that never failed in the window leaves no first
+        # red run: with no anchor the merge lines are dropped, not dated
+        # from epoch zero (Dec 31, 1969 ET).
+        merges = [{"sha": "abc1234", "at": "2026-09-08T08:10:00+00:00", "title": "fix(ci): the thing", "pr": 1280}]
+        with unittest.mock.patch.object(render, "recent_merges", return_value=merges):
+            out = render_to(pathlib.Path(self.tmp.name) / "nosince", self.data, health=health_doc(since="not a time", failing_cases=["never-failed-here"], recovering=True))
+            control = render_to(pathlib.Path(self.tmp.name) / "withsince", self.data, health=health_doc())
+        app = dom_text(out / "index.html")
+        self.assertIn("RECOVERING · since unknown time", app)
+        self.assertIn("What changed right before", app)
+        self.assertNotIn("Nothing merged", app)
+        # et() prints no year, so the epoch shows as "Dec 31" in ET.
+        self.assertNotIn("Dec 31", app)
+        self.assertIn("no start time on record", app)
+        self.assertIn("0 of 3 clean runs", app, "with no start there is nothing after the incident to count as recovery")
+        # The normal case still anchors on the first red run.
+        control_app = dom_text(control / "index.html")
+        self.assertIn("What changed right before", control_app)
+        self.assertNotIn("no start time on record", control_app)
+        self.assertNotIn("Dec 31", control_app)
+
+    def test_the_incident_link_carries_only_what_the_parser_reads(self):
+        # Sixty failing cases, one of them outside the id grammar: the
+        # banner's link must carry the first 50 in-grammar ids and nothing
+        # else, so following it scopes the Brief to exactly what it shows.
+        sixty = [f"case-{i:02d}" for i in range(59)]
+        sixty.insert(3, "bad case!")
+        out = render_to(pathlib.Path(self.tmp.name) / "sixty", self.data, health=health_doc(failing_cases=sixty))
+        app = dom_text(out / "run.html", query="build=2097282860221206528")
+        hrefs = re.findall(r'href="(index\.html\?cases=[^"]*)"', app)
+        self.assertEqual(len(hrefs), 1, app[:300])
+        query = urllib.parse.urlparse(html.unescape(hrefs[0])).query
+        cases = urllib.parse.parse_qs(query)["cases"][0].split(",")
+        self.assertEqual(cases, [f"case-{i:02d}" for i in range(50)])
+        self.assertNotIn("bad case!", query)
+        # And the parser reads that link back whole: 50 ids, not 49.
+        self.assertIn("50 gate cases fail", dom_text(out / "index.html", query=query))
+        # A hand-written link with more entries than the cap and an
+        # off-grammar one inside the first 50 still yields 50 in-grammar ids:
+        # the parser filters before it caps, as the writer does. (`since`
+        # names the live incident; without it the link's cases are not read.)
+        hand_written = urllib.parse.urlencode({"cases": ",".join(sixty[:51]), "since": OUTAGE_SINCE})
+        self.assertIn("50 gate cases fail", dom_text(out / "index.html", query=hand_written))
 
     def test_pr_view_outage_run(self):
         app = dom_text(self.run_page, query="build=2097282860221206528")

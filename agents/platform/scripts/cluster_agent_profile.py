@@ -47,6 +47,8 @@ SANDBOX_MIRROR = Path(
 # Comfortably past the mirror's own `--wait 30` plus one SSH round trip per
 # cluster profile, so this timeout only fires when the mirror itself is stuck.
 SANDBOX_MIRROR_TIMEOUT_SECONDS = 120
+ENV_HERMES_OTEL_ENABLED = "HERMES_OTEL_ENABLED"
+ENV_OTEL_SDK_DISABLED = "OTEL_SDK_DISABLED"
 # Hermes stores each profile at $HERMES_HOME/profiles/<name> (persists on the data PVC).
 PROFILES_BASE = HERMES_HOME / "profiles"
 
@@ -186,14 +188,23 @@ def _pin_otel_endpoint(home: Path, name: str) -> None:
         if not config.exists():
             return
         source = SHARED_PLUGINS_DIR / "hermes_otel" / "config.yaml"
+        hermes_otel_env = os.environ.get(ENV_HERMES_OTEL_ENABLED, "").strip().lower()
+        if hermes_otel_env == "false":
+            disabled = True
+        elif hermes_otel_env == "true":
+            disabled = False
+        else:
+            disabled = os.environ.get(ENV_OTEL_SDK_DISABLED, "").strip().lower() == "true"
+
         apply(
             config,
             service_name=os.environ.get("OTEL_SERVICE_NAME") or None,
             endpoint=os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT") or None,
             source_path=source if source.exists() else None,
+            disabled=disabled,
         )
     except Exception as e:  # noqa: BLE001 - telemetry must not fail the scaffold
-        log(f"{name}: pinning the OpenTelemetry endpoint failed ({e}); traces go to the image default")
+        log(f"{name}: configuring OpenTelemetry failed ({e}); telemetry config unchanged")
 
 
 def kubeconfig_landed(kubeconfig: Path) -> bool:

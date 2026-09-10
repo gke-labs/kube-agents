@@ -149,8 +149,8 @@ destroyed and rebuilt every run and no real user reaches them, so an
 unconditional check would fail the RC pipeline rather than protect anything.
 
 Optional, and copied through when set: `CLUSTER_MODE`, `MODEL_DEFAULT_NAME`,
-`VERTEX_PROJECT_ID`, `VERTEX_LOCATION`, `GOOGLE_CHAT_MODE`, `CHAT_TOPIC_NAME`,
-`CHAT_SUB_NAME`, `SLACK_ENABLED`, `SLACK_HOME_CHANNEL`,
+`VERTEX_PROJECT_ID`, `VERTEX_LOCATION`, `GOOGLE_CHAT_MODE`, `GOOGLE_CHAT_HOME_CHANNEL`,
+`CHAT_TOPIC_NAME`, `CHAT_SUB_NAME`, `SLACK_ENABLED`, `SLACK_HOME_CHANNEL`,
 `SLACK_HOME_CHANNEL_NAME`, `PLATFORM_AGENT_CUSTOM_ROLES`,
 `HERMES_DASHBOARD_ENABLED`, `REGISTRY_PREFIX`, `THIRD_PARTY_REGISTRY_PREFIX`,
 `KMS_KEYRING`, `KMS_KEY`, `GITOPS_ORG`, `GITOPS_REPO`. Secrets: `GH_APP_ID`,
@@ -161,7 +161,10 @@ Two naming details that are easy to trip over:
 
 - The namespace is `AGENT_NAMESPACE` on `rc` and `nightly` and `NAMESPACE` on
   `staging`. Both are read, so neither has to be renamed while installs are
-  running against it.
+  running against it. On a long-lived environment the value has to match the
+  namespace its release already runs in: the composition treats the release
+  namespace as replace-on-change, and `lifecycle.sh` refuses an apply that
+  would move it.
 - `GITOPS_ORG`/`GITOPS_REPO` name the repository the **agent** opens pull
   requests against. `GH_ORG`/`GH_REPO` name the **release** repository. Setting
   the minter's pair to the release repository scopes a live GitHub App token at

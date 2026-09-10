@@ -19,7 +19,7 @@ Every commit and build progresses through five distinct lifecycle tiers:
 | **Release Candidate (RC)** | `rc_YYMMDDHHMM_<SHORT_SHA>`           | 3-hour cron / manual dispatch | Candidate build selected for live cluster testing.                                                                     |
 | **RC Validated**           | `rc_YYMMDDHHMM_<SHORT_SHA>_validated` | Successful GKE E2E suite      | Quality gate: proof that `install.sh` succeeded on a real GKE cluster.                                                 |
 | **Staging Promoted**       | `staging_YYMMDDHHMM_<SHORT_SHA>`      | Successful nightly matrix     | Quality gate for GA: the full nightly E2E matrix passed on the commit. Also the deploy trigger for the staging estate. |
-| **GA Stable**              | `X.Y.Z` (pure numeric SemVer)         | Release publish workflow      | Official production release tagged on a stamped commit parented by the target commit (staging-promoted by default).    |
+| **GA Stable**              | `X.Y.Z` (pure numeric SemVer)         | Weekly cron / manual dispatch | Official production release tagged on a stamped commit parented by the target commit (staging-promoted by default).    |
 
 Only a staging-promoted commit is releasable. An `rc_*_validated` tag records the narrow
 three-hourly suite; the GA gate reads the `staging_<ts>_<sha>` tag that `nightly-pipeline.yml`
@@ -30,19 +30,19 @@ also a hand-pushable redeploy trigger.
 
 ## Release cadence
 
-The RC pipeline and the nightly staging promotion run on a schedule; the GA release is started by
-hand. This is `main` as it runs today.
+The RC pipeline, the nightly staging promotion, and the GA release all run on schedules,
+with manual dispatches available for overrides and off-schedule releases.
 
-| Step                        | When it runs                                                                                                  | Workflow                                                                                                                          |
-| :-------------------------- | :------------------------------------------------------------------------------------------------------------ | :-------------------------------------------------------------------------------------------------------------------------------- |
-| RC selection and validation | Every three hours, at 17 minutes past. Dispatches nothing when the newest candidate has already been tried.   | `rc-scheduler.yml` starts `rc-release-pipeline.yml`, which pushes the `rc_*` and `rc_*_validated` tags.                           |
-| Staging promotion           | Daily at 02:17 UTC, against the newest validated candidate. One already promoted is re-tested, not re-tagged. | `nightly-scheduler.yml` starts `nightly-pipeline.yml`, which pushes the `staging_<ts>_<sha>` tag when the full E2E matrix passes. |
-| GA release                  | When a maintainer dispatches it; `release-publish.yml` has no `schedule:`.                                    | `release-publish.yml`, run as described under [Cutting a GA release](#cutting-a-ga-release).                                      |
+| Step                        | When it runs                                                                                                    | Workflow                                                                                                                          |
+| :-------------------------- | :-------------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------- |
+| RC selection and validation | Every three hours, at 17 minutes past. Dispatches nothing when the newest candidate has already been tried.     | `rc-scheduler.yml` starts `rc-release-pipeline.yml`, which pushes the `rc_*` and `rc_*_validated` tags.                           |
+| Staging promotion           | Daily at 02:17 UTC, against the newest validated candidate. One already promoted is re-tested, not re-tagged.   | `nightly-scheduler.yml` starts `nightly-pipeline.yml`, which pushes the `staging_<ts>_<sha>` tag when the full E2E matrix passes. |
+| GA release                  | Weekly on Thursdays at 05:17 UTC, or when a maintainer dispatches it; `release-publish.yml` has no `schedule:`. | `release-scheduler.yml` starts `release-publish.yml` with `schedule_gate=evaluate` when an eligible staging candidate is found.   |
 
 Scheduled runs start when GitHub's scheduler picks them up, so the minute is a floor, not a
-promise. A GA release ships when a maintainer dispatches the workflow, and by default it releases
-the newest staging-promoted commit. The gate that decides whether a dispatch publishes, and how
-the two schedulers pick a candidate, are described in
+promise. A scheduled GA release ships unattended on Thursdays if a new staging-promoted
+candidate exists, or maintainers may dispatch the workflow by hand. The gate that decides whether
+a dispatch publishes, and how the schedulers pick a candidate, are described in
 [`scripts/release/README.md`](https://github.com/gke-labs/kube-agents/tree/main/scripts/release),
 which is canonical for both.
 
@@ -121,12 +121,16 @@ gh workflow run release-publish.yml --repo gke-labs/kube-agents \
   -f explicit_release_version="1.0.0"
 ```
 
-Every release is started by hand: the workflow has no `schedule:`. It carries the gate an
-unattended run would need — release only a staging-promoted candidate, skip quietly when nothing
-new has landed since the last GA tag, and stop for a human when a breaking change is waiting to
-ship — behind a `schedule_gate` input that defaults to `bypass`, so a dispatch publishes exactly as
-it did before. `dry-run` reports the verdict in the job summary and publishes nothing; `evaluate`
-acts on it, as a cron tick would.
+Scheduled releases are automated weekly on Thursdays at 05:17 UTC via
+`.github/workflows/release-scheduler.yml` using the decoupled trigger pattern.
+The publishing workflow itself (`release-publish.yml`) has no `schedule:` and is dispatch-only:
+when the scheduler finds an eligible staging-promoted candidate, it dispatches the workflow with
+`schedule_gate=evaluate`. In pre-1.0 initial development (`0.y.z`), breaking changes bump minor
+under SemVer Clause 4 and release unattended. Once `1.0.0` is cut, a breaking change halts the
+scheduled evaluation with an error annotation so maintainers can publish the major release by hand.
+Manual releases and emergency bypasses remain supported on `release-publish.yml` using
+`schedule_gate=bypass` (the default). `dry-run` reports the verdict in the job summary and
+publishes nothing.
 [`scripts/release/README.md`](https://github.com/gke-labs/kube-agents/tree/main/scripts/release) is
 canonical for that gate; [Release cadence](#release-cadence) above states when each step runs.
 

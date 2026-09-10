@@ -189,6 +189,38 @@ class LifecyclePlanTest(unittest.TestCase):
                                  re.MULTILINE | re.DOTALL).group(1)
         self.assertIn("adopt_pubsub", apply_branch)
 
+    def test_apply_runs_every_identity_guard_before_terraform(self):
+        """Each guard refuses a destroy-and-recreate an -auto-approve apply would not stop at."""
+        apply_branch = re.search(r"^  apply\)$(.*?)^  destroy\)$", self.text,
+                                 re.MULTILINE | re.DOTALL).group(1)
+        apply_idx = apply_branch.index("terraform apply")
+        for guard in ("guard_cluster_ownership", "guard_gsa_identity", "guard_release_namespace"):
+            with self.subTest(guard=guard):
+                self.assertIn(guard, apply_branch)
+                self.assertLess(apply_branch.index(guard), apply_idx)
+
+    def test_destroy_checks_the_release_namespace_before_deleting_the_cr(self):
+        """delete_agent_cr looks in the configured namespace, so a wrong one skips the CR."""
+        destroy_branch = re.search(r"^  destroy\)$(.*?)^  \*\)$", self.text,
+                                   re.MULTILINE | re.DOTALL).group(1)
+        self.assertLess(destroy_branch.index("guard_release_namespace"),
+                        destroy_branch.index("delete_agent_cr"))
+
+    def test_apply_forgets_unmanaged_cluster_kms_before_adopting(self):
+        """adopt_kms re-reads state, so the removals have to land first (#1296)."""
+        apply_branch = re.search(r"^  apply\)$(.*?)^  destroy\)$", self.text,
+                                 re.MULTILINE | re.DOTALL).group(1)
+        self.assertLess(apply_branch.index("forget_unmanaged_cluster_kms"),
+                        apply_branch.index("adopt_kms"))
+
+    def test_apply_guards_the_kms_names_before_terraform_runs(self):
+        """The CMEK names are ForceNew and now come from install.env, so the
+        guard has to sit with the other identity guards, ahead of the apply."""
+        apply_branch = re.search(r"^  apply\)$(.*?)^  destroy\)$", self.text,
+                                 re.MULTILINE | re.DOTALL).group(1)
+        self.assertLess(apply_branch.index("guard_kms_identity"),
+                        apply_branch.index("terraform apply"))
+
     def test_the_usage_range_still_covers_the_whole_header(self):
         """The fallback branch prints a fixed line range, so a longer header truncates it."""
         printed = re.search(r"sed -n '2,(\d+)p'", self.text)

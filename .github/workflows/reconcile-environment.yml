@@ -182,19 +182,20 @@ jobs:
           VERTEX_LOCATION: ${{ vars.VERTEX_LOCATION }}
           GOOGLE_CHAT_ENABLED: ${{ vars.GOOGLE_CHAT_ENABLED }}
           GOOGLE_CHAT_MODE: ${{ vars.GOOGLE_CHAT_MODE }}
+          GOOGLE_CHAT_HOME_CHANNEL: ${{ vars.GOOGLE_CHAT_HOME_CHANNEL }}
           CHAT_TOPIC_NAME: ${{ vars.CHAT_TOPIC_NAME }}
           CHAT_SUB_NAME: ${{ vars.CHAT_SUB_NAME }}
           ALLOWED_USERS: ${{ vars.ALLOWED_USERS }}
           SLACK_ENABLED: ${{ vars.SLACK_ENABLED }}
           SLACK_ALLOWED_USERS: ${{ vars.SLACK_ALLOWED_USERS }}
+          SLACK_HOME_CHANNEL: ${{ vars.SLACK_HOME_CHANNEL }}
+          SLACK_HOME_CHANNEL_NAME: ${{ vars.SLACK_HOME_CHANNEL_NAME }}
           # Not install.env keys, and deliberately so: an empty allowlist is
           # already what makes the operator admit everyone. These say that the
           # empty one is intended, which is the difference between an open
           # install and a variable somebody cleared by accident.
           GOOGLE_CHAT_ALLOW_ALL_USERS: ${{ vars.GOOGLE_CHAT_ALLOW_ALL_USERS }}
           SLACK_ALLOW_ALL_USERS: ${{ vars.SLACK_ALLOW_ALL_USERS }}
-          SLACK_HOME_CHANNEL: ${{ vars.SLACK_HOME_CHANNEL }}
-          SLACK_HOME_CHANNEL_NAME: ${{ vars.SLACK_HOME_CHANNEL_NAME }}
           ENABLE_GVISOR: ${{ vars.ENABLE_GVISOR }}
           ENABLE_GKE_BACKUP_PLAN: ${{ vars.ENABLE_GKE_BACKUP_PLAN }}
           ENABLE_PUBSUB_PLATFORM: ${{ vars.ENABLE_PUBSUB_PLATFORM }}

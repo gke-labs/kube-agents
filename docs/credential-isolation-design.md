@@ -105,7 +105,7 @@ a forge hand it file content and a commit message rather than a directory.
 
 `spec.deployment.env` is applied to the credential runtime because it may
 contain credentials. A short allowlist may also be copied to the sandbox — the
-four OpenTelemetry settings and the three `ALERT_DAILY_LIMIT_*` alert ceilings —
+OpenTelemetry settings, `EOD_EXCLUDE_NAMESPACES`, and the `ALERT_DAILY_LIMIT_*` alert ceilings —
 but only as literal values; all `valueFrom` sources are rejected. A name earns a
 place on that list only if an arbitrary value for it cannot redirect state,
 grant access, or change what code runs; `safeSandboxEnvOverrides` in

@@ -107,6 +107,7 @@ const (
 	sharedStateSetupEnvVar = "AGENT_SHARED_STATE_SETUP"
 	sharedStateSetupOwner  = "owner"
 	sharedStateSetupSkip   = "skip"
+	envHermesOtelEnabled   = "HERMES_OTEL_ENABLED"
 )
 
 // Which Hermes profile the gateway runs as, when it is not the default one.
@@ -2662,6 +2663,15 @@ func dropTmpScratchIfClaimed(defaults, userMounts []corev1.VolumeMount) []corev1
 //
 // Anything a container needs on top — a different user, a writable path — belongs on that
 // container, not here. This is the floor, not the whole context.
+//
+// The working directory is one of those, and it is the one that has bitten us. An image's
+// WORKDIR is chosen for the user that image expects, so a render that overrides the user
+// owns the working directory too. #1259: the A2A provision container runs natsio/nats-box
+// as UID 1000, the image ships WORKDIR /root with no USER because it expects to be root,
+// and every provisioning run died on "stat .: permission denied" — a healthy bus with no
+// streams and nothing in the render to blame, because the render was right and the kubelet
+// was the one refusing. Check the image's WORKDIR against the UID the pod imposes, and set
+// WorkingDir explicitly when they disagree.
 func hardenedSecurityContext() *corev1.SecurityContext {
 	return &corev1.SecurityContext{
 		AllowPrivilegeEscalation: ptr.To(false),
@@ -3236,6 +3246,7 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		"ALERT_DAILY_LIMIT_INFO":      {},
 		"ALERT_DAILY_LIMIT_WARNING":   {},
 		"EOD_EXCLUDE_NAMESPACES":      {},
+		envHermesOtelEnabled:          {},
 		"OTEL_EXPORTER_OTLP_ENDPOINT": {},
 		"OTEL_EXPORTER_OTLP_PROTOCOL": {},
 		"OTEL_RESOURCE_ATTRIBUTES":    {},
@@ -3251,6 +3262,19 @@ func safeSandboxEnvOverrides(custom []corev1.EnvVar) []corev1.EnvVar {
 		}
 	}
 	return result
+}
+
+// isHermesOtelForced checks whether spec.deployment.env explicitly force-enables the hermes_otel plugin.
+func isHermesOtelForced(agent *agentv1alpha1.PlatformAgent) bool {
+	if agent == nil || agent.Spec.Deployment == nil {
+		return false
+	}
+	for _, env := range agent.Spec.Deployment.Env {
+		if env.Name == envHermesOtelEnabled && strings.EqualFold(strings.TrimSpace(env.Value), "true") {
+			return true
+		}
+	}
+	return false
 }
 
 // buildEventWatcherKubeconfigVolume is the kubeconfig the broker writes for the
@@ -4776,7 +4800,12 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 	// either, though not always — a collector Service exposing only gRPC 4317 is rejected
 	// by otlpHTTPEndpointForService and also resolves to None, and there the namespace is
 	// real. The rule is dropped in both cases, because neither one exports.
-	if ns := otlpCollectorNamespace(otlpEndpoint); ns != "" && !otlpDisabled {
+	//
+	// Exception: when HERMES_OTEL_ENABLED=true is set in spec.deployment.env (#933),
+	// the plugin force-exports traces to the baked collector fallback even if the
+	// SDK metric exporter was disabled by otlpSourceNone, so egress must be admitted.
+	hermesForced := isHermesOtelForced(agent)
+	if ns := otlpCollectorNamespace(otlpEndpoint); ns != "" && (!otlpDisabled || hermesForced) {
 		egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
 			Ports: []networkingv1.NetworkPolicyPort{
 				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4317))},

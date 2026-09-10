@@ -63,10 +63,10 @@ class DecideReleaseGateTest(unittest.TestCase):
                 outputs[key] = value
         return proc, outputs, summary_file.read_text()
 
-    def _repo(self, new_commit_msg=MOCK_COMMIT_MSG_FEAT):
+    def _repo(self, ga_tag=_GA_TAG, new_commit_msg=MOCK_COMMIT_MSG_FEAT):
         """A repository the resolver would say yes to."""
         temp_dir, repo_dir, git = create_mock_git_repo()
-        git("tag", "-a", _GA_TAG, "-m", f"release {_GA_TAG}")
+        git("tag", "-a", ga_tag, "-m", f"release {ga_tag}")
         (pathlib.Path(repo_dir) / "second.txt").write_text("second\n")
         git("add", "second.txt")
         git("commit", "-m", new_commit_msg)
@@ -91,7 +91,7 @@ class DecideReleaseGateTest(unittest.TestCase):
 
     def test_bypass_publishes_even_where_the_resolver_would_halt(self):
         """The emergency path has to stay reachable past a breaking change."""
-        temp_dir, repo_dir, _, _ = self._repo(new_commit_msg=MOCK_COMMIT_MSG_BREAKING_PRE_1_0)
+        temp_dir, repo_dir, _, _ = self._repo(ga_tag="1.0.0", new_commit_msg=MOCK_COMMIT_MSG_BREAKING_PRE_1_0)
         try:
             proc, outputs, _ = self._run(
                 repo_dir, env={"EVENT_NAME": "workflow_dispatch", "SCHEDULE_GATE": "bypass"}
@@ -125,12 +125,23 @@ class DecideReleaseGateTest(unittest.TestCase):
         finally:
             temp_dir.cleanup()
 
-    def test_evaluate_passes_a_halt_through_as_a_failure(self):
-        temp_dir, repo_dir, _, _ = self._repo(new_commit_msg=MOCK_COMMIT_MSG_BREAKING_PRE_1_0)
+    def test_evaluate_passes_a_halt_through_as_a_failure_on_major_version(self):
+        temp_dir, repo_dir, _, _ = self._repo(ga_tag="1.0.0", new_commit_msg=MOCK_COMMIT_MSG_BREAKING_PRE_1_0)
         try:
             proc, outputs, _ = self._run(repo_dir, env={"SCHEDULE_GATE": "evaluate"})
             self.assertNotEqual(proc.returncode, 0)
             self.assertEqual(outputs["should_release"], "false")
+        finally:
+            temp_dir.cleanup()
+
+    def test_evaluate_pre_1_0_breaking_change_releases_unattended(self):
+        """Under SemVer Clause 4, pre-1.0 breaking changes release unattended."""
+        temp_dir, repo_dir, _, head = self._repo(ga_tag="0.4.0", new_commit_msg=MOCK_COMMIT_MSG_BREAKING_PRE_1_0)
+        try:
+            proc, outputs, _ = self._run(repo_dir, env={"SCHEDULE_GATE": "evaluate"})
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(outputs["should_release"], "true")
+            self.assertEqual(outputs["release_commit"], head)
         finally:
             temp_dir.cleanup()
 
@@ -178,9 +189,9 @@ class DecideReleaseGateTest(unittest.TestCase):
         finally:
             temp_dir.cleanup()
 
-    def test_dry_run_preserves_a_halt_exit_code(self):
+    def test_dry_run_preserves_a_halt_exit_code_on_major_version(self):
         """What the cron would do, including going red."""
-        temp_dir, repo_dir, _, _ = self._repo(new_commit_msg=MOCK_COMMIT_MSG_BREAKING_PRE_1_0)
+        temp_dir, repo_dir, _, _ = self._repo(ga_tag="1.0.0", new_commit_msg=MOCK_COMMIT_MSG_BREAKING_PRE_1_0)
         try:
             proc, outputs, _ = self._run(repo_dir, env={"SCHEDULE_GATE": "dry-run"})
             self.assertNotEqual(proc.returncode, 0)

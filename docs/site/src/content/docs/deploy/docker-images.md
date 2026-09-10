@@ -13,16 +13,18 @@ Every image an install pulls or a rebuild needs, and how their tags are managed.
 
 A bump starts here but rarely ends here. Several images keep a second copy that this file is the
 source for — a chart value, a Dockerfile `ARG` default, a compiled constant in the operator — and
-`make images-check` is what holds them in step. It covers every image the chart renders, on both a
-default and a mirrored install; the build-time bases against their Dockerfile `ARG` defaults; the
-Go builder pin against the `go` directive in `k8s-operator/go.mod`; the fluent-bit fallback baked
-into the operator binary; the example manifests; and the kustomize integrations, which it requires
-to name a variable this file owns rather than a literal.
+`make images-check` is what holds them in step. It covers every image the chart renders, on a
+default and a mirrored install, and what `githubMinter.enabled=true` adds to each; the build-time
+bases against their Dockerfile `ARG` defaults; the Go builder pin against the `go` directive in
+`k8s-operator/go.mod`; the fluent-bit fallback baked into the operator binary; the example
+manifests; and the kustomize integrations, which it requires to name a variable this file owns
+rather than a literal.
 
-Two copies it does not reach, where a stale pin passes every check. An image behind a non-default
-chart toggle is never rendered, so Hindsight (`memory.provider`) and the GitHub token minter
-(`githubMinter.enabled`) keep unguarded pins in `charts/kube-agents/values.yaml`. And cert-manager's
-version is set again in `terraform/examples/full-install/variables.tf`, which no check reads.
+Two copies it does not reach, where a stale pin passes every check. Hindsight's images sit behind
+`hindsight.enabled` — unset by default, and then following
+`platformAgent.harness.memory.provider`, which no render turns on — so their pins in
+`charts/kube-agents/values.yaml` are unguarded. And cert-manager's version is set again in
+`terraform/examples/full-install/variables.tf`, which no check reads.
 
 Bump the pin here, run `make images-check` and `make docs-generate`, then grep the tree for the old
 version before opening the pull request.
@@ -71,9 +73,9 @@ Needed only to rebuild the images above from source, not to run an install. Each
 | ----- | ------------------ | --- | -------- | --------- |
 | `hermes-agent` | `docker.io/nousresearch/hermes-agent` | `HERMES_AGENT_TAG` in [`tags.env`](https://github.com/gke-labs/kube-agents/blob/main/tags.env) | `HERMES_AGENT_IMAGE` | deploy/docker/Dockerfile (agent-base stage). |
 | `envoy` | `docker.io/envoyproxy/envoy` | `v1.39.1` | `ENVOY_IMAGE` | deploy/docker/Dockerfile (envoy-bin stage). |
-| `golang` | `docker.io/library/golang` | `1.27-alpine` | `GOLANG_IMAGE` | deploy/docker/Dockerfile and k8s-operator/Dockerfile builder stages. |
+| `golang` | `docker.io/library/golang` | `1.27-alpine` | `GOLANG_IMAGE` | deploy/docker/Dockerfile, k8s-operator/Dockerfile and a2a/Dockerfile.gateway builder stages. |
 | `python` | `docker.io/library/python` | `3.14-slim` | `PYTHON_IMAGE` | examples/inference-replay/replay-proxy/Dockerfile and deploy/sandbox/Dockerfile. |
-| `distroless-static` | `gcr.io/distroless/static` | `nonroot` | `DISTROLESS_IMAGE` | k8s-operator/Dockerfile runtime stage. |
+| `distroless-static` | `gcr.io/distroless/static` | `nonroot` | `DISTROLESS_IMAGE` | k8s-operator/Dockerfile and a2a/Dockerfile.gateway runtime stages. |
 | `busybox` | `docker.io/library/busybox` | `musl@sha256:32b5cdad7cce41dfd53d0ae06baebcf8357a147ee7694dc706911c373bc30c37` | — | agentplugins/*/Dockerfile base images. |
 
 <!-- prettier-ignore-end -->

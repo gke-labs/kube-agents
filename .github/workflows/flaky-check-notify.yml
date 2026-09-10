@@ -1,0 +1,120 @@
+name: Notify on Flaky Check
+
+# Open a `ci:flaky` issue when a re-run of a check passes on the same commit
+# the attempt before it failed on, and add a row to that issue each time the
+# same failure does it again. `scripts/notify_flaky_check.py` holds the
+# reasoning and the issue format; this file is the trigger and the guards.
+#
+# The signal is `run_attempt > 1` with a green conclusion. Only a re-run
+# produces a later attempt, nothing in this repository re-runs anything
+# automatically, and a re-run cannot change the commit -- so a green attempt
+# after a red one is a failure the code did not cause. That is a far cleaner
+# signal than "a check failed", which on a pull request is usually the pull
+# request's own fault. The script reads every earlier attempt back from the
+# API before recording anything: each one that failed becomes a row, a
+# cancelled one is skipped, and a re-run whose earlier attempts were all
+# cancelled records nothing.
+#
+# No setup: it writes with the workflow's own GITHUB_TOKEN and creates the
+# label the first time it needs one. Issues opened with GITHUB_TOKEN do not
+# trigger further workflows, so this cannot start a loop.
+#
+# `workflows:` matches on the workflow's `name:`, not its filename, and a
+# rename there silently stops this from firing.
+#
+# What may go on the list: a check whose result should not depend on the
+# attempt. That is every check that reads the tree and nothing else. Left off
+# on purpose: `Validate PR Title`, which a title edit legitimately turns green
+# without a commit; `Security Scanning`, whose advisory database moves between
+# attempts, so a green re-run there is the database changing rather than the
+# check flaking; and the `pull_request_target` automations (`Risk
+# Classification`, `Hold Unresolved Threads`, `Auto Assign Milestone on
+# Merge`), which are not checks on the tree at all.
+
+on:
+  # zizmor: ignore[dangerous-triggers] - workflow_run is only dangerous when it checks
+  # out the triggering run's code; this checks out the default branch, and passes the
+  # event nothing but a run id and an attempt number.
+  workflow_run:
+    workflows:
+      - A2A Module Tests
+      - Actionlint
+      - Agent Plugin Tests
+      - Agent Startup Tests
+      - Conformance
+      - Docker Build
+      - Docs Build
+      - Documentation Checks
+      - Documentation Freshness Check
+      - Installer Cross-OS Validation Matrix
+      - Operator Tests
+      - Prettier Check
+      - Python Unit Tests
+      - Validate Repo Structure
+    types: [completed]
+
+# Serialised per watched workflow. Two re-runs of the same check finishing
+# together would otherwise both find no issue for their fingerprint and both
+# open one. `cancel-in-progress: false` still drops the middle of a burst --
+# GitHub holds one run pending per group -- which costs a row on the issue,
+# not a wrong state: the script reconciles from what the issue already
+# records rather than reporting transitions.
+#
+# The group is evaluated before the job's `if:`, so every completed run of a
+# watched workflow enters it -- ten first attempts a day per workflow, and
+# every re-run that failed again, all of which the job then skips. Keying on
+# the same predicate as the `if:` keeps those out of the group that matters:
+# otherwise a skipped run arriving while one green re-run's notify runs and
+# another's is pending cancels the pending one, and that occurrence is never
+# recorded, because this script reads only its own run and cannot be healed
+# by the next. A storm of re-runs after an outage is exactly when that would
+# happen.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.workflow_id }}-${{ github.event.workflow_run.run_attempt > 1 && github.event.workflow_run.conclusion == 'success' && 'flake' || 'other' }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  notify:
+    name: Notify on Flaky Check
+    # The repository guard is required of any credentialed workflow that starts
+    # on its own (AGENTS.md, Pull Request Hygiene): a fork inherits the trigger
+    # and none of the secrets, so without it every fork sync mails its owner.
+    #
+    # `run_attempt > 1` is what keeps this from starting on every completed
+    # run of every watched workflow. It is a first filter, not the decision: the
+    # script reads both attempts back from the API and decides from those.
+    if: >-
+      github.repository == 'gke-labs/kube-agents' &&
+      github.event.workflow_run.run_attempt > 1 &&
+      github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    # No pull-requests scope: the pull request is found by listing pulls,
+    # which needs no permission on a public repository. On a private one
+    # this would need `pull-requests: read`.
+    permissions:
+      contents: read # check out the script
+      actions: read # read every attempt, the failed attempts' jobs, and their logs
+      issues: write # open and update the tracking issue, and its label
+    steps:
+      - name: Checkout the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # The run id and attempt number and nothing else. The script reads the
+      # conclusions, the commit and the failing jobs back from the API rather
+      # than trusting the event payload for them, so a stale or spoofed field
+      # cannot change what gets filed.
+      - name: Record the flake
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: python3 scripts/notify_flaky_check.py --run-id "$RUN_ID" --attempt "$RUN_ATTEMPT"

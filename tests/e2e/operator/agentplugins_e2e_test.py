@@ -121,6 +121,8 @@ DEFAULT_ROLLOUT_TIMEOUT_SEC: int = 900
 ROLLOUT_RETRY_INTERVAL_SEC: int = 3
 API_POLL_INTERVAL_SEC: int = 2
 MIN_ROLLOUT_TIMEOUT_SEC: int = 5
+DEFAULT_GENERATION_TIMEOUT_SEC: int = 180
+CRD_MISSING_LOG_POLL_TIMEOUT_SEC: int = 30
 GATEWAY_DEPLOYMENT: str = "platform-agent-gateway"
 # AgentPlugin names are restricted to ^[a-z][a-z0-9]*$ by the CRD: the name doubles as
 # the plugin directory and the module identifier Hermes imports.
@@ -444,8 +446,15 @@ def get_latest_pod_template_hash(deployment_name: str) -> str:
     return lines[-1] if lines else ""
 
 
-def wait_deployment_generation_change(deployment_name: str, min_gen: int, timeout_sec: int = 20) -> None:
-    """Wait for operator reconciliation to update deployment metadata.generation."""
+def wait_deployment_generation_change(
+    deployment_name: str, min_gen: int, timeout_sec: int = DEFAULT_GENERATION_TIMEOUT_SEC
+) -> None:
+    """Wait for operator reconciliation to update deployment metadata.generation.
+
+    Raises TimeoutError if the deployment generation does not reach min_gen within
+    timeout_sec, preventing subsequent rollout and spec checks from validating a stale
+    revision.
+    """
     end_time = time.time() + timeout_sec
     while time.time() < end_time:
         try:
@@ -456,7 +465,9 @@ def wait_deployment_generation_change(deployment_name: str, min_gen: int, timeou
         except (subprocess.CalledProcessError, ValueError):
             pass
         time.sleep(1)
-    log(f"Warning: Deployment '{deployment_name}' generation did not reach {min_gen} within {timeout_sec}s")
+    raise TimeoutError(
+        f"Deployment '{deployment_name}' generation did not reach {min_gen} within {timeout_sec}s"
+    )
 
 
 def poll_running_pod_name(label_selector: str, pod_template_hash: str | None = None, timeout_sec: int = 30) -> str:
@@ -1156,14 +1167,11 @@ def step12_verify_missing_crd_decoupled_dependency_safeguard() -> None:
         log("Deleting AgentPlugin CRD from cluster...")
         run_kubectl(["delete", "crd", "agentplugins.kubeagents.x-k8s.io"], check=True)
 
-        gen_before = get_deployment_generation(GATEWAY_DEPLOYMENT)
         trigger_val = str(int(time.time()))
         run_kubectl([
             "annotate", "platformagent", "platform-agent", "-n", NAMESPACE,
             f"e2e.test/crd-missing-trigger={trigger_val}", "--overwrite"
         ])
-
-        wait_deployment_generation_change(GATEWAY_DEPLOYMENT, min_gen=gen_before + 1)
         wait_deployment_rollout(GATEWAY_DEPLOYMENT)
 
         op_image = get_kubectl_output([
@@ -1171,10 +1179,18 @@ def step12_verify_missing_crd_decoupled_dependency_safeguard() -> None:
             "-o", "jsonpath={.spec.template.spec.containers[?(@.name==\"manager\")].image}"
         ])
         op_pod = poll_operator_pod(expected_image=op_image, timeout_sec=OPERATOR_PROBE_TIMEOUT_SEC)
-        crd_missing_logged = (
-            check_operator_error_log("the server could not find the requested resource") or
-            check_operator_error_log("AgentPlugin CRD is not installed on cluster")
-        )
+
+        crd_missing_logged = False
+        start_time = time.time()
+        while time.time() - start_time < CRD_MISSING_LOG_POLL_TIMEOUT_SEC:
+            if (
+                check_operator_error_log("the server could not find the requested resource") or
+                check_operator_error_log("AgentPlugin CRD is not installed on cluster")
+            ):
+                crd_missing_logged = True
+                break
+            time.sleep(1)
+
         assert crd_missing_logged, "Expected operator to log missing CRD reflector warning or info message"
         log("Verified operator logged missing CRD reflector message while PlatformAgent reconciliation succeeded.")
 

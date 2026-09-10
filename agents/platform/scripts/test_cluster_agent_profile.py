@@ -464,9 +464,63 @@ class CreateProfileTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("OTEL_EXPORTER_OTLP_ENDPOINT", None)
             os.environ.pop("OTEL_SERVICE_NAME", None)
+            os.environ.pop("OTEL_SDK_DISABLED", None)
+            os.environ.pop("HERMES_OTEL_ENABLED", None)
             self.create()
 
         self.assertEqual(self.plugin_config()["backends"][0]["endpoint"], self.BAKED)
+
+    def test_disabled_telemetry_disables_plugin_and_clears_backends(self):
+        self.bake_shared_plugin()
+        with mock.patch.dict(
+            os.environ,
+            {"OTEL_SDK_DISABLED": "true", "OTEL_SERVICE_NAME": "agent-gateway"},
+        ):
+            self.create()
+
+        cfg = self.plugin_config()
+        self.assertFalse(cfg["enabled"])
+        self.assertEqual(cfg["backends"], [])
+
+    def test_hermes_otel_enabled_false_disables_plugin(self):
+        self.bake_shared_plugin()
+        with mock.patch.dict(
+            os.environ,
+            {"HERMES_OTEL_ENABLED": "false", "OTEL_SERVICE_NAME": "agent-gateway"},
+        ):
+            self.create()
+
+        cfg = self.plugin_config()
+        self.assertFalse(cfg["enabled"])
+        self.assertEqual(cfg["backends"], [])
+
+    def test_hermes_otel_enabled_true_overrides_otel_sdk_disabled(self):
+        self.bake_shared_plugin()
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HERMES_OTEL_ENABLED": "true",
+                "OTEL_SDK_DISABLED": "true",
+                "OTEL_EXPORTER_OTLP_ENDPOINT": self.CUSTOM,
+            },
+        ):
+            self.create()
+
+        cfg = self.plugin_config()
+        self.assertTrue(cfg.get("enabled", True))
+        self.assertEqual(cfg["backends"][0]["endpoint"], self.CUSTOM + "/v1/traces")
+
+    def test_disabled_telemetry_handles_mixed_case(self):
+        self.bake_shared_plugin()
+        with mock.patch.dict(
+            os.environ,
+            {"OTEL_SDK_DISABLED": "TRUE", "OTEL_SERVICE_NAME": "agent-gateway"},
+        ):
+            self.create()
+
+        cfg = self.plugin_config()
+        self.assertFalse(cfg["enabled"])
+        self.assertEqual(cfg["backends"], [])
 
 
 if __name__ == "__main__":

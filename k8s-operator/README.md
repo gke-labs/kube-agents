@@ -237,7 +237,7 @@ Before deploying the GitHub integration, ensure you have:
 
 ### Step-by-Step Deployment
 
-Run the `make deploy-github` target, passing the required environment variables. The KSA/GSA names below are the same defaults the installer uses (see [`scripts/installer/installer_common.sh`](../scripts/installer/installer_common.sh) and [`scripts/installer/common.sh`](../scripts/installer/common.sh)), but they still have to be exported here: `make deploy-github` renders the manifests with `envsubst` and does not source `common.sh`, so an unset variable would be substituted as an empty string.
+Run the `make deploy-github` target, passing the required environment variables. The KSA/GSA names below are the same defaults the installer uses (the GSA names from [`install.defaults.env`](../install.defaults.env), the KSA names from [`scripts/installer/common.sh`](../scripts/installer/common.sh)), but they still have to be exported here: `make deploy-github` renders the manifests with `envsubst` and does not source `common.sh`, so an unset variable would be substituted as an empty string.
 
 `KMS_LOCATION` is the Cloud KMS location, which is separate from `REGION`, the GKE cluster location. Cloud KMS has no zonal locations, so the two differ for a zonal cluster: a cluster in `us-central1-c` needs `KMS_LOCATION=us-central1`. For a regional cluster they are the same value.
 

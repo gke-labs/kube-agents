@@ -13,6 +13,10 @@ live in the sibling [`../installer/`](../installer/README.md).
 | `teardown_dev_01_gcp_artifact_registry.sh` | Deletes the throwaway dev Artifact Registry this tooling created                        |
 | `update_cluster_name.sh`                   | Patches the target GKE cluster name into the deployed `PlatformAgent` spec; run by hand |
 
+`teardown_dev_01_gcp_artifact_registry.sh` asks before it deletes anything. `--no-confirm` (or
+`-y`) answers yes for an unattended run and `--dry-run` shows the delete without making it; a
+`CI=true` inherited from the environment is not a bypass.
+
 ## `setup-gcp-github-wif.sh`
 
 ### Purpose

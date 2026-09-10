@@ -9,8 +9,9 @@ variable "location" {
 }
 
 variable "service_account_id" {
-  description = "IAM Service Account ID for the GitHub token minter"
+  description = "IAM Service Account ID for the GitHub token minter. Fixed per project, so a second install in the same project must set its own. Passing null selects this default (nullable = false), which lets root modules expose a passthrough variable."
   type        = string
+  nullable    = false
   default     = "kubeagents-github-minter-gsa"
 
   validation {

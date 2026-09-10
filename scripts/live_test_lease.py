@@ -78,7 +78,7 @@ KUBECTL_TIMEOUT = 8
 SESSION_CONTINUES = frozenset({"clear", "resume"})
 
 # The namespace an install uses unless its configuration says otherwise. Source
-# of truth: NAMESPACE in scripts/installer/common.sh.
+# of truth: DEFAULT_NAMESPACE in install.defaults.env.
 DEFAULT_NAMESPACE = "kubeagents-system"
 
 # Only these keys are read out of an install's configuration. Both files are

@@ -27,7 +27,7 @@ every failure warns on stderr and returns False.
 
 Usage:
     otel_config.py --hermes-home DIR [--service-name NAME] [--endpoint URL]
-                   [--defaults-plugins DIR]
+                   [--defaults-plugins DIR] [--disabled]
 """
 
 from __future__ import annotations
@@ -46,6 +46,8 @@ DEFAULT_DEFAULTS_PLUGINS = "/opt/defaults/plugins"
 # base URL with the signal path appended, so the operator and the Helm chart carry base
 # URLs and this is the only place that knows the path.
 TRACES_PATH = "v1/traces"
+FIELD_ENABLED = "enabled"
+FIELD_BACKENDS = "backends"
 
 
 def log(msg: str) -> None:
@@ -91,11 +93,16 @@ def apply(
     service_name: str | None = None,
     endpoint: str | None = None,
     source_path: str | pathlib.Path | None = None,
+    disabled: bool = False,
 ) -> bool:
     """Write service.name and, when given, the collector endpoint into one plugin config.
 
     An unset endpoint leaves `backends` alone, so the baked default stands and an install
     that never configures telemetry keeps exporting exactly where it always did.
+
+    When `disabled` is True, `enabled` is set to False and `backends` is cleared to an empty
+    list, turning off telemetry export completely. When `disabled` is False and telemetry was
+    previously disabled, `enabled` is restored to True.
 
     Note that leaving `backends` alone is not the same as leaving the file alone. With
     source_path given, the result is re-derived from the pristine copy on every start, so
@@ -113,6 +120,11 @@ def apply(
 
     try:
         current = _load(config_path) if config_path.exists() else {}
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        log(f"WARN: cannot read {config_path}: {exc}; leaving the plugin config alone")
+        return False
+
+    try:
         config = _load(origin) if origin != config_path else copy.deepcopy(current)
     except (OSError, ValueError, yaml.YAMLError) as exc:
         log(f"WARN: cannot read {origin}: {exc}; leaving the plugin config alone")
@@ -127,23 +139,33 @@ def apply(
     else:
         attrs.pop("service.name", None)
 
-    if endpoint:
-        url = traces_url(endpoint)
-        backends = config.get("backends")
-        if not isinstance(backends, list) or not backends:
-            backends = config["backends"] = [{"name": "otlp", "type": "otlp"}]
-        first = backends[0]
-        if not isinstance(first, dict):
-            log(f"WARN: backends[0] in {origin} is not a mapping; replacing it")
-            first = backends[0] = {"name": "otlp", "type": "otlp"}
-        previous = first.get("endpoint")
-        if previous != url:
-            # Only the endpoint moves. name/type/headers are whatever the image baked or
-            # an operator edited, and the name in particular may be keyed on elsewhere —
-            # so it keeps its baked value even when repointed, which is worth saying out
-            # loud in the log rather than leaving to be discovered.
-            log(f"Repointing backend '{first.get('name')}' from {previous} to {url}")
-            first["endpoint"] = url
+    if disabled:
+        config[FIELD_ENABLED] = False
+        config[FIELD_BACKENDS] = []
+    else:
+        # Re-enable if previously disabled on disk, unless the pristine template
+        # explicitly configured enabled: false. Preserve enabled: true once re-enabled.
+        pristine_disabled = origin != config_path and config.get(FIELD_ENABLED) is False
+        if current.get(FIELD_ENABLED) in (True, False) and not pristine_disabled:
+            config[FIELD_ENABLED] = True
+
+        if endpoint:
+            url = traces_url(endpoint)
+            backends = config.get(FIELD_BACKENDS)
+            if not isinstance(backends, list) or not backends:
+                backends = config[FIELD_BACKENDS] = [{"name": "otlp", "type": "otlp"}]
+            first = backends[0]
+            if not isinstance(first, dict):
+                log(f"WARN: backends[0] in {origin} is not a mapping; replacing it")
+                first = backends[0] = {"name": "otlp", "type": "otlp"}
+            previous = first.get("endpoint")
+            if previous != url:
+                # Only the endpoint moves. name/type/headers are whatever the image baked or
+                # an operator edited, and the name in particular may be keyed on elsewhere —
+                # so it keeps its baked value even when repointed, which is worth saying out
+                # loud in the log rather than leaving to be discovered.
+                log(f"Repointing backend '{first.get('name')}' from {previous} to {url}")
+                first["endpoint"] = url
 
     if config == current:
         return True
@@ -162,6 +184,7 @@ def apply_all(
     service_name: str | None = None,
     endpoint: str | None = None,
     defaults_plugins: str | pathlib.Path | None = DEFAULT_DEFAULTS_PLUGINS,
+    disabled: bool = False,
 ) -> dict[str, bool]:
     """Apply to the root home's plugin config and to every profile's copy.
 
@@ -185,7 +208,13 @@ def apply_all(
         # and creating one here would enable telemetry Hermes was not asked for.
         if not target.exists():
             continue
-        results[str(target)] = apply(target, service_name, endpoint, source_path=source)
+        results[str(target)] = apply(
+            target,
+            service_name,
+            endpoint,
+            source_path=source,
+            disabled=disabled,
+        )
     return results
 
 
@@ -199,9 +228,21 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_DEFAULTS_PLUGINS,
         help="Pristine plugin directory to derive each config from",
     )
+    parser.add_argument(
+        "--disabled",
+        action="store_true",
+        default=False,
+        help="Disable hermes_otel plugin and clear backends",
+    )
     args = parser.parse_args(argv)
 
-    results = apply_all(args.hermes_home, args.service_name, args.endpoint, args.defaults_plugins)
+    results = apply_all(
+        args.hermes_home,
+        args.service_name,
+        args.endpoint,
+        args.defaults_plugins,
+        disabled=args.disabled,
+    )
     for path, ok in results.items():
         if not ok:
             log(f"WARN: could not update {path}")

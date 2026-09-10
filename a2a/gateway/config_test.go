@@ -25,6 +25,7 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("A2A_ATTRIBUTION_SALT", "")
 	t.Setenv("A2A_TASK_DEADLINE_SECONDS", "")
 	t.Setenv("A2A_ASK_TTL", "")
+	t.Setenv("A2A_FIRST_EVENT_GRACE", "")
 	t.Setenv("A2A_OWNER_DEPLOYMENT", "")
 	t.Setenv("A2A_MAX_SESSIONS", "")
 	t.Setenv("A2A_IDLE_TTL", "")
@@ -282,6 +283,37 @@ func TestFromEnvAskTTL(t *testing.T) {
 		t.Setenv("A2A_ASK_TTL", bad)
 		if _, err := FromEnv(); err == nil {
 			t.Fatalf("A2A_ASK_TTL=%q accepted", bad)
+		}
+	}
+}
+
+// TestFromEnvFirstEventGrace: the bound on a task with no events at all —
+// absent means 10m (the pod deadline's pre-start budget), and a sub-minute
+// value refuses at boot.
+func TestFromEnvFirstEventGrace(t *testing.T) {
+	setBaseEnv(t)
+
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.FirstEventGrace != 10*time.Minute {
+		t.Fatalf("default FirstEventGrace = %v, want 10m", cfg.FirstEventGrace)
+	}
+
+	t.Setenv("A2A_FIRST_EVENT_GRACE", "3m")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.FirstEventGrace != 3*time.Minute {
+		t.Fatalf("FirstEventGrace = %v, want 3m", cfg.FirstEventGrace)
+	}
+
+	for _, bad := range []string{"30s", "junk"} {
+		t.Setenv("A2A_FIRST_EVENT_GRACE", bad)
+		if _, err := FromEnv(); err == nil {
+			t.Fatalf("A2A_FIRST_EVENT_GRACE=%q accepted", bad)
 		}
 	}
 }

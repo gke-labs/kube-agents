@@ -191,6 +191,10 @@ if [ -n "${GOOGLE_CHAT_MODE:-}" ]; then
   INSTALL_ARGS+=(--google-chat-mode="${GOOGLE_CHAT_MODE}")
 fi
 
+if [ -n "${GOOGLE_CHAT_HOME_CHANNEL:-}" ]; then
+  INSTALL_ARGS+=(--google-chat-home-channel="${GOOGLE_CHAT_HOME_CHANNEL}")
+fi
+
 if [ -n "${CHAT_TOPIC_NAME:-}" ]; then
   INSTALL_ARGS+=(--chat-topic-name="${CHAT_TOPIC_NAME}")
 fi

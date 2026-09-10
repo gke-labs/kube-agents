@@ -1128,6 +1128,18 @@ func TestSafeSandboxEnvOverridesPassesOtelSdkDisabled(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesHermesOtelEnabled(t *testing.T) {
+	// HERMES_OTEL_ENABLED is the specific knob controlling the hermes_otel
+	// plugin trace exporter. On the allowlist it lets operators disable or
+	// force-enable agent span telemetry via CR spec.deployment.env (#933).
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{
+		{Name: "HERMES_OTEL_ENABLED", Value: "false"},
+	})
+	if len(got) != 1 || got[0].Name != "HERMES_OTEL_ENABLED" || got[0].Value != "false" {
+		t.Fatalf("expected HERMES_OTEL_ENABLED to survive the allowlist, got %#v", got)
+	}
+}
+
 func TestSafeSandboxEnvOverridesPassesAlertLimits(t *testing.T) {
 	// The session server reads its daily alert ceilings from the environment,
 	// so an operator has to be able to tune or disable them on the CR. Without

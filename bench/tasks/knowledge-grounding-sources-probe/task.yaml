@@ -47,6 +47,10 @@
 # for it. No tofu, no fleet read.
 id: knowledge-grounding-sources-probe
 name: Grounded GKE knowledge answer cites its sources
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
 prompt: >-
   What compute classes does GKE Autopilot support, and which nodeSelector do
   I use to run a workload on the Performance compute class?

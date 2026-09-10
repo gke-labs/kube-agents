@@ -111,6 +111,38 @@ class AgentPluginsE2EHelpersTest(unittest.TestCase):
             with self.assertRaises(TimeoutError):
                 e2e.wait_deployment_rollout("nonexistent-deployment", timeout="5s")
 
+    def test_wait_deployment_generation_change_succeeds_when_min_gen_reached(self):
+        """When current generation reaches or exceeds min_gen, return cleanly."""
+        with patch.object(e2e, "get_deployment_generation", return_value=3):
+            e2e.wait_deployment_generation_change("platform-agent-gateway", min_gen=2, timeout_sec=5)
+
+    def test_wait_deployment_generation_change_retries_and_succeeds(self):
+        """Retries through transient errors and lower generations until min_gen is reached."""
+        generations = [1, subprocess.CalledProcessError(1, ["cmd"]), 2]
+
+        def mock_get_generation(deployment_name):
+            val = generations.pop(0)
+            if isinstance(val, Exception):
+                raise val
+            return val
+
+        with patch.object(e2e, "get_deployment_generation", side_effect=mock_get_generation), \
+             patch("time.sleep", return_value=None):
+            e2e.wait_deployment_generation_change("platform-agent-gateway", min_gen=2, timeout_sec=10)
+
+        self.assertEqual(len(generations), 0)
+
+    def test_wait_deployment_generation_change_raises_timeout_error(self):
+        """When generation never reaches min_gen, poll until timeout and raise TimeoutError."""
+        with patch.object(e2e, "get_deployment_generation", return_value=1) as mock_get_gen, \
+             patch("time.time", side_effect=[100.0, 100.0, 103.0]), \
+             patch("time.sleep", return_value=None):
+            with self.assertRaises(TimeoutError) as ctx:
+                e2e.wait_deployment_generation_change("platform-agent-gateway", min_gen=2, timeout_sec=2)
+            self.assertIn("generation did not reach 2", str(ctx.exception))
+            mock_get_gen.assert_called_once_with("platform-agent-gateway")
+
 
 if __name__ == "__main__":
     unittest.main()
+

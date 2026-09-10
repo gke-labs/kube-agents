@@ -1,0 +1,680 @@
+/*
+ * Mission control, instrument-panel dialect. Lifted from the demo UI.
+ *
+ * The rail is the only lit surface in the room: near-black field, one white-hot
+ * trace with a cold halo, everything else in silkscreen grey. Hue is reserved —
+ * correlation ids own the spectrum (via corrColor), and amber is spent on
+ * exactly one thing, the browser's own link being down. Lifecycle is
+ * otherwise expressed in luminance: active is bright, idle and done are dim,
+ * closed fades off the trace.
+ */
+
+:root {
+  --void: #07080a;
+  --panel: #0b0d11;
+  --edge: #171b22;
+  --trace: #d7e6ff;
+  --halo: rgba(126, 178, 255, 0.22);
+  --ink: #8b95a5;
+  --ink-dim: #4c5462;
+  --ink-bright: #dfe6f0;
+  --warn: #d9a441;
+  --ghost: #9aa6b8;
+
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Roboto Mono", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Inter, Helvetica, Arial, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--void);
+  color: var(--ink);
+  font-family: var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* --- shell ---------------------------------------------------------------- */
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100%;
+}
+
+.app-topology {
+  flex: 0 0 45%;
+  min-height: 0;
+  border-bottom: 1px solid var(--edge);
+  background:
+    radial-gradient(120% 90% at 50% 0%, #101520 0%, var(--panel) 55%, var(--void) 100%);
+  overflow: hidden;
+}
+
+.app-chat {
+  flex: 1 1 55%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--void);
+}
+
+/* --- rail panel ----------------------------------------------------------- */
+
+.rail-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  padding: 18px 0 12px;
+}
+
+.rail-head,
+.rail-foot {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  padding: 0 24px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+.rail-title {
+  color: var(--ink-bright);
+  font-weight: 600;
+}
+
+.rail-subject {
+  color: var(--ink-dim);
+  letter-spacing: 0.08em;
+  text-transform: none;
+}
+
+/* Centred in whatever height the panel has: the trace should sit on the
+   panel's optical midline, not float under the title. */
+.rail-svg {
+  display: block;
+  flex: 0 0 auto;
+  margin: auto 0;
+  width: 100%;
+  overflow: visible;
+}
+
+.rail-foot {
+  justify-content: space-between;
+  color: var(--ink-dim);
+  letter-spacing: 0.08em;
+  text-transform: none;
+}
+
+.rail-replay {
+  color: var(--ink);
+  letter-spacing: 0.1em;
+  text-transform: none;
+}
+
+/* --- the trace ------------------------------------------------------------ */
+
+.rail-trace {
+  stroke: var(--trace);
+  stroke-width: 1.25;
+  opacity: 0.9;
+}
+
+.rail-trace-halo {
+  stroke: var(--halo);
+  stroke-width: 9;
+  filter: blur(4px);
+}
+
+.rail-terminator {
+  stroke: var(--trace);
+  stroke-width: 1;
+  opacity: 0.35;
+}
+
+/* --- taps ----------------------------------------------------------------- */
+
+.tap {
+  animation: tap-arrive 420ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+@keyframes tap-arrive {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+}
+
+.tap-lead {
+  stroke: var(--ink-dim);
+  stroke-width: 1;
+}
+
+.tap-dot {
+  fill: var(--trace);
+}
+
+.tap-port {
+  fill: none;
+  stroke: var(--trace);
+  stroke-width: 1.25;
+}
+
+.tap-hub {
+  fill: none;
+  stroke: var(--trace);
+  stroke-width: 1;
+  opacity: 0.3;
+}
+
+.tap-ripple {
+  fill: none;
+  stroke: var(--trace);
+  stroke-width: 1;
+}
+
+.tap-name {
+  fill: var(--ink-bright);
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+}
+
+.tap-status {
+  fill: var(--ink-dim);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.06em;
+}
+
+/* lifecycle, in luminance */
+
+.tap-done .tap-dot,
+.tap-absent .tap-dot {
+  fill: var(--ink-dim);
+}
+
+.tap-done .tap-name,
+.tap-absent .tap-name {
+  fill: var(--ink);
+}
+
+.tap-done,
+.tap-absent {
+  opacity: 0.62;
+}
+
+/* Idle is quieter than active but not retired: the pod is there, the bus is
+   just silent. */
+.tap-idle {
+  opacity: 0.8;
+}
+
+.tap-idle .tap-dot {
+  fill: var(--ink);
+}
+
+.tap-stale {
+  opacity: 0.75;
+}
+
+.tap-stale .tap-dot {
+  fill: var(--warn);
+}
+
+.tap-stale .tap-name,
+.tap-stale .tap-status {
+  fill: var(--warn);
+}
+
+.tap-closed {
+  animation: tap-retire 2s ease-in forwards;
+}
+
+@keyframes tap-retire {
+  0% {
+    opacity: 0.6;
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(14px);
+  }
+}
+
+.tap-clickable {
+  cursor: pointer;
+}
+
+.tap-clickable:hover .tap-dot {
+  r: 5.5;
+}
+
+.tap-clickable:hover .tap-name {
+  fill: #fff;
+}
+
+.tap-clickable:focus {
+  outline: none;
+}
+
+.tap-clickable:focus-visible .tap-name {
+  fill: #fff;
+}
+
+.tap-clickable:focus-visible .tap-dot,
+.tap-clickable:focus-visible .tap-port {
+  stroke: var(--trace);
+  stroke-width: 1;
+  paint-order: stroke;
+}
+
+.tap-clickable:focus-visible .tap-lead {
+  stroke: var(--trace);
+}
+
+/* --- pulses --------------------------------------------------------------- */
+
+.pulse-wake {
+  stroke-linecap: round;
+  opacity: 0.38;
+}
+
+.pulse-ghost .pulse-wake,
+.pulse-ghost .pulse-head {
+  stroke: var(--ghost);
+  fill: var(--ghost);
+}
+
+/* --- ghost replay strip ---------------------------------------------------- */
+
+.ghost-strip {
+  animation: strip-in 220ms ease-out both;
+}
+
+@keyframes strip-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+}
+
+.chip rect {
+  fill: #141b25;
+  stroke: #38424f;
+  stroke-width: 1;
+}
+
+.chip text {
+  fill: #8d97a6;
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.06em;
+}
+
+.chip-on rect {
+  fill: #202b3a;
+  stroke: #7d8898;
+}
+
+.chip-on text {
+  fill: var(--ink-bright);
+}
+
+/* --- chat ------------------------------------------------------------------ */
+
+.chat-pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+  padding: 16px 24px 18px;
+  gap: 12px;
+}
+
+.chat-transcript {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding-right: 8px;
+}
+
+.chat-entry-group {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.corr-chip {
+  flex: 0 0 auto;
+  width: 3px;
+  height: 12px;
+  border-radius: 1px;
+  align-self: center;
+}
+
+/* Entries with no chip still line up under the ones that have one. */
+.chat-entry-group > .chat-entry:first-child {
+  margin-left: 13px;
+}
+
+.chat-entry {
+  display: flex;
+  gap: 8px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--ink-bright);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.chat-entry > span:first-child:empty {
+  display: none;
+}
+
+.chat-glyph {
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-dim);
+}
+
+.chat-session {
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-dim);
+}
+
+.chat-user {
+  color: #fff;
+}
+
+.chat-steer {
+  color: var(--ink-bright);
+  font-style: italic;
+}
+
+.chat-answer {
+  color: var(--ink-bright);
+}
+
+/* A protocol anomaly is the one thing on this page worth interrupting for:
+   the panel exists to show the bus misbehaving. */
+.chat-anomaly {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--warn);
+  letter-spacing: 0.02em;
+}
+
+.chat-anomaly .chat-glyph,
+.chat-anomaly .chat-session {
+  color: var(--warn);
+}
+
+.chat-status,
+.chat-topic,
+.chat-cancel,
+.chat-progress {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-dim);
+  letter-spacing: 0.02em;
+}
+
+/* The progress glyph is the one full-colour emoji on the page; drain it. */
+.chat-progress > .chat-glyph {
+  filter: grayscale(1);
+  opacity: 0.55;
+}
+
+.chat-empty {
+  margin: auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-dim);
+  letter-spacing: 0.08em;
+}
+
+/* --- the read-only probe bar ------------------------------------------------ */
+
+.probe-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border-top: 1px solid var(--edge);
+  padding-top: 12px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-dim);
+  min-height: 38px;
+}
+
+.probe-label code {
+  color: var(--ink);
+}
+
+.probe-button {
+  background: transparent;
+  border: 1px solid var(--edge);
+  border-radius: 2px;
+  padding: 6px 14px;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.probe-button:hover {
+  color: var(--ink-bright);
+  border-color: #2c3644;
+}
+
+.probe-button:focus-visible {
+  outline: 1px solid var(--trace);
+  outline-offset: 1px;
+}
+
+.probe-button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* --- crash pane ------------------------------------------------------------- */
+
+.crash-pane {
+  max-width: 560px;
+  margin: 18vh auto 0;
+  padding: 28px;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+  font-family: var(--mono);
+  color: var(--ink);
+}
+
+.crash-pane h1 {
+  margin: 0 0 12px;
+  font-size: 14px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--warn);
+}
+
+.crash-pane p {
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--ink-dim);
+}
+
+.crash-pane pre {
+  overflow-x: auto;
+  padding: 10px;
+  background: var(--void);
+  border: 1px solid var(--edge);
+  border-radius: 2px;
+  font-size: 11px;
+  color: var(--ink-bright);
+}
+
+.crash-pane button {
+  background: transparent;
+  border: 1px solid var(--edge);
+  border-radius: 2px;
+  padding: 9px 18px;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.probe-result {
+  overflow-wrap: anywhere;
+}
+
+.probe-refused {
+  color: #6fbf87;
+}
+
+/* A publish that goes through means the read-only grant is broken: loud. */
+.probe-sent {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+.probe-error {
+  color: var(--ink);
+}
+
+/* --- connect form ------------------------------------------------------------ */
+
+.connect-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  max-width: 420px;
+  margin: 18vh auto 0;
+  padding: 28px;
+  background: var(--panel);
+  border: 1px solid var(--edge);
+  border-radius: 3px;
+  font-family: var(--mono);
+}
+
+.connect-form h1 {
+  margin: 0;
+  font-size: 14px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--ink-bright);
+}
+
+.connect-hint {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--ink-dim);
+}
+
+.connect-hint code {
+  color: var(--ink);
+}
+
+.connect-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-dim);
+}
+
+.connect-form input {
+  background: var(--void);
+  border: 1px solid var(--edge);
+  border-radius: 2px;
+  padding: 9px 12px;
+  color: var(--ink-bright);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.connect-form input:focus {
+  outline: none;
+  border-color: #2c3644;
+  box-shadow: 0 0 0 1px rgba(126, 178, 255, 0.18);
+}
+
+.connect-form button {
+  background: transparent;
+  border: 1px solid var(--edge);
+  border-radius: 2px;
+  padding: 9px 18px;
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+
+.connect-form button:hover {
+  color: var(--ink-bright);
+  border-color: #2c3644;
+}
+
+.connect-error {
+  margin: 0;
+  font-size: 11px;
+  color: var(--warn);
+  overflow-wrap: anywhere;
+}
+
+/* --- narrow screens -------------------------------------------------------- */
+
+@media (max-width: 720px) {
+  .rail-head,
+  .rail-foot,
+  .chat-pane {
+    padding-left: 14px;
+    padding-right: 14px;
+  }
+
+  .rail-foot {
+    flex-direction: column;
+    gap: 4px;
+    align-items: flex-start;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tap,
+  .ghost-strip,
+  .tap-closed {
+    animation-duration: 1ms;
+  }
+
+  .tap-closed {
+    opacity: 0;
+  }
+}

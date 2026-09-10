@@ -16,9 +16,10 @@
 #             cron would do, with the consequences left off.
 #   evaluate  Run the resolver and honour it. Exactly a cron tick, on demand.
 #
-# On a `schedule` event the mode is `evaluate` whatever the input says — inputs
-# are empty there anyway, and pinning it means a default edited later cannot
-# quietly turn the cron into a dry run.
+# Defense-in-depth: in kube-agents, release-publish.yml is dispatch-only and the
+# weekly cron lives decoupled on release-scheduler.yml. If a `schedule` event
+# were ever configured directly here, the mode is forced to `evaluate` whatever
+# the input says — ensuring an edited default cannot turn a cron tick into a dry run.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

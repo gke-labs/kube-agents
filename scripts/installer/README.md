@@ -18,23 +18,37 @@ agree on; it reads them from [`install.defaults.env`](../../install.defaults.env
 declares none itself. `install.sh`, `uninstall.sh`, and `upgrade.sh` source it rather than keeping
 their own copies:
 
-| Symbol                                   | What it fixes                                                                          |
-| ---------------------------------------- | -------------------------------------------------------------------------------------- |
-| `DEFAULT_CLUSTER_NAME`                   | GKE cluster name (`platform-agent-host`)                                               |
-| `DEFAULT_REGION`                         | GCP region (`us-central1`)                                                             |
-| `DEFAULT_CLUSTER_MODE`                   | Shape a fresh install creates (`autopilot`); a live cluster's probed shape always wins |
-| `DEFAULT_VERTEX_LOCATION`                | Vertex AI serving location (`global`)                                                  |
-| `DEFAULT_VERTEX_MANAGE_SERVING_PROJECT`  | Enable the API and grant the gateway's role in the serving project (`true`)            |
-| `DEFAULT_MODEL_PROVIDER`                 | Model provider (`gemini`)                                                              |
-| `DEFAULT_REGISTRY_PREFIX`                | Container registry prefix                                                              |
-| `default_model_for_provider <provider>`  | The default model for a provider                                                       |
-| `is_valid_model_provider <provider>`     | Accepted providers: `gemini`, `vertex_ai`, `anthropic`, `openai`                       |
-| `is_valid_permission_set <set>`          | Accepted GCP IAM permission sets: `read-only`, `custom`                                |
-| `require_supported_permission_set <set>` | The same check, reporting why a rejected value is rejected                             |
-| `is_valid_cluster_mode <mode>`           | Accepted cluster shapes: `autopilot`, `standard`                                       |
-| `derive_kms_location <region>`           | Region for Cloud KMS (strips a zone suffix)                                            |
-| `tf_state_bucket` / `tf_state_prefix`    | Where the install's Terraform state lives in GCS                                       |
-| `write_tfvars_from_state <dest> [tag]`   | The `terraform.tfvars` generator (reads the loaded `install.env` variable set)         |
+| Symbol                                                                    | What it fixes                                                                          |
+| ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| `DEFAULT_CLUSTER_NAME`                                                    | GKE cluster name (`platform-agent-host`)                                               |
+| `DEFAULT_REGION`                                                          | GCP region (`us-central1`)                                                             |
+| `DEFAULT_CLUSTER_MODE`                                                    | Shape a fresh install creates (`autopilot`); a live cluster's probed shape always wins |
+| `DEFAULT_VERTEX_LOCATION`                                                 | Vertex AI serving location (`global`)                                                  |
+| `DEFAULT_VERTEX_MANAGE_SERVING_PROJECT`                                   | Enable the API and grant the gateway's role in the serving project (`true`)            |
+| `DEFAULT_MODEL_PROVIDER`                                                  | Model provider (`gemini`)                                                              |
+| `DEFAULT_MODEL_GEMINI` / `_OPENAI` / `_ANTHROPIC`                         | The model each provider serves by default; the chart's `litellm.yaml` mirrors them     |
+| `DEFAULT_GEMINI_API_KEY_SECRET_NAME`                                      | Secret Manager secret a Gemini key is read from when none is given (`gemini-api-key`)  |
+| `DEFAULT_NAMESPACE`                                                       | Kubernetes namespace of the release (`kubeagents-system`)                              |
+| `DEFAULT_PLATFORM_AGENT_GSA_NAME`                                         | The agent's GCP service account id (`kubeagents-platform-gsa`); one name per project   |
+| `DEFAULT_GITHUB_MINTER_GSA_NAME`                                          | The minter's GCP service account id (`kubeagents-github-minter-gsa`); one per project  |
+| `DEFAULT_LITELLM_GSA_NAME`                                                | The gateway's Vertex AI service account id (`kubeagents-litellm-gsa`); one per project |
+| `DEFAULT_GKE_DB_KMS_KEYRING`                                              | Cloud KMS key ring for GKE database encryption (`platform-agent-keyring`)              |
+| `DEFAULT_GKE_DB_KMS_KEY`                                                  | Cloud KMS key for GKE database encryption (`k8s-secret-encryption-key`)                |
+| `DEFAULT_ENABLE_PUBSUB_PLATFORM` / `DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR` | The optional AgentPlugins (`false`)                                                    |
+| `DEFAULT_KUBE_AGENTS_STATE_BUCKET`                                        | The `KUBE_AGENTS_STATE_BUCKET` sentinel (`auto`) that derives the state bucket         |
+| `DEFAULT_TF_STATE_BUCKET_SUFFIX` / `DEFAULT_TF_STATE_PREFIX_ROOT`         | The derived bucket `<PROJECT_ID><suffix>` and prefix `<root>/<CLUSTER_NAME>`           |
+| `DEFAULT_REGISTRY_PREFIX`                                                 | Container registry prefix                                                              |
+| `default_model_for_provider <provider>`                                   | The default model for a provider                                                       |
+| `is_valid_model_provider <provider>`                                      | Accepted providers: `gemini`, `vertex_ai`, `anthropic`, `openai`                       |
+| `is_valid_permission_set <set>`                                           | Accepted GCP IAM permission sets: `read-only`, `custom`                                |
+| `require_supported_permission_set <set>`                                  | The same check, reporting why a rejected value is rejected                             |
+| `is_valid_cluster_mode <mode>`                                            | Accepted cluster shapes: `autopilot`, `standard`                                       |
+| `derive_kms_location <region>`                                            | Region for Cloud KMS (strips a zone suffix)                                            |
+| `tf_state_bucket` / `tf_state_prefix`                                     | Where the install's Terraform state lives in GCS                                       |
+| `kms_key_enabled_version <key> <ring> <location> <project>`               | The minter key's first ENABLED version, or nothing; one probe for three callers        |
+| `tf_state_has_cluster`                                                    | Whether that state manages THIS cluster (project, location and name all match)         |
+| `check_service_account_ownership`                                         | Refuses an apply that would 409 on a service account another install owns              |
+| `write_tfvars_from_state <dest> [tag]`                                    | The `terraform.tfvars` generator (reads the loaded `install.env` variable set)         |
 
 The values themselves live in [`install.defaults.env`](../../install.defaults.env) at the
 repository root, which `installer_common.sh` sources. That file does one job and holds
@@ -51,6 +65,30 @@ It is sourced **without** `set -a`, unlike `install.env`: these are the project'
 defaults, not the install's configuration, so they stay shell variables rather than
 entering the environment Terraform and the agent see.
 
+`terraform/examples/full-install/lifecycle.sh` sources the same file. It never sees
+`install.env` — it reads its inputs from the generated `terraform.tfvars` — but it has
+to agree with the front doors on where the state lives and on the agent GSA's default
+name, and reading those from the one file is what makes a hand-driven run and an
+installer-driven one name the same objects.
+
+`installer_common.sh` does declare constants of its own, and the distinction is the
+point: the Helm release name, the LiteLLM, operator and agent Deployment names, the
+`platform-agent-secrets` Secret, and the sandbox StatefulSet, credential-proxy
+Deployment and authorized-keys Secret the operator derives from the agent's name are
+the chart's and the operator's fixed names, which no `install.env` key can change, so
+they are `readonly` constants there (`KUBE_AGENTS_HELM_RELEASE`,
+`KUBE_AGENTS_OPERATOR_DEPLOYMENT`, `PLATFORM_AGENT_DEPLOYMENT`, `PLATFORM_AGENT_SECRET`,
+`LITELLM_DEPLOYMENT`, `PLATFORM_AGENT_SHELL_STATEFULSET`,
+`PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT`, `PLATFORM_AGENT_SHELL_AUTHORIZED_KEYS_SECRET`)
+rather than defaults an install could override. So are the Helm timeouts
+(`HELM_OPERATION_TIMEOUT`, `HELM_LOCK_POLL_INTERVAL`, `HELM_ROLLBACK_TIMEOUT`, each
+overridable from the environment for one run) and `IMAGE_TAG_FALLBACK`, which only a
+direct caller of the generator reaches because every front door rejects `latest`.
+Three things a front door needs before it has a checkout to read anything from — the
+clone URL, the clone directory and the Minty CLI tag — are named at the top of the
+front door that needs them, and `tests/test_install_script.py` pins the URL equal
+across the three.
+
 ## The install configuration: `install.env`
 
 An install has one hand-authored input and one derived artifact, and the difference
@@ -64,6 +102,9 @@ reach `write_tfvars_from_state` and the `TF_VAR_*` handoff, both of which read t
 environment. Order of authority is **flag, then file, then an exported variable, then
 the defaults above** — `set -a` sourcing means a key the file carries overwrites an
 export of the same name, so a flag is what overrides a recorded value for one run.
+One key is file-only: the front doors clear a shell-exported `NAMESPACE` before reading
+the file, because kubectl tooling exports that name and the value now reaches the Helm
+release's namespace. The dev tooling's `load_state` clears it the same way.
 `KUBE_AGENTS_INSTALL_ENV` points at a different path, which is how CI renders one from
 its own variables rather than keeping install state on an ephemeral runner.
 
@@ -96,7 +137,11 @@ only disagree with the live answer. `PROJECT_NUMBER` comes from `gcloud projects
 describe` and `KMS_LOCATION` from `derive_kms_location`. `create_cluster` and the
 **effective** `CLUSTER_MODE` come from `write_tfvars_from_state`'s own probe of the live
 cluster. `NO_CONFIRM` describes an invocation, not an install, and comes from
-`-y`/`--non-interactive`.
+`-y`/`--non-interactive`. The identity keys (`PLATFORM_AGENT_GSA_NAME`,
+`GITHUB_MINTER_GSA_NAME`, `LITELLM_GSA_NAME`, `GKE_DB_KMS_KEYRING`, `GKE_DB_KMS_KEY`) are
+written into a new `install.env` only when the run set them — a default copied in
+would freeze at that release, and a custom name that went missing would replace the
+account — and `NAMESPACE` is never copied in from the environment.
 
 `CLUSTER_MODE` in `install.env` therefore supplies one thing: the shape of a cluster that
 does not exist yet. Whenever the probe finds a cluster, that cluster's own shape wins and
@@ -114,8 +159,36 @@ when kubectl's current context is this install's cluster). `API_SERVER_KEY` is g
 once, when the configuration carries none and none can be recovered — not on every run,
 which used to replace the Secret and restart every pod holding it.
 
+### Cluster adoption and component toggles
+
 `SKIP_CERT_MANAGER=true` makes the generator emit `enable_cert_manager = false`, for a
-cluster whose cert-manager comes from somewhere else.
+cluster whose cert-manager comes from somewhere else. Without it, the generator probes an
+existing cluster for a `cert-manager` Deployment and emits `false` when it finds one that
+is not the composition's own; one whose release is in this install's Terraform state keeps
+`true`, so a retry after a failed apply, or an `upgrade.sh` run, does not have Terraform
+destroy the cert-manager it installed. A state that cannot be read also keeps `true`: the
+wrong `true` fails the apply on the existing CRDs, the wrong `false` destroys silently.
+
+A retry has one more leftover to clear. An apply that dies inside the kube-agents release
+leaves it in Helm's `failed` status, with no revision that ever served and no entry in
+Terraform state, and Helm refuses the retry's create with "cannot re-use a name that is
+still in use". When the cluster already exists, `install.sh` uninstalls exactly that
+release before the apply (`clear_failed_initial_helm_release`), and only while kubectl's
+current context is that cluster's; a failed release that served before, one the state
+manages, or one whose state cannot be read is left as it is.
+
+`MIGRATE_NODE_POOLS=true` (or `--migrate-node-pools`) authorizes migrating existing node pools
+using the legacy GCE metadata server to `GKE_METADATA`, which recreates the pool's nodes and restarts
+workloads. Without opt-in, the install aborts before making any cluster changes because kube-agents
+requires Workload Identity (`GKE_METADATA`).
+
+`ENABLE_NETWORK_POLICY=true` (or `--enable-network-policy`) authorizes enabling the legacy Calico
+NetworkPolicy addon and enforcement on pre-existing GKE Standard clusters lacking Dataplane V2.
+Enabling Calico may recreate nodes and restart workloads. Without opt-in, the install aborts before
+making any cluster changes because kube-agents requires NetworkPolicy enforcement.
+
+`ALLOW_UNENCRYPTED_SECRETS=true` skips the out-of-band Cloud KMS CMEK database encryption on
+pre-existing clusters (testing environments only).
 
 ### The predecessor: `vars.sh`
 

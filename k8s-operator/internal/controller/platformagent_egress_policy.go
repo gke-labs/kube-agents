@@ -373,12 +373,10 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 	// Unlike the gateway policy's rule 8, this one is kept when the agent
 	// resolves to no collector at all: otlpCollectorNamespace("") is the
 	// managed namespace, and the caller passes that through rather than
-	// dropping the rule, because the hermes_otel plugin does not read
-	// OTEL_EXPORTER_OTLP_ENDPOINT and keeps its baked gke-managed-otel backend
-	// on exactly that cluster (#933). Dropping the rule would turn that
-	// cosmetic gap into a blocked export the moment a collector appears there.
-	// A vendor endpoint or a bare hostname has no in-cluster namespace to
-	// name, so nothing is rendered for it, as for the gateway policy.
+	// dropping the rule, so that an export is not blocked the moment a
+	// collector appears there. A vendor endpoint or a bare hostname has no
+	// in-cluster namespace to name, so nothing is rendered for it, as for the
+	// gateway policy.
 	if otlpCollectorNS != "" {
 		rules = append(rules, networkingv1.NetworkPolicyEgressRule{
 			Ports: []networkingv1.NetworkPolicyPort{tcpPort(4317), tcpPort(4318)},

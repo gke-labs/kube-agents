@@ -29,7 +29,20 @@
 #   6. The agent GSA (account_id) is ForceNew. A lost agent_service_account_id
 #      override in install.env resolves back to the default name and plans a
 #      destructive replacement under -auto-approve. `guard_gsa_identity` refuses
-#      the apply before Terraform runs.
+#      the apply before Terraform runs. The release namespace is ForceNew the
+#      same way; `guard_release_namespace` refuses a move on apply and destroy.
+#   7. A state left by an interrupted install can hold the cluster's CMEK
+#      entries next to a create_cluster that the retry computes as false, and
+#      the module then plans their destruction. `forget_unmanaged_cluster_kms`
+#      drops them from state first; adopt_kms brings them back when the state
+#      creates a cluster again. `guard_cluster_ownership` refuses the other
+#      shape, a create over a cluster that already exists.
+#   8. The CMEK key ring and crypto key names are ForceNew as well, and the
+#      installer writes them into terraform.tfvars from install.env. A changed
+#      or lost GKE_DB_KMS_KEYRING / GKE_DB_KMS_KEY on a Terraform-created
+#      cluster plans the key's replacement and schedules the live key's
+#      versions for destruction under -auto-approve. `guard_kms_identity`
+#      refuses the apply first.
 #
 # Usage:
 #   ./lifecycle.sh apply    [extra terraform args...]
@@ -55,6 +68,23 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m warn\033[0m %s\n' "$*" >&2; }
 
+# The repository's install defaults, for what this script has to agree on with
+# the front doors and cannot read from terraform.tfvars: where the state lives
+# (the bucket a KUBE_AGENTS_STATE_BUCKET of "auto" derives and the prefix under
+# it) and the agent GSA's default name, which a hand-written tfvars leaves
+# null. The composition sources its modules from ../../modules, so this script
+# already runs only inside the repository, and the file is three levels up for
+# the same reason installer_common.sh finds it two up. Sourced without `set -a`,
+# as everywhere: defaults, not the install's configuration.
+INSTALL_DEFAULTS_FILE="${KUBE_AGENTS_INSTALL_DEFAULTS:-../../../install.defaults.env}"
+if [[ -r "$INSTALL_DEFAULTS_FILE" ]]; then
+  # shellcheck source=../../../install.defaults.env
+  . "$INSTALL_DEFAULTS_FILE"
+else
+  warn "cannot find the install defaults at ${INSTALL_DEFAULTS_FILE}; they ship with the repository (or point KUBE_AGENTS_INSTALL_DEFAULTS at a copy)."
+  return 1 2>/dev/null || exit 1
+fi
+
 # Remote state, opt-in. The composition ships no backend block — a hand-driven
 # example works fine on local state — but an installer-driven one cannot:
 # install.sh may run from a disposable clone, and uninstall.sh and upgrade.sh
@@ -67,6 +97,35 @@ warn() { printf '\033[1;33m warn\033[0m %s\n' "$*" >&2; }
 # project do not collide. Without the variable nothing here runs and local
 # state behaves exactly as before.
 BACKEND_OVERRIDE_FILE="backend_override.tf"
+
+# State addresses the guards below read. The cluster has three spellings:
+# one per mode, plus the index-less autopilot address a state predating the
+# mode switch still carries until its first plan renames it.
+CLUSTER_ADDRESSES=(
+  "module.gke_cluster.google_container_cluster.autopilot[0]"
+  "module.gke_cluster.google_container_cluster.standard[0]"
+  "module.gke_cluster.google_container_cluster.autopilot"
+)
+readonly CLUSTER_ADDRESSES
+# The cluster's CMEK resources, every one of which the gke-cluster module
+# manages only alongside a cluster it creates. The ring and the key are named
+# on their own because adopt_kms imports them and guard_kms_identity reads
+# them; the other two ride along in the list.
+readonly CLUSTER_KMS_KEYRING_ADDRESS="module.gke_cluster.google_kms_key_ring.gke_keyring[0]"
+readonly CLUSTER_KMS_KEY_ADDRESS="module.gke_cluster.google_kms_crypto_key.gke_key[0]"
+CLUSTER_KMS_ADDRESSES=(
+  "$CLUSTER_KMS_KEY_ADDRESS"
+  "$CLUSTER_KMS_KEYRING_ADDRESS"
+  "module.gke_cluster.google_kms_crypto_key_iam_member.gke_kms_binding[0]"
+  "module.gke_cluster.google_project_service_identity.gke_service_agent[0]"
+)
+readonly CLUSTER_KMS_ADDRESSES
+# The token minter's signing key ring and key, adopted and forgotten the same
+# way (KMS cannot delete either).
+readonly MINTER_KMS_KEYRING_ADDRESS="module.github_minter[0].google_kms_key_ring.minter"
+readonly MINTER_KMS_KEY_ADDRESS="module.github_minter[0].google_kms_crypto_key.minter"
+readonly HELM_RELEASE_ADDRESS="helm_release.kube_agents"
+readonly AGENT_GSA_ADDRESS="module.kube_agents_iam.google_service_account.agent"
 
 #
 # One argument, "readonly", suppresses the bucket creation for `plan`. A plan
@@ -90,8 +149,10 @@ ensure_backend() {
   local project bucket prefix region
   project=$(tfvar project_id)
   bucket="$KUBE_AGENTS_STATE_BUCKET"
-  [[ "$bucket" == "auto" ]] && bucket="${project}-kube-agents-tfstate"
-  prefix="${KUBE_AGENTS_STATE_PREFIX:-kube-agents/$(tfvar cluster_name)}"
+  # The same derivation as installer_common.sh's tf_state_bucket, from the same
+  # two defaults, so the front doors and a hand-driven run name one bucket.
+  [[ "$bucket" == "$DEFAULT_KUBE_AGENTS_STATE_BUCKET" ]] && bucket="${project}${DEFAULT_TF_STATE_BUCKET_SUFFIX}"
+  prefix="$(state_prefix)"
   # The bucket lives where the cluster does; strip a zone suffix to its region.
   region=$(sed -E 's/-[a-z]$//' <<<"$(tfvar location)")
 
@@ -126,6 +187,14 @@ ensure_backend() {
   fi
 }
 
+# Where this install's state lives under the bucket. One spelling, shared by
+# the backend override and the messages that tell an operator what to clear;
+# installer_common.sh's tf_state_prefix derives the front doors' answer from
+# the same default.
+state_prefix() {
+  echo "${KUBE_AGENTS_STATE_PREFIX:-${DEFAULT_TF_STATE_PREFIX_ROOT}/$(tfvar cluster_name)}"
+}
+
 # Runs before anything reads the configuration. init is idempotent and cheap
 # when nothing changed, and skipping it is how a routine `git pull` that adds a
 # module turns every subcommand below into a failure.
@@ -145,6 +214,7 @@ ensure_init() {
 # failing console left an empty value, `set -e` killed the script on the
 # assignment, and the run ended with no output whatsoever — which is exactly what
 # an uninitialised module did before ensure_init existed.
+#
 # A variable nobody set and whose default is null -- agent_service_account_id
 # in a hand-written tfvars -- prints as `tostring(null)` (a typed null; older
 # releases print `null`). Callers want "unset", not that spelling: read as a
@@ -168,9 +238,30 @@ tfvar() {
 # `grep -q` looks equivalent but is not: grep exits at the first match, terraform
 # dies of SIGPIPE, and `set -o pipefail` reports the whole pipeline as failed — so
 # an address that IS in state reads as absent purely because it sorts early.
+#
+# Read once per run and reused: every guard calls load_state, and a state list
+# is a backend round-trip each time. Anything that writes state -- import,
+# state rm, the targeted apply -- calls state_changed first, so the next
+# load_state reads again rather than trusting a snapshot it just invalidated.
 STATE_LIST=""
-load_state() { STATE_LIST=$(terraform state list 2>/dev/null || true); }
+STATE_LIST_FRESH=false
+load_state() {
+  [[ "$STATE_LIST_FRESH" == "true" ]] && return 0
+  STATE_LIST=$(terraform state list 2>/dev/null || true)
+  STATE_LIST_FRESH=true
+}
+state_changed() { STATE_LIST_FRESH=false; }
 in_state() { grep -Fxq "$1" <<<"$STATE_LIST"; }
+
+# The recorded value of a string attribute of a resource in state, for the
+# guards that compare it against the configuration. `head -1` keeps the
+# resource's own attribute when a nested block repeats the name (a key's
+# `name` before its `primary` version's): terraform state show prints the
+# top-level attributes first.
+state_attr() {
+  terraform state show -no-color "$1" 2>/dev/null |
+    sed -n "s/^ *$2 *= *\"\([^\"]*\)\".*/\1/p" | head -1
+}
 
 # terraform import configures every provider, and the helm provider here is built
 # from module.gke_cluster.cluster_endpoint — unknown until the cluster exists. On
@@ -243,8 +334,8 @@ adopt_kms() {
     keyring=$(tfvar kms_keyring_name)
     key=$(tfvar kms_key_name)
     targets+=(
-      "module.gke_cluster.google_kms_key_ring.gke_keyring[0]	keyring	projects/$project/locations/$location/keyRings/$keyring"
-      "module.gke_cluster.google_kms_crypto_key.gke_key[0]	key	projects/$project/locations/$location/keyRings/$keyring/cryptoKeys/$key"
+      "$CLUSTER_KMS_KEYRING_ADDRESS	keyring	projects/$project/locations/$location/keyRings/$keyring"
+      "$CLUSTER_KMS_KEY_ADDRESS	key	projects/$project/locations/$location/keyRings/$keyring/cryptoKeys/$key"
     )
   fi
 
@@ -253,19 +344,18 @@ adopt_kms() {
     minter_keyring=$(tfvar github_minter_kms_keyring)
     minter_key=$(tfvar github_minter_kms_key)
     targets+=(
-      "module.github_minter[0].google_kms_key_ring.minter	keyring	projects/$project/locations/$location/keyRings/$minter_keyring"
-      "module.github_minter[0].google_kms_crypto_key.minter	key	projects/$project/locations/$location/keyRings/$minter_keyring/cryptoKeys/$minter_key"
+      "$MINTER_KMS_KEYRING_ADDRESS	keyring	projects/$project/locations/$location/keyRings/$minter_keyring"
+      "$MINTER_KMS_KEY_ADDRESS	key	projects/$project/locations/$location/keyRings/$minter_keyring/cryptoKeys/$minter_key"
     )
   fi
 
   if [[ "$(tfvar enable_stockout_investigator)" == "true" ]]; then
+    # Each of the three variables has a default in variables.tf, and tfvar
+    # exits rather than returning empty, so no fallback is spelled here.
     local stockout_topic stockout_sub stockout_sink
     stockout_topic=$(tfvar stockout_pubsub_topic)
-    [[ -n "$stockout_topic" ]] || stockout_topic="gke-stockout-alerts-topic"
     stockout_sub=$(tfvar stockout_pubsub_subscription)
-    [[ -n "$stockout_sub" ]] || stockout_sub="gke-stockout-alerts-sub"
     stockout_sink=$(tfvar stockout_pubsub_sink)
-    [[ -n "$stockout_sink" ]] || stockout_sink="gke-stockout-alerts-sink"
     targets+=(
       "google_pubsub_topic.stockout_alerts[0]	pubsub_topic	projects/$project/topics/$stockout_topic"
       "google_pubsub_subscription.stockout_alerts[0]	pubsub_sub	projects/$project/subscriptions/$stockout_sub"
@@ -302,6 +392,7 @@ adopt_kms() {
 
     log "adopting pre-existing resource: $id"
     [[ -f "$OVERRIDE_FILE" ]] || with_override
+    state_changed
     if terraform import -input=false "$address" "$id" >/dev/null 2>&1; then
       adopted=$((adopted + 1))
       if [[ "$kind" == "key" ]]; then
@@ -372,6 +463,7 @@ adopt_pubsub() {
 
     log "adopting existing Pub/Sub resource: $id"
     [[ -f "$OVERRIDE_FILE" ]] || with_override
+    state_changed
     if terraform import -input=false "$address" "$id" >/dev/null 2>&1; then
       adopted=$((adopted + 1))
       # STATE_LIST is a snapshot taken by load_state above, so the
@@ -394,21 +486,85 @@ adopt_pubsub() {
 # plans the cluster's destruction. The installer derives create_cluster from a
 # liveness probe, so a re-run against an install whose cluster Terraform
 # created is exactly the run that would hit this.
+#
+# The other direction is guarded too. create_cluster = true with the cluster
+# absent from state is a create -- and a create over a cluster that already
+# exists is a 409 halfway through the apply, after the IAM and KMS resources
+# ahead of it have been applied. The installer derives create_cluster from
+# the state object, and state left by an interrupted run can answer "ours"
+# for a cluster it never finished creating (#1296); a hand-written tfvars can
+# say the same by mistake. Either way the remedy is a decision, not a retry,
+# so it is refused here with the choices spelled out.
 guard_cluster_ownership() {
-  [[ "$(tfvar create_cluster)" == "false" ]] || return 0
   load_state
-  local addr
-  for addr in \
-    "module.gke_cluster.google_container_cluster.autopilot[0]" \
-    "module.gke_cluster.google_container_cluster.standard[0]" \
-    "module.gke_cluster.google_container_cluster.autopilot"; do
-    if in_state "$addr"; then
-      warn "create_cluster is false, but this state already manages the cluster ($addr)."
-      warn "Applying now would plan the cluster's DESTRUCTION. Set create_cluster = true"
-      warn "in terraform.tfvars — this state created the cluster, so it is Terraform's to keep."
+  local addr managed=false
+  for addr in "${CLUSTER_ADDRESSES[@]}"; do
+    in_state "$addr" && managed=true && break
+  done
+
+  if [[ "$(tfvar create_cluster)" == "false" ]]; then
+    [[ "$managed" == "true" ]] || return 0
+    # Which cluster the entry names decides the remedy. Under a shared custom
+    # KUBE_AGENTS_STATE_PREFIX the state can manage some OTHER cluster, and
+    # "set create_cluster = true" would then plan that one's replacement.
+    local recorded cluster
+    recorded=$(state_attr "$addr" name)
+    cluster=$(tfvar cluster_name)
+    if [[ -n "$recorded" && -n "$cluster" && "$recorded" != "$cluster" ]]; then
+      warn "create_cluster is false, and this state manages a DIFFERENT cluster, '$recorded' ($addr), not '$cluster'."
+      warn "Applying now would plan the replacement of '$recorded'. Two installs are sharing one state prefix"
+      warn "($(state_prefix)); give this install its own KUBE_AGENTS_STATE_PREFIX, or unset it to take the per-cluster default."
       exit 1
     fi
-  done
+    warn "create_cluster is false, but this state already manages the cluster ($addr)."
+    warn "Applying now would plan the cluster's DESTRUCTION. Set create_cluster = true"
+    warn "in terraform.tfvars — this state created the cluster, so it is Terraform's to keep."
+    exit 1
+  fi
+
+  [[ "$managed" == "false" ]] || return 0
+  local cluster location project
+  cluster=$(tfvar cluster_name)
+  location=$(tfvar location)
+  project=$(tfvar project_id)
+  gcloud container clusters describe "$cluster" --location "$location" \
+    --project "$project" --format='value(name)' >/dev/null 2>&1 || return 0
+  warn "create_cluster is true, but cluster '$cluster' already exists in $project/$location and this state does not manage it."
+  warn "Applying now would try to CREATE it and fail with a 409 after the resources ahead of it have applied."
+  warn "If the cluster is somebody else's to install onto, set create_cluster = false."
+  warn "If this state created it and lost it, import it back first (the mode's address from ${CLUSTER_ADDRESSES[0]%%.google*}):"
+  warn "  terraform import 'module.gke_cluster.google_container_cluster.<autopilot|standard>[0]' projects/$project/locations/$location/clusters/$cluster"
+  warn "Through install.sh, run uninstall.sh or clear the state under gs://<bucket>/$(state_prefix)/ and re-run"
+  warn "install.sh, which derives create_cluster from the state and adopts the cluster."
+  exit 1
+}
+
+# The release's namespace is ForceNew on helm_release, and the installer now
+# writes it into terraform.tfvars from install.env's NAMESPACE. An install
+# whose configuration names a different namespace from the one its release
+# runs in -- a key that used to reach nothing, or a stray NAMESPACE in the
+# shell -- would otherwise have the release destroyed and recreated elsewhere
+# under -auto-approve, into a namespace the agent's fixed gateway endpoint
+# does not serve. Same shape as guard_gsa_identity, for the same reason.
+guard_release_namespace() {
+  load_state
+  local addr="$HELM_RELEASE_ADDRESS"
+  in_state "$addr" || return 0
+
+  local recorded
+  recorded=$(state_attr "$addr" namespace)
+  [[ -n "$recorded" ]] || return 0
+
+  local desired
+  desired=$(tfvar namespace)
+  [[ "$recorded" == "$desired" ]] && return 0
+
+  warn "namespace resolved to '$desired', but this state's release runs in '$recorded' ($addr)."
+  warn "Applying now would plan the release's DESTRUCTION and recreation in '$desired' under -auto-approve,"
+  warn "and the agent's gateway endpoint is fixed to the release namespace, so the moved release would not work."
+  warn "Set NAMESPACE=\"$recorded\" in install.env (or drop the key to take the default), or set namespace in"
+  warn "terraform.tfvars for a hand-driven apply."
+  exit 1
 }
 
 # account_id on google_service_account.agent is ForceNew, and the resource
@@ -421,30 +577,97 @@ guard_cluster_ownership() {
 # install #2 with no identity.
 guard_gsa_identity() {
   load_state
-  local addr="module.kube_agents_iam.google_service_account.agent"
+  local addr="$AGENT_GSA_ADDRESS"
   in_state "$addr" || return 0
 
   local recorded
-  recorded=$(terraform state show -no-color "$addr" 2>/dev/null |
-    sed -n 's/^ *account_id *= *"\([^"]*\)".*/\1/p' | head -1)
+  recorded=$(state_attr "$addr" account_id)
   [[ -n "$recorded" ]] || return 0
 
+  # The front doors always write agent_service_account_id, so empty here is a
+  # hand-written tfvars that left it null -- which Terraform resolves to the
+  # kube-agents-iam module's default, the same name the defaults file holds.
   local desired
   if ! desired=$(tfvar agent_service_account_id 2>/dev/null); then
-    desired="kubeagents-platform-gsa"
+    desired=""
   fi
-  if [[ "$desired" == "null" || "$desired" == "tostring(null)" || -z "$desired" ]]; then
-    desired="kubeagents-platform-gsa"
-  fi
+  [[ -n "$desired" ]] || desired="$DEFAULT_PLATFORM_AGENT_GSA_NAME"
 
   if [[ "$recorded" != "$desired" ]]; then
     warn "agent_service_account_id resolved to '$desired', but this state manages GSA '$recorded' ($addr)."
     warn "Applying now would plan the service account's DESTRUCTION and recreation under -auto-approve."
-    warn "If this install uses a custom GSA name, preserve it in install.env via:"
-    warn "  TF_VAR_agent_service_account_id=\"$recorded\""
-    warn "or pass it explicitly in terraform.tfvars."
+    warn "If this install uses a custom GSA name, record it in install.env, which the front doors regenerate terraform.tfvars from:"
+    warn "  PLATFORM_AGENT_GSA_NAME=\"$recorded\""
+    warn "A hand-driven apply sets agent_service_account_id in terraform.tfvars instead."
     exit 1
   fi
+}
+
+# `name` is ForceNew on google_kms_key_ring and google_kms_crypto_key, neither
+# carries prevent_destroy, and the installer writes both names into
+# terraform.tfvars from install.env's GKE_DB_KMS_KEYRING / GKE_DB_KMS_KEY. On
+# a cluster this state created, a name that disagrees with state -- a rotation
+# attempted by renaming, or a second install's recorded line going missing --
+# plans the key's destruction and recreation under -auto-approve; destroying
+# the crypto key schedules every version of the LIVE key for destruction, and
+# the cluster can no longer read its own etcd. Same shape as guard_gsa_identity.
+# Only the create_cluster = true shape manages these entries;
+# forget_unmanaged_cluster_kms owns the other one.
+guard_kms_identity() {
+  [[ "$(tfvar create_cluster)" != "false" ]] || return 0
+  load_state
+  # address <TAB> tfvars variable <TAB> install.env key
+  local -a checks=(
+    "$CLUSTER_KMS_KEYRING_ADDRESS	kms_keyring_name	GKE_DB_KMS_KEYRING"
+    "$CLUSTER_KMS_KEY_ADDRESS	kms_key_name	GKE_DB_KMS_KEY"
+  )
+  local check addr variable key recorded desired
+  for check in "${checks[@]}"; do
+    IFS=$'\t' read -r addr variable key <<<"$check"
+    in_state "$addr" || continue
+    recorded=$(state_attr "$addr" name)
+    [[ -n "$recorded" ]] || continue
+    desired=$(tfvar "$variable")
+    [[ "$recorded" != "$desired" ]] || continue
+    warn "$variable resolved to '$desired', but this state manages the CMEK resource '$recorded' ($addr)."
+    warn "Applying now would plan its DESTRUCTION and recreation under -auto-approve, and destroying the crypto key"
+    warn "schedules the live key's versions for destruction, after which the cluster cannot read its own etcd."
+    warn "Set ${key}=\"$recorded\" in install.env (or drop the key to take the default), or set $variable in"
+    warn "terraform.tfvars for a hand-driven apply. A key is rotated in Cloud KMS, not by renaming it here."
+    exit 1
+  done
+}
+
+# create_cluster = false hands the cluster's CMEK resources back as well: the
+# gke-cluster module manages them only alongside a cluster it creates
+# (manage_kms = create_cluster && enable_database_encryption), so any of them
+# still in state -- adopted by a retry that believed it was creating the
+# cluster, the state an interrupted install leaves behind (#1296) -- goes
+# from count = 1 to 0 and the apply DESTROYS it. For the crypto key that
+# schedules every version for destruction and leaves the live cluster unable
+# to read its own etcd. Forgetting them first is the treatment forget_kms
+# gives them on destroy: the key ring and key stay in GCP, and adopt_kms
+# imports them back the day this state creates a cluster again.
+forget_unmanaged_cluster_kms() {
+  [[ "$(tfvar create_cluster)" == "false" ]] || return 0
+  load_state
+  local address forgot=false
+  for address in "${CLUSTER_KMS_ADDRESSES[@]}"; do
+    in_state "$address" || continue
+    log "forgetting $address (create_cluster = false; kept in GCP, re-adopted when this state creates a cluster)"
+    state_changed
+    terraform state rm "$address" >/dev/null 2>&1 ||
+      warn "could not forget $address; the apply may schedule its key versions for destruction"
+    forgot=true
+  done
+  [[ "$forgot" == "true" ]] || return 0
+  # A bare apply on this state may already have scheduled the versions.
+  local project location
+  project=$(tfvar project_id)
+  location=$(sed -E 's/-[a-z]$//' <<<"$(tfvar location)")
+  restore_key_versions \
+    "projects/$project/locations/$location/keyRings/$(tfvar kms_keyring_name)/cryptoKeys/$(tfvar kms_key_name)" \
+    "$location" "$project"
 }
 
 delete_agent_cr() {
@@ -484,6 +707,9 @@ delete_agent_cr() {
     warn "finalizer did not clear in time; removing it so the namespace can terminate"
     kubectl patch "$ref" -n "$namespace" --type=merge \
       -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+    # The operator's naming, kubeagents:minimal:<namespace>:<name>, from
+    # k8s-operator/internal/controller/platformagent_manifests.go; a bash
+    # script cannot import it, so this must move when that does.
     kubectl delete clusterrolebinding "kubeagents:minimal:${namespace}:${ref##*/}" \
       --ignore-not-found >/dev/null 2>&1 || true
     kubectl delete clusterrole "kubeagents:minimal:${namespace}:${ref##*/}" \
@@ -499,6 +725,9 @@ purge_backups() {
   project=$(tfvar project_id)
   # Backup for GKE plans are regional, whatever the cluster location is.
   location=$(sed -E 's/-[a-z]$//' <<<"$(tfvar location)")
+  # The gke-backup-plan module's own derivation for a null `name`, which is
+  # the only value this composition ever passes (main.tf sets no name), so
+  # the plan cannot be called anything else here.
   plan="$(tfvar cluster_name)-backup-plan"
 
   gcloud beta container backup-restore backup-plans describe "$plan" \
@@ -528,10 +757,7 @@ disable_deletion_protection() {
   # no cluster in state at all and falls through to return 0.
   local address="" candidate
   load_state
-  for candidate in \
-    "module.gke_cluster.google_container_cluster.autopilot[0]" \
-    "module.gke_cluster.google_container_cluster.standard[0]" \
-    "module.gke_cluster.google_container_cluster.autopilot"; do
+  for candidate in "${CLUSTER_ADDRESSES[@]}"; do
     if in_state "$candidate"; then
       address="$candidate"
       break
@@ -552,6 +778,7 @@ disable_deletion_protection() {
   [[ "$recorded" == "true" ]] || return 0
 
   log "clearing deletion_protection so the cluster can be destroyed"
+  state_changed
   terraform apply -input=false -auto-approve \
     -var="deletion_protection=false" -target="$address" >/dev/null
 }
@@ -565,12 +792,13 @@ forget_kms() {
   load_state
   local address
   for address in \
-    "module.gke_cluster.google_kms_crypto_key.gke_key[0]" \
-    "module.gke_cluster.google_kms_key_ring.gke_keyring[0]" \
-    "module.github_minter[0].google_kms_crypto_key.minter" \
-    "module.github_minter[0].google_kms_key_ring.minter"; do
+    "$CLUSTER_KMS_KEY_ADDRESS" \
+    "$CLUSTER_KMS_KEYRING_ADDRESS" \
+    "$MINTER_KMS_KEY_ADDRESS" \
+    "$MINTER_KMS_KEYRING_ADDRESS"; do
     in_state "$address" || continue
     log "forgetting $address (kept in GCP; re-adopted on the next apply)"
+    state_changed
     terraform state rm "$address" >/dev/null 2>&1 ||
       warn "could not forget $address; its key versions may be scheduled for destruction"
   done
@@ -584,6 +812,7 @@ case "${1:-}" in
   adopt-kms)
     shift
     ensure_init
+    forget_unmanaged_cluster_kms
     adopt_kms
     ;;
   plan)
@@ -614,6 +843,9 @@ case "${1:-}" in
     ensure_init
     guard_cluster_ownership
     guard_gsa_identity
+    guard_kms_identity
+    guard_release_namespace
+    forget_unmanaged_cluster_kms
     adopt_kms
     adopt_pubsub
     log "terraform apply"
@@ -646,6 +878,10 @@ case "${1:-}" in
       fi
       set -- "$@" -auto-approve
     fi
+    # The CR is deleted in the configured namespace; a configuration that
+    # names a different one from the release's would skip it and leave its
+    # finalizer for terraform destroy to trip over.
+    guard_release_namespace
     delete_agent_cr
     purge_backups
     disable_deletion_protection
@@ -661,7 +897,7 @@ case "${1:-}" in
     # The line range is the header comment above, so it moves whenever that
     # comment grows. It ends at the blank comment line before `set -euo
     # pipefail`.
-    sed -n '2,50p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,63p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac

@@ -199,8 +199,8 @@ Rules:
   `docs/credential-isolation-design.md`.
 - **Do not document pull-request status.** Docs describe the current state of `main`; a merged PR
   leaves that prose silently stale.
-- **Verify identifiers against source, not against other docs.** Service account names live in
-  `scripts/installer/common.sh`, the Go version in `k8s-operator/go.mod`.
+- **Verify identifiers against source, not against other docs.** GCP service account names live
+  in `install.defaults.env`, the Go version in `k8s-operator/go.mod`.
 - **Add a document to the map (`docs/README.md`) with one line, and change nothing else there.**
   Write the row in the compact `| cell | cell |` form and never re-align a table: the map is edited
   from several branches every week, and a re-aligned table rewrites rows your PR did not author.

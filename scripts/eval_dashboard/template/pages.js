@@ -67,7 +67,11 @@ function parseIso(value) {
   let text = value;
   // ISO 8601 with a space separator is what fromisoformat reads as UTC too.
   if (/^\d{4}-\d{2}-\d{2} \d/.test(text)) text = text.replace(" ", "T");
-  if (text.includes("T") && !/(?:[zZ]|[+-]\d\d:?\d\d)$/.test(text)) text += "Z";
+  // ECMA-262's date-time format wants the colon in the offset; a bare
+  // ±HHMM (which isoParamRe and fromisoformat both admit) parses in V8
+  // and not elsewhere, so it is normalised before Date.parse sees it.
+  if (text.includes("T")) text = text.replace(/([+-]\d\d)(\d\d)$/, "$1:$2");
+  if (text.includes("T") && !/(?:[zZ]|[+-]\d\d:\d\d)$/.test(text)) text += "Z";
   const ms = Date.parse(text);
   return Number.isNaN(ms) ? null : ms;
 }
@@ -141,14 +145,18 @@ function normalizeHealth(raw) {
 
 /* ---- URL contract ---- */
 
+// The `cases` grammar, shared by the parser and the writer so a link the
+// pages build is one the pages read whole: in-grammar ids, the first
+// maxLinkCases of them.
+function linkCaseIds(values) {
+  return values.map((v) => String(v).trim()).filter((id) => PAGE.caseIdRe.test(id)).slice(0, PAGE.maxLinkCases);
+}
+
 function linkState() {
   const out = { cases: new Set(), sinceMs: null, untilMs: null, build: null, hash: "" };
   let params;
   try { params = new URLSearchParams(location.search); } catch (err) { return out; }
-  for (const id of (params.get("cases") || "").split(",").slice(0, PAGE.maxLinkCases)) {
-    const trimmed = id.trim();
-    if (PAGE.caseIdRe.test(trimmed)) out.cases.add(trimmed);
-  }
+  for (const id of linkCaseIds((params.get("cases") || "").split(","))) out.cases.add(id);
   const since = params.get("since") || "";
   if (PAGE.isoParamRe.test(since)) out.sinceMs = parseIso(since);
   const until = params.get("until") || "";
@@ -164,7 +172,8 @@ function linkState() {
 
 function incidentHref(inc) {
   const params = [];
-  if (inc.cases.length) params.push(`cases=${inc.cases.map(encodeURIComponent).join(",")}`);
+  const cases = linkCaseIds(inc.cases);
+  if (cases.length) params.push(`cases=${cases.map(encodeURIComponent).join(",")}`);
   if (inc.sinceMs != null) params.push(`since=${encodeURIComponent(utcIso(inc.sinceMs))}`);
   if (inc.untilMs != null) params.push(`until=${encodeURIComponent(utcIso(inc.untilMs))}`);
   return "index.html" + (params.length ? `?${params.join("&")}` : "") + "#gate";
@@ -339,6 +348,9 @@ function mergesFact(inc, inWindow) {
   if (!Array.isArray(brief.merges)) return null;
   const firstRed = inWindow.find((r) => gateFailures(r).some((c) => inc.cases.includes(c)));
   const firstRedMs = firstRed ? runFinish(firstRed) : inc.sinceMs;
+  // No red run in the window and no parseable `since`: nothing anchors
+  // "before", so the line is dropped rather than dated from epoch zero.
+  if (firstRedMs == null) return null;
   const greensBefore = runs().filter((r) => isGreen(r) && measured(r) && runFinish(r) < firstRedMs).sort((a, b) => runFinish(a) - runFinish(b));
   const fromMs = greensBefore.length ? runFinish(greensBefore[greensBefore.length - 1]) : firstRedMs - PAGE.mergesLookbackMs;
   const merges = brief.merges.filter((m) => { const at = parseIso(m.at); return at != null && at >= fromMs && at <= firstRedMs; });
@@ -402,6 +414,8 @@ function briefHeadline(inc, inWindow) {
 }
 
 function recoveryProgress(inc) {
+  // No start on record: nothing is "after" the incident, so no run counts.
+  if (inc.sinceMs == null) return 0;
   const later = runs().filter((r) => measured(r) && concluded(r) && runFinish(r) > inc.sinceMs).sort((a, b) => runFinish(b) - runFinish(a));
   const prs = new Set();
   let count = 0;
@@ -451,6 +465,10 @@ function changedBeforeHtml(inc, inWindow) {
   if (!Array.isArray(brief.merges)) return "";
   const firstRed = inWindow.find((r) => isBreak(inc) ? gateFailures(r).some((c) => inc.cases.includes(c)) : (inc.condition === "setup_deaths" ? r.setup_death : (r.storm_reps || 0) > 0));
   const firstRedMs = firstRed ? runFinish(firstRed) : inc.sinceMs;
+  if (firstRedMs == null) {
+    // Same anchor as mergesFact: without it there is no "before" to show.
+    return `<div class="sec"><h2>What changed right before</h2><p class="mut">The incident has no start time on record and no run in this window anchors it, so the merges before it cannot be picked out.</p></div>`;
+  }
   const fromMs = firstRedMs - PAGE.mergesLookbackMs;
   const merges = brief.merges.filter((m) => { const at = parseIso(m.at); return at != null && at >= fromMs && at <= firstRedMs; });
   const body = merges.length

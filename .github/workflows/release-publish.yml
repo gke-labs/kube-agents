@@ -5,21 +5,20 @@ name: Release & Publish (GA)
 #
 # Whether to release is decided in `evaluate-schedule`; what to publish is
 # decided in `publish-release`. An unattended run needs that split: it adds the
-# halt on a breaking change, which the publishing path has no counterpart for,
-# and it keeps the two shapes that exit 1 with nothing to ship — no staging tag
-# at all, and a GA tag left by an emergency release on a commit that is not the
-# candidate's stamped child — from being a red run nobody reads.
+# halt on a major breaking change on stable GA (>= 1.0.0), which the publishing
+# path has no counterpart for, and it keeps the two shapes that exit 1 with
+# nothing to ship — no staging tag at all, and a GA tag left by an emergency release
+# on a commit that is not the candidate's stamped child — from being a red run
+# nobody reads.
 #
 # `scripts/release/README.md`, "The weekly GA release", is canonical for the cron
 # value and the reasoning behind it — do not restate either here.
 
 on:
-  # No `schedule:` yet, and the reason is upstream of this workflow: the gate now
-  # reads the staging tag, and nightly-pipeline.yml — the only thing that pushes
-  # one — is itself dispatch-only. A weekly cron over a tag family nothing
-  # produces on a schedule would skip green every Thursday and prove nothing.
-  # Turn the nightly cron on first; scripts/release/README.md has the value and
-  # the ordering.
+  # No `schedule:` on this workflow: scheduled execution is owned by
+  # release-scheduler.yml via the decoupled trigger pattern, so a weekly tick
+  # with nothing to publish produces no pipeline run at all. Explicit overrides
+  # and manual dispatches remain supported here via workflow_dispatch.
   #checkov:skip=CKV_GHA_7:GA release publish workflow requires explicit version override, target commit, emergency bypass and schedule-gate parameters
   workflow_dispatch:
     inputs:
@@ -67,8 +66,8 @@ jobs:
   evaluate-schedule:
     name: Decide Whether To Release
     runs-on: ubuntu-latest
-    # A fork inherits workflow_dispatch — and will inherit the cron — but none
-    # of the release credentials. The guard repeats on both jobs rather than
+    # A fork inherits workflow_dispatch but none of the release credentials.
+    # The guard repeats on both jobs rather than
     # relying on the skip cascading through `needs`: an `always()` added to the
     # publish job later would silently un-guard it.
     if: github.repository == 'gke-labs/kube-agents' && github.ref == 'refs/heads/main'
@@ -118,8 +117,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: evaluate-schedule
     # The same repository and branch guard as the gate job, plus its verdict.
-    # On a `schedule` event `github.ref` is the default branch, so the second
-    # clause holds for a cron tick and pins a manual dispatch to `main`.
+    # Pins execution to the main branch on gke-labs/kube-agents and requires the
+    # evaluate-schedule gate to pass.
     if: |
       github.repository == 'gke-labs/kube-agents' &&
       github.ref == 'refs/heads/main' &&
@@ -131,7 +130,7 @@ jobs:
     steps:
       - name: Generate Release Bot Token
         id: release-token
-        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           app-id: ${{ vars.RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.RELEASE_BOT_APP_PRIVATE_KEY }}
@@ -149,8 +148,9 @@ jobs:
         env:
           EXPLICIT_RELEASE_VERSION: ${{ inputs.explicit_release_version }}
           # An unattended run releases the exact commit the gate passed, not
-          # whatever the scripts would auto-resolve. `inputs.target_commit` is
-          # empty on a schedule event, so the gate's answer is what is left; on a
+          # whatever the scripts would auto-resolve. On a scheduler dispatch
+          # (dispatched with schedule_gate=evaluate), `inputs.target_commit` is
+          # omitted, so the gate's resolved candidate is what is left; on a
           # bypassing dispatch the gate returns empty and a named commit — or the
           # scripts' own resolution — wins.
           #
@@ -226,7 +226,7 @@ jobs:
 
       - name: Install Syft
         if: steps.verify-eligibility.outputs.skip_release != 'true'
-        uses: anchore/sbom-action/download-syft@aa80c8c5bd439a416a62804f2151ab38c671a638 # v0.24.1
+        uses: anchore/sbom-action/download-syft@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           syft-version: "v1.51.1"
 

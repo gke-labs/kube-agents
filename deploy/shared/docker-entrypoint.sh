@@ -20,6 +20,7 @@ umask 0002
 # next container start fixes on its own. Step 5.7 warns on it and lets the agent
 # come up; every other non-zero exit there is still fatal. Change both together.
 readonly SANDBOX_MIRROR_RETRY_RC=2
+readonly OTEL_FLAG_DISABLED="--disabled"
 
 export TARGET_DIR="${PLATFORM_AGENT_HOME:-/opt/data}"
 export HERMES_HOME="$TARGET_DIR"
@@ -1408,7 +1409,10 @@ fi
 # Both values come from the operator's env. The endpoint matters because hermes_otel does
 # NOT read OTEL_EXPORTER_OTLP_ENDPOINT — its backend URL is baked into the image, so
 # without this sweep a customer-configured collector would show up in the pod env and in
-# .status.telemetry while every span still went to the GKE managed collector.
+# .status.telemetry while every span still went to the GKE managed collector. Likewise,
+# when telemetry is disabled (OTEL_SDK_DISABLED=true or HERMES_OTEL_ENABLED=false), passing
+# --disabled turns off hermes_otel and clears backends so spans are not exported to an
+# unresolvable default.
 #
 # Every profile carries its own copy of the plugin config (profile_scaffold copytrees
 # /opt/defaults/plugins), so otel_config sweeps them all, deriving each from the pristine
@@ -1422,11 +1426,18 @@ fi
 # this far. The step-1.5 gate now stops that container much earlier; this guard is what
 # keeps a non-primary owner (an HA replica) from repeating the damage.
 if [ "$IS_BOOTSTRAP_PRIMARY" = "1" ] && [ -f "$TARGET_DIR/scripts/otel_config.py" ]; then
+    OTEL_EXTRA_ARGS=""
+    hermes_otel_val=$(printf '%s' "${HERMES_OTEL_ENABLED:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    otel_sdk_val=$(printf '%s' "${OTEL_SDK_DISABLED:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    if [ "$hermes_otel_val" = "false" ] || { [ "$hermes_otel_val" != "true" ] && [ "$otel_sdk_val" = "true" ]; }; then
+        OTEL_EXTRA_ARGS="$OTEL_FLAG_DISABLED"
+    fi
     PYTHONPATH="$TARGET_DIR/scripts" "$INSTALL_DIR/.venv/bin/python3" "$TARGET_DIR/scripts/otel_config.py" \
         --hermes-home "$TARGET_DIR" \
         --service-name "${OTEL_SERVICE_NAME:-}" \
         --endpoint "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" \
         --defaults-plugins /opt/defaults/plugins \
+        $OTEL_EXTRA_ARGS \
         || echo "WARN: could not update the OpenTelemetry plugin config; traces may go to the image default" >&2
 fi
 

@@ -101,6 +101,7 @@ func TestBuildDeploymentDisabledTelemetryIsOverridable(t *testing.T) {
 					Env: []corev1.EnvVar{
 						{Name: "OTEL_SDK_DISABLED", Value: "false"},
 						{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: "http://insisted-on:4318"},
+						{Name: "HERMES_OTEL_ENABLED", Value: "true"},
 					},
 				},
 			},
@@ -116,6 +117,9 @@ func TestBuildDeploymentDisabledTelemetryIsOverridable(t *testing.T) {
 	}
 	if got := m["OTEL_EXPORTER_OTLP_ENDPOINT"].Value; got != "http://insisted-on:4318" {
 		t.Errorf("expected the pinned endpoint, got %q", got)
+	}
+	if got := m["HERMES_OTEL_ENABLED"].Value; got != "true" {
+		t.Errorf("expected HERMES_OTEL_ENABLED to be overridable, got %q", got)
 	}
 }
 
@@ -153,6 +157,26 @@ func TestBuildNetworkPolicyOmitsCollectorEgressWhenDisabled(t *testing.T) {
 	disabled := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", true)
 	if hasCollectorEgress(disabled, "gke-managed-otel") {
 		t.Error("expected no collector egress rule when telemetry is disabled")
+	}
+}
+
+func TestBuildNetworkPolicyAllowsCollectorEgressWhenHermesOtelForced(t *testing.T) {
+	agent := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-agent", Namespace: "my-ns"},
+		Spec: agentv1alpha1.PlatformAgentSpec{
+			AgentSpec: agentv1alpha1.AgentSpec{
+				Deployment: &agentv1alpha1.DeploymentSpec{
+					Env: []corev1.EnvVar{
+						{Name: "HERMES_OTEL_ENABLED", Value: "true"},
+					},
+				},
+			},
+		},
+	}
+
+	netpol := buildNetworkPolicy(agent, nil, defaultTestNetpolProfile(), false, "", true)
+	if !hasCollectorEgress(netpol, "gke-managed-otel") {
+		t.Error("expected collector egress rule when HERMES_OTEL_ENABLED=true even if otlpDisabled=true")
 	}
 }
 

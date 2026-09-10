@@ -80,6 +80,9 @@ validated: false
 # fix landing as a pull request, nothing applied directly.
 domain: remediation
 
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
 # The seeded-fleet defects this scenario asserts on, named by ROLE rather than
 # by cluster: each eval project carries its own trio and this case has to run
 # unchanged against all of them. Roles are defined in

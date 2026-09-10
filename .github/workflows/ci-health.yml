@@ -170,6 +170,21 @@ jobs:
           workload_identity_provider: ${{ env.WIF_PROVIDER }}
           service_account: ${{ env.COLLECT_SA }}
 
+      # setup-gcloud registers a credential only if one exists when it runs,
+      # and it runs before either auth step. gcloud honours the credential
+      # file the auth step exports through an environment variable; gsutil
+      # does not, and without this login every gsutil call in the job ran as
+      # an anonymous caller (401 on the bucket, 40 failed ticks on
+      # 2026-09-10). `gcloud auth login --cred-file` is what setup-gcloud
+      # would have done, and it makes the credential the active account for
+      # gcloud, gsutil and `gcloud auth print-access-token` alike. Moving
+      # setup-gcloud below this auth step would fix only this half; the
+      # publisher half below needs the same login (or a second SDK download),
+      # so one mechanism serves both. An empty path would send gcloud to the
+      # interactive browser flow and hang the job, hence the `:?` guard.
+      - name: Make the Prow-archive reader credential active for gsutil
+        run: gcloud auth login --cred-file="${GOOGLE_GHA_CREDS_PATH:?the auth step exported no credential file}" --quiet
+
       - name: Collect (incremental, onto the published data.json)
         id: collect
         continue-on-error: true
@@ -212,6 +227,11 @@ jobs:
         with:
           workload_identity_provider: ${{ env.WIF_PROVIDER }}
           service_account: ${{ env.CI_HEALTH_SA }}
+
+      # Same as the reader's login above: make this credential the active
+      # account for gsutil (and the Chat token mint) too.
+      - name: Make the publisher credential active for gsutil
+        run: gcloud auth login --cred-file="${GOOGLE_GHA_CREDS_PATH:?the auth step exported no credential file}" --quiet
 
       - name: Fetch data.json (after a failed collect) and the last-posted state
         env:

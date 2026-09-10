@@ -37,6 +37,10 @@ const defaultTaskDeadline = 30 * time.Minute
 // the horizon rationale.
 const defaultAskTTL = 24 * time.Hour
 
+// defaultFirstEventGrace is what FirstEventGrace means when unset; the
+// field's comment carries the sizing rationale.
+const defaultFirstEventGrace = 10 * time.Minute
+
 // Config is the gateway's runtime configuration. The env contract matches
 // what the W6 operator renders onto the a2a-gateway Deployment; everything
 // else has playground defaults.
@@ -110,6 +114,27 @@ type Config struct {
 	// retention erodes exactly that claim; lowering it only trims how long
 	// a status card can echo the ask.
 	AskTTL time.Duration
+
+	// FirstEventGrace bounds how long an active task with NOTHING on its
+	// events subject may hold a conversation's serialization
+	// (A2A_FIRST_EVENT_GRACE). Every other bound assumes a pod: the adapter's
+	// deadline runs from task start inside the worker, the pod deadline from
+	// pod start, and Sweep watches pod phases — so a task whose executor
+	// never came up (a spawn that never happened, a bus that dropped between
+	// the two publishes, a gateway restart mid-turn) has no events for the
+	// heal in handleInbound to see a terminal in, and the record steers every
+	// later message into it. Past this grace the heal treats "no events" as
+	// "never started" and releases the serialization; it publishes no
+	// terminal for the task, because age alone is not evidence. Unset
+	// means 10 minutes: the spec's cold start is 5-10s and the pod deadline's
+	// pre-start budget (podDeadlineGrace, the image pull before the process
+	// starts) is 10 minutes, so a task still legitimately pre-first-event at
+	// this age is a pod that will not be coming up. Lowering it risks
+	// releasing a slow-starting worker's task out from under it — the next
+	// turn then starts a second task while the first may still emit;
+	// raising it is how long a user waits before the conversation answers
+	// again. Values under 1m are refused at boot.
+	FirstEventGrace time.Duration
 
 	// OwnerDeployment names the gateway's own Deployment
 	// (A2A_OWNER_DEPLOYMENT; the operator renders its own render's name).
@@ -212,6 +237,16 @@ func FromEnv() (*Config, error) {
 		return nil, fmt.Errorf("A2A_ASK_TTL %q is under the 1m floor; it would erase the ask from status cards while the task runs", askTTL)
 	}
 	cfg.AskTTL = at
+
+	grace := envOr("A2A_FIRST_EVENT_GRACE", defaultFirstEventGrace.String())
+	fg, err := time.ParseDuration(grace)
+	if err != nil {
+		return nil, fmt.Errorf("A2A_FIRST_EVENT_GRACE %q: %w", grace, err)
+	}
+	if fg < time.Minute {
+		return nil, fmt.Errorf("A2A_FIRST_EVENT_GRACE %q is under the 1m floor; it would release a task still cold-starting", grace)
+	}
+	cfg.FirstEventGrace = fg
 
 	cfg.OwnerDeployment = os.Getenv("A2A_OWNER_DEPLOYMENT")
 

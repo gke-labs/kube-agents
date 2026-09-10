@@ -52,16 +52,17 @@ forbid() {
 }
 
 # --- Identity names -------------------------------------------------------
-# Ground truth: scripts/installer/common.sh
+# Ground truth: install.defaults.env for the GCP service accounts and the
+# namespace, scripts/installer/common.sh for the Kubernetes service accounts.
 forbid 'kubeagents-platform-agent-gsa' \
-  "Wrong GCP service account name. common.sh sets PLATFORM_AGENT_GSA_NAME=kubeagents-platform-gsa."
+  "Wrong GCP service account name. install.defaults.env sets DEFAULT_PLATFORM_AGENT_GSA_NAME=kubeagents-platform-gsa."
 
 forbid 'platform-agent-ksa' \
   "Wrong Kubernetes service account name. common.sh sets PLATFORM_AGENT_KSA_NAME=kubeagents-platform-agent (no -ksa suffix)."
 
 # --- Namespace ------------------------------------------------------------
 forbid 'platform-agent-system' \
-  "Stale namespace. The namespace is kubeagents-system."
+  "Stale namespace. install.defaults.env sets DEFAULT_NAMESPACE=kubeagents-system."
 
 # --- GKE host-discovery label -------------------------------------------
 # Ground truth: scripts/installer/common.sh. The Terraform full-install
