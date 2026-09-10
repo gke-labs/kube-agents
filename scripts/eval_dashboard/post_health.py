@@ -71,7 +71,9 @@ except ImportError:  # run as a script: scripts/eval_dashboard/post_health.py
 STATE_SCHEMA_VERSION = 1
 
 # The reader's clock. Every time rendered into a message is converted here
-# and written "7:30 AM ET"; DST is zoneinfo's problem, not ours.
+# and written "7:30 AM ET"; DST is zoneinfo's problem, not ours. The zone
+# and its label are fixed together: --digest-tz moves only the digest's
+# clock, never the wording, so the label cannot drift from the zone.
 DEFAULT_TZ = "America/Toronto"
 TZ_LABEL = "ET"
 LOCAL_TZ = ZoneInfo(DEFAULT_TZ)
@@ -614,7 +616,7 @@ def parse_args(argv):
     parser.add_argument("--health", type=pathlib.Path, required=True, help="the health.json health.py wrote")
     parser.add_argument("--state", required=True, help="last-posted state: local path or gs:// object (this script's only write)")
     parser.add_argument("--digest-hour", type=int, default=DEFAULT_DIGEST_HOUR, help="hour of the daily digest, in --digest-tz")
-    parser.add_argument("--digest-tz", type=parse_tz, default=LOCAL_TZ, help=f"IANA zone the digest hour and day are read in (default {DEFAULT_TZ})")
+    parser.add_argument("--digest-tz", type=parse_tz, default=LOCAL_TZ, help=f"IANA zone the digest hour and day are read in (default {DEFAULT_TZ}); times in messages stay {DEFAULT_TZ} ({TZ_LABEL}) regardless")
     parser.add_argument("--repo", default=ghcli.DEFAULT_REPO, help="owner/repo the tracking issue is filed in")
     parser.add_argument("--now", help="evaluate as of this ISO 8601 time (default: now)")
     parser.add_argument("--dry-run", action="store_true", help="print the messages (and the issue) instead of posting; still updates --state")

@@ -29,6 +29,8 @@ day matters), DST included. URL parameters, `health.json`, the state files and
 the history feed stay ISO 8601 UTC. The digest hour is a Toronto hour
 (`--digest-hour 9`, `--digest-tz America/Toronto` by default) and "once a day"
 is a Toronto day: the state file's `last_digest_date` is the local date.
+`--digest-tz` moves only the digest's clock; the times written into messages
+and the `ET` label are fixed to Toronto.
 
 The rules are the procedure the eval crew ran by hand through the week of
 2026-09-01, written down as constants in `health.py`; each one cites the
@@ -179,8 +181,9 @@ the publish, adjudicate and post steps run as; the space is
 workflow's `env`; the repository variables `CI_HEALTH_CHAT_SPACE` and
 `CI_HEALTH_SA` override them. The off switch is the repository variable
 `CI_HEALTH_MUTE=true`: no token is minted, the poster logs "webhook not
-configured" and exits 0, and the refresh, the verdict and the `health.json`
-upload carry on. An incoming-webhook URL in Secret Manager
+configured" and exits 0 before it would file a tracking issue, the comment
+step on pull requests is skipped, and the refresh, the verdict and the
+`health.json` upload carry on. An incoming-webhook URL in Secret Manager
 (`ci-health-chat-webhook`, `kube-agents-prow`) is the optional alternative.
 
 `post_health.py --dry-run` prints the messages instead of posting them.

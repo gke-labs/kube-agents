@@ -64,8 +64,10 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # "kube-agents-ci-health" space) is not a secret and defaults here; a
 # repository variable overrides it. The off switch is a separate variable,
 # CI_HEALTH_MUTE=true: no token is minted, the poster finds nothing to post
-# with and exits 0 ("webhook not configured"), and the refresh, the verdict
-# and the health.json upload carry on. (An empty CI_HEALTH_CHAT_SPACE could
+# with and exits 0 ("webhook not configured") before it would file an
+# issue, the comment step is skipped, and the refresh, the verdict and the
+# health.json upload carry on -- so the one switch silences every write
+# onto Chat, issues and other people's pull requests. (An empty CI_HEALTH_CHAT_SPACE could
 # not be that switch: `vars.X || 'default'` yields the default for an empty
 # string too.) An incoming-webhook URL is the optional alternative, read
 # from Secret Manager (ci-health-chat-webhook in kube-agents-prow) when a
@@ -148,6 +150,9 @@ jobs:
           # `git rev-parse --is-shallow-repository` is not "false"; any
           # positive depth is still shallow, so the full history it is.
           fetch-depth: 0
+          # The job token holds issues/PR write; nothing here pushes, and
+          # render's git log is local, so the token does not stay on disk.
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -266,14 +271,28 @@ jobs:
       - name: Append this tick to health-history.jsonl
         continue-on-error: true
         run: |
-          # Download-append-upload; a missing object is the first tick. Any
-          # other download failure stops here rather than uploading an empty
-          # file over the history.
-          if gsutil -q stat "$DASHBOARD_BUCKET/health-history.jsonl"; then
-            gsutil -q cp "$DASHBOARD_BUCKET/health-history.jsonl" work/health-history.jsonl
-          else
-            : > work/health-history.jsonl
+          # Download-append-upload. Only a download that failed because the
+          # object does not exist (the first tick) starts the feed empty; any
+          # other failure -- a 5xx, a timeout, a permission denial -- stops
+          # here, before an upload could replace the whole feed with one
+          # line. (`gsutil stat` cannot tell the two apart: it exits 1 for
+          # both, which is why the error text is read instead.)
+          set +e
+          gsutil -q cp "$DASHBOARD_BUCKET/health-history.jsonl" work/health-history.jsonl 2>gsutil.err
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            if grep -Eq "NotFound|No URLs matched|404" gsutil.err; then
+              echo "no health-history.jsonl yet; starting the feed"
+              : > work/health-history.jsonl
+            else
+              echo "::warning::could not download health-history.jsonl (not a NotFound); not appending this tick:"
+              cat gsutil.err
+              rm -f gsutil.err
+              exit 1
+            fi
           fi
+          rm -f gsutil.err
           python3 scripts/eval_dashboard/health_history.py --health work/health.json --history work/health-history.jsonl
           if ! gsutil -q -h "Cache-Control: no-cache" cp work/health-history.jsonl "$DASHBOARD_BUCKET/health-history.jsonl"; then
             echo "::warning::health-history.jsonl was not updated this tick"
@@ -285,22 +304,15 @@ jobs:
       # each passed only when the file exists). health.json is always there
       # by now; the history file is missing only when the step above failed
       # before downloading, and the Brief then shows the current state alone.
-      # The flags are passed only when this checkout's render.py advertises
-      # them, so the tick stays green whichever of the dashboard change and
-      # this one lands first. Still gated on the collect: publishing
-      # re-renders data.json too, and a failed collect has nothing new that
-      # is safe to publish (header).
+      # Still gated on the collect: publishing re-renders data.json too, and
+      # a failed collect has nothing new that is safe to publish (header).
       - name: Render and publish the dashboard
         if: steps.collect.outcome == 'success'
         run: |
           render_args=()
-          if python3 scripts/eval_dashboard/render.py --help 2>/dev/null | grep -q -- '--health-history'; then
-            [ -f work/health.json ] && render_args+=(--health work/health.json)
-            [ -f work/health-history.jsonl ] && render_args+=(--health-history work/health-history.jsonl)
-            [ -f work/health-history.jsonl ] || echo "::warning::no health-history.jsonl this tick; the Brief renders the current verdict only"
-          else
-            echo "::warning::render.py has no --health/--health-history yet; rendering without the verdict"
-          fi
+          [ -f work/health.json ] && render_args+=(--health work/health.json)
+          [ -f work/health-history.jsonl ] && render_args+=(--health-history work/health-history.jsonl)
+          [ -f work/health-history.jsonl ] || echo "::warning::no health-history.jsonl this tick; the Brief renders the current verdict only"
           python3 scripts/eval_dashboard/render.py --data work/data.json --out-dir work/site "${render_args[@]}"
           python3 scripts/eval_dashboard/publish.py --out-dir work/site --target "$DASHBOARD_BUCKET/"
 
@@ -352,7 +364,9 @@ jobs:
       # One comment per pull request whose smoke run went red since the
       # last tick (header). The script exits 0 on a GitHub failure; the
       # continue-on-error covers everything else, so this never reds the run.
+      # The mute switch covers this write too (header).
       - name: Comment on pull requests whose smoke run went red
+        if: env.CI_HEALTH_MUTE != 'true'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
