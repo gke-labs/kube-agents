@@ -28,7 +28,7 @@ Guidance on detecting GCE stockouts, querying Google Cloud Obtainability APIs, a
 Scan OpenShift `Machine` objects in namespace `openshift-machine-api` for provisioning failures:
 
 ```bash
-oc get machines -n openshift-machine-api -o json 2>/dev/null || kubectl get machines.machine.openshift.io -n openshift-machine-api -o json | jq -r '
+{ oc get machines -n openshift-machine-api -o json 2>/dev/null || kubectl get machines.machine.openshift.io -n openshift-machine-api -o json; } | jq -r '
   .items[] | select(.status.phase == "Failed" or .status.errorMessage != null) |
   "Machine: \(.metadata.name) | Zone: \(.spec.providerSpec.value.zone) | Error: \(.status.errorMessage)"
 '
@@ -61,7 +61,7 @@ OpenShift `MachineSet`s are zonal. When `us-central1-a` is exhausted:
    FAILED_MS=$(oc get machine <FAILED_MACHINE_NAME> -n openshift-machine-api -o jsonpath='{.metadata.labels.machine\.openshift\.io/cluster-api-machineset}' 2>/dev/null || kubectl get machine.machine.openshift.io <FAILED_MACHINE_NAME> -n openshift-machine-api -o jsonpath='{.metadata.labels.machine\.openshift\.io/cluster-api-machineset}')
 
    # Or query by matching the exhausted zone:
-   FAILED_MS=$(oc get machinesets -n openshift-machine-api -o json 2>/dev/null || kubectl get machinesets.machine.openshift.io -n openshift-machine-api -o json | jq -r --arg zone "$EXHAUSTED_ZONE" '.items[] | select(.spec.template.spec.providerSpec.value.zone == $zone) | .metadata.name')
+   FAILED_MS=$({ oc get machinesets -n openshift-machine-api -o json 2>/dev/null || kubectl get machinesets.machine.openshift.io -n openshift-machine-api -o json; } | jq -r --arg zone "$EXHAUSTED_ZONE" '.items[] | select(.spec.template.spec.providerSpec.value.zone == $zone) | .metadata.name')
    ```
 2. Clone the `MachineSet` manifest, altering:
    - `metadata.name`: Replace zone suffix with the healthy target zone (e.g. `us-central1-b`).
