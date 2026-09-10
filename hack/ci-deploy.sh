@@ -525,6 +525,18 @@ SANDBOX_KEY_DIR="$(umask 077 && mktemp -d)"
 ssh-keygen -q -t "${SANDBOX_SSH_KEY_TYPE}" -N '' -C "${SANDBOX_SSH_KEY_COMMENT}" \
   -f "${SANDBOX_KEY_DIR}/id_sandbox"
 
+# EXPERIMENT (do not merge): one switch, defined in ci-env.sh, drives both the
+# sidecar deploy here and the stats archival in ci-eval-pr.sh. replicaCount 1
+# because the chart refuses the sidecar on more (pod-local cache).
+if [ -n "${EVAL_RESPONSE_CACHE:-}" ]; then
+  RESPONSE_CACHE_ARGS=(
+    --set-string "litellm.responseCache=${EVAL_RESPONSE_CACHE}"
+    --set "litellm.replicaCount=1"
+  )
+else
+  RESPONSE_CACHE_ARGS=(--set-string "litellm.responseCache=")
+fi
+
 helm upgrade --install "${HELM_RELEASE_NAME}" ./charts/kube-agents \
   --namespace "${NAMESPACE}" --create-namespace \
   "${IMAGE_ARGS[@]}" \
@@ -541,6 +553,7 @@ helm upgrade --install "${HELM_RELEASE_NAME}" ./charts/kube-agents \
   --set-file "platformAgent.credentials.data.SANDBOX_SSH_PUBLIC_KEY=${SANDBOX_KEY_DIR}/id_sandbox.pub" \
   --set-string "litellm.modelProvider=${MODEL_PROVIDER}" \
   --set-string "litellm.modelDefaultName=${MODEL_DEFAULT_NAME}" \
+  "${RESPONSE_CACHE_ARGS[@]}" \
   --set-string "litellm.vertex.serviceAccountAnnotations.iam\.gke\.io/gcp-service-account=${LITELLM_GSA_NAME}@${PROJECT_ID}.iam.gserviceaccount.com" \
   --set "platformAgent.deployment.availability.runtimeClassName=" \
   --set-string "platformAgent.deployment.env[0].name=ALERT_DAILY_LIMIT_WARNING" \
