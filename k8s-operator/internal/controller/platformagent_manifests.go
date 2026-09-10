@@ -2663,6 +2663,15 @@ func dropTmpScratchIfClaimed(defaults, userMounts []corev1.VolumeMount) []corev1
 //
 // Anything a container needs on top — a different user, a writable path — belongs on that
 // container, not here. This is the floor, not the whole context.
+//
+// The working directory is one of those, and it is the one that has bitten us. An image's
+// WORKDIR is chosen for the user that image expects, so a render that overrides the user
+// owns the working directory too. #1259: the A2A provision container runs natsio/nats-box
+// as UID 1000, the image ships WORKDIR /root with no USER because it expects to be root,
+// and every provisioning run died on "stat .: permission denied" — a healthy bus with no
+// streams and nothing in the render to blame, because the render was right and the kubelet
+// was the one refusing. Check the image's WORKDIR against the UID the pod imposes, and set
+// WorkingDir explicitly when they disagree.
 func hardenedSecurityContext() *corev1.SecurityContext {
 	return &corev1.SecurityContext{
 		AllowPrivilegeEscalation: ptr.To(false),

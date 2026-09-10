@@ -67,6 +67,12 @@ const (
 	// provision Job's name carries a content hash, so deletion goes by label.
 	a2aComponentLabel = "kubeagents.x-k8s.io/a2a-component"
 
+	// a2aProvisionWritablePath is the one writable path the provision
+	// container has: the emptyDir mount, the nats CLI's HOME and
+	// XDG_CONFIG_HOME, and its working directory. Four references that have to
+	// agree, so they read from one name rather than four string literals.
+	a2aProvisionWritablePath = "/tmp"
+
 	a2aNATSImageEnvVar      = "A2A_NATS_IMAGE"
 	defaultA2ANATSImage     = "nats:2.10-alpine"
 	a2aProvisionImageEnvVar = "A2A_PROVISION_IMAGE"
@@ -894,11 +900,27 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 						Image:           a2aProvisionImage(),
 						Command:         []string{"sh", "-c", script},
 						SecurityContext: hardenedSecurityContext(),
-						VolumeMounts:    []corev1.VolumeMount{{Name: "tmp", MountPath: "/tmp"}},
+						// nats-box ships WORKDIR /root and declares no USER,
+						// so it expects to run as root (measured with
+						// `crane config` on 0.14.5). The pod above runs it as
+						// 1000, which cannot so much as stat a 0700 root-owned
+						// directory: the Job died on "stat .: permission
+						// denied" after printing its provisioning JSON, and a
+						// fresh next install came up with a healthy bus and no
+						// streams at all (#1259).
+						//
+						// An image's WORKDIR is chosen for the user that image
+						// expects, so a render overriding the user owns the
+						// working directory too. See hardenedSecurityContext().
+						// This container wants a writable one rather than
+						// merely a traversable one, because it is also the nats
+						// CLI's HOME.
+						WorkingDir:   a2aProvisionWritablePath,
+						VolumeMounts: []corev1.VolumeMount{{Name: "tmp", MountPath: a2aProvisionWritablePath}},
 						Env: []corev1.EnvVar{{
-							Name: "HOME", Value: "/tmp",
+							Name: "HOME", Value: a2aProvisionWritablePath,
 						}, {
-							Name: "XDG_CONFIG_HOME", Value: "/tmp",
+							Name: "XDG_CONFIG_HOME", Value: a2aProvisionWritablePath,
 						}, {
 							Name: "SEED_PASSWORD",
 							ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
@@ -1052,6 +1074,16 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 					Containers: []corev1.Container{{
 						Name:  "gateway",
 						Image: a2aGatewayImage(),
+						// Same rule as the provision container, caught by the
+						// same pass: the image is distroless nonroot, which
+						// ships WORKDIR /home/nonroot owned 0700 by 65532, and
+						// the pod above runs it as 1000. Latent rather than
+						// broken because the gateway binary never stats ".",
+						// which is luck rather than a guard. "/" is 0755 on
+						// that image and the gateway needs no writable cwd --
+						// it wants a directory it can traverse, not one it can
+						// write.
+						WorkingDir: "/",
 						Env: []corev1.EnvVar{
 							{Name: "NATS_URL", Value: fmt.Sprintf("nats://%s.%s.svc:4222", a2aNATSName(agent), agent.Namespace)},
 							{Name: "NATS_USER", Value: "gateway"},

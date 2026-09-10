@@ -1,6 +1,6 @@
 """Cross-file contract lints: joins that nothing in any language checks.
 
-Four contracts, each of which fails silently today when the two sides drift:
+Contracts that each fail silently today when the two sides drift:
 
 * A verification spec naming a tool that no registry defines can never trip —
   the silent-green shape review found on the first gate branch (a safeguard
@@ -15,6 +15,9 @@ Four contracts, each of which fails silently today when the two sides drift:
 * The broken-main notifier watches a fixed roster of push-to-main workflows;
   a required check dropped from that roster goes red on main without anyone
   being told, which is how a thirteen-hour red main went unnoticed (#1223).
+* The flaky-check notifier's roster is the inverse: every pull-request check
+  is either watched or named as excluded with a reason; a new check that is
+  neither has its re-runs recorded nowhere, and nothing says so.
 """
 
 from __future__ import annotations
@@ -46,6 +49,21 @@ BROKEN_MAIN_WATCHED_WORKFLOWS = (
     "Operator Tests",
     "Python Unit Tests",
     "Validate Repo Structure",
+)
+# The flaky-check reporter's contract is the inverse of the broken-main one:
+# not a fixed list it must contain, but that every pull-request check is
+# either watched or named here as left out on purpose. The reasons are in the
+# workflow's header comment; this tuple is the machine-readable copy of it.
+FLAKY_CHECK_NOTIFIER = "flaky-check-notify.yml"
+FLAKY_CHECK_EXCLUDED_WORKFLOWS = (
+    # A title edit legitimately turns it green without a commit.
+    "Validate PR Title",
+    # The advisory database moves between attempts.
+    "Security Scanning",
+    # pull_request_target automations, not checks on the tree.
+    "Auto Assign Milestone on Merge",
+    "Hold Unresolved Threads",
+    "Risk Classification",
 )
 SCRIPTS_DIR = REPO_ROOT / "agents" / "platform" / "scripts"
 
@@ -323,6 +341,43 @@ class WorkflowNameJoinTest(unittest.TestCase):
             "workflow_run references that match no workflow name: a rename "
             "has silently disabled these consumers: " + ", ".join(broken),
         )
+
+    def test_the_flaky_check_notifier_watches_every_pull_request_check_or_says_why_not(self):
+        """A pull-request check missing from the watch list fails silently:
+        re-runs of it record nothing and nothing says so. Every workflow with
+        a pull_request or pull_request_target trigger is therefore either in
+        the list or in FLAKY_CHECK_EXCLUDED_WORKFLOWS with its reason, and a
+        new check has to choose. The reverse holds too: an exclusion that no
+        longer names a workflow is stale."""
+        documents = self._workflows()
+        triggers = documents[FLAKY_CHECK_NOTIFIER].get("on") or documents[FLAKY_CHECK_NOTIFIER].get(True) or {}
+        watched = set((triggers.get("workflow_run") or {}).get("workflows") or [])
+        pull_request_checks = set()
+        for filename, document in documents.items():
+            if filename == FLAKY_CHECK_NOTIFIER:
+                continue
+            on = document.get("on") or document.get(True) or {}
+            # `on:` may be a mapping, a list, or a bare scalar (`on: pull_request`);
+            # iterating the scalar would walk its characters.
+            if isinstance(on, str):
+                on = {on: None}
+            elif not isinstance(on, dict):
+                on = {key: None for key in on}
+            if "pull_request" in on or "pull_request_target" in on:
+                pull_request_checks.add(document.get("name") or filename)
+        excluded = set(FLAKY_CHECK_EXCLUDED_WORKFLOWS)
+        unaccounted = sorted(pull_request_checks - watched - excluded)
+        self.assertEqual(
+            [],
+            unaccounted,
+            f"{FLAKY_CHECK_NOTIFIER} neither watches nor excludes these "
+            "pull-request checks, so a re-run of any of them files no issue: "
+            + ", ".join(unaccounted),
+        )
+        both = sorted(watched & excluded)
+        self.assertEqual([], both, "watched and excluded at once: " + ", ".join(both))
+        stale = sorted(excluded - pull_request_checks)
+        self.assertEqual([], stale, "excluded but no longer a pull-request check: " + ", ".join(stale))
 
     def test_the_broken_main_notifier_watches_every_whole_tree_required_check(self):
         """A required check missing from the watch list fails silently: main
