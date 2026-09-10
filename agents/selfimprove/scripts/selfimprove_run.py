@@ -3057,7 +3057,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # rename -- what an install does get to choose is whether its label scheme
     # spells them `severity:high`, `sev/high`, or nothing at all.
     severity_label_prefix = os.environ.get("SELFIMPROVE_SEVERITY_LABEL_PREFIX", "severity:").strip()
-    allow_fallback = env("SELFIMPROVE_ALLOW_UNSTAMPED_IMAGE", "false").lower() in ("1", "true", "yes")
+    allow_fallback = env("SELFIMPROVE_ALLOW_UNSTAMPED", "false").lower() in ("1", "true", "yes")
     signals = [s.strip() for s in env("SELFIMPROVE_SIGNALS", ",".join(ledger_mod.SIGNALS)).split(",") if s.strip()]
     # 3600 to match `investigateTimeoutSeconds` in charts/kube-agents/values.yaml
     # and the arithmetic in `seconds_left`'s docstring. The chart always sets

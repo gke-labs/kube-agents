@@ -1208,7 +1208,10 @@ spec:
                   value: {{ $ledgerName | quote }}
                 - name: SELFIMPROVE_AGENT_DEPLOYMENT
                   value: {{ $observed | quote }}
-                - name: SELFIMPROVE_ALLOW_UNSTAMPED_IMAGE
+                # Not `_IMAGE`-suffixed like the value it carries:
+                # hack/check-image-inventory.sh reads every env var named
+                # `*_IMAGE` as an image reference, and this one is a boolean.
+                - name: SELFIMPROVE_ALLOW_UNSTAMPED
                   value: {{ $si.allowUnstampedImage | default false | quote }}
                 - name: SELFIMPROVE_UPSTREAM_REPO
                   value: {{ $prTarget | quote }}
