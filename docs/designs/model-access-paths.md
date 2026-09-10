@@ -54,9 +54,14 @@ of the work:
    block on the cluster resource the module already owns; Autopilot needs nothing. #608 carried a
    300-line node pool script; the gvisor pool pattern would be about 60 lines of Terraform.
 
-## 4. Build plan
+## 4. Build plan: one pull request, four parts
 
-### PR 1: the `hosted_vllm` provider at the gateway (about 90 lines, plus tests)
+The whole change lands as one pull request against #1418, with this document in it, so a
+reviewer sees the provider, the server, the capacity, and the example together and the
+behavioural gate runs once. The parts below are its commits, in order, each self-contained so the
+review can proceed part by part.
+
+### Part 1: the `hosted_vllm` provider at the gateway (about 90 lines, plus tests)
 
 Mirrors `vertex_ai` file for file. The address of the server is one value,
 `litellm.hostedVllm.apiBase`, required when the provider is `hosted_vllm` and rejected at render
@@ -87,7 +92,7 @@ overlay builds and the recipe parses.
 Live: the gateway on the dev cluster re-rendered with `hosted_vllm` against the vLLM pod from
 `examples/vllm-gemma/`, one chat completion through it, one agent turn.
 
-### PR 2: the model server (about 110 lines, plus `images.json`)
+### Part 2: the model server (about 110 lines, plus `images.json`)
 
 **Dev path: build the example.** `examples/vllm-gemma/` gains a `kustomization.yaml` listing its
 four files, which changes nothing about applying it by hand. A new
@@ -116,7 +121,7 @@ cert-manager uses. Its values are the chart's own keys, filled from ours:
 `nodeSelectorTerms` on `cloud.google.com/gke-accelerator`, `hf_token` from a secret when given,
 `pvcStorage` sized from a variable; `routerSpec.enableRouter = true` so the Service is the
 router's on port 80. `hosted_vllm_api_base` then defaults to that Service's cluster address and
-PR 1's gateway change needs nothing new.
+Part 1's gateway change needs nothing new.
 
 | File                                                  | Change                                                                                                                                                                    | Lines |
 | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----- |
@@ -137,9 +142,9 @@ already names the example's Deployment. The chart's images join the inventory ch
 renders every toggle.
 
 Live: `terraform apply` on the dev cluster with the provider set, the router Service answering,
-the agent turn from PR 1 repeated through the install's own gateway.
+the agent turn from Part 1 repeated through the install's own gateway.
 
-### PR 3: GPU capacity by node auto-provisioning (about 35 lines)
+### Part 3: GPU capacity by node auto-provisioning (about 35 lines)
 
 On Standard, the `gke-cluster` module's `google_container_cluster.standard` gains a
 `cluster_autoscaling` block behind `enable_gpu_autoprovisioning`: `resource_limits` for CPU,
@@ -161,7 +166,7 @@ does for other adopted-cluster prerequisites.
 Spot capacity stocks out (both `us-central1` zones did on 2026-09-10), so the default asks for
 on-demand and the knob to prefer spot is a later addition if wanted.
 
-### PR 4: the example and the journey (copies by design)
+### Part 4: the example and the journey (copies by design)
 
 `examples/litellm-hosted-vllm/` is `examples/litellm-gemini/` with two edits: the ConfigMap's
 model line reads `hosted_vllm/<model>` and the Deployment carries `HOSTED_VLLM_API_BASE`. Six
@@ -172,9 +177,9 @@ the `check_iac_parity.py` roster, a row in the site's examples page, one line in
 
 `bench/cuj/` gains one journey for the hosted path, manual because CI has no GPU: server Ready,
 one completion through the gateway, one agent turn that calls a tool, and three numbers (load
-time, first token, VRAM headroom at the default max model length). PRs 1 and 2 each run it.
+time, first token, VRAM headroom at the default max model length). It runs once against the finished branch and is recorded in the pull request's Live validation.
 
-### Documentation, across the PRs
+### Documentation, across the parts
 
 The site's inference-gateway page: one row in "Choosing a provider" and the `MODEL_PROVIDER`
 table, and the "vLLM (local models)" section gains the install-path paragraph. `INSTALL.md`
@@ -188,8 +193,8 @@ Method 1 gets the `install.env` lines, Method 2 the `deploy-vllm` line. No new p
 - **Integration, every PR:** `deploy-litellm MODEL_PROVIDER=hosted_vllm` in kind against a stub
   OpenAI-compatible server, asserting `model-default` routes to it and the ConfigMap carries no
   key. Home: `tests/integration/`.
-- **Manual:** the `bench/cuj/` journey against a real GPU node, recorded in each PR's Live
-  validation.
+- **Manual:** the `bench/cuj/` journey against a real GPU node, recorded in the pull request's
+  Live validation.
 - **No new eval cases.** The agent's behaviour does not change.
 
 ## 6. On the #608 review
