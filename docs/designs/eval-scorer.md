@@ -5,8 +5,8 @@
 > covered by `bench/tests/`. The GCS backend is implemented and defaults **off**; it has been
 > validated end to end against a real bucket in a personal dev project (see
 > [What has been validated, and where](#what-has-been-validated-and-where)), but the production
-> bucket and its IAM grants do not exist yet, and the nightly job that writes to it is still a
-> draft pull request in `oss-test-infra`. The dashboard's
+> bucket and its IAM grants do not exist yet, and the nightly job that writes to it is still an
+> open pull request in `oss-test-infra`. The dashboard's
 > table and views are checked in as `bench/dashboard/` and have been run against that same bucket;
 > what is not built is the Looker Studio front end over them.
 
@@ -126,7 +126,7 @@ the state everything ships in.
 
 **The suite aggregate** covers admitted cases only, excludes infra repetitions, and reds when
 `pr_rate < main_rate - margin` **over at least `EVAL_AGGREGATE_MIN_SCORED` scored repetitions**
-(default 30) — and only once `EVAL_AGGREGATE_ARMED` is set in the job's environment. Unarmed,
+(default 30) — and only once `EVAL_AGGREGATE_ARMED` is set to `1` in the job's environment. Unarmed,
 which is the default, a rate below the margin over a full sample is written into the verdict as a
 note rather than a reason: the flat margin has not been measured against how much an unchanged
 pull request moves the aggregate on `main`, and arming it is a decision for after the store holds
@@ -323,13 +323,14 @@ one lease is not where the next run looks.
 `objectViewer`/`objectCreator` split is a real boundary.
 
 **2. The two jobs must run as different service accounts.** They do not: the presubmit and the
-nightly in [oss-test-infra#2665](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2665)
+nightly in [oss-test-infra#2682](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2682)
 both declare `serviceAccountName: prowjob-default-sa`. One identity cannot hold `objectCreator` for
 one job and withhold it from the other, so the split is unimplementable until the nightly gets a
-dedicated account. That is filed as a `TODO` on the periodic and reads there as a reviewer's
-preference; it is not. It is what the guard is made of — which is why creating
-`eval-baseline-recorder` is step 2 of [Provisioning it](#provisioning-it) rather than a follow-up,
-and why the periodic must be edited to name it before the bucket is any use.
+dedicated account. That is not a reviewer's preference; it is what the guard is made of — which is
+why creating `eval-baseline-recorder` is step 2 of [Provisioning it](#provisioning-it) rather than
+a follow-up, and why the change that arms the store
+([oss-test-infra#2698](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2698)) names it
+on the periodic.
 
 **Who can grant this.** `kube-agents-prow` has a single `roles/owner`, who is also one of its two
 `storage.admin` holders, so the bucket, the service account and all three grants are one person's
@@ -478,8 +479,8 @@ The backend has been exercised end to end against a real bucket
 | A pull request cannot append                                | `refusing to record a baseline with PULL_NUMBER set`              |
 | A missing bucket degrades rather than reds                  | 404 → advisory, with the banner in the markdown verdict           |
 
-What remains unvalidated is the part no local run can reach: the nightly Prow job, which is still a
-draft pull request against `oss-test-infra`.
+What remains unvalidated is the part no local run can reach: the nightly Prow job, which is still an
+open pull request against `oss-test-infra`.
 
 **Why a file per batch instead of one growing file per case.** GCS objects are immutable; there is
 no append. Growing one `<case>.jsonl` means download, concatenate, re-upload — an overwrite, which
@@ -773,8 +774,10 @@ it and on the presubmit, and
 runbook and the TestGrid alert. The YAML is not reproduced here — a
 copy in a second repository is a copy that goes stale, and the shape below is the part that matters.
 
-**Its script body is the presubmit's, byte-for-byte, plus three exports** — `EVAL_BASELINE_STORE`,
-`EVAL_REPETITIONS` and `PULL_PULL_SHA`, with their comments, and nothing removed. That is a
+**Its script body is the presubmit's, byte-for-byte, plus its exports** — `EVAL_TIER` to select
+the nightly matrix, `EVAL_BASELINE_STORE` to close the loop, `PULL_PULL_SHA` from the checkout (the
+table above), and `EVAL_REPETITIONS` only if the job overrides the script's default — with their
+comments, and nothing removed. That is a
 deliberate choice over factoring: the two jobs must agree on how a single run is produced, and a
 copy that is obviously a copy fails loudly under `diff` where a subtly different harness does not.
 It duplicates ~140 lines of Boskos lease, heartbeat and cleanup logic, and the right fix is to move
@@ -941,7 +944,7 @@ window is full.
 before the list: with at least `EVAL_ADMISSION_MIN_RUNS` runs at the current key, the pooled rate
 decides either way, and a listed case screened at 12/21 is turned away with a reason that says the
 record overrides the list. The list is consulted only in the first three pre-admission states
-below (nothing at this key, stale, collecting), and when the store holds anything for a listed
+above (nothing at this key, stale, collecting), and when the store holds anything for a listed
 case its state is appended to the reason, so the log says how far it is from being judged on
 evidence. Every verdict carries `admission_source` — `record`, `bootstrap` or `neither` — and the
 markdown renders it per case once a store is configured or the record has decided any case; with

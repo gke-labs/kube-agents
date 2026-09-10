@@ -5,7 +5,7 @@ presubmit's rules read it: collapse (rung 4), which may only red a case that
 has proved it passes reliably; judged regression (rung 6), which compares this
 pull request's judge scores against main's at the same version key; and the
 suite aggregate, which compares pass rates and reports the result — it reds
-the job only once `EVAL_AGGREGATE_ARMED` is set.
+the job only once `EVAL_AGGREGATE_ARMED` is set to `1`.
 
 **This store ships empty, and it fills itself.** Every nightly run on `main`
 appends what it measured (`bench-gate record`), and a case is admitted once its
@@ -238,7 +238,9 @@ store holds at least the minimum runs at
 the current key — the record decides and the list is not consulted: a named
 case screened at 12/21 is turned away, and the reason says the record overrides
 the list. Every verdict carries `admission_source` (`record`, `bootstrap` or
-`neither`), and the markdown renders it per case once a store is configured.
+`neither`), and the markdown renders it per case once a store is configured or
+the record has decided any case — which includes evidence landed by hand in
+this directory with no store configured.
 
 Admission is computed here, never declared in `task.yaml`. A pull request
 author therefore cannot self-admit a case in the same diff that makes it pass.

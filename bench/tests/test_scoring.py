@@ -996,8 +996,13 @@ def test_the_aggregate_is_advisory_unless_armed():
 
 
 def test_the_aggregate_tolerates_movement_inside_the_margin():
-    verdict = grade_suite([_case(passes=87, scored=100)], baseline_rate=0.9, margin=0.05)
+    # Armed, so a green here is the margin's doing and not the default's; and
+    # inside the margin there is nothing to note either.
+    verdict = grade_suite(
+        [_case(passes=87, scored=100)], baseline_rate=0.9, margin=0.05, armed=True
+    )
     assert verdict.green is True
+    assert verdict.notes == []
 
 
 def test_the_margin_rule_is_separable_from_the_sample_floor():

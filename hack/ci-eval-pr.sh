@@ -1704,14 +1704,11 @@ export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-
 # bucket that is not there is not fatal -- an unreachable store degrades to
 # advisory with a banner -- but it is a banner on every run, so both exports
 # wait for the bucket. Until then the store fills only by hand from the
-# --lines-out artefact below. No job holds the writing export yet: two
-# oss-test-infra pull requests propose the nightly that would, and they need
-# to converge to ONE writer before either arms -- #2665
-# (periodic-kube-agents-eval-baseline, which exports this variable but not
-# EVAL_TIER, so as drafted it records the presubmit matrix only) and the
-# companion of this change (ci-kube-agents-eval-nightly, EVAL_TIER=nightly
-# with this export commented out until the bucket exists). Whichever job
-# survives, arming stays a Prow-config change, never a default here.
+# --lines-out artefact below. No job holds the writing export yet: the
+# nightly periodic (ci-kube-agents-eval-nightly, EVAL_TIER=nightly, in
+# flight in oss-test-infra) carries it commented out, and the change that
+# uncomments it there adds the read-only export to the presubmit in the same
+# diff. Arming stays a Prow-config change, never a default here.
 export EVAL_BASELINE_STORE="${EVAL_BASELINE_STORE:-}"
 
 # Where the per-case hand-offs land. `bench-gate case` writes one per task and

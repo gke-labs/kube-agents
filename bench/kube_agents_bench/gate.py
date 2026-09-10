@@ -94,6 +94,8 @@ _TRUTHY = frozenset({"1", "true", "yes"})
 ADMISSION_COLUMN = "Admitted by"
 ADMISSION_CELL_NONE = "none"
 ADMISSION_CELL_RECORD_REFUSED = "record: not admitted"
+#: An admitted case whose hand-off predates `admission_source` (hand-authored).
+ADMISSION_CELL_UNKNOWN = "--"
 
 
 def _env_float(name: str, default: float) -> float:
@@ -336,7 +338,7 @@ def _admitted_by(case: dict[str, Any]) -> str:
     source = case.get("admission_source")
     if case.get("admitted"):
         # A hand-authored hand-off may predate the field; say so rather than guess.
-        return str(source or "--")
+        return str(source or ADMISSION_CELL_UNKNOWN)
     if source == ADMITTED_BY_RECORD:
         return ADMISSION_CELL_RECORD_REFUSED
     return ADMISSION_CELL_NONE

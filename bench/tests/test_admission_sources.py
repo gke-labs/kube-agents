@@ -218,3 +218,29 @@ def test_a_demoted_case_counts_on_neither_side_of_the_aggregate(tmp_path):
     rc, md = suite(tmp_path, *docs, extra=["--min-scored", "3"])
     assert rc == 0
     assert "Admitted-case pass rate: 100.0% (main: 100.0%, margin 5.0%)" in md
+
+
+def test_the_column_appears_when_the_record_decided_even_with_no_store_configured(
+    tmp_path, monkeypatch
+):
+    """Evidence landed by hand into the checked-in directory: no
+    ``--baseline-store``, no ``EVAL_BASELINE_STORE``, but the record decided
+    a case, and that must not be invisible in the verdict."""
+    monkeypatch.delenv("EVAL_BASELINE_STORE", raising=False)
+    out = tmp_path / "case.json"
+    argv = ["case", "--task", str(ADMISSION / "tasks" / "record-admits" / "task.yaml")]
+    argv += ["--baseline-dir", str(ADMISSION)]
+    for run in GREENS:
+        argv += ["--result", str(run)]
+    assert main([*argv, "--json-out", str(out)]) == 0
+    assert json.loads(out.read_text(encoding="utf-8"))["admission_source"] == "record"
+
+    md = tmp_path / "verdict.md"
+    rc = main([
+        "suite", "--baseline-dir", str(ADMISSION),
+        "--case-result", str(out), "--markdown-out", str(md),
+    ])
+    assert rc == 0
+    text = md.read_text(encoding="utf-8")
+    assert "| Admitted by |" in text
+    assert "| `record-admits` |" in text and "| record |" in text

@@ -12,8 +12,8 @@ roster-comment edits used to cost.
 
 ## What the roster is
 
-The roster is a transition bridge, not a destination. `bench/baselines/` ships empty and
-the evidence store is not armed yet, so no case is admitted by measured evidence and
+The roster is a transition bridge, not a destination. `bench/baselines/` ships empty and,
+while the evidence store is unarmed, no case is admitted by measured evidence and
 nothing could reach the collapse rung — the presubmit would block on nothing for as long
 as screening takes. Cases named in `BOOTSTRAP_ADMITTED` keep their old blocking behaviour
 meanwhile: a bootstrap-admitted case arms rung 4 by fiat, and while the store holds nothing
@@ -28,9 +28,11 @@ key — that pooled rate decides, either way: a case at 21/21 is admitted whethe
 is named here, and a case at 12/21 is turned away even if it is. The list is consulted
 only for a case the record cannot judge yet: no evidence, evidence only at a superseded key
 (`stale`), or fewer than the minimum runs at this one (`collecting`). Once a store is
-configured the verdict markdown names the decider per case in an **Admitted by** column —
-`record`, `bootstrap`, `record: not admitted`, or `none`; with `EVAL_BASELINE_STORE` unset
-the column is absent and the presubmit's output is what it was before. See
+configured, or the record has decided any case (evidence landed by hand in
+`bench/baselines/` counts), the verdict markdown names the decider per case in an
+**Admitted by** column — `record`, `bootstrap`, `record: not admitted`, or `none`; with
+`EVAL_BASELINE_STORE` unset and the checked-in directory empty, the column is absent and the
+presubmit's output is what it was before. See
 [`docs/designs/eval-scorer.md`](designs/eval-scorer.md) for computed admission and
 [`docs/designs/testing-strategy.md`](designs/testing-strategy.md) §4.2 for the verdict
 ladder the rungs below refer to.
@@ -150,9 +152,10 @@ hold, and not before:
 3. Those seven nights completed for every listed case. A nightly killed at its deadline
    records only the units that finished, so a case queued late can fall behind the count
    the calendar suggests; read the column rather than counting nights.
-4. The eval dashboard's `admission_state` view and the verdict's column agree on which
-   cases are live. The view knows nothing of the list, so it can only agree once 2 holds —
-   which is the point of checking it.
+4. The BigQuery `admission_state` view over the store (`bench/dashboard/dashboard.sql`, not
+   the HTML dashboard under `scripts/eval_dashboard/`) and the verdict's column agree on
+   which cases are live. The view knows nothing of the list, so it can only agree once 2
+   holds — which is the point of checking it.
 
 Deleting the list before 2 holds silently un-arms every case still riding the bridge — the
 gate goes green with rung 4 inert for them, which is the failure the list exists to
