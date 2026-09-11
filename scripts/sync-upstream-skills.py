@@ -77,13 +77,35 @@ gcloud container clusters update <cluster-name> \\
     --region <region>
 ```"""
 
+# gke-manifest-generation's frontmatter description is what the router reads to pick a skill, and
+# the routing has to name gcp-config-connector, a skill this repository has and upstream does not.
+# The description is a folded YAML scalar, so the whole sentence has to be replaced rather than an
+# appended footer.
+GKE_MANIFEST_GENERATION_OLD_ROUTING_SNIPPET = (
+    "pod troubleshooting (use gke-workload-troubleshooting), or cluster infrastructure provisioning "
+    "(use gke-cluster-creation)."
+)
+
+GKE_MANIFEST_GENERATION_NEW_ROUTING_SNIPPET = (
+    "pod troubleshooting (use gke-workload-troubleshooting), cluster infrastructure provisioning "
+    "(use gke-cluster-creation), or Google Cloud resources as Config Connector manifests "
+    "(use gcp-config-connector)."
+)
+
 # In-place content substitutions applied to freshly-synced skills to correct upstream defects
-# where an appended footer is insufficient (e.g. multi-step remediation commands).
+# where an appended footer is insufficient (e.g. multi-step remediation commands), or to route to a
+# skill only this repository has from a passage upstream cannot know about.
 SKILL_SUBSTITUTIONS = {
     "gke-workload-security": [
         (
             GKE_WORKLOAD_SECURITY_OLD_NETPOL_SNIPPET,
             GKE_WORKLOAD_SECURITY_NEW_NETPOL_SNIPPET,
+        ),
+    ],
+    "gke-manifest-generation": [
+        (
+            GKE_MANIFEST_GENERATION_OLD_ROUTING_SNIPPET,
+            GKE_MANIFEST_GENERATION_NEW_ROUTING_SNIPPET,
         ),
     ],
 }
