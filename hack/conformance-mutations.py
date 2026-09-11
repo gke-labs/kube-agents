@@ -145,9 +145,11 @@ MUTATIONS: list[Mutation] = [
         "obvious improvement that turns a denial into an oracle",
     ),
         Mutation(
-        # The original unpinned bind's resourceNames; #387 removed the bind
-        # rule outright, so the live escalation edit is granting escalate on
-        # the RBAC rule the operator still holds full CRUD through.
+        # The original unpinned bind's resourceNames. #387 removed the bind
+        # rule outright and this edit became "grant escalate on the RBAC rule
+        # the operator holds full CRUD through"; the auth callout has since
+        # brought bind back, scoped to one name, and A4-bind-unscoped below
+        # is the mutation that covers the scoping. This one stays on escalate.
         "A4-operator-escalate",
         "k8s-operator/config/rbac/role.yaml",
         ("      - roles\n    verbs:\n      - create\n",
@@ -196,9 +198,37 @@ MUTATIONS: list[Mutation] = [
         "refusals, which is how a control gets switched off in production",
     ),
         Mutation(
-        # Originally unpinned the chart's bind-to-view rule; the rule is gone
-        # from both delivery paths (#387), so the live edit is bind returning
-        # to the chart copy alone — the same-ceiling drift A4 exists to catch.
+        # The bind grant is only bounded while it names resources. Stripping
+        # resourceNames leaves a rule that lets the operator attach ANY
+        # existing ClusterRole -- cluster-admin included -- to any subject it
+        # can write a binding for, which is escalate without the verb.
+        "A4-bind-unscoped",
+        "k8s-operator/config/rbac/role.yaml",
+        ("    resourceNames:\n      - system:auth-delegator\n", ""),
+        "test_A4_the_operator_cannot_escalate_its_own_grants",
+        "drop the resourceNames bound on the operator's bind grant so it can "
+        "attach any role to any subject -- escalate without the verb",
+    ),
+    Mutation(
+        # The generated block is gated byte-for-byte by `make chart-check`, so
+        # the interesting place to hide a grant is just past its end marker:
+        # chart-sync will not touch it and a parser that reads only the block
+        # never sees it.
+        "A4-chart-bind-outside-markers",
+        "charts/kube-agents/templates/operator-rbac.yaml",
+        ("  # END GENERATED RULES",
+         "  # END GENERATED RULES\n  - apiGroups:\n      - rbac.authorization.k8s.io\n"
+         "    resources:\n      - clusterroles\n    verbs:\n      - bind"),
+        "test_A4_the_chart_grants_the_same_ceiling_as_the_kustomize_role",
+        "write an unrestricted bind into the chart BELOW the generated-rules "
+        "marker, where chart-sync leaves it and a block-scoped parse misses it",
+    ),
+    Mutation(
+        # Originally unpinned the chart's bind-to-view rule. Both delivery
+        # paths now carry a bind again (scoped to system:auth-delegator), so
+        # the edit is an UNSCOPED bind appearing in the chart copy alone —
+        # the same-ceiling drift A4 exists to catch, in the direction that
+        # widens.
         "A4-chart-bind-returns",
         "charts/kube-agents/templates/operator-rbac.yaml",
         ("  # END GENERATED RULES",
@@ -207,6 +237,31 @@ MUTATIONS: list[Mutation] = [
         "test_A4_the_chart_grants_the_same_ceiling_as_the_kustomize_role",
         "give the chart's operator role an unrestricted bind the kustomize "
         "role does not carry -- one delivery path quietly grows a ceiling",
+    ),
+    Mutation(
+        # The chart half was three literal string scans until #1319; this is
+        # the spelling that walked past them. Flow style is not exotic -- it is
+        # what `helm create` scaffolds and what a hand-edit reaches for.
+        "A4-chart-impersonate-flow-style",
+        "charts/kube-agents/templates/operator-rbac.yaml",
+        ("    resources:\n      - events\n    verbs:\n      - create\n      - patch",
+         "    resources:\n      - events\n    verbs: [impersonate, create, patch]"),
+        "test_A4_the_chart_grants_the_same_ceiling_as_the_kustomize_role",
+        "give the chart's leader-election Role impersonate, written in flow "
+        "style: the object is outside the generated block so chart-sync leaves "
+        "it, and `- impersonate` as a substring does not appear",
+    ),
+    Mutation(
+        # The kustomize half read role.yaml alone. leader_election_role.yaml is
+        # listed beside it in the same kustomization and installs just as
+        # readily.
+        "A4-leader-election-escalate",
+        "k8s-operator/config/rbac/leader_election_role.yaml",
+        ("    resources:\n      - events\n    verbs:\n      - create\n      - patch",
+         "    resources:\n      - events\n    verbs:\n      - escalate\n      - create\n      - patch"),
+        "test_A4_the_operator_cannot_escalate_its_own_grants",
+        "add escalate to the operator's OTHER Role -- the leader-election one, "
+        "which the same kustomization installs and A4 did not read",
     ),
     Mutation(
         "A4-inject-assertion-renamed",
@@ -319,10 +374,13 @@ Mutation(
         "add an auto-merge job, which is the thing B2 exists to forbid",
     ),
     Mutation(
+        # autopush-redeploy-agent.yml was deleted by #1199, which consolidated
+        # the autopush deploys; every run of the whole sweep has crashed on
+        # the missing path since. autopush-deploy.yml is the replacement and
+        # carries the same predicate, once. This branch and #1310 found and
+        # fixed that independently -- hence the missing-file case handled
+        # below, which turns a crash into one stale mutation.
         "B4-workflow-run-gate",
-        # Renamed from autopush-redeploy-agent.yml by #1199. The old path made
-        # the whole harness crash rather than report one stale mutation, which
-        # is why the missing-file case is handled below.
         ".github/workflows/autopush-deploy.yml",
         ("github.event.workflow_run.head_branch == 'main'", "true"),
         "test_B4_every_workflow_run_deploy_gates",

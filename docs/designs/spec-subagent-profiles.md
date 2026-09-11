@@ -201,7 +201,10 @@ profile's dispatch. Notes on the mechanics:
   with backoff until a slot frees. Nothing is dropped; the stream holds the backlog.
 - A new profile's first dispatch waits on its `BusCredentialsReady` status condition -
   the deployment spec owns why (auth-callout propagation). Submissions queue on the
-  stream meanwhile.
+  stream meanwhile. Note the name is already taken by a coarser condition: until this
+  CRD exists it lives on the `PlatformAgent` and means "the callout is ready and serving
+  a map" rather than "this profile's user is served". The deployment spec records both
+  readings so the two do not silently collide when profiles arrive.
 - At dequeue the dispatcher checks queue staleness against `queueTimeoutSeconds` using
   the message's server ingest timestamp (see the field table for why not `ts`), and
   refuses stale work with a terminal `failed` rather than running it late.

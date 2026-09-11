@@ -1,0 +1,49 @@
+# The a2a auth callout image.
+#
+# The service that decides who may connect to the bus: a client presents a
+# projected Kubernetes ServiceAccount token, this validates it with a
+# TokenReview against the local API server, and answers with the account and
+# permission set the operator mapped that identity to.
+#
+# It sits on the connection path — while it is down, no NEW connection is
+# authorized, though every established one keeps working — so the Deployment
+# that runs it uses two replicas and a rollout that never drops below the
+# running count.
+#
+# Build from the a2a/ module root:
+#   docker build -f Dockerfile.authcallout -t <registry>/a2a-authcallout:<tag> .
+
+# Bases come from images.json, the repo's image inventory, spelled the way
+# k8s-operator/Dockerfile spells them so `make mirror-images` and the pinning
+# there cover this build too. Note the distroless repository: images.json pins
+# gcr.io/distroless/static, not static-debian12, which is a different
+# repository and therefore a different pin.
+ARG GOLANG_IMAGE=golang
+ARG GOLANG_VERSION=1.27-alpine
+ARG DISTROLESS_IMAGE=gcr.io/distroless/static
+ARG DISTROLESS_VERSION=nonroot
+
+FROM ${GOLANG_IMAGE}:${GOLANG_VERSION} AS build
+# Refuse to download a toolchain the pin above does not name: without this, a
+# substituted GOLANG_IMAGE older than a2a/go.mod's `go` directive silently
+# fetches a newer one instead of failing the build (#1138).
+ENV GOTOOLCHAIN=local
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -o /out/authcallout ./cmd/authcallout
+
+# The binary writes nothing to disk, so a static distroless base with no shell
+# and no package manager is the whole runtime, and the Deployment can mount the
+# root filesystem read-only.
+#
+# `USER nonroot` is the image's own default and does NOT set the uid the
+# callout runs as in this product: distroless nonroot is uid 65532, while the
+# Deployment sets runAsNonRoot with runAsUser 1000, and the pod spec wins. It
+# is here so that running this image anywhere else — a `docker run`, another
+# chart — still does not get root by default.
+FROM ${DISTROLESS_IMAGE}:${DISTROLESS_VERSION}
+COPY --from=build /out/authcallout /authcallout
+USER nonroot
+ENTRYPOINT ["/authcallout"]

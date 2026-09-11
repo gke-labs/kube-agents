@@ -11,7 +11,10 @@ per-case classes come from the real classify.py.
 import contextlib
 import io
 import json
+import os
 import pathlib
+import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -159,8 +162,8 @@ class Shapes(Harness):
             lines[3],
             "> 🔴 **Gate outage in progress** since Sun 7:30 AM ET. The 3 crashloop tests fail on every PR (7 PRs so far)."
             " **Your 3 failures are exactly those 3, so this red is not your code.** Don't retest yet; run `/retest` once #kube-agents-ci-health says the gate is healthy again."
-            " [Why this run failed →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html?build=100)"
-            " · [Incident brief →](https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html?cases=cluster-agent-crashloop-debug,cluster-agent-crashloop-evidence-chain,cluster-agent-crashloop-misleading-symptom&since=2026-09-06T11:30:00Z#gate)",
+            " [Why this run failed →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html#build=100)"
+            " · [Incident brief →](https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html#since=2026-09-06T11:30:00Z&cases=cluster-agent-crashloop-debug,cluster-agent-crashloop-evidence-chain,cluster-agent-crashloop-misleading-symptom&view=gate)",
         )
         self.assertIn("| Case | Result | Also failing on |", body)
         self.assertIn("| `cluster-agent-crashloop-debug` | 0 / 3 reps | 7 other PRs |", body)
@@ -186,13 +189,26 @@ class Shapes(Harness):
         self.assertEqual(
             lines[3],
             "> 🟢 **Gate healthy.** `security-overgrant-probe` passed on the last 9 runs from other PRs and failed on your last 4. **This looks specific to your PR.**"
-            " [Why this run failed →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html?build=103)",
+            " [Why this run failed →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html#build=103)",
         )
         self.assertIn("| `security-overgrant-probe` | 0 / 3 reps | no other PR |", body)
         self.assertIn("Reason: `", body)
         self.assertIn("sandbox pod never reached Running (ImagePullBackOff: agent-sandbox:pr-913)", body)
         self.assertNotIn("Incident brief", body)
         self.assertIn("6 cases passed.", body)
+
+    def test_a_green_night_is_not_another_pr(self):
+        # The nightly periodic's run shares data.json with no pull request
+        # (tiers.py). Green an hour ago, it passed every case: it must neither
+        # raise the "runs from other PRs" count nor be commented on.
+        night = run(7000, None, NOW - timedelta(hours=1))
+        night.update({"tier": "nightly", "job": "ci-kube-agents-eval-nightly"})
+        mine = [run(100 + i, 913, NOW - timedelta(hours=3 - i), failing=["security-overgrant-probe"]) for i in range(4)]
+        self.tick(data(night, *mine, *green_others()), green_health())
+        self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/913/comments")])
+        body = self.gh.bodies()[0]
+        self.assertIn("`security-overgrant-probe` passed on the last 9 runs from other PRs and failed on your last 4.", body)
+        self.assertIn("| `security-overgrant-probe` | 0 / 3 reps | no other PR |", body)
 
     def test_mixed(self):
         mine = run(100, 1300, NOW - timedelta(minutes=5), failing=TRIO + ["agent-kanban-smoke"])
@@ -227,6 +243,122 @@ class Shapes(Harness):
         self.assertTrue(box.startswith("> 🟡 **Gate degraded** since Tue 9:00 AM ET. quota storm 9:15 AM–10:25 AM ET hit 3 PRs."), box)
         self.assertIn("Your 1 failure is exactly that one, so this red is not your code.", box)
         self.assertIn("| 0 / 3 reps (1 infra) |", self.gh.bodies()[0])
+
+
+class RunAsAScript(Harness):
+    """ci-health.yml runs gate_comment.py by path from the repository root.
+    That takes the module's import fallback, not the package import every
+    other test here takes, so a tick through it is the only proof the
+    fallback binds everything tick uses."""
+
+    def test_the_workflow_invocation_ticks(self):
+        mine = [run(100 + i, 913, NOW - timedelta(hours=3 - i), failing=["security-overgrant-probe"]) for i in range(4)]
+        (self.dir / "data.json").write_text(json.dumps(data(*mine, *green_others())))
+        (self.dir / "health.json").write_text(json.dumps(green_health()))
+        script = pathlib.Path(gate_comment.__file__).resolve()
+        argv = [sys.executable, str(script), "--data", str(self.dir / "data.json"), "--health", str(self.dir / "health.json"), "--state", str(self.state), "--admitted", ",".join(sorted(ADMITTED)), "--now", NOW.isoformat(), "--dry-run"]
+        # No PYTHONPATH, so the fallback is the import path; a `gh` that
+        # fails first on PATH, so the dry run's one GET (the marker search)
+        # is a logged warning and never the network.
+        fake_gh = self.dir / "gh"
+        fake_gh.write_text("#!/bin/sh\necho 'offline test: no gh' >&2\nexit 1\n")
+        fake_gh.chmod(0o755)
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        env["PATH"] = f"{self.dir}{os.pathsep}{env.get('PATH', '')}"
+        proc = subprocess.run(argv, cwd=script.parents[2], env=env, capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("warning: gh api GET repos/gke-labs/kube-agents/issues/913/comments", proc.stderr)
+        self.assertIn("--dry-run: would comment on #913 (build 103)", proc.stderr)
+        self.assertIn("`security-overgrant-probe` passed on the last 9 runs from other PRs and failed on your last 4.", proc.stderr)
+
+
+def lost(build, pr, finished, minutes=128, node="gke-kube-agents-prow-default-pool-eb220b2a-sgnk", **fields):
+    """A run whose build node went away: zero tasks, FAILURE, no build log,
+    a NodeNotReady pod event -- what the collector records for one."""
+    raw = run(build, pr, finished, tasks=[], result="failure", minutes=minutes, project=None)
+    raw.update({"has_build_log": False, "pod_phase": "Failed", "pod_node": node, "pod_last_event": "NodeNotReady", **fields})
+    return raw
+
+
+def lost_pods_health(prs=(926, 1118, 1246, 1258, 1319, 1351, 1362, 1439, 1451, 1456, 1460, 1471)):
+    return {
+        "state": "DEGRADED",
+        "condition": "lost_pods",
+        "since": "2026-09-08T14:05:52+00:00",  # Tue 10:05 AM EDT
+        "failing_cases": [],
+        "tracking_issues": [],
+        "incident": {"prs": list(prs), "runs": len(prs), "window_start": "2026-09-08T14:05:52+00:00", "window_end": "2026-09-08T14:19:16+00:00", "nodes": {"gke-kube-agents-prow-default-pool-eb220b2a-sgnk": 3}, "event": len(prs) >= 8},
+    }
+
+
+class LostPodComment(Harness):
+    """A run whose build node went away gets one short comment (#1478): the
+    time and node, that nothing was graded, and /retest -- with the
+    build-cluster event named while health.json's condition is lost_pods."""
+
+    def test_the_shape_without_an_incident(self):
+        mine = lost(100, 1300, NOW - timedelta(minutes=5))
+        rc, _ = self.tick(data(mine, *green_others()), green_health())
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/1300/comments")])
+        lines = self.gh.bodies()[0].split("\n")
+        self.assertEqual(lines[0], gate_comment.MARKER)
+        self.assertEqual(lines[1], "### ⚪ Smoke gate: run lost")
+        self.assertEqual(
+            lines[3],
+            "> The Prow build node running this job went away at 10:55 AM ET (gke-kube-agents-prow-default-pool-eb220b2a-sgnk)."
+            " Nothing was graded and nothing about your change is implied. `/retest` once new jobs are progressing."
+            " [Details →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html#build=100)",
+        )
+        self.assertEqual(lines[5], "Ran 128 min before the node went away · [build log](https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/1300/pull-kube-agents-smoke-test/100)")
+        self.assertNotIn("Incident brief", self.gh.bodies()[0])
+        self.assertNotIn("cases", self.gh.bodies()[0])
+        self.assertEqual(self.recorded()["comments"]["1300"], {"comment_id": 501, "build_id": "100", "at": NOW.isoformat()})
+
+    def test_inside_a_build_cluster_event_the_box_says_so(self):
+        mine = lost(100, 1300, NOW - timedelta(minutes=5))
+        self.tick(data(mine, *green_others()), lost_pods_health())
+        box = self.gh.bodies()[0].split("\n")[3]
+        self.assertTrue(box.startswith("> The Prow build node running this job went away at 10:55 AM ET (gke-kube-agents-prow-default-pool-eb220b2a-sgnk) — part of a build-cluster event: 12 runs on 12 PRs. Nothing was graded"), box)
+        self.assertTrue(box.endswith("[Details →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html#build=100) · [Incident brief →](https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html#since=2026-09-08T14:05:52Z&view=gate)"), box)
+
+    def test_below_the_event_bar_the_box_gives_the_count_without_calling_it_an_event(self):
+        mine = lost(100, 1300, NOW - timedelta(minutes=5))
+        self.tick(data(mine, *green_others()), lost_pods_health(prs=(1300, 1301, 1302)))
+        box = self.gh.bodies()[0].split("\n")[3]
+        self.assertIn("(gke-kube-agents-prow-default-pool-eb220b2a-sgnk) — one of 3 runs on 3 PRs that lost their build node. Nothing was graded", box)
+        self.assertNotIn("event", box)
+        self.assertIn("[Incident brief →]", box)
+
+    def test_a_lost_pod_known_only_by_its_missing_log_has_no_node_to_name(self):
+        mine = lost(100, 1300, NOW - timedelta(minutes=5), pod_node=None, pod_last_event=None, pod_phase=None)
+        self.tick(data(mine, *green_others()), green_health())
+        self.assertIn("> The Prow build node running this job went away at 10:55 AM ET. Nothing was graded", self.gh.bodies()[0])
+
+    def test_short_lost_pods_are_commented_on_and_setup_deaths_still_are_not(self):
+        # 297 s in with a NodeNotReady pod: a lost pod, not a setup death.
+        short = lost(100, 1300, NOW - timedelta(minutes=5), minutes=5)
+        clone_failed = run(101, 1301, NOW - timedelta(minutes=4), tasks=[], result="failure", minutes=0)
+        clone_failed.update({"has_build_log": True, "pod_phase": "Failed", "pod_node": "n", "pod_last_event": "Started"})
+        self.tick(data(short, clone_failed, *green_others()), green_health())
+        self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/1300/comments")])
+
+    def test_the_same_lost_build_is_never_commented_on_twice_and_a_later_one_edits(self):
+        first = lost(100, 1300, NOW - timedelta(minutes=30))
+        self.tick(data(first, *green_others()), green_health())
+        self.tick(data(first, *green_others()), green_health(), now=NOW + timedelta(minutes=15))
+        self.assertEqual(len(self.gh.writes()), 1)
+        later = NOW + timedelta(hours=1)
+        second = lost(101, 1300, later - timedelta(minutes=5))
+        self.tick(data(first, second, *green_others()), green_health(), now=later)
+        self.assertEqual(self.gh.writes()[-1], ("PATCH", "repos/gke-labs/kube-agents/issues/comments/501"))
+        self.assertEqual(self.recorded()["comments"]["1300"]["build_id"], "101")
+
+    def test_dry_run_prints_it(self):
+        rc, err = self.tick(data(lost(100, 1300, NOW - timedelta(minutes=5)), *green_others()), lost_pods_health(), dry_run=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.gh.writes(), [])
+        self.assertIn("### ⚪ Smoke gate: run lost", err)
 
 
 class WhenItComments(Harness):

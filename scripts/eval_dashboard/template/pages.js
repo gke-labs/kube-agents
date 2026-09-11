@@ -20,11 +20,17 @@
  * data older than its own stale_after_s reads STALE.
  *
  * Every time a reader sees is America/Toronto ("ET"), formatted with
- * Intl.DateTimeFormat. URL parameters stay ISO 8601 UTC:
- *   index.html?cases=a,b&since=<ISO>&until=<ISO>#agent|#gate
- *   run.html?build=<prow build id>
- *   grid.html?cases=a,b&since=<ISO>&until=<ISO>[&window=6h|24h|36h|7d][&rows=all|admitted|failing]
- *   cases.html[?sort=worst|domain|name][&show=all|blocking|held]#<case>
+ * Intl.DateTimeFormat. URL parameters stay ISO 8601 UTC and travel in the
+ * fragment, which a login redirect on the published host preserves where
+ * it drops the query string:
+ *   index.html#since=<ISO>&until=<ISO>&cases=a,b&view=gate|agent
+ *   run.html#build=<prow build id>
+ *   grid.html#since=<ISO>&until=<ISO>&cases=a,b[&window=6h|24h|36h|7d][&rows=all|admitted|failing]
+ *   cases.html#<case>, or cases.html#sort=worst|domain|name&show=all|blocking|held
+ * The older query form (`?cases=a,b&since=<ISO>&until=<ISO>` before a bare
+ * `#gate` or `#agent`; `?build=<id>` on run.html; the same on the Grid and
+ * the Cases page) is still read, so a link already posted opens the same
+ * page wherever its query survives.
  */
 "use strict";
 
@@ -49,9 +55,10 @@ const PAGE = {
   // The adjudicator's STORM_COOLDOWN: retest this long after the last storm-hit run.
   stormCooldownMs: 30 * 60 * 1000,
   // An incident's window opens this long before its `since`: the rule's own
-  // lookback (shared break 6 h, storm and setup deaths 2 h), so the runs
-  // that made the bot declare it are on the page, not only the ones after.
-  incidentLeadMs: { shared_break: 6 * 3600 * 1000, storm: 2 * 3600 * 1000, setup_deaths: 2 * 3600 * 1000 },
+  // lookback (shared break 6 h, storm, setup deaths and lost pods 2 h), so
+  // the runs that made the bot declare it are on the page, not only the ones
+  // after.
+  incidentLeadMs: { shared_break: 6 * 3600 * 1000, storm: 2 * 3600 * 1000, setup_deaths: 2 * 3600 * 1000, lost_pods: 2 * 3600 * 1000 },
   recoveryGreenRuns: 3,
   // A shared break "explains" the reds when at least this share of red runs
   // in the window collapsed one of its cases; below it the headline says "most".
@@ -61,6 +68,9 @@ const PAGE = {
   maxLinkCases: 50,
   caseIdRe: /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/,
   isoParamRe: /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?)?(?:Z|[+-]\d{2}:?\d{2})?$/,
+  // The Brief's two views (`view=` in a link, or the bare `#gate`/`#agent`
+  // anchors older links carry); each is also the id of the section it lands on.
+  views: { gate: "gate", agent: "agent" },
   states: { GREEN: "hs-green", DEGRADED: "hs-amber", OUTAGE: "hs-red", PAST: "hs-past" },
   glyphs: { GREEN: "🟢", DEGRADED: "🟡", OUTAGE: "🔴", PAST: "⚪" },
   spyglass: "https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents",
@@ -113,7 +123,7 @@ let health = normalizeHealth(inlineJson(PAGE.inlineHealth) ?? brief.health);
 let live = false;
 // What the reader has clicked on the Grid and the Cases page. URL parameters
 // seed it; a chip or a cell changes it and re-renders.
-const ui = { sort: null, show: null, window: null, rows: null, markers: { merge: true, incident: true }, selected: null, showHeld: false, showRetired: false, caseScrolled: null };
+const ui = { sort: null, show: null, window: null, rows: null, markers: { merge: true, incident: true }, selected: null, showHeld: false, showRetired: false };
 
 const esc = (value) => String(value)
   .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -210,47 +220,68 @@ function linkCaseIds(values) {
   return values.map((v) => String(v).trim()).filter((id) => PAGE.caseIdRe.test(id)).slice(0, PAGE.maxLinkCases);
 }
 
+// The one place a URL is read. The parameters are `key=value` pairs read
+// from the query string first (the form links carried before the fragment
+// form; a key present in both is the query's) and then from the fragment
+// (`#since=…&until=…&cases=…&view=…`, `#build=…`, the Grid's `window=` and
+// `rows=`, the Cases page's `sort=` and `show=`). A bare `#gate` or
+// `#agent`, the old anchors, still selects that view; a bare case id on
+// the Cases page names its row.
 function linkState() {
-  const out = { cases: new Set(), sinceMs: null, untilMs: null, build: null, hash: "", caseHash: null, sort: null, show: null, window: null, rows: null };
-  let params;
-  try { params = new URLSearchParams(location.search); } catch (err) { return out; }
-  for (const id of linkCaseIds((params.get("cases") || "").split(","))) out.cases.add(id);
-  const since = params.get("since") || "";
+  const out = { cases: new Set(), sinceMs: null, untilMs: null, build: null, view: "", caseHash: null, sort: null, show: null, window: null, rows: null };
+  let query, fragment;
+  try {
+    query = new URLSearchParams(location.search);
+    fragment = new URLSearchParams(location.hash.slice(1));
+  } catch (err) { return out; }
+  const param = (key) => query.get(key) ?? fragment.get(key) ?? "";
+  for (const id of linkCaseIds(param("cases").split(","))) out.cases.add(id);
+  const since = param("since");
   if (PAGE.isoParamRe.test(since)) out.sinceMs = parseIso(since);
-  const until = params.get("until") || "";
+  const until = param("until");
   if (out.sinceMs != null && PAGE.isoParamRe.test(until)) {
     const untilMs = parseIso(until);
     if (untilMs != null && untilMs >= out.sinceMs) out.untilMs = untilMs;
   }
-  const build = (params.get("build") || "").trim();
+  const build = param("build").trim();
   if (/^[0-9]{1,25}$/.test(build)) out.build = build;
   // The Grid's and the Cases page's view parameters: a value outside the
   // vocabulary is the default, never text on the page.
-  const pick = (key, allowed) => (allowed.includes(params.get(key)) ? params.get(key) : null);
+  const pick = (key, allowed) => (allowed.includes(param(key)) ? param(key) : null);
   out.sort = pick("sort", ["worst", "domain", "name"]);
   out.show = pick("show", ["all", "blocking", "held"]);
   out.window = pick("window", PAGE.gridWindows.map((w) => w[0]));
   out.rows = pick("rows", ["all", "admitted", "failing"]);
-  out.hash = /^#(agent|gate)$/.test(location.hash) ? location.hash : "";
-  // A fragment that is not valid percent-encoding is no case id; it must
+  const view = param("view") || location.hash.slice(1);
+  out.view = Object.values(PAGE.views).includes(view) ? view : "";
+  // A bare fragment that is a case id (`cases.html#<case>`) names the row to
+  // highlight. One that is not valid percent-encoding is no case id; it must
   // not stop the page from rendering.
-  let fragment = "";
-  try { fragment = decodeURIComponent(location.hash.slice(1) || ""); } catch (err) { fragment = ""; }
-  if (fragment && PAGE.caseIdRe.test(fragment) && fragment !== "agent" && fragment !== "gate") out.caseHash = fragment;
+  let bare = "";
+  try { bare = decodeURIComponent(location.hash.slice(1) || ""); } catch (err) { bare = ""; }
+  if (bare && !out.view && PAGE.caseIdRe.test(bare)) out.caseHash = bare;
   return out;
 }
 
-function incidentQuery(inc) {
+// The links the pages write, in the fragment form linkState reads. Nothing
+// is percent-encoded: the case ids passed linkCaseIds' grammar and the
+// timestamps are utcIso's `Z` form, so the text is the same one
+// post_health.dashboard_link writes.
+function scopeParams(inc) {
   const params = [];
+  if (inc.sinceMs != null) params.push(`since=${utcIso(inc.sinceMs)}`);
+  if (inc.untilMs != null) params.push(`until=${utcIso(inc.untilMs)}`);
   const cases = linkCaseIds(inc.cases || []);
-  if (cases.length) params.push(`cases=${cases.map(enc).join(",")}`);
-  if (inc.sinceMs != null) params.push(`since=${enc(utcIso(inc.sinceMs))}`);
-  if (inc.untilMs != null) params.push(`until=${enc(utcIso(inc.untilMs))}`);
-  return params.length ? `?${params.join("&")}` : "";
+  if (cases.length) params.push(`cases=${cases.join(",")}`);
+  return params;
 }
-const incidentHref = (inc) => PAGE.pages.brief + incidentQuery(inc) + "#gate";
-const gridHref = (inc) => PAGE.pages.grid + incidentQuery(inc);
+const briefHref = (view, inc = {}) => `${PAGE.pages.brief}#${[...scopeParams(inc), `view=${view}`].join("&")}`;
+const incidentHref = (inc) => briefHref(PAGE.views.gate, inc);
+const numbersHref = () => briefHref(PAGE.views.agent);
+// The Grid on the incident's own window: the same scope, no view.
+const gridHref = (inc) => { const params = scopeParams(inc); return PAGE.pages.grid + (params.length ? `#${params.join("&")}` : ""); };
 const caseHref = (name) => `${PAGE.pages.cases}#${enc(name)}`;
+const runHref = (run) => `${PAGE.pages.run}#build=${enc(run.build)}`;
 
 /* ---- links out ---- */
 
@@ -265,7 +296,6 @@ const issueLink = (issue) => {
   return match ? `<a href="${PAGE.issueUrl}/${match[1]}">${esc(issue)}</a>` : esc(issue);
 };
 const projectShort = (project) => (project ? String(project).replace(/^kube-agents-/, "") : "unknown");
-const runHref = (run) => `${PAGE.pages.run}?build=${enc(run.build)}`;
 
 /* ---- runs and windows ---- */
 
@@ -688,7 +718,7 @@ function releasesHtml() {
 function briefHtml(link) {
   const inc = resolveIncident(link);
   const anchor = nowMs();
-  if (link.hash === "#agent" || !inc) {
+  if (link.view === PAGE.views.agent || !inc) {
     const sinceMs = anchor - PAGE.numbersWindowMs;
     const healthy = !inc && !!health;
     const noVerdict = !inc && !health;
@@ -739,7 +769,7 @@ function briefHtml(link) {
 
 function footHtml() {
   const generated = parseIso(brief.generated_at);
-  return `<div class="foot"><span>Every case by run: <a href="${PAGE.pages.grid}">grid</a></span><span>How reliable is each test: <a href="${PAGE.pages.cases}">cases</a></span><span>Last night's run: <a href="${PAGE.pages.nightly}">nightly</a></span><span><a href="${PAGE.pages.brief}#agent">The last 24 hours in numbers</a></span><span><a href="${PAGE.rulesUrl}">How the tags are decided</a></span><span class="mut">data generated ${esc(generated != null ? et(generated) : "unknown")}${brief.run_days ? ` · runs from the last ${esc(brief.run_days)} days` : ""}</span></div>`;
+  return `<div class="foot"><span>Every case by run: <a href="${PAGE.pages.grid}">grid</a></span><span>How reliable is each test: <a href="${PAGE.pages.cases}">cases</a></span><span>Last night's run: <a href="${PAGE.pages.nightly}">nightly</a></span><span><a href="${esc(numbersHref())}">The last 24 hours in numbers</a></span><span><a href="${PAGE.rulesUrl}">How the tags are decided</a></span><span class="mut">data generated ${esc(generated != null ? et(generated) : "unknown")}${brief.run_days ? ` · runs from the last ${esc(brief.run_days)} days` : ""}</span></div>`;
 }
 
 /* ---- the PR view ---- */
@@ -761,6 +791,7 @@ function bannerHtml(run) {
   if (h.state === "GREEN") text = `<b>Gate healthy ${when}.</b> No shared break, storm or setup failures. <a href="${PAGE.pages.brief}">Brief →</a>`;
   else if (h.condition === "storm") text = `<b>Quota storm ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs lose repetitions to 429s and empty records. <a href="${esc(href)}">Read the brief →</a>`;
   else if (h.condition === "setup_deaths") text = `<b>Setup failures ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs die before any case runs. <a href="${esc(href)}">Read the brief →</a>`;
+  else if (h.condition === "lost_pods") text = `<b>Build nodes lost ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs died with the node under them; nothing about the branch. <a href="${esc(href)}">Read the brief →</a>`;
   else text = `<b>Gate ${h.recovering ? "recovering" : "outage"} ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: ${cases.length ? `<code>${cases.map(esc).join("</code>, <code>")}</code> fail${cases.length === 1 ? "s" : ""} on every PR` : esc(h.cause || "a shared break")}. <a href="${esc(href)}">Read the brief →</a>`;
   const state = h.recovering ? "DEGRADED" : h.state;
   return `<div class="banner ${PAGE.states[state] || "hs-past"}">${pillHtml(state, h.recovering ? "RECOVERING" : h.state)}<span>${text}</span></div>`;
@@ -814,7 +845,7 @@ function whatToDoHtml(run) {
 }
 
 function runHtml(link) {
-  if (!link.build) return `<div class="sec head"><h1>Which run?</h1><div class="lede">Open this page as <code>run.html?build=&lt;prow build id&gt;</code>; the gate comment on a PR links here. <a href="${PAGE.pages.brief}">Back to the brief →</a></div></div>` + footHtml();
+  if (!link.build) return `<div class="sec head"><h1>Which run?</h1><div class="lede">Open this page as <code>run.html#build=&lt;prow build id&gt;</code>; the gate comment on a PR links here. <a href="${PAGE.pages.brief}">Back to the brief →</a></div></div>` + footHtml();
   const run = runs().find((r) => String(r.build) === link.build);
   if (!run) return `<div class="sec head"><h1>No run with that id in the last ${esc(brief.run_days ?? "?")} days.</h1><div class="lede">Build <code>${esc(link.build)}</code> is not in the data behind this page: older than its window, still running, or never uploaded. <a href="${PAGE.pages.brief}">Back to the brief →</a></div></div>` + footHtml();
   const startMs = parseIso(run.started), finishMs = parseIso(run.finished);
@@ -901,7 +932,7 @@ function lastFailureHtml(c) {
   // the pull request itself rather than to a page that says "no run".
   const onRunPage = runs().some((r) => String(r.build) === String(f.build));
   const who = f.pr == null ? (f.tier === "nightly" ? "the nightly" : "a run")
-    : onRunPage ? `<a href="${PAGE.pages.run}?build=${enc(f.build)}">#${esc(f.pr)}</a>`
+    : onRunPage ? `<a href="${esc(runHref(f))}">#${esc(f.pr)}</a>`
     : `<a href="${PAGE.prUrl}/${enc(f.pr)}">#${esc(f.pr)}</a> <span class="mut">(older than this page's ${esc(brief.run_days ?? "")}-day run window)</span>`;
   const tier = f.tier === "nightly" ? " · nightly run; the presubmit has no failure on record" : "";
   return `<span class="lf"><span class="lbl">Last failure was</span> <span><b>${esc(head)}</b> · ${who} · ${esc(et(parseIso(f.at)))}${esc(tier)}</span>` +
@@ -1166,7 +1197,7 @@ function detailHtml() {
 /* ---- the Nightly report (SCHEMA.md: brief.json's nightly block) ---- */
 
 const nights = () => (brief.nightly && Array.isArray(brief.nightly.nights) ? brief.nightly.nights.filter((n) => n && typeof n === "object" && n.counts) : []);
-const nightHref = (night) => `${PAGE.pages.nightly}?build=${enc(night.build)}`;
+const nightHref = (night) => `${PAGE.pages.nightly}#build=${enc(night.build)}`;
 const nightStart = (night) => parseIso(night.started) ?? parseIso(night.finished);
 // The night's headline state: cut short, then failed cases, then partial, then clean.
 function nightVerdict(night) {
@@ -1322,7 +1353,11 @@ function renderFreshness() {
 
 const renderers = { brief: briefHtml, run: runHtml, grid: gridHtml, cases: casesHtml, nightly: nightlyHtml };
 
-function renderAll() {
+// `scroll` is true for a navigation (boot, a hash change): the page then
+// scrolls to the `view=` section or the `#<case>` row it just rendered. The
+// poll and a chip re-render with it false, so a reader who has scrolled on
+// is not pulled back.
+function renderAll(scroll = false) {
   const link = linkState();
   const app = document.getElementById("app");
   const page = document.body.dataset.page in renderers ? document.body.dataset.page : "brief";
@@ -1337,14 +1372,14 @@ function renderAll() {
   }
   document.title = PAGE.titles[page];
   renderFreshness();
-  if (link.hash) {
-    const target = document.querySelector(link.hash);
+  // The section is rendered just above, after the browser looked for the
+  // anchor, and a `view=` fragment names no element anyway: scroll by hand.
+  if (scroll && link.view) {
+    const target = document.getElementById(link.view);
     if (target) target.scrollIntoView();
-  } else if (page === "cases" && link.caseHash && ui.caseScrolled !== link.caseHash) {
-    // Once per hash: a re-render (a chip, the poll) must not pull the reader
-    // back to the row after they have scrolled away from it.
+  } else if (scroll && page === "cases" && link.caseHash) {
     const row = document.getElementById(`case-${link.caseHash}`);
-    if (row) { row.scrollIntoView({ block: "center" }); ui.caseScrolled = link.caseHash; }
+    if (row) row.scrollIntoView({ block: "center" });
   }
   if (page === "grid") {
     // First paint: a live window is read from its newest run, a linked
@@ -1385,10 +1420,10 @@ async function refresh() {
 }
 
 document.getElementById("app").addEventListener("click", onClick);
-renderAll();
+renderAll(true);
 // Polling is attempted everywhere, a file:// preview included: a failed
 // poll costs nothing but the "regenerated every N min" suffix.
 refresh();
 setInterval(refresh, PAGE.refreshMs);
-window.addEventListener("hashchange", renderAll);
+window.addEventListener("hashchange", () => renderAll(true));
 setInterval(renderFreshness, 30000);

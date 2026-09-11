@@ -5,9 +5,10 @@ Every gate incident in the week of 2026-09-01 was diagnosed by hand with the
 same mechanical procedure: open the dashboard, find the reds of the last few
 hours, ask whether the same cases failed on unrelated pull requests (a shared
 fixture broke -- #1278), whether the repetitions were lost to 429s and empty
-records rather than graded (a quota storm -- #1225, #1097), or whether runs
-died before any task ran (setup failures). Nobody derives that from a heatmap
-at 8am, so this turns the procedure into a job.
+records rather than graded (a quota storm -- #1225, #1097), whether runs
+died before any task ran (setup failures), or whether the build cluster lost
+the node the pod was on (lost pods -- #1478). Nobody derives that from a
+heatmap at 8am, so this turns the procedure into a job.
 
 It is a pure function: data.json (schema v1, SCHEMA.md) plus the previously
 written health.json in, health.json out::
@@ -48,6 +49,7 @@ import pathlib
 import re
 import sys
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 try:
     from . import tiers
@@ -67,6 +69,10 @@ SEVERITY = {state: rank for rank, state in enumerate(STATES)}
 SHARED_BREAK = "shared_break"
 STORM = "storm"
 SETUP_DEATHS = "setup_deaths"
+LOST_PODS = "lost_pods"
+# The conditions whose evidence is a count of runs that never became full
+# runs; rule 6's entry check takes the count itself as currency.
+COUNTED_CONDITIONS = (SETUP_DEATHS, LOST_PODS)
 
 # Prow's job verdicts (SCHEMA.md: runs[].result). ABORTED is a superseded
 # push, not a statement about the gate, and is counted nowhere below except
@@ -174,6 +180,38 @@ SETUP_DEATH_WINDOW = timedelta(hours=2)
 SETUP_DEATH_MIN = 3
 SETUP_DEATH_MIN_PRS = 2
 
+# --- Rule 3b: lost pods -> DEGRADED (#1478) ----------------------------------
+# Incident: on 2026-09-11 14:03-14:17Z five nodes of the Prow build cluster
+# went NotReady and twelve runs on twelve pull requests died mid-run, some of
+# them two hours in. Each left finished.json (`failure`), a podinfo.json
+# whose last event is NodeNotReady, and no build-log.txt; rule 3 saw the one
+# that was under five minutes old and blamed the pool projects.
+#
+# The rule: a run is a lost pod when it concluded FAILURE with no tasks and
+# either its pod's last event was NodeNotReady or it has no build log
+# (SCHEMA.md: runs[].pod_last_event, runs[].has_build_log; a run collected
+# before those fields existed is unknown and never one). LOST_POD_MIN of them
+# finishing within LOST_POD_SPAN of each other, among the runs that finished
+# inside LOST_POD_WINDOW, is the condition; LOST_POD_EVENT_MIN of them is a
+# build-cluster event and is announced as one. No distinct-PR floor: the pod
+# record already says it was the node, not the branch. A lost pod is never
+# also a setup death, whatever its duration -- each zero-task run is counted
+# in exactly one class. Ranked above the storm because its evidence is the
+# most mechanical and it has an owner to page.
+LOST_POD_WINDOW = timedelta(hours=2)
+LOST_POD_SPAN = timedelta(minutes=30)
+LOST_POD_MIN = 3
+LOST_POD_EVENT_MIN = 8
+POD_EVENT_NODE_NOT_READY = "NodeNotReady"
+# The lost-pod advice names the loss on the reader's clock, the way
+# post_health.py writes every time a person reads (docs/ci-health.md, Times);
+# zone and label are fixed together there and mirrored here rather than
+# imported, because this module is the pure function the replay and the
+# tests run standalone and imports nothing that talks to Chat or GitHub.
+READER_TZ = ZoneInfo("America/Toronto")
+READER_TZ_LABEL = "ET"
+NOON = 12
+
 # --- Rule 5: what GREEN reports ----------------------------------------------
 METRICS_WINDOW = timedelta(hours=24)
 WALL_CLOCK_PERCENTILES = (50, 90)
@@ -215,6 +253,7 @@ DASHBOARD_URL = "https://storage.cloud.google.com/kube-agents-dashboards/evals/i
 CAUSE_SHARED_BREAK = "shared fixture/environment break: {cases}"
 CAUSE_STORM = "quota storm window {start}–{end} UTC"
 CAUSE_SETUP = "setup/clone failures on {count} runs ({prs})"
+CAUSE_LOST_PODS = "lost pods: {count} runs on {prs} PRs died with their build node {start}–{end} UTC"
 ADVICE_OUTAGE = "Don't retest yet; the failing cases share a cause. Tracking: {tracking}"
 ADVICE_OUTAGE_NO_ISSUE = "no issue filed yet — file one with the presubmit-gate label"
 ADVICE_STORM = "Retest after {when} UTC; runs started inside the storm lose repetitions to 429s."
@@ -222,6 +261,12 @@ ADVICE_SETUP = (
     "Retest once the setup failures stop; check the leased pool projects"
     " (stuck Helm release, image pulls) before spending another run."
 )
+ADVICE_LOST_PODS = (
+    "The Prow build cluster lost node(s) {nodes} at {when}; {count} runs died mid-run."
+    " Nothing about your change; /retest when the new jobs are progressing."
+    " Cluster owner: check the node events and autorepair."
+)
+UNKNOWN_NODE = "(name unknown)"
 ADVICE_RECOVERING = (
     "The condition has cleared; a retest is reasonable. GREEN is reported"
     " after {count} consecutive green runs on distinct PRs."
@@ -239,6 +284,9 @@ GZIP_SUFFIX = ".gz"
 # every phrase STORM_REASON_RE matches sits inside the first 96 characters
 # of the harness's phrasings, and the dashboard keeps 300.
 TRIM_REASON_CHARS = 96
+# The optional "how the build ended" run fields (SCHEMA.md) the trimmer
+# carries when the source has them; absent stays absent.
+ENDED_FIELDS = ("has_build_log", "pod_phase", "pod_node", "pod_last_event")
 
 UTC = timezone.utc
 
@@ -267,6 +315,15 @@ def iso(value: datetime | None) -> str | None:
 
 def hhmm(value: datetime) -> str:
     return value.astimezone(UTC).strftime("%H:%M")
+
+
+def reader_clock(value: datetime | None) -> str:
+    """"10:05 AM ET": the time on the reader's clock, as post_health.py's
+    `clock` writes it; "?" for none."""
+    if not value:
+        return "?"
+    local = value.astimezone(READER_TZ)
+    return f"{local.hour % NOON or NOON}:{local.minute:02d} {'AM' if local.hour < NOON else 'PM'} {READER_TZ_LABEL}"
 
 
 def rep_kind(rep: dict) -> str:
@@ -317,7 +374,7 @@ class Task:
 
 
 class Run:
-    __slots__ = ("build_id", "duration", "finished", "pr", "result", "started", "tasks")
+    __slots__ = ("build_id", "duration", "finished", "has_build_log", "pod_last_event", "pod_node", "pr", "result", "started", "tasks")
 
     def __init__(self, run: dict):
         self.build_id = str(run.get("build_id") or "")
@@ -330,6 +387,12 @@ class Run:
         seconds = run.get("duration_s")
         self.duration = timedelta(seconds=seconds) if isinstance(seconds, (int, float)) else None
         self.tasks = [Task(task) for task in run.get("tasks") or []]
+        # How the build ended (SCHEMA.md, optional run fields). Absent means
+        # unknown -- a document written before the collector recorded it --
+        # and unknown never makes a lost pod.
+        self.has_build_log = run.get("has_build_log") if isinstance(run.get("has_build_log"), bool) else None
+        self.pod_node = run.get("pod_node") if isinstance(run.get("pod_node"), str) else None
+        self.pod_last_event = run.get("pod_last_event") if isinstance(run.get("pod_last_event"), str) else None
 
     @property
     def full(self) -> bool:
@@ -350,10 +413,20 @@ class Run:
         return sum(task.passes + task.fails + task.storms for task in self.tasks)
 
     @property
+    def lost_pod(self) -> bool:
+        """Rule 3b's unit: died with its build node, whatever its duration."""
+        return (
+            not self.tasks
+            and self.result == RUN_FAILURE
+            and (self.pod_last_event == POD_EVENT_NODE_NOT_READY or self.has_build_log is False)
+        )
+
+    @property
     def setup_death(self) -> bool:
         return (
             not self.tasks
             and self.result == RUN_FAILURE
+            and not self.lost_pod
             and self.duration is not None
             and self.duration < SETUP_DEATH_MAX_DURATION
         )
@@ -552,6 +625,62 @@ def setup_deaths(runs, now: datetime) -> dict:
     return {"fires": fires, "deaths": deaths, "prs": prs, "evidence": evidence}
 
 
+def node_counts(runs) -> dict[str, int]:
+    """{node: lost pods on it}, by name; runs with no recorded node skipped."""
+    counts: dict[str, int] = {}
+    for run in runs:
+        if run.pod_node:
+            counts[run.pod_node] = counts.get(run.pod_node, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def node_list(nodes: dict[str, int]) -> str:
+    """"…-er33 ×3, …-pe72" for the evidence and the advice."""
+    if not nodes:
+        return UNKNOWN_NODE
+    return ", ".join(f"{name} ×{count}" if count > 1 else name for name, count in nodes.items())
+
+
+def lost_pods(runs, now: datetime) -> dict:
+    """Rule 3b. Returns {fires, event, lost, prs, nodes, start, end, evidence}.
+
+    `lost` is the densest LOST_POD_SPAN of lost pods among those that
+    finished inside LOST_POD_WINDOW, anchored at one of them; the newest such
+    span wins a tie, so the numbers follow the latest losses. Lost pods in
+    the window but outside that span are counted in the evidence only.
+    """
+    recent = [run for run in _in_window(runs, now, LOST_POD_WINDOW) if run.lost_pod]
+    lost: list = []
+    for anchor in recent:
+        span = [run for run in recent if anchor.finished <= run.finished <= anchor.finished + LOST_POD_SPAN]
+        if len(span) >= len(lost):
+            lost = span
+    prs = _prs(lost)
+    nodes = node_counts(lost)
+    start = min((run.finished for run in lost), default=None)
+    end = max((run.finished for run in lost), default=None)
+    evidence = []
+    if lost:
+        line = (
+            f"lost pods: {len(lost)} runs on {len(prs)} PRs died with their build node"
+            f" {hhmm(start)}–{hhmm(end)} UTC (nodes {node_list(nodes)}; {_pr_list(prs)})"
+        )
+        more = len(recent) - len(lost)
+        if more > 0:
+            line += f"; {more} more earlier in the last {int(LOST_POD_WINDOW.total_seconds() // 3600)}h"
+        evidence.append(line)
+    return {
+        "fires": len(lost) >= LOST_POD_MIN,
+        "event": len(lost) >= LOST_POD_EVENT_MIN,
+        "lost": lost,
+        "prs": prs,
+        "nodes": nodes,
+        "start": start,
+        "end": end,
+        "evidence": evidence,
+    }
+
+
 def percentile(values: list[float], pct: int) -> float | None:
     if not values:
         return None
@@ -592,6 +721,7 @@ def metrics(runs, now: datetime, fixtures: dict | None, roster: Roster) -> dict:
     reds = len(concluded) - len(green)
     own = pr_caused_reds(full, roster)
     deaths = sum(1 for run in window if run.setup_death)
+    lost = sum(1 for run in window if run.lost_pod)
     out = {
         "window_hours": int(METRICS_WINDOW.total_seconds() // 3600),
         "full_runs": len(full),
@@ -600,12 +730,13 @@ def metrics(runs, now: datetime, fixtures: dict | None, roster: Roster) -> dict:
         "red_runs": reds,
         # The digest's split of the reds: the pull request's own, and
         # everything else (shared breaks, storms, empty records, setup
-        # deaths) as "infra".
+        # deaths, lost pods) as "infra".
         "pr_caused_reds": own,
-        "infra_reds": reds - own + deaths,
+        "infra_reds": reds - own + deaths + lost,
         "green_rate": round(len(green) / len(concluded), 3) if concluded else None,
         "aborted_runs": sum(1 for run in window if run.result not in (RUN_SUCCESS, RUN_FAILURE)),
         "setup_deaths": deaths,
+        "lost_pods": lost,
         "infra_rep_rate": round(storm_reps / reps, 3) if reps else None,
         "infra_reps": storm_reps,
     }
@@ -655,6 +786,18 @@ def issue_tag(issue) -> str | None:
     return f"#{number}" if number else None
 
 
+def issue_for(issue, condition: str | None) -> dict | None:
+    """The poster's tracking issue when it belongs to this condition. The
+    bot files one for an outage and one for a build-cluster event, and
+    records which (`condition`); an outage's issue is not the lost pods'
+    tracking nor the reverse. One with no `condition` predates the key, and
+    only outages filed issues then, so it is an outage's."""
+    if not issue_tag(issue):
+        return None
+    filed_for = issue.get("condition") or SHARED_BREAK
+    return issue if filed_for == condition else None
+
+
 def all_tracking(cases: list[str], notes: dict, issue) -> list[str]:
     """case-notes.yaml's issues for these cases, plus the bot's own if it is
     not already among them."""
@@ -673,10 +816,12 @@ def advice_for(
     notes: dict,
     recovering: bool = False,
     issue: dict | None = None,
+    incident: dict | None = None,
 ) -> str:
     """What the reader should do. Keyed on the condition, not on whether it
     is still firing: a storm being left is still a storm, not a setup
-    failure."""
+    failure. `incident` is the numbers behind the cause (assess), read for
+    the lost-pod advice's nodes, time and count."""
     if state == GREEN:
         return ADVICE_GREEN
     if recovering:
@@ -687,6 +832,13 @@ def advice_for(
     if condition == STORM:
         when = hhmm(storm_end + STORM_COOLDOWN) if storm_end else "the storm ends"
         return ADVICE_STORM.format(when=when)
+    if condition == LOST_PODS:
+        incident = incident or {}
+        return ADVICE_LOST_PODS.format(
+            nodes=node_list(incident.get("nodes") or {}),
+            when=reader_clock(parse_iso(incident.get("window_start"))),
+            count=incident.get("runs", 0),
+        )
     return ADVICE_SETUP
 
 
@@ -702,10 +854,14 @@ def assess(runs, now: datetime, roster: Roster) -> dict:
     r1 = shared_break(full_runs, now, roster)
     r2 = storm(full_runs, now)
     r3 = setup_deaths(visible, now)
+    r3b = lost_pods(visible, now)
 
     if r1["fires"]:
         state, condition = OUTAGE, SHARED_BREAK
         cause = CAUSE_SHARED_BREAK.format(cases=", ".join(r1["cases"]))
+    elif r3b["fires"]:
+        state, condition = DEGRADED, LOST_PODS
+        cause = CAUSE_LOST_PODS.format(count=len(r3b["lost"]), prs=len(r3b["prs"]), start=hhmm(r3b["start"]), end=hhmm(r3b["end"]))
     elif r2["fires"]:
         state, condition = DEGRADED, STORM
         cause = CAUSE_STORM.format(start=hhmm(r2["start"]), end=hhmm(r2["end"]))
@@ -715,15 +871,15 @@ def assess(runs, now: datetime, roster: Roster) -> dict:
     else:
         state, condition, cause = GREEN, None, ""
 
-    evidence = r1["evidence"] + r2["evidence"] + r3["evidence"] + r1["pr_caused"]
+    evidence = r1["evidence"] + r3b["evidence"] + r2["evidence"] + r3["evidence"] + r1["pr_caused"]
     if r1["fires"] and r2["fires"]:
         # Both true at once on 2026-09-02: the break is the state, the
         # storm is context the reader still needs.
         evidence.append(CAUSE_STORM.format(start=hhmm(r2["start"]), end=hhmm(r2["end"])) + " overlaps the break")
 
     # Currency for rule 6's entry check: whether one of the newest full runs
-    # carries the firing condition's signature. Setup deaths are not full
-    # runs; their count is their currency.
+    # carries the firing condition's signature. Setup deaths and lost pods
+    # are not full runs; their count is their currency.
     recent = full_runs[-TRANSITION_MIN_RUNS:]
     if condition == SHARED_BREAK:
         signature = r1["signature_runs"]
@@ -731,16 +887,26 @@ def assess(runs, now: datetime, roster: Roster) -> dict:
         signature = {run.build_id for run in full_runs if run.storm_reps > 0}
     else:
         signature = set()
-    current = condition == SETUP_DEATHS or any(run.build_id in signature for run in recent)
+    current = condition in COUNTED_CONDITIONS or any(run.build_id in signature for run in recent)
     # The numbers behind the cause, for the one-sentence message: which
     # pull requests the firing condition touched, how many runs, and the
-    # storm's window.
+    # storm's window -- or, for lost pods, the span of the losses, the
+    # nodes with a count each, and whether it is a build-cluster event.
     if condition == SHARED_BREAK:
         incident = {"prs": r1["prs"], "runs": r1["runs"], "window_start": None, "window_end": None}
     elif condition == STORM:
         incident = {"prs": r2["prs"], "runs": r2["runs"], "window_start": iso(r2["start"]), "window_end": iso(r2["end"])}
     elif condition == SETUP_DEATHS:
         incident = {"prs": r3["prs"], "runs": len(r3["deaths"]), "window_start": None, "window_end": None}
+    elif condition == LOST_PODS:
+        incident = {
+            "prs": r3b["prs"],
+            "runs": len(r3b["lost"]),
+            "window_start": iso(r3b["start"]),
+            "window_end": iso(r3b["end"]),
+            "nodes": r3b["nodes"],
+            "event": r3b["event"],
+        }
     else:
         incident = None
     return {
@@ -754,19 +920,20 @@ def assess(runs, now: datetime, roster: Roster) -> dict:
         "current": current,
         "full_runs": full_runs,
         "last_setup_death": max((run.finished for run in visible if run.setup_death), default=None),
+        "last_lost_pod": max((run.finished for run in visible if run.lost_pod), default=None),
         "roster": roster,
     }
 
 
-def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime | None, roster: Roster) -> bool:
+def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime | None, roster: Roster, last_lost_pod: datetime | None = None) -> bool:
     """Rule 6's exit: the last RECOVERY_GREEN_RUNS full runs are green, on
     distinct pull requests, all finished after the incident began, and none
     carries the signature of the condition being left -- a collapse of one
     of its cases for a shared break, STORM_RUN_SIGNATURE_REPS storm
-    repetitions for a storm, a setup death after it for setup deaths. Judged
-    from the runs themselves rather than from the rule's window, so the runs
-    that constituted the incident never count as its recovery once the
-    window has rolled past them."""
+    repetitions for a storm, a setup death after it for setup deaths, a lost
+    pod after it for lost pods. Judged from the runs themselves rather than
+    from the rule's window, so the runs that constituted the incident never
+    count as its recovery once the window has rolled past them."""
     recent = full_runs[-RECOVERY_GREEN_RUNS:]
     if len(recent) < RECOVERY_GREEN_RUNS:
         return False
@@ -784,6 +951,7 @@ def recovered(full_runs, prev: dict, since: datetime, last_setup_death: datetime
         SHARED_BREAK: lambda run: bool(run.collapsed_cases() & cases & roster.at(run.started or run.finished)),
         STORM: lambda run: run.storm_reps >= STORM_RUN_SIGNATURE_REPS,
         SETUP_DEATHS: lambda run: last_setup_death is not None and run.finished <= last_setup_death,
+        LOST_PODS: lambda run: last_lost_pod is not None and run.finished <= last_lost_pod,
     }.get(condition, lambda run: False)
     return not any(carries(run) for run in recent)
 
@@ -823,7 +991,7 @@ def transition(prev: dict | None, assessed: dict, now: datetime) -> dict:
     if raw_state != GREEN:
         return _keep(raw_state, assessed["condition"], assessed["cause"], assessed["failing_cases"], now, recovering=False)
     prev_condition = prev.get("condition")
-    if recovered(assessed["full_runs"], prev, since, assessed["last_setup_death"], assessed["roster"]):
+    if recovered(assessed["full_runs"], prev, since, assessed["last_setup_death"], assessed["roster"], assessed["last_lost_pod"]):
         return _keep(GREEN, None, "", [], now, recovering=False)
     return _keep(prev_state, prev_condition, prev.get("cause") or "", prev.get("failing_cases") or [], since, recovering=True)
 
@@ -857,7 +1025,8 @@ def adjudicate(
     or a pinned `--now` passes None and is never stale. `posted` is the
     poster's state file (post_health.py), read for the tracking issue the
     bot filed: it rides in `issue` and the advice while the state is not
-    GREEN, and is dropped on recovery.
+    GREEN and the condition is the one it was filed for (issue_for), and is
+    dropped on recovery.
     """
     if runs is None:
         runs = load_runs(data)
@@ -865,9 +1034,11 @@ def adjudicate(
     decided = transition(prev, assessed, now)
     issue = None
     if decided["state"] != GREEN:
-        issue = (posted or {}).get("issue") or (prev or {}).get("issue") or None
-        if not issue_tag(issue):
-            issue = None
+        # The poster keeps the current condition's issue in `issue` and
+        # every issue of the episode in `issues`; the one for the decided
+        # condition is cited, wherever it sits.
+        candidates = [(posted or {}).get("issue"), *((posted or {}).get("issues") or []), (prev or {}).get("issue")]
+        issue = next((match for match in (issue_for(candidate, decided["condition"]) for candidate in candidates) if match), None)
     evidence = list(assessed["evidence"])
     if decided["recovering"]:
         evidence.append(
@@ -877,8 +1048,12 @@ def adjudicate(
     elif decided["state"] != assessed["state"] and SEVERITY[assessed["state"]] > SEVERITY[decided["state"]]:
         evidence.append(f"{assessed['state']} condition seen but not yet current; holding {decided['state']}")
 
+    # A held state (recovering, or a worse condition not yet current) keeps
+    # the previous tick's numbers: the assessment's incident describes the
+    # raw state, not the one being reported.
+    incident = assessed["incident"] if decided["state"] == assessed["state"] else (prev or {}).get("incident")
     advice = advice_for(
-        decided["state"], decided["condition"], decided["failing_cases"], assessed["storm_end"], notes or {}, decided["recovering"], issue
+        decided["state"], decided["condition"], decided["failing_cases"], assessed["storm_end"], notes or {}, decided["recovering"], issue, incident
     )
     stale_after = DEFAULT_STALE_AFTER
     if isinstance(data.get("stale_after_s"), (int, float)):
@@ -889,10 +1064,6 @@ def adjudicate(
         note = ADVICE_STALE.format(generated_at=iso(now), age=f"{int(age.total_seconds() // 3600)}h")
         evidence.append(note)
         advice = f"{note} {advice}".strip()
-    # A held state (recovering, or a worse condition not yet current) keeps
-    # the previous tick's numbers: the assessment's incident describes the
-    # raw state, not the one being reported.
-    incident = assessed["incident"] if decided["state"] == assessed["state"] else (prev or {}).get("incident")
     out = {
         "schema_version": HEALTH_SCHEMA_VERSION,
         "state": decided["state"],
@@ -983,9 +1154,10 @@ def trim(data: dict, start: datetime, end: datetime, source: str) -> dict:
     """A data.json reduced to the fields this module reads, for a fixture.
 
     Runs that finished in [start, end); per run build_id, pr, started,
-    finished, result, duration_s and tasks; per task name, result and reps;
-    per rep result and the first TRIM_REASON_CHARS of the reason (null for
-    passing reps, as the collector writes them).
+    finished, result, duration_s and tasks, plus how the build ended
+    (has_build_log and the pod_* trio) when the source recorded it; per task
+    name, result and reps; per rep result and the first TRIM_REASON_CHARS of
+    the reason (null for passing reps, as the collector writes them).
     """
     runs = []
     for run in data.get("runs") or []:
@@ -1017,6 +1189,9 @@ def trim(data: dict, start: datetime, end: datetime, source: str) -> dict:
             # Kept as written so a fixture cut from a two-tier data.json
             # replays the same filter the live tick applies.
             entry[tiers.TIER_KEY] = run[tiers.TIER_KEY]
+        for key in ENDED_FIELDS:
+            if key in run:
+                entry[key] = run[key]
         runs.append(entry)
     runs.sort(key=lambda run: run["finished"])
     return {

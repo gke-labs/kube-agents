@@ -212,7 +212,7 @@ class NightlyPageTest(unittest.TestCase):
         self.assertIn(f'href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/{JOB}/{NIGHT_2}/artifacts/eval_case-b_rep1.log"', app)
         self.assertIn('href="cases.html#case-b"', app)
         # Against the night before, and the other nights list.
-        self.assertIn("<b>Newly failing</b> against <a href=\"nightly.html?build=3000000000000000001\">Sun, Sep 6</a>: <code>case-b</code>", app)
+        self.assertIn("<b>Newly failing</b> against <a href=\"nightly.html#build=3000000000000000001\">Sun, Sep 6</a>: <code>case-b</code>", app)
         self.assertIn("<b>Passing again:</b> <code>case-c</code>", app)
         self.assertIn('<span class="now">Mon, Sep 7<span class="pill p-fail">1 failed</span></span>', app)
         # The grader's reason reaches the DOM escaped.
@@ -220,18 +220,18 @@ class NightlyPageTest(unittest.TestCase):
         self.assertIn("check x: &lt;b&gt;absent&lt;/b&gt;", app)
 
     def test_an_older_night_and_an_unknown_build(self):
-        app = dom_text(self.page, query=f"build={NIGHT_1}")
+        app = dom_text(self.page, fragment=f"#build={NIGHT_1}")
         self.assertIn("<h1>Night of Sun, Sep 6</h1>", app)
         self.assertIn("First night on record: nothing to compare with yet.", app)
-        self.assertIn(f'<a href="nightly.html?build={NIGHT_2}">Mon, Sep 7<span class="pill p-fail">1 failed</span></a>', app)
-        app = dom_text(self.page, query="build=4242")
+        self.assertIn(f'<a href="nightly.html#build={NIGHT_2}">Mon, Sep 7<span class="pill p-fail">1 failed</span></a>', app)
+        app = dom_text(self.page, fragment="#build=4242")
         self.assertIn("<h1>No night with build 4242 on record</h1>", app)
 
     def test_the_brief_links_last_night(self):
         app = dom_text(self.out / "index.html")
         self.assertIn("<h2>Last night's run</h2>", app)
         self.assertIn("<b>Mon, Sep 7</b> — 3 cases · 1 passed all reps · 1 partial · 1 failed · newly failing: <code>case-b</code> · 6h 40m. "
-                      f'<a href="nightly.html?build={NIGHT_2}">Read the report →</a>', app)
+                      f'<a href="nightly.html#build={NIGHT_2}">Read the report →</a>', app)
         self.assertIn('Last night\'s run: <a href="nightly.html">nightly</a>', app)
 
     def test_no_night_on_record(self):

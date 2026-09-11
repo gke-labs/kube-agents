@@ -30,9 +30,11 @@ One side effect beyond posting: on a new OUTAGE with no tracking issue --
 none in case-notes.yaml, none open under the `presubmit-gate` label naming
 the same cases -- gate_issue.py files one with the workflow's GitHub token
 (`gh api`, GH_TOKEN), the "broken" message says "Tracking #NNN", and the
-recovery comments on it. It never closes an issue. A GitHub failure is a
-warning: the message goes out with "no issue yet" and the next change asks
-again.
+recovery comments on it. A new `lost_pods` condition (the build cluster lost
+the nodes under running jobs, #1478) files one the same way, addressed to
+the cluster owner, unless an open `presubmit-gate` issue already names the
+lost nodes. It never closes an issue. A GitHub failure is a warning: the
+message goes out with "no issue yet" and the next change asks again.
 
 Delivery is the Google Chat REST API with the job's service account acting
 as a Chat app: POST https://chat.googleapis.com/v1/{space}/messages with an
@@ -85,6 +87,8 @@ NOON = 12
 # health.json's vocabulary (scripts/eval_dashboard/health.py owns it).
 GREEN = "GREEN"
 OUTAGE = "OUTAGE"
+CONDITION_LOST_PODS = "lost_pods"
+CONDITION_SHARED_BREAK = "shared_break"
 # The 24h window health.py reports metrics over, for a health.json that
 # predates the `window_hours` field.
 DEFAULT_WINDOW_HOURS = 24
@@ -125,16 +129,26 @@ DIGEST_WINDOW = timedelta(minutes=20)
 OUTAGE_REPOST_INTERVAL = timedelta(hours=2)
 
 DASHBOARD_URL = "https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html"
+# The directory the pages are published in; the PR view lives beside the Brief.
+DASHBOARD_SITE = DASHBOARD_URL.rsplit("/", 1)[0]
+DASHBOARD_RUN_PAGE = "run.html"
 # Every message ends with a deep link into the dashboard, on a line of its
-# own so Chat auto-links it. The shape is a contract with the dashboard:
-# `?cases=<comma-separated case ids>&since=<ISO 8601 UTC>[&until=<ISO 8601
-# UTC>]` before the fragment, then `#gate` for an incident message and
-# `#agent` for the digest. Commas and colons stay literal.
-DASHBOARD_SECTION_GATE = "gate"
-DASHBOARD_SECTION_AGENT = "agent"
+# own so Chat auto-links it. The shape is a contract with the dashboard
+# (`linkState()` in template/pages.js reads it; SCHEMA.md states it): the
+# whole scope travels in the URL fragment,
+# `#since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>][&cases=<comma-separated
+# case ids>]&view=gate` for an incident message and `view=agent` for the
+# digest, `run.html#build=<prow build id>` for one run. The fragment
+# because the published host's login redirect drops a query string and a
+# browser carries the fragment through a redirect. Commas and colons stay
+# literal. dashboard_link and run_link are the only Python writers of
+# these shapes: gate_comment.py imports them and gate_issue.py is handed
+# the finished link, so neither spells a second copy.
+DASHBOARD_VIEW_GATE = "gate"
+DASHBOARD_VIEW_AGENT = "agent"
 # The Nightly report page beside the Brief; the digest's nightly line links
 # to it (nightly.py derives both the line and the page's data).
-NIGHTLY_URL = DASHBOARD_URL.rsplit("/", 1)[0] + "/" + nightly.NIGHTLY_PAGE
+NIGHTLY_URL = f"{DASHBOARD_SITE}/{nightly.NIGHTLY_PAGE}"
 
 # The message wording. One sentence of cause, one of what to do, then the
 # link; the details live behind the link. Case names are read by a human
@@ -306,23 +320,29 @@ def iso_z(value: datetime | None) -> str | None:
     return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ") if value else None
 
 
-def dashboard_link(section: str, cases=(), since: datetime | None = None, until: datetime | None = None) -> str:
-    """The deep link (see DASHBOARD_SECTION_*): query before fragment, empty
-    parameters omitted, nothing percent-encoded -- case ids are slugs and
-    the timestamps are the `Z` form."""
+def dashboard_link(view: str, cases=(), since: datetime | None = None, until: datetime | None = None) -> str:
+    """The deep link into the Brief (see DASHBOARD_VIEW_*): every parameter
+    in the fragment, `view` last, empty parameters omitted, nothing
+    percent-encoded -- case ids are slugs and the timestamps are the `Z`
+    form."""
     params = []
-    if cases:
-        params.append("cases=" + ",".join(cases))
     if since:
         params.append(f"since={iso_z(since)}")
     if until:
         params.append(f"until={iso_z(until)}")
-    query = "?" + "&".join(params) if params else ""
-    return f"{DASHBOARD_URL}{query}#{section}"
+    if cases:
+        params.append("cases=" + ",".join(cases))
+    params.append(f"view={view}")
+    return f"{DASHBOARD_URL}#{'&'.join(params)}"
 
 
 def incident_link(health: dict, until: datetime | None = None) -> str:
-    return dashboard_link(DASHBOARD_SECTION_GATE, health.get("failing_cases") or [], parse_iso(health.get("since")), until)
+    return dashboard_link(DASHBOARD_VIEW_GATE, health.get("failing_cases") or [], parse_iso(health.get("since")), until)
+
+
+def run_link(build_id) -> str:
+    """The PR view for one prow build: `run.html#build=<id>`."""
+    return f"{DASHBOARD_SITE}/{DASHBOARD_RUN_PAGE}#build={build_id}"
 
 
 def describe_cases(cases) -> str:
@@ -352,6 +372,27 @@ def issue_tag(issue) -> str | None:
     return f"#{number}" if number else None
 
 
+def issue_for(issue, condition: str | None) -> dict | None:
+    """The issue when it was filed for this condition (its `condition` key,
+    gate_issue.as_issue); one without the key predates it and is an
+    outage's, the only kind filed then. Mirrors health.py's issue_for."""
+    if not issue_tag(issue):
+        return None
+    return issue if (issue.get("condition") or CONDITION_SHARED_BREAK) == condition else None
+
+
+def episode_issues(state: dict) -> list[dict]:
+    """Every issue the recorded episode filed or adopted: the state's
+    `issues`, plus its `issue` when a state written before `issues` existed
+    holds one; deduplicated by number, oldest first."""
+    out: list[dict] = []
+    for candidate in [*(state.get("issues") or []), state.get("issue")]:
+        tag = issue_tag(candidate)
+        if tag and tag not in {issue_tag(seen) for seen in out}:
+            out.append(candidate)
+    return out
+
+
 def tracking_text(issues, issue=None) -> str:
     issues = list(issues or [])
     tag = issue_tag(issue)
@@ -360,12 +401,24 @@ def tracking_text(issues, issue=None) -> str:
     return ", ".join(issues) if issues else NO_ISSUE_TEXT
 
 
+def nodes_text(nodes) -> str:
+    """"a node" or "5 nodes": how many the build cluster lost."""
+    count = len(nodes or {})
+    return f"{count} nodes" if count > 1 else "a node"
+
+
 def cause_sentence(health: dict) -> str:
     """One sentence a reader can answer "is it me?" from."""
     incident = health.get("incident") or {}
     prs = len(incident.get("prs") or [])
     since = clock(parse_iso(health.get("since")))
     condition = health.get("condition")
+    if condition == CONDITION_LOST_PODS:
+        when = clock(parse_iso(incident.get("window_start"))) if incident.get("window_start") else since
+        runs = incident.get("runs", 0)
+        if incident.get("event"):
+            return f"the build cluster lost {nodes_text(incident.get('nodes'))} at {when}; {runs} runs on {prs} PRs died mid-run."
+        return f"{runs} runs on {prs} PRs died with their build node at {when}."
     if condition == "shared_break":
         return (
             f"{describe_cases(health.get('failing_cases'))} fail on every PR since {since}"
@@ -391,6 +444,10 @@ def render_change(health: dict, prev: dict | None, issue: dict | None = None) ->
         end = parse_iso((health.get("incident") or {}).get("window_end"))
         when = f"after {clock(end + STORM_COOLDOWN)}" if end else "once the storm has passed"
         lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)}  Passing runs still count; if yours went red, retest {when}."]
+    elif condition == CONDITION_LOST_PODS:
+        tag = issue_tag(issue)
+        tracking = f" Tracking {tag}." if tag else ""
+        lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)} Not your code; retest once new jobs are running.{tracking}"]
     else:
         lines = [f"🟡 *Smoke gate: flaky* — {cause_sentence(health)}  Passing runs still count; if yours died before any test ran, retest."]
     lines.append(incident_link(health))
@@ -412,6 +469,8 @@ def short_cause(prev: dict) -> str:
         return "quota storm"
     if condition == "setup_deaths":
         return "setup failures"
+    if condition == CONDITION_LOST_PODS:
+        return "the build cluster lost nodes"
     return prev.get("cause") or "unknown cause"
 
 
@@ -420,9 +479,10 @@ def render_recovery(health: dict, prev: dict, now: datetime) -> str:
     lasted = duration_text(now - since) if since else "a while"
     parts = [short_cause(prev)]
     issues = list(prev.get("tracking_issues") or [])
-    tag = issue_tag(prev.get("issue"))
-    if tag and tag not in issues:
-        issues.append(tag)
+    for each in episode_issues(prev):
+        tag = issue_tag(each)
+        if tag not in issues:
+            issues.append(tag)
     if issues:
         parts.append(", ".join(issues))
     # No "retests running" clause: this job queues none.
@@ -430,7 +490,7 @@ def render_recovery(health: dict, prev: dict, now: datetime) -> str:
         f"🟢 *Smoke gate: healthy again* — fixed after {lasted} ({', '.join(parts)}).",
         # The closed incident: the cases and start the space was told, and
         # now as its end.
-        dashboard_link(DASHBOARD_SECTION_GATE, prev.get("failing_cases") or [], since, now),
+        dashboard_link(DASHBOARD_VIEW_GATE, prev.get("failing_cases") or [], since, now),
     ]
     return "\n".join(lines)
 
@@ -457,7 +517,7 @@ def render_digest(health: dict, now: datetime, data: dict | None = None) -> str:
     if data is not None:
         lines.append(nightly.digest_line(data, now, clock=lambda value: clock(value, weekday=True)))
         lines.append(NIGHTLY_URL)
-    lines.append(dashboard_link(DASHBOARD_SECTION_AGENT, health.get("failing_cases") or [], parse_iso(health.get("since"))))
+    lines.append(dashboard_link(DASHBOARD_VIEW_AGENT, health.get("failing_cases") or [], parse_iso(health.get("since"))))
     return "\n".join(lines)
 
 
@@ -556,16 +616,34 @@ def run(
     `data`, when given, is the collector's data.json; the digest reads last
     night's nightly run from it.
 
-    `tracker`, when given, files the tracking issue a new OUTAGE lacks
-    before the "broken" message is rendered (so it can say "Tracking #NNN")
-    and comments on it after a recovery goes out."""
+    `tracker`, when given, files the tracking issue a new OUTAGE or a new
+    lost-pods condition lacks before the message is rendered (so it can say
+    "Tracking #NNN") and comments on it after a recovery goes out. An issue
+    filed for one condition is never cited for another (issue_for): the
+    outage's issue is not the cluster owner's, nor the reverse."""
     kinds = decide(health, prev, now, digest_hour, tz)
     before = prev or {}
-    issue = health.get("issue") or before.get("issue")
-    wants_issue = KIND_CHANGE in kinds and health.get("state") == OUTAGE and not issue and not health.get("tracking_issues")
+    condition = health.get("condition")
+    # Every issue this episode filed or adopted rides in `issues` until
+    # GREEN, whatever condition the gate has moved on to, so the recovery can
+    # comment on each of them; `issue` is the one for the current condition,
+    # the only one the message cites and the only one that decides whether a
+    # new one is needed.
+    carried = episode_issues(before)
+    if issue_tag(health.get("issue")) and health["issue"] not in carried:
+        carried.append(health["issue"])
+    issue = next((candidate for candidate in [health.get("issue"), *carried] if issue_for(candidate, condition)), None)
+    wants_issue = KIND_CHANGE in kinds and (health.get("state") == OUTAGE or condition == CONDITION_LOST_PODS) and not issue and not health.get("tracking_issues")
     if tracker is not None and wants_issue:
+        incident = health.get("incident") or {}
         since = parse_iso(health.get("since"))
-        issue = tracker.ensure(health, now, clock(since, weekday=True), incident_link(health))
+        if condition == CONDITION_LOST_PODS:
+            start, end = parse_iso(incident.get("window_start")), parse_iso(incident.get("window_end"))
+            issue = tracker.ensure(health, now, clock(start or since, weekday=True), incident_link(health), clock_range(start, end) if start and end else clock(since, weekday=True))
+        else:
+            issue = tracker.ensure(health, now, clock(since, weekday=True), incident_link(health))
+        if issue and issue not in carried:
+            carried.append(issue)
     messages = [(kind, render(kind, health, prev, now, issue, data)) for kind in kinds]
     failed = []
     for kind, text in messages:
@@ -574,9 +652,10 @@ def run(
         elif not sender.send(text):
             failed.append(kind)
     sent = [kind for kind in kinds if kind not in failed]
-    if tracker is not None and KIND_RECOVERY in sent and before.get("issue"):
+    if tracker is not None and KIND_RECOVERY in sent:
         began = parse_iso(before.get("since"))
-        tracker.recovered(before["issue"], duration_text(now - began) if began else "a while")
+        for each in episode_issues(before):
+            tracker.recovered(each, duration_text(now - began) if began else "a while")
 
     # The state file records what the space was last TOLD, kind by kind,
     # so the next tick asks its questions -- did the state change, did a new
@@ -587,10 +666,11 @@ def run(
     # leaves its part where it was, so the next tick re-asks exactly that
     # question: a change that failed beside a stale notice that succeeded is
     # posted next tick, and a stale flip posted mid-OUTAGE does not swallow a
-    # case that joined inside OUTAGE_REPOST_INTERVAL. The tracking issue
-    # rides along while the recorded state is not GREEN and is dropped by
-    # the recovery; health.py reads it back from here (`--posted-state`)
-    # into the next health.json.
+    # case that joined inside OUTAGE_REPOST_INTERVAL. The tracking issues
+    # ride along while the recorded state is not GREEN -- `issue` for the
+    # current condition, `issues` for every one this episode filed or
+    # adopted -- and are dropped by the recovery; health.py reads them back
+    # from here (`--posted-state`) into the next health.json.
     told_state = KIND_CHANGE in sent or KIND_RECOVERY in sent
     told_stale = KIND_STALE in sent
     if prev is None:
@@ -608,6 +688,7 @@ def run(
         "tracking_issues": source.get("tracking_issues") or [],
         "since": source.get("since"),
         "issue": issue if source.get("state") not in (None, GREEN) else None,
+        "issues": carried if source.get("state") not in (None, GREEN) else [],
         "stale": bool(health.get("stale")) if told_stale else bool(before.get("stale")),
         "posted_at": before.get("posted_at"),
         "last_digest_date": before.get("last_digest_date"),

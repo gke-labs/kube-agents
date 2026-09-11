@@ -21,7 +21,18 @@ lost every repetition to a storm gets no comment (the Chat space and the
 dashboard carry those). A red is either a gate case failing every graded
 repetition, or a hard failure: FAILURE with no such case, which is an
 absolute check (a forbidden cluster change, a verifier that errored) or a
-truncated log, and says so.
+truncated log, and says so. The nightly periodic's runs share data.json
+(`tier: nightly`, no pull request) and are dropped before anything is
+counted, so a green night never reads as another PR's pass (tiers.py).
+
+One zero-task run does get a comment: a lost pod -- the build node went
+away under the job (health.py rule 3b, #1478). Twelve authors saw a red
+with no log and no explanation on 2026-09-11; the comment is one line
+saying the node died, nothing was graded, and to /retest, with the same
+marker, edit-in-place and per-build dedupe as the red comment:
+
+    ### ⚪ Smoke gate: run lost
+    > The Prow build node running this job went away at 10:19 AM ET (...).
 
 Which words: classify.py's `classify_run` -- the same rules the dashboard's
 run.html and the incident brief use -- decides per case whether it is
@@ -47,10 +58,10 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 try:
-    from eval_dashboard import classify, ghcli, health, post_health
+    from eval_dashboard import classify, ghcli, health, post_health, tiers
 except ImportError:  # run as a script: scripts/eval_dashboard/gate_comment.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-    from eval_dashboard import classify, ghcli, health, post_health
+    from eval_dashboard import classify, ghcli, health, post_health, tiers
 
 STATE_SCHEMA_VERSION = 1
 # The hidden first line every comment starts with; how the next tick finds
@@ -89,10 +100,9 @@ OUTCOME_FAILED = classify.OUTCOME_FAILED
 ONLY_PR_WINDOW = classify.ONLY_PR_WINDOW
 EXCERPT_CHARS = 160
 
-# Links. The run page and the brief are the dashboard's (post_health owns
-# the brief's contract); the build log is Prow's Deck for this job.
-DASHBOARD_ROOT = post_health.DASHBOARD_URL.rsplit("/", 1)[0]
-RUN_URL = DASHBOARD_ROOT + "/run.html?build={build_id}"
+# Links. The run page and the brief are the dashboard's, written by
+# post_health.run_link and post_health.incident_link (post_health owns the
+# URL contract); the build log is Prow's Deck for this job.
 BUILD_LOG_URL = "https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{pr}/" + JOB_NAME + "/{build_id}"
 # "kube-agents-evals-23" reads as "evals-23".
 PROJECT_PREFIX = "kube-agents-"
@@ -124,6 +134,20 @@ HARD_FAILURE = (
 HELD_OUT_NOTE = " {n} held-out {cases} also failed; held-out cases do not block."
 LINK_RUN = "[Why this run failed →]({url})"
 LINK_BRIEF = "[Incident brief →]({url})"
+# The lost-pod comment (module docstring).
+HEADING_LOST = "### ⚪ Smoke gate: run lost"
+BOX_LOST = (
+    "The Prow build node running this job went away at {when}{node}{event}."
+    " Nothing was graded and nothing about your change is implied. `/retest` once new jobs are progressing."
+)
+# While health.json's condition is lost_pods: the build-cluster event when
+# health.py calls it one (incident.event), else the plain count -- the same
+# line post_health.py draws.
+BOX_LOST_EVENT = " — part of a build-cluster event: {runs} runs on {prs} PRs"
+BOX_LOST_SOME = " — one of {runs} runs on {prs} PRs that lost their build node"
+LINK_DETAILS = "[Details →]({url})"
+FOOTER_LOST = "Ran {minutes} min before the node went away · [build log]({url})"
+CONDITION_LOST_PODS = health.LOST_PODS
 TABLE_HEAD = "| Case | Result | Also failing on |\n| --- | --- | --- |"
 TABLE_ROW = "| `{case}`{note} | {result} | {also} |"
 HELD_OUT_CELL = " (held out)"
@@ -191,11 +215,12 @@ def is_red(run: health.Run) -> bool:
 
 
 def newest_red_per_pr(data: dict, since: datetime, now: datetime) -> list[dict]:
-    """The newest red run per pull request among those finishing in (since, now]."""
+    """The newest red or lost run per pull request among those finishing in
+    (since, now]."""
     newest: dict = {}
     for raw in data.get("runs") or []:
         run = health.Run(raw)
-        if run.pr is None or not run.finished or not (since < run.finished <= now) or not is_red(run):
+        if run.pr is None or not run.finished or not (since < run.finished <= now) or not (is_red(run) or run.lost_pod):
             continue
         current = newest.get(run.pr)
         if current is None or run.finished > health.Run(current).finished:
@@ -265,7 +290,7 @@ def health_box(red: Red, health_doc: dict, runs: list[dict]) -> str:
     state = health_doc.get("state")
     incident = state not in (None, health.GREEN)
     since = post_health.parse_iso(health_doc.get("since"))
-    links = [LINK_RUN.format(url=RUN_URL.format(build_id=red.run.build_id))]
+    links = [LINK_RUN.format(url=post_health.run_link(red.run.build_id))]
     if incident:
         links.append(LINK_BRIEF.format(url=post_health.incident_link(health_doc)))
     if red.hard:
@@ -340,6 +365,31 @@ def render_comment(red: Red, health_doc: dict, runs: list[dict]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_lost_comment(run: health.Run, health_doc: dict) -> str:
+    """The lost-pod comment: the node and the time, and -- while the health
+    condition is `lost_pods` -- that it is part of a build-cluster event."""
+    incident = health_doc.get("incident") or {}
+    in_event = health_doc.get("condition") == CONDITION_LOST_PODS and health_doc.get("state") != health.GREEN
+    shape = BOX_LOST_EVENT if incident.get("event") else BOX_LOST_SOME
+    event = shape.format(runs=incident.get("runs", 0), prs=len(incident.get("prs") or [])) if in_event else ""
+    node = f" ({run.pod_node})" if run.pod_node else ""
+    links = [LINK_DETAILS.format(url=post_health.run_link(run.build_id))]
+    if in_event:
+        links.append(LINK_BRIEF.format(url=post_health.incident_link(health_doc)))
+    box = BOX_LOST.format(when=post_health.clock(run.finished), node=node, event=event)
+    wall = run.wall_clock
+    minutes = int(wall.total_seconds() // 60) if wall else "?"
+    lines = [
+        MARKER,
+        HEADING_LOST,
+        "",
+        f"> {box} {' · '.join(links)}",
+        "",
+        FOOTER_LOST.format(minutes=minutes, url=BUILD_LOG_URL.format(pr=run.pr, build_id=run.build_id)),
+    ]
+    return "\n".join(lines) + "\n"
+
+
 # --------------------------------------------------------------------------- #
 # Posting
 # --------------------------------------------------------------------------- #
@@ -392,7 +442,9 @@ def tick(data: dict, health_doc: dict, state: dict | None, now: datetime, roster
     watermark_in = post_health.parse_iso(before.get("last_comment_tick")) or (now - FIRST_TICK_LOOKBACK)
     since = watermark_in - SCAN_OVERLAP
     comments = dict(before.get("comments") or {})
-    runs = [r for r in data.get("runs") or [] if isinstance(r, dict)]
+    # The gate's runs only (tiers.py): a nightly run has no pull request, so
+    # left in it would count as "another PR's" pass in the only-this-PR line.
+    runs = tiers.presubmit_runs([r for r in data.get("runs") or [] if isinstance(r, dict)])
     rendered = []
     retry_from = None
     for raw in newest_red_per_pr(data, since, now):
@@ -401,10 +453,13 @@ def tick(data: dict, health_doc: dict, state: dict | None, now: datetime, roster
         entry = comments.get(key, {})
         if entry.get("build_id") == run.build_id:
             continue  # never twice for the same build (nor after giving up on it)
-        admitted = roster.at(run.started or run.finished)
-        verdict = classify.classify_run(raw, runs, health_doc, now, admitted=admitted)
-        red = Red(raw, verdict, admitted)
-        body = render_comment(red, health_doc, runs)
+        if run.lost_pod:
+            body = render_lost_comment(run, health_doc)
+        else:
+            admitted = roster.at(run.started or run.finished)
+            verdict = classify.classify_run(raw, runs, health_doc, now, admitted=admitted)
+            red = Red(raw, verdict, admitted)
+            body = render_comment(red, health_doc, runs)
         rendered.append((run.pr, run.build_id, body))
         known = entry.get("comment_id")
         comment_id = post(gh, run.pr, body, known)

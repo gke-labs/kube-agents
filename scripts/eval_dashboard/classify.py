@@ -3,7 +3,7 @@
 which are the pull request's.
 
 The gate comment on a pull request, the dashboard's PR view
-(``run.html?build=<id>``) and the incident brief all answer the same
+(``run.html#build=<id>``) and the incident brief all answer the same
 question about a red run -- "is this mine?" -- and they must answer it the
 same way, so the rules live here once. ``classify_run`` is the whole
 interface::
@@ -26,7 +26,7 @@ health.json document in force when the run finished (state, condition,
 failing_cases are read; anything else is ignored); ``now`` anchors the
 30-day pass rate and defaults to the run's finish. Every rule below is a
 module constant with the incident it was tuned on; the vocabulary
-(``shared_break`` / ``storm`` / ``setup_deaths``, storm-classified
+(``shared_break`` / ``storm`` / ``setup_deaths`` / ``lost_pods``, storm-classified
 repetitions, collapsed cases) is the CI health adjudicator's, restated here
 so this module has no dependency beyond the standard library.
 
@@ -43,7 +43,10 @@ Per failed admitted case, in priority order:
 * ``None`` -- nothing above fits; the page says it cannot tell.
 
 ``setup`` is a run-level class: no tasks, a FAILURE verdict, under
-SETUP_DEATH_MAX_DURATION (#1172). Such a run has no cases to classify.
+SETUP_DEATH_MAX_DURATION (#1172). A lost pod -- the same zero-task FAILURE
+at any duration, with a NodeNotReady pod event or no build log at all
+(``is_lost_pod``, #1478) -- shares the class with its own headline and
+``do``. Neither run has cases to classify.
 
 ``runs`` may carry the nightly periodic's runs beside the presubmit's
 (SCHEMA.md: ``runs[].tier``; ``tiers.py``). Every rule above reads the
@@ -135,6 +138,9 @@ STATE_GREEN = "GREEN"
 CONDITION_SHARED_BREAK = "shared_break"
 CONDITION_STORM = "storm"
 CONDITION_SETUP_DEATHS = "setup_deaths"
+CONDITION_LOST_PODS = "lost_pods"
+# The pod event health.py's rule 3b reads (runs[].pod_last_event).
+POD_EVENT_NODE_NOT_READY = "NodeNotReady"
 RUN_SUCCESS = "SUCCESS"
 RUN_FAILURE = "FAILURE"
 RUN_ABORTED = "ABORTED"
@@ -170,6 +176,7 @@ DO_SHARED = "Nothing. This failure is the gate's; retest once the brief says it 
 DO_STORM = "Retest after the storm clears; a run started inside it loses repetitions to 429s."
 DO_ONLY_THIS_PR = "Fix the PR. Read the transcript first; it usually names the problem."
 DO_SETUP = "Retest. If it dies the same way again, the leased project is the suspect, not your change."
+DO_LOST_POD = "Retest once new jobs are progressing; the build node died under this run, not your change."
 DO_UNCLEAR = "Read the transcript. Nothing else on the gate matches this failure yet, so it may be yours."
 DO_HELD_OUT = "Nothing for the gate; this case is held out and does not block."
 DO_PASSED = ""
@@ -302,11 +309,23 @@ def run_length(run: dict) -> timedelta | None:
     return None
 
 
+def is_lost_pod(run: dict) -> bool:
+    """health.py's rule 3b unit: a zero-task FAILURE whose pod's last event
+    was NodeNotReady or that has no build log at all (SCHEMA.md, optional
+    run fields; absent is unknown and never one)."""
+    return (
+        not run_tasks(run)
+        and str(run.get("result") or "").upper() == RUN_FAILURE
+        and (run.get("pod_last_event") == POD_EVENT_NODE_NOT_READY or run.get("has_build_log") is False)
+    )
+
+
 def is_setup_death(run: dict) -> bool:
     length = run_length(run)
     return (
         not run_tasks(run)
         and str(run.get("result") or "").upper() == RUN_FAILURE
+        and not is_lost_pod(run)
         and length is not None
         and length < SETUP_DEATH_MAX_DURATION
     )
@@ -655,6 +674,20 @@ def classify_run(run: dict, runs: list[dict], health_at: dict | None = None, now
         result = str(run.get("result") or "").upper()
         length = run_length(run)
         minutes = int(length.total_seconds() // 60) if length is not None else None
+        if is_lost_pod(run):
+            when = f" {minutes} minutes in" if minutes is not None else ""
+            node = run.get("pod_node")
+            return dict(
+                base,
+                headline=f"The build node running this job went away{when}.",
+                lede=f"The Prow build cluster lost {node if node else 'the node'} mid-run; nothing was graded and nothing about this change is implied."
+                + ("" if condition != CONDITION_LOST_PODS else " Other PRs lost their runs the same way right now."),
+                verdict=VERDICT_INFRA,
+                setup_death=False,
+                cls=CLS_SETUP,
+                do=DO_LOST_POD,
+                matches_incident=condition == CONDITION_LOST_PODS,
+            )
         if is_setup_death(run):
             return dict(
                 base,

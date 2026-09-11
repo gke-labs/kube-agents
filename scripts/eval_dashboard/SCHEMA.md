@@ -77,6 +77,7 @@ the same layout and is collected from the moment it starts running.
   the gate's by default. Every gate verdict — the
   health adjudicator's rules and 24-hour metrics, `classify.py`'s "is this
   mine?" (other PRs, the only-this-PR passes, the 30-day pass rate), the
+  red comment's "runs from other PRs" count (`gate_comment.py`), the
   Brief's runs list, the Grid's columns, the Cases page's strips and
   presubmit rates — reads presubmit runs only. A nightly run appears where
   the nightly is meant to: `cases[].nightly`, the Cases page's nightly rate
@@ -159,6 +160,33 @@ the same layout and is collected from the moment it starts running.
   a single warning naming how many PRs went unresolved, never a crash, and
   a missing binary or a timed-out call stops further calls for the rest of
   the pass.
+
+- `has_build_log`, `pod_phase`, `pod_node`, `pod_last_event` — **optional,
+  additive**: how the build ended. A pod whose node went NotReady mid-run
+  (twelve runs on 2026-09-11, #1478) leaves `finished.json`, `podinfo.json`
+  and **no** `build-log.txt`, and lands here as a zero-task `FAILURE` of any
+  duration — the same shape as a clone failure, which does have a log. So
+  for a build with no build log, or one that concluded `FAILURE` with no
+  tasks, the collector reads Prow's `podinfo.json` (the pod record and its
+  events) as well — one extra object per such build, none for a build that
+  ran — and records `pod_phase` (`status.phase`),
+  `pod_node` (`spec.nodeName`) and `pod_last_event` (the `reason` of the
+  newest event by `lastTimestamp`/`eventTime`/creation, upload order
+  breaking ties), each `null` when the record lacks it. `has_build_log` is
+  `true` for a build with a log. Without one the collector reads the log a
+  second time, then lets the pod record decide: `false` when
+  `podinfo.json` answered and its `sidecar` container is still `running`
+  (the kubelet stopped reporting, so Prow's uploader never ran and there is
+  no log anywhere); any other sidecar state means a log was uploaded —
+  `terminated` on the way out, `waiting` when the clone stage failed and
+  initupload wrote it — so the miss is a failed read, `has_build_log` is
+  left **absent** and only the `pod_*` trio is written; a bucket that
+  served neither file leaves all four absent. A
+  zero-task `FAILURE` with a log but no readable `podinfo.json` carries
+  `has_build_log: true` alone. Absent means unknown; consumers treat a run
+  without the fields as neither a lost pod nor anything else. Runs carried
+  over by `--merge-with` keep whatever they have (older documents have
+  none).
 
 A truncated log yields a **partial run** (fewer tasks, fallback duration),
 never an error. A task line whose name matches nothing under `bench/tasks/`
@@ -303,6 +331,13 @@ what the renderer does with them.
   are excluded from every pass-fraction denominator, exactly like `infra`
   task results. When `reps` is absent the task's single `result` stands in
   for one rep.
+- `runs[].has_build_log`, `runs[].pod_*` — a zero-task `FAILURE` with
+  `pod_last_event: "NodeNotReady"` or `has_build_log: false` is a **lost
+  pod**: `classify.py` gives it its own run-level headline (`infra`, never
+  the branch's), `health.py` counts it under the `lost_pods` condition and
+  never as a setup death, and `gate_comment.py` leaves the one-line "run
+  lost" comment on its pull request. Absent fields make none of that
+  happen.
 
 ### `coverage` — from `docs/designs/domains.yaml`
 
@@ -411,10 +446,10 @@ America/Toronto ("ET"), formatted in the browser with
 | Page         | What it is                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `index.html` | **The Brief**: the gate's state and why, what the agent saw, what changed right before, what is being done, the runs in the window with a "See it in the grid" link, and the last release-candidate eval runs (`releases[]`). Healthy: the last 24 hours in numbers and the last incident.                                                                                                                                                                                                                                                  |
-| `run.html`   | **The PR view**, `run.html?build=<prow build id>`: one run, each failed gate case tagged `failing on N other PRs` / `only your PR` / `quota storm` / `unexplained` with its check reason, 30-day pass rate, transcript link, a link to its row on the Cases page and a one-line Do; a "what to do" box.                                                                                                                                                                                                                                     |
+| `run.html`   | **The PR view**, `run.html#build=<prow build id>`: one run, each failed gate case tagged `failing on N other PRs` / `only your PR` / `quota storm` / `unexplained` with its check reason, 30-day pass rate, transcript link, a link to its row on the Cases page and a one-line Do; a "what to do" box.                                                                                                                                                                                                                                     |
 | `grid.html`  | **The Grid**: one row per case (blocking cases by domain, then the held-out ones, folded away when they passed everything in the window), one column per presubmit run in a window of 6 h, 24 h, 36 h or 7 days (header: PR # and ET start; a green run that recorded no cases gets no column); cells passed / failed all reps / failed some / quota-infra / died before the cases / still running (`pending_builds`); merges to main and incident starts and ends marked between the columns; a cell opens that run's detail for the case. |
 | `cases.html` | **The Cases page** ("How reliable is each test?"): one row per case by domain — its last `STRIP_RUNS` presubmit outcomes, pass rate over reps at 7 and 30 days for the presubmit and the nightly apart (`—` when a tier has no graded run), its roster status (blocking / held out / demoted with its date / nightly only / not in any matrix), its last failure with the grader's reason, and its issues from `case-notes.yaml`.                                                                                                           |
-| `nightly.html` | **The Nightly report**: last night's run of the nightly tier (or the night `?build=` names) — its wall clock and whether it ran to the end, the counts (passed all reps / partial / failed / infra), what is newly failing against the night before and what passes again, every case by domain with its state, reps, the grader's reason and a transcript link, and the other nights on record. The Brief's "Last night's run" block and the 9 AM Chat digest link here. `nightly.py` derives it. |
+| `nightly.html` | **The Nightly report**: last night's run of the nightly tier (or the night `#build=` names) — its wall clock and whether it ran to the end, the counts (passed all reps / partial / failed / infra), what is newly failing against the night before and what passes again, every case by domain with its state, reps, the grader's reason and a transcript link, and the other nights on record. The Brief's "Last night's run" block and the 9 AM Chat digest link here. `nightly.py` derives it. |
 
 The pages render in the browser from `brief.json` (below),
 which `render.py` inlines into each page as
@@ -438,18 +473,37 @@ the question imports it.
 
 ### URL contract
 
-`index.html?cases=a,b&since=<ISO 8601 UTC>&until=<ISO 8601 UTC>#gate|#agent`
-`grid.html?cases=a,b&since=<ISO 8601 UTC>&until=<ISO 8601 UTC>[&window=6h|24h|36h|7d][&rows=all|admitted|failing]`
-`cases.html[?sort=worst|domain|name][&show=all|blocking|held]#<case id>`
-`nightly.html[?build=<digits>]`
+`index.html#since=<ISO 8601 UTC>&until=<ISO 8601 UTC>&cases=a,b&view=gate|agent`
+`run.html#build=<prow build id>`
+`grid.html#since=<ISO 8601 UTC>&until=<ISO 8601 UTC>&cases=a,b[&window=6h|24h|36h|7d][&rows=all|admitted|failing]`
+`cases.html#<case id>`, or `cases.html#sort=worst|domain|name&show=all|blocking|held`
+`nightly.html[#build=<prow build id>]`
+
+Every parameter travels in the URL fragment as `key=value` pairs joined
+by `&`. `storage.cloud.google.com` answers an unauthenticated request with
+a login redirect that comes back without the query string, so a scope
+carried there arrived empty and the reader landed on the unscoped Brief; a
+browser never sends the fragment to the server and carries it through a
+redirect, so a scope carried there survives. The older form,
+`index.html?cases=a,b&since=…&until=…#gate|#agent`, `run.html?build=<id>`
+and the same query form on the Grid and the Cases page, is still read, so
+a link already posted to Chat, a pull request or an issue opens the same
+page wherever its query survives (a session the host does not redirect, a
+local render); a key present in both places is read from the query.
+`linkState()` in `template/pages.js` is the one parser;
+`post_health.dashboard_link` / `run_link` (Python: the Chat messages, the
+gate comment, the tracking issue) and `briefHref` / `gridHref` / `runHref`
+/ `caseHref` / `nightHref` (the pages' own links; `incidentHref` and
+`numbersHref` wrap the first) are the writers. A writer omits an empty parameter.
 
 - `cases`, `since`, `until` scope the Brief to that incident (a past one
   when `until` is given). `since` is matched to an incident in
   `health-history.jsonl`; without history the parameters describe it. On
   the Grid the same three make the incident the window and pin its cases
   first; the Brief's "See it in the grid" link carries them.
-- `#agent` shows the last 24 hours in numbers; `#gate` lands on the
-  "why we think" block. No parameters: the current state from `health.json`.
+- `view=agent` shows the last 24 hours in numbers; `view=gate` lands on
+  the "why we think" block (the page scrolls to the section after it
+  renders). No parameters: the current state from `health.json`.
 - Case ids match `[A-Za-z0-9][A-Za-z0-9._-]{0,79}`; the first 50
   (`maxLinkCases`) that do are read, and a link the pages write carries at
   most those 50. A value that fails its grammar is dropped and everything
@@ -457,10 +511,11 @@ the question imports it.
   highlights that row; the PR view and the Grid link there.
 - `since` and `until` are read with a `Z`, a space separator, or a UTC
   offset written `+02:00` or `+0200`, and converted; the pages themselves
-  write `Z`.
-- `run.html?build=<digits>`; an id not in `brief.json` shows a
+  write `Z`, and nothing a writer emits is percent-encoded (the case-id
+  grammar and the `Z` form need none).
+- `run.html#build=<digits>`; an id not in `brief.json` shows a
   not-found page naming the window (`RUN_VIEW_DAYS`, 14 days).
-- `nightly.html?build=<digits>` opens that night instead of the newest;
+- `nightly.html#build=<digits>` opens that night instead of the newest;
   an id not among the `nightly.nights[]` on record says so and links
   last night's.
 - `window`, `rows`, `sort` and `show` are the Grid's and the Cases page's
@@ -543,12 +598,18 @@ never in `runs[]`.
 `health.json` is the CI health adjudicator's verdict, published beside
 `data.json` (nothing in this directory writes it); the fields read are
 `state` (`GREEN|DEGRADED|OUTAGE`), `condition`
-(`shared_break|storm|setup_deaths`), `since`, `cause`, `advice`,
+(`shared_break|storm|setup_deaths|lost_pods`), `since`, `cause`, `advice`,
 `failing_cases`, `tracking_issues`, `incident`, `recovering`, `stale`,
 `generated_at`, `tick`. Any other state, or an unreadable file, means no
 verdict: the Brief says no verdict is published and shows the last 24
 hours in numbers and the runs, the PR view classifies from the runs alone
-and shows no gate banner. Only a `GREEN` verdict reads as healthy.
+and shows no gate banner. Only a `GREEN` verdict reads as healthy. For
+`lost_pods` the `incident` also carries `nodes` (`{node name: runs lost on
+it}`) and `event` (`true` when the loss counts as a build-cluster event);
+the pages give it the same 2-hour lead on the Brief's window as a storm and
+a run-page banner of its own, and otherwise show the generic degraded
+headline. `issue` (`{number, url}`) may carry `condition`, the one it was
+filed for.
 
 `health-history.jsonl` is one JSON object per line, each the full
 `health.json` document as published at that tick plus
@@ -582,6 +643,17 @@ token observed in the wild (`pass`, `fail`, `infra`, `blocked`):
 | 2094432646640701440 | PR 1057 — parallel fan-out, green, one infra rep |
 | 2094467976156680192 | PR 1075 — serial markers, aborted mid-task       |
 | 2094714569262895104 | PR 1089 — blocked/infra-heavy, >300-char reasons |
+
+`testdata_lostpod/` holds two **real** builds of 2026-09-11 (#1478), the two
+zero-task shapes the health adjudicator has to tell apart. `started.json` /
+`finished.json` are verbatim; `podinfo.json` is trimmed to the pod's
+metadata, node, phase, container states and events (the values are real);
+PR 1446's build log keeps the clone header and the failing tail:
+
+| build               | why it is here                                                                                    |
+| ------------------- | ------------------------------------------------------------------------------------------------- |
+| 2098383791838990336 | PR 1118 — node went NotReady 2h08m in; no build-log.txt; `has_build_log: false`                   |
+| 2098418565454499840 | PR 1446 — clone failed (merge conflict) in 0 s; log present, last event `Started`, phase `Failed` |
 
 `testdata_rc/` holds one **real** `post-kube-agents-eval-rc` build — the
 release-candidate job, which is a postsubmit, so its `started.json` carries no
@@ -617,7 +689,12 @@ consumers compare it case-insensitively. `testdata_health/roster-history.json` i
 `BOOTSTRAP_ADMITTED` roster per era over the same week, taken from the
 commits that changed it. Together they are the replay fixture
 `scripts/test_eval_dashboard_health.py` asserts the week's incident
-timeline against.
+timeline against. `testdata_health/lost-pods-2026-09-11.json.gz` is the same
+cut of the published `data.json` for 2026-09-11 (#1478) — the day five build
+nodes went NotReady — with its twenty zero-task reds re-read by
+`collect.build_run` so they carry `has_build_log` and the `pod_*` trio
+(`trim` keeps those fields when the source has them); the same test file
+asserts it reads as `lost_pods` and not as setup deaths.
 
 `testdata_classify/incidents.json.gz` holds a published `data.json`'s runs
 for two windows of the week of 2026-09-01 (PR #913's last runs on 09-04/05;
