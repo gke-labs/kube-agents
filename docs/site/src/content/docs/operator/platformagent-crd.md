@@ -450,10 +450,17 @@ Configures the operator-generated egress `NetworkPolicy`.
   `kubeagents.x-k8s.io/enable-litellm-network-policy: "false"` on the `PlatformAgent`. When opted out, the operator deletes any managed copy of `litellm-policy`, leaving LiteLLM unselected (fail-open) unless a replacement policy is provided and managed out-of-band.
 
   **Upgrade note:** when upgrading from a chart version that shipped the static `litellm-policy`, Helm
-  prunes the static policy on the first upgrade. The operator recreates it once the new operator pod
+  prunes the static policy on the first upgrade (unless the live object already carries
+  `helm.sh/resource-policy: keep`, in which case Helm retains it and the operator adopts it). The operator recreates it once the new operator pod
   rolls out, acquires leader election, and reconciles. LiteLLM is unselected (fail-open) during this
   operator rollout window. To eliminate this window on an existing cluster, annotate the live policy before upgrading (`kubectl annotate netpol litellm-policy helm.sh/resource-policy=keep -n <namespace>`); Helm will retain the policy across the upgrade and the operator will adopt it via Server-Side Apply. Alternatively, pre-roll the new operator image before running `helm upgrade` to narrow the window to controller watch latency (~1s), or manage the
-  policy out-of-band during the transition via `litellm.networkPolicy=false`.
+  policy out-of-band during the transition via `litellm.networkPolicy=false`. The same window
+  opens on a fresh default install, with no live object to annotate; the chart README's
+  [upgrade notes](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/README.md#upgrade-notes-static-to-dynamic-networkpolicy)
+  say how to cover it. Going the other way,
+  from operator-managed back to the static copy, needs a handoff first — see
+  [Handing `litellm-policy` back to Helm](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/README.md#handing-litellm-policy-back-to-helm)
+  in the chart README.
 
 - `dnsClusterIPs` ([]string, optional, max 8 items) — pins the cluster DNS Service ClusterIPs in
   rule 1 of both the agent gateway policy (`<name>-gateway-netpol`) and the LiteLLM gateway policy
@@ -724,6 +731,7 @@ one reviewable place.
 - The `kubeagents.x-k8s.io/prevent-deletion: "true"` annotation on a `PlatformAgent` blocks deletion of the resource via the validating webhook (`ValidateDelete`). This serves as an accidental-deletion guardrail rather than an authorization control — `ValidateUpdate` does not block removing the annotation, so any principal with update permissions can patch the annotation off before deleting.
 - The `kubeagents.x-k8s.io/enable-litellm-network-policy: "false"` annotation on a `PlatformAgent` opts the shared `litellm-policy` out of operator reconciliation and deletes any managed copy without affecting the agent pod's own NetworkPolicy. Note that deleting the managed policy leaves LiteLLM unselected (fail-open) unless a replacement NetworkPolicy is managed out-of-band.
 - The `kubeagents.x-k8s.io/otlp-collector-namespace` annotation sets the collector namespace for `litellm-policy` when LiteLLM exports to an in-cluster collector whose namespace cannot be derived from `spec.telemetry.otlpEndpoint`.
+- Under the Helm chart, `platformAgent.annotations` is the route to these annotations. The chart stamps the last two itself from `litellm.networkPolicy=false` and a non-empty `telemetry.collectorNamespace`, and when it does, an entry that disagrees with the value fails the render — see [PlatformAgent annotations](https://github.com/gke-labs/kube-agents/blob/main/charts/kube-agents/README.md#platformagent-annotations) in the chart README.
 - The Helm chart renders and applies the CR (the install engine drives it through `terraform apply`); you can also edit it directly with `kubectl edit`.
 
 ## Where to go next
