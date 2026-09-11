@@ -26,7 +26,78 @@
 {{- fail "litellm.modelProvider 'vertex_ai' needs litellm.vertex.projectId (or platformAgent.harness.projectId): Vertex AI is addressed as projects/<project>/locations/<location> and the project has no usable default." }}
 {{- end }}
 {{- end }}
-{{- $callbacks := ternary `["otel", "prometheus"]` `["prometheus"]` .Values.litellm.otel }}
+{{- $redaction := .Values.litellm.redaction | default dict }}
+{{- $redactionEnabled := $redaction.enabled | default false }}
+{{- /*
+  The redaction rule file and the two Python modules that consume it, rendered
+  only when the feature is on so the default ConfigMap, and with it the
+  checksum below and the kustomize dev base, stay byte-identical. The action
+  checks duplicate what the hook checks at import on purpose: a typo here
+  should fail the render, not the rollout.
+*/}}
+{{- $redactionConfig := "" }}
+{{- $redactorSource := "" }}
+{{- $redactionCallbackSource := "" }}
+{{- if $redactionEnabled }}
+{{- $ip := $redaction.ip | default dict }}
+{{- /*
+  Strings only, checked before `default`: YAML 1.1 reads a bare `off`, `yes`
+  or `no` as a boolean, `default` treats false as empty, and the operator's
+  `action: off` would otherwise render as pseudonym without a word said.
+*/}}
+{{- if and (hasKey $ip "action") (not (kindIs "string" $ip.action)) }}
+{{- fail (printf "litellm.redaction.ip.action must be a string, got %v; YAML reads a bare off/yes/no as a boolean, so quote it: action: \"off\"" $ip.action) }}
+{{- end }}
+{{- $ipAction := $ip.action | default "pseudonym" }}
+{{- if not (has $ipAction (list "mask" "pseudonym" "off")) }}
+{{- fail (printf "litellm.redaction.ip.action %q is not one of mask, pseudonym, off" $ipAction) }}
+{{- end }}
+{{- $rules := $redaction.rules | default list }}
+{{- range $index, $rule := $rules }}
+{{- if not (kindIs "string" $rule.name) }}
+{{- fail (printf "litellm.redaction.rules[%d] needs a string name, got %v" $index $rule.name) }}
+{{- end }}
+{{- if not (regexMatch `^[A-Za-z0-9][A-Za-z0-9_.\-]*$` $rule.name) }}
+{{- fail (printf "litellm.redaction.rules[%d]: name %q must start with a letter or digit and use only letters, digits, _ . -" $index $rule.name) }}
+{{- end }}
+{{- if and (hasKey $rule "action") (not (kindIs "string" $rule.action)) }}
+{{- fail (printf "litellm.redaction.rules[%d] (%s): action must be a string, got %v; quote a bare yes/no/off" $index $rule.name $rule.action) }}
+{{- end }}
+{{- $ruleAction := $rule.action | default "mask" }}
+{{- if not (has $ruleAction (list "mask" "pseudonym")) }}
+{{- fail (printf "litellm.redaction.rules[%d] (%s): action %q is not one of mask, pseudonym" $index $rule.name $ruleAction) }}
+{{- end }}
+{{- if eq (hasKey $rule "pattern") (hasKey $rule "literal") }}
+{{- fail (printf "litellm.redaction.rules[%d] (%s): give exactly one of pattern or literal" $index $rule.name) }}
+{{- end }}
+{{- $sourceKey := ternary "pattern" "literal" (hasKey $rule "pattern") }}
+{{- $source := get $rule $sourceKey }}
+{{- if or (not (kindIs "string" $source)) (empty $source) }}
+{{- fail (printf "litellm.redaction.rules[%d] (%s): %s must be a non-empty string, got %v; an empty rule would mark every position of every request, and YAML reads a bare yes/no/on/off or a number as something other than text" $index $rule.name $sourceKey $source) }}
+{{- end }}
+{{- end }}
+{{- $redactionConfig = toYaml (dict "ip" (dict "action" $ipAction "allowCidrs" ($ip.allowCidrs | default list)) "rules" $rules) }}
+{{- $redactorSource = .Files.Get "files/redactor.py" }}
+{{- $redactionCallbackSource = .Files.Get "files/litellm_redaction_callback.py" }}
+{{- if or (empty $redactorSource) (empty $redactionCallbackSource) }}
+{{- fail "litellm.redaction is enabled but the chart's files/redactor.py or files/litellm_redaction_callback.py is missing" }}
+{{- end }}
+{{- end }}
+{{- /*
+  Rendered as the flow list LiteLLM's config expects, byte-identical to the
+  kustomize base for the default cases. The redaction callback is a module
+  path relative to the config directory, which is why its two files are
+  mounted beside config.yaml below.
+*/}}
+{{- $callbackList := ternary (list "otel" "prometheus") (list "prometheus") .Values.litellm.otel }}
+{{- if $redactionEnabled }}
+{{- $callbackList = append $callbackList "litellm_redaction_callback.proxy_handler_instance" }}
+{{- end }}
+{{- $quotedCallbacks := list }}
+{{- range $callbackList }}
+{{- $quotedCallbacks = append $quotedCallbacks (quote .) }}
+{{- end }}
+{{- $callbacks := printf "[%s]" (join ", " $quotedCallbacks) }}
 {{- /*
   Rendered once here and used twice below — as the ConfigMap body and as the
   input to the Deployment's checksum. Three aliases for one upstream model,
@@ -35,6 +106,13 @@
   concrete model gets routed rather than a 404 from the gateway.
 */}}
 {{- $config := include "kube-agents.litellmConfig" (dict "provider" $provider "model" $model "callbacks" $callbacks) }}
+{{- /*
+  Every key the ConfigMap carries feeds the checksum: the rule file and the
+  two modules are subPath mounts too, so an edit to any of them has to roll
+  the pods the same way an edit to config.yaml does. With redaction off the
+  three extras are empty strings and the hash is the one it always was.
+*/}}
+{{- $checksumInput := printf "%s%s%s%s" $config $redactionConfig $redactorSource $redactionCallbackSource }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -46,6 +124,14 @@ metadata:
 data:
   config.yaml: |
     {{- $config | nindent 4 }}
+  {{- if $redactionEnabled }}
+  redaction.yaml: |
+    {{- $redactionConfig | nindent 4 }}
+  redactor.py: |
+    {{- $redactorSource | nindent 4 }}
+  litellm_redaction_callback.py: |
+    {{- $redactionCallbackSource | nindent 4 }}
+  {{- end }}
 {{- if eq $provider "vertex_ai" }}
 ---
 {{- /* Nothing else creates this one. The Platform Agent's KSA can be left to
@@ -96,7 +182,7 @@ spec:
         # Hashes the rendered config itself, not the inputs it was rendered
         # from: an edit to the config template has to roll the pods too, and
         # the subPath mount below means nothing else will deliver it.
-        checksum/config: {{ $config | sha256sum }}
+        checksum/config: {{ $checksumInput | sha256sum }}
     spec:
       {{- if eq $provider "vertex_ai" }}
       serviceAccountName: {{ $vertexSA | quote }}
@@ -136,6 +222,19 @@ spec:
                   name: {{ .Values.platformAgent.credentials.secretName | quote }}
                   key: OPENAI_API_KEY
                   optional: true
+            {{- if $redactionEnabled }}
+            - name: KUBE_AGENTS_REDACTION_CONFIG
+              value: /app/redaction.yaml
+            # Salts the [rule:<hex>] pseudonyms. Optional: without it the
+            # redactor warns and uses a per-pod salt, so tokens still redact
+            # but stop matching across replicas and restarts.
+            - name: SESSION_KV_SALT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.platformAgent.credentials.secretName | quote }}
+                  key: SESSION_KV_SALT
+                  optional: true
+            {{- end }}
             {{- if .Values.litellm.otel }}
             - name: LITELLM_OTEL_V2
               value: "true"
@@ -186,6 +285,20 @@ spec:
             - name: config-volume
               mountPath: /app/config.yaml
               subPath: config.yaml
+            {{- if $redactionEnabled }}
+            # Beside config.yaml, because LiteLLM resolves a custom callback
+            # module relative to the config file's directory and the callback
+            # imports redactor.py from its own.
+            - name: config-volume
+              mountPath: /app/redaction.yaml
+              subPath: redaction.yaml
+            - name: config-volume
+              mountPath: /app/redactor.py
+              subPath: redactor.py
+            - name: config-volume
+              mountPath: /app/litellm_redaction_callback.py
+              subPath: litellm_redaction_callback.py
+            {{- end }}
       volumes:
         - name: config-volume
           configMap:

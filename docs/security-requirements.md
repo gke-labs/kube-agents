@@ -92,11 +92,13 @@ sandbox is a StatefulSet of its own, and the agent gateway is a third. `sharePro
 unset in every configuration.
 
 The broker authenticates every caller. A caller presents an audience-bound projected ServiceAccount
-token (audience `kubeagents-credential-proxy`, one hour) as a bearer header, and the broker verifies
+token (one hour; the audience is per pod, `kubeagents-credential-proxy` for the sandbox and
+`kubeagents-credential-proxy-chat` for the gateway) as a bearer header, and the broker verifies
 it with a `TokenReview` before serving any path but `/healthz`; `CREDENTIAL_PROXY_ALLOWED_CALLERS`
-names the two ServiceAccounts allowed to call. Three properties do not follow from that. The
-allowlist names the gateway's ServiceAccount and the sandbox's, and no policy varies on which one
-presented the token, so the check is a multi-tenancy control rather than an agent-containment one.
+names the ServiceAccounts allowed to call. Three properties do not follow from that. The
+allowlist names the gateway's ServiceAccount and the sandbox's and does not vary on which one
+presented the token (the audience and the route table it feeds do), so the allowlist is a
+multi-tenancy control rather than an agent-containment one.
 The token crosses the cluster network in cleartext. And the sandbox holds that token, so it holds a
 credential where the design would prefer it held none — short-lived, audience-bound and revocable,
 but not non-exportable.
@@ -159,7 +161,7 @@ The selected configuration is accepted when:
 2. Kubernetes and infrastructure-provider operations execute as the AgentSA;
 3. the required AgentSA preflight, and optional UserSA preflight, authorize an operation before it executes;
 4. operator-managed persisted state is scoped to its `PlatformAgent`;
-5. the operator-generated agent sandbox receives no credentials or Kubernetes ServiceAccount tokens through environment variables or mounted filesystems. This holds fully for the `<agent>-shell` Pod, which runs model-authored code. The gateway's `platform-agent` container is the one exception: it mounts an audience-bound projected ServiceAccount token so it can authenticate to the broker across the network — a deliberate trade described in section 6;
+5. the operator-generated agent sandbox receives no credentials or Kubernetes ServiceAccount tokens through environment variables or mounted filesystems. This holds fully for the `<agent>-shell` Pod, which runs model-authored code. The gateway's `platform-agent` container carries the exceptions: it mounts an audience-bound projected ServiceAccount token so it can authenticate to the broker across the network — a deliberate trade described in section 6 — and, under the unsupported `mode: next` toggle, it also receives the A2A bus's `worker` password by SecretKeyRef, which appears and disappears with the A2A stack;
 6. direct, autonomous, and automation-mediated actions remain distinguishable in telemetry; and
 7. the configured chat access policy accepts only authorized initiators.
 

@@ -7,10 +7,12 @@ package gateway
 import "context"
 
 // InboundMessage is one chat message, normalized across backends. AuthorID is
-// the backend-native immutable id of the sender as the backend's own identity
-// mechanism reported it — for Discord, the authenticated gateway websocket.
-// Verification against the principal map happens in the session manager;
-// adapters never see principals.
+// the sender's id as the backend's own identity mechanism reported it — the
+// immutable snowflake over Discord's authenticated gateway websocket, the
+// Google-asserted email on Google Chat, where the email IS the id
+// (spec-chatops-gateway.md, "The Google Chat adapter"). Verification —
+// against the principal map, or the allowlist — happens in the session
+// manager; adapters never see principals.
 type InboundMessage struct {
 	// Conversation is the backend-qualified conversation id — the session key
 	// (eg discord:1234/5678). A channel or space is not a session; a
@@ -18,7 +20,7 @@ type InboundMessage struct {
 	Conversation string
 	// Kind is "dm" or "group".
 	Kind string
-	// AuthorID is the backend-native immutable sender id.
+	// AuthorID is the sender id in the backend's own identity vocabulary.
 	AuthorID string
 	// MessageID is the backend-native message id, recorded against the
 	// correlationId in the ingress log so the audit chain runs chat message ->
@@ -47,7 +49,8 @@ type Adapter interface {
 	// model cost.
 	Edit(conversation, messageID, text string) error
 
-	// Roster returns the backend-native member ids of a conversation and
+	// Roster returns the members of a conversation in the same vocabulary
+	// as AuthorID (so a member who is also the requester matches), and
 	// whether the list is complete. The session manager pseudonymizes and
 	// caps it; adapters return it raw.
 	Roster(conversation string) (ids []string, complete bool, err error)

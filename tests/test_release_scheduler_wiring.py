@@ -2,11 +2,11 @@
 
 Following the decoupled trigger pattern established by rc-scheduler.yml and
 nightly-scheduler.yml, release-scheduler.yml holds the cron trigger
-("17 5 * * 4") so that quiet ticks with nothing to release produce no
+("17 5 * * 5") so that quiet ticks with nothing to release produce no
 pipeline run at all.
 
 These tests pin the structural invariants:
-- The scheduler holds the cron ("17 5 * * 4"), and release-publish.yml does not.
+- The scheduler holds the cron ("17 5 * * 5"), and release-publish.yml does not.
 - The scheduler evaluates candidates via resolve_scheduled_release.sh.
 - Dispatch is strictly gated on steps.resolve.outputs.should_release == 'true'.
 - Skips are recorded via record_release_scheduler_skip.sh on should_release != 'true'.
@@ -22,7 +22,7 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _WORKFLOWS = _REPO_ROOT / ".github" / "workflows"
 _SCHEDULER = "release-scheduler.yml"
 _PIPELINE = "release-publish.yml"
-_RELEASE_CRON = "17 5 * * 4"
+_RELEASE_CRON = "17 5 * * 5"
 
 _DISPATCH_SCRIPT_NAME = "dispatch_release_pipeline.sh"
 _DISPATCH_SCRIPT = (

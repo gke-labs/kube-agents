@@ -224,6 +224,23 @@ a rollout drops the only Pod before its replacement is ready, so LiteLLM is
 unreachable for up to the three minutes its `startupProbe` allows. `values.yaml`
 states the trade in full.
 
+`litellm.redaction.enabled=true` makes the gateway redact every request body
+before it reaches the provider: the ConfigMap gains the shared redactor module,
+a LiteLLM pre-call hook and a `redaction.yaml` rule file, all mounted beside
+`/app/config.yaml`, and the gateway container gets `KUBE_AGENTS_REDACTION_CONFIG`
+plus an optional `SESSION_KV_SALT` from the credentials Secret to salt the
+pseudonyms. `litellm.redaction.ip.action` (`pseudonym`, `mask`, `"off"` — quoted,
+because YAML reads the bare word as a boolean and the render refuses it) and
+`litellm.redaction.ip.allowCidrs` govern IP literals; `litellm.redaction.rules`
+adds named `literal` or `pattern` rules with a `mask` or `pseudonym` action, and
+a name, action or source the chart does not accept fails the render. Off by
+default, and the rendered config is unchanged while it is; the feature is
+chart-only, so with it on the gateway diverges from the kustomize dev base,
+which carries no redaction. The site's
+[inference gateway page](../../docs/site/src/content/docs/concepts/inference-gateway.md)
+owns what is redacted, what is not (responses, on-disk transcripts, chat
+egress) and why a pseudonymised identifier is one the agent cannot act on.
+
 ### Hindsight memory store
 
 `hindsight.*` renders the agents' long-term memory store — the Hindsight API

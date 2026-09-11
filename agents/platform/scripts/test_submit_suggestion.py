@@ -18,6 +18,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -143,7 +144,15 @@ class SubmitSuggestionTestCase(unittest.TestCase):
 
         # `gh pr create` needs a GitHub. Record the call instead.
         self.gh_calls = []
-        self.patch_attr(submit_suggestion, "subprocess", _GhStub(self))
+        self.gh_stub = _GhStub(self)
+        self.patch_attr(submit_suggestion, "subprocess", self.gh_stub)
+
+        # `--body-file` is confined to the scratch directory, which on a test
+        # machine is not /opt/data/scratch. Point it at one this test owns —
+        # the confinement is what is under test, not the path it names.
+        self.scratch_dir = self.tmp_path / "body-scratch"
+        self.scratch_dir.mkdir()
+        self.patch_attr(submit_suggestion, "SCRATCH_DIR", str(self.scratch_dir))
 
     def seed_origin(self) -> Path:
         origin = self.tmp_path / "origin.git"
@@ -179,15 +188,30 @@ class SubmitSuggestionTestCase(unittest.TestCase):
             submit_suggestion.dispatch(args)
         return json.loads(out.getvalue())
 
-    def submit(self, branch, workspace, lease=None, title="t", body="b"):
+    def submit(
+        self,
+        branch,
+        workspace,
+        lease=None,
+        title="t",
+        body="b",
+        body_file=None,
+        keep_description=False,
+    ):
         args = [
             "submit",
             "--branch", branch,
-            "--title", title,
-            "--body", body,
             "--workspace", str(workspace),
             "--repo", "acme/fleet",
         ]
+        if title is not None:
+            args += ["--title", title]
+        if body_file is not None:
+            args += ["--body-file", str(body_file)]
+        elif body is not None:
+            args += ["--body", body]
+        if keep_description:
+            args.append("--keep-description")
         if lease:
             args += ["--lease", lease]
         out = io.StringIO()
@@ -505,6 +529,167 @@ class TestSubmit(SubmitSuggestionTestCase):
         stub = submit_suggestion.subprocess
         self.assertEqual(stub.titles["platform-agent/fix-netpol"], "round two")
 
+    def test_keep_description_leaves_the_open_pull_requests_body_alone(self):
+        """A caller that is not re-describing the change, only adding to it.
+
+        A conflict merge or a CI fix lands on a pull request that has been
+        under human review, and `submit`'s ordinary path overwrites the
+        description unconditionally. The loss is invisible — `submit` prints a
+        URL — and the only mitigation on offer otherwise is prose asking a
+        model to echo a multi-kilobyte markdown document back byte-for-byte.
+        """
+        payload = self.prepare()
+        self.commit(payload["workspace"])
+        authored = "## Context\n\nHand-written, with `backticks` and a list:\n- one\n"
+        first = self.submit(payload["branch"], payload["workspace"], body=authored)
+
+        again = self.prepare()
+        self.commit(again["workspace"], name="clusters/prod/netpol-v2.yaml")
+        second = self.submit(
+            again["branch"],
+            again["workspace"],
+            title=None,
+            body=None,
+            keep_description=True,
+        )
+
+        self.assertEqual(second, first)
+        self.assertEqual(self.gh_stub.bodies["platform-agent/fix-netpol"], authored)
+        self.assertEqual(self.gh_stub.titles["platform-agent/fix-netpol"], "t")
+        # The push still happened — this mode changes the description, nothing
+        # else — and no `pr edit` was issued at all.
+        self.assertIn(["pr", "create"], [argv[1:3] for argv, _ in self.gh_calls])
+        self.assertNotIn(["pr", "edit"], [argv[1:3] for argv, _ in self.gh_calls])
+
+    def test_keep_description_without_an_open_pull_request_says_so(self):
+        """There is no description to keep, so the flag is a caller error."""
+        payload = self.prepare()
+        self.commit(payload["workspace"])
+        with self.assertRaises(RuntimeError) as caught:
+            self.submit(
+                payload["branch"],
+                payload["workspace"],
+                title=None,
+                body=None,
+                keep_description=True,
+            )
+        self.assertIn("no pull request is open", str(caught.exception))
+        # The lookup itself is fine; what must not happen is falling through to
+        # a `create` with the empty title and body this mode allows.
+        verbs = [argv[1:3] for argv, _ in self.gh_calls]
+        self.assertEqual(verbs, [["pr", "view"]])
+
+    def test_a_description_without_keep_still_needs_a_title_and_a_body(self):
+        payload = self.prepare()
+        self.commit(payload["workspace"])
+        with self.assertRaises(ValueError) as caught:
+            self.submit(payload["branch"], payload["workspace"], title=None, body=None)
+        self.assertIn("--keep-description", str(caught.exception))
+
+    def test_a_body_survives_backticks_on_both_the_create_and_the_edit(self):
+        """argv is the wrong channel for a document a shell will see.
+
+        Inside double quotes bash expands backticks and `$(...)`, so a body
+        that reaches `gh` through a shell-built argv either loses its own text
+        or runs it. Every other body in this repository is handed over out of
+        band — `pr_conversation.py reply` takes a path it reads itself, and
+        `forge.post_comment` sends the text on fd 0 — and the pull request
+        description was the one that did not.
+        """
+        hostile = "Fixes the `main` branch.\n\nRun `id` to check. $(whoami)\n"
+        path = self.scratch_dir / "body.md"
+        path.write_text(hostile, encoding="utf-8")
+
+        payload = self.prepare()
+        self.commit(payload["workspace"])
+        self.submit(payload["branch"], payload["workspace"], body_file=path)
+        self.assertEqual(self.gh_stub.bodies["platform-agent/fix-netpol"], hostile)
+
+        again = self.prepare()
+        self.commit(again["workspace"], name="clusters/prod/netpol-v2.yaml")
+        self.submit(again["branch"], again["workspace"], body_file=path)
+        self.assertEqual(self.gh_stub.bodies["platform-agent/fix-netpol"], hostile)
+        # The edit hands it over as a file too, so the body never becomes a
+        # shell word on either path.
+        edits = [argv for argv, _ in self.gh_calls if argv[1:3] == ["pr", "edit"]]
+        self.assertTrue(edits)
+        for argv in edits:
+            self.assertIn("--body-file", argv)
+            self.assertNotIn("--body", argv)
+
+    def test_a_body_file_outside_scratch_is_refused(self):
+        """The file's contents are published, so the path is bounded.
+
+        `pr_conversation.py` and the issue resolver both bound theirs for this
+        reason. Unbounded, `--body-file /proc/self/environ` puts the agent
+        container's environment — `SESSION_KV_API_KEY`, and under `mode: next`
+        the bus password, which is not pod-scoped — into a public pull request
+        description. The agent does not have to intend it: Step 5 has it read
+        review comments, which are somebody else's text.
+        """
+        outside = self.tmp_path / "outside.md"
+        outside.write_text("secrets\n", encoding="utf-8")
+        payload = self.prepare()
+        self.commit(payload["workspace"])
+        with self.assertRaises(ValueError) as caught:
+            self.submit(payload["branch"], payload["workspace"], body_file=outside)
+        self.assertIn("resolves outside", str(caught.exception))
+        # Refused on argv alone, before the branch was pushed anywhere.
+        self.assertEqual([], self.gh_calls)
+
+    def test_a_symlink_out_of_scratch_is_refused(self):
+        """Resolved before the prefix test, so a link planted inside is not a way out."""
+        secret = self.tmp_path / "token"
+        secret.write_text("ghs_not_yours\n", encoding="utf-8")
+        link = self.scratch_dir / "body.md"
+        link.symlink_to(secret)
+
+        payload = self.prepare()
+        self.commit(payload["workspace"])
+        with self.assertRaises(ValueError) as caught:
+            self.submit(payload["branch"], payload["workspace"], body_file=link)
+        self.assertIn("resolves outside", str(caught.exception))
+
+    def test_a_body_file_that_is_missing_or_empty_is_refused(self):
+        """Named separately from "no body at all", which is the same outcome
+        by a different mistake — a heredoc that wrote nowhere."""
+        payload = self.prepare()
+        self.commit(payload["workspace"])
+        missing = self.scratch_dir / "gone.md"
+        with self.assertRaises(ValueError) as caught:
+            self.submit(payload["branch"], payload["workspace"], body_file=missing)
+        self.assertIn("does not exist", str(caught.exception))
+
+        blank = self.scratch_dir / "blank.md"
+        blank.write_text("\n  \n", encoding="utf-8")
+        with self.assertRaises(ValueError) as caught:
+            self.submit(payload["branch"], payload["workspace"], body_file=blank)
+        self.assertIn("is empty", str(caught.exception))
+
+    def test_keep_description_and_a_body_are_mutually_exclusive(self):
+        """A body handed over beside the flag is a body the run would discard.
+
+        Argparse refuses the combination rather than the run reading the file
+        and throwing the text away, which reported success for a description it
+        had not touched.
+        """
+        path = self.scratch_dir / "body.md"
+        path.write_text("new prose\n", encoding="utf-8")
+        payload = self.prepare()
+        self.commit(payload["workspace"])
+        for extra in (["--body", "b"], ["--body-file", str(path)]):
+            with self.subTest(extra=extra[0]):
+                with self.assertRaises(SystemExit):
+                    submit_suggestion.dispatch([
+                        "submit",
+                        "--branch", payload["branch"],
+                        "--workspace", str(payload["workspace"]),
+                        "--repo", "acme/fleet",
+                        "--keep-description",
+                        *extra,
+                    ])
+        self.assertEqual([], self.gh_calls)
+
     def test_a_gh_failure_that_is_not_an_existing_pr_still_raises(self):
         # The fallback must not swallow "not authenticated" or "base branch is
         # protected" — those are real failures and the run has to stop.
@@ -513,7 +698,7 @@ class TestSubmit(SubmitSuggestionTestCase):
 
         stub = submit_suggestion.subprocess
         original = stub._create
-        stub._create = lambda argv: subprocess.CompletedProcess(
+        stub._create = lambda argv, _stdin: subprocess.CompletedProcess(
             argv, 1, "", "HTTP 403: Resource not accessible by integration\n"
         )
         self.addCleanup(setattr, stub, "_create", original)
@@ -754,18 +939,32 @@ class TestContentMode(SubmitSuggestionTestCase):
         return json.loads(out.getvalue())
 
     def submit_content(
-        self, prepared, source, title="t", body="b", deletes=(), repo="acme/fleet"
+        self,
+        prepared,
+        source,
+        title="t",
+        body="b",
+        body_file=None,
+        keep_description=False,
+        deletes=(),
+        repo="acme/fleet",
     ):
         argv = [
             "submit",
             "--branch", prepared["branch"],
-            "--title", title,
-            "--body", body,
             "--handle", prepared["handle"],
             "--from", str(source),
             "--base-sha", prepared["baseSha"],
             "--repo", repo,
         ]
+        if title is not None:
+            argv += ["--title", title]
+        if body_file is not None:
+            argv += ["--body-file", str(body_file)]
+        elif body is not None:
+            argv += ["--body", body]
+        if keep_description:
+            argv.append("--keep-description")
         for path in deletes:
             argv += ["--delete", path]
         out = io.StringIO()
@@ -851,6 +1050,154 @@ class TestContentMode(SubmitSuggestionTestCase):
         # No cwd either: in content mode there is no directory in this container
         # for `gh` to run in, and it does not need one — every call names --repo.
         self.assertIsNone(cwd)
+
+    def test_a_body_file_reaches_gh_intact_in_content_mode(self):
+        """The safe channel has to be the safe channel in both transports.
+
+        Content mode read `args.body` directly, so `--body-file` was accepted,
+        ignored, and the pull request opened with an empty description — on the
+        path every current install takes, because the operator renders
+        `CREDENTIAL_PROXY_CONTENT_WORKSPACE=1` unconditionally.
+        """
+        hostile = "Fixes the `main` branch.\n\nRun `id` to check. $(whoami)\n"
+        path = self.scratch_dir / "body.md"
+        path.write_text(hostile, encoding="utf-8")
+
+        prepared = self.prepare_content()
+        source = self.scratch({"a.yaml": "kind: X\n"})
+        self.submit_content(prepared, source, body=None, body_file=path)
+
+        self.assertEqual(self.gh_stub.bodies["platform-agent/fix-netpol"], hostile)
+
+    def test_keep_description_leaves_the_body_alone_in_content_mode(self):
+        """Round two under a handle used to overwrite a reviewed description.
+
+        `--keep-description` reached `create_pull_request` only from directory
+        mode; the content path passed the flag's absence, so the mode meant to
+        protect a human's prose did nothing on the transport that carries every
+        real submission.
+        """
+        authored = "## Context\n\nHand-written, with `backticks` and a list:\n- one\n"
+        first = self.prepare_content()
+        first_url = self.submit_content(
+            first, self.scratch({"a.yaml": "kind: X\n"}), body=authored
+        )
+
+        again = self.prepare_content()
+        second_url = self.submit_content(
+            again,
+            self.scratch({"b.yaml": "kind: Y\n"}),
+            body=None,
+            keep_description=True,
+        )
+
+        self.assertEqual(second_url, first_url)
+        self.assertEqual(self.gh_stub.bodies["platform-agent/fix-netpol"], authored)
+        # The commit still landed — this mode changes the description, nothing
+        # else — and `pr edit` never ran.
+        files = self.origin_git(
+            ["ls-tree", "-r", "--name-only", "platform-agent/fix-netpol"]
+        ).split()
+        self.assertIn("b.yaml", files)
+        self.assertNotIn(["pr", "edit"], [argv[1:3] for argv, _ in self.gh_calls])
+
+    def test_keep_description_without_an_open_pull_request_refuses_before_the_commit(self):
+        """The refusal has to land before the branch moves, not after.
+
+        The check used to live inside `create_pull_request`, which content mode
+        reaches only once the broker has committed and pushed. The error tells
+        the caller to retry with a body — and that retry finds the files
+        already on the branch, so `commit` reports nothing to do and refuses
+        too, leaving commits pushed, no pull request, and no way through this
+        script to open one.
+        """
+        prepared = self.prepare_content()
+        self.verbs.clear()
+        source = self.scratch({"a.yaml": "kind: X\n"})
+        with self.assertRaises(RuntimeError) as caught:
+            self.submit_content(prepared, source, body=None, keep_description=True)
+        self.assertIn("no pull request is open", str(caught.exception))
+        self.assertEqual([["pr", "view"]], [argv[1:3] for argv, _ in self.gh_calls])
+        # Nothing was committed and nothing was pushed, so the retry the error
+        # asks for is a retry that can work.
+        self.assertEqual([], self.verbs)
+        self.assertNotIn("platform-agent/fix-netpol", self.origin_branches())
+
+    def test_a_merged_pull_request_is_not_a_description_to_keep(self):
+        """`gh pr view` answers for a merged pull request too.
+
+        Branch names here are derived from the change, so a branch outlives the
+        pull request opened from it. Counting the merged one as "there is a
+        description to keep" made the run return that old URL and open nothing:
+        the commits landed, the log said `PR SUBMITTED SUCCESSFULLY`, and no
+        pull request existed for them.
+        """
+        first = self.prepare_content()
+        url = self.submit_content(first, self.scratch({"a.yaml": "kind: X\n"}))
+        branch = first["branch"]
+        self.gh_stub.closed_prs[branch] = self.gh_stub.open_prs.pop(branch)
+
+        again = self.prepare_content()
+        with self.assertRaises(RuntimeError) as caught:
+            self.submit_content(
+                again, self.scratch({"b.yaml": "kind: Y\n"}),
+                body=None, keep_description=True,
+            )
+        self.assertIn("no pull request is open", str(caught.exception))
+        self.assertNotIn(url, str(caught.exception))
+
+    def test_a_failed_lookup_is_not_read_as_an_absent_pull_request(self):
+        """An expired token and "there is no pull request" are opposite answers.
+
+        Collapsing both into "" told the agent to resubmit with a title and a
+        body — and on the transient it is, that resubmission finds the pull
+        request open after all and overwrites the reviewed description this
+        mode exists to protect.
+        """
+        prepared = self.prepare_content()
+        source = self.scratch({"a.yaml": "kind: X\n"})
+        stub = submit_suggestion.subprocess
+        stub._view = lambda argv: subprocess.CompletedProcess(
+            argv, 1, "", "HTTP 401: Bad credentials\n"
+        )
+
+        with self.assertRaises(RuntimeError) as caught:
+            self.submit_content(prepared, source, body=None, keep_description=True)
+        message = str(caught.exception)
+        self.assertIn("Bad credentials", message)
+        self.assertNotIn("no pull request is open", message)
+
+    def test_content_mode_needs_a_title_even_under_keep_description(self):
+        """The title is the commit message here, and only here.
+
+        Directory mode has already made the commit by the time `submit` runs,
+        so `--keep-description` can waive the title along with the body. Under
+        a handle this script makes the commit, and a commit with no message is
+        not something the broker can be asked for.
+        """
+        prepared = self.prepare_content()
+        self.verbs.clear()
+        source = self.scratch({"a.yaml": "kind: X\n"})
+        with self.assertRaises(ValueError) as caught:
+            self.submit_content(
+                prepared, source, title=None, body=None, keep_description=True
+            )
+        self.assertIn("--title is required with --handle", str(caught.exception))
+        self.assertEqual([], self.verbs)
+        self.assertEqual([], self.gh_calls)
+
+    def test_content_mode_without_keep_still_needs_a_title_and_a_body(self):
+        """The guard ran after the dispatch, so it never covered this path."""
+        prepared = self.prepare_content()
+        self.verbs.clear()
+        source = self.scratch({"a.yaml": "kind: X\n"})
+        with self.assertRaises(ValueError) as caught:
+            self.submit_content(prepared, source, title="t", body=None)
+        self.assertIn("--keep-description", str(caught.exception))
+        # Refused on argv alone: nothing was sent to the broker and no
+        # credential was spent.
+        self.assertEqual([], self.verbs)
+        self.assertEqual([], self.gh_calls)
 
     def test_a_delete_reaches_the_commit(self):
         prepared = self.prepare_content()
@@ -1076,6 +1423,28 @@ class _GhStub:
         self._test = test
         self.open_prs: dict[str, str] = {}
         self.titles: dict[str, str] = {}
+        self.bodies: dict[str, str] = {}
+        # Branches whose pull request `gh pr view` still resolves but whose
+        # state is no longer OPEN. The real CLI answers for a merged or closed
+        # pull request exactly as it does for an open one, and branch names
+        # here are reused across rounds, so this is a reachable state rather
+        # than a hypothetical.
+        self.closed_prs: dict[str, str] = {}
+
+    @staticmethod
+    def _body_of(argv, stdin):
+        """The description `gh` was handed, whichever channel carried it.
+
+        `--body-file -` is the one the code uses; the path and `--body` forms
+        are here because `gh` accepts them and a caller outside this repository
+        may still pass one.
+        """
+        if "--body-file" in argv:
+            path = argv[argv.index("--body-file") + 1]
+            if path == "-":
+                return stdin
+            return Path(path).read_text(encoding="utf-8")
+        return argv[argv.index("--body") + 1]
 
     def __getattr__(self, name):
         return getattr(subprocess, name)
@@ -1086,15 +1455,16 @@ class _GhStub:
             return subprocess.run(cmd, **kwargs)
         self._test.gh_calls.append((argv, kwargs.get("cwd")))
         verb = argv[1:3]
+        stdin = kwargs.get("input")
         if verb == ["pr", "create"]:
-            return self._create(argv)
+            return self._create(argv, stdin)
         if verb == ["pr", "edit"]:
-            return self._edit(argv)
+            return self._edit(argv, stdin)
         if verb == ["pr", "view"]:
             return self._view(argv)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
-    def _create(self, argv):
+    def _create(self, argv, stdin):
         branch = argv[argv.index("--head") + 1]
         if branch in self.open_prs:
             # Verbatim shape of the real refusal, because the code keys on it.
@@ -1106,20 +1476,42 @@ class _GhStub:
         url = f"https://github.com/acme/fleet/pull/{len(self.open_prs) + 1}"
         self.open_prs[branch] = url
         self.titles[branch] = argv[argv.index("--title") + 1]
+        self.bodies[branch] = self._body_of(argv, stdin)
         return subprocess.CompletedProcess(argv, 0, url + "\n", "")
 
-    def _edit(self, argv):
+    def _edit(self, argv, stdin):
         branch = argv[3]
         if branch not in self.open_prs:
             return subprocess.CompletedProcess(argv, 1, "", "no pull requests found\n")
         self.titles[branch] = argv[argv.index("--title") + 1]
+        self.bodies[branch] = self._body_of(argv, stdin)
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     def _view(self, argv):
+        """`gh pr view`, including the two answers that are not "here it is".
+
+        A branch with no pull request at all exits 1 with `no pull requests
+        found`. A branch whose pull request merged or closed exits *0* — the
+        real CLI does not filter by state — and the `--jq` on the command line
+        is what turns that into empty output. Modelling the jq rather than the
+        outcome is deliberate: the code under test is the query, so a stub that
+        answered "" directly would assert only that the test agrees with
+        itself.
+        """
         branch = argv[3]
-        if branch not in self.open_prs:
+        url = self.open_prs.get(branch) or self.closed_prs.get(branch)
+        if not url:
             return subprocess.CompletedProcess(argv, 1, "", "no pull requests found\n")
-        return subprocess.CompletedProcess(argv, 0, self.open_prs[branch] + "\n", "")
+        state = "OPEN" if branch in self.open_prs else "MERGED"
+        jq = argv[argv.index("--jq") + 1]
+        wanted = re.search(r'select\(\.state == "([A-Z]+)"\)', jq)
+        # No `select` filters nothing, exactly as jq would not: a query that
+        # stopped asking for the state has to come back with the merged pull
+        # request here, or the test passes for a reason of its own making.
+        selected = "" if wanted and wanted.group(1) != state else url
+        return subprocess.CompletedProcess(
+            argv, 0, (selected + "\n") if selected else "", ""
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

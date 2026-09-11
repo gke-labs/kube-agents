@@ -32,6 +32,7 @@ kube_agents_clone_dir() { printf '%s/kube-agents' "${HOME:?the installer clones 
 MINTY_CLI_REPO_URL="https://github.com/abcxyz/github-token-minter.git"
 MINTY_CLI_GIT_TAG="v2.7.1"
 MINTY_CLI_MANUAL_CLONE_DIR="/tmp/minty"
+SPINNER_INTERVAL_SECS="0.2"
 
 # ─── ANSI Colors & Terminal Responsive Helpers ─────────────────────────────────
 # A function because scripts/installer/common.sh defines the same variables
@@ -322,6 +323,7 @@ fi
 
 # ─── Agentic & Automation Parameter States ────────────────────────────────────
 PARAM_NON_INTERACTIVE="${NONINTERACTIVE:-false}"
+PARAM_GENERATE_ONLY="${GENERATE_ONLY:-false}"
 PARAM_DRY_RUN="${DRY_RUN:-false}"
 PARAM_PROJECT_ID="${PROJECT_ID:-}"
 PARAM_REGION="${REGION:-}"
@@ -390,6 +392,10 @@ memory_mode_from_provider() {
 PARAM_MEMORY="${MEMORY:-$(memory_mode_from_provider "${MEMORY_PROVIDER:-}")}"
 PARAM_ALLOWED_USERS="${ALLOWED_USERS:-}"
 PARAM_IMAGE_TAG="${IMAGE_TAG:-}"
+PARAM_MIGRATE_NODE_POOLS="${MIGRATE_NODE_POOLS:-}"
+PARAM_MIGRATE_NODE_POOLS_PASSED="false"
+PARAM_ENABLE_NETWORK_POLICY="${ENABLE_NETWORK_POLICY:-}"
+PARAM_ENABLE_NETWORK_POLICY_PASSED="false"
 PARAM_ALLOW_UNVERIFIED_SOURCE="${ALLOW_UNVERIFIED_SOURCE:-false}"
 # "<repo_dir>@<ref>" already checked by verify_local_source_ref, so the pre-flight
 # check and the one at the workspace step do not report the same verdict twice.
@@ -421,6 +427,9 @@ Usage:
 
 Flags for AI Agents & Automation:
   -y, --yes, --non-interactive  Run in non-interactive mode (use flags/defaults)
+  --generate-only               Generate install.env and terraform.tfvars, run
+                                pre-apply checks, print lifecycle commands, and
+                                exit without applying
   --dry-run                     Validate prerequisites & output config/plan without creating resources
   --project-id=ID               Target GCP Project ID
   --region=REGION               Target GCP Region (default: install.defaults.env
@@ -507,6 +516,12 @@ Flags for AI Agents & Automation:
                                 (default: DEFAULT_GOOGLE_CHAT_MODE, currently default)
   --google-chat-home-channel=SPACE_ID
                                 Google Chat space ID for unsolicited alerts/messages (e.g. spaces/AAAA...)
+  --migrate-node-pools          Opt in to migrating legacy node pools to GKE_METADATA on an existing
+                                cluster (recreates nodes and restarts workloads; required on clusters
+                                with legacy pools, else install aborts)
+  --enable-network-policy       Opt in to enabling legacy Calico NetworkPolicy addon and enforcement
+                                on an existing GKE Standard cluster without Dataplane V2 (may recreate
+                                nodes and restart workloads; required on such clusters, else install aborts)
   --menu, --config              Launch interactive Day-2 Control Panel Menu (raspi-config style)
   -h, --help, -?                Show this help message
 
@@ -524,6 +539,7 @@ parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -y|--yes|--non-interactive) PARAM_NON_INTERACTIVE="true"; shift ;;
+      --generate-only) PARAM_GENERATE_ONLY="true"; shift ;;
       --dry-run) PARAM_DRY_RUN="true"; shift ;;
       --menu|--config|--configure|menu|config) PARAM_MENU_MODE="true"; shift ;;
       --project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
@@ -560,6 +576,26 @@ parse_args() {
       --chat-topic-name=*) PARAM_CHAT_TOPIC_NAME="${1#*=}"; shift ;;
       --google-chat-mode=*) PARAM_GOOGLE_CHAT_MODE="${1#*=}"; shift ;;
       --google-chat-home-channel=*) PARAM_GOOGLE_CHAT_HOME_CHANNEL="${1#*=}"; shift ;;
+      --migrate-node-pools=*)
+        PARAM_MIGRATE_NODE_POOLS="${1#*=}"
+        PARAM_MIGRATE_NODE_POOLS_PASSED="true"
+        shift
+        ;;
+      --migrate-node-pools)
+        PARAM_MIGRATE_NODE_POOLS="true"
+        PARAM_MIGRATE_NODE_POOLS_PASSED="true"
+        shift
+        ;;
+      --enable-network-policy=*)
+        PARAM_ENABLE_NETWORK_POLICY="${1#*=}"
+        PARAM_ENABLE_NETWORK_POLICY_PASSED="true"
+        shift
+        ;;
+      --enable-network-policy)
+        PARAM_ENABLE_NETWORK_POLICY="true"
+        PARAM_ENABLE_NETWORK_POLICY_PASSED="true"
+        shift
+        ;;
       -h|--help|-\?|help) show_help; exit 0 ;;
       *) print_error "Unknown parameter: $1"; show_help >&2; return 2 ;;
     esac
@@ -1304,6 +1340,113 @@ resolve_shared_defaults() {
   PARAM_ENABLE_STOCKOUT_INVESTIGATOR="${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
 }
 
+# Run a command or function in the background, animating a spinner with elapsed
+# time and the command's latest output line. Output is streamed to log_file.
+# Falls back to direct execution when stdout is not a terminal (CI, piped logs).
+# Returns the command's exit status and leaves error presentation to callers.
+run_with_spinner() {
+  local msg="$1"
+  local log_file="$2"
+  shift 2
+
+  if [ ! -t 1 ]; then
+    print_info "$msg..."
+    local rc=0
+    "$@" 2>&1 | tee "$log_file" || rc=${PIPESTATUS[0]}
+    return "$rc"
+  fi
+
+  # Everything the handler reads is given a value before the handler can run,
+  # because `set -u` would otherwise kill it on an unbound variable instead of
+  # letting it restore the cursor and reap the job.
+  local task_pid=0
+  local term_width=0
+  local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+  local frame=0
+  local started=$SECONDS
+  local status_line=""
+
+  on_spinner_interrupt() {
+    local sig="$1"
+    trap - INT TERM
+    # Reap the children before the job itself. When "$@" is a shell function
+    # bash forks a subshell, so task_pid is that subshell and the process doing
+    # the work -- terraform, for the dry-run caller -- is its child; signalling
+    # only task_pid leaves that child running, detached, against the same
+    # .terraform directory the next run reads. Nothing else will clean it up:
+    # with job control off bash sets SIGINT to SIG_IGN for `&` children and the
+    # disposition survives both fork and exec, so the terminal's own Ctrl-C
+    # never reaches either process.
+    if [ "$task_pid" -ne 0 ]; then
+      pkill -TERM -P "$task_pid" 2>/dev/null || true
+      kill -TERM "$task_pid" 2>/dev/null || true
+    fi
+    tput cnorm 2>/dev/null || true
+    printf '\r%*s\r' "$term_width" ''
+    if [ -s "$log_file" ]; then
+      echo -e "\n  ${C_CYAN}ℹ Interrupted. Command output saved to: ${log_file}${C_RESET}" >&2
+    else
+      rm -f -- "$log_file"
+    fi
+    exit "$sig"
+  }
+
+  # Armed before the job exists, not after. Arming afterwards leaves a window in
+  # which the worker is already running while SIGINT still has its default
+  # disposition here: the shell dies, and the worker -- which inherited SIG_IGN
+  # for SIGINT as a `&` child -- outlives it with nothing left to reap it.
+  trap 'on_spinner_interrupt 130' INT
+  trap 'on_spinner_interrupt 143' TERM
+
+  "$@" >"$log_file" 2>&1 &
+  task_pid=$!
+
+  term_width="$(get_term_width)"
+  # Everything except the status line: two spaces, spinner, message, "(NNNs)",
+  # separators. Keep one column spare so the line never wraps.
+  local status_width=$((term_width - ${#msg} - 15))
+  if [ "$status_width" -lt 10 ]; then
+    status_width=10
+  fi
+  tput civis 2>/dev/null || true
+  while kill -0 "$task_pid" 2>/dev/null; do
+    # Both of these fork a child, and SIGINT from a terminal goes to the whole
+    # foreground group, so on Ctrl-C the child dies of it and the command
+    # reports 130. Unguarded under `set -Ee` that fires the ERR trap, and
+    # on_error exits the shell before bash dispatches the pending INT trap --
+    # so the handler below never runs, the worker is orphaned, the cursor stays
+    # hidden, and the cancellation is recorded as a FAILED install report.
+    # `|| true` keeps errexit out of the loop and leaves the INT trap the only
+    # way out of it.
+    status_line="$(tail -n 1 "$log_file" 2>/dev/null | tr -d '\r' | cut -c1-"$status_width")" || status_line=""
+    printf '\r  %b%s%b %s %b(%ss)%b %-*s' \
+      "$C_CYAN" "${frames[$((frame % 10))]}" "$C_RESET" "$msg" \
+      "$C_YELLOW" "$((SECONDS - started))" "$C_RESET" "$status_width" "$status_line"
+    frame=$((frame + 1))
+    sleep "$SPINNER_INTERVAL_SECS" || true
+  done
+  tput cnorm 2>/dev/null || true
+  printf '\r%*s\r' "$term_width" ''
+
+  trap - INT TERM
+  local rc=0
+  wait "$task_pid" || rc=$?
+  return "$rc"
+}
+
+# The dry run's Terraform check. At file scope, rather than inside main(), so the
+# test suite can source install.sh and drive this exact function instead of its
+# own copy of the chain -- a copy asserts that the copy short-circuits, which is
+# true of any string. Runs in whatever directory the caller has cd'd into.
+#
+# The && is load-bearing: `terraform validate` against an uninitialised directory
+# reports init's failure as a configuration error, so an unchained pair blames
+# the composition for what is really a provider download that did not happen.
+validate_tf_config() {
+  terraform init -backend=false -input=false &&
+    terraform validate
+}
+
 # Wait for one deployment to roll out, animating a spinner with the elapsed time
 # and kubectl's own latest progress line. Falls back to plain streaming output
 # when stdout is not a terminal (CI, piped logs). Returns kubectl's exit status.
@@ -1312,48 +1455,28 @@ wait_for_rollout() {
   local namespace="$2"
   local timeout_secs="$3"
 
-  if [ ! -t 1 ]; then
-    kubectl rollout status "deployment/${deployment}" -n "$namespace" --timeout="${timeout_secs}s"
-    return $?
-  fi
-
+  local started=$SECONDS
   local log_file=""
   log_file="$(mktemp -t kube-agents-rollout.XXXXXX)"
-  kubectl rollout status "deployment/${deployment}" -n "$namespace" --timeout="${timeout_secs}s" \
-    >"$log_file" 2>&1 &
-  local kubectl_pid=$!
-
-  local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
-  local frame=0
-  local started=$SECONDS
-  local status_line=""
-  local term_width=0
-  term_width="$(get_term_width)"
-  # Everything except the kubectl line: two spaces, spinner, name, "(NNNs)",
-  # separators. Keep one column spare so the line never wraps — a wrapped line
-  # cannot be rewritten with \r and would scroll the spinner down the screen.
-  local status_width=$((term_width - ${#deployment} - 15))
-  if [ "$status_width" -lt 10 ]; then
-    status_width=10
-  fi
-  tput civis 2>/dev/null || true
-  while kill -0 "$kubectl_pid" 2>/dev/null; do
-    status_line="$(tail -n 1 "$log_file" 2>/dev/null | tr -d '\r' | cut -c1-"$status_width")"
-    printf '\r  %b%s%b %s %b(%ss)%b %-*s' \
-      "$C_CYAN" "${frames[$((frame % 10))]}" "$C_RESET" "$deployment" \
-      "$C_YELLOW" "$((SECONDS - started))" "$C_RESET" "$status_width" "$status_line"
-    frame=$((frame + 1))
-    sleep 0.2
-  done
-  tput cnorm 2>/dev/null || true
-  printf '\r%*s\r' "$term_width" ''
 
   local rc=0
-  wait "$kubectl_pid" || rc=$?
+  run_with_spinner "$deployment" "$log_file" \
+    kubectl rollout status "deployment/${deployment}" -n "$namespace" --timeout="${timeout_secs}s" || rc=$?
+
+  # Published for the caller's failure message. How long the wait actually ran is
+  # the diagnostic: a ProgressDeadlineExceeded that comes back in seconds is a
+  # different problem from one that used the whole budget, and the timeout
+  # constant cannot tell them apart.
+  ROLLOUT_ELAPSED_SECS=$((SECONDS - started))
+
   if [ "$rc" -eq 0 ]; then
-    print_success "$deployment rolled out in $((SECONDS - started))s"
-  else
-    tail -n 3 "$log_file" | tr -d '\r' | while IFS= read -r line; do
+    print_success "$deployment rolled out in ${ROLLOUT_ELAPSED_SECS}s"
+  elif [ -t 1 ]; then
+    # Only the spinner branch withholds the command's output. The non-TTY branch
+    # of run_with_spinner has already streamed it through tee, so echoing the
+    # tail there prints the same failure twice -- and on stdout, since the 2>&1
+    # that branch needs has already folded kubectl's stderr into it.
+    tail -n 3 "$log_file" 2>/dev/null | tr -d '\r' | while IFS= read -r line; do
       [ -n "$line" ] && print_info "$line"
     done
   fi
@@ -1673,6 +1796,7 @@ write_json_report() {
 {
   "status": "$(json_escape "$status")",
   "dry_run": ${PARAM_DRY_RUN},
+  "generate_only": ${PARAM_GENERATE_ONLY},
   "non_interactive": ${PARAM_NON_INTERACTIVE},
   "project_id": "$(json_escape "${project_id:-}")",
   "project_number": "$(json_escape "${project_number:-}")",
@@ -1714,6 +1838,70 @@ handle_pipeline_status() {
   elif [ "$rc_tee" -ne 0 ]; then
     on_error "$rc_tee" "$LINENO" "tee \"$log_file\""
   fi
+}
+
+# Prints out-of-Terraform prerequisites, lifecycle commands with state bucket
+# and prefix, and post-apply steps when running with --generate-only.
+print_generate_only_handoff() {
+  local repo_dir="$1" project_id="$2" cluster_name="$3" region="$4" tfvars_file="$5"
+  local kms_loc key_resource keyring key minter_keyring minter_key state_bkt state_pfx
+
+  kms_loc="$(derive_kms_location "$region")"
+  keyring="${GKE_DB_KMS_KEYRING:-$DEFAULT_GKE_DB_KMS_KEYRING}"
+  key="${GKE_DB_KMS_KEY:-$DEFAULT_GKE_DB_KMS_KEY}"
+  key_resource="projects/${project_id}/locations/${kms_loc}/keyRings/${keyring}/cryptoKeys/${key}"
+  minter_keyring="${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}"
+  minter_key="${KMS_KEY:-$DEFAULT_KMS_KEY}"
+  state_bkt="$(tf_state_bucket)"
+  state_pfx="$(tf_state_prefix)"
+
+  print_step "Generation Complete — Operator Handoff"
+  print_success "Configuration generated and validated without touching GCP resources."
+  echo ""
+  echo -e "  • ${C_CYAN}Install configuration:${C_RESET} ${INSTALL_ENV_FILE}"
+  echo -e "  • ${C_CYAN}Terraform input:${C_RESET} ${tfvars_file}"
+  echo ""
+  echo -e "${C_BOLD}Next steps for the operator to apply manually:${C_RESET}"
+  echo ""
+  echo -e "${C_BOLD}1. Out-of-Terraform prerequisites (run if applicable to your cluster):${C_RESET}"
+  echo -e "  • ${C_CYAN}CMEK Database Encryption (pre-existing cluster without CMEK):${C_RESET}"
+  echo -e "    # Note: the two KMS create commands report ALREADY_EXISTS on a re-run, which is safe to ignore."
+  echo -e "    gcloud services enable cloudkms.googleapis.com --project=${project_id}"
+  echo -e "    gcloud kms keyrings create ${keyring} --location=${kms_loc} --project=${project_id}"
+  echo -e "    gcloud kms keys create ${key} --keyring=${keyring} --location=${kms_loc} --purpose=encryption --project=${project_id}"
+  echo -e "    gcloud beta services identity create --service=container.googleapis.com --project=${project_id}"
+  echo -e "    gcloud kms keys add-iam-policy-binding ${key} --keyring=${keyring} --location=${kms_loc} \\\\"
+  echo -e "      --member=\"serviceAccount:service-\$(gcloud projects describe ${project_id} --format='value(projectNumber)')@container-engine-robot.iam.gserviceaccount.com\" \\\\"
+  echo -e "      --role=\"roles/cloudkms.cryptoKeyEncrypterDecrypter\" --project=${project_id} --quiet"
+  echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --database-encryption-key=${key_resource} --project ${project_id}"
+  echo ""
+  echo -e "  • ${C_CYAN}Workload Identity Pool (pre-existing Standard cluster):${C_RESET}"
+  echo -e "    # Note: Migrating node pools to GKE_METADATA recreates nodes and restarts workloads."
+  echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --workload-pool=${project_id}.svc.id.goog"
+  echo -e "    gcloud container node-pools update <node-pool> --cluster=${cluster_name} --location=${region} --project=${project_id} --workload-metadata=GKE_METADATA"
+  echo ""
+  echo -e "  • ${C_CYAN}NetworkPolicy Enforcement (pre-existing cluster without Dataplane V2):${C_RESET}"
+  echo -e "    # Note: Enabling Calico may recreate nodes and restart workloads."
+  echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --update-addons=NetworkPolicy=ENABLED"
+  echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --enable-network-policy"
+  echo ""
+  echo -e "  • ${C_CYAN}GitHub App PEM Import (before apply, when GitOps minter is enabled):${C_RESET}"
+  echo -e "    # Note: the two create commands report ALREADY_EXISTS on a re-run, which is safe to ignore."
+  echo -e "    gcloud services enable cloudkms.googleapis.com --project=${project_id}"
+  echo -e "    gcloud kms keyrings create ${minter_keyring} --location=${kms_loc} --project=${project_id}"
+  echo -e "    gcloud kms keys create ${minter_key} --keyring=${minter_keyring} --location=${kms_loc} \\\\"
+  echo -e "      --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 \\\\"
+  echo -e "      --import-only --skip-initial-version-creation --protection-level=software --project=${project_id}"
+  echo -e "    git clone --depth 1 --branch ${MINTY_CLI_GIT_TAG} ${MINTY_CLI_REPO_URL} ${MINTY_CLI_MANUAL_CLONE_DIR}"
+  echo -e "    (cd ${MINTY_CLI_MANUAL_CLONE_DIR} && go run ./cmd/minty tools import-pk -project-id=${project_id} -location=${kms_loc} -key-ring=${minter_keyring} -key=${minter_key} -private-key=@<path-to-pem>)"
+  echo ""
+  echo -e "${C_BOLD}2. Apply via lifecycle.sh (remote state in GCS):${C_RESET}"
+  echo -e "  cd ${repo_dir}/terraform/examples/full-install"
+  echo -e "  KUBE_AGENTS_STATE_BUCKET=\"${state_bkt}\" KUBE_AGENTS_STATE_PREFIX=\"${state_pfx}\" ./lifecycle.sh apply"
+  echo ""
+  echo -e "${C_BOLD}3. Out-of-Terraform post-apply steps (if creating a new cluster):${C_RESET}"
+  echo -e "  • ${C_CYAN}Managed OpenTelemetry Scope:${C_RESET}"
+  echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS"
 }
 
 # Runs lifecycle.sh apply against the generated terraform.tfvars. Reads the
@@ -1818,18 +2006,49 @@ ensure_existing_cluster_workload_identity() {
   # Enabling the pool does not migrate node pools off the legacy GCE metadata
   # server, and pods on such pools still get the node's service account.
   # Standard-cluster concern: Autopilot pools are managed onto GKE_METADATA
-  # already.
+  # already. Migrating a node pool recreates its nodes and restarts workloads,
+  # so explicit opt-in is required.
   local legacy_pool
+  local legacy_pools=()
   while IFS= read -r legacy_pool; do
     [ -n "$legacy_pool" ] || continue
-    print_warning "Node pool '${legacy_pool}' uses the legacy GCE metadata server; migrating to GKE_METADATA (this recreates the pool's nodes)..."
-    gcloud container node-pools update "$legacy_pool" \
-      --cluster="$cluster_name" --location="$region" --project="$project_id" \
-      --workload-metadata=GKE_METADATA --quiet
+    legacy_pools+=("$legacy_pool")
   done < <(trap - ERR; gcloud container node-pools list --cluster="$cluster_name" \
       --location="$region" --project="$project_id" \
       --format="csv[no-heading](name,config.workloadMetadataConfig.mode)" 2>/dev/null \
     | awk -F',' '$2 != "GKE_METADATA" {print $1}' || true)
+
+  if [ "${#legacy_pools[@]}" -gt 0 ]; then
+    if [ -z "${PARAM_MIGRATE_NODE_POOLS:-${MIGRATE_NODE_POOLS:-}}" ]; then
+      if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
+        PARAM_MIGRATE_NODE_POOLS="false"
+      else
+        local migrate_choice=""
+        prompt_read "Node pool(s) '${legacy_pools[*]}' use the legacy GCE metadata server; migrating to GKE_METADATA recreates nodes and restarts workloads. Declining ends the install (kube-agents requires Workload Identity). Migrate now? (y/N)" migrate_choice "n"
+        if is_truthy "$migrate_choice"; then
+          PARAM_MIGRATE_NODE_POOLS="true"
+        else
+          PARAM_MIGRATE_NODE_POOLS="false"
+        fi
+      fi
+    fi
+
+    if ! is_truthy "${PARAM_MIGRATE_NODE_POOLS:-${MIGRATE_NODE_POOLS:-false}}"; then
+      print_error "Existing cluster '$cluster_name' has node pool(s) '${legacy_pools[*]}' using the legacy GCE metadata server."
+      print_info "kube-agents requires Workload Identity (GKE_METADATA) to authenticate agent and operator pods."
+      print_info "Pods on these pools cannot use Workload Identity and would silently authenticate as the node's default compute service account."
+      print_info "Migrating node pools recreates nodes and restarts workloads. Because explicit opt-in was not granted, provisioning cannot proceed."
+      print_info "Aborting before making any cluster changes. Pass --migrate-node-pools or set MIGRATE_NODE_POOLS=true to authorize."
+      return 1
+    else
+      for legacy_pool in "${legacy_pools[@]}"; do
+        print_warning "Node pool '${legacy_pool}' uses the legacy GCE metadata server; migrating to GKE_METADATA (this recreates the pool's nodes)..."
+        gcloud container node-pools update "$legacy_pool" \
+          --cluster="$cluster_name" --location="$region" --project="$project_id" \
+          --workload-metadata=GKE_METADATA --quiet
+      done
+    fi
+  fi
 }
 
 # NetworkPolicy enforcement on a pre-existing cluster is the third such
@@ -1837,29 +2056,59 @@ ensure_existing_cluster_workload_identity() {
 # minter's, Hindsight's, and the ones the operator generates around the
 # agent — is accepted and silently inert on a cluster with neither Dataplane
 # V2 nor the legacy Calico addon, which is GKE Standard's default shape.
-# Terraform-created clusters always have Dataplane V2; adopted ones get the
-# legacy addon enabled here. The gke-cluster module's postcondition backstops
-# bare-Terraform installs.
+# Clusters created by this repository's gke-cluster module have Dataplane V2;
+# clusters created by other Terraform configurations or pre-existing Standard
+# clusters may have neither Dataplane V2 nor Calico, requiring explicit opt-in
+# to enable the legacy Calico addon. The gke-cluster module's postcondition
+# backstops bare-Terraform installs.
 ensure_existing_cluster_network_policy() {
   local project_id="$1" cluster_name="$2" region="$3"
-  local dp_provider
+  local cluster_info
   # trap - ERR: same bash-3.2 subshell-trap suppression as the Workload
-  # Identity probe above.
-  dp_provider=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
+  # Identity probe above. Query status alongside network fields so an
+  # unreadable cluster fails safely rather than attempting mutations.
+  cluster_info=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
     --location="$region" --project="$project_id" \
-    --format="value(networkConfig.datapathProvider)" 2>/dev/null) || return 0
+    --format="csv[no-heading](status,networkConfig.datapathProvider,networkPolicy.enabled)" 2>/dev/null || echo "")
+  local status="" dp_provider="" legacy_np=""
+  if [ -n "$cluster_info" ]; then
+    IFS=',' read -r status dp_provider legacy_np <<< "$cluster_info" || true
+  fi
+  if [ -z "$status" ]; then
+    print_error "Could not query NetworkPolicy configuration for existing cluster '$cluster_name'."
+    print_info "Refusing to attempt cluster mutations on unread cluster state."
+    return 1
+  fi
   if [ "$dp_provider" = "ADVANCED_DATAPATH" ]; then
     print_success "Existing cluster '$cluster_name' runs Dataplane V2; NetworkPolicy enforcement is built in."
     return 0
   fi
-  local legacy_np
-  legacy_np=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
-    --location="$region" --project="$project_id" \
-    --format="value(networkPolicy.enabled)" 2>/dev/null || echo "")
   if [ "$legacy_np" = "True" ] || [ "$legacy_np" = "true" ]; then
     print_success "Existing cluster '$cluster_name' already enforces NetworkPolicy (legacy Calico addon)."
     return 0
   fi
+
+  if [ -z "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-}}" ]; then
+    if [ "$PARAM_NON_INTERACTIVE" = "true" ] || ! has_controlling_tty; then
+      PARAM_ENABLE_NETWORK_POLICY="false"
+    else
+      local np_choice=""
+      prompt_read "Existing cluster '$cluster_name' does not enforce NetworkPolicy (kube-agents requires Dataplane V2 or Calico). Enabling Calico may recreate nodes and restart workloads. Declining ends the install (kube-agents requires NetworkPolicy enforcement). Enable Calico NetworkPolicy now? (y/N)" np_choice "n"
+      if is_truthy "$np_choice"; then
+        PARAM_ENABLE_NETWORK_POLICY="true"
+      else
+        PARAM_ENABLE_NETWORK_POLICY="false"
+      fi
+    fi
+  fi
+
+  if ! is_truthy "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-false}}"; then
+    print_error "Existing cluster '$cluster_name' has neither Dataplane V2 nor legacy Calico NetworkPolicy."
+    print_info "kube-agents requires NetworkPolicy enforcement. Enabling Calico may recreate nodes and restart workloads."
+    print_info "Explicit opt-in was not provided (--enable-network-policy). Refusing to proceed without NetworkPolicy enforcement."
+    return 1
+  fi
+
   # Two calls, in this order. GKE rejects --enable-network-policy with "The
   # network policy addon must be enabled before updating the nodes" (HTTP 400)
   # until the Calico addon is on the control plane, and gcloud puts
@@ -1882,14 +2131,275 @@ ensure_existing_cluster_network_policy() {
   gcloud container clusters update "$cluster_name" --location "$region" \
     --enable-network-policy --project "$project_id" --quiet
   local active_op
-  active_op=$(gcloud container operations list --location="$region" --project="$project_id" \
-    --filter="targetLink:$cluster_name AND status=RUNNING" --format="value(name)" 2>/dev/null | head -n1)
+  active_op=$({ gcloud container operations list --location="$region" --project="$project_id" \
+    --filter="targetLink ~ /clusters/${cluster_name}$ AND status=RUNNING" --format="value(name)" 2>/dev/null || true; } | head -n1)
   if [ -n "$active_op" ]; then
     print_info "Waiting for operation $active_op to complete..."
     gcloud container operations wait "$active_op" --location="$region" --project="$project_id" ||
       print_warning "Operation wait returned non-zero (it may have finished between list and wait); proceeding..."
   fi
   print_warning "Legacy Network Policy enabled. FQDN-based NetworkPolicies stay unsupported without Dataplane V2."
+}
+
+# Interactively prompts for existing-cluster opt-in mutations before the Step 11 summary
+prompt_existing_cluster_opt_ins() {
+  local project_id="$1" cluster_name="$2" region="$3"
+  [ "$PARAM_NON_INTERACTIVE" != "true" ] && [ "$PARAM_DRY_RUN" != "true" ] && has_controlling_tty || return 0
+
+  local is_autopilot
+  is_autopilot=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
+    --location="$region" --project="$project_id" \
+    --format="value(autopilot.enabled)" 2>/dev/null || echo "false")
+  [ "$is_autopilot" != "True" ] || return 0
+
+  # Node pool migration opt-in prompt
+  if [ -z "${PARAM_MIGRATE_NODE_POOLS:-${MIGRATE_NODE_POOLS:-}}" ]; then
+    local legacy_pools=() legacy_pool
+    while IFS= read -r legacy_pool; do
+      [ -n "$legacy_pool" ] || continue
+      legacy_pools+=("$legacy_pool")
+    done < <(trap - ERR; gcloud container node-pools list --cluster="$cluster_name" \
+        --location="$region" --project="$project_id" \
+        --format="csv[no-heading](name,config.workloadMetadataConfig.mode)" 2>/dev/null \
+      | awk -F',' '$2 != "GKE_METADATA" {print $1}' || true)
+
+    if [ "${#legacy_pools[@]}" -gt 0 ]; then
+      local migrate_choice=""
+      prompt_read "Node pool(s) '${legacy_pools[*]}' use the legacy GCE metadata server; migrating to GKE_METADATA recreates nodes and restarts workloads. Declining ends the install (kube-agents requires Workload Identity). Migrate now? (y/N)" migrate_choice "n"
+      if is_truthy "$migrate_choice"; then
+        PARAM_MIGRATE_NODE_POOLS="true"
+      else
+        PARAM_MIGRATE_NODE_POOLS="false"
+      fi
+    fi
+  fi
+
+  # Calico NetworkPolicy opt-in prompt
+  if [ -z "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-}}" ]; then
+    local cluster_info
+    cluster_info=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
+      --location="$region" --project="$project_id" \
+      --format="csv[no-heading](status,networkConfig.datapathProvider,networkPolicy.enabled)" 2>/dev/null || echo "")
+    local status="" dp_provider="" legacy_np=""
+    if [ -n "$cluster_info" ]; then
+      IFS=',' read -r status dp_provider legacy_np <<< "$cluster_info" || true
+    fi
+    if [ -n "$status" ] && [ "$dp_provider" != "ADVANCED_DATAPATH" ] && [ "$legacy_np" != "True" ] && [ "$legacy_np" != "true" ]; then
+      local np_choice=""
+      prompt_read "Existing cluster '$cluster_name' does not enforce NetworkPolicy (kube-agents requires Dataplane V2 or Calico). Enabling Calico may recreate nodes and restart workloads. Declining ends the install (kube-agents requires NetworkPolicy enforcement). Authorize enabling Calico NetworkPolicy now? (y/N)" np_choice "n"
+      if is_truthy "$np_choice"; then
+        PARAM_ENABLE_NETWORK_POLICY="true"
+      else
+        PARAM_ENABLE_NETWORK_POLICY="false"
+      fi
+    fi
+  fi
+}
+
+is_existing_cluster_node_pools_satisfied() {
+  local project_id="$1" cluster_name="$2" region="$3"
+  [ "${TFVARS_CREATE_CLUSTER:-true}" = "false" ] || return 0
+
+  local is_autopilot
+  is_autopilot=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
+    --location="$region" --project="$project_id" \
+    --format="value(autopilot.enabled)" 2>/dev/null || echo "false")
+  [ "$is_autopilot" != "True" ] || return 0
+
+  local legacy_pools=() legacy_pool
+  while IFS= read -r legacy_pool; do
+    [ -n "$legacy_pool" ] || continue
+    legacy_pools+=("$legacy_pool")
+  done < <(trap - ERR; gcloud container node-pools list --cluster="$cluster_name" \
+      --location="$region" --project="$project_id" \
+      --format="csv[no-heading](name,config.workloadMetadataConfig.mode)" 2>/dev/null \
+    | awk -F',' '$2 != "GKE_METADATA" {print $1}' || true)
+
+  [ "${#legacy_pools[@]}" -eq 0 ] || return 1
+  return 0
+}
+
+check_existing_cluster_node_pools_preflight() {
+  local project_id="$1" cluster_name="$2" region="$3"
+  [ "${TFVARS_CREATE_CLUSTER:-true}" = "false" ] || return 0
+
+  local is_autopilot
+  is_autopilot=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
+    --location="$region" --project="$project_id" \
+    --format="value(autopilot.enabled)" 2>/dev/null || echo "false")
+  [ "$is_autopilot" != "True" ] || return 0
+
+  local legacy_pools=() legacy_pool
+  while IFS= read -r legacy_pool; do
+    [ -n "$legacy_pool" ] || continue
+    legacy_pools+=("$legacy_pool")
+  done < <(trap - ERR; gcloud container node-pools list --cluster="$cluster_name" \
+      --location="$region" --project="$project_id" \
+      --format="csv[no-heading](name,config.workloadMetadataConfig.mode)" 2>/dev/null \
+    | awk -F',' '$2 != "GKE_METADATA" {print $1}' || true)
+
+  [ "${#legacy_pools[@]}" -gt 0 ] || return 0
+
+  if ! is_truthy "${PARAM_MIGRATE_NODE_POOLS:-${MIGRATE_NODE_POOLS:-false}}"; then
+    print_error "Existing cluster '$cluster_name' has node pool(s) '${legacy_pools[*]}' using the legacy GCE metadata server."
+    print_info "kube-agents requires Workload Identity (GKE_METADATA) to authenticate agent and operator pods."
+    print_info "Pods on these pools cannot use Workload Identity and would silently authenticate as the node's default compute service account."
+    print_info "Migrating node pools recreates nodes and restarts workloads. Because explicit opt-in was not granted, provisioning cannot proceed."
+    print_info "Aborting before making any cluster changes. Pass --migrate-node-pools or set MIGRATE_NODE_POOLS=true to authorize."
+    write_json_report "REFUSED_MISSING_NODE_POOL_MIGRATION"
+    exit 1
+  fi
+}
+
+is_existing_cluster_network_policy_satisfied() {
+  local project_id="$1" cluster_name="$2" region="$3"
+  [ "${TFVARS_CREATE_CLUSTER:-true}" = "false" ] || return 0
+
+  local cluster_info
+  cluster_info=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
+    --location="$region" --project="$project_id" \
+    --format="csv[no-heading](status,networkConfig.datapathProvider,networkPolicy.enabled)" 2>/dev/null || echo "")
+  local status="" dp_provider="" legacy_np=""
+  if [ -n "$cluster_info" ]; then
+    IFS=',' read -r status dp_provider legacy_np <<< "$cluster_info" || true
+  fi
+  if [ -z "$status" ]; then
+    return 2
+  fi
+  [ "$dp_provider" != "ADVANCED_DATAPATH" ] || return 0
+  [ "$legacy_np" = "True" ] || [ "$legacy_np" = "true" ] || return 1
+  return 0
+}
+
+check_existing_cluster_network_policy_preflight() {
+  local project_id="$1" cluster_name="$2" region="$3"
+  [ "${TFVARS_CREATE_CLUSTER:-true}" = "false" ] || return 0
+
+  local np_status=0
+  is_existing_cluster_network_policy_satisfied "$project_id" "$cluster_name" "$region" || np_status=$?
+  if [ "$np_status" -eq 0 ]; then
+    return 0
+  fi
+
+  if [ "$np_status" -eq 2 ]; then
+    print_error "Could not query NetworkPolicy configuration for existing cluster '$cluster_name'."
+    print_info "Failed to read cluster details from GCP. Check cluster name, region, permissions, and network connectivity."
+    write_json_report "FAILED_PREFLIGHT_CLUSTER_UNREADABLE"
+    exit 1
+  fi
+
+  if ! is_truthy "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-false}}"; then
+    print_error "Existing cluster '$cluster_name' enforces no NetworkPolicy (neither Dataplane V2 nor legacy Calico)."
+    print_info "kube-agents requires NetworkPolicy enforcement to isolate agent execution sandboxes."
+    print_info "The Terraform apply will refuse an existing cluster without Dataplane V2 or NetworkPolicy enforcement."
+    print_info "Enabling Calico may recreate nodes and restart workloads. Because explicit opt-in was not granted, provisioning cannot proceed."
+    print_info "Aborting before making any cluster changes. Pass --enable-network-policy or set ENABLE_NETWORK_POLICY=true to authorize."
+    write_json_report "REFUSED_MISSING_NETWORK_POLICY"
+    exit 1
+  fi
+}
+
+# Validates explicit values for existing-cluster opt-in flags (loud like --gvisor)
+validate_existing_cluster_opt_in_flags() {
+  if { [ "${PARAM_MIGRATE_NODE_POOLS_PASSED:-false}" = "true" ] || [ -n "${PARAM_MIGRATE_NODE_POOLS:-}" ]; } && \
+     [[ ! "$PARAM_MIGRATE_NODE_POOLS" =~ ^(true|false)$ ]]; then
+    print_error "--migrate-node-pools must be either true or false."
+    exit 1
+  fi
+  if { [ "${PARAM_ENABLE_NETWORK_POLICY_PASSED:-false}" = "true" ] || [ -n "${PARAM_ENABLE_NETWORK_POLICY:-}" ]; } && \
+     [[ ! "$PARAM_ENABLE_NETWORK_POLICY" =~ ^(true|false)$ ]]; then
+    print_error "--enable-network-policy must be either true or false."
+    exit 1
+  fi
+}
+
+# Enumerates pending existing-cluster mutations for the pre-flight summary
+summarize_existing_cluster_mutations() {
+  local project_id="$1" cluster_name="$2" region="$3" enable_gvisor="${4:-false}"
+
+  # 1. CMEK database encryption
+  local enc_state
+  enc_state=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
+    --location="$region" --project="$project_id" \
+    --format="value(databaseEncryption.state)" 2>/dev/null || echo "")
+  if is_valid_cmek_encryption_state "$enc_state"; then
+    echo -e "    • ${C_CYAN}CMEK Database Encryption:${C_RESET} ${C_GREEN}Already enabled${C_RESET} ($enc_state)"
+  elif is_truthy "${ALLOW_UNENCRYPTED_SECRETS:-false}"; then
+    echo -e "    • ${C_CYAN}CMEK Database Encryption:${C_RESET} ${C_YELLOW}Skipped${C_RESET} (ALLOW_UNENCRYPTED_SECRETS=true)"
+  elif [ -z "$enc_state" ]; then
+    echo -e "    • ${C_CYAN}CMEK Database Encryption:${C_RESET} ${C_YELLOW}Skipped${C_RESET} (could not query cluster encryption state)"
+  else
+    local keyring="${GKE_DB_KMS_KEYRING:-platform-agent-keyring}" key="${GKE_DB_KMS_KEY:-k8s-secret-encryption-key}"
+    echo -e "    • ${C_CYAN}CMEK Database Encryption:${C_RESET} ${C_YELLOW}Will enable${C_RESET} Cloud KMS encryption on control plane (${keyring}/${key}; non-revertible)"
+  fi
+
+  # 2. Workload Identity & 3. Node pool metadata
+  local is_autopilot pool
+  is_autopilot=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
+    --location="$region" --project="$project_id" \
+    --format="value(autopilot.enabled)" 2>/dev/null || echo "false")
+  if [ "$is_autopilot" = "True" ]; then
+    echo -e "    • ${C_CYAN}Workload Identity Pool:${C_RESET} ${C_GREEN}Native${C_RESET} (GKE Autopilot)"
+    echo -e "    • ${C_CYAN}Node Pool Metadata:${C_RESET} ${C_GREEN}Managed${C_RESET} (GKE Autopilot)"
+  else
+    pool=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
+      --location="$region" --project="$project_id" \
+      --format="value(workloadIdentityConfig.workloadPool)" 2>/dev/null || echo "")
+    if [ "$pool" = "${project_id}.svc.id.goog" ]; then
+      echo -e "    • ${C_CYAN}Workload Identity Pool:${C_RESET} ${C_GREEN}Already enabled${C_RESET} ($pool)"
+    else
+      echo -e "    • ${C_CYAN}Workload Identity Pool:${C_RESET} ${C_YELLOW}Will enable${C_RESET} ${project_id}.svc.id.goog on control plane (non-revertible)"
+    fi
+
+    local legacy_pools=() legacy_pool
+    while IFS= read -r legacy_pool; do
+      [ -n "$legacy_pool" ] || continue
+      legacy_pools+=("$legacy_pool")
+    done < <(trap - ERR; gcloud container node-pools list --cluster="$cluster_name" \
+        --location="$region" --project="$project_id" \
+        --format="csv[no-heading](name,config.workloadMetadataConfig.mode)" 2>/dev/null \
+      | awk -F',' '$2 != "GKE_METADATA" {print $1}' || true)
+
+    if [ "${#legacy_pools[@]}" -eq 0 ]; then
+      echo -e "    • ${C_CYAN}Node Pool Metadata:${C_RESET} ${C_GREEN}All node pools use GKE_METADATA${C_RESET}"
+    else
+      if is_truthy "${PARAM_MIGRATE_NODE_POOLS:-${MIGRATE_NODE_POOLS:-false}}"; then
+        echo -e "    • ${C_CYAN}Node Pool Metadata Migration:${C_RESET} ${C_RED}Will migrate${C_RESET} '${legacy_pools[*]}' to GKE_METADATA (${C_RED}recreates nodes, restarts workloads${C_RESET})"
+      else
+        echo -e "    • ${C_CYAN}Node Pool Metadata Migration:${C_RESET} ${C_RED}Refused${C_RESET} for '${legacy_pools[*]}' (opt-in not provided; pass --migrate-node-pools; install will abort)"
+      fi
+    fi
+  fi
+
+  # 4. NetworkPolicy
+  local cluster_info
+  cluster_info=$(trap - ERR; gcloud container clusters describe "$cluster_name" \
+    --location="$region" --project="$project_id" \
+    --format="csv[no-heading](status,networkConfig.datapathProvider,networkPolicy.enabled)" 2>/dev/null || echo "")
+  local status="" dp_provider="" legacy_np=""
+  if [ -n "$cluster_info" ]; then
+    IFS=',' read -r status dp_provider legacy_np <<< "$cluster_info" || true
+  fi
+  if [ -z "$status" ]; then
+    echo -e "    • ${C_CYAN}NetworkPolicy Enforcement:${C_RESET} ${C_YELLOW}Skipped${C_RESET} (could not query cluster network policy state)"
+  elif [ "$dp_provider" = "ADVANCED_DATAPATH" ]; then
+    echo -e "    • ${C_CYAN}NetworkPolicy Enforcement:${C_RESET} ${C_GREEN}Built-in${C_RESET} (Dataplane V2)"
+  elif [ "$legacy_np" = "True" ] || [ "$legacy_np" = "true" ]; then
+    echo -e "    • ${C_CYAN}NetworkPolicy Enforcement:${C_RESET} ${C_GREEN}Already enabled${C_RESET} (legacy Calico addon)"
+  else
+    if is_truthy "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-false}}"; then
+      echo -e "    • ${C_CYAN}NetworkPolicy Enforcement:${C_RESET} ${C_YELLOW}Will enable${C_RESET} legacy Calico addon & enforcement (${C_YELLOW}may recreate nodes, restart workloads${C_RESET})"
+    else
+      echo -e "    • ${C_CYAN}NetworkPolicy Enforcement:${C_RESET} ${C_RED}Refused${C_RESET} (opt-in not provided; pass --enable-network-policy; install will abort)"
+    fi
+  fi
+
+  # 5. gVisor pool
+  if [ "$is_autopilot" != "True" ] && is_truthy "$enable_gvisor"; then
+    echo -e "    • ${C_CYAN}gVisor Sandbox Node Pool:${C_RESET} ${C_YELLOW}Will create${C_RESET} 'gvisor-pool' (1 e2-standard-4 per zone; new billable capacity)"
+  else
+    echo -e "    • ${C_CYAN}gVisor Sandbox Node Pool:${C_RESET} None (not requested or native on Autopilot)"
+  fi
 }
 
 # Neither google provider has a field for --managed-otel-scope, so it is set
@@ -2298,6 +2808,10 @@ run_menu_system() {
 # ─── Main Installer Procedure ──────────────────────────────────────────────────
 main() {
   parse_args "$@"
+  if [ "$PARAM_DRY_RUN" = "true" ] && [ "$PARAM_GENERATE_ONLY" = "true" ]; then
+    print_error "--dry-run and --generate-only are different modes and cannot be combined."
+    return 2
+  fi
   print_banner
 
   if [ "${PARAM_MENU_MODE:-false}" = "true" ]; then
@@ -2316,6 +2830,10 @@ main() {
 
   if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
     print_info "Execution Mode: ${C_BOLD}Non-Interactive / AI Agent Automated Mode${C_RESET} 🤖"
+    export CLOUDSDK_CORE_DISABLE_PROMPTS="1"
+  fi
+  if [ "$PARAM_GENERATE_ONLY" = "true" ]; then
+    print_info "Execution Mode: ${C_BOLD}Generate-Only Mode (stopping before apply)${C_RESET} 📄"
   fi
 
   local image_tag=""
@@ -2728,7 +3246,7 @@ main() {
 
   local detected_gemini_key="${PARAM_GEMINI_API_KEY:-${GEMINI_API_KEY:-}}"
   if [ -z "$detected_gemini_key" ]; then
-    detected_gemini_key=$(gcloud secrets versions access latest --secret="${GEMINI_API_KEY_SECRET_NAME:-$DEFAULT_GEMINI_API_KEY_SECRET_NAME}" --project="$project_id" 2>/dev/null || echo "")
+    detected_gemini_key=$(gcloud secrets versions access latest --secret="${GEMINI_API_KEY_SECRET_NAME:-$DEFAULT_GEMINI_API_KEY_SECRET_NAME}" --project="$project_id" --quiet 2>/dev/null || echo "")
   fi
   local gemini_api_key="${detected_gemini_key:-}"
   local openai_api_key="${PARAM_OPENAI_API_KEY:-}"
@@ -2767,7 +3285,7 @@ main() {
         fi
         local detected_key="${GEMINI_API_KEY:-}"
         if [ -z "$detected_key" ]; then
-          detected_key=$(gcloud secrets versions access latest --secret="${GEMINI_API_KEY_SECRET_NAME:-$DEFAULT_GEMINI_API_KEY_SECRET_NAME}" --project="$project_id" 2>/dev/null || echo "")
+          detected_key=$(gcloud secrets versions access latest --secret="${GEMINI_API_KEY_SECRET_NAME:-$DEFAULT_GEMINI_API_KEY_SECRET_NAME}" --project="$project_id" --quiet 2>/dev/null || echo "")
         fi
         prompt_read "Gemini API Key" gemini_api_key "$detected_key" true
         ;;
@@ -2953,6 +3471,7 @@ main() {
     print_error "--enable-web-ui must be either true or false."
     exit 1
   fi
+  validate_existing_cluster_opt_in_flags
   # An agent that forgets every conversation is the worse default, so memory is
   # on unless it is turned off. The choice decides two things: whether the
   # harness keeps memory at all, and — when it does — whether that costs an
@@ -3252,6 +3771,11 @@ main() {
   # cluster's replacement.
   bootstrap_install_env_file "$INSTALL_ENV_FILE" "$image_tag"
 
+  # Prompt for opt-ins on existing cluster mutations before the summary checkpoint
+  if [ "${TFVARS_CREATE_CLUSTER:-true}" = "false" ]; then
+    prompt_existing_cluster_opt_ins "$project_id" "$cluster_name" "$region"
+  fi
+
   # Pre-Flight Summary & Final Confirmation Checkpoint
   print_step "11. Pre-Flight Configuration Summary"
   echo -e "${C_CYAN}${C_BOLD}"
@@ -3261,6 +3785,10 @@ main() {
   # The generator's answer, not the interview's: on an existing cluster it
   # probed the live shape and the flag had no say.
   echo -e "  • ${C_CYAN}GKE Cluster:${C_RESET} ${C_BOLD}${cluster_name}${C_RESET} (${region}, GKE $(cluster_mode_label "${TFVARS_CLUSTER_MODE:-$cluster_mode}"))"
+  if [ "${TFVARS_CREATE_CLUSTER:-true}" = "false" ]; then
+    echo -e "  • ${C_CYAN}Existing Cluster Mutations (Adoption):${C_RESET}"
+    summarize_existing_cluster_mutations "$project_id" "$cluster_name" "$region" "$enable_gvisor"
+  fi
   echo -e "  • ${C_CYAN}gVisor Sandbox Isolation:${C_RESET} ${enable_gvisor}"
   echo -e "  • ${C_CYAN}AI Model Provider:${C_RESET} ${model_provider} (${model_default_name})"
   if [ "$model_provider" = "vertex_ai" ]; then
@@ -3290,16 +3818,61 @@ main() {
     print_info "Dry-run: validating the Terraform configuration (local state; nothing is created)."
     (
       cd "$(tf_compose_dir "$repo_dir")"
-      terraform init -backend=false -input=false >/dev/null
-      terraform validate >/dev/null
+      local tf_log=""
+      tf_log="$(mktemp -t kube-agents-tf-validate.XXXXXX)"
+      local rc=0
+      run_with_spinner "Validating Terraform configuration" "$tf_log" validate_tf_config || rc=$?
+      if [ "$rc" -eq 0 ]; then
+        print_success "Terraform configuration is valid."
+        rm -f -- "$tf_log"
+      else
+        # Only the spinner branch withheld the output; the non-TTY branch already
+        # streamed it through tee, where repeating it doubles the log. The two
+        # messages differ so the non-TTY one does not end on a colon promising
+        # output that never follows. An `if` rather than `[ -t 1 ] &&`, which
+        # under `set -e` would exit the subshell with the test's own status
+        # instead of the validation's.
+        if [ -t 1 ]; then
+          print_error "Terraform validation failed (exit code $rc):"
+          cat "$tf_log" >&2
+        else
+          print_error "Terraform validation failed (exit code $rc); its output is above."
+        fi
+        rm -f -- "$tf_log"
+        exit "$rc"
+      fi
     )
-    print_success "Terraform configuration is valid."
     if gcloud auth application-default print-access-token >/dev/null 2>&1; then
-      print_info "Previewing the resources a real run would create (terraform plan)..."
-      (
-        cd "$(tf_compose_dir "$repo_dir")"
-        terraform plan -input=false -lock=false
-      )
+      local np_status=0
+      is_existing_cluster_network_policy_satisfied "$project_id" "$cluster_name" "$region" || np_status=$?
+      if [ "$np_status" -eq 2 ]; then
+        print_warning "Dry-run: skipping terraform plan because existing cluster '$cluster_name' could not be queried."
+      elif [ "$np_status" -ne 0 ]; then
+        if is_truthy "${PARAM_ENABLE_NETWORK_POLICY:-${ENABLE_NETWORK_POLICY:-false}}"; then
+          print_info "Dry-run: skipping terraform plan because Calico has not yet been applied to the live cluster (a real run enables Calico prior to apply)."
+        else
+          print_warning "Dry-run: skipping terraform plan because existing cluster '$cluster_name' enforces no NetworkPolicy (postcondition would fail)."
+          print_info "A real run will abort unless authorized with --enable-network-policy or ENABLE_NETWORK_POLICY=true."
+          print_info "To remediate manually beforehand, run these two commands in this order:"
+          print_info "  gcloud container clusters update $cluster_name --location $region --project $project_id --update-addons=NetworkPolicy=ENABLED"
+          print_info "  gcloud container clusters update $cluster_name --location $region --project $project_id --enable-network-policy"
+        fi
+      elif ! is_existing_cluster_node_pools_satisfied "$project_id" "$cluster_name" "$region"; then
+        if is_truthy "${PARAM_MIGRATE_NODE_POOLS:-${MIGRATE_NODE_POOLS:-false}}"; then
+          print_info "Dry-run: skipping terraform plan because node pool migration to GKE_METADATA has not yet been applied to the live cluster (a real run migrates pools prior to apply)."
+        else
+          print_warning "Dry-run: skipping terraform plan because existing cluster '$cluster_name' has node pool(s) on legacy metadata server."
+          print_info "A real run will abort unless authorized with --migrate-node-pools or MIGRATE_NODE_POOLS=true."
+          print_info "To remediate manually beforehand, update each legacy node pool:"
+          print_info "  gcloud container node-pools update <pool-name> --cluster $cluster_name --location $region --project $project_id --workload-metadata=GKE_METADATA"
+        fi
+      else
+        print_info "Previewing the resources a real run would create (terraform plan)..."
+        (
+          cd "$(tf_compose_dir "$repo_dir")"
+          terraform plan -input=false -lock=false
+        )
+      fi
     else
       print_warning "No Application Default Credentials; skipping the resource preview (terraform plan)."
       print_info "Run 'gcloud auth application-default login' for a full dry-run preview."
@@ -3309,15 +3882,47 @@ main() {
     exit 0
   fi
 
-  if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
+  # Refuse before the confirmation checkpoint and before any cluster mutations
+  # if adopting an existing cluster lacking required node pool migration or NetworkPolicy
+  # without explicit opt-in.
+  #
+  # Generate-only is held to the same bar, for two reasons. The tfvars that mode
+  # exists to produce cannot apply against a cluster enforcing no NetworkPolicy --
+  # the gke-cluster module's postcondition refuses them -- so emitting a handoff
+  # that calls those inputs validated hands the operator a plan already known to
+  # fail. And the refusals name the opt-in flags (--enable-network-policy,
+  # --migrate-node-pools) that the apply needs regardless, so an operator who
+  # wants tfvars for such a cluster gets them by passing what they were going to
+  # have to pass anyway. Running here also keeps --generate-only and the
+  # interactive `g` the same choice, which install-kube-agents/SKILL.md says
+  # they are: this sits above the (Y/n/g) prompt, so both routes cross it.
+  check_existing_cluster_node_pools_preflight "$project_id" "$cluster_name" "$region"
+  check_existing_cluster_network_policy_preflight "$project_id" "$cluster_name" "$region"
+
+  if [ "$PARAM_GENERATE_ONLY" != "true" ] && [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
     local confirm_choice=""
-    prompt_read "\nProceed with automated GKE cluster & Platform Agent provisioning? (Y/n)" confirm_choice "y"
-    if [[ ! "$confirm_choice" =~ ^[Yy]$ ]]; then
-      print_warning "Provisioning paused by user. Configuration saved to: $INSTALL_ENV_FILE"
-      print_info "To launch provisioning later, run: ${C_BOLD}cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=${DEFAULT_KUBE_AGENTS_STATE_BUCKET} ./lifecycle.sh apply${C_RESET}"
-      write_json_report "PAUSED"
-      exit 0
-    fi
+    prompt_read "\nProceed with automated GKE cluster & Platform Agent provisioning? (Y/n/g)" confirm_choice "y"
+    case "$confirm_choice" in
+      [Yy])
+        ;;
+      [Gg])
+        PARAM_GENERATE_ONLY="true"
+        ;;
+      *)
+        print_warning "Provisioning paused by user. Configuration saved to: $INSTALL_ENV_FILE"
+        print_info "To launch provisioning later, run: ${C_BOLD}cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=${DEFAULT_KUBE_AGENTS_STATE_BUCKET} ./lifecycle.sh apply${C_RESET}"
+        write_json_report "PAUSED"
+        exit 0
+        ;;
+    esac
+  fi
+
+  if [ "$PARAM_GENERATE_ONLY" = "true" ]; then
+    print_info "Generate-only: configuration files written. Running pre-apply validation checks..."
+    check_github_org_is_organization "${GITOPS_ORG:-}"
+    print_generate_only_handoff "$repo_dir" "$project_id" "$cluster_name" "$region" "$tfvars_file"
+    write_json_report "GENERATE_ONLY_SUCCESS"
+    exit 0
   fi
 
   # 12. Execute the Terraform Engine
@@ -3332,11 +3937,15 @@ main() {
 
   # The three script behaviours a data source cannot express: CMEK, the
   # Workload Identity pool, and NetworkPolicy enforcement on a cluster that
-  # already exists. All are no-ops when the cluster does not exist yet or is
-  # already configured.
-  ensure_existing_cluster_cmek "$project_id" "$cluster_name" "$region"
-  ensure_existing_cluster_workload_identity "$project_id" "$cluster_name" "$region"
-  ensure_existing_cluster_network_policy "$project_id" "$cluster_name" "$region"
+  # already exists. Only run when adopting an existing cluster; a cluster
+  # created by this install already has them configured via Terraform.
+  # NetworkPolicy is verified and applied first so that a refusal or failure
+  # halts before permanent control-plane modifications (Workload Identity, CMEK).
+  if [ "${TFVARS_CREATE_CLUSTER:-true}" = "false" ]; then
+    ensure_existing_cluster_network_policy "$project_id" "$cluster_name" "$region"
+    ensure_existing_cluster_workload_identity "$project_id" "$cluster_name" "$region"
+    ensure_existing_cluster_cmek "$project_id" "$cluster_name" "$region"
+  fi
 
   # The App key import sits here — after the dry-run exit and the operator's
   # confirmation (it enables the KMS API, creates permanent key rings, and
@@ -3425,7 +4034,7 @@ main() {
     # the chat links and port-forward command.
     if ! wait_for_rollout "$deployment" "$namespace" "$ROLLOUT_TIMEOUT_SECS"; then
       slow_rollouts+=("$deployment")
-      print_warning "$deployment did not report ready within ${ROLLOUT_TIMEOUT_SECS}s."
+      print_warning "$deployment did not report ready (after ${ROLLOUT_ELAPSED_SECS}s)."
     fi
   done
   if [ "${#slow_rollouts[@]}" -eq 0 ]; then

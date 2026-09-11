@@ -5,9 +5,9 @@ Run: cd scripts && python3 -m unittest test_pin_smoke_status
 
 Every wrong answer here fails green: a status that should have been pinned is
 left stale and Tide quietly re-runs a 1.5-3.5h job; a status that should have
-been left alone -- a red, an override, a newer `pending` -- is overwritten with
-a success. So the guards get one test each, and the description builder is
-driven with what crier actually writes, U+2001 padding included.
+been left alone -- a red, a newer `pending` -- is overwritten with a success.
+So the guards get one test each, and the description builder is driven with
+what crier and the override plugin actually write, U+2001 padding included.
 """
 
 import sys
@@ -25,6 +25,10 @@ MAIN = "a" * 40
 OLD = "b" * 40
 HEAD = "c" * 40
 CRIER = "Job succeeded." + " " * 20 + "BaseSHA:" + OLD
+#: The shape `/override` left on #1177's head: crier's report of the plugin's success ProwJob, padded like a green.
+OVERRIDE = "Overridden by bradhoekstra" + " " * 17 + "BaseSHA:" + OLD
+#: The plugin's own status on the same head, posted the same second, with no base at all.
+BARE_OVERRIDE = "Overridden by bradhoekstra"
 URL = "https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/1/pull-kube-agents-smoke-test/1"
 
 
@@ -105,6 +109,12 @@ class DescriptionTest(unittest.TestCase):
     def test_a_malformed_base_is_not_mistaken_for_one(self):
         self.assertIsNone(pin.split_description("Job succeeded. BaseSHA:ABC")[1])
 
+    def test_an_override_keeps_its_prefix_where_the_override_plugin_looks_for_it(self):
+        """`/override-cancel` finds its own statuses by the "Overridden by" text; a reader does too."""
+        got = pin.pinned_description(OVERRIDE, MAIN)
+        self.assertEqual(got, f"Overridden by bradhoekstra {pin.PIN_NOTE} BaseSHA:{MAIN}")
+        self.assertEqual(pin.split_description(got), ("Overridden by bradhoekstra", MAIN))
+
 
 class GuardTest(unittest.TestCase):
     def test_a_stale_green_is_pinned(self):
@@ -117,8 +127,11 @@ class GuardTest(unittest.TestCase):
         for state in ("pending", "failure", "error"):
             self.assertIn(state, pin.skip_reason(status(state=state), MAIN))
 
-    def test_an_admin_override_is_left_alone(self):
-        self.assertIn("override", pin.skip_reason(status(description="Overridden by someone BaseSHA:" + OLD), MAIN))
+    def test_a_stale_admin_override_is_pinned_like_a_green(self):
+        """The override plugin writes the same suffix crier does, and it expired the same way (#1202)."""
+        self.assertIsNone(pin.skip_reason(status(description=OVERRIDE), MAIN))
+        self.assertIsNone(pin.skip_reason(status(description=BARE_OVERRIDE), MAIN))
+        self.assertIn("already pinned", pin.skip_reason(status(description=f"Overridden by someone BaseSHA:{MAIN}"), MAIN))
 
     def test_a_commit_with_no_smoke_status_is_left_alone(self):
         self.assertIn("no pull-kube-agents-smoke-test status", pin.skip_reason(None, MAIN))

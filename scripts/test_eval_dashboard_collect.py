@@ -38,6 +38,11 @@ BUILD_1057_PARALLEL = "2094432646640701440"  # PR 1057, parallel fan-out, green
 BUILD_1075_SERIAL = "2094467976156680192"  # PR 1075, serial reps, aborted mid-run
 BUILD_1089_MIXED = "2094714569262895104"  # PR 1089, blocked/infra-heavy reps
 
+# A real post-kube-agents-eval-rc build -- a postsubmit, so no `pull` key in
+# started.json and no PR number anywhere in the log.
+RC_TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_rc"
+BUILD_RC_GREEN = "2097891568546484224"  # staging_2609092307_5b5ad10, GREEN, no baseline
+
 # The three real builds, oldest first (started.json timestamps).
 BUILD_956_TRUNCATED = "2092688354838581248"  # PR 956, deadline hit before verdict
 BUILD_998_INFRA = "2093030474753511424"  # PR 998, compliance canary infra-failed
@@ -261,6 +266,10 @@ FAKE_GLOB = FAKE_BUCKET + "pull/gke-labs_kube-agents/998/pull-kube-agents-smoke-
 # one: <prefix>/<build_id>.txt holding the build directory's gs:// path.
 FAKE_INDEX_PREFIX = FAKE_BUCKET + "pr-logs/directory/pull-kube-agents-smoke-test/"
 
+# The RC job is a postsubmit, so its builds land under logs/ rather than
+# pull-logs/. Same fake gsutil, different prefix.
+RC_FAKE_GLOB = "gs://fake-prow/logs/post-kube-agents-eval-rc/*"
+
 
 class _MergeBase(unittest.TestCase):
     def setUp(self):
@@ -286,6 +295,20 @@ class _MergeBase(unittest.TestCase):
         index = root / FAKE_INDEX_PREFIX[len(FAKE_BUCKET):]
         index.mkdir(parents=True, exist_ok=True)
         (index / "latest-build.txt").write_text(max(builds, key=int) + "\n" if builds else "")
+        return self._install_fake_gsutil(root)
+
+    def fake_rc_gsutil(self, build_ids) -> tuple[str, pathlib.Path]:
+        """The same, under the RC job's prefix, serving copies of the one real
+        RC fixture under whatever build ids the test needs."""
+        root = self.tmp / "bucket"
+        prefix = root / RC_FAKE_GLOB[len(FAKE_BUCKET):].rstrip("*")
+        prefix.mkdir(parents=True, exist_ok=True)
+        for build_id in build_ids:
+            shutil.copytree(RC_TESTDATA / BUILD_RC_GREEN, prefix / build_id)
+        return self._install_fake_gsutil(root)
+
+    def _install_fake_gsutil(self, root) -> tuple[str, pathlib.Path]:
+        """Write the fake gsutil over `root`; (gsutil path, call-log path)."""
         gsutil = self.tmp / "fake-gsutil"
         gsutil.write_text(_FAKE_GSUTIL)
         gsutil.chmod(gsutil.stat().st_mode | stat.S_IXUSR)
@@ -616,8 +639,13 @@ class TestIncrementalGcsScan(_MergeBase):
 # The refresh workflow's publish gate, read from .github/workflows/
 # ci-health.yml rather than copied, so the tests below pin that a failed
 # index listing or pointer read trips the grep the workflow actually runs.
+# The workflow pipes collect.log through a `grep -v` that drops the
+# release-candidate lane's lines before this pattern sees it; index warnings
+# name the presubmit job, so that filter never hides them.
 _WORKFLOW = pathlib.Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci-health.yml"
-_REFUSAL_GREP = re.search(r'grep -Eq "([^"]+)" work/collect\.log', _WORKFLOW.read_text())
+_REFUSAL_GREP = re.search(
+    r'work/collect\.log \\\n\s*\| grep -Eq "([^"]+)"', _WORKFLOW.read_text()
+)
 assert _REFUSAL_GREP, f"{_WORKFLOW} no longer greps collect.log; update this test's gate"
 WORKFLOW_REFUSAL = re.compile(_REFUSAL_GREP.group(1))
 
@@ -913,6 +941,186 @@ class TestContractShape(unittest.TestCase):
             list(data["cases"][0]),
             ["name", "domain", "active", "runs_on_record", "pass_rate", "last3", "durations", "ov_history"],
         )
+
+
+class TestReleaseCandidateParsing(unittest.TestCase):
+    """releases[] from a REAL post-kube-agents-eval-rc build.
+
+    The fixture is the first RC to go through the release-gate lane end to
+    end: staging_2609092307_5b5ad10, four hours, 26 tasks, GREEN with no
+    baseline at its version key. It keeps both banners the driver prints --
+    resolve-rc-target.sh's "RELEASE CANDIDATE EVAL TARGET" near the top and
+    ci-eval-rc.sh's "RELEASE CANDIDATE EVAL" at the bottom -- because a
+    substring match opens the parse block on the wrong one.
+    """
+
+    def test_real_rc_build_parses(self):
+        releases = collect.releases_from_dir(RC_TESTDATA)
+        self.assertEqual(len(releases), 1)
+        release = releases[0]
+        self.assertEqual(release["build_id"], BUILD_RC_GREEN)
+        self.assertEqual(release["rc_tag"], "staging_2609092307_5b5ad10")
+        self.assertEqual(release["commit"], "5b5ad10")  # abbreviated from the banner's full sha
+        self.assertEqual(release["tier"], "nightly")
+        self.assertEqual(release["verdict"], "GREEN")
+        self.assertEqual(release["result"], "SUCCESS")
+        self.assertEqual(release["project"], "kube-agents-evals-10")
+        self.assertEqual(release["started"], "2026-09-10T03:35:01+00:00")
+        self.assertEqual(release["duration_s"], 15006)  # the verdict line, not the Prow delta
+        self.assertEqual(
+            release["artifacts_url"],
+            "https://oss.gprow.dev/view/gs/kube-agents-prow/logs/"
+            "post-kube-agents-eval-rc/" + BUILD_RC_GREEN,
+        )
+        self.assertEqual(release["pass_rate"], 0.9)
+        # "(no baseline at the current version key -- advisory)" carries no
+        # numbers, so the comparison stays unset rather than defaulting to 0.
+        self.assertIsNone(release["baseline_rate"])
+        self.assertIsNone(release["margin"])
+        results = [t["result"] for t in release["tasks"]]
+        self.assertEqual((results.count("pass"), results.count("fail"), results.count("infra")), (15, 10, 1))
+
+    def test_release_field_names(self):
+        release = collect.releases_from_dir(RC_TESTDATA)[0]
+        self.assertEqual(
+            list(release),
+            [
+                "build_id", "rc_tag", "commit", "tier", "verdict", "result",
+                "started", "finished", "duration_s", "project",
+                "artifacts_url", "pass_rate", "baseline_rate", "margin", "tasks",
+            ],
+        )
+
+    def test_target_banner_alone_is_not_a_verdict_banner(self):
+        """A run that died after resolve-rc-target.sh printed its banner but
+        before ci-eval-rc.sh printed its own has no banner at all."""
+        head = (RC_TESTDATA / BUILD_RC_GREEN / "build-log.txt").read_text().splitlines()
+        truncated = "\n".join(head[:20])
+        self.assertIn("RELEASE CANDIDATE EVAL TARGET", truncated)
+        banner = collect.parse_rc_banner(truncated)
+        self.assertFalse(banner["banner"])
+        self.assertIsNone(banner["rc_tag"])
+        self.assertIsNone(banner["verdict"])
+
+    def test_admitted_rate_with_a_baseline_carries_the_comparison(self):
+        banner = collect.parse_rc_banner(
+            "Admitted-case pass rate: 88.5% (main: 91.0%, margin -2.5%)\n"
+            "🏷️ RELEASE CANDIDATE EVAL\n"
+            "Verdict:     RED (advisory: this lane gates nothing)\n"
+        )
+        self.assertEqual(banner["pass_rate"], 0.885)
+        self.assertEqual(banner["baseline_rate"], 0.91)
+        self.assertEqual(banner["margin"], -0.025)
+        self.assertEqual(banner["verdict"], "RED")
+
+    def test_build_without_a_banner_still_records_the_run(self):
+        """A driver that exited on an early guard is a release with no verdict,
+        not a missing release -- the dashboard has to show the attempt."""
+        with tempfile.TemporaryDirectory() as tmp:
+            build = pathlib.Path(tmp) / "999"
+            build.mkdir()
+            (build / "build-log.txt").write_text("=== boom ===\n")
+            (build / "started.json").write_text('{"timestamp": 1789011301}')
+            (build / "finished.json").write_text('{"timestamp": 1789011401, "result": "FAILURE"}')
+            release = collect.releases_from_dir(pathlib.Path(tmp))[0]
+        self.assertEqual(release["result"], "FAILURE")
+        self.assertIsNone(release["verdict"])
+        self.assertIsNone(release["rc_tag"])
+        self.assertIsNone(release["pass_rate"])
+
+
+class TestReleaseCollection(_MergeBase):
+    """releases[] through collect(): the trim, the carry-forward, the skip."""
+
+    def _rc_dir(self, build_ids) -> pathlib.Path:
+        """A local RC archive holding copies of the real fixture, renamed."""
+        root = self.tmp / "rc"
+        root.mkdir(exist_ok=True)
+        for build_id in build_ids:
+            shutil.copytree(RC_TESTDATA / BUILD_RC_GREEN, root / build_id, dirs_exist_ok=True)
+        return root
+
+    def test_releases_are_newest_first_and_absent_when_none(self):
+        plain = collect.collect(from_dir=TESTDATA)
+        self.assertNotIn("releases", plain)
+        data, _ = self.quiet_collect(from_dir=TESTDATA, rc_from_dir=self._rc_dir(["10", "30", "20"]))
+        # Same started.json in every copy, so the build id breaks the tie.
+        self.assertEqual([r["build_id"] for r in data["releases"]], ["30", "20", "10"])
+
+    def test_rc_limit_trims_the_written_list(self):
+        data, _ = self.quiet_collect(
+            from_dir=TESTDATA, rc_from_dir=self._rc_dir(["10", "20", "30"]), rc_limit=2
+        )
+        self.assertEqual([r["build_id"] for r in data["releases"]], ["30", "20"])
+
+    def write_release_prior(self, releases) -> str:
+        """A prior data.json load_prior will accept, carrying `releases`."""
+        prior = collect.collect(from_dir=TESTDATA)
+        prior["releases"] = releases
+        return self.write_prior(prior)
+
+    def test_prior_releases_are_carried_forward(self):
+        prior = self.write_release_prior(
+            [{"build_id": "5", "verdict": "RED", "started": "2020-01-01T00:00:00+00:00"}]
+        )
+        data, _ = self.quiet_collect(
+            from_dir=TESTDATA, rc_from_dir=self._rc_dir(["10"]), merge_with=prior
+        )
+        self.assertEqual([r["build_id"] for r in data["releases"]], ["10", "5"])
+
+    def test_a_retyped_prior_started_sorts_instead_of_crashing(self):
+        """The prior filter validates `build_id` and nothing else, so a
+        hand-edited data.json can carry a non-string `started`. Sorting that
+        against a real entry's string raised TypeError and lost the whole
+        merge; both halves of the key are coerced now."""
+        prior = self.write_release_prior(
+            [{"build_id": "5", "started": 20260101},
+             {"build_id": "6", "started": None},
+             {"build_id": "7", "started": {"nested": "nonsense"}}]
+        )
+        data, _ = self.quiet_collect(
+            from_dir=TESTDATA, rc_from_dir=self._rc_dir(["10"]), merge_with=prior
+        )
+        self.assertEqual(
+            sorted(r["build_id"] for r in data["releases"]), ["10", "5", "6", "7"]
+        )
+
+    def test_corrupt_prior_releases_are_discarded_not_fatal(self):
+        prior = self.write_release_prior([{"no_build_id": True}, "nonsense", 7])
+        data, _ = self.quiet_collect(
+            from_dir=TESTDATA, rc_from_dir=self._rc_dir(["10"]), merge_with=prior
+        )
+        self.assertEqual([r["build_id"] for r in data["releases"]], ["10"])
+
+    def test_known_releases_are_never_re_read_from_the_bucket(self):
+        """A recorded release is final, so the sweep must not pay for it again."""
+        gsutil, log = self.fake_rc_gsutil(["10", "20"])
+        prior = self.write_release_prior(
+            [{"build_id": "20", "started": "2026-09-10T03:35:01+00:00"}]
+        )
+        data, _ = self.quiet_collect(rc_globs=[RC_FAKE_GLOB], merge_with=prior, gsutil=gsutil)
+        self.assertEqual({r["build_id"] for r in data["releases"]}, {"10", "20"})
+        calls = log.read_text()
+        self.assertIn("/10/build-log.txt", calls)
+        self.assertNotIn("/20/build-log.txt", calls)
+
+    def test_rc_limit_is_applied_before_the_reads(self):
+        gsutil, log = self.fake_rc_gsutil(["10", "20", "30"])
+        data, _ = self.quiet_collect(rc_globs=[RC_FAKE_GLOB], rc_limit=1, gsutil=gsutil)
+        self.assertEqual([r["build_id"] for r in data["releases"]], ["30"])
+        calls = log.read_text()
+        self.assertIn("/30/build-log.txt", calls)
+        self.assertNotIn("/10/build-log.txt", calls)
+        self.assertNotIn("/20/build-log.txt", calls)
+
+    def test_a_failed_listing_warns_and_keeps_the_rest_of_the_collect(self):
+        gsutil, _ = self.fake_rc_gsutil([])
+        data, err = self.quiet_collect(
+            from_dir=TESTDATA, rc_globs=["gs://fake-prow/nowhere/*"], gsutil=gsutil
+        )
+        self.assertNotIn("releases", data)
+        self.assertIn("gsutil ls failed", err)
+        self.assertEqual(len(data["runs"]), 3)
 
 
 class TestRepParsing(unittest.TestCase):

@@ -132,8 +132,9 @@ WORKER_TASK_ENV = "HERMES_KANBAN_TASK"
 #: first write; boards that predate it read as "no children".
 CHILDREN_TABLE = "kanban_worker_children"
 
-#: Statuses that no longer owe anyone an answer. Matches ``SETTLED`` in
-#: ``kanban_scheduling.py`` and the ``claim_task`` gate in
+#: Statuses that no longer owe anyone an answer. Matches
+#: ``kanban_scheduling.CHILD_SETTLED_STATUSES`` — reconciled against this tuple
+#: at build time by ``apply_kanban_scheduling`` — and the ``claim_task`` gate in
 #: ``hermes_cli/kanban_db.py``.
 SETTLED_STATUSES = ("done", "archived")
 

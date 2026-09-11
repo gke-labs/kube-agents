@@ -1,6 +1,6 @@
 # The agent shell sandbox: the container the agent's terminal, file and
 # code-execution tools actually run in, reached over SSH from the agent pod.
-# See docs/designs/agent-shell-sandbox.md for why the shell moved out of the
+# See docs/designs/agent-shell-sandboxing.md for why the shell moved out of the
 # agent container at all.
 #
 # Two things this image is deliberately not:
@@ -257,6 +257,11 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #
 #   sandbox_exec.py        the both-sides-safe dispatch; inert here (no
 #                          /etc/hermes/config.yaml, so it runs commands locally)
+#   repo_ref.py            the one repository parser, imported by forge,
+#                          github_token_refresh and gitops_workspace. Stdlib
+#                          only and deliberately so — the sidecar imports it
+#                          across the credential boundary, so it may not reach
+#                          for anything that shells out
 #   forge.py               GitHub REST client, imported by pr_conversation
 #   pr_triggers.py         imported by pr_conversation, imports forge
 #   github_token_refresh.py  invoked directly by submit-suggestion Step 5
@@ -295,6 +300,7 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 # Hermes home. Leaving the paths empty reads as a broken image; the stub says what
 # is actually true and exits non-zero.
 COPY agents/platform/scripts/sandbox_exec.py \
+     agents/platform/scripts/repo_ref.py \
      agents/platform/scripts/forge.py \
      agents/platform/scripts/pr_triggers.py \
      agents/platform/scripts/github_token_refresh.py \

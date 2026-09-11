@@ -458,5 +458,16 @@ class GvisorFloorCannotBlockTheTeardownTest(unittest.TestCase):
         )
 
 
+class UninstallSummaryDisclosureTest(unittest.TestCase):
+    """The uninstall summary discloses preserved cluster-level settings."""
+
+    def test_retained_cluster_settings_disclosed_in_summary(self):
+        text = _UNINSTALL_SH.read_text()
+        self.assertIn(
+            "Cluster-level settings kept on pre-existing clusters: CMEK database encryption, Workload Identity pool, GKE_METADATA node pool migrations, and Calico NetworkPolicy are preserved and not reverted.",
+            text,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

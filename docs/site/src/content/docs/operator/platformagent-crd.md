@@ -234,8 +234,10 @@ Sizing notes: `maxTurns` is consumed mostly by repository exploration, so scale 
 the agent has to read rather than how complex the request is. `apiMaxRetries` exists because
 Hermes' default of `3` assumes an interactive session where a human retries; a background worker
 has nobody to retry it, so a transient burst of upstream 429s or 503s simply ends the run. Raising
-`maxTurns` interacts with `maxInProgress`: a long-running worker holds its slot for the whole task
-and there are only `maxInProgress` of them, so raising one is a reason to reconsider the other.
+`maxTurns` interacts with `maxInProgress`: a worker doing the work holds its slot for the whole
+task and there are only `maxInProgress` of them, so raising one is a reason to reconsider the other.
+A coordinator waiting on work it fanned out is the exception — see
+[why dispatch is capped](#why-dispatch-is-capped-by-default).
 
 #### Why dispatch is capped by default
 
@@ -255,6 +257,12 @@ hold on the smallest pod anyone runs, and because the cost of being wrong is asy
 delays a delegated task, too high loses it silently. Raise it once you know your worker footprint
 and your model quota — that quota is the other shared resource, and for most deployments it binds
 before memory does.
+
+The cap counts running cards, not resident processes, and one case makes those differ: a coordinator
+waiting on work it fanned out is discounted, or it would hold the slot its own children need
+([`kanban_scheduling.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/kanban_scheduling.py)).
+Peak memory is therefore the cap plus however many coordinators are waiting, held down by the
+dispatcher's memory-pressure guard rather than by this number.
 
 ### `spec.harness.experimental`
 
@@ -493,24 +501,25 @@ See [`k8s-operator/api/v1alpha1/platformagent_types.go`](https://github.com/gke-
 
 The operator writes observed state to the `status` subresource:
 
-| Field                                  | Type     | Purpose                                                                                             |
-| -------------------------------------- | -------- | --------------------------------------------------------------------------------------------------- |
-| `phase`                                | string   | Overall state (`Pending`, `Provisioning`, `Ready`, `Degraded`, `Failed`).                           |
-| `address`                              | string   | Fully qualified domain name (FQDN) of the agent service.                                            |
-| `lastReconcileTime`                    | time     | Timestamp of the last status update.                                                                |
-| `conditions`                           | list     | Standard `metav1.Condition` observations, keyed by `type`.                                          |
-| `deploymentStatus.name`                | string   | Name of the underlying Deployment.                                                                  |
-| `deploymentStatus.readyReplicas`       | int32    | Number of fully ready replicas.                                                                     |
-| `serviceStatus.endpoint`               | string   | Primary URL/IP (with protocol and port) to reach the agent.                                         |
-| `storageStatus.bound`                  | bool     | Whether the primary PVC has been provisioned.                                                       |
-| `telemetry.otlpEndpoint`               | string   | The OTLP collector the agent was wired to.                                                          |
-| `telemetry.otlpEndpointSource`         | string   | Which rung answered: `DeploymentEnv`, `Spec`, `OperatorEnv`, `Discovered`, `None`, or `Default`.    |
-| `networkPolicy.generated`              | bool     | Whether the operator-managed NetworkPolicy is active. `false` when disabled, or not yet reconciled. |
-| `networkPolicy.dnsClusterIPs`          | []string | The DNS ClusterIPs written into rule 1.                                                             |
-| `networkPolicy.dnsClusterIPsSource`    | string   | Which rung answered: `Annotation`, `Spec`, `OperatorEnv`, `Discovered`, or `Default`.               |
-| `networkPolicy.metadataDaemonIP`       | string   | The post-NAT daemon IP in rule 3, empty when suppressed.                                            |
-| `networkPolicy.metadataDaemonPort`     | int32    | The post-NAT daemon port in rule 3, resolved from live DaemonSet or default (`988`).                |
-| `networkPolicy.metadataDaemonIPSource` | string   | Which rung answered: `Annotation`, `Spec`, `OperatorEnv`, `Discovered`, `Default`, or `Suppressed`. |
+| Field                                  | Type     | Purpose                                                                                                                                         |
+| -------------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `phase`                                | string   | Overall state (`Pending`, `Provisioning`, `Ready`, `Degraded`, `Failed`).                                                                       |
+| `observedGeneration`                   | int64    | The `metadata.generation` the status was last computed from. Behind `metadata.generation` from a spec edit until the reconcile that follows it. |
+| `address`                              | string   | Fully qualified domain name (FQDN) of the agent service.                                                                                        |
+| `lastReconcileTime`                    | time     | Timestamp of the last status update.                                                                                                            |
+| `conditions`                           | list     | Standard `metav1.Condition` observations, keyed by `type`.                                                                                      |
+| `deploymentStatus.name`                | string   | Name of the underlying Deployment.                                                                                                              |
+| `deploymentStatus.readyReplicas`       | int32    | Number of fully ready replicas.                                                                                                                 |
+| `serviceStatus.endpoint`               | string   | Primary URL/IP (with protocol and port) to reach the agent.                                                                                     |
+| `storageStatus.bound`                  | bool     | Whether the primary PVC has been provisioned.                                                                                                   |
+| `telemetry.otlpEndpoint`               | string   | The OTLP collector the agent was wired to.                                                                                                      |
+| `telemetry.otlpEndpointSource`         | string   | Which rung answered: `DeploymentEnv`, `Spec`, `OperatorEnv`, `Discovered`, `None`, or `Default`.                                                |
+| `networkPolicy.generated`              | bool     | Whether the operator-managed NetworkPolicy is active. `false` when disabled, or not yet reconciled.                                             |
+| `networkPolicy.dnsClusterIPs`          | []string | The DNS ClusterIPs written into rule 1.                                                                                                         |
+| `networkPolicy.dnsClusterIPsSource`    | string   | Which rung answered: `Annotation`, `Spec`, `OperatorEnv`, `Discovered`, or `Default`.                                                           |
+| `networkPolicy.metadataDaemonIP`       | string   | The post-NAT daemon IP in rule 3, empty when suppressed.                                                                                        |
+| `networkPolicy.metadataDaemonPort`     | int32    | The post-NAT daemon port in rule 3, resolved from live DaemonSet or default (`988`).                                                            |
+| `networkPolicy.metadataDaemonIPSource` | string   | Which rung answered: `Annotation`, `Spec`, `OperatorEnv`, `Discovered`, `Default`, or `Suppressed`.                                             |
 
 Three condition types appear in `conditions`, and only the first is always present:
 
@@ -529,10 +538,35 @@ state — it is a decision somebody made, and `phase` stays `Ready`.
 $ kubectl describe platformagent platform-agent -n kubeagents-system
 ...
   Conditions:
-    Type:     EventWatcher
-    Status:   False
-    Reason:   DisabledBySpec
-    Message:  Cluster event ingestion is disabled by spec.harness.eventWatcher.enabled=false. …
+    Type:                 EventWatcher
+    Status:               False
+    Observed Generation:  3
+    Reason:               DisabledBySpec
+    Message:              Cluster event ingestion is disabled by spec.harness.eventWatcher.enabled=false. …
+```
+
+### Telling a current status from a stale one
+
+`status.observedGeneration` is the `metadata.generation` the status was last computed from, and the
+`Ready` condition, with any `Degraded` or `EventWatcher` condition written in the same pass, carries
+it in its own `observedGeneration`. `Degraded`/`RBACIncomplete` is the exception: it is written when
+the set of denied permissions changes and left in place otherwise, so its `observedGeneration` is
+the generation at which that set last changed. A spec edit bumps `metadata.generation` at admission
+and leaves both behind until the next reconcile, so a `Ready` condition whose `observedGeneration`
+is below `metadata.generation` describes the previous spec, and `kubectl wait --for=condition=Ready`
+on its own can return on it. The field says the operator has processed that generation; it does not
+say the rollout it triggered has finished. `Ready` is still derived from replica counts, and during
+a rollout the replica satisfying it can be the previous one. `Ready` is a claim about three
+workloads (the gateway, the shell sandbox and the credential broker), so to gate on a change, wait
+for the generation to be observed, then for the rollout of each workload, then for the condition:
+
+```bash
+gen=$(kubectl get platformagent platform-agent -n kubeagents-system -o jsonpath='{.metadata.generation}')
+kubectl wait platformagent/platform-agent -n kubeagents-system --for=jsonpath='{.status.observedGeneration}'="$gen"
+kubectl rollout status deployment/platform-agent-gateway -n kubeagents-system
+kubectl rollout status statefulset/platform-agent-shell -n kubeagents-system
+kubectl rollout status deployment/platform-agent-credential-proxy -n kubeagents-system
+kubectl wait platformagent/platform-agent -n kubeagents-system --for=condition=Ready
 ```
 
 ## How config reaches each profile
