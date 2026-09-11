@@ -118,7 +118,7 @@ To determine which users have interacted with the system via Google Chat in the 
   A source of `Default` on a cluster without GKE Managed OTel is the one to treat as a fault: it means nobody established what is there, so discovery is switched off (`OTEL_COLLECTOR_DISCOVERY=false`) or the probe cannot complete — most often the operator's cluster-wide RBAC on `services` has been narrowed. Spans are going nowhere and the endpoint on the pod does not resolve.
 
 - Ensure the `hermes_otel` plugin is enabled in the profile's own config — `/opt/data/config.yaml` for the Chat Agent, `/opt/data/profiles/<profile>/config.yaml` for the Platform and Cluster Agents.
-- Verify the plugin's exporter backend matches that endpoint. It is rewritten at container start from `OTEL_EXPORTER_OTLP_ENDPOINT`, so a mismatch means the pod predates the current setting and needs a restart:
+- Verify the plugin's exporter backend matches that endpoint (on a `None` cluster, `enabled: false` and `backends: []` is expected in the plugin config). It is rewritten at container start from `OTEL_EXPORTER_OTLP_ENDPOINT`, so a mismatch means the pod predates the current setting and needs a restart:
   ```bash
   kubectl exec <pod-name> -c <agent-container-name> -n kubeagents-system -- \
     sh -c 'echo "$OTEL_EXPORTER_OTLP_ENDPOINT"; grep -r endpoint /opt/data/plugins/hermes_otel/config.yaml /opt/data/profiles/*/plugins/hermes_otel/config.yaml'

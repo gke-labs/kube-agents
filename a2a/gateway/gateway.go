@@ -24,6 +24,12 @@ const turnTimeout = 60 * time.Second
 // Options.RelayDurable for the one caller that may not share it.
 const relayDurable = "gateway-relay"
 
+// neverStartedNotice is what the conversation sees when the heal releases a
+// task that produced no first event inside FirstEventGrace: the task id,
+// the grace, and what happens to the message that triggered it. It states
+// the evidence (nothing on the stream in that long), not the inference.
+const neverStartedNotice = "⚠️ task `%s` has produced nothing on its event stream in %s, so this conversation is released and this message is handled as a new turn"
+
 // Hex-suffix widths for the ids the gateway mints. Context and correlation
 // ids are wider than task and message ids: they outlive one task and join
 // records across surfaces, so a collision costs more.
@@ -153,6 +159,9 @@ func New(o Options) (*Gateway, error) {
 	}
 	if o.Config.AskTTL <= 0 {
 		o.Config.AskTTL = defaultAskTTL
+	}
+	if o.Config.FirstEventGrace <= 0 {
+		o.Config.FirstEventGrace = defaultFirstEventGrace
 	}
 	g := &Gateway{
 		cfg:            o.Config,
@@ -313,11 +322,47 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 	// card rather than clearing silently — the same deterministic template
 	// the status ask uses. In the relay-lag case this duplicates the
 	// rolling-line edit that follows; redundant beats swallowed.
+	//
+	// The other stale shape has no terminal to find: a task with NO events
+	// at all (TasksGet answers TaskNotFound) because its executor never
+	// came up — nothing for the fold to see, nothing for Sweep to watch,
+	// and reap never clears ActiveTask. Past FirstEventGrace that is a
+	// task that never started, and the serialization is released the same
+	// way, with a plain line instead of a status card (there is no status
+	// to replay). Only TaskNotFound qualifies: a transport failure cannot
+	// rule out events, so it heals nothing, as everywhere else the
+	// supervisor paths consult the stream. No terminal is published here:
+	// age alone is not evidence, a first event that is merely late could
+	// still arrive, and no supervisor path ever sees a task with no pod —
+	// so a task released here ages out with the stream's retention, the
+	// residue Session lifecycle names. The task index stays, as in the
+	// terminal case, so a late start still renders; its key is retired
+	// only if the task ever terminates.
 	if active := rec.ActiveTask; active != nil && !active.Detached {
-		if task, err := g.client.TasksGet(ctx, rec.Addressee, active.TaskID); err == nil && task.Final {
+		task, err := g.client.TasksGet(ctx, rec.Addressee, active.TaskID)
+		healed := false
+		switch {
+		case err == nil && task.Final:
 			g.log.Info("healing stale active task", "taskId", active.TaskID, "state", task.State)
 			g.post(rec.Key, formatTaskStatus(task, active.Ask, active.SubmittedAt))
+			healed = true
+		case isTaskNotFound(err) && !active.SubmittedAt.IsZero() &&
+			time.Since(active.SubmittedAt) > g.cfg.FirstEventGrace:
+			g.log.Info("healing an active task with no first event inside the grace",
+				"conversation", rec.Key, "taskId", active.TaskID, "addressee", rec.Addressee,
+				"age", time.Since(active.SubmittedAt).Round(time.Second), "grace", g.cfg.FirstEventGrace)
+			g.post(rec.Key, fmt.Sprintf(neverStartedNotice, active.TaskID, g.cfg.FirstEventGrace))
+			healed = true
+		}
+		if healed {
 			rec.ActiveTask = nil
+			// Write the release now, not at the end of the turn: a turn that
+			// returns early — a cap refusal, on exactly the Delegate that
+			// follows a wedge — would otherwise announce a release it never
+			// wrote and announce it again on the next turn.
+			if err := withRetry(kvRetryAttempts, func() error { return g.reg.Put(ctx, rec) }); err != nil {
+				g.log.Error("healed record write failed", "conversation", rec.Key, "err", err)
+			}
 		}
 	}
 
@@ -346,6 +391,12 @@ func (g *Gateway) handleInbound(msg InboundMessage) {
 			g.post(rec.Key, "🤷 nothing is running")
 		}
 	case active != nil && !active.Detached:
+		// The one routing decision with no other log line: a new task logs
+		// "ingress", a heal logs itself, but a steer used to be silent, and
+		// a conversation wedged on a stale record was undiagnosable from
+		// the gateway's logs (#1318).
+		g.log.Info("routing as steer", "conversation", msg.Conversation, "taskId", active.TaskID,
+			"addressee", rec.Addressee, "taskAge", time.Since(active.SubmittedAt).Round(time.Second))
 		g.steerTask(ctx, rec, msg, authority)
 	default:
 		if rest, ok := isDelegate(msg.Text); ok && g.spawner != nil {

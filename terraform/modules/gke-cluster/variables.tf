@@ -36,8 +36,9 @@ variable "create_cluster" {
     Whether the module creates the cluster. Set false to install onto a
     cluster somebody else made: the module then only reads the named cluster
     through a data source and creates no cluster or KMS resources. The
-    existing cluster must already have Workload Identity enabled, and
-    enabling CMEK database encryption on it stays a
+    existing cluster must already have Workload Identity enabled and enforce
+    NetworkPolicy (Dataplane V2 or the legacy Calico addon); two postconditions
+    refuse the plan otherwise. Enabling CMEK database encryption on it stays a
     `gcloud container clusters update --database-encryption-key` step outside
     Terraform — a data source cannot mutate the cluster.
   EOT

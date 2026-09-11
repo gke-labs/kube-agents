@@ -148,14 +148,15 @@ HAS_BREAKING="false"
 
 # Check for Breaking Changes in subject (feat!:, fix!:) or footer (BREAKING CHANGE: / BREAKING-CHANGE:).
 # The definition lives in common.sh because resolve_scheduled_release.sh gates an
-# unattended release on the same question and the two must not drift.
+# unattended release on stable GA (>= 1.0.0) on the same question, while in 0.y.z
+# initial development breaking changes bump MINOR under SemVer Clause 4.
 if commit_messages_have_breaking_change "${COMMITS_SUBJECTS}" "${COMMITS_BODIES}"; then
   HAS_BREAKING="true"
 fi
 
 if [ "${HAS_BREAKING}" = "true" ]; then
   # SemVer 2.0 Clause 4: in 0.y.z initial development, breaking changes bump MINOR (0.1.0 -> 0.2.0)
-  if [ "$MAJOR" -eq 0 ]; then
+  if ga_tag_is_initial_development "${LATEST_GA_TAG}"; then
     BUMP_TYPE="minor-breaking"
     MINOR=$((MINOR + 1))
     PATCH=0

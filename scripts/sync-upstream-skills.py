@@ -95,10 +95,11 @@ FOOTER_MARKER = "<!-- kube-agents: local addition (auto-injected by sync-upstrea
 # Upstream skills are copied over verbatim on every sync (the local dir is rmtree'd first), so any
 # local edits are wiped. Anything this repository needs an upstream skill to say therefore belongs
 # here rather than in the skill file: these footers are the single source of truth for it and are
-# re-appended after each sync. Two things need saying today — the GKE create/lifecycle skills must
+# re-appended after each sync. Three things need saying today — the GKE create/lifecycle skills must
 # keep pointing at this repo's Cluster Agent profile lifecycle, which upstream knows nothing about
 # (see agents/platform/skills/cluster-agent-lifecycle/SKILL.md for the mechanics they reference),
-# and gke-networking must not present `--dns-endpoint` as unconditionally safe.
+# gke-networking must not present `--dns-endpoint` as unconditionally safe, and gke-upgrades must
+# point at this repo's fleet-upgrade-verification skill for executed per-member version checks.
 SKILL_FOOTERS = {
     "gke-cluster-creation": f"""{FOOTER_MARKER}
 
@@ -160,6 +161,25 @@ The Platform Agent's own tooling makes this decision per cluster in
 scaffolding already pass the flag exactly when it applies; the check above is for the times you
 run `get-credentials` by hand. That decision is re-read about once a minute per cluster, so after
 enabling the setting, wait a moment before retrying rather than concluding it did not work.
+""",
+    "gke-upgrades": f"""{FOOTER_MARKER}
+
+## Executed version checks: the fleet-upgrade-verification skill
+
+This skill plans one upgrade at a time; its references read one cluster at a time. When the
+question is which clusters in a fleet lag a target version, by how many minors, and whether the
+control plane or a node pool is the laggard, run the
+[fleet-upgrade-verification](../fleet-upgrade-verification/SKILL.md) skill's script and paste its
+table rather than reasoning from memory:
+
+```bash
+./skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --target-version <version> \\
+  --output /opt/data/scratch/fleet_versions.json
+```
+
+Without `--target-version` it measures each cluster against its own release channel's default and
+prints that baseline per member. It reads with `gcloud container` only and changes nothing. The
+plan, runbook and checklist for the members it flags are this skill's job.
 """,
 }
 

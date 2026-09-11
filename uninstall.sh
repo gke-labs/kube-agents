@@ -20,6 +20,13 @@ C_YELLOW="\033[1;33m"
 C_RED="\033[1;31m"
 C_BOLD="\033[1m"
 C_RESET="\033[0m"
+
+# Where the teardown engine is fetched from when this script runs outside a
+# checkout. install.sh and upgrade.sh carry the same URL, each needing it
+# before it has a checkout to read it from; tests/test_install_script.py pins
+# the three equal.
+KUBE_AGENTS_REPO_URL="https://github.com/gke-labs/kube-agents.git"
+
 # Process Lock File & Error Trap Handling
 #
 # The 2>/dev/null probes whether the lock file can be opened; it must NOT ride
@@ -234,7 +241,7 @@ persist_state_var() {
 resolve_state_location() {
   local compose_dir="$1"
   local state_object probe_err="" probe_rc=0
-  state_object="gs://$(tf_state_bucket)/$(tf_state_prefix)/default.tfstate"
+  state_object="gs://$(tf_state_bucket)/$(tf_state_prefix)/${TF_STATE_OBJECT}"
 
   # The probe's stderr is kept, not discarded, because "the object is not
   # there" and "I could not look" are different answers and only the first one
@@ -252,8 +259,8 @@ resolve_state_location() {
   if [ "$probe_rc" -eq 0 ]; then
     # Remote state where the installer keeps it (or where the caller pointed
     # us): pin the backend for lifecycle.sh.
-    export KUBE_AGENTS_STATE_BUCKET="${KUBE_AGENTS_STATE_BUCKET:-auto}"
-  elif ! printf '%s' "$probe_err" | grep -qiE 'matched no objects|not found|404|does not exist'; then
+    export KUBE_AGENTS_STATE_BUCKET="${KUBE_AGENTS_STATE_BUCKET:-$DEFAULT_KUBE_AGENTS_STATE_BUCKET}"
+  elif ! printf '%s' "$probe_err" | grep -qiE "$GCS_OBJECT_ABSENT_PATTERN"; then
     # Anything that is not a clean "absent" — refuse rather than report an
     # empty target. Reaching the local-state branches below on a permission
     # error would be the same mistake one level down.
@@ -296,7 +303,7 @@ main() {
     TEMP_REPO_DIR="$(mktemp -d)"
     repo_dir="${TEMP_REPO_DIR}/kube-agents"
     print_info "Fetching the teardown engine pinned at '${PARAM_SOURCE_REF}'..."
-    git clone --filter=blob:none --no-checkout https://github.com/gke-labs/kube-agents.git "$repo_dir"
+    git clone --filter=blob:none --no-checkout "$KUBE_AGENTS_REPO_URL" "$repo_dir"
     git -C "$repo_dir" fetch --depth=1 origin "$PARAM_SOURCE_REF"
     git -C "$repo_dir" checkout --detach FETCH_HEAD
     if [ ! -f "${repo_dir}/uninstall.sh" ]; then
@@ -331,12 +338,12 @@ main() {
     repo_dir="${TEMP_REPO_DIR}/kube-agents"
     if [ -n "${BAKED_RELEASE_VERSION:-}" ]; then
       print_info "Fetching the teardown engine for baked release '${BAKED_RELEASE_VERSION}'..."
-      git clone --filter=blob:none --no-checkout https://github.com/gke-labs/kube-agents.git "$repo_dir"
+      git clone --filter=blob:none --no-checkout "$KUBE_AGENTS_REPO_URL" "$repo_dir"
       git -C "$repo_dir" fetch --depth=1 origin "$BAKED_RELEASE_VERSION"
       git -C "$repo_dir" checkout --detach FETCH_HEAD
     else
       print_warning "No --source-ref given; fetching the teardown engine from main, which may be newer than your installed release."
-      git clone --depth=1 https://github.com/gke-labs/kube-agents.git "$repo_dir"
+      git clone --depth=1 "$KUBE_AGENTS_REPO_URL" "$repo_dir"
     fi
   fi
   # Defaults, validators, and the terraform.tfvars generator shared with
@@ -507,6 +514,7 @@ main() {
   print_step "🎉 Uninstall Complete!"
   echo -e "${C_GREEN}${C_BOLD}🏆 All kube-agents infrastructure elements have been safely removed.${C_RESET}"
   print_info "Kept by design: the Cloud KMS key rings (GCP cannot delete them; the next install adopts them) and the Terraform state bucket gs://$(tf_state_bucket)."
+  print_info "Cluster-level settings kept on pre-existing clusters: CMEK database encryption, Workload Identity pool, GKE_METADATA node pool migrations, and Calico NetworkPolicy are preserved and not reverted."
   print_info "If this project will not host kube-agents again, delete the bucket yourself: gcloud storage rm -r gs://$(tf_state_bucket)"
 }
 

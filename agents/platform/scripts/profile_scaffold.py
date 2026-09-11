@@ -25,6 +25,8 @@ from pathlib import Path
 # configuration, and so must be merged rather than replaced. Relative to the
 # profile home, POSIX-separated; each one needs a merge rule below.
 MERGE_PATHS: tuple[str, ...] = ("cron/jobs.json",)
+DEFAULT_LEGACY_CRON_RISK: str = "low"
+
 
 
 def make_log(prefix: str):
@@ -224,9 +226,60 @@ def merge_cron_store(
         out.append({**job, **{k: v for k, v in existing.items() if k not in job}})
 
     shipped = {str(j.get("id", "")) for j in image_jobs if isinstance(j, dict)}
-    out += [j for j in live_jobs if str(j.get("id", "")) not in shipped]
+    for j in live_jobs:
+        if str(j.get("id", "")) not in shipped:
+            if isinstance(j, dict) and "risk" not in j:
+                out.append({**j, "risk": DEFAULT_LEGACY_CRON_RISK})
+            else:
+                out.append(j)
     merged["jobs"] = out
     return merged
+
+
+def backfill_cron_store(store: object) -> object:
+    """Backfill DEFAULT_LEGACY_CRON_RISK onto unannotated jobs in a cron store.
+
+    Pure transform: returns a fresh dict when changes are needed, without
+    mutating the caller's input.
+    """
+    if not isinstance(store, dict):
+        return store
+    raw_jobs = store.get("jobs")
+    if not isinstance(raw_jobs, list):
+        return store
+    out: list[object] = []
+    changed = False
+    for j in raw_jobs:
+        if isinstance(j, dict) and "risk" not in j:
+            out.append({**j, "risk": DEFAULT_LEGACY_CRON_RISK})
+            changed = True
+        else:
+            out.append(j)
+    if not changed:
+        return store
+    return {**store, "jobs": out}
+
+
+def backfill_cron_file(path: Path) -> bool:
+    """Backfill DEFAULT_LEGACY_CRON_RISK into a cron/jobs.json file if present.
+
+    Atomic rewrite using a .tmp sibling and os.replace, matching _merge_after_overlay.
+    Returns True if the file was modified, False otherwise.
+    """
+    data = read_json(path)
+    if data is None:
+        return False
+    backfilled = backfill_cron_store(data)
+    if backfilled == data:
+        return False
+    try:
+        scratch = path.with_name(path.name + ".tmp")
+        scratch.write_text(json.dumps(backfilled, indent=2) + "\n", encoding="utf-8")
+        os.replace(scratch, path)
+        return True
+    except OSError as exc:
+        log(f"WARN: could not backfill cron store {path}: {exc}")
+        return False
 
 
 def retire_cron_jobs(store: object, retire_ids: tuple[str, ...]) -> object:
@@ -379,7 +432,11 @@ def main() -> None:
     # rewrites that file constantly, so the volume's copy always looks newer than
     # the image's and a newly shipped job would never land on an existing PVC.
     group.add_argument("--home", help="Overlay directly onto this home; skips profile registration.")
-    ap.add_argument("--template", required=True, help="Baked template dir to overlay onto the profile home.")
+    group.add_argument(
+        "--backfill-cron",
+        help="Backfill default risk tier onto a cron/jobs.json file directly without overlaying.",
+    )
+    ap.add_argument("--template", default="", help="Baked template dir to overlay onto the profile home.")
     ap.add_argument("--description", default="", help="Profile description (surfaced in discovery).")
     ap.add_argument("--plugins", default="", help="Optional shared plugins dir to overlay for observability.")
     ap.add_argument(
@@ -404,6 +461,16 @@ def main() -> None:
         ),
     )
     args = ap.parse_args()
+
+    if args.backfill_cron:
+        target = Path(args.backfill_cron)
+        if not target.is_file():
+            raise SystemExit(f"ERROR: --backfill-cron target not found: {target}")
+        backfill_cron_file(target)
+        return
+
+    if not args.template:
+        raise SystemExit("ERROR: --template is required when scaffolding or overlaying a profile.")
 
     if args.home:
         home = Path(args.home)

@@ -99,7 +99,7 @@ class TheSourcesAreReal(unittest.TestCase):
         )
 
     def test_the_golden_fixtures_render_more_than_a_stub(self) -> None:
-        """Four fixtures, each a full object set.
+        """Five fixtures, each a full object set.
 
         Several assertions iterate the fixtures and would pass vacuously over
         an empty parse -- a YAML change that made `safe_load_all` yield nothing

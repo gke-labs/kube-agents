@@ -10,15 +10,32 @@
 # Build from the a2a/ module root:
 #   docker build -f Dockerfile.gateway -t <registry>/gateway:<tag> .
 
-FROM golang:1.27 AS build
+# Bases come from images.json, the repo's image inventory, spelled the way
+# k8s-operator/Dockerfile spells them so `make mirror-images` and the pinning
+# there cover this build too. Note the distroless repository: images.json pins
+# gcr.io/distroless/static, not static-debian12, which is a different
+# repository and therefore a different pin.
+ARG GOLANG_IMAGE=golang
+ARG GOLANG_VERSION=1.27-alpine
+ARG DISTROLESS_IMAGE=gcr.io/distroless/static
+ARG DISTROLESS_VERSION=nonroot
+
+FROM ${GOLANG_IMAGE}:${GOLANG_VERSION} AS build
+# Refuse to download a toolchain the pin above does not name: without this, a
+# substituted GOLANG_IMAGE older than a2a/go.mod's `go` directive silently
+# fetches a newer one instead of failing the build (#1138).
+ENV GOTOOLCHAIN=local
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -o /out/gateway ./cmd/gateway
 
-# Distroless nonroot matches the Deployment's runAsNonRoot/runAsUser posture.
-FROM gcr.io/distroless/static-debian12:nonroot
+# Distroless nonroot satisfies the Deployment's runAsNonRoot, but it does not match its
+# runAsUser: this image's USER is 65532 and the pod imposes 1000. That override is why the
+# Deployment sets WorkingDir explicitly -- the image's WORKDIR /home/nonroot is 0700 owned
+# by 65532, which 1000 cannot chdir into. See hardenedSecurityContext() and #1259.
+FROM ${DISTROLESS_IMAGE}:${DISTROLESS_VERSION}
 COPY --from=build /out/gateway /gateway
 USER nonroot
 ENTRYPOINT ["/gateway"]

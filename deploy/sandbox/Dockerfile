@@ -1,6 +1,6 @@
 # The agent shell sandbox: the container the agent's terminal, file and
 # code-execution tools actually run in, reached over SSH from the agent pod.
-# See docs/designs/agent-shell-sandbox.md for why the shell moved out of the
+# See docs/designs/agent-shell-sandboxing.md for why the shell moved out of the
 # agent container at all.
 #
 # Two things this image is deliberately not:

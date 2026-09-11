@@ -25,10 +25,12 @@ default changes.
 Order of operations: resolve the image/source ref → check CLI prerequisites (including
 `terraform`, which it offers to install; `make` is not needed) → put the repository on disk and
 verify it against that ref → load `install.env` → interview for what is missing → generate
-`terraform.tfvars` → run
+`terraform.tfvars` → refuse a service account another install in the project owns
+(`check_service_account_ownership`, before the summary and the dry-run exit) → run
 `lifecycle.sh apply`. The source check happens **before** the interview, so a bad ref fails in
-seconds rather than after a dozen answers. Two steps stay `gcloud` calls after the apply — the
-managed-OTel scope and CMEK on a pre-existing cluster — and the GitHub App PEM import runs through
+seconds rather than after a dozen answers. Some steps stay `gcloud` calls outside the apply — before
+it, CMEK, the Workload Identity pool and NetworkPolicy enforcement on a pre-existing cluster; after
+it, the managed-OTel scope on a cluster it created — and the GitHub App PEM import runs through
 the Minty CLI so the key never enters Terraform state. Re-running the installer (or its `--menu`
 Day-2 panel's Save & Apply) reconciles every change through one `terraform apply`.
 
@@ -126,6 +128,10 @@ Upon completion, `install.sh` generates a machine-readable JSON status report at
 }
 ```
 
+The full report also carries `gvisor_enabled` and `memory_mode`. A report written before the
+interview decided them (a run that failed early) says so: `gvisor_enabled` is `null` and
+`memory_mode` is empty, rather than restating a default the run never applied.
+
 ## Supported Command-Line Flags
 
 Defaults marked "`installer_common.sh`" reach the installer through
@@ -158,5 +164,7 @@ Defaults marked "`installer_common.sh`" reach the installer through
 | `--gvisor=true\|false`               | Enable GKE Sandbox (gVisor) runtime isolation                                                                                                                                                                                                          | `true`                                                                                                                                             |
 | `--enable-web-ui=true\|false`        | Enable the Hermes Web UI on port 9119                                                                                                                                                                                                                  | `false`                                                                                                                                            |
 | `--allowed-users=EMAILS`             | Comma-separated chat users allowed to reach the agent; empty allows everyone                                                                                                                                                                           | _unset_                                                                                                                                            |
+| `--migrate-node-pools`               | Authorize migrating legacy GCE metadata server node pools to `GKE_METADATA` (recreates nodes, restarts workloads; required on clusters with legacy pools, else install aborts)                                                                         | `false`                                                                                                                                            |
+| `--enable-network-policy`            | Authorize enabling legacy Calico NetworkPolicy addon and node enforcement on GKE Standard clusters without Dataplane V2 (may recreate nodes, restart workloads; required on such clusters, else install aborts)                                        | `false`                                                                                                                                            |
 | `--memory=MODE`                      | Long-term agent memory engine: `file` \| `hindsight` \| `off`                                                                                                                                                                                          | `file`                                                                                                                                             |
 | `-h, --help, -?`                     | Output CLI usage banner and parameter details                                                                                                                                                                                                          | `N/A`                                                                                                                                              |

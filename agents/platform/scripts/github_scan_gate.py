@@ -31,7 +31,7 @@ to deliver on almost every tick; its product goes to GitHub, not to chat; and a
 card appears only in the rare case where there is genuine work. What it gives
 up it can afford — the card body names the skill, and ``model``/``max_turns``
 take their defaults — and the one thing it must not give up, an audible
-failure, stays here: this job keeps ``deliver: "all"``, and anything printed to
+failure, stays here: this job keeps ``deliver: "chat"``, and anything printed to
 stdout below is a fault report that reaches the room.
 
 One watcher, several sweeps

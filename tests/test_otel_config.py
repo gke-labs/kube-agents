@@ -98,6 +98,72 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual(backend["type"], "otlp")
         self.assertEqual(backend["headers"], {"x-api-key": "abc"})
 
+    def test_disabled_clears_backends_and_sets_enabled_false(self):
+        self.assertTrue(oc.apply(self.config, disabled=True))
+        cfg = self.load()
+        self.assertFalse(cfg["enabled"])
+        self.assertEqual(cfg["backends"], [])
+
+    def test_re_enabling_from_disabled_state_restores_enabled_true(self):
+        oc.apply(self.config, disabled=True)
+        self.assertTrue(oc.apply(self.config, endpoint=CUSTOM, disabled=False))
+        cfg = self.load()
+        self.assertTrue(cfg["enabled"])
+        self.assertEqual(cfg["backends"][0]["endpoint"], CUSTOM + "/v1/traces")
+
+    def test_re_enabling_with_source_path_restores_enabled_true(self):
+        pristine = self.write_baked(self.tmp / "defaults" / "hermes_otel" / "config.yaml")
+        # Ensure pristine has no 'enabled' field (matches image default)
+        cfg = yaml.safe_load(pristine.read_text())
+        cfg.pop("enabled", None)
+        pristine.write_text(yaml.safe_dump(cfg))
+
+        # Disable on disk
+        oc.apply(self.config, disabled=True)
+        self.assertFalse(self.load()["enabled"])
+
+        # Re-enable using pristine source_path
+        self.assertTrue(oc.apply(self.config, service_name="agent-gateway", source_path=pristine, disabled=False))
+        cfg = self.load()
+        self.assertTrue(cfg["enabled"])
+        self.assertEqual(cfg["backends"][0]["endpoint"], BAKED)
+
+    def test_re_enabling_is_idempotent_across_multiple_restarts(self):
+        pristine = self.write_baked(self.tmp / "defaults" / "hermes_otel" / "config.yaml")
+        cfg = yaml.safe_load(pristine.read_text())
+        cfg.pop("enabled", None)
+        pristine.write_text(yaml.safe_dump(cfg))
+
+        # Disable on disk
+        oc.apply(self.config, disabled=True)
+        self.assertFalse(self.load()["enabled"])
+
+        # Restart 1: Re-enable using pristine source_path
+        self.assertTrue(oc.apply(self.config, service_name="agent-gateway", source_path=pristine, disabled=False))
+        first_load = self.load()
+        self.assertTrue(first_load["enabled"])
+
+        # Restart 2: Apply again with pristine source_path (must preserve enabled: true without rewriting)
+        self.assertTrue(oc.apply(self.config, service_name="agent-gateway", source_path=pristine, disabled=False))
+        second_load = self.load()
+        self.assertEqual(first_load, second_load)
+        self.assertTrue(second_load["enabled"])
+
+    def test_pristine_disabled_template_is_not_forced_true(self):
+        pristine = self.tmp / "defaults" / "hermes_otel" / "config.yaml"
+        pristine.parent.mkdir(parents=True, exist_ok=True)
+        pristine.write_text(yaml.safe_dump({"enabled": False, "backends": []}))
+
+        self.assertTrue(oc.apply(self.config, source_path=pristine, disabled=False))
+        cfg = self.load()
+        self.assertFalse(cfg["enabled"])
+
+    def test_disabled_takes_precedence_over_endpoint(self):
+        self.assertTrue(oc.apply(self.config, endpoint=CUSTOM, disabled=True))
+        cfg = self.load()
+        self.assertFalse(cfg["enabled"])
+        self.assertEqual(cfg["backends"], [])
+
     def test_is_idempotent(self):
         oc.apply(self.config, service_name="agent-gateway", endpoint=CUSTOM)
         first = self.config.read_text()
@@ -120,7 +186,17 @@ class ApplyTest(unittest.TestCase):
         with redirect_stderr(err):
             self.assertFalse(oc.apply(self.config, endpoint=CUSTOM))
         self.assertIn("WARN", err.getvalue())
+        self.assertIn(str(self.config), err.getvalue())
         self.assertEqual(self.config.read_text(), before)
+
+    def test_bad_yaml_in_source_path_warns_and_leaves_file(self):
+        pristine = self.tmp / "defaults" / "hermes_otel" / "config.yaml"
+        pristine.parent.mkdir(parents=True, exist_ok=True)
+        pristine.write_text("backends: [ not valid yaml")
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertFalse(oc.apply(self.config, source_path=pristine))
+        self.assertIn(str(pristine), err.getvalue())
 
     def test_unwritable_file_warns_rather_than_raising(self):
         self.config.chmod(0o444)
@@ -188,6 +264,35 @@ class ApplyAllTest(unittest.TestCase):
 
     def test_nothing_to_do_is_not_an_error(self):
         self.assertEqual(oc.apply_all(self.home, "agent-gateway", CUSTOM, self.defaults), {})
+
+    def test_disabled_sweeps_all_profiles(self):
+        root = self.baked(self.home / "plugins" / "hermes_otel" / "config.yaml")
+        platform = self.baked(self.home / "profiles" / "platform" / "plugins" / "hermes_otel" / "config.yaml")
+        cluster = self.baked(self.home / "profiles" / "cluster-prod" / "plugins" / "hermes_otel" / "config.yaml")
+
+        results = oc.apply_all(self.home, "agent-gateway", CUSTOM, self.defaults, disabled=True)
+
+        self.assertEqual(set(results), {str(root), str(platform), str(cluster)})
+        self.assertTrue(all(results.values()))
+        for path in (root, platform, cluster):
+            cfg = yaml.safe_load(path.read_text())
+            self.assertFalse(cfg["enabled"])
+            self.assertEqual(cfg["backends"], [])
+            self.assertEqual(cfg["resource_attributes"]["service.name"], "agent-gateway")
+
+    def test_main_handles_disabled_flag(self):
+        target = self.baked(self.home / "plugins" / "hermes_otel" / "config.yaml")
+        with redirect_stderr(io.StringIO()):
+            rc = oc.main([
+                "--hermes-home", str(self.home),
+                "--service-name", "agent-gateway",
+                "--defaults-plugins", str(self.defaults),
+                "--disabled",
+            ])
+        self.assertEqual(rc, 0)
+        cfg = yaml.safe_load(target.read_text())
+        self.assertFalse(cfg["enabled"])
+        self.assertEqual(cfg["backends"], [])
 
     def test_main_never_fails_the_container_start(self):
         self.baked(self.home / "plugins" / "hermes_otel" / "config.yaml")

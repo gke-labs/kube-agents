@@ -161,7 +161,7 @@ The selected configuration is accepted when:
 2. Kubernetes and infrastructure-provider operations execute as the AgentSA;
 3. the required AgentSA preflight, and optional UserSA preflight, authorize an operation before it executes;
 4. operator-managed persisted state is scoped to its `PlatformAgent`;
-5. the operator-generated agent sandbox receives no credentials or Kubernetes ServiceAccount tokens through environment variables or mounted filesystems. This holds fully for the `<agent>-shell` Pod, which runs model-authored code. The gateway's `platform-agent` container is the one exception: it mounts an audience-bound projected ServiceAccount token so it can authenticate to the broker across the network — a deliberate trade described in section 6;
+5. the operator-generated agent sandbox receives no credentials or Kubernetes ServiceAccount tokens through environment variables or mounted filesystems. This holds fully for the `<agent>-shell` Pod, which runs model-authored code. The gateway's `platform-agent` container carries the exceptions: it mounts an audience-bound projected ServiceAccount token so it can authenticate to the broker across the network — a deliberate trade described in section 6 — and, under the unsupported `mode: next` toggle, it also receives the A2A bus's `worker` password by SecretKeyRef, which appears and disappears with the A2A stack;
 6. direct, autonomous, and automation-mediated actions remain distinguishable in telemetry; and
 7. the configured chat access policy accepts only authorized initiators.
 

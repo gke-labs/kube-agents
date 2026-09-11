@@ -82,6 +82,7 @@ exit 0
                     "IMAGE_TAG": MOCK_IMAGE_TAG_SHA,
                     "GOOGLE_CHAT_ENABLED": "true",
                     "GOOGLE_CHAT_MODE": MOCK_GOOGLE_CHAT_MODE,
+                    "GOOGLE_CHAT_HOME_CHANNEL": "spaces/TEST12345",
                     "CHAT_TOPIC_NAME": MOCK_CHAT_TOPIC_NAME,
                     "MODEL_PROVIDER": MOCK_MODEL_PROVIDER,
                     "MODEL_DEFAULT_NAME": MOCK_MODEL_DEFAULT_NAME,
@@ -121,6 +122,7 @@ exit 0
                 f"--image-tag={MOCK_IMAGE_TAG_SHA} "
                 f"--enable-google-chat "
                 f"--google-chat-mode={MOCK_GOOGLE_CHAT_MODE} "
+                f"--google-chat-home-channel=spaces/TEST12345 "
                 f"--chat-topic-name={MOCK_CHAT_TOPIC_NAME} "
                 f"--model-provider={MOCK_MODEL_PROVIDER} "
                 f"--model-default-name={MOCK_MODEL_DEFAULT_NAME} "
@@ -169,6 +171,7 @@ exit 0
             calls = recorded_calls.read_text().splitlines()
             self.assertNotIn("--enable-pubsub-platform", calls[0])
             self.assertNotIn("--enable-stockout-investigator", calls[0])
+            self.assertNotIn("--google-chat-home-channel", calls[0])
 
     def test_memory_provider_mappings(self):
         """Verifies memory mode resolution for hindsight, file, and off."""

@@ -5,10 +5,11 @@ Reusable Terraform module for provisioning the Platform Agent's Google Service A
 ## Relationship to the install
 
 This is the module the full-install composition (and therefore `install.sh`) uses for the
-agent's identity. The canonical identifiers (GSA `kubeagents-platform-gsa`, KSA
-`kubeagents-platform-agent`, namespace `kubeagents-system`) also appear in
-`scripts/installer/common.sh` for the dev tooling, and the module's defaults mirror
-them.
+agent's identity. The canonical identifiers also live with the installer, and the
+module's defaults mirror them: the GSA `kubeagents-platform-gsa` and the namespace
+`kubeagents-system` as defaults in `install.defaults.env` (an install overrides them
+through `install.env`), the KSA `kubeagents-platform-agent` as a constant in
+`scripts/installer/common.sh` for the dev tooling.
 
 By default the module grants the read-only role set (the composition's
 `permission_set = "read-only"`, also the installer's default). Pass `project_roles = []` to grant

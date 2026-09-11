@@ -496,6 +496,11 @@ source "${SCRIPT_DIR}/ci-env.sh"
 #      overwrites the same object paths, so any workable role carries
 #      storage.objects.delete; the boundary is the identity, not the role:
 #      no account a presubmit can run as ever holds a write on this bucket.
+#      (.github/workflows/ci-health.yml publishes the same dashboard, plus
+#      health.json and health-state.json, as this same publisher identity
+#      reached through GitHub Actions' Workload Identity -- so "bound to
+#      that periodic alone" now reads "to that periodic and that workflow",
+#      still nothing a presubmit can run as.)
 #      The same identity also needs READ on the sweep's source --
 #      roles/storage.objectViewer on gs://kube-agents-prow -- unless that
 #      bucket's existing public read already covers it; without it the first
@@ -1284,17 +1289,8 @@ TASKS=(
   # "./tasks/cluster-agent-pending-replicas-capped-pool/task.yaml"
   # gpu-stress-test-diagnosis: moved to NIGHTLY_TASKS 2026-09-03 (tofu wall clock, #1218/#1202).
   "./tasks/agent-kanban-smoke/task.yaml"
-  # Knowledge-grounding probe (#945): a pure GKE documentation question,
-  # graded on the persona's grounding contract — the answer names the
-  # compute-class nodeSelector key and concludes with the mandated
-  # `## Sources` section citing Developer Knowledge MCP or its web-search
-  # fallback. deployer: noop, no fixture, no cluster read: one delegation
-  # round trip plus one knowledge lookup. Measured 615/715/166s on its
-  # first run (build 2097362391401500672, 2026-09-08), so it is priced in
-  # unit_cost_hint rather than left at the default. Activated without a
-  # budget raise on the headroom #1218 freed by dropping the two tofu
-  # cases; runs unadmitted (the #1049 precedent) while it earns a record.
-  "./tasks/knowledge-grounding-sources-probe/task.yaml"
+  # knowledge-grounding-sources-probe: moved to NIGHTLY_TASKS 2026-09-09 after one
+  # presubmit cycle (#945) -- knowledge grounding is not a core kube-agents journey.
   # Last, because it is the only entry that pays twice. Its stack plants an
   # OOM-killed workload on the host cluster and blocks until the event
   # watcher's leading-edge debounce clears and the incident opens (~1 minute,
@@ -1306,7 +1302,7 @@ TASKS=(
   # bench/tf/prebuilt/autoops-incident/main.tf for why it cannot, and why it
   # is the host cluster and not the per-run one that gets the incident.
   # autoops-warning-event-triage: moved to NIGHTLY_TASKS 2026-09-03 (tofu wall clock, #1218/#1202).
-  # Five registered scenarios stay commented out, and seven more run in the
+  # Five registered scenarios stay commented out, and eight more run in the
   # nightly tier only -- NIGHTLY_TASKS below; the task-registration lint
   # reads both arrays. A commented entry here counts as registered, so a
   # line is a promise the scenario exists, not that it runs; the
@@ -1403,6 +1399,18 @@ TASKS=(
   # "./tasks/chat-routing-fleet-question/task.yaml"
   # "./tasks/fleet-cost-idle-pool/task.yaml"
   #
+  # The fleet version table (#1343, the fleet-upgrade-verification skill's
+  # Phase-1 case), held commented out by the maintainer's call on #1343 until
+  # #1254 is closed. #1254 is the open issue on upgrades-lagging-master-probe
+  # above: a delegated run's acknowledgement graded as the final answer on
+  # unrelated pull requests, the #1010 family docs/eval-gate-roster.md holds
+  # two other cases out on. That probe is admitted and rides it out on the
+  # all-three-repetitions rule; this case would enter unadmitted and could
+  # not red the job on quality, but it reads the same final answer with the
+  # same fixture, so it cannot be watched to pass and fail until then. It
+  # needs no change to activate.
+  # "./tasks/upgrades-fleet-version-table/task.yaml"
+  #
   # Refusal variant of cluster debugging, and not one of the nine above. Its
   # compliant answer is a pull request on the eval GitOps repo, so it was A1's
   # until A1 closed; A5's residual is the same privilege gap every fleet case
@@ -1418,11 +1426,13 @@ TASKS=(
 # ─── The nightly tier (#1021, the catch-all; #1023/#1024 consume it) ─────────
 # The nightly periodic runs the FULL catalog: every active TASKS entry above,
 # identically -- same repetitions, same gate, same reporting order -- PLUS the
-# entries here. What earns a case this array is measured cost or presubmit
-# redundancy, never doubt about the case: a case whose header above says it is
+# entries here. What earns a case this array is measured cost, presubmit
+# redundancy, or grading something outside the core journeys the presubmit
+# gate is for -- never doubt about the case: a case whose header above says it is
 # broken, unvalidated, or fails on a correct agent stays commented out in
 # TASKS (refusal-direct-mutation, pending-replicas-capped-pool, fix-request,
-# chat-routing-fleet-question, fleet-cost-idle-pool), because the nightly is
+# chat-routing-fleet-question, fleet-cost-idle-pool,
+# upgrades-fleet-version-table), because the nightly is
 # what appends to the baseline evidence store (EVAL_BASELINE_STORE below) and
 # a case that can only fail would append nothing but evidence keeping itself
 # unadmitted while spending ~10 minutes of matrix a night doing it.
@@ -1434,18 +1444,21 @@ TASKS=(
 # commented one -- not at all.
 #
 # Budget, priced the way EVAL_REPETITIONS' comment prices the presubmit: the
-# twenty-five-task nightly matrix is the pre-#1218 twenty-task presubmit
-# (measured ~317min SERIAL) plus the five recast cases -- four audit-shaped
-# (600-1300s a repetition, hinted at 900s in unit_cost_hint below) and one
-# probe-shaped, ~190min serial at three repetitions. #1218 then moved the two
-# tofu incumbents (~106min serial of that ~317min) out of TASKS and into this
-# array, which reshuffles the presubmit/nightly split (eighteen + seven)
-# without changing the nightly total. IF the periodic mirrors the
-# presubmit's shape -- 360m
-# deadline, EVAL_REPETITIONS at its default 3; the periodic is in flight in
+# twenty-five-task nightly matrix of 2026-09-03 was the pre-#1218 twenty-task
+# presubmit (measured ~317min SERIAL) plus the five recast cases -- four
+# audit-shaped (600-1300s a repetition, hinted at 900s in unit_cost_hint
+# below) and one probe-shaped, ~190min serial at three repetitions. #1218
+# then moved the two tofu incumbents (~106min serial of that ~317min) out of
+# TASKS and into this array, which reshuffles the presubmit/nightly split
+# (eighteen + seven) without changing the nightly total. #945 then added
+# knowledge-grounding-sources-probe, moved here 2026-09-09: its two
+# presubmit runs measured 615/715/166s and 1602/597/420s, ~25-45min serial
+# at three repetitions, so eighteen + eight, twenty-six in all, ~532-552min
+# serial. IF the periodic mirrors the presubmit's shape -- 360m deadline,
+# EVAL_REPETITIONS at its default 3; the periodic is in flight in
 # oss-test-infra, not merged, so this is the assumption and not yet a fact --
-# ~507min serial fits only through the fan-out: parallelism 4 has to realise
-# 1.4x or better, which the first scheduled run measures, and at more
+# ~532-552min serial fits only through the fan-out: parallelism 4 has to
+# realise 1.5x or better, which the first scheduled run measures, and at more
 # repetitions the required factor scales with them. A deadline kill is
 # survivable by design --
 # the cost-hinted queue means it truncates in-flight units, the EXIT trap
@@ -1478,6 +1491,16 @@ NIGHTLY_TASKS=(
   # admission record here.
   "./tasks/gpu-stress-test-diagnosis/task.yaml"
   "./tasks/autoops-warning-event-triage/task.yaml"
+  # Knowledge-grounding probe (#945): a pure GKE documentation question
+  # graded on the persona's grounding contract -- the answer names the
+  # compute-class nodeSelector key and ends in the mandated `## Sources`
+  # section. deployer: noop, no fixture, no cluster read. It ran one
+  # presubmit cycle in TASKS (2/3 on build 2097362391401500672, then 3/3 on
+  # 2097414338968031232 after its citation check was widened) and moved here
+  # on 2026-09-09: knowledge grounding is a cross-cutting persona behavior,
+  # not one of the core journeys the presubmit gate exists for, so it earns
+  # its record in the full catalog instead. Priced at 600s in unit_cost_hint.
+  "./tasks/knowledge-grounding-sources-probe/task.yaml"
 )
 
 # Which matrix this run gets. "presubmit" -- the default, and what every
@@ -1728,8 +1751,9 @@ unit_cost_hint() {
     upgrade-readiness-lagging-cluster | consistency-drift-outlier) echo 900 ;;
     compliance-rbac-overgrant | rca-remediation-pr) echo 700 ;;
     consistency-authorized-networks-probe) echo 300 ;;
-    # Median of its first three measured repetitions (615/715/166s, build
-    # 2097362391401500672); the 200s default under-packs it by 3x.
+    # Nightly-only since 2026-09-09. Median of its first three measured
+    # repetitions (615/715/166s, build 2097362391401500672); the 200s default
+    # under-packs it by 3x.
     knowledge-grounding-sources-probe) echo 600 ;;
     *) echo 200 ;;
   esac

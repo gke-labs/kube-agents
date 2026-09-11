@@ -32,6 +32,29 @@ _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _MANIFESTS_GO = _ROOT / "k8s-operator" / "internal" / "controller" / "platformagent_manifests.go"
 _UPGRADE_SCRIPT = _ROOT / "upgrade.sh"
 _READINESS_SCRIPT = _ROOT / "scripts" / "release" / "wait_for_gke_readiness.sh"
+# Where the front doors' constants for the chart's fixed object names live.
+# upgrade.sh spells a Deployment through one of them ("deployment/${NAME}"),
+# so a gate is matched by the literal name or by any constant that holds it.
+_INSTALLER_COMMON = _ROOT / "scripts" / "installer" / "installer_common.sh"
+
+
+def _deployment_spellings(deployment):
+    """The literal name plus every `readonly X="<name>"` constant that equals it."""
+    constants = re.findall(
+        rf'^readonly (\w+)="{re.escape(deployment)}"$',
+        _INSTALLER_COMMON.read_text(),
+        re.MULTILINE,
+    )
+    return [re.escape(deployment)] + [rf"\$\{{{name}\}}" for name in constants]
+
+
+def rollout_gate_pattern(deployment):
+    """The `kubectl rollout status` line for one Deployment, however it is spelled."""
+    return re.compile(
+        r'kubectl rollout status "?deployment/(?:'
+        + "|".join(_deployment_spellings(deployment))
+        + r')"?\s[^\n]*?--timeout=(\d+)s'
+    )
 
 # What the gate must have over the startupProbe budget, in seconds, for the
 # node scale-up and image pull that precede the container starting at all.
@@ -76,10 +99,7 @@ def _gateway_progress_deadline_seconds():
 
 def _rollout_gate_seconds(workflow, deployment):
     """The --timeout on a `kubectl rollout status` for one Deployment."""
-    match = re.search(
-        rf"kubectl rollout status deployment/{re.escape(deployment)}\b[^\n]*?--timeout=(\d+)s",
-        workflow.read_text(),
-    )
+    match = rollout_gate_pattern(deployment).search(workflow.read_text())
     assert match, f"could not find the rollout gate for {deployment} in {workflow.name}"
     return int(match.group(1))
 

@@ -1,0 +1,77 @@
+name: "Release: Scheduler"
+
+# Holds the GA release pipeline's cron one level up, so a weekly tick with
+# nothing to release produces no pipeline run at all.
+#
+# Following the decoupled trigger pattern established by rc-scheduler.yml,
+# this scheduler resolves whether an eligible candidate exists via
+# resolve_scheduled_release.sh and dispatches release-publish.yml only when
+# work is required, quietly recording skips to Job Summary when no candidate
+# exists or when no commits have merged since the last release.
+#
+# Every Thursday, the scheduler ships whatever has merged since the last GA release.
+# In pre-1.0 initial development (0.y.z), breaking changes bump minor under SemVer 2.0
+# Clause 4 and release unattended. Once 1.0.0 has been cut, resolve_scheduled_release.sh
+# halts on major breaking changes with exit 1 and an error annotation, turning this scheduler
+# run red so maintainers are notified to publish the major release by hand.
+
+permissions:
+  contents: read
+
+on:
+  schedule:
+    - cron: "17 5 * * 4"
+  # Dispatchable so the evaluation can be exercised by hand without waiting for
+  # Thursday 05:17 UTC. It takes no inputs: the whole job is "work out whether
+  # there is anything to release", and a manual run that overrode that would be
+  # testing something else. To force a specific release through, dispatch
+  # release-publish.yml directly with schedule_gate=bypass.
+  workflow_dispatch:
+
+concurrency:
+  group: release-scheduler
+  cancel-in-progress: false
+
+jobs:
+  dispatch-if-there-is-work:
+    name: Dispatch the GA release pipeline if a candidate is eligible
+    # A fork inherits the cron but none of the release credentials. The guard is
+    # on the job rather than trusted to cascade, and scheduled/manual release
+    # evaluation must only run against the canonical main branch.
+    if: github.repository == 'gke-labs/kube-agents' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      # For the dispatch step below. `workflow_dispatch` is exempt from the
+      # recursion suppression that would otherwise stop the default token
+      # starting another run.
+      actions: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The resolver reads the tag graph and commit ranges, so a shallow clone
+          # would answer incorrectly.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Evaluate whether to release
+        id: resolve
+        run: ./scripts/release/resolve_scheduled_release.sh
+
+      - name: Record that there is nothing to do
+        if: steps.resolve.outputs.should_release != 'true'
+        env:
+          RELEASE_COMMIT: ${{ steps.resolve.outputs.release_commit }}
+          GATE_TAG: ${{ steps.resolve.outputs.gate_tag }}
+          SKIP_REASON: ${{ steps.resolve.outputs.skip_reason }}
+        run: ./scripts/release/record_release_scheduler_skip.sh
+
+      - name: Dispatch the release pipeline
+        if: steps.resolve.outputs.should_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ steps.resolve.outputs.release_commit }}
+          GATE_TAG: ${{ steps.resolve.outputs.gate_tag }}
+        run: ./scripts/release/dispatch_release_pipeline.sh

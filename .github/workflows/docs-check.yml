@@ -34,8 +34,9 @@ jobs:
       - name: Generated tables are current
         run: make docs-check-generated
 
-      # Relative links must resolve. Catches paths broken by moved files.
-      - name: Relative links resolve
+      # Relative links, and design-doc paths cited from code, must resolve.
+      # Catches paths broken by moved files and citations of unmerged docs.
+      - name: Links and cited design docs resolve
         run: make docs-check-links
 
       # Identifiers must match the source of truth (service accounts,

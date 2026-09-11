@@ -1,7 +1,6 @@
-# data.json schema (version 1)
+# Eval dashboard contracts: `data.json`, `brief.json`, the pages
 
-`collect.py` writes this file; the dashboard renderer and the publisher are
-built against it **in parallel**. It is a contract: field names, types and
+`collect.py` writes `data.json`; the renderer and the publisher read it. It is a contract: field names, types and
 derivation rules below are fixed. Changes must be additive optional fields
 only — anything that renames, removes or re-types a field bumps
 `schema_version` and lands together with both consumers.
@@ -183,6 +182,62 @@ Additive, optional, and safe to omit — consumers must default them.
   `first_seen` is more than 2 days old (`PENDING_RETRY_DAYS` — a build
   unfinished that long is a pod that died without uploading). Omitted when
   empty; a malformed value is ignored with a warning, never a crash.
+- `releases[]` — release-candidate eval runs, **newest first**, at most 20
+  (`RC_RELEASES_MAX`). Omitted when there are none. Collected from
+  `--rc-glob` / `--rc-from-dir`, which point at `post-kube-agents-eval-rc`:
+  the postsubmit that runs the same `hack/ci-eval-pr.sh` against a release
+  candidate's own images. **They are never in `runs[]`**, because `runs[]`
+  feeds `cases[]` and a candidate is judged against main's window rather
+  than added to it (`hack/ci-eval-pr.sh:1998`: "the baseline store is read,
+  never written"). The renderer shows the newest 10 of them
+  (`RELEASES_MAX_ROWS`), so the store holds twice what the page displays.
+
+```json
+{
+  "build_id": "2097891568546484224",
+  "rc_tag": "staging_2609092307_5b5ad10",
+  "commit": "5b5ad10",
+  "tier": "nightly",
+  "verdict": "GREEN|RED|NOT RUN|null",
+  "result": "SUCCESS|FAILURE|ABORTED",
+  "started": "<iso8601>",
+  "finished": "<iso8601>",
+  "duration_s": 15006,
+  "project": "kube-agents-evals-10",
+  "artifacts_url": "https://oss.gprow.dev/view/gs/...",
+  "pass_rate": 0.9,
+  "baseline_rate": null,
+  "margin": null,
+  "tasks": []
+}
+```
+
+- `rc_tag`, `commit`, `tier`, `verdict`, `artifacts_url` — from the banner
+  `hack/ci-eval-rc.sh` prints once per run. A missing banner means the
+  driver exited on one of its early guards and measured nothing; the entry
+  is still emitted, because a resolver broken for a month must not read as
+  a month with no releases. `rc_tag`, `tier`, `verdict`, and
+  `artifacts_url` are then `null` — but `commit` is not, when Prow recorded
+  a `revision`: it falls back to that ref's first 7 characters, which for a
+  tag-push postsubmit is the same commit the banner would have named.
+  `artifacts_url` is additionally `null` for a run outside Prow.
+- `verdict` — the eval's, which is **not** the job's: the lane is advisory,
+  so a `RED` candidate still leaves a `SUCCESS` in `result`. That is the job
+  config's doing — it runs the driver under `|| true` — not the driver's, so
+  a future config that drops the `|| true` would make the two agree without
+  anything here changing. `NOT RUN` is
+  the deploy-failed path — nothing was measured, so it is not a judgement
+  on the candidate.
+- `pass_rate` / `baseline_rate` / `margin` — fractions in `0..1` (`margin`
+  may be negative), from `bench-gate suite`'s `Admitted-case pass rate:`
+  line. `baseline_rate` and `margin` are `null` while the baseline store
+  holds nothing at the candidate's version key, which is what makes the
+  non-inferiority number advisory; the renderer labels it so.
+- `tasks` — the same shape as `runs[].tasks`, parsed by the same code.
+- Collection is bounded by build id, not by a watermark: the newest
+  `--rc-limit` (default 20) ids are read, minus any the `--merge-with`
+  prior already covers. A recorded release is final, so a carried-forward
+  entry is never re-read.
 
 ### Optional run and task fields
 
@@ -214,8 +269,12 @@ what the renderer does with them.
   `gsutil ls`, read with `gsutil cat`. **Read-only.**
 - `--from-dir <dir>` — local `<build_id>/` subdirectories with the same
   three files; the offline/testing path.
+- `--rc-glob <gs glob>` (repeatable) / `--rc-from-dir <dir>` — the same two
+  shapes for `post-kube-agents-eval-rc`, collected into `releases[]` rather
+  than `runs[]`. `--rc-limit <n>` (default 20) bounds how many builds per
+  glob are read, newest first.
 
-### Incremental collection (the output stays schema v1; it may add the optional `pending_builds`)
+### Incremental collection (the output stays schema v1; it may add the optional `pending_builds` and `releases`)
 
 - `--merge-with <data.json | gs:// URL>` — load a previously written
   data.json, carry its `runs[]` over (verbatim except `pr_merged`, which
@@ -244,6 +303,78 @@ what the renderer does with them.
   top-level fields) into the output. Omitted, the field is omitted and the
   renderer's default applies.
 
+## The rendered pages
+
+`render.py` writes three pages beside `data.json`. Every time shown on the
+first two is America/Toronto ("ET"), formatted in the browser with
+`Intl.DateTimeFormat`; URL parameters stay ISO 8601 UTC.
+
+| Page          | What it is                                                                                                                                                                                                                                                         |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `index.html`  | **The Brief**: the gate's state and why, what the agent saw, what changed right before, what is being done, and the runs in the window. Healthy: the last 24 hours in numbers and the last incident.                                                               |
+| `run.html`    | **The PR view**, `run.html?build=<prow build id>`: one run, each failed gate case tagged `failing on N other PRs` / `only your PR` / `quota storm` / `unexplained` with its check reason, 30-day pass rate, transcript link and a one-line Do; a "what to do" box. |
+| `legacy.html` | The two-band page (agent trend, gate matrix, Pareto, evidence table).                                                                                                                                                                                              |
+
+The Brief and the PR view render in the browser from `brief.json` (below)
+and refetch it and `health.json` every 60 seconds. `classify.py` is the one
+place the "is this red mine?" rule lives; the pages read its answer through
+`brief.json`, and anything else that answers the question imports it.
+
+### URL contract
+
+`index.html?cases=a,b&since=<ISO 8601 UTC>&until=<ISO 8601 UTC>#gate|#agent`
+
+- `cases`, `since`, `until` scope the Brief to that incident (a past one
+  when `until` is given). `since` is matched to an incident in
+  `health-history.jsonl`; without history the parameters describe it.
+- `#agent` shows the last 24 hours in numbers; `#gate` lands on the
+  "why we think" block. No parameters: the current state from `health.json`.
+- Case ids match `[A-Za-z0-9][A-Za-z0-9._-]{0,79}`; the first 50
+  (`maxLinkCases`) that do are read, and a link the pages write carries at
+  most those 50. A value that fails its grammar is dropped and everything
+  reaches the DOM escaped.
+- `since` and `until` are read with a `Z`, a space separator, or a UTC
+  offset written `+02:00` or `+0200`, and converted; the pages themselves
+  write `Z`.
+- `run.html?build=<digits>`; an id not in `brief.json` shows a
+  not-found page naming the window (`RUN_VIEW_DAYS`, 14 days).
+
+### `brief.json` (written by `render.py`)
+
+`{schema_version, generated_at, stale_after_s, run_days, admitted[],
+health, history, merges, cases{}, runs[]}`. `runs[]` is the last
+`run_days` of `data.json`, oldest first, each carrying its identity and
+timing plus `classify.classify_run(...)`: `verdict` (`red` = looks like
+the PR, `green`, `infra` = the gate's), `headline`, `lede`,
+`matches_incident`, `setup_death`, `storm_reps`, `do`, `cases[]`
+(`{case, outcome, cls, also_failing_prs, pass_rate_30d, reason, excerpt,
+do, admitted, reps}`) and `health_at` (the verdict in force when it
+finished, from history; `null` without history). `health` is the current
+verdict, `history` the ticks and the incidents derived from them, `merges`
+the recent first-parent commits of the checkout (`null` when the checkout
+is shallow or has no git, and the page omits "what changed right before").
+
+### `health.json` and `health-history.jsonl` (optional inputs)
+
+`health.json` is the CI health adjudicator's verdict, published beside
+`data.json` (nothing in this directory writes it); the fields read are
+`state` (`GREEN|DEGRADED|OUTAGE`), `condition`
+(`shared_break|storm|setup_deaths`), `since`, `cause`, `advice`,
+`failing_cases`, `tracking_issues`, `incident`, `recovering`, `stale`,
+`generated_at`, `tick`. Any other state, or an unreadable file, means no
+verdict: the Brief says no verdict is published and shows the last 24
+hours in numbers and the runs, the PR view classifies from the runs alone
+and shows no gate banner. Only a `GREEN` verdict reads as healthy.
+
+`health-history.jsonl` is one JSON object per line, each the full
+`health.json` document as published at that tick plus
+`"tick": "<ISO 8601 UTC>"`, oldest first (the reader sorts anyway and
+skips a malformed line). A run of non-GREEN ticks is one incident, from
+its first tick's `since` to the first GREEN tick after it; that is what
+the Brief's past-incident view and the PR view's "gate state at the time"
+banner read. Absent, the pages show the current verdict only. Neither
+file is copied into the out-dir: the adjudicator owns both.
+
 ## Fixtures
 
 `testdata/` holds three **real** `pull-kube-agents-smoke-test` builds
@@ -267,3 +398,44 @@ token observed in the wild (`pass`, `fail`, `infra`, `blocked`):
 | 2094432646640701440 | PR 1057 — parallel fan-out, green, one infra rep |
 | 2094467976156680192 | PR 1075 — serial markers, aborted mid-task       |
 | 2094714569262895104 | PR 1089 — blocked/infra-heavy, >300-char reasons |
+
+`testdata_rc/` holds one **real** `post-kube-agents-eval-rc` build — the
+release-candidate job, which is a postsubmit, so its `started.json` carries no
+`pull` key and its log carries no PR number:
+
+| build               | why it is here                                        |
+| ------------------- | ----------------------------------------------------- |
+| 2097891568546484224 | `staging_2609092307_5b5ad10` — GREEN, no baseline yet |
+
+Captured from
+`https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/2097891568546484224`
+— which is also where the job name the collector globs for is verifiable, since
+nothing in this repository declares it (the job lives in
+`GoogleCloudPlatform/oss-test-infra`). A wrong name degrades to an empty
+`releases[]` rather than an error, so check the path before changing it.
+
+It is the fixture for `releases[]`, and it keeps both banners the driver
+prints: `resolve-rc-target.sh`'s `RELEASE CANDIDATE EVAL TARGET` near the top
+and `ci-eval-rc.sh`'s `RELEASE CANDIDATE EVAL` at the end. A substring match
+opens the parse on the first one, so the decoy stays in the fixture.
+
+`testdata_health/data.json.gz` is a **real** published `data.json` reduced by
+`health.py --trim` (and gzip-compressed, which `health.py --data` reads by
+suffix) to the runs that finished in [2026-09-01, 2026-09-09) — the last of
+them on 2026-09-08 — and the fields the health adjudicator reads (`build_id`,
+`pr`, `started`, `finished`, `result`, `duration_s`, and per task `name`,
+`result`, `reps[].result` and the first 96 characters of `reps[].reason`);
+its `trimmed` key records the source and the cut. Six of its zero-task runs
+carry `result: "failure"` in lowercase, as Prow wrote them on 2026-09-05 —
+the one departure from the `result` vocabulary above seen in the wild, so
+consumers compare it case-insensitively. `testdata_health/roster-history.json` is the
+`BOOTSTRAP_ADMITTED` roster per era over the same week, taken from the
+commits that changed it. Together they are the replay fixture
+`scripts/test_eval_dashboard_health.py` asserts the week's incident
+timeline against.
+
+`testdata_classify/incidents.json.gz` holds a published `data.json`'s runs
+for two windows of the week of 2026-09-01 (PR #913's last runs on 09-04/05;
+the crashloop outage of 09-07/08 with PR #608's 15-case red inside it),
+trimmed to the fields `classify.py` reads, for `test_eval_dashboard_classify.py`
+and the page tests.

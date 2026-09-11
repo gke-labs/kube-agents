@@ -32,7 +32,7 @@ Custom resources in the `kubeagents.x-k8s.io/v1alpha1` API group:
 
 The controller reconciles a `PlatformAgent` into:
 
-- A `Deployment` (named `<name>-gateway`) for the Platform Agent, running the Hermes runtime with a Fluent Bit log-forwarding sidecar and an `agent-api-auth` sidecar that terminates the PlatformAgent API bearer key and runs the `k8s-event-watcher`. The gateway holds no credential and executes nothing the model wrote.
+- A `Deployment` (named `<name>-gateway`) for the Platform Agent, running the Hermes runtime with a Fluent Bit log-forwarding sidecar and an `agent-api-auth` sidecar that terminates the PlatformAgent API bearer key and runs the `k8s-event-watcher`. The gateway executes nothing the model wrote; which credentials it does hold, and why, are on [Credential isolation](/kube-agents/reference/credential-isolation/).
 - A `StatefulSet` (named `<name>-shell`) and its `Service`, the shell sandbox: `sshd` on `2222`, the durable `/opt/data`, and the wrappers that stand in for `gcloud`, `kubectl`, `gh` and `git`. This is the pod that runs model-authored commands, and its ServiceAccount carries no Workload Identity annotation.
 - A `Deployment` (named `<name>-credential-proxy`), a `ClusterIP` `Service` on port `8765`, and a `NetworkPolicy` narrowing who may reach it — the credential broker, which holds every credential in the install and executes the real CLIs on the sandbox's behalf. See [Credential isolation](/kube-agents/reference/credential-isolation/).
 - A `Service` fronting the gateway `Deployment` (API port `8642`, plus dashboard port `9119` when the dashboard is enabled).

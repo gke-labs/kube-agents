@@ -15,7 +15,18 @@ Scope is deliberately narrow and offline:
 * site-absolute routes (``/kube-agents/...``) are Starlight routes rather than
   paths on disk, so they are skipped -- broken ones surface as a failed site
   build in ``docs-build.yml``;
-* anchors are stripped before resolution, and a bare ``#anchor`` is skipped.
+* anchors are stripped before resolution, and a bare ``#anchor`` is skipped;
+* a ``docs/designs/...`` or ``docs/architecture/...`` path written inside a
+  code or configuration file (the ``CODE_GLOBS`` below: Python, Go, shell,
+  Dockerfiles, YAML, Terraform, TypeScript) is resolved from the repository
+  root and must be git-tracked too. Comments cite design documents as the
+  reasoning behind what they sit above, and a citation of a document that
+  was never merged reads the same as a real one (#992). No other path in
+  those files is inspected. A test fixture that needs a fake document path
+  cites something like ``docs/x.md``, outside the two directories, as the
+  existing ones do, or assembles the path from parts at runtime the way
+  this script's own tests do; a literal in a tracked file is a citation
+  like any other.
 
 Standard library only, so it runs in CI and in a bare clone.
 
@@ -33,6 +44,17 @@ from pathlib import Path
 from urllib.parse import unquote
 
 REPO = Path(__file__).resolve().parent.parent
+
+MARKDOWN_GLOBS = ("*.md", "*.mdx")
+# Where a design document gets cited as the reasoning behind something: code,
+# shell, container builds, Helm and cron configuration, Terraform, the A2A web
+# client. Selected by name pattern because `git ls-files` takes one; the
+# citation pattern below is conservative enough that any text file could be
+# scanned, so widen this rather than exempt when a new kind of file starts
+# citing designs.
+CODE_GLOBS = ("*.py", "*.go", "*.sh", "*Dockerfile*", "*.yaml", "*.yml", "*.tf", "*.ts")
+# The docs site's dependency tree carries its own Markdown and scripts.
+VENDORED_DIR = "node_modules"
 
 # [text](target) but not ![image](target) handled separately; both are checked.
 LINK_RE = re.compile(r"!?\[[^\]]*\]\(\s*([^)\s]+)(?:\s+\"[^\"]*\")?\s*\)")
@@ -65,6 +87,13 @@ FENCE_RE = re.compile(r"^\s*(```|~~~)")
 # report keep meaning what they say.
 INLINE_CODE_RE = re.compile(r"(?<!`)(`+)(?!`).+?(?<!`)\1(?!`)")
 
+# A design or architecture document named from code. The match ends at `.md`,
+# so a trailing `)`, `.`, `,`, `:12`, `#anchor`, a closing backtick or a
+# following ` §4` is never part of the path, and the lookahead keeps `.mdx`
+# from matching as `.md`. A glob (`*.md`) or an f-string (`{name}.md`) contains
+# a character outside the class and is skipped, which is the safe direction.
+CITATION_RE = re.compile(r"docs/(?:designs|architecture)/[A-Za-z0-9_./-]+?\.md(?![A-Za-z0-9_])")
+
 
 def tracked_paths() -> set[Path]:
     out = subprocess.run(
@@ -77,15 +106,23 @@ def tracked_paths() -> set[Path]:
     return {(REPO / p).resolve() for p in out if p and (REPO / p).is_file()}
 
 
-def tracked_markdown() -> list[Path]:
+def tracked_files(patterns: tuple[str, ...]) -> list[Path]:
     out = subprocess.run(
-        ["git", "ls-files", "-z", "*.md", "*.mdx"],
+        ["git", "ls-files", "-z", *patterns],
         cwd=REPO,
         capture_output=True,
         text=True,
         check=True,
     ).stdout.split("\0")
-    return [REPO / p for p in out if p and "node_modules" not in p and (REPO / p).is_file()]
+    return [REPO / p for p in out if p and VENDORED_DIR not in p and (REPO / p).is_file()]
+
+
+def tracked_markdown() -> list[Path]:
+    return tracked_files(MARKDOWN_GLOBS)
+
+
+def tracked_code() -> list[Path]:
+    return tracked_files(CODE_GLOBS)
 
 
 def strip_code_fences(text: str) -> list[tuple[int, str]]:
@@ -131,6 +168,24 @@ def check_file(path: Path, tracked: set[Path]) -> list[str]:
     return problems
 
 
+def check_code_file(path: Path, tracked: set[Path]) -> list[str]:
+    """Report every design-document path cited in a code file that is not tracked.
+
+    Citations are repository-root paths by convention, so nothing is resolved
+    relative to the citing file. Code fences and inline code are not stripped
+    here: in a comment, backticks are how a path is quoted, not a sign that it
+    is a specimen.
+    """
+    problems: list[str] = []
+    for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        for m in CITATION_RE.finditer(line):
+            cited = m.group(0)
+            if (REPO / cited).resolve() not in tracked:
+                rel = path.relative_to(REPO)
+                problems.append(f"{rel}:{lineno}: broken citation -> {cited}")
+    return problems
+
+
 def main() -> int:
     files = tracked_markdown()
     if not files:
@@ -142,13 +197,20 @@ def main() -> int:
     for f in files:
         problems.extend(check_file(f, tracked))
 
-    print(f"Checked relative links in {len(files)} Markdown files.")
+    code = tracked_code()
+    for f in code:
+        problems.extend(check_code_file(f, tracked))
+
+    print(
+        f"Checked relative links in {len(files)} Markdown files "
+        f"and design-doc citations in {len(code)} code files."
+    )
     if problems:
-        print(f"\n{len(problems)} broken link(s):\n", file=sys.stderr)
+        print(f"\n{len(problems)} broken link(s) or citation(s):\n", file=sys.stderr)
         for p in problems:
             print(f"    {p}", file=sys.stderr)
         return 1
-    print("All relative links resolve.")
+    print("All relative links and design-doc citations resolve.")
     return 0
 
 

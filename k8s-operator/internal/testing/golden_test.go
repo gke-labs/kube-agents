@@ -119,6 +119,20 @@ func TestAgentsGolden(t *testing.T) {
 			},
 		},
 		{
+			// The above-one-replica shape. This is the only fixture that
+			// renders the leader Role's pods get/patch rule, and it is here
+			// because that rule is the agent identity's one write grant --
+			// the shape a reviewer most needs to be able to read off a
+			// manifest, and the one every other fixture renders away.
+			name:         "PlatformAgentHighAvailability",
+			inputPath:    filepath.Join("testdata", "platform", "platformagent-ha.yaml"),
+			expectedPath: filepath.Join("testdata", "platform", "expected", "platformagent-ha.yaml"),
+			newAgent:     func() client.Object { return &agentv1alpha1.PlatformAgent{} },
+			newReconciler: func(c client.Client, s *runtime.Scheme) reconcile.Reconciler {
+				return &controller.PlatformAgentReconciler{Client: c, Scheme: s}
+			},
+		},
+		{
 			// The egress policy on. Diff this against
 			// platformagent-tagged.yaml and the whole of what
 			// spec.security.egressPolicy renders is one NetworkPolicy —

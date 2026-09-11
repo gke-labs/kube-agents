@@ -13,6 +13,7 @@ having read nothing.
 
 import os
 import pathlib
+import re
 import subprocess
 import tempfile
 import textwrap
@@ -26,6 +27,12 @@ _SCRIPT = _ROOT / "scripts" / "confirm_agent_image.sh"
 _READINESS_SCRIPT = _ROOT / "scripts" / "release" / "wait_for_gke_readiness.sh"
 
 _GATEWAY = "platform-agent-gateway"
+# upgrade.sh spells the gateway through installer_common.sh's constant, so the
+# gate is matched by the literal name or by the constant that holds it, the way
+# test_gateway_rollout_budgets.py's rollout_gate_pattern does.
+_GATEWAY_GATE = re.compile(
+    r'rollout status "?deployment/(?:platform-agent-gateway|\$\{PLATFORM_AGENT_DEPLOYMENT\})'
+)
 _TAG = "f1908801e545abffd967d3b8bf34d58833f5d945"
 _OLD = "a1456a4b0b5b60090b96bd70edb030a53873768d"
 
@@ -45,10 +52,11 @@ class DeployWorkflowWiringTest(unittest.TestCase):
     def test_the_confirmation_precedes_the_rollout_gate(self):
         # Ordering is not cosmetic; past the gate the job has already reported success.
         confirm = self.text.index(_SCRIPT.name)
-        gate = self.text.index(f"rollout status deployment/{_GATEWAY}")
+        gate = _GATEWAY_GATE.search(self.text)
+        self.assertIsNotNone(gate, f"could not find the rollout gate for {_GATEWAY}")
         self.assertLess(
             confirm,
-            gate,
+            gate.start(),
             "the tag confirmation must run before `kubectl rollout status`",
         )
 
@@ -95,8 +103,9 @@ class ReleaseReadinessDelegatesTest(unittest.TestCase):
 
     def test_the_confirmation_precedes_the_gateway_rollout_gate(self):
         confirm = self.text.index(_SCRIPT.name)
-        gate = self.text.index("rollout status deployment/platform-agent-gateway")
-        self.assertLess(confirm, gate)
+        gate = _GATEWAY_GATE.search(self.text)
+        self.assertIsNotNone(gate, f"could not find the rollout gate for {_GATEWAY}")
+        self.assertLess(confirm, gate.start())
 
 
 class _StubKubectl:

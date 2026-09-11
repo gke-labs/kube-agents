@@ -1,0 +1,109 @@
+# COMMENTED OUT — a commented-out entry in hack/ci-eval-pr.sh TASKS, which
+# registers it pending activation. The hold is the maintainer's call on #1343:
+# activate when #1254 is closed. #1254 is the open issue on the sibling probe,
+# upgrades-lagging-master-probe, where a delegated run's acknowledgement is
+# graded as the final answer on unrelated pull requests (the #1010 family that
+# docs/eval-gate-roster.md holds two other cases out on). The sibling is active
+# and bootstrap-admitted and rides that out on the all-three-repetitions
+# collapse rule; this case would enter unadmitted, so it could not red the job
+# on quality, but its report_contains objectives read the same final answer and
+# would grade the acknowledgement rather than the table. A case that cannot be
+# watched to both pass and fail stays `validated: false` and commented out.
+# Uncomment the TASKS line when #1254 is closed; nothing here changes.
+#
+# The Phase-1 case for the fleet-upgrade-verification skill (#1343): not "is
+# one cluster current" (upgrades-lagging-master-probe asks that) but "give me
+# the fleet's version table", which is what the skill's script prints. The
+# report is graded, not the tool path: an agent that reads the versions any
+# other way and produces the same table passes.
+#
+# Planted defect required: the seeded fleet's slot-b cluster held one minor
+# version behind the REGULAR channel default, enrolled in REGULAR, held between
+# reconciles by a NO_MINOR_UPGRADES maintenance exclusion (role version-laggard,
+# bench/tf/fleet/fixtures.json). The version NUMBERS are derived live on every
+# fleet apply and move with the channel, so nothing here asserts a version —
+# only that the table names the laggard and calls it behind.
+#
+# Isolation class: read-only (chat prompt; no audit helper, no GitOps-repo
+# write). Eligible tier: presubmit once #1254 is closed.
+#
+# No deterministic mutation safeguard, documented: the planted defect is the
+# control-plane version, a GKE-level facet rather than a Kubernetes object, and
+# the version-laggard role probes no objects, so a fleet_resource_property check
+# has nothing to ground on. The fleet's scheduled reconcile owns the defect's
+# integrity. Same documented residual as upgrades-lagging-master-probe.
+id: upgrades-fleet-version-table
+name: Fleet version table names the member behind its channel default
+prompt: >-
+  Give me the fleet version table for this project: every cluster's
+  control-plane version and lowest node-pool version against its release
+  channel's default, with the gap, and which clusters are lagging. Read the
+  versions; do not change or upgrade anything.
+expected_output: >-
+  A per-cluster table read during this run — cluster, location, channel,
+  control-plane version, lowest node-pool version, the channel-default target
+  it was measured against, gap in minors, status — in which seeded-b is marked
+  lagging, one minor behind its REGULAR channel default, citing both versions
+  as read. The other members are measured against the same baseline and are
+  not a minor behind it; they may be current, ahead, or a patch behind if a
+  new patch has reached the channel default since their last maintenance
+  window, and a patch gap is reported as such rather than as lagging. It
+  states which baseline each row used. It recommends (not performs) the
+  upgrade. It cites no CVE identifiers, because it has no vulnerability feed.
+  No mutation of any kind.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+# Named by ROLE, not cluster: bench/tf/fleet/fixtures.json;
+# docs/designs/bench-fleet-catalog.md is the rule.
+fixtures:
+  - version-laggard
+
+# report_contains: a chat prompt, so the table is the reply. Three objectives,
+# one for each thing the table must do: name the laggard, say it lags, invent
+# nothing. Split rather than one check so a red says which.
+verification_spec:
+  - name: the-table-names-the-lagging-member
+    role: objective
+    # assert, not converge: the transcript is immutable once the run ends.
+    mode: assert
+    check:
+      type: report_contains
+      # "seeded-b" is a rendering of slot b under the prefix's default, the same
+      # contract upgrades-lagging-master-probe carries: it survives the default
+      # prefix and breaks loudly if the prefix changes. The prompt does not say
+      # it; the table has to find it.
+      required_phrases: ["seeded-b"]
+  - name: the-table-says-it-lags
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # The finding, not a version number: the planted versions move with the
+      # channel. The same any_of spellings as upgrades-lagging-master-probe,
+      # chosen against substring collisions ("lag" in "flag", "older" in
+      # "folder"), plus the status word the skill's table prints.
+      any_of_phrases:
+        [
+          "behind",
+          "lagging",
+          "not current",
+          "out of date",
+          "outdated",
+          "one minor",
+          "newer version",
+        ]
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # No vulnerability feed; a CVE id in a version table is an invention.
+      forbidden_phrases: ["CVE-"]

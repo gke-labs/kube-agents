@@ -14,13 +14,15 @@
 #      matched on its shape rather than its prefix. Skip.
 #   2. There is something to release: commits exist between the newest GA tag
 #      and that candidate's commit. Skip.
-#   3. Nothing in the range is a breaking change. HALT.
+#   3. On stable GA (>= 1.0.0), nothing in the range is a breaking change. HALT.
 #
 # Conditions 1 and 2 are green skips: nothing is published, the run stays green,
-# and the next run asks again. Condition 3 is not, and the difference matters. A
-# breaking change does not clear itself — every following run takes the same
-# branch and GA releases stop until somebody publishes by hand — so it fails the
-# job. A skip means "nothing to do this week"; red means "something needs you".
+# and the next run asks again. Condition 3 is not, and the difference matters. On
+# stable GA (>= 1.0.0), a major breaking change does not clear itself — every
+# following run takes the same branch and GA releases stop until somebody publishes
+# by hand — so it fails the job with an error annotation. During pre-1.0 development
+# (0.y.z), breaking changes bump minor under SemVer 2.0 Clause 4 and release unattended.
+# A skip means "nothing to do this week"; red means "something needs you".
 #
 # Why this gate is worth having when the publishing path already skips a quiet
 # week on its own is `scripts/release/README.md`, "The weekly GA release". It is
@@ -190,25 +192,27 @@ if [ -z "${RELEASE_RANGE_SUBJECTS}" ]; then
   emit_and_exit
 fi
 
-# ── 3. Is any of it a breaking change? ───────────────────────────────────────
+# ── 3. Is any of it a major breaking change? ────────────────────────────────
 #
-# Spelled as "breaking" rather than "MAJOR" deliberately. calculate_next_version.sh
-# implements SemVer clause 4, so while the repository is on 0.y.z a breaking
-# change bumps MINOR and the MAJOR digit never moves — a guard written against
-# MAJOR would pass every breaking release straight through until 1.0.0.
+# Under SemVer 2.0 Clause 4, in 0.y.z initial development (MAJOR == 0), breaking
+# changes bump MINOR (0.4.0 -> 0.5.0) and are permitted for automated scheduled
+# releases. Once a 1.0.0 GA release has been cut (MAJOR != 0), any breaking change
+# triggers a true MAJOR version bump, which halts for human review and manual dispatch.
 #
 # The definition is common.sh's, shared with calculate_next_version.sh, because a
 # second copy here is how the bump and the halt come to disagree about what
 # "breaking" means — and the direction that fails silently is the gate waving one
-# through into an unattended release.
+# through into an unattended release on stable releases.
 #
 # Reached only with a GA tag in hand, which is what keeps this bounded. Against
 # all of history it would match some long-shipped `feat!:` and then never stop
 # matching it, since there is no range to shrink: one permanent halt, every run.
 if commit_messages_have_breaking_change "${RELEASE_RANGE_SUBJECTS}" "${RELEASE_RANGE_BODIES}"; then
-  HALTED_FOR_HUMAN="true"
-  SKIP_REASON="A breaking change is waiting to ship. Releases carrying one are published by a human: run release-publish.yml manually against ${RELEASE_COMMIT:0:7}."
-  emit_and_exit
+  if ! ga_tag_is_initial_development "${LATEST_GA_TAG}"; then
+    HALTED_FOR_HUMAN="true"
+    SKIP_REASON="A major breaking change is waiting to ship on stable GA (${LATEST_GA_TAG}). Major releases are published by a human: run release-publish.yml manually against ${RELEASE_COMMIT:0:7}."
+    emit_and_exit
+  fi
 fi
 
 SHOULD_RELEASE="true"

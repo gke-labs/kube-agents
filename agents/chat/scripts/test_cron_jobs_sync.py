@@ -156,6 +156,16 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual([j["id"] for j in merged], ["from-image", "hand-written"])
         self.assertEqual(summary["refreshed"], [])
 
+    def test_unannotated_operator_added_job_is_backfilled_with_low_risk(self):
+        """A custom runtime job lacking risk is backfilled to low risk."""
+        unannotated = {"id": "hand-written", "schedule": {"kind": "cron", "expr": "* * * * *"}}
+        merged, _, summary = cron_jobs_sync.reconcile(
+            [job("from-image")], [unannotated], set()
+        )
+        self.assertEqual([j["id"] for j in merged], ["from-image", "hand-written"])
+        self.assertEqual(merged[1]["risk"], "low")
+        self.assertNotIn("risk", unannotated, "input dict must stay unmodified")
+
     def test_identical_input_reports_no_change(self):
         """An unchanged image must not rewrite the file — that would churn the PVC
         on every restart and make a real change impossible to spot in a diff."""

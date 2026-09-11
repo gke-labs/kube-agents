@@ -13,7 +13,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
   - `contributor/`: The contributor-agent protocol: the claim/PR/review/escalation loop for external bots (e.g. Kyber, Codebot Robot) coordinating over GitHub alone. Not a runtime blueprint; not shipped in the images.
 - `.agents/skills/`: Repository-level skills, not shipped in the agent images — review skills (adversarial change review, security audits, docs-drift, skill quality) run against pull requests and clusters, with `review-preflight` running the pre-PR set of them in a context that did not write the change, plus the `install-kube-agents`/`uninstall-kube-agents`/`upgrade-kube-agents` lifecycle skills that drive the repository's installer scripts.
 - `.agents/rules/`: Repository-level rules an agent follows, one file per family and none shipped in the agent images — `core_engineering.md` for the code itself, `github_actions.md` for workflow authoring, `pre_pr_review.md` for the mechanics of the two pre-PR passes. This file states each rule and links there for the form it takes; the split keeps `AGENTS.md` inside the context budget `scripts/check_context_budget.py` enforces.
-- `a2a/`: Go module for the agent-to-agent bus — wire-protocol library and `a2a` topics CLI per `docs/designs/spec-a2a-payloads.md`, plus agent profiles. Nothing imports it yet.
+- `a2a/`: Go module for the agent-to-agent bus — wire-protocol library and `a2a` topics CLI per `docs/designs/spec-a2a-payloads.md`, plus agent profiles and persona.
 - `charts/`: Canonical Helm charts (`kube-agents`) for deploying the Kube-Agents operator and profiles.
 - `terraform/`: Companion reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `chat-pubsub`, `github-minter`, `gke-backup-plan`, `drift-pubsub`) for infrastructure provisioning, plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top. `drift-pubsub` is not yet part of that composition.
 - `deploy/`: Deployment infrastructure code (Dockerfile, Kustomize bases, shared runtime assets).
@@ -199,8 +199,8 @@ Rules:
   `docs/credential-isolation-design.md`.
 - **Do not document pull-request status.** Docs describe the current state of `main`; a merged PR
   leaves that prose silently stale.
-- **Verify identifiers against source, not against other docs.** Service account names live in
-  `scripts/installer/common.sh`, the Go version in `k8s-operator/go.mod`.
+- **Verify identifiers against source, not against other docs.** GCP service account names live
+  in `install.defaults.env`, the Go version in `k8s-operator/go.mod`.
 - **Add a document to the map (`docs/README.md`) with one line, and change nothing else there.**
   Write the row in the compact `| cell | cell |` form and never re-align a table: the map is edited
   from several branches every week, and a re-aligned table rewrites rows your PR did not author.

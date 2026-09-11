@@ -73,7 +73,7 @@ Three properties are load-bearing, and each has a test:
   resolver that cannot run is not, and reaches the room as a `⚠️` line naming the reason code.
   Flattening the two would make a broken watcher indistinguishable from a quiet repository — the
   same distinction `test_resolver.py` protects one layer down, and the same reason the job is
-  `deliver: "all"` rather than `"local"`.
+  `deliver: "chat"` rather than `"local"`.
 - **A raising sweep does not stop its sibling.** Two separate jobs gave that isolation for free;
   consolidating buys it back with a `try` per sweep.
 
@@ -661,7 +661,7 @@ The mechanism is already shipped, which is the point:
 
 - The age is free. `Comment.created_at` is in the payload the sweep already fetches, and
   `pr_triggers.handled_node_ids` already computes whether a trigger is unanswered.
-- The channel is free. `github-repo-watcher` is `deliver: "all"` so that a sweep which cannot run is
+- The channel is free. `github-repo-watcher` is `deliver: "chat"` so that a sweep which cannot run is
   audible (§2); an escalation is the same class of message and rides the same stdout.
 - There is no new state, no table, no route, and nothing for `submit_suggestion.py` to register.
 

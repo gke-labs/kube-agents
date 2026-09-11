@@ -48,6 +48,15 @@ var SensitiveEnvVars = map[string]struct{}{
 	// spec.deployment.env[i].name.
 	"CREDENTIAL_PROXY_ENFORCE_READ_ONLY": {},
 	"HERMES_HOME":                        {},
+	// The A2A bus wiring the operator renders under `mode: next`. NATS_PASSWORD
+	// arrives by SecretKeyRef, so the credential is in the container no matter
+	// what the address says: a CR-set NATS_URL would send the worker password
+	// to an address of the setter's choosing, in the CONNECT frame, in the
+	// clear. NATS_USER is here for the same reason at one remove — picking the
+	// identity picks which grants the connection gets.
+	"NATS_URL":      {},
+	"NATS_USER":     {},
+	"NATS_PASSWORD": {},
 }
 
 type HermesSpec struct {
@@ -290,10 +299,12 @@ type TuningSpec struct {
 	// The cap is bought at a real price, so raise it deliberately rather than leaving it
 	// alone by default. A slot is held for a worker's entire run, so capping serialises
 	// minutes of model work: measured against real fan-outs on a live cluster, capping at
-	// 2 roughly doubled the time for a batch to finish. Do NOT reach for a lower value as
-	// a latency fix — an uncapped fan-out does spawn every sandboxed worker at once and
-	// they contend during startup, but a cap trades minutes of model work for seconds of
-	// boot. What the workers contend for is not established either — CPU limit, memory
+	// 2 roughly doubled the time for a batch to finish. One exception: a worker that is
+	// only waiting on cards it fanned out does not hold a slot, or it would block the very
+	// children it is waiting for. Do NOT reach for a lower value as a latency fix — an
+	// uncapped fan-out does spawn every sandboxed worker at once and they contend during
+	// startup, but a cap trades minutes of model work for seconds of boot. What the
+	// workers contend for is not established either — CPU limit, memory
 	// ceiling and gVisor I/O all fit the evidence, and gVisor hides the cgroup throttle
 	// counters that would settle it — so raising resources is not a guaranteed fix;
 	// measure it.
@@ -1193,6 +1204,10 @@ type AgentStatus struct {
 	// Phase is the overall state (Pending, Provisioning, Ready, Failed).
 	// +optional
 	Phase string `json:"phase,omitempty"`
+
+	// ObservedGeneration is the .metadata.generation the status was last computed from.
+	// +optional
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
 	// Address is the fully qualified domain name (FQDN) of the agent service.
 	// +optional

@@ -38,10 +38,11 @@ Only if the PEM is gone does the move cost a credential: GitHub does not re-issu
 This is the module the full-install composition (and therefore `install.sh`, when the
 GitHub integration is configured) uses for the minter's GCP half; the chart's
 `githubMinter.*` values render the Kubernetes half, and the PEM import above completes
-the pair. The canonical identifiers (GSA `kubeagents-github-minter-gsa`, KSA
-`kubeagents-github-minter`, namespace `kubeagents-system`) also appear in
-`scripts/installer/common.sh` for the dev tooling, and the module's defaults mirror
-them.
+the pair. The canonical identifiers also live with the installer, and the module's
+defaults mirror them: the GSA `kubeagents-github-minter-gsa` and the namespace
+`kubeagents-system` as defaults in `install.defaults.env` (an install overrides them
+through `install.env`), the KSA `kubeagents-github-minter` as a constant in
+`scripts/installer/common.sh` for the dev tooling.
 
 ## Usage
 

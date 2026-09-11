@@ -90,6 +90,23 @@ WORKDIR /workspace/k8s-operator
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
     go build -ldflags="-w -s" -o /workspace/k8s-event-watcher ./cmd/k8s-event-watcher/
 
+# The a2a CLI — the topics reader/writer for the A2A bus (mode: next). Same
+# pattern as the event watcher above. The binary ships UNGATED at
+# /usr/local/bin: it is inert until something invokes it, and the thing that
+# invokes it — the a2a-topics skill — is what ships dark (see the
+# /opt/a2a-template COPY below and docker-entrypoint.sh step 2.6a-bis).
+FROM --platform=$BUILDPLATFORM ${GOLANG_IMAGE}:${GOLANG_VERSION} AS a2a-builder
+# Repeated for the same reason as watcher-builder above: a substituted
+# GOLANG_IMAGE must not reintroduce GOTOOLCHAIN=auto (#1138).
+ENV GOTOOLCHAIN=local
+ARG TARGETOS
+ARG TARGETARCH
+WORKDIR /workspace
+COPY a2a/ /workspace/a2a/
+WORKDIR /workspace/a2a
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} \
+    go build -ldflags="-w -s" -o /workspace/bin/a2a ./cmd/a2a/
+
 FROM ${HERMES_AGENT_IMAGE}:${HERMES_AGENT_TAG} AS agent-base
 
 USER root
@@ -224,10 +241,11 @@ COPY deploy/docker/patches/patchlib.py \
 # v2026.8.13 wrapped it onto three lines. The applier locates it by AST.
 RUN /opt/hermes/.venv/bin/python3 /tmp/apply_cron_run_scope.py /opt/hermes && \
     grep -qF ", outcome=None" /opt/hermes/cron/scheduler.py && \
-    grep -q "with cron_run_scope(job_id):" /opt/hermes/tools/cronjob_tools.py && \
+    grep -q 'with cron_run_scope(job_id, risk=' /opt/hermes/tools/cronjob_tools.py && \
     grep -qF "extra_prompt=extra_prompt, outcome=outcome," /opt/hermes/tools/cronjob_tools.py && \
     grep -q "cron_ownership_violation(tid)" /opt/hermes/tools/kanban_tools.py && \
     grep -q 'outcome\["output_file"\] = str(output_file)' /opt/hermes/cron/scheduler.py && \
+    grep -q 'job\["risk"\] = _eff_risk' /opt/hermes/cron/jobs.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 -c "\
 from gateway.kanban_handoff_clip import clip_handoff; \
 from tools.cron_run_scope import clip_cron_response, cron_run_scope; \
@@ -345,6 +363,21 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/apply_cron_tirith_scan.p
     grep -q "describe=_format_tirith_description" /opt/hermes/tools/approval.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/cron-tirith-scan/verify_cron_tirith_scan.py && \
     rm -rf /tmp/cron-tirith-scan
+
+# Security: cron risk gate, execute_code refuse, and content checks (THREAT-002).
+# Must run after cron_tirith_scan: anchors into tools/approval.py at the point
+# introduced by apply_cron_tirith_scan.py.
+COPY --chmod=0644 agents/platform/scripts/command_policy.py /opt/hermes/tools/command_policy.py
+COPY --chmod=0644 deploy/docker/patches/cron_risk_gate.py /opt/hermes/tools/cron_risk_gate.py
+COPY deploy/docker/patches/apply_cron_risk_gate.py \
+     deploy/docker/patches/verify_cron_risk_gate.py \
+     deploy/docker/patches/patchlib.py \
+     /tmp/cron-risk-gate/
+RUN /opt/hermes/.venv/bin/python3 /tmp/cron-risk-gate/apply_cron_risk_gate.py /opt/hermes && \
+    grep -q "from tools.cron_risk_gate import" /opt/hermes/tools/approval.py && \
+    grep -q "cron_execute_code_block" /opt/hermes/tools/approval.py && \
+    cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/cron-risk-gate/verify_cron_risk_gate.py && \
+    rm -rf /tmp/cron-risk-gate
 
 # Cron delivery: `deliver: "chat"` hands a job's finished report to the Chat
 # Agent instead of posting it, so the finding lands in a thread that can answer
@@ -843,7 +876,17 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_report_format.
 #     raise `kanban.failure_limit` above 2 and systemic trips become revertible
 #     again, above 3 and protocol trips follow.
 #
-# All three are emergent scheduling behaviour rather than a bad string, so the
+#   * A coordinator waiting on the work it fanned out is still `running`, so it
+#     holds a `max_in_progress` slot its own children need, and two waiters
+#     wedge the shipped cap of 2. Neither exit from `running` is open to it:
+#     `kanban_complete` is refused by the children-settled guard and SOUL.md
+#     forbids the dependency block. The patch discounts those cards inside
+#     `count_running_tasks`, using the same settled test the guard uses so the
+#     two never disagree. It reads a table a later build stage writes, so the
+#     read fails open and the applier reconciles both names at import time
+#     (issue #1252).
+#
+# All four are emergent scheduling behaviour rather than a bad string, so the
 # anchors alone prove nothing: verify_kanban_scheduling.py replays every
 # incident against a real board through the patched engine, and -- the part that
 # actually earns its runtime -- asserts that `assign_task`, `unblock_task`,
@@ -860,14 +903,20 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-result/apply_kanban_report_format.
 # shorter text would have matched neither shape reliably.
 #
 # Must stay ahead of the kanban_wake_nudge block below, which anchors on
-# `create_task`, `complete_task` and `unblock_task` in the same file. The six
+# `create_task`, `complete_task` and `unblock_task` in the same file. The seven
 # anchors here touch none of those three, and test_kanban_scheduling.py asserts
 # that rather than leaving it to a reader.
 # See the module docstring in deploy/docker/patches/kanban_scheduling.py and the
 # applier docstring in deploy/docker/patches/apply_kanban_scheduling.py.
 COPY --chmod=0644 deploy/docker/patches/kanban_scheduling.py /opt/hermes/hermes_cli/kanban_scheduling.py
+# kanban_scheduling.py and kanban_children_settled.py are here as the applier's
+# import-time cross-check reads them, not to be installed from here. The former
+# lands in hermes_cli/ via the COPY above; the latter is installed by the
+# kanban-children-settled stage further down and is only read here.
 COPY deploy/docker/patches/apply_kanban_scheduling.py \
      deploy/docker/patches/verify_kanban_scheduling.py \
+     deploy/docker/patches/kanban_scheduling.py \
+     deploy/docker/patches/kanban_children_settled.py \
      deploy/docker/patches/patchlib.py \
      /tmp/kanban-scheduling/
 RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling.py /opt/hermes && \
@@ -876,6 +925,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling
     grep -q "_kanban_claim_is_self(lock, _kanban_claimer)" /opt/hermes/hermes_cli/kanban_db.py && \
     grep -q "conn, _kanban_reclaimed.chargeable, _record_task_failure" /opt/hermes/hermes_cli/kanban_db.py && \
     grep -q "persisted_failures = max(failures, effective_limit)" /opt/hermes/hermes_cli/kanban_db.py && \
+    grep -q "return max(0, running - _kanban_count_waiting_on_children(conn))" /opt/hermes/hermes_cli/kanban_db.py && \
     test "$(grep -c 'lock.startswith(host_prefix)' /opt/hermes/hermes_cli/kanban_db.py)" = "2" && \
     test "$(grep -c '(persisted_failures, error\[:500\], task_id),' /opt/hermes/hermes_cli/kanban_db.py)" = "2" && \
     test "$(grep -c '(failures, error\[:500\], task_id),' /opt/hermes/hermes_cli/kanban_db.py)" = "1" && \
@@ -1261,6 +1311,9 @@ COPY --chmod=0755 deploy/shared/docker-entrypoint.sh /usr/local/bin/agent-entryp
 # Copy event-watcher binary from builder stage
 COPY --from=watcher-builder --chmod=0755 /workspace/k8s-event-watcher /usr/local/bin/k8s-event-watcher
 
+# The a2a CLI, ungated (see the a2a-builder stage for why that is safe).
+COPY --from=a2a-builder --chmod=0755 /workspace/bin/a2a /usr/local/bin/a2a
+
 # 6. Expose ports shared by all agent gateways
 EXPOSE 8642
 EXPOSE 9119
@@ -1365,6 +1418,17 @@ COPY --chown=hermes:hermes agents/platform/SOUL.md \
      agents/platform/CAPABILITIES.md \
      /opt/platform-template/
 COPY --chown=hermes:hermes agents/platform/skills/ /opt/platform-template/skills/
+
+# --- A2A persona content, deliberately OUTSIDE /opt/platform-template ---
+# A skill in the template appears in the agent's skill list on every install,
+# including the ones where the bus does not exist — which breaks the mode
+# switch's promise that a normal install cannot tell this feature exists
+# (a2a/persona/README.md). It lands here instead, and docker-entrypoint.sh
+# step 2.6a-bis overlays it into the platform profile only when
+# runtime_mode.is_next(). Step 2.6a's replace-from-image is also why the PVC
+# is not a place a skill can live: this template is the only route.
+COPY --chown=hermes:hermes a2a/persona/platform/skills/ /opt/a2a-template/skills/
+
 COPY --chown=hermes:hermes agents/platform/cron/ /opt/platform-template/cron/
 COPY --chown=hermes:hermes agents/platform/governance/ /opt/platform-template/governance/
 # The specialist's Hindsight connection file. Profile-scoped: a kanban worker
@@ -1629,7 +1693,7 @@ COPY agents/platform/plugins/ agents/chat/plugins/ /tmp/repo-plugins/
 # account for.
 RUN set -eu; \
     chown -R hermes:hermes /opt/defaults; \
-    for d in /opt/defaults /opt/hermes/skills /opt/cluster-template /opt/platform-template /opt/chat-template /tmp/repo-plugins; do \
+    for d in /opt/defaults /opt/hermes/skills /opt/cluster-template /opt/platform-template /opt/chat-template /opt/a2a-template /tmp/repo-plugins; do \
         find "$d" -type d -exec chmod 755 {} + ; \
         find "$d" -type f -exec chmod 644 {} + ; \
     done; \
@@ -1641,7 +1705,7 @@ RUN set -eu; \
     rm -rf /tmp/repo-plugins; \
     /opt/hermes/.venv/bin/python3 -m compileall -q /opt/hermes \
       || echo "WARN: some modules under /opt/hermes did not precompile; they will compile at import, as they do without this step" >&2; \
-    for d in /opt/hermes/skills /opt/platform-template/skills /opt/cluster-template/skills; do \
+    for d in /opt/hermes/skills /opt/platform-template/skills /opt/cluster-template/skills /opt/a2a-template/skills; do \
         [ -d "$d" ] \
             || { echo "$d does not exist at manifest generation; the boot check refuses to start a pod whose skill tree has no manifest inside it, so shipping this image would crash-loop the fleet" >&2; exit 1; }; \
         [ -z "$(find "$d" -type l -print -quit)" ] \
@@ -1653,7 +1717,7 @@ RUN set -eu; \
             || { echo "manifest for $d has $(wc -l < "$d/skills_manifest.sha256") entries, expected $n" >&2; exit 1; }; \
         chmod 644 "$d/skills_manifest.sha256"; \
     done; \
-    chown -R root:root /opt/hermes/skills /opt/platform-template /opt/cluster-template /opt/chat-template /opt/defaults/scripts
+    chown -R root:root /opt/hermes/skills /opt/platform-template /opt/cluster-template /opt/chat-template /opt/a2a-template /opt/defaults/scripts
 
 # Guard: nothing that carries a cluster credential may come back into this image.
 #

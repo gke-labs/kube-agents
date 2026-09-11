@@ -20,7 +20,7 @@ variable "cluster_mode" {
 }
 
 variable "create_cluster" {
-  description = "Whether to create the cluster. Set false to install onto an existing cluster: the gke-cluster module then only reads it, creates no KMS resources, and enabling CMEK on it stays a gcloud step outside Terraform. The existing cluster must already have Workload Identity enabled."
+  description = "Whether to create the cluster. Set false to install onto an existing cluster: the gke-cluster module then only reads it, creates no KMS resources, and enabling CMEK on it stays a gcloud step outside Terraform. The existing cluster must already have Workload Identity enabled and enforce NetworkPolicy (Dataplane V2 or the legacy Calico addon); the module refuses the plan otherwise."
   type        = bool
   default     = true
 }
@@ -149,9 +149,21 @@ variable "scoped_clusters" {
 }
 
 variable "agent_service_account_id" {
-  description = "IAM service account ID for the agent's GSA. The module default (kubeagents-platform-gsa) is one fixed name per project, so a second install in the same project must set its own — the collision otherwise surfaces as alreadyExists halfway through the second install's first apply. Null selects the module default. Two limits before relying on it: the vertex_ai and github-minter paths create their own fixed-name GSAs this variable does not reach (the minter's authorization rule does track it — the composition passes the resulting email as githubMinter.allowedServiceAccount), and the Workload Identity binding is keyed on namespace/KSA rather than on a cluster, so installs sharing the agent namespace can each mint the other's tokens — a distinct name un-collides creation, not identity."
+  description = "IAM service account ID for the agent's GSA. The module default (kubeagents-platform-gsa) is one fixed name per project, so a second install in the same project must set its own — the collision otherwise surfaces as alreadyExists halfway through the second install's first apply. Null selects the module default. Two limits before relying on it: the vertex_ai and github-minter paths create their own fixed-name GSAs, named by litellm_service_account_id and github_minter_service_account_id rather than by this variable (the minter's authorization rule does track this one — the composition passes the resulting email as githubMinter.allowedServiceAccount), and the Workload Identity binding is keyed on namespace/KSA rather than on a cluster, so installs sharing the agent namespace can each mint the other's tokens — a distinct name un-collides creation, not identity."
   type        = string
   default     = null
+}
+
+variable "github_minter_service_account_id" {
+  description = "IAM service account ID for the GitHub token minter's GSA. Null selects the module default (kubeagents-github-minter-gsa), which is one fixed name per project like agent_service_account_id, and a second install in the same project that enables the minter must set its own for the same reason."
+  type        = string
+  default     = null
+}
+
+variable "litellm_service_account_id" {
+  description = "IAM service account ID for the LiteLLM gateway's Vertex AI GSA (model_provider = vertex_ai only). One fixed name per project, so a second Vertex install in the same project must set its own. A real default rather than null: the module it reaches (kube-agents-iam) defaults to the AGENT's name, which a null would select."
+  type        = string
+  default     = "kubeagents-litellm-gsa"
 }
 
 variable "image_tag" {

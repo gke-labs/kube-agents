@@ -273,10 +273,10 @@ class ResolveScheduledReleaseTest(unittest.TestCase):
         finally:
             temp_dir.cleanup()
 
-    # ── Condition 3: a breaking change halts, and halting is red ─────────────
+    # ── Condition 3: a major breaking change halts, and halting is red ──────
 
-    def test_breaking_change_in_the_subject_halts_and_fails_the_job(self):
-        temp_dir, repo_dir, _, _ = self._repo(new_commit_msg=MOCK_COMMIT_MSG_BREAKING_PRE_1_0)
+    def test_breaking_change_in_the_subject_halts_and_fails_the_job_on_major_version(self):
+        temp_dir, repo_dir, _, _ = self._repo(ga_tag="1.0.0", new_commit_msg=MOCK_COMMIT_MSG_BREAKING_PRE_1_0)
         try:
             proc, outputs, summary = self._run(repo_dir)
             self.assertNotEqual(proc.returncode, 0, "a halt has to fail the job, not skip green")
@@ -288,13 +288,24 @@ class ResolveScheduledReleaseTest(unittest.TestCase):
         finally:
             temp_dir.cleanup()
 
-    def test_breaking_change_in_the_body_halts_and_fails_the_job(self):
-        temp_dir, repo_dir, _, _ = self._repo(new_commit_msg=MOCK_COMMIT_MSG_BREAKING_BODY)
+    def test_breaking_change_in_the_body_halts_and_fails_the_job_on_major_version(self):
+        temp_dir, repo_dir, _, _ = self._repo(ga_tag="1.0.0", new_commit_msg=MOCK_COMMIT_MSG_BREAKING_BODY)
         try:
             proc, outputs, _ = self._run(repo_dir)
             self.assertNotEqual(proc.returncode, 0, "a halt has to fail the job, not skip green")
             self.assertEqual(outputs["should_release"], "false")
             self.assertIn("breaking change", outputs["skip_reason"].lower())
+        finally:
+            temp_dir.cleanup()
+
+    def test_breaking_change_pre_1_0_does_not_halt_and_permits_release(self):
+        """Under SemVer Clause 4, breaking changes in 0.x bump minor and release unattended."""
+        temp_dir, repo_dir, _, head = self._repo(ga_tag="0.4.0", new_commit_msg=MOCK_COMMIT_MSG_BREAKING_PRE_1_0)
+        try:
+            proc, outputs, _ = self._run(repo_dir)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(outputs["should_release"], "true")
+            self.assertEqual(outputs["release_commit"], head)
         finally:
             temp_dir.cleanup()
 
@@ -310,7 +321,7 @@ class ResolveScheduledReleaseTest(unittest.TestCase):
             (pathlib.Path(repo_dir) / "breaking.txt").write_text("breaking\n")
             git("add", "breaking.txt")
             git("commit", "-m", MOCK_COMMIT_MSG_BREAKING_PRE_1_0)
-            git("tag", "-a", _GA_TAG, "-m", f"release {_GA_TAG}")
+            git("tag", "-a", "1.0.0", "-m", "release 1.0.0")
 
             (pathlib.Path(repo_dir) / "after.txt").write_text("after\n")
             git("add", "after.txt")
@@ -326,13 +337,8 @@ class ResolveScheduledReleaseTest(unittest.TestCase):
             temp_dir.cleanup()
 
     def test_the_halt_uses_the_same_breaking_definition_as_the_version_calculator(self):
-        """A scoped `fix(x)!:` is breaking too, and 0.y.z hides it from MAJOR.
-
-        calculate_next_version.sh bumps MINOR for this on 0.y.z, so a guard
-        written against the MAJOR digit would wave it straight through. The
-        resolver has to catch it.
-        """
-        temp_dir, repo_dir, _, _ = self._repo(new_commit_msg="fix(operator)!: drop the v1alpha1 field")
+        """A scoped `fix(x)!:` is breaking too, and halts when MAJOR >= 1."""
+        temp_dir, repo_dir, _, _ = self._repo(ga_tag="1.0.0", new_commit_msg="fix(operator)!: drop the v1alpha1 field")
         try:
             proc, outputs, _ = self._run(repo_dir)
             self.assertNotEqual(proc.returncode, 0, proc.stdout)

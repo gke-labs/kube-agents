@@ -9,12 +9,17 @@ that ships rather than a copy (the approach of tests/test_ci_teardown_sweep.py).
 """
 
 import pathlib
-import re
 import subprocess
+import sys
 import tempfile
 import unittest
 
-_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+_HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE))
+
+from _lift_shell import lift_function  # noqa: E402
+
+_REPO_ROOT = _HERE.parent
 _SCRIPT = _REPO_ROOT / "hack" / "check-image-inventory.sh"
 
 # The three functions the check needs, each lifted by name. A rename fails
@@ -26,6 +31,7 @@ _LIFTED_FUNCTIONS = ("fail", "arg_default", "check_go_directive")
 _CALL_SITES = (
     "check_go_directive deploy/docker/Dockerfile GOLANG_VERSION",
     "check_go_directive k8s-operator/Dockerfile GOLANG_VERSION",
+    "check_go_directive a2a/Dockerfile.gateway GOLANG_VERSION a2a/go.mod",
 )
 
 # What the check requires of the builder stage besides the ARG default, and
@@ -58,20 +64,13 @@ _CASES = (
 )
 
 
-def _lift(name: str, text: str) -> str:
-    match = re.search(rf"^{re.escape(name)}\(\) \{{\n.*?^\}}\n", text, re.S | re.M)
-    if match is None:
-        raise AssertionError(f"{_SCRIPT} no longer defines {name}()")
-    return match.group(0)
-
-
 def _dockerfile(tag: str) -> str:
     return f"ARG GOLANG_VERSION={tag}\n{_BUILDER_FROM}\n{_TOOLCHAIN_PIN}\nFROM scratch\n"
 
 
 def _run_check(go_mod: str, dockerfile: str) -> subprocess.CompletedProcess:
     text = _SCRIPT.read_text()
-    functions = "".join(_lift(name, text) for name in _LIFTED_FUNCTIONS)
+    functions = "".join(lift_function(name, text, _SCRIPT) for name in _LIFTED_FUNCTIONS)
     with tempfile.TemporaryDirectory() as tmp:
         root = pathlib.Path(tmp)
         (root / "go.mod").write_text(go_mod)
@@ -152,10 +151,30 @@ class CheckGoDirectiveTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_script_calls_the_check_for_both_dockerfiles(self):
+    def test_script_calls_the_check_for_dockerfiles(self):
         text = _SCRIPT.read_text()
         for call in _CALL_SITES:
             self.assertIn(call, text)
+
+    def test_custom_go_mod_path_respected(self):
+        text = _SCRIPT.read_text()
+        functions = "".join(lift_function(name, text, _SCRIPT) for name in _LIFTED_FUNCTIONS)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            (root / "custom.mod").write_text("module example.com/y\n\ngo 1.27.0\n")
+            (root / "go.mod").write_text("module example.com/x\n\ngo 1.28.0\n")
+            (root / "Dockerfile").write_text(_dockerfile("1.27-alpine"))
+            script = (
+                "set -u\nstatus=0\nGO_MOD=go.mod\nGOLANG_IMAGE_ARG=GOLANG_IMAGE\n"
+                f"GOTOOLCHAIN_PIN='{_TOOLCHAIN_PIN}'\n"
+                + functions
+                + "check_go_directive Dockerfile GOLANG_VERSION custom.mod\nexit $status\n"
+            )
+            result = subprocess.run(
+                ["bash", "-c", script], cwd=root, capture_output=True, text=True, check=False
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "")
 
 
 if __name__ == "__main__":

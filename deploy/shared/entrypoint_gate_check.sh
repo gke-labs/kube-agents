@@ -33,9 +33,14 @@
 #     that rather than asserting it.
 #
 # The environment is cleared with `env -u` per case rather than assumed empty for the same
-# family of reasons: under the operator AGENT_SHARED_STATE_SETUP is already set in the
-# container, and inheriting it would silently test something other than what is named.
+# family of reasons: under the operator AGENT_SHARED_STATE_SETUP and OTEL_SDK_DISABLED
+# (on None clusters) are already set in the container (and HERMES_OTEL_ENABLED may be
+# configured in spec.deployment.env), and inheriting them would silently test something
+# other than what is named.
 set -eu
+
+# Container-inherited telemetry flags that must not leak across cases.
+unset OTEL_SDK_DISABLED HERMES_OTEL_ENABLED OTEL_EXPORTER_OTLP_ENDPOINT OTEL_SERVICE_NAME
 
 ENTRYPOINT="${ENTRYPOINT:-/usr/local/bin/agent-entrypoint}"
 SCRATCH_PREFIX=/tmp/gate-
@@ -103,12 +108,24 @@ run_entrypoint() {
     err=$4
     shift 4
 
+    otel_sdk_override=""
+    if [ -n "${OTEL_SDK_DISABLED:-}" ]; then
+        otel_sdk_override="OTEL_SDK_DISABLED=$OTEL_SDK_DISABLED"
+    fi
+    hermes_otel_override=""
+    if [ -n "${HERMES_OTEL_ENABLED:-}" ]; then
+        hermes_otel_override="HERMES_OTEL_ENABLED=$HERMES_OTEL_ENABLED"
+    fi
+
     if [ -n "$envval" ]; then
-        env -u AGENT_SHARED_STATE_SETUP AGENT_SHARED_STATE_SETUP="$envval" \
+        env -u AGENT_SHARED_STATE_SETUP -u HERMES_OTEL_ENABLED -u OTEL_SDK_DISABLED \
+            AGENT_SHARED_STATE_SETUP="$envval" \
+            $otel_sdk_override $hermes_otel_override \
             PLATFORM_AGENT_HOME="$scratch" HOME="$scratch/home" \
             "$ENTRYPOINT" "$@" >"$out" 2>"$err" || true
     else
-        env -u AGENT_SHARED_STATE_SETUP \
+        env -u AGENT_SHARED_STATE_SETUP -u HERMES_OTEL_ENABLED -u OTEL_SDK_DISABLED \
+            $otel_sdk_override $hermes_otel_override \
             PLATFORM_AGENT_HOME="$scratch" HOME="$scratch/home" \
             "$ENTRYPOINT" "$@" >"$out" 2>"$err" || true
     fi
@@ -287,6 +304,55 @@ if [ -n "$otel_missed" ]; then
     failures=$((failures + 1))
 else
     printf 'ok    %-44s %s\n' "otel endpoint reaches root + platform profile" "$sentinel"
+fi
+rm -rf "$home" "$home.out" "$home.err"
+
+# Step 4's disabled sweep. When OTEL_SDK_DISABLED=true or HERMES_OTEL_ENABLED=false,
+# hermes_otel must be disabled (enabled: false) and backends emptied.
+checks=$((checks + 1))
+home=$(mktemp -d "${SCRATCH_PREFIX}otel_dis.XXXXXX")
+OTEL_SDK_DISABLED=true
+export OTEL_SDK_DISABLED
+run_entrypoint "$home" owner "$home.out" "$home.err" /bin/echo hermes gateway run
+unset OTEL_SDK_DISABLED
+
+otel_dis_missed=""
+for cfg in "$home/plugins/hermes_otel/config.yaml" "$home/profiles/platform/plugins/hermes_otel/config.yaml"; do
+    [ -f "$cfg" ] || { otel_dis_missed="$otel_dis_missed $cfg(absent)"; continue; }
+    grep -q "enabled: false" "$cfg" || otel_dis_missed="$otel_dis_missed $cfg(not-disabled)"
+    grep -q "backends: \[\]" "$cfg" || otel_dis_missed="$otel_dis_missed $cfg(backends-not-empty)"
+done
+if [ -n "$otel_dis_missed" ]; then
+    echo "FAIL  step 4 did not disable hermes_otel configs:$otel_dis_missed"
+    failures=$((failures + 1))
+else
+    printf 'ok    %-44s %s\n' "otel disabled disables root + platform profile" "enabled=false, backends=[]"
+fi
+rm -rf "$home" "$home.out" "$home.err"
+
+# Step 4's force-override sweep. When OTEL_SDK_DISABLED=true (e.g. None cluster) but
+# HERMES_OTEL_ENABLED=true is configured, hermes_otel must not be disabled and must keep
+# the baked fallback endpoint.
+checks=$((checks + 1))
+home=$(mktemp -d "${SCRATCH_PREFIX}otel_forced.XXXXXX")
+OTEL_SDK_DISABLED=true
+HERMES_OTEL_ENABLED=true
+export OTEL_SDK_DISABLED HERMES_OTEL_ENABLED
+run_entrypoint "$home" owner "$home.out" "$home.err" /bin/echo hermes gateway run
+unset OTEL_SDK_DISABLED HERMES_OTEL_ENABLED
+
+otel_forced_missed=""
+for cfg in "$home/plugins/hermes_otel/config.yaml" "$home/profiles/platform/plugins/hermes_otel/config.yaml"; do
+    [ -f "$cfg" ] || { otel_forced_missed="$otel_forced_missed $cfg(absent)"; continue; }
+    grep -q "enabled: false" "$cfg" && otel_forced_missed="$otel_forced_missed $cfg(still-disabled)"
+    grep -q "backends: \[\]" "$cfg" && otel_forced_missed="$otel_forced_missed $cfg(backends-empty)"
+    grep -q "gke-managed-otel" "$cfg" || otel_forced_missed="$otel_forced_missed $cfg(missing-baked-endpoint)"
+done
+if [ -n "$otel_forced_missed" ]; then
+    echo "FAIL  step 4 did not restore hermes_otel configs on forced override:$otel_forced_missed"
+    failures=$((failures + 1))
+else
+    printf 'ok    %-44s %s\n' "otel force override restores hermes_otel" "not-disabled, baked endpoint"
 fi
 rm -rf "$home" "$home.out" "$home.err"
 

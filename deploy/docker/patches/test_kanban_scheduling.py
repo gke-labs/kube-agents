@@ -2,13 +2,15 @@
 
 Run: python3 -m unittest discover -s deploy/docker/patches -p 'test_*.py' -t deploy/docker/patches
 
-Three faults in ``hermes_cli/kanban_db.py``, one quartet, one test file:
+Four faults in ``hermes_cli/kanban_db.py``, one quartet, one test file:
 
   * the self-parenting dependency deadlock (``repair_inverted_dependencies``),
   * claims fenced to a process life, and the discriminator that decides which
     reclaims cost a retry (``release_dead_foreign_claims``),
   * the breaker counter, which is a pure source rewrite and so is tested
-    through the applier alone.
+    through the applier alone,
+  * the waiting-coordinator discount (``count_waiting_on_children``), which is
+    SQL over a table another patch owns, so it is tested against a board.
 
 The dependency tests run against a miniature of the real schema and, crucially,
 against a copy of the *real* gating predicate that ``claim_task`` and
@@ -44,7 +46,10 @@ import itertools
 import json
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -61,6 +66,7 @@ from apply_kanban_scheduling import (
     RELATIVE,
     SPAWN_BIND_ANCHOR,
     TRIP_ANCHOR,
+    WAITING_ANCHOR,
     apply,
 )
 from apply_kanban_wake_nudge import (
@@ -68,7 +74,12 @@ from apply_kanban_wake_nudge import (
     CREATE_ANCHOR as WAKE_CREATE_ANCHOR,
     UNBLOCK_ANCHOR as WAKE_UNBLOCK_ANCHOR,
 )
+import apply_kanban_scheduling
+import kanban_children_settled as children_settled
 from kanban_scheduling import (
+    CHILDREN_TABLE,
+    CHILD_COLUMNS,
+    CHILD_SETTLED_STATUSES,
     CLAIM_TIME_UNKNOWN,
     CONCURRENT_OWNER,
     DEPENDENCY_EVENT_KIND,
@@ -76,13 +87,16 @@ from kanban_scheduling import (
     PROCESS_DIED_IN_PLACE,
     RECLAIM_ERROR,
     RECLAIM_EVENT_KIND,
+    SETTLED,
     Reclaimed,
     charge_reclaimed_cards,
+    count_waiting_on_children,
     claim_host,
     claim_is_self,
     classify_reclaim,
     find_deadlocked_children,
     process_start_time,
+    _WAITING_ON_CHILDREN_SQL,
     read_proc_start_time,
     release_dead_foreign_claims,
     repair_inverted_dependencies,
@@ -1161,7 +1175,265 @@ class FingerprintTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Part 3: the applier
+# Part 3: the waiting-coordinator discount (part 4 of kanban_scheduling.py --
+# these banners number this file's sections, not that module's)
+# ---------------------------------------------------------------------------
+
+
+def waiting_board(tasks, children=(), links=()):
+    """A board plus the attribution table ``tools/kanban_children_settled`` owns.
+
+    ``children`` is ``(child_id, creator_id)``, the direction that table stores.
+    Built here rather than imported so the test pins the schema edit 7 reads
+    against, not whatever the other patch happens to write today.
+    """
+    conn = board(tasks, links=links)
+    conn.execute(
+        f"CREATE TABLE {CHILDREN_TABLE} ("
+        " child_id TEXT PRIMARY KEY, creator_id TEXT NOT NULL,"
+        " created_at INTEGER NOT NULL)"
+    )
+    for child, creator in children:
+        conn.execute(
+            f"INSERT INTO {CHILDREN_TABLE} (child_id, creator_id, created_at)"
+            " VALUES (?, ?, 0)",
+            (child, creator),
+        )
+    return conn
+
+
+class CountWaitingOnChildrenTest(unittest.TestCase):
+    """What the discount counts, and the four things it must not."""
+
+    def test_a_coordinator_with_a_live_child_is_waiting(self):
+        conn = waiting_board(
+            {"coord": "running", "kid": "ready"}, children=[("kid", "coord")]
+        )
+        self.assertEqual(count_waiting_on_children(conn), 1)
+
+    def test_a_running_card_with_no_children_is_not_waiting(self):
+        """The control. An ordinary worker must keep holding its slot."""
+        conn = waiting_board({"busy": "running"})
+        self.assertEqual(count_waiting_on_children(conn), 0)
+
+    def test_every_child_settled_means_the_wait_is_over(self):
+        conn = waiting_board(
+            {"coord": "running", "a": "done", "b": "archived"},
+            children=[("a", "coord"), ("b", "coord")],
+        )
+        self.assertEqual(count_waiting_on_children(conn), 0)
+
+    def test_one_live_child_among_settled_ones_still_counts(self):
+        conn = waiting_board(
+            {"coord": "running", "a": "done", "b": "running"},
+            children=[("a", "coord"), ("b", "coord")],
+        )
+        self.assertEqual(count_waiting_on_children(conn), 1)
+
+    def test_a_gated_continuation_child_does_not_free_the_slot(self):
+        """It cannot start until this card completes, so the slot buys nothing.
+
+        The same exemption ``kanban_children_settled`` applies before refusing a
+        completion, and it has to be the same one: a card whose only children are
+        continuations is not waiting, it is finishing.
+        """
+        conn = waiting_board(
+            {"coord": "running", "next": "todo"},
+            children=[("next", "coord")],
+            links=[("coord", "next")],
+        )
+        self.assertEqual(count_waiting_on_children(conn), 0)
+
+    def test_a_coordinator_that_is_not_running_is_not_counted(self):
+        """Only ``running`` cards occupy a slot, so only they can be discounted."""
+        for state in ("ready", "todo", "blocked", "review", "done"):
+            with self.subTest(status=state):
+                conn = waiting_board(
+                    {"coord": state, "kid": "ready"}, children=[("kid", "coord")]
+                )
+                self.assertEqual(count_waiting_on_children(conn), 0)
+
+    def test_each_waiting_card_is_counted_once_however_many_children(self):
+        conn = waiting_board(
+            {"coord": "running", "a": "ready", "b": "ready", "c": "ready"},
+            children=[("a", "coord"), ("b", "coord"), ("c", "coord")],
+        )
+        self.assertEqual(count_waiting_on_children(conn), 1)
+
+    def test_two_waiting_coordinators_count_two(self):
+        conn = waiting_board(
+            {"c1": "running", "c2": "running", "a": "ready", "b": "ready"},
+            children=[("a", "c1"), ("b", "c2")],
+        )
+        self.assertEqual(count_waiting_on_children(conn), 2)
+
+    def test_a_board_with_no_attribution_table_reads_as_no_waiters(self):
+        """Boards predate this table, and the build applies edit 7 before its writer.
+
+        Zero is upstream's count, so failing open here narrows dispatch back to
+        the old behaviour rather than unbounding it.
+        """
+        conn = board({"coord": "running", "kid": "ready"})
+        self.assertEqual(count_waiting_on_children(conn), 0)
+
+    def test_an_attributed_child_that_no_longer_exists_is_not_a_wait(self):
+        """The JOIN drops it. A deleted card cannot be waited on."""
+        conn = waiting_board({"coord": "running"}, children=[("ghost", "coord")])
+        self.assertEqual(count_waiting_on_children(conn), 0)
+
+    def test_a_broken_connection_reads_as_no_waiters(self):
+        conn = sqlite3.connect(":memory:")
+        conn.close()
+        with self.assertLogs("kanban_scheduling", level="WARNING") as logs:
+            self.assertEqual(count_waiting_on_children(conn), 0)
+        self.assertIn("no discount applied this tick", logs.output[0])
+
+    def test_a_board_with_no_attribution_table_reads_as_no_waiters_quietly(self):
+        """The pre-upgrade state, which recurs every tick until the writer lands.
+
+        Warning on it would drown the drift the warning above exists to surface.
+        """
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE tasks (id TEXT, status TEXT)")
+        with self.assertLogs("kanban_scheduling", level="DEBUG") as logs:
+            self.assertEqual(count_waiting_on_children(conn), 0)
+        self.assertEqual([r.levelname for r in logs.records], ["DEBUG"])
+        conn.close()
+
+
+class ChildrenTableAgreementTest(unittest.TestCase):
+    """Edit 7 reads a table another patch owns, and neither imports the other."""
+
+    def test_the_table_name_matches_the_patch_that_writes_it(self):
+        self.assertEqual(CHILDREN_TABLE, children_settled.CHILDREN_TABLE)
+
+    def test_the_settled_statuses_match_the_completion_gate(self):
+        """Disagree and the two differ on whether a card is done waiting."""
+        self.assertEqual(
+            tuple(CHILD_SETTLED_STATUSES), tuple(children_settled.SETTLED_STATUSES)
+        )
+
+    def test_the_columns_match_the_table_the_patch_creates(self):
+        """The drift the table name misses: a rename here fails open to zero."""
+        probe = sqlite3.connect(":memory:")
+        for ddl in children_settled._TABLE_DDL:
+            probe.execute(ddl)
+        created = {
+            row[1]
+            for row in probe.execute(
+                f"PRAGMA table_info({children_settled.CHILDREN_TABLE})"
+            )
+        }
+        probe.close()
+        for column in CHILD_COLUMNS:
+            self.assertIn(column, created)
+            self.assertIn(column, _WAITING_ON_CHILDREN_SQL)
+
+    def test_the_settled_sql_fragment_spells_the_settled_tuple(self):
+        """Part 2 interpolates a third copy of the set; tie it to the other two."""
+        self.assertEqual(
+            SETTLED, "(" + ", ".join(repr(s) for s in CHILD_SETTLED_STATUSES) + ")"
+        )
+
+    def _applier_exit(self, mutate):
+        """Run the applier in a copied patch dir with one constant rewritten.
+
+        A subprocess, because the mutation has to be read by a fresh import of
+        both modules and this process has already imported them. Asserting on the
+        applier's own source text — which is what this test did first — keeps
+        passing when the check is rewritten to compare the wrong attributes, so
+        it proved nothing.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = Path(tmp) / "patches"
+            stage.mkdir()
+            here = Path(apply_kanban_scheduling.__file__).parent
+            for name in (
+                "apply_kanban_scheduling.py",
+                "kanban_scheduling.py",
+                "kanban_children_settled.py",
+                "patchlib.py",
+            ):
+                shutil.copy(here / name, stage / name)
+            mutate(stage)
+            target = Path(tmp) / "tree" / "hermes_cli"
+            target.mkdir(parents=True)
+            (target / "kanban_db.py").write_text(pristine())
+            return subprocess.run(
+                [sys.executable, str(stage / "apply_kanban_scheduling.py"),
+                 str(Path(tmp) / "tree")],
+                capture_output=True,
+                text=True,
+            )
+
+    def test_the_dockerfile_greps_for_the_markers_this_file_defines(self):
+        """The grep strings live in two files and nothing else ties them.
+
+        Edit 7's marker especially: the Dockerfile's copy is a literal duplicate
+        of a line inside WAITING_PATCHED, so editing the patch text silently
+        stops the build gate checking anything.
+        """
+        dockerfile = Path(apply_kanban_scheduling.__file__).parents[1] / "Dockerfile"
+        if not dockerfile.exists():  # running from an installed copy, not the repo
+            self.skipTest("Dockerfile not beside the patches")
+        text = dockerfile.read_text()
+        self.assertIn(BUILD_MARKER, text)
+        self.assertIn(apply_kanban_scheduling.WAITING_BUILD_MARKER, text)
+
+    def test_the_edit_count_matches_what_the_prose_claims(self):
+        """Seven is written into ten comments and asserted nowhere else."""
+        self.assertEqual(len(apply_kanban_scheduling.EDITS), 7)
+
+    def test_the_unmutated_applier_succeeds(self):
+        """The control. Without it the three refusals below prove nothing: an
+        applier that failed for any unrelated reason would pass all of them."""
+        result = self._applier_exit(lambda stage: None)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_the_applier_refuses_to_build_on_a_table_rename(self):
+        def rename(stage):
+            path = stage / "kanban_scheduling.py"
+            path.write_text(
+                path.read_text().replace(
+                    f'CHILDREN_TABLE = "{CHILDREN_TABLE}"',
+                    'CHILDREN_TABLE = "kanban_worker_kids"',
+                    1,
+                )
+            )
+
+        result = self._applier_exit(rename)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("CHILDREN_TABLE disagrees", result.stdout + result.stderr)
+
+    def test_the_applier_refuses_to_build_on_a_column_rename(self):
+        def rename(stage):
+            path = stage / "kanban_children_settled.py"
+            path.write_text(
+                path.read_text().replace("creator_id TEXT NOT NULL", "owner_id TEXT NOT NULL", 1)
+            )
+
+        result = self._applier_exit(rename)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("_TABLE_DDL does not execute", result.stdout + result.stderr)
+
+    def test_the_applier_refuses_to_build_on_a_settled_status_change(self):
+        def rename(stage):
+            path = stage / "kanban_children_settled.py"
+            path.write_text(
+                path.read_text().replace(
+                    'SETTLED_STATUSES = ("done", "archived")',
+                    'SETTLED_STATUSES = ("done",)',
+                    1,
+                )
+            )
+
+        result = self._applier_exit(rename)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("settled-status set disagrees", result.stdout + result.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Part 4: the applier
 # ---------------------------------------------------------------------------
 
 # A stand-in for block_task's dependency branch with the same indentation as
@@ -1265,8 +1537,15 @@ def _record_task_failure(conn, task_id, error, *, outcome, failure_limit=None,
 '''
 
 
+# Upstream's ``count_running_tasks``, verbatim around the anchor edit 7 replaces.
+COUNT_RUNNING_PREAMBLE = '''\
+def count_running_tasks(conn):
+    """Return the number of tasks currently in ``status='running'``."""
+'''
+
+
 def pristine():
-    """A fake ``kanban_db.py`` carrying exactly one of each of the six anchors."""
+    """A fake ``kanban_db.py`` carrying exactly one of each of the seven anchors."""
     return (
         "import re\n\n"
         + BLOCK_TASK_PREAMBLE
@@ -1278,6 +1557,9 @@ def pristine():
         + CHARGE_ANCHOR
         + DETECT_CRASHED_EPILOGUE
         + RECORD_FAILURE_FIXTURE
+        + COUNT_RUNNING_PREAMBLE
+        + WAITING_ANCHOR
+        + "\n\n"
         + UPSTREAM_FINGERPRINT_SOURCE
     )
 
@@ -1305,7 +1587,7 @@ class ApplierTest(unittest.TestCase):
                 self.assertEqual(source.count(anchor), 1)
         ast.parse(source)
 
-    def test_all_six_edits_land_and_the_result_parses(self):
+    def test_all_seven_edits_land_and_the_result_parses(self):
         out = self._applied()
         self.assertIn("_kanban_repair_inverted_deps(conn, task_id, reason)", out)
         self.assertIn(
@@ -1322,6 +1604,7 @@ class ApplierTest(unittest.TestCase):
             out,
         )
         self.assertIn(BUILD_MARKER, out)
+        self.assertIn(apply_kanban_scheduling.WAITING_BUILD_MARKER, out)
         ast.parse(out)
 
     def test_one_trailer_imports_everything_the_edits_call(self):
@@ -1331,6 +1614,7 @@ class ApplierTest(unittest.TestCase):
         for name in (
             "_kanban_charge_reclaimed_cards",
             "_kanban_claim_is_self",
+            "_kanban_count_waiting_on_children",
             "_kanban_release_dead_foreign_claims",
             "_kanban_repair_inverted_deps",
         ):
@@ -1456,7 +1740,7 @@ class WakeNudgeCompatibilityTest(unittest.TestCase):
     """``apply_kanban_wake_nudge`` rewrites the same file, immediately after.
 
     Its three ``kanban_db.py`` anchors sit in ``create_task``,
-    ``complete_task`` and ``unblock_task`` — functions none of the six edits
+    ``complete_task`` and ``unblock_task`` — functions none of the seven edits
     here touch. The coupling is invisible from either applier alone, so it is
     asserted rather than left to inspection: a future edit that widens an anchor
     into one of those functions fails here instead of in the image build.
@@ -1520,7 +1804,7 @@ class WakeNudgeCompatibilityTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Part 4: the verifier's own fixture
+# Part 5: the verifier's own fixture
 # ---------------------------------------------------------------------------
 
 VERIFIER = Path(__file__).with_name("verify_kanban_scheduling.py")

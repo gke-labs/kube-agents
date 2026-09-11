@@ -512,7 +512,10 @@ def handle_poll(args):
         # Query next unaddressed issue.
         # `agent:audit` is excluded because those issues are fleet-audit ledgers:
         # that skill owns them and rewrites them in place on every run.
-        search_query = "is:issue is:open -label:status:in-progress -label:status:escalation-needed -label:agent:ignore -label:status:resolved -label:agent:audit"
+        # `agent:delivery-watch` is the same shape one job over: the ledger
+        # `chat_delivery_watch.py` keeps of scheduled reports that stopped
+        # reaching chat, edited and closed by that job alone.
+        search_query = "is:issue is:open -label:status:in-progress -label:status:escalation-needed -label:agent:ignore -label:status:resolved -label:agent:audit -label:agent:delivery-watch"
         # check=False: `gh auth status` passes when *any* host is authenticated, so
         # a token without scope for this repo — or a repo that 404s — only fails
         # here. With check=True that exits non-zero having printed no JSON at all,

@@ -373,12 +373,10 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 	// Unlike the gateway policy's rule 8, this one is kept when the agent
 	// resolves to no collector at all: otlpCollectorNamespace("") is the
 	// managed namespace, and the caller passes that through rather than
-	// dropping the rule, because the hermes_otel plugin does not read
-	// OTEL_EXPORTER_OTLP_ENDPOINT and keeps its baked gke-managed-otel backend
-	// on exactly that cluster (#933). Dropping the rule would turn that
-	// cosmetic gap into a blocked export the moment a collector appears there.
-	// A vendor endpoint or a bare hostname has no in-cluster namespace to
-	// name, so nothing is rendered for it, as for the gateway policy.
+	// dropping the rule, so that an export is not blocked the moment a
+	// collector appears there. A vendor endpoint or a bare hostname has no
+	// in-cluster namespace to name, so nothing is rendered for it, as for the
+	// gateway policy.
 	if otlpCollectorNS != "" {
 		rules = append(rules, networkingv1.NetworkPolicyEgressRule{
 			Ports: []networkingv1.NetworkPolicyPort{tcpPort(4317), tcpPort(4318)},
@@ -416,6 +414,30 @@ func buildAgentEgressNetworkPolicy(agent *agentv1alpha1.PlatformAgent, dnsCluste
 			},
 		}},
 	})
+
+	// The A2A bus, rendered only when the agent surface is up (mode: next, or
+	// version skew freezing a running next stack — a2aAgentSurface owns that
+	// asymmetry). buildPodTemplateSpec sets NATS_URL to the operator's own
+	// NATS Service under the same gate, so the destination comes from this
+	// repository's render, not a guess. The peer selects the NATS pods by the
+	// labels buildA2ANATSStatefulSet stamps, and mirrors the gateway policy's
+	// bus rule exactly, for the reason the sandbox rule above duplicates rule
+	// 11: either policy can be the only one present, and a missing rule here
+	// does not refuse the dial — it hangs it to the client timeout on an
+	// install whose CR reads Ready.
+	if a2aAgentSurface(agent) {
+		rules = append(rules, networkingv1.NetworkPolicyEgressRule{
+			Ports: []networkingv1.NetworkPolicyPort{tcpPort(4222)},
+			To: []networkingv1.NetworkPolicyPeer{{
+				PodSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{
+						labelPartOf:       a2aPartOf,
+						a2aComponentLabel: "nats",
+					},
+				},
+			}},
+		})
+	}
 
 	// The Kubernetes API server, if and only if the operator was told where it
 	// is. There is no NetworkPolicy peer for "the API server": on GKE the

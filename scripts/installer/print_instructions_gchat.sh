@@ -37,6 +37,6 @@ if [ "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}" = "true" ]; then
   fi
   echo -e "[ ] 3. ${C_YELLOW}[Optional]${C_RESET} Approve pairing code in GKE container:"
   echo -e "       ${C_CYAN}(Only required for first-time bot deployments. If the bot responds instantly, skip this!)${C_RESET}"
-  echo -e "       ${C_WHITE}kubectl exec -it deploy/platform-agent-gateway -n ${NAMESPACE:-kubeagents-system} -- hermes pairing approve google_chat <PAIRING_CODE>${C_RESET}"
+  echo -e "       ${C_WHITE}kubectl exec -it deploy/${PLATFORM_AGENT_DEPLOYMENT} -n ${NAMESPACE:-$DEFAULT_NAMESPACE} -- hermes pairing approve google_chat <PAIRING_CODE>${C_RESET}"
   echo -e ""
 fi

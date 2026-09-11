@@ -3,12 +3,35 @@
 
 Usage::
 
-    python3 scripts/eval_dashboard/render.py --data data.json --out-dir out/
+    python3 scripts/eval_dashboard/render.py --data data.json --out-dir out/ \\
+        [--health health.json] [--health-history health-history.jsonl]
 
-writes ``out/index.html`` (from ``template/index.html.tmpl``) and copies the
-data file alongside it, so the published directory is self-contained.
+writes three pages and two data files into ``out/``:
 
-The page tells one story in two bands:
+* ``index.html`` -- **the Brief**: what state the smoke gate is in, why the
+  bot thinks so, what the agent saw, what changed right before, what is
+  being done, and the runs in the window. Scoped by
+  ``?cases=a,b&since=<ISO>&until=<ISO>`` to a past incident; ``#agent``
+  shows the last 24 hours in numbers.
+* ``run.html?build=<prow build id>`` -- **the PR view**: one run, its
+  failed cases each tagged as the gate's or the pull request's
+  (``classify.py``), and what to do.
+* ``legacy.html`` -- the two-band page below: the matrix, the Pareto, the
+  evidence table.
+* ``brief.json`` -- what the two new pages render from: the per-run
+  classification, the current health verdict, the incident history and the
+  recent merges. ``data.json`` is copied verbatim beside it.
+
+The Brief and the PR view are rendered in the browser from ``brief.json``
+(``template/page.html.tmpl`` + ``template/pages.js``); every time they show
+is America/Toronto, formatted there. The optional inputs are
+``health.json`` (the CI health adjudicator's verdict, published beside
+data.json; nothing here writes it) and ``health-history.jsonl`` (one
+health.json document per line plus a ``tick`` stamp); without them the
+Brief says no verdict is published and both pages show what the runs
+alone support, never an error.
+
+The legacy page tells one story in two bands:
 
 * **THE AGENT** -- is the agent getting better or worse, measured on the
   merged-PR cohort (the final ``pr_merged`` run of each PR): weekly pass
@@ -20,9 +43,9 @@ The page tells one story in two bands:
 
 Three rules shape everything here:
 
-* **Computed-only.** Every figure on the page is derived from data.json --
-  no hand-typed numbers can go stale in a template. The two optional extra
-  inputs are ``case-notes.yaml`` (``--notes``: one-line annotations, issue
+* **Computed-only.** Every figure on the legacy page is derived from
+  data.json -- no hand-typed numbers can go stale in a template. Its two
+  optional extra inputs are ``case-notes.yaml`` (``--notes``: one-line annotations, issue
   links and badges per case) and ``events.yaml`` (``--events``: dated event
   markers plus the few human-judgment counts no log line carries). An absent
   file degrades to "no annotation" -- never an error.
@@ -41,11 +64,10 @@ The reader contract is schema_version 1 of the collector's data.json.
 Optional fields may be absent and unknown additive fields are ignored, so
 this renderer and the collector can ship independently. In particular
 ``tasks[].reps`` and ``runs[].pr_merged`` are optional additive fields
-(SCHEMA.md, "Optional run and task fields") that no collector version emits
-yet; without them every task falls back to its single ``result`` and the
-merged-PR cohort is simply empty.
+(SCHEMA.md, "Optional run and task fields"); without them every task falls
+back to its single ``result`` and the merged-PR cohort is simply empty.
 
-The rendered page is also live: render.py bakes the data, notes and events
+The legacy page is also live: render.py bakes the data, notes and events
 into the template, whose script re-renders in place from a fresh
 ``data.json`` fetch every 60 seconds and keeps a freshness badge honest (see
 the template's "Live read side" comment). The Python fragment builders here
@@ -64,16 +86,56 @@ import math
 import pathlib
 import re
 import shutil
+import subprocess
 import sys
 
 import yaml
 
+try:
+    from . import classify
+except ImportError:  # run as a script: python3 scripts/eval_dashboard/render.py
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import classify
+
 HERE = pathlib.Path(__file__).resolve().parent
 TEMPLATE = HERE / "template" / "index.html.tmpl"
+PAGE_TEMPLATE = HERE / "template" / "page.html.tmpl"
+PAGES_JS = HERE / "template" / "pages.js"
 DEFAULT_NOTES = HERE / "case-notes.yaml"
 DEFAULT_EVENTS = HERE / "events.yaml"
 ISSUE_URL = "https://github.com/gke-labs/kube-agents/issues"
 ISSUE_RE = re.compile(r"^#(\d+)$")
+
+# --- the three pages and their data ---------------------------------------
+BRIEF_PAGE = "index.html"
+RUN_PAGE = "run.html"
+LEGACY_PAGE = "legacy.html"
+BRIEF_JSON = "brief.json"
+# The object names the pages poll beside their own; the adjudicator job
+# writes both (health-history.jsonl is appended one line per tick).
+HEALTH_FILE = "health.json"
+HEALTH_HISTORY_FILE = "health-history.jsonl"
+# The three states health.json can carry. The pages announce a state with
+# a glyph and the word, never with colour alone.
+HEALTH_STATES = ("GREEN", "DEGRADED", "OUTAGE")
+# brief.json carries the runs started inside this many days of the data's
+# generated_at -- the depth the collector keeps current (SCHEMA.md,
+# --since-days 14) -- and run.html says so when a build id is not in it.
+RUN_VIEW_DAYS = 14
+# "What changed right before" lists merges to main from this far back; the
+# page narrows it to the window between the last green run and the first
+# red one. Read from the checkout's git log at render time; a shallow
+# checkout (actions/checkout's default) has no usable history and the
+# block is omitted rather than shown one commit deep.
+MERGES_LOOKBACK_DAYS = 3
+MERGES_MAX = 300
+MERGE_PR_RE = re.compile(r"\(#(\d+)\)\s*$")
+GIT_TIMEOUT_S = 20
+# A run finished this long after the last history tick still takes that
+# tick's verdict; beyond it the current verdict is what the page has. A
+# gap inside the history (the adjudicator down for a while) keeps the tick
+# before the gap: the last thing it said is still what the space heard.
+HEALTH_AT_TICK_SLACK_MS = 30 * 60 * 1000
 
 # The 20-run yardstick the evidence bars are drawn against, borrowed from
 # the screening window in docs/designs/testing-strategy.md. The bars show
@@ -86,6 +148,21 @@ SCREENING_WINDOW = 20
 # The three results a rep (or a task) can carry; anything else is treated as
 # "not measured" rather than guessed at.
 REP_RESULTS = ("pass", "fail", "infra")
+
+# Releases section: how many release-candidate eval runs the table shows,
+# newest first. RCs are cut per staging promotion, so ten rows is roughly a
+# fortnight of them, and the whole list stays in data.json for anyone who
+# wants further back.
+RELEASES_MAX_ROWS = 10
+# Verdict pill colour by the banner hack/ci-eval-rc.sh prints. NOT RUN is the
+# deploy-failed path: nothing was measured, which is neither a pass nor a
+# judgement on the candidate, so it takes the neutral infra colour.
+RELEASE_VERDICT_CLASS = {"GREEN": "p-pass", "RED": "p-fail", "NOT RUN": "p-infra"}
+# The only URL scheme a collected artifacts link may carry into an href.
+RELEASE_URL_SCHEME = "https://"
+# releases[].duration_s is seconds; the cell renders it as `4h16m`.
+SECONDS_PER_HOUR = 3600
+SECONDS_PER_MINUTE = 60
 
 # Matrix window: the last N runs that measured at least one task. 30 columns
 # is about two weeks of PR traffic and still fits one screen at 22px cells.
@@ -173,6 +250,12 @@ def fmt(value: float, digits: int = 0) -> str:
     change when the template's on-load re-render replaces the baked HTML."""
     factor = 10**digits
     return f"{math.floor(value * factor + 0.5) / factor:.{digits}f}"
+
+
+def is_number(value) -> bool:
+    """A finite real number. Mirrors the template's ``Number.isFinite``
+    guard; bools are data errors, not zeroes and ones."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def is_count(value) -> bool:
@@ -508,6 +591,323 @@ def load_events(path: pathlib.Path | None) -> dict:
         }
     out["false_reds_7d"] = raw.get("false_reds_7d")
     return out
+
+
+# --------------------------------------------------------------------------
+# health.json and health-history.jsonl (optional; the verdict and its past)
+
+
+def normalize_health(raw) -> dict | None:
+    """The fields the pages read from a health.json document, each
+    defaulted: absent, unparseable, a non-object, or a state outside
+    HEALTH_STATES all read as "no verdict" (None). Mirrors the template's
+    ``normalizeHealth``."""
+    if not isinstance(raw, dict):
+        return None
+    state = str(raw.get("state") or "").upper()
+    if state not in HEALTH_STATES:
+        return None
+
+    def text(key: str) -> str:
+        value = raw.get(key)
+        return value if isinstance(value, str) else ""
+
+    def strings(key: str) -> list[str]:
+        value = raw.get(key)
+        return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+
+    incident = raw.get("incident") if isinstance(raw.get("incident"), dict) else None
+    return {
+        "state": state,
+        "condition": raw["condition"] if isinstance(raw.get("condition"), str) else None,
+        "since": raw["since"] if iso_ms(raw.get("since")) is not None else None,
+        "cause": text("cause"),
+        "advice": text("advice"),
+        "failing_cases": strings("failing_cases"),
+        "tracking_issues": strings("tracking_issues"),
+        "recovering": raw.get("recovering") is True,
+        "stale": raw.get("stale") is True,
+        "generated_at": raw["generated_at"] if iso_ms(raw.get("generated_at")) is not None else None,
+        "incident": {
+            "prs": [p for p in incident.get("prs") or [] if isinstance(p, int)] if incident else [],
+            "runs": incident.get("runs") if incident and is_count(incident.get("runs")) else None,
+            "window_start": incident.get("window_start") if incident and iso_ms(incident.get("window_start")) is not None else None,
+            "window_end": incident.get("window_end") if incident and iso_ms(incident.get("window_end")) is not None else None,
+        } if incident else None,
+        "tick": raw["tick"] if iso_ms(raw.get("tick")) is not None else None,
+    }
+
+
+def load_health(path: pathlib.Path | None) -> dict | None:
+    if path is None or not path.exists():
+        return None
+    try:
+        return normalize_health(json.loads(path.read_text()))
+    except (OSError, ValueError):
+        return None
+
+
+def load_health_history(path: pathlib.Path | None) -> list[dict] | None:
+    """health-history.jsonl: one JSON object per line, each the health.json
+    published at that tick plus ``"tick": "<ISO UTC>"``. Returns the
+    normalized ticks in tick order (a line without a parseable tick uses
+    its generated_at), or None when the file is absent or unreadable --
+    the pages then show the current state only. A malformed line is
+    skipped, never fatal."""
+    if path is None or not path.exists():
+        return None
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return None
+    ticks = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            raw = json.loads(line)
+        except ValueError:
+            continue
+        entry = normalize_health(raw)
+        if entry is None:
+            continue
+        if entry["tick"] is None:
+            entry["tick"] = entry["generated_at"]
+        if entry["tick"] is None:
+            continue
+        ticks.append(entry)
+    ticks.sort(key=lambda t: iso_ms(t["tick"]))
+    return ticks
+
+
+def history_incidents(ticks: list[dict]) -> list[dict]:
+    """The episodes in a tick list: a run of non-GREEN ticks is one
+    incident, from its first tick's ``since`` to the first GREEN tick
+    after it (``until`` is None while it is still open). State is the
+    worst seen, cases the union, condition the last one reported."""
+    incidents: list[dict] = []
+    open_incident = None
+    rank = {state: i for i, state in enumerate(HEALTH_STATES)}
+    for tick in ticks:
+        if tick["state"] == "GREEN":
+            if open_incident is not None:
+                open_incident["until"] = tick["tick"]
+                open_incident = None
+            continue
+        if open_incident is None:
+            open_incident = {
+                "since": tick["since"] or tick["tick"],
+                "until": None,
+                "state": tick["state"],
+                "condition": tick["condition"],
+                "failing_cases": [],
+                "tracking_issues": [],
+                "cause": tick["cause"],
+                "advice": tick["advice"],
+            }
+            incidents.append(open_incident)
+        if rank[tick["state"]] > rank[open_incident["state"]]:
+            open_incident["state"] = tick["state"]
+        if tick["condition"]:
+            open_incident["condition"] = tick["condition"]
+        if tick["cause"]:
+            open_incident["cause"] = tick["cause"]
+        if tick["advice"]:
+            open_incident["advice"] = tick["advice"]
+        for case in tick["failing_cases"]:
+            if case not in open_incident["failing_cases"]:
+                open_incident["failing_cases"].append(case)
+        for issue in tick["tracking_issues"]:
+            if issue not in open_incident["tracking_issues"]:
+                open_incident["tracking_issues"].append(issue)
+    return incidents
+
+
+def health_at(ticks: list[dict] | None, when_ms: float | None, incidents: list[dict] | None = None) -> dict | None:
+    """The verdict in force at ``when_ms``: the last tick at or before it
+    (a run finished within HEALTH_AT_TICK_SLACK_MS after the last tick
+    still gets that tick). None without history or before its first
+    tick. Carries the incident's ``until`` when the tick sits inside a
+    closed episode, so the PR view can link the past brief."""
+    if not ticks or when_ms is None:
+        return None
+    chosen = None
+    for tick in ticks:
+        tick_ms = iso_ms(tick["tick"])
+        if tick_ms is not None and tick_ms <= when_ms:
+            chosen = tick
+        else:
+            break
+    if chosen is None:
+        return None
+    last_ms = iso_ms(ticks[-1]["tick"])
+    if chosen is ticks[-1] and last_ms is not None and when_ms - last_ms > HEALTH_AT_TICK_SLACK_MS:
+        return None
+    until = None
+    for incident in incidents or []:
+        since_ms, until_ms = iso_ms(incident["since"]), iso_ms(incident["until"])
+        if since_ms is not None and until_ms is not None and since_ms <= when_ms <= until_ms:
+            until = incident["until"]
+    return {
+        "state": chosen["state"],
+        "condition": chosen["condition"],
+        "since": chosen["since"],
+        "until": until,
+        "failing_cases": chosen["failing_cases"],
+        "recovering": chosen["recovering"],
+        "cause": chosen["cause"],
+        "tick": chosen["tick"],
+    }
+
+
+# --------------------------------------------------------------------------
+# merges to main (optional; from the checkout's git log)
+
+
+def recent_merges(repo_root: pathlib.Path, now_ms: float | None, runner=subprocess.run) -> list[dict] | None:
+    """Commits on the checkout's first-parent line from the last
+    MERGES_LOOKBACK_DAYS before ``now_ms``: ``[{sha, at, title, pr}]``,
+    newest first. None when git is unavailable, the checkout is shallow
+    (its log would be one commit deep and read as "one merge"), or the
+    command fails -- the page omits the block rather than guess."""
+    if now_ms is None:
+        return None
+    try:
+        shallow = runner(
+            ["git", "-C", str(repo_root), "rev-parse", "--is-shallow-repository"],
+            capture_output=True, text=True, timeout=GIT_TIMEOUT_S, check=False,
+        )
+        if shallow.returncode != 0 or shallow.stdout.strip() != "false":
+            return None
+        since = ms_to_utc(now_ms - MERGES_LOOKBACK_DAYS * DAY_MS)
+        log = runner(
+            [
+                "git", "-C", str(repo_root), "log", "--first-parent", f"--max-count={MERGES_MAX}",
+                f"--since={since:%Y-%m-%dT%H:%M:%S}+00:00", "--format=%H%x1f%cI%x1f%s", "HEAD",
+            ],
+            capture_output=True, text=True, timeout=GIT_TIMEOUT_S, check=False,
+        )
+        if log.returncode != 0:
+            return None
+    except (OSError, subprocess.SubprocessError):
+        return None
+    merges = []
+    for line in log.stdout.splitlines():
+        parts = line.split("\x1f")
+        if len(parts) != 3 or iso_ms(parts[1]) is None:
+            continue
+        match = MERGE_PR_RE.search(parts[2])
+        merges.append({
+            "sha": parts[0],
+            "at": parts[1],
+            "title": MERGE_PR_RE.sub("", parts[2]).strip(),
+            "pr": int(match.group(1)) if match else None,
+        })
+    return merges
+
+
+def ms_to_utc(ms: float) -> datetime.datetime:
+    return datetime.datetime.fromtimestamp(ms / 1000, tz=datetime.timezone.utc)
+
+
+# --------------------------------------------------------------------------
+# brief.json: what the Brief and the PR view render from
+
+
+def compact_run(run: dict, verdict: dict, at: dict | None) -> dict:
+    """One run as the pages need it: identity, timing, and classify.py's
+    result (SCHEMA.md, "brief.json")."""
+    return {
+        "build": verdict["build"],
+        "pr": run.get("pr"),
+        "head_sha": run.get("head_sha") if isinstance(run.get("head_sha"), str) else None,
+        "project": run.get("project") if isinstance(run.get("project"), str) else None,
+        "started": run.get("started") if iso_ms(run.get("started")) is not None else None,
+        "finished": run.get("finished") if iso_ms(run.get("finished")) is not None else None,
+        "duration_s": run.get("duration_s") if isinstance(run.get("duration_s"), (int, float)) else None,
+        "result": str(run.get("result") or "").upper() or None,
+        "verdict": verdict["verdict"],
+        "headline": verdict["headline"],
+        "lede": verdict.get("lede", ""),
+        "matches_incident": verdict["matches_incident"],
+        "setup_death": verdict.get("setup_death", False),
+        "storm_reps": verdict.get("storm_reps", 0),
+        "do": verdict.get("do", ""),
+        "cases": verdict["cases"],
+        "health_at": at,
+    }
+
+
+def brief_document(data: dict, health: dict | None, history: list[dict] | None, merges: list[dict] | None) -> dict:
+    """The document both new pages read. Runs are the last RUN_VIEW_DAYS
+    of data.json, oldest first, each classified against every run on
+    record with the verdict in force when it finished."""
+    anchor = reference_ms(data)
+    runs = [r for r in data.get("runs") or [] if isinstance(r, dict)]
+    now = ms_to_utc(anchor) if anchor is not None else None
+    incidents = history_incidents(history) if history else []
+    admitted = classify.admitted_cases()
+    out_runs = []
+    for run in sorted_runs(data):
+        started = iso_ms(run.get("started"))
+        if anchor is not None and started is not None and started < anchor - RUN_VIEW_DAYS * DAY_MS:
+            continue
+        finished = iso_ms(run.get("finished")) or started
+        at = health_at(history, finished, incidents) if history else None
+        # The verdict a run is judged against: its tick from the history;
+        # the current verdict for a run newer than the history's last tick
+        # (or when there is no history at all); none for a run that
+        # predates the history -- today's outage says nothing about it.
+        first_tick = iso_ms(history[0]["tick"]) if history else None
+        predates = first_tick is not None and finished is not None and finished < first_tick
+        against = at if at is not None else (None if predates else health)
+        verdict = classify.classify_run(run, runs, health_at=against, now=now, admitted=admitted)
+        out_runs.append(compact_run(run, verdict, at))
+    cases = {}
+    for case in data.get("cases") or []:
+        if isinstance(case, dict) and case.get("name") is not None:
+            name = str(case["name"])
+            cases[name] = {"active": case.get("active") is True, "admitted": admitted is None or name in admitted}
+    return {
+        "schema_version": 1,
+        "generated_at": data.get("generated_at") if iso_ms(data.get("generated_at")) is not None else None,
+        "stale_after_s": data.get("stale_after_s") if isinstance(data.get("stale_after_s"), (int, float)) else None,
+        "run_days": RUN_VIEW_DAYS,
+        "admitted": sorted(admitted) if admitted is not None else None,
+        "health": health,
+        "history": {"ticks": [
+            {"tick": t["tick"], "state": t["state"], "condition": t["condition"], "since": t["since"],
+             "failing_cases": t["failing_cases"], "recovering": t["recovering"]} for t in history
+        ], "incidents": incidents} if history is not None else None,
+        "merges": merges,
+        "cases": cases,
+        "runs": out_runs,
+    }
+
+
+def render_new_page(page: str, brief: dict, data: dict) -> str:
+    """The Brief (``page`` = "brief") or the PR view ("run") from the shared
+    template, with brief.json and pages.js inlined."""
+    template = PAGE_TEMPLATE.read_text()
+    script = PAGES_JS.read_text()
+    values = {
+        "__TITLE__": "kube-agents · smoke gate brief" if page == "brief" else "kube-agents · smoke run",
+        "__PAGE__": page,
+        "__NAV_BRIEF__": 'class="on"' if page == "brief" else "",
+        "__NAV_RUN__": 'class="on"' if page == "run" else "",
+        "__META__": meta_html(data),
+        "__FRESHNESS__": freshness_html(data),
+        "__PAGES_JS__": script.replace("__BRIEF_JSON__", bootstrap_json(brief)),
+    }
+    for token in values:
+        if token not in template:
+            raise SystemExit(f"ERROR: page template is missing the {token} marker")
+    return re.sub(
+        "|".join(re.escape(token) for token in values),
+        lambda match: values[match.group(0)],
+        template,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -945,12 +1345,145 @@ def evidence_html(data: dict, notes: dict) -> str:
   </table></div>"""
 
 
-RELEASES_HTML = """
+RELEASES_EMPTY_HTML = """
   <h2 id="release">Releases</h2>
   <div class="empty">
     <span class="banner">⏳ No RC in the gate window</span>
-    <p style="margin-top:12px">When the next RC cuts, the four-gate checklist renders here automatically: E2E matrix · audit-machinery canary on the RC image · eval non-inferiority · operator sign-off.</p>
+    <p style="margin-top:12px">When the next RC cuts, its eval run renders here automatically: candidate, tier, verdict, and the advisory non-inferiority number.</p>
   </div>"""
+
+
+RELEASES_SUB = (
+    "One row per post-kube-agents-eval-rc run — the full suite against a "
+    "release candidate's own images. Advisory: this lane reports and does not "
+    "gate, and the non-inferiority comparison stays advisory while the "
+    "baseline store is maturing. The admitted rate covers only the cases "
+    "admitted to the gate, while Cases passed counts every graded case in the "
+    "run, so the two differ."
+)
+
+
+def release_verdict_pill(verdict: str | None) -> str:
+    """The verdict cell. A missing verdict is its own state, not a pass:
+    hack/ci-eval-rc.sh prints no banner when it exits on an early guard, and
+    that run measured nothing."""
+    cls = RELEASE_VERDICT_CLASS.get(verdict or "", "p-infra")
+    return f'<span class="pill {cls}">{esc(verdict or "NO VERDICT")}</span>'
+
+
+def release_duration(seconds) -> str:
+    """`4h16m`, or an empty string when the run carries no duration."""
+    if not is_count(seconds) or seconds <= 0:
+        return ""
+    total = int(seconds)
+    hours, minutes = total // SECONDS_PER_HOUR, (total % SECONDS_PER_HOUR) // SECONDS_PER_MINUTE
+    return f"{hours}h{minutes:02d}m" if hours else f"{minutes}m"
+
+
+def release_rate_cell(release: dict) -> str:
+    """The admitted-case pass rate, with what it was compared against."""
+    rate = release.get("pass_rate")
+    if not is_number(rate):
+        return '<td class="num">—<div class="tnote">not reported</div></td>'
+    baseline = release.get("baseline_rate")
+    margin = release.get("margin")
+    if is_number(baseline):
+        note = f"main {fmt(baseline * 100, 1)}%"
+        if is_number(margin):
+            # Points, not percent: the margin is a difference of two rates.
+            # fmt() only formats non-negatives, and the sign carries the
+            # whole meaning of the number, so it is written explicitly.
+            sign = "+" if margin >= 0 else "−"
+            note += f" · margin {sign}{fmt(abs(margin) * 100, 1)}pt"
+    else:
+        note = "no baseline — baselines maturing"
+    return (
+        f'<td class="num">{fmt(rate * 100, 1)}%'
+        f'<div class="tnote">{esc(note)}</div></td>'
+    )
+
+
+def release_cases_cell(release: dict) -> str:
+    """Graded outcomes for the run: passes over graded, infra called out
+    separately because an infra rep is excluded rather than failed."""
+    tasks = run_tasks(release)
+    passed = sum(1 for t in tasks if t.get("result") == "pass")
+    infra = sum(1 for t in tasks if t.get("result") == "infra")
+    graded = len(tasks) - infra
+    if not tasks:
+        return '<td class="num">—<div class="tnote">no cases parsed</div></td>'
+    note = f"{infra} infra excluded" if infra else "none excluded"
+    return f'<td class="num">{passed}/{graded}<div class="tnote">{esc(note)}</div></td>'
+
+
+def release_candidate_cell(release: dict) -> str:
+    tag = str(release.get("rc_tag") or "") or "unknown candidate"
+    url = release.get("artifacts_url")
+    # Only an https URL becomes an href. The value is read out of a build
+    # log, and a log line is the wrong place to be minting `javascript:`.
+    name = esc(tag)
+    if isinstance(url, str) and url.startswith(RELEASE_URL_SCHEME):
+        name = f'<a href="{esc(url)}" rel="noopener">{name}</a>'
+    bits = []
+    if release.get("commit"):
+        bits.append(str(release["commit"]))
+    if release.get("build_id"):
+        bits.append(f"build {release['build_id']}")
+    if not release.get("verdict"):
+        # The banner is missing, so Prow's own result is the only thing left
+        # that says whether the job survived. Say so rather than showing a
+        # blank row that reads like a quiet pass.
+        bits.append(f"no eval banner · job {release.get('result') or 'unknown'}")
+    return (
+        f'<td><div class="tname">{name}</div>'
+        f'<div class="tnote">{esc(" · ".join(bits))}</div></td>'
+    )
+
+
+def release_row(release: dict) -> str:
+    started = parse_iso(release.get("started"))
+    when = f"{started:%Y-%m-%d %H:%M} UTC" if started else "unknown time"
+    duration = release_duration(release.get("duration_s"))
+    return (
+        "<tr>"
+        + release_candidate_cell(release)
+        + f'<td><span class="cap">{esc(str(release.get("tier") or "—"))}</span></td>'
+        + f"<td>{release_verdict_pill(release.get('verdict'))}</td>"
+        + release_rate_cell(release)
+        + release_cases_cell(release)
+        + f'<td><span class="cap">{esc(when)}</span></td>'
+        + f'<td class="cap">{esc(duration)}</td>'
+        + "</tr>"
+    )
+
+
+def sorted_releases(data: dict) -> list[dict]:
+    """Newest first. data.json is re-sorted here rather than trusted: the
+    collector writes it in order, but the renderer also runs against files
+    edited by hand."""
+    releases = [r for r in data.get("releases") or [] if isinstance(r, dict)]
+    releases.sort(
+        key=lambda r: (
+            str(r.get("started") or ""),
+            int(r["build_id"]) if str(r.get("build_id", "")).isdigit() else 0,
+        ),
+        reverse=True,
+    )
+    return releases[:RELEASES_MAX_ROWS]
+
+
+def releases_html(data: dict) -> str:
+    releases = sorted_releases(data)
+    if not releases:
+        return RELEASES_EMPTY_HTML
+    rows = "".join(release_row(r) for r in releases)
+    return f"""
+  <h2 id="release">Releases</h2>
+  <div class="sub">{RELEASES_SUB}</div>
+  <div class="card"><table id="releases">
+    <thead><tr><th>Candidate</th><th>Tier</th><th>Verdict</th><th>Admitted rate</th><th>Cases passed</th><th>Started</th><th>Eval took</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table></div>"""
 
 
 HERO_LEDE = (
@@ -996,14 +1529,21 @@ EMPTY_STATE_HTML = """
 
 
 def app_html(data: dict, notes: dict, events: dict) -> str:
-    if not (data.get("runs") or data.get("cases")):
+    # releases[] counts as data, so a file carrying only RC records renders
+    # its table instead of "no evaluation data yet". Neither publish pipeline
+    # can reach this: both refuse to publish a data.json with an empty runs[]
+    # before render is called, and deliberately so -- a run whose presubmit
+    # sweep came back empty must not overwrite a good dashboard with a
+    # releases-only page. This is for the hand-run render sorted_releases
+    # already documents, and for whoever next reads a bare data.json.
+    if not (data.get("runs") or data.get("cases") or sorted_releases(data)):
         return EMPTY_STATE_HTML
     return (
         HERO_HTML
         + band_agent_html(data, events)
         + band_gate_html(data, notes, events)
         + evidence_html(data, notes)
-        + RELEASES_HTML
+        + releases_html(data)
         + foot_html(data)
     )
 
@@ -1074,17 +1614,42 @@ def main(argv: list[str] | None = None) -> int:
         default=str(DEFAULT_EVENTS),
         help="events.yaml (optional markers and catch counts; absent file is fine)",
     )
+    parser.add_argument(
+        "--health",
+        default=None,
+        help=f"{HEALTH_FILE} from the adjudicator (optional; absent or malformed renders no verdict)",
+    )
+    parser.add_argument(
+        "--health-history",
+        default=None,
+        help=f"{HEALTH_HISTORY_FILE}, one health.json per line plus a tick stamp (optional; absent means current state only)",
+    )
+    parser.add_argument(
+        "--repo-root",
+        default=str(classify.REPO_ROOT),
+        help="checkout whose git log lists the merges to main (a shallow checkout omits the block)",
+    )
     args = parser.parse_args(argv)
 
     data = load_data(pathlib.Path(args.data))
     notes = load_notes(pathlib.Path(args.notes))
     events = load_events(pathlib.Path(args.events))
+    health = load_health(pathlib.Path(args.health)) if args.health else None
+    history = load_health_history(pathlib.Path(args.health_history)) if args.health_history else None
+    merges = recent_merges(pathlib.Path(args.repo_root), reference_ms(data))
+    brief = brief_document(data, health, history, merges)
 
     out_dir = pathlib.Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "index.html").write_text(render_page(data, notes, events))
+    (out_dir / BRIEF_PAGE).write_text(render_new_page("brief", brief, data))
+    (out_dir / RUN_PAGE).write_text(render_new_page("run", brief, data))
+    (out_dir / LEGACY_PAGE).write_text(render_page(data, notes, events))
+    (out_dir / BRIEF_JSON).write_text(json.dumps(brief, separators=(",", ":")))
+    # health.json and health-history.jsonl are deliberately not copied into
+    # the out-dir: the adjudicator owns those objects, and republishing a
+    # copy would overwrite a fresher verdict with the one this render read.
     shutil.copyfile(args.data, out_dir / "data.json")
-    print(f"wrote {out_dir / 'index.html'}")
+    print(f"wrote {out_dir / BRIEF_PAGE}, {RUN_PAGE}, {LEGACY_PAGE}, {BRIEF_JSON}")
     return 0
 
 

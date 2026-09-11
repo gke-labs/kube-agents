@@ -127,6 +127,33 @@ class CalculateNextVersionTest(unittest.TestCase):
         finally:
             temp_dir.cleanup()
 
+    def test_automated_calculator_never_produces_1_0_from_pre_1_0_base(self):
+        """Invariant: in 0.y.z initial development, automated calculation never produces 1.0.0.
+
+        Even with multiple breaking change commits, SemVer Clause 4 bumps MINOR (e.g. 0.9.0 -> 0.10.0).
+        Graduating to 1.0.0 is strictly a manual governance decision.
+        """
+        temp_dir, repo_dir, git = self._create_mock_repo()
+        try:
+            git("tag", "-a", "0.9.0", "-m", "Release 0.9.0")
+
+            (pathlib.Path(repo_dir) / "file1.txt").write_text("breaking 1")
+            git("add", "file1.txt")
+            git("commit", "-m", "feat!: breaking change 1")
+
+            (pathlib.Path(repo_dir) / "file2.txt").write_text("breaking 2")
+            git("add", "file2.txt")
+            git("commit", "-m", "fix!: breaking change 2")
+
+            proc = self._run_calc_script(repo_dir)
+            self.assertEqual(proc.returncode, 0)
+            next_ver = proc.stdout.strip()
+            self.assertEqual(next_ver, "0.10.0")
+            self.assertTrue(next_ver.startswith("0."))
+            self.assertFalse(next_ver.startswith("1."))
+        finally:
+            temp_dir.cleanup()
+
     def test_breaking_change_in_body_footer(self):
         temp_dir, repo_dir, git = self._create_mock_repo()
         try:

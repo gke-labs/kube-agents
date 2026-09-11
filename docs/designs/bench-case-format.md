@@ -23,9 +23,9 @@ in silence — no error, no warning. The fields it reads are `id`, `name`, `prom
 `recoverable_safety`, `infrastructure`, `documentation` and `validated`. Strict mode
 means no coercion: `critical: yes` is a string, not a boolean, and fails validation.
 
-**This repository's lints** read the same file for fields devops-bench discards: `domain`
-and `fixtures`. Those are ours. A typo in either cannot fail a run, which is exactly why
-`scripts/validate_bench_cases.py` exists.
+**This repository's lints** read the same file for fields devops-bench discards: `domain`,
+`fixtures` and `owner`. Those are ours. A typo in any of them cannot fail a run, which is
+exactly why `scripts/validate_bench_cases.py` exists.
 
 ## The id key
 
@@ -90,6 +90,12 @@ A case whose spec reads live cluster state must declare it. `fixtures: []` is th
 declaration for a case that plants its own state — `gpu-stress-test-diagnosis` brings up
 its own Terraform stack and depends on no fixture — and an absent key on such a case is a
 finding, because a grep that returns one case for a role has to mean one case uses it.
+
+`owner` is who answers for the case when it flakes: a GitHub login written without the at
+sign, or the literal `maintainers` for a case the repository's `OWNERS` approvers own. It is
+the field the demotion mechanic in `docs/eval-gate-roster.md` addresses its issue to, and
+`bench/CONTRIBUTING.md` is where the commitment, and the reason the login is bare, are
+spelled out.
 
 `verification_spec` is the exact half of the grade, and the rest of this document is
 mostly about it.
@@ -274,9 +280,13 @@ A commented-out `TASKS` entry counts as registered. That is the intended state f
 case whose fixture or blocker is not ready: it is written down, it is greppable, and
 activation is uncommenting one line. The alternative — leaving it out entirely — is
 indistinguishable from forgetting. A `NIGHTLY_TASKS` entry counts too, and means more:
-the case runs every night, kept out of the presubmit for cost or because a cheaper probe
-holds its presubmit seat — never out of doubt about the case, which is what the
-commented-out state is for.
+the case runs every night, kept out of the presubmit for cost, because a cheaper probe
+holds its presubmit seat, or because what it grades is not one of the core journeys the
+presubmit gate is for — never out of doubt about the case, which is what the
+commented-out state is for. The core journeys are the `journey:` rows of
+`docs/designs/domains.yaml`; a case that claims no domain there is outside them by
+construction. This paragraph is the one statement of the rule; `bench/CUSTOM-TASKS.md`
+and `docs/designs/testing-strategy.md` restate it and defer here.
 
 ## The validator
 
@@ -285,10 +295,20 @@ commented-out state is for.
 id that disagrees with its directory, a `domain:` that is missing or not in
 `domains.yaml`, a `fixtures:` role the fleet catalog does not define, a cluster-reading
 case that declares no `fixtures:` at all, a missing, empty or inline `verification_spec`,
-a check that carries no assertion and so can only pass, and a case that is registered
-nowhere. It also applies the entry vocabulary above — role, the severity pairing, the
-rejected `hold` mode, a positive weight — which devops-bench enforces too, at spec-load
-time, after the lease.
+a check that carries no assertion and so can only pass, a missing `owner:` or one written
+as a mention or as something other than a login, and a case that is registered nowhere. It
+also applies the entry vocabulary above — role, the severity pairing, the rejected `hold`
+mode, a positive weight — which devops-bench enforces too, at spec-load time, after the
+lease.
+
+It also scans what the case brings with it: every text file under `bench/tasks/` and
+`bench/tf/prebuilt/`, for an IPv4 literal outside the RFC 5737 documentation ranges or a
+string matching the token-shaped subset of `AuditRedactor`'s patterns, with
+`sanitizer: allow <reason>` as the per-line escape. `bench/CONTRIBUTING.md` is the home of
+that rule — the ranges, the shapes, the skip list, the marker, and what review covers that
+the scan cannot. The scan is tree-level rather than per case, like the fixture-catalogue
+drift check, so `validate_all()` does not carry it; the lint asserts on
+`sanitization_findings()` in its own right.
 
 `scripts/test_task_registration.py` calls the same module in CI and asserts that it
 returned no findings at all, so the fast local check and the gating lint cannot disagree.

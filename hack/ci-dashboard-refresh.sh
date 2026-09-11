@@ -48,7 +48,15 @@
 #                              (default 14).
 #   EVAL_DASHBOARD_TIMEOUT     whole-pipeline budget in seconds (default 900).
 #   EVAL_DASHBOARD_FROM_DIR    local build-dir source instead of the GCS glob
-#                              -- the offline path the unit tests use.
+#                              -- the offline path the unit tests use. It also
+#                              disarms EVAL_DASHBOARD_RC_GLOB, so a from-dir
+#                              run reaches no bucket at all.
+#   EVAL_DASHBOARD_RC_GLOB     release-candidate build-dir glob, feeding the
+#                              page's Releases section; default below is
+#                              post-kube-agents-eval-rc's archive. Empty =
+#                              leave releases[] to the prior data.json.
+#   EVAL_DASHBOARD_RC_FROM_DIR local release-candidate source, the offline
+#                              counterpart; wins over the glob when set.
 #   JOB_TYPE / PULL_NUMBER     Prow's; gate bucket writes as above.
 #   ARTIFACTS                  when set, receives eval-dashboard-refresh.log.
 #
@@ -109,6 +117,11 @@ trap cleanup EXIT
 trap 'exit 143' TERM INT
 
 EVAL_DASHBOARD_PR_GLOB="${EVAL_DASHBOARD_PR_GLOB:-gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*}"
+# The release-candidate archive, which feeds the page's Releases section.
+# post-kube-agents-eval-rc is a postsubmit, so its builds land under logs/
+# rather than pr-logs/. Set to the empty string to leave the section on its
+# placeholder; a sweep that finds nothing does the same thing.
+EVAL_DASHBOARD_RC_GLOB="${EVAL_DASHBOARD_RC_GLOB-gs://kube-agents-prow/logs/post-kube-agents-eval-rc/*}"
 EVAL_DASHBOARD_SINCE_DAYS="${EVAL_DASHBOARD_SINCE_DAYS:-14}"
 # Freshness contract with the rendered page: the badge turns amber this many
 # seconds after generated_at. Sized to the periodic's 15m cadence with slack
@@ -139,6 +152,22 @@ case "${EVAL_DASHBOARD_TARGET}" in
     ;;
 esac
 
+# The adjudicator's verdict and its history, when the target has them, so the
+# rendered Brief bakes the current state instead of waiting for the page's
+# first poll. Missing is the normal case until the adjudicator has run.
+HEALTH_PRIOR="${WORK}/health.json"
+HISTORY_PRIOR="${WORK}/health-history.jsonl"
+case "${EVAL_DASHBOARD_TARGET}" in
+  gs://*)
+    gsutil cp "${EVAL_DASHBOARD_TARGET%/}/health.json" "${HEALTH_PRIOR}" >>"${REFRESH_LOG}" 2>&1 || rm -f "${HEALTH_PRIOR}"
+    gsutil cp "${EVAL_DASHBOARD_TARGET%/}/health-history.jsonl" "${HISTORY_PRIOR}" >>"${REFRESH_LOG}" 2>&1 || rm -f "${HISTORY_PRIOR}"
+    ;;
+  *)
+    [ -f "${EVAL_DASHBOARD_TARGET%/}/health.json" ] && cp "${EVAL_DASHBOARD_TARGET%/}/health.json" "${HEALTH_PRIOR}"
+    [ -f "${EVAL_DASHBOARD_TARGET%/}/health-history.jsonl" ] && cp "${EVAL_DASHBOARD_TARGET%/}/health-history.jsonl" "${HISTORY_PRIOR}"
+    ;;
+esac
+
 # ─── Steps 2-5: collect (incremental) -> floor -> render -> publish ─────────
 # One timeout over the whole pipeline so a hung gsutil cannot eat the job.
 # The budget must stay LARGER than the 300s collect.py grants each individual
@@ -150,7 +179,7 @@ BUDGET="${EVAL_DASHBOARD_TIMEOUT:-900}"
 TIMEOUT_CMD=(timeout "${BUDGET}")
 command -v timeout >/dev/null 2>&1 || TIMEOUT_CMD=()
 
-# Single quotes on purpose: $1..$7 are the child bash's own positionals, so
+# Single quotes on purpose: $1..$9 are the child bash's own positionals, so
 # no value ever meets an outer expansion. --merge-with always points at the
 # prior path; when the download above left nothing there, collect.py treats
 # it as a first run and bounds the sweep itself.
@@ -163,6 +192,15 @@ ${TIMEOUT_CMD[@]+"${TIMEOUT_CMD[@]}"} bash -c '
   else
     src_args=(--pr-glob "$4")
   fi
+  # The RC source. $9 is the offline one and wins outright; the bucket glob
+  # in $8 is only armed on the bucket path, so EVAL_DASHBOARD_FROM_DIR stays
+  # what it says it is -- a run that reaches no bucket at all. Neither set
+  # leaves releases[] to whatever --merge-with carried forward.
+  if [ -n "$9" ]; then
+    src_args+=(--rc-from-dir "$9")
+  elif [ -n "$8" ] && [ -z "$6" ]; then
+    src_args+=(--rc-glob "$8")
+  fi
   python3 "$1/collect.py" "${src_args[@]}" \
     --merge-with "$2/prior-data.json" \
     --since-days "$5" \
@@ -173,11 +211,15 @@ import json, sys
 if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
     sys.exit(\"collected zero runs: source unreadable or empty; refusing to publish an empty dashboard over a good one\")
 " "$2/data.json"
-  python3 "$1/render.py" --data "$2/data.json" --out-dir "$2/site"
+  render_args=()
+  [ -f "$2/health.json" ] && render_args+=(--health "$2/health.json")
+  [ -f "$2/health-history.jsonl" ] && render_args+=(--health-history "$2/health-history.jsonl")
+  python3 "$1/render.py" --data "$2/data.json" --out-dir "$2/site" "${render_args[@]}"
   python3 "$1/publish.py" --out-dir "$2/site" --target "$3"
 ' _ "${DASH_SRC}" "${WORK}" "${EVAL_DASHBOARD_TARGET}" "${EVAL_DASHBOARD_PR_GLOB}" \
   "${EVAL_DASHBOARD_SINCE_DAYS}" "${EVAL_DASHBOARD_FROM_DIR:-}" \
-  "${EVAL_DASHBOARD_STALE_AFTER_S}" \
+  "${EVAL_DASHBOARD_STALE_AFTER_S}" "${EVAL_DASHBOARD_RC_GLOB}" \
+  "${EVAL_DASHBOARD_RC_FROM_DIR:-}" \
   >>"${REFRESH_LOG}" 2>&1 || rc=$?
 
 # The full stage log always goes to stdout too: on a periodic, the build log

@@ -58,6 +58,11 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import command_policy  # noqa: E402
 import credential_proxy  # noqa: E402
 
+# The name the gateway redactor is registered under in sys.modules when a test
+# imports it by path. Distinct from the callback's own registration name so
+# the two copies never shadow each other inside one interpreter.
+GATEWAY_REDACTOR_MODULE_NAME = "kube_agents_gateway_redactor"
+
 
 @dataclass(frozen=True)
 class Source:
@@ -192,6 +197,35 @@ SOURCES: dict[str, Source] = {
         "platformagent-tagged.yaml",
         ("kind: Deployment",),
     ),
+    # The above-one-replica shape. Its anchor is the leader Role's pods rule,
+    # because that rule is the only reason the fixture is registered here:
+    # every other golden is single-replica and renders it away, so without
+    # this key group C bounds the leader Role only in the shape where it holds
+    # no write verb on pods at all.
+    "golden_ha": Source(
+        "k8s-operator/internal/testing/testdata/platform/expected/"
+        "platformagent-ha.yaml",
+        ("kind: Deployment", "kubeagents:leader:", "- pods"),
+    ),
+    # --- model egress -----------------------------------------------------
+    # The redactor the chart mounts into the LiteLLM gateway. It is a copy of
+    # the chat plugin's module, and tests/test_litellm_redaction.py keeps the
+    # two identical; C1 reads this one because this one is what runs at the
+    # egress point. The anchors are the pattern names and the exemption the
+    # two C1 tests exercise, so a rename fails the self-check rather than
+    # letting the assertions pass against a module that no longer redacts.
+    "gateway_redactor": Source(
+        "charts/kube-agents/files/redactor.py",
+        (
+            "GCP_OAUTH_TOKEN_PATTERN",
+            "GCP_API_KEY_PATTERN",
+            "JWT_PATTERN",
+            "PRIVATE_KEY_PATTERN",
+            "SECRET_BLOCK_PATTERN",
+            "gserviceaccount",
+            "def redact_text(",
+        ),
+    ),
     # --- supply chain -----------------------------------------------------
     "skill_sync": Source(
         "scripts/sync-upstream-skills.py",
@@ -215,6 +249,7 @@ _GOLDEN_KEYS = (
     "golden_tagged",
     "golden_scoped_sa",
     "golden_egress_allowlist",
+    "golden_ha",
 )
 
 
@@ -275,10 +310,11 @@ def yaml_documents(name: str) -> tuple[dict, ...]:
 def golden_documents() -> dict[str, tuple[dict, ...]]:
     """The rendered PlatformAgent object sets, keyed by fixture name.
 
-    Four fixtures cover four spec shapes the operator renders: the default
+    Five fixtures cover five spec shapes the operator renders: the default
     layout, the same with a pinned image tag, the scoped service-account pool,
-    and the egress allowlist. An invariant about the rendered output has to hold
-    on all four or it is a property of one configuration.
+    the egress allowlist, and the above-one-replica deployment. An invariant
+    about the rendered output has to hold on all five or it is a property of
+    one configuration.
 
     The split-broker fixture was the third of these until #913 deleted it: the
     broker is its own Deployment unconditionally now, so the layout it covered
@@ -295,6 +331,26 @@ def containers_of(document: dict) -> list[dict]:
     """Every container and init container in a Deployment document."""
     spec = document.get("spec", {}).get("template", {}).get("spec", {})
     return list(spec.get("initContainers") or []) + list(spec.get("containers") or [])
+
+
+def gateway_redactor_module():
+    """The redactor the gateway runs, imported from the chart's copy by path.
+
+    By path rather than through the chat plugin package, because the chart's
+    file is the one mounted into the LiteLLM pod; a test of what leaves the
+    estate has to read the artifact that does the leaving.
+    """
+    import importlib.util
+
+    path = path_of("gateway_redactor")
+    spec = importlib.util.spec_from_file_location(GATEWAY_REDACTOR_MODULE_NAME, path)
+    module = importlib.util.module_from_spec(spec)
+    # Registered before execution, as the import system does: the module
+    # declares a dataclass, and dataclasses resolve the defining module through
+    # sys.modules while the class body is being processed.
+    sys.modules[GATEWAY_REDACTOR_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def go_function_body(source: str, name: str) -> str:

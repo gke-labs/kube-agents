@@ -54,6 +54,37 @@ fi
 # Keep this value aligned with the Terraform full-install composition and admin portal.
 KUBE_AGENTS_HOST_LABEL="kube-agents-host"
 
+# The Artifact Registry repository the dev path builds into when the state
+# file names none. Dev scratch state, not an install default, so it lives
+# here rather than in install.defaults.env.
+readonly DEV_ARTIFACT_REGISTRY_REPO_DEFAULT="kube-agents"
+
+# ─── Identity names ───────────────────────────────────────────────────────────
+# The Kubernetes service accounts are the chart's and the operator's to name:
+# nothing the installer configures changes them, so they are constants here,
+# read by the kustomize dev path's envsubst (the minter's and LiteLLM's) or by
+# the docs terminology check (the agent's; the controller's is the kustomize
+# namePrefix applied to its base). The GCP service accounts and the namespace
+# are install configuration -- install.env can set them, and their defaults
+# live in install.defaults.env with the rest -- so export_identity_names fills
+# each in only when nothing loaded before it did. No controller GSA: no
+# install path creates one.
+readonly PLATFORM_AGENT_KSA_NAME_FIXED="kubeagents-platform-agent"
+readonly CONTROLLER_KSA_NAME_FIXED="kubeagents-controller"
+readonly GITHUB_MINTER_KSA_NAME_FIXED="kubeagents-github-minter"
+readonly LITELLM_KSA_NAME_FIXED="kubeagents-litellm"
+
+export_identity_names() {
+  export NAMESPACE="${NAMESPACE:-$DEFAULT_NAMESPACE}"
+  export PLATFORM_AGENT_GSA_NAME="${PLATFORM_AGENT_GSA_NAME:-$DEFAULT_PLATFORM_AGENT_GSA_NAME}"
+  export GITHUB_MINTER_GSA_NAME="${GITHUB_MINTER_GSA_NAME:-$DEFAULT_GITHUB_MINTER_GSA_NAME}"
+  export LITELLM_GSA_NAME="${LITELLM_GSA_NAME:-$DEFAULT_LITELLM_GSA_NAME}"
+  export PLATFORM_AGENT_KSA_NAME="$PLATFORM_AGENT_KSA_NAME_FIXED"
+  export CONTROLLER_KSA_NAME="$CONTROLLER_KSA_NAME_FIXED"
+  export GITHUB_MINTER_KSA_NAME="$GITHUB_MINTER_KSA_NAME_FIXED"
+  export LITELLM_KSA_NAME="$LITELLM_KSA_NAME_FIXED"
+}
+
 # ─── UI Helpers ───────────────────────────────────────────────────────────────
 print_step() { echo -e "\n${C_MAGENTA}${C_BOLD}>>>  $1  <<<${C_RESET}"; }
 print_success() { echo -e "  ${C_GREEN}✓ $1${C_RESET}"; }
@@ -439,7 +470,7 @@ init_var_image_tag() {
       print_error "IMAGE_TAG is required in non-interactive mode. Set it to an immutable release tag or validated commit SHA."
       exit 1
     else
-      local default_tag="latest"
+      local default_tag="$IMAGE_TAG_FALLBACK"
       echo -e "  ${C_CYAN}The base image tag is used for all images built from the kube-agents repo.${C_RESET}"
       echo -ne "  ${C_CYAN}Enter Base Image Tag (a commit SHA; 'latest' = latest commit on main) [${C_WHITE}${default_tag}${C_CYAN}]: ${C_RESET}"
       read -r input_tag
@@ -466,6 +497,9 @@ install_env_file_for_state() {
 load_state() {
   local env_registry_prefix="${REGISTRY_PREFIX:-}"
   local env_third_party_prefix="${THIRD_PARTY_REGISTRY_PREFIX:-}"
+  # Only the files may set NAMESPACE, as in the front doors: kubectl tooling
+  # exports that name, and the value reaches the release namespace.
+  unset NAMESPACE
   # Read if present, never created here. save_var below still appends to
   # VARS_FILE on its own, so a run that records anything creates the file
   # whether or not this block ran; opening it eagerly would only add an empty
@@ -510,19 +544,13 @@ load_state() {
     init_var_image_tag
   fi
   init_var_registry_prefix
-  export NAMESPACE="kubeagents-system"
-  export PLATFORM_AGENT_KSA_NAME="kubeagents-platform-agent"
-  export PLATFORM_AGENT_SANDBOX_KSA_NAME="platform-agent-sandbox"
-  export PLATFORM_AGENT_GSA_NAME="kubeagents-platform-gsa"
-  export CONTROLLER_KSA_NAME="kubeagents-controller"
-  export CONTROLLER_GSA_NAME="kubeagents-controller-gsa"
-  export GITHUB_MINTER_KSA_NAME="kubeagents-github-minter"
-  export GITHUB_MINTER_GSA_NAME="kubeagents-github-minter-gsa"
-  export LITELLM_KSA_NAME="kubeagents-litellm"
-  export LITELLM_GSA_NAME="kubeagents-litellm-gsa"
+  export_identity_names
 }
 
 ensure_teardown_state() {
+  # Only the files may set NAMESPACE, as in the front doors: kubectl tooling
+  # exports that name, and the value reaches the release namespace.
+  unset NAMESPACE
   # Both files, in load_state's order: VARS_FILE first, install.env last so the
   # hand-authored input wins. Reading only VARS_FILE is not enough here --
   # it holds dev scratch state (the artifact-registry repo name, whether this
@@ -552,18 +580,9 @@ ensure_teardown_state() {
     export CLUSTER_NAME="${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}"
     export GKE_DB_KMS_KEYRING="${GKE_DB_KMS_KEYRING:-}"
     export GKE_DB_KMS_KEY="${GKE_DB_KMS_KEY:-}"
-    export GCP_ARTIFACT_REGISTRY_REPO_NAME="${GCP_ARTIFACT_REGISTRY_REPO_NAME:-${REPO_NAME:-kube-agents}}"
+    export GCP_ARTIFACT_REGISTRY_REPO_NAME="${GCP_ARTIFACT_REGISTRY_REPO_NAME:-${REPO_NAME:-$DEV_ARTIFACT_REGISTRY_REPO_DEFAULT}}"
     export DEV_ARTIFACT_REGISTRY_CREATED="${DEV_ARTIFACT_REGISTRY_CREATED:-false}"
-    export NAMESPACE="kubeagents-system"
-    export PLATFORM_AGENT_KSA_NAME="kubeagents-platform-agent"
-    export PLATFORM_AGENT_SANDBOX_KSA_NAME="platform-agent-sandbox"
-    export PLATFORM_AGENT_GSA_NAME="kubeagents-platform-gsa"
-    export CONTROLLER_KSA_NAME="kubeagents-controller"
-    export CONTROLLER_GSA_NAME="kubeagents-controller-gsa"
-    export GITHUB_MINTER_KSA_NAME="kubeagents-github-minter"
-    export GITHUB_MINTER_GSA_NAME="kubeagents-github-minter-gsa"
-    export LITELLM_KSA_NAME="kubeagents-litellm"
-    export LITELLM_GSA_NAME="kubeagents-litellm-gsa"
+    export_identity_names
   else
     echo -e "  ${C_YELLOW}⚠ No install coordinates in ${VARS_FILE} or install.env. Prompting for target values...${C_RESET}"
     local ACTIVE_PROJECT
@@ -597,10 +616,9 @@ ensure_teardown_state() {
       read -r INPUT_CLUSTER_NAME
       export CLUSTER_NAME="${INPUT_CLUSTER_NAME:-$CLUSTER_NAME}"
     fi
-    export NAMESPACE="kubeagents-system"
     export GKE_DB_KMS_KEYRING="${GKE_DB_KMS_KEYRING:-}"
     export GKE_DB_KMS_KEY="${GKE_DB_KMS_KEY:-}"
-    export GCP_ARTIFACT_REGISTRY_REPO_NAME="${GCP_ARTIFACT_REGISTRY_REPO_NAME:-${REPO_NAME:-kube-agents}}"
+    export GCP_ARTIFACT_REGISTRY_REPO_NAME="${GCP_ARTIFACT_REGISTRY_REPO_NAME:-${REPO_NAME:-$DEV_ARTIFACT_REGISTRY_REPO_DEFAULT}}"
     export DEV_ARTIFACT_REGISTRY_CREATED="${DEV_ARTIFACT_REGISTRY_CREATED:-false}"
     if [ "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}" = "true" ]; then
       export CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
@@ -609,15 +627,7 @@ ensure_teardown_state() {
       export CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-}"
       export CHAT_SUB_NAME="${CHAT_SUB_NAME:-}"
     fi
-    export PLATFORM_AGENT_KSA_NAME="kubeagents-platform-agent"
-    export PLATFORM_AGENT_SANDBOX_KSA_NAME="platform-agent-sandbox"
-    export PLATFORM_AGENT_GSA_NAME="kubeagents-platform-gsa"
-    export CONTROLLER_KSA_NAME="kubeagents-controller"
-    export CONTROLLER_GSA_NAME="kubeagents-controller-gsa"
-    export GITHUB_MINTER_KSA_NAME="kubeagents-github-minter"
-    export GITHUB_MINTER_GSA_NAME="kubeagents-github-minter-gsa"
-    export LITELLM_KSA_NAME="kubeagents-litellm"
-    export LITELLM_GSA_NAME="kubeagents-litellm-gsa"
+    export_identity_names
   fi
 }
 
@@ -782,8 +792,17 @@ register_host_label() {
 confirm_action() {
   local warning_msg=$1
   shift
-  
-  if [ "${NO_CONFIRM:-0}" -eq 1 ] || [ "${DRY_RUN:-0}" -eq 1 ] || is_ci_pipeline; then
+
+  # Only explicit intent gets past a destruction prompt: --no-confirm/-y (or
+  # an exported NO_CONFIRM=1, the same intent spelled as a variable), or
+  # --dry-run, under which nothing is destroyed. CI is deliberately not on
+  # this list. GitHub Actions and GitLab CI set CI=true on their own, so
+  # reading it as "yes" let an inherited variable authorise a delete nobody
+  # asked for (#557). is_non_interactive still
+  # consults CI, and that is right: a value prompt asks "can anyone answer",
+  # and taking the default there is what an unattended run wants. This prompt
+  # asks "did someone authorise this", which an inherited variable cannot say.
+  if [ "${NO_CONFIRM:-0}" -eq 1 ] || [ "${DRY_RUN:-0}" -eq 1 ]; then
     return 0
   fi
   
@@ -798,9 +817,16 @@ confirm_action() {
   echo -e "${C_YELLOW}==============================================================================${C_RESET}"
   echo ""
   echo -ne "  ${C_CYAN}Are you sure you want to proceed? (y/N): ${C_RESET}"
-  read -r -n 1 REPLY
+  # `|| REPLY=""`: read returns 1 at EOF, and the callers run under set -e, so
+  # a run with no terminal used to die mid-prompt with nothing said. Say what
+  # is missing and what to pass instead, the way uninstall.sh does.
+  read -r -n 1 REPLY || REPLY=""
   echo
   if ! is_truthy "$REPLY"; then
+      if [ ! -t 0 ]; then
+        print_error "No interactive terminal is available. Re-run with --no-confirm only after reviewing the target above."
+        exit 1
+      fi
       echo -e "  ${C_YELLOW}ℹ Aborted.${C_RESET}"
       exit 0
   fi

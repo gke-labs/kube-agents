@@ -181,7 +181,7 @@
       "repository": "docker.io/library/golang",
       "tag": "1.27-alpine",
       "buildArg": "GOLANG_IMAGE",
-      "pulledBy": "deploy/docker/Dockerfile and k8s-operator/Dockerfile builder stages.",
+      "pulledBy": "deploy/docker/Dockerfile, k8s-operator/Dockerfile and a2a/Dockerfile.gateway builder stages.",
       "description": "Go toolchain for the operator and k8s-event-watcher builds."
     },
     {
@@ -199,7 +199,7 @@
       "repository": "gcr.io/distroless/static",
       "tag": "nonroot",
       "buildArg": "DISTROLESS_IMAGE",
-      "pulledBy": "k8s-operator/Dockerfile runtime stage.",
+      "pulledBy": "k8s-operator/Dockerfile and a2a/Dockerfile.gateway runtime stages.",
       "description": "Runtime base for the operator image."
     },
     {

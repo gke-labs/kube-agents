@@ -320,7 +320,10 @@ Mutation(
     ),
     Mutation(
         "B4-workflow-run-gate",
-        ".github/workflows/autopush-redeploy-agent.yml",
+        # Renamed from autopush-redeploy-agent.yml by #1199. The old path made
+        # the whole harness crash rather than report one stale mutation, which
+        # is why the missing-file case is handled below.
+        ".github/workflows/autopush-deploy.yml",
         ("github.event.workflow_run.head_branch == 'main'", "true"),
         "test_B4_every_workflow_run_deploy_gates",
         "drop the branch predicate while debugging a deploy, which is when it "
@@ -509,6 +512,27 @@ Mutation(
         "test_C1_every_operator_supplied_cidr_reaches_the_refusal_guards",
         "rename the 4-in-6 guard so every call site misses it; Go would not "
         "compile, but the point is that the conformance suite says so first",
+    ),
+    Mutation(
+        "C1-gateway-oauth-shape",
+        "charts/kube-agents/files/redactor.py",
+        ('        text = cls.GCP_OAUTH_TOKEN_PATTERN.sub("[REDACTED_SECRET]", text)\n', ""),
+        "test_C1_the_gateway_redactor_matches_the_leaked_credential_shapes",
+        "drop the ya29 substitution from the chain while reordering it -- the "
+        "pattern constant stays, so anything that greps for it is satisfied, "
+        "and the shape gke-labs/kube-agents#603 measured leaves for the "
+        "provider in the clear",
+    ),
+    Mutation(
+        "C1-gateway-sa-exemption",
+        "charts/kube-agents/files/redactor.py",
+        ('r"[a-zA-Z0-9._%+\\-]+@(?!(?:[a-zA-Z0-9\\-]+\\.)*gserviceaccount\\.com(?!\\.?[\\w\\-]))"',
+         'r"[a-zA-Z0-9._%+\\-]+@"'),
+        "test_C1_the_gateway_redactor_leaves_ordinary_manifest_content_alone",
+        "simplify the e-mail pattern by dropping the service-account exemption; "
+        "every IAM principal in a tool result then reaches the model as "
+        "[REDACTED_EMAIL], which is the over-eager shape that gets redaction "
+        "turned off",
     ),
     Mutation(
         "C2-unknown-flag-fail-open",
@@ -740,7 +764,10 @@ Mutation(
     ),
     Mutation(
         "C5-leader-reaches-configmaps",
-        "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
+        # platformagent-ha.yaml, not platformagent.yaml: the leader Role's pods
+        # rule renders only above one replica, and the HA fixture is the only
+        # golden that sets it.
+        "k8s-operator/internal/testing/testdata/platform/expected/platformagent-ha.yaml",
         ("    resources:\n      - pods\n    verbs:\n      - get\n      - patch\n",
          "    resources:\n      - configmaps\n      - pods\n    verbs:\n      - get\n      - patch\n"),
         "test_C5_the_leader_role_stays_confined_to_coordination",
@@ -1037,6 +1064,10 @@ def main() -> int:
     verdicts = []
     for mutation in selected:
         path = REPO / mutation.path
+        if not path.exists():
+            verdicts.append((mutation, "STALE", []))
+            print(f"STALE    {mutation.id}: {mutation.path} does not exist")
+            continue
         original = path.read_text()
         old, new = mutation.edit
         if old not in original:
