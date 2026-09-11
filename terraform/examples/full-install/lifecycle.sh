@@ -124,6 +124,14 @@ readonly CLUSTER_KMS_ADDRESSES
 # way (KMS cannot delete either).
 readonly MINTER_KMS_KEYRING_ADDRESS="module.github_minter[0].google_kms_key_ring.minter"
 readonly MINTER_KMS_KEY_ADDRESS="module.github_minter[0].google_kms_crypto_key.minter"
+# What "the minter's signing key is not there" looks like coming back from
+# gcloud, as against "the guard could not ask". NOT_FOUND is the key ring or key
+# itself missing. The other two are Cloud KMS not being enabled on the project,
+# which on a first apply says the same thing: main.tf enables cloudkms in the
+# very apply guard_minter_key runs ahead of, so a fresh project answers
+# SERVICE_DISABLED where an established one answers NOT_FOUND. Same shape as
+# GCS_OBJECT_ABSENT_PATTERN in scripts/installer/installer_common.sh.
+readonly MINTER_KEY_ABSENT_PATTERN='NOT_FOUND|SERVICE_DISABLED|has not been used in project'
 readonly HELM_RELEASE_ADDRESS="helm_release.kube_agents"
 readonly AGENT_GSA_ADDRESS="module.kube_agents_iam.google_service_account.agent"
 
@@ -199,6 +207,7 @@ state_prefix() {
 # when nothing changed, and skipping it is how a routine `git pull` that adds a
 # module turns every subcommand below into a failure.
 ensure_init() {
+  log "initializing Terraform..."
   ensure_backend "${1:-}"
   terraform init -input=false >/dev/null || {
     warn "terraform init failed; run it by hand to see why"
@@ -670,6 +679,56 @@ forget_unmanaged_cluster_kms() {
     "$location" "$project"
 }
 
+# When enable_github_minter is true, the minter Deployment cannot pass readiness
+# probes without an ENABLED private key version in KMS. Terraform creates the key
+# with skip_initial_version_creation = true (import-only), and the helm release
+# waits on every Deployment (wait = true), so applying without an imported key
+# wedges the apply with the cluster already built.
+#
+# Two distinct ways the key can fail to be usable, and they are not the same
+# question. NOT_FOUND means the keyring or key does not exist yet -- the state
+# before the very first apply, since Terraform is what creates them -- which is
+# exactly the wedge above, so refuse. PERMISSION_DENIED or a transient API error
+# means the guard could not ask, which is not evidence that the key is missing:
+# warn and proceed rather than blocking an apply on the guard's own blind spot.
+guard_minter_key() {
+  [[ "$(tfvar enable_github_minter)" == "true" ]] || return 0
+  local project location keyring key versions list_err err_file reason="" list_rc=0
+  project=$(tfvar project_id)
+  location=$(sed -E 's/-[a-z]$//' <<<"$(tfvar location)")
+  keyring=$(tfvar github_minter_kms_keyring)
+  key=$(tfvar github_minter_kms_key)
+
+  # stderr is captured apart from the version list rather than merged into it: a
+  # gcloud that exits 0 after writing an impersonation or quota-project notice to
+  # stderr would otherwise have that notice read back as an ENABLED version.
+  err_file=$(mktemp)
+  versions=$(gcloud kms keys versions list --key "$key" --keyring "$keyring" \
+    --location "$location" --project "$project" \
+    --filter='state=ENABLED' --format='value(name)' 2>"$err_file") || list_rc=$?
+  list_err=$(cat "$err_file")
+  rm -f "$err_file"
+
+  if [[ $list_rc -ne 0 ]]; then
+    if ! printf '%s' "$list_err" | grep -qiE "$MINTER_KEY_ABSENT_PATTERN"; then
+      warn "could not verify Cloud KMS signing key '$location/$keyring/$key' for GitHub minter ($list_err)."
+      warn "Proceeding with apply, but note that the minter requires an ENABLED imported private key to pass readiness."
+      return 0
+    fi
+    reason="does not exist yet"
+  elif [[ -z "$(head -1 <<<"$versions")" ]]; then
+    reason="has no ENABLED version"
+  else
+    return 0
+  fi
+
+  warn "enable_github_minter is true, but KMS signing key '$location/$keyring/$key' $reason."
+  warn "Applying now would deploy the minter and wedge waiting on its readiness probe."
+  warn "Import the GitHub App private key before applying (see k8s-operator/config/integrations/github/README.md),"
+  warn "or set enable_github_minter = false in terraform.tfvars."
+  exit 1
+}
+
 delete_agent_cr() {
   local namespace cluster location project names
   namespace=$(tfvar namespace)
@@ -841,11 +900,14 @@ case "${1:-}" in
   apply)
     shift
     ensure_init
+    log "verifying pre-apply safety guards (cluster, IAM, KMS)..."
     guard_cluster_ownership
     guard_gsa_identity
     guard_kms_identity
     guard_release_namespace
     forget_unmanaged_cluster_kms
+    guard_minter_key
+    log "checking pre-existing GCP resources to adopt (KMS, Pub/Sub)..."
     adopt_kms
     adopt_pubsub
     log "terraform apply"

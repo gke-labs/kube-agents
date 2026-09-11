@@ -67,8 +67,38 @@ DEFAULT_TTL_MIN = 60
 # to stay well inside the `timeout` set in .claude/settings.json. The hook makes
 # at most three of these in a row (read the lease, then renew: read again and
 # replace) plus one context probe, which is cached per classification because a
-# compound line would otherwise pay for one probe per segment.
 KUBECTL_TIMEOUT = 8
+
+
+def _get_kubectl_timeout() -> int:
+    """Resolves the kubectl execution timeout in seconds.
+
+    Reads KUBE_AGENTS_KUBECTL_TIMEOUT from the environment if set, otherwise
+    defaults to KUBECTL_TIMEOUT (8s).
+
+    Why this variable exists:
+    On cold GitHub Actions runners, the first kubectl command must cold-start
+    gke-gcloud-auth-plugin, exchange tokens with Google STS / IAM via Workload
+    Identity Federation (WIF), and perform TLS handshakes to GKE API endpoints
+    over the public internet. Under cloud latency jitter this takes ~8-9s,
+    exceeding the 8s hook budget and causing spurious acquire/status timeouts
+    (exit code 124) during reconcile and deploy CI jobs (#1465).
+
+    Where it is configured:
+    In GitHub Repository Settings under Environments (e.g. `autopush`, `staging`)
+    as `vars.KUBE_AGENTS_KUBECTL_TIMEOUT` (typically set to 15s), passed into CI
+    workflow steps via `env: KUBE_AGENTS_KUBECTL_TIMEOUT: ${{ vars.KUBE_AGENTS_KUBECTL_TIMEOUT }}`.
+    Can also be exported locally in shell environments to override the timeout.
+    """
+    raw = os.environ.get("KUBE_AGENTS_KUBECTL_TIMEOUT")
+    if raw:
+        try:
+            val = int(raw)
+            if val > 0:
+                return val
+        except ValueError:
+            pass
+    return KUBECTL_TIMEOUT
 
 # SessionEnd `reason` values that do not end the session. Claude Code fires the
 # event for `/clear` and `/resume` too, on a process that carries on with the
@@ -586,13 +616,14 @@ def kubectl(install, args, stdin=None):
     kenv = dict(os.environ)
     if install.kubeconfig:
         kenv["KUBECONFIG"] = install.kubeconfig
+    timeout = _get_kubectl_timeout()
     try:
         proc = subprocess.run(
             cmd, input=stdin, capture_output=True, text=True,
-            timeout=KUBECTL_TIMEOUT, env=kenv,
+            timeout=timeout, env=kenv,
         )
     except subprocess.TimeoutExpired:
-        return 124, "", "kubectl timed out after %ds" % KUBECTL_TIMEOUT
+        return 124, "", "kubectl timed out after %ds" % timeout
     except FileNotFoundError:
         return 127, "", "kubectl not found on PATH"
     return proc.returncode, proc.stdout, proc.stderr

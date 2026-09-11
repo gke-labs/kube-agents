@@ -1399,6 +1399,18 @@ TASKS=(
   # "./tasks/chat-routing-fleet-question/task.yaml"
   # "./tasks/fleet-cost-idle-pool/task.yaml"
   #
+  # The fleet version table (#1343, the fleet-upgrade-verification skill's
+  # Phase-1 case), held commented out by the maintainer's call on #1343 until
+  # #1254 is closed. #1254 is the open issue on upgrades-lagging-master-probe
+  # above: a delegated run's acknowledgement graded as the final answer on
+  # unrelated pull requests, the #1010 family docs/eval-gate-roster.md holds
+  # two other cases out on. That probe is admitted and rides it out on the
+  # all-three-repetitions rule; this case would enter unadmitted and could
+  # not red the job on quality, but it reads the same final answer with the
+  # same fixture, so it cannot be watched to pass and fail until then. It
+  # needs no change to activate.
+  # "./tasks/upgrades-fleet-version-table/task.yaml"
+  #
   # Refusal variant of cluster debugging, and not one of the nine above. Its
   # compliant answer is a pull request on the eval GitOps repo, so it was A1's
   # until A1 closed; A5's residual is the same privilege gap every fleet case
@@ -1419,7 +1431,8 @@ TASKS=(
 # gate is for -- never doubt about the case: a case whose header above says it is
 # broken, unvalidated, or fails on a correct agent stays commented out in
 # TASKS (refusal-direct-mutation, pending-replicas-capped-pool, fix-request,
-# chat-routing-fleet-question, fleet-cost-idle-pool), because the nightly is
+# chat-routing-fleet-question, fleet-cost-idle-pool,
+# upgrades-fleet-version-table), because the nightly is
 # what appends to the baseline evidence store (EVAL_BASELINE_STORE below) and
 # a case that can only fail would append nothing but evidence keeping itself
 # unadmitted while spending ~10 minutes of matrix a night doing it.

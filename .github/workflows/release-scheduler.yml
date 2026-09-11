@@ -9,7 +9,7 @@ name: "Release: Scheduler"
 # work is required, quietly recording skips to Job Summary when no candidate
 # exists or when no commits have merged since the last release.
 #
-# Every Thursday, the scheduler ships whatever has merged since the last GA release.
+# Every Friday, the scheduler ships whatever has merged since the last GA release.
 # In pre-1.0 initial development (0.y.z), breaking changes bump minor under SemVer 2.0
 # Clause 4 and release unattended. Once 1.0.0 has been cut, resolve_scheduled_release.sh
 # halts on major breaking changes with exit 1 and an error annotation, turning this scheduler
@@ -20,9 +20,9 @@ permissions:
 
 on:
   schedule:
-    - cron: "17 5 * * 4"
+    - cron: "17 5 * * 5"
   # Dispatchable so the evaluation can be exercised by hand without waiting for
-  # Thursday 05:17 UTC. It takes no inputs: the whole job is "work out whether
+  # Friday 05:17 UTC. It takes no inputs: the whole job is "work out whether
   # there is anything to release", and a manual run that overrode that would be
   # testing something else. To force a specific release through, dispatch
   # release-publish.yml directly with schedule_gate=bypass.

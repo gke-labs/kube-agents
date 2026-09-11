@@ -78,8 +78,10 @@ pseudonym, and stays readable so an operator can still resolve it against the
 Slack directory. The hash is stable for as long as the salt is, so sessions from
 the same person still correlate; the salt is generated once at install and
 rotating it re-anonymizes everyone. `agents/chat/defaults/plugins/common/redactor.py`
-is the single implementation, shared by the store, the OTel bridge, and both
-audit hooks.
+is the canonical implementation, shared by the store, the OTel bridge, and both
+audit hooks; `charts/kube-agents/files/redactor.py` is a byte-identical mirror
+the chart mounts into the LiteLLM gateway for request redaction, kept equal by
+`tests/test_litellm_redaction.py`.
 
 Rows written before this change still carry `user_email`, so
 `session_kv_server.init_db()` strips the plaintext keys out of them on startup.

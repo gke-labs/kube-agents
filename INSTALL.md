@@ -18,6 +18,8 @@ This comprehensive, step-by-step guide explains how to install, configure, deplo
 1. [Architecture & Overview](#architecture--overview)
 2. [Prerequisites & Tooling Matrix](#prerequisites--tooling-matrix)
 3. [Method 0: Zero-Friction One-Liner Installation (Fastest)](#method-0-zero-friction-one-liner-installation-fastest)
+   - [Generate-Only Mode (Recommended for Existing Infrastructure)](#generate-only-mode-recommended-for-existing-infrastructure)
+   - [Non-Interactive & AI Agent Execution Mode](#non-interactive--ai-agent-execution-mode)
 4. [Method 1: The Install Engine — Terraform + Helm](#method-1-the-install-engine--terraform--helm)
    - [Step-by-Step Execution](#step-by-step-execution)
 5. [The Shell Sandbox](#the-shell-sandbox)
@@ -88,6 +90,37 @@ Three behaviours worth knowing before the first run:
   on — so the sandbox costs nothing there. On a Standard cluster it provisions a `gvisor-pool`
   node pool of one `e2-standard-4` per zone. Pass `--gvisor=false` to run on the standard
   container runtime.
+
+### Generate-Only Mode (Recommended for Existing Infrastructure)
+
+When deploying `kube-agents` onto **pre-existing infrastructure** (an existing GKE cluster, shared VPC, or existing GCP project), running with `--generate-only` (or answering `g` at the installer's final confirmation prompt) is the **recommended approach**:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
+  --generate-only \
+  --project-id="my-gcp-project" \
+  --cluster-name="existing-cluster-name" \
+  --region="us-central1"
+```
+
+#### Why `--generate-only` on Existing Infrastructure:
+
+- **Operator Review Before Live Mutation**: Adopting existing infrastructure means `terraform apply` touches resources you did not create, so generating the inputs (`terraform.tfvars`, `install.env`) and reviewing them before the apply keeps that decision with the operator.
+- **Out-of-Terraform Prerequisites & Operator Handoff**: The installer probes the target cluster, runs pre-apply validations without mutating GCP resources, and prints a checklist of the steps Terraform cannot perform (CMEK database encryption, the Workload Identity pool, NetworkPolicy enforcement, the GitHub App private key import, and the managed-OTel scope) for you to apply as they pertain to your cluster.
+
+#### What `--generate-only` Does:
+
+1. Probes cluster parameters and writes the complete configuration to `install.env` (if absent) and `terraform/examples/full-install/terraform.tfvars`.
+2. Runs the same pre-flight checks a real run does — including the existing-cluster node-pool and NetworkPolicy consent gates, and the refusal for a cluster that cannot be described — without creating or modifying GCP resources. A cluster that needs `--migrate-node-pools` or `--enable-network-policy` is refused here, exiting 1 with a `REFUSED_*` status. `install.env` and `terraform.tfvars` are written before these checks run, so a refused run leaves both on disk; what it withholds is the operator handoff and the `GENERATE_ONLY_SUCCESS` report, and the tfvars it leaves behind have not been validated.
+3. Prints the exact step-by-step manual execution recipe:
+   - **Out-of-Terraform prerequisites** for existing clusters (CMEK database encryption enablement, node-pool `GKE_METADATA` workload identity update, NetworkPolicy enablement, and Cloud KMS key creation for GitHub App private key signing).
+   - **Terraform Apply execution** with remote state management via `lifecycle.sh`:
+     ```bash
+     cd terraform/examples/full-install
+     KUBE_AGENTS_STATE_BUCKET="<project>-kube-agents-tfstate" KUBE_AGENTS_STATE_PREFIX="kube-agents/<cluster>" ./lifecycle.sh apply
+     ```
+   - **Post-apply steps** (managed-OTel collection scope, on a cluster this install created).
+4. Exits with code `0` and writes `{"status": "GENERATE_ONLY_SUCCESS", ...}` to `/tmp/kube-agents-install-report.json`.
 
 ### Non-Interactive & AI Agent Execution Mode
 
@@ -247,6 +280,8 @@ KUBE_AGENTS_STATE_BUCKET=auto ./lifecycle.sh apply
   where Save & Apply re-applies through the same engine, or edit your
   hand-written tfvars and re-apply.
 
+- **Existing Infrastructure Recommendation**: When installing on pre-existing infrastructure (such as an existing GKE cluster or shared VPC), using `./install.sh --generate-only` (see [Generate-Only Mode](#generate-only-mode-recommended-for-existing-infrastructure)) is recommended to auto-generate `terraform.tfvars`, run pre-apply validation checks, and review prerequisites before applying.
+
 - **Private Container Registry**: If your GKE clusters may only pull from an approved registry, see
   [Private container registry](#private-container-registry) below for the full recipe. Mirroring
   only the `kube-agents` images is not enough on its own: `image_registry` (or `install.sh`'s
@@ -351,7 +386,8 @@ If you enabled Google Chat or Slack during the install, perform the following re
 
 1. **Verify Slack App Settings**:
    - Ensure **Socket Mode** is enabled in your Slack App console.
-   - Verify that your Bot Token (`SLACK_BOT_TOKEN`) has the required scopes: `app_mentions:read`, `channels:history`, `chat:write`, `channels:read`, `groups:read`, `im:read`, `mpim:read`, `files:write`, `reactions:write`.
+   - Verify that your Bot Token (`SLACK_BOT_TOKEN`) holds every bot scope in the manifest `hermes slack manifest` emits (step 4 below). At the Hermes tag in [`tags.env`](tags.env) that list is `app_mentions:read`, `assistant:write`, `channels:history`, `channels:read`, `chat:write`, `commands`, `files:read`, `files:write`, `groups:history`, `groups:read`, `im:history`, `im:read`, `im:write`, `mpim:history`, `mpim:read`, `reactions:read`, `reactions:write`, `users:read`. Regenerate it from the command rather than editing this line: `reactions:write` is added by [`deploy/docker/patches/apply_slack_reactions_scope.py`](deploy/docker/patches/apply_slack_reactions_scope.py) rather than by Hermes, and `--no-assistant` drops `assistant:write`. If the app does not exist yet, create it from that manifest (**Create New App → From a manifest**) instead of ticking scopes by hand; the command reads nothing from Slack, so it runs on an install where Slack is not configured.
+   - The `*:history` scopes are the ones a hand-built app most often lacks. `im:read` grants the conversation metadata; the text of a DM arrives on `message.im`, which needs `im:history`, and `groups:history` and `mpim:history` do the same for private and group channels. A bot without them connects normally and is never sent the message; the only symptom is a DM that goes unanswered.
    - `files:write` is the one that is easy to miss, because omitting it looks like nothing is wrong. A card whose answer is text is delivered normally; a card that produces a **file** has its upload rejected with `missing_scope`, which the artifact delivery path catches and logs as a warning. The user is told the task completed and never sees the artifact. Add the scope and reinstall the app.
    - `reactions:write` fails more quietly still. The agent puts 👀 on a message when it picks the work up and swaps it for ✅ or ❌ when the turn ends; without the scope Slack rejects each of those with `missing_scope`, the adapter logs it at debug and carries on, and the answer still arrives. The only symptom is that no reaction ever appears. Add the scope and reinstall.
 2. **Test Bot Connection**:
@@ -480,9 +516,12 @@ kubectl create secret generic platform-agent-secrets \
 
 The last two are generated, not chosen: `SESSION_KV_API_KEY` is the bearer token
 for the pod-local Session KV server, and `SESSION_KV_SALT` is the HMAC salt that
-pseudonymises chat identities before they are written to disk. Keep the salt:
+pseudonymises chat identities before they are written to disk, and, when the
+chart's `litellm.redaction` is on, also keys the `[ip:…]` and `[<rule>:…]`
+pseudonyms the gateway substitutes into provider requests. Keep the salt:
 rotating it re-anonymises every user, severing their past sessions from their
-future ones.
+future ones, and gives every pseudonymised identifier a new token the model
+cannot correlate with the old one.
 
 Both are optional in the sense that the pod still starts without them, but
 `SESSION_KV_API_KEY` is not optional in practice: the in-pod `k8s-event-watcher`

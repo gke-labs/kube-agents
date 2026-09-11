@@ -87,8 +87,9 @@ The operator does not place managed credentials in the sandbox Pod's:
   metadata server has nothing to give it.
 
 Two containers mount a projected ServiceAccount token on purpose, and both projections
-carry the broker's audience rather than the Kubernetes API's: the gateway's
-`platform-agent` container and the sandbox's `shell` container. Each presents it to the
+carry a broker audience rather than the Kubernetes API's (one per pod, so the broker can
+tell the two apart): the gateway's `platform-agent` container and the sandbox's `shell`
+container. Each presents it to the
 broker to be let past the listener's authentication, which is what
 `CREDENTIAL_PROXY_TOKEN_FILE` names. The API server rejects a token minted for another
 audience, so neither is a Kubernetes credential and neither undoes the Pod's
@@ -140,10 +141,12 @@ an auditable object rather than a control until that gateway policy is narrowed.
 in any case do nothing on a cluster whose CNI does not enforce NetworkPolicy. See
 [Denying the sandbox the metadata server](site/src/content/docs/reference/credential-isolation.md#denying-the-sandbox-the-metadata-server).
 
-Nothing tells the gateway from the sandbox. The broker authenticates every caller with a
-`TokenReview` over an audience-bound projected token, but `CREDENTIAL_PROXY_ALLOWED_CALLERS`
-names both ServiceAccounts and no policy varies on which one presented it. The broker
-records the principal; nothing reads it yet.
+The ServiceAccount does not tell the gateway from the sandbox. The broker authenticates
+every caller with a `TokenReview` over an audience-bound projected token, and
+`CREDENTIAL_PROXY_ALLOWED_CALLERS` names every calling ServiceAccount without varying on
+which one presented it; what does vary the policy is the audience the token was minted for
+and the route table it feeds
+([Caller authentication](designs/agent-shell-sandboxing.md#caller-authentication)).
 
 ## Scope
 
@@ -197,12 +200,14 @@ Envoy is the only listener for credentialed tool and chat requests. The
 credential runtime listens on a Unix socket mounted only in its own Pod, so no
 caller can bypass Envoy by reaching the runtime directly. Envoy authenticates
 every caller that is not asking for `/healthz`: the caller presents an
-audience-bound projected ServiceAccount token (audience
-`kubeagents-credential-proxy`, one hour) as a bearer header, and the runtime
-verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLERS`. That
-list names the gateway's ServiceAccount and the sandbox's, and no policy varies
-on which one presented the token, so the check keeps other workloads out rather
-than telling those two apart. The token crosses the cluster network in cleartext;
+audience-bound projected ServiceAccount token (one hour; the audience is per
+pod, `kubeagents-credential-proxy` for the sandbox and
+`kubeagents-credential-proxy-chat` for the gateway) as a bearer header, and the
+runtime verifies it with a `TokenReview` against `CREDENTIAL_PROXY_ALLOWED_CALLERS`.
+That list names the gateway's ServiceAccount and the sandbox's and does not vary
+on which one presented the token — the audience and the route table it feeds do —
+so the allowlist itself keeps other workloads out rather than telling those two
+apart. The token crosses the cluster network in cleartext;
 a NetworkPolicy is what keeps it off the wire elsewhere.
 
 The `agent-api-auth` sidecar authenticates the existing PlatformAgent API on port
@@ -269,13 +274,14 @@ to a per-process random salt with one warning.
 The projected token uses the audience `kubeagents-credential-proxy`, expires
 after one hour, and is mounted at
 `/var/run/secrets/kubeagents/serviceaccount/token` in the credential runtime. A token
-with the same audience is also mounted read-only in the `platform-agent` container,
-because that is how the agent authenticates to a broker that is not on loopback.
-The event watcher has a separate one-hour token with the Kubernetes API's
-default audience, plus the cluster CA and Pod namespace, mounted at the
-conventional in-cluster path in `agent-api-auth`. Two differently
-audienced tokens therefore sit side by side in the gateway Pod: the broker-audience one,
-which the Kubernetes API will not accept, and the watcher's, which it will. Neither is
+for the gateway's own broker audience, `kubeagents-credential-proxy-chat`, is mounted
+read-only in the `platform-agent` container, because that is how the agent
+authenticates to a broker that is not on loopback and how the broker knows it is the
+gateway calling. The event watcher has a separate one-hour token with the Kubernetes
+API's default audience, plus the cluster CA and Pod namespace, mounted at the
+conventional in-cluster path in `agent-api-auth`. Two differently audienced tokens
+therefore sit side by side in the gateway Pod: the broker-audience one, which the
+Kubernetes API will not accept, and the watcher's, which it will. Neither is
 shared with the sandbox or dashboard.
 Deleting a default token during startup is intentionally not used: projected
 tokens rotate, and mount-time exclusion is reliable.

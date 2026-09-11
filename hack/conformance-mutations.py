@@ -514,6 +514,27 @@ Mutation(
         "compile, but the point is that the conformance suite says so first",
     ),
     Mutation(
+        "C1-gateway-oauth-shape",
+        "charts/kube-agents/files/redactor.py",
+        ('        text = cls.GCP_OAUTH_TOKEN_PATTERN.sub("[REDACTED_SECRET]", text)\n', ""),
+        "test_C1_the_gateway_redactor_matches_the_leaked_credential_shapes",
+        "drop the ya29 substitution from the chain while reordering it -- the "
+        "pattern constant stays, so anything that greps for it is satisfied, "
+        "and the shape gke-labs/kube-agents#603 measured leaves for the "
+        "provider in the clear",
+    ),
+    Mutation(
+        "C1-gateway-sa-exemption",
+        "charts/kube-agents/files/redactor.py",
+        ('r"[a-zA-Z0-9._%+\\-]+@(?!(?:[a-zA-Z0-9\\-]+\\.)*gserviceaccount\\.com(?!\\.?[\\w\\-]))"',
+         'r"[a-zA-Z0-9._%+\\-]+@"'),
+        "test_C1_the_gateway_redactor_leaves_ordinary_manifest_content_alone",
+        "simplify the e-mail pattern by dropping the service-account exemption; "
+        "every IAM principal in a tool result then reaches the model as "
+        "[REDACTED_EMAIL], which is the over-eager shape that gets redaction "
+        "turned off",
+    ),
+    Mutation(
         "C2-unknown-flag-fail-open",
         "agents/platform/scripts/command_policy.py",
         ("            if name not in _KUBECTL_FLAGS_WITH_VALUE and name not in _KUBECTL_BOOLEAN_FLAGS:\n"

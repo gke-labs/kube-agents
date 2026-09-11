@@ -8,7 +8,8 @@ name: Smoke Test Sticky Status
 # the 1.5-3.5h job runs again for a pull request whose head has not changed
 # (#1179, #1202). `scripts/pin_smoke_status.py` re-pins that suffix to the new
 # head of `main` -- for every open pull request on each push to `main`, and for
-# one commit when its green arrives after `main` has already moved -- so a pull
+# one commit when its green arrives after `main` has already moved (or with no
+# base at all, as the override plugin's own status does) -- so a pull
 # request green at its own head merges without a fresh-base retest. What that
 # gives up is testing the combination with the `main` it lands on before the
 # merge; until a scheduled eval run on `main` exists, a bad combination is
@@ -20,8 +21,13 @@ name: Smoke Test Sticky Status
 # What it does NOT change: a push creates a new head with no status, so the
 # job runs as before; `/test pull-kube-agents-smoke-test` on the same head
 # posts `pending`, which is newer and wins (`/retest` does not -- it reruns
-# only failed contexts); a red is never touched, and neither is an admin
-# `/override`.
+# only failed contexts); a red is never touched.
+#
+# An admin `/override` is re-pinned like a green -- crier stamps the same
+# `BaseSHA:` suffix on it -- so a plain `/override` holds for the head it was
+# given until a push whenever the sweep wins the race below; when it loses,
+# the overridden job reruns, reds, and the override has to be repeated.
+# Upstream's `/override-sticky` has no race, and this Prow does not have it.
 #
 # It races Tide's sync loop: a sync that sees the stale statuses before the
 # sweep has re-pinned them starts the retest, and crier's `pending` then wins.
@@ -49,16 +55,15 @@ jobs:
     name: Pin green smoke-test statuses to the head of main
     # The repository guard is required of any credentialed workflow that starts
     # on its own (AGENTS.md, Pull Request Hygiene). A push to main always
-    # sweeps; a status event qualifies only when it is the smoke test, green,
-    # and not an admin override -- the script checks the same things again and
-    # is the reference, this expression is what keeps the other statuses off a
-    # runner.
+    # sweeps; a status event qualifies only when it is the smoke test and green
+    # -- an admin override included -- the script checks the same things again
+    # and is the reference, this expression is what keeps the other statuses
+    # off a runner.
     if: >-
       github.repository == 'gke-labs/kube-agents' &&
       (github.event_name == 'push' ||
         (github.event.context == 'pull-kube-agents-smoke-test' &&
-          github.event.state == 'success' &&
-          !startsWith(github.event.description, 'Overridden by')))
+          github.event.state == 'success'))
     runs-on: ubuntu-latest
     permissions:
       contents: read # check out the default branch: the script

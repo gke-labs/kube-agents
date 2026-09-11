@@ -58,6 +58,11 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import command_policy  # noqa: E402
 import credential_proxy  # noqa: E402
 
+# The name the gateway redactor is registered under in sys.modules when a test
+# imports it by path. Distinct from the callback's own registration name so
+# the two copies never shadow each other inside one interpreter.
+GATEWAY_REDACTOR_MODULE_NAME = "kube_agents_gateway_redactor"
+
 
 @dataclass(frozen=True)
 class Source:
@@ -202,6 +207,25 @@ SOURCES: dict[str, Source] = {
         "platformagent-ha.yaml",
         ("kind: Deployment", "kubeagents:leader:", "- pods"),
     ),
+    # --- model egress -----------------------------------------------------
+    # The redactor the chart mounts into the LiteLLM gateway. It is a copy of
+    # the chat plugin's module, and tests/test_litellm_redaction.py keeps the
+    # two identical; C1 reads this one because this one is what runs at the
+    # egress point. The anchors are the pattern names and the exemption the
+    # two C1 tests exercise, so a rename fails the self-check rather than
+    # letting the assertions pass against a module that no longer redacts.
+    "gateway_redactor": Source(
+        "charts/kube-agents/files/redactor.py",
+        (
+            "GCP_OAUTH_TOKEN_PATTERN",
+            "GCP_API_KEY_PATTERN",
+            "JWT_PATTERN",
+            "PRIVATE_KEY_PATTERN",
+            "SECRET_BLOCK_PATTERN",
+            "gserviceaccount",
+            "def redact_text(",
+        ),
+    ),
     # --- supply chain -----------------------------------------------------
     "skill_sync": Source(
         "scripts/sync-upstream-skills.py",
@@ -307,6 +331,26 @@ def containers_of(document: dict) -> list[dict]:
     """Every container and init container in a Deployment document."""
     spec = document.get("spec", {}).get("template", {}).get("spec", {})
     return list(spec.get("initContainers") or []) + list(spec.get("containers") or [])
+
+
+def gateway_redactor_module():
+    """The redactor the gateway runs, imported from the chart's copy by path.
+
+    By path rather than through the chat plugin package, because the chart's
+    file is the one mounted into the LiteLLM pod; a test of what leaves the
+    estate has to read the artifact that does the leaving.
+    """
+    import importlib.util
+
+    path = path_of("gateway_redactor")
+    spec = importlib.util.spec_from_file_location(GATEWAY_REDACTOR_MODULE_NAME, path)
+    module = importlib.util.module_from_spec(spec)
+    # Registered before execution, as the import system does: the module
+    # declares a dataclass, and dataclasses resolve the defining module through
+    # sys.modules while the class body is being processed.
+    sys.modules[GATEWAY_REDACTOR_MODULE_NAME] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def go_function_body(source: str, name: str) -> str:

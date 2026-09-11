@@ -209,3 +209,22 @@ Refer to [`references/troubleshooting.md`](references/troubleshooting.md) for th
 - [Maintenance Windows & Exclusions](https://cloud.google.com/kubernetes-engine/docs/concepts/maintenance-windows-and-exclusions)
 - [Rollout Sequencing Concepts](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/rollout-sequencing/about-rollout-sequencing)
 - [Configure Rollout Sequencing](https://cloud.google.com/kubernetes-engine/docs/how-to/rollout-sequencing)
+
+<!-- kube-agents: local addition (auto-injected by sync-upstream-skills.py) -->
+
+## Executed version checks: the fleet-upgrade-verification skill
+
+This skill plans one upgrade at a time; its references read one cluster at a time. When the
+question is which clusters in a fleet lag a target version, by how many minors, and whether the
+control plane or a node pool is the laggard, run the
+[fleet-upgrade-verification](../fleet-upgrade-verification/SKILL.md) skill's script and paste its
+table rather than reasoning from memory:
+
+```bash
+./skills/fleet-upgrade-verification/scripts/fleet_upgrade_report.py --target-version <version> \
+  --output /opt/data/scratch/fleet_versions.json
+```
+
+Without `--target-version` it measures each cluster against its own release channel's default and
+prints that baseline per member. It reads with `gcloud container` only and changes nothing. The
+plan, runbook and checklist for the members it flags are this skill's job.

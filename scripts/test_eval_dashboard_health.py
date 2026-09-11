@@ -489,6 +489,21 @@ class Advice(unittest.TestCase):
         text = health.advice_for("OUTAGE", "shared_break", ["unknown-case"], None, notes)
         self.assertTrue(text.endswith("Tracking: no issue filed yet — file one with the presubmit-gate label"))
 
+    def test_the_posters_tracking_issue_rides_in_health_json_until_green(self):
+        doc = data(*(run(100 + i, i, T0 - timedelta(hours=1) + timedelta(minutes=10 * i), tasks=broken_tasks({"agent-kanban-smoke"})) for i in range(4)))
+        posted = {"state": "OUTAGE", "issue": {"number": 1300, "url": "https://github.com/gke-labs/kube-agents/issues/1300"}}
+        first = health.adjudicate(doc, T0, None, health.Roster.fixed(ADMITTED), posted=posted)
+        self.assertEqual(first["issue"], posted["issue"])
+        self.assertEqual(first["tracking_issues"], ["#1300"])
+        self.assertEqual(first["advice"], "Don't retest yet; the failing cases share a cause. Tracking: #1300")
+        # Carried from the previous health.json when the poster's state has none.
+        second = health.adjudicate(doc, T0 + timedelta(minutes=15), first, health.Roster.fixed(ADMITTED), posted={"state": "OUTAGE"})
+        self.assertEqual(second["issue"], posted["issue"])
+        # Gone on GREEN, and never a non-issue.
+        self.assertIsNone(health.adjudicate(data(), T0, None, health.Roster.fixed(ADMITTED), posted=posted)["issue"])
+        self.assertIsNone(health.adjudicate(doc, T0, None, health.Roster.fixed(ADMITTED), posted={"issue": None})["issue"])
+        self.assertEqual(health.adjudicate(doc, T0, None, health.Roster.fixed(ADMITTED))["tracking_issues"], [])
+
     def test_the_repo_case_notes_load(self):
         notes = health.load_case_notes(CASE_NOTES)
         self.assertIn("#1171", notes["compliance-rbac-overgrant"]["issues"])

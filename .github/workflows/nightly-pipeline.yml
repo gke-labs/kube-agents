@@ -183,6 +183,7 @@ jobs:
           app-id: ${{ vars.RELEASE_BOT_APP_ID }}
           private-key: ${{ secrets.RELEASE_BOT_APP_PRIVATE_KEY }}
           permission-contents: write
+          permission-workflows: write
 
       - name: Checkout repository
         if: needs.step-1-resolve-candidate.outputs.skip_promotion != 'true'

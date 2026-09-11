@@ -29,9 +29,12 @@
 #     included on any `custom` set that names an admin role. RECONCILE_EXCLUDE is the opt-out,
 #     and the security reference is the canonical statement.
 #
-# It runs as a `no_agent` cron job on the profile the gateway actually ticks (the `default`/chat
-# profile — see docs/designs/fleet-handover-retirement.md §4). Scripts and the profiles PVC are
-# shared pod-wide, so it operates on every profile regardless of which profile ticks it. It is
+# It runs as a `no_agent` cron job on the `default`/chat profile's roster
+# (agents/chat/defaults/cron/jobs.json), not the Platform Agent's: it belongs to no one profile,
+# and that store is the one the gateway's own ticker thread ticks directly. Scripts and the
+# profiles PVC are shared pod-wide, so it operates on every profile regardless of which profile
+# ticks it — see "This roster is not inert" and "Never put an id on both rosters" in
+# agents/platform/cron/README.md for the ticking model and why the id lives on one roster. It is
 # resilient (always exit 0 on the cron path) and posts a summary to every configured chat
 # platform only when it created or pruned. `--require-create-pass` opts out of that for a caller
 # that has to know whether the roster is actually reconciled; the bootstrap scan gate is the only

@@ -53,11 +53,13 @@ class SmokeTestStickyWorkflowTest(unittest.TestCase):
     def test_the_job_carries_the_fork_guard(self):
         self.assertIn(_FORK_GUARD, self.condition)
 
-    def test_a_status_event_must_be_a_green_smoke_test_and_not_an_override(self):
+    def test_a_status_event_must_be_a_green_smoke_test_an_admin_override_included(self):
         self.assertIn(f"github.event.context == '{_CONTEXT}'", self.condition)
         self.assertIn("github.event.state == 'success'", self.condition)
-        self.assertIn("!startsWith(github.event.description, 'Overridden by')", self.condition)
         self.assertIn("github.event_name == 'push' ||", self.condition)
+        # An override is re-pinned like a green, so nothing may keep it off the runner.
+        self.assertNotIn("Overridden", self.condition)
+        self.assertNotIn("description", self.condition)
 
     def test_the_token_can_write_statuses_and_read_the_checkout_and_nothing_else(self):
         self.assertEqual(self.workflow["permissions"], {})

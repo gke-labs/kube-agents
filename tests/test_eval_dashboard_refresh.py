@@ -22,6 +22,7 @@ import unittest
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "hack" / "ci-dashboard-refresh.sh"
 TESTDATA = REPO_ROOT / "scripts" / "eval_dashboard" / "testdata"
+RC_TESTDATA = REPO_ROOT / "scripts" / "eval_dashboard" / "testdata_rc"
 SKIP = "eval-dashboard refresh skipped:"
 
 # Prow-ish variables that must not leak from the environment running the
@@ -32,6 +33,8 @@ _SCRUB = (
     "EVAL_DASHBOARD_SINCE_DAYS",
     "EVAL_DASHBOARD_TIMEOUT",
     "EVAL_DASHBOARD_FROM_DIR",
+    "EVAL_DASHBOARD_RC_GLOB",
+    "EVAL_DASHBOARD_RC_FROM_DIR",
     "JOB_TYPE",
     "PULL_NUMBER",
     "ARTIFACTS",
@@ -127,6 +130,43 @@ class RefreshScriptTest(unittest.TestCase):
         self.assertEqual(data["schema_version"], 1)
         self.assertEqual(len(data["runs"]), 3)
         self.assertIn("<html", (self.target / "index.html").read_text().lower())
+
+    def test_a_from_dir_run_never_reaches_the_rc_bucket(self):
+        """EVAL_DASHBOARD_RC_GLOB defaults to a real bucket path, so the
+        offline path has to disarm it along with the presubmit glob."""
+        stubs = self.tmp / "stubs"
+        stubs.mkdir()
+        write_stub(stubs, "gsutil", f'touch "{self.tmp}/gsutil-was-called"\nexit 1\n')
+        proc = run_script(
+            env={
+                "EVAL_DASHBOARD_TARGET": str(self.target),
+                "EVAL_DASHBOARD_FROM_DIR": str(TESTDATA),
+                "JOB_TYPE": "periodic",
+            },
+            path_prepend=str(stubs),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertFalse((self.tmp / "gsutil-was-called").exists(), proc.stdout)
+        self.assertNotIn("releases", json.loads((self.target / "data.json").read_text()))
+
+    def test_rc_from_dir_publishes_the_releases_section(self):
+        proc = run_script(
+            env={
+                "EVAL_DASHBOARD_TARGET": str(self.target),
+                "EVAL_DASHBOARD_FROM_DIR": str(TESTDATA),
+                "EVAL_DASHBOARD_RC_FROM_DIR": str(RC_TESTDATA),
+                "JOB_TYPE": "periodic",
+            }
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("1 releases", proc.stdout + proc.stderr)
+        data = json.loads((self.target / "data.json").read_text())
+        self.assertEqual([r["rc_tag"] for r in data["releases"]], ["staging_2609092307_5b5ad10"])
+        # The Releases table is on the two-band page, which the Brief links
+        # to as "Legacy view" -- not on index.html, which renders from
+        # brief.json and carries no release records at all.
+        self.assertIn("staging_2609092307_5b5ad10", (self.target / "legacy.html").read_text())
+        self.assertNotIn("staging_2609092307_5b5ad10", (self.target / "index.html").read_text())
 
     def test_second_run_merges_with_the_published_prior(self):
         env = {

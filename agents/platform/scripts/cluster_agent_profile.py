@@ -111,9 +111,10 @@ def _inject_cluster_identity(home: Path, project: str, cluster: str, location: s
 
     Records the target project/cluster/location as structured identity metadata — robust
     vs the sanitized/hashed profile name. (Re-dumping drops the template's comments in this
-    per-profile copy, which is fine.) Kept intentionally after the fleet-handover retirement:
-    it is cheap identity metadata and is what a restored `write_handover` producer would read
-    (see docs/designs/fleet-handover-retirement.md).
+    per-profile copy, which is fine.) The stamp is load-bearing: `read_cluster_identity` below
+    is how cluster_agent_reconcile.py matches a profile to its live cluster, and a profile
+    without it is skipped — neither matched nor pruned. It is also what the proposed handover
+    producer would read (docs/designs/agent-communication.md, design of record, not implemented).
     """
     import yaml  # lazy: only needed on the scaffold path, keeps the module importable without pyyaml
 

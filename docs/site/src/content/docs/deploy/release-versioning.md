@@ -33,14 +33,14 @@ also a hand-pushable redeploy trigger.
 The RC pipeline, the nightly staging promotion, and the GA release all run on schedules,
 with manual dispatches available for overrides and off-schedule releases.
 
-| Step                        | When it runs                                                                                                    | Workflow                                                                                                                          |
-| :-------------------------- | :-------------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------- |
-| RC selection and validation | Every three hours, at 17 minutes past. Dispatches nothing when the newest candidate has already been tried.     | `rc-scheduler.yml` starts `rc-release-pipeline.yml`, which pushes the `rc_*` and `rc_*_validated` tags.                           |
-| Staging promotion           | Daily at 02:17 UTC, against the newest validated candidate. One already promoted is re-tested, not re-tagged.   | `nightly-scheduler.yml` starts `nightly-pipeline.yml`, which pushes the `staging_<ts>_<sha>` tag when the full E2E matrix passes. |
-| GA release                  | Weekly on Thursdays at 05:17 UTC, or when a maintainer dispatches it; `release-publish.yml` has no `schedule:`. | `release-scheduler.yml` starts `release-publish.yml` with `schedule_gate=evaluate` when an eligible staging candidate is found.   |
+| Step                        | When it runs                                                                                                  | Workflow                                                                                                                          |
+| :-------------------------- | :------------------------------------------------------------------------------------------------------------ | :-------------------------------------------------------------------------------------------------------------------------------- |
+| RC selection and validation | Every three hours, at 17 minutes past. Dispatches nothing when the newest candidate has already been tried.   | `rc-scheduler.yml` starts `rc-release-pipeline.yml`, which pushes the `rc_*` and `rc_*_validated` tags.                           |
+| Staging promotion           | Daily at 02:17 UTC, against the newest validated candidate. One already promoted is re-tested, not re-tagged. | `nightly-scheduler.yml` starts `nightly-pipeline.yml`, which pushes the `staging_<ts>_<sha>` tag when the full E2E matrix passes. |
+| GA release                  | Weekly on Fridays at 05:17 UTC, or when a maintainer dispatches it; `release-publish.yml` has no `schedule:`. | `release-scheduler.yml` starts `release-publish.yml` with `schedule_gate=evaluate` when an eligible staging candidate is found.   |
 
 Scheduled runs start when GitHub's scheduler picks them up, so the minute is a floor, not a
-promise. A scheduled GA release ships unattended on Thursdays if a new staging-promoted
+promise. A scheduled GA release ships unattended on Fridays if a new staging-promoted
 candidate exists, or maintainers may dispatch the workflow by hand. The gate that decides whether
 a dispatch publishes, and how the schedulers pick a candidate, are described in
 [`scripts/release/README.md`](https://github.com/gke-labs/kube-agents/tree/main/scripts/release),
@@ -121,7 +121,7 @@ gh workflow run release-publish.yml --repo gke-labs/kube-agents \
   -f explicit_release_version="1.0.0"
 ```
 
-Scheduled releases are automated weekly on Thursdays at 05:17 UTC via
+Scheduled releases are automated weekly on Fridays at 05:17 UTC via
 `.github/workflows/release-scheduler.yml` using the decoupled trigger pattern.
 The publishing workflow itself (`release-publish.yml`) has no `schedule:` and is dispatch-only:
 when the scheduler finds an eligible staging-promoted candidate, it dispatches the workflow with

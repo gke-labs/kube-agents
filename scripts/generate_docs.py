@@ -128,6 +128,7 @@ SKILL_GROUPS: dict[str, list[str]] = {
         "kube-agents-observability",
     ],
     "Reliability": [
+        "fleet-upgrade-verification",
         "gke-reliability",
         "gke-upgrades",
     ],

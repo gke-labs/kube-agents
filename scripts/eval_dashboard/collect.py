@@ -10,11 +10,19 @@ data.json the dashboard renders.
 
 data.json is a CONTRACT: the renderer and the publisher are built against the
 exact shape documented in SCHEMA.md. Changes must be additive optional fields
-only, with schema_version bumped on anything else. The two additive fields
+only, with schema_version bumped on anything else. The three additive fields
 this collector emits beyond the v1 core: `tasks[].reps` (per-repetition
-grading detail, present only when the log carries `rep N:` grading lines) and
+grading detail, present only when the log carries `rep N:` grading lines),
 `runs[].pr_merged` (whether the run's PR had merged at collection time,
-resolved best-effort through `gh`).
+resolved best-effort through `gh`) and `releases[]` (release-candidate eval
+runs, below).
+
+Release candidates are collected separately and land in `releases[]`, never
+in `runs[]`. post-kube-agents-eval-rc drives the same hack/ci-eval-pr.sh, so
+its build log parses identically -- but a candidate is judged against main's
+window rather than added to it (hack/ci-eval-pr.sh:1998: "the baseline store
+is read, never written"), and folding an RC into runs[] would feed it to
+build_cases and move the pass rates the candidate is being measured against.
 
 Sources:
   --pr-glob   gsutil glob(s) of Prow build directories (read-only; requires
@@ -22,6 +30,13 @@ Sources:
   --from-dir  a local directory whose immediate subdirectories each hold a
               build's build-log.txt / started.json / finished.json -- the
               offline path the unit tests use.
+  --rc-glob / --rc-from-dir
+              the same two shapes, for the release-candidate job. Bounded to
+              the newest --rc-limit builds rather than by a watermark: RC
+              runs are cut per staging promotion, so there are few of them.
+              --merge-with still applies -- a recorded release is final, so
+              the prior file's releases are carried forward and only the
+              build ids it does not cover are read.
 
 Incremental mode (what the hourly refresh job runs):
   --merge-with  a previously written data.json (local path or gs:// URL).
@@ -107,6 +122,12 @@ DEGRADED_SINCE_DAYS = 14.0
 # reads it costs every sweep -- bounded.
 PENDING_RETRY_DAYS = 2.0
 
+# How many release-candidate builds the RC sweep reads, newest first. The RC
+# job has no incremental watermark (see the module docstring), so this is the
+# only thing bounding its cost as the archive grows: one promotion a day for
+# a year is 365 build dirs at ~3 serial gsutil reads each.
+RC_RELEASES_MAX = 20
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 TASKS_DIR = REPO_ROOT / "bench" / "tasks"
 EVAL_SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
@@ -154,6 +175,36 @@ _LEASE = re.compile(r"Successfully leased project:\s*(\S+)")
 _FINAL_VERDICT = re.compile(
     r"PR Smoke Test Evaluation (?P<verdict>Succeeded|Failed)"
     r".*\(Total Duration:\s*(?P<duration>\d+)s\)"
+)
+
+# The release-candidate banner hack/ci-eval-rc.sh prints once per run, between
+# two rules of `=`:
+#   🏷️ RELEASE CANDIDATE EVAL
+#   Candidate:   staging_2609092307_5b5ad10 (5b5ad10163cf10c73871b279518c7165c098bec9)
+#   Tier:        nightly
+#   Verdict:     GREEN (advisory: this lane gates nothing)
+#   Artifacts:   https://oss.gprow.dev/view/gs/kube-agents-prow/logs/<job>/<build>
+# The Artifacts line is absent when the driver ran outside Prow (no JOB_NAME
+# or BUILD_ID), so it is optional here. The whole banner is absent when the
+# driver exited on one of its early guards, which build_release reports as a
+# release with no verdict rather than dropping -- a resolver that has been
+# broken for a month must not read as a month with no releases.
+#
+# Anchored at the end of the line on purpose: hack/resolve-rc-target.sh
+# prints its own "🏷️ RELEASE CANDIDATE EVAL TARGET" banner earlier in the
+# same log, and a substring match would open the block on that one instead.
+_RC_BANNER = re.compile(r"RELEASE CANDIDATE EVAL$")
+_RC_CANDIDATE = re.compile(r"^Candidate:\s+(?P<tag>\S+)\s+\((?P<sha>[0-9a-fA-F]{7,40})\)\s*$")
+_RC_TIER = re.compile(r"^Tier:\s+(?P<tier>\S+)\s*$")
+_RC_VERDICT = re.compile(r"^Verdict:\s+(?P<verdict>GREEN|RED|NOT RUN)\b")
+_RC_ARTIFACTS = re.compile(r"^Artifacts:\s+(?P<url>\S+)\s*$")
+# bench-gate's aggregate line, printed into the log by `bench-gate suite` and
+# also written to eval-verdict.md. Two shapes, per gate.py's _markdown:
+#   Admitted-case pass rate: 90.0% (no baseline at the current version key -- advisory)
+#   Admitted-case pass rate: 90.0% (main: 92.5%, margin -2.5%)
+_ADMITTED_RATE = re.compile(
+    r"^Admitted-case pass rate: (?P<rate>-?[0-9.]+)%"
+    r"(?:\s*\(main:\s*(?P<baseline>-?[0-9.]+)%,\s*margin\s*(?P<margin>-?[0-9.]+)%\))?"
 )
 
 _RESULT_BY_VERDICT = {
@@ -319,6 +370,107 @@ def build_run(build_id: str, read, pr_hint: int | None = None) -> dict | None:
         "result": finished.get("result"),
         "duration_s": duration_s,
         "tasks": parsed["tasks"],
+    }
+
+
+def _percent(text: str | None) -> float | None:
+    """A percentage string from the aggregate line as a 0..1 fraction."""
+    if text is None:
+        return None
+    try:
+        return float(text) / 100.0
+    except ValueError:
+        return None
+
+
+def parse_rc_banner(text: str) -> dict:
+    """The release-candidate facts from one build-log.txt, best effort.
+
+    Every field is None when the log does not carry it: a driver that exited
+    on an early guard prints no banner at all, and one run outside Prow
+    prints no Artifacts line. `banner` says which of those happened.
+    """
+    found = False
+    rc_tag = commit = tier = verdict = artifacts_url = None
+    pass_rate = baseline_rate = margin = None
+    for line in text.splitlines():
+        line = line.rstrip()
+        if _RC_BANNER.search(line):
+            found = True
+            continue
+        m = _ADMITTED_RATE.match(line)
+        if m:
+            # The last one wins: `bench-gate suite` prints the aggregate once,
+            # but the summary markdown is echoed as well on some paths.
+            pass_rate = _percent(m.group("rate"))
+            baseline_rate = _percent(m.group("baseline"))
+            margin = _percent(m.group("margin"))
+            continue
+        if not found:
+            continue
+        m = _RC_CANDIDATE.match(line)
+        if m:
+            rc_tag = m.group("tag")
+            commit = m.group("sha")
+            continue
+        m = _RC_TIER.match(line)
+        if m:
+            tier = m.group("tier")
+            continue
+        m = _RC_VERDICT.match(line)
+        if m:
+            verdict = m.group("verdict")
+            continue
+        m = _RC_ARTIFACTS.match(line)
+        if m:
+            artifacts_url = m.group("url")
+    return {
+        "banner": found,
+        "rc_tag": rc_tag,
+        "commit": commit,
+        "tier": tier,
+        "verdict": verdict,
+        "artifacts_url": artifacts_url,
+        "pass_rate": pass_rate,
+        "baseline_rate": baseline_rate,
+        "margin": margin,
+    }
+
+
+def build_release(build_id: str, read) -> dict | None:
+    """Assemble one `releases[]` entry, or None for a build still in flight.
+
+    `read(name)` is build_run's reader. The eval detail is parsed by the same
+    parse_build_log the presubmit uses -- the RC job runs the same
+    hack/ci-eval-pr.sh -- and only the banner on top of it is RC-specific.
+    """
+    run = build_run(build_id, read)
+    if run is None:
+        return None
+    banner = parse_rc_banner(read("build-log.txt") or "")
+    return {
+        "build_id": run["build_id"],
+        "rc_tag": banner["rc_tag"],
+        # The banner's commit is the candidate's; run["head_sha"] is the ref
+        # Prow checked out, which for a tag-push postsubmit is the same
+        # commit. Prefer the banner: it is what the driver actually measured.
+        "commit": (banner["commit"] or run["head_sha"] or "")[:7] or None,
+        "tier": banner["tier"],
+        "verdict": banner["verdict"],
+        # Prow's own verdict on the job, which is not the eval's: the lane is
+        # advisory, so a RED candidate still reports SUCCESS. It is here for
+        # the case where the banner is missing entirely, where it is the only
+        # thing that says whether the job survived.
+        "result": run["result"],
+        "started": run["started"],
+        "finished": run["finished"],
+        "duration_s": run["duration_s"],
+        "project": run["project"],
+        "artifacts_url": banner["artifacts_url"],
+        "pass_rate": banner["pass_rate"],
+        "baseline_rate": banner["baseline_rate"],
+        "margin": banner["margin"],
+        "tasks": run["tasks"],
     }
 
 
@@ -575,6 +727,45 @@ def _started_at(started_text: str | None) -> datetime | None:
         return None
 
 
+def _build_dirs(listing: str) -> list[tuple[str, str]]:
+    """(build_id, directory URL) pairs from one `gsutil ls` listing.
+
+    `gsutil ls a/*` expands the wildcard and prints each matched directory as
+    a `gs://.../<id>/:` header over its contents; `gsutil ls a/` prints plain
+    `gs://.../<id>/` lines. Accept both, and drop everything that is not a
+    numerically-named directory (latest-build.txt, per-object lines).
+    """
+    dirs = []
+    seen = set()
+    for line in listing.splitlines():
+        line = line.strip()
+        if line.endswith("/:"):
+            line = line[:-1]
+        if not line.endswith("/") or line in seen:
+            continue
+        seen.add(line)
+        build_id = line.rstrip("/").rsplit("/", 1)[-1]
+        if build_id.isdigit():
+            dirs.append((build_id, line))
+    return dirs
+
+
+def _gcs_reader(base: str, gsutil: str):
+    """A build_run/build_release reader over one GCS build directory.
+
+    Caches per file: build_run asks for finished.json, started.json and
+    build-log.txt, and build_release re-asks for the log.
+    """
+    cache: dict[str, str | None] = {}
+
+    def reader(name: str) -> str | None:
+        if name not in cache:
+            cache[name] = _gsutil(["cat", base + name], gsutil)
+        return cache[name]
+
+    return reader
+
+
 def runs_from_gcs(
     pr_globs: list[str],
     gsutil: str = "gsutil",
@@ -589,20 +780,7 @@ def runs_from_gcs(
         if listing is None:
             print(f"warning: gsutil ls failed for {glob}; skipping", file=sys.stderr)
             continue
-        seen = set()
-        for line in listing.splitlines():
-            line = line.strip()
-            # `gsutil ls a/*` expands the wildcard and prints each matched
-            # directory as a `gs://.../<id>/:` header over its contents;
-            # `gsutil ls a/` prints plain `gs://.../<id>/` lines. Accept both.
-            if line.endswith("/:"):
-                line = line[:-1]
-            if not line.endswith("/") or line in seen:
-                continue  # latest-build.txt, per-object lines, duplicates
-            seen.add(line)
-            build_id = line.rstrip("/").rsplit("/", 1)[-1]
-            if not build_id.isdigit():
-                continue
+        for build_id, line in _build_dirs(listing):
             # The incremental watermark. Prow build ids are monotonic in
             # START order, so a build at or below the newest RECORDED id may
             # still be in flight (started earlier, outlived the build the
@@ -620,12 +798,7 @@ def runs_from_gcs(
             m = _PR_IN_PATH.search(line)
             pr_hint = int(m.group(1)) if m else None
 
-            cache: dict[str, str | None] = {}
-
-            def reader(name: str, base: str = line, cache: dict = cache) -> str | None:
-                if name not in cache:
-                    cache[name] = _gsutil(["cat", base + name], gsutil)
-                return cache[name]
+            reader = _gcs_reader(line, gsutil)
 
             if since_cutoff is not None:
                 # One probe read decides whether to pay the other two. An
@@ -651,24 +824,99 @@ def runs_from_gcs(
     return runs
 
 
+def _dir_reader(base: pathlib.Path):
+    """A build_run/build_release reader over one local build directory."""
+
+    def reader(name: str) -> str | None:
+        try:
+            return (base / name).read_text()
+        except OSError:
+            return None
+
+    return reader
+
+
 def runs_from_dir(root: pathlib.Path) -> list[dict]:
     runs = []
     for build_dir in sorted(p for p in root.iterdir() if p.is_dir()):
-
-        def reader(name: str, base: pathlib.Path = build_dir) -> str | None:
-            try:
-                return (base / name).read_text()
-            except OSError:
-                return None
-
         try:
-            run = build_run(build_dir.name, reader)
+            run = build_run(build_dir.name, _dir_reader(build_dir))
         except Exception as exc:  # noqa: BLE001
             print(f"warning: build {build_dir.name}: {exc}; skipping", file=sys.stderr)
             continue
         if run is not None:
             runs.append(run)
     return runs
+
+
+def _release_sort_key(release: dict):
+    """Newest first: started time, then build id for same-second ties.
+
+    Both halves are coerced rather than trusted. A carried-forward release
+    comes from a prior data.json that only had its `build_id` validated, so
+    a hand-edited file can put an int in `started` -- and comparing that to
+    another entry's str raises TypeError mid-sort, losing the whole merge.
+    """
+    try:
+        build_num = int(release["build_id"])
+    except (ValueError, TypeError, KeyError):
+        build_num = 0
+    return (str(release.get("started") or ""), build_num)
+
+
+def releases_from_gcs(
+    rc_globs: list[str],
+    gsutil: str = "gsutil",
+    limit: int = RC_RELEASES_MAX,
+    known: frozenset[str] = frozenset(),
+) -> list[dict]:
+    """The newest `limit` release-candidate builds under the given globs.
+
+    The listing is free and the per-build reads are not, so both filters
+    happen on the build id before anything is read: the trim to `limit`, and
+    `known` -- the build ids the caller already has records for. A recorded
+    release is final (build_release records nothing without a finished.json),
+    so re-reading one buys nothing and costs three gsutil calls.
+    """
+    releases = []
+    for glob in rc_globs:
+        listing = _gsutil(["ls", glob], gsutil)
+        if listing is None:
+            print(f"warning: gsutil ls failed for {glob}; skipping", file=sys.stderr)
+            continue
+        dirs = sorted(_build_dirs(listing), key=lambda d: int(d[0]), reverse=True)
+        if len(dirs) > limit:
+            print(
+                f"note: {glob}: {len(dirs)} release-candidate builds listed,"
+                f" reading the newest {limit}",
+                file=sys.stderr,
+            )
+            dirs = dirs[:limit]
+        dirs = [d for d in dirs if d[0] not in known]
+        for build_id, line in dirs:
+            try:
+                release = build_release(build_id, _gcs_reader(line, gsutil))
+            except Exception as exc:  # noqa: BLE001 -- one bad build must not kill the sweep
+                print(f"warning: rc build {build_id}: {exc}; skipping", file=sys.stderr)
+                continue
+            if release is None:
+                print(f"note: rc build {build_id}: no finished.json; skipping", file=sys.stderr)
+                continue
+            releases.append(release)
+    return releases
+
+
+def releases_from_dir(root: pathlib.Path) -> list[dict]:
+    releases = []
+    for build_dir in sorted(p for p in root.iterdir() if p.is_dir()):
+        try:
+            release = build_release(build_dir.name, _dir_reader(build_dir))
+        except Exception as exc:  # noqa: BLE001
+            print(f"warning: rc build {build_dir.name}: {exc}; skipping", file=sys.stderr)
+            continue
+        if release is not None:
+            releases.append(release)
+    return releases
 
 
 # --------------------------------------------------------------------------
@@ -848,6 +1096,9 @@ def collect(
     since_days: float | None = None,
     now: datetime | None = None,
     stale_after_s: int | None = None,
+    rc_globs: list[str] | None = None,
+    rc_from_dir: pathlib.Path | None = None,
+    rc_limit: int = RC_RELEASES_MAX,
 ) -> dict:
     # gh=None skips pr_merged resolution entirely (runs carry no key), which
     # keeps library callers and unit tests hermetic; the CLI passes its --gh
@@ -945,6 +1196,34 @@ def collect(
         # generated_at. The publisher sets it to its own cadence with slack,
         # so the badge means "the refresh job missed ticks", not jitter.
         data["stale_after_s"] = stale_after_s
+
+    # releases[] rides --merge-with the way runs[] does, for the same reason
+    # and by a simpler rule: a recorded release is final, so the prior file's
+    # list is carried forward and the RC sweep only reads the build ids it
+    # does not already cover. A run given no RC source at all still carries
+    # the prior list forward untouched -- the refresh job is armed with
+    # --rc-glob separately from --pr-glob, and an unarmed tick must not
+    # silently empty the Releases section of a dashboard that had one.
+    prior_releases = []
+    if merge_with is not None and prior_data is not None:
+        raw = prior_data.get("releases")
+        if isinstance(raw, list):
+            prior_releases = [
+                r for r in raw if isinstance(r, dict) and isinstance(r.get("build_id"), str)
+            ]
+    by_id = {r["build_id"]: r for r in prior_releases}
+    if rc_from_dir is not None:
+        for release in releases_from_dir(rc_from_dir):
+            by_id[release["build_id"]] = release
+    if rc_globs:
+        for release in releases_from_gcs(
+            rc_globs, gsutil, limit=rc_limit, known=frozenset(by_id)
+        ):
+            by_id[release["build_id"]] = release
+    if by_id:
+        # Trimmed as well as read-bounded: without this the carried-forward
+        # list grows without limit as the RC archive does.
+        data["releases"] = sorted(by_id.values(), key=_release_sort_key, reverse=True)[:rc_limit]
     return data
 
 
@@ -964,6 +1243,31 @@ def main(argv: list[str] | None = None) -> int:
         type=pathlib.Path,
         help="local directory of <build_id>/ subdirs with build-log.txt,"
         " started.json and finished.json (offline/testing source)",
+    )
+    parser.add_argument(
+        "--rc-glob",
+        action="append",
+        default=[],
+        metavar="GS_GLOB",
+        help="gsutil glob of release-candidate build dirs, e.g."
+        " gs://kube-agents-prow/logs/post-kube-agents-eval-rc/* . Collected"
+        " into releases[], never into runs[]: a candidate is judged against"
+        " main's window, not added to it (repeatable)",
+    )
+    parser.add_argument(
+        "--rc-from-dir",
+        type=pathlib.Path,
+        help="local directory of release-candidate <build_id>/ subdirs, the"
+        " offline counterpart of --rc-glob",
+    )
+    parser.add_argument(
+        "--rc-limit",
+        type=int,
+        default=RC_RELEASES_MAX,
+        metavar="N",
+        help=f"read at most the newest N release-candidate builds per"
+        f" --rc-glob (default {RC_RELEASES_MAX}); the RC sweep has no"
+        " incremental watermark, so this is what bounds its cost",
     )
     parser.add_argument(
         "--merge-with",
@@ -1008,8 +1312,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    if not args.pr_glob and args.from_dir is None and args.merge_with is None:
-        parser.error("nothing to collect: pass --pr-glob, --from-dir and/or --merge-with")
+    if (
+        not args.pr_glob
+        and args.from_dir is None
+        and args.merge_with is None
+        and not args.rc_glob
+        and args.rc_from_dir is None
+    ):
+        parser.error(
+            "nothing to collect: pass --pr-glob, --from-dir, --rc-glob,"
+            " --rc-from-dir and/or --merge-with"
+        )
+    if args.rc_limit < 1:
+        parser.error("--rc-limit must be at least 1")
 
     data = collect(
         pr_globs=args.pr_glob,
@@ -1020,10 +1335,14 @@ def main(argv: list[str] | None = None) -> int:
         merge_with=args.merge_with,
         since_days=args.since_days,
         stale_after_s=args.stale_after_s,
+        rc_globs=args.rc_glob,
+        rc_from_dir=args.rc_from_dir,
+        rc_limit=args.rc_limit,
     )
     args.out.write_text(json.dumps(data, indent=2) + "\n")
     print(
         f"wrote {args.out}: {len(data['runs'])} runs, {len(data['cases'])} cases,"
+        f" {len(data.get('releases') or [])} releases,"
         f" {data['coverage']['domains_covered']}/{data['coverage']['domains_total']}"
         " domains covered",
         file=sys.stderr,

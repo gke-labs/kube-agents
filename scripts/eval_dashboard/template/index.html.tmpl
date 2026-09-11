@@ -242,6 +242,10 @@ const DASH = {
   trendEventLabelChars: 18,
   trendEventRowOffset: 10,
   runEventCaption: "run-level events excluded from per-case stats",
+  // Releases section; mirrors render.py's RELEASES_* constants.
+  releasesMaxRows: 10,
+  releaseVerdictClass: { GREEN: "p-pass", RED: "p-fail", "NOT RUN": "p-infra" },
+  releaseUrlScheme: "https://",
   issueUrl: "https://github.com/gke-labs/kube-agents/issues",
 };
 
@@ -799,12 +803,107 @@ function evidenceHtml(data) {
   </table></div>`;
 }
 
-const RELEASES_HTML = `
+/* ---- Releases (mirrors render.py's releases_html) ---- */
+
+const RELEASES_EMPTY_HTML = `
   <h2 id="release">Releases</h2>
   <div class="empty">
     <span class="banner">⏳ No RC in the gate window</span>
-    <p style="margin-top:12px">When the next RC cuts, the four-gate checklist renders here automatically: E2E matrix · audit-machinery canary on the RC image · eval non-inferiority · operator sign-off.</p>
+    <p style="margin-top:12px">When the next RC cuts, its eval run renders here automatically: candidate, tier, verdict, and the advisory non-inferiority number.</p>
   </div>`;
+
+const RELEASES_SUB = "One row per post-kube-agents-eval-rc run — the full suite against a " +
+  "release candidate's own images. Advisory: this lane reports and does not " +
+  "gate, and the non-inferiority comparison stays advisory while the " +
+  "baseline store is maturing. The admitted rate covers only the cases " +
+  "admitted to the gate, while Cases passed counts every graded case in the " +
+  "run, so the two differ.";
+
+const isNumber = (value) => typeof value === "number" && Number.isFinite(value);
+
+function releaseVerdictPill(verdict) {
+  const cls = DASH.releaseVerdictClass[verdict || ""] || "p-infra";
+  return `<span class="pill ${cls}">${esc(verdict || "NO VERDICT")}</span>`;
+}
+
+function releaseDuration(seconds) {
+  if (!isCount(seconds) || seconds <= 0) return "";
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  return hours ? `${hours}h${String(minutes).padStart(2, "0")}m` : `${minutes}m`;
+}
+
+function releaseRateCell(release) {
+  const rate = release.pass_rate;
+  if (!isNumber(rate)) return `<td class="num">—<div class="tnote">not reported</div></td>`;
+  let note;
+  if (isNumber(release.baseline_rate)) {
+    note = `main ${(release.baseline_rate * 100).toFixed(1)}%`;
+    if (isNumber(release.margin)) {
+      const sign = release.margin >= 0 ? "+" : "−";
+      note += ` · margin ${sign}${(Math.abs(release.margin) * 100).toFixed(1)}pt`;
+    }
+  } else {
+    note = "no baseline — baselines maturing";
+  }
+  return `<td class="num">${(rate * 100).toFixed(1)}%<div class="tnote">${esc(note)}</div></td>`;
+}
+
+function releaseCasesCell(release) {
+  const tasks = (release.tasks || []).filter((t) => t && typeof t === "object");
+  if (!tasks.length) return `<td class="num">—<div class="tnote">no cases parsed</div></td>`;
+  const passed = tasks.filter((t) => t.result === "pass").length;
+  const infra = tasks.filter((t) => t.result === "infra").length;
+  const note = infra ? `${infra} infra excluded` : "none excluded";
+  return `<td class="num">${passed}/${tasks.length - infra}<div class="tnote">${esc(note)}</div></td>`;
+}
+
+function releaseCandidateCell(release) {
+  const tag = String(release.rc_tag || "") || "unknown candidate";
+  let name = esc(tag);
+  if (typeof release.artifacts_url === "string" && release.artifacts_url.startsWith(DASH.releaseUrlScheme)) {
+    name = `<a href="${esc(release.artifacts_url)}" rel="noopener">${name}</a>`;
+  }
+  const bits = [];
+  if (release.commit) bits.push(String(release.commit));
+  if (release.build_id) bits.push(`build ${release.build_id}`);
+  if (!release.verdict) bits.push(`no eval banner · job ${release.result || "unknown"}`);
+  return `<td><div class="tname">${name}</div>` +
+    `<div class="tnote">${esc(bits.join(" · "))}</div></td>`;
+}
+
+function releaseRow(release) {
+  const started = parseIso(release.started);
+  const when = started != null ? `${utcStamp(started)} UTC` : "unknown time";
+  return "<tr>" + releaseCandidateCell(release) +
+    `<td><span class="cap">${esc(String(release.tier || "—"))}</span></td>` +
+    `<td>${releaseVerdictPill(release.verdict)}</td>` +
+    releaseRateCell(release) + releaseCasesCell(release) +
+    `<td><span class="cap">${esc(when)}</span></td>` +
+    `<td class="cap">${esc(releaseDuration(release.duration_s))}</td></tr>`;
+}
+
+function sortedReleases(data) {
+  const buildNum = (r) => (/^\d+$/.test(String(r.build_id || "")) ? Number(r.build_id) : 0);
+  return (data.releases || []).filter((r) => r && typeof r === "object")
+    .sort((a, b) => {
+      const sa = String(a.started || ""), sb = String(b.started || "");
+      return sa < sb ? 1 : sa > sb ? -1 : buildNum(b) - buildNum(a);
+    })
+    .slice(0, DASH.releasesMaxRows);
+}
+
+function releasesHtml(data) {
+  const releases = sortedReleases(data);
+  if (!releases.length) return RELEASES_EMPTY_HTML;
+  return `
+  <h2 id="release">Releases</h2>
+  <div class="sub">${RELEASES_SUB}</div>
+  <div class="card"><table id="releases">
+    <thead><tr><th>Candidate</th><th>Tier</th><th>Verdict</th><th>Admitted rate</th><th>Cases passed</th><th>Started</th><th>Eval took</th></tr></thead>
+    <tbody>${releases.map(releaseRow).join("")}</tbody>
+  </table></div>`;
+}
 
 const HERO_LEDE = "Every pull request runs the agent against a real seeded fleet. " +
   "Exact checks gate; judged scores are recorded, never blocking; infrastructure " +
@@ -842,9 +941,11 @@ const EMPTY_STATE_HTML = `
   </section>`;
 
 function appHtml(data) {
-  if (!((data.runs || []).length || (data.cases || []).length)) return EMPTY_STATE_HTML;
+  // releases[] counts as data -- see the note on render.py's app_html.
+  if (!((data.runs || []).length || (data.cases || []).length ||
+        sortedReleases(data).length)) return EMPTY_STATE_HTML;
   return HERO_HTML + bandAgentHtml(data, DASH.events) + bandGateHtml(data, DASH.notes, DASH.events)
-    + evidenceHtml(data) + RELEASES_HTML + footHtml(data);
+    + evidenceHtml(data) + releasesHtml(data) + footHtml(data);
 }
 
 function metaHtml(data) {
