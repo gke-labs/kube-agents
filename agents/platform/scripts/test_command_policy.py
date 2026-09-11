@@ -1029,10 +1029,9 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
                 self.assertTrue(evaluate(argv).allowed, desc)
 
     def test_the_obtainability_skill_spellings_reach_their_allowlist_entries(self):
-        # gke-obtainability's design-time mode issues these exactly (SKILL.md
-        # design-time section): per-model capacity probes, the Flex-Start
-        # variant with a run duration, and the single-machine-type history
-        # read. Same failure class as the stockout SOP's spellings: an entry
+        # capacity-obtainability's Diagnostics D shows these exactly: the Spot
+        # capacity probe, the Flex-Start variant with a run duration, and the
+        # single-machine-type history read. Same failure class as the stockout SOP's spellings: an entry
         # whose flags lack arity is unreachable.
         for argv, desc in (
             (["gcloud", "beta", "compute", "advice", "capacity",

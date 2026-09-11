@@ -1,5 +1,5 @@
 ---
-name: gke-obtainability
+name: capacity-obtainability
 description: >-
   Check GKE quota and live hardware obtainability before recommending
   capacity. Use when a cluster design, capacity plan, or scale-up decision
@@ -51,17 +51,23 @@ Loaded from a design, planning, or capacity-check request — for example the
 ### Record what you executed as typed evidence
 
 Use the `record_evidence` tool — one record per check, built from the real
-command output, never from memory:
+command output, never from memory. If `record_evidence` or `attach_artifact`
+is not among your tools, do not stop and do not skip the check: put the same
+JSON under an `## Evidence` heading in your report, and the manifests as
+fenced YAML there, so the record still reaches the reader.
 
 - after the quota check: `type: quota_check` with the metric, limit, usage,
-  and whether the request fits in `analysis`;
+  whether the request fits, and the reservations found, in `analysis` — this
+  record is the On-Demand assessment;
 - after the capacity advice calls: `type: advice_service_capacity` with
   `api_method: compute.beta.AdviceService.Capacity`, shaped exactly as below.
 
 For `advice_service_capacity`, use **exactly** these key names and shapes for
 `request` and `analysis` — do not rename keys, do not replace object entries
 with bare strings, fill the values from the real responses (probe at least two
-zones, with per-zone queries if one call returns fewer):
+zones, with per-zone queries if one call returns fewer). Only the two models
+the API returns belong in this record; On-Demand is assessed from the quota
+and reservation checks and reported under its own path below:
 
 ```json
 {
@@ -73,13 +79,12 @@ zones, with per-zone queries if one call returns fewer):
   "analysis": {
     "availableQuantity": 32,
     "zones": [
-      {"zone": "us-central1-f", "obtainability": 0.9},
-      {"zone": "us-central1-a", "obtainability": 0.5}
+      { "zone": "us-central1-f", "obtainability": 0.9 },
+      { "zone": "us-central1-a", "obtainability": 0.5 }
     ],
     "provisioningModels": {
-      "SPOT": {"obtainability": 0.9, "zone": "us-central1-f"},
-      "FLEX_START": {"status": "probed", "notes": "..."},
-      "ON_DEMAND": {"source": "quota+reservations", "notes": "..."}
+      "SPOT": { "obtainability": 0.9, "zone": "us-central1-f" },
+      "FLEX_START": { "status": "probed", "notes": "..." }
     }
   }
 }
@@ -116,7 +121,10 @@ a manifest that departs from them is a finding, not a deliverable.
 
 A GKE ComputeClass is `cloud.google.com/v1` (never `autopilot.gke.io/*`),
 `machineFamily` takes a family (`a2`), not a machine type, and GPU fallback
-tiers select accelerators via `gpu.type`:
+tiers select accelerators via `gpu.type`. The order follows the
+[gke-compute-classes](../gke-compute-classes/SKILL.md) AI/ML rule and Rule D
+below: On-Demand (or a reservation) on the requested family first, Spot on
+the same family second, never Spot as the primary tier:
 
 ```yaml
 apiVersion: cloud.google.com/v1
@@ -125,12 +133,13 @@ metadata:
   name: <design>-cc
 spec:
   priorities:
-    - machineFamily: a2          # primary: the requested accelerator family
+    - machineFamily: a2 # primary: the requested family, On-Demand
+    - machineFamily: a2 # same family on Spot, behind the floor
       spot: true
-    - gpu:                       # fallback tier: smaller accelerator
+    - gpu: # fallback tier: smaller accelerator
         type: nvidia-l4
         count: 1
-    - gpu:                       # last-resort tier
+    - gpu: # last-resort tier
         type: nvidia-tesla-t4
         count: 1
   nodePoolAutoCreation:
@@ -206,6 +215,20 @@ gcloud beta compute advice capacity \
     --target-distribution-shape=ANY \
     --size=1 \
     --region=us-central1 \
+    --format="json"
+```
+
+**Flex-Start Availability Advice** (the same probe with
+`--provisioning-model=FLEX_START` and the job's run duration):
+
+```bash
+gcloud beta compute advice capacity \
+    --provisioning-model=FLEX_START \
+    --instance-selection-machine-types="a2-highgpu-8g" \
+    --target-distribution-shape=ANY \
+    --size=4 \
+    --region=us-central1 \
+    --max-run-duration=12h \
     --format="json"
 ```
 
