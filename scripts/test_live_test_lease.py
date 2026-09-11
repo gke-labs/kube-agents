@@ -1762,5 +1762,36 @@ def _fake_kubectl(data, rv="1"):
     return mock.Mock(side_effect=call)
 
 
+class KubectlTimeoutConfigurationTest(unittest.TestCase):
+    """Tests the resolution of kubectl timeout, including CI environment overrides."""
+
+    def test_default_timeout_is_eight_seconds(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(lease._get_kubectl_timeout(), 8)
+
+    def test_env_override_sets_custom_timeout(self):
+        with mock.patch.dict(os.environ, {"KUBE_AGENTS_KUBECTL_TIMEOUT": "30"}, clear=True):
+            self.assertEqual(lease._get_kubectl_timeout(), 30)
+
+    def test_invalid_env_override_falls_back_to_default(self):
+        for invalid in ("", "invalid", "-5", "0"):
+            with self.subTest(invalid=invalid):
+                with mock.patch.dict(os.environ, {"KUBE_AGENTS_KUBECTL_TIMEOUT": invalid}, clear=True):
+                    self.assertEqual(lease._get_kubectl_timeout(), 8)
+
+    def test_kubectl_uses_configured_timeout(self):
+        install = lease.Install(
+            name="test",
+            context="test-ctx",
+            namespace="kubeagents-system",
+        )
+        with mock.patch.dict(os.environ, {"KUBE_AGENTS_KUBECTL_TIMEOUT": "45"}, clear=True), \
+             mock.patch.object(lease.subprocess, "run") as run_mock:
+            run_mock.return_value = mock.Mock(returncode=0, stdout="ok", stderr="")
+            rc, out, err = lease.kubectl(install, ["version"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(run_mock.call_args.kwargs.get("timeout"), 45)
+
+
 if __name__ == "__main__":
     unittest.main()

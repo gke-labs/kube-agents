@@ -158,6 +158,8 @@ currently fails.
 | C1  | the rendered egress policy is default-deny                       | 1 **KV** | `test_C1_the_rendered_egress_policy_is_default_deny`                  | **slice 2b 1.3, and back**: `0.0.0.0/0 except 169.254.169.254/32` adds the internet rather than subtracting the address — #676 gave the gateway policy exactly that rule, so this is a violation again             |
 | C1  | the rendered egress policy reaches no metadata address           | 1 **KV** | `test_C1_the_rendered_egress_policy_reaches_no_metadata_address`      | a guard written against one of the three spellings; a violation again since #676 for the same reason as the row above                                                                                              |
 | C1  | every operator-supplied CIDR reaches the refusal guards          | 1        | `test_C1_every_operator_supplied_cidr_reaches_the_refusal_guards`     | a new CRD field that accepts a CIDR and never calls the guard                                                                                                                                                      |
+| C1  | the gateway redactor matches the leaked credential shapes        | 1        | `test_C1_the_gateway_redactor_matches_the_leaked_credential_shapes`   | #603: a 200-character `ya29.` token, a projected-token JWT, an `AIza` key, a PEM block and a Secret `data:` block, each measured in the clear in a durable artifact; the gateway hook runs this module at egress   |
+| C1  | the gateway redactor leaves ordinary manifest content alone      | 1        | `test_C1_the_gateway_redactor_leaves_ordinary_manifest_content_alone` | the over-eager redactor that eats every IAM principal and gets switched off — the service-account exemption's anchored lookahead is the control                                                                    |
 | C1  | the metadata server is unreachable from the sandbox              | 2        | `Scenario5`                                                           | the controller deleting the metadata-deny NetworkPolicy; the credential-free sandbox minting the GSA token                                                                                                         |
 | C1  | a violating request is rejected by the API server                | 2        | `Scenario6`                                                           | **slice 2b 1.2**: kustomize `namePrefix` leaving the policy applied and silently inert                                                                                                                             |
 | C2  | an unparseable argv is refused                                   | 1        | `test_C2_an_unparseable_argv_is_refused`                              | a new kubectl release adding a flag that hides the verb                                                                                                                                                            |
@@ -242,9 +244,9 @@ python3 hack/conformance-mutations.py --list
 python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 ```
 
-80 mutations: 61 KILLED, 17 NOISY, two `must_survive` controls (one on the
+82 mutations: 63 KILLED, 17 NOISY, two `must_survive` controls (one on the
 harness itself, one pinning a deliberate redundancy in the shorthand
-handling), zero genuine survivors, zero stale — measured 2026-09-08 against
+handling), zero genuine survivors, zero stale — measured 2026-09-09 against
 `main`; re-run the harness rather than trusting these numbers, which is the
 sentence this paragraph exists to make cheap. Each names the control
 it removes, the test that must notice, and the plausible bad change it

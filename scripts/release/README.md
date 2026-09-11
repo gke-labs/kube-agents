@@ -84,7 +84,7 @@ The end-to-end pipeline (`.github/workflows/rc-release-pipeline.yml`) is dispatc
   - Automatically resolves the latest validated candidate (`rc_*_validated`) using `resolve_promotion_candidate.sh`.
   - **Redundant Run Skipping**: If no eligible validated candidate exists, the scheduler dispatches nothing and records the reason in its job summary via `record_nightly_scheduler_skip.sh`.
   - Dispatches `nightly-pipeline.yml` using `dispatch_nightly_pipeline.sh` with the default `GITHUB_TOKEN` and `actions: write`.
-- **Weekly GA Scheduled Cadence (`release-scheduler.yml`, weekly on Thursdays at `17 5 * * 4`, best-effort)**:
+- **Weekly GA Scheduled Cadence (`release-scheduler.yml`, weekly on Fridays at `17 5 * * 5`, best-effort)**:
   - Automatically resolves whether an eligible candidate exists using `resolve_scheduled_release.sh` (requiring a valid `staging_<ts>_<sha>` tag and unreleased commits since the last GA tag, while halting on major breaking changes on stable `>= 1.0.0` releases).
   - **Redundant Run Skipping**: If no eligible candidate exists or no new commits have merged, the scheduler dispatches nothing and records why in its job summary via `record_release_scheduler_skip.sh`.
   - Dispatches `release-publish.yml` using `dispatch_release_pipeline.sh` (`-f schedule_gate=evaluate`) with the default `GITHUB_TOKEN` and `actions: write`.
@@ -302,7 +302,7 @@ reason is strictly the emergency override for hotfixes rather than a way to cut 
 ### Scheduled execution & testing the gate
 
 **Scheduled execution is owned by `.github/workflows/release-scheduler.yml` via the decoupled
-trigger pattern (`cron: "17 5 * * 4"`), while `release-publish.yml` remains dispatch-only.** The gate
+trigger pattern (`cron: "17 5 * * 5"`), while `release-publish.yml` remains dispatch-only.** The gate
 reads the staging tag produced nightly by `nightly-pipeline.yml` (dispatched by `nightly-scheduler.yml`).
 The activation ladder progresses in order:
 
@@ -327,15 +327,15 @@ The activation ladder progresses in order:
    bump minor under SemVer 2.0 Clause 4 (`0.4.0 -> 0.5.0`) and release unattended.
 
 4. **Automate on weekly schedule via dedicated scheduler.** Automated execution is owned by
-   `.github/workflows/release-scheduler.yml` via the decoupled trigger pattern (`cron: "17 5 * * 4"`).
-   Thursday leaves a working day to react to a bad release, which Friday does not. 05:17 UTC is meant
+   `.github/workflows/release-scheduler.yml` via the decoupled trigger pattern (`cron: "17 5 * * 5"`).
+   The schedule runs overnight from Thursday into Friday at 05:17 UTC, which is meant
    to sit after the nightly pipeline has finished, but that is an estimate rather than a measured
    margin — its 02:17 start gives three hours for a run that budgets 60 minutes on the deploy plus
    `timeout_minutes: 120` on the matrix. Being wrong about it costs latency and never correctness,
    because the gate is a poll: a candidate promoted later is simply picked up the following week.
    Pick a later slot if the two turn out to overlap.
 
-Two things to know about a weekly cadence, neither of them a reason to change it. A Thursday that
+Two things to know about a weekly cadence, neither of them a reason to change it. A Friday that
 produces nothing costs a full week, because there is no rate limiter inside the resolver to buy the
 week back — the cron is the cadence, which is what keeps wall-clock arithmetic out of the decision
 entirely. Against the staging gate that is a real risk rather than a rarity: a release needs a

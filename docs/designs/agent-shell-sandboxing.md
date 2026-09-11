@@ -1869,8 +1869,8 @@ with the shell, the file tools and `execute_code` all in the sandbox the model h
 to that. What is left in the agent pod is trusted code: the MCP server, the cron scripts,
 the gateway. The point of the proxy is that raw credentials never reach the agent, not
 that no process can invoke a command, so this is the property that matters. What settles
-the rest of it is per-caller authentication: the broker is in a pod of its own, both
-callers reach it over a Service, and neither gets in without a bearer token.
+the rest of it is per-caller authentication: the broker is in a pod of its own, its
+callers reach it over a Service, and none gets in without a bearer token.
 
 The kubeconfig entanglement that used to argue for a shared volume is gone. `gcloud
 container clusters get-credentials` writes a kubeconfig, and the broker used to validate
@@ -2070,7 +2070,7 @@ the same placement:
 | PlatformAgent API proxy (`:8643`)    | `API_SERVER_EXTERNAL_KEY`            | already authenticated and network-exposed             |
 | k8s-event-watcher                    | `KUBECONFIG`, `SESSION_KV_API_KEY`   | posts to the Session KV over **pod loopback**         |
 | Slack relay                          | `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN` | `SocketModeClient` WebSocket — **stateful singleton** |
-| Google Chat relay                    | GCP via ADC (Pub/Sub)                | inbound pump; must deliver into the gateway           |
+| Google Chat relay (one per consumer) | GCP via ADC (Pub/Sub)                | inbound pump; must deliver into the gateway           |
 
 The relays move with the broker rather than staying behind. The Google Chat relay
 authenticates to Pub/Sub through ADC, so leaving it in the gateway pod would mean that pod
@@ -2194,30 +2194,35 @@ credential a `no_agent` job actually asks for; it does not decide that.
 ### Caller authentication
 
 Every caller is now remote, so nothing on the exec path is protected by being on loopback.
-The broker listens on `0.0.0.0` behind a ClusterIP, and both the sandbox and the gateway
+The broker listens on `0.0.0.0` behind a ClusterIP, and the sandbox, the gateway and any other caller
 dial the Service by name.
 
 What replaced the loopback listener and the `0600` socket is a projected ServiceAccount
 token: one hour, presented as a bearer header and verified with a `TokenReview` against the
 API server. Every path except `/healthz` requires it, and an unidentified caller gets an
-undifferentiated `401` rather than a reason. `CREDENTIAL_PROXY_ALLOWED_CALLERS` names the two
+undifferentiated `401` rather than a reason. `CREDENTIAL_PROXY_ALLOWED_CALLERS` names the
 TokenReview usernames the broker will serve — the sandbox's ServiceAccount, which is where
-every credentialed command originates, and the gateway's, because the chat relays go through
-the same listener. The operator grants the broker exactly one verb, `create` on
-`tokenreviews`, to do it.
+every credentialed command originates, the gateway's, because the chat relays go through
+the same listener, and, once the operator renders it, the A2A gateway's. The operator grants
+the broker exactly one verb, `create` on `tokenreviews`, to do it.
 
-**The audience is per Pod, and it is what separates the two callers.** The sandbox's token is
+**The audience is per Pod, and it is what separates the callers.** The sandbox's token is
 minted for `kubeagents-credential-proxy`, the gateway's for
-`kubeagents-credential-proxy-chat`, and the `TokenReview` response echoes which audience it
-validated. A username cannot do this job: the gateway shares its ServiceAccount with the
+`kubeagents-credential-proxy-chat`, the A2A gateway's, once rendered, for whatever
+`CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE` names, and the `TokenReview` response echoes which
+audience it validated. A username cannot do this job: the gateway shares its ServiceAccount with the
 broker because the Workload Identity binding names it, so the two Pods are one identity at
 the `TokenReview` layer. The audience is chosen by the operator, per Pod, and the API server
 will not validate a token against an audience it was not minted for, so it is a claim the
 caller cannot restate. `ROUTE_ROLES` in `credential_proxy.py` is the table it feeds: the
 sandbox, where every model-authored command runs, cannot reach `/v1/chat/**` at all, and the
-gateway cannot reach `/v1/exec`, `/v1/github/**` or `/v1/workspace/**`. Neither ever needed
-the other's routes, so this enforces a separation the deployment already had and nothing
-checked. A `NetworkPolicy` would have expressed the same thing and is not the mechanism
+gateway cannot reach `/v1/exec`, `/v1/github/**` or `/v1/workspace/**`. Neither of those
+two ever needed the other's routes, so this enforces a separation the deployment already
+had and nothing checked. The same table carries a third role, `a2a-chat`, for the A2A
+gateway: `/v1/chat/a2a/**` is that role's alone, `/v1/chat/api` it shares with the chat
+role, and the legacy event routes it cannot reach; [the chatops gateway
+design](spec-chatops-gateway.md) ("The Google Chat adapter") owns why that caller is kept
+apart from the legacy chat one. A `NetworkPolicy` would have expressed the same thing and is not the mechanism
 chosen, because it does nothing at all on a CNI that does not implement `NetworkPolicy` and
 `TokenReview` is answered by the API server on every cluster.
 
@@ -2233,14 +2238,16 @@ fix and is not deployed.
 
 `GOOGLE_CHAT_RELAY_URL` and `SLACK_RELAY_URL` both point at the proxy Service rather than
 `127.0.0.1` — the relay listener moved with the broker, so both follow it. Both Google Chat
-directions are gateway-initiated pulls against `/v1/chat/events` on the relay, so moving the
-relay out of the gateway pod does not reverse the direction of any connection and the
-gateway needs no new ingress rule for either.
+directions are gateway-initiated pulls against `/v1/chat/events` on the relay (the A2A
+gateway's own instance pulls `/v1/chat/a2a/events` the same way), so moving the relay out
+of the gateway pod does not reverse the direction of any connection and the gateway needs
+no new ingress rule for either.
 
 It needs an egress one, which is a different sentence and was the easier half to miss. A
 loopback call crosses no NetworkPolicy; this one does, so rule 12 of `buildNetworkPolicy`
 reaches the broker's pod selector on `credentialProxyPort` and
-`buildCredentialProxyNetworkPolicy` admits the gateway there. Written one-sided, both
+`buildCredentialProxyNetworkPolicy` admits the gateway there (the legacy gateway; the A2A
+gateway's admission is on the chatops gateway design's not-yet-rendered list). Written one-sided, both
 policies still read as though they permitted the call and an enforcing dataplane drops
 every chat pull while the pods stay Running and the CR reads Ready — which is rule 11's
 lesson about the sandbox's sshd, arriving a second time by the same route.
@@ -2517,9 +2524,12 @@ the property this document is about; what is left is trusted code holding more t
 needs. Two ways to close it: configure federation, or give the broker a ServiceAccount of
 its own and take the annotation off the gateway's. Neither ships today.
 
-**Nothing tells the gateway from the sandbox.** The broker authenticates its callers, but
-`CREDENTIAL_PROXY_ALLOWED_CALLERS` names both ServiceAccounts and no policy varies on which
-one presented the token. See [Caller authentication](#caller-authentication). Federation
+**The ServiceAccount does not tell the gateway from the sandbox.** The broker authenticates
+its callers, but `CREDENTIAL_PROXY_ALLOWED_CALLERS` names every calling ServiceAccount and
+nothing varies on which one presented the token. What separates them is the audience and
+the role table it feeds ([Caller authentication](#caller-authentication)), and that rests
+entirely on the operator projecting a distinct audience per Pod: an install whose broker
+has no `CREDENTIAL_PROXY_CHAT_AUDIENCE` is back to one role for every caller. Federation
 does not fix this one.
 
 ---

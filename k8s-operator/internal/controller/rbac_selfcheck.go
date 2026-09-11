@@ -375,6 +375,7 @@ func (r *PlatformAgentReconciler) reportRBACSkew(ctx context.Context, agent *age
 		Status:             metav1.ConditionTrue,
 		Reason:             reasonRBACIncomplete,
 		Message:            message,
+		ObservedGeneration: agent.Generation,
 		LastTransitionTime: metav1.Now(),
 	})
 	return true, r.Status().Update(ctx, agent)

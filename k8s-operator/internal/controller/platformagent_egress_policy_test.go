@@ -1609,3 +1609,52 @@ func TestTheReconciledOTelRuleFollowsTheResolvedEndpoint(t *testing.T) {
 		})
 	}
 }
+
+// The Allowlist policy and the gateway policy are rendered independently and
+// either can be the only one present, so the bus rule has to exist in both:
+// an agent Pod handed NATS credentials under `next` but fenced by a policy
+// with no 4222 rule does not refuse the dial, it hangs it to the client
+// timeout on an install whose CR reads Ready. Today's render must not carry
+// the rule — the dark-stack promise is that a normal install cannot tell the
+// feature exists, and this policy is part of a normal install's surface.
+func TestAgentEgressPolicyBusRuleGatedOnMode(t *testing.T) {
+	findBusRule := func(policy *networkingv1.NetworkPolicy) *networkingv1.NetworkPolicyEgressRule {
+		for i := range policy.Spec.Egress {
+			for _, p := range policy.Spec.Egress[i].Ports {
+				if p.Port != nil && p.Port.IntVal == 4222 {
+					return &policy.Spec.Egress[i]
+				}
+			}
+		}
+		return nil
+	}
+
+	today, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(), nil, managedOTelCollectorNamespace)
+	if rule := findBusRule(today); rule != nil {
+		t.Errorf("mode absent rendered a bus egress rule on the Allowlist policy: %+v", rule)
+	}
+
+	next, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(func(agent *agentv1alpha1.PlatformAgent) {
+		agent.Spec.Mode = ptr.To("next")
+	}), nil, managedOTelCollectorNamespace)
+	rule := findBusRule(next)
+	if rule == nil {
+		t.Fatal("mode next rendered no 4222 rule on the Allowlist policy; the bus dial hangs to the timeout")
+	}
+	if len(rule.To) != 1 || rule.To[0].PodSelector == nil || rule.To[0].IPBlock != nil {
+		t.Fatalf("the bus rule must select the NATS pods by label and nothing else: %+v", rule.To)
+	}
+	if rule.To[0].PodSelector.MatchLabels[labelPartOf] != a2aPartOf ||
+		rule.To[0].PodSelector.MatchLabels[a2aComponentLabel] != "nats" {
+		t.Errorf("the bus rule does not pin the NATS pod labels: %+v", rule.To[0].PodSelector.MatchLabels)
+	}
+
+	// Skew preserves the surface, matching the gateway policy's rule — the
+	// reconciler freezes a running next stack rather than cleaning it up.
+	skewed, _ := buildAgentEgressNetworkPolicy(egressPolicyAgent(func(agent *agentv1alpha1.PlatformAgent) {
+		agent.Spec.Mode = ptr.To("quantum")
+	}), nil, managedOTelCollectorNamespace)
+	if findBusRule(skewed) == nil {
+		t.Error("skew removed the Allowlist policy's bus rule while the bus keeps running")
+	}
+}

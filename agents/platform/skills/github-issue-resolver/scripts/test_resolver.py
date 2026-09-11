@@ -319,6 +319,23 @@ class HandlePollRoutingTest(unittest.TestCase):
         for field in ("number", "title", "body", "labels", "createdAt"):
             self.assertIn(field, projection)
 
+    def test_poll_leaves_every_machine_owned_ledger_alone(self):
+        """The query excludes the labels other jobs rewrite in place.
+
+        `agent:audit` is the fleet-audit ledger and `agent:delivery-watch` is
+        `chat_delivery_watch.py`'s ledger of scheduled reports that stopped
+        reaching chat; both are edited and closed by their owner alone, and a
+        resolver turn on either corrupts a report that is not its own.
+        """
+        record = []
+        self._poll(["acme/toolkit"], record=record)
+        listing = next(
+            a for a in record if a[1:3] == ["issue", "list"] and "--search" in a
+        )
+        query = listing[listing.index("--search") + 1]
+        for label in ("agent:audit", "agent:delivery-watch", "agent:ignore"):
+            self.assertIn(f"-label:{label}", query)
+
     def test_poll_still_reports_when_the_comment_fetch_fails(self):
         """Comments are context for the investigation, not the finding itself.
 

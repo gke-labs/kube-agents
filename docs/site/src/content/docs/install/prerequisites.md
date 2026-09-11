@@ -57,7 +57,7 @@ Three more things the installer sets on a cluster it creates, and treats differe
 - **Managed OpenTelemetry collection scope.** Set only on clusters the install created; on an adopted one, follow [Enable Managed OpenTelemetry on an existing cluster](/kube-agents/reference/attribution/#enable-managed-opentelemetry-on-an-existing-cluster).
 - **The Backup for GKE agent.** Only needed with `enable_gke_backup_plan = true`, which is off by default; the module cannot enable the agent on a cluster it only reads.
 
-Run the installer with `--dry-run` to see the plan against the cluster without changing it. The installer's own cluster changes happen only on a real run, so a dry run against a cluster still missing NetworkPolicy enforcement or legacy node pool migration skips the resource preview (`terraform plan`) with a warning; a real run aborts unless authorized with `--enable-network-policy` or `--migrate-node-pools`.
+Run the installer with `--dry-run` to see the plan against the cluster without changing it. The installer's own cluster changes happen only on a real run, so a dry run against a cluster still missing NetworkPolicy enforcement or legacy node pool migration skips the resource preview (`terraform plan`) with a warning; a real run, and `--generate-only`, abort unless authorized with `--enable-network-policy` or `--migrate-node-pools`.
 
 **No extra firewall rule is needed on private clusters.** The operator's webhook server listens on
 `10250`, one of the two ports GKE's automatic control-plane-to-node rule already permits — see

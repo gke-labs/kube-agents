@@ -2018,6 +2018,47 @@ class RepositoryValidationTest(unittest.TestCase):
         # runs (defense-in-depth against regex denial-of-service).
         self.assertFalse(is_valid_repository("-" * (MAX_REPOSITORY_LENGTH + 1)))
 
+    def test_rejects_traversal_and_flag_segments(self):
+        # The local validator this replaced accepted both; every other copy in
+        # the tree rejected them. `acme/..` names the owner's namespace rather
+        # than a repository, and a leading dash makes `gh -R <slug>` read the
+        # slug as a flag.
+        for value in ("acme/..", "acme/.", "acme/-x", "-acme/repo", "../.."):
+            with self.subTest(value=value):
+                self.assertFalse(is_valid_repository(value))
+
+    def test_rejects_a_value_it_would_have_to_normalise(self):
+        # The caller passes the *original* string to github_token_refresh.py,
+        # which splits it on "/" and sends the left half to Minty as an org
+        # name. Accepting a value that merely normalises to a slug would put
+        # "  acme" in that request.
+        for value in (
+            " acme/repo ",
+            "acme/repo\n",
+            "/acme/repo",
+            "acme/repo/",
+            "acme/repo.git",
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(is_valid_repository(value))
+
+    def test_rejects_a_value_carrying_a_host(self):
+        for value in (
+            "github.com/acme",
+            "github.com/acme/repo",
+            "https://github.com/acme/repo",
+            "git@github.com:acme/repo",
+        ):
+            with self.subTest(value=value):
+                self.assertFalse(is_valid_repository(value))
+
+    def test_stays_total_on_a_malformed_url(self):
+        # urlsplit raises a bare ValueError on these; nothing may escape a
+        # predicate the request handler calls on untrusted input.
+        for value in ("https://[::1/x", "http://[abc]:x/a/b", "https://a]b/c/d"):
+            with self.subTest(value=value):
+                self.assertFalse(is_valid_repository(value))
+
 
 class GitHubRefreshHandlerTest(unittest.TestCase):
     """A failed refresh splits its diagnosis: detail to the log, none to the reply.
@@ -4141,24 +4182,114 @@ class AudienceRoleTest(unittest.TestCase):
 
 
 class RequiredRoleTest(unittest.TestCase):
-    """Which side of the split each route belongs to."""
+    """Which side of the split each route belongs to.
+
+    Reads ``required_roles`` (plural) since this branch: a route can admit more
+    than one caller role, because the /v1/chat/api passthrough is shared by the
+    legacy chat relay and the A2A one — one credential, two subscriptions. The
+    singular ``required_role`` these tests were written against returned the
+    first match and could not express that.
+    """
 
     def test_the_shell_routes(self):
         for path in ("/v1/exec", "/v1/github/refresh", "/v1/workspace/open"):
             with self.subTest(path=path):
                 self.assertEqual(
-                    credential_proxy.CALLER_ROLE_SHELL, credential_proxy.required_role(path)
+                    (credential_proxy.CALLER_ROLE_SHELL,),
+                    credential_proxy.required_roles(path),
                 )
 
     def test_the_chat_routes(self):
         for path in ("/v1/chat/slack/events", "/v1/chat/google/api"):
             with self.subTest(path=path):
                 self.assertEqual(
-                    credential_proxy.CALLER_ROLE_CHAT, credential_proxy.required_role(path)
+                    (credential_proxy.CALLER_ROLE_CHAT,),
+                    credential_proxy.required_roles(path),
                 )
 
+    def test_the_shared_api_passthrough_admits_both_chat_callers(self):
+        """The case the plural exists for, and the reason a rename was not enough.
+
+        Both relays hold the same app credential and must reach the API
+        passthrough, while each side's event route stays its own. Under the
+        singular form this route resolved to whichever role matched first, so
+        one of the two consumers was refused a route it is entitled to.
+        """
+        self.assertEqual(
+            (credential_proxy.CALLER_ROLE_CHAT, credential_proxy.CALLER_ROLE_A2A_CHAT),
+            credential_proxy.required_roles("/v1/chat/api"),
+        )
+
+    def test_the_a2a_event_route_stays_its_own(self):
+        self.assertEqual(
+            (credential_proxy.CALLER_ROLE_A2A_CHAT,),
+            credential_proxy.required_roles("/v1/chat/a2a/events"),
+        )
+
     def test_a_route_belonging_to_neither(self):
-        self.assertEqual("", credential_proxy.required_role("/healthz"))
+        self.assertEqual((), credential_proxy.required_roles("/healthz"))
+
+
+class RouteRolesTableTest(unittest.TestCase):
+    """The shape checks that keep ROUTE_ROLES able to enforce what it says.
+
+    Three ways this table can be mis-edited into admitting a caller it should
+    refuse, none of which any linter here would catch and none of which shows
+    up as a failing route. ``_validate_route_roles`` runs at import, so a
+    mis-shaped table fails every test module rather than shipping; these pin
+    that it still does, and name the escalation each one prevents.
+    """
+
+    def test_the_shipped_table_is_valid(self):
+        credential_proxy._validate_route_roles(credential_proxy.ROUTE_ROLES)
+
+    def test_a_bare_string_entry_is_refused(self):
+        """The old (prefix, role) shape, which turns membership into substring.
+
+        ``principal.role in "a2a-chat"`` is true for the legacy chat role, so
+        this entry would hand the chat relay the A2A event routes.
+        """
+        self.assertIn(
+            credential_proxy.CALLER_ROLE_CHAT, credential_proxy.CALLER_ROLE_A2A_CHAT
+        )
+        with self.assertRaises(TypeError):
+            credential_proxy._validate_route_roles(
+                (("/v1/chat/a2a/", credential_proxy.CALLER_ROLE_A2A_CHAT),)
+            )
+
+    def test_a_role_that_is_not_a_role_is_refused(self):
+        with self.assertRaises(ValueError):
+            credential_proxy._validate_route_roles((("/v1/chat/a2a/", ("a2a_chat",)),))
+
+    def test_an_empty_prefix_is_refused(self):
+        """An empty prefix matches every path and shadows the whole table."""
+        with self.assertRaises(ValueError):
+            credential_proxy._validate_route_roles(
+                (("", (credential_proxy.CALLER_ROLE_SHELL,)),)
+            )
+
+    def test_sorting_the_table_is_refused(self):
+        """The escalation a tidying edit reaches without mistyping anything.
+
+        "/v1/chat/" sorts ahead of "/v1/chat/a2a/", so an alphabetized table
+        answers the A2A event routes with the chat role and the legacy relay
+        walks in. Sorted output is checked rather than a hand-written pair, so
+        this stays true as routes are added.
+        """
+        table = tuple(sorted(credential_proxy.ROUTE_ROLES))
+        self.assertNotEqual(credential_proxy.ROUTE_ROLES, table)
+        with self.assertRaises(ValueError):
+            credential_proxy._validate_route_roles(table)
+
+    def test_a_duplicate_prefix_is_refused(self):
+        """The second entry is dead, so its roles are a comment, not a rule."""
+        with self.assertRaises(ValueError):
+            credential_proxy._validate_route_roles(
+                (
+                    ("/v1/chat/", (credential_proxy.CALLER_ROLE_CHAT,)),
+                    ("/v1/chat/", (credential_proxy.CALLER_ROLE_A2A_CHAT,)),
+                )
+            )
 
 
 class RolePermitsTest(unittest.TestCase):
@@ -4256,6 +4387,56 @@ class ManagedRepositoryGateTest(unittest.TestCase):
 
 
 class BuildAuthenticatorTest(unittest.TestCase):
+    def test_the_a2a_chat_audience_confers_its_own_role(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE": "aud-a2a",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(
+            authenticator.audience_roles,
+            {
+                credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE: credential_proxy.CALLER_ROLE_SHELL,
+                "aud-chat": credential_proxy.CALLER_ROLE_CHAT,
+                "aud-a2a": credential_proxy.CALLER_ROLE_A2A_CHAT,
+            },
+        )
+
+    def test_the_a2a_chat_audience_means_nothing_without_the_chat_split(self):
+        # And says so: a gateway presenting that audience would otherwise 401
+        # with "audience not known" and nothing naming the env.
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE": "aud-a2a",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                authenticator = credential_proxy.build_authenticator()
+        self.assertEqual(
+            authenticator.audience_roles, {credential_proxy.DEFAULT_CREDENTIAL_PROXY_AUDIENCE: ""}
+        )
+        self.assertTrue(any("CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE" in line for line in logs.output))
+
+    def test_an_a2a_chat_audience_equal_to_the_chat_audience_is_refused_with_a_warning(self):
+        environment = {
+            "CREDENTIAL_PROXY_AUTH_MODE": "serviceaccount",
+            "CREDENTIAL_PROXY_ALLOWED_CALLERS": "system:serviceaccount:ns:agent",
+            "KUBERNETES_SERVICE_HOST": "10.0.0.1",
+            "CREDENTIAL_PROXY_CHAT_AUDIENCE": "aud-chat",
+            "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE": "aud-chat",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertLogs(credential_proxy.LOGGER, level="WARNING") as logs:
+                authenticator = credential_proxy.build_authenticator()
+        self.assertNotIn(credential_proxy.CALLER_ROLE_A2A_CHAT, authenticator.audience_roles.values())
+        self.assertTrue(any("CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE" in line for line in logs.output))
+
     def test_the_default_is_the_null_authenticator(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertIsInstance(
@@ -5402,6 +5583,42 @@ class ScopedServiceAccountOverTheSocketTest(unittest.TestCase):
         self.assertIn("token: TOKEN", body["stdout"])
         self.assertEqual([self.EMAIL], self.minted)
 
+
+
+class ChatRelaySubscriptionsTest(unittest.TestCase):
+    def test_two_relays_on_one_subscription_are_refused_at_startup(self):
+        environment = {
+            "GOOGLE_CHAT_SUBSCRIPTION_NAME": "projects/p/subscriptions/one",
+            "A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME": "projects/p/subscriptions/one",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertRaises(RuntimeError):
+                credential_proxy.chat_relay_subscriptions("p")
+
+    def test_distinct_or_single_subscriptions_pass_through(self):
+        with mock.patch.dict(
+            os.environ,
+            {"GOOGLE_CHAT_SUBSCRIPTION_NAME": "a", "A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME": "b"},
+            clear=True,
+        ):
+            self.assertEqual(credential_proxy.chat_relay_subscriptions("p"), ("a", "b"))
+        with mock.patch.dict(os.environ, {"A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME": "b"}, clear=True):
+            self.assertEqual(credential_proxy.chat_relay_subscriptions("p"), ("", "b"))
+
+    def test_a_short_name_and_its_qualified_spelling_are_one_subscription(self):
+        environment = {
+            "GOOGLE_CHAT_SUBSCRIPTION_NAME": "chat-sub",
+            "A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME": "projects/p/subscriptions/chat-sub",
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            with self.assertRaises(RuntimeError):
+                credential_proxy.chat_relay_subscriptions("p")
+        # Same short name in another project is a different subscription.
+        with mock.patch.dict(os.environ, environment, clear=True):
+            self.assertEqual(
+                credential_proxy.chat_relay_subscriptions("q"),
+                ("chat-sub", "projects/p/subscriptions/chat-sub"),
+            )
 
 if __name__ == "__main__":
     unittest.main()

@@ -75,10 +75,13 @@ do.
 
 On the W6 install the bridge connects as the static `worker` user, whose grants already
 cover it: subscribe `a2a.tasks.>`, publish `a2a.tasks.*.*.events`, plus the JetStream
-tax (`$JS.API.>`, `$JS.ACK.TASKS.>` — ack scoped to the one stream this user consumes
-with explicit ack; unscoped `$JS.ACK.>` is a cross-principal +TERM — `$JS.FC.>`,
-`_INBOX.worker.>`) and `$KV.runtime-state.>`
-for the in-flight registry below. Playground posture - the shared static user is the
+tax and `$KV.runtime-state.>` for the in-flight registry below. The tax is not
+`$JS.API.>`: it is the `$JS.API` subjects the bridge emits on TASKS and
+`KV_runtime-state` — stream info, consumer create, pull, direct get, and the KV
+watcher's consumer delete — named one by one, with the CLI's topic-stream reads, in the
+operator's `a2aWorkerJetStreamGrants`; `$JS.ACK.TASKS.>`, ack scoped to the one stream this user
+consumes with explicit ack (unscoped `$JS.ACK.>` is a cross-principal +TERM); `$JS.FC.>`;
+and `_INBOX.worker.>`. Playground posture - the shared static user is the
 playground, per the deployment spec. The production shape, recorded for when the
 callout arms: a dedicated `bridge` identity with subscribe `a2a.tasks.platform.*.in`,
 publish `a2a.tasks.platform.*.events`, its own inbox prefix, and the KV grant. Nothing

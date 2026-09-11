@@ -39,7 +39,6 @@ flag, so a session that started under one does not finish under the other.
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -54,13 +53,28 @@ import credential_proxy_client
 import gitops_workspace
 from github_token_refresh import refresh_git_credentials, log
 
-BARE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 # Branches a suggestion may never target. `main` and `master` are the GitOps
 # rollout branches; `production` is the convention some fleets use instead.
 PROTECTED_BRANCHES = {"main", "master", "production"}
 
 OWNER = "submit-suggestion"
+
+# The one directory `--body-file` may name. The same bound `pr_conversation.py`
+# and `github-issue-resolver`'s resolver put on their own body paths, for the
+# same reason: what the file holds is posted publicly, so a path the model
+# supplies is a way to publish any file the agent container can read.
+SCRATCH_DIR = "/opt/data/scratch"
+
+# `gh pr view` reports the branch's most recent pull request whatever its state,
+# so "there is a pull request" and "there is one to keep the description of" are
+# different questions. Ask for the state and require this.
+PR_STATE_OPEN = "OPEN"
+
+# How `gh pr view` says the branch has no pull request at all. Every other
+# non-zero exit -- an expired token, a 502, a rate limit -- means the lookup
+# failed rather than came back empty, and the two must not read alike.
+NO_PULL_REQUEST_MARKER = "no pull requests found"
 
 
 def check_branch(branch_name: str) -> str:
@@ -311,8 +325,20 @@ def collect_changes(source: str, deletes: list[str] | None) -> dict[str, bytes |
     return changes
 
 
-def handle_submit_content(args) -> int:
+def handle_submit_content(args, body: str) -> int:
     branch = check_branch(args.branch)
+    # `--keep-description` waives the body here, never the title. In directory
+    # mode the caller has already made the commit and the title only ever
+    # reaches `gh pr create`; here this script makes the commit, and the title
+    # is its message. Leaving the pull request's description alone says nothing
+    # about what the new commit should be called.
+    if not args.title:
+        raise ValueError(
+            "--title is required with --handle: in content mode this script "
+            "makes the commit, and --title is its message. With "
+            "--keep-description the pull request's own description is still "
+            "left as its author wrote it."
+        )
     if not args.source:
         raise ValueError(
             "--from is required with --handle: in content mode the broker owns "
@@ -332,6 +358,14 @@ def handle_submit_content(args) -> int:
     # on which transport the run picked.
     validate_repo(repo)
     refresh_git_credentials(repo)
+
+    # Before the commit, not after the push. `create_pull_request` is the last
+    # thing this handler does, and a refusal there leaves the commit already on
+    # the branch -- at which point the retry the error asks for finds nothing
+    # to commit and refuses too.
+    keep_url = (
+        _keep_description_url(branch, None, repo) if args.keep_description else ""
+    )
 
     # `with`, so the broker's clone is released on the failure paths too. A
     # commit refused as a duplicate, a push that lost the lease, `gh` exiting
@@ -360,7 +394,13 @@ def handle_submit_content(args) -> int:
         workspace.push(branch)
 
         pr_url = create_pull_request(
-            branch, args.title, args.body, None, repo, result["base"]
+            branch,
+            args.title,
+            body,
+            None,
+            repo,
+            result["base"],
+            keep_description_url=keep_url,
         )
     log(f"PR SUBMITTED SUCCESSFULLY! 🏆 URL: {pr_url}")
     print(pr_url)
@@ -384,12 +424,24 @@ def remote_branch_exists(branch: str, workspace) -> bool:
 
 
 def handle_submit(args) -> int:
+    # Resolve and check the description *before* the dispatch below, so both
+    # transports get the same answer. `CREDENTIAL_PROXY_CONTENT_WORKSPACE=1` is
+    # rendered unconditionally by the operator, which makes content mode the
+    # path every current install takes: a check that sits after the dispatch is
+    # a check that runs almost nowhere.
+    body = _submit_body(args)
+    if not args.keep_description and not (args.title and body):
+        raise ValueError(
+            "--title and one of --body / --body-file are required unless "
+            "--keep-description is given."
+        )
+
     # Dispatch on the handle rather than on a flag or on what the broker
     # supports right now. A session that prepared in one mode has to finish in
     # that mode: prepared under content-passing there is no leased directory to
     # fall back to, and prepared under a lease there is no handle to present.
     if args.handle:
-        return handle_submit_content(args)
+        return handle_submit_content(args, body)
     branch = check_branch(args.branch)
     workspace = args.workspace or os.getcwd()
     lease = args.lease or gitops_workspace.session_lease()
@@ -426,14 +478,74 @@ def handle_submit(args) -> int:
     validate_repo(repo)
     refresh_git_credentials(repo)
 
+    # Before the push, for the reason `_keep_description_url` gives -- and here
+    # so the two transports refuse at the same point rather than one of them
+    # refusing after it has already moved the branch.
+    keep_url = ""
+    if args.keep_description:
+        keep_url = _keep_description_url(branch, workspace, repo)
+        if args.title:
+            # Not silently. `--keep-description` keeps the title along with the
+            # body, so a title passed here is read and discarded, and a caller
+            # who passed one believes it landed.
+            log(
+                "--title is ignored under --keep-description: the title is part "
+                "of the description being kept."
+            )
+
     push_branch(branch, workspace)
     base = gitops_workspace.resolve_base_branch(workspace, _runner)
-    pr_url = create_pull_request(branch, args.title, args.body, workspace, repo, base)
+    pr_url = create_pull_request(
+        branch,
+        args.title,
+        body,
+        workspace,
+        repo,
+        base,
+        keep_description_url=keep_url,
+    )
     log(f"PR SUBMITTED SUCCESSFULLY! 🏆 URL: {pr_url}")
 
     # Print raw URL to stdout for the MCP tool to parse
     print(pr_url)
     return 0
+
+
+def _submit_body(args) -> str:
+    """The description text, from `--body-file` if one was given.
+
+    A pull request body is long, full of backticks, and assembled by a model
+    into a shell command. Through argv it is one `$(...)` away from executing
+    in the leased clone, where a credentialed `gh` and `git` are on `PATH`, and
+    one stray backtick away from silently deleting its own text. A file is the
+    channel the rest of this repository already uses for model-written prose —
+    `pr_conversation.py reply` and `resolver.py report` both take a path — and
+    the asymmetry was that the larger document went the other way.
+
+    The path is confined the way both of those confine theirs, and for the
+    reason they give: the file's contents are published, so an unbounded path
+    is a way to put `/proc/self/environ` into a public pull request
+    description. Reaching for one is not something the agent has to intend --
+    Step 5 of the SKILL has it read review comments, which are somebody else's
+    text.
+
+    `--body` stays because callers outside this repository pass it and short
+    bodies are fine.
+    """
+    if not args.body_file:
+        return args.body or ""
+    # Resolved before the prefix test, so a symlink planted inside scratch
+    # cannot reach out of it.
+    scratch = os.path.realpath(SCRATCH_DIR)
+    real = os.path.realpath(args.body_file)
+    if not real.startswith(scratch + os.sep):
+        raise ValueError(f"--body-file {args.body_file} resolves outside {scratch}.")
+    if not os.path.isfile(real):
+        raise ValueError(f"--body-file {args.body_file} does not exist.")
+    body = Path(real).read_text(encoding="utf-8")
+    if not body.strip():
+        raise ValueError(f"--body-file {args.body_file} is empty.")
+    return body
 
 
 def push_branch(branch_name: str, workspace: str) -> None:
@@ -458,7 +570,13 @@ def push_branch(branch_name: str, workspace: str) -> None:
 
 
 def create_pull_request(
-    branch: str, title: str, body: str, workspace: str, repo: str, base: str
+    branch: str,
+    title: str,
+    body: str,
+    workspace: str,
+    repo: str,
+    base: str,
+    keep_description_url: str = "",
 ) -> str:
     """Open the pull request — or refresh the one that is already open.
 
@@ -476,10 +594,26 @@ def create_pull_request(
     contains. `audit_report.open_remediation_pr` edits its own pull requests
     for the same reason.
 
+    `keep_description_url` inverts that, for a caller that is not re-describing
+    the change but adding to it — a conflict merge or a CI fix pushed onto a
+    pull request that has been under human review. There the description is
+    somebody else's work and rewriting it is pure loss, invisible in the
+    output: the skill prints a URL and says nothing about the body. The
+    alternative on offer was prose telling the model to read the description
+    and hand it back unchanged, which is asking it to reproduce a
+    multi-kilobyte markdown document byte-for-byte through its own context.
+
+    It arrives as the URL rather than as a flag because `_keep_description_url`
+    has to run before the push, not here: see the reason in its own docstring.
+
     `workspace` is None in content mode, where there is no directory to run in.
     Nothing here needs one: every call names `--repo` explicitly.
     """
     log(f"Submitting GitOps Pull Request for branch '{branch}'...")
+
+    if keep_description_url:
+        log(f"Leaving the description of '{branch}' as its author wrote it.")
+        return keep_description_url
 
     # `--body-file -` rather than `--body`. A pull-request body is the one
     # argument here that carries agent-authored prose of unbounded length, and
@@ -510,19 +644,72 @@ def create_pull_request(
     return update_pull_request(branch, title, body, workspace, repo)
 
 
+def _open_pull_request(branch: str, workspace: str, repo: str) -> str:
+    """The URL of the *open* pull request for `branch`, or "" if there is none.
+
+    Two things this does not do, both of which a plain `gh pr view … --jq .url`
+    did. It does not count a merged or closed pull request: branch names here
+    are derived from the change (`platform-agent/<type>-<target>`), so a branch
+    is reused after its pull request merges, and `gh pr view` answers with that
+    one. And it does not read a failed lookup as an empty one -- an expired
+    installation token and "this branch has no pull request" are opposite
+    answers, and collapsing them into "" sends the caller down the branch that
+    rewrites a description it was told to keep.
+    """
+    res = subprocess.run(
+        [
+            "gh", "pr", "view", branch, "--repo", repo,
+            "--json", "url,state",
+            "--jq", f'select(.state == "{PR_STATE_OPEN}") | .url',
+        ],
+        cwd=workspace, capture_output=True, text=True, check=False,
+    )
+    if res.returncode != 0:
+        stderr = (res.stderr or "").strip()
+        if NO_PULL_REQUEST_MARKER in stderr.lower():
+            return ""
+        raise RuntimeError(
+            f"`gh pr view {branch}` failed against {repo}, so whether a pull "
+            f"request is open for it is unknown: {stderr or res.returncode}"
+        )
+    return res.stdout.strip()
+
+
+def _keep_description_url(branch: str, workspace: str, repo: str) -> str:
+    """The open pull request whose description this run must leave alone.
+
+    Resolved before anything is pushed, because the failure it raises is one
+    the caller cannot retry out of otherwise. In content mode this script makes
+    the commit: discover after the push that there is no pull request to keep,
+    and the retry that the error text asks for finds the files already on the
+    branch, so `commit` reports nothing to do and refuses. The run would be
+    left with commits pushed, no pull request, and no path through this script
+    to open one.
+    """
+    url = _open_pull_request(branch, workspace, repo)
+    if not url:
+        raise RuntimeError(
+            f"--keep-description was given but no pull request is open for "
+            f"'{branch}' on {repo}. There is no description to keep. Open it "
+            "with a --title and a --body-file first."
+        )
+    return url
+
+
 def update_pull_request(
     branch: str, title: str, body: str, workspace: str, repo: str
 ) -> str:
-    """Point the existing pull request for `branch` at the work just pushed."""
+    """Point the existing pull request for `branch` at the work just pushed.
+
+    Overwrites the title and description. `create_pull_request`'s
+    `keep_description_url` is the way past this for a caller that did not write
+    them.
+    """
     subprocess.run(
         ["gh", "pr", "edit", branch, "--repo", repo, "--title", title, "--body-file", "-"],
         cwd=workspace, input=body, capture_output=True, text=True, check=True,
     )
-    res = subprocess.run(
-        ["gh", "pr", "view", branch, "--repo", repo, "--json", "url", "--jq", ".url"],
-        cwd=workspace, capture_output=True, text=True, check=True,
-    )
-    url = res.stdout.strip()
+    url = _open_pull_request(branch, workspace, repo)
     if not url:
         raise RuntimeError(
             f"`gh pr view {branch}` returned no URL for the pull request it just "
@@ -558,8 +745,29 @@ def build_parser() -> argparse.ArgumentParser:
 
     submit = subparsers.add_parser("submit", help="Push the branch and open the PR")
     submit.add_argument("--branch", required=True, help="Active Git branch name")
-    submit.add_argument("--title", required=True, help="Pull Request title")
-    submit.add_argument("--body", required=True, help="Pull Request description body")
+    # Not `required=True` any more: `--keep-description` submits without them,
+    # and `handle_submit` refuses a call that gives neither. Argparse cannot
+    # express "required unless" without a mutually-exclusive group that would
+    # also forbid the legitimate `--title` + `--keep-description` combination.
+    submit.add_argument("--title", default=None, help="Pull Request title")
+    # One group of three, not two of two. `--keep-description` says the
+    # description on the pull request is the one to publish, so a body handed
+    # over beside it is a body the run would read and throw away.
+    description = submit.add_mutually_exclusive_group()
+    description.add_argument(
+        "--body", default=None, help="Pull Request description body"
+    )
+    description.add_argument(
+        "--body-file",
+        default=None,
+        help=f"File under {SCRATCH_DIR} holding the description; the safe "
+             "channel for a long body",
+    )
+    description.add_argument(
+        "--keep-description",
+        action="store_true",
+        help="Leave the open pull request's title and body as its author wrote them",
+    )
     submit.add_argument(
         "--workspace", default=None, help="The leased workspace from `prepare`"
     )

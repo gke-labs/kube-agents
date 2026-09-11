@@ -150,6 +150,21 @@ SCREENING_WINDOW = 20
 # "not measured" rather than guessed at.
 REP_RESULTS = ("pass", "fail", "infra")
 
+# Releases section: how many release-candidate eval runs the table shows,
+# newest first. RCs are cut per staging promotion, so ten rows is roughly a
+# fortnight of them, and the whole list stays in data.json for anyone who
+# wants further back.
+RELEASES_MAX_ROWS = 10
+# Verdict pill colour by the banner hack/ci-eval-rc.sh prints. NOT RUN is the
+# deploy-failed path: nothing was measured, which is neither a pass nor a
+# judgement on the candidate, so it takes the neutral infra colour.
+RELEASE_VERDICT_CLASS = {"GREEN": "p-pass", "RED": "p-fail", "NOT RUN": "p-infra"}
+# The only URL scheme a collected artifacts link may carry into an href.
+RELEASE_URL_SCHEME = "https://"
+# releases[].duration_s is seconds; the cell renders it as `4h16m`.
+SECONDS_PER_HOUR = 3600
+SECONDS_PER_MINUTE = 60
+
 # Matrix window: the last N runs that measured at least one task. 30 columns
 # is about two weeks of PR traffic and still fits one screen at 22px cells.
 MATRIX_RUNS = 30
@@ -245,6 +260,12 @@ def fmt(value: float, digits: int = 0) -> str:
     change when the template's on-load re-render replaces the baked HTML."""
     factor = 10**digits
     return f"{math.floor(value * factor + 0.5) / factor:.{digits}f}"
+
+
+def is_number(value) -> bool:
+    """A finite real number. Mirrors the template's ``Number.isFinite``
+    guard; bools are data errors, not zeroes and ones."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def is_count(value) -> bool:
@@ -1409,12 +1430,145 @@ def evidence_html(data: dict, notes: dict) -> str:
   </table></div>"""
 
 
-RELEASES_HTML = """
+RELEASES_EMPTY_HTML = """
   <h2 id="release">Releases</h2>
   <div class="empty">
     <span class="banner">⏳ No RC in the gate window</span>
-    <p style="margin-top:12px">When the next RC cuts, the four-gate checklist renders here automatically: E2E matrix · audit-machinery canary on the RC image · eval non-inferiority · operator sign-off.</p>
+    <p style="margin-top:12px">When the next RC cuts, its eval run renders here automatically: candidate, tier, verdict, and the advisory non-inferiority number.</p>
   </div>"""
+
+
+RELEASES_SUB = (
+    "One row per post-kube-agents-eval-rc run — the full suite against a "
+    "release candidate's own images. Advisory: this lane reports and does not "
+    "gate, and the non-inferiority comparison stays advisory while the "
+    "baseline store is maturing. The admitted rate covers only the cases "
+    "admitted to the gate, while Cases passed counts every graded case in the "
+    "run, so the two differ."
+)
+
+
+def release_verdict_pill(verdict: str | None) -> str:
+    """The verdict cell. A missing verdict is its own state, not a pass:
+    hack/ci-eval-rc.sh prints no banner when it exits on an early guard, and
+    that run measured nothing."""
+    cls = RELEASE_VERDICT_CLASS.get(verdict or "", "p-infra")
+    return f'<span class="pill {cls}">{esc(verdict or "NO VERDICT")}</span>'
+
+
+def release_duration(seconds) -> str:
+    """`4h16m`, or an empty string when the run carries no duration."""
+    if not is_count(seconds) or seconds <= 0:
+        return ""
+    total = int(seconds)
+    hours, minutes = total // SECONDS_PER_HOUR, (total % SECONDS_PER_HOUR) // SECONDS_PER_MINUTE
+    return f"{hours}h{minutes:02d}m" if hours else f"{minutes}m"
+
+
+def release_rate_cell(release: dict) -> str:
+    """The admitted-case pass rate, with what it was compared against."""
+    rate = release.get("pass_rate")
+    if not is_number(rate):
+        return '<td class="num">—<div class="tnote">not reported</div></td>'
+    baseline = release.get("baseline_rate")
+    margin = release.get("margin")
+    if is_number(baseline):
+        note = f"main {fmt(baseline * 100, 1)}%"
+        if is_number(margin):
+            # Points, not percent: the margin is a difference of two rates.
+            # fmt() only formats non-negatives, and the sign carries the
+            # whole meaning of the number, so it is written explicitly.
+            sign = "+" if margin >= 0 else "−"
+            note += f" · margin {sign}{fmt(abs(margin) * 100, 1)}pt"
+    else:
+        note = "no baseline — baselines maturing"
+    return (
+        f'<td class="num">{fmt(rate * 100, 1)}%'
+        f'<div class="tnote">{esc(note)}</div></td>'
+    )
+
+
+def release_cases_cell(release: dict) -> str:
+    """Graded outcomes for the run: passes over graded, infra called out
+    separately because an infra rep is excluded rather than failed."""
+    tasks = run_tasks(release)
+    passed = sum(1 for t in tasks if t.get("result") == "pass")
+    infra = sum(1 for t in tasks if t.get("result") == "infra")
+    graded = len(tasks) - infra
+    if not tasks:
+        return '<td class="num">—<div class="tnote">no cases parsed</div></td>'
+    note = f"{infra} infra excluded" if infra else "none excluded"
+    return f'<td class="num">{passed}/{graded}<div class="tnote">{esc(note)}</div></td>'
+
+
+def release_candidate_cell(release: dict) -> str:
+    tag = str(release.get("rc_tag") or "") or "unknown candidate"
+    url = release.get("artifacts_url")
+    # Only an https URL becomes an href. The value is read out of a build
+    # log, and a log line is the wrong place to be minting `javascript:`.
+    name = esc(tag)
+    if isinstance(url, str) and url.startswith(RELEASE_URL_SCHEME):
+        name = f'<a href="{esc(url)}" rel="noopener">{name}</a>'
+    bits = []
+    if release.get("commit"):
+        bits.append(str(release["commit"]))
+    if release.get("build_id"):
+        bits.append(f"build {release['build_id']}")
+    if not release.get("verdict"):
+        # The banner is missing, so Prow's own result is the only thing left
+        # that says whether the job survived. Say so rather than showing a
+        # blank row that reads like a quiet pass.
+        bits.append(f"no eval banner · job {release.get('result') or 'unknown'}")
+    return (
+        f'<td><div class="tname">{name}</div>'
+        f'<div class="tnote">{esc(" · ".join(bits))}</div></td>'
+    )
+
+
+def release_row(release: dict) -> str:
+    started = parse_iso(release.get("started"))
+    when = f"{started:%Y-%m-%d %H:%M} UTC" if started else "unknown time"
+    duration = release_duration(release.get("duration_s"))
+    return (
+        "<tr>"
+        + release_candidate_cell(release)
+        + f'<td><span class="cap">{esc(str(release.get("tier") or "—"))}</span></td>'
+        + f"<td>{release_verdict_pill(release.get('verdict'))}</td>"
+        + release_rate_cell(release)
+        + release_cases_cell(release)
+        + f'<td><span class="cap">{esc(when)}</span></td>'
+        + f'<td class="cap">{esc(duration)}</td>'
+        + "</tr>"
+    )
+
+
+def sorted_releases(data: dict) -> list[dict]:
+    """Newest first. data.json is re-sorted here rather than trusted: the
+    collector writes it in order, but the renderer also runs against files
+    edited by hand."""
+    releases = [r for r in data.get("releases") or [] if isinstance(r, dict)]
+    releases.sort(
+        key=lambda r: (
+            str(r.get("started") or ""),
+            int(r["build_id"]) if str(r.get("build_id", "")).isdigit() else 0,
+        ),
+        reverse=True,
+    )
+    return releases[:RELEASES_MAX_ROWS]
+
+
+def releases_html(data: dict) -> str:
+    releases = sorted_releases(data)
+    if not releases:
+        return RELEASES_EMPTY_HTML
+    rows = "".join(release_row(r) for r in releases)
+    return f"""
+  <h2 id="release">Releases</h2>
+  <div class="sub">{RELEASES_SUB}</div>
+  <div class="card"><table id="releases">
+    <thead><tr><th>Candidate</th><th>Tier</th><th>Verdict</th><th>Admitted rate</th><th>Cases passed</th><th>Started</th><th>Eval took</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table></div>"""
 
 
 HERO_LEDE = (
@@ -1462,14 +1616,21 @@ EMPTY_STATE_HTML = """
 
 
 def app_html(data: dict, notes: dict, events: dict) -> str:
-    if not (data.get("runs") or data.get("cases")):
+    # releases[] counts as data, so a file carrying only RC records renders
+    # its table instead of "no evaluation data yet". Neither publish pipeline
+    # can reach this: both refuse to publish a data.json with an empty runs[]
+    # before render is called, and deliberately so -- a run whose presubmit
+    # sweep came back empty must not overwrite a good dashboard with a
+    # releases-only page. This is for the hand-run render sorted_releases
+    # already documents, and for whoever next reads a bare data.json.
+    if not (data.get("runs") or data.get("cases") or sorted_releases(data)):
         return EMPTY_STATE_HTML
     return (
         HERO_HTML
         + band_agent_html(data, events)
         + band_gate_html(data, notes, events)
         + evidence_html(data, notes)
-        + RELEASES_HTML
+        + releases_html(data)
         + foot_html(data)
     )
 

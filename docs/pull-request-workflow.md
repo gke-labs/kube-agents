@@ -307,15 +307,17 @@ and retries it every ~85 seconds ahead of everyone else — #608 and #1197 held 
 for an hour on 2026-09-05. `/hold cancel` does not remove this label; resolving the threads does.
 A person who applies the same label by hand keeps it: the workflow removes only what it added.
 `/override <context>`, which only
-a repository admin can use, forces a required check that cannot pass on its own — and expires: the
-forced status embeds the base SHA at override time, so the next merge to `main` invalidates it,
-Tide re-runs the job, and the override has to be repeated if `main` moves before Tide merges
-(#1202).
-Prow's `/override-sticky` would write the `[prow:skip-retest]` sentinel instead, which Tide accepts
-regardless of base — but it is not in the Prow build this repository merges through: the
+a repository admin can use, forces a required check that cannot pass on its own. The forced status
+embeds the base SHA at override time, so by itself it would expire on the next merge to `main` and
+Tide would re-run the job — which is how an override came to need repeating whenever `main` moved
+before Tide merged (#1202). The re-pin below carries it across merges the way it carries a green, so
+an override usually holds for the head it was given until a push — subject to the same race with
+Tide's sync, and a lost race costs more here, because the retest is of a check that cannot pass: it
+comes back red and the override has to be given again. Prow's `/override-sticky` would do this
+without the race, with the `[prow:skip-retest]` sentinel Tide accepts regardless of base — but it is
+not in the Prow build this repository merges through: the
 [plugin help](https://oss.gprow.dev/command-help?repo=gke-labs%2Fkube-agents) lists only
-`/override`, and the command is silently ignored. A green run of the job is a different matter,
-below.
+`/override`, and the command is silently ignored.
 
 **Branch protection is not the gate and reads as though there is none.** `main` requires ten
 contexts — `cla/google`, `actionlint`, `build`, `prettier`, `validate`, `Run Controller Tests`,
@@ -353,7 +355,8 @@ starts the retest as before (a batch, when two or more qualify), crier's `pendin
 newer status, and the sweep leaves it alone. A push still starts a fresh run;
 `/test pull-kube-agents-smoke-test` on the same head posts `pending`, which wins until that run
 reports (`/retest` does not, because it reruns only failed contexts); a red is never touched, and
-neither is an admin `/override`. What this trades away is testing the combination with the `main`
+an admin `/override` is carried the same way as a green, because crier stamps the same `BaseSHA:`
+suffix on it. What this trades away is testing the combination with the `main`
 it lands on before the merge; until a scheduled eval run on `main` exists, a bad combination is
 found by the next smoke run that actually starts after it — a push or `/test` on whichever pull
 request that is, whose author then sees a red that is not theirs. Prow's own form of this — a `[prow:skip-retest]` sentinel

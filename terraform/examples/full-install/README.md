@@ -533,7 +533,10 @@ uninstall its standalone release before setting these variables (`helm uninstall
   select Cloud Pub/Sub and enter the created topic (the `chat_topic_name`
   output, as `projects/<project>/topics/<topic>`), set visibility, and verify
   a **Service account email** appears under Connection settings after saving
-  (if it stays blank, Chat silently delivers no events). Then DM the bot; on
+  (if it stays blank, Chat silently delivers no events). That address is the
+  Workspace Add-ons service agent,
+  `service-<PROJECT_NUMBER>@gcp-sa-gsuiteaddons.iam.gserviceaccount.com`, not
+  the agent's own GSA. Then DM the bot; on
   first contact, optionally approve the pairing code via
   `hermes pairing approve google_chat <CODE>` in the gateway pod.
 - **Slack:** in the Slack app console enable Socket Mode and grant the bot

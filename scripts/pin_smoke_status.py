@@ -29,13 +29,25 @@ is sometimes lost. Two merges seconds apart start two sweeps with no ordering
 between them, so a pin is always made to the head of `main` as read just
 before the write, never to the head the run started with.
 
-What it will not do: touch a status that is not `success`, touch an admin
-`/override`, pin a pull request that does not target `main` (Tide keys the
-base SHA on the pull request's own base branch), or overwrite a newer status
-on the same context. Deciding and writing are separate calls, and a throttled
-call retries with a delay of seconds to a minute, so the status is read a
-second time immediately before the write and the write is dropped if a newer
-one has landed. What stays open is the POST itself. One pull request failing
+An admin `/override` is pinned the same way as a green. The plugin on this
+Prow build posts a bare `Overridden by <user>`, and crier posts a second
+status with the same `BaseSHA:` suffix a green carries when it reports the
+success ProwJob the plugin creates; whichever is the latest, Tide reads it the
+way it reads a green, and so does this (a bare one has no base, which is a
+stale one). So a plain `/override` holds for the head it was given until a
+push whenever the sweep wins the race above, instead of having to be repeated
+after every merge to `main` (#1202). A lost race costs an override more than
+it costs a green: the retest is of a job that was overridden because it cannot
+pass, so it comes back red and the override has to be given again. Upstream's
+`/override-sticky` sentinel has no race, which is one more reason to switch.
+
+What it will not do: touch a status that is not `success`, pin a pull request
+that does not target `main` (Tide keys the base SHA on the pull request's own
+base branch), or overwrite a newer status on the same context. Deciding and
+writing are separate calls, and a throttled call retries with a delay of
+seconds to a minute, so the status is read a second time immediately before
+the write and the write is dropped if a newer one has landed. What stays open
+is the POST itself. One pull request failing
 -- a head force-pushed away mid-sweep, a call out of retries -- is logged and
 the sweep goes on, because every pull request after it would otherwise wait
 for the next merge; the failure still sets the exit status.
@@ -56,8 +68,6 @@ from github_api import GitHubAPI, log  # noqa: E402
 CONTEXT = "pull-kube-agents-smoke-test"
 #: `contextDescriptionBaseSHADelimiter` in kubernetes-sigs/prow, pkg/config/config.go.
 BASE_SHA_DELIMITER = " BaseSHA:"
-#: What the override plugin writes; its statuses are an admin's decision, not ours.
-OVERRIDE_PREFIX = "Overridden by"
 #: Left in the human-readable part so the description does not claim a run it did not have.
 PIN_NOTE = "(base pinned to main by smoke-test-sticky)"
 #: GitHub rejects a longer status description; Prow's `contextDescriptionMaxLen` agrees.
@@ -107,10 +117,7 @@ def skip_reason(status, main_sha):
         return f"no {CONTEXT} status on the commit"
     if status.get("state") != SUCCESS:
         return f"state is {status.get('state')!r}, not {SUCCESS}"
-    description = status.get("description") or ""
-    if description.startswith(OVERRIDE_PREFIX):
-        return "an admin override, which is not ours to extend"
-    _, base_sha = split_description(description)
+    _, base_sha = split_description(status.get("description") or "")
     if base_sha == main_sha:
         return "already pinned to the head of main"
     return None

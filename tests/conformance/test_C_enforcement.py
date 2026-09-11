@@ -508,6 +508,73 @@ class C1IsolationIsStructural(unittest.TestCase):
                     "to the metadata server in the cluster",
                 )
 
+    # The credential shapes gke-labs/kube-agents#603 measured in the durable
+    # artifacts, plus the two the same tool output carries alongside them. The
+    # OAuth token is 200 characters because that is the length #603 saw and
+    # the length the live check on #1340 sends; a pattern with a ceiling
+    # would pass a 40-character fixture and miss the real one.
+    LEAKED_CREDENTIAL_SHAPES = {
+        "gcp oauth token": "ya29." + "A" * 195,
+        "jwt": "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJzeXN0ZW0iLCJhdWQiOlsiazhzIl19.c2lnbmF0dXJlXw",
+        "gcp api key": "AIza" + "a" * 35,
+        "pem block": (
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAx3f9\n-----END RSA PRIVATE KEY-----"
+        ),
+    }
+    # A Secret's payload is credential material whatever its keys are called,
+    # which is the one shape no token pattern can see.
+    LEAKED_SECRET_BLOCK = "kind: Secret\ndata:\n  ROTATED_ONCE: YWJjMTIz\n  other-key: c2FsdHk=\n"
+    LEAKED_SECRET_VALUES = ("YWJjMTIz", "c2FsdHk=")
+    # What a kubectl read of a healthy namespace looks like, and the two
+    # identifiers an over-eager redactor takes first: a service-account
+    # address, and an environment variable whose name merely contains `token`.
+    ORDINARY_MANIFEST_CONTENT = (
+        "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: nginx\n"
+        "  namespace: prod\nspec:\n  replicas: 3\n  template:\n    spec:\n"
+        "      containers:\n        - name: nginx\n          image: nginx:1.27\n"
+        "          env:\n            - name: TOKENIZER_PATH\n              value: /models/tok\n",
+        "binding kube-agents-platform@my-proj.iam.gserviceaccount.com to roles/container.viewer",
+        "kubectl get pods -n kube-system --sort-by=.status.startTime",
+    )
+
+    def test_C1_the_gateway_redactor_matches_the_leaked_credential_shapes(self) -> None:
+        """What leaves for the provider is what the redactor lets leave.
+
+        Isolation is structural only if the egress point enforces it without
+        the model's cooperation: the gateway hook runs before the provider
+        call, so this asserts the module it runs redacts every credential
+        shape #603 found in the clear. It reads the chart's copy, because that
+        is the file the LiteLLM pod mounts; the plugin copy's own suite covers
+        the audit path.
+        """
+        redactor = h.gateway_redactor_module().AuditRedactor
+        for label, credential in self.LEAKED_CREDENTIAL_SHAPES.items():
+            with self.subTest(shape=label):
+                result = redactor.redact_text(f"tool output: {credential} end")
+                self.assertNotIn(
+                    credential,
+                    result,
+                    f"a {label} passes the gateway redactor in the clear",
+                )
+                self.assertIn("[REDACTED_", result, f"the {label} was dropped, not marked")
+        result = redactor.redact_text(self.LEAKED_SECRET_BLOCK)
+        for value in self.LEAKED_SECRET_VALUES:
+            with self.subTest(shape="secret data block", value=value):
+                self.assertNotIn(value, result, "a Secret's data: value passes in the clear")
+
+    def test_C1_the_gateway_redactor_leaves_ordinary_manifest_content_alone(self) -> None:
+        """The other half: a redactor that eats the manifest gets switched off.
+
+        The service-account address is the load-bearing case. It is the one
+        thing an operator greps for, so the e-mail pattern exempts it by an
+        anchored negative lookahead; a mutation that drops the exemption
+        redacts every IAM principal and this goes red.
+        """
+        redactor = h.gateway_redactor_module().AuditRedactor
+        for content in self.ORDINARY_MANIFEST_CONTENT:
+            with self.subTest(content=content[:40]):
+                self.assertEqual(redactor.redact_text(content), content)
+
 
 class C2FailClosed(unittest.TestCase):
     """C2: anything the policy layer cannot parse, resolve or verify is refused."""

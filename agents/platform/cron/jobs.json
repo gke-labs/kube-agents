@@ -189,6 +189,22 @@
       "risk": "low",
       "enabled": true,
       "deliver": "chat"
+    },
+    {
+      "id": "chat-delivery-watch",
+      "name": "Chat Delivery Watch",
+      "schedule": {
+        "kind": "cron",
+        "expr": "*/30 * * * *",
+        "display": "*/30 * * * *"
+      },
+      "prompt": "",
+      "skills": [],
+      "no_agent": true,
+      "script": "chat_delivery_watch.py",
+      "risk": "low",
+      "enabled": true,
+      "deliver": "local"
     }
   ]
 }

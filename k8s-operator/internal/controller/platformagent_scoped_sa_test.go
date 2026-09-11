@@ -389,6 +389,30 @@ func TestTheReservedListNamesThePoolVariablesInItsOwnRight(t *testing.T) {
 	}
 }
 
+// The A2A gateway's broker-side variables are reserved before the operator
+// renders them, so a CR cannot decide who holds the a2a-chat role or arm a
+// second Chat consumer through spec.deployment.env. Called with an empty
+// managed list for the same reason as the test above: until the render
+// exists, the explicit list is the only thing that reserves them.
+func TestTheReservedListNamesTheA2AChatVariables(t *testing.T) {
+	merged := mergeCredentialProxyEnv(nil, []corev1.EnvVar{
+		{Name: "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE", Value: "kubeagents-credential-proxy"},
+		{Name: "A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME", Value: "projects/p/subscriptions/theirs"},
+		{Name: "HARMLESS_PLUGIN_SETTING", Value: "kept"},
+	})
+	for _, name := range []string{
+		"CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE",
+		"A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME",
+	} {
+		if _, count := envValueCount(merged, name); count != 0 {
+			t.Errorf("%s survived the merge from spec.deployment.env", name)
+		}
+	}
+	if value, count := envValueCount(merged, "HARMLESS_PLUGIN_SETTING"); count != 1 || value != "kept" {
+		t.Errorf("the merge dropped an unrelated plugin variable; the reserved list is too wide")
+	}
+}
+
 func TestTheMappingReachesTheRenderedBrokerPod(t *testing.T) {
 	// The tests above check the container builder. This one checks the Pod it
 	// ends up in: a SubPath mount is only satisfiable if the Pod also declares

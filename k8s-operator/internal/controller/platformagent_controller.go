@@ -2314,7 +2314,16 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 	degradedUnchanged := (degradedStatus == metav1.ConditionFalse && existingDegradedCond == nil) || rbacDegradedPreserved ||
 		(degradedStatus == metav1.ConditionTrue && existingDegradedCond != nil && existingDegradedCond.Status == metav1.ConditionTrue && existingDegradedCond.Reason == degradedReason && existingDegradedCond.Message == condMsg)
 
-	// Check if anything actually changed
+	// Check if anything actually changed. The generation is in the list so that
+	// a spec edit which changes nothing derived here still gets one write:
+	// without it the status would keep describing the previous generation and
+	// a reader could not tell that the operator had seen the new one (#534).
+	// The witness is the Ready condition's observedGeneration rather than the
+	// top-level field, deliberately: the two are written together, but a CRD
+	// that predates status.observedGeneration prunes the top-level copy on
+	// every write while the condition's has always been in the schema. Keyed
+	// on the pruned copy, an operator rolled ahead of its CRD would write on
+	// every pass, and each write wakes the next through the unfiltered watch.
 	if agent.Status.Phase == newPhase &&
 		agent.Status.DeploymentStatus.Name == newDeploymentStatusName &&
 		agent.Status.DeploymentStatus.ReadyReplicas == newDeploymentStatusReadyReplicas &&
@@ -2326,12 +2335,14 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		networkPolicyStatusUnchanged(agent.Status.NetworkPolicy, netpolProfile) &&
 		degradedUnchanged &&
 		eventWatcherUnchanged &&
-		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg {
+		existingCond != nil && existingCond.Status == condStatus && existingCond.Reason == condReason && existingCond.Message == condMsg &&
+		existingCond.ObservedGeneration == agent.Generation {
 		return newPhase, nil
 	}
 
 	// Apply updates
 	agent.Status.Phase = newPhase
+	agent.Status.ObservedGeneration = agent.Generation
 	agent.Status.DeploymentStatus.Name = newDeploymentStatusName
 	agent.Status.DeploymentStatus.ReadyReplicas = newDeploymentStatusReadyReplicas
 	agent.Status.StorageStatus.Bound = newStorageStatusBound
@@ -2354,6 +2365,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 		Status:             condStatus,
 		Reason:             condReason,
 		Message:            condMsg,
+		ObservedGeneration: agent.Generation,
 		LastTransitionTime: now,
 	}
 	meta.SetStatusCondition(&agent.Status.Conditions, condition)
@@ -2364,6 +2376,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 			Status:             metav1.ConditionTrue,
 			Reason:             degradedReason,
 			Message:            condMsg,
+			ObservedGeneration: agent.Generation,
 			LastTransitionTime: now,
 		}
 		meta.SetStatusCondition(&agent.Status.Conditions, degradedCond)
@@ -2382,6 +2395,7 @@ func (r *PlatformAgentReconciler) updateStatusReady(ctx context.Context, agent *
 			Status:             metav1.ConditionFalse,
 			Reason:             eventWatcherDisabledReason,
 			Message:            eventWatcherDisabledMessage,
+			ObservedGeneration: agent.Generation,
 			LastTransitionTime: now,
 		})
 	}
@@ -2600,6 +2614,7 @@ func requestedRuntimeClasses(agent *agentv1alpha1.PlatformAgent) []string {
 
 func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agent *agentv1alpha1.PlatformAgent, reason, message string) error {
 	agent.Status.Phase = "Degraded"
+	agent.Status.ObservedGeneration = agent.Generation
 	now := metav1.Now()
 	agent.Status.LastReconcileTime = &now
 
@@ -2608,6 +2623,7 @@ func (r *PlatformAgentReconciler) updateStatusDegraded(ctx context.Context, agen
 		Status:             metav1.ConditionFalse,
 		Reason:             reason,
 		Message:            message,
+		ObservedGeneration: agent.Generation,
 		LastTransitionTime: now,
 	}
 	meta.SetStatusCondition(&agent.Status.Conditions, condition)

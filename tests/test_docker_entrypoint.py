@@ -784,7 +784,7 @@ class SyncProfileSkillsTest(unittest.TestCase):
     NEW = f"skills.new.{POD}"
     OLD = f"skills.old.{POD}"
 
-    def _sync(self, src_parent, dst_parent, preamble="", pod=None):
+    def _sync(self, src_parent, dst_parent, preamble="", pod=None, overlay=None):
         """Run the real function under `set -e`, returning the completed process.
 
         `preamble` is shell injected between the function definition and the call.
@@ -801,7 +801,7 @@ class SyncProfileSkillsTest(unittest.TestCase):
         """
         script = f"set -e\n{_extract_shell_function('sync_profile_skills')}\n"
         script += preamble
-        script += f'sync_profile_skills "{src_parent}" "{dst_parent}"\necho DONE\n'
+        script += f'sync_profile_skills "{src_parent}" "{dst_parent}" "{overlay or ""}"\necho DONE\n'
         return subprocess.run(
             ["sh", "-c", script],
             capture_output=True,
@@ -832,6 +832,72 @@ class SyncProfileSkillsTest(unittest.TestCase):
         for path in [root, *root.rglob("*")]:
             if path.is_dir():
                 path.chmod(0o700)
+
+    def test_the_overlay_is_composed_into_the_same_atomic_swap(self):
+        """The A2A skill rides 2.6a's staging as $3 rather than being copied into
+        the live directory afterwards.
+
+        Written as a second pass over $_dst it would be a non-staged writer on a
+        volume the staging protocol exists to protect: landing inside another
+        replica's swap window it recreates skills/ holding only its own file,
+        which sends that pod down the "reappeared during the swap" arm and
+        leaves the shared profile with no real skills at all. Composed here,
+        template and overlay install together in one rename.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            self._tree(tmp / "template" / "skills", **{"platform.md": "shipped"})
+            self._tree(tmp / "a2a" / "skills", **{"a2a-topics.md": "bus"})
+            self._tree(tmp / "profile" / "skills", **{"stale.md": "x"})
+
+            proc = self._sync(
+                tmp / "template", tmp / "profile", overlay=tmp / "a2a" / "skills"
+            )
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            installed = sorted(p.name for p in (tmp / "profile" / "skills").iterdir())
+            self.assertEqual(installed, ["a2a-topics.md", "platform.md"])
+            # No staging litter survives a clean run.
+            self.assertFalse((tmp / "profile" / self.NEW).exists())
+            self.assertFalse((tmp / "profile" / self.OLD).exists())
+
+    def test_no_overlay_leaves_the_template_alone(self):
+        """A today install passes an empty $3 — the flip-back self-clean. The
+        skill is gone because the swap rebuilt skills/ from the template only."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            self._tree(tmp / "template" / "skills", **{"platform.md": "shipped"})
+            self._tree(
+                tmp / "profile" / "skills",
+                **{"platform.md": "old", "a2a-topics.md": "left from next"},
+            )
+
+            proc = self._sync(tmp / "template", tmp / "profile")
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            installed = sorted(p.name for p in (tmp / "profile" / "skills").iterdir())
+            self.assertEqual(installed, ["platform.md"])
+
+    def test_an_unstageable_overlay_keeps_the_existing_copy(self):
+        """Same class as a failed stage: abandon the swap rather than install a
+        half-composed tree, and never fail the boot."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            self._tree(tmp / "template" / "skills", **{"platform.md": "shipped"})
+            overlay = self._tree(tmp / "a2a" / "skills", **{"a2a-topics.md": "bus"})
+            self._tree(tmp / "profile" / "skills", **{"existing.md": "keep me"})
+            overlay.chmod(0o000)
+            try:
+                proc = self._sync(tmp / "template", tmp / "profile", overlay=overlay)
+
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("DONE", proc.stdout)
+                installed = sorted(
+                    p.name for p in (tmp / "profile" / "skills").iterdir()
+                )
+                self.assertEqual(installed, ["existing.md"])
+            finally:
+                self._restore_modes(tmp)
 
     def test_the_image_copy_replaces_the_volume_copy(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1652,6 +1718,133 @@ class SandboxMirrorGateTest(unittest.TestCase):
         self.assertFalse(invoked)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("REACHED-EXEC", proc.stdout)
+
+
+class A2AModeProbeTest(unittest.TestCase):
+    """Step 2.6a-bis gates the A2A skill overlay on runtime_mode.is_next().
+
+    The probe hands the operator's managed .env to Python and lets runtime_mode —
+    the one agent-side reader the mode spec allows — answer. Exit meanings:
+    0 next (overlay), 1 today or no managed scope (skip silently), 2 no readable
+    managed env (skip with a warning; on an operator-managed install that is a
+    fault the skill's silent absence would otherwise hide).
+
+    The parse is the strict KEY=value renderManagedEnv writes, never `.`-sourced:
+    the entrypoint is pid 1, and sourcing would execute whatever a value that
+    grew a space turned into. That property is asserted here, not just claimed.
+    """
+
+    def _probe(self, managed_env, pwned_marker=None, extra_env=None, reader=True):
+        """Run the real probe. `managed_env` is the .env body, or None for no file,
+        or ... (Ellipsis) for HERMES_MANAGED_DIR unset entirely.
+
+        `extra_env` adds process environment the container would have inherited.
+        `reader=False` drops runtime_mode off the path, standing in for a broken
+        image.
+        """
+        script = f"{_extract_shell_function('a2a_mode_probe')}\na2a_mode_probe\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = pathlib.Path(tmp)
+            # The image runs the probe on $INSTALL_DIR's venv Python and imports
+            # runtime_mode from /opt/defaults/scripts; neither exists on a host.
+            # The venv is faked with a symlink and the module comes in through
+            # PYTHONPATH — sys.path.insert of an absent directory is harmless, so
+            # the probe under test is byte-identical to the one the image runs.
+            (tmp / ".venv" / "bin").mkdir(parents=True)
+            (tmp / ".venv" / "bin" / "python3").symlink_to(sys.executable)
+            env = {
+                "PATH": "/usr/bin:/bin",
+                "INSTALL_DIR": str(tmp),
+            }
+            if reader:
+                env["PYTHONPATH"] = str(_REPO / "agents" / "platform" / "scripts")
+            if extra_env:
+                env.update(extra_env)
+            if managed_env is not Ellipsis:
+                managed = tmp / "managed"
+                managed.mkdir()
+                env["HERMES_MANAGED_DIR"] = str(managed)
+                if managed_env is not None:
+                    body = managed_env
+                    if pwned_marker:
+                        body = body.replace("{MARKER}", str(pwned_marker))
+                    (managed / ".env").write_text(body, encoding="utf-8")
+            return subprocess.run(
+                ["sh", "-c", script], capture_output=True, text=True, timeout=60, env=env
+            )
+
+    def test_next_answers_overlay(self):
+        proc = self._probe("API_SERVER_KEY=x\nKUBEAGENTS_MODE=next\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_today_answers_skip(self):
+        proc = self._probe("API_SERVER_KEY=x\nKUBEAGENTS_MODE=today\n")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+
+    def test_an_unrecognized_mode_fails_closed(self):
+        """runtime_mode's own rule, exercised through the probe: the dark stack
+        stays dark from both sides of the boundary."""
+        proc = self._probe("KUBEAGENTS_MODE=quantum\n")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+
+    def test_a_pin_free_env_reads_as_today(self):
+        proc = self._probe("API_SERVER_KEY=x\n")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+
+    def test_a_missing_managed_env_is_reported_not_conflated(self):
+        proc = self._probe(None)
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+
+    def test_no_managed_scope_at_all_skips_silently(self):
+        """Unset HERMES_MANAGED_DIR is a non-operator start (compose, docker run),
+        not a fault — the same marker every other managed-scope step gates on."""
+        proc = self._probe(Ellipsis)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+
+    def test_the_inherited_container_env_cannot_decide_the_mode(self):
+        """The managed file is the ONLY delivery path, which is the spec's whole
+        point — one answer per agent, computed in one place.
+
+        This is not hypothetical: an AgentPlugin's spec.env is copied into the
+        agent container verbatim with no allowlist, so a plugin can put this key
+        in the process environment. Before os.environ.clear() the probe read it
+        whenever the file was silent, which made the plugin a second writer of a
+        decision the operator owns. Found by adversarial review before this
+        shipped.
+        """
+        # Key absent from the file entirely: the inherited value must not fill in.
+        proc = self._probe("API_SERVER_KEY=x\n", extra_env={"KUBEAGENTS_MODE": "next"})
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        # And the file still wins when the two disagree.
+        proc = self._probe(
+            "KUBEAGENTS_MODE=today\n", extra_env={"KUBEAGENTS_MODE": "next"}
+        )
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+
+    def test_a_malformed_line_is_skipped_not_called_unreadable(self):
+        """An empty key is not a pin. os.environ refuses one, and letting that
+        raise reported a perfectly readable file as missing."""
+        proc = self._probe("=x\nKUBEAGENTS_MODE=next\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_a_missing_reader_is_a_fault_not_a_decision(self):
+        """A broken image must not read as 'today' behind a bare traceback: the
+        skill would be silently absent with nothing saying why."""
+        proc = self._probe("KUBEAGENTS_MODE=next\n", reader=False)
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+
+    def test_a_hostile_value_is_data_not_shell(self):
+        """The reason this is a parse and not a `.`: a value carrying a space and
+        a command must neither break the gate nor run."""
+        with tempfile.TemporaryDirectory() as outside:
+            marker = pathlib.Path(outside) / "pwned"
+            proc = self._probe(
+                "SLACK_HOME_CHANNEL_NAME=general chat; touch {MARKER}\n"
+                "KUBEAGENTS_MODE=next\n",
+                pwned_marker=marker,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertFalse(marker.exists(), "a managed .env value was executed")
 
 
 if __name__ == "__main__":

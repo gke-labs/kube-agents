@@ -90,6 +90,18 @@ const (
 	// exceeding Kubernetes 63-byte annotation key limits when GKE Autopilot / gVisor injects
 	// "dev.gvisor.internal.seccomp.<container-name>" (28-byte prefix without slash).
 	maxAutopilotContainerNameLen = 35
+
+	// agentAPIAuthContainerName names the gateway Pod's container that runs the
+	// API authenticator and the k8s-event-watcher. The Downward API reference
+	// below has to name it exactly, which is why it is a constant.
+	agentAPIAuthContainerName = "agent-api-auth"
+	// eventWatcherMemoryLimitEnv tells the watcher its container's memory limit
+	// in bytes, so it can set the Go runtime's soft limit to a share of it. The
+	// watcher reads it under the same name (cmd/k8s-event-watcher/main.go).
+	eventWatcherMemoryLimitEnv = "EVENT_WATCHER_MEMORY_LIMIT_BYTES"
+	// containerMemoryLimitResource is the Downward API resource selector for
+	// a container's own memory limit.
+	containerMemoryLimitResource = "limits.memory"
 )
 
 // Shared-state ownership. Step 1.5 of deploy/shared/docker-entrypoint.sh reads this
@@ -334,11 +346,13 @@ func renderManagedEnv(agent *agentv1alpha1.PlatformAgent) string {
 		// render never intended — and the mode this file delivers is read back
 		// through exactly that line shape (Hermes loads the file per-line into
 		// the environment with override semantics, last occurrence winning;
-		// agents/platform/scripts/runtime_mode.py answers from the result), so
-		// a smuggled `KUBEAGENTS_MODE=next` line rendered after the operator's
-		// own pin is a mode flip written by whoever can edit the CR's chat
-		// settings. Stripped, not escaped: nothing downstream reads a
-		// multi-line value, so there is nothing to preserve.
+		// agents/platform/scripts/runtime_mode.py answers from the result, and
+		// the entrypoint's a2a_mode_probe hands these same lines to that
+		// reader to gate the A2A skill overlay at boot), so a smuggled
+		// `KUBEAGENTS_MODE=next` line rendered after the operator's own pin is
+		// a mode flip written by whoever can edit the CR's chat settings.
+		// Stripped, not escaped: nothing downstream reads a multi-line value,
+		// so there is nothing to preserve.
 		value = strings.ReplaceAll(value, "\n", "")
 		value = strings.ReplaceAll(value, "\r", "")
 		lines = append(lines, fmt.Sprintf("%s=%s", key, value))
@@ -1957,8 +1971,8 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		},
 	}
 
-	// The two exceptions to "no credentials in the sandbox", both of them
-	// pod-scoped and useless outside this pod's loopback interface:
+	// Two of the three exceptions to "no credentials in the sandbox", and the
+	// two that are pod-scoped — useless outside this pod's loopback interface:
 	//
 	//   SESSION_KV_API_KEY  authenticates callers of the Session KV server on
 	//                       127.0.0.1:8699. This container both serves it and
@@ -1970,6 +1984,11 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 	//
 	// Neither grants access to any cloud API, any repository, or anything
 	// outside the pod, which is the property the isolation boundary protects.
+	//
+	// The third is NATS_PASSWORD, appended further down under mode: next, and
+	// it is the one that does not have that property: it authenticates to the
+	// A2A bus over the cluster network. Do not reason about what this Pod
+	// holds from this block alone.
 	// See docs/credential-isolation-design.md.
 	envVars = append(envVars,
 		corev1.EnvVar{
@@ -2172,6 +2191,25 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 
 	if len(agentPlugins) > 0 {
 		extEnvs := extractAgentPluginEnvVars(agentPlugins)
+		// The bus names are reserved while the A2A surface is up, because the
+		// operator appends them AFTER this merge (below) and an appended name
+		// does not shadow a same-named plugin entry — it sits beside it, and
+		// server-side apply refuses a duplicate key in `env`, which would wedge
+		// every reconcile of this CR (the EVENT_WATCHER_ENABLED comment in
+		// buildCredentialProxyContainer records the same rule). Gated on the
+		// surface rather than unconditional so a today install's plugin env is
+		// untouched — dropping a name only the next stack cares about would be
+		// one more way to tell the feature exists.
+		if a2aAgentSurface(agent) {
+			kept := extEnvs[:0]
+			for _, e := range extEnvs {
+				if e.Name == "NATS_URL" || e.Name == "NATS_USER" || e.Name == "NATS_PASSWORD" {
+					continue
+				}
+				kept = append(kept, e)
+			}
+			extEnvs = kept
+		}
 		if len(extEnvs) > 0 {
 			envVars = mergeEnvVars(envVars, extEnvs)
 		}
@@ -2249,6 +2287,54 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 		Name:  "CREDENTIAL_PROXY_TOKEN_FILE",
 		Value: credentialProxyTokenMountPath + "/token",
 	})
+	// The A2A bus, under `next` only: address and credentials for the worker
+	// user, whose grants fit an agent-side reader — subscribe on a2a.topics.>,
+	// publish on the provisioned topics. From the same Secret the A2A gateway
+	// reads, and container env only: a copy in a profile .env on the PVC would
+	// be a second place to rotate and a first place to leak. A bridge sidecar
+	// declared in spec.deployment.sidecars shares the pod and declares the
+	// same three against the same Secret, so this is one Secret seam, not two.
+	//
+	// APPENDED AFTER THE PLUGIN MERGE, and this one is not about pins but about
+	// a credential. NATS_PASSWORD is injected by SecretKeyRef, so the value
+	// lands in the container whatever the address says; if a plugin could set
+	// NATS_URL, the client would hand the worker password to an address of the
+	// plugin's choosing, in the CONNECT frame, in plaintext — and egress rule 7
+	// permits 443 to the internet whenever FQDN policy is off, so it leaves the
+	// cluster. It cannot: the three names are dropped from plugin env above
+	// while the surface is up, and they are in SensitiveEnvVars so the CR's
+	// own spec.deployment.env cannot reach them either. Found by adversarial
+	// review before this shipped.
+	//
+	// The SecretKeyRef is Optional, and that is what keeps the skew branch of
+	// a2aAgentSurface inert rather than fatal: on a today-lineage install that
+	// hit skew the creds Secret has never existed, and a required ref there
+	// would roll the pod (strategy Recreate) into CreateContainerConfigError —
+	// a full agent outage bought by a helper that exists to prevent one. With
+	// Optional the kubelet omits the variable when the Secret is absent and
+	// injects it when a frozen next stack's Secret exists, which is the freeze
+	// the helper promises. Under plain next the Secret is reconciled into
+	// existence before anything dials, so Optional costs nothing there.
+	if a2aAgentSurface(agent) {
+		envVars = append(envVars,
+			corev1.EnvVar{
+				Name:  "NATS_URL",
+				Value: fmt.Sprintf("nats://%s.%s.svc:4222", a2aNATSName(agent), agent.Namespace),
+			},
+			corev1.EnvVar{
+				Name:  "NATS_USER",
+				Value: "worker",
+			},
+			corev1.EnvVar{
+				Name: "NATS_PASSWORD",
+				ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: a2aNATSName(agent) + "-creds"},
+					Key:                  "worker-password",
+					Optional:             ptr.To(true),
+				}},
+			},
+		)
+	}
 	envVars = append(envVars, corev1.EnvVar{
 		Name:  "PATH",
 		Value: "/opt/hermes/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -2427,11 +2513,16 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			Annotations: mergeAnnotations(defaultAnnotations, podAnnotations),
 		},
 		Spec: corev1.PodSpec{
-			// No ShareProcessNamespace. Nothing in this Pod holds a credential
-			// any more, so the field is not load-bearing here — it stays unset
-			// because a Pod that shares its process namespace hands every
-			// container's /proc/<pid>/environ to every other one, and the next
-			// container added here should not inherit that by default.
+			// No ShareProcessNamespace, and under mode: next the field is
+			// load-bearing rather than a default. The agent container carries
+			// the A2A bus credential there (NATS_PASSWORD, by SecretKeyRef
+			// above), and a Pod that shares its process namespace hands every
+			// container's /proc/<pid>/environ — that value included — to every
+			// other container in it, spec.deployment.sidecars entries among
+			// them. Under mode: today the credential is absent and only the
+			// weaker reason applies: the next container added here should not
+			// inherit a shared namespace by default. Do not set this field on
+			// the strength of that weaker reason alone.
 			// See docs/security-requirements.md.
 			RuntimeClassName: runtimeClassName,
 			InitContainers:   initContainers,
@@ -2444,8 +2535,7 @@ func buildPodTemplateSpec(agent *agentv1alpha1.PlatformAgent, configHash, fluent
 			AutomountServiceAccountToken: ptr.To(false),
 			SecurityContext: &corev1.PodSecurityContext{
 				FSGroup: ptr.To(agentFSGroup),
-				// Every container in this Pod runs as the agent image's user;
-				// none of them holds a credential.
+				// Every container in this Pod runs as the agent image's user.
 				RunAsUser:      ptr.To(sandboxUID),
 				RunAsGroup:     ptr.To(agentFSGroup),
 				RunAsNonRoot:   ptr.To(true),
@@ -2877,6 +2967,20 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 	// describe loopback plumbing inside this container and live in the
 	// entrypoint.
 	envVars = append(envVars, corev1.EnvVar{Name: "EVENT_WATCHER_CLUSTER_NAME", Value: resolveHarnessClusterName(agent)})
+	// The container's own memory limit, in bytes, for the watcher to derive its
+	// Go soft memory limit from. Read through the Downward API rather than
+	// copied from the Resources block below so the two cannot drift: a limit
+	// changed in one place is the limit the watcher sees. Divisor 1 makes the
+	// value a plain byte count. Reserved in mergeCredentialProxyEnv like the
+	// other two watcher variables appended here.
+	envVars = append(envVars, corev1.EnvVar{
+		Name: eventWatcherMemoryLimitEnv,
+		ValueFrom: &corev1.EnvVarSource{ResourceFieldRef: &corev1.ResourceFieldSelector{
+			ContainerName: agentAPIAuthContainerName,
+			Resource:      containerMemoryLimitResource,
+			Divisor:       resource.MustParse("1"),
+		}},
+	})
 	// The emergency stop from spec.harness.eventWatcher.enabled. Written on every
 	// reconcile rather than only when off, so the Deployment answers "is the
 	// watcher meant to be running?" without reading the CR — the pod stays Ready
@@ -2896,7 +3000,7 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 	// shared PVC as the agent's own user.
 	securityContext := hardenedSecurityContext()
 	return corev1.Container{
-		Name:            "agent-api-auth",
+		Name:            agentAPIAuthContainerName,
 		Image:           image,
 		ImagePullPolicy: pullPolicy,
 		// Starts two of the image's three peer services — the API authenticator
@@ -3140,6 +3244,13 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// audience would collapse the two roles into one, which is how the
 		// broker spells "no split".
 		"CREDENTIAL_PROXY_CHAT_AUDIENCE",
+		// The A2A gateway's audience and subscription are reserved before the
+		// operator renders them, for the same reason: one that could set the
+		// audience would decide who holds the a2a-chat role, and one that
+		// could set the subscription would arm a second Chat consumer on
+		// whatever the broker's credential can pull.
+		"CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE",
+		"A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME",
 		"CREDENTIAL_PROXY_BOOTSTRAP_COMMAND",
 		// The listen address is reserved for the placements as well as for the
 		// authentication: it is appended after this merge in every container
@@ -3184,8 +3295,8 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		"CREDENTIAL_PROXY_TIMEOUT_SECONDS",
 		"CREDENTIAL_PROXY_UNIX_SOCKET",
 		"CREDENTIAL_PROXY_WORKSPACE_ROOT",
-		// Both appended by buildAgentAPIAuthSidecar after this merge runs,
-		// so neither is in `managed` above and neither reserves its own name.
+		// All three appended by buildAgentAPIAuthSidecar after this merge runs,
+		// so none is in `managed` above and none reserves its own name.
 		// Without them here a same-named entry in spec.deployment.env is kept
 		// and the operator's is appended alongside it — two entries with one
 		// name. That is not last-wins: `containers[].env` is a listType=map,
@@ -3193,6 +3304,7 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// resolving the duplicate, so the agent stops reconciling entirely.
 		"EVENT_WATCHER_CLUSTER_NAME",
 		"EVENT_WATCHER_ENABLED",
+		eventWatcherMemoryLimitEnv,
 		"KSA_TOKEN_FILE",
 		"TOKEN_BROKER_URL",
 	} {
@@ -4903,6 +5015,29 @@ func buildNetworkPolicy(agent *agentv1alpha1.PlatformAgent, apiCIDRs []string, p
 			},
 		},
 	})
+
+	// 13. The A2A bus, under `next` only. The NATS pods by label rather than
+	//     CIDR: the pod IP does not survive a restart, and a policy pinned to
+	//     an address silently stops matching. Egress here is deny-by-default,
+	//     and a missing rule does not refuse the dial — it hangs it to the
+	//     timeout, the least diagnosable shape this failure has.
+	if a2aAgentSurface(agent) {
+		egressRules = append(egressRules, networkingv1.NetworkPolicyEgressRule{
+			Ports: []networkingv1.NetworkPolicyPort{
+				{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4222))},
+			},
+			To: []networkingv1.NetworkPolicyPeer{
+				{
+					PodSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{
+							labelPartOf:       a2aPartOf,
+							a2aComponentLabel: "nats",
+						},
+					},
+				},
+			},
+		})
+	}
 
 	// Additional Egress rules from spec. Last, so a spec-supplied rule reads as an
 	// addition to the operator's own set rather than being interleaved with it.

@@ -289,6 +289,39 @@ litellm:
   # apply time.
   networkPolicy: true
   podMonitoring: true
+  # Redaction of every request body the gateway forwards to a provider. Off by
+  # default: on, the ConfigMap also carries the shared redactor module and a
+  # LiteLLM pre-call hook, mounted beside /app/config.yaml, and the hook runs
+  # the built-in credential patterns plus the rules below over messages,
+  # embeddings input and completion prompts before the provider sees them.
+  # Request bodies only: responses, tool results on disk and chat egress are
+  # not covered. The concepts/inference-gateway page on the site owns the
+  # model, including why a pseudonymised identifier is one the agent can no
+  # longer act on.
+  redaction:
+    enabled: false
+    # IPv4 and IPv6 literals. action: pseudonym replaces each with a stable
+    # [ip:<12 hex>] token salted from SESSION_KV_SALT in the credentials
+    # Secret (a missing salt still redacts, with a per-pod salt); mask
+    # replaces each with [REDACTED_IP]; "off" leaves IP literals alone. Quote
+    # off: YAML reads the bare word as a boolean, and the chart refuses that
+    # rather than guessing. allowCidrs lists networks the model must still
+    # see, in CIDR form.
+    ip:
+      action: pseudonym
+      allowCidrs: []
+    # Operator rules, applied in order after the IP rules. Each has a name
+    # (starting with a letter or digit, then letters, digits, `_`, `.`, `-`),
+    # exactly one of `pattern` (a Python regular expression) or `literal` (an
+    # exact string), both non-empty text, and an action of mask (default,
+    # [REDACTED_<NAME>] with the name upper-cased and punctuation folded to
+    # `_`) or pseudonym ([<name>:<12 hex>]). The render fails on a name,
+    # action or source it cannot accept; a pattern that does not compile stops
+    # the gateway pod at startup rather than forwarding requests unredacted.
+    #   - name: cluster-name
+    #     literal: prod-eu-1
+    #     action: pseudonym
+    rules: []
 
 # The Hindsight memory store: the API the agents call for long-term memory,
 # the Postgres/pgvector StatefulSet behind it, a NetworkPolicy standing in for
