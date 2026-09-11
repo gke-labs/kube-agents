@@ -8,10 +8,10 @@ from typing import Any
 
 from cuj.utils.acceptance_criteria import AcceptanceCriteria, AcceptanceCriterion
 from cuj.utils.interaction import (
+    delivered_answer,
     latest_artifact,
     projected_records,
     projected_tasks,
-    substantive_output,
     tool_operations,
     unnormalized_tool_calls,
 )
@@ -337,7 +337,7 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         and created_at <= top_start
         and top_start + JOB_DURATION <= created_at + PLANNING_HORIZON
     )
-    final_output = substantive_output(interaction)
+    final_output = delivered_answer(interaction)
     recommended_in_output = (
         bool(top)
         and str(top.get("zone") or "") in final_output

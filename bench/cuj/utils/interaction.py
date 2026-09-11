@@ -78,7 +78,12 @@ class InteractionRunner:
                 )
                 previous = current
 
-        self.log.record("interaction_final", {"poll": poll, "value": interaction})
+        # The loop above recorded the terminal projection when it appeared, so
+        # this marker carries the poll count and status only.
+        self.log.record(
+            "interaction_final",
+            {"poll": poll, "status": interaction.get("status")},
+        )
         return interaction
 
 
@@ -152,12 +157,14 @@ def tool_operations(
 #: bold markers and the task id in backticks — and must not fire on a report
 #: that merely cites its own task id. Every branch therefore pairs hand-off
 #: phrasing with the thing handed off.
+#:
+#: Each branch is the template's own wording, not a paraphrase of it: "Results
+#: for the design will post below" and "Assigned under task t_...: start at
+#: 14:00" are answers that a looser matcher stripped.
 _DELEGATION_ACK = re.compile(
     r"\bdelegat(?:ed|ing)\b[^.\n]{0,60}\b\**\w[\w-]*\**\s+agent\b"
-    r"|\b(?:started|routed|assigned|handed off)\b[^.\n]{0,80}"
-    r"\btask\s+[`'\"]?t_[0-9a-f]+"
-    r"|\b(?:answer|results?|report)\b[^.\n]{0,60}\bwill post\b"
-    r"|\bwill post\b[^.\n]{0,60}\b(?:thread|here)\b",
+    r"|\bstarted this as task\s+[`'\"]?t_[0-9a-f]+"
+    r"|\bwill post into this thread\b",
     re.IGNORECASE,
 )
 
@@ -180,13 +187,33 @@ def substantive_output(interaction: dict[str, Any]) -> str:
             kept.append(paragraph)
             continue
         sentences = re.split(r"(?<=[.!?])\s+", paragraph.strip())
-        remainder = list(sentences)
+        remainder = [sentence for sentence in sentences if sentence.strip()]
         while remainder and _DELEGATION_ACK.search(remainder[0]):
             remainder.pop(0)
         if remainder:
             skipping = False
             kept.append(" ".join(remainder))
     return "\n\n".join(kept).strip()
+
+
+def delivered_answer(interaction: dict[str, Any]) -> str:
+    """Everything the user reads for this interaction, acknowledgments removed.
+
+    The coordinator's reply is the hand-off alone by instruction (SOUL.md,
+    Planning Loop step 4); the specialist's ``result`` is posted into the same
+    thread by the gateway without passing back through the coordinator. A
+    criterion scored on "the answer the user received" therefore reads both:
+    the substantive part of the root output, then each projected task's
+    result, in task order. Where the projection carries no task results the
+    value is the root output alone, which is what earlier criteria scored.
+    """
+
+    parts = [substantive_output(interaction)]
+    for task in projected_tasks(interaction):
+        result = task.get("result")
+        if isinstance(result, str) and result.strip():
+            parts.append(result.strip())
+    return "\n\n".join(part for part in parts if part)
 
 
 def latest_artifact(
