@@ -703,6 +703,7 @@ def credential_patterns() -> dict[str, re.Pattern[str]]:
     if spec is None or spec.loader is None:
         raise CaseError(f"{REDACTOR_FILE}: could not be loaded")
     module = importlib.util.module_from_spec(spec)
+    sys.modules[REDACTOR_MODULE_NAME] = module
     try:
         spec.loader.exec_module(module)
     except Exception as exc:  # any import failure is the finding, whatever its class
