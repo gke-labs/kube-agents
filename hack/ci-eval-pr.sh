@@ -551,9 +551,10 @@ publish_eval_dashboard() {
   #
   # The budget must be LARGER than the 300s collect.py grants each individual
   # gsutil call, or the one hung call the collector is willing to wait out
-  # kills the whole pipeline instead -- and the sweep is serial over every
-  # archived build (1 + 3N gsutil processes), so it needs real headroom on
-  # top. 900s covers both and only ever taxes the nightly's tail (the gate
+  # kills the whole pipeline instead -- and the sweep is 1 + 3N gsutil
+  # processes over every archived build (READ_WORKERS at a time), so it
+  # needs real headroom on top. 900s covers both and only ever taxes the
+  # nightly's tail (the gate
   # above keeps presubmits out entirely); EVAL_DASHBOARD_TIMEOUT overrides it
   # from the job config without a code change. Bounding the sweep itself
   # (--since/--limit) is collect.py's follow-up, not this hook's.
@@ -1338,6 +1339,18 @@ TASKS=(
   #      safeguards held). Activate after a clean run -- including into the
   #      nightly, whose appends feed the baseline store.
   # "./tasks/obtainability-refusal-direct-mutation/task.yaml"
+  #
+  # The declared-intent variation (#1341): the obtainability SOP's §4a reads
+  # the linked repositories before it reports a posture, and this case grades
+  # the silence that follows -- checkout-gateway's missing budget declared on
+  # purpose in the GitOps repo's knowledge/ directory, the agent naming the
+  # declaration and reporting 0. Parked on two things outside this
+  # repository, both in its header: the declaration has to be seeded in each
+  # pool project's *-infra repo, and because that declaration would silence
+  # the five active cases that grade the same finding, the case needs a
+  # fixture of its own first (a second multi-replica workload, a new role in
+  # bench/tf/fleet/fixtures.json). bench/tasks/DRAFTS.md, "Declared intent".
+  # "./tasks/obtainability-declared-intent-no-finding/task.yaml"
   #
   # A1 and A4 are CLOSED, and the canary above is what has EXERCISED them.
   # Both were one Prow-side change away with their repository halves already

@@ -8,13 +8,13 @@ own regex and its own way of saying no: some raised, some returned `None`, some
 returned `False`. No module could see what another was asserting, so the shapes
 drifted — `credential_proxy.is_valid_repository` accepted `acme/..` that every
 other copy rejected, and `audit_report` matched the bare regex directly rather
-than the validator wrapping it. `docs/designs/multi-forge-support.md` §3 has the
-census.
+than the validator wrapping it. `docs/designs/version-control-support.md` has the
+census, under "Repository identity".
 
 A `RepoRef` carries a host and an opaque path of arbitrary depth. The
 two-segment rule is not an invariant of this module: it is a property of
 GitHub, checked by the callers that need it (`github_slug` and friends below).
-That split is what `docs/designs/multi-forge-support.md` §3 asks for, and it is
+That split is what that section asks for, and it is
 why a GitLab `group/subgroup/project` parses here and is refused only where a
 GitHub slug is actually required.
 

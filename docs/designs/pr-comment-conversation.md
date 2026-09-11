@@ -194,7 +194,8 @@ the claim check enforces — see step 4 of the worker skill below.
 dispatches on the host `repo_ref.parse` reads out of the repository value the caller passes: a host
 with no provider registered raises rather than falling back, while a value naming no host at all —
 the bare `owner/name` every caller here passes today, or no repository at all — still selects
-GitHub. `multi-forge-support.md` §3 owns that rule. Every provider call goes through
+GitHub. [`version-control-support.md`](version-control-support.md) owns that rule
+under "Repository identity". Every provider call goes through
 one `_call()` seam, so a `ProxyForgeProvider` speaking to a future sidecar route drops in without
 touching anything above it.
 
@@ -259,7 +260,7 @@ rather than reimplements.
 
 The provider protocol makes this feature portable. The stack under it is not — token brokering, the
 sidecar's executable allowlist, the git credential shape and the CRD each name GitHub, and none of
-that is caused by this design. [`multi-forge-support.md`](multi-forge-support.md) owns the full
+that is caused by this design. [`version-control-support.md`](version-control-support.md) owns the full
 account and the order the layers have to be unwound in; this section records only what bears on the
 protocol above them.
 

@@ -44,8 +44,9 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # against (#1251's review). The fork guard covers the other axis.
 #
 # Budget: this job runs the INCREMENTAL path only -- the bucket holds
-# data.json, and collect.py's watermark makes a tick cost the archive
-# listing plus the new builds (seconds to a few minutes). A cold sweep does
+# data.json, and collect.py's watermark makes a tick cost one listing of
+# Prow's per-job directory index plus the new builds (seconds to a few
+# minutes). A cold sweep does
 # not fit here and is not attempted: hack/ci-dashboard-refresh.sh prices it
 # at 30-45 minutes, past the 30-minute job, and retrying it every 15 minutes
 # would burn a red run per tick without ever publishing. So a tick that finds

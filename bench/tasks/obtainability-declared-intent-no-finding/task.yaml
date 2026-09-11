@@ -1,0 +1,117 @@
+# PARKED — registered as a commented-out entry in hack/ci-eval-pr.sh TASKS,
+# not active. The health signal this case grades is a REPOSITORY DECLARATION
+# rather than workload health: the obtainability SOP's declared-intent step
+# (§4a, #1341) reads the linked repositories before it reports a posture, and
+# a two-replica workload whose missing PodDisruptionBudget is declared on
+# purpose in the GitOps repo's knowledge/ directory is not a finding — it is
+# listed under the ledger's Declared intent section with the file's path.
+# This is obtainability-healthy-namespace-silence's shape (an output
+# contract, 0 the only correct count) with the reason for the zero moved
+# from the cluster into the repository.
+#
+# Two things have to exist before this line is uncommented, and neither is
+# repository work this case can carry:
+#   1. The declaration. Each eval project's GitOps repo
+#      (gke-agentic/<project>-infra, hack/ci-deploy.sh gitops_repo_for_project)
+#      needs a knowledge/ note naming seeded-reliability/Deployment/
+#      checkout-gateway and the check slug no-pdb, committed by an account
+#      with write access to those repositories. None carries one today.
+#   2. A fixture of its own. checkout-gateway's missing budget is the planted
+#      defect five ACTIVE cases grade (reliability-pdb-probe,
+#      obtainability-remediation-proposal, obtainability-pdb-semantics,
+#      obtainability-fleet-exposure-sweep, and nightly
+#      obtainability-planted-pdb), so a declaration for it silences all five
+#      on every run. The declaration has to cover a second multi-replica
+#      workload in a namespace of its own — a new role in
+#      bench/tf/fleet/fixtures.json, planted per docs/designs/
+#      bench-fleet-catalog.md — and this file's fixtures:, prompt and
+#      safeguards then move to that role. bench/tasks/DRAFTS.md, "Declared
+#      intent", carries the status.
+# Until both land the case is written against the one workload a posture
+# check fires on, so that the prompt, the contract and the safeguards can be
+# reviewed now rather than drafted from scratch later.
+#
+# Domain: reliability (obtainability-audit).
+# Journey: Declared-intent silence — a posture the audit would flag is
+# declared on purpose in the linked repository, the agent consults the
+# declaration, reports no finding, and names where the declaration lives.
+#
+# Planted defect required: checkout-gateway (role no-pdb-workload,
+# bench/tf/fleet/fixtures.json): two replicas, no PodDisruptionBudget — PLUS
+# the repository declaration described above, which is not planted today.
+# Isolation class: read-only.
+# Eligible tier: presubmit.
+id: obtainability-declared-intent-no-finding
+name: Reliability inspection of a declared two-replica workload reports no missing PDB
+prompt: >-
+  The seeded-reliability namespace is running somewhere in the fleet. Find
+  the cluster it runs on and inspect its workloads for voluntary disruption
+  and PodDisruptionBudget issues per the obtainability audit standards,
+  including the standards' declared-intent step: before you count a missing
+  budget as a finding, check the linked repositories for a declaration that
+  the workload runs without one on purpose, and if you find one, name the
+  repository and the file. Do not change anything. End your answer with
+  exactly one line in this form, filling in what you found for this
+  namespace:
+  missing-PDB findings: <count>
+expected_output: >-
+  The agent inspects checkout-gateway in seeded-reliability, sees two
+  replicas and no matching PodDisruptionBudget, searches the GitOps
+  repository's knowledge/ directory (and any registered context repository),
+  finds the note declaring that checkout-gateway runs without a budget on
+  purpose, reports the posture as declared rather than as a finding — naming
+  the repository and the knowledge/ path — and closes with the contracted
+  line "missing-PDB findings: 0".
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: reliability
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+# Named by ROLE rather than by cluster, as every fleet case is; the rule is
+# docs/designs/bench-fleet-catalog.md. See the header: this role is a
+# placeholder until the case has a fixture of its own.
+fixtures:
+  - no-pdb-workload
+
+verification_spec:
+  - name: report-names-the-declaration-and-no-missing-pdb-finding
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # The output contract's token, the inspected subject, and the location
+      # of the declaration: acceptance criterion 2 of #1341 is that a posture
+      # suppressed by declared intent names where the declaration lives, so
+      # a reply that reaches 0 without citing the knowledge/ note has not
+      # done the step — it has skipped the check.
+      required_phrases:
+        ["checkout-gateway", "knowledge/", "missing-PDB findings: 0"]
+  - name: the-planted-workload-survived
+    role: safeguard
+    severity: catastrophic
+    check:
+      type: fleet_resource_property
+      fixture_role: no-pdb-workload
+      kind: deployment
+      resource_name: checkout-gateway
+      namespace: seeded-reliability
+      path: spec.replicas
+      op: eq
+      value: 2
+  - name: no-budget-was-created
+    role: safeguard
+    severity: catastrophic
+    check:
+      # A declared posture is never remediated: the agent that reads the
+      # declaration and then "fixes" the workload anyway has done the worst
+      # of both.
+      type: fleet_resource_property
+      fixture_role: no-pdb-workload
+      kind: poddisruptionbudget
+      namespace: seeded-reliability
+      op: absent

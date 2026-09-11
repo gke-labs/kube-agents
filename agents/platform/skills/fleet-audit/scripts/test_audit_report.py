@@ -51,6 +51,9 @@ class GitResult:
 
 
 AUDIT = "compliance-audit"
+# The one stream whose SOP has a declared-intent step, so the one stream on
+# which a `declared` list validates. Every other stream rejects the list.
+DECLARING_AUDIT = "obtainability-audit"
 NOW = datetime(2026, 8, 1, 9, 30, tzinfo=timezone.utc)
 
 # Which SOP owns each stream's check roster. Spelled out rather than derived
@@ -627,6 +630,12 @@ class HarnessTestCase(BaseTestCase):
         self.patch_attr("refresh_credentials", lambda repo=None: None)
         self.patch_attr("resolve_repo", lambda *a, **k: "acme/fleet")
         self.patch_attr("repo_root", lambda: self.workspace)
+        # `start` reads `context_repos` through gitops_workspace, which with no
+        # mounted ConfigMap falls through to kubectl. Pin it to "none
+        # registered"; the tests about the key set their own value.
+        context = patch.object(gitops_workspace, "get_context_github_repos", lambda: [])
+        context.start()
+        self.addCleanup(context.stop)
         # Most tests describe a pod that has audited before, so the clone
         # already exists and `ensure_workspace` takes the fetch path. Tests
         # about the first run call `self.unclone()` to remove it.
@@ -1961,6 +1970,24 @@ class TestAuditCatalogue(unittest.TestCase):
                     f"{jobs[audit_id]['name']!r}",
                 )
 
+    def test_declarable_checks_are_posture_checks_on_the_roster(self):
+        """`declarable` is a subset of the roster: no derived slug, no duplicate.
+
+        The validator holds `declared[].check` to this set, so a slug listed
+        here but not on the roster would admit a declared posture no check can
+        produce, and a derived slug here would let a meta-finding be declared
+        away.
+        """
+        for audit_id, spec in audit_report.AUDITS.items():
+            with self.subTest(audit=audit_id):
+                self.assertEqual(len(spec.declarable), len(set(spec.declarable)))
+                self.assertLessEqual(set(spec.declarable), set(spec.checks))
+                self.assertFalse(set(spec.declarable) & set(spec.derived))
+                self.assertEqual(
+                    audit_report.audit_declarable_checks(audit_id),
+                    frozenset(spec.declarable),
+                )
+
     def test_check_rosters_match_the_sops(self):
         """The roster is the SOP's check list, or it is a lie the validator tells.
 
@@ -2646,6 +2673,7 @@ class TestFinishWithFindings(HarnessTestCase):
                 "silent_ok": False,
                 "partial": False,
                 "coverage_gaps": [],
+                "declared": 0,
             },
         )
 
@@ -2704,6 +2732,7 @@ class TestFinishWithFindings(HarnessTestCase):
                 "silent_ok": False,
                 "partial": False,
                 "coverage_gaps": [],
+                "declared": 0,
             },
         )
 
@@ -2922,6 +2951,30 @@ class TestPublishedBodies(HarnessTestCase):
 
 
 class TestFinishClean(HarnessTestCase):
+    def test_a_clean_run_with_no_ledger_still_counts_what_was_declared(self):
+        # Nothing to open and nothing to close, so the JSON line and the log
+        # are the only trace that the run deferred to a declaration.
+        self.harness.replies = {"issue list": "[]"}
+        doc = make_doc(audit=DECLARING_AUDIT, findings=[])
+        doc["declared"] = [make_declared()]
+        self.assertEqual(self.run_finish(doc, audit=DECLARING_AUDIT), 0)
+        payload = self.stdout_json()
+        self.assertEqual(payload["status"], "CLEAN")
+        self.assertEqual(payload["declared"], 1)
+        # A standing declaration is the same every morning; it must not wake
+        # the channel.
+        self.assertTrue(payload["silent_ok"])
+        self.assertIn("1 declared posture(s)", self.err)
+        self.assertFalse(self.harness.gh_calls("issue", "create"))
+        self.assertFalse(self.harness.gh_calls("issue", "comment"))
+
+    def test_the_findings_branch_reports_the_declared_count_too(self):
+        self.harness.replies = {"issue list": "[]"}
+        doc = make_doc(audit=DECLARING_AUDIT, findings=[make_finding(check="no-pdb")])
+        doc["declared"] = [make_declared(), make_declared(obj="Deployment/web")]
+        self.assertEqual(self.run_finish(doc, audit=DECLARING_AUDIT), 0)
+        self.assertEqual(self.stdout_json()["declared"], 2)
+
     def test_clean_run_closes_the_open_ledger_as_completed(self):
         previous_body = published_body(
             make_doc(findings=[make_finding(fid="a"), make_finding(fid="b")]),
@@ -2958,6 +3011,7 @@ class TestFinishClean(HarnessTestCase):
                 "silent_ok": False,
                 "partial": False,
                 "coverage_gaps": [],
+                "declared": 0,
             },
         )
 
@@ -2989,6 +3043,7 @@ class TestFinishClean(HarnessTestCase):
                 "silent_ok": True,
                 "partial": False,
                 "coverage_gaps": [],
+                "declared": 0,
             },
         )
 
@@ -3072,6 +3127,7 @@ class TestStart(HarnessTestCase):
                 "workspace": str(self.workspace),
                 "findings_path": str(self.tmp_path / "findings_compliance-audit.json"),
                 "pending_remediation_requests": [],
+                "context_repos": [],
                 "sop": "governance/compliance_audit_sop.md",
                 "checks": list(audit_report.audit_checks(AUDIT)),
             },
@@ -3115,6 +3171,38 @@ class TestStart(HarnessTestCase):
                 self.assertEqual(
                     f"governance/{audit_report.audit_sop(audit_id)}", payload["sop"]
                 )
+
+    def test_start_hands_over_the_context_repositories(self):
+        """The declared-intent step searches what `start` names, and nothing else.
+
+        Printed here rather than looked up by the worker so the list it
+        searched is the list the harness read, and so no SOP step needs a
+        `kubectl get configmap` of its own.
+        """
+        self.harness.replies = {"issue list": "[]"}
+        with patch.object(
+            gitops_workspace,
+            "get_context_github_repos",
+            lambda: ["acme/terraform-live", "acme/fleet"],
+        ):
+            self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertEqual(
+            json.loads(self.out)["context_repos"], ["acme/terraform-live", "acme/fleet"]
+        )
+
+    def test_an_unreadable_context_key_degrades_to_none_and_says_so(self):
+        # A filter over an optional list must not stop the audit: the run
+        # searches the clone alone and every unmatched posture stays a finding.
+        self.harness.replies = {"issue list": "[]"}
+
+        def unreadable():
+            raise RuntimeError("kubectl failed: Forbidden")
+
+        with patch.object(gitops_workspace, "get_context_github_repos", unreadable):
+            self.assertEqual(self.run_main(["start", "--audit", AUDIT]), 0)
+        self.assertEqual(json.loads(self.out)["context_repos"], [])
+        self.assertIn("could not read context_repos", self.err)
+        self.assertIn("Forbidden", self.err)
 
     def test_the_workspace_is_named_so_manifests_can_be_written_into_it(self):
         # The agent does not start in a working tree, so a `remediation.path`
@@ -3341,6 +3429,395 @@ class TestDryRun(BaseTestCase):
         self.assertEqual(sorted(announced), sorted(rendered))
 
 
+def make_declared(
+    check="no-hpa",
+    cluster="prod-us-east",
+    namespace="payments",
+    obj="Deployment/api",
+    title="api is pinned at three replicas by Terraform",
+    repo="acme/terraform-live",
+    path="clusters/prod-us-east/payments.tf",
+    excerpt="min_replicas = 3\nmax_replicas = 3",
+):
+    """One `declared[]` entry: a finding's identity plus the declaration that justifies it."""
+    return {
+        "check": check,
+        "cluster": cluster,
+        "namespace": namespace,
+        "object": obj,
+        "title": title,
+        "declaration": {"repo": repo, "path": path, "excerpt": excerpt},
+    }
+
+
+def declaring_doc(findings=None, **kwargs):
+    """A document on the declaring stream, carrying one posture finding by default."""
+    if findings is None:
+        findings = [make_finding(check="no-pdb")]
+    return make_doc(findings=findings, audit=DECLARING_AUDIT, **kwargs)
+
+
+class TestDeclaredIntent(BaseTestCase):
+    """The `declared` list: seen, declared on purpose, and therefore not a finding.
+
+    Two properties carry the whole design. A declared posture is *not a
+    finding* — no id, no severity, no slot in the delta block, so it is never
+    announced as new or resolved and never becomes a pull request. And it is
+    *refutable* — every row names `repo:path` and the lines that pin the
+    property, so a reviewer who disagrees edits the declaration rather than
+    arguing with the ledger.
+    """
+
+    def validate(self, doc):
+        return audit_report.validate_findings(copy.deepcopy(doc), DECLARING_AUDIT)
+
+    def rejects(self, doc, *fragments):
+        with self.assertRaises(audit_report.ValidationError) as caught:
+            self.validate(doc)
+        for fragment in fragments:
+            self.assertIn(fragment, str(caught.exception))
+        return caught.exception
+
+    # -- validation ---------------------------------------------------------
+
+    def test_a_document_without_the_key_validates_as_before(self):
+        doc = declaring_doc()
+        self.assertNotIn("declared", doc)
+        self.validate(doc)
+
+    def test_a_well_formed_entry_is_accepted_and_gets_no_id(self):
+        doc = declaring_doc(findings=[])
+        doc["declared"] = [make_declared()]
+        validated = self.validate(doc)
+        self.assertNotIn("id", validated["declared"][0])
+        self.assertNotIn("severity", validated["declared"][0])
+
+    def test_the_key_must_be_a_list(self):
+        doc = declaring_doc()
+        doc["declared"] = {"check": "no-hpa"}
+        self.rejects(doc, "declared: must be a list")
+
+    def test_the_check_must_be_on_the_roster_and_the_roster_is_not_printed(self):
+        doc = declaring_doc()
+        doc["declared"] = [make_declared(check="pinned-replicas")]
+        exc = self.rejects(doc, "declared[0].check", "'pinned-replicas'")
+        for slug in audit_report.audit_checks(DECLARING_AUDIT):
+            self.assertNotIn(slug, str(exc))
+
+    def test_a_fault_check_is_rejected_and_the_declarable_set_is_not_printed(self):
+        # The red line "a declaration justifies posture, never a fault" is an
+        # exit 2, not a sentence: `blocking-pdb` is the SOP's own example of a
+        # declared bug, and `no-requests` is the fault a declaration most
+        # plausibly names by accident. Both are on the roster; neither moves.
+        for fault in ("blocking-pdb", "no-requests", "rigid-scheduling"):
+            with self.subTest(check=fault):
+                doc = declaring_doc()
+                doc["declared"] = [make_declared(check=fault)]
+                exc = self.rejects(
+                    doc, "declared[0].check", repr(fault), "fault, not a posture"
+                )
+                for slug in audit_report.audit_declarable_checks(DECLARING_AUDIT):
+                    self.assertNotIn(slug, str(exc))
+
+    def test_every_posture_check_may_be_declared(self):
+        for posture in audit_report.audit_declarable_checks(DECLARING_AUDIT):
+            with self.subTest(check=posture):
+                doc = declaring_doc(findings=[])
+                doc["declared"] = [make_declared(check=posture)]
+                self.validate(doc)
+
+    def test_a_stream_without_a_declared_intent_step_rejects_the_list(self):
+        # Eight streams have no §4a. A worker on one of them that writes a
+        # `declared` list has misread a step that does not exist for it, and a
+        # hostile document has found a stream with no rule to break; both are
+        # rejected whole rather than admitted because the check is on the
+        # roster. `[]` still validates everywhere: it says what an absent key
+        # says.
+        silent = [
+            audit_id
+            for audit_id, spec in audit_report.AUDITS.items()
+            if not spec.declarable
+        ]
+        self.assertIn(AUDIT, silent)
+        self.assertEqual(len(silent), len(audit_report.AUDITS) - 1)
+        for audit_id in silent:
+            with self.subTest(audit=audit_id):
+                doc = make_doc(audit=audit_id, findings=[])
+                doc["declared"] = []
+                audit_report.validate_findings(copy.deepcopy(doc), audit_id)
+                doc["declared"] = [
+                    make_declared(check=audit_report.audit_checks(audit_id)[0])
+                ]
+                with self.assertRaises(audit_report.ValidationError) as caught:
+                    audit_report.validate_findings(copy.deepcopy(doc), audit_id)
+                self.assertIn("declared[0]", str(caught.exception))
+                self.assertIn("no declared-intent step", str(caught.exception))
+
+    def test_an_entry_must_be_an_object(self):
+        doc = declaring_doc()
+        for bad in ("no-hpa", ["no-hpa"], None, 7):
+            with self.subTest(entry=bad):
+                doc["declared"] = [bad]
+                self.rejects(doc, "declared[0]: expected an object")
+
+    def test_the_cluster_must_be_one_this_run_read(self):
+        doc = declaring_doc(skipped=[{"cluster": "dr-west", "reason": "unreachable"}])
+        doc["declared"] = [make_declared(cluster="dr-west")]
+        self.rejects(doc, "declared[0].cluster", "not in scope.clusters")
+        doc["declared"] = [make_declared(cluster="never-heard-of")]
+        self.rejects(doc, "declared[0].cluster", "not in scope.clusters")
+
+    def test_the_declaration_is_required_and_complete(self):
+        doc = declaring_doc()
+        entry = make_declared()
+        del entry["declaration"]
+        doc["declared"] = [entry]
+        self.rejects(doc, "declared[0].declaration", "'repo', 'path', 'excerpt'")
+        for field in audit_report.DECLARATION_FIELDS:
+            with self.subTest(missing=field):
+                entry = make_declared()
+                del entry["declaration"][field]
+                doc["declared"] = [entry]
+                self.rejects(doc, f"declared[0].declaration.{field}")
+
+    def test_the_repository_is_a_slug(self):
+        doc = declaring_doc()
+        for bad in ("https://github.com/acme/terraform-live", "acme", "", None, 7):
+            with self.subTest(repo=bad):
+                doc["declared"] = [make_declared(repo=bad)]
+                self.rejects(doc, "declared[0].declaration.repo", "owner/name")
+
+    def test_the_path_follows_the_remediation_path_rules(self):
+        doc = declaring_doc()
+        for bad in ("/etc/passwd", "../../secrets.tf", "clusters/*.tf", "a/.git/config"):
+            with self.subTest(path=bad):
+                doc["declared"] = [make_declared(path=bad)]
+                self.rejects(doc, "declared[0].declaration.path")
+        doc["declared"] = [make_declared(path="./clusters//prod/./main.tf")]
+        validated = self.validate(doc)
+        self.assertEqual(
+            validated["declared"][0]["declaration"]["path"], "clusters/prod/main.tf"
+        )
+
+    def test_the_excerpt_must_carry_the_lines_that_pin_the_property(self):
+        doc = declaring_doc()
+        doc["declared"] = [make_declared(excerpt="   ")]
+        self.rejects(doc, "declared[0].declaration.excerpt", "non-empty")
+
+    def test_a_title_is_required(self):
+        doc = declaring_doc()
+        doc["declared"] = [make_declared(title="")]
+        self.rejects(doc, "declared[0].title")
+
+    def test_identity_fields_must_name_something(self):
+        doc = declaring_doc()
+        doc["declared"] = [make_declared(obj="///")]
+        self.rejects(doc, "declared[0].object", "names nothing")
+
+    def test_a_posture_cannot_be_both_a_finding_and_declared(self):
+        finding = make_finding(check="no-pdb", obj="Deployment/api", namespace="payments")
+        doc = declaring_doc(findings=[finding])
+        doc["declared"] = [
+            make_declared(
+                check=finding["check"],
+                cluster=finding["cluster"],
+                namespace=finding["namespace"],
+                obj=finding["object"],
+            )
+        ]
+        self.rejects(
+            doc,
+            "declared[0]",
+            "same identity as findings[0]",
+            "listed as a finding and as declared",
+        )
+
+    def test_two_declared_entries_cannot_share_an_identity(self):
+        doc = declaring_doc()
+        doc["declared"] = [make_declared(), make_declared(title="said twice")]
+        self.rejects(doc, "declared[1]", "same identity as declared[0]")
+
+    def test_the_same_object_may_be_declared_under_two_checks(self):
+        # Identity is the finding's identity: check is part of it, so a
+        # workload whose replica count and missing budget are both declared
+        # is two entries, not a collision.
+        doc = declaring_doc()
+        doc["declared"] = [
+            make_declared(check="no-hpa"),
+            make_declared(check="no-pdb"),
+        ]
+        self.validate(doc)
+
+    # -- rendering ----------------------------------------------------------
+
+    def test_the_ledger_renders_a_declared_intent_section_after_the_findings(self):
+        doc = declaring_doc()
+        doc["declared"] = [make_declared()]
+        body = render_body(self.validate(doc), generated_at=NOW)
+        self.assertIn("## Declared intent", body)
+        self.assertLess(body.index("## Findings"), body.index("## Declared intent"))
+        # The pointer a reviewer follows, and the lines that pin the property.
+        self.assertIn("`acme/terraform-live:clusters/prod-us-east/payments.tf`", body)
+        self.assertIn("`payments/Deployment/api`", body)
+        self.assertIn("api is pinned at three replicas by Terraform", body)
+        self.assertIn("min_replicas = 3 max_replicas = 3", body)
+
+    def test_no_section_renders_when_nothing_is_declared(self):
+        self.assertNotIn(
+            "## Declared intent", render_body(declaring_doc(), generated_at=NOW)
+        )
+        doc = declaring_doc()
+        doc["declared"] = []
+        self.assertNotIn("## Declared intent", render_body(doc, generated_at=NOW))
+
+    def test_declared_entries_never_enter_the_delta_block(self):
+        # The whole point of a separate list. In the delta block the entry
+        # would be announced as new today and as resolved the day the
+        # declaration is removed — the opposite of what happened.
+        doc = declaring_doc(findings=[make_finding(check="no-pdb", fid="real")])
+        doc["declared"] = [make_declared()]
+        validated = self.validate(doc)
+        rendered = audit_report.render_issue_body(validated, generated_at=NOW)
+        self.assertEqual(rendered.rendered_ids, [validated["findings"][0]["id"]])
+        self.assertEqual(
+            audit_report.parse_delta_block(rendered.body), rendered.rendered_ids
+        )
+
+    def test_a_declared_posture_renders_on_a_ledger_with_no_findings(self):
+        # Coverage gap plus zero findings opens a ledger; the declared section
+        # still says what was seen and where it is declared.
+        doc = declaring_doc(
+            findings=[], skipped=[{"cluster": "dr-west", "reason": "down"}]
+        )
+        doc["declared"] = [make_declared()]
+        body = render_body(self.validate(doc), generated_at=NOW)
+        self.assertIn("No findings", body)
+        self.assertIn("## Declared intent", body)
+
+    def test_cells_are_escaped_and_clipped(self):
+        doc = declaring_doc()
+        doc["declared"] = [
+            make_declared(
+                title="pipe | and `tick` in the title",
+                excerpt="x" * (audit_report.MAX_CELL_CHARS + 50),
+            )
+        ]
+        body = render_body(self.validate(doc), generated_at=NOW)
+        row = next(line for line in body.splitlines() if "acme/terraform-live" in line)
+        self.assertIn("pipe \\| and 'tick' in the title", row)
+        self.assertNotIn("x" * (audit_report.MAX_CELL_CHARS + 1), row)
+
+    def test_the_table_is_row_capped_and_says_so(self):
+        doc = declaring_doc()
+        doc["declared"] = [
+            make_declared(obj=f"Deployment/api-{n}")
+            for n in range(audit_report.MAX_DECLARED_ROWS + 5)
+        ]
+        body = render_body(self.validate(doc), generated_at=NOW)
+        section = body.split("## Declared intent", 1)[1].split("\n## ", 1)[0]
+        rows = [line for line in section.splitlines() if "acme/terraform-live" in line]
+        self.assertEqual(len(rows), audit_report.MAX_DECLARED_ROWS)
+        self.assertIn("…and 5 more", section)
+        self.assertIn(f"{audit_report.MAX_DECLARED_ROWS + 5} posture(s)", section)
+
+    def test_the_section_is_charged_against_the_body_budget(self):
+        # Findings yield to the declared table, not the other way round: with
+        # the table present, fewer findings fit and the body stays legal.
+        findings = bulk_findings(400, check="no-pdb")
+        plain = audit_report.render_issue_body(
+            self.validate(declaring_doc(findings=findings)), generated_at=NOW
+        )
+        doc = declaring_doc(findings=findings)
+        doc["declared"] = [
+            make_declared(obj=f"Deployment/api-{n}")
+            for n in range(audit_report.MAX_DECLARED_ROWS)
+        ]
+        with_declared = audit_report.render_issue_body(
+            self.validate(doc), generated_at=NOW
+        )
+        self.assertLess(len(with_declared.body), audit_report.MAX_BODY_CHARS)
+        self.assertLessEqual(len(with_declared.body), audit_report.BODY_BUDGET + 2000)
+        self.assertIn("## Declared intent", with_declared.body)
+        self.assertGreater(len(with_declared.omitted), len(plain.omitted))
+
+    # -- the clean run --------------------------------------------------------
+
+    def test_the_clean_comment_says_what_was_declared(self):
+        doc = declaring_doc(findings=[])
+        doc["declared"] = [make_declared()]
+        comment = audit_report.render_clean_comment(
+            DECLARING_AUDIT, self.validate(doc), NOW
+        )
+        self.assertIn("is now clean", comment)
+        self.assertIn("1 posture(s)", comment)
+        self.assertIn("`acme/terraform-live:clusters/prod-us-east/payments.tf`", comment)
+        self.assertIn("`payments/Deployment/api`", comment)
+
+    def test_the_clean_comment_is_row_capped_and_says_so(self):
+        doc = declaring_doc(findings=[])
+        doc["declared"] = [
+            make_declared(obj=f"Deployment/api-{n}")
+            for n in range(audit_report.MAX_DECLARED_ROWS + 5)
+        ]
+        comment = audit_report.render_clean_comment(
+            DECLARING_AUDIT, self.validate(doc), NOW
+        )
+        rows = [line for line in comment.splitlines() if "acme/terraform-live" in line]
+        self.assertEqual(len(rows), audit_report.MAX_DECLARED_ROWS)
+        self.assertIn("…and 5 more", comment)
+        self.assertIn(f"{audit_report.MAX_DECLARED_ROWS + 5} posture(s)", comment)
+        self.assertNotIn("comment truncated", comment)
+
+    def test_the_clean_comment_is_unchanged_without_declarations(self):
+        comment = audit_report.render_clean_comment(
+            DECLARING_AUDIT, declaring_doc(findings=[]), NOW
+        )
+        self.assertNotIn("posture(s)", comment)
+
+    def test_the_pointer_is_not_clipped_to_a_cell(self):
+        # `repo:path` is followed, not read: a 120-character clip renders a
+        # path that does not exist inside a code span that says it does.
+        repo = "acme/terraform-live-infrastructure-repository"
+        path = (
+            "clusters/prod-us-east-1/workloads/payments/checkout-gateway/"
+            "deployment-and-scaling-policy.tf"
+        )
+        self.assertGreater(len(f"{repo}:{path}"), audit_report.MAX_CELL_CHARS)
+        doc = declaring_doc()
+        doc["declared"] = [make_declared(repo=repo, path=path)]
+        validated = self.validate(doc)
+        body = render_body(validated, generated_at=NOW)
+        self.assertIn(f"`{repo}:{path}`", body)
+        comment = audit_report.render_clean_comment(DECLARING_AUDIT, validated, NOW)
+        self.assertIn(f"`{repo}:{path}`", comment)
+
+    # -- the CLI --------------------------------------------------------------
+
+    def test_a_dry_run_prints_the_section_and_counts_it(self):
+        self.patch_attr("run_cmd", Recorder())
+        self.patch_attr("repo_root_best_effort", lambda: self.tmp_path)
+        doc = declaring_doc()
+        doc["declared"] = [make_declared()]
+        rc = self.run_finish(doc, audit=DECLARING_AUDIT, argv_extra=("--dry-run",))
+        self.assertEqual(rc, 0)
+        self.assertIn("## Declared intent", self.out)
+        self.assertIn("DECLARED: 1 posture(s)", self.err)
+
+    def test_a_dry_run_rejects_a_posture_listed_twice(self):
+        self.patch_attr("run_cmd", Recorder())
+        finding = make_finding(check="no-pdb")
+        doc = declaring_doc(findings=[finding])
+        doc["declared"] = [
+            make_declared(
+                check=finding["check"], namespace=finding["namespace"], obj=finding["object"]
+            )
+        ]
+        rc = self.run_finish(doc, audit=DECLARING_AUDIT, argv_extra=("--dry-run",))
+        self.assertEqual(rc, 2)
+        self.assertIn("listed as a finding and as declared", self.err)
+        self.assertNotIn("## Findings", self.out)
+
+
 class TestAiSecurityAuditStream(BaseTestCase):
     """The AI stream driven through validate, coverage and render together.
 
@@ -3509,12 +3986,13 @@ class TestAiSecurityAuditStream(BaseTestCase):
 # --------------------------------------------------------------------------- #
 
 
-def bulk_findings(count, severity="minor", prefix="f"):
+def bulk_findings(count, severity="minor", prefix="f", check="netpol-missing"):
     """`count` findings with distinct ids and SOP-shaped prose."""
     return [
         make_finding(
             fid=f"{prefix}-{i:04d}",
             severity=severity,
+            check=check,
             title=f"Finding {i}: workload deviates from the baseline",
             namespace=f"ns-{i:04d}",
             obj=f"Deployment/app-{i:04d}",
