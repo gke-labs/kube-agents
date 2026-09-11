@@ -1759,19 +1759,19 @@ write_tfvars_from_state() {
     fi
     echo ""
     local chat_topic="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
-    local chat_sub="${CHAT_SUB_NAME:-}"
-    local state_sub="" state_rc=0
-    state_sub="$(tf_state_chat_subscription_name)" || state_rc=$?
-    if [ "$state_rc" -eq "$TF_STATE_RC_UNREADABLE" ]; then
-      print_warning "Could not determine if Google Chat Pub/Sub subscription is in Terraform state (see above); proceeding with configuration."
-    fi
+    local chat_sub="${CHAT_SUB_NAME:-$DEFAULT_CHAT_SUB_NAME}"
+    if [ "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}" = "true" ]; then
+      local state_sub="" state_rc=0
+      state_sub="$(tf_state_chat_subscription_name)" || state_rc=$?
+      if [ "$state_rc" -eq "$TF_STATE_RC_UNREADABLE" ]; then
+        print_warning "Could not determine if Google Chat Pub/Sub subscription is in Terraform state (see above); proceeding with configuration." >&2
+      fi
 
-    if [ -n "$state_sub" ]; then
-      chat_sub="$state_sub"
-    elif [ -n "$chat_sub" ] && [ "$chat_sub" != "$DEFAULT_CHAT_SUB_NAME" ]; then
-      chat_sub="$chat_sub"
-    else
-      chat_sub="$(derive_chat_sub_name "$chat_topic")"
+      if [ -n "$state_sub" ]; then
+        chat_sub="$state_sub"
+      elif [ -z "${CHAT_SUB_NAME:-}" ] || [ "$CHAT_SUB_NAME" = "$DEFAULT_CHAT_SUB_NAME" ]; then
+        chat_sub="$(derive_chat_sub_name "$chat_topic")"
+      fi
     fi
     echo "enable_google_chat        = $(hcl_bool "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}")"
     echo "chat_topic_name           = $(hcl_str "$chat_topic")"

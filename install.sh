@@ -2598,17 +2598,17 @@ run_menu_system() {
   local allowed_users="${ALLOWED_USERS:-}"
   local chat_topic_name="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
   local chat_sub_name="${CHAT_SUB_NAME:-}"
-  local state_sub="" state_rc=0
-  state_sub="$(tf_state_chat_subscription_name "$project_id" "$cluster_name")" || state_rc=$?
-  if [ "$state_rc" -eq "$TF_STATE_RC_UNREADABLE" ]; then
-    print_warning "Could not determine if Google Chat Pub/Sub subscription is in Terraform state (see above); proceeding with configuration."
-  fi
-  if [ -n "$state_sub" ]; then
-    chat_sub_name="$state_sub"
-  elif [ -n "$chat_sub_name" ] && [ "$chat_sub_name" != "$DEFAULT_CHAT_SUB_NAME" ]; then
-    chat_sub_name="$chat_sub_name"
-  else
-    chat_sub_name="$(derive_chat_sub_name "$chat_topic_name")"
+  if [ "$google_chat_enabled" = "true" ]; then
+    local state_sub="" state_rc=0
+    state_sub="$(tf_state_chat_subscription_name "$project_id" "$cluster_name")" || state_rc=$?
+    if [ "$state_rc" -eq "$TF_STATE_RC_UNREADABLE" ]; then
+      print_warning "Could not determine if Google Chat Pub/Sub subscription is in Terraform state (see above); proceeding with configuration." >&2
+    fi
+    if [ -n "$state_sub" ]; then
+      chat_sub_name="$state_sub"
+    elif [ -z "$chat_sub_name" ] || [ "$chat_sub_name" = "$DEFAULT_CHAT_SUB_NAME" ]; then
+      chat_sub_name="$(derive_chat_sub_name "$chat_topic_name")"
+    fi
   fi
   local permission_set="${PLATFORM_AGENT_PERMISSION_SET:-$DEFAULT_PERMISSION_SET}"
   local custom_roles="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
@@ -3215,7 +3215,7 @@ main() {
     local state_sub="" state_rc=0
     state_sub="$(tf_state_chat_subscription_name "$project_id" "$cluster_name")" || state_rc=$?
     if [ "$state_rc" -eq "$TF_STATE_RC_UNREADABLE" ]; then
-      print_warning "Could not determine if Google Chat Pub/Sub subscription is in Terraform state (see above); proceeding with configuration."
+      print_warning "Could not determine if Google Chat Pub/Sub subscription is in Terraform state (see above); proceeding with configuration." >&2
     fi
 
     local default_sub

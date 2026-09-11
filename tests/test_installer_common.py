@@ -1028,9 +1028,9 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn('chat_topic_name           = "custom-chat-events"', content)
             self.assertIn('chat_subscription_name    = "custom-chat-events-sub"', content)
 
-            # 7. Unreadable state emits a warning and proceeds
+            # 7. Unreadable state emits a warning to stderr (not into tfvars stdout) and proceeds
             proc = self._run(
-                f'print_warning() {{ echo "WARN: $*" >&2; }}; write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                f'print_warning() {{ echo "WARN: $*"; }}; write_tfvars_from_state "{dest}"; echo "rc=$?"',
                 gcloud_stderr="ERROR: 403 Forbidden",
                 gcloud_exit=1,
                 env={
@@ -1041,6 +1041,26 @@ class InstallerCommonTest(unittest.TestCase):
             )
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             self.assertIn("Could not determine if Google Chat Pub/Sub subscription is in Terraform state", proc.stderr)
+            content = dest.read_text()
+            self.assertNotIn("Could not determine", content)
+            self.assertNotIn("WARN:", content)
+            self.assertIn('chat_topic_name           = "custom-chat-events"', content)
+            self.assertIn('chat_subscription_name    = "custom-chat-events-sub"', content)
+
+            # 8. Chat disabled never probes state even if state is unreadable
+            proc = self._run(
+                f'print_warning() {{ echo "WARN: $*"; }}; write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                gcloud_stderr="ERROR: 403 Forbidden",
+                gcloud_exit=1,
+                env={
+                    "API_SERVER_KEY": "k",
+                    "GOOGLE_CHAT_ENABLED": "false",
+                    "CHAT_TOPIC_NAME": "custom-chat-events",
+                },
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertNotIn("Could not determine", proc.stderr)
+            self.assertNotIn("WARN:", proc.stderr)
 
     def test_tf_state_chat_subscription_name_returns_name(self):
         state = _state_doc([{

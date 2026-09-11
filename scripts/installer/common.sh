@@ -628,11 +628,11 @@ ensure_teardown_state() {
         print_warning "Could not determine if Google Chat Pub/Sub subscription is in Terraform state (see above); proceeding with configuration."
       fi
       if [ -n "$state_sub" ]; then
-        export CHAT_SUB_NAME="$state_sub"
-      elif [ -n "${CHAT_SUB_NAME:-}" ] && [ "$CHAT_SUB_NAME" != "$DEFAULT_CHAT_SUB_NAME" ]; then
-        export CHAT_SUB_NAME="$CHAT_SUB_NAME"
-      else
-        export CHAT_SUB_NAME="$(derive_chat_sub_name "$CHAT_TOPIC_NAME")"
+        CHAT_SUB_NAME="$state_sub"
+        export CHAT_SUB_NAME
+      elif [ -z "${CHAT_SUB_NAME:-}" ] || [ "$CHAT_SUB_NAME" = "$DEFAULT_CHAT_SUB_NAME" ]; then
+        CHAT_SUB_NAME="$(derive_chat_sub_name "$CHAT_TOPIC_NAME")"
+        export CHAT_SUB_NAME
       fi
     else
       export CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-}"
