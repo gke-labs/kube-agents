@@ -249,6 +249,30 @@ class StormAndSetupTest(unittest.TestCase):
         self.assertEqual(verdict["do"], classify.DO_SETUP)
         self.assertFalse(classify_run(target, [target])["matches_incident"])
 
+    def test_a_lost_pod_is_run_level_and_never_a_setup_death(self):
+        # The build node went away (#1478): zero tasks, FAILURE, no build
+        # log, NodeNotReady -- at any duration, including under five minutes.
+        for minutes in (2, 128):
+            raw = {"build_id": "1", "pr": 1118, "result": "failure", "started": "2026-09-11T12:11:04+00:00", "finished": "2026-09-11T14:19:16+00:00", "duration_s": minutes * 60, "tasks": [], "has_build_log": False, "pod_phase": "Failed", "pod_node": "gke-kube-agents-prow-default-pool-eb220b2a-sgnk", "pod_last_event": "NodeNotReady"}
+            self.assertTrue(classify.is_lost_pod(raw))
+            self.assertFalse(classify.is_setup_death(raw))
+            verdict = classify.classify_run(raw, [raw], None, admitted=frozenset())
+            self.assertEqual(verdict["headline"], f"The build node running this job went away {minutes} minutes in.")
+            self.assertIn("lost gke-kube-agents-prow-default-pool-eb220b2a-sgnk mid-run", verdict["lede"])
+            self.assertEqual((verdict["verdict"], verdict["setup_death"], verdict["matches_incident"]), ("infra", False, False))
+            self.assertEqual(verdict["do"], classify.DO_LOST_POD)
+        lost = {"state": "DEGRADED", "condition": "lost_pods", "failing_cases": []}
+        verdict = classify.classify_run(raw, [raw], lost, admitted=frozenset())
+        self.assertTrue(verdict["matches_incident"])
+        self.assertIn("Other PRs lost their runs the same way right now.", verdict["lede"])
+        # Missing log alone is enough; an old document with neither field
+        # is unknown and falls through to the setup-death rule.
+        self.assertTrue(classify.is_lost_pod(dict(raw, pod_last_event=None, pod_node=None)))
+        self.assertFalse(classify.is_lost_pod(dict(raw, has_build_log=True, pod_last_event="Started")))
+        legacy = {k: v for k, v in raw.items() if k not in ("has_build_log", "pod_phase", "pod_node", "pod_last_event")}
+        self.assertFalse(classify.is_lost_pod(legacy))
+        self.assertTrue(classify.is_setup_death(dict(legacy, duration_s=120)))
+
     def test_a_zero_task_green_is_a_revalidated_push(self):
         # hack/ci-eval-pr.sh step 0: inert paths changed, the earlier green stands.
         verdict = classify_run(run(1, 913, T0, minutes=4, result="SUCCESS"), [])

@@ -235,6 +235,18 @@ type PlatformAgentReconciler struct {
 // The split credential broker verifies its callers with a TokenReview. The operator has to
 // hold that permission in order to grant it; it confers no read access and cannot mint a token.
 // +kubebuilder:rbac:groups=authentication.k8s.io,resources=tokenreviews,verbs=create
+//
+// The A2A auth callout also verifies callers with a TokenReview, and under mode next the
+// operator binds it to the built-in system:auth-delegator ClusterRole. RBAC escalation
+// prevention refuses that binding unless the operator either holds every permission in the
+// role it is granting or holds `bind` on that role by name. It holds tokenreviews/create
+// above but not subjectaccessreviews/create, which system:auth-delegator also carries — so
+// without this line the binding is refused at runtime and the callout never gets TokenReview,
+// on every install that turns next on. Measured against a real API server, not inferred:
+// without it, "attempting to grant RBAC permissions not currently held"; with it, allowed.
+// `bind` scoped by resourceNames is the narrow form — it permits granting this one role and
+// confers none of its permissions on the operator itself.
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles,resourceNames="system:auth-delegator",verbs=bind
 // `get` and nothing else on secrets, and checkShellSandboxKeys is the only caller. It asks
 // whether the sandbox's authorized-keys Secret exists so the status can say so; it never reads
 // a value out of one, and the operator creates that Secret nowhere. The read goes through
@@ -245,7 +257,7 @@ type PlatformAgentReconciler struct {
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get
 // +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
 
-func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (_ ctrl.Result, retErr error) {
 	log := logf.FromContext(ctx)
 
 	instance := &agentv1alpha1.PlatformAgent{}
@@ -324,6 +336,45 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	_, modeErr := resolveMode(instance)
 	if modeErr != nil {
 		log.Info("Unrecognized spec.mode; rendering today's stack and reporting Degraded", "error", modeErr.Error())
+	}
+
+	// 2d. BusCredentialsReady, written on the way out rather than at a point in
+	// the sequence below.
+	//
+	// It was at the bottom, under everything, which meant a reconcile that
+	// parked Degraded above it neither wrote it nor cleared it. Moving it up to
+	// just after the bus step fixed two of those parks and left four: the
+	// refusals of today's stack at 9b, 9c, 10 and 11e all return above the bus
+	// step, and the bus step cannot move above them because it renders on top
+	// of what they withhold. There is no position in the sequence that works,
+	// so this is not a position in the sequence.
+	//
+	// Skipping the write is worse than it sounds, and the reason is
+	// updateStatusDegraded: it writes Ready alone and preserves every other
+	// condition, so the last BusCredentialsReady stands unchallenged for as
+	// long as the refusal does. The CR reports a callout serving a named map
+	// version through a Deployment that may since have lost every replica.
+	//
+	// Version skew is the one case with nothing to say. renderMode fails closed
+	// to today while cleanupA2A is deliberately not run (see the mode gate
+	// below), so the bus a newer CRD rendered is still standing; clearing the
+	// condition would report it gone, and rewriting it would claim this binary
+	// knows what it describes. Both are worse than leaving it.
+	busCredsMapVersion := ""
+	if modeErr == nil {
+		wantNext := renderMode(instance, "nats") == ModeNext
+		defer func() {
+			if err := r.syncBusCredentialsReady(ctx, instance, wantNext, busCredsMapVersion); err != nil {
+				if retErr == nil {
+					retErr = err
+					return
+				}
+				// The reconcile is already failing and will requeue. Losing
+				// this write is not what to report about that pass, but it is
+				// not nothing either: the condition is a pass behind.
+				log.Error(err, "could not write BusCredentialsReady")
+			}
+		}()
 	}
 
 	// 3. Reconcile Service Account (with Workload Identity annotation)
@@ -545,6 +596,13 @@ func (r *PlatformAgentReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
+	// The version this pass rendered, for the deferred write at 2d. Empty on
+	// every path that did not get here, where the write reads it back off the
+	// ConfigMap the callout watches instead.
+	if a2aNext {
+		busCredsMapVersion = a2aState.AuthMapVersion
+	}
+
 	// 9. Update status phase. While the mode is unrecognized the phase is
 	// Degraded with a named reason — silently rendering today at that point
 	// would leave nothing in `kubectl describe` saying the cluster runs
@@ -662,6 +720,25 @@ func (r *PlatformAgentReconciler) handleDeletion(ctx context.Context, agent *age
 			return ctrl.Result{}, err
 		}
 		if err := r.cleanupAgentRBAC(ctx, agent, true); err != nil {
+			return ctrl.Result{}, err
+		}
+
+		// The auth callout's ClusterRoleBinding, which nothing else reclaims.
+		//
+		// It is cluster-scoped, so it carries no owner reference — the garbage
+		// collector treats a cluster-scoped object owned by a namespaced one as
+		// an orphan and deletes it immediately, which is worse than leaking it.
+		// cleanupAgentRBAC's two label sweeps do not reach it either: the first
+		// selects agent-name/agent-namespace labels that commonLabels does not
+		// set, the second selects part-of=kube-agents which a2aLabels overrides
+		// to a2a-next, and both then require a kubeagents-prefixed name.
+		//
+		// Left behind, it is a standing grant of tokenreviews/create and
+		// subjectaccessreviews/create to a ServiceAccount name in a namespace,
+		// surviving the workload it was minted for — so anyone who can later
+		// create a ServiceAccount of that name inherits it. cleanupA2A reaps it
+		// on a mode flip; this is the other way the stack can go away.
+		if err := r.deleteA2ACalloutClusterRoleBinding(ctx, agent); err != nil {
 			return ctrl.Result{}, err
 		}
 

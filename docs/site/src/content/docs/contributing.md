@@ -69,7 +69,13 @@ where a new one belongs, `docs/testing-map.md` maps the ten test homes to their 
 - **A2A module** (if you touched `a2a/`):
 
   ```bash
-  cd a2a && go vet ./... && go test -race ./...   # what the A2A Module Tests CI job runs; the conformance suite uses an embedded JetStream server, no cluster needed
+  cd a2a && go vet ./... && go test -race ./...   # the conformance suite uses an embedded JetStream server, no cluster needed
+  # The CI job additionally installs the envtest binaries and the nats CLI; without them the
+  # auth callout's API-server and CLI cases skip and the run still reports green. To match it:
+  #   KUBEBUILDER_ASSETS="$(make -C ../k8s-operator -s envtest-path)" go test -race ./...
+  # The path is relative to a2a/, which is where the cd above leaves you. Get it wrong and make
+  # fails, the substitution yields empty, and the cases skip exactly as if you had not set it.
+  # docs/testing-map.md is canonical for which suite runs where.
   ```
 
 - **Integration seams** (if you touched a component that another one talks to across a process, language, or protocol boundary):

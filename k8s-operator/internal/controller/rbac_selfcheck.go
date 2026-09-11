@@ -53,7 +53,7 @@ import (
 // the cause.
 //
 // The probe never runs on the reconcile worker. It is one
-// SelfSubjectAccessReview per (verb, resource) — 179 of them — and the
+// SelfSubjectAccessReview per (verb, resource) — 193 of them today — and the
 // PlatformAgent controller has a single worker, so a reconcile that paid for
 // the round trips would stall every agent for their duration. The checker is
 // a manager Runnable that re-probes on its own ticker under a deadline;
@@ -103,6 +103,15 @@ type requiredPermission struct {
 	Group     string
 	Resources []string
 	Verbs     []string
+
+	// Name scopes the probe to one object, matching a marker that carries
+	// resourceNames. It is not optional decoration: a grant scoped by
+	// resourceNames does NOT authorize the unscoped request, so probing
+	// without the name asks for strictly more than the marker declares and
+	// the check reports a shortfall that does not exist. Found live — the
+	// operator reported RBACIncomplete against a ClusterRole that had
+	// exactly the rule it was asking about.
+	Name string
 }
 
 var (
@@ -145,6 +154,12 @@ var requiredPermissions = []requiredPermission{
 	{Group: "networking.gke.io", Resources: []string{"fqdnnetworkpolicies"}, Verbs: rbacWriteVerbs},
 	{Group: "policy", Resources: []string{"poddisruptionbudgets"}, Verbs: rbacWriteVerbs},
 	{Group: "rbac.authorization.k8s.io", Resources: []string{"clusterroles", "clusterrolebindings", "roles", "rolebindings"}, Verbs: rbacWriteVerbs},
+	// `bind` on system:auth-delegator, which the operator uses under mode:
+	// next to grant the auth callout TokenReview. Probed WITH the name,
+	// because the grant is scoped by resourceNames and a scoped grant does
+	// not authorize an unscoped request — probing without it asks for more
+	// than the marker declares and reports a shortfall that is not real.
+	{Group: "rbac.authorization.k8s.io", Resources: []string{"clusterroles"}, Verbs: []string{"bind"}, Name: a2aAuthDelegatorRole},
 	{Group: "authentication.k8s.io", Resources: []string{"tokenreviews"}, Verbs: []string{"create"}},
 	{Group: "apiextensions.k8s.io", Resources: []string{"customresourcedefinitions"}, Verbs: rbacReadVerbs},
 }
@@ -162,6 +177,7 @@ func describePermission(verb, group, resource string) string {
 // of requiredPermissions, in declaration order.
 type permissionTuple struct {
 	group, resource, subresource, verb string
+	name                               string
 	label                              string
 }
 
@@ -171,9 +187,14 @@ func flattenRequiredPermissions() []permissionTuple {
 		for _, fullResource := range permission.Resources {
 			resource, subresource, _ := strings.Cut(fullResource, rbacSubresourceSeparator)
 			for _, verb := range permission.Verbs {
+				label := describePermission(verb, permission.Group, fullResource)
+				if permission.Name != "" {
+					label += " (" + permission.Name + ")"
+				}
 				tuples = append(tuples, permissionTuple{
 					group: permission.Group, resource: resource, subresource: subresource, verb: verb,
-					label: describePermission(verb, permission.Group, fullResource),
+					name:  permission.Name,
+					label: label,
 				})
 			}
 		}
@@ -215,6 +236,7 @@ func probeRBAC(ctx context.Context, reviews authorizationv1client.SelfSubjectAcc
 						Group:       tuple.group,
 						Resource:    tuple.resource,
 						Subresource: tuple.subresource,
+						Name:        tuple.name,
 						Verb:        tuple.verb,
 					},
 				},

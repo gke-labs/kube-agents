@@ -1,0 +1,39 @@
+{
+  "version": "5aacb1bd321669b3",
+  "identities": [
+    {
+      "serviceAccount": "system:serviceaccount:kubeagents-system:agent-a2a-provision",
+      "user": "provision",
+      "account": "APP",
+      "grants": {
+        "publish": [
+          "a2a.topics.agent.platform.upgrade-readiness",
+          "a2a.topics.shared.blueprint",
+          "a2a.topics.shared.annotations",
+          "$JS.API.INFO",
+          "$JS.API.STREAM.NAMES",
+          "$JS.API.STREAM.LIST",
+          "$JS.API.STREAM.CREATE.TASKS",
+          "$JS.API.STREAM.CREATE.DIRECTORY",
+          "$JS.API.STREAM.CREATE.TOPICS-STATE",
+          "$JS.API.STREAM.CREATE.TOPICS-JOURNAL",
+          "$JS.API.STREAM.CREATE.KV_runtime-state",
+          "$JS.API.STREAM.CREATE.KV_session-state",
+          "$JS.API.STREAM.CREATE.KV_cap",
+          "$JS.API.STREAM.INFO.TASKS",
+          "$JS.API.STREAM.INFO.DIRECTORY",
+          "$JS.API.STREAM.INFO.TOPICS-STATE",
+          "$JS.API.STREAM.INFO.TOPICS-JOURNAL",
+          "$JS.API.STREAM.INFO.KV_runtime-state",
+          "$JS.API.STREAM.INFO.KV_session-state",
+          "$JS.API.STREAM.INFO.KV_cap",
+          "_INBOX.provision.>"
+        ],
+        "subscribe": [
+          "a2a.topics.>",
+          "_INBOX.provision.>"
+        ]
+      }
+    }
+  ]
+}

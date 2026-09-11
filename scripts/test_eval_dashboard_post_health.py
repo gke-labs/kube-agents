@@ -84,6 +84,27 @@ def deaths(since="2026-09-05T13:00:00+00:00", prs=(965, 1121, 1186, 1199)):
     return health("DEGRADED", "setup/clone failures on 4 runs", since=since, condition="setup_deaths", prs=prs, runs=4)
 
 
+# The 2026-09-11 build-cluster event (#1478), as health.py reports it: the
+# losses spanned 14:05:52-14:19:16Z (10:05-10:19 AM EDT) on five nodes.
+NODES_0911 = {
+    "gke-kube-agents-prow-default-pool-eb220b2a-6uhg": 1,
+    "gke-kube-agents-prow-default-pool-eb220b2a-93sl": 2,
+    "gke-kube-agents-prow-default-pool-eb220b2a-er33": 3,
+    "gke-kube-agents-prow-default-pool-eb220b2a-pe72": 3,
+    "gke-kube-agents-prow-default-pool-eb220b2a-sgnk": 3,
+}
+PRS_0911 = (926, 1118, 1246, 1258, 1319, 1351, 1362, 1439, 1451, 1456, 1460, 1471)
+
+
+def lost_pods(since="2026-09-11T14:05:52+00:00", prs=PRS_0911, nodes=None, window=("2026-09-11T14:05:52+00:00", "2026-09-11T14:19:16+00:00"), evidence=()):
+    nodes = NODES_0911 if nodes is None else nodes
+    doc = health("DEGRADED", f"lost pods: {len(prs)} runs on {len(prs)} PRs died with their build node 14:05–14:19 UTC", since=since, condition="lost_pods", prs=prs, runs=len(prs), window=window)
+    doc["incident"]["nodes"] = dict(nodes)
+    doc["incident"]["event"] = len(prs) >= 8
+    doc["evidence"] = list(evidence)
+    return doc
+
+
 class FakeResponse:
     def __init__(self, status=200):
         self.status = status
@@ -491,7 +512,7 @@ class TrackingIssue(RunHarness):
         self.assertTrue(body["body"].rstrip().endswith("Filed automatically by the smoke health bot; edit freely. Fix PRs: reference this issue."))
         self.assertEqual(self.opener.texts[0].split("\n")[1], "Don't retest yet. Tracking #1300.")
         recorded = self.recorded()
-        self.assertEqual(recorded["issue"], {"number": 1300, "url": "https://github.com/gke-labs/kube-agents/issues/1300"})
+        self.assertEqual(recorded["issue"], {"number": 1300, "url": "https://github.com/gke-labs/kube-agents/issues/1300", "condition": "shared_break"})
         # The same outage growing a case re-posts but does not re-file.
         grown = outage(cases=["cost-idle-pool-probe", "reliability-pdb-probe", "agent-kanban-smoke"], since="2026-09-08T11:30:00+00:00", prs=(1, 2, 3, 4))
         self.tick(grown, T0.replace(hour=15), environ=self.environ())
@@ -539,6 +560,142 @@ class TrackingIssue(RunHarness):
         self.assertEqual(self.gh.writes(), [])
         self.assertIn("--dry-run: would POST repos/gke-labs/kube-agents/issues", err)
         self.assertIn("Smoke gate outage: 1 case failing on every PR since", err)
+
+
+class LostPods(RunHarness):
+    """The build-cluster event of 2026-09-11 (#1478): the message names the
+    nodes' count and the loss on the reader's clock, the cluster owner gets
+    an issue once per event, a human's issue naming the nodes is adopted,
+    and an outage's issue is never cited for it."""
+
+    def environ(self):
+        return {post_health.SPACE_ENV: SPACE, post_health.TOKEN_ENV: TOKEN, **GH_ENV}
+
+    def test_a_build_cluster_event_message(self):
+        self.tick(lost_pods(), T0.replace(day=11, hour=14, minute=30))
+        self.assertEqual(
+            self.opener.texts[0],
+            "🟡 *Smoke gate: flaky* — the build cluster lost 5 nodes at 10:05 AM ET; 12 runs on 12 PRs died mid-run. Not your code; retest once new jobs are running.\n"
+            f"{URL}?since=2026-09-11T14:05:52Z#gate",
+        )
+
+    def test_a_few_lost_pods_say_how_many_without_calling_it_an_event_and_still_file(self):
+        doc = lost_pods(prs=(1, 2, 3), nodes={"gke-kube-agents-prow-default-pool-eb220b2a-er33": 3})
+        self.tick(doc, T0.replace(day=11, hour=14, minute=30), environ=self.environ())
+        self.assertEqual(self.opener.texts[0].split("\n")[0], "🟡 *Smoke gate: flaky* — 3 runs on 3 PRs died with their build node at 10:05 AM ET. Not your code; retest once new jobs are running. Tracking #1300.")
+        # The cluster owner's issue is filed on any new lost_pods condition;
+        # the 8-run bar changes only the wording.
+        self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues")])
+        self.assertEqual(self.gh.calls[-1][2]["title"], "Build cluster lost node(s) gke-kube-agents-prow-default-pool-eb220b2a-er33 at Fri 10:05 AM ET: 3 smoke runs on 3 PRs died mid-run")
+
+    def test_the_cluster_owner_gets_an_issue_once_and_the_message_cites_it(self):
+        now = T0.replace(day=11, hour=14, minute=30)
+        doc = lost_pods(evidence=["lost pods: 12 runs on 12 PRs died with their build node 14:05–14:19 UTC"])
+        rc, _ = self.tick(doc, now, environ=self.environ())
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues")])
+        _, _, body = self.gh.calls[-1]
+        self.assertEqual(body["title"], "Build cluster lost node(s) gke-kube-agents-prow-default-pool-eb220b2a-{6uhg,93sl,er33,pe72,sgnk} at Fri 10:05 AM ET: 12 smoke runs on 12 PRs died mid-run")
+        self.assertEqual(body["labels"], ["presubmit-gate"])
+        text = body["body"]
+        self.assertIn("lost the node(s) below at Fri 10:05 AM ET; 12 `pull-kube-agents-smoke-test` runs on 12 pull requests died mid-run. Each pod's last event is `NodeNotReady`, or the pod never uploaded a build log.", text)
+        self.assertIn("- `gke-kube-agents-prow-default-pool-eb220b2a-6uhg` (1 run)\n- `gke-kube-agents-prow-default-pool-eb220b2a-93sl` (2 runs)\n- `gke-kube-agents-prow-default-pool-eb220b2a-er33` (3 runs)", text)
+        self.assertIn("**Window:** 10:05 AM–10:19 AM ET (2026-09-11T14:05:52+00:00 – 2026-09-11T14:19:16+00:00).", text)
+        self.assertIn("**Affected PRs:** #926, #1118, #1246, #1258, #1319, #1351, #1362, #1439, #1451, #1456, #1460, #1471.", text)
+        self.assertIn("- lost pods: 12 runs on 12 PRs died with their build node 14:05–14:19 UTC", text)
+        self.assertIn("**Advice for authors:** nothing about your change; `/retest` once new jobs are progressing.", text)
+        self.assertIn(f"Incident brief: {URL}?since=2026-09-11T14:05:52Z#gate", text)
+        self.assertTrue(text.rstrip().endswith("Filed automatically by the smoke health bot; the cluster owner should check the node events and autorepair; the bot will not close it."))
+        self.assertTrue(self.opener.texts[0].split("\n")[0].endswith("retest once new jobs are running. Tracking #1300."))
+        self.assertEqual(self.recorded()["issue"], {"number": 1300, "url": "https://github.com/gke-labs/kube-agents/issues/1300", "condition": "lost_pods"})
+        # The same event on the next tick: nothing posted, nothing filed.
+        self.tick(doc, now.replace(minute=45), environ=self.environ())
+        self.assertEqual(len(self.gh.writes()), 1)
+        self.assertEqual(len(self.opener.requests), 1)
+
+    def test_a_human_issue_naming_the_nodes_is_adopted(self):
+        human = {"number": 1478, "html_url": "https://github.com/gke-labs/kube-agents/issues/1478", "title": "Build-cluster nodes went NotReady", "body": "nodes gke-kube-agents-prow-default-pool-eb220b2a-pe72 and gke-kube-agents-prow-default-pool-eb220b2a-sgnk"}
+        gh = FakeGh(open_issues=[human])
+        doc = lost_pods(prs=(1, 2, 3, 4, 5, 6, 7, 8), nodes={"gke-kube-agents-prow-default-pool-eb220b2a-pe72": 5, "gke-kube-agents-prow-default-pool-eb220b2a-sgnk": 3})
+        self.tick(doc, T0.replace(day=11, hour=14, minute=30), environ=self.environ(), gh=gh)
+        self.assertEqual(gh.writes(), [], "nothing filed")
+        self.assertIn("Tracking #1478.", self.opener.texts[0])
+        self.assertEqual(self.recorded()["issue"]["condition"], "lost_pods")
+        # An issue naming only one of the two nodes is not this event's.
+        partial = FakeGh(open_issues=[dict(human, body="gke-kube-agents-prow-default-pool-eb220b2a-pe72 only")])
+        self.state.unlink()
+        self.tick(doc, T0.replace(day=11, hour=15), environ=self.environ(), gh=partial)
+        self.assertEqual(partial.writes(), [("POST", "repos/gke-labs/kube-agents/issues")])
+
+    def test_an_outage_issue_is_not_the_lost_pods_tracking_nor_the_reverse(self):
+        self.tick(outage(cases=["a-probe"], since="2026-09-11T12:00:00+00:00", prs=(1, 2, 3)), T0.replace(day=11, hour=12), environ=self.environ())
+        self.assertEqual(self.recorded()["issue"]["number"], 1300)
+        # The break clears and the nodes go: DEGRADED lost_pods is a change,
+        # and the outage's #1300 is not its tracking issue.
+        self.tick(lost_pods(), T0.replace(day=11, hour=14, minute=30), environ=self.environ())
+        self.assertEqual(self.gh.writes()[-1], ("POST", "repos/gke-labs/kube-agents/issues"))
+        self.assertIn("Tracking #1301.", self.opener.texts[-1])
+        recorded = self.recorded()
+        self.assertEqual(recorded["issue"], {"number": 1301, "url": "https://github.com/gke-labs/kube-agents/issues/1301", "condition": "lost_pods"})
+        self.assertEqual([issue["number"] for issue in recorded["issues"]], [1300, 1301], "the outage's issue still rides along")
+        # And back up to an OUTAGE: #1301 is the cluster owner's and is not
+        # cited; the episode's own outage issue #1300 still rides along and
+        # is, so nothing new is filed.
+        self.tick(outage(cases=["b-probe"], since="2026-09-11T15:00:00+00:00", prs=(4, 5, 6)), T0.replace(day=11, hour=15), environ=self.environ())
+        self.assertIn("Tracking #1300.", self.opener.texts[-1])
+        self.assertEqual(len([1 for method, path in self.gh.writes() if path == "repos/gke-labs/kube-agents/issues"]), 2, "two issues in the episode, no third")
+        # GREEN: every issue of the episode gets the recovery comment, and
+        # the message names them all.
+        self.tick(health(), T0.replace(day=11, hour=17), environ=self.environ())
+        recovered = [path for method, path in self.gh.writes() if method == "POST" and path.endswith("/comments")]
+        self.assertEqual(recovered, [f"repos/gke-labs/kube-agents/issues/{n}/comments" for n in (1300, 1301)])
+        self.assertIn("#1300, #1301)", self.opener.texts[-1].split("\n")[0])
+        self.assertEqual((self.recorded()["issue"], self.recorded()["issues"]), (None, []))
+
+    def test_an_outage_that_decays_into_a_storm_still_gets_its_recovery_comment(self):
+        # The 2026-09-02 shape: the break clears, the storm is what is left,
+        # then GREEN. The outage's issue is not the storm's tracking, but it
+        # rides in the state until the recovery comments on it.
+        self.tick(outage(cases=["a-probe"], since="2026-09-04T09:00:00+00:00", prs=(1, 2, 3)), T0, environ=self.environ())
+        self.tick(storm(since="2026-09-04T13:00:00+00:00"), T0.replace(hour=13), environ=self.environ())
+        self.assertNotIn("Tracking", self.opener.texts[-1])
+        self.assertEqual((self.recorded()["issue"], [i["number"] for i in self.recorded()["issues"]]), (None, [1300]))
+        self.tick(health(), T0.replace(hour=15, minute=30), environ=self.environ())
+        self.assertEqual(self.gh.writes()[-1], ("POST", "repos/gke-labs/kube-agents/issues/1300/comments"))
+        self.assertEqual(self.gh.calls[-1][2], {"body": "Healthy again after 2h 30m; bot will not close it."})
+        self.assertEqual(self.opener.texts[-1].split("\n")[0], "🟢 *Smoke gate: healthy again* — fixed after 2h 30m (quota storm, #1300).")
+        # A state file from before `issues` existed: its lone `issue` is
+        # the episode's, and gets the comment too.
+        self.state.write_text(json.dumps(dict(self.recorded(), state="DEGRADED", condition="storm", since="2026-09-04T13:00:00+00:00", issue={"number": 1200, "url": "x"}, issues=None)))
+        self.tick(health(), T0.replace(hour=18), environ=self.environ())
+        self.assertEqual(self.gh.writes()[-1], ("POST", "repos/gke-labs/kube-agents/issues/1200/comments"))
+
+    def test_the_recovery_names_the_lost_nodes_and_the_issue(self):
+        self.tick(lost_pods(), T0.replace(day=11, hour=14, minute=30), environ=self.environ())
+        self.tick(health(), T0.replace(day=11, hour=16), environ=self.environ())
+        # `since` is the first loss, 14:05:52Z; the recovery tick is 16:00Z.
+        self.assertEqual(self.opener.texts[1].split("\n")[0], "🟢 *Smoke gate: healthy again* — fixed after 1h 54m (the build cluster lost nodes, #1300).")
+        self.assertEqual(self.gh.calls[-1][2], {"body": "Healthy again after 1h 54m; bot will not close it."})
+        self.assertIsNone(self.recorded()["issue"])
+
+    def test_dry_run_prints_the_cluster_owner_issue_instead_of_filing_it(self):
+        rc, err = self.tick(lost_pods(), T0.replace(day=11, hour=14, minute=30), environ={}, dry_run=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.gh.writes(), [])
+        self.assertIn("--dry-run: would POST repos/gke-labs/kube-agents/issues", err)
+        self.assertIn("Build cluster lost node(s) gke-kube-agents-prow-default-pool-eb220b2a-{6uhg,93sl,er33,pe72,sgnk} at Fri 10:05 AM ET", err)
+
+    def test_the_title_compacts_the_node_names_and_stays_under_githubs_limit(self):
+        compact = post_health.gate_issue.compact_nodes
+        self.assertEqual(compact([]), "(node name not recorded)")
+        self.assertEqual(compact(["gke-a-b-1"]), "gke-a-b-1")
+        self.assertEqual(compact(["gke-pool-1-aaaa", "gke-pool-1-bbbb"]), "gke-pool-1-{aaaa,bbbb}")
+        self.assertEqual(compact(["gke-pool-1-aaaa", "gke-pool-2-bbbb"]), "gke-pool-{1-aaaa,2-bbbb}")
+        self.assertEqual(compact(["alpha", "beta"]), "alpha, beta")
+        many = {f"gke-kube-agents-prow-pool-{i:02d}-node-{i:04d}": 1 for i in range(12)}
+        title = post_health.gate_issue.render_lost_pods_title(lost_pods(nodes=many), "Fri 10:05 AM ET")
+        self.assertLessEqual(len(title), post_health.gate_issue.TITLE_MAX_CHARS)
+        self.assertTrue(title.startswith("Build cluster lost 12 nodes at Fri 10:05 AM ET: 12 smoke runs"), title)
 
 
 # --------------------------------------------------------------------------- #

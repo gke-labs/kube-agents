@@ -160,6 +160,33 @@ the same layout and is collected from the moment it starts running.
   a missing binary or a timed-out call stops further calls for the rest of
   the pass.
 
+- `has_build_log`, `pod_phase`, `pod_node`, `pod_last_event` — **optional,
+  additive**: how the build ended. A pod whose node went NotReady mid-run
+  (twelve runs on 2026-09-11, #1478) leaves `finished.json`, `podinfo.json`
+  and **no** `build-log.txt`, and lands here as a zero-task `FAILURE` of any
+  duration — the same shape as a clone failure, which does have a log. So
+  for a build with no build log, or one that concluded `FAILURE` with no
+  tasks, the collector reads Prow's `podinfo.json` (the pod record and its
+  events) as well — one extra object per such build, none for a build that
+  ran — and records `pod_phase` (`status.phase`),
+  `pod_node` (`spec.nodeName`) and `pod_last_event` (the `reason` of the
+  newest event by `lastTimestamp`/`eventTime`/creation, upload order
+  breaking ties), each `null` when the record lacks it. `has_build_log` is
+  `true` for a build with a log. Without one the collector reads the log a
+  second time, then lets the pod record decide: `false` when
+  `podinfo.json` answered and its `sidecar` container is still `running`
+  (the kubelet stopped reporting, so Prow's uploader never ran and there is
+  no log anywhere); any other sidecar state means a log was uploaded —
+  `terminated` on the way out, `waiting` when the clone stage failed and
+  initupload wrote it — so the miss is a failed read, `has_build_log` is
+  left **absent** and only the `pod_*` trio is written; a bucket that
+  served neither file leaves all four absent. A
+  zero-task `FAILURE` with a log but no readable `podinfo.json` carries
+  `has_build_log: true` alone. Absent means unknown; consumers treat a run
+  without the fields as neither a lost pod nor anything else. Runs carried
+  over by `--merge-with` keep whatever they have (older documents have
+  none).
+
 A truncated log yields a **partial run** (fewer tasks, fallback duration),
 never an error. A task line whose name matches nothing under `bench/tasks/`
 on the current checkout still parses; only its domain lookup degrades (see
@@ -303,6 +330,13 @@ what the renderer does with them.
   are excluded from every pass-fraction denominator, exactly like `infra`
   task results. When `reps` is absent the task's single `result` stands in
   for one rep.
+- `runs[].has_build_log`, `runs[].pod_*` — a zero-task `FAILURE` with
+  `pod_last_event: "NodeNotReady"` or `has_build_log: false` is a **lost
+  pod**: `classify.py` gives it its own run-level headline (`infra`, never
+  the branch's), `health.py` counts it under the `lost_pods` condition and
+  never as a setup death, and `gate_comment.py` leaves the one-line "run
+  lost" comment on its pull request. Absent fields make none of that
+  happen.
 
 ### `coverage` — from `docs/designs/domains.yaml`
 
@@ -516,12 +550,18 @@ changed right before" and the Grid its merge markers).
 `health.json` is the CI health adjudicator's verdict, published beside
 `data.json` (nothing in this directory writes it); the fields read are
 `state` (`GREEN|DEGRADED|OUTAGE`), `condition`
-(`shared_break|storm|setup_deaths`), `since`, `cause`, `advice`,
+(`shared_break|storm|setup_deaths|lost_pods`), `since`, `cause`, `advice`,
 `failing_cases`, `tracking_issues`, `incident`, `recovering`, `stale`,
 `generated_at`, `tick`. Any other state, or an unreadable file, means no
 verdict: the Brief says no verdict is published and shows the last 24
 hours in numbers and the runs, the PR view classifies from the runs alone
-and shows no gate banner. Only a `GREEN` verdict reads as healthy.
+and shows no gate banner. Only a `GREEN` verdict reads as healthy. For
+`lost_pods` the `incident` also carries `nodes` (`{node name: runs lost on
+it}`) and `event` (`true` when the loss counts as a build-cluster event);
+the pages give it the same 2-hour lead on the Brief's window as a storm and
+a run-page banner of its own, and otherwise show the generic degraded
+headline. `issue` (`{number, url}`) may carry `condition`, the one it was
+filed for.
 
 `health-history.jsonl` is one JSON object per line, each the full
 `health.json` document as published at that tick plus
@@ -555,6 +595,17 @@ token observed in the wild (`pass`, `fail`, `infra`, `blocked`):
 | 2094432646640701440 | PR 1057 — parallel fan-out, green, one infra rep |
 | 2094467976156680192 | PR 1075 — serial markers, aborted mid-task       |
 | 2094714569262895104 | PR 1089 — blocked/infra-heavy, >300-char reasons |
+
+`testdata_lostpod/` holds two **real** builds of 2026-09-11 (#1478), the two
+zero-task shapes the health adjudicator has to tell apart. `started.json` /
+`finished.json` are verbatim; `podinfo.json` is trimmed to the pod's
+metadata, node, phase, container states and events (the values are real);
+PR 1446's build log keeps the clone header and the failing tail:
+
+| build               | why it is here                                                                                    |
+| ------------------- | ------------------------------------------------------------------------------------------------- |
+| 2098383791838990336 | PR 1118 — node went NotReady 2h08m in; no build-log.txt; `has_build_log: false`                   |
+| 2098418565454499840 | PR 1446 — clone failed (merge conflict) in 0 s; log present, last event `Started`, phase `Failed` |
 
 `testdata_rc/` holds one **real** `post-kube-agents-eval-rc` build — the
 release-candidate job, which is a postsubmit, so its `started.json` carries no
@@ -590,7 +641,12 @@ consumers compare it case-insensitively. `testdata_health/roster-history.json` i
 `BOOTSTRAP_ADMITTED` roster per era over the same week, taken from the
 commits that changed it. Together they are the replay fixture
 `scripts/test_eval_dashboard_health.py` asserts the week's incident
-timeline against.
+timeline against. `testdata_health/lost-pods-2026-09-11.json.gz` is the same
+cut of the published `data.json` for 2026-09-11 (#1478) — the day five build
+nodes went NotReady — with its twenty zero-task reds re-read by
+`collect.build_run` so they carry `has_build_log` and the `pod_*` trio
+(`trim` keeps those fields when the source has them); the same test file
+asserts it reads as `lost_pods` and not as setup deaths.
 
 `testdata_classify/incidents.json.gz` holds a published `data.json`'s runs
 for two windows of the week of 2026-09-01 (PR #913's last runs on 09-04/05;

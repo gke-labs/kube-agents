@@ -15,8 +15,10 @@ collector emits beyond the v1 core: `tasks[].reps` (per-repetition grading
 detail, present only when the log carries `rep N:` grading lines),
 `runs[].pr_merged` (whether the run's PR had merged at collection time,
 resolved best-effort through `gh`), `runs[].tier` / `runs[].job` (which job
-produced the run: the presubmit gate, or the nightly periodic below) and
-`releases[]` (release-candidate eval runs, below).
+produced the run: the presubmit gate, or the nightly periodic below),
+`runs[].has_build_log` plus the `runs[].pod_*` trio (how the build ended,
+from Prow's podinfo.json -- read only for a build that looks like a lost
+pod, below) and `releases[]` (release-candidate eval runs, below).
 
 Two tiers, one schema. The presubmit (pull-kube-agents-smoke-test) runs the
 gate matrix on every pull request; the nightly periodic
@@ -27,6 +29,14 @@ on the run so every consumer can keep the nightly out of the gate's verdicts
 (tiers.py). Prow's build ids are one global, start-ordered sequence, so the
 newest presubmit id sits far above every nightly id and a shared watermark
 would skip every night: each source keeps its own.
+
+A build whose node went NotReady mid-run (2026-09-11: twelve runs on five
+nodes, #1478) leaves finished.json (`failure`), podinfo.json and no
+build-log.txt at all; it lands here as a zero-task FAILURE of any duration
+and is indistinguishable from a clone failure without the pod's last event.
+So when a build has no build log, or concluded FAILURE with no tasks,
+podinfo.json is read as well -- one extra object per such build, none for a
+build that ran -- and the pod's phase, node and last event are recorded.
 
 Release candidates are collected separately and land in `releases[]`, never
 in `runs[]`. post-kube-agents-eval-rc drives the same hack/ci-eval-pr.sh, so
@@ -198,6 +208,26 @@ REP_REASON_MAX_CHARS = 300
 # primary signal; the marker is the fallback for lines that carry the literal
 # under another token.
 INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
+
+# Prow's podinfo.json: `{"pod": <v1.Pod>, "events": [<v1.Event>]}`, uploaded
+# by crier when the pod is done. Read only for a build with no build-log.txt
+# or a zero-task FAILURE (module docstring); the three keys below are what
+# the health adjudicator needs to tell a lost pod from a clone failure.
+PODINFO_FILE = "podinfo.json"
+BUILD_LOG_FILE = "build-log.txt"
+# Prow's uploader container. A pod the kubelet stopped reporting on is
+# frozen with its sidecar `running`, and nothing ever uploaded a log; every
+# other sidecar state means a log exists somewhere -- `terminated` uploaded
+# it on the way out, `waiting` means the clone stage failed and initupload
+# wrote it -- so a missing log is then a failed read, not a lost pod.
+SIDECAR_CONTAINER = "sidecar"
+CONTAINER_RUNNING = "running"
+# The build log is the largest object read; a transient gsutil failure on it
+# alone would otherwise look exactly like a pod that never uploaded one.
+LOG_READ_ATTEMPTS = 2
+# Prow's job verdict for a failed build, as finished.json spells it (also
+# seen lowercase in the wild; compared case-insensitively).
+FINISHED_FAILURE = "FAILURE"
 
 # runs[].pr_merged is resolved against this repository. The collector only
 # reads this repo's Prow archive (the --pr-glob defaults in the CI scripts),
@@ -417,6 +447,55 @@ def _iso(ts) -> str | None:
         return None
 
 
+def _event_time(event: dict) -> str:
+    """The sortable timestamp of one v1.Event: lastTimestamp, else eventTime,
+    else the object's creation; "" when none, which sorts first."""
+    for key in ("lastTimestamp", "eventTime"):
+        value = event.get(key)
+        if isinstance(value, str) and value:
+            return value
+    meta = event.get("metadata")
+    created = meta.get("creationTimestamp") if isinstance(meta, dict) else None
+    return created if isinstance(created, str) else ""
+
+
+def parse_podinfo(text: str | None) -> dict | None:
+    """{pod_phase, pod_node, pod_last_event, sidecar_state} from podinfo.json
+    text, or None when there is no parseable document. Each value is None
+    when the pod record lacks it. The last event is the newest by timestamp
+    (list order breaks ties, so an unstamped list reads in upload order).
+    `sidecar_state` is the state key of Prow's uploader container (running,
+    waiting, terminated) -- read by build_run, not written."""
+    if text is None:
+        return None
+    try:
+        info = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(info, dict):
+        return None
+    pod = info.get("pod") if isinstance(info.get("pod"), dict) else {}
+    status = pod.get("status") if isinstance(pod.get("status"), dict) else {}
+    spec = pod.get("spec") if isinstance(pod.get("spec"), dict) else {}
+    events = [e for e in (info.get("events") or []) if isinstance(e, dict)] if isinstance(info.get("events"), list) else []
+    # Scheduled, Pulled, Created and Started all land in one second; among
+    # equal timestamps upload order decides, so the max is taken over the
+    # reversed list and the later-uploaded event wins the tie.
+    last = max(reversed(events), key=_event_time) if events else None
+    reason = last.get("reason") if last else None
+    sidecar_state = None
+    for container in status.get("containerStatuses") or []:
+        if isinstance(container, dict) and container.get("name") == SIDECAR_CONTAINER:
+            state = container.get("state") if isinstance(container.get("state"), dict) else {}
+            sidecar_state = next(iter(state), None)
+    return {
+        "pod_phase": status.get("phase") if isinstance(status.get("phase"), str) else None,
+        "pod_node": spec.get("nodeName") if isinstance(spec.get("nodeName"), str) else None,
+        "pod_last_event": reason if isinstance(reason, str) else None,
+        "sidecar_state": sidecar_state if isinstance(sidecar_state, str) else None,
+    }
+
+
 def build_run(
     build_id: str,
     read,
@@ -454,7 +533,45 @@ def build_run(
         except ValueError:
             started = {}
 
-    parsed = parse_build_log(read("build-log.txt") or "")
+    log_text = None
+    for _attempt in range(LOG_READ_ATTEMPTS):
+        log_text = read(BUILD_LOG_FILE)
+        if log_text is not None:
+            break
+    parsed = parse_build_log(log_text or "")
+    result = finished.get("result")
+
+    # How the build ended (module docstring). A build that ran has a log and
+    # costs no extra read; the two shapes a lost pod leaves -- no log at all,
+    # or a zero-task FAILURE -- pay one read of podinfo.json. `has_build_log`
+    # is written as False only when the pod record corroborates it: the
+    # sidecar is still `running` (SIDECAR_CONTAINER), so nothing was ever
+    # uploaded. Any other sidecar state means a log exists and a miss on it
+    # is a failed read; a bucket that served neither file is unreachable.
+    # Both leave the field out (unknown) rather than guessed.
+    ended: dict = {}
+    zero_task_failure = not parsed["tasks"] and str(result or "").upper() == FINISHED_FAILURE
+    if log_text is None or zero_task_failure:
+        pod = parse_podinfo(read(PODINFO_FILE))
+        if pod is not None:
+            sidecar_state = pod.pop("sidecar_state")
+            if log_text is not None:
+                ended = {"has_build_log": True, **pod}
+            elif sidecar_state == CONTAINER_RUNNING:
+                ended = {"has_build_log": False, **pod}
+            else:
+                print(
+                    f"warning: build {build_id}: build-log.txt could not be read but the pod's sidecar is"
+                    f" {sidecar_state or 'unrecorded'}, so one was uploaded; how it ended is unknown",
+                    file=sys.stderr,
+                )
+                ended = dict(pod)
+        elif log_text is not None:
+            ended = {"has_build_log": True}
+        else:
+            print(f"warning: build {build_id}: no build-log.txt and no readable podinfo.json; how it ended is unknown", file=sys.stderr)
+    else:
+        ended = {"has_build_log": True}
 
     pr = pr_hint
     pull = started.get("pull")
@@ -492,9 +609,10 @@ def build_run(
         "project": parsed["project"],
         "started": _iso(started_ts),
         "finished": _iso(finished_ts),
-        "result": finished.get("result"),
+        "result": result,
         "duration_s": duration_s,
         "tasks": parsed["tasks"],
+        **ended,
     }
 
 
@@ -951,13 +1069,18 @@ def _gcs_reader(base: str, gsutil: str):
     """A build_run/build_release reader over one GCS build directory.
 
     Caches per file: build_run asks for finished.json, started.json and
-    build-log.txt, and build_release re-asks for the log.
+    build-log.txt (and podinfo.json for a build that looks like a lost pod),
+    and build_release re-asks for the log. A failed read is not cached, so
+    build_run's retry of the log is a real second attempt.
     """
-    cache: dict[str, str | None] = {}
+    cache: dict[str, str] = {}
 
     def reader(name: str) -> str | None:
         if name not in cache:
-            cache[name] = _gsutil(["cat", base + name], gsutil)
+            text = _gsutil(["cat", base + name], gsutil)
+            if text is None:
+                return None
+            cache[name] = text
         return cache[name]
 
     return reader
