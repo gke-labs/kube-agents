@@ -4,7 +4,8 @@
 Usage::
 
     python3 scripts/eval_dashboard/render.py --data data.json --out-dir out/ \\
-        [--health health.json] [--health-history health-history.jsonl]
+        [--health health.json] [--health-history health-history.jsonl] \\
+        [--public-url [BASE]]
 
 writes four pages and two data files into ``out/``:
 
@@ -28,15 +29,23 @@ writes four pages and two data files into ``out/``:
   incident history, the recent merges and the release-candidate runs.
   ``data.json`` is copied verbatim beside it.
 
-Every page is rendered in the browser from ``brief.json``
-(``template/page.html.tmpl`` + ``template/pages.js``); every time they show
-is America/Toronto, formatted there. The optional inputs are ``health.json``
-(the CI health adjudicator's verdict, published beside data.json; nothing
-here writes it), ``health-history.jsonl`` (one health.json document per line
-plus a ``tick`` stamp), ``case-notes.yaml`` (``--notes``: a one-line note
-and issue links per case) and ``events.yaml`` (``--events``: the
-human-annotated catch counts). Without any of them the pages show what the
-runs alone support, never an error.
+Every page is rendered in the browser (``template/page.html.tmpl`` +
+``template/pages.js``) from the brief.json document inlined into it as
+``<script type="application/json" id="inline-brief">`` (the verdict it read
+again as ``inline-health``), so a page needs no request beyond itself; the
+60-second poll of the published ``brief.json`` and ``health.json`` is a
+best-effort refresh on top, and a host that answers an XHR with a login
+redirect (storage.cloud.google.com does) just leaves the inlined data on
+screen. ``--public-url`` adds ``<base href>`` so every relative link
+resolves to the published site wherever the browser landed after that
+redirect. Every time the pages show is America/Toronto, formatted there.
+The optional inputs are ``health.json`` (the CI health adjudicator's
+verdict, published beside data.json; nothing here writes it),
+``health-history.jsonl`` (one health.json document per line plus a ``tick``
+stamp), ``case-notes.yaml`` (``--notes``: a one-line note and issue links
+per case) and ``events.yaml`` (``--events``: the human-annotated catch
+counts). Without any of them the pages show what the runs alone support,
+never an error.
 
 Two rules shape everything here:
 
@@ -75,10 +84,11 @@ import sys
 import yaml
 
 try:
-    from . import classify, tiers
+    from . import classify, post_health, tiers
 except ImportError:  # run as a script: python3 scripts/eval_dashboard/render.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     import classify
+    import post_health
     import tiers
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -105,6 +115,16 @@ PAGES = {
 # writes both (health-history.jsonl is appended one line per tick).
 HEALTH_FILE = "health.json"
 HEALTH_HISTORY_FILE = "health-history.jsonl"
+# The ids of the <script type="application/json"> elements each page
+# carries its data in; pages.js boots from them, so the
+# page renders whole without a single fetch (module docstring).
+INLINE_BRIEF_ID = "inline-brief"
+INLINE_HEALTH_ID = "inline-health"
+# Where the pages are published: the directory of the index.html URL the
+# Chat messages (post_health.py) and the gate comment (gate_comment.py's
+# DASHBOARD_ROOT) already link to, so `--public-url` with no value names
+# the host they do rather than a second copy of it.
+PUBLISHED_SITE = post_health.DASHBOARD_URL.rsplit("/", 1)[0]
 # The three states health.json can carry. The pages announce a state with
 # a glyph and the word, never with colour alone.
 HEALTH_STATES = ("GREEN", "DEGRADED", "OUTAGE")
@@ -957,11 +977,11 @@ def brief_document(data: dict, health: dict | None, history: list[dict] | None, 
 # the pages
 
 
-def render_page(page: str, brief: dict, data: dict) -> str:
-    """One of the four pages from the shared template, with brief.json and
-    pages.js inlined. ``page`` is a PAGES key."""
+def render_page(page: str, brief: dict, data: dict, public_url: str | None = None) -> str:
+    """One of the four pages from the shared template, with brief.json (and
+    the health verdict, when there is one) inlined as JSON data elements and
+    pages.js after them. ``page`` is a PAGES key."""
     template = PAGE_TEMPLATE.read_text()
-    script = PAGES_JS.read_text()
     values = {
         "__TITLE__": PAGES[page]["title"],
         "__PAGE__": page,
@@ -970,9 +990,12 @@ def render_page(page: str, brief: dict, data: dict) -> str:
         "__NAV_CASES__": 'class="on"' if page == "cases" else "",
         # The PR view is a tab only while it is the page being read.
         "__NAV_RUN__": f'<a href="{RUN_PAGE}" class="on">PR view</a>' if page == "run" else "",
+        "__BASE__": base_html(public_url),
+        "__INLINE_BRIEF__": inline_json_html(INLINE_BRIEF_ID, brief),
+        "__INLINE_HEALTH__": inline_json_html(INLINE_HEALTH_ID, brief["health"]) if brief.get("health") else "",
         "__META__": meta_html(data),
         "__FRESHNESS__": freshness_html(data),
-        "__PAGES_JS__": script.replace("__BRIEF_JSON__", bootstrap_json(brief)),
+        "__PAGES_JS__": PAGES_JS.read_text(),
     }
     for token in values:
         if token not in template:
@@ -1019,6 +1042,22 @@ def bootstrap_json(value) -> str:
     return json.dumps(value, separators=(",", ":")).replace("<", "\\u003c")
 
 
+def inline_json_html(element_id: str, value) -> str:
+    """A data element a page reads with JSON.parse on boot. bootstrap_json
+    keeps every '<' out of it, so no data string can close the element."""
+    return f'<script type="application/json" id="{element_id}">{bootstrap_json(value)}</script>'
+
+
+def base_html(public_url: str | None) -> str:
+    """``<base href>`` for the published site, so every relative link on the
+    page (nav, footer, run.html?build=, the incident deep links) resolves
+    there whatever URL the browser is showing; nothing when no public URL
+    is known, which keeps a file:// render browsable."""
+    if not public_url:
+        return ""
+    return f'<base href="{esc(public_url.rstrip("/") + "/")}">'
+
+
 # --------------------------------------------------------------------------
 
 
@@ -1051,6 +1090,14 @@ def main(argv: list[str] | None = None) -> int:
         default=str(classify.REPO_ROOT),
         help="checkout whose git log lists the merges to main (a shallow checkout omits the block)",
     )
+    parser.add_argument(
+        "--public-url",
+        nargs="?",
+        const=PUBLISHED_SITE,
+        default=None,
+        metavar="BASE",
+        help=f"emit <base href> so every link resolves to this site; the bare flag means the published dashboard ({PUBLISHED_SITE}); default (or an empty value): none, links stay relative",
+    )
     args = parser.parse_args(argv)
 
     data = load_data(pathlib.Path(args.data))
@@ -1064,7 +1111,7 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = pathlib.Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     for page, spec in PAGES.items():
-        (out_dir / spec["file"]).write_text(render_page(page, brief, data))
+        (out_dir / spec["file"]).write_text(render_page(page, brief, data, args.public_url))
     (out_dir / BRIEF_JSON).write_text(json.dumps(brief, separators=(",", ":")))
     # health.json and health-history.jsonl are deliberately not copied into
     # the out-dir: the adjudicator owns those objects, and republishing a

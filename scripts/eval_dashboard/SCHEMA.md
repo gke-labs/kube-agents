@@ -80,8 +80,8 @@ the same layout and is collected from the moment it starts running.
   Brief's runs list, the Grid's columns, the Cases page's strips and
   presubmit rates — reads presubmit runs only. A nightly run appears where
   the nightly is meant to: `cases[].nightly`, the Cases page's nightly rate
-  columns and a nightly-only case's last failure, and `classify.py`'s
-  per-case `nightly_failed_recent` note.
+  columns and a case's last failure when the presubmit has none on record,
+  and `classify.py`'s per-case `nightly_failed_recent` note.
 - `job` — **optional, additive**: the Prow job name, read from the build
   directory's URL (the segment before the build id) or overridden by
   `--nightly-job`. `null` for a `--from-dir` build, which has no URL.
@@ -404,10 +404,9 @@ what the renderer does with them.
 
 ## The rendered pages
 
-`render.py` writes four pages beside `data.json`, all rendered in the
-browser from `brief.json` (below), which every page refetches together with
-`health.json` every 60 seconds. Every time shown is America/Toronto ("ET"),
-formatted with `Intl.DateTimeFormat`; URL parameters stay ISO 8601 UTC.
+`render.py` writes four pages beside `data.json`. Every time shown is
+America/Toronto ("ET"), formatted in the browser with
+`Intl.DateTimeFormat`; URL parameters stay ISO 8601 UTC.
 
 | Page         | What it is                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -416,9 +415,25 @@ formatted with `Intl.DateTimeFormat`; URL parameters stay ISO 8601 UTC.
 | `grid.html`  | **The Grid**: one row per case (blocking cases by domain, then the held-out ones, folded away when they passed everything in the window), one column per presubmit run in a window of 6 h, 24 h, 36 h or 7 days (header: PR # and ET start); cells passed / failed all reps / failed some / quota-infra / died before the cases / still running (`pending_builds`); merges to main and incident starts and ends marked between the columns; a cell opens that run's detail for the case. |
 | `cases.html` | **The Cases page** ("How reliable is each test?"): one row per case by domain — its last `STRIP_RUNS` presubmit outcomes, pass rate over reps at 7 and 30 days for the presubmit and the nightly apart (`—` when a tier has no graded run), its roster status (blocking / held out / demoted with its date / nightly only / not in any matrix), its last failure with the grader's reason, and its issues from `case-notes.yaml`.                                                        |
 
-`classify.py` is the one place the "is this red mine?" rule lives; the pages
-read its answer through `brief.json`, and anything else that answers the
-question imports it.
+The pages render in the browser from `brief.json` (below),
+which `render.py` inlines into each page as
+`<script type="application/json" id="inline-brief">` (the verdict it read,
+the same document as `brief.health`, again as `inline-health`), so a page
+needs no request beyond itself;
+the poll of the published `brief.json` and `health.json` every 60 seconds
+is a best-effort refresh on top. That matters on `storage.cloud.google.com`, which answers an XHR
+with a login redirect: the pages still render whole there. The header
+badge says `updated <time> · Nm ago`, plus `· regenerated every 15 min`
+while no poll has succeeded (the workflow republishes every page on that
+cron, so that is how old the inlined copy can be); `STALE` is prepended
+only when the data's `generated_at` is older than its `stale_after_s`.
+`render.py --public-url [BASE]` emits `<base href>` so every relative link
+resolves to the published site wherever the browser landed after the
+login redirect; the bare flag means `post_health.DASHBOARD_URL`'s
+directory, and without the flag links stay relative for a local render.
+`classify.py` is the one place the "is this red mine?" rule lives; the
+pages read its answer through `brief.json`, and anything else that answers
+the question imports it.
 
 ### URL contract
 

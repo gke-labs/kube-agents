@@ -146,19 +146,21 @@ Layout:
   0.4) is what makes these grants expressible - executor-granularity at connect time,
   with per-task scoping the parked tightening under the authority work.
 - **The JetStream tax.** Deny-by-default reaches JetStream's own plumbing, and three
-  grants are part of being a JetStream client at all: the `$JS.API.>` surface a role's
-  streams and buckets need; `$JS.ACK.<its streams>.>` for explicit acks - an ack is a
-  publish, and missing this grant means every consumer redelivers forever while TCP
-  health stays green, the NR-5 incident class created at connect time; and `$JS.FC.>`
-  for flow control. The inbox rule cuts both ways, too: a client whose subscribe grant
+  grants are part of being a JetStream client at all: the `$JS.API` subjects a role's
+  streams and buckets need, enumerated per stream and per verb where the caller set is
+  known (the worker's list is the operator's `a2aWorkerJetStreamGrants`; a user still
+  holding `$JS.API.>` holds playground posture); `$JS.ACK.<its streams>.>` for explicit
+  acks - an ack is a publish, and missing this grant means every consumer redelivers
+  forever while TCP health stays green, the NR-5 incident class created at connect time;
+  and `$JS.FC.>` for flow control. The inbox rule cuts both ways, too: a client whose subscribe grant
   is `_INBOX.<user>.>` MUST configure its inbox prefix to match - the client library's
   default random inbox is refused by the user's own grant and every API call times out.
   Both halves were found live (8/26): the provision Job could never succeed and no
   consumer could ever ack until these landed. The ack grant should be scoped per
   stream, for the reason the web section below teaches: an ack subject names a stream
   and a consumer, never the caller, so an unscoped `$JS.ACK.>` lets any holder `+TERM`
-  another principal's in-flight delivery. The stage 1 render still grants the unscoped
-  form to the trusted system users; narrowing it is recorded debt, not a settled shape.
+  another principal's in-flight delivery. The render scopes the ack grant to TASKS for
+  gateway and worker, and grants seed and web none.
 - **Topic publish grants are exact, never namespace wildcards.** Publish grants match
   the provisioned topic list subject-for-subject. A wildcard over a topic namespace
   turns provisioned-only into silent loss - a publish to an unprovisioned topic sails
@@ -204,12 +206,29 @@ Layout:
   it holds no grant to ack - endless redeliveries, churn against the server, and an
   amplifier for the deliver-subject write below; within the four
   granted streams consumer names are the caller's choice, so `web` can pull a delivery
-  off another reader's consumer or retune it through create-as-update; and a consumer's
+  off another reader's consumer or retune it through create-as-update - a route that
+  reaches the gateway's relay durable from `worker` too, measured on the render: one
+  permitted `$JS.API.CONSUMER.CREATE.TASKS.gateway-relay` retunes its filter subject, and
+  one carrying `inactive_threshold` has the server reap it, ack floor and all, with
+  `CONSUMER.DELETE` refused in the same run; and a consumer's
   deliver subject can aim replay of stored messages at another stream's subject, which is
-  a persisted write, reaching `a2a.agents.>` (the identity plane) as easily as
-  annotations. Per-name scoping is **not** available as a mitigation: NATS wildcards match
-  whole tokens, so a `web-*` grant matches a consumer literally named `web-*` and nothing
-  else - measured, not assumed. The real closes are the callout or a separate account
+  a persisted write under the messages' original subjects - not forgery, since a read by
+  subject never sees them, but an eviction lever against the capturing stream. Delivery
+  needs a subscription whose subject is **exactly** the deliver subject - a push consumer
+  registers through `Sublist.registerNotification`, which takes interest only from a match
+  that is byte-equal, so a wildcard subscription covering the deliver subject supplies
+  none - and that splits the streams
+  (measured on 2.10.29 and 2.14.5): the topic streams have literal subjects, so their own
+  ingest is the interest and the write lands unaided; DIRECTORY, TASKS and the buckets
+  have wildcard subjects, so reaching
+  `a2a.agents.>` (the identity plane) takes a principal subscribed to a card subject
+  itself. A watcher on `a2a.agents.>` - exactly `gateway`'s subscribe grant, and inside
+  `web`'s `a2a.>` - is not that principal: measured, DIRECTORY stayed empty.
+  This survives per-stream scoping of any user that may create consumers at all, the
+  worker included; the closure is not holding `CONSUMER.CREATE`, which is a consumer
+  created per task by the dispatcher. Per-name scoping is **not** available as a
+  mitigation: NATS wildcards match whole tokens, so a `web-*` grant matches a consumer
+  literally named `web-*` and nothing else - measured, not assumed. The real closes are the callout or a separate account
   with an export/import.
 
   **The probe subject.** `a2a.topics.shared.probe` is provisioned into `TOPICS-STATE`

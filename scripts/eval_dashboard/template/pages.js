@@ -1,13 +1,23 @@
 /* The Brief (index.html), the PR view (run.html), the Grid (grid.html) and
  * the Cases page (cases.html) share this script.
  *
- * render.py inlines it into every page together with brief.json -- the
- * per-run classification classify.py produced, the per-case record, the
- * current health verdict, the health history, the recent merges and the
- * release-candidate runs -- and each page renders itself from that document
- * in the browser. There is no server-side HTML for any page: everything a
- * reader sees is computed here from the baked copy, then again from a fresh
- * brief.json and health.json every PAGE.refreshMs.
+ * render.py inlines it into every page after two JSON data elements
+ * (PAGE.inlineBrief and PAGE.inlineHealth): brief.json -- the per-run
+ * classification classify.py produced, the per-case record, the current
+ * health verdict, the health history, the recent merges and the
+ * release-candidate runs -- and, when there is a verdict, that verdict again
+ * under its own id (the same normalized document as brief.health). Each page
+ * renders itself from those in the browser. There is no server-side HTML
+ * for any page: everything a reader sees is computed here from the inlined
+ * copy, with no request beyond the page itself.
+ *
+ * The poll of the published brief.json and health.json every PAGE.refreshMs
+ * is a best-effort refresh on top, not what the page depends on: the whole
+ * page is republished every PAGE.republishMinutes by the workflow, so a
+ * host that will not answer an XHR (storage.cloud.google.com answers one
+ * with a login redirect) still shows a page at most that old. A poll that
+ * fails leaves the inlined data on screen and the badge saying so; only
+ * data older than its own stale_after_s reads STALE.
  *
  * Every time a reader sees is America/Toronto ("ET"), formatted with
  * Intl.DateTimeFormat. URL parameters stay ISO 8601 UTC:
@@ -19,8 +29,12 @@
 "use strict";
 
 const PAGE = {
-  brief: __BRIEF_JSON__,
+  // The ids of the data elements render.py inlines (its INLINE_*_ID).
+  inlineBrief: "inline-brief",
+  inlineHealth: "inline-health",
   refreshMs: 60000,
+  // The ci-health workflow's cron: how old the inlined copy can be at most.
+  republishMinutes: 15,
   tz: "America/Toronto",
   tzLabel: "ET",
   // Dates inside this many days of "now" read as a weekday ("Sun 7:30 AM ET");
@@ -77,9 +91,21 @@ const PAGE = {
   releaseVerdictClass: { GREEN: "p-pass", RED: "p-fail", "NOT RUN": "p-infra" },
 };
 
-let brief = PAGE.brief || {};
-let health = normalizeHealth(brief.health);
-let unreachable = false;
+function inlineJson(id) {
+  const el = document.getElementById(id);
+  if (!el) return null;
+  try { return JSON.parse(el.textContent); } catch (err) { return null; }
+}
+
+let brief = inlineJson(PAGE.inlineBrief);
+// No usable data element (a truncated upload, a hand-edited page): say so
+// rather than render an empty dashboard that reads as "nothing happened".
+let briefLoaded = brief != null && typeof brief === "object";
+brief = briefLoaded ? brief : {};
+let health = normalizeHealth(inlineJson(PAGE.inlineHealth) ?? brief.health);
+// True once a brief.json poll has succeeded; until then (a file:// preview,
+// a host that redirects XHRs) the page is as fresh as its last publish.
+let live = false;
 // What the reader has clicked on the Grid and the Cases page. URL parameters
 // seed it; a chip or a cell changes it and re-renders.
 const ui = { sort: null, show: null, window: null, rows: null, markers: { merge: true, incident: true }, selected: null, showHeld: false, showRetired: false };
@@ -1151,9 +1177,9 @@ function renderFreshness() {
   const staleAfterMs = 1000 * (typeof brief.stale_after_s === "number" ? brief.stale_after_s : 7200);
   const ageMin = generated != null ? Math.max(0, Math.round((Date.now() - generated) / 60000)) : null;
   let text = `updated ${generated != null ? et(generated, Date.now()) : "—"}${ageMin != null ? ` · ${ageMin}m ago` : ""}`;
-  let stale = false;
-  if (unreachable) { text = `UNREACHABLE · ${text}`; stale = true; }
-  else if (generated != null && Date.now() - generated > staleAfterMs) { text = `STALE · ${text}`; stale = true; }
+  if (!live) text += ` · regenerated every ${PAGE.republishMinutes} min`;
+  const stale = generated != null && Date.now() - generated > staleAfterMs;
+  if (stale) text = `STALE · ${text}`;
   el.textContent = text;
   el.className = stale ? "fresh stale" : "fresh";
 }
@@ -1165,6 +1191,7 @@ function renderAll() {
   const app = document.getElementById("app");
   const page = document.body.dataset.page in renderers ? document.body.dataset.page : "brief";
   try {
+    if (!briefLoaded) throw new Error(`the page's data element (#${PAGE.inlineBrief}) is missing or unreadable`);
     app.innerHTML = renderers[page](link);
   } catch (err) {
     app.innerHTML = `<div class="sec head"><h1>This page could not render.</h1><div class="lede">${esc(String(err && err.message || err))}. The data behind it is <a href="${PAGE.briefFile}">${PAGE.briefFile}</a>.</div></div>`;
@@ -1196,26 +1223,30 @@ async function refresh() {
     const next = await fetchJson(PAGE.briefFile);
     if (next && typeof next === "object" && Array.isArray(next.runs)) {
       brief = next;
+      briefLoaded = true;
       health = normalizeHealth(next.health) ?? health;
+      // Only a payload the page took counts as a successful poll.
+      live = true;
     }
-    unreachable = false;
   } catch (err) {
-    unreachable = true;
+    // The inlined data stays on screen; the badge says the page is as
+    // fresh as its last publish.
+    live = false;
   }
   try {
     const fresh = normalizeHealth(await fetchJson(PAGE.healthFile));
     if (fresh) health = fresh;
   } catch (err) {
-    // health.json is optional; the baked verdict (or none) stays.
+    // health.json is optional; the inlined verdict (or none) stays.
   }
   renderAll();
 }
 
 document.getElementById("app").addEventListener("click", onClick);
 renderAll();
-if (location.protocol !== "file:") {
-  refresh();
-  setInterval(refresh, PAGE.refreshMs);
-}
+// Polling is attempted everywhere, a file:// preview included: a failed
+// poll costs nothing but the "regenerated every N min" suffix.
+refresh();
+setInterval(refresh, PAGE.refreshMs);
 window.addEventListener("hashchange", renderAll);
 setInterval(renderFreshness, 30000);

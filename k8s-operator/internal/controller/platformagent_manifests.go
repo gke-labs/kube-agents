@@ -90,6 +90,18 @@ const (
 	// exceeding Kubernetes 63-byte annotation key limits when GKE Autopilot / gVisor injects
 	// "dev.gvisor.internal.seccomp.<container-name>" (28-byte prefix without slash).
 	maxAutopilotContainerNameLen = 35
+
+	// agentAPIAuthContainerName names the gateway Pod's container that runs the
+	// API authenticator and the k8s-event-watcher. The Downward API reference
+	// below has to name it exactly, which is why it is a constant.
+	agentAPIAuthContainerName = "agent-api-auth"
+	// eventWatcherMemoryLimitEnv tells the watcher its container's memory limit
+	// in bytes, so it can set the Go runtime's soft limit to a share of it. The
+	// watcher reads it under the same name (cmd/k8s-event-watcher/main.go).
+	eventWatcherMemoryLimitEnv = "EVENT_WATCHER_MEMORY_LIMIT_BYTES"
+	// containerMemoryLimitResource is the Downward API resource selector for
+	// a container's own memory limit.
+	containerMemoryLimitResource = "limits.memory"
 )
 
 // Shared-state ownership. Step 1.5 of deploy/shared/docker-entrypoint.sh reads this
@@ -2955,6 +2967,20 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 	// describe loopback plumbing inside this container and live in the
 	// entrypoint.
 	envVars = append(envVars, corev1.EnvVar{Name: "EVENT_WATCHER_CLUSTER_NAME", Value: resolveHarnessClusterName(agent)})
+	// The container's own memory limit, in bytes, for the watcher to derive its
+	// Go soft memory limit from. Read through the Downward API rather than
+	// copied from the Resources block below so the two cannot drift: a limit
+	// changed in one place is the limit the watcher sees. Divisor 1 makes the
+	// value a plain byte count. Reserved in mergeCredentialProxyEnv like the
+	// other two watcher variables appended here.
+	envVars = append(envVars, corev1.EnvVar{
+		Name: eventWatcherMemoryLimitEnv,
+		ValueFrom: &corev1.EnvVarSource{ResourceFieldRef: &corev1.ResourceFieldSelector{
+			ContainerName: agentAPIAuthContainerName,
+			Resource:      containerMemoryLimitResource,
+			Divisor:       resource.MustParse("1"),
+		}},
+	})
 	// The emergency stop from spec.harness.eventWatcher.enabled. Written on every
 	// reconcile rather than only when off, so the Deployment answers "is the
 	// watcher meant to be running?" without reading the CR — the pod stays Ready
@@ -2974,7 +3000,7 @@ func buildAgentAPIAuthSidecar(agent *agentv1alpha1.PlatformAgent, homeDir string
 	// shared PVC as the agent's own user.
 	securityContext := hardenedSecurityContext()
 	return corev1.Container{
-		Name:            "agent-api-auth",
+		Name:            agentAPIAuthContainerName,
 		Image:           image,
 		ImagePullPolicy: pullPolicy,
 		// Starts two of the image's three peer services — the API authenticator
@@ -3269,8 +3295,8 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		"CREDENTIAL_PROXY_TIMEOUT_SECONDS",
 		"CREDENTIAL_PROXY_UNIX_SOCKET",
 		"CREDENTIAL_PROXY_WORKSPACE_ROOT",
-		// Both appended by buildAgentAPIAuthSidecar after this merge runs,
-		// so neither is in `managed` above and neither reserves its own name.
+		// All three appended by buildAgentAPIAuthSidecar after this merge runs,
+		// so none is in `managed` above and none reserves its own name.
 		// Without them here a same-named entry in spec.deployment.env is kept
 		// and the operator's is appended alongside it — two entries with one
 		// name. That is not last-wins: `containers[].env` is a listType=map,
@@ -3278,6 +3304,7 @@ func mergeCredentialProxyEnv(managed, custom []corev1.EnvVar) []corev1.EnvVar {
 		// resolving the duplicate, so the agent stops reconciling entirely.
 		"EVENT_WATCHER_CLUSTER_NAME",
 		"EVENT_WATCHER_ENABLED",
+		eventWatcherMemoryLimitEnv,
 		"KSA_TOKEN_FILE",
 		"TOKEN_BROKER_URL",
 	} {

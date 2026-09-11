@@ -2155,3 +2155,170 @@ func TestSeedHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 		}
 	}
 }
+
+// TestWorkerHoldsNoWholesaleJetStreamAPI is the shape check for the worker's
+// JetStream API grant; the refusal proof is TestWorkerJetStreamGrantOnARealServer,
+// which asks a server. This one keeps the wildcard from coming back by
+// accident, and asks three questions, none by substring -- the web user's test
+// above records why: `$JS.API.STREAM.>` contains none of the words a blocklist
+// would think to name.
+//
+//  1. The publish allow-list is pinned exactly: the task-events subject, the
+//     three topic subjects, heartbeats, the runtime-state bucket, the grants
+//     a2aWorkerJetStreamGrants renders, the TASKS ack, flow control, and the
+//     worker's own inbox. Any other entry, in any spelling, is a diff.
+//  2. Every destructive or out-of-scope route -- a concrete subject per verb,
+//     on every provisioned stream, not one sample per verb -- is run through
+//     subjectMatches against every rendered entry. That is the question the
+//     server asks, so a wildcard cannot grant a route without naming it.
+//  3. The grant function's own output is bounded by shape, because want in (1)
+//     is built from that same function and cannot see an entry added inside it.
+//  4. The subscribe list is pinned exactly too: a subscribe grant is delivery
+//     interest for a push consumer's deliver_subject, so widening it is a
+//     review conversation for the same reason widening publish is.
+func TestWorkerHoldsNoWholesaleJetStreamAPI(t *testing.T) {
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds()).Data["nats.conf"])
+	got := a2aGrantSubjects(t, conf, "worker", "publish")
+
+	if sub, want := a2aGrantSubjects(t, conf, "worker", "subscribe"), []string{"a2a.tasks.>", "a2a.topics.>", "$KV.runtime-state.>", "_INBOX.worker.>"}; !reflect.DeepEqual(sub, want) {
+		t.Errorf("worker subscribe allow-list changed.\n got: %q\nwant: %q", sub, want)
+	}
+
+	want := []string{
+		"a2a.tasks.*.*.events",
+		"a2a.topics.agent.platform.upgrade-readiness",
+		"a2a.topics.shared.blueprint",
+		"a2a.topics.shared.annotations",
+		"agents.hb.>",
+		"$KV.runtime-state.>",
+	}
+	want = append(want, a2aWorkerJetStreamGrants()...)
+	want = append(want, "$JS.ACK.TASKS.>", "$JS.FC.>", "_INBOX.worker.>")
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("worker publish allow-list changed.\n got: %q\nwant: %q", got, want)
+	}
+
+	// Verbs no worker path uses, against every stream the provision script
+	// creates. A named grant only widens the stream it names, so a verb
+	// sampled on TASKS says nothing about the same verb on DIRECTORY.
+	provisioned := []string{"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL", "KV_runtime-state", "KV_session-state", "KV_cap"}
+	forbiddenVerbs := []string{
+		"$JS.API.STREAM.CREATE.",
+		"$JS.API.STREAM.UPDATE.",
+		"$JS.API.STREAM.DELETE.",
+		"$JS.API.STREAM.PURGE.",
+		"$JS.API.STREAM.MSG.DELETE.",
+		"$JS.API.STREAM.MSG.GET.",
+		"$JS.API.STREAM.RESTORE.",
+		"$JS.API.STREAM.SNAPSHOT.",
+		"$JS.API.CONSUMER.NAMES.",
+		"$JS.API.CONSUMER.LIST.",
+	}
+	var forbidden []string
+	for _, s := range provisioned {
+		for _, verb := range forbiddenVerbs {
+			forbidden = append(forbidden, verb+s)
+		}
+		forbidden = append(forbidden, "$JS.API.CONSUMER.INFO."+s+".x")
+	}
+	// Streams the worker has no business on at all: not a read, not a
+	// consumer, not a direct get. The directory is the identity plane; the
+	// session registry is the gateway's; cap is the capability envelope's.
+	for _, s := range []string{"DIRECTORY", "KV_session-state", "KV_cap"} {
+		forbidden = append(forbidden,
+			"$JS.API.STREAM.INFO."+s,
+			"$JS.API.CONSUMER.CREATE."+s+".x",
+			"$JS.API.CONSUMER.CREATE."+s+".x.a2a.agents.platform",
+			"$JS.API.CONSUMER.DURABLE.CREATE."+s+".x",
+			"$JS.API.CONSUMER.MSG.NEXT."+s+".x",
+			"$JS.API.CONSUMER.DELETE."+s+".x",
+			"$JS.API.DIRECT.GET."+s+".a2a.agents.platform",
+			"$JS.API.DIRECT.GET."+s,
+		)
+	}
+	forbidden = append(forbidden,
+		// The gateway's relay durable: CREATE and MSG.NEXT on a shared stream
+		// are conceded, DELETE is not (see a2aWorkerJetStreamGrants).
+		"$JS.API.CONSUMER.DELETE.TASKS.gateway-relay",
+		// The registry is put, listed and deleted, never read by key.
+		"$JS.API.DIRECT.GET.KV_runtime-state.$KV.runtime-state.k",
+		// Topic streams are read by direct get, never consumed.
+		"$JS.API.CONSUMER.CREATE.TOPICS-STATE.x",
+		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.x",
+		"$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.x",
+		"$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.x",
+		// Account discovery and enumeration.
+		"$JS.API.INFO",
+		"$JS.API.STREAM.NAMES",
+		"$JS.API.STREAM.LIST",
+		// A stream nobody provisions, for the verbs the worker does hold.
+		"$JS.API.STREAM.INFO.NOT-PROVISIONED",
+		"$JS.API.CONSUMER.CREATE.NOT-PROVISIONED.x",
+		"$JS.API.DIRECT.GET.NOT-PROVISIONED.x",
+	)
+	for _, subject := range forbidden {
+		for _, grant := range got {
+			if subjectMatches(grant, subject) {
+				t.Errorf("worker grant %q permits %q; nothing on the worker path uses it", grant, subject)
+			}
+		}
+	}
+
+	// The other direction, and the one a forbidden list cannot cover: an
+	// entry added inside a2aWorkerJetStreamGrants is invisible to the
+	// DeepEqual above. Anything outside these shapes has to be argued for in
+	// that function's comment rather than added quietly.
+	allowedShapes := map[string]bool{}
+	for _, s := range []string{"TASKS", "KV_runtime-state", "TOPICS-STATE", "TOPICS-JOURNAL"} {
+		allowedShapes["$JS.API.STREAM.INFO."+s] = true
+	}
+	for _, s := range []string{"TASKS", "TOPICS-STATE", "TOPICS-JOURNAL"} {
+		allowedShapes["$JS.API.DIRECT.GET."+s+".>"] = true
+	}
+	for _, s := range []string{"TASKS", "KV_runtime-state"} {
+		allowedShapes["$JS.API.CONSUMER.CREATE."+s+".>"] = true
+	}
+	allowedShapes["$JS.API.CONSUMER.MSG.NEXT.TASKS.*"] = true
+	allowedShapes["$JS.API.CONSUMER.DELETE.KV_runtime-state.*"] = true
+	for _, grant := range a2aWorkerJetStreamGrants() {
+		if !allowedShapes[grant] {
+			t.Errorf("worker holds JetStream API grant %q, which is outside the shapes a2aWorkerJetStreamGrants argues for", grant)
+		}
+	}
+}
+
+// TestWorkerGrantNamesStreamsTheProvisionScriptCreates pins the pair. The
+// worker's grants render from the stream-name constants; the provision script
+// spells each name itself, because every create line carries its own subjects,
+// retention and caps. Rename a stream on one side only and the worker holds
+// grants on a name that does not exist -- an authorization failure at runtime
+// with a green suite -- so the script's create lines are held to the constants
+// here. Anchored to the create itself, not the bare name, for the reason
+// #1306's pairing test records: the script's prose mentions every name too.
+func TestWorkerGrantNamesStreamsTheProvisionScriptCreates(t *testing.T) {
+	script := a2aProvisionScript(a2aTestAgent())
+	for _, create := range []string{
+		"stream add " + a2aTasksStream + " ",
+		"stream add " + a2aTopicsStateStream + " ",
+		"stream add " + a2aTopicsJournalStream + " ",
+		"kv add " + a2aRuntimeStateBucket + " ",
+	} {
+		if !strings.Contains(script, create) {
+			t.Errorf("the provision script has no %q; the worker's grant names a stream nothing creates", strings.TrimSpace(create))
+		}
+	}
+	// Every grant names one of those constants, so the check above covers
+	// the whole list rather than the four names this test happens to know.
+	known := []string{a2aTasksStream, a2aTopicsStateStream, a2aTopicsJournalStream, a2aKVStreamPrefix + a2aRuntimeStateBucket}
+	for _, grant := range a2aWorkerJetStreamGrants() {
+		if !slices.ContainsFunc(known, func(name string) bool { return strings.Contains(grant, "."+name) }) {
+			t.Errorf("worker grant %q names a stream outside the constants the provision script is held to", grant)
+		}
+	}
+	// And the direct-get route the grants assume: every stream add says so.
+	for _, line := range strings.Split(script, "\n") {
+		if strings.Contains(line, "stream add ") && !strings.Contains(line, "--allow-direct") {
+			t.Errorf("provision line %q does not set --allow-direct; the worker's grant is written for DIRECT.GET, not STREAM.MSG.GET", strings.TrimSpace(line))
+		}
+	}
+}

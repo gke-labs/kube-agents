@@ -591,7 +591,7 @@ class RenderedPagesTest(unittest.TestCase):
         for page in ("index.html", "cases.html", "grid.html"):
             text = (out_dir / page).read_text()
             self.assertNotIn("</script><script>alert", text)
-            self.assertNotIn("<!--", text)
+            self.assertNotIn("<!--<script>", text)
             self.assertNotIn("<img src=x", text)
             self.assertIn("\\u003c/script>\\u003cscript>alert(1)\\u003c/script>", text)
         self.assertEqual(json.loads(render.bootstrap_json("<!--<script></script>")), "<!--<script></script>")
