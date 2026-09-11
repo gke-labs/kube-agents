@@ -106,6 +106,12 @@ Generated from the `name` and `description` frontmatter of every `agents/platfor
 | [`inspect-repository`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/inspect-repository/SKILL.md) | Read and analyze the source of any GitHub repository — public or one this install has a token for — without a local checkout. Clones broker-side and pulls file content back; use it to answer questions about code, not to change it. |
 | [`pr-conversation`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/pr-conversation/SKILL.md) | Answer a reviewer who addressed you on one of your own pull requests — read the thread, answer or amend the branch, and reply in the thread. |
 
+### Other
+
+| Skill | Description |
+| ----- | ----------- |
+| [`openshift-routes-ingress`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/openshift-routes-ingress/SKILL.md) | Configures and troubleshoots OpenShift native Routes (route.openshift.io/v1), HAProxy edge ingress, TLS termination (edge, passthrough, re-encrypt), and service exposing. Use when exposing services externally on OpenShift, configuring HTTP-to-HTTPS redirects, setting custom hostnames, resolving router 503 "Application is not available" errors, or configuring OpenShift Service Serving Certificates. Don't use for GKE Gateway API, GKE Ingress, or Cloud Armor policies. |
+
 ### Cluster Agent (per-cluster runtime)
 
 | Skill | Description |
