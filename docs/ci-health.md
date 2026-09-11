@@ -170,7 +170,11 @@ adopted instead. The Chat message then reads `Tracking #NNN`, the issue rides
 in `health-state.json` and in `health.json`'s `issue` field (`{number, url, condition}`,
 `null` outside an incident; `health.py` reads it back through
 `--posted-state`), and the recovery comments on it: "Healthy again after Xh;
-bot will not close it." The bot never closes an issue. A GitHub failure leaves
+bot will not close it." `issue` is the current condition's; every issue the
+incident filed or adopted stays in `health-state.json`'s `issues` list until
+GREEN, so an outage that gives way to a storm or to lost pods before it clears
+still gets its recovery comment, and the recovery message names them all. The
+bot never closes an issue. A GitHub failure leaves
 the message at "no issue yet — file one with the presubmit-gate label" and the
 next change asks again.
 
@@ -186,7 +190,8 @@ issue that already names every lost node is adopted instead. The Chat message
 reads `Tracking #NNN`; the issue rides in the state the same way and is filed
 once per event. Each issue records the condition it was filed for (`{number,
 url, condition}`): an outage's issue is never cited as the lost pods' tracking,
-nor the reverse, so a break followed by a node loss files both.
+nor the reverse, so a break followed by a node loss files both, and both are
+commented on when the gate recovers.
 
 ## The history feed
 

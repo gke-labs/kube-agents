@@ -360,6 +360,18 @@ def issue_for(issue, condition: str | None) -> dict | None:
     return issue if (issue.get("condition") or CONDITION_SHARED_BREAK) == condition else None
 
 
+def episode_issues(state: dict) -> list[dict]:
+    """Every issue the recorded episode filed or adopted: the state's
+    `issues`, plus its `issue` when a state written before `issues` existed
+    holds one; deduplicated by number, oldest first."""
+    out: list[dict] = []
+    for candidate in [*(state.get("issues") or []), state.get("issue")]:
+        tag = issue_tag(candidate)
+        if tag and tag not in {issue_tag(seen) for seen in out}:
+            out.append(candidate)
+    return out
+
+
 def tracking_text(issues, issue=None) -> str:
     issues = list(issues or [])
     tag = issue_tag(issue)
@@ -446,9 +458,10 @@ def render_recovery(health: dict, prev: dict, now: datetime) -> str:
     lasted = duration_text(now - since) if since else "a while"
     parts = [short_cause(prev)]
     issues = list(prev.get("tracking_issues") or [])
-    tag = issue_tag(prev.get("issue"))
-    if tag and tag not in issues:
-        issues.append(tag)
+    for each in episode_issues(prev):
+        tag = issue_tag(each)
+        if tag not in issues:
+            issues.append(tag)
     if issues:
         parts.append(", ".join(issues))
     # No "retests running" clause: this job queues none.
@@ -579,7 +592,15 @@ def run(
     kinds = decide(health, prev, now, digest_hour, tz)
     before = prev or {}
     condition = health.get("condition")
-    issue = issue_for(health.get("issue"), condition) or issue_for(before.get("issue"), condition)
+    # Every issue this episode filed or adopted rides in `issues` until
+    # GREEN, whatever condition the gate has moved on to, so the recovery can
+    # comment on each of them; `issue` is the one for the current condition,
+    # the only one the message cites and the only one that decides whether a
+    # new one is needed.
+    carried = episode_issues(before)
+    if issue_tag(health.get("issue")) and health["issue"] not in carried:
+        carried.append(health["issue"])
+    issue = next((candidate for candidate in [health.get("issue"), *carried] if issue_for(candidate, condition)), None)
     wants_issue = KIND_CHANGE in kinds and (health.get("state") == OUTAGE or condition == CONDITION_LOST_PODS) and not issue and not health.get("tracking_issues")
     if tracker is not None and wants_issue:
         incident = health.get("incident") or {}
@@ -589,6 +610,8 @@ def run(
             issue = tracker.ensure(health, now, clock(start or since, weekday=True), incident_link(health), clock_range(start, end) if start and end else clock(since, weekday=True))
         else:
             issue = tracker.ensure(health, now, clock(since, weekday=True), incident_link(health))
+        if issue and issue not in carried:
+            carried.append(issue)
     messages = [(kind, render(kind, health, prev, now, issue)) for kind in kinds]
     failed = []
     for kind, text in messages:
@@ -597,9 +620,10 @@ def run(
         elif not sender.send(text):
             failed.append(kind)
     sent = [kind for kind in kinds if kind not in failed]
-    if tracker is not None and KIND_RECOVERY in sent and before.get("issue"):
+    if tracker is not None and KIND_RECOVERY in sent:
         began = parse_iso(before.get("since"))
-        tracker.recovered(before["issue"], duration_text(now - began) if began else "a while")
+        for each in episode_issues(before):
+            tracker.recovered(each, duration_text(now - began) if began else "a while")
 
     # The state file records what the space was last TOLD, kind by kind,
     # so the next tick asks its questions -- did the state change, did a new
@@ -610,10 +634,11 @@ def run(
     # leaves its part where it was, so the next tick re-asks exactly that
     # question: a change that failed beside a stale notice that succeeded is
     # posted next tick, and a stale flip posted mid-OUTAGE does not swallow a
-    # case that joined inside OUTAGE_REPOST_INTERVAL. The tracking issue
-    # rides along while the recorded state is not GREEN and is dropped by
-    # the recovery; health.py reads it back from here (`--posted-state`)
-    # into the next health.json.
+    # case that joined inside OUTAGE_REPOST_INTERVAL. The tracking issues
+    # ride along while the recorded state is not GREEN -- `issue` for the
+    # current condition, `issues` for every one this episode filed or
+    # adopted -- and are dropped by the recovery; health.py reads them back
+    # from here (`--posted-state`) into the next health.json.
     told_state = KIND_CHANGE in sent or KIND_RECOVERY in sent
     told_stale = KIND_STALE in sent
     if prev is None:
@@ -631,6 +656,7 @@ def run(
         "tracking_issues": source.get("tracking_issues") or [],
         "since": source.get("since"),
         "issue": issue if source.get("state") not in (None, GREEN) else None,
+        "issues": carried if source.get("state") not in (None, GREEN) else [],
         "stale": bool(health.get("stale")) if told_stale else bool(before.get("stale")),
         "posted_at": before.get("posted_at"),
         "last_digest_date": before.get("last_digest_date"),

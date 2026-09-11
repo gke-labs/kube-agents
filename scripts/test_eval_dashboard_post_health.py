@@ -635,11 +635,38 @@ class LostPods(RunHarness):
         self.tick(lost_pods(), T0.replace(day=11, hour=14, minute=30), environ=self.environ())
         self.assertEqual(self.gh.writes()[-1], ("POST", "repos/gke-labs/kube-agents/issues"))
         self.assertIn("Tracking #1301.", self.opener.texts[-1])
-        self.assertEqual(self.recorded()["issue"], {"number": 1301, "url": "https://github.com/gke-labs/kube-agents/issues/1301", "condition": "lost_pods"})
+        recorded = self.recorded()
+        self.assertEqual(recorded["issue"], {"number": 1301, "url": "https://github.com/gke-labs/kube-agents/issues/1301", "condition": "lost_pods"})
+        self.assertEqual([issue["number"] for issue in recorded["issues"]], [1300, 1301], "the outage's issue still rides along")
         # And back up to an OUTAGE: #1301 is the cluster owner's, so a new
         # outage issue is filed rather than #1301 cited.
         self.tick(outage(cases=["b-probe"], since="2026-09-11T15:00:00+00:00", prs=(4, 5, 6)), T0.replace(day=11, hour=15), environ=self.environ())
         self.assertIn("Tracking #1302.", self.opener.texts[-1])
+        # GREEN: every issue of the episode gets the recovery comment, and
+        # the message names them all.
+        self.tick(health(), T0.replace(day=11, hour=17), environ=self.environ())
+        recovered = [path for method, path in self.gh.writes() if method == "POST" and path.endswith("/comments")]
+        self.assertEqual(recovered, [f"repos/gke-labs/kube-agents/issues/{n}/comments" for n in (1300, 1301, 1302)])
+        self.assertIn("#1300, #1301, #1302)", self.opener.texts[-1].split("\n")[0])
+        self.assertEqual((self.recorded()["issue"], self.recorded()["issues"]), (None, []))
+
+    def test_an_outage_that_decays_into_a_storm_still_gets_its_recovery_comment(self):
+        # The 2026-09-02 shape: the break clears, the storm is what is left,
+        # then GREEN. The outage's issue is not the storm's tracking, but it
+        # rides in the state until the recovery comments on it.
+        self.tick(outage(cases=["a-probe"], since="2026-09-04T09:00:00+00:00", prs=(1, 2, 3)), T0, environ=self.environ())
+        self.tick(storm(since="2026-09-04T13:00:00+00:00"), T0.replace(hour=13), environ=self.environ())
+        self.assertNotIn("Tracking", self.opener.texts[-1])
+        self.assertEqual((self.recorded()["issue"], [i["number"] for i in self.recorded()["issues"]]), (None, [1300]))
+        self.tick(health(), T0.replace(hour=15, minute=30), environ=self.environ())
+        self.assertEqual(self.gh.writes()[-1], ("POST", "repos/gke-labs/kube-agents/issues/1300/comments"))
+        self.assertEqual(self.gh.calls[-1][2], {"body": "Healthy again after 2h 30m; bot will not close it."})
+        self.assertEqual(self.opener.texts[-1].split("\n")[0], "🟢 *Smoke gate: healthy again* — fixed after 2h 30m (quota storm, #1300).")
+        # A state file from before `issues` existed: its lone `issue` is
+        # the episode's, and gets the comment too.
+        self.state.write_text(json.dumps(dict(self.recorded(), state="DEGRADED", condition="storm", since="2026-09-04T13:00:00+00:00", issue={"number": 1200, "url": "x"}, issues=None)))
+        self.tick(health(), T0.replace(hour=18), environ=self.environ())
+        self.assertEqual(self.gh.writes()[-1], ("POST", "repos/gke-labs/kube-agents/issues/1200/comments"))
 
     def test_the_recovery_names_the_lost_nodes_and_the_issue(self):
         self.tick(lost_pods(), T0.replace(day=11, hour=14, minute=30), environ=self.environ())

@@ -1022,7 +1022,11 @@ def adjudicate(
     decided = transition(prev, assessed, now)
     issue = None
     if decided["state"] != GREEN:
-        issue = issue_for((posted or {}).get("issue"), decided["condition"]) or issue_for((prev or {}).get("issue"), decided["condition"])
+        # The poster keeps the current condition's issue in `issue` and
+        # every issue of the episode in `issues`; the one for the decided
+        # condition is cited, wherever it sits.
+        candidates = [(posted or {}).get("issue"), *((posted or {}).get("issues") or []), (prev or {}).get("issue")]
+        issue = next((match for match in (issue_for(candidate, decided["condition"]) for candidate in candidates) if match), None)
     evidence = list(assessed["evidence"])
     if decided["recovering"]:
         evidence.append(
