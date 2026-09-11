@@ -107,8 +107,11 @@ and its clock, and a member that is `current` at the same versions as an ungrade
 
 A rollout is active when at least one member is `started` or `completed` in the same comparison,
 or when the operator passed `--rollout-in-progress`, which is for a rollout whose first wave has
-not produced a mover yet. Without either, an unmoved member is `unchanged`, never `stalled`, so
-two quiet runs a week apart do not invent a stall. A member that is `current`, `ahead` or
+not produced a mover yet. Pass the flag when the user says a rollout is under way; when there is
+no earlier record to compare with and the user asks which members have stalled, run the report
+twice in the turn with the flag and read the second run's section. Without a mover or the flag,
+an unmoved member is `unchanged`, never `stalled`, so two quiet runs a week apart do not invent a
+stall. A member that is `current`, `ahead` or
 `unknown` is never `stalled`.
 
 A member in the previous record with no row this run is listed once under the section: dropped
