@@ -2438,7 +2438,8 @@ run_menu_system() {
   local slack_enabled="${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}"
   local allowed_users="${ALLOWED_USERS:-}"
   local chat_topic_name="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
-  local chat_sub_name="$(derive_chat_sub_name "$chat_topic_name" "${CHAT_SUB_NAME:-}")"
+  local chat_sub_name
+  chat_sub_name="$(derive_chat_sub_name "$chat_topic_name" "${CHAT_SUB_NAME:-}")"
   local permission_set="${PLATFORM_AGENT_PERMISSION_SET:-$DEFAULT_PERMISSION_SET}"
   local custom_roles="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
   # Not the fresh-install default. The control panel describes an install that
@@ -2977,7 +2978,8 @@ main() {
     allowed_users_hint="empty list"
   fi
   local chat_topic_name="$PARAM_CHAT_TOPIC_NAME"
-  local chat_sub_name="$(derive_chat_sub_name "$chat_topic_name" "${PARAM_CHAT_SUB_NAME:-${CHAT_SUB_NAME:-}}")"
+  local chat_sub_name
+  chat_sub_name="$(derive_chat_sub_name "$chat_topic_name" "${PARAM_CHAT_SUB_NAME:-${CHAT_SUB_NAME:-}}")"
   local google_chat_mode="$PARAM_GOOGLE_CHAT_MODE"
   if [[ ! "$google_chat_mode" =~ ^(default|debug)$ ]]; then
     print_error "--google-chat-mode must be either 'default' or 'debug'."
