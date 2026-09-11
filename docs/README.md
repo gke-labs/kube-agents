@@ -200,6 +200,7 @@ identifier appears, add its source here.
 | Contributor-agent merge labels (`lgtm`, `approved`, `ok-to-test`, `do-not-merge/hold`) and the `triage` permission grant | external tide automation and GitHub repo settings (not in-tree); named in `AGENTS.md` and `agents/contributor/AGENTS.md` |
 | Queue-wait thresholds that justify onboarding an eval project, and the window they run over | `scripts/pool_pressure.py` |
 | Presubmit-gate health rules (windows, thresholds, hysteresis), the Chat posting variables and the digest hour | `scripts/eval_dashboard/health.py`, `scripts/eval_dashboard/post_health.py` and `.github/workflows/ci-health.yml` |
+| The eval dashboard's roster-page contract (the `demoted YYYY-MM-DD` phrase inside a `- **case-name** —` hold-out bullet), its page files and its URL parameter vocabularies | `ROSTER_ENTRY_RE` / `DEMOTED_RE` and `PAGES` in `scripts/eval_dashboard/render.py`; `linkState()` in `scripts/eval_dashboard/template/pages.js` |
 | Testing-domain slugs a bench case may claim | `docs/designs/domains.yaml` |
 | Seeded-fleet fixture role names and the cluster slot each lives on | `bench/tf/fleet/fixtures.json` |
 | Day-N availability gate per fixture, and the project-scoped fixtures that sit on no cluster | `docs/designs/fleet-fixtures.yaml`, which overlays `fixtures.json` and may not rename a role |

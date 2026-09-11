@@ -188,10 +188,22 @@ STATUS_HELD_OUT = "held_out"  # active, never admitted (or no date on record)
 STATUS_DEMOTED = "demoted"  # active, held out, with a demotion date
 STATUS_NIGHTLY_ONLY = "nightly_only"  # in NIGHTLY_TASKS only
 STATUS_RETIRED = "retired"  # in neither matrix on this checkout
-# The two states a case's last non-pass appearance can be in: every graded
-# rep failed, or some did (the gate counts the latter as a pass).
-STRIP_FAIL = "fail"
+# A case's state in one run, on the strip and in a Grid cell: every graded
+# rep passed, some failed (the gate counts that as a pass), every graded rep
+# failed, every rep was infra (excluded, not failed), or nothing measured.
+STRIP_PASS = "pass"
 STRIP_PARTIAL = "partial"
+STRIP_FAIL = "fail"
+STRIP_INFRA = "infra"
+STRIP_NONE = "none"
+# The domain of a case whose task.yaml is not on this checkout.
+DOMAIN_UNKNOWN = "unknown"
+# A pending build first seen longer ago than this is not still running: the
+# presubmit's ceiling is 360 minutes (AGENTS.md), and a build past it with
+# no finished.json is a pod that died without uploading, which the
+# collector keeps on pending_builds for two days (SCHEMA.md,
+# PENDING_RETRY_DAYS). The Grid shows it as running only inside this window.
+PENDING_MAX_AGE_MS = 8 * 3600 * 1000
 
 # --- release candidates (SCHEMA.md: releases[]) -----------------------------
 # The Brief's release table: how many release-candidate eval runs it shows,
@@ -326,15 +338,15 @@ def cell_state(task: dict) -> str:
     'none' (nothing measured)."""
     reps = task_reps(task)
     if not reps:
-        return "none"
+        return STRIP_NONE
     passed, failed, _ = rep_counts(reps)
     if passed and failed:
         return STRIP_PARTIAL
     if failed:
         return STRIP_FAIL
     if passed:
-        return "pass"
-    return "infra"
+        return STRIP_PASS
+    return STRIP_INFRA
 
 
 def is_run_event(run: dict) -> bool:
@@ -342,7 +354,7 @@ def is_run_event(run: dict) -> bool:
     (state pass/partial/fail; infra and unmeasured don't grade) failed
     outright. Such a run is broken as a whole, so its failures are charged
     to the run, not the cases."""
-    graded = [s for s in (cell_state(t) for t in run_tasks(run)) if s in ("pass", STRIP_PARTIAL, STRIP_FAIL)]
+    graded = [s for s in (cell_state(t) for t in run_tasks(run)) if s in (STRIP_PASS, STRIP_PARTIAL, STRIP_FAIL)]
     if not graded:
         return False
     return graded.count(STRIP_FAIL) / len(graded) >= RUN_EVENT_FAIL_FRACTION
@@ -740,7 +752,7 @@ def appearances_by_case(runs: list[dict]) -> dict[str, list[tuple[dict, dict]]]:
     out: dict[str, list[tuple[dict, dict]]] = {}
     for run in runs:
         for task in run_tasks(run):
-            if cell_state(task) != "none":
+            if cell_state(task) != STRIP_NONE:
                 out.setdefault(str(task.get("name")), []).append((run, task))
     return out
 
@@ -829,7 +841,7 @@ def case_documents(data: dict, notes: dict, admitted: frozenset | None, demoted:
             "active": case.get("active") is True,
             "nightly_active": case.get("nightly_active") is True,
             "admitted": admitted is None or name in admitted,
-            "domain": str(case.get("domain") or "unknown"),
+            "domain": str(case.get("domain") or DOMAIN_UNKNOWN),
             "status": status,
             "demoted_on": demoted_on,
             "note": note.get("note"),
@@ -898,15 +910,20 @@ def compact_release(release: dict) -> dict:
 
 def pending_builds(data: dict) -> list[dict]:
     """``pending_builds`` as the Grid's "still running" columns: id and when
-    the collector first saw it, oldest first; a malformed entry is dropped."""
+    the collector first saw it, oldest first. A malformed entry is dropped,
+    and so is one first seen more than PENDING_MAX_AGE_MS before the
+    reference time: that build is not running any more (docstring of the
+    constant)."""
     raw = data.get("pending_builds")
     if not isinstance(raw, list):
         return []
+    anchor = reference_ms(data)
     out = []
     for entry in raw:
         if not isinstance(entry, dict) or not str(entry.get("build_id") or "").isdigit():
             continue
-        if iso_ms(entry.get("first_seen")) is None:
+        seen = iso_ms(entry.get("first_seen"))
+        if seen is None or (anchor is not None and seen < anchor - PENDING_MAX_AGE_MS):
             continue
         out.append({"build": str(entry["build_id"]), "first_seen": entry["first_seen"]})
     out.sort(key=lambda e: int(e["build"]))

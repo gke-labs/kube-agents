@@ -227,7 +227,10 @@ function linkState() {
   out.window = pick("window", PAGE.gridWindows.map((w) => w[0]));
   out.rows = pick("rows", ["all", "admitted", "failing"]);
   out.hash = /^#(agent|gate)$/.test(location.hash) ? location.hash : "";
-  const fragment = decodeURIComponent(location.hash.slice(1) || "");
+  // A fragment that is not valid percent-encoding is no case id; it must
+  // not stop the page from rendering.
+  let fragment = "";
+  try { fragment = decodeURIComponent(location.hash.slice(1) || ""); } catch (err) { fragment = ""; }
   if (fragment && PAGE.caseIdRe.test(fragment) && fragment !== "agent" && fragment !== "gate") out.caseHash = fragment;
   return out;
 }
@@ -272,6 +275,10 @@ const heldOutFailures = (run) => (run.cases || []).filter((c) => !c.admitted && 
 // A superseded push (aborted, nothing recorded) says nothing about the gate;
 // the Brief counts it and the Grid gives it no column.
 const tellsSomething = (run) => measured(run) || run.setup_death || concluded(run);
+// A Grid column: a run that graded cases, or died before them. A green run
+// with no cases recorded (the gate revalidated the branch's earlier run) is
+// neither; it gets no column rather than a row of "died" cells.
+const gridColumnRun = (run) => measured(run) || run.setup_death || (concluded(run) && !isGreen(run));
 
 function windowRuns(sinceMs, untilMs) {
   return runs().filter((run) => {
@@ -975,14 +982,14 @@ const cellOutcome = { passed: "pass", failed: "fail", partial: "partial", infra:
 function gridWindow(link, inc) {
   const key = ui.window || link.window;
   const toMs = link.sinceMs != null ? (link.untilMs ?? nowMs()) : nowMs();
-  if (link.sinceMs != null && !key) return { fromMs: inc ? incidentStartMs(inc) : link.sinceMs, toMs, key: "linked", live: link.untilMs == null };
+  if (link.sinceMs != null && (!key || key === "linked")) return { fromMs: inc ? incidentStartMs(inc) : link.sinceMs, toMs, key: "linked", live: link.untilMs == null };
   const chosen = PAGE.gridWindows.find((w) => w[0] === (key || PAGE.gridDefaultWindow)) || PAGE.gridWindows[0];
   return { fromMs: toMs - chosen[1], toMs, key: chosen[0], live: link.untilMs == null };
 }
 
 function gridColumns(win) {
   const inWindow = runs().filter((r) => { const t = runStart(r); return t != null && t >= win.fromMs && t <= win.toMs; });
-  const cols = inWindow.filter(tellsSomething).map((r) => ({ kind: "run", run: r, t: runStart(r), build: String(r.build) }));
+  const cols = inWindow.filter(gridColumnRun).map((r) => ({ kind: "run", run: r, t: runStart(r), build: String(r.build) }));
   const hidden = inWindow.length - cols.length;
   if (win.live) {
     for (const p of Array.isArray(brief.pending) ? brief.pending : []) {
@@ -1095,7 +1102,7 @@ function gridHtml(link) {
     `<span class="sep">·</span>markers ${chip("marker", "merge", "merges", ui.markers.merge)}${chip("marker", "incident", "incidents", ui.markers.incident)}</div>`;
   if (!cols.length) {
     return `<div class="sec head"><h1>Cases by run</h1><div class="lede">Every case by every presubmit run in the window, in time order; a cell opens that run's detail for the case.</div></div>${banner}${ctl}` +
-      `<div class="gridwrap"><p class="mut">No presubmit run started ${esc(etSpan(win.fromMs, win.toMs))}${hidden ? ` (${plural(hidden, "aborted run")} not shown)` : ""}. This page carries the runs of the last ${esc(brief.run_days ?? "?")} days.</p></div>` + footHtml();
+      `<div class="gridwrap"><p class="mut">No presubmit run started ${esc(etSpan(win.fromMs, win.toMs))}${hidden ? ` (${plural(hidden, "run")} without cases not shown)` : ""}. This page carries the runs of the last ${esc(brief.run_days ?? "?")} days.</p></div>` + footHtml();
   }
   // Column heads are written vertically: a busy day is a hundred columns,
   // and a PR number needs its digits more than the grid needs the width.
@@ -1116,7 +1123,7 @@ function gridHtml(link) {
     (g.more ? `<div class="more">${plural(g.more, "more held-out case")} passed everything in this window · <button type="button" data-toggle="held">show</button></div><div class="grp-fill"></div>` : "")).join("");
   const legend = `<div class="legend"><span><i class="pass"></i>passed</span><span><i class="fail"></i>failed all reps</span><span><i class="partial"></i>failed some reps</span><span><i class="infra"></i>quota / infra</span><span><i class="died"></i>run died before the cases</span><span><i class="running"></i>still running</span><span><i></i>not in run</span>` +
     (ui.markers.merge ? `<span><i class="mkmerge"></i>merge to main</span>` : "") + (ui.markers.incident ? `<span><i class="mkincident"></i>incident start</span><span><i class="mkrecovered"></i>healthy again</span>` : "") +
-    `<span style="margin-left:auto">${plural(cols.length, "column")} · presubmit runs in start order${hidden ? ` · ${plural(hidden, "aborted run")} not shown` : ""}</span></div>`;
+    `<span style="margin-left:auto">${plural(cols.length, "column")} · presubmit runs in start order${hidden ? ` · ${plural(hidden, "run")} without cases (aborted, or green on revalidation) not shown` : ""}</span></div>`;
   return `<div class="sec head"><h1>Cases by run</h1><div class="lede">Every case by every presubmit run in the window, in time order. Blocking cases first, by domain; held-out cases that passed everything are folded away. Click a cell for that run's detail.</div></div>${banner}${ctl}` +
     `<div class="gridwrap"><div class="gscroll"><div class="g" style="grid-template-columns:var(--namew) repeat(${cols.length},minmax(var(--colmin),1fr));padding-top:${mk.padTop}px">${mk.lines}${mk.labels}${head}${body}</div></div>${legend}${mk.list}</div>` +
     detailHtml() + footHtml();
@@ -1154,7 +1161,7 @@ function onClick(event) {
   const d = target.dataset;
   if (d.sort) ui.sort = d.sort;
   else if (d.show) ui.show = d.show;
-  else if (d.window) ui.window = d.window === "linked" ? null : d.window;
+  else if (d.window) ui.window = d.window;
   else if (d.rows) ui.rows = d.rows;
   else if (d.marker) ui.markers[d.marker] = !ui.markers[d.marker];
   else if (d.toggle === "held") ui.showHeld = true;
@@ -1190,6 +1197,9 @@ function renderAll() {
   const link = linkState();
   const app = document.getElementById("app");
   const page = document.body.dataset.page in renderers ? document.body.dataset.page : "brief";
+  // A re-render (a click, the poll) must not move the Grid under the reader.
+  const scrolled = document.querySelector(".gscroll");
+  const keepLeft = scrolled ? scrolled.scrollLeft : null;
   try {
     if (!briefLoaded) throw new Error(`the page's data element (#${PAGE.inlineBrief}) is missing or unreadable`);
     app.innerHTML = renderers[page](link);
@@ -1205,10 +1215,11 @@ function renderAll() {
     const row = document.getElementById(`case-${link.caseHash}`);
     if (row) row.scrollIntoView({ block: "center" });
   }
-  if (page === "grid" && link.sinceMs == null) {
-    // A live window is read from its newest run; a linked incident from its start.
+  if (page === "grid") {
+    // First paint: a live window is read from its newest run, a linked
+    // incident from its start. Afterwards the reader's position stands.
     const wrap = document.querySelector(".gscroll");
-    if (wrap) wrap.scrollLeft = wrap.scrollWidth;
+    if (wrap) wrap.scrollLeft = keepLeft != null ? keepLeft : (link.sinceMs == null ? wrap.scrollWidth : 0);
   }
 }
 

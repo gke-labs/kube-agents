@@ -748,6 +748,14 @@ class CasesAndGridPagesTest(unittest.TestCase):
         data["cases"].append({"name": "retired-probe", "domain": "cost", "active": False})
         data["releases"] = [RC_RELEASE, dict(RC_RELEASE, build_id="7", rc_tag="hostile", artifacts_url="javascript:alert(1)", verdict=None, started="2026-09-09T03:35:01+00:00")]
         data["pending_builds"] = [{"build_id": "2097300000000000000", "first_seen": "2026-09-08T14:00:00+00:00"}]
+        # A green run that recorded no cases (the gate revalidated the
+        # branch's earlier run) sits inside the live window: no Grid column.
+        data["runs"].append({"build_id": "2097299999999999999", "pr": 4242, "started": "2026-09-08T13:00:00+00:00",
+                             "finished": "2026-09-08T13:04:00+00:00", "result": "SUCCESS", "duration_s": 240, "tasks": []})
+        # Hostile strings on the paths the Grid and the Cases page render.
+        oldest = next(r for r in data["runs"] if any(t.get("name") == CRASHLOOP_TRIO[0] and t.get("reps") for t in r["tasks"]))
+        next(t for t in oldest["tasks"] if t.get("name") == CRASHLOOP_TRIO[0])["reps"][0]["reason"] = "<script>alert(1)</script> required phrases absent"
+        data["cases"].append({"name": "<img src=x onerror=alert(2)>", "domain": "<b>x</b>", "active": False, "nightly_active": True})
         history = history_lines(
             dict(health_doc("GREEN"), tick="2026-09-06T01:00:00+00:00", since="2026-09-06T01:00:00+00:00"),
             dict(health_doc(since="2026-09-07T14:00:00+00:00"), tick="2026-09-07T14:00:00+00:00"),
@@ -821,6 +829,32 @@ class CasesAndGridPagesTest(unittest.TestCase):
         self.assertLess(six.count('class="hd"'), app.count('class="hd"'))
         failing = dom_text(self.grid_page, query="rows=failing")
         self.assertNotIn("passed everything in this window", failing)
+
+    def test_hostile_data_and_a_bad_fragment_never_break_the_new_pages(self):
+        for page in (self.cases_page, self.grid_page):
+            for fragment in ("", "#%", "#%E0%A4%A"):
+                app = dom_text(page, fragment=fragment)
+                self.assertNotIn("<img", app, f"{page.name}{fragment}")
+                self.assertNotIn("<script>alert", app, f"{page.name}{fragment}")
+                self.assertNotIn("<b>x</b>", app, f"{page.name}{fragment}")
+                self.assertNotIn("could not render", app, f"{page.name}{fragment}")
+                self.assertIn("cluster-agent-crashloop-debug", app, f"{page.name}{fragment} rendered")
+        cases = dom_text(self.cases_page)
+        self.assertIn("&lt;img src=x onerror=alert(2)&gt;", cases, "the hostile name is on the page, escaped")
+
+    def test_a_green_run_without_cases_gets_no_grid_column(self):
+        app = dom_text(self.grid_page)
+        self.assertNotIn("#4242", app)
+        self.assertIn("without cases", app)
+        self.assertIn("#4242", dom_text(self.out / "index.html"), "the Brief still lists it")
+
+    def test_the_this_incident_chip_wins_over_a_window_parameter(self):
+        query = urllib.parse.urlencode({"cases": CRASHLOOP_TRIO[0], "since": "2026-09-07T14:00:00Z", "until": "2026-09-08T01:00:00Z", "window": "24h"})
+        app = dom_text(self.grid_page, query=query)
+        self.assertIn('data-window="24h" class="on"', app)
+        clicked = dom_text(clicked_page(self.grid_page, 'button[data-window="linked"]'), query=query)
+        self.assertIn('data-window="linked" class="on"', clicked)
+        self.assertNotIn('data-window="24h" class="on"', clicked)
 
     def test_grid_deep_link_scopes_to_the_incident(self):
         query = urllib.parse.urlencode({"cases": ",".join(CRASHLOOP_TRIO), "since": "2026-09-07T14:00:00Z", "until": "2026-09-08T01:00:00Z"})

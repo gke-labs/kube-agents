@@ -113,7 +113,7 @@ SETUP_DEATH_MAX_DURATION = timedelta(minutes=5)
 
 # --- Pass rate ---------------------------------------------------------------
 # The per-case pass rate the PR view quotes is over runs started inside
-# this many days before `now`, run-level events excluded as on the legacy
+# this many days before `now`, run-level events excluded as on the Cases
 # page (a broken run's failures are the run's, not the cases').
 PASS_RATE_DAYS = 30
 RUN_EVENT_FAIL_FRACTION = 0.8
