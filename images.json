@@ -181,8 +181,17 @@
       "repository": "docker.io/library/golang",
       "tag": "1.27-alpine",
       "buildArg": "GOLANG_IMAGE",
-      "pulledBy": "deploy/docker/Dockerfile, k8s-operator/Dockerfile and a2a/Dockerfile.gateway builder stages.",
+      "pulledBy": "deploy/docker/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.gateway and a2a/Dockerfile.worker builder stages.",
       "description": "Go toolchain for the operator and k8s-event-watcher builds."
+    },
+    {
+      "name": "node",
+      "origin": "build-time",
+      "repository": "docker.io/library/node",
+      "tag": "22-slim",
+      "buildArg": "NODE_IMAGE",
+      "pulledBy": "a2a/Dockerfile.worker runtime stage.",
+      "description": "Node runtime for the session worker image, which installs the agent SDK's platform package to get the harness binary."
     },
     {
       "name": "python",

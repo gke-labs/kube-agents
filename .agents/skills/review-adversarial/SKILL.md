@@ -9,10 +9,12 @@ Given a diff range, find the defects in it and report only the ones you can defe
 the review method itself and holds no plumbing: it is run by an author against their own branch
 before opening a pull request (the `AGENTS.md` requirement, wrapped by `review-preflight`), and by a
 reviewer against a pull request already open (`.claude/commands/pr-review-batch.md`, which wraps it
-in the GitHub-side work).
+in the GitHub-side work), and by `kube-agents-bot` as the method for its candidate passes when a
+repository nominates it (step 1 says what that reader keeps and what it cannot do).
 
 `review-docs-drift` is the companion pass, not part of this one. Angle H stops at the rules the
-diff visibly breaks and leaves the rest of the documentation question to that skill.
+diff visibly breaks and at prose the diff makes false — the one hop from a hunk to the sentence it
+falsified — and leaves the rest of the documentation question to that skill.
 
 # Procedure
 
@@ -46,6 +48,26 @@ bodies, plan files, or scratch notes_.
 You will be tempted to skip this on a small diff. The cost of a fresh context is one subagent; the
 cost of skipping it is that the pass reports what you already believed.
 
+**When a review bot runs this file.** `kube-agents-bot` can be handed this file as the method for
+its candidate passes — `playbook:` in a repository's `.github/kube-agents-bot.yml`; whether this
+repository has set it is a question for that file, and the bot's own README and design document
+(`kube-agents-bot`, `playbook:`) are canonical for the key and for everything this paragraph says
+about the bot — so that the author's pre-PR pass and the automated review look for the same
+things. The bot reads this file from the **base** commit, so a pull request editing it is reviewed
+under the version it did not write. For that reader this step is met by construction: it did not
+write the change and cannot spawn anything, so it starts at step 2. It has no shell, no `gh`, and no
+way to write, and it hands what it finds to a scoring stage of its own. In that setting, every
+instruction below to run, build, revert, or query is a step to reason about and to name as not run:
+raise the candidate on what the tree shows, say which run would settle it, and do not drop a
+candidate for want of the run. Angle J is the exception the host already makes for its own
+equivalent — a reviewer whose only input is a `gh` query is skipped, not guessed at. This file's
+step 6, the disposition, belongs to the author. And the bot's own output contract replaces three
+things here: the shape under **Output**, the verdict labels of step 5, and the words under
+**Severity** — the pass still writes a severity, in the host's vocabulary, and the host's scoring
+stage adds the confidence and decides what is kept. The angles, and the discipline of re-deriving
+every candidate from source before it counts, are the same document in both hands, which is the
+point.
+
 ## 2. Fix the diff range
 
 Everything below is measured against one range, so name it before you start:
@@ -57,8 +79,17 @@ git diff --stat "$BASE"...HEAD     # three-dot: against the merge base, not the 
 `$BASE` is `main` for a branch you are about to propose, or the branch the pull request targets.
 The three-dot form keeps unrelated base-branch drift out of scope.
 
-Read the changed files at their **post-merge state**, not just the hunks. A hunk shows you what
-moved; the enclosing function tells you whether it still works.
+Out of the diff is not out of the review. When the tree is the pull request already merged onto its
+base — what a review bot reads, and what actually lands — the base's drift since the branch point
+is in it, and an assumption the branch made about the base that the base has since moved (a pinned
+image, a schema, a helper's signature) is in scope even though no hunk shows it: it is the thing
+that breaks on merge. A reviewer's worktree under `pr-review-batch` is the same tree, its base
+merged in first. On an author's own branch the same question is the drift check in
+[`docs/pull-request-workflow.md`](../../../docs/pull-request-workflow.md#measure-how-far-a-branch-has-drifted-from-main).
+In every case, ask what the base changed under the files the diff touches.
+
+Read the changed files at their state **with this change applied**, not just the hunks. A hunk shows
+you what moved; the enclosing function tells you whether it still works.
 
 ## 3. Establish intent
 
@@ -133,6 +164,11 @@ repo already applies this to prose — identifiers verified against source, not 
 docs — and code gets it for the same reason. Watch for the neighbours: an import added for a symbol
 nothing uses, a dependency added without a pin or a provenance, a value hard-coded where the
 surrounding code reads configuration, and files changed that the stated intent never mentioned.
+The same goes for what the diff **calls without changing**: a script a workflow step now runs, a
+template a chart now includes, a helper a new container should have gone through — open it and
+check that what the diff hands it (a token's scope, a variable's shape, a security context) is what
+it needs. #1237's blocker was a token minted `contents: write` and handed to a script the diff never
+touched, which needed `packages: write`; nothing in the hunks said so.
 
 **Angle D — operations and security.** This repo provisions clusters and holds credentials, so
 weigh blast radius: IAM and RBAC scope, credential handling and redaction, NetworkPolicy reach,
@@ -164,7 +200,11 @@ where docs drift belongs: one canonical home per fact, generated `<!-- BEGIN GEN
 regenerated rather than hand-edited, identifiers verified against source rather than against other
 docs. `review-docs-drift` is the exhaustive form of that check and the author is required to have
 run it before opening — which is a reason to read what they reported, not a reason to skip this
-angle.
+angle. **Prose this change makes false is a finding on the same footing as a bug**, not a style
+note: a comment, a document, an in-tree statement that described the old behaviour and now
+describes something that no longer ships. Name the passage and the mechanism in the change that
+falsified it. It is one hop from the diff — the file the hunk sits in, the page that documents the
+flag it changed — and it is a class a second reader finds after a first reader said nothing.
 
 **Angle I — scope and test coverage.** Hold the diff against the intent sentence from step 3. Flag
 changes that do not serve it: an unrelated refactor riding along, a dependency bump nobody asked
@@ -173,6 +213,16 @@ diff and hides the real hunks. Repo convention is scoped changes and no unrelate
 cite the rule when it applies. Judge by whether a change serves the stated intent, not by how large
 it is — a big diff that does one thing is in scope, and a three-line change that does a second
 thing is not.
+
+Read the pull request's **Self-Review** and **Testing** sections when there is a body. `AGENTS.md`
+is canonical for what each owes a reviewer — "What any reviewer reads first" for the Self-Review,
+and the live-validation bullet under Pull Request Hygiene with `.agents/rules/pre_pr_review.md` for
+Testing; what this angle adds is that they are claims the tree can check: every path, script, or
+command the Testing section credits must exist and do what it is credited with, and a guard or test
+the description says covers a case must reach that case. A claim the diff does not support is the
+finding that page describes. One exception: on a preflight re-run of your own branch the Self-Review
+is the previous round's dispositions, and `review-preflight` §7 says a fresh pass is not handed
+those — read it on a reviewer's or a bot's pass, withhold it on a re-run of your own.
 
 Then check that the intent is actually tested: for each behaviour the change claims, name the test
 that would fail if that behaviour regressed. Where there is none, the candidate is the untested
@@ -281,11 +331,30 @@ instead of a silent edit.
 When the review is your own, before opening a pull request, that disposition list **is** the PR
 body's **Self-Review** section. See `AGENTS.md`, "Pull Request Hygiene".
 
+# Severity
+
+Severity is the consequence if the finding ships; the verdict from step 5 is your confidence in it.
+Keep the two apart — a CONFIRMED LOW and a PLAUSIBLE BLOCKER are both ordinary — and use these four,
+which `review-preflight`'s merged list and `pr-review-batch`'s report line both order by.
+A review bot running this file writes its severity in the host's own words, and step 1 says so:
+
+- **BLOCKER** — merging it breaks something for everyone: a release or CI path, a running install,
+  a credential's scope or reach. Must not merge as it stands.
+- **HIGH** — a defect a user or operator reaches in ordinary use, introduced or unmasked by this
+  change; or a claim in the description, the Self-Review, or the docs that the diff contradicts.
+  Fix before merge, or argue the reason in the disposition.
+- **MEDIUM** — a real defect on a narrow or unusual path, a degraded but not broken behaviour, or a
+  behaviour the change claims that nothing tests. Fix, or file it and say so.
+- **LOW** — a cleanup with a concrete, stated cost: duplication, a missed reuse, a hard-coded value,
+  an unneeded step. Reported like the rest — what step 5 keeps is reported and the reader decides
+  what to hold back — and never promoted to pad a list.
+
 # Output
 
 Severity-ordered findings, each with:
 
 - an anchor (`file:line`),
+- its severity (the four words above),
 - what is wrong, in one sentence,
 - the concrete failure scenario,
 - the verdict from step 5,

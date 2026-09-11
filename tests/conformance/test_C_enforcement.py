@@ -364,6 +364,100 @@ class C1IsolationIsStructural(unittest.TestCase):
                         "an egress rule with no `to` allows every destination",
                     )
 
+    def test_C1_the_session_fence_selects_the_pods_the_spawner_stamps(self) -> None:
+        """The one A2A assertion that has to live here rather than in Go.
+
+        Under `spec.mode: next` the operator renders an egress NetworkPolicy
+        over the pods the A2A gateway spawns per delegated task. That fence is
+        what stops delegation being the way around the agent pod's own egress
+        allowlist: a session pod runs the model, holds a shared bus credential,
+        and without the fence has open egress.
+
+        A NetworkPolicy binds by label. The selector is a constant in the
+        operator (Go module `k8s-operator`) and the labels are constants in the
+        gateway's spawner (Go module `a2a`) -- two modules, so neither can
+        import the other's constant and no Go test can compare them. Rename
+        either side and both suites stay green, `kubectl get netpol` still
+        shows the policy, and it selects zero pods. There is no "selected
+        nothing" signal in the API, which is precisely the failure this suite
+        exists for: an object's existence mistaken for its enforcement.
+
+        Asserted as agreement rather than as literal values, so that renaming
+        the pair on purpose -- in both places, which is the point -- keeps this
+        green.
+        """
+        # The operator's constants are split across two files in one package.
+        fence = h.text("a2a_session_fence") + h.text("operator_labels")
+        spawner = h.text("a2a_spawner")
+
+        def go_const(source: str, name: str) -> str:
+            match = re.search(
+                rf"^\s*(?:const\s+)?{name}\s*=\s*\"([^\"]+)\"", source, re.MULTILINE
+            )
+            self.assertIsNotNone(match, f"{name} is no longer a string constant")
+            return match.group(1)
+
+        # The spawner's side: what a session pod actually carries.
+        stamped = {
+            go_const(spawner, "labelPartOf"): go_const(spawner, "partOfValue"),
+            go_const(spawner, "labelRole"): go_const(spawner, "sessionRole"),
+        }
+
+        # The operator's side: what the fence's podSelector requires. Read out
+        # of the function body, so a doc comment naming the labels cannot
+        # satisfy this.
+        body = h.go_function_body(fence, "buildA2ASessionNetworkPolicy")
+        selector = re.search(
+            r"PodSelector: metav1\.LabelSelector\{\s*MatchLabels: map\[string\]string\{(.+?)\}",
+            body,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(selector, "the session fence no longer has a podSelector")
+
+        required = {}
+        for key_expr, value_expr in re.findall(
+            r"(\"[^\"]+\"|\w+):\s*(\"[^\"]+\"|\w+),", selector.group(1)
+        ):
+            key = key_expr.strip('"') if key_expr.startswith('"') else go_const(fence, key_expr)
+            value = value_expr.strip('"') if value_expr.startswith('"') else go_const(fence, value_expr)
+            required[key] = value
+
+        self.assertTrue(required, "the fence's podSelector parsed as empty")
+        # Every label the fence requires must be one the spawner stamps, with
+        # the same value. A selector requiring a label the pod lacks matches
+        # nothing; the reverse -- a pod carrying extra labels -- is fine.
+        self.assertEqual(
+            required,
+            {key: stamped.get(key) for key in required},
+            "the session fence selects labels the spawner does not stamp, so it "
+            "fences no pod: fence requires %r, spawner stamps %r" % (required, stamped),
+        )
+
+    def test_C1_a_session_pod_carries_no_kubernetes_identity(self) -> None:
+        """The premise the fence's rule set rests on.
+
+        The fence grants DNS, the bus and LiteLLM and nothing else -- no
+        API-server rule, no 443, no metadata rule beyond DNS -- and that is
+        only safe while a session pod has no ServiceAccount to use them with.
+        The spawner sets AutomountServiceAccountToken false and names no
+        ServiceAccountName; if either changes, the pod acquires an identity
+        the fence was written on the assumption it did not have.
+        """
+        spawner = h.text("a2a_spawner")
+        body = h.go_function_body(spawner, "Spawn")
+
+        self.assertIn(
+            "AutomountServiceAccountToken: ptr.To(false)",
+            body,
+            "the spawner no longer refuses the ServiceAccount token mount",
+        )
+        self.assertNotIn(
+            "ServiceAccountName:",
+            body,
+            "the spawner now names a ServiceAccount, so a session pod has a "
+            "Kubernetes identity the session fence's rule set does not account for",
+        )
+
     @h.known_violation("C1", "slice-2b/findings.md 1.4 (see gke-labs/kube-agents#676)")
     def test_C1_the_rendered_egress_policy_reaches_no_metadata_address(self) -> None:
         """KNOWN VIOLATION. The sandbox reaches the metadata server anyway.

@@ -37,10 +37,22 @@ file matters.
 ### Live validation
 
 <!--
-Required: an empty section is not an answer. Describe how this change was exercised
-against a real, running kube-agents installation — which install (cluster, image tag,
-operator version), what you did, and what you observed at each layer the change claims to
-touch: the CR `.status`, the Deployment env, the file or process inside the pod.
+Required: an empty section is not an answer. Three forms, by what the change touches:
+
+- It changes what an agent does (prompt, SOP, skill, tool, runtime path, a fix for agent
+  behaviour, or a chart/operator/config change that alters it): the eval loop is the live
+  validation. Name the case (new or existing); the red run against `main` (install and commit,
+  the failing check and its reason, one line of the agent's report); the three green runs
+  against this branch; where the case is registered. Mechanics:
+  .agents/rules/eval_driven_development.md. "No cluster" is not an answer: every contributor
+  has a dev project.
+- It changes runtime behaviour but not what an agent does (operator, chart, installer, image):
+  describe how it was exercised against a real, running kube-agents installation — which
+  install (cluster, image tag, operator version), what you did, and what you observed at each
+  layer the change claims to touch: the CR `.status`, the Deployment env, the file or process
+  inside the pod.
+- It cannot reach a running installation (docs, CI, pool/fleet/Prow infrastructure, the bench
+  harness under `bench/kube_agents_bench/`): write "Not live-tested" and say why.
 
 Prove the mechanism, not a coincidence: if the new behaviour happens to match the old
 default, set something distinctly different, then revert and confirm it goes back.
@@ -52,9 +64,6 @@ For a genuinely graphical surface (admin console, docs site, chat), capture and 
 screenshot with `scripts/pr_evidence_screenshot.sh` — it publishes the image and prints
 Markdown stamped with the commit and capture time. Command output stays as fenced text
 transcripts, not screenshots.
-
-If the change cannot reach a running installation — docs-only, a CI workflow, a path
-that needs infrastructure you do not have — write "Not live-tested" and say why.
 
 If the install is shared with other agents, take the lease first: see
 docs/designs/live-test-lease.md.

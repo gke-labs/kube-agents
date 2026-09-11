@@ -22,7 +22,7 @@
         "expr": "50 6 * * *",
         "display": "50 6 * * *"
       },
-      "prompt": "Run the daily workload reliability audit. Read the SOP at 'governance/obtainability_audit_sop.md' in your profile home — all 288 lines of it, before you run anything. Its eleven checks are section 3, lines 91-220, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
+      "prompt": "Run the daily workload reliability audit. Read the SOP at 'governance/obtainability_audit_sop.md' in your profile home — all 301 lines of it, before you run anything. Its eleven checks are section 3, lines 92-221, so a read that stops early skips almost the entire audit and reports a clean fleet it never looked at. Then execute it exactly, using the fleet-audit skill to open and close the audit run.",
       "skills": ["fleet-audit"],
       "risk": "low",
       "enabled": true,

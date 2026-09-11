@@ -79,6 +79,10 @@ readonly PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT="platform-agent-credential-p
 readonly TF_HELM_RELEASE_TYPE="helm_release"
 readonly TF_CERT_MANAGER_RELEASE_NAME="cert_manager"
 readonly TF_KUBE_AGENTS_RELEASE_NAME="kube_agents"
+# The composition's Google Chat Pub/Sub subscription in Terraform state (#1397).
+readonly TF_PUBSUB_SUBSCRIPTION_TYPE="google_pubsub_subscription"
+readonly TF_CHAT_EVENTS_SUBSCRIPTION_NAME="chat_events"
+readonly TF_RESOURCE_MODE_MANAGED="managed"
 # The Helm status of a release whose last operation failed, the one of a first
 # install still in flight or interrupted, and the statuses `helm history`
 # gives a revision that served at some point.
@@ -95,6 +99,9 @@ readonly PLATFORM_AGENT_SHELL_AUTHORIZED_KEYS_SECRET="platform-agent-shell-autho
 # validate_immutable_ref, so only a direct caller of the generator or the
 # interactive dev prompt ever reaches it.
 readonly IMAGE_TAG_FALLBACK="latest"
+
+# Suffix appended when deriving Google Chat Pub/Sub subscription name from a custom topic (#1397).
+readonly CHAT_SUBSCRIPTION_SUFFIX="-sub"
 
 # ─── Terraform state in GCS ───────────────────────────────────────────────────
 # The object the gcs backend writes under the prefix, and how gcloud spells
@@ -561,6 +568,27 @@ derive_kms_location() {
   echo "$loc"
 }
 
+# ─── Pub/Sub Derivations ──────────────────────────────────────────────────────
+# Derive the Google Chat Pub/Sub subscription name from the topic name.
+# When CHAT_SUB_NAME is unset (empty), derive "${topic}${CHAT_SUBSCRIPTION_SUFFIX}"
+# if CHAT_TOPIC_NAME is non-default, or DEFAULT_CHAT_SUB_NAME on the default topic (#1397).
+# An explicit CHAT_SUB_NAME (even if set to the default subscription name) always wins
+# to prevent destroying working subscriptions on existing installs during upgrade.
+derive_chat_sub_name() {
+  local topic="${1:-${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}}"
+  local sub="${2:-}"
+
+  if [ -n "$sub" ]; then
+    echo "$sub"
+    return
+  fi
+  if [ -n "$topic" ] && [ "$topic" != "$DEFAULT_CHAT_TOPIC_NAME" ]; then
+    echo "${topic}${CHAT_SUBSCRIPTION_SUFFIX}"
+  else
+    echo "$DEFAULT_CHAT_SUB_NAME"
+  fi
+}
+
 # ─── GitHub Account Classification ────────────────────────────────────────────
 # Classifies a GitHub account name against the public API, echoing exactly one
 # of: organization | user | missing | unknown.
@@ -663,13 +691,15 @@ check_github_org_is_organization() {
 # from the original install. lifecycle.sh's ensure_backend and state_prefix
 # derive the same two answers from the same install.defaults.env values.
 tf_state_bucket() {
+  local project="${1:-${PROJECT_ID:-}}"
   local bucket="${KUBE_AGENTS_STATE_BUCKET:-$DEFAULT_KUBE_AGENTS_STATE_BUCKET}"
-  [ "$bucket" = "$DEFAULT_KUBE_AGENTS_STATE_BUCKET" ] && bucket="${PROJECT_ID}${DEFAULT_TF_STATE_BUCKET_SUFFIX}"
+  [ "$bucket" = "$DEFAULT_KUBE_AGENTS_STATE_BUCKET" ] && bucket="${project}${DEFAULT_TF_STATE_BUCKET_SUFFIX}"
   echo "$bucket"
 }
 
 tf_state_prefix() {
-  echo "${KUBE_AGENTS_STATE_PREFIX:-${DEFAULT_TF_STATE_PREFIX_ROOT}/${CLUSTER_NAME}}"
+  local cluster="${1:-${CLUSTER_NAME:-}}"
+  echo "${KUBE_AGENTS_STATE_PREFIX:-${DEFAULT_TF_STATE_PREFIX_ROOT}/${cluster}}"
 }
 
 # The basename of the first ENABLED version of a Cloud KMS key, or nothing.
@@ -728,8 +758,13 @@ tf_state_read() {
   # probe whose miss is expected, while the caller's `|| return` carries on
   # regardless. Dropping the trap affects this subshell only.
   trap - ERR
+  local project="${1:-${PROJECT_ID:-}}"
+  local cluster="${2:-${CLUSTER_NAME:-}}"
+  if [ -z "$project" ] || [ -z "$cluster" ]; then
+    return 1
+  fi
   local object state err_file err
-  object="gs://$(tf_state_bucket)/$(tf_state_prefix)/${TF_STATE_OBJECT}"
+  object="gs://$(tf_state_bucket "$project")/$(tf_state_prefix "$cluster")/${TF_STATE_OBJECT}"
   err_file="$(mktemp)"
   if ! state="$(gcloud storage cat "$object" 2>"$err_file")"; then
     err="$(cat "$err_file" 2>/dev/null)"
@@ -845,6 +880,32 @@ for r in doc.get("resources", []):
         if account_id:
             print(account_id)
 ' "$TF_STATE_RC_UNREADABLE"
+}
+
+# The name of the Google Chat Pub/Sub subscription this install's state
+# manages. Empty when there is no state or the subscription is not in state;
+# tf_state_read's return code when the state could not be read or parsed.
+# shellcheck disable=SC2120
+tf_state_chat_subscription_name() {
+  trap - ERR
+  local state
+  state=$(tf_state_read "$@") || return $?
+  printf '%s' "$state" | python3 -c '
+import json, sys
+rtype, rname, rmode, unreadable = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    sys.exit(unreadable)
+for r in doc.get("resources", []):
+    if r.get("type") == rtype and r.get("name") == rname and r.get("mode") == rmode:
+        for i in r.get("instances", []):
+            name = (i.get("attributes") or {}).get("name")
+            if name:
+                print(name)
+                sys.exit(0)
+sys.exit(0)
+' "$TF_PUBSUB_SUBSCRIPTION_TYPE" "$TF_CHAT_EVENTS_SUBSCRIPTION_NAME" "$TF_RESOURCE_MODE_MANAGED" "$TF_STATE_RC_UNREADABLE"
 }
 
 # Refuse an apply that would stop on a service account this install does not
@@ -1703,9 +1764,24 @@ write_tfvars_from_state() {
       echo "project_roles  = $(hcl_csv_list "${PLATFORM_AGENT_CUSTOM_ROLES:-}")"
     fi
     echo ""
+    local chat_topic="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
+    local chat_sub="${CHAT_SUB_NAME:-$DEFAULT_CHAT_SUB_NAME}"
+    if [ "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}" = "true" ]; then
+      local state_sub="" state_rc=0
+      state_sub="$(tf_state_chat_subscription_name)" || state_rc=$?
+      if [ "$state_rc" -eq "$TF_STATE_RC_UNREADABLE" ]; then
+        print_warning "Could not determine if Google Chat Pub/Sub subscription is in Terraform state (see above); proceeding with configuration." >&2
+      fi
+
+      if [ -n "$state_sub" ]; then
+        chat_sub="$state_sub"
+      elif [ -z "${CHAT_SUB_NAME:-}" ] || [ "$CHAT_SUB_NAME" = "$DEFAULT_CHAT_SUB_NAME" ]; then
+        chat_sub="$(derive_chat_sub_name "$chat_topic")"
+      fi
+    fi
     echo "enable_google_chat        = $(hcl_bool "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}")"
-    echo "chat_topic_name           = $(hcl_str "${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}")"
-    echo "chat_subscription_name    = $(hcl_str "${CHAT_SUB_NAME:-$DEFAULT_CHAT_SUB_NAME}")"
+    echo "chat_topic_name           = $(hcl_str "$chat_topic")"
+    echo "chat_subscription_name    = $(hcl_str "$chat_sub")"
     echo "google_chat_allowed_users = $(hcl_csv_list "${ALLOWED_USERS:-}")"
     echo "google_chat_home_channel  = $(hcl_str "${GOOGLE_CHAT_HOME_CHANNEL:-}")"
     echo "google_chat_mode          = $(hcl_str "${GOOGLE_CHAT_MODE:-$DEFAULT_GOOGLE_CHAT_MODE}")"

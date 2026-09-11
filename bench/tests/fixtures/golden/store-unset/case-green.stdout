@@ -1,0 +1,7 @@
+exit 0
+Task agent-kanban-smoke Result: [PASSED] passed all 3 repetitions
+  deployer: noop
+  rep 1: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.5]
+  rep 2: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.5]
+  rep 3: pass -- VerificationCorrectness=1.0 [OutcomeScore=1.0 OutcomeValidity=1.0 ToolInvocation=0.5]
+  admission: admitted by BOOTSTRAP_ADMITTED (transition bridge)

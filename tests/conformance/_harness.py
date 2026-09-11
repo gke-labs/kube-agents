@@ -207,6 +207,25 @@ SOURCES: dict[str, Source] = {
         "platformagent-ha.yaml",
         ("kind: Deployment", "kubeagents:leader:", "- pods"),
     ),
+    # C1's cross-module pair. The session fence is rendered by the operator
+    # (Go module k8s-operator) and its selector has to match the labels the
+    # A2A gateway's spawner stamps (Go module a2a). Two modules, so no Go test
+    # can compare them, and a NetworkPolicy that selects nothing is
+    # indistinguishable from one that is working.
+    "a2a_session_fence": Source(
+        "k8s-operator/internal/controller/platformagent_a2a_manifests.go",
+        ("func buildA2ASessionNetworkPolicy", "a2aSessionComponent", "a2aPartOf ="),
+    ),
+    # labelPartOf lives here rather than beside the fence, so resolving the
+    # operator's side of the pair needs both files.
+    "operator_labels": Source(
+        "k8s-operator/internal/controller/manifest_helpers.go",
+        ("labelPartOf",),
+    ),
+    "a2a_spawner": Source(
+        "a2a/gateway/spawn.go",
+        ("partOfValue", "sessionRole", "AutomountServiceAccountToken"),
+    ),
     # --- model egress -----------------------------------------------------
     # The redactor the chart mounts into the LiteLLM gateway. It is a copy of
     # the chat plugin's module, and tests/test_litellm_redaction.py keeps the

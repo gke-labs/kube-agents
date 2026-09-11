@@ -14,9 +14,9 @@ only, with schema_version bumped on anything else. The additive fields this
 collector emits beyond the v1 core: `tasks[].reps` (per-repetition grading
 detail, present only when the log carries `rep N:` grading lines),
 `runs[].pr_merged` (whether the run's PR had merged at collection time,
-resolved best-effort through `gh`), `runs[].tier` / `runs[].job` (which
-job produced the run: the presubmit gate, or the nightly periodic below)
-and `releases[]` (release-candidate eval runs, below).
+resolved best-effort through `gh`), `runs[].tier` / `runs[].job` (which job
+produced the run: the presubmit gate, or the nightly periodic below) and
+`releases[]` (release-candidate eval runs, below).
 
 Two tiers, one schema. The presubmit (pull-kube-agents-smoke-test) runs the
 gate matrix on every pull request; the nightly periodic
@@ -617,13 +617,13 @@ def task_domain(name: str, repo_root: pathlib.Path = REPO_ROOT) -> str:
         text = path.read_text()
     except OSError:
         return "unknown"
-    m = re.search(r"^domain:\s*([A-Za-z0-9_-]+)\s*$", text, re.MULTILINE)
+    m = re.search(r"^domain:\s*([A-Za-z0-9_-]+)\s*$", text, re.M)
     return m.group(1) if m else "unknown"
 
 
 def _task_array_names(text: str, array: str) -> set[str]:
     """The uncommented `./tasks/<name>/task.yaml` entries of one bash array."""
-    m = re.search(rf"^{array}=\(\n(.*?)^\)$", text, re.MULTILINE | re.DOTALL)
+    m = re.search(rf"^{array}=\(\n(.*?)^\)$", text, re.M | re.S)
     if not m:
         raise ValueError(f"{array}=( ... ) array not found in hack/ci-eval-pr.sh")
     names = set()
@@ -667,7 +667,7 @@ def coverage(repo_root: pathlib.Path = REPO_ROOT) -> dict:
     and the unit tests here assert this parse agrees with it.
     """
     text = (repo_root / "docs" / "designs" / "domains.yaml").read_text()
-    slugs = re.findall(r"^\s*-\s*slug:\s*([A-Za-z0-9_-]+)", text, re.MULTILINE)
+    slugs = re.findall(r"^\s*-\s*slug:\s*([A-Za-z0-9_-]+)", text, re.M)
     uncovered = []
     in_allowlist = False
     for line in text.splitlines():
@@ -904,6 +904,26 @@ def _started_at(started_text: str | None) -> datetime | None:
         return None
 
 
+def _admitted(build_id: str, after_build: int | None, retry_builds: frozenset[str]) -> bool:
+    """The incremental watermark: whether a listed build is worth reading.
+
+    Prow build ids are monotonic in START order, so a build at or below the
+    newest RECORDED id may still be in flight (started earlier, outlived the
+    build the watermark came from) -- skipping on the id alone would drop it
+    from the dashboard permanently once the watermark climbs past it.
+    retry_builds carries exactly those ids (the prior file's pending_builds)
+    back through the filter; everything else at or below the watermark is
+    already on record and costs zero reads.
+    """
+    return after_build is None or int(build_id) > after_build or build_id in retry_builds
+
+
+def _job_from_base(base: str) -> str | None:
+    """The job name in a build directory's URL, or None when it has none."""
+    m = _JOB_IN_PATH.search(base)
+    return m.group("job") if m else None
+
+
 def _build_dirs(listing: str) -> list[tuple[str, str]]:
     """(build_id, directory URL) pairs from one `gsutil ls` listing.
 
@@ -941,26 +961,6 @@ def _gcs_reader(base: str, gsutil: str):
         return cache[name]
 
     return reader
-
-
-def _admitted(build_id: str, after_build: int | None, retry_builds: frozenset[str]) -> bool:
-    """The incremental watermark: whether a listed build is worth reading.
-
-    Prow build ids are monotonic in START order, so a build at or below the
-    newest RECORDED id may still be in flight (started earlier, outlived the
-    build the watermark came from) -- skipping on the id alone would drop it
-    from the dashboard permanently once the watermark climbs past it.
-    retry_builds carries exactly those ids (the prior file's pending_builds)
-    back through the filter; everything else at or below the watermark is
-    already on record and costs zero reads.
-    """
-    return after_build is None or int(build_id) > after_build or build_id in retry_builds
-
-
-def _job_from_base(base: str) -> str | None:
-    """The job name in a build directory's URL, or None when it has none."""
-    m = _JOB_IN_PATH.search(base)
-    return m.group("job") if m else None
 
 
 def _read_build(

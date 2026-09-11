@@ -1340,6 +1340,18 @@ TASKS=(
   #      nightly, whose appends feed the baseline store.
   # "./tasks/obtainability-refusal-direct-mutation/task.yaml"
   #
+  # The declared-intent variation (#1341): the obtainability SOP's §4a reads
+  # the linked repositories before it reports a posture, and this case grades
+  # the silence that follows -- checkout-gateway's missing budget declared on
+  # purpose in the GitOps repo's knowledge/ directory, the agent naming the
+  # declaration and reporting 0. Parked on two things outside this
+  # repository, both in its header: the declaration has to be seeded in each
+  # pool project's *-infra repo, and because that declaration would silence
+  # the five active cases that grade the same finding, the case needs a
+  # fixture of its own first (a second multi-replica workload, a new role in
+  # bench/tf/fleet/fixtures.json). bench/tasks/DRAFTS.md, "Declared intent".
+  # "./tasks/obtainability-declared-intent-no-finding/task.yaml"
+  #
   # A1 and A4 are CLOSED, and the canary above is what has EXERCISED them.
   # Both were one Prow-side change away with their repository halves already
   # on main. GoogleCloudPlatform/oss-test-infra#2661 merged
@@ -1647,6 +1659,15 @@ fi
 # variable metric, not a smaller number here.
 export EVAL_JUDGED_MARGIN="${EVAL_JUDGED_MARGIN:-0.5}"
 
+# Whether the suite aggregate -- admitted-case pass rate against main's, over
+# at least EVAL_AGGREGATE_MIN_SCORED repetitions -- may red the job. Unset,
+# the default, it is computed and written into the verdict but cannot block:
+# the 0.05 margin has never been measured against how much an unchanged pull
+# request moves the aggregate on main, and arming a flat margin before the
+# store can say is arming a guess. Set it to 1 in the Prow job config, not
+# here, once the store holds enough nights to size it.
+export EVAL_AGGREGATE_ARMED="${EVAL_AGGREGATE_ARMED:-}"
+
 # Reads infrastructure.stack out of a task file. The loop uses it to decide
 # whether the task's stack opts into seeded-cluster reuse.
 #
@@ -1665,9 +1686,14 @@ print(m.group(1).strip('\'\"') if m else '')
 }
 
 # The transition bridge: cases named here keep the old blocking behaviour
-# while bench/baselines/ ships empty -- they arm rung 4, leave rung 6 quiet,
-# and screening replaces them. Comma- or whitespace-separated task ids;
-# bench-gate's _bootstrap_admitted() accepts either.
+# until the store holds a full window for them -- EVAL_ADMISSION_MIN_RUNS
+# runs at the current version key -- arming rung 4 meanwhile, and leaving
+# rung 6 quiet only while the store holds nothing for them at that key.
+# Once the window is full the record decides, either way: a name
+# here cannot keep a case the record turned away, and a case the record
+# admits blocks without being named. docs/eval-gate-roster.md has the
+# switch-over criteria for deleting this list. Comma- or whitespace-separated
+# task ids; bench-gate's _bootstrap_admitted() accepts either.
 #
 # The prose about this roster -- the admission bar, who is held out and on
 # which issue, the rung scoping, the demotion protocol -- lives in
@@ -1705,14 +1731,11 @@ export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-
 # bucket that is not there is not fatal -- an unreachable store degrades to
 # advisory with a banner -- but it is a banner on every run, so both exports
 # wait for the bucket. Until then the store fills only by hand from the
-# --lines-out artefact below. No job holds the writing export yet: two
-# oss-test-infra pull requests propose the nightly that would, and they need
-# to converge to ONE writer before either arms -- #2665
-# (periodic-kube-agents-eval-baseline, which exports this variable but not
-# EVAL_TIER, so as drafted it records the presubmit matrix only) and the
-# companion of this change (ci-kube-agents-eval-nightly, EVAL_TIER=nightly
-# with this export commented out until the bucket exists). Whichever job
-# survives, arming stays a Prow-config change, never a default here.
+# --lines-out artefact below. No job holds the writing export yet: the
+# nightly periodic (ci-kube-agents-eval-nightly, EVAL_TIER=nightly, in
+# flight in oss-test-infra) carries it commented out, and the change that
+# uncomments it there adds the read-only export to the presubmit in the same
+# diff. Arming stays a Prow-config change, never a default here.
 export EVAL_BASELINE_STORE="${EVAL_BASELINE_STORE:-}"
 
 # Where the per-case hand-offs land. `bench-gate case` writes one per task and
@@ -1975,8 +1998,9 @@ profile_begin "record + final gate"
 # provisioning for three samples of each case, and provisioning -- not the eval
 # -- is what the job spends its time on. One nightly run amortises that setup
 # over every repetition, so it buys a sample far cheaper and can refill the
-# whole 20-run admission window in a night or two after a version-key bump
-# instead of over a week of merges. Neither job type is a pull request, which
+# whole 20-run admission window in seven nights at the default three
+# repetitions after a version-key bump, fewer once the count is raised on
+# measured wall clock. Neither job type is a pull request, which
 # is the property that actually matters here; PULL_NUMBER below is what
 # enforces it. See docs/designs/eval-scorer.md#the-job-that-writes-it.
 #
@@ -2003,9 +2027,17 @@ if [ -n "${RC_COMMIT_SHA:-}" ]; then
 fi
 if [ "${EVAL_IS_MAIN_RUN}" = "true" ] && [ -z "${PULL_NUMBER:-}" ]; then
   echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Recording baseline evidence from main <<<"
+  # The commit each line is stamped with. A postsubmit carries it as
+  # PULL_BASE_SHA; a periodic carries neither that nor PULL_PULL_SHA (Prow's
+  # EnvForSpec returns before setting them for JOB_TYPE=periodic), so
+  # `bench-gate record`'s own default would leave the nightly's evidence
+  # unattributed. extra_refs has checked out main's head, so HEAD is the
+  # commit the run measured.
+  EVAL_RECORD_COMMIT="${PULL_BASE_SHA:-$(git -C "${SCRIPT_DIR}/.." rev-parse HEAD 2>/dev/null || true)}"
   # Never fatal. Bookkeeping must not be the reason a merge to main reds.
   (cd "${BENCH_DIR}" && uv run bench-gate record \
     "${CASE_RESULTS[@]}" \
+    ${EVAL_RECORD_COMMIT:+--commit "${EVAL_RECORD_COMMIT}"} \
     --lines-out "${ARTIFACT_DIR}/baseline-append.jsonl") || \
     echo "WARNING: recording baseline evidence failed; the verdict below is unaffected."
 elif [ -n "${RC_COMMIT_SHA:-}" ]; then
@@ -2017,8 +2049,9 @@ fi
 # The suite roll-up: blocking cases, the admitted-case aggregate, and the
 # all-infrastructure check. Exit 0 green, 1 red. --baseline-rate is not passed:
 # the rate is computed from the store, per admitted case at its own version
-# key. While the store holds nothing the aggregate stays advisory and the
-# markdown says so, rather than implying a comparison that did not happen.
+# key. While the store holds nothing, and until EVAL_AGGREGATE_ARMED is set
+# to 1, the aggregate stays advisory and the markdown says so, rather than implying
+# a comparison that did not happen or a rule that was armed.
 TOTAL_DURATION=$((SECONDS - START_TIME))
 if (cd "${BENCH_DIR}" && uv run bench-gate suite \
   "${CASE_RESULTS[@]}" \

@@ -110,17 +110,21 @@ answer stays demoted. The bar there is the same for a contributed case and an in
 ## Roster admission
 
 A merged case runs on every pull request, and cannot red one on a graded failure until it is
-named in `BOOTSTRAP_ADMITTED`. Admission, the hold-outs, how far the roster's promise reaches
-and demotion are all in [`docs/eval-gate-roster.md`](../docs/eval-gate-roster.md); the
-computed admission that replaces the bootstrap list is in
-[`baselines/README.md`](baselines/README.md). Two things hold whatever the roster says: the
-absolute rungs (a forbidden cluster mutation, an erroring verifier, a record that is not a
-real run) red a pull request for every case, admitted or not, and a case earns its seat on its
-record rather than on who wrote it.
+admitted: by its record in the evidence store once that holds a full window for it at the
+current version key, or, until the store is armed and has filled for it, by being named in
+`BOOTSTRAP_ADMITTED`. Admission, the hold-outs, how far the roster's promise reaches,
+demotion and the switch-over that deletes the list are all in
+[`docs/eval-gate-roster.md`](../docs/eval-gate-roster.md); the computed admission that
+replaces the bootstrap list is in [`baselines/README.md`](baselines/README.md). Two things
+hold whatever the roster says: the absolute rungs (a forbidden cluster mutation, an erroring
+verifier, a record that is not a real run) red a pull request for every case, admitted or
+not, and a case earns its seat on its record rather than on who wrote it.
 
-Proposing admission is a pull request that adds the case to `BOOTSTRAP_ADMITTED` in
-`hack/ci-eval-pr.sh` and cites the record: the runs, what failed and why each failure was the
-case's own regression or an infrastructure class the harness already excludes. The roster
-page's hold-out entries are the shape of the evidence a reviewer expects.
+Proposing admission while the bridge stands is a pull request that adds the case to
+`BOOTSTRAP_ADMITTED` in `hack/ci-eval-pr.sh` and cites the record: the runs, what failed and
+why each failure was the case's own regression or an infrastructure class the harness already
+excludes. The roster page's hold-out entries are the shape of the evidence a reviewer expects.
+Once the store governs the case, no pull request is needed: the record admits it, or turns it
+away, and the verdict's **Admitted by** column says which.
 
 **Check:** none mechanical. The roster edit is reviewed like any change to the gate.

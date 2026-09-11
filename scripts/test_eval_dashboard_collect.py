@@ -295,7 +295,7 @@ class _MergeBase(unittest.TestCase):
         index = root / FAKE_INDEX_PREFIX[len(FAKE_BUCKET):]
         index.mkdir(parents=True, exist_ok=True)
         (index / "latest-build.txt").write_text(max(builds, key=int) + "\n" if builds else "")
-        return self._arm_fake_gsutil(root)
+        return self._install_fake_gsutil(root)
 
     def fake_rc_gsutil(self, build_ids) -> tuple[str, pathlib.Path]:
         """The same, under the RC job's prefix, serving copies of the one real
@@ -305,10 +305,10 @@ class _MergeBase(unittest.TestCase):
         prefix.mkdir(parents=True, exist_ok=True)
         for build_id in build_ids:
             shutil.copytree(RC_TESTDATA / BUILD_RC_GREEN, prefix / build_id)
-        return self._arm_fake_gsutil(root)
+        return self._install_fake_gsutil(root)
 
-    def _arm_fake_gsutil(self, root: pathlib.Path) -> tuple[str, pathlib.Path]:
-        """Install the fake gsutil over `root` and return (path, call log)."""
+    def _install_fake_gsutil(self, root) -> tuple[str, pathlib.Path]:
+        """Write the fake gsutil over `root`; (gsutil path, call-log path)."""
         gsutil = self.tmp / "fake-gsutil"
         gsutil.write_text(_FAKE_GSUTIL)
         gsutil.chmod(gsutil.stat().st_mode | stat.S_IXUSR)
@@ -639,11 +639,14 @@ class TestIncrementalGcsScan(_MergeBase):
 # The refresh workflow's publish gate, read from .github/workflows/
 # ci-health.yml rather than copied, so the tests below pin that a failed
 # index listing or pointer read trips the grep the workflow actually runs.
+# The workflow pipes collect.log through a `grep -v` that drops the
+# release-candidate lane's lines before this pattern sees it; index warnings
+# name the presubmit job, so that filter never hides them.
 _WORKFLOW = pathlib.Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci-health.yml"
-# The workflow filters the advisory RC lane's lines out first (`grep -v`),
-# then greps the rest; the refusal pattern is the second grep's.
-_REFUSAL_GREP = re.search(r'work/collect\.log \\\n\s*\| grep -Eq "([^"]+)"', _WORKFLOW.read_text())
-assert _REFUSAL_GREP, f"{_WORKFLOW} no longer greps collect.log the way this test reads it; update this test's gate"
+_REFUSAL_GREP = re.search(
+    r'work/collect\.log \\\n\s*\| grep -Eq "([^"]+)"', _WORKFLOW.read_text()
+)
+assert _REFUSAL_GREP, f"{_WORKFLOW} no longer greps collect.log; update this test's gate"
 WORKFLOW_REFUSAL = re.compile(_REFUSAL_GREP.group(1))
 
 
@@ -826,6 +829,8 @@ class TestIndexDiscovery(_MergeBase):
         }.items():
             with self.subTest(label):
                 log.write_text("")
+                # Pinned: the fixture build finished 2026-08-27 and the
+                # default --since-days window would age it out.
                 merged, _ = self.quiet_collect(
                     pr_globs=[FAKE_GLOB], gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX, now=now, **kwargs
                 )

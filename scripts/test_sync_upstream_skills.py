@@ -116,6 +116,27 @@ class ApplySubstitutionsTest(unittest.TestCase):
         self.assertFalse(sync.apply_substitutions(str(d), "gke-workload-security"))
         self.assertEqual(self._read(d), "other content\n")
 
+    def test_applies_manifest_generation_routing_substitution(self):
+        d = self._skill_dir(body="description: >-\n  " + sync.GKE_MANIFEST_GENERATION_OLD_ROUTING_SNIPPET + "\n")
+        self.assertTrue(sync.apply_substitutions(str(d), "gke-manifest-generation"))
+        text = self._read(d)
+        self.assertNotIn(sync.GKE_MANIFEST_GENERATION_OLD_ROUTING_SNIPPET, text)
+        self.assertIn(sync.GKE_MANIFEST_GENERATION_NEW_ROUTING_SNIPPET, text)
+        self.assertIn("(use gcp-config-connector)", text)
+        # Second call must be a no-op (replacement already present).
+        self.assertFalse(sync.apply_substitutions(str(d), "gke-manifest-generation"))
+        self.assertEqual(self._read(d).count(sync.GKE_MANIFEST_GENERATION_NEW_ROUTING_SNIPPET), 1)
+
+    def test_repo_manifest_generation_skill_routes_to_config_connector(self):
+        # The in-tree mirror must already read as a fresh sync would leave it: the substitution's
+        # replacement present, its target gone, and the skill it routes to present in the tree.
+        repo_root = Path(__file__).resolve().parent.parent
+        skills_dir = repo_root / "agents" / "platform" / "skills"
+        content = (skills_dir / "gke-manifest-generation" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertNotIn(sync.GKE_MANIFEST_GENERATION_OLD_ROUTING_SNIPPET, content)
+        self.assertIn(sync.GKE_MANIFEST_GENERATION_NEW_ROUTING_SNIPPET, content)
+        self.assertTrue((skills_dir / "gcp-config-connector" / "SKILL.md").is_file())
+
     def test_repo_workload_security_skills_have_enforcement_command(self):
         repo_root = Path(__file__).resolve().parent.parent
         for agent in ["platform", "cluster"]:
