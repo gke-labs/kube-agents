@@ -322,6 +322,7 @@ fi
 
 # ─── Agentic & Automation Parameter States ────────────────────────────────────
 PARAM_NON_INTERACTIVE="${NONINTERACTIVE:-false}"
+PARAM_GENERATE_ONLY="${GENERATE_ONLY:-false}"
 PARAM_DRY_RUN="${DRY_RUN:-false}"
 PARAM_PROJECT_ID="${PROJECT_ID:-}"
 PARAM_REGION="${REGION:-}"
@@ -426,6 +427,9 @@ Usage:
 
 Flags for AI Agents & Automation:
   -y, --yes, --non-interactive  Run in non-interactive mode (use flags/defaults)
+  --generate-only               Generate install.env and terraform.tfvars, run
+                                pre-apply checks, print lifecycle commands, and
+                                exit without applying
   --dry-run                     Validate prerequisites & output config/plan without creating resources
   --project-id=ID               Target GCP Project ID
   --region=REGION               Target GCP Region (default: install.defaults.env
@@ -538,6 +542,7 @@ parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -y|--yes|--non-interactive) PARAM_NON_INTERACTIVE="true"; shift ;;
+      --generate-only) PARAM_GENERATE_ONLY="true"; shift ;;
       --dry-run) PARAM_DRY_RUN="true"; shift ;;
       --menu|--config|--configure|menu|config) PARAM_MENU_MODE="true"; shift ;;
       --project-id=*) PARAM_PROJECT_ID="${1#*=}"; shift ;;
@@ -1709,6 +1714,7 @@ write_json_report() {
 {
   "status": "$(json_escape "$status")",
   "dry_run": ${PARAM_DRY_RUN},
+  "generate_only": ${PARAM_GENERATE_ONLY},
   "non_interactive": ${PARAM_NON_INTERACTIVE},
   "project_id": "$(json_escape "${project_id:-}")",
   "project_number": "$(json_escape "${project_number:-}")",
@@ -1737,8 +1743,6 @@ tf_compose_dir() {
   echo "${1}/terraform/examples/full-install"
 }
 
-# Evaluates PIPESTATUS after a pipeline guarded with `|| ps=("${PIPESTATUS[@]}")`.
-# Dispatches to on_error with the primary command name instead of the trailing tee.
 handle_pipeline_status() {
   local primary_cmd="$1"
   local log_file="$2"
@@ -1750,6 +1754,68 @@ handle_pipeline_status() {
   elif [ "$rc_tee" -ne 0 ]; then
     on_error "$rc_tee" "$LINENO" "tee \"$log_file\""
   fi
+}
+
+# Prints out-of-Terraform prerequisites, lifecycle commands with state bucket
+# and prefix, and post-apply steps when running with --generate-only.
+print_generate_only_handoff() {
+  local repo_dir="$1" project_id="$2" cluster_name="$3" region="$4" tfvars_file="$5"
+  local kms_loc key_resource keyring key minter_keyring minter_key state_bkt state_pfx
+
+  kms_loc="$(derive_kms_location "$region")"
+  keyring="${GKE_DB_KMS_KEYRING:-$DEFAULT_GKE_DB_KMS_KEYRING}"
+  key="${GKE_DB_KMS_KEY:-$DEFAULT_GKE_DB_KMS_KEY}"
+  key_resource="projects/${project_id}/locations/${kms_loc}/keyRings/${keyring}/cryptoKeys/${key}"
+  minter_keyring="${KMS_KEYRING:-$DEFAULT_KMS_KEYRING}"
+  minter_key="${KMS_KEY:-$DEFAULT_KMS_KEY}"
+  state_bkt="$(tf_state_bucket)"
+  state_pfx="$(tf_state_prefix)"
+
+  print_step "Generation Complete — Operator Handoff"
+  print_success "Configuration generated and validated without touching GCP resources."
+  echo ""
+  echo -e "  • ${C_CYAN}Install configuration:${C_RESET} ${INSTALL_ENV_FILE}"
+  echo -e "  • ${C_CYAN}Terraform input:${C_RESET} ${tfvars_file}"
+  echo ""
+  echo -e "${C_BOLD}Next steps for the operator to apply manually:${C_RESET}"
+  echo ""
+  echo -e "${C_BOLD}1. Out-of-Terraform prerequisites (run if applicable to your cluster):${C_RESET}"
+  echo -e "  • ${C_CYAN}CMEK Database Encryption (pre-existing cluster without CMEK):${C_RESET}"
+  echo -e "    gcloud services enable cloudkms.googleapis.com --project=${project_id}"
+  echo -e "    gcloud kms keyrings create ${keyring} --location=${kms_loc} --project=${project_id} 2>/dev/null || true"
+  echo -e "    gcloud kms keys create ${key} --keyring=${keyring} --location=${kms_loc} --purpose=encryption --project=${project_id} 2>/dev/null || true"
+  echo -e "    gcloud beta services identity create --service=container.googleapis.com --project=${project_id} 2>/dev/null || true"
+  echo -e "    gcloud kms keys add-iam-policy-binding ${key} --keyring=${keyring} --location=${kms_loc} \\\\"
+  echo -e "      --member=\"serviceAccount:service-\$(gcloud projects describe ${project_id} --format='value(projectNumber)')@container-engine-robot.iam.gserviceaccount.com\" \\\\"
+  echo -e "      --role=\"roles/cloudkms.cryptoKeyEncrypterDecrypter\" --project=${project_id} --quiet"
+  echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --database-encryption-key=${key_resource} --project ${project_id}"
+  echo ""
+  echo -e "  • ${C_CYAN}Workload Identity Pool (pre-existing Standard cluster):${C_RESET}"
+  echo -e "    # Note: Migrating node pools to GKE_METADATA recreates nodes and restarts workloads."
+  echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --workload-pool=${project_id}.svc.id.goog"
+  echo -e "    gcloud container node-pools update <node-pool> --cluster=${cluster_name} --location=${region} --project=${project_id} --workload-metadata=GKE_METADATA"
+  echo ""
+  echo -e "  • ${C_CYAN}NetworkPolicy Enforcement (pre-existing cluster without Dataplane V2):${C_RESET}"
+  echo -e "    # Note: Enabling Calico may recreate nodes and restart workloads."
+  echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --update-addons=NetworkPolicy=ENABLED"
+  echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --enable-network-policy"
+  echo ""
+  echo -e "  • ${C_CYAN}GitHub App PEM Import (before apply, when GitOps minter is enabled):${C_RESET}"
+  echo -e "    gcloud services enable cloudkms.googleapis.com --project=${project_id}"
+  echo -e "    gcloud kms keyrings create ${minter_keyring} --location=${kms_loc} --project=${project_id} 2>/dev/null || true"
+  echo -e "    gcloud kms keys create ${minter_key} --keyring=${minter_keyring} --location=${kms_loc} \\\\"
+  echo -e "      --purpose=asymmetric-signing --default-algorithm=rsa-sign-pkcs1-2048-sha256 \\\\"
+  echo -e "      --import-only --skip-initial-version-creation --protection-level=software --project=${project_id} 2>/dev/null || true"
+  echo -e "    git clone --depth 1 --branch ${MINTY_CLI_GIT_TAG} ${MINTY_CLI_REPO_URL} ${MINTY_CLI_MANUAL_CLONE_DIR}"
+  echo -e "    (cd ${MINTY_CLI_MANUAL_CLONE_DIR} && go run ./cmd/minty tools import-pk -project-id=${project_id} -location=${kms_loc} -key-ring=${minter_keyring} -key=${minter_key} -private-key=@<path-to-pem>)"
+  echo ""
+  echo -e "${C_BOLD}2. Apply via lifecycle.sh (remote state in GCS):${C_RESET}"
+  echo -e "  cd ${repo_dir}/terraform/examples/full-install"
+  echo -e "  KUBE_AGENTS_STATE_BUCKET=\"${state_bkt}\" KUBE_AGENTS_STATE_PREFIX=\"${state_pfx}\" ./lifecycle.sh apply"
+  echo ""
+  echo -e "${C_BOLD}3. Out-of-Terraform post-apply steps (if creating a new cluster):${C_RESET}"
+  echo -e "  • ${C_CYAN}Managed OpenTelemetry Scope:${C_RESET}"
+  echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS"
 }
 
 # Runs lifecycle.sh apply against the generated terraform.tfvars. Reads the
@@ -2665,6 +2731,10 @@ run_menu_system() {
 # ─── Main Installer Procedure ──────────────────────────────────────────────────
 main() {
   parse_args "$@"
+  if [ "$PARAM_DRY_RUN" = "true" ] && [ "$PARAM_GENERATE_ONLY" = "true" ]; then
+    print_error "--dry-run and --generate-only are different modes and cannot be combined."
+    return 2
+  fi
   print_banner
 
   if [ "${PARAM_MENU_MODE:-false}" = "true" ]; then
@@ -2684,6 +2754,9 @@ main() {
   if [ "$PARAM_NON_INTERACTIVE" = "true" ]; then
     print_info "Execution Mode: ${C_BOLD}Non-Interactive / AI Agent Automated Mode${C_RESET} 🤖"
     export CLOUDSDK_CORE_DISABLE_PROMPTS="1"
+  fi
+  if [ "$PARAM_GENERATE_ONLY" = "true" ]; then
+    print_info "Execution Mode: ${C_BOLD}Generate-Only Mode (stopping before apply)${C_RESET} 📄"
   fi
 
   local image_tag=""
@@ -3731,21 +3804,38 @@ main() {
     exit 0
   fi
 
-  # Refuse before the confirmation checkpoint and before any cluster mutations
-  # if adopting an existing cluster lacking required node pool migration or NetworkPolicy
-  # without explicit opt-in.
-  check_existing_cluster_node_pools_preflight "$project_id" "$cluster_name" "$region"
-  check_existing_cluster_network_policy_preflight "$project_id" "$cluster_name" "$region"
+  if [ "$PARAM_GENERATE_ONLY" != "true" ]; then
+    # Refuse before the confirmation checkpoint and before any cluster mutations
+    # if adopting an existing cluster lacking required node pool migration or NetworkPolicy
+    # without explicit opt-in.
+    check_existing_cluster_node_pools_preflight "$project_id" "$cluster_name" "$region"
+    check_existing_cluster_network_policy_preflight "$project_id" "$cluster_name" "$region"
+  fi
 
-  if [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
+  if [ "$PARAM_GENERATE_ONLY" != "true" ] && [ "$PARAM_NON_INTERACTIVE" != "true" ]; then
     local confirm_choice=""
-    prompt_read "\nProceed with automated GKE cluster & Platform Agent provisioning? (Y/n)" confirm_choice "y"
-    if [[ ! "$confirm_choice" =~ ^[Yy]$ ]]; then
-      print_warning "Provisioning paused by user. Configuration saved to: $INSTALL_ENV_FILE"
-      print_info "To launch provisioning later, run: ${C_BOLD}cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=${DEFAULT_KUBE_AGENTS_STATE_BUCKET} ./lifecycle.sh apply${C_RESET}"
-      write_json_report "PAUSED"
-      exit 0
-    fi
+    prompt_read "\nProceed with automated GKE cluster & Platform Agent provisioning? (Y/n/g)" confirm_choice "y"
+    case "$confirm_choice" in
+      [Yy])
+        ;;
+      [Gg])
+        PARAM_GENERATE_ONLY="true"
+        ;;
+      *)
+        print_warning "Provisioning paused by user. Configuration saved to: $INSTALL_ENV_FILE"
+        print_info "To launch provisioning later, run: ${C_BOLD}cd terraform/examples/full-install && KUBE_AGENTS_STATE_BUCKET=${DEFAULT_KUBE_AGENTS_STATE_BUCKET} ./lifecycle.sh apply${C_RESET}"
+        write_json_report "PAUSED"
+        exit 0
+        ;;
+    esac
+  fi
+
+  if [ "$PARAM_GENERATE_ONLY" = "true" ]; then
+    print_info "Generate-only: configuration files written. Running pre-apply validation checks..."
+    check_github_org_is_organization "${GITOPS_ORG:-}"
+    print_generate_only_handoff "$repo_dir" "$project_id" "$cluster_name" "$region" "$tfvars_file"
+    write_json_report "GENERATE_ONLY_SUCCESS"
+    exit 0
   fi
 
   # 12. Execute the Terraform Engine

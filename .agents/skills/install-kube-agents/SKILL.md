@@ -76,6 +76,28 @@ cd kube-agents
 
 Do not clone `main` to deploy an official release: manifests and CRD schemas on `main` evolve continuously and diverge from released container images. Running install scripts against a mismatched checkout will fail `verify_local_source_ref` to prevent deploying incompatible manifests.
 
+## Generate-Only Mode
+
+To generate configuration files (`install.env` and `terraform.tfvars`), run pre-apply validation checks, and hand off the apply to the operator without creating or mutating cloud resources, use `--generate-only`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gke-labs/kube-agents/<RELEASE_VERSION>/install.sh | bash -s -- \
+  --generate-only \
+  --non-interactive \
+  --project-id="YOUR_GCP_PROJECT_ID" \
+  --cluster-name="platform-agent-host" \
+  --region="us-central1"
+```
+
+In `--generate-only` mode, the installer:
+
+1. Writes `install.env` (if absent) and `terraform/examples/full-install/terraform.tfvars`.
+2. Runs pre-apply validation checks (e.g., verifying the GitOps organization).
+3. Prints a checklist of out-of-Terraform prerequisites (CMEK database encryption, Workload Identity, NetworkPolicy, GitHub App PEM import, and OTel scope) and the `lifecycle.sh apply` command with remote state variables (`KUBE_AGENTS_STATE_BUCKET` and `KUBE_AGENTS_STATE_PREFIX`).
+4. Exits 0 with status `GENERATE_ONLY_SUCCESS` in `/tmp/kube-agents-install-report.json`.
+
+The interactive wizard also offers the same choice by answering `g` at the final confirmation step.
+
 ## Dry-Run Inspection
 
 To validate prerequisites and preview the install without creating GCP resources, AI Agents must use `--dry-run` with the official release installer (substituting `<RELEASE_VERSION>` with the resolved release version):
