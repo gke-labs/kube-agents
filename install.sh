@@ -32,6 +32,7 @@ kube_agents_clone_dir() { printf '%s/kube-agents' "${HOME:?the installer clones 
 MINTY_CLI_REPO_URL="https://github.com/abcxyz/github-token-minter.git"
 MINTY_CLI_GIT_TAG="v2.7.1"
 MINTY_CLI_MANUAL_CLONE_DIR="/tmp/minty"
+SPINNER_INTERVAL_SECS="0.2"
 
 # ─── ANSI Colors & Terminal Responsive Helpers ─────────────────────────────────
 # A function because scripts/installer/common.sh defines the same variables
@@ -1345,6 +1346,71 @@ resolve_shared_defaults() {
   PARAM_ENABLE_STOCKOUT_INVESTIGATOR="${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
 }
 
+# Run a command or function in the background, animating a spinner with elapsed
+# time and the command's latest output line. Output is streamed to log_file.
+# Falls back to direct execution when stdout is not a terminal (CI, piped logs).
+# Returns the command's exit status and leaves error presentation to callers.
+run_with_spinner() {
+  local msg="$1"
+  local log_file="$2"
+  shift 2
+
+  if [ ! -t 1 ]; then
+    print_info "$msg..."
+    local rc=0
+    "$@" 2>&1 | tee "$log_file" || rc=${PIPESTATUS[0]}
+    return "$rc"
+  fi
+
+  "$@" >"$log_file" 2>&1 &
+  local task_pid=$!
+
+  on_spinner_interrupt() {
+    local sig="$1"
+    trap - INT TERM
+    kill -TERM "$task_pid" 2>/dev/null || true
+    tput cnorm 2>/dev/null || true
+    printf '\r%*s\r' "$term_width" ''
+    if [ -s "$log_file" ]; then
+      echo -e "\n  ${C_CYAN}ℹ Interrupted. Command output saved to: ${log_file}${C_RESET}" >&2
+    else
+      rm -f -- "$log_file"
+    fi
+    exit "$sig"
+  }
+  trap 'on_spinner_interrupt 130' INT
+  trap 'on_spinner_interrupt 143' TERM
+
+  local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
+  local frame=0
+  local started=$SECONDS
+  local status_line=""
+  local term_width=0
+  term_width="$(get_term_width)"
+  # Everything except the status line: two spaces, spinner, message, "(NNNs)",
+  # separators. Keep one column spare so the line never wraps.
+  local status_width=$((term_width - ${#msg} - 15))
+  if [ "$status_width" -lt 10 ]; then
+    status_width=10
+  fi
+  tput civis 2>/dev/null || true
+  while kill -0 "$task_pid" 2>/dev/null; do
+    status_line="$(tail -n 1 "$log_file" 2>/dev/null | tr -d '\r' | cut -c1-"$status_width")"
+    printf '\r  %b%s%b %s %b(%ss)%b %-*s' \
+      "$C_CYAN" "${frames[$((frame % 10))]}" "$C_RESET" "$msg" \
+      "$C_YELLOW" "$((SECONDS - started))" "$C_RESET" "$status_width" "$status_line"
+    frame=$((frame + 1))
+    sleep "$SPINNER_INTERVAL_SECS"
+  done
+  tput cnorm 2>/dev/null || true
+  printf '\r%*s\r' "$term_width" ''
+
+  trap - INT TERM
+  local rc=0
+  wait "$task_pid" || rc=$?
+  return "$rc"
+}
+
 # Wait for one deployment to roll out, animating a spinner with the elapsed time
 # and kubectl's own latest progress line. Falls back to plain streaming output
 # when stdout is not a terminal (CI, piped logs). Returns kubectl's exit status.
@@ -1353,48 +1419,18 @@ wait_for_rollout() {
   local namespace="$2"
   local timeout_secs="$3"
 
-  if [ ! -t 1 ]; then
-    kubectl rollout status "deployment/${deployment}" -n "$namespace" --timeout="${timeout_secs}s"
-    return $?
-  fi
-
+  local started=$SECONDS
   local log_file=""
   log_file="$(mktemp -t kube-agents-rollout.XXXXXX)"
-  kubectl rollout status "deployment/${deployment}" -n "$namespace" --timeout="${timeout_secs}s" \
-    >"$log_file" 2>&1 &
-  local kubectl_pid=$!
-
-  local frames=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
-  local frame=0
-  local started=$SECONDS
-  local status_line=""
-  local term_width=0
-  term_width="$(get_term_width)"
-  # Everything except the kubectl line: two spaces, spinner, name, "(NNNs)",
-  # separators. Keep one column spare so the line never wraps — a wrapped line
-  # cannot be rewritten with \r and would scroll the spinner down the screen.
-  local status_width=$((term_width - ${#deployment} - 15))
-  if [ "$status_width" -lt 10 ]; then
-    status_width=10
-  fi
-  tput civis 2>/dev/null || true
-  while kill -0 "$kubectl_pid" 2>/dev/null; do
-    status_line="$(tail -n 1 "$log_file" 2>/dev/null | tr -d '\r' | cut -c1-"$status_width")"
-    printf '\r  %b%s%b %s %b(%ss)%b %-*s' \
-      "$C_CYAN" "${frames[$((frame % 10))]}" "$C_RESET" "$deployment" \
-      "$C_YELLOW" "$((SECONDS - started))" "$C_RESET" "$status_width" "$status_line"
-    frame=$((frame + 1))
-    sleep 0.2
-  done
-  tput cnorm 2>/dev/null || true
-  printf '\r%*s\r' "$term_width" ''
 
   local rc=0
-  wait "$kubectl_pid" || rc=$?
+  run_with_spinner "$deployment" "$log_file" \
+    kubectl rollout status "deployment/${deployment}" -n "$namespace" --timeout="${timeout_secs}s" || rc=$?
+
   if [ "$rc" -eq 0 ]; then
     print_success "$deployment rolled out in $((SECONDS - started))s"
   else
-    tail -n 3 "$log_file" | tr -d '\r' | while IFS= read -r line; do
+    tail -n 3 "$log_file" 2>/dev/null | tr -d '\r' | while IFS= read -r line; do
       [ -n "$line" ] && print_info "$line"
     done
   fi
@@ -3760,10 +3796,25 @@ main() {
     print_info "Dry-run: validating the Terraform configuration (local state; nothing is created)."
     (
       cd "$(tf_compose_dir "$repo_dir")"
-      terraform init -backend=false -input=false >/dev/null
-      terraform validate >/dev/null
+      # shellcheck disable=SC2317,SC2329  # invoked indirectly via run_with_spinner
+      validate_tf_config() {
+        terraform init -backend=false -input=false &&
+          terraform validate
+      }
+      local tf_log=""
+      tf_log="$(mktemp -t kube-agents-tf-validate.XXXXXX)"
+      local rc=0
+      run_with_spinner "Validating Terraform configuration" "$tf_log" validate_tf_config || rc=$?
+      if [ "$rc" -eq 0 ]; then
+        print_success "Terraform configuration is valid."
+        rm -f -- "$tf_log"
+      else
+        print_error "Terraform validation failed (exit code $rc):"
+        cat "$tf_log" >&2
+        rm -f -- "$tf_log"
+        exit "$rc"
+      fi
     )
-    print_success "Terraform configuration is valid."
     if gcloud auth application-default print-access-token >/dev/null 2>&1; then
       local np_status=0
       is_existing_cluster_network_policy_satisfied "$project_id" "$cluster_name" "$region" || np_status=$?
@@ -3947,7 +3998,7 @@ main() {
     # the chat links and port-forward command.
     if ! wait_for_rollout "$deployment" "$namespace" "$ROLLOUT_TIMEOUT_SECS"; then
       slow_rollouts+=("$deployment")
-      print_warning "$deployment did not report ready within ${ROLLOUT_TIMEOUT_SECS}s."
+      print_warning "$deployment did not report ready."
     fi
   done
   if [ "${#slow_rollouts[@]}" -eq 0 ]; then
