@@ -159,6 +159,10 @@ jobs:
         id: reconcile
         env:
           CLOUDSDK_CORE_DISABLE_PROMPTS: "1"
+          # Configured in GitHub Environment Variables (vars.KUBE_AGENTS_KUBECTL_TIMEOUT).
+          # Overrides the default 8s kubectl timeout in live_test_lease.py to accommodate
+          # cold runner gke-gcloud-auth-plugin WIF token exchange and TLS handshake to GKE (#1465).
+          KUBE_AGENTS_KUBECTL_TIMEOUT: ${{ vars.KUBE_AGENTS_KUBECTL_TIMEOUT }}
           RECONCILE_MODE: ${{ inputs.mode }}
           GITHUB_ENVIRONMENT: ${{ inputs.github_environment }}
           IMAGE_TAG: ${{ inputs.image_tag }}
