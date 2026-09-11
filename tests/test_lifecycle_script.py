@@ -28,7 +28,9 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    tfvar_namespace='"kubeagents-system"',
                    tfvar_kms_keyring='"platform-agent-keyring"',
                    tfvar_kms_key='"k8s-secret-encryption-key"',
-                   tfvar_cluster_name="null"):
+                   tfvar_cluster_name="null",
+                   tfvar_enable_google_chat="true",
+                   tfvar_chat_sub_name='"platform-agent-chat-events-sub"'):
         """Run a lifecycle.sh function against stubbed terraform and gcloud commands.
 
         `gcloud_stub` answers every gcloud call; the default says the cluster
@@ -79,6 +81,12 @@ elif [[ "$cmd" == "console" ]]; then
         exit 0
     elif [[ "$expr" == *"cluster_name"* ]]; then
         echo '{tfvar_cluster_name}'
+        exit 0
+    elif [[ "$expr" == *"enable_google_chat"* ]]; then
+        echo '{tfvar_enable_google_chat}'
+        exit 0
+    elif [[ "$expr" == *"chat_subscription_name"* ]]; then
+        echo '{tfvar_chat_sub_name}'
         exit 0
     fi
     echo 'null'
@@ -414,6 +422,34 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 1)
         self.assertIn("namespace resolved to 'agents-two', but this state's release runs in 'kubeagents-system'", proc.stderr)
         self.assertIn('NAMESPACE="kubeagents-system"', proc.stderr)
+
+    def test_guard_pubsub_subscription_no_op_when_chat_disabled(self):
+        proc = self._run_guard("guard_pubsub_subscription", tfvar_enable_google_chat="false")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_pubsub_subscription_no_op_when_subscription_not_in_state(self):
+        proc = self._run_guard("guard_pubsub_subscription", state_list="")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_pubsub_subscription_passes_when_matches_state(self):
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list="module.chat_pubsub[0].google_pubsub_subscription.chat_events",
+            state_show='resource "google_pubsub_subscription" "chat_events" {\n    name = "platform-agent-chat-events-sub"\n}',
+            tfvar_chat_sub_name='"platform-agent-chat-events-sub"',
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_guard_pubsub_subscription_refuses_when_differs_from_state(self):
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list="module.chat_pubsub[0].google_pubsub_subscription.chat_events",
+            state_show='resource "google_pubsub_subscription" "chat_events" {\n    name = "platform-agent-chat-events-sub"\n}',
+            tfvar_chat_sub_name='"custom-chat-events-sub"',
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("chat_subscription_name resolved to 'custom-chat-events-sub', but this state manages Pub/Sub subscription 'platform-agent-chat-events-sub'", proc.stderr)
+        self.assertIn('CHAT_SUB_NAME="platform-agent-chat-events-sub"', proc.stderr)
 
 
 if __name__ == "__main__":

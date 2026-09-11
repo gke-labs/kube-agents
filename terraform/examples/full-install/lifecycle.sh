@@ -126,6 +126,7 @@ readonly MINTER_KMS_KEYRING_ADDRESS="module.github_minter[0].google_kms_key_ring
 readonly MINTER_KMS_KEY_ADDRESS="module.github_minter[0].google_kms_crypto_key.minter"
 readonly HELM_RELEASE_ADDRESS="helm_release.kube_agents"
 readonly AGENT_GSA_ADDRESS="module.kube_agents_iam.google_service_account.agent"
+readonly CHAT_SUBSCRIPTION_ADDRESS="module.chat_pubsub[0].google_pubsub_subscription.chat_events"
 
 #
 # One argument, "readonly", suppresses the bucket creation for `plan`. A plan
@@ -603,6 +604,39 @@ guard_gsa_identity() {
   fi
 }
 
+# `name` is ForceNew on google_pubsub_subscription, and the resource carries
+# neither create_before_destroy nor prevent_destroy. If a custom or default
+# subscription is managed in state and chat_subscription_name in terraform.tfvars
+# resolves to a different name, the next apply destroys the live subscription
+# and recreates it under -auto-approve, dropping unacknowledged Google Chat events.
+# Same shape as guard_gsa_identity.
+guard_pubsub_subscription() {
+  [[ "$(tfvar enable_google_chat)" == "true" ]] || return 0
+  load_state
+  local addr="$CHAT_SUBSCRIPTION_ADDRESS"
+  in_state "$addr" || return 0
+
+  local recorded
+  recorded=$(state_attr "$addr" name)
+  [[ -n "$recorded" ]] || return 0
+
+  local desired
+  if ! desired=$(tfvar chat_subscription_name 2>/dev/null); then
+    desired=""
+  fi
+  [[ -n "$desired" ]] || desired="$DEFAULT_CHAT_SUB_NAME"
+
+  if [[ "$recorded" != "$desired" ]]; then
+    warn "chat_subscription_name resolved to '$desired', but this state manages Pub/Sub subscription '$recorded' ($addr)."
+    warn "Applying now would plan the subscription's DESTRUCTION and recreation under -auto-approve,"
+    warn "dropping unacknowledged Google Chat events."
+    warn "If this install uses an existing subscription name, record it in install.env, which the front doors regenerate terraform.tfvars from:"
+    warn "  CHAT_SUB_NAME=\"$recorded\""
+    warn "A hand-driven apply sets chat_subscription_name in terraform.tfvars instead."
+    exit 1
+  fi
+}
+
 # `name` is ForceNew on google_kms_key_ring and google_kms_crypto_key, neither
 # carries prevent_destroy, and the installer writes both names into
 # terraform.tfvars from install.env's GKE_DB_KMS_KEYRING / GKE_DB_KMS_KEY. On
@@ -845,6 +879,7 @@ case "${1:-}" in
     guard_gsa_identity
     guard_kms_identity
     guard_release_namespace
+    guard_pubsub_subscription
     forget_unmanaged_cluster_kms
     adopt_kms
     adopt_pubsub

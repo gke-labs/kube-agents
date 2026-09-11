@@ -1334,7 +1334,7 @@ resolve_shared_defaults() {
   PARAM_ENABLE_GOOGLE_CHAT="${PARAM_ENABLE_GOOGLE_CHAT:-$DEFAULT_GOOGLE_CHAT_ENABLED}"
   PARAM_GOOGLE_CHAT_MODE="${PARAM_GOOGLE_CHAT_MODE:-$DEFAULT_GOOGLE_CHAT_MODE}"
   PARAM_CHAT_TOPIC_NAME="${PARAM_CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
-  PARAM_CHAT_SUB_NAME="$(derive_chat_sub_name "$PARAM_CHAT_TOPIC_NAME" "${PARAM_CHAT_SUB_NAME:-}")"
+  PARAM_CHAT_SUB_NAME="${PARAM_CHAT_SUB_NAME:-}"
   PARAM_GITOPS_REPO="${PARAM_GITOPS_REPO:-$DEFAULT_GITOPS_REPO}"
   PARAM_ENABLE_PUBSUB_PLATFORM="${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
   PARAM_ENABLE_STOCKOUT_INVESTIGATOR="${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
@@ -2438,8 +2438,7 @@ run_menu_system() {
   local slack_enabled="${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}"
   local allowed_users="${ALLOWED_USERS:-}"
   local chat_topic_name="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
-  local chat_sub_name
-  chat_sub_name="$(derive_chat_sub_name "$chat_topic_name" "${CHAT_SUB_NAME:-}")"
+  local chat_sub_name="${CHAT_SUB_NAME:-$DEFAULT_CHAT_SUB_NAME}"
   local permission_set="${PLATFORM_AGENT_PERMISSION_SET:-$DEFAULT_PERMISSION_SET}"
   local custom_roles="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
   # Not the fresh-install default. The control panel describes an install that
@@ -2978,8 +2977,10 @@ main() {
     allowed_users_hint="empty list"
   fi
   local chat_topic_name="$PARAM_CHAT_TOPIC_NAME"
-  local chat_sub_name
-  chat_sub_name="$(derive_chat_sub_name "$chat_topic_name" "${PARAM_CHAT_SUB_NAME:-${CHAT_SUB_NAME:-}}")"
+  local chat_sub_name="${PARAM_CHAT_SUB_NAME:-}"
+  if [ -z "$chat_sub_name" ]; then
+    chat_sub_name="$(derive_chat_sub_name "$chat_topic_name")"
+  fi
   local google_chat_mode="$PARAM_GOOGLE_CHAT_MODE"
   if [[ ! "$google_chat_mode" =~ ^(default|debug)$ ]]; then
     print_error "--google-chat-mode must be either 'default' or 'debug'."
@@ -3035,7 +3036,9 @@ main() {
     prompt_read "Allowed User Email(s) for Google Chat (comma-separated, empty allows all users)" \
       allowed_users "$allowed_users" false "$allowed_users_hint"
     prompt_read "Pub/Sub Topic Name for Google Chat" chat_topic_name "$chat_topic_name"
-    chat_sub_name="$(derive_chat_sub_name "$chat_topic_name" "${PARAM_CHAT_SUB_NAME:-${CHAT_SUB_NAME:-}}")"
+    if [ -z "${PARAM_CHAT_SUB_NAME:-}" ]; then
+      chat_sub_name="$(derive_chat_sub_name "$chat_topic_name")"
+    fi
     prompt_read "Pub/Sub Subscription Name for Google Chat" chat_sub_name "$chat_sub_name"
     prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
       google_chat_home_channel "$google_chat_home_channel"

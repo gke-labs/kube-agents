@@ -622,7 +622,7 @@ ensure_teardown_state() {
     export DEV_ARTIFACT_REGISTRY_CREATED="${DEV_ARTIFACT_REGISTRY_CREATED:-false}"
     if [ "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}" = "true" ]; then
       export CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
-      export CHAT_SUB_NAME="$(derive_chat_sub_name "$CHAT_TOPIC_NAME" "${CHAT_SUB_NAME:-}")"
+      export CHAT_SUB_NAME="${CHAT_SUB_NAME:-$DEFAULT_CHAT_SUB_NAME}"
     else
       export CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-}"
       export CHAT_SUB_NAME="${CHAT_SUB_NAME:-}"

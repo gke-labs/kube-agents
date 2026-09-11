@@ -936,7 +936,7 @@ class InstallerCommonTest(unittest.TestCase):
     def test_google_chat_derived_subscription_written_to_tfvars(self):
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
-            # 1. Custom topic with default/unset subscription derives <topic>-sub
+            # 1. Custom topic with unset subscription preserves default subscription (no destroy on legacy installs)
             proc = self._run(
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
                 env={
@@ -948,7 +948,7 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             content = dest.read_text()
             self.assertIn('chat_topic_name           = "custom-chat-events"', content)
-            self.assertIn('chat_subscription_name    = "custom-chat-events-sub"', content)
+            self.assertIn('chat_subscription_name    = "platform-agent-chat-events-sub"', content)
 
             # 2. Custom topic with explicit custom subscription retains explicit value
             proc = self._run(
@@ -964,19 +964,19 @@ class InstallerCommonTest(unittest.TestCase):
             content = dest.read_text()
             self.assertIn('chat_subscription_name    = "my-explicit-sub"', content)
 
-            # 3. Custom topic with explicit default subscription retains default subscription (no destroy on upgrade)
+            # 3. Custom topic with derived subscription (e.g. exported by install.sh) writes derived value
             proc = self._run(
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
                 env={
                     "API_SERVER_KEY": "k",
                     "GOOGLE_CHAT_ENABLED": "true",
                     "CHAT_TOPIC_NAME": "custom-chat-events",
-                    "CHAT_SUB_NAME": "platform-agent-chat-events-sub",
+                    "CHAT_SUB_NAME": "custom-chat-events-sub",
                 },
             )
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             content = dest.read_text()
-            self.assertIn('chat_subscription_name    = "platform-agent-chat-events-sub"', content)
+            self.assertIn('chat_subscription_name    = "custom-chat-events-sub"', content)
 
             # 4. Default topic retains default subscription
             proc = self._run(

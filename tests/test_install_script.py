@@ -3059,12 +3059,59 @@ source_provisioning_helpers . >/dev/null
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("SUB=custom-sub", proc.stdout)
 
-    def test_apply_defaults_derives_chat_sub_name_when_topic_custom(self):
+    def test_resolve_shared_defaults_leaves_chat_sub_name_empty_when_unset(self):
         proc = self._run_install_func(
-            'PARAM_CHAT_TOPIC_NAME="custom-events"; resolve_shared_defaults; echo "SUB=$PARAM_CHAT_SUB_NAME"'
+            'PARAM_CHAT_TOPIC_NAME="custom-events"; resolve_shared_defaults; echo "SUB=${PARAM_CHAT_SUB_NAME:-EMPTY}"'
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("SUB=custom-events-sub", proc.stdout)
+        self.assertIn("SUB=EMPTY", proc.stdout)
+
+    def test_resolve_shared_defaults_preserves_explicit_chat_sub_name(self):
+        proc = self._run_install_func(
+            'PARAM_CHAT_TOPIC_NAME="custom-events"; PARAM_CHAT_SUB_NAME="my-sub"; resolve_shared_defaults; echo "SUB=$PARAM_CHAT_SUB_NAME"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SUB=my-sub", proc.stdout)
+
+    def test_prompt_google_chat_settings_rederives_when_flag_unset(self):
+        body = pathlib.Path(_INSTALL_SH).read_text().split("_prompt_google_chat_settings() {")[1].split('case "$chat_choice" in')[0].strip()
+        proc = self._run_install_func(f"""
+prompt_read() {{
+  local prompt="$1" var="$2" default_val="${{3:-}}"
+  if [ "$var" = "chat_topic_name" ]; then
+    eval "$var=\\"operator-custom-topic\\""
+  else
+    eval "$var=\\"$default_val\\""
+  fi
+}}
+allowed_users="" allowed_users_hint="" chat_topic_name="platform-agent-chat-events" chat_sub_name="" PARAM_CHAT_SUB_NAME="" google_chat_home_channel=""
+_prompt_google_chat_settings() {{
+{body}
+_prompt_google_chat_settings
+echo "DERIVED_SUB=$chat_sub_name"
+""")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("DERIVED_SUB=operator-custom-topic-sub", proc.stdout)
+
+    def test_prompt_google_chat_settings_preserves_explicit_flag(self):
+        body = pathlib.Path(_INSTALL_SH).read_text().split("_prompt_google_chat_settings() {")[1].split('case "$chat_choice" in')[0].strip()
+        proc = self._run_install_func(f"""
+prompt_read() {{
+  local prompt="$1" var="$2" default_val="${{3:-}}"
+  if [ "$var" = "chat_topic_name" ]; then
+    eval "$var=\\"operator-custom-topic\\""
+  else
+    eval "$var=\\"$default_val\\""
+  fi
+}}
+allowed_users="" allowed_users_hint="" chat_topic_name="platform-agent-chat-events" chat_sub_name="pinned-sub" PARAM_CHAT_SUB_NAME="pinned-sub" google_chat_home_channel=""
+_prompt_google_chat_settings() {{
+{body}
+_prompt_google_chat_settings
+echo "DERIVED_SUB=$chat_sub_name"
+""")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("DERIVED_SUB=pinned-sub", proc.stdout)
 
 
 if __name__ == "__main__":
