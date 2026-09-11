@@ -38,6 +38,7 @@ _FIXTURE = _ROOT / "tests" / "e2e" / "test_stockout_investigation.py"
 _CLEAN_SCRIPT = _ROOT / "agentplugins" / "gke-stockout-investigator" / "scenarios" / "lib" / "clean_stale_kanban_tasks.py"
 _UPGRADE_SCRIPT = _ROOT / "upgrade.sh"
 _E2E_RUN_WORKFLOW = _ROOT / ".github" / "workflows" / "e2e-run.yml"
+_E2E_CONFIG = _ROOT / "tests" / "e2e" / "e2e_config.yaml"
 
 
 def _load_clean_script_module():
@@ -783,6 +784,37 @@ class EnsurePluginInstalledTest(unittest.TestCase):
             sof.ensure_stockout_plugin_installed(
                 "proj", "cluster", "us-central1", "kubeagents-system"
             )
+
+    def test_suites_running_stockout_match_expected_suites_tuple(self):
+        doc = yaml.safe_load(_E2E_CONFIG.read_text())
+        fixture_rel = "tests/e2e/test_stockout_investigation.py"
+        suites_with_stockout = {
+            suite["name"]
+            for suite in doc.get("suites", [])
+            if fixture_rel in suite.get("tests", [])
+        }
+        self.assertEqual(
+            suites_with_stockout,
+            set(sof._EXPECTED_E2E_SUITES),
+            f"Suites in {_E2E_CONFIG} listing {fixture_rel} must match "
+            f"test_stockout_investigation._EXPECTED_E2E_SUITES exactly.",
+        )
+
+    def test_fails_when_plugin_cr_is_absent_and_suite_is_gating(self):
+        def fake_kubectl(*args, **kwargs):
+            if "crd" in args:
+                return _completed(returncode=0)
+            if "agentplugins" in args:
+                return _completed(returncode=1, stderr="NotFound")
+            return _completed(returncode=0)
+
+        with mock.patch.object(sof, "_kubectl", side_effect=fake_kubectl), \
+                mock.patch.dict(sof.os.environ, {"E2E_SUITE": "rc", "ENABLE_STOCKOUT_INVESTIGATOR": ""}):
+            with self.assertRaises(_StubFail) as caught:
+                sof.ensure_stockout_plugin_installed(
+                    "proj", "cluster", "us-central1", "kubeagents-system"
+                )
+        self.assertIn("was expected on this environment", str(caught.exception))
 
 
 class PluginReadyStatusTest(unittest.TestCase):

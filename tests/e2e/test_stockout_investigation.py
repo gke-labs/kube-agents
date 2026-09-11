@@ -26,6 +26,12 @@ _PLUGIN_SKILL_NAME = "gke-stockout-investigator"
 _DEFAULT_AGENT_REF = "platform-agent"
 _CRD_NAME = "agentplugins.kubeagents.x-k8s.io"
 
+# Suites in tests/e2e/e2e_config.yaml that run this test file. When E2E_SUITE matches
+# any of these, the stockout plugin is required to be provisioned, and its absence fails
+# the run (pytest.fail) rather than skipping it.
+# Enforced by test_suites_running_stockout_match_expected_suites_tuple in tests/test_stockout_fixture_helpers.py.
+_EXPECTED_E2E_SUITES = ("rc", "nightly", "stockout-full", "investigations")
+
 # Everything this fixture does has to finish inside the E2E job's `timeout-minutes`
 # (.github/workflows/e2e-run.yml, whose default is what the RC pipeline gets), which also
 # has to cover runner setup, the other e2e modules, and scenario 04's own 360s watch. A wait that outlives the job
@@ -747,7 +753,7 @@ def ensure_stockout_plugin_installed(
 
     expected = (
         os.environ.get("ENABLE_STOCKOUT_INVESTIGATOR", "").lower() == "true"
-        or os.environ.get("E2E_SUITE") in ("rc", "nightly", "stockout-full", "investigations")
+        or os.environ.get("E2E_SUITE") in _EXPECTED_E2E_SUITES
     )
 
     # 1. The CRD is the prerequisite for plugins. If absent, plugins are not installed on the cluster.
