@@ -283,6 +283,16 @@ litellm:
     limits:
       cpu: 500m
       memory: 2Gi
+  # Node scheduling controls for the LiteLLM proxy, empty by default: with all
+  # three empty the Deployment renders exactly as it did before they existed.
+  # Empty tolerations are what keep LiteLLM off the gVisor pool, since a pod
+  # with none cannot schedule onto a node tainted
+  # sandbox.gke.io/runtime=gvisor:NoSchedule. Set these only to place the proxy
+  # on a specific pool in a multi-pool cluster; a gVisor toleration here puts a
+  # credential-bearing proxy beside sandboxed workload execution.
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
   # NetworkPolicy and GKE managed-Prometheus PodMonitoring for the gateway;
   # when platformAgent.enabled and operator.enabled are true (the default), litellm-policy is managed
   # dynamically by the operator with cluster-discovered DNS VIPs. When either

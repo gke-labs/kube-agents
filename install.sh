@@ -34,6 +34,23 @@ MINTY_CLI_GIT_TAG="v2.7.1"
 MINTY_CLI_MANUAL_CLONE_DIR="/tmp/minty"
 SPINNER_INTERVAL_SECS="0.2"
 
+# Polling interval and limits for background rollout monitoring and diagnostics (#1297)
+readonly ROLLOUT_MONITOR_POLL_INTERVAL_SECS=20
+readonly ROLLOUT_DIAGNOSTIC_EVENT_LIMIT=5
+readonly ROLLOUT_MONITOR_KUBECTL_TIMEOUT="5s"
+
+# Bounds on --helm-timeout, in seconds, both derived from hindsight-api, the
+# slowest workload the install rolls out. The floor is its 300s startupProbe
+# budget plus 240s for pulling a 1.4 GB image; below it the wait ends on a cold
+# roll that is loading normally. The ceiling is one second under its
+# progressDeadlineSeconds (900): at or above that the Deployment gives up
+# first with "exceeded its progress deadline", so the extra wait buys nothing.
+# terraform/examples/full-install/variables.tf repeats the pair as a variable
+# validation, and tests/test_hindsight_probes.py holds both against the
+# manifest they come from.
+readonly HELM_TIMEOUT_MIN_SECONDS=540
+readonly HELM_TIMEOUT_MAX_SECONDS=899
+
 # ─── ANSI Colors & Terminal Responsive Helpers ─────────────────────────────────
 # A function because scripts/installer/common.sh defines the same variables
 # unconditionally: sourcing it would re-enable colour under NO_COLOR or in a pipe,
@@ -417,6 +434,8 @@ PARAM_GOOGLE_CHAT_MODE="${GOOGLE_CHAT_MODE:-}"
 PARAM_GOOGLE_CHAT_HOME_CHANNEL="${GOOGLE_CHAT_HOME_CHANNEL:-}"
 PARAM_MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-}"
 PARAM_USER_PROFILE_ENABLED="${USER_PROFILE_ENABLED:-}"
+PARAM_HELM_TIMEOUT="${HELM_TIMEOUT:-}"
+PARAM_SKIP_CAPACITY_CHECK="${SKIP_CAPACITY_CHECK:-false}"
 
 show_help() {
   cat << EOF
@@ -522,6 +541,10 @@ Flags for AI Agents & Automation:
   --enable-network-policy       Opt in to enabling legacy Calico NetworkPolicy addon and enforcement
                                 on an existing GKE Standard cluster without Dataplane V2 (may recreate
                                 nodes and restart workloads; required on such clusters, else install aborts)
+  --helm-timeout=SECONDS        Timeout in seconds for Helm rollouts, 540-899
+                                (default: DEFAULT_HELM_TIMEOUT, currently 600)
+  --skip-capacity-check         Skip the schedulable capacity preflight check on adopted Standard
+                                clusters, for this run only (never saved to install.env)
   --menu, --config              Launch interactive Day-2 Control Panel Menu (raspi-config style)
   -h, --help, -?                Show this help message
 
@@ -596,6 +619,8 @@ parse_args() {
         PARAM_ENABLE_NETWORK_POLICY_PASSED="true"
         shift
         ;;
+      --helm-timeout=*) PARAM_HELM_TIMEOUT="${1#*=}"; shift ;;
+      --skip-capacity-check) PARAM_SKIP_CAPACITY_CHECK="true"; shift ;;
       -h|--help|-\?|help) show_help; exit 0 ;;
       *) print_error "Unknown parameter: $1"; show_help >&2; return 2 ;;
     esac
@@ -678,6 +703,29 @@ validate_immutable_ref() {
   if [[ ! "$ref" =~ ^[0-9a-fA-F]{40}$ ]] \
     && [[ ! "$ref" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
     print_error "Image/source ref must be a full 40-character commit SHA or a pure numeric SemVer release tag (X.Y.Z, e.g. 0.1.0)."
+    return 1
+  fi
+}
+
+# --helm-timeout, as a named validator rather than a block inside main(): a
+# test can call this, and could not call the block. An empty value is "not
+# passed", where DEFAULT_HELM_TIMEOUT applies. The bounds are the two numbers
+# hindsight-api's manifest fixes; see HELM_TIMEOUT_MIN_SECONDS above.
+validate_helm_timeout() {
+  local seconds="${1:-}"
+  if [ -z "$seconds" ]; then
+    return 0
+  fi
+  if [[ ! "$seconds" =~ ^[1-9][0-9]*$ ]]; then
+    print_error "--helm-timeout must be a positive integer in seconds (got '${seconds}')."
+    return 1
+  fi
+  if [ "$seconds" -lt "$HELM_TIMEOUT_MIN_SECONDS" ]; then
+    print_error "--helm-timeout must be at least ${HELM_TIMEOUT_MIN_SECONDS}s (got '${seconds}'): a shorter wait gives up on a cold hindsight-api roll that is loading normally."
+    return 1
+  fi
+  if [ "$seconds" -gt "$HELM_TIMEOUT_MAX_SECONDS" ]; then
+    print_error "--helm-timeout must be at most ${HELM_TIMEOUT_MAX_SECONDS}s (got '${seconds}'): hindsight-api's Deployment gives up at its 900s progressDeadlineSeconds, so a longer wait ends the same way and no later."
     return 1
   fi
 }
@@ -1112,6 +1160,14 @@ bootstrap_install_env_file() {
   write_env_var "$tmp" ENABLE_GKE_BACKUP_PLAN "${ENABLE_GKE_BACKUP_PLAN:-$DEFAULT_ENABLE_GKE_BACKUP_PLAN}"
   write_env_var "$tmp" ENABLE_PUBSUB_PLATFORM "${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
   write_env_var "$tmp" ENABLE_STOCKOUT_INVESTIGATOR "${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
+  write_env_var "$tmp" HELM_TIMEOUT "${PARAM_HELM_TIMEOUT:-$DEFAULT_HELM_TIMEOUT}"
+  # SKIP_CAPACITY_CHECK is deliberately not written. This file is bootstrapped
+  # once and then read by every later run, and every other key in it describes
+  # what the install IS. A bypass describes one run: the install that needed
+  # --skip-capacity-check is the undersized one, and persisting it would skip
+  # the preflight silently for the upgrade that adds hindsight-api's 2000m
+  # single-node requirement. ALLOW_UNVERIFIED_SOURCE and
+  # ALLOW_UNENCRYPTED_SECRETS are kept out of the file for the same reason.
   
   write_env_var "$tmp" REGISTRY_PREFIX "${REGISTRY_PREFIX:-}"
   if [ -n "${THIRD_PARTY_REGISTRY_PREFIX:-}" ]; then
@@ -1338,6 +1394,7 @@ resolve_shared_defaults() {
   PARAM_GITOPS_REPO="${PARAM_GITOPS_REPO:-$DEFAULT_GITOPS_REPO}"
   PARAM_ENABLE_PUBSUB_PLATFORM="${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
   PARAM_ENABLE_STOCKOUT_INVESTIGATOR="${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
+  PARAM_HELM_TIMEOUT="${PARAM_HELM_TIMEOUT:-$DEFAULT_HELM_TIMEOUT}"
 }
 
 # Run a command or function in the background, animating a spinner with elapsed
@@ -1904,12 +1961,217 @@ print_generate_only_handoff() {
   echo -e "    gcloud container clusters update ${cluster_name} --location ${region} --project ${project_id} --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS"
 }
 
+# Periodically queries the cluster during Terraform/Helm rollout to surface
+# pending pods and scheduling bottlenecks rather than sitting silent during
+# long Helm waits (#1297).
+monitor_lifecycle_rollout() {
+  local namespace="${NAMESPACE:-$DEFAULT_NAMESPACE}"
+  local expected_ctx=""
+  if type gke_context_name >/dev/null 2>&1; then
+    expected_ctx="$(gke_context_name)"
+  fi
+  local start_time=$SECONDS
+  local sleep_pid=""
+  # The monitor is diagnostic, so it claims the kubeconfig at most once and
+  # never on a run that is still building its cluster; see the comment on the
+  # attempt below.
+  local credentials_attempted="false"
+  trap 'if [ -n "$sleep_pid" ]; then kill "$sleep_pid" 2>/dev/null || true; fi; exit 0' TERM INT
+  while true; do
+    sleep "$ROLLOUT_MONITOR_POLL_INTERVAL_SECS" &
+    sleep_pid=$!
+    wait "$sleep_pid" 2>/dev/null || break
+    local elapsed=$((SECONDS - start_time))
+    if command -v kubectl >/dev/null 2>&1; then
+      local current_ctx
+      current_ctx="$(kubectl config current-context 2>/dev/null || true)"
+      if [ -n "$expected_ctx" ] && [ -n "$current_ctx" ] && [ "$current_ctx" != "$expected_ctx" ]; then
+        # One attempt, and only against a cluster that already exists. This is
+        # a background job the operator did not start: fetching credentials
+        # per poll rewrites their kubeconfig every 20 seconds for the length
+        # of the apply, and on a create-cluster run the context cannot match
+        # until Terraform has built the cluster, so all of those calls are
+        # churn ending in one silent context switch. The apply is indifferent
+        # either way — the helm provider gets an explicit host and token from
+        # the module, not the kubeconfig — so what this protects is the
+        # operator's own session. Losing the diagnostics on a run whose
+        # context does not match is the cheaper side of that trade.
+        if [ "$credentials_attempted" = "false" ] \
+          && [ "${TFVARS_CREATE_CLUSTER:-true}" != "true" ] \
+          && command -v gcloud >/dev/null 2>&1 && [ -n "${PROJECT_ID:-}" ]; then
+          credentials_attempted="true"
+          local gke_dns_flag=""
+          if type gke_dns_endpoint_flag >/dev/null 2>&1; then
+            GKE_DNS_ENDPOINT_FLAG=""
+            gke_dns_endpoint_flag "${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}" "${REGION:-$DEFAULT_REGION}" "${PROJECT_ID:-}" 2>/dev/null || true
+            gke_dns_flag="$GKE_DNS_ENDPOINT_FLAG"
+          fi
+          # shellcheck disable=SC2086
+          gcloud container clusters get-credentials "${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}" \
+            --location "${REGION:-$DEFAULT_REGION}" --project "${PROJECT_ID:-}" $gke_dns_flag >/dev/null 2>&1 || true
+          current_ctx="$(kubectl config current-context 2>/dev/null || true)"
+        fi
+        if [ "$current_ctx" != "$expected_ctx" ]; then
+          continue
+        fi
+      fi
+
+      local namespaces_to_check=("$namespace")
+      if [ "${TFVARS_ENABLE_CERT_MANAGER:-true}" = "true" ]; then
+        namespaces_to_check+=("cert-manager")
+      fi
+
+      for ns in "${namespaces_to_check[@]}"; do
+        local p_names
+        p_names="$(kubectl --request-timeout="$ROLLOUT_MONITOR_KUBECTL_TIMEOUT" get pods -n "$ns" --field-selector=status.phase=Pending -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)"
+        for p in $p_names; do
+          local reason
+          reason="$(kubectl --request-timeout="$ROLLOUT_MONITOR_KUBECTL_TIMEOUT" get events -n "$ns" --field-selector "involvedObject.name=${p},type=Warning" --sort-by='.lastTimestamp' -o jsonpath='{.items[-1].message}' 2>/dev/null || true)"
+          local node_name
+          node_name="$(kubectl --request-timeout="$ROLLOUT_MONITOR_KUBECTL_TIMEOUT" get pod "$p" -n "$ns" -o jsonpath='{.spec.nodeName}' 2>/dev/null || true)"
+          local ns_label=""
+          if [ "$ns" != "$namespace" ]; then
+            ns_label=" (${ns})"
+          fi
+          if [ -n "$reason" ]; then
+            echo -e "  ${C_YELLOW}⏳ [Rollout ${elapsed}s] Pod '${p}'${ns_label} is Pending: ${reason}${C_RESET}" >&2
+          elif [ -n "$node_name" ]; then
+            echo -e "  ${C_YELLOW}⏳ [Rollout ${elapsed}s] Pod '${p}'${ns_label} is scheduled to node '${node_name}' (pulling images / initializing)...${C_RESET}" >&2
+          else
+            echo -e "  ${C_YELLOW}⏳ [Rollout ${elapsed}s] Pod '${p}'${ns_label} is Pending (awaiting scheduling)...${C_RESET}" >&2
+          fi
+        done
+      done
+    fi
+  done
+}
+
+# Diagnoses Helm rollout failures (such as context deadline exceeded) by
+# inspecting Pending pods, failed containers, and scheduling warning events (#1297).
+diagnose_rollout_failure() {
+  local log_file="$1"
+  local namespace="${NAMESPACE:-$DEFAULT_NAMESPACE}"
+
+  if ! grep -qiE "context deadline exceeded|timed out waiting" "$log_file" 2>/dev/null; then
+    return 0
+  fi
+
+  print_error "Helm rollout timed out waiting for Kubernetes workloads to become ready."
+  print_info "Diagnosing cluster pod states and scheduling events in namespace '${namespace}'..."
+
+  if ! command -v kubectl >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local namespaces_to_check=("$namespace")
+  if [ "${TFVARS_ENABLE_CERT_MANAGER:-true}" = "true" ]; then
+    namespaces_to_check+=("cert-manager")
+  fi
+
+  for ns in "${namespaces_to_check[@]}"; do
+    local ns_label=""
+    if [ "$ns" != "$namespace" ]; then
+      ns_label=" (${ns})"
+    fi
+
+    local pending_pods
+    pending_pods="$(kubectl get pods -n "$ns" --field-selector=status.phase=Pending -o jsonpath='{.items[*].metadata.name}' 2>/dev/null || true)"
+
+    if [ -n "$pending_pods" ]; then
+      echo -e "\n${C_RED}${C_BOLD}Pending Pods Detected${ns_label}:${C_RESET}"
+      for pod in $pending_pods; do
+        echo -e "  • ${C_BOLD}${pod}${C_RESET}"
+        local events
+        events="$(kubectl get events -n "$ns" --field-selector "involvedObject.name=${pod},type=Warning" --sort-by='.lastTimestamp' -o custom-columns=REASON:.reason,MESSAGE:.message --no-headers 2>/dev/null | tail -n "$ROLLOUT_DIAGNOSTIC_EVENT_LIMIT" || true)"
+        if [ -n "$events" ]; then
+          echo "$events" | while IFS= read -r ev; do
+            echo -e "      ${C_YELLOW}↳ $ev${C_RESET}"
+          done
+        fi
+      done
+    fi
+
+    local unready_pods
+    unready_pods="$(kubectl get pods -n "$ns" --field-selector=status.phase=Running -o json 2>/dev/null | python3 -c '
+import sys, json
+try:
+    data = json.load(sys.stdin)
+    unready = []
+    for item in data.get("items", []):
+        statuses = item.get("status", {}).get("containerStatuses", [])
+        if statuses and any(not s.get("ready", False) for s in statuses):
+            unready.append(item["metadata"]["name"])
+    print(" ".join(unready))
+except Exception:
+    pass
+' 2>/dev/null || true)"
+    if [ -n "$unready_pods" ]; then
+      echo -e "\n${C_RED}${C_BOLD}Unready / Crashing Pods Detected${ns_label}:${C_RESET}"
+      for pod in $unready_pods; do
+        echo -e "  • ${C_BOLD}${pod}${C_RESET}"
+        local events
+        events="$(kubectl get events -n "$ns" --field-selector "involvedObject.name=${pod},type=Warning" --sort-by='.lastTimestamp' -o custom-columns=REASON:.reason,MESSAGE:.message --no-headers 2>/dev/null | tail -n "$ROLLOUT_DIAGNOSTIC_EVENT_LIMIT" || true)"
+        if [ -n "$events" ]; then
+          echo "$events" | while IFS= read -r ev; do
+            echo -e "      ${C_YELLOW}↳ $ev${C_RESET}"
+          done
+        fi
+      done
+    fi
+  done
+}
+
+# What the install does when the capacity preflight reports a deficit: a dry
+# run says so and carries on, a non-interactive run stops before Terraform
+# touches anything, and an interactive one asks. A function rather than a
+# block in main() so a test can drive the policy with a stubbed preflight;
+# returns non-zero where the caller exits.
+enforce_capacity_preflight() {
+  local cluster_name="$1"
+  local region="$2"
+  local project_id="$3"
+  local enable_gvisor="$4"
+  local memory_mode="$5"
+  local enable_webui="$6"
+  local github_org="$7"
+  local github_repo="$8"
+
+  if check_existing_cluster_capacity_preflight "$cluster_name" "$region" "$project_id" \
+    "$enable_gvisor" "$memory_mode" "$enable_webui" "$github_org" "$github_repo"; then
+    return 0
+  fi
+
+  if [ "${PARAM_DRY_RUN:-false}" = "true" ]; then
+    print_warning "Capacity check reported a deficit; continuing dry-run validation."
+    return 0
+  fi
+
+  if [ "${PARAM_NON_INTERACTIVE:-false}" = "true" ]; then
+    print_error "Cluster capacity preflight check failed in non-interactive mode. Aborting before Terraform apply."
+    return 1
+  fi
+
+  local proceed_capacity=""
+  prompt_read "\nCapacity check failed. Proceed anyway? (y/N)" proceed_capacity "n"
+  if [[ ! "$proceed_capacity" =~ ^[Yy]$ ]]; then
+    print_warning "Installation paused by user to allow cluster resizing. Configuration saved to: ${INSTALL_ENV_FILE:-install.env}"
+    return 1
+  fi
+}
+
 # Runs lifecycle.sh apply against the generated terraform.tfvars. Reads the
 # install coordinates from the environment (load install.env first).
 run_lifecycle_apply() {
   local repo_dir="$1"
   local log_file="$2"
   local -a ps=()
+  local monitor_pid=""
+
+  if command -v kubectl >/dev/null 2>&1; then
+    monitor_lifecycle_rollout &
+    monitor_pid=$!
+  fi
+
   (
     cd "$(tf_compose_dir "$repo_dir")"
     export KUBE_AGENTS_STATE_BUCKET="${KUBE_AGENTS_STATE_BUCKET:-$DEFAULT_KUBE_AGENTS_STATE_BUCKET}"
@@ -1917,6 +2179,27 @@ run_lifecycle_apply() {
     KUBE_AGENTS_STATE_PREFIX="$(tf_state_prefix)"
     ./lifecycle.sh apply -auto-approve -input=false
   ) 2>&1 | tee "$log_file" || ps=("${PIPESTATUS[@]}")
+
+  if [ -n "$monitor_pid" ]; then
+    kill "$monitor_pid" 2>/dev/null || true
+    wait "$monitor_pid" 2>/dev/null || true
+  fi
+
+  local rc_primary="${ps[0]:-0}"
+  if [ "$rc_primary" -ne 0 ]; then
+    if command -v gcloud >/dev/null 2>&1 && [ -n "${PROJECT_ID:-}" ]; then
+      local gke_dns_flag=""
+      if type gke_dns_endpoint_flag >/dev/null 2>&1; then
+        GKE_DNS_ENDPOINT_FLAG=""
+        gke_dns_endpoint_flag "${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}" "${REGION:-$DEFAULT_REGION}" "${PROJECT_ID:-}" 2>/dev/null || true
+        gke_dns_flag="$GKE_DNS_ENDPOINT_FLAG"
+      fi
+      # shellcheck disable=SC2086
+      gcloud container clusters get-credentials "${CLUSTER_NAME:-$DEFAULT_CLUSTER_NAME}" \
+        --location "${REGION:-$DEFAULT_REGION}" --project "${PROJECT_ID:-}" $gke_dns_flag >/dev/null 2>&1 || true
+    fi
+    diagnose_rollout_failure "$log_file"
+  fi
 
   # ${ps[@]+"${ps[@]}"}: empty on a clean apply, and macOS's bash 3.2 treats an
   # empty array expansion as unbound under `set -u`.
@@ -3744,6 +4027,11 @@ main() {
   if [ -n "$third_party_registry_prefix" ]; then
     export THIRD_PARTY_REGISTRY_PREFIX="$third_party_registry_prefix"
   fi
+
+  validate_helm_timeout "${PARAM_HELM_TIMEOUT:-}" || exit 1
+  export HELM_TIMEOUT="${PARAM_HELM_TIMEOUT:-$DEFAULT_HELM_TIMEOUT}"
+  export SKIP_CAPACITY_CHECK="${PARAM_SKIP_CAPACITY_CHECK:-false}"
+
   # No *_IMAGE variables. The operator reads OPERATOR_IMAGE and
   # PLATFORM_AGENT_IMAGE from its own pod environment, where the chart sets them
   # from values.yaml. The images this install pulls are decided by
@@ -3810,6 +4098,9 @@ main() {
   echo -e "${C_CYAN}${C_BOLD}"
   draw_separator
   echo -e "${C_RESET}"
+
+  # Preflight schedulable capacity on adopted Standard clusters (#1297)
+  enforce_capacity_preflight "$cluster_name" "$region" "$project_id" "$enable_gvisor" "$memory_mode" "$PARAM_ENABLE_WEBUI" "$github_org" "$github_repo" || exit 1
 
   if [ "$PARAM_DRY_RUN" = "true" ]; then
     # A real resource preview, not just a config write: validate always, and

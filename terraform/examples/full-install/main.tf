@@ -443,7 +443,7 @@ resource "helm_release" "cert_manager" {
   # webhook is already serving. wait blocks until the three Deployments report
   # Available, which is what makes the depends_on below mean anything.
   wait    = true
-  timeout = 600
+  timeout = var.helm_timeout
 
   # Helm deep-merges the docs in order, so the mirror overrides (second doc,
   # present only on a mirrored install) reach the image repositories without
@@ -490,7 +490,7 @@ resource "helm_release" "kube_agents" {
   # and waiting longer buys nothing. tests/test_hindsight_probes.py asserts
   # the ordering.
   wait    = true
-  timeout = 600
+  timeout = var.helm_timeout
 
   values = [yamlencode({
     # Reaches every image this release pulls, including the three the chart

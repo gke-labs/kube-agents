@@ -160,6 +160,7 @@ def create_mock_git_repo(temp_dir=None):
     git_cmd("config", "user.name", "Test User")
     git_cmd("config", "user.email", "test@example.com")
     git_cmd("config", "commit.gpgsign", "false")
+    git_cmd("config", "tag.gpgsign", "false")
 
     init_file = repo_dir / "init.txt"
     init_file.write_text("initial commit\n")

@@ -485,6 +485,10 @@ composition's own CR on the first apply. See the
 [chart README](../../../charts/kube-agents/README.md) for switching it to
 `Fail` afterwards.
 
+### Helm rollout timeout (`helm_timeout`)
+
+`helm_timeout` (default `600`, in seconds) controls the wait timeout for both the `cert_manager` and `kube_agents` Helm releases. Raise it on clusters with constrained node resources or slow image pulls, where the default expires mid-rollout and Terraform reports a bare `context deadline exceeded`. The accepted range is 540 to 899 seconds, and both ends come from `hindsight-api`, the slowest workload the install rolls out: under 540 the wait ends while a cold start is still loading its models (a 300s `startupProbe` budget plus an allowance for pulling a 1.4 GB image), and at 900 the Deployment's own `progressDeadlineSeconds` ends the rollout first — Helm returns `exceeded its progress deadline` at that point however long it was asked to wait, so a larger number buys nothing.
+
 ### Reaching the control plane (`allow_external_dns_traffic`)
 
 `allow_external_dns_traffic` (default `false`) is passed to the `gke-cluster`

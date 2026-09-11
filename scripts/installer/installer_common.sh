@@ -11,6 +11,11 @@
 # set from the environment (load it first); none of them prompt.
 # ==============================================================================
 
+if [ -n "${_KUBE_AGENTS_INSTALLER_COMMON_SOURCED:-}" ]; then
+  return 0 2>/dev/null || exit 0
+fi
+_KUBE_AGENTS_INSTALLER_COMMON_SOURCED=1
+
 # ─── Shared Installer Defaults ────────────────────────────────────────────────
 # Every default an install gets for saying nothing lives in install.defaults.env
 # at the repository root, beside install.env. One file, one job: this one has
@@ -89,6 +94,27 @@ readonly HELM_SERVED_REVISION_STATUSES="deployed superseded"
 readonly HELM_FAILED_RELEASE_UNINSTALL_TIMEOUT="5m"
 # shellcheck disable=SC2034
 readonly PLATFORM_AGENT_SHELL_AUTHORIZED_KEYS_SECRET="platform-agent-shell-authorized-keys"
+
+# ─── Capacity Preflight Sizing Constants ─────────────────────────────────────
+# Baseline schedulable resource minimums required on untainted nodes for
+# non-gVisor workloads (controller-manager, LiteLLM replicas, cert-manager, etc.)
+readonly PREFLIGHT_MIN_CPU_MILLIS_OPERATOR=10
+readonly PREFLIGHT_MIN_MEM_MIB_OPERATOR=64
+readonly PREFLIGHT_MIN_CPU_MILLIS_LITELLM_REPLICA=100
+readonly PREFLIGHT_MIN_MEM_MIB_LITELLM_REPLICA=512
+readonly PREFLIGHT_DEFAULT_LITELLM_REPLICAS=2
+readonly PREFLIGHT_MIN_CPU_MILLIS_CERT_MANAGER=30
+readonly PREFLIGHT_MIN_MEM_MIB_CERT_MANAGER=96
+readonly PREFLIGHT_MIN_CPU_MILLIS_WEBUI=256
+readonly PREFLIGHT_MIN_MEM_MIB_WEBUI=512
+readonly PREFLIGHT_MIN_CPU_MILLIS_MINTER=200
+readonly PREFLIGHT_MIN_MEM_MIB_MINTER=256
+readonly PREFLIGHT_MIN_CPU_MILLIS_HINDSIGHT=2250
+readonly PREFLIGHT_MIN_MEM_MIB_HINDSIGHT=1280
+readonly PREFLIGHT_MIN_CPU_MILLIS_HINDSIGHT_API=2000
+readonly PREFLIGHT_MIN_MEM_MIB_HINDSIGHT_API=1024
+readonly PREFLIGHT_MIN_CPU_MILLIS_AGENT_UNSANDBOXED=1250
+readonly PREFLIGHT_MIN_MEM_MIB_AGENT_UNSANDBOXED=2560
 
 # The image tag the generator and the dev prompt fall back to when none was
 # given. Not an install default: every front door rejects it through
@@ -1530,6 +1556,8 @@ write_tfvars_from_state() {
       fi
     fi
   fi
+  TFVARS_ENABLE_CERT_MANAGER="$enable_cert_manager"
+  export TFVARS_ENABLE_CERT_MANAGER
 
   # Only a mirrored install sets image_registry; the default prefix means
   # "the public registries", which the composition spells as empty.
@@ -1743,6 +1771,7 @@ write_tfvars_from_state() {
     echo "# Optional AgentPlugins"
     echo "enable_pubsub_platform       = $(hcl_bool "${ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}")"
     echo "enable_stockout_investigator = $(hcl_bool "${ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}")"
+    echo "helm_timeout                 = ${HELM_TIMEOUT:-$DEFAULT_HELM_TIMEOUT}"
   } > "${dest}.tmp"
   chmod 600 "${dest}.tmp"
   mv -f -- "${dest}.tmp" "$dest"
@@ -1767,4 +1796,323 @@ write_tfvars_from_state() {
   export TF_VAR_slack_app_token="${SLACK_APP_TOKEN:-}"
   export TF_VAR_session_kv_api_key="${SESSION_KV_API_KEY:-}"
   export TF_VAR_session_kv_salt="${SESSION_KV_SALT:-}"
+}
+
+# ─── Cluster Schedulable Capacity Preflight Check ────────────────────────────
+# Preflights whether an adopted GKE Standard cluster has sufficient schedulable
+# CPU and memory on untainted nodes before the apply starts (#1297).
+#
+# Because the installer creates a dedicated gvisor-pool carrying the taint
+# 'sandbox.gke.io/runtime=gvisor:NoSchedule', workloads that do not run under
+# gVisor (LiteLLM, the controller-manager, cert-manager) cannot schedule on
+# that pool. If the existing node pool(s) lack capacity, those pods go Pending
+# and the Helm rollout hangs until its timeout expires with a bare
+# 'context deadline exceeded'.
+#
+# Skipped when:
+#   - SKIP_CAPACITY_CHECK is true (--skip-capacity-check)
+#   - create_cluster is true (Terraform provisions a fresh pool with ample capacity)
+#   - cluster_mode is autopilot (Autopilot provisions nodes dynamically)
+#   - kubectl is unavailable or cannot query the live cluster
+check_existing_cluster_capacity_preflight() {
+  local cluster_name="${1:-${CLUSTER_NAME:-}}"
+  local region="${2:-${REGION:-}}"
+  local project_id="${3:-${PROJECT_ID:-}}"
+  local gvisor_enabled="${4:-${ENABLE_GVISOR:-$DEFAULT_ENABLE_GVISOR}}"
+  local memory_mode="${5:-${MEMORY:-$DEFAULT_MEMORY}}"
+  local webui_enabled="${6:-${HERMES_DASHBOARD_ENABLED:-$DEFAULT_ENABLE_WEBUI}}"
+  local gitops_org="${7:-${GITOPS_ORG:-}}"
+  local gitops_repo="${8:-${GITOPS_REPO:-}}"
+  local enable_cert_manager="${9:-${TFVARS_ENABLE_CERT_MANAGER:-true}}"
+
+  if ! type print_info >/dev/null 2>&1; then
+    print_info() { echo "  ℹ $1"; }
+  fi
+  if ! type print_warning >/dev/null 2>&1; then
+    print_warning() { echo "  ⚠ $1" >&2; }
+  fi
+  if ! type print_success >/dev/null 2>&1; then
+    print_success() { echo "  ✓ $1"; }
+  fi
+  if ! type print_error >/dev/null 2>&1; then
+    print_error() { echo "  ✗ $1" >&2; }
+  fi
+
+  if is_truthy "${SKIP_CAPACITY_CHECK:-false}"; then
+    print_info "Skipping cluster capacity preflight check (SKIP_CAPACITY_CHECK=true)."
+    return 0
+  fi
+
+  if [ "${TFVARS_CREATE_CLUSTER:-true}" = "true" ]; then
+    return 0
+  fi
+  if [ "${TFVARS_CLUSTER_MODE:-${CLUSTER_MODE:-}}" != "standard" ]; then
+    return 0
+  fi
+
+  if ! command -v kubectl >/dev/null 2>&1; then
+    print_warning "kubectl is not installed; skipping cluster capacity preflight check."
+    return 0
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    print_warning "python3 is not installed; skipping cluster capacity preflight check."
+    return 0
+  fi
+
+  local expected_ctx="gke_${project_id}_${region}_${cluster_name}"
+  local current_ctx
+  current_ctx="$(kubectl config current-context 2>/dev/null || true)"
+  if [ -n "$project_id" ] && [ -n "$current_ctx" ] && [ "$current_ctx" != "$expected_ctx" ]; then
+    print_warning "kubectl current context ('${current_ctx}') does not match target cluster ('${expected_ctx}'); skipping cluster capacity preflight check."
+    return 0
+  fi
+
+  local tmp_cap_dir
+  tmp_cap_dir="$(mktemp -d 2>/dev/null || mktemp -d -t 'kube-agents-cap')"
+  kubectl get nodes -o json > "${tmp_cap_dir}/nodes.json" 2>/dev/null || true
+  if [ ! -s "${tmp_cap_dir}/nodes.json" ]; then
+    rm -rf "$tmp_cap_dir"
+    print_warning "Could not query nodes via kubectl; skipping cluster capacity preflight check."
+    return 0
+  fi
+
+  kubectl get pods -A --field-selector status.phase!=Failed,status.phase!=Succeeded -o json > "${tmp_cap_dir}/pods.json" 2>/dev/null || true
+  if [ ! -s "${tmp_cap_dir}/pods.json" ]; then
+    rm -rf "$tmp_cap_dir"
+    print_warning "Could not query running pods via kubectl; skipping cluster capacity preflight check."
+    return 0
+  fi
+
+  local req_cpu=$((PREFLIGHT_MIN_CPU_MILLIS_OPERATOR + PREFLIGHT_MIN_CPU_MILLIS_LITELLM_REPLICA * PREFLIGHT_DEFAULT_LITELLM_REPLICAS))
+  local req_mem=$((PREFLIGHT_MIN_MEM_MIB_OPERATOR + PREFLIGHT_MIN_MEM_MIB_LITELLM_REPLICA * PREFLIGHT_DEFAULT_LITELLM_REPLICAS))
+
+  if is_truthy "$enable_cert_manager"; then
+    req_cpu=$((req_cpu + PREFLIGHT_MIN_CPU_MILLIS_CERT_MANAGER))
+    req_mem=$((req_mem + PREFLIGHT_MIN_MEM_MIB_CERT_MANAGER))
+  fi
+
+  if is_truthy "$webui_enabled"; then
+    req_cpu=$((req_cpu + PREFLIGHT_MIN_CPU_MILLIS_WEBUI))
+    req_mem=$((req_mem + PREFLIGHT_MIN_MEM_MIB_WEBUI))
+  fi
+
+  if [ -n "$gitops_org" ] && [ -n "$gitops_repo" ]; then
+    req_cpu=$((req_cpu + PREFLIGHT_MIN_CPU_MILLIS_MINTER))
+    req_mem=$((req_mem + PREFLIGHT_MIN_MEM_MIB_MINTER))
+  fi
+
+  if [ "$memory_mode" = "hindsight" ]; then
+    req_cpu=$((req_cpu + PREFLIGHT_MIN_CPU_MILLIS_HINDSIGHT))
+    req_mem=$((req_mem + PREFLIGHT_MIN_MEM_MIB_HINDSIGHT))
+  fi
+
+  local single_pods_spec="[{\"name\":\"LiteLLM\",\"cpu\":${PREFLIGHT_MIN_CPU_MILLIS_LITELLM_REPLICA},\"mem\":${PREFLIGHT_MIN_MEM_MIB_LITELLM_REPLICA}}"
+  if is_truthy "$webui_enabled"; then
+    single_pods_spec="${single_pods_spec},{\"name\":\"WebUI\",\"cpu\":${PREFLIGHT_MIN_CPU_MILLIS_WEBUI},\"mem\":${PREFLIGHT_MIN_MEM_MIB_WEBUI}}"
+  fi
+  if [ -n "$gitops_org" ] && [ -n "$gitops_repo" ]; then
+    single_pods_spec="${single_pods_spec},{\"name\":\"Minter\",\"cpu\":${PREFLIGHT_MIN_CPU_MILLIS_MINTER},\"mem\":${PREFLIGHT_MIN_MEM_MIB_MINTER}}"
+  fi
+  if ! is_truthy "$gvisor_enabled"; then
+    req_cpu=$((req_cpu + PREFLIGHT_MIN_CPU_MILLIS_AGENT_UNSANDBOXED))
+    req_mem=$((req_mem + PREFLIGHT_MIN_MEM_MIB_AGENT_UNSANDBOXED))
+    single_pods_spec="${single_pods_spec},{\"name\":\"unsandboxed agent\",\"cpu\":${PREFLIGHT_MIN_CPU_MILLIS_AGENT_UNSANDBOXED},\"mem\":${PREFLIGHT_MIN_MEM_MIB_AGENT_UNSANDBOXED}}"
+  fi
+
+  if [ "$memory_mode" = "hindsight" ]; then
+    single_pods_spec="${single_pods_spec},{\"name\":\"hindsight-api\",\"cpu\":${PREFLIGHT_MIN_CPU_MILLIS_HINDSIGHT_API},\"mem\":${PREFLIGHT_MIN_MEM_MIB_HINDSIGHT_API}}"
+  fi
+  single_pods_spec="${single_pods_spec}]"
+
+  local eval_result
+  eval_result="$(python3 -c '
+import sys, json
+
+def parse_cpu(val):
+    if not val: return 0
+    s = str(val).strip()
+    if s.endswith("m"): return int(s[:-1])
+    return int(float(s) * 1000)
+
+def parse_mem(val):
+    if not val: return 0
+    s = str(val).strip()
+    units = {
+        "Ki": 1/1024, "Mi": 1, "Gi": 1024, "Ti": 1024*1024,
+        "k": 1000/(1024*1024), "M": 1000**2/(1024*1024), "G": 1000**3/(1024*1024),
+    }
+    for u, factor in units.items():
+        if s.endswith(u):
+            return int(float(s[:-len(u)]) * factor)
+    try:
+        return int(float(s) / (1024*1024))
+    except Exception:
+        return 0
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as f:
+        nodes = json.load(f)
+    with open(sys.argv[2], "r", encoding="utf-8") as f:
+        pods = json.load(f)
+    req_cpu = int(sys.argv[3])
+    req_mem = int(sys.argv[4])
+    single_pods = json.loads(sys.argv[5]) if len(sys.argv) > 5 else []
+except Exception as e:
+    print(json.dumps({"error": str(e)}))
+    sys.exit(0)
+
+untainted_nodes = {}
+for n in nodes.get("items", []):
+    name = n["metadata"]["name"]
+    taints = n.get("spec", {}).get("taints", [])
+    has_nosched = any(t.get("effect") in ("NoSchedule", "NoExecute") for t in taints)
+    is_unschedulable = n.get("spec", {}).get("unschedulable", False)
+    conditions = n.get("status", {}).get("conditions", [])
+    is_not_ready = any(c.get("type") == "Ready" and c.get("status") in ("False", "Unknown") for c in conditions)
+    if not has_nosched and not is_unschedulable and not is_not_ready:
+        alloc_cpu = parse_cpu(n.get("status", {}).get("allocatable", {}).get("cpu", 0))
+        alloc_mem = parse_mem(n.get("status", {}).get("allocatable", {}).get("memory", 0))
+        untainted_nodes[name] = {
+            "alloc_cpu": alloc_cpu,
+            "alloc_mem": alloc_mem,
+            "req_cpu": 0,
+            "req_mem": 0,
+            "sched_cpu": 0,
+            "sched_mem": 0,
+        }
+
+for p in pods.get("items", []):
+    node_name = p.get("spec", {}).get("nodeName")
+    if node_name in untainted_nodes:
+        p_cpu = 0
+        p_mem = 0
+        for c in p.get("spec", {}).get("containers", []):
+            res = c.get("resources", {}).get("requests", {})
+            p_cpu += parse_cpu(res.get("cpu", 0))
+            p_mem += parse_mem(res.get("memory", 0))
+        init_cpu = 0
+        init_mem = 0
+        for c in p.get("spec", {}).get("initContainers", []):
+            res = c.get("resources", {}).get("requests", {})
+            init_cpu = max(init_cpu, parse_cpu(res.get("cpu", 0)))
+            init_mem = max(init_mem, parse_mem(res.get("memory", 0)))
+        untainted_nodes[node_name]["req_cpu"] += max(p_cpu, init_cpu)
+        untainted_nodes[node_name]["req_mem"] += max(p_mem, init_mem)
+
+total_sched_cpu = 0
+total_sched_mem = 0
+max_single_cpu = 0
+max_single_mem = 0
+
+for name, data in untainted_nodes.items():
+    sched_cpu = max(0, data["alloc_cpu"] - data["req_cpu"])
+    sched_mem = max(0, data["alloc_mem"] - data["req_mem"])
+    data["sched_cpu"] = sched_cpu
+    data["sched_mem"] = sched_mem
+    total_sched_cpu += sched_cpu
+    total_sched_mem += sched_mem
+    max_single_cpu = max(max_single_cpu, sched_cpu)
+    max_single_mem = max(max_single_mem, sched_mem)
+
+ok = True
+reason = ""
+if len(untainted_nodes) == 0:
+    ok = False
+    reason = "No untainted nodes found in cluster"
+elif total_sched_cpu < req_cpu:
+    ok = False
+    reason = f"Insufficient schedulable CPU ({total_sched_cpu}m < {req_cpu}m)"
+elif total_sched_mem < req_mem:
+    ok = False
+    reason = f"Insufficient schedulable Memory ({total_sched_mem}Mi < {req_mem}Mi)"
+else:
+    for sp in single_pods:
+        p_name = sp.get("name", "workload")
+        p_cpu = int(sp.get("cpu", 0))
+        p_mem = int(sp.get("mem", 0))
+        if p_cpu > 0 or p_mem > 0:
+            fit = any(d["sched_cpu"] >= p_cpu and d["sched_mem"] >= p_mem for d in untainted_nodes.values())
+            if not fit:
+                ok = False
+                reason = f"No single untainted node has sufficient schedulable capacity for {p_name} pod (requires {p_cpu}m CPU, {p_mem}Mi Memory; max available on a single node is {max_single_cpu}m CPU, {max_single_mem}Mi Memory)"
+                break
+
+print(json.dumps({
+    "ok": ok,
+    "untainted_count": len(untainted_nodes),
+    "total_sched_cpu": total_sched_cpu,
+    "total_sched_mem": total_sched_mem,
+    "req_cpu": req_cpu,
+    "req_mem": req_mem,
+    "reason": reason
+}))
+' "${tmp_cap_dir}/nodes.json" "${tmp_cap_dir}/pods.json" "$req_cpu" "$req_mem" "$single_pods_spec" 2>/dev/null || true)"
+
+  rm -rf "$tmp_cap_dir"
+
+  if [ -z "$eval_result" ]; then
+    print_warning "Failed to calculate cluster schedulable capacity; continuing."
+    return 0
+  fi
+
+  local ok untainted_count total_sched_cpu total_sched_mem reason
+  # One parse, and a failed one is a failed check rather than a defaulted one.
+  # The evaluator prints {"error": ...} and exits 0 when it cannot read the
+  # node or pod JSON — a truncated `kubectl get nodes` write clears the [ -s ]
+  # guard above — and a document with no "ok" key read with .get('ok', True)
+  # reports a pass over zero nodes, the same shape the working path fails
+  # hard on.
+  local eval_fields
+  eval_fields="$(python3 -c '
+import sys, json
+
+try:
+    result = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(1)
+if "error" in result or "ok" not in result:
+    sys.exit(1)
+print(result["ok"])
+print(result.get("untainted_count", 0))
+print(result.get("total_sched_cpu", 0))
+print(result.get("total_sched_mem", 0))
+print(str(result.get("reason", "")).replace("\n", " "))
+' "$eval_result" 2>/dev/null)" || eval_fields=""
+
+  if [ -z "$eval_fields" ]; then
+    print_warning "Failed to calculate cluster schedulable capacity; continuing."
+    return 0
+  fi
+
+  {
+    read -r ok
+    read -r untainted_count
+    read -r total_sched_cpu
+    read -r total_sched_mem
+    # An empty reason is the passing case, and command substitution strips the
+    # blank line it prints, so this read lands on EOF: tolerated, not fatal.
+    read -r reason || reason=""
+  } <<EOF
+${eval_fields}
+EOF
+
+  if [ "$ok" != "True" ]; then
+    print_error "Cluster capacity preflight check failed for adopted Standard cluster '${cluster_name}'."
+    print_error "Untainted nodes have insufficient schedulable capacity for non-gVisor workloads (LiteLLM, operator, cert-manager):"
+    print_info "  • Available on untainted nodes: ${total_sched_cpu}m CPU, ${total_sched_mem}Mi Memory (${untainted_count} untainted node(s))"
+    print_info "  • Required minimum capacity:   ${req_cpu}m CPU, ${req_mem}Mi Memory"
+    if [ -n "$reason" ]; then
+      print_info "  • Reason:                      ${reason}"
+    fi
+    print_info "Note: The installer creates 'gvisor-pool' carrying taint 'sandbox.gke.io/runtime=gvisor:NoSchedule'."
+    print_info "Trusted system workloads cannot schedule on gvisor-pool and require schedulable capacity on untainted nodes."
+    print_info "To resolve:"
+    print_info "  1. Resize your existing node pool: gcloud container clusters resize ${cluster_name} --node-pool <pool> --num-nodes <count> --location ${region}"
+    print_info "  2. Or bypass this check: ./install.sh ... --skip-capacity-check"
+    return 1
+  fi
+
+  print_success "Cluster capacity preflight check passed (${total_sched_cpu}m CPU, ${total_sched_mem}Mi Memory schedulable across ${untainted_count} untainted node(s))."
+  return 0
 }

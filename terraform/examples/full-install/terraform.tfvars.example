@@ -143,6 +143,10 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # enable_webhooks      = true
 # cert_manager_version = "v1.21.1"
 
+# Timeout (in seconds) for Helm releases (cert-manager and kube-agents).
+# Defaults to 600s (10 minutes).
+# helm_timeout = 600
+
 # Anything the variables above do not reach. Deep-merged over the values this
 # composition computes, so one leaf can be set without restating its block.
 # extra_helm_values = {

@@ -500,3 +500,14 @@ variable "extra_helm_values" {
   type        = any
   default     = {}
 }
+
+variable "helm_timeout" {
+  description = "Timeout in seconds for Helm rollouts (cert-manager and kube-agents). Defaults to 600s (10 minutes). Bounded by hindsight-api, the slowest workload the install rolls out: its startupProbe budget plus an image-pull allowance below, its progressDeadlineSeconds above. tests/test_hindsight_probes.py holds the bounds against that manifest."
+  type        = number
+  default     = 600
+
+  validation {
+    condition     = var.helm_timeout >= 540 && var.helm_timeout < 900
+    error_message = "helm_timeout must be at least 540 and under 900 seconds. Below 540 the wait ends on a cold hindsight-api roll that is loading normally (a 300s startupProbe budget plus 240s to pull a 1.4 GB image). At 900 and above, hindsight-api's progressDeadlineSeconds ends the rollout first with \"exceeded its progress deadline\", so the extra wait changes nothing."
+  }
+}
