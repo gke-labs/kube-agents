@@ -1853,6 +1853,11 @@ def validate_findings(data: object, audit_id: str) -> dict:
             )
         declarable = audit_declarable_checks(audit_id)
         seen_declared: dict[str, int] = {}
+        # Lazy for the reason the module comment on `sys.path` gives; the slug
+        # rule is the one `resolve_repo` applies, so a declaration names a
+        # repository the same way a `--repo` flag does.
+        import gitops_workspace
+
         for i, entry in enumerate(declared):
             where = f"declared[{i}]"
             if not isinstance(entry, dict):
@@ -1907,7 +1912,7 @@ def validate_findings(data: object, audit_id: str) -> dict:
                     "with no declaration to point at is a finding, not a declaration"
                 )
             repo = declaration.get("repo")
-            if not isinstance(repo, str) or not BARE_REPO_RE.match(repo):
+            if not isinstance(repo, str) or not gitops_workspace.is_valid_repo_slug(repo):
                 raise ValidationError(
                     f"{where}.declaration.repo: must name the repository as "
                     f"owner/name, got {repo!r}"
