@@ -21,6 +21,7 @@ only — anything that renames, removes or re-types a field bumps
       "started": "<iso8601>",
       "finished": "<iso8601>",
       "result": "SUCCESS|FAILURE|ABORTED",
+      "eval_verdict": "GREEN|RED|null",
       "duration_s": 5793,
       "tasks": [
         {
@@ -99,6 +100,13 @@ the same layout and is collected from the moment it starts running.
   ISO 8601 UTC; `null` when unparseable.
 - `result` — `finished.json`'s `result` verbatim: `SUCCESS`, `FAILURE` or
   `ABORTED`. This is the Prow job verdict, not the eval verdict.
+- `eval_verdict` — **optional, additive**: the eval loop's own verdict, from
+  the final `PR Smoke Test Evaluation Succeeded/Failed` line: `GREEN` or
+  `RED`. `null` when the log has no such line — the job ended before its
+  verdict: Prow's deadline (it delivers SIGTERM and records `FAILURE`, not
+  `ABORTED`; build 2092688354838581248 below is one), a death before the
+  cases, or step 0's revalidation (a `SUCCESS`). A record written before
+  the field existed has no key: unknown, which is not `null`.
 - `duration_s` — the `Total Duration` of the final
   `PR Smoke Test Evaluation Succeeded/Failed` line (eval loop only). A
   truncated log has no verdict line — and neither does a `SUCCESS` build that
@@ -333,6 +341,9 @@ what the renderer does with them.
   are excluded from every pass-fraction denominator, exactly like `infra`
   task results. When `reps` is absent the task's single `result` stands in
   for one rep.
+- `runs[].eval_verdict` — `GREEN` | `RED` | `null`: the Nightly report reads
+  it; a night that is not a `SUCCESS` and carries `null` was ended before
+  its verdict and is reported as truncated. Absent means unknown.
 - `runs[].has_build_log`, `runs[].pod_*` — a zero-task `FAILURE` with
   `pod_last_event: "NodeNotReady"` or `has_build_log: false` is a **lost
   pod**: `classify.py` gives it its own run-level headline (`infra`, never
@@ -588,8 +599,12 @@ by the strip's rule over the task's reps (no `reps` key: the task's result
 is one rep) and `reason` the first failing rep's grader text (`null` on a
 pass). `expected` counts the cases `nightly_active` on this checkout;
 `missing[]` names the expected cases the night did not record.
-`truncated` is `result == "ABORTED"` (the periodic's deadline ended the
-job); `complete` is neither truncated nor missing anything. `newly_failing`
+`truncated` is a night Prow ended before its verdict: `result == "ABORTED"`
+(an interrupt), or any other non-`SUCCESS` result with `eval_verdict`
+`null` — the periodic's deadline arrives as SIGTERM and Prow records
+`FAILURE`, so `ABORTED` alone would miss it; a record without the field
+is unknown, not truncated. `complete` is neither truncated nor missing
+anything. `newly_failing`
 is every `fail` tonight that was not `fail` on `previous_build`, the night
 before it on record (the one past the window included), `fixed` every
 `fail` then that is `pass` now; both `[]` on the first night, when

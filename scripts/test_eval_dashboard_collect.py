@@ -100,6 +100,7 @@ class TestFixtureParsing(unittest.TestCase):
         self.assertEqual(run["head_sha"], "b336c6c")
         self.assertEqual(run["project"], "kube-agents-evals-5")
         self.assertEqual(run["duration_s"], 2143)
+        self.assertEqual(run["eval_verdict"], "RED", "the final verdict line, in the release record's words")
         self.assertEqual(len(run["tasks"]), 11)
         by_name = {t["name"]: t for t in run["tasks"]}
         infra = by_name["compliance-rbac-overgrant"]
@@ -117,6 +118,9 @@ class TestFixtureParsing(unittest.TestCase):
         self.assertEqual(run["head_sha"], "13b2c71")
         self.assertEqual(run["project"], "kube-agents-evals-3")
         self.assertEqual(run["result"], "FAILURE")
+        # The deadline ended the job before its verdict line: recorded as such,
+        # since Prow says FAILURE here, not ABORTED.
+        self.assertIsNone(run["eval_verdict"])
         # No verdict line -> fall back to finished-started timestamps.
         self.assertEqual(run["duration_s"], 1787775335 - 1787770764)
         self.assertEqual(len(run["tasks"]), 5)
@@ -1158,7 +1162,7 @@ class TestContractShape(unittest.TestCase):
         # carries; the pod_* trio appears only when podinfo.json was read.
         self.assertEqual(
             list(data["runs"][0]),
-            ["build_id", "tier", "job", "pr", "head_sha", "project", "started", "finished", "result", "duration_s", "tasks", "has_build_log"],
+            ["build_id", "tier", "job", "pr", "head_sha", "project", "started", "finished", "result", "eval_verdict", "duration_s", "tasks", "has_build_log"],
         )
         self.assertEqual(
             list(data["runs"][0]["tasks"][0]),

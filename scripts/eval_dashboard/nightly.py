@@ -18,8 +18,11 @@ graded repetition passed), ``partial`` (some passed, some failed), ``fail``
 (every graded repetition failed), ``infra`` (nothing graded -- quota or
 setup losses, which never count against a case).
 
-A night is **truncated** when Prow ended the job (``result: ABORTED`` --
-the periodic's deadline) and **incomplete** when it concluded but recorded
+A night is **truncated** when Prow ended the job before the eval loop's
+verdict -- ``result: ABORTED`` (an interrupt), or any other non-SUCCESS
+result whose log has no verdict line (``eval_verdict: null``): the
+periodic's deadline arrives as SIGTERM and Prow records FAILURE, so ABORTED
+alone would miss it -- and **incomplete** when it concluded but recorded
 fewer cases than the nightly matrix on this checkout expects
 (``cases[].nightly_active``). Either way the page and the digest say so
 instead of reporting the counts as if the whole matrix had run.
@@ -50,9 +53,16 @@ STATE_INFRA = "infra"
 STATES = (STATE_PASS, STATE_PARTIAL, STATE_FAIL, STATE_INFRA)
 # Rep results as the collector writes them (SCHEMA.md: runs[].tasks[].reps).
 REP_RESULTS = ("pass", "fail", "infra")
-# Prow's verdict on the job (SCHEMA.md: runs[].result). ABORTED is the
-# periodic's deadline: the job was killed, so the night is truncated.
+# Prow's verdict on the job (SCHEMA.md: runs[].result) and the eval loop's
+# own (runs[].eval_verdict; None when the log has no verdict line). ABORTED
+# is an interrupt. The periodic's deadline is not one: it arrives as SIGTERM
+# and Prow records FAILURE (collect.py's fixture 2092688354838581248), so a
+# non-SUCCESS run with no verdict line is the truncated night this module
+# exists to name. A record from before the collector wrote eval_verdict has
+# no key at all: unknown, not truncated.
 RESULT_ABORTED = "ABORTED"
+RESULT_SUCCESS = "SUCCESS"
+EVAL_VERDICT_KEY = "eval_verdict"
 # A nightly build on the collector's pending_builds (listed, no finished.json
 # yet) is a night still running only while its first sighting is this
 # recent: the periodic's budget is 8 hours (oss-test-infra: timeout 480m)
@@ -213,6 +223,17 @@ def states_of(cases: list[dict]) -> dict[str, str]:
     return {c["case"]: c["state"] for c in cases}
 
 
+def night_truncated(run: dict, result: str | None) -> bool:
+    """Whether Prow ended the job before its verdict (module docstring):
+    ABORTED, or any other non-SUCCESS result whose record says the log has
+    no verdict line. A record without ``eval_verdict`` is unknown."""
+    if result == RESULT_ABORTED:
+        return True
+    if result == RESULT_SUCCESS or EVAL_VERDICT_KEY not in run:
+        return False
+    return run.get(EVAL_VERDICT_KEY) is None
+
+
 def night_document(run: dict, data: dict, previous: dict | None) -> dict:
     """One night as the page and the digest read it (SCHEMA.md,
     "brief.json": ``nightly.nights[]``). ``previous`` is the night before
@@ -229,7 +250,7 @@ def night_document(run: dict, data: dict, previous: dict | None) -> dict:
     fixed = sorted(name for name, state in before.items() if state == STATE_FAIL and now_states.get(name) == STATE_PASS)
     result = str(run.get("result") or "").upper() or None
     missing = [name for name in expected if name not in recorded]
-    truncated = result == RESULT_ABORTED
+    truncated = night_truncated(run, result)
     started = parse_iso(run.get("started"))
     finished = parse_iso(run.get("finished"))
     duration = run.get("duration_s")
@@ -287,7 +308,7 @@ def night_reports(data: dict, limit: int = NIGHTS_ON_RECORD) -> list[dict]:
 
 def nightly_job(data: dict) -> str:
     """The periodic's name as the newest nightly run carries it, else the default."""
-    return next((r.get("job") for r in sorted_nightly_runs(data) if isinstance(r.get("job"), str)), DEFAULT_NIGHTLY_JOB)
+    return next((r.get("job") for r in reversed(sorted_nightly_runs(data)) if isinstance(r.get("job"), str)), DEFAULT_NIGHTLY_JOB)
 
 
 def running_nights(data: dict, now: datetime.datetime | None) -> list[dict]:

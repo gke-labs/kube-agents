@@ -106,11 +106,22 @@ class NightDocumentTest(unittest.TestCase):
         self.assertEqual(last["counts"]["missing"], 1)
         self.assertEqual(last["duration_s"], 8 * 3600, "no verdict line: finished - started")
         self.assertEqual(last["newly_failing"], [], "case-b lost every rep to infra: not a failure")
-        # Concluded but short of the matrix: incomplete, not truncated.
+        # Concluded but short of the matrix: incomplete, not truncated. (No
+        # eval_verdict key at all: a record from before the collector wrote
+        # it, unknown rather than truncated.)
         data["runs"][-1].update(result="FAILURE", duration_s=20000)
         last = nightly.night_reports(data)[0]
         self.assertFalse(last["truncated"])
         self.assertFalse(last["complete"])
+        # Prow's deadline delivers SIGTERM and records FAILURE, not ABORTED
+        # (collect.py's fixture 2092688354838581248): a night that is not a
+        # SUCCESS and whose log has no verdict line is truncated too.
+        data["runs"][-1].update(eval_verdict=None)
+        self.assertTrue(nightly.night_reports(data)[0]["truncated"])
+        data["runs"][-1].update(eval_verdict="RED")
+        self.assertFalse(nightly.night_reports(data)[0]["truncated"], "graded to the end, short of the matrix: incomplete")
+        data["runs"][-1].update(result="SUCCESS", eval_verdict=None)
+        self.assertFalse(nightly.night_reports(data)[0]["truncated"], "a SUCCESS without a verdict line is step 0's revalidation, not a kill")
 
     def test_reps_absent_means_the_task_result_is_one_rep_and_bad_rows_are_skipped(self):
         data = two_nights()
@@ -171,7 +182,10 @@ class DigestLineTest(unittest.TestCase):
         data = two_nights()
         data["runs"][-1].update(result="ABORTED", duration_s=None, tasks=data["runs"][-1]["tasks"][:1])
         self.assertEqual(self.line(data), "🌙 Nightly: truncated after 6h 40m · 1 of 3 cases recorded · the night's numbers are not comparable")
-        data["runs"][-1].update(result="FAILURE", duration_s=20000)
+        # The deadline's real shape: FAILURE with no verdict line.
+        data["runs"][-1].update(result="FAILURE", eval_verdict=None)
+        self.assertEqual(self.line(data), "🌙 Nightly: truncated after 6h 40m · 1 of 3 cases recorded · the night's numbers are not comparable")
+        data["runs"][-1].update(eval_verdict="RED", duration_s=20000)
         self.assertEqual(self.line(data), "🌙 Nightly: 1 cases · 0 passed all reps · 1 partial · 0 failed · nothing newly failing · incomplete: 1 of 3 cases recorded · 5h 33m")
 
     def test_a_missing_night_and_no_night_at_all_say_so(self):
