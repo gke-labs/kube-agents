@@ -147,9 +147,9 @@ the assignee is the claim; do not apply `status:` labels to issues in this repos
 
 ## Skills Guidelines
 
-- Skills live under `agents/platform/skills/` (Platform Agent) and `agents/cluster/skills/` (Cluster Agent); each skill directory holds a `SKILL.md` written for an AI agent.
-- Place a skill by persona: fleet, provisioning and GitOps-write skills belong to the Platform Agent; read-only, single-cluster runtime-debugging skills belong to the Cluster Agent.
-- `agents/platform/skills/gke-*` are mirrors of `google/skills`, deleted and recopied by `scripts/sync-upstream-skills.py` on every sync, so a direct edit lasts until the next run. Do not make one; add a `SKILL_SUBSTITUTIONS` or `SKILL_FOOTERS` entry in that script and rerun the sync.
+- Skills live under `agents/platform/skills/` (Platform Agent) and `agents/cluster/skills/` (Cluster Agent); each holds a `SKILL.md` for an AI agent.
+- Place a skill by persona: fleet, provisioning and GitOps-write skills go to the Platform Agent; read-only, single-cluster runtime debugging to the Cluster Agent.
+- `agents/platform/skills/gke-*` are copies of `google/skills` that `scripts/sync-upstream-skills.py` overwrites wholesale, so the prefix is reserved and a direct edit lasts until the next sync. Put a `SKILL.md` change in its `SKILL_SUBSTITUTIONS` or `SKILL_FOOTERS` and make the same edit by hand; a rerun refreshes every skill from upstream.
 
 ## Engineering Rules
 
