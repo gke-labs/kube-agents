@@ -735,13 +735,13 @@ def task_domain(name: str, repo_root: pathlib.Path = REPO_ROOT) -> str:
         text = path.read_text()
     except OSError:
         return "unknown"
-    m = re.search(r"^domain:\s*([A-Za-z0-9_-]+)\s*$", text, re.M)
+    m = re.search(r"^domain:\s*([A-Za-z0-9_-]+)\s*$", text, re.MULTILINE)
     return m.group(1) if m else "unknown"
 
 
 def _task_array_names(text: str, array: str) -> set[str]:
     """The uncommented `./tasks/<name>/task.yaml` entries of one bash array."""
-    m = re.search(rf"^{array}=\(\n(.*?)^\)$", text, re.M | re.S)
+    m = re.search(rf"^{array}=\(\n(.*?)^\)$", text, re.MULTILINE | re.DOTALL)
     if not m:
         raise ValueError(f"{array}=( ... ) array not found in hack/ci-eval-pr.sh")
     names = set()
@@ -785,7 +785,7 @@ def coverage(repo_root: pathlib.Path = REPO_ROOT) -> dict:
     and the unit tests here assert this parse agrees with it.
     """
     text = (repo_root / "docs" / "designs" / "domains.yaml").read_text()
-    slugs = re.findall(r"^\s*-\s*slug:\s*([A-Za-z0-9_-]+)", text, re.M)
+    slugs = re.findall(r"^\s*-\s*slug:\s*([A-Za-z0-9_-]+)", text, re.MULTILINE)
     uncovered = []
     in_allowlist = False
     for line in text.splitlines():
