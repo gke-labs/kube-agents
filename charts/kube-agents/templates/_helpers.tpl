@@ -206,12 +206,21 @@ it has to be right when the policy is applied. So it comes from telemetry.collec
 when given, and otherwise from the endpoint host, which is a cluster-local Service name in
 the case this feature exists for (<svc>.<ns>.svc.cluster.local, or the shortened <svc>.<ns>).
 
-Anything else — an external vendor endpoint, a bare hostname — fails the render, but only
-when litellm.otel is on. Silently falling back to gke-managed-otel would emit a policy that
-blocks the very collector the user just configured, and the symptom would be zero spans
-with a green install. With litellm.otel off (the default) there is no LiteLLM exporter for
-the policy to block, so failing the whole install over an egress rule nothing uses would
-punish a user who only meant to repoint the agents.
+Anything else — an external vendor endpoint, a bare hostname — has no namespace to open,
+and what the static policy does then follows the operator's dynamic copy. With
+litellm.otel on, this renders "" and the caller emits no OTLP rule: the exporter goes out
+over the port-443 rule, and a made-up namespaceSelector would open 4317/4318 to a
+namespace nothing exports to. With litellm.otel off (the default) there is no LiteLLM
+exporter, and the rule keeps the shipping gke-managed-otel default rather than changing
+a policy over an egress rule nothing uses.
+
+The host is parsed the way the operator's otlpCollectorNamespace (k8s-operator,
+platformagent_manifests.go) parses the same value when it builds the dynamic policy —
+exact lowercase scheme prefixes, cut at the first "/", then at the first ":" — so the two
+renders reach the same verdict about the same endpoint.
+
+Only the static litellm-policy render calls this. On the default install the operator
+owns the policy and resolves the namespace at reconcile time from the CR.
 */}}
 {{- define "kube-agents.otlpCollectorNamespace" -}}
 {{- if .Values.telemetry.collectorNamespace -}}
@@ -232,8 +241,6 @@ gke-managed-otel
 {{- index $parts 1 -}}
 {{- else if not .Values.litellm.otel -}}
 gke-managed-otel
-{{- else -}}
-{{- fail (printf "telemetry.otlpEndpoint %q does not name an in-cluster Service, so the LiteLLM NetworkPolicy cannot tell which namespace to allow egress to. Set telemetry.collectorNamespace, or set litellm.networkPolicy=false if the policy is managed elsewhere." .Values.telemetry.otlpEndpoint) -}}
 {{- end -}}
 {{- end -}}
 {{- end }}

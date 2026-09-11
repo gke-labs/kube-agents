@@ -11,11 +11,31 @@ metadata:
   {{- with .Values.platformAgent.annotations }}
   {{- $annotations = deepCopy . }}
   {{- end }}
+  {{- /*
+    Two keys the operator reads are also derived from chart values, and the value
+    wins because it drives the rest of the release too: litellm.networkPolicy is
+    the static render gate, telemetry.collectorNamespace the static policy's
+    egress namespace. A platformAgent.annotations entry that disagrees with the
+    value it duplicates fails the render rather than being overwritten in silence.
+  */}}
+  {{- $litellmPolicyKey := "kubeagents.x-k8s.io/enable-litellm-network-policy" }}
   {{- if and .Values.litellm (not .Values.litellm.networkPolicy) }}
-  {{- $_ := set $annotations "kubeagents.x-k8s.io/enable-litellm-network-policy" "false" }}
+  {{- with get $annotations $litellmPolicyKey }}
+  {{- /* The operator reads this value trimmed and case-insensitively; agree with it. */}}
+  {{- if ne (toString . | trim | lower) "false" }}
+  {{- fail (printf "platformAgent.annotations[%q]=%q contradicts litellm.networkPolicy=false, which stamps it \"false\". Drop the annotation or set litellm.networkPolicy=true." $litellmPolicyKey (toString .)) }}
   {{- end }}
+  {{- end }}
+  {{- $_ := set $annotations $litellmPolicyKey "false" }}
+  {{- end }}
+  {{- $collectorNamespaceKey := "kubeagents.x-k8s.io/otlp-collector-namespace" }}
   {{- with .Values.telemetry.collectorNamespace }}
-  {{- $_ := set $annotations "kubeagents.x-k8s.io/otlp-collector-namespace" . }}
+  {{- with get $annotations $collectorNamespaceKey }}
+  {{- if ne (toString .) $.Values.telemetry.collectorNamespace }}
+  {{- fail (printf "platformAgent.annotations[%q]=%q contradicts telemetry.collectorNamespace=%q. Set telemetry.collectorNamespace alone; the chart stamps the annotation from it." $collectorNamespaceKey (toString .) $.Values.telemetry.collectorNamespace) }}
+  {{- end }}
+  {{- end }}
+  {{- $_ := set $annotations $collectorNamespaceKey . }}
   {{- end }}
   {{- with $annotations }}
   annotations:
