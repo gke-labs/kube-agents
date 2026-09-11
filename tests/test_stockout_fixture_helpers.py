@@ -816,6 +816,36 @@ class EnsurePluginInstalledTest(unittest.TestCase):
                 )
         self.assertIn("was expected on this environment", str(caught.exception))
 
+    def test_fails_when_crd_check_encounters_transport_error(self):
+        def fake_kubectl(*args, **kwargs):
+            if "crd" in args:
+                return _completed(returncode=1, stderr="dial tcp 127.0.0.1:8080: connect: connection refused")
+            return _completed(returncode=0)
+
+        with mock.patch.object(sof, "_kubectl", side_effect=fake_kubectl):
+            with self.assertRaises(_StubFail) as caught:
+                sof.ensure_stockout_plugin_installed(
+                    "proj", "cluster", "us-central1", "kubeagents-system"
+                )
+        self.assertIn("Failed to reach cluster", str(caught.exception))
+        self.assertIn("connection refused", str(caught.exception))
+
+    def test_fails_when_plugin_check_encounters_transport_error(self):
+        def fake_kubectl(*args, **kwargs):
+            if "crd" in args:
+                return _completed(returncode=0)
+            if "agentplugins" in args:
+                return _completed(returncode=1, stderr="Unable to connect to the server: net/http: TLS handshake timeout")
+            return _completed(returncode=0)
+
+        with mock.patch.object(sof, "_kubectl", side_effect=fake_kubectl):
+            with self.assertRaises(_StubFail) as caught:
+                sof.ensure_stockout_plugin_installed(
+                    "proj", "cluster", "us-central1", "kubeagents-system"
+                )
+        self.assertIn("Failed to reach cluster", str(caught.exception))
+        self.assertIn("TLS handshake timeout", str(caught.exception))
+
 
 class PluginReadyStatusTest(unittest.TestCase):
     """Verifies that _wait_for_plugin_ready tolerates transient Degraded and fails on persistent Degraded."""

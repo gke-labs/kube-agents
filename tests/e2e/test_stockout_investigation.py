@@ -158,6 +158,17 @@ def _kubectl(
         )
 
 
+def _is_resource_not_found(res: subprocess.CompletedProcess) -> bool:
+    """Reports whether kubectl failed specifically because the resource does not exist.
+
+    Distinguishes genuine resource absence (NotFound / not found) from transport,
+    connection, authentication, or context errors (e.g. connection refused, dial tcp,
+    unauthorized, or no context set).
+    """
+    err = (res.stderr + " " + res.stdout).lower()
+    return "notfound" in err or "not found" in err
+
+
 def _remaining(deadline: float, cap: int) -> Tuple[int, str]:
     """How long a wait gets, and which of the two ceilings decided it.
 
@@ -578,8 +589,10 @@ def _verify_skill_mounted(
         # Conclusive: the exec ran, repeatedly, and the file is not there.
         pytest.fail(
             f"The stockout plugin's skill is not mounted in {absent_in}: {skill_path} does not "
-            f"exist, {window}s ({bound}) after the gateway rolled out. The AgentPlugin is present, "
-            f"but image volume mounting or staging failed to link the skill into profile '{target_profile or 'default'}'."
+            f"exist, {window}s ({bound}) after the gateway rolled out. The AgentPlugin "
+            f"reconciled, so the alerts these tests publish would be investigated by nobody. "
+            f"Either the plugin image did not reach the '{target_profile or 'default'}' profile, "
+            "or the spec the operator reconciled is not the one this candidate installs."
         )
     # Inconclusive rather than a verdict on the plugin: no pod resolved, or every exec
     # failed. Saying which, and which ceiling ran out, keeps this from reading as an
@@ -759,6 +772,11 @@ def ensure_stockout_plugin_installed(
     # 1. The CRD is the prerequisite for plugins. If absent, plugins are not installed on the cluster.
     check_crd = _kubectl("get", "crd", _CRD_NAME, fail_on_timeout=True)
     if check_crd.returncode != 0:
+        if not _is_resource_not_found(check_crd):
+            pytest.fail(
+                f"Failed to reach cluster when checking for CRD '{_CRD_NAME}': "
+                f"{check_crd.stderr.strip() or f'kubectl exited {check_crd.returncode}'}"
+            )
         if expected:
             pytest.fail(
                 f"AgentPlugin CRD '{_CRD_NAME}' was expected on this environment, but is missing from cluster."
@@ -773,6 +791,11 @@ def ensure_stockout_plugin_installed(
         "get", "agentplugins", _PLUGIN_NAME, "-n", agent_namespace, fail_on_timeout=True
     )
     if check_plugin.returncode != 0:
+        if not _is_resource_not_found(check_plugin):
+            pytest.fail(
+                f"Failed to reach cluster when checking for AgentPlugin '{_PLUGIN_NAME}' in '{agent_namespace}': "
+                f"{check_plugin.stderr.strip() or f'kubectl exited {check_plugin.returncode}'}"
+            )
         if expected:
             pytest.fail(
                 f"Stockout investigator was expected on this environment (ENABLE_STOCKOUT_INVESTIGATOR=true), "
