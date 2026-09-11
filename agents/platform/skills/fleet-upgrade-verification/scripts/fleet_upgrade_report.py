@@ -117,8 +117,10 @@ MEMBER_KEY_SEPARATOR = "/"
 TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 # Per-member progress since the previous run for the same target. `completed`: the
-# status became current or ahead. `started`: the control plane or the lowest pool
-# changed version without reaching the target, or the member is in flight. `unchanged`:
+# member is current or ahead after a version change (a current member that moved to a
+# new channel default included), or its status became current or ahead. `started`:
+# the control plane or the lowest pool changed version without reaching the target, or
+# the member is in flight. `unchanged`:
 # the same versions and status as before. `new`: no prior record. `stalled` is an
 # unchanged member that is lagging or patch-behind while a rollout is active, which is
 # the signal a point-in-time table cannot give: a member that has not moved between two
@@ -546,9 +548,12 @@ def _delta(member: dict, previous: dict | None) -> tuple[str, bool]:
     versions_before = (previous.get("control_plane_version"), previous.get("lowest_node_pool_version"))
     status_now, status_before = member["status"], previous.get("status")
     moved = versions_now != versions_before
-    # `completed` needs evidence of a move: a graded behind status before, or a version
-    # change. An `unknown` baseline (a failed server-config read) proves nothing.
-    if status_now in DONE_STATUSES and status_before not in DONE_STATUSES and (status_before in GRADED_STATUSES or moved):
+    # `completed` needs evidence of a move: a version change, or a graded behind status
+    # before. A member that was already at the target and changed version is at the
+    # target again (the channel default moved and it followed), which is a completed
+    # upgrade, not a started one. An `unknown` baseline (a failed server-config read)
+    # proves nothing on its own.
+    if status_now in DONE_STATUSES and (moved or status_before in BEHIND_STATUSES):
         return PROGRESS_COMPLETED, False
     in_flight = [member["cluster_status"]] + [p.get("status", "") for p in member["node_pools"]]
     if moved or any(s in IN_FLIGHT_STATUSES for s in in_flight):

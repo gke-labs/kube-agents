@@ -86,7 +86,9 @@ The first run for a target prints one line saying the baseline was recorded and 
 run prints a "Rollout progress" section after the table, naming the previous run's time and, per
 member, the control-plane and lowest-pool versions then and now, the current status, and one of:
 
-- `completed`: the member's status became `current` or `ahead` since the previous run.
+- `completed`: the member is `current` or `ahead` after a version change, or its status became
+  `current` or `ahead` since the previous run. A `current` member that followed its channel
+  default to a new version is `completed`, not `started`.
 - `started`: the control plane or the lowest pool changed version without reaching the target,
   or the cluster or a pool is `RECONCILING`/`PROVISIONING`.
 - `unchanged`: the same versions as the previous run. A member whose versions are the same but

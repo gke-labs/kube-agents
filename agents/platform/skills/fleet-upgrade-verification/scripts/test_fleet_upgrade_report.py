@@ -580,6 +580,35 @@ class RolloutTrackingTest(unittest.TestCase):
             report.main(argv + ["--rollout-in-progress"])
         self.assertEqual(self._progress_rows(out.getvalue())["x"][6], "stalled (unchanged for 1h 0m)")
 
+    def test_a_member_at_the_target_that_changes_version_is_completed_not_started(self):
+        # Channel-default runs: the REGULAR default moves a patch and a current member
+        # follows it in its window. It is current again at new versions: a completed
+        # upgrade, and a mover, not a member that has just started.
+        config = {"us-central1": server_config(REGULAR="1.31.0-gke.1")}
+        clusters = [
+            cluster("x", "us-central1", "1.31.0-gke.1", [("p", "1.31.0-gke.1")]),
+            cluster("y", "us-central1", "1.30.0-gke.1", [("p", "1.30.0-gke.1")]),
+        ]
+        self._run_channel_default(clusters, config)
+        self.now = self.T0 + timedelta(hours=1)
+        config = {"us-central1": server_config(REGULAR="1.31.1-gke.1")}
+        clusters[0] = cluster("x", "us-central1", "1.31.1-gke.1", [("p", "1.31.1-gke.1")])
+        out = self._run_channel_default(clusters, config)
+        rows = self._progress_rows(out)
+        self.assertEqual(rows["x"][5], "current")
+        self.assertEqual(rows["x"][6], "completed")
+        self.assertEqual(rows["y"][6], "stalled (unchanged for 1h 0m)", "x moving makes the rollout active")
+        self.assertIn("1 completed, 0 started, 1 stalled, 0 unchanged, 0 new", out)
+        # Explicit target: a current member that moves past it is `completed` too, and a
+        # current member that did not move stays `unchanged`.
+        self._run(self._fleet())
+        self.now = self.T0 + timedelta(hours=2)
+        rows = self._progress_rows(self._run(self._fleet(d="1.32.0-gke.1"))[1])
+        self.assertEqual((rows["d"][5], rows["d"][6]), ("ahead", "completed"))
+        self.now = self.T0 + timedelta(hours=3)
+        rows = self._progress_rows(self._run(self._fleet(d="1.32.0-gke.1"))[1])
+        self.assertEqual((rows["d"][5], rows["d"][6]), ("ahead", "unchanged"))
+
     def _run_channel_default(self, clusters, config, *extra_args, failing_locations=()):
         fake = FakeGcloud({"p1": clusters}, config, failing_locations=failing_locations)
         out = io.StringIO()
