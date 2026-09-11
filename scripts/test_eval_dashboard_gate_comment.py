@@ -162,8 +162,8 @@ class Shapes(Harness):
             lines[3],
             "> 🔴 **Gate outage in progress** since Sun 7:30 AM ET. The 3 crashloop tests fail on every PR (7 PRs so far)."
             " **Your 3 failures are exactly those 3, so this red is not your code.** Don't retest yet; run `/retest` once #kube-agents-ci-health says the gate is healthy again."
-            " [Why this run failed →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html?build=100)"
-            " · [Incident brief →](https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html?cases=cluster-agent-crashloop-debug,cluster-agent-crashloop-evidence-chain,cluster-agent-crashloop-misleading-symptom&since=2026-09-06T11:30:00Z#gate)",
+            " [Why this run failed →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html#build=100)"
+            " · [Incident brief →](https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html#since=2026-09-06T11:30:00Z&cases=cluster-agent-crashloop-debug,cluster-agent-crashloop-evidence-chain,cluster-agent-crashloop-misleading-symptom&view=gate)",
         )
         self.assertIn("| Case | Result | Also failing on |", body)
         self.assertIn("| `cluster-agent-crashloop-debug` | 0 / 3 reps | 7 other PRs |", body)
@@ -189,7 +189,7 @@ class Shapes(Harness):
         self.assertEqual(
             lines[3],
             "> 🟢 **Gate healthy.** `security-overgrant-probe` passed on the last 9 runs from other PRs and failed on your last 4. **This looks specific to your PR.**"
-            " [Why this run failed →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html?build=103)",
+            " [Why this run failed →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html#build=103)",
         )
         self.assertIn("| `security-overgrant-probe` | 0 / 3 reps | no other PR |", body)
         self.assertIn("Reason: `", body)
@@ -308,7 +308,7 @@ class LostPodComment(Harness):
             lines[3],
             "> The Prow build node running this job went away at 10:55 AM ET (gke-kube-agents-prow-default-pool-eb220b2a-sgnk)."
             " Nothing was graded and nothing about your change is implied. `/retest` once new jobs are progressing."
-            " [Details →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html?build=100)",
+            " [Details →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html#build=100)",
         )
         self.assertEqual(lines[5], "Ran 128 min before the node went away · [build log](https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/1300/pull-kube-agents-smoke-test/100)")
         self.assertNotIn("Incident brief", self.gh.bodies()[0])
@@ -320,7 +320,7 @@ class LostPodComment(Harness):
         self.tick(data(mine, *green_others()), lost_pods_health())
         box = self.gh.bodies()[0].split("\n")[3]
         self.assertTrue(box.startswith("> The Prow build node running this job went away at 10:55 AM ET (gke-kube-agents-prow-default-pool-eb220b2a-sgnk) — part of a build-cluster event: 12 runs on 12 PRs. Nothing was graded"), box)
-        self.assertTrue(box.endswith("[Details →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html?build=100) · [Incident brief →](https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html?since=2026-09-08T14:05:52Z#gate)"), box)
+        self.assertTrue(box.endswith("[Details →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html#build=100) · [Incident brief →](https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html#since=2026-09-08T14:05:52Z&view=gate)"), box)
 
     def test_below_the_event_bar_the_box_gives_the_count_without_calling_it_an_event(self):
         mine = lost(100, 1300, NOW - timedelta(minutes=5))

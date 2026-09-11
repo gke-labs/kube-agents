@@ -20,6 +20,7 @@ trap body around it -- lifted out of the real file, rather than grepping for
 guards, so it fails if the fail-safe is weakened by any future edit.
 """
 
+import json
 import pathlib
 import re
 import subprocess
@@ -254,6 +255,34 @@ class PublishHookFailSafeTest(unittest.TestCase):
                     result.stdout,
                 )
                 self.assertNotIn(SKIP, result.stdout)
+
+    def test_a_bucket_target_renders_with_the_public_url(self):
+        """A bucket target is the published site, read from
+        storage.cloud.google.com, which redirects to a locked domain that
+        serves one object: without <base href> every relative link on the
+        page is dead there. This hook publishes to the same bucket as
+        hack/ci-dashboard-refresh.sh, so it has to pass the same flag, or a
+        run of it replaces good pages with unnavigable ones until the next
+        15-minute refresh. A local target keeps relative links."""
+        collect_ok = """\
+            import json, pathlib, sys
+            out = sys.argv[sys.argv.index("--out") + 1]
+            pathlib.Path(out).write_text(json.dumps({"runs": [{"build": "1"}]}))
+            """
+        record_argv = (
+            "import json, pathlib, sys\n"
+            "pathlib.Path(sys.path[0], 'render.py.argv').write_text(json.dumps(sys.argv[1:]))\n"
+        )
+        for target, expected in (("gs://kube-agents-dashboards/evals/", True), ("/tmp/local-site", False)):
+            with tempfile.TemporaryDirectory() as tmp:
+                fake_hack = dashboard_stubs(pathlib.Path(tmp), collect_ok)
+                dash = pathlib.Path(tmp) / "scripts" / "eval_dashboard"
+                (dash / "render.py").write_text(record_argv)
+                result = run_hook(0, fake_hack, target=target)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                argv = json.loads((dash / "render.py.argv").read_text())
+                self.assertEqual("--public-url" in argv, expected, f"{target}: {argv}")
+                self.assertNotIn("", argv, "no empty argument from an unset array")
 
     def test_zero_collected_runs_skip_instead_of_publishing_empty(self):
         """The evidence_store lesson: an unreadable source is not an empty

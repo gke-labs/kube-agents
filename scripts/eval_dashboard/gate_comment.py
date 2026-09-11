@@ -100,10 +100,9 @@ OUTCOME_FAILED = classify.OUTCOME_FAILED
 ONLY_PR_WINDOW = classify.ONLY_PR_WINDOW
 EXCERPT_CHARS = 160
 
-# Links. The run page and the brief are the dashboard's (post_health owns
-# the brief's contract); the build log is Prow's Deck for this job.
-DASHBOARD_ROOT = post_health.DASHBOARD_URL.rsplit("/", 1)[0]
-RUN_URL = DASHBOARD_ROOT + "/run.html?build={build_id}"
+# Links. The run page and the brief are the dashboard's, written by
+# post_health.run_link and post_health.incident_link (post_health owns the
+# URL contract); the build log is Prow's Deck for this job.
 BUILD_LOG_URL = "https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/{pr}/" + JOB_NAME + "/{build_id}"
 # "kube-agents-evals-23" reads as "evals-23".
 PROJECT_PREFIX = "kube-agents-"
@@ -291,7 +290,7 @@ def health_box(red: Red, health_doc: dict, runs: list[dict]) -> str:
     state = health_doc.get("state")
     incident = state not in (None, health.GREEN)
     since = post_health.parse_iso(health_doc.get("since"))
-    links = [LINK_RUN.format(url=RUN_URL.format(build_id=red.run.build_id))]
+    links = [LINK_RUN.format(url=post_health.run_link(red.run.build_id))]
     if incident:
         links.append(LINK_BRIEF.format(url=post_health.incident_link(health_doc)))
     if red.hard:
@@ -374,7 +373,7 @@ def render_lost_comment(run: health.Run, health_doc: dict) -> str:
     shape = BOX_LOST_EVENT if incident.get("event") else BOX_LOST_SOME
     event = shape.format(runs=incident.get("runs", 0), prs=len(incident.get("prs") or [])) if in_event else ""
     node = f" ({run.pod_node})" if run.pod_node else ""
-    links = [LINK_DETAILS.format(url=RUN_URL.format(build_id=run.build_id))]
+    links = [LINK_DETAILS.format(url=post_health.run_link(run.build_id))]
     if in_event:
         links.append(LINK_BRIEF.format(url=post_health.incident_link(health_doc)))
     box = BOX_LOST.format(when=post_health.clock(run.finished), node=node, event=event)

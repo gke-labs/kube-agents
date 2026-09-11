@@ -3,7 +3,7 @@
 which are the pull request's.
 
 The gate comment on a pull request, the dashboard's PR view
-(``run.html?build=<id>``) and the incident brief all answer the same
+(``run.html#build=<id>``) and the incident brief all answer the same
 question about a red run -- "is this mine?" -- and they must answer it the
 same way, so the rules live here once. ``classify_run`` is the whole
 interface::

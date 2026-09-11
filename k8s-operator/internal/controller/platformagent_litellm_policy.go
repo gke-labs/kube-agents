@@ -268,10 +268,15 @@ func buildLiteLLMNetworkPolicy(agent *agentv1alpha1.PlatformAgent, profile netpo
 // litellmOTLPCollectorNamespace resolves the collector namespace for the LiteLLM NetworkPolicy.
 // LiteLLM's OTLP exporter is statically configured by Helm (defaulting to gke-managed-otel)
 // and does not participate in the agent's dynamic runtime discovery.
-// Precedence matches Helm (_helpers.tpl:217-220):
-// 1. AnnotationOTLPCollectorNamespace on the PlatformAgent CR if set and valid.
-// 2. The namespace extracted from agent.Spec.Telemetry.OTLPEndpoint if specified.
-// 3. Fallback to managedOTelCollectorNamespace ("gke-managed-otel").
+// The ladder resolves the same inputs the same way as Helm's
+// kube-agents.otlpCollectorNamespace, except for an endpoint that names no
+// in-cluster Service while the LiteLLM exporter is off, where it deliberately differs:
+//  1. AnnotationOTLPCollectorNamespace on the PlatformAgent CR if set and valid.
+//  2. The namespace extracted from agent.Spec.Telemetry.OTLPEndpoint if specified.
+//     An endpoint that names no in-cluster Service yields "", and the caller emits
+//     no OTLP rule. The static Helm render does the same with litellm.otel on, and
+//     keeps gke-managed-otel there with it off.
+//  3. With no endpoint at all, managedOTelCollectorNamespace ("gke-managed-otel").
 func litellmOTLPCollectorNamespace(agent *agentv1alpha1.PlatformAgent) string {
 	if ns := trimmedAnnotation(agent, AnnotationOTLPCollectorNamespace); ns != "" {
 		if errs := validation.IsValidLabelValue(ns); len(errs) == 0 {
@@ -377,9 +382,12 @@ func (r *PlatformAgentReconciler) reconcileLiteLLMNetworkPolicy(ctx context.Cont
 	}
 
 	netpol := buildLiteLLMNetworkPolicy(agent, profile)
-	if agent != nil && agent.Spec.Telemetry != nil && agent.Spec.Telemetry.OTLPEndpoint != "" && otlpCollectorNamespace(agent.Spec.Telemetry.OTLPEndpoint) == "" {
+	if agent.Spec.Telemetry != nil && agent.Spec.Telemetry.OTLPEndpoint != "" && otlpCollectorNamespace(agent.Spec.Telemetry.OTLPEndpoint) == "" {
 		if litellmOTLPCollectorNamespace(agent) == "" {
-			logf.FromContext(ctx).Info("WARNING: LiteLLM OTLP endpoint does not name an in-cluster Service and no collector namespace is configured; omitting OTLP egress rule",
+			// Not a warning: an external endpoint on port 443 is a supported shape, and the
+			// exporter leaves over the policy's 443 rule. A collector namespace is the remedy
+			// only when the collector is in fact in-cluster behind a host that hides it.
+			logf.FromContext(ctx).Info("LiteLLM OTLP endpoint names no in-cluster Service; emitting no OTLP egress rule, the exporter uses the port-443 rule (set the otlp-collector-namespace annotation if the collector is in-cluster)",
 				"namespace", agent.Namespace, "endpoint", agent.Spec.Telemetry.OTLPEndpoint)
 		}
 	}

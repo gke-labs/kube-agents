@@ -99,13 +99,6 @@
 {{- end }}
 {{- $callbacks := printf "[%s]" (join ", " $quotedCallbacks) }}
 {{- /*
-  LiteLLM OTLP collector validation: ensure collector namespace can be determined
-  when otel and network policy are active, failing the render early if unresolvable.
-*/}}
-{{- if and .Values.litellm.otel .Values.litellm.networkPolicy }}
-{{- $null := include "kube-agents.otlpCollectorNamespace" . }}
-{{- end }}
-{{- /*
   Rendered once here and used twice below — as the ConfigMap body and as the
   input to the Deployment's checksum. Three aliases for one upstream model,
   mirroring the kustomize base: the agent configs only ever request
@@ -340,11 +333,15 @@ metadata:
   labels:
     app.kubernetes.io/name: litellm
     {{- include "kube-agents.labels" . | nindent 4 }}
-  annotations:
-    # When static rendering is active (either platformAgent.enabled or operator.enabled is false),
-    # stamp keep so that transitioning to dynamic operator management later causes Helm to retain
-    # the existing policy rather than deleting it and leaving LiteLLM with unrestricted egress.
-    helm.sh/resource-policy: keep
+  {{- /*
+    No helm.sh/resource-policy: keep here. Helm reads that annotation off the
+    live object at prune time, so the documented `kubectl annotate` step before
+    a static-to-dynamic upgrade already carries the policy across. Stamped in
+    the template it would also make `helm uninstall` and
+    `litellm.networkPolicy: false` leave the policy behind, and a kept object
+    still carrying the old release's ownership metadata blocks a reinstall
+    under a different release name.
+  */}}
 spec:
   egress:
     - ports:
@@ -415,6 +412,11 @@ spec:
             cidr: 169.254.169.252/32
         - ipBlock:
             cidr: 169.254.169.254/32
+    {{- /*
+      Empty for an external endpoint with litellm.otel on: the exporter leaves over the
+      port-443 rule above, as it does under the operator's copy, and no rule is emitted.
+    */}}
+    {{- with include "kube-agents.otlpCollectorNamespace" . }}
     - ports:
         - port: 4317
           protocol: TCP
@@ -423,7 +425,8 @@ spec:
       to:
         - namespaceSelector:
             matchLabels:
-              kubernetes.io/metadata.name: {{ include "kube-agents.otlpCollectorNamespace" . }}
+              kubernetes.io/metadata.name: {{ . }}
+    {{- end }}
   ingress:
     - from:
         - podSelector: {}

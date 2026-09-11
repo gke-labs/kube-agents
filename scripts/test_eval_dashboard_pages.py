@@ -112,16 +112,28 @@ def strict_date_parse_page(page: pathlib.Path) -> pathlib.Path:
     return copy
 
 
-def dom_html(page: pathlib.Path, query: str = "", fragment: str = "") -> str:
+def dom_html(page: pathlib.Path, query: str = "", fragment: str = "", budget_ms: int = 3000) -> str:
     """The whole document after the script ran, via headless Chrome. From
     file:// every fetch fails, which is the condition a host that answers
-    an XHR with a login redirect puts the pages in."""
+    an XHR with a login redirect puts the pages in. ``budget_ms`` is the
+    virtual time the page is given; timers fire inside it, so a budget past
+    PAGE.refreshMs runs the poll too."""
     url = page.as_uri() + (f"?{query}" if query else "") + fragment
     result = subprocess.run(
-        [chrome(), "--headless", "--disable-gpu", "--no-sandbox", "--virtual-time-budget=3000", "--dump-dom", url],
+        [chrome(), "--headless", "--disable-gpu", "--no-sandbox", f"--virtual-time-budget={budget_ms}", "--dump-dom", url],
         capture_output=True, text=True, timeout=90, check=False,
     )
     return result.stdout
+
+
+def scroll_counting_page(page: pathlib.Path) -> pathlib.Path:
+    """A copy of the rendered page whose scrollIntoView records each call
+    on <body data-scrolls>, which --dump-dom serialises."""
+    shim = ("<script>Element.prototype.scrollIntoView = function () {"
+            " document.body.dataset.scrolls = String(Number(document.body.dataset.scrolls || 0) + 1); };</script>")
+    copy = page.with_name(page.stem + "-scrolls" + page.suffix)
+    copy.write_text(page.read_text().replace("<head>", "<head>" + shim, 1))
+    return copy
 
 
 def dom_text(page: pathlib.Path, query: str = "", fragment: str = "") -> str:
@@ -383,8 +395,8 @@ class RenderedFilesTest(unittest.TestCase):
                 page = (out / name).read_text()
                 self.assertEqual(page.count("<base "), 1, name)
                 self.assertIn('<base href="https://example.test/evals/">', page.split("<body", 1)[0], f"{name}: in <head>, with the trailing slash")
-                # Under <base>, a bare "#agent" resolves to the site root, not
-                # this page: every in-page link must carry its file name.
+                # Under <base>, a bare "#view=agent" resolves to the site root,
+                # not this page: every in-page link must carry its file name.
                 self.assertNotIn('href="#', page, f"{name}: no fragment-only link")
             # A trailing slash on the flag is not doubled.
             out = render_to(pathlib.Path(tmp) / "slash", data, extra_args=["--public-url", "https://example.test/evals/"])
@@ -410,9 +422,11 @@ class RenderedFilesTest(unittest.TestCase):
 
     def test_pages_js_carries_the_url_contract_and_the_vocabulary(self):
         script = PAGES_JS.read_text()
-        for token in ('params.get("cases")', 'params.get("since")', 'params.get("until")', 'params.get("build")', "#agent", "#gate",
-                      "shared_break", "storm", "setup_deaths", "only-this-pr", "run.html?build=", "legacy.html", "health.json", "brief.json"):
+        for token in ('param("cases")', 'param("since")', 'param("until")', 'param("build")', 'param("view")', "location.search", "location.hash",
+                      "shared_break", "storm", "setup_deaths", "only-this-pr", "run.html#build=", "index.html#", "legacy.html", "health.json", "brief.json"):
             self.assertIn(token, script)
+        self.assertNotIn("run.html?build=", script, "the pages write the fragment form only")
+        self.assertNotIn("index.html?", script)
         self.assertEqual(script.count("new Intl.DateTimeFormat"), 1, "one place a time becomes text")
         self.assertNotIn("toISOString().slice(11, 16)", script, "no UTC clock text on the new pages")
 
@@ -462,7 +476,7 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("Tracking <a", app)
         self.assertIn("issues/1278", app)
         self.assertIn("Runs in this window", app)
-        self.assertIn("run.html?build=2097282860221206528", app)
+        self.assertIn('href="run.html#build=2097282860221206528"', app)
         self.assertIn('class="chip hit">cluster-agent-crashloop-debug', app)
         self.assertNotIn("What changed right before", app, "no merges were given, so the block is omitted")
         self.assertIn("legacy.html", app)
@@ -513,7 +527,10 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("Last incident", app)
         self.assertIn("PAST OUTAGE", app)
         self.assertIn("Mon 10:00 AM – 9:00 PM ET", app)
-        self.assertIn("index.html?cases=cluster-agent-crashloop-debug", app)
+        # "Open the brief for it →" carries the whole scope in the fragment,
+        # the text post_health.dashboard_link writes for the same incident.
+        self.assertIn('href="index.html#since=2026-09-07T14:00:00Z&amp;until=2026-09-08T01:00:00Z&amp;cases=' + ",".join(CRASHLOOP_TRIO) + '&amp;view=gate"', app)
+        self.assertNotIn("index.html?", app)
 
     def test_healthy_brief_without_any_health_files(self):
         out = render_to(pathlib.Path(self.tmp.name) / "nohealth", self.data)
@@ -524,14 +541,49 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("Last 24 hours", app)
         self.assertIn("No incident history is published yet", app)
 
-    def test_past_incident_through_the_url(self):
+    def assert_past_outage_window(self, app, label):
+        self.assertIn("PAST OUTAGE · Mon 10:00 AM – 9:00 PM ET", app, label)
+        self.assertIn("3 gate cases failed on", app, label)
+        self.assertIn("This incident is over", app, label)
+        self.assertIn("run.html#build=2096999509014876160", app, f"{label}: #1195, red inside that window")
+        self.assertNotIn("run.html#build=2097282860221206528", app, f"{label}: #1275 ran the next morning")
+
+    def test_past_incident_through_the_fragment(self):
+        # The form every emitter writes: the scope in the fragment, which the
+        # published host's login redirect preserves where it drops a query.
+        fragment = "#since=2026-09-07T14:00:00Z&until=2026-09-08T01:00:00Z&cases=" + ",".join(CRASHLOOP_TRIO) + "&view=gate"
+        app = dom_text(self.index, fragment=fragment)
+        self.assert_past_outage_window(app, "fragment form")
+        self.assertIn('id="gate"', app, "the view lands on the why-we-think block")
+        # Without the scope the same page is the live outage: the fragment is
+        # what scoped it.
+        self.assertIn("OUTAGE · since Tue 5:00 AM ET", dom_text(self.index))
+
+    def test_past_incident_through_the_old_query_form(self):
+        # Links posted before the fragment form still open the same incident.
         query = urllib.parse.urlencode({"cases": ",".join(CRASHLOOP_TRIO), "since": "2026-09-07T14:00:00Z", "until": "2026-09-08T01:00:00Z"})
         app = dom_text(self.index, query=query, fragment="#gate")
+        self.assert_past_outage_window(app, "query form")
+        fragment = "#since=2026-09-07T14:00:00Z&until=2026-09-08T01:00:00Z&cases=" + ",".join(CRASHLOOP_TRIO) + "&view=gate"
+        self.assertEqual(app, dom_text(self.index, fragment=fragment), "both forms render the same page")
+
+    def test_the_query_wins_when_both_forms_are_present(self):
+        query = urllib.parse.urlencode({"cases": "cluster-agent-crashloop-debug", "since": "2026-09-07T14:00:00Z", "until": "2026-09-08T01:00:00Z"})
+        app = dom_text(self.index, query=query, fragment="#since=2026-09-08T09:00:00Z&view=gate")
         self.assertIn("PAST OUTAGE · Mon 10:00 AM – 9:00 PM ET", app)
-        self.assertIn("3 gate cases failed on", app)
-        self.assertIn("This incident is over", app)
-        self.assertIn("run.html?build=2096999509014876160", app, "#1195, red inside that window")
-        self.assertNotIn("run.html?build=2097282860221206528", app, "#1275 ran the next morning")
+        self.assertIn("1 gate case failed on", app)
+        app = dom_text(self.run_page, query="build=2097282860221206528", fragment="#build=1")
+        self.assertIn("PR #1275", app)
+        self.assertNotIn("No run with that id", app)
+
+    def test_pr_view_through_the_fragment(self):
+        app = dom_text(self.run_page, fragment="#build=2097282860221206528")
+        self.assertIn("PR #1275", app)
+        self.assertIn("3 of 10 gate cases failed. None of them look like your PR.", app)
+        self.assertIn("Gate outage at the time of this run", app)
+        self.assertEqual(app, dom_text(self.run_page, query="build=2097282860221206528"), "the old query form renders the same run")
+        app = dom_text(self.run_page, fragment="#build=1")
+        self.assertIn(f"No run with that id in the last {render.RUN_VIEW_DAYS} days.", app)
 
     def test_past_incident_without_history_is_described_by_the_parameters(self):
         out = render_to(pathlib.Path(self.tmp.name) / "nohist", self.data, health=health_doc("GREEN"))
@@ -540,19 +592,33 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("PAST INCIDENT", app)
         self.assertIn("1 gate case failed on", app)
 
-    def test_agent_fragment_shows_the_numbers(self):
-        app = dom_text(self.index, fragment="#agent")
+    def test_agent_view_shows_the_numbers(self):
+        app = dom_text(self.index, fragment="#view=agent")
         self.assertIn("The last 24 hours in numbers", app)
         self.assertIn('id="agent"', app)
+        self.assertEqual(app, dom_text(self.index, fragment="#agent"), "the old bare anchor selects the same view")
+        self.assertIn('href="index.html#view=agent"', app, "the footer link is the fragment form")
+
+    def test_a_view_scrolls_once_on_navigation_and_not_on_the_poll(self):
+        # 130 s of virtual time: boot, the refresh after it, and two polls.
+        # The section is scrolled to once; the polls, which re-render the
+        # page, must not pull a reader back to it.
+        page = scroll_counting_page(self.index)
+        scrolls = lambda html: re.search(r'<body[^>]*data-scrolls="(\d+)"', html)
+        self.assertEqual(scrolls(dom_html(page, fragment="#since=2026-09-07T14:00:00Z&view=gate", budget_ms=130000)).group(1), "1")
+        self.assertEqual(scrolls(dom_html(page, fragment="#gate", budget_ms=130000)).group(1), "1", "the bare anchor, the same way")
+        self.assertIsNone(scrolls(dom_html(page, budget_ms=130000)), "no view, no scroll")
 
     def test_hostile_parameters_never_reach_the_dom(self):
-        app = dom_text(self.index, query="cases=%3Cimg%20src%3Dx%3E&since=%3Cscript%3E")
-        self.assertNotIn("<img", app)
-        self.assertNotIn("<script", app)
-        self.assertIn("OUTAGE", app, "the bad parameters were dropped and the page still rendered")
-        app = dom_text(self.run_page, query="build=%3Cb%3E1%3C%2Fb%3E")
-        self.assertNotIn("<b>1", app)
-        self.assertIn("Which run?", app)
+        for form in ({"query": "cases=%3Cimg%20src%3Dx%3E&since=%3Cscript%3E"}, {"fragment": "#cases=%3Cimg%20src%3Dx%3E&since=%3Cscript%3E&view=%3Cb%3E"}):
+            app = dom_text(self.index, **form)
+            self.assertNotIn("<img", app, form)
+            self.assertNotIn("<script", app, form)
+            self.assertIn("OUTAGE · since Tue 5:00 AM ET", app, f"{form}: the bad parameters were dropped and the live page still rendered")
+        for form in ({"query": "build=%3Cb%3E1%3C%2Fb%3E"}, {"fragment": "#build=%3Cb%3E1%3C%2Fb%3E"}):
+            app = dom_text(self.run_page, **form)
+            self.assertNotIn("<b>1", app, form)
+            self.assertIn("Which run?", app, form)
 
     def test_a_space_separated_since_is_read_as_utc(self):
         query = urllib.parse.urlencode({"cases": "cluster-agent-crashloop-debug", "since": "2026-09-07 14:00:00", "until": "2026-09-08 01:00:00"})
@@ -572,18 +638,21 @@ class BrowserTest(unittest.TestCase):
         self.assertEqual(strict, expected, "in an engine that rejects ±HHMM, so parseIso must normalise it")
 
     def test_the_current_outage_opened_through_its_own_link_is_still_live(self):
-        query = urllib.parse.urlencode({"cases": ",".join(CRASHLOOP_TRIO), "since": "2026-09-08T09:00:00Z"})
-        for label, page in (("with history", self.index), ("without history", render_to(pathlib.Path(self.tmp.name) / "nohist-live", self.data, health=health_doc()) / "index.html")):
-            app = dom_text(page, query=query, fragment="#gate")
-            self.assertIn("OUTAGE · since Tue 5:00 AM ET", app, label)
-            self.assertNotIn("PAST", app, label)
-            self.assertNotIn("This incident is over", app, label)
-            self.assertIn("What's being done", app, label)
-            self.assertIn("issues/1278", app, label)
-        # The PR view's own banner link, followed, lands on the live brief.
-        run_app = dom_text(render_to(pathlib.Path(self.tmp.name) / "nohist-live", self.data, health=health_doc()) / "run.html", query="build=2097282860221206528")
-        self.assertIn("index.html?cases=cluster-agent-crashloop-debug", run_app)
-        self.assertIn("since=2026-09-08T09%3A00%3A00Z", run_app)
+        scope = "since=2026-09-08T09:00:00Z&cases=" + ",".join(CRASHLOOP_TRIO)
+        forms = (("fragment form", {"fragment": f"#{scope}&view=gate"}), ("old query form", {"query": scope, "fragment": "#gate"}))
+        nohist = render_to(pathlib.Path(self.tmp.name) / "nohist-live", self.data, health=health_doc())
+        for label, page in (("with history", self.index), ("without history", nohist / "index.html")):
+            for form, args in forms:
+                app = dom_text(page, **args)
+                self.assertIn("OUTAGE · since Tue 5:00 AM ET", app, f"{label}, {form}")
+                self.assertNotIn("PAST", app, f"{label}, {form}")
+                self.assertNotIn("This incident is over", app, f"{label}, {form}")
+                self.assertIn("What's being done", app, f"{label}, {form}")
+                self.assertIn("issues/1278", app, f"{label}, {form}")
+        # The PR view's own banner link is that fragment, so following it
+        # lands on the live brief.
+        run_app = dom_text(nohist / "run.html", fragment="#build=2097282860221206528")
+        self.assertIn(f'href="index.html#{scope}&view=gate"'.replace("&", "&amp;"), run_app)
 
     def test_an_incident_without_a_start_or_a_red_run_dates_nothing_from_1969(self):
         # normalizeHealth keeps a non-GREEN state whose `since` will not
@@ -615,21 +684,22 @@ class BrowserTest(unittest.TestCase):
         sixty = [f"case-{i:02d}" for i in range(59)]
         sixty.insert(3, "bad case!")
         out = render_to(pathlib.Path(self.tmp.name) / "sixty", self.data, health=health_doc(failing_cases=sixty))
-        app = dom_text(out / "run.html", query="build=2097282860221206528")
-        hrefs = re.findall(r'href="(index\.html\?cases=[^"]*)"', app)
+        app = dom_text(out / "run.html", fragment="#build=2097282860221206528")
+        hrefs = re.findall(r'href="(index\.html#since=[^"]*)"', app)
         self.assertEqual(len(hrefs), 1, app[:300])
-        query = urllib.parse.urlparse(html.unescape(hrefs[0])).query
-        cases = urllib.parse.parse_qs(query)["cases"][0].split(",")
+        fragment = urllib.parse.urlparse(html.unescape(hrefs[0])).fragment
+        cases = urllib.parse.parse_qs(fragment)["cases"][0].split(",")
         self.assertEqual(cases, [f"case-{i:02d}" for i in range(50)])
-        self.assertNotIn("bad case!", query)
+        self.assertNotIn("bad case!", fragment)
         # And the parser reads that link back whole: 50 ids, not 49.
-        self.assertIn("50 gate cases fail", dom_text(out / "index.html", query=query))
+        self.assertIn("50 gate cases fail", dom_text(out / "index.html", fragment=f"#{fragment}"))
         # A hand-written link with more entries than the cap and an
         # off-grammar one inside the first 50 still yields 50 in-grammar ids:
         # the parser filters before it caps, as the writer does. (`since`
         # names the live incident; without it the link's cases are not read.)
         hand_written = urllib.parse.urlencode({"cases": ",".join(sixty[:51]), "since": OUTAGE_SINCE})
         self.assertIn("50 gate cases fail", dom_text(out / "index.html", query=hand_written))
+        self.assertIn("50 gate cases fail", dom_text(out / "index.html", fragment=f"#{hand_written}"))
 
     def test_pr_view_outage_run(self):
         app = dom_text(self.run_page, query="build=2097282860221206528")
