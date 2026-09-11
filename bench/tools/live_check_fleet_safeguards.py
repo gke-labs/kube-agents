@@ -54,6 +54,7 @@ DEFAULT_CASES = [
     "cluster-agent-crashloop-evidence-chain",
     "cluster-agent-healthy-workload-no-finding",
     "cluster-agent-pending-replicas-capped-pool",
+    "cluster-agent-stalled-controller-healthy-silence",
 ]
 TIMEOUT_SEC = 60.0
 

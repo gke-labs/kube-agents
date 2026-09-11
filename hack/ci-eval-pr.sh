@@ -1273,6 +1273,12 @@ TASKS=(
   "./tasks/cluster-agent-crashloop-misleading-symptom/task.yaml"
   "./tasks/cluster-agent-crashloop-evidence-chain/task.yaml"
   "./tasks/cluster-agent-healthy-workload-no-finding/task.yaml"
+  # The silence case for the gke-stall-detection skill (#1342), in the
+  # no-finding shape above and on the same fixture: a secondhand report of
+  # a reconciliation stall that is not there, graded on the contracted
+  # "stalled resources: 0" line. `deployer: noop`, read-only, unadmitted --
+  # its first scored runs are the measurement. Adds one noop case per run.
+  "./tasks/cluster-agent-stalled-controller-healthy-silence/task.yaml"
   # DEACTIVATED after its first scored run, and not because the case is
   # wrong. On 2026-08-26 the agent read the cluster, changed nothing (all
   # three safeguards green) and misdiagnosed: it blamed a missing label on
