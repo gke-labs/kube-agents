@@ -1952,7 +1952,7 @@ def content_workspace_enabled() -> bool:
 
 
 class CommandExecutor:
-    ALLOWED_EXECUTABLES = ("gcloud", "kubectl", "gh", "git")
+    ALLOWED_EXECUTABLES = ("gcloud", "kubectl", "oc", "gh", "git")
 
     def __init__(
         self,
@@ -2258,7 +2258,7 @@ class CommandExecutor:
         # requests still resolve a named kubeconfig the way they did before
         # the pool existed -- regenerated on the ambient identity, never
         # selected on.
-        scoped = executable == "kubectl"
+        scoped = executable in ("kubectl", "oc")
         command, flag_kubeconfig = self._reroute_kubeconfig_flags(command, scoped=scoped)
         if flag_kubeconfig is not None:
             # The flag beats the environment, because that is the precedence
@@ -2279,7 +2279,7 @@ class CommandExecutor:
             )
         elif kubeconfig_context:
             kubeconfig_path = self._resolve_kubeconfig(kubeconfig_context, scoped=scoped)
-        elif self.scoped_pool is not None and executable == "kubectl":
+        elif self.scoped_pool is not None and executable in ("kubectl", "oc"):
             # `KUBECONFIG` is in the base environment, so this branch is not
             # "no cluster" — it is "the sidecar's default cluster", and it has to
             # go through selection like any other.

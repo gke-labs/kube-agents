@@ -104,7 +104,7 @@ Pod-wide `automountServiceAccountToken` is `false` everywhere. The broker's proj
 
 ## Request paths
 
-- **CLI commands** — only `gcloud`, `kubectl`, `gh`, and `git` are accepted. The proxy rejects known credential-disclosure, credential-replacement, and self-modification operations, and the GitHub write path (see below); interactive TTY programs, unbounded streaming, sandbox-only file paths, and background processes fail closed.
+- **CLI commands** — only `gcloud`, `kubectl`, `oc`, `gh`, and `git` are accepted. The proxy rejects known credential-disclosure, credential-replacement, and self-modification operations, and the GitHub write path (see below); interactive TTY programs, unbounded streaming, sandbox-only file paths, and background processes fail closed.
 - **Chat** — Slack and Google Chat adapters send credential-free payloads to Envoy; the credential runtime owns the platform tokens and performs the external API calls, enforcing user allowlists and payload limits.
 - **PlatformAgent API** — the Service targets port 8643 on `agent-api-auth` in the gateway Pod, which validates the external bearer key and forwards to the agent API on loopback (port 8642) with a non-secret sentinel. The real key never reaches `platform-agent`.
 - **GitHub** — the broker obtains a Google OIDC identity token and calls [Minty](/kube-agents/deploy/token-minter/), which brokers a repository-scoped GitHub App installation token with a maximum one-hour lifetime. The App's private key stays in Cloud KMS.

@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-SUPPORTED_EXECUTABLES = ("kubectl", "gcloud", "gh", "git")
+SUPPORTED_EXECUTABLES = ("kubectl", "oc", "gcloud", "gh", "git")
 
 # How long to wait to reach the broker. Bounds the connect only — see
 # BrokerConnection.
@@ -122,7 +122,7 @@ def authorization_headers() -> dict[str, str]:
 # resolving it for them buys nothing and costs plenty — an unreadable kubeconfig
 # is a hard failure, which would turn a stray KUBECONFIG into a refused `gh pr
 # create`.
-KUBECONFIG_AWARE = frozenset({"kubectl", "gcloud"})
+KUBECONFIG_AWARE = frozenset({"kubectl", "gcloud", "oc"})
 
 # Flags whose value may be `-`, meaning "read the document from stdin". This is
 # the whole list the shipped skills use: kubectl's `-f`/`--filename` and

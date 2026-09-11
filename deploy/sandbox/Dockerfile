@@ -355,10 +355,10 @@ RUN find /opt/defaults -name '__pycache__' -type d -prune -exec rm -rf {} + && \
 # the build PATH — profile.d puts it there at login — so `command -v` here can
 # only be finding a native binary.
 RUN mkdir -p /opt/credential-proxy/bin && \
-    for binary in gcloud kubectl gh git; do \
+    for binary in gcloud kubectl oc gh git; do \
         ln -s /usr/local/bin/credential-proxy-exec "/opt/credential-proxy/bin/${binary}"; \
     done && \
-    for binary in gcloud kubectl gh git; do \
+    for binary in gcloud kubectl oc gh git; do \
         if command -v "${binary}" >/dev/null 2>&1; then \
             echo "unexpected credential-aware CLI in the sandbox image: ${binary}" >&2; \
             exit 1; \
