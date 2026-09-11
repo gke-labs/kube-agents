@@ -687,13 +687,15 @@ check_github_org_is_organization() {
 # from the original install. lifecycle.sh's ensure_backend and state_prefix
 # derive the same two answers from the same install.defaults.env values.
 tf_state_bucket() {
+  local project="${1:-${PROJECT_ID:-}}"
   local bucket="${KUBE_AGENTS_STATE_BUCKET:-$DEFAULT_KUBE_AGENTS_STATE_BUCKET}"
-  [ "$bucket" = "$DEFAULT_KUBE_AGENTS_STATE_BUCKET" ] && bucket="${PROJECT_ID}${DEFAULT_TF_STATE_BUCKET_SUFFIX}"
+  [ "$bucket" = "$DEFAULT_KUBE_AGENTS_STATE_BUCKET" ] && bucket="${project}${DEFAULT_TF_STATE_BUCKET_SUFFIX}"
   echo "$bucket"
 }
 
 tf_state_prefix() {
-  echo "${KUBE_AGENTS_STATE_PREFIX:-${DEFAULT_TF_STATE_PREFIX_ROOT}/${CLUSTER_NAME}}"
+  local cluster="${1:-${CLUSTER_NAME:-}}"
+  echo "${KUBE_AGENTS_STATE_PREFIX:-${DEFAULT_TF_STATE_PREFIX_ROOT}/${cluster}}"
 }
 
 # The basename of the first ENABLED version of a Cloud KMS key, or nothing.
@@ -752,8 +754,13 @@ tf_state_read() {
   # probe whose miss is expected, while the caller's `|| return` carries on
   # regardless. Dropping the trap affects this subshell only.
   trap - ERR
+  local project="${1:-${PROJECT_ID:-}}"
+  local cluster="${2:-${CLUSTER_NAME:-}}"
+  if [ -z "$project" ] || [ -z "$cluster" ]; then
+    return 1
+  fi
   local object state err_file err
-  object="gs://$(tf_state_bucket)/$(tf_state_prefix)/${TF_STATE_OBJECT}"
+  object="gs://$(tf_state_bucket "$project")/$(tf_state_prefix "$cluster")/${TF_STATE_OBJECT}"
   err_file="$(mktemp)"
   if ! state="$(gcloud storage cat "$object" 2>"$err_file")"; then
     err="$(cat "$err_file" 2>/dev/null)"
@@ -877,7 +884,7 @@ for r in doc.get("resources", []):
 tf_state_chat_subscription_name() {
   trap - ERR
   local state
-  state=$(tf_state_read) || return $?
+  state=$(tf_state_read "$@") || return $?
   printf '%s' "$state" | python3 -c '
 import json, sys
 try:
@@ -1753,14 +1760,18 @@ write_tfvars_from_state() {
     echo ""
     local chat_topic="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
     local chat_sub="${CHAT_SUB_NAME:-}"
-    if [ -z "$chat_sub" ]; then
-      local state_sub
-      state_sub="$(tf_state_chat_subscription_name 2>/dev/null)" || true
-      if [ -n "$state_sub" ]; then
-        chat_sub="$state_sub"
-      else
-        chat_sub="$(derive_chat_sub_name "$chat_topic")"
-      fi
+    local state_sub="" state_rc=0
+    state_sub="$(tf_state_chat_subscription_name)" || state_rc=$?
+    if [ "$state_rc" -eq "$TF_STATE_RC_UNREADABLE" ]; then
+      print_warning "Could not determine if Google Chat Pub/Sub subscription is in Terraform state (see above); proceeding with configuration."
+    fi
+
+    if [ -n "$state_sub" ]; then
+      chat_sub="$state_sub"
+    elif [ -n "$chat_sub" ] && [ "$chat_sub" != "$DEFAULT_CHAT_SUB_NAME" ]; then
+      chat_sub="$chat_sub"
+    else
+      chat_sub="$(derive_chat_sub_name "$chat_topic")"
     fi
     echo "enable_google_chat        = $(hcl_bool "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}")"
     echo "chat_topic_name           = $(hcl_str "$chat_topic")"

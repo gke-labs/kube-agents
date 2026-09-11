@@ -35,7 +35,8 @@ class LifecycleScriptGuardTest(unittest.TestCase):
                    gcloud_kms_error="ERROR: permission denied",
                    gcloud_kms_notice="",
                    tfvar_enable_google_chat="true",
-                   tfvar_chat_sub_name='"platform-agent-chat-events-sub"'):
+                   tfvar_chat_sub_name='"platform-agent-chat-events-sub"',
+                   tfvar_chat_topic_name='"platform-agent-chat-events"'):
         """Run a lifecycle.sh function against stubbed terraform and gcloud commands."""
         with tempfile.TemporaryDirectory() as tmp:
             bin_dir = pathlib.Path(tmp) / "bin"
@@ -113,6 +114,9 @@ elif [[ "$cmd" == "console" ]]; then
         exit 0
     elif [[ "$expr" == *"chat_subscription_name"* ]]; then
         echo '{tfvar_chat_sub_name}'
+        exit 0
+    elif [[ "$expr" == *"chat_topic_name"* ]]; then
+        echo '{tfvar_chat_topic_name}'
         exit 0
     fi
     echo 'null'
@@ -476,6 +480,18 @@ resource "google_service_account" "agent" {
         self.assertEqual(proc.returncode, 1)
         self.assertIn("chat_subscription_name resolved to 'custom-chat-events-sub', but this state manages Pub/Sub subscription 'platform-agent-chat-events-sub'", proc.stderr)
         self.assertIn('CHAT_SUB_NAME="platform-agent-chat-events-sub"', proc.stderr)
+
+    def test_guard_pubsub_subscription_refuses_when_topic_differs_from_state(self):
+        proc = self._run_guard(
+            "guard_pubsub_subscription",
+            state_list="module.chat_pubsub[0].google_pubsub_subscription.chat_events",
+            state_show='resource "google_pubsub_subscription" "chat_events" {\n    name = "platform-agent-chat-events-sub"\n    topic = "projects/test-proj/topics/platform-agent-chat-events"\n}',
+            tfvar_chat_sub_name='"platform-agent-chat-events-sub"',
+            tfvar_chat_topic_name='"renamed-chat-topic"',
+        )
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("chat_topic_name resolved to 'renamed-chat-topic', but this state's Pub/Sub subscription is attached to topic 'platform-agent-chat-events'", proc.stderr)
+        self.assertIn('CHAT_TOPIC_NAME="platform-agent-chat-events"', proc.stderr)
 
     def test_guard_minter_key_no_op_when_minter_disabled(self):
         """When enable_github_minter is false, guard_minter_key passes cleanly."""

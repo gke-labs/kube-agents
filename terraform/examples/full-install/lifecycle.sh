@@ -613,11 +613,12 @@ guard_gsa_identity() {
   fi
 }
 
-# `name` is ForceNew on google_pubsub_subscription, and the resource carries
-# neither create_before_destroy nor prevent_destroy. If a custom or default
-# subscription is managed in state and chat_subscription_name in terraform.tfvars
-# resolves to a different name, the next apply destroys the live subscription
-# and recreates it under -auto-approve, dropping unacknowledged Google Chat events.
+# `name` and `topic` are ForceNew on google_pubsub_subscription, and `name` is
+# ForceNew on google_pubsub_topic. The subscription resource carries neither
+# create_before_destroy nor prevent_destroy. If a custom or default subscription
+# is managed in state and chat_subscription_name or chat_topic_name in terraform.tfvars
+# resolves to a different name/topic, the next apply destroys the live subscription
+# (and its topic) and recreates it under -auto-approve, dropping unacknowledged Google Chat events.
 # Same shape as guard_gsa_identity.
 guard_pubsub_subscription() {
   [[ "$(tfvar enable_google_chat)" == "true" ]] || return 0
@@ -625,23 +626,41 @@ guard_pubsub_subscription() {
   local addr="$CHAT_SUBSCRIPTION_ADDRESS"
   in_state "$addr" || return 0
 
-  local recorded
-  recorded=$(state_attr "$addr" name)
-  [[ -n "$recorded" ]] || return 0
+  local recorded_name
+  recorded_name=$(state_attr "$addr" name)
+  local recorded_topic
+  recorded_topic=$(state_attr "$addr" topic)
 
-  local desired
-  if ! desired=$(tfvar chat_subscription_name 2>/dev/null); then
-    desired=""
+  local desired_name
+  if ! desired_name=$(tfvar chat_subscription_name 2>/dev/null); then
+    desired_name=""
   fi
-  [[ -n "$desired" ]] || desired="$DEFAULT_CHAT_SUB_NAME"
+  [[ -n "$desired_name" ]] || desired_name="$DEFAULT_CHAT_SUB_NAME"
 
-  if [[ "$recorded" != "$desired" ]]; then
-    warn "chat_subscription_name resolved to '$desired', but this state manages Pub/Sub subscription '$recorded' ($addr)."
+  if [[ -n "$recorded_name" && "$recorded_name" != "$desired_name" ]]; then
+    warn "chat_subscription_name resolved to '$desired_name', but this state manages Pub/Sub subscription '$recorded_name' ($addr)."
     warn "Applying now would plan the subscription's DESTRUCTION and recreation under -auto-approve,"
     warn "dropping unacknowledged Google Chat events."
     warn "If this install uses an existing subscription name, record it in install.env, which the front doors regenerate terraform.tfvars from:"
-    warn "  CHAT_SUB_NAME=\"$recorded\""
+    warn "  CHAT_SUB_NAME=\"$recorded_name\""
     warn "A hand-driven apply sets chat_subscription_name in terraform.tfvars instead."
+    exit 1
+  fi
+
+  local desired_topic
+  if ! desired_topic=$(tfvar chat_topic_name 2>/dev/null); then
+    desired_topic=""
+  fi
+  [[ -n "$desired_topic" ]] || desired_topic="$DEFAULT_CHAT_TOPIC_NAME"
+
+  local stripped_topic="${recorded_topic##*/}"
+  if [[ -n "$stripped_topic" && "$stripped_topic" != "$desired_topic" ]]; then
+    warn "chat_topic_name resolved to '$desired_topic', but this state's Pub/Sub subscription is attached to topic '$stripped_topic' ($addr)."
+    warn "Applying now would plan the topic and subscription's DESTRUCTION and recreation under -auto-approve,"
+    warn "dropping unacknowledged Google Chat events."
+    warn "If this install uses an existing topic name, record it in install.env, which the front doors regenerate terraform.tfvars from:"
+    warn "  CHAT_TOPIC_NAME=\"$stripped_topic\""
+    warn "A hand-driven apply sets chat_topic_name in terraform.tfvars instead."
     exit 1
   fi
 }

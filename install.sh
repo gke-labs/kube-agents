@@ -414,6 +414,7 @@ PARAM_THIRD_PARTY_REGISTRY_PREFIX="${THIRD_PARTY_REGISTRY_PREFIX:-}"
 PARAM_ENABLE_GOOGLE_CHAT="${GOOGLE_CHAT_ENABLED:-}"
 PARAM_CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-}"
 PARAM_CHAT_SUB_NAME="${CHAT_SUB_NAME:-}"
+CLI_CHAT_SUB_NAME=""
 PARAM_GOOGLE_CHAT_MODE="${GOOGLE_CHAT_MODE:-}"
 PARAM_GOOGLE_CHAT_HOME_CHANNEL="${GOOGLE_CHAT_HOME_CHANNEL:-}"
 PARAM_MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-}"
@@ -578,7 +579,7 @@ parse_args() {
       --enable-google-chat|--google-chat) PARAM_ENABLE_GOOGLE_CHAT="true"; shift ;;
       --allowed-users=*) PARAM_ALLOWED_USERS="${1#*=}"; shift ;;
       --chat-topic-name=*) PARAM_CHAT_TOPIC_NAME="${1#*=}"; shift ;;
-      --chat-sub-name=*) PARAM_CHAT_SUB_NAME="${1#*=}"; shift ;;
+      --chat-sub-name=*) PARAM_CHAT_SUB_NAME="${1#*=}"; CLI_CHAT_SUB_NAME="${1#*=}"; shift ;;
       --google-chat-mode=*) PARAM_GOOGLE_CHAT_MODE="${1#*=}"; shift ;;
       --google-chat-home-channel=*) PARAM_GOOGLE_CHAT_HOME_CHANNEL="${1#*=}"; shift ;;
       --migrate-node-pools=*)
@@ -2597,14 +2598,17 @@ run_menu_system() {
   local allowed_users="${ALLOWED_USERS:-}"
   local chat_topic_name="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
   local chat_sub_name="${CHAT_SUB_NAME:-}"
-  if [ -z "$chat_sub_name" ]; then
-    local state_sub
-    state_sub="$(tf_state_chat_subscription_name 2>/dev/null)" || true
-    if [ -n "$state_sub" ]; then
-      chat_sub_name="$state_sub"
-    else
-      chat_sub_name="$(derive_chat_sub_name "$chat_topic_name")"
-    fi
+  local state_sub="" state_rc=0
+  state_sub="$(tf_state_chat_subscription_name "$project_id" "$cluster_name")" || state_rc=$?
+  if [ "$state_rc" -eq "$TF_STATE_RC_UNREADABLE" ]; then
+    print_warning "Could not determine if Google Chat Pub/Sub subscription is in Terraform state (see above); proceeding with configuration."
+  fi
+  if [ -n "$state_sub" ]; then
+    chat_sub_name="$state_sub"
+  elif [ -n "$chat_sub_name" ] && [ "$chat_sub_name" != "$DEFAULT_CHAT_SUB_NAME" ]; then
+    chat_sub_name="$chat_sub_name"
+  else
+    chat_sub_name="$(derive_chat_sub_name "$chat_topic_name")"
   fi
   local permission_set="${PLATFORM_AGENT_PERMISSION_SET:-$DEFAULT_PERMISSION_SET}"
   local custom_roles="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
@@ -3152,15 +3156,6 @@ main() {
   fi
   local chat_topic_name="$PARAM_CHAT_TOPIC_NAME"
   local chat_sub_name="${PARAM_CHAT_SUB_NAME:-}"
-  if [ -z "$chat_sub_name" ]; then
-    local state_sub
-    state_sub="$(tf_state_chat_subscription_name 2>/dev/null)" || true
-    if [ -n "$state_sub" ]; then
-      chat_sub_name="$state_sub"
-    else
-      chat_sub_name="$(derive_chat_sub_name "$chat_topic_name")"
-    fi
-  fi
   local google_chat_mode="$PARAM_GOOGLE_CHAT_MODE"
   if [[ ! "$google_chat_mode" =~ ^(default|debug)$ ]]; then
     print_error "--google-chat-mode must be either 'default' or 'debug'."
@@ -3216,15 +3211,24 @@ main() {
     prompt_read "Allowed User Email(s) for Google Chat (comma-separated, empty allows all users)" \
       allowed_users "$allowed_users" false "$allowed_users_hint"
     prompt_read "Pub/Sub Topic Name for Google Chat" chat_topic_name "$chat_topic_name"
-    if [ -z "${PARAM_CHAT_SUB_NAME:-}" ]; then
-      local state_sub
-      state_sub="$(tf_state_chat_subscription_name 2>/dev/null)" || true
-      if [ -n "$state_sub" ]; then
-        chat_sub_name="$state_sub"
-      else
-        chat_sub_name="$(derive_chat_sub_name "$chat_topic_name")"
-      fi
+
+    local state_sub="" state_rc=0
+    state_sub="$(tf_state_chat_subscription_name "$project_id" "$cluster_name")" || state_rc=$?
+    if [ "$state_rc" -eq "$TF_STATE_RC_UNREADABLE" ]; then
+      print_warning "Could not determine if Google Chat Pub/Sub subscription is in Terraform state (see above); proceeding with configuration."
     fi
+
+    local default_sub
+    if [ -n "$state_sub" ]; then
+      default_sub="$state_sub"
+    elif [ -n "${CLI_CHAT_SUB_NAME:-}" ]; then
+      default_sub="$CLI_CHAT_SUB_NAME"
+    elif [ -n "${PARAM_CHAT_SUB_NAME:-}" ] && [ "$PARAM_CHAT_SUB_NAME" != "$DEFAULT_CHAT_SUB_NAME" ]; then
+      default_sub="$PARAM_CHAT_SUB_NAME"
+    else
+      default_sub="$(derive_chat_sub_name "$chat_topic_name")"
+    fi
+    chat_sub_name="$default_sub"
     prompt_read "Pub/Sub Subscription Name for Google Chat" chat_sub_name "$chat_sub_name"
     prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
       google_chat_home_channel "$google_chat_home_channel"

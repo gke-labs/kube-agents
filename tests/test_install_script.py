@@ -3368,7 +3368,7 @@ prompt_read() {{
     eval "$var=\\"$default_val\\""
   fi
 }}
-allowed_users="" allowed_users_hint="" chat_topic_name="platform-agent-chat-events" chat_sub_name="pinned-sub" PARAM_CHAT_SUB_NAME="pinned-sub" google_chat_home_channel=""
+allowed_users="" allowed_users_hint="" chat_topic_name="platform-agent-chat-events" chat_sub_name="pinned-sub" PARAM_CHAT_SUB_NAME="pinned-sub" google_chat_home_channel="" project_id="p" cluster_name="c"
 _prompt_google_chat_settings() {{
 {body}
 _prompt_google_chat_settings
@@ -3376,6 +3376,49 @@ echo "DERIVED_SUB=$chat_sub_name"
 """)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("DERIVED_SUB=pinned-sub", proc.stdout)
+
+    def test_prompt_google_chat_settings_rederives_when_param_is_recorded_default(self):
+        body = pathlib.Path(_INSTALL_SH).read_text().split("_prompt_google_chat_settings() {")[1].split('case "$chat_choice" in')[0].strip()
+        proc = self._run_install_func(f"""
+prompt_read() {{
+  local prompt="$1" var="$2" default_val="${{3:-}}"
+  if [ "$var" = "chat_topic_name" ]; then
+    eval "$var=\\"operator-custom-topic\\""
+  else
+    eval "$var=\\"$default_val\\""
+  fi
+}}
+allowed_users="" allowed_users_hint="" chat_topic_name="platform-agent-chat-events" chat_sub_name="platform-agent-chat-events-sub" PARAM_CHAT_SUB_NAME="platform-agent-chat-events-sub" google_chat_home_channel="" project_id="p" cluster_name="c"
+_prompt_google_chat_settings() {{
+{body}
+_prompt_google_chat_settings
+echo "DERIVED_SUB=$chat_sub_name"
+""")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("DERIVED_SUB=operator-custom-topic-sub", proc.stdout)
+
+    def test_prompt_google_chat_settings_recovers_state_subscription(self):
+        body = pathlib.Path(_INSTALL_SH).read_text().split("_prompt_google_chat_settings() {")[1].split('case "$chat_choice" in')[0].strip()
+        proc = self._run_install_func(f"""
+prompt_read() {{
+  local prompt="$1" var="$2" default_val="${{3:-}}"
+  if [ "$var" = "chat_topic_name" ]; then
+    eval "$var=\\"operator-custom-topic\\""
+  else
+    eval "$var=\\"$default_val\\""
+  fi
+}}
+tf_state_chat_subscription_name() {{
+  echo "legacy-managed-sub"
+}}
+allowed_users="" allowed_users_hint="" chat_topic_name="platform-agent-chat-events" chat_sub_name="" PARAM_CHAT_SUB_NAME="" google_chat_home_channel="" project_id="p" cluster_name="c"
+_prompt_google_chat_settings() {{
+{body}
+_prompt_google_chat_settings
+echo "DERIVED_SUB=$chat_sub_name"
+""")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("DERIVED_SUB=legacy-managed-sub", proc.stdout)
 
 
 @unittest.skipUnless(hasattr(pty, "fork"), "run_with_spinner's terminal branch needs a pty")

@@ -1013,6 +1013,35 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn('chat_topic_name           = "platform-agent-chat-events"', content)
             self.assertIn('chat_subscription_name    = "platform-agent-chat-events-sub"', content)
 
+            # 6. Custom topic with recorded default subscription re-derives when state has no subscription (#1397)
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={
+                    "API_SERVER_KEY": "k",
+                    "GOOGLE_CHAT_ENABLED": "true",
+                    "CHAT_TOPIC_NAME": "custom-chat-events",
+                    "CHAT_SUB_NAME": "platform-agent-chat-events-sub",
+                },
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn('chat_topic_name           = "custom-chat-events"', content)
+            self.assertIn('chat_subscription_name    = "custom-chat-events-sub"', content)
+
+            # 7. Unreadable state emits a warning and proceeds
+            proc = self._run(
+                f'print_warning() {{ echo "WARN: $*" >&2; }}; write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                gcloud_stderr="ERROR: 403 Forbidden",
+                gcloud_exit=1,
+                env={
+                    "API_SERVER_KEY": "k",
+                    "GOOGLE_CHAT_ENABLED": "true",
+                    "CHAT_TOPIC_NAME": "custom-chat-events",
+                },
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("Could not determine if Google Chat Pub/Sub subscription is in Terraform state", proc.stderr)
+
     def test_tf_state_chat_subscription_name_returns_name(self):
         state = _state_doc([{
             "module": "module.chat_pubsub[0]",
