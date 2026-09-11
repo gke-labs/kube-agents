@@ -638,16 +638,18 @@ class LostPods(RunHarness):
         recorded = self.recorded()
         self.assertEqual(recorded["issue"], {"number": 1301, "url": "https://github.com/gke-labs/kube-agents/issues/1301", "condition": "lost_pods"})
         self.assertEqual([issue["number"] for issue in recorded["issues"]], [1300, 1301], "the outage's issue still rides along")
-        # And back up to an OUTAGE: #1301 is the cluster owner's, so a new
-        # outage issue is filed rather than #1301 cited.
+        # And back up to an OUTAGE: #1301 is the cluster owner's and is not
+        # cited; the episode's own outage issue #1300 still rides along and
+        # is, so nothing new is filed.
         self.tick(outage(cases=["b-probe"], since="2026-09-11T15:00:00+00:00", prs=(4, 5, 6)), T0.replace(day=11, hour=15), environ=self.environ())
-        self.assertIn("Tracking #1302.", self.opener.texts[-1])
+        self.assertIn("Tracking #1300.", self.opener.texts[-1])
+        self.assertEqual(len([1 for method, path in self.gh.writes() if path == "repos/gke-labs/kube-agents/issues"]), 2, "two issues in the episode, no third")
         # GREEN: every issue of the episode gets the recovery comment, and
         # the message names them all.
         self.tick(health(), T0.replace(day=11, hour=17), environ=self.environ())
         recovered = [path for method, path in self.gh.writes() if method == "POST" and path.endswith("/comments")]
-        self.assertEqual(recovered, [f"repos/gke-labs/kube-agents/issues/{n}/comments" for n in (1300, 1301, 1302)])
-        self.assertIn("#1300, #1301, #1302)", self.opener.texts[-1].split("\n")[0])
+        self.assertEqual(recovered, [f"repos/gke-labs/kube-agents/issues/{n}/comments" for n in (1300, 1301)])
+        self.assertIn("#1300, #1301)", self.opener.texts[-1].split("\n")[0])
         self.assertEqual((self.recorded()["issue"], self.recorded()["issues"]), (None, []))
 
     def test_an_outage_that_decays_into_a_storm_still_gets_its_recovery_comment(self):
