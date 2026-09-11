@@ -111,8 +111,14 @@ In directory mode the credential proxy refuses `git add`, `commit`, `checkout`,
 command run anywhere else comes back as a security refusal rather than quietly
 damaging another agent's work.
 
-`base` is the repository's own default branch, not a hardcoded `main`. In
-directory mode `started_from` records what the branch was actually cut from:
+`base` is the repository's own default branch, not a hardcoded `main`. In directory
+mode `gitops_workspace.py`'s `resolve_base_branch` applies the `GITOPS_BASE_BRANCH`
+environment variable first, when the operator sets it on the agent, then the remote's
+advertised default; content mode takes the broker's default and does not read the
+variable. (`--base` on `submit` only feeds the `--base-sha` conflict check; it does not
+choose the PR base.) The bench's GitOps fix cycle (gke-labs/kube-agents#1307) uses the
+variable to point a run's PRs at a throwaway `run/<id>/<task>` branch that a controller
+in the task cluster syncs; you do not set it yourself. In directory mode `started_from` records what the branch was actually cut from:
 when the branch already exists on the remote (Step 5, addressing feedback on an
 open PR) it is `origin/<branch>` and your commits land **on top of** the ones
 already under review; when it does not, the branch is cut fresh from

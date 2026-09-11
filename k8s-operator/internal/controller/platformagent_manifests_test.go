@@ -1115,6 +1115,23 @@ func TestSafeSandboxEnvOverridesRejectsValueFrom(t *testing.T) {
 	}
 }
 
+func TestSafeSandboxEnvOverridesPassesGitopsBaseBranch(t *testing.T) {
+	// The bench's GitOps fix cycle points submit-suggestion at a per-run
+	// branch through GITOPS_BASE_BRANCH. Off the allowlist the CR renders and
+	// the agent silently keeps opening PRs against the default branch.
+	got := safeSandboxEnvOverrides([]corev1.EnvVar{
+		{Name: "GITOPS_BASE_BRANCH", Value: "run/eval-pr1/b-0011"},
+		{Name: "GITOPS_BASE_BRANCH_FROM_SECRET", ValueFrom: &corev1.EnvVarSource{
+			SecretKeyRef: &corev1.SecretKeySelector{
+				LocalObjectReference: corev1.LocalObjectReference{Name: "s"}, Key: "k",
+			},
+		}},
+	})
+	if len(got) != 1 || got[0].Name != "GITOPS_BASE_BRANCH" || got[0].Value != "run/eval-pr1/b-0011" {
+		t.Fatalf("expected GITOPS_BASE_BRANCH to survive the allowlist as a literal, got %#v", got)
+	}
+}
+
 func TestSafeSandboxEnvOverridesPassesOtelSdkDisabled(t *testing.T) {
 	// The chart documents OTEL_SDK_DISABLED as the off-switch for clusters
 	// with no OTLP collector, where the exporter otherwise retries an

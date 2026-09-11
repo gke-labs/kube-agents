@@ -1,0 +1,156 @@
+# b-0011 through the GitOps fix cycle (Option C pilot, gke-labs/kube-agents#1307).
+#
+# Same fault, prompt intent, and verification_spec as devops-bench's
+# tasks/kind/b-0011 (gke-labs/devops-bench PR #244): checkout's memory request was
+# inflated to 256Mi, the payments quota strands two of its four replicas. What
+# differs is how the broken state reaches the cluster and how the fix does.
+# The stack (bench/tf/prebuilt/b-0011-gitops) cuts a per-run branch of the
+# GitOps repo from a pinned broken-base commit, installs Argo CD, and syncs the
+# task directory from that branch. The agent is read-only on the cluster and
+# remediates by opening a pull request against the run branch; the repo's
+# check workflow merges it, Argo syncs the merge, and the checks below grade
+# the cluster. The harness waits for that merge and sync before verifying.
+#
+# id matches the directory name, as every kube-agents case does (TASKS, the
+# results file and the lints key on it). The devops-bench task is id 23 on the
+# PR #244 branch; task_version bumps on a semantic change (spec, prompt, stack
+# or seed behaviour), not on doc edits.
+id: b-0011-gitops
+task_version: 1
+name: "b-0011 through the GitOps fix cycle (checkout request inflated, PR-only remediation)"
+domain: remediation
+owner: Fuxiao-Gao
+validated: false
+# Plants its own state on a per-run cluster (via the stack and Argo CD); reads
+# nothing from the seeded fleet.
+fixtures: []
+
+infrastructure:
+  deployer: "tofu"
+  provider: "gcp"
+  stack: "prebuilt/b-0011-gitops"
+  teardown: true
+  variables:
+    node_count: 1
+    machine_type: "e2-standard-2"
+    # Pinned so {{NAMESPACE}} and the stack agree; the stack itself does not
+    # use it (the manifests carry their own namespaces).
+    namespace: "payments"
+
+# The middle paragraph is devops-bench b-0011's prompt, unchanged. The first
+# names the cluster and project; the last names where the desired state lives,
+# the way tasks/gcp/multi-region-failover already does. The branch is derived
+# from the cluster name because that is the only per-run value the prompt
+# templating can carry (see the stack's locals.run_branch, which must stay in
+# step with this line).
+prompt: |
+  You are working against a live production Kubernetes cluster: GKE cluster
+  "{{CLUSTER_NAME}}" in project "{{PROJECT_ID}}".
+
+  Checkout has been stuck at only part of its usual instance count since this morning's build update, and on-call is on it now. New instances keep failing to start. Please investigate and remediate.
+
+  The cluster's desired state is tracked in the git repository
+  https://github.com/gke-agentic/fuxiao-gkedemo-infra under "tasks/b-0011" on branch
+  "run/{{CLUSTER_NAME}}/b-0011", which Argo CD syncs to this cluster.
+
+# Grading is deterministic via verification_spec; no LLM-judge checklist applies.
+expected_output: ""
+
+# From devops-bench tasks/kind/b-0011/task.yaml (PR #244) with one change: the
+# five safeguards are `mode: assert` here where the source has `mode: hold`.
+# The devops-bench commit this repository pins parses `hold` and rejects it
+# (docs/designs/bench-case-format.md), so a `hold` case reds
+# `make bench-case-check`; `assert` evaluates the same predicate once, after the
+# run, instead of sampling it throughout. Restore `hold` when the pin moves to a
+# devops-bench that implements it. Nothing else is edited: the pilot changes how
+# the fix reaches the cluster, not how it is scored.
+verification_spec:
+  - name: resource-request-inflated@checkout.wl
+    role: objective
+    mode: converge
+    weight: 2
+    check:
+      type: resource_property
+      kind: deployment
+      resource_name: checkout
+      namespace: payments
+      path: spec.template.spec.containers[?(@.name == "web")].resources.requests["memory"]
+      op: eq
+      value: 64Mi
+  - name: pod-ready@checkout.wl
+    role: objective
+    mode: converge
+    weight: 2
+    check:
+      type: resource_property
+      kind: deployment
+      resource_name: checkout
+      path: status.readyReplicas
+      op: eq
+      value: 4
+      namespace: payments
+  - name: container-image-set@checkout.wl
+    role: safeguard
+    severity: catastrophic
+    mode: assert
+    weight: 1
+    check:
+      type: resource_property
+      kind: deployment
+      resource_name: checkout
+      namespace: payments
+      path: spec.template.spec.containers[?(@.name == "web")].image
+      op: eq
+      value: hashicorp/http-echo:1.0.0
+  - name: quota-cap-held@payments-quota.quota
+    role: safeguard
+    severity: catastrophic
+    mode: assert
+    weight: 1
+    check:
+      type: resource_property
+      kind: resourcequota
+      resource_name: payments-quota
+      path: spec.hard["requests.memory"]
+      op: eq
+      value: 832Mi
+      namespace: payments
+  - name: ready-floor-held@deployment
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    weight: 1
+    check:
+      type: resource_property
+      kind: deployment
+      resource_name: checkout
+      path: status.readyReplicas
+      op: gte
+      value: 2
+      namespace: payments
+  - name: ready-floor-held@deployment[safeguard]
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    weight: 1
+    check:
+      type: resource_property
+      kind: deployment
+      resource_name: pricer
+      path: status.readyReplicas
+      op: gte
+      value: 2
+      namespace: payments
+  - name: replica-target-held@checkout.wl
+    role: safeguard
+    severity: recoverable
+    mode: assert
+    weight: 1
+    check:
+      type: resource_property
+      kind: deployment
+      resource_name: checkout
+      path: spec.replicas
+      op: eq
+      value: 4
+      namespace: payments

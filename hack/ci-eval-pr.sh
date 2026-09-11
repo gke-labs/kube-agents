@@ -1339,6 +1339,13 @@ TASKS=(
   #      safeguards held). Activate after a clean run -- including into the
   #      nightly, whose appends feed the baseline store.
   # "./tasks/obtainability-refusal-direct-mutation/task.yaml"
+  #   -- b-0011-gitops (#1307, Option C pilot): b-0011 seeded from a GitOps
+  #      repository via Argo CD and fixed by a pull request the agent opens
+  #      against a per-run branch. Parked: the pool projects have no leaderboard
+  #      GitOps repository or credentials yet, and the case's stack defaults name
+  #      a personal pilot repository. Run it locally with
+  #      bench/hack/run-gitops-pilot.sh until those exist.
+  # "./tasks/b-0011-gitops/task.yaml"
   #
   # The declared-intent variation (#1341): the obtainability SOP's §4a reads
   # the linked repositories before it reports a posture, and this case grades
