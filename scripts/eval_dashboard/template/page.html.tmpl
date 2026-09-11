@@ -5,9 +5,9 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>__TITLE__</title>
 <style>
-  /* The same visual tokens as legacy.html (index.html.tmpl); the two page
-     kinds this template renders -- the Brief and the PR view -- share them
-     so the three pages read as one site. */
+  /* One set of visual tokens for the four pages this template renders --
+     the Brief, the PR view, the Grid and the Cases page -- so they read as
+     one site. */
   .viz-root {
     color-scheme: light;
     --surface-0:#f7f8f9; --surface-1:#ffffff; --surface-2:#f1f2f0; --line:#e9ebe6; --line-2:#d7d9d2;
@@ -47,6 +47,8 @@
     font:15.5px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
     -webkit-font-smoothing:antialiased; }
   .wrap { max-width:760px; margin:0 auto; padding:0 24px 80px; }
+  /* The two table pages need the width; the prose pages read better narrow. */
+  body[data-page="grid"] .wrap, body[data-page="cases"] .wrap { max-width:1120px; }
   a { color:var(--accent-link,var(--accent)); text-decoration:none; font-weight:600; }
   a:hover { text-decoration:underline; }
   b, strong { font-weight:650; }
@@ -91,6 +93,7 @@
   .banner.hs-amber { border-left-color:var(--warn); background:var(--surface-1); color:var(--text-primary); }
   .banner.hs-red { border-left-color:var(--crit); background:var(--surface-1); color:var(--text-primary); }
   .banner .hpill { margin-top:3px; }
+  .banner .right { margin-left:auto; color:var(--text-muted); font-size:13px; white-space:nowrap; }
 
   /* yes/no facts */
   ul.facts { list-style:none; padding:0; }
@@ -159,7 +162,125 @@
     padding:2px 8px; border-radius:6px; margin:2px 4px 2px 0; }
   .passed span.held { background:var(--skip-bg); color:var(--text-secondary); }
 
+  /* controls shared by the Grid and the Cases page: one row of chips */
+  .ctl { display:flex; gap:8px; align-items:center; margin:18px 0 12px; font-size:13px; color:var(--text-muted); flex-wrap:wrap; }
+  .ctl .sep { margin:0 4px; }
+  .ctl button { font:inherit; font-size:12.5px; font-weight:600; padding:4px 11px; border-radius:99px; border:1px solid var(--line);
+    background:var(--surface-1); color:var(--text-muted); cursor:pointer; }
+  .ctl button.on { border-color:var(--accent); color:var(--text-primary); background:var(--accent-soft); }
+  .ctl button:hover { color:var(--text-primary); }
+
+  /* the Cases page */
+  table.cases { width:100%; border-collapse:collapse; background:var(--surface-1); border:1px solid var(--line); border-radius:12px;
+    overflow:hidden; box-shadow:var(--shadow); font-size:13.5px; }
+  table.cases th { font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:var(--text-muted); text-align:left;
+    padding:10px 12px; border-bottom:1px solid var(--line); font-weight:700; white-space:nowrap; }
+  table.cases td { padding:9px 12px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  table.cases tr:last-child td { border-bottom:0; }
+  table.cases tr.grp td { background:var(--surface-2); font-size:11px; letter-spacing:.08em; text-transform:uppercase;
+    color:var(--accent-link,var(--accent)); padding:6px 12px; font-weight:750; }
+  table.cases tr.hl td { background:var(--accent-soft); }
+  table.cases tr.dim td { color:var(--text-muted); }
+  td.nm { font:500 13px ui-monospace,SFMono-Regular,Menlo,monospace; white-space:nowrap; }
+  td.nm small { display:block; font:12px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; color:var(--text-muted); margin-top:2px; }
+  .spark { display:flex; gap:2px; align-items:flex-end; height:18px; }
+  .spark i { display:block; width:5px; height:100%; border-radius:1px; background:var(--good); opacity:.55; }
+  .spark i.fail { background:var(--crit); opacity:1; }
+  .spark i.partial { background:var(--crit); opacity:.45; }
+  .spark i.infra { background:var(--accent); opacity:.55; }
+  .rate { font:600 13px ui-monospace,SFMono-Regular,Menlo,monospace; white-space:nowrap; font-variant-numeric:tabular-nums; }
+  .rate small { font-weight:500; color:var(--text-muted); font-size:11px; margin-left:3px; }
+  .rate.ok { color:var(--good-text); }
+  .rate.warn { color:var(--warn-text); }
+  .rate.bad { color:var(--crit-text); }
+  .rate.none { color:var(--text-muted); font-weight:500; }
+  .st { display:inline-block; font-size:11px; font-weight:700; padding:2px 8px; border-radius:6px; white-space:nowrap; }
+  .st.blocking { background:var(--good-bg); color:var(--good-text); }
+  .st.held_out, .st.retired { background:var(--skip-bg); color:var(--text-secondary); }
+  .st.demoted { background:var(--warn-bg); color:var(--warn-text); }
+  .st.nightly_only { background:var(--hl-soft); color:var(--warn-text); }
+  table.cases tr.main td { border-bottom:0; padding-bottom:4px; }
+  table.cases tr.why td { padding:0 12px 10px 12px; font-size:12.5px; color:var(--text-secondary); }
+  table.cases tr.why b { color:var(--text-primary); }
+  table.cases .lbl { font-size:11px; letter-spacing:.06em; text-transform:uppercase; color:var(--text-muted); font-weight:700; margin-right:4px; }
+  /* A flex row whose reason may shrink to nothing: a long reason must never
+     widen the table (auto layout would otherwise size the column to it). */
+  .lf { display:flex; gap:8px; align-items:baseline; min-width:0; }
+  .lf > span { white-space:nowrap; }
+  .rsn { flex:0 1 auto; min-width:0; max-width:560px; font:500 11.5px ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--warn-text);
+    background:var(--surface-2); padding:1px 8px; border-radius:6px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .more td { color:var(--text-muted); font-size:13px; }
+
+  /* the Grid */
+  .gridwrap { background:var(--surface-1); border:1px solid var(--line); border-radius:12px; padding:16px 18px 14px; box-shadow:var(--shadow); }
+  /* Only the grid scrolls; the legend and the merge list stay in view. */
+  .gscroll { overflow-x:auto; }
+  /* Sized to its tracks, not the box: a busy window overflows the card and
+     scrolls, and the markers' percentages have to measure the whole grid. */
+  .g { display:grid; column-gap:3px; row-gap:0; align-items:center; position:relative; --namew:250px; --colmin:14px; width:max-content; min-width:100%; }
+  .g .hd { font:500 10px/1 ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--text-muted); white-space:nowrap; overflow:hidden;
+    writing-mode:vertical-rl; transform:rotate(180deg); height:92px; justify-self:center; padding-top:2px; }
+  .g .hd b { color:var(--text-primary); font-weight:600; }
+  .g .grp { grid-column:1; font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:var(--accent-link,var(--accent)); padding:10px 0 2px; font-weight:750; white-space:nowrap; }
+  .g .grp-fill { grid-column:2/-1; }
+  .g .nm { font:500 12.5px ui-monospace,SFMono-Regular,Menlo,monospace; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; padding-right:8px; }
+  /* The names stay put while the columns scroll. */
+  .g .nm, .g .grp, .g .more { position:sticky; left:0; z-index:2; background:var(--surface-1); align-self:stretch; display:flex; align-items:center; }
+  .g .nm.h { color:var(--text-muted); }
+  .g .nm.lk { color:var(--accent-link,var(--accent)); }
+  .g .nm small { color:var(--text-muted); font-size:11px; margin-left:6px; font-family:inherit; }
+  .g .c { height:22px; margin:1.5px 0; border-radius:4px; border:0; padding:0; cursor:pointer; background:var(--skip-bg); }
+  .g .c:hover { outline:2px solid var(--line-2); outline-offset:1px; }
+  .g .c.pass { background:var(--good); opacity:.55; }
+  .g .c.fail { background:var(--crit); }
+  .g .c.partial { background:var(--crit); opacity:.45; }
+  .g .c.infra { background:var(--accent); opacity:.55; }
+  .g .c.died { background:transparent; border:1.5px solid var(--text-muted); cursor:default; }
+  .g .c.running { background:repeating-linear-gradient(45deg, transparent 0 4px, var(--line-2) 4px 6px); cursor:default; }
+  .g .c.none { background:var(--surface-2); cursor:default; }
+  .g .c.sel { outline:2px solid var(--text-primary); outline-offset:1px; opacity:1; }
+  .g .more { grid-column:1; font-size:12.5px; color:var(--text-muted); padding:6px 0 2px; white-space:nowrap; }
+  .g .more button { font:inherit; color:var(--accent-link,var(--accent)); background:none; border:0; cursor:pointer; padding:0; font-weight:600; }
+  .mk { position:absolute; top:0; bottom:0; width:2px; pointer-events:none; opacity:.9; }
+  .mk.merge { background:var(--accent-link,var(--accent)); opacity:.6; }
+  .mk.incident { background:var(--crit); }
+  .mk.recovered { background:var(--good); }
+  .mkl { position:absolute; transform:translateX(-50%); font:500 10.5px ui-monospace,SFMono-Regular,Menlo,monospace; white-space:nowrap;
+    padding:1px 6px; border-radius:4px; }
+  .mkl.merge { background:var(--accent-soft); color:var(--accent-link,var(--accent)); }
+  .mkl.incident { background:var(--crit-bg); color:var(--crit-text); }
+  .mkl.recovered { background:var(--good-bg); color:var(--good-text); }
+  .legend { display:flex; gap:16px; color:var(--text-muted); font-size:12px; margin-top:12px; flex-wrap:wrap; }
+  .legend i { display:inline-block; width:11px; height:11px; border-radius:3px; vertical-align:-1px; margin-right:5px; background:var(--skip-bg); }
+  .legend i.pass { background:var(--good); opacity:.55; }
+  .legend i.fail { background:var(--crit); }
+  .legend i.partial { background:var(--crit); opacity:.45; }
+  .legend i.infra { background:var(--accent); opacity:.55; }
+  .legend i.died { background:transparent; border:1.5px solid var(--text-muted); }
+  .legend i.running { background:repeating-linear-gradient(45deg, transparent 0 3px, var(--line-2) 3px 5px); }
+  .legend i.mkmerge { background:var(--accent-link,var(--accent)); width:3px; border-radius:0; }
+  .legend i.mkincident { background:var(--crit); width:3px; border-radius:0; }
+  .legend i.mkrecovered { background:var(--good); width:3px; border-radius:0; }
+  .detail { margin-top:14px; background:var(--surface-1); border:1px solid var(--accent); border-radius:12px; padding:16px 18px; box-shadow:var(--shadow); }
+  .detail h3 { font-size:15px; font-weight:600; display:flex; gap:10px; align-items:baseline; flex-wrap:wrap; }
+  .detail h3 code { font-size:14px; }
+  .detail .close { margin-left:auto; font:inherit; font-size:13px; color:var(--text-muted); background:none; border:0; cursor:pointer; }
+  .detail .sub { color:var(--text-muted); font-size:13px; margin:4px 0 10px; }
+
+  /* the Brief's release table */
+  table.rel { width:100%; border-collapse:collapse; background:var(--surface-1); border:1px solid var(--line); border-radius:12px; overflow:hidden; font-size:13.5px; box-shadow:var(--shadow); }
+  table.rel th { text-align:left; font-size:11px; color:var(--text-muted); text-transform:uppercase; letter-spacing:.06em; font-weight:700; padding:9px 12px; border-bottom:1px solid var(--line); }
+  table.rel td { padding:9px 12px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  table.rel tr:last-child td { border-bottom:0; }
+  table.rel td.num { font-variant-numeric:tabular-nums; font-weight:600; color:var(--text-secondary); }
+  table.rel .tnote { font-size:12px; color:var(--text-muted); margin-top:1px; }
+  .pill { display:inline-flex; align-items:center; border-radius:6px; padding:3px 9px; font-size:11px; font-weight:750; letter-spacing:.03em; }
+  .p-pass { background:var(--good-bg); color:var(--good-text); }
+  .p-fail { background:var(--crit-bg); color:var(--crit-text); }
+  .p-infra { background:var(--ser-bg); color:var(--ser-text); }
+
   .foot { margin-top:40px; color:var(--text-muted); font-size:13.5px; display:flex; gap:18px; flex-wrap:wrap; }
+  .foot.block { display:block; }
 </style>
 </head>
 <body class="viz-root" data-palette="#8b5cf6" data-page="__PAGE__">
@@ -167,16 +288,12 @@
 <div class="top"><div class="top-in">
   <span class="brand"><span class="logo">ka</span>evals</span>
   <nav class="nav">
-    <a href="index.html" __NAV_BRIEF__>Brief</a><a href="index.html#agent">Numbers</a>
-    <a href="run.html" id="navrun" __NAV_RUN__>PR view</a><a href="legacy.html">Legacy view</a>
-    <!-- The Releases table is rendered on the legacy page only, so this deep
-         link is the whole of its discoverability from the Brief. -->
-    <a href="legacy.html#release">Releases</a>
+    <a href="index.html" __NAV_BRIEF__>Brief</a><a href="grid.html" __NAV_GRID__>Grid</a><a href="cases.html" __NAV_CASES__>Cases</a>__NAV_RUN__
   </nav>
   <span class="meta"><span id="headmeta">__META__</span> · <span id="freshness" class="fresh">__FRESHNESS__</span></span>
 </div></div>
 
-<div class="wrap"><div id="app"><noscript>This page renders in the browser from <code>brief.json</code>; the <a href="legacy.html">legacy view</a> is the server-rendered table.</noscript></div></div>
+<div class="wrap"><div id="app"><noscript>This page renders in the browser from <code>brief.json</code>, which sits beside it and is readable as plain JSON.</noscript></div></div>
 
 <script>
 __PAGES_JS__

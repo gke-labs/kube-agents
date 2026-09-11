@@ -3,16 +3,18 @@
 The collector (`collect.py`) writes one data.json; its schema is a contract
 shared with the renderer and the publisher -- see SCHEMA.md in this directory
 before changing any field. `render.py` turns one data.json (schema_version 1)
-into three pages -- `index.html` (the incident Brief), `run.html` (the per-run
-PR view) and `legacy.html` (the two-band table) -- plus `brief.json`, the
-per-run classification `classify.py` produces (the one place the "is this
-red mine?" rule lives), and a copy of the data file; `publish.py` ships an out-dir to its serving
-location. Everything measurable on the pages is computed from data.json
-alone -- the optional extra inputs are `case-notes.yaml` (human one-line
-annotations, issue links and badges per case), `events.yaml` (dated event
-markers plus the human-classified catch and false-red counts), and the CI
-health adjudicator's `health.json` / `health-history.jsonl` when published; render.py's docstring
-owns the details.
+into four pages -- `index.html` (the incident Brief), `run.html` (the per-run
+PR view), `grid.html` (every case by every run, with the merges and
+incidents marked) and `cases.html` (how reliable each test is) -- plus
+`brief.json`, the document they all render from: the per-run classification
+`classify.py` produces (the one place the "is this red mine?" rule lives)
+and the per-case record; and a copy of the data file. `publish.py` ships an
+out-dir to its serving location. Everything measurable on the pages is
+computed from data.json alone -- the optional extra inputs are
+`case-notes.yaml` (a human one-line note and issue links per case),
+`events.yaml` (the human-classified catch counts), and the CI health
+adjudicator's `health.json` / `health-history.jsonl` when published;
+render.py's docstring owns the details.
 
 Two more readers of the same data.json live here: `health.py` decides
 whether the presubmit gate is GREEN / DEGRADED / OUTAGE and why, and
