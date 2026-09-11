@@ -81,6 +81,15 @@ CONDITION_TRUE = "True"
 # A Pod that has finished is not stalled however long its Ready condition has
 # been False, so terminal phases are skipped entirely.
 TERMINAL_POD_PHASES = frozenset({"Succeeded", "Failed"})
+# The same holds for anything else that has finished: a Job whose Complete or
+# Failed condition is True, and any object whose spec asks for zero replicas.
+# A Deployment keeps up to ten retired ReplicaSets at replicas: 0, and once a
+# hash-suffixed ConfigMap generator has pruned the old names each one's envFrom
+# resolves to nothing; a CronJob's history Jobs do the same once their Secret
+# is renamed. Neither is a stall, so neither is read by any heuristic.
+FINISHED_JOB_CONDITION_TYPES = frozenset({"Complete", "Failed"})
+REPLICAS_SPEC_KEY = "replicas"
+JOB_KIND = "Job"
 
 # What counts as a repeating warning in one snapshot: at least this many
 # occurrences, spanning at least the threshold, the newest inside the last
@@ -567,6 +576,21 @@ def is_terminal_pod(obj: dict) -> bool:
     )
 
 
+def is_finished(obj: dict) -> bool:
+    """A Job that has completed or failed, or anything scaled to zero."""
+    spec = obj.get("spec")
+    if obj.get("kind") == JOB_KIND:
+        status = obj.get("status")
+        conditions = status.get(CONDITIONS_KEY) if isinstance(status, dict) else None
+        return any(
+            isinstance(cond, dict)
+            and cond.get("type") in FINISHED_JOB_CONDITION_TYPES
+            and cond.get("status") == CONDITION_TRUE
+            for cond in conditions or []
+        )
+    return isinstance(spec, dict) and spec.get(REPLICAS_SPEC_KEY) == 0
+
+
 def analyze(
     objects: list[dict],
     events: list[dict],
@@ -579,7 +603,7 @@ def analyze(
     findings: list[dict] = []
     for obj in objects:
         kind = obj.get("kind", "")
-        if kind in SKIPPED_OBJECT_KINDS or is_terminal_pod(obj):
+        if kind in SKIPPED_OBJECT_KINDS or is_terminal_pod(obj) or is_finished(obj):
             continue
         name = (obj.get("metadata") or {}).get("name", "")
         threshold = threshold_for(kind, override_minutes)
