@@ -4,6 +4,7 @@
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -336,6 +337,7 @@ class OutputShapeTest(unittest.TestCase):
     def setUp(self):
         # main() records every run under DEFAULT_STATE_DIR; keep the tests out of /opt/data.
         self.state_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.state_dir, True)
         patcher = patch.object(report, "DEFAULT_STATE_DIR", self.state_dir)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -421,6 +423,7 @@ class RolloutTrackingTest(unittest.TestCase):
 
     def setUp(self):
         self.state_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.state_dir, True)
         self.now = self.T0
 
     def _clock(self):
@@ -576,6 +579,57 @@ class RolloutTrackingTest(unittest.TestCase):
         with patch.object(report, "run_cmd", FakeGcloud({"p1": clusters}, config)), patch.object(report, "utc_now", self._clock), redirect_stdout(out):
             report.main(argv + ["--rollout-in-progress"])
         self.assertEqual(self._progress_rows(out.getvalue())["x"][6], "stalled (unchanged for 1h 0m)")
+
+    def _run_channel_default(self, clusters, config, *extra_args, failing_locations=()):
+        fake = FakeGcloud({"p1": clusters}, config, failing_locations=failing_locations)
+        out = io.StringIO()
+        with patch.object(report, "run_cmd", fake), patch.object(report, "utc_now", self._clock), redirect_stdout(out):
+            report.main(["--state-dir", self.state_dir, "--project", "p1", *extra_args])
+        return out.getvalue()
+
+    def test_a_failed_server_config_read_is_not_a_move_and_keeps_the_clock(self):
+        # Run 2 cannot grade anyone (get-server-config fails); run 3 must not report the
+        # current member as completed, must not call the rollout active on it, and must
+        # date the lagging member's stall from run 1, not run 3.
+        config = {"us-central1": server_config(REGULAR="1.31.0-gke.1")}
+        clusters = [
+            cluster("x", "us-central1", "1.30.0-gke.1", [("p", "1.30.0-gke.1")]),
+            cluster("y", "us-central1", "1.31.0-gke.1", [("p", "1.31.0-gke.1")]),
+        ]
+        self._run_channel_default(clusters, config)
+        self.now = self.T0 + timedelta(hours=1)
+        out = self._run_channel_default(clusters, config, failing_locations=["us-central1"])
+        rows = self._progress_rows(out)
+        self.assertEqual((rows["x"][5], rows["x"][6]), ("unknown", "unchanged"))
+        self.assertEqual((rows["y"][5], rows["y"][6]), ("unknown", "unchanged"))
+        self.assertNotIn("rollout active", out)
+        members = self._state("channel-default")["members"]
+        self.assertEqual(members["p1/us-central1/x"]["status"], "lagging", "an ungraded run keeps the last graded status")
+        self.assertEqual(members["p1/us-central1/x"]["unchanged_since"], "2026-09-11T10:00:00Z")
+        self.now = self.T0 + timedelta(hours=2)
+        out = self._run_channel_default(clusters, config)
+        rows = self._progress_rows(out)
+        self.assertEqual(rows["y"][6], "unchanged")
+        self.assertEqual(rows["x"][6], "unchanged")
+        self.assertNotIn("rollout active", out)
+        self.assertEqual(self._state("channel-default")["members"]["p1/us-central1/x"]["unchanged_since"], "2026-09-11T10:00:00Z")
+        self.now = self.T0 + timedelta(hours=3)
+        out = self._run_channel_default(clusters, config, "--rollout-in-progress")
+        self.assertEqual(self._progress_rows(out)["x"][6], "stalled (unchanged for 3h 0m)")
+
+    def test_an_unknown_baseline_yields_completed_only_on_a_version_change(self):
+        config = {"us-central1": server_config(REGULAR="1.31.0-gke.1")}
+        clusters = [
+            cluster("same", "us-central1", "1.31.0-gke.1", [("p", "1.31.0-gke.1")]),
+            cluster("moved", "us-central1", "1.30.0-gke.1", [("p", "1.30.0-gke.1")]),
+        ]
+        self._run_channel_default(clusters, config, failing_locations=["us-central1"])
+        self.assertEqual(self._state("channel-default")["members"]["p1/us-central1/same"]["status"], "unknown")
+        self.now = self.T0 + timedelta(hours=1)
+        clusters[1] = cluster("moved", "us-central1", "1.31.0-gke.1", [("p", "1.31.0-gke.1")])
+        rows = self._progress_rows(self._run_channel_default(clusters, config))
+        self.assertEqual(rows["same"][6], "unchanged", "current at the same versions as an ungraded baseline is not a completion")
+        self.assertEqual(rows["moved"][6], "completed")
 
     def test_a_different_target_reads_a_different_record(self):
         self._run(self._fleet())

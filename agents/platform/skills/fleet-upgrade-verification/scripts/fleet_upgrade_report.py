@@ -25,6 +25,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 
 # Project resolution, in the order networking_audit.py and the fleet SOPs use it:
@@ -91,17 +92,22 @@ TABLE_COLUMNS = (
     "note",
 )
 
-# Where a run leaves its record for the next one. /opt/data is the sandbox's persistent
-# volume, shared with nothing else; /opt/data/scratch is per-run scratch by convention
-# and /opt/data/state already holds what must survive between runs (kubeconfigs), so
-# the record goes there, under the skill's own name. One file per target, named after
+# Where a run leaves its record for the next one. The script runs in the shell sandbox,
+# whose /opt/data is a PersistentVolumeClaim the operator retains when the sandbox
+# StatefulSet goes (shell_sandbox_manifests.go), and whose entrypoint replaces only the
+# /opt/defaults trees and the database stubs on start (deploy/sandbox/entrypoint.sh);
+# /opt/data/scratch is per-run scratch by convention, so the record goes in a directory
+# of the skill's own name that nothing else writes. One file per target, named after
 # it: the target string is validated by VERSION_RE, so it is filesystem-safe as is, and
 # a run without --target-version measures each member against its channel default and
 # keys its record under CHANNEL_DEFAULT_STATE_KEY. --state-dir overrides the directory.
 DEFAULT_STATE_DIR = "/opt/data/state/fleet-upgrade-verification"
 CHANNEL_DEFAULT_STATE_KEY = "channel-default"
 STATE_FILE_SUFFIX = ".json"
-STATE_TMP_SUFFIX = ".tmp"
+# The record is written to a uniquely named sibling and renamed into place, so two
+# runs against one target at once (a chat turn and a delegated card) cannot truncate
+# each other's half-written file; the last rename wins whole.
+STATE_TMP_PREFIX = ".fleet-upgrade-record-"
 # Bumped when the record's shape changes; a file with another version is reported and
 # treated as no prior run rather than compared field by field.
 STATE_FORMAT_VERSION = 1
@@ -124,9 +130,14 @@ PROGRESS_UNCHANGED = "unchanged"
 PROGRESS_STALLED = "stalled"
 PROGRESS_ORDER = (PROGRESS_COMPLETED, PROGRESS_STARTED, PROGRESS_STALLED, PROGRESS_UNCHANGED, PROGRESS_NEW)
 # Statuses that mean the member has reached the target, and the ones a stall can be
-# called on. `unknown` is in neither: a row that could not be graded is not a stall.
+# called on. `unknown` is in neither: a row that could not be graded is not a stall,
+# and an `unknown` observation on either side of a comparison is not evidence of a
+# move either (a timed-out get-server-config must not read as a completed upgrade),
+# so the comparison falls back to the versions alone and the record keeps the last
+# graded status.
 DONE_STATUSES = (STATUS_CURRENT, STATUS_AHEAD)
 BEHIND_STATUSES = (STATUS_LAGGING, STATUS_PATCH_BEHIND)
+GRADED_STATUSES = DONE_STATUSES + BEHIND_STATUSES
 # Why a rollout counted as active, for the summary line and the JSON.
 ACTIVE_REASON_FLAG = "--rollout-in-progress"
 ACTIVE_REASON_MOVERS = "another member moved since the previous run"
@@ -496,20 +507,32 @@ def load_state(path: str) -> tuple[dict | None, str | None]:
 
 
 def save_state(path: str, state: dict) -> None:
-    """Writes the record atomically (temp file, then rename); raises OSError on failure."""
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    tmp = path + STATE_TMP_SUFFIX
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=JSON_INDENT)
-    os.replace(tmp, path)
+    """Writes the record atomically (unique temp file, then rename); raises OSError on failure."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=STATE_TMP_PREFIX, suffix=STATE_FILE_SUFFIX, dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=JSON_INDENT)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
-def _member_record(member: dict, unchanged_since: str) -> dict:
+def _member_record(member: dict, unchanged_since: str, previous: dict | None) -> dict:
+    """The member's entry in the record; an ungraded run keeps the last graded status."""
     lowest = member["lowest_node_pool"]
+    status = member["status"]
+    if status == STATUS_UNKNOWN and previous and previous.get("status") in GRADED_STATUSES:
+        status = previous["status"]
     return {
         "control_plane_version": member["control_plane_version"],
         "lowest_node_pool_version": lowest["version"] if lowest else None,
-        "status": member["status"],
+        "status": status,
         "unchanged_since": unchanged_since,
     }
 
@@ -522,16 +545,21 @@ def _delta(member: dict, previous: dict | None) -> tuple[str, bool]:
     versions_now = (member["control_plane_version"], lowest["version"] if lowest else None)
     versions_before = (previous.get("control_plane_version"), previous.get("lowest_node_pool_version"))
     status_now, status_before = member["status"], previous.get("status")
-    if status_now in DONE_STATUSES and status_before not in DONE_STATUSES:
+    moved = versions_now != versions_before
+    # `completed` needs evidence of a move: a graded behind status before, or a version
+    # change. An `unknown` baseline (a failed server-config read) proves nothing.
+    if status_now in DONE_STATUSES and status_before not in DONE_STATUSES and (status_before in GRADED_STATUSES or moved):
         return PROGRESS_COMPLETED, False
     in_flight = [member["cluster_status"]] + [p.get("status", "") for p in member["node_pools"]]
-    if versions_now != versions_before or any(s in IN_FLIGHT_STATUSES for s in in_flight):
+    if moved or any(s in IN_FLIGHT_STATUSES for s in in_flight):
         return PROGRESS_STARTED, False
-    # Same versions. A status that moved without them (the channel default advanced
-    # under a member) starts a new observation series rather than inheriting the old
-    # one's clock, so a stall is never dated from before the target it is measured
-    # against existed.
-    return PROGRESS_UNCHANGED, status_now == status_before
+    # Same versions. A graded status that moved without them (the channel default
+    # advanced under a member) starts a new observation series rather than inheriting
+    # the old one's clock, so a stall is never dated from before the target it is
+    # measured against existed. An `unknown` on either side is not a status change:
+    # the versions agree, and that is all the observation says.
+    both_graded = status_now in GRADED_STATUSES and status_before in GRADED_STATUSES
+    return PROGRESS_UNCHANGED, status_now == status_before or not both_graded
 
 
 def compute_progress(report: dict, previous: dict | None, now: datetime, rollout_flag: bool, path: str) -> dict:
@@ -562,7 +590,7 @@ def compute_progress(report: dict, previous: dict | None, now: datetime, rollout
         member["unchanged_since"] = since
         since_at = parse_timestamp(since)
         member["unchanged_for_seconds"] = int((now - since_at).total_seconds()) if since_at else None
-        record[key] = _member_record(member, since)
+        record[key] = _member_record(member, since, before if isinstance(before, dict) else None)
 
     movers = [m for m in report["members"] if m["progress"] in (PROGRESS_STARTED, PROGRESS_COMPLETED)]
     active_reason = None
