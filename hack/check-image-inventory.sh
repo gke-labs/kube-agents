@@ -375,8 +375,10 @@ check_mirror_names() {
   done <<<"$images"
 }
 
-# The images in the first list that the second does not carry. Both come out
-# of image_refs, so both are sorted and deduplicated.
+# The images in the first list that the second does not carry.
+# Precondition: requires both inputs to be sorted and deduplicated under matching
+# collation (as produced by image_refs' sort -u) for comm -23 to perform a correct
+# sorted merge.
 added_images() {
   comm -23 <(printf '%s\n' "$1" | sed '/^$/d') <(printf '%s\n' "$2" | sed '/^$/d')
 }

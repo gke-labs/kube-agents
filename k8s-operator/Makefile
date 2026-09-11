@@ -305,13 +305,14 @@ endef
 
 ##@ Setup & Cleanup
 
-.PHONY: dev-rebuild-agent images-check
+.PHONY: dev-rebuild-agent
 # The script moved to the repository root's scripts/dev/, so the root Makefile
 # owns this target now and this one delegates up. Kept because the target has
 # always been reachable from inside k8s-operator/.
 dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
 	@$(MAKE) -C .. dev-rebuild-agent ARGS="$(ARGS)"
 
+.PHONY: images-check
 images-check: ## Verify images.json matches pins and the chart mirrors cleanly (delegates to root).
 	@$(MAKE) -C .. images-check
 
