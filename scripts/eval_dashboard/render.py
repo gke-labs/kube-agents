@@ -922,12 +922,11 @@ def compact_release(release: dict) -> dict:
 
 def pending_builds(data: dict) -> list[dict]:
     """``pending_builds`` as the Grid's "still running" columns: id and when
-    the collector first saw it, oldest first. The presubmit's only: the Grid
-    is every case by every presubmit run, and a nightly build in flight is
-    the Nightly report's to mention (``nightly.running_nights``). A
-    malformed entry is dropped, and so is one first seen more than
-    PENDING_MAX_AGE_MS before the reference time: that build is not running
-    any more (docstring of the constant)."""
+    the collector first saw it, oldest first. A malformed entry is dropped,
+    and so is one first seen more than PENDING_MAX_AGE_MS before the
+    reference time: that build is not running any more (docstring of the
+    constant). The columns are the presubmit's, so a night in flight
+    (``tier: nightly`` on the entry) gets none."""
     raw = data.get("pending_builds")
     if not isinstance(raw, list):
         return []

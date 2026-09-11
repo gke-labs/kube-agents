@@ -560,13 +560,10 @@ class TestIncrementalGcsScan(_MergeBase):
         self.assertEqual(first["runs"], [])
         self.assertEqual(
             first["pending_builds"],
-            [{"build_id": BUILD_998_FULL, "first_seen": first_sweep.isoformat(), "tier": "presubmit"}],
+            [{"build_id": BUILD_998_FULL, "first_seen": first_sweep.isoformat()}],
         )
         # An hour later it is STILL unfinished: the entry is carried with its
         # original first_seen, so the retry clock runs from the first sighting.
-        # A prior written before entries carried a tier reads as the
-        # presubmit's, like a run without one.
-        del first["pending_builds"][0]["tier"]
         prior = self.write_prior(first)
         second, _ = self.quiet_collect(
             pr_globs=[FAKE_GLOB],
@@ -576,7 +573,7 @@ class TestIncrementalGcsScan(_MergeBase):
         )
         self.assertEqual(
             second["pending_builds"],
-            [{"build_id": BUILD_998_FULL, "first_seen": first_sweep.isoformat(), "tier": "presubmit"}],
+            [{"build_id": BUILD_998_FULL, "first_seen": first_sweep.isoformat()}],
         )
         # Another hour on, finished.json has landed: recorded, list emptied.
         shutil.copy(
@@ -750,7 +747,7 @@ class TestIndexDiscovery(_MergeBase):
         )
         self.assertEqual(len(merged["runs"]), 2)
         self.assertEqual(
-            merged["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "presubmit"}]
+            merged["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat()}]
         )
         # An in-flight build is the ordinary case, not a stall: publishable.
         self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
@@ -807,7 +804,7 @@ class TestIndexDiscovery(_MergeBase):
         self.assertEqual(len(merged["runs"]), 2)
         self.assertRegex(stderr, WORKFLOW_REFUSAL)
         self.assertEqual(
-            merged["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "presubmit"}]
+            merged["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat()}]
         )
 
     def test_pointer_without_a_gs_path_is_skipped_with_a_plain_warning(self):
@@ -1033,10 +1030,10 @@ class TestNightlySource(_MergeBase):
         self.assertRegex(stderr, WORKFLOW_REFUSAL)
         self.assertIn(f"warning: gsutil ls failed for {FAKE_NIGHTLY_PREFIX}", stderr)
 
-    def test_an_unfinished_nightly_build_rides_pending_tagged_with_its_tier(self):
-        """The entry says which source listed the build: the Grid draws a
-        presubmit's as a running column, the Nightly report a nightly's as
-        a night in flight. The tag survives the carry-forward."""
+    def test_an_unfinished_nightly_build_rides_pending_with_its_tier(self):
+        """The retry list is shared, so the entry says which source listed
+        the build: the Grid's running columns are the presubmit's, and a
+        night in flight for hours must not draw one every morning."""
         gsutil, _ = self.fake_gsutil([])
         built = self.place_nightly_build(BUILD_998_FULL)
         (built / "finished.json").unlink()
@@ -1045,17 +1042,13 @@ class TestNightlySource(_MergeBase):
         self.assertEqual(data["runs"], [])
         self.assertEqual(data["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "nightly"}])
         self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
-        # Still unfinished a tick later, and the periodic not scanned this
-        # time: the entry is carried as it was, tier included.
+        # The tag survives a scan whose nightly listing does not name the
+        # build again (the listing failed, or the build fell off it).
         prior = self.write_prior(data)
-        later, _ = self.quiet_collect(merge_with=prior, gsutil=gsutil, now=now + timedelta(minutes=15))
-        self.assertEqual(later["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "nightly"}])
-        # A tier that is not a string is a malformed entry, like a missing first_seen.
-        data["pending_builds"][0]["tier"] = 7
-        prior = self.write_prior(data)
-        later, stderr = self.quiet_collect(merge_with=prior, gsutil=gsutil, now=now + timedelta(minutes=15))
-        self.assertNotIn("pending_builds", later)
-        self.assertIn("pending_builds is malformed", stderr)
+        gsutil, _ = self.fake_gsutil([])
+        later = now + timedelta(minutes=15)
+        merged, _ = self.quiet_collect(nightly_prefix=FAKE_NIGHTLY_PREFIX, merge_with=prior, gsutil=gsutil, now=later)
+        self.assertEqual(merged["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "nightly"}])
 
     def test_cases_keep_the_two_records_apart(self):
         """The per-case fields are the presubmit's; the nightly's sit under
