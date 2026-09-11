@@ -5,6 +5,6 @@ type: application
 # version and appVersion are placeholders: release-publish.yml stamps both with
 # the SemVer release tag on the release commit (via tag_ga_release.sh and publish_helm_chart.sh),
 # so the chart version tracks the app version.
-version: 0.1.0
-appVersion: "v0.1.0"
+version: 0.5.0
+appVersion: "0.5.0"
 kubeVersion: ">=1.29.0-0"

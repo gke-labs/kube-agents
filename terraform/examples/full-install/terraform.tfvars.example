@@ -18,7 +18,7 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 
 # Image tag for the operator and platform agent. Defaults to "latest";
 # pin an X.Y.Z release tag for production.
-# image_tag = "1.2.0"
+# image_tag = "0.5.0"
 
 # Pull every image from a mirror instead of the public registries. Copy them
 # there first with `make mirror-images MIRROR_PREFIX=<prefix> IMAGE_TAG=<tag>`

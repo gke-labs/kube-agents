@@ -26,7 +26,7 @@ C_RESET="\033[0m"
 
 # Sourced/baked release version. On developer checkouts (main), this is empty.
 # Release automation stamps this value (e.g. BAKED_RELEASE_VERSION="0.2.0") when publishing a GA release.
-BAKED_RELEASE_VERSION=""
+BAKED_RELEASE_VERSION="0.5.0"
 
 # Where the upgrade engine is fetched from when this script runs outside a
 # checkout. install.sh and uninstall.sh carry the same URL, each needing it
