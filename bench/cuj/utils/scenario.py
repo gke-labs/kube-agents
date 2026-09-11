@@ -100,7 +100,13 @@ class Scenario:
                 log.record("milestone", result.to_dict())
             for result in acceptance.results:
                 log.record("acceptance_criterion", result.to_dict())
-            transcript = log.write_transcript(prompt, interaction)
+            # The transcript is a reading aid; a malformed projection must
+            # not turn a scored run into an error.
+            transcript = None
+            try:
+                transcript = log.write_transcript(prompt, interaction)
+            except Exception as exc:  # non-gating, like the milestones
+                log.record("transcript_error", f"{type(exc).__name__}: {exc}")
             log.record(
                 "summary",
                 {
@@ -132,7 +138,8 @@ class Scenario:
         for line in acceptance.report_lines():
             print(line)
         print(f"Evidence: {log.path}")
-        print(f"Conversation: {transcript}")
+        if transcript is not None:
+            print(f"Conversation: {transcript}")
         interaction_failure = (
             f"interaction {status}"
             + (f": {error}" if error else "")

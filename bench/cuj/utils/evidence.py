@@ -77,7 +77,13 @@ class EvidenceLog:
             ),
         ]
 
-        tasks = [t for t in interaction.get("tasks") or [] if isinstance(t, dict)]
+        def mapping(value: Any) -> dict[str, Any]:
+            return value if isinstance(value, dict) else {}
+
+        def mappings(value: Any) -> list[dict[str, Any]]:
+            return [item for item in (value or []) if isinstance(item, dict)]
+
+        tasks = mappings(interaction.get("tasks"))
         if tasks:
             lines += ["AGENT WORK", "=" * TRANSCRIPT_WIDTH, ""]
         for task in tasks:
@@ -90,8 +96,8 @@ class EvidenceLog:
                 lines.append(f"    ✓ {task['summary']}")
             elif task.get("error"):
                 lines.append(f"    ✗ {task['error']}")
-            for item in task.get("evidence") or []:
-                details = item.get("details") or {}
+            for item in mappings(task.get("evidence")):
+                details = mapping(item.get("details"))
                 lines.append(
                     f"    · evidence {item.get('type')} [{item.get('status')}]"
                     f" — {details.get('apiMethod') or 'unknown method'}"
@@ -108,8 +114,8 @@ class EvidenceLog:
                             for row in rendered.splitlines()[:EVIDENCE_PREVIEW_LINES]
                         ],
                     ]
-            for item in task.get("artifacts") or []:
-                manifest = item.get("manifest") or {}
+            for item in mappings(task.get("artifacts")):
+                manifest = mapping(item.get("manifest"))
                 rendered = json.dumps(manifest, indent=2, sort_keys=True)
                 lines.append(f"    · artifact {item.get('type')}")
                 lines += [

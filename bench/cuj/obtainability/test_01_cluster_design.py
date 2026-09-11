@@ -8,10 +8,10 @@ from typing import Any
 from cuj.utils.acceptance_criteria import AcceptanceCriteria, AcceptanceCriterion
 from cuj.utils.interaction import (
     completed_evidence,
+    delivered_answer,
     latest_artifact,
     projected_records,
     projected_tasks,
-    substantive_output,
     tool_operations,
     unnormalized_tool_calls,
 )
@@ -31,7 +31,11 @@ cloud.google.com/machine-family values n2, n2d, and c2d with location policy \
 ANY. This is design-only: do not create a cluster, apply a manifest, open a \
 pull request, or mutate cloud or Kubernetes state."""
 
-REQUIRED_SKILLS = {"gke-cluster-creation", "gke-compute-classes", "gke-obtainability"}
+REQUIRED_SKILLS = {
+    "gke-cluster-creation",
+    "gke-compute-classes",
+    "capacity-obtainability",
+}
 FORBIDDEN_OPERATIONS = {
     "create_cluster",
     "delete_cluster",
@@ -91,7 +95,7 @@ MILESTONES = (
         "The Platform Agent must load the cluster-creation, ComputeClass, and "
         "obtainability skills needed to design a stockout-resilient topology.",
         "platform task requests and loads gke-cluster-creation, "
-        "gke-compute-classes, and gke-obtainability",
+        "gke-compute-classes, and capacity-obtainability",
         ("m2-platform-task-created",),
     ),
     Milestone(
@@ -450,25 +454,25 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         if value not in (None, "", [], {})
     }
     # Exact keys, not prefixes: a stray "spotplaceholder" is not a Spot
-    # signal. On-Demand is required too — it has no AdviceService signal, but
-    # the skill mandates recording the quota-and-reservations assessment
-    # under the same key, and that recording never depends on the API.
+    # signal. Only the two models the AdviceService returns are required in
+    # its evidence; On-Demand has no API signal, is assessed from the quota
+    # check (m5), and is scored on the answer below.
     advice_models_covered = all(
         populated_models & aliases
         for aliases in (
             {"spot"},
             {"flex", "flexstart"},
-            {"ondemand"},
         )
     )
-    # Score the reply that follows the delegation acknowledgment; the
-    # hand-off boilerplate is not an answer.
-    answer = substantive_output(interaction)
+    # Score what the user actually reads: the reply after the delegation
+    # acknowledgment plus the delegated task results the gateway posts into
+    # the same thread.
+    answer = delivered_answer(interaction)
     # Word-bounded so prose like "inflexible" or "spotted" cannot satisfy a
-    # provisioning path; "flex" still matches Flex, Flex-Start, and
-    # flex-start spellings.
+    # provisioning path; the separators admit On-Demand, on demand, and the
+    # ON_DEMAND / FLEX_START key spellings the skill's records use.
     paths_weighed = {
-        "onDemand": bool(re.search(r"\bon[- ]?demand\b", answer, re.IGNORECASE)),
+        "onDemand": bool(re.search(r"\bon[-_ ]?demand\b", answer, re.IGNORECASE)),
         "spot": bool(re.search(r"\bspot\b", answer, re.IGNORECASE)),
         # \bflex\b alone misses FLEX_START: the underscore is a word
         # character, so there is no boundary after "flex".
@@ -546,7 +550,7 @@ def evaluate_kage_milestones(interaction: dict[str, Any]) -> MilestoneSuite:
     operations = tool_operations(interaction)
     completed_operations = tool_operations(interaction, completed_only=True)
     final_output_available = "output" in interaction
-    result_text = substantive_output(interaction)
+    result_text = delivered_answer(interaction)
     claims_met, claims_observed = capacity_claims(
         result_text, str(interaction.get("output") or "")
     )
