@@ -108,7 +108,7 @@ let health = normalizeHealth(inlineJson(PAGE.inlineHealth) ?? brief.health);
 let live = false;
 // What the reader has clicked on the Grid and the Cases page. URL parameters
 // seed it; a chip or a cell changes it and re-renders.
-const ui = { sort: null, show: null, window: null, rows: null, markers: { merge: true, incident: true }, selected: null, showHeld: false, showRetired: false };
+const ui = { sort: null, show: null, window: null, rows: null, markers: { merge: true, incident: true }, selected: null, showHeld: false, showRetired: false, caseScrolled: null };
 
 const esc = (value) => String(value)
   .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -892,7 +892,12 @@ function lastFailureHtml(c) {
   else if (f.cls === "only-this-pr") head = "PR-caused: passed on other PRs around it";
   else if (f.event) head = "failed all reps in a run where almost everything failed";
   else head = "failed all reps";
-  const who = f.pr != null ? `<a href="${PAGE.pages.run}?build=${enc(f.build)}">#${esc(f.pr)}</a>` : (f.tier === "nightly" ? "the nightly" : "a run");
+  // The run page carries the last run_days only; an older failure links to
+  // the pull request itself rather than to a page that says "no run".
+  const onRunPage = runs().some((r) => String(r.build) === String(f.build));
+  const who = f.pr == null ? (f.tier === "nightly" ? "the nightly" : "a run")
+    : onRunPage ? `<a href="${PAGE.pages.run}?build=${enc(f.build)}">#${esc(f.pr)}</a>`
+    : `<a href="${PAGE.prUrl}/${enc(f.pr)}">#${esc(f.pr)}</a> <span class="mut">(older than this page's ${esc(brief.run_days ?? "")}-day run window)</span>`;
   const tier = f.tier === "nightly" ? " · nightly run; the presubmit has no failure on record" : "";
   return `<span class="lf"><span class="lbl">Last failure was</span> <span><b>${esc(head)}</b> · ${who} · ${esc(et(parseIso(f.at)))}${esc(tier)}</span>` +
     (f.reason ? `<span class="rsn" title="${esc(f.reason)}">${esc(f.reason)}</span>` : "") + `</span>` +
@@ -1211,9 +1216,11 @@ function renderAll() {
   if (link.hash) {
     const target = document.querySelector(link.hash);
     if (target) target.scrollIntoView();
-  } else if (page === "cases" && link.caseHash) {
+  } else if (page === "cases" && link.caseHash && ui.caseScrolled !== link.caseHash) {
+    // Once per hash: a re-render (a chip, the poll) must not pull the reader
+    // back to the row after they have scrolled away from it.
     const row = document.getElementById(`case-${link.caseHash}`);
-    if (row) row.scrollIntoView({ block: "center" });
+    if (row) { row.scrollIntoView({ block: "center" }); ui.caseScrolled = link.caseHash; }
   }
   if (page === "grid") {
     // First paint: a live window is read from its newest run, a linked

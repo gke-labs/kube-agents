@@ -756,6 +756,12 @@ class CasesAndGridPagesTest(unittest.TestCase):
         oldest = next(r for r in data["runs"] if any(t.get("name") == CRASHLOOP_TRIO[0] and t.get("reps") for t in r["tasks"]))
         next(t for t in oldest["tasks"] if t.get("name") == CRASHLOOP_TRIO[0])["reps"][0]["reason"] = "<script>alert(1)</script> required phrases absent"
         data["cases"].append({"name": "<img src=x onerror=alert(2)>", "domain": "<b>x</b>", "active": False, "nightly_active": True})
+        # A case whose only failure is older than brief.json's 14-day run
+        # window: its "last failure" cannot link a run page that has no run.
+        data["runs"].append({"build_id": "2090000000000000000", "pr": 777, "started": "2026-08-20T10:00:00+00:00",
+                             "finished": "2026-08-20T11:00:00+00:00", "result": "FAILURE", "duration_s": 3600,
+                             "tasks": [{"name": "old-failure-case", "result": "fail", "reps": [{"n": 1, "result": "fail", "reason": "check ancient: required phrases absent"}]}]})
+        data["cases"].append({"name": "old-failure-case", "domain": "cost", "active": True})
         history = history_lines(
             dict(health_doc("GREEN"), tick="2026-09-06T01:00:00+00:00", since="2026-09-06T01:00:00+00:00"),
             dict(health_doc(since="2026-09-07T14:00:00+00:00"), tick="2026-09-07T14:00:00+00:00"),
@@ -782,7 +788,7 @@ class CasesAndGridPagesTest(unittest.TestCase):
         self.assertIn('id="case-cluster-agent-crashloop-debug"', app)
         self.assertIn('<span class="st blocking">blocking</span>', app)
         self.assertIn('<span class="st demoted">demoted 09-02</span>', app)
-        self.assertIn("held out · 1 case", app)
+        self.assertIn("held out · 2 cases", app)
         self.assertIn("not in any matrix · 1 case", app)
         self.assertNotIn('id="case-retired-probe"', app, "retired cases are folded until asked for")
         self.assertIn('class="rate ', app)
@@ -841,6 +847,16 @@ class CasesAndGridPagesTest(unittest.TestCase):
                 self.assertIn("cluster-agent-crashloop-debug", app, f"{page.name}{fragment} rendered")
         cases = dom_text(self.cases_page)
         self.assertIn("&lt;img src=x onerror=alert(2)&gt;", cases, "the hostile name is on the page, escaped")
+
+    def test_an_old_last_failure_links_the_pull_request_not_a_missing_run_page(self):
+        app = dom_text(self.cases_page)
+        row = app.split('id="case-old-failure-case"', 1)[1].split("</tr>", 2)[1]
+        self.assertIn("check ancient", row)
+        self.assertNotIn("run.html?build=2090000000000000000", row)
+        self.assertIn('href="https://github.com/gke-labs/kube-agents/pull/777"', row)
+        self.assertIn("older than this page&#x27;s 14-day run window".replace("&#x27;", "'"), row)
+        # A failure inside the window still opens the run's page.
+        self.assertIn('href="run.html?build=', app)
 
     def test_a_green_run_without_cases_gets_no_grid_column(self):
         app = dom_text(self.grid_page)
