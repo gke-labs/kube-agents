@@ -241,3 +241,11 @@ rules:
       - patch
       - update
       - watch
+  - apiGroups:
+      - rbac.authorization.k8s.io
+    resourceNames:
+      - system:auth-delegator
+    resources:
+      - clusterroles
+    verbs:
+      - bind

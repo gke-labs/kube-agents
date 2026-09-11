@@ -204,9 +204,10 @@ running the headless harness behind a thin shim that bridges bus envelopes to th
 stream-json stdin/stdout. Model auth, as shipped (amended 8/31): the worker talks to
 the install's own LiteLLM, in-namespace, with no per-pod credential at all - the
 spawned pod carries no ServiceAccount and no Workload Identity. Its bus credential is
-the static worker user, injected as env, until the deployment spec's auth callout
-arms; arming it is what gives a session pod a KSA and a projected token, per the
-subagent framework's worker posture. Direct Vertex via WI
+the static worker user, injected as env. The auth callout does not reach it and arming
+the callout did not change it: a session pod carries no ServiceAccount and no projected
+token for the callout to resolve, so this closes when each session gets a principal of
+its own rather than when the callout arms. The deployment spec owns the reasoning. Direct Vertex via WI
 stays the target, and arming it is a policy change as well as an IAM one: the session
 egress fence encodes the shipped path (no 443, no metadata route), which is where a
 piecemeal flip fails loudly instead of silently widening. Cold start is 5-10s; the

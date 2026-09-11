@@ -69,11 +69,6 @@ const (
 	// provision Job's name carries a content hash, so deletion goes by label.
 	a2aComponentLabel = "kubeagents.x-k8s.io/a2a-component"
 
-	// a2aNATSClientPort is the bus client port, named here because the
-	// session-pod fence grants it and a fence and a listener that disagree
-	// about a port fail as a timeout rather than as a refusal.
-	a2aNATSClientPort = int32(4222)
-
 	// The LiteLLM ports the session fence grants, for the reason
 	// buildAgentEgressNetworkPolicy's LiteLLM rule states in full: a Pod
 	// selector matches after the ClusterIP translation, so the container port
@@ -151,6 +146,41 @@ const (
 	// annotation. The annotation is a change detector, not an identifier.
 	a2aConfigHashLength = 16
 
+	// a2aNATSClientPort is the bus's client port: what the server listens on,
+	// what the Service and the container port publish, what the ingress fence
+	// allows, what the session-pod fence grants, and what every client URL
+	// below dials. One name because those have to agree — a port changed in
+	// all but one of them is a bus nothing can reach, and each is in a
+	// different shape (a config line, an int32, an intstr, a URL) so a grep
+	// does not reliably find them all. A fence and a listener that disagree
+	// about a port fail as a timeout rather than as a refusal, which is the
+	// slowest way to find this out.
+	//
+	// Untyped on purpose: strconv.Itoa below wants an int and the container
+	// port wants an int32.
+	a2aNATSClientPort = 4222
+
+	// The other two listeners, named for the same reason: each is written in
+	// the config, the container port and the Service, and the ingress fence
+	// argues about all three by number.
+	a2aNATSMonitorPort   = 8222
+	a2aNATSWebSocketPort = 9222
+
+	// The creds Secret's keys. Each is written in at least three places — this
+	// list, the nats.conf template, and whatever workload consumes it through
+	// a secretKeyRef — and a key that disagrees between them renders
+	// `password: ""` or mounts nothing, so they are named rather than spelled
+	// out at each site.
+	a2aGatewayPasswordKey = "gateway-password" // #nosec G101 -- Secret key name, not a credential
+	a2aWorkerPasswordKey  = "worker-password"  // #nosec G101 -- Secret key name, not a credential
+	a2aSeedPasswordKey    = "seed-password"    // #nosec G101 -- Secret key name, not a credential
+	a2aWebPasswordKey     = "web-password"     // #nosec G101 -- Secret key name, not a credential
+	a2aSysPasswordKey     = "sys-password"     // #nosec G101 -- Secret key name, not a credential
+	a2aCalloutPasswordKey = "callout-password" // #nosec G101 -- Secret key name, not a credential
+
+	// a2aCredsSecretSuffix is appended to the NATS object name.
+	a2aCredsSecretSuffix = "-creds"
+
 	// a2aProvisionJobNameInfix sits between the agent's name and the digest in
 	// the provision Job's name; a2aProvisionJobNameHashLength is how much of
 	// the hex digest follows it. Eight characters is a change detector, the
@@ -162,11 +192,18 @@ const (
 
 	// a2aPostureComment travels on every rendered config and script so the
 	// posture cannot be mistaken for the product when read on the cluster.
-	a2aPostureComment = `# PLAYGROUND POSTURE (stage 1): static per-component NATS users instead of
-# the auth callout, single-node R1 JetStream (production: 3-node R3), no
-# audit exporter, no breaker, gateway sweep as the only janitor. Each has a
-# decided design in the specs (spec-nats-deployment.md); none gates letting
-# people play. Static creds are the playground, not the product.`
+	a2aPostureComment = `# PLAYGROUND POSTURE (stage 1): single-node R1 JetStream (production: 3-node
+# R3), no audit exporter, no breaker, gateway sweep as the only janitor. Each
+# has a decided design in the specs (spec-nats-deployment.md); none gates
+# letting people play.
+#
+# Authentication is NOT on that list any more. The auth callout is armed: a
+# client presents a projected Kubernetes ServiceAccount token, the callout
+# validates it against the cluster with a TokenReview, and answers with the
+# permission set the operator mapped that identity to. The users that remain
+# static below are the ones with nothing to present - a browser, a session pod
+# that carries no ServiceAccount, an operator at a port-forward, the callout
+# itself - and each says so where it is defined.`
 )
 
 func a2aNATSImage() string {
@@ -199,6 +236,30 @@ func a2aWorkerImage() string {
 
 func a2aNATSName(agent *agentv1alpha1.PlatformAgent) string    { return agent.Name + "-a2a-nats" }
 func a2aGatewayName(agent *agentv1alpha1.PlatformAgent) string { return agent.Name + "-a2a-gateway" }
+func a2aCalloutName(agent *agentv1alpha1.PlatformAgent) string { return agent.Name + "-a2a-callout" }
+
+// a2aCredsSecretName is the Secret holding the static users' passwords.
+func a2aCredsSecretName(agent *agentv1alpha1.PlatformAgent) string {
+	return a2aNATSName(agent) + a2aCredsSecretSuffix
+}
+
+// a2aNATSAddress is the bus's in-cluster host:port. a2aNATSClientURL is the
+// same thing as a client URL; both exist because the nats CLI takes the first
+// and the Go client takes the second.
+func a2aNATSAddress(agent *agentv1alpha1.PlatformAgent) string {
+	return fmt.Sprintf("%s.%s.svc:%d", a2aNATSName(agent), agent.Namespace, a2aNATSClientPort)
+}
+
+func a2aNATSClientURL(agent *agentv1alpha1.PlatformAgent) string {
+	return "nats://" + a2aNATSAddress(agent)
+}
+
+// The provision Job's pods run as their own ServiceAccount so the auth callout
+// has an identity to resolve them by. It holds no RBAC — the token exists to
+// authenticate to NATS, not to talk to the API server.
+func a2aProvisionServiceAccountName(agent *agentv1alpha1.PlatformAgent) string {
+	return agent.Name + "-a2a-provision"
+}
 
 // a2aLabels returns the common labels with part-of overridden to a2a-next and
 // the component named. withCommonLabels leaves pre-set keys alone, so these
@@ -224,7 +285,15 @@ func randomA2APassword() (string, error) {
 // a2aCredsKeys is every key the creds Secret must carry; an absent or empty
 // key would render `password: ""` into nats.conf — a user anyone can log in
 // as — so ensureA2ACredsSecret repairs the shape rather than trusting it.
-var a2aCredsKeys = []string{"gateway-password", "worker-password", "seed-password", "web-password", "sys-password"}
+// The gateway, agent and provision principals are absent on purpose: under the
+// auth callout they hold no shared secret at all, which is the point. The
+// gateway and seed keys survive so an install that predates the callout keeps a
+// valid Secret shape through the upgrade, and so the hand-applied seed tooling
+// still has a credential.
+var a2aCredsKeys = []string{
+	a2aGatewayPasswordKey, a2aWorkerPasswordKey, a2aSeedPasswordKey,
+	a2aWebPasswordKey, a2aSysPasswordKey, a2aCalloutPasswordKey,
+}
 
 // a2aProvisionedStreams is every JetStream stream the provision Job creates, and
 // the exact set seed's $JS.API grant is scoped to. KV buckets are streams named
@@ -233,12 +302,18 @@ var a2aCredsKeys = []string{"gateway-password", "worker-password", "seed-passwor
 // The seed grant in nats.conf renders from this slice. The provision script
 // does not: each stream's create line carries its own subjects, retention and
 // caps, so the script names the streams itself, in a2aProvisionScript. The two
-// are a pair — a grant that does not name a stream makes the script's create
-// for it time out on a refused API request, and a script that creates a stream
-// the grant does not name is the same bug from the other side — and what holds
-// them together is TestSeedGrantsAndProvisionScriptNameTheSameStreams, which
-// reads the script's `stream add` / `kv add` lines and checks both directions
-// against this list. Add a stream to one side and that test says so.
+// are a pair — a grant that does not name a stream makes that create time out
+// on a refused API request, and a script that creates a stream the grant does
+// not name is the same bug from the other side — and what holds them together
+// is TestSeedGrantsAndProvisionScriptNameTheSameStreams, which reads the
+// script's `stream add` / `kv add` lines and checks both directions against
+// this list. Add a stream to one side and that test says so.
+//
+// Since the callout armed, the rendered Job authenticates as `provision` rather
+// than as seed, and provisionIdentity enumerates the same objects for itself
+// rather than from this slice. So the refusal the pair describes is provision's
+// to hit now; seed keeps the scoped grant because the hand-applied seed tooling
+// still connects with it. Nothing yet binds that third spelling to this list.
 var a2aProvisionedStreams = []string{
 	"TASKS", "DIRECTORY", "TOPICS-STATE", "TOPICS-JOURNAL",
 	"KV_runtime-state", "KV_session-state", "KV_cap",
@@ -247,11 +322,13 @@ var a2aProvisionedStreams = []string{
 // a2aSeedJetStreamGrants is seed's publish allow-list for the JetStream API,
 // replacing the `$JS.API.>` wildcard this user shipped with.
 //
-// seed is trust-root — it is the identity the provision Job runs under — so this
-// is defence in depth rather than a boundary. It is worth having anyway, because
-// the seed password lives in the creds Secret for the life of the CR and
-// deliberately survives a flip back to today, so the blast radius of a leak is
-// not bounded by anything else.
+// seed was the identity the provision Job ran under, and it is still the one the
+// hand-applied seed tooling connects with — the rendered Job has moved to the
+// callout-authenticated `provision` principal — so this is defence in depth
+// rather than a boundary. It is worth having anyway, because the seed password
+// lives in the creds Secret for the life of the CR and deliberately survives a
+// flip back to today, so the blast radius of a leak is not bounded by anything
+// else.
 //
 // What the wildcard granted that provisioning never uses, and this list now
 // refuses: STREAM.RESTORE (arbitrary messages with arbitrary stored subjects),
@@ -465,7 +542,7 @@ func (r *PlatformAgentReconciler) a2aReader() client.Reader {
 // gateway image may have cached in a still-running pod. The one thing it
 // changes on an existing Secret is a missing or empty key, which it fills.
 func (r *PlatformAgentReconciler) ensureA2ACredsSecret(ctx context.Context, agent *agentv1alpha1.PlatformAgent) (*corev1.Secret, error) {
-	name := types.NamespacedName{Name: a2aNATSName(agent) + "-creds", Namespace: agent.Namespace}
+	name := types.NamespacedName{Name: a2aCredsSecretName(agent), Namespace: agent.Namespace}
 	existing := &corev1.Secret{}
 	err := r.a2aReader().Get(ctx, name, existing)
 	if err == nil {
@@ -525,10 +602,15 @@ func (r *PlatformAgentReconciler) ensureA2ACredsSecret(ctx context.Context, agen
 // _INBOX prefixes so the reply path cannot leak what the subject grants
 // withheld. Seed's JetStream API grant is scoped to the streams it provisions
 // and the worker's to the streams it uses, both by name and by verb
-// (a2aSeedJetStreamGrants, a2aWorkerJetStreamGrants). Gateway alone still
-// holds $JS.API.>, which is playground posture; narrowing it is the same
-// change again with its own table of what it emits, and it wants its own live
-// proof because it owns the relay durable and the session registry.
+// (a2aSeedJetStreamGrants, a2aWorkerJetStreamGrants), and provision has moved
+// to the callout and holds the enumerated subjects too (its identity entry
+// spells them). Gateway alone still holds a bare $JS.API.>, which is playground
+// posture; narrowing it is the same change again with its own table of what it
+// emits, and it wants its own live proof because it owns the relay durable and
+// the session registry. It is also the one identity that cannot narrow on this
+// branch's terms: it has no client presenting a token yet.
+//
+// This comment is only true of the identity table below it: read that, not this.
 //
 // pw is a parameter rather than a closure over the creds Secret because two
 // callers walk this template: buildA2ANATSConfigSecret with the real lookup,
@@ -545,12 +627,29 @@ func (r *PlatformAgentReconciler) ensureA2ACredsSecret(ctx context.Context, agen
 // it catches a digest of a password, or of the real conf, reaching a rendered
 // name, label or annotation, and it cannot see a credential folded into the
 // hashed bytes as a third string.
-func renderA2ANATSConf(agent *agentv1alpha1.PlatformAgent, pw func(key string) string) string {
+//
+// keys carries the callout's two PUBLIC keys, which is why they travel with
+// pw's placeholders rather than being one of them: an issuer public key is not
+// a credential, and the rollout digest has to cover it. If it did not, rotating
+// the callout keypair would update the config Secret without rolling the
+// StatefulSet, leaving the server trusting an issuer nothing signs with any
+// more — every answer the callout gives refused, on a bus that looks healthy.
+func renderA2ANATSConf(agent *agentv1alpha1.PlatformAgent, pw func(key string) string, keys *a2aCalloutKeys) string {
 	return a2aPostureComment + `
 
 server_name: ` + a2aNATSName(agent) + `
-port: 4222
-http: 8222
+port: ` + strconv.Itoa(a2aNATSClientPort) + `
+http: ` + strconv.Itoa(a2aNATSMonitorPort) + `
+
+# A ServiceAccount token travels inside the client's CONNECT frame, and the
+# default max_control_line of 4096 bounds that whole frame - measured, the
+# usable room for the token itself is around 3920 bytes once the rest of the
+# CONNECT JSON is accounted for. A plain projected token fits with room to
+# spare; one bound to several audiences, from a client with a long name, does
+# not. The failure is not graceful: the server closes the connection with
+# "Maximum Control Line Exceeded" before authentication happens at all, so it
+# reads as the bus refusing a workload rather than as a size limit.
+max_control_line: 65536
 
 # Websocket listener for the web user (the read-only web rail reads the bus
 # over this).
@@ -584,7 +683,7 @@ http: 8222
 # anything that is not a browser simply omits it. The boundary is the web
 # user's grant list below.
 websocket {
-  port: 9222
+  port: ` + strconv.Itoa(a2aNATSWebSocketPort) + `
   no_tls: true
   allowed_origins: ["http://localhost:5173", "http://127.0.0.1:5173"]
 }
@@ -595,221 +694,105 @@ jetstream {
   # inside this.
   max_file_store: 34359738368
 }
-
 accounts {
-  APP {
-    jetstream: enabled
+  # AUTH: the auth callout service and nothing else.
+  #
+  # A dedicated account, and that is a boundary rather than tidiness. The
+  # server publishes each authorization request into THIS account and takes
+  # the first answer that comes back on the reply inbox — and it does not
+  # check that the answer's outer envelope was signed by the configured
+  # issuer (measured; the inner user JWT's signature IS checked). So anything
+  # able to publish into this account's $SYS._INBOX.> and win the race can
+  # answer an authorization request. It could not forge a grant without the
+  # issuer seed, but it could refuse one. Nothing else belongs in here.
+  AUTH {
     users [
       {
-        # gateway: task requester, chat-session supervisor, session-registry
-        # owner. Production scopes supervisor publish to sessions the gateway
-        # spawned; statically that collapses to the task-events wildcard.
-        user: gateway
-        password: "` + pw("gateway-password") + `"
+        # The callout cannot authenticate through itself, so it is exempt via
+        # auth_users below and carries a password. This permission pair is
+        # the entire surface it needs: read the requests, answer them.
+        user: callout
+        password: "` + pw(a2aCalloutPasswordKey) + `"
         permissions {
-          # $JS.ACK / $JS.FC.> are the delivery path's reply subjects: an
-          # explicit ack is a publish to $JS.ACK.<stream>.<consumer>..., and
-          # push flow control answers on $JS.FC.>. Without them a consumer
-          # redelivers forever while TCP health stays green.
-          #
-          # The ack grant is scoped to the streams this user actually
-          # consumes with explicit ack (the gateway-relay durable on TASKS;
-          # everything else it reads is ordered/ack-none). An ack subject
-          # names a stream and a CONSUMER, never the caller, so unscoped
-          # $JS.ACK.> would let this user +TERM another principal's
-          # in-flight delivery on ANY stream — the escape deleted from the
-          # web user below. What scoping cannot close: within a granted
-          # stream, consumer names are the caller's choice (NATS wildcards
-          # match whole tokens, so per-name scoping is not expressible), so
-          # gateway and worker can still address each other's TASKS
-          # deliveries. The auth callout closes that residue when it arms.
-          publish { allow = [
-            "a2a.tasks.*.*.in",
-            "a2a.tasks.*.*.events",
-            "$KV.session-state.>",
-            "$JS.API.>",
-            "$JS.ACK.TASKS.>",
-            "$JS.FC.>",
-            "_INBOX.gateway.>"
-          ] }
-          subscribe { allow = [
-            "a2a.tasks.*.*.events",
-            "a2a.agents.>",
-            "agents.hb.>",
-            "$KV.session-state.>",
-            "_INBOX.gateway.>"
-          ] }
-        }
-      }
-      {
-        # worker: executor for any addressee (production: per-identity users
-        # minted by the callout; the shared static user is the playground).
-        user: worker
-        password: "` + pw("worker-password") + `"
-        permissions {
-          # Topic grants name the provisioned registry exactly (payload spec:
-          # topics are provisioned-only). A wildcard here would let a publish
-          # to an unprovisioned topic vanish into core NATS; the exact list
-          # turns that into a connect-time refusal instead of silent loss.
-          #
-          # Ack scope: TASKS only — the bridge sidecar's durable task
-          # consumer rides this user; the worker adapter and every topic or
-          # state read are ordered/ack-none. See the gateway's comment for
-          # why unscoped $JS.ACK.> is a cross-principal +TERM and what
-          # scoping still cannot close inside a shared stream.
-          publish { allow = [
-            "a2a.tasks.*.*.events",
-            "a2a.topics.agent.platform.upgrade-readiness",
-            "a2a.topics.shared.blueprint",
-            "a2a.topics.shared.annotations",
-            # No a2a.agents.> publish. The directory is the identity plane:
-            # a2a.agents.{profile} is last-value, so one publish REPLACES a
-            # profile's card, and an agent-closed tombstone retires it. The
-            # payload spec says cards are "published by the profile's owner
-            # (the operator once profiles are CRs), not by workers", and
-            # nothing in the tree publishes one today — this grant had no
-            # caller and let the least-trusted principal in the deployment
-            # forge any profile's card. The gateway keeps SUBSCRIBE on the
-            # same subjects, which is the read discovery actually needs.
-            #
-            # Closing forgery is not closing reach: the JetStream API grant
-            # below is what decides whether the worker can PURGE or DELETE
-            # the directory instead, so it is scoped by stream and by verb.
-            # a2aWorkerJetStreamGrants is the list and the argument for each
-            # entry; nothing in it names DIRECTORY.
-            "agents.hb.>",
-            "$KV.runtime-state.>",
-` + a2aNATSConfGrantLines(a2aWorkerJetStreamGrants()) + `
-            "$JS.ACK.TASKS.>",
-            "$JS.FC.>",
-            "_INBOX.worker.>"
-          ] }
-          subscribe { allow = [
-            "a2a.tasks.>",
-            "a2a.topics.>",
-            "$KV.runtime-state.>",
-            "_INBOX.worker.>"
-          ] }
-        }
-      }
-      {
-        # seed: provisions the streams and buckets (the $JS.API grant is what
-        # the provision Job runs under) and writes the starter topic entries.
-        # Nothing on the task plane — a seed that can publish tasks is a seed
-        # that can impersonate the fabric.
-        user: seed
-        password: "` + pw("seed-password") + `"
-        permissions {
-          # No ack grant at all: seed creates no consumers. Provisioning is
-          # $JS.API requests and the starter topics are publishes — nothing
-          # here ever acks, so an ack grant would be pure unused capability
-          # to +TERM other principals' deliveries (the same deletion the web
-          # user got).
-          #
-          # Seed also reads no topics. "a2a topics read" is a stream API call
-          # (GetLastMsgForSubject, so $JS.API.DIRECT.GET.<stream>.<subject> on
-          # these streams, or STREAM.MSG.GET as the fallback) and the scoped
-          # grant below refuses both. Nothing runs it as seed: the provision
-          # script does writes and info checks only, and the a2a CLI runs in
-          # the agent pod as worker.
-          publish { allow = [
-            "a2a.topics.agent.platform.upgrade-readiness",
-            "a2a.topics.shared.blueprint",
-            "a2a.topics.shared.annotations",
-` + a2aNATSConfGrantLines(a2aSeedJetStreamGrants()) + `
-            "_INBOX.seed.>"
-          ] }
-          subscribe { allow = [
-            "a2a.topics.>",
-            "_INBOX.seed.>"
-          ] }
-        }
-      }
-      {
-        # web: the read surface, the one user meant to face a browser, and
-        # the only user whose credential is published to one by design.
-        #
-        # "Read-only" is not expressible as a subject list, and the first
-        # version of this user proved it the hard way. Subject permissions
-        # cannot see a request BODY, and JetStream puts the reach there: a
-        # consumer's target stream, its durability, and its delivery subject
-        # are all fields, not subjects. Every grant below is therefore
-        # enumerated per stream rather than wildcarded, because the wildcard
-        # is what turned "may read a2a.>" into three findings adversarial
-        # review reproduced live:
-        #
-        #   $JS.API.CONSUMER.CREATE.>  — a push consumer on KV_session-state
-        #     with deliver_subject set to web's OWN inbox read the session
-        #     registry out of a bucket web has no $KV grant for, on either
-        #     side. Subscribe permissions are not consulted when a consumer
-        #     is created; the deliver subject is.
-        #   $JS.ACK.>                  — an ack subject names a stream and a
-        #     CONSUMER, not the caller, so web could publish +TERM onto the
-        #     gateway's in-flight delivery and destroy it. The web rail uses
-        #     ack-none ordered consumers, so the grant is simply gone.
-        #   CONSUMER.MSG.NEXT.*.*      — web could pull messages off the
-        #     gateway's own durable and retune its config through
-        #     CONSUMER.CREATE, which is create-OR-UPDATE by name.
-        #
-        # The list is now exactly what the web rail needs, confirmed against
-        # its live conformance suite: the four a2a message streams, no KV
-        # buckets, no enumeration (NAMES/LIST), no ACK, no FC, no DELETE.
-        #
-        # Residues that remain, because a static permission map cannot hold
-        # them, both closed by the auth callout when it arms:
-        #  - Durability is a body field. Withholding the legacy
-        #    DURABLE.CREATE subject does NOT prevent a durable; the modern
-        #    CREATE carries durable_name. max_consumers on each stream bounds
-        #    what that can cost.
-        #  - Within these four streams, consumer names are the caller's
-        #    choice, so web can still address another principal's consumer.
-        #    Dropping ACK removed the destructive half; what is left is
-        #    stealing a delivery of data web may already read.
-        user: web
-        password: "` + pw("web-password") + `"
-        permissions {
-          publish { allow = [
-            "$JS.API.INFO",
-            "$JS.API.STREAM.INFO.TASKS",
-            "$JS.API.STREAM.INFO.DIRECTORY",
-            "$JS.API.STREAM.INFO.TOPICS-STATE",
-            "$JS.API.STREAM.INFO.TOPICS-JOURNAL",
-            "$JS.API.CONSUMER.CREATE.TASKS.>",
-            "$JS.API.CONSUMER.CREATE.DIRECTORY.>",
-            "$JS.API.CONSUMER.CREATE.TOPICS-STATE.>",
-            "$JS.API.CONSUMER.CREATE.TOPICS-JOURNAL.>",
-            "$JS.API.CONSUMER.INFO.TASKS.*",
-            "$JS.API.CONSUMER.INFO.DIRECTORY.*",
-            "$JS.API.CONSUMER.INFO.TOPICS-STATE.*",
-            "$JS.API.CONSUMER.INFO.TOPICS-JOURNAL.*",
-            "$JS.API.CONSUMER.MSG.NEXT.TASKS.*",
-            "$JS.API.CONSUMER.MSG.NEXT.DIRECTORY.*",
-            "$JS.API.CONSUMER.MSG.NEXT.TOPICS-STATE.*",
-            "$JS.API.CONSUMER.MSG.NEXT.TOPICS-JOURNAL.*",
-            "_INBOX.web.>"
-          ] }
-          subscribe { allow = [
-            "a2a.>",
-            "_INBOX.web.>"
-          ] }
+          subscribe { allow = [ "$SYS.REQ.USER.AUTH" ] }
+          publish { allow = [ "$SYS._INBOX.>" ] }
         }
       }
     ]
   }
+  APP {
+    jetstream: enabled
+    users [
+` + renderA2AStaticUsers(agent, pw, a2aAccountApp) + `    ]
+  }
   # $SYS: human operators and monitoring only; no agent authenticates here.
   SYS {
-    users [ { user: sys, password: "` + pw("sys-password") + `" } ]
+    users [
+` + renderA2AStaticUsers(agent, pw, a2aAccountSys) + `    ]
   }
 }
 system_account: SYS
+
+# The auth callout: who a connection is, decided against the cluster that
+# issued its identity rather than against a password this file rendered.
+#
+# What changes for a client: it presents a projected ServiceAccount token
+# instead of a password, the callout validates that token with a TokenReview
+# against the local API server, and the grants it gets back are the ones the
+# operator rendered for that ServiceAccount. What does NOT change is where
+# enforcement happens — the permission set still arrives before the connection
+# is usable, and the server still refuses on it without consulting any
+# application code.
+authorization {
+  # Two seconds, and this is a ceiling rather than a preference.
+  #
+  # The server starts a first-ping timer on a connection that has not yet
+  # authenticated, at roughly two seconds. If the callout has not answered by
+  # then the client receives a PING where the Go client library requires a
+  # PONG, and it aborts the connect reporting "expected 'PONG', got 'PING'" —
+  # which names nothing about authorization and sends whoever is debugging it
+  # to the network layer. Measured: at timeout 2 the failure is a clean
+  # Authorization Violation at a predictable deadline; at 3 or above it is
+  # that message instead. A merely SLOW callout hits it too, so the real
+  # budget for a TokenReview round trip is under two seconds whatever this
+  # number says.
+  timeout: 2
+
+  auth_callout {
+    # Public halves only. The seeds live in the callout's own Secret, mounted
+    # by the callout Deployment and nothing else. The issuer signs the user
+    # JWTs that carry the permissions this server enforces, so its holder can
+    # mint a user with any grants at all — see the callout-keys Secret for the
+    # custody note.
+    issuer: ` + keys.IssuerPublic + `
+    account: AUTH
+
+    # The request carries the client's raw ServiceAccount token, so it is
+    # encrypted in flight to the callout. Note the server does not require the
+    # RESPONSE to be encrypted even with this set, so response confidentiality
+    # is the callout's own discipline rather than something enforced here.
+    xkey: ` + keys.XKeyPublic + `
+
+    # Exempt from the callout: authenticated from this file, by username.
+    #
+    # This is a bypass and not a fallback — a listed user with a wrong
+    # password is refused statically and never reaches the callout at all.
+    # Every name here is a principal that cannot present a ServiceAccount
+    # token: the callout itself (it cannot authenticate through itself), the
+    # session workers (a session pod carries no Kubernetes identity yet), the
+    # browser-facing read user (a browser never can), and the operator's own
+    # $SYS login.
+    auth_users: [ ` + renderA2AAuthUsers(agent) + ` ]
+  }
+}
 `
 }
 
 // buildA2ANATSConfigSecret renders nats.conf with the real credentials from
 // the creds Secret. This Secret's Data is the one place the passwords are
 // meant to appear; a2aConfigRolloutHash covers the rest of the render.
-func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret) *corev1.Secret {
-	conf := renderA2ANATSConf(agent, func(key string) string { return string(creds.Data[key]) })
+func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys) *corev1.Secret {
+	conf := renderA2ANATSConf(agent, func(key string) string { return string(creds.Data[key]) }, keys)
 
 	return &corev1.Secret{
 		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
@@ -857,10 +840,10 @@ func buildA2ANATSConfigSecret(agent *agentv1alpha1.PlatformAgent, creds *corev1.
 // one until something else restarts it. That gap predates this function — the
 // conf digest rolled only the StatefulSet too — and closing it means deciding
 // what a rotation should restart, which is not this function's call.
-func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret) string {
+func a2aConfigRolloutHash(agent *agentv1alpha1.PlatformAgent, creds *corev1.Secret, keys *a2aCalloutKeys) string {
 	redacted := renderA2ANATSConf(agent, func(key string) string {
 		return fmt.Sprintf(a2aConfigHashPlaceholder, key)
-	})
+	}, keys)
 	sum := sha256.Sum256([]byte(redacted + a2aConfigHashRotationSeparator + creds.ResourceVersion))
 	return hex.EncodeToString(sum[:])[:a2aConfigHashLength]
 }
@@ -911,9 +894,9 @@ func buildA2ANATSStatefulSet(agent *agentv1alpha1.PlatformAgent, confHash string
 						Image: a2aNATSImage(),
 						Args:  []string{"-c", "/etc/nats/nats.conf"},
 						Ports: []corev1.ContainerPort{
-							{Name: "client", ContainerPort: 4222},
-							{Name: "monitor", ContainerPort: 8222},
-							{Name: "websocket", ContainerPort: 9222},
+							{Name: "client", ContainerPort: a2aNATSClientPort},
+							{Name: "monitor", ContainerPort: a2aNATSMonitorPort},
+							{Name: "websocket", ContainerPort: a2aNATSWebSocketPort},
 						},
 						VolumeMounts: []corev1.VolumeMount{
 							{Name: "config", MountPath: "/etc/nats", ReadOnly: true},
@@ -960,12 +943,12 @@ func buildA2ANATSService(agent *agentv1alpha1.PlatformAgent) *corev1.Service {
 		Spec: corev1.ServiceSpec{
 			Selector: map[string]string{"app": name},
 			Ports: []corev1.ServicePort{
-				{Name: "client", Port: 4222},
-				{Name: "monitor", Port: 8222},
+				{Name: "client", Port: a2aNATSClientPort},
+				{Name: "monitor", Port: a2aNATSMonitorPort},
 				// The web user's transport. ClusterIP on purpose: the demo
 				// reaches it with kubectl port-forward, and plain ws must not
 				// be reachable any other way.
-				{Name: "websocket", Port: 9222},
+				{Name: "websocket", Port: a2aNATSWebSocketPort},
 			},
 		},
 	}
@@ -1110,9 +1093,38 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress},
 			Ingress: []networkingv1.NetworkPolicyIngressRule{{
 				Ports: []networkingv1.NetworkPolicyPort{
-					{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(4222))},
+					{Protocol: &tcp, Port: ptr.To(intstr.FromInt32(a2aNATSClientPort))},
 				},
 				From: []networkingv1.NetworkPolicyPeer{
+					// The auth callout, FIRST, and the ordering is the
+					// point rather than tidiness.
+					//
+					// The callout is itself a bus client: it subscribes
+					// to $SYS.REQ.USER.AUTH from its own AUTH account -
+					// the subject name is not the system account - and
+					// answers every connection attempt. So it sits
+					// ON the connection path, and a fence that does not
+					// name it refuses the one peer every new connection
+					// depends on. Nothing looks broken when that
+					// happens — established connections are already
+					// authorized and keep working, so the bus stays up,
+					// serves traffic, and silently accepts no new
+					// client until something tries to connect and hangs.
+					// That is why this peer and the callout itself have
+					// to land in one change: arming the callout against
+					// a fence that predates it takes the fabric dark to
+					// new work.
+					//
+					// The same rule is owed to the peers that arm later.
+					// The audit exporter, the janitor and the metrics
+					// scrape each add one when they exist. And the NATS
+					// pods join on their route port the moment this
+					// leaves the single-node dev shape: a 3-node cluster's
+					// servers dial each other, and a fence without the
+					// route peer means the cluster never forms.
+					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+						"app": a2aCalloutName(agent),
+					}}},
 					// The agent pod — a bridge sidecar declared on
 					// spec.deployment.sidecars rides this selector too.
 					{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
@@ -1151,13 +1163,28 @@ func buildA2ANATSNetworkPolicy(agent *agentv1alpha1.PlatformAgent) *networkingv1
 // idempotently with the nats CLI. Topics are provisioned-only (payload spec):
 // which topics exist is exactly the subject lists rendered here.
 func a2aProvisionScript(agent *agentv1alpha1.PlatformAgent) string {
-	server := fmt.Sprintf("nats://seed:${SEED_PASSWORD}@%s.%s.svc:4222", a2aNATSName(agent), agent.Namespace)
+	server := a2aNATSAddress(agent)
 	return a2aPostureComment + `
 set -euo pipefail
+# This Job authenticates to the bus with its own projected ServiceAccount
+# token, which the auth callout resolves against the cluster. It holds no
+# password: there is no "provision" entry in nats.conf at all.
+#
+# The token goes in the PASSWORD field rather than a --token flag. NOT for
+# secrecy: --password puts it on argv exactly as --token would, so it is in
+# /proc/<pid>/cmdline for the life of each call either way, and the pod is the
+# boundary that matters. The reason is that the username half then carries the
+# ServiceAccount this Job claims to be - a claim the callout does not trust and
+# does not need to, since it validates the token and derives the identity from
+# the TokenReview. It travels because it costs nothing and makes a connection
+# legible in a server-side log. The callout accepts the token in either field.
+BUS_TOKEN="$(cat ` + a2aBusTokenPath + `/` + a2aBusTokenFile + `)"
+
 # --inbox-prefix: every stream/kv call here is a $JS.API request whose reply
-# lands on an inbox, and seed may only subscribe under _INBOX.seed.> — the
-# CLI's default _INBOX.<nuid> would be refused and every call would time out.
-NATS="nats --server ` + server + ` --inbox-prefix=_INBOX.seed"
+# lands on an inbox, and this principal may only subscribe under
+# _INBOX.provision.> — the CLI's default _INBOX.<nuid> would be refused and
+# every call would time out.
+NATS="nats --server ` + server + ` --user ${BUS_USER} --password ${BUS_TOKEN} --inbox-prefix=_INBOX.provision"
 
 # max_consumers caps each stream at 64. Consumer durability is a request-body
 # field, so no permission list can hold web to ephemeral ones (see the web user
@@ -1275,7 +1302,13 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: a2aLabels(agent, "provision")},
 				Spec: corev1.PodSpec{
-					RestartPolicy:                corev1.RestartPolicyOnFailure,
+					RestartPolicy: corev1.RestartPolicyOnFailure,
+					// Its own ServiceAccount, holding no RBAC at all: the
+					// token exists to authenticate to the bus, not to talk to
+					// the API server. Automount stays off and the bus token is
+					// an explicit projected volume, so the only credential in
+					// this pod is the audience-bound one it actually needs.
+					ServiceAccountName:           a2aProvisionServiceAccountName(agent),
 					AutomountServiceAccountToken: ptr.To(false),
 					SecurityContext: &corev1.PodSecurityContext{
 						SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
@@ -1285,7 +1318,7 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 					// The nats CLI wants a writable HOME for its context
 					// directory even when every call passes --server, so the
 					// hardened read-only root needs somewhere to point it.
-					Volumes: []corev1.Volume{{
+					Volumes: []corev1.Volume{a2aBusTokenVolumeSource(), {
 						Name:         "tmp",
 						VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 					}},
@@ -1309,19 +1342,25 @@ func buildA2AProvisionJob(agent *agentv1alpha1.PlatformAgent) *batchv1.Job {
 						// This container wants a writable one rather than
 						// merely a traversable one, because it is also the nats
 						// CLI's HOME.
-						WorkingDir:   a2aProvisionWritablePath,
-						VolumeMounts: []corev1.VolumeMount{{Name: "tmp", MountPath: a2aProvisionWritablePath}},
+						WorkingDir: a2aProvisionWritablePath,
 						Env: []corev1.EnvVar{{
 							Name: "HOME", Value: a2aProvisionWritablePath,
 						}, {
 							Name: "XDG_CONFIG_HOME", Value: a2aProvisionWritablePath,
 						}, {
-							Name: "SEED_PASSWORD",
-							ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-								LocalObjectReference: corev1.LocalObjectReference{Name: a2aNATSName(agent) + "-creds"},
-								Key:                  "seed-password",
-							}},
+							// The ServiceAccount this Job claims to be.
+							// Unverified by construction: the callout
+							// derives the real identity from the TokenReview
+							// and never reads this. It is here so the
+							// connection is legible in a server-side log,
+							// not as any part of the decision.
+							Name:  "BUS_USER",
+							Value: a2aServiceAccountName(agent.Namespace, a2aProvisionServiceAccountName(agent)),
 						}},
+						VolumeMounts: []corev1.VolumeMount{
+							{Name: "tmp", MountPath: a2aProvisionWritablePath},
+							a2aBusTokenVolumeMount(),
+						},
 					}},
 				},
 			},
@@ -1540,11 +1579,11 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 						// write.
 						WorkingDir: "/",
 						Env: []corev1.EnvVar{
-							{Name: "NATS_URL", Value: fmt.Sprintf("nats://%s.%s.svc:4222", a2aNATSName(agent), agent.Namespace)},
+							{Name: "NATS_URL", Value: a2aNATSClientURL(agent)},
 							{Name: "NATS_USER", Value: "gateway"},
 							{Name: "NATS_PASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-								LocalObjectReference: corev1.LocalObjectReference{Name: a2aNATSName(agent) + "-creds"},
-								Key:                  "gateway-password",
+								LocalObjectReference: corev1.LocalObjectReference{Name: a2aCredsSecretName(agent)},
+								Key:                  a2aGatewayPasswordKey,
 							}}},
 							// Created by hand at install time (the bot token is
 							// operator input, never repo content); the
@@ -1634,6 +1673,11 @@ type a2aProvisionState struct {
 	done    bool
 	failed  bool
 	message string
+
+	// AuthMapVersion is the identity-map version this reconcile rendered.
+	// BusCredentialsReady is the callout confirming it is serving this
+	// value, so it has to travel out of the render to the status write.
+	AuthMapVersion string
 }
 
 // a2aSessionDNSClusterIPs is the resolved cluster DNS VIP list for the session
@@ -1693,7 +1737,31 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		return state, fmt.Errorf("failed to ensure A2A NATS creds: %w", err)
 	}
 
-	config := buildA2ANATSConfigSecret(agent, creds)
+	// Before the config, because the config carries the public halves. A
+	// nats.conf rendered without them would name an issuer nothing holds and
+	// refuse every callout-authenticated connection.
+	calloutKeys, err := r.ensureA2ACalloutKeysSecret(ctx, agent)
+	if err != nil {
+		return state, fmt.Errorf("failed to ensure A2A callout keys: %w", err)
+	}
+
+	// The identity map before the server that will be authorizing against
+	// it: the callout refuses connections until it is serving a map, so
+	// rendering the map first shortens the window in which a restarting bus
+	// has a callout with nothing to say.
+	authMap, authMapVersion, err := buildA2AAuthMapConfigMap(agent)
+	if err != nil {
+		return state, fmt.Errorf("failed to render the A2A identity map: %w", err)
+	}
+	if err := ctrl.SetControllerReference(agent, authMap, r.Scheme); err != nil {
+		return state, err
+	}
+	if err := r.applyManaged(ctx, agent, authMap); err != nil {
+		return state, fmt.Errorf("failed to apply the A2A identity map: %w", err)
+	}
+	state.AuthMapVersion = authMapVersion
+
+	config := buildA2ANATSConfigSecret(agent, creds, calloutKeys)
 	if err := ctrl.SetControllerReference(agent, config, r.Scheme); err != nil {
 		return state, err
 	}
@@ -1701,7 +1769,7 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 		return state, fmt.Errorf("failed to apply A2A NATS config: %w", err)
 	}
 
-	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds))
+	sts := buildA2ANATSStatefulSet(agent, a2aConfigRolloutHash(agent, creds, calloutKeys))
 	if err := ctrl.SetControllerReference(agent, sts, r.Scheme); err != nil {
 		return state, err
 	}
@@ -1715,6 +1783,15 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	}
 	if err := r.applyManaged(ctx, agent, svc); err != nil {
 		return state, fmt.Errorf("failed to apply A2A NATS Service: %w", err)
+	}
+
+	// The auth callout, before the fence and before anything that dials the
+	// bus. nats.conf now names it as the authority for every non-exempt
+	// connection, so a bus standing up without it accepts only the static
+	// users and refuses everything else — and refuses it as an Authorization
+	// Violation, which reads exactly like a credential problem.
+	if err := r.reconcileA2ACallout(ctx, agent); err != nil {
+		return state, err
 	}
 
 	// Both fences ride reconcileA2ANetworkFences so they appear and disappear
@@ -1795,69 +1872,39 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	return state, nil
 }
 
-// cleanupA2A returns the dark stack to dark when the mode is not next. The
-// creds Secret stays (inert data; re-enabling must not re-roll credentials)
-// and so does the StatefulSet's PVC (JetStream's file store is the audit
-// substrate — flipping a mode is not license to destroy evidence).
-//
-// Session pods — spawned by the gateway once the worker PR arms spawning —
-// are the gateway's, not the operator's: every spawned pod carries an
-// ownerReference to the gateway Deployment (A2A_OWNER_DEPLOYMENT above), so
-// deleting the gateway here hands any stragglers to Kubernetes GC, with no
-// operator exception to the IsControlledBy refusal below.
-func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
-	// The early exit. This path runs on every reconcile of every install that
-	// is not `next` — forever, on installs that have never rendered an A2A
-	// object — so proving "nothing to do" one object at a time is a standing
-	// cost for a no-op. Three reads answer it instead of nine:
-	//
-	//   - the StatefulSet, which is deleted LAST below, so its absence means an
-	//     earlier pass ran to completion rather than dying partway,
-	//   - the gateway Deployment, which the render creates last and this
-	//     function deletes first, so it catches a pass that failed immediately,
-	//   - the config Secret, which is the only object the render creates BEFORE
-	//     the StatefulSet, so it is what a render that died in between leaves
-	//     behind. Without it the exit would step over that Secret and leave an
-	//     A2A object on a `today` install, which is the darkness property.
-	//
-	// The first two are Owns kinds and free. The Secret read is the only
-	// uncached one, and it happens only when the free two both miss.
-	sentinels := []struct {
-		obj    client.Object
-		reader client.Reader
-	}{
-		{&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
-		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent) + "-config", Namespace: agent.Namespace}}, r.a2aReader()},
-	}
-	anyPresent := false
-	for _, s := range sentinels {
-		err := s.reader.Get(ctx, client.ObjectKeyFromObject(s.obj), s.obj)
-		if err == nil {
-			anyPresent = true
-			break
-		}
-		if client.IgnoreNotFound(err) != nil {
-			return err
-		}
-	}
-	if !anyPresent {
-		return nil
-	}
+// a2aTeardownEntry is one namespaced object cleanupA2A removes, with the reader
+// that can see it: the Owns() kinds come from the cache, the rest go through
+// a2aReader so no cluster-wide informer starts for a kind nothing watches.
+type a2aTeardownEntry struct {
+	obj    client.Object
+	reader client.Reader
+}
 
-	// Deployment/StatefulSet/Service/ServiceAccount reads come from the cache —
-	// those kinds are already watched (Owns, see SetupWithManager) so the reads
-	// are free. Secret, Role/RoleBinding, ResourceQuota and Job reads go through
-	// a2aReader: a cached read would start a cluster-wide informer for a kind
-	// this controller otherwise never watches, on every install.
-	//
-	// Those uncached reads are the standing cost of this path, which runs on
-	// every reconcile of every today install — see the note on the sweep below.
-	named := []struct {
-		obj    client.Object
-		reader client.Reader
-	}{
+// a2aNamespacedTeardown is the ordered list of namespaced objects cleanupA2A
+// deletes by name. The order is load-bearing: see the sentinel argument in
+// cleanupA2A below.
+//
+// A function rather than a literal inside cleanupA2A so its length is readable
+// from a test. That is what lets the cost test assert the early exit is cheaper
+// than the walk it skips, instead of restating how long the walk is and going
+// stale the next time the render grows a step.
+func (r *PlatformAgentReconciler) a2aNamespacedTeardown(agent *agentv1alpha1.PlatformAgent) []a2aTeardownEntry {
+	return []a2aTeardownEntry{
 		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
+		// The auth callout, before the bus it authorizes for. Its Deployment
+		// goes first so it stops answering while there is still a server to
+		// answer for; the keys Secret goes with it rather than surviving like
+		// the per-user creds, because a flip back to today and forward again
+		// re-renders nats.conf anyway, and a stale issuer is the one thing
+		// that would make every callout answer be refused.
+		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		{&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{Name: a2aProvisionServiceAccountName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		{&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: a2aAuthMapName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&rbacv1.RoleBinding{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		{&rbacv1.Role{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
 		// ServiceAccount is an Owns() kind, so this read is cached and free.
@@ -1887,7 +1934,77 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		// end", which is only true while nothing is deleted after it.
 		{&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
 	}
-	for _, entry := range named {
+}
+
+// cleanupA2A returns the dark stack to dark when the mode is not next. The
+// creds Secret stays (inert data; re-enabling must not re-roll credentials)
+// and so does the StatefulSet's PVC (JetStream's file store is the audit
+// substrate — flipping a mode is not license to destroy evidence).
+//
+// Session pods — spawned by the gateway once the worker PR arms spawning —
+// are the gateway's, not the operator's: every spawned pod carries an
+// ownerReference to the gateway Deployment (A2A_OWNER_DEPLOYMENT above), so
+// deleting the gateway here hands any stragglers to Kubernetes GC, with no
+// operator exception to the IsControlledBy refusal below.
+func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	// The early exit. This path runs on every reconcile of every install that
+	// is not `next` — forever, on installs that have never rendered an A2A
+	// object — so proving "nothing to do" one object at a time is a standing
+	// cost for a no-op. Four reads answer it instead of nineteen:
+	//
+	//   - the StatefulSet, which is deleted LAST below, so its absence means an
+	//     earlier pass ran to completion rather than dying partway,
+	//   - the gateway Deployment, which the render creates last and this
+	//     function deletes first, so it catches a pass that failed immediately,
+	//   - the callout keys Secret, which is the FIRST deletable object
+	//     reconcileA2A creates — the per-user creds Secret is created before it
+	//     and deliberately survives — so a render that died anywhere leaves this
+	//     one behind. It covers the identity-map ConfigMap created right after
+	//     it for the same reason,
+	//   - the config Secret, which held that role before the callout existed.
+	//     Kept for the install whose partial render predates the keys Secret:
+	//     an operator upgraded across this change and then flipped to `today`
+	//     would otherwise step over a config Secret no later object accompanies.
+	//
+	// Without the third and fourth the exit would step over those objects and
+	// leave an A2A object on a `today` install, which is the darkness property.
+	// The first two are Owns kinds and free; the two Secret reads are uncached
+	// and happen only when the free two both miss.
+	//
+	// Adding an object to reconcileA2A ahead of the keys Secret means adding it
+	// here. TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere walks every
+	// prefix of the render and is what makes forgetting it red rather than
+	// silent: without the keys Secret below, its writes 3 and 4 fail.
+	sentinels := []a2aTeardownEntry{
+		{&appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: a2aGatewayName(agent), Namespace: agent.Namespace}}, r.Client},
+		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutKeysName(agent), Namespace: agent.Namespace}}, r.a2aReader()},
+		{&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: a2aNATSName(agent) + "-config", Namespace: agent.Namespace}}, r.a2aReader()},
+	}
+	anyPresent := false
+	for _, s := range sentinels {
+		err := s.reader.Get(ctx, client.ObjectKeyFromObject(s.obj), s.obj)
+		if err == nil {
+			anyPresent = true
+			break
+		}
+		if client.IgnoreNotFound(err) != nil {
+			return err
+		}
+	}
+	if !anyPresent {
+		return nil
+	}
+
+	// Deployment/StatefulSet/Service/ServiceAccount reads come from the cache —
+	// those kinds are already watched (Owns, see SetupWithManager) so the reads
+	// are free. Secret, Role/RoleBinding, ResourceQuota and Job reads go through
+	// a2aReader: a cached read would start a cluster-wide informer for a kind
+	// this controller otherwise never watches, on every install.
+	//
+	// Those uncached reads are the standing cost of this path, which runs on
+	// every reconcile of every today install — see the note on the sweep below.
+	for _, entry := range r.a2aNamespacedTeardown(agent) {
 		obj := entry.obj
 		if err := entry.reader.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
 			if client.IgnoreNotFound(err) != nil {
@@ -1901,6 +2018,19 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		if err := client.IgnoreNotFound(r.Delete(ctx, obj)); err != nil {
 			return err
 		}
+	}
+
+	// The callout's ClusterRoleBinding. Cluster-scoped, so it carries no
+	// owner reference — the garbage collector treats a cluster-scoped object
+	// owned by a namespaced one as an orphan and deletes it at once — which
+	// means nothing reclaims it but this. Left behind, it is an A2A-named
+	// ClusterRoleBinding on an install that is supposed to look like it has
+	// never heard of A2A, and it is the darkness property's most visible
+	// residue: cluster-scoped objects are exactly what a security reviewer
+	// lists first. The ownership refusal above cannot apply, so it is matched
+	// on its labels instead.
+	if err := r.deleteA2ACalloutClusterRoleBinding(ctx, agent); err != nil {
+		return err
 	}
 
 	// Provision Jobs carry a spec digest in the name, one per generation
@@ -1922,4 +2052,24 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		}
 	}
 	return nil
+}
+
+// deleteA2ACalloutClusterRoleBinding reaps the callout's cluster-scoped grant.
+//
+// Called from two places, because there are two ways the next stack goes away:
+// a flip to today (cleanupA2A) and deletion of the CR itself (handleDeletion).
+// Nothing else reclaims it — a cluster-scoped object cannot carry an owner
+// reference to a namespaced CR — so missing either path leaves a standing
+// TokenReview grant behind forever.
+func (r *PlatformAgentReconciler) deleteA2ACalloutClusterRoleBinding(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
+	crb := &rbacv1.ClusterRoleBinding{ObjectMeta: metav1.ObjectMeta{Name: a2aCalloutClusterRoleBindingName(agent)}}
+	if err := r.a2aReader().Get(ctx, client.ObjectKeyFromObject(crb), crb); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	// Ownership by label, since the refusal the named objects get cannot
+	// apply: there is no owner reference to check.
+	if crb.Labels[labelInstance] != instanceLabel(agent.Namespace, agent.Name) {
+		return fmt.Errorf("refusing to delete unowned A2A ClusterRoleBinding %s", crb.Name)
+	}
+	return client.IgnoreNotFound(r.Delete(ctx, crb))
 }

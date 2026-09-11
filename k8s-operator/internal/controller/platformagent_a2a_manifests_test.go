@@ -61,6 +61,8 @@ func a2aTestCreds() *corev1.Secret {
 			"worker-password":  []byte("pw-worker"),
 			"seed-password":    []byte("pw-seed"),
 			"web-password":     []byte("pw-web"),
+			"sys-password":     []byte("pw-sys"),
+			"callout-password": []byte("pw-callout"),
 		},
 	}
 }
@@ -70,7 +72,8 @@ func a2aTestCreds() *corev1.Secret {
 // the auth callout, but the deny-by-default subject lists are the real shape.
 func TestBuildA2ANATSConfig(t *testing.T) {
 	agent := a2aTestAgent()
-	secret := buildA2ANATSConfigSecret(agent, a2aTestCreds())
+	keys := a2aTestCalloutKeys(t)
+	secret := buildA2ANATSConfigSecret(agent, a2aTestCreds(), keys)
 
 	if secret.Name != "test-agent-a2a-nats-config" {
 		t.Errorf("config secret name = %q", secret.Name)
@@ -80,6 +83,19 @@ func TestBuildA2ANATSConfig(t *testing.T) {
 	}
 
 	conf := string(secret.Data["nats.conf"])
+	// Matched as whole lines, not substrings. `Contains(conf, "timeout: 2")`
+	// is satisfied by `timeout: 20` - ten times the budget the comment beside
+	// it calls a ceiling - and `Contains(conf, "max_control_line:")` is
+	// satisfied by a value BELOW the default it exists to raise. Both were
+	// mutation-tested and both passed while wrong.
+	confLine := func(want string) bool {
+		for _, line := range strings.Split(conf, "\n") {
+			if strings.TrimSpace(line) == want {
+				return true
+			}
+		}
+		return false
+	}
 	if !strings.Contains(conf, "PLAYGROUND POSTURE") {
 		t.Error("nats.conf is missing the playground-posture comment block")
 	}
@@ -87,43 +103,100 @@ func TestBuildA2ANATSConfig(t *testing.T) {
 		t.Error("nats.conf does not enable jetstream")
 	}
 
-	// Per-user inbox prefixes: without them any agent can subscribe to any
-	// inbox and the connect-time property leaks through the reply path.
-	for _, user := range []string{"gateway", "worker", "seed"} {
+	// The static principals, with their inbox prefixes and their generated
+	// passwords. Per-user inbox prefixes are what stop the connect-time
+	// property leaking through the reply path.
+	for _, user := range []string{"worker", "web", "gateway"} {
 		if !strings.Contains(conf, "user: "+user) {
-			t.Errorf("nats.conf missing user %q", user)
+			t.Errorf("nats.conf missing static user %q", user)
 		}
 		if !strings.Contains(conf, "_INBOX."+user+".>") {
 			t.Errorf("nats.conf missing the _INBOX prefix for %q", user)
 		}
 	}
-
-	// Passwords come from the creds Secret, not from literals invented here.
-	for _, pw := range []string{"pw-gateway", "pw-worker", "pw-seed"} {
+	for _, pw := range []string{"pw-worker", "pw-web", "pw-gateway"} {
 		if !strings.Contains(conf, pw) {
 			t.Errorf("nats.conf does not carry the generated password %q", pw)
 		}
 	}
 
-	// Spot the load-bearing grants: the gateway owns the session registry and
-	// the task plane; the seed writes exactly the three starter topics.
-	for _, grant := range []string{
-		"a2a.tasks.*.*.in",
-		"a2a.tasks.*.*.events",
-		"$KV.session-state.>",
-		"a2a.topics.agent.platform.upgrade-readiness",
-		"a2a.topics.shared.blueprint",
-		"a2a.topics.shared.annotations",
-		// The delivery path's reply subjects: without an ack grant an
-		// explicit ack is a permissions violation and every consumer
-		// redelivers forever while TCP health stays green. Scoped per
-		// stream — the exact surface is
-		// TestSystemUsersAckGrantsAreScopedPerStream's to pin.
-		"$JS.ACK.TASKS.>",
-		"$JS.FC.>",
-	} {
-		if !strings.Contains(conf, grant) {
-			t.Errorf("nats.conf missing grant %q", grant)
+	// The principals the callout issues must NOT be here. A user present in
+	// both renders is authenticated by whichever path the client happened to
+	// take, and the config copy would still carry a password - which is the
+	// whole thing this change removes.
+	for _, user := range calloutIdentities(agent) {
+		if strings.Contains(conf, "user: "+user.user+"\n") {
+			t.Errorf("nats.conf still carries a static block for %q, which the callout now issues", user.user)
+		}
+	}
+
+	// The callout wiring itself.
+	if !strings.Contains(conf, "auth_callout {") {
+		t.Fatal("nats.conf has no auth_callout block")
+	}
+	if !strings.Contains(conf, "account: AUTH") {
+		t.Error("the callout is not scoped to its own account")
+	}
+	// The exact keys, not their first letter. `Contains(conf, "issuer: A")`
+	// matches any account key at all, including one unrelated to the callout's
+	// seed - which is the mismatch that refuses every connection with a bare
+	// Authorization Violation naming nothing.
+	if !confLine("issuer: " + keys.IssuerPublic) {
+		t.Errorf("auth_callout.issuer is not this callout's issuer public key (%s)", keys.IssuerPublic)
+	}
+	if !confLine("xkey: " + keys.XKeyPublic) {
+		t.Errorf("auth_callout.xkey is not this callout's curve public key (%s)", keys.XKeyPublic)
+	}
+	// And no seed reaches the config: it would hand whoever can read the
+	// config Secret the key that mints every grant on the bus.
+	for _, seed := range []string{keys.IssuerSeed, keys.XKeySeed} {
+		if strings.Contains(conf, seed) {
+			t.Error("nats.conf carries a SEED; it must hold only public halves")
+		}
+	}
+
+	// Above roughly two seconds the connect failure stops being an
+	// Authorization Violation and becomes "expected 'PONG', got 'PING'".
+	if !confLine("timeout: 2") {
+		t.Error("authorization.timeout is not exactly 2; above it the client-side failure names nothing about authorization")
+	}
+	// A ServiceAccount token rides in the CONNECT frame, and the 4096 default
+	// leaves under 4KB for the whole thing.
+	if !confLine("max_control_line: 65536") {
+		t.Error("max_control_line is not raised to 65536; below it a projected token is a hard connect refusal before authentication")
+	}
+
+	// Whole-line again: `Contains(conf, "web")` matches `websocket` and
+	// `Contains(conf, "sys")` matches `system_account`, so the obvious form of
+	// this check cannot fail.
+	for _, id := range staticIdentities(agent) {
+		if !confLine("user: " + id.user) {
+			t.Errorf("static principal %q has no user block in nats.conf", id.user)
+		}
+	}
+	// Reported rather than panicked: a slice on Index would panic with -1 if
+	// the block went missing, which is a failure mode worth a message.
+	authStart := strings.Index(conf, "auth_users:")
+	if authStart < 0 {
+		t.Fatal("nats.conf has no auth_users list; every static principal would be handed to the callout and refused")
+	}
+	authUsers := conf[authStart:]
+	authEnd := strings.Index(authUsers, "]")
+	if authEnd < 0 {
+		t.Fatal("the auth_users list is unterminated")
+	}
+	authUsers = authUsers[:authEnd]
+	for _, id := range staticIdentities(agent) {
+		if !strings.Contains(authUsers, id.user) {
+			t.Errorf("static principal %q is not in auth_users; it would be refused at connect", id.user)
+		}
+	}
+	if !strings.Contains(authUsers, a2aCalloutConfUser) {
+		t.Error("the callout's own user is not exempt; it could not connect to serve the subject it exists to serve")
+	}
+	for _, id := range calloutIdentities(agent) {
+		if strings.Contains(authUsers, id.user) {
+			t.Errorf("%q is exempt from the callout but is issued BY the callout", id.user)
 		}
 	}
 
@@ -143,40 +216,43 @@ func TestBuildA2ANATSConfig(t *testing.T) {
 // tokens), so any widening of this list is a review conversation, not a
 // diff.
 func TestSystemUsersAckGrantsAreScopedPerStream(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds()).Data["nats.conf"])
+	agent := a2aTestAgent()
 
+	// Asserted against the principal list, which spans both renders: the
+	// gateway is now issued by the callout and the worker still comes from
+	// nats.conf, and an unscoped ack grant is exactly as dangerous in either.
 	want := map[string][]string{
-		"gateway": {"$JS.ACK.TASKS.>"},
-		"worker":  {"$JS.ACK.TASKS.>"},
-		"seed":    nil,
-		"web":     nil,
+		"gateway":   {"$JS.ACK.TASKS.>"},
+		"worker":    {"$JS.ACK.TASKS.>"},
+		"agent":     nil,
+		"provision": nil,
+		"seed":      nil,
+		"web":       nil,
+		"sys":       nil,
 	}
-	for user, wantAcks := range want {
-		start := strings.Index(conf, "user: "+user)
-		if start < 0 {
-			t.Fatalf("nats.conf has no %s user", user)
-		}
-		block := conf[start:]
-		if next := strings.Index(block[1:], "user: "); next >= 0 {
-			block = block[:next+1]
-		}
-		pubStart, subStart := strings.Index(block, "publish"), strings.Index(block, "subscribe")
-		if pubStart < 0 || subStart < 0 {
-			t.Fatalf("%s: could not slice the publish block", user)
+
+	for _, id := range a2aIdentities(agent) {
+		wantAcks, known := want[id.user]
+		if !known {
+			t.Errorf("principal %q has no expected ack surface; add one rather than letting a new principal inherit silence", id.user)
+			continue
 		}
 		var got []string
-		for _, line := range strings.Split(block[pubStart:subStart], "\n") {
-			entry := strings.Trim(strings.TrimSuffix(strings.TrimSpace(line), ","), `"`)
-			if strings.HasPrefix(entry, "$JS.ACK") {
-				got = append(got, entry)
+		for _, grant := range id.publish {
+			if strings.HasPrefix(grant, "$JS.ACK") {
+				got = append(got, grant)
 			}
 		}
 		if !reflect.DeepEqual(got, wantAcks) {
-			t.Errorf("%s ack grants = %q, want %q", user, got, wantAcks)
+			t.Errorf("%s ack grants = %q, want %q", id.user, got, wantAcks)
+		}
+		// The unscoped form is a cross-principal +TERM whoever holds it.
+		if slices.Contains(got, "$JS.ACK.>") {
+			t.Errorf("%s holds unscoped $JS.ACK.>", id.user)
 		}
 	}
 
-	// The unscoped form is gone from the whole config, not just relocated.
+	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
 	if strings.Contains(conf, `"$JS.ACK.>"`) {
 		t.Error("nats.conf still grants unscoped $JS.ACK.> to someone")
 	}
@@ -242,9 +318,10 @@ func TestBuildA2AProvisionJob(t *testing.T) {
 		// KV buckets, capped like the streams
 		"runtime-state", "session-state", "--max-bucket-size",
 		// Every stream/kv call is a $JS.API request answered on an inbox, and
-		// seed may only subscribe under _INBOX.seed.> — without the prefix
-		// override every CLI call times out and the Job can never succeed.
-		"--inbox-prefix=_INBOX.seed",
+		// this principal may only subscribe under _INBOX.provision.> — without
+		// the prefix override every CLI call times out and the Job can never
+		// succeed.
+		"--inbox-prefix=_INBOX.provision",
 		// posture
 		"PLAYGROUND POSTURE",
 	} {
@@ -494,7 +571,7 @@ func TestHandleDeletionReapsOnlyTheLabeledJetStreamPVC(t *testing.T) {
 // reach beyond those. The read-only web rail is the consumer; kubectl
 // port-forward is the demo transport, which is why ClusterIP is enough.
 func TestBuildA2ANATSConfigWebsocketAndWebUser(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds()).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
 
 	if !strings.Contains(conf, "websocket {") {
 		t.Fatal("nats.conf has no websocket block")
@@ -788,24 +865,15 @@ func TestProbeTopicIsProvisionedAndWriterless(t *testing.T) {
 		t.Error("probe subject is not provisioned; a refusal against it would only prove the subject is missing")
 	}
 
-	conf := string(buildA2ANATSConfigSecret(agent, a2aTestCreds()).Data["nats.conf"])
-	for _, user := range []string{"gateway", "worker", "seed", "web"} {
-		start := strings.Index(conf, "user: "+user)
-		if start < 0 {
-			t.Fatalf("no %s user in nats.conf", user)
-		}
-		entry := conf[start:]
-		if next := strings.Index(entry[1:], "user: "); next >= 0 {
-			entry = entry[:next+1]
-		}
-		pub := entry[strings.Index(entry, "publish"):strings.Index(entry, "subscribe")]
-		for _, line := range strings.Split(pub, "\n") {
-			line = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(line), ","))
-			if !strings.HasPrefix(line, `"`) {
-				continue
-			}
-			if grant := strings.Trim(line, `"`); subjectMatches(grant, probe) {
-				t.Errorf("user %q can publish the probe subject via grant %q; it must have no writer", user, grant)
+	// Checked against the principal list rather than by parsing nats.conf,
+	// because since the callout armed there are two renders and the conf is
+	// only one of them. A grant that made the probe writable from the
+	// callout's identity map would be just as fatal to the probe's meaning
+	// and would not appear in the config at all.
+	for _, id := range a2aIdentities(agent) {
+		for _, grant := range id.publish {
+			if subjectMatches(grant, probe) {
+				t.Errorf("principal %q can publish the probe subject via grant %q; it must have no writer", id.user, grant)
 			}
 		}
 	}
@@ -838,11 +906,21 @@ func TestBuildA2ANATSNetworkPolicy(t *testing.T) {
 		t.Errorf("ingress rule is not exactly TCP 4222: %+v", rule.Ports)
 	}
 
-	// The client list, pinned exactly: the agent pod (whose sidecars share
-	// its labels), the A2A gateway, session pods, the provision Job, and the
-	// hand-applied seed tooling. All same-namespace pod selectors — no
-	// namespace-crossing, no IPBlock.
+	// The client list, pinned exactly: the auth callout, the agent pod
+	// (whose sidecars share its labels), the A2A gateway, session pods, the
+	// provision Job, and the hand-applied seed tooling. All same-namespace
+	// pod selectors — no namespace-crossing, no IPBlock.
+	//
+	// Pinned exactly, and the count is load-bearing rather than tidy: this
+	// fence sits in front of every connection to the bus, and the callout
+	// peer in particular is the one whose absence is invisible. Without it
+	// the callout cannot reach 4222, so it answers no authorization
+	// request, so no NEW connection succeeds — while every established one
+	// keeps working and the bus looks healthy. A peer added without
+	// updating this list is a peer nobody decided on; a peer removed is the
+	// fabric going dark somewhere it takes a reconnect to notice.
 	wantPeers := []map[string]string{
+		{"app": "test-agent-a2a-callout"},
 		{"app": "test-agent-gateway"},
 		{"app": "test-agent-a2a-gateway"},
 		{labelPartOf: a2aPartOf, "app.kubernetes.io/component": "a2a-session"},
@@ -1207,26 +1285,75 @@ func TestA2ASessionQuotaGatedByMode(t *testing.T) {
 	}
 }
 
+// assertEveryA2APodBearingBuilderHasARow ties a table of A2A pods to the
+// package, so the table cannot narrow silently.
+//
+// Two tables below say a fourth A2A container "fails here until it has a row".
+// Typed out, neither did: a builder nobody listed renders a pod nothing
+// reaches, which is exactly how the auth callout arrived with a row in neither.
+// This reads the package source instead and requires every buildA2A* function
+// returning a pod-bearing kind to be named. Same mechanism as
+// TestTheWalkCallsEveryPodBearingBuilder, narrowed to the A2A stack: the other
+// pod-bearing builders in this package are the agent's, and that walk covers
+// them.
+func assertEveryA2APodBearingBuilderHasARow(t *testing.T, rows []string) {
+	t.Helper()
+
+	covered := map[string]bool{}
+	for _, row := range rows {
+		covered[row] = true
+	}
+
+	found := 0
+	for builder, kind := range buildersReturning(t, podBearingKinds) {
+		if !strings.HasPrefix(builder, "buildA2A") {
+			continue
+		}
+		found++
+		if !covered[builder] {
+			t.Errorf("%s renders a %s and has no row in this table, so its containers are asserted nowhere", builder, kind)
+		}
+	}
+	if found == 0 {
+		t.Fatal("no A2A pod-bearing builder found in this package, so this table's coverage check passed vacuously")
+	}
+	// The other direction. A builder with no row is reported by name above;
+	// this catches the reverse, a row left behind after its builder was
+	// renamed or removed, which would otherwise sit there asserting nothing.
+	if found < len(rows) {
+		t.Errorf("the table has %d rows but the package has %d buildA2A* pod-bearing builders; a row names one that is gone", len(rows), found)
+	}
+}
+
 // TestEveryA2AContainerHasAHardenedSecurityContext is the mode-next half of
 // TestEveryContainerHasAHardenedSecurityContext, which walks the agent Pod and
-// stops there. These three containers are rendered by their own builders and
-// sit outside that walk, which is how all three shipped without the helper --
-// the provision container with no SecurityContext at all. One list, so a fourth
-// A2A container has somewhere to be added and fails here until it is.
+// stops there. These containers are rendered by their own builders and sit
+// outside that walk, which is how the first three shipped without the helper --
+// the provision container with no SecurityContext at all.
 func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 	agent := newTestPlatformAgent()
 	sts := buildA2ANATSStatefulSet(agent, "deadbeefdeadbeef")
 	job := buildA2AProvisionJob(agent)
 	dep := buildA2AGatewayDeployment(agent)
+	callout := buildA2ACalloutDeployment(agent)
 
-	for _, tc := range []struct {
-		render string
-		spec   corev1.PodSpec
+	cases := []struct {
+		render  string
+		builder string
+		spec    corev1.PodSpec
 	}{
-		{"nats", sts.Spec.Template.Spec},
-		{"provision", job.Spec.Template.Spec},
-		{"gateway", dep.Spec.Template.Spec},
-	} {
+		{"nats", "buildA2ANATSStatefulSet", sts.Spec.Template.Spec},
+		{"provision", "buildA2AProvisionJob", job.Spec.Template.Spec},
+		{"gateway", "buildA2AGatewayDeployment", dep.Spec.Template.Spec},
+		{"callout", "buildA2ACalloutDeployment", callout.Spec.Template.Spec},
+	}
+	builders := make([]string, 0, len(cases))
+	for _, tc := range cases {
+		builders = append(builders, tc.builder)
+	}
+	assertEveryA2APodBearingBuilderHasARow(t, builders)
+
+	for _, tc := range cases {
 		t.Run(tc.render, func(t *testing.T) {
 			all := append(append([]corev1.Container{}, tc.spec.InitContainers...), tc.spec.Containers...)
 			if len(all) == 0 {
@@ -1276,19 +1403,22 @@ func TestEveryA2AContainerHasAHardenedSecurityContext(t *testing.T) {
 // somewhere else.
 //
 // imageWorkDir is measured, not assumed -- `crane config <pinned tag>` on each
-// of the three, recorded here so a reader can check the premise without pulling
-// anything. All three pods override the user, so wherever the image's WORKDIR
-// is not traversable by the UID the pod imposes, the render owes an explicit
-// WorkingDir. A fourth A2A container needs a row, and fails here until it has
-// one -- the same shape as the hardening test above, deliberately.
+// image, recorded here so a reader can check the premise without pulling
+// anything. Every one of these pods overrides the user, so wherever the image's
+// WORKDIR is not traversable by the UID the pod imposes, the render owes an
+// explicit WorkingDir. A fourth A2A container needs a row and fails here until
+// it has one -- enumerated rather than asserted, by the same coverage check the
+// hardening test above uses.
 func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 	agent := newTestPlatformAgent()
 	sts := buildA2ANATSStatefulSet(agent, "deadbeefdeadbeef")
 	job := buildA2AProvisionJob(agent)
 	dep := buildA2AGatewayDeployment(agent)
+	callout := buildA2ACalloutDeployment(agent)
 
-	for _, tc := range []struct {
+	cases := []struct {
 		render    string
+		builder   string
 		container string
 		spec      corev1.PodSpec
 		// imageWorkDir is what the pinned image ships, and traversable says
@@ -1309,20 +1439,37 @@ func TestEveryA2AContainerLandsInAWorkingDirectoryItsUserCanUse(t *testing.T) {
 	}{
 		// nats:2.10-alpine -- WORKDIR /, mode 0755, so UID 1000 is fine and
 		// the render owes nothing.
-		{render: "nats", container: "nats", spec: sts.Spec.Template.Spec,
+		{render: "nats", builder: "buildA2ANATSStatefulSet", container: "nats", spec: sts.Spec.Template.Spec,
 			imageWorkDir: "/", traversable: true},
 		// natsio/nats-box:0.14.5 -- WORKDIR /root, no USER, and /root is
 		// drwx------ root:root. This is #1259. The cwd is also the nats CLI's
 		// HOME, so it has to be writable, which leaves the emptyDir.
-		{render: "provision", container: "provision", spec: job.Spec.Template.Spec,
+		{render: "provision", builder: "buildA2AProvisionJob", container: "provision", spec: job.Spec.Template.Spec,
 			imageWorkDir: "/root", usable: []string{a2aProvisionWritablePath}, wantWritable: true},
 		// distroless static nonroot -- WORKDIR /home/nonroot, drwx------
 		// owned by 65532, and the pod runs as 1000. Latent rather than broken
 		// because the gateway binary never stats ".". It writes nothing, so
 		// traversable is enough, and "/" is 0755 on that image.
-		{render: "gateway", container: "gateway", spec: dep.Spec.Template.Spec,
+		{render: "gateway", builder: "buildA2AGatewayDeployment", container: "gateway", spec: dep.Spec.Template.Spec,
 			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
-	} {
+		// The same distroless static nonroot base as the gateway, measured
+		// with `crane config` on both the built image and the base: WorkingDir
+		// /home/nonroot, User nonroot, and this pod imposes UID 1000. Latent
+		// in the same way -- the binary never stats "." and the Deployment has
+		// been observed 2/2 on a cluster -- which is why it wants a row rather
+		// than a shrug. "Latent" describes today's code, and the change that
+		// ends it would not announce itself. The callout writes nothing, so
+		// traversable is enough.
+		{render: "callout", builder: "buildA2ACalloutDeployment", container: "callout", spec: callout.Spec.Template.Spec,
+			imageWorkDir: "/home/nonroot", usable: []string{"/"}},
+	}
+	builders := make([]string, 0, len(cases))
+	for _, tc := range cases {
+		builders = append(builders, tc.builder)
+	}
+	assertEveryA2APodBearingBuilderHasARow(t, builders)
+
+	for _, tc := range cases {
 		t.Run(tc.render, func(t *testing.T) {
 			all := append(append([]corev1.Container{}, tc.spec.InitContainers...), tc.spec.Containers...)
 			if len(all) == 0 {
@@ -1448,10 +1595,12 @@ func TestA2AProvisionJobConditionsDriveStatus(t *testing.T) {
 }
 
 // TestCleanupA2AResumesAfterAMidPassError is the safety proof for cleanupA2A's
-// early exit. The exit reads three sentinels and returns when all are absent,
+// early exit. The exit reads four sentinels and returns when all are absent,
 // which is only sound while nothing it deletes can outlive them: the
-// StatefulSet is deleted last, the gateway Deployment first, and the config
-// Secret is the one object the render creates before the StatefulSet.
+// StatefulSet is deleted last, the gateway Deployment first, and the callout
+// keys and config Secrets are the deletable objects the render creates first.
+// TestTheEarlyExitSeesEveryObjectTheRenderCreatesFirst holds that soundness
+// one object at a time; this one holds it across a pass that dies partway.
 //
 // The failure this pins is the one the optimisation invites — a pass that dies
 // partway leaves objects behind, and the NEXT pass steps over them because its
@@ -1525,11 +1674,11 @@ func TestCleanupA2AResumesAfterAMidPassError(t *testing.T) {
 	}
 }
 
-// TestCleanupA2ACostsThreeReadsWhenThereIsNothingToClean measures the thing the
+// TestCleanupA2ACostsFourReadsWhenThereIsNothingToClean measures the thing the
 // change was for. Counting is the only honest check here: the early exit is a
 // cost optimisation, and a correctness test passes just as well with the reads
 // still happening one object at a time.
-func TestCleanupA2ACostsThreeReadsWhenThereIsNothingToClean(t *testing.T) {
+func TestCleanupA2ACostsFourReadsWhenThereIsNothingToClean(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()
 
@@ -1553,14 +1702,121 @@ func TestCleanupA2ACostsThreeReadsWhenThereIsNothingToClean(t *testing.T) {
 	if err := r.cleanupA2A(context.Background(), agent); err != nil {
 		t.Fatalf("cleanupA2A on a never-rendered install: %v", err)
 	}
-	// Three sentinel Gets and nothing else: no per-object walk, and in
+	// Four sentinel Gets and nothing else: no per-object walk, and in
 	// particular no Job List, which is the uncached one that ran every
 	// reconcile of every today install before this.
-	if gets != 3 {
-		t.Errorf("Gets = %d, want 3 (the sentinels); the per-object walk is running on a no-op", gets)
+	//
+	// The literal moved 3 -> 4 when the callout keys Secret joined the
+	// sentinels. Raising it is a real decision — every today install pays it
+	// on every reconcile, forever — so it is spelled out rather than derived.
+	// The inequality below is the part that must hold whatever the literal is:
+	// the exit is only worth having while it costs less than the walk.
+	if gets != 4 {
+		t.Errorf("Gets = %d, want 4 (the sentinels); the per-object walk is running on a no-op", gets)
+	}
+	if walk := len(r.a2aNamespacedTeardown(agent)); gets >= walk {
+		t.Errorf("Gets = %d for an exit that saves a %d-object walk; the exit has stopped paying for itself", gets, walk)
 	}
 	if lists != 0 {
 		t.Errorf("Lists = %d, want 0; the provision-Job sweep is still running on a no-op", lists)
+	}
+}
+
+// TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere is the correctness
+// half of the optimisation the test above prices.
+//
+// cleanupA2A answers "is there anything to tear down?" from four objects. That
+// is sound only while every render that leaves residue leaves at least one of
+// the four, and the case that breaks it is not a full render -- it is a render
+// that died partway. Miss it and an A2A object stays alive on a today install,
+// which is the darkness property.
+//
+// The reachable partial renders are the prefixes of reconcileA2A's own order,
+// so that is what this walks: fail the Nth object the render writes, for every
+// N, then flip to today and require the namespace to come back clean. Derived
+// from the render rather than listed here, so an object inserted anywhere in
+// reconcileA2A -- including ahead of the current first sentinel, which is the
+// way this breaks -- gets a case for free and reds until the exit can see it.
+func TestTheEarlyExitSeesTheResidueOfARenderThatDiedAnywhere(t *testing.T) {
+	// The one documented survivor: the per-user creds Secret is created before
+	// anything the teardown deletes and is meant to outlive a flip.
+	const residue = "test-agent-a2a-nats-creds"
+
+	// buildClient returns a client whose Nth object write fails. failAt 0 never
+	// fails, which is how the render's length is measured.
+	buildClient := func(agent *agentv1alpha1.PlatformAgent, failAt int, writes *int) client.WithWatch {
+		ssa := fakeServerSideApplyInterceptors().Patch
+		stop := func() error {
+			*writes++
+			if *writes == failAt {
+				return fmt.Errorf("injected: the render dies on write %d", failAt)
+			}
+			return nil
+		}
+		return fake.NewClientBuilder().
+			WithScheme(setupScheme()).
+			WithObjects(agent.DeepCopy()).
+			WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+			WithInterceptorFuncs(interceptor.Funcs{
+				Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+					if err := stop(); err != nil {
+						return err
+					}
+					return cl.Create(ctx, obj, opts...)
+				},
+				Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+					if err := stop(); err != nil {
+						return err
+					}
+					return ssa(ctx, cl, obj, patch, opts...)
+				},
+			}).
+			Build()
+	}
+
+	scheme := setupScheme()
+	next := a2aTestAgent()
+
+	full := 0
+	unobstructed := &PlatformAgentReconciler{Client: buildClient(next, 0, &full), Scheme: scheme}
+	if _, err := unobstructed.reconcileA2A(context.Background(), next.DeepCopy()); err != nil {
+		t.Fatalf("unobstructed render: %v", err)
+	}
+	if full == 0 {
+		t.Fatal("the render wrote nothing; every case below would be vacuous")
+	}
+
+	for n := 1; n <= full; n++ {
+		t.Run(fmt.Sprintf("render_dies_on_write_%d_of_%d", n, full), func(t *testing.T) {
+			writes := 0
+			cl := buildClient(next, n, &writes)
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+			ctx := context.Background()
+
+			if _, err := r.reconcileA2A(ctx, next.DeepCopy()); err == nil {
+				t.Fatal("want the injected error, got nil: the render did not die where this case says it did")
+			}
+
+			today := next.DeepCopy()
+			today.Spec.Mode = nil
+			if err := r.cleanupA2A(ctx, today); err != nil {
+				t.Fatalf("cleanupA2A after a partial render: %v", err)
+			}
+
+			var leftovers []string
+			sweepA2ALabelled(ctx, t, cl, func(kind, name string) {
+				if kind == "Secret" && name == residue {
+					return
+				}
+				leftovers = append(leftovers, kind+"/"+name)
+			})
+			if len(leftovers) > 0 {
+				t.Errorf("a render that died on write %d leaves these on a today install: %v\n"+
+					"The early exit returned before the walk because none of its sentinels was present. "+
+					"Add the object to the sentinel list in cleanupA2A, or key the exit on something "+
+					"that does not have to be re-derived every time the render grows a step.", n, leftovers)
+			}
+		})
 	}
 }
 
@@ -1850,7 +2106,9 @@ func a2aGrantSubjects(t *testing.T, conf, user, section string) []string {
 }
 
 func TestNoWorkerCanPublishToTheDirectory(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds()).Data["nats.conf"])
+	// Third argument is this branch's: the callout's NKey seeds. #1313 wrote
+	// this test against the two-argument signature on main.
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
 
 	// Asked as the server would ask it, not as a substring scan would. A grant
 	// need not spell the subject to authorize it: "a2a.*.*" covers
@@ -1916,26 +2174,30 @@ func a2aPasswordDigestNeedles(password string) []string {
 // go/weak-sensitive-data-hashing). The hash now covers the placeholder render
 // plus the creds Secret's resourceVersion, and all three properties below have
 // to hold at once: changing only the passwords must NOT move it, while a
-// config change and an in-place rotation must both still move it.
+// config change and an in-place rotation must both still move it. The callout
+// keypair is a fourth: its public halves are config, not credentials, and they
+// are rendered into the auth_callout block, so rotating them has to roll the
+// StatefulSet the same way any other config change does.
 func TestA2AConfigRolloutHashOmitsCredentialsAndTracksRotation(t *testing.T) {
 	agent := a2aTestAgent()
+	keys := a2aTestCalloutKeys(t)
 	const rv = "4711"
 	credsA := a2aFullCreds("a", rv)
 	credsB := a2aFullCreds("b", rv)
 
 	// Guard against an inert test: if the two creds rendered the same conf,
 	// an equal hash below would prove nothing.
-	confA := string(buildA2ANATSConfigSecret(agent, credsA).Data["nats.conf"])
-	confB := string(buildA2ANATSConfigSecret(agent, credsB).Data["nats.conf"])
+	confA := string(buildA2ANATSConfigSecret(agent, credsA, keys).Data["nats.conf"])
+	confB := string(buildA2ANATSConfigSecret(agent, credsB, keys).Data["nats.conf"])
 	if confA == confB {
 		t.Fatal("the two creds Secrets render the same nats.conf; the omission check below is inert")
 	}
 
-	hashA := a2aConfigRolloutHash(agent, credsA)
+	hashA := a2aConfigRolloutHash(agent, credsA, keys)
 	if len(hashA) != a2aConfigHashLength {
 		t.Errorf("rollout hash is %d characters, want %d", len(hashA), a2aConfigHashLength)
 	}
-	if hashB := a2aConfigRolloutHash(agent, credsB); hashA != hashB {
+	if hashB := a2aConfigRolloutHash(agent, credsB, keys); hashA != hashB {
 		t.Errorf("the rollout hash still tracks the password bytes: %q vs %q", hashA, hashB)
 	}
 
@@ -1943,15 +2205,24 @@ func TestA2AConfigRolloutHashOmitsCredentialsAndTracksRotation(t *testing.T) {
 	// Update on the same Secret, so the UID does not move and the
 	// resourceVersion is the only thing that says a credential changed.
 	rotated := a2aFullCreds("b", "4712")
-	if hashRotated := a2aConfigRolloutHash(agent, rotated); hashA == hashRotated {
+	if hashRotated := a2aConfigRolloutHash(agent, rotated, keys); hashA == hashRotated {
 		t.Error("a credential rotation does not roll the bus: the hash ignores resourceVersion")
 	}
 
 	// A config change: the agent's name is rendered into server_name.
 	other := a2aTestAgent()
 	other.Name = "other-agent"
-	if hashOther := a2aConfigRolloutHash(other, credsA); hashA == hashOther {
+	if hashOther := a2aConfigRolloutHash(other, credsA, keys); hashA == hashOther {
 		t.Error("a config change does not roll the bus: the hash ignores the render")
+	}
+
+	// A callout keypair rotation: the issuer and xkey public keys are rendered
+	// into auth_callout, and a server still holding the old ones cannot verify
+	// what the new callout signs. If this does not move the hash, the
+	// StatefulSet is never rolled and the bus rejects every authorization.
+	rotatedKeys := a2aTestCalloutKeys(t)
+	if hashKeys := a2aConfigRolloutHash(agent, credsA, rotatedKeys); hashA == hashKeys {
+		t.Error("a callout keypair rotation does not roll the bus: the hash ignores the public keys")
 	}
 }
 
@@ -2342,7 +2613,7 @@ func TestSeedGrantsAndProvisionScriptNameTheSameStreams(t *testing.T) {
 //     including the ones a2aSeedJetStreamGrants produced. That is the question
 //     the server asks, so a wildcard cannot grant a route without naming it.
 func TestSeedHoldsNoWholesaleJetStreamAPI(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds()).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
 
 	// Seed's publish allow-list exactly, not the span to the next user: the
 	// following block's explanatory comment names grants of its own, and a
@@ -2458,7 +2729,7 @@ func TestSeedHoldsNoWholesaleJetStreamAPI(t *testing.T) {
 //     interest for a push consumer's deliver_subject, so widening it is a
 //     review conversation for the same reason widening publish is.
 func TestWorkerHoldsNoWholesaleJetStreamAPI(t *testing.T) {
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds()).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), a2aTestCreds(), a2aTestCalloutKeys(t)).Data["nats.conf"])
 	got := a2aGrantSubjects(t, conf, "worker", "publish")
 
 	if sub, want := a2aGrantSubjects(t, conf, "worker", "subscribe"), []string{"a2a.tasks.>", "a2a.topics.>", "$KV.runtime-state.>", "_INBOX.worker.>"}; !reflect.DeepEqual(sub, want) {

@@ -246,7 +246,7 @@ func a2aProvisionLikeTheScript(t *testing.T, url, seedPassword string) {
 // reproduced on this server.
 func TestWorkerJetStreamGrantOnARealServer(t *testing.T) {
 	creds := a2aFullCreds("a", "1")
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t)).Data["nats.conf"])
 	workerPW := string(creds.Data["worker-password"])
 	seedPW := string(creds.Data["seed-password"])
 	gatewayPW := string(creds.Data["gateway-password"])
@@ -741,7 +741,7 @@ func TestWorkerJetStreamGrantOnARealServer(t *testing.T) {
 // re-verify back fails here with the subject named.
 func TestWorkerConsumersSurviveABusRestart(t *testing.T) {
 	creds := a2aFullCreds("a", "1")
-	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds).Data["nats.conf"])
+	conf := string(buildA2ANATSConfigSecret(a2aTestAgent(), creds, a2aTestCalloutKeys(t)).Data["nats.conf"])
 	workerPW := string(creds.Data["worker-password"])
 	seedPW := string(creds.Data["seed-password"])
 	gatewayPW := string(creds.Data["gateway-password"])

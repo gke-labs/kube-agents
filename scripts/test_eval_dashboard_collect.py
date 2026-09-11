@@ -43,6 +43,13 @@ BUILD_1089_MIXED = "2094714569262895104"  # PR 1089, blocked/infra-heavy reps
 RC_TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_rc"
 BUILD_RC_GREEN = "2097891568546484224"  # staging_2609092307_5b5ad10, GREEN, no baseline
 
+# Two real builds of 2026-09-11 (#1478): a pod whose node went NotReady
+# mid-run, and a clone failure -- the two zero-task shapes the health
+# adjudicator has to tell apart.
+LOSTPOD_TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_lostpod"
+BUILD_1118_LOST = "2098383791838990336"  # PR 1118, NodeNotReady 2h08m in, no build-log.txt
+BUILD_1446_CLONE_FAILED = "2098418565454499840"  # PR 1446, clone failed (merge conflict) in 0s
+
 # The three real builds, oldest first (started.json timestamps).
 BUILD_956_TRUNCATED = "2092688354838581248"  # PR 956, deadline hit before verdict
 BUILD_998_INFRA = "2093030474753511424"  # PR 998, compliance canary infra-failed
@@ -929,9 +936,11 @@ class TestContractShape(unittest.TestCase):
 
     def test_run_and_case_field_names(self):
         data = collect.collect(from_dir=TESTDATA)
+        # `has_build_log` is the one "how it ended" field a build that ran
+        # carries; the pod_* trio appears only when podinfo.json was read.
         self.assertEqual(
             list(data["runs"][0]),
-            ["build_id", "pr", "head_sha", "project", "started", "finished", "result", "duration_s", "tasks"],
+            ["build_id", "pr", "head_sha", "project", "started", "finished", "result", "duration_s", "tasks", "has_build_log"],
         )
         self.assertEqual(
             list(data["runs"][0]["tasks"][0]),
@@ -941,6 +950,176 @@ class TestContractShape(unittest.TestCase):
             list(data["cases"][0]),
             ["name", "domain", "active", "runs_on_record", "pass_rate", "last3", "durations", "ov_history"],
         )
+
+
+class TestHowTheBuildEnded(unittest.TestCase):
+    """runs[].has_build_log and the pod_* trio, from two REAL builds of
+    2026-09-11 (#1478): PR 1118's, whose node went NotReady two hours in and
+    which has no build-log.txt at all, and PR 1446's, a clone failure (a
+    merge conflict) that has a log and a pod whose last event is Started.
+    podinfo.json is trimmed to the pod record and events; the values are
+    the real ones."""
+
+    def runs(self):
+        return {run["build_id"]: run for run in collect.runs_from_dir(LOSTPOD_TESTDATA)}
+
+    def test_the_lost_pod_of_pr_1118(self):
+        run = self.runs()[BUILD_1118_LOST]
+        self.assertEqual((run["pr"], run["result"], run["tasks"]), (1118, "failure", []))
+        self.assertEqual(run["started"], "2026-09-11T12:11:04+00:00")
+        self.assertEqual(run["finished"], "2026-09-11T14:19:16+00:00")
+        self.assertEqual(run["duration_s"], 7692, "started.json to finished.json: the pod ran two hours")
+        self.assertIs(run["has_build_log"], False)
+        self.assertEqual(run["pod_phase"], "Failed")
+        self.assertEqual(run["pod_node"], "gke-kube-agents-prow-default-pool-eb220b2a-sgnk")
+        self.assertEqual(run["pod_last_event"], "NodeNotReady")
+
+    def test_the_clone_failure_of_pr_1446_has_a_log_and_a_started_pod(self):
+        run = self.runs()[BUILD_1446_CLONE_FAILED]
+        # initupload wrote this finished.json (uppercase); crier wrote the
+        # lost pod's (lowercase). Consumers compare case-insensitively.
+        self.assertEqual((run["pr"], run["result"], run["tasks"], run["duration_s"]), (1446, "FAILURE", [], 0))
+        self.assertIs(run["has_build_log"], True)
+        self.assertEqual(run["pod_phase"], "Failed")
+        self.assertEqual(run["pod_node"], "gke-kube-agents-prow-default-pool-eb220b2a-baaq")
+        # Scheduled, Pulled, Created and Started share a second; upload
+        # order breaks the tie, so the newest is Started, not Pulled.
+        self.assertEqual(run["pod_last_event"], "Started")
+
+    def test_a_build_that_ran_costs_no_extra_read(self):
+        asked = []
+        inner = collect._dir_reader(TESTDATA / BUILD_998_FULL)
+
+        def reader(name):
+            asked.append(name)
+            return inner(name)
+
+        run = collect.build_run(BUILD_998_FULL, reader)
+        self.assertNotIn("podinfo.json", asked)
+        self.assertIs(run["has_build_log"], True)
+        self.assertFalse({"pod_phase", "pod_node", "pod_last_event"} & set(run))
+
+    def test_a_zero_task_failure_reads_podinfo_once(self):
+        for build in (BUILD_1118_LOST, BUILD_1446_CLONE_FAILED):
+            asked = []
+            inner = collect._dir_reader(LOSTPOD_TESTDATA / build)
+
+            def reader(name, inner=inner, asked=asked):
+                asked.append(name)
+                return inner(name)
+
+            collect.build_run(build, reader)
+            self.assertEqual(asked.count("podinfo.json"), 1, build)
+
+    def test_a_failed_log_read_on_a_pod_that_uploaded_is_not_a_lost_pod(self):
+        # PR 998's real red run, with only the build-log read failing: the
+        # podinfo of a completed pod (sidecar terminated) says the log was
+        # uploaded, so `has_build_log` stays unknown rather than False.
+        podinfo = json.dumps({"pod": {"spec": {"nodeName": "n1"}, "status": {"phase": "Failed", "containerStatuses": [{"name": "test", "state": {"terminated": {"exitCode": 1}}}, {"name": "sidecar", "state": {"terminated": {"exitCode": 0}}}]}}, "events": [{"reason": "Started", "lastTimestamp": "2026-08-27T19:14:00Z"}]})
+        inner = collect._dir_reader(TESTDATA / BUILD_998_INFRA)
+        asked = []
+
+        def reader(name):
+            asked.append(name)
+            if name == "build-log.txt":
+                return None
+            if name == "podinfo.json":
+                return podinfo
+            return inner(name)
+
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            run = collect.build_run(BUILD_998_INFRA, reader)
+        self.assertEqual(asked.count("build-log.txt"), 2, "the log is read twice before it is given up on")
+        self.assertNotIn("has_build_log", run)
+        self.assertEqual((run["pod_phase"], run["pod_node"], run["pod_last_event"]), ("Failed", "n1", "Started"))
+        self.assertIn("the pod's sidecar is terminated, so one was uploaded", err.getvalue())
+        # A clone failure's sidecar is `waiting` (initupload wrote the log at
+        # the clone stage): the same double miss is unknown, not a lost pod.
+        waiting = collect._dir_reader(LOSTPOD_TESTDATA / BUILD_1446_CLONE_FAILED)
+
+        def clone_reader(name):
+            return None if name == "build-log.txt" else waiting(name)
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            run = collect.build_run(BUILD_1446_CLONE_FAILED, clone_reader)
+        self.assertNotIn("has_build_log", run)
+        self.assertEqual(run["pod_last_event"], "Started")
+        # Only a sidecar the kubelet left `running` corroborates a missing log.
+        self.assertIs(collect.build_run(BUILD_1118_LOST, collect._dir_reader(LOSTPOD_TESTDATA / BUILD_1118_LOST))["has_build_log"], False)
+        # And the GCS reader does not cache the failure, so the retry is real.
+        calls = []
+
+        def gsutil_fake(args, gsutil):
+            calls.append(args[-1])
+            return None if len(calls) == 1 else "text"
+
+        original = collect._gsutil
+        collect._gsutil = gsutil_fake
+        try:
+            gcs = collect._gcs_reader("gs://b/", "gsutil")
+            self.assertIsNone(gcs("build-log.txt"))
+            self.assertEqual(gcs("build-log.txt"), "text")
+            self.assertEqual(gcs("build-log.txt"), "text")
+        finally:
+            collect._gsutil = original
+        self.assertEqual(len(calls), 2)
+
+    def test_neither_log_nor_podinfo_leaves_how_it_ended_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            build = pathlib.Path(tmp) / "42"
+            build.mkdir()
+            shutil.copy(LOSTPOD_TESTDATA / BUILD_1118_LOST / "started.json", build / "started.json")
+            shutil.copy(LOSTPOD_TESTDATA / BUILD_1118_LOST / "finished.json", build / "finished.json")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                run = collect.build_run("42", collect._dir_reader(build))
+            self.assertNotIn("has_build_log", run, "absent means unknown, never a guessed False")
+            self.assertNotIn("pod_last_event", run)
+            self.assertIn("how it ended is unknown", err.getvalue())
+            # A clone failure whose podinfo.json is missing still has its log.
+            (build / "build-log.txt").write_text("# FAILED\n")
+            run = collect.build_run("42", collect._dir_reader(build))
+            self.assertIs(run["has_build_log"], True)
+            self.assertNotIn("pod_last_event", run)
+
+    def test_parse_podinfo_is_best_effort(self):
+        self.assertIsNone(collect.parse_podinfo(None))
+        self.assertIsNone(collect.parse_podinfo("not json"))
+        self.assertIsNone(collect.parse_podinfo("[]"))
+        self.assertEqual(collect.parse_podinfo("{}"), {"pod_phase": None, "pod_node": None, "pod_last_event": None, "sidecar_state": None})
+        unordered = json.dumps(
+            {
+                "pod": {"spec": {"nodeName": "n1"}, "status": {"phase": "Failed"}},
+                "events": [
+                    {"reason": "NodeNotReady", "lastTimestamp": "2026-09-11T14:17:18Z"},
+                    {"reason": "Scheduled", "lastTimestamp": "2026-09-11T12:10:56Z"},
+                    {"reason": "Started", "lastTimestamp": "2026-09-11T12:11:06Z"},
+                ],
+            }
+        )
+        self.assertEqual(collect.parse_podinfo(unordered), {"pod_phase": "Failed", "pod_node": "n1", "pod_last_event": "NodeNotReady", "sidecar_state": None})
+        statuses = {"pod": {"status": {"containerStatuses": [{"name": "test", "state": {"terminated": {}}}, {"name": "sidecar", "state": {"running": {}}}]}}}
+        self.assertEqual(collect.parse_podinfo(json.dumps(statuses))["sidecar_state"], "running")
+        statuses["pod"]["status"]["containerStatuses"][1]["state"] = {"terminated": {"exitCode": 0}}
+        self.assertEqual(collect.parse_podinfo(json.dumps(statuses))["sidecar_state"], "terminated")
+        unstamped = json.dumps({"pod": {}, "events": [{"reason": "Scheduled"}, {"reason": "Started"}]})
+        self.assertEqual(collect.parse_podinfo(unstamped)["pod_last_event"], "Started", "no timestamps: upload order")
+        self.assertEqual(collect.parse_podinfo(json.dumps({"pod": {}, "events": "junk"}))["pod_last_event"], None)
+
+    def test_lost_pod_fixtures_merge_with_a_prior_that_lacks_the_fields(self):
+        prior_runs = collect.collect(from_dir=TESTDATA)["runs"]
+        for run in prior_runs:
+            run.pop("has_build_log", None)
+        with tempfile.TemporaryDirectory() as tmp:
+            prior = pathlib.Path(tmp) / "prior.json"
+            prior.write_text(json.dumps({"schema_version": 1, "generated_at": "x", "source": "logs", "runs": prior_runs, "cases": [], "coverage": {}}))
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                merged = collect.collect(from_dir=LOSTPOD_TESTDATA, merge_with=str(prior))
+        by_id = {run["build_id"]: run for run in merged["runs"]}
+        self.assertNotIn("has_build_log", by_id[BUILD_998_FULL], "a prior run is carried verbatim")
+        self.assertIs(by_id[BUILD_1118_LOST]["has_build_log"], False)
 
 
 class TestReleaseCandidateParsing(unittest.TestCase):

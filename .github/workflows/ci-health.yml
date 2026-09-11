@@ -85,10 +85,12 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 # the job asks for pull-requests: write and issues: write and nothing else
 # does: the poster files the tracking issue a new OUTAGE lacks (label
 # presubmit-gate; it adopts a human's if one names the same cases, and
-# never closes one), and scripts/eval_dashboard/gate_comment.py leaves one
-# comment per pull request whose smoke run went red since the last tick,
-# edited in place on later runs. Both are best-effort: a GitHub failure is
-# a warning, retried next tick, never a failed run.
+# never closes one) and, for a new lost_pods condition, the issue the
+# cluster owner is owed (same label; it adopts a human's naming the same
+# nodes); scripts/eval_dashboard/gate_comment.py leaves one comment per
+# pull request whose smoke run went red -- or lost its build node -- since
+# the last tick, edited in place on later runs. Both are best-effort: a
+# GitHub failure is a warning, retried next tick, never a failed run.
 
 on:
   schedule:
@@ -139,7 +141,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # The workflow-level grant plus the two writes the header explains: the
-    # gate comment on a pull request and the OUTAGE tracking issue.
+    # gate comment on a pull request (a red run, or a lost build node) and
+    # the tracking issue (an OUTAGE, or a lost_pods condition).
     permissions:
       contents: read
       id-token: write
@@ -369,7 +372,7 @@ jobs:
         continue-on-error: true
         env:
           CI_HEALTH_CHAT_TOKEN: ${{ steps.chat_token.outputs.token }}
-          # For the tracking issue a new OUTAGE files (header).
+          # For the tracking issue a new OUTAGE or lost_pods condition files (header).
           GH_TOKEN: ${{ github.token }}
         run: |
           # --digest-hour is a Toronto hour (the poster's default zone).
@@ -378,11 +381,12 @@ jobs:
             --state "$DASHBOARD_BUCKET/health-state.json" \
             --digest-hour 9
 
-      # One comment per pull request whose smoke run went red since the
-      # last tick (header). The script exits 0 on a GitHub failure; the
-      # continue-on-error covers everything else, so this never reds the run.
-      # The mute switch covers this write too (header).
-      - name: Comment on pull requests whose smoke run went red
+      # One comment per pull request whose smoke run went red, or lost its
+      # build node, since the last tick (header). The script exits 0 on a
+      # GitHub failure; the continue-on-error covers everything else, so
+      # this never reds the run. The mute switch covers this write too
+      # (header).
+      - name: Comment on pull requests whose smoke run went red or lost its node
         if: env.CI_HEALTH_MUTE != 'true'
         continue-on-error: true
         env:

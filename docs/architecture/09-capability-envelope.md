@@ -423,7 +423,13 @@ permissions §4 relies on, so its holder can grant itself publish under `$KV.cap
 across the bucket -- mint a root at any tier, and read every capability in flight. Compromising the
 verifier exposes what is in the store; compromising the seed lets you write to it as the gateway.
 Neither is a reason not to do this, and both belong in the same tier of scrutiny, but the seed is
-the one to write the custody and rotation story for first.
+the one to write the custody and rotation story for first. It now has an object to write
+that story about: the seed lives in Secret `<agent>-a2a-callout-keys`, mounted by the auth
+callout Deployment and nothing else and deliberately not in the per-user credentials
+Secret that several workloads read. `docs/designs/spec-nats-deployment.md` owns the
+detail. Rotation is not a credential refresh: the public half is in `nats.conf`, and the
+server refuses a config reload that touches the callout block at all, so rotating it is a
+bus restart.
 
 **Nothing expires.** No entry carries an issue time, a use count, or any notion of the request
 being over, and a TTL is rejected elsewhere in this document as a thing revocation saves us from. So
@@ -486,11 +492,11 @@ Nothing in the current topology needs that.
 
 The same reasoning decided three separate questions:
 
-| Question                                                 | The crypto answer                                                          | What we do instead                                                                                                                                                                                                                                         |
-| :------------------------------------------------------- | :------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| How do agents authenticate to the bus?                   | NATS decentralized JWT -- operator key signs accounts, accounts sign users | Auth callout against ServiceAccount tokens the cluster already issues. Every conformant cluster is an OIDC issuer with audience-bound, rotated tokens. **One account seed for the callout, none for capabilities -- and see §5 on what that seed can do.** |
-| What stops a capability being forged?                    | Sign it, distribute verification keys                                      | A KV entry on a subject the forger cannot publish to. The server refuses the publish.                                                                                                                                                                      |
-| What stops a token being used against the wrong cluster? | Encode a scope, check it                                                   | The token is issued _by_ the target cluster. Another cluster rejects it because a different issuer signed it. **Nothing has to check anything.**                                                                                                           |
+| Question                                                 | The crypto answer                                                          | What we do instead                                                                                                                                                                                                                                                                                                                                                                                                             |
+| :------------------------------------------------------- | :------------------------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| How do agents authenticate to the bus?                   | NATS decentralized JWT -- operator key signs accounts, accounts sign users | Auth callout against ServiceAccount tokens the cluster already issues. Every conformant cluster is an OIDC issuer with audience-bound, rotated tokens. **One account seed for the callout -- plus a curve seed that encrypts the authorization request, so the ServiceAccount token it carries is not in flight in the clear, and which grants nothing -- and none for capabilities. See §5 on what the account seed can do.** |
+| What stops a capability being forged?                    | Sign it, distribute verification keys                                      | A KV entry on a subject the forger cannot publish to. The server refuses the publish.                                                                                                                                                                                                                                                                                                                                          |
+| What stops a token being used against the wrong cluster? | Encode a scope, check it                                                   | The token is issued _by_ the target cluster. Another cluster rejects it because a different issuer signed it. **Nothing has to check anything.**                                                                                                                                                                                                                                                                               |
 
 > **Prefer a boundary that already exists and is enforced by someone else over a check we have to
 > write, distribute and operate.**
