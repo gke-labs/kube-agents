@@ -1770,3 +1770,40 @@ func TestAgentEgressPolicyBusRuleGatedOnMode(t *testing.T) {
 		t.Error("skew removed the Allowlist policy's bus rule while the bus keeps running")
 	}
 }
+
+// TestALiteLLMFailureDoesNotSuspendTheAgentGuardrails pins the ordering
+// reconcileAgentNetworkGuardrails promises. litellm-policy selects a different
+// Pod, so an error on its side — here a failing Get on Deployment/litellm —
+// must leave neither of the agent Pod's own policies unreconciled, and must
+// still surface from the joined result rather than be swallowed.
+func TestALiteLLMFailureDoesNotSuspendTheAgentGuardrails(t *testing.T) {
+	scheme := setupScheme()
+	agent := egressPolicyAgent()
+	injectedErr := errors.New("injected litellm deployment get error")
+	funcs := ssaApplyInterceptor()
+	funcs.Get = func(ctx context.Context, cl client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+		if _, ok := obj.(*appsv1.Deployment); ok && key.Name == litellmDeploymentName {
+			return injectedErr
+		}
+		return cl.Get(ctx, key, obj, opts...)
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(agent).
+		WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+		WithInterceptorFuncs(funcs).
+		Build()
+	r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+	ctx := context.Background()
+
+	err := r.reconcileAgentNetworkGuardrails(ctx, agent)
+	if !errors.Is(err, injectedErr) {
+		t.Fatalf("expected the LiteLLM error to surface from the joined result, got %v", err)
+	}
+	for _, name := range []string{agent.Name + "-gateway-netpol", agentEgressPolicyName(agent)} {
+		var np networkingv1.NetworkPolicy
+		if err := cl.Get(ctx, types.NamespacedName{Namespace: agent.Namespace, Name: name}, &np); err != nil {
+			t.Errorf("%s was not reconciled behind the LiteLLM failure: %v", name, err)
+		}
+	}
+}
