@@ -77,6 +77,7 @@ the same layout and is collected from the moment it starts running.
   the gate's by default. Every gate verdict — the
   health adjudicator's rules and 24-hour metrics, `classify.py`'s "is this
   mine?" (other PRs, the only-this-PR passes, the 30-day pass rate), the
+  red comment's "runs from other PRs" count (`gate_comment.py`), the
   Brief's runs list, the legacy page's gate band, matrix and Pareto — reads
   presubmit runs only. A nightly run appears where the nightly is meant to:
   `cases[].nightly`, the evidence table's nightly columns, and

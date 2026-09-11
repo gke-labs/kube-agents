@@ -194,6 +194,19 @@ class Shapes(Harness):
         self.assertNotIn("Incident brief", body)
         self.assertIn("6 cases passed.", body)
 
+    def test_a_green_night_is_not_another_pr(self):
+        # The nightly periodic's run shares data.json with no pull request
+        # (tiers.py). Green an hour ago, it passed every case: it must neither
+        # raise the "runs from other PRs" count nor be commented on.
+        night = run(7000, None, NOW - timedelta(hours=1))
+        night.update({"tier": "nightly", "job": "ci-kube-agents-eval-nightly"})
+        mine = [run(100 + i, 913, NOW - timedelta(hours=3 - i), failing=["security-overgrant-probe"]) for i in range(4)]
+        self.tick(data(night, *mine, *green_others()), green_health())
+        self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/913/comments")])
+        body = self.gh.bodies()[0]
+        self.assertIn("`security-overgrant-probe` passed on the last 9 runs from other PRs and failed on your last 4.", body)
+        self.assertIn("| `security-overgrant-probe` | 0 / 3 reps | no other PR |", body)
+
     def test_mixed(self):
         mine = run(100, 1300, NOW - timedelta(minutes=5), failing=TRIO + ["agent-kanban-smoke"])
         self.tick(data(mine, *other_runs()), outage_health())

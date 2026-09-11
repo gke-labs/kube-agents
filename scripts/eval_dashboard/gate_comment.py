@@ -21,7 +21,9 @@ lost every repetition to a storm gets no comment (the Chat space and the
 dashboard carry those). A red is either a gate case failing every graded
 repetition, or a hard failure: FAILURE with no such case, which is an
 absolute check (a forbidden cluster change, a verifier that errored) or a
-truncated log, and says so.
+truncated log, and says so. The nightly periodic's runs share data.json
+(`tier: nightly`, no pull request) and are dropped before anything is
+counted, so a green night never reads as another PR's pass (tiers.py).
 
 One zero-task run does get a comment: a lost pod -- the build node went
 away under the job (health.py rule 3b, #1478). Twelve authors saw a red
@@ -56,7 +58,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 try:
-    from eval_dashboard import classify, ghcli, health, post_health
+    from eval_dashboard import classify, ghcli, health, post_health, tiers
 except ImportError:  # run as a script: scripts/eval_dashboard/gate_comment.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
     from eval_dashboard import classify, ghcli, health, post_health
@@ -441,7 +443,9 @@ def tick(data: dict, health_doc: dict, state: dict | None, now: datetime, roster
     watermark_in = post_health.parse_iso(before.get("last_comment_tick")) or (now - FIRST_TICK_LOOKBACK)
     since = watermark_in - SCAN_OVERLAP
     comments = dict(before.get("comments") or {})
-    runs = [r for r in data.get("runs") or [] if isinstance(r, dict)]
+    # The gate's runs only (tiers.py): a nightly run has no pull request, so
+    # left in it would count as "another PR's" pass in the only-this-PR line.
+    runs = tiers.presubmit_runs([r for r in data.get("runs") or [] if isinstance(r, dict)])
     rendered = []
     retry_from = None
     for raw in newest_red_per_pr(data, since, now):
