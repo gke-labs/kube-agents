@@ -360,7 +360,7 @@ def handle_submit_content(args) -> int:
         workspace.push(branch)
 
         pr_url = create_pull_request(
-            branch, args.title, args.body, None, repo, result["base"]
+            branch, args.title, render_body_with_telemetry(args), None, repo, result["base"]
         )
     log(f"PR SUBMITTED SUCCESSFULLY! 🏆 URL: {pr_url}")
     print(pr_url)
@@ -381,6 +381,76 @@ def remote_branch_exists(branch: str, workspace) -> bool:
         check=False,
     )
     return res.returncode == 0
+
+
+def render_body_with_telemetry(args) -> str:
+    """Appends verified telemetry metrics and structured JSON metadata to the PR body."""
+    input_tokens = getattr(args, "input_tokens", None)
+    output_tokens = getattr(args, "output_tokens", None)
+    cache_read = None
+    cache_write = None
+
+    elapsed = getattr(args, "elapsed", None) or os.environ.get("HERMES_SESSION_ELAPSED")
+    model = getattr(args, "model", None) or os.environ.get("HERMES_MODEL")
+    trace_id = getattr(args, "trace_id", None) or os.environ.get("OTEL_TRACE_ID")
+    steps = getattr(args, "steps", None) or os.environ.get("HERMES_TOOL_STEPS")
+
+    token_display = None
+    if input_tokens is not None and output_tokens is not None:
+        total = input_tokens + (cache_read or 0) + (cache_write or 0) + output_tokens
+        if (cache_read or 0) > 0 or (cache_write or 0) > 0:
+            cached_sum = (cache_read or 0) + (cache_write or 0)
+            token_display = f"{total:,} ({input_tokens:,} input / {output_tokens:,} output / {cached_sum:,} cache)"
+        else:
+            token_display = f"{total:,} ({input_tokens:,} input / {output_tokens:,} output)"
+    elif input_tokens is not None:
+        token_display = f"{input_tokens:,} input"
+    elif output_tokens is not None:
+        token_display = f"{output_tokens:,} output"
+
+    body = args.body
+    if token_display or elapsed or model or trace_id or steps:
+        telemetry = ["\n\n---", "### ⏱️ Telemetry & SLA Metrics"]
+        if elapsed:
+            telemetry.append(f"- **Discovery-to-PR Duration:** `{elapsed}`")
+        if token_display:
+            telemetry.append(f"- **Token Consumption:** `{token_display}`")
+        if model:
+            telemetry.append(f"- **AI Model:** `{model}`")
+        if steps:
+            telemetry.append(f"- **Tool Call Executions:** `{steps}`")
+        if trace_id:
+            telemetry.append(f"- **OpenTelemetry Trace ID:** `{trace_id}`")
+
+        # Machine-readable JSON comment for automated downstream CI/CD
+        meta = {}
+        if input_tokens is not None:
+            meta["input_tokens"] = input_tokens
+        if output_tokens is not None:
+            meta["output_tokens"] = output_tokens
+        if cache_read is not None:
+            meta["cache_read_tokens"] = cache_read
+        if cache_write is not None:
+            meta["cache_write_tokens"] = cache_write
+        if input_tokens is not None and output_tokens is not None:
+            meta["total_tokens"] = input_tokens + (cache_read or 0) + (cache_write or 0) + output_tokens
+
+        if elapsed:
+            meta["elapsed"] = elapsed
+        if model:
+            meta["model"] = model
+        if steps:
+            try:
+                meta["steps"] = int(steps)
+            except (ValueError, TypeError):
+                meta["steps"] = steps
+        if trace_id:
+            meta["trace_id"] = trace_id
+
+        telemetry.append(f"\n<!-- kube-agents-telemetry: {json.dumps(meta, sort_keys=True)} -->")
+        body += "\n" + "\n".join(telemetry)
+
+    return body
 
 
 def handle_submit(args) -> int:
@@ -426,9 +496,10 @@ def handle_submit(args) -> int:
     validate_repo(repo)
     refresh_git_credentials(repo)
 
+    body = render_body_with_telemetry(args)
     push_branch(branch, workspace)
     base = gitops_workspace.resolve_base_branch(workspace, _runner)
-    pr_url = create_pull_request(branch, args.title, args.body, workspace, repo, base)
+    pr_url = create_pull_request(branch, args.title, body, workspace, repo, base)
     log(f"PR SUBMITTED SUCCESSFULLY! 🏆 URL: {pr_url}")
 
     # Print raw URL to stdout for the MCP tool to parse
@@ -583,6 +654,38 @@ def build_parser() -> argparse.ArgumentParser:
     submit.add_argument(
         "--base-sha", dest="base_sha", default=None,
         help="baseSha from `prepare`; makes the broker refuse a colliding commit",
+    )
+    submit.add_argument(
+        "--input-tokens",
+        type=int,
+        default=None,
+        help="Input / prompt tokens consumed (e.g. 14820)",
+    )
+    submit.add_argument(
+        "--output-tokens",
+        type=int,
+        default=None,
+        help="Output / completion tokens generated (e.g. 1240)",
+    )
+    submit.add_argument(
+        "--elapsed",
+        default=None,
+        help="Remediation SLA duration from issue discovery to PR submission (e.g. '45s' or '1m 12s')",
+    )
+    submit.add_argument(
+        "--model",
+        default=None,
+        help="AI Model utilized (e.g. 'gemini-3.5-flash')",
+    )
+    submit.add_argument(
+        "--trace-id",
+        default=None,
+        help="OpenTelemetry Trace ID for diagnostic auditability",
+    )
+    submit.add_argument(
+        "--steps",
+        default=None,
+        help="Tool execution step count during session (e.g. '4 tool calls' or 4)",
     )
 
     # The read half of content mode. Directory mode needs neither: the files are
