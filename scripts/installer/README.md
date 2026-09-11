@@ -44,6 +44,7 @@ their own copies:
 | `require_supported_permission_set <set>`                                  | The same check, reporting why a rejected value is rejected                             |
 | `is_valid_cluster_mode <mode>`                                            | Accepted cluster shapes: `autopilot`, `standard`                                       |
 | `derive_kms_location <region>`                                            | Region for Cloud KMS (strips a zone suffix)                                            |
+| `derive_chat_sub_name [topic] [sub]`                                      | Derive Google Chat Pub/Sub subscription (<topic>-sub) when topic is custom (#1397)     |
 | `tf_state_bucket` / `tf_state_prefix`                                     | Where the install's Terraform state lives in GCS                                       |
 | `kms_key_enabled_version <key> <ring> <location> <project>`               | The minter key's first ENABLED version, or nothing; one probe for three callers        |
 | `tf_state_has_cluster`                                                    | Whether that state manages THIS cluster (project, location and name all match)         |

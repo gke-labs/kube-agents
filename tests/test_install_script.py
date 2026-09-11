@@ -2411,7 +2411,7 @@ class SlackPromptsKeepTheirCurrentValuesTest(unittest.TestCase):
         )
 
     def test_each_google_chat_prompt_defaults_to_its_own_current_value(self):
-        for var in ("allowed_users", "chat_topic_name", "google_chat_home_channel"):
+        for var in ("allowed_users", "chat_topic_name", "chat_sub_name", "google_chat_home_channel"):
             with self.subTest(var=var):
                 self.assertRegex(
                     self._SOURCE,
