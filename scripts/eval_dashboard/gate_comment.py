@@ -61,7 +61,7 @@ try:
     from eval_dashboard import classify, ghcli, health, post_health, tiers
 except ImportError:  # run as a script: scripts/eval_dashboard/gate_comment.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-    from eval_dashboard import classify, ghcli, health, post_health
+    from eval_dashboard import classify, ghcli, health, post_health, tiers
 
 STATE_SCHEMA_VERSION = 1
 # The hidden first line every comment starts with; how the next tick finds
