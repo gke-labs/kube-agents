@@ -141,7 +141,7 @@ under the job, #1478). It is one line, same marker and dedupe:
 
 > The Prow build node running this job went away at 10:19 AM ET (<node>).
 > Nothing was graded and nothing about your change is implied. `/retest` once
-> new jobs are progressing. [Details →](run.html?build=<build id>)
+> new jobs are progressing. [Details →](run.html#build=<build id>)
 
 Ran 128 min before the node went away · build log
 ```

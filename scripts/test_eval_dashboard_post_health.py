@@ -578,7 +578,7 @@ class LostPods(RunHarness):
         self.assertEqual(
             self.opener.texts[0],
             "🟡 *Smoke gate: flaky* — the build cluster lost 5 nodes at 10:05 AM ET; 12 runs on 12 PRs died mid-run. Not your code; retest once new jobs are running.\n"
-            f"{URL}?since=2026-09-11T14:05:52Z#gate",
+            f"{URL}#since=2026-09-11T14:05:52Z&view=gate",
         )
 
     def test_a_few_lost_pods_say_how_many_without_calling_it_an_event_and_still_file(self):
@@ -606,7 +606,7 @@ class LostPods(RunHarness):
         self.assertIn("**Affected PRs:** #926, #1118, #1246, #1258, #1319, #1351, #1362, #1439, #1451, #1456, #1460, #1471.", text)
         self.assertIn("- lost pods: 12 runs on 12 PRs died with their build node 14:05–14:19 UTC", text)
         self.assertIn("**Advice for authors:** nothing about your change; `/retest` once new jobs are progressing.", text)
-        self.assertIn(f"Incident brief: {URL}?since=2026-09-11T14:05:52Z#gate", text)
+        self.assertIn(f"Incident brief: {URL}#since=2026-09-11T14:05:52Z&view=gate", text)
         self.assertTrue(text.rstrip().endswith("Filed automatically by the smoke health bot; the cluster owner should check the node events and autorepair; the bot will not close it."))
         self.assertTrue(self.opener.texts[0].split("\n")[0].endswith("retest once new jobs are running. Tracking #1300."))
         self.assertEqual(self.recorded()["issue"], {"number": 1300, "url": "https://github.com/gke-labs/kube-agents/issues/1300", "condition": "lost_pods"})

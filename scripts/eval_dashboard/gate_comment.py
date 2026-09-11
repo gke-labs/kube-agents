@@ -371,7 +371,7 @@ def render_lost_comment(run: health.Run, health_doc: dict) -> str:
     shape = BOX_LOST_EVENT if incident.get("event") else BOX_LOST_SOME
     event = shape.format(runs=incident.get("runs", 0), prs=len(incident.get("prs") or [])) if in_event else ""
     node = f" ({run.pod_node})" if run.pod_node else ""
-    links = [LINK_DETAILS.format(url=RUN_URL.format(build_id=run.build_id))]
+    links = [LINK_DETAILS.format(url=post_health.run_link(run.build_id))]
     if in_event:
         links.append(LINK_BRIEF.format(url=post_health.incident_link(health_doc)))
     box = BOX_LOST.format(when=post_health.clock(run.finished), node=node, event=event)
