@@ -3,7 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+__BASE__
 <title>__TITLE__</title>
+<!-- The page's data, inlined by render.py: pages.js boots from these two
+     elements, so the page renders whole with no request beyond itself; the
+     poll of the published brief.json is a best-effort refresh on top. -->
+__INLINE_BRIEF__
+__INLINE_HEALTH__
 <style>
   /* The same visual tokens as legacy.html (index.html.tmpl); the two page
      kinds this template renders -- the Brief and the PR view -- share them
@@ -176,7 +182,7 @@
   <span class="meta"><span id="headmeta">__META__</span> · <span id="freshness" class="fresh">__FRESHNESS__</span></span>
 </div></div>
 
-<div class="wrap"><div id="app"><noscript>This page renders in the browser from <code>brief.json</code>; the <a href="legacy.html">legacy view</a> is the server-rendered table.</noscript></div></div>
+<div class="wrap"><div id="app"><noscript>This page renders in the browser from the data inlined in it; the <a href="legacy.html">legacy view</a> is the server-rendered table.</noscript></div></div>
 
 <script>
 __PAGES_JS__

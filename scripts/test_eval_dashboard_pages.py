@@ -112,19 +112,51 @@ def strict_date_parse_page(page: pathlib.Path) -> pathlib.Path:
     return copy
 
 
-def dom_text(page: pathlib.Path, query: str = "", fragment: str = "") -> str:
-    """The page's #app innerHTML after the script ran, via headless Chrome."""
+def dom_html(page: pathlib.Path, query: str = "", fragment: str = "") -> str:
+    """The whole document after the script ran, via headless Chrome. From
+    file:// every fetch fails, which is the condition a host that answers
+    an XHR with a login redirect puts the pages in."""
     url = page.as_uri() + (f"?{query}" if query else "") + fragment
     result = subprocess.run(
         [chrome(), "--headless", "--disable-gpu", "--no-sandbox", "--virtual-time-budget=3000", "--dump-dom", url],
         capture_output=True, text=True, timeout=90, check=False,
     )
-    html = result.stdout
+    return result.stdout
+
+
+def dom_text(page: pathlib.Path, query: str = "", fragment: str = "") -> str:
+    """The page's #app innerHTML after the script ran."""
+    html = dom_html(page, query, fragment)
     start = html.find('<div id="app">')
     # Slice up to the page's own inline script (its first comment line), not
     # the first <script> tag: an injected tag inside #app must stay visible.
     end = html.find("<script>\n/* The Brief", start)
     return html[start:end]
+
+
+def freshness_badge(html: str) -> tuple[str, str]:
+    """(class, text) of the header's freshness badge in a rendered document."""
+    match = re.search(r'<span id="freshness" class="([^"]*)">([^<]*)</span>', html)
+    assert match, "no freshness badge in the document"
+    return match.group(1), match.group(2)
+
+
+def clock_page(page: pathlib.Path, now_iso: str) -> pathlib.Path:
+    """A copy of the rendered page whose wall clock is pinned to
+    ``now_iso``, so the badge's age and staleness are the test's, not the
+    day the suite happens to run."""
+    ms = int(render.iso_ms(now_iso))
+    shim = f"<script>Date.now = () => {ms};</script>"
+    copy = page.with_name(page.stem + "-clock" + page.suffix)
+    copy.write_text(page.read_text().replace("<head>", "<head>" + shim, 1))
+    return copy
+
+
+def inline_blob(html: str, element_id: str):
+    """The parsed JSON of a page's ``<script type="application/json">``
+    data element, or None when the page carries none by that id."""
+    match = re.search(rf'<script type="application/json" id="{element_id}">(.*?)</script>', html, re.DOTALL)
+    return json.loads(match.group(1)) if match else None
 
 
 class HealthInputsTest(unittest.TestCase):
@@ -301,16 +333,65 @@ class RenderedFilesTest(unittest.TestCase):
             self.assertIn('data-page="brief"', index)
             self.assertIn('timeZone: PAGE.tz', index.replace("Object.assign({ timeZone: PAGE.tz }", "timeZone: PAGE.tz"))
             self.assertIn('tz: "America/Toronto"', index)
-            self.assertIn("brief:", index)
             self.assertIn("\\u003c", render.bootstrap_json({"x": "<script>"}))
-            self.assertNotIn("__BRIEF_JSON__", index)
             self.assertNotIn("__PAGES_JS__", index)
+            self.assertNotIn("__INLINE_", index)
+            self.assertNotIn("__BASE__", index)
             run_page = (out / "run.html").read_text()
             self.assertIn('data-page="run"', run_page)
             legacy = (out / "legacy.html").read_text()
             self.assertIn('href="index.html">Brief</a>', legacy)
             self.assertIn('id="agent"', legacy)
+            self.assertNotIn("__BASE__", legacy)
             self.assertFalse((out / "health.json").exists(), "the adjudicator owns health.json")
+
+    def test_each_page_carries_its_data_inline(self):
+        # The pages must render with no request beyond themselves (the
+        # published host answers an XHR with a login redirect), so brief.json
+        # and the verdict travel inside each page as JSON data elements.
+        data = load_fixture()
+        data["generated_at"] = NOW
+        with tempfile.TemporaryDirectory() as tmp:
+            out = render_to(tmp, data, health=health_doc())
+            brief = json.loads((out / "brief.json").read_text())
+            for name in ("index.html", "run.html"):
+                page = (out / name).read_text()
+                head = page.split("<body", 1)[0]
+                self.assertEqual(inline_blob(head, render.INLINE_BRIEF_ID), brief, f"{name}: the inline brief is brief.json")
+                self.assertEqual(inline_blob(head, render.INLINE_HEALTH_ID), brief["health"], f"{name}: the inline verdict")
+                self.assertEqual(page.count('id="inline-brief">'), 1, f"{name}: one copy of the document, not two")
+                raw = re.search(r'id="inline-brief">(.*?)</script>', head, re.DOTALL).group(1)
+                self.assertNotIn("<", raw, f"{name}: no '<' inside the data element, so no string in it can close it")
+            self.assertIn('inlineBrief: "inline-brief"', page, "pages.js reads the id render.py writes")
+            self.assertIn('inlineHealth: "inline-health"', page)
+            self.assertNotIn("brief: ", page.split("const PAGE = {")[1].split("};")[0], "brief.json is no longer a JS literal inside pages.js")
+            # No verdict: the health element is absent and the page still parses its brief.
+            out = render_to(pathlib.Path(tmp) / "nohealth", data)
+            page = (out / "index.html").read_text()
+            self.assertIsNone(inline_blob(page, render.INLINE_HEALTH_ID))
+            self.assertIsNone(inline_blob(page, render.INLINE_BRIEF_ID)["health"])
+
+    def test_base_href_only_with_a_public_url(self):
+        data = load_fixture()
+        data["generated_at"] = NOW
+        with tempfile.TemporaryDirectory() as tmp:
+            out = render_to(tmp, data)
+            for name in ("index.html", "run.html", "legacy.html"):
+                self.assertNotIn("<base", (out / name).read_text(), f"{name}: a local render keeps relative links")
+            out = render_to(pathlib.Path(tmp) / "pub", data, extra_args=["--public-url", "https://example.test/evals"])
+            for name in ("index.html", "run.html", "legacy.html"):
+                page = (out / name).read_text()
+                self.assertEqual(page.count("<base "), 1, name)
+                self.assertIn('<base href="https://example.test/evals/">', page.split("<body", 1)[0], f"{name}: in <head>, with the trailing slash")
+            # A trailing slash on the flag is not doubled.
+            out = render_to(pathlib.Path(tmp) / "slash", data, extra_args=["--public-url", "https://example.test/evals/"])
+            self.assertIn('<base href="https://example.test/evals/">', (out / "index.html").read_text())
+            # The bare flag names the published dashboard, post_health's URL.
+            out = render_to(pathlib.Path(tmp) / "bare", data, extra_args=["--public-url"])
+            self.assertIn('<base href="https://storage.cloud.google.com/kube-agents-dashboards/evals/">', (out / "index.html").read_text())
+            self.assertEqual(render.PUBLISHED_SITE + "/index.html", render.post_health.DASHBOARD_URL)
+        self.assertEqual(render.base_html(None), "")
+        self.assertEqual(render.base_html('https://h/"><script>'), '<base href="https://h/&quot;&gt;&lt;script&gt;/">')
 
     def test_hostile_data_never_escapes_the_script_block(self):
         data = load_fixture()
@@ -572,6 +653,42 @@ class BrowserTest(unittest.TestCase):
         self.assertIn(f"No run with that id in the last {render.RUN_VIEW_DAYS} days.", app)
         app = dom_text(self.run_page)
         self.assertIn("Which run?", app)
+
+    def test_pages_render_whole_when_every_fetch_fails(self):
+        # From file:// every fetch fails, as it does on storage.cloud.google.com
+        # (an XHR there is answered with a login redirect). The pages must
+        # render fully from their inlined data, the badge must not call the
+        # feed unreachable, and it must say how old the page can be instead.
+        # The clock is pinned to the data's generated_at so the badge is fresh.
+        for name, query, expect in (
+            ("index.html", "", "3 gate cases fail on every PR"),
+            ("index.html", "", "Runs in this window"),
+            ("run.html", "build=2097282860221206528", "3 of 10 gate cases failed. None of them look like your PR."),
+        ):
+            page = clock_page(self.out / name, NOW)
+            html = dom_html(page, query=query)
+            app = html[html.find('<div id="app">'):html.find("<script>\n/* The Brief")]
+            self.assertIn(expect, app, f"{name}?{query}")
+            self.assertNotIn("could not render", app, name)
+            cls, text = freshness_badge(html)
+            self.assertEqual(cls, "fresh", f"{name}: not amber")
+            self.assertNotIn("UNREACHABLE", text, name)
+            self.assertNotIn("STALE", text, name)
+            self.assertEqual(text, "updated Tue 10:30 AM ET · 0m ago · regenerated every 15 min", name)
+        # The legacy page's content is baked; its badge follows the same rule.
+        cls, text = freshness_badge(dom_html(clock_page(self.out / "legacy.html", NOW)))
+        self.assertEqual((cls, text), ("fresh", "updated 14:30 UTC · 0m ago · regenerated every 15 min"))
+
+    def test_old_inline_data_still_reads_stale(self):
+        # Not calling a failed poll UNREACHABLE must not hide real staleness:
+        # inlined data older than its stale_after_s (7200 s default) is STALE.
+        three_hours_on = "2026-09-08T17:30:00+00:00"
+        for name in ("index.html", "run.html", "legacy.html"):
+            cls, text = freshness_badge(dom_html(clock_page(self.out / name, three_hours_on)))
+            self.assertEqual(cls, "fresh stale", name)
+            self.assertTrue(text.startswith("STALE · updated "), f"{name}: {text}")
+            self.assertIn("180m ago · regenerated every 15 min", text, name)
+            self.assertNotIn("UNREACHABLE", text, name)
 
 
 if __name__ == "__main__":

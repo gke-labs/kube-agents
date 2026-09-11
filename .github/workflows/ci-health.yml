@@ -326,7 +326,10 @@ jobs:
           [ -f work/health.json ] && render_args+=(--health work/health.json)
           [ -f work/health-history.jsonl ] && render_args+=(--health-history work/health-history.jsonl)
           [ -f work/health-history.jsonl ] || echo "::warning::no health-history.jsonl this tick; the Brief renders the current verdict only"
-          python3 scripts/eval_dashboard/render.py --data work/data.json --out-dir work/site "${render_args[@]}"
+          # --public-url (bare) emits <base href> for the published site,
+          # post_health.DASHBOARD_URL's directory, so the pages' links
+          # resolve there whatever URL the console login lands on.
+          python3 scripts/eval_dashboard/render.py --data work/data.json --out-dir work/site "${render_args[@]}" --public-url
           python3 scripts/eval_dashboard/publish.py --out-dir work/site --target "$DASHBOARD_BUCKET/"
 
       - name: Fetch the webhook URL (optional alternative to the Chat API)
