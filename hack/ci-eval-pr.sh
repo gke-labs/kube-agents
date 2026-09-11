@@ -1300,6 +1300,16 @@ TASKS=(
   # Uncomment when the agent can diagnose a capped pool, not before.
   # "./tasks/cluster-agent-pending-replicas-capped-pool/task.yaml"
   # gpu-stress-test-diagnosis: moved to NIGHTLY_TASKS 2026-09-03 (tofu wall clock, #1218/#1202).
+  # vcs-history-only-fact: the version-control skill's route-and-answer case
+  # (#1253). Seen red on main and green three times on the branch in the dev
+  # project, where the GitOps repository carries the git-access corpus branch
+  # `git-access-ab/r200` it reads. The eval pool repositories
+  # (`gke-agentic/<project>-infra`) do not carry that branch yet; pushing it
+  # is a fleet-activation step, and until it is done the case fails every
+  # run with the branch absent, which is broken rather than red. Uncomment
+  # once the branch is on every pool repository -- into NIGHTLY_TASKS if the
+  # clone-plus-history round trip prices above a presubmit seat.
+  # "./tasks/vcs-history-only-fact/task.yaml"
   "./tasks/agent-kanban-smoke/task.yaml"
   # knowledge-grounding-sources-probe: moved to NIGHTLY_TASKS 2026-09-09 after one
   # presubmit cycle (#945) -- knowledge grounding is not a core kube-agents journey.

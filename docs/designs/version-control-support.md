@@ -526,7 +526,17 @@ default clone, edit, commit, publish sequence writing to the shared line of
 development with nothing in the protocol objecting. `vcs.py` refuses it before
 it builds the bundle so the message costs no round trip, and the broker refuses
 it again with `TARGET_IS_BRANCH` rather than trusting the client that sent the
-objects.
+objects. That comparison alone is not enough, because `target` is the client's
+field too: naming any other existing branch as the target would skip it and
+leave two ancestry checks that a fast-forward of the shared branch satisfies.
+So the broker also asks the remote which branch is its default and refuses a
+publish to that branch outright, `PROTECTED_BRANCH`, whatever the request says
+the target is. The client, which alone knows which branch its copy was cloned
+from, refuses to publish that branch under any target, and tells the broker
+which branch that was (`clonedFrom`) so the broker refuses it too,
+`CLONED_BRANCH` — defence in depth for a confused caller, since a client that
+lied would gain nothing it could not get by omitting the field. A protected branch that is not the default is the forge's own
+branch protection to enforce; the broker does not claim to know it.
 
 The scratch repository is never checked out. It is fetched into and pushed from,
 and nothing materialises a working tree, so a `.gitattributes`, a hook, or a
@@ -763,8 +773,8 @@ another for no property gained.
 | `issue-create`                       | `{repository, title, body?, labels?}`                      | `{issue}`                                             |
 
 Refusals carry a code: 501 `FORGE_UNSUPPORTED`, 413 `CLONE_TOO_LARGE` and
-`BUNDLE_TOO_LARGE`, 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED` and
-`TARGET_IS_BRANCH`, 502 `GIT_FAILED`.
+`BUNDLE_TOO_LARGE`, 409 `NOT_FAST_FORWARD`, `BASE_MOVED`, `BRANCH_DIVERGED`,
+`TARGET_IS_BRANCH`, `CLONED_BRANCH` and `PROTECTED_BRANCH`, 502 `GIT_FAILED`.
 
 A refusal the forge itself produced is translated rather than forwarded, and it
 is written for the reader it has. That reader is a model choosing its next tool
@@ -1424,9 +1434,12 @@ agents/platform/scripts/
     credentials.py         # Credential protocol, BrokeredCredential, StaticFileCredential
     registry.py            # AVAILABLE, build_forges(config)
     github/
-      __init__.py  forge.py  translate.py  errors.py  fixtures/
+      __init__.py  forge.py  translate.py  errors.py
     gitlab/
-      __init__.py  forge.py  translate.py  fixtures/
+      __init__.py  forge.py  translate.py
+  testdata/
+    providers/
+      github/  gitlab/       # recorded API responses the contract harness replays
 ```
 
 The split is by _who owns the decision_. `providers/` holds everything a forge
@@ -1537,13 +1550,14 @@ every change rather than in a nightly.
 ### The contract test, parameterised
 
 The verb tests are one suite parameterised over `AVAILABLE`, not a file per
-forge. Each forge package supplies a `fixtures/` directory of recorded API
-responses — the JSON its host actually returns for each of the eight verbs — and
-the suite reads them.
+forge. Each forge supplies a directory of recorded API responses — the JSON its
+host actually returns for each of the eight verbs — under
+`testdata/providers/<forge name>/`, beside the tests and outside the package the
+images ship, and the suite finds it by the forge's name.
 
 That inverts where the cost falls. A per-forge test file means holding a new
 forge to the same assertions is a shared-test edit somebody has to remember to
-make; here a new package ships its fixtures and the existing suite picks it up.
+make; here a new forge adds its recordings and the existing suite picks them up.
 The same assertions about normalised shape, about `ForgeUnsupported` for
 unimplemented verbs, about validators rejecting the same inputs, run against it
 without anyone touching a shared test.

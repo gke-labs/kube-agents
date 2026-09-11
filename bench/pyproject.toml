@@ -54,6 +54,7 @@ kubeagents = "kube_agents_bench.harness:KubeAgentsHarness"
 fleet_resource_property = "kube_agents_bench.verifiers:FleetResourcePropertyVerifier"
 ledger_issue_contains = "kube_agents_bench.verifiers:LedgerIssueContainsVerifier"
 report_contains = "kube_agents_bench.verifiers:ReportContainsVerifier"
+worker_commands = "kube_agents_bench.verifiers:WorkerCommandsVerifier"
 tool_called = "kube_agents_bench.verifiers:ToolCalledVerifier"
 
 # Required for the git-URL dependency pin above.

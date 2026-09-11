@@ -159,12 +159,14 @@ matched objects, with `op` one of eq/ne/gt/gte/lt/lte/exists/absent/contains/mat
 `pod_healthy` (pods matching a selector reach Ready), and `scaling_complete` (a
 deployment's ready replicas land in a range).
 
-Three read what the run produced, from this repository
+Four read what the run produced, from this repository
 (`bench/kube_agents_bench/verifiers.py`, registered through the
 `devops_bench.verifiers` entry-point group in `bench/pyproject.toml`):
 `report_contains` (phrases in the agent's answer), `tool_called` (calls in the
-trajectory), and `ledger_issue_contains` (the GitHub ledger issue a fleet audit
-published).
+trajectory), `ledger_issue_contains` (the GitHub ledger issue a fleet audit
+published), and `worker_commands` (regular expressions over the terminal commands
+the delegated workers ran, read from each card's worker log before the harness
+purges it).
 
 Two limits are worth knowing before choosing one. `tool_called` sees the delegating
 turn's calls only — a delegated worker's calls never reach the trajectory — so it can
@@ -173,9 +175,12 @@ safeguard built on it is blind to the calls it fears; use `resource_property` fo
 And `report_contains` defaults to `scope: final`, the answer the user receives. `full`
 also matches a phrase the agent merely quoted in progress chatter, which passes a
 required phrase that was never reported and false-fails a forbidden one that only appears
-in quoted material.
+in quoted material. `worker_commands` is the complement of the `tool_called` limit: it is
+the one check that sees the route a worker took, but only its terminal commands, never
+its MCP tool calls, and only for cards the run delegated — a router that answered without
+delegating leaves it nothing to read, which is `status: "error"`, not a pass.
 
-All six fail closed. A check that cannot observe its subject returns `status: "error"`,
+All seven fail closed. A check that cannot observe its subject returns `status: "error"`,
 never a pass and never a fail, and an errored check drops `VerificationCoverage` below
 1.0, which the gate fails. Silence is not a pass.
 

@@ -47,6 +47,7 @@ import http.client
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -97,6 +98,13 @@ INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 # finished answer by searching the filesystem.
 _ATTACHMENTS_DIR = "/opt/data/kanban/attachments"
 _LOGS_DIR = "/opt/data/kanban/logs"
+# One terminal command per line in a card's worker log, as hermes renders it:
+# ``  ┊ 💻 $         <command>  0.6s [exit 1]``. The timing and exit suffixes
+# are stripped; the command is kept verbatim otherwise.
+_WORKER_COMMAND_RE = re.compile(
+    r"💻 \$\s+(?P<command>.+?)(?:\s+\d+(?:\.\d+)?s(?: \[exit \d+\])?)?\s*$"
+)
+_MAX_WORKER_LOG_BYTES = 512_000
 
 # Bound on artifact text folded into one answer. The judge grades the output as
 # prose, so a worker that writes a large file would otherwise bury the reply.
@@ -530,6 +538,51 @@ def _append_artifacts(result: AgentResult, task_ids: list[str], timeout: float) 
     _append_final(result, sections)
 
 
+_LOG_PRESENT = "__WORKER_LOG__"
+_LOG_ABSENT = "__NO_WORKER_LOG__"
+
+
+def _worker_commands(task_ids: list[str], timeout: float) -> list[dict[str, str]] | None:
+    """Every terminal command the delegated workers ran, from their card logs.
+
+    The worker is a separate hermes session and its tool calls never reach
+    ``result.trajectory`` (see ``ToolCalledVerifier``), but its log records
+    each terminal command it executed. Read here, before ``_purge_card_state``
+    deletes the log, and stashed for the ``worker_commands`` verifier -- the
+    one check that can say which route a worker took, not only what it
+    answered. Only terminal commands are visible; MCP tool calls are not.
+
+    ``None`` when any card's log could not be read at all. ``_agent_shell``
+    returns ``""`` for a kubectl that failed as readily as for an empty file,
+    and the first time this ran, a credential hiccup on the runner turned a
+    worker that had run dozens of commands into "0 command(s)" -- which
+    failed the required pattern for the wrong reason and passed the forbidden
+    one for no reason. The script therefore prints a sentinel before the log
+    (or a different one when the file is absent), and a reply carrying
+    neither is a capture failure, which the verifier reports as
+    ``status="error"`` rather than grading.
+    """
+    commands: list[dict[str, str]] = []
+    for tid in task_ids:
+        path = _shell_quote(f"{_LOGS_DIR}/{tid}.log")
+        script = (
+            f'if [ -f {path} ]; then echo {_LOG_PRESENT}; head -c {_MAX_WORKER_LOG_BYTES} {path}; '
+            f"else echo {_LOG_ABSENT}; fi"
+        )
+        text = _agent_shell(script, timeout)
+        first, _, body = text.partition("\n")
+        if first.strip() == _LOG_ABSENT:
+            continue
+        if first.strip() != _LOG_PRESENT:
+            _log.warning("worker log for %s could not be read; route checks will error", tid)
+            return None
+        for line in body.splitlines():
+            match = _WORKER_COMMAND_RE.search(line)
+            if match:
+                commands.append({"task": tid, "command": match.group("command").strip()})
+    return commands
+
+
 def _purge_card_state(task_ids: list[str], timeout: float) -> None:
     """Delete the attachments and worker log of every card this run filed.
 
@@ -780,6 +833,7 @@ class KubeAgentsHarness(AgentHarness):
             prompt=prompt,
             final_message=str(result.metadata.get("final_message") or ""),
             started_at=started_at,
+            worker_commands=result.metadata.get("worker_commands"),
         )
         return result
 
@@ -1124,6 +1178,7 @@ class KubeAgentsHarness(AgentHarness):
         """
         _append_delivered(result, observed, awaited)
         _append_artifacts(result, awaited, _EXEC_TIMEOUT)
+        result.metadata["worker_commands"] = _worker_commands(awaited, _EXEC_TIMEOUT)
         _purge_card_state(awaited, _EXEC_TIMEOUT)
 
     @staticmethod

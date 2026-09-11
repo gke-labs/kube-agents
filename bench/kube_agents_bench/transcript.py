@@ -97,6 +97,12 @@ class TranscriptSnapshot:
     # a phrase check against it passes on progress chatter; checks default to
     # this field instead.
     final_message: str = ""
+    # Every terminal command the delegated workers ran, as ``{"task", "command"}``
+    # rows parsed from each card's worker log before the harness purged it.
+    # ``None`` means the harness captured nothing -- no card was delegated, or
+    # the run ended before settlement -- which ``worker_commands`` reports as
+    # ``status="error"``; an empty list means workers ran and typed nothing.
+    worker_commands: list[dict[str, str]] | None = None
 
 
 _current: TranscriptSnapshot | None = None
@@ -109,6 +115,7 @@ def set(  # noqa: A001 - deliberate, matches get/clear
     prompt: str = "",
     final_message: str = "",
     started_at: float = 0.0,
+    worker_commands: list[dict[str, str]] | None = None,
 ) -> None:
     """Stash the just-finished run's transcript for the verifiers.
 
@@ -125,6 +132,7 @@ def set(  # noqa: A001 - deliberate, matches get/clear
         prompt_head=prompt[:64],
         final_message=final_message or output,
         started_at=started_at,
+        worker_commands=None if worker_commands is None else list(worker_commands),
     )
 
 

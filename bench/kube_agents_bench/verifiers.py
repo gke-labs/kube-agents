@@ -71,6 +71,7 @@ __all__ = [
     "LedgerIssueContainsVerifier",
     "ReportContainsVerifier",
     "ToolCalledVerifier",
+    "WorkerCommandsVerifier",
 ]
 
 _NO_TRANSCRIPT_REASON = (
@@ -339,6 +340,99 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
         return None
+
+
+_NO_WORKER_COMMANDS_REASON = (
+    "no delegated worker's commands were captured for this run: either no card "
+    "was delegated, the run ended before the cards settled, or the harness "
+    "predates command capture -- so this check could not be evaluated"
+)
+_MAX_NAMED_COMMANDS = 5
+
+
+@VERIFIERS.register("worker_commands")
+class WorkerCommandsVerifier(BaseVerifier):
+    """Pattern checks against the terminal commands the delegated workers ran.
+
+    The one check that sees the ROUTE a worker took rather than the answer it
+    gave. ``tool_called`` cannot: a worker's calls never reach the trajectory.
+    The harness reads each delegated card's worker log before purging it and
+    stashes every ``💻 $`` line as a command (``transcript.worker_commands``);
+    this verifier matches Python regular expressions against those strings,
+    ``re.search`` on each command verbatim.
+
+    ``required_patterns``: each must match at least one command.
+    ``forbidden_patterns``: none may match any command.
+
+    Limits, stated so a case is not written against them: only terminal
+    commands are visible, not MCP tool calls; only delegated workers' logs
+    are read, never the router's; and a command the shell resolved through an
+    alias appears as typed. Fails closed like its siblings -- a run with no
+    captured worker commands is ``status="error"``, not a pass.
+    """
+
+    type: Literal["worker_commands"]
+    required_patterns: list[str] = Field(default_factory=list)
+    forbidden_patterns: list[str] = Field(default_factory=list)
+
+    @field_validator("required_patterns", "forbidden_patterns")
+    @classmethod
+    def _patterns_compile(cls, patterns: list[str]) -> list[str]:
+        for pattern in patterns:
+            re.compile(pattern)
+        return patterns
+
+    def verify(self, timeout_sec: float) -> VerificationResult:
+        start = time.monotonic()
+        snap = transcript.get()
+        if snap is None:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_TRANSCRIPT_REASON,
+            )
+        if snap.worker_commands is None:
+            return VerificationResult(
+                success=False,
+                status="error",
+                elapsed_time=time.monotonic() - start,
+                reason=_NO_WORKER_COMMANDS_REASON,
+            )
+        commands = [row.get("command", "") for row in snap.worker_commands]
+        missing = [
+            p for p in self.required_patterns
+            if not any(re.search(p, c) for c in commands)
+        ]
+        hits = [
+            (p, c) for p in self.forbidden_patterns for c in commands if re.search(p, c)
+        ]
+        if missing or hits:
+            parts = []
+            if missing:
+                parts.append(
+                    f"no worker command matched required pattern(s) {missing} "
+                    f"across {len(commands)} command(s)"
+                )
+            if hits:
+                shown = "; ".join(
+                    f"{p!r} matched {c[:120]!r}" for p, c in hits[:_MAX_NAMED_COMMANDS]
+                )
+                more = f" (+{len(hits) - _MAX_NAMED_COMMANDS} more)" if len(hits) > _MAX_NAMED_COMMANDS else ""
+                parts.append(f"forbidden pattern(s) matched worker commands: {shown}{more}")
+            return VerificationResult(
+                success=False,
+                elapsed_time=time.monotonic() - start,
+                reason="; ".join(parts),
+            )
+        return VerificationResult(
+            success=True,
+            elapsed_time=time.monotonic() - start,
+            reason=(
+                f"{len(commands)} worker command(s): all {len(self.required_patterns)} "
+                f"required pattern(s) matched, none of {len(self.forbidden_patterns)} forbidden"
+            ),
+        )
 
 
 def _http_get_json(url: str, token: str, timeout: float) -> tuple[int, Any]:
