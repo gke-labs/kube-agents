@@ -123,13 +123,23 @@ DIGEST_WINDOW = timedelta(minutes=20)
 OUTAGE_REPOST_INTERVAL = timedelta(hours=2)
 
 DASHBOARD_URL = "https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html"
+# The directory the pages are published in; the PR view lives beside the Brief.
+DASHBOARD_SITE = DASHBOARD_URL.rsplit("/", 1)[0]
+DASHBOARD_RUN_PAGE = "run.html"
 # Every message ends with a deep link into the dashboard, on a line of its
-# own so Chat auto-links it. The shape is a contract with the dashboard:
-# `?cases=<comma-separated case ids>&since=<ISO 8601 UTC>[&until=<ISO 8601
-# UTC>]` before the fragment, then `#gate` for an incident message and
-# `#agent` for the digest. Commas and colons stay literal.
-DASHBOARD_SECTION_GATE = "gate"
-DASHBOARD_SECTION_AGENT = "agent"
+# own so Chat auto-links it. The shape is a contract with the dashboard
+# (`linkState()` in template/pages.js reads it; SCHEMA.md states it): the
+# whole scope travels in the URL fragment,
+# `#since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>][&cases=<comma-separated
+# case ids>]&view=gate` for an incident message and `view=agent` for the
+# digest, `run.html#build=<prow build id>` for one run. The fragment
+# because the published host's login redirect drops a query string and a
+# browser carries the fragment through a redirect. Commas and colons stay
+# literal. dashboard_link and run_link are the only writers of these
+# shapes; gate_comment.py and gate_issue.py import them rather than
+# spelling a second copy.
+DASHBOARD_VIEW_GATE = "gate"
+DASHBOARD_VIEW_AGENT = "agent"
 
 # The message wording. One sentence of cause, one of what to do, then the
 # link; the details live behind the link. Case names are read by a human
@@ -301,23 +311,29 @@ def iso_z(value: datetime | None) -> str | None:
     return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ") if value else None
 
 
-def dashboard_link(section: str, cases=(), since: datetime | None = None, until: datetime | None = None) -> str:
-    """The deep link (see DASHBOARD_SECTION_*): query before fragment, empty
-    parameters omitted, nothing percent-encoded -- case ids are slugs and
-    the timestamps are the `Z` form."""
+def dashboard_link(view: str, cases=(), since: datetime | None = None, until: datetime | None = None) -> str:
+    """The deep link into the Brief (see DASHBOARD_VIEW_*): every parameter
+    in the fragment, `view` last, empty parameters omitted, nothing
+    percent-encoded -- case ids are slugs and the timestamps are the `Z`
+    form."""
     params = []
-    if cases:
-        params.append("cases=" + ",".join(cases))
     if since:
         params.append(f"since={iso_z(since)}")
     if until:
         params.append(f"until={iso_z(until)}")
-    query = "?" + "&".join(params) if params else ""
-    return f"{DASHBOARD_URL}{query}#{section}"
+    if cases:
+        params.append("cases=" + ",".join(cases))
+    params.append(f"view={view}")
+    return f"{DASHBOARD_URL}#{'&'.join(params)}"
 
 
 def incident_link(health: dict, until: datetime | None = None) -> str:
-    return dashboard_link(DASHBOARD_SECTION_GATE, health.get("failing_cases") or [], parse_iso(health.get("since")), until)
+    return dashboard_link(DASHBOARD_VIEW_GATE, health.get("failing_cases") or [], parse_iso(health.get("since")), until)
+
+
+def run_link(build_id) -> str:
+    """The PR view for one prow build: `run.html#build=<id>`."""
+    return f"{DASHBOARD_SITE}/{DASHBOARD_RUN_PAGE}#build={build_id}"
 
 
 def describe_cases(cases) -> str:
@@ -425,7 +441,7 @@ def render_recovery(health: dict, prev: dict, now: datetime) -> str:
         f"🟢 *Smoke gate: healthy again* — fixed after {lasted} ({', '.join(parts)}).",
         # The closed incident: the cases and start the space was told, and
         # now as its end.
-        dashboard_link(DASHBOARD_SECTION_GATE, prev.get("failing_cases") or [], since, now),
+        dashboard_link(DASHBOARD_VIEW_GATE, prev.get("failing_cases") or [], since, now),
     ]
     return "\n".join(lines)
 
@@ -445,7 +461,7 @@ def render_digest(health: dict, now: datetime) -> str:
         # The window is measured from the data's horizon, so during a stall
         # these are the same numbers every morning; say so every morning.
         lines.append(f"⚪ No fresh data since {clock(parse_iso(health.get('generated_at')))} — these numbers stop there. Someone check the refresh job.")
-    lines.append(dashboard_link(DASHBOARD_SECTION_AGENT, health.get("failing_cases") or [], parse_iso(health.get("since"))))
+    lines.append(dashboard_link(DASHBOARD_VIEW_AGENT, health.get("failing_cases") or [], parse_iso(health.get("since"))))
     return "\n".join(lines)
 
 

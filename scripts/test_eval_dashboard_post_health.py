@@ -18,6 +18,7 @@ import pathlib
 import tempfile
 import unittest
 import urllib.error
+import urllib.parse
 from datetime import datetime, timezone
 
 from eval_dashboard import post_health
@@ -198,7 +199,7 @@ class Shapes(RunHarness):
             self.opener.texts[0],
             "🔴 *Smoke gate: broken* — the 3 crashloop tests fail on every PR since 5:00 AM ET (6 PRs so far). Shared test fixture, not your code.\n"
             "Don't retest yet. Tracking #1278.\n"
-            f"{URL}?cases=cluster-agent-crashloop-debug,cluster-agent-crashloop-evidence-chain,cluster-agent-crashloop-misleading-symptom&since=2026-09-08T09:00:00Z#gate",
+            f"{URL}#since=2026-09-08T09:00:00Z&cases=cluster-agent-crashloop-debug,cluster-agent-crashloop-evidence-chain,cluster-agent-crashloop-misleading-symptom&view=gate",
         )
 
     def test_outage_without_an_issue_says_so(self):
@@ -212,7 +213,7 @@ class Shapes(RunHarness):
         self.assertEqual(
             self.opener.texts[0],
             "🟡 *Smoke gate: flaky* — quota storm 1:15 PM–2:25 PM ET hit 3 PRs.  Passing runs still count; if yours went red, retest after 2:55 PM ET.\n"
-            f"{URL}?since=2026-09-03T18:30:00Z#gate",
+            f"{URL}#since=2026-09-03T18:30:00Z&view=gate",
         )
 
     def test_setup_deaths(self):
@@ -220,7 +221,7 @@ class Shapes(RunHarness):
         self.assertEqual(
             self.opener.texts[0],
             "🟡 *Smoke gate: flaky* — 4 runs on 4 PRs died during setup since 9:00 AM ET.  Passing runs still count; if yours died before any test ran, retest.\n"
-            f"{URL}?since=2026-09-05T13:00:00Z#gate",
+            f"{URL}#since=2026-09-05T13:00:00Z&view=gate",
         )
 
     def test_recovery(self):
@@ -229,7 +230,7 @@ class Shapes(RunHarness):
         self.assertEqual(
             self.opener.texts[1],
             "🟢 *Smoke gate: healthy again* — fixed after 11h (the 3 crashloop tests were failing, #1269).\n"
-            f"{URL}?cases=cluster-agent-crashloop-debug,cluster-agent-crashloop-evidence-chain,cluster-agent-crashloop-misleading-symptom&since=2026-09-07T14:00:00Z&until=2026-09-08T01:00:00Z#gate",
+            f"{URL}#since=2026-09-07T14:00:00Z&until=2026-09-08T01:00:00Z&cases=cluster-agent-crashloop-debug,cluster-agent-crashloop-evidence-chain,cluster-agent-crashloop-misleading-symptom&view=gate",
         )
 
     def test_recovery_from_a_storm(self):
@@ -241,7 +242,7 @@ class Shapes(RunHarness):
         self.tick(health(), self.at(DIGEST_UTC, 5))
         self.assertEqual(
             self.opener.texts[0],
-            f"📊 *Smoke gate, last 24h:* 31 runs · 26 green · 2 PR-caused red · 5 infra · typical run 125 min\n{URL}?since=2026-09-04T03:30:00Z#agent",
+            f"📊 *Smoke gate, last 24h:* 31 runs · 26 green · 2 PR-caused red · 5 infra · typical run 125 min\n{URL}#since=2026-09-04T03:30:00Z&view=agent",
         )
 
     def test_stale_and_fresh_again(self):
@@ -265,7 +266,8 @@ class Shapes(RunHarness):
         # The links stay ISO UTC.
         self.tick(outage(since="2026-09-08T11:30:00+00:00"), T0)
         self.assertIn("since 7:30 AM ET", self.opener.texts[0])
-        self.assertTrue(self.opener.texts[0].endswith("&since=2026-09-08T11:30:00Z#gate"))
+        self.assertIn("#since=2026-09-08T11:30:00Z&", self.opener.texts[0])
+        self.assertTrue(self.opener.texts[0].endswith("&view=gate"))
 
     def test_case_descriptions(self):
         d = post_health.describe_cases
@@ -487,7 +489,7 @@ class TrackingIssue(RunHarness):
         self.assertIn("- `cost-idle-pool-probe`\n- `reliability-pdb-probe`", body["body"])
         self.assertIn("**Window:** since Tue 7:30 AM ET (2026-09-08T11:30:00+00:00), 3 PRs red so far.", body["body"])
         self.assertIn("**Class:** shared fixture/environment break: cost-idle-pool-probe, reliability-pdb-probe (`shared_break`).", body["body"])
-        self.assertIn(f"Incident brief: {URL}?cases=cost-idle-pool-probe,reliability-pdb-probe&since=2026-09-08T11:30:00Z#gate", body["body"])
+        self.assertIn(f"Incident brief: {URL}#since=2026-09-08T11:30:00Z&cases=cost-idle-pool-probe,reliability-pdb-probe&view=gate", body["body"])
         self.assertTrue(body["body"].rstrip().endswith("Filed automatically by the smoke health bot; edit freely. Fix PRs: reference this issue."))
         self.assertEqual(self.opener.texts[0].split("\n")[1], "Don't retest yet. Tracking #1300.")
         recorded = self.recorded()
@@ -546,30 +548,72 @@ class TrackingIssue(RunHarness):
 # --------------------------------------------------------------------------- #
 
 
+class LinkBuilders(unittest.TestCase):
+    """post_health.dashboard_link and run_link are the one Python writer of
+    the dashboard's URL contract (SCHEMA.md, "URL contract"): every
+    parameter in the fragment, none in the query, so the scope survives
+    the published host's login redirect."""
+
+    SINCE = datetime(2026, 9, 11, 14, 42, 37, tzinfo=timezone.utc)
+    UNTIL = datetime(2026, 9, 11, 16, 50, 9, tzinfo=timezone.utc)
+
+    def test_every_parameter_is_in_the_fragment_and_the_query_is_empty(self):
+        link = post_health.dashboard_link(post_health.DASHBOARD_VIEW_GATE, ["a-probe", "b-probe"], self.SINCE, self.UNTIL)
+        self.assertEqual(link, f"{URL}#since=2026-09-11T14:42:37Z&until=2026-09-11T16:50:09Z&cases=a-probe,b-probe&view=gate")
+        parts = urllib.parse.urlsplit(link)
+        self.assertEqual(parts.query, "", "nothing rides in the query string")
+        self.assertEqual(
+            urllib.parse.parse_qs(parts.fragment),
+            {"since": ["2026-09-11T14:42:37Z"], "until": ["2026-09-11T16:50:09Z"], "cases": ["a-probe,b-probe"], "view": ["gate"]},
+            "the fragment parses as key=value pairs, the way URLSearchParams reads it",
+        )
+
+    def test_empty_parameters_are_omitted_and_view_is_always_last(self):
+        self.assertEqual(post_health.dashboard_link(post_health.DASHBOARD_VIEW_AGENT), f"{URL}#view=agent")
+        self.assertEqual(post_health.dashboard_link(post_health.DASHBOARD_VIEW_GATE, [], self.SINCE), f"{URL}#since=2026-09-11T14:42:37Z&view=gate")
+        self.assertEqual(post_health.dashboard_link(post_health.DASHBOARD_VIEW_GATE, ["a-probe"]), f"{URL}#cases=a-probe&view=gate")
+
+    def test_incident_link_reads_the_health_document(self):
+        doc = outage(cases=["a-probe"], since="2026-09-11T14:42:37+00:00")
+        self.assertEqual(post_health.incident_link(doc), f"{URL}#since=2026-09-11T14:42:37Z&cases=a-probe&view=gate")
+        self.assertEqual(post_health.incident_link(doc, self.UNTIL), f"{URL}#since=2026-09-11T14:42:37Z&until=2026-09-11T16:50:09Z&cases=a-probe&view=gate")
+
+    def test_run_link_is_the_pr_view_beside_the_brief(self):
+        self.assertEqual(post_health.run_link("2097282860221206528"), "https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html#build=2097282860221206528")
+        self.assertEqual(post_health.DASHBOARD_SITE + "/index.html", URL)
+
+
 class DeepLinks(RunHarness):
     """Every message but the stale notice ends with the dashboard deep link the
-    dashboard understands: query before fragment, literal commas and colons,
-    #gate for an incident, #agent for the digest."""
+    dashboard understands: the whole scope in the fragment, literal commas
+    and colons, view=gate for an incident, view=agent for the digest."""
 
     def last_line(self, index=-1):
         return self.opener.texts[index].split("\n")[-1]
 
     def test_a_state_change_links_the_cases_and_the_start(self):
         self.tick(outage(cases=["cluster-agent-crashloop-debug", "cluster-agent-crashloop-evidence-chain"], since="2026-09-08T03:08:00+00:00"), T0)
-        self.assertEqual(self.last_line(), f"{URL}?cases=cluster-agent-crashloop-debug,cluster-agent-crashloop-evidence-chain&since=2026-09-08T03:08:00Z#gate")
+        self.assertEqual(self.last_line(), f"{URL}#since=2026-09-08T03:08:00Z&cases=cluster-agent-crashloop-debug,cluster-agent-crashloop-evidence-chain&view=gate")
 
     def test_a_storm_links_the_start_without_cases(self):
         self.tick(storm(since="2026-09-04T18:30:00+00:00"), T0)
-        self.assertEqual(self.last_line(), f"{URL}?since=2026-09-04T18:30:00Z#gate")
+        self.assertEqual(self.last_line(), f"{URL}#since=2026-09-04T18:30:00Z&view=gate")
 
     def test_a_recovery_closes_the_incident_with_until(self):
         self.tick(outage(cases=["x-probe"], since="2026-09-04T03:08:00+00:00", prs=(1, 2, 3)), T0)
         self.tick(health(since="2026-09-04T14:00:00+00:00"), T0.replace(hour=14))
-        self.assertEqual(self.last_line(), f"{URL}?cases=x-probe&since=2026-09-04T03:08:00Z&until=2026-09-04T14:00:00Z#gate")
+        self.assertEqual(self.last_line(), f"{URL}#since=2026-09-04T03:08:00Z&until=2026-09-04T14:00:00Z&cases=x-probe&view=gate")
 
     def test_the_digest_links_the_agent_section(self):
         self.tick(health(since="2026-09-04T03:30:00+00:00"), self.at(DIGEST_UTC, 5))
-        self.assertEqual(self.last_line(), f"{URL}?since=2026-09-04T03:30:00Z#agent")
+        self.assertEqual(self.last_line(), f"{URL}#since=2026-09-04T03:30:00Z&view=agent")
+
+    def test_no_message_carries_a_query_string(self):
+        self.tick(outage(cases=["x-probe"], since="2026-09-04T03:08:00+00:00", prs=(1, 2, 3)), T0)
+        self.tick(health(since="2026-09-04T14:00:00+00:00"), self.at(DIGEST_UTC, 5))
+        self.assertEqual(len(self.opener.texts), 3, "the change, the recovery and the digest")
+        for text in self.opener.texts:
+            self.assertEqual(urllib.parse.urlsplit(text.split("\n")[-1]).query, "", text)
 
     def test_the_link_is_the_whole_last_line(self):
         self.tick(storm(since="2026-09-04T18:30:00+00:00"), T0)

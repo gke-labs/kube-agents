@@ -159,8 +159,8 @@ class Shapes(Harness):
             lines[3],
             "> 🔴 **Gate outage in progress** since Sun 7:30 AM ET. The 3 crashloop tests fail on every PR (7 PRs so far)."
             " **Your 3 failures are exactly those 3, so this red is not your code.** Don't retest yet; run `/retest` once #kube-agents-ci-health says the gate is healthy again."
-            " [Why this run failed →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html?build=100)"
-            " · [Incident brief →](https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html?cases=cluster-agent-crashloop-debug,cluster-agent-crashloop-evidence-chain,cluster-agent-crashloop-misleading-symptom&since=2026-09-06T11:30:00Z#gate)",
+            " [Why this run failed →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html#build=100)"
+            " · [Incident brief →](https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html#since=2026-09-06T11:30:00Z&cases=cluster-agent-crashloop-debug,cluster-agent-crashloop-evidence-chain,cluster-agent-crashloop-misleading-symptom&view=gate)",
         )
         self.assertIn("| Case | Result | Also failing on |", body)
         self.assertIn("| `cluster-agent-crashloop-debug` | 0 / 3 reps | 7 other PRs |", body)
@@ -186,7 +186,7 @@ class Shapes(Harness):
         self.assertEqual(
             lines[3],
             "> 🟢 **Gate healthy.** `security-overgrant-probe` passed on the last 9 runs from other PRs and failed on your last 4. **This looks specific to your PR.**"
-            " [Why this run failed →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html?build=103)",
+            " [Why this run failed →](https://storage.cloud.google.com/kube-agents-dashboards/evals/run.html#build=103)",
         )
         self.assertIn("| `security-overgrant-probe` | 0 / 3 reps | no other PR |", body)
         self.assertIn("Reason: `", body)

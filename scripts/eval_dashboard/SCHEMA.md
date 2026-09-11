@@ -359,21 +359,38 @@ the question imports it.
 
 ### URL contract
 
-`index.html?cases=a,b&since=<ISO 8601 UTC>&until=<ISO 8601 UTC>#gate|#agent`
+`index.html#since=<ISO 8601 UTC>&until=<ISO 8601 UTC>&cases=a,b&view=gate|agent`
+`run.html#build=<prow build id>`
+
+Every parameter travels in the URL fragment as `key=value` pairs joined
+by `&`. `storage.cloud.google.com` answers an unauthenticated request with
+a login redirect that comes back without the query string, so a scope
+carried there arrived empty and the reader landed on the unscoped Brief; a
+browser never sends the fragment to the server and carries it through a
+redirect, so a scope carried there survives. The older form,
+`index.html?cases=a,b&since=…&until=…#gate|#agent` and
+`run.html?build=<id>`, is still read — links already posted to Chat,
+pull requests and issues keep working — and a key present in both places
+is read from the query. `linkState()` in `template/pages.js` is the one
+parser; `post_health.dashboard_link` / `run_link` (Python: the Chat
+messages, the gate comment, the tracking issue) and `incidentHref` /
+`runHref` (the pages' own links) are the writers.
 
 - `cases`, `since`, `until` scope the Brief to that incident (a past one
   when `until` is given). `since` is matched to an incident in
   `health-history.jsonl`; without history the parameters describe it.
-- `#agent` shows the last 24 hours in numbers; `#gate` lands on the
-  "why we think" block. No parameters: the current state from `health.json`.
+- `view=agent` shows the last 24 hours in numbers; `view=gate` lands on
+  the "why we think" block (the page scrolls to the section after it
+  renders). No parameters: the current state from `health.json`.
 - Case ids match `[A-Za-z0-9][A-Za-z0-9._-]{0,79}`; the first 50
   (`maxLinkCases`) that do are read, and a link the pages write carries at
   most those 50. A value that fails its grammar is dropped and everything
   reaches the DOM escaped.
 - `since` and `until` are read with a `Z`, a space separator, or a UTC
   offset written `+02:00` or `+0200`, and converted; the pages themselves
-  write `Z`.
-- `run.html?build=<digits>`; an id not in `brief.json` shows a
+  write `Z`, and nothing a writer emits is percent-encoded (the case-id
+  grammar and the `Z` form need none).
+- `run.html#build=<digits>`; an id not in `brief.json` shows a
   not-found page naming the window (`RUN_VIEW_DAYS`, 14 days).
 
 ### `brief.json` (written by `render.py`)

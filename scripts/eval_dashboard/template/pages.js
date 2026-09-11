@@ -19,9 +19,14 @@
  * data older than its own stale_after_s reads STALE.
  *
  * Every time a reader sees is America/Toronto ("ET"), formatted with
- * Intl.DateTimeFormat. URL parameters stay ISO 8601 UTC:
- *   index.html?cases=a,b&since=<ISO>&until=<ISO>#agent|#gate
- *   run.html?build=<prow build id>
+ * Intl.DateTimeFormat. URL parameters stay ISO 8601 UTC and travel in the
+ * fragment, which a login redirect on the published host preserves where
+ * it drops the query string:
+ *   index.html#since=<ISO>&until=<ISO>&cases=a,b&view=gate|agent
+ *   run.html#build=<prow build id>
+ * The older query form (`?cases=a,b&since=<ISO>&until=<ISO>` before a bare
+ * `#gate` or `#agent`; `?build=<id>` on run.html) is still read, so links
+ * already posted keep working.
  */
 "use strict";
 
@@ -58,6 +63,9 @@ const PAGE = {
   maxLinkCases: 50,
   caseIdRe: /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/,
   isoParamRe: /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?)?(?:Z|[+-]\d{2}:?\d{2})?$/,
+  // The Brief's two views (`view=` in a link, or the bare `#gate`/`#agent`
+  // anchors older links carry); each is also the id of the section it lands on.
+  views: { gate: "gate", agent: "agent" },
   states: { GREEN: "hs-green", DEGRADED: "hs-amber", OUTAGE: "hs-red", PAST: "hs-past" },
   glyphs: { GREEN: "🟢", DEGRADED: "🟡", OUTAGE: "🔴", PAST: "⚪" },
   spyglass: "https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents",
@@ -179,32 +187,50 @@ function linkCaseIds(values) {
   return values.map((v) => String(v).trim()).filter((id) => PAGE.caseIdRe.test(id)).slice(0, PAGE.maxLinkCases);
 }
 
+// The one place a URL is read. The parameters are `key=value` pairs read
+// from the query string first (the form links carried before the fragment
+// form; a key present in both is the query's) and then from the fragment
+// (`#since=…&until=…&cases=…&view=…`, `#build=…`). A bare `#gate` or
+// `#agent`, the old anchors, still selects that view.
 function linkState() {
-  const out = { cases: new Set(), sinceMs: null, untilMs: null, build: null, hash: "" };
-  let params;
-  try { params = new URLSearchParams(location.search); } catch (err) { return out; }
-  for (const id of linkCaseIds((params.get("cases") || "").split(","))) out.cases.add(id);
-  const since = params.get("since") || "";
+  const out = { cases: new Set(), sinceMs: null, untilMs: null, build: null, view: "" };
+  let query, fragment;
+  try {
+    query = new URLSearchParams(location.search);
+    fragment = new URLSearchParams(location.hash.slice(1));
+  } catch (err) { return out; }
+  const param = (key) => query.get(key) ?? fragment.get(key) ?? "";
+  for (const id of linkCaseIds(param("cases").split(","))) out.cases.add(id);
+  const since = param("since");
   if (PAGE.isoParamRe.test(since)) out.sinceMs = parseIso(since);
-  const until = params.get("until") || "";
+  const until = param("until");
   if (out.sinceMs != null && PAGE.isoParamRe.test(until)) {
     const untilMs = parseIso(until);
     if (untilMs != null && untilMs >= out.sinceMs) out.untilMs = untilMs;
   }
-  const build = (params.get("build") || "").trim();
+  const build = param("build").trim();
   if (/^[0-9]{1,25}$/.test(build)) out.build = build;
-  out.hash = /^#(agent|gate)$/.test(location.hash) ? location.hash : "";
+  const view = param("view") || location.hash.slice(1);
+  out.view = Object.values(PAGE.views).includes(view) ? view : "";
   return out;
 }
 
-function incidentHref(inc) {
+// The links the pages write, in the fragment form linkState reads. Nothing
+// is percent-encoded: the case ids passed linkCaseIds' grammar and the
+// timestamps are utcIso's `Z` form, so the text is the same one
+// post_health.dashboard_link writes.
+function briefHref(view, inc = {}) {
   const params = [];
-  const cases = linkCaseIds(inc.cases);
-  if (cases.length) params.push(`cases=${cases.map(encodeURIComponent).join(",")}`);
-  if (inc.sinceMs != null) params.push(`since=${encodeURIComponent(utcIso(inc.sinceMs))}`);
-  if (inc.untilMs != null) params.push(`until=${encodeURIComponent(utcIso(inc.untilMs))}`);
-  return "index.html" + (params.length ? `?${params.join("&")}` : "") + "#gate";
+  if (inc.sinceMs != null) params.push(`since=${utcIso(inc.sinceMs)}`);
+  if (inc.untilMs != null) params.push(`until=${utcIso(inc.untilMs)}`);
+  const cases = linkCaseIds(inc.cases || []);
+  if (cases.length) params.push(`cases=${cases.join(",")}`);
+  params.push(`view=${view}`);
+  return `index.html#${params.join("&")}`;
 }
+const incidentHref = (inc) => briefHref(PAGE.views.gate, inc);
+const numbersHref = () => briefHref(PAGE.views.agent);
+const runHref = (run) => `run.html#build=${encodeURIComponent(run.build)}`;
 
 /* ---- links out ---- */
 
@@ -219,7 +245,6 @@ const issueLink = (issue) => {
   return match ? `<a href="${PAGE.issueUrl}/${match[1]}">${esc(issue)}</a>` : esc(issue);
 };
 const projectShort = (project) => (project ? String(project).replace(/^kube-agents-/, "") : "unknown");
-const runHref = (run) => `run.html?build=${encodeURIComponent(run.build)}`;
 
 /* ---- runs and windows ---- */
 
@@ -582,7 +607,7 @@ function lastIncidentHtml() {
 function briefHtml(link) {
   const inc = resolveIncident(link);
   const anchor = nowMs();
-  if (link.hash === "#agent" || !inc) {
+  if (link.view === PAGE.views.agent || !inc) {
     const sinceMs = anchor - PAGE.numbersWindowMs;
     const healthy = !inc && !!health;
     const noVerdict = !inc && !health;
@@ -633,7 +658,7 @@ function briefHtml(link) {
 
 function footHtml() {
   const generated = parseIso(brief.generated_at);
-  return `<div class="foot"><span>Full history table: <a href="legacy.html">legacy view</a></span><span><a href="index.html#agent">The last 24 hours in numbers</a></span><span><a href="${PAGE.rulesUrl}">How the tags are decided</a></span><span class="mut">data generated ${esc(generated != null ? et(generated) : "unknown")}${brief.run_days ? ` · runs from the last ${esc(brief.run_days)} days` : ""}</span></div>`;
+  return `<div class="foot"><span>Full history table: <a href="legacy.html">legacy view</a></span><span><a href="${esc(numbersHref())}">The last 24 hours in numbers</a></span><span><a href="${PAGE.rulesUrl}">How the tags are decided</a></span><span class="mut">data generated ${esc(generated != null ? et(generated) : "unknown")}${brief.run_days ? ` · runs from the last ${esc(brief.run_days)} days` : ""}</span></div>`;
 }
 
 /* ---- the PR view ---- */
@@ -703,7 +728,7 @@ function whatToDoHtml(run) {
 }
 
 function runHtml(link) {
-  if (!link.build) return `<div class="sec head"><h1>Which run?</h1><div class="lede">Open this page as <code>run.html?build=&lt;prow build id&gt;</code>; the gate comment on a PR links here. <a href="index.html">Back to the brief →</a></div></div>` + footHtml();
+  if (!link.build) return `<div class="sec head"><h1>Which run?</h1><div class="lede">Open this page as <code>run.html#build=&lt;prow build id&gt;</code>; the gate comment on a PR links here. <a href="index.html">Back to the brief →</a></div></div>` + footHtml();
   const run = runs().find((r) => String(r.build) === link.build);
   if (!run) return `<div class="sec head"><h1>No run with that id in the last ${esc(brief.run_days ?? "?")} days.</h1><div class="lede">Build <code>${esc(link.build)}</code> is not in the data behind this page: older than its window, still running, or never uploaded. <a href="index.html">Back to the brief →</a></div></div>` + footHtml();
   const startMs = parseIso(run.started), finishMs = parseIso(run.finished);
@@ -759,8 +784,10 @@ function renderAll() {
   if (nav) nav.textContent = page === "run" && link.build ? `PR view` : "PR view";
   document.title = page === "run" ? "kube-agents · smoke run" : "kube-agents · smoke gate brief";
   renderFreshness();
-  if (link.hash) {
-    const target = document.querySelector(link.hash);
+  // The section is rendered just above, after the browser looked for the
+  // anchor, and a `view=` fragment names no element anyway: scroll by hand.
+  if (link.view) {
+    const target = document.getElementById(link.view);
     if (target) target.scrollIntoView();
   }
 }
