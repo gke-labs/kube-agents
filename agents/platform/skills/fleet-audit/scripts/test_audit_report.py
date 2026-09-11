@@ -1663,6 +1663,14 @@ class TestAuditCatalogue(unittest.TestCase):
         the thing that produces them.
         """
         audible = {"all", "chat"}
+        # The one entry whose product is not a chat message: `chat-delivery-watch`
+        # exists to notice that the chat leg is down, and reports on a GitHub
+        # ledger issue and a log line fluent-bit ships instead
+        # (`chat_delivery_watch.py`). A chat delivery for it would be circular.
+        # The exemption is pinned to a `no_agent` job whose script exists, so a
+        # prompt job cannot borrow it.
+        local_by_design = {"chat-delivery-watch"}
+        scripts_dir = Path(__file__).resolve().parents[4] / "platform" / "scripts"
         watchdogs = self.governance_jobs()
         self.assertTrue(
             watchdogs,
@@ -1671,6 +1679,11 @@ class TestAuditCatalogue(unittest.TestCase):
         )
         for job_id, job in sorted(watchdogs.items()):
             with self.subTest(job=job_id):
+                if job_id in local_by_design:
+                    self.assertEqual(job.get("deliver"), "local")
+                    self.assertTrue(job.get("no_agent"))
+                    self.assertTrue((scripts_dir / str(job.get("script"))).is_file())
+                    continue
                 self.assertIn(
                     job.get("deliver"),
                     audible,
@@ -1748,6 +1761,7 @@ class TestAuditCatalogue(unittest.TestCase):
                 "eod-event-watcher-daily-report",
                 "kanban-workspace-gc",
                 "findings-morning-nudge",
+                "chat-delivery-watch",
             },
             set(live) - prompted,
             "the platform roster's `no_agent` entries are not the expected "

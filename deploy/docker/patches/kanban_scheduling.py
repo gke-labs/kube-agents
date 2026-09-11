@@ -1,17 +1,18 @@
 """Scheduling repairs for ``hermes_cli/kanban_db.py``.
 
-Three faults share this one upstream file, so they share one patch quartet.
-Splitting them across three appliers meant three anchored rewrites of
-``kanban_db.py`` racing to stay consistent with each other, two import trailers,
-and a build gate whose halves could disagree about what the engine now does.
-They are merged here; ``apply_kanban_scheduling.py`` carries the anchors,
-``verify_kanban_scheduling.py`` replays all three against a real board inside
+Four faults share this one upstream file, so they share one patch quartet.
+Splitting them across separate appliers meant several anchored rewrites of
+``kanban_db.py`` racing to stay consistent with each other, multiple import
+trailers, and a build gate whose halves could disagree about what the engine now
+does. They are merged here; ``apply_kanban_scheduling.py`` carries the anchors,
+``verify_kanban_scheduling.py`` replays all four against a real board inside
 the image. The breaker-counter fix (part 3) is a pure source rewrite with no
 runtime code, so its reasoning lives in the applier docstring rather than here.
 
 Part 1 — inverted fan-out dependencies (``repair_inverted_dependencies``)
 Part 2 — claims fenced to a process life (``release_dead_foreign_claims``)
 Part 3 — the breaker counter, in ``apply_kanban_scheduling.py``
+Part 4 — a waiting coordinator holds a slot (``count_waiting_on_children``)
 
 ===========================================================================
 Part 1: repair inverted fan-out dependency edges instead of deadlocking
@@ -394,14 +395,54 @@ six cards at once still cannot collapse into one systemic verdict — the proper
 this module was written to protect, and the reason
 ``charge_reclaimed_cards`` is a separate pass rather than extra
 ``crash_details`` entries.
+
+===========================================================================
+Part 4: a coordinator waiting on its children must not hold their slot
+===========================================================================
+
+``dispatch_once`` caps concurrency by counting ``status='running'`` cards, and a
+card waiting on the work it fanned out is still ``running``. So the coordinator
+holds a slot for its whole wait and its own children compete for what is left.
+At the shipped ``max_in_progress`` of 2 (``agents/chat/config.yaml``, matching
+``defaultKanbanMaxInProgress``) two waiters wedge the board outright.
+
+Neither exit from ``running`` is open. ``kanban_complete`` is refused while
+recorded children are unsettled (``tools/kanban_children_settled.py``, #1010) and
+``kanban_block(kind="dependency")`` is forbidden by ``agents/platform/SOUL.md``
+because it routes to ``todo`` and respawns every few seconds — part 1's fault by
+another route. It self-clears when the coordinator runs out of iterations or its
+retry lands inside the gate's ``NUDGE_TTL_SECONDS``, so it reads as slowness.
+
+``count_waiting_on_children`` counts those waiters and the patched
+``count_running_tasks`` subtracts them. Waiting means holding a recorded child
+that is neither settled nor gated behind this card —
+``kanban_children_settled._LIVE_CHILDREN_SQL``'s question, and its
+gated-continuation exemption is right here too, since a child this card gates
+cannot start until it completes.
+
+Patched at the counter rather than its two call sites because
+``count_running_tasks_other_boards`` calls it per board, and the cap is
+host-level. The attribution table is created on first write, so the read
+fails open to zero — no attribution, no waiters, upstream's count. That is the
+state during the build, which verifies this patch stages before installing the
+writer.
+
+Cost: real process count becomes ``cap + waiting coordinators``, unbounded. A cap
+that counts waiters does not bound memory either — it deadlocks, and the wedged
+coordinator stays resident. The backstop is upstream's ``_memory_pressure_level``
+check in the dispatch tick, reactive where the cap is preventive. It lives in
+Hermes rather than this repository, so nothing here pins it.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from typing import NamedTuple, Optional
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Part 1: inverted fan-out dependency edges
@@ -848,3 +889,72 @@ def charge_reclaimed_cards(conn, task_ids, record_failure) -> list[str]:
         ):
             tripped.append(task_id)
     return tripped
+
+
+# ---------------------------------------------------------------------------
+# Part 4: a coordinator waiting on its children must not hold their slot
+# ---------------------------------------------------------------------------
+
+# Owned by ``tools/kanban_children_settled.py``, which installs several build
+# stages later. Duplicated rather than imported to keep ``hermes_cli`` off
+# ``tools``; ``apply_kanban_scheduling`` reconciles all three names against it at
+# import time, so a rename there fails the build instead of zeroing this count.
+# The columns are listed because the SQL below names them and a rename would be
+# swallowed by the fail-open, which is the one drift the table name misses.
+CHILDREN_TABLE = "kanban_worker_children"
+CHILD_SETTLED_STATUSES = ("done", "archived")
+CHILD_COLUMNS = ("child_id", "creator_id")
+
+_WAITING_ON_CHILDREN_SQL = (
+    "SELECT COUNT(*) FROM tasks t"
+    " WHERE t.status = 'running'"
+    "   AND EXISTS ("
+    f"        SELECT 1 FROM {CHILDREN_TABLE} c"
+    "         JOIN tasks ct ON ct.id = c.child_id"
+    "         WHERE c.creator_id = t.id"
+    f"          AND ct.status NOT IN ({','.join('?' * len(CHILD_SETTLED_STATUSES))})"
+    "           AND NOT EXISTS ("
+    "                 SELECT 1 FROM task_links l"
+    "                  WHERE l.parent_id = c.creator_id"
+    "                    AND l.child_id = c.child_id"
+    "           )"
+    "   )"
+)
+
+
+def count_waiting_on_children(conn) -> int:
+    """``running`` cards that are only waiting for work they fanned out.
+
+    Subtracted from ``count_running_tasks`` so a waiter does not hold the slot
+    its children need. Waiting means holding an unsettled recorded child that is
+    not gated behind this card — ``kanban_children_settled``'s test, so the two
+    never disagree about whether a card is done waiting.
+
+    Fails open to 0, including for a board whose attribution table was never
+    written. Zero is upstream's count, so an error here narrows dispatch rather
+    than unbounding it.
+
+    A fail-open that says nothing hides its own cause, so anything but the
+    missing table warns. The missing table is the documented pre-upgrade state
+    and recurs every tick until the writer installs, so it stays at debug.
+    """
+    try:
+        row = conn.execute(
+            _WAITING_ON_CHILDREN_SQL, CHILD_SETTLED_STATUSES
+        ).fetchone()
+        return int(row[0]) if row else 0
+    except Exception as exc:  # noqa: BLE001 — never break the dispatch tick
+        # Matched on the message rather than the type because the table is
+        # missing rather than empty, which sqlite reports as OperationalError —
+        # the same type a renamed column raises, and that one is drift.
+        if "no such table" in str(exc):
+            logger.debug(
+                "kanban_scheduling: no attribution table yet, no discount: %r", exc
+            )
+        else:
+            logger.warning(
+                "kanban_scheduling: counting waiting coordinators failed, "
+                "no discount applied this tick: %r",
+                exc,
+            )
+        return 0

@@ -649,6 +649,22 @@ def tracking_issues(cases: list[str], notes: dict[str, dict]) -> list[str]:
     return issues
 
 
+def issue_tag(issue) -> str | None:
+    """"#1278" for the {number, url} the poster filed or adopted; None otherwise."""
+    number = issue.get("number") if isinstance(issue, dict) else None
+    return f"#{number}" if number else None
+
+
+def all_tracking(cases: list[str], notes: dict, issue) -> list[str]:
+    """case-notes.yaml's issues for these cases, plus the bot's own if it is
+    not already among them."""
+    issues = tracking_issues(cases, notes)
+    tag = issue_tag(issue)
+    if tag and tag not in issues:
+        issues.append(tag)
+    return issues
+
+
 def advice_for(
     state: str,
     condition: str | None,
@@ -656,6 +672,7 @@ def advice_for(
     storm_end: datetime | None,
     notes: dict,
     recovering: bool = False,
+    issue: dict | None = None,
 ) -> str:
     """What the reader should do. Keyed on the condition, not on whether it
     is still firing: a storm being left is still a storm, not a setup
@@ -665,7 +682,7 @@ def advice_for(
     if recovering:
         return ADVICE_RECOVERING.format(count=RECOVERY_GREEN_RUNS)
     if condition == SHARED_BREAK:
-        issues = tracking_issues(cases, notes)
+        issues = all_tracking(cases, notes, issue)
         return ADVICE_OUTAGE.format(tracking=", ".join(issues) if issues else ADVICE_OUTAGE_NO_ISSUE)
     if condition == STORM:
         when = hhmm(storm_end + STORM_COOLDOWN) if storm_end else "the storm ends"
@@ -831,17 +848,26 @@ def adjudicate(
     notes: dict | None = None,
     runs: list | None = None,
     wall_clock: datetime | None = None,
+    posted: dict | None = None,
 ) -> dict:
     """data.json + previous health.json -> health.json (as a dict).
 
     `now` is the data's horizon, the instant every window is measured from.
     `wall_clock`, when given, is compared against it for staleness; a replay
-    or a pinned `--now` passes None and is never stale.
+    or a pinned `--now` passes None and is never stale. `posted` is the
+    poster's state file (post_health.py), read for the tracking issue the
+    bot filed: it rides in `issue` and the advice while the state is not
+    GREEN, and is dropped on recovery.
     """
     if runs is None:
         runs = load_runs(data)
     assessed = assess(runs, now, roster)
     decided = transition(prev, assessed, now)
+    issue = None
+    if decided["state"] != GREEN:
+        issue = (posted or {}).get("issue") or (prev or {}).get("issue") or None
+        if not issue_tag(issue):
+            issue = None
     evidence = list(assessed["evidence"])
     if decided["recovering"]:
         evidence.append(
@@ -852,7 +878,7 @@ def adjudicate(
         evidence.append(f"{assessed['state']} condition seen but not yet current; holding {decided['state']}")
 
     advice = advice_for(
-        decided["state"], decided["condition"], decided["failing_cases"], assessed["storm_end"], notes or {}, decided["recovering"]
+        decided["state"], decided["condition"], decided["failing_cases"], assessed["storm_end"], notes or {}, decided["recovering"], issue
     )
     stale_after = DEFAULT_STALE_AFTER
     if isinstance(data.get("stale_after_s"), (int, float)):
@@ -874,7 +900,8 @@ def adjudicate(
         "since": iso(decided["since"]),
         "cause": decided["cause"],
         "failing_cases": decided["failing_cases"],
-        "tracking_issues": tracking_issues(decided["failing_cases"], notes or {}),
+        "tracking_issues": all_tracking(decided["failing_cases"], notes or {}, issue),
+        "issue": issue,
         "incident": incident,
         "evidence": evidence,
         "advice": advice,
@@ -1065,6 +1092,7 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--data", type=pathlib.Path, required=True, help="data.json (schema v1)")
     parser.add_argument("--prev", type=pathlib.Path, help="the previous health.json (missing is fine)")
+    parser.add_argument("--posted-state", type=pathlib.Path, help="post_health.py's state file, for the tracking issue it filed (missing is fine)")
     parser.add_argument("--out", type=pathlib.Path, help="where to write health.json (default: stdout)")
     parser.add_argument(
         "--now",
@@ -1117,6 +1145,7 @@ def main(argv=None) -> int:
             load_json(args.fixture_status),
             notes,
             wall_clock=None if args.now else wall_clock,
+            posted=load_json(args.posted_state),
         )
         text = json.dumps(health, indent=2) + "\n"
 

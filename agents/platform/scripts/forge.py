@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""forge.py — the five forge operations this harness needs, behind one seam.
+"""forge.py — the forge operations this harness needs, behind one seam.
 
 Staged into `$HERMES_HOME/scripts` by the entrypoint's step 2b force-sync, so
 every skill script on the Platform Agent's `sys.path` can import it.
 
 What this is for
 ----------------
-Reading and answering a pull-request conversation needs exactly five things from
-a code-hosting service: who am I, which pull requests are open, what has been
-said on one, say something back, and acknowledge that a request was seen. Those
-five are the whole forge-shaped surface of the feature; everything above them —
+Reading and answering a pull-request conversation needs a handful of things from
+a code-hosting service, and `ForgeProvider` below is the whole list: can I reach
+it, who am I, which pull requests are open, what has been said on one, what has
+landed on one, say something back, and acknowledge that a request was seen.
+Those are the whole forge-shaped surface of the feature; everything above them —
 what counts as addressing the agent, who is allowed to, when a request has
 already been answered — is harness policy that does not change between forges.
 
@@ -27,7 +28,7 @@ no GitHub token: `gh` is proxied to the credential sidecar, which is also why
 `ALLOWED_EXECUTABLES` is a closed list. Bitbucket has no comparable CLI, so a
 Bitbucket provider cannot shell anything at all — it needs a `/v1/<forge>/…`
 route on that sidecar. Funnelling every call through one override point means
-that provider replaces one method instead of reimplementing five.
+that provider replaces one method instead of reimplementing all of them.
 
 Three normalisations, and the forge that forced each
 ----------------------------------------------------
@@ -54,12 +55,18 @@ Three normalisations, and the forge that forced each
 
 On the repository parser
 ------------------------
-`_parse_repo` validates and normalizes repository slugs (`owner/repo`). `test_forge.py` verifies repository slug resolution.
+There is no longer one here. `repo_ref.py` parses every repository value this
+harness sees, and this module is one of its callers — see `provider_for`. The
+copy that used to live here read a configured `SETTINGS.md` line, which #504
+removed; it outlived its caller by a release, along with the parity test that
+held it level with a `resolver.py` function that is also gone.
 
-A second parser, `github_token_refresh.github_repo_from_remote`, reads the git
-remote rather than a configured value and rejects a non-GitHub host outright.
-Its host set carries `ssh.github.com` — GitHub's SSH-over-443 endpoint, which
-appears in a clone URL — so a remote of that form resolves there and not here.
+`github_token_refresh.github_repo_from_remote` reads the git remote rather than
+a configured value, and it now asks `repo_ref` the same question this module
+does. What separates the two is the host set each accepts, both declared in
+`repo_ref`: a remote may carry any of `GITHUB_HOSTS`, including
+`ssh.github.com`, GitHub's SSH-over-443 endpoint, which appears in a clone URL
+and nowhere a repository is configured.
 """
 
 from __future__ import annotations
@@ -72,6 +79,7 @@ import urllib.parse
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional, Protocol, Sequence
 
+import repo_ref
 import sandbox_exec
 from github_token_refresh import (
     GH_MISSING_RC,
@@ -82,8 +90,6 @@ from github_token_refresh import (
 )
 
 LOGGER = logging.getLogger(__name__)
-
-SETTINGS_PATH = "/opt/data/SETTINGS.md"
 
 #: How long any single `gh` call may take. A hung proxy must not hold the cron
 #: tick's per-job lock open indefinitely.
@@ -113,20 +119,6 @@ AGENT_BRANCH_PREFIX = "platform-agent/"
 #: `github-issue-resolver` already honours on issues.
 IGNORE_LABEL = "agent:ignore"
 
-#: The operator writes this literal when no GitOps repo is configured
-#: (`buildSettingsConfigMap` in `platformagent_manifests.go`). It means absent,
-#: not malformed — a distinction the two callers branch on differently.
-SETTINGS_REPO_UNSET = "none"
-
-# Host must sit at the *start* of the value, after an optional scheme and
-# optional userinfo. Copied from resolver.py, whose comment explains why the
-# obvious spellings admit `https://evil.com/github.com/attacker/repo`.
-REPO_URL_RE = re.compile(
-    r"^(?:(?:https?|git|ssh)://)?(?:[^/@]+@)?(?:www\.)?github\.com[/:]"
-    r"([a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+)"
-)
-BARE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-
 #: `permission` values from `repos/{repo}/collaborators/{user}/permission` that
 #: carry the standing to direct the agent. GitHub collapses the `maintain` and
 #: `triage` roles into this legacy field, so `maintain` arrives as `write` and
@@ -147,6 +139,12 @@ VIEWER_RE = re.compile(r"Logged in to \S+ account (\S+)")
 #: retried even for read-only queries.
 DEFINITIVE_HTTP_STATUS_RE = re.compile(r"HTTP (?:401|403|404)\b", re.IGNORECASE)
 
+#: Reason code for a repository whose host has no provider registered. Named
+#: here beside the other operator-facing strings rather than inline in
+#: `UnknownForgeHost`, the way `RepoUnparseable` takes
+#: `repo_ref.REASON_UNPARSEABLE`. `_forge_warning` renders it verbatim.
+REASON_HOST_UNSUPPORTED = "FORGE_HOST_UNSUPPORTED"
+
 
 class ForgeError(Exception):
     """A fault with a machine-readable reason code.
@@ -164,15 +162,31 @@ class ForgeError(Exception):
 
 
 class RepoUnparseable(ForgeError):
-    """SETTINGS.md names a repository that could not be understood.
+    """A registered repository value that could not be understood.
 
     Distinct from absent on purpose. Configuring nothing is a supported install
     with no work to do; configuring something unreadable is a fault, and
     silence there means the watcher stops working and nobody finds out.
+
+    The parse itself lives in `repo_ref`, which raises a plain `ValueError`
+    because the credential sidecar imports it and must not import this module.
+    This is where that becomes a reason code an operator sees.
     """
 
     def __init__(self, value: str):
-        super().__init__("GIT_REPO_UNPARSEABLE", value)
+        super().__init__(repo_ref.REASON_UNPARSEABLE, value)
+
+
+class UnknownForgeHost(ForgeError):
+    """A repository on a host this harness has no provider for.
+
+    Raised rather than falling back to GitHub. The fallback is what would send
+    `gh` at a same-named GitHub repository on behalf of a GitLab URL, which is
+    a different repository belonging to somebody else.
+    """
+
+    def __init__(self, host: str):
+        super().__init__(REASON_HOST_UNSUPPORTED, host)
 
 
 @dataclass(frozen=True)
@@ -328,35 +342,6 @@ def is_agent_pull_request(pr: PullRequest, repo: str, viewer: str) -> bool:
         and pr.head_ref.startswith(AGENT_BRANCH_PREFIX)
         and pr.head_repo.lower() == repo.lower()
     )
-
-
-def _valid_repo_component(part: str) -> bool:
-    """Reject path components unsafe to hand to `gh -R`.
-
-    The slug pattern permits "." and "-", so it happily produces "../..", and a
-    leading dash is parsed by `gh` as a flag. Neither is a shape the regex can
-    express.
-    """
-    return bool(part) and part not in (".", "..") and not part.startswith("-")
-
-
-def _parse_repo(configured: str) -> str:
-    """`owner/name` from a configured value, or raise `RepoUnparseable`."""
-    match = REPO_URL_RE.search(configured)
-    if match:
-        repo = match.group(1)
-    elif BARE_REPO_RE.match(configured):
-        repo = configured
-    else:
-        raise RepoUnparseable(configured)
-
-    repo = re.sub(r"\.git$", "", repo)
-    owner, _, name = repo.partition("/")
-    # After the shorthand branch, not instead of it: "../.." satisfies
-    # BARE_REPO_RE, so this is what rejects it.
-    if not _valid_repo_component(owner) or not _valid_repo_component(name):
-        raise RepoUnparseable(configured)
-    return repo
 
 
 def _should_retry_transient(result: subprocess.CompletedProcess) -> bool:
@@ -817,20 +802,34 @@ class GitHubProvider:
         return commits
 
 
-#: Host substring -> provider. One entry today; the point of the table is that
-#: adding a second is a registration rather than a branch in the sweep.
-PROVIDERS: dict[str, type] = {"github.com": GitHubProvider}
+#: Host -> provider, keyed on the parsed host and matched exactly. One forge
+#: today; the point of the table is that adding a second is a registration
+#: rather than a branch in the sweep.
+PROVIDERS: dict[str, type] = {host: GitHubProvider for host in repo_ref.GITHUB_HOSTS}
 
 
 def provider_for(repo: Optional[str] = None, **kwargs) -> ForgeProvider:
-    """Pick a provider from the host in repo or default to GitHub.
+    """Pick a provider from the host in `repo`, or GitHub when it names none.
 
     A bare `owner/repo` — which the operator accepts and writes through
     verbatim — names no host, so it means GitHub: that shorthand is `gh -R`'s
-    own form and no other forge shares it.
+    own form and no other forge shares it. A host this harness does not have a
+    provider for raises rather than falling back, because the fallback is what
+    turns a GitLab URL into GitHub calls against a same-named repository.
+
+    The host is compared after parsing, never searched for: the substring test
+    this replaced selected `GitHubProvider` for
+    `https://example.invalid/github.com/o/r`.
     """
-    lowered = (repo or "").lower()
-    for host, cls in PROVIDERS.items():
-        if host in lowered:
-            return cls(**kwargs)
-    return GitHubProvider(**kwargs)
+    if not repo:
+        return GitHubProvider(**kwargs)
+    try:
+        ref = repo_ref.parse(repo)
+    except repo_ref.RepoRefError as error:
+        raise RepoUnparseable(str(repo)) from error
+    if not ref.host:
+        return GitHubProvider(**kwargs)
+    provider = PROVIDERS.get(ref.host)
+    if provider is None:
+        raise UnknownForgeHost(ref.host)
+    return provider(**kwargs)

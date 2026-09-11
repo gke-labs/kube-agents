@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from common.redactor import SALT_ENV_VAR, AuditRedactor  # noqa: E402
+from common.redactor import SALT_ENV_VAR, AuditRedactor, RedactionRule  # noqa: E402
 import common.redactor as redactor_module  # noqa: E402
 
 
@@ -299,6 +299,190 @@ class TestPseudonymiseIdentity(unittest.TestCase):
 
     def test_non_string_input_does_not_raise(self):
         self.assertEqual(AuditRedactor.pseudonymise_identity(42), "42")
+
+
+class TestRedactionRules(unittest.TestCase):
+    """The operator-configured layer that runs after the credential patterns."""
+
+    def setUp(self):
+        self._previous = os.environ.get(SALT_ENV_VAR)
+        os.environ[SALT_ENV_VAR] = "test-salt"
+        redactor_module._fallback_salt = None
+
+    def tearDown(self):
+        if self._previous is None:
+            os.environ.pop(SALT_ENV_VAR, None)
+        else:
+            os.environ[SALT_ENV_VAR] = self._previous
+        redactor_module._fallback_salt = None
+
+    def test_no_rules_leaves_the_output_exactly_as_before(self):
+        text = "pod at 10.0.0.5 in prod-eu-1 with ya29." + "A" * 40
+        self.assertEqual(AuditRedactor.redact_text(text), AuditRedactor.redact_text(text, None))
+        self.assertEqual(AuditRedactor.redact_text(text), AuditRedactor.redact_text(text, []))
+        self.assertIn("10.0.0.5 in prod-eu-1", AuditRedactor.redact_text(text))
+
+    def test_ip_literals_are_masked(self):
+        rules = AuditRedactor.ip_rules("mask")
+        self.assertEqual(
+            AuditRedactor.redact_text("from 10.0.0.5 to fe80::1 done", rules),
+            "from [REDACTED_IP] to [REDACTED_IP] done",
+        )
+
+    def test_ip_literals_are_pseudonymised_stably(self):
+        rules = AuditRedactor.ip_rules("pseudonym")
+        first = AuditRedactor.redact_text("10.0.0.5", rules)
+        self.assertRegex(first, r"^\[ip:[0-9a-f]{12}\]$")
+        self.assertEqual(first, AuditRedactor.redact_text("10.0.0.5", rules))
+        self.assertNotEqual(first, AuditRedactor.redact_text("10.0.0.6", rules))
+        # The token is the salted HMAC prefix, so it moves with the salt and
+        # nothing in it is the address.
+        os.environ[SALT_ENV_VAR] = "another-salt"
+        self.assertNotEqual(first, AuditRedactor.redact_text("10.0.0.5", rules))
+
+    def test_equivalent_ipv6_spellings_share_a_pseudonym(self):
+        rules = AuditRedactor.ip_rules("pseudonym")
+        self.assertEqual(
+            AuditRedactor.redact_text("::1", rules),
+            AuditRedactor.redact_text("0:0:0:0:0:0:0:1", rules),
+        )
+
+    def test_allowlisted_cidrs_are_left_alone(self):
+        rules = AuditRedactor.ip_rules("mask", ["127.0.0.0/8", "10.96.0.0/12", "fd00::/8"])
+        text = "127.0.0.1 10.96.0.10 fd00::1 stay; 10.0.0.5 fe80::1 go"
+        self.assertEqual(
+            AuditRedactor.redact_text(text, rules),
+            "127.0.0.1 10.96.0.10 fd00::1 stay; [REDACTED_IP] [REDACTED_IP] go",
+        )
+
+    def test_ip_action_off_disables_the_ip_rules(self):
+        self.assertEqual(AuditRedactor.ip_rules("off"), [])
+
+    def test_things_that_look_like_addresses_but_are_not(self):
+        rules = AuditRedactor.ip_rules("mask")
+        for text in (
+            "at 12:30:45 on 2026-09-09T16:27:58Z",
+            "mac aa:bb:cc:dd:ee:ff",
+            "image litellm:v1.98.0 and version 1.2.3",
+            "octet 999.1.1.1 is not an address",
+            "a longer dotted run 1.2.3.4.5",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(AuditRedactor.redact_text(text, rules), text)
+
+    def test_an_address_with_a_port_or_a_prefix_length_keeps_its_suffix(self):
+        rules = AuditRedactor.ip_rules("mask")
+        self.assertEqual(
+            AuditRedactor.redact_text("10.0.0.5:8080 and 10.0.0.0/8", rules),
+            "[REDACTED_IP]:8080 and [REDACTED_IP]/8",
+        )
+
+    def test_a_literal_rule_matches_the_exact_string_only(self):
+        rules = AuditRedactor.rules_from_config(
+            {"rules": [{"name": "cluster-name", "literal": "prod.eu-1", "action": "pseudonym"}]}
+        )
+        result = AuditRedactor.redact_text("prod.eu-1 is not prodXeu-1", rules)
+        self.assertRegex(result, r"^\[cluster-name:[0-9a-f]{12}\] is not prodXeu-1$")
+
+    def test_a_pattern_rule_masks_under_its_own_name(self):
+        rules = AuditRedactor.rules_from_config(
+            {"ip": {"action": "off"}, "rules": [{"name": "project", "pattern": r"my-proj-\d+"}]}
+        )
+        self.assertEqual(
+            AuditRedactor.redact_text("in my-proj-42 now", rules), "in [REDACTED_PROJECT] now"
+        )
+
+    def test_rules_run_after_the_credential_patterns(self):
+        # A rule cannot un-redact a credential by matching it first.
+        rules = AuditRedactor.rules_from_config(
+            {"ip": {"action": "off"}, "rules": [{"name": "t", "pattern": "ya29", "action": "mask"}]}
+        )
+        token = "ya29." + "A" * 40
+        self.assertEqual(AuditRedactor.redact_text(token, rules), "[REDACTED_SECRET]")
+
+    def test_the_config_loader_defaults_to_ip_pseudonyms(self):
+        rules = AuditRedactor.rules_from_config({})
+        self.assertEqual([r.name for r in rules], ["ip", "ip"])
+        self.assertTrue(all(r.action == "pseudonym" for r in rules))
+        self.assertEqual(
+            [(r.name, r.action) for r in AuditRedactor.rules_from_config(None)],
+            [(r.name, r.action) for r in rules],
+        )
+
+    def test_the_config_loader_refuses_what_it_does_not_understand(self):
+        for config in (
+            {"ip": {"action": "reverse"}},
+            {"ip": {"allowCidrs": ["not-a-cidr"]}},
+            {"ip": {"cidrs": []}},
+            {"rules": [{"name": "x", "pattern": "a", "action": "hash"}]},
+            {"rules": [{"name": "x", "pattern": "a", "literal": "a"}]},
+            {"rules": [{"name": "x"}]},
+            {"rules": [{"name": "x", "pattern": "("}]},
+            {"rules": [{"name": "bad name", "pattern": "a"}]},
+            {"rules": [{"pattern": "a"}]},
+            {"rules": [{"name": "x", "regex": "a"}]},
+            {"rules": ["x"]},
+            {"extra": {}},
+            # Empty, or matching the empty string: either would put a marker
+            # between every character of every request.
+            {"rules": [{"name": "x", "literal": ""}]},
+            {"rules": [{"name": "x", "pattern": ""}]},
+            {"rules": [{"name": "x", "pattern": "a*"}]},
+            {"rules": [{"name": "x", "pattern": "(?:)"}]},
+            # What YAML makes of a blank value, a bare `yes` and `1.10`; each
+            # would otherwise become a rule for a word the operator never wrote.
+            {"rules": [{"name": "x", "literal": None}]},
+            {"rules": [{"name": "x", "pattern": None}]},
+            {"rules": [{"name": "x", "literal": True}]},
+            {"rules": [{"name": "x", "literal": 1.1}]},
+            {"rules": [{"name": 7, "literal": "a"}]},
+            {"rules": [{"name": "x", "literal": "a", "action": False}]},
+            {"ip": {"action": False}},
+        ):
+            with self.subTest(config=config):
+                with self.assertRaises(ValueError):
+                    AuditRedactor.rules_from_config(config)
+
+    def test_a_mask_marker_folds_the_name_to_one_spelling(self):
+        import re
+
+        for name in ("cluster-name", "cluster.name", "cluster_name", "cluster--name"):
+            with self.subTest(name=name):
+                rule = RedactionRule(name, re.compile("x"), "mask")
+                self.assertEqual(rule.mask, "[REDACTED_CLUSTER_NAME]")
+
+    def test_a_generator_of_rules_is_not_spent_after_the_first_string(self):
+        rules = (rule for rule in AuditRedactor.ip_rules("mask"))
+        self.assertEqual(
+            AuditRedactor.redact({"a": "10.0.0.5", "b": ["10.0.0.6", {"c": "10.0.0.7"}]}, rules),
+            {"a": "[REDACTED_IP]", "b": ["[REDACTED_IP]", {"c": "[REDACTED_IP]"}]},
+        )
+
+    def test_a_rule_with_an_unknown_action_is_refused_at_construction(self):
+        import re
+
+        with self.assertRaises(ValueError):
+            RedactionRule("x", re.compile("a"), "hash")
+
+    def test_counts_name_every_layer_that_fired(self):
+        rules = AuditRedactor.rules_from_config(
+            {"rules": [{"name": "cluster-name", "literal": "prod-eu-1"}]}
+        )
+        text = "ya29." + "A" * 40 + " alice@example.com 10.0.0.5 10.0.0.6 prod-eu-1"
+        redacted, counts = AuditRedactor.redact_text_counted(text, rules)
+        self.assertEqual(counts, {"credential": 1, "email": 1, "ip": 2, "cluster-name": 1})
+        for literal in ("ya29", "alice", "10.0.0", "prod-eu-1"):
+            self.assertNotIn(literal, redacted)
+        # Nothing to do, nothing counted -- and an already-masked marker is not
+        # counted as work this call did.
+        self.assertEqual(AuditRedactor.redact_text_counted("[REDACTED_SECRET] ok", rules)[1], {})
+
+    def test_structures_carry_the_rules_down(self):
+        rules = AuditRedactor.ip_rules("mask")
+        self.assertEqual(
+            AuditRedactor.redact({"args": ["10.0.0.5"], "note": ("10.0.0.6",)}, rules),
+            {"args": ["[REDACTED_IP]"], "note": ("[REDACTED_IP]",)},
+        )
 
 
 class TestPackageSurface(unittest.TestCase):

@@ -19,7 +19,7 @@ Three expressions carry it, and each fails quietly if it is dropped:
     publish job, and the release goes out at a commit nothing gated.
 
 The cron trigger is decoupled: release-publish.yml is strictly dispatch-only so that quiet
-ticks with nothing to release produce no workflow run at all. The weekly cron ("17 5 * * 4")
+ticks with nothing to release produce no workflow run at all. The weekly cron ("17 5 * * 5")
 lives on .github/workflows/release-scheduler.yml, which evaluates candidate eligibility
 and dispatches release-publish.yml only when work is required.
 """
@@ -185,6 +185,7 @@ class ReleasePublishWorkflowTest(unittest.TestCase):
         self.assertIn("RELEASE_BOT_APP_ID", token_step["with"]["app-id"])
         self.assertIn("RELEASE_BOT_APP_PRIVATE_KEY", token_step["with"]["private-key"])
         self.assertEqual(token_step["with"].get("permission-contents"), "write")
+        self.assertEqual(token_step["with"].get("permission-workflows"), "write")
         checkout = next(
             step
             for step in steps

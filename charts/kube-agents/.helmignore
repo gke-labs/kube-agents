@@ -1,0 +1,3 @@
+# Bytecode a local import of files/*.py leaves behind; it must not ship in the package.
+__pycache__/
+*.pyc

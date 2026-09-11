@@ -1369,20 +1369,37 @@ func TestBuildPodTemplateSpecHoldsNoCredentialRuntime(t *testing.T) {
 //
 // Dashboard-disabled is deliberately absent: TestBuildDeployment_DashboardDisabled
 // already asserts it, and a second copy would only look like coverage.
+//
+// mode: next is the shape the field is actually load-bearing on, and it had no
+// case here until the bus surface landed: that render puts NATS_PASSWORD on the
+// agent container by SecretKeyRef, so sharing the namespace publishes the bus
+// credential through /proc/<pid>/environ to every other container in the Pod,
+// spec.deployment.sidecars entries included. The case carries a non-vacuity
+// check for exactly that reason -- an assertion that the process namespace is
+// unshared on a Pod that turns out to hold no credential proves nothing, so the
+// subtest fails if the credential it is guarding is not there.
 func TestTheProcessNamespaceIsUnsharedOnEverySpecShape(t *testing.T) {
 	stock := &agentv1alpha1.PlatformAgent{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "test-ns"},
 	}
 
 	for _, testCase := range []struct {
-		name  string
-		agent *agentv1alpha1.PlatformAgent
+		name string
+		// credentialed marks the shapes whose agent container carries the A2A
+		// bus password; on those the subtest first proves the credential is
+		// present, so the assertion below cannot pass by its absence.
+		credentialed bool
+		agent        *agentv1alpha1.PlatformAgent
 	}{
-		{"no harness configuration at all", stock},
-		{"broker in its own Pod", brokerPodAgent()},
+		{"no harness configuration at all", false, stock},
+		{"broker in its own Pod", false, brokerPodAgent()},
+		{"mode: next, where the agent container holds the bus credential", true, a2aTestAgent()},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			spec := buildPodTemplateSpec(testCase.agent, "c", "f", "s", "p", nil, renderOptions{imageVolumeSupported: true}).Spec
+			if testCase.credentialed {
+				assertAgentContainerHoldsBusCredential(t, spec)
+			}
 			if spec.ShareProcessNamespace != nil {
 				t.Errorf("a shared process namespace puts the credential holder's /proc/<pid>/environ "+
 					"inside a directory the sandbox can read; got shareProcessNamespace=%v",
@@ -1390,6 +1407,33 @@ func TestTheProcessNamespaceIsUnsharedOnEverySpecShape(t *testing.T) {
 			}
 		})
 	}
+}
+
+// assertAgentContainerHoldsBusCredential fails unless the platform-agent
+// container carries NATS_PASSWORD as a SecretKeyRef. It is the non-vacuity
+// guard for the credentialed rows above: were the bus surface to stop
+// rendering, or move to another container, those rows would keep passing while
+// asserting nothing, and the comment in buildPodTemplateSpec that tells the
+// next author why ShareProcessNamespace stays unset would lose its test.
+func assertAgentContainerHoldsBusCredential(t *testing.T, spec corev1.PodSpec) {
+	t.Helper()
+	for _, container := range spec.Containers {
+		if container.Name != "platform-agent" {
+			continue
+		}
+		for _, env := range container.Env {
+			if env.Name != "NATS_PASSWORD" {
+				continue
+			}
+			if env.ValueFrom == nil || env.ValueFrom.SecretKeyRef == nil {
+				t.Fatalf("NATS_PASSWORD is not a SecretKeyRef (%+v); the literal must never render into the pod spec", env)
+			}
+			return
+		}
+		t.Fatal("no NATS_PASSWORD on the platform-agent container: this shape holds no bus credential, " +
+			"so the shared-process-namespace assertion beside this one would pass vacuously")
+	}
+	t.Fatal("no platform-agent container in the pod template")
 }
 
 func TestResolveCredentialProxyImagePreservesTag(t *testing.T) {

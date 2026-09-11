@@ -90,9 +90,22 @@ class GitHubTokenRefreshTest(unittest.TestCase):
     @patch("github_token_refresh.subprocess.run")
     def test_get_current_git_repo_local_path_returns_none(self, run):
         res = MagicMock()
-        res.stdout = "/srv/git/kube-agents.git\n"
         run.return_value = res
-        self.assertIsNone(get_current_git_repo())
+        for url in (
+            "/srv/git/kube-agents.git",
+            # `git remote add origin github.com/gke-labs/kube-agents` succeeds:
+            # git takes it as a relative local path, not a GitHub URL. It is a
+            # directory name, and `repo_ref`'s shorthand lift gives it an
+            # inferred github.com host -- which is right for a repository
+            # someone registered and wrong for a remote git emitted. Admitting
+            # it here mints an installation token for whichever org the
+            # directory happens to name.
+            "github.com/gke-labs/kube-agents",
+            "GitHub.com/gke-labs/kube-agents",
+        ):
+            with self.subTest(url=url):
+                res.stdout = url + "\n"
+                self.assertIsNone(get_current_git_repo())
 
     @patch("github_token_refresh.subprocess.run")
     def test_get_current_git_repo_failure_returns_none(self, run):
@@ -108,6 +121,36 @@ class GitHubTokenRefreshTest(unittest.TestCase):
         with self.assertRaises(RuntimeError) as cm:
             refresh_git_credentials("invalid-repo-no-slash")
         self.assertIn("Could not identify target repository", str(cm.exception))
+
+    def test_refresh_git_credentials_refuses_a_host_shaped_repository(self):
+        """The slug gate, not a slash count.
+
+        The check this replaced counted separators, so every value here passed
+        it and reached the Minty branch below, which splits on the first slash
+        and posts the left half as an org name: `github.com/acme` would have
+        been minted for an org called `github.com`. Nothing downstream of that
+        branch validates, so these have to fail here or not at all.
+
+        `" acme/toolkit "` is deliberately absent: the line above the gate
+        strips whitespace and slashes and it is the *stripped* value that goes
+        on to the broker, so normalising it there is safe. What is not safe is
+        normalising and then posting the original, which is why
+        `credential_proxy` gets the strict predicate.
+        """
+        for repository in (
+            "github.com/acme",
+            "www.github.com/acme",
+            "ssh.github.com/acme",
+            "acme/..",
+            "acme/-toolkit",
+            "acme/toolkit.git",
+        ):
+            with self.subTest(repository=repository):
+                with self.assertRaises(RuntimeError) as cm:
+                    refresh_git_credentials(repository)
+                self.assertIn(
+                    "Could not identify target repository", str(cm.exception)
+                )
 
     @patch("github_token_refresh.subprocess.run")
     @patch("github_token_refresh.urllib.request.urlopen")

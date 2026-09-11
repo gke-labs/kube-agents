@@ -68,3 +68,26 @@ func renderMode(agent *agentv1alpha1.PlatformAgent, _ string) Mode {
 	}
 	return mode
 }
+
+// a2aAgentSurface reports whether the AGENT pod carries its half of the A2A
+// wiring: the bus credentials in its env and the 4222 egress rule on its
+// NetworkPolicy. Next, yes; today, no — and on version skew, yes, which is
+// where this differs from renderMode and why it exists.
+//
+// The reconciler freezes the A2A objects on skew rather than cleaning them up
+// (spec-mode-switch.md: "fail closed to today" must not mean "clean up next",
+// or an operator rollback kills a live bus). Fail-closed on the agent side
+// would break the same promise from the other end: a frozen, running bus with
+// an agent pod that just lost its credentials and its egress rule, hanging to
+// the dial timeout — the least diagnosable shape this failure has.
+//
+// The asymmetry is deliberate. Rendering the surface on a today install that
+// hit skew costs two inert env vars and an egress rule to pods that do not
+// exist, on a CR already reporting Degraded/ModeNotRecognized; NOT rendering it
+// on a next install that hit skew breaks a working bus. The dark-stack promise
+// is not weakened either way: skew needs a newer CRD with a mode this build has
+// never heard of, which no normal install has.
+func a2aAgentSurface(agent *agentv1alpha1.PlatformAgent) bool {
+	mode, err := resolveMode(agent)
+	return err != nil || mode == ModeNext
+}

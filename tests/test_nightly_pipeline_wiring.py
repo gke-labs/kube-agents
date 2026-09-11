@@ -114,6 +114,7 @@ class NightlyPipelineWiringTest(unittest.TestCase):
         self.assertIn("RELEASE_BOT_APP_ID", token_step["with"]["app-id"])
         self.assertIn("RELEASE_BOT_APP_PRIVATE_KEY", token_step["with"]["private-key"])
         self.assertEqual(token_step["with"].get("permission-contents"), "write")
+        self.assertEqual(token_step["with"].get("permission-workflows"), "write")
         checkout = next(
             step
             for step in steps
@@ -315,6 +316,34 @@ class DockerPublishGhcrWiringTest(unittest.TestCase):
         self.assertIn("publish-operator", self.jobs)
         self.assertIn("publish-agents", self.jobs)
         self.assertFalse((_WORKFLOWS / "docker-publish-k8s-operator.yml").exists())
+
+
+class ReleaseBotTokenWiringTest(unittest.TestCase):
+    """Every workflow that mints a token for RELEASE_BOT_APP_ID must request both
+    contents: write (for creating refs/tags) and workflows: write (to prevent GH013
+    rejections when the tagged commit has workflow diffs relative to main)."""
+
+    def test_every_release_bot_token_mint_requests_workflows_write(self):
+        workflows = [
+            "nightly-pipeline.yml",
+            "release-publish.yml",
+            "rc-create-tag.yml",
+            "rc-tag-validated.yml",
+        ]
+        for name in workflows:
+            with self.subTest(workflow=name):
+                doc = _doc(_WORKFLOWS / name)
+                token_steps = [
+                    step
+                    for job in (doc.get("jobs") or {}).values()
+                    for step in (job.get("steps") or [])
+                    if str(step.get("uses", "")).startswith("actions/create-github-app-token@")
+                    and "RELEASE_BOT_APP_ID" in str(step.get("with", {}).get("app-id", ""))
+                ]
+                self.assertTrue(token_steps, f"expected at least one release bot token step in {name}")
+                for step in token_steps:
+                    self.assertEqual(step["with"].get("permission-contents"), "write")
+                    self.assertEqual(step["with"].get("permission-workflows"), "write")
 
 
 if __name__ == "__main__":

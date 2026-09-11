@@ -35,8 +35,8 @@ delivery, so routing it through a card loses the run. A poller is the inverse: i
 has nothing to deliver on almost every tick, its product goes to GitHub, and it
 owes a model turn only when real work exists — which is why `github-repo-watcher`
 is a `no_agent` script that costs nothing when idle and files a card when it
-finds something. It still names an audible `deliver` for itself — `"chat"`, like
-every other entry here — so a sweep that cannot run still says so. Being
+finds something. It still names an audible `deliver` for itself — `"chat"` — like
+every other report-producing entry here, so a sweep that cannot run still says so. Being
 `no_agent` changes what it delivers, not whether it does: a clean tick prints
 nothing and relays nothing, and only a sweep that failed produces text.
 
@@ -75,20 +75,30 @@ rosters both carrying one id is that audit running twice per schedule,
 concurrently with itself, writing its ledger issue twice. The per-job lock
 (`cron/.job-<id>.lock`) is per profile directory, so it does not stop this.
 
-## `deliver` is never `"local"`
+## `deliver` is `"local"` on exactly one job
 
-Every enabled job here sets `deliver` to `"chat"` (`"all"` is the other audible
-value). `cron/scheduler.py::_resolve_delivery_targets` returns an **empty target list**
-for `"local"` — the outcome is written to `last_output` and delivered nowhere. A
-watchdog whose run failed would then be indistinguishable from a quiet fleet.
-Both audible values carry a failure: the scheduler builds one with
-`_summarize_cron_failure_for_delivery` and delivers it on the same leg.
+Every enabled job here sets `deliver` to `"chat"` or `"all"`, the two audible
+values, with one exception below. `cron/scheduler.py::_resolve_delivery_targets`
+returns an **empty target list** for `"local"` — the outcome is written to
+`last_output` and delivered nowhere. A watchdog whose run failed would then be
+indistinguishable from a quiet fleet. Both audible values carry a failure: the
+scheduler builds one with `_summarize_cron_failure_for_delivery` and delivers it
+on the same leg.
 
 Silence is still cheap: a run with no findings returns `[SILENT]` and the
 scheduler skips delivery, so a steadily clean fleet generates no chat traffic.
 
+The exception is `chat-delivery-watch`, whose job is to notice that the chat leg
+itself is down. Its product is a GitHub ledger issue and an `ALERT` line in
+`logs/chat_delivery_watch.log` that fluent-bit ships to Cloud Logging, neither of
+which passes through chat, and a chat delivery for it would be circular. The
+design is in
+[`docs/designs/cron-report-relay.md`](../../../docs/designs/cron-report-relay.md)
+under "Detecting a broken leg".
+
 `test_every_watchdog_declares_all_delivery` in
-`../skills/fleet-audit/scripts/test_audit_report.py` enforces this.
+`../skills/fleet-audit/scripts/test_audit_report.py` enforces this, and carries
+the exemption by name, pinned to a `no_agent` entry whose script exists.
 
 ## `deliver: "chat"` — reporting through the Chat Agent
 
@@ -106,8 +116,9 @@ reached.
 
 The relay itself posts to every chat platform the install has enabled, so on a
 dual-platform install a job left on `"all"` is now heard twice on _each_ of them
-rather than twice in one place. Every entry here names `"chat"`, so this reaches
-only a runtime-created job or a hand-edited roster.
+rather than twice in one place. Two entries here name `"all"`
+(`gcp-networking-fabric-audit` and `gce-compute-fleet-audit`) and accept that;
+the rest name `"chat"`.
 
 The mode is a bundled platform plugin, not a patch: `chat` is a delivery-only
 platform ([`deploy/docker/plugins/chat/`](../../../deploy/docker/plugins/chat/))
@@ -122,7 +133,7 @@ instruction, and what the plugin route costs — is
 
 ## Moving the roster onto `"chat"` needed no migration
 
-Every job here names `"chat"`, and getting there was an edit to this file alone
+Every report-producing job here names `"chat"` or `"all"`, and getting there was an edit to this file alone
 — no script, no one-off Job, nothing run against a live volume. `deliver` is an
 image-owned key on this profile: `merge_cron_store` gives the image every key it
 ships and leaves the volume only the keys it does not, so the next pod start

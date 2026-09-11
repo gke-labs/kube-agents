@@ -4284,9 +4284,6 @@ def refresh_credentials(repo: str | None = None) -> None:
     refresh_git_credentials(repo)
 
 
-BARE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-
-
 def resolve_repo(
     audit_id: str | None = None,
     repo: str | None = None,
@@ -4297,7 +4294,7 @@ def resolve_repo(
 
     if repo and str(repo).strip():
         r = str(repo).strip()
-        if not BARE_REPO_RE.match(r):
+        if not gitops_workspace.is_valid_repo_slug(r):
             raise ValueError(f"Invalid repository format: {r!r}. Expected 'owner/name'.")
         managed = gitops_workspace.get_managed_github_repos()
         if managed and r not in managed:
@@ -4309,7 +4306,7 @@ def resolve_repo(
     if workspace is not None:
         try:
             w_repo = gitops_workspace.resolve_repo(workspace=workspace)
-            if w_repo and BARE_REPO_RE.match(w_repo):
+            if w_repo and gitops_workspace.is_valid_repo_slug(w_repo):
                 return w_repo
         except Exception:
             pass

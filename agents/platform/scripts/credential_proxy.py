@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 import command_policy
+import repo_ref
 import scoped_sa_pool
 
 # Re-exported, not re-implemented. The shim owns kubeconfig parsing because the
@@ -50,27 +51,29 @@ LOGGER = logging.getLogger("credential-proxy")
 SLACK_EVENT_QUEUE_MAXSIZE = 1000
 SLACK_ERROR_DIAGNOSTIC_FIELDS = ("ok", "error", "needed", "provided")
 
-# GitHub "owner/name" slug validation. Each segment is matched with a single,
-# unambiguous character class rather than two adjacent "+" groups around the
-# "/" separator, so the match is linear-time and cannot be forced into
-# polynomial backtracking (ReDoS). The length guard bounds untrusted input as
-# defense-in-depth; 256 is far above real GitHub owner/name limits, so valid
-# input is never rejected.
-MAX_REPOSITORY_LENGTH = 256
-_REPOSITORY_SEGMENT = re.compile(r"[A-Za-z0-9_.-]+")
+# GitHub "owner/name" slug validation, shared with the agent-side callers via
+# `repo_ref` — which imports nothing but the standard library precisely so this
+# process, the one holding the credentials, can use it. The linear-time segment
+# match and the length guard both live there, at the same 256 this module
+# enforced before; the alias keeps the name this module's own tests use.
+MAX_REPOSITORY_LENGTH = repo_ref.MAX_REPO_LENGTH
 
 
 def is_valid_repository(repository: Any) -> bool:
-    """Return True if ``repository`` is a well-formed ``owner/name`` slug."""
-    if not isinstance(repository, str) or len(repository) > MAX_REPOSITORY_LENGTH:
-        return False
-    owner, slash, name = repository.partition("/")
-    if not slash:
-        return False
-    return (
-        _REPOSITORY_SEGMENT.fullmatch(owner) is not None
-        and _REPOSITORY_SEGMENT.fullmatch(name) is not None
-    )
+    """Return True if ``repository`` is a well-formed ``owner/name`` slug.
+
+    Strictly narrower than the local copy this replaced. It additionally
+    refuses the traversal and leading-dash shapes — `acme/..`, `acme/-x` —
+    which every other validator in the tree already rejected, and `github.com/o`,
+    which is a host and a one-segment path rather than a slug.
+
+    Nothing is admitted that was not admitted before. That matters here more
+    than elsewhere: the caller passes the *original* string on to
+    `github_token_refresh.py`, so a value this accepts after normalising it
+    would reach Minty in its unnormalised form. `repo_ref.is_github_slug`
+    requires the value to already be the slug for that reason.
+    """
+    return repo_ref.is_github_slug(repository)
 
 
 # Two shapes, because two are what the GitHub refresh helper handles: the
@@ -155,12 +158,13 @@ class ThreadingUnixHTTPServer(socketserver.ThreadingMixIn, socketserver.UnixStre
 
 DEFAULT_CREDENTIAL_PROXY_AUDIENCE = "kubeagents-credential-proxy"
 
-# The second audience, and the whole of the per-caller split.
+# The second audience, and the per-caller split it introduced (the third
+# audience below extends it).
 #
-# Two Pods call this broker and ``Principal.workload`` cannot tell them apart.
-# It is per-ServiceAccount, and the two ServiceAccounts are both on
+# The Pods that call this broker cannot be told apart by ``Principal.workload``.
+# It is per-ServiceAccount, and every calling ServiceAccount is on
 # CREDENTIAL_PROXY_ALLOWED_CALLERS, so knowing which one called says only that
-# the caller was one of the two Pods entitled to. What *can* separate them is
+# the caller was one of the Pods entitled to. What *can* separate them is
 # the audience their token was projected with: the operator chooses it per Pod,
 # and the API server refuses to validate a token against an audience it was not
 # minted for. So the gateway's token is minted for the chat audience and the
@@ -180,9 +184,24 @@ DEFAULT_CREDENTIAL_PROXY_AUDIENCE = "kubeagents-credential-proxy"
 # split would have been a control on some clusters and a comment on the rest.
 DEFAULT_CREDENTIAL_PROXY_CHAT_AUDIENCE = "kubeagents-credential-proxy-chat"
 
+# The third audience: the A2A gateway. It posts through the same Chat API
+# passthrough as the legacy chat caller, but its event routes are its alone —
+# the legacy chat caller is the LLM-driven Hermes pod, and with a shared role
+# it could pull and ack the A2A gateway's events, silently consuming user
+# asks. Same upgrade story as the chat audience: unset means the role is
+# never conferred and the a2a routes are reachable by any authenticated
+# caller only where no roles are established at all (the NullAuthenticator
+# posture behind the socket).
+
 # The roles a caller can hold, named by which Pod holds them.
 CALLER_ROLE_SHELL = "shell"
 CALLER_ROLE_CHAT = "chat"
+CALLER_ROLE_A2A_CHAT = "a2a-chat"
+
+# Every role that exists, for the table check below. Note that two of them
+# nest: "chat" is a substring of "a2a-chat". Nothing here may compare roles in
+# a way that cannot tell those two apart.
+CALLER_ROLES = (CALLER_ROLE_SHELL, CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT)
 
 # Which role each route demands. Checked by prefix, so the trailing slash on
 # the three families is load-bearing: without it "/v1/chatter" would match
@@ -195,20 +214,84 @@ CALLER_ROLE_CHAT = "chat"
 # credential_proxy_client.workspaces_available detects an older broker by
 # asking, and a 403 there would read as "not permitted" rather than "not
 # supported".
-ROUTE_ROLES: tuple[tuple[str, str], ...] = (
-    ("/v1/chat/", CALLER_ROLE_CHAT),
-    ("/v1/exec", CALLER_ROLE_SHELL),
-    ("/v1/github/", CALLER_ROLE_SHELL),
-    ("/v1/workspace/", CALLER_ROLE_SHELL),
+ROUTE_ROLES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # Order matters: the a2a family sits under the chat prefix and must be
+    # matched first. The api passthrough belongs to both chat consumers —
+    # one credential, two subscriptions — while each side's event routes
+    # stay its own. _validate_route_roles below enforces that order, and the
+    # shape of every entry, at import; do not sort this table.
+    ("/v1/chat/a2a/", (CALLER_ROLE_A2A_CHAT,)),
+    # No trailing slash: the passthrough is one exact path, and the handler
+    # 404s anything else under it, so the prefix admits nothing extra today.
+    ("/v1/chat/api", (CALLER_ROLE_CHAT, CALLER_ROLE_A2A_CHAT)),
+    ("/v1/chat/", (CALLER_ROLE_CHAT,)),
+    ("/v1/exec", (CALLER_ROLE_SHELL,)),
+    ("/v1/github/", (CALLER_ROLE_SHELL,)),
+    ("/v1/workspace/", (CALLER_ROLE_SHELL,)),
 )
 
 
-def required_role(path: str) -> str:
-    """The caller role ``path`` demands, or "" if it demands none."""
-    for prefix, role in ROUTE_ROLES:
+def _validate_route_roles(table: tuple[tuple[str, tuple[str, ...]], ...]) -> None:
+    """Refuse a ``ROUTE_ROLES`` that cannot enforce what it appears to say.
+
+    Three invariants this table has carried in comments only. Each fails
+    towards admitting a caller rather than refusing one, each is silent, and no
+    linter here would catch any of them -- there is no mypy, ruff or pyright in
+    the Makefile or the workflows.
+
+    *Roles must be a tuple.* ``_role_permits`` decides with ``principal.role in
+    needed``, and a bare string is also a container, so a single entry left in
+    the older ``(prefix, role)`` shape turns that membership test into a
+    substring test. Because the role names nest, ``("/v1/chat/a2a/",
+    CALLER_ROLE_A2A_CHAT)`` would then admit the legacy chat relay to the A2A
+    event routes, which is the turn-stealing the split exists to prevent.
+
+    *Roles must be roles.* A typo confers nothing, so the route it guards
+    refuses every caller -- which reads as policy rather than as a mistake.
+
+    *No prefix may shadow a later entry.* Matching is first-wins, so an entry
+    whose prefix extends an earlier one is unreachable. Sorting this table
+    alphabetically does exactly that: "/v1/chat/" sorts ahead of
+    "/v1/chat/a2a/" and takes its routes, handing them to the chat role. That
+    is the same escalation as the bare string, reachable by a tidying edit
+    rather than a mistyped one.
+
+    Raising at import is the point. A broker that will not start is a red test
+    on the pull request that mis-shaped the table -- every test module imports
+    this one -- rather than an escalation that ships quietly.
+    """
+    for index, (prefix, roles) in enumerate(table):
+        if not isinstance(prefix, str) or not prefix:
+            raise ValueError(f"ROUTE_ROLES[{index}]: the prefix must be a non-empty str")
+        if not isinstance(roles, tuple):
+            raise TypeError(
+                f"ROUTE_ROLES[{index}] ({prefix}): the roles must be a tuple, not "
+                f"{type(roles).__name__}; a bare string makes the role check a "
+                f"substring test"
+            )
+        for role in roles:
+            if role not in CALLER_ROLES:
+                raise ValueError(
+                    f"ROUTE_ROLES[{index}] ({prefix}): {role!r} is not a caller role"
+                )
+    for index, (prefix, _) in enumerate(table):
+        for later, (shadowed, _) in enumerate(table[index + 1 :], start=index + 1):
+            if shadowed.startswith(prefix):
+                raise ValueError(
+                    f"ROUTE_ROLES[{later}] ({shadowed}) is unreachable: "
+                    f"ROUTE_ROLES[{index}] ({prefix}) matches first"
+                )
+
+
+_validate_route_roles(ROUTE_ROLES)
+
+
+def required_roles(path: str) -> tuple[str, ...]:
+    """The caller roles ``path`` admits, or () if it demands none."""
+    for prefix, roles in ROUTE_ROLES:
         if path.startswith(prefix):
-            return role
-    return ""
+            return roles
+    return ()
 
 
 # How long a managed-repository allowlist read is reused.
@@ -632,8 +715,31 @@ def build_authenticator() -> NullAuthenticator | ServiceAccountAuthenticator:
             shell_audience: CALLER_ROLE_SHELL,
             chat_audience: CALLER_ROLE_CHAT,
         }
+        # The third audience only means anything once the split exists at
+        # all, so it nests here; read raw for the same unset-vs-default
+        # reason as the chat audience above.
+        a2a_audience = os.getenv("CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE", "").strip()
+        if a2a_audience and a2a_audience in audience_roles:
+            # A copy-pasted audience would make every a2a-chat caller the
+            # chat (or shell) role and 403 on its own routes with nothing
+            # naming the env; say so once, at startup.
+            LOGGER.warning(
+                "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE equals the %s audience; the a2a-chat "
+                "role needs an audience of its own, so it is not conferred",
+                audience_roles[a2a_audience] or CALLER_ROLE_SHELL,
+            )
+        elif a2a_audience:
+            audience_roles[a2a_audience] = CALLER_ROLE_A2A_CHAT
     else:
         audience_roles = {shell_audience: ""}
+        if os.getenv("CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE", "").strip():
+            # Say so, rather than letting every a2a-chat caller 401 with
+            # "audience not known" and nothing pointing at the env.
+            LOGGER.warning(
+                "CREDENTIAL_PROXY_A2A_CHAT_AUDIENCE is set but CREDENTIAL_PROXY_CHAT_AUDIENCE "
+                "is not; the a2a-chat role only exists once the chat audience split does, "
+                "so the a2a audience is ignored"
+            )
     return ServiceAccountAuthenticator(
         audience_roles=audience_roles,
         allowed_callers=allowed,
@@ -2926,6 +3032,12 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
     slack_max_request_bytes: int
     enforce_read_only: bool = True
     chat_relay: GoogleChatRelay | None = None
+    # The A2A gateway's own relay instance, on its own subscription. Two
+    # consumers on one subscription split deliveries randomly, so the A2A
+    # routes never touch chat_relay and vice versa; only the /v1/chat/api
+    # passthrough is shared, because both instances hold the same app
+    # credential and an install may arm either one alone.
+    a2a_chat_relay: GoogleChatRelay | None = None
     slack_relay: SlackRelay | None = None
     # None unless CREDENTIAL_PROXY_CONTENT_WORKSPACE is on. While it is None the
     # /v1/workspace/* routes answer 404 — the same answer an older broker gives,
@@ -2983,14 +3095,14 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         has not been upgraded to project a second audience yet; ``role`` is set
         only where the API server confirmed which audience it validated.
         """
-        needed = required_role(self.path)
-        if not needed or not principal.role or principal.role == needed:
+        needed = required_roles(self.path)
+        if not needed or not principal.role or principal.role in needed:
             return True
         LOGGER.warning(
             "refused a route this caller's role does not reach path=%s role=%s needed=%s",
             _sanitize_for_logging(self.path),
             principal.role,
-            needed,
+            "|".join(needed),
         )
         self._json(
             HTTPStatus.FORBIDDEN,
@@ -3065,6 +3177,17 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 self._json(
                     HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Slack event pull failed"}
                 )
+            return
+        if self.path.startswith("/v1/chat/a2a/events"):
+            if self.a2a_chat_relay is None:
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "a2a chat relay disabled"})
+                return
+            try:
+                event = self.a2a_chat_relay.pull()
+                self._json(HTTPStatus.OK, {"event": event})
+            except Exception as exc:
+                LOGGER.warning("a2a chat event pull failed: %s", type(exc).__name__)
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "a2a chat event pull failed"})
             return
         if self.path.startswith("/v1/chat/events"):
             if self.chat_relay is None:
@@ -3563,17 +3686,24 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
         return payload
 
     def _handle_chat_post(self) -> None:
-        if self.chat_relay is None:
+        # The api passthrough is served by whichever instance is armed; the
+        # event settles are strictly per-instance.
+        api_relay = self.chat_relay or self.a2a_chat_relay
+        if api_relay is None:
             self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "chat relay disabled"})
             return
         try:
             payload = self._read_json_body()
-            if self.path == "/v1/chat/events/ack":
-                ok = self.chat_relay.settle(str(payload.get("receipt", "")), True)
-                self._json(HTTPStatus.OK if ok else HTTPStatus.NOT_FOUND, {"settled": ok})
-                return
-            if self.path == "/v1/chat/events/nack":
-                ok = self.chat_relay.settle(str(payload.get("receipt", "")), False)
+            if self.path in ("/v1/chat/a2a/events/ack", "/v1/chat/a2a/events/nack"):
+                if self.a2a_chat_relay is None:
+                    self._json(
+                        HTTPStatus.SERVICE_UNAVAILABLE, {"error": "a2a chat relay disabled"}
+                    )
+                    return
+                ok = self.a2a_chat_relay.settle(
+                    str(payload.get("receipt", "")),
+                    self.path.endswith("/ack"),
+                )
                 self._json(HTTPStatus.OK if ok else HTTPStatus.NOT_FOUND, {"settled": ok})
                 return
             if self.path == "/v1/chat/api":
@@ -3581,12 +3711,22 @@ class CredentialProxyHandler(BaseHTTPRequestHandler):
                 arguments = payload.get("arguments", {})
                 if not isinstance(resource, list) or not isinstance(arguments, dict):
                     raise ValueError("resource must be a list and arguments an object")
-                result = self.chat_relay.api_call(
+                result = api_relay.api_call(
                     resource,
                     str(payload.get("method", "")),
                     arguments,
                 )
                 self._json(HTTPStatus.OK, {"response": result})
+                return
+            if self.chat_relay is None:
+                self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "chat relay disabled"})
+                return
+            if self.path in ("/v1/chat/events/ack", "/v1/chat/events/nack"):
+                ok = self.chat_relay.settle(
+                    str(payload.get("receipt", "")),
+                    self.path.endswith("/ack"),
+                )
+                self._json(HTTPStatus.OK if ok else HTTPStatus.NOT_FOUND, {"settled": ok})
                 return
             self._json(HTTPStatus.NOT_FOUND, {"status": "not_found"})
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -3752,6 +3892,33 @@ def resolve_role() -> str:
     return role
 
 
+def chat_relay_subscriptions(project_id: str) -> tuple[str, str]:
+    """Return the legacy and A2A Chat subscription names, refusing one shared.
+
+    Two relay instances pulling one subscription split its deliveries between
+    them at random — the exact failure the A2A path's own subscription exists
+    to prevent — so pointing both env vars at the same subscription is refused
+    at startup rather than discovered as every other ask going missing. The
+    comparison is on the fully qualified name, the way GoogleChatRelay
+    resolves it: a short name and its projects/… spelling are one subscription.
+    """
+    chat_subscription = os.getenv("GOOGLE_CHAT_SUBSCRIPTION_NAME", "").strip()
+    a2a_subscription = os.getenv("A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME", "").strip()
+
+    def qualified(name: str) -> str:
+        if not name or name.startswith("projects/"):
+            return name
+        return f"projects/{project_id}/subscriptions/{name}"
+
+    if chat_subscription and qualified(chat_subscription) == qualified(a2a_subscription):
+        raise RuntimeError(
+            "A2A_GOOGLE_CHAT_SUBSCRIPTION_NAME names the same subscription as "
+            "GOOGLE_CHAT_SUBSCRIPTION_NAME; two relay instances on one subscription "
+            "split its deliveries, so the A2A consumer needs its own"
+        )
+    return chat_subscription, a2a_subscription
+
+
 def serve(args: argparse.Namespace) -> None:
     role = resolve_role()
     if role == "api-proxy":
@@ -3793,12 +3960,21 @@ def serve(args: argparse.Namespace) -> None:
         os.getenv("SLACK_RELAY_MAX_REQUEST_BYTES", str(28 * 1024 * 1024))
     )
     chat_project = os.getenv("GOOGLE_CHAT_PROJECT_ID", "").strip()
-    chat_subscription = os.getenv("GOOGLE_CHAT_SUBSCRIPTION_NAME", "").strip()
+    chat_subscription, a2a_subscription = chat_relay_subscriptions(chat_project)
     if chat_project and chat_subscription:
         CredentialProxyHandler.chat_relay = GoogleChatRelay(
             chat_project, chat_subscription
         )
         LOGGER.info("Google Chat relay enabled project=%s subscription=<redacted>", chat_project)
+    # The A2A gateway's own subscription on the same topic and credential;
+    # armed independently so an install can run either consumer alone.
+    if chat_project and a2a_subscription:
+        CredentialProxyHandler.a2a_chat_relay = GoogleChatRelay(
+            chat_project, a2a_subscription
+        )
+        LOGGER.info(
+            "A2A Google Chat relay enabled project=%s subscription=<redacted>", chat_project
+        )
     slack_bot_tokens = os.getenv("SLACK_BOT_TOKEN", "").strip()
     slack_app_token = os.getenv("SLACK_APP_TOKEN", "").strip()
     if slack_bot_tokens and slack_app_token:

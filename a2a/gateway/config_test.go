@@ -29,6 +29,11 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("A2A_OWNER_DEPLOYMENT", "")
 	t.Setenv("A2A_MAX_SESSIONS", "")
 	t.Setenv("A2A_IDLE_TTL", "")
+	t.Setenv("A2A_GCHAT_RELAY_URL", "")
+	t.Setenv("A2A_GCHAT_TOKEN_PATH", "")
+	t.Setenv("A2A_GCHAT_ALLOWED_USERS", "")
+	t.Setenv("A2A_GCHAT_ALLOW_ALL_USERS", "")
+	t.Setenv("A2A_CHAT_DISPLAY_MODE", "")
 }
 
 // TestFromEnvSaltPrecedence: the salt is SESSION_KV_SALT, the one the
@@ -338,5 +343,67 @@ func TestFromEnvOwnerDeployment(t *testing.T) {
 	}
 	if cfg.OwnerDeployment != "agent-a2a-gateway" {
 		t.Fatalf("OwnerDeployment = %q", cfg.OwnerDeployment)
+	}
+}
+
+// TestFromEnvGchatBackendSelection: setting the relay URL selects the gchat
+// backend and carries the allowlist; the token path has a projected default.
+func TestFromEnvGchatBackendSelection(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("DISCORD_TOKEN", "")
+	t.Setenv("A2A_GCHAT_RELAY_URL", "http://relay.ns.svc:8081")
+	t.Setenv("A2A_GCHAT_ALLOWED_USERS", "a@example.com, B@example.com ,")
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Backend() != "gchat" {
+		t.Fatalf("Backend() = %q, want gchat", cfg.Backend())
+	}
+	if cfg.GchatTokenPath != "/var/run/secrets/a2a-chat-relay/token" {
+		t.Fatalf("token path default = %q", cfg.GchatTokenPath)
+	}
+	if len(cfg.GchatAllowedUsers) != 2 || cfg.GchatAllowedUsers[0] != "a@example.com" || cfg.GchatAllowedUsers[1] != "B@example.com" {
+		t.Fatalf("allowed users = %v", cfg.GchatAllowedUsers)
+	}
+	if cfg.GchatAllowAllUsers {
+		t.Fatal("allow-all must be off unless stated")
+	}
+	t.Setenv("A2A_GCHAT_ALLOW_ALL_USERS", "true")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.GchatAllowAllUsers {
+		t.Fatal("A2A_GCHAT_ALLOW_ALL_USERS=true not honored")
+	}
+}
+
+// TestFromEnvOneBackendPerProcess: two backends on one relay durable split
+// event deliveries, and no backend is a misconfiguration, not a default.
+func TestFromEnvOneBackendPerProcess(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("A2A_GCHAT_RELAY_URL", "http://relay.ns.svc:8081")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("DISCORD_TOKEN and A2A_GCHAT_RELAY_URL together must refuse")
+	}
+	t.Setenv("DISCORD_TOKEN", "")
+	t.Setenv("A2A_GCHAT_RELAY_URL", "")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("no backend at all must refuse")
+	}
+}
+
+// A typo in the display mode must be refused, not silently rendered as
+// debug (the relay branches on != default).
+func TestFromEnvRefusesAnUnknownDisplayMode(t *testing.T) {
+	setBaseEnv(t)
+	t.Setenv("A2A_CHAT_DISPLAY_MODE", "verbose")
+	if _, err := FromEnv(); err == nil || !strings.Contains(err.Error(), "A2A_CHAT_DISPLAY_MODE") {
+		t.Fatalf("FromEnv() error = %v; want a refusal naming A2A_CHAT_DISPLAY_MODE", err)
+	}
+	t.Setenv("A2A_CHAT_DISPLAY_MODE", "default")
+	if cfg, err := FromEnv(); err != nil || cfg.DisplayMode != "default" {
+		t.Fatalf("FromEnv() = %+v, %v", cfg, err)
 	}
 }

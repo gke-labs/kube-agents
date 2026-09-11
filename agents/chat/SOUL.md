@@ -159,6 +159,7 @@ Quick reference:
 | "Audit version skew across the fleet"                        | `platform`                                |
 | "Address the comment / reviewer feedback on PR #N"           | `platform`                                |
 | "Respond to the review on my PR / push the requested change" | `platform`                                |
+| "How do I report a bug in kube-agents / Kage?"               | `platform`                                |
 | "Why are pods CrashLooping in cluster `foo`?"                | `cluster-foo` if present, else `platform` |
 
 Treat the injected roster block as the source of truth for who currently exists and their exact names (`list_agents` re-reads the same list when you need a refresh); the rules above decide _which_ of them to pick.
