@@ -1199,14 +1199,22 @@ function detailHtml() {
 const nights = () => (brief.nightly && Array.isArray(brief.nightly.nights) ? brief.nightly.nights.filter((n) => n && typeof n === "object" && n.counts) : []);
 const nightHref = (night) => `${PAGE.pages.nightly}#build=${enc(night.build)}`;
 const nightStart = (night) => parseIso(night.started) ?? parseIso(night.finished);
-// The night's headline state: cut short, then failed cases, then partial, then clean.
+// The night's headline state, worst first: cut short, failed cases, partial
+// cases, nothing recorded or nothing graded, a pass short of the matrix
+// (cases lost to infra or never recorded), then clean. Green means every
+// expected case was graded and passed -- a quota storm that grades nothing
+// is not a pass. `word` is the pill on the page and the Brief, `short` the
+// chip in the other-nights list.
 function nightVerdict(night) {
   const c = night.counts;
-  if (night.truncated) return { cls: "p-infra", word: `TRUNCATED · ${c.recorded} of ${c.expected || "?"} cases recorded` };
-  if (c.failed) return { cls: "p-fail", word: `${plural(c.failed, "case")} failed all reps` };
-  if (c.partial) return { cls: "p-partial", word: `${plural(c.partial, "case")} failed some reps` };
-  if (!c.recorded) return { cls: "p-infra", word: "no case recorded" };
-  return { cls: "p-pass", word: "every case passed" };
+  if (night.truncated) return { cls: "p-infra", word: `TRUNCATED · ${c.recorded} of ${c.expected || "?"} cases recorded`, short: "cut short" };
+  if (c.failed) return { cls: "p-fail", word: `${plural(c.failed, "case")} failed all reps`, short: `${c.failed} failed` };
+  if (c.partial) return { cls: "p-partial", word: `${plural(c.partial, "case")} failed some reps`, short: `${c.partial} partial` };
+  if (!c.recorded) return { cls: "p-infra", word: "no case recorded", short: "no cases" };
+  if (!c.passed) return { cls: "p-infra", word: `nothing graded · ${plural(c.infra, "case")} lost to infra`, short: "nothing graded" };
+  const gaps = [c.infra ? `${plural(c.infra, "case")} lost to infra` : "", c.missing ? `${c.missing} not recorded` : ""].filter(Boolean);
+  if (gaps.length) return { cls: "p-infra", word: `${c.passed} passed · ${gaps.join(" · ")}`, short: [c.infra ? `${c.infra} lost` : "", c.missing ? `${c.missing} missing` : ""].filter(Boolean).join(" · ") };
+  return { cls: "p-pass", word: "every case passed", short: "clean" };
 }
 function nightPill(night) {
   const v = nightVerdict(night);
@@ -1283,7 +1291,7 @@ function nightsListHtml(current) {
   if (list.length < 2) return "";
   const items = list.map((n) => {
     const v = nightVerdict(n);
-    const label = `${esc(nightDay(n))}<span class="pill ${v.cls}">${n.truncated ? "cut short" : n.counts.failed ? `${n.counts.failed} failed` : n.counts.partial ? `${n.counts.partial} partial` : "clean"}</span>`;
+    const label = `${esc(nightDay(n))}<span class="pill ${v.cls}">${esc(v.short)}</span>`;
     return String(n.build) === String(current.build) ? `<span class="now">${label}</span>` : `<a href="${esc(nightHref(n))}">${label}</a>`;
   });
   return `<div class="sec"><h2>Other nights</h2><div class="nights">${items.join("")}</div><p class="mut small">The last ${plural(list.length, "night")} on record, newest first; the Cases page carries each case's nightly pass rate over 7 and 30 days.</p></div>`;

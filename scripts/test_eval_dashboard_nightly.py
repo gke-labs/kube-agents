@@ -283,6 +283,45 @@ class NightlyPageTest(unittest.TestCase):
         self.assertIn('Last night\'s run: <a href="nightly.html">nightly</a>', app)
         self.assertIn("A night is running now: build <a href=", app)
 
+    def test_a_night_that_graded_nothing_or_less_than_the_matrix_is_not_clean(self):
+        """A quota storm grades nothing; a pass short of the matrix is not
+        every case passing. Neither earns the green pill or the "clean"
+        chip (kube-agents-bot on #1503)."""
+        def page_for(newest):
+            data = load_fixture()
+            data["generated_at"] = NOW
+            data["cases"] = copy.deepcopy(CASES)
+            data["runs"] += copy.deepcopy([FIRST, newest])
+            tmp = tempfile.TemporaryDirectory()
+            self.addCleanup(tmp.cleanup)
+            with unittest.mock.patch.object(render.classify, "admitted_cases", return_value=frozenset()), \
+                    unittest.mock.patch.object(render, "demotion_dates", return_value={}), \
+                    unittest.mock.patch.object(render, "recent_merges", return_value=None):
+                out = render_to(tmp.name, data, health=health_doc("GREEN"))
+            return dom_text(out / "nightly.html"), dom_text(out / "index.html")
+
+        storm = night(NIGHT_2, "2026-09-08T00:00:00+00:00", "2026-09-08T06:40:00+00:00",
+                      [task(name, "infra", "infra", "infra", reason="KUBE_AGENTS_INFRA_FAILURE 429") for name in ("case-a", "case-b", "case-c")])
+        page, brief_page = page_for(storm)
+        self.assertIn('<span class="pill p-infra">nothing graded · 3 cases lost to infra</span>', page)
+        self.assertIn('<span class="now">Mon, Sep 7<span class="pill p-infra">nothing graded</span></span>', page)
+        self.assertNotIn("every case passed", page)
+        self.assertNotIn("every case passed", brief_page)
+        self.assertIn("3 cases · 0 passed all reps · 0 partial · 0 failed · 3 infra", brief_page)
+        short = night(NIGHT_2, "2026-09-08T00:00:00+00:00", "2026-09-08T06:40:00+00:00",
+                      [task("case-a", "pass", "pass", "pass"), task("case-b", "infra", "infra", "infra", reason="429")])
+        page, brief_page = page_for(short)
+        self.assertIn('<span class="pill p-infra">1 passed · 1 case lost to infra · 1 not recorded</span>', page)
+        self.assertIn('<span class="pill p-infra">1 lost · 1 missing</span>', page)
+        self.assertNotIn("every case passed", page)
+        self.assertNotIn("every case passed", brief_page)
+        # Every expected case graded and passed: green, and clean in the list.
+        clean = night(NIGHT_2, "2026-09-08T00:00:00+00:00", "2026-09-08T06:40:00+00:00",
+                      [task(name, "pass", "pass", "pass") for name in ("case-a", "case-b", "case-c")])
+        page, _ = page_for(clean)
+        self.assertIn('<span class="pill p-pass">every case passed</span>', page)
+        self.assertIn('<span class="now">Mon, Sep 7<span class="pill p-pass">clean</span></span>', page)
+
     def test_no_night_on_record(self):
         data = load_fixture()
         data["generated_at"] = NOW
