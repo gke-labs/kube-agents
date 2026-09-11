@@ -106,6 +106,12 @@ Generated from the `name` and `description` frontmatter of every `agents/platfor
 | [`inspect-repository`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/inspect-repository/SKILL.md) | Read and analyze the source of any GitHub repository — public or one this install has a token for — without a local checkout. Clones broker-side and pulls file content back; use it to answer questions about code, not to change it. |
 | [`pr-conversation`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/pr-conversation/SKILL.md) | Answer a reviewer who addressed you on one of your own pull requests — read the thread, answer or amend the branch, and reply in the thread. |
 
+### Other
+
+| Skill | Description |
+| ----- | ----------- |
+| [`openshift-gcp-obtainability`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/openshift-gcp-obtainability/SKILL.md) | Orchestrates resource obtainability, zonal stockout recovery, and machine type fallbacks for OpenShift clusters running on Google Compute Engine (GCE). Trigger when OpenShift MachineSets fail to provision nodes due to ZONE_RESOURCE_POOL_EXHAUSTED or QUOTA_EXCEEDED, when pods remain Pending with FailedScheduling, or when designing stockout-resilient machine topologies. |
+
 ### Cluster Agent (per-cluster runtime)
 
 | Skill | Description |
