@@ -119,7 +119,8 @@ ISSUE_RE = re.compile(r"^#(\d+)$")
 
 # --- the three pages and their data ---------------------------------------
 BRIEF_PAGE = "index.html"
-RUN_PAGE = "run.html"
+# The file post_health.run_link points at; one name for it.
+RUN_PAGE = post_health.DASHBOARD_RUN_PAGE
 LEGACY_PAGE = "legacy.html"
 BRIEF_JSON = "brief.json"
 # The object names the pages poll beside their own; the adjudicator job

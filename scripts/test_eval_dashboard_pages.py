@@ -112,16 +112,28 @@ def strict_date_parse_page(page: pathlib.Path) -> pathlib.Path:
     return copy
 
 
-def dom_html(page: pathlib.Path, query: str = "", fragment: str = "") -> str:
+def dom_html(page: pathlib.Path, query: str = "", fragment: str = "", budget_ms: int = 3000) -> str:
     """The whole document after the script ran, via headless Chrome. From
     file:// every fetch fails, which is the condition a host that answers
-    an XHR with a login redirect puts the pages in."""
+    an XHR with a login redirect puts the pages in. ``budget_ms`` is the
+    virtual time the page is given; timers fire inside it, so a budget past
+    PAGE.refreshMs runs the poll too."""
     url = page.as_uri() + (f"?{query}" if query else "") + fragment
     result = subprocess.run(
-        [chrome(), "--headless", "--disable-gpu", "--no-sandbox", "--virtual-time-budget=3000", "--dump-dom", url],
+        [chrome(), "--headless", "--disable-gpu", "--no-sandbox", f"--virtual-time-budget={budget_ms}", "--dump-dom", url],
         capture_output=True, text=True, timeout=90, check=False,
     )
     return result.stdout
+
+
+def scroll_counting_page(page: pathlib.Path) -> pathlib.Path:
+    """A copy of the rendered page whose scrollIntoView records each call
+    on <body data-scrolls>, which --dump-dom serialises."""
+    shim = ("<script>Element.prototype.scrollIntoView = function () {"
+            " document.body.dataset.scrolls = String(Number(document.body.dataset.scrolls || 0) + 1); };</script>")
+    copy = page.with_name(page.stem + "-scrolls" + page.suffix)
+    copy.write_text(page.read_text().replace("<head>", "<head>" + shim, 1))
+    return copy
 
 
 def dom_text(page: pathlib.Path, query: str = "", fragment: str = "") -> str:
@@ -383,8 +395,8 @@ class RenderedFilesTest(unittest.TestCase):
                 page = (out / name).read_text()
                 self.assertEqual(page.count("<base "), 1, name)
                 self.assertIn('<base href="https://example.test/evals/">', page.split("<body", 1)[0], f"{name}: in <head>, with the trailing slash")
-                # Under <base>, a bare "#agent" resolves to the site root, not
-                # this page: every in-page link must carry its file name.
+                # Under <base>, a bare "#view=agent" resolves to the site root,
+                # not this page: every in-page link must carry its file name.
                 self.assertNotIn('href="#', page, f"{name}: no fragment-only link")
             # A trailing slash on the flag is not doubled.
             out = render_to(pathlib.Path(tmp) / "slash", data, extra_args=["--public-url", "https://example.test/evals/"])
@@ -573,6 +585,16 @@ class BrowserTest(unittest.TestCase):
         self.assertIn('id="agent"', app)
         self.assertEqual(app, dom_text(self.index, fragment="#agent"), "the old bare anchor selects the same view")
         self.assertIn('href="index.html#view=agent"', app, "the footer link is the fragment form")
+
+    def test_a_view_scrolls_once_on_navigation_and_not_on_the_poll(self):
+        # 130 s of virtual time: boot, the refresh after it, and two polls.
+        # The section is scrolled to once; the polls, which re-render the
+        # page, must not pull a reader back to it.
+        page = scroll_counting_page(self.index)
+        scrolls = lambda html: re.search(r'<body[^>]*data-scrolls="(\d+)"', html)
+        self.assertEqual(scrolls(dom_html(page, fragment="#since=2026-09-07T14:00:00Z&view=gate", budget_ms=130000)).group(1), "1")
+        self.assertEqual(scrolls(dom_html(page, fragment="#gate", budget_ms=130000)).group(1), "1", "the bare anchor, the same way")
+        self.assertIsNone(scrolls(dom_html(page, budget_ms=130000)), "no view, no scroll")
 
     def test_hostile_parameters_never_reach_the_dom(self):
         for form in ({"query": "cases=%3Cimg%20src%3Dx%3E&since=%3Cscript%3E"}, {"fragment": "#cases=%3Cimg%20src%3Dx%3E&since=%3Cscript%3E&view=%3Cb%3E"}):

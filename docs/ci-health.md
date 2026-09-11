@@ -17,13 +17,14 @@ The same tick comments on each pull request whose run went red
 (`gate_issue.py`), and appends `health.json` to a history feed. A
 `workflow_dispatch` of the same workflow is the on-demand refresh button.
 
-Every message ends with a deep link into the dashboard, its scope in the URL
-fragment (the host's login redirect drops a query string, and a browser
-carries the fragment through the redirect):
+Every message ends with a deep link into the dashboard:
 `index.html#since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>][&cases=<comma-separated case ids>]&view=gate`
 for an incident (`until` on the recovery message), `view=agent` for the
-digest. The contract, and the older `?cases=…#gate` form the pages still
-read, is in [`scripts/eval_dashboard/SCHEMA.md`](../scripts/eval_dashboard/SCHEMA.md).
+digest. The scope rides in the URL fragment because the host's login redirect
+drops a query string and a browser carries the fragment through the redirect.
+The contract, and the older `?cases=…#gate` form the pages still read (it
+opens the same page wherever its query survives), are in
+[`scripts/eval_dashboard/SCHEMA.md`](../scripts/eval_dashboard/SCHEMA.md).
 
 ## Times
 

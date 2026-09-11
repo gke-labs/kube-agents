@@ -135,9 +135,9 @@ DASHBOARD_RUN_PAGE = "run.html"
 # digest, `run.html#build=<prow build id>` for one run. The fragment
 # because the published host's login redirect drops a query string and a
 # browser carries the fragment through a redirect. Commas and colons stay
-# literal. dashboard_link and run_link are the only writers of these
-# shapes; gate_comment.py and gate_issue.py import them rather than
-# spelling a second copy.
+# literal. dashboard_link and run_link are the only Python writers of
+# these shapes: gate_comment.py imports them and gate_issue.py is handed
+# the finished link, so neither spells a second copy.
 DASHBOARD_VIEW_GATE = "gate"
 DASHBOARD_VIEW_AGENT = "agent"
 

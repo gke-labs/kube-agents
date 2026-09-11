@@ -25,8 +25,8 @@
  *   index.html#since=<ISO>&until=<ISO>&cases=a,b&view=gate|agent
  *   run.html#build=<prow build id>
  * The older query form (`?cases=a,b&since=<ISO>&until=<ISO>` before a bare
- * `#gate` or `#agent`; `?build=<id>` on run.html) is still read, so links
- * already posted keep working.
+ * `#gate` or `#agent`; `?build=<id>` on run.html) is still read, so a link
+ * already posted opens the same page wherever its query survives.
  */
 "use strict";
 
@@ -770,7 +770,10 @@ function renderFreshness() {
   el.className = stale ? "fresh stale" : "fresh";
 }
 
-function renderAll() {
+// `scroll` is true for a navigation (boot, a hash change): the page then
+// scrolls to the `view=` section it just rendered. The poll re-renders
+// with it false, so a reader who has scrolled on is not pulled back.
+function renderAll(scroll = false) {
   const link = linkState();
   const app = document.getElementById("app");
   const page = document.body.dataset.page;
@@ -786,7 +789,7 @@ function renderAll() {
   renderFreshness();
   // The section is rendered just above, after the browser looked for the
   // anchor, and a `view=` fragment names no element anyway: scroll by hand.
-  if (link.view) {
+  if (scroll && link.view) {
     const target = document.getElementById(link.view);
     if (target) target.scrollIntoView();
   }
@@ -822,10 +825,10 @@ async function refresh() {
   renderAll();
 }
 
-renderAll();
+renderAll(true);
 // Polling is attempted everywhere, a file:// preview included: a failed
 // poll costs nothing but the "regenerated every N min" suffix.
 refresh();
 setInterval(refresh, PAGE.refreshMs);
-window.addEventListener("hashchange", renderAll);
+window.addEventListener("hashchange", () => renderAll(true));
 setInterval(renderFreshness, 30000);

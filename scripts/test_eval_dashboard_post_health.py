@@ -604,7 +604,7 @@ class DeepLinks(RunHarness):
         self.tick(health(since="2026-09-04T14:00:00+00:00"), T0.replace(hour=14))
         self.assertEqual(self.last_line(), f"{URL}#since=2026-09-04T03:08:00Z&until=2026-09-04T14:00:00Z&cases=x-probe&view=gate")
 
-    def test_the_digest_links_the_agent_section(self):
+    def test_the_digest_links_the_agent_view(self):
         self.tick(health(since="2026-09-04T03:30:00+00:00"), self.at(DIGEST_UTC, 5))
         self.assertEqual(self.last_line(), f"{URL}#since=2026-09-04T03:30:00Z&view=agent")
 
