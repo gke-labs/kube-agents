@@ -5,13 +5,13 @@ from pathlib import Path
 
 from command_policy import evaluate, GCLOUD_READ_COMMANDS, _gcloud_words_and_flag
 
-# The gke-config-connector skill is prompt material that spells out the
+# The gcp-config-connector skill is prompt material that spells out the
 # commands the model runs verbatim, and it promises to stay read-only. Both
 # halves are checked below against the policy itself: a fenced command the
 # policy refuses would present at runtime as a skill that stops halfway
 # through Step 2, and no other test in the tree would notice.
 CONFIG_CONNECTOR_SKILL_DIR = (
-    Path(__file__).resolve().parents[1] / "skills" / "gke-config-connector"
+    Path(__file__).resolve().parents[1] / "skills" / "gcp-config-connector"
 )
 FENCED_SHELL_BLOCK = re.compile(r"^```(?:bash|sh|shell)\n(.*?)^```", re.MULTILINE | re.DOTALL)
 GOVERNED_TOOLS = frozenset({"kubectl", "gcloud"})
@@ -1168,7 +1168,7 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
 
 
 class TheConfigConnectorSkillStaysInsideThePolicy(unittest.TestCase):
-    """agents/platform/skills/gke-config-connector authors KCC manifests for a
+    """agents/platform/skills/gcp-config-connector authors KCC manifests for a
     pull request and validates them read-only. Every kubectl and gcloud
     command its fenced blocks spell must be one the policy allows, and the
     validation it tells the model to leave to reviewers must be one the

@@ -45,21 +45,21 @@ September 2026; `kubectl explain` on the customer's CRDs decides.
 
 From `gcloud compute firewall-rules describe ... --format=json`:
 
-| `describe` field                                | spec path                                       | Note                                                  |
-| ----------------------------------------------- | ----------------------------------------------- | ----------------------------------------------------- |
-| `name`                                          | `metadata.name`, `spec.resourceID`              |                                                       |
-| `network` (a URL ending `/global/networks/<n>`) | `spec.networkRef.external`                      | rewrite as `projects/<project>/global/networks/<n>`   |
-| `direction`                                     | `spec.direction`                                | immutable                                             |
-| `priority`                                      | `spec.priority`                                 |                                                       |
-| `allowed[].IPProtocol`, `allowed[].ports`       | `spec.allow[].protocol`, `spec.allow[].ports`   |                                                       |
-| `denied[].IPProtocol`, `denied[].ports`         | `spec.deny[].protocol`, `spec.deny[].ports`     |                                                       |
-| `sourceRanges`, `destinationRanges`             | `spec.sourceRanges`, `spec.destinationRanges`   |                                                       |
-| `sourceTags`, `targetTags`                      | `spec.sourceTags`, `spec.targetTags`            |                                                       |
-| `sourceServiceAccounts`, `targetServiceAccounts` | `spec.sourceServiceAccounts[].external`, `spec.targetServiceAccounts[].external` | the account email |
-| `disabled`                                      | `spec.disabled`                                 |                                                       |
-| `logConfig.enable`, `logConfig.metadata`        | `spec.logConfig.metadata`                       | state `logConfig` only when `enable` is true          |
-| `description`                                   | `spec.description`                              |                                                       |
-| `id`, `selfLink`, `creationTimestamp`, `kind`   | not spec                                        |                                                       |
+| `describe` field                                 | spec path                                                                        | Note                                                |
+| ------------------------------------------------ | -------------------------------------------------------------------------------- | --------------------------------------------------- |
+| `name`                                           | `metadata.name`, `spec.resourceID`                                               |                                                     |
+| `network` (a URL ending `/global/networks/<n>`)  | `spec.networkRef.external`                                                       | rewrite as `projects/<project>/global/networks/<n>` |
+| `direction`                                      | `spec.direction`                                                                 | immutable                                           |
+| `priority`                                       | `spec.priority`                                                                  |                                                     |
+| `allowed[].IPProtocol`, `allowed[].ports`        | `spec.allow[].protocol`, `spec.allow[].ports`                                    |                                                     |
+| `denied[].IPProtocol`, `denied[].ports`          | `spec.deny[].protocol`, `spec.deny[].ports`                                      |                                                     |
+| `sourceRanges`, `destinationRanges`              | `spec.sourceRanges`, `spec.destinationRanges`                                    |                                                     |
+| `sourceTags`, `targetTags`                       | `spec.sourceTags`, `spec.targetTags`                                             |                                                     |
+| `sourceServiceAccounts`, `targetServiceAccounts` | `spec.sourceServiceAccounts[].external`, `spec.targetServiceAccounts[].external` | the account email                                   |
+| `disabled`                                       | `spec.disabled`                                                                  |                                                     |
+| `logConfig.enable`, `logConfig.metadata`         | `spec.logConfig.metadata`                                                        | state `logConfig` only when `enable` is true        |
+| `description`                                    | `spec.description`                                                               |                                                     |
+| `id`, `selfLink`, `creationTimestamp`, `kind`    | not spec                                                                         |                                                     |
 
 ## Create: allow HTTPS from the corporate range to tagged instances
 

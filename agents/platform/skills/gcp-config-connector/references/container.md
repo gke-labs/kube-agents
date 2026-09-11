@@ -43,27 +43,27 @@ The common request: grow a pool, turn on autoscaling, change its bounds.
 
 From `gcloud container node-pools describe ... --format=json`:
 
-| `describe` field                                      | spec path                                              | Note                                       |
-| ----------------------------------------------------- | ------------------------------------------------------ | ------------------------------------------ |
-| `name`                                                | `metadata.name`, `spec.resourceID`                     |                                            |
-| (the `--cluster` and `--location` you passed)         | `spec.clusterRef.external`, `spec.location`            | immutable                                  |
-| `locations[]`                                         | `spec.nodeLocations`                                   |                                            |
-| `autoscaling.{minNodeCount,maxNodeCount}`             | `spec.autoscaling.{minNodeCount,maxNodeCount}`         | only when `autoscaling.enabled` is true    |
-| `autoscaling.{totalMinNodeCount,totalMaxNodeCount}`   | `spec.autoscaling.{totalMinNodeCount,totalMaxNodeCount}` | exclusive with the per-zone pair         |
-| `autoscaling.locationPolicy`                          | `spec.autoscaling.locationPolicy`                      |                                            |
-| `initialNodeCount`                                    | omit                                                   | immutable; describes creation only         |
-| `config.machineType`, `config.diskSizeGb`, `config.diskType` | `spec.nodeConfig.{machineType,diskSizeGb,diskType}` | immutable; copy verbatim               |
-| `config.spot`, `config.preemptible`                   | `spec.nodeConfig.{spot,preemptible}`                   | immutable                                  |
-| `config.serviceAccount`                               | `spec.nodeConfig.serviceAccountRef.external`           |                                            |
-| `config.oauthScopes[]`                                | `spec.nodeConfig.oauthScopes`                          | immutable                                  |
-| `config.labels`, `config.metadata`                    | `spec.nodeConfig.{labels,metadata}`                    | immutable                                  |
-| `config.taints[]`                                     | `spec.nodeConfig.taint[]` (`key`, `value`, `effect`)   |                                            |
-| `config.imageType`                                    | `spec.nodeConfig.imageType`                            |                                            |
-| `management.{autoRepair,autoUpgrade}`                 | `spec.management.{autoRepair,autoUpgrade}`             |                                            |
-| `upgradeSettings.{maxSurge,maxUnavailable}`           | `spec.upgradeSettings.{maxSurge,maxUnavailable}`       |                                            |
-| `maxPodsConstraint.maxPodsPerNode`                    | `spec.maxPodsPerNode`                                  |                                            |
-| `version`                                             | `spec.version`                                         | state only when the request pins it        |
-| `status`, `selfLink`, `instanceGroupUrls`, `podIpv4CidrSize` | not spec                                        |                                            |
+| `describe` field                                             | spec path                                                | Note                                    |
+| ------------------------------------------------------------ | -------------------------------------------------------- | --------------------------------------- |
+| `name`                                                       | `metadata.name`, `spec.resourceID`                       |                                         |
+| (the `--cluster` and `--location` you passed)                | `spec.clusterRef.external`, `spec.location`              | immutable                               |
+| `locations[]`                                                | `spec.nodeLocations`                                     |                                         |
+| `autoscaling.{minNodeCount,maxNodeCount}`                    | `spec.autoscaling.{minNodeCount,maxNodeCount}`           | only when `autoscaling.enabled` is true |
+| `autoscaling.{totalMinNodeCount,totalMaxNodeCount}`          | `spec.autoscaling.{totalMinNodeCount,totalMaxNodeCount}` | exclusive with the per-zone pair        |
+| `autoscaling.locationPolicy`                                 | `spec.autoscaling.locationPolicy`                        |                                         |
+| `initialNodeCount`                                           | omit                                                     | immutable; describes creation only      |
+| `config.machineType`, `config.diskSizeGb`, `config.diskType` | `spec.nodeConfig.{machineType,diskSizeGb,diskType}`      | immutable; copy verbatim                |
+| `config.spot`, `config.preemptible`                          | `spec.nodeConfig.{spot,preemptible}`                     | immutable                               |
+| `config.serviceAccount`                                      | `spec.nodeConfig.serviceAccountRef.external`             |                                         |
+| `config.oauthScopes[]`                                       | `spec.nodeConfig.oauthScopes`                            | immutable                               |
+| `config.labels`, `config.metadata`                           | `spec.nodeConfig.{labels,metadata}`                      | immutable                               |
+| `config.taints[]`                                            | `spec.nodeConfig.taint[]` (`key`, `value`, `effect`)     |                                         |
+| `config.imageType`                                           | `spec.nodeConfig.imageType`                              |                                         |
+| `management.{autoRepair,autoUpgrade}`                        | `spec.management.{autoRepair,autoUpgrade}`               |                                         |
+| `upgradeSettings.{maxSurge,maxUnavailable}`                  | `spec.upgradeSettings.{maxSurge,maxUnavailable}`         |                                         |
+| `maxPodsConstraint.maxPodsPerNode`                           | `spec.maxPodsPerNode`                                    |                                         |
+| `version`                                                    | `spec.version`                                           | state only when the request pins it     |
+| `status`, `selfLink`, `instanceGroupUrls`, `podIpv4CidrSize` | not spec                                                 |                                         |
 
 ### Create: an autoscaled pool on a cluster the repo already describes
 

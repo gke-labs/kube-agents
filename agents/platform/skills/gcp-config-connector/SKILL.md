@@ -1,5 +1,5 @@
 ---
-name: gke-config-connector
+name: gcp-config-connector
 description: >-
   Authors Config Connector (KCC) manifests for Google Cloud resource changes
   and hands them to submit-suggestion as a pull request under the GitOps
@@ -13,7 +13,7 @@ description: >-
   gke-cluster-creation), or Terraform HCL.
 ---
 
-# GKE Config Connector (KCC) Authoring
+# Config Connector (KCC) Authoring
 
 A Google Cloud change leaves this agent only one way: as a Config Connector
 manifest in the GitOps repository, reviewed by a human and applied by the

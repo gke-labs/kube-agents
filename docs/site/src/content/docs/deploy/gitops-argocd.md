@@ -157,7 +157,7 @@ gcloud iam service-accounts add-iam-policy-binding \
 
 Then apply a `ConfigConnector` in `namespaced` mode and a `ConfigConnectorContext` in your namespace naming that service account, and check `status.healthy` is `true` before trusting it.
 
-The Platform Agent authors KCC manifests for this path through its [`gke-config-connector` skill](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gke-config-connector/SKILL.md), which covers `ContainerCluster`/`ContainerNodePool`, `SQLInstance` and `ComputeFirewall`. It assumes three things about your installation, and stops with the missing one named rather than working around it:
+The Platform Agent authors KCC manifests for this path through its [`gcp-config-connector` skill](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/gcp-config-connector/SKILL.md), which covers `ContainerCluster`/`ContainerNodePool`, `SQLInstance` and `ComputeFirewall`. It assumes three things about your installation, and stops with the missing one named rather than working around it:
 
 - **The KCC CRDs are installed on a cluster the agent's kubeconfig reaches.** Its only pre-PR validation is `kubectl explain` against those CRDs; there is no bundled schema, and the agent cannot run `kubectl apply --dry-run=server` (write RBAC it does not hold, and a verb its command policy refuses). That dry-run is the reviewer's or CI's step, and the agent says so in every PR body.
 - **The namespace it writes into is bound to a project** — through `ConfigConnectorContext` or a `cnrm.cloud.google.com/project-id` annotation on the sibling manifests, which it copies rather than choosing.
