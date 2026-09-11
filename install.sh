@@ -411,6 +411,7 @@ PARAM_THIRD_PARTY_REGISTRY_PREFIX="${THIRD_PARTY_REGISTRY_PREFIX:-}"
 # google_chat_enabled = false and plan the Pub/Sub topic and subscription away.
 PARAM_ENABLE_GOOGLE_CHAT="${GOOGLE_CHAT_ENABLED:-}"
 PARAM_CHAT_TOPIC_NAME="${CHAT_TOPIC_NAME:-}"
+PARAM_CHAT_SUB_NAME="${CHAT_SUB_NAME:-}"
 PARAM_GOOGLE_CHAT_MODE="${GOOGLE_CHAT_MODE:-}"
 PARAM_GOOGLE_CHAT_HOME_CHANNEL="${GOOGLE_CHAT_HOME_CHANNEL:-}"
 PARAM_MODEL_DEFAULT_NAME="${MODEL_DEFAULT_NAME:-}"
@@ -507,6 +508,9 @@ Flags for AI Agents & Automation:
   --chat-topic-name=TOPIC       Pub/Sub topic name for Google Chat
                                 (default: DEFAULT_CHAT_TOPIC_NAME,
                                 currently platform-agent-chat-events)
+  --chat-sub-name=SUB           Pub/Sub subscription name for Google Chat
+                                (default: derived as <topic>-sub when --chat-topic-name
+                                is custom; DEFAULT_CHAT_SUB_NAME on default topic)
   --google-chat-mode=MODE       Google Chat output mode: default | debug
                                 (default: DEFAULT_GOOGLE_CHAT_MODE, currently default)
   --google-chat-home-channel=SPACE_ID
@@ -568,6 +572,7 @@ parse_args() {
       --enable-google-chat|--google-chat) PARAM_ENABLE_GOOGLE_CHAT="true"; shift ;;
       --allowed-users=*) PARAM_ALLOWED_USERS="${1#*=}"; shift ;;
       --chat-topic-name=*) PARAM_CHAT_TOPIC_NAME="${1#*=}"; shift ;;
+      --chat-sub-name=*) PARAM_CHAT_SUB_NAME="${1#*=}"; shift ;;
       --google-chat-mode=*) PARAM_GOOGLE_CHAT_MODE="${1#*=}"; shift ;;
       --google-chat-home-channel=*) PARAM_GOOGLE_CHAT_HOME_CHANNEL="${1#*=}"; shift ;;
       --migrate-node-pools=*)
@@ -1329,6 +1334,7 @@ resolve_shared_defaults() {
   PARAM_ENABLE_GOOGLE_CHAT="${PARAM_ENABLE_GOOGLE_CHAT:-$DEFAULT_GOOGLE_CHAT_ENABLED}"
   PARAM_GOOGLE_CHAT_MODE="${PARAM_GOOGLE_CHAT_MODE:-$DEFAULT_GOOGLE_CHAT_MODE}"
   PARAM_CHAT_TOPIC_NAME="${PARAM_CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
+  PARAM_CHAT_SUB_NAME="$(derive_chat_sub_name "$PARAM_CHAT_TOPIC_NAME" "${PARAM_CHAT_SUB_NAME:-}")"
   PARAM_GITOPS_REPO="${PARAM_GITOPS_REPO:-$DEFAULT_GITOPS_REPO}"
   PARAM_ENABLE_PUBSUB_PLATFORM="${PARAM_ENABLE_PUBSUB_PLATFORM:-$DEFAULT_ENABLE_PUBSUB_PLATFORM}"
   PARAM_ENABLE_STOCKOUT_INVESTIGATOR="${PARAM_ENABLE_STOCKOUT_INVESTIGATOR:-$DEFAULT_ENABLE_STOCKOUT_INVESTIGATOR}"
@@ -2432,7 +2438,7 @@ run_menu_system() {
   local slack_enabled="${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}"
   local allowed_users="${ALLOWED_USERS:-}"
   local chat_topic_name="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
-  local chat_sub_name="${CHAT_SUB_NAME:-$DEFAULT_CHAT_SUB_NAME}"
+  local chat_sub_name="$(derive_chat_sub_name "$chat_topic_name" "${CHAT_SUB_NAME:-}")"
   local permission_set="${PLATFORM_AGENT_PERMISSION_SET:-$DEFAULT_PERMISSION_SET}"
   local custom_roles="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
   # Not the fresh-install default. The control panel describes an install that
@@ -2971,7 +2977,7 @@ main() {
     allowed_users_hint="empty list"
   fi
   local chat_topic_name="$PARAM_CHAT_TOPIC_NAME"
-  local chat_sub_name="${CHAT_SUB_NAME:-$DEFAULT_CHAT_SUB_NAME}"
+  local chat_sub_name="$(derive_chat_sub_name "$chat_topic_name" "${PARAM_CHAT_SUB_NAME:-${CHAT_SUB_NAME:-}}")"
   local google_chat_mode="$PARAM_GOOGLE_CHAT_MODE"
   if [[ ! "$google_chat_mode" =~ ^(default|debug)$ ]]; then
     print_error "--google-chat-mode must be either 'default' or 'debug'."
@@ -3027,6 +3033,8 @@ main() {
     prompt_read "Allowed User Email(s) for Google Chat (comma-separated, empty allows all users)" \
       allowed_users "$allowed_users" false "$allowed_users_hint"
     prompt_read "Pub/Sub Topic Name for Google Chat" chat_topic_name "$chat_topic_name"
+    chat_sub_name="$(derive_chat_sub_name "$chat_topic_name" "$chat_sub_name")"
+    prompt_read "Pub/Sub Subscription Name for Google Chat" chat_sub_name "$chat_sub_name"
     prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
       google_chat_home_channel "$google_chat_home_channel"
   }

@@ -561,6 +561,29 @@ derive_kms_location() {
   echo "$loc"
 }
 
+# ─── Pub/Sub Derivations ──────────────────────────────────────────────────────
+# Derive the Google Chat Pub/Sub subscription name from the topic name.
+# When CHAT_TOPIC_NAME is not the default and CHAT_SUB_NAME is unset or equals
+# the default name, derive "${CHAT_TOPIC_NAME}-sub" to avoid 409 collisions
+# against an existing default subscription bound to another topic (#1397).
+# An explicit custom CHAT_SUB_NAME always wins.
+derive_chat_sub_name() {
+  local topic="${1:-${CHAT_TOPIC_NAME:-${DEFAULT_CHAT_TOPIC_NAME:-}}}"
+  local sub="${2:-${CHAT_SUB_NAME:-}}"
+  local default_topic="${DEFAULT_CHAT_TOPIC_NAME:-platform-agent-chat-events}"
+  local default_sub="${DEFAULT_CHAT_SUB_NAME:-platform-agent-chat-events-sub}"
+
+  if [ -n "$sub" ] && [ "$sub" != "$default_sub" ]; then
+    echo "$sub"
+    return
+  fi
+  if [ -n "$topic" ] && [ "$topic" != "$default_topic" ]; then
+    echo "${topic}-sub"
+  else
+    echo "${sub:-$default_sub}"
+  fi
+}
+
 # ─── GitHub Account Classification ────────────────────────────────────────────
 # Classifies a GitHub account name against the public API, echoing exactly one
 # of: organization | user | missing | unknown.
@@ -1703,9 +1726,11 @@ write_tfvars_from_state() {
       echo "project_roles  = $(hcl_csv_list "${PLATFORM_AGENT_CUSTOM_ROLES:-}")"
     fi
     echo ""
+    local derived_chat_topic="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
+    local derived_chat_sub="$(derive_chat_sub_name "$derived_chat_topic" "${CHAT_SUB_NAME:-}")"
     echo "enable_google_chat        = $(hcl_bool "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}")"
-    echo "chat_topic_name           = $(hcl_str "${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}")"
-    echo "chat_subscription_name    = $(hcl_str "${CHAT_SUB_NAME:-$DEFAULT_CHAT_SUB_NAME}")"
+    echo "chat_topic_name           = $(hcl_str "$derived_chat_topic")"
+    echo "chat_subscription_name    = $(hcl_str "$derived_chat_sub")"
     echo "google_chat_allowed_users = $(hcl_csv_list "${ALLOWED_USERS:-}")"
     echo "google_chat_home_channel  = $(hcl_str "${GOOGLE_CHAT_HOME_CHANNEL:-}")"
     echo "google_chat_mode          = $(hcl_str "${GOOGLE_CHAT_MODE:-$DEFAULT_GOOGLE_CHAT_MODE}")"

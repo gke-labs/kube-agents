@@ -2997,5 +2997,68 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         )
 
 
+class ChatSubscriptionDerivationTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self._empty_install_env = pathlib.Path(tmp.name) / "install.env"
+        self._empty_install_env.write_text("")
+
+    def _run_install_func(self, func_call, env=None):
+        setup = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
+source_provisioning_helpers . >/dev/null
+{func_call}
+"""
+        overrides = {"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}
+        overrides.update(env or {})
+        full_env = get_isolated_test_env(overrides=overrides)
+        return subprocess.run(
+            ["bash", "-c", setup],
+            capture_output=True,
+            text=True,
+            env=full_env,
+            cwd=str(_REPO_ROOT),
+        )
+
+    def test_default_topic_derives_default_subscription(self):
+        proc = self._run_install_func('echo "SUB=$(derive_chat_sub_name)"')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SUB=platform-agent-chat-events-sub", proc.stdout)
+
+    def test_custom_topic_derives_matching_subscription(self):
+        proc = self._run_install_func('echo "SUB=$(derive_chat_sub_name "my-custom-topic")"')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SUB=my-custom-topic-sub", proc.stdout)
+
+    def test_custom_topic_with_default_sub_re_derives(self):
+        proc = self._run_install_func(
+            'echo "SUB=$(derive_chat_sub_name "my-custom-topic" "platform-agent-chat-events-sub")"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SUB=my-custom-topic-sub", proc.stdout)
+
+    def test_explicit_custom_subscription_wins(self):
+        proc = self._run_install_func(
+            'echo "SUB=$(derive_chat_sub_name "my-custom-topic" "explicit-sub-name")"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SUB=explicit-sub-name", proc.stdout)
+
+    def test_parse_args_supports_chat_sub_name_flag(self):
+        proc = self._run_install_func(
+            'parse_args --chat-sub-name=custom-sub; echo "SUB=$PARAM_CHAT_SUB_NAME"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SUB=custom-sub", proc.stdout)
+
+    def test_apply_defaults_derives_chat_sub_name_when_topic_custom(self):
+        proc = self._run_install_func(
+            'PARAM_CHAT_TOPIC_NAME="custom-events"; resolve_shared_defaults; echo "SUB=$PARAM_CHAT_SUB_NAME"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SUB=custom-events-sub", proc.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
