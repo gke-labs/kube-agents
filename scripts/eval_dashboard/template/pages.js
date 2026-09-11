@@ -31,9 +31,10 @@ const PAGE = {
   // The adjudicator's STORM_COOLDOWN: retest this long after the last storm-hit run.
   stormCooldownMs: 30 * 60 * 1000,
   // An incident's window opens this long before its `since`: the rule's own
-  // lookback (shared break 6 h, storm and setup deaths 2 h), so the runs
-  // that made the bot declare it are on the page, not only the ones after.
-  incidentLeadMs: { shared_break: 6 * 3600 * 1000, storm: 2 * 3600 * 1000, setup_deaths: 2 * 3600 * 1000 },
+  // lookback (shared break 6 h, storm, setup deaths and lost pods 2 h), so
+  // the runs that made the bot declare it are on the page, not only the ones
+  // after.
+  incidentLeadMs: { shared_break: 6 * 3600 * 1000, storm: 2 * 3600 * 1000, setup_deaths: 2 * 3600 * 1000, lost_pods: 2 * 3600 * 1000 },
   recoveryGreenRuns: 3,
   // A shared break "explains" the reds when at least this share of red runs
   // in the window collapsed one of its cases; below it the headline says "most".
@@ -628,6 +629,7 @@ function bannerHtml(run) {
   if (h.state === "GREEN") text = `<b>Gate healthy ${when}.</b> No shared break, storm or setup failures. <a href="index.html">Brief →</a>`;
   else if (h.condition === "storm") text = `<b>Quota storm ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs lose repetitions to 429s and empty records. <a href="${esc(href)}">Read the brief →</a>`;
   else if (h.condition === "setup_deaths") text = `<b>Setup failures ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs die before any case runs. <a href="${esc(href)}">Read the brief →</a>`;
+  else if (h.condition === "lost_pods") text = `<b>Build nodes lost ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs died with the node under them; nothing about the branch. <a href="${esc(href)}">Read the brief →</a>`;
   else text = `<b>Gate ${h.recovering ? "recovering" : "outage"} ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: ${cases.length ? `<code>${cases.map(esc).join("</code>, <code>")}</code> fail${cases.length === 1 ? "s" : ""} on every PR` : esc(h.cause || "a shared break")}. <a href="${esc(href)}">Read the brief →</a>`;
   const state = h.recovering ? "DEGRADED" : h.state;
   return `<div class="banner ${PAGE.states[state] || "hs-past"}">${pillHtml(state, h.recovering ? "RECOVERING" : h.state)}<span>${text}</span></div>`;
