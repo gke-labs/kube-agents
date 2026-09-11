@@ -703,6 +703,24 @@ def credential_patterns() -> dict[str, re.Pattern[str]]:
     if spec is None or spec.loader is None:
         raise CaseError(f"{REDACTOR_FILE}: could not be loaded")
     module = importlib.util.module_from_spec(spec)
+    # Registered before the exec, the way the import system would, and left
+    # there. A module object on its own stopped being enough once the redactor
+    # gained a dataclass: the file carries `from __future__ import annotations`,
+    # so every field annotation reaches dataclasses as a string, and an
+    # unqualified one like `name: str` gets probed for KW_ONLY through
+    # sys.modules[cls.__module__].__dict__ -- unguarded, so a module absent
+    # from sys.modules dies there on None (dataclasses._is_type). The failure
+    # lands inside dataclasses, nowhere near this loader.
+    #
+    # Same shape as _load_redactor in charts/kube-agents/files/
+    # litellm_redaction_callback.py, which loads this same redactor at the
+    # gateway and hit this first; one convention between the two loaders is
+    # worth more than a marginally tidier sys.modules here. Leaving it
+    # registered also keeps the module usable afterwards -- unregistering it
+    # would leave an object whose own annotations no longer resolve, which
+    # breaks at a distance rather than here. REDACTOR_MODULE_NAME is ours
+    # alone (see its definition), so this displaces nothing.
+    sys.modules[REDACTOR_MODULE_NAME] = module
     try:
         spec.loader.exec_module(module)
     except Exception as exc:  # any import failure is the finding, whatever its class

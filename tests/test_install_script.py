@@ -242,6 +242,20 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{isolated_install_sh}"
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn(f"MODE={MOCK_GOOGLE_CHAT_MODE}", proc.stdout)
 
+    def test_parse_args_generate_only(self):
+        """Verifies parse_args captures --generate-only."""
+        cmd = 'parse_args --generate-only; echo "GEN=$PARAM_GENERATE_ONLY"'
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("GEN=true", proc.stdout)
+
+    def test_main_generate_only_and_dry_run_cannot_be_combined(self):
+        """Verifies that combining --dry-run and --generate-only fails."""
+        cmd = 'main --dry-run --generate-only || rc=$?; echo "RC=$rc"'
+        proc = self._run_install_func(cmd)
+        self.assertIn("RC=2", proc.stdout)
+        self.assertIn("--dry-run and --generate-only are different modes and cannot be combined", proc.stdout)
+
     def test_parse_args_cluster_mode(self):
         """Verifies parse_args captures --cluster-mode."""
         cmd = 'parse_args --cluster-mode=autopilot; echo "MODE=$PARAM_CLUSTER_MODE"'
@@ -951,6 +965,60 @@ run_menu_system "."
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("RC=1", proc.stdout)
+
+    def test_print_generate_only_handoff_renders_required_commands(self):
+        """Verifies print_generate_only_handoff prints all out-of-Terraform and lifecycle commands."""
+        cmd = f"""
+{_SOURCE_INSTALLER_COMMON}
+PROJECT_ID="test-proj"
+CLUSTER_NAME="test-cluster"
+INSTALL_ENV_FILE="/tmp/test/install.env"
+print_generate_only_handoff "/tmp/test-repo" "test-proj" "test-cluster" "us-central1" "/tmp/test-repo/terraform/examples/full-install/terraform.tfvars"
+"""
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = proc.stdout
+        # Out-of-Terraform prerequisites
+        self.assertIn("CMEK Database Encryption (pre-existing cluster without CMEK):", out)
+        self.assertIn("gcloud services enable cloudkms.googleapis.com --project=test-proj", out)
+        self.assertIn("gcloud beta services identity create --service=container.googleapis.com --project=test-proj", out)
+        self.assertIn("gcloud kms keys add-iam-policy-binding", out)
+        self.assertIn('--member="serviceAccount:service-$(gcloud projects describe test-proj --format=\'value(projectNumber)\')@container-engine-robot.iam.gserviceaccount.com" \\', out)
+        self.assertIn('--role="roles/cloudkms.cryptoKeyEncrypterDecrypter" --project=test-proj --quiet', out)
+        self.assertIn("gcloud container clusters update test-cluster --location us-central1 --database-encryption-key=", out)
+        self.assertIn("Workload Identity Pool (pre-existing Standard cluster):", out)
+        self.assertIn("gcloud container clusters update test-cluster --location us-central1 --project test-proj --workload-pool=test-proj.svc.id.goog", out)
+        self.assertIn("NetworkPolicy Enforcement (pre-existing cluster without Dataplane V2):", out)
+        self.assertIn("gcloud container clusters update test-cluster --location us-central1 --project test-proj --update-addons=NetworkPolicy=ENABLED", out)
+        self.assertIn("gcloud container clusters update test-cluster --location us-central1 --project test-proj --enable-network-policy", out)
+        self.assertIn("GitHub App PEM Import (before apply, when GitOps minter is enabled):", out)
+        self.assertIn("gcloud kms keyrings create github-token-minter-keyring --location=us-central1 --project=test-proj", out)
+        self.assertIn("gcloud kms keys create github-token-minter-key --keyring=github-token-minter-keyring", out)
+        self.assertIn("--purpose=asymmetric-signing", out)
+        self.assertIn("--import-only --skip-initial-version-creation", out)
+        self.assertIn("git clone --depth 1 --branch v2.7.1 https://github.com/abcxyz/github-token-minter.git /tmp/minty", out)
+        self.assertIn("go run ./cmd/minty tools import-pk", out)
+        # Lifecycle commands with bucket/prefix
+        self.assertIn("cd /tmp/test-repo/terraform/examples/full-install", out)
+        self.assertIn('KUBE_AGENTS_STATE_BUCKET="test-proj-kube-agents-tfstate" KUBE_AGENTS_STATE_PREFIX="kube-agents/test-cluster" ./lifecycle.sh apply', out)
+        # Post-apply OTel scope
+        self.assertIn("Managed OpenTelemetry Scope:", out)
+        self.assertIn("gcloud container clusters update test-cluster --location us-central1 --project test-proj --managed-otel-scope=COLLECTION_AND_INSTRUMENTATION_COMPONENTS", out)
+
+    def test_write_json_report_includes_generate_only(self):
+        """Verifies write_json_report outputs generate_only boolean."""
+        cmd = """
+PARAM_DRY_RUN="false"
+PARAM_GENERATE_ONLY="true"
+PARAM_NON_INTERACTIVE="true"
+INSTALL_ENV_FILE="/tmp/install.env"
+write_json_report "GENERATE_ONLY_SUCCESS" >/dev/null
+cat /tmp/kube-agents-install-report.json
+"""
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn('"status": "GENERATE_ONLY_SUCCESS"', proc.stdout)
+        self.assertIn('"generate_only": true', proc.stdout)
 
 
 class InstallEnvInputTest(unittest.TestCase):
@@ -2995,6 +3063,137 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
             'handle_pipeline_status "./lifecycle.sh apply -auto-approve -input=false" "$log_file" "${ps[@]}"',
             source,
         )
+
+
+class RunWithSpinnerAndRolloutTest(unittest.TestCase):
+    """Verifies run_with_spinner, wait_for_rollout, and dry-run validation error propagation."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self._tmp_path = pathlib.Path(tmp.name)
+        self._empty_install_env = self._tmp_path / "install.env"
+        self._empty_install_env.write_text("")
+
+    def _run_func(self, func_call, env=None, cwd=None, bin_dir=None):
+        setup = f"""
+source "{_INSTALLER_COMMON}"
+KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
+{func_call}
+"""
+        overrides = {
+            "KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env),
+            "KUBE_AGENTS_INSTALL_REPORT_FILE": str(self._tmp_path / "report.json"),
+        }
+        overrides.update(env or {})
+        full_env = get_isolated_test_env(overrides=overrides, bin_dir=bin_dir)
+        return subprocess.run(
+            ["bash", "-c", setup],
+            capture_output=True,
+            text=True,
+            env=full_env,
+            cwd=str(cwd or _REPO_ROOT),
+        )
+
+    def test_run_with_spinner_non_tty_streams_output_and_returns_zero(self):
+        log_file = self._tmp_path / "test.log"
+        script = f"""
+mock_cmd() {{
+  echo "streamed line 1"
+  echo "streamed line 2"
+  return 0
+}}
+run_with_spinner "Step A" "{log_file}" mock_cmd
+"""
+        proc = self._run_func(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("Step A...", proc.stdout)
+        self.assertIn("streamed line 1", proc.stdout)
+        self.assertIn("streamed line 2", proc.stdout)
+        self.assertTrue(log_file.exists())
+        self.assertIn("streamed line 1\nstreamed line 2", log_file.read_text())
+
+    def test_run_with_spinner_non_tty_propagates_nonzero_exit_code_and_log(self):
+        log_file = self._tmp_path / "test.log"
+        script = f"""
+mock_failing_cmd() {{
+  echo "failing message" >&2
+  return 42
+}}
+rc=0
+run_with_spinner "Step B" "{log_file}" mock_failing_cmd || rc=$?
+echo "RC=$rc"
+"""
+        proc = self._run_func(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("RC=42", proc.stdout)
+        self.assertTrue(log_file.exists())
+        self.assertIn("failing message", log_file.read_text())
+
+    def test_wait_for_rollout_succeeds_when_kubectl_succeeds(self):
+        bin_dir = self._tmp_path / "bin"
+        bin_dir.mkdir(parents=True)
+        kubectl = bin_dir / "kubectl"
+        kubectl.write_text("#!/bin/bash\necho 'deployment successfully rolled out'\nexit 0\n")
+        kubectl.chmod(0o755)
+
+        script = 'rc=0; wait_for_rollout test-dep test-ns 5 || rc=$?; echo "RC=$rc"'
+        proc = self._run_func(script, bin_dir=str(bin_dir))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("RC=0", proc.stdout)
+        self.assertIn("test-dep rolled out in", proc.stdout)
+
+    def test_wait_for_rollout_fails_and_echoes_tail_when_kubectl_fails(self):
+        bin_dir = self._tmp_path / "bin"
+        bin_dir.mkdir(parents=True)
+        kubectl = bin_dir / "kubectl"
+        kubectl.write_text("#!/bin/bash\necho 'error: deadline exceeded' >&2\nexit 1\n")
+        kubectl.chmod(0o755)
+
+        script = 'rc=0; wait_for_rollout test-dep test-ns 5 || rc=$?; echo "RC=$rc"'
+        proc = self._run_func(script, bin_dir=str(bin_dir))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("RC=1", proc.stdout)
+        self.assertIn("error: deadline exceeded", proc.stdout + proc.stderr)
+
+    def test_dry_run_validation_fails_fast_when_terraform_init_fails(self):
+        bin_dir = self._tmp_path / "bin"
+        bin_dir.mkdir(parents=True)
+        terraform = bin_dir / "terraform"
+        counter = self._tmp_path / "validate_counter.txt"
+        terraform.write_text(f"""#!/bin/bash
+if [ "$1" = "init" ]; then
+  echo "init failed" >&2
+  exit 2
+fi
+if [ "$1" = "validate" ]; then
+  echo "called" >> "{counter}"
+  exit 0
+fi
+exit 0
+""")
+        terraform.chmod(0o755)
+
+        script = f"""
+# shellcheck disable=SC2317,SC2329
+validate_tf_config() {{
+  terraform init -backend=false -input=false &&
+    terraform validate
+}}
+tf_log="{self._tmp_path}/tf.log"
+rc=0
+run_with_spinner "Validating Terraform configuration" "$tf_log" validate_tf_config || rc=$?
+echo "RC=$rc"
+"""
+        proc = self._run_func(script, bin_dir=str(bin_dir))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("RC=2", proc.stdout)
+        self.assertFalse(counter.exists(), "terraform validate must not be invoked if terraform init fails")
+
+    def test_rollout_warning_does_not_mention_hardcoded_timeout(self):
+        source = _INSTALL_SH.read_text()
+        self.assertIn('print_warning "$deployment did not report ready."', source)
+        self.assertNotIn('print_warning "$deployment did not report ready within ${ROLLOUT_TIMEOUT_SECS}s."', source)
 
 
 if __name__ == "__main__":

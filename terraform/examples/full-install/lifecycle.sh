@@ -199,6 +199,7 @@ state_prefix() {
 # when nothing changed, and skipping it is how a routine `git pull` that adds a
 # module turns every subcommand below into a failure.
 ensure_init() {
+  log "initializing Terraform..."
   ensure_backend "${1:-}"
   terraform init -input=false >/dev/null || {
     warn "terraform init failed; run it by hand to see why"
@@ -623,7 +624,7 @@ guard_kms_identity() {
   )
   local check addr variable key recorded desired
   for check in "${checks[@]}"; do
-    IFS=$'\t' read -r addr variable key <<<"$check"
+    IFS=$'	' read -r addr variable key <<<"$check"
     in_state "$addr" || continue
     recorded=$(state_attr "$addr" name)
     [[ -n "$recorded" ]] || continue
@@ -668,6 +669,43 @@ forget_unmanaged_cluster_kms() {
   restore_key_versions \
     "projects/$project/locations/$location/keyRings/$(tfvar kms_keyring_name)/cryptoKeys/$(tfvar kms_key_name)" \
     "$location" "$project"
+}
+
+# When enable_github_minter is true, the minter Deployment cannot pass readiness
+# probes without an ENABLED private key version in KMS. Terraform creates the key
+# with skip_initial_version_creation = true (import-only), and the helm release
+# waits on every Deployment (wait = true), so applying without an imported key
+# wedges the apply with the cluster already built. Refuse early if minter is enabled
+# but the key has no ENABLED version.
+guard_minter_key() {
+  [[ "$(tfvar enable_github_minter 2>/dev/null || echo "false")" == "true" ]] || return 0
+  local project raw_loc location keyring key list_out list_rc=0 version
+  project=$(tfvar project_id 2>/dev/null || echo "")
+  [[ -n "$project" ]] || return 0
+  raw_loc=$(tfvar location 2>/dev/null || echo "")
+  [[ -n "$raw_loc" ]] || return 0
+  location=$(sed -E 's/-[a-z]$//' <<<"$raw_loc")
+  keyring=$(tfvar github_minter_kms_keyring 2>/dev/null || echo "")
+  [[ -n "$keyring" ]] || keyring="github-token-minter-keyring"
+  key=$(tfvar github_minter_kms_key 2>/dev/null || echo "")
+  [[ -n "$key" ]] || key="github-token-minter-key"
+
+  list_out=$(gcloud kms keys versions list --key "$key" --keyring "$keyring" \
+    --location "$location" --project "$project" \
+    --filter='state=ENABLED' --format='value(name)' 2>&1) || list_rc=$?
+  if [[ $list_rc -ne 0 ]]; then
+    warn "could not verify Cloud KMS signing key '$location/$keyring/$key' for GitHub minter ($list_out)."
+    warn "Proceeding with apply, but note that the minter requires an ENABLED imported private key to pass readiness."
+    return 0
+  fi
+  version=$(head -1 <<<"$list_out")
+  if [[ -z "$version" ]]; then
+    warn "enable_github_minter is true, but KMS signing key '$location/$keyring/$key' has no ENABLED version."
+    warn "Applying now would deploy the minter and wedge waiting on its readiness probe."
+    warn "Import the GitHub App private key before applying (see k8s-operator/config/integrations/github/README.md),"
+    warn "or set enable_github_minter = false in terraform.tfvars."
+    exit 1
+  fi
 }
 
 delete_agent_cr() {
@@ -841,11 +879,14 @@ case "${1:-}" in
   apply)
     shift
     ensure_init
+    log "verifying pre-apply safety guards (cluster, IAM, KMS)..."
     guard_cluster_ownership
     guard_gsa_identity
     guard_kms_identity
     guard_release_namespace
     forget_unmanaged_cluster_kms
+    guard_minter_key
+    log "checking pre-existing GCP resources to adopt (KMS, Pub/Sub)..."
     adopt_kms
     adopt_pubsub
     log "terraform apply"
