@@ -1,0 +1,36 @@
+{{- $openshift := .Values.openshift | default dict }}
+{{- $scc := $openshift.scc | default dict }}
+{{- if and $openshift.enabled $scc.create }}
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: {{ .Release.Name }}-scc
+  labels:
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    {{- include "kube-agents.labels" . | nindent 4 }}
+priority: 10
+allowHostDirVolumePlugin: false
+allowHostIPC: false
+allowHostNetwork: false
+allowHostPID: false
+allowHostPorts: false
+allowPrivilegedContainer: false
+allowedCapabilities: []
+defaultAddCapabilities: []
+readOnlyRootFilesystem: false
+runAsUser:
+  type: RunAsAny
+seLinuxContext:
+  type: MustRunAs
+fsGroup:
+  type: RunAsAny
+supplementalGroups:
+  type: RunAsAny
+seccompProfiles:
+  - runtime/default
+users:
+  - system:serviceaccount:{{ .Release.Namespace }}:{{ default "kubeagents-platform-agent" .Values.platformAgent.security.serviceAccountName }}
+  - system:serviceaccount:{{ .Release.Namespace }}:{{ default "platform-agent" .Values.platformAgent.name }}-shell
+  - system:serviceaccount:{{ .Release.Namespace }}:{{ .Release.Name }}-controller-manager
+  - system:serviceaccount:{{ .Release.Namespace }}:{{ .Release.Name }}-cr-cleanup
+{{- end }}
