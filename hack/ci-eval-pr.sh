@@ -1156,6 +1156,10 @@ BENCH_DIR="${SCRIPT_DIR}/../bench"
 # agent-kanban-smoke is deployer: noop, so it adds a delegation round trip
 # (~100-300s), not a cluster.
 TASKS=(
+  # MEASUREMENT SCAFFOLDING FOR #1254 -- DO NOT MERGE. Every entry below
+  # except upgrades-lagging-master-probe is commented out so this draft
+  # can be triggered four times inside the presubmit budget. Uncomment
+  # them and restore EVAL_REPETITIONS to put the gate back.
   # SEVEN DOMAINS THROUGH PROBES, THE AUDIT MACHINERY THROUGH ONE CANARY.
   # The 2026-08-26 smoke run (build 2092638061140643840, kube-agents-evals-3)
   # measured what six full audits cost: obtainability-planted-pdb PASSED in
@@ -1179,12 +1183,12 @@ TASKS=(
   # fan-out's cost-hinted queue below (longest units first), so a Prow
   # deadline kills whatever is still in flight rather than truncating this
   # list's tail.
-  "./tasks/reliability-pdb-probe/task.yaml"
-  "./tasks/capacity-pinned-pool-probe/task.yaml"
-  "./tasks/security-overgrant-probe/task.yaml"
+  # "./tasks/reliability-pdb-probe/task.yaml"
+  # "./tasks/capacity-pinned-pool-probe/task.yaml"
+  # "./tasks/security-overgrant-probe/task.yaml"
   "./tasks/upgrades-lagging-master-probe/task.yaml"
-  "./tasks/consistency-authorized-networks-probe/task.yaml"
-  "./tasks/cost-idle-pool-probe/task.yaml"
+  # "./tasks/consistency-authorized-networks-probe/task.yaml"
+  # "./tasks/cost-idle-pool-probe/task.yaml"
   # The security prompt variation, in the same relation to
   # security-overgrant-probe that obtainability-remediation-proposal below
   # holds to reliability-pdb-probe: the probe asks whether debug-binding is
@@ -1198,7 +1202,7 @@ TASKS=(
   # safeguard where the reliability variation below carries two; its
   # task.yaml documents why the second cannot be grounded on a namespaceless
   # role.
-  "./tasks/security-overgrant-remediation-proposal/task.yaml"
+  # "./tasks/security-overgrant-remediation-proposal/task.yaml"
   # Three activations that take the reliability domain to five enabled
   # tasks (#1049), each grading a behavior nothing active grades: PDB
   # SEMANTICS (what a wrong budget does — minAvailable: 2 on two replicas
@@ -1214,9 +1218,9 @@ TASKS=(
   # reporting order only. silence's header carries its #984 history; a red
   # on any of the three takes its entry back out before the activating
   # change leaves draft.
-  "./tasks/obtainability-pdb-semantics/task.yaml"
-  "./tasks/obtainability-fleet-exposure-sweep/task.yaml"
-  "./tasks/obtainability-healthy-namespace-silence/task.yaml"
+  # "./tasks/obtainability-pdb-semantics/task.yaml"
+  # "./tasks/obtainability-fleet-exposure-sweep/task.yaml"
+  # "./tasks/obtainability-healthy-namespace-silence/task.yaml"
   # The reliability prompt variation that grades what the probe does not
   # ask for: reliability-pdb-probe asks whether checkout-gateway survives a
   # drain; this one asks for a remediation manifest and checks the reply
@@ -1226,7 +1230,7 @@ TASKS=(
   # 126s/130s/124s, OutcomeValidity 1.0 each time, on three different
   # leased projects. Its three sibling variations are registered commented
   # out below.
-  "./tasks/obtainability-remediation-proposal/task.yaml"
+  # "./tasks/obtainability-remediation-proposal/task.yaml"
   # rca-remediation-pr -- remediation domain. Activated 2026-08-27 as its own
   # validation run: cost and signal were unmeasured (the 2026-08-26 run hit
   # the job deadline before reaching it), so this entry's first smoke IS the
@@ -1234,19 +1238,19 @@ TASKS=(
   # list's position.
   # The one active task that WRITES: it files a remediation PR against the
   # leased project's throwaway GitOps repo via submit-suggestion.
-  "./tasks/rca-remediation-pr/task.yaml"
+  # "./tasks/rca-remediation-pr/task.yaml"
   # The audit-machinery canary: measured 606s clean on 2026-08-26, every
   # exact check green -- the only task that has proven the A1/A4 path
   # (minted token, cloned *-infra workspace, published ledger issue) in a
   # real presubmit.
-  "./tasks/compliance-rbac-overgrant/task.yaml"
+  # "./tasks/compliance-rbac-overgrant/task.yaml"
   # Activated by #939, the first Phase 2 domain scenario to run. It was blocked
   # on A5 and nothing else -- no GitHub write, so no A1 and no A4 -- and it
   # exercises the whole of step 2b end to end: label discovery, slot-to-role
   # resolution, the .confirmed probe, and fleet_resource_property binding the
   # role to a kubeconfig. It is the cheapest task in this array (142s on the
   # 2026-08-25 run) and it proves the chain the probes above stand on.
-  "./tasks/cluster-agent-crashloop-debug/task.yaml"
+  # "./tasks/cluster-agent-crashloop-debug/task.yaml"
   # Three more cluster-debugging cases in the same family, added by #982:
   # measured 190s, 142s and 220s on build 2092719124550520832, all
   # `deployer: noop`. Position here is reporting order only; execution
@@ -1270,9 +1274,9 @@ TASKS=(
   # Two scored runs bore that out: every safeguard across all four held
   # (VerificationCatastrophic and VerificationCoverage both 1.0), and every
   # failure was an objective rather than a safeguard.
-  "./tasks/cluster-agent-crashloop-misleading-symptom/task.yaml"
-  "./tasks/cluster-agent-crashloop-evidence-chain/task.yaml"
-  "./tasks/cluster-agent-healthy-workload-no-finding/task.yaml"
+  # "./tasks/cluster-agent-crashloop-misleading-symptom/task.yaml"
+  # "./tasks/cluster-agent-crashloop-evidence-chain/task.yaml"
+  # "./tasks/cluster-agent-healthy-workload-no-finding/task.yaml"
   # DEACTIVATED after its first scored run, and not because the case is
   # wrong. On 2026-08-26 the agent read the cluster, changed nothing (all
   # three safeguards green) and misdiagnosed: it blamed a missing label on
@@ -1289,7 +1293,7 @@ TASKS=(
   # Uncomment when the agent can diagnose a capped pool, not before.
   # "./tasks/cluster-agent-pending-replicas-capped-pool/task.yaml"
   # gpu-stress-test-diagnosis: moved to NIGHTLY_TASKS 2026-09-03 (tofu wall clock, #1218/#1202).
-  "./tasks/agent-kanban-smoke/task.yaml"
+  # "./tasks/agent-kanban-smoke/task.yaml"
   # knowledge-grounding-sources-probe: moved to NIGHTLY_TASKS 2026-09-09 after one
   # presubmit cycle (#945) -- knowledge grounding is not a core kube-agents journey.
   # Last, because it is the only entry that pays twice. Its stack plants an
@@ -1639,7 +1643,10 @@ export DETERMINISTIC_CORRECTNESS_FLOOR="${DETERMINISTIC_CORRECTNESS_FLOOR:-1.0}"
 # pull request. It is not a legitimate default: at 1 the collapse rung
 # degenerates to "the single run failed", which is exactly the trigger-happy
 # rule this change exists to replace.
-EVAL_REPETITIONS="${EVAL_REPETITIONS:-3}"
+# MEASUREMENT SCAFFOLDING FOR #1254 -- DO NOT MERGE. Was 3. Fifteen
+# repetitions of the single case left active above, triggered four times,
+# is the sample the phrase-list fix is being measured against.
+EVAL_REPETITIONS="${EVAL_REPETITIONS:-15}"
 if ! [ "${EVAL_REPETITIONS}" -ge 1 ] 2>/dev/null; then
   echo "ERROR: EVAL_REPETITIONS must be a positive integer, got '${EVAL_REPETITIONS}'." >&2
   echo "Zero repetitions would run nothing and report green -- refusing." >&2
@@ -1751,7 +1758,18 @@ CASE_RESULTS=()
 # (profiled 2026-08-28), so the matrix is embarrassingly parallel. The cap
 # bounds concurrent load on the one gateway, LiteLLM and the judge quota;
 # 1 reproduces serial behaviour through the same code path.
-EVAL_TASK_PARALLELISM="${EVAL_TASK_PARALLELISM:-4}"
+# MEASUREMENT SCAFFOLDING FOR #1254 -- DO NOT MERGE. Was 4. With one task in
+# the matrix every repetition contends on the same per-task lock, so three of
+# four lanes only ever sleep on it, and lock_acquire is a 3s retry rather than
+# a queue: a loser can keep losing. Builds 2097793380187639808 and
+# 2097813968994177024 lost reps 6, and 3 and 4, to the 1800s deadline that way.
+# At 1 there is no contention and all 15 repetitions grade.
+# Sample so far: 2097793380187639808 evals-9 13/14, 2097813968994177024
+# evals-12 10/13, 2097884694312914944 evals-3 9/15. Build 2097912147194417152
+# measured nothing -- Step 0 revalidated it against the green run 3 on this
+# same commit, so a fourth sample needs a non-inert push, which is what this
+# comment is.
+EVAL_TASK_PARALLELISM="${EVAL_TASK_PARALLELISM:-1}"
 if ! [ "${EVAL_TASK_PARALLELISM}" -ge 1 ] 2>/dev/null; then
   echo "ERROR: EVAL_TASK_PARALLELISM must be a positive integer, got '${EVAL_TASK_PARALLELISM}'." >&2
   exit 1
