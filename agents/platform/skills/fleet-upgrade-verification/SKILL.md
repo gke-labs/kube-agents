@@ -1,6 +1,6 @@
 ---
 name: fleet-upgrade-verification
-description: Reports every GKE cluster's control-plane and node-pool versions against a target version or each cluster's release-channel default, naming the members that lag and by how many minors; run again during a rollout, it shows which members started, completed or stalled since the previous run. Read-only, from gcloud container reads; the executed counterpart to gke-upgrades' advice.
+description: Reports every GKE cluster's control-plane and node-pool versions against a target version or each cluster's release-channel default, naming the members that lag and by how many minors; run again during a rollout, it shows which members started, completed or stalled since the previous run. Read-only against GCP, from gcloud container reads, keeping only its own record of each run; the executed counterpart to gke-upgrades' advice.
 ---
 
 # Fleet upgrade verification
@@ -89,11 +89,19 @@ member, the control-plane and lowest-pool versions then and now, the current sta
 - `completed`: the member's status became `current` or `ahead` since the previous run.
 - `started`: the control plane or the lowest pool changed version without reaching the target,
   or the cluster or a pool is `RECONCILING`/`PROVISIONING`.
-- `unchanged`: the same versions and status as the previous run.
+- `unchanged`: the same versions as the previous run. A member whose versions are the same but
+  whose status changed (the channel default advanced under it) is also `unchanged`, but it starts
+  a new observation series: it is not `stalled` in that run, and its elapsed time counts from it.
 - `stalled (unchanged for <elapsed>)`: an `unchanged` member that is `lagging` or `patch-behind`
-  while a rollout is active. Elapsed counts from the first of the consecutive runs that saw the
-  member at these versions, so it keeps growing across runs until the member moves.
+  while a rollout is active, seen at these versions and this status by the previous run too.
+  Elapsed counts from the first of the consecutive runs that saw the member so, and keeps growing
+  across runs until the member moves.
 - `new`: no record of this member in the previous run.
+
+An `unknown` grade (a failed `get-server-config` read, an unparsable version) is not evidence of a
+move: the comparison falls back to the versions alone, the record keeps the last graded status
+and its clock, and a member that is `current` at the same versions as an ungraded baseline is
+`unchanged`, not `completed`.
 
 A rollout is active when at least one member is `started` or `completed` in the same comparison,
 or when the operator passed `--rollout-in-progress`, which is for a rollout whose first wave has
