@@ -8,8 +8,15 @@ reads each control-plane and node-pool version, and compares them with a target:
 release-channel `defaultVersion` from `gcloud container get-server-config`. Prints a
 Markdown table on stdout and, with `--output`, writes the same data as JSON.
 
-Read-only: the three gcloud commands it runs are `container clusters list`,
-`container get-server-config`, and `config get-value project`.
+Each run also records its per-member result under a state directory, keyed by target,
+and reads the previous run's record for the same target: a "Rollout progress" section
+after the table says per member whether it `started`, `completed`, or is `unchanged`
+since that run, and flags an unchanged, behind member as `stalled` while a rollout is
+active (another member moved, or `--rollout-in-progress` was passed).
+
+Read-only against GCP: the three gcloud commands it runs are `container clusters list`,
+`container get-server-config`, and `config get-value project`. The only thing it writes
+is its own state file and the optional `--output` JSON.
 """
 
 import argparse
@@ -18,6 +25,8 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
+from datetime import datetime, timezone
 
 # Project resolution, in the order networking_audit.py and the fleet SOPs use it:
 # explicit --project flags, then the fleet's monitored-project list, then the
@@ -82,6 +91,79 @@ TABLE_COLUMNS = (
     "status",
     "note",
 )
+
+# Where a run leaves its record for the next one. The script runs in the shell sandbox,
+# whose /opt/data is a PersistentVolumeClaim the operator retains when the sandbox
+# StatefulSet goes (shell_sandbox_manifests.go), and whose entrypoint replaces only the
+# /opt/defaults trees and the database stubs on start (deploy/sandbox/entrypoint.sh);
+# /opt/data/scratch is per-run scratch by convention, so the record goes in a directory
+# of the skill's own name that nothing else writes. One file per target, named after
+# it: the target string is validated by VERSION_RE, so it is filesystem-safe as is, and
+# a run without --target-version measures each member against its channel default and
+# keys its record under CHANNEL_DEFAULT_STATE_KEY. --state-dir overrides the directory.
+DEFAULT_STATE_DIR = "/opt/data/state/fleet-upgrade-verification"
+CHANNEL_DEFAULT_STATE_KEY = "channel-default"
+STATE_FILE_SUFFIX = ".json"
+# The record is written to a uniquely named sibling and renamed into place, so two
+# runs against one target at once (a chat turn and a delegated card) cannot truncate
+# each other's half-written file; the last rename wins whole.
+STATE_TMP_PREFIX = ".fleet-upgrade-record-"
+# Bumped when the record's shape changes; a file with another version is reported and
+# treated as no prior run rather than compared field by field.
+STATE_FORMAT_VERSION = 1
+# `project/location/cluster`, the same triple the table sorts on; unique across a
+# fleet because a project's cluster names are unique per location.
+MEMBER_KEY_SEPARATOR = "/"
+TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+# Per-member progress since the previous run for the same target. `completed`: the
+# member is current or ahead after a version change (a current member that moved to a
+# new channel default included), or its status became current or ahead. `started`:
+# the control plane or the lowest pool changed version without reaching the target, or
+# the member is in flight. `unchanged`:
+# the same versions and status as before. `new`: no prior record. `stalled` is an
+# unchanged member that is lagging or patch-behind while a rollout is active, which is
+# the signal a point-in-time table cannot give: a member that has not moved between two
+# polls while its peers did.
+PROGRESS_NEW = "new"
+PROGRESS_STARTED = "started"
+PROGRESS_COMPLETED = "completed"
+PROGRESS_UNCHANGED = "unchanged"
+PROGRESS_STALLED = "stalled"
+PROGRESS_ORDER = (PROGRESS_COMPLETED, PROGRESS_STARTED, PROGRESS_STALLED, PROGRESS_UNCHANGED, PROGRESS_NEW)
+# Statuses that mean the member has reached the target, and the ones a stall can be
+# called on. `unknown` is in neither: a row that could not be graded is not a stall,
+# and an `unknown` observation on either side of a comparison is not evidence of a
+# move either (a timed-out get-server-config must not read as a completed upgrade),
+# so the comparison falls back to the versions alone and the record keeps the last
+# graded status.
+DONE_STATUSES = (STATUS_CURRENT, STATUS_AHEAD)
+BEHIND_STATUSES = (STATUS_LAGGING, STATUS_PATCH_BEHIND)
+GRADED_STATUSES = DONE_STATUSES + BEHIND_STATUSES
+# Why a rollout counted as active, for the summary line and the JSON.
+ACTIVE_REASON_FLAG = "--rollout-in-progress"
+ACTIVE_REASON_MOVERS = "another member moved since the previous run"
+# Why a member in the previous record has no row this run.
+GONE_REASON_ABSENT = "not in this run's cluster list; dropped from the record"
+GONE_REASON_NOT_READ = "not read this run ({why}); carried forward"
+NOT_READ_FAILED = "clusters list failed for {project}"
+NOT_READ_OUT_OF_SCOPE = "{project} not in this run's projects"
+
+# Elapsed-time rendering for `stalled (unchanged for ...)`.
+SECONDS_PER_MINUTE = 60
+SECONDS_PER_HOUR = 3600
+SECONDS_PER_DAY = 86400
+ELAPSED_UNDER_A_MINUTE = "<1m"
+PROGRESS_COLUMNS = (
+    "project",
+    "cluster",
+    "location",
+    "previous (control plane / lowest pool)",
+    "now (control plane / lowest pool)",
+    "status",
+    "progress",
+)
+VERSION_PAIR_SEPARATOR = " / "
 
 # Exit codes. A failed gcloud call is reported per project and per location and does
 # not abort the run; the exit code only says whether every requested read succeeded.
@@ -369,12 +451,247 @@ def render_table(report: dict) -> str:
         lines.append(f"- read failed for {where}: {err['message']}")
     return "\n".join(lines)
 
+def utc_now() -> datetime:
+    """The clock every timestamp in the state file comes from; tests patch it."""
+    return datetime.now(timezone.utc)
+
+
+def format_timestamp(when: datetime) -> str:
+    return when.astimezone(timezone.utc).strftime(TIMESTAMP_FORMAT)
+
+
+def parse_timestamp(text) -> datetime | None:
+    """A TIMESTAMP_FORMAT string back to an aware datetime; None when it does not parse."""
+    if not isinstance(text, str):
+        return None
+    try:
+        return datetime.strptime(text, TIMESTAMP_FORMAT).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def format_elapsed(seconds: int) -> str:
+    """`2h 15m`, `3d 1h`, `45m`; under a minute is ELAPSED_UNDER_A_MINUTE."""
+    seconds = max(0, int(seconds))
+    days, rest = divmod(seconds, SECONDS_PER_DAY)
+    hours, rest = divmod(rest, SECONDS_PER_HOUR)
+    minutes = rest // SECONDS_PER_MINUTE
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m"
+    return ELAPSED_UNDER_A_MINUTE
+
+
+def member_key(member: dict) -> str:
+    return MEMBER_KEY_SEPARATOR.join((member["project"], member["location"], member["cluster"]))
+
+
+def state_path(state_dir: str, explicit_target: str | None) -> str:
+    """The record for this target: `<state_dir>/<target>.json`, or the channel-default file."""
+    return os.path.join(state_dir, (explicit_target or CHANNEL_DEFAULT_STATE_KEY) + STATE_FILE_SUFFIX)
+
+
+def load_state(path: str) -> tuple[dict | None, str | None]:
+    """(previous record, error). No file is (None, None); a bad file is (None, why)."""
+    if not os.path.exists(path):
+        return None, None
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        return None, f"previous record {path} unreadable, starting a new baseline: {e}"
+    if not isinstance(data, dict) or data.get("format_version") != STATE_FORMAT_VERSION or not isinstance(data.get("members"), dict):
+        return None, f"previous record {path} is not a format-{STATE_FORMAT_VERSION} record, starting a new baseline"
+    return data, None
+
+
+def save_state(path: str, state: dict) -> None:
+    """Writes the record atomically (unique temp file, then rename); raises OSError on failure."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=STATE_TMP_PREFIX, suffix=STATE_FILE_SUFFIX, dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=JSON_INDENT)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _member_record(member: dict, unchanged_since: str, previous: dict | None) -> dict:
+    """The member's entry in the record; an ungraded run keeps the last graded status."""
+    lowest = member["lowest_node_pool"]
+    status = member["status"]
+    if status == STATUS_UNKNOWN and previous and previous.get("status") in GRADED_STATUSES:
+        status = previous["status"]
+    return {
+        "control_plane_version": member["control_plane_version"],
+        "lowest_node_pool_version": lowest["version"] if lowest else None,
+        "status": status,
+        "unchanged_since": unchanged_since,
+    }
+
+
+def _delta(member: dict, previous: dict | None) -> tuple[str, bool]:
+    """(progress before the stall rule, whether this observation agrees with the previous)."""
+    if previous is None:
+        return PROGRESS_NEW, False
+    lowest = member["lowest_node_pool"]
+    versions_now = (member["control_plane_version"], lowest["version"] if lowest else None)
+    versions_before = (previous.get("control_plane_version"), previous.get("lowest_node_pool_version"))
+    status_now, status_before = member["status"], previous.get("status")
+    moved = versions_now != versions_before
+    # `completed` needs evidence of a move: a version change, or a graded behind status
+    # before. A member that was already at the target and changed version is at the
+    # target again (the channel default moved and it followed), which is a completed
+    # upgrade, not a started one. An `unknown` baseline (a failed server-config read)
+    # proves nothing on its own.
+    if status_now in DONE_STATUSES and (moved or status_before in BEHIND_STATUSES):
+        return PROGRESS_COMPLETED, False
+    in_flight = [member["cluster_status"]] + [p.get("status", "") for p in member["node_pools"]]
+    if moved or any(s in IN_FLIGHT_STATUSES for s in in_flight):
+        return PROGRESS_STARTED, False
+    # Same versions. A graded status that moved without them (the channel default
+    # advanced under a member) starts a new observation series rather than inheriting
+    # the old one's clock, so a stall is never dated from before the target it is
+    # measured against existed. An `unknown` on either side is not a status change:
+    # the versions agree, and that is all the observation says.
+    both_graded = status_now in GRADED_STATUSES and status_before in GRADED_STATUSES
+    return PROGRESS_UNCHANGED, status_now == status_before or not both_graded
+
+
+def compute_progress(report: dict, previous: dict | None, now: datetime, rollout_flag: bool, path: str) -> dict:
+    """Annotates every member with its progress since `previous`; returns the record to save.
+
+    A member's `progress` is one of PROGRESS_ORDER; `unchanged_since` is the timestamp of
+    the first of the consecutive agreeing observations, carried forward across runs, and
+    `unchanged_for_seconds` the time since it. `report["rollout"]` gets the run-level view:
+    whether the rollout counted as active and why, the per-progress counts, and the members
+    of the previous record that have no row this run.
+    """
+    now_text = format_timestamp(now)
+    prior_members = previous["members"] if previous else {}
+    failed_projects = {e["project"] for e in report["errors"] if e.get("location") is None}
+    read_projects = set(report["projects"]) - failed_projects
+
+    record: dict[str, dict] = {}
+    agreeing: set[str] = set()
+    for member in report["members"]:
+        key = member_key(member)
+        before = prior_members.get(key)
+        progress, agrees = _delta(member, before if isinstance(before, dict) else None)
+        since = now_text
+        if agrees:
+            since = before.get("unchanged_since") or (previous or {}).get("recorded_at") or now_text
+            agreeing.add(key)
+        member["progress"] = progress
+        member["unchanged_since"] = since
+        since_at = parse_timestamp(since)
+        member["unchanged_for_seconds"] = int((now - since_at).total_seconds()) if since_at else None
+        record[key] = _member_record(member, since, before if isinstance(before, dict) else None)
+
+    movers = [m for m in report["members"] if m["progress"] in (PROGRESS_STARTED, PROGRESS_COMPLETED)]
+    active_reason = None
+    if rollout_flag:
+        active_reason = ACTIVE_REASON_FLAG
+    elif movers:
+        active_reason = ACTIVE_REASON_MOVERS
+    if active_reason:
+        for member in report["members"]:
+            if member["progress"] == PROGRESS_UNCHANGED and member["status"] in BEHIND_STATUSES and member_key(member) in agreeing:
+                member["progress"] = PROGRESS_STALLED
+
+    # Members of the previous record with no row this run: gone when their project was
+    # read cleanly (a deleted cluster leaves the record); carried forward when it was not
+    # read at all, so a failed or narrowed read never loses a record or dates a stall
+    # from it.
+    gone = []
+    for key, before in prior_members.items():
+        if key in record or not isinstance(before, dict):
+            continue
+        project = key.split(MEMBER_KEY_SEPARATOR, 1)[0]
+        if project in read_projects:
+            gone.append({"member": key, "reason": GONE_REASON_ABSENT, "carried_forward": False})
+            continue
+        why = NOT_READ_FAILED.format(project=project) if project in failed_projects else NOT_READ_OUT_OF_SCOPE.format(project=project)
+        gone.append({"member": key, "reason": GONE_REASON_NOT_READ.format(why=why), "carried_forward": True})
+        record[key] = before
+
+    report["rollout"] = {
+        "state_file": path,
+        "recorded_at": now_text,
+        "previous_run_at": previous.get("recorded_at") if previous else None,
+        "active": active_reason is not None,
+        "active_reason": active_reason,
+        "summary": {p: sum(1 for m in report["members"] if m["progress"] == p) for p in PROGRESS_ORDER},
+        "missing_members": gone,
+    }
+    return {
+        "format_version": STATE_FORMAT_VERSION,
+        "target": report["target_version"],
+        "recorded_at": now_text,
+        "members": dict(sorted(record.items())),
+    }
+
+
+def _versions_cell(control_plane, lowest_pool) -> str:
+    return _cell(control_plane) + VERSION_PAIR_SEPARATOR + _cell(lowest_pool)
+
+
+def render_progress(report: dict, previous: dict | None) -> str:
+    """The "Rollout progress" section printed after the table; one line on a first run."""
+    rollout = report["rollout"]
+    target = f"target {report['target_version']}" if report["target_version"] else "each cluster's channel default"
+    if previous is None:
+        return f"Rollout progress: no previous run for {target}; baseline recorded at {rollout['state_file']}. Rerun after the next wave to see per-member deltas."
+    lines = [
+        f"Rollout progress against {target}, compared with the run at {rollout['previous_run_at']} (record: {rollout['state_file']}):",
+        "",
+        "| " + " | ".join(PROGRESS_COLUMNS) + " |",
+        "| " + " | ".join(TABLE_SEPARATOR_CELL for _ in PROGRESS_COLUMNS) + " |",
+    ]
+    prior_members = previous["members"]
+    for m in report["members"]:
+        before = prior_members.get(member_key(m))
+        before = before if isinstance(before, dict) else {}
+        lowest = m["lowest_node_pool"]
+        progress = m["progress"]
+        if progress == PROGRESS_STALLED:
+            progress = f"{PROGRESS_STALLED} (unchanged for {format_elapsed(m['unchanged_for_seconds'] or 0)})"
+        row = (
+            m["project"],
+            m["cluster"],
+            m["location"],
+            _versions_cell(before.get("control_plane_version"), before.get("lowest_node_pool_version")) if before else EMPTY_CELL,
+            _versions_cell(m["control_plane_version"], lowest["version"] if lowest else None),
+            m["status"],
+            progress,
+        )
+        lines.append("| " + " | ".join(_cell(v) for v in row) + " |")
+    summary = rollout["summary"]
+    active = f"rollout active ({rollout['active_reason']})" if rollout["active"] else "no member moved and --rollout-in-progress not passed, so nothing is flagged stalled"
+    lines.append("")
+    lines.append(f"{len(report['members'])} member(s): " + ", ".join(f"{summary[p]} {p}" for p in PROGRESS_ORDER) + f"; {active}.")
+    for gone in rollout["missing_members"]:
+        lines.append(f"- {gone['member']}: in the previous record, {gone['reason']}")
+    return "\n".join(lines)
+
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Per-member GKE version table against a target version.")
     parser.add_argument("--project", action="append", help="GCP project to enumerate; repeatable. Defaults to the fleet's configured projects.")
     parser.add_argument("--target-version", help="Target for every member, e.g. 1.31.4-gke.1183000. Default: each cluster's channel defaultVersion.")
     parser.add_argument("--output", help="Path to write the report as JSON.")
+    parser.add_argument("--state-dir", default=DEFAULT_STATE_DIR, help=f"Directory holding one record per target from the previous run (default: {DEFAULT_STATE_DIR}).")
+    parser.add_argument("--rollout-in-progress", action="store_true", help="Assert a rollout is under way, so an unchanged, behind member is flagged stalled even when no other member moved.")
     args = parser.parse_args(argv)
 
     if args.target_version and parse_version(args.target_version) is None:
@@ -387,7 +704,21 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_USAGE
 
     report = build_report(projects, args.target_version)
+    path = state_path(args.state_dir, args.target_version)
+    previous, state_error = load_state(path)
+    state = compute_progress(report, previous, utc_now(), args.rollout_in_progress, path)
     print(render_table(report))
+    print()
+    print(render_progress(report, previous))
+    if state_error:
+        sys.stderr.write(state_error + "\n")
+
+    write_failed = False
+    try:
+        save_state(path, state)
+    except OSError as e:
+        sys.stderr.write(f"failed to write the record {path}: {e}\n")
+        write_failed = True
 
     if args.output:
         try:
@@ -397,9 +728,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\nWrote {len(report['members'])} member(s) to {args.output}")
         except OSError as e:
             sys.stderr.write(f"failed to write {args.output}: {e}\n")
-            return EXIT_PARTIAL
+            write_failed = True
 
-    return EXIT_PARTIAL if report["errors"] else EXIT_OK
+    return EXIT_PARTIAL if report["errors"] or write_failed else EXIT_OK
 
 
 if __name__ == "__main__":
