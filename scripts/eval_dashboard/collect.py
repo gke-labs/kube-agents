@@ -1542,18 +1542,20 @@ def load_prior_runs(source: str, gsutil: str = "gsutil") -> list[dict] | None:
     return None if data is None else data["runs"]
 
 
-def pending_from_prior(data: dict) -> dict[str, str]:
-    """The prior file's pending_builds as {build_id: first_seen}.
+def pending_from_prior(data: dict) -> dict[str, tuple[str, str]]:
+    """The prior file's pending_builds as {build_id: (first_seen, tier)}.
 
     pending_builds is a retry hint, not history: dropping it merely delays
     the listed builds until the next cold sweep re-finds them. So unlike an
     implausible runs[] -- which distrusts the whole file -- a malformed
-    entry only discards this field, with a warning.
+    entry only discards this field, with a warning. An entry's `tier` reads
+    like a run's (tiers.run_tier): absent is the presubmit, the only source
+    there was before the key existed.
     """
     entries = data.get("pending_builds")
     if entries is None:
         return {}
-    pending: dict[str, str] = {}
+    pending: dict[str, tuple[str, str]] = {}
     valid = isinstance(entries, list)
     if valid:
         for entry in entries:
@@ -1562,8 +1564,9 @@ def pending_from_prior(data: dict) -> dict[str, str]:
                 and isinstance(entry.get("build_id"), str)
                 and entry["build_id"].isdigit()
                 and isinstance(entry.get("first_seen"), str)
+                and isinstance(entry.get(tiers.TIER_KEY, ""), str)
             ):
-                pending[entry["build_id"]] = entry["first_seen"]
+                pending[entry["build_id"]] = (entry["first_seen"], tiers.run_tier(entry))
             else:
                 valid = False
                 break
@@ -1650,7 +1653,7 @@ def collect(
     # the runs it yields.
     now_dt = now or datetime.now(timezone.utc)
     prior: list[dict] = []
-    retry: dict[str, str] = {}  # build_id -> first_seen, still worth re-reading
+    retry: dict[str, tuple[str, str]] = {}  # build_id -> (first_seen, tier), still worth re-reading
     # One watermark per source. Prow's build ids are one global sequence
     # ordered by start, so the newest presubmit id (dozens of builds a day)
     # is normally above every nightly id (one a day); the newest id on
@@ -1663,7 +1666,7 @@ def collect(
             prior = prior_data["runs"]
             after_build = newest_build_id(tiers.presubmit_runs(prior))
             nightly_after = newest_build_id(tiers.nightly_runs(prior))
-            for build_id, first_seen in pending_from_prior(prior_data).items():
+            for build_id, (first_seen, tier) in pending_from_prior(prior_data).items():
                 if _pending_expired(first_seen, now_dt):
                     print(
                         f"note: build {build_id}: still unfinished after"
@@ -1672,7 +1675,7 @@ def collect(
                         file=sys.stderr,
                     )
                 else:
-                    retry[build_id] = first_seen
+                    retry[build_id] = (first_seen, tier)
         # No usable prior -- or a prior that yields no numeric watermark --
         # means the incremental scan cannot resume, and an unbounded cold
         # sweep is ~3 gsutil calls per archived build. Bound the recovery
@@ -1733,8 +1736,12 @@ def collect(
         )
     # The nightly periodic, above its own watermark. The shared retry list
     # is safe to hand over whole: a pending id is only re-read where its
-    # source's listing names it, and no id is in both listings.
+    # source's listing names it, and no id is in both listings. Its
+    # unfinished builds are collected apart so the pending entry can say
+    # which tier the build is: the Grid draws a presubmit's as a "still
+    # running" column, and a night in flight is not one of those.
     nightly_fresh: list[dict] = []
+    nightly_unfinished: set[str] = set()
     if nightly_prefix:
         nightly_fresh = runs_from_periodic(
             nightly_prefix,
@@ -1742,7 +1749,7 @@ def collect(
             after_build=nightly_after,
             since_cutoff=since_cutoff,
             retry_builds=frozenset(retry),
-            unfinished=unfinished,
+            unfinished=nightly_unfinished,
             job=nightly_job,
         )
         fresh.extend(nightly_fresh)
@@ -1771,11 +1778,14 @@ def collect(
     # The next scan's retry list: every build listed but not (yet) recorded
     # -- still running, or its finished.json unreadable this sweep -- keeps
     # its original first_seen so the PENDING_RETRY_DAYS clock runs from the
-    # first sighting, and anything that made it into runs[] drops off.
+    # first sighting, and anything that made it into runs[] drops off. Each
+    # entry carries the tier of the source that listed it.
     recorded = {run["build_id"] for run in runs}
-    pending = {b: seen for b, seen in retry.items() if b not in recorded}
+    pending = {b: entry for b, entry in retry.items() if b not in recorded}
     for build_id in unfinished - recorded:
-        pending.setdefault(build_id, now_dt.isoformat())
+        pending.setdefault(build_id, (now_dt.isoformat(), tiers.TIER_PRESUBMIT))
+    for build_id in nightly_unfinished - recorded:
+        pending.setdefault(build_id, (now_dt.isoformat(), tiers.TIER_NIGHTLY))
 
     data = {
         "schema_version": SCHEMA_VERSION,
@@ -1787,7 +1797,7 @@ def collect(
     }
     if pending:
         data["pending_builds"] = [
-            {"build_id": build_id, "first_seen": pending[build_id]}
+            {"build_id": build_id, "first_seen": pending[build_id][0], tiers.TIER_KEY: pending[build_id][1]}
             for build_id in sorted(pending, key=int)
         ]
     if stale_after_s is not None:

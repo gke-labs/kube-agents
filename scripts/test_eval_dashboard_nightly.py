@@ -130,7 +130,26 @@ class NightDocumentTest(unittest.TestCase):
         self.assertEqual([n["build"] for n in nightly.night_reports(data)], [NIGHT_2, NIGHT_1])
         self.assertEqual([n["build"] for n in nightly.night_reports(data, limit=1)], [NIGHT_2])
         self.assertEqual(nightly.night_reports(data, limit=1)[0]["previous_build"], NIGHT_1, "the night outside the window still serves as the comparison")
-        self.assertEqual(nightly.nightly_document({"runs": [], "cases": []}), {"job": JOB, "nights": []})
+        self.assertEqual(nightly.nightly_document({"runs": [], "cases": []}), {"job": JOB, "nights": [], "running": []})
+
+    def test_a_nightly_build_in_flight_is_a_running_night_not_a_grid_column(self):
+        data = two_nights()
+        data["pending_builds"] = [
+            {"build_id": "3000000000000000003", "first_seen": "2026-09-08T14:05:00+00:00", "tier": "nightly"},
+            {"build_id": "3000000000000000004", "first_seen": "2026-09-08T14:10:00+00:00"},  # the presubmit's
+            {"build_id": "2999999999999999999", "first_seen": "2026-09-08T01:00:00+00:00", "tier": "nightly"},  # died 13 h ago
+            {"build_id": "bogus", "first_seen": "2026-09-08T14:05:00+00:00", "tier": "nightly"},
+        ]
+        now = datetime.datetime.fromisoformat(NOW)
+        self.assertEqual(nightly.running_nights(data, now), [
+            {"build": "3000000000000000003", "first_seen": "2026-09-08T14:05:00+00:00",
+             "log_url": f"https://oss.gprow.dev/view/gs/kube-agents-prow/logs/{JOB}/3000000000000000003"},
+        ])
+        self.assertEqual([r["build"] for r in nightly.running_nights(data, None)], ["2999999999999999999", "3000000000000000003"], "no clock: no age judged")
+        self.assertEqual(nightly.running_nights({"pending_builds": "soon"}, now), [])
+        brief = render.brief_document(data, None, None, None, admitted=frozenset(), demoted={})
+        self.assertEqual([r["build"] for r in brief["nightly"]["running"]], ["3000000000000000003"], "judged against generated_at")
+        self.assertEqual([p["build"] for p in brief["pending"]], ["3000000000000000004"], "the Grid's running columns are the presubmit's")
 
 
 class DigestLineTest(unittest.TestCase):
@@ -159,6 +178,14 @@ class DigestLineTest(unittest.TestCase):
         data = two_nights()
         two_days_on = DIGEST_AT + datetime.timedelta(days=2)
         self.assertEqual(self.line(data, two_days_on), "🌙 Nightly: no run last night (the newest on record started Mon 8:00 PM ET)")
+        # Unless a night is still running: a late start, or one at its budget.
+        data["pending_builds"] = [{"build_id": "3000000000000000003", "first_seen": (two_days_on - datetime.timedelta(hours=8)).isoformat(), "tier": "nightly"}]
+        self.assertEqual(self.line(data, two_days_on), "🌙 Nightly: still running (first seen Thu 1:00 AM ET) · the report follows when it finishes")
+        self.assertEqual(self.line({"runs": [], "cases": [], "pending_builds": data["pending_builds"]}, two_days_on), "🌙 Nightly: still running (first seen Thu 1:00 AM ET) · the report follows when it finishes")
+        # A last night on record outranks a build in flight: the numbers are there.
+        self.assertIn("newly failing: case-b", self.line(data))
+        data["pending_builds"][0]["first_seen"] = (two_days_on - datetime.timedelta(hours=10)).isoformat()
+        self.assertEqual(self.line(data, two_days_on), "🌙 Nightly: no run last night (the newest on record started Mon 8:00 PM ET)", "past the budget: not running")
         self.assertEqual(self.line({"runs": [], "cases": []}), "🌙 Nightly: no run on record yet")
         self.assertEqual(self.line({}), "🌙 Nightly: no data.json to read a night from")
         self.assertEqual(self.line(None), "🌙 Nightly: no data.json to read a night from")
@@ -187,6 +214,8 @@ class NightlyPageTest(unittest.TestCase):
         data["generated_at"] = NOW
         data["cases"] = copy.deepcopy(CASES)
         data["runs"] += copy.deepcopy([FIRST, SECOND])
+        # A third night in flight at render time (NOW is Tue 10:30 AM ET).
+        data["pending_builds"] = [{"build_id": "3000000000000000003", "first_seen": "2026-09-08T14:05:00+00:00", "tier": "nightly"}]
         with unittest.mock.patch.object(render.classify, "admitted_cases", return_value=frozenset()), \
                 unittest.mock.patch.object(render, "demotion_dates", return_value={}), \
                 unittest.mock.patch.object(render, "recent_merges", return_value=None):
@@ -218,6 +247,11 @@ class NightlyPageTest(unittest.TestCase):
         # The grader's reason reaches the DOM escaped.
         self.assertNotIn("<b>absent</b>", app)
         self.assertIn("check x: &lt;b&gt;absent&lt;/b&gt;", app)
+        # The night in flight, on last night's page only.
+        running = f'A night is running now: build <a href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/{JOB}/3000000000000000003">3000000000000000003</a>, first seen Tue 10:05 AM ET.'
+        self.assertIn(running, app)
+        self.assertNotIn(running, dom_text(self.page, fragment=f"#build={NIGHT_1}"))
+        self.assertNotIn('class="c running"', dom_text(self.out / "grid.html"), "a night in flight is no presubmit column")
 
     def test_an_older_night_and_an_unknown_build(self):
         app = dom_text(self.page, fragment=f"#build={NIGHT_1}")
@@ -233,6 +267,7 @@ class NightlyPageTest(unittest.TestCase):
         self.assertIn("<b>Mon, Sep 7</b> — 3 cases · 1 passed all reps · 1 partial · 1 failed · newly failing: <code>case-b</code> · 6h 40m. "
                       f'<a href="nightly.html#build={NIGHT_2}">Read the report →</a>', app)
         self.assertIn('Last night\'s run: <a href="nightly.html">nightly</a>', app)
+        self.assertIn("A night is running now: build <a href=", app)
 
     def test_no_night_on_record(self):
         data = load_fixture()

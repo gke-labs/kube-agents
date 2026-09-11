@@ -1215,6 +1215,17 @@ function nightPill(night) {
 // The night's date on the reader's clock: an 8 PM ET start is "the night of" that day.
 const nightDay = (night) => { const ms = nightStart(night); return ms != null ? fmtParts(ms, { weekday: "short", month: "short", day: "numeric" }) : "an unknown day"; };
 
+// A nightly build the collector listed with no finished.json yet
+// (brief.json's nightly.running): a night in flight, said in one line so
+// nobody reads "no night" while the job is still going.
+function runningNoteHtml() {
+  const running = brief.nightly && Array.isArray(brief.nightly.running) ? brief.nightly.running.filter((r) => r && typeof r === "object" && r.build != null) : [];
+  if (!running.length) return "";
+  const r = running[running.length - 1];
+  const seen = parseIso(r.first_seen);
+  return `<p class="mut">A night is running now: build ${r.log_url ? `<a href="${esc(r.log_url)}">${esc(r.build)}</a>` : `<code>${esc(r.build)}</code>`}, first seen ${esc(seen != null ? et(seen) : "at an unknown time")}. Its report is here once the collector records it.</p>`;
+}
+
 function nightlyBriefHtml() {
   const list = nights();
   const night = list[0];
@@ -1227,7 +1238,7 @@ function nightlyBriefHtml() {
       : `${plural(c.recorded, "case")} · ${c.passed} passed all reps · ${c.partial} partial · ${c.failed} failed${c.infra ? ` · ${c.infra} infra` : ""}${night.newly_failing.length ? ` · newly failing: <code>${night.newly_failing.map(esc).join("</code>, <code>")}</code>` : ""}${night.duration_s != null ? ` · ${minutesText(night.duration_s * 1000)}` : ""}`;
     body = `<p>${nightPill(night)} <b>${esc(nightDay(night))}</b> — ${summary}. <a href="${esc(nightHref(night))}">Read the report →</a></p>`;
   }
-  return `<div class="sec" id="nightly"><h2>Last night's run</h2>${body}</div>`;
+  return `<div class="sec" id="nightly"><h2>Last night's run</h2>${body}${runningNoteHtml()}</div>`;
 }
 
 function nightCaseRow(night, c, newly) {
@@ -1282,7 +1293,7 @@ function nightlyHtml(link) {
   const list = nights();
   const job = brief.nightly && brief.nightly.job || "the nightly periodic";
   if (!list.length) {
-    return `<div class="sec head"><h1>No night on record yet</h1><div class="lede">The nightly tier (<code>${esc(job)}</code>, every case against <code>main</code> once a night) has not been collected yet. When it has, this page is last night's report: every case with its state and the grader's reason, what is newly failing against the night before, and whether the night ran to the end.</div></div>` + footHtml();
+    return `<div class="sec head"><h1>No night on record yet</h1><div class="lede">The nightly tier (<code>${esc(job)}</code>, every case against <code>main</code> once a night) has not been collected yet. When it has, this page is last night's report: every case with its state and the grader's reason, what is newly failing against the night before, and whether the night ran to the end.</div>${runningNoteHtml()}</div>` + footHtml();
   }
   const night = (link.build && list.find((n) => String(n.build) === link.build)) || list[0];
   if (link.build && String(night.build) !== link.build) {
@@ -1299,7 +1310,7 @@ function nightlyHtml(link) {
   else ledeHow = `The job ran to the end in ${esc(took)}: ${c.recorded} cases recorded${c.expected ? ` of ${c.expected} expected` : ""}.`;
   const head = `<div class="sec head">${nightPill(night)}<h1>${isLast ? "Last night's run" : `Night of ${esc(nightDay(night))}`}</h1>` +
     `<div class="lede">${esc(when)} · <code>${esc(job)}</code>${night.head_sha ? ` at <code>${esc(night.head_sha)}</code>` : ""}${night.project ? ` · project ${esc(projectShort(night.project))}` : ""}${night.log_url ? ` · <a href="${esc(night.log_url)}">build log and artifacts</a>` : ""}</div>` +
-    `<div class="lede">${ledeHow}</div></div>`;
+    `<div class="lede">${ledeHow}</div>${isLast ? runningNoteHtml() : ""}</div>`;
   const tiles = `<div class="sec"><h2>In numbers</h2><div class="tiles">` +
     tile("Cases", `${c.recorded}`, c.expected ? `of ${c.expected} in the nightly matrix` : "recorded") +
     tile("Passed all reps", `${c.passed}`, c.recorded ? `${pct(c.passed / c.recorded)} of recorded cases` : "no case recorded") +

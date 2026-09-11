@@ -16,9 +16,10 @@ The digest also carries one line on last night's run of the nightly tier
 (`--data`, the `data.json` the tick collected): the cases recorded, how many
 passed all reps, partial and failed, what is newly failing against the night
 before, and the wall clock, with a link to the dashboard's Nightly report
-(`nightly.html`); a night Prow cut short, or no night since the day before
-yesterday, says so instead of numbers. `scripts/eval_dashboard/nightly.py`
-derives the line and the report from the same nightly runs.
+(`nightly.html`); a night Prow cut short, one still running, or no night
+since the day before yesterday, says so instead of numbers.
+`scripts/eval_dashboard/nightly.py` derives the line and the report from the
+same nightly runs.
 The same tick comments on each pull request whose run went red or whose
 build node went away (`gate_comment.py`), files the tracking issue a new
 OUTAGE lacks or the one a build-cluster node loss owes the cluster owner

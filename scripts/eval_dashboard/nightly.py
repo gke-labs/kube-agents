@@ -9,7 +9,9 @@ grader's reason and a transcript link; which cases fail tonight that did not
 fail the night before; the wall clock; and whether the night finished or was
 cut short. ``render.py`` puts the result into ``brief.json`` for
 ``nightly.html`` and the Brief, ``post_health.py`` writes one line of it into
-the 9 AM digest, so the two say the same thing by construction.
+the 9 AM digest, so the two say the same thing by construction. A night
+still in flight -- a nightly build on the collector's ``pending_builds`` --
+is reported as running rather than missing (``running_nights``).
 
 States follow the vocabulary the Cases page's strip uses: ``pass`` (every
 graded repetition passed), ``partial`` (some passed, some failed), ``fail``
@@ -51,6 +53,13 @@ REP_RESULTS = ("pass", "fail", "infra")
 # Prow's verdict on the job (SCHEMA.md: runs[].result). ABORTED is the
 # periodic's deadline: the job was killed, so the night is truncated.
 RESULT_ABORTED = "ABORTED"
+# A nightly build on the collector's pending_builds (listed, no finished.json
+# yet) is a night still running only while its first sighting is this
+# recent: the periodic's budget is 8 hours (oss-test-infra: timeout 480m)
+# and Prow needs a little longer to write finished.json after ending the
+# job. Past that the build is a pod that died without uploading, which the
+# collector keeps on pending_builds for two days; it is not a running night.
+RUNNING_MAX_AGE = datetime.timedelta(hours=9)
 # A night whose start is older than this when the digest goes out is not
 # "last night": the 8 PM ET run ends by 4 AM under its 8-hour budget, so at
 # 9 AM the newest night is at most 13 hours old; 36 hours tolerates one
@@ -276,11 +285,44 @@ def night_reports(data: dict, limit: int = NIGHTS_ON_RECORD) -> list[dict]:
     return out
 
 
+def nightly_job(data: dict) -> str:
+    """The periodic's name as the newest nightly run carries it, else the default."""
+    return next((r.get("job") for r in sorted_nightly_runs(data) if isinstance(r.get("job"), str)), DEFAULT_NIGHTLY_JOB)
+
+
+def running_nights(data: dict, now: datetime.datetime | None) -> list[dict]:
+    """The nightly builds still in flight: the ``tier: "nightly"`` entries of
+    the collector's ``pending_builds`` (SCHEMA.md) first seen inside
+    RUNNING_MAX_AGE of ``now``, oldest first, each ``{build, first_seen,
+    log_url}``. Without a ``now`` the age is not judged. A malformed entry
+    is skipped; a value that is not a list is no entries."""
+    raw = data.get("pending_builds")
+    if not isinstance(raw, list):
+        return []
+    job = nightly_job(data)
+    out = []
+    for entry in raw:
+        if not isinstance(entry, dict) or not tiers.is_nightly(entry):
+            continue
+        build = entry.get("build_id")
+        seen = parse_iso(entry.get("first_seen"))
+        if not isinstance(build, str) or not build.isdigit() or seen is None:
+            continue
+        if now is not None and now - seen > RUNNING_MAX_AGE:
+            continue
+        out.append({"build": build, "first_seen": seen.isoformat(), "log_url": build_url({"build_id": build, "job": job})})
+    out.sort(key=lambda e: int(e["build"]))
+    return out
+
+
 def nightly_document(data: dict) -> dict:
-    """The ``nightly`` block of brief.json."""
+    """The ``nightly`` block of brief.json. ``running`` is judged against
+    ``generated_at``, the render's time axis, so two renders of one
+    data.json agree."""
     return {
-        "job": next((r.get("job") for r in sorted_nightly_runs(data) if isinstance(r.get("job"), str)), DEFAULT_NIGHTLY_JOB),
+        "job": nightly_job(data),
         "nights": night_reports(data),
+        "running": running_nights(data, parse_iso(data.get("generated_at"))),
     }
 
 
@@ -328,6 +370,13 @@ def digest_line(data: dict | None, now: datetime.datetime, clock=None) -> str:
         return f"{DIGEST_GLYPH} Nightly: no data.json to read a night from"
     night, newest = last_night(data, now)
     if night is None:
+        running = running_nights(data, now)
+        if running:
+            # Still in flight at digest time -- a late start, or a night at
+            # its budget -- so there are no numbers yet, and the report
+            # carries them once the collector records the build.
+            seen = parse_iso(running[-1]["first_seen"])
+            return f"{DIGEST_GLYPH} Nightly: still running (first seen {when(seen)}){SEP}the report follows when it finishes"
         if newest is None:
             return f"{DIGEST_GLYPH} Nightly: no run on record yet"
         started = parse_iso(newest.get("started"))

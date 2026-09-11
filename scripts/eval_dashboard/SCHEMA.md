@@ -251,8 +251,12 @@ Additive, optional, and safe to omit — consumers must default them.
   readable `finished.json` yet (still running, or the upload failed), or an
   index pointer that could not be read this scan, so
   they are not in `runs[]` and do not raise the watermark. Entries are
-  `{"build_id": "<id>", "first_seen": "<iso8601>"}`, lowest id first;
-  `first_seen` is when the collector first listed the build. The next
+  `{"build_id": "<id>", "first_seen": "<iso8601>", "tier": "presubmit"|"nightly"}`,
+  lowest id first; `first_seen` is when the collector first listed the
+  build and `tier` is the source that listed it, read like `runs[].tier`
+  (absent: the presubmit, the only source there was before the key) — so
+  the Grid draws only the presubmit's as "still running" columns and the
+  Nightly report says the nightly's is a night in flight. The next
   incremental scan re-reads exactly these ids even though they sit at or
   below the watermark, and drops an entry once it is recorded or once
   `first_seen` is more than 2 days old (`PENDING_RETRY_DAYS` — a build
@@ -558,7 +562,8 @@ build, pr, at, state, reps, reason, excerpt, cls, also_failing_prs, event}`
 when it is in `runs[]`, else `null` and `0`), or `null` when there is none.
 
 `pending[]` is `pending_builds` as `{build, first_seen}`, the Grid's "still
-running" columns — only the entries first seen inside the last
+running" columns — the presubmit's entries only (a nightly build in flight
+is `nightly.running[]`), and only those first seen inside the last
 `PENDING_MAX_AGE_MS` (8 hours, past the presubmit's ceiling): an older one
 is a build that never finished, not one still running. `releases[]` is `data.json`'s `releases[]` newest first,
 at most `RELEASES_MAX_ROWS`, each reduced to `{build, rc_tag, commit, tier,
@@ -571,8 +576,9 @@ them, `merges` the recent first-parent commits of the checkout (`null`
 when the checkout is shallow or has no git; the Brief then omits "what
 changed right before" and the Grid its merge markers).
 
-`nightly` is `{job, nights[]}` from `nightly.py`: `job` the periodic's name
-as the newest nightly run carries it (the default when none is on record),
+`nightly` is `{job, nights[], running[]}` from `nightly.py`: `job` the
+periodic's name as the newest nightly run carries it (the default when none
+is on record),
 `nights[]` the last `NIGHTS_ON_RECORD` (14) nightly runs **newest first**,
 each `{build, job, head_sha, project, started, finished, duration_s, result,
 log_url, truncated, complete, counts{expected, recorded, passed, partial,
@@ -591,7 +597,11 @@ before it on record (the one past the window included), `fixed` every
 `fail` then that is `pass` now; both `[]` on the first night, when
 `previous_build` is `null`. `log_url` and `transcript_url` point at
 Spyglass under `logs/<job>/<build>`, a periodic's path. The nights are
-never in `runs[]`.
+never in `runs[]`. `running[]` is the nightly's entries of `pending_builds`
+first seen inside `RUNNING_MAX_AGE` (9 hours: the periodic's 8-hour budget
+and Prow's time to write `finished.json`) of `generated_at`, oldest first,
+each `{build, first_seen, log_url}` — a night in flight, which the Brief's
+block, the report page and the digest say instead of "no night".
 
 ### `health.json` and `health-history.jsonl` (optional inputs)
 
