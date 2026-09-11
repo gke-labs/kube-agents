@@ -1009,6 +1009,21 @@ class TestContextRepos(WorkspaceTestCase):
                 Path("/mnt/state/managed_repos"),
             )
 
+    def test_a_skipped_context_entry_names_the_list_it_came_from(self):
+        """The skip warning says which ConfigMap key holds the entry, so an
+        administrator fixing it edits the right list."""
+        state_file = self.mount(
+            managed_repos=self.MANAGED,
+            context_repos='[{"type": "gitlab", "url": "https://gitlab.com/acme/live"}]',
+        )
+        with patch.dict(os.environ, {"GITOPS_STATE_PATH": str(state_file)}):
+            with self.assertLogs("gitops_workspace", level="WARNING") as logs:
+                self.assertEqual(gitops_workspace.get_context_github_repos(), [])
+        joined = "\n".join(logs.output)
+        self.assertIn("context_repos", joined)
+        self.assertIn("no provider for type 'gitlab'", joined)
+        self.assertNotIn("managed_repos repository", joined)
+
     def test_validate_repo_org_matching_primary_org(self):
         with patch.dict(os.environ, {"GITOPS_ORG": "gke-labs"}):
             self.assertEqual(gitops_workspace.validate_repo_org("gke-labs/kube-agents"), "gke-labs/kube-agents")

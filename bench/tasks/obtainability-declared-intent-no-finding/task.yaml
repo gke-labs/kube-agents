@@ -69,6 +69,9 @@ validated: false
 # Slug per docs/designs/domains.yaml.
 domain: reliability
 
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
 # Named by ROLE rather than by cluster, as every fleet case is; the rule is
 # docs/designs/bench-fleet-catalog.md. See the header: this role is a
 # placeholder until the case has a fixture of its own.
