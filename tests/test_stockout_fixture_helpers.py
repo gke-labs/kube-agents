@@ -786,7 +786,7 @@ class EnsurePluginInstalledTest(unittest.TestCase):
 
 
 class PluginReadyStatusTest(unittest.TestCase):
-    """Verifies that _wait_for_plugin_ready returns Ready object or fails immediately on Degraded."""
+    """Verifies that _wait_for_plugin_ready tolerates transient Degraded and fails on persistent Degraded."""
 
     def test_ready_plugin_returns_object(self):
         obj = {
@@ -797,7 +797,30 @@ class PluginReadyStatusTest(unittest.TestCase):
             res = sof._wait_for_plugin_ready("ns", time.time() + 60)
         self.assertEqual(res["status"]["phase"], "Ready")
 
-    def test_degraded_plugin_fails_immediately_with_reason(self):
+    def test_transient_degraded_recovers_to_ready_without_failing(self):
+        degraded_obj = {
+            "metadata": {"generation": 2},
+            "status": {
+                "phase": "Degraded",
+                "observedGeneration": 2,
+                "conditions": [
+                    {"type": "Ready", "status": "False", "reason": "ImagePullFailed", "message": "Failed to pull image xyz"}
+                ],
+            },
+        }
+        ready_obj = {
+            "metadata": {"generation": 2},
+            "status": {"phase": "Ready", "observedGeneration": 2},
+        }
+        # First poll sees transient Degraded (e.g. 429 during pull); second poll sees Ready.
+        with mock.patch.object(sof, "_kubectl", side_effect=[
+            _completed(stdout=json.dumps(degraded_obj)),
+            _completed(stdout=json.dumps(ready_obj)),
+        ]), mock.patch.object(sof.time, "sleep"):
+            res = sof._wait_for_plugin_ready("ns", time.time() + 60)
+        self.assertEqual(res["status"]["phase"], "Ready")
+
+    def test_persistent_degraded_fails_with_reason_after_persistence_window(self):
         obj = {
             "metadata": {"generation": 2},
             "status": {
@@ -808,12 +831,24 @@ class PluginReadyStatusTest(unittest.TestCase):
                 ],
             },
         }
-        with mock.patch.object(sof, "_kubectl", return_value=_completed(stdout=json.dumps(obj))):
+
+        class _MockClock:
+            def __init__(self, start: float = 100.0):
+                self.cur = start
+            def time(self) -> float:
+                return self.cur
+            def sleep(self, seconds: float) -> None:
+                self.cur += seconds
+
+        clock = _MockClock(start=100.0)
+        with mock.patch.object(sof, "_kubectl", return_value=_completed(stdout=json.dumps(obj))), \
+                mock.patch.object(sof.time, "time", side_effect=clock.time), \
+                mock.patch.object(sof.time, "sleep", side_effect=clock.sleep):
             with self.assertRaises(_StubFail) as caught:
-                sof._wait_for_plugin_ready("ns", time.time() + 60)
+                sof._wait_for_plugin_ready("ns", clock.cur + 120.0)
         msg = str(caught.exception)
         self.assertIn("installation failed", msg)
-        self.assertIn("phase is 'Degraded'", msg)
+        self.assertIn("phase has remained 'Degraded'", msg)
         self.assertIn("ImagePullFailed", msg)
         self.assertIn("Failed to pull image xyz", msg)
 

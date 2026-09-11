@@ -59,6 +59,17 @@ _GENERATION_STABLE_SECONDS = 20
 # roll on a warm node rather than a boot from nothing.
 _ROLLOUT_TIMEOUT_SECONDS = 300
 _PLUGIN_READY_TIMEOUT_SECONDS = 300
+# How long an AgentPlugin must continuously report Degraded before treating it as a
+# permanent failure rather than a transient condition.
+#
+# The operator updates plugin.Status.ObservedGeneration = plugin.Generation on every pass
+# before evaluating readiness (platformagent_controller.go:3004), and maps live container
+# states such as ErrImagePull, ImagePullBackOff, or staging crashes directly into
+# Degraded (platformagent_controller.go:3076-3119). During gateway rollouts or under
+# registry throttling (e.g. HTTP 429), kubelet retries pulling the image automatically.
+# Requiring the Degraded state to persist prevents failing on transient retry windows while
+# still failing fast on broken specs or unpullable images well short of the 300s ceiling.
+_DEGRADED_PERSISTENCE_SECONDS = 30
 # Polled rather than read once, because rollout-complete does not always mean the entrypoint
 # has finished linking plugins.
 #
@@ -281,10 +292,16 @@ def _wait_for_plugin_ready(namespace: str, budget_deadline: float) -> Dict[str, 
     platformagent_controller.go:485 and the workload at :514 inside one reconcile, so
     waiting here first means the rollout wait that follows is looking at a workload the
     operator has already written, not one it is about to.
+
+    Requires a Degraded observation to persist for _DEGRADED_PERSISTENCE_SECONDS before
+    treating it as a terminal failure. The operator stamps observedGeneration = generation
+    on every pass before evaluating readiness, and maps transient container states like
+    ErrImagePull (which kubelet retries) straight into Degraded.
     """
     window, bound = _remaining(budget_deadline, _PLUGIN_READY_TIMEOUT_SECONDS)
     deadline = time.time() + window
     detail = "the AgentPlugin was never read"
+    degraded_first_seen: Optional[float] = None
     while True:
         res = _kubectl("get", "agentplugins", _PLUGIN_NAME, "-n", namespace, "-o", "json")
         if res.returncode == 0:
@@ -304,20 +321,28 @@ def _wait_for_plugin_ready(namespace: str, budget_deadline: float) -> Dict[str, 
                 if phase == "Ready" and observed == generation:
                     return obj
                 if phase == "Degraded" and observed == generation:
-                    conditions = status.get("conditions", [])
-                    reason = ""
-                    message = ""
-                    for cond in conditions:
-                        if cond.get("status") == "False" or cond.get("reason"):
-                            reason = cond.get("reason", "")
-                            message = cond.get("message", "")
-                            break
-                    pytest.fail(
-                        f"AgentPlugin '{_PLUGIN_NAME}' in '{namespace}' installation failed: "
-                        f"phase is 'Degraded' (reason: {reason or 'Unknown'}): {message or detail}"
-                    )
+                    now = time.time()
+                    if degraded_first_seen is None:
+                        degraded_first_seen = now
+                    elif now - degraded_first_seen >= _DEGRADED_PERSISTENCE_SECONDS:
+                        conditions = status.get("conditions", [])
+                        reason = ""
+                        message = ""
+                        for cond in conditions:
+                            if cond.get("status") == "False" or cond.get("reason"):
+                                reason = cond.get("reason", "")
+                                message = cond.get("message", "")
+                                break
+                        pytest.fail(
+                            f"AgentPlugin '{_PLUGIN_NAME}' in '{namespace}' installation failed: "
+                            f"phase has remained 'Degraded' for {int(now - degraded_first_seen)}s "
+                            f"(reason: {reason or 'Unknown'}): {message or detail}"
+                        )
+                else:
+                    degraded_first_seen = None
         else:
             detail = res.stderr.strip() or f"kubectl exited {res.returncode}"
+            degraded_first_seen = None
         if time.time() >= deadline:
             break
         time.sleep(5)
