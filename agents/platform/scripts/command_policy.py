@@ -413,7 +413,7 @@ _GCLOUD_FLAGS_WITH_VALUE = frozenset(
         "--instance-selection-machine-types", "--size", "--types", "--zones",
         "--machine-type", "--provisioning-model", "--target-distribution-shape",
         "--instance-selection",
-        # gke-obtainability's Flex-Start capacity probe adds a run duration.
+        # capacity-obtainability's Flex-Start capacity probe adds a run duration.
         # Without the arity entry the allowlisted command is unreachable.
         "--max-run-duration",
         # `compute routers list` scopes by --regions (plural), the router

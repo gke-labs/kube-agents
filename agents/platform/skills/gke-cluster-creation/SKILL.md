@@ -32,16 +32,6 @@ for all new clusters.
     template or mode, present the available templates (e.g., Autopilot, Standard
     Regional, GPU Inference, AI Hypercompute) and explain key trade-offs (Cost
     vs. Availability, Autopilot vs. Standard node management).
-    3a. **Check quota and live obtainability (GPU/TPU or large-shape
-    designs)**: before recommending capacity, load the
-    [gke-obtainability](../gke-obtainability/SKILL.md) skill and run its
-    design-time diagnostics: verify the regional quota for the
-    exact accelerator metric (e.g. `NVIDIA_A100_GPUS`), then gather capacity obtainability
-    advice (`gcloud beta compute advice capacity`) for the requested machine
-    shape and count across the region's zones, for the Spot and Flex-Start
-    provisioning models the advice API accepts. That skill owns the rules for
-    what to probe and how to report it; follow it rather than restating them
-    here.
 4.  **Configure networking**: auto-create subnet (default) or bring-your-own.
 5.  **Review golden path settings**: present the default configuration block
     (`gcloud` command or `create_cluster` JSON payload) and confirm with the
@@ -400,3 +390,13 @@ Do not delete a Cluster Agent profile while its cluster still exists.
 Deleting the profile here is the immediate, preferred path. As a backstop, the hourly
 `cluster-agent-reconcile` job auto-prunes any profile whose cluster is definitively gone, so a
 profile missed during teardown is cleaned up on the next reconcile cycle.
+
+## Before recommending GPU/TPU or large-shape capacity
+
+Before recommending capacity for a GPU/TPU or large-shape design, load the
+[capacity-obtainability](../capacity-obtainability/SKILL.md) skill and run its diagnostics:
+verify the regional quota for the exact accelerator metric (e.g. `NVIDIA_A100_GPUS`), then gather
+capacity obtainability advice (`gcloud beta compute advice capacity`) for the requested machine
+shape and count across the region's zones, for the Spot and Flex-Start provisioning models the
+advice API accepts. That skill owns the rules for what to probe and how to report it; follow it
+rather than restating them here.
