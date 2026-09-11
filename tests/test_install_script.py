@@ -815,6 +815,114 @@ run_menu_system "."
         self.assertEqual(proc.returncode, 0, f"Failed: {proc.stderr}")
         self.assertIn("VERIFIED_IMAGE_TAG=0.4.0", proc.stdout)
 
+    def test_run_menu_system_derives_chat_sub_name_on_save_and_apply(self):
+        """Verifies run_menu_system derives CHAT_SUB_NAME from custom topic when saving."""
+        cmd = """
+has_controlling_tty() { return 0; }
+prompt_menu() {
+  local var="${!#}"
+  printf -v "$var" "%s" "6"
+}
+resolve_effective_image_tag() { return 0; }
+validate_immutable_ref() { return 0; }
+verify_local_source_ref() { return 0; }
+print_success() {
+  if [[ "$1" == *"Updated configuration saved to"* ]]; then
+    exit 0
+  fi
+}
+tf_state_chat_subscription_name() { return 0; }
+
+PROJECT_ID="test-project"
+GOOGLE_CHAT_ENABLED="true"
+CHAT_TOPIC_NAME="custom-topic"
+run_menu_system "."
+"""
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, f"Failed: {proc.stderr}")
+        env_content = self._empty_install_env.read_text()
+        self.assertIn("CHAT_SUB_NAME=custom-topic-sub", env_content)
+
+    def test_run_menu_system_recovers_chat_sub_name_from_state_on_save_and_apply(self):
+        """Verifies run_menu_system recovers existing subscription from state when saving."""
+        cmd = """
+has_controlling_tty() { return 0; }
+prompt_menu() {
+  local var="${!#}"
+  printf -v "$var" "%s" "6"
+}
+resolve_effective_image_tag() { return 0; }
+validate_immutable_ref() { return 0; }
+verify_local_source_ref() { return 0; }
+print_success() {
+  if [[ "$1" == *"Updated configuration saved to"* ]]; then
+    exit 0
+  fi
+}
+gcloud() {
+  if [ "$1" = "storage" ] && [ "$2" = "cat" ]; then
+    cat <<'EOF'
+{
+  "resources": [
+    {
+      "mode": "managed",
+      "type": "google_pubsub_subscription",
+      "name": "chat_events",
+      "instances": [
+        {
+          "attributes": {
+            "name": "managed-state-sub"
+          }
+        }
+      ]
+    }
+  ]
+}
+EOF
+    return 0
+  fi
+  command gcloud "$@"
+}
+
+PROJECT_ID="test-project"
+GOOGLE_CHAT_ENABLED="true"
+CHAT_TOPIC_NAME="custom-topic"
+run_menu_system "."
+"""
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, f"Failed: {proc.stderr}")
+        env_content = self._empty_install_env.read_text()
+        self.assertIn("CHAT_SUB_NAME=managed-state-sub", env_content)
+
+    def test_run_menu_system_rederives_when_recorded_sub_equals_default_and_state_empty(self):
+        """Verifies run_menu_system re-derives custom-topic subscription if recorded sub is default and state is empty."""
+        cmd = """
+has_controlling_tty() { return 0; }
+prompt_menu() {
+  local var="${!#}"
+  printf -v "$var" "%s" "6"
+}
+resolve_effective_image_tag() { return 0; }
+validate_immutable_ref() { return 0; }
+verify_local_source_ref() { return 0; }
+print_success() {
+  if [[ "$1" == *"Updated configuration saved to"* ]]; then
+    exit 0
+  fi
+}
+tf_state_chat_subscription_name() { return 0; }
+
+PROJECT_ID="test-project"
+GOOGLE_CHAT_ENABLED="true"
+CHAT_TOPIC_NAME="custom-topic"
+CHAT_SUB_NAME="platform-agent-chat-events-sub"
+run_menu_system "."
+"""
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, f"Failed: {proc.stderr}")
+        env_content = self._empty_install_env.read_text()
+        self.assertIn("CHAT_SUB_NAME=custom-topic-sub", env_content)
+
     def test_verify_local_source_ref_accepts_baked_release_in_non_git_dir(self):
         """Verifies verify_local_source_ref succeeds for unpacked release archive without Git repository."""
         with tempfile.TemporaryDirectory(prefix="unpacked-release-") as outer_dir:
