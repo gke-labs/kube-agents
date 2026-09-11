@@ -251,8 +251,10 @@ Additive, optional, and safe to omit — consumers must default them.
   readable `finished.json` yet (still running, or the upload failed), or an
   index pointer that could not be read this scan, so
   they are not in `runs[]` and do not raise the watermark. Entries are
-  `{"build_id": "<id>", "first_seen": "<iso8601>"}`, lowest id first;
-  `first_seen` is when the collector first listed the build. The next
+  `{"build_id": "<id>", "first_seen": "<iso8601>"}`, plus `"tier": "nightly"`
+  when the nightly periodic's listing named the build (absent: the
+  presubmit's, as for `runs[].tier`; the tag is kept across scans), lowest
+  id first; `first_seen` is when the collector first listed the build. The next
   incremental scan re-reads exactly these ids even though they sit at or
   below the watermark, and drops an entry once it is recorded or once
   `first_seen` is more than 2 days old (`PENDING_RETRY_DAYS` — a build
@@ -553,7 +555,8 @@ build, pr, at, state, reps, reason, excerpt, cls, also_failing_prs, event}`
 when it is in `runs[]`, else `null` and `0`), or `null` when there is none.
 
 `pending[]` is `pending_builds` as `{build, first_seen}`, the Grid's "still
-running" columns — only the entries first seen inside the last
+running" columns — the presubmit's entries only (a night in flight,
+`tier: nightly`, gets no column) and only the ones first seen inside the last
 `PENDING_MAX_AGE_MS` (8 hours, past the presubmit's ceiling): an older one
 is a build that never finished, not one still running. `releases[]` is `data.json`'s `releases[]` newest first,
 at most `RELEASES_MAX_ROWS`, each reduced to `{build, rc_tag, commit, tier,

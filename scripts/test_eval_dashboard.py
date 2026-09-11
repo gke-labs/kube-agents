@@ -497,6 +497,8 @@ class ReleasesAndPendingTest(unittest.TestCase):
             {"build_id": "2098409186789429248", "first_seen": "2026-09-01T11:58:44+00:00"},
             {"build_id": "2098076561386246144", "first_seen": "2026-09-01T10:12:39+00:00"},
             {"build_id": "2097000000000000000", "first_seen": "2026-08-31T12:00:00+00:00"},
+            # A night in flight is on the retry list too; the Grid's columns are the presubmit's.
+            {"build_id": "2098300000000000000", "first_seen": "2026-09-01T11:00:00+00:00", "tier": "nightly"},
             {"build_id": "not-a-build", "first_seen": "2026-09-01T10:12:39+00:00"},
             {"build_id": "2098000000000000000", "first_seen": "yesterday"},
             "junk",
