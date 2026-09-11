@@ -12,15 +12,17 @@ writes four pages and two data files into ``out/``:
 * ``index.html`` -- **the Brief**: what state the smoke gate is in, why the
   bot thinks so, what the agent saw, what changed right before, what is
   being done, the runs in the window and the last release-candidate eval
-  runs. Scoped by ``?cases=a,b&since=<ISO>&until=<ISO>`` to a past
-  incident; ``#agent`` shows the last 24 hours in numbers.
-* ``run.html?build=<prow build id>`` -- **the PR view**: one run, its
+  runs. Scoped by ``#since=<ISO>&until=<ISO>&cases=a,b&view=gate`` to a
+  past incident; ``#view=agent`` shows the last 24 hours in numbers
+  (SCHEMA.md, "URL contract"; the older ``?cases=…#gate`` form is still
+  read).
+* ``run.html#build=<prow build id>`` -- **the PR view**: one run, its
   failed cases each tagged as the gate's or the pull request's
   (``classify.py``), and what to do.
 * ``grid.html`` -- **the Grid**: every case by every presubmit run in a
   window, with the merges to main and the incidents marked between the
   columns; a cell opens the run's detail for that case. Scoped by the same
-  ``?cases=&since=&until=`` the Brief carries.
+  ``#since=&until=&cases=`` the Brief carries.
 * ``cases.html`` -- **the Cases page**: one row per case with its last
   ``STRIP_RUNS`` presubmit outcomes, its 7- and 30-day pass rates per tier,
   its roster status and its last failure; ``#<case>`` lands on the row.
@@ -99,7 +101,8 @@ DEFAULT_EVENTS = HERE / "events.yaml"
 
 # --- the four pages and their data ----------------------------------------
 BRIEF_PAGE = "index.html"
-RUN_PAGE = "run.html"
+# The file post_health.run_link points at; one name for it.
+RUN_PAGE = post_health.DASHBOARD_RUN_PAGE
 GRID_PAGE = "grid.html"
 CASES_PAGE = "cases.html"
 BRIEF_JSON = "brief.json"
@@ -121,10 +124,10 @@ HEALTH_HISTORY_FILE = "health-history.jsonl"
 INLINE_BRIEF_ID = "inline-brief"
 INLINE_HEALTH_ID = "inline-health"
 # Where the pages are published: the directory of the index.html URL the
-# Chat messages (post_health.py) and the gate comment (gate_comment.py's
-# DASHBOARD_ROOT) already link to, so `--public-url` with no value names
-# the host they do rather than a second copy of it.
-PUBLISHED_SITE = post_health.DASHBOARD_URL.rsplit("/", 1)[0]
+# Chat messages and the gate comment (post_health.py's link builders)
+# already link to, so `--public-url` with no value names the host they do
+# rather than a second copy of it.
+PUBLISHED_SITE = post_health.DASHBOARD_SITE
 # The three states health.json can carry. The pages announce a state with
 # a glyph and the word, never with colour alone.
 HEALTH_STATES = ("GREEN", "DEGRADED", "OUTAGE")
@@ -1067,7 +1070,7 @@ def inline_json_html(element_id: str, value) -> str:
 
 def base_html(public_url: str | None) -> str:
     """``<base href>`` for the published site, so every relative link on the
-    page (nav, footer, run.html?build=, the incident deep links) resolves
+    page (nav, footer, run.html#build=, the incident deep links) resolves
     there whatever URL the browser is showing; nothing when no public URL
     is known, which keeps a file:// render browsable."""
     if not public_url:

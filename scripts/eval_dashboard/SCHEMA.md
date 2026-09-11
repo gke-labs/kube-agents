@@ -445,7 +445,7 @@ America/Toronto ("ET"), formatted in the browser with
 | Page         | What it is                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `index.html` | **The Brief**: the gate's state and why, what the agent saw, what changed right before, what is being done, the runs in the window with a "See it in the grid" link, and the last release-candidate eval runs (`releases[]`). Healthy: the last 24 hours in numbers and the last incident.                                                                                                                                                                                                                                                  |
-| `run.html`   | **The PR view**, `run.html?build=<prow build id>`: one run, each failed gate case tagged `failing on N other PRs` / `only your PR` / `quota storm` / `unexplained` with its check reason, 30-day pass rate, transcript link, a link to its row on the Cases page and a one-line Do; a "what to do" box.                                                                                                                                                                                                                                     |
+| `run.html`   | **The PR view**, `run.html#build=<prow build id>`: one run, each failed gate case tagged `failing on N other PRs` / `only your PR` / `quota storm` / `unexplained` with its check reason, 30-day pass rate, transcript link, a link to its row on the Cases page and a one-line Do; a "what to do" box.                                                                                                                                                                                                                                     |
 | `grid.html`  | **The Grid**: one row per case (blocking cases by domain, then the held-out ones, folded away when they passed everything in the window), one column per presubmit run in a window of 6 h, 24 h, 36 h or 7 days (header: PR # and ET start; a green run that recorded no cases gets no column); cells passed / failed all reps / failed some / quota-infra / died before the cases / still running (`pending_builds`); merges to main and incident starts and ends marked between the columns; a cell opens that run's detail for the case. |
 | `cases.html` | **The Cases page** ("How reliable is each test?"): one row per case by domain — its last `STRIP_RUNS` presubmit outcomes, pass rate over reps at 7 and 30 days for the presubmit and the nightly apart (`—` when a tier has no graded run), its roster status (blocking / held out / demoted with its date / nightly only / not in any matrix), its last failure with the grader's reason, and its issues from `case-notes.yaml`.                                                                                                           |
 
@@ -471,17 +471,36 @@ the question imports it.
 
 ### URL contract
 
-`index.html?cases=a,b&since=<ISO 8601 UTC>&until=<ISO 8601 UTC>#gate|#agent`
-`grid.html?cases=a,b&since=<ISO 8601 UTC>&until=<ISO 8601 UTC>[&window=6h|24h|36h|7d][&rows=all|admitted|failing]`
-`cases.html[?sort=worst|domain|name][&show=all|blocking|held]#<case id>`
+`index.html#since=<ISO 8601 UTC>&until=<ISO 8601 UTC>&cases=a,b&view=gate|agent`
+`run.html#build=<prow build id>`
+`grid.html#since=<ISO 8601 UTC>&until=<ISO 8601 UTC>&cases=a,b[&window=6h|24h|36h|7d][&rows=all|admitted|failing]`
+`cases.html#<case id>`, or `cases.html#sort=worst|domain|name&show=all|blocking|held`
+
+Every parameter travels in the URL fragment as `key=value` pairs joined
+by `&`. `storage.cloud.google.com` answers an unauthenticated request with
+a login redirect that comes back without the query string, so a scope
+carried there arrived empty and the reader landed on the unscoped Brief; a
+browser never sends the fragment to the server and carries it through a
+redirect, so a scope carried there survives. The older form,
+`index.html?cases=a,b&since=…&until=…#gate|#agent`, `run.html?build=<id>`
+and the same query form on the Grid and the Cases page, is still read, so
+a link already posted to Chat, a pull request or an issue opens the same
+page wherever its query survives (a session the host does not redirect, a
+local render); a key present in both places is read from the query.
+`linkState()` in `template/pages.js` is the one parser;
+`post_health.dashboard_link` / `run_link` (Python: the Chat messages, the
+gate comment, the tracking issue) and `briefHref` / `gridHref` / `runHref`
+/ `caseHref` (the pages' own links; `incidentHref` and `numbersHref` wrap
+the first) are the writers. A writer omits an empty parameter.
 
 - `cases`, `since`, `until` scope the Brief to that incident (a past one
   when `until` is given). `since` is matched to an incident in
   `health-history.jsonl`; without history the parameters describe it. On
   the Grid the same three make the incident the window and pin its cases
   first; the Brief's "See it in the grid" link carries them.
-- `#agent` shows the last 24 hours in numbers; `#gate` lands on the
-  "why we think" block. No parameters: the current state from `health.json`.
+- `view=agent` shows the last 24 hours in numbers; `view=gate` lands on
+  the "why we think" block (the page scrolls to the section after it
+  renders). No parameters: the current state from `health.json`.
 - Case ids match `[A-Za-z0-9][A-Za-z0-9._-]{0,79}`; the first 50
   (`maxLinkCases`) that do are read, and a link the pages write carries at
   most those 50. A value that fails its grammar is dropped and everything
@@ -489,8 +508,9 @@ the question imports it.
   highlights that row; the PR view and the Grid link there.
 - `since` and `until` are read with a `Z`, a space separator, or a UTC
   offset written `+02:00` or `+0200`, and converted; the pages themselves
-  write `Z`.
-- `run.html?build=<digits>`; an id not in `brief.json` shows a
+  write `Z`, and nothing a writer emits is percent-encoded (the case-id
+  grammar and the `Z` form need none).
+- `run.html#build=<digits>`; an id not in `brief.json` shows a
   not-found page naming the window (`RUN_VIEW_DAYS`, 14 days).
 - `window`, `rows`, `sort` and `show` are the Grid's and the Cases page's
   chips as parameters; a value outside the vocabulary is the default.
