@@ -2438,7 +2438,16 @@ run_menu_system() {
   local slack_enabled="${SLACK_ENABLED:-$DEFAULT_SLACK_ENABLED}"
   local allowed_users="${ALLOWED_USERS:-}"
   local chat_topic_name="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
-  local chat_sub_name="${CHAT_SUB_NAME:-$DEFAULT_CHAT_SUB_NAME}"
+  local chat_sub_name="${CHAT_SUB_NAME:-}"
+  if [ -z "$chat_sub_name" ]; then
+    local state_sub
+    state_sub="$(tf_state_chat_subscription_name 2>/dev/null)" || true
+    if [ -n "$state_sub" ]; then
+      chat_sub_name="$state_sub"
+    else
+      chat_sub_name="$(derive_chat_sub_name "$chat_topic_name")"
+    fi
+  fi
   local permission_set="${PLATFORM_AGENT_PERMISSION_SET:-$DEFAULT_PERMISSION_SET}"
   local custom_roles="${PLATFORM_AGENT_CUSTOM_ROLES:-}"
   # Not the fresh-install default. The control panel describes an install that
@@ -2979,7 +2988,13 @@ main() {
   local chat_topic_name="$PARAM_CHAT_TOPIC_NAME"
   local chat_sub_name="${PARAM_CHAT_SUB_NAME:-}"
   if [ -z "$chat_sub_name" ]; then
-    chat_sub_name="$(derive_chat_sub_name "$chat_topic_name")"
+    local state_sub
+    state_sub="$(tf_state_chat_subscription_name 2>/dev/null)" || true
+    if [ -n "$state_sub" ]; then
+      chat_sub_name="$state_sub"
+    else
+      chat_sub_name="$(derive_chat_sub_name "$chat_topic_name")"
+    fi
   fi
   local google_chat_mode="$PARAM_GOOGLE_CHAT_MODE"
   if [[ ! "$google_chat_mode" =~ ^(default|debug)$ ]]; then
@@ -3037,7 +3052,13 @@ main() {
       allowed_users "$allowed_users" false "$allowed_users_hint"
     prompt_read "Pub/Sub Topic Name for Google Chat" chat_topic_name "$chat_topic_name"
     if [ -z "${PARAM_CHAT_SUB_NAME:-}" ]; then
-      chat_sub_name="$(derive_chat_sub_name "$chat_topic_name")"
+      local state_sub
+      state_sub="$(tf_state_chat_subscription_name 2>/dev/null)" || true
+      if [ -n "$state_sub" ]; then
+        chat_sub_name="$state_sub"
+      else
+        chat_sub_name="$(derive_chat_sub_name "$chat_topic_name")"
+      fi
     fi
     prompt_read "Pub/Sub Subscription Name for Google Chat" chat_sub_name "$chat_sub_name"
     prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \

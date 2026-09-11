@@ -871,6 +871,30 @@ for r in doc.get("resources", []):
 ' "$TF_STATE_RC_UNREADABLE"
 }
 
+# The name of the Google Chat Pub/Sub subscription this install's state
+# manages. Empty when there is no state or the subscription is not in state;
+# tf_state_read's return code when the state could not be read or parsed.
+tf_state_chat_subscription_name() {
+  trap - ERR
+  local state
+  state=$(tf_state_read) || return $?
+  printf '%s' "$state" | python3 -c '
+import json, sys
+try:
+    doc = json.load(sys.stdin)
+except Exception:
+    sys.exit(int(sys.argv[1]))
+for r in doc.get("resources", []):
+    if r.get("type") == "google_pubsub_subscription" and r.get("name") == "chat_events" and r.get("mode") == "managed":
+        for i in r.get("instances", []):
+            name = (i.get("attributes") or {}).get("name")
+            if name:
+                print(name)
+                sys.exit(0)
+sys.exit(0)
+' "$TF_STATE_RC_UNREADABLE"
+}
+
 # Refuse an apply that would stop on a service account this install does not
 # own. Every GSA the composition creates has ONE fixed name per project while
 # state is kept per cluster, so the second install in a project -- or a
@@ -1727,9 +1751,20 @@ write_tfvars_from_state() {
       echo "project_roles  = $(hcl_csv_list "${PLATFORM_AGENT_CUSTOM_ROLES:-}")"
     fi
     echo ""
+    local chat_topic="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
+    local chat_sub="${CHAT_SUB_NAME:-}"
+    if [ -z "$chat_sub" ]; then
+      local state_sub
+      state_sub="$(tf_state_chat_subscription_name 2>/dev/null)" || true
+      if [ -n "$state_sub" ]; then
+        chat_sub="$state_sub"
+      else
+        chat_sub="$(derive_chat_sub_name "$chat_topic")"
+      fi
+    fi
     echo "enable_google_chat        = $(hcl_bool "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}")"
-    echo "chat_topic_name           = $(hcl_str "${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}")"
-    echo "chat_subscription_name    = $(hcl_str "${CHAT_SUB_NAME:-$DEFAULT_CHAT_SUB_NAME}")"
+    echo "chat_topic_name           = $(hcl_str "$chat_topic")"
+    echo "chat_subscription_name    = $(hcl_str "$chat_sub")"
     echo "google_chat_allowed_users = $(hcl_csv_list "${ALLOWED_USERS:-}")"
     echo "google_chat_home_channel  = $(hcl_str "${GOOGLE_CHAT_HOME_CHANNEL:-}")"
     echo "google_chat_mode          = $(hcl_str "${GOOGLE_CHAT_MODE:-$DEFAULT_GOOGLE_CHAT_MODE}")"

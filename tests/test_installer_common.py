@@ -936,7 +936,7 @@ class InstallerCommonTest(unittest.TestCase):
     def test_google_chat_derived_subscription_written_to_tfvars(self):
         with tempfile.TemporaryDirectory() as out_dir:
             dest = pathlib.Path(out_dir) / "terraform.tfvars"
-            # 1. Custom topic with unset subscription preserves default subscription (no destroy on legacy installs)
+            # 1. Custom topic with unset subscription and no state derives <topic>-sub
             proc = self._run(
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
                 env={
@@ -948,9 +948,31 @@ class InstallerCommonTest(unittest.TestCase):
             self.assertIn("rc=0", proc.stdout, proc.stderr)
             content = dest.read_text()
             self.assertIn('chat_topic_name           = "custom-chat-events"', content)
+            self.assertIn('chat_subscription_name    = "custom-chat-events-sub"', content)
+
+            # 2. Custom topic with state managing legacy default subscription recovers state value
+            legacy_state = _state_doc([{
+                "module": "module.chat_pubsub[0]",
+                "mode": "managed",
+                "type": "google_pubsub_subscription",
+                "name": "chat_events",
+                "instances": [{"attributes": {"name": "platform-agent-chat-events-sub"}}],
+            }])
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                gcloud_stdout=legacy_state,
+                env={
+                    "API_SERVER_KEY": "k",
+                    "GOOGLE_CHAT_ENABLED": "true",
+                    "CHAT_TOPIC_NAME": "custom-chat-events",
+                },
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn('chat_topic_name           = "custom-chat-events"', content)
             self.assertIn('chat_subscription_name    = "platform-agent-chat-events-sub"', content)
 
-            # 2. Custom topic with explicit custom subscription retains explicit value
+            # 3. Custom topic with explicit custom subscription retains explicit value
             proc = self._run(
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
                 env={
@@ -964,7 +986,7 @@ class InstallerCommonTest(unittest.TestCase):
             content = dest.read_text()
             self.assertIn('chat_subscription_name    = "my-explicit-sub"', content)
 
-            # 3. Custom topic with derived subscription (e.g. exported by install.sh) writes derived value
+            # 4. Custom topic with derived subscription (e.g. exported by install.sh) writes derived value
             proc = self._run(
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
                 env={
@@ -978,7 +1000,7 @@ class InstallerCommonTest(unittest.TestCase):
             content = dest.read_text()
             self.assertIn('chat_subscription_name    = "custom-chat-events-sub"', content)
 
-            # 4. Default topic retains default subscription
+            # 5. Default topic retains default subscription
             proc = self._run(
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
                 env={
@@ -990,6 +1012,30 @@ class InstallerCommonTest(unittest.TestCase):
             content = dest.read_text()
             self.assertIn('chat_topic_name           = "platform-agent-chat-events"', content)
             self.assertIn('chat_subscription_name    = "platform-agent-chat-events-sub"', content)
+
+    def test_tf_state_chat_subscription_name_returns_name(self):
+        state = _state_doc([{
+            "module": "module.chat_pubsub[0]",
+            "mode": "managed",
+            "type": "google_pubsub_subscription",
+            "name": "chat_events",
+            "instances": [{"attributes": {"name": "test-chat-sub"}}],
+        }])
+        proc = self._run(
+            'tf_state_chat_subscription_name; echo "rc=$?"',
+            gcloud_stdout=state,
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn("test-chat-sub", proc.stdout)
+
+    def test_tf_state_chat_subscription_name_empty_when_absent(self):
+        state = _state_doc([])
+        proc = self._run(
+            'sub="$(tf_state_chat_subscription_name)"; echo "sub=$sub rc=$?"',
+            gcloud_stdout=state,
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn("sub= rc=0", proc.stdout)
 
     def test_minter_deferred_without_an_enabled_key_version(self):
         # A minter whose KMS key holds no ENABLED version never passes
