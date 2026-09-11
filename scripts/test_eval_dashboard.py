@@ -509,15 +509,16 @@ class ReleasesAndPendingTest(unittest.TestCase):
 
 
 class RenderedPagesTest(unittest.TestCase):
-    def test_four_pages_are_written_and_none_names_the_legacy_page(self):
+    def test_five_pages_are_written_and_none_names_the_legacy_page(self):
         out_dir, _, tmp = render_fixture(fixture_data())
         self.addCleanup(tmp.cleanup)
-        self.assertEqual(sorted(p.name for p in out_dir.iterdir()), ["brief.json", "cases.html", "data.json", "grid.html", "index.html", "run.html"])
-        for page in ("index.html", "run.html", "grid.html", "cases.html"):
+        self.assertEqual(sorted(p.name for p in out_dir.iterdir()), ["brief.json", "cases.html", "data.json", "grid.html", "index.html", "nightly.html", "run.html"])
+        for page in ("index.html", "run.html", "grid.html", "cases.html", "nightly.html"):
             text = (out_dir / page).read_text()
             self.assertNotIn("legacy", text.lower(), page)
             self.assertIn('href="grid.html"', text, page)
             self.assertIn('href="cases.html"', text, page)
+            self.assertIn('href="nightly.html"', text, page)
         for template in TEMPLATES:
             self.assertNotIn("legacy", template.read_text().lower(), template.name)
 
@@ -533,6 +534,9 @@ class RenderedPagesTest(unittest.TestCase):
         self.assertIn('data-page="grid"', grid)
         cases = (out_dir / "cases.html").read_text()
         self.assertIn('<a href="cases.html" class="on">Cases</a>', cases)
+        night = (out_dir / "nightly.html").read_text()
+        self.assertIn('<a href="nightly.html" class="on">Nightly</a>', night)
+        self.assertIn('data-page="nightly"', night)
         run = (out_dir / "run.html").read_text()
         self.assertIn('<a href="run.html" class="on">PR view</a>', run)
         self.assertIn("head f6e5d4c", index)
@@ -693,7 +697,7 @@ class PublishTest(unittest.TestCase):
         self.assertTrue(check)
         self.assertEqual(argv[:4], ["gsutil", "-h", "Cache-Control: no-cache", "cp"])
         self.assertEqual(argv[-1], "gs://bucket/dash/")
-        for name in ("index.html", "grid.html", "cases.html", "run.html", "brief.json", "data.json"):
+        for name in ("index.html", "grid.html", "cases.html", "nightly.html", "run.html", "brief.json", "data.json"):
             self.assertIn(str(out_dir / name), argv)
 
     def test_local_target_copies_without_any_subprocess(self):

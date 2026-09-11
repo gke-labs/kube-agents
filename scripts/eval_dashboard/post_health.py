@@ -9,7 +9,9 @@ sends a message only when:
     the state changed                       -> "CI health: DEGRADED (was GREEN)"
     the state returned to GREEN             -> the recovery, with how long it lasted
     an OUTAGE grew to name a new case       -> the same shape, rate-limited
-    it is the digest hour and none went out -> the daily digest with the 24h numbers
+    it is the digest hour and none went out -> the daily digest with the 24h numbers,
+                                               plus one line on last night's
+                                               nightly run when --data is given
 
 Everything else is silence. The last-posted state lives in a small JSON file
 (`--state`, a local path or a gs:// object) that this script is the only
@@ -63,10 +65,10 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 try:
-    from eval_dashboard import gate_issue, ghcli
+    from eval_dashboard import gate_issue, ghcli, nightly
 except ImportError:  # run as a script: scripts/eval_dashboard/post_health.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
-    from eval_dashboard import gate_issue, ghcli
+    from eval_dashboard import gate_issue, ghcli, nightly
 
 STATE_SCHEMA_VERSION = 1
 
@@ -130,6 +132,9 @@ DASHBOARD_URL = "https://storage.cloud.google.com/kube-agents-dashboards/evals/i
 # `#agent` for the digest. Commas and colons stay literal.
 DASHBOARD_SECTION_GATE = "gate"
 DASHBOARD_SECTION_AGENT = "agent"
+# The Nightly report page beside the Brief; the digest's nightly line links
+# to it (nightly.py derives both the line and the page's data).
+NIGHTLY_URL = DASHBOARD_URL.rsplit("/", 1)[0] + "/" + nightly.NIGHTLY_PAGE
 
 # The message wording. One sentence of cause, one of what to do, then the
 # link; the details live behind the link. Case names are read by a human
@@ -430,7 +435,11 @@ def render_recovery(health: dict, prev: dict, now: datetime) -> str:
     return "\n".join(lines)
 
 
-def render_digest(health: dict, now: datetime) -> str:
+def render_digest(health: dict, now: datetime, data: dict | None = None) -> str:
+    """The 24h numbers, the stale note while a stall lasts, and -- when
+    data.json was given -- one line on last night's nightly run with a link
+    to its report: the counts, what is newly failing against the night
+    before and the wall clock, or that the night was truncated or missing."""
     metrics = health.get("metrics") or {}
     p50 = metrics.get("wall_clock_p50_s")
     typical = f"{int(p50 // 60)} min" if p50 is not None else "n/a"
@@ -445,15 +454,18 @@ def render_digest(health: dict, now: datetime) -> str:
         # The window is measured from the data's horizon, so during a stall
         # these are the same numbers every morning; say so every morning.
         lines.append(f"⚪ No fresh data since {clock(parse_iso(health.get('generated_at')))} — these numbers stop there. Someone check the refresh job.")
+    if data is not None:
+        lines.append(nightly.digest_line(data, now, clock=lambda value: clock(value, weekday=True)))
+        lines.append(NIGHTLY_URL)
     lines.append(dashboard_link(DASHBOARD_SECTION_AGENT, health.get("failing_cases") or [], parse_iso(health.get("since"))))
     return "\n".join(lines)
 
 
-def render(kind: str, health: dict, prev: dict | None, now: datetime, issue: dict | None = None) -> str:
+def render(kind: str, health: dict, prev: dict | None, now: datetime, issue: dict | None = None, data: dict | None = None) -> str:
     if kind == KIND_RECOVERY:
         return render_recovery(health, prev or {}, now)
     if kind == KIND_DIGEST:
-        return render_digest(health, now)
+        return render_digest(health, now, data)
     if kind == KIND_STALE:
         return render_stale(health)
     return render_change(health, prev, issue)
@@ -537,8 +549,12 @@ def run(
     dry_run: bool,
     tz=LOCAL_TZ,
     tracker: gate_issue.Tracker | None = None,
+    data: dict | None = None,
 ) -> tuple[dict, list[tuple[str, str]], list[str]]:
     """Decide, render, send. Returns (new state, [(kind, text)], kinds that failed).
+
+    `data`, when given, is the collector's data.json; the digest reads last
+    night's nightly run from it.
 
     `tracker`, when given, files the tracking issue a new OUTAGE lacks
     before the "broken" message is rendered (so it can say "Tracking #NNN")
@@ -550,7 +566,7 @@ def run(
     if tracker is not None and wants_issue:
         since = parse_iso(health.get("since"))
         issue = tracker.ensure(health, now, clock(since, weekday=True), incident_link(health))
-    messages = [(kind, render(kind, health, prev, now, issue)) for kind in kinds]
+    messages = [(kind, render(kind, health, prev, now, issue, data)) for kind in kinds]
     failed = []
     for kind, text in messages:
         if dry_run:
@@ -615,6 +631,7 @@ def parse_args(argv):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--health", type=pathlib.Path, required=True, help="the health.json health.py wrote")
     parser.add_argument("--state", required=True, help="last-posted state: local path or gs:// object (this script's only write)")
+    parser.add_argument("--data", type=pathlib.Path, default=None, help="the collector's data.json; the digest then carries one line on last night's nightly run (unreadable: a warning and the line says so)")
     parser.add_argument("--digest-hour", type=int, default=DEFAULT_DIGEST_HOUR, help="hour of the daily digest, in --digest-tz")
     parser.add_argument("--digest-tz", type=parse_tz, default=LOCAL_TZ, help=f"IANA zone the digest hour and day are read in (default {DEFAULT_TZ}); times in messages stay {DEFAULT_TZ} ({TZ_LABEL}) regardless")
     parser.add_argument("--repo", default=ghcli.DEFAULT_REPO, help="owner/repo the tracking issue is filed in")
@@ -631,6 +648,17 @@ def main(argv=None, environ=os.environ, opener=urllib.request.urlopen, runner=su
         log(f"ERROR: {args.health}: {exc}")
         return 1
     now = parse_iso(args.now) or datetime.now(UTC)
+    data = None
+    if args.data is not None:
+        try:
+            data = json.loads(args.data.read_text())
+        except (OSError, ValueError) as exc:
+            # The digest still goes out; its nightly line says the data was
+            # unreadable rather than inventing a quiet night.
+            log(f"warning: {args.data}: {exc}; the digest's nightly line will say so")
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
     sender = Sender.from_env(environ, opener)
     if not sender.configured and not args.dry_run:
         log(NOT_CONFIGURED)
@@ -642,7 +670,7 @@ def main(argv=None, environ=os.environ, opener=urllib.request.urlopen, runner=su
         tracker = gate_issue.Tracker(ghcli.Gh(args.repo, gh_runner or runner, dry_run=args.dry_run))
 
     prev = read_state(args.state, runner)
-    state, messages, failed = run(health, prev, now, args.digest_hour, sender, args.dry_run, args.digest_tz, tracker)
+    state, messages, failed = run(health, prev, now, args.digest_hour, sender, args.dry_run, args.digest_tz, tracker, data)
     if prev is None and failed and len(failed) == len(messages):
         # Nothing has ever been told and nothing got through: there is no
         # state worth recording, and the next tick starts from scratch.
