@@ -1,3 +1,11 @@
+---
+# Claude Code loads this rule only beside files matching `paths`; other tools ignore this block.
+paths:
+  - "**/*.go"
+  - "**/*.py"
+  - "**/*.sh"
+---
+
 # Core engineering rules
 
 Rules for code written in this repository. [`AGENTS.md`](../../AGENTS.md) names this file and is

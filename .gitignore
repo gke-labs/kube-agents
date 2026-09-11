@@ -54,7 +54,7 @@ terraform.tfvars.json
 build/
 *.tgz
 
-# Per-developer Claude Code state (session settings, local skills). The shared
+# Per-developer Claude Code state (session settings). The shared
 # slash commands in .claude/commands/ and the review skills in .agents/skills/
 # are committed; .claude/settings.json and .claude/settings.local.json stay
 # personal. settings.json is deliberately *not* committed even though the
@@ -65,6 +65,12 @@ build/
 # descends into the directory: a rule that excludes the directory itself can
 # never be undone by a nested .gitignore or a negation, because git does not
 # look inside it.
+#
+# .claude/skills and .claude/rules are symlinks into .agents/, the tool-neutral
+# home Gemini CLI and Codex already read; Claude Code scans only .claude/. No
+# trailing slash on those two negations: git records a symlink as a file.
 .claude/*
 !.claude/commands/
 !.claude/settings.json.example
+!.claude/skills
+!.claude/rules
