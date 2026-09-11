@@ -79,6 +79,10 @@ readonly PLATFORM_AGENT_CREDENTIAL_PROXY_DEPLOYMENT="platform-agent-credential-p
 readonly TF_HELM_RELEASE_TYPE="helm_release"
 readonly TF_CERT_MANAGER_RELEASE_NAME="cert_manager"
 readonly TF_KUBE_AGENTS_RELEASE_NAME="kube_agents"
+# The composition's Google Chat Pub/Sub subscription in Terraform state (#1397).
+readonly TF_PUBSUB_SUBSCRIPTION_TYPE="google_pubsub_subscription"
+readonly TF_CHAT_EVENTS_SUBSCRIPTION_NAME="chat_events"
+readonly TF_RESOURCE_MODE_MANAGED="managed"
 # The Helm status of a release whose last operation failed, the one of a first
 # install still in flight or interrupted, and the statuses `helm history`
 # gives a revision that served at some point.
@@ -881,25 +885,27 @@ for r in doc.get("resources", []):
 # The name of the Google Chat Pub/Sub subscription this install's state
 # manages. Empty when there is no state or the subscription is not in state;
 # tf_state_read's return code when the state could not be read or parsed.
+# shellcheck disable=SC2120
 tf_state_chat_subscription_name() {
   trap - ERR
   local state
   state=$(tf_state_read "$@") || return $?
   printf '%s' "$state" | python3 -c '
 import json, sys
+rtype, rname, rmode, unreadable = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 try:
     doc = json.load(sys.stdin)
 except Exception:
-    sys.exit(int(sys.argv[1]))
+    sys.exit(unreadable)
 for r in doc.get("resources", []):
-    if r.get("type") == "google_pubsub_subscription" and r.get("name") == "chat_events" and r.get("mode") == "managed":
+    if r.get("type") == rtype and r.get("name") == rname and r.get("mode") == rmode:
         for i in r.get("instances", []):
             name = (i.get("attributes") or {}).get("name")
             if name:
                 print(name)
                 sys.exit(0)
 sys.exit(0)
-' "$TF_STATE_RC_UNREADABLE"
+' "$TF_PUBSUB_SUBSCRIPTION_TYPE" "$TF_CHAT_EVENTS_SUBSCRIPTION_NAME" "$TF_RESOURCE_MODE_MANAGED" "$TF_STATE_RC_UNREADABLE"
 }
 
 # Refuse an apply that would stop on a service account this install does not
