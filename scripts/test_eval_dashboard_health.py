@@ -34,6 +34,21 @@ from eval_dashboard import health
 TESTDATA = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "testdata_health"
 FIXTURE = TESTDATA / "data.json.gz"
 ROSTER_HISTORY = TESTDATA / "roster-history.json"
+# 2026-09-11, the build-cluster node loss (#1478), and BOOTSTRAP_ADMITTED as
+# hack/ci-eval-pr.sh had it that day.
+LOST_FIXTURE = TESTDATA / "lost-pods-2026-09-11.json.gz"
+ROSTER_0911 = [
+    "reliability-pdb-probe",
+    "security-overgrant-probe",
+    "upgrades-lagging-master-probe",
+    "consistency-authorized-networks-probe",
+    "cost-idle-pool-probe",
+    "obtainability-remediation-proposal",
+    "cluster-agent-crashloop-debug",
+    "cluster-agent-crashloop-misleading-symptom",
+    "cluster-agent-crashloop-evidence-chain",
+    "agent-kanban-smoke",
+]
 CASE_NOTES = pathlib.Path(__file__).resolve().parent / "eval_dashboard" / "case-notes.yaml"
 
 UTC = timezone.utc
@@ -334,6 +349,123 @@ class SetupDeaths(unittest.TestCase):
     def test_a_lowercase_prow_verdict_still_counts(self):
         # Prow wrote `failure` on six zero-task runs on 2026-09-05.
         self.assertEqual(assess(self.deaths([1, 1, 2], result="failure"), T0)["state"], "DEGRADED")
+
+
+# --------------------------------------------------------------------------- #
+# Rule 3b: lost pods
+# --------------------------------------------------------------------------- #
+
+
+def lost(build_id, pr, finished, minutes=120, node="node-a", **fields):
+    """A run whose build node went away, as the collector records it: a
+    zero-task FAILURE with no build log and a NodeNotReady pod event."""
+    raw = run(build_id, pr, finished, minutes=minutes, result="FAILURE")
+    raw.update({"has_build_log": False, "pod_phase": "Failed", "pod_node": node, "pod_last_event": "NodeNotReady"})
+    raw.update(fields)
+    return raw
+
+
+class LostPods(unittest.TestCase):
+    def lost_doc(self, count, spread_minutes=5, prs=None, nodes=("node-a", "node-b")):
+        prs = prs or list(range(1, count + 1))
+        return data(*(lost(100 + i, prs[i], T0 - timedelta(minutes=spread_minutes * i), node=nodes[i % len(nodes)]) for i in range(count)))
+
+    def test_the_predicate_reads_the_pod_record_not_the_clock(self):
+        long_run, short_run = health.Run(lost(1, 1, T0, minutes=128)), health.Run(lost(2, 2, T0, minutes=2))
+        self.assertEqual((long_run.lost_pod, long_run.setup_death), (True, False))
+        self.assertEqual((short_run.lost_pod, short_run.setup_death), (True, False), "under five minutes is still a lost pod, never a setup death")
+        self.assertTrue(health.Run(lost(3, 3, T0, pod_phase=None, pod_node=None, pod_last_event=None)).lost_pod, "a missing log alone is enough")
+        self.assertTrue(health.Run(lost(4, 4, T0, has_build_log=True)).lost_pod, "NodeNotReady alone is enough")
+        self.assertTrue(health.Run(lost(5, 5, T0, result="failure")).lost_pod, "Prow's lowercase verdict")
+        clone_failed = health.Run(lost(6, 6, T0, minutes=0, has_build_log=True, pod_last_event="Started"))
+        self.assertEqual((clone_failed.lost_pod, clone_failed.setup_death), (False, True))
+        legacy = run(7, 7, T0, minutes=2, result="FAILURE")
+        self.assertEqual((health.Run(legacy).lost_pod, health.Run(legacy).setup_death), (False, True), "a document without the fields is unknown")
+        self.assertEqual((health.Run(dict(legacy, duration_s=3600)).lost_pod, health.Run(dict(legacy, duration_s=3600)).setup_death), (False, False))
+        self.assertFalse(health.Run(lost(8, 8, T0, result="ABORTED")).lost_pod)
+        self.assertFalse(health.Run(lost(9, 9, T0, tasks=green_tasks())).lost_pod, "a run with tasks is a full run")
+
+    def test_three_within_thirty_minutes_degrade_and_fewer_or_sparser_do_not(self):
+        result = assess(self.lost_doc(3, spread_minutes=10), T0)
+        self.assertEqual((result["state"], result["condition"]), ("DEGRADED", "lost_pods"))
+        self.assertEqual(result["cause"], "lost pods: 3 runs on 3 PRs died with their build node 23:40–00:00 UTC")
+        self.assertEqual(result["evidence"][0], "lost pods: 3 runs on 3 PRs died with their build node 23:40–00:00 UTC (nodes node-a ×2, node-b; #1, #2, #3)")
+        self.assertEqual(assess(self.lost_doc(2), T0)["state"], "GREEN")
+        self.assertEqual(assess(self.lost_doc(3, spread_minutes=15), T0)["state"], "DEGRADED", "0, 15 and 30 minutes ago fit one span")
+        self.assertEqual(assess(self.lost_doc(3, spread_minutes=20), T0)["state"], "GREEN", "0, 20 and 40 minutes ago do not")
+
+    def test_no_distinct_pr_floor_the_pod_record_already_blames_the_node(self):
+        self.assertEqual(assess(self.lost_doc(3, prs=[7, 7, 7]), T0)["condition"], "lost_pods")
+
+    def test_eight_is_a_build_cluster_event(self):
+        # Eight losses four minutes apart: 28 minutes, one span.
+        incident = assess(self.lost_doc(8, spread_minutes=4), T0)["incident"]
+        self.assertTrue(incident["event"])
+        self.assertEqual(incident["nodes"], {"node-a": 4, "node-b": 4})
+        self.assertEqual((incident["runs"], incident["prs"]), (8, list(range(1, 9))))
+        self.assertEqual((incident["window_start"], incident["window_end"]), (health.iso(T0 - timedelta(minutes=28)), health.iso(T0)))
+        self.assertFalse(assess(self.lost_doc(7, spread_minutes=4), T0)["incident"]["event"])
+        # Eight losses five minutes apart span 35 minutes: the densest
+        # 30-minute span holds seven, and seven is not an event.
+        self.assertEqual(assess(self.lost_doc(8), T0)["incident"]["runs"], 7)
+
+    def test_older_losses_in_the_window_are_evidence_not_the_event(self):
+        doc = self.lost_doc(3)
+        doc["runs"].append(lost(200, 20, T0 - timedelta(minutes=90)))
+        result = assess(doc, T0)
+        self.assertEqual(result["incident"]["runs"], 3)
+        self.assertTrue(result["evidence"][0].endswith("; 1 more earlier in the last 2h"), result["evidence"])
+
+    def test_lost_pods_outrank_a_storm_and_are_counted_in_exactly_one_class(self):
+        doc = self.lost_doc(3)
+        for i in range(3):
+            stormy = [task(f"s{k}", "eee") for k in range(2)] + broken_tasks(set())
+            doc["runs"].append(run(300 + i, 30 + i, T0 - timedelta(minutes=2 * i), result="SUCCESS", tasks=stormy))
+        result = adjudicate(doc, T0)
+        self.assertEqual(result["condition"], "lost_pods")
+        self.assertTrue(any(line.startswith("quota storm:") for line in result["evidence"]), "the storm stays as context")
+        self.assertEqual((result["metrics"]["lost_pods"], result["metrics"]["setup_deaths"]), (3, 0))
+        self.assertEqual(result["metrics"]["infra_reds"], 3)
+
+    def test_advice_names_the_nodes_on_the_readers_clock(self):
+        # The first loss was 20 minutes before T0 (2026-09-08 00:00Z): 7:40 PM EDT on the 7th.
+        self.assertEqual(
+            adjudicate(self.lost_doc(3, spread_minutes=10), T0)["advice"],
+            "The Prow build cluster lost node(s) node-a ×2, node-b at 7:40 PM ET; 3 runs died mid-run."
+            " Nothing about your change; /retest when the new jobs are progressing. Cluster owner: check the node events and autorepair.",
+        )
+        self.assertEqual(health.reader_clock(None), "?")
+
+    def test_recovery_needs_greens_after_the_last_loss(self):
+        doc = self.lost_doc(3)
+        doc["runs"] += [run(200 + i, 20 + i, T0 - timedelta(hours=3) + timedelta(minutes=10 * i), tasks=broken_tasks(set())) for i in range(3)]
+        prev = adjudicate(doc, T0)
+        self.assertEqual((prev["state"], prev["condition"]), ("DEGRADED", "lost_pods"))
+        later = T0 + timedelta(hours=2, minutes=1)
+        held = adjudicate(doc, later, prev)
+        self.assertEqual((held["state"], held["condition"], held["recovering"]), ("DEGRADED", "lost_pods", True))
+        doc["runs"] += [run(300 + i, 30 + i, later - timedelta(minutes=30 - 5 * i), tasks=broken_tasks(set())) for i in range(3)]
+        self.assertEqual(adjudicate(doc, later, held)["state"], "GREEN")
+
+    def test_the_posters_issue_is_cited_only_for_the_condition_it_was_filed_for(self):
+        doc = self.lost_doc(3)
+        outage_issue = {"number": 1300, "url": "https://github.com/gke-labs/kube-agents/issues/1300", "condition": "shared_break"}
+        self.assertIsNone(health.adjudicate(doc, T0, None, health.Roster.fixed(ADMITTED), posted={"issue": outage_issue})["issue"])
+        owner_issue = dict(outage_issue, number=1301, condition="lost_pods")
+        cited = health.adjudicate(doc, T0, None, health.Roster.fixed(ADMITTED), posted={"issue": owner_issue})
+        self.assertEqual((cited["issue"], cited["tracking_issues"]), (owner_issue, ["#1301"]))
+        # An issue from before the key was only ever an outage's: cited for
+        # a shared break, never for lost pods.
+        untagged = {"number": 1302, "url": "x"}
+        self.assertIsNone(health.adjudicate(doc, T0, None, health.Roster.fixed(ADMITTED), posted={"issue": untagged})["issue"])
+        outage_doc = data(*(run(100 + i, i, T0 - timedelta(hours=1) + timedelta(minutes=10 * i), tasks=broken_tasks({"agent-kanban-smoke"})) for i in range(4)))
+        self.assertEqual(health.adjudicate(outage_doc, T0, None, health.Roster.fixed(ADMITTED), posted={"issue": untagged})["issue"], untagged)
+
+    def test_trim_carries_how_the_build_ended(self):
+        doc = data(lost(1, 1, T0), run(2, 2, T0, tasks=[task("x", "ppp")]))
+        trimmed = health.trim(doc, T0 - timedelta(days=1), T0 + timedelta(days=1), "test")["runs"]
+        self.assertEqual({k: trimmed[0][k] for k in health.ENDED_FIELDS}, {"has_build_log": False, "pod_phase": "Failed", "pod_node": "node-a", "pod_last_event": "NodeNotReady"})
+        self.assertFalse(set(health.ENDED_FIELDS) & set(trimmed[1]))
 
 
 # --------------------------------------------------------------------------- #
@@ -682,6 +814,81 @@ class Replay(unittest.TestCase):
         # window's moving bounds do not count. Bound the week's entries so
         # the poster's silence is real, not a coincidence of the fixture.
         self.assertLess(len(self.timeline), 60, [e["at"] for e in self.timeline])
+
+
+class LostPodsReplay(unittest.TestCase):
+    """2026-09-11 (#1478): the published data.json's runs of that day, with
+    the twenty zero-task reds re-read by the collector so they carry
+    has_build_log and the pod record. Twelve of them are lost pods -- five
+    nodes went NotReady 14:03-14:17Z under runs on twelve pull requests --
+    and eight are clone failures (setup deaths), five of them in the morning.
+    health.py of the day counted three of the twelve as setup deaths and
+    advised checking the pool projects."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.data = health.load_json(LOST_FIXTURE)
+        cls.roster = health.Roster.fixed(ROSTER_0911)
+        cls.every = list(health.replay(cls.data, timedelta(minutes=30), cls.roster, start=day("09-11")))
+        cls.timeline = health.timeline(cls.every)
+
+    def tick(self, when):
+        return next(h for now, h in self.every if now == when)
+
+    def test_the_fixture_is_what_trim_produces(self):
+        trimmed = self.data["trimmed"]
+        again = health.trim(self.data, health.parse_iso(trimmed["from"]), health.parse_iso(trimmed["to"]), trimmed["source"])
+        self.assertEqual(again["runs"], self.data["runs"])
+        runs = [health.Run(r) for r in self.data["runs"]]
+        self.assertEqual(sum(1 for r in runs if r.lost_pod), 12)
+        self.assertEqual(sum(1 for r in runs if r.setup_death), 8)
+
+    def test_the_morning_clone_failures_are_still_setup_deaths(self):
+        # 10:50-11:16Z: four clone failures on three pull requests (#1195
+        # twice, #1456, #1468), none of them a lost pod.
+        entry = at(self.timeline, day("09-11", 11, 30))
+        self.assertEqual((entry["state"], entry["condition"]), ("DEGRADED", "setup_deaths"), entry)
+        self.assertNotIn("lost_pods", {e["condition"] for e in between(self.timeline, day("09-11"), day("09-11", 14, 0))})
+
+    def test_the_build_cluster_event_is_lost_pods_on_five_nodes(self):
+        entry = at(self.timeline, day("09-11", 14, 30))
+        self.assertEqual((entry["state"], entry["condition"]), ("DEGRADED", "lost_pods"), entry)
+        self.assertEqual(entry["cause"], "lost pods: 12 runs on 12 PRs died with their build node 14:05–14:19 UTC")
+        tick = self.tick(day("09-11", 15, 0))
+        self.assertEqual(
+            tick["incident"],
+            {
+                "prs": [926, 1118, 1246, 1258, 1319, 1351, 1362, 1439, 1451, 1456, 1460, 1471],
+                "runs": 12,
+                "window_start": "2026-09-11T14:05:52+00:00",
+                "window_end": "2026-09-11T14:19:16+00:00",
+                "nodes": {
+                    "gke-kube-agents-prow-default-pool-eb220b2a-6uhg": 1,
+                    "gke-kube-agents-prow-default-pool-eb220b2a-93sl": 2,
+                    "gke-kube-agents-prow-default-pool-eb220b2a-er33": 3,
+                    "gke-kube-agents-prow-default-pool-eb220b2a-pe72": 3,
+                    "gke-kube-agents-prow-default-pool-eb220b2a-sgnk": 3,
+                },
+                "event": True,
+            },
+        )
+        self.assertTrue(
+            tick["advice"].startswith(
+                "The Prow build cluster lost node(s) gke-kube-agents-prow-default-pool-eb220b2a-6uhg, gke-kube-agents-prow-default-pool-eb220b2a-93sl ×2,"
+                " gke-kube-agents-prow-default-pool-eb220b2a-er33 ×3, gke-kube-agents-prow-default-pool-eb220b2a-pe72 ×3, gke-kube-agents-prow-default-pool-eb220b2a-sgnk ×3"
+                " at 10:05 AM ET; 12 runs died mid-run."
+            ),
+            tick["advice"],
+        )
+
+    def test_setup_deaths_no_longer_claim_the_lost_pods(self):
+        # At 15:00Z the setup-death window holds three clone failures (#1471
+        # 13:14Z, #1446 14:29Z, #1319 14:49Z); #1351's 297-second lost pod,
+        # which the old rule counted, is not among them.
+        tick = self.tick(day("09-11", 15, 0))
+        setup = [line for line in tick["evidence"] if line.startswith("setup/clone failures:")]
+        self.assertEqual(setup, ["setup/clone failures: 3 runs under 5 min with no tasks in the last 2h (#1319, #1446, #1471)"])
+        self.assertEqual((tick["metrics"]["lost_pods"], tick["metrics"]["setup_deaths"]), (12, 8))
 
 
 class CommandLine(unittest.TestCase):

@@ -47,9 +47,9 @@ const (
 	// metadataDaemonNamespace and metadataDaemonDaemonSet locate the GKE metadata daemon
 	// DaemonSet whose declared container port is discovery's only reliable signal — see
 	// discoverMetadataDaemonPort's doc comment for why the IP itself isn't read from it.
-	metadataDaemonNamespace   = "kube-system"
-	metadataDaemonDaemonSet   = "gke-metadata-server"
-	metadataDaemonPortName    = "metadata-server"
+	metadataDaemonNamespace         = "kube-system"
+	metadataDaemonDaemonSet         = "gke-metadata-server"
+	metadataDaemonPortName          = "metadata-server"
 	metadataDaemonDefaultPort int32 = 988
 
 	// Source constants reporting how the network policy values were chosen.

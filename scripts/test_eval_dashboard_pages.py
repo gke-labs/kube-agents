@@ -483,6 +483,19 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("Why we think it's the setup, not the PRs", app)
         self.assertIn("died within 5 minutes", app)
 
+    def test_lost_pods_banner_and_window(self):
+        # A build-cluster node loss (#1478): the run page's banner names it
+        # rather than calling a DEGRADED state an outage, and the Brief's
+        # window reaches back two hours, so the lost runs are on the page.
+        lost = health_doc("DEGRADED", condition="lost_pods", failing_cases=[], tracking_issues=[], since="2026-09-08T14:30:00+00:00",
+                          cause="lost pods: 12 runs on 12 PRs died with their build node 14:05–14:19 UTC",
+                          incident={"prs": [1275, 1246], "runs": 12, "window_start": "2026-09-08T14:05:52+00:00", "window_end": "2026-09-08T14:19:16+00:00", "nodes": {"gke-kube-agents-prow-default-pool-eb220b2a-sgnk": 3}, "event": True})
+        out = render_to(pathlib.Path(self.tmp.name) / "lost", self.data, health=lost)
+        run_app = dom_text(out / "run.html", query="build=2097282860221206528")
+        self.assertIn("<b>Build nodes lost right now</b> since Tue 10:30 AM ET: runs died with the node under them; nothing about the branch.", run_app)
+        self.assertNotIn("Gate outage", run_app)
+        self.assertIn('lost_pods: 2 * 3600 * 1000', (out / "index.html").read_text())
+
     def test_recovering_brief(self):
         app = self.render_state(health_doc(recovering=True), "rec")
         self.assertIn("RECOVERING · since Tue 5:00 AM ET", app)

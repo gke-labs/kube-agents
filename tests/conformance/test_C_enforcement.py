@@ -1156,7 +1156,25 @@ class C5PrivilegedControllersAreBounded(unittest.TestCase):
         )
 
     def test_C5_no_agent_binding_names_the_auth_delegator_role(self) -> None:
-        """The shortcut the test above exists to keep closed."""
+        """The shortcut the test above exists to keep closed.
+
+        Scoped to the agent, and the name says so. The four golden fixtures
+        are all `mode: today`, and under `mode: next` the operator DOES bind
+        system:auth-delegator -- to the auth callout's own ServiceAccount, so
+        it can TokenReview the tokens bus clients present. That is the role's
+        intended use by a component whose whole job is validating tokens, and
+        it is bounded on the Go side instead: the operator's own grant is
+        `bind` restricted by resourceNames to this one role (A4), and in
+        platformagent_a2a_callout_test.go TestA2ACalloutIsGatedByMode asserts
+        the binding's roleRef while
+        TestEveryA2ABindingNamesOnlyTheServiceAccountItsWorkloadRunsAs asserts
+        it names exactly one subject, the callout's own ServiceAccount in the
+        agent's namespace.
+
+        What no fixture covers is the rendered mode: next object set, so this
+        invariant cannot yet be asserted over it. A golden_a2a_next fixture is
+        the way to close that, and it is owed rather than done.
+        """
         for name, documents in h.golden_documents().items():
             for kind in ("RoleBinding", "ClusterRoleBinding"):
                 for binding in h.objects_of_kind(documents, kind):

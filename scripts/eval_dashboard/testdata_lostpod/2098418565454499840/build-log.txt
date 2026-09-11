@@ -1,0 +1,23 @@
+Environment setup
+# Final SHA: 
+# Total runtime: 0s
+# FAILED
+# Cloning gke-labs/kube-agents at main(57efd2d15e193067c5a8276d0e53d3dcf4750ba1)
+# Checking out pulls:
+#	1446(fd4420b2325c6d2fbdd18e3f979e8874c056366d)
+$ PWD=/  mkdir -p /home/prow/go/src/github.com/gke-labs/kube-agents (runtime: 1.597893ms)
+[... clone transcript trimmed for the fixture ...]
+Auto-merging scripts/eval_dashboard/collect.py
+CONFLICT (content): Merge conflict in scripts/eval_dashboard/collect.py
+Auto-merging scripts/eval_dashboard/health.py
+Auto-merging scripts/eval_dashboard/render.py
+Auto-merging scripts/eval_dashboard/template/index.html.tmpl
+Auto-merging scripts/test_eval_dashboard.py
+Auto-merging scripts/test_eval_dashboard_collect.py
+CONFLICT (content): Merge conflict in scripts/test_eval_dashboard_collect.py
+Auto-merging scripts/test_eval_dashboard_health.py
+Auto-merging tests/test_eval_dashboard_refresh.py
+Automatic merge failed; fix conflicts and then commit the result.
+# Error: exit status 1
+# Final SHA: 
+# Total runtime: 0s

@@ -180,7 +180,7 @@ currently fails.
 | C5  | no minted role grants a write verb                               | 1        | `test_C5_no_minted_role_grants_a_write_verb`                          | the blueprints operator minting ClusterRoleBindings from a namespaced CRD with no ceiling                                                                                                                          |
 | C5  | the leader role stays confined to coordination                   | 1        | `test_C5_the_leader_role_stays_confined_to_coordination`              | —                                                                                                                                                                                                                  |
 | C5  | the tokenreview role is the narrowest form of itself             | 1        | `test_C5_the_tokenreview_role_is_the_narrowest_form_of_itself`        | binding `system:auth-delegator` for one verb, and getting subjectaccessreviews with it                                                                                                                             |
-| C5  | no binding names `system:auth-delegator`                         | 1        | `test_C5_no_agent_binding_names_the_auth_delegator_role`              | —                                                                                                                                                                                                                  |
+| C5  | no _agent_ binding names `system:auth-delegator`                 | 1        | `test_C5_no_agent_binding_names_the_auth_delegator_role`              | —                                                                                                                                                                                                                  |
 | C5  | the agent is bound to no write-capable built-in role             | 1        | `test_C5_the_agent_is_bound_to_no_write_capable_builtin_role`         | read-only rules next to a binding to `edit`                                                                                                                                                                        |
 | C5  | the controller does not reap the metadata-deny guardrail         | 1        | `test_C5_the_controller_does_not_reap_the_metadata_deny_guardrail`    | **slice 2b 1.5**: `deleteLegacyCredentialIsolationResources` garbage-collecting a whole shipped isolation design, with a test holding it down                                                                      |
 | C5  | the admission binding names a policy that exists                 | 1        | `test_C5_the_admission_binding_names_a_policy_that_exists`            | **slice 2b 1.2**: `namePrefix` rewriting `metadata.name` and not `spec.policyName`                                                                                                                                 |
@@ -244,14 +244,17 @@ python3 hack/conformance-mutations.py --list
 python3 hack/conformance-mutations.py -k C1    # substring filter on the id
 ```
 
-82 mutations: 63 KILLED, 17 NOISY, two `must_survive` controls (one on the
+86 mutations: 66 KILLED, 18 NOISY, two `must_survive` controls (one on the
 harness itself, one pinning a deliberate redundancy in the shorthand
-handling), zero genuine survivors, zero stale — measured 2026-09-09 against
-`main`; re-run the harness rather than trusting these numbers, which is the
-sentence this paragraph exists to make cheap. Each names the control
-it removes, the test that must notice, and the plausible bad change it
-imitates. It is not run in CI — it edits tracked files in place — so it is a
-thing to run when adding a test, which step 4 below says to do.
+handling), zero genuine survivors, zero stale — measured 2026-09-11 against
+this branch merged with `main`; re-run the harness rather than trusting these
+numbers, which is the sentence this paragraph exists to make cheap. Note that
+the summary line the harness prints accounts for 84 of the 86: a `must_survive`
+control's verdict is `SURVIVED (expected)`, which is neither killed, noisy, nor
+a survivor. Each names the control it removes, the test that must notice, and
+the plausible bad change it imitates. It is not run in CI — it edits tracked
+files in place — so it is a thing to run when adding a test, which step 4
+below says to do.
 
 **The coverage of that set is checked by the suite, because it rotted once.**
 The first version of this file claimed every test had been mutation-verified
