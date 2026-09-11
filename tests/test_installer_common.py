@@ -933,6 +933,159 @@ class InstallerCommonTest(unittest.TestCase):
             content = dest.read_text()
             self.assertIn('google_chat_home_channel  = "spaces/TEST12345"', content)
 
+    def test_google_chat_derived_subscription_written_to_tfvars(self):
+        with tempfile.TemporaryDirectory() as out_dir:
+            dest = pathlib.Path(out_dir) / "terraform.tfvars"
+            # 1. Custom topic with unset subscription and no state derives <topic>-sub
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={
+                    "API_SERVER_KEY": "k",
+                    "GOOGLE_CHAT_ENABLED": "true",
+                    "CHAT_TOPIC_NAME": "custom-chat-events",
+                },
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn('chat_topic_name           = "custom-chat-events"', content)
+            self.assertIn('chat_subscription_name    = "custom-chat-events-sub"', content)
+
+            # 2. Custom topic with state managing legacy default subscription recovers state value
+            legacy_state = _state_doc([{
+                "module": "module.chat_pubsub[0]",
+                "mode": "managed",
+                "type": "google_pubsub_subscription",
+                "name": "chat_events",
+                "instances": [{"attributes": {"name": "platform-agent-chat-events-sub"}}],
+            }])
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                gcloud_stdout=legacy_state,
+                env={
+                    "API_SERVER_KEY": "k",
+                    "GOOGLE_CHAT_ENABLED": "true",
+                    "CHAT_TOPIC_NAME": "custom-chat-events",
+                },
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn('chat_topic_name           = "custom-chat-events"', content)
+            self.assertIn('chat_subscription_name    = "platform-agent-chat-events-sub"', content)
+
+            # 3. Custom topic with explicit custom subscription retains explicit value
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={
+                    "API_SERVER_KEY": "k",
+                    "GOOGLE_CHAT_ENABLED": "true",
+                    "CHAT_TOPIC_NAME": "custom-chat-events",
+                    "CHAT_SUB_NAME": "my-explicit-sub",
+                },
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn('chat_subscription_name    = "my-explicit-sub"', content)
+
+            # 4. Custom topic with derived subscription (e.g. exported by install.sh) writes derived value
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={
+                    "API_SERVER_KEY": "k",
+                    "GOOGLE_CHAT_ENABLED": "true",
+                    "CHAT_TOPIC_NAME": "custom-chat-events",
+                    "CHAT_SUB_NAME": "custom-chat-events-sub",
+                },
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn('chat_subscription_name    = "custom-chat-events-sub"', content)
+
+            # 5. Default topic retains default subscription
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={
+                    "API_SERVER_KEY": "k",
+                    "GOOGLE_CHAT_ENABLED": "true",
+                },
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn('chat_topic_name           = "platform-agent-chat-events"', content)
+            self.assertIn('chat_subscription_name    = "platform-agent-chat-events-sub"', content)
+
+            # 6. Custom topic with recorded default subscription re-derives when state has no subscription (#1397)
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={
+                    "API_SERVER_KEY": "k",
+                    "GOOGLE_CHAT_ENABLED": "true",
+                    "CHAT_TOPIC_NAME": "custom-chat-events",
+                    "CHAT_SUB_NAME": "platform-agent-chat-events-sub",
+                },
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn('chat_topic_name           = "custom-chat-events"', content)
+            self.assertIn('chat_subscription_name    = "custom-chat-events-sub"', content)
+
+            # 7. Unreadable state emits a warning to stderr (not into tfvars stdout) and proceeds
+            proc = self._run(
+                f'print_warning() {{ echo "WARN: $*"; }}; write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                gcloud_stderr="ERROR: 403 Forbidden",
+                gcloud_exit=1,
+                env={
+                    "API_SERVER_KEY": "k",
+                    "GOOGLE_CHAT_ENABLED": "true",
+                    "CHAT_TOPIC_NAME": "custom-chat-events",
+                },
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertIn("Could not determine if Google Chat Pub/Sub subscription is in Terraform state", proc.stderr)
+            content = dest.read_text()
+            self.assertNotIn("Could not determine", content)
+            self.assertNotIn("WARN:", content)
+            self.assertIn('chat_topic_name           = "custom-chat-events"', content)
+            self.assertIn('chat_subscription_name    = "custom-chat-events-sub"', content)
+
+            # 8. Chat disabled never probes state even if state is unreadable
+            proc = self._run(
+                f'print_warning() {{ echo "WARN: $*"; }}; write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                gcloud_stderr="ERROR: 403 Forbidden",
+                gcloud_exit=1,
+                env={
+                    "API_SERVER_KEY": "k",
+                    "GOOGLE_CHAT_ENABLED": "false",
+                    "CHAT_TOPIC_NAME": "custom-chat-events",
+                },
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            self.assertNotIn("Could not determine", proc.stderr)
+            self.assertNotIn("WARN:", proc.stderr)
+
+    def test_tf_state_chat_subscription_name_returns_name(self):
+        state = _state_doc([{
+            "module": "module.chat_pubsub[0]",
+            "mode": "managed",
+            "type": "google_pubsub_subscription",
+            "name": "chat_events",
+            "instances": [{"attributes": {"name": "test-chat-sub"}}],
+        }])
+        proc = self._run(
+            'tf_state_chat_subscription_name; echo "rc=$?"',
+            gcloud_stdout=state,
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn("test-chat-sub", proc.stdout)
+
+    def test_tf_state_chat_subscription_name_empty_when_absent(self):
+        state = _state_doc([])
+        proc = self._run(
+            'sub="$(tf_state_chat_subscription_name)"; echo "sub=$sub rc=$?"',
+            gcloud_stdout=state,
+        )
+        self.assertIn("rc=0", proc.stdout, proc.stderr)
+        self.assertIn("sub= rc=0", proc.stdout)
+
     def test_minter_deferred_without_an_enabled_key_version(self):
         # A minter whose KMS key holds no ENABLED version never passes
         # readiness, and the apply waits on it — the generator defers.

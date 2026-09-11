@@ -975,6 +975,26 @@ Mutation(
         "entering it costs an argument",
     ),
     Mutation(
+        "C1-session-fence-selector-drift",
+        "a2a/gateway/spawn.go",
+        ('\tsessionRole = "a2a-session"', '\tsessionRole = "a2a-worker"'),
+        "test_C1_the_session_fence_selects_the_pods_the_spawner_stamps",
+        "rename the session pod's component label on the spawner side only -- "
+        "the shape a rename that misses the other Go module takes. Both Go "
+        "suites stay green and the operator's NetworkPolicy then selects no "
+        "pod, which the API server reports as success",
+    ),
+    Mutation(
+        "C1-session-pod-gets-an-identity",
+        "a2a/gateway/spawn.go",
+        ("AutomountServiceAccountToken: ptr.To(false),",
+         "AutomountServiceAccountToken: ptr.To(true),"),
+        "test_C1_a_session_pod_carries_no_kubernetes_identity",
+        "mount the default ServiceAccount token into a session pod, giving the "
+        "model-directed worker a Kubernetes identity the session fence's rule "
+        "set was written on the assumption it did not have",
+    ),
+    Mutation(
         "harness-fixture-emptied",
         "k8s-operator/internal/testing/testdata/platform/expected/platformagent.yaml",
         ("\nkind: StatefulSet\n", "\nkind: StatefulSetXX\n"),

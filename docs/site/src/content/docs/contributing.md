@@ -24,7 +24,7 @@ This project follows [Google's Open Source Community Guidelines](https://opensou
 - **Commit style.** [Conventional Commits](https://www.conventionalcommits.org/).
 - **Branch location.** Push PR branches to your fork, not to the upstream repository.
 - **PR template.** Use [`.github/PULL_REQUEST_TEMPLATE.md`](https://github.com/gke-labs/kube-agents/blob/main/.github/PULL_REQUEST_TEMPLATE.md). Don't use `--fill` with `gh pr create` — it bypasses the template.
-- **Live validation.** Every PR describes how the change was exercised against a real, running installation. See [Live validation](#live-validation) below.
+- **Live validation.** Every PR describes how the change was exercised against a real, running installation. See [Live validation](#live-validation) below. For a change to what an agent does, that means an eval case seen red against `main` and green three times against the branch ([`.agents/rules/eval_driven_development.md`](https://github.com/gke-labs/kube-agents/blob/main/.agents/rules/eval_driven_development.md)).
 - **Self-review.** Every PR arrives already reviewed by its author, and says what that review found. See [Self-review](#self-review) below.
 
 ## Local validation

@@ -413,10 +413,26 @@ first two is America/Toronto ("ET"), formatted in the browser with
 | `run.html`    | **The PR view**, `run.html?build=<prow build id>`: one run, each failed gate case tagged `failing on N other PRs` / `only your PR` / `quota storm` / `unexplained` with its check reason, 30-day pass rate, transcript link and a one-line Do; a "what to do" box. |
 | `legacy.html` | The two-band page (agent trend, gate matrix, Pareto — presubmit runs only) and the evidence table, the per-case view: presubmit depth and nightly count, pass rate over reps for each tier at 7 and 30 days, and which matrix runs the case.                       |
 
-The Brief and the PR view render in the browser from `brief.json` (below)
-and refetch it and `health.json` every 60 seconds. `classify.py` is the one
-place the "is this red mine?" rule lives; the pages read its answer through
-`brief.json`, and anything else that answers the question imports it.
+The Brief and the PR view render in the browser from `brief.json` (below),
+which `render.py` inlines into each page as
+`<script type="application/json" id="inline-brief">` (the verdict it read,
+the same document as `brief.health`, again as `inline-health`), so a page
+needs no request beyond itself;
+the poll of the published `brief.json` and `health.json` every 60 seconds
+is a best-effort refresh on top, and the legacy page polls `data.json` the
+same way. That matters on `storage.cloud.google.com`, which answers an XHR
+with a login redirect: the pages still render whole there. The header
+badge says `updated <time> · Nm ago`, plus `· regenerated every 15 min`
+while no poll has succeeded (the workflow republishes every page on that
+cron, so that is how old the inlined copy can be); `STALE` is prepended
+only when the data's `generated_at` is older than its `stale_after_s`.
+`render.py --public-url [BASE]` emits `<base href>` so every relative link
+resolves to the published site wherever the browser landed after the
+login redirect; the bare flag means `post_health.DASHBOARD_URL`'s
+directory, and without the flag links stay relative for a local render.
+`classify.py` is the one place the "is this red mine?" rule lives; the
+pages read its answer through `brief.json`, and anything else that answers
+the question imports it.
 
 ### URL contract
 

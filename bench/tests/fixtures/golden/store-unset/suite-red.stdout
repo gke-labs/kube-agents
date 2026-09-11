@@ -1,0 +1,16 @@
+exit 1
+## Evaluation verdict
+
+**RED**
+
+Admitted-case pass rate: 50.0% (no baseline at the current version key -- advisory)
+
+### Why it is red
+
+- agent-kanban-smoke: rung 4 (COLLAPSE) -- failed all 3 repetitions, and this case is admitted (it has screening evidence that it passes reliably): VerificationCorrectness=0.5 (floor 1.0) -- report-states-the-probe-title: required phrases absent from the report: ['devops-bench smoke probe']
+
+| Case | Domain | Verdict | Passes | Detail |
+| --- | --- | --- | --- | --- |
+| `agent-kanban-smoke` | chat-and-routing | FAILED (rung 4) | 0/3 | failed all 3 repetitions, and this case is admitted (it has screening evidence that it passes reliably): VerificationCorrectness=0.5 (floor 1.0) -- report-states-the-probe-title: required phrases absent from the report: ['devops-bench smoke probe'] |
+| `agent-kanban-smoke` | chat-and-routing | PASSED (rung 7) | 3/3 | passed all 3 repetitions |
+

@@ -815,6 +815,114 @@ run_menu_system "."
         self.assertEqual(proc.returncode, 0, f"Failed: {proc.stderr}")
         self.assertIn("VERIFIED_IMAGE_TAG=0.4.0", proc.stdout)
 
+    def test_run_menu_system_derives_chat_sub_name_on_save_and_apply(self):
+        """Verifies run_menu_system derives CHAT_SUB_NAME from custom topic when saving."""
+        cmd = """
+has_controlling_tty() { return 0; }
+prompt_menu() {
+  local var="${!#}"
+  printf -v "$var" "%s" "6"
+}
+resolve_effective_image_tag() { return 0; }
+validate_immutable_ref() { return 0; }
+verify_local_source_ref() { return 0; }
+print_success() {
+  if [[ "$1" == *"Updated configuration saved to"* ]]; then
+    exit 0
+  fi
+}
+tf_state_chat_subscription_name() { return 0; }
+
+PROJECT_ID="test-project"
+GOOGLE_CHAT_ENABLED="true"
+CHAT_TOPIC_NAME="custom-topic"
+run_menu_system "."
+"""
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, f"Failed: {proc.stderr}")
+        env_content = self._empty_install_env.read_text()
+        self.assertIn("CHAT_SUB_NAME=custom-topic-sub", env_content)
+
+    def test_run_menu_system_recovers_chat_sub_name_from_state_on_save_and_apply(self):
+        """Verifies run_menu_system recovers existing subscription from state when saving."""
+        cmd = """
+has_controlling_tty() { return 0; }
+prompt_menu() {
+  local var="${!#}"
+  printf -v "$var" "%s" "6"
+}
+resolve_effective_image_tag() { return 0; }
+validate_immutable_ref() { return 0; }
+verify_local_source_ref() { return 0; }
+print_success() {
+  if [[ "$1" == *"Updated configuration saved to"* ]]; then
+    exit 0
+  fi
+}
+gcloud() {
+  if [ "$1" = "storage" ] && [ "$2" = "cat" ]; then
+    cat <<'EOF'
+{
+  "resources": [
+    {
+      "mode": "managed",
+      "type": "google_pubsub_subscription",
+      "name": "chat_events",
+      "instances": [
+        {
+          "attributes": {
+            "name": "managed-state-sub"
+          }
+        }
+      ]
+    }
+  ]
+}
+EOF
+    return 0
+  fi
+  command gcloud "$@"
+}
+
+PROJECT_ID="test-project"
+GOOGLE_CHAT_ENABLED="true"
+CHAT_TOPIC_NAME="custom-topic"
+run_menu_system "."
+"""
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, f"Failed: {proc.stderr}")
+        env_content = self._empty_install_env.read_text()
+        self.assertIn("CHAT_SUB_NAME=managed-state-sub", env_content)
+
+    def test_run_menu_system_rederives_when_recorded_sub_equals_default_and_state_empty(self):
+        """Verifies run_menu_system re-derives custom-topic subscription if recorded sub is default and state is empty."""
+        cmd = """
+has_controlling_tty() { return 0; }
+prompt_menu() {
+  local var="${!#}"
+  printf -v "$var" "%s" "6"
+}
+resolve_effective_image_tag() { return 0; }
+validate_immutable_ref() { return 0; }
+verify_local_source_ref() { return 0; }
+print_success() {
+  if [[ "$1" == *"Updated configuration saved to"* ]]; then
+    exit 0
+  fi
+}
+tf_state_chat_subscription_name() { return 0; }
+
+PROJECT_ID="test-project"
+GOOGLE_CHAT_ENABLED="true"
+CHAT_TOPIC_NAME="custom-topic"
+CHAT_SUB_NAME="platform-agent-chat-events-sub"
+run_menu_system "."
+"""
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, f"Failed: {proc.stderr}")
+        env_content = self._empty_install_env.read_text()
+        self.assertIn("CHAT_SUB_NAME=custom-topic-sub", env_content)
+
     def test_verify_local_source_ref_accepts_baked_release_in_non_git_dir(self):
         """Verifies verify_local_source_ref succeeds for unpacked release archive without Git repository."""
         with tempfile.TemporaryDirectory(prefix="unpacked-release-") as outer_dir:
@@ -2530,7 +2638,7 @@ class SlackPromptsKeepTheirCurrentValuesTest(unittest.TestCase):
         )
 
     def test_each_google_chat_prompt_defaults_to_its_own_current_value(self):
-        for var in ("allowed_users", "chat_topic_name", "google_chat_home_channel"):
+        for var in ("allowed_users", "chat_topic_name", "chat_sub_name", "google_chat_home_channel"):
             with self.subTest(var=var):
                 self.assertRegex(
                     self._SOURCE,
@@ -3251,6 +3359,174 @@ echo "RC=$rc"
         self.assertIn('print_warning "$deployment did not report ready (after ${ROLLOUT_ELAPSED_SECS}s)."', source)
         self.assertIn("ROLLOUT_ELAPSED_SECS=$((SECONDS - started))", source)
         self.assertNotIn('print_warning "$deployment did not report ready within ${ROLLOUT_TIMEOUT_SECS}s."', source)
+
+
+class ChatSubscriptionDerivationTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self._empty_install_env = pathlib.Path(tmp.name) / "install.env"
+        self._empty_install_env.write_text("")
+
+    def _run_install_func(self, func_call, env=None):
+        setup = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
+source_provisioning_helpers . >/dev/null
+{func_call}
+"""
+        overrides = {"KUBE_AGENTS_INSTALL_ENV": str(self._empty_install_env)}
+        overrides.update(env or {})
+        full_env = get_isolated_test_env(overrides=overrides)
+        return subprocess.run(
+            ["bash", "-c", setup],
+            capture_output=True,
+            text=True,
+            env=full_env,
+            cwd=str(_REPO_ROOT),
+        )
+
+    def test_default_topic_derives_default_subscription(self):
+        proc = self._run_install_func('echo "SUB=$(derive_chat_sub_name)"')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SUB=platform-agent-chat-events-sub", proc.stdout)
+
+    def test_custom_topic_derives_matching_subscription(self):
+        proc = self._run_install_func('echo "SUB=$(derive_chat_sub_name "my-custom-topic")"')
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SUB=my-custom-topic-sub", proc.stdout)
+
+    def test_custom_topic_with_empty_sub_derives(self):
+        proc = self._run_install_func(
+            'echo "SUB=$(derive_chat_sub_name "my-custom-topic" "")"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SUB=my-custom-topic-sub", proc.stdout)
+
+    def test_custom_topic_with_explicit_default_sub_is_preserved(self):
+        proc = self._run_install_func(
+            'echo "SUB=$(derive_chat_sub_name "my-custom-topic" "platform-agent-chat-events-sub")"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SUB=platform-agent-chat-events-sub", proc.stdout)
+
+    def test_explicit_custom_subscription_wins(self):
+        proc = self._run_install_func(
+            'echo "SUB=$(derive_chat_sub_name "my-custom-topic" "explicit-sub-name")"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SUB=explicit-sub-name", proc.stdout)
+
+    def test_custom_topic_ignores_ambient_chat_sub_name_when_not_passed(self):
+        proc = self._run_install_func(
+            'echo "SUB=$(derive_chat_sub_name "my-custom-topic")"',
+            env={"CHAT_SUB_NAME": "stale-env-sub"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SUB=my-custom-topic-sub", proc.stdout)
+
+    def test_parse_args_supports_chat_sub_name_flag(self):
+        proc = self._run_install_func(
+            'parse_args --chat-sub-name=custom-sub; echo "SUB=$PARAM_CHAT_SUB_NAME"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SUB=custom-sub", proc.stdout)
+
+    def test_resolve_shared_defaults_leaves_chat_sub_name_empty_when_unset(self):
+        proc = self._run_install_func(
+            'PARAM_CHAT_TOPIC_NAME="custom-events"; resolve_shared_defaults; echo "SUB=${PARAM_CHAT_SUB_NAME:-EMPTY}"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SUB=EMPTY", proc.stdout)
+
+    def test_resolve_shared_defaults_preserves_explicit_chat_sub_name(self):
+        proc = self._run_install_func(
+            'PARAM_CHAT_TOPIC_NAME="custom-events"; PARAM_CHAT_SUB_NAME="my-sub"; resolve_shared_defaults; echo "SUB=$PARAM_CHAT_SUB_NAME"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SUB=my-sub", proc.stdout)
+
+    def test_prompt_google_chat_settings_rederives_when_flag_unset(self):
+        body = pathlib.Path(_INSTALL_SH).read_text().split("_prompt_google_chat_settings() {")[1].split('case "$chat_choice" in')[0].strip()
+        proc = self._run_install_func(f"""
+prompt_read() {{
+  local prompt="$1" var="$2" default_val="${{3:-}}"
+  if [ "$var" = "chat_topic_name" ]; then
+    eval "$var=\\"operator-custom-topic\\""
+  else
+    eval "$var=\\"$default_val\\""
+  fi
+}}
+allowed_users="" allowed_users_hint="" chat_topic_name="platform-agent-chat-events" chat_sub_name="" PARAM_CHAT_SUB_NAME="" google_chat_home_channel=""
+_prompt_google_chat_settings() {{
+{body}
+_prompt_google_chat_settings
+echo "DERIVED_SUB=$chat_sub_name"
+""")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("DERIVED_SUB=operator-custom-topic-sub", proc.stdout)
+
+    def test_prompt_google_chat_settings_preserves_explicit_flag(self):
+        body = pathlib.Path(_INSTALL_SH).read_text().split("_prompt_google_chat_settings() {")[1].split('case "$chat_choice" in')[0].strip()
+        proc = self._run_install_func(f"""
+prompt_read() {{
+  local prompt="$1" var="$2" default_val="${{3:-}}"
+  if [ "$var" = "chat_topic_name" ]; then
+    eval "$var=\\"operator-custom-topic\\""
+  else
+    eval "$var=\\"$default_val\\""
+  fi
+}}
+allowed_users="" allowed_users_hint="" chat_topic_name="platform-agent-chat-events" chat_sub_name="pinned-sub" PARAM_CHAT_SUB_NAME="pinned-sub" google_chat_home_channel="" project_id="p" cluster_name="c"
+_prompt_google_chat_settings() {{
+{body}
+_prompt_google_chat_settings
+echo "DERIVED_SUB=$chat_sub_name"
+""")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("DERIVED_SUB=pinned-sub", proc.stdout)
+
+    def test_prompt_google_chat_settings_rederives_when_param_is_recorded_default(self):
+        body = pathlib.Path(_INSTALL_SH).read_text().split("_prompt_google_chat_settings() {")[1].split('case "$chat_choice" in')[0].strip()
+        proc = self._run_install_func(f"""
+prompt_read() {{
+  local prompt="$1" var="$2" default_val="${{3:-}}"
+  if [ "$var" = "chat_topic_name" ]; then
+    eval "$var=\\"operator-custom-topic\\""
+  else
+    eval "$var=\\"$default_val\\""
+  fi
+}}
+allowed_users="" allowed_users_hint="" chat_topic_name="platform-agent-chat-events" chat_sub_name="platform-agent-chat-events-sub" PARAM_CHAT_SUB_NAME="platform-agent-chat-events-sub" google_chat_home_channel="" project_id="p" cluster_name="c"
+_prompt_google_chat_settings() {{
+{body}
+_prompt_google_chat_settings
+echo "DERIVED_SUB=$chat_sub_name"
+""")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("DERIVED_SUB=operator-custom-topic-sub", proc.stdout)
+
+    def test_prompt_google_chat_settings_recovers_state_subscription(self):
+        body = pathlib.Path(_INSTALL_SH).read_text().split("_prompt_google_chat_settings() {")[1].split('case "$chat_choice" in')[0].strip()
+        proc = self._run_install_func(f"""
+prompt_read() {{
+  local prompt="$1" var="$2" default_val="${{3:-}}"
+  if [ "$var" = "chat_topic_name" ]; then
+    eval "$var=\\"operator-custom-topic\\""
+  else
+    eval "$var=\\"$default_val\\""
+  fi
+}}
+tf_state_chat_subscription_name() {{
+  echo "legacy-managed-sub"
+}}
+allowed_users="" allowed_users_hint="" chat_topic_name="platform-agent-chat-events" chat_sub_name="" PARAM_CHAT_SUB_NAME="" google_chat_home_channel="" project_id="p" cluster_name="c"
+_prompt_google_chat_settings() {{
+{body}
+_prompt_google_chat_settings
+echo "DERIVED_SUB=$chat_sub_name"
+""")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("DERIVED_SUB=legacy-managed-sub", proc.stdout)
 
 
 @unittest.skipUnless(hasattr(pty, "fork"), "run_with_spinner's terminal branch needs a pty")

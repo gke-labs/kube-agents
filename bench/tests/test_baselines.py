@@ -697,3 +697,62 @@ def test_blocked_and_infra_counts_stay_out_of_the_rate(tmp_path):
     [got] = BaselineStore.load(tmp_path).history_for("planted-pdb")
     assert (got.runs, got.passes, got.blocked) == (2, 2, 1)
     assert got.rate == 1.0
+
+
+# --------------------------------------------------------------------------
+# Who decides: the record once it holds a full window, the bootstrap list
+# until then. `admission()` is `is_admitted()` with the source attached.
+# --------------------------------------------------------------------------
+
+
+def test_the_record_overrides_the_bootstrap_list_once_it_holds_a_full_window(tmp_path):
+    """A list that could overrule the evidence it bridges toward would never
+    be safe to delete. 12/20 turns the case away, listed or not."""
+    write_store(tmp_path, "planted-pdb", [record(runs=20, passes=12)])
+    store = BaselineStore.load(tmp_path)
+    decision = store.admission(
+        "planted-pdb", KEY, bar=AdmissionBar(), bootstrap=frozenset({"planted-pdb"})
+    )
+    assert decision.admitted is False
+    assert decision.source == "record"
+    assert "overrides BOOTSTRAP_ADMITTED" in decision.reason
+    # And a full window that clears the bar admits a case the list never named.
+    write_store(tmp_path, "unlisted", [record(runs=20, passes=20)])
+    decision = BaselineStore.load(tmp_path).admission(
+        "unlisted", KEY, bar=AdmissionBar(), bootstrap=frozenset({"planted-pdb"})
+    )
+    assert decision.admitted is True and decision.source == "record"
+
+
+def test_the_bootstrap_list_is_the_fallback_while_the_record_cannot_judge(tmp_path):
+    """Nothing, stale, or collecting: the list decides, and the reason says
+    which of the three the store is in -- except for nothing, where the
+    sentence is the one the list has always produced."""
+    listed = frozenset({"planted-pdb"})
+    bare = BaselineStore.load(tmp_path).admission(
+        "planted-pdb", KEY, bar=AdmissionBar(), bootstrap=listed
+    )
+    assert bare.admitted is True and bare.source == "bootstrap"
+    assert bare.reason == "admitted by BOOTSTRAP_ADMITTED (transition bridge)"
+
+    import dataclasses
+
+    old_key = dataclasses.replace(KEY, judge_model="gemini-3.0-judge")
+    write_store(tmp_path, "planted-pdb", [record(old_key, runs=20, passes=20)])
+    stale = BaselineStore.load(tmp_path).admission(
+        "planted-pdb", KEY, bar=AdmissionBar(), bootstrap=listed
+    )
+    assert stale.admitted is True and stale.source == "bootstrap"
+    assert "stale:" in stale.reason
+
+    write_store(tmp_path, "planted-pdb", [record(runs=9, passes=9)])
+    collecting = BaselineStore.load(tmp_path).admission(
+        "planted-pdb", KEY, bar=AdmissionBar(), bootstrap=listed
+    )
+    assert collecting.admitted is True and collecting.source == "bootstrap"
+    assert "collecting: 9/9" in collecting.reason
+
+    unlisted = BaselineStore.load(tmp_path).admission(
+        "planted-pdb", KEY, bar=AdmissionBar(), bootstrap=frozenset()
+    )
+    assert unlisted.admitted is False and unlisted.source == "neither"

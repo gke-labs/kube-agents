@@ -1131,15 +1131,20 @@ class LiveReadSideTest(unittest.TestCase):
         self.assertIn("staleDefaultS: 7200", self.html)
         self.assertIn('"stale_after_s":600', self.html)
 
-    def test_stale_and_unreachable_states_carry_text_labels(self):
+    def test_stale_state_carries_a_text_label_and_a_failed_poll_is_not_an_alarm(self):
         # A template-contract tripwire, deliberately: the baked page cannot
-        # reach these states server-side (they exist only after a poll), so
-        # this pins the *shipped script* -- the amber badge must always
+        # reach the stale state server-side (it exists only against a clock),
+        # so this pins the *shipped script* -- the amber badge must always
         # carry a written label, never color alone -- scoped to the script
-        # source so it fails if the labels leave the template.
+        # source so it fails if the label leaves the template. A failed poll
+        # is not a state of its own: the page is republished every 15
+        # minutes, so the badge says that and stays un-amber (the published
+        # host answers every XHR with a login redirect).
         js = script_source(self.html)
         self.assertIn("`STALE · ${text}`", js)
-        self.assertIn("`UNREACHABLE · ${text}`", js)
+        self.assertNotIn("UNREACHABLE", js)
+        self.assertIn("regenerated every ${DASH.republishMinutes} min", js)
+        self.assertIn("republishMinutes: 15", js)
         self.assertIn(".fresh.stale", self.html)
 
     def test_notes_travel_with_the_bootstrap(self):
@@ -1171,7 +1176,7 @@ class LiveReadSideTest(unittest.TestCase):
         # bare Date.parse reads one as local time, so the mirror appends
         # "Z" -- otherwise every day bucket and week window would shift
         # for a viewer outside UTC. Contract tripwire on the shipped
-        # script, like the STALE/UNREACHABLE labels.
+        # script, like the STALE label.
         self.assertIn('text += "Z"', script_source(self.html))
 
 

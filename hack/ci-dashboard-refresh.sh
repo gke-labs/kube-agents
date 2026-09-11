@@ -223,6 +223,10 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
   render_args=()
   [ -f "$2/health.json" ] && render_args+=(--health "$2/health.json")
   [ -f "$2/health-history.jsonl" ] && render_args+=(--health-history "$2/health-history.jsonl")
+  # A bucket target is the published site: --public-url (bare) emits
+  # <base href> for post_health.DASHBOARD_URL'"'"'s host, so the pages link
+  # there wherever the browser landed. A local directory keeps relative links.
+  case "$3" in gs://*) render_args+=(--public-url) ;; esac
   python3 "$1/render.py" --data "$2/data.json" --out-dir "$2/site" "${render_args[@]}"
   python3 "$1/publish.py" --out-dir "$2/site" --target "$3"
 ' _ "${DASH_SRC}" "${WORK}" "${EVAL_DASHBOARD_TARGET}" "${EVAL_DASHBOARD_PR_GLOB}" \

@@ -69,6 +69,7 @@ def _clean_env(monkeypatch):
         "JUDGE_MODEL",
         "DETERMINISTIC_CORRECTNESS_FLOOR",
         "EVAL_AGGREGATE_MARGIN",
+        "EVAL_AGGREGATE_ARMED",
         "EVAL_ADMISSION_RATE",
         "EVAL_ADMISSION_MIN_RUNS",
         "EVAL_JUDGED_MARGIN",
@@ -377,7 +378,8 @@ def test_the_markdown_escapes_a_pipe_in_a_reason(tmp_path):
     assert row.count("|") - row.count(r"\|") == 6
 
 
-def test_the_suite_json_records_the_aggregate(tmp_path):
+def test_the_suite_json_records_the_aggregate(tmp_path, monkeypatch):
+    monkeypatch.setenv("EVAL_AGGREGATE_ARMED", "1")
     out = tmp_path / "suite.json"
     main(
         ["suite", "--case-result", str(case_file(tmp_path, "a", passes=1, scored=4)),
@@ -390,11 +392,36 @@ def test_the_suite_json_records_the_aggregate(tmp_path):
 
 def test_the_aggregate_margin_comes_from_the_environment(tmp_path, monkeypatch):
     """0.25 against a 0.9 baseline: red at the default margin, green at 0.9."""
+    monkeypatch.setenv("EVAL_AGGREGATE_ARMED", "1")
     path = case_file(tmp_path, "a", passes=1, scored=4)
     args = ["suite", "--case-result", str(path), "--baseline-rate", "0.9", "--min-scored", "1"]
     assert main(args) == 1
     monkeypatch.setenv("EVAL_AGGREGATE_MARGIN", "0.9")
     assert main(args) == 0
+
+
+def test_the_aggregate_is_advisory_until_the_environment_arms_it(
+    tmp_path, monkeypatch, capsys
+):
+    """Same input as above, nothing armed: the finding is printed, the job is green.
+
+    The margin has never been measured against how much an unchanged pull
+    request moves the aggregate on main, so the rule ships reporting rather
+    than blocking. Only the documented spellings arm it; "0" does not.
+    """
+    path = case_file(tmp_path, "a", passes=1, scored=4)
+    args = ["suite", "--case-result", str(path), "--baseline-rate", "0.9", "--min-scored", "1"]
+    assert main(args) == 0
+    printed = capsys.readouterr().out
+    assert "**GREEN**" in printed
+    assert "below main's 0.900" in printed
+    assert "not armed" in printed and "EVAL_AGGREGATE_ARMED" in printed
+
+    monkeypatch.setenv("EVAL_AGGREGATE_ARMED", "0")
+    assert main(args) == 0
+    for spelling in ("1", "true", "YES"):
+        monkeypatch.setenv("EVAL_AGGREGATE_ARMED", spelling)
+        assert main(args) == 1, spelling
 
 
 def test_the_verdict_is_advisory_with_no_baseline(tmp_path, capsys):
@@ -643,7 +670,8 @@ def test_the_suite_aggregate_comes_from_the_store_not_a_flag(
     assert "advisory" not in printed
 
 
-def test_the_aggregate_reds_when_the_store_says_main_did_better(tmp_path):
+def test_the_aggregate_reds_when_the_store_says_main_did_better(tmp_path, monkeypatch):
+    monkeypatch.setenv("EVAL_AGGREGATE_ARMED", "1")
     store = store_with(
         tmp_path, baseline_line("a", runs=20, passes=20)
     )
@@ -669,6 +697,7 @@ def test_the_shipped_sample_floor_keeps_a_small_run_from_redding(tmp_path, capsy
 
 
 def test_the_sample_floor_comes_from_the_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("EVAL_AGGREGATE_ARMED", "1")
     store = store_with(tmp_path, baseline_line("a", runs=20, passes=20))
     doc = case_file(tmp_path, "a", version_key=KEY, passes=1, scored=4)
     monkeypatch.setenv("EVAL_AGGREGATE_MIN_SCORED", "2")

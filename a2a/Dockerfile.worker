@@ -1,0 +1,59 @@
+# worker-next: the session-pod image - the harness's native binary plus the
+# worker adapter as the entry point.
+#
+# PLAYGROUND POSTURE: this image authenticates to the bus with a static
+# per-component NATS user and reaches the model through the install's
+# LiteLLM with no per-worker credential. Each of these has a decided design
+# in the specs (auth callout, Vertex/WI per profile); none of them gates
+# "Adam can play." Static creds are the playground, not the product.
+
+# Build from the a2a/ module root:
+#   docker build -f Dockerfile.worker -t <registry>/worker-next:<tag> .
+
+# Bases come from images.json, the repo's image inventory, spelled the way
+# a2a/Dockerfile.gateway spells them so `make mirror-images` and the pinning
+# there cover this build too. The exemption in the header above is for the four
+# PUBLISHED a2a images, whose registry is a stage-1 dev one; it does not reach
+# the bases they are built from, which a mirrored or air-gapped build has to be
+# able to resolve like any other.
+ARG GOLANG_IMAGE=golang
+ARG GOLANG_VERSION=1.27-alpine
+ARG NODE_IMAGE=node
+ARG NODE_VERSION=22-slim
+
+# --- adapter build stage ---
+FROM ${GOLANG_IMAGE}:${GOLANG_VERSION} AS build
+# Refuse to download a toolchain the pin above does not name: without this, a
+# substituted GOLANG_IMAGE older than a2a/go.mod's `go` directive silently
+# fetches a newer one instead of failing the build (#1138).
+ENV GOTOOLCHAIN=local
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux \
+    go build -trimpath -ldflags="-w -s" -o /out/worker-adapter ./cmd/worker-adapter
+
+# --- runtime ---
+FROM ${NODE_IMAGE}:${NODE_VERSION}
+
+WORKDIR /app
+# The agent SDK's platform package carries the harness as a native binary at
+# node_modules/@anthropic-ai/claude-agent-sdk-linux-x64/claude, the path
+# DefaultHarnessPath in worker-adapter/harness.go names. Pinned to the
+# version these stream-json shapes were proved against.
+RUN npm install @anthropic-ai/claude-agent-sdk@0.3.236 \
+    && npm cache clean --force
+
+COPY --from=build /out/worker-adapter /usr/local/bin/worker-adapter
+
+# Non-root as the stock node user (UID 1000, matching the spawner's
+# runAsUser); the harness keeps its state under a writable HOME.
+RUN mkdir -p /home/node/.claude /scratch \
+    && chown -R node:node /home/node /app /scratch
+USER node
+ENV HOME=/home/node \
+    CLAUDE_CONFIG_DIR=/home/node/.claude \
+    CLAUDE_CODE_DISABLE_AUTO_MEMORY=1
+
+ENTRYPOINT ["/usr/local/bin/worker-adapter"]

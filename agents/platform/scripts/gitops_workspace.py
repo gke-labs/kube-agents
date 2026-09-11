@@ -64,6 +64,24 @@ import repo_ref
 
 DEFAULT_AGENT_HOME = "/opt/data"
 
+# The two keys of the `<agent>-gitops-state` ConfigMap this module reads.
+#
+# `managed_repos` is the list the agent may *write* to: the credential
+# broker's push gate (`credential_proxy.repository_is_managed`), `resolve_repo`
+# below, and the operator's token-minter policy all read it, so an entry there
+# is a repository the harness can open pull requests against.
+#
+# `context_repos` is the list the agent may only *read* — Terraform or GitOps
+# repositories consulted for declared intent before an audit reports a
+# finding. It is a separate key, and nothing in this module merges it into the
+# managed list, which is what makes a context repository read-only by
+# construction: the broker, the resolver and the operator never see it. A
+# `role: context` marker inside `managed_repos` would instead be flattened by
+# `_parse_repos_json` into a writable entry. The operator's reconcile leaves
+# keys it does not own alone, so a hand-added `context_repos` survives it.
+MANAGED_REPOS_KEY = "managed_repos"
+CONTEXT_REPOS_KEY = "context_repos"
+
 
 def agent_home() -> str:
     """The agent's data root — which is not always `/opt/data`.
@@ -711,8 +729,14 @@ DEFAULT_GITOPS_STATE_PATH = "/etc/gitops/managed_repos"
 GITOPS_STATE_READ_TIMEOUT_SECONDS = 30
 
 
-def _parse_managed_repos_json(repos_str: str) -> list[dict[str, str]]:
-    """Parse JSON string containing list of repo specifications."""
+def _parse_repos_json(repos_str: str, key: str = MANAGED_REPOS_KEY) -> list[dict[str, str]]:
+    """Parse a JSON list of `{type, url}` repository entries under ConfigMap key `key`.
+
+    Both keys share one shape and one parser. What they do not share is a
+    caller: nothing hands a `context_repos` list to anything that gates a
+    write, and keeping the parser ignorant of which list it is parsing is
+    what keeps that true — there is no field it could read to promote one.
+    """
     repos_str = repos_str.strip()
     if not repos_str:
         return []
@@ -728,22 +752,36 @@ def _parse_managed_repos_json(repos_str: str) -> list[dict[str, str]]:
                         if url and repo_type:
                             entries.append({"type": repo_type, "url": url})
         except json.JSONDecodeError as err:
-            LOGGER.warning("Failed to decode managed_repos JSON: %s", err)
+            LOGGER.warning("Failed to decode %s JSON: %s", key, err)
             return []
     else:
-        LOGGER.warning("managed_repos JSON does not start with '[': %r", repos_str)
+        LOGGER.warning("%s JSON does not start with '[': %r", key, repos_str)
         return []
     return entries
 
 
-def get_managed_repo_entries() -> list[dict[str, str]]:
-    """Reads managed repos from the mounted state file or falls back to ConfigMap via kubectl."""
-    state_file_path = os.environ.get("GITOPS_STATE_PATH", DEFAULT_GITOPS_STATE_PATH)
-    state_file = Path(state_file_path)
+def _state_key_path(key: str) -> Path:
+    """Where ConfigMap key `key` lands on disk.
+
+    `GITOPS_STATE_PATH` names the `managed_repos` file. The operator projects
+    the whole ConfigMap as a directory (`gitopsStateDir` in
+    `platformagent_manifests.go`), so every other key is a sibling file under
+    the same parent — `/etc/gitops/context_repos` beside
+    `/etc/gitops/managed_repos` — and one environment variable locates both.
+    """
+    state_file = Path(os.environ.get("GITOPS_STATE_PATH", DEFAULT_GITOPS_STATE_PATH))
+    if key == MANAGED_REPOS_KEY:
+        return state_file
+    return state_file.parent / key
+
+
+def _read_state_key(key: str) -> list[dict[str, str]]:
+    """Read one repository list from the mounted state file, else from the ConfigMap via kubectl."""
+    state_file = _state_key_path(key)
     if state_file.is_file():
         try:
             content = state_file.read_text(encoding="utf-8")
-            return _parse_managed_repos_json(content)
+            return _parse_repos_json(content, key)
         except Exception:
             pass
     elif state_file.parent.is_dir():
@@ -795,25 +833,45 @@ def get_managed_repo_entries() -> list[dict[str, str]]:
             f"Failed to parse ConfigMap {cfg_name} JSON output: {e}"
         ) from e
 
-    repos_str = (cm.get("data") or {}).get("managed_repos", "")
-    return _parse_managed_repos_json(repos_str)
+    repos_str = (cm.get("data") or {}).get(key, "")
+    return _parse_repos_json(repos_str, key)
 
 
-def get_managed_github_repos() -> list[str]:
-    """Extracts managed GitHub repositories ('owner/name' slugs) from the state ConfigMap.
+def get_managed_repo_entries() -> list[dict[str, str]]:
+    """Reads managed repos from the mounted state file or falls back to ConfigMap via kubectl."""
+    return _read_state_key(MANAGED_REPOS_KEY)
+
+
+def get_context_repo_entries() -> list[dict[str, str]]:
+    """The `context_repos` list: repositories read for declared intent, never written.
+
+    Same file-then-kubectl resolution as `get_managed_repo_entries`, and the
+    same known-empty answer when the mount is present without the key. The
+    result is *not* folded into the managed list anywhere — see the key
+    constants at the top of the file for why that separation is the whole
+    safety property.
+    """
+    return _read_state_key(CONTEXT_REPOS_KEY)
+
+
+def _github_slugs(entries: list[dict[str, str]], key: str) -> list[str]:
+    """The GitHub `owner/name` slugs in `entries`, in order, without duplicates.
 
     An entry naming a forge this agent cannot drive is logged rather than
     dropped in silence. It is still skipped — there is one provider — but this
     is the point at which a `type` becomes a choice of provider rather than a
     filter, and the silent version made a registered repository the agent will
-    never touch indistinguishable from one that was never registered.
+    never touch indistinguishable from one that was never registered. `key`
+    names the list in the warning, because both ConfigMap keys come through
+    here and an administrator fixing the entry needs to know which one.
     """
     res: list[str] = []
-    for entry in get_managed_repo_entries():
+    for entry in entries:
         url = entry.get("url", "")
         if entry.get("type") != GITHUB_REPO_TYPE:
             LOGGER.warning(
-                "Skipping managed repository %r: no provider for type %r.",
+                "Skipping %s repository %r: no provider for type %r.",
+                key,
                 url,
                 entry.get("type"),
             )
@@ -821,12 +879,28 @@ def get_managed_github_repos() -> list[str]:
         slug = extract_github_slug(url)
         if not slug:
             LOGGER.warning(
-                "Skipping managed repository %r: not a GitHub repository URL.", url
+                "Skipping %s repository %r: not a GitHub repository URL.", key, url
             )
             continue
         if slug not in res:
             res.append(slug)
     return res
+
+
+def get_managed_github_repos() -> list[str]:
+    """Extracts managed GitHub repositories ('owner/name' slugs) from the state ConfigMap."""
+    return _github_slugs(get_managed_repo_entries(), MANAGED_REPOS_KEY)
+
+
+def get_context_github_repos() -> list[str]:
+    """The GitHub `owner/name` slugs under `context_repos`, in ConfigMap order.
+
+    A slug that also appears in `managed_repos` is returned here too: the
+    caller asked which repositories to read for intent, and the GitOps repo
+    is one of them. Nothing goes the other way — this list never reaches
+    `resolve_repo` or `get_managed_github_repos`.
+    """
+    return _github_slugs(get_context_repo_entries(), CONTEXT_REPOS_KEY)
 
 
 def resolve_repo(workspace: str | Path | None = None) -> str:

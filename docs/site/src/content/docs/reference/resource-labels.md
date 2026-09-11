@@ -45,10 +45,13 @@ database are all built from them. Do not add `component` anywhere else on the st
 
 One more source exists in the tree but is dark by default: the a2a chatops gateway
 (`a2a/gateway/spawn.go`) stamps `app.kubernetes.io/component: a2a-session` and
-`app.kubernetes.io/part-of: a2a-next` on the session pods it spawns — and it spawns none until
-`A2A_SPAWN_SESSIONS` is set, which nothing renders yet. The values are load-bearing the same way
-Hindsight's are: the gateway's session cap counts pods and its sweeper lists them by exactly this
-pair. `part-of` is deliberately not `kube-agents`: a session pod is spawned per conversation at
+`app.kubernetes.io/part-of: a2a-next` on the session pods it spawns, and it spawns them only
+under `spec.mode: next`, where the operator renders `A2A_SPAWN_SESSIONS`. The values are
+load-bearing the same way Hindsight's are, and for four consumers rather than two: the gateway's
+session cap counts pods and its sweeper lists them by exactly this pair, the operator's bus fence
+admits them to NATS by it, and the operator's session egress policy selects them by it — and a
+NetworkPolicy that selects nothing looks exactly like one that is
+working. `part-of` is deliberately not `kube-agents`: a session pod is spawned per conversation at
 runtime rather than installed, so it stays out of the footprint query above and is reaped by its
 ownerReference to the gateway Deployment, not by uninstall.
 

@@ -11,6 +11,18 @@ Every image an install pulls or a rebuild needs, and how their tags are managed.
 
 [`images.json`](https://github.com/gke-labs/kube-agents/blob/main/images.json) at the repository root is the source of truth for this list. It is what `make mirror-images` copies from, what the chart and the dev tooling resolve their third-party pins from, and what the table below is generated from — so there is one pin per image, not one per install path.
 
+One set of images is deliberately absent: the four the A2A `next` stack pulls — NATS, nats-box,
+the gateway and the session worker. The inventory documents what a supported install pulls, and
+`spec.mode: next` is an unsupported dev toggle, so those pins live as defaults on the operator's
+`A2A_NATS_IMAGE`, `A2A_PROVISION_IMAGE`, `A2A_GATEWAY_IMAGE` and `A2A_WORKER_IMAGE` env vars
+instead. They join this inventory when the stack graduates; until then a mirrored or air-gapped
+install that flips `next` has to override all four.
+
+The exemption covers those four published images, not the bases they are built from. `golang` and
+`node` in the build-time table below carry `a2a/Dockerfile.gateway` and `a2a/Dockerfile.worker`
+alongside every other builder, because an override of `A2A_WORKER_IMAGE` names an image someone
+still has to build, and a build in a mirrored environment has to resolve its bases like any other.
+
 A bump starts here but rarely ends here. Several images keep a second copy that this file is the
 source for — a chart value, a Dockerfile `ARG` default, a compiled constant in the operator — and
 `make images-check` is what holds them in step. It covers every image the chart renders, on a
@@ -73,7 +85,8 @@ Needed only to rebuild the images above from source, not to run an install. Each
 | ----- | ------------------ | --- | -------- | --------- |
 | `hermes-agent` | `docker.io/nousresearch/hermes-agent` | `HERMES_AGENT_TAG` in [`tags.env`](https://github.com/gke-labs/kube-agents/blob/main/tags.env) | `HERMES_AGENT_IMAGE` | deploy/docker/Dockerfile (agent-base stage). |
 | `envoy` | `docker.io/envoyproxy/envoy` | `v1.39.1` | `ENVOY_IMAGE` | deploy/docker/Dockerfile (envoy-bin stage). |
-| `golang` | `docker.io/library/golang` | `1.27-alpine` | `GOLANG_IMAGE` | deploy/docker/Dockerfile, k8s-operator/Dockerfile and a2a/Dockerfile.gateway builder stages. |
+| `golang` | `docker.io/library/golang` | `1.27-alpine` | `GOLANG_IMAGE` | deploy/docker/Dockerfile, k8s-operator/Dockerfile, a2a/Dockerfile.gateway and a2a/Dockerfile.worker builder stages. |
+| `node` | `docker.io/library/node` | `22-slim` | `NODE_IMAGE` | a2a/Dockerfile.worker runtime stage. |
 | `python` | `docker.io/library/python` | `3.14-slim` | `PYTHON_IMAGE` | examples/inference-replay/replay-proxy/Dockerfile and deploy/sandbox/Dockerfile. |
 | `distroless-static` | `gcr.io/distroless/static` | `nonroot` | `DISTROLESS_IMAGE` | k8s-operator/Dockerfile and a2a/Dockerfile.gateway runtime stages. |
 | `busybox` | `docker.io/library/busybox` | `musl@sha256:32b5cdad7cce41dfd53d0ae06baebcf8357a147ee7694dc706911c373bc30c37` | — | agentplugins/*/Dockerfile base images. |

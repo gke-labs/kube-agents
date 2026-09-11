@@ -726,7 +726,7 @@ make uninstall
 
 ### 1. Workload Identity Authorization Errors (`403 Permission Denied`)
 
-- Ensure the GKE Kubernetes Service Account (`kubeagents-system/kubeagents-platform-agent`) is correctly annotated with the GCP Service Account email (`iam.gke.io/gcp-service-account`).
+- Ensure the GKE Kubernetes Service Account (`kubeagents-system/kubeagents-platform-agent` by default) is correctly annotated with the GCP Service Account email (`iam.gke.io/gcp-service-account`).
 - Verify IAM bindings using:
   ```bash
   gcloud iam service-accounts get-iam-policy <GSA_EMAIL>

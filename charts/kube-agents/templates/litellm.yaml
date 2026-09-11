@@ -99,6 +99,13 @@
 {{- end }}
 {{- $callbacks := printf "[%s]" (join ", " $quotedCallbacks) }}
 {{- /*
+  LiteLLM OTLP collector validation: ensure collector namespace can be determined
+  when otel and network policy are active, failing the render early if unresolvable.
+*/}}
+{{- if and .Values.litellm.otel .Values.litellm.networkPolicy }}
+{{- $null := include "kube-agents.otlpCollectorNamespace" . }}
+{{- end }}
+{{- /*
   Rendered once here and used twice below — as the ConfigMap body and as the
   input to the Deployment's checksum. Three aliases for one upstream model,
   mirroring the kustomize base: the agent configs only ever request
@@ -323,7 +330,7 @@ spec:
       port: 80
       targetPort: 8080
   type: ClusterIP
-{{- if .Values.litellm.networkPolicy }}
+{{- if and .Values.litellm.networkPolicy (not (and .Values.platformAgent.enabled .Values.operator.enabled)) }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -333,6 +340,11 @@ metadata:
   labels:
     app.kubernetes.io/name: litellm
     {{- include "kube-agents.labels" . | nindent 4 }}
+  annotations:
+    # When static rendering is active (either platformAgent.enabled or operator.enabled is false),
+    # stamp keep so that transitioning to dynamic operator management later causes Helm to retain
+    # the existing policy rather than deleting it and leaving LiteLLM with unrestricted egress.
+    helm.sh/resource-policy: keep
 spec:
   egress:
     - ports:

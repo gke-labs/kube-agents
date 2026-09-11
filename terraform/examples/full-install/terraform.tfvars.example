@@ -49,15 +49,23 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # agent_runtime_class = "gvisor"
 
 # A second install in this project: each GSA's default name is one fixed name
-# per project, so give each install after the first its own. Two caveats: the
-# installer front doors regenerate this file on every run, so through
+# per project, so give each install after the first its own. A distinct GSA
+# name un-collides creation, not identity - the Workload Identity principal is
+# namespace/KSA with no cluster in it, so give the second install its own KSA
+# name too, or both installs bind one principal and each agent can mint the
+# other's GSA tokens. The KSA name must end in -agent: the admission policy the
+# chart ships selects agent bindings by that suffix, so a name outside it goes
+# unselected; the plan is refused instead (variables.tf has the detail).
+# The installer front doors regenerate this file on every run, so through
 # install.sh/upgrade.sh set PLATFORM_AGENT_GSA_NAME, GITHUB_MINTER_GSA_NAME and
-# LITELLM_GSA_NAME in install.env instead of editing here; and a distinct name
-# un-collides creation, not identity - both installs still bind one Workload
-# Identity principal (see the variable description in variables.tf).
+# LITELLM_GSA_NAME in install.env instead of editing here. The KSA name has no
+# install.env key of its own yet, so it goes in the same file as
+# TF_VAR_agent_ksa_name=... — the generator never writes agent_ksa_name, so
+# nothing in this file overrides it.
 # agent_service_account_id         = "kubeagents-platform-gsa-2"
 # github_minter_service_account_id = "kubeagents-github-minter-gsa-2"
 # litellm_service_account_id       = "kubeagents-litellm-gsa-2"
+# agent_ksa_name                   = "kubeagents-platform-2-agent"
 
 # Cluster tuning
 # deletion_protection = true

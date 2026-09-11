@@ -10,10 +10,10 @@ A ``gs://`` target shells out to gsutil; anything else is a local directory
 copy (which is also what the tests exercise -- nothing in the test suite
 touches a bucket).
 
-Every object is uploaded with ``Cache-Control: no-cache``. The page refetches
-``data.json`` every 60 seconds, and GCS's default public-object caching
-(3600s) would quietly turn that into an hour-stale dashboard; ``no-cache``
-makes each poll revalidate instead.
+Every object is uploaded with ``Cache-Control: no-cache``. The pages poll
+``brief.json``, ``health.json`` and ``data.json`` every 60 seconds, and GCS's
+default public-object caching (3600s) would quietly turn that into an
+hour-stale dashboard; ``no-cache`` makes each poll revalidate instead.
 """
 
 from __future__ import annotations

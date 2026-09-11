@@ -18,6 +18,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"net/netip"
 	"strings"
 	"testing"
@@ -33,13 +34,13 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
 
-// dnsPort is the one port on which the rendered policy is allowed to name a
-// metadata address; see permitsBeyondDNS.
-const dnsPort = 53
+// dnsPort is declared in platformagent_litellm_policy.go; it is the one port
+// on which the rendered policy is allowed to name a metadata address; see permitsBeyondDNS.
 
 // egressPolicyAgent is an agent with the allowlist on.
 func egressPolicyAgent(mutate ...func(*agentv1alpha1.PlatformAgent)) *agentv1alpha1.PlatformAgent {
@@ -1232,6 +1233,117 @@ func TestARefusalDoesNotSuspendTheGatewayNetworkPolicy(t *testing.T) {
 			}
 			if !tc.guarded && err == nil {
 				t.Error("the split-broker refusal rendered the egress policy, which is the outage it exists to prevent")
+			}
+		})
+	}
+}
+
+// TestRefusalStillUpdatesStatusWhenGuardrailReconcileFails covers the failure mode
+// where reconciling network guardrails errors on a refusal path: the status must still
+// record Degraded with the refusal reason rather than returning early without updating status.
+func TestRefusalStillUpdatesStatusWhenGuardrailReconcileFails(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*agentv1alpha1.PlatformAgent)
+		reason string
+	}{
+		{
+			name:   "EgressAllowlistRefused",
+			reason: reasonEgressAllowlistRefused,
+			mutate: func(a *agentv1alpha1.PlatformAgent) {
+				a.Spec.Security.EgressAllowlist = &agentv1alpha1.EgressAllowlistSpec{
+					ControlPlaneCIDRs: []string{"0.0.0.0/0"},
+				}
+			},
+		},
+		{
+			name:   "ForbiddenVolumeMount",
+			reason: reasonForbiddenVolumeMount,
+			mutate: func(a *agentv1alpha1.PlatformAgent) {
+				a.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+					ExtraVolumeMounts: []corev1.VolumeMount{
+						{Name: "credential-proxy-state", MountPath: "/var/lib/credential-proxy"},
+					},
+				}
+			},
+		},
+		{
+			name:   "ShellSandboxCannotBeDisabled",
+			reason: reasonShellSandboxCannotBeDisabled,
+			mutate: func(a *agentv1alpha1.PlatformAgent) {
+				a.Spec.Harness.Experimental = &agentv1alpha1.ExperimentalSpec{
+					ShellSandbox: &agentv1alpha1.ShellSandboxSpec{Enabled: ptr.To(false)},
+				}
+			},
+		},
+		{
+			name:   "RuntimeClassNotFound",
+			reason: reasonRuntimeClassNotFound,
+			mutate: func(a *agentv1alpha1.PlatformAgent) {
+				a.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+					Availability: &agentv1alpha1.AvailabilitySpec{
+						RuntimeClassName: ptr.To("non-existent-runtime"),
+					},
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			scheme := setupScheme()
+			agent := egressPolicyAgent(tc.mutate)
+
+			injectedErr := errors.New("injected networkpolicy apply error")
+			ssa := ssaApplyInterceptor()
+			cl := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(agent).
+				WithStatusSubresource(&agentv1alpha1.PlatformAgent{}).
+				WithInterceptorFuncs(interceptor.Funcs{
+					Create: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.CreateOption) error {
+						if np, ok := obj.(*networkingv1.NetworkPolicy); ok && np.Name == agent.Name+"-gateway-netpol" {
+							return injectedErr
+						}
+						if ssa.Create != nil {
+							return ssa.Create(ctx, cl, obj, opts...)
+						}
+						return cl.Create(ctx, obj, opts...)
+					},
+					Patch: func(ctx context.Context, cl client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+						if np, ok := obj.(*networkingv1.NetworkPolicy); ok && np.Name == agent.Name+"-gateway-netpol" {
+							return injectedErr
+						}
+						if ssa.Patch != nil {
+							return ssa.Patch(ctx, cl, obj, patch, opts...)
+						}
+						return cl.Patch(ctx, obj, patch, opts...)
+					},
+				}).
+				Build()
+
+			r := &PlatformAgentReconciler{Client: cl, Scheme: scheme}
+			req := ctrl.Request{NamespacedName: types.NamespacedName{Name: agent.Name, Namespace: agent.Namespace}}
+			ctx := context.Background()
+
+			_, err := r.Reconcile(ctx, req)
+			if err == nil {
+				t.Fatal("expected Reconcile to return the guardrail error, got nil")
+			}
+
+			stored := &agentv1alpha1.PlatformAgent{}
+			if err := cl.Get(ctx, client.ObjectKeyFromObject(agent), stored); err != nil {
+				t.Fatalf("failed to re-read the agent: %v", err)
+			}
+			if stored.Status.Phase != "Degraded" {
+				t.Errorf("expected Status.Phase to be Degraded despite guardrail error, got %q", stored.Status.Phase)
+			}
+			var gotReason string
+			for _, condition := range stored.Status.Conditions {
+				if condition.Type == "Ready" {
+					gotReason = condition.Reason
+				}
+			}
+			if gotReason != tc.reason {
+				t.Errorf("expected Ready condition reason %q, got %q", tc.reason, gotReason)
 			}
 		})
 	}

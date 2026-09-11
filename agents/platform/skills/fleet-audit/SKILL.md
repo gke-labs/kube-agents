@@ -142,6 +142,7 @@ branch. It prints exactly one JSON line:
   "workspace": "/opt/data/gitops/compliance-audit/acme__fleet",
   "findings_path": "/opt/data/scratch/findings_compliance-audit.json",
   "pending_remediation_requests": ["netpol-missing-payments"],
+  "context_repos": ["acme/terraform-live"],
   "sop": "governance/compliance_audit_sop.md",
   "checks": ["privileged-container", "host-namespace", "…"],
   "checks_contract": "Run every check above against every cluster you can read. …"
@@ -166,6 +167,14 @@ workspace is empty rather than a checkout. Read it rather than guessing from wha
 `pending_remediation_requests` lists the findings a repository writer has already asked to be fixed,
 parsed from the ledger's comments. **Write those manifests during inspection** — if the finding is
 still reproducing at `finish`, its pull request opens immediately instead of a week later.
+
+`context_repos` names the repositories registered for **declared intent**: the `context_repos` key
+of `$GITOPS_STATE_CONFIGMAP`, added by an administrator by hand, as `owner/name` slugs. A stream
+whose SOP has a declared-intent step (today `obtainability-audit`, §4a) searches them before it
+reports a posture as a finding. They are read and nothing else: the key is separate from
+`managed_repos`, the harness never merges the two, so the broker's push gate, the repository
+resolver and the sweep never see them. The list is empty when nothing is registered or the key
+could not be read, which `start` says on stderr; the GitOps clone is searched either way.
 
 ### Step 2 — Inspect the fleet (reasoning phase)
 
@@ -228,14 +237,15 @@ All three exit 2 in directory mode, where the clone already holds the file.
 The script validates the document, reconciles every finding against the pull requests already open
 for this stream, rewrites (or opens) the ledger issue, comments the delta, opens pull requests for
 the fixes that qualify, and closes the ones whose findings have stopped reproducing. It prints one
-JSON line with nine fields — `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`,
-`partial`, `coverage_gaps`, and `silent_ok`:
+JSON line with ten fields — `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`,
+`partial`, `coverage_gaps`, `silent_ok`, and `declared`, the number of postures a repository
+declaration kept off the ledger (it never decides silence):
 
-- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false}`
+- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0}`
   — the stream had no open ledger.
-- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false}`
+- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0}`
   — the existing ledger was rewritten.
-- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false}`
+- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0}`
   — zero findings; the ledger closed as completed and its open fixes closed with it.
 
 Add `--dry-run` to validate and print the rendered ledger body — and every PR body it _would_ open —
@@ -359,9 +369,29 @@ and say which clusters were not covered. See [The clean run](#the-clean-run) for
         "note": "Apply a default-deny NetworkPolicy."
       }
     }
+  ],
+  "declared": [
+    {
+      "check": "no-hpa",
+      "cluster": "prod-us-east",
+      "namespace": "payments",
+      "object": "Deployment/api",
+      "title": "api is pinned at three replicas by Terraform",
+      "declaration": {
+        "repo": "acme/terraform-live",
+        "path": "clusters/prod-us-east/payments.tf",
+        "excerpt": "replicas = 3  # fixed: the upstream rate limit is per-instance"
+      }
+    }
   ]
 }
 ```
+
+(The `declared` entry is illustrative and crosses streams: a real compliance document would be
+rejected for carrying it. `declared[].check` is validated against the stream's `declarable` set in
+`AUDITS` — its posture checks, a subset of the roster — and only `obtainability-audit` has one
+today, because only its SOP has a step that writes the list. A non-empty `declared` on any other
+stream exits 2; `[]` validates everywhere.)
 
 Field rules the validator enforces — a violation exits 2 naming the offending finding index and
 field, and publishes nothing:
@@ -437,6 +467,16 @@ field, and publishes nothing:
 - `remediation.kind` is `manifest`, `gcloud`, or `manual`. `path` is required for `manifest`
   (repo-relative, no `..`, no absolute paths, no glob metacharacters) and forbidden for the other
   two. For `gcloud`, put the exact command in `note` — it is rendered as a runnable block.
+- `declared` is **optional**, and is not a list of findings. Each entry is a posture a check would
+  have flagged that a linked repository declares on purpose — see
+  [`declared`](#declared) below. It carries `check`, `cluster`, `namespace`, `object` and `title`
+  under the same rules as a finding, plus a `declaration` object whose `repo` is an `owner/name`
+  slug, whose `path` follows the remediation-path rules, and whose `excerpt` is the non-empty lines
+  that pin the property. No `severity`, no `remediation`, no `id`. The document is rejected when an
+  entry's four identity fields match a finding's — a posture is reported or declared, never both —
+  when its `cluster` is not in `scope.clusters`, or when its `check` is not one of the stream's
+  declarable posture checks (a declared fault is a declared bug, and a stream with no
+  declared-intent step has none). A document without the key validates as before.
 - **A `path` is discovered, never invented.** Editing an object means writing over its existing
   declaration. Creating one means writing beside a sibling already applied to the same cluster and
   namespace — search the repository for `namespace: <namespace>`, then **open the hits and confirm
@@ -503,6 +543,32 @@ Three fields, all required, all load-bearing for the human who has to decide:
 - **`rationale`** — why _this_ fix and not the obvious alternative. **Name the alternative you
   considered and why you rejected it.** A rationale that restates the action is not a rationale.
 - **`risk`** — what breaks on apply, and the read-only check to run first.
+
+### `declared`
+
+A finding says the fleet is wrong; a declared posture says the fleet is what somebody meant. The
+list exists because the audits judge live state against generic practice, and a platform team that
+pinned a replica count in Terraform on purpose was getting the same `no-hpa` finding every morning
+until someone suppressed it by hand. The SOP's declared-intent step (`obtainability_audit_sop.md`
+§4a, the pilot) searches the GitOps clone's `provisioning/` and `knowledge/` directories and every
+repository in `context_repos` for a declaration that names the same object and pins the flagged
+property, and moves a match here instead of into `findings`.
+
+What the shape enforces:
+
+- **It is not a finding.** No id is derived, so a declared posture never enters the hidden delta
+  block: it is not announced as new when the declaration appears and not announced as resolved when
+  it goes, and nothing about it is ever promoted to a pull request. A finding that moves here
+  _does_ read as resolved in that run's delta — that is the intended outcome, and the ledger's
+  _Declared intent_ section says where it went.
+- **It is refutable.** Every entry names `repo:path` and quotes the lines that pin the property,
+  and the ledger renders both, so a reviewer who disagrees changes or removes the declaration and
+  the posture returns as a finding on the next run. A declaration the worker did not read is not
+  one it may cite.
+- **It justifies posture, never a fault.** Which checks may move here is the stream's `declarable`
+  set in `AUDITS`, four for the pilot, and the validator rejects any other check with exit 2. A
+  drain-blocking budget declared in a repository is a declared bug and stays a finding, and a
+  document that lists it under `declared` publishes nothing.
 
 ## Evidence rules
 
@@ -575,6 +641,16 @@ April close every morning forever. Post a fresh one.
 
 `pr-merged-persists` is the state worth reading twice: a fix merged and the deviation is still
 there. Either the remediation was incomplete or something outside this repository reverted it.
+
+Below the findings, a ledger whose document carried a `declared` list renders a **Declared intent**
+table: one row per entry, with the check, the cluster, the object, `repo:path`, and the title and
+excerpt. Rows have no state and no id — nothing in that table is tracked between runs — and the
+table is capped at 50 rows and says how many it left out. On a clean run the ledger closes without
+being rewritten, so the all-clear comment lists the declared postures instead, with the same
+`repo:path` pointers — and that comment is the last ledger record: a later clean run with nothing
+but declarations opens no ledger and posts nothing, because the ledger tracks findings and a
+standing declaration is the same every morning. From then on the declaration in the repository is
+the record, and `finish` reports the count as `declared`.
 
 ## Remediation pull requests
 
@@ -708,6 +784,10 @@ Resolution accounting is unaffected by truncation, because the two halves of the
 against different sets: **new** is judged against what the body rendered, and **resolved** against
 every finding in the document, rendered or not. A finding cut for space still reproduces and is
 never reported as fixed.
+
+The **Declared intent** table is measured with the fixed sections, before the findings claim what
+is left, so on a body near the limit it is the findings that yield — and it is row-capped, so what
+it can cost is bounded.
 
 The ledger's last section, **How this run checked the fleet**, is a collapsed table of every
 `checks_run` entry — cluster, check, command. It is rendered last, against whatever budget the

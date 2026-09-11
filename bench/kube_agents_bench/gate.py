@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from kube_agents_bench.baselines import (
+    ADMITTED_BY_RECORD,
     AdmissionBar,
     BaselineRecord,
     BaselineStore,
@@ -73,6 +74,28 @@ from kube_agents_bench.scoring import (
 __all__ = ["main"]
 
 _DEFAULT_BASELINE_DIR = "baselines"
+
+#: Set to one of these (case-insensitive) and the suite aggregate may red the
+#: job. Unset, the aggregate rule still runs and is still reported -- it just
+#: cannot block. Advisory is the default because the margin is a flat 0.05
+#: against a rate whose variance on main has never been measured; the store
+#: has to fill before anyone can say what an unchanged pull request's
+#: aggregate looks like, and a rule armed before that is tuned by guess.
+AGGREGATE_ARMED_ENV = "EVAL_AGGREGATE_ARMED"
+_TRUTHY = frozenset({"1", "true", "yes"})
+
+#: The verdict table's admission column, shown once a store is configured OR
+#: the record decided any case this run -- which covers evidence landed by
+#: hand into the checked-in directory with no store configured. With an empty
+#: store the column could only ever read "bootstrap" or "none" -- exactly
+#: what the BOOTSTRAP_ADMITTED list already says -- and leaving it out then
+#: keeps the store-unset verdict byte-identical to what the presubmit
+#: produced before.
+ADMISSION_COLUMN = "Admitted by"
+ADMISSION_CELL_NONE = "none"
+ADMISSION_CELL_RECORD_REFUSED = "record: not admitted"
+#: An admitted case whose hand-off predates `admission_source` (hand-authored).
+ADMISSION_CELL_UNKNOWN = "--"
 
 
 def _env_float(name: str, default: float) -> float:
@@ -115,6 +138,27 @@ def _store_location(args: argparse.Namespace) -> str:
         or os.environ.get("EVAL_BASELINE_STORE")
         or args.baseline_dir
     )
+
+
+def _store_configured(args: argparse.Namespace) -> bool:
+    """Whether a store was named, by flag or by ``EVAL_BASELINE_STORE``.
+
+    False means the gate is reading the checked-in default, which ships empty
+    -- the presubmit's state until the Prow config exports the variable.
+    """
+    return bool(
+        getattr(args, "baseline_store", None) or os.environ.get("EVAL_BASELINE_STORE")
+    )
+
+
+def _aggregate_armed() -> bool:
+    """Whether the suite aggregate may red the job. See :data:`AGGREGATE_ARMED_ENV`."""
+    return os.environ.get(AGGREGATE_ARMED_ENV, "").strip().lower() in _TRUTHY
+
+
+def _record_decided(cases: list[dict[str, Any]]) -> bool:
+    """Whether the evidence store admitted or refused any case this run."""
+    return any(c.get("admission_source") == ADMITTED_BY_RECORD for c in cases)
 
 
 def _load_store(location: str) -> tuple[BaselineStore | None, str | None, str | None]:
@@ -226,14 +270,18 @@ def _cmd_case(args: argparse.Namespace) -> int:
         print("WARNING: grading with no baseline; nothing can be admitted.", file=sys.stderr)
 
     bar = AdmissionBar.from_env()
-    admitted, admission_reason = store.is_admitted(
+    decision = store.admission(
         spec.case_id, key, bar=bar, bootstrap=_bootstrap_admitted()
     )
+    admitted, admission_reason = decision.admitted, decision.reason
 
-    # Rung 6's comparator. None whenever the store has nothing at this key --
-    # including for a BOOTSTRAP_ADMITTED case, which is admitted by fiat and
-    # therefore has no measured judged mean to be compared against. Admitted
-    # without evidence still means the judged rung stays quiet.
+    # Rung 6's comparator. None whenever the store has nothing at this key,
+    # which is every BOOTSTRAP_ADMITTED case until the nightly has appended
+    # something for it: admitted by fiat with no measured judged mean to be
+    # compared against, so the judged rung stays quiet. A listed case with a
+    # partial window (`collecting`) does have a mean at the key, and rung 6
+    # compares against it -- fewer runs behind it than a full window, but
+    # measured on main, which is what the rung asks for.
     evidence = store.evidence_for(spec.case_id, key, min_runs=bar.min_runs)
     baseline_judged = evidence.judged_means if evidence else None
 
@@ -249,6 +297,10 @@ def _cmd_case(args: argparse.Namespace) -> int:
 
     payload = verdict.to_dict()
     payload["admission_reason"] = admission_reason
+    # Who decided: record, bootstrap or neither. The suite renders it per case
+    # once a store is configured or the record decided any case, so a reader
+    # can tell a case the evidence admitted from one still riding the bridge.
+    payload["admission_source"] = decision.source
     payload["version_key"] = key.to_dict() if key else None
     payload["baseline_judged"] = baseline_judged
     payload["baseline_runs"] = evidence.runs if evidence else 0
@@ -281,7 +333,20 @@ def _cmd_case(args: argparse.Namespace) -> int:
     return 0
 
 
-def _markdown(verdict: Any, cases: list[dict[str, Any]]) -> str:
+def _admitted_by(case: dict[str, Any]) -> str:
+    """The admission column's cell: who admitted the case, or who refused."""
+    source = case.get("admission_source")
+    if case.get("admitted"):
+        # A hand-authored hand-off may predate the field; say so rather than guess.
+        return str(source or ADMISSION_CELL_UNKNOWN)
+    if source == ADMITTED_BY_RECORD:
+        return ADMISSION_CELL_RECORD_REFUSED
+    return ADMISSION_CELL_NONE
+
+
+def _markdown(
+    verdict: Any, cases: list[dict[str, Any]], *, admission_column: bool = False
+) -> str:
     lines = [
         "## Evaluation verdict",
         "",
@@ -301,9 +366,11 @@ def _markdown(verdict: Any, cases: list[dict[str, Any]]) -> str:
         lines += ["### Why it is red", ""]
         lines += [f"- {r}" for r in verdict.reasons]
         lines += [""]
+    extra_header = f" {ADMISSION_COLUMN} |" if admission_column else ""
+    extra_rule = " --- |" if admission_column else ""
     lines += [
-        "| Case | Domain | Verdict | Passes | Detail |",
-        "| --- | --- | --- | --- | --- |",
+        f"| Case | Domain | Verdict |{extra_header} Passes | Detail |",
+        f"| --- | --- | --- |{extra_rule} --- | --- |",
     ]
     for case in cases:
         rung = Rung(int(case.get("rung") or Rung.GREEN))
@@ -313,9 +380,10 @@ def _markdown(verdict: Any, cases: list[dict[str, Any]]) -> str:
         # A verifier's reason can contain a pipe (a required-phrase list, a
         # kubectl selector), which would silently split the table cell.
         detail = str(case.get("reason") or "").replace("|", "\\|")
+        extra_cell = f" {_admitted_by(case)} |" if admission_column else ""
         lines.append(
             f"| `{case.get('case')}` | {case.get('domain') or '--'} | {mark} "
-            f"(rung {int(rung)}) | {case.get('passes')}/{scored} | {detail} |"
+            f"(rung {int(rung)}) |{extra_cell} {case.get('passes')}/{scored} | {detail} |"
         )
     return "\n".join(lines) + "\n"
 
@@ -348,10 +416,11 @@ def _baseline_rate(
     difference between them means anything.
 
     Only cases with evidence at their own version key contribute. A case
-    admitted by ``BOOTSTRAP_ADMITTED`` has none by construction, so it counts
-    toward the pull request's rate and not toward main's; that skews the
-    comparison, and the honest fix is to screen the case rather than to invent
-    a baseline for it.
+    admitted by ``BOOTSTRAP_ADMITTED`` with nothing at the key counts toward
+    the pull request's rate and not toward main's; that skews the comparison,
+    and the honest fix is to screen the case rather than to invent a baseline
+    for it. A listed case with a partial window (``collecting``) contributes
+    what it has: fewer runs, weighted accordingly, but measured on main.
 
     Returns None when no admitted case has any evidence, which makes the
     aggregate advisory and says so.
@@ -398,6 +467,7 @@ def _cmd_suite(args: argparse.Namespace) -> int:
         baseline_rate=baseline_rate,
         margin=args.margin,
         min_scored=args.min_scored,
+        armed=_aggregate_armed(),
     )
 
     # BOOTSTRAP_ADMITTED is hand-edited in the Prow job config, and a
@@ -420,7 +490,11 @@ def _cmd_suite(args: argparse.Namespace) -> int:
     # times in the banner is how a reader learns to skip banners.
     case_notes = sorted({n for c in cases for n in (c.get("notes") or [])})
 
-    text = _markdown(verdict, cases)
+    text = _markdown(
+        verdict,
+        cases,
+        admission_column=_store_configured(args) or _record_decided(cases),
+    )
     # The banner goes in the markdown, not only in the log. A degraded read
     # silently loosens the gate, and the one thing that must not happen is a
     # green nobody knows was measured against nothing.

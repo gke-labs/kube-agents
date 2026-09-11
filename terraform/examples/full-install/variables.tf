@@ -149,9 +149,43 @@ variable "scoped_clusters" {
 }
 
 variable "agent_service_account_id" {
-  description = "IAM service account ID for the agent's GSA. The module default (kubeagents-platform-gsa) is one fixed name per project, so a second install in the same project must set its own — the collision otherwise surfaces as alreadyExists halfway through the second install's first apply. Null selects the module default. Two limits before relying on it: the vertex_ai and github-minter paths create their own fixed-name GSAs, named by litellm_service_account_id and github_minter_service_account_id rather than by this variable (the minter's authorization rule does track this one — the composition passes the resulting email as githubMinter.allowedServiceAccount), and the Workload Identity binding is keyed on namespace/KSA rather than on a cluster, so installs sharing the agent namespace can each mint the other's tokens — a distinct name un-collides creation, not identity."
+  description = "IAM service account ID for the agent's GSA. The module default (kubeagents-platform-gsa) is one fixed name per project, so a second install in the same project must set its own — the collision otherwise surfaces as alreadyExists halfway through the second install's first apply. Null selects the module default. Two limits before relying on it: the vertex_ai and github-minter paths create their own fixed-name GSAs, named by litellm_service_account_id and github_minter_service_account_id rather than by this variable (the minter's authorization rule does track this one — the composition passes the resulting email as githubMinter.allowedServiceAccount), and the Workload Identity binding is keyed on namespace/KSA rather than on a cluster, so a distinct GSA name un-collides creation, not identity: set agent_ksa_name too, or installs sharing the agent namespace can each mint the other's tokens."
   type        = string
   default     = null
+}
+
+variable "agent_ksa_name" {
+  description = "Kubernetes ServiceAccount the agent pod runs as, and the KSA half of its Workload Identity binding. The Workload Identity principal is project/namespace/KSA with no cluster in it, so two installs in one project that share the namespace and this name bind one principal and each agent can mint the other's GSA tokens however differently the GSAs are named; give a second install its own name here. One variable feeds both consumers — the composition passes it to the kube-agents-iam module's ksa_name and to the chart's platformAgent.security.serviceAccountName — so the binding and the pod cannot name different KSAs. The default is the name both consumers defaulted to before this variable existed, so an install that never sets it does not move. Through the installer front doors, set it as a TF_VAR_agent_ksa_name=... line in install.env: unlike agent_service_account_id, which the front doors now name with PLATFORM_AGENT_GSA_NAME, this has no install.env key of its own yet, and the generator writes no agent_ksa_name into terraform.tfvars, so the TF_VAR_ passthrough is what Terraform reads."
+  type        = string
+  nullable    = false
+  default     = "kubeagents-platform-agent"
+
+  # A label rather than the DNS subdomain a ServiceAccount name may be: the
+  # value is interpolated into the Workload Identity member string and into
+  # system:serviceaccount:<ns>:<name> principals, and a label is the subset
+  # every one of those accepts.
+  validation {
+    condition     = can(regex("^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$", var.agent_ksa_name))
+    error_message = "agent_ksa_name must be a DNS-1123 label: lowercase letters, digits and hyphens, 1-63 characters, starting and ending with a letter or digit."
+  }
+
+  # The suffix keeps the KSA inside the admission policy's selector. The chart
+  # ships the kube-agents-agent-binding-scope ValidatingAdmissionPolicy (source:
+  # k8s-operator/config/admission/agent-rbac-policy.yaml), whose binds-agent-sa
+  # matchCondition selects the bindings it governs by `s.name.endsWith('-agent')`
+  # on the bound ServiceAccount, and a matchCondition that evaluates false
+  # removes the object from the policy rather than failing it. Today that
+  # policy's one validation names developer-team-agent, and the operator's own
+  # reconcile is exempt from it, so on current main no admission decision
+  # changes for a platform KSA either way. What a name outside the suffix loses
+  # is selection: every validation the policy gains, and every binding to this
+  # KSA written by something other than the operator (a GitOps overlay, a
+  # human), falls outside it with nothing reporting the gap.
+  # tests/test_agent_ksa_name_guard.py holds this literal to the policy's.
+  validation {
+    condition     = endswith(var.agent_ksa_name, "-agent")
+    error_message = "agent_ksa_name must end in \"-agent\": the kube-agents-agent-binding-scope ValidatingAdmissionPolicy (k8s-operator/config/admission/agent-rbac-policy.yaml, shipped by the chart) selects the bindings it governs by matchCondition binds-agent-sa, s.name.endsWith('-agent'), so a name outside the suffix drops this install's agent bindings out of the policy rather than failing them."
+  }
 }
 
 variable "github_minter_service_account_id" {

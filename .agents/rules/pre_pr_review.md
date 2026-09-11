@@ -47,6 +47,10 @@ The rule, and the requirement to fill in the template's **Self-Review** section,
 The rule, and the requirement to fill in the template's **Testing → Live validation** section, are
 in `AGENTS.md` under Pull Request Hygiene.
 
+- **For a change to what an agent does, the live validation is the eval loop**: a case seen
+  red against `main` and green three times against the branch, per
+  [`eval_driven_development.md`](eval_driven_development.md). The bullets below are the form for
+  runtime changes that do not alter agent behaviour.
 - **Name the install and what you observed.** Cluster, image tag, operator version; what you
   did; and the result at each layer the change claims to touch — the CR `.status`, the
   Deployment env, the file or process inside the pod.

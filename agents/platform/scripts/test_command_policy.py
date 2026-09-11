@@ -1,6 +1,23 @@
+import re
+import shlex
 import unittest
+from pathlib import Path
 
 from command_policy import evaluate, GCLOUD_READ_COMMANDS, _gcloud_words_and_flag
+
+# The gcp-config-connector skill is prompt material that spells out the
+# commands the model runs verbatim, and it promises to stay read-only. Both
+# halves are checked below against the policy itself: a fenced command the
+# policy refuses would present at runtime as a skill that stops halfway
+# through Step 2, and no other test in the tree would notice.
+CONFIG_CONNECTOR_SKILL_DIR = (
+    Path(__file__).resolve().parents[1] / "skills" / "gcp-config-connector"
+)
+FENCED_SHELL_BLOCK = re.compile(r"^```(?:bash|sh|shell)\n(.*?)^```", re.MULTILINE | re.DOTALL)
+GOVERNED_TOOLS = frozenset({"kubectl", "gcloud"})
+# Fewer fenced commands than this means the parser or the path went stale
+# and the allowed-commands test would pass by finding nothing.
+MIN_FENCED_COMMANDS = 8
 
 
 def _gcloud_words(argv):
@@ -1148,6 +1165,66 @@ class TheAllowlistCoversWhatTheProductActuallyRuns(unittest.TestCase):
         ):
             with self.subTest(desc=desc):
                 self.assertFalse(evaluate(argv).allowed, desc)
+
+
+class TheConfigConnectorSkillStaysInsideThePolicy(unittest.TestCase):
+    """agents/platform/skills/gcp-config-connector authors KCC manifests for a
+    pull request and validates them read-only. Every kubectl and gcloud
+    command its fenced blocks spell must be one the policy allows, and the
+    validation it tells the model to leave to reviewers must be one the
+    policy refuses -- otherwise the skill's own text would coach the model
+    into a refusal, or the refusal it relies on would not exist.
+    """
+
+    @staticmethod
+    def _fenced_commands():
+        commands = []
+        for path in sorted(CONFIG_CONNECTOR_SKILL_DIR.rglob("*.md")):
+            text = path.read_text(encoding="utf-8")
+            for block in FENCED_SHELL_BLOCK.findall(text):
+                for line in block.replace("\\\n", " ").splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    argv = shlex.split(line)
+                    if argv and argv[0] in GOVERNED_TOOLS:
+                        commands.append((path.name, argv))
+        return commands
+
+    def test_every_fenced_kubectl_and_gcloud_command_is_allowed(self):
+        commands = self._fenced_commands()
+        self.assertGreaterEqual(
+            len(commands), MIN_FENCED_COMMANDS,
+            f"found {len(commands)} governed commands under "
+            f"{CONFIG_CONNECTOR_SKILL_DIR}; the skill moved or the fence parser is stale",
+        )
+        for name, argv in commands:
+            with self.subTest(file=name, command=" ".join(argv)):
+                decision = evaluate(argv)
+                self.assertTrue(decision.allowed, f"{decision.rule_id}: {decision.message}")
+
+    def test_the_validation_the_skill_defers_to_reviewers_is_refused(self):
+        # SKILL.md Step 4 says server-side dry-run, apply and diff are the
+        # reviewer's step because the policy refuses them, and its SQL
+        # reference says `gcloud sql instances describe` is not a read the
+        # model has. Each of those claims is asserted here so the skill text
+        # cannot drift away from the policy it describes.
+        for argv, desc in (
+            (["kubectl", "apply", "--dry-run=server", "-f", "nodepool.yaml"],
+             "server-side dry-run"),
+            (["kubectl", "apply", "-f", "nodepool.yaml"], "apply"),
+            (["kubectl", "create", "-f", "nodepool.yaml"], "create"),
+            (["kubectl", "diff", "-f", "nodepool.yaml"], "diff"),
+            (["gcloud", "sql", "instances", "describe", "orders-db", "--project=p"],
+             "the sql read the skill says it lacks"),
+            (["gcloud", "container", "node-pools", "update", "default-pool",
+              "--cluster=c", "--location=us-central1"], "node-pools update"),
+            (["gcloud", "compute", "firewall-rules", "update", "allow-ssh",
+              "--project=p"], "firewall-rules update"),
+        ):
+            with self.subTest(desc=desc):
+                self.assertFalse(evaluate(argv).allowed, desc)
+
 
 if __name__ == "__main__":
     unittest.main()

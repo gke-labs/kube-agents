@@ -18,6 +18,22 @@ _AUDIT_REPORT_SCRIPT = (
 _POD_WAIT_TIMEOUT_SECONDS = 120
 _POD_POLL_INTERVAL_SECONDS = 5
 
+# Where the refresh client lives inside the pod the probe execs into. Both pod
+# layouts bake it into the image at /opt/defaults/scripts and their entrypoints
+# copy it onto the data volume at /opt/data/scripts on every start; the volume
+# copy is preferred because that is the one the agent itself runs. No wider
+# search: a copy found elsewhere (a GitOps clone under the data volume, say)
+# would let the probe pass on an image that lost its own.
+_REFRESH_SCRIPT_NAME = "github_token_refresh.py"
+_REFRESH_SCRIPT_CANDIDATES = (
+    f"/opt/data/scripts/{_REFRESH_SCRIPT_NAME}",
+    f"/opt/defaults/scripts/{_REFRESH_SCRIPT_NAME}",
+)
+_REFRESH_CONFIRMATION = "Refreshed GitHub credentials via"
+# The exec budget covers the refresh (its client waits up to 60s on the proxy)
+# plus the gh call, with room for a slow broker.
+_PROBE_TIMEOUT_SECONDS = 180
+
 # All Registered Audit Streams and their human titles
 AUDIT_STREAMS: List[Tuple[str, str]] = [
     ("compliance-audit", "Security & RBAC Posture Audit"),
@@ -39,11 +55,17 @@ def test_github_token_minting_and_connectivity(
 ) -> None:
     """Verifies live in-cluster GitHub authentication, token minting, and repository reachability.
 
-    Executes a genuinely 100% read-only probe inside the platform-agent pod:
-    1. Triggers token refresh via the Envoy credential proxy sidecar and GitHub Token Minter (Cloud KMS).
+    Executes a genuinely 100% read-only probe inside the agent's shell sandbox pod, or the
+    legacy gateway pod on an install that has no sandbox:
+    1. Triggers token refresh through the credential proxy and GitHub Token Minter (Cloud KMS).
     2. Executes `gh api repos/<target_repo>` from the shared workspace root.
     3. Verifies repository access and permissions over the network.
     Does NOT invoke `audit_report.py start`, preventing workspace reset, lease scrubbing, or label writes.
+
+    Step 1 is the only thing that mints on a fresh install: nothing at startup writes the
+    proxy's gh credentials, so a probe that skips it passes or fails on whether some earlier
+    task happened to mint. The probe therefore fails when the refresh client cannot be found
+    or the refresh fails, instead of falling through to `gh`.
     """
     if not gke_cluster_name or not github_repo:
         pytest.fail("GKE cluster name and GITHUB_REPO are required for live GitHub connectivity probe.")
@@ -108,14 +130,30 @@ def test_github_token_minting_and_connectivity(
     script = f"""
 import sys, subprocess, os
 
-# 1. Refresh credentials in the credential proxy via the broker client
-p_refresh = subprocess.run(['find', '/opt', '-name', 'github_token_refresh.py'], capture_output=True, text=True)
-if p_refresh.returncode == 0 and p_refresh.stdout.strip():
-    refresh_script = p_refresh.stdout.strip().splitlines()[0]
-    res_ref = subprocess.run(['python3', refresh_script, '{github_repo}'], capture_output=True, text=True)
-    if res_ref.returncode != 0:
-        print(f"Token refresh failed: {{res_ref.stderr}}", file=sys.stderr)
-        sys.exit(res_ref.returncode)
+# 1. Refresh credentials in the credential proxy via the broker client.
+# The script is resolved from its known locations, not searched for: as the
+# sandbox user, `find /opt` cannot enter the root-owned lost+found on the
+# data volume and exits non-zero even after printing a match, so an exit-code
+# gate on it skipped this step and left the probe to pass or fail on whatever
+# credentials an earlier task had left in the proxy.
+candidates = [p for p in {_REFRESH_SCRIPT_CANDIDATES!r} if os.path.isfile(p)]
+if not candidates:
+    print(
+        f"{_REFRESH_SCRIPT_NAME} not found at any of {_REFRESH_SCRIPT_CANDIDATES!r}; "
+        "the pod cannot mint a GitHub token.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+refresh_script = candidates[0]
+res_ref = subprocess.run(['python3', refresh_script, '{github_repo}'], capture_output=True, text=True)
+if res_ref.returncode != 0:
+    print(
+        f"Token refresh via {{refresh_script}} failed (exit {{res_ref.returncode}}):\\n"
+        f"STDOUT:\\n{{res_ref.stdout}}\\nSTDERR:\\n{{res_ref.stderr}}",
+        file=sys.stderr,
+    )
+    sys.exit(res_ref.returncode)
+print(f"{_REFRESH_CONFIRMATION} {{refresh_script}}")
 
 # 2. Execute read-only GitHub API verification via Envoy proxy from workspace root
 env = os.environ.copy()
@@ -151,16 +189,21 @@ print(f"Successfully authenticated and queried repository: {{full_name}}")
         cmd = base_exec + ["python3", "-c", script]
 
     try:
-        proc_start = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        proc_start = subprocess.run(cmd, capture_output=True, text=True, timeout=_PROBE_TIMEOUT_SECONDS)
         assert proc_start.returncode == 0, (
             f"GitHub token minting and API probe failed inside pod '{pod_name}' (exit code {proc_start.returncode}):\n"
             f"STDOUT:\n{proc_start.stdout}\nSTDERR:\n{proc_start.stderr}"
+        )
+        assert _REFRESH_CONFIRMATION in proc_start.stdout, (
+            f"The probe reached `gh` without running the token refresh; stdout was:\n{proc_start.stdout}"
         )
         assert f"Successfully authenticated and queried repository: {github_repo}" in proc_start.stdout, (
             f"Expected successful repository query confirmation in stdout, got:\n{proc_start.stdout}"
         )
     except subprocess.TimeoutExpired:
-        pytest.fail(f"GitHub token minting / API probe timed out after 90s in pod '{pod_name}'")
+        pytest.fail(
+            f"GitHub token minting / API probe timed out after {_PROBE_TIMEOUT_SECONDS}s in pod '{pod_name}'"
+        )
 
 
 def test_github_token_minter_credential_isolation(

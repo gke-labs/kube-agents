@@ -15,3 +15,7 @@
 
 # Admission policies (the security backstop itself)
 /policy/                          @your-org/security
+
+# Declared intent: a knowledge/ note can move an audit posture off the ledger
+# (README, "Declared intent"), so it carries the same review as provisioning/
+/knowledge/                       @your-org/platform-admins

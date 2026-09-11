@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+__BASE__
 <title>kube-agents · evaluation dashboard</title>
 <style>
   .viz-root {
@@ -59,7 +60,7 @@
   .nav a.on { color:var(--text-primary); border-bottom-color:var(--accent); }
   .top .meta { margin-left:auto; font-size:12px; color:var(--text-muted); font-weight:500; }
   .fresh { font-weight:650; white-space:nowrap; }
-  /* Staleness is announced with a text label (STALE / UNREACHABLE), never
+  /* Staleness is announced with a text label (STALE), never
      with color alone; the amber chrome is reinforcement. */
   .fresh.stale { background:var(--hl-soft); border:1px solid var(--hl);
     border-radius:6px; padding:2px 8px; color:var(--text-primary); font-weight:750; }
@@ -175,8 +176,8 @@
   <span class="brand"><span class="logo">ka</span>evals</span>
   <nav class="nav">
     <a href="index.html">Brief</a>
-    <a class="on" href="#agent">The agent</a><a href="#gate">The gate</a>
-    <a href="#nightly">Evidence</a><a href="#release">Releases</a>
+    <a class="on" href="legacy.html#agent">The agent</a><a href="legacy.html#gate">The gate</a>
+    <a href="legacy.html#nightly">Evidence</a><a href="legacy.html#release">Releases</a>
   </nav>
   <span class="meta"><span id="headmeta">__META__</span> · <span id="freshness" class="fresh">__FRESHNESS__</span></span>
 </div></div>
@@ -202,12 +203,18 @@ document.addEventListener("mousemove",e=>{
  * function names, same order); render.py owns the golden tests, this owns
  * the screen a viewer actually watches. Change them together.
  *
- * States:
- *  - fresh:       "updated HH:MM UTC · Nm ago"
- *  - stale:       generated_at older than data.json's stale_after_s
- *                 (default 7200s) -> amber badge labelled STALE
- *  - unreachable: a poll failed -> amber badge labelled UNREACHABLE, and
- *                 the last successfully rendered data stays on screen
+ * The poll is a best-effort refresh, not what the page depends on: the
+ * whole page is republished every DASH.republishMinutes by the workflow,
+ * so a host that will not answer an XHR (storage.cloud.google.com answers
+ * one with a login redirect) still shows a page at most that old.
+ *
+ * Badge states:
+ *  - polled:   "updated HH:MM UTC · Nm ago" -- a poll has succeeded
+ *  - baked:    the same plus "· regenerated every 15 min" -- no poll has
+ *              succeeded (yet, or at all), so the page is as fresh as its
+ *              last publish
+ *  - stale:    generated_at older than data.json's stale_after_s (default
+ *              7200s), from either source -> amber badge labelled STALE
  */
 "use strict";
 
@@ -218,6 +225,8 @@ const DASH = {
   refreshMs: 60000,
   freshnessTickMs: 30000,
   staleDefaultS: 7200,
+  // The ci-health workflow's cron: how old the baked copy can be at most.
+  republishMinutes: 15,
   screeningWindow: 20,
   repResults: ["pass", "fail", "infra"],
   matrixRuns: 30,
@@ -260,7 +269,9 @@ const DASH = {
 };
 
 let current = DASH.bootstrap;
-let unreachable = false;
+// True once a data.json poll has succeeded; until then (a file:// preview,
+// a host that redirects XHRs) the page is as fresh as its last publish.
+let live = false;
 
 const esc = (value) => String(value)
   .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -1035,11 +1046,9 @@ function renderFreshness() {
   const hhmm = generated != null ? new Date(generated).toISOString().slice(11, 16) : "—";
   const ageMin = generated != null ? Math.max(0, Math.round((Date.now() - generated) / 60000)) : null;
   let text = `updated ${hhmm} UTC` + (ageMin != null ? ` · ${ageMin}m ago` : "");
-  let stale = false;
-  if (unreachable) { text = `UNREACHABLE · ${text}`; stale = true; }
-  else if (generated != null && Date.now() - generated > staleAfterMs) {
-    text = `STALE · ${text}`; stale = true;
-  }
+  if (!live) text += ` · regenerated every ${DASH.republishMinutes} min`;
+  const stale = generated != null && Date.now() - generated > staleAfterMs;
+  if (stale) text = `STALE · ${text}`;
   el.textContent = text;
   el.className = stale ? "fresh stale" : "fresh";
 }
@@ -1055,22 +1064,21 @@ async function refresh() {
     const response = await fetch("data.json", { cache: "no-store" });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     current = await response.json();
-    unreachable = false;
+    live = true;
     renderAll();
   } catch (err) {
-    // Keep the last rendered data on screen; only the badge changes.
-    unreachable = true;
+    // Keep the last rendered data on screen; the badge says the page is
+    // as fresh as its last publish.
+    live = false;
     renderFreshness();
   }
 }
 
 renderAll();
-if (location.protocol !== "file:") {
-  // A file:// preview of a rendered out-dir cannot fetch; it stays a static
-  // render of the baked data instead of pretending the feed is down.
-  refresh();
-  setInterval(refresh, DASH.refreshMs);
-}
+// Polling is attempted everywhere, a file:// preview included: a failed
+// poll costs nothing but the "regenerated every N min" suffix.
+refresh();
+setInterval(refresh, DASH.refreshMs);
 setInterval(renderFreshness, DASH.freshnessTickMs);
 </script>
 </body>

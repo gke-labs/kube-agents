@@ -33,13 +33,15 @@ All eleven are covered and the allowlist is empty, which is Phase 2's exit crite
 ```bash
 cd bench
 uv sync
+export PROJECT_ID=<gcp project> CLUSTER_NAME=<cluster> AGENT_CLUSTER_CONTEXT=<kubectl context>
+export BENCH_TF_ROOT=./tf
 PLATFORM_AGENT_TOKEN=$(kubectl get secret platform-agent-secrets -n <namespace> \
   -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode) \
   JUDGE_PROVIDER=<provider> JUDGE_MODEL=<model> \
-  uv run devops-bench ./tasks --no-infra --agent-type kubeagents
+  uv run devops-bench ./tasks/<id> --agent-type kubeagents
 ```
 
-This is the stock `devops-bench` CLI — there is no wrapper command. `source` is positional. Drop `--no-infra` for tasks that provision infrastructure, and see `--help` for the rest.
+This is the stock `devops-bench` CLI — there is no wrapper command. `source` is positional, and `./tasks` runs every case. The exports are what `hack/ci-eval-pr.sh` sets, so a local run grades the way the presubmit does; a case with `fixtures:` also needs `BENCH_FLEET_KUBECONFIG_DIR` from `hack/fleet-kubeconfigs.sh`. `--no-infra` smokes the agent path only: it skips the deterministic checks, so such a run can neither pass nor fail the gate. [`.agents/rules/eval_driven_development.md`](../.agents/rules/eval_driven_development.md) is the loop that uses this. See `--help` for the rest.
 
 ## The gate
 
@@ -58,11 +60,11 @@ The gate is rate-based, not all-must-pass: at a few hundred cases and realistic 
 
 That evidence is what `baselines/` holds, and admission is computed from it rather than declared in `task.yaml` — a case cannot admit itself in the same diff that makes it pass. A case with no record at the current version key is reported unadmitted, and one whose record was measured on different software is reported _stale_ rather than silently compared against.
 
-**The loop closes through `record`.** Everything a pull request is compared against comes from lines that a run on `main` appended, so the store fills itself: each nightly run appends its own repetitions, the reader pools the newest lines at a key until it holds 20 runs, and a case is admitted once that pooled evidence clears the bar — about two nights from empty at the nightly's ten repetitions. The window is what makes de-admission automatic too: a case that starts failing pushes its own passing history out and stops being able to red the job. `record` refuses to run with `PULL_NUMBER` set, and the shell only calls it on a run whose `JOB_TYPE` is `periodic` or `postsubmit`. Where those lines land is `EVAL_BASELINE_STORE`: unset, they append to `baselines/` in the checkout, which is hermetic and needs no credential but has no way to commit itself from CI; set to `gs://bucket/prefix`, each batch becomes one immutable object under a `roles/storage.objectCreator` grant that cannot overwrite or delete, which is what actually closes the loop on `main`. `VERSIONS.json` stays in git either way. See [docs/designs/eval-scorer.md](../docs/designs/eval-scorer.md).
+**The loop closes through `record`.** Everything a pull request is compared against comes from lines that a run on `main` appended, so the store fills itself: each nightly run appends its own repetitions, the reader pools the newest lines at a key until it holds 20 runs, and a case is admitted once that pooled evidence clears the bar — seven nights from empty at `EVAL_REPETITIONS=3`, the default the nightly inherits (the pool takes whole lines, so it lands on 21). Until a case has that full window at the current key, `BOOTSTRAP_ADMITTED` decides it; once it does, the record decides either way, and the verdict's **Admitted by** column says which. The window is what makes de-admission automatic too: a case that starts failing pushes its own passing history out and stops being able to red the job. `record` refuses to run with `PULL_NUMBER` set, and the shell only calls it on a run whose `JOB_TYPE` is `periodic` or `postsubmit`. Where those lines land is `EVAL_BASELINE_STORE`: unset, they append to `baselines/` in the checkout, which is hermetic and needs no credential but has no way to commit itself from CI; set to `gs://bucket/prefix`, each batch becomes one immutable object under a `roles/storage.objectCreator` grant that cannot overwrite or delete, which is what actually closes the loop on `main`. `VERSIONS.json` stays in git either way. See [docs/designs/eval-scorer.md](../docs/designs/eval-scorer.md).
 
 Two speeds, deliberately: the deterministic `Verification*` scores decide whether a repetition passed, and no judged score can fail a repetition on its own. The captured fixtures are the argument — three byte-identical failing runs scored `OutcomeValidity` 0.9, 1.0 and 0.2 while `VerificationCorrectness` held at 0.5 on all three. The judge is given exactly one job (rung 6): catching a **collapse** in judged quality against main's mean at the same version key, at a margin of two standard errors of that measured spread. At three repetitions it cannot see drift, and widening it is a matter of more repetitions or a less variable metric, not a smaller number.
 
-Thresholds are named environment variables, all with the documented default: `EVAL_REPETITIONS`, `DETERMINISTIC_CORRECTNESS_FLOOR`, `EVAL_ADMISSION_RATE`, `EVAL_ADMISSION_MIN_RUNS`, `EVAL_AGGREGATE_MARGIN`, `EVAL_JUDGED_MARGIN`, `EVAL_JUDGED_METRICS`, `EVAL_BASELINE_STORE`, `EVAL_BASELINE_MAX_OBJECTS`, and `BOOTSTRAP_ADMITTED` (the transition bridge — cases that keep blocking before any screening exists).
+Thresholds are named environment variables, all with the documented default: `EVAL_REPETITIONS`, `DETERMINISTIC_CORRECTNESS_FLOOR`, `EVAL_ADMISSION_RATE`, `EVAL_ADMISSION_MIN_RUNS`, `EVAL_AGGREGATE_MARGIN`, `EVAL_AGGREGATE_MIN_SCORED`, `EVAL_AGGREGATE_ARMED` (unset by default: the suite aggregate is computed and reported against main's rate but cannot red the job until this is set to `1`, `true` or `yes`), `EVAL_JUDGED_MARGIN`, `EVAL_JUDGED_METRICS`, `EVAL_BASELINE_STORE`, `EVAL_BASELINE_MAX_OBJECTS`, and `BOOTSTRAP_ADMITTED` (the transition bridge — cases that keep blocking until the store holds a full window for them at the current key; [`docs/eval-gate-roster.md`](../docs/eval-gate-roster.md) has the switch-over criteria).
 
 ## Portal CUJ evaluations
 

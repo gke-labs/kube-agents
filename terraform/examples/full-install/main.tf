@@ -260,6 +260,10 @@ module "kube_agents_iam" {
   project_roles      = local.agent_project_roles
   scoped_clusters    = var.scoped_clusters
   service_account_id = var.agent_service_account_id
+  # The KSA half of the Workload Identity member; the same variable is the
+  # chart's platformAgent.security.serviceAccountName below. The variable's
+  # description in variables.tf says why it exists and what bounds it.
+  ksa_name = var.agent_ksa_name
 
   # module.gke_cluster, and not only the API enablements, because the module's
   # workload_identity binding names the pool as an interpolated string
@@ -584,6 +588,9 @@ resource "helm_release" "kube_agents" {
         # With annotations set, the OPERATOR creates and manages the KSA (see
         # the chart README's ServiceAccount-ownership section); this one wires
         # Workload Identity to the GSA the kube-agents-iam module created.
+        # The KSA module.kube_agents_iam bound above -- one variable, so the
+        # binding cannot name a KSA the pod does not run as.
+        serviceAccountName = var.agent_ksa_name
         serviceAccountAnnotations = {
           "iam.gke.io/gcp-service-account" = module.kube_agents_iam.service_account_email
         }
