@@ -367,7 +367,7 @@ first two is America/Toronto ("ET"), formatted in the browser with
 | Page          | What it is                                                                                                                                                                                                                                                         |
 | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `index.html`  | **The Brief**: the gate's state and why, what the agent saw, what changed right before, what is being done, and the runs in the window. Healthy: the last 24 hours in numbers and the last incident.                                                               |
-| `run.html`    | **The PR view**, `run.html?build=<prow build id>`: one run, each failed gate case tagged `failing on N other PRs` / `only your PR` / `quota storm` / `unexplained` with its check reason, 30-day pass rate, transcript link and a one-line Do; a "what to do" box. |
+| `run.html`    | **The PR view**, `run.html#build=<prow build id>`: one run, each failed gate case tagged `failing on N other PRs` / `only your PR` / `quota storm` / `unexplained` with its check reason, 30-day pass rate, transcript link and a one-line Do; a "what to do" box. |
 | `legacy.html` | The two-band page (agent trend, gate matrix, Pareto, evidence table).                                                                                                                                                                                              |
 
 The Brief and the PR view render in the browser from `brief.json` (below),
@@ -393,21 +393,41 @@ the question imports it.
 
 ### URL contract
 
-`index.html?cases=a,b&since=<ISO 8601 UTC>&until=<ISO 8601 UTC>#gate|#agent`
+`index.html#since=<ISO 8601 UTC>&until=<ISO 8601 UTC>&cases=a,b&view=gate|agent`
+`run.html#build=<prow build id>`
+
+Every parameter travels in the URL fragment as `key=value` pairs joined
+by `&`. `storage.cloud.google.com` answers an unauthenticated request with
+a login redirect that comes back without the query string, so a scope
+carried there arrived empty and the reader landed on the unscoped Brief; a
+browser never sends the fragment to the server and carries it through a
+redirect, so a scope carried there survives. The older form,
+`index.html?cases=a,b&since=…&until=…#gate|#agent` and
+`run.html?build=<id>`, is still read, so a link already posted to Chat, a
+pull request or an issue opens the same page wherever its query survives
+(a session the host does not redirect, a local render); a key present in
+both places is read from the query. `linkState()` in `template/pages.js` is the one
+parser; `post_health.dashboard_link` / `run_link` (Python: the Chat
+messages, the gate comment, the tracking issue) and `briefHref` /
+`runHref` (the pages' own links, `incidentHref` and `numbersHref` wrap
+the first; the nav's "Numbers" link in `page.html.tmpl` is the same
+text) are the writers. A writer omits an empty parameter.
 
 - `cases`, `since`, `until` scope the Brief to that incident (a past one
   when `until` is given). `since` is matched to an incident in
   `health-history.jsonl`; without history the parameters describe it.
-- `#agent` shows the last 24 hours in numbers; `#gate` lands on the
-  "why we think" block. No parameters: the current state from `health.json`.
+- `view=agent` shows the last 24 hours in numbers; `view=gate` lands on
+  the "why we think" block (the page scrolls to the section after it
+  renders). No parameters: the current state from `health.json`.
 - Case ids match `[A-Za-z0-9][A-Za-z0-9._-]{0,79}`; the first 50
   (`maxLinkCases`) that do are read, and a link the pages write carries at
   most those 50. A value that fails its grammar is dropped and everything
   reaches the DOM escaped.
 - `since` and `until` are read with a `Z`, a space separator, or a UTC
   offset written `+02:00` or `+0200`, and converted; the pages themselves
-  write `Z`.
-- `run.html?build=<digits>`; an id not in `brief.json` shows a
+  write `Z`, and nothing a writer emits is percent-encoded (the case-id
+  grammar and the `Z` form need none).
+- `run.html#build=<digits>`; an id not in `brief.json` shows a
   not-found page naming the window (`RUN_VIEW_DAYS`, 14 days).
 
 ### `brief.json` (written by `render.py`)

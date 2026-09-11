@@ -19,8 +19,13 @@ OUTAGE lacks or the one a build-cluster node loss owes the cluster owner
 `workflow_dispatch` of the same workflow is the on-demand refresh button.
 
 Every message ends with a deep link into the dashboard:
-`index.html?cases=<comma-separated case ids>&since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>]#gate`
-for an incident (`until` on the recovery message), `#agent` for the digest.
+`index.html#since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>][&cases=<comma-separated case ids>]&view=gate`
+for an incident (`until` on the recovery message), `view=agent` for the
+digest. The scope rides in the URL fragment because the host's login redirect
+drops a query string and a browser carries the fragment through the redirect.
+The contract, and the older `?cases=…#gate` form the pages still read (it
+opens the same page wherever its query survives), are in
+[`scripts/eval_dashboard/SCHEMA.md`](../scripts/eval_dashboard/SCHEMA.md).
 
 ## Times
 
@@ -121,7 +126,7 @@ when there are several):
   other pull requests the case is failing on right now;
 - the check's reason for a case that looks like the pull request's;
 - how many cases passed, the run's wall clock and pool project, and links: the
-  build log, `run.html?build=<build id>` on the dashboard, and the incident
+  build log, `run.html#build=<build id>` on the dashboard, and the incident
   brief when there is an incident.
 
 Which class a case gets — `shared`, `only-this-pr`, `storm`, unexplained — is
@@ -136,7 +141,7 @@ under the job, #1478). It is one line, same marker and dedupe:
 
 > The Prow build node running this job went away at 10:19 AM ET (<node>).
 > Nothing was graded and nothing about your change is implied. `/retest` once
-> new jobs are progressing. [Details →](run.html?build=<build id>)
+> new jobs are progressing. [Details →](run.html#build=<build id>)
 
 Ran 128 min before the node went away · build log
 ```
