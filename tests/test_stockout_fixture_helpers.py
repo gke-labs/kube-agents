@@ -480,7 +480,8 @@ class BudgetTest(unittest.TestCase):
     def test_every_wait_is_capped_by_the_budget(self):
         for name in ("_ROLLOUT_TIMEOUT_SECONDS",
                      "_PLUGIN_READY_TIMEOUT_SECONDS", "_SKILL_MOUNT_TIMEOUT_SECONDS",
-                     "_GENERATION_STABLE_SECONDS", "_AGENT_AVAILABILITY_TIMEOUT_SECONDS"):
+                     "_GENERATION_STABLE_SECONDS", "_AGENT_AVAILABILITY_TIMEOUT_SECONDS",
+                     "_DEGRADED_PERSISTENCE_SECONDS"):
             with self.subTest(constant=name):
                 self.assertLessEqual(getattr(sof, name), sof._FIXTURE_BUDGET_SECONDS)
 
@@ -907,10 +908,10 @@ class PluginReadyStatusTest(unittest.TestCase):
                 mock.patch.object(sof.time, "time", side_effect=clock.time), \
                 mock.patch.object(sof.time, "sleep", side_effect=clock.sleep):
             with self.assertRaises(_StubFail) as caught:
-                sof._wait_for_plugin_ready("ns", clock.cur + 120.0)
+                sof._wait_for_plugin_ready("ns", clock.cur + 300.0)
         msg = str(caught.exception)
         self.assertIn("installation failed", msg)
-        self.assertIn("phase has remained 'Degraded'", msg)
+        self.assertIn("phase has remained 'Degraded' for 120s", msg)
         self.assertIn("ImagePullFailed", msg)
         self.assertIn("Failed to pull image xyz", msg)
 

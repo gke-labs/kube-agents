@@ -72,10 +72,10 @@ _PLUGIN_READY_TIMEOUT_SECONDS = 300
 # before evaluating readiness (platformagent_controller.go:3004), and maps live container
 # states such as ErrImagePull, ImagePullBackOff, or staging crashes directly into
 # Degraded (platformagent_controller.go:3076-3119). During gateway rollouts or under
-# registry throttling (e.g. HTTP 429), kubelet retries pulling the image automatically.
-# Requiring the Degraded state to persist prevents failing on transient retry windows while
-# still failing fast on broken specs or unpullable images well short of the 300s ceiling.
-_DEGRADED_PERSISTENCE_SECONDS = 30
+# registry throttling (e.g. HTTP 429), kubelet retries pulling the image on an exponential
+# backoff (10s -> 20s -> 40s...). A 120s window allows several backoff cycles while still
+# failing fast on permanently broken specs or missing images well short of the 300s ceiling.
+_DEGRADED_PERSISTENCE_SECONDS = 120
 # Polled rather than read once, because rollout-complete does not always mean the entrypoint
 # has finished linking plugins.
 #
