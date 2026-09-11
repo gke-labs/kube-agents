@@ -1,0 +1,12 @@
+# What kube-agents-bot, the GitHub App that reviews every pull request here, reads about this
+# repository. Read from the default branch only, so a pull request cannot reconfigure its own
+# reviewer; the keys and their meanings are the bot's own README (gke-labs/kube-agents-bot).
+#
+# The review method the bot's candidate passes follow: the same skill an author runs before
+# opening a pull request (AGENTS.md, "Pull Request Hygiene"), read from the base commit, so the
+# pre-PR self-review and the automated review look for the same things. Measured on the core set
+# of gke-labs/kube-agents-bot#75 before it was set, one run per arm: no change to HIGH+ recall; the
+# docs-made-false and description-contradicted findings a second reader had posted now posted by
+# the bot; about 13% more cost per review, and more findings posted per pull request
+# (gke-labs/kube-agents-bot#78).
+playbook: .agents/skills/review-adversarial/SKILL.md
