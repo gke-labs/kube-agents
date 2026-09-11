@@ -187,6 +187,43 @@ class StaleConditions(unittest.TestCase):
             events = [warning("Pod", "job-x", 9, first_ago=800, last_ago=1)]
             self.assertEqual(analyze([pod], events=events, existing={("configmaps", NAMESPACE): set()}), [], phase)
 
+    def test_retired_replicaset_is_skipped_by_every_heuristic(self):
+        rs = obj(
+            "ReplicaSet",
+            "web-old",
+            spec={"replicas": 0, "template": {"spec": {"containers": [{"name": "app", "envFrom": [{"configMapRef": {"name": "web-config-abc123"}}]}]}}},
+            status={"observedGeneration": 1, "replicas": 0, "conditions": [condition("Ready", "False", 900)]},
+            managed_fields=[managed(900)],
+        )
+        rs["metadata"]["generation"] = 2
+        events = [warning("ReplicaSet", "web-old", 9, first_ago=800, last_ago=1)]
+        existing = {("configmaps", NAMESPACE): set()}
+        self.assertEqual(analyze([rs], events=events, existing=existing), [])
+        rs["spec"]["replicas"] = 1
+        rows = analyze([rs], events=events, existing=existing)
+        self.assertIn("dangling-reference", [r["heuristic"] for r in rows])
+
+    def test_finished_job_is_skipped_by_every_heuristic(self):
+        def job(conditions):
+            j = obj(
+                "Job",
+                "backup-1",
+                spec={"template": {"spec": {"containers": [{"name": "app", "envFrom": [{"secretRef": {"name": "backup-creds"}}]}]}}},
+                status={"observedGeneration": 0, "conditions": conditions},
+                managed_fields=[managed(900)],
+            )
+            j["metadata"]["generation"] = 1
+            return j
+
+        events = [warning("Job", "backup-1", 9, first_ago=800, last_ago=1)]
+        existing = {("secrets", NAMESPACE): set()}
+        for ctype in ("Complete", "Failed"):
+            finished = job([condition("Ready", "False", 900), condition(ctype, "True", 850)])
+            self.assertEqual(analyze([finished], events=events, existing=existing), [], ctype)
+        running = job([condition("Complete", "False", 850)])
+        rows = analyze([running], events=events, existing=existing)
+        self.assertIn("dangling-reference", [r["heuristic"] for r in rows])
+
     def test_paused_deployment_is_not_a_stall(self):
         dep = healthy_deployment()
         dep["spec"]["paused"] = True
