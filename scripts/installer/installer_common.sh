@@ -572,7 +572,7 @@ derive_kms_location() {
 # to prevent destroying working subscriptions on existing installs during upgrade.
 derive_chat_sub_name() {
   local topic="${1:-${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}}"
-  local sub="${2:-${CHAT_SUB_NAME:-}}"
+  local sub="${2:-}"
 
   if [ -n "$sub" ]; then
     echo "$sub"
