@@ -96,6 +96,9 @@ readonly PLATFORM_AGENT_SHELL_AUTHORIZED_KEYS_SECRET="platform-agent-shell-autho
 # interactive dev prompt ever reaches it.
 readonly IMAGE_TAG_FALLBACK="latest"
 
+# Suffix appended when deriving Google Chat Pub/Sub subscription name from a custom topic (#1397).
+readonly CHAT_SUBSCRIPTION_SUFFIX="-sub"
+
 # ─── Terraform state in GCS ───────────────────────────────────────────────────
 # The object the gcs backend writes under the prefix, and how gcloud spells
 # "there is no such object" -- as opposed to "I could not look", which
@@ -563,24 +566,22 @@ derive_kms_location() {
 
 # ─── Pub/Sub Derivations ──────────────────────────────────────────────────────
 # Derive the Google Chat Pub/Sub subscription name from the topic name.
-# When CHAT_TOPIC_NAME is not the default and CHAT_SUB_NAME is unset or equals
-# the default name, derive "${CHAT_TOPIC_NAME}-sub" to avoid 409 collisions
-# against an existing default subscription bound to another topic (#1397).
-# An explicit custom CHAT_SUB_NAME always wins.
+# When CHAT_SUB_NAME is unset (empty), derive "${topic}${CHAT_SUBSCRIPTION_SUFFIX}"
+# if CHAT_TOPIC_NAME is non-default, or DEFAULT_CHAT_SUB_NAME on the default topic (#1397).
+# An explicit CHAT_SUB_NAME (even if set to the default subscription name) always wins
+# to prevent destroying working subscriptions on existing installs during upgrade.
 derive_chat_sub_name() {
-  local topic="${1:-${CHAT_TOPIC_NAME:-${DEFAULT_CHAT_TOPIC_NAME:-}}}"
+  local topic="${1:-${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}}"
   local sub="${2:-${CHAT_SUB_NAME:-}}"
-  local default_topic="${DEFAULT_CHAT_TOPIC_NAME:-platform-agent-chat-events}"
-  local default_sub="${DEFAULT_CHAT_SUB_NAME:-platform-agent-chat-events-sub}"
 
-  if [ -n "$sub" ] && [ "$sub" != "$default_sub" ]; then
+  if [ -n "$sub" ]; then
     echo "$sub"
     return
   fi
-  if [ -n "$topic" ] && [ "$topic" != "$default_topic" ]; then
-    echo "${topic}-sub"
+  if [ -n "$topic" ] && [ "$topic" != "$DEFAULT_CHAT_TOPIC_NAME" ]; then
+    echo "${topic}${CHAT_SUBSCRIPTION_SUFFIX}"
   else
-    echo "${sub:-$default_sub}"
+    echo "$DEFAULT_CHAT_SUB_NAME"
   fi
 }
 
@@ -1727,7 +1728,8 @@ write_tfvars_from_state() {
     fi
     echo ""
     local derived_chat_topic="${CHAT_TOPIC_NAME:-$DEFAULT_CHAT_TOPIC_NAME}"
-    local derived_chat_sub="$(derive_chat_sub_name "$derived_chat_topic" "${CHAT_SUB_NAME:-}")"
+    local derived_chat_sub
+    derived_chat_sub="$(derive_chat_sub_name "$derived_chat_topic" "${CHAT_SUB_NAME:-}")"
     echo "enable_google_chat        = $(hcl_bool "${GOOGLE_CHAT_ENABLED:-$DEFAULT_GOOGLE_CHAT_ENABLED}")"
     echo "chat_topic_name           = $(hcl_str "$derived_chat_topic")"
     echo "chat_subscription_name    = $(hcl_str "$derived_chat_sub")"

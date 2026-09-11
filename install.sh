@@ -3035,7 +3035,7 @@ main() {
     prompt_read "Allowed User Email(s) for Google Chat (comma-separated, empty allows all users)" \
       allowed_users "$allowed_users" false "$allowed_users_hint"
     prompt_read "Pub/Sub Topic Name for Google Chat" chat_topic_name "$chat_topic_name"
-    chat_sub_name="$(derive_chat_sub_name "$chat_topic_name" "$chat_sub_name")"
+    chat_sub_name="$(derive_chat_sub_name "$chat_topic_name" "${PARAM_CHAT_SUB_NAME:-${CHAT_SUB_NAME:-}}")"
     prompt_read "Pub/Sub Subscription Name for Google Chat" chat_sub_name "$chat_sub_name"
     prompt_read "Google Chat Home Channel / Space ID (optional, e.g. spaces/AAAA...)" \
       google_chat_home_channel "$google_chat_home_channel"

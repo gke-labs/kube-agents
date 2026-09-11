@@ -964,7 +964,21 @@ class InstallerCommonTest(unittest.TestCase):
             content = dest.read_text()
             self.assertIn('chat_subscription_name    = "my-explicit-sub"', content)
 
-            # 3. Default topic retains default subscription
+            # 3. Custom topic with explicit default subscription retains default subscription (no destroy on upgrade)
+            proc = self._run(
+                f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
+                env={
+                    "API_SERVER_KEY": "k",
+                    "GOOGLE_CHAT_ENABLED": "true",
+                    "CHAT_TOPIC_NAME": "custom-chat-events",
+                    "CHAT_SUB_NAME": "platform-agent-chat-events-sub",
+                },
+            )
+            self.assertIn("rc=0", proc.stdout, proc.stderr)
+            content = dest.read_text()
+            self.assertIn('chat_subscription_name    = "platform-agent-chat-events-sub"', content)
+
+            # 4. Default topic retains default subscription
             proc = self._run(
                 f'write_tfvars_from_state "{dest}"; echo "rc=$?"',
                 env={

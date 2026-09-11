@@ -3031,12 +3031,19 @@ source_provisioning_helpers . >/dev/null
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("SUB=my-custom-topic-sub", proc.stdout)
 
-    def test_custom_topic_with_default_sub_re_derives(self):
+    def test_custom_topic_with_empty_sub_derives(self):
+        proc = self._run_install_func(
+            'echo "SUB=$(derive_chat_sub_name "my-custom-topic" "")"'
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("SUB=my-custom-topic-sub", proc.stdout)
+
+    def test_custom_topic_with_explicit_default_sub_is_preserved(self):
         proc = self._run_install_func(
             'echo "SUB=$(derive_chat_sub_name "my-custom-topic" "platform-agent-chat-events-sub")"'
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("SUB=my-custom-topic-sub", proc.stdout)
+        self.assertIn("SUB=platform-agent-chat-events-sub", proc.stdout)
 
     def test_explicit_custom_subscription_wins(self):
         proc = self._run_install_func(
