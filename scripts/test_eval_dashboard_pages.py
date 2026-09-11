@@ -383,6 +383,9 @@ class RenderedFilesTest(unittest.TestCase):
                 page = (out / name).read_text()
                 self.assertEqual(page.count("<base "), 1, name)
                 self.assertIn('<base href="https://example.test/evals/">', page.split("<body", 1)[0], f"{name}: in <head>, with the trailing slash")
+                # Under <base>, a bare "#agent" resolves to the site root, not
+                # this page: every in-page link must carry its file name.
+                self.assertNotIn('href="#', page, f"{name}: no fragment-only link")
             # A trailing slash on the flag is not doubled.
             out = render_to(pathlib.Path(tmp) / "slash", data, extra_args=["--public-url", "https://example.test/evals/"])
             self.assertIn('<base href="https://example.test/evals/">', (out / "index.html").read_text())
@@ -676,8 +679,21 @@ class BrowserTest(unittest.TestCase):
             self.assertNotIn("STALE", text, name)
             self.assertEqual(text, "updated Tue 10:30 AM ET · 0m ago · regenerated every 15 min", name)
         # The legacy page's content is baked; its badge follows the same rule.
-        cls, text = freshness_badge(dom_html(clock_page(self.out / "legacy.html", NOW)))
-        self.assertEqual((cls, text), ("fresh", "updated 14:30 UTC · 0m ago · regenerated every 15 min"))
+        html = dom_html(clock_page(self.out / "legacy.html", NOW))
+        self.assertIn("Is the agent getting better or worse?", html[html.find('<div id="app">'):])
+        self.assertEqual(freshness_badge(html), ("fresh", "updated 14:30 UTC · 0m ago · regenerated every 15 min"))
+
+    def test_a_page_without_its_data_element_says_so(self):
+        # A truncated upload must not read as a quiet, empty dashboard.
+        for name, query in (("index.html", ""), ("run.html", "build=2097282860221206528")):
+            page = self.out / name
+            copy = page.with_name(page.stem + "-nodata" + page.suffix)
+            copy.write_text(re.sub(r'<script type="application/json" id="inline-brief">.*?</script>', "", page.read_text(), count=1, flags=re.DOTALL))
+            app = dom_text(copy, query=query)
+            self.assertIn("This page could not render.", app, name)
+            self.assertIn("inline-brief", app, name)
+            self.assertNotIn("No gate verdict is published", app, name)
+            self.assertNotIn("No run with that id", app, name)
 
     def test_old_inline_data_still_reads_stale(self):
         # Not calling a failed poll UNREACHABLE must not hide real staleness:

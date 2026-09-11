@@ -4,7 +4,8 @@
 Usage::
 
     python3 scripts/eval_dashboard/render.py --data data.json --out-dir out/ \\
-        [--health health.json] [--health-history health-history.jsonl]
+        [--health health.json] [--health-history health-history.jsonl] \\
+        [--public-url [BASE]]
 
 writes three pages and two data files into ``out/``:
 
@@ -25,9 +26,9 @@ writes three pages and two data files into ``out/``:
 The Brief and the PR view are rendered in the browser
 (``template/page.html.tmpl`` + ``template/pages.js``) from the brief.json
 document inlined into each page as ``<script type="application/json"
-id="inline-brief">`` (health.json beside it as ``inline-health``), so a
+id="inline-brief">`` (the verdict it read again as ``inline-health``), so a
 page needs no request beyond itself; the 60-second poll of the published
-``brief.json`` is a best-effort refresh on top, and a host that answers an
+``brief.json`` and ``health.json`` is a best-effort refresh on top, and a host that answers an
 XHR with a login redirect (storage.cloud.google.com does) just leaves the
 inlined data on screen. ``--public-url`` adds ``<base href>`` so every
 relative link resolves to the published site wherever the browser landed
@@ -130,8 +131,9 @@ HEALTH_HISTORY_FILE = "health-history.jsonl"
 INLINE_BRIEF_ID = "inline-brief"
 INLINE_HEALTH_ID = "inline-health"
 # Where the pages are published: the directory of the index.html URL the
-# Chat messages and the gate comment link to, so `--public-url` with no
-# value names the same host they do (one source, post_health.py).
+# Chat messages (post_health.py) and the gate comment (gate_comment.py's
+# DASHBOARD_ROOT) already link to, so `--public-url` with no value names
+# the host they do rather than a second copy of it.
 PUBLISHED_SITE = post_health.DASHBOARD_URL.rsplit("/", 1)[0]
 # The three states health.json can carry. The pages announce a state with
 # a glyph and the word, never with colour alone.
@@ -1673,7 +1675,7 @@ def main(argv: list[str] | None = None) -> int:
         const=PUBLISHED_SITE,
         default=None,
         metavar="BASE",
-        help=f"emit <base href> so every link resolves to this site; the bare flag means the published dashboard ({PUBLISHED_SITE}); default: none, links stay relative",
+        help=f"emit <base href> so every link resolves to this site; the bare flag means the published dashboard ({PUBLISHED_SITE}); default (or an empty value): none, links stay relative",
     )
     args = parser.parse_args(argv)
 

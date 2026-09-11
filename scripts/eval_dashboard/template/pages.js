@@ -3,8 +3,9 @@
  * render.py inlines it into both pages after two JSON data elements
  * (PAGE.inlineBrief and PAGE.inlineHealth): brief.json -- the per-run
  * classification classify.py produced, the current health verdict, the
- * health history and the recent merges -- and health.json when there is
- * one. Each page renders itself from those in the browser. There is no
+ * health history and the recent merges -- and, when there is a verdict,
+ * that verdict again under its own id (the same normalized document as
+ * brief.health). Each page renders itself from those in the browser. There is no
  * server-side HTML for these two pages:
  * everything a reader sees is computed here from the inlined copy, with no
  * request beyond the page itself.
@@ -74,7 +75,11 @@ function inlineJson(id) {
   try { return JSON.parse(el.textContent); } catch (err) { return null; }
 }
 
-let brief = inlineJson(PAGE.inlineBrief) || {};
+let brief = inlineJson(PAGE.inlineBrief);
+// No usable data element (a truncated upload, a hand-edited page): say so
+// rather than render an empty dashboard that reads as "nothing happened".
+let briefLoaded = brief != null && typeof brief === "object";
+brief = briefLoaded ? brief : {};
 let health = normalizeHealth(inlineJson(PAGE.inlineHealth) ?? brief.health);
 // True once a brief.json poll has succeeded; until then (a file:// preview,
 // a host that redirects XHRs) the page is as fresh as its last publish.
@@ -745,6 +750,7 @@ function renderAll() {
   const app = document.getElementById("app");
   const page = document.body.dataset.page;
   try {
+    if (!briefLoaded) throw new Error(`the page's data element (#${PAGE.inlineBrief}) is missing or unreadable`);
     app.innerHTML = page === "run" ? runHtml(link) : briefHtml(link);
   } catch (err) {
     app.innerHTML = `<div class="sec head"><h1>This page could not render.</h1><div class="lede">${esc(String(err && err.message || err))}. <a href="legacy.html">Legacy view →</a></div></div>`;
@@ -770,9 +776,11 @@ async function refresh() {
     const next = await fetchJson(PAGE.briefFile);
     if (next && typeof next === "object" && Array.isArray(next.runs)) {
       brief = next;
+      briefLoaded = true;
       health = normalizeHealth(next.health) ?? health;
+      // Only a payload the page took counts as a successful poll.
+      live = true;
     }
-    live = true;
   } catch (err) {
     // The inlined data stays on screen; the badge says the page is as
     // fresh as its last publish.

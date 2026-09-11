@@ -1066,7 +1066,7 @@ class LiveReadSideTest(unittest.TestCase):
         # bare Date.parse reads one as local time, so the mirror appends
         # "Z" -- otherwise every day bucket and week window would shift
         # for a viewer outside UTC. Contract tripwire on the shipped
-        # script, like the STALE/UNREACHABLE labels.
+        # script, like the STALE label.
         self.assertIn('text += "Z"', script_source(self.html))
 
 

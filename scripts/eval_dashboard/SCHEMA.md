@@ -317,8 +317,9 @@ first two is America/Toronto ("ET"), formatted in the browser with
 
 The Brief and the PR view render in the browser from `brief.json` (below),
 which `render.py` inlines into each page as
-`<script type="application/json" id="inline-brief">` (the health verdict
-beside it as `inline-health`), so a page needs no request beyond itself;
+`<script type="application/json" id="inline-brief">` (the verdict it read,
+the same document as `brief.health`, again as `inline-health`), so a page
+needs no request beyond itself;
 the poll of the published `brief.json` and `health.json` every 60 seconds
 is a best-effort refresh on top, and the legacy page polls `data.json` the
 same way. That matters on `storage.cloud.google.com`, which answers an XHR
