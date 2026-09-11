@@ -118,6 +118,53 @@ func TestResolveNetpolProfile(t *testing.T) {
 		}
 	})
 
+	t.Run("DiscoveryOpenShiftDNS", func(t *testing.T) {
+		t.Parallel()
+		scheme := setupScheme()
+		ocpDNSSvc := &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Namespace: "openshift-dns", Name: "dns-default"},
+			Spec:       corev1.ServiceSpec{ClusterIP: "172.30.0.10"},
+		}
+		client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(ocpDNSSvc).Build()
+		r := &PlatformAgentReconciler{Client: client, Scheme: scheme}
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+		}
+
+		profile := r.resolveNetpolProfile(context.Background(), agent)
+		if !reflect.DeepEqual(profile.DNSClusterIPs, []string{"172.30.0.10"}) {
+			t.Errorf("got DNSClusterIPs %v, want [172.30.0.10]", profile.DNSClusterIPs)
+		}
+		if profile.DNSSource != netpolSourceDiscovered {
+			t.Errorf("got DNSSource %q, want %q", profile.DNSSource, netpolSourceDiscovered)
+		}
+	})
+
+	t.Run("DiscoveryOpenShiftDNS_TransientError_PreservesDiscoveredStatus", func(t *testing.T) {
+		t.Parallel()
+		scheme := setupScheme()
+		client := fake.NewClientBuilder().WithScheme(scheme).
+			WithInterceptorFuncs(openShiftDNSGetFails()).Build()
+		r := &PlatformAgentReconciler{Client: client, Scheme: scheme}
+		agent := &agentv1alpha1.PlatformAgent{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-agent", Namespace: "default"},
+			Status: agentv1alpha1.AgentStatus{
+				NetworkPolicy: agentv1alpha1.NetworkPolicyStatus{
+					DNSClusterIPs:       []string{"172.30.0.10"},
+					DNSClusterIPsSource: netpolSourceDiscovered,
+				},
+			},
+		}
+
+		profile := r.resolveNetpolProfile(context.Background(), agent)
+		if !reflect.DeepEqual(profile.DNSClusterIPs, []string{"172.30.0.10"}) {
+			t.Errorf("got DNSClusterIPs %v, want [172.30.0.10]", profile.DNSClusterIPs)
+		}
+		if profile.DNSSource != netpolSourceDiscovered {
+			t.Errorf("got DNSSource %q, want %q", profile.DNSSource, netpolSourceDiscovered)
+		}
+	})
+
 	// The three subtests below hold the anti-flap arm of the discovery rung: a Get that
 	// fails with anything other than NotFound must not drop the agent back to
 	// defaultDNSClusterIP. On a cluster whose kube-dns sits outside the classic Service
@@ -905,3 +952,17 @@ func metadataDaemonGetFails() interceptor.Funcs {
 		},
 	}
 }
+
+// openShiftDNSGetFails makes the openshift-dns/dns-default read return ServiceUnavailable --
+// a transient API error rather than a NotFound, testing anti-flap logic for OpenShift DNS.
+func openShiftDNSGetFails() interceptor.Funcs {
+	return interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if key.Namespace == openShiftDNSNamespace && key.Name == openShiftDNSServiceName {
+				return apierrors.NewServiceUnavailable("apiserver is shutting down")
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}
+}
+

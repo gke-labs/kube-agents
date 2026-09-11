@@ -385,6 +385,10 @@ func TestTheAllowlistCoversWhatTheAgentCannotRunWithout(t *testing.T) {
 			why: "every other destination is reached by name; without DNS the allowlist is a total block",
 		},
 		{
+			name: "openshift-dns", ns: "openshift-dns", labels: map[string]string{"dns.operator.openshift.io/daemonset-dns": "default"}, port: 53,
+			why: "OpenShift CoreDNS daemonset in openshift-dns resolves names on OpenShift clusters",
+		},
+		{
 			name: "the credential broker", ns: agent.Namespace,
 			labels: map[string]string{"app": credentialBrokerName(agent)}, port: credentialProxyPort,
 			why: "CREDENTIAL_PROXY_URL, GOOGLE_CHAT_RELAY_URL and SLACK_RELAY_URL all address it (credentialProxyBaseURL)",
