@@ -106,6 +106,14 @@ def profile_home(name: str) -> Path:
     return PROFILES_BASE / name
 
 
+def kubeconfig_dir() -> Path:
+    return HERMES_HOME / ".kubeconfigs"
+
+
+def kubeconfig_path(project: str, cluster: str, location: str) -> Path:
+    return kubeconfig_dir() / f"kubeconfig_{project}_{cluster}_{location}.yaml"
+
+
 def _inject_cluster_identity(home: Path, project: str, cluster: str, location: str) -> None:
     """Write a machine-readable cluster_identity block into the profile's config.yaml.
 
@@ -358,7 +366,15 @@ def create_profile(project: str, cluster: str, location: str) -> str:
     # dns_endpoint_args below stays on the default login: it consumes gcloud's
     # output as a fact about the cluster, which is what TERMINAL_PRINCIPAL is
     # not for.
-    kubeconfig = home / "kubeconfig.yaml"
+    # Pinned under HERMES_HOME/.kubeconfigs rather than directly inside the
+    # profile home directory: Hermes tightens profile home permissions to 0700
+    # on worker launch, which renders files inside it unreadable to the
+    # credential proxy sidecar (uid 10001, group hermes) (#1500). Storing the
+    # kubeconfig in .kubeconfigs (mode 0664) ensures the proxy and kubectl
+    # can both access it regardless of profile home permission tightening.
+    kdir = kubeconfig_dir()
+    kdir.mkdir(parents=True, exist_ok=True)
+    kubeconfig = kubeconfig_path(project, cluster, location)
     env = _run_env({"KUBECONFIG": str(kubeconfig)})
     try:
         sandbox_exec.run(
@@ -407,6 +423,12 @@ def create_profile(project: str, cluster: str, location: str) -> str:
             f"at {kubeconfig} where kubectl will look for it. The profile is "
             "scaffolded; re-run this command once the shell sandbox is up."
         )
+
+    if kubeconfig.exists():
+        try:
+            kubeconfig.chmod(0o664)
+        except OSError:
+            pass
 
     # 3b. Pin KUBECONFIG for the dispatcher-spawned worker via the profile's .env.
     _pin_kubeconfig_env(home, kubeconfig)
@@ -459,6 +481,14 @@ def delete_profile(name: str) -> None:
     subcommand and the reconcile engine.
     """
     home = profile_home(name)
+    identity = read_cluster_identity(home)
+    if identity:
+        try:
+            kc = kubeconfig_path(identity["project"], identity["cluster"], identity["location"])
+            if kc.exists():
+                kc.unlink()
+        except OSError:
+            pass
     try:
         # Stays in the agent pod: `hermes` needs the profiles on the data PVC and
         # the gateway on loopback, and the sandbox image does not carry it.

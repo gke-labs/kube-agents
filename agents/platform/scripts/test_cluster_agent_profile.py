@@ -405,7 +405,7 @@ class CreateProfileTest(unittest.TestCase):
             "project": self.PROJECT,
             "cluster": self.CLUSTER,
             "location": self.LOCATION,
-            "kubeconfig": str(self.profile / "kubeconfig.yaml").lower(),
+            "kubeconfig": str(cap.kubeconfig_path(self.PROJECT, self.CLUSTER, self.LOCATION)).lower(),
         }
         for key, value in expected.items():
             # The Python equivalent of the script's
@@ -521,6 +521,20 @@ class CreateProfileTest(unittest.TestCase):
         cfg = self.plugin_config()
         self.assertFalse(cfg["enabled"])
         self.assertEqual(cfg["backends"], [])
+
+    def test_kubeconfig_pinned_outside_profile_home(self):
+        self.create()
+        expected_kc = cap.kubeconfig_path(self.PROJECT, self.CLUSTER, self.LOCATION)
+        self.assertEqual(expected_kc.parent, self.home_root / ".kubeconfigs")
+        self.assertIn(f"KUBECONFIG={expected_kc}\n", (self.profile / ".env").read_text())
+
+    def test_delete_profile_cleans_external_kubeconfig(self):
+        self.create()
+        expected_kc = cap.kubeconfig_path(self.PROJECT, self.CLUSTER, self.LOCATION)
+        expected_kc.touch()
+        self.assertTrue(expected_kc.exists())
+        cap.delete_profile(self.profile.name)
+        self.assertFalse(expected_kc.exists())
 
 
 if __name__ == "__main__":
