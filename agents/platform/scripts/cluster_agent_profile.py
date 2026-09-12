@@ -68,10 +68,6 @@ RESERVED_PROFILES = frozenset({"default", "platform"})
 KUBECONFIG_PROBE = "/usr/bin/test"
 KUBECONFIG_PROBE_TIMEOUT_SECONDS = 30
 
-# How delete_profile unlinks a kubeconfig on the sandbox volume.
-KUBECONFIG_RM = "/bin/rm"
-KUBECONFIG_RM_TIMEOUT_SECONDS = 30
-
 
 def log(msg: str) -> None:
     print(f"[CLUSTER-PROFILE] {msg}", file=sys.stderr)
@@ -108,14 +104,6 @@ def profile_name(project: str, cluster: str, location: str) -> str:
 
 def profile_home(name: str) -> Path:
     return PROFILES_BASE / name
-
-
-def kubeconfig_dir() -> Path:
-    return HERMES_HOME / ".kubeconfigs"
-
-
-def kubeconfig_path(project: str, cluster: str, location: str) -> Path:
-    return kubeconfig_dir() / f"kubeconfig_{project}_{cluster}_{location}.yaml"
 
 
 def _inject_cluster_identity(home: Path, project: str, cluster: str, location: str) -> None:
@@ -244,31 +232,6 @@ def kubeconfig_landed(kubeconfig: Path) -> bool:
     return probe.returncode == 0
 
 
-def _unlink_kubeconfig(kubeconfig: Path) -> None:
-    """Remove the kubeconfig file wherever it was written.
-
-    Which filesystem that is depends on the install: with a sandbox, gcloud
-    wrote it on the sandbox volume as TERMINAL_PRINCIPAL; without one, it was
-    written on this pod's own filesystem. Unlinked the same way as
-    kubeconfig_landed probes.
-    """
-    try:
-        if kubeconfig.exists():
-            kubeconfig.unlink()
-    except OSError:
-        pass
-    if sandbox_exec.sandbox_enabled():
-        try:
-            sandbox_exec.run(
-                [KUBECONFIG_RM, "-f", "--", str(kubeconfig)],
-                check=False,
-                timeout=KUBECONFIG_RM_TIMEOUT_SECONDS,
-                principal=sandbox_exec.TERMINAL_PRINCIPAL,
-            )
-        except (sandbox_exec.SandboxUnavailable, OSError, subprocess.TimeoutExpired):
-            pass
-
-
 def _push_sandbox_layout(name: str) -> None:
     """Run the mirror's skeleton pass so this profile exists in the sandbox.
 
@@ -395,13 +358,7 @@ def create_profile(project: str, cluster: str, location: str) -> str:
     # dns_endpoint_args below stays on the default login: it consumes gcloud's
     # output as a fact about the cluster, which is what TERMINAL_PRINCIPAL is
     # not for.
-    # Pinned under HERMES_HOME/.kubeconfigs rather than directly inside the
-    # profile home directory: aligns cluster agent profiles with the shared
-    # credential layout used by the platform MCP server and governance SOPs,
-    # and keeps cluster credentials decoupled from profile directory lifecycles (#1500).
-    kdir = kubeconfig_dir()
-    kdir.mkdir(parents=True, exist_ok=True)
-    kubeconfig = kubeconfig_path(project, cluster, location)
+    kubeconfig = home / "kubeconfig.yaml"
     env = _run_env({"KUBECONFIG": str(kubeconfig)})
     try:
         sandbox_exec.run(
@@ -502,11 +459,6 @@ def delete_profile(name: str) -> None:
     subcommand and the reconcile engine.
     """
     home = profile_home(name)
-    identity = read_cluster_identity(home)
-    if identity:
-        _unlink_kubeconfig(
-            kubeconfig_path(identity["project"], identity["cluster"], identity["location"])
-        )
     try:
         # Stays in the agent pod: `hermes` needs the profiles on the data PVC and
         # the gateway on loopback, and the sandbox image does not carry it.
