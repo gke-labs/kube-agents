@@ -202,6 +202,28 @@ class ParseManifestsTest(unittest.TestCase):
         self.assertEqual(docs, [])
         self.assertEqual(reason, scan.REASON_TEMPLATE)
 
+    def test_loader_errors_outside_yamlerror_are_skipped_not_fatal(self):
+        # PyYAML's timestamp constructor raises a bare ValueError for a date that
+        # does not exist; that used to escape and mark the whole repository unread.
+        docs, reason = scan.parse_manifests("d.yaml", b"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: x\n  annotations:\n    reviewed: 2001-02-30\n")
+        self.assertEqual(docs, [])
+        self.assertTrue(reason.startswith("YAML did not parse: ValueError"), reason)
+        nested = b"[" * 20000 + b"]" * 20000
+        docs, reason = scan.parse_manifests("deep.json", nested)
+        self.assertEqual(docs, [])
+        self.assertTrue(reason.startswith("JSON did not parse"), reason)
+
+    def test_a_bad_scalar_in_one_file_does_not_hide_a_hit_in_another(self):
+        snapshot = scan.Snapshot(source="local directory t", sha=None, files={
+            "a.yaml": b"apiVersion: v1\nkind: ConfigMap\nmetadata: {name: x, annotations: {reviewed: 2001-02-30}}\n",
+            "b.yaml": PDB_V1BETA1,
+        })
+        report = scan.build_report(scan.load_table(), (1, 24), (1, 27), [], [("t", lambda: snapshot)])
+        section = report["sources"]["t"]
+        self.assertIsNone(section["error"])
+        self.assertEqual([h["kind"] for h in section["hits"]], ["PodDisruptionBudget"])
+        self.assertEqual([k["path"] for k in section["skipped"]], ["a.yaml"])
+
     def test_bad_yaml_json_and_bytes_are_skipped(self):
         _, reason = scan.parse_manifests("b.yaml", b"a: [unclosed\n")
         self.assertTrue(reason.startswith("YAML did not parse"), reason)
@@ -320,6 +342,39 @@ class ContentModeTest(unittest.TestCase):
         self.assertIsNone(snapshot.stopped)
         self.assertTrue(fake.closed)
         self.assertEqual(sum(len(b) for b in fake.read_batches), 4)
+
+    def test_request_budget_deferrals_are_asked_for_again(self):
+        files = {"a.yaml": PDB_V1BETA1, "b.yaml": CRONJOB_V1BETA1, "c.yaml": CRONJOB_V1}
+
+        class BudgetedWorkspace(FakeWorkspace):
+            page_size = 10
+
+            def read_many(self, paths):
+                self.read_batches.append(list(paths))
+                if len(self.read_batches) == 1:
+                    # The broker served the first path and deferred the rest.
+                    return {paths[0]: self.files[paths[0]]}, [{"path": p, "reason": "requestBudget"} for p in paths[1:]]
+                return {p: self.files[p] for p in paths}, []
+
+        fake = BudgetedWorkspace(files)
+        snapshot = scan.read_repo_content("acme/infra", "http://broker", open_workspace=lambda *a, **k: fake)
+        self.assertEqual(sorted(snapshot.files), ["a.yaml", "b.yaml", "c.yaml"])
+        self.assertEqual(snapshot.skipped, [])
+        self.assertEqual(fake.read_batches, [["a.yaml", "b.yaml", "c.yaml"], ["b.yaml", "c.yaml"]])
+
+    def test_a_deferral_that_never_clears_is_recorded_once_and_ends(self):
+        class StuckWorkspace(FakeWorkspace):
+            page_size = 10
+
+            def read_many(self, paths):
+                self.read_batches.append(list(paths))
+                return {}, [{"path": p, "reason": "requestBudget"} for p in paths]
+
+        fake = StuckWorkspace({"a.yaml": PDB_V1BETA1, "b.yaml": CRONJOB_V1})
+        snapshot = scan.read_repo_content("acme/infra", "http://broker", open_workspace=lambda *a, **k: fake)
+        self.assertEqual(snapshot.files, {})
+        self.assertEqual([k["path"] for k in snapshot.skipped], ["a.yaml", "b.yaml"])
+        self.assertEqual(len(fake.read_batches), 1)
 
     def test_file_cap_is_reported(self):
         fake = FakeWorkspace({f"m{i}.yaml": CRONJOB_V1 for i in range(5)})
@@ -460,11 +515,30 @@ class MainTest(unittest.TestCase):
 
             with patch.object(scan, "content_mode_available", return_value=False), patch.object(scan, "_runner", runner), patch.object(
                 scan.gitops_workspace, "ensure_workspace", return_value=Path(tmp)
-            ), patch.object(scan.gitops_workspace, "lease_id", return_value="lease-x"):
+            ) as ensure, patch.dict(os.environ, {"HERMES_SESSION_ID": "session-7", "HERMES_KANBAN_TASK": ""}):
                 rc, out, _ = self.run_main(["--repo", "acme/infra", "--current-version", "1.24", "--target-version", "1.27"])
         self.assertEqual(rc, scan.EXIT_OK)
         self.assertIn("## acme/infra — repo manifests as of d00d", out)
         self.assertIn(scan.GIT_HEAD_CMD, runner_calls)
+        # Not the session lease: that clone is the tree submit-suggestion's
+        # prepare handed the agent, and ensure_workspace(reset=True) scrubs it.
+        self.assertEqual(ensure.call_args.kwargs["lease"], "api-deprecation-scan-session-7")
+
+
+class ScanLeaseTest(unittest.TestCase):
+    def test_explicit_lease_is_used_as_given(self):
+        self.assertEqual(scan.scan_lease("my lease"), "my-lease")
+
+    def test_default_lease_is_the_sessions_with_the_scan_prefix(self):
+        with patch.dict(os.environ, {"HERMES_KANBAN_TASK": "card-42"}):
+            self.assertEqual(scan.scan_lease(None), "api-deprecation-scan-card-42")
+        with patch.dict(os.environ, {"HERMES_KANBAN_TASK": "", "HERMES_SESSION_ID": ""}):
+            self.assertTrue(scan.scan_lease(None).startswith("api-deprecation-scan-adhoc-"))
+
+    def test_a_long_session_lease_still_differs_from_the_scan_lease(self):
+        long_lease = "x" * 80
+        with patch.dict(os.environ, {"HERMES_KANBAN_TASK": long_lease}):
+            self.assertNotEqual(scan.scan_lease(None), scan.gitops_workspace.lease_id(None))
 
 
 if __name__ == "__main__":

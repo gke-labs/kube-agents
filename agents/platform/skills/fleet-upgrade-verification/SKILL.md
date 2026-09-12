@@ -87,9 +87,11 @@ the pools that do parse. A note reading `upgrade in flight` means the cluster or
   `--manifests-dir` scans a local tree instead of, or as well as, repositories.
 - It reads each repository the way `inspect-repository` does: through the credential broker's
   content workspaces as a shallow read-only clone, or, on an install whose broker is not armed
-  for content-passing, through a leased checkout on the shared volume. It runs no `gcloud` and
-  writes nothing. A repository the broker or git cannot serve is listed under errors and sets
-  exit code 1; the other repositories are still reported.
+  for content-passing, through a leased checkout on the shared volume. That checkout is under
+  a lease of the scan's own (`--lease` overrides it), so positioning it on the base branch
+  never resets the session's working tree, the one `submit-suggestion` `prepare` hands you to
+  edit. It runs no `gcloud` and writes to no repository. A repository the broker or git cannot
+  serve is listed under errors and sets exit code 1; the other repositories are still reported.
 - Removal data is `removed_apis.json` beside the script: Kubernetes 1.16 through 1.32, from the
   upstream Deprecated API Migration Guide, whose URL and `as_of` version the report prints. The
   script cannot call MCP tools, so when the target is newer than the table (the report says so)
