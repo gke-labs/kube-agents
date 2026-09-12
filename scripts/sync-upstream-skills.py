@@ -92,6 +92,13 @@ GKE_MANIFEST_GENERATION_NEW_ROUTING_SNIPPET = (
     "(use gcp-config-connector)."
 )
 
+# gke-manifest-generation's example ServiceAccount name upstream is `devteam-agent-sa`, a name from
+# this repository's retired multi-CR era (issue #340). The example is neutral here so the skill does
+# not suggest a DevTeamAgent exists.
+GKE_MANIFEST_GENERATION_OLD_SERVICE_ACCOUNT_SNIPPET = "(e.g., `devteam-agent-sa`)"
+
+GKE_MANIFEST_GENERATION_NEW_SERVICE_ACCOUNT_SNIPPET = "(e.g., `checkout-sa`)"
+
 # In-place content substitutions applied to freshly-synced skills to correct upstream defects
 # where an appended footer is insufficient (e.g. multi-step remediation commands), or to route to a
 # skill only this repository has from a passage upstream cannot know about.
@@ -106,6 +113,10 @@ SKILL_SUBSTITUTIONS = {
         (
             GKE_MANIFEST_GENERATION_OLD_ROUTING_SNIPPET,
             GKE_MANIFEST_GENERATION_NEW_ROUTING_SNIPPET,
+        ),
+        (
+            GKE_MANIFEST_GENERATION_OLD_SERVICE_ACCOUNT_SNIPPET,
+            GKE_MANIFEST_GENERATION_NEW_SERVICE_ACCOUNT_SNIPPET,
         ),
     ],
 }
