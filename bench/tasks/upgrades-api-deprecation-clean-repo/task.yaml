@@ -1,0 +1,95 @@
+# COMMENTED OUT — a commented-out entry in hack/ci-eval-pr.sh TASKS, which
+# registers it pending activation. Nobody has watched this case pass and fail:
+# the install it was written against (the robot's) links no GitOps repository,
+# so the scan there has nothing to read. The eval projects do link
+# gke-agentic/kube-agents-evals*-infra as managed_repos, so a maintainer can
+# activate it after one observed run on that fleet. A case that cannot be
+# watched to both pass and fail stays `validated: false` and commented out.
+#
+# The Phase-4 case for the fleet-upgrade-verification skill (#1343, #1412):
+# not "which clusters lag" (upgrades-fleet-version-table asks that) but "is the
+# linked GitOps repository ready for the next minor", which the skill's
+# api_deprecation_scan.py answers per repository with the commit it read. The
+# report is graded, not the tool path: an agent that reads the manifests any
+# other way and states the same source and verdict passes.
+#
+# The clean variant. The eval repositories carry no manifest on an apiVersion
+# the next minor removes, so the correct answer is a clean section that names
+# its source ("repo manifests as of <sha>"). The positive variant — a planted
+# manifest on a removed apiVersion, graded on the resource, the apiVersion and
+# the replacement — needs a manifest committed to the eval repository, which is
+# a fleet-owner change, not a case change; it is drafted in bench/tasks/DRAFTS.md.
+#
+# Isolation class: read-only (chat prompt; no audit helper, no GitOps-repo
+# write). Eligible tier: presubmit once observed.
+#
+# No deterministic mutation safeguard, documented: the case plants nothing and
+# the answer is read from Git, so a fleet_resource_property check has nothing
+# to ground on. The scan itself is read-only by construction.
+id: upgrades-api-deprecation-clean-repo
+name: Deprecation scan of the linked GitOps repository states its source and a per-repo verdict
+prompt: >-
+  Before we pick the next minor version for this project's clusters, check the
+  linked GitOps repository for Kubernetes API versions that the next minor
+  above our current control-plane versions removes. Tell me, per repository,
+  which commit you read, what you found, and what you could not read. Read
+  only; change and upgrade nothing.
+expected_output: >-
+  A per-repository deprecation section read during this run, each stating its
+  source as the repository's commit ("repo manifests as of <sha>"), the current
+  floor and the target minor the scan used, and a verdict: the manifests
+  declaring a removed apiVersion with the resource, the apiVersion used and its
+  replacement, or a clean statement with the count of files and documents read
+  and any files skipped because they did not parse. It says the scan reads what
+  Git declares and points at GKE Deprecation Insights for live client usage
+  rather than claiming no client uses the API. It recommends (not performs)
+  any migration. It cites no CVE identifiers, because it has no vulnerability
+  feed. No mutation of any kind.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+# report_contains: a chat prompt, so the sections are the reply. Three
+# objectives, one for each thing the report must do: name its source, give a
+# verdict, invent nothing. Split rather than one check so a red says which.
+verification_spec:
+  - name: the-section-names-its-source
+    role: objective
+    # assert, not converge: the transcript is immutable once the run ends.
+    mode: assert
+    check:
+      type: report_contains
+      # The source line the issue's acceptance criterion asks for. "as of" is
+      # the phrase the skill's script prints; a report that read the repository
+      # another way still has to say which commit it read.
+      required_phrases: ["as of"]
+  - name: the-section-gives-a-verdict
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # Either outcome is a verdict; what fails is a reply that names neither.
+      # The clean spellings come first because the eval repositories carry no
+      # removed apiVersion; the hit spellings are the table's column names, so
+      # a planted manifest (the positive variant) grades on the same check.
+      any_of_phrases:
+        [
+          "clean",
+          "no manifest",
+          "none of the manifests",
+          "removed in",
+          "replacement",
+        ]
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # No vulnerability feed; a CVE id in a deprecation scan is an invention.
+      forbidden_phrases: ["CVE-"]
