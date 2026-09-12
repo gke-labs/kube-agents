@@ -58,6 +58,7 @@ from cluster_agent_profile import (
     create_profile,
     delete_profile,
     kubeconfig_landed,
+    kubeconfig_path,
     list_profiles,
     profile_home,
     read_cluster_identity,
@@ -217,7 +218,7 @@ SCAFFOLD_ARTIFACTS = ("USER.md",)
 KUBECONFIG_ARTIFACT = "kubeconfig.yaml"
 
 
-def _scaffold_gaps(home: Path) -> list[str]:
+def _scaffold_gaps(home: Path, identity: dict[str, str] | None = None) -> list[str]:
     """Artifacts create_profile writes after the identity stamp that this home lacks.
 
     ``create_profile`` stamps ``cluster_identity`` into ``config.yaml`` (step 2b)
@@ -239,7 +240,17 @@ def _scaffold_gaps(home: Path) -> list[str]:
     reached, which is the case a recreated sandbox volume actually needs.
     """
     gaps = [f for f in SCAFFOLD_ARTIFACTS if not (home / f).exists()]
-    if not kubeconfig_landed(home / KUBECONFIG_ARTIFACT):
+    kc_landed = False
+    if identity:
+        ext_kc = kubeconfig_path(identity["project"], identity["cluster"], identity["location"])
+        if kubeconfig_landed(ext_kc):
+            kc_landed = True
+    if not kc_landed:
+        int_kc = home / KUBECONFIG_ARTIFACT
+        if kubeconfig_landed(int_kc):
+            kc_landed = True
+
+    if not kc_landed:
         gaps.insert(0, KUBECONFIG_ARTIFACT)
     return gaps
 
@@ -272,7 +283,7 @@ def reconcile(dry_run: bool = False) -> dict:
     for name, identity in identities.items():
         if not identity:
             continue
-        missing = _scaffold_gaps(profile_home(name))
+        missing = _scaffold_gaps(profile_home(name), identity=identity)
         if missing:
             log(f"{name}: incomplete scaffold ({', '.join(missing)} missing) — recreating.")
             report["incomplete"].append(name)
