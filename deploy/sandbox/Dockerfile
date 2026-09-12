@@ -264,6 +264,10 @@ COPY agents/platform/governance/ /opt/defaults/governance/
 #                          for anything that shells out
 #   forge.py               GitHub REST client, imported by pr_conversation
 #   pr_triggers.py         imported by pr_conversation, imports forge
+#   pr_skill.py            the gates pr_conversation and update_pr share — the
+#                          managed-repo check, the agent-owns-this-PR check, and
+#                          the scratch confinement on a comment body. Imports
+#                          forge, and gitops_workspace at call time
 #   github_token_refresh.py  invoked directly by submit-suggestion Step 5
 #   wif_credentials.py     imported by github_token_refresh, and reached only by
 #                          the branch the proxy container takes; here so that the
@@ -303,6 +307,7 @@ COPY agents/platform/scripts/sandbox_exec.py \
      agents/platform/scripts/repo_ref.py \
      agents/platform/scripts/forge.py \
      agents/platform/scripts/pr_triggers.py \
+     agents/platform/scripts/pr_skill.py \
      agents/platform/scripts/github_token_refresh.py \
      agents/platform/scripts/wif_credentials.py \
      agents/platform/scripts/gitops_workspace.py \

@@ -65,7 +65,7 @@ terraform output manual_steps
 
 Two steps are human-only, and the minter does not work until both are done. `terraform output manual_steps` prints them with this project's values substituted.
 
-**1. Install the GitHub App on the project's GitOps repository.** A GitHub App installation is not a GCP resource, and creating one needs org-admin rights on `gke-agentic`. Grant `contents: write`, `pull_requests: write` and `issues: write` on that repository only.
+**1. Install the GitHub App on the project's GitOps repository.** A GitHub App installation is not a GCP resource, and creating one needs org-admin rights on `gke-agentic`. Grant `contents: write`, `pull_requests: write`, `issues: write`, `checks: read` and `statuses: read` on that repository only. The scope the minter hands out cannot exceed what the installation holds, so the two reads have to be here as well as in the ConfigMap.
 
 **This is already done for every project onboarded so far.** The pool is served by one App, `kube-agents-evals-token-minter`, **App ID `4675512`**, installed on each project's `gke-agentic/<project>-infra` repository and nothing else. The query below is the list, rather than a copy of it kept here to go stale:
 

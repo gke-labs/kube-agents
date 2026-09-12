@@ -49,6 +49,12 @@ a request by pasting the string, which is the same trap
 
 The human's comment is never edited and never consumed. Whatever the agent
 learns about a conversation, it learns by re-reading it.
+
+**Has it already tried to fix the branch?** By the same scheme, keyed on the
+head sha rather than on a comment: `<!-- agent-updated:<sha> -->` in a comment
+the agent wrote. That third marker belongs to the `pr_updates` sweep and the
+`update-pr` skill, which are triggered by the state of a branch rather than by
+anything anyone said — see `updated_head_shas` for the two bounds it carries.
 """
 
 from __future__ import annotations
@@ -75,6 +81,22 @@ BOT_ALLOWLIST_ENV = "PR_AGENT_BOT_ALLOWLIST"
 #: hundred comments the budget was there to prevent.
 MAX_REFUSALS_ENV = "PR_AGENT_MAX_REFUSALS_PER_PR"
 MAX_REFUSALS_DEFAULT = 10
+
+#: How many times the agent will ever push an unprompted fix to one pull
+#: request. Read here for the same reason as the refusal budget: the `pr_updates`
+#: sweep and the `update-pr` worker skill both count against it, and a budget
+#: each caller keeps its own copy of is a budget the second one can spend again.
+#:
+#: This bound is what makes an autonomous fix loop terminate. Every other bound
+#: in this module is per *request* — a human wrote something, the agent answers
+#: it once. An update run has no such anchor: it is triggered by the state of the
+#: branch, and its own fix commit changes that state, so a fix that does not work
+#: re-triggers the sweep on the new head sha and the agent tries again. Five is
+#: enough for the ordinary shape (resolve a conflict, then fix the lint it
+#: exposed, then fix the test that lint fixed wrong) and short of the number at
+#: which a reviewer would rather nobody had tried.
+MAX_UPDATE_ATTEMPTS_ENV = "PR_AGENT_MAX_UPDATE_ATTEMPTS"
+MAX_UPDATE_ATTEMPTS_DEFAULT = 5
 
 #: The command form. A leading `/` mirrors `/remediate` on the audit ledger and
 #: `/review` on this repository's own pull requests, so a reviewer who has seen
@@ -120,11 +142,18 @@ HIDING_CHARS = "<[]"
 ANSWERED_MARKER = "agent-answered"
 REFUSED_MARKER = "agent-refused"
 
+#: The third marker names a **commit sha**, not a comment node id: an update run
+#: is triggered by the state of the head commit rather than by anything anyone
+#: said, so the thing it records having handled is that commit. One marker per
+#: attempt, so counting them is the attempt budget above and testing the current
+#: head against them is what stops the same tip being worked twice.
+UPDATED_MARKER = "agent-updated"
+
 #: Deliberately permissive about the id: GraphQL node ids are base64-ish and the
 #: alphabet is not documented as stable. Over-matching here costs nothing — the
 #: id is only ever compared for equality against one the forge just gave us.
 MARKER_RE = re.compile(
-    r"<!--\s*agent-(answered|refused)\s*:\s*([A-Za-z0-9_=+/\-]+)\s*-->"
+    r"<!--\s*agent-(answered|refused|updated)\s*:\s*([A-Za-z0-9_=+/\-]+)\s*-->"
 )
 
 #: How much of a request is carried into a card title. The body is not truncated.
@@ -284,6 +313,22 @@ def max_refusals_per_pr() -> int:
         return MAX_REFUSALS_DEFAULT
 
 
+def max_update_attempts() -> int:
+    """Total unprompted fix runs either caller may make on one pull request.
+
+    Same reading as `max_refusals_per_pr`: unset or unparseable takes the
+    default, and zero or below is honoured as a way to stop the agent updating
+    pull requests at all without editing the roster.
+    """
+    raw = os.environ.get(MAX_UPDATE_ATTEMPTS_ENV, "").strip()
+    if not raw:
+        return MAX_UPDATE_ATTEMPTS_DEFAULT
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return MAX_UPDATE_ATTEMPTS_DEFAULT
+
+
 def is_addressable_bot(comment, allowed: set[str]) -> bool:
     """May this comment be read as addressing the agent, given its author?
 
@@ -295,7 +340,11 @@ def is_addressable_bot(comment, allowed: set[str]) -> bool:
 
 
 def _marked_node_ids(comments, self_login: str, kinds) -> set[str]:
-    """Node ids carrying one of `kinds` in a comment the agent wrote itself.
+    """Ids carrying one of `kinds` in a comment the agent wrote itself.
+
+    "Id" is a comment node id for `answered` and `refused` and a commit sha for
+    `updated`. The scan does not care which — it compares for equality against
+    an id the forge just gave us, and never parses one.
 
     Only comments whose author normalises to `self_login` are read: see the
     module docstring for why that restriction is the whole security of the
@@ -326,3 +375,31 @@ def refused_node_ids(comments, self_login: str) -> set[str]:
     an unbounded number of them.
     """
     return _marked_node_ids(comments, self_login, ("refused",))
+
+
+def updated_head_shas(comments, self_login: str) -> set[str]:
+    """Head shas the agent has already tried to fix on this pull request.
+
+    Two questions come off one scan. Whether the *current* head is in the set
+    answers "have I already worked this tip", which is what stops a fix run that
+    changed nothing being repeated every ten minutes for as long as the pull
+    request stays open. How many entries the set holds answers "how many times
+    have I tried at all", which is `max_update_attempts` and is what stops a fix
+    that itself re-triggers the sweep from looping — each attempt pushes a
+    commit, so each one is a new tip that would otherwise qualify afresh.
+
+    A run the agent abandoned before posting leaves no marker, and is therefore
+    retried, and neither bound above has counted it. That is deliberate for a
+    run that pushed nothing — the card's idempotency key holds the retry to
+    once an hour, and the alternative, treating an unrecorded attempt as an
+    attempt, would let one crashed turn park a pull request for good with
+    nothing said to anyone.
+
+    It is not free for a run that pushed. The commit moves the tip, so the key
+    carries a new sha and mints immediately rather than waiting out the hour,
+    and the retry is every sweep. `update_pr.py record` closes the part of that
+    it can reach, by writing the marker on any refusal that comes after the
+    push; a turn reaped before `record` runs at all is the residue, and its
+    module docstring says what closing that one would cost.
+    """
+    return _marked_node_ids(comments, self_login, ("updated",))

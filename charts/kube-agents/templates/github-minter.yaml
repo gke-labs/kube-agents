@@ -73,6 +73,14 @@ data:
           contents: 'write'
           pull_requests: 'write'
           issues: 'write'
+          # Read-only, and read-only for one reason: the update-pr sweep asks
+          # `GET /commits/{sha}/check-runs` and `/commits/{sha}/status` which
+          # checks are red before it decides whether a pull request needs a
+          # card. Without these the App gets 403 on both, forge.py raises
+          # REPO_UNREACHABLE, and the sweep drops the pull request entirely --
+          # the merge-conflict card with it, since one `try` covers both reads.
+          checks: 'read'
+          statuses: 'read'
   {{ $repo }}.yaml: |
     version: 'minty.abcxyz.dev/v2'
     rule:
@@ -87,6 +95,14 @@ data:
           contents: 'write'
           pull_requests: 'write'
           issues: 'write'
+          # Read-only, and read-only for one reason: the update-pr sweep asks
+          # `GET /commits/{sha}/check-runs` and `/commits/{sha}/status` which
+          # checks are red before it decides whether a pull request needs a
+          # card. Without these the App gets 403 on both, forge.py raises
+          # REPO_UNREACHABLE, and the sweep drops the pull request entirely --
+          # the merge-conflict card with it, since one `try` covers both reads.
+          checks: 'read'
+          statuses: 'read'
 ---
 apiVersion: apps/v1
 kind: Deployment

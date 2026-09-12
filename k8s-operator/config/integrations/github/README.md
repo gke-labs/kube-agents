@@ -34,7 +34,7 @@ Create the GitOps repository under an organization, or transfer an existing repo
 ### Setting up the GitHub App
 
 1. Navigate to your GitHub Organization (or personal settings) -> **Developer Settings** -> **GitHub Apps** -> **New GitHub App**.
-2. Assign a name and configure the required repository permissions (e.g., `Contents: Read & write`, `Pull requests: Read & write`, `Issues: Read & write`).
+2. Assign a name and configure the required repository permissions: `Contents: Read & write`, `Pull requests: Read & write`, `Issues: Read & write`, `Checks: Read-only`, `Commit statuses: Read-only`. The two read-only ones are what the update-pr sweep reads to see which checks are red; the minter can only hand out a subset of what the installation holds, so the `checks: read` and `statuses: read` in `platform-agent-scope` do nothing without them.
 3. Once created, note the **App ID**.
 4. Scroll down and click **Generate a private key**. This will download a `.pem` file to your local machine.
 5. Navigate to the target repository the agent is intended to manage, go to **Settings** -> **GitHub Apps**, and install the newly created App.
