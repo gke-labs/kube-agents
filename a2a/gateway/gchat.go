@@ -109,16 +109,23 @@ const (
 )
 
 // verifiedByFor names the mechanism that checked the requester at ingress
-// for one backend (authority.requester.verifiedBy).
+// for one backend (authority.requester.verifiedBy) — the authority block
+// should say what was actually checked, not just "the map". Discord (and
+// anything unlisted) is the test mapping table alone.
 func verifiedByFor(backend string) string {
-	if backend == gchatBackend {
+	switch backend {
+	case gchatBackend:
 		return gchatVerifiedBy
+	case slackBackend:
+		return slackVerifiedBy
+	default:
+		return "principal-map"
 	}
-	return "principal-map"
 }
 
 // unverifiedRemedyFor names what an admin edits to admit a sender — the
-// allowlist on gchat, the mapping table everywhere else.
+// allowlist on gchat, the mapping table everywhere else (Discord's ConfigMap,
+// Slack's a2a-slack-principal-map Secret).
 func unverifiedRemedyFor(backend string) string {
 	if backend == gchatBackend {
 		return "the allowed users list"

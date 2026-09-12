@@ -12,22 +12,24 @@ import (
 )
 
 // PrincipalMap resolves backend-native user ids to principals in our trust
-// domain. For Discord it is a mounted install-side mapping table (a
-// ConfigMap; nothing is checked into the repo) and a test fixture by
-// construction: a Discord identity never maps to a real cloud principal,
-// full stop (spec-chatops-gateway.md). A sender with no entry cannot be
-// verified and their message is dropped at ingress.
+// domain. For Discord it is a mounted install-side ConfigMap (nothing is
+// checked into the repo) and a test fixture by construction: a Discord
+// identity never maps to a real cloud principal, full stop. For Slack it is
+// the admin-owned a2a-slack-principal-map Secret, joining the immutable
+// user_id to an IdP-sourced principal (spec-chatops-gateway.md, "The Slack
+// adapter"). A sender with no entry cannot be verified and their message is
+// dropped at ingress.
 type PrincipalMap struct {
 	mu sync.RWMutex
 	m  map[string]string
 }
 
-// LoadPrincipalMap reads the map from a directory of files (the mounted
-// principal-map ConfigMap: one file per backend user id, content is the
+// LoadPrincipalMap reads the map from a directory of files (a mounted
+// ConfigMap or Secret: one file per backend user id, content is the
 // principal) or from a single file of "id principal" lines. A missing path
 // yields an empty map — the gateway runs, and every message drops at
-// verification, which is the honest failure for an install without W0's
-// ConfigMap.
+// verification, which is the honest failure for an install without its
+// mapping table.
 func LoadPrincipalMap(path string) (*PrincipalMap, error) {
 	pm := &PrincipalMap{m: map[string]string{}}
 	info, err := os.Stat(path)

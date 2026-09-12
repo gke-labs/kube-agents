@@ -352,6 +352,13 @@ func TestNewTaskRoutesToPlatformWithMintedIdsAndAuthority(t *testing.T) {
 	}
 }
 
+// TestUnmappedSenderIsDropped: nothing an unmapped sender types reaches the
+// bus, and the drop is visible — one notice per sender, so a real user's
+// silent drop doesn't become a support ticket while a repeat-typer still
+// can't make the gateway spam the room (chat-adapters card: "say so visibly
+// somewhere"). The second message arrives in a DIFFERENT conversation on
+// purpose: a channel mention mints a fresh conversation every time, so a
+// conversation-scoped dedupe would be no bound at all.
 func TestUnmappedSenderIsDropped(t *testing.T) {
 	r := startRig(t)
 	for i := 0; i < 2; i++ {
@@ -366,10 +373,28 @@ func TestUnmappedSenderIsDropped(t *testing.T) {
 	}
 	posts := r.adapter.postTexts()
 	if len(posts) != 1 {
-		t.Fatalf("drop must be visible exactly once per sender, got %d posts: %v", len(posts), posts)
+		t.Fatalf("drop notice must be once per sender, not once per conversation: one unmapped sender across two conversations produced %d posts: %v", len(posts), posts)
 	}
 	if !strings.Contains(posts[0], "can't verify") {
 		t.Fatalf("drop notice missing: %q", posts[0])
+	}
+}
+
+// TestVerifiedByNamesTheMechanism: the authority block should say what was
+// actually checked, per backend. Google Chat asserted the sender email over
+// a topic only its own service accounts may publish to; Slack's sender is
+// asserted by Slack over the Socket Mode connection and joined by our
+// table; Discord (and anything unlisted) is the test mapping table alone.
+func TestVerifiedByNamesTheMechanism(t *testing.T) {
+	for backend, want := range map[string]string{
+		"gchat":   "chat-event-topic-iam",
+		"slack":   "slack-socket-mode+principal-map",
+		"discord": "principal-map",
+		"":        "principal-map",
+	} {
+		if got := verifiedByFor(backend); got != want {
+			t.Errorf("verifiedByFor(%q) = %q, want %q", backend, got, want)
+		}
 	}
 }
 

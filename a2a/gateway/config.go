@@ -60,7 +60,18 @@ type Config struct {
 	NATSPassword string
 	DiscordToken string
 
-	// PrincipalMapPath is the mounted principal-map ConfigMap.
+	// SlackBotToken and SlackAppToken arm the Slack backend: Socket Mode
+	// needs both (xoxb- drives the Web API, xapp- the outbound websocket —
+	// no inbound endpoint, nothing to expose). Exactly one backend may be
+	// configured per gateway process: two gateways bound to one relay
+	// durable split event deliveries (Options.RelayDurable), so a second
+	// backend is a second Deployment with its own durable, not a second
+	// adapter here.
+	SlackBotToken string
+	SlackAppToken string
+
+	// PrincipalMapPath is the mounted principal map — Discord's test
+	// ConfigMap or Slack's admin-owned Secret; same on-disk shape either way.
 	PrincipalMapPath string
 
 	// GchatRelayURL is the credential proxy's relay base URL — the gchat
@@ -205,12 +216,18 @@ type Config struct {
 	MaxSessions int
 }
 
-// Backend names the chat backend this config arms: "gchat" or "discord".
+// Backend names the chat backend this config arms: "gchat", "slack" or
+// "discord". FromEnv refuses more than one, so the order only decides what a
+// hand-built Config means.
 func (c *Config) Backend() string {
-	if c.GchatRelayURL != "" {
+	switch {
+	case c.GchatRelayURL != "":
 		return gchatBackend
+	case c.SlackBotToken != "":
+		return slackBackend
+	default:
+		return "discord"
 	}
-	return "discord"
 }
 
 // FromEnv loads the config from the environment.
@@ -220,6 +237,8 @@ func FromEnv() (*Config, error) {
 		NATSUser:         os.Getenv("NATS_USER"),
 		NATSPassword:     os.Getenv("NATS_PASSWORD"),
 		DiscordToken:     os.Getenv("DISCORD_TOKEN"),
+		SlackBotToken:    os.Getenv("SLACK_BOT_TOKEN"),
+		SlackAppToken:    os.Getenv("SLACK_APP_TOKEN"),
 		PrincipalMapPath: envOr("A2A_PRINCIPAL_MAP", "/etc/a2a/principal-map"),
 		DefaultAddressee: envOr("A2A_DEFAULT_ADDRESSEE", "platform"),
 		SpawnSessions:    os.Getenv("A2A_SPAWN_SESSIONS") == "true",
@@ -242,14 +261,33 @@ func FromEnv() (*Config, error) {
 	if cfg.NATSURL == "" {
 		return nil, fmt.Errorf("NATS_URL is required")
 	}
-	// A silent default here would make a two-backend misconfiguration a
-	// working Discord gateway that quietly never consumes Chat — refuse
-	// both directions instead.
-	switch {
-	case cfg.GchatRelayURL != "" && cfg.DiscordToken != "":
-		return nil, fmt.Errorf("both DISCORD_TOKEN and A2A_GCHAT_RELAY_URL are set: one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend")
-	case cfg.GchatRelayURL == "" && cfg.DiscordToken == "":
-		return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret) or A2A_GCHAT_RELAY_URL (the credential proxy's chat relay)")
+	// Socket Mode needs the whole Slack pair; half a pair is a typo, not a
+	// choice, so it refuses rather than silently running another backend.
+	if (cfg.SlackBotToken != "") != (cfg.SlackAppToken != "") {
+		return nil, fmt.Errorf("SLACK_BOT_TOKEN and SLACK_APP_TOKEN arm Slack together; only one is set")
+	}
+	// One backend per gateway process, chosen by which credential is set. A
+	// silent default here would make a two-backend misconfiguration a working
+	// Discord gateway that quietly never consumes Chat — refuse both
+	// directions instead. Counted rather than enumerated pairwise: with three
+	// backends the pairs are the easy thing to leave a hole in, and a fourth
+	// backend must not be addable with a combination nobody checked.
+	var armed []string
+	if cfg.GchatRelayURL != "" {
+		armed = append(armed, "A2A_GCHAT_RELAY_URL")
+	}
+	if cfg.SlackBotToken != "" {
+		armed = append(armed, "the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair")
+	}
+	if cfg.DiscordToken != "" {
+		armed = append(armed, "DISCORD_TOKEN")
+	}
+	switch len(armed) {
+	case 1:
+	case 0:
+		return nil, fmt.Errorf("no chat backend: set DISCORD_TOKEN (W0's discord-bot Secret), A2A_GCHAT_RELAY_URL (the credential proxy's chat relay), or the SLACK_BOT_TOKEN+SLACK_APP_TOKEN pair")
+	default:
+		return nil, fmt.Errorf("more than one chat backend is configured (%s): one backend per gateway process — two gateways on one relay durable split event deliveries; run a second Deployment for a second backend", strings.Join(armed, ", "))
 	}
 	// The addressee is a subject token; validate at boot, not per-message.
 	// The "session" sentinel passes by construction; whether a spawner backs
