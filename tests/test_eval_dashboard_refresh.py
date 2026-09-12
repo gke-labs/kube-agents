@@ -130,6 +130,38 @@ class RefreshScriptTest(unittest.TestCase):
         self.assertEqual(data["schema_version"], 1)
         self.assertEqual(len(data["runs"]), 3)
         self.assertIn("<html", (self.target / "index.html").read_text().lower())
+        self.assertNotIn("<base href", (self.target / "index.html").read_text())
+
+    def test_bucket_target_emits_derived_base_href(self):
+        """gs:// target derives <base href> from the bucket URL rather than
+        hardcoding production, so staging bucket targets point to staging."""
+        stubs = self.tmp / "stubs"
+        stubs.mkdir()
+        published_capture = self.tmp / "captured_site"
+        published_capture.mkdir()
+        fake_gsutil = f"""
+        for arg in "$@"; do
+            if [[ -f "$arg" ]]; then
+                cp "$arg" "{published_capture}/"
+            fi
+        done
+        exit 0
+        """
+        write_stub(stubs, "gsutil", fake_gsutil)
+        proc = run_script(
+            env={
+                "EVAL_DASHBOARD_TARGET": "gs://staging-bucket/evals/",
+                "EVAL_DASHBOARD_FROM_DIR": str(TESTDATA),
+                "JOB_TYPE": "periodic",
+            },
+            path_prepend=str(stubs),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        rendered_html = (published_capture / "index.html").read_text()
+        self.assertIn(
+            '<base href="https://storage.cloud.google.com/staging-bucket/evals/">',
+            rendered_html,
+        )
 
     def test_a_from_dir_run_never_reaches_the_rc_bucket(self):
         """EVAL_DASHBOARD_RC_GLOB defaults to a real bucket path, so the

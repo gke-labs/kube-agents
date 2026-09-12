@@ -51,6 +51,7 @@ def run_hook(
     artifacts: str = "",
     timeout_s: str = "",
     rc_commit_sha: str = "",
+    path_prepend: str = "",
 ) -> subprocess.CompletedProcess:
     """Exit a `set -euo pipefail` shell with `exit_code`, real trap installed.
 
@@ -60,18 +61,22 @@ def run_hook(
     pipeline stubs do. Defaults to a main-branch shape (periodic, no
     PULL_NUMBER) because everything else is gated off before it can publish.
     """
-    script = "\n".join(
+    lines = [
+        "set -euo pipefail",
+        f'SCRIPT_DIR="{script_dir}"',
+        f'export JOB_TYPE="{job_type}"',
+        f'export PULL_NUMBER="{pull_number}"',
+        f'export RC_COMMIT_SHA="{rc_commit_sha}"',
+        # Always pinned: the suite itself runs under Prow, where a real
+        # $ARTIFACTS is set, and the hook copies its log there.
+        f'export ARTIFACTS="{artifacts}"',
+        f'export EVAL_DASHBOARD_TIMEOUT="{timeout_s}"',
+        f'export EVAL_DASHBOARD_TARGET="{target}"',
+    ]
+    if path_prepend:
+        lines.append(f'export PATH="{path_prepend}:$PATH"')
+    lines.extend(
         [
-            "set -euo pipefail",
-            f'SCRIPT_DIR="{script_dir}"',
-            f'export JOB_TYPE="{job_type}"',
-            f'export PULL_NUMBER="{pull_number}"',
-            f'export RC_COMMIT_SHA="{rc_commit_sha}"',
-            # Always pinned: the suite itself runs under Prow, where a real
-            # $ARTIFACTS is set, and the hook copies its log there.
-            f'export ARTIFACTS="{artifacts}"',
-            f'export EVAL_DASHBOARD_TIMEOUT="{timeout_s}"',
-            f'export EVAL_DASHBOARD_TARGET="{target}"',
             "collect_bench_results() { :; }",
             "profile_report() { :; }",
             "dump_prow_artifacts_on_failure() { echo \"called dumper with $?\"; }",
@@ -81,9 +86,17 @@ def run_hook(
             f"exit {exit_code}",
         ]
     )
+    script = "\n".join(lines)
     return subprocess.run(
         ["bash", "-c", script], capture_output=True, text=True, check=False
     )
+
+
+def write_stub(directory: pathlib.Path, name: str, body: str) -> pathlib.Path:
+    stub = directory / name
+    stub.write_text("#!/usr/bin/env bash\n" + body)
+    stub.chmod(stub.stat().st_mode | 0o755)
+    return stub
 
 
 def dashboard_stubs(root: pathlib.Path, collect_body: str) -> pathlib.Path:
@@ -260,10 +273,10 @@ class PublishHookFailSafeTest(unittest.TestCase):
         """A bucket target is the published site, read from
         storage.cloud.google.com, which redirects to a locked domain that
         serves one object: without <base href> every relative link on the
-        page is dead there. This hook publishes to the same bucket as
-        hack/ci-dashboard-refresh.sh, so it has to pass the same flag, or a
-        run of it replaces good pages with unnavigable ones until the next
-        15-minute refresh. A local target keeps relative links."""
+        page is dead there. The hook derives the public URL from the bucket
+        target without hardcoding production, so staging targets get a base
+        href pointing to staging rather than production. A local target
+        keeps relative links."""
         collect_ok = """\
             import json, pathlib, sys
             out = sys.argv[sys.argv.index("--out") + 1]
@@ -273,16 +286,137 @@ class PublishHookFailSafeTest(unittest.TestCase):
             "import json, pathlib, sys\n"
             "pathlib.Path(sys.path[0], 'render.py.argv').write_text(json.dumps(sys.argv[1:]))\n"
         )
-        for target, expected in (("gs://kube-agents-dashboards/evals/", True), ("/tmp/local-site", False)):
+        cases = (
+            ("gs://kube-agents-dashboards/evals/", "https://storage.cloud.google.com/kube-agents-dashboards/evals"),
+            ("gs://staging-bucket/test-evals", "https://storage.cloud.google.com/staging-bucket/test-evals"),
+            ("/tmp/local-site", None),
+        )
+        for target, expected_url in cases:
             with tempfile.TemporaryDirectory() as tmp:
                 fake_hack = dashboard_stubs(pathlib.Path(tmp), collect_ok)
                 dash = pathlib.Path(tmp) / "scripts" / "eval_dashboard"
                 (dash / "render.py").write_text(record_argv)
-                result = run_hook(0, fake_hack, target=target)
+                stubs_dir = pathlib.Path(tmp) / "stubs"
+                stubs_dir.mkdir()
+                write_stub(stubs_dir, "gsutil", "exit 1\n")
+                result = run_hook(0, fake_hack, target=target, path_prepend=str(stubs_dir))
                 self.assertEqual(result.returncode, 0, result.stderr)
                 argv = json.loads((dash / "render.py.argv").read_text())
-                self.assertEqual("--public-url" in argv, expected, f"{target}: {argv}")
+                if expected_url is not None:
+                    self.assertIn("--public-url", argv, f"{target}: {argv}")
+                    actual_url = argv[argv.index("--public-url") + 1]
+                    self.assertEqual(actual_url, expected_url)
+                else:
+                    self.assertNotIn("--public-url", argv, f"{target}: {argv}")
                 self.assertNotIn("", argv, "no empty argument from an unset array")
+
+    def test_health_and_history_passed_when_present(self):
+        """When health.json and health-history.jsonl exist at target, the
+        hook passes them to render.py so the Brief bakes the current verdict
+        and incident history instead of rendering NO VERDICT."""
+        collect_ok = """\
+            import json, pathlib, sys
+            out = sys.argv[sys.argv.index("--out") + 1]
+            pathlib.Path(out).write_text(json.dumps({"runs": [{"build": "1"}]}))
+            """
+        record_argv = """\
+            import json, pathlib, sys
+            argv = sys.argv[1:]
+            health_path = pathlib.Path(argv[argv.index('--health') + 1]) if '--health' in argv else None
+            hist_path = pathlib.Path(argv[argv.index('--health-history') + 1]) if '--health-history' in argv else None
+            result = {
+                'argv': argv,
+                'health_exists': health_path.is_file() if health_path else False,
+                'health_content': health_path.read_text() if health_path and health_path.is_file() else None,
+                'hist_exists': hist_path.is_file() if hist_path else False,
+            }
+            pathlib.Path(sys.path[0], 'render.py.argv').write_text(json.dumps(result))
+            """
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_hack = dashboard_stubs(pathlib.Path(tmp), collect_ok)
+            dash = pathlib.Path(tmp) / "scripts" / "eval_dashboard"
+            (dash / "render.py").write_text(textwrap.dedent(record_argv))
+            target = pathlib.Path(tmp) / "local-target"
+            target.mkdir()
+            (target / "health.json").write_text(json.dumps({"state": "GREEN"}))
+            (target / "health-history.jsonl").write_text(json.dumps({"state": "GREEN"}) + "\n")
+            result = run_hook(0, fake_hack, target=str(target))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads((dash / "render.py.argv").read_text())
+            argv = data["argv"]
+            self.assertIn("--health", argv)
+            self.assertTrue(data["health_exists"])
+            self.assertEqual(json.loads(data["health_content"]), {"state": "GREEN"})
+            self.assertIn("--health-history", argv)
+            self.assertTrue(data["hist_exists"])
+
+    def test_health_and_history_omitted_when_absent(self):
+        """When health.json and health-history.jsonl are absent at target,
+        --health and --health-history must not be passed to render.py."""
+        collect_ok = """\
+            import json, pathlib, sys
+            out = sys.argv[sys.argv.index("--out") + 1]
+            pathlib.Path(out).write_text(json.dumps({"runs": [{"build": "1"}]}))
+            """
+        record_argv = (
+            "import json, pathlib, sys\n"
+            "pathlib.Path(sys.path[0], 'render.py.argv').write_text(json.dumps(sys.argv[1:]))\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_hack = dashboard_stubs(pathlib.Path(tmp), collect_ok)
+            dash = pathlib.Path(tmp) / "scripts" / "eval_dashboard"
+            (dash / "render.py").write_text(record_argv)
+            target = pathlib.Path(tmp) / "empty-target"
+            target.mkdir()
+            result = run_hook(0, fake_hack, target=str(target))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            argv = json.loads((dash / "render.py.argv").read_text())
+            self.assertNotIn("--health", argv)
+            self.assertNotIn("--health-history", argv)
+
+    def test_gsutil_downloads_health_and_history_for_bucket_target(self):
+        """For a gs:// target, the hook calls gsutil cp to download
+        health.json and health-history.jsonl and passes them to render.py."""
+        collect_ok = """\
+            import json, pathlib, sys
+            out = sys.argv[sys.argv.index("--out") + 1]
+            pathlib.Path(out).write_text(json.dumps({"runs": [{"build": "1"}]}))
+            """
+        record_argv = (
+            "import json, pathlib, sys\n"
+            "pathlib.Path(sys.path[0], 'render.py.argv').write_text(json.dumps(sys.argv[1:]))\n"
+        )
+        fake_gsutil = """\
+            if [[ "$1" == "cp" ]]; then
+                src="$2"
+                dst="$3"
+                if [[ "$src" == *"health.json" ]]; then
+                    echo '{"state":"GREEN"}' > "$dst"
+                    exit 0
+                elif [[ "$src" == *"health-history.jsonl" ]]; then
+                    echo '{"state":"GREEN"}' > "$dst"
+                    exit 0
+                fi
+            fi
+            exit 1
+            """
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_hack = dashboard_stubs(pathlib.Path(tmp), collect_ok)
+            dash = pathlib.Path(tmp) / "scripts" / "eval_dashboard"
+            (dash / "render.py").write_text(record_argv)
+            stubs_dir = pathlib.Path(tmp) / "stubs"
+            stubs_dir.mkdir()
+            write_stub(stubs_dir, "gsutil", textwrap.dedent(fake_gsutil))
+            result = run_hook(
+                0,
+                fake_hack,
+                target="gs://kube-agents-dashboards/evals/",
+                path_prepend=str(stubs_dir),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            argv = json.loads((dash / "render.py.argv").read_text())
+            self.assertIn("--health", argv)
+            self.assertIn("--health-history", argv)
 
     def test_zero_collected_runs_skip_instead_of_publishing_empty(self):
         """The evidence_store lesson: an unreadable source is not an empty
