@@ -1,3 +1,10 @@
+---
+# Claude Code loads this rule only beside files matching `paths`; other tools ignore this block.
+paths:
+  - ".github/PULL_REQUEST_TEMPLATE.md"
+  - "docs/pull-request-workflow.md"
+---
+
 # Pre-PR review mechanics
 
 [`AGENTS.md`](../../AGENTS.md) owns both rules below — that adversarial self-review and live

@@ -1,3 +1,9 @@
+---
+# Claude Code loads this rule only beside files matching `paths`; other tools ignore this block.
+paths:
+  - ".github/workflows/**"
+---
+
 # GitHub Actions rules
 
 [`AGENTS.md`](../../AGENTS.md) states both rules below under Pull Request Hygiene. This file holds
