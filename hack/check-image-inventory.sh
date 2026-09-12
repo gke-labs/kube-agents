@@ -45,6 +45,17 @@ readonly LABEL_MIRRORED="a mirrored install"
 readonly IMAGE_ENV_NAME_RE='^[[:space:]]*-[[:space:]]+name:[[:space:]]*[A-Z0-9_]*_IMAGE[[:space:]]*$'
 readonly VALUE_FIELD_RE='^[[:space:]]*value:[[:space:]]*'
 
+# The `image:` field of a rendered manifest, quoted or bare, reference in group
+# 1; a reference has no whitespace, so the class stops there and trailing
+# blanks stay out of it. Extended syntax like the two awk patterns above,
+# applied with `sed -E`: the basic-syntax spelling of an optional quote is
+# `"\?`, a GNU extension that BSD sed reads as a pattern matching nothing, so
+# on macOS every `image:` field dropped out of image_refs and nothing reported
+# it (#1449). POSIX basic syntax has `"\{0,1\}`, which works everywhere and
+# reads as a repetition count rather than an optional quote; `-E` is what the
+# sed programs in checks 4 and 5 use.
+readonly IMAGE_FIELD_RE='^[[:space:]]*image:[[:space:]]*"?([^"[:space:]]*)"?[[:space:]]*$'
+
 status=0
 
 fail() {
@@ -250,9 +261,12 @@ render_chart() {
   }
 }
 
-# The `image:` fields of a rendered manifest stream on stdin.
+# The `image:` fields of a rendered manifest stream on stdin. The job that
+# runs this, validate.yml, runs it on GNU sed, which accepts the escapes BSD
+# sed does not; tests/test_check_image_inventory_sed_portability.py lints
+# every sed program in this file for them, so a Linux run notices.
 image_field_refs() {
-  sed -n 's/^[[:space:]]*image:[[:space:]]*"\?\([^"]*\)"\?[[:space:]]*$/\1/p'
+  sed -E -n "s/${IMAGE_FIELD_RE}/\1/p"
 }
 
 # The image references the *_IMAGE env vars carry, from the same stream. The
@@ -428,12 +442,18 @@ mirrored_render="$(render_chart --set "global.imageRegistry=$MIRROR")" || exit 1
 default_images="$(image_refs <<<"$default_render")"
 mirrored_images="$(image_refs <<<"$mirrored_render")"
 
-[ -n "$default_images" ] || {
-  echo "ERROR: the chart rendered no image references at all — the extraction patterns in image_refs no longer match the manifests, so checks 3a, 3b and 3c are inspecting nothing." >&2
+# One guard per extractor rather than one over their union. Either half of
+# image_refs keeps the union non-empty while the other matches nothing, so a
+# guard on the union passes with half the images unchecked — the state macOS
+# sat in until #1449: BSD sed matched nothing for image_field_refs, the env
+# vars kept the list non-empty, and checks 3a, 3b and 3c inspected the three
+# env-var references and none of the `image:` fields.
+[ -n "$(image_field_refs <<<"$default_render")" ] || {
+  echo "ERROR: the chart rendered no 'image:' field that image_field_refs recognises, so checks 3a, 3b and 3c see only the *_IMAGE env vars. Either the chart stopped emitting them, IMAGE_FIELD_RE no longer matches the shape it emits, or this sed does not accept the pattern." >&2
   exit 1
 }
 [ -n "$(image_env_refs <<<"$default_render")" ] || {
-  echo "ERROR: the chart rendered no *_IMAGE env var that image_env_refs recognises, so the images the operator stamps onto agent pods are unchecked — and the 'image:' fields keep the list above non-empty, which is why the guard above does not catch it. Either the chart stopped emitting them or IMAGE_ENV_NAME_RE no longer matches the shape it emits." >&2
+  echo "ERROR: the chart rendered no *_IMAGE env var that image_env_refs recognises, so the images the operator stamps onto agent pods are unchecked. Either the chart stopped emitting them or IMAGE_ENV_NAME_RE no longer matches the shape it emits." >&2
   exit 1
 }
 

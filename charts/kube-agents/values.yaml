@@ -180,9 +180,10 @@ telemetry:
   # appended by the exporters. A gRPC-only collector (port 4317) will not work.
   otlpEndpoint: ""
   # The namespace the NetworkPolicy opens OTLP egress to. Derived from otlpEndpoint when
-  # it names an in-cluster Service (<svc>.<ns>.svc.cluster.local); set it explicitly for
-  # any endpoint that is not a cluster-local Service name, or the render fails rather
-  # than emit a policy that blocks the collector you just configured.
+  # it names an in-cluster Service (<svc>.<ns>.svc.cluster.local); set it for an
+  # in-cluster collector whose host does not (an IP literal, a bare Service name).
+  # Leave it empty for an external endpoint, which then has to be a public host on
+  # port 443 — the chart README's "Telemetry" section says why.
   collectorNamespace: ""
 
 litellm:
@@ -287,6 +288,9 @@ litellm:
   # when platformAgent.enabled and operator.enabled are true (the default), litellm-policy is managed
   # dynamically by the operator with cluster-discovered DNS VIPs. When either
   # is false, setting networkPolicy: true renders the static template copy.
+  # Moving a live release from operator-managed back to the static copy needs
+  # a handoff first (chart README, "Handing litellm-policy back to Helm"):
+  # Helm refuses to adopt an object the operator has labelled as its own.
   # Disable podMonitoring off-GKE — the PodMonitoring CRD is GKE-managed, and
   # helm template/lint cannot catch its absence: a non-GKE install fails at
   # apply time.
@@ -470,7 +474,15 @@ agentSandbox:
 platformAgent:
   enabled: true
   name: platform-agent
-  # Annotations to add to the PlatformAgent custom resource metadata.
+  # Annotations to add to the PlatformAgent custom resource metadata. The
+  # operator reads its kubeagents.x-k8s.io/* keys from here (chart README,
+  # "PlatformAgent annotations"). Two of them the chart also derives from
+  # values: litellm.networkPolicy=false stamps
+  # kubeagents.x-k8s.io/enable-litellm-network-policy: "false", and
+  # telemetry.collectorNamespace stamps
+  # kubeagents.x-k8s.io/otlp-collector-namespace. When the chart stamps a key,
+  # an entry here that disagrees with it fails the render; otherwise the entry
+  # passes through untouched.
   annotations: {}
   harness:
     # Required — the install fails fast when these are left empty.

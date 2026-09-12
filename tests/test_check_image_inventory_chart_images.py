@@ -33,7 +33,7 @@ _SCRIPT = _REPO_ROOT / "hack" / "check-image-inventory.sh"
 _LIFTED_FUNCTIONS = ("image_field_refs", "image_env_refs", "image_refs")
 
 # The constants those functions read, lifted the same way.
-_LIFTED_CONSTANTS = ("IMAGE_ENV_NAME_RE", "VALUE_FIELD_RE")
+_LIFTED_CONSTANTS = ("IMAGE_FIELD_RE", "IMAGE_ENV_NAME_RE", "VALUE_FIELD_RE")
 
 # Check 3 itself, lifted the same way and driven below against a stubbed
 # render.
@@ -56,15 +56,18 @@ _IMAGE_ENV_NAMES = ("PLATFORM_AGENT_IMAGE", "AGENT_SANDBOX_IMAGE", "FLUENT_BIT_I
 
 # What the behavioural tests below cannot reach, because it is top-level script
 # rather than a function: the call that puts the minter through check_toggle,
-# the values that turn it on, and the two guards standing between an extraction
-# that has stopped matching and a clean run. Each guard is identified by the
-# variable it tests, so rewording a message does not break the test.
+# the values that turn it on, and the guard standing between each extractor
+# and a clean run. One guard per extractor, not one over image_refs: either
+# half keeps the union non-empty while the other matches nothing, which is how
+# macOS ran with every `image:` field unchecked (#1449). Each guard is
+# identified by the expression it tests, so rewording a message does not break
+# the test.
 _CALL_SITES = (
     'check_toggle githubMinter "${MINTER_VALUES[@]}"',
     "--set githubMinter.enabled=true",
 )
 _GUARDS = (
-    '[ -n "$default_images" ] || {',
+    '[ -n "$(image_field_refs <<<"$default_render")" ] || {',
     '[ -n "$(image_env_refs <<<"$default_render")" ] || {',
 )
 
@@ -269,11 +272,26 @@ class ImageRefsTest(unittest.TestCase):
         )
         self.assertEqual(_extract("image_env_refs", entry), [])
 
-    def test_image_fields_are_read_quoted_or_bare(self):
-        fields = '          image: example.invalid/bare:v1\n          image: "example.invalid/quoted:v1"\n'
+    def test_image_fields_are_read_quoted_bare_or_trailing_space(self):
+        """Runs the shipped sed program under whatever sed is on PATH, so on
+        a machine with BSD sed this is the test that fails outright when the
+        pattern slips back to a GNU-only escape (#1449); the CI runner is GNU
+        sed, where tests/test_check_image_inventory_sed_portability.py stands
+        in for it."""
+        fields = (
+            "          image: example.invalid/bare:v1\n"
+            '          image: "example.invalid/quoted:v1"\n'
+            "          image: example.invalid/bare-trailing:v1   \n"
+            '          image: "example.invalid/quoted-trailing:v1" \n'
+        )
         self.assertEqual(
             _extract("image_field_refs", fields),
-            ["example.invalid/bare:v1", "example.invalid/quoted:v1"],
+            [
+                "example.invalid/bare:v1",
+                "example.invalid/quoted:v1",
+                "example.invalid/bare-trailing:v1",
+                "example.invalid/quoted-trailing:v1",
+            ],
         )
 
 

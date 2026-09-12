@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	goerrors "errors"
 	"fmt"
 	"net"
 	"regexp"
@@ -1705,23 +1706,30 @@ func validateEgressAllowlist(agent *agentv1alpha1.PlatformAgent) (string, string
 // what is left to render is a good policy minus one rule. Under spec.mode: next
 // the A2A fences join them, for the reason reconcileA2ANetworkFences states: they
 // are applied from reconcileA2A, which every path here returns before reaching,
-// and the session fence is the whole of what confines a session pod.
+// and the session fence is the whole of what confines a session pod. litellm-policy
+// rides along too, after the agent's own: it selects a different Pod, so a failure
+// on its side (a transient Get on Deployment/litellm, say) must not cost the
+// agent's guardrails a requeue cycle. Every step runs even when an earlier one
+// fails, and the errors are joined so none of them is hidden.
 func (r *PlatformAgentReconciler) reconcileAgentNetworkGuardrails(ctx context.Context, agent *agentv1alpha1.PlatformAgent) error {
 	otlpEndpoint, otlpSource := r.resolveOTLPEndpoint(ctx, agent)
 	netpolProf := r.resolveNetpolProfile(ctx, agent)
+	var errs []error
 	if err := r.reconcileNetworkPolicy(ctx, agent, netpolProf, otlpEndpoint, otlpSource == otlpSourceNone); err != nil {
-		return err
-	}
-	if err := r.reconcileLiteLLMNetworkPolicy(ctx, agent, netpolProf); err != nil {
-		return err
+		errs = append(errs, err)
 	}
 	if err := r.reconcileAgentEgressPolicy(ctx, agent, r.agentEgressDNSClusterIPs(ctx, agent, netpolProf), otlpEndpoint); err != nil {
-		return err
+		errs = append(errs, err)
 	}
-	if !a2aStackRendering(agent) {
-		return nil
+	if a2aStackRendering(agent) {
+		if err := r.reconcileA2ANetworkFences(ctx, agent); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	return r.reconcileA2ANetworkFences(ctx, agent)
+	if err := r.reconcileLiteLLMNetworkPolicy(ctx, agent, netpolProf); err != nil {
+		errs = append(errs, err)
+	}
+	return goerrors.Join(errs...)
 }
 
 // a2aStackRendering is the gate reconcileA2A sits behind, as a predicate rather

@@ -148,10 +148,9 @@ the assignee is the claim; do not apply `status:` labels to issues in this repos
 
 ## Skills Guidelines
 
-- Skills are located under `agents/platform/skills/` (Platform Agent: provisioning, governance, cost, manifest generation, GitOps) and `agents/cluster/skills/` (Cluster Agent: single-cluster runtime debugging and operations).
-- Each skill directory must contain a `SKILL.md` file providing instructions for that specific skill.
-- Place a skill according to its persona: fleet/provisioning/GitOps-write skills belong to the Platform Agent; read-only, single-cluster runtime-debugging skills belong to the Cluster Agent.
-- When adding new skills, ensure they follow the existing structure and are clearly documented to be understood by AI agents.
+- Skills live under `agents/platform/skills/` (Platform Agent) and `agents/cluster/skills/` (Cluster Agent); each holds a `SKILL.md` for an AI agent.
+- Place a skill by persona: fleet, provisioning and GitOps-write skills go to the Platform Agent; read-only, single-cluster runtime debugging to the Cluster Agent.
+- `agents/platform/skills/gke-*` are copies of `google/skills` that `scripts/sync-upstream-skills.py` overwrites wholesale, so the prefix is reserved and a direct edit lasts until the next sync. Put a `SKILL.md` change in its `SKILL_SUBSTITUTIONS` or `SKILL_FOOTERS` and make the same edit by hand; a rerun refreshes every skill from upstream.
 
 ## Engineering Rules
 
@@ -352,12 +351,10 @@ Agents with a user in the loop follow this file.
 ### The behavioural presubmit gate
 
 `pull-kube-agents-smoke-test` runs the eval matrix in `hack/ci-eval-pr.sh` — every active case,
-three repetitions each — and has been merge-blocking since 2026-09-02
-(GoogleCloudPlatform/oss-test-infra#2677). It is slow — recent green runs took 1.5 to 3.5 hours
-against a 360-minute ceiling — and a push restarts it unless only inert paths changed (step 0), so
-open the pull request early and batch changes. Another pull request merging usually does not — the
-green status is re-pinned to `main`'s new head
-([how a change merges](docs/pull-request-workflow.md#how-a-change-merges)).
+three repetitions each — and has blocked merges since 2026-09-02 (oss-test-infra#2677). It takes
+1.5 to 3.5 hours against a 360-minute ceiling, and a push restarts it unless only inert paths
+changed (step 0), so open the pull request early and batch changes. Another pull request merging
+usually does not — the green status is re-pinned to `main`'s new head.
 
 Two things red it. A case on the `BOOTSTRAP_ADMITTED` roster in `hack/ci-eval-pr.sh` fails **all**
 of its repetitions — one failed repetition out of three does nothing on its own. Or any case,
@@ -370,11 +367,12 @@ for what is admitted, `docs/eval-gate-roster.md` for demotion, and
 [`docs/designs/testing-strategy.md`](docs/designs/testing-strategy.md) §4.2 for the full verdict
 ladder.
 
-On a red, ask whether your diff explains it. If yes, fix it. If no, file an issue with the
-`presubmit-gate` label; if the cause is evident and the fix is quick, fixing it yourself is
-welcome — otherwise keep working while the eval crew classifies it. One `/retest` is reasonable
-for a suspected transient; repeated blind retests are noise. Never merge around a red gate, and
-never instruct anyone to.
+On a red, the health bot's comment on your pull request (and the dashboard,
+<https://storage.cloud.google.com/kube-agents-dashboards/evals/index.html>) tags each failed case
+as the gate's or yours. If yours, fix it; if unexplained, read the transcript first. If the gate's,
+file an issue with the `presubmit-gate` label; fix it yourself if quick, or keep working while the
+eval crew classifies it. One `/retest` is reasonable for a suspected transient; blind repeats are
+noise. Never merge around a red gate, and never instruct anyone to.
 
 `/override` (admin-only) is only for a red the eval crew classified as not the pull request's;
 the rest of the override mechanics, and why an approved, green pull request can sit unmerged,
