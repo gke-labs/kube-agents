@@ -143,8 +143,16 @@ delegation's status as its answer.
 ``block_task(kind="transient", reason=<provider error text>)`` under the same
 ``expected_run_id`` the ``kanban_block`` tool uses. ``transient`` is the kind
 upstream reserves for "this might clear on its own"; it lands the card in
-``blocked`` with the 429 text as the reason and the run closed ``blocked``. It
-runs from two sites, because the loop has two ways of leaving on a rate limit:
+``blocked`` with the 429 text as the reason and the run closed ``blocked``.
+Like every truly-blocked kind it also counts in upstream's unblock-loop
+breaker: ``unblock_task`` keeps ``block_kind``, so a card blocked ``transient``
+once, unblocked, and blocked ``transient`` again (a worker re-run into the same
+or the next storm) reaches ``BLOCK_RECURRENCE_LIMIT`` (2) and lands in
+``triage`` with a ``block_loop_detected`` event instead of ``blocked``. That is
+the breaker doing its job on a card the quota has refused twice, and the
+``kanban_block`` tool would route it the same way; the reason text still names
+the 429 either way. It runs from two sites, because the loop has two ways of
+leaving on a rate limit:
 
 * the ``cli.py`` exit-code block (``block_rate_limited_worker``), for the
   ``failed=True`` return the code shows a 429 taking, and
@@ -224,6 +232,10 @@ TASK_ENV = "HERMES_KANBAN_TASK"
 RUN_ID_ENV = "HERMES_KANBAN_RUN_ID"
 GOAL_MODE_ENV = "HERMES_KANBAN_GOAL_MODE"
 
+#: The value ``_default_spawn`` sets ``HERMES_KANBAN_GOAL_MODE`` to for a
+#: goal-mode card; anything else, including unset, is a normal worker.
+GOAL_MODE_ON = "1"
+
 _HALT_SUFFIX = (
     "\n\n[System: `{tool}` is exhausted for the rest of this run "
     "({code}) — every further call will be blocked, so do not try again. "
@@ -298,25 +310,37 @@ def should_record_missing_terminal(
         # nonzero, and the iteration-budget path records its own failure
         # immediately above this check.
         return False
+    return not card_is_somebody_elses(
+        goal_mode=goal_mode, cron_run=cron_run, delegated_child=delegated_child
+    )
+
+
+def card_is_somebody_elses(*, goal_mode, cron_run, delegated_child) -> bool:
+    """Whether ``HERMES_KANBAN_TASK`` names a card this turn may not terminate.
+
+    The one exclusion chain both board-writing predicates in this module share,
+    so the next context that must not write is added in one place. Each
+    argument is the caller's own answer, or ``None`` to read the process:
+    ``delegated_child`` and ``cron_run`` default to the predicates in
+    ``tools/kanban_ownership.py``, asked with ``on_unknown=True`` because a
+    reader that raises must not let this charge or block a card somebody else
+    is working; ``goal_mode`` defaults to the flag the dispatcher sets.
+    """
     if delegated_child is None:
-        # on_unknown=True: a reader that raises must not let this charge a
-        # ``timed_out`` to a parent's card and release its claim mid-run.
         delegated_child = is_delegated_child(on_unknown=True)
     if delegated_child:
         # task_id here is the PARENT's card, inherited through the shared
         # process. The child owns no card and must not touch that one.
-        return False
+        return True
     if cron_run is None:
-        # on_unknown=True, same rule from the other side: the dispatcher is still
-        # blocked on this run, and a wrong "not cron" releases its claim.
         cron_run = in_cron_run(on_unknown=True)
     if cron_run:
         # task_id here is the DISPATCHER's card, inherited: this run has none of
         # its own and may not terminate that one. See the docstring.
-        return False
+        return True
     if goal_mode is None:
-        goal_mode = os.environ.get(GOAL_MODE_ENV) == "1"
-    return not goal_mode
+        goal_mode = os.environ.get(GOAL_MODE_ENV) == GOAL_MODE_ON
+    return bool(goal_mode)
 
 
 def task_is_still_running(conn, task_id: str) -> bool:
@@ -482,17 +506,9 @@ def should_block_rate_limited(
         return False
     if not is_rate_limit_failure(failure_reason):
         return False
-    if delegated_child is None:
-        delegated_child = is_delegated_child(on_unknown=True)
-    if delegated_child:
-        return False
-    if cron_run is None:
-        cron_run = in_cron_run(on_unknown=True)
-    if cron_run:
-        return False
-    if goal_mode is None:
-        goal_mode = os.environ.get(GOAL_MODE_ENV) == "1"
-    return not goal_mode
+    return not card_is_somebody_elses(
+        goal_mode=goal_mode, cron_run=cron_run, delegated_child=delegated_child
+    )
 
 
 def record_rate_limit_block(
@@ -557,7 +573,7 @@ def block_rate_limited_worker(
     task_id = env.get(TASK_ENV)
     failure_reason = result.get("failure_reason")
     if goal_mode is None:
-        goal_mode = env.get(GOAL_MODE_ENV) == "1"
+        goal_mode = env.get(GOAL_MODE_ENV) == GOAL_MODE_ON
     if not should_block_rate_limited(
         task_id=task_id,
         failure_reason=failure_reason,

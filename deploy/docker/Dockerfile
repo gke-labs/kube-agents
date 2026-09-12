@@ -989,7 +989,9 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-scheduling/apply_kanban_scheduling
 # worker block its own card first, `kind=transient` with the provider's 429
 # text as the reason: at the cli.py exit-code site (the return a 429 takes) and,
 # through the finalize_turn backstop, for a retry loop that ends with no
-# response at all. billing keeps the stock exit. The second half,
+# response at all. billing keeps the stock exit. transient counts in upstream's
+# unblock-loop breaker like every truly-blocked kind: a card blocked this way,
+# unblocked, and blocked this way again lands in triage, not blocked. The second half,
 # rate_limit_retry_delay, makes the retries land where they can succeed: the
 # loop honoured only a Retry-After header, and Google sends its ~54s window in
 # the body as google.rpc.RetryInfo.retryDelay, so the three retries fell 2-6s

@@ -892,6 +892,31 @@ check(
     f"events={[k for k, _ in events(conn, ctx_card)]}",
 )
 
+# The recurrence rule the module docstring states: unblock keeps block_kind,
+# so a second transient block after an unblock trips upstream's loop breaker
+# and lands the card in triage. If upstream changes that, the docstring lies.
+conn = board()
+check("the cli.py-site card can be unblocked", K.unblock_task(conn, cli_card))
+K.recompute_ready(conn)
+check("and re-claimed", K.claim_task(conn, cli_card))
+re_run = K.get_task(conn, cli_card).current_run_id
+did = block_rate_limited_worker(
+    STORM_RESULT,
+    connect=board,
+    block_task=K.block_task,
+    environ={"HERMES_KANBAN_TASK": cli_card, "HERMES_KANBAN_RUN_ID": str(re_run)},
+    cron_run=False,
+    delegated_child=False,
+)
+check("a second storm on the same card still writes", did is True)
+after = block_row(board(), cli_card)
+check(
+    "and upstream's loop breaker routes it to triage, as the docstring says",
+    after["status"] == "triage" and after["block_kind"] == RATE_LIMIT_BLOCK_KIND,
+    f"status={after['status']!r} kind={after['block_kind']!r}; "
+    f"BLOCK_RECURRENCE_LIMIT={getattr(K, 'BLOCK_RECURRENCE_LIMIT', None)!r}",
+)
+
 # billing keeps the stock path: the card is left for the reaper.
 bill_card, bill_run = claimed_card("Estimate spend (billing wall)")
 check(
