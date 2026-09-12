@@ -303,11 +303,19 @@ def proxy_endpoint() -> str:
 
 
 def content_mode_available(endpoint: str | None = None) -> bool:
-    """Asked of the broker, as inspect_repository.py asks: the switch is not here."""
+    """Asked of the broker, as inspect_repository.py asks: the switch is not here.
+
+    A broker client without the workspace routes at all (an image built before
+    content-passing landed, observed on a live install) is a broker that is not
+    armed, and reads as such rather than as an AttributeError.
+    """
     endpoint = proxy_endpoint() if endpoint is None else endpoint
     if not endpoint:
         return False
-    return credential_proxy_client.workspaces_available(endpoint)
+    probe = getattr(credential_proxy_client, "workspaces_available", None)
+    if probe is None:
+        return False
+    return probe(endpoint)
 
 
 def read_repo_content(
