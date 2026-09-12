@@ -7,81 +7,66 @@ Usage::
         [--health health.json] [--health-history health-history.jsonl] \\
         [--public-url [BASE]]
 
-writes three pages and two data files into ``out/``:
+writes four pages and two data files into ``out/``:
 
 * ``index.html`` -- **the Brief**: what state the smoke gate is in, why the
   bot thinks so, what the agent saw, what changed right before, what is
-  being done, and the runs in the window. Scoped by
-  ``#since=<ISO>&until=<ISO>&cases=a,b&view=gate`` to a past incident;
-  ``#view=agent`` shows the last 24 hours in numbers (SCHEMA.md, "URL
-  contract"; the older ``?cases=…#gate`` form is still read).
+  being done, the runs in the window and the last release-candidate eval
+  runs. Scoped by ``#since=<ISO>&until=<ISO>&cases=a,b&view=gate`` to a
+  past incident; ``#view=agent`` shows the last 24 hours in numbers
+  (SCHEMA.md, "URL contract"; the older ``?cases=…#gate`` form is still
+  read).
 * ``run.html#build=<prow build id>`` -- **the PR view**: one run, its
   failed cases each tagged as the gate's or the pull request's
   (``classify.py``), and what to do.
-* ``legacy.html`` -- the two-band page below: the matrix, the Pareto, the
-  evidence table.
-* ``brief.json`` -- what the two new pages render from: the per-run
-  classification, the current health verdict, the incident history and the
-  recent merges. ``data.json`` is copied verbatim beside it.
+* ``grid.html`` -- **the Grid**: every case by every presubmit run in a
+  window, with the merges to main and the incidents marked between the
+  columns; a cell opens the run's detail for that case. Scoped by the same
+  ``#since=&until=&cases=`` the Brief carries.
+* ``cases.html`` -- **the Cases page**: one row per case with its last
+  ``STRIP_RUNS`` presubmit outcomes, its 7- and 30-day pass rates per tier,
+  its roster status and its last failure; ``#<case>`` lands on the row.
+* ``brief.json`` -- what the four pages render from: the per-run
+  classification, the per-case record, the current health verdict, the
+  incident history, the recent merges and the release-candidate runs.
+  ``data.json`` is copied verbatim beside it.
 
-The Brief and the PR view are rendered in the browser
-(``template/page.html.tmpl`` + ``template/pages.js``) from the brief.json
-document inlined into each page as ``<script type="application/json"
-id="inline-brief">`` (the verdict it read again as ``inline-health``), so a
-page needs no request beyond itself; the 60-second poll of the published
-``brief.json`` and ``health.json`` is a best-effort refresh on top, and a host that answers an
-XHR with a login redirect (storage.cloud.google.com does) just leaves the
-inlined data on screen. ``--public-url`` adds ``<base href>`` so every
-relative link resolves to the published site wherever the browser landed
-after that redirect. Every time they show is America/Toronto, formatted
-there. The optional inputs are
-``health.json`` (the CI health adjudicator's verdict, published beside
-data.json; nothing here writes it) and ``health-history.jsonl`` (one
-health.json document per line plus a ``tick`` stamp); without them the
-Brief says no verdict is published and both pages show what the runs
-alone support, never an error.
+Every page is rendered in the browser (``template/page.html.tmpl`` +
+``template/pages.js``) from the brief.json document inlined into it as
+``<script type="application/json" id="inline-brief">`` (the verdict it read
+again as ``inline-health``), so a page needs no request beyond itself; the
+60-second poll of the published ``brief.json`` and ``health.json`` is a
+best-effort refresh on top, and a host that answers an XHR with a login
+redirect (storage.cloud.google.com does) just leaves the inlined data on
+screen. ``--public-url`` adds ``<base href>`` so every relative link
+resolves to the published site wherever the browser landed after that
+redirect. Every time the pages show is America/Toronto, formatted there.
+The optional inputs are ``health.json`` (the CI health adjudicator's
+verdict, published beside data.json; nothing here writes it),
+``health-history.jsonl`` (one health.json document per line plus a ``tick``
+stamp), ``case-notes.yaml`` (``--notes``: a one-line note and issue links
+per case) and ``events.yaml`` (``--events``: the human-annotated catch
+counts). Without any of them the pages show what the runs alone support,
+never an error.
 
-The legacy page tells one story in two bands:
+Two rules shape everything here:
 
-* **THE AGENT** -- is the agent getting better or worse, measured on the
-  merged-PR cohort (the final ``pr_merged`` run of each PR): weekly pass
-  rate, human-annotated catches, domain coverage, and a by-day pass-fraction
-  trend with named event markers.
-* **THE GATE** -- is the gate trustworthy: false-red and infra-rep tiles, a
-  case x run outcome matrix over the last runs, and a Pareto of normalized
-  failure signatures.
-
-Three rules shape everything here:
-
-* **Computed-only.** Every figure on the legacy page is derived from
-  data.json -- no hand-typed numbers can go stale in a template. Its two
-  optional extra inputs are ``case-notes.yaml`` (``--notes``: one-line annotations, issue
-  links and badges per case) and ``events.yaml`` (``--events``: dated event
-  markers plus the few human-judgment counts no log line carries). An absent
-  file degrades to "no annotation" -- never an error.
 * **INFRA is not failure.** A rep (or task) whose result is ``infra`` is
   excluded from every pass-fraction denominator, matching the suite's policy
   that infrastructure failures never count against a PR.
 * **Run-level events are charged to the run, not the cases.** A run where at
   least ``RUN_EVENT_FAIL_FRACTION`` of its graded tasks failed (a broken PR,
-  an endpoint outage) renders normally in the matrix but its failures are
-  excluded from per-case aggregates such as the failure-signature Pareto.
-  The exclusion is deliberately scoped to per-case aggregates: band 1's
-  cohort is the final run of each *merged* PR, and a merged PR's own
-  failures are that cohort's signal, not noise to exclude.
+  an endpoint outage) keeps its cells on the Grid and its bars on a case's
+  strip, but its failures are excluded from the per-case pass rates.
 
 The reader contract is schema_version 1 of the collector's data.json.
 Optional fields may be absent and unknown additive fields are ignored, so
 this renderer and the collector can ship independently. In particular
-``tasks[].reps`` and ``runs[].pr_merged`` are optional additive fields
-(SCHEMA.md, "Optional run and task fields"); without them every task falls
-back to its single ``result`` and the merged-PR cohort is simply empty.
-
-The legacy page is also live: render.py bakes the data, notes and events
-into the template, whose script re-renders in place from a fresh
-``data.json`` fetch every 60 seconds and keeps a freshness badge honest (see
-the template's "Live read side" comment). The Python fragment builders here
-and the JS mirrors there are intentionally parallel -- change them together.
+``tasks[].reps``, ``runs[].tier``, ``runs[].pr_merged``, ``pending_builds``
+and ``releases[]`` are optional additive fields (SCHEMA.md); without them
+every task falls back to its single ``result``, every run is the
+presubmit's, and the Grid has no "still running" columns and the Brief no
+release table.
 
 Only stdlib + PyYAML (already in requirements-test.txt) -- no build step.
 """
@@ -90,7 +75,6 @@ from __future__ import annotations
 
 import argparse
 import datetime
-import html
 import json
 import math
 import pathlib
@@ -110,26 +94,32 @@ except ImportError:  # run as a script: python3 scripts/eval_dashboard/render.py
     import tiers
 
 HERE = pathlib.Path(__file__).resolve().parent
-TEMPLATE = HERE / "template" / "index.html.tmpl"
 PAGE_TEMPLATE = HERE / "template" / "page.html.tmpl"
 PAGES_JS = HERE / "template" / "pages.js"
 DEFAULT_NOTES = HERE / "case-notes.yaml"
 DEFAULT_EVENTS = HERE / "events.yaml"
-ISSUE_URL = "https://github.com/gke-labs/kube-agents/issues"
-ISSUE_RE = re.compile(r"^#(\d+)$")
 
-# --- the three pages and their data ---------------------------------------
+# --- the four pages and their data ----------------------------------------
 BRIEF_PAGE = "index.html"
 # The file post_health.run_link points at; one name for it.
 RUN_PAGE = post_health.DASHBOARD_RUN_PAGE
-LEGACY_PAGE = "legacy.html"
+GRID_PAGE = "grid.html"
+CASES_PAGE = "cases.html"
 BRIEF_JSON = "brief.json"
+# Per page: the file and the <title>. The PR view has no tab of its own on
+# the other pages; it appears only when opened.
+PAGES = {
+    "brief": {"file": BRIEF_PAGE, "title": "kube-agents · smoke gate brief"},
+    "run": {"file": RUN_PAGE, "title": "kube-agents · smoke run"},
+    "grid": {"file": GRID_PAGE, "title": "kube-agents · cases by run"},
+    "cases": {"file": CASES_PAGE, "title": "kube-agents · how reliable is each test"},
+}
 # The object names the pages poll beside their own; the adjudicator job
 # writes both (health-history.jsonl is appended one line per tick).
 HEALTH_FILE = "health.json"
 HEALTH_HISTORY_FILE = "health-history.jsonl"
 # The ids of the <script type="application/json"> elements each page
-# carries its data in; pages.js and the legacy script boot from them, so the
+# carries its data in; pages.js boots from them, so the
 # page renders whole without a single fetch (module docstring).
 INLINE_BRIEF_ID = "inline-brief"
 INLINE_HEALTH_ID = "inline-health"
@@ -160,134 +150,74 @@ GIT_TIMEOUT_S = 20
 # before the gap: the last thing it said is still what the space heard.
 HEALTH_AT_TICK_SLACK_MS = 30 * 60 * 1000
 
-# The 20-run yardstick the evidence bars are drawn against, borrowed from
-# the screening window in docs/designs/testing-strategy.md. The bars show
-# recorded history depth only -- admission to the gate is measured by the
-# baseline store, which fills from main-branch runs alone
-# (bench/baselines/README.md); the presubmit runs collected here never
-# advance it, so a full bar is not admission.
-SCREENING_WINDOW = 20
-
 # The three results a rep (or a task) can carry; anything else is treated as
 # "not measured" rather than guessed at.
 REP_RESULTS = ("pass", "fail", "infra")
 
-# Releases section: how many release-candidate eval runs the table shows,
+# The Cases page's strip: a case's last N presubmit outcomes, newest last.
+# 30 is about two weeks of PR traffic per case and fits one table cell.
+STRIP_RUNS = 30
+# A run where at least this fraction of its graded tasks failed is a
+# run-level event: the run is broken (a red PR, an outage), so its failures
+# are charged to the run and excluded from the per-case pass rates.
+RUN_EVENT_FAIL_FRACTION = 0.8
+DAY_MS = 24 * 3600 * 1000
+# The Cases page's per-tier pass rates: rep-level pass / (pass + fail) over
+# the runs started inside each of these windows before the reference time,
+# run-level events excluded. Two tiers, two numbers, never pooled: the
+# presubmit's is the gate's own history, the nightly's is the readable view
+# of a case's record on main (what that record is for:
+# docs/eval-gate-roster.md).
+TIER_RATE_WINDOWS_DAYS = (7, 30)
+
+# --- the roster: what blocks, what is held out, what was demoted when ------
+# Admission is BOOTSTRAP_ADMITTED in hack/ci-eval-pr.sh (classify.py reads
+# it). The demotion dates are prose: docs/eval-gate-roster.md's hold-out
+# entries say "demoted YYYY-MM-DD" -- data.json carries no roster history,
+# so that page is where the date lives, and this reads it the same way
+# classify.py reads the script, degrading to "no date" when it cannot.
+ROSTER_DOC = classify.REPO_ROOT / "docs" / "eval-gate-roster.md"
+# One hold-out entry: a "- **case-name** —" bullet and its indented body,
+# up to the next bullet or the next unindented line.
+ROSTER_ENTRY_RE = re.compile(
+    r"^- \*\*(?P<case>[A-Za-z0-9][A-Za-z0-9._-]*)\*\*(?P<body>.*?)(?=^- \*\*|^\S|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+DEMOTED_RE = re.compile(r"\bdemoted (\d{4}-\d{2}-\d{2})")
+# A case's roster status on the Cases page (the pill) and on the Grid (which
+# rows are blocking). The words the pages print for each live in pages.js.
+STATUS_BLOCKING = "blocking"  # active and in BOOTSTRAP_ADMITTED
+STATUS_HELD_OUT = "held_out"  # active, never admitted (or no date on record)
+STATUS_DEMOTED = "demoted"  # active, held out, with a demotion date
+STATUS_NIGHTLY_ONLY = "nightly_only"  # in NIGHTLY_TASKS only
+STATUS_RETIRED = "retired"  # in neither matrix on this checkout
+# A case's state in one run, on the strip and in a Grid cell: every graded
+# rep passed, some failed (the gate counts that as a pass), every graded rep
+# failed, every rep was infra (excluded, not failed), or nothing measured.
+STRIP_PASS = "pass"
+STRIP_PARTIAL = "partial"
+STRIP_FAIL = "fail"
+STRIP_INFRA = "infra"
+STRIP_NONE = "none"
+# The domain of a case whose task.yaml is not on this checkout.
+DOMAIN_UNKNOWN = "unknown"
+# A pending build first seen longer ago than this is not still running: the
+# presubmit's ceiling is 360 minutes (AGENTS.md), and a build past it with
+# no finished.json is a pod that died without uploading, which the
+# collector keeps on pending_builds for two days (SCHEMA.md,
+# PENDING_RETRY_DAYS). The Grid shows it as running only inside this window.
+PENDING_MAX_AGE_MS = 8 * 3600 * 1000
+
+# --- release candidates (SCHEMA.md: releases[]) -----------------------------
+# The Brief's release table: how many release-candidate eval runs it shows,
 # newest first. RCs are cut per staging promotion, so ten rows is roughly a
 # fortnight of them, and the whole list stays in data.json for anyone who
 # wants further back.
 RELEASES_MAX_ROWS = 10
-# Verdict pill colour by the banner hack/ci-eval-rc.sh prints. NOT RUN is the
-# deploy-failed path: nothing was measured, which is neither a pass nor a
-# judgement on the candidate, so it takes the neutral infra colour.
-RELEASE_VERDICT_CLASS = {"GREEN": "p-pass", "RED": "p-fail", "NOT RUN": "p-infra"}
-# The only URL scheme a collected artifacts link may carry into an href.
+# The only URL scheme a collected artifacts link may carry into an href. The
+# value is read out of a build log, and a log line is the wrong place to be
+# minting `javascript:`; anything else is dropped before it reaches the page.
 RELEASE_URL_SCHEME = "https://"
-# releases[].duration_s is seconds; the cell renders it as `4h16m`.
-SECONDS_PER_HOUR = 3600
-SECONDS_PER_MINUTE = 60
-
-# Matrix window: the last N runs that measured at least one task. 30 columns
-# is about two weeks of PR traffic and still fits one screen at 22px cells.
-MATRIX_RUNS = 30
-# The by-day trend keeps at most this many day buckets on screen.
-TREND_DAYS = 30
-# Failure-signature Pareto: reps from runs started within this many days of
-# the data's generated_at, and at most this many bars.
-PARETO_WINDOW_DAYS = 7
-PARETO_MAX_ROWS = 8
-# A run where at least this fraction of its graded tasks failed is a
-# run-level event: the run is broken (a red PR, an outage), so its failures
-# are charged to the run and excluded from per-case aggregates.
-RUN_EVENT_FAIL_FRACTION = 0.8
-# Weekly pass-rate window, in milliseconds (all time math here is epoch ms,
-# matching the JS mirror's Date.parse).
-WEEK_MS = 7 * 24 * 3600 * 1000
-DAY_MS = 24 * 3600 * 1000
-# An unrecognized failure reason is grouped by its first characters.
-REASON_SNIPPET_CHARS = 60
-# Prow's job verdict for a green run (SCHEMA.md: runs[].result).
-RUN_RESULT_GREEN = "SUCCESS"
-# The evidence table's per-tier pass rates: rep-level pass / (pass + fail)
-# over the runs started inside each of these windows before the reference
-# time, run-level events excluded as everywhere on this page. Two tiers,
-# two numbers, never pooled: the presubmit's is the gate's own history, the
-# nightly's is the readable view of a case's record on main (what that
-# record is for: docs/eval-gate-roster.md).
-TIER_RATE_WINDOWS_DAYS = (7, 30)
-# The evidence table's columns that are not a rate: Case, Evidence, Tier.
-EVIDENCE_FIXED_COLUMNS = 3
-
-# --- failure-signature normalization -------------------------------------
-# Deliberately small and documented: a reason that matches nothing renders
-# as its own first-60-chars group with a neutral bar, so an unclassified
-# failure is never silently blamed on infra, the checks, or the agent.
-# Signature substrings (matched case-insensitively against reps[].reason):
-SIG_429 = "http 429"  # endpoint saturation; infra-classed since #1095
-SIG_NOT_REAL_RUN = ("not evidence of a real agent run", "not_a_real_run")
-SIG_NEVER_RAN = "no agent ever ran"  # the never-ran signature; infra-classed since #1184
-SIG_PHRASES_ABSENT = "required phrases absent"  # an exact-check miss
-# "check <name>" inside a phrases-absent reason names the exact check.
-CHECK_NAME_RE = re.compile(r"check[ :]+['\"]?([A-Za-z0-9_./-]+)", re.I)
-# Bar-color classification keywords, applied to the raw reason:
-INFRA_REASON_KEYWORDS = (
-    "http 429",
-    "rate limit",
-    "timed out",
-    "timeout",
-    "connection",
-    SIG_NEVER_RAN,
-)
-CHECK_REASON_KEYWORDS = (SIG_PHRASES_ABSENT,)
-AGENT_REASON_KEYWORDS = ("false finding",)
-
-# Pareto groups for reps that carry no reason string at all (the collector
-# fallback path, and infra reps whose reason never got recorded). Split by
-# result so an unexplained infra wave is never mistaken for agent failures.
-LABEL_NO_REASON = "(no reason recorded)"
-LABEL_NO_REASON_INFRA = "(infra, no reason recorded)"
-
-# The run-level event rule, stated wherever per-case aggregates are shown.
-RUN_EVENT_CAPTION = "run-level events excluded from per-case stats"
-
-# Matrix cell rendering: CSS class and tooltip text per cell state.
-CELL_CLASSES = {"pass": "c-g", "partial": "c-a", "fail": "c-r", "infra": "c-i", "none": "c-n"}
-CELL_TITLES = {
-    "pass": "passed all reps",
-    "partial": "partial (some reps passed)",
-    "fail": "failed all reps",
-    "infra": "infra — excluded",
-    "none": "not in run",
-}
-
-# Trend chart geometry (SVG user units) and axis furniture.
-TREND_W, TREND_H = 1000, 196
-TREND_PAD_X, TREND_PAD_Y = 34, 28
-# Consecutive event labels alternate between two rows so adjacent markers
-# do not overwrite each other.
-TREND_EVENT_ROW_OFFSET = 10
-TREND_GRIDLINES = (0.25, 0.5, 0.75, 1.0)
-TREND_MAX_X_LABELS = 8
-# Event labels on the chart are clipped so clustered events stay readable;
-# the matrix footnote carries every label in full.
-TREND_EVENT_LABEL_CHARS = 18
-
-esc = html.escape
-
-
-def fmt(value: float, digits: int = 0) -> str:
-    """Format a non-negative number the way JS ``toFixed``/``Math.round``
-    does. Python's ``:.Nf`` rounds half to even (0.25 -> "0.2"), JS rounds
-    half away from zero (0.25 -> "0.3"); without this, numbers visibly
-    change when the template's on-load re-render replaces the baked HTML."""
-    factor = 10**digits
-    return f"{math.floor(value * factor + 0.5) / factor:.{digits}f}"
-
-
-def is_number(value) -> bool:
-    """A finite real number. Mirrors the template's ``Number.isFinite``
-    guard; bools are data errors, not zeroes and ones."""
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 def is_count(value) -> bool:
@@ -300,6 +230,12 @@ def is_count(value) -> bool:
         and math.isfinite(value)
         and float(value).is_integer()
     )
+
+
+def is_number(value) -> bool:
+    """A finite real number. Mirrors the template's ``Number.isFinite``
+    guard; bools are data errors, not zeroes and ones."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
 # --------------------------------------------------------------------------
@@ -329,22 +265,14 @@ def run_tasks(run: dict | None) -> list[dict]:
 
 
 def gate_runs(data: dict) -> list[dict]:
-    """The presubmit's runs, chronological: what the gate band, the matrix,
-    the Pareto and the Brief are about (SCHEMA.md: runs[].tier; a run with
-    no tier predates the field and is the presubmit)."""
+    """The presubmit's runs, chronological: what the Grid, the strips, the
+    presubmit rates and the Brief are about (SCHEMA.md: runs[].tier; a run
+    with no tier predates the field and is the presubmit)."""
     return tiers.presubmit_runs(sorted_runs(data))
 
 
 def nightly_runs(data: dict) -> list[dict]:
     return tiers.nightly_runs(sorted_runs(data))
-
-
-def measured_runs(data: dict) -> list[dict]:
-    """Gate runs that measured anything: at least one task row. An aborted
-    or deadline-truncated build parses to zero tasks; giving one a matrix
-    column or a trend point would chart a run that measured nothing. The
-    header sha deliberately stays on sorted_runs."""
-    return [r for r in gate_runs(data) if run_tasks(r)]
 
 
 def parse_iso(value) -> datetime.datetime | None:
@@ -360,23 +288,9 @@ def parse_iso(value) -> datetime.datetime | None:
 
 
 def iso_ms(value) -> float | None:
-    """Epoch milliseconds, the unit the JS mirror gets from Date.parse."""
+    """Epoch milliseconds, the unit the page gets from Date.parse."""
     parsed = parse_iso(value)
     return parsed.timestamp() * 1000 if parsed else None
-
-
-def utc_day(value) -> str | None:
-    """'YYYY-MM-DD' in UTC; the trend's day bucket and the event-marker
-    join key. Mirrors the JS ``toISOString().slice(0, 10)``."""
-    parsed = parse_iso(value)
-    return f"{parsed:%Y-%m-%d}" if parsed else None
-
-
-def run_label(run: dict, index: int) -> str:
-    if run.get("pr") is not None:
-        return f"#{run['pr']}"
-    build_id = str(run.get("build_id") or "")
-    return build_id[:6] if build_id else f"run {index + 1}"
 
 
 # --------------------------------------------------------------------------
@@ -421,21 +335,21 @@ def rep_counts(reps: list[dict]) -> tuple[int, int, int]:
 
 
 def cell_state(task: dict) -> str:
-    """One task's matrix verdict: 'pass' (every graded rep passed),
+    """One task's verdict in a run: 'pass' (every graded rep passed),
     'partial' (some passed, some failed), 'fail' (every graded rep failed),
     'infra' (every counted rep was infra -- excluded, not failed), or
     'none' (nothing measured)."""
     reps = task_reps(task)
     if not reps:
-        return "none"
+        return STRIP_NONE
     passed, failed, _ = rep_counts(reps)
     if passed and failed:
-        return "partial"
+        return STRIP_PARTIAL
     if failed:
-        return "fail"
+        return STRIP_FAIL
     if passed:
-        return "pass"
-    return "infra"
+        return STRIP_PASS
+    return STRIP_INFRA
 
 
 def is_run_event(run: dict) -> bool:
@@ -443,35 +357,20 @@ def is_run_event(run: dict) -> bool:
     (state pass/partial/fail; infra and unmeasured don't grade) failed
     outright. Such a run is broken as a whole, so its failures are charged
     to the run, not the cases."""
-    graded = [s for s in (cell_state(t) for t in run_tasks(run)) if s in ("pass", "partial", "fail")]
+    graded = [s for s in (cell_state(t) for t in run_tasks(run)) if s in (STRIP_PASS, STRIP_PARTIAL, STRIP_FAIL)]
     if not graded:
         return False
-    return graded.count("fail") / len(graded) >= RUN_EVENT_FAIL_FRACTION
+    return graded.count(STRIP_FAIL) / len(graded) >= RUN_EVENT_FAIL_FRACTION
 
 
 # --------------------------------------------------------------------------
-# cohorts and windows
-
-
-def merged_final_runs(data: dict) -> list[dict]:
-    """Band-1 cohort: for each PR, its final measured run with
-    ``pr_merged: true`` -- the run whose codebase is (modulo the merge
-    commit) what actually shipped. Runs without a PR number count
-    individually. Empty when no collector has reported pr_merged yet."""
-    runs = [r for r in measured_runs(data) if r.get("pr_merged") is True]
-
-    def key(run: dict):
-        # A run without a PR number is its own cohort entry (identity key).
-        return f"pr:{run['pr']}" if run.get("pr") is not None else id(run)
-
-    final = {key(run): run for run in runs}  # chronological: last one wins
-    return [r for r in runs if final[key(r)] is r]
+# windows and rates
 
 
 def reference_ms(data: dict) -> float | None:
     """The time axis anchor: generated_at, else the newest run's start.
-    Deliberately not the wall clock, so the baked HTML and the JS re-render
-    of the same data.json agree."""
+    Deliberately not the wall clock, so two renders of the same data.json
+    agree."""
     anchor = iso_ms(data.get("generated_at"))
     if anchor is not None:
         return anchor
@@ -480,62 +379,6 @@ def reference_ms(data: dict) -> float | None:
         if anchor is not None:
             return anchor
     return None
-
-
-def week_pass_stats(data: dict) -> dict:
-    """Rep-level pass fraction of the merged-PR cohort for the 7 days ending
-    at the reference time ('cur') and the 7 before that ('prev'), plus the
-    current window's run count. A cohort with no usable timestamps counts
-    entirely as current -- better one honest number than none."""
-    anchor = reference_ms(data)
-    cur = {"pass": 0, "fail": 0, "runs": 0}
-    prev = {"pass": 0, "fail": 0}
-    for run in merged_final_runs(data):
-        started = iso_ms(run.get("started"))
-        bucket = None
-        if anchor is None or started is None:
-            bucket = cur
-        elif anchor - WEEK_MS < started <= anchor:
-            bucket = cur
-        elif anchor - 2 * WEEK_MS < started <= anchor - WEEK_MS:
-            bucket = prev
-        if bucket is None:
-            continue
-        passed = failed = 0
-        for task in run_tasks(run):
-            p, f, _ = rep_counts(task_reps(task))
-            passed += p
-            failed += f
-        bucket["pass"] += passed
-        bucket["fail"] += failed
-        if bucket is cur:
-            cur["runs"] += 1
-    def rate(bucket):
-        total = bucket["pass"] + bucket["fail"]
-        return bucket["pass"] / total if total else None
-    return {"cur": rate(cur), "prev": rate(prev), "runs_cur": cur["runs"]}
-
-
-def day_points(data: dict) -> list[tuple[str, float]]:
-    """(day, rep-level pass fraction) per UTC day of the merged-PR cohort,
-    oldest first, capped to the last TREND_DAYS days that measured
-    anything."""
-    buckets: dict[str, list[int]] = {}
-    for run in merged_final_runs(data):
-        day = utc_day(run.get("started"))
-        if day is None:
-            continue
-        bucket = buckets.setdefault(day, [0, 0])
-        for task in run_tasks(run):
-            p, f, _ = rep_counts(task_reps(task))
-            bucket[0] += p
-            bucket[1] += f
-    points = [
-        (day, counts[0] / (counts[0] + counts[1]))
-        for day, counts in sorted(buckets.items())
-        if counts[0] + counts[1]
-    ]
-    return points[-TREND_DAYS:]
 
 
 def tier_pass_rates(data: dict, tier: str, days: int) -> dict[str, tuple[int, int]]:
@@ -563,22 +406,13 @@ def tier_pass_rates(data: dict, tier: str, days: int) -> dict[str, tuple[int, in
     return {name: (p, f) for name, (p, f) in tally.items()}
 
 
-def rate_cell(counts: tuple[int, int] | None) -> str:
-    """One pass-rate cell: 'NN% (n)' over n graded reps, or a dash."""
-    if not counts or counts[0] + counts[1] == 0:
-        return '<span class="cap">—</span>'
-    passed, failed = counts
-    return f'<span class="num">{fmt(100 * passed / (passed + failed))}%</span> <span class="cap">({passed + failed})</span>'
-
-
 # --------------------------------------------------------------------------
-# case-notes.yaml (optional flavor; never an error)
+# case-notes.yaml and events.yaml (optional flavor; never an error)
 
 
 def load_notes(path: pathlib.Path | None) -> dict[str, dict]:
-    """``{case: {"note": str|None, "issues": [str, ...], "badge":
-    str|None}}``. Absent file, empty file, or malformed entry all degrade
-    to "no note"."""
+    """``{case: {"note": str|None, "issues": [str, ...]}}``. Absent file,
+    empty file, or malformed entry all degrade to "no note"."""
     if path is None or not path.exists():
         return {}
     try:
@@ -597,52 +431,19 @@ def load_notes(path: pathlib.Path | None) -> dict[str, dict]:
         if not isinstance(entry, dict):
             continue
         note = entry.get("note")
+        note = str(note) if isinstance(note, (str, int, float)) and note != "" else None
         raw_issues = entry.get("issues")
         issues = [str(i) for i in raw_issues] if isinstance(raw_issues, list) else []
-        badge = entry.get("badge")
-        badge = str(badge) if isinstance(badge, str) else None
-        if note or issues or badge:
-            notes[str(name)] = {"note": note, "issues": issues, "badge": badge}
+        if note or issues:
+            notes[str(name)] = {"note": note, "issues": issues}
     return notes
 
 
-def note_html(entry: dict | None) -> str:
-    if not entry:
-        return ""
-    parts = []
-    if entry.get("note"):
-        parts.append(esc(str(entry["note"])))
-    for issue in entry.get("issues", []):
-        match = ISSUE_RE.match(issue.strip())
-        if match:
-            parts.append(f'<a href="{ISSUE_URL}/{match.group(1)}">{esc(issue)}</a>')
-        else:
-            parts.append(esc(issue))
-    if not parts:
-        return ""
-    return f'<div class="tnote">{" · ".join(parts)}</div>'
-
-
-def badge_html(entry: dict | None) -> str:
-    """The held-out / new pill next to a matrix row name. Values come from
-    case-notes.yaml, never from code; an unknown badge renders nothing."""
-    badge = str((entry or {}).get("badge") or "").strip().lower()
-    if badge == "held-out":
-        return '<em class="b-hold">held out</em>'
-    if badge == "new":
-        return '<em class="b-new">new</em>'
-    return ""
-
-
-# --------------------------------------------------------------------------
-# events.yaml (optional; dated markers + the human-judgment counts)
-
-
 def load_events(path: pathlib.Path | None) -> dict:
-    """``{"events": [{"date": "YYYY-MM-DD", "label": str}], "catches":
-    dict|None, "false_reds_7d": value|None}``. Absent or malformed file
-    degrades to no markers and em-dash tiles."""
-    out = {"events": [], "catches": None, "false_reds_7d": None}
+    """``{"catches": {"product_bugs", "prs_blocked", "ledger"} | None}``:
+    the human-judgment counts the Cases page's footer quotes. Absent or
+    malformed file degrades to no counts."""
+    out = {"catches": None}
     if path is None or not path.exists():
         return out
     try:
@@ -651,21 +452,13 @@ def load_events(path: pathlib.Path | None) -> dict:
         return out
     if not isinstance(raw, dict):
         return out
-    for entry in raw.get("events") or []:
-        if not isinstance(entry, dict):
-            continue
-        date, label = entry.get("date"), entry.get("label")
-        if date is None or label is None:
-            continue
-        out["events"].append({"date": str(date)[:10], "label": str(label)})
     catches = raw.get("catches")
     if isinstance(catches, dict):
         out["catches"] = {
-            "product_bugs": catches.get("product_bugs"),
-            "prs_blocked": catches.get("prs_blocked"),
+            "product_bugs": catches["product_bugs"] if is_count(catches.get("product_bugs")) else None,
+            "prs_blocked": catches["prs_blocked"] if is_count(catches.get("prs_blocked")) else None,
             "ledger": str(catches["ledger"]) if catches.get("ledger") is not None else None,
         }
-    out["false_reds_7d"] = raw.get("false_reds_7d")
     return out
 
 
@@ -846,7 +639,8 @@ def recent_merges(repo_root: pathlib.Path, now_ms: float | None, runner=subproce
     MERGES_LOOKBACK_DAYS before ``now_ms``: ``[{sha, at, title, pr}]``,
     newest first. None when git is unavailable, the checkout is shallow
     (its log would be one commit deep and read as "one merge"), or the
-    command fails -- the page omits the block rather than guess."""
+    command fails -- the pages omit the block and the markers rather than
+    guess."""
     if now_ms is None:
         return None
     try:
@@ -888,7 +682,47 @@ def ms_to_utc(ms: float) -> datetime.datetime:
 
 
 # --------------------------------------------------------------------------
-# brief.json: what the Brief and the PR view render from
+# the roster: status and demotion dates
+
+
+def demotion_dates(doc: pathlib.Path = ROSTER_DOC) -> dict[str, str]:
+    """``{case: "YYYY-MM-DD"}`` for every hold-out entry in the roster page
+    whose text says when the case was demoted. An unreadable page, or an
+    entry without a date, is simply no date -- the pill then says "held
+    out" without one."""
+    try:
+        text = doc.read_text()
+    except OSError:
+        return {}
+    dates = {}
+    for match in ROSTER_ENTRY_RE.finditer(text):
+        when = DEMOTED_RE.search(match.group("body"))
+        if when:
+            dates[match.group("case")] = when.group(1)
+    return dates
+
+
+def case_status(case: dict, admitted: frozenset | None, demoted: dict[str, str]) -> tuple[str, str | None]:
+    """(status, demoted_on). Blocking is active *and* on the roster; an
+    active case off the roster is held out, "demoted" when the roster page
+    dates it; a case only the nightly runs is nightly-only; a case in
+    neither matrix on this checkout is retired. An unreadable roster
+    (``admitted`` None) reads every active case as blocking, which
+    over-reports rather than hides, as classify.py does."""
+    name = str(case.get("name"))
+    if case.get("active") is True:
+        if admitted is None or name in admitted:
+            return STATUS_BLOCKING, None
+        if name in demoted:
+            return STATUS_DEMOTED, demoted[name]
+        return STATUS_HELD_OUT, None
+    if case.get("nightly_active") is True:
+        return STATUS_NIGHTLY_ONLY, None
+    return STATUS_RETIRED, None
+
+
+# --------------------------------------------------------------------------
+# brief.json: what the pages render from
 
 
 def compact_run(run: dict, verdict: dict, at: dict | None) -> dict:
@@ -915,656 +749,114 @@ def compact_run(run: dict, verdict: dict, at: dict | None) -> dict:
     }
 
 
-def brief_document(data: dict, health: dict | None, history: list[dict] | None, merges: list[dict] | None) -> dict:
-    """The document both new pages read. Runs are the presubmit's last
-    RUN_VIEW_DAYS of data.json, oldest first, each classified against every
-    run on record with the verdict in force when it finished. The nightly's
-    runs are not listed -- they are nobody's pull request and the Brief is
-    the gate's -- but they travel into the classification, which reads them
-    for each case's nightly_failed_recent note."""
-    anchor = reference_ms(data)
-    runs = [r for r in data.get("runs") or [] if isinstance(r, dict)]
-    now = ms_to_utc(anchor) if anchor is not None else None
-    incidents = history_incidents(history) if history else []
-    admitted = classify.admitted_cases()
-    out_runs = []
-    for run in gate_runs(data):
-        started = iso_ms(run.get("started"))
-        if anchor is not None and started is not None and started < anchor - RUN_VIEW_DAYS * DAY_MS:
-            continue
-        finished = iso_ms(run.get("finished")) or started
-        at = health_at(history, finished, incidents) if history else None
-        # The verdict a run is judged against: its tick from the history;
-        # the current verdict for a run newer than the history's last tick
-        # (or when there is no history at all); none for a run that
-        # predates the history -- today's outage says nothing about it.
-        first_tick = iso_ms(history[0]["tick"]) if history else None
-        predates = first_tick is not None and finished is not None and finished < first_tick
-        against = at if at is not None else (None if predates else health)
-        verdict = classify.classify_run(run, runs, health_at=against, now=now, admitted=admitted)
-        out_runs.append(compact_run(run, verdict, at))
-    cases = {}
-    for case in data.get("cases") or []:
-        if isinstance(case, dict) and case.get("name") is not None:
-            name = str(case["name"])
-            cases[name] = {
-                "active": case.get("active") is True,
-                "nightly_active": case.get("nightly_active") is True,
-                "admitted": admitted is None or name in admitted,
+def appearances_by_case(runs: list[dict]) -> dict[str, list[tuple[dict, dict]]]:
+    """{case: [(run, task), ...]} in run order, one entry per task row a
+    run recorded for the case (an unmeasured task row is skipped)."""
+    out: dict[str, list[tuple[dict, dict]]] = {}
+    for run in runs:
+        for task in run_tasks(run):
+            if cell_state(task) != STRIP_NONE:
+                out.setdefault(str(task.get("name")), []).append((run, task))
+    return out
+
+
+def run_when(run: dict) -> str | None:
+    """The stamp a case's history is placed by: the run's finish, else its
+    start (the Brief lists runs the same way)."""
+    for key in ("finished", "started"):
+        if iso_ms(run.get(key)) is not None:
+            return run[key]
+    return None
+
+
+def case_strip(appearances: list[tuple[dict, dict]]) -> list[dict]:
+    """The case's last STRIP_RUNS presubmit outcomes, oldest first:
+    ``{build, pr, at, state, event}`` -- ``event`` marks a run-level event,
+    whose failure the rates do not count but the strip still shows."""
+    return [
+        {
+            "build": str(run.get("build_id") or ""),
+            "pr": run.get("pr") if isinstance(run.get("pr"), int) else None,
+            "at": run_when(run),
+            "state": cell_state(task),
+            "event": is_run_event(run),
+        }
+        for run, task in appearances[-STRIP_RUNS:]
+    ]
+
+
+def last_failure(name: str, gate: list[tuple[dict, dict]], nightly: list[tuple[dict, dict]], classified: dict[str, dict]) -> dict | None:
+    """The case's newest non-pass appearance: the presubmit's first, the
+    nightly's only when the presubmit has none on record. Carries the
+    grader's reason and excerpt (classify.py's readers) and, for a run the
+    Brief classified, that run's tag for the case (``cls``,
+    ``also_failing_prs``) so the page can say whose failure it was."""
+    for tier, rows in ((tiers.TIER_PRESUBMIT, gate), (tiers.TIER_NIGHTLY, nightly)):
+        for run, task in reversed(rows):
+            state = cell_state(task)
+            if state not in (STRIP_FAIL, STRIP_PARTIAL):
+                continue
+            build = str(run.get("build_id") or "")
+            tagged = classified.get(build, {}).get(name) or {}
+            passed, failed, infra = rep_counts(task_reps(task))
+            return {
+                "tier": tier,
+                "build": build,
+                "pr": run.get("pr") if isinstance(run.get("pr"), int) else None,
+                "at": run_when(run),
+                "state": state,
+                "reps": {"pass": passed, "fail": failed, "infra": infra},
+                "reason": classify.first_reason(task),
+                "excerpt": classify.excerpt_of(task),
+                "cls": tagged.get("cls"),
+                "also_failing_prs": tagged.get("also_failing_prs", 0),
+                "event": is_run_event(run),
             }
-    return {
-        "schema_version": 1,
-        "generated_at": data.get("generated_at") if iso_ms(data.get("generated_at")) is not None else None,
-        "stale_after_s": data.get("stale_after_s") if isinstance(data.get("stale_after_s"), (int, float)) else None,
-        "run_days": RUN_VIEW_DAYS,
-        "admitted": sorted(admitted) if admitted is not None else None,
-        "health": health,
-        "history": {"ticks": [
-            {"tick": t["tick"], "state": t["state"], "condition": t["condition"], "since": t["since"],
-             "failing_cases": t["failing_cases"], "recovering": t["recovering"]} for t in history
-        ], "incidents": incidents} if history is not None else None,
-        "merges": merges,
-        "cases": cases,
-        "runs": out_runs,
-    }
+    return None
 
 
-def render_new_page(page: str, brief: dict, data: dict, public_url: str | None = None) -> str:
-    """The Brief (``page`` = "brief") or the PR view ("run") from the shared
-    template, with brief.json (and the health verdict, when there is one)
-    inlined as JSON data elements and pages.js after them."""
-    template = PAGE_TEMPLATE.read_text()
-    values = {
-        "__TITLE__": "kube-agents · smoke gate brief" if page == "brief" else "kube-agents · smoke run",
-        "__PAGE__": page,
-        "__NAV_BRIEF__": 'class="on"' if page == "brief" else "",
-        "__NAV_RUN__": 'class="on"' if page == "run" else "",
-        "__BASE__": base_html(public_url),
-        "__INLINE_BRIEF__": inline_json_html(INLINE_BRIEF_ID, brief),
-        "__INLINE_HEALTH__": inline_json_html(INLINE_HEALTH_ID, brief["health"]) if brief.get("health") else "",
-        "__META__": meta_html(data),
-        "__FRESHNESS__": freshness_html(data),
-        "__PAGES_JS__": PAGES_JS.read_text(),
-    }
-    for token in values:
-        if token not in template:
-            raise SystemExit(f"ERROR: page template is missing the {token} marker")
-    return re.sub(
-        "|".join(re.escape(token) for token in values),
-        lambda match: values[match.group(0)],
-        template,
-    )
+def rate_pair(counts: tuple[int, int] | None) -> list[int] | None:
+    """``[passed, failed]`` over graded reps, or None when nothing graded."""
+    if not counts or counts[0] + counts[1] == 0:
+        return None
+    return [counts[0], counts[1]]
 
 
-# --------------------------------------------------------------------------
-# failure signatures
-
-
-def reason_signature(reason: str | None) -> str:
-    """The Pareto group a rep's reason string falls into. The map is small
-    on purpose (module docstring: honest over clever); anything unmatched
-    groups by its first REASON_SNIPPET_CHARS characters."""
-    text = (reason or "").strip()
-    if not text:
-        return LABEL_NO_REASON
-    low = text.lower()
-    if SIG_429 in low:
-        return "endpoint saturation (infra)"
-    if SIG_NEVER_RAN in low:
-        return "never ran: empty trajectory, zero tokens (infra)"
-    if any(sig in low for sig in SIG_NOT_REAL_RUN):
-        return "not a real agent run"
-    if SIG_PHRASES_ABSENT in low:
-        match = CHECK_NAME_RE.search(text)
-        if match:
-            return f"exact-check: {match.group(1)}"
-        return "exact-check: required phrases absent"
-    if len(text) > REASON_SNIPPET_CHARS:
-        return text[:REASON_SNIPPET_CHARS] + "…"
-    return text
-
-
-def reason_class(reason: str | None) -> str:
-    """Bar color: infra / check / agent by keyword, 'unknown' (neutral)
-    otherwise -- an unclassified failure is not silently blamed."""
-    low = (reason or "").lower()
-    if any(kw in low for kw in INFRA_REASON_KEYWORDS):
-        return "infra"
-    if any(kw in low for kw in CHECK_REASON_KEYWORDS):
-        return "check"
-    if any(kw in low for kw in AGENT_REASON_KEYWORDS):
-        return "agent"
-    return "unknown"
-
-
-def pareto_groups(data: dict) -> list[dict]:
-    """Non-pass reps of the last PARETO_WINDOW_DAYS, grouped by normalized
-    reason. Run-level events are excluded (charged to the run); runs
-    without a started timestamp cannot be windowed and are skipped unless
-    the data has no time anchor at all."""
-    anchor = reference_ms(data)
-    groups: dict[str, dict] = {}
-    for run in gate_runs(data):
-        started = iso_ms(run.get("started"))
-        if anchor is not None:
-            if started is None:
-                continue
-            if started <= anchor - PARETO_WINDOW_DAYS * DAY_MS or started > anchor:
-                continue
-        if is_run_event(run):
-            continue
-        for task in run_tasks(run):
-            for rep in task_reps(task):
-                if rep["result"] == "pass":
-                    continue
-                reason = (rep["reason"] or "").strip()
-                if reason:
-                    label, cls = reason_signature(reason), reason_class(reason)
-                elif rep["result"] == "infra":
-                    # No reason, but the result itself says what it was.
-                    label, cls = LABEL_NO_REASON_INFRA, "infra"
-                else:
-                    label, cls = LABEL_NO_REASON, "unknown"
-                group = groups.setdefault(label, {"label": label, "count": 0, "cls": cls})
-                group["count"] += 1
-    ordered = sorted(groups.values(), key=lambda g: (-g["count"], g["label"]))
-    return ordered[:PARETO_MAX_ROWS]
-
-
-# --------------------------------------------------------------------------
-# HTML fragments
-
-
-def delta_chip(cls: str, text: str) -> str:
-    return f'<span class="delta {cls}">{esc(text)}</span>'
-
-
-def tile(key: str, value_html: str, chip_html: str, detail: str) -> str:
-    return (
-        f'<div class="tile"><div class="k">{esc(key)}</div>'
-        f'<div class="v">{value_html}{chip_html}</div>'
-        f'<div class="d2">{esc(detail)}</div></div>'
-    )
-
-
-def agent_tiles_html(data: dict, events: dict) -> str:
-    tiles = []
-
-    # Pass rate, this week vs prior week.
-    stats = week_pass_stats(data)
-    if stats["cur"] is not None:
-        pct = int(fmt(stats["cur"] * 100))
-        chip = ""
-        if stats["prev"] is not None:
-            diff = pct - int(fmt(stats["prev"] * 100))
-            if diff > 0:
-                chip = delta_chip("up", f"▲ +{diff}pt vs prior week")
-            elif diff < 0:
-                chip = delta_chip("flat", f"▼ {diff}pt vs prior week")
-            else:
-                chip = delta_chip("flat", "= prior week")
-        runs = stats["runs_cur"]
-        detail = f"merged-PR cohort · {runs} run{'s' if runs != 1 else ''} this week"
-        tiles.append(tile("Pass rate · this week", f"{pct}<small>%</small>", chip, detail))
-    else:
-        detail = (
-            "no merged-PR runs this week"
-            if merged_final_runs(data)
-            else "no merged-PR runs on record"
-        )
-        tiles.append(tile("Pass rate · this week", "—", "", detail))
-
-    # Product bugs caught -- human judgment, annotated in events.yaml.
-    catches = events.get("catches") or {}
-    if is_count(catches.get("product_bugs")):
-        value = f"{int(catches['product_bugs'])}"
-        if is_count(catches.get("prs_blocked")):
-            value += f"<small> + {int(catches['prs_blocked'])} PRs blocked</small>"
-        detail = (
-            f"catch ledger {catches['ledger']}" if catches.get("ledger") else "events.yaml annotation"
-        )
-        tiles.append(tile("Product bugs caught", value, "", detail))
-    else:
-        tiles.append(tile("Product bugs caught", "—", "", "not annotated (events.yaml)"))
-
-    # Domain coverage (collector-computed).
-    coverage = data.get("coverage")
-    if not isinstance(coverage, dict):
-        coverage = {}
-    covered, total = coverage.get("domains_covered"), coverage.get("domains_total")
-    if is_count(covered) and is_count(total):
-        covered, total = int(covered), int(total)
-        raw_uncovered = coverage.get("uncovered")
-        uncovered = [str(d) for d in raw_uncovered] if isinstance(raw_uncovered, list) else []
-        chip = (
-            delta_chip("up", "all covered")
-            if covered >= total
-            else delta_chip("flat", f"{total - covered} open")
-        )
-        cases = [c for c in data.get("cases") or [] if isinstance(c, dict)]
-        blocking = sum(1 for c in cases if c.get("active"))
-        if uncovered:
-            detail = f"uncovered: {', '.join(uncovered)}"
-        else:
-            detail = f"{len(cases)} scenarios · {blocking} blocking"
-        tiles.append(tile("Domains covered", f"{covered}<small>/ {total}</small>", chip, detail))
-    else:
-        tiles.append(tile("Domains covered", "—", "", "not reported"))
-
-    return "".join(tiles)
-
-
-def gate_tiles_html(data: dict, events: dict) -> str:
-    tiles = []
-
-    # False reds, 7d -- human classification, annotated in events.yaml.
-    false_reds = events.get("false_reds_7d")
-    if is_count(false_reds):
-        tiles.append(tile("False reds · 7d", f"{int(false_reds)}", "", "human-classified · events.yaml"))
-    else:
-        tiles.append(tile("False reds · 7d", "—", "", "not annotated (events.yaml)"))
-
-    # Infra-rep rate over the matrix window.
-    window = measured_runs(data)[-MATRIX_RUNS:]
-    total = infra = 0
-    reps_reported = False
-    for run in window:
-        for task in run_tasks(run):
-            raw = task.get("reps")
-            if isinstance(raw, list) and any(
-                isinstance(r, dict) and str(r.get("result", "")).lower() in REP_RESULTS
-                for r in raw
-            ):
-                reps_reported = True
-            for rep in task_reps(task):
-                total += 1
-                if rep["result"] == "infra":
-                    infra += 1
-    if total:
-        value = f"{fmt(100 * infra / total, 1)}<small>%</small>"
-        detail = (
-            f"{infra} of {total} reps · last {len(window)} runs"
-            if reps_reported
-            else f"task-level fallback · last {len(window)} runs"
-        )
-        tiles.append(tile("Infra-rep rate", value, "", detail))
-    else:
-        tiles.append(tile("Infra-rep rate", "—", "", "no measured runs yet"))
-
-    # Wall clock of the latest green full run.
-    runs = gate_runs(data)
-    green = None
-    green_index = -1
-    for index in range(len(runs) - 1, -1, -1):
-        run = runs[index]
-        if (
-            str(run.get("result") or "") == RUN_RESULT_GREEN
-            and run_tasks(run)
-            and isinstance(run.get("duration_s"), (int, float))
-        ):
-            green, green_index = run, index
-            break
-    if green:
-        value = f"{fmt(green['duration_s'] / 60)}<small>min</small>"
-        detail = f"latest green full run · {run_label(green, green_index)}"
-        tiles.append(tile("Wall clock · green run", value, "", detail))
-    else:
-        tiles.append(tile("Wall clock · green run", "—", "", "no green full run on record"))
-
-    # Queue wait: data.json carries no queued-at timestamp, so this cannot
-    # be computed. An honest em-dash beats an invented number.
-    tiles.append(tile("Queue wait · median", "—", "", "not reported in data.json"))
-
-    return "".join(tiles)
-
-
-def matrix_html(data: dict, notes: dict, events: dict) -> str:
-    runs = measured_runs(data)[-MATRIX_RUNS:]
-    cases = [
-        c for c in data.get("cases") or [] if isinstance(c, dict) and c.get("active") is not False
-    ]
-    if not runs:
-        return '<div class="cap" style="margin-top:12px">no measured runs yet</div>'
-    if not cases:
-        return '<div class="cap" style="margin-top:12px">no active cases on record yet</div>'
-
-    event_days = {e["date"]: e["label"] for e in events.get("events") or []}
-    run_days = [utc_day(r.get("started")) for r in runs]
-    run_events = [is_run_event(r) for r in runs]
-    task_maps = [{str(t.get("name")): t for t in run_tasks(r)} for r in runs]
-
-    head = ['<div class="mx-row mx-head"><div class="mx-name"></div>']
-    for index, run in enumerate(runs):
-        day = run_days[index]
-        marker = "▲" if day in event_days else ""
-        title = f"{run_label(run, index)} · {day or '?'}"
-        if day in event_days:
-            title += f" · {event_days[day]}"
-        if run_events[index]:
-            title += " · run-level event"
-        head.append(f'<div class="mx-col" title="{esc(title)}">{marker}</div>')
-    head.append("</div>")
-
-    rows = ["".join(head)]
-    for case in cases:
-        name = str(case.get("name") or "?")
-        entry = notes.get(name)
-        row = [f'<div class="mx-row"><div class="mx-name"><span>{esc(name)}</span>{badge_html(entry)}</div>']
-        for index, run in enumerate(runs):
-            task = task_maps[index].get(name)
-            state = cell_state(task) if task else "none"
-            title = f"{name} · {run_label(run, index)} · {CELL_TITLES[state]}"
-            if run_events[index]:
-                title += " · run-level event (charged to the run)"
-            row.append(f'<div class="cell {CELL_CLASSES[state]}" title="{esc(title)}"></div>')
-        row.append("</div>")
-        rows.append("".join(row))
-
-    marks = [
-        f'<span>▲ {esc(day[5:])} {esc(event_days[day])}</span>'
-        for day in sorted(set(d for d in run_days if d in event_days))
-    ]
-    if marks:
-        rows.append(f'<div class="mx-ev">{"".join(marks)}</div>')
-    return f'<div class="mx">{"".join(rows)}</div>'
-
-
-def pareto_html(data: dict) -> str:
-    groups = pareto_groups(data)
-    if not groups:
-        return (
-            '<div class="cap" style="margin-top:12px">'
-            f"no failing or infra reps in the last {PARETO_WINDOW_DAYS} days</div>"
-        )
-    top = groups[0]["count"]
-    rows = []
-    for group in groups:
-        width = fmt(100 * group["count"] / top, 1)
-        rows.append(
-            f'<div class="pa-row"><div class="pa-bar-wrap">'
-            f'<div class="pa-bar pa-{group["cls"]}" style="width:{width}%"></div></div>'
-            f'<div class="pa-count">{group["count"]}</div>'
-            f'<div class="pa-name">{esc(group["label"])}</div></div>'
-        )
-    return "".join(rows)
-
-
-def trend_svg(points: list[tuple[str, float]], events: dict) -> str:
-    """The band-1 by-day pass-fraction line, with vertical event markers on
-    days that carry an events.yaml entry. Dots carry ``data-l`` labels the
-    shared tooltip listener reads."""
-    if len(points) < 2:
-        return ""
-    width, height, px, py = TREND_W, TREND_H, TREND_PAD_X, TREND_PAD_Y
-
-    def xs(i: int) -> float:
-        return px + i * (width - 2 * px) / (len(points) - 1)
-
-    def ys(v: float) -> float:
-        return height - py - v * (height - 2 * py)
-
-    parts = [f'<svg viewBox="0 0 {width} {height}" preserveAspectRatio="none">']
-    for grid in TREND_GRIDLINES:
-        parts.append(
-            f'<line x1="{px}" y1="{fmt(ys(grid), 1)}" x2="{width - px}" y2="{fmt(ys(grid), 1)}" stroke="var(--line)"/>'
-            f'<text x="{px - 6}" y="{fmt(ys(grid) + 3, 1)}" text-anchor="end" font-size="9" '
-            f'fill="var(--text-muted)">{fmt(grid * 100)}</text>'
-        )
-    event_days = {e["date"]: e["label"] for e in events.get("events") or []}
-    marker = 0
-    for i, (day, _) in enumerate(points):
-        if day in event_days:
-            label = event_days[day]
-            if len(label) > TREND_EVENT_LABEL_CHARS:
-                label = label[:TREND_EVENT_LABEL_CHARS] + "…"
-            text_y = py - 6 - (marker % 2) * TREND_EVENT_ROW_OFFSET
-            marker += 1
-            parts.append(
-                f'<line x1="{fmt(xs(i), 1)}" y1="{py}" x2="{fmt(xs(i), 1)}" y2="{height - py}" '
-                f'stroke="var(--accent)" stroke-opacity=".35" stroke-dasharray="3 3"/>'
-                f'<text x="{fmt(xs(i), 1)}" y="{text_y}" text-anchor="middle" font-size="9" '
-                f'fill="var(--accent-link,var(--accent))">{esc(label)}</text>'
-            )
-    poly = " ".join(f"{fmt(xs(i), 1)},{fmt(ys(v), 1)}" for i, (_, v) in enumerate(points))
-    parts.append(
-        f'<polyline points="{poly}" fill="none" stroke="var(--accent)" stroke-width="2.5" '
-        f'stroke-linejoin="round" stroke-linecap="round"/>'
-    )
-    for i, (day, v) in enumerate(points):
-        parts.append(
-            f'<circle cx="{fmt(xs(i), 1)}" cy="{fmt(ys(v), 1)}" r="4" fill="var(--accent)" '
-            f'stroke="var(--surface-1)" stroke-width="2" data-l="{esc(day)} · {fmt(v * 100)}%"/>'
-        )
-    step = max(1, math.ceil(len(points) / TREND_MAX_X_LABELS))
-    for i, (day, _) in enumerate(points):
-        if i % step == 0 or i == len(points) - 1:
-            parts.append(
-                f'<text x="{fmt(xs(i), 1)}" y="{height - 4}" text-anchor="middle" font-size="9.5" '
-                f'font-weight="600" fill="var(--text-muted)">{esc(day[5:])}</text>'
-            )
-    parts.append("</svg>")
-    return "".join(parts)
-
-
-def band_agent_html(data: dict, events: dict) -> str:
-    chart = trend_svg(day_points(data), events)
-    chart = chart or (
-        '<div class="cap" style="margin-top:14px">not enough merged-PR days yet '
-        "(needs runs with pr_merged from the collector)</div>"
-    )
-    return f"""
-  <section class="band">
-    <div class="band-h"><h2 id="agent">The agent</h2><span class="cohort">cohort: final run of each merged PR</span></div>
-    <div class="sub">Measured only where the codebase is what actually shipped.</div>
-    <div class="tiles tiles-3">{agent_tiles_html(data, events)}</div>
-    <div class="card pad chartcard">
-      <div class="t">Suite pass fraction, by day</div>
-      <div class="s">merged-PR cohort · pass / (pass + fail) over reps, INFRA excluded · event markers from events.yaml</div>
-      <div id="daytrend">{chart}</div>
-    </div>
-  </section>"""
-
-
-def band_gate_html(data: dict, notes: dict, events: dict) -> str:
-    matrix_runs = len(measured_runs(data)[-MATRIX_RUNS:])
-    return f"""
-  <section class="band">
-    <div class="band-h"><h2 id="gate">The gate</h2><span class="cohort">cohort: all PR runs · {RUN_EVENT_CAPTION}</span></div>
-    <div class="sub">Is the gate trustworthy — flake forensics, infra tax, and the cost of a run.</div>
-    <div class="tiles">{gate_tiles_html(data, events)}</div>
-    <div class="card pad">
-      <div class="t">Case × run outcome matrix</div>
-      <div class="s">one row per active case, one cell per run · last {matrix_runs} measured runs · ▲ = events.yaml marker · {RUN_EVENT_CAPTION}</div>
-      {matrix_html(data, notes, events)}
-      <div class="legend mx-legend">
-        <span><span class="cell c-g"></span>passed all reps</span>
-        <span><span class="cell c-a"></span>partial</span>
-        <span><span class="cell c-r"></span>failed all reps</span>
-        <span><span class="cell c-i"></span>infra — excluded</span>
-        <span><span class="cell c-n"></span>not in run</span>
-      </div>
-    </div>
-    <div class="card pad">
-      <div class="t">Failure signatures · last {PARETO_WINDOW_DAYS} days</div>
-      <div class="s">non-pass reps grouped by normalized reason · {RUN_EVENT_CAPTION} · gray = infra, violet = check design, amber = agent behaviour, neutral = unclassified</div>
-      {pareto_html(data)}
-    </div>
-  </section>"""
-
-
-def tier_pill(case: dict) -> str:
-    """Which matrix runs the case: the presubmit's (and so the nightly's,
-    its superset), the nightly's alone, or neither on this checkout."""
-    if case.get("active"):
-        return '<span class="pill p-pass">IN PRESUBMIT</span>'
-    if case.get("nightly_active"):
-        return '<span class="pill p-night">NIGHTLY ONLY</span>'
-    return '<span class="pill p-fix">NOT IN PRESUBMIT</span>'
-
-
-def evidence_row(case: dict, notes: dict, rates: dict) -> str:
-    name = str(case.get("name") or "?")
-    have = case.get("runs_on_record")
-    have = int(have) if is_count(have) else 0
-    width = min(100.0, 100.0 * have / SCREENING_WINDOW)
-    nightly = case.get("nightly") if isinstance(case.get("nightly"), dict) else {}
-    nights = nightly.get("runs_on_record")
-    nights = int(nights) if is_count(nights) else 0
-    cells = "".join(
-        f"<td>{rate_cell(rates[(tier, days)].get(name))}</td>"
-        for tier in tiers.TIERS
-        for days in TIER_RATE_WINDOWS_DAYS
-    )
-    return (
-        f'<tr><td><div class="tname">{esc(name)}</div>{note_html(notes.get(name))}</td>'
-        f'<td><div style="display:flex;align-items:center;gap:10px">'
-        f'<div class="prog"><i style="width:{fmt(width)}%"></i></div>'
-        f'<span class="cap">{have} of {SCREENING_WINDOW}</span></div>'
-        f'<div class="cap">{nights} nightly</div></td>'
-        f"{cells}"
-        f"<td>{tier_pill(case)}</td></tr>"
-    )
-
-
-def evidence_html(data: dict, notes: dict) -> str:
-    cases = sorted(
-        (c for c in data.get("cases") or [] if isinstance(c, dict)),
-        key=lambda c: (
-            -(int(c["runs_on_record"]) if is_count(c.get("runs_on_record")) else 0),
-            str(c.get("name") or ""),
-        ),
-    )
+def case_documents(data: dict, notes: dict, admitted: frozenset | None, demoted: dict[str, str], classified: dict[str, dict]) -> dict[str, dict]:
+    """``brief.json``'s ``cases{}``: per case, what the Cases page and the
+    Grid need beyond the runs -- roster status, domain, notes, the per-tier
+    7- and 30-day rates, the strip and the last failure."""
+    gate = appearances_by_case(gate_runs(data))
+    nightly = appearances_by_case(nightly_runs(data))
     rates = {
         (tier, days): tier_pass_rates(data, tier, days)
         for tier in tiers.TIERS
         for days in TIER_RATE_WINDOWS_DAYS
     }
-    rows = "".join(evidence_row(c, notes, rates) for c in cases)
-    columns = EVIDENCE_FIXED_COLUMNS + len(tiers.TIERS) * len(TIER_RATE_WINDOWS_DAYS)
-    if not rows:
-        rows = f'<tr><td colspan="{columns}"><span class="cap">no cases on record yet</span></td></tr>'
-    heads = "".join(
-        f"<th>{esc(tier)} · {days}d</th>" for tier in tiers.TIERS for days in TIER_RATE_WINDOWS_DAYS
-    )
-    return f"""
-  <h2 id="nightly">Evidence on record</h2>
-  <div class="sub">Recorded task appearances per case (presubmit runs, infra included), against the {SCREENING_WINDOW}-run yardstick, with the nightly's count beside it · history depth, not admission progress — the screening window fills only from main-branch runs in the baseline store (bench/baselines/README.md) · pass rates are pass / (pass + fail) over reps in the window, per tier, never pooled · {RUN_EVENT_CAPTION} · annotations from case-notes.yaml</div>
-  <div class="card"><table id="evidence">
-    <thead><tr><th>Case</th><th>Evidence collected</th>{heads}<th>Tier</th></tr></thead>
-    <tbody>{rows}</tbody>
-  </table></div>"""
-
-
-RELEASES_EMPTY_HTML = """
-  <h2 id="release">Releases</h2>
-  <div class="empty">
-    <span class="banner">⏳ No RC in the gate window</span>
-    <p style="margin-top:12px">When the next RC cuts, its eval run renders here automatically: candidate, tier, verdict, and the advisory non-inferiority number.</p>
-  </div>"""
-
-
-RELEASES_SUB = (
-    "One row per post-kube-agents-eval-rc run — the full suite against a "
-    "release candidate's own images. Advisory: this lane reports and does not "
-    "gate, and the non-inferiority comparison stays advisory while the "
-    "baseline store is maturing. The admitted rate covers only the cases "
-    "admitted to the gate, while Cases passed counts every graded case in the "
-    "run, so the two differ."
-)
-
-
-def release_verdict_pill(verdict: str | None) -> str:
-    """The verdict cell. A missing verdict is its own state, not a pass:
-    hack/ci-eval-rc.sh prints no banner when it exits on an early guard, and
-    that run measured nothing."""
-    cls = RELEASE_VERDICT_CLASS.get(verdict or "", "p-infra")
-    return f'<span class="pill {cls}">{esc(verdict or "NO VERDICT")}</span>'
-
-
-def release_duration(seconds) -> str:
-    """`4h16m`, or an empty string when the run carries no duration."""
-    if not is_count(seconds) or seconds <= 0:
-        return ""
-    total = int(seconds)
-    hours, minutes = total // SECONDS_PER_HOUR, (total % SECONDS_PER_HOUR) // SECONDS_PER_MINUTE
-    return f"{hours}h{minutes:02d}m" if hours else f"{minutes}m"
-
-
-def release_rate_cell(release: dict) -> str:
-    """The admitted-case pass rate, with what it was compared against."""
-    rate = release.get("pass_rate")
-    if not is_number(rate):
-        return '<td class="num">—<div class="tnote">not reported</div></td>'
-    baseline = release.get("baseline_rate")
-    margin = release.get("margin")
-    if is_number(baseline):
-        note = f"main {fmt(baseline * 100, 1)}%"
-        if is_number(margin):
-            # Points, not percent: the margin is a difference of two rates.
-            # fmt() only formats non-negatives, and the sign carries the
-            # whole meaning of the number, so it is written explicitly.
-            sign = "+" if margin >= 0 else "−"
-            note += f" · margin {sign}{fmt(abs(margin) * 100, 1)}pt"
-    else:
-        note = "no baseline — baselines maturing"
-    return (
-        f'<td class="num">{fmt(rate * 100, 1)}%'
-        f'<div class="tnote">{esc(note)}</div></td>'
-    )
-
-
-def release_cases_cell(release: dict) -> str:
-    """Graded outcomes for the run: passes over graded, infra called out
-    separately because an infra rep is excluded rather than failed."""
-    tasks = run_tasks(release)
-    passed = sum(1 for t in tasks if t.get("result") == "pass")
-    infra = sum(1 for t in tasks if t.get("result") == "infra")
-    graded = len(tasks) - infra
-    if not tasks:
-        return '<td class="num">—<div class="tnote">no cases parsed</div></td>'
-    note = f"{infra} infra excluded" if infra else "none excluded"
-    return f'<td class="num">{passed}/{graded}<div class="tnote">{esc(note)}</div></td>'
-
-
-def release_candidate_cell(release: dict) -> str:
-    tag = str(release.get("rc_tag") or "") or "unknown candidate"
-    url = release.get("artifacts_url")
-    # Only an https URL becomes an href. The value is read out of a build
-    # log, and a log line is the wrong place to be minting `javascript:`.
-    name = esc(tag)
-    if isinstance(url, str) and url.startswith(RELEASE_URL_SCHEME):
-        name = f'<a href="{esc(url)}" rel="noopener">{name}</a>'
-    bits = []
-    if release.get("commit"):
-        bits.append(str(release["commit"]))
-    if release.get("build_id"):
-        bits.append(f"build {release['build_id']}")
-    if not release.get("verdict"):
-        # The banner is missing, so Prow's own result is the only thing left
-        # that says whether the job survived. Say so rather than showing a
-        # blank row that reads like a quiet pass.
-        bits.append(f"no eval banner · job {release.get('result') or 'unknown'}")
-    return (
-        f'<td><div class="tname">{name}</div>'
-        f'<div class="tnote">{esc(" · ".join(bits))}</div></td>'
-    )
-
-
-def release_row(release: dict) -> str:
-    started = parse_iso(release.get("started"))
-    when = f"{started:%Y-%m-%d %H:%M} UTC" if started else "unknown time"
-    duration = release_duration(release.get("duration_s"))
-    return (
-        "<tr>"
-        + release_candidate_cell(release)
-        + f'<td><span class="cap">{esc(str(release.get("tier") or "—"))}</span></td>'
-        + f"<td>{release_verdict_pill(release.get('verdict'))}</td>"
-        + release_rate_cell(release)
-        + release_cases_cell(release)
-        + f'<td><span class="cap">{esc(when)}</span></td>'
-        + f'<td class="cap">{esc(duration)}</td>'
-        + "</tr>"
-    )
+    cases = {}
+    for case in data.get("cases") or []:
+        if not isinstance(case, dict) or case.get("name") is None:
+            continue
+        name = str(case["name"])
+        status, demoted_on = case_status(case, admitted, demoted)
+        note = notes.get(name) or {}
+        cases[name] = {
+            "active": case.get("active") is True,
+            "nightly_active": case.get("nightly_active") is True,
+            "admitted": admitted is None or name in admitted,
+            "domain": str(case.get("domain") or DOMAIN_UNKNOWN),
+            "status": status,
+            "demoted_on": demoted_on,
+            "note": note.get("note"),
+            "issues": list(note.get("issues") or []),
+            "rates": {
+                tier: [rate_pair(rates[(tier, days)].get(name)) for days in TIER_RATE_WINDOWS_DAYS]
+                for tier in tiers.TIERS
+            },
+            "strip": case_strip(gate.get(name, [])),
+            "last_failure": last_failure(name, gate.get(name, []), nightly.get(name, []), classified),
+        }
+    return cases
 
 
 def sorted_releases(data: dict) -> list[dict]:
@@ -1582,81 +874,162 @@ def sorted_releases(data: dict) -> list[dict]:
     return releases[:RELEASES_MAX_ROWS]
 
 
-def releases_html(data: dict) -> str:
-    releases = sorted_releases(data)
-    if not releases:
-        return RELEASES_EMPTY_HTML
-    rows = "".join(release_row(r) for r in releases)
-    return f"""
-  <h2 id="release">Releases</h2>
-  <div class="sub">{RELEASES_SUB}</div>
-  <div class="card"><table id="releases">
-    <thead><tr><th>Candidate</th><th>Tier</th><th>Verdict</th><th>Admitted rate</th><th>Cases passed</th><th>Started</th><th>Eval took</th></tr></thead>
-    <tbody>{rows}</tbody>
-  </table></div>"""
+def compact_release(release: dict) -> dict:
+    """One release-candidate run as the Brief's table needs it, every field
+    validated here so the page formats and never judges: strings kept as
+    strings, numbers only when finite, the artifacts link only when it is
+    https, and the graded outcome counted rather than shipped task by task."""
+    def text(key: str) -> str | None:
+        value = release.get(key)
+        return str(value) if isinstance(value, (str, int)) and not isinstance(value, bool) and str(value) else None
+
+    def number(key: str) -> float | None:
+        value = release.get(key)
+        return value if is_number(value) else None
+
+    tasks = run_tasks(release)
+    infra = sum(1 for t in tasks if t.get("result") == "infra")
+    url = release.get("artifacts_url")
+    return {
+        "build": text("build_id"),
+        "rc_tag": text("rc_tag"),
+        "commit": text("commit"),
+        "tier": text("tier"),
+        "verdict": text("verdict"),
+        "result": text("result"),
+        "started": release.get("started") if iso_ms(release.get("started")) is not None else None,
+        "duration_s": release["duration_s"] if is_count(release.get("duration_s")) and release["duration_s"] > 0 else None,
+        "artifacts_url": url if isinstance(url, str) and url.startswith(RELEASE_URL_SCHEME) else None,
+        "pass_rate": number("pass_rate"),
+        "baseline_rate": number("baseline_rate"),
+        "margin": number("margin"),
+        "cases": {
+            "passed": sum(1 for t in tasks if t.get("result") == "pass"),
+            "graded": len(tasks) - infra,
+            "infra": infra,
+        } if tasks else None,
+    }
 
 
-HERO_LEDE = (
-    "Every pull request runs the agent against a real seeded fleet. Exact checks "
-    "gate; judged scores are recorded, never blocking; infrastructure failures "
-    "never count against a PR."
-)
+def pending_builds(data: dict) -> list[dict]:
+    """``pending_builds`` as the Grid's "still running" columns: id and when
+    the collector first saw it, oldest first. A malformed entry is dropped,
+    and so is one first seen more than PENDING_MAX_AGE_MS before the
+    reference time: that build is not running any more (docstring of the
+    constant). The columns are the presubmit's, so a night in flight
+    (``tier: nightly`` on the entry) gets none."""
+    raw = data.get("pending_builds")
+    if not isinstance(raw, list):
+        return []
+    anchor = reference_ms(data)
+    out = []
+    for entry in raw:
+        if not isinstance(entry, dict) or not str(entry.get("build_id") or "").isdigit():
+            continue
+        if not tiers.is_presubmit(entry):
+            continue
+        seen = iso_ms(entry.get("first_seen"))
+        if seen is None or (anchor is not None and seen < anchor - PENDING_MAX_AGE_MS):
+            continue
+        out.append({"build": str(entry["build_id"]), "first_seen": entry["first_seen"]})
+    out.sort(key=lambda e: int(e["build"]))
+    return out
 
 
-HERO_HTML = f"""
-  <section style="margin-top:30px">
-    <span class="eyebrow">Agent evaluation · presubmit</span>
-    <h1>Is the agent getting better or worse?</h1>
-    <div class="lede">{HERO_LEDE}</div>
-  </section>"""
+def brief_document(data: dict, health: dict | None, history: list[dict] | None, merges: list[dict] | None,
+                   notes: dict | None = None, events: dict | None = None,
+                   admitted: frozenset | None = None, demoted: dict[str, str] | None = None) -> dict:
+    """The document every page reads. Runs are the presubmit's last
+    RUN_VIEW_DAYS of data.json, oldest first, each classified against every
+    run on record with the verdict in force when it finished. The nightly's
+    runs are not listed -- they are nobody's pull request and the Brief is
+    the gate's -- but they travel into the classification, which reads them
+    for each case's nightly_failed_recent note, and into each case's record
+    (its nightly rates, and its last failure when the presubmit has none).
+    ``admitted`` and ``demoted`` default to the checkout's roster and roster
+    page; tests pass their own."""
+    anchor = reference_ms(data)
+    runs = [r for r in data.get("runs") or [] if isinstance(r, dict)]
+    now = ms_to_utc(anchor) if anchor is not None else None
+    incidents = history_incidents(history) if history else []
+    if admitted is None:
+        admitted = classify.admitted_cases()
+    if demoted is None:
+        demoted = demotion_dates()
+    out_runs = []
+    classified: dict[str, dict] = {}
+    for run in gate_runs(data):
+        started = iso_ms(run.get("started"))
+        if anchor is not None and started is not None and started < anchor - RUN_VIEW_DAYS * DAY_MS:
+            continue
+        finished = iso_ms(run.get("finished")) or started
+        at = health_at(history, finished, incidents) if history else None
+        # The verdict a run is judged against: its tick from the history;
+        # the current verdict for a run newer than the history's last tick
+        # (or when there is no history at all); none for a run that
+        # predates the history -- today's outage says nothing about it.
+        first_tick = iso_ms(history[0]["tick"]) if history else None
+        predates = first_tick is not None and finished is not None and finished < first_tick
+        against = at if at is not None else (None if predates else health)
+        verdict = classify.classify_run(run, runs, health_at=against, now=now, admitted=admitted)
+        out_runs.append(compact_run(run, verdict, at))
+        classified[verdict["build"]] = {c["case"]: c for c in verdict["cases"]}
+    return {
+        "schema_version": 1,
+        "generated_at": data.get("generated_at") if iso_ms(data.get("generated_at")) is not None else None,
+        "stale_after_s": data.get("stale_after_s") if isinstance(data.get("stale_after_s"), (int, float)) else None,
+        "run_days": RUN_VIEW_DAYS,
+        "rate_windows_days": list(TIER_RATE_WINDOWS_DAYS),
+        "strip_runs": STRIP_RUNS,
+        "admitted": sorted(admitted) if admitted is not None else None,
+        "health": health,
+        "history": {"ticks": [
+            {"tick": t["tick"], "state": t["state"], "condition": t["condition"], "since": t["since"],
+             "failing_cases": t["failing_cases"], "recovering": t["recovering"]} for t in history
+        ], "incidents": incidents} if history is not None else None,
+        "merges": merges,
+        "catches": (events or {}).get("catches"),
+        "cases": case_documents(data, notes or {}, admitted, demoted, classified),
+        "runs": out_runs,
+        "pending": pending_builds(data),
+        "releases": [compact_release(r) for r in sorted_releases(data)],
+    }
 
 
-def foot_html(data: dict) -> str:
-    generated = parse_iso(data.get("generated_at"))
-    generated_text = f"{generated:%Y-%m-%d %H:%M} UTC" if generated else "unknown time"
-    runs = len(data.get("runs") or [])
-    nightly = len(nightly_runs(data))
-    threshold = fmt(RUN_EVENT_FAIL_FRACTION * 100)
-    return (
-        f'<div class="foot" id="foot">Every number on this page is computed from '
-        f"<code>data.json</code> (source: {esc(str(data.get('source') or '?'))}, "
-        f"generated {generated_text}, {runs} run{'s' if runs != 1 else ''} on record, "
-        f"{nightly} of them nightly; the agent and gate bands read presubmit runs only). "
-        f"Run-level event rule: a run where ≥{threshold}% of its graded tasks failed is "
-        f"charged to the run, not the cases. Event markers and catch counts come from "
-        f"<code>events.yaml</code>; row annotations and badges from "
-        f"<code>case-notes.yaml</code>. All three are advisory only.</div>"
-    )
+# --------------------------------------------------------------------------
+# the pages
 
 
-EMPTY_STATE_HTML = """
-  <section style="margin-top:30px" id="empty-state">
-    <span class="eyebrow">Agent evaluation · presubmit</span>
-    <h1>Is the agent getting better or worse?</h1>
-    <div class="empty" style="margin-top:24px">
-      <span class="banner">⏳ No evaluation data yet</span>
-      <p style="margin-top:12px">No runs are on record in <code>data.json</code>. Once the collector publishes its first run, the band tiles, the day trend, the case × run matrix, the failure signatures and the evidence table all render from that file automatically — nothing else feeds this page.</p>
-    </div>
-  </section>"""
-
-
-def app_html(data: dict, notes: dict, events: dict) -> str:
-    # releases[] counts as data, so a file carrying only RC records renders
-    # its table instead of "no evaluation data yet". Neither publish pipeline
-    # can reach this: both refuse to publish a data.json with an empty runs[]
-    # before render is called, and deliberately so -- a run whose presubmit
-    # sweep came back empty must not overwrite a good dashboard with a
-    # releases-only page. This is for the hand-run render sorted_releases
-    # already documents, and for whoever next reads a bare data.json.
-    if not (data.get("runs") or data.get("cases") or sorted_releases(data)):
-        return EMPTY_STATE_HTML
-    return (
-        HERO_HTML
-        + band_agent_html(data, events)
-        + band_gate_html(data, notes, events)
-        + evidence_html(data, notes)
-        + releases_html(data)
-        + foot_html(data)
+def render_page(page: str, brief: dict, data: dict, public_url: str | None = None) -> str:
+    """One of the four pages from the shared template, with brief.json (and
+    the health verdict, when there is one) inlined as JSON data elements and
+    pages.js after them. ``page`` is a PAGES key."""
+    template = PAGE_TEMPLATE.read_text()
+    values = {
+        "__TITLE__": PAGES[page]["title"],
+        "__PAGE__": page,
+        "__NAV_BRIEF__": 'class="on"' if page == "brief" else "",
+        "__NAV_GRID__": 'class="on"' if page == "grid" else "",
+        "__NAV_CASES__": 'class="on"' if page == "cases" else "",
+        # The PR view is a tab only while it is the page being read.
+        "__NAV_RUN__": f'<a href="{RUN_PAGE}" class="on">PR view</a>' if page == "run" else "",
+        "__BASE__": base_html(public_url),
+        "__INLINE_BRIEF__": inline_json_html(INLINE_BRIEF_ID, brief),
+        "__INLINE_HEALTH__": inline_json_html(INLINE_HEALTH_ID, brief["health"]) if brief.get("health") else "",
+        "__META__": meta_html(data),
+        "__FRESHNESS__": freshness_html(data),
+        "__PAGES_JS__": PAGES_JS.read_text(),
+    }
+    for token in values:
+        if token not in template:
+            raise SystemExit(f"ERROR: page template is missing the {token} marker")
+    # One pass over the template only: substituted values are never
+    # re-scanned, so data that happens to contain a marker string stays
+    # inert text instead of expanding into the raw JSON bootstrap.
+    return re.sub(
+        "|".join(re.escape(token) for token in values),
+        lambda match: values[match.group(0)],
+        template,
     )
 
 
@@ -1669,8 +1042,17 @@ def meta_html(data: dict) -> str:
 
 
 def freshness_html(data: dict) -> str:
+    """The badge's baked text; the page rewrites it in Toronto time on load."""
     generated = parse_iso(data.get("generated_at"))
     return f"updated {generated:%H:%M} UTC" if generated else "updated —"
+
+
+def esc(value) -> str:
+    return (
+        str(value)
+        .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        .replace('"', "&quot;").replace("'", "&#x27;")
+    )
 
 
 def bootstrap_json(value) -> str:
@@ -1699,33 +1081,6 @@ def base_html(public_url: str | None) -> str:
     return f'<base href="{esc(public_url.rstrip("/") + "/")}">'
 
 
-def render_page(data: dict, notes: dict, events: dict, public_url: str | None = None) -> str:
-    page = TEMPLATE.read_text()
-    values = {
-        "__BASE__": base_html(public_url),
-        "__META__": meta_html(data),
-        "__FRESHNESS__": freshness_html(data),
-        "__APP__": app_html(data, notes, events),
-        # The live read side: the template's script re-renders from this
-        # baked copy on load, then polls data.json every 60s.
-        "__DATA_JSON__": bootstrap_json(data),
-        "__NOTES_JSON__": bootstrap_json(notes),
-        "__EVENTS_JSON__": bootstrap_json(events),
-    }
-    for token in values:
-        if token not in page:
-            raise SystemExit(f"ERROR: template is missing the {token} marker")
-    # One pass over the template only: substituted values are never
-    # re-scanned, so data that happens to contain a marker string (a case
-    # *named* __DATA_JSON__, say) stays inert text instead of expanding
-    # into the raw JSON bootstrap inside the page body.
-    return re.sub(
-        "|".join(re.escape(token) for token in values),
-        lambda match: values[match.group(0)],
-        page,
-    )
-
-
 # --------------------------------------------------------------------------
 
 
@@ -1736,12 +1091,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--notes",
         default=str(DEFAULT_NOTES),
-        help="case-notes.yaml (optional annotations; absent file is fine)",
+        help="case-notes.yaml (optional notes and issue links per case; absent file is fine)",
     )
     parser.add_argument(
         "--events",
         default=str(DEFAULT_EVENTS),
-        help="events.yaml (optional markers and catch counts; absent file is fine)",
+        help="events.yaml (optional catch counts; absent file is fine)",
     )
     parser.add_argument(
         "--health",
@@ -1774,19 +1129,18 @@ def main(argv: list[str] | None = None) -> int:
     health = load_health(pathlib.Path(args.health)) if args.health else None
     history = load_health_history(pathlib.Path(args.health_history)) if args.health_history else None
     merges = recent_merges(pathlib.Path(args.repo_root), reference_ms(data))
-    brief = brief_document(data, health, history, merges)
+    brief = brief_document(data, health, history, merges, notes=notes, events=events)
 
     out_dir = pathlib.Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / BRIEF_PAGE).write_text(render_new_page("brief", brief, data, args.public_url))
-    (out_dir / RUN_PAGE).write_text(render_new_page("run", brief, data, args.public_url))
-    (out_dir / LEGACY_PAGE).write_text(render_page(data, notes, events, args.public_url))
+    for page, spec in PAGES.items():
+        (out_dir / spec["file"]).write_text(render_page(page, brief, data, args.public_url))
     (out_dir / BRIEF_JSON).write_text(json.dumps(brief, separators=(",", ":")))
     # health.json and health-history.jsonl are deliberately not copied into
     # the out-dir: the adjudicator owns those objects, and republishing a
     # copy would overwrite a fresher verdict with the one this render read.
     shutil.copyfile(args.data, out_dir / "data.json")
-    print(f"wrote {out_dir / BRIEF_PAGE}, {RUN_PAGE}, {LEGACY_PAGE}, {BRIEF_JSON}")
+    print(f"wrote {', '.join(str(out_dir / spec['file']) for spec in PAGES.values())}, {BRIEF_JSON}")
     return 0
 
 

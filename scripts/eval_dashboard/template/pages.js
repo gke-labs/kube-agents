@@ -1,14 +1,15 @@
-/* The Brief (index.html) and the PR view (run.html) share this script.
+/* The Brief (index.html), the PR view (run.html), the Grid (grid.html) and
+ * the Cases page (cases.html) share this script.
  *
- * render.py inlines it into both pages after two JSON data elements
+ * render.py inlines it into every page after two JSON data elements
  * (PAGE.inlineBrief and PAGE.inlineHealth): brief.json -- the per-run
- * classification classify.py produced, the current health verdict, the
- * health history and the recent merges -- and, when there is a verdict,
- * that verdict again under its own id (the same normalized document as
- * brief.health). Each page renders itself from those in the browser. There is no
- * server-side HTML for these two pages:
- * everything a reader sees is computed here from the inlined copy, with no
- * request beyond the page itself.
+ * classification classify.py produced, the per-case record, the current
+ * health verdict, the health history, the recent merges and the
+ * release-candidate runs -- and, when there is a verdict, that verdict again
+ * under its own id (the same normalized document as brief.health). Each page
+ * renders itself from those in the browser. There is no server-side HTML
+ * for any page: everything a reader sees is computed here from the inlined
+ * copy, with no request beyond the page itself.
  *
  * The poll of the published brief.json and health.json every PAGE.refreshMs
  * is a best-effort refresh on top, not what the page depends on: the whole
@@ -24,9 +25,12 @@
  * it drops the query string:
  *   index.html#since=<ISO>&until=<ISO>&cases=a,b&view=gate|agent
  *   run.html#build=<prow build id>
+ *   grid.html#since=<ISO>&until=<ISO>&cases=a,b[&window=6h|24h|36h|7d][&rows=all|admitted|failing]
+ *   cases.html#<case>, or cases.html#sort=worst|domain|name&show=all|blocking|held
  * The older query form (`?cases=a,b&since=<ISO>&until=<ISO>` before a bare
- * `#gate` or `#agent`; `?build=<id>` on run.html) is still read, so a link
- * already posted opens the same page wherever its query survives.
+ * `#gate` or `#agent`; `?build=<id>` on run.html; the same on the Grid and
+ * the Cases page) is still read, so a link already posted opens the same
+ * page wherever its query survives.
  */
 "use strict";
 
@@ -74,8 +78,27 @@ const PAGE = {
   prUrl: "https://github.com/gke-labs/kube-agents/pull",
   issueUrl: "https://github.com/gke-labs/kube-agents/issues",
   rulesUrl: "https://github.com/gke-labs/kube-agents/blob/main/scripts/eval_dashboard/classify.py",
+  rosterUrl: "https://github.com/gke-labs/kube-agents/blob/main/docs/eval-gate-roster.md",
   briefFile: "brief.json",
   healthFile: "health.json",
+  pages: { brief: "index.html", run: "run.html", grid: "grid.html", cases: "cases.html" },
+  titles: { brief: "kube-agents · smoke gate brief", run: "kube-agents · smoke run", grid: "kube-agents · cases by run", cases: "kube-agents · how reliable is each test" },
+  // The Grid's window chips, and the one it opens with when the URL names none.
+  gridWindows: [["6h", 6 * 3600 * 1000], ["24h", 24 * 3600 * 1000], ["36h", 36 * 3600 * 1000], ["7d", 7 * 24 * 3600 * 1000]],
+  gridDefaultWindow: "36h",
+  // Merge markers get a label each up to this many in the window; beyond it
+  // the lines stay and the merges are listed under the grid instead.
+  gridLabelledMergesMax: 6,
+  // The Cases page's colour bands for a pass rate. Display bands only -- the
+  // admission rule is prose in docs/eval-gate-roster.md, not a threshold.
+  rateOkMin: 0.9,
+  rateWarnMin: 0.75,
+  // The words for a case's roster status (render.py's STATUS_* values).
+  statusWords: { blocking: "blocking", held_out: "held out", demoted: "demoted", nightly_only: "nightly only", retired: "not in any matrix" },
+  // Verdict pill colour by the banner hack/ci-eval-rc.sh prints. NOT RUN is the
+  // deploy-failed path: nothing was measured, which is neither a pass nor a
+  // judgement on the candidate, so it takes the neutral infra colour.
+  releaseVerdictClass: { GREEN: "p-pass", RED: "p-fail", "NOT RUN": "p-infra" },
 };
 
 function inlineJson(id) {
@@ -93,10 +116,14 @@ let health = normalizeHealth(inlineJson(PAGE.inlineHealth) ?? brief.health);
 // True once a brief.json poll has succeeded; until then (a file:// preview,
 // a host that redirects XHRs) the page is as fresh as its last publish.
 let live = false;
+// What the reader has clicked on the Grid and the Cases page. URL parameters
+// seed it; a chip or a cell changes it and re-renders.
+const ui = { sort: null, show: null, window: null, rows: null, markers: { merge: true, incident: true }, selected: null, showHeld: false, showRetired: false };
 
 const esc = (value) => String(value)
   .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
   .replace(/"/g, "&quot;").replace(/'/g, "&#x27;");
+const enc = encodeURIComponent;
 
 function parseIso(value) {
   if (typeof value !== "string") return null;
@@ -191,10 +218,12 @@ function linkCaseIds(values) {
 // The one place a URL is read. The parameters are `key=value` pairs read
 // from the query string first (the form links carried before the fragment
 // form; a key present in both is the query's) and then from the fragment
-// (`#since=…&until=…&cases=…&view=…`, `#build=…`). A bare `#gate` or
-// `#agent`, the old anchors, still selects that view.
+// (`#since=…&until=…&cases=…&view=…`, `#build=…`, the Grid's `window=` and
+// `rows=`, the Cases page's `sort=` and `show=`). A bare `#gate` or
+// `#agent`, the old anchors, still selects that view; a bare case id on
+// the Cases page names its row.
 function linkState() {
-  const out = { cases: new Set(), sinceMs: null, untilMs: null, build: null, view: "" };
+  const out = { cases: new Set(), sinceMs: null, untilMs: null, build: null, view: "", caseHash: null, sort: null, show: null, window: null, rows: null };
   let query, fragment;
   try {
     query = new URLSearchParams(location.search);
@@ -211,8 +240,21 @@ function linkState() {
   }
   const build = param("build").trim();
   if (/^[0-9]{1,25}$/.test(build)) out.build = build;
+  // The Grid's and the Cases page's view parameters: a value outside the
+  // vocabulary is the default, never text on the page.
+  const pick = (key, allowed) => (allowed.includes(param(key)) ? param(key) : null);
+  out.sort = pick("sort", ["worst", "domain", "name"]);
+  out.show = pick("show", ["all", "blocking", "held"]);
+  out.window = pick("window", PAGE.gridWindows.map((w) => w[0]));
+  out.rows = pick("rows", ["all", "admitted", "failing"]);
   const view = param("view") || location.hash.slice(1);
   out.view = Object.values(PAGE.views).includes(view) ? view : "";
+  // A bare fragment that is a case id (`cases.html#<case>`) names the row to
+  // highlight. One that is not valid percent-encoding is no case id; it must
+  // not stop the page from rendering.
+  let bare = "";
+  try { bare = decodeURIComponent(location.hash.slice(1) || ""); } catch (err) { bare = ""; }
+  if (bare && !out.view && PAGE.caseIdRe.test(bare)) out.caseHash = bare;
   return out;
 }
 
@@ -220,26 +262,29 @@ function linkState() {
 // is percent-encoded: the case ids passed linkCaseIds' grammar and the
 // timestamps are utcIso's `Z` form, so the text is the same one
 // post_health.dashboard_link writes.
-function briefHref(view, inc = {}) {
+function scopeParams(inc) {
   const params = [];
   if (inc.sinceMs != null) params.push(`since=${utcIso(inc.sinceMs)}`);
   if (inc.untilMs != null) params.push(`until=${utcIso(inc.untilMs)}`);
   const cases = linkCaseIds(inc.cases || []);
   if (cases.length) params.push(`cases=${cases.join(",")}`);
-  params.push(`view=${view}`);
-  return `index.html#${params.join("&")}`;
+  return params;
 }
+const briefHref = (view, inc = {}) => `${PAGE.pages.brief}#${[...scopeParams(inc), `view=${view}`].join("&")}`;
 const incidentHref = (inc) => briefHref(PAGE.views.gate, inc);
 const numbersHref = () => briefHref(PAGE.views.agent);
-const runHref = (run) => `run.html#build=${encodeURIComponent(run.build)}`;
+// The Grid on the incident's own window: the same scope, no view.
+const gridHref = (inc) => { const params = scopeParams(inc); return PAGE.pages.grid + (params.length ? `#${params.join("&")}` : ""); };
+const caseHref = (name) => `${PAGE.pages.cases}#${enc(name)}`;
+const runHref = (run) => `${PAGE.pages.run}#build=${enc(run.build)}`;
 
 /* ---- links out ---- */
 
 const prLink = (pr) => (pr == null ? "no PR" : `<a href="${PAGE.prUrl}/${esc(pr)}">PR #${esc(pr)}</a>`);
-const buildUrl = (run) => (run.pr == null ? null : `${PAGE.spyglass}/${encodeURIComponent(run.pr)}/${PAGE.job}/${encodeURIComponent(run.build)}`);
+const buildUrl = (run) => (run.pr == null ? null : `${PAGE.spyglass}/${enc(run.pr)}/${PAGE.job}/${enc(run.build)}`);
 const transcriptUrl = (run, kase) => {
   const base = buildUrl(run);
-  return base ? `${base}/artifacts/eval_${encodeURIComponent(kase)}_rep1.log` : null;
+  return base ? `${base}/artifacts/eval_${enc(kase)}_rep1.log` : null;
 };
 const issueLink = (issue) => {
   const match = /^#(\d+)$/.exec(String(issue).trim());
@@ -251,11 +296,19 @@ const projectShort = (project) => (project ? String(project).replace(/^kube-agen
 
 const runs = () => (Array.isArray(brief.runs) ? brief.runs.filter((r) => r && typeof r === "object") : []);
 const runFinish = (run) => parseIso(run.finished) ?? parseIso(run.started);
+const runStart = (run) => parseIso(run.started) ?? parseIso(run.finished);
 const measured = (run) => Array.isArray(run.cases) && run.cases.length > 0;
 const concluded = (run) => run.result === "SUCCESS" || run.result === "FAILURE";
 const isGreen = (run) => run.result === "SUCCESS";
 const gateFailures = (run) => (run.cases || []).filter((c) => c.admitted && c.outcome === "failed").map((c) => c.case);
 const heldOutFailures = (run) => (run.cases || []).filter((c) => !c.admitted && c.outcome === "failed").map((c) => c.case);
+// A superseded push (aborted, nothing recorded) says nothing about the gate;
+// the Brief counts it and the Grid gives it no column.
+const tellsSomething = (run) => measured(run) || run.setup_death || concluded(run);
+// A Grid column: a run that graded cases, or died before them. A green run
+// with no cases recorded (the gate revalidated the branch's earlier run) is
+// neither; it gets no column rather than a row of "died" cells.
+const gridColumnRun = (run) => measured(run) || run.setup_death || (concluded(run) && !isGreen(run));
 
 function windowRuns(sinceMs, untilMs) {
   return runs().filter((run) => {
@@ -411,7 +464,7 @@ function mergesFact(inc, inWindow) {
   return fact(true, `${plural(merges.length, "merge")} to main between the last green run and the first red one: ${merges.slice(0, 4).map((m) => m.pr != null ? `<a href="${PAGE.prUrl}/${esc(m.pr)}">#${esc(m.pr)}</a>` : esc(String(m.sha).slice(0, 7))).join(", ")}${merges.length > 4 ? ", …" : ""}.`);
 }
 
-/* ---- fragments shared by both pages ---- */
+/* ---- fragments shared by the pages ---- */
 
 function pillHtml(state, text) {
   const key = state in PAGE.states ? state : "PAST";
@@ -432,6 +485,9 @@ function stormRetestMs(inc) {
   if (inc.windowEndMs != null) return inc.windowEndMs + PAGE.stormCooldownMs;
   return null;
 }
+
+// One chip row: [{key, value, label, on}] as buttons the click handler reads.
+const chip = (key, value, label, on) => `<button type="button" data-${key}="${esc(value)}"${on ? ' class="on"' : ""}>${esc(label)}</button>`;
 
 /* ---- the Brief ---- */
 
@@ -547,8 +603,7 @@ function beingDoneHtml(inc) {
 
 function runsListHtml(inWindow, inc, title) {
   const cases = new Set(inc ? inc.cases : []);
-  // A superseded push (aborted, nothing recorded) says nothing about the gate; count it, don't list it.
-  const shown = inWindow.filter((run) => measured(run) || run.setup_death || concluded(run));
+  const shown = inWindow.filter(tellsSomething);
   const hidden = inWindow.length - shown.length;
   const rows = [...shown].reverse().map((run) => {
     const failed = gateFailures(run);
@@ -563,8 +618,10 @@ function runsListHtml(inWindow, inc, title) {
       `<span class="rpr">#${esc(run.pr ?? "?")}</span><span class="rwhen">${esc(et(runFinish(run)))}</span>` +
       `<span class="rproj">${esc(projectShort(run.project))}</span><span class="rcases">${chips}${note}${stormChip}${held ? `<span class="mut small">+${held} held-out</span>` : ""}</span></a>`;
   });
+  // The incident's own window on the Grid: the same cases, since and until.
+  const grid = inc ? `<p><a href="${esc(gridHref(inc))}">See it in the grid →</a></p>` : "";
   return `<div class="sec"><h2>${esc(title)}</h2><div class="runs">${rows.join("") || '<p class="mut">No runs in this window.</p>'}</div>` +
-    `<p class="mut small">Each row opens that run's page. Red chips are the incident's cases; amber ones are other gate failures.${hidden ? ` ${plural(hidden, "aborted run")} not listed.` : ""}</p></div>`;
+    `<p class="mut small">Each row opens that run's page. Red chips are the incident's cases; amber ones are other gate failures.${hidden ? ` ${plural(hidden, "aborted run")} not listed.` : ""}</p>${grid}</div>`;
 }
 
 function numbers(sinceMs, untilMs) {
@@ -605,6 +662,54 @@ function lastIncidentHtml() {
   return `<p>${pillHtml(inc.state, `PAST ${inc.state}`)} <b>${esc(etSpan(inc.sinceMs, inc.untilMs))}</b> — ${what}${inc.cases.length ? ` (<code>${inc.cases.map(esc).join("</code>, <code>")}</code>)` : ""}. <a href="${esc(incidentHref(inc))}">Open the brief for it →</a></p>`;
 }
 
+/* ---- the Brief's release table (SCHEMA.md: releases[]) ---- */
+
+const isNumber = (value) => typeof value === "number" && Number.isFinite(value);
+
+function releaseRow(r) {
+  const tag = r.rc_tag || "unknown candidate";
+  const name = r.artifacts_url ? `<a href="${esc(r.artifacts_url)}" rel="noopener">${esc(tag)}</a>` : esc(tag);
+  const bits = [];
+  if (r.commit) bits.push(String(r.commit));
+  if (r.build) bits.push(`build ${r.build}`);
+  // The banner is missing, so Prow's own result is the only thing left that
+  // says whether the job survived. Say so rather than showing a blank row
+  // that reads like a quiet pass.
+  if (!r.verdict) bits.push(`no eval banner · job ${r.result || "unknown"}`);
+  const cls = PAGE.releaseVerdictClass[r.verdict || ""] || "p-infra";
+  let rate;
+  if (!isNumber(r.pass_rate)) rate = `—<div class="tnote">not reported</div>`;
+  else {
+    let note = "no baseline — baselines maturing";
+    if (isNumber(r.baseline_rate)) {
+      note = `main ${(r.baseline_rate * 100).toFixed(1)}%`;
+      // Points, not percent: the margin is a difference of two rates.
+      if (isNumber(r.margin)) note += ` · margin ${r.margin >= 0 ? "+" : "−"}${(Math.abs(r.margin) * 100).toFixed(1)}pt`;
+    }
+    rate = `${(r.pass_rate * 100).toFixed(1)}%<div class="tnote">${esc(note)}</div>`;
+  }
+  const cases = r.cases
+    ? `${r.cases.passed}/${r.cases.graded}<div class="tnote">${r.cases.infra ? `${r.cases.infra} infra excluded` : "none excluded"}</div>`
+    : `—<div class="tnote">no cases parsed</div>`;
+  const started = parseIso(r.started);
+  return `<tr><td><b>${name}</b><div class="tnote">${esc(bits.join(" · "))}</div></td>` +
+    `<td class="mut">${esc(r.tier || "—")}</td>` +
+    `<td><span class="pill ${cls}">${esc(r.verdict || "NO VERDICT")}</span></td>` +
+    `<td class="num">${rate}</td><td class="num">${cases}</td>` +
+    `<td class="mut">${esc(started != null ? et(started) : "unknown time")}</td>` +
+    `<td class="mut">${esc(r.duration_s ? minutesText(r.duration_s * 1000) : "")}</td></tr>`;
+}
+
+function releasesHtml() {
+  const releases = (Array.isArray(brief.releases) ? brief.releases : []).filter((r) => r && typeof r === "object");
+  const body = releases.length
+    ? `<table class="rel"><thead><tr><th>Candidate</th><th>Tier</th><th>Verdict</th><th>Admitted rate</th><th>Cases passed</th><th>Started</th><th>Eval took</th></tr></thead>` +
+      `<tbody>${releases.map(releaseRow).join("")}</tbody></table>` +
+      `<p class="mut small">One row per <code>post-kube-agents-eval-rc</code> run: the full suite against a release candidate's own images. Advisory: this lane reports and does not gate, and the non-inferiority comparison stays advisory while the baseline store is maturing. The admitted rate covers only the cases admitted to the gate; cases passed counts every graded case in the run.</p>`
+    : `<p class="mut">No release-candidate eval run on record. When the next RC cuts, its run appears here: candidate, tier, verdict and the advisory non-inferiority number.</p>`;
+  return `<div class="sec" id="releases"><h2>Release candidates</h2>${body}</div>`;
+}
+
 function briefHtml(link) {
   const inc = resolveIncident(link);
   const anchor = nowMs();
@@ -621,18 +726,18 @@ function briefHtml(link) {
     } else if (noVerdict) {
       // No health.json beside the data: the runs alone cannot say the gate is healthy.
       head = "No gate verdict is published";
-      lede = `The adjudicator's health.json is not beside data.json, so this page cannot say whether the gate is healthy. The counts below come from the runs alone; each run's page still tags its failures.`;
+      lede = `The adjudicator's health.json is not beside brief.json, so this page cannot say whether the gate is healthy. The counts below come from the runs alone; each run's page still tags its failures.`;
       pill = pillHtml("PAST", "NO VERDICT");
     } else {
       head = "The last 24 hours in numbers";
-      lede = `The gate is ${inc.recovering ? "recovering" : inc.state.toLowerCase()} — <a href="index.html">read the brief</a>. These are the plain counts.`;
+      lede = `The gate is ${inc.recovering ? "recovering" : inc.state.toLowerCase()} — <a href="${PAGE.pages.brief}">read the brief</a>. These are the plain counts.`;
       pill = pillHtml(inc.state, stateWord(inc));
     }
     return `<div class="sec head">${pill}<h1>${esc(head)}</h1><div class="lede">${lede}</div></div>` +
       `<div class="sec" id="agent"><h2>Last 24 hours</h2>${numbersHtml(sinceMs, null)}</div>` +
       (healthy || noVerdict ? `<div class="sec"><h2>Last incident</h2>${lastIncidentHtml()}</div>` : "") +
       runsListHtml(windowRuns(sinceMs, null), inc, "Runs in the last 24 hours") +
-      footHtml();
+      releasesHtml() + footHtml();
   }
   const inWindow = windowRuns(incidentStartMs(inc), inc.untilMs);
   if (!inWindow.some(measured) && !inWindow.some((r) => r.setup_death)) {
@@ -654,12 +759,12 @@ function briefHtml(link) {
     changedBeforeHtml(inc, inWindow) +
     beingDoneHtml(inc) +
     runsListHtml(inWindow, inc, "Runs in this window") +
-    footHtml();
+    releasesHtml() + footHtml();
 }
 
 function footHtml() {
   const generated = parseIso(brief.generated_at);
-  return `<div class="foot"><span>Full history table: <a href="legacy.html">legacy view</a></span><span><a href="${esc(numbersHref())}">The last 24 hours in numbers</a></span><span><a href="${PAGE.rulesUrl}">How the tags are decided</a></span><span class="mut">data generated ${esc(generated != null ? et(generated) : "unknown")}${brief.run_days ? ` · runs from the last ${esc(brief.run_days)} days` : ""}</span></div>`;
+  return `<div class="foot"><span>Every case by run: <a href="${PAGE.pages.grid}">grid</a></span><span>How reliable is each test: <a href="${PAGE.pages.cases}">cases</a></span><span><a href="${esc(numbersHref())}">The last 24 hours in numbers</a></span><span><a href="${PAGE.rulesUrl}">How the tags are decided</a></span><span class="mut">data generated ${esc(generated != null ? et(generated) : "unknown")}${brief.run_days ? ` · runs from the last ${esc(brief.run_days)} days` : ""}</span></div>`;
 }
 
 /* ---- the PR view ---- */
@@ -678,7 +783,7 @@ function bannerHtml(run) {
   const cases = h.failing_cases || [];
   const href = incidentHref({ cases, sinceMs, untilMs: h.until ? parseIso(h.until) : null });
   let text;
-  if (h.state === "GREEN") text = `<b>Gate healthy ${when}.</b> No shared break, storm or setup failures. <a href="index.html">Brief →</a>`;
+  if (h.state === "GREEN") text = `<b>Gate healthy ${when}.</b> No shared break, storm or setup failures. <a href="${PAGE.pages.brief}">Brief →</a>`;
   else if (h.condition === "storm") text = `<b>Quota storm ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs lose repetitions to 429s and empty records. <a href="${esc(href)}">Read the brief →</a>`;
   else if (h.condition === "setup_deaths") text = `<b>Setup failures ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs die before any case runs. <a href="${esc(href)}">Read the brief →</a>`;
   else if (h.condition === "lost_pods") text = `<b>Build nodes lost ${when}</b>${sinceMs != null ? ` since ${esc(et(sinceMs))}` : ""}: runs died with the node under them; nothing about the branch. <a href="${esc(href)}">Read the brief →</a>`;
@@ -712,7 +817,7 @@ function caseCard(run, c) {
     (c.reason ? `<div class="reason">${esc(c.reason)}</div>` : "") +
     (c.excerpt ? `<div class="quote">“${esc(c.excerpt)}”</div>` : "") +
     (c.do ? `<div class="do"><b>Do:</b> ${esc(c.do)}</div>` : "") +
-    `<div class="links">${url ? `<a href="${esc(url)}">transcript (rep 1)</a>` : ""}${log ? `<a href="${esc(log)}">build log</a>` : ""}<a href="legacy.html#gate">this case's history</a></div></div>`;
+    `<div class="links">${url ? `<a href="${esc(url)}">transcript (rep 1)</a>` : ""}${log ? `<a href="${esc(log)}">build log</a>` : ""}<a href="${esc(caseHref(c.case))}">this case's history</a></div></div>`;
 }
 
 function whatToDoHtml(run) {
@@ -735,9 +840,9 @@ function whatToDoHtml(run) {
 }
 
 function runHtml(link) {
-  if (!link.build) return `<div class="sec head"><h1>Which run?</h1><div class="lede">Open this page as <code>run.html#build=&lt;prow build id&gt;</code>; the gate comment on a PR links here. <a href="index.html">Back to the brief →</a></div></div>` + footHtml();
+  if (!link.build) return `<div class="sec head"><h1>Which run?</h1><div class="lede">Open this page as <code>run.html#build=&lt;prow build id&gt;</code>; the gate comment on a PR links here. <a href="${PAGE.pages.brief}">Back to the brief →</a></div></div>` + footHtml();
   const run = runs().find((r) => String(r.build) === link.build);
-  if (!run) return `<div class="sec head"><h1>No run with that id in the last ${esc(brief.run_days ?? "?")} days.</h1><div class="lede">Build <code>${esc(link.build)}</code> is not in the data behind this page: older than its window, still running, or never uploaded. <a href="index.html">Back to the brief →</a></div></div>` + footHtml();
+  if (!run) return `<div class="sec head"><h1>No run with that id in the last ${esc(brief.run_days ?? "?")} days.</h1><div class="lede">Build <code>${esc(link.build)}</code> is not in the data behind this page: older than its window, still running, or never uploaded. <a href="${PAGE.pages.brief}">Back to the brief →</a></div></div>` + footHtml();
   const startMs = parseIso(run.started), finishMs = parseIso(run.finished);
   const log = buildUrl(run);
   const crumb = [`Smoke run for ${prLink(run.pr)}`, startMs != null ? `started ${esc(et(startMs))}` : "", finishMs != null ? `finished ${esc(startMs != null && etDay(startMs) === etDay(finishMs) ? `${etTime(finishMs)} ${PAGE.tzLabel}` : et(finishMs))}` : "",
@@ -761,6 +866,351 @@ function runHtml(link) {
     bannerHtml(run) + body + whatToDoHtml(run) + footHtml();
 }
 
+/* ---- the per-case record (brief.json's cases{}) ---- */
+
+function caseDocs() {
+  const raw = brief.cases && typeof brief.cases === "object" && !Array.isArray(brief.cases) ? brief.cases : {};
+  return Object.keys(raw).filter((name) => raw[name] && typeof raw[name] === "object").map((name) => Object.assign({
+    domain: "unknown", status: "retired", rates: {}, strip: [], issues: [], last_failure: null,
+  }, raw[name], { name }));
+}
+const isBlocking = (c) => c.status === "blocking";
+const isHeldOut = (c) => c.status === "held_out" || c.status === "demoted";
+const byName = (a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+const domainWords = (domain) => String(domain).replace(/-/g, " ");
+// [passed, failed] -> the fraction, or null when nothing was graded.
+const rateOf = (pair) => (Array.isArray(pair) && pair.length === 2 && pair[0] + pair[1] > 0 ? pair[0] / (pair[0] + pair[1]) : null);
+const rate7d = (c) => rateOf((c.rates && c.rates.presubmit || [])[0]);
+// Worst first; a case with no graded repetition sorts after every rate.
+const worstKey = (c) => (rate7d(c) == null ? 2 : rate7d(c));
+const byWorst = (a, b) => worstKey(a) - worstKey(b) || byName(a, b);
+
+function statusPill(c) {
+  const word = c.status === "demoted" && c.demoted_on ? `demoted ${String(c.demoted_on).slice(5)}` : (PAGE.statusWords[c.status] || String(c.status));
+  return `<span class="st ${esc(c.status)}">${esc(word)}</span>`;
+}
+
+/* ---- the Cases page ---- */
+
+function rateCell(pair) {
+  const rate = rateOf(pair);
+  if (rate == null) return `<span class="rate none">—</span>`;
+  const cls = rate >= PAGE.rateOkMin ? "ok" : rate >= PAGE.rateWarnMin ? "warn" : "bad";
+  const n = pair[0] + pair[1];
+  return `<span class="rate ${cls}" title="${pair[0]} of ${n} graded repetitions passed">${pct(rate)}<small>(${n})</small></span>`;
+}
+
+const stripWords = { pass: "passed all reps", fail: "failed all reps", partial: "failed some reps", infra: "quota / infra, not counted" };
+
+function stripHtml(c) {
+  const strip = Array.isArray(c.strip) ? c.strip : [];
+  if (!strip.length) return `<span class="mut small">no presubmit run on record</span>`;
+  const bars = strip.map((s) => {
+    const title = `${s.pr != null ? `#${s.pr}` : "no PR"} · ${et(parseIso(s.at))} · ${stripWords[s.state] || s.state}${s.event ? " · whole run broken, not counted in the rates" : ""}`;
+    return `<i class="${esc(s.state)}" title="${esc(title)}"></i>`;
+  });
+  return `<div class="spark" title="${esc(`last ${strip.length} presubmit runs, oldest first`)}">${bars.join("")}</div>`;
+}
+
+function lastFailureHtml(c) {
+  const f = c.last_failure;
+  if (!f || typeof f !== "object") return `<span class="lbl">Last failure was</span> <span class="mut">none on record</span>`;
+  const reps = f.reps || { pass: 0, fail: 0, infra: 0 };
+  let head;
+  if (f.state === "partial") head = `${reps.fail} of ${reps.pass + reps.fail} reps failed (the gate counts that as a pass)`;
+  else if (f.cls === "shared") head = f.also_failing_prs >= 1 ? `the gate's: failing on ${plural(f.also_failing_prs, "other PR")} at the time` : "the gate's: in the outage at the time";
+  else if (f.cls === "storm") head = "a quota storm: repetitions lost before grading";
+  else if (f.cls === "only-this-pr") head = "PR-caused: passed on other PRs around it";
+  else if (f.event) head = "failed all reps in a run where almost everything failed";
+  else head = "failed all reps";
+  // The run page carries the last run_days only; an older failure links to
+  // the pull request itself rather than to a page that says "no run".
+  const onRunPage = runs().some((r) => String(r.build) === String(f.build));
+  const who = f.pr == null ? (f.tier === "nightly" ? "the nightly" : "a run")
+    : onRunPage ? `<a href="${esc(runHref(f))}">#${esc(f.pr)}</a>`
+    : `<a href="${PAGE.prUrl}/${enc(f.pr)}">#${esc(f.pr)}</a> <span class="mut">(older than this page's ${esc(brief.run_days ?? "")}-day run window)</span>`;
+  const tier = f.tier === "nightly" ? " · nightly run; the presubmit has no failure on record" : "";
+  return `<span class="lf"><span class="lbl">Last failure was</span> <span><b>${esc(head)}</b> · ${who} · ${esc(et(parseIso(f.at)))}${esc(tier)}</span>` +
+    (f.reason ? `<span class="rsn" title="${esc(f.reason)}">${esc(f.reason)}</span>` : "") + `</span>` +
+    (f.excerpt ? `<div class="quote small">“${esc(f.excerpt)}”</div>` : "");
+}
+
+// Two rows per case: the numbers, then the last failure in a line of its
+// own -- a grader's reason is too long to share a row with eight columns.
+const CASE_COLUMNS = 8;
+
+function caseRow(c, link) {
+  const rates = c.rates || {};
+  const pre = rates.presubmit || [], night = rates.nightly || [];
+  const classes = [link.caseHash === c.name ? "hl" : "", c.status === "retired" ? "dim" : ""].filter(Boolean).join(" ");
+  const issues = (c.issues || []).map(issueLink).join(" · ") || `<span class="mut">—</span>`;
+  return `<tr id="case-${esc(c.name)}" class="main ${classes}"><td class="nm">${esc(c.name)}${c.note ? `<small>${esc(c.note)}</small>` : ""}</td>` +
+    `<td>${stripHtml(c)}</td><td>${rateCell(pre[0])}</td><td>${rateCell(pre[1])}</td><td>${rateCell(night[0])}</td><td>${rateCell(night[1])}</td>` +
+    `<td>${statusPill(c)}</td><td class="iss">${issues}</td></tr>` +
+    `<tr class="why ${classes}"><td colspan="${CASE_COLUMNS}">${lastFailureHtml(c)}</td></tr>`;
+}
+
+function caseGroups(cases, sort) {
+  if (sort === "name") return [{ label: null, cases: [...cases].sort(byName) }];
+  const groups = [];
+  const primary = new Map();
+  for (const c of cases.filter(isBlocking)) {
+    if (!primary.has(c.domain)) primary.set(c.domain, []);
+    primary.get(c.domain).push(c);
+  }
+  for (const [domain, list] of primary) groups.push({ label: domainWords(domain), cases: list, key: Math.min(...list.map(worstKey)) });
+  if (sort === "worst") {
+    groups.sort((a, b) => a.key - b.key || a.label.localeCompare(b.label));
+    for (const g of groups) g.cases.sort(byWorst);
+  } else {
+    groups.sort((a, b) => a.label.localeCompare(b.label));
+    for (const g of groups) g.cases.sort(byName);
+  }
+  const rest = [
+    ["held out", cases.filter(isHeldOut), false],
+    ["nightly only", cases.filter((c) => c.status === "nightly_only"), false],
+    ["not in any matrix", cases.filter((c) => c.status === "retired"), !ui.showRetired],
+  ];
+  for (const [label, list, collapsed] of rest) {
+    if (list.length) groups.push({ label: `${label} · ${plural(list.length, "case")}`, cases: list.sort(sort === "worst" ? byWorst : byName), collapsed });
+  }
+  return groups;
+}
+
+function casesHtml(link) {
+  const sort = ui.sort || link.sort || "worst";
+  const show = ui.show || link.show || "all";
+  const all = caseDocs();
+  const counts = { all: all.length, blocking: all.filter(isBlocking).length, held: all.filter(isHeldOut).length };
+  const cases = show === "blocking" ? all.filter(isBlocking) : show === "held" ? all.filter(isHeldOut) : all;
+  const columns = CASE_COLUMNS;
+  const rows = [];
+  for (const group of caseGroups(cases, sort)) {
+    if (group.label) rows.push(`<tr class="grp"><td colspan="${columns}">${esc(group.label)}</td></tr>`);
+    if (group.collapsed) {
+      rows.push(`<tr class="more"><td colspan="${columns}">${plural(group.cases.length, "case")} that no matrix runs on this checkout, kept for their history · <button type="button" data-toggle="retired" class="linklike">show</button></td></tr>`);
+      continue;
+    }
+    for (const c of group.cases) rows.push(caseRow(c, link));
+  }
+  if (!rows.length) rows.push(`<tr><td colspan="${columns}" class="mut">No case on record.</td></tr>`);
+  const windows = Array.isArray(brief.rate_windows_days) && brief.rate_windows_days.length === 2 ? brief.rate_windows_days : [7, 30];
+  const catches = brief.catches && typeof brief.catches === "object" ? brief.catches : null;
+  const caught = catches && Number.isInteger(catches.product_bugs)
+    ? ` The suite has caught ${plural(catches.product_bugs, "real product bug")}${Number.isInteger(catches.prs_blocked) ? ` and stopped ${plural(catches.prs_blocked, "PR")} from merging` : ""}${catches.ledger ? ` (catch ledger ${issueLink(catches.ledger)})` : ""}.`
+    : "";
+  const generated = parseIso(brief.generated_at);
+  return `<div class="sec head"><h1>How reliable is each test?</h1><div class="lede">One row per case. Pass rates count only repetitions the grader scored: quota and setup losses are left out, and a run where almost everything failed is charged to the run, not the cases. Blocking means the case is on the admitted roster and can red a PR.</div></div>` +
+    `<div class="ctl">sort by ${chip("sort", "worst", `worst ${windows[0]}d`, sort === "worst")}${chip("sort", "domain", "domain", sort === "domain")}${chip("sort", "name", "name", sort === "name")}` +
+    `<span class="sep">·</span>show ${chip("show", "all", `all ${counts.all}`, show === "all")}${chip("show", "blocking", `blocking only · ${counts.blocking}`, show === "blocking")}${chip("show", "held", `held out only · ${counts.held}`, show === "held")}</div>` +
+    `<table class="cases"><thead><tr><th>Case</th><th>Last ${esc(brief.strip_runs ?? 30)} runs</th><th>${windows[0]}d</th><th>${windows[1]}d</th><th>Nightly ${windows[0]}d</th><th>Nightly ${windows[1]}d</th><th>Status</th><th>Issue</th></tr></thead><tbody>${rows.join("")}</tbody></table>` +
+    `<div class="foot block"><p>Colours in the strip: green passed all reps · red failed all reps · faded red failed some reps · violet quota or infra, not counted. Rate colours are display bands (green from ${pct(PAGE.rateOkMin)}, amber from ${pct(PAGE.rateWarnMin)}), not the admission rule.</p>` +
+    `<p>A case blocks when it is named in <code>BOOTSTRAP_ADMITTED</code>; one that reds a PR its diff cannot explain is demoted the same day and comes back when its issue's re-admission bar holds — <a href="${PAGE.rosterUrl}">how the roster works</a>.${caught}</p>` +
+    `<p class="mut">Presubmit rates are the gate's own history on PRs; nightly rates are the case's record on main, kept apart. Data generated ${esc(generated != null ? et(generated) : "unknown")}.</p></div>`;
+}
+
+/* ---- the Grid ---- */
+
+// The column a run gets: its state for a case is read from the run's
+// classified cases, so a cell and the PR view agree by construction.
+const cellOutcome = { passed: "pass", failed: "fail", partial: "partial", infra: "infra" };
+
+function gridWindow(link, inc) {
+  const key = ui.window || link.window;
+  const toMs = link.sinceMs != null ? (link.untilMs ?? nowMs()) : nowMs();
+  if (link.sinceMs != null && (!key || key === "linked")) return { fromMs: inc ? incidentStartMs(inc) : link.sinceMs, toMs, key: "linked", live: link.untilMs == null };
+  const chosen = PAGE.gridWindows.find((w) => w[0] === (key || PAGE.gridDefaultWindow)) || PAGE.gridWindows[0];
+  return { fromMs: toMs - chosen[1], toMs, key: chosen[0], live: link.untilMs == null };
+}
+
+function gridColumns(win) {
+  const inWindow = runs().filter((r) => { const t = runStart(r); return t != null && t >= win.fromMs && t <= win.toMs; });
+  const cols = inWindow.filter(gridColumnRun).map((r) => ({ kind: "run", run: r, t: runStart(r), build: String(r.build) }));
+  const hidden = inWindow.length - cols.length;
+  if (win.live) {
+    for (const p of Array.isArray(brief.pending) ? brief.pending : []) {
+      const t = parseIso(p && p.first_seen);
+      if (t != null && t >= win.fromMs) cols.push({ kind: "pending", t, build: String(p.build) });
+    }
+  }
+  cols.sort((a, b) => a.t - b.t || (a.build < b.build ? -1 : 1));
+  return { cols, hidden };
+}
+
+function cellState(col, name) {
+  if (col.kind === "pending") return "running";
+  if (!measured(col.run)) return "died";
+  const c = (col.run.cases || []).find((x) => x.case === name);
+  return c ? (cellOutcome[c.outcome] || "none") : "none";
+}
+
+function gridMarkers(win, cols) {
+  const markers = [];
+  if (ui.markers.merge && Array.isArray(brief.merges)) {
+    for (const m of brief.merges) {
+      const t = parseIso(m.at);
+      if (t != null && t >= win.fromMs && t <= win.toMs) markers.push({ t, cls: "merge", label: m.pr != null ? `merge #${m.pr}` : `merge ${String(m.sha).slice(0, 7)}`, title: `${et(t)} · ${m.title || ""}`, href: m.pr != null ? `${PAGE.prUrl}/${enc(m.pr)}` : null });
+    }
+  }
+  if (ui.markers.incident) {
+    const seen = [];
+    const add = (t, cls, label) => {
+      if (t == null || t < win.fromMs || t > win.toMs) return;
+      if (seen.some((s) => s.cls === cls && Math.abs(s.t - t) <= PAGE.hourMs)) return;
+      seen.push({ t, cls });
+      markers.push({ t, cls, label, title: `${et(t)} · ${label}` });
+    };
+    const what = (inc) => (isBreak(inc) ? "shared break" : inc.condition === "storm" ? "quota storm" : inc.condition === "setup_deaths" ? "setup deaths" : "degraded");
+    for (const inc of historyIncidents().map(incidentFromHistory)) {
+      add(inc.sinceMs, "incident", `${inc.state.toLowerCase()}: ${what(inc)}`);
+      add(inc.untilMs, "recovered", "healthy again");
+    }
+    if (health && health.state !== "GREEN") add(parseIso(health.since), "incident", `${health.state.toLowerCase()}: ${what(incidentFromHealth(health))}`);
+  }
+  // Position: the boundary before the first column that starts after the
+  // marker, as a fraction of the column area.
+  const n = Math.max(cols.length, 1);
+  for (const m of markers) m.at = cols.filter((c) => c.t <= m.t).length / n;
+  markers.sort((a, b) => a.t - b.t);
+  return markers;
+}
+
+function markerHtml(markers, cols) {
+  const mergeCount = markers.filter((m) => m.cls === "merge").length;
+  const labelMerges = mergeCount <= PAGE.gridLabelledMergesMax;
+  const left = (m) => `left:calc(var(--namew) + (100% - var(--namew)) * ${m.at.toFixed(4)})`;
+  const labelled = markers.filter((m) => m.cls !== "merge" || labelMerges);
+  const lines = markers.map((m) => `<div class="mk ${m.cls}" style="${left(m)}" title="${esc(m.title)}"></div>`).join("");
+  const labels = labelled.map((m, i) => `<div class="mkl ${m.cls}" style="${left(m)};top:${i % 2 ? 2 : 16}px" title="${esc(m.title)}">${esc(m.label)}</div>`).join("");
+  const merges = !labelMerges ? markers.filter((m) => m.cls === "merge") : [];
+  const list = merges.length ? `<p class="mut small">${plural(merges.length, "merge")} to main in this window, marked as lines: ${merges.slice(0, 12).map((m) => `${m.href ? `<a href="${esc(m.href)}">${esc(m.label.replace("merge ", ""))}</a>` : esc(m.label)} ${esc(etTime(m.t))}`).join(" · ")}${merges.length > 12 ? " · …" : ""}</p>` : "";
+  return { lines, labels, list, padTop: labelled.length ? 34 : 0, colsCount: cols.length };
+}
+
+function gridRows(cols, link, rowsFilter) {
+  const linked = link.cases;
+  const states = new Map();
+  const visible = [];
+  for (const c of caseDocs()) {
+    const row = cols.map((col) => cellState(col, c.name));
+    const present = row.some((s) => s !== "none" && s !== "died" && s !== "running");
+    if (!present && !linked.has(c.name)) continue;
+    states.set(c.name, row);
+    visible.push(c);
+  }
+  const failing = (c) => states.get(c.name).some((s) => s === "fail" || s === "partial");
+  let cases = visible;
+  if (rowsFilter === "admitted") cases = cases.filter((c) => isBlocking(c) || linked.has(c.name));
+  else if (rowsFilter === "failing") cases = cases.filter((c) => failing(c) || linked.has(c.name));
+  const groups = [];
+  const pinned = cases.filter((c) => linked.has(c.name)).sort(byName);
+  if (pinned.length) groups.push({ label: "in this incident", cases: pinned, linked: true });
+  const primary = new Map();
+  for (const c of cases.filter((c) => isBlocking(c) && !linked.has(c.name))) {
+    if (!primary.has(c.domain)) primary.set(c.domain, []);
+    primary.get(c.domain).push(c);
+  }
+  for (const [domain, list] of [...primary.entries()].sort((a, b) => a[0].localeCompare(b[0]))) groups.push({ label: `${domainWords(domain)} · blocking`, cases: list.sort(byName) });
+  const held = cases.filter((c) => !isBlocking(c) && !linked.has(c.name)).sort(byName);
+  if (held.length) {
+    const shown = ui.showHeld ? held : held.filter(failing);
+    groups.push({ label: "held out · not blocking", cases: shown, more: held.length - shown.length });
+  }
+  return { groups, states };
+}
+
+function gridHtml(link) {
+  const inc = resolveIncident(link);
+  const win = gridWindow(link, inc);
+  const rowsFilter = ui.rows || link.rows || "all";
+  const { cols, hidden } = gridColumns(win);
+  const { groups, states } = gridRows(cols, link, rowsFilter);
+  const markers = gridMarkers(win, cols);
+  const mk = markerHtml(markers, cols);
+  const inWindow = windowRuns(win.fromMs, win.toMs);
+  let banner = "";
+  if (inc) {
+    const { head } = briefHeadline(inc, inWindow);
+    banner = `<div class="banner ${PAGE.states[inc.recovering ? "DEGRADED" : inc.state] || "hs-past"}">${pillHtml(inc.recovering ? "DEGRADED" : inc.state, stateWord(inc))}<span><b>${head}</b>${inc.sinceMs != null ? ` · ${esc(inc.past ? etSpan(inc.sinceMs, inc.untilMs) : `since ${et(inc.sinceMs)}`)}` : ""} · <a href="${esc(incidentHref(inc))}">read the brief →</a></span><span class="right">showing ${esc(etSpan(win.fromMs, win.toMs))}</span></div>`;
+  }
+  const windowChips = (link.sinceMs != null ? chip("window", "linked", "this incident", win.key === "linked") : "") + PAGE.gridWindows.map((w) => chip("window", w[0], w[0], win.key === w[0])).join("");
+  const ctl = `<div class="ctl">window ${windowChips}<span class="sep">·</span>rows ${chip("rows", "all", "all cases", rowsFilter === "all")}${chip("rows", "admitted", "admitted only", rowsFilter === "admitted")}${chip("rows", "failing", "failing only", rowsFilter === "failing")}` +
+    `<span class="sep">·</span>markers ${chip("marker", "merge", "merges", ui.markers.merge)}${chip("marker", "incident", "incidents", ui.markers.incident)}</div>`;
+  if (!cols.length) {
+    return `<div class="sec head"><h1>Cases by run</h1><div class="lede">Every case by every presubmit run in the window, in time order; a cell opens that run's detail for the case.</div></div>${banner}${ctl}` +
+      `<div class="gridwrap"><p class="mut">No presubmit run started ${esc(etSpan(win.fromMs, win.toMs))}${hidden ? ` (${plural(hidden, "run")} without cases not shown)` : ""}. This page carries the runs of the last ${esc(brief.run_days ?? "?")} days.</p></div>` + footHtml();
+  }
+  // Column heads are written vertically: a busy day is a hundred columns,
+  // and a PR number needs its digits more than the grid needs the width.
+  const head = `<div></div>` + cols.map((col) => col.kind === "pending"
+    ? `<div class="hd" title="${esc(`build ${col.build} · still running · first seen ${et(col.t)}`)}"><b>running</b> ${esc(etTime(col.t))}</div>`
+    : `<div class="hd" title="${esc(`${col.run.pr != null ? `PR #${col.run.pr}` : "no PR"} · started ${et(col.t)} · ${projectShort(col.run.project)}`)}"><b>#${esc(col.run.pr ?? "?")}</b> ${esc(etTime(col.t))}</div>`).join("");
+  const cell = (c, col, state) => {
+    const sel = ui.selected && ui.selected.build === col.build && ui.selected.case === c.name ? " sel" : "";
+    const clickable = state !== "none" && state !== "died" && state !== "running";
+    const title = col.kind === "pending" ? "still running" : `${c.name} · #${col.run.pr ?? "?"} · ${cellWords[state] || state}`;
+    return clickable
+      ? `<button type="button" class="c ${state}${sel}" data-build="${esc(col.build)}" data-case="${esc(c.name)}" title="${esc(title)}" aria-label="${esc(title)}"></button>`
+      : `<div class="c ${state}" title="${esc(title)}"></div>`;
+  };
+  const body = groups.map((g) => `<div class="grp">${esc(g.label)}</div><div class="grp-fill"></div>` +
+    g.cases.map((c) => `<div class="nm${g.linked ? " lk" : isBlocking(c) ? "" : " h"}" title="${esc(c.name)}">${esc(c.name)}${!isBlocking(c) && !g.linked ? `<small>${esc(c.status === "demoted" && c.demoted_on ? `demoted ${String(c.demoted_on).slice(5)}` : PAGE.statusWords[c.status] || "")}</small>` : ""}</div>` +
+      cols.map((col, i) => cell(c, col, states.get(c.name)[i])).join("")).join("") +
+    (g.more ? `<div class="more">${plural(g.more, "more held-out case")} passed everything in this window · <button type="button" data-toggle="held">show</button></div><div class="grp-fill"></div>` : "")).join("");
+  const legend = `<div class="legend"><span><i class="pass"></i>passed</span><span><i class="fail"></i>failed all reps</span><span><i class="partial"></i>failed some reps</span><span><i class="infra"></i>quota / infra</span><span><i class="died"></i>run died before the cases</span><span><i class="running"></i>still running</span><span><i></i>not in run</span>` +
+    (ui.markers.merge ? `<span><i class="mkmerge"></i>merge to main</span>` : "") + (ui.markers.incident ? `<span><i class="mkincident"></i>incident start</span><span><i class="mkrecovered"></i>healthy again</span>` : "") +
+    `<span style="margin-left:auto">${plural(cols.length, "column")} · presubmit runs in start order${hidden ? ` · ${plural(hidden, "run")} without cases (aborted, or green on revalidation) not shown` : ""}</span></div>`;
+  return `<div class="sec head"><h1>Cases by run</h1><div class="lede">Every case by every presubmit run in the window, in time order. Blocking cases first, by domain; held-out cases that passed everything are folded away. Click a cell for that run's detail.</div></div>${banner}${ctl}` +
+    `<div class="gridwrap"><div class="gscroll"><div class="g" style="grid-template-columns:var(--namew) repeat(${cols.length},minmax(var(--colmin),1fr));padding-top:${mk.padTop}px">${mk.lines}${mk.labels}${head}${body}</div></div>${legend}${mk.list}</div>` +
+    detailHtml() + footHtml();
+}
+
+const cellWords = { pass: "passed all reps", fail: "failed all reps", partial: "failed some reps", infra: "quota / infra, not graded", died: "run died before the cases", running: "still running", none: "not in this run" };
+
+function detailHtml() {
+  const sel = ui.selected;
+  if (!sel) return "";
+  const run = runs().find((r) => String(r.build) === sel.build);
+  const c = run ? (run.cases || []).find((x) => x.case === sel.case) : null;
+  if (!run || !c) return "";
+  const reps = c.reps || { pass: 0, fail: 0, infra: 0 };
+  const total = reps.pass + reps.fail + reps.infra;
+  const how = c.outcome === "failed" ? `failed all ${plural(reps.fail, "graded rep")}${reps.infra ? ` (${reps.infra} lost)` : ""}` : c.outcome === "infra" ? `all ${plural(total, "rep")} lost before grading` : c.outcome === "partial" ? `${reps.fail} of ${total} reps failed` : `passed all ${plural(reps.pass, "rep")}`;
+  const others = (run.cases || []).filter((x) => x.case !== c.case && x.outcome === "passed").length;
+  const startMs = parseIso(run.started), finishMs = parseIso(run.finished);
+  const length = startMs != null && finishMs != null ? ` · ${minutesText(finishMs - startMs)} run` : "";
+  const tag = c.outcome === "failed" || c.outcome === "infra" ? ` · ${tagFor(c)}` : "";
+  const url = transcriptUrl(run, c.case), log = buildUrl(run);
+  return `<div class="detail" id="detail"><h3><code>${esc(c.case)}</code> · ${prLink(run.pr)} · ${esc(et(runFinish(run)))} · project ${esc(projectShort(run.project))}<button type="button" class="close" data-toggle="close">close ×</button></h3>` +
+    `<div class="sub">${esc(how)}${esc(length)} · ${plural(others, "other case")} passed in this run${tag}</div>` +
+    (c.reason ? `<div class="reason">${esc(c.reason)}</div>` : "") +
+    (c.excerpt ? `<div class="quote">“${esc(c.excerpt)}”</div>` : "") +
+    (c.do ? `<div class="do"><b>Do:</b> ${esc(c.do)}</div>` : "") +
+    `<div class="links">${url ? `<a href="${esc(url)}">full transcript (rep 1)</a>` : ""}${log ? `<a href="${esc(log)}">build log</a>` : ""}<a href="${esc(runHref(run))}">this run's page</a><a href="${esc(caseHref(c.case))}">this case's history →</a></div></div>`;
+}
+
+/* ---- clicks on the Grid and the Cases page ---- */
+
+function onClick(event) {
+  const target = event.target.closest("button[data-sort],button[data-show],button[data-window],button[data-rows],button[data-marker],button[data-toggle],button[data-build]");
+  if (!target) return;
+  const d = target.dataset;
+  if (d.sort) ui.sort = d.sort;
+  else if (d.show) ui.show = d.show;
+  else if (d.window) ui.window = d.window;
+  else if (d.rows) ui.rows = d.rows;
+  else if (d.marker) ui.markers[d.marker] = !ui.markers[d.marker];
+  else if (d.toggle === "held") ui.showHeld = true;
+  else if (d.toggle === "retired") ui.showRetired = true;
+  else if (d.toggle === "close") ui.selected = null;
+  else if (d.build && d.case) ui.selected = { build: d.build, case: d.case };
+  renderAll();
+  if (d.build && d.case) {
+    const panel = document.getElementById("detail");
+    if (panel) panel.scrollIntoView({ block: "nearest" });
+  }
+}
+
 /* ---- freshness, poll, boot ---- */
 
 function renderFreshness() {
@@ -777,28 +1227,41 @@ function renderFreshness() {
   el.className = stale ? "fresh stale" : "fresh";
 }
 
+const renderers = { brief: briefHtml, run: runHtml, grid: gridHtml, cases: casesHtml };
+
 // `scroll` is true for a navigation (boot, a hash change): the page then
-// scrolls to the `view=` section it just rendered. The poll re-renders
-// with it false, so a reader who has scrolled on is not pulled back.
+// scrolls to the `view=` section or the `#<case>` row it just rendered. The
+// poll and a chip re-render with it false, so a reader who has scrolled on
+// is not pulled back.
 function renderAll(scroll = false) {
   const link = linkState();
   const app = document.getElementById("app");
-  const page = document.body.dataset.page;
+  const page = document.body.dataset.page in renderers ? document.body.dataset.page : "brief";
+  // A re-render (a click, the poll) must not move the Grid under the reader.
+  const scrolled = document.querySelector(".gscroll");
+  const keepLeft = scrolled ? scrolled.scrollLeft : null;
   try {
     if (!briefLoaded) throw new Error(`the page's data element (#${PAGE.inlineBrief}) is missing or unreadable`);
-    app.innerHTML = page === "run" ? runHtml(link) : briefHtml(link);
+    app.innerHTML = renderers[page](link);
   } catch (err) {
-    app.innerHTML = `<div class="sec head"><h1>This page could not render.</h1><div class="lede">${esc(String(err && err.message || err))}. <a href="legacy.html">Legacy view →</a></div></div>`;
+    app.innerHTML = `<div class="sec head"><h1>This page could not render.</h1><div class="lede">${esc(String(err && err.message || err))}. The data behind it is <a href="${PAGE.briefFile}">${PAGE.briefFile}</a>.</div></div>`;
   }
-  const nav = document.getElementById("navrun");
-  if (nav) nav.textContent = page === "run" && link.build ? `PR view` : "PR view";
-  document.title = page === "run" ? "kube-agents · smoke run" : "kube-agents · smoke gate brief";
+  document.title = PAGE.titles[page];
   renderFreshness();
   // The section is rendered just above, after the browser looked for the
   // anchor, and a `view=` fragment names no element anyway: scroll by hand.
   if (scroll && link.view) {
     const target = document.getElementById(link.view);
     if (target) target.scrollIntoView();
+  } else if (scroll && page === "cases" && link.caseHash) {
+    const row = document.getElementById(`case-${link.caseHash}`);
+    if (row) row.scrollIntoView({ block: "center" });
+  }
+  if (page === "grid") {
+    // First paint: a live window is read from its newest run, a linked
+    // incident from its start. Afterwards the reader's position stands.
+    const wrap = document.querySelector(".gscroll");
+    if (wrap) wrap.scrollLeft = keepLeft != null ? keepLeft : (link.sinceMs == null ? wrap.scrollWidth : 0);
   }
 }
 
@@ -832,6 +1295,7 @@ async function refresh() {
   renderAll();
 }
 
+document.getElementById("app").addEventListener("click", onClick);
 renderAll(true);
 // Polling is attempted everywhere, a file:// preview included: a failed
 // poll costs nothing but the "regenerated every N min" suffix.

@@ -6,8 +6,9 @@ The page tests run the shipped script for real (Chrome is present on
 ubuntu-latest and skipped with a reason elsewhere): the Brief in each state
 the design covers (OUTAGE, DEGRADED storm, DEGRADED setup deaths,
 RECOVERING, HEALTHY, a PAST incident opened through the URL) and the PR
-view in its three verdicts, plus the not-found page. Every asserted time is
-America/Toronto.
+view in its three verdicts, plus the not-found page; the Cases page's sorts,
+filters and pills; the Grid's window, deep link, markers and the detail a
+cell click opens. Every asserted time is America/Toronto.
 """
 
 import contextlib
@@ -338,7 +339,7 @@ class RenderedFilesTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             out = render_to(tmp, data, health=health_doc())
             names = sorted(p.name for p in out.iterdir())
-            self.assertEqual(names, ["brief.json", "data.json", "index.html", "legacy.html", "run.html"])
+            self.assertEqual(names, ["brief.json", "cases.html", "data.json", "grid.html", "index.html", "run.html"])
             brief = json.loads((out / "brief.json").read_text())
             self.assertEqual(brief["health"]["state"], "OUTAGE")
             index = (out / "index.html").read_text()
@@ -351,10 +352,11 @@ class RenderedFilesTest(unittest.TestCase):
             self.assertNotIn("__BASE__", index)
             run_page = (out / "run.html").read_text()
             self.assertIn('data-page="run"', run_page)
-            legacy = (out / "legacy.html").read_text()
-            self.assertIn('href="index.html">Brief</a>', legacy)
-            self.assertIn('id="agent"', legacy)
-            self.assertNotIn("__BASE__", legacy)
+            for name in ("grid.html", "cases.html"):
+                page = (out / name).read_text()
+                self.assertIn(f'data-page="{name[:-5]}"', page)
+                self.assertIn('<a href="index.html" >Brief</a>', page)
+                self.assertNotIn("__BASE__", page)
             self.assertFalse((out / "health.json").exists(), "the adjudicator owns health.json")
 
     def test_each_page_carries_its_data_inline(self):
@@ -376,7 +378,7 @@ class RenderedFilesTest(unittest.TestCase):
                 self.assertNotIn("<", raw, f"{name}: no '<' inside the data element, so no string in it can close it")
             self.assertIn('inlineBrief: "inline-brief"', page, "pages.js reads the id render.py writes")
             self.assertIn('inlineHealth: "inline-health"', page)
-            self.assertNotIn("brief: ", page.split("const PAGE = {")[1].split("};")[0], "brief.json is no longer a JS literal inside pages.js")
+            self.assertNotIn("__BRIEF_JSON__", page, "the document is a data element, not a JS literal in pages.js")
             # No verdict: the health element is absent and the page still parses its brief.
             out = render_to(pathlib.Path(tmp) / "nohealth", data)
             page = (out / "index.html").read_text()
@@ -388,10 +390,10 @@ class RenderedFilesTest(unittest.TestCase):
         data["generated_at"] = NOW
         with tempfile.TemporaryDirectory() as tmp:
             out = render_to(tmp, data)
-            for name in ("index.html", "run.html", "legacy.html"):
+            for name in ("index.html", "run.html", "grid.html", "cases.html"):
                 self.assertNotIn("<base", (out / name).read_text(), f"{name}: a local render keeps relative links")
             out = render_to(pathlib.Path(tmp) / "pub", data, extra_args=["--public-url", "https://example.test/evals"])
-            for name in ("index.html", "run.html", "legacy.html"):
+            for name in ("index.html", "run.html", "grid.html", "cases.html"):
                 page = (out / name).read_text()
                 self.assertEqual(page.count("<base "), 1, name)
                 self.assertIn('<base href="https://example.test/evals/">', page.split("<body", 1)[0], f"{name}: in <head>, with the trailing slash")
@@ -423,7 +425,8 @@ class RenderedFilesTest(unittest.TestCase):
     def test_pages_js_carries_the_url_contract_and_the_vocabulary(self):
         script = PAGES_JS.read_text()
         for token in ('param("cases")', 'param("since")', 'param("until")', 'param("build")', 'param("view")', "location.search", "location.hash",
-                      "shared_break", "storm", "setup_deaths", "only-this-pr", "run.html#build=", "index.html#", "legacy.html", "health.json", "brief.json"):
+                      "shared_break", "storm", "setup_deaths", "only-this-pr", "#build=", 'pick("window"', 'pick("sort"', 'pick("show"', 'pick("rows"',
+                      "grid.html", "cases.html", "health.json", "brief.json"):
             self.assertIn(token, script)
         self.assertNotIn("run.html?build=", script, "the pages write the fragment form only")
         self.assertNotIn("index.html?", script)
@@ -479,8 +482,14 @@ class BrowserTest(unittest.TestCase):
         self.assertIn('href="run.html#build=2097282860221206528"', app)
         self.assertIn('class="chip hit">cluster-agent-crashloop-debug', app)
         self.assertNotIn("What changed right before", app, "no merges were given, so the block is omitted")
-        self.assertIn("legacy.html", app)
-        self.assertNotIn(" UTC", app.split("legacy.html")[0], "no UTC clock text above the footer")
+        self.assertIn("See it in the grid", app)
+        # The Grid link carries the incident's scope in the fragment, the
+        # same text as the Brief's own links, with no view.
+        self.assertIn('href="grid.html#since=2026-09-08T09:00:00Z&amp;cases=' + ",".join(CRASHLOOP_TRIO) + '"', app)
+        self.assertNotIn("grid.html?", app)
+        self.assertIn("Release candidates", app)
+        self.assertNotIn(" UTC", app, "no UTC clock text on the page")
+        self.assertNotIn("legacy", app.lower())
 
     def test_storm_brief(self):
         app = self.render_state(health_doc("DEGRADED", condition="storm", failing_cases=[], tracking_issues=[],
@@ -717,8 +726,7 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/1275/pull-kube-agents-smoke-test/2097282860221206528", app)
         self.assertIn("Nothing right now.", app)
         self.assertIn("held out", app)
-        self.assertIn('href="legacy.html#gate">this case&#x27;s history</a>'.replace("&#x27;", "'"), app)
-        self.assertNotIn("grid", app.lower(), "there is no Grid page; the legacy matrix is the case history")
+        self.assertIn('href="cases.html#cluster-agent-crashloop-debug">this case\'s history</a>', app)
 
     def test_pr_view_run_with_an_unexplained_failure(self):
         app = dom_text(self.run_page, query="build=2097253644305960960")
@@ -761,10 +769,6 @@ class BrowserTest(unittest.TestCase):
             self.assertNotIn("UNREACHABLE", text, name)
             self.assertNotIn("STALE", text, name)
             self.assertEqual(text, "updated Tue 10:30 AM ET · 0m ago · regenerated every 15 min", name)
-        # The legacy page's content is baked; its badge follows the same rule.
-        html = dom_html(clock_page(self.out / "legacy.html", NOW))
-        self.assertIn("Is the agent getting better or worse?", html[html.find('<div id="app">'):])
-        self.assertEqual(freshness_badge(html), ("fresh", "updated 14:30 UTC · 0m ago · regenerated every 15 min"))
 
     def test_a_page_without_its_data_element_says_so(self):
         # A truncated upload must not read as a quiet, empty dashboard.
@@ -782,12 +786,231 @@ class BrowserTest(unittest.TestCase):
         # Not calling a failed poll UNREACHABLE must not hide real staleness:
         # inlined data older than its stale_after_s (7200 s default) is STALE.
         three_hours_on = "2026-09-08T17:30:00+00:00"
-        for name in ("index.html", "run.html", "legacy.html"):
+        for name in ("index.html", "run.html", "grid.html", "cases.html"):
             cls, text = freshness_badge(dom_html(clock_page(self.out / name, three_hours_on)))
             self.assertEqual(cls, "fresh stale", name)
             self.assertTrue(text.startswith("STALE · updated "), f"{name}: {text}")
             self.assertIn("180m ago · regenerated every 15 min", text, name)
             self.assertNotIn("UNREACHABLE", text, name)
+
+
+RC_RELEASE = {
+    "build_id": "2097891568546484224", "rc_tag": "staging_2609092307_5b5ad10", "commit": "5b5ad10", "tier": "nightly",
+    "verdict": "GREEN", "result": "SUCCESS", "started": "2026-09-10T03:35:01+00:00", "finished": "2026-09-10T07:51:10+00:00",
+    "duration_s": 15006, "project": "kube-agents-evals-10",
+    "artifacts_url": "https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/2097891568546484224",
+    "pass_rate": 0.9, "baseline_rate": None, "margin": None,
+    "tasks": [{"name": f"case-{n}", "result": "pass" if n < 15 else "fail"} for n in range(25)] + [{"name": "case-infra", "result": "infra"}],
+}
+MERGES = [
+    {"sha": "abc1234abc1234", "at": "2026-09-07T20:10:00+00:00", "title": "fix(ci): the thing", "pr": 1280},
+    {"sha": "def5678def5678", "at": "2026-09-08T12:40:00+00:00", "title": "docs: no pr number", "pr": None},
+]
+
+
+def clicked_page(page: pathlib.Path, selector: str) -> pathlib.Path:
+    """A copy of the rendered page that clicks `selector` once the script
+    has rendered: the page's script runs synchronously at the end of the
+    body, so a script after it sees the rendered DOM."""
+    shim = f"<script>(() => {{ const el = document.querySelector({json.dumps(selector)}); if (el) el.click(); }})();</script>"
+    copy = page.with_name(page.stem + "-click" + page.suffix)
+    copy.write_text(page.read_text().replace("</body>", shim + "</body>", 1))
+    return copy
+
+
+@unittest.skipUnless(chrome(), "headless Chrome not found")
+class CasesAndGridPagesTest(unittest.TestCase):
+    """The Cases page and the Grid as a browser renders them from the real
+    fixture week. The roster is the test's: two of the trio are admitted,
+    the third is dated as demoted, so every pill has a row."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        data = load_fixture()
+        data["generated_at"] = NOW
+        data["cases"] = [{"name": n, "domain": "cluster-debugging", "active": True} for n in CRASHLOOP_TRIO]
+        data["cases"].append({"name": "retired-probe", "domain": "cost", "active": False})
+        data["releases"] = [RC_RELEASE, dict(RC_RELEASE, build_id="7", rc_tag="hostile", artifacts_url="javascript:alert(1)", verdict=None, started="2026-09-09T03:35:01+00:00")]
+        data["pending_builds"] = [{"build_id": "2097300000000000000", "first_seen": "2026-09-08T14:00:00+00:00"}]
+        # A green run that recorded no cases (the gate revalidated the
+        # branch's earlier run) sits inside the live window: no Grid column.
+        data["runs"].append({"build_id": "2097299999999999999", "pr": 4242, "started": "2026-09-08T13:00:00+00:00",
+                             "finished": "2026-09-08T13:04:00+00:00", "result": "SUCCESS", "duration_s": 240, "tasks": []})
+        # Hostile strings on the paths the Grid and the Cases page render.
+        oldest = next(r for r in data["runs"] if any(t.get("name") == CRASHLOOP_TRIO[0] and t.get("reps") for t in r["tasks"]))
+        next(t for t in oldest["tasks"] if t.get("name") == CRASHLOOP_TRIO[0])["reps"][0]["reason"] = "<script>alert(1)</script> required phrases absent"
+        data["cases"].append({"name": "<img src=x onerror=alert(2)>", "domain": "<b>x</b>", "active": False, "nightly_active": True})
+        # A case whose only failure is older than brief.json's 14-day run
+        # window: its "last failure" cannot link a run page that has no run.
+        data["runs"].append({"build_id": "2090000000000000000", "pr": 777, "started": "2026-08-20T10:00:00+00:00",
+                             "finished": "2026-08-20T11:00:00+00:00", "result": "FAILURE", "duration_s": 3600,
+                             "tasks": [{"name": "old-failure-case", "result": "fail", "reps": [{"n": 1, "result": "fail", "reason": "check ancient: required phrases absent"}]}]})
+        data["cases"].append({"name": "old-failure-case", "domain": "cost", "active": True})
+        history = history_lines(
+            dict(health_doc("GREEN"), tick="2026-09-06T01:00:00+00:00", since="2026-09-06T01:00:00+00:00"),
+            dict(health_doc(since="2026-09-07T14:00:00+00:00"), tick="2026-09-07T14:00:00+00:00"),
+            dict(health_doc("GREEN"), tick="2026-09-08T01:00:00+00:00", since="2026-09-08T01:00:00+00:00"),
+            dict(health_doc(), tick="2026-09-08T09:00:00+00:00"),
+            dict(health_doc(), tick=NOW),
+        )
+        admitted = frozenset(CRASHLOOP_TRIO[:2])
+        with unittest.mock.patch.object(render.classify, "admitted_cases", return_value=admitted), \
+                unittest.mock.patch.object(render, "demotion_dates", return_value={CRASHLOOP_TRIO[2]: "2026-09-02"}), \
+                unittest.mock.patch.object(render, "recent_merges", return_value=MERGES):
+            cls.out = render_to(cls.tmp.name, data, health=health_doc(), history=history)
+        cls.cases_page = cls.out / "cases.html"
+        cls.grid_page = cls.out / "grid.html"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def test_cases_page_rows_pills_rates_and_last_failure(self):
+        app = dom_text(self.cases_page)
+        self.assertIn("How reliable is each test?", app)
+        self.assertIn('<tr class="grp"><td colspan="8">cluster debugging</td></tr>', app)
+        self.assertIn('id="case-cluster-agent-crashloop-debug"', app)
+        self.assertIn('<span class="st blocking">blocking</span>', app)
+        self.assertIn('<span class="st demoted">demoted 09-02</span>', app)
+        self.assertIn("held out · 2 cases", app)
+        self.assertIn("not in any matrix · 1 case", app)
+        self.assertNotIn('id="case-retired-probe"', app, "retired cases are folded until asked for")
+        self.assertIn('class="rate ', app)
+        self.assertIn("Nightly 7d", app)
+        self.assertIn('<span class="rate none">—</span>', app, "no nightly on record reads as a dash")
+        self.assertIn("Last failure was", app)
+        self.assertIn("rca-names-the-oom", app)
+        self.assertIn('<span class="lbl">Last failure was</span> <span><b>', app)
+        self.assertIn(" ET", app)
+        self.assertNotIn(" UTC", app)
+        self.assertIn("how the roster works", app)
+        self.assertIn('href="run.html#build=', app)
+        self.assertNotIn(".html?", app, "the pages write the fragment form only")
+
+    def test_cases_page_sorts_filters_and_the_hash_highlight(self):
+        by_name = dom_text(self.cases_page, query="sort=name")
+        self.assertNotIn('class="grp"', by_name, "a flat list by name has no group rows")
+        self.assertIn('id="case-retired-probe"', by_name)
+        names = re.findall(r'id="case-([^"]+)"', by_name)
+        self.assertEqual(names, sorted(names))
+        blocking = dom_text(self.cases_page, query="show=blocking")
+        self.assertNotIn("demoted 09-02", blocking)
+        self.assertIn('<span class="st blocking">blocking</span>', blocking)
+        held = dom_text(self.cases_page, query="show=held")
+        self.assertIn("demoted 09-02", held)
+        self.assertNotIn('class="st blocking"', held)
+        highlighted = dom_text(self.cases_page, fragment="#cluster-agent-crashloop-evidence-chain")
+        self.assertIn('<tr id="case-cluster-agent-crashloop-evidence-chain" class="main hl">', highlighted)
+        self.assertEqual(dom_text(self.cases_page, fragment="#sort=name&show=held"), dom_text(self.cases_page, query="sort=name&show=held"), "the fragment form reads the same")
+        # The row is scrolled to once, on navigation; the polls that follow
+        # re-render without pulling the reader back to it.
+        scrolls = re.search(r'<body[^>]*data-scrolls="(\d+)"', dom_html(scroll_counting_page(self.cases_page), fragment="#cluster-agent-crashloop-evidence-chain", budget_ms=130000))
+        self.assertEqual(scrolls.group(1), "1")
+        clicked = dom_text(clicked_page(self.cases_page, 'button[data-toggle="retired"]'))
+        self.assertIn('id="case-retired-probe"', clicked)
+
+    def test_grid_live_window_columns_markers_and_folding(self):
+        app = dom_text(self.grid_page)
+        self.assertIn("Cases by run", app)
+        self.assertIn('data-window="36h" class="on"', app)
+        self.assertIn('class="grp">cluster debugging · blocking</div>', app)
+        self.assertIn('class="nm h"', app, "the demoted case is a held-out row")
+        self.assertIn("outage: shared break", app)
+        self.assertIn("merge #1280", app, "merged 18 hours before the data's generated_at")
+        self.assertIn('class="mk incident"', app)
+        self.assertIn('class="c running"', app, "a pending build is a still-running column")
+        self.assertIn('class="c died"', app, "a setup death is a column with no cases")
+        self.assertIn("presubmit runs in start order", app)
+        six = dom_text(self.grid_page, query="window=6h")
+        self.assertLess(six.count('class="hd"'), app.count('class="hd"'))
+        self.assertEqual(six, dom_text(self.grid_page, fragment="#window=6h"), "the fragment form reads the same")
+        failing = dom_text(self.grid_page, query="rows=failing")
+        self.assertNotIn("passed everything in this window", failing)
+
+    def test_hostile_data_and_a_bad_fragment_never_break_the_new_pages(self):
+        for page in (self.cases_page, self.grid_page):
+            for fragment in ("", "#%", "#%E0%A4%A"):
+                app = dom_text(page, fragment=fragment)
+                self.assertNotIn("<img", app, f"{page.name}{fragment}")
+                self.assertNotIn("<script>alert", app, f"{page.name}{fragment}")
+                self.assertNotIn("<b>x</b>", app, f"{page.name}{fragment}")
+                self.assertNotIn("could not render", app, f"{page.name}{fragment}")
+                self.assertIn("cluster-agent-crashloop-debug", app, f"{page.name}{fragment} rendered")
+        cases = dom_text(self.cases_page)
+        self.assertIn("&lt;img src=x onerror=alert(2)&gt;", cases, "the hostile name is on the page, escaped")
+
+    def test_an_old_last_failure_links_the_pull_request_not_a_missing_run_page(self):
+        app = dom_text(self.cases_page)
+        row = app.split('id="case-old-failure-case"', 1)[1].split("</tr>", 2)[1]
+        self.assertIn("check ancient", row)
+        self.assertNotIn("run.html#build=2090000000000000000", row)
+        self.assertIn('href="https://github.com/gke-labs/kube-agents/pull/777"', row)
+        self.assertIn("older than this page&#x27;s 14-day run window".replace("&#x27;", "'"), row)
+        # A failure inside the window still opens the run's page.
+        self.assertIn('href="run.html#build=', app)
+
+    def test_a_green_run_without_cases_gets_no_grid_column(self):
+        app = dom_text(self.grid_page)
+        self.assertNotIn("#4242", app)
+        self.assertIn("without cases", app)
+        self.assertIn("#4242", dom_text(self.out / "index.html"), "the Brief still lists it")
+
+    def test_the_this_incident_chip_wins_over_a_window_parameter(self):
+        query = urllib.parse.urlencode({"cases": CRASHLOOP_TRIO[0], "since": "2026-09-07T14:00:00Z", "until": "2026-09-08T01:00:00Z", "window": "24h"})
+        app = dom_text(self.grid_page, query=query)
+        self.assertIn('data-window="24h" class="on"', app)
+        clicked = dom_text(clicked_page(self.grid_page, 'button[data-window="linked"]'), query=query)
+        self.assertIn('data-window="linked" class="on"', clicked)
+        self.assertNotIn('data-window="24h" class="on"', clicked)
+
+    def test_grid_deep_link_scopes_to_the_incident(self):
+        # The form the Brief's "See it in the grid" link writes.
+        fragment = "#since=2026-09-07T14:00:00Z&until=2026-09-08T01:00:00Z&cases=" + ",".join(CRASHLOOP_TRIO)
+        app = dom_text(self.grid_page, fragment=fragment)
+        self.assertIn("PAST OUTAGE", app)
+        self.assertIn("read the brief →", app)
+        self.assertIn('data-window="linked" class="on">this incident</button>', app)
+        self.assertIn('class="grp">in this incident</div>', app)
+        self.assertEqual(app.count('class="nm lk"'), 3, "the linked cases are pinned first")
+        self.assertIn("#1195", app, "red inside that window")
+        self.assertNotIn("#1275", app, "ran the next morning")
+        self.assertIn("merge #1280", app, "merged inside the window")
+        self.assertNotIn('class="c running"', app, "a past window has no running columns")
+        self.assertIn("Mon 10:00 AM – 9:00 PM ET", app)
+        # A link posted in the older query form opens the same window.
+        query = urllib.parse.urlencode({"cases": ",".join(CRASHLOOP_TRIO), "since": "2026-09-07T14:00:00Z", "until": "2026-09-08T01:00:00Z"})
+        self.assertEqual(app, dom_text(self.grid_page, query=query))
+
+    def test_a_cell_click_opens_the_detail_panel(self):
+        page = clicked_page(self.grid_page, 'button.c.fail[data-case="cluster-agent-crashloop-debug"]')
+        app = dom_text(page)
+        self.assertIn('id="detail"', app)
+        self.assertIn("<code>cluster-agent-crashloop-debug</code>", app)
+        self.assertIn("failed all 3 graded reps", app)
+        self.assertIn("rca-names-the-oom", app)
+        self.assertIn("other case", app)
+        self.assertIn('href="cases.html#cluster-agent-crashloop-debug"', app)
+        self.assertIn("this run&#x27;s page".replace("&#x27;", "'"), app)
+        self.assertIn("artifacts/eval_cluster-agent-crashloop-debug_rep1.log", app)
+        self.assertIn('class="c fail sel"', app)
+        self.assertNotIn('id="detail"', dom_text(self.grid_page), "nothing is selected until a cell is clicked")
+
+    def test_the_brief_lists_the_release_candidates(self):
+        app = dom_text(self.out / "index.html")
+        self.assertIn("Release candidates", app)
+        self.assertIn('href="https://oss.gprow.dev/view/gs/kube-agents-prow/logs/post-kube-agents-eval-rc/2097891568546484224"', app)
+        self.assertIn('<span class="pill p-pass">GREEN</span>', app)
+        self.assertIn("90.0%", app)
+        self.assertIn("baselines maturing", app)
+        self.assertIn("15/25", app)
+        self.assertIn("1 infra excluded", app)
+        self.assertIn("Wed 11:35 PM ET", app)
+        self.assertIn("4h 10m", app)
+        self.assertIn('<span class="pill p-infra">NO VERDICT</span>', app)
+        self.assertIn("no eval banner · job SUCCESS", app)
+        self.assertNotIn("javascript:", app)
+        self.assertNotIn('href="hostile', app)
 
 
 if __name__ == "__main__":

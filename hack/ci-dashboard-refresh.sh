@@ -58,7 +58,7 @@
 #                              disarms EVAL_DASHBOARD_RC_GLOB, so a from-dir
 #                              run reaches no bucket at all.
 #   EVAL_DASHBOARD_RC_GLOB     release-candidate build-dir glob, feeding the
-#                              page's Releases section; default below is
+#                              Brief's release-candidate table; default below is
 #                              post-kube-agents-eval-rc's archive. Empty =
 #                              leave releases[] to the prior data.json.
 #   EVAL_DASHBOARD_RC_FROM_DIR local release-candidate source, the offline
@@ -124,7 +124,7 @@ trap 'exit 143' TERM INT
 
 EVAL_DASHBOARD_PR_GLOB="${EVAL_DASHBOARD_PR_GLOB:-gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*}"
 EVAL_DASHBOARD_NIGHTLY_PREFIX="${EVAL_DASHBOARD_NIGHTLY_PREFIX-gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly/}"
-# The release-candidate archive, which feeds the page's Releases section.
+# The release-candidate archive, which feeds the Brief's release-candidate table.
 # post-kube-agents-eval-rc is a postsubmit, so its builds land under logs/
 # rather than pr-logs/. Set to the empty string to leave the section on its
 # placeholder; a sweep that finds nothing does the same thing.

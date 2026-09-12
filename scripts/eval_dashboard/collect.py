@@ -1651,6 +1651,10 @@ def collect(
     now_dt = now or datetime.now(timezone.utc)
     prior: list[dict] = []
     retry: dict[str, str] = {}  # build_id -> first_seen, still worth re-reading
+    # The retry ids the nightly's listing named (or the prior tagged): their
+    # pending_builds entry carries the tier, so a consumer whose columns are
+    # the presubmit's (the Grid) can keep a night in flight off them.
+    nightly_pending: set[str] = set()
     # One watermark per source. Prow's build ids are one global sequence
     # ordered by start, so the newest presubmit id (dozens of builds a day)
     # is normally above every nightly id (one a day); the newest id on
@@ -1673,6 +1677,11 @@ def collect(
                     )
                 else:
                     retry[build_id] = first_seen
+            nightly_pending.update(
+                entry["build_id"]
+                for entry in (prior_data.get("pending_builds") if isinstance(prior_data.get("pending_builds"), list) else [])
+                if isinstance(entry, dict) and entry.get("build_id") in retry and tiers.is_nightly(entry)
+            )
         # No usable prior -- or a prior that yields no numeric watermark --
         # means the incremental scan cannot resume, and an unbounded cold
         # sweep is ~3 gsutil calls per archived build. Bound the recovery
@@ -1736,6 +1745,7 @@ def collect(
     # source's listing names it, and no id is in both listings.
     nightly_fresh: list[dict] = []
     if nightly_prefix:
+        listed_before = set(unfinished)
         nightly_fresh = runs_from_periodic(
             nightly_prefix,
             gsutil,
@@ -1745,6 +1755,7 @@ def collect(
             unfinished=unfinished,
             job=nightly_job,
         )
+        nightly_pending |= unfinished - listed_before
         fresh.extend(nightly_fresh)
     if merge_with is not None:
         print(
@@ -1787,7 +1798,11 @@ def collect(
     }
     if pending:
         data["pending_builds"] = [
-            {"build_id": build_id, "first_seen": pending[build_id]}
+            {
+                "build_id": build_id,
+                "first_seen": pending[build_id],
+                **({tiers.TIER_KEY: tiers.TIER_NIGHTLY} if build_id in nightly_pending else {}),
+            }
             for build_id in sorted(pending, key=int)
         ]
     if stale_after_s is not None:
