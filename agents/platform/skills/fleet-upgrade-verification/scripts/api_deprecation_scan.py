@@ -13,10 +13,12 @@ The fleet's current version comes from Phase 1's table (`fleet_upgrade_report.py
 or from `--current-version`; the floor is the lowest control-plane minor, because the API
 server is what stops serving a removed version — node pools do not enter into it.
 
-Read-only. It opens each repository through the credential broker's content workspaces
-(a shallow read-only clone the broker owns) and, on an install whose broker is not armed
-for content-passing, through a leased checkout on the shared volume, the way
-`inspect_repository.py clone` does. It runs no `gcloud`. Live client usage of deprecated
+Read-only against every repository. It opens each one through the credential broker's
+content workspaces (a shallow read-only clone the broker owns) and, on an install whose
+broker is not armed for content-passing, through a leased checkout on the shared volume,
+the way `inspect_repository.py clone` does — under a lease of its own, so the reset that
+positions that checkout on the base branch never touches the session's working tree, the
+one `submit_suggestion.py prepare` hands the agent to edit. It runs no `gcloud`. Live client usage of deprecated
 APIs is a different question, answered by GKE Deprecation Insights; the footer says where.
 
 A file that does not parse (a Helm template, a Kustomize patch with anchors the loader
@@ -50,8 +52,14 @@ import credential_proxy_client  # noqa: E402
 import gitops_workspace  # noqa: E402
 
 # The lease owner name written beside a directory-mode checkout, so a stale
-# lease names the skill that took it.
+# lease names the skill that took it, and the prefix that makes the scan's lease
+# its own. `ensure_workspace(reset=True)` runs `git reset --hard` and `git clean`
+# in the lease's clone; under the session lease that clone is the tree
+# submit-suggestion's `prepare` opened for the agent to edit, and a scan asked
+# for mid-edit would delete the edits. A prefix rather than a suffix, because
+# `sanitize_lease` keeps the first 64 characters.
 OWNER = "fleet-upgrade-verification"
+SCAN_LEASE_PREFIX = "api-deprecation-scan-"
 
 # The removal table, beside this script so a skill copy carries its data.
 TABLE_PATH = Path(__file__).resolve().parent / "removed_apis.json"
@@ -96,6 +104,11 @@ METADATA_KEY = "metadata"
 NAME_KEY = "name"
 ITEMS_KEY = "items"
 LIST_KIND = "List"
+
+# The broker's `read` answers the tail of a batch that crossed its per-request
+# byte budget with this reason, which `Workspace.read_many` documents as "ask
+# again for the rest"; the other reasons (`tooLarge`, `symlink`) are final.
+REASON_REQUEST_BUDGET = "requestBudget"
 
 # Skip reasons. A Go-template marker in a file that fails to parse is the
 # commonest cause, and the reason says what to do about it.
@@ -316,13 +329,19 @@ def read_repo_content(
 
         def flush() -> None:
             nonlocal batch, batch_bytes
-            if not batch:
-                return
-            files, missed = workspace.read_many(batch)
-            snapshot.files.update(files)
-            snapshot.skipped.extend(missed)
+            pending = batch
             batch = []
             batch_bytes = 0
+            while pending:
+                files, missed = workspace.read_many(pending)
+                snapshot.files.update(files)
+                deferred = [m for m in missed if m.get("reason") == REASON_REQUEST_BUDGET]
+                snapshot.skipped.extend(m for m in missed if m.get("reason") != REASON_REQUEST_BUDGET)
+                if deferred and not files:
+                    # Nothing fit, so asking again would loop: the deferral is final.
+                    snapshot.skipped.extend(deferred)
+                    break
+                pending = [m["path"] for m in deferred]
 
         while snapshot.stopped is None:
             listing = workspace.list(after=cursor)
@@ -458,17 +477,23 @@ def parse_manifests(path: str, data: bytes) -> tuple[list[Document], str | None]
     except UnicodeDecodeError:
         return [], REASON_ENCODING
     docs: list[Document] = []
+    is_json = path.lower().endswith(JSON_SUFFIX)
+    # Anything the loader raises is this file's problem, not the repository's.
+    # PyYAML's YAMLError is not the whole set: its timestamp constructor raises a
+    # bare ValueError for a date that does not exist, and a pathologically nested
+    # document raises RecursionError.
     try:
-        if path.lower().endswith(JSON_SUFFIX):
+        if is_json:
             parsed = [json.loads(text)] if text.strip() else []
         else:
             parsed = list(yaml.safe_load_all(text))
-    except json.JSONDecodeError as e:
-        return [], REASON_JSON.format(error=e)
-    except yaml.YAMLError as e:
+    except Exception as e:  # noqa: BLE001 - a file that does not parse is listed, never fatal
+        if is_json:
+            return [], REASON_JSON.format(error=e)
         if TEMPLATE_MARKER in text:
             return [], REASON_TEMPLATE
-        return [], REASON_YAML.format(error=str(e).splitlines()[0] if str(e) else type(e).__name__)
+        first_line = str(e).splitlines()[0] if str(e) else ""
+        return [], REASON_YAML.format(error=f"{type(e).__name__}: {first_line}" if first_line else type(e).__name__)
     for node in parsed:
         _documents_of(node, path, docs)
     return docs, None
@@ -689,6 +714,13 @@ def build_report(
     }
 
 
+def scan_lease(explicit: str | None) -> str:
+    """The directory-mode lease: `--lease` as given, else the session's with the scan prefix."""
+    if explicit and str(explicit).strip():
+        return gitops_workspace.lease_id(explicit)
+    return gitops_workspace.sanitize_lease(SCAN_LEASE_PREFIX + gitops_workspace.lease_id(None))
+
+
 def build_readers(args, endpoint: str, content_mode: bool) -> list[tuple[str, Callable[[], Snapshot]]]:
     """One (name, reader) per source: local trees, then repositories in the mode the broker allows."""
     readers: list[tuple[str, Callable[[], Snapshot]]] = []
@@ -697,7 +729,7 @@ def build_readers(args, endpoint: str, content_mode: bool) -> list[tuple[str, Ca
     repos = list(args.repo or [])
     if not repos and not args.manifests_dir:
         repos = gitops_workspace.get_managed_github_repos()
-    lease = gitops_workspace.lease_id(args.lease) if repos and not content_mode else None
+    lease = scan_lease(args.lease) if repos and not content_mode else None
     for repo in repos:
         if content_mode:
             readers.append((repo, lambda r=repo: read_repo_content(r, endpoint, args.max_files, args.max_bytes)))
@@ -715,7 +747,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--current-version", help="The fleet's current version when there is no --versions file.")
     parser.add_argument("--repo", action="append", help="owner/name to scan; repeatable. Default: every managed_repos GitHub entry.")
     parser.add_argument("--manifests-dir", action="append", help="Local directory to scan instead of, or as well as, repositories; repeatable.")
-    parser.add_argument("--lease", help="Directory mode only: the workspace lease to check the repository out under.")
+    parser.add_argument("--lease", help="Directory mode only: the workspace lease to check the repository out under. Default: a scan-private lease derived from the session's.")
     parser.add_argument("--max-files", type=int, default=DEFAULT_MAX_FILES, help="Manifest files read per source before the scan stops and says so.")
     parser.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES, help="Bytes read per source before the scan stops and says so.")
     parser.add_argument("--output", help="Path to write the report as JSON.")
