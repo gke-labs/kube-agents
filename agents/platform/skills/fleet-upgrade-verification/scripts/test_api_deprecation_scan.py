@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import tempfile
+import types
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -317,6 +318,13 @@ class ScanAndRenderTest(unittest.TestCase):
 
 
 class ContentModeTest(unittest.TestCase):
+    def test_a_client_without_workspace_routes_is_not_armed(self):
+        # Observed live: an agent image built before content-passing has a
+        # credential_proxy_client with no workspaces_available at all.
+        with patch.object(scan, "credential_proxy_client", types.SimpleNamespace()):
+            self.assertFalse(scan.content_mode_available("http://broker"))
+        self.assertFalse(scan.content_mode_available(""))
+
     def test_pages_filters_batches_and_reports_broker_skips(self):
         files = {
             "README.md": b"# nope",
