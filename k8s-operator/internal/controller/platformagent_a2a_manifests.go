@@ -69,6 +69,12 @@ const (
 	// provision Job's name carries a content hash, so deletion goes by label.
 	a2aComponentLabel = "kubeagents.x-k8s.io/a2a-component"
 
+	// a2aProvisionComponent is the a2aComponentLabel value the provision Job
+	// carries, and the selector both sweeps of it (deleteA2AProvisionJobs)
+	// list by. The builder's a2aLabels call spells the same value; the two
+	// are pinned together by TestReconcileA2ADeletesSupersededProvisionJobs.
+	a2aProvisionComponent = "provision"
+
 	// The LiteLLM ports the session fence grants, for the reason
 	// buildAgentEgressNetworkPolicy's LiteLLM rule states in full: a Pod
 	// selector matches after the ClusterIP translation, so the container port
@@ -1815,7 +1821,8 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 
 	// Jobs are immutable, so the provision Job is create-if-absent under its
 	// spec-digested name; a changed render — script or pod spec — is a new
-	// name and a fresh run, and the superseded Job is left to its TTL.
+	// name and a fresh run. The superseded generation is swept below rather
+	// than left to its TTL, for the reason the sweep's own comment gives.
 	job := buildA2AProvisionJob(agent)
 	if err := ctrl.SetControllerReference(agent, job, r.Scheme); err != nil {
 		return state, err
@@ -1844,6 +1851,23 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 					existing.Name, cond.Reason, cond.Message)
 			}
 		}
+	}
+
+	// Superseded generations go now, not by TTL. A Job whose name the render
+	// has moved past leaves on its own only if it reached a terminal
+	// condition: a completed one by TTL, one whose pod ran and failed by
+	// backoffLimit and then TTL. One whose pod never ran — an unpullable
+	// image, an unschedulable pod, an admission refusal — has no condition
+	// for the TTL to start from and would sit in Pending until a mode flip
+	// or agent deletion, holding one slot of the namespace pod quota the
+	// whole time (#1389). An unpullable image is the likely way to get there
+	// once the name tracks the pod spec (#1347), and a bad script is the way
+	// today. The sweep runs after the current Job is ensured above, never
+	// before it: a reconcile leaves N+1 provision Jobs for a moment, never
+	// zero. The status scan above read the current name only, so a Failed
+	// on a generation deleted here never reached the phase.
+	if err := r.deleteA2AProvisionJobs(ctx, agent, job.Name); err != nil {
+		return state, fmt.Errorf("failed to delete superseded A2A provision Jobs: %w", err)
 	}
 
 	// Identity before workload: the gateway pod must not start before the
@@ -2033,18 +2057,44 @@ func (r *PlatformAgentReconciler) cleanupA2A(ctx context.Context, agent *agentv1
 		return err
 	}
 
-	// Provision Jobs carry a spec digest in the name, one per generation
-	// that has been rendered here; find them all by label.
+	// Provision Jobs carry a content hash in the name, one per generation
+	// that has been rendered here; a mode flip removes every generation.
+	return r.deleteA2AProvisionJobs(ctx, agent, "")
+}
+
+// deleteA2AProvisionJobs deletes this agent's provision Jobs, found by label
+// because their names carry a content hash, except the one named keep. Two
+// callers: reconcileA2A passes the current render's name so superseded
+// generations go, and cleanupA2A passes "" so a mode flip clears them all.
+// One function so the two sweeps cannot drift apart in what they select.
+//
+// The List is uncached (a2aReader) for the reason that function gives, and
+// on the reconcile path it is a standing cost paid once per reconcile of a
+// next install — the same shape as the Job Get that precedes it. Sweeping
+// only on the pass that created a new generation would be cheaper and would
+// miss two cases: an install whose superseded Jobs predate this sweep, which
+// never sees a create again under the current name, and a pass whose create
+// succeeded and whose sweep then failed.
+//
+// Background propagation, for the same reason cleanupA2A always used it: the
+// pod is what holds the quota slot, and Background hands it to the garbage
+// collector the moment the Job is gone rather than pinning the Job under a
+// foregroundDeletion finalizer until the pod has left — which would put the
+// same Job back in this List on the next pass. A Job already carrying a
+// deletionTimestamp is skipped for that reason too. The IsControlledBy guard
+// is cleanupA2A's: a Job somebody labelled to look like ours, but which this
+// agent does not own, is not ours to delete.
+func (r *PlatformAgentReconciler) deleteA2AProvisionJobs(ctx context.Context, agent *agentv1alpha1.PlatformAgent, keep string) error {
 	var jobs batchv1.JobList
 	if err := r.a2aReader().List(ctx, &jobs, client.InNamespace(agent.Namespace), client.MatchingLabels{
-		a2aComponentLabel: "provision",
+		a2aComponentLabel: a2aProvisionComponent,
 		labelInstance:     instanceLabel(agent.Namespace, agent.Name),
 	}); err != nil {
 		return err
 	}
 	for i := range jobs.Items {
 		job := &jobs.Items[i]
-		if !metav1.IsControlledBy(job, agent) {
+		if job.Name == keep || job.DeletionTimestamp != nil || !metav1.IsControlledBy(job, agent) {
 			continue
 		}
 		if err := client.IgnoreNotFound(r.Delete(ctx, job, client.PropagationPolicy(metav1.DeletePropagationBackground))); err != nil {

@@ -157,13 +157,17 @@ func TestA2AProvisionJobNameTracksTheScript(t *testing.T) {
 // TestReconcileA2ACreatesANewProvisionJobWhenThePodSpecChanges is the naming
 // change seen from the reconciler: an install carrying the Job rendered by
 // one operator build gets a second Job, under a new name and with the new
-// spec, from the next. The superseded Job is left where it is — the operator
-// does not delete it — which this test pins as the current behaviour rather
-// than a goal. The superseded Job is also marked Failed before the second
-// reconcile, because the live case is a crash-looping old generation next to
-// a healthy new one, and the status scan has to read the current Job only: a
-// scan that folded conditions across generations would park the phase on
-// A2AProvisionFailed for a Job the operator has already moved past.
+// spec, from the next. The superseded Job is swept in the same pass (this PR;
+// the version of this test that landed with #1388 pinned the old
+// leave-it-to-TTL behaviour as current rather than as a goal, and that is the
+// behaviour being changed). The superseded Job is still marked Failed before
+// the second reconcile, because the live case is a crash-looping old
+// generation next to a healthy new one, and the status scan has to read the
+// current Job only: a scan that folded conditions across generations would
+// park the phase on A2AProvisionFailed for a Job the operator has already
+// moved past. That assertion is not made inert by the sweep — the scan reads
+// the current name by Get, so it never sees the superseded generation at all,
+// whichever order the two run in.
 func TestReconcileA2ACreatesANewProvisionJobWhenThePodSpecChanges(t *testing.T) {
 	scheme := setupScheme()
 	agent := a2aTestAgent()
@@ -219,20 +223,18 @@ func TestReconcileA2ACreatesANewProvisionJobWhenThePodSpecChanges(t *testing.T) 
 	if err := cl.List(ctx, jobs); err != nil {
 		t.Fatalf("list Jobs: %v", err)
 	}
-	if len(jobs.Items) != 2 {
-		t.Fatalf("%d provision Jobs after the image changed, want 2: the old one left alone and a new one carrying the change", len(jobs.Items))
-	}
-	for _, job := range jobs.Items {
-		image := job.Spec.Template.Spec.Containers[0].Image
-		switch job.Name {
-		case original.Name:
-			if image == pinned {
-				t.Errorf("the original Job %q now carries the new image; Jobs are immutable, so something rewrote it", job.Name)
-			}
-		default:
-			if image != pinned {
-				t.Errorf("the new Job %q carries %q, want %q", job.Name, image, pinned)
-			}
+	if len(jobs.Items) != 1 {
+		names := make([]string, 0, len(jobs.Items))
+		for _, job := range jobs.Items {
+			names = append(names, job.Name)
 		}
+		t.Fatalf("%d provision Jobs after the image changed (%v), want 1: the new one, with the superseded generation swept", len(jobs.Items), names)
+	}
+	survivor := jobs.Items[0]
+	if survivor.Name == original.Name {
+		t.Fatalf("the surviving Job is the original %q; the render moved past it and it should have been swept", original.Name)
+	}
+	if image := survivor.Spec.Template.Spec.Containers[0].Image; image != pinned {
+		t.Errorf("the new Job %q carries %q, want %q", survivor.Name, image, pinned)
 	}
 }
