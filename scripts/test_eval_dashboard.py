@@ -239,10 +239,10 @@ class RenderGoldenTest(unittest.TestCase):
         self.assertIn('<h2 id="agent">The agent</h2>', self.app)
         self.assertIn("cohort: final run of each merged PR", self.app)
         self.assertIn('<h2 id="gate">The gate</h2>', self.app)
-        # The run-level rule is stated verbatim on the gate band and again
-        # in the matrix caption.
+        # The run-level rule is stated verbatim on the gate band, in the
+        # matrix caption, on the Pareto and on the evidence table.
         self.assertEqual(
-            self.app.count("run-level events excluded from per-case stats"), 3
+            self.app.count("run-level events excluded from per-case stats"), 4
         )
 
     def test_week_pass_rate_tile_with_delta_vs_prior_week(self):
@@ -370,6 +370,19 @@ class RenderGoldenTest(unittest.TestCase):
         self.assertIn("6 of 20", self.app)
         self.assertIn(">IN PRESUBMIT</span>", self.app)
         self.assertIn(">NOT IN PRESUBMIT</span>", self.app)  # case-f
+        # Per-tier rate columns, presubmit and nightly, 7 and 30 days.
+        for head in ("<th>presubmit · 7d</th>", "<th>presubmit · 30d</th>", "<th>nightly · 7d</th>", "<th>nightly · 30d</th>"):
+            self.assertIn(head, self.app)
+        # case-a, presubmit (windows end at generated_at 09-01T12:00; run D
+        # is a run-level event and never counts): 7d = B 3/3, C 3/3, E 2/3,
+        # F 3/3 -> 11 of 12; 30d adds run A's 3/3 -> 14 of 15. No nightly on
+        # record: two dashes.
+        row = self.app.split('<div class="tname">case-a</div>', 1)[1].split("</tr>", 1)[0]
+        cells = row.split("<td>")[2:6]
+        self.assertIn('<span class="num">92%</span> <span class="cap">(12)</span>', cells[0])
+        self.assertIn('<span class="num">93%</span> <span class="cap">(15)</span>', cells[1])
+        self.assertEqual(row.count('<span class="cap">—</span>'), 2)
+        self.assertIn("0 nightly", row)
 
     def test_superseded_sections_are_gone(self):
         for marker in (
@@ -393,6 +406,103 @@ class RenderGoldenTest(unittest.TestCase):
     def test_data_json_copied_next_to_index(self):
         copied = json.loads((self.out_dir / "data.json").read_text())
         self.assertEqual(copied["generated_at"], "2026-09-01T12:00:00Z")
+
+
+def nightly_run():
+    """A nightly build the day before generated_at: red on case-a and on a
+    nightly-only case-g, green on case-b. Nobody's pull request."""
+    return {
+        "build_id": "bN", "tier": "nightly", "job": "ci-kube-agents-eval-nightly", "pr": None,
+        "head_sha": "7a32267", "started": "2026-08-31T20:00:00Z", "finished": "2026-09-01T00:30:00Z",
+        "result": "FAILURE", "duration_s": 16200,
+        "tasks": [
+            {"name": "case-a", "result": "fail",
+             "reps": [rep("fail", "NIGHTLY-ONLY-REASON drift"), rep("fail", "NIGHTLY-ONLY-REASON drift"), rep("fail", "NIGHTLY-ONLY-REASON drift")]},
+            {"name": "case-b", "result": "pass", "reps": [rep("pass"), rep("pass"), rep("pass")]},
+            {"name": "case-g", "result": "fail", "reps": [rep("pass"), rep("fail", "NIGHTLY-ONLY-REASON audit"), rep("fail", "NIGHTLY-ONLY-REASON audit")]},
+        ],
+    }
+
+
+class NightlyTierRenderTest(unittest.TestCase):
+    """A nightly run in data.json (runs[].tier) shows up where the nightly is
+    meant to -- the evidence table's nightly columns and count, the footer
+    -- and nowhere the gate is judged: no matrix column, no Pareto bar, no
+    infra-rep tile, no wall-clock tile, no Brief run."""
+
+    @classmethod
+    def setUpClass(cls):
+        data = fixture_data()
+        data["runs"].append(nightly_run())
+        data["cases"].append({"name": "case-g", "domain": "obtainability", "active": False, "nightly_active": True,
+                              "runs_on_record": 0, "nightly": {"runs_on_record": 1, "pass_rate": 0.0, "last3": ["fail"]}})
+        data["cases"][0]["nightly"] = {"runs_on_record": 1, "pass_rate": 0.0, "last3": ["fail"]}
+        cls.data = data
+        cls.html, cls.out_dir, cls._tmp = render_fixture(data, events_yaml=fixture_events_yaml())
+        cls.app = baked_app(cls.html)
+        cls.control = baked_app(render_fixture(fixture_data(), events_yaml=fixture_events_yaml())[0])
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._tmp.cleanup()
+
+    def test_the_gate_band_and_the_agent_band_are_unchanged(self):
+        gate = lambda app: app.split('<h2 id="gate">', 1)[1].split('<h2 id="nightly">', 1)[0]
+        agent = lambda app: app.split('<h2 id="agent">', 1)[1].split('<h2 id="gate">', 1)[0]
+        self.assertEqual(gate(self.app), gate(self.control), "matrix, tiles and Pareto read presubmit runs only")
+        # The agent band differs only by the scenario count, which is the
+        # cases[] list (case-g was added), not the runs.
+        self.assertEqual(agent(self.app).replace("7 scenarios", "6 scenarios"), agent(self.control))
+        self.assertEqual(self.app.count("mx-col"), 6)
+        self.assertNotIn("NIGHTLY-ONLY-REASON", self.app)
+        self.assertNotIn("bN", gate(self.app))
+
+    def test_the_evidence_table_carries_the_nightly_record_apart(self):
+        row = self.app.split('<div class="tname">case-a</div>', 1)[1].split("</tr>", 1)[0]
+        cells = row.split("<td>")[2:6]  # presubmit 7d, 30d, nightly 7d, 30d
+        self.assertIn("92%", cells[0])
+        self.assertIn("93%", cells[1])
+        self.assertIn('<span class="num">0%</span> <span class="cap">(3)</span>', cells[2])
+        self.assertIn('<span class="num">0%</span> <span class="cap">(3)</span>', cells[3])
+        self.assertIn("1 nightly", row)
+        # case-g runs in the nightly only: its row exists, presubmit side empty.
+        row_g = self.app.split('<div class="tname">case-g</div>', 1)[1].split("</tr>", 1)[0]
+        self.assertIn(">NIGHTLY ONLY</span>", row_g)
+        self.assertIn("0 of 20", row_g)
+        self.assertIn('<span class="num">33%</span> <span class="cap">(3)</span>', row_g)
+        self.assertNotIn("NIGHTLY ONLY", self.control)
+
+    def test_the_footer_counts_the_tiers(self):
+        self.assertIn("7 runs on record, 1 of them nightly; the agent and gate bands read presubmit runs only", self.app)
+        self.assertIn("6 runs on record, 0 of them nightly", self.control)
+
+    def test_brief_json_lists_presubmit_runs_only(self):
+        brief = json.loads((self.out_dir / "brief.json").read_text())
+        self.assertNotIn("bN", [r["build"] for r in brief["runs"]])
+        self.assertEqual(len(brief["runs"]), 6)
+        self.assertTrue(brief["cases"]["case-g"]["nightly_active"])
+        self.assertFalse(brief["cases"]["case-a"]["nightly_active"], "absent in the fixture reads false")
+        # The nightly still informs each case's note on the PR view.
+        run_e = next(r for r in brief["runs"] if r["build"] == "bE")
+        case_a = next(c for c in run_e["cases"] if c["case"] == "case-a")
+        self.assertIs(case_a["nightly_failed_recent"], True)
+
+    def test_the_js_mirror_carries_the_tier_filter(self):
+        js = script_source(self.html)
+        for token in ('tiers: ["presubmit", "nightly"]', "tierRateWindowsDays: [7, 30]", "const runTier =", "const gateRuns =",
+                      "function tierPassRates(", "NIGHTLY ONLY", "const measuredRuns = (data) => gateRuns(data)",
+                      f"evidenceFixedColumns: {render.EVIDENCE_FIXED_COLUMNS}"):
+            self.assertIn(token, js)
+
+    def test_an_unknown_tier_is_neither_the_gates_nor_the_nightlys(self):
+        data = fixture_data()
+        data["runs"][-1]["tier"] = "rc"  # run F, the latest green full run
+        html, _, tmp = render_fixture(data, events_yaml=fixture_events_yaml())
+        self.addCleanup(tmp.cleanup)
+        app = baked_app(html)
+        self.assertEqual(app.count("mx-col"), 5)
+        self.assertNotIn("latest green full run · #953", app)
+        self.assertIn("6 runs on record, 0 of them nightly", app)
 
 
 class ReasonSignatureTest(unittest.TestCase):

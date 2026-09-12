@@ -30,6 +30,7 @@ SKIP = "eval-dashboard refresh skipped:"
 _SCRUB = (
     "EVAL_DASHBOARD_TARGET",
     "EVAL_DASHBOARD_PR_GLOB",
+    "EVAL_DASHBOARD_NIGHTLY_PREFIX",
     "EVAL_DASHBOARD_SINCE_DAYS",
     "EVAL_DASHBOARD_TIMEOUT",
     "EVAL_DASHBOARD_FROM_DIR",
@@ -59,6 +60,22 @@ def write_stub(directory: pathlib.Path, name: str, body: str) -> None:
     stub = directory / name
     stub.write_text("#!/usr/bin/env bash\n" + body)
     stub.chmod(stub.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def recording_python(directory: pathlib.Path, log: pathlib.Path) -> None:
+    """A python3 on PATH that appends collect.py's argv to `log` and then
+    runs the real interpreter, so a test can assert what the script hands
+    the collector without faking the pipeline."""
+    real = shutil.which("python3")
+    write_stub(
+        directory,
+        "python3",
+        f'case "$1" in *collect.py) printf "%s\\n" "$@" >> "{log}" ;; esac\nexec "{real}" "$@"\n',
+    )
+
+
+def collect_argv(log: pathlib.Path) -> list[str]:
+    return log.read_text().splitlines() if log.exists() else []
 
 
 class RefreshScriptTest(unittest.TestCase):
@@ -116,12 +133,17 @@ class RefreshScriptTest(unittest.TestCase):
     # ── The pipeline itself, against the real fixtures ─────────────────────
 
     def test_first_run_publishes_the_fixture_dashboard(self):
+        stubs = self.tmp / "stubs"
+        stubs.mkdir()
+        argv_log = self.tmp / "collect-argv.log"
+        recording_python(stubs, argv_log)
         proc = run_script(
             env={
                 "EVAL_DASHBOARD_TARGET": str(self.target),
                 "EVAL_DASHBOARD_FROM_DIR": str(TESTDATA),
                 "JOB_TYPE": "periodic",
-            }
+            },
+            path_prepend=str(stubs),
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("first run against this directory", proc.stdout)
@@ -130,6 +152,12 @@ class RefreshScriptTest(unittest.TestCase):
         self.assertEqual(data["schema_version"], 1)
         self.assertEqual(len(data["runs"]), 3)
         self.assertIn("<html", (self.target / "index.html").read_text().lower())
+        # The offline path hands collect.py the directory and no bucket
+        # source of either tier.
+        argv = collect_argv(argv_log)
+        self.assertIn("--from-dir", argv)
+        self.assertNotIn("--pr-glob", argv)
+        self.assertNotIn("--nightly-prefix", argv)
         self.assertNotIn("<base href", (self.target / "index.html").read_text())
 
     def test_bucket_target_emits_derived_base_href(self):
@@ -252,6 +280,8 @@ class RefreshScriptTest(unittest.TestCase):
         stubs = self.tmp / "stubs"
         stubs.mkdir()
         write_stub(stubs, "gsutil", "exit 1\n")
+        argv_log = self.tmp / "collect-argv.log"
+        recording_python(stubs, argv_log)
         artifacts = self.tmp / "artifacts"
         artifacts.mkdir()
         proc = run_script(
@@ -268,6 +298,25 @@ class RefreshScriptTest(unittest.TestCase):
         self.assertIn(
             "gsutil ls failed", (artifacts / "eval-dashboard-refresh.log").read_text()
         )
+        # The bucket path hands collect.py both sources, the nightly one with
+        # its default prefix; an empty EVAL_DASHBOARD_NIGHTLY_PREFIX drops it.
+        argv = collect_argv(argv_log)
+        self.assertIn("--pr-glob", argv)
+        self.assertIn("--nightly-prefix", argv)
+        self.assertEqual(
+            argv[argv.index("--nightly-prefix") + 1],
+            "gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly/",
+        )
+        argv_log.unlink()
+        run_script(
+            env={
+                "EVAL_DASHBOARD_TARGET": "gs://fake-dashboards/evals/",
+                "JOB_TYPE": "periodic",
+                "EVAL_DASHBOARD_NIGHTLY_PREFIX": "",
+            },
+            path_prepend=str(stubs),
+        )
+        self.assertNotIn("--nightly-prefix", collect_argv(argv_log))
 
     @unittest.skipUnless(shutil.which("timeout"), "needs coreutils timeout")
     def test_a_hung_pipeline_times_out_red(self):
