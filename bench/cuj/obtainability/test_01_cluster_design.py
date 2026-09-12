@@ -8,6 +8,8 @@ from typing import Any
 from cuj.utils.acceptance_criteria import AcceptanceCriteria, AcceptanceCriterion
 from cuj.utils.interaction import (
     completed_evidence,
+    delivered_answer,
+    latest_artifact,
     projected_records,
     projected_tasks,
     tool_operations,
@@ -29,7 +31,11 @@ cloud.google.com/machine-family values n2, n2d, and c2d with location policy \
 ANY. This is design-only: do not create a cluster, apply a manifest, open a \
 pull request, or mutate cloud or Kubernetes state."""
 
-REQUIRED_SKILLS = {"gke-cluster-creation", "gke-compute-classes"}
+REQUIRED_SKILLS = {
+    "gke-cluster-creation",
+    "gke-compute-classes",
+    "capacity-obtainability",
+}
 FORBIDDEN_OPERATIONS = {
     "create_cluster",
     "delete_cluster",
@@ -86,10 +92,10 @@ MILESTONES = (
     ),
     Milestone(
         "m3-design-skills-loaded",
-        "The Platform Agent must load the cluster-creation and ComputeClass "
-        "skills needed to design a stockout-resilient topology.",
-        "platform task requests and loads gke-cluster-creation and "
-        "gke-compute-classes",
+        "The Platform Agent must load the cluster-creation, ComputeClass, and "
+        "obtainability skills needed to design a stockout-resilient topology.",
+        "platform task requests and loads gke-cluster-creation, "
+        "gke-compute-classes, and capacity-obtainability",
         ("m2-platform-task-created",),
     ),
     Milestone(
@@ -122,13 +128,6 @@ MILESTONES = (
         ("m4-specialist-completes",),
     ),
     Milestone(
-        "m8-computeclass-validates",
-        "The recommended resilient topology must include a ComputeClass "
-        "fallback manifest that passes server-side dry-run validation.",
-        "completed computeclass_server_dry_run evidence",
-        ("m4-specialist-completes",),
-    ),
-    Milestone(
         "m9-design-remains-read-only",
         "The Day-0 journey is design-only and must not create a cluster, "
         "apply manifests, open a pull request, or mutate infrastructure.",
@@ -145,10 +144,9 @@ ACCEPTANCE_CRITERIA = (
     ),
     AcceptanceCriterion(
         "ac02-obtainability-api-invoked",
-        "kube-agents invokes AdviceService.Capacity or "
-        "GeneralCapacityRecommendation for the requested capacity.",
-        "completed evidence names an allowed method and requests 32 A100 GPUs "
-        "in us-central1",
+        "kube-agents invokes AdviceService.Capacity for the requested capacity.",
+        "completed evidence names AdviceService.Capacity and requests 32 A100 "
+        "GPUs in us-central1",
     ),
     AcceptanceCriterion(
         "ac03-available-quantity-analyzed",
@@ -162,8 +160,12 @@ ACCEPTANCE_CRITERIA = (
     ),
     AcceptanceCriterion(
         "ac05-provisioning-models-analyzed",
-        "kube-agents analyzes On-Demand, Spot, and Flex provisioning signals.",
-        "capacity evidence contains non-empty ON_DEMAND, SPOT, and FLEX signals",
+        "kube-agents analyzes the obtainability signals AdviceService offers "
+        "(Spot and Flex) and advises the user on the trade-offs of all three "
+        "provisioning paths; On-Demand carries no advance obtainability "
+        "signal, so its assessment rests on quota and reservations.",
+        "capacity evidence contains non-empty SPOT and FLEX signals and the "
+        "answer weighs On-Demand, Spot, and Flex",
     ),
     AcceptanceCriterion(
         "ac06-computeclass-generated",
@@ -215,27 +217,11 @@ def _completed_capacity_evidence(
 def _computeclass_artifact(
     artifacts: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
-    return next(
-        (
-            artifact
-            for artifact in artifacts
-            if isinstance(artifact.get("manifest"), dict)
-            and artifact["manifest"].get("kind") == "ComputeClass"
-        ),
-        None,
-    )
+    return latest_artifact(artifacts, kind="ComputeClass")
 
 
 def _nap_artifact(artifacts: list[dict[str, Any]]) -> dict[str, Any] | None:
-    return next(
-        (
-            artifact
-            for artifact in artifacts
-            if artifact.get("type") == "node_auto_provisioning"
-            and isinstance(artifact.get("manifest"), dict)
-        ),
-        None,
-    )
+    return latest_artifact(artifacts, artifact_type="node_auto_provisioning")
 
 
 def _machine_families(spec: dict[str, Any]) -> set[str]:
@@ -288,7 +274,16 @@ def _location_policy(spec: dict[str, Any]) -> str:
     return str(location.get("locationPolicy") or "").upper()
 
 
-def capacity_claims(result_text: str) -> tuple[bool, dict[str, Any]]:
+def capacity_claims(
+    result_text: str, full_text: str | None = None
+) -> tuple[bool, dict[str, Any]]:
+    """Score the answer, but hunt forbidden claims across everything said.
+
+    Required terms are looked for in the answer alone — an acknowledgment
+    should not be able to satisfy them. Guarantees are looked for in the
+    whole output, because a capacity promise made in the hand-off paragraph
+    is still a promise the user read.
+    """
     folded = result_text.casefold()
     present = sorted(term for term in CAPACITY_TERMS if term in folded)
     distinguishes_quota = any(
@@ -296,7 +291,7 @@ def capacity_claims(result_text: str) -> tuple[bool, dict[str, Any]]:
     )
     guarantee_claims = [
         sentence.strip()
-        for sentence in re.split(r"[.!?\n]+", result_text)
+        for sentence in re.split(r"[.!?\n]+", full_text or result_text)
         if "capacity" in sentence.casefold()
         and "guarantee" in sentence.casefold()
         and not NEGATED_GUARANTEE.search(sentence)
@@ -428,10 +423,7 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
     )
     suite.record(
         "ac02-obtainability-api-invoked",
-        (
-            method.endswith("AdviceService.Capacity")
-            or method.endswith("AdviceService.GeneralCapacityRecommendation")
-        )
+        method.endswith("AdviceService.Capacity")
         and str(capacity_request.get("region") or "").casefold() == "us-central1"
         and "a100"
         in str(capacity_request.get("acceleratorType") or "").casefold()
@@ -456,12 +448,40 @@ def evaluate_acceptance(interaction: dict[str, Any]) -> AcceptanceCriteria:
         {"zones": zones, "distinctZones": sorted(distinct_zones)},
         blocked_by=evidence_blocker,
     )
-    required_models = {"ondemand", "spot", "flex"}
+    populated_models = {
+        key
+        for key, value in normalized_models.items()
+        if value not in (None, "", [], {})
+    }
+    # Exact keys, not prefixes: a stray "spotplaceholder" is not a Spot
+    # signal. Only the two models the AdviceService returns are required in
+    # its evidence; On-Demand has no API signal, is assessed from the quota
+    # check (m5), and is scored on the answer below.
+    advice_models_covered = all(
+        populated_models & aliases
+        for aliases in (
+            {"spot"},
+            {"flex", "flexstart"},
+        )
+    )
+    # Score what the user actually reads: the reply after the delegation
+    # acknowledgment plus the delegated task results the gateway posts into
+    # the same thread.
+    answer = delivered_answer(interaction)
+    # Word-bounded so prose like "inflexible" or "spotted" cannot satisfy a
+    # provisioning path; the separators admit On-Demand, on demand, and the
+    # ON_DEMAND / FLEX_START key spellings the skill's records use.
+    paths_weighed = {
+        "onDemand": bool(re.search(r"\bon[-_ ]?demand\b", answer, re.IGNORECASE)),
+        "spot": bool(re.search(r"\bspot\b", answer, re.IGNORECASE)),
+        # \bflex\b alone misses FLEX_START: the underscore is a word
+        # character, so there is no boundary after "flex".
+        "flex": bool(re.search(r"\bflex(?:[-_ ]?start)?\b", answer, re.IGNORECASE)),
+    }
     suite.record(
         "ac05-provisioning-models-analyzed",
-        required_models <= normalized_models.keys()
-        and all(normalized_models[item] not in (None, "", [], {}) for item in required_models),
-        models,
+        advice_models_covered and all(paths_weighed.values()),
+        {"provisioningModels": models, "answerWeighs": paths_weighed},
         blocked_by=evidence_blocker,
     )
     suite.record(
@@ -530,8 +550,10 @@ def evaluate_kage_milestones(interaction: dict[str, Any]) -> MilestoneSuite:
     operations = tool_operations(interaction)
     completed_operations = tool_operations(interaction, completed_only=True)
     final_output_available = "output" in interaction
-    result_text = str(interaction.get("output") or "")
-    claims_met, claims_observed = capacity_claims(result_text)
+    result_text = delivered_answer(interaction)
+    claims_met, claims_observed = capacity_claims(
+        result_text, str(interaction.get("output") or "")
+    )
     unnormalized_calls = unnormalized_tool_calls(interaction)
     suite = MilestoneSuite(MILESTONES)
     suite.record(
@@ -592,12 +614,6 @@ def evaluate_kage_milestones(interaction: dict[str, Any]) -> MilestoneSuite:
         blocked_by=()
         if final_output_available
         else ("portal interaction projection omits output",),
-    )
-    suite.record(
-        "m8-computeclass-validates",
-        "computeclass_server_dry_run" in completed,
-        sorted(completed),
-        blocked_by=evidence_blocker,
     )
     mutations = sorted(FORBIDDEN_OPERATIONS.intersection(operations))
     suite.record(

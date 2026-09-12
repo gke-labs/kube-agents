@@ -56,6 +56,7 @@ agents/platform/governance/*.md
   agents/platform/governance/stockout_prevention_sop.md
 
 agents/platform/skills/*/SKILL.md
+  agents/platform/skills/capacity-obtainability/SKILL.md
   agents/platform/skills/cluster-agent-lifecycle/SKILL.md
   agents/platform/skills/fleet-audit/SKILL.md
   agents/platform/skills/fleet-upgrade-verification/SKILL.md

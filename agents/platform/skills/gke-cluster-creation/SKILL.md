@@ -390,3 +390,13 @@ Do not delete a Cluster Agent profile while its cluster still exists.
 Deleting the profile here is the immediate, preferred path. As a backstop, the hourly
 `cluster-agent-reconcile` job auto-prunes any profile whose cluster is definitively gone, so a
 profile missed during teardown is cleaned up on the next reconcile cycle.
+
+## Before recommending GPU/TPU or large-shape capacity
+
+Before recommending capacity for a GPU/TPU or large-shape design, load the
+[capacity-obtainability](../capacity-obtainability/SKILL.md) skill and run its diagnostics:
+verify the regional quota for the exact accelerator metric (e.g. `NVIDIA_A100_GPUS`), then gather
+capacity obtainability advice (`gcloud beta compute advice capacity`) for the requested machine
+shape and count across the region's zones, for the Spot and Flex-Start provisioning models the
+advice API accepts. That skill owns the rules for what to probe and how to report it; follow it
+rather than restating them here.
