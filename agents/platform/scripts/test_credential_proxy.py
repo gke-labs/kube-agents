@@ -903,7 +903,10 @@ class GitHardeningTest(unittest.TestCase):
         self.append_repository_config(
             repository, "\n[help]\n\tautocorrect = immediate\n"
         )
-        self.assertIsNone(git_argument_violation(["git", "bisct", "run", "x"]))
+        # Under the subcommand allowlist, `bisct` is refused at the argument gate
+        # as unsupported. Even if reached by an executor, autocorrection is pinned
+        # to 0 so the command fails rather than executing.
+        self.assertIsNotNone(git_argument_violation(["git", "bisct", "run", "x"]))
         result = executor.execute(
             ["git", "bisct", "run", str(self.payload)], cwd=str(repository)
         )
@@ -1065,7 +1068,7 @@ class GitHardeningTest(unittest.TestCase):
         # Scanning every token cannot disagree with git about where the
         # subcommand is.
         self.assertEqual(
-            _git_plan(["git", "--attr-source", "HEAD", "help", "-m", "git"])[0], "HEAD"
+            _git_plan(["git", "--attr-source", "HEAD", "help", "-m", "git"])[0], "help"
         )
         self.assertIsNotNone(
             git_argument_violation(["git", "--attr-source", "HEAD", "help", "-m", "git"])
@@ -1130,8 +1133,82 @@ class GitHardeningTest(unittest.TestCase):
             git_argument_violation(["git", "config", "user.email", "a@b.invalid"])
         )
         self.assertIsNone(
+            git_argument_violation(["git", "config", "user.name", "bot"])
+        )
+        self.assertIsNone(
             git_argument_violation(["git", "config", "--get", "remote.origin.url"])
         )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "--list"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "-l"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "--show-origin", "--get", "remote.origin.url"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "--add", "user.name", "bot"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "--unset", "user.email"])
+        )
+        self.assertIsNone(
+            git_argument_violation(["git", "config", "user.name"])
+        )
+        # Writing unapproved keys repo-locally is also refused.
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "alias.zz", "!sh"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "core.pager", "sh"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--add", "alias.foo", "bar"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--unset", "core.pager"])
+        )
+        # Trailing query flags after positional arguments do not bypass write restrictions.
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "alias.zz", "!sh", "--get"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "diff.external", "payload", "--get"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "config", "--show-origin", "core.pager", "sh"])
+        )
+        # --attr-source cannot bypass the subcommand allowlist or config gate.
+        self.assertIsNotNone(
+            git_argument_violation(["git", "--attr-source", "status", "difftool"])
+        )
+        self.assertIsNotNone(
+            git_argument_violation(["git", "--attr-source", "status", "config", "alias.zz", "!sh"])
+        )
+
+    def test_unsupported_git_subcommands_are_refused(self):
+        for argv in (
+            ["git", "foobar"],
+            ["git", "custom-verb"],
+            ["git", "x"],
+            ["git", "-C", "/tmp", "not-a-subcommand"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNotNone(git_argument_violation(argv))
+
+    def test_supported_git_subcommands_are_allowed(self):
+        for argv in (
+            ["git", "status"],
+            ["git", "diff"],
+            ["git", "log"],
+            ["git", "branch"],
+            ["git", "rev-parse", "HEAD"],
+            ["git", "--version"],
+            ["git", "-v"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertIsNone(git_argument_violation(argv))
 
     def test_a_git_dir_redirect_cannot_reach_outside_the_workspace(self):
         # `_execute` refuses a cwd outside the shared workspace and the lease
@@ -1854,6 +1931,12 @@ class CommandExecutorTest(unittest.TestCase):
         for name, value in tokens.items():
             self.assertNotIn(name, environment)
             self.assertNotIn(value, environment.values())
+
+    def test_git_environment_excludes_unrelated_credentials(self):
+        executor = self.executor(max_output_bytes=1 << 16)
+        environment = self.git_environment(executor)
+        self.assertNotIn("KUBECONFIG", environment)
+        self.assertNotIn("CLOUDSDK_CONFIG", environment)
 
     def test_bootstrap_prepares_profile_for_later_commands(self):
         import os

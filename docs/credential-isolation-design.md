@@ -564,10 +564,10 @@ layer and reinstating the runtime's own helper immediately after it discards a
 repository's helper while leaving authenticated push working — but that couples
 the runtime to the value `gh auth setup-git` writes, and it has not been done.
 
-The refused-subcommand list is likewise a denylist over a set that is not closed:
-git holds a command in configuration for several tools, and a future release may
-add another. Allowlisting the subcommands the product issues, and failing closed
-on the rest, is the structurally correct form and is the recommended follow-up.
+The proxy enforces an explicit allowlist of the subcommands the product and skills
+issue (`ALLOWED_GIT_SUBCOMMANDS`), failing closed on unknown or custom verbs.
+Writing configuration via repository-local `git config` is restricted to author identity
+keys (`user.name`, `user.email`), with non-query mutations to other keys refused.
 
 Reducing both is the motivation for having the runtime receive file content from
 the sandbox rather than operate inside a directory the sandbox controls. The
