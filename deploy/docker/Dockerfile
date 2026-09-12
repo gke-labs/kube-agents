@@ -303,14 +303,14 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-tick-lock/apply_cron_tick_lock_scope
 # stops firing looks exactly like one with nothing to report. The applier
 # widens the CHECK to include 'skipped', migrates the existing ledger in place
 # (table rebuild under BEGIN IMMEDIATE, refused rather than guessed if the DDL
-# is ambiguous), and writes a row at each of the five places the scheduler
+# is ambiguous), and writes a row at each of the seven places the scheduler
 # drops an occurrence today.
 #
 # Upstream also prunes to the newest 1000 terminal rows across ALL jobs, so the
 # minute-ly ticker evicts a daily watchdog's only row inside 17 hours.
 # Retention becomes per job, with a global ceiling and a per-job floor.
 #
-# Must stay AFTER the cron_tick_lock_scope block: two of the seventeen anchors
+# Must stay AFTER the cron_tick_lock_scope block: two of the nineteen anchors
 # are text that patch inserts.
 COPY --chmod=0644 deploy/docker/patches/cron_skip_ledger.py /opt/hermes/tools/cron_skip_ledger.py
 COPY deploy/docker/patches/apply_cron_skip_ledger.py \
@@ -326,6 +326,9 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/cron-skip-ledger/apply_cron_skip_ledger.p
     grep -q "reason=SKIP_ALREADY_RUNNING_ELSEWHERE" /opt/hermes/cron/scheduler.py && \
     grep -q "reason=SKIP_INTERPRETER_SHUTDOWN" /opt/hermes/cron/scheduler.py && \
     grep -q "reason=SKIP_DISPATCH_CLAIM_REJECTED" /opt/hermes/cron/scheduler.py && \
+    grep -q "reason=SKIP_CREATE_EXECUTION_FAILED" /opt/hermes/cron/scheduler.py && \
+    grep -q "reason=SKIP_FIRE_CLAIM_LOST" /opt/hermes/cron/scheduler.py && \
+    ! grep -q 'error="Fire claim lost' /opt/hermes/cron/scheduler.py && \
     grep -q "reason=SKIP_MISSED_WINDOW" /opt/hermes/cron/jobs.py && \
     grep -q "reason=SKIP_ALREADY_RUNNING," /opt/hermes/tools/cronjob_tools.py && \
     grep -q "reason=SKIP_ALREADY_RUNNING_ELSEWHERE" /opt/hermes/tools/cronjob_tools.py && \

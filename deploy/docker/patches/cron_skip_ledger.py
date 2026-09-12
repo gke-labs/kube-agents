@@ -28,7 +28,7 @@ hourly and half-hourly jobs fire, so they are contention, not noise. Every one
 of the board's 1000 rows reads ``completed``. There is no query against the
 current schema that can find the twenty.
 
-Five ways an occurrence is lost, all recorded with a distinguishing
+Seven ways an occurrence is lost, all recorded with a distinguishing
 reason (the codes below are the vocabulary, and they are content-free so they
 can also be projected to monitoring):
 
@@ -78,6 +78,30 @@ an occurrence where it used to cost nothing.
     over: it inflates the failure count that ``cron_health`` derives, and it
     describes a correctly-enforced at-most-once guarantee as a fault.
 
+``create_execution_failed``
+    ``tick``'s dispatch loop could not write the ``claimed`` row (v2026.8.19
+    wrapped ``create_execution`` in an ``except``). Upstream releases the
+    running slot and the per-job flock and returns; ``advance_next_runs`` has
+    already moved ``next_run_at``, so the occurrence is gone with nothing but a
+    ``logger.exception`` behind it. The skip is recorded after both releases,
+    the ordering every other guard keeps, so the job is never held across the
+    ledger write. One limit is structural: ``record_skip`` writes to the same
+    SQLite file ``create_execution`` just failed on and swallows by design, so
+    a failure of the ledger itself still leaves no row. What this code catches
+    is everything else — a lock held past the busy timeout on the first write
+    but not the second, ``copy_context`` raising, an ``execution`` record
+    missing its ``id``.
+
+``fire_claim_lost``
+    ``_process_job`` (the worker ``_run_and_release`` runs) re-takes the fire
+    claim at execution time, and that CAS lost — another owner stamped the
+    job between dispatch and start. Upstream (v2026.8.19) closes the claimed
+    row as ``failed`` with ``Fire claim lost; execution was not started.``,
+    which is ``dispatch_claim_rejected``'s complaint again: an at-most-once
+    guarantee working, counted as a fault by ``cron_health``. Closed as
+    ``skipped`` through ``skip_execution`` instead; the ``return True`` that
+    tells the tick the occurrence was handled is unchanged.
+
 Two near-misses deliberately *not* recorded, because neither loses an
 occurrence: the tick-lock contention path (``Tick skipped — another instance
 holds the lock``) returns before ``get_due_jobs``, so the other tick fires
@@ -88,19 +112,10 @@ common case it re-anchors onto the same wall-clock time later in the same
 period and nothing is lost, so a row there would be a false positive in every
 case but a rare DST collision.
 
-v2026.8.19 added two more drop paths, and neither is recorded here yet.
-``tick``'s dispatch loop grew an ``except`` around ``create_execution``: it
-releases the in-flight claim and returns, and because ``advance_next_runs``
-already moved ``next_run_at``, the occurrence is gone leaving nothing but a
-``logger.exception`` — the exact shape this ledger exists to close. Separately,
-``_run_and_release`` now re-takes the fire claim at execution time and, when
-that CAS loses, writes ``Fire claim lost; execution was not started.`` as a
-FAILED execution — ``dispatch_claim_rejected``'s complaint again, an
-at-most-once guarantee working correctly and counted as a fault by
-``cron_health``. Both are deliberately left out of the base-image bump that
-found them and tracked in #1131: a sixth and seventh code is a change to the
-vocabulary above, which monitoring reads, and wants reviewing on its own
-merits.
+The executor submit-failure path beside ``create_execution_failed`` is also
+left alone: ``pool.submit`` raising is a real dispatch fault, and upstream
+already closes its row as ``failed`` with the cause, which is the right
+reading of it.
 
 Hole 2 — pruning is global, so a chatty job evicts a quiet one
 ---------------------------------------------------------------
@@ -212,6 +227,11 @@ SKIP_INTERPRETER_SHUTDOWN = "interpreter_shutdown"
 SKIP_MISSED_WINDOW = "missed_window"
 #: A finite one-shot had already consumed its dispatch budget.
 SKIP_DISPATCH_CLAIM_REJECTED = "dispatch_claim_rejected"
+#: tick could not write the claimed row; the slot and flock were released and
+#: the schedule had already advanced.
+SKIP_CREATE_EXECUTION_FAILED = "create_execution_failed"
+#: The worker re-took the fire claim at execution time and lost the CAS.
+SKIP_FIRE_CLAIM_LOST = "fire_claim_lost"
 
 #: Every reason the ledger will accept. An unknown code is coerced rather than
 #: rejected: a skip recorded under a bad label is still evidence, and dropping
@@ -223,6 +243,8 @@ SKIP_REASONS = frozenset(
         SKIP_INTERPRETER_SHUTDOWN,
         SKIP_MISSED_WINDOW,
         SKIP_DISPATCH_CLAIM_REJECTED,
+        SKIP_CREATE_EXECUTION_FAILED,
+        SKIP_FIRE_CLAIM_LOST,
     }
 )
 SKIP_REASON_UNSPECIFIED = "unspecified"
