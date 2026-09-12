@@ -81,8 +81,8 @@ const PAGE = {
   rosterUrl: "https://github.com/gke-labs/kube-agents/blob/main/docs/eval-gate-roster.md",
   briefFile: "brief.json",
   healthFile: "health.json",
-  pages: { brief: "index.html", run: "run.html", grid: "grid.html", cases: "cases.html" },
-  titles: { brief: "kube-agents · smoke gate brief", run: "kube-agents · smoke run", grid: "kube-agents · cases by run", cases: "kube-agents · how reliable is each test" },
+  pages: { brief: "index.html", run: "run.html", grid: "grid.html", cases: "cases.html", nightly: "nightly.html" },
+  titles: { brief: "kube-agents · smoke gate brief", run: "kube-agents · smoke run", grid: "kube-agents · cases by run", cases: "kube-agents · how reliable is each test", nightly: "kube-agents · last night's run" },
   // The Grid's window chips, and the one it opens with when the URL names none.
   gridWindows: [["6h", 6 * 3600 * 1000], ["24h", 24 * 3600 * 1000], ["36h", 36 * 3600 * 1000], ["7d", 7 * 24 * 3600 * 1000]],
   gridDefaultWindow: "36h",
@@ -99,6 +99,11 @@ const PAGE = {
   // deploy-failed path: nothing was measured, which is neither a pass nor a
   // judgement on the candidate, so it takes the neutral infra colour.
   releaseVerdictClass: { GREEN: "p-pass", RED: "p-fail", "NOT RUN": "p-infra" },
+  // The Nightly report: a case's state (nightly.py's STATE_*) as a pill,
+  // and how many nights the page lists beside last night's.
+  nightStateClass: { pass: "p-pass", partial: "p-partial", fail: "p-fail", infra: "p-infra" },
+  nightStateWords: { pass: "passed all reps", partial: "failed some reps", fail: "failed all reps", infra: "quota / infra, not graded" },
+  nightsListed: 14,
 };
 
 function inlineJson(id) {
@@ -737,7 +742,7 @@ function briefHtml(link) {
       `<div class="sec" id="agent"><h2>Last 24 hours</h2>${numbersHtml(sinceMs, null)}</div>` +
       (healthy || noVerdict ? `<div class="sec"><h2>Last incident</h2>${lastIncidentHtml()}</div>` : "") +
       runsListHtml(windowRuns(sinceMs, null), inc, "Runs in the last 24 hours") +
-      releasesHtml() + footHtml();
+      nightlyBriefHtml() + releasesHtml() + footHtml();
   }
   const inWindow = windowRuns(incidentStartMs(inc), inc.untilMs);
   if (!inWindow.some(measured) && !inWindow.some((r) => r.setup_death)) {
@@ -759,12 +764,12 @@ function briefHtml(link) {
     changedBeforeHtml(inc, inWindow) +
     beingDoneHtml(inc) +
     runsListHtml(inWindow, inc, "Runs in this window") +
-    releasesHtml() + footHtml();
+    nightlyBriefHtml() + releasesHtml() + footHtml();
 }
 
 function footHtml() {
   const generated = parseIso(brief.generated_at);
-  return `<div class="foot"><span>Every case by run: <a href="${PAGE.pages.grid}">grid</a></span><span>How reliable is each test: <a href="${PAGE.pages.cases}">cases</a></span><span><a href="${esc(numbersHref())}">The last 24 hours in numbers</a></span><span><a href="${PAGE.rulesUrl}">How the tags are decided</a></span><span class="mut">data generated ${esc(generated != null ? et(generated) : "unknown")}${brief.run_days ? ` · runs from the last ${esc(brief.run_days)} days` : ""}</span></div>`;
+  return `<div class="foot"><span>Every case by run: <a href="${PAGE.pages.grid}">grid</a></span><span>How reliable is each test: <a href="${PAGE.pages.cases}">cases</a></span><span>Last night's run: <a href="${PAGE.pages.nightly}">nightly</a></span><span><a href="${esc(numbersHref())}">The last 24 hours in numbers</a></span><span><a href="${PAGE.rulesUrl}">How the tags are decided</a></span><span class="mut">data generated ${esc(generated != null ? et(generated) : "unknown")}${brief.run_days ? ` · runs from the last ${esc(brief.run_days)} days` : ""}</span></div>`;
 }
 
 /* ---- the PR view ---- */
@@ -1189,6 +1194,144 @@ function detailHtml() {
     `<div class="links">${url ? `<a href="${esc(url)}">full transcript (rep 1)</a>` : ""}${log ? `<a href="${esc(log)}">build log</a>` : ""}<a href="${esc(runHref(run))}">this run's page</a><a href="${esc(caseHref(c.case))}">this case's history →</a></div></div>`;
 }
 
+/* ---- the Nightly report (SCHEMA.md: brief.json's nightly block) ---- */
+
+const nights = () => (brief.nightly && Array.isArray(brief.nightly.nights) ? brief.nightly.nights.filter((n) => n && typeof n === "object" && n.counts) : []);
+const nightHref = (night) => `${PAGE.pages.nightly}#build=${enc(night.build)}`;
+const nightStart = (night) => parseIso(night.started) ?? parseIso(night.finished);
+// The night's headline state, worst first: cut short, failed cases, partial
+// cases, nothing recorded or nothing graded, a pass short of the matrix
+// (cases lost to infra or never recorded), then clean. Green means every
+// expected case was graded and passed -- a quota storm that grades nothing
+// is not a pass. `word` is the pill on the page and the Brief, `short` the
+// chip in the other-nights list.
+function nightVerdict(night) {
+  const c = night.counts;
+  if (night.truncated) return { cls: "p-infra", word: `TRUNCATED · ${c.recorded} of ${c.expected || "?"} cases recorded`, short: "cut short" };
+  if (c.failed) return { cls: "p-fail", word: `${plural(c.failed, "case")} failed all reps`, short: `${c.failed} failed` };
+  if (c.partial) return { cls: "p-partial", word: `${plural(c.partial, "case")} failed some reps`, short: `${c.partial} partial` };
+  if (!c.recorded) return { cls: "p-infra", word: "no case recorded", short: "no cases" };
+  if (!c.passed) return { cls: "p-infra", word: `nothing graded · ${plural(c.infra, "case")} lost to infra`, short: "nothing graded" };
+  const gaps = [c.infra ? `${plural(c.infra, "case")} lost to infra` : "", c.missing ? `${c.missing} not recorded` : ""].filter(Boolean);
+  if (gaps.length) return { cls: "p-infra", word: `${c.passed} passed · ${gaps.join(" · ")}`, short: [c.infra ? `${c.infra} lost` : "", c.missing ? `${c.missing} missing` : ""].filter(Boolean).join(" · ") };
+  return { cls: "p-pass", word: "every case passed", short: "clean" };
+}
+function nightPill(night) {
+  const v = nightVerdict(night);
+  return `<span class="pill ${v.cls}">${esc(v.word)}</span>`;
+}
+// The night's date on the reader's clock: an 8 PM ET start is "the night of" that day.
+const nightDay = (night) => { const ms = nightStart(night); return ms != null ? fmtParts(ms, { weekday: "short", month: "short", day: "numeric" }) : "an unknown day"; };
+
+// A nightly build the collector listed with no finished.json yet
+// (brief.json's nightly.running): a night in flight, said in one line so
+// nobody reads "no night" while the job is still going.
+function runningNoteHtml() {
+  const running = brief.nightly && Array.isArray(brief.nightly.running) ? brief.nightly.running.filter((r) => r && typeof r === "object" && r.build != null) : [];
+  if (!running.length) return "";
+  const r = running[running.length - 1];
+  const seen = parseIso(r.first_seen);
+  return `<p class="mut">A night is running now: build ${r.log_url ? `<a href="${esc(r.log_url)}">${esc(r.build)}</a>` : `<code>${esc(r.build)}</code>`}, first seen ${esc(seen != null ? et(seen) : "at an unknown time")}. Its report is here once the collector records it.</p>`;
+}
+
+function nightlyBriefHtml() {
+  const list = nights();
+  const night = list[0];
+  let body;
+  if (!night) body = `<p class="mut">No night on record yet. Once <code>${esc(brief.nightly && brief.nightly.job || "the nightly periodic")}</code> has run, last night's report is here and one line of it goes into the 9 AM digest.</p>`;
+  else {
+    const c = night.counts;
+    const summary = night.truncated
+      ? `truncated after ${night.duration_s != null ? minutesText(night.duration_s * 1000) : "an unknown time"}: ${c.recorded} of ${c.expected || "?"} cases recorded`
+      : `${plural(c.recorded, "case")} · ${c.passed} passed all reps · ${c.partial} partial · ${c.failed} failed${c.infra ? ` · ${c.infra} infra` : ""}${night.newly_failing.length ? ` · newly failing: <code>${night.newly_failing.map(esc).join("</code>, <code>")}</code>` : ""}${night.duration_s != null ? ` · ${minutesText(night.duration_s * 1000)}` : ""}`;
+    body = `<p>${nightPill(night)} <b>${esc(nightDay(night))}</b> — ${summary}. <a href="${esc(nightHref(night))}">Read the report →</a></p>`;
+  }
+  return `<div class="sec" id="nightly"><h2>Last night's run</h2>${body}${runningNoteHtml()}</div>`;
+}
+
+function nightCaseRow(night, c, newly) {
+  const reps = c.reps || { pass: 0, fail: 0, infra: 0 };
+  const total = reps.pass + reps.fail + reps.infra;
+  const repText = c.state === "infra" ? `${plural(total, "rep")} lost` : `${reps.pass}/${reps.pass + reps.fail}${reps.infra ? ` (+${reps.infra} lost)` : ""}`;
+  const links = [c.transcript_url ? `<a href="${esc(c.transcript_url)}">transcript</a>` : "", `<a href="${esc(caseHref(c.case))}">history</a>`].filter(Boolean).join(" · ");
+  return `<tr class="${newly.has(c.case) ? "newly" : ""}"><td class="nm">${esc(c.case)}</td>` +
+    `<td><span class="pill ${PAGE.nightStateClass[c.state] || "p-infra"}" title="${esc(PAGE.nightStateWords[c.state] || c.state)}">${esc(c.state)}</span></td>` +
+    `<td class="num" title="repetitions passed / graded">${esc(repText)}</td>` +
+    `<td>${c.reason ? `<span class="rsn" title="${esc(c.reason)}">${esc(c.reason)}</span>` : `<span class="mut">—</span>`}</td>` +
+    `<td class="mut small">${links}</td></tr>`;
+}
+
+function nightCasesTable(night) {
+  const cases = Array.isArray(night.cases) ? night.cases.filter((c) => c && typeof c === "object") : [];
+  if (!cases.length) return `<p class="mut">This night recorded no case${night.truncated ? ": the job was ended before any case finished" : ""}.</p>`;
+  const newly = new Set(night.newly_failing || []);
+  const rows = [];
+  let domain = null;
+  for (const c of cases) {
+    if (c.domain !== domain) { domain = c.domain; rows.push(`<tr class="grp"><td colspan="5">${esc(domainWords(domain))}</td></tr>`); }
+    rows.push(nightCaseRow(night, c, newly));
+  }
+  return `<table class="rel night"><thead><tr><th>Case</th><th>State</th><th>Reps</th><th>Grader's reason</th><th></th></tr></thead><tbody>${rows.join("")}</tbody></table>`;
+}
+
+function nightChangesHtml(night) {
+  if (night.previous_build == null) return `<p class="mut">First night on record: nothing to compare with yet.</p>`;
+  const prev = nights().find((n) => String(n.build) === String(night.previous_build));
+  const prevText = prev ? `<a href="${esc(nightHref(prev))}">${esc(nightDay(prev))}</a>` : `the night before (build ${esc(night.previous_build)})`;
+  const list = (names) => `<code>${names.map(esc).join("</code>, <code>")}</code>`;
+  const parts = [];
+  parts.push(night.newly_failing.length ? `<p><b>Newly failing</b> against ${prevText}: ${list(night.newly_failing)} — failed every rep tonight and did not the night before.</p>` : `<p>Nothing newly failing against ${prevText}.</p>`);
+  if (night.fixed.length) parts.push(`<p><b>Passing again:</b> ${list(night.fixed)} — failed every rep the night before, passed every rep tonight.</p>`);
+  if (night.missing.length) parts.push(`<p><b>Not recorded</b> (${plural(night.missing.length, "case")} the nightly matrix on this checkout expects): ${list(night.missing)}.</p>`);
+  return parts.join("");
+}
+
+function nightsListHtml(current) {
+  const list = nights().slice(0, PAGE.nightsListed);
+  if (list.length < 2) return "";
+  const items = list.map((n) => {
+    const v = nightVerdict(n);
+    const label = `${esc(nightDay(n))}<span class="pill ${v.cls}">${esc(v.short)}</span>`;
+    return String(n.build) === String(current.build) ? `<span class="now">${label}</span>` : `<a href="${esc(nightHref(n))}">${label}</a>`;
+  });
+  return `<div class="sec"><h2>Other nights</h2><div class="nights">${items.join("")}</div><p class="mut small">The last ${plural(list.length, "night")} on record, newest first; the Cases page carries each case's nightly pass rate over 7 and 30 days.</p></div>`;
+}
+
+function nightlyHtml(link) {
+  const list = nights();
+  const job = brief.nightly && brief.nightly.job || "the nightly periodic";
+  if (!list.length) {
+    return `<div class="sec head"><h1>No night on record yet</h1><div class="lede">The nightly tier (<code>${esc(job)}</code>, every case against <code>main</code> once a night) has not been collected yet. When it has, this page is last night's report: every case with its state and the grader's reason, what is newly failing against the night before, and whether the night ran to the end.</div>${runningNoteHtml()}</div>` + footHtml();
+  }
+  const night = (link.build && list.find((n) => String(n.build) === link.build)) || list[0];
+  if (link.build && String(night.build) !== link.build) {
+    return `<div class="sec head"><h1>No night with build ${esc(link.build)} on record</h1><div class="lede">This page carries the last ${esc(PAGE.nightsListed)} nights. <a href="${PAGE.pages.nightly}">Last night's report →</a></div></div>` + footHtml();
+  }
+  const c = night.counts;
+  const startMs = nightStart(night), finishMs = parseIso(night.finished);
+  const isLast = String(night.build) === String(list[0].build);
+  const when = startMs != null ? (finishMs != null ? etSpan(startMs, finishMs) : et(startMs)) : "unknown time";
+  const took = night.duration_s != null ? minutesText(night.duration_s * 1000) : "unknown wall clock";
+  let ledeHow;
+  if (night.truncated) ledeHow = `<b>The night was cut short:</b> Prow ended the job after ${esc(took)} with ${c.recorded} of ${c.expected || "?"} cases recorded, so the counts below are not comparable with a full night.`;
+  else if (!night.complete) ledeHow = `<b>Incomplete:</b> the job concluded after ${esc(took)} but recorded ${c.recorded} of the ${c.expected} cases the nightly matrix on this checkout expects.`;
+  else ledeHow = `The job ran to the end in ${esc(took)}: ${c.recorded} cases recorded${c.expected ? ` of ${c.expected} expected` : ""}.`;
+  const head = `<div class="sec head">${nightPill(night)}<h1>${isLast ? "Last night's run" : `Night of ${esc(nightDay(night))}`}</h1>` +
+    `<div class="lede">${esc(when)} · <code>${esc(job)}</code>${night.head_sha ? ` at <code>${esc(night.head_sha)}</code>` : ""}${night.project ? ` · project ${esc(projectShort(night.project))}` : ""}${night.log_url ? ` · <a href="${esc(night.log_url)}">build log and artifacts</a>` : ""}</div>` +
+    `<div class="lede">${ledeHow}</div>${isLast ? runningNoteHtml() : ""}</div>`;
+  const tiles = `<div class="sec"><h2>In numbers</h2><div class="tiles">` +
+    tile("Cases", `${c.recorded}`, c.expected ? `of ${c.expected} in the nightly matrix` : "recorded") +
+    tile("Passed all reps", `${c.passed}`, c.recorded ? `${pct(c.passed / c.recorded)} of recorded cases` : "no case recorded") +
+    tile("Partial", `${c.partial}`, "failed some repetitions") +
+    tile("Failed", `${c.failed}`, `failed every graded rep · ${plural(c.infra, "case")} lost to infra`) +
+    tile("Newly failing", `${night.previous_build == null ? "—" : night.newly_failing.length}`, night.previous_build == null ? "first night on record" : "against the night before") +
+    `</div></div>`;
+  return head + tiles +
+    `<div class="sec"><h2>Against the night before</h2>${nightChangesHtml(night)}</div>` +
+    `<div class="sec"><h2>Every case, by domain</h2>${nightCasesTable(night)}<p class="mut small">States: pass = every graded rep passed · partial = some reps failed · fail = every graded rep failed · infra = nothing graded (quota or setup losses, never counted against a case). Reps read passed / graded. The transcript is the first repetition's.</p></div>` +
+    nightsListHtml(night) + footHtml();
+}
+
 /* ---- clicks on the Grid and the Cases page ---- */
 
 function onClick(event) {
@@ -1227,7 +1370,7 @@ function renderFreshness() {
   el.className = stale ? "fresh stale" : "fresh";
 }
 
-const renderers = { brief: briefHtml, run: runHtml, grid: gridHtml, cases: casesHtml };
+const renderers = { brief: briefHtml, run: runHtml, grid: gridHtml, cases: casesHtml, nightly: nightlyHtml };
 
 // `scroll` is true for a navigation (boot, a hash change): the page then
 // scrolls to the `view=` section or the `#<case>` row it just rendered. The

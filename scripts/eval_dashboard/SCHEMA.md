@@ -21,6 +21,7 @@ only — anything that renames, removes or re-types a field bumps
       "started": "<iso8601>",
       "finished": "<iso8601>",
       "result": "SUCCESS|FAILURE|ABORTED",
+      "eval_verdict": "GREEN|RED|null",
       "duration_s": 5793,
       "tasks": [
         {
@@ -99,6 +100,13 @@ the same layout and is collected from the moment it starts running.
   ISO 8601 UTC; `null` when unparseable.
 - `result` — `finished.json`'s `result` verbatim: `SUCCESS`, `FAILURE` or
   `ABORTED`. This is the Prow job verdict, not the eval verdict.
+- `eval_verdict` — **optional, additive**: the eval loop's own verdict, from
+  the final `PR Smoke Test Evaluation Succeeded/Failed` line: `GREEN` or
+  `RED`. `null` when the log has no such line — the job ended before its
+  verdict: Prow's deadline (it delivers SIGTERM and records `FAILURE`, not
+  `ABORTED`; build 2092688354838581248 below is one), a death before the
+  cases, or step 0's revalidation (a `SUCCESS`). A record written before
+  the field existed has no key: unknown, which is not `null`.
 - `duration_s` — the `Total Duration` of the final
   `PR Smoke Test Evaluation Succeeded/Failed` line (eval loop only). A
   truncated log has no verdict line — and neither does a `SUCCESS` build that
@@ -333,6 +341,9 @@ what the renderer does with them.
   are excluded from every pass-fraction denominator, exactly like `infra`
   task results. When `reps` is absent the task's single `result` stands in
   for one rep.
+- `runs[].eval_verdict` — `GREEN` | `RED` | `null`: the Nightly report reads
+  it; a night that is not a `SUCCESS` and carries `null` was ended before
+  its verdict and is reported as truncated. Absent means unknown.
 - `runs[].has_build_log`, `runs[].pod_*` — a zero-task `FAILURE` with
   `pod_last_event: "NodeNotReady"` or `has_build_log: false` is a **lost
   pod**: `classify.py` gives it its own run-level headline (`infra`, never
@@ -441,16 +452,17 @@ what the renderer does with them.
 
 ## The rendered pages
 
-`render.py` writes four pages beside `data.json`. Every time shown is
+`render.py` writes five pages beside `data.json`. Every time shown is
 America/Toronto ("ET"), formatted in the browser with
 `Intl.DateTimeFormat`; URL parameters stay ISO 8601 UTC.
 
-| Page         | What it is                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `index.html` | **The Brief**: the gate's state and why, what the agent saw, what changed right before, what is being done, the runs in the window with a "See it in the grid" link, and the last release-candidate eval runs (`releases[]`). Healthy: the last 24 hours in numbers and the last incident.                                                                                                                                                                                                                                                  |
-| `run.html`   | **The PR view**, `run.html#build=<prow build id>`: one run, each failed gate case tagged `failing on N other PRs` / `only your PR` / `quota storm` / `unexplained` with its check reason, 30-day pass rate, transcript link, a link to its row on the Cases page and a one-line Do; a "what to do" box.                                                                                                                                                                                                                                     |
-| `grid.html`  | **The Grid**: one row per case (blocking cases by domain, then the held-out ones, folded away when they passed everything in the window), one column per presubmit run in a window of 6 h, 24 h, 36 h or 7 days (header: PR # and ET start; a green run that recorded no cases gets no column); cells passed / failed all reps / failed some / quota-infra / died before the cases / still running (`pending_builds`); merges to main and incident starts and ends marked between the columns; a cell opens that run's detail for the case. |
-| `cases.html` | **The Cases page** ("How reliable is each test?"): one row per case by domain — its last `STRIP_RUNS` presubmit outcomes, pass rate over reps at 7 and 30 days for the presubmit and the nightly apart (`—` when a tier has no graded run), its roster status (blocking / held out / demoted with its date / nightly only / not in any matrix), its last failure with the grader's reason, and its issues from `case-notes.yaml`.                                                                                                           |
+| Page           | What it is                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `index.html`   | **The Brief**: the gate's state and why, what the agent saw, what changed right before, what is being done, the runs in the window with a "See it in the grid" link, and the last release-candidate eval runs (`releases[]`). Healthy: the last 24 hours in numbers and the last incident.                                                                                                                                                                                                                                                  |
+| `run.html`     | **The PR view**, `run.html#build=<prow build id>`: one run, each failed gate case tagged `failing on N other PRs` / `only your PR` / `quota storm` / `unexplained` with its check reason, 30-day pass rate, transcript link, a link to its row on the Cases page and a one-line Do; a "what to do" box.                                                                                                                                                                                                                                     |
+| `grid.html`    | **The Grid**: one row per case (blocking cases by domain, then the held-out ones, folded away when they passed everything in the window), one column per presubmit run in a window of 6 h, 24 h, 36 h or 7 days (header: PR # and ET start; a green run that recorded no cases gets no column); cells passed / failed all reps / failed some / quota-infra / died before the cases / still running (`pending_builds`); merges to main and incident starts and ends marked between the columns; a cell opens that run's detail for the case. |
+| `cases.html`   | **The Cases page** ("How reliable is each test?"): one row per case by domain — its last `STRIP_RUNS` presubmit outcomes, pass rate over reps at 7 and 30 days for the presubmit and the nightly apart (`—` when a tier has no graded run), its roster status (blocking / held out / demoted with its date / nightly only / not in any matrix), its last failure with the grader's reason, and its issues from `case-notes.yaml`.                                                                                                           |
+| `nightly.html` | **The Nightly report**: last night's run of the nightly tier (or the night `#build=` names) — its wall clock and whether it ran to the end, the counts (passed all reps / partial / failed / infra), what is newly failing against the night before and what passes again, every case by domain with its state, reps, the grader's reason and a transcript link, and the other nights on record. The Brief's "Last night's run" block and the 9 AM Chat digest link here. `nightly.py` derives it.                                          |
 
 The pages render in the browser from `brief.json` (below),
 which `render.py` inlines into each page as
@@ -478,6 +490,7 @@ the question imports it.
 `run.html#build=<prow build id>`
 `grid.html#since=<ISO 8601 UTC>&until=<ISO 8601 UTC>&cases=a,b[&window=6h|24h|36h|7d][&rows=all|admitted|failing]`
 `cases.html#<case id>`, or `cases.html#sort=worst|domain|name&show=all|blocking|held`
+`nightly.html[#build=<prow build id>]`
 
 Every parameter travels in the URL fragment as `key=value` pairs joined
 by `&`. `storage.cloud.google.com` answers an unauthenticated request with
@@ -493,8 +506,8 @@ local render); a key present in both places is read from the query.
 `linkState()` in `template/pages.js` is the one parser;
 `post_health.dashboard_link` / `run_link` (Python: the Chat messages, the
 gate comment, the tracking issue) and `briefHref` / `gridHref` / `runHref`
-/ `caseHref` (the pages' own links; `incidentHref` and `numbersHref` wrap
-the first) are the writers. A writer omits an empty parameter.
+/ `caseHref` / `nightHref` (the pages' own links; `incidentHref` and
+`numbersHref` wrap the first) are the writers. A writer omits an empty parameter.
 
 - `cases`, `since`, `until` scope the Brief to that incident (a past one
   when `until` is given). `since` is matched to an incident in
@@ -515,6 +528,9 @@ the first) are the writers. A writer omits an empty parameter.
   grammar and the `Z` form need none).
 - `run.html#build=<digits>`; an id not in `brief.json` shows a
   not-found page naming the window (`RUN_VIEW_DAYS`, 14 days).
+- `nightly.html#build=<digits>` opens that night instead of the newest;
+  an id not among the `nightly.nights[]` on record says so and links
+  last night's.
 - `window`, `rows`, `sort` and `show` are the Grid's and the Cases page's
   chips as parameters; a value outside the vocabulary is the default.
 
@@ -522,7 +538,7 @@ the first) are the writers. A writer omits an empty parameter.
 
 `{schema_version, generated_at, stale_after_s, run_days, rate_windows_days,
 strip_runs, admitted[], health, history, merges, catches, cases{}, runs[],
-pending[], releases[]}`. `runs[]` is the **presubmit's** last `run_days` of
+pending[], releases[], nightly{}}`. `runs[]` is the **presubmit's** last `run_days` of
 `data.json`, oldest first — a nightly run is nobody's pull request and is
 not listed — each carrying its identity and timing plus
 `classify.classify_run(...)`: `verdict` (`red` = looks like the PR, `green`,
@@ -568,6 +584,37 @@ the current verdict, `history` the ticks and the incidents derived from
 them, `merges` the recent first-parent commits of the checkout (`null`
 when the checkout is shallow or has no git; the Brief then omits "what
 changed right before" and the Grid its merge markers).
+
+`nightly` is `{job, nights[], running[]}` from `nightly.py`: `job` the
+periodic's name as the newest nightly run carries it (the default when none
+is on record),
+`nights[]` the last `NIGHTS_ON_RECORD` (14) nightly runs **newest first**,
+each `{build, job, head_sha, project, started, finished, duration_s, result,
+log_url, truncated, complete, counts{expected, recorded, passed, partial,
+failed, infra, missing}, missing[], newly_failing[], fixed[],
+previous_build, cases[]}`. `cases[]` is every task row the night measured,
+sorted by domain then name, as `{case, domain, state, reps{pass, fail,
+infra}, reason, transcript_url}` with `state` in `pass|partial|fail|infra`
+by the strip's rule over the task's reps (no `reps` key: the task's result
+is one rep) and `reason` the first failing rep's grader text (`null` on a
+pass). `expected` counts the cases `nightly_active` on this checkout;
+`missing[]` names the expected cases the night did not record.
+`truncated` is a night Prow ended before its verdict: `result == "ABORTED"`
+(an interrupt), or any other non-`SUCCESS` result with `eval_verdict`
+`null` — the periodic's deadline arrives as SIGTERM and Prow records
+`FAILURE`, so `ABORTED` alone would miss it; a record without the field
+is unknown, not truncated. `complete` is neither truncated nor missing
+anything. `newly_failing`
+is every `fail` tonight that was not `fail` on `previous_build`, the night
+before it on record (the one past the window included), `fixed` every
+`fail` then that is `pass` now; both `[]` on the first night, when
+`previous_build` is `null`. `log_url` and `transcript_url` point at
+Spyglass under `logs/<job>/<build>`, a periodic's path. The nights are
+never in `runs[]`. `running[]` is the nightly's entries of `pending_builds`
+first seen inside `RUNNING_MAX_AGE` (9 hours: the periodic's 8-hour budget
+and Prow's time to write `finished.json`) of `generated_at`, oldest first,
+each `{build, first_seen, log_url}` — a night in flight, which the Brief's
+block, the report page and the digest say instead of "no night".
 
 ### `health.json` and `health-history.jsonl` (optional inputs)
 

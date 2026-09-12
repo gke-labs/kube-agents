@@ -7,7 +7,7 @@ Usage::
         [--health health.json] [--health-history health-history.jsonl] \\
         [--public-url [BASE]]
 
-writes four pages and two data files into ``out/``:
+writes five pages and two data files into ``out/``:
 
 * ``index.html`` -- **the Brief**: what state the smoke gate is in, why the
   bot thinks so, what the agent saw, what changed right before, what is
@@ -26,9 +26,15 @@ writes four pages and two data files into ``out/``:
 * ``cases.html`` -- **the Cases page**: one row per case with its last
   ``STRIP_RUNS`` presubmit outcomes, its 7- and 30-day pass rates per tier,
   its roster status and its last failure; ``#<case>`` lands on the row.
-* ``brief.json`` -- what the four pages render from: the per-run
+* ``nightly.html[#build=<prow build id>]`` -- **the Nightly report**: last
+  night's run of the nightly tier (or the night ``build`` names), its cases
+  by domain with pass / partial / fail and the grader's reason, what is
+  newly failing against the night before, the wall clock and whether the
+  night was cut short (``nightly.py``).
+* ``brief.json`` -- what the five pages render from: the per-run
   classification, the per-case record, the current health verdict, the
-  incident history, the recent merges and the release-candidate runs.
+  incident history, the recent merges, the release-candidate runs and the
+  nights on record.
   ``data.json`` is copied verbatim beside it.
 
 Every page is rendered in the browser (``template/page.html.tmpl`` +
@@ -86,10 +92,11 @@ import sys
 import yaml
 
 try:
-    from . import classify, post_health, tiers
+    from . import classify, nightly, post_health, tiers
 except ImportError:  # run as a script: python3 scripts/eval_dashboard/render.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     import classify
+    import nightly
     import post_health
     import tiers
 
@@ -99,12 +106,13 @@ PAGES_JS = HERE / "template" / "pages.js"
 DEFAULT_NOTES = HERE / "case-notes.yaml"
 DEFAULT_EVENTS = HERE / "events.yaml"
 
-# --- the four pages and their data ----------------------------------------
+# --- the five pages and their data ----------------------------------------
 BRIEF_PAGE = "index.html"
 # The file post_health.run_link points at; one name for it.
 RUN_PAGE = post_health.DASHBOARD_RUN_PAGE
 GRID_PAGE = "grid.html"
 CASES_PAGE = "cases.html"
+NIGHTLY_PAGE = nightly.NIGHTLY_PAGE
 BRIEF_JSON = "brief.json"
 # Per page: the file and the <title>. The PR view has no tab of its own on
 # the other pages; it appears only when opened.
@@ -113,6 +121,7 @@ PAGES = {
     "run": {"file": RUN_PAGE, "title": "kube-agents · smoke run"},
     "grid": {"file": GRID_PAGE, "title": "kube-agents · cases by run"},
     "cases": {"file": CASES_PAGE, "title": "kube-agents · how reliable is each test"},
+    "nightly": {"file": NIGHTLY_PAGE, "title": "kube-agents · last night's run"},
 }
 # The object names the pages poll beside their own; the adjudicator job
 # writes both (health-history.jsonl is appended one line per tick).
@@ -993,6 +1002,7 @@ def brief_document(data: dict, health: dict | None, history: list[dict] | None, 
         "runs": out_runs,
         "pending": pending_builds(data),
         "releases": [compact_release(r) for r in sorted_releases(data)],
+        "nightly": nightly.nightly_document(data),
     }
 
 
@@ -1001,7 +1011,7 @@ def brief_document(data: dict, health: dict | None, history: list[dict] | None, 
 
 
 def render_page(page: str, brief: dict, data: dict, public_url: str | None = None) -> str:
-    """One of the four pages from the shared template, with brief.json (and
+    """One of the five pages from the shared template, with brief.json (and
     the health verdict, when there is one) inlined as JSON data elements and
     pages.js after them. ``page`` is a PAGES key."""
     template = PAGE_TEMPLATE.read_text()
@@ -1011,6 +1021,7 @@ def render_page(page: str, brief: dict, data: dict, public_url: str | None = Non
         "__NAV_BRIEF__": 'class="on"' if page == "brief" else "",
         "__NAV_GRID__": 'class="on"' if page == "grid" else "",
         "__NAV_CASES__": 'class="on"' if page == "cases" else "",
+        "__NAV_NIGHTLY__": 'class="on"' if page == "nightly" else "",
         # The PR view is a tab only while it is the page being read.
         "__NAV_RUN__": f'<a href="{RUN_PAGE}" class="on">PR view</a>' if page == "run" else "",
         "__BASE__": base_html(public_url),
