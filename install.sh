@@ -1256,6 +1256,64 @@ verify_local_source_ref() {
   print_success "Verified install sources and image ref resolve to commit ${expected_commit}."
 }
 
+# Fetch one ref from KUBE_AGENTS_REPO_URL into an existing clone, leaving it in
+# FETCH_HEAD. A 40-hex ref is fetched by object name; anything else is a release
+# tag, fetched under its own name so verify_local_source_ref can resolve it.
+fetch_source_ref() {
+  local repo_dir="$1"
+  local expected_ref="$2"
+  if [[ "$expected_ref" =~ ^[0-9a-fA-F]{40}$ ]]; then
+    git -C "$repo_dir" fetch --depth=1 "$KUBE_AGENTS_REPO_URL" "$expected_ref"
+  else
+    git -C "$repo_dir" fetch --depth=1 "$KUBE_AGENTS_REPO_URL" "+refs/tags/${expected_ref}:refs/tags/${expected_ref}"
+  fi
+}
+
+# Move a clone left by an earlier install (or a plain `git clone`) to the
+# requested ref. Only the curl | bash path calls this: the two arms that run
+# install.sh from a checkout never move it. A clean worktree whose HEAD is not
+# already the ref is fetched and detached at it, a branch it was on (main, say)
+# being left behind. Every other case prints which one applied and returns 0 so
+# verify_local_source_ref, which runs next, reports it in its own words: a dirty
+# tree, a directory that is not a Git worktree, or a fetch or checkout that
+# fails (offline, a tag that does not exist).
+refresh_existing_clone() {
+  local repo_dir="$1"
+  local expected_ref="$2"
+  local head_commit="" expected_commit="" head_branch=""
+  if ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    print_info "Using existing repository at $repo_dir as-is: it is not a Git worktree."
+    return 0
+  fi
+  if [ -n "$(git -C "$repo_dir" status --porcelain --untracked-files=no)" ]; then
+    print_info "Using existing repository at $repo_dir without modifying local changes: the checkout is dirty, so '$expected_ref' was not fetched into it."
+    return 0
+  fi
+  if ! head_commit="$(git -C "$repo_dir" rev-parse --verify HEAD 2>/dev/null)"; then
+    print_info "Using existing repository at $repo_dir as-is: it has no commit checked out."
+    return 0
+  fi
+  if expected_commit="$(git -C "$repo_dir" rev-parse --verify "${expected_ref}^{commit}" 2>/dev/null)" && [ "$head_commit" = "$expected_commit" ]; then
+    print_info "Using existing repository at $repo_dir: already at '$expected_ref' ($head_commit)."
+    return 0
+  fi
+  head_branch="$(git -C "$repo_dir" symbolic-ref --short -q HEAD || true)"
+  print_info "Using existing repository at $repo_dir: fetching '$expected_ref' from $KUBE_AGENTS_REPO_URL..."
+  if ! fetch_source_ref "$repo_dir" "$expected_ref"; then
+    print_warning "Could not fetch '$expected_ref' into $repo_dir; the checkout stays at $head_commit."
+    return 0
+  fi
+  if ! git -C "$repo_dir" checkout --detach FETCH_HEAD; then
+    print_warning "Could not check out '$expected_ref' in $repo_dir; the checkout stays at $head_commit."
+    return 0
+  fi
+  if [ -n "$head_branch" ]; then
+    print_info "Moved $repo_dir from branch '$head_branch' ($head_commit) to '$expected_ref' (detached HEAD). The branch is left where it was; 'git checkout $head_branch' returns to it."
+  else
+    print_info "Moved $repo_dir from $head_commit to '$expected_ref' (detached HEAD). 'git checkout $head_commit' returns to the previous revision."
+  fi
+}
+
 # Put the install sources on disk and return the directory holding them.
 # Runs before the interview so a bad source ref or a dirty tree fails immediately,
 # and so installer_common.sh — which owns every installer default — can be sourced.
@@ -1276,15 +1334,11 @@ acquire_source_repo() {
   else
     resolved_dir="$(kube_agents_clone_dir)"
     if [ -d "$resolved_dir" ]; then
-      print_info "Using existing repository at $resolved_dir without modifying local changes."
+      refresh_existing_clone "$resolved_dir" "$expected_ref"
     else
       print_info "Cloning kube-agents install sources at '$expected_ref' into $resolved_dir..."
       git clone --filter=blob:none --no-checkout "$KUBE_AGENTS_REPO_URL" "$resolved_dir"
-      if [[ "$expected_ref" =~ ^[0-9a-fA-F]{40}$ ]]; then
-        git -C "$resolved_dir" fetch --depth=1 "$KUBE_AGENTS_REPO_URL" "$expected_ref"
-      else
-        git -C "$resolved_dir" fetch --depth=1 "$KUBE_AGENTS_REPO_URL" "+refs/tags/${expected_ref}:refs/tags/${expected_ref}"
-      fi
+      fetch_source_ref "$resolved_dir" "$expected_ref"
       git -C "$resolved_dir" checkout --detach FETCH_HEAD
     fi
     cd "$resolved_dir"

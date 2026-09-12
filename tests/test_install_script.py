@@ -122,86 +122,174 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn(f"DIR={_REPO_ROOT}", proc.stdout)
 
+    def _existing_clone_fixture(self, checked_out_tag):
+        """Build the curl | bash situation: a clone of an earlier release under HOME.
+
+        A bare "upstream" repository holds tags 0.2.0 and 0.3.0. HOME/kube-agents
+        is cloned from it while only 0.2.0 exists, so a clone at 0.2.0 has never
+        seen 0.3.0, the way a clone from an earlier install has never seen the
+        next release; 0.3.0 is then pushed to the bare repository. The clone is
+        left detached at `checked_out_tag`. Returns (home_dir, clone_dir,
+        upstream_url, {tag: commit}).
+        """
+        temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(temp_dir.cleanup)
+        base = pathlib.Path(temp_dir.name)
+        work_dir = base / "work"
+        bare_dir = base / "upstream.git"
+        home_dir = base / "home"
+        clone_dir = home_dir / "kube-agents"
+        home_dir.mkdir()
+
+        def git(*args, cwd):
+            return subprocess.run(
+                ["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True
+            ).stdout.strip()
+
+        work_dir.mkdir()
+        git("init", "-b", "main", cwd=work_dir)
+        git("config", "user.name", "Test", cwd=work_dir)
+        git("config", "user.email", "test@example.com", cwd=work_dir)
+        git("config", "commit.gpgsign", "false", cwd=work_dir)
+        (work_dir / "file.txt").write_text("release 0.2.0\n")
+        git("add", "file.txt", cwd=work_dir)
+        git("commit", "-m", "release 0.2.0", cwd=work_dir)
+        git("tag", "0.2.0", cwd=work_dir)
+        git("clone", "--bare", "--quiet", str(work_dir), str(bare_dir), cwd=base)
+        upstream_url = bare_dir.as_uri()
+        git("clone", "--quiet", upstream_url, str(clone_dir), cwd=base)
+
+        (work_dir / "file.txt").write_text("release 0.3.0\n")
+        git("commit", "-am", "release 0.3.0", cwd=work_dir)
+        git("tag", "0.3.0", cwd=work_dir)
+        git("push", "--quiet", upstream_url, "main", "--tags", cwd=work_dir)
+        commits = {tag: git("rev-parse", f"{tag}^{{commit}}", cwd=work_dir) for tag in ("0.2.0", "0.3.0")}
+
+        if checked_out_tag == "0.3.0":
+            git("fetch", "--quiet", upstream_url, "+refs/tags/0.3.0:refs/tags/0.3.0", cwd=clone_dir)
+        git("checkout", "--quiet", "--detach", checked_out_tag, cwd=clone_dir)
+        return home_dir, clone_dir, upstream_url, commits
+
+    def _acquire_from_outside(self, home_dir, upstream_url, requested_ref):
+        """Run acquire_source_repo with install.sh copied outside any checkout.
+
+        Neither the script's directory nor the working directory holds
+        scripts/installer/, so acquire_source_repo takes the clone arm and
+        looks under HOME. KUBE_AGENTS_REPO_URL is overridden after sourcing,
+        because install.sh assigns it unconditionally.
+        """
+        outside_dir = home_dir.parent / "outside"
+        outside_dir.mkdir(exist_ok=True)
+        isolated_install_sh = outside_dir / "install.sh"
+        isolated_install_sh.write_text(_INSTALL_SH.read_text())
+        setup = f"""
+KUBE_AGENTS_SOURCE_ONLY=true source "{isolated_install_sh}"
+KUBE_AGENTS_REPO_URL="{upstream_url}"
+out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_dir"
+"""
+        return subprocess.run(
+            ["bash", "-c", setup],
+            capture_output=True,
+            text=True,
+            env={"HOME": str(home_dir), "PATH": os.environ["PATH"]},
+            cwd=str(outside_dir),
+        )
+
+    @staticmethod
+    def _head_of(clone_dir):
+        return subprocess.run(
+            ["git", "-C", str(clone_dir), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+        ).stdout.strip()
+
     def test_acquire_source_repo_refuses_to_mutate_dirty_existing_repo(self):
-        """Verifies acquire_source_repo uses existing HOME/kube-agents and verify_local_source_ref rejects dirty checkout."""
-        temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        try:
-            home_dir = pathlib.Path(temp_dir.name) / "home"
-            repo_dir = home_dir / "kube-agents"
-            repo_dir.mkdir(parents=True, exist_ok=True)
-            subprocess.run(["git", "init"], cwd=str(repo_dir), check=True, capture_output=True)
-            subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo_dir), check=True)
-            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo_dir), check=True)
-            (repo_dir / "file.txt").write_text("initial\n")
-            subprocess.run(["git", "add", "file.txt"], cwd=str(repo_dir), check=True)
-            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo_dir), check=True)
-            subprocess.run(["git", "tag", "0.2.0"], cwd=str(repo_dir), check=True)
+        """A dirty clone already at the ref is left alone and verify_local_source_ref rejects it."""
+        home_dir, clone_dir, upstream_url, commits = self._existing_clone_fixture("0.2.0")
+        (clone_dir / "file.txt").write_text("dirty changes\n")
 
-            # Make working tree dirty
-            (repo_dir / "file.txt").write_text("dirty changes\n")
+        proc = self._acquire_from_outside(home_dir, upstream_url, "0.2.0")
 
-            outside_dir = pathlib.Path(temp_dir.name) / "outside"
-            outside_dir.mkdir()
-            isolated_install_sh = outside_dir / "install.sh"
-            isolated_install_sh.write_text(_INSTALL_SH.read_text())
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("Using existing repository", proc.stdout)
+        self.assertIn("without modifying local changes", proc.stdout)
+        self.assertIn("dirty checkout", proc.stdout)
+        self.assertIn("--allow-unverified-source", proc.stdout)
+        self.assertEqual(self._head_of(clone_dir), commits["0.2.0"])
+        self.assertEqual((clone_dir / "file.txt").read_text(), "dirty changes\n")
 
-            cmd = 'out_dir=""; acquire_source_repo out_dir "0.2.0"'
-            setup = f"""
-KUBE_AGENTS_SOURCE_ONLY=true source "{isolated_install_sh}"
-{cmd}
-"""
-            proc = subprocess.run(
-                ["bash", "-c", setup],
-                capture_output=True,
-                text=True,
-                env={"HOME": str(home_dir), "PATH": os.environ["PATH"]},
-                cwd=str(outside_dir),
-            )
-            self.assertNotEqual(proc.returncode, 0)
-            self.assertIn("Using existing repository", proc.stdout)
-            self.assertIn("without modifying local changes", proc.stdout)
-            self.assertIn("dirty checkout", proc.stdout)
-        finally:
-            temp_dir.cleanup()
+    def test_acquire_source_repo_uses_clean_existing_repo_already_at_the_ref(self):
+        """A clean clone already at the requested ref is used as-is, with no fetch."""
+        home_dir, clone_dir, upstream_url, commits = self._existing_clone_fixture("0.3.0")
 
-    def test_acquire_source_repo_uses_clean_existing_repo_without_modifying_changes(self):
-        """Verifies acquire_source_repo uses clean existing HOME/kube-agents without mutating branch/checkout."""
-        temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        try:
-            home_dir = pathlib.Path(temp_dir.name) / "home"
-            repo_dir = home_dir / "kube-agents"
-            repo_dir.mkdir(parents=True, exist_ok=True)
-            subprocess.run(["git", "init"], cwd=str(repo_dir), check=True, capture_output=True)
-            subprocess.run(["git", "config", "user.name", "Test"], cwd=str(repo_dir), check=True)
-            subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo_dir), check=True)
-            (repo_dir / "file.txt").write_text("initial\n")
-            subprocess.run(["git", "add", "file.txt"], cwd=str(repo_dir), check=True)
-            subprocess.run(["git", "commit", "-m", "init"], cwd=str(repo_dir), check=True)
-            subprocess.run(["git", "tag", "0.2.0"], cwd=str(repo_dir), check=True)
+        proc = self._acquire_from_outside(home_dir, upstream_url, "0.3.0")
 
-            outside_dir = pathlib.Path(temp_dir.name) / "outside"
-            outside_dir.mkdir()
-            isolated_install_sh = outside_dir / "install.sh"
-            isolated_install_sh.write_text(_INSTALL_SH.read_text())
+        self.assertEqual(proc.returncode, 0, f"Failed: {proc.stdout}\n{proc.stderr}")
+        self.assertIn("Using existing repository", proc.stdout)
+        self.assertIn("already at '0.3.0'", proc.stdout)
+        self.assertNotIn("fetching", proc.stdout)
+        self.assertNotIn("Moved", proc.stdout)
+        self.assertIn(f"RESOLVED={clone_dir}", proc.stdout)
+        self.assertEqual(self._head_of(clone_dir), commits["0.3.0"])
 
-            cmd = 'out_dir=""; acquire_source_repo out_dir "0.2.0"; echo "RESOLVED=$out_dir"'
-            setup = f"""
-KUBE_AGENTS_SOURCE_ONLY=true source "{isolated_install_sh}"
-{cmd}
-"""
-            proc = subprocess.run(
-                ["bash", "-c", setup],
-                capture_output=True,
-                text=True,
-                env={"HOME": str(home_dir), "PATH": os.environ["PATH"]},
-                cwd=str(outside_dir),
-            )
-            self.assertEqual(proc.returncode, 0, f"Failed: {proc.stderr}")
-            self.assertIn("Using existing repository", proc.stdout)
-            self.assertIn("without modifying local changes", proc.stdout)
-            self.assertIn(f"RESOLVED={repo_dir}", proc.stdout)
-        finally:
-            temp_dir.cleanup()
+    def test_acquire_source_repo_moves_clean_existing_repo_to_the_requested_ref(self):
+        """A clean clone at an earlier release is fetched and detached at the requested tag."""
+        home_dir, clone_dir, upstream_url, commits = self._existing_clone_fixture("0.2.0")
+
+        proc = self._acquire_from_outside(home_dir, upstream_url, "0.3.0")
+
+        self.assertEqual(proc.returncode, 0, f"Failed: {proc.stdout}\n{proc.stderr}")
+        self.assertIn("Using existing repository", proc.stdout)
+        self.assertIn("fetching '0.3.0'", proc.stdout)
+        self.assertIn(f"Moved {clone_dir} from {commits['0.2.0']} to '0.3.0'", proc.stdout)
+        self.assertIn(f"Verified install sources and image ref resolve to commit {commits['0.3.0']}", proc.stdout)
+        self.assertIn(f"RESOLVED={clone_dir}", proc.stdout)
+        self.assertEqual(self._head_of(clone_dir), commits["0.3.0"])
+        self.assertEqual((clone_dir / "file.txt").read_text(), "release 0.3.0\n")
+
+    def test_acquire_source_repo_names_the_branch_it_leaves_behind(self):
+        """A clean clone on a branch is moved to the detached tag and the message names the branch."""
+        home_dir, clone_dir, upstream_url, commits = self._existing_clone_fixture("0.2.0")
+        subprocess.run(["git", "-C", str(clone_dir), "checkout", "--quiet", "main"], check=True)
+
+        proc = self._acquire_from_outside(home_dir, upstream_url, "0.3.0")
+
+        self.assertEqual(proc.returncode, 0, f"Failed: {proc.stdout}\n{proc.stderr}")
+        self.assertIn(f"from branch 'main' ({commits['0.2.0']}) to '0.3.0' (detached HEAD)", proc.stdout)
+        self.assertEqual(self._head_of(clone_dir), commits["0.3.0"])
+        branch_head = subprocess.run(
+            ["git", "-C", str(clone_dir), "rev-parse", "main"], check=True, capture_output=True, text=True
+        ).stdout.strip()
+        self.assertEqual(branch_head, commits["0.2.0"])
+
+    def test_acquire_source_repo_leaves_a_dirty_existing_repo_at_an_older_ref_alone(self):
+        """A dirty clone at an earlier release is neither fetched nor moved, and the run stops."""
+        home_dir, clone_dir, upstream_url, commits = self._existing_clone_fixture("0.2.0")
+        (clone_dir / "file.txt").write_text("dirty changes\n")
+
+        proc = self._acquire_from_outside(home_dir, upstream_url, "0.3.0")
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("the checkout is dirty, so '0.3.0' was not fetched", proc.stdout)
+        self.assertNotIn("Moved", proc.stdout)
+        # verify_local_source_ref checks for the ref before it checks for a clean
+        # tree, so the refusal names the missing ref; the opt-out hint is the same.
+        self.assertIn("'0.3.0' is not present in the current checkout", proc.stdout)
+        self.assertIn("--allow-unverified-source", proc.stdout)
+        self.assertEqual(self._head_of(clone_dir), commits["0.2.0"])
+        self.assertEqual((clone_dir / "file.txt").read_text(), "dirty changes\n")
+
+    def test_acquire_source_repo_falls_through_when_the_ref_cannot_be_fetched(self):
+        """A ref the upstream lacks leaves the clone where it was and the existing error names it."""
+        home_dir, clone_dir, upstream_url, commits = self._existing_clone_fixture("0.2.0")
+
+        proc = self._acquire_from_outside(home_dir, upstream_url, "9.9.9")
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("fetching '9.9.9'", proc.stdout)
+        self.assertIn(f"Could not fetch '9.9.9' into {clone_dir}; the checkout stays at {commits['0.2.0']}", proc.stdout)
+        self.assertIn("'9.9.9' is not present in the current checkout", proc.stdout)
+        self.assertIn("--allow-unverified-source", proc.stdout)
+        self.assertNotIn("Moved", proc.stdout)
+        self.assertEqual(self._head_of(clone_dir), commits["0.2.0"])
 
     def test_verify_local_source_ref_dry_run_warning_does_not_claim_cluster_mutation(self):
         """Under --dry-run, an unverified mismatched checkout warns about dry-run continuing without claiming cluster mutation."""
