@@ -185,8 +185,10 @@ agent:
 # Per-turn web_search ceiling. Hermes defaults to 50, and the docstring on that
 # default is right about interactive sessions: fifty searches in one turn is
 # pathological. It is not right about a kanban worker. Those are spawned
-# non-goal-mode, so `chat -q` gives the whole card exactly one turn, and the
-# per-turn cap is really a per-card research budget.
+# non-goal-mode — triage cards by instruction (`_build_agent_query` rule 4 in
+# `scripts/session_kv_server.py`, #656), everything else by the tool's default —
+# so `chat -q` gives the whole card exactly one turn, and the per-turn cap is
+# really a per-card research budget.
 #
 # Card t_d3efabef ("Evaluate Config Connector Setup Patterns") hit that ceiling
 # on all four of its runs — 208 searches, 173 of them successful, 38 minutes,

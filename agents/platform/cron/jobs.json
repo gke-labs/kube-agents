@@ -175,6 +175,22 @@
       "deliver": "chat"
     },
     {
+      "id": "kanban-board-health",
+      "name": "Kanban Board Health",
+      "schedule": {
+        "kind": "cron",
+        "expr": "35 7 * * *",
+        "display": "35 7 * * *"
+      },
+      "prompt": "",
+      "skills": [],
+      "no_agent": true,
+      "script": "kanban_board_health.py",
+      "risk": "low",
+      "enabled": true,
+      "deliver": "chat"
+    },
+    {
       "id": "eod-event-watcher-daily-report",
       "name": "Event Watcher Daily Activity Recap",
       "schedule": {

@@ -153,6 +153,7 @@ CLUSTER_SKILL_GROUP = "Cluster Agent (per-cluster runtime)"
 
 CRON_CADENCE = {
     "40 5 * * *": "Daily 05:40",
+    "35 7 * * *": "Daily 07:35",
     "20 6 * * *": "Daily 06:20",
     "50 6 * * *": "Daily 06:50",
     "50 8 * * *": "Daily 08:50",

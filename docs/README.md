@@ -389,7 +389,7 @@ only what the title does not say.
 | `concepts/chatops.md` | Site page | Chat ingress: Google Chat and Slack terminate at the Planning Agent front door, which delegates to the Platform Agent. Both opt-in. | Enablement flags, allowed users, session metadata | — |
 | `concepts/skills.md` | Site page | How the Platform Agent loads and invokes skill bundles; adding and importing skills. | SKILL.md format, frontmatter contract | — |
 | `concepts/governance-sops.md` | Site page | What the governance SOPs are (strategy vs skills' tactics) and which ship. | SOP roster | Sources live in `agents/platform/governance/` |
-| `concepts/autonomous-watchdogs.md` | Site page | Cron-scheduled jobs that make the agent proactive; job shape, disabling, adding. | `agents/chat/defaults/cron/jobs.json` | Schedule table lives on `reference/cron-jobs.md` (generated) |
+| `concepts/autonomous-watchdogs.md` | Site page | Cron-scheduled jobs that make the agent proactive; job shape, disabling, adding. | `agents/chat/defaults/cron/jobs.json`, `agents/platform/cron/jobs.json` | Schedule table lives on `reference/cron-jobs.md` (generated) |
 | `concepts/declarative-workflow.md` | Site page | All infrastructure changes route through Git; how `submit-suggestion` and Minty enforce it. | No direct mutation, short-lived tokens, anti-patterns | — |
 | `concepts/inference-gateway.md` | Site page | Model access as a config toggle: LiteLLM for hosted models, vLLM for local, optional replay caching, opt-in request redaction at the gateway. | Provider choice, replay modes, gateway redaction | — |
 | `concepts/observability.md` | Site page | OTel traces, Prometheus metrics, and Cloud Logging routing for agent and gateway. | Exports per component, console links, tool-call audit | — |
@@ -413,7 +413,7 @@ only what the title does not say.
 | `operator/development.md` | Site page | Building, testing, and iterating on the operator locally. | Kubebuilder workflow, fast iteration | — |
 | `reference/index.mdx` | Site page | Card-grid hub for the reference section. | Navigation | — |
 | `reference/config.md` | Site page | `agents/platform/config.yaml` annotated: MCP servers, toolsets, memory, plugins. | Config keys | — |
-| `reference/cron-jobs.md` | Site page | Annotated cron reference; the jobs table is a **generated region** sourced from `agents/chat/defaults/cron/jobs.json`. | Job schema, editing | Do not hand-edit the table; `make docs-generate` |
+| `reference/cron-jobs.md` | Site page | Annotated cron reference; the jobs table is a **generated region** sourced from both rosters, `agents/chat/defaults/cron/jobs.json` and `agents/platform/cron/jobs.json`. | Job schema, editing | Do not hand-edit the table; `make docs-generate` |
 | `reference/examples.md` | Site page | Tour of the inference example bundles shipped in `examples/`. | Replay, LiteLLM, vLLM bundles | — |
 | `reference/glossary.md` | Site page | Human-facing glossary of kube-agents and ecosystem terminology. | Terminology | Distinct from the runtime `agents/platform/docs/glossary.md` |
 | `reference/attribution.md` | Site page | Operator-facing runbook for connecting an agent action back to the requesting human; query recipes. | Attribution contract, trust boundary | Summarizes `docs/designs/audit-logging-user-attribution.md` |

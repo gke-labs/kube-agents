@@ -68,6 +68,30 @@ accumulated 34 directories and 3.9 MB on the agent pod and 9 directories and
 and nothing. A tighter interval buys nothing against that rate and spends an SSH
 round trip per tick.
 
+## `kanban-board-health` asks whether the board is wedged
+
+The same shape as the collector above: housekeeping that needs the board, which
+is on the agent pod at `<agent home>/kanban.db`. `kanban_board_health.py` reads
+that file read-only, asks `hermes kanban diagnostics` for the shipped rule
+engine's findings, and prints only when something is wrong. One finding is
+reported whatever the severity floor says: a card `blocked` for more than a day
+with no comment or unblock since. A worker's or operator's block is sticky by
+design, nothing retries it, and #656 was a finished report parked that way for
+weeks because nothing periodically asked. Each such line carries the card's
+kind, reason and age, read from the board, and the `hermes kanban unblock` and
+`archive` commands, because the engine's JSON has neither the kind nor the
+reason and a line that names a stuck card without saying how to move it is a
+line the room learns to skip.
+
+Daily, and it repeats: the rule is stateless, so a card still blocked is named
+every morning until someone unblocks, comments on, or archives it. That is the
+intended nag, the same rule `findings-morning-nudge` keeps, and the reason a
+finer cadence buys nothing: the engine's threshold is a day.
+
+It sits here rather than on the Chat Agent's roster because that roster delivers
+`local`. `PLATFORM_AGENT_HOME`, not `HERMES_HOME`, is how it finds the board:
+under this roster `HERMES_HOME` is `profiles/platform`, which holds no board.
+
 ## Never put an id on both rosters
 
 Do not add any id here to `agents/chat/defaults/cron/jobs.json` as well. Two

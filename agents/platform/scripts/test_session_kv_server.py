@@ -1941,6 +1941,25 @@ class TestTriageDeliveryInstruction(unittest.TestCase):
         # instruction became unfollowable.
         self.assertNotIn("send_notification", self.body())
 
+    def test_it_says_what_done_means(self):
+        # #656: a goal-mode judge grades title + body. A body that only says
+        # what the report looks like cannot be satisfied; one that says what
+        # done means can, and it also tells a worker not to block over shape.
+        body = self.body()
+        self.assertIn("**Done when:**", body)
+        self.assertIn("no manifest change is warranted", body)
+        self.assertIn("recorded with `kanban_complete`", body)
+        self.assertIn("never `kanban_block` over formatting", body)
+
+    def test_done_when_is_not_a_fourth_section(self):
+        # The three-section rule (test_template_uses_only_the_three_permitted
+        # _sections) is what keeps the persona and the template in step; the
+        # acceptance criterion joins the prose above the template, not the
+        # template itself, and stays out of the span the bench contract slices.
+        body = self.body()
+        self.assertFalse([line for line in body.splitlines() if line.startswith("## Done")])
+        self.assertLess(body.index("**Done when:**"), body.index("## What's wrong"))
+
 
 class TestFrontDoorDelegation(unittest.TestCase):
     """The turn itself, which is always read by the `default` profile.
@@ -1990,6 +2009,15 @@ class TestFrontDoorDelegation(unittest.TestCase):
         # It holds no cluster tools at all, so an instruction it cannot follow
         # is an invitation to invent an answer.
         self.assertIn("Do not diagnose the event", self.query())
+
+    def test_it_keeps_the_card_out_of_goal_mode(self):
+        # #656: the front door set goal_mode=true unprompted, and a goal-mode
+        # card's worker cannot complete once the judge rejects its report. The
+        # rule is the router's, so it sits above the body it copies.
+        query = self.query()
+        self.assertIn("`goal_mode`: leave it unset", query)
+        self.assertIn("**Leave `goal_mode` off.**", query)
+        self.assertLess(query.index("Leave `goal_mode` off"), query.index("--- BEGIN TASK BODY"))
 
 
 class TestGatewaySessionBody(unittest.TestCase):
