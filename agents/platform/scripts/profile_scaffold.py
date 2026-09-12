@@ -110,6 +110,11 @@ def ensure_profile(name: str, description: str, hermes_home: Path) -> Path:
     if not is_scaffolded(home):
         _clear_mount_skeleton(home)
         pre_existing = home.exists()
+        if pre_existing:
+            try:
+                home.chmod(0o775)
+            except OSError:
+                pass
         try:
             subprocess.run(
                 [HERMES_BIN, "profile", "create", name, "--no-skills", "--description", description],

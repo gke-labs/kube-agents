@@ -13,6 +13,7 @@ directory cases below are that regression, not a formality.
 import io
 import shutil
 import json
+import stat
 import subprocess
 import sys
 import tempfile
@@ -395,6 +396,24 @@ class EnsureProfileTest(unittest.TestCase):
 
         self.assertTrue((self.home / "USER.md").is_file())
         self.assertIn("continuing", self.stderr, "the refusal is logged, not fatal")
+
+    def test_pre_existing_profile_home_mode_relaxed_to_0775(self):
+        """A pre-existing home (e.g. materialised bare at 0700) is relaxed to 0775."""
+        self.home.mkdir(parents=True)
+        (self.home / "USER.md").write_text("cluster identity\n")
+        self.home.chmod(0o700)
+
+        self.ensure()
+
+        self.assertEqual(stat.S_IMODE(self.home.stat().st_mode), 0o775)
+
+    def test_pre_existing_profile_home_chmod_oserror_tolerated(self):
+        """OSError during chmod on pre-existing home (e.g. read-only mount) is tolerated."""
+        self.home.mkdir(parents=True)
+        (self.home / "USER.md").write_text("cluster identity\n")
+        with unittest.mock.patch.object(Path, "chmod", side_effect=OSError("Read-only filesystem")):
+            self.ensure()
+        self.assertTrue((self.home / "USER.md").is_file())
 
     def test_a_failed_create_on_a_fresh_home_is_fatal(self):
         self.fail_create = True
