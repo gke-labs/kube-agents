@@ -90,6 +90,13 @@ original hold-out rationale stands —
 record. It enters `BOOTSTRAP_ADMITTED` when the lettered-options bar is settled and it
 has a clean record.
 
+The eval dashboard's legacy page ("Evidence on record") is the readable view of
+that record: per case, the presubmit and the nightly pass rate over repetitions
+at 7 and 30 days, kept apart — the nightly tier is the only place a case outside
+`TASKS` runs at all. The admission evidence itself is the baseline store
+([`bench/baselines/README.md`](../bench/baselines/README.md)); the page shows
+the same nightly runs, it does not replace the store.
+
 The others are simply new and earn their record like any case, then enter:
 **security-overgrant-remediation-proposal**
 ([#1066](https://github.com/gke-labs/kube-agents/issues/1066)) and the three

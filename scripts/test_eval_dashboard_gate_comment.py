@@ -11,7 +11,10 @@ per-case classes come from the real classify.py.
 import contextlib
 import io
 import json
+import os
 import pathlib
+import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -194,6 +197,19 @@ class Shapes(Harness):
         self.assertNotIn("Incident brief", body)
         self.assertIn("6 cases passed.", body)
 
+    def test_a_green_night_is_not_another_pr(self):
+        # The nightly periodic's run shares data.json with no pull request
+        # (tiers.py). Green an hour ago, it passed every case: it must neither
+        # raise the "runs from other PRs" count nor be commented on.
+        night = run(7000, None, NOW - timedelta(hours=1))
+        night.update({"tier": "nightly", "job": "ci-kube-agents-eval-nightly"})
+        mine = [run(100 + i, 913, NOW - timedelta(hours=3 - i), failing=["security-overgrant-probe"]) for i in range(4)]
+        self.tick(data(night, *mine, *green_others()), green_health())
+        self.assertEqual(self.gh.writes(), [("POST", "repos/gke-labs/kube-agents/issues/913/comments")])
+        body = self.gh.bodies()[0]
+        self.assertIn("`security-overgrant-probe` passed on the last 9 runs from other PRs and failed on your last 4.", body)
+        self.assertIn("| `security-overgrant-probe` | 0 / 3 reps | no other PR |", body)
+
     def test_mixed(self):
         mine = run(100, 1300, NOW - timedelta(minutes=5), failing=TRIO + ["agent-kanban-smoke"])
         self.tick(data(mine, *other_runs()), outage_health())
@@ -227,6 +243,33 @@ class Shapes(Harness):
         self.assertTrue(box.startswith("> 🟡 **Gate degraded** since Tue 9:00 AM ET. quota storm 9:15 AM–10:25 AM ET hit 3 PRs."), box)
         self.assertIn("Your 1 failure is exactly that one, so this red is not your code.", box)
         self.assertIn("| 0 / 3 reps (1 infra) |", self.gh.bodies()[0])
+
+
+class RunAsAScript(Harness):
+    """ci-health.yml runs gate_comment.py by path from the repository root.
+    That takes the module's import fallback, not the package import every
+    other test here takes, so a tick through it is the only proof the
+    fallback binds everything tick uses."""
+
+    def test_the_workflow_invocation_ticks(self):
+        mine = [run(100 + i, 913, NOW - timedelta(hours=3 - i), failing=["security-overgrant-probe"]) for i in range(4)]
+        (self.dir / "data.json").write_text(json.dumps(data(*mine, *green_others())))
+        (self.dir / "health.json").write_text(json.dumps(green_health()))
+        script = pathlib.Path(gate_comment.__file__).resolve()
+        argv = [sys.executable, str(script), "--data", str(self.dir / "data.json"), "--health", str(self.dir / "health.json"), "--state", str(self.state), "--admitted", ",".join(sorted(ADMITTED)), "--now", NOW.isoformat(), "--dry-run"]
+        # No PYTHONPATH, so the fallback is the import path; a `gh` that
+        # fails first on PATH, so the dry run's one GET (the marker search)
+        # is a logged warning and never the network.
+        fake_gh = self.dir / "gh"
+        fake_gh.write_text("#!/bin/sh\necho 'offline test: no gh' >&2\nexit 1\n")
+        fake_gh.chmod(0o755)
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        env["PATH"] = f"{self.dir}{os.pathsep}{env.get('PATH', '')}"
+        proc = subprocess.run(argv, cwd=script.parents[2], env=env, capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("warning: gh api GET repos/gke-labs/kube-agents/issues/913/comments", proc.stderr)
+        self.assertIn("--dry-run: would comment on #913 (build 103)", proc.stderr)
+        self.assertIn("`security-overgrant-probe` passed on the last 9 runs from other PRs and failed on your last 4.", proc.stderr)
 
 
 def lost(build, pr, finished, minutes=128, node="gke-kube-agents-prow-default-pool-eb220b2a-sgnk", **fields):

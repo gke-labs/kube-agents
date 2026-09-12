@@ -699,11 +699,16 @@ function caseCard(run, c) {
   const reps = c.reps || { pass: 0, fail: 0, infra: 0 };
   const total = reps.pass + reps.fail + reps.infra;
   const how = c.outcome === "failed" ? `failed all ${plural(reps.fail, "graded rep")}${reps.infra ? ` (${reps.infra} lost)` : ""}` : c.outcome === "infra" ? `all ${plural(total, "rep")} lost before grading` : `${reps.pass} of ${total} reps passed`;
-  const rate = c.pass_rate_30d != null ? ` · this case passed ${pct(c.pass_rate_30d)} of the time over the last 30 days` : "";
+  const rate = c.pass_rate_30d != null ? ` · this case passed ${pct(c.pass_rate_30d)} of the time over the last 30 days on PRs` : "";
+  // The nightly's record beside the gate's: the newest night within two
+  // days of this run, when one graded the case. Evidence about main, never
+  // a tag -- the tags above answer "is this mine?" from the presubmit alone.
+  const nightly = c.nightly_failed_recent === true ? " · it also failed every repetition on the latest nightly run"
+    : c.nightly_failed_recent === false ? " · the latest nightly run passed it" : "";
   const url = transcriptUrl(run, c.case);
   const log = buildUrl(run);
   return `<div class="case"><div class="hd"><h3>${esc(c.case)}</h3>${tagFor(c)}</div>` +
-    `<div class="sub">${esc(how)}${esc(rate)}</div>` +
+    `<div class="sub">${esc(how)}${esc(rate)}${esc(nightly)}</div>` +
     (c.reason ? `<div class="reason">${esc(c.reason)}</div>` : "") +
     (c.excerpt ? `<div class="quote">“${esc(c.excerpt)}”</div>` : "") +
     (c.do ? `<div class="do"><b>Do:</b> ${esc(c.do)}</div>` : "") +

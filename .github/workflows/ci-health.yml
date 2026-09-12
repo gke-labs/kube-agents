@@ -118,11 +118,17 @@ env:
   CI_HEALTH_CHAT_SPACE: ${{ vars.CI_HEALTH_CHAT_SPACE || 'spaces/AAQAlcuDUJI' }}
   CI_HEALTH_MUTE: ${{ vars.CI_HEALTH_MUTE || 'false' }}
   # collect.py's inputs, the same values hack/ci-dashboard-refresh.sh uses:
-  # the smoke-test presubmit's archive, the bound collect.py applies to a
-  # prior it finds unusable (a corrupt download; a missing one stops the step
-  # before collect.py runs), and the freshness-badge threshold written into
-  # data.json (this job's 15m cadence with slack for ~2 missed ticks).
+  # the smoke-test presubmit's archive, the nightly periodic's log prefix
+  # (same bucket, so the reader's grant already covers it; until the
+  # periodic exists the prefix lists nothing, which collect.py notes and
+  # carries on -- it is not the refusal line below until a night is on
+  # record, after which a prefix that stops listing is), the bound collect.py
+  # applies to a prior it finds unusable (a corrupt download; a missing one
+  # stops the step before collect.py runs), and the freshness-badge
+  # threshold written into data.json (this job's 15m cadence with slack for
+  # ~2 missed ticks).
   PR_GLOB: gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*
+  NIGHTLY_PREFIX: gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly/
   # The release-candidate lane's archive. A postsubmit, so logs/ rather than
   # pr-logs/. Bounded by --rc-limit rather than by the presubmit watermark.
   RC_GLOB: gs://kube-agents-prow/logs/post-kube-agents-eval-rc/*
@@ -215,6 +221,7 @@ jobs:
           fi
           timeout "$COLLECT_TIMEOUT_S" python3 scripts/eval_dashboard/collect.py \
             --pr-glob "$PR_GLOB" \
+            --nightly-prefix "$NIGHTLY_PREFIX" \
             --rc-glob "$RC_GLOB" \
             --merge-with work/prior-data.json \
             --since-days "$SINCE_DAYS" \
