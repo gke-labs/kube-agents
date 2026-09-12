@@ -7,7 +7,7 @@ matched exactly once; that says nothing about whether the inserted code is
 reachable, whether it still composes with the upstream helpers it calls, or
 whether the board write it makes lands.
 
-Four things are checked, and each one is a way the patch could match its anchor
+Six things are checked, and each one is a way the patch could match its anchor
 and still be useless:
 
 1. **The nudge is reachable and terminal.** Parsed out of the *patched*
@@ -34,6 +34,18 @@ and still be useless:
    against the real ``tools.cron_run_scope``: the unit tests can only reach that
    module as a top-level sibling, so this is the only place the import the
    exclusion actually defaults to is exercised.
+
+5. **The rate-limit sites are where the code says a 429 goes.** The stash in
+   ``agent/conversation_loop.py`` follows the classification it copies from,
+   inside the same handler; the ``cli.py`` block runs ahead of the exit-code
+   decision it must not change, and that decision still routes ``rate_limit``
+   to ``KANBAN_RATE_LIMIT_EXIT_CODE``. ``transient`` is still a valid block
+   kind and ``rate_limit`` is still how ``FailoverReason`` spells a 429.
+6. **The block lands.** Both sites are driven against a real board through the
+   real ``block_task``: the card ends ``blocked`` with ``block_kind=transient``,
+   the run closed ``blocked`` with the provider text as its summary, and no
+   failure counted. A stale run id is refused, a non-429 exhaustion still
+   records ``timed_out``, and ``billing`` is left to the stock exit.
 
 The per-turn ``max_web_searches`` ceiling that triggered all this is a config
 change, not a patch, and is gated where the template is built — see the
@@ -168,6 +180,11 @@ from hermes_cli.kanban_guardrail_exit import (  # noqa: E402
     DEFAULT_MAX_NUDGES,
     DETECTOR,
     OUTCOME,
+    RATE_LIMIT_BLOCK_KIND,
+    RATE_LIMIT_FAILURE_REASONS,
+    RATE_LIMIT_REASON_PREFIX,
+    RETRIES_EXHAUSTED_EXIT_REASON,
+    block_rate_limited_worker,
     guardrail_halt_nudge,
     missing_terminal_error,
     record_missing_terminal_call,
@@ -420,10 +437,186 @@ check(
 )
 
 
+# --- 5. The rate-limit sites sit where a 429 actually goes ------------------
+print("rate-limit sites (agent/conversation_loop.py, cli.py):")
+
+STASH_TARGET = "agent._kube_last_api_failure"
+CLASSIFY_TARGET = "classified"
+CLI_MARKER = "_kube_block_rate_limited"
+
+
+def _enclosing_block(tree, stmt):
+    for node in ast.walk(tree):
+        for field in ("body", "orelse", "finalbody", "handlers"):
+            block = getattr(node, field, None)
+            if isinstance(block, list) and stmt in block:
+                return block
+    return None
+
+
+def _assigns_to(block, target):
+    return [
+        s
+        for s in block
+        if isinstance(s, ast.Assign)
+        and any(ast.unparse(t) == target for t in s.targets)
+    ]
+
+
+stashes = [
+    node
+    for node in ast.walk(loop_tree)
+    if isinstance(node, ast.Assign)
+    and any(ast.unparse(t) == STASH_TARGET for t in node.targets)
+    and isinstance(node.value, ast.Tuple)
+]
+check("the stash is written exactly once", len(stashes) == 1, f"found {len(stashes)}")
+if len(stashes) == 1:
+    stash = stashes[0]
+    stash_try = next(
+        (
+            node
+            for node in ast.walk(loop_tree)
+            if isinstance(node, ast.Try) and stash in node.body
+        ),
+        None,
+    )
+    check("the stash is wrapped so it cannot raise out of the handler", stash_try is not None)
+    block = _enclosing_block(loop_tree, stash_try) if stash_try is not None else None
+    check("the stash sits in a statement block", block is not None)
+    if block is not None:
+        classify = [
+            s
+            for s in _assigns_to(block, CLASSIFY_TARGET)
+            if "classify_api_error" in ast.unparse(s.value)
+        ]
+        check(
+            "the stash follows the classification in the same handler",
+            len(classify) == 1 and block.index(classify[0]) < block.index(stash_try),
+            "the stash would read a `classified` from somewhere else",
+        )
+        handlers = [
+            node
+            for node in ast.walk(loop_tree)
+            if isinstance(node, ast.ExceptHandler)
+            and node.name == "api_error"
+            and stash_try in ast.walk(node)
+        ]
+        check(
+            "and that handler is the retry loop's `except ... as api_error`",
+            len(handlers) >= 1,
+        )
+    check(
+        "the stash records the classified reason and the summarised error",
+        "classified.reason.value" in ast.unparse(stash)
+        and "_summarize_api_error" in ast.unparse(stash),
+    )
+
+check(
+    "the retries-exhausted exit reason is still spelled the way the branch keys on",
+    f'_turn_exit_reason = "{RETRIES_EXHAUSTED_EXIT_REASON}"'
+    in (HERMES / "agent" / "conversation_loop.py").read_text(),
+)
+
+cli_tree = ast.parse((HERMES / "cli.py").read_text())
+exit_inits = [
+    node
+    for node in ast.walk(cli_tree)
+    if isinstance(node, ast.Assign)
+    and any(ast.unparse(t) == "_exit_code" for t in node.targets)
+    and ast.unparse(node.value) == "0"
+]
+check(
+    "the worker's exit-code block is still a single site",
+    len(exit_inits) == 1,
+    f"found {len(exit_inits)}",
+)
+if len(exit_inits) == 1:
+    exit_init = exit_inits[0]
+    block = _enclosing_block(cli_tree, exit_init)
+    check("the exit-code block sits in a statement block", block is not None)
+    if block is not None:
+        index = block.index(exit_init)
+        before = block[:index]
+        after = block[index + 1 :]
+        blockers = [
+            s
+            for s in before
+            if isinstance(s, ast.Try) and CLI_MARKER in ast.unparse(s)
+        ]
+        check(
+            "the rate-limit block runs before the exit code is decided",
+            len(blockers) == 1,
+            "a block after sys.exit never runs",
+        )
+        if blockers:
+            check(
+                "and it cannot change the exit code or exit itself",
+                "_exit_code" not in ast.unparse(blockers[0])
+                and "sys.exit" not in ast.unparse(blockers[0]),
+                "exit 75 is the reaper's contract; the block is additive",
+            )
+        decision = next((s for s in after if isinstance(s, ast.If)), None)
+        check(
+            "the stock decision still routes rate_limit to the rate-limit exit code",
+            decision is not None
+            and "rate_limit" in ast.unparse(decision)
+            and "KANBAN_RATE_LIMIT_EXIT_CODE" in ast.unparse(decision),
+        )
+
+CHAT_MARKER = "_kube_block_rate_limited_chat"
+chat_defs = [
+    node
+    for node in ast.walk(cli_tree)
+    if isinstance(node, ast.FunctionDef) and node.name == "chat"
+    and CHAT_MARKER in ast.unparse(node)
+]
+check(
+    "the chat() site is inside a single def chat()",
+    len(chat_defs) == 1,
+    f"found {len(chat_defs)} chat() defs carrying the marker",
+)
+if len(chat_defs) == 1:
+    chat_src = ast.unparse(chat_defs[0])
+    billing = [
+        node
+        for node in ast.walk(chat_defs[0])
+        if isinstance(node, ast.If)
+        and "failure_reason" in ast.unparse(node.test)
+        and "billing" in ast.unparse(node.test)
+    ]
+    check(
+        "the chat() site runs where the failed result is still in hand, "
+        "ahead of the billing call-to-action",
+        len(billing) == 1
+        and chat_src.index(CHAT_MARKER) < chat_src.index(ast.unparse(billing[0].test)),
+    )
+    check(
+        "the chat() site is gated on the worker's task id",
+        "HERMES_KANBAN_TASK" in chat_src,
+    )
+
+from agent.error_classifier import FailoverReason  # noqa: E402
+from hermes_cli import kanban_db as K  # noqa: E402
+
+check(
+    "transient is still a valid block kind",
+    RATE_LIMIT_BLOCK_KIND in K.VALID_BLOCK_KINDS,
+    f"VALID_BLOCK_KINDS={sorted(K.VALID_BLOCK_KINDS)}",
+)
+check(
+    "rate_limit is still how FailoverReason spells a 429",
+    FailoverReason.rate_limit.value in RATE_LIMIT_FAILURE_REASONS,
+)
+check(
+    "billing is deliberately not blocked",
+    FailoverReason.billing.value not in RATE_LIMIT_FAILURE_REASONS,
+    "a credit wall does not clear on its own; it keeps the stock exit",
+)
+
+
 # --- 4. The board write lands -----------------------------------------------
 print("board write:")
-
-from hermes_cli import kanban_db as K  # noqa: E402
 
 TMP = Path(tempfile.mkdtemp())
 DB = TMP / "kanban.db"
@@ -563,6 +756,213 @@ check(
     "the card ends up blocked for a human rather than in flight",
     row(conn, card)["status"] == "blocked",
     f"status={row(conn, card)['status']!r}",
+)
+
+
+# --- 6. The rate-limit block lands ------------------------------------------
+print("rate-limit block:")
+
+STORM_ERROR = (
+    "Error code: 429 - {'error': {'message': 'litellm.RateLimitError: "
+    'VertexAIException - {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", '
+    '"details": [{"@type": "type.googleapis.com/google.rpc.RetryInfo", '
+    "\"retryDelay\": \"54s\"}]}}', 'type': None, 'code': '429'}}"
+)
+STORM_RESULT = {"failed": True, "failure_reason": "rate_limit", "error": STORM_ERROR}
+
+
+def block_row(conn, tid):
+    return conn.execute(
+        "SELECT status, claim_lock, block_kind, consecutive_failures "
+        "FROM tasks WHERE id = ?",
+        (tid,),
+    ).fetchone()
+
+
+def last_run(conn, tid):
+    return conn.execute(
+        "SELECT status, outcome, summary, ended_at FROM task_runs "
+        "WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (tid,),
+    ).fetchone()
+
+
+def claimed_card(title):
+    conn = board()
+    tid = K.create_task(conn, title=title, assignee="platform")
+    K.recompute_ready(conn)
+    check(f"{title!r} is claimed the way the dispatcher claims it", K.claim_task(conn, tid))
+    run_id = K.get_task(conn, tid).current_run_id
+    check("the dispatcher opened a run for it", isinstance(run_id, int))
+    return tid, run_id
+
+
+# The cli.py site, with the environment the dispatcher gives a worker.
+cli_card, cli_run = claimed_card("Summarise fleet posture (cli.py site)")
+did = block_rate_limited_worker(
+    STORM_RESULT,
+    connect=board,
+    block_task=K.block_task,
+    environ={"HERMES_KANBAN_TASK": cli_card, "HERMES_KANBAN_RUN_ID": str(cli_run)},
+    cron_run=False,
+    delegated_child=False,
+)
+check("the cli.py site blocks the card", did is True)
+conn = board()
+after = block_row(conn, cli_card)
+check(
+    "the card is blocked, not counted",
+    after["status"] == "blocked"
+    and after["claim_lock"] is None
+    and (after["consecutive_failures"] or 0) == 0,
+    f"status={after['status']!r} lock={after['claim_lock']!r} "
+    f"failures={after['consecutive_failures']!r}",
+)
+check(
+    f"the block kind is {RATE_LIMIT_BLOCK_KIND}",
+    after["block_kind"] == RATE_LIMIT_BLOCK_KIND,
+    f"block_kind={after['block_kind']!r}",
+)
+run = last_run(conn, cli_card)
+check(
+    "the run is closed blocked",
+    run is not None and run["ended_at"] is not None and run["outcome"] == "blocked",
+    f"run={dict(run) if run else None}",
+)
+check(
+    "the provider's text is the run's summary",
+    run is not None
+    and (run["summary"] or "").startswith(RATE_LIMIT_REASON_PREFIX)
+    and "RESOURCE_EXHAUSTED" in (run["summary"] or ""),
+    f"summary={run['summary'] if run else None!r}",
+)
+check(
+    "the reason reaches the blocked event",
+    any(
+        k == "blocked" and "RESOURCE_EXHAUSTED" in (p or "")
+        for k, p in events(conn, cli_card)
+    ),
+    f"events: {[k for k, _ in events(conn, cli_card)]}",
+)
+check(
+    "a second attempt finds nothing to do",
+    block_rate_limited_worker(
+        STORM_RESULT,
+        connect=board,
+        block_task=K.block_task,
+        environ={"HERMES_KANBAN_TASK": cli_card, "HERMES_KANBAN_RUN_ID": str(cli_run)},
+        cron_run=False,
+        delegated_child=False,
+    )
+    is False,
+)
+
+# The finalize_turn site: retries exhausted with no response, after a 429.
+fin_card, fin_run = claimed_card("Audit node pools (finalize_turn site)")
+did = record_missing_terminal_call(
+    task_id=fin_card,
+    turn_exit_reason=RETRIES_EXHAUSTED_EXIT_REASON,
+    connect=board,
+    record_failure=K._record_task_failure,
+    block_task=K.block_task,
+    last_api_failure=("rate_limit", STORM_ERROR),
+    run_id=fin_run,
+)
+check("the finalize_turn site blocks the card", did is True)
+conn = board()
+after = block_row(conn, fin_card)
+check(
+    "blocked transient, no failure counted",
+    after["status"] == "blocked"
+    and after["block_kind"] == RATE_LIMIT_BLOCK_KIND
+    and (after["consecutive_failures"] or 0) == 0,
+    f"status={after['status']!r} kind={after['block_kind']!r} "
+    f"failures={after['consecutive_failures']!r}",
+)
+check(
+    "no timed_out event was written for it",
+    OUTCOME not in [k for k, _ in events(conn, fin_card)],
+)
+
+# A stale run id: the dispatcher reclaimed and re-ran the card underneath this
+# worker, so the block must be refused rather than land on someone else's run.
+stale_card, stale_run = claimed_card("Rotate credentials (stale run)")
+did = record_missing_terminal_call(
+    task_id=stale_card,
+    turn_exit_reason=RETRIES_EXHAUSTED_EXIT_REASON,
+    connect=board,
+    record_failure=K._record_task_failure,
+    block_task=K.block_task,
+    last_api_failure=("rate_limit", STORM_ERROR),
+    run_id=stale_run + 1000,
+)
+check("a stale run id is refused", did is False)
+check(
+    "and the card is left as it was",
+    block_row(board(), stale_card)["status"] == "running",
+)
+
+# A retries-exhausted exit that was not a 429 still counts a timed_out.
+ctx_card, ctx_run = claimed_card("Compare chart values (context overflow)")
+did = record_missing_terminal_call(
+    task_id=ctx_card,
+    turn_exit_reason=RETRIES_EXHAUSTED_EXIT_REASON,
+    connect=board,
+    record_failure=K._record_task_failure,
+    block_task=K.block_task,
+    last_api_failure=("context_overflow", "request too large"),
+    run_id=ctx_run,
+)
+check("a non-429 exhaustion is still recorded", did is True)
+conn = board()
+after = block_row(conn, ctx_card)
+check(
+    f"and it is still a counted {OUTCOME}",
+    (after["consecutive_failures"] or 0) == 1
+    and OUTCOME in [k for k, _ in events(conn, ctx_card)],
+    f"failures={after['consecutive_failures']!r} "
+    f"events={[k for k, _ in events(conn, ctx_card)]}",
+)
+
+# The recurrence rule the module docstring states: unblock keeps block_kind,
+# so a second transient block after an unblock trips upstream's loop breaker
+# and lands the card in triage. If upstream changes that, the docstring lies.
+conn = board()
+check("the cli.py-site card can be unblocked", K.unblock_task(conn, cli_card))
+K.recompute_ready(conn)
+check("and re-claimed", K.claim_task(conn, cli_card))
+re_run = K.get_task(conn, cli_card).current_run_id
+did = block_rate_limited_worker(
+    STORM_RESULT,
+    connect=board,
+    block_task=K.block_task,
+    environ={"HERMES_KANBAN_TASK": cli_card, "HERMES_KANBAN_RUN_ID": str(re_run)},
+    cron_run=False,
+    delegated_child=False,
+)
+check("a second storm on the same card still writes", did is True)
+after = block_row(board(), cli_card)
+check(
+    "and upstream's loop breaker routes it to triage, as the docstring says",
+    after["status"] == "triage" and after["block_kind"] == RATE_LIMIT_BLOCK_KIND,
+    f"status={after['status']!r} kind={after['block_kind']!r}; "
+    f"BLOCK_RECURRENCE_LIMIT={getattr(K, 'BLOCK_RECURRENCE_LIMIT', None)!r}",
+)
+
+# billing keeps the stock path: the card is left for the reaper.
+bill_card, bill_run = claimed_card("Estimate spend (billing wall)")
+check(
+    "a billing wall is left to the stock exit",
+    block_rate_limited_worker(
+        {"failed": True, "failure_reason": "billing", "error": "402"},
+        connect=board,
+        block_task=K.block_task,
+        environ={"HERMES_KANBAN_TASK": bill_card, "HERMES_KANBAN_RUN_ID": str(bill_run)},
+        cron_run=False,
+        delegated_child=False,
+    )
+    is False
+    and block_row(board(), bill_card)["status"] == "running",
 )
 
 

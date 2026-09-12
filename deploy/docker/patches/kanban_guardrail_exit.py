@@ -126,6 +126,55 @@ Four exclusions matter, and all of them are load-bearing:
   Dropping the transcript check costs one SQLite read on an exit path that is
   already exceptional, and the board cannot be wrong about its own rows.
 
+The third fix: a 429 storm (2026-09-03)
+--------------------------------------
+When the shared Gemini quota saturates, the worker's model call raises a 429
+through LiteLLM. The loop retries ``api_max_retries`` times, gives up, and
+``run_conversation`` returns ``failed=True, failure_reason="rate_limit"``;
+``cli.py`` then exits with ``KANBAN_RATE_LIMIT_EXIT_CODE`` (75) so the
+dispatcher's reaper can release the card back to ``ready`` without counting a
+failure. The card itself is left ``running`` with an open run and *nothing on
+the board says why the worker left*. Whatever the reaper then makes of the exit
+(the storm recorded ``crashed``, three times, and a hard block), the card ends
+with no reason a front-end can read, and the delegating agent reports the
+delegation's status as its answer.
+
+``record_rate_limit_block`` is the worker closing its own card before it exits:
+``block_task(kind="transient", reason=<provider error text>)`` under the same
+``expected_run_id`` the ``kanban_block`` tool uses. ``transient`` is the kind
+upstream reserves for "this might clear on its own"; it lands the card in
+``blocked`` with the 429 text as the reason and the run closed ``blocked``.
+Like every truly-blocked kind it also counts in upstream's unblock-loop
+breaker: ``unblock_task`` keeps ``block_kind``, so a card blocked ``transient``
+once, unblocked, and blocked ``transient`` again (a worker re-run into the same
+or the next storm) reaches ``BLOCK_RECURRENCE_LIMIT`` (2) and lands in
+``triage`` with a ``block_loop_detected`` event instead of ``blocked``. That is
+the breaker doing its job on a card the quota has refused twice, and the
+``kanban_block`` tool would route it the same way; the reason text still names
+the 429 either way. It runs from two sites, because the loop has two ways of
+leaving on a rate limit:
+
+* ``cli.py`` (``block_rate_limited_worker``), for the ``failed=True`` return
+  the code shows a 429 taking. Two anchors there, because the worker has two
+  single-query paths: the fully-quiet ``-Q`` path goal-mode workers take ends
+  in an exit-code block (the one that maps ``rate_limit`` to exit 75), while
+  the non-quiet ``chat -q`` path every normal worker takes calls
+  ``cli.chat()`` and returns with exit 0, never reaching that block. The
+  live run on 2026-09-12 showed the second is the storm's path, so the block
+  also sits in ``chat()`` where the failed result is last in hand. And
+* the ``finalize_turn`` backstop above, for a retry loop that ends with no
+  response at all (``all_retries_exhausted_no_response``): there the loop's
+  error handler has stashed its last classified failure on the agent
+  (``_kube_last_api_failure``), and when that failure was a rate limit the
+  backstop blocks instead of charging a ``timed_out``.
+
+Both sites share the exclusions above and the board check: only a card still
+``running`` is blocked, so whichever site runs second finds nothing to do.
+``billing`` is deliberately not treated the same way: a credit wall does not
+clear on its own, and it keeps today's exit-75 path. So does ``goal_mode``,
+where the ``kanban_block`` tool refuses ``transient`` and the goal loop owns the
+card's lifecycle.
+
 What is deliberately *not* excluded is the halt nudge. It fires during a cron run
 too — ``kanban_stop_nudge_enabled()`` is on whenever ``HERMES_KANBAN_TASK`` is
 set, and upstream interpolates that id straight into the text — so the run is
@@ -154,6 +203,44 @@ DEFAULT_MAX_NUDGES = 2
 OUTCOME = "timed_out"
 
 DETECTOR = "kanban_guardrail_exit"
+
+#: The kind ``block_task`` files a rate-limit exhaustion under. It is in
+#: ``hermes_cli.kanban_db.VALID_BLOCK_KINDS`` and is the one upstream's tool
+#: docstring reserves for "this might clear on its own".
+RATE_LIMIT_BLOCK_KIND = "transient"
+
+#: ``FailoverReason`` values, as ``result["failure_reason"]`` spells them, that
+#: mean the provider throttled the call rather than the task being broken.
+#: ``billing`` is absent on purpose: a credit wall does not clear on its own and
+#: keeps the stock exit-75 path.
+RATE_LIMIT_FAILURE_REASONS = frozenset({"rate_limit"})
+
+#: The loop's ``_turn_exit_reason`` when the retry loop ends with no response.
+RETRIES_EXHAUSTED_EXIT_REASON = "all_retries_exhausted_no_response"
+
+#: How the block reason opens, so a human or a classifier can find it.
+RATE_LIMIT_REASON_PREFIX = "provider rate limit: API retries exhausted"
+
+#: Stands in for the provider text when none was captured.
+RATE_LIMIT_REASON_NO_TEXT = "no provider error text was captured"
+
+#: Longest block reason written. ``_summarize_api_error`` already truncates the
+#: provider text to 1000 characters; this bounds a caller that hands us more.
+BLOCK_REASON_MAX_CHARS = 1000
+
+#: The attribute the loop's error handler stashes ``(reason, summary)`` on, for
+#: the finalize_turn site.
+LAST_API_FAILURE_ATTR = "_kube_last_api_failure"
+
+#: The dispatcher's environment: the card this worker owns, its run row, and
+#: the goal-mode flag.
+TASK_ENV = "HERMES_KANBAN_TASK"
+RUN_ID_ENV = "HERMES_KANBAN_RUN_ID"
+GOAL_MODE_ENV = "HERMES_KANBAN_GOAL_MODE"
+
+#: The value ``_default_spawn`` sets ``HERMES_KANBAN_GOAL_MODE`` to for a
+#: goal-mode card; anything else, including unset, is a normal worker.
+GOAL_MODE_ON = "1"
 
 _HALT_SUFFIX = (
     "\n\n[System: `{tool}` is exhausted for the rest of this run "
@@ -229,25 +316,37 @@ def should_record_missing_terminal(
         # nonzero, and the iteration-budget path records its own failure
         # immediately above this check.
         return False
+    return not card_is_somebody_elses(
+        goal_mode=goal_mode, cron_run=cron_run, delegated_child=delegated_child
+    )
+
+
+def card_is_somebody_elses(*, goal_mode, cron_run, delegated_child) -> bool:
+    """Whether ``HERMES_KANBAN_TASK`` names a card this turn may not terminate.
+
+    The one exclusion chain both board-writing predicates in this module share,
+    so the next context that must not write is added in one place. Each
+    argument is the caller's own answer, or ``None`` to read the process:
+    ``delegated_child`` and ``cron_run`` default to the predicates in
+    ``tools/kanban_ownership.py``, asked with ``on_unknown=True`` because a
+    reader that raises must not let this charge or block a card somebody else
+    is working; ``goal_mode`` defaults to the flag the dispatcher sets.
+    """
     if delegated_child is None:
-        # on_unknown=True: a reader that raises must not let this charge a
-        # ``timed_out`` to a parent's card and release its claim mid-run.
         delegated_child = is_delegated_child(on_unknown=True)
     if delegated_child:
         # task_id here is the PARENT's card, inherited through the shared
         # process. The child owns no card and must not touch that one.
-        return False
+        return True
     if cron_run is None:
-        # on_unknown=True, same rule from the other side: the dispatcher is still
-        # blocked on this run, and a wrong "not cron" releases its claim.
         cron_run = in_cron_run(on_unknown=True)
     if cron_run:
         # task_id here is the DISPATCHER's card, inherited: this run has none of
         # its own and may not terminate that one. See the docstring.
-        return False
+        return True
     if goal_mode is None:
-        goal_mode = os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1"
-    return not goal_mode
+        goal_mode = os.environ.get(GOAL_MODE_ENV) == GOAL_MODE_ON
+    return bool(goal_mode)
 
 
 def task_is_still_running(conn, task_id: str) -> bool:
@@ -279,6 +378,9 @@ def record_missing_terminal_call(
     turn_exit_reason,
     connect,
     record_failure,
+    block_task=None,
+    last_api_failure=None,
+    run_id=None,
 ) -> bool:
     """Charge a leaked exit to the card's failure budget. Returns whether it did.
 
@@ -288,6 +390,13 @@ def record_missing_terminal_call(
     path uses: the card is still ``running`` with an open run, and this hands
     both back.
 
+    One exit is not charged but blocked: ``all_retries_exhausted_no_response``
+    when ``last_api_failure`` (the ``(reason, summary)`` pair the loop's error
+    handler stashed) says the last failure was a rate limit and ``block_task``
+    (``hermes_cli.kanban_db.block_task``) was given. That is
+    ``record_rate_limit_block``; see the module docstring for why a 429 is a
+    reason on the board rather than a count against the card.
+
     ``event_payload_extra`` reaches only the ``gave_up`` event, on the attempt
     that trips the breaker — the per-attempt ``timed_out`` event carries a fixed
     ``{error, failures}`` payload. So the exit reason has to travel in the error
@@ -295,6 +404,18 @@ def record_missing_terminal_call(
     ``missing_terminal_error`` is for; the structured copy is a convenience for
     the one event a human is most likely to read.
     """
+    if block_task is not None and is_rate_limit_exhaustion(
+        turn_exit_reason, last_api_failure
+    ):
+        failure_reason, error_text = last_api_failure
+        return record_rate_limit_block(
+            task_id=task_id,
+            failure_reason=failure_reason,
+            error_text=error_text,
+            connect=connect,
+            block_task=block_task,
+            run_id=run_id,
+        )
     conn = connect()
     try:
         if not task_is_still_running(conn, task_id):
@@ -317,3 +438,166 @@ def record_missing_terminal_call(
             conn.close()
         except Exception:
             pass
+
+
+def is_rate_limit_failure(failure_reason) -> bool:
+    """Whether a ``failure_reason`` names a provider throttle, not a task error."""
+    return str(failure_reason or "") in RATE_LIMIT_FAILURE_REASONS
+
+
+def is_rate_limit_exhaustion(turn_exit_reason, last_api_failure) -> bool:
+    """Whether a retries-exhausted exit was the retry loop losing to a 429.
+
+    ``last_api_failure`` is the ``(reason, summary)`` pair the loop's error
+    handler stashes on the agent after every classified failure. Anything but a
+    two-item pair whose reason is a rate limit answers ``False``, which keeps
+    the other six leaking exits on the ``timed_out`` path.
+    """
+    if str(turn_exit_reason) != RETRIES_EXHAUSTED_EXIT_REASON:
+        return False
+    try:
+        failure_reason, _ = last_api_failure
+    except (TypeError, ValueError):
+        return False
+    return is_rate_limit_failure(failure_reason)
+
+
+def rate_limit_block_reason(failure_reason, error_text) -> str:
+    """The reason written on the card: what happened, then the provider's text.
+
+    The text is what ``_summarize_api_error`` produced, already redacted and
+    truncated by upstream; the bound here covers a caller that hands us more.
+    """
+    text = " ".join(str(error_text or "").split()) or RATE_LIMIT_REASON_NO_TEXT
+    return (
+        f"{RATE_LIMIT_REASON_PREFIX} (failure_reason={failure_reason}): "
+        f"{text[:BLOCK_REASON_MAX_CHARS]}"
+    )
+
+
+def worker_run_id(environ=None):
+    """This worker's dispatcher run id, or ``None`` when unset or unparseable.
+
+    Mirrors ``tools.kanban_tools._worker_run_id``: passing it as
+    ``expected_run_id`` pins the block to the run the dispatcher opened, so a
+    worker that has been superseded cannot block a card someone else now holds.
+    """
+    env = os.environ if environ is None else environ
+    raw = env.get(RUN_ID_ENV)
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def should_block_rate_limited(
+    *,
+    task_id,
+    failure_reason,
+    goal_mode=None,
+    cron_run=None,
+    delegated_child=None,
+) -> bool:
+    """Whether a rate-limited exit is one this worker may block its card for.
+
+    The exclusions are ``should_record_missing_terminal``'s, for the same
+    reasons: a delegated child or a cron run holds somebody else's task id, and
+    a goal-mode card is owned by the goal loop (whose ``kanban_block`` refuses
+    ``transient``). ``failed`` is not consulted: this predicate exists for the
+    ``failed=True`` return that the finalize_turn backstop rules out.
+    """
+    if not task_id:
+        return False
+    if not is_rate_limit_failure(failure_reason):
+        return False
+    return not card_is_somebody_elses(
+        goal_mode=goal_mode, cron_run=cron_run, delegated_child=delegated_child
+    )
+
+
+def record_rate_limit_block(
+    *,
+    task_id: str,
+    failure_reason,
+    error_text,
+    connect,
+    block_task,
+    run_id=None,
+) -> bool:
+    """Block the card with the provider's 429 text. Returns whether it did.
+
+    ``connect`` is ``hermes_cli.kanban_db.connect`` and ``block_task`` is
+    ``hermes_cli.kanban_db.block_task``, both injected. The board is consulted
+    first, as everywhere in this module: a card no longer ``running`` was moved
+    by a terminal tool or by the other site, and is left alone. ``block_task``
+    itself re-checks under its write transaction and returns ``False`` when the
+    card or its run moved in between.
+    """
+    conn = connect()
+    try:
+        if not task_is_still_running(conn, task_id):
+            return False
+        return bool(
+            block_task(
+                conn,
+                task_id,
+                reason=rate_limit_block_reason(failure_reason, error_text),
+                kind=RATE_LIMIT_BLOCK_KIND,
+                expected_run_id=run_id,
+            )
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def block_rate_limited_worker(
+    result,
+    *,
+    connect=None,
+    block_task=None,
+    environ=None,
+    goal_mode=None,
+    cron_run=None,
+    delegated_child=None,
+) -> bool:
+    """The ``cli.py`` site: block the card for a ``failed`` rate-limit result.
+
+    ``result`` is what ``run_conversation`` returned. Anything that is not a
+    ``failed`` dict with a rate-limit ``failure_reason`` is not this function's
+    business and returns ``False`` without touching the board. ``connect`` and
+    ``block_task`` default to ``hermes_cli.kanban_db``, imported here so the
+    module stays importable on a host without Hermes.
+    """
+    if not isinstance(result, dict) or not result.get("failed"):
+        return False
+    env = os.environ if environ is None else environ
+    task_id = env.get(TASK_ENV)
+    failure_reason = result.get("failure_reason")
+    if goal_mode is None:
+        goal_mode = env.get(GOAL_MODE_ENV) == GOAL_MODE_ON
+    if not should_block_rate_limited(
+        task_id=task_id,
+        failure_reason=failure_reason,
+        goal_mode=goal_mode,
+        cron_run=cron_run,
+        delegated_child=delegated_child,
+    ):
+        return False
+    if connect is None or block_task is None:
+        from hermes_cli import kanban_db as _kb
+
+        connect = connect or _kb.connect
+        block_task = block_task or _kb.block_task
+    return record_rate_limit_block(
+        task_id=task_id,
+        failure_reason=failure_reason,
+        error_text=result.get("error"),
+        connect=connect,
+        block_task=block_task,
+        run_id=worker_run_id(env),
+    )
