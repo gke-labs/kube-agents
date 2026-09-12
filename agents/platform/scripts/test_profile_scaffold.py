@@ -407,6 +407,14 @@ class EnsureProfileTest(unittest.TestCase):
 
         self.assertEqual(stat.S_IMODE(self.home.stat().st_mode), 0o775)
 
+    def test_pre_existing_profile_home_chmod_oserror_tolerated(self):
+        """OSError during chmod on pre-existing home (e.g. read-only mount) is tolerated."""
+        self.home.mkdir(parents=True)
+        (self.home / "USER.md").write_text("cluster identity\n")
+        with unittest.mock.patch.object(Path, "chmod", side_effect=OSError("Read-only filesystem")):
+            self.ensure()
+        self.assertTrue((self.home / "USER.md").is_file())
+
     def test_a_failed_create_on_a_fresh_home_is_fatal(self):
         self.fail_create = True
         with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
