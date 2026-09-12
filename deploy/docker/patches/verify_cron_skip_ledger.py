@@ -2,7 +2,7 @@
 """Build gate for the cron skip-ledger patch.
 
 Run by ``deploy/docker/Dockerfile`` from ``/opt/hermes`` after
-``apply_cron_skip_ledger.py``. The applier proves seventeen anchors matched and
+``apply_cron_skip_ledger.py``. The applier proves nineteen anchors matched and
 that five files still parse; it proves nothing about whether a skip actually
 reaches the ledger, and this patch fails silently in both directions if it does
 not.
@@ -27,9 +27,11 @@ The six checks:
 
 1. SHAPE, ON THE REAL TREE. The prune is per job; ``_ensure_skip_schema`` runs
    before the indexes it invalidates; the ledger write in the in-process guard
-   is outside ``_running_lock``; the cross-process guard releases the running
-   slot before writing. Each is an ordering the applier's text match cannot see
-   and a behavioural check would only catch under contention.
+   is outside ``_running_lock``; the cross-process guard and the
+   ``create_execution`` failure path both release the running slot (and the
+   latter the flock) before writing; ``_process_job`` no longer closes a lost
+   fire claim as failed. Each is an ordering the applier's text match cannot
+   see and a behavioural check would only catch under contention.
 2. THE MIGRATION. Legacy DDL, rows in it, driven through ``list_executions``.
    Rows preserved, CHECK widened and still enforced, indexes back, scratch
    table gone, second pass a no-op.
@@ -37,9 +39,10 @@ The six checks:
    terminal-once still holding.
 4. TELEMETRY. ``project_execution_event`` must not launder ``skipped`` into
    ``unknown`` — the state that means an owner process died mid-run.
-5. THE FIVE REASONS, END TO END. Three ``tick`` guards, ``run_one_job``'s
-   dispatch claim, and a genuinely stale job store through the real
-   ``cron.jobs.get_due_jobs``.
+5. THE SEVEN REASONS, END TO END. Three ``tick`` guards, a
+   ``create_execution`` that raises under ``tick``, ``run_one_job``'s dispatch
+   claim, a fire claim the worker loses inside ``tick``'s own pool, and a
+   genuinely stale job store through the real ``cron.jobs.get_due_jobs``.
 6. RETENTION. A flood of one job's rows must not evict another job's, which is
    the live failure this half of the patch exists to fix.
 
@@ -96,6 +99,11 @@ QUIET_JOB = "compliance-audit"
 #: A third id, used only by the dispatch guards. Retention is asserted against
 #: exact row counts for the two above, so the driven skips must land elsewhere.
 DISPATCH_JOB = "fleet-audit"
+#: A fourth, for the lost fire claim: that check asserts the job's rows are
+#: exactly one skipped row and nothing else, so it cannot share an id.
+CLAIM_LOST_JOB = "drift-audit"
+#: The message the injected create_execution raises with; the row must carry it.
+INJECTED_CAUSE = "injected: executions ledger unavailable"
 LEGACY_ROWS = 40
 
 FAILURES: list = []
@@ -193,6 +201,51 @@ def check_shape() -> None:
             "reaching into the set here re-implements the lock discipline "
             "that release_running_job now owns",
         )
+        handlers = [
+            ast.unparse(n)
+            for n in ast.walk(guard)
+            if isinstance(n, ast.ExceptHandler)
+            and "execution creation failed" in ast.unparse(n)
+        ]
+        check(
+            "the create_execution failure path is still where it was",
+            len(handlers) == 1,
+            f"{len(handlers)} handlers log that message",
+        )
+        if len(handlers) == 1:
+            handler = handlers[0]
+            released = handler.find("release_running_job(job_id)")
+            unlocked = handler.find("_job_lock.release()")
+            recorded = handler.find("SKIP_CREATE_EXECUTION_FAILED")
+            check(
+                "a failed create_execution records a skip",
+                recorded >= 0,
+                "next_run_at had already advanced, so the occurrence is gone "
+                "with nothing but a stack trace the pod rotates out in hours",
+            )
+            check(
+                "after the running slot and the flock are released",
+                0 <= released < recorded and 0 <= unlocked < recorded,
+                "a slow ledger write would hold the job in the running set or "
+                "the flock, suppressing it on the next tick as well",
+            )
+
+    process = function_named(scheduler, "_process_job")
+    check("_process_job still re-takes the fire claim", process is not None)
+    if process is not None:
+        src = ast.unparse(process)
+        check(
+            "a lost fire claim closes the claimed row as skipped",
+            "skip_execution(" in src and "SKIP_FIRE_CLAIM_LOST" in src,
+            "an at-most-once guarantee working as designed is still written "
+            "as a failure",
+        )
+        check(
+            "and the FAILED write is gone",
+            "finish_execution(" not in src,
+            "the upstream close survived alongside the skip, so the row is "
+            "written twice or the second write is refused",
+        )
 
     # The same pair of guards, in the run half a manual fire and a background
     # dispatch share. Both sit after claim_job_for_fire, so both drop a
@@ -283,6 +336,22 @@ def ledger_objects(kind: str) -> set:
                 "SELECT name FROM sqlite_master WHERE type=? "
                 "AND name NOT LIKE 'sqlite_%'",
                 (kind,),
+            )
+        }
+    finally:
+        conn.close()
+
+
+def statuses_for(job_id: str) -> dict:
+    """``{status: count}`` for one job, so a check can say "one skip, nothing else"."""
+    conn = sqlite3.connect(f"file:{LEDGER}?mode=ro", uri=True)
+    try:
+        return {
+            r[0]: r[1]
+            for r in conn.execute(
+                "SELECT status, count(*) FROM executions WHERE job_id=? "
+                "GROUP BY status",
+                (job_id,),
             )
         }
     finally:
@@ -426,7 +495,7 @@ def check_telemetry(record, reasons) -> None:
     )
 
 
-# --- 5. the five reasons, end to end -----------------------------------------
+# --- 5. the seven reasons, end to end ----------------------------------------
 
 
 def check_tick_guards(sched, reasons) -> None:
@@ -480,6 +549,48 @@ def check_tick_guards(sched, reasons) -> None:
         "a rollout silently eats the occurrences that were mid-dispatch",
     )
 
+    # The guard has passed the shutdown check, registered the job and taken
+    # its flock by the time create_execution runs, so this is the one path
+    # that has to give back two things before it writes.
+    def _refuse_create(job_id, source="builtin", **kwargs):
+        raise RuntimeError(INJECTED_CAUSE)
+
+    real_create = sched.create_execution
+    sched.create_execution = _refuse_create
+    try:
+        sched.tick(verbose=False, sync=True)
+    finally:
+        sched.create_execution = real_create
+    rows = [
+        r
+        for r in skips_for(reasons.SKIP_CREATE_EXECUTION_FAILED)
+        if r["job_id"] == CHATTY_JOB
+    ]
+    check(
+        "a failed create_execution is recorded",
+        bool(rows),
+        "next_run_at had already advanced, so the occurrence is gone with "
+        "nothing but a stack trace behind it",
+    )
+    check(
+        "with its cause",
+        bool(rows) and all(INJECTED_CAUSE in (r["error"] or "") for r in rows),
+        f"details {[r['error'] for r in rows]!r}",
+    )
+    check(
+        "and the job is not left wedged in the running set",
+        CHATTY_JOB not in sched.get_running_job_ids(),
+    )
+    reclaimed = sched._job_locks.claim(CHATTY_JOB)
+    check(
+        "and its flock is claimable again",
+        reclaimed is not None,
+        "the per-job lock was still held after the guard returned, so the "
+        "next tick reads already_running_elsewhere for a job that is not",
+    )
+    if reclaimed is not None:
+        reclaimed.release()
+
     real_claim_dispatch = sched.claim_dispatch
     sched.claim_dispatch = lambda job_id: False
     try:
@@ -493,6 +604,54 @@ def check_tick_guards(sched, reasons) -> None:
         "an at-most-once guarantee working as designed is still inflating the "
         "failure rate cron_health derives",
     )
+
+    # Through the real pool: tick creates the claimed row and submits
+    # _run_and_release, whose _process_job re-takes the fire claim and loses.
+    # sync=True waits for the future, so the ledger is settled on return.
+    from agent.monitoring.cron_health import project_execution_event
+
+    sched.get_due_jobs = lambda: [{"id": CLAIM_LOST_JOB, "name": "Drift Audit"}]
+    real_claim_fire = sched.claim_job_for_fire
+    sched.claim_job_for_fire = lambda job_id, **kwargs: None
+    try:
+        sched.tick(verbose=False, sync=True)
+    finally:
+        sched.claim_job_for_fire = real_claim_fire
+        sched.get_due_jobs = lambda: [dict(job)]
+    statuses = statuses_for(CLAIM_LOST_JOB)
+    check(
+        "a lost fire claim is recorded as skipped, not failed",
+        statuses.get("skipped") == 1,
+        f"rows by status {statuses!r} — an at-most-once guarantee working as "
+        "designed is still counted as a fault",
+    )
+    check(
+        "and the claimed row was closed in place, not left beside a new one",
+        statuses == {"skipped": 1},
+        f"rows by status {statuses!r}",
+    )
+    lost = [
+        r
+        for r in skips_for(reasons.SKIP_FIRE_CLAIM_LOST)
+        if r["job_id"] == CLAIM_LOST_JOB
+    ]
+    check("under its own reason", len(lost) == 1, f"{len(lost)} rows")
+    if lost:
+        event = project_execution_event(lost[0])
+        check(
+            "and cron_health projects it as a skip with that reason",
+            event.status == "skipped"
+            and event.error_class == reasons.SKIP_FIRE_CLAIM_LOST,
+            f"status={event.status!r} error_class={event.error_class!r}",
+        )
+    if rows:
+        event = project_execution_event(rows[0])
+        check(
+            "as it does the creation failure",
+            event.status == "skipped"
+            and event.error_class == reasons.SKIP_CREATE_EXECUTION_FAILED,
+            f"status={event.status!r} error_class={event.error_class!r}",
+        )
 
 
 def check_dispatch_guards(sched, reasons) -> None:

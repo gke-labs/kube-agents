@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Wire tools/cron_skip_ledger.py into the Hermes source tree.
 
-Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. Seventeen anchored
+Run by ``deploy/docker/Dockerfile`` against ``/opt/hermes``. Nineteen anchored
 replacements across five files, with the same guarantee as every other patch in
 that Dockerfile: each anchor must be found the exact number of times expected,
 each edited file must still parse, and anything else fails the build loudly
@@ -144,7 +144,7 @@ EXEC_NEW_FUNCTIONS_PATCHED = '''def record_skipped_execution(
     kube-agents patch. Written straight into a terminal state because there is
     no claim to transition from: the decision not to run is taken before
     dispatch, which is precisely why upstream had nowhere to put it. See
-    tools/cron_skip_ledger.py for the five ways this happens.
+    tools/cron_skip_ledger.py for the seven ways this happens.
 
     ``pid`` and ``process_started_at`` describe the process that made the
     decision, not a runner — they are what tells two racing tickers apart once
@@ -182,11 +182,12 @@ def skip_execution(
 ) -> Optional[Dict[str, Any]]:
     """Close an already-claimed attempt as skipped rather than failed.
 
-    kube-agents patch. For the one path that claims first and only then learns
+    kube-agents patch. For the two paths that claim first and only then learn
     the occurrence must not run: a finite one-shot whose dispatch budget was
-    already spent. Upstream closed that as ``failed``, which both inflates the
-    failure rate cron_health derives and libels an at-most-once guarantee that
-    is working exactly as designed. Terminal-once, like ``finish_execution``.
+    already spent, and a worker whose re-taken fire claim lost to another
+    owner. Upstream closed both as ``failed``, which both inflates the failure
+    rate cron_health derives and libels an at-most-once guarantee that is
+    working exactly as designed. Terminal-once, like ``finish_execution``.
     """
     now = _hermes_now().isoformat()
     code = _normalize_skip_reason(reason)
@@ -210,7 +211,7 @@ def skip_execution(
 
 ''' + EXEC_NEW_FUNCTIONS_ANCHOR
 
-# --- cron/scheduler.py: record the four ways a due occurrence is dropped ----
+# --- cron/scheduler.py: record the six ways a due occurrence is dropped -----
 
 SCHED_IMPORT = (
     "from cron.executions import create_execution, finish_execution, "
@@ -230,7 +231,9 @@ SCHED_IMPORT_PATCHED = (
     "from tools.cron_skip_ledger import (\n"
     "    SKIP_ALREADY_RUNNING,\n"
     "    SKIP_ALREADY_RUNNING_ELSEWHERE,\n"
+    "    SKIP_CREATE_EXECUTION_FAILED,\n"
     "    SKIP_DISPATCH_CLAIM_REJECTED,\n"
+    "    SKIP_FIRE_CLAIM_LOST,\n"
     "    SKIP_INTERPRETER_SHUTDOWN,\n"
     "    record_skip,\n"
     ")"
@@ -363,6 +366,86 @@ SCHED_DISPATCH_CLAIM_PATCHED = '''            # kube-agents patch: a one-shot th
                 detail="Dispatch claim rejected; execution was not started.",
             )
             return True  # not an error — already handled/removed
+'''
+
+# The ``except`` around ``create_execution``, new in v2026.8.19. Anchored on the
+# ``logger.exception`` call rather than on the releases above it, because the
+# ``_job_lock.release()`` line among them is apply_cron_tick_lock_scope.py's
+# insertion and this anchor should not be a third one that depends on it. The
+# message text is unique in the file. The write goes after the log call, so
+# ``release_running_job`` and the flock release have both already run — the
+# ordering every other guard keeps, and the one check_shape asserts.
+SCHED_CREATE_EXECUTION_ERR = '''                logger.exception(
+                    "Job '%s' not dispatched: execution creation failed: %s",
+                    job.get("name", job_id),
+                    execution_err,
+                )
+                return None
+'''
+
+SCHED_CREATE_EXECUTION_ERR_PATCHED = '''                logger.exception(
+                    "Job '%s' not dispatched: execution creation failed: %s",
+                    job.get("name", job_id),
+                    execution_err,
+                )
+                # kube-agents patch: next_run_at was advanced for this whole
+                # due set before dispatch, so the occurrence is gone, and the
+                # stack trace above is rotated out of the pod in hours. Written
+                # after the running slot and the flock are released, like every
+                # other guard. A failure of the ledger itself cannot be recorded
+                # this way — record_skip writes to the same file and swallows.
+                # See tools/cron_skip_ledger.py.
+                record_skip(
+                    job_id,
+                    source="builtin",
+                    reason=SKIP_CREATE_EXECUTION_FAILED,
+                    detail=(
+                        "Execution record could not be created before "
+                        f"dispatch ({type(execution_err).__name__}: "
+                        f"{execution_err}); the job was not run and its "
+                        "schedule had already advanced."
+                    ),
+                )
+                return None
+'''
+
+# ``_process_job``, the body ``_run_and_release`` runs on the worker. It
+# re-takes the fire claim at execution time (v2026.8.19) and, when that CAS
+# loses, upstream closes the claimed row as failed. The row is still
+# ``claimed`` here — nothing has marked it running — so ``skip_execution``
+# closes it in place; the ``return True`` that tells the tick the occurrence
+# was handled is unchanged.
+SCHED_FIRE_CLAIM_LOST = '''                finish_execution(
+                    job["execution_id"],
+                    success=False,
+                    error="Fire claim lost; execution was not started.",
+                )
+                return True
+'''
+
+SCHED_FIRE_CLAIM_LOST_PATCHED = '''                # kube-agents patch: the re-taken fire claim was refused and
+                # this worker stood down without running. Usually another
+                # owner holds a fresh claim — at-most-once working, not a
+                # failure — but claim_job_for_fire also returns False for a
+                # job no longer runnable and for a fire fence that timed out
+                # or could not be opened, and this call site cannot tell them
+                # apart. Closed as failed it inflated the failure rate
+                # cron_health derives from this ledger; closed as skipped the
+                # count of the code is the signal, and upstream's fence log
+                # lines name the infrastructure causes. See
+                # tools/cron_skip_ledger.py.
+                skip_execution(
+                    job["execution_id"],
+                    reason=SKIP_FIRE_CLAIM_LOST,
+                    detail=(
+                        "Fire claim was not obtained at execution time; the "
+                        "execution was not started. Another owner holds a "
+                        "fresh claim, the job is no longer runnable, or the "
+                        "fire fence timed out or could not be opened; the "
+                        "scheduler log names which."
+                    ),
+                )
+                return True
 '''
 
 # --- cron/jobs.py: the outage that hides itself -----------------------------
@@ -577,6 +660,8 @@ PATCHES = (
             (SCHED_RUNNING_GUARD, SCHED_RUNNING_GUARD_PATCHED, 1),
             (SCHED_JOB_LOCK_GUARD, SCHED_JOB_LOCK_GUARD_PATCHED, 1),
             (SCHED_DISPATCH_CLAIM, SCHED_DISPATCH_CLAIM_PATCHED, 1),
+            (SCHED_CREATE_EXECUTION_ERR, SCHED_CREATE_EXECUTION_ERR_PATCHED, 1),
+            (SCHED_FIRE_CLAIM_LOST, SCHED_FIRE_CLAIM_LOST_PATCHED, 1),
         ),
     ),
     (
