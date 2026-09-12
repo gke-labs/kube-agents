@@ -162,6 +162,34 @@ class ApplySubstitutionsTest(unittest.TestCase):
         self.assertNotIn(sync.GKE_MANIFEST_GENERATION_OLD_SERVICE_ACCOUNT_SNIPPET, content)
         self.assertIn(sync.GKE_MANIFEST_GENERATION_NEW_SERVICE_ACCOUNT_SNIPPET, content)
 
+    def test_applies_manifest_generation_output_path_substitution(self):
+        d = self._skill_dir(
+            body="        ```bash\n        gcloud container ai profiles manifests create \\\n"
+            "          --output=manifest \\\n"
+            + sync.GKE_MANIFEST_GENERATION_OLD_OUTPUT_PATH_SNIPPET
+            + "\n    -   *Constraint*: You must include all resources returned by this command\n"
+        )
+        self.assertTrue(sync.apply_substitutions(str(d), "gke-manifest-generation"))
+        text = self._read(d)
+        self.assertNotIn("--output-path={output_file_path}", text)
+        self.assertIn(sync.GKE_MANIFEST_GENERATION_NEW_OUTPUT_PATH_SNIPPET, text)
+        self.assertIn("> {output_file_path}", text)
+        self.assertIn("refuses it.", text)
+        # Second call must be a no-op (replacement already present).
+        self.assertFalse(sync.apply_substitutions(str(d), "gke-manifest-generation"))
+        self.assertEqual(self._read(d).count(sync.GKE_MANIFEST_GENERATION_NEW_OUTPUT_PATH_SNIPPET), 1)
+
+    def test_repo_manifest_generation_skill_carries_every_substitution(self):
+        # The in-tree mirror is rmtree'd and re-copied from upstream on every sync, so every local
+        # divergence has to be a registered pair, and the file has to already read as a fresh sync
+        # would leave it: every replacement present exactly once, every target gone.
+        repo_root = Path(__file__).resolve().parent.parent
+        skill_md = repo_root / "agents" / "platform" / "skills" / "gke-manifest-generation" / "SKILL.md"
+        content = skill_md.read_text(encoding="utf-8")
+        for target, replacement in sync.SKILL_SUBSTITUTIONS["gke-manifest-generation"]:
+            self.assertNotIn(target, content)
+            self.assertEqual(content.count(replacement), 1, replacement)
+
     def test_repo_workload_security_skills_have_enforcement_command(self):
         repo_root = Path(__file__).resolve().parent.parent
         for agent in ["platform", "cluster"]:
