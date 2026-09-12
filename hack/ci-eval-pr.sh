@@ -578,17 +578,28 @@ import json, sys
 if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
     sys.exit(\"collected zero runs: source unreadable or empty; refusing to publish an empty dashboard over a good one\")
 " "$2/data.json"
-    # Same --public-url rule as hack/ci-dashboard-refresh.sh: a bucket target
-    # is the published site, so the bare flag emits the <base href> that makes
-    # every relative link resolve there. Without it this hook would overwrite
-    # the refresh job'"'"'s pages with a set whose nav is dead on
-    # storage.cloud.google.com until the next 15-minute refresh.
-    # The parity stops at that flag. That script also renders --health and
-    # --health-history from files it downloads from the bucket first, and this
-    # hook downloads neither, so the Brief it publishes reads NO VERDICT until
-    # the next refresh. Closing that needs the download step, not an argument.
+    # The adjudicator verdict and its history, when the target has them, so the
+    # rendered Brief bakes the current state instead of waiting for the first
+    # page poll (and on storage.cloud.google.com that XHR redirects and fails).
+    # Missing is the normal case until the adjudicator has run.
+    case "$3" in
+      gs://*)
+        gsutil cp "${3%/}/health.json" "$2/health.json" 2>&1 || rm -f "$2/health.json"
+        gsutil cp "${3%/}/health-history.jsonl" "$2/health-history.jsonl" 2>&1 || rm -f "$2/health-history.jsonl"
+        ;;
+      *)
+        [ -f "${3%/}/health.json" ] && cp "${3%/}/health.json" "$2/health.json" || true
+        [ -f "${3%/}/health-history.jsonl" ] && cp "${3%/}/health-history.jsonl" "$2/health-history.jsonl" || true
+        ;;
+    esac
     render_args=()
-    case "$3" in gs://*) render_args+=(--public-url) ;; esac
+    [ -f "$2/health.json" ] && render_args+=(--health "$2/health.json")
+    [ -f "$2/health-history.jsonl" ] && render_args+=(--health-history "$2/health-history.jsonl")
+    # Same --public-url rule as hack/ci-dashboard-refresh.sh: a bucket target
+    # is the published site, so pass the target to derive <base href> without
+    # hardcoding production when targeting a staging bucket. A local directory
+    # target keeps links relative.
+    case "$3" in gs://*) render_args+=(--public-url "$3") ;; esac
     python3 "$1/render.py" --data "$2/data.json" --out-dir "$2/site" ${render_args[@]+"${render_args[@]}"}
     python3 "$1/publish.py" --out-dir "$2/site" --target "$3"
   ' _ "${dash_src}" "${dash_tmp}" "${EVAL_DASHBOARD_TARGET}" >"${dash_tmp}/publish.log" 2>&1 || dash_rc=$?
