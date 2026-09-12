@@ -226,14 +226,21 @@ exhausts either stops mid-task without ever calling a terminal kanban tool. The 
 `timed_out` failure whose error text names how the turn ended — `Iteration budget exhausted (N/M)`
 for `maxTurns`, `turn_exit_reason=all_retries_exhausted_no_response` for `apiMaxRetries` — and
 retrying re-runs into the same wall, so read that text and the upstream error rate before suspecting
-the worker. An exit like this that reaches the dispatcher unexplained surfaces instead as a
-**protocol violation**, which describes the symptom and hides the cause; the image narrows that
-window in [`deploy/docker/patches/kanban_guardrail_exit.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/kanban_guardrail_exit.py).
+the worker. One `apiMaxRetries` exhaustion is handled differently: when the retries were spent on
+provider rate limits (429s), the worker blocks its own card instead, kind `transient`, with the
+provider's error text as the reason; `kanban_unblock` it once the quota window has passed. A
+second rate-limit block after an unblock sends the card to `triage`. An exit like this that reaches
+the dispatcher unexplained surfaces instead as a **protocol violation**, which describes the
+symptom and hides the cause; the image narrows that window in
+[`deploy/docker/patches/kanban_guardrail_exit.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/kanban_guardrail_exit.py).
 
 Sizing notes: `maxTurns` is consumed mostly by repository exploration, so scale it against how much
 the agent has to read rather than how complex the request is. `apiMaxRetries` exists because
 Hermes' default of `3` assumes an interactive session where a human retries; a background worker
-has nobody to retry it, so a transient burst of upstream 429s or 503s simply ends the run. Raising
+has nobody to retry it, so a transient burst of upstream 503s simply ends the run. A 429 retry
+waits out the delay Google states in the error body (up to 600 s) rather than a few seconds, so a
+burst shorter than that window is survived; see
+[`deploy/docker/patches/rate_limit_retry_delay.py`](https://github.com/gke-labs/kube-agents/blob/main/deploy/docker/patches/rate_limit_retry_delay.py). Raising
 `maxTurns` interacts with `maxInProgress`: a worker doing the work holds its slot for the whole
 task and there are only `maxInProgress` of them, so raising one is a reason to reconsider the other.
 A coordinator waiting on work it fanned out is the exception — see
