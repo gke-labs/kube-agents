@@ -14,10 +14,21 @@ only, with schema_version bumped on anything else. The additive fields this
 collector emits beyond the v1 core: `tasks[].reps` (per-repetition grading
 detail, present only when the log carries `rep N:` grading lines),
 `runs[].pr_merged` (whether the run's PR had merged at collection time,
-resolved best-effort through `gh`), `runs[].has_build_log` plus the
-`runs[].pod_*` trio (how the build ended, from Prow's podinfo.json -- read
-only for a build that looks like a lost pod, below) and `releases[]`
-(release-candidate eval runs, below).
+resolved best-effort through `gh`), `runs[].tier` / `runs[].job` (which job
+produced the run: the presubmit gate, or the nightly periodic below),
+`runs[].has_build_log` plus the `runs[].pod_*` trio (how the build ended,
+from Prow's podinfo.json -- read only for a build that looks like a lost
+pod, below) and `releases[]` (release-candidate eval runs, below).
+
+Two tiers, one schema. The presubmit (pull-kube-agents-smoke-test) runs the
+gate matrix on every pull request; the nightly periodic
+(ci-kube-agents-eval-nightly, EVAL_TIER=nightly in the same script) runs the
+full catalogue against main once a day, with no pull request. Both archive
+the same artifact layout, so both parse through build_run; the tier travels
+on the run so every consumer can keep the nightly out of the gate's verdicts
+(tiers.py). Prow's build ids are one global, start-ordered sequence, so the
+newest presubmit id sits far above every nightly id and a shared watermark
+would skip every night: each source keeps its own.
 
 A build whose node went NotReady mid-run (2026-09-11: twelve runs on five
 nodes, #1478) leaves finished.json (`failure`), podinfo.json and no
@@ -35,6 +46,21 @@ is read, never written"), and folding an RC into runs[] would feed it to
 build_cases and move the pass rates the candidate is being measured against.
 
 Sources:
+  --nightly-prefix  Prow's log prefix for the nightly periodic,
+              gs://<bucket>/logs/<job>/: for a periodic that prefix IS the
+              directory index -- one directory per build plus a
+              `latest-build.txt` this collector ignores -- so one `gsutil
+              ls` of it names every build. Given without a value it is the
+              live nightly's prefix (DEFAULT_NIGHTLY_PREFIX); omitted, no
+              nightly scan happens. A prefix that does not list while no
+              night is on record (the job has not run yet) is a note and no
+              nightly runs this scan, not the refusal line below: the
+              nightly is evidence beside the gate, and a missing night must
+              not stop the gate's dashboard from publishing. Once a night is
+              on record, a prefix that stops listing IS the refusal line: a
+              stall, not an absent job.
+  --nightly-job  the job name recorded on nightly runs (`runs[].job`);
+              defaults to the prefix's last path segment.
   --index-prefix  Prow's per-job directory index, gs://<bucket>/pr-logs/
               directory/<job>/: one small `<build_id>.txt` object per build
               holding the gs:// path of that build's directory (plus a
@@ -112,7 +138,30 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
+try:
+    from . import tiers
+except ImportError:  # run as a script: python3 scripts/eval_dashboard/collect.py
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import tiers
+
 SCHEMA_VERSION = 1
+
+# The nightly periodic (oss-test-infra: ci-kube-agents-eval-nightly, the
+# EVAL_TIER=nightly companion of the presubmit) and where Prow archives it.
+# A periodic's log prefix holds one directory per build and a
+# latest-build.txt, so listing it is the directory index; there is no
+# pointer object to follow.
+DEFAULT_NIGHTLY_JOB = "ci-kube-agents-eval-nightly"
+PROW_LOGS_ROOT = "gs://kube-agents-prow/logs"
+DEFAULT_NIGHTLY_PREFIX = f"{PROW_LOGS_ROOT}/{DEFAULT_NIGHTLY_JOB}/"
+# What a build's job is called, read from the build directory's URL: the
+# segment before the build id, for a presubmit
+# (.../pull/<org_repo>/<pr>/<job>/<build>/) and a periodic
+# (.../logs/<job>/<build>/) alike. A --from-dir build has no URL and no job.
+_JOB_IN_PATH = re.compile(r"/(?P<job>[^/]+)/\d+/?$")
+# What a commit id looks like, and how much of one runs[].head_sha keeps.
+_SHA_SHAPE = re.compile(r"^[0-9a-f]{7,40}$")
+HEAD_SHA_CHARS = 7
 
 # The shape of a Prow presubmit build-directory glob,
 # gs://<bucket>/pr-logs/pull/<org_repo>/<pr or *>/<job>/*, from which the
@@ -447,13 +496,21 @@ def parse_podinfo(text: str | None) -> dict | None:
     }
 
 
-def build_run(build_id: str, read, pr_hint: int | None = None) -> dict | None:
+def build_run(
+    build_id: str,
+    read,
+    pr_hint: int | None = None,
+    tier: str = tiers.TIER_PRESUBMIT,
+    job: str | None = None,
+) -> dict | None:
     """Assemble one `runs[]` entry.
 
     `read(name)` returns the text of a file in the build directory, or None.
     Returns None when the build has no parseable finished.json -- the run is
     still in flight or never finished uploading, so there is nothing final to
-    record.
+    record. `tier` and `job` are the source's, not the build's: the same
+    artifact layout parses for both tiers, and a nightly build has no pull
+    request whatever its metadata says.
     """
     finished_text = read("finished.json")
     if finished_text is None:
@@ -520,11 +577,19 @@ def build_run(build_id: str, read, pr_hint: int | None = None) -> dict | None:
     pull = started.get("pull")
     if isinstance(pull, (int, str)) and str(pull).isdigit():
         pr = int(pull)
+    if tier == tiers.TIER_NIGHTLY:
+        # A periodic runs main; the number a hint or a stray `pull` key
+        # might carry is nobody's pull request.
+        pr = None
 
+    # finished.json's `revision` is the tested commit on a presubmit; on a
+    # periodic Prow writes the branch name ("main") there and the commit in
+    # started.json's `repo-commit`, so take whichever one looks like a sha.
     head_sha = None
-    revision = finished.get("revision")
-    if isinstance(revision, str) and revision:
-        head_sha = revision[:7]
+    for candidate in (finished.get("revision"), started.get("repo-commit")):
+        if isinstance(candidate, str) and _SHA_SHAPE.match(candidate):
+            head_sha = candidate[:HEAD_SHA_CHARS]
+            break
 
     started_ts = started.get("timestamp")
     finished_ts = finished.get("timestamp")
@@ -537,6 +602,8 @@ def build_run(build_id: str, read, pr_hint: int | None = None) -> dict | None:
 
     return {
         "build_id": str(build_id),
+        "tier": tier,
+        "job": job,
         "pr": pr,
         "head_sha": head_sha,
         "project": parsed["project"],
@@ -668,8 +735,23 @@ def task_domain(name: str, repo_root: pathlib.Path = REPO_ROOT) -> str:
         text = path.read_text()
     except OSError:
         return "unknown"
-    m = re.search(r"^domain:\s*([A-Za-z0-9_-]+)\s*$", text, re.M)
+    m = re.search(r"^domain:\s*([A-Za-z0-9_-]+)\s*$", text, re.MULTILINE)
     return m.group(1) if m else "unknown"
+
+
+def _task_array_names(text: str, array: str) -> set[str]:
+    """The uncommented `./tasks/<name>/task.yaml` entries of one bash array."""
+    m = re.search(rf"^{array}=\(\n(.*?)^\)$", text, re.MULTILINE | re.DOTALL)
+    if not m:
+        raise ValueError(f"{array}=( ... ) array not found in hack/ci-eval-pr.sh")
+    names = set()
+    for line in m.group(1).splitlines():
+        line = line.strip()
+        if line.startswith('"') and line.endswith('"'):
+            entry = re.fullmatch(r"\./tasks/([^/]+)/task\.yaml", line.strip('"'))
+            if entry:
+                names.add(entry.group(1))
+    return names
 
 
 def active_task_names(repo_root: pathlib.Path = REPO_ROOT) -> set[str]:
@@ -679,17 +761,20 @@ def active_task_names(repo_root: pathlib.Path = REPO_ROOT) -> set[str]:
     script provisions clusters, so executing it to ask is not an option.
     """
     text = (repo_root / "hack" / "ci-eval-pr.sh").read_text()
-    m = re.search(r"^TASKS=\(\n(.*?)^\)$", text, re.M | re.S)
-    if not m:
-        raise ValueError("TASKS=( ... ) array not found in hack/ci-eval-pr.sh")
-    active = set()
-    for line in m.group(1).splitlines():
-        line = line.strip()
-        if line.startswith('"') and line.endswith('"'):
-            entry = re.fullmatch(r"\./tasks/([^/]+)/task\.yaml", line.strip('"'))
-            if entry:
-                active.add(entry.group(1))
-    return active
+    return _task_array_names(text, "TASKS")
+
+
+def nightly_task_names(repo_root: pathlib.Path = REPO_ROOT) -> set[str]:
+    """Case names the nightly runs: TASKS plus the uncommented NIGHTLY_TASKS.
+
+    EVAL_TIER=nightly appends NIGHTLY_TASKS to TASKS in hack/ci-eval-pr.sh,
+    so the nightly matrix is the presubmit's superset by construction.
+    """
+    return nightly_task_names_from((repo_root / "hack" / "ci-eval-pr.sh").read_text())
+
+
+def nightly_task_names_from(text: str) -> set[str]:
+    return _task_array_names(text, "TASKS") | _task_array_names(text, "NIGHTLY_TASKS")
 
 
 def coverage(repo_root: pathlib.Path = REPO_ROOT) -> dict:
@@ -700,7 +785,7 @@ def coverage(repo_root: pathlib.Path = REPO_ROOT) -> dict:
     and the unit tests here assert this parse agrees with it.
     """
     text = (repo_root / "docs" / "designs" / "domains.yaml").read_text()
-    slugs = re.findall(r"^\s*-\s*slug:\s*([A-Za-z0-9_-]+)", text, re.M)
+    slugs = re.findall(r"^\s*-\s*slug:\s*([A-Za-z0-9_-]+)", text, re.MULTILINE)
     uncovered = []
     in_allowlist = False
     for line in text.splitlines():
@@ -729,39 +814,60 @@ def coverage(repo_root: pathlib.Path = REPO_ROOT) -> dict:
 # --------------------------------------------------------------------------
 
 
+def _case_history(runs: list[dict]) -> dict[str, list[tuple[dict, dict]]]:
+    history: dict[str, list[tuple[dict, dict]]] = {}
+    for run in runs:
+        for task in run["tasks"]:
+            history.setdefault(task["name"], []).append((run, task))
+    return history
+
+
+def _graded_pass_rate(results: list[str]) -> float | None:
+    """pass / (pass + fail); None when nothing on record was graded."""
+    graded = [r for r in results if r != "infra"]
+    passes = sum(1 for r in graded if r == "pass")
+    return round(passes / len(graded), 4) if graded else None
+
+
 def build_cases(runs: list[dict], repo_root: pathlib.Path = REPO_ROOT) -> list[dict]:
     """Derive per-case history from chronologically ordered runs.
 
     INFRA results never count against a case: they are excluded from the
     pass_rate denominator and from the duration stats, though they do appear
     in runs_on_record and last3 (they are still history).
+
+    The per-case fields are the PRESUBMIT's record, as they were before the
+    nightly existed; the nightly's record sits beside them under `nightly`,
+    never pooled into them, so a hold-out's admission evidence and the
+    gate's own history stay two numbers. A case only the nightly has run is
+    still on record, with an empty presubmit side.
     """
-    active = active_task_names(repo_root)
-    history: dict[str, list[tuple[dict, dict]]] = {}
-    for run in runs:
-        for task in run["tasks"]:
-            history.setdefault(task["name"], []).append((run, task))
+    script = (repo_root / "hack" / "ci-eval-pr.sh").read_text()
+    active = _task_array_names(script, "TASKS")
+    nightly_active = nightly_task_names_from(script)
+    history = _case_history(tiers.presubmit_runs(runs))
+    nightly_history = _case_history(tiers.nightly_runs(runs))
 
     cases = []
-    for name in sorted(history):
-        entries = history[name]
+    for name in sorted(set(history) | set(nightly_history)):
+        entries = history.get(name, [])
         results = [task["result"] for _, task in entries]
-        graded = [r for r in results if r != "infra"]
-        passes = sum(1 for r in graded if r == "pass")
         durations = [
             task["duration_s"]
             for _, task in entries
             if task["result"] != "infra" and task["duration_s"] is not None
         ]
+        nightly_results = [task["result"] for _, task in nightly_history.get(name, [])]
         cases.append(
             {
                 "name": name,
                 "domain": task_domain(name, repo_root),
                 "active": name in active,
+                "nightly_active": name in nightly_active,
                 "runs_on_record": len(entries),
                 # null when every run on record was an infra failure: there
                 # is nothing graded to rate.
-                "pass_rate": round(passes / len(graded), 4) if graded else None,
+                "pass_rate": _graded_pass_rate(results),
                 "last3": results[-3:],
                 "durations": {
                     "min": min(durations) if durations else None,
@@ -773,6 +879,11 @@ def build_cases(runs: list[dict], repo_root: pathlib.Path = REPO_ROOT) -> list[d
                     for run, task in entries
                     if task["outcome_validity"] is not None
                 ],
+                "nightly": {
+                    "runs_on_record": len(nightly_results),
+                    "pass_rate": _graded_pass_rate(nightly_results),
+                    "last3": nightly_results[-3:],
+                },
             }
         )
     return cases
@@ -925,6 +1036,12 @@ def _admitted(build_id: str, after_build: int | None, retry_builds: frozenset[st
     return after_build is None or int(build_id) > after_build or build_id in retry_builds
 
 
+def _job_from_base(base: str) -> str | None:
+    """The job name in a build directory's URL, or None when it has none."""
+    m = _JOB_IN_PATH.search(base)
+    return m.group("job") if m else None
+
+
 def _build_dirs(listing: str) -> list[tuple[str, str]]:
     """(build_id, directory URL) pairs from one `gsutil ls` listing.
 
@@ -970,16 +1087,22 @@ def _gcs_reader(base: str, gsutil: str):
 
 
 def _read_build(
-    build_id: str, base: str, gsutil: str, since_cutoff: datetime | None
+    build_id: str,
+    base: str,
+    gsutil: str,
+    since_cutoff: datetime | None,
+    tier: str = tiers.TIER_PRESUBMIT,
+    job: str | None = None,
 ) -> tuple[str, dict | None, str]:
     """One build's reads: (build_id, run or None, _RECORDED/_UNFINISHED/_FILTERED).
 
     `base` is the build directory's gs:// URL with its trailing slash. Runs
     on a worker thread, so it touches nothing shared: every outcome travels
-    back in the return value.
+    back in the return value. `job` overrides the name read from the URL.
     """
     m = _PR_IN_PATH.search(base)
     pr_hint = int(m.group(1)) if m else None
+    job = job or _job_from_base(base)
     reader = _gcs_reader(base, gsutil)
     if since_cutoff is not None:
         # One probe read decides whether to pay the other two. An
@@ -990,7 +1113,7 @@ def _read_build(
         if started_at is not None and started_at < since_cutoff:
             return build_id, None, _FILTERED
     try:
-        run = build_run(build_id, reader, pr_hint)
+        run = build_run(build_id, reader, pr_hint, tier=tier, job=job)
     except Exception as exc:  # noqa: BLE001 -- one bad build must not kill the sweep
         print(f"warning: build {build_id}: {exc}; skipping", file=sys.stderr)
         return build_id, None, _UNFINISHED
@@ -1005,6 +1128,8 @@ def _read_builds(
     gsutil: str,
     since_cutoff: datetime | None,
     unfinished: set[str] | None,
+    tier: str = tiers.TIER_PRESUBMIT,
+    job: str | None = None,
 ) -> list[dict]:
     """Read `(build_id, base_url)` candidates READ_WORKERS at a time.
 
@@ -1016,7 +1141,8 @@ def _read_builds(
     runs = []
     with ThreadPoolExecutor(max_workers=READ_WORKERS) as pool:
         results = pool.map(
-            lambda c: _read_build(c[0], c[1], gsutil, since_cutoff), candidates
+            lambda c: _read_build(c[0], c[1], gsutil, since_cutoff, tier=tier, job=job),
+            candidates,
         )
         for build_id, run, status in results:
             if status == _RECORDED:
@@ -1163,12 +1289,74 @@ def runs_from_gcs(
         if listing is None:
             print(f"warning: gsutil ls failed for {glob}; skipping", file=sys.stderr)
             continue
-        candidates: list[tuple[str, str]] = []
-        for build_id, line in _build_dirs(listing):
-            if _admitted(build_id, after_build, retry_builds):
-                candidates.append((build_id, line))
+        candidates = _build_dirs_in_listing(listing, after_build, retry_builds)
         runs.extend(_read_builds(candidates, gsutil, since_cutoff, unfinished))
     return runs
+
+
+def _build_dirs_in_listing(
+    listing: str, after_build: int | None, retry_builds: frozenset[str]
+) -> list[tuple[str, str]]:
+    """The admitted `(build_id, directory URL)` pairs in a `gsutil ls` listing."""
+    return [
+        (build_id, line)
+        for build_id, line in _build_dirs(listing)
+        if _admitted(build_id, after_build, retry_builds)
+    ]
+
+
+def runs_from_periodic(
+    prefix: str,
+    gsutil: str = "gsutil",
+    after_build: int | None = None,
+    since_cutoff: datetime | None = None,
+    retry_builds: frozenset[str] = frozenset(),
+    unfinished: set[str] | None = None,
+    job: str | None = None,
+) -> list[dict]:
+    """The nightly periodic's builds: list its log prefix, then read them.
+
+    For a periodic the prefix is the directory index -- one `<build_id>/`
+    per build beside `latest-build.txt` -- so the one listing names every
+    build and the watermark filter runs on it directly; there is no pointer
+    to resolve. Every run comes back tagged tier `nightly`, `pr` null and
+    `job` = `job` (default: the prefix's last segment). A prefix that does
+    not list is read two ways. With no nightly on record yet (no watermark)
+    the job may simply not have run, and the nightly must never be what
+    stops the gate's dashboard publishing, so that is a note and no runs,
+    deliberately NOT the `warning: gsutil ls ... failed` line the refresh
+    workflow refuses on. Once a night IS on record, a prefix that listed
+    yesterday and does not today is the bucket or the grant failing, and
+    republishing would freeze the nightly record under a fresh generated_at
+    with nothing said -- so that one is the warning line. A listing that
+    hangs past GSUTIL_TIMEOUT_S is the warning line either way.
+    """
+    prefix = prefix.rstrip("/") + "/"
+    job = job or prefix.rstrip("/").rsplit("/", 1)[-1]
+    listing = _gsutil(["ls", prefix], gsutil)
+    if listing is None:
+        if after_build is not None:
+            print(
+                f"warning: gsutil ls failed for {prefix}; the nightly record is not"
+                " refreshed this scan",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"note: nightly prefix {prefix} did not list (no builds yet, or"
+                " unreadable); no nightly runs this scan",
+                file=sys.stderr,
+            )
+        return []
+    candidates = _build_dirs_in_listing(listing, after_build, retry_builds)
+    print(
+        f"note: nightly prefix {prefix}: {len(candidates)} build(s) to read"
+        f" (watermark {after_build}, {len(retry_builds)} pending)",
+        file=sys.stderr,
+    )
+    return _read_builds(
+        candidates, gsutil, since_cutoff, unfinished, tier=tiers.TIER_NIGHTLY, job=job
+    )
 
 
 def _dir_reader(base: pathlib.Path):
@@ -1444,6 +1632,8 @@ def collect(
     now: datetime | None = None,
     stale_after_s: int | None = None,
     index_prefix: str | None = None,
+    nightly_prefix: str | None = None,
+    nightly_job: str | None = None,
     rc_globs: list[str] | None = None,
     rc_from_dir: pathlib.Path | None = None,
     rc_limit: int = RC_RELEASES_MAX,
@@ -1454,16 +1644,25 @@ def collect(
     # pr_merged resolution window and the pending-build/--since-days clocks
     # (tests pin it; the CLI leaves it None). index_prefix is the
     # --index-prefix tri-state: None derives each glob's job index, "" turns
-    # the index off, anything else is listed as given.
+    # the index off, anything else is listed as given. nightly_prefix is
+    # what asks for the nightly periodic to be scanned at all (None: it is
+    # not), the way --pr-glob asks for the presubmit; nightly_job labels
+    # the runs it yields.
     now_dt = now or datetime.now(timezone.utc)
     prior: list[dict] = []
     retry: dict[str, str] = {}  # build_id -> first_seen, still worth re-reading
+    # One watermark per source. Prow's build ids are one global sequence
+    # ordered by start, so the newest presubmit id (dozens of builds a day)
+    # is normally above every nightly id (one a day); the newest id on
+    # record says what one source has seen, not the other.
     after_build = None
+    nightly_after = None
     if merge_with is not None:
         prior_data = load_prior(merge_with, gsutil)
         if prior_data is not None:
             prior = prior_data["runs"]
-            after_build = newest_build_id(prior)
+            after_build = newest_build_id(tiers.presubmit_runs(prior))
+            nightly_after = newest_build_id(tiers.nightly_runs(prior))
             for build_id, first_seen in pending_from_prior(prior_data).items():
                 if _pending_expired(first_seen, now_dt):
                     print(
@@ -1532,12 +1731,34 @@ def collect(
                 unfinished=unfinished,
             )
         )
+    # The nightly periodic, above its own watermark. The shared retry list
+    # is safe to hand over whole: a pending id is only re-read where its
+    # source's listing names it, and no id is in both listings.
+    nightly_fresh: list[dict] = []
+    if nightly_prefix:
+        nightly_fresh = runs_from_periodic(
+            nightly_prefix,
+            gsutil,
+            after_build=nightly_after,
+            since_cutoff=since_cutoff,
+            retry_builds=frozenset(retry),
+            unfinished=unfinished,
+            job=nightly_job,
+        )
+        fresh.extend(nightly_fresh)
     if merge_with is not None:
         print(
             f"note: merged {len(prior)} prior runs with {len(fresh)} newly"
             f" collected (GCS scan resumed above build {after_build}"
             f" via {'the directory index' if indexes else 'the build-dir glob'},"
-            f" retrying {len(retry)} pending)",
+            f" retrying {len(retry)} pending"
+            + (
+                f"; nightly scan resumed above build {nightly_after},"
+                f" {len(nightly_fresh)} new"
+                if nightly_prefix
+                else ""
+            )
+            + ")",
             file=sys.stderr,
         )
     runs = merge_runs(prior, fresh)
@@ -1629,6 +1850,26 @@ def main(argv: list[str] | None = None) -> int:
         " disable it and list the glob even with a watermark",
     )
     parser.add_argument(
+        "--nightly-prefix",
+        nargs="?",
+        const=DEFAULT_NIGHTLY_PREFIX,
+        default=None,
+        metavar="GS_PREFIX",
+        help="also collect the nightly periodic from this Prow log prefix"
+        " (gs://<bucket>/logs/<job>/, one directory per build; for a periodic"
+        " the prefix is its own directory index). Given without a value:"
+        f" {DEFAULT_NIGHTLY_PREFIX}. Omitted: no nightly scan. Its runs carry"
+        " tier=nightly, pr=null, and their own incremental watermark",
+    )
+    parser.add_argument(
+        "--nightly-job",
+        default=None,
+        metavar="NAME",
+        help="the job name recorded on nightly runs (runs[].job); default: the"
+        f" last path segment of --nightly-prefix (i.e. {DEFAULT_NIGHTLY_JOB}"
+        " for the default prefix)",
+    )
+    parser.add_argument(
         "--from-dir",
         type=pathlib.Path,
         help="local directory of <build_id>/ subdirs with build-log.txt,"
@@ -1706,12 +1947,13 @@ def main(argv: list[str] | None = None) -> int:
         not args.pr_glob
         and args.from_dir is None
         and args.merge_with is None
+        and args.nightly_prefix is None
         and not args.rc_glob
         and args.rc_from_dir is None
     ):
         parser.error(
-            "nothing to collect: pass --pr-glob, --from-dir, --rc-glob,"
-            " --rc-from-dir and/or --merge-with"
+            "nothing to collect: pass --pr-glob, --nightly-prefix, --from-dir,"
+            " --rc-glob, --rc-from-dir and/or --merge-with"
         )
     if args.rc_limit < 1:
         parser.error("--rc-limit must be at least 1")
@@ -1726,13 +1968,17 @@ def main(argv: list[str] | None = None) -> int:
         since_days=args.since_days,
         stale_after_s=args.stale_after_s,
         index_prefix=args.index_prefix,
+        nightly_prefix=args.nightly_prefix,
+        nightly_job=args.nightly_job,
         rc_globs=args.rc_glob,
         rc_from_dir=args.rc_from_dir,
         rc_limit=args.rc_limit,
     )
     args.out.write_text(json.dumps(data, indent=2) + "\n")
+    nightly = len(tiers.nightly_runs(data["runs"]))
     print(
-        f"wrote {args.out}: {len(data['runs'])} runs, {len(data['cases'])} cases,"
+        f"wrote {args.out}: {len(data['runs'])} runs ({len(data['runs']) - nightly} presubmit,"
+        f" {nightly} nightly), {len(data['cases'])} cases,"
         f" {len(data.get('releases') or [])} releases,"
         f" {data['coverage']['domains_covered']}/{data['coverage']['domains_total']}"
         " domains covered",

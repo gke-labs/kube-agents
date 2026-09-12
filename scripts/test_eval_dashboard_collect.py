@@ -824,6 +824,10 @@ class TestIndexDiscovery(_MergeBase):
         """The cold sweep: no prior (or a prior with no numeric watermark)
         still discovers through --pr-glob, index or no index."""
         gsutil, log = self.fake_gsutil([BUILD_998_FULL])
+        # A prior with no watermark bounds the sweep to DEGRADED_SINCE_DAYS,
+        # so `now` is pinned near the fixture: on the wall clock the build
+        # (started 2026-08-27) aged out of that bound on 2026-09-10.
+        now = datetime(2026, 9, 1, tzinfo=timezone.utc)
         for label, kwargs in {
             "no prior": {},
             "prior without a watermark": {
@@ -835,8 +839,7 @@ class TestIndexDiscovery(_MergeBase):
                 # Pinned: the fixture build finished 2026-08-27 and the
                 # default --since-days window would age it out.
                 merged, _ = self.quiet_collect(
-                    pr_globs=[FAKE_GLOB], gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX,
-                    now=datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc), **kwargs
+                    pr_globs=[FAKE_GLOB], gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX, now=now, **kwargs
                 )
                 self.assertEqual([run["build_id"] for run in merged["runs"]], [BUILD_998_FULL])
                 listings = [c for c in log.read_text().splitlines() if c.startswith("ls ")]
@@ -903,7 +906,212 @@ class TestIndexDiscovery(_MergeBase):
             self.assertIsNone(collect.discovery_index(FAKE_GLOB, None))  # no pr-logs/, no job
 
 
+# The nightly periodic's archive on the fake bucket, laid out as Prow lays out
+# a periodic: gs://<bucket>/logs/<job>/<build_id>/ plus latest-build.txt, no
+# pointer objects. The job name is deliberately not the live default, so a
+# test can tell a derived job from a hardcoded one.
+FAKE_NIGHTLY_JOB = "ci-fake-eval-nightly"
+FAKE_NIGHTLY_PREFIX = f"{FAKE_BUCKET}logs/{FAKE_NIGHTLY_JOB}/"
+
+
+class TestNightlySource(_MergeBase):
+    """The nightly periodic beside the presubmit: same parser, its own tier,
+    no pull request, its own watermark, and never the refusal line."""
+
+    def place_nightly_build(self, build) -> pathlib.Path:
+        """Copy fixture `build` under the periodic's prefix (one directory per
+        build, as Prow archives a periodic) and refresh latest-build.txt."""
+        root = self.bucket_root()
+        prefix = root / FAKE_NIGHTLY_PREFIX[len(FAKE_BUCKET):]
+        prefix.mkdir(parents=True, exist_ok=True)
+        dst = prefix / build
+        shutil.copytree(TESTDATA / build, dst)
+        (prefix / "latest-build.txt").write_text(max(p.name for p in prefix.iterdir() if p.is_dir()) + "\n")
+        return dst
+
+    def test_nightly_builds_parse_with_tier_job_and_no_pr(self):
+        gsutil, log = self.fake_gsutil([])
+        self.place_nightly_build(BUILD_998_FULL)
+        data, stderr = self.quiet_collect(nightly_prefix=FAKE_NIGHTLY_PREFIX, gsutil=gsutil)
+        (run,) = data["runs"]
+        self.assertEqual(run["build_id"], BUILD_998_FULL)
+        self.assertEqual(run["tier"], "nightly")
+        self.assertEqual(run["job"], FAKE_NIGHTLY_JOB, "derived from the prefix, not hardcoded")
+        # The real fixture's started.json says pull 998; a periodic runs main
+        # and its run is nobody's pull request whatever the metadata says.
+        self.assertIsNone(run["pr"])
+        # The same parser as the presubmit: every task, the verdict duration.
+        self.assertEqual(len(run["tasks"]), 14)
+        self.assertEqual(run["duration_s"], 5793)
+        self.assertEqual(run["head_sha"], "a28f0b3")
+        calls = log.read_text().splitlines()
+        self.assertEqual([c for c in calls if c.startswith("ls ")], [f"ls {FAKE_NIGHTLY_PREFIX}"])
+        self.assertNotIn("latest-build.txt", "\n".join(calls))
+        self.assertIn(f"nightly prefix {FAKE_NIGHTLY_PREFIX}: 1 build(s) to read", stderr)
+        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
+
+    def test_nightly_job_flag_overrides_the_derived_name(self):
+        gsutil, _ = self.fake_gsutil([])
+        self.place_nightly_build(BUILD_998_FULL)
+        data, _ = self.quiet_collect(nightly_prefix=FAKE_NIGHTLY_PREFIX, nightly_job="renamed-job", gsutil=gsutil)
+        self.assertEqual(data["runs"][0]["job"], "renamed-job")
+
+    def test_presubmit_runs_carry_their_job_from_the_build_path(self):
+        gsutil, _ = self.fake_gsutil([BUILD_998_FULL])
+        data, _ = self.quiet_collect(pr_globs=[FAKE_GLOB], gsutil=gsutil)
+        (run,) = data["runs"]
+        self.assertEqual((run["tier"], run["job"], run["pr"]), ("presubmit", "pull-kube-agents-smoke-test", 998))
+
+    def test_each_source_resumes_above_its_own_watermark(self):
+        """Prow build ids are one global sequence, so the newest presubmit
+        id is usually ABOVE every nightly id on record and vice versa. A
+        shared watermark would skip whichever source is behind."""
+        gsutil, log = self.fake_gsutil([BUILD_998_INFRA])  # presubmit: the middle id
+        self.place_nightly_build(BUILD_956_TRUNCATED)  # nightly: the lowest id
+        # Prior: the presubmit's HIGHEST id recorded (so the presubmit
+        # candidate is genuinely old and must be skipped), and one old
+        # nightly run with a tiny id. Under a shared watermark -- the
+        # newest id on record -- the nightly candidate would be skipped
+        # forever; above the nightly's own watermark it is new.
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_FULL])).read_text())
+        prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="nightly", pr=None))
+        prior = self.write_prior(prior_data)
+        merged, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], nightly_prefix=FAKE_NIGHTLY_PREFIX, merge_with=prior, gsutil=gsutil,
+            index_prefix=FAKE_INDEX_PREFIX,
+        )
+        by_id = {run["build_id"]: run for run in merged["runs"]}
+        self.assertEqual(by_id[BUILD_956_TRUNCATED]["tier"], "nightly", "below the presubmit watermark, above the nightly's own")
+        self.assertNotIn(BUILD_998_INFRA, by_id, "below the presubmit's own watermark and not pending: skipped, zero reads")
+        self.assertNotIn(BUILD_998_INFRA + "/", log.read_text())
+        self.assertEqual(sorted(by_id), sorted([BUILD_956_TRUNCATED, BUILD_998_FULL, "1"]))
+        self.assertIn(f"GCS scan resumed above build {BUILD_998_FULL}", stderr)
+        self.assertIn("nightly scan resumed above build 1, 1 new", stderr)
+
+    def test_the_presubmit_watermark_ignores_nightly_ids(self):
+        gsutil, log = self.fake_gsutil([BUILD_998_INFRA, BUILD_998_FULL])
+        # Prior: presubmit INFRA on record, plus a nightly run whose id is
+        # above FULL. FULL must still be read through the presubmit index.
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_INFRA])).read_text())
+        prior_data["runs"].append(dict(prior_data["runs"][0], build_id=str(int(BUILD_998_FULL) + 1), tier="nightly", pr=None))
+        prior = self.write_prior(prior_data)
+        merged, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], merge_with=prior, gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX
+        )
+        self.assertIn(BUILD_998_FULL, {run["build_id"] for run in merged["runs"]})
+        self.assertIn(f"GCS scan resumed above build {BUILD_998_INFRA}", stderr)
+        self.assertNotIn(f"cat {FAKE_INDEX_PREFIX}{BUILD_998_INFRA}.txt", log.read_text())
+
+    def test_a_prefix_that_does_not_list_is_a_note_never_the_refusal_line(self):
+        """Until oss-test-infra's periodic runs, the prefix does not exist;
+        the gate's dashboard must keep publishing meanwhile."""
+        gsutil, _ = self.fake_gsutil([BUILD_998_FULL])
+        prior = self.prior_with([BUILD_998_INFRA])
+        merged, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], nightly_prefix=FAKE_NIGHTLY_PREFIX, merge_with=prior, gsutil=gsutil,
+            index_prefix=FAKE_INDEX_PREFIX,
+        )
+        self.assertEqual([run["build_id"] for run in merged["runs"]], [BUILD_998_INFRA, BUILD_998_FULL])
+        self.assertIn(f"note: nightly prefix {FAKE_NIGHTLY_PREFIX} did not list", stderr)
+        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
+        self.assertIn("nightly scan resumed above build None, 0 new", stderr)
+
+    def test_a_known_prefix_that_stops_listing_is_the_refusal_line(self):
+        """Once a night is on record, a prefix that does not list is a stall,
+        not an absent job: republishing would freeze the nightly record."""
+        gsutil, _ = self.fake_gsutil([BUILD_998_FULL])
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_INFRA])).read_text())
+        prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="nightly", pr=None))
+        merged, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], nightly_prefix=FAKE_NIGHTLY_PREFIX, merge_with=self.write_prior(prior_data),
+            gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX,
+        )
+        self.assertEqual(len(merged["runs"]), 3, "the presubmit side still collected")
+        self.assertRegex(stderr, WORKFLOW_REFUSAL)
+        self.assertIn(f"warning: gsutil ls failed for {FAKE_NIGHTLY_PREFIX}", stderr)
+
+    def test_an_unfinished_nightly_build_rides_pending_like_any_other(self):
+        gsutil, _ = self.fake_gsutil([])
+        built = self.place_nightly_build(BUILD_998_FULL)
+        (built / "finished.json").unlink()
+        now = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+        data, stderr = self.quiet_collect(nightly_prefix=FAKE_NIGHTLY_PREFIX, gsutil=gsutil, now=now)
+        self.assertEqual(data["runs"], [])
+        self.assertEqual(data["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat()}])
+        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
+
+    def test_cases_keep_the_two_records_apart(self):
+        """The per-case fields are the presubmit's; the nightly's sit under
+        `nightly`. A case only the nightly ran is still on record."""
+        gsutil, _ = self.fake_gsutil([BUILD_998_INFRA])
+        self.place_nightly_build(BUILD_998_FULL)
+        data, _ = self.quiet_collect(pr_globs=[FAKE_GLOB], nightly_prefix=FAKE_NIGHTLY_PREFIX, gsutil=gsutil)
+        cases = _cases_by_name(data)
+        # compliance-rbac-overgrant: infra on the presubmit build, fail on the nightly one.
+        case = cases["compliance-rbac-overgrant"]
+        self.assertEqual((case["runs_on_record"], case["pass_rate"], case["last3"]), (1, None, ["infra"]))
+        self.assertEqual(case["nightly"], {"runs_on_record": 1, "pass_rate": 0.0, "last3": ["fail"]})
+        # A task only the FULL build ran (as the nightly here): empty presubmit side.
+        only_nightly = [name for name, c in cases.items() if c["runs_on_record"] == 0]
+        self.assertTrue(only_nightly)
+        for name in only_nightly:
+            self.assertEqual(cases[name]["nightly"]["runs_on_record"], 1, name)
+            self.assertIsNone(cases[name]["pass_rate"])
+            self.assertEqual(cases[name]["last3"], [])
+        # And the pooled numbers a consumer used to read stay the presubmit's.
+        self.assertEqual(sum(c["runs_on_record"] for c in cases.values()), 11)
+
+    def test_nightly_active_is_the_superset_matrix(self):
+        data = collect.collect(from_dir=TESTDATA)
+        cases = _cases_by_name(data)
+        self.assertTrue(cases["reliability-pdb-probe"]["active"])
+        self.assertTrue(cases["reliability-pdb-probe"]["nightly_active"], "TASKS is in the nightly too")
+        self.assertFalse(cases["obtainability-planted-pdb"]["active"])
+        self.assertTrue(cases["obtainability-planted-pdb"]["nightly_active"], "an uncommented NIGHTLY_TASKS entry")
+        self.assertFalse(cases["compliance-rbac-overgrant"]["nightly_active"] and not cases["compliance-rbac-overgrant"]["active"])
+
+    def test_head_sha_falls_back_to_the_started_commit_for_a_periodic(self):
+        """Prow writes `revision: main` in a periodic's finished.json and the
+        commit in started.json's repo-commit."""
+        files = {
+            "finished.json": json.dumps({"timestamp": 1789072197, "result": "SUCCESS", "revision": "main"}),
+            "started.json": json.dumps({"timestamp": 1789071786, "repo-commit": "7a322673af0252b464695ae65b0a044b72520fd4"}),
+            "build-log.txt": "",
+        }
+        run = collect.build_run("1", files.get, tier="nightly", job="j")
+        self.assertEqual(run["head_sha"], "7a32267")
+        self.assertEqual((run["tier"], run["job"], run["pr"]), ("nightly", "j", None))
+        files["finished.json"] = json.dumps({"timestamp": 1, "result": "SUCCESS", "revision": "727f252fb6709e7471bc63e2465bc68ef5aaa81e"})
+        self.assertEqual(collect.build_run("1", files.get)["head_sha"], "727f252", "a presubmit's revision still wins")
+
+    def test_cli_flags_bare_and_explicit(self):
+        gsutil, log = self.fake_gsutil([])
+        self.place_nightly_build(BUILD_998_FULL)
+        out = self.tmp / "out.json"
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(
+                collect.main(["--nightly-prefix", FAKE_NIGHTLY_PREFIX, "--gsutil", gsutil, "--gh", "", "--out", str(out)]), 0
+            )
+        data = json.loads(out.read_text())
+        self.assertEqual([(r["tier"], r["job"]) for r in data["runs"]], [("nightly", FAKE_NIGHTLY_JOB)])
+        # Bare --nightly-prefix means the live periodic's prefix.
+        log.write_text("")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(collect.main(["--nightly-prefix", "--gsutil", gsutil, "--gh", "", "--out", str(out)]), 0)
+        self.assertEqual([c for c in log.read_text().splitlines() if c.startswith("ls ")], [f"ls {collect.DEFAULT_NIGHTLY_PREFIX}"])
+        self.assertEqual(collect.DEFAULT_NIGHTLY_PREFIX, "gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly/")
+        # Nothing at all is still an error.
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            collect.main(["--out", str(out)])
+
+
 class TestRepoDerivedFacts(unittest.TestCase):
+    def test_nightly_tasks_are_tasks_plus_the_nightly_only_array(self):
+        nightly = collect.nightly_task_names()
+        self.assertTrue(collect.active_task_names() <= nightly)
+        self.assertIn("obtainability-planted-pdb", nightly)
+        self.assertIn("gpu-stress-test-diagnosis", nightly)
+
     def test_coverage_matches_domains_yaml(self):
         cov = collect.coverage()
         self.assertEqual(cov["domains_total"], 11)
@@ -940,7 +1148,7 @@ class TestContractShape(unittest.TestCase):
         # carries; the pod_* trio appears only when podinfo.json was read.
         self.assertEqual(
             list(data["runs"][0]),
-            ["build_id", "pr", "head_sha", "project", "started", "finished", "result", "duration_s", "tasks", "has_build_log"],
+            ["build_id", "tier", "job", "pr", "head_sha", "project", "started", "finished", "result", "duration_s", "tasks", "has_build_log"],
         )
         self.assertEqual(
             list(data["runs"][0]["tasks"][0]),
@@ -948,8 +1156,16 @@ class TestContractShape(unittest.TestCase):
         )
         self.assertEqual(
             list(data["cases"][0]),
-            ["name", "domain", "active", "runs_on_record", "pass_rate", "last3", "durations", "ov_history"],
+            ["name", "domain", "active", "nightly_active", "runs_on_record", "pass_rate", "last3", "durations", "ov_history", "nightly"],
         )
+        self.assertEqual(list(data["cases"][0]["nightly"]), ["runs_on_record", "pass_rate", "last3"])
+
+    def test_from_dir_runs_are_the_presubmit_with_no_job(self):
+        """The offline source has no URL to read a job from; the tier is the
+        presubmit, as every run was before the field existed."""
+        for run in collect.collect(from_dir=TESTDATA)["runs"]:
+            self.assertEqual(run["tier"], "presubmit")
+            self.assertIsNone(run["job"])
 
 
 class TestHowTheBuildEnded(unittest.TestCase):

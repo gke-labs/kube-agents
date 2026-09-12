@@ -13,6 +13,8 @@ only — anything that renames, removes or re-types a field bumps
   "runs": [
     {
       "build_id": "2093054394793725952",
+      "tier": "presubmit",
+      "job": "pull-kube-agents-smoke-test",
       "pr": 998,
       "head_sha": "a28f0b3",
       "project": "kube-agents-evals-2",
@@ -35,11 +37,13 @@ only — anything that renames, removes or re-types a field bumps
       "name": "...",
       "domain": "reliability",
       "active": true,
+      "nightly_active": true,
       "runs_on_record": 4,
       "pass_rate": 1.0,
       "last3": ["pass", "pass", "pass"],
       "durations": { "min": 145, "med": 165, "max": 182 },
-      "ov_history": [{ "build_id": "...", "value": 1.0 }]
+      "ov_history": [{ "build_id": "...", "value": 1.0 }],
+      "nightly": { "runs_on_record": 1, "pass_rate": 1.0, "last3": ["pass"] }
     }
   ],
   "coverage": {
@@ -56,13 +60,38 @@ only — anything that renames, removes or re-types a field bumps
 
 Parsed from `build-log.txt` plus Prow's `started.json`/`finished.json`.
 A build with no `finished.json` is still running and is skipped entirely.
+One job feeds it today, the presubmit gate (`pull-kube-agents-smoke-test`,
+one build per pull-request push). The collector also reads a second, the
+nightly periodic (`ci-kube-agents-eval-nightly`, `EVAL_TIER=nightly` in the
+same `hack/ci-eval-pr.sh`, against `main`, no pull request), which archives
+the same layout and is collected from the moment it starts running.
 
 - `build_id` — the Prow build directory name, as a **string** (the ids
   overflow 53-bit JSON-consumer integers).
+- `tier` — **optional, additive**: `"presubmit"` or `"nightly"`, from the
+  source the build was discovered through, never from the build's own
+  metadata. **Absent means `presubmit`** — every run written before the
+  field existed was one — and consumers read it through `tiers.py`'s
+  `run_tier` / `presubmit_runs` / `nightly_runs`. A value outside the two
+  is neither tier and counts nowhere: a run tagged some new way is never
+  the gate's by default. Every gate verdict — the
+  health adjudicator's rules and 24-hour metrics, `classify.py`'s "is this
+  mine?" (other PRs, the only-this-PR passes, the 30-day pass rate), the
+  red comment's "runs from other PRs" count (`gate_comment.py`), the
+  Brief's runs list, the legacy page's gate band, matrix and Pareto — reads
+  presubmit runs only. A nightly run appears where the nightly is meant to:
+  `cases[].nightly`, the evidence table's nightly columns, and
+  `classify.py`'s per-case `nightly_failed_recent` note.
+- `job` — **optional, additive**: the Prow job name, read from the build
+  directory's URL (the segment before the build id) or overridden by
+  `--nightly-job`. `null` for a `--from-dir` build, which has no URL.
 - `pr` — `started.json`'s `pull`, falling back to the number in the GCS
-  path. `null` when neither is available.
-- `head_sha` — first 7 chars of `finished.json`'s `revision`; `null` when
-  absent.
+  path. `null` when neither is available, and **always `null` on a
+  `nightly` run**: a periodic runs `main`, whatever its metadata carries.
+- `head_sha` — first 7 chars of the first sha-shaped value among
+  `finished.json`'s `revision` and `started.json`'s `repo-commit` (a
+  periodic's `finished.json` says `revision: main` and keeps the commit in
+  `started.json`); `null` when neither is one.
 - `project` — from the `Successfully leased project: <name>` log line;
   `null` when the log never got that far.
 - `started` / `finished` — `started.json` / `finished.json` timestamps as
@@ -163,7 +192,13 @@ never an error. A task line whose name matches nothing under `bench/tasks/`
 on the current checkout still parses; only its domain lookup degrades (see
 below).
 
-### `cases[]` — one entry per task name seen in any run, sorted by name
+### `cases[]` — one entry per task name seen in any run of either tier, sorted by name
+
+The per-case fields are the **presubmit's** record, exactly as they were
+before the nightly existed; the nightly's record sits beside them under
+`nightly`, never pooled in. A case only the nightly has run is on record
+with `runs_on_record: 0`, `pass_rate: null`, `last3: []` on the presubmit
+side.
 
 - `domain` — the top-level `domain:` field of
   `bench/tasks/<name>/task.yaml` **on the checkout the collector runs
@@ -173,7 +208,12 @@ below).
   `hack/ci-eval-pr.sh`'s `TASKS` array (same textual parse as
   `scripts/test_domain_coverage.py`). Historical-only cases are kept with
   `active: false`.
-- `runs_on_record` — total task appearances across all runs, `infra`
+- `nightly_active` — **optional, additive**: `true` iff the name is an
+  uncommented entry in `TASKS` **or** `NIGHTLY_TASKS` — the nightly matrix
+  is the presubmit's superset (`EVAL_TIER=nightly` appends the second
+  array). `active` implies `nightly_active`; the renderer's "NIGHTLY ONLY"
+  pill is `nightly_active and not active`.
+- `runs_on_record` — total task appearances across presubmit runs, `infra`
   included (it is history).
 - `pass_rate` — `passes / (passes + fails)`. **`infra` results are excluded
   from the denominator** — an infrastructure failure never counts against a
@@ -184,6 +224,13 @@ below).
   runs; all three `null` when there are none. Median is rounded to an int.
 - `ov_history` — `{build_id, value}` per run that recorded an
   OutcomeValidity, oldest first.
+- `nightly` — **optional, additive**: `{runs_on_record, pass_rate, last3}`
+  over the nightly runs alone, each derived by the rule of its presubmit
+  namesake above (task-level, `infra` in `runs_on_record` and `last3`,
+  out of the `pass_rate` denominator; `pass_rate` `null` when nothing was
+  graded). Present on every case, zeros and `null` when the nightly has
+  not run it. The renderer's per-tier 7- and 30-day rates are computed
+  from `runs[]` at rep level, not from this block.
 - **Known gap:** multi-repetition verdict lines carry no task-level
   duration or OutcomeValidity, so `durations` and `ov_history` accrue only
   from single-repetition-era runs and freeze once those age out of the
@@ -322,8 +369,33 @@ what the renderer does with them.
   build deferred to `pending_builds`. The refresh workflow greps for either
   line and does not publish, so a stall is never republished under a fresh
   `generated_at`.
+- `--nightly-prefix [<gs prefix>]` — the nightly periodic's Prow log
+  prefix, `gs://<bucket>/logs/<job>/`. For a periodic that prefix **is**
+  the directory index: one `<build_id>/` directory per build beside a
+  `latest-build.txt` (ignored), no pointer objects, so one `gsutil ls`
+  names every build and the watermark filter runs on it directly. Every
+  build read through it is `tier: "nightly"`, `pr: null`, `job` the
+  prefix's last segment (or `--nightly-job`). Given without a value it is
+  `gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly/`; omitted, no
+  nightly scan happens (`--merge-with` alone still recomputes without
+  touching the bucket). A prefix that does not list is read by whether a
+  night is already on record. With none (no nightly watermark) the
+  periodic may simply not have run yet, so that is a
+  `note: nightly prefix ... did not list` line and no nightly runs this
+  scan, **not** the refusal line below: the nightly is evidence beside the
+  gate, and a missing night must not stop the gate's dashboard from
+  publishing. With a night on record it is a
+  `warning: gsutil ls failed for ...` line — the refusal line — because a
+  prefix that listed yesterday and not today is the bucket or the grant
+  failing, and republishing would freeze the nightly record under a fresh
+  `generated_at` with nothing said. A listing that hangs past
+  `GSUTIL_TIMEOUT_S` is the refusal line either way, as any hung `gsutil`
+  call is.
+- `--nightly-job <name>` — the `job` recorded on nightly runs; default
+  derived from the prefix.
 - `--from-dir <dir>` — local `<build_id>/` subdirectories with the same
-  three files; the offline/testing path.
+  three files; the offline/testing path. Its runs are the presubmit with
+  `job: null`.
 - `--rc-glob <gs glob>` (repeatable) / `--rc-from-dir <dir>` — the same two
   shapes for `post-kube-agents-eval-rc`, collected into `releases[]` rather
   than `runs[]`. `--rc-limit <n>` (default 20) bounds how many builds per
@@ -336,8 +408,14 @@ what the renderer does with them.
   is re-resolved on carried runs by the same rules as on fresh ones — a
   `false`/`null` inside the 14-day window is re-asked, `true` is
   terminal), and skip every GCS build whose id is ≤ the newest
-  **numeric** `build_id` on record — except the
-  ids on the prior's `pending_builds`, which are re-read regardless. Prow
+  **numeric** `build_id` on record **for that source** — the presubmit
+  scan resumes above the newest presubmit run, the nightly scan above the
+  newest nightly run; Prow's ids are one global sequence, so the newest
+  presubmit id is normally far above every nightly id and a shared
+  watermark would skip every night — except the
+  ids on the prior's `pending_builds`, which are re-read regardless (the
+  list is shared: an id is only ever re-read where its own source's
+  listing names it). Prow
   build ids increase monotonically **by start time**, not by finish time,
   so the watermark alone would permanently skip a build that was still in
   flight when a later, shorter build got recorded; `pending_builds` (see
@@ -368,7 +446,7 @@ first two is America/Toronto ("ET"), formatted in the browser with
 | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `index.html`  | **The Brief**: the gate's state and why, what the agent saw, what changed right before, what is being done, and the runs in the window. Healthy: the last 24 hours in numbers and the last incident.                                                               |
 | `run.html`    | **The PR view**, `run.html#build=<prow build id>`: one run, each failed gate case tagged `failing on N other PRs` / `only your PR` / `quota storm` / `unexplained` with its check reason, 30-day pass rate, transcript link and a one-line Do; a "what to do" box. |
-| `legacy.html` | The two-band page (agent trend, gate matrix, Pareto, evidence table).                                                                                                                                                                                              |
+| `legacy.html` | The two-band page (agent trend, gate matrix, Pareto — presubmit runs only) and the evidence table, the per-case view: presubmit depth and nightly count, pass rate over reps for each tier at 7 and 30 days, and which matrix runs the case.                       |
 
 The Brief and the PR view render in the browser from `brief.json` (below),
 which `render.py` inlines into each page as
@@ -433,17 +511,24 @@ text) are the writers. A writer omits an empty parameter.
 ### `brief.json` (written by `render.py`)
 
 `{schema_version, generated_at, stale_after_s, run_days, admitted[],
-health, history, merges, cases{}, runs[]}`. `runs[]` is the last
-`run_days` of `data.json`, oldest first, each carrying its identity and
-timing plus `classify.classify_run(...)`: `verdict` (`red` = looks like
-the PR, `green`, `infra` = the gate's), `headline`, `lede`,
-`matches_incident`, `setup_death`, `storm_reps`, `do`, `cases[]`
-(`{case, outcome, cls, also_failing_prs, pass_rate_30d, reason, excerpt,
-do, admitted, reps}`) and `health_at` (the verdict in force when it
-finished, from history; `null` without history). `health` is the current
-verdict, `history` the ticks and the incidents derived from them, `merges`
-the recent first-parent commits of the checkout (`null` when the checkout
-is shallow or has no git, and the page omits "what changed right before").
+health, history, merges, cases{}, runs[]}`. `runs[]` is the **presubmit's**
+last `run_days` of `data.json`, oldest first — a nightly run is nobody's
+pull request and is not listed — each carrying its identity and timing
+plus `classify.classify_run(...)`: `verdict` (`red` = looks like the PR,
+`green`, `infra` = the gate's), `headline`, `lede`, `matches_incident`,
+`setup_death`, `storm_reps`, `do`, `cases[]` (`{case, outcome, cls,
+also_failing_prs, pass_rate_30d, reason, excerpt, do, admitted, reps,
+nightly_failed_recent}`) and `health_at` (the verdict in force when it
+finished, from history; `null` without history). `also_failing_prs` and
+`pass_rate_30d` count presubmit runs only; `nightly_failed_recent` is
+`true` / `false` when the newest nightly run within two days of this one
+graded the case and failed / did not fail it on every repetition, `null`
+when none did — evidence about `main`, shown beside the case, never a tag.
+`cases{}` is `{active, nightly_active, admitted}` per case. `health` is
+the current verdict, `history` the ticks and the incidents derived from
+them, `merges` the recent first-parent commits of the checkout (`null`
+when the checkout is shallow or has no git, and the page omits "what
+changed right before").
 
 ### `health.json` and `health-history.jsonl` (optional inputs)
 
@@ -531,8 +616,9 @@ opens the parse on the first one, so the decoy stays in the fixture.
 `health.py --trim` (and gzip-compressed, which `health.py --data` reads by
 suffix) to the runs that finished in [2026-09-01, 2026-09-09) — the last of
 them on 2026-09-08 — and the fields the health adjudicator reads (`build_id`,
-`pr`, `started`, `finished`, `result`, `duration_s`, and per task `name`,
-`result`, `reps[].result` and the first 96 characters of `reps[].reason`);
+`pr`, `started`, `finished`, `result`, `duration_s`, `tier` when the run
+carries one, and per task `name`, `result`, `reps[].result` and the first
+96 characters of `reps[].reason`);
 its `trimmed` key records the source and the cut. Six of its zero-task runs
 carry `result: "failure"` in lowercase, as Prow wrote them on 2026-09-05 —
 the one departure from the `result` vocabulary above seen in the wild, so
