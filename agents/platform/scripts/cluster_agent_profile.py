@@ -396,10 +396,9 @@ def create_profile(project: str, cluster: str, location: str) -> str:
     # output as a fact about the cluster, which is what TERMINAL_PRINCIPAL is
     # not for.
     # Pinned under HERMES_HOME/.kubeconfigs rather than directly inside the
-    # profile home directory: Hermes tightens profile home permissions to 0700
-    # on worker launch. Storing the kubeconfig in .kubeconfigs outside
-    # the profile home directory ensures that access to the kubeconfig is
-    # decoupled from profile home permission tightening (#1500).
+    # profile home directory: aligns cluster agent profiles with the shared
+    # credential layout used by the platform MCP server and governance SOPs,
+    # and keeps cluster credentials decoupled from profile directory lifecycles (#1500).
     kdir = kubeconfig_dir()
     kdir.mkdir(parents=True, exist_ok=True)
     kubeconfig = kubeconfig_path(project, cluster, location)
