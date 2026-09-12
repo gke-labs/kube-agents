@@ -321,7 +321,7 @@ green. A list of substrings is a second copy of the rule set; keep the assertion
 set.
 
 `make bench-case-check` itself is invoked by no workflow, and that is the intended shape.
-The lint reaches the same `validate_all()` through `PYTHON_TEST_DIRS` (`Makefile:129`) and
+The lint reaches the same `validate_all()` through `PYTHON_TEST_DIRS` in the `Makefile` and
 `.github/workflows/python-tests.yml`, so a separate job running the target would re-derive
 findings CI already has, on a second checkout, for nothing. The target is the pre-push
 copy of the gate rather than the gate; a rule that has to be enforced goes in the

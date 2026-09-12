@@ -15,9 +15,9 @@ it takes for the two to agree: this lint also has to assert on everything that
 module returns rather than on a hand-listed set of substrings, which is what
 TestEveryTaskIsValid's whole-set assertion is for -- see its docstring for the
 rules that leaked through before it existed. `make bench-case-check` is
-invoked by no workflow; this lint, reached through PYTHON_TEST_DIRS
-(Makefile:129) and run by .github/workflows/python-tests.yml, is the whole of
-the enforcement on a pull request. A case passes by being named in
+invoked by no workflow; this lint, reached through PYTHON_TEST_DIRS in the
+Makefile and run by .github/workflows/python-tests.yml, is the whole of the
+enforcement on a pull request. A case passes by being named in
 TASKS (a commented-out entry counts: it is registered, pending activation,
 which is how scenarios wait for the seeded fleet), by an entry in
 NIGHTLY_TASKS (the nightly tier, which EVAL_TIER=nightly appends to TASKS --
