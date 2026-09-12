@@ -154,8 +154,14 @@ the breaker doing its job on a card the quota has refused twice, and the
 the 429 either way. It runs from two sites, because the loop has two ways of
 leaving on a rate limit:
 
-* the ``cli.py`` exit-code block (``block_rate_limited_worker``), for the
-  ``failed=True`` return the code shows a 429 taking, and
+* ``cli.py`` (``block_rate_limited_worker``), for the ``failed=True`` return
+  the code shows a 429 taking. Two anchors there, because the worker has two
+  single-query paths: the fully-quiet ``-Q`` path goal-mode workers take ends
+  in an exit-code block (the one that maps ``rate_limit`` to exit 75), while
+  the non-quiet ``chat -q`` path every normal worker takes calls
+  ``cli.chat()`` and returns with exit 0, never reaching that block. The
+  live run on 2026-09-12 showed the second is the storm's path, so the block
+  also sits in ``chat()`` where the failed result is last in hand. And
 * the ``finalize_turn`` backstop above, for a retry loop that ends with no
   response at all (``all_retries_exhausted_no_response``): there the loop's
   error handler has stashed its last classified failure on the agent

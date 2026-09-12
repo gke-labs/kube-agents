@@ -1015,6 +1015,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_kanban_guardr
     grep -q "_kanban_should_record_missing(" /opt/hermes/agent/turn_finalizer.py && \
     grep -q "agent._kube_last_api_failure = (" /opt/hermes/agent/conversation_loop.py && \
     grep -q "_kube_block_rate_limited(result)" /opt/hermes/cli.py && \
+    grep -q "_kube_block_rate_limited_chat(result)" /opt/hermes/cli.py && \
     grep -q "_kube_retry_delay_from_error(api_error)" /opt/hermes/agent/conversation_loop.py && \
     cd /opt/hermes && /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_kanban_guardrail_exit.py && \
     /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/verify_rate_limit_retry_delay.py && \

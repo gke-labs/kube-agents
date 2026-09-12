@@ -1,6 +1,6 @@
 """Stop kanban workers leaking out of ``run_conversation`` without a board write.
 
-Four anchored edits across three files:
+Five anchored edits across three files:
 
 1. ``agent/conversation_loop.py`` — the tool-guardrail halt branch breaks out of
    the agent loop from inside the tool-call branch, jumping over the kanban
@@ -16,7 +16,11 @@ Four anchored edits across three files:
    edit 2 tells a 429 exhaustion from the other retries-exhausted exits.
 4. ``cli.py`` — the kanban worker's exit-code block, where a ``failed`` result
    with ``failure_reason="rate_limit"`` becomes exit 75: block the card there,
-   with the provider's text, before the process leaves.
+   with the provider's text, before the process leaves. Only the fully-quiet
+   ``-Q`` path (goal-mode workers) reaches that block.
+5. ``cli.py`` again — ``chat()``, where the non-quiet ``chat -q`` path every
+   normal worker takes last holds the failed result. Same block; whichever of
+   the two runs second finds the card already moved.
 
 The inserts mirror code that is already in the file: edit 1 copies the shape of
 the stop guard's local-import + ``try``/``except`` at
@@ -243,6 +247,40 @@ CLI_INSERT = '''                        # kube-agents patch: a worker whose 429 
                             )
 '''
 
+# The one place ``chat()`` reads the failed result's ``failure_reason``: the
+# billing call-to-action under the response panel. A normal kanban worker
+# (``hermes ... chat -q``, no ``-Q``) ends its turn here and then returns
+# through ``_print_exit_summary`` with exit 0, so this is the last point at
+# which its 429 result is in hand.
+CHAT_ANCHOR = (
+    '                if result and result.get("failure_reason") == "billing":\n'
+)
+
+CHAT_INSERT = '''                # kube-agents patch: the non-quiet single-query path every
+                # normal kanban worker takes (`hermes ... chat -q`) never
+                # reaches the exit-code block, so this is where its failed
+                # result is last in hand. Block the card here on a 429
+                # exhaustion; the exit-code site covers the -Q path and finds
+                # nothing left to do when this ran first.
+                # See hermes_cli/kanban_guardrail_exit.py.
+                if result and os.environ.get("HERMES_KANBAN_TASK"):
+                    try:
+                        from hermes_cli.kanban_guardrail_exit import (
+                            block_rate_limited_worker as _kube_block_rate_limited_chat,
+                        )
+
+                        if _kube_block_rate_limited_chat(result):
+                            logger.info(
+                                "blocked kanban task %s: provider rate limit "
+                                "exhausted the API retries",
+                                os.environ.get("HERMES_KANBAN_TASK", ""),
+                            )
+                    except Exception:
+                        logger.debug(
+                            "kanban rate-limit block failed", exc_info=True
+                        )
+'''
+
 # Every insert sits next to its anchor rather than consuming it, so the anchor
 # count alone cannot tell a fresh file from an already-patched one. These
 # markers can: each appears only in the inserted text.
@@ -273,7 +311,14 @@ EDITS = (
         "rate-limited worker exit block",
         CLI_ANCHOR,
         CLI_INSERT + CLI_ANCHOR,
-        "_kube_block_rate_limited",
+        "_kube_block_rate_limited(",
+    ),
+    (
+        CLI_RELATIVE,
+        "rate-limited worker chat() block",
+        CHAT_ANCHOR,
+        CHAT_INSERT + CHAT_ANCHOR,
+        "_kube_block_rate_limited_chat",
     ),
 )
 

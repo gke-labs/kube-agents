@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest import mock
 
 from apply_kanban_guardrail_exit import (
+    CHAT_ANCHOR,
     CLASSIFY_ANCHOR,
     CLI_ANCHOR,
     CLI_RELATIVE,
@@ -869,6 +870,14 @@ import sys
 
 logger = None
 
+class CLI:
+    def chat(self, message):
+                result = self.agent.run_conversation(message)
+                response = result.get("final_response")
+                if result and result.get("failure_reason") == "billing":
+                    print("billing")
+                return response
+
 def main(result):
                         _exit_code = 0
                         if isinstance(result, dict) and result.get("failed"):
@@ -969,6 +978,29 @@ class ApplierTest(unittest.TestCase):
         )
         self.assertEqual(cli.count(CLI_ANCHOR), 1)
 
+    def test_the_chat_path_blocks_before_the_billing_cta(self):
+        """Normal workers end in chat(); only -Q workers reach the exit block."""
+        _, _, cli = self._apply_all()
+        self.assertLess(
+            cli.index("_kube_block_rate_limited_chat(result)"),
+            cli.index('if result and result.get("failure_reason") == "billing":'),
+        )
+        self.assertEqual(cli.count(CHAT_ANCHOR), 1)
+        chat_site = cli[cli.index("def chat(") : cli.index("def main(")]
+        self.assertIn("_kube_block_rate_limited_chat(result)", chat_site)
+        self.assertIn('os.environ.get("HERMES_KANBAN_TASK")', chat_site)
+        self.assertIn("except Exception:", chat_site)
+
+    def test_a_missing_chat_anchor_is_fatal_too(self):
+        root = stage_tree()
+        (root / CLI_RELATIVE).write_text(CLI_STUB.replace(
+            'if result and result.get("failure_reason") == "billing":',
+            'if result and result.get("failure_reason") == "credits":',
+        ))
+        with self.assertRaises(SystemExit) as ctx:
+            apply(root)
+        self.assertIn("found 0", str(ctx.exception))
+
     def test_the_cli_block_cannot_change_the_exit_code(self):
         """Exit 75 is the reaper's contract; the block is additive."""
         _, _, cli = self._apply_all()
@@ -1043,6 +1075,7 @@ class ApplierTest(unittest.TestCase):
         self.assertIn("# Determine if conversation completed", FINALIZER_ANCHOR)
         self.assertIn("classified = classify_api_error(", CLASSIFY_ANCHOR)
         self.assertIn("_exit_code = 0", CLI_ANCHOR)
+        self.assertIn('result.get("failure_reason") == "billing"', CHAT_ANCHOR)
 
 
 if __name__ == "__main__":

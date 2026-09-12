@@ -564,6 +564,38 @@ if len(exit_inits) == 1:
             and "KANBAN_RATE_LIMIT_EXIT_CODE" in ast.unparse(decision),
         )
 
+CHAT_MARKER = "_kube_block_rate_limited_chat"
+chat_defs = [
+    node
+    for node in ast.walk(cli_tree)
+    if isinstance(node, ast.FunctionDef) and node.name == "chat"
+    and CHAT_MARKER in ast.unparse(node)
+]
+check(
+    "the chat() site is inside a single def chat()",
+    len(chat_defs) == 1,
+    f"found {len(chat_defs)} chat() defs carrying the marker",
+)
+if len(chat_defs) == 1:
+    chat_src = ast.unparse(chat_defs[0])
+    billing = [
+        node
+        for node in ast.walk(chat_defs[0])
+        if isinstance(node, ast.If)
+        and "failure_reason" in ast.unparse(node.test)
+        and "billing" in ast.unparse(node.test)
+    ]
+    check(
+        "the chat() site runs where the failed result is still in hand, "
+        "ahead of the billing call-to-action",
+        len(billing) == 1
+        and chat_src.index(CHAT_MARKER) < chat_src.index(ast.unparse(billing[0].test)),
+    )
+    check(
+        "the chat() site is gated on the worker's task id",
+        "HERMES_KANBAN_TASK" in chat_src,
+    )
+
 from agent.error_classifier import FailoverReason  # noqa: E402
 from hermes_cli import kanban_db as K  # noqa: E402
 
