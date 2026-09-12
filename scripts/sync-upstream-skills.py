@@ -92,9 +92,34 @@ GKE_MANIFEST_GENERATION_NEW_ROUTING_SNIPPET = (
     "(use gcp-config-connector)."
 )
 
+# gke-manifest-generation's example ServiceAccount name upstream is `devteam-agent-sa`, a name from
+# this repository's retired multi-CR era (issue #340). The example is neutral here so the skill does
+# not suggest a DevTeamAgent exists.
+GKE_MANIFEST_GENERATION_OLD_SERVICE_ACCOUNT_SNIPPET = "(e.g., `devteam-agent-sa`)"
+
+GKE_MANIFEST_GENERATION_NEW_SERVICE_ACCOUNT_SNIPPET = "(e.g., `checkout-sa`)"
+
+# gke-manifest-generation's inference-manifest step upstream passes `--output-path` to gcloud. Here
+# gcloud runs in the credential proxy's container, which refuses that flag, so the skill has to
+# redirect stdout instead (#723). The replacement keeps the fence and adds the paragraph saying why.
+GKE_MANIFEST_GENERATION_OLD_OUTPUT_PATH_SNIPPET = """          --output-path={output_file_path}
+        ```
+"""
+
+GKE_MANIFEST_GENERATION_NEW_OUTPUT_PATH_SNIPPET = """          > {output_file_path}
+        ```
+
+        Redirect stdout rather than passing `--output-path`: `gcloud` runs in
+        the credential proxy's container, so that flag writes the manifest
+        next to the credentials instead of in your workspace, and the proxy
+        refuses it.
+"""
+
 # In-place content substitutions applied to freshly-synced skills to correct upstream defects
-# where an appended footer is insufficient (e.g. multi-step remediation commands), or to route to a
-# skill only this repository has from a passage upstream cannot know about.
+# where an appended footer is insufficient (e.g. multi-step remediation commands), to route to a
+# skill only this repository has from a passage upstream cannot know about, or to drop a name this
+# repository has retired. Every pair here is also applied by hand to the in-tree copy, and
+# scripts/test_sync_upstream_skills.py checks that copy already reads as the next sync leaves it.
 SKILL_SUBSTITUTIONS = {
     "gke-workload-security": [
         (
@@ -106,6 +131,14 @@ SKILL_SUBSTITUTIONS = {
         (
             GKE_MANIFEST_GENERATION_OLD_ROUTING_SNIPPET,
             GKE_MANIFEST_GENERATION_NEW_ROUTING_SNIPPET,
+        ),
+        (
+            GKE_MANIFEST_GENERATION_OLD_SERVICE_ACCOUNT_SNIPPET,
+            GKE_MANIFEST_GENERATION_NEW_SERVICE_ACCOUNT_SNIPPET,
+        ),
+        (
+            GKE_MANIFEST_GENERATION_OLD_OUTPUT_PATH_SNIPPET,
+            GKE_MANIFEST_GENERATION_NEW_OUTPUT_PATH_SNIPPET,
         ),
     ],
 }
