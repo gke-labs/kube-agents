@@ -273,10 +273,10 @@ class PublishHookFailSafeTest(unittest.TestCase):
         """A bucket target is the published site, read from
         storage.cloud.google.com, which redirects to a locked domain that
         serves one object: without <base href> every relative link on the
-        page is dead there. The hook derives the public URL from the bucket
-        target without hardcoding production, so staging targets get a base
-        href pointing to staging rather than production. A local target
-        keeps relative links."""
+        page is dead there. The hook passes the bucket target to render.py,
+        which derives <base href> without hardcoding production, so staging
+        targets get a base href pointing to staging rather than production.
+        A local target keeps relative links."""
         collect_ok = """\
             import json, pathlib, sys
             out = sys.argv[sys.argv.index("--out") + 1]
@@ -287,8 +287,8 @@ class PublishHookFailSafeTest(unittest.TestCase):
             "pathlib.Path(sys.path[0], 'render.py.argv').write_text(json.dumps(sys.argv[1:]))\n"
         )
         cases = (
-            ("gs://kube-agents-dashboards/evals/", "https://storage.cloud.google.com/kube-agents-dashboards/evals"),
-            ("gs://staging-bucket/test-evals", "https://storage.cloud.google.com/staging-bucket/test-evals"),
+            ("gs://kube-agents-dashboards/evals/", "gs://kube-agents-dashboards/evals/"),
+            ("gs://staging-bucket/test-evals", "gs://staging-bucket/test-evals"),
             ("/tmp/local-site", None),
         )
         for target, expected_url in cases:

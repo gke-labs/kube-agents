@@ -596,17 +596,10 @@ if not json.load(open(sys.argv[1], encoding=\"utf-8\")).get(\"runs\"):
     [ -f "$2/health.json" ] && render_args+=(--health "$2/health.json")
     [ -f "$2/health-history.jsonl" ] && render_args+=(--health-history "$2/health-history.jsonl")
     # Same --public-url rule as hack/ci-dashboard-refresh.sh: a bucket target
-    # is the published site, so derive <base href> from the target URL so every
-    # relative link resolves there without hardcoding production when
-    # targeting a staging bucket. Without it this hook would overwrite the
-    # refresh job pages with a set whose nav is dead on
-    # storage.cloud.google.com until the next 15-minute refresh.
-    case "$3" in
-      gs://*)
-        render_target="${3#gs://}"
-        render_args+=(--public-url "https://storage.cloud.google.com/${render_target%/}")
-        ;;
-    esac
+    # is the published site, so pass the target to derive <base href> without
+    # hardcoding production when targeting a staging bucket. A local directory
+    # target keeps links relative.
+    case "$3" in gs://*) render_args+=(--public-url "$3") ;; esac
     python3 "$1/render.py" --data "$2/data.json" --out-dir "$2/site" ${render_args[@]+"${render_args[@]}"}
     python3 "$1/publish.py" --out-dir "$2/site" --target "$3"
   ' _ "${dash_src}" "${dash_tmp}" "${EVAL_DASHBOARD_TARGET}" >"${dash_tmp}/publish.log" 2>&1 || dash_rc=$?

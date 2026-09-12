@@ -405,8 +405,19 @@ class RenderedFilesTest(unittest.TestCase):
             out = render_to(pathlib.Path(tmp) / "bare", data, extra_args=["--public-url"])
             self.assertIn('<base href="https://storage.cloud.google.com/kube-agents-dashboards/evals/">', (out / "index.html").read_text())
             self.assertEqual(render.PUBLISHED_SITE + "/index.html", render.post_health.DASHBOARD_URL)
+            # A gs:// target derives <base href> using the published dashboard host.
+            out = render_to(pathlib.Path(tmp) / "gcs", data, extra_args=["--public-url", "gs://staging-bucket/test-evals/"])
+            self.assertIn('<base href="https://storage.cloud.google.com/staging-bucket/test-evals/">', (out / "index.html").read_text())
         self.assertEqual(render.base_html(None), "")
         self.assertEqual(render.base_html('https://h/"><script>'), '<base href="https://h/&quot;&gt;&lt;script&gt;/">')
+        self.assertEqual(
+            render.base_html("gs://staging-bucket/test-evals"),
+            '<base href="https://storage.cloud.google.com/staging-bucket/test-evals/">',
+        )
+        self.assertEqual(
+            render.base_html("gs://staging-bucket/test-evals/"),
+            '<base href="https://storage.cloud.google.com/staging-bucket/test-evals/">',
+        )
 
     def test_hostile_data_never_escapes_the_script_block(self):
         data = load_fixture()

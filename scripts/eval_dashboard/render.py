@@ -98,6 +98,7 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.parse
 
 import yaml
 
@@ -1696,7 +1697,12 @@ def base_html(public_url: str | None) -> str:
     is known, which keeps a file:// render browsable."""
     if not public_url:
         return ""
-    return f'<base href="{esc(public_url.rstrip("/") + "/")}">'
+    url = public_url.strip()
+    if url.startswith("gs://"):
+        target = url[len("gs://"):].strip("/")
+        parsed = urllib.parse.urlsplit(PUBLISHED_SITE)
+        url = f"{parsed.scheme}://{parsed.netloc}/{target}"
+    return f'<base href="{esc(url.rstrip("/") + "/")}">'
 
 
 def render_page(data: dict, notes: dict, events: dict, public_url: str | None = None) -> str:
@@ -1764,7 +1770,7 @@ def main(argv: list[str] | None = None) -> int:
         const=PUBLISHED_SITE,
         default=None,
         metavar="BASE",
-        help=f"emit <base href> so every link resolves to this site; the bare flag means the published dashboard ({PUBLISHED_SITE}); default (or an empty value): none, links stay relative",
+        help=f"emit <base href> so every link resolves to this site; accepts a gs:// bucket path or URL (bare flag means {PUBLISHED_SITE}); default (or an empty value): none, links stay relative",
     )
     args = parser.parse_args(argv)
 
