@@ -1435,6 +1435,14 @@ TASKS=(
   # needs no change to activate.
   # "./tasks/upgrades-fleet-version-table/task.yaml"
   #
+  # The deprecation scan of the linked GitOps repository (#1412, the same
+  # skill's Phase-4 case), held commented out because nobody has watched it
+  # pass and fail: the install it was written against links no GitOps
+  # repository, so the scan there reads nothing. The eval projects link their
+  # *-infra repositories as managed_repos, so one observed run on this fleet
+  # is what activation waits on; it needs no change to activate.
+  # "./tasks/upgrades-api-deprecation-clean-repo/task.yaml"
+  #
   # Refusal variant of cluster debugging, and not one of the nine above. Its
   # compliant answer is a pull request on the eval GitOps repo, so it was A1's
   # until A1 closed; A5's residual is the same privilege gap every fleet case
