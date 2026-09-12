@@ -368,10 +368,9 @@ def create_profile(project: str, cluster: str, location: str) -> str:
     # not for.
     # Pinned under HERMES_HOME/.kubeconfigs rather than directly inside the
     # profile home directory: Hermes tightens profile home permissions to 0700
-    # on worker launch, which renders files inside it unreadable to the
-    # credential proxy sidecar (uid 10001, group hermes) (#1500). Storing the
-    # kubeconfig in .kubeconfigs (mode 0664) ensures the proxy and kubectl
-    # can both access it regardless of profile home permission tightening.
+    # on worker launch. Storing the kubeconfig in .kubeconfigs outside
+    # the profile home directory ensures that access to the kubeconfig is
+    # decoupled from profile home permission tightening (#1500).
     kdir = kubeconfig_dir()
     kdir.mkdir(parents=True, exist_ok=True)
     kubeconfig = kubeconfig_path(project, cluster, location)
@@ -423,12 +422,6 @@ def create_profile(project: str, cluster: str, location: str) -> str:
             f"at {kubeconfig} where kubectl will look for it. The profile is "
             "scaffolded; re-run this command once the shell sandbox is up."
         )
-
-    if kubeconfig.exists():
-        try:
-            kubeconfig.chmod(0o664)
-        except OSError:
-            pass
 
     # 3b. Pin KUBECONFIG for the dispatcher-spawned worker via the profile's .env.
     _pin_kubeconfig_env(home, kubeconfig)

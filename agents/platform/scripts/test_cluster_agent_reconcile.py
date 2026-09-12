@@ -270,6 +270,19 @@ class IncompleteScaffoldTest(HomesMixin):
         with mock.patch.object(rec, "kubeconfig_landed", return_value=False):
             self.assertEqual(rec._scaffold_gaps(home), ["kubeconfig.yaml"])
 
+    def test_external_kubeconfig_pinned_is_not_a_gap(self):
+        """Kubeconfig pinned outside profile home satisfies scaffold check."""
+        home = self.homes / "cluster-beta"
+        home.mkdir()
+        (home / "USER.md").touch()
+        identity = _identity(project="p", cluster="beta", location="us-central1")
+        with mock.patch.object(cap, "HERMES_HOME", self.homes):
+            ext_kc = cap.kubeconfig_path(identity["project"], identity["cluster"], identity["location"])
+            ext_kc.parent.mkdir(parents=True, exist_ok=True)
+            ext_kc.touch()
+            with mock.patch.object(rec, "kubeconfig_landed", side_effect=_local_kubeconfig_landed):
+                self.assertEqual(rec._scaffold_gaps(home, identity=identity), [])
+
 
 class AllClustersTest(unittest.TestCase):
     """A failed `gcloud list` must be loud and must not look like an empty project."""
