@@ -31,6 +31,7 @@ from apply_kanban_guardrail_exit import (
 from kanban_guardrail_exit import (
     BLOCK_REASON_MAX_CHARS,
     DETECTOR,
+    LAST_API_FAILURE_ATTR,
     OUTCOME,
     RATE_LIMIT_BLOCK_KIND,
     RATE_LIMIT_REASON_PREFIX,
@@ -937,6 +938,12 @@ class ApplierTest(unittest.TestCase):
             loop.index("agent._kube_last_api_failure = ("),
             loop.index("Error classified"),
         )
+
+    def test_the_stash_and_the_finalizer_agree_on_the_attribute(self):
+        """The applier spells the name twice; the module owns it."""
+        loop, finalizer, _ = self._apply_all()
+        self.assertIn(f"agent.{LAST_API_FAILURE_ATTR} = (", loop)
+        self.assertIn(f'getattr(agent, "{LAST_API_FAILURE_ATTR}", None)', finalizer)
 
     def test_the_stash_cannot_raise_out_of_the_error_handler(self):
         loop, _, _ = self._apply_all()
