@@ -458,7 +458,7 @@ class MissedWindowTest(unittest.TestCase):
 
 
 # --- the applier ------------------------------------------------------------
-# Minimal stand-ins for the four Hermes modules: only the anchored regions are
+# Minimal stand-ins for the five Hermes modules: only the anchored regions are
 # reproduced, at their real indentation, wrapped in just enough scaffolding to
 # parse. Whether the anchors match the real tree is settled at build time by
 # the applier's own count check; what is worth testing here is that a matched
@@ -765,7 +765,7 @@ class ApplierTest(unittest.TestCase):
         branch = branch.split("return True", 1)[0]
         self.assertIn("skip_execution(", branch)
         self.assertIn("reason=SKIP_FIRE_CLAIM_LOST,", branch)
-        self.assertIn("Fire claim lost; execution was not started.", branch)
+        self.assertIn("Fire claim was not obtained at execution time", branch)
         self.assertNotIn("finish_execution(", branch)
         self.assertNotIn("success=False", branch)
 

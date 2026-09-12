@@ -423,15 +423,27 @@ SCHED_FIRE_CLAIM_LOST = '''                finish_execution(
                 return True
 '''
 
-SCHED_FIRE_CLAIM_LOST_PATCHED = '''                # kube-agents patch: another owner took the fire claim between
-                # dispatch and start, and this worker correctly stood down.
-                # That is an at-most-once guarantee working, not a failure;
-                # closed as failed it inflated the failure rate cron_health
-                # derives from this ledger. See tools/cron_skip_ledger.py.
+SCHED_FIRE_CLAIM_LOST_PATCHED = '''                # kube-agents patch: the re-taken fire claim was refused and
+                # this worker stood down without running. Usually another
+                # owner holds a fresh claim — at-most-once working, not a
+                # failure — but claim_job_for_fire also returns False for a
+                # job no longer runnable and for a fire fence that timed out
+                # or could not be opened, and this call site cannot tell them
+                # apart. Closed as failed it inflated the failure rate
+                # cron_health derives from this ledger; closed as skipped the
+                # count of the code is the signal, and upstream's fence log
+                # lines name the infrastructure causes. See
+                # tools/cron_skip_ledger.py.
                 skip_execution(
                     job["execution_id"],
                     reason=SKIP_FIRE_CLAIM_LOST,
-                    detail="Fire claim lost; execution was not started.",
+                    detail=(
+                        "Fire claim was not obtained at execution time; the "
+                        "execution was not started. Another owner holds a "
+                        "fresh claim, the job is no longer runnable, or the "
+                        "fire fence timed out or could not be opened; the "
+                        "scheduler log names which."
+                    ),
                 )
                 return True
 '''
