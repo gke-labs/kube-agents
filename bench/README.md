@@ -5,6 +5,7 @@ Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/k
 ## Layout
 
 - `kube_agents_bench/harness.py` — the `kubeagents` agent harness: establishes `kubectl port-forward` to `svc/platform-agent` when the local port is closed, POSTs the task prompt to `/v1/responses`, and waits out any work the agent delegates to a subagent. Environment variables are documented in the module docstring.
+- `kube_agents_bench/gitops.py` — the GitOps fix-cycle wait the harness runs after delegated work when `GITOPS_RUN_BRANCH` is set: a pull request on the run branch, its merge or rejection, then Argo CD `Synced` at the branch head and `Healthy`; the outcome lands in the run record as a `gitops_fix_cycle` trajectory entry. See [docs/designs/gitops-fix-cycle.md](../docs/designs/gitops-fix-cycle.md).
 - `kube_agents_bench/parsing.py` — pure payload and trajectory reading: maps a response onto devops-bench's canonical `AgentResult`, and reads back which kanban cards a turn filed, what statuses it reported, and what a finished card delivered.
 - `kube_agents_bench/cuj.py` — black-box CUJ evaluator for the portal's shared
   `/api/v1` interaction contract. It waits for aggregate terminal state before
@@ -17,6 +18,7 @@ Evaluation harness that runs [kubernetes-sigs/devops-bench](https://github.com/k
 - `scenarios/` — evaluation matrices using `Agent + Persona + Scenario + Goals
 -> Run -> Assertions` terminology.
 - `tests/` — offline tests: the harness against a local HTTP stub, and the gate against real run records captured from a live cluster (`tests/fixtures/runs/`).
+- `hack/` — `run-gitops-pilot.sh`, the laptop driver for the `b-0011-gitops` case (agent base branch, tokens, stack and harness env, cleanup).
 - `tools/` — operator-run scripts that are neither tasks nor tests. `live_check_fleet_safeguards.py` drives every `fleet_resource_property` check in the cluster-debugging cases against a live cluster, through the real verifier, without running an agent.
 
 To add a task or plug in a different agent, see
