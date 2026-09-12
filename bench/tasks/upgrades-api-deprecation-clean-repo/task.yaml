@@ -18,7 +18,8 @@
 # its source ("repo manifests as of <sha>"). The positive variant — a planted
 # manifest on a removed apiVersion, graded on the resource, the apiVersion and
 # the replacement — needs a manifest committed to the eval repository, which is
-# a fleet-owner change, not a case change; it is drafted in bench/tasks/DRAFTS.md.
+# a fleet-owner change, not a case change; its plant and its graded phrases are
+# on the seeded-fleet shopping list in bench/tasks/DRAFTS.md.
 #
 # Isolation class: read-only (chat prompt; no audit helper, no GitOps-repo
 # write). Eligible tier: presubmit once observed.
@@ -65,10 +66,13 @@ verification_spec:
     mode: assert
     check:
       type: report_contains
-      # The source line the issue's acceptance criterion asks for. "as of" is
-      # the phrase the skill's script prints; a report that read the repository
-      # another way still has to say which commit it read.
-      required_phrases: ["as of"]
+      # The source line the issue's acceptance criterion asks for, in the form
+      # the skill's script prints ("repo manifests as of <sha>"). Not the bare
+      # "as of": the script's header and footer say "as of Kubernetes 1.32" of
+      # the removal table on every run, including one that read no repository,
+      # so that phrase cannot fail. A report that read the repository another
+      # way still has to say which commit its manifests were read at.
+      required_phrases: ["manifests as of"]
   - name: the-section-gives-a-verdict
     role: objective
     mode: assert
@@ -78,10 +82,13 @@ verification_spec:
       # The clean spellings come first because the eval repositories carry no
       # removed apiVersion; the hit spellings are the table's column names, so
       # a planted manifest (the positive variant) grades on the same check.
+      # "no manifest declares" rather than "no manifest": the script's
+      # no-repositories body says "there are no manifests to scan", and a
+      # verdict check that text satisfies would pass a run that read nothing.
       any_of_phrases:
         [
           "clean",
-          "no manifest",
+          "no manifest declares",
           "none of the manifests",
           "removed in",
           "replacement",
