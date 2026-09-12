@@ -25,6 +25,14 @@ KUBE_AGENTS_REPO_URL="https://github.com/gke-labs/kube-agents.git"
 # service environments (a systemd system unit, a container with no passwd
 # entry), where `set -u` would otherwise stop the script on this line.
 kube_agents_clone_dir() { printf '%s/kube-agents' "${HOME:?the installer clones its sources under HOME when it does not run from a checkout}"; }
+# A path every kube-agents revision tracks, back to release 0.1.0. An existing
+# clone is moved to the requested release only when its HEAD tracks this file,
+# so a repository that merely shares the directory name is left alone.
+KUBE_AGENTS_CLONE_MARKER="install.sh"
+# The fetch depth the fresh clone uses, and that a clone which is already
+# shallow (one an earlier install left) keeps; a complete clone is fetched
+# without it so it does not become shallow.
+KUBE_AGENTS_FETCH_DEPTH_OPT="--depth=1"
 # The github-token-minter release whose CLI imports the App key
 # (import_github_pem): the repository the CLI is cloned from, its tag, and the
 # directory the manual recipe names. A git tag, not an image, so it is not in
@@ -1256,61 +1264,84 @@ verify_local_source_ref() {
   print_success "Verified install sources and image ref resolve to commit ${expected_commit}."
 }
 
-# Fetch one ref from KUBE_AGENTS_REPO_URL into an existing clone, leaving it in
-# FETCH_HEAD. A 40-hex ref is fetched by object name; anything else is a release
-# tag, fetched under its own name so verify_local_source_ref can resolve it.
+# Fetch one ref from KUBE_AGENTS_REPO_URL into a clone, leaving it in FETCH_HEAD.
+# A 40-hex ref is fetched by object name; anything else is a release tag,
+# fetched under its own name so verify_local_source_ref can resolve it. $3 is
+# the depth option or empty: the fresh clone passes it, an existing clone only
+# when it is already shallow.
 fetch_source_ref() {
   local repo_dir="$1"
   local expected_ref="$2"
+  local depth_opt="${3:-}"
   if [[ "$expected_ref" =~ ^[0-9a-fA-F]{40}$ ]]; then
-    git -C "$repo_dir" fetch --depth=1 "$KUBE_AGENTS_REPO_URL" "$expected_ref"
+    git -C "$repo_dir" fetch ${depth_opt:+"$depth_opt"} "$KUBE_AGENTS_REPO_URL" "$expected_ref"
   else
-    git -C "$repo_dir" fetch --depth=1 "$KUBE_AGENTS_REPO_URL" "+refs/tags/${expected_ref}:refs/tags/${expected_ref}"
+    git -C "$repo_dir" fetch ${depth_opt:+"$depth_opt"} "$KUBE_AGENTS_REPO_URL" "+refs/tags/${expected_ref}:refs/tags/${expected_ref}"
   fi
 }
 
 # Move a clone left by an earlier install (or a plain `git clone`) to the
 # requested ref. Only the curl | bash path calls this: the two arms that run
-# install.sh from a checkout never move it. A clean worktree whose HEAD is not
-# already the ref is fetched and detached at it, a branch it was on (main, say)
-# being left behind. Every other case prints which one applied and returns 0 so
-# verify_local_source_ref, which runs next, reports it in its own words: a dirty
-# tree, a directory that is not a Git worktree, or a fetch or checkout that
-# fails (offline, a tag that does not exist).
+# install.sh from a checkout never move it. A clean kube-agents worktree whose
+# HEAD is not already the ref is detached at it, a branch it was on (main, say)
+# being left behind; the ref is fetched first only when the clone does not have
+# it. Every other case prints which one applied and returns 0 so
+# verify_local_source_ref, which runs next, reports it in its own words: a
+# directory that is not the root of a Git worktree or whose HEAD is not a
+# kube-agents revision, a dirty tree, or a fetch or checkout that fails
+# (offline, a tag that does not exist).
 refresh_existing_clone() {
   local repo_dir="$1"
   local expected_ref="$2"
-  local head_commit="" expected_commit="" head_branch=""
-  if ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    print_info "Using existing repository at $repo_dir as-is: it is not a Git worktree."
-    return 0
-  fi
-  if [ -n "$(git -C "$repo_dir" status --porcelain --untracked-files=no)" ]; then
-    print_info "Using existing repository at $repo_dir without modifying local changes: the checkout is dirty, so '$expected_ref' was not fetched into it."
+  local head_commit="" expected_commit="" head_branch="" depth_opt=""
+  # -e "$repo_dir/.git" (a directory, or the file a linked worktree carries)
+  # rules out a plain directory inside a Git-managed HOME, which
+  # --is-inside-work-tree alone would accept and every -C command below would
+  # then act on: HOME itself would be fetched into and detached.
+  if ! git -C "$repo_dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 || [ ! -e "${repo_dir}/.git" ]; then
+    print_info "Using existing repository at $repo_dir as-is: it is not the root of a Git worktree."
     return 0
   fi
   if ! head_commit="$(git -C "$repo_dir" rev-parse --verify HEAD 2>/dev/null)"; then
     print_info "Using existing repository at $repo_dir as-is: it has no commit checked out."
     return 0
   fi
-  if expected_commit="$(git -C "$repo_dir" rev-parse --verify "${expected_ref}^{commit}" 2>/dev/null)" && [ "$head_commit" = "$expected_commit" ]; then
-    print_info "Using existing repository at $repo_dir: already at '$expected_ref' ($head_commit)."
+  # ls-tree reads the tree object only, so a blobless clone answers without
+  # fetching a blob.
+  if [ -z "$(git -C "$repo_dir" ls-tree --name-only HEAD -- "$KUBE_AGENTS_CLONE_MARKER" 2>/dev/null)" ]; then
+    print_info "Using existing repository at $repo_dir as-is: its HEAD is not a kube-agents revision (no $KUBE_AGENTS_CLONE_MARKER), so it was not moved."
+    return 0
+  fi
+  if [ -n "$(git -C "$repo_dir" status --porcelain --untracked-files=no)" ]; then
+    print_info "Using existing repository at $repo_dir without modifying local changes: the checkout is dirty, so '$expected_ref' was not fetched into it."
     return 0
   fi
   head_branch="$(git -C "$repo_dir" symbolic-ref --short -q HEAD || true)"
-  print_info "Using existing repository at $repo_dir: fetching '$expected_ref' from $KUBE_AGENTS_REPO_URL..."
-  if ! fetch_source_ref "$repo_dir" "$expected_ref"; then
-    print_warning "Could not fetch '$expected_ref' into $repo_dir; the checkout stays at $head_commit."
-    return 0
+  if expected_commit="$(git -C "$repo_dir" rev-parse --verify "${expected_ref}^{commit}" 2>/dev/null)"; then
+    if [ "$head_commit" = "$expected_commit" ]; then
+      print_info "Using existing repository at $repo_dir: already at '$expected_ref' ($head_commit)."
+      return 0
+    fi
+    print_info "Using existing repository at $repo_dir: it already has '$expected_ref' ($expected_commit); checking it out."
+  else
+    if [ "$(git -C "$repo_dir" rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+      depth_opt="$KUBE_AGENTS_FETCH_DEPTH_OPT"
+    fi
+    print_info "Using existing repository at $repo_dir: fetching '$expected_ref' from $KUBE_AGENTS_REPO_URL..."
+    if ! fetch_source_ref "$repo_dir" "$expected_ref" "$depth_opt"; then
+      print_warning "Could not fetch '$expected_ref' into $repo_dir; the checkout stays at $head_commit."
+      return 0
+    fi
+    expected_commit="FETCH_HEAD"
   fi
-  if ! git -C "$repo_dir" checkout --detach FETCH_HEAD; then
+  if ! git -C "$repo_dir" checkout --detach "$expected_commit"; then
     print_warning "Could not check out '$expected_ref' in $repo_dir; the checkout stays at $head_commit."
     return 0
   fi
   if [ -n "$head_branch" ]; then
-    print_info "Moved $repo_dir from branch '$head_branch' ($head_commit) to '$expected_ref' (detached HEAD). The branch is left where it was; 'git checkout $head_branch' returns to it."
+    print_info "Moved $repo_dir from branch '$head_branch' ($head_commit) to '$expected_ref' (detached HEAD). The branch is left where it was and 'git checkout $head_branch' returns to it; untracked files such as install.env are kept."
   else
-    print_info "Moved $repo_dir from $head_commit to '$expected_ref' (detached HEAD). 'git checkout $head_commit' returns to the previous revision."
+    print_info "Moved $repo_dir from $head_commit to '$expected_ref' (detached HEAD). 'git checkout $head_commit' returns to the previous revision; untracked files such as install.env are kept."
   fi
 }
 
@@ -1338,7 +1369,7 @@ acquire_source_repo() {
     else
       print_info "Cloning kube-agents install sources at '$expected_ref' into $resolved_dir..."
       git clone --filter=blob:none --no-checkout "$KUBE_AGENTS_REPO_URL" "$resolved_dir"
-      fetch_source_ref "$resolved_dir" "$expected_ref"
+      fetch_source_ref "$resolved_dir" "$expected_ref" "$KUBE_AGENTS_FETCH_DEPTH_OPT"
       git -C "$resolved_dir" checkout --detach FETCH_HEAD
     fi
     cd "$resolved_dir"
