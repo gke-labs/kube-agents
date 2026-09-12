@@ -68,6 +68,10 @@ RESERVED_PROFILES = frozenset({"default", "platform"})
 KUBECONFIG_PROBE = "/usr/bin/test"
 KUBECONFIG_PROBE_TIMEOUT_SECONDS = 30
 
+# How delete_profile unlinks a kubeconfig on the sandbox volume.
+KUBECONFIG_RM = "/bin/rm"
+KUBECONFIG_RM_TIMEOUT_SECONDS = 30
+
 
 def log(msg: str) -> None:
     print(f"[CLUSTER-PROFILE] {msg}", file=sys.stderr)
@@ -238,6 +242,31 @@ def kubeconfig_landed(kubeconfig: Path) -> bool:
         # gone away since the fetch is the case this check is for.
         return False
     return probe.returncode == 0
+
+
+def _unlink_kubeconfig(kubeconfig: Path) -> None:
+    """Remove the kubeconfig file wherever it was written.
+
+    Which filesystem that is depends on the install: with a sandbox, gcloud
+    wrote it on the sandbox volume as TERMINAL_PRINCIPAL; without one, it was
+    written on this pod's own filesystem. Unlinked the same way as
+    kubeconfig_landed probes.
+    """
+    try:
+        if kubeconfig.exists():
+            kubeconfig.unlink()
+    except OSError:
+        pass
+    if sandbox_exec.sandbox_enabled():
+        try:
+            sandbox_exec.run(
+                [KUBECONFIG_RM, "-f", "--", str(kubeconfig)],
+                check=False,
+                timeout=KUBECONFIG_RM_TIMEOUT_SECONDS,
+                principal=sandbox_exec.TERMINAL_PRINCIPAL,
+            )
+        except (sandbox_exec.SandboxUnavailable, OSError, subprocess.TimeoutExpired):
+            pass
 
 
 def _push_sandbox_layout(name: str) -> None:
@@ -476,12 +505,9 @@ def delete_profile(name: str) -> None:
     home = profile_home(name)
     identity = read_cluster_identity(home)
     if identity:
-        try:
-            kc = kubeconfig_path(identity["project"], identity["cluster"], identity["location"])
-            if kc.exists():
-                kc.unlink()
-        except OSError:
-            pass
+        _unlink_kubeconfig(
+            kubeconfig_path(identity["project"], identity["cluster"], identity["location"])
+        )
     try:
         # Stays in the agent pod: `hermes` needs the profiles on the data PVC and
         # the gateway on loopback, and the sandbox image does not carry it.

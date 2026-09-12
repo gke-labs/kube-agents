@@ -536,6 +536,31 @@ class CreateProfileTest(unittest.TestCase):
         cap.delete_profile(self.profile.name)
         self.assertFalse(expected_kc.exists())
 
+    def test_delete_profile_cleans_external_kubeconfig_in_sandbox(self):
+        self.create()
+        expected_kc = cap.kubeconfig_path(self.PROJECT, self.CLUSTER, self.LOCATION)
+        with mock.patch.object(cap.sandbox_exec, "sandbox_enabled", return_value=True):
+            rm_run = mock.MagicMock(return_value=subprocess.CompletedProcess(["rm"], 0, "", ""))
+            with mock.patch.object(cap.sandbox_exec, "run", rm_run):
+                cap.delete_profile(self.profile.name)
+            rm_run.assert_called_once_with(
+                [cap.KUBECONFIG_RM, "-f", "--", str(expected_kc)],
+                check=False,
+                timeout=cap.KUBECONFIG_RM_TIMEOUT_SECONDS,
+                principal=cap.sandbox_exec.TERMINAL_PRINCIPAL,
+            )
+
+    def test_delete_profile_tolerates_sandbox_unavailable_on_unlink(self):
+        self.create()
+        with mock.patch.object(cap.sandbox_exec, "sandbox_enabled", return_value=True):
+            with mock.patch.object(
+                cap.sandbox_exec,
+                "run",
+                side_effect=cap.sandbox_exec.SandboxUnavailable("unreachable"),
+            ):
+                # Must not raise
+                cap.delete_profile(self.profile.name)
+
 
 if __name__ == "__main__":
     unittest.main()
