@@ -32,8 +32,15 @@ CRON_SCAN_KEY = "cron_scan"
 APPROVALS_KEY = "approvals"
 
 #: Hex digits of the SHA-256 digest a refusal log line uses to identify the
-#: command; the command text itself never reaches the log (CodeQL alert 29).
+#: command in place of reproducing it; a refused command is user-authored
+#: shell that can embed credentials (CodeQL py/clear-text-logging-sensitive-data,
+#: alert 29). The lookalike line still names the offending host, a token
+#: derived from the command, so an operator can see which domain was refused.
 LOG_DIGEST_LEN = 12
+#: ``str.encode`` error handler for the digest. A lone surrogate, which
+#: ``json.loads`` yields for a ``\ud800``-style escape in a tool call, cannot
+#: be encoded strictly; a refusal must log and return, never raise.
+DIGEST_ENCODE_ERRORS = "surrogatepass"
 DEFAULT_MAX_GCLOUD_COMMAND_LEN = 5
 
 MSG_EXECUTE_CODE_REFUSED = (
@@ -651,7 +658,8 @@ def _command_digest(command: str) -> str:
     Refusal log lines carry this digest and the command's length instead of the
     command text, which is user-authored shell and can embed credentials.
     """
-    return hashlib.sha256(command.encode()).hexdigest()[:LOG_DIGEST_LEN]
+    digest = hashlib.sha256(command.encode("utf-8", DIGEST_ENCODE_ERRORS))
+    return digest.hexdigest()[:LOG_DIGEST_LEN]
 
 
 def cron_command_policy_block(command: str, risk: str | None) -> Optional[dict]:

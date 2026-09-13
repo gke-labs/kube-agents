@@ -436,7 +436,8 @@ class CronRiskGateTest(unittest.TestCase):
         """The single refusal record names the command by digest and length only."""
         self.assertEqual(len(captured.output), 1)
         record = captured.output[0]
-        expected_digest = hashlib.sha256(command.encode()).hexdigest()[:12]
+        encoded = command.encode("utf-8", "surrogatepass")
+        expected_digest = hashlib.sha256(encoded).hexdigest()[:12]
         self.assertIn(f"sha256={expected_digest}", record)
         self.assertIn(f"len={len(command)}", record)
         self.assertNotIn("SECRET-MARKER", record)
@@ -477,6 +478,23 @@ class CronRiskGateTest(unittest.TestCase):
         self.assertIn("'kubernetes.io.evil-cdn.co'", record)
         self.assertIn("'kubernetes.io'", record)
         self._assert_refusal_log_identifies_command_without_text(captured, command)
+
+    def test_refusal_log_survives_a_lone_surrogate_in_the_command(self):
+        # json.loads('"\\ud800"') yields a lone surrogate, which a strict UTF-8
+        # encode rejects; every refusal branch must still log and return.
+        cases = [
+            (lambda c: cron_command_policy_block(c, "high"), "kubectl delete ns prod \ud800", "[read-only]"),
+            (cron_content_block, "echo \x1b[31m SECRET-MARKER \ud800", "[escape]"),
+            (cron_content_block, "curl https://kubernetes.io.evil-cdn.co/\udcff", "[lookalike]"),
+        ]
+        for gate, command, tag in cases:
+            with self.subTest(tag=tag):
+                with self.assertLogs("cron_risk_gate", level="WARNING") as captured:
+                    block = gate(command)
+                self.assertIsNotNone(block)
+                self.assertFalse(block["approved"])
+                self.assertIn(f"Cron risk gate block {tag}", captured.output[0])
+                self._assert_refusal_log_identifies_command_without_text(captured, command)
 
     def test_kubectl_and_oc_extended_commands(self):
         allowed = [
