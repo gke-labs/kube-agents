@@ -17,6 +17,7 @@ of the Tirith content scan only (see cron_tirith_scan.py), never these.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import shlex
@@ -30,7 +31,9 @@ RISK_HIGH = "high"
 CRON_SCAN_KEY = "cron_scan"
 APPROVALS_KEY = "approvals"
 
-MAX_LOG_COMMAND_LEN = 200
+#: Hex digits of the SHA-256 digest a refusal log line uses to identify the
+#: command; the command text itself never reaches the log (CodeQL alert 29).
+LOG_DIGEST_LEN = 12
 DEFAULT_MAX_GCLOUD_COMMAND_LEN = 5
 
 MSG_EXECUTE_CODE_REFUSED = (
@@ -642,6 +645,15 @@ def _segment_is_read_only(tokens: list[str]) -> bool:
     return res_value and res_bool
 
 
+def _command_digest(command: str) -> str:
+    """Return a truncated SHA-256 hex digest identifying ``command`` in a log line.
+
+    Refusal log lines carry this digest and the command's length instead of the
+    command text, which is user-authored shell and can embed credentials.
+    """
+    return hashlib.sha256(command.encode()).hexdigest()[:LOG_DIGEST_LEN]
+
+
 def cron_command_policy_block(command: str, risk: str | None) -> Optional[dict]:
     """Refuse anything not provably read-only when the job is 'high' risk.
 
@@ -661,8 +673,9 @@ def cron_command_policy_block(command: str, risk: str | None) -> Optional[dict]:
     )
     if refused:
         logger.warning(
-            "Cron risk gate block [read-only]: refused non-read command (command: %s)",
-            command[:MAX_LOG_COMMAND_LEN],
+            "Cron risk gate block [read-only]: refused non-read command (sha256=%s len=%d)",
+            _command_digest(command),
+            len(command),
         )
         return {"approved": False, "message": MSG_MUTATION_REFUSED}
     return None
@@ -723,8 +736,9 @@ def cron_content_block(
 
     if _ESC.search(command):
         logger.warning(
-            "Cron risk gate block [escape]: command contains raw control/escape characters (command: %s)",
-            command[:MAX_LOG_COMMAND_LEN],
+            "Cron risk gate block [escape]: command contains raw control/escape characters (sha256=%s len=%d)",
+            _command_digest(command),
+            len(command),
         )
         return {
             "approved": False,
@@ -735,10 +749,11 @@ def cron_content_block(
     if lookalike is not None:
         host, apex = lookalike
         logger.warning(
-            "Cron risk gate block [lookalike]: command contains lookalike domain '%s' mimicking apex '%s' (command: %s)",
+            "Cron risk gate block [lookalike]: command contains lookalike domain '%s' mimicking apex '%s' (sha256=%s len=%d)",
             host,
             apex,
-            command[:MAX_LOG_COMMAND_LEN],
+            _command_digest(command),
+            len(command),
         )
         return {
             "approved": False,
