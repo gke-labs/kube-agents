@@ -9,13 +9,15 @@ targets are the developer entry points for two gates that otherwise run only
 by hand and from the unit suite, so this pins them to the help output.
 """
 
-import os
 import pathlib
 import re
-import subprocess
+import sys
 import unittest
 
-REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+_HERE = pathlib.Path(__file__).resolve().parent
+sys.path.insert(0, str(_HERE))
+
+from _run_make import run_make  # noqa: E402
 
 #: Targets `make help` must list, each with a `## description` on its recipe
 #: line in the Makefile.
@@ -31,20 +33,7 @@ MAKE_TIMEOUT_SECONDS = 60
 
 
 def _make_help():
-    env = dict(os.environ)
-    # This test may itself be running inside the `make test-python` sweep, and
-    # an inherited jobserver or MAKELEVEL would make the nested make behave
-    # unlike the one a developer runs by hand.
-    env.pop("MAKEFLAGS", None)
-    env.pop("MAKELEVEL", None)
-    result = subprocess.run(
-        ["make", "help"],
-        cwd=REPO_ROOT,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=MAKE_TIMEOUT_SECONDS,
-    )
+    result = run_make(["help"], timeout=MAKE_TIMEOUT_SECONDS)
     if result.returncode != 0:
         raise AssertionError(
             "make help failed (%d):\n%s" % (result.returncode, result.stderr)

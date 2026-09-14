@@ -17,9 +17,15 @@ and RUFF_SELECT in the Makefile is the same rule set; the Makefile test below
 pins the two together.
 
 ruff comes from requirements-test.txt (`make test-python-deps`). Where it is
-not installed the test skips on a laptop and fails in CI, so a runner that
-lost the dependency cannot report the gate green. `CI` is the variable GitHub
-Actions sets on every job.
+not installed the test skips on a laptop, and skips on a CI job that never
+installs that file at all -- agent-startup-test.yml discovers this directory
+with PyYAML as its only dependency, on purpose, so the tests run anywhere the
+agent image does. It fails on a CI job that did install requirements-test.txt
+and still has no ruff, which is a runner that lost the dependency and must not
+report the gate green. `CI` is the variable GitHub Actions sets on every job;
+whether requirements-test.txt was installed is read from `coverage`, the
+package `make coverage` (the job the gate exists for) runs the suite under,
+which that file provides and no runner ships on its own.
 """
 
 import importlib.util
@@ -56,9 +62,14 @@ RUFF_COMMAND = (
 #: the cheapest way to ask whether `python3 -m ruff` can start at all.
 RUFF_MODULE = "ruff"
 
-#: Set by GitHub Actions on every job. Where it is set, a missing ruff is a
-#: broken runner and the test fails; where it is not, the test skips.
+#: Set by GitHub Actions on every job. Where it is set and the runner did
+#: install requirements-test.txt, a missing ruff is a broken runner and the
+#: test fails; anywhere else, the test skips.
 CI_ENV_VAR = "CI"
+
+#: A package requirements-test.txt provides and nothing else installs: where it
+#: imports, that file was installed, so ruff should have been too.
+REQUIREMENTS_SENTINEL_MODULE = "coverage"
 
 #: The Makefile assignment the developer target reads its rule set from.
 MAKEFILE_RUFF_SELECT = re.compile(r"^RUFF_SELECT\s*:?=\s*(\S+)\s*$", re.MULTILINE)
@@ -74,8 +85,14 @@ class RuffErrorRulesTest(unittest.TestCase):
             "ruff is not installed for %s; install it with `make test-python-deps`"
             % sys.executable
         )
-        if os.environ.get(CI_ENV_VAR):
-            self.fail(message + " (CI is set, so a missing linter is a failure)")
+        if os.environ.get(CI_ENV_VAR) and (
+            importlib.util.find_spec(REQUIREMENTS_SENTINEL_MODULE) is not None
+        ):
+            self.fail(
+                message
+                + " (CI is set and requirements-test.txt was installed, so a"
+                " missing linter is a failure)"
+            )
         self.skipTest(message)
 
     def test_error_rules_pass_over_the_repository(self):
