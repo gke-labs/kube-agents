@@ -611,9 +611,14 @@ class C1IsolationIsStructural(unittest.TestCase):
         "gcp oauth token": "ya29." + "A" * 195,
         "jwt": "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJzeXN0ZW0iLCJhdWQiOlsiazhzIl19.c2lnbmF0dXJlXw",
         "gcp api key": "AIza" + "a" * 35,
-        "pem block": (
-            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAx3f9\n-----END RSA PRIVATE KEY-----"
-        ),
+        # The body is elided, as `test_audit_report.py`'s copy is. The redactor
+        # keys on the armour lines and reads nothing between them. GitHub
+        # secret-scanning alert 4 reported the earlier form of this literal --
+        # header, twenty characters of DER framing with no modulus behind
+        # them, footer, in one string -- as a leaked RSA key; the same body
+        # split across three literals in the plugin's `test_redactor.py` has
+        # never been reported.
+        "pem block": "-----BEGIN RSA PRIVATE KEY-----\nMIIEow...\n-----END RSA PRIVATE KEY-----",
     }
     # A Secret's payload is credential material whatever its keys are called,
     # which is the one shape no token pattern can see.
