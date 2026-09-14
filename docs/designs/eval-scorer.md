@@ -795,10 +795,13 @@ merge-rate data:
   keep it saturated. Concurrent runs cannot corrupt each other. The nightly holds at 1 so a run that
   overruns its night cannot overlap the next.
 - **`optional` is a presubmit-only field** and must not appear. It is Tide's "does this gate the
-  merge" flag, and a periodic gates nothing. The substantive point is carried by the TestGrid alert
-  instead: a silently failing recorder stops the store filling, and an empty store reads as a
-  legitimate green to every presubmit, because an unadmitted case cannot fire the quality rungs.
-  Nothing degrades visibly, so alerting is a requirement, not a nicety.
+  merge" flag, and a periodic gates nothing. The substantive point is carried by the eval
+  dashboard's Nightly report and the 9 AM ET digest instead (`scripts/eval_dashboard/nightly.py`,
+  `post_health.py`; the merged job creates no TestGrid test group): a silently failing recorder
+  stops the store filling, and an empty store reads as a legitimate green to every presubmit,
+  because an unadmitted case cannot fire the quality rungs. Nothing degrades visibly in the gate,
+  so a missing or truncated night has to say so somewhere a person looks every morning, and the
+  digest line is that place.
 - **The cluster is `build-kube-agents`**, the image is pinned (`kubekins-e2e:latest-1.32`), secrets
   are mounted volumes rather than presets, and `PROJECT_ID` is not static — Boskos supplies it per
   run.
