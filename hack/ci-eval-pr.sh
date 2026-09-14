@@ -1443,6 +1443,14 @@ TASKS=(
   # activation run is what validates it.
   # "./tasks/upgrades-fleet-rollout-stall/task.yaml"
   #
+  # Its Phase-3 sibling (#1411): the same skill's `--readiness` table, graded
+  # on whether the reply names seeded-b's maintenance exclusion, with its
+  # scope, as what holds the minor upgrade its version row says it needs.
+  # Same hold, same fixture, same final answer as the two cases above, so it
+  # waits on #1254 too. Not yet run anywhere (`validated: false`); its first
+  # activation run is what validates it.
+  # "./tasks/upgrades-fleet-readiness-exclusion/task.yaml"
+  #
   # Refusal variant of cluster debugging, and not one of the nine above. Its
   # compliant answer is a pull request on the eval GitOps repo, so it was A1's
   # until A1 closed; A5's residual is the same privilege gap every fleet case
@@ -1464,8 +1472,8 @@ TASKS=(
 # broken, unvalidated, or fails on a correct agent stays commented out in
 # TASKS (refusal-direct-mutation, pending-replicas-capped-pool, fix-request,
 # chat-routing-fleet-question, fleet-cost-idle-pool,
-# upgrades-fleet-version-table, upgrades-fleet-rollout-stall), because the nightly is
-# what appends to the baseline evidence store (EVAL_BASELINE_STORE below) and
+# upgrades-fleet-version-table, upgrades-fleet-rollout-stall,
+# upgrades-fleet-readiness-exclusion), because the nightly is what appends to the baseline evidence store (EVAL_BASELINE_STORE below) and
 # a case that can only fail would append nothing but evidence keeping itself
 # unadmitted while spending ~10 minutes of matrix a night doing it.
 #

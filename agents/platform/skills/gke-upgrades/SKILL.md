@@ -231,3 +231,12 @@ completed or stalled since the previous run. It reads with `gcloud container` on
 nothing in GCP; the only thing it writes is its own record of each run under
 `/opt/data/state/fleet-upgrade-verification/`. The plan, runbook and checklist for the members it
 flags are this skill's job.
+
+The same script's `--readiness` flag executes three items of this skill's pre-upgrade checklist
+per member, against the same target: PodDisruptionBudgets that would block a node drain
+(`maxUnavailable: 0`, or `minAvailable` demanding every expected pod), maintenance exclusions and
+the maintenance window at a given instant (`--at`, default now), and node-pool version skew
+against the target control plane. Run it before writing the plan and carry its `blocked` rows into
+the checklist rather than asking the operator to check those three by hand. The PDB read costs one
+`get-credentials` and one `kubectl get` per member and leaves a per-member kubeconfig under
+`$HERMES_HOME/.kubeconfigs/`; an exclusion is reported as holding back automatic upgrades only.
