@@ -177,6 +177,11 @@ def handle_open(args) -> int:
                 "handle": workspace.handle,
                 "repo": workspace.repo,
                 "base": workspace.base,
+                # The commit the tree was cloned at. A caller that has to say
+                # which commit it read — the fleet-audit declared-intent record
+                # names each repository as `owner/name@sha` — takes it from
+                # here, since there is no `.git` on this side to ask.
+                "sha": workspace.base_sha,
                 "shallow": workspace.shallow,
             }
         )
@@ -291,10 +296,13 @@ def clone_content(args) -> int:
             cursor = listing[-1]["path"]
         base = workspace.base
         repo = workspace.repo
+        sha = workspace.base_sha
     result = {
         "mode": "content",
         "repo": repo,
         "base": base,
+        # The commit the copy was taken from; see `handle_open`.
+        "sha": sha,
         "into": str(into),
         "written": written,
         "bytes": total_bytes,
