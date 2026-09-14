@@ -1713,7 +1713,7 @@ print(m.group(1).strip('\'\"') if m else '')
 #                     hand-off (record_verdict) and, once a store is
 #                     configured, in the verdict's "Record says" column,
 #                     so a roster edit cites it. Nothing the nightly appends
-#                     can change what blocks.
+#                     changes which cases block.
 #   record            The store decides once it holds a full window for a
 #                     case at the current key (EVAL_ADMISSION_MIN_RUNS
 #                     runs), either way; the list is the fallback until

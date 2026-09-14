@@ -32,7 +32,7 @@ selects who decides, and it defaults to `roster`:
   (`EVAL_ADMISSION_MIN_RUNS` runs, default 20, at the current key, above or below the
   `EVAL_ADMISSION_RATE` bar), `collecting` for a partial one, `stale` for evidence only at a
   superseded key, `none` for nothing — and a roster edit cites that sentence. Nothing the
-  nightly appends changes what blocks.
+  nightly appends changes which cases block.
 - **`record`**: the store decides once it holds a full window for a case, either way — a
   case at 21/21 is admitted whether or not it is named here, and a case at 12/21 is turned
   away even if it is — and the list is the fallback for a case the record cannot judge yet.

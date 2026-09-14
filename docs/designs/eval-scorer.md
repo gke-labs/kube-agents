@@ -950,7 +950,7 @@ then applies the mode:
   decides outright. A listed case at 12/21 stays admitted and its reason says the record would
   demote it; an unlisted case at 21/21 stays out and its reason says the record would admit it and
   that the roster decides. The record informs a roster edit, which is a reviewed diff — the point of
-  the mode is that nothing the nightly appends can change what blocks.
+  the mode is that nothing the nightly appends changes which cases block.
 - `record`: the record governs once it holds a full window. A listed case screened at 12/21 is
   turned away with a reason that says the record overrides the list, and an unlisted case at 21/21
   is admitted. The list is consulted only in the three pre-admission states, and when the store
