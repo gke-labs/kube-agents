@@ -59,6 +59,12 @@ with open(os.environ["STUB_LOG"], "a") as fh:
 world = json.load(open(os.environ["STUB_WORLD"]))
 i = args.index("get")
 kind = args[i + 1]
+# Real kubectl refuses a resource type it does not serve; a subject split on
+# the wrong delimiter must fail here the way it would against a cluster,
+# not be quietly rebuilt into the world's key.
+if "?" in kind or "/" in kind:
+    print(f'error: the server doesn\'t have a resource type "{kind}"', file=sys.stderr)
+    sys.exit(1)
 name = None
 selector = None
 rest = args[i + 2:]
@@ -428,6 +434,29 @@ class PassTest(_Harness):
         assert "WARNING: fixture role 'no-pdb-workload' could not be checked" in done.stderr
         assert "Unable to connect" in done.stderr
 
+    def test_an_unreadable_role_does_not_hold_the_wait(self):
+        import time
+
+        world = _healthy_world()
+        world["kubectl"]["deployment/checkout-gateway"] = "UNREACHABLE"
+        started = time.monotonic()
+        done = self.run_script(world, "--wait", "30", "--interval", "0.1")
+        assert done.returncode == 0, done.stderr
+        assert time.monotonic() - started < 20, "nothing was worth waiting for"
+        assert "1 not checked" in done.stderr
+        assert self.log.read_text().count("get deployment checkout-gateway") == 1
+
+    def test_an_unreadable_role_is_re_read_while_another_is_worth_waiting_for(self):
+        world = _healthy_world()
+        world["kubectl"]["deployment/checkout-gateway"] = ["UNREACHABLE", world["kubectl"]["deployment/checkout-gateway"]]
+        world["kubectl"]["pod?app=payments-api"] = [
+            _pods(_pod(restarts=0, last_reason=None, phase="Pending")),
+            _pods(_pod(restarts=1, last_reason="OOMKilled")),
+        ]
+        done = self.run_script(world, "--wait", "20", "--interval", "0.1")
+        assert done.returncode == 0, done.stderr
+        assert "7 role(s) in their designed state, 0 drifted, 0 not checked" in done.stderr
+
     def test_a_read_failure_beside_a_failed_assertion_is_still_drift(self):
         world = _healthy_world()
         world["kubectl"]["deployment/checkout-gateway"] = "UNREACHABLE"
@@ -447,6 +476,10 @@ class PassTest(_Harness):
 
     def test_the_idle_pool_needs_a_ready_tainted_node(self):
         world = _healthy_world()
+        done = self.run_script(world)
+        assert "7 role(s) in their designed state" in done.stderr, done.stderr
+        # The label key carries a slash: the subject is a selector, not kind/name.
+        assert "get node -l cloud.google.com/gke-nodepool=idle-batch-pool" in self.log.read_text()
         world["kubectl"]["node?cloud.google.com/gke-nodepool=idle-batch-pool"] = {"items": [_node(ready="False")]}
         done = self.run_script(world)
         assert "idle-nodepool" in self.drift_files()

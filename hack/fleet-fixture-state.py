@@ -32,8 +32,11 @@ It runs in two places. `scripts/verify_ci_pool_project.py` runs it after the
 presence pass and fails a project whose fixtures have drifted. `hack/ci-eval-pr.sh`
 runs it after the lease-time seeded-a heal (section 2c), where it can WAIT: a
 fixture that has just been rescheduled onto a healed node needs its first
-restart before OOMKilled evidence exists, so `--wait` polls until every role
-converges or the deadline passes. A role still drifted at the deadline gets a
+restart before OOMKilled evidence exists, so `--wait` keeps re-reading a role
+that is positively out of shape until it converges or the deadline passes. A
+role whose reads fail does not hold the wait: nothing about it can converge,
+so it is re-read only while some other role is worth waiting for. A role
+still drifted at the deadline gets a
 `<role>.drift` file beside its kubeconfig; the runner skips the cases that
 depend on that role and `bench-gate` grades their repetitions as
 infrastructure -- the environment was not ready, which is not the pull
@@ -322,7 +325,13 @@ def read_kubectl(kubeconfig: Path, namespace: str | None, subject: str) -> list[
     Unreadable: nothing was learned this pass.
     """
     cmd = ["kubectl", f"--kubeconfig={kubeconfig}", f"--request-timeout={KUBECTL_REQUEST_TIMEOUT}", "get"]
-    if "/" in subject:
+    # Selector first, as hack/fleet-kubeconfigs.sh's _fleet_probe_present
+    # does: a label key may itself contain a slash
+    # (`node?cloud.google.com/gke-nodepool=idle-batch-pool`), so testing for
+    # `/` first would split that subject as kind/name and ask kubectl for a
+    # resource type that does not exist.
+    named = "?" not in subject
+    if named:
         kind, name = subject.split("/", 1)
         cmd += [kind, name]
     else:
@@ -335,7 +344,7 @@ def read_kubectl(kubeconfig: Path, namespace: str | None, subject: str) -> list[
     cmd += ["-o", "json"]
     rc, out, err = _run(cmd, KUBECTL_TIMEOUT_SECONDS)
     if rc != 0:
-        if "/" in subject and NOT_FOUND_RE.search(err):
+        if named and NOT_FOUND_RE.search(err):
             return []
         raise Unreadable(f"kubectl get {kind} failed ({rc}): {err.strip().splitlines()[-1] if err.strip() else 'no output'}")
     try:
@@ -625,7 +634,14 @@ def run(directory: Path, catalog: Path, project_override: str | None, wait: floa
         for role in converged:
             pending.pop(role, None)
         remaining = deadline - time.monotonic()
-        if not pending or remaining <= 0:
+        # Only a role that was READ and found out of shape is worth another
+        # pass: a fixture rescheduling onto a healed node converges; a refused
+        # or timed-out read does not, and holding the presubmit's whole wait
+        # for it would make every run with one unreachable API server pay the
+        # full deadline for nothing. Such a role is still re-read while another
+        # role keeps the loop going, so a transient failure gets its retries.
+        waiting = [role for role in pending if last[role][0]]
+        if not waiting or remaining <= 0:
             break
         time.sleep(min(interval, remaining))
 
