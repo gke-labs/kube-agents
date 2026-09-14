@@ -147,7 +147,7 @@ The six probes that carry the audit domains in presubmit after the 2026-08-26 re
 
 ## Cluster debugging beyond the first draft
 
-The table gives each domain one draft, which is the floor rather than the target: issue #901's lane asks for coverage of a domain, and one case per domain measures one journey through it. Cluster debugging has five more, all read-only, all still `validated: false`; four are active and `cluster-agent-pending-replicas-capped-pool/` is registered commented out. None is blocked by A1 or A4 — they open no pull request and read no ledger — and A5's residual is the privilege gap every fleet case carries.
+The table gives each domain one draft, which is the floor rather than the target: issue #901's lane asks for coverage of a domain, and one case per domain measures one journey through it. Cluster debugging has five more, all read-only, all still `validated: false`; four are active, three in `TASKS` and `cluster-agent-stalled-controller-healthy-silence/` in `NIGHTLY_TASKS`, and `cluster-agent-pending-replicas-capped-pool/` is registered commented out. None is blocked by A1 or A4 — they open no pull request and read no ledger — and A5's residual is the privilege gap every fleet case carries.
 
 They activated while unvalidated deliberately. `validated: false` means nobody has watched the case pass and fail, and the only thing that can produce a scored agent run against the seeded fleet is the presubmit — the fleet lives in the Boskos pool projects, where a `container.clusters.get` a developer does not hold is the difference between reading it and not. Leaving them commented out to wait for a validation that only activating them can produce is the loop this breaks.
 
