@@ -15,11 +15,13 @@ reviewers:
       - mateuszklinowski
       - mplakhtiy
     # Mirrors the eval-crew alias in OWNERS_ALIASES: only it can /approve a
-    # change under bench/tasks/ or to hack/ci-eval-pr.sh (#1546). Widen both
-    # together, and only with root approvers: a mixed pull request routes
-    # here alone, and its reviewer has to be able to clear the rest of it too.
+    # change under bench/tasks/ or to hack/ci-eval-pr.sh (#1546). Keep the two
+    # lists identical. A mixed pull request routes here alone, so a member who
+    # is not a root approver can clear the case or roster half and the rest
+    # still waits on a root approver's /approve.
     eval-crew:
       - jayantid
+      - lapis2002
 
 files:
   # Keys are glob expressions.

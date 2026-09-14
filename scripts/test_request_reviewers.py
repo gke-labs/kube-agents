@@ -37,7 +37,7 @@ CONFIG = {
         "groups": {
             "repository-owners": ["bradhoekstra", "jayantid", "toshiowang", "dshnayder"],
             "waw-leads": ["fatoshoti", "mateuszklinowski", "mplakhtiy"],
-            "eval-crew": ["jayantid"],
+            "eval-crew": ["jayantid", "lapis2002"],
         },
     },
     "files": {
@@ -181,13 +181,6 @@ class ConfigValidationTest(unittest.TestCase):
         self.assertEqual(live, CONFIG)
         self.assertEqual(list(live["files"]), list(CONFIG["files"]))
 
-    def test_eval_crew_stays_inside_the_root_owners(self):
-        # A mixed pull request routes to eval-crew alone (last match wins), and
-        # the promise that the requested reviewer can clear it rests on every
-        # member also being a root approver. Widening the group past
-        # repository-owners breaks that for the README half of such a change.
-        self.assertTrue(set(EVAL_CREW) <= set(OWNERS), f"{EVAL_CREW} is not within {OWNERS}")
-
     def test_per_author_is_refused(self):
         config = {"reviewers": {"per_author": {"alice": ["bob"]}}}
         with self.assertRaises(ValueError) as caught:
@@ -238,7 +231,7 @@ class SelectionTest(unittest.TestCase):
         # they cannot clear, and nothing would tell eval-crew it exists.
         matched = rr.reviewers_by_changed_files(CONFIG, ["bench/tasks/new-case/task.yaml"], "author")
         self.assertEqual(matched, EVAL_CREW)
-        self.assertEqual(self.select(["bench/tasks/new-case/task.yaml"]), EVAL_CREW)
+        self.assertIn(self.select(["bench/tasks/new-case/task.yaml"])[0], EVAL_CREW)
 
     def test_a_roster_change_goes_to_eval_crew_but_the_rest_of_hack_does_not(self):
         # hack/OWNERS scopes ci-eval-pr.sh alone; its neighbours stay with root.
@@ -246,20 +239,32 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual(rr.reviewers_by_changed_files(CONFIG, ["hack/ci-deploy.sh"], "author"), OWNERS)
 
     def test_a_mixed_change_still_goes_to_eval_crew(self):
-        # Last match wins, and eval-crew is listed last: the one reviewer who
-        # can clear the case half is asked, and being a root owner too, the rest.
+        # Last match wins, and eval-crew is listed last: the reviewer who can
+        # clear the case half is asked. Not every member is a root owner, so
+        # the README half may still wait on a root approver's /approve; the
+        # alternative, a random root owner who cannot clear the case at all,
+        # is the gap this entry closes.
         matched = rr.reviewers_by_changed_files(CONFIG, ["README.md", "bench/tasks/x/task.yaml"], "author")
         self.assertEqual(matched, EVAL_CREW)
 
-    def test_eval_crews_own_case_change_falls_back_to_a_root_owner(self):
-        # The author is never requested, so with one member the glob yields
-        # nobody and the defaults carry it -- to a root owner, whose review sets
-        # lgtm; the author's approved is already on it (#1075).
+    def test_eval_crews_own_case_change_goes_to_the_other_member(self):
+        # The author is never requested, so a member's own case change goes to
+        # the rest of the group; the author's approved is already on it (#1075).
         author = EVAL_CREW[0]
-        self.assertEqual(rr.reviewers_by_changed_files(CONFIG, ["bench/tasks/x/task.yaml"], author), [])
-        picked = self.select(["bench/tasks/x/task.yaml"], author=author)
+        matched = rr.reviewers_by_changed_files(CONFIG, ["bench/tasks/x/task.yaml"], author)
+        self.assertEqual(matched, [name for name in EVAL_CREW if name != author])
+        self.assertEqual(self.select(["bench/tasks/x/task.yaml"], author=author), matched)
+
+    def test_a_case_change_by_the_whole_group_falls_back_to_the_defaults(self):
+        # Only the author is excluded, so this needs a one-member group: the
+        # shape the config had before lapis2002 joined, and the shape it has
+        # again if the alias ever shrinks. The defaults carry it to a root
+        # owner, whose review sets lgtm.
+        config = dict(CONFIG, reviewers=dict(CONFIG["reviewers"], groups=dict(CONFIG["reviewers"]["groups"], **{"eval-crew": ["jayantid"]})))
+        self.assertEqual(rr.reviewers_by_changed_files(config, ["bench/tasks/x/task.yaml"], "jayantid"), [])
+        picked = rr.select_reviewers(config, ["bench/tasks/x/task.yaml"], "jayantid", rng=random.Random(0))
         self.assertEqual(len(picked), 1)
-        self.assertIn(picked[0], [name for name in OWNERS if name != author])
+        self.assertIn(picked[0], [name for name in OWNERS if name != "jayantid"])
 
     def test_the_author_is_never_requested(self):
         matched = rr.reviewers_by_changed_files(CONFIG, ["README.md"], "bradhoekstra")

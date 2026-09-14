@@ -292,13 +292,14 @@ The two labels are the two people:
   change from someone in `OWNERS` starts with the `approved` half already satisfied and waits only
   on the `lgtm` (#1075).
 
-Everyone `.github/auto_request_review.yml` can assign is also an `OWNERS` approver, and its
-`bench/tasks/**` and `hack/ci-eval-pr.sh` entries send a change there to its own `eval-crew` group,
-so the reviewer the bot's green check summons is always someone who can clear both labels in one
-action. The bot never requests the author, so a case or roster change from `eval-crew` itself falls
-back to a root owner, whose review sets `lgtm` alone; the author's `approved` is already on it
-(#1075). That is a property of two lists agreeing today — the alias in `OWNERS_ALIASES` and the
-group in the bot's config — not a guarantee either file makes.
+Everyone `.github/auto_request_review.yml` can assign is an `OWNERS` approver for what it assigns
+them: its `bench/tasks/**` and `hack/ci-eval-pr.sh` entries send a change there to its own
+`eval-crew` group, so the reviewer the bot's green check summons can clear both labels in one
+action. Not every `eval-crew` member is a root approver, so a change that also touches root-owned
+paths still waits on a root approver's `/approve` after that review. The bot never requests the
+author, so a member's own case or roster change goes to the rest of the group, with the author's
+`approved` already on it (#1075). That is a property of two lists agreeing today — the alias in
+`OWNERS_ALIASES` and the group in the bot's config — not a guarantee either file makes.
 
 Before any of that, a pull request from an author Prow does not already trust is labelled
 `needs-ok-to-test`, and its Prow presubmits hold until a member comments `/ok-to-test`. It gates
