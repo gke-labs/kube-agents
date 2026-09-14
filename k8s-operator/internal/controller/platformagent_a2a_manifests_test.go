@@ -3054,6 +3054,15 @@ type a2aGrantRow struct {
 	// callout is true for a principal the callout issues rather than
 	// nats.conf renders; its lists come from a2aIdentities.
 	callout bool
+	// perConnection is a callout-issued principal whose entry carries no
+	// grants at all: every pod behind it runs as one ServiceAccount, and
+	// the callout mints each connection's authorization from the pod the
+	// API server attested, so a grant in its rendered lists would be handed
+	// to every pod sharing the ServiceAccount. Its row names no streams and
+	// no account-level discovery, and both of its lists are held empty;
+	// the entry gaining a grant fails, the way an empty row for any other
+	// principal fails.
+	perConnection bool
 	// streams maps each stream the principal may name to the verbs it may
 	// hold there, in a2aGrantStream's spelling. Checked in both directions:
 	// a grant outside the row fails, and a row entry no grant reaches fails.
@@ -3123,10 +3132,37 @@ func a2aReservedSubjects(user string, row a2aGrantRow, users []string) []string 
 	return out
 }
 
+// a2aGrantReporter is the part of testing.T that checkA2AUserGrants uses,
+// so TestCheckA2AUserGrants can hand it a recorder and read what it refused.
+type a2aGrantReporter interface {
+	Helper()
+	Errorf(format string, args ...any)
+}
+
+// a2aGrantRecorder collects what checkA2AUserGrants would have failed.
+type a2aGrantRecorder struct{ errors []string }
+
+func (r *a2aGrantRecorder) Helper() {}
+func (r *a2aGrantRecorder) Errorf(format string, args ...any) {
+	r.errors = append(r.errors, fmt.Sprintf(format, args...))
+}
+
 // checkA2AUserGrants asks the per-user property of one principal's publish
 // and subscribe lists against its row, whichever render the lists came from.
-func checkA2AUserGrants(t *testing.T, user string, row a2aGrantRow, lists map[string][]string) {
+func checkA2AUserGrants(t a2aGrantReporter, user string, row a2aGrantRow, lists map[string][]string) {
 	t.Helper()
+	if row.perConnection {
+		// The row's assertion is the opposite of every other row's: the
+		// entry holds nothing, because its authorization is minted per
+		// connection. Anything in either list is a grant to every pod
+		// behind the ServiceAccount.
+		for _, section := range []string{"publish", "subscribe"} {
+			if len(lists[section]) != 0 {
+				t.Errorf("%s %s = %q; its authorization is minted per connection and its rendered entry holds no grants", user, section, lists[section])
+			}
+		}
+		return
+	}
 	const (
 		bareJetStreamAPI = "$JS.API.>"
 		flowControl      = "$JS.FC.>"
@@ -3251,7 +3287,11 @@ func checkA2AUserGrants(t *testing.T, user string, row a2aGrantRow, lists map[st
 // a list would too. The render is also held equal to the identity lists it
 // came from. The one callout-issued principal, provision, never reaches
 // nats.conf, so its lists are read from a2aIdentities and held to the same
-// rows.
+// rows. A callout-issued principal whose entry carries no grants at all,
+// because the callout mints each connection's authorization from the pod the
+// API server attested, is recorded as perConnection and held to zero grants
+// in both lists; an empty row without that flag fails rule 1, so the empty
+// entry has to be claimed, not left.
 //
 // The table is the record of what each principal may reach. Adding a stream,
 // a verb or a principal is expected to fail this test once, and the failure
@@ -3312,6 +3352,9 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 			if !slices.Contains(a2aProvisionedStreams, s) {
 				t.Errorf("row %s names stream %q, which a2aProvisionedStreams does not; the table follows the provisioner, not the other way round", user, s)
 			}
+		}
+		if row.perConnection && (!row.callout || len(row.streams) != 0 || len(row.accountLevel) != 0 || row.wholesale) {
+			t.Errorf("row %s is per-connection, which is a callout-issued principal with no grants to record; it names %v, %v, wholesale=%v", user, row.streams, row.accountLevel, row.wholesale)
 		}
 		if row.callout {
 			calloutRows = append(calloutRows, user)
@@ -3518,5 +3561,43 @@ func TestA2AReservedSubjects(t *testing.T) {
 		return strings.HasPrefix(s, "$JS.API.")
 	}) {
 		t.Errorf("a wholesale row reserves JetStream API subjects its grant covers: %q", got)
+	}
+}
+
+// TestCheckA2AUserGrants runs the per-user checker against a recorder, for
+// the two shapes the invariant test's own table cannot show: a row with
+// empty lists, which is refused rather than passed, and a per-connection
+// row, which passes only while both lists stay empty.
+func TestCheckA2AUserGrants(t *testing.T) {
+	const user = "u"
+	empty := map[string][]string{"publish": nil, "subscribe": nil}
+	cases := []struct {
+		name    string
+		row     a2aGrantRow
+		lists   map[string][]string
+		wantErr string // a substring of one recorded failure, or "" for none
+	}{
+		{"empty lists on an ordinary row are refused", a2aGrantRow{}, empty, "has no publish allow-list"},
+		{"empty lists on a callout row are refused", a2aGrantRow{callout: true}, empty, "has no publish allow-list"},
+		{"a per-connection row passes with nothing rendered", a2aGrantRow{callout: true, perConnection: true}, empty, ""},
+		{"a per-connection row fails when its entry gains a publish", a2aGrantRow{callout: true, perConnection: true},
+			map[string][]string{"publish": {"a2a.topics.shared.blueprint"}}, "minted per connection"},
+		{"a per-connection row fails when its entry gains a subscribe", a2aGrantRow{callout: true, perConnection: true},
+			map[string][]string{"subscribe": {"_INBOX." + user + ".>"}}, "minted per connection"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := &a2aGrantRecorder{}
+			checkA2AUserGrants(r, user, c.row, c.lists)
+			if c.wantErr == "" {
+				if len(r.errors) != 0 {
+					t.Errorf("checker refused a row it should pass: %q", r.errors)
+				}
+				return
+			}
+			if !slices.ContainsFunc(r.errors, func(e string) bool { return strings.Contains(e, c.wantErr) }) {
+				t.Errorf("checker did not refuse with %q; recorded %q", c.wantErr, r.errors)
+			}
+		})
 	}
 }
