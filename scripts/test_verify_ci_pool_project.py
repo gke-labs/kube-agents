@@ -439,7 +439,7 @@ class SeededFleetFixturesTest(unittest.TestCase):
         # shape (#1278), which every presence probe waved through.
         stderr = "\n".join([
             "WARNING: fixture role 'crashloop-workload' is present but not in its designed "
-            "state in kube-agents-evals-5, so the cases that depend on it will be skipped: "
+            "state in kube-agents-evals-5; the cases that depend on it cannot be graded against it: "
             "pod?app=payments-api status.containerStatuses[*].restartCount any_ge 1: observed 0",
             self._state(self._roles() - 1, drifted=1),
         ])

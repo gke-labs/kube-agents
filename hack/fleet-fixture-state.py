@@ -28,19 +28,18 @@ Ready and tainted, slot b's control plane is still one minor behind its
 channel -- and reports the roles whose fixture is there but not in the shape
 the cases depend on.
 
-It runs in two places. `scripts/verify_ci_pool_project.py` runs it after the
-presence pass and fails a project whose fixtures have drifted. `hack/ci-eval-pr.sh`
-runs it after the lease-time seeded-a heal (section 2c), where it can WAIT: a
-fixture that has just been rescheduled onto a healed node needs its first
-restart before OOMKilled evidence exists, so `--wait` keeps re-reading a role
-that is positively out of shape until it converges or the deadline passes. A
-role whose reads fail does not hold the wait: nothing about it can converge,
-so it is re-read only while some other role is worth waiting for. A role
-still drifted at the deadline gets a
-`<role>.drift` file beside its kubeconfig; the runner skips the cases that
-depend on that role and `bench-gate` grades their repetitions as
-infrastructure -- the environment was not ready, which is not the pull
-request's failure (the reading #1486 gives a lost build node).
+`scripts/verify_ci_pool_project.py` runs it after the presence pass and fails
+a project whose fixtures have drifted; a scheduled scan of every pool project
+from the CI health bot is the follow-up on #1550 (detection is this script's
+whole job -- nothing here, and nothing in the presubmit, acts on a drift).
+`--wait` is for a fixture that has just been rescheduled -- the crashloop needs
+its first restart before OOMKilled evidence exists -- and keeps re-reading a
+role that is positively out of shape until it converges or the deadline
+passes. A role whose reads fail does not hold the wait: nothing about it can
+converge, so it is re-read only while some other role is worth waiting for. A
+role still drifted at the deadline gets a `<role>.drift` file beside its
+kubeconfig, one failed assertion per line with what was observed, which is the
+output contract a consumer reads.
 
 What it never does: mutate anything (every read is `kubectl get -o json` or
 `gcloud container clusters describe`), address a cluster it discovered itself
@@ -82,8 +81,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # Files the runner (hack/fleet-kubeconfigs.sh) writes and this script reads or
-# writes beside them. `.drift` is new here and is what kube_agents_bench.fleet
-# reads back; the other three names are the runner's.
+# writes beside them. `.drift` is this script's own output, one file per
+# drifted role; the other three names are the runner's.
 KUBECONFIG_SUFFIX = ".kubeconfig"
 DRIFT_SUFFIX = ".drift"
 CONTEXT_FILE = ".fleet-context"
@@ -151,8 +150,8 @@ GCLOUD_TIMEOUT_SECONDS = 120
 # kubectl's own request ceiling, below the subprocess one so the message on a
 # slow API server is kubectl's rather than a kill.
 KUBECTL_REQUEST_TIMEOUT = "30s"
-# Polling defaults. Zero wait is one pass, which is what the onboarding
-# verifier wants; the presubmit passes the wait it can afford.
+# Polling defaults. Zero wait is one pass; a caller that has just re-applied
+# the stack passes the wait it can afford.
 DEFAULT_WAIT_SECONDS = 0.0
 DEFAULT_INTERVAL_SECONDS = 15.0
 
@@ -636,8 +635,8 @@ def run(directory: Path, catalog: Path, project_override: str | None, wait: floa
         remaining = deadline - time.monotonic()
         # Only a role that was READ and found out of shape is worth another
         # pass: a fixture rescheduling onto a healed node converges; a refused
-        # or timed-out read does not, and holding the presubmit's whole wait
-        # for it would make every run with one unreachable API server pay the
+        # or timed-out read does not, and holding the caller's whole wait for
+        # it would make every scan with one unreachable API server pay the
         # full deadline for nothing. Such a role is still re-read while another
         # role keeps the loop going, so a transient failure gets its retries.
         waiting = [role for role in pending if last[role][0]]
@@ -652,7 +651,7 @@ def run(directory: Path, catalog: Path, project_override: str | None, wait: floa
         # Positive evidence wins: an assertion that was READ and failed is drift
         # whatever else in the role went unread. Only a role whose every failure
         # was a failed read is "not checked", and it gets no drift file -- a
-        # case must not be skipped as infrastructure on a fixture nobody saw.
+        # fixture nobody saw must not be reported as out of shape.
         if drift:
             drifted += 1
             lines = drift + [f"unread: {u}" for u in unreadable]
@@ -661,8 +660,8 @@ def run(directory: Path, catalog: Path, project_override: str | None, wait: floa
             os.chmod(path, 0o600)
             _warn(
                 f"fixture role '{role}' is present but not in its designed state in "
-                f"{project}, so the cases that depend on it will be skipped and graded "
-                f"as infrastructure rather than run: " + "; ".join(lines)
+                f"{project}; the cases that depend on it cannot be graded against it: "
+                + "; ".join(lines)
             )
         else:
             unchecked += 1

@@ -776,34 +776,6 @@ if [ "${FLEET_HEAL_SEEDED_A:-1}" != "0" ]; then
   echo "✓ seeded-a heal finished in $((SECONDS - STEP_START))s"
 fi
 
-# ─── 2d. Assert the planted fixtures are in their designed state (#1544) ────
-# Presence is not state. On 2026-09-07 every probe in 2b passed while
-# payments-api and checkout-gateway sat Pending on all 30 pool projects
-# (#1278), and each pull request spent two hours finding out.
-# hack/fleet-fixture-state.py reads each published role's `state` assertions
-# from bench/tf/fleet/fixtures.json and polls until they hold or the wait
-# runs out. The wait is the point of running it HERE, after 2c: a fixture
-# rescheduled onto a healed node needs its first restart before OOMKilled
-# evidence exists, and the #1278 retest sweep saw that lag the node repair
-# by about 40 minutes on one project. A healthy project converges on the
-# first pass and pays seconds; only a drifted one waits, and it would
-# otherwise pay far more in the fan-out. A role still drifted at the
-# deadline gets a <role>.drift file beside its kubeconfig: the fan-out below
-# does not launch the cases naming it, and bench-gate grades their
-# repetitions as infrastructure (scoring.py) -- the reading #1486 gives a
-# lost build node, not the pull request's failure. Non-fatal for the same
-# reason 2b is: weather warns and the checks downstream grade what they
-# see; the script exits non-zero only for a repository bug, which the
-# warning names. FLEET_ASSERT_FIXTURE_STATE=0 disables it.
-readonly FLEET_FIXTURE_STATE_WAIT_DEFAULT=600
-if [ "${FLEET_ASSERT_FIXTURE_STATE:-1}" != "0" ] && [ -n "${BENCH_FLEET_KUBECONFIG_DIR:-}" ]; then
-  STEP_START=$SECONDS
-  python3 "${SCRIPT_DIR}/fleet-fixture-state.py" \
-    --wait "${FLEET_FIXTURE_STATE_WAIT_SECONDS:-${FLEET_FIXTURE_STATE_WAIT_DEFAULT}}" \
-    || echo "WARNING: hack/fleet-fixture-state.py could not run, so nothing is known about the fixtures' state; the fixture checks will report what they see (#1544)" >&2
-  echo "✓ Seeded-fleet fixture state finished in $((SECONDS - STEP_START))s"
-fi
-
 
 # 3. Agent & Harness Configuration
 profile_begin "config: env, platform-agent token fetch, prereqs"
@@ -1732,48 +1704,6 @@ print(m.group(1).strip('\'\"') if m else '')
 " "$1" 2>/dev/null || echo ""
 }
 
-# Reads `fixtures:` out of a task file -- the seeded-fleet roles the case
-# depends on (docs/designs/bench-case-format.md) -- as one space-separated
-# line. A regex like task_stack's, for the same reason: the fan-out reads it
-# to decide whether to LAUNCH a unit, before bench-gate parses the file
-# properly at grading time. Accepts the block-list form and an inline
-# `[a, b]`; an absent key or `[]` prints nothing.
-task_fixtures() {
-  python3 -c "
-import re, sys
-text = open(sys.argv[1]).read()
-m = re.search(r'^fixtures:[ \t]*(\[[^\]\n]*\])?[ \t]*(?:#.*)?\$', text, re.M)
-if not m:
-    sys.exit()
-roles = []
-if m.group(1):
-    roles = [r.strip().strip('\'\"') for r in m.group(1)[1:-1].split(',')]
-else:
-    for line in text[m.end():].splitlines()[1:]:
-        item = re.match(r'^[ \t]+-[ \t]+([A-Za-z0-9-]+)', line)
-        if item:
-            roles.append(item.group(1))
-        elif line.strip() and not line.lstrip().startswith('#'):
-            break
-print(' '.join(r for r in roles if r))
-" "$1" 2>/dev/null || echo ""
-}
-
-# Why a task's units must not launch, or nothing. Joins the <role>.drift
-# files section 2d left for the roles the task names (#1544). Empty when no
-# role drifted, the runner never wrote a fleet directory, or the task names
-# no fixture -- in every one of which cases the unit runs as it always did.
-unit_fixture_drift() { # <task-path>
-  local role file reasons=""
-  [ -n "${BENCH_FLEET_KUBECONFIG_DIR:-}" ] || return 0
-  for role in $(task_fixtures "$1"); do
-    file="${BENCH_FLEET_KUBECONFIG_DIR}/${role}.drift"
-    [ -f "$file" ] || continue
-    reasons+="${role}: $(tr '\n' ' ' <"$file" | sed 's/ *$//'); "
-  done
-  printf '%s' "${reasons%; }"
-}
-
 # The transition bridge: cases named here keep the old blocking behaviour
 # until the store holds a full window for them -- EVAL_ADMISSION_MIN_RUNS
 # runs at the current version key -- arming rung 4 meanwhile, and leaving
@@ -1881,19 +1811,11 @@ unit_cost_hint() {
 TASK_NAMES=()
 TASK_REUSE=()
 TASK_HAS_STACK=()
-TASK_DRIFT=()
 for TASK in "${TASKS[@]}"; do
   TASK_NAME="$(basename "$(dirname "${TASK}")")"
   TASK_NAMES+=("${TASK_NAME}")
   TASK_STACK="$(task_stack "${BENCH_DIR}/${TASK}")"
   if [ -n "${TASK_STACK}" ]; then TASK_HAS_STACK+=("true"); else TASK_HAS_STACK+=(""); fi
-  # Decided once per task, like the rest: section 2d's verdict on the
-  # fixtures does not change between repetitions.
-  TASK_DRIFT_REASON="$(unit_fixture_drift "${BENCH_DIR}/${TASK}")"
-  TASK_DRIFT+=("${TASK_DRIFT_REASON}")
-  if [ -n "${TASK_DRIFT_REASON}" ]; then
-    echo "Task ${TASK_NAME}: a seeded fixture it depends on is not in its designed state, so its units will not launch and its repetitions grade as infrastructure (#1544): ${TASK_DRIFT_REASON}"
-  fi
   if [ -n "${SEEDED_TASK_CLUSTER}" ] && [ -n "${TASK_STACK}" ] \
     && grep -qs 'variable "reuse_existing_cluster"' "${BENCH_DIR}/tf/${TASK_STACK}"/*.tf; then
     TASK_REUSE+=("true")
@@ -1943,26 +1865,9 @@ lock_acquire() { # <dir> [deadline-seconds]
 }
 lock_release() { rmdir "$1" 2>/dev/null || true; }
 
-run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:true|empty> <seq> <drift-reason|empty>
-  local task="$1" name="$2" rep="$3" reuse="$4" has_stack="$5" seq="$6" drift="${7:-}"
+run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:true|empty> <seq>
+  local task="$1" name="$2" rep="$3" reuse="$4" has_stack="$5" seq="$6"
   local log="/tmp/eval_${name}_rep${rep}.log"
-  if [ -n "${drift}" ]; then
-    # Section 2d recorded the fixture this case depends on as drifted (#1544).
-    # Nothing this unit could measure would be about the pull request, so it
-    # leaves the state files an empty run leaves -- the grading pass hands
-    # bench-gate MISSING and the <role>.drift file says why (scoring.py) --
-    # and a one-line log, so the phase breakdown and the artifact copy find
-    # a file where they expect one.
-    local skipped
-    skipped="<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] skipped ${name} rep ${rep}: seeded fixture not in its designed state (${drift})"
-    printf '%s\n' "${skipped}" >"${log}"
-    printf '%s\n' "$(_now_ms)" >"${STATE_DIR}/${name}.rep${rep}.start"
-    printf '%s\n' "$(_now_ms)" >"${STATE_DIR}/${name}.rep${rep}.end"
-    : >"${STATE_DIR}/${name}.rep${rep}.dir"
-    cp "${log}" "${ARTIFACT_DIR}/eval_${name}_rep${rep}.log" 2>/dev/null || true
-    echo "${skipped}"
-    return 0
-  fi
   # A distinct local port per unit: the harness's port-forward is owned by
   # the process that spawned it and its atexit teardown would drop a shared
   # listener under every sibling mid-conversation. On its own port, each
@@ -2040,7 +1945,7 @@ while read -r REP _COST IDX; do
   done
   echo ">>> [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] launching ${TASK_NAMES[IDX]} rep ${REP}/${EVAL_REPETITIONS}"
   UNIT_SEQ=$((${UNIT_SEQ:-0} + 1))
-  run_one_unit "${TASKS[IDX]}" "${TASK_NAMES[IDX]}" "${REP}" "${TASK_REUSE[IDX]}" "${TASK_HAS_STACK[IDX]}" "${UNIT_SEQ}" "${TASK_DRIFT[IDX]}" &
+  run_one_unit "${TASKS[IDX]}" "${TASK_NAMES[IDX]}" "${REP}" "${TASK_REUSE[IDX]}" "${TASK_HAS_STACK[IDX]}" "${UNIT_SEQ}" &
   # Staggered, so N units do not open their first model call in the same
   # second -- burst 429s at the model quota are the fan-out's failure mode.
   sleep 5

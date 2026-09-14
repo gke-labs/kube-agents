@@ -11,9 +11,9 @@ these tests pin, with ``kubectl`` and ``gcloud`` stubbed on ``PATH``:
   what was observed, a WARNING naming the role, and a summary count;
 * ``--wait`` re-reads until the fixture converges (the crashloop's first
   restart) and only records drift at the deadline;
-* a read that failed is "not checked", never drift -- no file, so no case is
-  skipped as infrastructure on a fixture nobody saw -- while one assertion
-  read and failed beside an unread one is still drift;
+* a read that failed is "not checked", never drift -- no file, so a fixture
+  nobody saw is never reported out of shape -- while one assertion read and
+  failed beside an unread one is still drift;
 * the ``cluster`` subject reads the slot's recorded name and location, and the
   minor-behind operator compares against the cluster's own channel default;
 * a re-run that finds a role converged removes a stale ``.drift`` file;
@@ -397,7 +397,7 @@ class PassTest(_Harness):
         assert "lastState.terminated.reason any_eq \"OOMKilled\": observed nothing" in body
         assert "(why:" in body
         assert "WARNING: fixture role 'crashloop-workload' is present but not in its designed state in kube-agents-evals" in done.stderr
-        assert "skipped and graded as infrastructure" in done.stderr
+        assert "not in its designed state in kube-agents-evals" in done.stderr
 
     def test_the_wait_lets_the_first_restart_arrive(self):
         world = _healthy_world()

@@ -48,7 +48,6 @@ __all__ = [
     "FleetRoleUnresolved",
     "available_roles",
     "confirmed_subjects",
-    "drift_reason",
     "kubeconfig_for_role",
     "provisioned_project",
 ]
@@ -75,14 +74,6 @@ _CONTEXT_FILE = ".fleet-context"
 # `<kind>?<selector>` form, for every object the runner SAW on that cluster
 # before the agent started.
 _CONFIRMED_SUFFIX = ".confirmed"
-
-# Written by hack/fleet-fixture-state.py beside a role's kubeconfig when the
-# fixture was there but NOT in the state the catalog's `state` assertions
-# describe (#1544): one failed assertion per line, with what was observed.
-# Present means the environment was not ready for the cases naming this role;
-# the scorer grades their repetitions as infrastructure rather than as the
-# pull request's failure, and the runner does not launch them at all.
-_DRIFT_SUFFIX = ".drift"
 
 
 class FleetRoleUnresolved(LookupError):
@@ -159,33 +150,6 @@ def confirmed_subjects(
     except OSError:
         return frozenset()
     return frozenset(line.strip() for line in text.splitlines() if line.strip())
-
-
-def drift_reason(role: str, directory: str | os.PathLike[str] | None = None) -> str | None:
-    """Why ``role``'s fixture was out of its designed state, or None if it was not.
-
-    Reads the ``<role>.drift`` file hack/fleet-fixture-state.py writes when a
-    published role failed a catalog ``state`` assertion at the end of its
-    wait. The text is the script's own lines -- which assertion, what it
-    observed, why the cases need it -- joined for a reason string.
-
-    None when the runner never ran, the role is not a plain name, or no drift
-    was recorded: every one of those means nothing may be excused on this
-    role's account, and a case that then fails is graded as it always was.
-    """
-    if not ROLE_PATTERN.fullmatch(role):
-        return None
-    root = directory if directory is not None else os.environ.get(FLEET_KUBECONFIG_DIR_ENV)
-    if not root:
-        return None
-    try:
-        text = (Path(root) / f"{role}{_DRIFT_SUFFIX}").read_text(encoding="utf-8")
-    except OSError:
-        return None
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    # An empty file is a recorded drift with no detail, which still must not
-    # read as "no drift".
-    return "; ".join(lines) if lines else "drift recorded without detail"
 
 
 def kubeconfig_for_role(role: str, directory: str | os.PathLike[str] | None = None) -> str:

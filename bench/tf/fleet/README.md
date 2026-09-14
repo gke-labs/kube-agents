@@ -45,19 +45,18 @@ Drift is corrected by re-applying this stack on a schedule — a scheduled GitHu
 workflow, because the repository's other recurring jobs already live there and the
 apply needs nothing Cloud Build has that Actions lacks. The workflow does not exist
 yet; creating it is the fleet owner's call (#1550). Until it does, a manual `tofu apply`
-after any suspected drift is the reconcile, and drift is _detected_ per lease rather
-than per day: `hack/ci-eval-pr.sh` §2d runs the same state pass after the slot-a heal,
-waiting up to ten minutes for a freshly rescheduled fixture to converge (the crashloop
-needs its first restart before OOMKilled evidence exists, observed about 40 minutes
-behind the node repair on one project in the #1278 retest sweep). A role still drifted
-at the deadline is skipped for that run, not waited out: it gets a `<role>.drift` file
-beside its kubeconfig; the fan-out does not launch the cases that name it in their
-`fixtures:`, and `bench-gate` grades their repetitions as infrastructure — the
-environment was not ready, not the pull request's failure (#1544) — with
-`KUBE_AGENTS_FIXTURE_DRIFT` first in the reason, so the dashboard's storm rule does not
-count them as repetitions lost to 429s. The `.drift` file's lines, and the presubmit
-log's WARNING, name the assertion and what was observed, so the operator knows whether it
-is a `tofu apply` or a node.
+after any suspected drift is the reconcile. Detecting the drift is a separate job, and
+it is `hack/fleet-fixture-state.py`'s: today the pool verifier runs it against one
+project when asked; a scheduled scan of every pool project from the CI health bot, which
+reports a repeated drift the way it reports a lost build node, is the follow-up pull
+request on #1550. The presubmit does not run it and does not act on a drift: an eval
+run's verdict is about the pull request, and skipping or excusing cases on the fleet's
+account is deliberately not part of evals v1. The script's `--wait` exists for a
+fixture that has just been rescheduled (the crashloop needs its first restart before
+OOMKilled evidence exists, observed about 40 minutes behind the node repair on one
+project in the #1278 retest sweep); a role still drifted at the deadline gets a
+`<role>.drift` file beside its kubeconfig whose lines name the assertion and what was
+observed, so the operator knows whether it is a `tofu apply` or a node.
 
 The reconcile is load-bearing for `seeded-b` in particular, and it does two distinct
 things there. First, it **carries the control plane forward**: `min_master_version` is

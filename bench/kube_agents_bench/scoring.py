@@ -51,7 +51,6 @@ from pathlib import Path
 from typing import Any
 
 from kube_agents_bench.cases import NOOP_DEPLOYER, CaseSpec
-from kube_agents_bench.fleet import drift_reason
 
 __all__ = [
     "CaseVerdict",
@@ -148,16 +147,6 @@ DEFAULT_JUDGED_MARGIN = 0.5
 #: plain JSON. ``test_scoring.py`` asserts the two strings agree, so the
 #: duplication cannot drift silently.
 INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
-
-#: First word of the reason a repetition gets when a seeded fixture the case
-#: names was recorded as DRIFTED at lease time (#1544): present, but not in
-#: its designed state, so ``hack/ci-eval-pr.sh`` never launched the unit. The
-#: outcome is ``infra`` like a transport failure, but the dashboard must not
-#: read it as a quota storm: ``scripts/eval_dashboard/classify.py`` and
-#: ``health.py`` match this literal (duplicated there; both are stdlib-only)
-#: to keep skipped repetitions out of the storm counts. It leads the reason so
-#: the collector's 300-character cap cannot cut it off.
-FIXTURE_DRIFT_MARKER = "KUBE_AGENTS_FIXTURE_DRIFT"
 
 #: Field values from devops-bench's ``_build_failed_record``: ``status`` is
 #: ``"failed"`` on every failed record, and ``verification_status`` is
@@ -528,30 +517,6 @@ def classify_rep(
         )
 
     has_infra = spec.deployer != NOOP_DEPLOYER
-
-    # A seeded fixture the case depends on was present but NOT in its designed
-    # state when the run leased the project (#1544): hack/fleet-fixture-state.py
-    # recorded it after the lease-time heal, and hack/ci-eval-pr.sh did not
-    # launch this case's units at all. Whatever the record holds -- usually
-    # nothing, since nothing ran -- is not evidence about the pull request:
-    # on 2026-09-07 this shape (payments-api Pending on every project) redded
-    # every open pull request for a day as a graded 0.0 (#1278). No noop
-    # carve-out, for the same reason as the transport marker below: this is
-    # the environment stating what happened, not an inference from an absent
-    # record, and a fixture that is not in shape is infrastructure whatever
-    # the task's deployer builds. Placed first because it is the strongest
-    # statement available: a record that somehow exists for a skipped unit
-    # was still measured against a fixture the cases were not written for.
-    drifted = [(role, drift_reason(role)) for role in spec.fixtures]
-    drifted = [(role, reason) for role, reason in drifted if reason]
-    if drifted:
-        named = "; ".join(f"{role}: {reason}" for role, reason in drifted)
-        return rep(
-            "infra",
-            f"{FIXTURE_DRIFT_MARKER}: the seeded fixture this case depends on "
-            "was not in its designed state at lease time, so the case was not "
-            f"run and nothing here is evidence about the pull request ({named})",
-        )
 
     if record is None or record.empty_record:
         what = (

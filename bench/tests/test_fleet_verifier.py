@@ -1940,8 +1940,8 @@ def test_the_runner_refuses_a_directory_it_did_not_create(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# The designed-state half (#1544): what the runner records for it, what the
-# catalog declares, and what the scorer reads back.
+# The designed-state half (#1544): what the runner records for it and what
+# the catalog declares.
 # --------------------------------------------------------------------------
 
 
@@ -1987,8 +1987,8 @@ def test_every_catalog_role_declares_its_designed_state():
 
 def test_every_state_subject_the_catalog_declares_is_something_the_terraform_plants():
     """Same standard as the probes: an assertion on an object no apply creates
-    would hold the role drifted forever, and the presubmit would skip its
-    cases as infrastructure on every run."""
+    would hold the role drifted forever, and the pool verifier would fail
+    every project."""
     fleet_dir = _BENCH / "tf" / "fleet"
     main = (fleet_dir / "main.tf").read_text()
     seen = 0
@@ -2015,30 +2015,3 @@ def test_every_state_subject_the_catalog_declares_is_something_the_terraform_pla
             )
     assert seen, "no role asserts on a named subject; this test is vacuous"
 
-
-def test_drift_reason_reads_the_state_scripts_file(tmp_path):
-    (tmp_path / "crashloop-workload.drift").write_text(
-        "pod?app=payments-api status.containerStatuses[*].restartCount any_ge 1: observed 0\n"
-        "unread: deployment/x: kubectl get deployment failed\n"
-    )
-    reason = fleet.drift_reason("crashloop-workload", tmp_path)
-    assert reason == (
-        "pod?app=payments-api status.containerStatuses[*].restartCount any_ge 1: observed 0; "
-        "unread: deployment/x: kubectl get deployment failed"
-    )
-
-
-def test_drift_reason_is_none_when_nothing_was_recorded(tmp_path, monkeypatch):
-    assert fleet.drift_reason("crashloop-workload", tmp_path) is None
-    assert fleet.drift_reason("../../etc/passwd", tmp_path) is None
-    monkeypatch.delenv(FLEET_KUBECONFIG_DIR_ENV, raising=False)
-    assert fleet.drift_reason("crashloop-workload") is None
-    monkeypatch.setenv(FLEET_KUBECONFIG_DIR_ENV, str(tmp_path))
-    assert fleet.drift_reason("crashloop-workload") is None
-    (tmp_path / "crashloop-workload.drift").write_text("x\n")
-    assert fleet.drift_reason("crashloop-workload") == "x"
-
-
-def test_an_empty_drift_file_still_reads_as_drift(tmp_path):
-    (tmp_path / "idle-nodepool.drift").write_text("")
-    assert fleet.drift_reason("idle-nodepool", tmp_path) == "drift recorded without detail"

@@ -48,9 +48,6 @@ ADMITTED = frozenset(
 HOLD_OUT = "compliance-rbac-overgrant"
 GRADED_FAIL = "VerificationCorrectness=0.0 (floor 1.0) -- rca-names-the-oom: required phrases absent from the report: ['OOMKilled']"
 NEVER_RAN = "the record shows no agent ever ran: the trajectory is empty and tokens.total is 0"
-# What bench/kube_agents_bench/scoring.py writes for a repetition the
-# presubmit skipped because the case's seeded fixture drifted (#1544).
-DRIFT = "KUBE_AGENTS_FIXTURE_DRIFT: the seeded fixture this case depends on was not in its designed state at lease time, so the case was not run and nothing here is evidence about the pull request (crashloop-workload: pod?app=payments-api status.containerStatuses[*].restartCount any_ge 1: observed 0)"
 OUTAGE = {"state": "OUTAGE", "condition": "shared_break", "failing_cases": CRASHLOOP_TRIO}
 STORM = {"state": "DEGRADED", "condition": "storm", "failing_cases": []}
 SETUP = {"state": "DEGRADED", "condition": "setup_deaths", "failing_cases": []}
@@ -62,13 +59,12 @@ def rep(letter):
         "f": {"result": "fail", "reason": GRADED_FAIL},
         "i": {"result": "infra", "reason": NEVER_RAN},
         "e": {"result": "fail", "reason": NEVER_RAN},
-        "d": {"result": "infra", "reason": DRIFT},
     }[letter]
 
 
 def task(name, letters):
     reps = [dict(rep(letter), n=i + 1) for i, letter in enumerate(letters)]
-    result = "pass" if all(x == "p" for x in letters) else "infra" if all(x in "id" for x in letters) else "fail"
+    result = "pass" if all(x == "p" for x in letters) else "infra" if all(x == "i" for x in letters) else "fail"
     return {"name": name, "result": result, "reps": reps}
 
 
@@ -103,19 +99,6 @@ class RepAndOutcomeTest(unittest.TestCase):
         self.assertEqual(classify.rep_kind({"result": "fail", "reason": "... (KUBE_AGENTS_INFRA_FAILURE): ..."}), "storm")
         self.assertEqual(classify.rep_kind({"result": "fail", "reason": GRADED_FAIL}), "fail")
         self.assertEqual(classify.rep_kind({"result": "pass"}), "pass")
-
-    def test_a_fixture_drift_skip_is_infra_but_not_a_storm_rep(self):
-        self.assertEqual(classify.rep_kind({"result": "infra", "reason": DRIFT}), "drift")
-        counts = classify.rep_counts(task("a", "ddd"))
-        self.assertEqual((counts["infra"], counts["storm"]), (3, 0))
-        self.assertEqual(classify.outcome_of(counts), "infra")
-        self.assertEqual(classify.rep_counts(task("a", "ddi"))["storm"], 1)
-
-    def test_the_drift_marker_is_the_scorers(self):
-        # classify.py cannot import the scorer (stdlib only), so the literal
-        # is duplicated; this is what stops the two drifting apart.
-        source = (pathlib.Path(__file__).resolve().parents[1] / "bench" / "kube_agents_bench" / "scoring.py").read_text()
-        self.assertIn(f'FIXTURE_DRIFT_MARKER = "{classify.FIXTURE_DRIFT_MARKER}"', source)
 
     def test_outcomes(self):
         self.assertEqual(classify.outcome_of(classify.rep_counts(task("a", "ppp"))), "passed")
@@ -242,18 +225,6 @@ class StormAndSetupTest(unittest.TestCase):
         self.assertEqual(case(verdict, "agent-kanban-smoke")["cls"], "storm")
         self.assertEqual(case(verdict, "x")["cls"], "storm", "an ungraded case inside the storm is the storm's")
         self.assertEqual(verdict["verdict"], "infra")
-
-    def test_fixture_drift_skips_are_not_the_storm(self):
-        # #1544: the crashloop fixture drifted on the leased project, so two
-        # cases were skipped -- six infra reps, none of them lost to the quota.
-        drifted = CRASHLOOP_TRIO[:2]
-        tasks = [task(n, "ddd" if n in drifted else "ppp") for n in sorted(ADMITTED)]
-        verdict = classify_run(run(1, 1, T0, tasks=tasks), [run(1, 1, T0, tasks=tasks)])
-        self.assertEqual(verdict["storm_reps"], 0)
-        for name in drifted:
-            self.assertEqual(case(verdict, name)["outcome"], "infra")
-            self.assertIsNone(case(verdict, name)["cls"], "no quota storm tag for a skipped case")
-            self.assertEqual(case(verdict, name)["do"], classify.DO_DRIFT)
 
     def test_four_storm_reps_are_noise_unless_the_verdict_says_storm(self):
         target = run(1, 1, T0, tasks=gate_tasks(["agent-kanban-smoke"], letters="ffi") + [task("x", "iii")])

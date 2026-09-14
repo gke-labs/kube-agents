@@ -66,9 +66,6 @@ EMPTY_RECORD = "the record is not evidence of a real agent run: the trajectory i
 NEVER_RAN = "the record shows no agent ever ran: the trajectory is empty and tokens.total is 0"
 RETRIES = "the harness exhausted its retries without reaching the agent (KUBE_AGENTS_INFRA_FAILURE): "
 GRADED_FAIL = "VerificationCorrectness=0.0 (floor 1.0) -- rca-names-the-oom: required phrases absent"
-# A repetition the presubmit skipped for seeded-fixture drift (#1544), as
-# bench/kube_agents_bench/scoring.py writes it.
-DRIFT = "KUBE_AGENTS_FIXTURE_DRIFT: the seeded fixture this case depends on was not in its designed state at lease time, so the case was not run and nothing here is evidence about the pull request (crashloop-workload: pod?app=payments-api status.containerStatuses[*].restartCount any_ge 1: observed 0)"
 
 
 # --------------------------------------------------------------------------- #
@@ -80,7 +77,6 @@ REP_LETTER = {
     "f": {"result": "fail", "reason": GRADED_FAIL},
     "i": {"result": "infra", "reason": RETRIES},
     "e": {"result": "fail", "reason": EMPTY_RECORD},
-    "d": {"result": "infra", "reason": DRIFT},
 }
 
 
@@ -88,7 +84,7 @@ def task(name, letters):
     reps = [dict(REP_LETTER[letter], n=i + 1) for i, letter in enumerate(letters)]
     if all(letter == "p" for letter in letters):
         result = "pass"
-    elif all(letter in "id" for letter in letters):
+    elif all(letter == "i" for letter in letters):
         result = "infra"
     else:
         result = "fail"
@@ -156,13 +152,6 @@ class RepKinds(unittest.TestCase):
         self.assertFalse(health.Task(task("x", "ffp")).collapsed, "one pass out of three is not a collapse")
         self.assertFalse(health.Task(task("x", "eee")).collapsed, "nothing graded, nothing collapsed")
         self.assertFalse(health.Task(task("x", "iii")).collapsed)
-
-    def test_a_fixture_drift_skip_is_neither_a_storm_rep_nor_graded(self):
-        self.assertEqual(health.rep_kind({"result": "infra", "reason": DRIFT}), "drift")
-        skipped = health.Task(task("x", "ddd"))
-        self.assertEqual((skipped.storms, skipped.drifts, skipped.graded), (0, 3, 0))
-        self.assertFalse(skipped.collapsed, "nothing graded, nothing collapsed")
-        self.assertEqual(health.Task(task("x", "ddi")).storms, 1)
 
     def test_a_task_without_reps_stands_in_for_one_repetition(self):
         self.assertTrue(health.Task({"name": "x", "result": "fail"}).collapsed)
@@ -282,11 +271,6 @@ class Storm(unittest.TestCase):
 
     def test_infra_verdicts_count_the_same_as_empty_records(self):
         self.assertEqual(assess(self.stormy([1, 2, 3], 6, letter="i"), T0)["state"], "DEGRADED")
-
-    def test_fixture_drift_skips_do_not_make_a_storm(self):
-        # #1544: eighteen repetitions skipped across three PRs because a
-        # seeded fixture drifted is the fleet's problem, not a quota storm.
-        self.assertEqual(assess(self.stormy([1, 2, 3], 6, letter="d"), T0)["state"], "GREEN")
 
     def test_fourteen_reps_or_two_prs_do_not(self):
         self.assertEqual(assess(self.stormy([1, 2, 3], 3), T0)["state"], "GREEN", "9 reps")

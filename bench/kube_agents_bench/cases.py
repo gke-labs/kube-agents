@@ -89,14 +89,6 @@ class CaseSpec:
     path: Path
     """The task.yaml this was read from, for error messages."""
 
-    fixtures: tuple[str, ...] = ()
-    """``fixtures:``, the seeded-fleet roles the case depends on
-    (``docs/designs/bench-case-format.md``). The scorer reads it for one
-    thing: a repetition of a case naming a role the runner recorded as
-    DRIFTED -- present but not in its designed state at lease time -- is
-    infrastructure, not the pull request. Absent means the case declared no
-    dependency, so nothing can be excused on a fixture's account."""
-
 
 def _coerce_bool(value: Any, *, field: str, path: Path) -> bool:
     """YAML's bool, and nothing looser.
@@ -186,21 +178,6 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
     name_raw = doc.get("name")
     name = str(name_raw).strip() if name_raw is not None else case_id
 
-    # A list of role slugs, or absent. Anything else is refused rather than
-    # read as "no fixtures": `fixtures: crashloop-workload` (a bare string)
-    # would otherwise silently un-excuse the case on the day its fixture
-    # drifts, which is the one moment the field is consulted.
-    fixtures_raw = doc.get("fixtures")
-    if fixtures_raw is None:
-        fixtures: tuple[str, ...] = ()
-    elif isinstance(fixtures_raw, list) and all(isinstance(f, str) for f in fixtures_raw):
-        fixtures = tuple(f.strip() for f in fixtures_raw if f.strip())
-    else:
-        raise CaseSpecError(
-            f"{path}: fixtures: must be a list of role slugs, got "
-            f"{type(fixtures_raw).__name__} ({fixtures_raw!r})"
-        )
-
     return CaseSpec(
         case_id=case_id,
         name=name,
@@ -209,5 +186,4 @@ def load_case(task_yaml: str | Path) -> CaseSpec:
         declares_verification_spec=declares_spec,
         expected_fail=expected_fail,
         path=path,
-        fixtures=fixtures,
     )
