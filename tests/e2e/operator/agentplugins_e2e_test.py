@@ -1795,8 +1795,11 @@ spec:
             f"the healed link must resolve to the mounted plugin: {reachable.stdout}{reachable.stderr}"
         )
         log("Verified startup replaced the stale directory with a working link.")
+        run_kubectl(["delete", "agentplugin", TARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE])
+        reconcile_and_wait()
     finally:
         run_kubectl(["delete", "agentplugin", TARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE], check=False)
+        wait_deployment_rollout(GATEWAY_DEPLOYMENT)
 
     log("STEP 17 SUCCESS: stale plugin directory self-heals into the link on startup.")
 

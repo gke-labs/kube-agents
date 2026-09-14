@@ -11,6 +11,7 @@ import base64
 import json
 import os
 import re
+import subprocess
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -28,12 +29,24 @@ except ImportError:
     UserCredentials = Any  # type: ignore
     Resource = Any  # type: ignore
     HttpError = Exception  # type: ignore
-import pytest
+try:
+    import pytest
+except ImportError:
+    class _DummyPytest:
+        fixture = staticmethod(lambda *a, **kw: (lambda f: f))
+        fail = staticmethod(lambda msg: (_ for _ in ()).throw(AssertionError(msg)))
+        main = staticmethod(lambda *a, **kw: None)
+    pytest = _DummyPytest()  # type: ignore
 
 # Configuration from Environment Variables (read dynamically from tests/e2e/.env or the CI environment)
 GCP_PROJECT_ID: Optional[str] = os.environ.get("GCP_PROJECT_ID") or os.environ.get("PROJECT_ID")
 CHAT_SPACE_ID: Optional[str] = os.environ.get("CHAT_SPACE_ID")
 CHAT_TOPIC_NAME: str = os.environ.get("CHAT_TOPIC_NAME", "platform-agent-chat-events")
+
+DEFAULT_AGENT_NAMESPACE: str = "kubeagents-system"
+AGENT_NAMESPACE: str = os.environ.get("AGENT_NAMESPACE") or os.environ.get("NAMESPACE") or DEFAULT_AGENT_NAMESPACE
+GATEWAY_DEPLOYMENT_NAME: str = "platform-agent-gateway"
+GATEWAY_ROLLOUT_TIMEOUT_SEC: int = int(os.environ.get("GATEWAY_ROLLOUT_TIMEOUT_SEC", "900"))
 
 # Test Identity Resolution (Defaults to CI Service Account email if GCP_PROJECT_ID is set)
 DEFAULT_SA_EMAIL: str = f"github-actions-e2e@{GCP_PROJECT_ID}.iam.gserviceaccount.com" if GCP_PROJECT_ID else "e2e-runner@google.com"
@@ -57,6 +70,20 @@ SCOPES: list[str] = [
     "https://www.googleapis.com/auth/pubsub",
     "https://www.googleapis.com/auth/cloud-platform",
 ]
+
+
+def wait_for_gateway_deployment_ready(namespace: str = AGENT_NAMESPACE) -> None:
+    """Wait for deployment/platform-agent-gateway to finish any rolling restart before posting a prompt."""
+    cmd = ["kubectl", "rollout", "status", f"deployment/{GATEWAY_DEPLOYMENT_NAME}", "-n", namespace, f"--timeout={GATEWAY_ROLLOUT_TIMEOUT_SEC}s"]
+    if os.environ.get("KUBE_CONTEXT"):
+        cmd[1:1] = ["--context", os.environ["KUBE_CONTEXT"]]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=GATEWAY_ROLLOUT_TIMEOUT_SEC + 10)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return
+    err = res.stderr.lower()
+    if res.returncode != 0 and ("timed out waiting for the condition" in err or "exceeded its progress deadline" in err):
+        pytest.fail(f"Gateway deployment rollout failed: {res.stderr.strip()}")
 
 
 @pytest.fixture(scope="module")
@@ -142,6 +169,8 @@ def test_gchat_agent_math_response(
     print(f"[E2E Test] Pub/Sub Topic: {CHAT_TOPIC_NAME}")
     print(f"[E2E Test] Test Identity: {TEST_USER_EMAIL}")
     print(f"[E2E Test] Chat UI Prompt: '{prompt_body}'")
+
+    wait_for_gateway_deployment_ready()
 
     # Step 1: Post clean prompt message to create real Google Chat space thread
     try:

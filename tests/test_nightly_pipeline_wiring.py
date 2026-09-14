@@ -122,6 +122,20 @@ class NightlyPipelineWiringTest(unittest.TestCase):
         )
         self.assertIn(token_step.get("id", "release-token"), checkout["with"]["token"])
 
+    def test_optional_suites_runs_gchat_before_agent_plugin(self):
+        """Running gchat before agent-plugin executes chat E2E on a quiescent cluster
+        before the 17-step AgentPlugins suite repeatedly rolls platform-agent-gateway."""
+        matrix_job = self.jobs["step-3-run-e2e-matrix"]
+        optional_suites = matrix_job["with"]["optional_suites"]
+        suites = [s.strip() for s in optional_suites.split(",")]
+        self.assertIn("gchat", suites)
+        self.assertIn("agent-plugin", suites)
+        self.assertLess(
+            suites.index("gchat"),
+            suites.index("agent-plugin"),
+            f"gchat must run before agent-plugin in optional_suites, got: {optional_suites!r}",
+        )
+
 
 class ConcurrencyGroupTest(unittest.TestCase):
     def test_no_workflow_hardcodes_the_rc_environment_lock(self):
@@ -344,6 +358,45 @@ class ReleaseBotTokenWiringTest(unittest.TestCase):
                 for step in token_steps:
                     self.assertEqual(step["with"].get("permission-contents"), "write")
                     self.assertEqual(step["with"].get("permission-workflows"), "write")
+
+
+class GchatAgentPreflightTest(unittest.TestCase):
+    """Verifies wait_for_gateway_deployment_ready in gchat_agent_test.py."""
+
+    def test_skips_when_kubectl_not_found(self):
+        from unittest.mock import patch
+        from tests.e2e.gchat_agent_test import wait_for_gateway_deployment_ready
+
+        with patch("tests.e2e.gchat_agent_test.subprocess.run", side_effect=FileNotFoundError):
+            wait_for_gateway_deployment_ready(namespace="kubeagents-system")
+
+    def test_skips_when_deployment_not_found(self):
+        from unittest.mock import MagicMock, patch
+        from tests.e2e.gchat_agent_test import wait_for_gateway_deployment_ready
+
+        not_found = MagicMock(returncode=1, stdout="", stderr='Error from server (NotFound): deployments.apps "platform-agent-gateway" not found')
+        with patch("tests.e2e.gchat_agent_test.subprocess.run", return_value=not_found):
+            wait_for_gateway_deployment_ready(namespace="kubeagents-system")
+
+    def test_succeeds_when_rollout_passes(self):
+        from unittest.mock import MagicMock, patch
+        from tests.e2e.gchat_agent_test import wait_for_gateway_deployment_ready
+
+        ok_res = MagicMock(returncode=0, stdout="deployment successfully rolled out", stderr="")
+        with patch("tests.e2e.gchat_agent_test.subprocess.run", return_value=ok_res) as mock_run:
+            wait_for_gateway_deployment_ready(namespace="kubeagents-system")
+            self.assertEqual(mock_run.call_count, 1)
+            self.assertIn("rollout", mock_run.call_args[0][0])
+
+    def test_fails_when_rollout_times_out(self):
+        from unittest.mock import MagicMock, patch
+        from tests.e2e.gchat_agent_test import wait_for_gateway_deployment_ready
+
+        rollout_fail = MagicMock(returncode=1, stdout="", stderr="error: timed out waiting for the condition")
+        with patch("tests.e2e.gchat_agent_test.subprocess.run", return_value=rollout_fail):
+            with self.assertRaises(BaseException) as ctx:
+                wait_for_gateway_deployment_ready(namespace="kubeagents-system")
+            self.assertIn("Gateway deployment rollout failed", str(ctx.exception))
 
 
 if __name__ == "__main__":
