@@ -18,9 +18,18 @@ told. So:
     and no OPEN issue labelled `presubmit-gate` already names every lost node
     -> create one addressed to the cluster owner, and say "Tracking #NNN"
 
+The third shape (#1550): the hourly seeded-fleet scan finds a fixture role out
+of its designed state on the same project two scans running, or on three
+projects at once, and every case depending on it reds on the runs that
+lease those projects. So:
+
+    the condition becomes `fixture_drift`
+    and no OPEN issue labelled `presubmit-gate` already names every drifted role
+    -> create one addressed to the fleet owner, and say "Tracking #NNN"
+
 The dedupe is against people: a human who filed first, with the case names
-(or the node names) in the title or body, wins and the bot adopts their
-issue. A recovery gets one comment ("Healthy again after Xh; bot will not
+(or the node names, or the role names) in the title or body, wins and the bot
+adopts their issue. A recovery gets one comment ("Healthy again after Xh; bot will not
 close it"). The bot never closes an issue -- a green gate is not proof the
 fixture is fixed, only that three runs passed, and the node events are still
 worth reading after the pool has healed itself.
@@ -41,9 +50,10 @@ JOB_NAME = "pull-kube-agents-smoke-test"
 OPEN_ISSUES_PATH = f"issues?labels={LABEL}&state=open&per_page=100"
 ISSUES_PATH = "issues"
 COMMENTS_PATH = "issues/{number}/comments"
-# health.json's condition this module files for besides an OUTAGE
+# health.json's conditions this module files for besides an OUTAGE
 # (health.py owns the vocabulary).
 CONDITION_LOST_PODS = "lost_pods"
+CONDITION_FIXTURE_DRIFT = "fixture_drift"
 # GitHub rejects a longer title; the node list is compacted, then dropped
 # for a count, to stay under it.
 TITLE_MAX_CHARS = 256
@@ -88,6 +98,30 @@ The Prow build cluster (`kube-agents-prow`) lost the node(s) below at {when}; {r
 Incident brief: {brief}
 
 Filed automatically by the smoke health bot; the cluster owner should check the node events and autorepair; the bot will not close it.
+"""
+FIXTURE_DRIFT_TITLE = "Seeded fleet drift: {roles} out of designed state on {projects} pool {noun} since {since}"
+PROJECT_NOUN = ("project", "projects")
+FIXTURE_DRIFT_BODY = """\
+The seeded fleet's fixture role(s) below are present but not in the state the cases depend on, on the pool projects named, and have been so on two consecutive hourly scans or on three projects at once. The presubmit detects a drift and does not act on it (decision 2026-09-14: evals v1 detects, does not act), so the cases that depend on a drifted role run against it and red on every run that leases one of these projects; that red is the fixture's, not the pull request's, and a retest is worth it only after the re-apply below.
+
+**Drifted roles**
+
+{roles}
+
+**Per project** (the assertion from `bench/tf/fleet/fixtures.json`, and what the scan observed)
+
+{projects}
+
+**Window:** since {since} ({since_iso}); latest scan {scanned_at}.
+**Evidence:**
+
+{evidence}
+
+**Reconcile:** re-apply `bench/tf/fleet` in each project named (`bench/tf/fleet/README.md`, "State and reconcile"), then wait for the next hourly scan or run `python3 scripts/verify_ci_pool_project.py --project-id <project>`.
+
+Incident brief: {brief}
+
+Filed automatically by the smoke health bot; the fleet owner should re-apply the stack in the projects named; the bot will not close it.
 """
 RECOVERY_COMMENT = "Healthy again after {lasted}; bot will not close it."
 NO_EVIDENCE = "- (none recorded)"
@@ -183,6 +217,40 @@ def render_lost_pods_body(health: dict, when_text: str, window_text: str, brief_
     )
 
 
+def render_fixture_drift_title(health: dict, since_text: str) -> str:
+    incident = health.get("incident") or {}
+    roles = list(incident.get("roles") or [])
+    projects = list(incident.get("projects") or [])
+    return FIXTURE_DRIFT_TITLE.format(
+        roles=", ".join(roles) or "fixture role(s)",
+        projects=len(projects),
+        noun=PROJECT_NOUN[len(projects) != 1],
+        since=since_text,
+    )
+
+
+def render_fixture_drift_body(health: dict, since_text: str, brief_link: str) -> str:
+    incident = health.get("incident") or {}
+    roles = list(incident.get("roles") or [])
+    drift = incident.get("drift") or {}
+    evidence = [f"- {line}" for line in health.get("evidence") or []]
+    per_project = []
+    for project in sorted(drift):
+        per_project.append(f"- `{project}`")
+        for role, lines in sorted((drift.get(project) or {}).items()):
+            per_project.append(f"  - `{role}`")
+            per_project.extend(f"    - {line}" for line in lines or ["(no detail recorded)"])
+    return FIXTURE_DRIFT_BODY.format(
+        roles="\n".join(f"- `{role}`" for role in roles) or "- (none recorded)",
+        projects="\n".join(per_project) or "- (none recorded)",
+        since=since_text,
+        since_iso=health.get("since") or "?",
+        scanned_at=incident.get("window_start") or "?",
+        evidence="\n".join(evidence) or NO_EVIDENCE,
+        brief=brief_link,
+    )
+
+
 class Tracker:
     def __init__(self, gh):
         self.gh = gh
@@ -207,6 +275,8 @@ class Tracker:
         condition = health.get("condition")
         if condition == CONDITION_LOST_PODS:
             return self._ensure_lost_pods(health, since_text, window_text or since_text, brief_link)
+        if condition == CONDITION_FIXTURE_DRIFT:
+            return self._ensure_fixture_drift(health, since_text, brief_link)
         cases = list(health.get("failing_cases") or [])
         if not cases:
             return None
@@ -234,6 +304,22 @@ class Tracker:
         created = as_issue(self.gh.call("POST", self.gh.path(ISSUES_PATH), payload), CONDITION_LOST_PODS)
         if created:
             log(f"tracking issue: filed #{created['number']} for the cluster owner")
+        return created
+
+    def _ensure_fixture_drift(self, health: dict, since_text: str, brief_link: str) -> dict | None:
+        roles = sorted((health.get("incident") or {}).get("roles") or [])
+        found = self.existing(roles) if roles else None
+        if found:
+            log(f"tracking issue: adopting open #{found['number']} (names every drifted role)")
+            return dict(found, condition=CONDITION_FIXTURE_DRIFT)
+        payload = {
+            "title": render_fixture_drift_title(health, since_text),
+            "body": render_fixture_drift_body(health, since_text, brief_link),
+            "labels": [LABEL],
+        }
+        created = as_issue(self.gh.call("POST", self.gh.path(ISSUES_PATH), payload), CONDITION_FIXTURE_DRIFT)
+        if created:
+            log(f"tracking issue: filed #{created['number']} for the fleet owner")
         return created
 
     def recovered(self, issue: dict, lasted: str) -> bool:

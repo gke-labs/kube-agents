@@ -621,7 +621,7 @@ block, the report page and the digest say instead of "no night".
 `health.json` is the CI health adjudicator's verdict, published beside
 `data.json` (nothing in this directory writes it); the fields read are
 `state` (`GREEN|DEGRADED|OUTAGE`), `condition`
-(`shared_break|storm|setup_deaths|lost_pods`), `since`, `cause`, `advice`,
+(`shared_break|storm|setup_deaths|lost_pods|fixture_drift`), `since`, `cause`, `advice`,
 `failing_cases`, `tracking_issues`, `incident`, `recovering`, `stale`,
 `generated_at`, `tick`. Any other state, or an unreadable file, means no
 verdict: the Brief says no verdict is published and shows the last 24
@@ -632,7 +632,12 @@ it}`) and `event` (`true` when the loss counts as a build-cluster event);
 the pages give it the same 2-hour lead on the Brief's window as a storm and
 a run-page banner of its own, and otherwise show the generic degraded
 headline. `issue` (`{number, url}`) may carry `condition`, the one it was
-filed for.
+filed for. `fixture_drift` (the hourly seeded-fleet scan found a fixture
+role out of its designed state; docs/ci-health.md, "The seeded-fleet scan")
+carries `roles`, `projects` and `drift` in its `incident` and a
+`fixture_state` block beside `metrics`; the pages show it as the generic
+degraded headline, and `fixture-state.json` beside `health.json` is the
+scan's own document, which no page reads.
 
 `health-history.jsonl` is one JSON object per line, each the full
 `health.json` document as published at that tick plus
