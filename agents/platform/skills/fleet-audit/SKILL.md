@@ -624,9 +624,15 @@ What `finish` does with it:
 - **A complete record renders.** One line under Scope, `Declared-intent search: owner/name@sha, …`,
   so a reader can see what was read.
 
-Where the sha comes from: in content mode `list`, `grep` and `fetch` print it, and
-`inspect_repository.py clone` and `open` print it for a context copy; in directory mode it is
-`git -C <workspace> rev-parse HEAD` on the clone. The SOP's §4a is the procedure.
+Where the sha comes from is the SOP's §4a: in content mode `list`, `grep` and `fetch` print it for
+the GitOps repository and `inspect_repository.py clone` and `open` print it for a context copy; in
+directory mode it is `git -C <dir> rev-parse HEAD` on the GitOps clone and on the `workspace` that
+`clone` named for the context copy.
+
+The withhold binds the direct-ask path too: `remediate --finding <id>` applies it against the same
+record and refuses a withheld id by name, because a pull request for a posture the ledger says was
+held back would contradict the ledger. A `/remediate` comment naming a withheld posture is deferred,
+not refused — see the answers list under [Remediation pull requests](#remediation-pull-requests).
 
 ## Evidence rules
 
@@ -739,6 +745,13 @@ Every `/remediate` gets exactly one answer, and the answer is never silence:
   silently dropped".
 - Refused — one reply saying why, for a commenter without write access, a `/remediate` naming a
   finding that is not in the current document, or one naming a non-`manifest` finding.
+- **Deferred**, when the target is a posture this run withheld for want of a declared-intent search
+  ([`declared_intent_searched`](#declared_intent_searched)) — on the findings branch and on the clean
+  branch alike, since "no longer reproduces" would be false there. One reply says the request is on
+  hold and why, under its own `audit-deferred` marker, which nothing reads as an answer: the same
+  comment is acted on, and acknowledged, by the first run that records the search and still sees
+  the posture. The refused marker is never written for it, so the requester is not told their id was
+  a typo and does not have to ask again.
 - Refused **on syntax**, likewise once, because a command the parser will not honour is a person
   waiting for a fix that is never coming. `/remediate` is only read at the start of its own line outside
   block quotes, so one written mid-sentence or rendered inside a block quote / lazy continuation gets a reply

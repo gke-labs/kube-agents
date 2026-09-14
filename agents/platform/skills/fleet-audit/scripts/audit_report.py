@@ -441,6 +441,14 @@ REFUSED_MARKER_RE = re.compile(
 ACKED_MARKER_RE = re.compile(
     r"^[ \t]*<!--[ \t]*audit-acked:[ \t]*(\S+?)[ \t]*-->[ \t]*$", re.M
 )
+# A `/remediate` naming a posture `finish` withheld for want of a declared-intent
+# search is neither refused nor acted on: it is answered once with this marker
+# and left standing, so the first run that records the search honours it. The
+# other two markers are permanent; this one is not consulted by anything that
+# decides whether a request is still open.
+DEFERRED_MARKER_RE = re.compile(
+    r"^[ \t]*<!--[ \t]*audit-deferred:[ \t]*(\S+?)[ \t]*-->[ \t]*$", re.M
+)
 # Written into the closing comment of a pull request the *harness* closed, so
 # the audit trail says who closed it. The machine-readable half of the same
 # fact is the `audit:stale-closed` label — see STALE_CLOSED_LABEL.
@@ -2809,13 +2817,27 @@ def is_machine_author(comment: dict) -> bool:
     )
 
 
+def deferral_reason(target: str) -> str:
+    """Why a `/remediate` on a withheld posture is neither refused nor acted on."""
+    return (
+        f"`{target}` is a posture finding this run held back rather than "
+        "published, because the document recorded no complete declared-intent "
+        "search (see _Declared intent not searched_ on the ledger). The request "
+        "stands: the first run that records the search and still sees the "
+        "posture acts on it, and one that no longer sees it says so"
+    )
+
+
 def parse_remediate_commands(
-    comments: list[dict], findings: list[dict]
+    comments: list[dict], findings: list[dict], withheld: list[dict] | None = None
 ) -> RemediateRequests:
     """Read `/remediate` requests off the ledger issue.
 
     A refusal is one entry per comment, not per bad target, because the reply is
-    posted once per comment and marked with that comment's node id.
+    posted once per comment and marked with that comment's node id. An entry
+    carrying `deferred: True` is not a refusal: it names a posture `finish`
+    withheld this run, and `reply_to_refusals` answers it on the deferred
+    marker, which nothing reads as "answered", so the request stands.
 
     `accepted_by_comment` exists so a request that *worked* gets an answer too.
     A command that silently succeeds is indistinguishable from one that was
@@ -2835,6 +2857,12 @@ def parse_remediate_commands(
         for fid, finding in by_id.items()
         if (finding.get("remediation") or {}).get("kind") == "manifest"
     }
+    # The postures `finish` took out of `findings` this run. A target among
+    # them is not "not a finding in the current report": it is one the harness
+    # is holding, and a refusal here would carry the permanent marker and a
+    # false reason — the requester would be told their id was a typo, and the
+    # request would never be revisited when the posture returns.
+    withheld_ids = {str(f.get("id", "")) for f in withheld or []}
 
     targets: set[str] = set()
     refusals: list[dict] = []
@@ -2929,8 +2957,12 @@ def parse_remediate_commands(
             continue
 
         accepted: list[str] = []
+        deferred: list[str] = []
         for raw in matches:
             target = raw.strip().strip("`")
+            if target in withheld_ids:
+                deferred.append(deferral_reason(target))
+                continue
             if not target:
                 # An empty target is not a wildcard. Reading it as one would
                 # open every promotable pull request the cap allows on somebody
@@ -2994,6 +3026,15 @@ def parse_remediate_commands(
         if reasons:
             refusals.append(
                 {"comment_id": node_id, "author": author, "reasons": reasons}
+            )
+        if deferred:
+            refusals.append(
+                {
+                    "comment_id": node_id,
+                    "author": author,
+                    "reasons": deferred,
+                    "deferred": True,
+                }
             )
 
     return RemediateRequests(
@@ -3287,6 +3328,10 @@ def refused_marker(comment_id: str) -> str:
 
 def acked_marker(comment_id: str) -> str:
     return f"<!-- audit-acked:{comment_id} -->"
+
+
+def deferred_marker(comment_id: str) -> str:
+    return f"<!-- audit-deferred:{comment_id} -->"
 
 
 def stale_closed_marker(pr_number: int | str) -> str:
@@ -4656,6 +4701,25 @@ def render_refusal_comment(refusal: dict, generated_at: datetime) -> str:
     return "\n".join(out)
 
 
+def render_deferral_comment(deferral: dict, generated_at: datetime) -> str:
+    """Said once per `/remediate` that names a posture this run withheld.
+
+    Not a refusal: nothing was wrong with the request, and it is not closed by
+    this answer. The marker is the deferred one, which nothing reads as
+    "answered", so the same comment is honoured by the first run that records
+    the declared-intent search.
+    """
+    stamp = generated_at.strftime("%Y-%m-%d %H:%M UTC")
+    out = [
+        f"@{deferral.get('author', 'someone')} — that `/remediate` was read on "
+        f"{stamp} and is on hold, not refused:",
+        "",
+    ]
+    out += [f"- {reason}" for reason in deferral.get("reasons") or []]
+    out += ["", deferred_marker(str(deferral.get("comment_id", "")))]
+    return "\n".join(out)
+
+
 def render_ack_comment(
     comment_id: str,
     accepted: list[str],
@@ -5850,6 +5914,11 @@ def reply_to_refusals(
     cannot be recorded on the command itself.
     """
     for refusal in refusals:
+        if refusal.get("deferred"):
+            reply_to_deferrals(
+                repo, issue_number, [refusal], existing_comments, generated_at
+            )
+            continue
         comment_id = str(refusal.get("comment_id", ""))
         if comment_id and marker_from_harness(
             existing_comments, REFUSED_MARKER_RE, comment_id
@@ -5860,6 +5929,34 @@ def reply_to_refusals(
             issue_number,
             render_refusal_comment(refusal, generated_at),
             what="/remediate refusal",
+        )
+
+
+def reply_to_deferrals(
+    repo: str,
+    issue_number: int,
+    deferrals: list[dict],
+    existing_comments: list[dict],
+    generated_at: datetime,
+) -> None:
+    """Answer each deferred `/remediate` once per hold, on the deferred marker.
+
+    The guard is this marker alone: a comment that was deferred yesterday and
+    is deferred again today is not answered twice, and one that was deferred
+    and is acted on today gets its acknowledgement, because the ack path never
+    looks at this marker.
+    """
+    for deferral in deferrals:
+        comment_id = str(deferral.get("comment_id", ""))
+        if comment_id and marker_from_harness(
+            existing_comments, DEFERRED_MARKER_RE, comment_id
+        ):
+            continue
+        post_comment(
+            repo,
+            issue_number,
+            render_deferral_comment(deferral, generated_at),
+            what="/remediate deferral",
         )
 
 
@@ -5902,11 +5999,15 @@ def write_run_record(audit_id: str, repo: str, context: list[str]) -> str:
     return path
 
 
-def read_run_record(audit_id: str) -> dict | None:
+def read_run_record(audit_id: str, repo: str | None = None) -> dict | None:
     """The record `start` wrote for this stream, or None when there is none usable.
 
-    Missing, unreadable, or not the shape `write_run_record` writes all read as
-    "no record", and no record is no search: the run withholds. Nothing here
+    Missing, unreadable, not the shape `write_run_record` writes, or — when the
+    caller knows which repository it is finishing — written for a different
+    one, all read as "no record", and no record is no search: the run
+    withholds. The repository check is what keeps a multi-repository cron,
+    which runs `start` and `finish` per repository in turn, from measuring
+    repository B's document against a record left behind for A. Nothing here
     guesses at a repository list the way `finish` would if it fell back to the
     ConfigMap.
     """
@@ -5916,11 +6017,13 @@ def read_run_record(audit_id: str) -> dict | None:
         return None
     if not isinstance(data, dict) or data.get("audit") != audit_id:
         return None
-    repo = data.get("repo")
+    recorded = data.get("repo")
     context = data.get("context_repos")
-    if not isinstance(repo, str) or not repo or not isinstance(context, list):
+    if not isinstance(recorded, str) or not recorded or not isinstance(context, list):
         return None
-    return {"repo": repo, "context_repos": [str(slug) for slug in context]}
+    if repo and recorded.strip().lower() != repo.strip().lower():
+        return None
+    return {"repo": recorded, "context_repos": [str(slug) for slug in context]}
 
 
 def load_findings(path: str, audit_id: str) -> dict:
@@ -6109,6 +6212,12 @@ def context_repos() -> list[str]:
 def handle_start(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
 
+    # Yesterday's run record goes first, before anything below can fail. Every
+    # step from here to the write can raise, and a `start` that died between
+    # them would otherwise leave the previous run's repository list for a
+    # `finish` to measure today's document against.
+    Path(run_record_path_for(audit_id)).unlink(missing_ok=True)
+
     opt_repo = getattr(args, "repo", None)
     repo = resolve_repo(audit_id=audit_id, repo=opt_repo)
     refresh_credentials(repo)
@@ -6136,9 +6245,11 @@ def handle_start(args: argparse.Namespace) -> None:
     Path(findings_path).unlink(missing_ok=True)
 
     # The run record: which repositories this run's declared-intent step was
-    # told to search. Written before the JSON below is printed, so a crash
-    # between the two leaves no record and `finish` withholds rather than
-    # measuring the document against yesterday's list.
+    # told to search. Written here, after every step that can fail and before
+    # the JSON below is printed, so the record is never newer than the list
+    # the worker was handed; with the unlink at the top, a `start` that did
+    # not get this far leaves no record at all, and `finish` withholds rather
+    # than measuring the document against yesterday's list.
     context = context_repos()
     write_run_record(audit_id, repo, context)
 
@@ -6624,8 +6735,27 @@ def handle_remediate(args: argparse.Namespace) -> None:
     """
     audit_id = validate_audit_id(args.audit)
     data = load_findings(args.findings_file, audit_id)
-    findings = list(data["findings"])
     opt_repo = getattr(args, "repo", None)
+    # The same withhold `finish` applies, against the same record. A direct
+    # ask is uncapped, not unfiltered: the ledger says these postures were held
+    # back for want of a declared-intent search, and a pull request for one of
+    # them would contradict it.
+    repo_hint = opt_repo if args.dry_run else resolve_repo(audit_id=audit_id, repo=opt_repo)
+    withheld_ids = set(
+        finding_ids(
+            withhold_unsearched_postures(data, read_run_record(audit_id, repo=repo_hint))
+        )
+    )
+    findings = list(data["findings"])
+    held = [fid for fid in args.finding if fid in withheld_ids]
+    if held:
+        raise ValidationError(
+            f"--finding: {', '.join(held)} withheld — the document recorded no "
+            "complete declared-intent search, so finish holds these posture "
+            "findings back rather than publishing them, and a pull request for "
+            "one would contradict the ledger. Record the search "
+            "(declared_intent_searched) and run finish, then ask again"
+        )
 
     by_id = {str(f.get("id", "")): f for f in findings}
     unknown = [fid for fid in args.finding if fid not in by_id]
@@ -6683,7 +6813,7 @@ def handle_remediate(args: argparse.Namespace) -> None:
             )
         return
 
-    repo = resolve_repo(audit_id=audit_id, repo=opt_repo)
+    repo = repo_hint or resolve_repo(audit_id=audit_id, repo=opt_repo)
     refresh_credentials(repo)
     root = ensure_workspace(repo, audit_id)
     ensure_labels(repo, audit_id)
@@ -6795,10 +6925,14 @@ def handle_remediate(args: argparse.Namespace) -> None:
 def handle_finish(args: argparse.Namespace) -> None:
     audit_id = validate_audit_id(args.audit)
     data = load_findings(args.findings_file, audit_id)
+    opt_repo = getattr(args, "repo", None)
     # Once, here, ahead of the dry-run split: both paths then see the same
     # document, and `coverage_gaps` reads the gap back off it wherever it is
-    # called from.
-    withheld = withhold_unsearched_postures(data, read_run_record(audit_id))
+    # called from. The real run knows which repository it is finishing and
+    # holds the record to it; a dry run resolves nothing and compares only
+    # when `--repo` was given.
+    repo_hint = opt_repo if args.dry_run else resolve_repo(audit_id=audit_id, repo=opt_repo)
+    withheld = withhold_unsearched_postures(data, read_run_record(audit_id, repo=repo_hint))
     if withheld:
         log(
             f"WITHHELD: {len(withheld)} posture finding(s) with no complete "
@@ -6808,13 +6942,12 @@ def handle_finish(args: argparse.Namespace) -> None:
     findings = list(data["findings"])
     declared = list(data.get("declared") or [])
     now = datetime.now(timezone.utc)
-    opt_repo = getattr(args, "repo", None)
 
     if args.dry_run:
         _handle_finish_dry_run(audit_id, data, now, repo=opt_repo)
         return
 
-    repo = resolve_repo(audit_id=audit_id, repo=opt_repo)
+    repo = repo_hint
     refresh_credentials(repo)
     root = ensure_workspace(repo, audit_id)
     ensure_labels(repo, audit_id)
@@ -6881,9 +7014,28 @@ def handle_finish(args: argparse.Namespace) -> None:
             # clean run as its exception: that is the one morning the issue
             # disappears, taking the thread the requester would re-ask on with
             # it.
-            for request in unanswered_remediate_comments(
-                fetch_issue_comments(repo, existing_issue)
-            ):
+            # A request naming a posture this run withheld is not answered
+            # with "no longer reproduces": the harness is holding it, not the
+            # fleet, so it is deferred on its own marker and stays open.
+            withheld_ids = set(finding_ids(withheld))
+            clean_comments = fetch_issue_comments(repo, existing_issue)
+            for request in unanswered_remediate_comments(clean_comments):
+                held = [t for t in request.get("targets") or [] if t in withheld_ids]
+                if held:
+                    reply_to_deferrals(
+                        repo,
+                        existing_issue,
+                        [
+                            {
+                                "comment_id": request.get("comment_id", ""),
+                                "author": request.get("author", "someone"),
+                                "reasons": [deferral_reason(t) for t in held],
+                            }
+                        ],
+                        clean_comments,
+                        now,
+                    )
+                    continue
                 post_comment(
                     repo,
                     existing_issue,
@@ -7028,7 +7180,7 @@ def handle_finish(args: argparse.Namespace) -> None:
     }
 
     ledger_comments = fetch_issue_comments(repo, existing_issue) if existing_issue else []
-    requests = parse_remediate_commands(ledger_comments, findings)
+    requests = parse_remediate_commands(ledger_comments, findings, withheld)
     plan = promotion_candidates(
         findings,
         pr_by_finding,

@@ -390,15 +390,20 @@ the list's length as `declared`.
 
 `declared_intent_repos` is the set that step must account for — the GitOps repository plus every
 `context_repos` slug, folded to one entry each — and `start` writes the same set to a run record
-beside the findings document (`run_<audit-id>.json`) before it prints, so a crash between the two
-leaves no record. The document may carry a top-level `declared_intent_searched` list of
-`owner/name@sha` strings, one per repository the step searched, validated for shape (the slug rule
-`declared[].declaration.repo` uses, a sha of 7 to 40 hex characters) and rejected on a stream with
-no `declarable` set. `finish` measures it against the run record, not the ConfigMap at finish time:
-whenever any cluster's `checks_run` names a declarable check and the list does not cover every slug
-in the record — or there is no record — every finding whose check is declarable is withheld and the
-run goes partial (§7.4). The sha comes from the reads: `list`, `grep` and `fetch` print the broker's
-tree sha, and `inspect_repository.py clone` and `open` print it for a context copy (#1477).
+beside the findings document (`run_<audit-id>.json`). `start` clears the previous record as its
+first act and writes the new one last, after every step that can fail and before it prints, so the
+record is never newer than the list the worker was handed and a `start` that failed leaves none.
+The document may carry a top-level `declared_intent_searched` list of `owner/name@sha` strings, one
+per repository the step searched, validated for shape (the slug rule `declared[].declaration.repo`
+uses, a sha of 7 to 40 lowercase hex characters) and rejected on a stream with no `declarable`
+set. `finish` measures it against the run record, not the ConfigMap at finish time, and holds the
+record to the repository it is finishing, so a multi-repository cron cannot measure one
+repository's document against another's record: whenever any cluster's `checks_run` names a
+declarable check and the list does not cover every slug in the record — or there is no usable
+record — every finding whose check is declarable is withheld and the run goes partial (§7.4).
+`remediate` applies the same withhold and refuses a withheld id by name. The sha comes from the
+reads: `list`, `grep` and `fetch` print the broker's tree sha, and in content mode
+`inspect_repository.py clone` and `open` print it for a context copy (#1477).
 
 `workspace` is the clone, and it is not decoration. The audit cron starts in the agent's profile
 directory, which is not a working tree — so there is nothing to `git add` into and nothing for
@@ -789,7 +794,11 @@ of `findings`, the dangling-target `hpa-cannot-scale` fault included (the valida
 from the `min == max` posture), and files them on the document under `postures_withheld`. Every
 caller of `coverage_gaps` then derives the same sentence — each withheld entry, the repositories not
 searched, and the `hpa-cannot-scale` caveat — and the withheld ids enter no delta block and no
-remediation pull request; the faults and the `declared[]` entries publish unchanged. Routing it
+remediation pull request; the faults and the `declared[]` entries publish unchanged. A `/remediate`
+standing on the ledger that names a withheld posture is neither refused nor acted on: it is
+answered once with a reply carrying an `audit-deferred` marker, which nothing reads as "answered",
+so the same comment is honoured by the first run that records the search — on the findings branch
+and on the clean branch alike, where the "no longer reproduces" answer would be false. Routing it
 through `coverage_gaps` rather than through a fifth gate is the same economy as the roster
 shortfall below: everything keyed on `partial` follows. The ledger renders the withheld postures
 under _Declared intent not searched_ below the Scope table, and the clean comment lists them, so a

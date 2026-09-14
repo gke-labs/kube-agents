@@ -4318,6 +4318,177 @@ class TestDeclaredIntentSearch(HarnessTestCase):
         payload = json.loads(self.out)
         self.assertEqual(payload["declared_intent_repos"], ["acme/fleet", "acme/terraform-live"])
 
+    def test_start_clears_yesterdays_record_before_anything_can_fail(self):
+        # Every step between the top of `start` and the write can raise. A
+        # `start` that died in between must not leave the previous run's
+        # repository list for today's `finish` to measure a document against.
+        patcher = patch.object(audit_report.os, "makedirs", lambda *a, **k: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.record_run(context=("acme/old-context",))
+
+        def boom(repo, audit_id):
+            raise RuntimeError("gh label create: 502")
+
+        self.patch_attr("ensure_labels", boom)
+        self.assertNotEqual(self.run_main(["start", "--audit", DECLARING_AUDIT]), 0)
+        self.assertIsNone(audit_report.read_run_record(DECLARING_AUDIT))
+
+    def test_a_record_for_another_repository_is_no_record(self):
+        # The multi-repository cron runs `start` and `finish` per repository in
+        # turn; a record left behind for repository A must not measure B's
+        # document. The harness resolves `acme/fleet`.
+        self.record_run(repo="acme/other", context=())
+        payload = self.finish(self.doc(repos=["acme/fleet", "acme/other"]))
+        self.assert_withheld(payload, self.ledger_body())
+        self.assertIn("no run record from `start`", self.declared_gaps(payload)[0])
+
+    # -- remediate ------------------------------------------------------------
+
+    def test_remediate_refuses_a_withheld_id_by_name(self):
+        """The direct-ask path applies the same withhold as `finish`.
+
+        The ledger says the posture was held back for want of a search; a pull
+        request for it opened through `remediate` would contradict that.
+        """
+        self.record_run(context=self.CONTEXT)
+        findings_file = self.write_findings(self.doc())
+        held = derived_id(
+            check="no-pdb", namespace="payments", obj="Deployment/checkout-gateway"
+        )
+        rc = self.run_main(
+            ["remediate", "--audit", DECLARING_AUDIT, "--findings-file", findings_file,
+             "--finding", held]
+        )
+        self.assertEqual(rc, 2, self.err)
+        self.assertIn("withheld", self.err)
+        self.assertIn("declared_intent_searched", self.err)
+        self.assertEqual(self.harness.gh_calls("pr", "create"), [])
+        # And `--dry-run`, which resolves no repository, holds the same line.
+        rc = self.run_main(
+            ["remediate", "--audit", DECLARING_AUDIT, "--findings-file", findings_file,
+             "--finding", held, "--dry-run"]
+        )
+        self.assertEqual(rc, 2, self.err)
+        self.assertIn("withheld", self.err)
+
+    def test_remediate_still_opens_a_fault_on_a_withheld_run(self):
+        self.record_run(context=self.CONTEXT)
+        findings_file = self.write_findings(self.doc())
+        fault = derived_id(
+            check="blocking-pdb", namespace="payments", obj="PodDisruptionBudget/payments-db"
+        )
+        rc = self.run_main(
+            ["remediate", "--audit", DECLARING_AUDIT, "--findings-file", findings_file,
+             "--finding", fault]
+        )
+        self.assertEqual(rc, 0, self.err)
+        self.assertEqual(len(self.stdout_json()["prs_opened"]), 1)
+
+    # -- a standing /remediate on a withheld posture ---------------------------
+
+    def held_id(self):
+        return derived_id(
+            check="no-pdb", namespace="payments", obj="Deployment/checkout-gateway"
+        )
+
+    def test_a_request_for_a_withheld_posture_is_deferred_not_refused(self):
+        """Neither "typo" nor a permanent marker: the request stands.
+
+        The withhold takes the posture out of `findings` before the ledger's
+        comments are parsed. Read as "not a finding in the current report" it
+        would be refused with a false reason and the refused marker, and never
+        revisited when the posture returns. It is deferred on its own marker
+        instead, which nothing reads as answered.
+        """
+        request = comment(f"/remediate {self.held_id()}")
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json comments": json.dumps({"comments": [request]}),
+            "pr create": "https://github.com/acme/fleet/pull/8\n",
+        }
+        self.record_run(context=self.CONTEXT)
+        payload = self.finish(self.doc())
+        self.assertTrue(payload["partial"])
+        posted = self.harness.bodies_for("issue", "comment")
+        deferrals = [b for b in posted if audit_report.deferred_marker("IC_1") in b]
+        self.assertEqual(len(deferrals), 1, posted)
+        self.assertIn("on hold, not refused", deferrals[0])
+        self.assertIn("declared-intent search", deferrals[0])
+        self.assertNotIn("typo", deferrals[0])
+        for body in posted:
+            self.assertNotIn(audit_report.refused_marker("IC_1"), body)
+            self.assertNotIn(audit_report.acked_marker("IC_1"), body)
+        # The one pull request is the critical fault's auto-promotion; nothing
+        # opened for the deferred posture.
+        self.assertEqual(len(self.harness.gh_calls("pr", "create")), 1)
+        self.assertNotIn(
+            "checkout-gateway", " ".join(" ".join(c) for c in self.harness.gh_calls("pr", "create"))
+        )
+
+    def test_a_deferred_request_is_answered_once_per_hold(self):
+        request = comment(f"/remediate {self.held_id()}")
+        earlier = harness_comment(f"on hold\n{audit_report.deferred_marker('IC_1')}\n")
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json comments": json.dumps({"comments": [request, earlier]}),
+        }
+        self.record_run(context=self.CONTEXT)
+        self.finish(self.doc())
+        for body in self.harness.bodies_for("issue", "comment"):
+            self.assertNotIn(audit_report.deferred_marker("IC_1"), body)
+
+    def test_a_deferred_request_is_honoured_by_the_run_that_records_the_search(self):
+        # Yesterday's deferral marker does not count as an answer: the same
+        # comment is acted on and acknowledged once the search is recorded.
+        request = comment(f"/remediate {self.held_id()}")
+        earlier = harness_comment(f"on hold\n{audit_report.deferred_marker('IC_1')}\n")
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json comments": json.dumps({"comments": [request, earlier]}),
+            "pr create": "https://github.com/acme/fleet/pull/9\n",
+        }
+        self.record_run(context=self.CONTEXT)
+        # The posture carries a manifest this time, so there is something to open.
+        findings = posture_and_fault_findings()
+        findings[0]["remediation"] = {
+            "kind": "manifest",
+            "path": "clusters/prod-us-east/checkout-gateway-pdb.yaml",
+            "note": "Add a PDB.",
+        }
+        self.touch("clusters/prod-us-east/checkout-gateway-pdb.yaml")
+        payload = self.finish(
+            self.doc(findings=findings, repos=["acme/fleet", "acme/terraform-live"])
+        )
+        self.assertFalse(payload["partial"])
+        # Two pull requests: the critical fault's auto-promotion, and the
+        # requested posture's.
+        self.assertEqual(len(self.harness.gh_calls("pr", "create")), 2)
+        acked = [
+            b for b in self.harness.bodies_for("issue", "comment")
+            if audit_report.acked_marker("IC_1") in b
+        ]
+        self.assertEqual(len(acked), 1)
+
+    def test_a_clean_run_defers_a_request_for_a_withheld_posture(self):
+        # Every finding was a posture, so the run lands on the CLEAN branch
+        # with a gap. "No longer reproduces" would be false — the harness is
+        # holding it — so the request is deferred there too, and not acked.
+        request = comment(f"/remediate {self.held_id()}")
+        self.harness.replies = {
+            "issue list": self.issue_list(),
+            "--json comments": json.dumps({"comments": [request]}),
+        }
+        self.record_run(context=self.CONTEXT)
+        postures = [f for f in posture_and_fault_findings() if f["check"] in POSTURE_CHECKS]
+        payload = self.finish(self.doc(findings=postures))
+        self.assertEqual(payload["status"], "CLEAN")
+        posted = self.harness.bodies_for("issue", "comment")
+        self.assertTrue(any(audit_report.deferred_marker("IC_1") in b for b in posted), posted)
+        for body in posted:
+            self.assertNotIn(audit_report.acked_marker("IC_1"), body)
+            self.assertNotIn("no longer reproduces", body)
+
     def test_start_replaces_yesterdays_record(self):
         patcher = patch.object(audit_report.os, "makedirs", lambda *a, **k: None)
         patcher.start()
