@@ -190,14 +190,42 @@ spec:
       {{- with (include "kube-agents.imagePullSecrets" .) }}
       {{- . | nindent 6 }}
       {{- end }}
+      # The pinned image declares User root, so without this the gateway runs
+      # as root on a writable root filesystem. The values are the house set the
+      # operator, github-minter and Hindsight API already carry, kept in step
+      # with k8s-operator/config/integrations/litellm/base/deployment.yaml and
+      # asserted by tests/test_workload_security_context.py. The one writable
+      # path is the tmp emptyDir at /tmp; HOME points there too, because uid
+      # 1000 has no passwd entry in the image and the tokenizer and library
+      # caches follow HOME. Nothing else needs to be writable: the chart sets
+      # no DATABASE_URL, so Prisma never runs, and the proxy only logs a
+      # warning when its UI directory under /app is read-only. If the
+      # container still fails on a write elsewhere, add one more emptyDir at
+      # that path and name it here; do not set readOnlyRootFilesystem: false.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: litellm-container
           image: "{{ include "kube-agents.imageRepository" (dict "repository" .Values.litellm.image.repository "registry" (include "kube-agents.thirdPartyImageRegistry" .)) }}:{{ .Values.litellm.image.tag }}"
           imagePullPolicy: {{ .Values.litellm.image.pullPolicy }}
           args: ["--config", "/app/config.yaml", "--port", "8080"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           resources:
             {{- toYaml .Values.litellm.resources | nindent 12 }}
           env:
+            # See the pod securityContext above: the only writable directory.
+            - name: HOME
+              value: /tmp
             {{- if eq $provider "vertex_ai" }}
             - name: VERTEXAI_PROJECT
               value: {{ $vertexProject | quote }}
@@ -299,10 +327,14 @@ spec:
               mountPath: /app/litellm_redaction_callback.py
               subPath: litellm_redaction_callback.py
             {{- end }}
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: config-volume
           configMap:
             name: litellm-config
+        - name: tmp
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service

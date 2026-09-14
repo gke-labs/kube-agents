@@ -62,7 +62,10 @@ spec:
     spec:
       serviceAccountName: hindsight
       securityContext:
+        runAsNonRoot: true
         fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: api
           # Resolved from images.json by the deploy target, so a mirrored
