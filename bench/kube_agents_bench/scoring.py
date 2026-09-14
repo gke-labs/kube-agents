@@ -149,6 +149,16 @@ DEFAULT_JUDGED_MARGIN = 0.5
 #: duplication cannot drift silently.
 INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 
+#: First word of the reason a repetition gets when a seeded fixture the case
+#: names was recorded as DRIFTED at lease time (#1544): present, but not in
+#: its designed state, so ``hack/ci-eval-pr.sh`` never launched the unit. The
+#: outcome is ``infra`` like a transport failure, but the dashboard must not
+#: read it as a quota storm: ``scripts/eval_dashboard/classify.py`` and
+#: ``health.py`` match this literal (duplicated there; both are stdlib-only)
+#: to keep skipped repetitions out of the storm counts. It leads the reason so
+#: the collector's 300-character cap cannot cut it off.
+FIXTURE_DRIFT_MARKER = "KUBE_AGENTS_FIXTURE_DRIFT"
+
 #: Field values from devops-bench's ``_build_failed_record``: ``status`` is
 #: ``"failed"`` on every failed record, and ``verification_status`` is
 #: ``"not_evaluated"`` when verification did not run -- which has TWO
@@ -538,9 +548,9 @@ def classify_rep(
         named = "; ".join(f"{role}: {reason}" for role, reason in drifted)
         return rep(
             "infra",
-            "the seeded fixture this case depends on was not in its designed "
-            "state at lease time, so the case was not run and nothing here is "
-            f"evidence about the pull request ({named})",
+            f"{FIXTURE_DRIFT_MARKER}: the seeded fixture this case depends on "
+            "was not in its designed state at lease time, so the case was not "
+            f"run and nothing here is evidence about the pull request ({named})",
         )
 
     if record is None or record.empty_record:

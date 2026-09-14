@@ -1493,6 +1493,10 @@ def test_a_drifted_fixture_is_infrastructure_even_on_a_noop_task(fleet_spec, dri
     assert "crashloop-workload" in verdict.reps[0].reason
     assert "restartCount any_ge 1: observed 0" in verdict.reps[0].reason
     assert "not in its designed state" in verdict.reps[0].reason
+    # The dashboard keys on this literal to keep a skipped repetition out of
+    # its quota-storm counts (scripts/eval_dashboard/classify.py, health.py);
+    # it must lead the reason, ahead of the collector's 300-character cap.
+    assert verdict.reps[0].reason.startswith("KUBE_AGENTS_FIXTURE_DRIFT: ")
 
 
 def test_a_drifted_fixture_outranks_a_record_that_somehow_exists(fleet_spec, drifted_fleet, make_run):

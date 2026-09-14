@@ -134,7 +134,12 @@ the same layout and is collected from the moment it starts running.
     - `result` maps the grading verdict token: `pass` → `pass`; `infra` →
       `infra`, as is any **non-pass** rep whose line carries the literal
       `KUBE_AGENTS_INFRA_FAILURE` marker; anything else (`fail`, `blocked`,
-      tokens this collector has never seen) → `fail`.
+      tokens this collector has never seen) → `fail`. An `infra` rep whose
+      `reason` begins with `KUBE_AGENTS_FIXTURE_DRIFT` is a case
+      `hack/ci-eval-pr.sh` never launched because a seeded fixture it names
+      was not in its designed state at lease time (section 2d, #1544): it is
+      `infra` on every page and in every pass-rate denominator, and
+      `classify.py` / `health.py` keep it out of their storm counts.
     - `reason` — the free text after the first space-padded `--` separator
       (later separators belong to the reason — fail reasons contain the
       delimiter themselves), with the trailing `[OutcomeScore=…]` metrics

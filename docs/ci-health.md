@@ -67,7 +67,9 @@ the runs of the last 2 hours, #1478; 8+ is announced as a build-cluster event,
 and the cluster owner's issue below is filed on any new `lost_pods`
 condition), a quota storm (15+
 repetitions lost to 429s or empty records across 3+ pull requests among the
-runs that finished in the last 2 hours, #1225 / #1214), or setup deaths (3+ runs
+runs that finished in the last 2 hours, #1225 / #1214; a repetition the presubmit
+skipped for seeded-fixture drift, its reason led by `KUBE_AGENTS_FIXTURE_DRIFT`,
+is infra but never a storm repetition), or setup deaths (3+ runs
 that concluded `FAILURE` under 5 minutes with no tasks, on 2+ pull requests, in
 2 hours, #1172; an aborted zero-task run is a superseded push). A zero-task run
 is either a lost pod or a setup death, never both: a lost pod is never a setup

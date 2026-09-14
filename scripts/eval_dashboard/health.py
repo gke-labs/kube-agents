@@ -88,6 +88,10 @@ REP_RESULT_INFRA = "infra"
 REP_PASS = "pass"
 REP_FAIL = "fail"
 REP_STORM = "storm"
+# A fourth kind, sorted out of the other three: a repetition the presubmit
+# never launched because a seeded fixture the case names was out of its
+# designed state (#1544). Neither graded nor lost to the quota.
+REP_DRIFT = "drift"
 
 # How old data.json may be before health.json is flagged stale. The
 # collector writes `stale_after_s` when it knows its own cadence
@@ -140,6 +144,16 @@ SHARED_BREAK_MIN_RED_SHARE = 0.5
 # graded `fail`, so the reason text is the only signal that survives in
 # older runs. render.py's INFRA_REASON_KEYWORDS is the dashboard's version
 # of the same list; the two are kept in step by hand.
+#
+# Not a storm repetition: one the presubmit skipped because a seeded fixture
+# the case names was not in its designed state at lease time (#1544).
+# bench/kube_agents_bench/scoring.py grades it `infra` with
+# FIXTURE_DRIFT_MARKER first in the reason (duplicated here; classify.py's
+# test reads the scorer's source to keep them in step). Nothing was lost to
+# the quota, so it counts toward neither this rule nor a run's storm
+# signature; it is not graded either, so it cannot collapse a case for rule
+# 1. A fleet-wide drift therefore reads as skipped cases on the pages, not as
+# an OUTAGE -- a `fixture_drift` condition is the follow-up on #1550.
 STORM_WINDOW = timedelta(hours=2)
 STORM_MIN_REPS = 15
 STORM_MIN_PRS = 3
@@ -155,6 +169,7 @@ STORM_REASON_RE = re.compile(
     r"|rate.?limit",
     re.IGNORECASE,
 )
+FIXTURE_DRIFT_MARKER = "KUBE_AGENTS_FIXTURE_DRIFT"
 # "Retest after" is the end of the storm window plus this: a run started the
 # minute the last storm-hit run finished still overlaps its tail.
 STORM_COOLDOWN = timedelta(minutes=30)
@@ -327,15 +342,19 @@ def reader_clock(value: datetime | None) -> str:
 
 
 def rep_kind(rep: dict) -> str:
-    """pass | fail | storm for one repetition.
+    """pass | fail | storm | drift for one repetition.
 
     `storm` is what the harness could not grade: an `infra` verdict, or a
     `fail` whose reason is one of the never-ran phrasings (graded `fail`
     before #1184, classified `infra` after it -- the text is the same).
+    `drift` is an `infra` verdict the presubmit wrote for a case it skipped
+    because its seeded fixture was out of shape (FIXTURE_DRIFT_MARKER).
     """
     result = rep.get("result")
     if result == REP_RESULT_PASS:
         return REP_PASS
+    if FIXTURE_DRIFT_MARKER in (rep.get("reason") or ""):
+        return REP_DRIFT
     if result == REP_RESULT_INFRA:
         return REP_STORM
     if STORM_REASON_RE.search(rep.get("reason") or ""):
@@ -344,11 +363,11 @@ def rep_kind(rep: dict) -> str:
 
 
 class Task:
-    __slots__ = ("fails", "name", "passes", "storms")
+    __slots__ = ("drifts", "fails", "name", "passes", "storms")
 
     def __init__(self, task: dict):
         self.name = task.get("name") or ""
-        self.passes = self.fails = self.storms = 0
+        self.passes = self.fails = self.storms = self.drifts = 0
         reps = task.get("reps")
         if reps is None:
             # No per-rep detail (SCHEMA.md: absence means unknown); the
@@ -360,6 +379,8 @@ class Task:
                 self.passes += 1
             elif kind == REP_STORM:
                 self.storms += 1
+            elif kind == REP_DRIFT:
+                self.drifts += 1
             else:
                 self.fails += 1
 
@@ -409,8 +430,14 @@ class Run:
         return sum(task.storms for task in self.tasks)
 
     @property
+    def drift_reps(self) -> int:
+        """Repetitions skipped for seeded-fixture drift (#1544): infra for
+        the metrics, never a storm."""
+        return sum(task.drifts for task in self.tasks)
+
+    @property
     def total_reps(self) -> int:
-        return sum(task.passes + task.fails + task.storms for task in self.tasks)
+        return sum(task.passes + task.fails + task.storms + task.drifts for task in self.tasks)
 
     @property
     def lost_pod(self) -> bool:
@@ -718,6 +745,9 @@ def metrics(runs, now: datetime, fixtures: dict | None, roster: Roster) -> dict:
     walls = [run.wall_clock.total_seconds() for run in concluded if run.wall_clock]
     reps = sum(run.total_reps for run in full)
     storm_reps = sum(run.storm_reps for run in full)
+    # The infra-rep metric counts every ungraded repetition, fixture-drift
+    # skips included; the storm rule above counts only the storm ones.
+    infra_reps = storm_reps + sum(run.drift_reps for run in full)
     reds = len(concluded) - len(green)
     own = pr_caused_reds(full, roster)
     deaths = sum(1 for run in window if run.setup_death)
@@ -737,8 +767,8 @@ def metrics(runs, now: datetime, fixtures: dict | None, roster: Roster) -> dict:
         "aborted_runs": sum(1 for run in window if run.result not in (RUN_SUCCESS, RUN_FAILURE)),
         "setup_deaths": deaths,
         "lost_pods": lost,
-        "infra_rep_rate": round(storm_reps / reps, 3) if reps else None,
-        "infra_reps": storm_reps,
+        "infra_rep_rate": round(infra_reps / reps, 3) if reps else None,
+        "infra_reps": infra_reps,
     }
     for pct in WALL_CLOCK_PERCENTILES:
         value = percentile(walls, pct)

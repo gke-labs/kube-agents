@@ -37,7 +37,10 @@ Per failed admitted case, in priority order:
   [start - SHARED_WINDOW_BEFORE, finish], or the health verdict names it.
   The 2026-09-07/08 crashloop outage (#1269, #1278) is the shape.
 * ``storm`` -- the run lost at least STORM_RUN_SIGNATURE_REPS repetitions
-  to 429s or empty records, or the verdict says storm (#1225, #1214).
+  to 429s or empty records, or the verdict says storm (#1225, #1214). A
+  repetition the presubmit skipped for seeded-fixture drift (reason led by
+  FIXTURE_DRIFT_MARKER, #1544) is ``infra`` on every count but never a
+  storm repetition.
 * ``only-this-pr`` -- the case passed on the last ONLY_PR_MIN_OTHER_RUNS
   runs of other pull requests inside ONLY_PR_WINDOW and failed here.
 * ``None`` -- nothing above fits; the page says it cannot tell.
@@ -108,6 +111,16 @@ STORM_REASON_RE = re.compile(
     r"|rate.?limit",
     re.IGNORECASE,
 )
+# A repetition hack/ci-eval-pr.sh never launched because a seeded fixture the
+# case names was not in its designed state at lease time (#1544).
+# bench/kube_agents_bench/scoring.py grades it `infra` with this literal first
+# in the reason (FIXTURE_DRIFT_MARKER there; duplicated here, this module is
+# stdlib-only, and test_eval_dashboard_classify.py reads the scorer's source
+# to keep the two in step). It is infra on every page and in every pass-rate
+# denominator, but NOT a storm repetition: nothing was lost to the quota, and
+# the fix is the fleet owner's apply, not a retest.
+FIXTURE_DRIFT_MARKER = "KUBE_AGENTS_FIXTURE_DRIFT"
+KIND_DRIFT = "drift"
 
 # --- Setup death (#1172, #1176) -----------------------------------------------
 # Zero tasks, concluded FAILURE, and over inside this long: the run died at
@@ -178,6 +191,7 @@ DO_ONLY_THIS_PR = "Fix the PR. Read the transcript first; it usually names the p
 DO_SETUP = "Retest. If it dies the same way again, the leased project is the suspect, not your change."
 DO_LOST_POD = "Retest once new jobs are progressing; the build node died under this run, not your change."
 DO_UNCLEAR = "Read the transcript. Nothing else on the gate matches this failure yet, so it may be yours."
+DO_DRIFT = "Nothing. A seeded fixture this case depends on was not in its designed state when the run leased its project, so the case was skipped; the build log's fixture-state warning names the assertion. The fleet's, not your change."
 DO_HELD_OUT = "Nothing for the gate; this case is held out and does not block."
 DO_PASSED = ""
 
@@ -218,12 +232,15 @@ def task_reps(task: dict) -> list[dict]:
 
 
 def rep_kind(rep: dict) -> str:
-    """'pass' | 'fail' | 'storm' -- the adjudicator's three kinds. A storm rep is
-    one the harness could not grade: an infra verdict, or a fail whose
-    reason is a never-ran phrasing."""
+    """'pass' | 'fail' | 'storm' | 'drift'. A storm rep is one the harness
+    could not grade: an infra verdict, or a fail whose reason is a never-ran
+    phrasing. A drift rep is one it never ran because the case's seeded
+    fixture was out of shape (FIXTURE_DRIFT_MARKER): infra, but no storm."""
     result = str(rep.get("result") or "").lower()
     if result == "pass":
         return "pass"
+    if FIXTURE_DRIFT_MARKER in (rep.get("reason") or ""):
+        return KIND_DRIFT
     if result == "infra":
         return "storm"
     if STORM_REASON_RE.search(rep.get("reason") or ""):
@@ -232,10 +249,18 @@ def rep_kind(rep: dict) -> str:
 
 
 def rep_counts(task: dict) -> dict:
-    counts = {"pass": 0, "fail": 0, "infra": 0}
+    """pass / fail / infra, plus `storm`: the subset of `infra` that were
+    storm repetitions (a fixture-drift skip is in `infra` and not in it)."""
+    counts = {"pass": 0, "fail": 0, "infra": 0, "storm": 0}
     for rep in task_reps(task):
         kind = rep_kind(rep)
-        counts["infra" if kind == "storm" else kind] += 1
+        if kind == "storm":
+            counts["infra"] += 1
+            counts["storm"] += 1
+        elif kind == KIND_DRIFT:
+            counts["infra"] += 1
+        else:
+            counts[kind] += 1
     return counts
 
 
@@ -272,7 +297,7 @@ def _run_facts(run: dict) -> dict:
         name = str(task.get("name"))
         counts_by_case[name] = counts
         outcomes[name] = outcome_of(counts)
-        storm += counts["infra"]
+        storm += counts["storm"]
     started = parse_iso(run.get("started"))
     facts = {
         "outcomes": outcomes,
@@ -554,7 +579,11 @@ def classify_case(task: dict, run: dict, others: list[dict], admitted: frozenset
         if not is_admitted:
             do = DO_HELD_OUT
     elif outcome == OUTCOME_INFRA:
-        if run_storm or condition == CONDITION_STORM:
+        if not counts["storm"]:
+            # Every ungraded repetition was a fixture-drift skip (#1544): the
+            # run never launched the case, and no storm is implied.
+            do = DO_DRIFT
+        elif run_storm or condition == CONDITION_STORM:
             cls = CLS_STORM
             do = DO_STORM
     return {
