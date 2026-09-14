@@ -148,6 +148,18 @@ class PdbGradingTest(unittest.TestCase):
         self.assertEqual(result["orphan"], 1)
         self.assertEqual(result["evaluated"], 0)
 
+    def test_expected_pods_above_the_matched_total_sets_the_total(self):
+        # A bare ReplicaSet shares the Deployment's labels: the controller expects 5 pods,
+        # so minAvailable 4 leaves one disruption and blocks nothing; 5 blocks.
+        dep = workload("Deployment", "d", 3, {"app": "x"})
+        sel = {"matchLabels": {"app": "x"}}
+        self.assertEqual(self._grade(dep, pdb("p", {"minAvailable": 4, "selector": sel}, expected=5, allowed=1))["blocking"], [])
+        finding = self._grade(dep, pdb("p", {"minAvailable": 5, "selector": sel}, expected=5, allowed=0))["blocking"][0]
+        self.assertEqual(finding["field"], "minAvailable: 5 (>= 5 expected pods)")
+        self.assertEqual(finding["expected_pods"], 5)
+        # A stale status below the spec total does not shrink it.
+        self.assertEqual(self._grade(dep, pdb("p", {"minAvailable": 3, "selector": sel}, expected=1, allowed=0))["blocking"][0]["field"], "minAvailable: 3 (>= 3 expected pods)")
+
     def test_pdb_covering_pods_of_an_unread_kind_is_unmatched_not_orphan(self):
         result = self._grade(pdb("rs", {"maxUnavailable": 0, "selector": {"matchLabels": {"app": "bare"}}}, expected=2, allowed=0))
         self.assertEqual(result["unmatched"], 1)
@@ -278,8 +290,12 @@ class WindowTest(unittest.TestCase):
 
     def test_weekly_without_byday_uses_the_start_weekday(self):
         window = {"recurringWindow": {"recurrence": "FREQ=WEEKLY", "window": {"startTime": "2026-01-05T04:00:00Z", "endTime": "2026-01-05T08:00:00Z"}}}  # a Monday
-        result = r.evaluate_window(window, AT.replace(hour=6))
-        self.assertEqual(result["state"], "open")
+        monday = r.evaluate_window(window, AT.replace(hour=6))
+        self.assertEqual(monday["state"], "open")
+        self.assertEqual(monday["detail"], "MO from 04:00Z for 4h")
+        tuesday = r.evaluate_window(window, AT.replace(day=15, hour=6))
+        self.assertEqual(tuesday["state"], "closed")
+        self.assertEqual(tuesday["next_opening"], "2026-09-21T04:00Z")
 
     def test_recurring_daily_with_long_window(self):
         window = {"recurringWindow": {"recurrence": "FREQ=DAILY", "window": {"startTime": "2026-01-01T20:00:00Z", "endTime": "2026-01-02T06:00:00Z"}}}
@@ -292,6 +308,11 @@ class WindowTest(unittest.TestCase):
         result = r.evaluate_window(window, AT)
         self.assertEqual(result["state"], "closed")
         self.assertEqual(result["next_opening"], "2026-09-16T04:00Z")
+        # A first occurrence beyond the one-week horizon is still the next opening.
+        far = {"recurringWindow": {"recurrence": "FREQ=DAILY", "window": {"startTime": "2026-10-01T04:00:00Z", "endTime": "2026-10-01T08:00:00Z"}}}
+        result = r.evaluate_window(far, AT)
+        self.assertEqual(result["state"], "closed")
+        self.assertEqual(result["next_opening"], "2026-10-01T04:00Z")
 
     def test_unsupported_recurrences_are_not_evaluated(self):
         for rule in ("FREQ=MONTHLY;BYMONTHDAY=1", "FREQ=WEEKLY;INTERVAL=2;BYDAY=SA", "FREQ=WEEKLY;BYDAY=1SA", "FREQ=DAILY;BYDAY=SA", "nonsense", ""):
@@ -313,8 +334,10 @@ class WindowTest(unittest.TestCase):
     def test_rfc3339_parsing(self):
         self.assertEqual(r.parse_rfc3339("2026-12-11T14:35:00Z"), datetime(2026, 12, 11, 14, 35, tzinfo=timezone.utc))
         self.assertEqual(r.parse_rfc3339("2026-12-11T15:35:00+01:00"), datetime(2026, 12, 11, 14, 35, tzinfo=timezone.utc))
-        self.assertEqual(r.parse_rfc3339("2026-12-11T14:35:00").tzinfo, timezone.utc)
-        for bad in ("2026-13-01T00:00:00Z", "tomorrow", "", None):
+        self.assertEqual(r.parse_rfc3339("2026-12-11t14:35:00.250z"), datetime(2026, 12, 11, 14, 35, 0, 250000, tzinfo=timezone.utc))
+        # RFC 3339 proper: a bare date, the basic form and a naive time are refused, not
+        # read as midnight or as UTC.
+        for bad in ("2026-13-01T00:00:00Z", "2026-09-14", "20260914T150000Z", "2026-09-14T15:00:00", "2026-09-14 15:00:00Z", "tomorrow", "", None):
             self.assertIsNone(r.parse_rfc3339(bad), bad)
 
 

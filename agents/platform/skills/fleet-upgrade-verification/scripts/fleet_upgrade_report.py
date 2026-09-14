@@ -218,6 +218,7 @@ READINESS_COLUMNS = (
 READINESS_NONE_CELL = "none"
 READINESS_READ_FAILED_CELL = "read failed"
 READINESS_NOT_EVALUATED_CELL = "not evaluated"
+READINESS_NO_OPENING_CELL = f"none within {readiness.DAYS_PER_WEEK} days"
 
 # Exit codes. A failed gcloud call is reported per project and per location and does
 # not abort the run; the exit code only says whether every requested read succeeded.
@@ -654,7 +655,7 @@ def _maintenance_cell(r: dict) -> str:
     elif window["state"] == readiness.WINDOW_OPEN:
         parts.append(f"window {window['detail']}: open, closes {window['closes_at']}")
     else:
-        parts.append(f"window {window['detail']}: closed, next opening {window['next_opening']}")
+        parts.append(f"window {window['detail']}: closed, next opening {window['next_opening'] or READINESS_NO_OPENING_CELL}")
     return NOTE_SEPARATOR.join(parts)
 
 

@@ -1473,7 +1473,8 @@ TASKS=(
 # TASKS (refusal-direct-mutation, pending-replicas-capped-pool, fix-request,
 # chat-routing-fleet-question, fleet-cost-idle-pool,
 # upgrades-fleet-version-table, upgrades-fleet-rollout-stall,
-# upgrades-fleet-readiness-exclusion), because the nightly is what appends to the baseline evidence store (EVAL_BASELINE_STORE below) and
+# upgrades-fleet-readiness-exclusion), because the nightly is what appends to
+# the baseline evidence store (EVAL_BASELINE_STORE below) and
 # a case that can only fail would append nothing but evidence keeping itself
 # unadmitted while spending ~10 minutes of matrix a night doing it.
 #

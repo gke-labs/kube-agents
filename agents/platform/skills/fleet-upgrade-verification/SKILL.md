@@ -136,22 +136,26 @@ members missing this run.
 `--readiness` adds a second table after the version table, one row per member, graded against
 the same target as the member's version row, and a `readiness` object per member in the JSON
 (`members[].readiness`, with a top-level `readiness` block holding the instant evaluated and a
-count per verdict). Without the flag nothing changes. Three rules, each the executed form of a
-governance SOP check:
+count per verdict). Without the flag nothing changes. Three rules, each derived from a governance
+SOP check and named beside it; the maintenance rule departs from its SOP where the two differ,
+and says so below:
 
 - **Drain-blocking PDBs** (`obtainability_audit_sop.md` §3.4). For each member the script runs
   `gcloud container clusters get-credentials` into a kubeconfig of its own under
-  `$HERMES_HOME/.kubeconfigs/` (`kubeconfig_<project>_<cluster>_<location>.yaml`, one file per
+  `${HERMES_HOME:-/opt/data}/.kubeconfigs/` (`kubeconfig_<project>_<cluster>_<location>.yaml`, one file per
   target so concurrent reads never share a current-context; `--kubeconfig-dir` moves the
   directory), adding `--dns-endpoint` when the cluster record says its DNS endpoint accepts
   external traffic, then one `kubectl get pdb,deploy,statefulset -A -o json`. A PDB is matched to
   the Deployments and StatefulSets in its namespace whose pod-template labels satisfy its
   selector (`matchLabels` and `matchExpressions`), and it blocks every drain when
   `maxUnavailable` is `0` or `0%`, or when `minAvailable` demands every expected pod: an integer
-  at or above the matched workloads' replica total, or a percentage that rounds up to it the way
-  the disruption controller rounds (`100%` always; `90%` on nine replicas too). The cell names
-  the PDB as `namespace/name`, the offending field and the workloads with their replica counts;
-  the JSON adds `status.expectedPods` and `disruptionsAllowed` as corroboration. Skipped and
+  at or above the pods the controller expects, or a percentage that rounds up to them the way
+  the disruption controller rounds (`100%` always; `90%` on nine replicas too). The expected
+  count is the matched workloads' replica total, or the PDB's `status.expectedPods` when that is
+  larger, as it is when the selector also covers pods of a kind the read does not include. The
+  cell names the PDB as `namespace/name`, the offending field and the workloads with their
+  replica counts; each JSON finding carries `expected_pods` and `disruptions_allowed`, from the
+  PDB's `status.expectedPods` and `status.disruptionsAllowed`, as corroboration. Skipped and
   counted in the note rather than graded: a PDB whose matched workloads are scaled to zero, an
   orphan matching no workload and covering no pod, and a PDB that covers pods of a kind the read
   does not include (a bare ReplicaSet, a custom controller), which is noted so it is never
@@ -162,7 +166,11 @@ governance SOP check:
   the target needs: `NO_UPGRADES` (the default when the record carries no scope) always;
   `NO_MINOR_UPGRADES` when the target is a minor above the control plane or a pool;
   `NO_MINOR_OR_NODE_UPGRADES` when it is a minor above the control plane or any pool is below the
-  target. The cell says `blocks auto-upgrade`, because that is what an exclusion holds back: an
+  target. This grades the scope against the target, which the SOP's `blocking-exclusion` check
+  does not: that check never flags `NO_MINOR_UPGRADES` and adds a 30-day threshold, so the two
+  disagree on a cluster whose `NO_MINOR_UPGRADES` exclusion holds exactly the minor upgrade its
+  target needs, and this table is the one that reads it as a blocker. The cell says
+  `blocks auto-upgrade`, because that is what an exclusion holds back: an
   operator running `gcloud container clusters upgrade` by hand is not subject to it. An exclusion
   in effect whose scope does not cover the upgrade (a patch-only target under
   `NO_MINOR_UPGRADES`) is reported and not a blocker. The maintenance window is reported as

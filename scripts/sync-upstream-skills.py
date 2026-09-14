@@ -234,10 +234,10 @@ table rather than reasoning from memory:
 
 Without `--target-version` it measures each cluster against its own release channel's default and
 prints that baseline per member. Run again during a rollout, it says which members started,
-completed or stalled since the previous run. It reads with `gcloud container` only and changes
-nothing in GCP; the only thing it writes is its own record of each run under
-`/opt/data/state/fleet-upgrade-verification/`. The plan, runbook and checklist for the members it
-flags are this skill's job.
+completed or stalled since the previous run. Without `--readiness` (below) it reads with
+`gcloud container` only and changes nothing in GCP; the only thing it then writes is its own
+record of each run under `/opt/data/state/fleet-upgrade-verification/`. The plan, runbook and
+checklist for the members it flags are this skill's job.
 
 The same script's `--readiness` flag executes three items of this skill's pre-upgrade checklist
 per member, against the same target: PodDisruptionBudgets that would block a node drain
@@ -246,7 +246,8 @@ the maintenance window at a given instant (`--at`, default now), and node-pool v
 against the target control plane. Run it before writing the plan and carry its `blocked` rows into
 the checklist rather than asking the operator to check those three by hand. The PDB read costs one
 `get-credentials` and one `kubectl get` per member and leaves a per-member kubeconfig under
-`$HERMES_HOME/.kubeconfigs/`; an exclusion is reported as holding back automatic upgrades only.
+`${{HERMES_HOME:-/opt/data}}/.kubeconfigs/`; an exclusion is reported as holding back automatic
+upgrades only.
 """,
 }
 

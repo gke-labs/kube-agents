@@ -106,6 +106,10 @@ SECONDS_PER_HOUR = 3600
 # weekly rule, plus the window's own length for a window that started before the range.
 OCCURRENCE_HORIZON = timedelta(days=DAYS_PER_WEEK)
 WINDOW_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%MZ"
+# RFC 3339 proper: date, `T`, time, and an offset or `Z`. `datetime.fromisoformat` alone
+# also takes a bare date, the basic form and a naive time, and a bare `--at 2026-09-14`
+# read as midnight would move an exclusion or window verdict by up to a day unnoticed.
+RFC3339_RE = re.compile(r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})$")
 
 # Version skew, SOP §3.2: GKE keeps nodes within two minors of the control plane, so a
 # pool more than two behind the target (or on another major) blocks the control-plane
@@ -275,7 +279,10 @@ def grade_pdbs(pdbs: list[dict], workloads: list[dict]) -> dict:
             result["scaled_to_zero"] += 1
             continue
         result["evaluated"] += 1
-        field = blocking_field(spec, total)
+        # The controller counts every pod the selector covers, including pods of a kind
+        # not read here (a bare ReplicaSet beside the Deployment); when its count is the
+        # larger, that is the total minAvailable is measured against.
+        field = blocking_field(spec, max(total, expected_pods or 0))
         if field is None:
             continue
         result["blocking"].append(
@@ -303,14 +310,12 @@ def describe_finding(finding: dict) -> str:
 
 def parse_rfc3339(text) -> datetime | None:
     """An RFC 3339 timestamp as an aware UTC datetime; None when it does not parse."""
-    if not isinstance(text, str) or not text.strip():
+    if not isinstance(text, str) or not RFC3339_RE.match(text.strip()):
         return None
     try:
-        parsed = datetime.fromisoformat(text.strip())
+        parsed = datetime.fromisoformat(text.strip().upper())
     except ValueError:
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
 
 
@@ -447,13 +452,20 @@ def _occurrences(first_start: datetime, bydays: list[str], at: datetime, duratio
     return starts
 
 
-def _window_state(starts: list[datetime], duration: timedelta, at: datetime) -> dict:
+def _window_state(starts: list[datetime], duration: timedelta, at: datetime, first_start: datetime) -> dict:
+    """Open or closed at `at`, when it closes, and the next start after `at`.
+
+    The starts cover one week either side of `at`; a window whose first occurrence is
+    further out than that has that occurrence as its next opening.
+    """
     open_until = None
     for start in starts:
         if start <= at < start + duration:
             open_until = start + duration
             break
     next_opening = min((s for s in starts if s > at), default=None)
+    if next_opening is None and first_start > at:
+        next_opening = first_start
     return {
         "state": WINDOW_OPEN if open_until else WINDOW_CLOSED,
         "closes_at": format_instant(open_until),
@@ -481,7 +493,7 @@ def evaluate_window(window: dict, at: datetime) -> dict:
             return result
         duration = parse_iso_duration(daily.get("duration")) or timedelta(hours=DAILY_WINDOW_HOURS)
         first = datetime.combine(at.date() - OCCURRENCE_HORIZON, time(start_time.hour, start_time.minute, tzinfo=timezone.utc))
-        result.update(_window_state(_occurrences(first, [], at, duration), duration, at))
+        result.update(_window_state(_occurrences(first, [], at, duration), duration, at, first))
         result["detail"] = f"daily at {start_time.strftime(DAILY_START_FORMAT)}Z for {int(duration.total_seconds() // SECONDS_PER_HOUR)}h"
         return result
     if isinstance(recurring, dict):
@@ -496,8 +508,10 @@ def evaluate_window(window: dict, at: datetime) -> dict:
             result["detail"] = f"recurrence {recurring.get('recurrence')!r} not evaluated; only FREQ=DAILY and FREQ=WEEKLY[;BYDAY=...] are"
             return result
         duration = end - start
-        result.update(_window_state(_occurrences(start, rule["bydays"], at, duration), duration, at))
-        days = LIST_SEPARATOR.join(rule["bydays"]) if rule["bydays"] else RRULE_DAILY.lower()
+        # RFC 5545: a WEEKLY rule with no BYDAY recurs on DTSTART's weekday, not every day.
+        bydays = rule["bydays"] or ([WEEKDAYS[start.weekday()]] if rule["freq"] == RRULE_WEEKLY else [])
+        result.update(_window_state(_occurrences(start, bydays, at, duration), duration, at, start))
+        days = LIST_SEPARATOR.join(bydays) if bydays else RRULE_DAILY.lower()
         result["detail"] = f"{days} from {start.strftime(DAILY_START_FORMAT)}Z for {int(duration.total_seconds() // SECONDS_PER_HOUR)}h"
         return result
     result["detail"] = "no maintenance window; automatic upgrades may start at any hour"
