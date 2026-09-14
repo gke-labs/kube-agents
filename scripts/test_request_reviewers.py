@@ -37,6 +37,7 @@ CONFIG = {
         "groups": {
             "repository-owners": ["bradhoekstra", "jayantid", "toshiowang", "dshnayder"],
             "waw-leads": ["fatoshoti", "mateuszklinowski", "mplakhtiy"],
+            "eval-crew": ["jayantid"],
         },
     },
     "files": {
@@ -44,6 +45,8 @@ CONFIG = {
         "k8s-operator/**": ["waw-leads"],
         ".github/workflows/k8s-operator-test.yml": ["waw-leads"],
         ".github/workflows/staging-deploy.yml": ["waw-leads"],
+        "bench/tasks/**": ["eval-crew"],
+        "hack/ci-eval-pr.sh": ["eval-crew"],
     },
     "options": {
         "ignore_draft": True,
@@ -56,6 +59,8 @@ CONFIG = {
 
 OWNERS = CONFIG["reviewers"]["groups"]["repository-owners"]
 WAW = CONFIG["reviewers"]["groups"]["waw-leads"]
+EVAL_CREW = CONFIG["reviewers"]["groups"]["eval-crew"]
+LIVE_CONFIG = _HERE.parent / rr.DEFAULT_CONFIG_PATH
 
 
 def pull_request(**overrides):
@@ -167,6 +172,11 @@ class ConfigValidationTest(unittest.TestCase):
     def test_the_live_config_is_accepted(self):
         rr.validate_config(CONFIG)
 
+    def test_the_fixture_is_the_live_config(self):
+        # The docstring above promises the fixture mirrors the file, order
+        # included. Nothing else would notice the two drifting apart.
+        self.assertEqual(rr.load_config(LIVE_CONFIG), CONFIG)
+
     def test_per_author_is_refused(self):
         config = {"reviewers": {"per_author": {"alice": ["bob"]}}}
         with self.assertRaises(ValueError) as caught:
@@ -210,6 +220,35 @@ class SelectionTest(unittest.TestCase):
         # and the defaults carry it.
         self.assertEqual(rr.reviewers_by_changed_files(CONFIG, [".github/workflows/validate.yml"], "author"), [])
         self.assertEqual(self.select([".github/workflows/validate.yml"])[0] in OWNERS, True)
+
+    def test_an_eval_case_change_goes_to_eval_crew(self):
+        # Only eval-crew can /approve under bench/tasks/ (bench/tasks/OWNERS,
+        # no_parent_owners), so a random root owner would review a pull request
+        # they cannot clear, and nothing would tell eval-crew it exists.
+        matched = rr.reviewers_by_changed_files(CONFIG, ["bench/tasks/new-case/task.yaml"], "author")
+        self.assertEqual(matched, EVAL_CREW)
+        self.assertEqual(self.select(["bench/tasks/new-case/task.yaml"]), EVAL_CREW)
+
+    def test_a_roster_change_goes_to_eval_crew_but_the_rest_of_hack_does_not(self):
+        # hack/OWNERS scopes ci-eval-pr.sh alone; its neighbours stay with root.
+        self.assertEqual(rr.reviewers_by_changed_files(CONFIG, ["hack/ci-eval-pr.sh"], "author"), EVAL_CREW)
+        self.assertEqual(rr.reviewers_by_changed_files(CONFIG, ["hack/ci-deploy.sh"], "author"), OWNERS)
+
+    def test_a_mixed_change_still_goes_to_eval_crew(self):
+        # Last match wins, and eval-crew is listed last: the one reviewer who
+        # can clear the case half is asked, and being a root owner too, the rest.
+        matched = rr.reviewers_by_changed_files(CONFIG, ["README.md", "bench/tasks/x/task.yaml"], "author")
+        self.assertEqual(matched, EVAL_CREW)
+
+    def test_eval_crews_own_case_change_falls_back_to_a_root_owner(self):
+        # The author is never requested, so with one member the glob yields
+        # nobody and the defaults carry it -- to a root owner, whose review sets
+        # lgtm; the author's approved is already on it (#1075).
+        author = EVAL_CREW[0]
+        self.assertEqual(rr.reviewers_by_changed_files(CONFIG, ["bench/tasks/x/task.yaml"], author), [])
+        picked = self.select(["bench/tasks/x/task.yaml"], author=author)
+        self.assertEqual(len(picked), 1)
+        self.assertIn(picked[0], [name for name in OWNERS if name != author])
 
     def test_the_author_is_never_requested(self):
         matched = rr.reviewers_by_changed_files(CONFIG, ["README.md"], "bradhoekstra")
