@@ -6,8 +6,7 @@ AGENTS.md ("Pull Request Hygiene") states two rules for `.github/workflows/` and
   - a third-party `uses:` names a 40-character commit SHA with the version in a
     trailing comment (`uses: actions/checkout@3d3c42e... # v7.0.1`), because a
     mutable tag lets a retagged release change what CI runs. Local reusable
-    workflows (`./.github/workflows/...`) are exempt; a `docker://` image is
-    pinned by digest instead.
+    workflows (`./.github/workflows/...`) are exempt.
   - a workflow that starts on its own (`push`, `schedule`, `workflow_run`, ...)
     and needs this repository's credentials carries
     `if: github.repository == 'gke-labs/kube-agents'` on every job, because a
@@ -16,20 +15,44 @@ AGENTS.md ("Pull Request Hygiene") states two rules for `.github/workflows/` and
     workflow needs no guard, and `docs-deploy.yml` is unguarded on purpose so a
     fork can publish its own Pages site.
 
-`actionlint.yml` checks syntax, not either rule, so before this file a dropped
-guard or an `@v4` merged silently. The checker below is a set of pure functions
-over a directory; `FixtureTests` exercises them against workflows written to a
-temporary directory, so the checker is itself tested, and `RealTreeTests` points
-them at the checkout. The real-tree test also asserts a floor on how many
-workflows and third-party `uses:` it examined, so an empty walk cannot pass.
+What already checks part of this: `tests/conformance/test_C_enforcement.py`
+(C4) asserts every third-party `uses:` ends in a 40-hex SHA, and
+`tests/conformance/test_B_write_path.py` (B4) asserts `github.repository ==` in
+the `if:` of every `workflow_run` job. `actionlint.yml` checks syntax only. This
+file adds what neither covers: the version comment beside the SHA, a digest on a
+`docker://` ref, the fork guard on every job of every auto-triggered credentialed
+workflow whatever its trigger, and a currency check on the allowlist of
+workflows unguarded by design.
 
-"Credentialed" is read from three signals: a `${{ ... }}` expression that names
-`secrets.<NAME>` for a NAME other than `GITHUB_TOKEN`; `id-token: write` (or
-`write-all`, which grants it) in the workflow's or a job's `permissions:`; or a
-job passing `secrets: inherit` to a reusable workflow. Actions has no other route
-for a repository credential to reach a job. The secret match runs inside the
-expression braces only, so a filename such as `bad-pull-secrets.yaml` in a `run:`
-block does not count.
+The `docker://` rule is this file's reading of "pin to an immutable reference",
+not a clause of the rule file: an image has no commit SHA, and `@sha256:<digest>`
+is its immutable form. No workflow uses one today.
+
+The checker below is a set of pure functions over a directory; `FixtureTests`
+exercises them against workflows written to a temporary directory, so the checker
+is itself tested, and `RealTreeTests` points them at the checkout. The real-tree
+test also asserts a floor on how many workflows and third-party `uses:` it
+examined, so an empty or partial walk cannot pass.
+
+"Credentialed" is read from the parsed document, never from comments, through
+these signals:
+
+  - a `${{ ... }}` expression naming `secrets.<NAME>` for a NAME other than
+    `GITHUB_TOKEN` (compared case-insensitively, as Actions does), or naming the
+    `vars.` context, which a fork's repository and environments do not carry;
+  - `permissions:` at workflow or job level granting `id-token: write`
+    (a cloud credential), `actions: write` (dispatching another workflow, which
+    is how a scheduler starts a credentialed `workflow_dispatch`-only pipeline
+    that the rule exempts from its own guard), or `write-all`;
+  - a job bound to an `environment:`, which exists to hold secrets, variables
+    and protection rules a fork does not have;
+  - a job passing `secrets: inherit` to a reusable workflow.
+
+A workflow that acts with `GITHUB_TOKEN` alone is not credentialed by this
+definition even where it carries the guard by convention (the notifiers and
+commenters do, so a fork does not open issues on itself); the rule's own
+statement is "needs this repository's secrets", and widening scope past
+credentials is a policy change this file does not make.
 
 Run:
   python3 -m unittest discover -s tests -p 'test_workflow_pins_and_fork_guards.py' -v
@@ -53,9 +76,13 @@ WORKFLOW_GLOBS = ("*.yml", "*.yaml")
 _REPO = "gke-labs/kube-agents"
 _GUARD = f"github.repository == '{_REPO}'"
 
-# Triggers that start a workflow without anyone asking for it, so a fork sync
-# fires them too. `pull_request` is deliberately absent: the rule in
-# `.agents/rules/github_actions.md` does not list it.
+# Triggers that fire without a deliberate dispatch and run with the
+# repository's own secrets. `.agents/rules/github_actions.md` names push, a tag,
+# schedule, status and workflow_run; `pull_request_target` and `release` share
+# the property (the base repository's secrets, no operator starting them) and
+# so fall under the rule's reasoning. `pull_request` is deliberately absent: a
+# fork's pull requests to itself run with the fork's own, empty, secrets, so a
+# guard there changes nothing, and the rule does not list it.
 _AUTO_TRIGGERS = {"push", "schedule", "workflow_run", "pull_request_target", "release", "status"}
 # Triggers that only fire when a caller or a person deliberately starts the
 # workflow; a workflow reachable only through these needs no guard.
@@ -79,16 +106,24 @@ _DOCKER_DIGEST_MARKER = "@sha256:"
 # document supplies the structure and this regex supplies the annotation.
 _USES_LINE_RE = re.compile(r"""^\s*-?\s*uses:\s*(?P<quote>["']?)(?P<ref>[^\s"']+)(?P=quote)(?P<rest>.*)$""")
 
-# A `${{ ... }}` expression, and a secrets reference inside one.
+# A `${{ ... }}` expression, and the secrets and vars references inside one.
+# Both are matched against string values of the parsed document, so a comment
+# or a filename that merely contains the word does not count.
 _EXPRESSION_RE = re.compile(r"\$\{\{(?P<body>.*?)\}\}", re.DOTALL)
 _SECRET_REF_RE = re.compile(r"\bsecrets\.(?P<name>[A-Za-z_][A-Za-z0-9_]*)")
+_VARS_REF_RE = re.compile(r"\bvars\.[A-Za-z_]")
 # The token every workflow gets, fork or not; referencing it needs no guard.
+# Actions secret names are case-insensitive, so the comparison is upper-cased.
 _BUILTIN_SECRET = "GITHUB_TOKEN"
 
 _PERMISSIONS_KEY = "permissions"
-_ID_TOKEN_KEY = "id-token"
+# Permission scopes whose `write` marks a job as credentialed: an OIDC token is
+# a cloud credential, and `actions: write` lets the job dispatch a workflow that
+# holds one.
+_CREDENTIAL_SCOPES = ("id-token", "actions")
 _WRITE = "write"
 _WRITE_ALL = "write-all"
+_ENVIRONMENT_KEY = "environment"
 _SECRETS_KEY = "secrets"
 _SECRETS_INHERIT = "inherit"
 _JOBS_KEY = "jobs"
@@ -97,12 +132,13 @@ _USES_KEY = "uses"
 _IF_KEY = "if"
 _ON_KEY = "on"
 
-# Floors for the real-tree test: main carries 45 workflows and 145 third-party
-# `uses:` entries as this file lands. A floor rather than an exact count, so an
-# empty or partial walk fails without every workflow added or removed failing
-# the suite. Raise them when the tree grows well past them.
-_MIN_WORKFLOWS = 40
-_MIN_THIRD_PARTY_USES = 140
+# Floors for the real-tree test, so an empty or partial walk fails. Each sits
+# at roughly two thirds of what the tree carries as this file lands, so a
+# workflow removed in ordinary cleanup does not trip it while a walk that lost
+# a third of the directory does. Lower them, with the count in the commit, if
+# a deliberate removal ever reaches one; raise them as the tree grows.
+_MIN_WORKFLOWS = 30
+_MIN_THIRD_PARTY_USES = 100
 
 
 @dataclass
@@ -224,29 +260,48 @@ def check_pins(directory: Path) -> PinReport:
     return report
 
 
-def _grants_id_token(permissions: object) -> bool:
+def _grants_credential(permissions: object) -> bool:
     if isinstance(permissions, str):
         return permissions == _WRITE_ALL
     if isinstance(permissions, dict):
-        return permissions.get(_ID_TOKEN_KEY) == _WRITE
+        return any(permissions.get(scope) == _WRITE for scope in _CREDENTIAL_SCOPES)
     return False
 
 
-def _references_secret(text: str) -> bool:
-    for expression in _EXPRESSION_RE.finditer(text):
-        for secret in _SECRET_REF_RE.finditer(expression.group("body")):
-            if secret.group("name") != _BUILTIN_SECRET:
+def _strings(node: object):
+    """Every string value in the parsed document, depth first; comments are already gone."""
+    if isinstance(node, str):
+        yield node
+    elif isinstance(node, dict):
+        for value in node.values():
+            yield from _strings(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _strings(item)
+
+
+def _references_credential_context(doc: dict) -> bool:
+    """A `${{ }}` expression names a non-builtin secret or the vars context."""
+    for value in _strings(doc):
+        for expression in _EXPRESSION_RE.finditer(value):
+            body = expression.group("body")
+            if _VARS_REF_RE.search(body):
                 return True
+            for secret in _SECRET_REF_RE.finditer(body):
+                if secret.group("name").upper() != _BUILTIN_SECRET:
+                    return True
     return False
 
 
-def _is_credentialed(text: str, doc: dict) -> bool:
-    if _references_secret(text):
+def _is_credentialed(doc: dict) -> bool:
+    if _references_credential_context(doc):
         return True
-    if _grants_id_token(doc.get(_PERMISSIONS_KEY)):
+    if _grants_credential(doc.get(_PERMISSIONS_KEY)):
         return True
     for job in _jobs(doc).values():
-        if _grants_id_token(job.get(_PERMISSIONS_KEY)):
+        if _grants_credential(job.get(_PERMISSIONS_KEY)):
+            return True
+        if job.get(_ENVIRONMENT_KEY) is not None:
             return True
         if job.get(_SECRETS_KEY) == _SECRETS_INHERIT:
             return True
@@ -254,8 +309,9 @@ def _is_credentialed(text: str, doc: dict) -> bool:
 
 
 def _is_auto_triggered(doc: dict) -> bool:
-    triggers = _triggers(doc)
-    return bool(triggers & _AUTO_TRIGGERS) and not triggers <= _MANUAL_ONLY
+    # _AUTO_TRIGGERS and _MANUAL_ONLY are disjoint, so a workflow whose triggers
+    # are all manual has an empty intersection; no second clause is needed.
+    return bool(_triggers(doc) & _AUTO_TRIGGERS)
 
 
 def _unguarded_jobs(doc: dict) -> list[str]:
@@ -267,11 +323,11 @@ def check_guards(directory: Path) -> GuardReport:
     report = GuardReport()
     for path in _workflow_files(directory):
         report.workflows += 1
-        text, doc = _load(path)
+        _, doc = _load(path)
         if doc is None:
             report.violations.append(f"{path.name}: not a YAML mapping, cannot check guards")
             continue
-        if not (_is_auto_triggered(doc) and _is_credentialed(text, doc)):
+        if not (_is_auto_triggered(doc) and _is_credentialed(doc)):
             continue
         unguarded = _unguarded_jobs(doc)
         report.in_scope[path.name] = unguarded
@@ -480,6 +536,93 @@ jobs:
 """
 
 
+PUSH_WITH_SECRET_ONLY_IN_COMMENT_WORKFLOW = """
+name: push-comment
+on:
+  push:
+    branches: [main]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      # do not use ${{ secrets.FOO }} here; this job needs no credential
+      - run: echo checking
+"""
+
+PUSH_WITH_LOWERCASE_GITHUB_TOKEN_WORKFLOW = """
+name: push-lowercase-token
+on:
+  push:
+    branches: [main]
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - run: gh pr edit --add-label ready
+        env:
+          GH_TOKEN: ${{ secrets.github_token }}
+"""
+
+SCHEDULE_WITH_ENVIRONMENT_UNGUARDED_WORKFLOW = """
+name: schedule-environment
+on:
+  schedule:
+    - cron: "0 4 * * *"
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    environment: nightly
+    steps:
+      - run: echo resolving
+"""
+
+SCHEDULE_WITH_VARS_UNGUARDED_WORKFLOW = """
+name: schedule-vars
+on:
+  schedule:
+    - cron: "0 4 * * *"
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "$GH_ORG"
+        env:
+          GH_ORG: ${{ vars.GH_ORG }}
+"""
+
+SCHEDULE_WITH_ACTIONS_WRITE_UNGUARDED_WORKFLOW = """
+name: schedule-dispatch
+on:
+  schedule:
+    - cron: "0 4 * * *"
+permissions:
+  contents: read
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - run: gh workflow run pipeline.yml
+        env:
+          GH_TOKEN: ${{ github.token }}
+"""
+
+# One credentialed, unguarded job under a trigger filled in per test, so every
+# member of _AUTO_TRIGGERS is shown to put a workflow in scope and every member
+# of _MANUAL_ONLY to leave it out.
+TRIGGER_TEMPLATE_WORKFLOW = """
+name: trigger-{trigger}
+on:
+  {trigger}:
+jobs:
+  job:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{{{ secrets.DEPLOY_KEY }}}}"
+"""
+
+
 def _write_workflows(directory: Path, **workflows: str) -> None:
     for stem, body in workflows.items():
         (directory / f"{stem}.yml").write_text(textwrap.dedent(body).lstrip(), encoding="utf-8")
@@ -601,6 +744,45 @@ class FixtureTests(unittest.TestCase):
         report = check_guards(self.dir)
         self.assertEqual(report.violations, [])
         self.assertEqual(report.in_scope, {})
+
+    def test_secret_named_only_in_a_comment_is_not_a_credential(self) -> None:
+        _write_workflows(self.dir, comment=PUSH_WITH_SECRET_ONLY_IN_COMMENT_WORKFLOW)
+        report = check_guards(self.dir)
+        self.assertEqual(report.violations, [])
+        self.assertEqual(report.in_scope, {})
+
+    def test_builtin_token_is_matched_case_insensitively(self) -> None:
+        _write_workflows(self.dir, lower=PUSH_WITH_LOWERCASE_GITHUB_TOKEN_WORKFLOW)
+        report = check_guards(self.dir)
+        self.assertEqual(report.violations, [])
+        self.assertEqual(report.in_scope, {})
+
+    def test_environment_vars_and_actions_write_count_as_credentialed(self) -> None:
+        _write_workflows(
+            self.dir,
+            env=SCHEDULE_WITH_ENVIRONMENT_UNGUARDED_WORKFLOW,
+            vars=SCHEDULE_WITH_VARS_UNGUARDED_WORKFLOW,
+            dispatch=SCHEDULE_WITH_ACTIONS_WRITE_UNGUARDED_WORKFLOW,
+        )
+        report = check_guards(self.dir)
+        self.assertEqual(sorted(report.in_scope), ["dispatch.yml", "env.yml", "vars.yml"])
+        self.assertEqual(len(report.violations), 3, report.violations)
+
+    def test_every_auto_trigger_puts_a_workflow_in_scope(self) -> None:
+        for trigger in sorted(_AUTO_TRIGGERS):
+            with self.subTest(trigger=trigger):
+                _write_workflows(self.dir, wf=TRIGGER_TEMPLATE_WORKFLOW.format(trigger=trigger))
+                report = check_guards(self.dir)
+                self.assertEqual(report.in_scope, {"wf.yml": ["job"]})
+                self.assertEqual(len(report.violations), 1, report.violations)
+
+    def test_every_manual_only_trigger_leaves_a_workflow_out_of_scope(self) -> None:
+        for trigger in sorted(_MANUAL_ONLY):
+            with self.subTest(trigger=trigger):
+                _write_workflows(self.dir, wf=TRIGGER_TEMPLATE_WORKFLOW.format(trigger=trigger))
+                report = check_guards(self.dir)
+                self.assertEqual(report.in_scope, {})
+                self.assertEqual(report.violations, [])
 
     def test_guard_inside_a_compound_condition_counts(self) -> None:
         _write_workflows(self.dir, wr=WORKFLOW_RUN_WITH_SECRET_GUARDED)
