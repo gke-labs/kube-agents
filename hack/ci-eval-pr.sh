@@ -1489,13 +1489,14 @@ TASKS=(
 # serial. The periodic (ci-kube-agents-eval-nightly in oss-test-infra) runs
 # at 00:00 UTC -- 8 PM EDT, after the working day's presubmit herd -- with a
 # 480m deadline, EVAL_TASK_PARALLELISM=6 and EVAL_REPETITIONS at its default
-# 3 (#1491). The presubmit's fan-out realised only ~1.15x at parallelism 4
-# under the daytime quota contention; at that rate ~532-552min serial
-# projects to ~470-490min, which the presubmit's 360m would truncate most
-# nights, and 480m fits with margin. The wider fan-out is safe because the
-# nightly is alone on the model quota at that hour. Both numbers are priced,
-# not measured: confirm them on the first three nights' wall clock and record
-# the result on #1491. A deadline kill is survivable by design --
+# 3 (#1491). The presubmit realised only ~1.15x on whole-job wall clock
+# (fixed provision/deploy term included) at parallelism 4 under the daytime
+# quota contention, per the periodic's timeout comment on its 2026-09-10
+# runs; at that rate ~532-552min serial projects to ~470-490min, which the
+# presubmit's 360m would truncate most nights, and 480m fits with margin.
+# The wider fan-out is safe because the nightly is alone on the model quota
+# at that hour. All three are priced, not measured: confirm them on the
+# first three nights' wall clock and record the result on #1491. A deadline kill is survivable by design --
 # the cost-hinted queue means it truncates in-flight units, the EXIT trap
 # still records what completed -- but it is a truncated night, so if the
 # first runs blow the deadline the lever is the periodic's timeout, not this

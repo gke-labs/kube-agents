@@ -303,10 +303,13 @@ set — and if the two job types can run as different service accounts, withhold
 `objectCreator` from the presubmit's makes it structural rather than conventional. That is the
 strongest of the three guards, because it survives a careless edit to either of the others.
 
-#### Two conditions that guard depends on, neither of which holds today
+#### Two conditions that guard depends on
 
-Both were checked rather than assumed, and until they hold, the paragraph above describes an
-intention and the two software guards are the only real ones.
+Both were checked rather than assumed, and both have held since 2026-09-14: the bucket is in
+`kube-agents-prow` with the grants [Provisioning it](#provisioning-it) lists, and the periodic runs
+as `eval-baseline-recorder` ([oss-test-infra#2682](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2682),
+armed by [#2698](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2698)). Until then
+the paragraph above described an intention and the two software guards were the only real ones.
 
 **1. The bucket must not live in an evaluation-pool project.** This is why
 [Provisioning it](#provisioning-it) below says `PROJECT=kube-agents-prow`.
@@ -324,13 +327,13 @@ one lease is not where the next run looks.
 `projectIamAdmin` there. So in that project, and only in that project, the
 `objectViewer`/`objectCreator` split is a real boundary.
 
-**2. The two jobs must run as different service accounts.** They do not: the presubmit and the
-nightly as proposed both declare `serviceAccountName: prowjob-default-sa`. One identity cannot hold
-`objectCreator` for one job and withhold it from the other, so the split is unimplementable until
-the nightly gets a dedicated account. That is not a reviewer's preference; it is what the guard is
-made of — which is why creating `eval-baseline-recorder` is step 2 of
-[Provisioning it](#provisioning-it) rather than a follow-up, and why the change that arms the store
-must name it on the periodic in the same diff.
+**2. The two jobs must run as different service accounts.** They do: the presubmit declares
+`serviceAccountName: prowjob-default-sa` and the nightly `eval-baseline-recorder`. As first
+proposed both declared `prowjob-default-sa`, and one identity cannot hold `objectCreator` for one
+job and withhold it from the other, so the split was unimplementable until the nightly got a
+dedicated account. That is not a reviewer's preference; it is what the guard is made of — which is
+why creating `eval-baseline-recorder` is step 2 of [Provisioning it](#provisioning-it) rather than a
+follow-up, and why the change that armed the store named it on the periodic in the same diff.
 
 **Who can grant this.** `kube-agents-prow` has a single `roles/owner`, who is also one of its two
 `storage.admin` holders, so the bucket, the service account and all three grants are one person's
@@ -352,9 +355,9 @@ own.
 ### Provisioning it
 
 Three things to create, in this order. The service account is not optional and is not a tidiness
-preference — see [the two conditions](#two-conditions-that-guard-depends-on-neither-of-which-holds-today)
-— because the presubmit and the nightly share one identity today, and one identity cannot both hold
-and be denied `objectCreator`.
+preference — see [the two conditions](#two-conditions-that-guard-depends-on)
+— because the presubmit and the nightly as first proposed shared one identity, and one identity
+cannot both hold and be denied `objectCreator`.
 
 ```bash
 BUCKET=kube-agents-evals-bench          # globally unique; the name is not the project
@@ -422,7 +425,7 @@ gcloud storage buckets add-iam-policy-binding "gs://${BUCKET}" \
 this bucket, and withholding `objectCreator` genuinely withholds it. In `kube-agents-evals` the
 same account holds `roles/storage.admin` and `roles/resourcemanager.projectIamAdmin`, which would
 make all three grants decorative;
-[Two conditions](#two-conditions-that-guard-depends-on-neither-of-which-holds-today) above is the
+[Two conditions](#two-conditions-that-guard-depends-on) above is the
 long form.
 
 All three steps are one ask of one person in one project: the sole `roles/owner` on
@@ -803,8 +806,11 @@ merge-rate data:
 Three numbers in it are priced rather than measured. The repetition count is the script's default 3
 unless the job sets `EVAL_REPETITIONS`. The timeout is `480m`, not the presubmit's `360m`: the
 twenty-six-task matrix prices at ~532–552 serial minutes at three repetitions (the `NIGHTLY_TASKS`
-comment in `hack/ci-eval-pr.sh`), and the presubmit's fan-out realised only ~1.15× under the daytime
-quota contention, at which the night projects to ~470–490 minutes — `360m` would truncate most
+comment in `hack/ci-eval-pr.sh`), and the presubmit realised only ~1.15× on whole-job wall clock
+against its serial matrix estimate on 2026-09-10 (the periodic's timeout comment; the fixed
+provision-and-deploy term is inside that figure, which is why it sits far below the unit-loop
+speed-ups measured under [Open items](#open-items)), at which the night projects to ~470–490
+minutes — `360m` would truncate most
 nights, and the job gates nothing, so a long night costs a lease and nothing else. The fan-out is
 `EVAL_TASK_PARALLELISM=6`, wider than the presubmit's 4, because the nightly is alone on the model
 quota at its hour. The binding constraint on the first two is that `gpu-stress-test-diagnosis`
@@ -817,7 +823,7 @@ Whether the shared `prowjob-default-sa` or a dedicated identity should hold the 
 not an open question: it has to be a dedicated one, or the read/write split cannot be expressed at
 all. The periodic runs as `eval-baseline-recorder`, and its store export is armed only because it
 does — see
-[Two conditions](#two-conditions-that-guard-depends-on-neither-of-which-holds-today).
+[Two conditions](#two-conditions-that-guard-depends-on).
 
 The shape, with the harness elided (the alert row in the table above is met through the eval
 dashboard's Nightly report and the 9 AM digest rather than a TestGrid tab, so the job creates no test
@@ -902,17 +908,21 @@ Neither role includes the other, and neither carries `storage.objects.delete`, s
 append-only by construction. The `gcloud` is in [Provisioning it](#provisioning-it).
 
 It must be a **dedicated** GSA, `eval-baseline-recorder@kube-agents-prow`, and that is not a
-preference. Both jobs run as `prowjob-default-sa` today; granting creator to that shared identity
-grants it to the presubmit too, and one account cannot simultaneously hold and be denied a role.
-So the defence-in-depth the layout is built on — presubmit gets `objectViewer` only, and "a pull
-request never writes" survives a careless edit to the shell — is not merely weaker on a shared
-account, it does not exist.
+preference. Had both jobs kept running as `prowjob-default-sa`, granting creator to that shared
+identity would have granted it to the presubmit too, and one account cannot simultaneously hold and
+be denied a role. So the defence-in-depth the layout is built on — presubmit gets `objectViewer`
+only, and "a pull request never writes" survives a careless edit to the shell — is not merely
+weaker on a shared account, it does not exist there.
 
-The cost is real: a new GSA, a new KSA in whichever namespace `build-kube-agents` runs these pods
-in, and the Workload Identity binding between them — infrastructure this repository does not own,
-so all of it is the `kube-agents-prow` owner's to create. Until it does exist, "a pull request never
-writes" rests on the two guards in the code, `JOB_TYPE` and `PULL_NUMBER`, and the store export
-must stay commented out on the periodic rather than arm it pointed at the shared account.
+The cost was real: a new GSA, a new KSA in `test-pods` (the namespace `build-kube-agents` runs
+these pods in), and the Workload Identity binding between them — infrastructure this repository
+does not own, all of it the `kube-agents-prow` owner's to create, and all of it in place since
+2026-09-14: the recorder holds `objectViewer` and `objectCreator` on the bucket, `prowjob-default-sa`
+holds `objectViewer` only, and the recorder carries the `workloadIdentityUser` binding for
+`test-pods/eval-baseline-recorder` (read back with `gcloud storage buckets get-iam-policy` and
+`gcloud iam service-accounts get-iam-policy`). Until it existed, "a pull request never writes"
+rested on the two guards in the code, `JOB_TYPE` and `PULL_NUMBER`, and the store export stayed
+commented out on the periodic rather than arm it pointed at the shared account.
 
 ### The four pre-admission states
 
@@ -1230,16 +1240,15 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   `EVAL_REPETITIONS=1` with rungs 4–6 explicitly reported as unarmed, or a smaller matrix — not a
   three-repetition ladder fed one repetition.
 
-- The bucket does not exist (`gs://kube-agents-evals-bench` returns 404), so the GCS backend is
-  dormant and the local backend is the default. **Ask the `kube-agents-prow` project owner** — a
-  single `roles/owner` holds it — for three things, all in that project and none of them optional:
-  the bucket; a dedicated `eval-baseline-recorder` service account with its Workload Identity
-  binding; and the grants, `objectViewer` + `objectCreator` on the recorder, `objectViewer` only on
-  `prowjob-default-sa`. `prowjob-default-sa` holds **zero** project-level roles in
-  `kube-agents-prow` today, which is exactly why the bucket goes there and not in a pool project
-  where it already holds `storage.admin`. Commands in [Provisioning it](#provisioning-it),
-  reasoning in
-  [Two conditions that guard depends on](#two-conditions-that-guard-depends-on-neither-of-which-holds-today).
+- Provisioned, 2026-09-14: `gs://kube-agents-evals-bench` exists in `kube-agents-prow`, the
+  `eval-baseline-recorder` service account carries its Workload Identity binding, and the grants
+  are `objectViewer` + `objectCreator` on the recorder and `objectViewer` only on
+  `prowjob-default-sa` — so the GCS backend is live on both Prow jobs and the local backend is the
+  default only off Prow. `prowjob-default-sa` holds **zero** project-level roles in
+  `kube-agents-prow`, which is exactly why the bucket went there and not in a pool project where
+  it already holds `storage.admin`. Commands in [Provisioning it](#provisioning-it), reasoning in
+  [Two conditions that guard depends on](#two-conditions-that-guard-depends-on). What remains
+  open is the evidence itself: the `evidence/` prefix is empty until the first night appends.
 - **Switching the store on is two Prow exports, not one, and the presubmit's is the one that gets
   forgotten.** `EVAL_BASELINE_STORE` is the single variable for both directions: the nightly sets
   it and appends (`objectViewer` + `objectCreator`), and the presubmit must set it too and only
