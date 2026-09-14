@@ -1,10 +1,12 @@
 # COMMENTED OUT — a commented-out entry in hack/ci-eval-pr.sh TASKS, which
-# registers it pending activation. Nobody has watched this case pass and fail:
-# the install it was written against (the robot's) links no GitOps repository,
-# so the scan there has nothing to read. The eval projects do link
-# gke-agentic/kube-agents-evals*-infra as managed_repos, so a maintainer can
-# activate it after one observed run on that fleet. A case that cannot be
-# watched to both pass and fail stays `validated: false` and commented out.
+# registers it pending activation. Held by the same maintainer's call that
+# holds the skill's Phase-1 and Phase-2 cases: commented out pending #1254.
+# Its eval loop was not run (`validated: false`): the only install its author
+# could reach (the robot's) links no GitOps repository, so the scan there has
+# nothing to read, and no fleet-linked install was available to that account.
+# The eval projects do link gke-agentic/kube-agents-evals*-infra as
+# managed_repos, so once #1254 closes a maintainer can activate it after one
+# observed run on that fleet.
 #
 # The Phase-4 case for the fleet-upgrade-verification skill (#1343, #1412):
 # not "which clusters lag" (upgrades-fleet-version-table asks that) but "is the

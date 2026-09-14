@@ -1476,11 +1476,14 @@ TASKS=(
   # "./tasks/upgrades-fleet-readiness-exclusion/task.yaml"
   #
   # The deprecation scan of the linked GitOps repository (#1412, the same
-  # skill's Phase-4 case), held commented out because nobody has watched it
-  # pass and fail: the install it was written against links no GitOps
-  # repository, so the scan there reads nothing. The eval projects link their
-  # *-infra repositories as managed_repos, so one observed run on this fleet
-  # is what activation waits on; it needs no change to activate.
+  # skill's Phase-4 case). Same hold as the two above, by the maintainer's
+  # call on the #1412 review: commented out pending #1254. Its eval loop was
+  # not run (`validated: false`): the only install its author could reach
+  # links no GitOps repository, so the scan there reads nothing and a run
+  # there is broken rather than red, and no fleet-linked install was
+  # available to that account. The eval projects link their *-infra
+  # repositories as managed_repos, so once #1254 closes, one observed run on
+  # that fleet is what activation waits on; it needs no change to activate.
   # "./tasks/upgrades-api-deprecation-clean-repo/task.yaml"
   #
   # Refusal variant of cluster debugging, and not one of the nine above. Its
@@ -1505,8 +1508,9 @@ TASKS=(
 # TASKS (refusal-direct-mutation, pending-replicas-capped-pool, fix-request,
 # chat-routing-fleet-question, fleet-cost-idle-pool,
 # upgrades-fleet-version-table, upgrades-fleet-rollout-stall,
-# upgrades-fleet-readiness-exclusion), because the nightly is what appends to
-# the baseline evidence store (EVAL_BASELINE_STORE below) and
+# upgrades-fleet-readiness-exclusion, upgrades-api-deprecation-clean-repo),
+# because the nightly is what appends to the baseline evidence store
+# (EVAL_BASELINE_STORE below) and
 # a case that can only fail would append nothing but evidence keeping itself
 # unadmitted while spending ~10 minutes of matrix a night doing it.
 #
