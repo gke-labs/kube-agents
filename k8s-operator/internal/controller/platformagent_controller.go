@@ -88,13 +88,16 @@ const (
 	// The gap between reads while that wait runs.
 	shellSandboxDeletePollInterval = 100 * time.Millisecond
 
-	// How long applyCredentialProxyDeployment waits for its foreground delete.
-	// Longer than the sandbox's budget because this one waits on a pod to
-	// terminate and not only on a finalizer: foreground propagation holds the
-	// Deployment until the ReplicaSet and its pod are gone, and the broker has a
-	// termination grace period to serve out. Expiry requeues, so overshooting
+	// How long applyDeploymentRecreatingOnInvalid waits for its foreground
+	// delete. Longer than the sandbox's budget because this one waits on a pod
+	// to terminate and not only on a finalizer: foreground propagation holds
+	// the Deployment until the ReplicaSet and its pod are gone, and the pod has
+	// a termination grace period to serve out. Expiry requeues, so overshooting
 	// costs a reconcile rather than the recreation.
-	credentialProxyDeleteTimeout = 60 * time.Second
+	deploymentRecreateDeleteTimeout = 60 * time.Second
+	// What applyDeploymentRecreatingOnInvalid calls the broker's Deployment in
+	// its log line and errors.
+	credentialBrokerRecreateLabel = "credential broker"
 
 	AnnotationAPIServerCIDR           = "kubeagents.x-k8s.io/apiserver-cidr"
 	AnnotationCustomEgressCIDRs       = "kubeagents.x-k8s.io/custom-egress-cidrs"
@@ -1537,58 +1540,78 @@ func (r *PlatformAgentReconciler) reconcileCredentialProxy(ctx context.Context, 
 // of the agent's reconcile with it: the Service has already been applied by
 // then, so its endpoints are empty, every credentialed command fails, and the CR
 // still reads Ready because the status update is never reached.
+func (r *PlatformAgentReconciler) applyCredentialProxyDeployment(ctx context.Context, agent *agentv1alpha1.PlatformAgent, obj client.Object) error {
+	return r.applyDeploymentRecreatingOnInvalid(ctx, agent, obj, credentialBrokerRecreateLabel)
+}
+
+// applyDeploymentRecreatingOnInvalid applies a Deployment and, when the API
+// server answers Invalid, deletes it with foreground propagation, waits for it
+// to leave, and applies again. `what` names the Deployment in the log line and
+// the errors.
+//
+// Invalid is the one refusal a delete can fix, and two of this controller's
+// Deployments have crossed a transition that produces it. The credential
+// broker's selector gained a label, and spec.selector is immutable
+// (applyCredentialProxyDeployment). The A2A gateway moved from the
+// RollingUpdate default to Recreate: the server defaulted a rollingUpdate
+// block onto the live object, no field manager owns it, so a server-side
+// apply of `type: Recreate` leaves it in place and is refused with
+// "spec.strategy.rollingUpdate: Forbidden: may not be specified when strategy
+// type is 'Recreate'" -- on every reconcile, since ForceOwnership only settles
+// conflicts between managers and this block has none. Either way the apply
+// fails forever and takes the rest of the reconcile with it.
 //
 // Foreground propagation rather than the Orphan the StatefulSet uses. Orphaning
-// works there because the replacement adopts the running pod by selector; here
-// the selector is the thing that changed and the new labels are not a superset,
-// so nothing would ever adopt the old pod. It would sit in the namespace
-// unowned, unreferenced by the Service, and still mounting the broker's
-// credentials. Deleting it costs the outage that the label change makes
-// unavoidable, and the outage is bounded by one pod start.
-func (r *PlatformAgentReconciler) applyCredentialProxyDeployment(ctx context.Context, agent *agentv1alpha1.PlatformAgent, obj client.Object) error {
+// works there because the replacement adopts the running pod by selector; for
+// the broker the selector is the thing that changed and the new labels are not
+// a superset, so nothing would ever adopt the old pod. It would sit in the
+// namespace unowned, unreferenced by the Service, and still mounting the
+// broker's credentials. Deleting it costs the outage that the change makes
+// unavoidable, and the outage is bounded by one pod start -- for the gateway,
+// the same gap Recreate already implies on every later roll.
+func (r *PlatformAgentReconciler) applyDeploymentRecreatingOnInvalid(ctx context.Context, agent *agentv1alpha1.PlatformAgent, obj client.Object, what string) error {
 	err := r.applyManaged(ctx, agent, obj)
 	if !errors.IsInvalid(err) {
 		return err
 	}
 
 	log := logf.FromContext(ctx)
-	log.Info("the credential broker Deployment needs an immutable field changed; recreating it",
-		"deployment", obj.GetName(), "reason", err.Error())
+	log.Info("the Deployment needs a field changed that an update cannot; recreating it",
+		"what", what, "deployment", obj.GetName(), "reason", err.Error())
 
 	foreground := metav1.DeletePropagationForeground
 	existing := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{Name: obj.GetName(), Namespace: obj.GetNamespace()},
 	}
 	if delErr := r.Delete(ctx, existing, &client.DeleteOptions{PropagationPolicy: &foreground}); client.IgnoreNotFound(delErr) != nil {
-		return fmt.Errorf("failed to delete the credential broker Deployment for recreation: %w", delErr)
+		return fmt.Errorf("failed to delete the %s Deployment for recreation: %w", what, delErr)
 	}
-	if err := r.awaitCredentialProxyDeploymentGone(ctx, client.ObjectKeyFromObject(obj)); err != nil {
+	if err := r.awaitDeploymentGone(ctx, client.ObjectKeyFromObject(obj), what); err != nil {
 		return err
 	}
 	return r.applyManaged(ctx, agent, obj)
 }
 
-// awaitCredentialProxyDeploymentGone blocks until the deleted Deployment has left
-// the API server, or the budget runs out.
+// awaitDeploymentGone blocks until the deleted Deployment has left the API
+// server, or the budget runs out.
 //
 // Same reason as awaitStatefulSetGone: Delete returns once the object is marked,
 // and an apply issued inside that window addresses the object that is still
-// terminating, so it is validated against the immutable field the recreation
-// exists to change and comes back Invalid a second time. Running out of budget
-// requeues — the delete has been accepted, and the next reconcile finds the name
-// free.
-func (r *PlatformAgentReconciler) awaitCredentialProxyDeploymentGone(ctx context.Context, key client.ObjectKey) error {
-	deadline := time.Now().Add(credentialProxyDeleteTimeout)
+// terminating, so it is validated against the field the recreation exists to
+// change and comes back Invalid a second time. Running out of budget requeues
+// -- the delete has been accepted, and the next reconcile finds the name free.
+func (r *PlatformAgentReconciler) awaitDeploymentGone(ctx context.Context, key client.ObjectKey, what string) error {
+	deadline := time.Now().Add(deploymentRecreateDeleteTimeout)
 	for {
 		err := r.Get(ctx, key, &appsv1.Deployment{})
 		if errors.IsNotFound(err) {
 			return nil
 		}
 		if err != nil {
-			return fmt.Errorf("failed to read the credential broker Deployment %s/%s while waiting for its deletion: %w", key.Namespace, key.Name, err)
+			return fmt.Errorf("failed to read the %s Deployment %s/%s while waiting for its deletion: %w", what, key.Namespace, key.Name, err)
 		}
 		if time.Now().After(deadline) {
-			return fmt.Errorf("the credential broker Deployment %s/%s is still terminating %s after it was deleted for recreation; retrying on the next reconcile", key.Namespace, key.Name, credentialProxyDeleteTimeout)
+			return fmt.Errorf("the %s Deployment %s/%s is still terminating %s after it was deleted for recreation; retrying on the next reconcile", what, key.Namespace, key.Name, deploymentRecreateDeleteTimeout)
 		}
 		select {
 		case <-ctx.Done():

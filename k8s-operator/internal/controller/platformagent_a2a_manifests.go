@@ -75,6 +75,10 @@ const (
 	// are pinned together by TestReconcileA2ADeletesSupersededProvisionJobs.
 	a2aProvisionComponent = "provision"
 
+	// What applyDeploymentRecreatingOnInvalid calls the gateway's Deployment
+	// in its log line and errors.
+	a2aGatewayRecreateLabel = "A2A gateway"
+
 	// The LiteLLM ports the session fence grants, for the reason
 	// buildAgentEgressNetworkPolicy's LiteLLM rule states in full: a Pod
 	// selector matches after the ClusterIP translation, so the container port
@@ -1905,7 +1909,12 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return state, err
 	}
-	if err := r.applyManaged(ctx, agent, dep); err != nil {
+	// Recreating on Invalid rather than a plain applyManaged: a gateway
+	// Deployment applied before the strategy became Recreate carries the
+	// server-defaulted rollingUpdate block, which no manager owns, so the
+	// apply that sets Recreate is refused until the object is replaced.
+	// applyDeploymentRecreatingOnInvalid says why an update cannot do it.
+	if err := r.applyDeploymentRecreatingOnInvalid(ctx, agent, dep, a2aGatewayRecreateLabel); err != nil {
 		return state, fmt.Errorf("failed to apply A2A gateway Deployment: %w", err)
 	}
 
