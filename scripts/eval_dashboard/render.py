@@ -74,6 +74,7 @@ Only stdlib + PyYAML (already in requirements-test.txt) -- no build step.
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime
 import json
 import math
@@ -96,6 +97,11 @@ except ImportError:  # run as a script: python3 scripts/eval_dashboard/render.py
 HERE = pathlib.Path(__file__).resolve().parent
 PAGE_TEMPLATE = HERE / "template" / "page.html.tmpl"
 PAGES_JS = HERE / "template" / "pages.js"
+# The mark in the header and the browser tab: the same logo as the PR
+# dashboard, inlined as a data URI so the page keeps rendering whole from
+# its own bytes (SCHEMA.md, "The rendered pages": storage.cloud.google.com
+# answers a subresource fetch with a login redirect).
+LOGO = HERE / "template" / "logo.jpeg"
 DEFAULT_NOTES = HERE / "case-notes.yaml"
 DEFAULT_EVENTS = HERE / "events.yaml"
 
@@ -1019,6 +1025,7 @@ def render_page(page: str, brief: dict, data: dict, public_url: str | None = Non
         "__META__": meta_html(data),
         "__FRESHNESS__": freshness_html(data),
         "__PAGES_JS__": PAGES_JS.read_text(),
+        "__LOGO__": logo_data_uri(),
     }
     for token in values:
         if token not in template:
@@ -1069,6 +1076,11 @@ def inline_json_html(element_id: str, value) -> str:
     """A data element a page reads with JSON.parse on boot. bootstrap_json
     keeps every '<' out of it, so no data string can close the element."""
     return f'<script type="application/json" id="{element_id}">{bootstrap_json(value)}</script>'
+
+
+def logo_data_uri() -> str:
+    """The header and favicon image as a data URI, read from template/logo.jpeg."""
+    return "data:image/jpeg;base64," + base64.b64encode(LOGO.read_bytes()).decode("ascii")
 
 
 def base_html(public_url: str | None) -> str:

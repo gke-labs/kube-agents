@@ -350,6 +350,13 @@ class RenderedFilesTest(unittest.TestCase):
             self.assertNotIn("__PAGES_JS__", index)
             self.assertNotIn("__INLINE_", index)
             self.assertNotIn("__BASE__", index)
+            # The logo is inlined twice, tab and header, so the page still
+            # makes no request beyond itself.
+            logo = render.logo_data_uri()
+            self.assertTrue(logo.startswith("data:image/jpeg;base64,/9j/"))
+            self.assertIn(f'<link rel="icon" type="image/jpeg" href="{logo}">', index)
+            self.assertIn(f'<img class="logo" src="{logo}" alt=""', index)
+            self.assertNotIn("__LOGO__", index)
             run_page = (out / "run.html").read_text()
             self.assertIn('data-page="run"', run_page)
             for name in ("grid.html", "cases.html"):
