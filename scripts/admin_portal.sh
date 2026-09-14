@@ -3,8 +3,10 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-readonly REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+readonly SCRIPT_DIR
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd -P)"
+readonly REPO_ROOT
 readonly REQUIREMENTS="${REPO_ROOT}/admin_console/requirements.txt"
 readonly PORT="${ADMIN_PORTAL_PORT:-8501}"
 readonly HOST="127.0.0.1"

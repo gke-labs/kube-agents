@@ -195,6 +195,7 @@ plugin_image_glob_segments() {
     while :; do
         pseg="${pat%%/*}"
         fseg="${path%%/*}"
+        # shellcheck disable=SC2254 # the pattern is meant to glob-match the path segment
         case "$fseg" in
             $pseg) ;;
             *) return 1 ;;
