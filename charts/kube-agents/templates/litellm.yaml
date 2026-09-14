@@ -191,9 +191,10 @@ spec:
       {{- . | nindent 6 }}
       {{- end }}
       # The pinned image declares User root, so without this the gateway runs
-      # as root on a writable root filesystem. The values are the house set the
-      # operator, github-minter and Hindsight API already carry, kept in step
-      # with k8s-operator/config/integrations/litellm/base/deployment.yaml and
+      # as root on a writable root filesystem. The fields are the ones the
+      # operator and github-minter already carry (each with its own uid; the
+      # Hindsight API has the pod-level half), kept in step with
+      # k8s-operator/config/integrations/litellm/base/deployment.yaml and
       # asserted by tests/test_workload_security_context.py. The one writable
       # path is the tmp emptyDir at /tmp; HOME points there too, because uid
       # 1000 has no passwd entry in the image and the tokenizer and library

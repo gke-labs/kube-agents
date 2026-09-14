@@ -223,9 +223,17 @@ spec:
       # still runs chmod 700 on $PGDATA on every start, which keeps the data
       # directory's mode check passing after fsGroup adds group bits, and
       # OnRootMismatch relabels an existing volume once rather than walking it
-      # on every start. Kept in step with
+      # on every start. A fresh volume depends on that fsGroup pass: its root
+      # arrives root-owned, and only the kubelet's relabel lets uid 999 create
+      # PGDATA inside it. GKE's Persistent Disk CSI driver applies fsGroup to
+      # ReadWriteOnce volumes; under a StorageClass whose driver reports
+      # fsGroupPolicy None, the entrypoint's mkdir fails with EACCES before
+      # initdb runs, where the old root entrypoint would have chowned the
+      # directory itself. Kept in step with
       # k8s-operator/config/integrations/hindsight/postgresql.yaml and
-      # asserted by tests/test_workload_security_context.py. Writable paths
+      # asserted by tests/test_workload_security_context.py;
+      # docs/designs/memory.md summarises the posture of both Hindsight pods.
+      # Writable paths
       # under the read-only root: the run emptyDir at /var/run/postgresql
       # (socket and pid, used by the entrypoint's temporary init server and
       # the pg_isready probe), the tmp emptyDir at /tmp, and PGDATA on the

@@ -7,13 +7,13 @@ Stdlib unittest, no pytest, matching the other suites in this directory.
 The pinned LiteLLM image declares `User: root`, and the pgvector image's
 entrypoint starts as root before dropping to `postgres` itself, so a Deployment
 or StatefulSet that sets no `securityContext` runs them as root on a writable
-root filesystem. The operator, github-minter and the Hindsight API already
-carry the house set — `runAsNonRoot`, a `RuntimeDefault` seccomp profile,
+root filesystem. The operator and github-minter already carry the same fields
+— `runAsNonRoot`, a `RuntimeDefault` seccomp profile,
 `allowPrivilegeEscalation: false`, `readOnlyRootFilesystem: true`,
-`capabilities.drop: [ALL]` — and nothing checks that the two workloads this
-suite covers keep it. Each of them exists twice, in the chart template and in
-the kustomize dev path `AGENTS.md` keeps in step with it, and the pair can
-drift apart without any gate noticing:
+`capabilities.drop: [ALL]` — each with a uid of its own, and nothing checks
+that the two workloads this suite covers keep them. Each of them exists twice,
+in the chart template and in the kustomize dev path `AGENTS.md` keeps in step
+with it, and the pair can drift apart without any gate noticing:
 
     charts/kube-agents/templates/litellm.yaml
     k8s-operator/config/integrations/litellm/base/deployment.yaml
@@ -31,8 +31,10 @@ The read-only root is only safe with a writable path for what the process has
 to write, so the volumes are part of the contract: an `emptyDir` at `/tmp` for
 LiteLLM (with `HOME` pointing there, because uid 1000 has no passwd entry in
 the image), and `emptyDir`s at `/var/run/postgresql` and `/tmp` for Postgres.
-The Hindsight API container keeps `readOnlyRootFilesystem: false` on purpose;
-only its pod-level fields are asserted here.
+The Hindsight API container's `readOnlyRootFilesystem: false` is left as it
+is: what the API writes under `/` has not been enumerated, so this suite pins
+its pod-level fields (`runAsNonRoot`, `fsGroup`, seccomp) and nothing on the
+container beyond `runAsNonRoot`.
 """
 
 import pathlib

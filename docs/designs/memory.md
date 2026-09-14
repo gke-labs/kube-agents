@@ -493,8 +493,10 @@ It adds exactly two workloads to `kubeagents-system`.
   because LiteLLM honours it in a model entry's `litellm_params` rather than
   globally. Per-model it would work, at the price of editing a config every
   agent request passes through in order to accommodate one caller.
-- Requests 2 CPU/1Gi, limits 4 CPU/4Gi. Runs non-root, no privilege escalation, all
-  capabilities dropped. The CPU numbers are sized for model inference rather than for
+- Requests 2 CPU/1Gi, limits 4 CPU/4Gi. Runs non-root under a `RuntimeDefault` seccomp
+  profile, no privilege escalation, all capabilities dropped; its root filesystem stays
+  writable, and what the API writes under `/` has not been enumerated. The CPU numbers
+  are sized for model inference rather than for
   serving HTTP, though measurement says the headroom goes unused —
   see [What a recall costs](#what-a-recall-costs).
 
@@ -552,6 +554,17 @@ It adds exactly two workloads to `kubeagents-system`.
 - One 8Gi `ReadWriteOnce` volume from a `volumeClaimTemplate`. `PGDATA` points at a
   **subdirectory** of the mount, not the root: the RWO volume arrives with a
   `lost+found` entry and `initdb` refuses a non-empty data directory.
+- Runs as uid 999, the image's `postgres` user, rather than letting the entrypoint
+  start as root and drop to it, under a `RuntimeDefault` seccomp profile with no
+  privilege escalation and all capabilities dropped. The root filesystem is read-only;
+  the writable paths are `emptyDir`s at `/var/run/postgresql` (socket and pid, which
+  the entrypoint's temporary init server and the readiness probe use) and `/tmp`, and
+  `PGDATA` on the volume. `fsGroup: 999` with `fsGroupChangePolicy: OnRootMismatch`
+  relabels a volume the old root entrypoint initialised once, the entrypoint's
+  `chmod 700` on `PGDATA` keeps Postgres's data-directory mode check passing, and a
+  fresh volume needs a storage driver that applies `fsGroup` (GKE's Persistent Disk
+  CSI driver does). The comment on the StatefulSet in the chart template holds the
+  full account; `tests/test_workload_security_context.py` pins the fields.
 - **Passwordless** (`POSTGRES_HOST_AUTH_METHOD=trust`). It is reachable only from
   the API pod, holds nothing that is not already in the agent's context, and a
   password would have to be generated, agreed between two keys and rotated by
