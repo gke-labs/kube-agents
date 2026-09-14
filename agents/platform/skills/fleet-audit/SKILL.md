@@ -143,6 +143,7 @@ branch. It prints exactly one JSON line:
   "findings_path": "/opt/data/scratch/findings_compliance-audit.json",
   "pending_remediation_requests": ["netpol-missing-payments"],
   "context_repos": ["acme/terraform-live"],
+  "declared_intent_repos": ["acme/fleet", "acme/terraform-live"],
   "sop": "governance/compliance_audit_sop.md",
   "checks": ["privileged-container", "host-namespace", "…"],
   "checks_contract": "Run every check above against every cluster you can read. …"
@@ -175,6 +176,13 @@ reports a posture as a finding. They are read and nothing else: the key is separ
 `managed_repos`, the harness never merges the two, so the broker's push gate, the repository
 resolver and the sweep never see them. The list is empty when nothing is registered or the key
 could not be read, which `start` says on stderr; the GitOps clone is searched either way.
+
+`declared_intent_repos` is the set that step must account for: the GitOps repository plus every
+`context_repos` slug, one entry each. `start` writes the same set to a run record beside the
+findings document (`/opt/data/scratch/run_<audit-id>.json`), before it prints, and `finish` measures
+the document's `declared_intent_searched` against that record rather than against the ConfigMap as
+it stands at finish time. Every stream prints it; only a stream with a declared-intent step is held
+to it.
 
 ### Step 2 — Inspect the fleet (reasoning phase)
 
@@ -217,6 +225,10 @@ returns, so read `truncated` on both and **pass `--prefix`** on a large reposito
 each file into the workspace at its repo-relative path, which is exactly where a remediation editing
 that file has to end up; fetch it, edit it in place, and name the same path in the finding.
 
+All three print `sha`, the commit of the tree the broker answered from. There is no `git` on this
+side to ask, and the declared-intent record (`declared_intent_searched`, below) names each repository
+as `owner/name@sha`; take the sha from the command whose answer you searched.
+
 All three take `--branch`, and a second round needs it. Without it they answer from the base, so a
 file the remediation branch has already changed — by an earlier run or by a reviewer — comes back as
 the base has it, and committing the edit onto that branch reverts the change. The revert
@@ -237,15 +249,18 @@ All three exit 2 in directory mode, where the clone already holds the file.
 The script validates the document, reconciles every finding against the pull requests already open
 for this stream, rewrites (or opens) the ledger issue, comments the delta, opens pull requests for
 the fixes that qualify, and closes the ones whose findings have stopped reproducing. It prints one
-JSON line with ten fields — `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`,
-`partial`, `coverage_gaps`, `silent_ok`, and `declared`, the number of postures a repository
-declaration kept off the ledger (it never decides silence):
+JSON line with eleven fields — `status`, `issue_url`, `new`, `resolved`, `prs_opened`, `prs_closed`,
+`partial`, `coverage_gaps`, `silent_ok`, `declared`, the number of postures a repository
+declaration kept off the ledger (it never decides silence), and `postures_withheld`, the ids of the
+posture findings `finish` held back because the document recorded no complete declared-intent
+search (empty everywhere but on a declaring stream that skipped the step; see
+[`declared_intent_searched`](#declared_intent_searched)):
 
-- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0}`
+- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[]}`
   — the stream had no open ledger.
-- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0}`
+- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[]}`
   — the existing ledger was rewritten.
-- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0}`
+- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[]}`
   — zero findings; the ledger closed as completed and its open fixes closed with it.
 
 Add `--dry-run` to validate and print the rendered ledger body — and every PR body it _would_ open —
@@ -264,9 +279,11 @@ broke.
 ### Partial coverage
 
 `partial` is `true` exactly when the run could not speak for the whole fleet: any entry in
-`scope.skipped`, any cluster carrying a `limitations` note, or any cluster whose `checks_run` is
-short of the checks that _apply_ to it. `coverage_gaps` says which, and why — so `partial` is `true`
-if and only if `coverage_gaps` is non-empty, and you can report from either.
+`scope.skipped`, any cluster carrying a `limitations` note, any cluster whose `checks_run` is
+short of the checks that _apply_ to it, or — on a stream with a declared-intent step — posture
+checks that ran without a complete search record ([`declared_intent_searched`](#declared_intent_searched)).
+`coverage_gaps` says which, and why — so `partial` is `true` if and only if `coverage_gaps` is
+non-empty, and you can report from either.
 
 A check the cluster's shape rules out is not a gap. Declaring it in that cluster's
 `checks_not_applicable` (below) takes it out of the denominator, so a cluster that ran everything
@@ -383,15 +400,20 @@ and say which clusters were not covered. See [The clean run](#the-clean-run) for
         "excerpt": "replicas = 3  # fixed: the upstream rate limit is per-instance"
       }
     }
+  ],
+  "declared_intent_searched": [
+    "acme/fleet@3f2a9c1d8e7b6a5f4c3d2e1f0a9b8c7d6e5f4a3b",
+    "acme/terraform-live@8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d"
   ]
 }
 ```
 
-(The `declared` entry is illustrative and crosses streams: a real compliance document would be
-rejected for carrying it. `declared[].check` is validated against the stream's `declarable` set in
-`AUDITS` — its posture checks, a subset of the roster — and only `obtainability-audit` has one
-today, because only its SOP has a step that writes the list. A non-empty `declared` on any other
-stream exits 2; `[]` validates everywhere.)
+(The `declared` entry and the `declared_intent_searched` list are illustrative and cross streams: a
+real compliance document would be rejected for carrying either. `declared[].check` is validated
+against the stream's `declarable` set in `AUDITS` — its posture checks, a subset of the roster — and
+only `obtainability-audit` has one today, because only its SOP has a step that writes the list. A
+non-empty `declared` or `declared_intent_searched` on any other stream exits 2; `[]` validates
+everywhere.)
 
 Field rules the validator enforces — a violation exits 2 naming the offending finding index and
 field, and publishes nothing:
@@ -569,6 +591,42 @@ What the shape enforces:
   set in `AUDITS`, four for the pilot, and the validator rejects any other check with exit 2. A
   drain-blocking budget declared in a repository is a declared bug and stays a finding, and a
   document that lists it under `declared` publishes nothing.
+
+### `declared_intent_searched`
+
+A top-level list of `owner/name@sha` strings: each repository the declared-intent step searched,
+at the commit it was read at. It is the record that the step ran, and it is what makes a skipped
+step visible. Nothing else in the document can: a run that skipped the search and published every
+posture as a finding, and a run that skipped it and left a candidate out, both validated as complete
+before this field existed.
+
+What `finish` does with it:
+
+- **Complete means every repository `start` named.** The list, sha stripped and case-folded, must
+  cover every slug in `start`'s `declared_intent_repos` — the GitOps repository and every
+  `context_repos` entry — measured against the run record `start` wrote, not the ConfigMap at finish
+  time. Extra repositories are allowed. The sha is checked for shape only (7 to 40 lowercase hex
+  characters), so the record is as forgeable as a padded `checks_run` and carries less; it makes a
+  skipped step visible, not impossible.
+- **It is owed whenever a declarable check ran.** Keyed on `checks_run`, not on the postures in
+  `findings`, for the reason above: a candidate left out without a search reads exactly like one a
+  declaration covered. A run on which none of the four checks ran anywhere owes nothing.
+- **Anything less is no search, and the postures are withheld.** No key, a list missing a
+  repository, or no run record: `finish` — real and `--dry-run` — takes every finding whose check is
+  declarable out of the document, the dangling-target `hpa-cannot-scale` fault included because it
+  shares its slug with the `min == max` posture, and adds one `coverage_gaps` sentence naming each
+  withheld entry and the repositories not searched. The faults publish; `declared[]` entries publish.
+  `partial` stays `bool(coverage_gaps)`, so the ledger does not close, `resolved` is `0`, no stale
+  pull request is retired, and the withheld ids enter no delta block and no remediation pull
+  request. The ledger names the withheld postures under _Declared intent not searched_ below the
+  Scope table, the clean comment lists them, and the JSON line carries their ids as
+  `postures_withheld`.
+- **A complete record renders.** One line under Scope, `Declared-intent search: owner/name@sha, …`,
+  so a reader can see what was read.
+
+Where the sha comes from: in content mode `list`, `grep` and `fetch` print it, and
+`inspect_repository.py clone` and `open` print it for a context copy; in directory mode it is
+`git -C <workspace> rev-parse HEAD` on the clone. The SOP's §4a is the procedure.
 
 ## Evidence rules
 

@@ -367,7 +367,8 @@ stream's open ledger issue, and returns the scratch path for `findings.json`. Em
   "workspace": "/opt/data/gitops/compliance-audit/acme__fleet",
   "findings_path": "/opt/data/scratch/findings_compliance-audit.json",
   "pending_remediation_requests": ["netpol-missing-payments"],
-  "context_repos": ["acme/terraform-live"]
+  "context_repos": ["acme/terraform-live"],
+  "declared_intent_repos": ["acme/fleet", "acme/terraform-live"]
 }
 ```
 
@@ -386,6 +387,18 @@ beside the roster; a fault check or a stream with no declared-intent step is rej
 given an id, so it enters no delta and no pull request. The obtainability SOP (§4a) is the pilot;
 the schema and the ledger section it renders to are stated in the skill file, and `finish` reports
 the list's length as `declared`.
+
+`declared_intent_repos` is the set that step must account for — the GitOps repository plus every
+`context_repos` slug, folded to one entry each — and `start` writes the same set to a run record
+beside the findings document (`run_<audit-id>.json`) before it prints, so a crash between the two
+leaves no record. The document may carry a top-level `declared_intent_searched` list of
+`owner/name@sha` strings, one per repository the step searched, validated for shape (the slug rule
+`declared[].declaration.repo` uses, a sha of 7 to 40 hex characters) and rejected on a stream with
+no `declarable` set. `finish` measures it against the run record, not the ConfigMap at finish time:
+whenever any cluster's `checks_run` names a declarable check and the list does not cover every slug
+in the record — or there is no record — every finding whose check is declarable is withheld and the
+run goes partial (§7.4). The sha comes from the reads: `list`, `grep` and `fetch` print the broker's
+tree sha, and `inspect_repository.py clone` and `open` print it for a context copy (#1477).
 
 `workspace` is the clone, and it is not decoration. The audit cron starts in the agent's profile
 directory, which is not a working tree — so there is nothing to `git add` into and nothing for
@@ -456,13 +469,16 @@ was probably never a command is a bot picking an argument. A `/remediate` the ha
 into a comment is always inside a code span, and inline code is stripped before the mention search
 runs — otherwise the ledger reads its own replies back on the next run and answers itself forever.
 
-Exit contract — ten keys, always all ten:
+Exit contract — eleven keys, always all eleven:
 
-- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0}`
-- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0}`
-- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0}`
-- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":true,"coverage_gaps":["prod-eu-1: API server unreachable"],"silent_ok":false,"declared":0}`
-- `{"status":"UPDATED","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":true,"declared":0}`
+- `{"status":"OPENED","issue_url":"…","new":7,"resolved":0,"prs_opened":["…"],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[]}`
+- `{"status":"UPDATED","issue_url":"…","new":2,"resolved":3,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[]}`
+- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":5,"prs_opened":[],"prs_closed":["…"],"partial":false,"coverage_gaps":[],"silent_ok":false,"declared":0,"postures_withheld":[]}`
+- `{"status":"CLEAN","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":true,"coverage_gaps":["prod-eu-1: API server unreachable"],"silent_ok":false,"declared":0,"postures_withheld":[]}`
+- `{"status":"UPDATED","issue_url":"…","new":0,"resolved":0,"prs_opened":[],"prs_closed":[],"partial":false,"coverage_gaps":[],"silent_ok":true,"declared":0,"postures_withheld":[]}`
+
+`postures_withheld` is the ids of the posture findings `finish` took out of the document because it
+recorded no complete declared-intent search (§7.4); empty on every other run.
 
 `--dry-run` renders the issue body and every PR body it _would_ open to stdout with zero git or gh
 **side effects**: nothing is cloned, staged, committed, pushed, created, edited, commented, or
@@ -755,14 +771,29 @@ nobody controls, so all of it is untrusted input to a Markdown renderer that wil
 
 ### 7.4 Partial coverage
 
-`coverage_gaps(data)` folds the three representations of "did not look" — every `scope.skipped`
-entry, every cluster `limitations` note, and every cluster whose `checks_run` falls short of the
-checks that _apply_ to it — into one list of human-readable strings, and a run with a non-empty list
-is **partial**. A cluster contributes at most one line however many of the three apply to it, so a
-partly-checked cluster that also carries a limitation reads as one sentence with two reasons rather
-than as two separate gaps. The denominator is the stream's roster minus that cluster's
-`checks_not_applicable`, which is what keeps a check the cluster's shape forbids from reading as a
-check nobody ran.
+`coverage_gaps(data)` folds the four representations of "did not look" — every `scope.skipped`
+entry, every cluster `limitations` note, every cluster whose `checks_run` falls short of the
+checks that _apply_ to it, and, on a stream with a declared-intent step, posture checks that ran
+with no complete search record — into one list of human-readable strings, and a run with a
+non-empty list is **partial**. A cluster contributes at most one line however many of the first
+three apply to it, so a partly-checked cluster that also carries a limitation reads as one sentence
+with two reasons rather than as two separate gaps. The denominator is the stream's roster minus that
+cluster's `checks_not_applicable`, which is what keeps a check the cluster's shape forbids from
+reading as a check nobody ran.
+
+The fourth is fleet-wide and comes from `withhold_unsearched_postures`, which `finish` runs once,
+right after the document loads and before the dry-run split. When any cluster's `checks_run` names a
+declarable check and the document's `declared_intent_searched` does not cover every repository in
+`start`'s run record — or `start` left none — it takes every finding whose check is declarable out
+of `findings`, the dangling-target `hpa-cannot-scale` fault included (the validator cannot tell it
+from the `min == max` posture), and files them on the document under `postures_withheld`. Every
+caller of `coverage_gaps` then derives the same sentence — each withheld entry, the repositories not
+searched, and the `hpa-cannot-scale` caveat — and the withheld ids enter no delta block and no
+remediation pull request; the faults and the `declared[]` entries publish unchanged. Routing it
+through `coverage_gaps` rather than through a fifth gate is the same economy as the roster
+shortfall below: everything keyed on `partial` follows. The ledger renders the withheld postures
+under _Declared intent not searched_ below the Scope table, and the clean comment lists them, so a
+clean run that is clean only because the harness took the postures out says so (#1477).
 
 Routing the roster shortfall through `coverage_gaps` rather than gating it separately is the whole
 economy of the change. Everything below already keys off `partial`, so an incomplete run inherits
