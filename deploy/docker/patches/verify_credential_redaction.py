@@ -60,6 +60,11 @@ FLOOR_SHAPES = {
 CURL_COMMAND = f"curl -sS -H 'Authorization: Bearer {TOKEN}' https://example.invalid/v1/x"
 WORKER_TASK_ID = "t_verify"
 CHILD_TIMEOUT_SECONDS = 60
+#: The duration a rendered completion line is given; any value renders.
+CUTE_DURATION_SECONDS = 0.4
+#: How much of an offending line, or of a transcript tail, a failure prints.
+DETAIL_CHARS = 120
+TAIL_CHARS = 200
 
 #: Every print path a worker writes the transcript through, exercised by the
 #: child below: ``print``, ``sys.stderr.write``, a logging StreamHandler on
@@ -143,14 +148,14 @@ check(
     first_statement is not None
     and isinstance(first_statement, ast.Try)
     and "install_or_report" in ast.unparse(first_statement),
-    ast.unparse(first_statement)[:120] if first_statement is not None else "no main()",
+    ast.unparse(first_statement)[:DETAIL_CHARS] if first_statement is not None else "no main()",
 )
 
 # --- 2. The token is masked at every in-process sink -------------------------
 print("in-process masking:")
 masked = R.redact_sensitive_text(TOKEN)
-check("redact_sensitive_text masks a bare token", not leaked(masked), masked[:80])
-check("the mask keeps 6 head and 4 tail characters", masked == TOKEN_MASK, masked[:80])
+check("redact_sensitive_text masks a bare token", not leaked(masked), masked[:DETAIL_CHARS])
+check("the mask keeps 6 head and 4 tail characters", masked == TOKEN_MASK, masked[:DETAIL_CHARS])
 check(
     "an exported token is masked",
     not leaked(R.redact_sensitive_text(f"export TOKEN={TOKEN}")),
@@ -174,13 +179,13 @@ from agent.display import (  # noqa: E402
     redact_tool_args_for_display,
 )
 
-cute = get_cute_tool_message("terminal", {"command": CURL_COMMAND}, 0.4)
-check("the terminal completion line masks the bearer token", not leaked(cute), cute[:120])
-check("the completion line still names the command", "curl -sS -H" in cute, cute[:120])
+cute = get_cute_tool_message("terminal", {"command": CURL_COMMAND}, CUTE_DURATION_SECONDS)
+check("the terminal completion line masks the bearer token", not leaked(cute), cute[:DETAIL_CHARS])
+check("the completion line still names the command", "curl -sS -H" in cute, cute[:DETAIL_CHARS])
 check(
     "the completion line still shows the redacted header",
     "Authorization: Bearer" in cute,
-    cute[:120],
+    cute[:DETAIL_CHARS],
 )
 preview = build_tool_preview("terminal", {"command": CURL_COMMAND})
 check("the tool preview masks the bearer token", preview is not None and not leaked(preview))
@@ -224,11 +229,11 @@ def run_child(script: str, *args: str, env_extra: dict | None = None) -> str:
 
 
 transcript = run_child(CHILD_SCRIPT, TOKEN, env_extra={"HERMES_KANBAN_TASK": WORKER_TASK_ID})
-check("the worker installed the wrapper", "installed=True" in transcript, transcript[-200:])
+check("the worker installed the wrapper", "installed=True" in transcript, transcript[-TAIL_CHARS:])
 check(
     "the transcript holds no 20+ character ya29 run",
     not leaked(transcript),
-    next((line[:120] for line in transcript.splitlines() if leaked(line)), ""),
+    next((line[:DETAIL_CHARS] for line in transcript.splitlines() if leaked(line)), ""),
 )
 lines = transcript.splitlines()
 for path in (
@@ -243,7 +248,7 @@ for path in (
     check(
         f"the {path} line carries the mask, not the token",
         len(matching) == 1 and TOKEN_MASK in matching[0],
-        matching[0][:120] if matching else "line absent",
+        matching[0][:DETAIL_CHARS] if matching else "line absent",
     )
 # The prefix mask leaves a 13-character stub, which the Authorization-header
 # rule then treats as a short value and masks whole: the header line reads
@@ -252,7 +257,7 @@ header_lines = [line for line in lines if "💻 $" in line]
 check(
     "the 💻 $ line reached the transcript through prompt_toolkit, redacted",
     len(header_lines) == 1 and "Bearer ***" in header_lines[0],
-    header_lines[0][:120] if header_lines else "line absent",
+    header_lines[0][:DETAIL_CHARS] if header_lines else "line absent",
 )
 check(
     "a plain line is untouched, Bearer as a word included",
@@ -281,7 +286,7 @@ with tempfile.NamedTemporaryFile("w+", suffix=".log") as out_f:
 check(
     "a process without HERMES_KANBAN_TASK keeps sys.stdout unwrapped",
     proc.returncode == 0 and "installed=False type=TextIOWrapper" in unwrapped,
-    unwrapped[-200:],
+    unwrapped[-TAIL_CHARS:],
 )
 
 # --- 4. The module itself needs no Hermes to import --------------------------
