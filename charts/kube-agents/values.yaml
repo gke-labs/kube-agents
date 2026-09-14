@@ -220,7 +220,7 @@ litellm:
   # (a released version on PyPI; releases cannot be re-uploaded in place).
   # A runtime pull images.json cannot inventory, which is acceptable only
   # because the sidecar is off by default and experiment-scoped.
-  responseCachePackage: "cached-response==0.2.0"
+  responseCachePackage: "cached-response==0.2.1"
   # model-default routes to <modelProvider>/<modelDefaultName>. Providers:
   # gemini, anthropic, openai, vertex_ai. The provider's API key must exist in
   # the credentials Secret — except vertex_ai, which authenticates with
