@@ -127,12 +127,14 @@ A day when every run is green but takes twice as long matches none of the
 conditions above — nothing is lost, nothing is shared — and on 2026-09-14 the
 bot stayed GREEN while every open pull request waited three hours on Vertex
 latency (#1586). The wall clock is therefore a note beside the state, never a
-state. `health.json`'s `slow` is set when the median wall clock of the last 5
-full runs — a concluded run of 15+ cases, all five finished in the last 6
-hours — is at least 1.2× the median of the trailing 7 days' full runs (at
-least 20 of them), and stays set until that median is back under 1.1×. Wall
-clock is a run's finish minus its start, the digest's measure. The poster
-sends one line the first tick the note appears:
+state, and only beside a GREEN one: inside a storm or an outage the long runs
+are the incident's symptom, and the incident's advice stands alone.
+`health.json`'s `slow` is set, while the state is GREEN, when the median wall
+clock of the last 5 full runs — a concluded run of 15+ cases, all five
+finished in the last 6 hours — is at least 1.2× the median of the trailing 7
+days' full runs (at least 20 of them), and stays set until that median is back
+under 1.1×. Wall clock is a run's finish minus its start, the digest's
+measure. The poster sends one line the first tick the note appears:
 
 ```text
 🐢 Smoke gate: slow — the last 5 full runs took 152–213 min (median 183)
@@ -150,7 +152,8 @@ it sooner and are not read: the adjudicate step runs as the dashboard
 publisher, which holds nothing on the Prow build cluster, and the tick
 carries no `kubectl`. The rule the issue proposed — three consecutive full
 runs above the trailing seven-day p90 — is not the one used: replayed over
-the published `data.json` it never fired that day (the p90 stood at 198
+the published `data.json` (`health.py --replay` prints the note's edges
+beside the state changes) it never fired that day (the p90 stood at 198
 minutes because 09-08 to 09-11 had been slow too), while the median rule
 fired from 2:00 PM ET and stayed quiet over 09-06 to 09-09 and the 09-12/13
 weekend. Model latency is not sampled: the per-repetition eval logs carry

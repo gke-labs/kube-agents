@@ -1136,9 +1136,14 @@ def adjudicate(
     advice = advice_for(
         decided["state"], decided["condition"], decided["failing_cases"], assessed["storm_end"], notes or {}, decided["recovering"], issue, incident
     )
-    # Rule 7 rides beside the state: the previous note is the only memory
-    # it needs, and a health.json from before the field has none.
-    slow = slow_gate(assessed["full_runs"], now, (prev or {}).get("slow") or None)
+    # Rule 7 rides beside the state, and only a GREEN one: inside a storm
+    # or an outage the long runs are the incident's symptom (429 retries
+    # stretch a run), and a note saying "not a break, /retest won't help"
+    # beside advice to retest after the storm would contradict it. The
+    # previous note is the only memory it needs; a health.json from before
+    # the field, or from a non-GREEN tick, has none, so an episode that
+    # outlasts an incident starts afresh when GREEN returns.
+    slow = slow_gate(assessed["full_runs"], now, (prev or {}).get("slow") or None) if decided["state"] == GREEN else None
     if slow:
         evidence.append(slow_evidence(slow))
     stale_after = DEFAULT_STALE_AFTER
@@ -1203,17 +1208,19 @@ def replay(data: dict, step: timedelta, roster: Roster, start: datetime | None =
 
 
 def timeline(ticks, every: bool = False) -> list[dict]:
-    """The state changes in a replay: [{at, state, cause, failing_cases}].
+    """The state changes in a replay: [{at, state, cause, failing_cases, slow}].
 
     A change is a new state, a new condition, or a new set of failing
-    cases within an OUTAGE -- the things the poster reacts to. A storm
-    window's bounds move every tick and are detail, not a change. `every`
-    keeps all ticks.
+    cases within an OUTAGE -- the things the poster reacts to -- and the
+    slow note (rule 7) appearing or clearing, since the poster reacts to
+    that too. A storm window's bounds move every tick and are detail, not
+    a change. `every` keeps all ticks.
     """
     out = []
     last = None
     for now, health in ticks:
-        key = (health["state"], health["condition"], tuple(health["failing_cases"]))
+        slow = health.get("slow") or None
+        key = (health["state"], health["condition"], tuple(health["failing_cases"]), bool(slow))
         if every or key != last:
             out.append(
                 {
@@ -1223,6 +1230,7 @@ def timeline(ticks, every: bool = False) -> list[dict]:
                     "cause": health["cause"],
                     "failing_cases": health["failing_cases"],
                     "recovering": health["recovering"],
+                    "slow": {"since": slow["since"], "median_s": slow["median_s"], "baseline_p50_s": slow["baseline_p50_s"]} if slow else None,
                 }
             )
             last = key
@@ -1233,6 +1241,9 @@ def format_timeline(entries: list[dict]) -> str:
     lines = []
     for entry in entries:
         flag = " (recovering)" if entry["recovering"] else ""
+        slow = entry.get("slow")
+        if slow:
+            flag += f" (slow since {slow['since']}: median {slow['median_s'] // 60} min against {slow['baseline_p50_s'] // 60})"
         lines.append(f"{entry['at']}  {entry['state']:<8}  {entry['cause']}{flag}")
     return "\n".join(lines)
 

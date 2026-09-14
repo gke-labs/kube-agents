@@ -598,12 +598,17 @@ class SlowNote(RunHarness):
         self.assertEqual(len(self.opener.requests), 1)
         self.assertTrue(self.recorded()["slow"])
 
-    def test_the_note_goes_out_beside_a_change_and_moves_nothing_else(self):
-        doc = outage()
-        doc["slow"] = slow_note()
-        self.tick(doc, T0)
-        self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["🔴", "🐢"])
-        self.assertEqual((self.recorded()["state"], self.recorded()["slow"]), ("OUTAGE", True))
+    def test_a_note_that_vanishes_with_the_state_is_told_again_when_green_returns(self):
+        # health.py computes the note for GREEN ticks only, so an incident
+        # takes it away; the state file follows it down silently and the
+        # note after the recovery is a new episode, told once more.
+        self.tick(slow(), self.at(10))
+        self.tick(outage(), self.at(10, 15))
+        self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["🐢", "🔴"])
+        self.assertEqual((self.recorded()["state"], self.recorded()["slow"]), ("OUTAGE", False))
+        self.tick(slow(), self.at(10, 30))
+        self.assertEqual([text.split(" ")[0] for text in self.opener.texts][2:], ["🟢", "🐢"])
+        self.assertTrue(self.recorded()["slow"])
 
 
 # --------------------------------------------------------------------------- #

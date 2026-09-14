@@ -632,11 +632,12 @@ it}`) and `event` (`true` when the loss counts as a build-cluster event);
 the pages give it the same 2-hour lead on the Brief's window as a storm and
 a run-page banner of its own, and otherwise show the generic degraded
 headline. `issue` (`{number, url}`) may carry `condition`, the one it was
-filed for. `slow` is `null` or the slow-gate note (`{since, runs, min_s,
-median_s, max_s, baseline_days, baseline_runs, baseline_p50_s,
-baseline_p90_s, infra_reps}`, `docs/ci-health.md`, "A slow gate"); the pages
-read `since`, `runs`, `median_s`, `baseline_p50_s` and `baseline_days` for
-the one sentence the Brief's healthy headline adds while it is set.
+filed for. `slow` is `null` or, on a `GREEN` tick, the slow-gate note
+(`{since, runs, min_s, median_s, max_s, baseline_days, baseline_runs,
+baseline_p50_s, baseline_p90_s, infra_reps}`, `docs/ci-health.md`, "A slow
+gate"); the pages read `since`, `runs`, `median_s`, `baseline_p50_s` and
+`baseline_days` for the one sentence the Brief's healthy headline adds while
+it is set.
 
 `health-history.jsonl` is one JSON object per line, each the full
 `health.json` document as published at that tick plus

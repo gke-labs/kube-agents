@@ -755,6 +755,24 @@ class SlowGate(unittest.TestCase):
         legacy = {"state": "GREEN", "condition": None, "cause": "", "failing_cases": [], "since": health.iso(T0), "recovering": False}
         self.assertEqual(adjudicate(self.week([180] * 5), T0, legacy)["slow"]["since"], health.iso(T0))
 
+    def test_a_slow_gate_inside_an_incident_is_not_a_note(self):
+        # Three setup deaths on two pull requests in the last half hour make
+        # the state DEGRADED (rule 3); the same five slow runs are then the
+        # incident's symptom, not a note, and an episode in progress does not
+        # hold across the incident: GREEN afterwards starts one afresh.
+        earlier = T0 - timedelta(hours=1)
+        before = adjudicate(self.week([200] * 5, recent_end=earlier), earlier)
+        self.assertIsNotNone(before["slow"])
+        doc = self.week([200] * 5)
+        doc["runs"] += [run(300 + i, pr, T0 - timedelta(minutes=10 * i), minutes=1, result="FAILURE") for i, pr in enumerate([1, 1, 2])]
+        degraded = adjudicate(doc, T0, before)
+        self.assertEqual((degraded["state"], degraded["condition"]), ("DEGRADED", "setup_deaths"))
+        self.assertIsNone(degraded["slow"])
+        self.assertFalse(any(line.startswith("slow gate") for line in degraded["evidence"]), degraded["evidence"])
+        later = T0 + timedelta(hours=3)
+        again = adjudicate(self.week([200] * 5, recent_end=later), later, degraded)
+        self.assertEqual((again["state"], again["slow"]["since"]), ("GREEN", health.iso(later)))
+
     def test_repetitions_lost_in_the_slow_runs_are_counted(self):
         doc = self.week([200] * 5)
         doc["runs"][-1]["tasks"][-1] = task("case-17", "eee")
@@ -1027,6 +1045,15 @@ class SlowGateReplay(unittest.TestCase):
         )
         self.assertIn("slow gate: last 5 full runs 152–213 min (median 183) against a 7-day typical of 151 min (p90 198); 2 reps lost to infra", tick["evidence"])
         self.assertEqual(self.tick(day("09-14", 18, 30))["slow"]["since"], "2026-09-14T18:00:00+00:00", "the episode keeps its start")
+
+    def test_the_replay_timeline_shows_the_note_beside_the_state(self):
+        # `--replay` is how a threshold is re-checked on the next incident,
+        # so the note's edges are entries and the text form names them.
+        entries = health.timeline(self.every)
+        edge = next(e for e in entries if e["slow"] and health.parse_iso(e["at"]) >= day("09-14"))
+        self.assertEqual((edge["at"], edge["state"], edge["slow"]), ("2026-09-14T18:00:00+00:00", "GREEN", {"since": "2026-09-14T18:00:00+00:00", "median_s": 10984, "baseline_p50_s": 9085}))
+        self.assertIn("2026-09-14T18:00:00+00:00  GREEN      (slow since 2026-09-14T18:00:00+00:00: median 183 min against 151)", health.format_timeline([edge]))
+        self.assertTrue(all(e["slow"] is None for e in entries if day("09-12") <= health.parse_iso(e["at"]) < day("09-14", 18, 0)))
 
     def test_three_runs_above_the_seven_day_p90_would_not_have_fired(self):
         # The rule the issue proposed, checked at the tick the note appears:
