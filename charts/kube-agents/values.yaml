@@ -216,10 +216,11 @@ litellm:
   # recorded. Off everywhere real: a cached completion measures the cache,
   # not the model, so this exists for eval-cost experiments only.
   responseCache: ""
-  # Where the sidecar's package comes from, pinned to an immutable snapshot.
+  # Where the sidecar's package comes from, pinned to an immutable snapshot
+  # (a released version on PyPI; releases cannot be re-uploaded in place).
   # A runtime pull images.json cannot inventory, which is acceptable only
   # because the sidecar is off by default and experiment-scoped.
-  responseCachePackage: "https://github.com/haoxuw/cached-response/archive/0ffd7e73b9b9f901b753079fed8f740bd169cc12.tar.gz"
+  responseCachePackage: "cached-response==0.2.0"
   # model-default routes to <modelProvider>/<modelDefaultName>. Providers:
   # gemini, anthropic, openai, vertex_ai. The provider's API key must exist in
   # the credentials Secret — except vertex_ai, which authenticates with
