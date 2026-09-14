@@ -98,6 +98,18 @@ INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 _ATTACHMENTS_DIR = "/opt/data/kanban/attachments"
 _LOGS_DIR = "/opt/data/kanban/logs"
 
+# The board itself: hermes's kanban SQLite in the same data volume, resolved
+# the way hermes resolves it (env pin first, then the volume default). The
+# purge deletes this run's card rows so the next repetition's board listings
+# do not enumerate them -- board contents reach the model through
+# kanban_list/kanban_show tool results, and every leftover card makes those
+# results differ between repetitions of the same task (and grows the board
+# without bound across a run). Scoped to the run's own cards, so concurrent
+# units' live cards are never touched.
+_KANBAN_DB_ENV = "HERMES_KANBAN_DB"
+_KANBAN_DB_DEFAULT = "/opt/data/kanban.db"
+_KANBAN_DB_BUSY_TIMEOUT = 10  # seconds; matches the notifier's own writes
+
 # Bound on artifact text folded into one answer. The judge grades the output as
 # prose, so a worker that writes a large file would otherwise bury the reply.
 _MAX_ARTIFACT_BYTES = 20000
@@ -531,21 +543,52 @@ def _append_artifacts(result: AgentResult, task_ids: list[str], timeout: float) 
 
 
 def _purge_card_state(task_ids: list[str], timeout: float) -> None:
-    """Delete the attachments and worker log of every card this run filed.
+    """Delete the disk state and board rows of every card this run filed.
 
     The agent pod outlives the run, so without this each finished task leaves
     its report and its worker transcript on disk for the next run to find --
     which is how a repeat of a task reads back the previous attempt's answer
-    instead of doing the work. Scoped to cards this harness delegated, so it
-    cannot touch anything the run did not create.
+    instead of doing the work. The board rows go with them: a leftover card
+    shows up in every later run's kanban_list/kanban_show tool results, which
+    both grows the board without bound across an eval run and makes the same
+    task's repetitions see different board listings. Scoped to cards this
+    harness delegated, so it cannot touch anything the run did not create;
+    the row deletion is best-effort like the rest of :func:`_agent_shell`.
     """
     if not task_ids:
         return
     listing = " ".join(_shell_quote(t) for t in task_ids)
+    # Schema-agnostic on purpose: hermes owns the board schema and this repo
+    # only patches it, so the sweep deletes from every table keyed by task_id
+    # rather than naming tables that may move under an image bump.
+    board_cleanup = f"""
+import os, sqlite3, sys
+ids = [i for i in sys.argv[1:] if i]
+path = os.environ.get("{_KANBAN_DB_ENV}") or "{_KANBAN_DB_DEFAULT}"
+if ids and os.path.exists(path):
+    conn = sqlite3.connect(path, timeout={_KANBAN_DB_BUSY_TIMEOUT})
+    marks = ",".join("?" * len(ids))
+    names = [r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")]
+    with conn:
+        for name in names:
+            columns = {{r[1] for r in conn.execute(
+                'PRAGMA table_info("%s")' % name)}}
+            if "task_id" in columns:
+                conn.execute(
+                    'DELETE FROM "%s" WHERE task_id IN (%s)' % (name, marks),
+                    ids)
+        if "tasks" in names:
+            conn.execute("DELETE FROM tasks WHERE id IN (%s)" % marks, ids)
+    conn.close()
+"""
     script = (
         f"for t in {listing}; do "
         f'  rm -rf {_ATTACHMENTS_DIR}/"$t" {_LOGS_DIR}/"$t".log; '
-        "done"
+        "done; "
+        f"python3 - {listing} <<'PURGE_BOARD_ROWS'\n"
+        f"{board_cleanup}\n"
+        "PURGE_BOARD_ROWS"
     )
     _agent_shell(script, timeout)
 

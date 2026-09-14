@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
+import sqlite3
 import subprocess
+import sys
 import threading
 import time
 import urllib.error
@@ -2758,6 +2761,79 @@ def test_artifacts_are_read_before_the_card_state_is_purged(
 
     kinds = ["purge" if "rm -rf" in s else "read" for s in no_cluster_exec]
     assert kinds == ["read", "purge"]
+
+
+def test_the_purge_also_deletes_the_cards_board_rows(
+    stub_agent: _StubAgentServer, instant_polls: None, no_cluster_exec: list[str]
+) -> None:
+    """A leftover card poisons every later run's board listings.
+
+    kanban_list/kanban_show tool results enumerate the whole board, so a card
+    that outlives its run makes the same task's repetitions see different
+    listings and grows the board without bound across an eval run.
+    """
+    stub_agent.turns = [_create_turn(), _show_turn("done", result=_RCA_RESULT)]
+
+    KubeAgentsHarness().run("Find the root cause.")
+
+    purges = [s for s in no_cluster_exec if "rm -rf" in s]
+    assert len(purges) == 1
+    script = purges[0]
+    assert harness._KANBAN_DB_ENV in script
+    assert harness._KANBAN_DB_DEFAULT in script
+    assert f"python3 - {harness._shell_quote(_TASK_ID)}" in script
+    assert "DELETE FROM tasks WHERE id IN" in script
+
+
+def test_the_board_row_cleanup_deletes_only_the_named_cards(
+    stub_agent: _StubAgentServer,
+    instant_polls: None,
+    no_cluster_exec: list[str],
+    tmp_path: Path,
+) -> None:
+    """The embedded cleanup runs against a real board and spares other cards.
+
+    Executes the exact python the purge would run in the pod, pointed at a
+    scratch SQLite board via the same env pin hermes honors, and checks that
+    every table keyed by task_id loses the run's rows and nothing else.
+    """
+    stub_agent.turns = [_create_turn(), _show_turn("done", result=_RCA_RESULT)]
+    KubeAgentsHarness().run("Find the root cause.")
+    script = next(s for s in no_cluster_exec if "rm -rf" in s)
+    _, _, rest = script.partition("<<'PURGE_BOARD_ROWS'\n")
+    body, _, _ = rest.rpartition("\nPURGE_BOARD_ROWS")
+
+    board = tmp_path / "kanban.db"
+    conn = sqlite3.connect(board)
+    conn.executescript(
+        """
+        CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT);
+        CREATE TABLE task_events (id INTEGER PRIMARY KEY, task_id TEXT, kind TEXT);
+        CREATE TABLE kanban_notify_subs (task_id TEXT, platform TEXT);
+        """
+    )
+    for tid in (_TASK_ID, "t_survivor1"):
+        conn.execute("INSERT INTO tasks VALUES (?, 'done')", (tid,))
+        conn.execute("INSERT INTO task_events (task_id, kind) VALUES (?, 'created')", (tid,))
+        conn.execute("INSERT INTO kanban_notify_subs VALUES (?, 'chat')", (tid,))
+    conn.commit()
+    conn.close()
+
+    proc = subprocess.run(
+        [sys.executable, "-", _TASK_ID],
+        input=body,
+        text=True,
+        capture_output=True,
+        env={**os.environ, harness._KANBAN_DB_ENV: str(board)},
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    conn = sqlite3.connect(board)
+    assert [r[0] for r in conn.execute("SELECT id FROM tasks")] == ["t_survivor1"]
+    assert [r[0] for r in conn.execute("SELECT task_id FROM task_events")] == ["t_survivor1"]
+    assert [r[0] for r in conn.execute("SELECT task_id FROM kanban_notify_subs")] == ["t_survivor1"]
+    conn.close()
 
 
 def test_a_run_that_delegates_nothing_touches_no_pod(
