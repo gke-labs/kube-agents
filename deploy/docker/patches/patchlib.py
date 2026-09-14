@@ -138,6 +138,45 @@ class _Site:
 class Definition(_Site):
     """A module-level ``def`` located by name."""
 
+    @property
+    def body_indent(self) -> str:
+        """The body's indentation, as literal text, for an insert at :attr:`body_start`."""
+        return " " * self.node.body[0].col_offset
+
+    @property
+    def body_start(self) -> int:
+        """Start of the first body line after the docstring, for a prologue insert.
+
+        The place for code that has to run before anything else in the function
+        -- a stream wrapper installed ahead of the first print. With a docstring
+        the offset is the line after it, so the insert lands ahead of any
+        comment that introduces the first real statement rather than between
+        that comment and its statement; without one it is the first statement's
+        own line. A body that starts on the ``def`` line (``def f(): pass``) has
+        no line of its own to insert on, and is refused.
+        """
+        first = self.node.body[0]
+        starts = _line_starts(self.patch.source)
+        is_docstring = (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        )
+        if is_docstring and len(self.node.body) > 1:
+            return starts[first.end_lineno + 1]
+        if is_docstring:
+            raise self.patch._fail(
+                f"the {self.label} def {self.node.name}() has no body after "
+                f"its docstring. {self.patch.note}"
+            )
+        if first.lineno == self.node.lineno:
+            raise self.patch._fail(
+                f"the {self.label} def {self.node.name}() has its body on the "
+                f"def line, so there is no line to insert a prologue on. "
+                f"{self.patch.note}"
+            )
+        return starts[first.lineno]
+
     def expect_keyword_only(self, *names: str) -> None:
         """Assert the signature still declares each keyword-only parameter.
 
