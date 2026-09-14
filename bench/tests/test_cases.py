@@ -164,3 +164,27 @@ def test_yaml_is_loaded_safely(write_task):
     path = write_task("evil", "id: evil\nname: !!python/object/apply:os.system ['true']\n")
     with pytest.raises(CaseSpecError, match="not parseable as YAML"):
         load_case(path)
+
+
+def test_fixtures_are_read_as_a_tuple_of_roles(write_task):
+    spec = load_case(write_task("f", {"id": "f", "fixtures": ["crashloop-workload", " idle-nodepool "]}))
+    assert spec.fixtures == ("crashloop-workload", "idle-nodepool")
+
+
+def test_absent_fixtures_means_none(write_task):
+    assert load_case(write_task("nf", {"id": "nf"})).fixtures == ()
+    assert load_case(write_task("ef", {"id": "ef", "fixtures": []})).fixtures == ()
+
+
+@pytest.mark.parametrize("literal", ["crashloop-workload", {"role": "x"}, [1, 2], True])
+def test_fixtures_that_are_not_a_list_of_slugs_are_fatal(write_task, literal):
+    """A bare string would otherwise read as no fixtures at all, and the case
+    would lose its infrastructure excuse on the day its fixture drifts -- the
+    one moment the field is consulted (#1544)."""
+    with pytest.raises(CaseSpecError, match="fixtures: must be a list"):
+        load_case(write_task("bf", {"id": "bf", "fixtures": literal}))
+
+
+def test_the_real_crashloop_case_names_its_role():
+    spec = load_case(TASKS / "cluster-agent-crashloop-debug" / "task.yaml")
+    assert spec.fixtures == ("crashloop-workload",)

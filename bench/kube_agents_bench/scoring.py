@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import Any
 
 from kube_agents_bench.cases import NOOP_DEPLOYER, CaseSpec
+from kube_agents_bench.fleet import drift_reason
 
 __all__ = [
     "CaseVerdict",
@@ -517,6 +518,30 @@ def classify_rep(
         )
 
     has_infra = spec.deployer != NOOP_DEPLOYER
+
+    # A seeded fixture the case depends on was present but NOT in its designed
+    # state when the run leased the project (#1544): hack/fleet-fixture-state.py
+    # recorded it after the lease-time heal, and hack/ci-eval-pr.sh did not
+    # launch this case's units at all. Whatever the record holds -- usually
+    # nothing, since nothing ran -- is not evidence about the pull request:
+    # on 2026-09-07 this shape (payments-api Pending on every project) redded
+    # every open pull request for a day as a graded 0.0 (#1278). No noop
+    # carve-out, for the same reason as the transport marker below: this is
+    # the environment stating what happened, not an inference from an absent
+    # record, and a fixture that is not in shape is infrastructure whatever
+    # the task's deployer builds. Placed first because it is the strongest
+    # statement available: a record that somehow exists for a skipped unit
+    # was still measured against a fixture the cases were not written for.
+    drifted = [(role, drift_reason(role)) for role in spec.fixtures]
+    drifted = [(role, reason) for role, reason in drifted if reason]
+    if drifted:
+        named = "; ".join(f"{role}: {reason}" for role, reason in drifted)
+        return rep(
+            "infra",
+            "the seeded fixture this case depends on was not in its designed "
+            "state at lease time, so the case was not run and nothing here is "
+            f"evidence about the pull request ({named})",
+        )
 
     if record is None or record.empty_record:
         what = (

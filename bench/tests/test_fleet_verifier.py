@@ -1610,7 +1610,8 @@ def test_the_runner_writes_one_kubeconfig_per_catalog_role(shell, tmp_path):
     assert done.returncode == 0, done.stderr
     roles = set(_catalog()["roles"])
     assert {p.stem for p in out.glob("*.kubeconfig")} == roles
-    assert (out / ".fleet-context").read_text().strip() == "project=kube-agents-evals"
+    context = (out / ".fleet-context").read_text().splitlines()
+    assert context[0] == "project=kube-agents-evals"
     # And each role's file holds credentials for the cluster its catalog SLOT
     # discovered -- the whole point of the indirection. A role that resolved to
     # the wrong member of the trio would read a live cluster and report the
@@ -1936,3 +1937,108 @@ def test_the_runner_refuses_a_directory_it_did_not_create(tmp_path):
     assert done.returncode != 0
     assert "refusing to remove it" in done.stderr
     assert (victim / "keep-me").exists()
+
+
+# --------------------------------------------------------------------------
+# The designed-state half (#1544): what the runner records for it, what the
+# catalog declares, and what the scorer reads back.
+# --------------------------------------------------------------------------
+
+
+def test_the_runner_records_each_slots_cluster_for_the_state_pass(shell, tmp_path):
+    """hack/fleet-fixture-state.py reads slot b's and c's control planes with
+    `clusters describe`, and it must not discover clusters on its own: the
+    catalog's rule is that the runner is the one place a seeded cluster is
+    resolved. So the runner writes each resolved slot's name and location
+    into the context file, beside the project."""
+    out = _provision(shell, tmp_path)
+    context = (out / ".fleet-context").read_text().splitlines()
+    for slot in ("a", "b", "c"):
+        assert f"cluster.{slot}=seeded-{slot}" in context
+        assert f"location.{slot}=us-central1-a" in context
+    # And nothing for a slot that did not resolve: the state script reports
+    # its roles as not checked rather than describing a guessed name.
+    short = _provision(shell, tmp_path / "short", STUB_CLUSTERS="seeded-a\tus-central1-a\n")
+    context = (short / ".fleet-context").read_text().splitlines()
+    assert "cluster.a=seeded-a" in context
+    assert not any(line.startswith(("cluster.b=", "cluster.c=")) for line in context)
+
+
+def _state_module():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "fleet_fixture_state", _REPO / "hack" / "fleet-fixture-state.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_every_catalog_role_declares_its_designed_state():
+    """Presence is not state (#1278). A role with no `state` list would pass
+    the runner's probes while its fixture sat Pending, which is the outage
+    this half of the check exists to catch, so every role asserts something
+    and the assertions parse under the script that evaluates them."""
+    roles = _state_module().load_assertions(_CATALOG)
+    for role, spec in roles.items():
+        assert spec["state"], f"role {role!r} asserts nothing beyond presence"
+
+
+def test_every_state_subject_the_catalog_declares_is_something_the_terraform_plants():
+    """Same standard as the probes: an assertion on an object no apply creates
+    would hold the role drifted forever, and the presubmit would skip its
+    cases as infrastructure on every run."""
+    fleet_dir = _BENCH / "tf" / "fleet"
+    main = (fleet_dir / "main.tf").read_text()
+    seen = 0
+    for role, entry in _catalog()["roles"].items():
+        defects = fleet_dir / f"defects-{entry['cluster_slot']}.tf"
+        body = main + (defects.read_text() if defects.is_file() else "")
+        for assertion in entry["state"]:
+            subject = assertion["subject"]
+            if subject == "cluster":
+                # The GKE cluster itself, which main.tf declares for every slot
+                # (test_the_catalog_agrees_with_the_terraform_it_sits_beside).
+                continue
+            if "?" in subject:
+                selector = subject.split("?", 1)[1]
+                if not selector:
+                    continue  # `kind?`: every object of the kind, nothing named
+                target = selector.split("=")[-1]
+            else:
+                target = subject.split("/", 1)[1]
+            seen += 1
+            assert re.search(rf'(?:name|app)\s*=\s*"{re.escape(target)}"', body), (
+                f"role {role!r} asserts on {subject!r}, but nothing in main.tf or "
+                f"defects-{entry['cluster_slot']}.tf declares {target!r}"
+            )
+    assert seen, "no role asserts on a named subject; this test is vacuous"
+
+
+def test_drift_reason_reads_the_state_scripts_file(tmp_path):
+    (tmp_path / "crashloop-workload.drift").write_text(
+        "pod?app=payments-api status.containerStatuses[*].restartCount any_ge 1: observed 0\n"
+        "unread: deployment/x: kubectl get deployment failed\n"
+    )
+    reason = fleet.drift_reason("crashloop-workload", tmp_path)
+    assert reason == (
+        "pod?app=payments-api status.containerStatuses[*].restartCount any_ge 1: observed 0; "
+        "unread: deployment/x: kubectl get deployment failed"
+    )
+
+
+def test_drift_reason_is_none_when_nothing_was_recorded(tmp_path, monkeypatch):
+    assert fleet.drift_reason("crashloop-workload", tmp_path) is None
+    assert fleet.drift_reason("../../etc/passwd", tmp_path) is None
+    monkeypatch.delenv(FLEET_KUBECONFIG_DIR_ENV, raising=False)
+    assert fleet.drift_reason("crashloop-workload") is None
+    monkeypatch.setenv(FLEET_KUBECONFIG_DIR_ENV, str(tmp_path))
+    assert fleet.drift_reason("crashloop-workload") is None
+    (tmp_path / "crashloop-workload.drift").write_text("x\n")
+    assert fleet.drift_reason("crashloop-workload") == "x"
+
+
+def test_an_empty_drift_file_still_reads_as_drift(tmp_path):
+    (tmp_path / "idle-nodepool.drift").write_text("")
+    assert fleet.drift_reason("idle-nodepool", tmp_path) == "drift recorded without detail"

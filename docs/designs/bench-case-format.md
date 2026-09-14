@@ -84,7 +84,11 @@ a cluster knows which cases go quiet. The same slugs name a `fleet_resource_prop
 check's `fixture_role:`, and a check naming a role the case does not list is rejected —
 one planted defect, one name, however the case refers to it. Cases address fixtures by
 role and never by cluster name or project id; `docs/designs/bench-fleet-catalog.md` is
-the contract for why.
+the contract for why. The list has one runtime consumer as well (#1544): when the
+presubmit's fixture-state pass records a role as drifted — present but not in the state
+the catalog's `state` assertions describe — `hack/ci-eval-pr.sh` does not launch the
+cases that name it and `bench-gate` grades their repetitions as infrastructure, so a case
+that omits a role it depends on loses that excuse on the day the fixture drifts.
 
 A case whose spec reads live cluster state must declare it. `fixtures: []` is the
 declaration for a case that plants its own state — `gpu-stress-test-diagnosis` brings up

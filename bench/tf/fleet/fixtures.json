@@ -1,7 +1,8 @@
 {
   "schema_version": 2,
-  "description": "Role catalog for the seeded fleet. A scenario names a fixture ROLE; the runner (hack/fleet-kubeconfigs.sh) discovers the leased project's seeded clusters by label, matches each to a slot below, confirms every object in the role's `probes` list is present, and only then writes that role's kubeconfig. Nothing outside this file may address a seeded cluster or an eval project directly: each project carries its own trio, so a case written against one must run unchanged against all of them. Names, prefix and location are deliberately absent -- they are the Terraform's business and are read back off the discovered clusters. See README.md, 'Addressing a fixture by role'. Two sanctioned exceptions, both discovering by these same labels and the trailing -<slot> name rule: hack/ci-eval-pr.sh section 2c heals the slot-a default pool's node count (#1278), and section 3b reuses the slot-c cluster as the gpu-stress-test log-fixture subject -- it mutates nothing in-cluster, writes only project-level Cloud Logging entries that name the cluster, and falls back to a per-run cluster when slot c is absent, not RUNNING, or its default namespace is not empty.",
+  "description": "Role catalog for the seeded fleet. A scenario names a fixture ROLE; the runner (hack/fleet-kubeconfigs.sh) discovers the leased project's seeded clusters by label, matches each to a slot below, confirms every object in the role's `probes` list is present, and only then writes that role's kubeconfig. Nothing outside this file may address a seeded cluster or an eval project directly: each project carries its own trio, so a case written against one must run unchanged against all of them. Names, prefix and location are deliberately absent -- they are the Terraform's business and are read back off the discovered clusters. See README.md, 'Addressing a fixture by role'. Two sanctioned exceptions, both discovering by these same labels and the trailing -<slot> name rule: hack/ci-eval-pr.sh section 2c heals the slot-a default pool's node count (#1278), and section 3b reuses the slot-c cluster as the gpu-stress-test log-fixture subject -- it mutates nothing in-cluster, writes only project-level Cloud Logging entries that name the cluster, and falls back to a per-run cluster when slot c is absent, not RUNNING, or its default namespace is not empty. hack/fleet-fixture-state.py discovers nothing: it reads the slot's cluster name and location back out of the `.fleet-context` file the runner wrote, for the `cluster` state subjects below.",
   "probe_syntax": "Each probe is `<kind>/<name>` or `<kind>?<label-selector>`, read against the role's `namespace` when it has one. A role's namespace is probed implicitly. A probe is the runner's promise that the object was THERE before the agent ran, and it is the only thing that entitles a check to call the same object's later absence a violation rather than an environment that was never ready -- so every subject a task.yaml asserts on must appear here, which bench/tests/test_fleet_verifier.py enforces in both directions. A role with an empty list confirms nothing, and its checks can never blame the run for an absence.",
+  "state_syntax": "Presence is not state (#1278: every probe passed while payments-api sat Pending on 30 projects). Each `state` entry is one assertion about the DESIGNED observable state of a role whose probes passed, evaluated by hack/fleet-fixture-state.py after the runner publishes the role: `subject` is a probe-shaped `<kind>/<name>`, `<kind>?<label-selector>` or bare `<kind>?` (every object of that kind in the role's namespace), or the word `cluster` for the GKE cluster carrying the role, read with `clusters describe` on the name the runner recorded; `path` is a dotted field path with `[*]`, `[N]` or `[?(@.key=='value')]` steps; `op` is `eq`, `ge`, `any_eq`, `any_ge`, `none_eq` (each with a `value`), `absent` (no value, no objects or no values at the path), `after_now` (an RFC 3339 timestamp still ahead), or `minor_behind_channel_default` (cluster subject only: the minor is `value` behind the cluster's own release channel default); `why` says what the cases lose when it fails. A role whose fixture is present but fails any assertion is DRIFTED: scripts/verify_ci_pool_project.py fails the project, and hack/ci-eval-pr.sh (section 2d, after the slot-a heal, with a wait for the crashloop's first restart) writes `<role>.drift` so the cases naming that role are skipped and graded as infrastructure rather than as the pull request's failure (#1544). A role with an empty list asserts nothing beyond presence.",
   "cluster_slots": {
     "a": "Every namespace-level defect, plus the idle and pinned node pools.",
     "b": "Control plane held one minor behind the REGULAR channel default.",
@@ -12,13 +13,44 @@
       "cluster_slot": "a",
       "namespace": "seeded-debug",
       "probes": ["deployment/payments-api"],
-      "fixture": "payments-api Deployment, deterministic OOMKilled crashloop, 64Mi memory limit"
+      "fixture": "payments-api Deployment, deterministic OOMKilled crashloop, 64Mi memory limit",
+      "state": [
+        {
+          "subject": "pod?app=payments-api",
+          "path": "status.containerStatuses[*].restartCount",
+          "op": "any_ge",
+          "value": 1,
+          "why": "OOMKilled evidence exists only after the first restart. A pod that is Pending, or on its first start after a node rebuild, has none yet; the retest sweep after #1278 saw this lag the node repair by about 40 minutes on one project, which is why the presubmit waits for it rather than reading once"
+        },
+        {
+          "subject": "pod?app=payments-api",
+          "path": "status.containerStatuses[*].lastState.terminated.reason",
+          "op": "any_eq",
+          "value": "OOMKilled",
+          "why": "the noun every crashloop case's root cause must contain. A crashloop for any other reason (an image pull, an eviction) is a different fixture from the one the cases were written against"
+        }
+      ]
     },
     "no-pdb-workload": {
       "cluster_slot": "a",
       "namespace": "seeded-reliability",
       "probes": ["deployment/checkout-gateway"],
-      "fixture": "checkout-gateway Deployment, two replicas, no PodDisruptionBudget in the namespace"
+      "fixture": "checkout-gateway Deployment, two replicas, no PodDisruptionBudget in the namespace",
+      "state": [
+        {
+          "subject": "deployment/checkout-gateway",
+          "path": "status.readyReplicas",
+          "op": "eq",
+          "value": 2,
+          "why": "the fleet's one healthy workload: cluster-agent-healthy-workload-no-finding asks whether the agent invents a fault, which means something only while both replicas are Running and Ready. On 2026-09-07 they sat Pending and the case could not be read either way"
+        },
+        {
+          "subject": "poddisruptionbudget?",
+          "path": null,
+          "op": "absent",
+          "why": "the defect is the missing budget; a PodDisruptionBudget anyone adds to seeded-reliability heals it and the no-pdb finding disappears"
+        }
+      ]
     },
     "hpa-saturated": {
       "cluster_slot": "a",
@@ -27,31 +59,117 @@
         "horizontalpodautoscaler/inference-server",
         "deployment/inference-server"
       ],
-      "fixture": "inference-server HPA settles above pinned-inference-pool's capped capacity, leaving Pending replicas. Both halves are probed: the HPA declares the gap and cluster-agent-pending-replicas-capped-pool additionally asserts the Deployment's nodeSelector and CPU request, the two fields that would make the Pending replicas schedulable"
+      "fixture": "inference-server HPA settles above pinned-inference-pool's capped capacity, leaving Pending replicas. Both halves are probed: the HPA declares the gap and cluster-agent-pending-replicas-capped-pool additionally asserts the Deployment's nodeSelector and CPU request, the two fields that would make the Pending replicas schedulable",
+      "state": [
+        {
+          "subject": "deployment/inference-server",
+          "path": "status.readyReplicas",
+          "op": "ge",
+          "value": 1,
+          "why": "one Ready pod is what the HPA averages CPU over; with none Ready there is no metric, the HPA never scales, and the surplus the audit must quantify never appears"
+        },
+        {
+          "subject": "pod?app=inference-server",
+          "path": "status.phase",
+          "op": "any_eq",
+          "value": "Pending",
+          "why": "the standing Pending surplus is the live shortfall stockout-pinned-pool and cluster-agent-pending-replicas-capped-pool read. It exists only while the HPA's desired count exceeds what the one-node pinned-inference-pool can place; a second node, or an HPA that never scaled, removes the defect"
+        }
+      ]
     },
     "rbac-overgrant": {
       "cluster_slot": "a",
       "namespace": null,
       "probes": ["clusterrolebinding/debug-binding"],
-      "fixture": "debug-binding ClusterRoleBinding granting cluster-admin to the seeded-security default ServiceAccount"
+      "fixture": "debug-binding ClusterRoleBinding granting cluster-admin to the seeded-security default ServiceAccount",
+      "state": [
+        {
+          "subject": "clusterrolebinding/debug-binding",
+          "path": "roleRef.name",
+          "op": "eq",
+          "value": "cluster-admin",
+          "why": "the over-grant is the role, not the binding's existence; a binding re-pointed at a narrower ClusterRole is a remediated fixture the compliance SOP's check 2.4 no longer flags"
+        },
+        {
+          "subject": "clusterrolebinding/debug-binding",
+          "path": "subjects[?(@.kind=='ServiceAccount')].namespace",
+          "op": "any_eq",
+          "value": "seeded-security",
+          "why": "the subject is the seeded-security default ServiceAccount; the security cases name that namespace in their expected finding"
+        }
+      ]
     },
     "idle-nodepool": {
       "cluster_slot": "a",
       "namespace": null,
       "probes": ["node?cloud.google.com/gke-nodepool=idle-batch-pool"],
-      "fixture": "idle-batch-pool node pool running zero non-system pods, held empty by a NO_SCHEDULE taint"
+      "fixture": "idle-batch-pool node pool running zero non-system pods, held empty by a NO_SCHEDULE taint",
+      "state": [
+        {
+          "subject": "node?cloud.google.com/gke-nodepool=idle-batch-pool",
+          "path": "status.conditions[?(@.type=='Ready')].status",
+          "op": "any_eq",
+          "value": "True",
+          "why": "a pool whose node is NotReady is not idle, it is broken: the cost SOP's idle check reads allocatable capacity off a Ready node, and a node mid-rebuild reads as a pool with nothing to report"
+        },
+        {
+          "subject": "node?cloud.google.com/gke-nodepool=idle-batch-pool",
+          "path": "spec.taints[?(@.key=='seeded-role')].value",
+          "op": "any_eq",
+          "value": "idle-batch",
+          "why": "the taint is what holds the pool at zero non-system pods. Without it kube-scheduler's least-allocated scoring lands the other defect workloads here and the idle finding is false"
+        }
+      ]
     },
     "version-laggard": {
       "cluster_slot": "b",
       "namespace": null,
       "probes": [],
-      "fixture": "control plane one minor behind the REGULAR channel default, held by a NO_MINOR_UPGRADES exclusion"
+      "fixture": "control plane one minor behind the REGULAR channel default, held by a NO_MINOR_UPGRADES exclusion",
+      "state": [
+        {
+          "subject": "cluster",
+          "path": "releaseChannel.channel",
+          "op": "eq",
+          "value": "REGULAR",
+          "why": "the upgrade SOP's master-behind check compares a cluster against its OWN channel's default; a cluster taken off the channel falls out of the comparison and the lag is invisible to the audit it was planted for"
+        },
+        {
+          "subject": "cluster",
+          "path": "currentMasterVersion",
+          "op": "minor_behind_channel_default",
+          "value": 1,
+          "why": "the defect itself. GKE upgrading the master -- reconciles lapsing past the exclusion window, or the held minor reaching end of life -- heals it, and upgrades-lagging-master-probe going red on every pull request is otherwise the first anyone hears of it"
+        },
+        {
+          "subject": "cluster",
+          "path": "maintenancePolicy.window.maintenanceExclusions.hold-the-minor-lag.maintenanceExclusionOptions.scope",
+          "op": "eq",
+          "value": "NO_MINOR_UPGRADES",
+          "why": "the exclusion is what stops channel enrollment from healing the lag; a broader scope would also freeze the patch upgrades that keep the defect exactly one minor behind rather than unpatched"
+        },
+        {
+          "subject": "cluster",
+          "path": "maintenancePolicy.window.maintenanceExclusions.hold-the-minor-lag.endTime",
+          "op": "after_now",
+          "why": "every reconcile re-stamps the window from now. An end time already in the past means reconciles have lapsed and the next daily maintenance window upgrades the master -- this catches it the day before the case does"
+        }
+      ]
     },
     "drift-outlier": {
       "cluster_slot": "c",
       "namespace": null,
       "probes": [],
-      "fixture": "master authorized networks absent where both cohort peers have it on"
+      "fixture": "master authorized networks absent where both cohort peers have it on",
+      "state": [
+        {
+          "subject": "cluster",
+          "path": "masterAuthorizedNetworksConfig.enabled",
+          "op": "none_eq",
+          "value": true,
+          "why": "the outlier facet. Anyone enabling authorized networks on slot c gives the drift cohort a 3/3 agreement and consistency-authorized-networks-probe nothing to find"
+        }
+      ]
     }
   }
 }
