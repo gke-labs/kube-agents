@@ -125,16 +125,24 @@ prettier-write: ## Reformat all Markdown/YAML in place.
 # `# shellcheck disable=SCnnnn # reason`, so widening this list is how a real
 # finding gets silenced. Wiring the target into CI is a workflow edit and a
 # separate change.
+#
+# The scripts under agents/platform/skills/gke-*/ are left out. Those trees are
+# copies of google/skills that scripts/sync-upstream-skills.py deletes and
+# re-copies wholesale (AGENTS.md, Skills Guidelines), and its substitution
+# hooks rewrite SKILL.md only, so a directive or fix written into one of their
+# .sh files lasts until the next sync and the target goes red on a tree nobody
+# edited by hand. A warning in one of them is fixed upstream, not here.
 SHELLCHECK_PATHSPEC := *.sh
+SHELLCHECK_SKIP_PATHSPEC := :!agents/platform/skills/gke-*
 SHELLCHECK_SEVERITY := warning
 SHELLCHECK_EXCLUDE := SC1090,SC1091
 
-shellcheck: ## Run shellcheck over every tracked .sh file at warning severity.
+shellcheck: ## Run shellcheck over every tracked .sh file (upstream-synced gke-* skills excepted) at warning severity.
 	@command -v shellcheck >/dev/null 2>&1 || { \
 		echo "shellcheck needs the shellcheck binary: apt install shellcheck, brew install shellcheck, or see https://github.com/koalaman/shellcheck#installing"; \
 		exit 1; \
 	}
-	@git ls-files -z '$(SHELLCHECK_PATHSPEC)' | xargs -0 shellcheck -x -S $(SHELLCHECK_SEVERITY) -e $(SHELLCHECK_EXCLUDE)
+	@git ls-files -z '$(SHELLCHECK_PATHSPEC)' '$(SHELLCHECK_SKIP_PATHSPEC)' | xargs -0 shellcheck -x -S $(SHELLCHECK_SEVERITY) -e $(SHELLCHECK_EXCLUDE)
 
 # ruff's error-only rules: syntax errors (E9), comparisons that are always
 # wrong (F63), misplaced control flow (F7) and undefined names (F82) -- the
