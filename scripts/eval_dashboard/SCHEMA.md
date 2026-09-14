@@ -623,7 +623,7 @@ block, the report page and the digest say instead of "no night".
 `state` (`GREEN|DEGRADED|OUTAGE`), `condition`
 (`shared_break|storm|setup_deaths|lost_pods`), `since`, `cause`, `advice`,
 `failing_cases`, `tracking_issues`, `incident`, `recovering`, `stale`,
-`generated_at`, `tick`. Any other state, or an unreadable file, means no
+`slow`, `generated_at`, `tick`. Any other state, or an unreadable file, means no
 verdict: the Brief says no verdict is published and shows the last 24
 hours in numbers and the runs, the PR view classifies from the runs alone
 and shows no gate banner. Only a `GREEN` verdict reads as healthy. For
@@ -632,7 +632,11 @@ it}`) and `event` (`true` when the loss counts as a build-cluster event);
 the pages give it the same 2-hour lead on the Brief's window as a storm and
 a run-page banner of its own, and otherwise show the generic degraded
 headline. `issue` (`{number, url}`) may carry `condition`, the one it was
-filed for.
+filed for. `slow` is `null` or the slow-gate note (`{since, runs, min_s,
+median_s, max_s, baseline_days, baseline_runs, baseline_p50_s,
+baseline_p90_s, infra_reps}`, `docs/ci-health.md`, "A slow gate"); the pages
+read `since`, `runs`, `median_s`, `baseline_p50_s` and `baseline_days` for
+the one sentence the Brief's healthy headline adds while it is set.
 
 `health-history.jsonl` is one JSON object per line, each the full
 `health.json` document as published at that tick plus
@@ -718,6 +722,11 @@ nodes went NotReady — with its twenty zero-task reds re-read by
 `collect.build_run` so they carry `has_build_log` and the `pod_*` trio
 (`trim` keeps those fields when the source has them); the same test file
 asserts it reads as `lost_pods` and not as setup deaths.
+`testdata_health/slow-gate-2026-09-14.json.gz` is the same cut for
+[2026-09-07 18:00Z, 2026-09-14 18:20Z) — the seven days the slow-gate rule's
+baseline needs, ending on the afternoon every run was green and three hours
+long (#1586); the test asserts the `slow` note from 18:00Z that day and none
+over the 09-12/13 weekend.
 
 `testdata_classify/incidents.json.gz` holds a published `data.json`'s runs
 for two windows of the week of 2026-09-01 (PR #913's last runs on 09-04/05;

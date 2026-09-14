@@ -502,6 +502,9 @@ def normalize_health(raw) -> dict | None:
         return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
 
     incident = raw.get("incident") if isinstance(raw.get("incident"), dict) else None
+    # The slow-gate note (health.py rule 7): the fields the Brief's one
+    # sentence reads; the rest of the note stays in health.json.
+    slow = raw.get("slow") if isinstance(raw.get("slow"), dict) else None
     return {
         "state": state,
         "condition": raw["condition"] if isinstance(raw.get("condition"), str) else None,
@@ -519,6 +522,13 @@ def normalize_health(raw) -> dict | None:
             "window_start": incident.get("window_start") if incident and iso_ms(incident.get("window_start")) is not None else None,
             "window_end": incident.get("window_end") if incident and iso_ms(incident.get("window_end")) is not None else None,
         } if incident else None,
+        "slow": {
+            "since": slow.get("since") if iso_ms(slow.get("since")) is not None else None,
+            "runs": slow.get("runs") if is_count(slow.get("runs")) else None,
+            "median_s": slow.get("median_s") if is_count(slow.get("median_s")) else None,
+            "baseline_p50_s": slow.get("baseline_p50_s") if is_count(slow.get("baseline_p50_s")) else None,
+            "baseline_days": slow.get("baseline_days") if is_count(slow.get("baseline_days")) else None,
+        } if slow else None,
         "tick": raw["tick"] if iso_ms(raw.get("tick")) is not None else None,
     }
 

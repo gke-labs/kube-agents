@@ -193,6 +193,16 @@ class HealthInputsTest(unittest.TestCase):
         self.assertIsNone(full["since"])
         self.assertEqual(full["tracking_issues"], ["#1278"])
         self.assertEqual(full["incident"]["prs"], [1275, 1246])
+        # The slow-gate note: the five fields the Brief's sentence reads,
+        # each defaulted; the rest of the note is not carried.
+        self.assertIsNone(minimal["slow"])
+        note = {"since": "2026-09-14T18:00:00+00:00", "runs": 5, "median_s": 10984, "baseline_p50_s": 9085, "baseline_days": 7, "max_s": 12836, "infra_reps": 2}
+        self.assertEqual(
+            render.normalize_health(health_doc("GREEN", slow=note))["slow"],
+            {"since": "2026-09-14T18:00:00+00:00", "runs": 5, "median_s": 10984, "baseline_p50_s": 9085, "baseline_days": 7},
+        )
+        self.assertIsNone(render.normalize_health(health_doc("GREEN", slow={"median_s": "long"}))["slow"]["median_s"])
+        self.assertIsNone(render.normalize_health(health_doc("GREEN", slow=[]))["slow"])
 
     def test_load_health_degrades_on_absent_or_broken_files(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -589,6 +599,18 @@ class BrowserTest(unittest.TestCase):
         # the text post_health.dashboard_link writes for the same incident.
         self.assertIn('href="index.html#since=2026-09-07T14:00:00Z&amp;until=2026-09-08T01:00:00Z&amp;cases=' + ",".join(CRASHLOOP_TRIO) + '&amp;view=gate"', app)
         self.assertNotIn("index.html?", app)
+
+    def test_healthy_brief_says_when_the_gate_is_slow(self):
+        # health.py's rule-7 note (#1586), dated 8:00 AM ET on the page's
+        # Tuesday: one sentence in the healthy headline, nothing else moves.
+        note = {"since": "2026-09-08T12:00:00+00:00", "runs": 5, "min_s": 9161, "median_s": 10984, "max_s": 12836,
+                "baseline_days": 7, "baseline_runs": 264, "baseline_p50_s": 9085, "baseline_p90_s": 11919, "infra_reps": 2}
+        out = render_to(pathlib.Path(self.tmp.name) / "slow", self.data, health=health_doc("GREEN", slow=note))
+        app = dom_text(out / "index.html")
+        self.assertIn("Smoke gate is healthy", app)
+        self.assertIn("Runs are slow since Tue 8:00 AM ET: the last 5 full runs took a median of 183 min against a 7-day typical of 151. Nothing is broken; /retest won't make yours faster.", app)
+        control = dom_text(render_to(pathlib.Path(self.tmp.name) / "notslow", self.data, health=health_doc("GREEN")) / "index.html")
+        self.assertNotIn("Runs are slow", control)
 
     def test_healthy_brief_without_any_health_files(self):
         out = render_to(pathlib.Path(self.tmp.name) / "nohealth", self.data)

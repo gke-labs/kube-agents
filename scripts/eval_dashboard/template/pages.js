@@ -190,6 +190,8 @@ function normalizeHealth(raw) {
   const text = (key) => (typeof raw[key] === "string" ? raw[key] : "");
   const list = (key) => (Array.isArray(raw[key]) ? raw[key].filter((v) => typeof v === "string") : []);
   const incident = raw.incident && typeof raw.incident === "object" ? raw.incident : null;
+  const slow = raw.slow && typeof raw.slow === "object" ? raw.slow : null;
+  const count = (v) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : null);
   return {
     state,
     condition: typeof raw.condition === "string" ? raw.condition : null,
@@ -207,8 +209,25 @@ function normalizeHealth(raw) {
       window_start: parseIso(incident.window_start) != null ? incident.window_start : null,
       window_end: parseIso(incident.window_end) != null ? incident.window_end : null,
     } : null,
+    // The slow-gate note (health.py rule 7), as render.py normalizes it.
+    slow: slow ? {
+      since: parseIso(slow.since) != null ? slow.since : null,
+      runs: count(slow.runs),
+      median_s: count(slow.median_s),
+      baseline_p50_s: count(slow.baseline_p50_s),
+      baseline_days: count(slow.baseline_days),
+    } : null,
     tick: parseIso(raw.tick) != null ? raw.tick : null,
   };
+}
+
+// One sentence for the Brief's headline while the gate is slow; "" otherwise.
+// Same numbers as the Chat note, without the range and the p90.
+function slowSentence(h) {
+  const s = h && h.slow;
+  if (!s || s.median_s == null || s.baseline_p50_s == null) return "";
+  const since = s.since ? ` since ${esc(et(parseIso(s.since)))}` : "";
+  return ` Runs are slow${since}: the last ${s.runs ?? "few"} full runs took a median of ${Math.round(s.median_s / 60)} min against a ${s.baseline_days ?? "7"}-day typical of ${Math.round(s.baseline_p50_s / 60)}. Nothing is broken; /retest won't make yours faster.`;
 }
 
 /* ---- URL contract ---- */
@@ -727,7 +746,7 @@ function briefHtml(link) {
     let head, lede, pill;
     if (healthy) {
       head = "Smoke gate is healthy";
-      lede = `No shared breaks, quota storms or setup failures right now. ${n.green} of ${n.green + n.reds} concluded runs in the last 24 hours were green.${health.stale ? " The data behind this state has stopped refreshing." : ""}`;
+      lede = `No shared breaks, quota storms or setup failures right now. ${n.green} of ${n.green + n.reds} concluded runs in the last 24 hours were green.${health.stale ? " The data behind this state has stopped refreshing." : ""}${slowSentence(health)}`;
       pill = pillHtml(health.stale ? "DEGRADED" : "GREEN", health.stale ? "HEALTHY · STALE" : "HEALTHY");
     } else if (noVerdict) {
       // No health.json beside the data: the runs alone cannot say the gate is healthy.
