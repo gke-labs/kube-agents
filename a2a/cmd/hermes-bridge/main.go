@@ -31,19 +31,19 @@ const (
 	// cannot default; it is the code the sidecar has always used for it.
 	exitUsage = 2
 
-	// defaultProfile is the hermes profile the bridge answers for; the
-	// sidecar sits in the platform-agent pod.
-	defaultProfile = "platform"
-	// defaultConcurrency is how many hermes subprocesses run at once.
-	defaultConcurrency = 2
-	// defaultTaskDeadlineSeconds bounds one task's hermes invocation; two
-	// hours covers a long investigation without holding a slot forever.
+	// The default* values below are the environment's spelling of the
+	// zero-value defaults hermesbridge.Config applies in defaults()
+	// (a2a/hermes-bridge/bridge.go); the two must agree, because a variable
+	// left unset and one set to its default have to configure the same
+	// bridge. defaultConcurrency and defaultTaskDeadlineSeconds are the
+	// platform profile's concurrency and activeDeadlineSeconds in
+	// docs/designs/spec-subagent-profiles.md, which is where the numbers
+	// come from.
+	defaultProfile             = "platform"
+	defaultConcurrency         = 2
 	defaultTaskDeadlineSeconds = 7200
-	// defaultKillGraceSeconds is how long a SIGTERMed hermes has to flush
-	// before the bridge stops waiting for it.
-	defaultKillGraceSeconds = 10
-	// defaultKVBucket is the JetStream KV bucket the bridge keeps task state in.
-	defaultKVBucket = "runtime-state"
+	defaultKillGraceSeconds    = 10
+	defaultKVBucket            = "runtime-state"
 )
 
 // errUsage is what realMain returns when NATS_URL is missing, so run can

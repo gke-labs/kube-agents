@@ -8,7 +8,14 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+
+	"github.com/nats-io/nats.go"
 )
+
+// unreachableNATSURL is a loopback port nothing listens on. lib.Connect
+// dials once with no retry-on-failed-connect, so a refused port fails the
+// dial immediately rather than waiting out a timeout.
+const unreachableNATSURL = "nats://127.0.0.1:1"
 
 // A missing NATS_URL is the one failure the bridge reports with a usage exit,
 // and it is decided before anything is dialed, so a test can reach it.
@@ -25,6 +32,26 @@ func TestRunMapsUsageErrorToExitUsage(t *testing.T) {
 	t.Setenv("NATS_URL", "")
 	if got := run(); got != exitUsage {
 		t.Errorf("run() = %d, want %d", got, exitUsage)
+	}
+}
+
+// Every failure after the environment is read is the failure exit, not the
+// usage exit and not a clean zero: a bridge that cannot reach the bus must
+// show as Error in the pod, not Completed. The dial is the first such
+// failure a test can reach without a bus.
+func TestRunMapsDialFailureToExitFailure(t *testing.T) {
+	t.Setenv("NATS_URL", unreachableNATSURL)
+	t.Setenv("NATS_USER", "")
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	err := realMain(context.Background(), log)
+	if !errors.Is(err, nats.ErrNoServers) {
+		t.Fatalf("realMain against %s returned %v, want a wrapped nats.ErrNoServers", unreachableNATSURL, err)
+	}
+	if errors.Is(err, errUsage) {
+		t.Fatalf("realMain dial failure %v satisfies errUsage; it must not", err)
+	}
+	if got := run(); got != exitFailure {
+		t.Errorf("run() = %d, want %d", got, exitFailure)
 	}
 }
 
