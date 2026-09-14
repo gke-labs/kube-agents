@@ -1107,7 +1107,23 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_kanban_guardr
 # itself was installed by its own stage.
 # See the module docstring in deploy/docker/patches/kanban_children_settled.py.
 #
-# All six patches ship in ONE COPY + ONE RUN on purpose. This stage is the base
+# credential-redaction: a kanban worker that pasted a GCP access token into a
+# curl left it in plaintext on the PVC (#603). Upstream already redacts
+# agent.log and the terminal-output spill; the two sinks it did not cover are
+# the worker transcript (<board>/logs/<task>.log, the file kanban_db.py hands
+# Popen as the worker's stdout) and the `💻 $` completion line, which renders
+# the whole command. Registers the ya29. pattern through upstream's own plugin
+# registry from a trailer on agent/redact.py, gives display.py's
+# redact_tool_args_for_display a terminal/execute_code branch, and installs a
+# line-redacting stdout/stderr wrapper as the first statement of the console
+# entry point, live only when HERMES_KANBAN_TASK is set and stdout is not a
+# TTY. Order-independent w.r.t. every other patch: no other applier edits
+# agent/redact.py, agent/display.py or hermes_cli/main.py. The module lands in
+# /opt/hermes/agent, which no chmod loop walks, so its mode is stated at the
+# write site with install -m.
+# See the module docstring in deploy/docker/patches/credential_redaction.py.
+#
+# Every patch in this block ships in ONE COPY + ONE RUN on purpose. This stage is the base
 # for `platform`, and the block-per-patch layout these would normally get pushed
 # that chain past Docker's layer-depth ceiling ("max depth exceeded" on build
 # f9f1747c, 2026-08-07). The guarantees are unchanged — same appliers,
@@ -1131,6 +1147,9 @@ COPY deploy/docker/patches/kanban_wake_nudge.py \
      deploy/docker/patches/apply_kanban_children_settled.py \
      deploy/docker/patches/verify_kanban_children_settled.py \
      deploy/docker/patches/kanban_result_required.py \
+     deploy/docker/patches/credential_redaction.py \
+     deploy/docker/patches/apply_credential_redaction.py \
+     deploy/docker/patches/verify_credential_redaction.py \
      deploy/docker/patches/patchlib.py \
      /tmp/latency-patches/
 # `install -m 0644`, not `cp`, for the first line. `cp` gives a newly created
@@ -1174,6 +1193,11 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     grep -qF '_kanban_record_worker_child(conn, new_tid)' /opt/hermes/tools/kanban_tools.py && \
     grep -qF 'tid, _kanban_children_connect, result' /opt/hermes/tools/kanban_tools.py && \
     grep -q "from tools.kanban_children_settled import" /opt/hermes/tools/kanban_tools.py && \
+    install -m 0644 /tmp/latency-patches/credential_redaction.py /opt/hermes/agent/credential_redaction.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/apply_credential_redaction.py /opt/hermes && \
+    test "$(grep -c '_kube_agents_register_patterns()' /opt/hermes/agent/redact.py)" = "1" && \
+    test "$(grep -c '_kube_agents_redact_tool_argument' /opt/hermes/agent/display.py)" = "2" && \
+    test "$(grep -c '_kube_agents_install_transcript_redaction()' /opt/hermes/hermes_cli/main.py)" = "1" && \
     cd /opt/hermes && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_wake_nudge.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_auto_subscribe.py && \
@@ -1181,6 +1205,7 @@ RUN install -m 0644 /tmp/latency-patches/kanban_wake_nudge.py /opt/hermes/hermes
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_notify_delivery.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_event_routing.py && \
     /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_kanban_children_settled.py && \
+    /opt/hermes/.venv/bin/python3 /tmp/latency-patches/verify_credential_redaction.py && \
     rm -rf /tmp/latency-patches
 
 
