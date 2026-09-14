@@ -67,7 +67,7 @@ readonly KUBECTL_REQUEST_TIMEOUT="${CI_TEARDOWN_KUBECTL_REQUEST_TIMEOUT:-30s}"
 readonly PROW_BOSKOS_DEFAULT_HOST="http://boskos.boskos.svc.cluster.local"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "${REPO_ROOT}"
+cd "${REPO_ROOT}" || exit 1
 
 # 1. Target Cluster Context
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

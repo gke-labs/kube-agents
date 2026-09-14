@@ -558,7 +558,7 @@ echo "✓ Chart deployment finished in $((SECONDS - STEP_START))s"
 # its own gate with diagnostics.
 STEP_START=$SECONDS
 echo "=== [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] Verifying platform-agent rollout ==="
-for i in {1..60}; do
+for _ in {1..60}; do
   kubectl get deployment platform-agent-gateway -n "${NAMESPACE}" >/dev/null 2>&1 && break
   sleep 5
 done
@@ -575,7 +575,7 @@ fi
 # stuck on ImagePullBackOff is an install this job must fail rather than pass.
 # Gated separately for the same reason the Deployment is -- the operator
 # creates it from the CR, so `helm --wait` never saw it.
-for i in {1..60}; do
+for _ in {1..60}; do
   kubectl get statefulset platform-agent-shell -n "${NAMESPACE}" >/dev/null 2>&1 && break
   sleep 5
 done
@@ -619,7 +619,7 @@ for ((attempt = 1; attempt <= CONNECTIVITY_ATTEMPTS; attempt++)); do
   PF_PID=$!
 
   echo "Waiting for platform-agent port-forward on port 8642 (attempt ${attempt}/${CONNECTIVITY_ATTEMPTS})..."
-  for i in {1..30}; do
+  for _ in {1..30}; do
     if nc -z localhost 8642 2>/dev/null; then
       break
     fi

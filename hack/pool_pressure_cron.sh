@@ -14,7 +14,8 @@
 # list of environment variables.
 set -euo pipefail
 
-readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+readonly REPO_ROOT
 readonly CHECK="${REPO_ROOT}/scripts/pool_pressure.py"
 
 readonly PYTHON="${POOL_PRESSURE_PYTHON:-python3}"

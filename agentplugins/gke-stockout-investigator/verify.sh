@@ -7,8 +7,6 @@ set -euo pipefail
 # that the platform agent processes the alert.
 # ==============================================================================
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
 PROJECT_ID="${GCP_PROJECT_ID:-${PROJECT_ID:-$(gcloud config get-value project 2>/dev/null || echo "")}}"
 if [ -z "$PROJECT_ID" ]; then
     echo "Error: Could not determine GCP Project ID. Set GCP_PROJECT_ID or PROJECT_ID."

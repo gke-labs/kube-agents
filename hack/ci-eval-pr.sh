@@ -1123,7 +1123,8 @@ export TF_VAR_prow_pull_number="${PULL_NUMBER:-}"
 
 # 4. Token & Model Configuration
 # Dynamically fetches API_SERVER_KEY from GKE secret and locks down Gemini 3.1
-export PLATFORM_AGENT_TOKEN="$(kubectl get secret platform-agent-secrets -n "${TARGET_NAMESPACE}" -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode)"
+PLATFORM_AGENT_TOKEN="$(kubectl get secret platform-agent-secrets -n "${TARGET_NAMESPACE}" -o jsonpath='{.data.API_SERVER_KEY}' | base64 --decode)"
+export PLATFORM_AGENT_TOKEN
 export JUDGE_API_KEY="${GEMINI_API_KEY}"
 export JUDGE_PROVIDER="google"
 # The judge is pinned INDEPENDENTLY of the agent, and the invariant is:
