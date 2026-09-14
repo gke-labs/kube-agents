@@ -700,7 +700,8 @@ def test_blocked_and_infra_counts_stay_out_of_the_rate(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# Who decides: the record once it holds a full window, the bootstrap list
+# Who decides. In record mode (the library default, and what these first
+# two tests pin): the record once it holds a full window, the bootstrap list
 # until then. `admission()` is `is_admitted()` with the source attached.
 # --------------------------------------------------------------------------
 
@@ -756,3 +757,97 @@ def test_the_bootstrap_list_is_the_fallback_while_the_record_cannot_judge(tmp_pa
         "planted-pdb", KEY, bar=AdmissionBar(), bootstrap=frozenset()
     )
     assert unlisted.admitted is False and unlisted.source == "neither"
+
+
+# --------------------------------------------------------------------------
+# Roster mode: the list decides, the record informs (#1493).
+# --------------------------------------------------------------------------
+
+
+def test_admission_mode_defaults_to_roster_and_refuses_a_typo():
+    from kube_agents_bench.baselines import admission_mode
+
+    assert admission_mode({}) == "roster"
+    assert admission_mode({"EVAL_ADMISSION_MODE": ""}) == "roster"
+    assert admission_mode({"EVAL_ADMISSION_MODE": " Record "}) == "record"
+    with pytest.raises(ValueError, match="EVAL_ADMISSION_MODE='records'"):
+        admission_mode({"EVAL_ADMISSION_MODE": "records"})
+    with pytest.raises(ValueError, match="expected one of roster, record"):
+        BaselineStore({}).admission("x", KEY, bar=AdmissionBar(), mode="list")
+
+
+def test_the_record_verdict_is_the_same_five_states_in_either_mode(tmp_path):
+    """Pure evidence: computed before the list is consulted and reported on
+    every decision, so "would admit" in roster mode means exactly "admitted"
+    in record mode."""
+    import dataclasses
+
+    store = BaselineStore.load(tmp_path)
+    assert store.record_verdict("planted-pdb", KEY, bar=AdmissionBar()).state == "none"
+    assert store.record_verdict("planted-pdb", None, bar=AdmissionBar()).state == "none"
+
+    old_key = dataclasses.replace(KEY, judge_model="gemini-3.0-judge")
+    write_store(tmp_path, "planted-pdb", [record(old_key, runs=20, passes=20)])
+    assert BaselineStore.load(tmp_path).record_verdict(
+        "planted-pdb", KEY, bar=AdmissionBar()
+    ).state == "stale"
+
+    write_store(tmp_path, "planted-pdb", [record(runs=9, passes=9)])
+    assert BaselineStore.load(tmp_path).record_verdict(
+        "planted-pdb", KEY, bar=AdmissionBar()
+    ).state == "collecting"
+
+    write_store(tmp_path, "planted-pdb", [record(runs=20, passes=12)])
+    verdict = BaselineStore.load(tmp_path).record_verdict("planted-pdb", KEY, bar=AdmissionBar())
+    assert verdict.state == "would-demote" and verdict.full_window
+    assert verdict.detail.startswith("screened at 12/20")
+
+    write_store(tmp_path, "planted-pdb", [record(runs=20, passes=20)])
+    verdict = BaselineStore.load(tmp_path).record_verdict("planted-pdb", KEY, bar=AdmissionBar())
+    assert verdict.state == "would-admit" and verdict.full_window
+    assert verdict.detail == "20/20 screening runs across 1 recorded run(s) (bar 95% over 20)"
+
+    for mode in ("roster", "record"):
+        decision = BaselineStore.load(tmp_path).admission(
+            "planted-pdb", KEY, bar=AdmissionBar(), mode=mode
+        )
+        assert decision.record == "would-admit"
+
+
+def test_in_roster_mode_the_list_decides_and_the_record_is_only_said(tmp_path):
+    """A full window changes the sentence and nothing else: a named case at
+    12/20 stays admitted and an unnamed one at 20/20 stays out."""
+    listed = frozenset({"planted-pdb"})
+    write_store(tmp_path, "planted-pdb", [record(runs=20, passes=12)])
+    write_store(tmp_path, "unlisted", [record(runs=20, passes=20)])
+    store = BaselineStore.load(tmp_path)
+
+    kept = store.admission("planted-pdb", KEY, bar=AdmissionBar(), bootstrap=listed, mode="roster")
+    assert kept.admitted is True and kept.source == "bootstrap"
+    assert kept.record == "would-demote"
+    assert kept.reason == (
+        "admitted by BOOTSTRAP_ADMITTED (transition bridge); the record would "
+        "demote it: screened at 12/20 across 1 recorded run(s), below the bar "
+        "of 95% over 20 runs"
+    )
+
+    out = store.admission("unlisted", KEY, bar=AdmissionBar(), bootstrap=listed, mode="roster")
+    assert out.admitted is False and out.source == "neither"
+    assert out.record == "would-admit"
+    assert out.reason == (
+        "the record would admit it: 20/20 screening runs across 1 recorded "
+        "run(s) (bar 95% over 20) -- EVAL_ADMISSION_MODE=roster, so "
+        "BOOTSTRAP_ADMITTED decides and does not name this case"
+    )
+
+    # The same store in record mode: the answers the first block pins.
+    assert store.admission("planted-pdb", KEY, bar=AdmissionBar(), bootstrap=listed).admitted is False
+    assert store.admission("unlisted", KEY, bar=AdmissionBar(), bootstrap=listed).admitted is True
+
+    # Nothing in the store for a listed case: the sentence the list has
+    # always produced, byte for byte, in both modes.
+    bare = BaselineStore.load(tmp_path / "empty").admission(
+        "planted-pdb", KEY, bar=AdmissionBar(), bootstrap=listed, mode="roster"
+    )
+    assert bare.reason == "admitted by BOOTSTRAP_ADMITTED (transition bridge)"
+    assert bare.record == "none"

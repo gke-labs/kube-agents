@@ -1704,15 +1704,44 @@ print(m.group(1).strip('\'\"') if m else '')
 " "$1" 2>/dev/null || echo ""
 }
 
-# The transition bridge: cases named here keep the old blocking behaviour
-# until the store holds a full window for them -- EVAL_ADMISSION_MIN_RUNS
-# runs at the current version key -- arming rung 4 meanwhile, and leaving
-# rung 6 quiet only while the store holds nothing for them at that key.
-# Once the window is full the record decides, either way: a name
-# here cannot keep a case the record turned away, and a case the record
-# admits blocks without being named. docs/eval-gate-roster.md has the
-# switch-over criteria for deleting this list. Comma- or whitespace-separated
-# task ids; bench-gate's _bootstrap_admitted() accepts either.
+# Who admits a case: the roster below, or the evidence store. Decided
+# 2026-09-14 on #1493: the roster stays hand-edited and the record informs.
+#
+#   roster  (default) BOOTSTRAP_ADMITTED decides, outright. The store's own
+#                     verdict on each case -- would-admit, would-demote,
+#                     collecting, stale, none -- rides in the per-case
+#                     hand-off (record_verdict) and, once a store is
+#                     configured, in the verdict's "Record says" column,
+#                     so a roster edit cites it. Nothing the nightly appends
+#                     can change what blocks.
+#   record            The store decides once it holds a full window for a
+#                     case at the current key (EVAL_ADMISSION_MIN_RUNS
+#                     runs), either way; the list is the fallback until
+#                     then. Kept for a later decision, not a schedule.
+#
+# Nobody should be able to move a case into or out of the blocking set
+# without the eval crew knowing, and a roster edit reviewed in a pull
+# request is that knowledge. Switching to `record` is a Prow-config change
+# and a team decision, never a default here; docs/eval-gate-roster.md says
+# what the record has to show first. Any other value stops the job here,
+# before a task runs: `records` grading as `roster` would look like a
+# working switch and switch nothing, and bench-gate refuses it too.
+export EVAL_ADMISSION_MODE="${EVAL_ADMISSION_MODE:-roster}"
+case "${EVAL_ADMISSION_MODE}" in
+  roster | record) ;;
+  *)
+    echo "ERROR: EVAL_ADMISSION_MODE must be 'roster' or 'record', got '${EVAL_ADMISSION_MODE}'." >&2
+    exit 1
+    ;;
+esac
+
+# The blocking roster: cases named here arm rung 4 -- three failed
+# repetitions red the job -- and, while the store holds nothing for them at
+# the current key, leave rung 6 quiet. Under EVAL_ADMISSION_MODE=roster this
+# list is the whole answer to "which case can red a pull request on a graded
+# failure"; the store's record beside it says whether the evidence agrees.
+# Comma- or whitespace-separated task ids; bench-gate's _bootstrap_admitted()
+# accepts either.
 #
 # The prose about this roster -- the admission bar, who is held out and on
 # which issue, the rung scoping, the demotion protocol -- lives in
@@ -1722,7 +1751,8 @@ print(m.group(1).strip('\'\"') if m else '')
 # list here, the prose there.
 #
 # Demoting a flaky case is a one-line same-day edit: delete its name from
-# this list, referencing the issue that names its re-admission condition.
+# this list, referencing the issue that names its re-admission condition
+# and citing what the record says about it.
 
 export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,cluster-agent-crashloop-debug,cluster-agent-crashloop-misleading-symptom,cluster-agent-crashloop-evidence-chain,agent-kanban-smoke}"
 

@@ -909,7 +909,7 @@ Reported distinctly, because only one of them is a problem with the case:
 The middle two are the store filling up, which is the ordinary state of a new case and of every
 case after a version bump. During that window nothing is admitted on evidence, so for an unlisted
 case rung 4 cannot fire and rung 6 is silent — a legitimate green, not a broken gate. A listed case
-rides the bridge meanwhile; [Bootstrap](#bootstrap) below says what that arms.
+blocks meanwhile; [The roster, and the mode](#the-roster-and-the-mode) below says what that arms.
 
 ## Resetting a baseline
 
@@ -932,26 +932,39 @@ There is deliberately no "reset this baseline" command. Every legitimate reset i
 new evidence, and a button that discards evidence is a button that gets pressed when the gate is
 inconvenient.
 
-### Bootstrap
+### The roster, and the mode
 
-`BOOTSTRAP_ADMITTED` names cases that keep blocking before screening exists for them. It is a
-bridge, not a destination: a bootstrap-admitted case has no full window at the current key, so it
-arms rung 4 by fiat. While the store holds nothing for it at that key it also leaves rung 6 quiet
-and contributes nothing to `main`'s side of the aggregate; once the nightly has appended a partial
-window (`collecting`), that evidence feeds both, and the list still decides admission until the
-window is full.
+`BOOTSTRAP_ADMITTED` names the cases that block. A listed case arms rung 4 by the list's say-so.
+While the store holds nothing for it at the current key it also leaves rung 6 quiet and contributes
+nothing to `main`'s side of the aggregate; once the nightly has appended a partial window
+(`collecting`), that evidence feeds both.
 
-**The record governs once it holds a full window.** `BaselineStore.admission()` consults the store
-before the list: with at least `EVAL_ADMISSION_MIN_RUNS` runs at the current key, the pooled rate
-decides either way, and a listed case screened at 12/21 is turned away with a reason that says the
-record overrides the list. The list is consulted only in the first three pre-admission states
-above (nothing at this key, stale, collecting), and when the store holds anything for a listed
-case its state is appended to the reason, so the log says how far it is from being judged on
-evidence. Every verdict carries `admission_source` — `record`, `bootstrap` or `neither` — and the
-markdown renders it per case once a store is configured or the record has decided any case; with
-the store unset what the shell displays is unchanged (the per-case JSON gains that one key), which
-`bench/tests/test_store_unset_golden.py` pins. The switch-over criteria for deleting the list are in
-[`docs/eval-gate-roster.md`](../eval-gate-roster.md).
+**Who decides is `EVAL_ADMISSION_MODE`, and the roster is the default.** The record is computed
+first in either mode — `BaselineStore.record_verdict()` returns one of five states, `would-admit`
+and `would-demote` for a full window (at least `EVAL_ADMISSION_MIN_RUNS` runs at the current key,
+above or below the bar) and the three pre-admission states above — and `BaselineStore.admission()`
+then applies the mode:
+
+- `roster` (default; decided 2026-09-14 on
+  [gke-labs/kube-agents#1493](https://github.com/gke-labs/kube-agents/issues/1493)): the list
+  decides outright. A listed case at 12/21 stays admitted and its reason says the record would
+  demote it; an unlisted case at 21/21 stays out and its reason says the record would admit it and
+  that the roster decides. The record informs a roster edit, which is a reviewed diff — the point of
+  the mode is that nothing the nightly appends can change what blocks.
+- `record`: the record governs once it holds a full window. A listed case screened at 12/21 is
+  turned away with a reason that says the record overrides the list, and an unlisted case at 21/21
+  is admitted. The list is consulted only in the three pre-admission states, and when the store
+  holds anything for a listed case its state is appended to the reason.
+
+Any other value is exit 2 from `bench-gate case`, and `hack/ci-eval-pr.sh` refuses it before a task
+runs: a typo that fell back to `roster` would look like a working switch.
+
+Every per-case hand-off carries `admission_source` (`record`, `bootstrap` or `neither`),
+`record_verdict` (the five states) and `admission_mode`, and the markdown renders the first two per
+case as **Admitted by** and **Record says** once a store is configured or the record holds a full
+window for any case. With the store unset what the shell displays is unchanged (the per-case JSON
+gains those three keys), which `bench/tests/test_store_unset_golden.py` pins. What the record has
+to show before anyone switches the mode is in [`docs/eval-gate-roster.md`](../eval-gate-roster.md).
 
 **A name in it that matches no graded case is reported, loudly.** It is a free-text environment
 variable holding case ids, and its whole job is to keep something blocking — so a typo, or a rename
@@ -960,7 +973,7 @@ exactly the way it would have if the list were right. `bench-gate suite` therefo
 list against the ids it actually graded and prints every unmatched name on stderr and as a banner
 in the markdown verdict. It is a warning rather than a red: the list is also legitimately allowed
 to name a case that is deactivated in the `TASKS` array or skipped on a given run, and redding for
-that would make the bridge harder to hold than the thing it bridges.
+that would make the roster harder to hold than the thing it protects.
 
 ## How "judged scores below main's baseline" is determined
 

@@ -8,14 +8,17 @@ suite aggregate, which compares pass rates and reports the result — it reds
 the job only once `EVAL_AGGREGATE_ARMED` is set to `1` (or `true`/`yes`).
 
 **This store ships empty, and it fills itself.** Every nightly run on `main`
-appends what it measured (`bench-gate record`), and a case is admitted once its
-accumulated evidence clears the bar. Until then nothing is admitted: rung 4
-cannot fire, rung 6 has nothing to compare against, and the aggregate is
-advisory. That is a legitimate green, not a broken gate — it is the gate
-collecting. `BOOTSTRAP_ADMITTED` in `hack/ci-eval-pr.sh` names the cases that
-keep blocking meanwhile — until the store holds a full window for a case at
-the current key, at which point the record decides either way and the list is
-not consulted for it; `docs/eval-gate-roster.md` has the switch-over.
+appends what it measured (`bench-gate record`), and the record's verdict on a
+case — would admit, would demote, collecting, stale — is computed from that
+evidence on every read. Who acts on it is `EVAL_ADMISSION_MODE` in
+`hack/ci-eval-pr.sh`: under `roster`, the default, `BOOTSTRAP_ADMITTED` there
+decides what blocks and the record is reported beside it for a roster edit to
+cite; under `record`, the record decides once it holds a full window for a
+case at the current key. Either way, a case with no evidence at the current
+key has nothing for rung 6 to compare against and contributes nothing to
+main's side of the aggregate — a legitimate green, not a broken gate; it is
+the gate collecting. `docs/eval-gate-roster.md` has the decision and what the
+record must show before the mode changes.
 
 ## Layout
 
@@ -231,16 +234,20 @@ Only the last is a problem with the case. The middle two are the store filling
 up, which is the ordinary state of a new case and of every case after a version
 bump.
 
-A case named in `BOOTSTRAP_ADMITTED` is admitted through the first three states
-by the list rather than the store, and, when the store holds anything for it,
-its reason says which state the store is in. In the fourth — and whenever the
-store holds at least the minimum runs at
-the current key — the record decides and the list is not consulted: a named
-case screened at 12/21 is turned away, and the reason says the record overrides
-the list. Every verdict carries `admission_source` (`record`, `bootstrap` or
-`neither`), and the markdown renders it per case once a store is configured or
-the record has decided any case — which includes evidence landed by hand in
-this directory with no store configured.
+Whether that verdict decides anything is `EVAL_ADMISSION_MODE`. Under `roster`
+(the default) `BOOTSTRAP_ADMITTED` decides: a named case is admitted through
+all four states and its reason says what the store would do (`the record would
+demote it: screened at 12/21 …`); an unnamed case at 21/21 stays out and its
+reason says the record would admit it. Under `record`, a named case is
+admitted through the first three states by the list, and in the fourth — and
+whenever the store holds at least the minimum runs at the current key — the
+record decides and the list is not consulted: a named case screened at 12/21
+is turned away, and the reason says the record overrides the list. Every
+verdict carries `admission_source` (`record`, `bootstrap` or `neither`),
+`record_verdict` (`would-admit`, `would-demote`, `collecting`, `stale`, `none`)
+and `admission_mode`, and the markdown renders the first two per case once a
+store is configured or the record holds a full window for any case — which
+includes evidence landed by hand in this directory with no store configured.
 
 Admission is computed here, never declared in `task.yaml`. A pull request
 author therefore cannot self-admit a case in the same diff that makes it pass.
