@@ -10,6 +10,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -22,20 +23,71 @@ import (
 	hermesbridge "github.com/gke-labs/kube-agents/a2a/hermes-bridge"
 )
 
+const (
+	// exitFailure is the exit for anything that went wrong after the
+	// environment was read: bridge init, the run itself.
+	exitFailure = 1
+	// exitUsage is the exit for a missing NATS_URL, the one thing the bridge
+	// cannot default; it is the code the sidecar has always used for it.
+	exitUsage = 2
+
+	// defaultProfile is the hermes profile the bridge answers for; the
+	// sidecar sits in the platform-agent pod.
+	defaultProfile = "platform"
+	// defaultConcurrency is how many hermes subprocesses run at once.
+	defaultConcurrency = 2
+	// defaultTaskDeadlineSeconds bounds one task's hermes invocation; two
+	// hours covers a long investigation without holding a slot forever.
+	defaultTaskDeadlineSeconds = 7200
+	// defaultKillGraceSeconds is how long a SIGTERMed hermes has to flush
+	// before the bridge stops waiting for it.
+	defaultKillGraceSeconds = 10
+	// defaultKVBucket is the JetStream KV bucket the bridge keeps task state in.
+	defaultKVBucket = "runtime-state"
+)
+
+// errUsage is what realMain returns when NATS_URL is missing, so run can
+// keep the usage exit code distinct from every other failure.
+var errUsage = errors.New("NATS_URL is required")
+
 func main() {
+	os.Exit(run())
+}
+
+// run owns the process logger, the signal context and the exit code.
+// Everything that can fail is in realMain, which returns the error instead
+// of exiting so a test can drive it to each failure.
+func run() int {
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	if err := realMain(ctx, log); err != nil {
+		if errors.Is(err, errUsage) {
+			return exitUsage
+		}
+		return exitFailure
+	}
+	return 0
+}
+
+// realMain is the bridge from environment to shutdown. Every failure is
+// logged where it is found and then returned; a missing NATS_URL returns
+// errUsage before anything is dialed.
+func realMain(ctx context.Context, log *slog.Logger) error {
 	url := os.Getenv("NATS_URL")
 	if url == "" {
 		log.Error("NATS_URL is required")
-		os.Exit(2)
+		return errUsage
 	}
 	cfg := hermesbridge.Config{
 		NATSURL:      url,
-		Profile:      envOr("BRIDGE_PROFILE", "platform"),
-		Concurrency:  envInt(log, "BRIDGE_CONCURRENCY", 2),
-		TaskDeadline: time.Duration(envInt(log, "BRIDGE_TASK_DEADLINE_SECONDS", 7200)) * time.Second,
-		KillGrace:    time.Duration(envInt(log, "BRIDGE_KILL_GRACE_SECONDS", 10)) * time.Second,
-		KVBucket:     envOr("BRIDGE_KV_BUCKET", "runtime-state"),
+		Profile:      envOr("BRIDGE_PROFILE", defaultProfile),
+		Concurrency:  envInt(log, "BRIDGE_CONCURRENCY", defaultConcurrency),
+		TaskDeadline: time.Duration(envInt(log, "BRIDGE_TASK_DEADLINE_SECONDS", defaultTaskDeadlineSeconds)) * time.Second,
+		KillGrace:    time.Duration(envInt(log, "BRIDGE_KILL_GRACE_SECONDS", defaultKillGraceSeconds)) * time.Second,
+		KVBucket:     envOr("BRIDGE_KV_BUCKET", defaultKVBucket),
 		Logger:       log,
 	}
 	if bin := os.Getenv("HERMES_BIN"); bin != "" {
@@ -49,19 +101,17 @@ func main() {
 		cfg.NATSOptions = append(cfg.NATSOptions, nats.CustomInboxPrefix("_INBOX."+user))
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-	defer stop()
-
 	b, err := hermesbridge.New(ctx, cfg)
 	if err != nil {
 		log.Error("bridge init failed", "err", err)
-		os.Exit(1)
+		return err
 	}
 	if err := b.Run(ctx); err != nil {
 		log.Error("bridge exited", "err", err)
-		os.Exit(1)
+		return err
 	}
 	log.Info("bridge shut down cleanly")
+	return nil
 }
 
 func envOr(key, def string) string {
