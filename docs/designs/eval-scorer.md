@@ -4,10 +4,11 @@
 > version key, admission, reset and rung 6 are implemented in `bench/kube_agents_bench/` and
 > covered by `bench/tests/`. The GCS backend is implemented and defaults **off**; it has been
 > validated end to end against a real bucket in a personal dev project (see
-> [What has been validated, and where](#what-has-been-validated-and-where)), but the production
-> bucket and its IAM grants do not exist yet, and the nightly job that writes to it is still an
-> open pull request in `oss-test-infra`. The dashboard's
-> table and views are checked in as `bench/dashboard/` and have been run against that same bucket;
+> [What has been validated, and where](#what-has-been-validated-and-where)); the production bucket
+> exists, and the nightly job that appends to it, `ci-kube-agents-eval-nightly`, is merged in
+> `oss-test-infra` with its store export armed (see [The job definition](#the-job-definition)). The
+> dashboard's table and views are checked in as `bench/dashboard/` and have been run against that
+> same bucket;
 > what is not built is the Looker Studio front end over them.
 
 **Scope:** How the eval scorer decides, where its results are stored, how a baseline is
@@ -478,8 +479,8 @@ The backend has been exercised end to end against a real bucket
 | A pull request cannot append                                | `refusing to record a baseline with PULL_NUMBER set`              |
 | A missing bucket degrades rather than reds                  | 404 → advisory, with the banner in the markdown verdict           |
 
-What remains unvalidated is the part no local run can reach: the nightly Prow job, which is still an
-open pull request against `oss-test-infra`.
+What no local run can reach is the nightly Prow job's own append. Its nights are the validation,
+read through the dashboard's Nightly report (`scripts/eval_dashboard/nightly.py`).
 
 **Why a file per batch instead of one growing file per case.** GCS objects are immutable; there is
 no append. Growing one `<case>.jsonl` means download, concatenate, re-upload — an overwrite, which
@@ -707,10 +708,9 @@ does.
 
 ### The job that writes it
 
-This is the piece that is written but not landed, and nothing appends until it lands. It is a change to
-**`GoogleCloudPlatform/oss-test-infra`** — where this repo's Prow config lives, per
-`hack/ci-env.sh`'s reference to `oss-test-infra#2655` — not to this repo, which is why no amount of
-work here can close the loop. What it has to be:
+It lives in **`GoogleCloudPlatform/oss-test-infra`** — where this repo's Prow config lives, per
+`hack/ci-env.sh`'s reference to `oss-test-infra#2655` — not in this repo, which is why no change
+here can alter its schedule, budget or identity. What it has to be:
 
 | Requirement                                                   | Why                                                                                                                                                                                                                                                                                       |
 | ------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -764,10 +764,13 @@ More repetitions on the recording side is strictly better evidence.
 #### The job definition
 
 It is `ci-kube-agents-eval-nightly` in
-`prow/prowjobs/gke-labs/kube-agents/kube-agents-periodics.yaml` of `oss-test-infra`, open there as
-pull requests; [gke-labs/kube-agents#1448](https://github.com/gke-labs/kube-agents/issues/1448)
-tracks them, the provisioning they wait on, and the merge order. The YAML is not reproduced here — a
-copy in a second repository is a copy that goes stale, and the shape below is the part that matters.
+`prow/prowjobs/gke-labs/kube-agents/kube-agents-periodics.yaml` of `oss-test-infra`:
+[oss-test-infra#2682](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2682) added it and
+[oss-test-infra#2698](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2698) armed its store
+export. Its schedule, budget and fan-out are the decisions recorded on
+[gke-labs/kube-agents#1491](https://github.com/gke-labs/kube-agents/issues/1491). The YAML is not
+reproduced here — a copy in a second repository is a copy that goes stale, and the shape below is
+the part that matters.
 
 **Its script body is the presubmit's, byte-for-byte, plus its exports** — `EVAL_TIER` to select
 the nightly matrix, `EVAL_BASELINE_STORE` to close the loop, `PULL_PULL_SHA` from the checkout (the
@@ -797,48 +800,61 @@ merge-rate data:
   are mounted volumes rather than presets, and `PROJECT_ID` is not static — Boskos supplies it per
   run.
 
-Two numbers in it are starting points rather than measurements: the repetition count (the script's
-default 3 unless the job sets `EVAL_REPETITIONS`) and the timeout. The binding constraint on both is that
-`gpu-stress-test-diagnosis` re-applies its OpenTofu GPU stack on **every** repetition, so the cost
-per repetition is not the ~90s of agent time the fixtures show. Tune them from the first few runs.
+Three numbers in it are priced rather than measured. The repetition count is the script's default 3
+unless the job sets `EVAL_REPETITIONS`. The timeout is `480m`, not the presubmit's `360m`: the
+twenty-six-task matrix prices at ~532–552 serial minutes at three repetitions (the `NIGHTLY_TASKS`
+comment in `hack/ci-eval-pr.sh`), and the presubmit's fan-out realised only ~1.15× under the daytime
+quota contention, at which the night projects to ~470–490 minutes — `360m` would truncate most
+nights, and the job gates nothing, so a long night costs a lease and nothing else. The fan-out is
+`EVAL_TASK_PARALLELISM=6`, wider than the presubmit's 4, because the nightly is alone on the model
+quota at its hour. The binding constraint on the first two is that `gpu-stress-test-diagnosis`
+re-applies its OpenTofu GPU stack on **every** repetition, so the cost per repetition is not the ~90s
+of agent time the fixtures show. Confirm all three on the first three nights' measured wall clock and
+record the result on #1491; the dashboard's Nightly report carries each night's wall clock and
+whether the deadline cut it short.
 
 Whether the shared `prowjob-default-sa` or a dedicated identity should hold the bucket grants is
 not an open question: it has to be a dedicated one, or the read/write split cannot be expressed at
-all. `serviceAccountName: eval-baseline-recorder` is a required edit before the store export is
-uncommented on the periodic — see
+all. The periodic runs as `eval-baseline-recorder`, and its store export is armed only because it
+does — see
 [Two conditions](#two-conditions-that-guard-depends-on-neither-of-which-holds-today).
 
-The shape, with the harness elided (the alert row in the table above is a requirement the job as
-proposed does not yet meet — it is read through the eval dashboard instead):
+The shape, with the harness elided (the alert row in the table above is met through the eval
+dashboard's Nightly report and the 9 AM digest rather than a TestGrid tab, so the job creates no test
+group):
 
 ```yaml
 # GoogleCloudPlatform/oss-test-infra:
 #   prow/prowjobs/gke-labs/kube-agents/kube-agents-periodics.yaml
 periodics:
   - name: ci-kube-agents-eval-nightly
-    # 08:00 UTC: the pool's low-traffic hour, clear of the working day's
-    # presubmit herd and of the repo's 02:00 UTC GitHub Actions nightly.
-    cron: "0 8 * * *"
+    # 00:00 UTC (8 PM EDT, 7 PM EST): after the working day's presubmit herd
+    # in the team's Eastern time zone, so the nightly's lease and model-quota
+    # draw do not contend with pull requests, and the night is over before
+    # the next morning's 9 AM ET digest reports it.
+    cron: "0 0 * * *"
     # A periodic has no ref of its own. base_ref is a branch, not a pin: Prow
     # resolves it at trigger time, so every run is main's latest commit.
     extra_refs:
       - org: gke-labs
         repo: kube-agents
         base_ref: main
+        workdir: true
     annotations:
-      testgrid-dashboards: googleoss-kube-agents
-      testgrid-tab-name: nightly-eval-baseline
-      testgrid-alert-email: <owner alias>
-      testgrid-num-failures-to-alert: "2"
+      # No TestGrid tab: the run is read through the eval dashboard's
+      # Nightly report and the 9 AM digest, not a second UI.
+      testgrid-create-test-group: "false"
     # Scheduling, not safety -- Boskos leasing makes concurrency safe. This is
     # so a run that overruns its night cannot overlap the next.
     max_concurrency: 1
     cluster: build-kube-agents
     decorate: true
     decoration_config:
-      # The presubmit's budget for a bigger matrix: a starting point, like the
-      # repetition count; tune both from real nights.
-      timeout: 360m
+      # Eight hours, not the presubmit's 360m: the twenty-six-task matrix
+      # prices at ~532-552min serial at three repetitions, and the presubmit's
+      # fan-out realised ~1.15x, which 360m would truncate most nights. Priced,
+      # not measured; confirm on the first three nights (kube-agents#1491).
+      timeout: 480m
       grace_period: 5m
     spec:
       # NOT prowjob-default-sa, which is what the presubmit runs as. The
@@ -856,6 +872,9 @@ periodics:
               # the presubmit matrix on this value. Without it the job records
               # the presubmit matrix only.
               export EVAL_TIER="nightly"
+              # Wider fan-out than the presubmit's 4: the nightly runs alone on
+              # the model quota at this hour (see the timeout comment above).
+              export EVAL_TASK_PARALLELISM="6"
               # A periodic has no PULL_PULL_SHA, and ci-deploy.sh falls back to
               # the literal "latest", so every night would tag its build
               # pr-local-latest. extra_refs has already checked out main's
@@ -1137,7 +1156,8 @@ actually lives, with rung 6 as the collapse alarm underneath it.
 
   **The table above is serial arithmetic, and the loop is no longer serial.** `hack/ci-eval-pr.sh`
   now runs the matrix as a bounded parallel fan-out of (task, repetition) units
-  (`EVAL_TASK_PARALLELISM`, default 4; tofu-stack units and repetitions of one task still serialize
+  (`EVAL_TASK_PARALLELISM`, default 4, the presubmit's; the nightly periodic exports 6; tofu-stack
+  units and repetitions of one task still serialize
   among themselves). Wall clock is therefore fixed cost + roughly invocations ÷ realised
   parallelism, where "realised" is capped by the leased project's model quota — measured on a
   quota-constrained dev install: 16 units serial 3240s, parallelism 4 in 1022s with six units lost
@@ -1227,14 +1247,13 @@ actually lives, with rung 6 as the collapse alarm underneath it.
   finds nothing admitted, and reports a **legitimate green** with rung 4, rung 6 and the aggregate
   all inert — the rate-based half of this design, silently absent, with no signal that it is
   missing. The absolute rungs (1, 2, 3, 5) and the correctness floor still block, so the failure
-  looks like a working gate. Neither export exists on `master` yet; both wait on the bucket.
-- No Prow job yet appends for `hack/ci-eval-pr.sh` (job config lives in
-  `GoogleCloudPlatform/oss-test-infra`). Without one, nothing ever appends and no case is ever
-  admitted. The job is written — see [The job that writes it](#the-job-that-writes-it) — and runs
-  the script's default repetitions and the presubmit's `360m`, both starting points to tune from
-  the first real nights; `serviceAccountName: eval-baseline-recorder` must exist before the store
-  export arms. [gke-labs/kube-agents#1448](https://github.com/gke-labs/kube-agents/issues/1448)
-  carries the pull requests and their order.
+  looks like a working gate. Both exports exist since
+  [oss-test-infra#2698](https://github.com/GoogleCloudPlatform/oss-test-infra/pull/2698).
+- The nightly periodic's three numbers — the script's default repetitions, the `480m` timeout and
+  `EVAL_TASK_PARALLELISM=6` — are priced, not measured;
+  [The job definition](#the-job-definition) says from what. Confirm them on the first three nights'
+  wall clock and record the result on
+  [gke-labs/kube-agents#1491](https://github.com/gke-labs/kube-agents/issues/1491).
 - A lint that a behaviour change bumped `fleet` or `verifiers`.
 - The GCS listing is unbounded while the fetch is capped. The reader lists the whole prefix and
   filters afterwards, because `BaselineStore.load` does not know which key it is about to be asked
