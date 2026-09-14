@@ -198,7 +198,7 @@ identifier appears, add its source here.
 | Unresolved-thread hold: the label, the pool condition, the sweep interval, the ownership rule | `scripts/hold_unresolved_threads.py` and `.github/workflows/hold-unresolved-threads.yml` |
 | Flaky-check tracking: the `ci:flaky` label, the watched checks and the exclusions, the one-issue-per-container key, the never-close rule | `scripts/notify_flaky_check.py` and `.github/workflows/flaky-check-notify.yml`; the exclusion list the contract test enforces is `FLAKY_CHECK_EXCLUDED_WORKFLOWS` in `scripts/test_integration_contracts.py` |
 | Context budget for the always-loaded agent instruction files (`AGENTS.md`, `CLAUDE.md`) | `BUDGET` in `scripts/check_context_budget.py` |
-| Who may set the `approved` label on a change | `OWNERS`, `k8s-operator/OWNERS`, and `OWNERS_ALIASES` |
+| Who may set the `approved` label on a change | `OWNERS`, `k8s-operator/OWNERS`, `hack/OWNERS`, `bench/tasks/OWNERS`, and `OWNERS_ALIASES` |
 | Which labels Tide merges on, and which Prow presubmits gate | `prow/oss/config.yaml` and `prow/prowjobs/gke-labs/kube-agents/` in `GoogleCloudPlatform/oss-test-infra` — not a file in this repository |
 | Contributor-agent merge labels (`lgtm`, `approved`, `ok-to-test`, `do-not-merge/hold`) and the `triage` permission grant | external tide automation and GitHub repo settings (not in-tree); named in `AGENTS.md` and `agents/contributor/AGENTS.md` |
 | Queue-wait thresholds that justify onboarding an eval project, and the window they run over | `scripts/pool_pressure.py` |

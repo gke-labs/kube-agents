@@ -127,4 +127,7 @@ excludes. The roster page's hold-out entries are the shape of the evidence a rev
 Once the store governs the case, no pull request is needed: the record admits it, or turns it
 away, and the verdict's **Admitted by** column says which.
 
-**Check:** none mechanical. The roster edit is reviewed like any change to the gate.
+**Check:** none mechanical, but the approver is: a roster edit needs an `approved` from the
+`eval-crew` alias ([`hack/OWNERS`](../hack/OWNERS) scopes `ci-eval-pr.sh` to it, and
+[`OWNERS`](tasks/OWNERS) in `tasks/` does the same for a case), and a root approver alone
+cannot merge either.

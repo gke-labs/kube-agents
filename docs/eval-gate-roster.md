@@ -4,7 +4,12 @@
 that can red `pull-kube-agents-smoke-test`. This page is the prose that used to sit above
 that export: what admits a case, which cases are held out and on which issue, how far the
 roster's promise reaches, and how a flaky case is demoted. The list itself stays in the
-script — edit it there, and keep this page in step. It lives under `docs/` on purpose:
+script — edit it there, and keep this page in step. A roster edit merges only with an
+`approved` from the `eval-crew` alias in [`OWNERS_ALIASES`](../OWNERS_ALIASES):
+[`hack/OWNERS`](../hack/OWNERS) scopes `ci-eval-pr.sh` to that alias with
+`no_parent_owners`, so a root approver does not count for it, and
+[`bench/tasks/OWNERS`](../bench/tasks/OWNERS) does the same for a new or changed case
+([#1546](https://github.com/gke-labs/kube-agents/issues/1546)). It lives under `docs/` on purpose:
 the script's step-0 revalidation treats `docs/` as inert (and the Prow path filter in
 `oss-test-infra` does today too), so a review finding against this prose costs no eval run
 ([#1179](https://github.com/gke-labs/kube-agents/issues/1179)), which is exactly what

@@ -282,15 +282,21 @@ The two labels are the two people:
   strips it again unless the author is in that team, and the reviewer has to give it a second time.
 - **`approved` is an `OWNERS` approver's.** `/approve`, from someone in the `OWNERS` file governing
   the changed paths — [`OWNERS`](../OWNERS) at the root, [`k8s-operator/OWNERS`](../k8s-operator/OWNERS)
-  for the operator, with [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `waw-leads`. An approver's
+  for the operator, [`bench/tasks/OWNERS`](../bench/tasks/OWNERS) for the eval cases and
+  [`hack/OWNERS`](../hack/OWNERS) for `hack/ci-eval-pr.sh` alone, with
+  [`OWNERS_ALIASES`](../OWNERS_ALIASES) expanding `waw-leads` and `eval-crew`. The last two name
+  only `eval-crew` and set `no_parent_owners`, so a root approver's `/approve` does not clear
+  a change to a case or to the presubmit roster (#1546). An approver's
   "Approve" review sets both labels at once, which is why most pull requests here need exactly one
   review from one person (#1070). An approver's own pull request counts as self-approved, so a
   change from someone in `OWNERS` starts with the `approved` half already satisfied and waits only
   on the `lgtm` (#1075).
 
 Everyone `.github/auto_request_review.yml` can assign is also an `OWNERS` approver, so the reviewer
-the bot's green check summons is always someone who can clear both labels in one action. That is a
-property of two lists agreeing today, not a guarantee either file makes.
+the bot's green check summons is always someone who can clear both labels in one action — except
+under `bench/tasks/` and for `hack/ci-eval-pr.sh`, where only `eval-crew` can set `approved` and
+another reviewer's review sets `lgtm` alone. That is a property of two lists agreeing today, not a
+guarantee either file makes.
 
 Before any of that, a pull request from an author Prow does not already trust is labelled
 `needs-ok-to-test`, and its Prow presubmits hold until a member comments `/ok-to-test`. It gates
