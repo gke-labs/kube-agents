@@ -397,23 +397,37 @@ class EnsureProfileTest(unittest.TestCase):
         self.assertTrue((self.home / "USER.md").is_file())
         self.assertIn("continuing", self.stderr, "the refusal is logged, not fatal")
 
-    def test_pre_existing_profile_home_mode_relaxed_to_0775(self):
-        """A pre-existing home (e.g. materialised bare at 0700) is relaxed to 0775."""
+    def test_pre_existing_profile_home_mode_relaxed_additively(self):
+        """A pre-existing home (e.g. materialised bare at 0700) gets group rwx added additively."""
         self.home.mkdir(parents=True)
         (self.home / "USER.md").write_text("cluster identity\n")
         self.home.chmod(0o700)
 
         self.ensure()
 
-        self.assertEqual(stat.S_IMODE(self.home.stat().st_mode), 0o775)
+        self.assertEqual(stat.S_IMODE(self.home.stat().st_mode), 0o770)
 
-    def test_pre_existing_profile_home_chmod_oserror_tolerated(self):
-        """OSError during chmod on pre-existing home (e.g. read-only mount) is tolerated."""
+    def test_pre_existing_profile_home_preserves_setgid_bit(self):
+        """Additive chmod preserves the volume setgid bit set by kubelet for fsGroup."""
         self.home.mkdir(parents=True)
         (self.home / "USER.md").write_text("cluster identity\n")
-        with unittest.mock.patch.object(Path, "chmod", side_effect=OSError("Read-only filesystem")):
+        self.home.chmod(0o2700)
+
+        self.ensure()
+
+        mode = stat.S_IMODE(self.home.stat().st_mode)
+        self.assertEqual(mode, 0o2770)
+        self.assertTrue(bool(mode & stat.S_ISGID), "setgid bit must be preserved")
+
+    def test_pre_existing_profile_home_chmod_oserror_tolerated_and_logged(self):
+        """OSError during chmod on pre-existing home (e.g. EPERM) is logged and tolerated."""
+        self.home.mkdir(parents=True)
+        (self.home / "USER.md").write_text("cluster identity\n")
+        with unittest.mock.patch.object(Path, "chmod", side_effect=OSError(1, "Operation not permitted")):
             self.ensure()
         self.assertTrue((self.home / "USER.md").is_file())
+        self.assertIn("could not relax permissions on pre-existing home", self.stderr)
+        self.assertIn("Operation not permitted", self.stderr)
 
     def test_a_failed_create_on_a_fresh_home_is_fatal(self):
         self.fail_create = True

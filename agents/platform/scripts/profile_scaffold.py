@@ -17,6 +17,7 @@ import argparse
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -26,6 +27,13 @@ from pathlib import Path
 # profile home, POSIX-separated; each one needs a merge rule below.
 MERGE_PATHS: tuple[str, ...] = ("cron/jobs.json",)
 DEFAULT_LEGACY_CRON_RISK: str = "low"
+
+# Permission bits additively applied to a pre-existing profile home before scaffolding.
+# Group read/write/execute (0o070) ensures that a directory created bare (e.g. by
+# Hermes at 0700 during dispatch to an unscaffolded assignee) is group-accessible to
+# processes sharing the volume under fsGroup (platformagent_manifests.go:80-86), while
+# an additive bitwise-OR preserves the setgid bit set by kubelet for group inheritance.
+PRE_EXISTING_HOME_GROUP_MODE: int = 0o070
 
 
 
@@ -111,10 +119,17 @@ def ensure_profile(name: str, description: str, hermes_home: Path) -> Path:
         _clear_mount_skeleton(home)
         pre_existing = home.exists()
         if pre_existing:
+            target_mode = None
             try:
-                home.chmod(0o775)
-            except OSError:
-                pass
+                target_mode = home.stat().st_mode | PRE_EXISTING_HOME_GROUP_MODE
+                home.chmod(target_mode)
+            except OSError as e:
+                target_desc = (
+                    oct(stat.S_IMODE(target_mode))
+                    if target_mode is not None
+                    else f"+{oct(PRE_EXISTING_HOME_GROUP_MODE)}"
+                )
+                log(f"could not relax permissions on pre-existing home {home} to {target_desc}: {e}")
         try:
             subprocess.run(
                 [HERMES_BIN, "profile", "create", name, "--no-skills", "--description", description],
