@@ -34,6 +34,19 @@ MINTY_CLI_GIT_TAG="v2.7.1"
 MINTY_CLI_MANUAL_CLONE_DIR="/tmp/minty"
 SPINNER_INTERVAL_SECS="0.2"
 
+# Node pool metadata migration dynamic timeout and polling parameters (#1286).
+# GKE rolling node updates cordon, drain, and recreate nodes sequentially (~4-5m
+# per node), so pools with >5 nodes regularly exceed gcloud's hardcoded 30m
+# client wait window. Allow environment overrides so tests can run in milliseconds.
+readonly NODE_POOL_UPDATE_MIN_TIMEOUT_SECS="${NODE_POOL_UPDATE_MIN_TIMEOUT_SECS:-1800}"
+readonly NODE_POOL_UPDATE_PER_NODE_TIMEOUT_SECS="${NODE_POOL_UPDATE_PER_NODE_TIMEOUT_SECS:-300}"
+readonly NODE_POOL_UPDATE_EXTENSION_SECS="${NODE_POOL_UPDATE_EXTENSION_SECS:-300}"
+readonly NODE_POOL_UPDATE_MAX_TIMEOUT_SECS="${NODE_POOL_UPDATE_MAX_TIMEOUT_SECS:-7200}"
+readonly NODE_POOL_UPDATE_POLL_INTERVAL_SECS="${NODE_POOL_UPDATE_POLL_INTERVAL_SECS:-15}"
+readonly NODE_POOL_UPDATE_POLL_MAX_RETRIES="${NODE_POOL_UPDATE_POLL_MAX_RETRIES:-3}"
+readonly GKE_OP_STATUS_DONE="DONE"
+readonly GKE_OP_STATUS_RUNNING="RUNNING"
+
 # ─── ANSI Colors & Terminal Responsive Helpers ─────────────────────────────────
 # A function because scripts/installer/common.sh defines the same variables
 # unconditionally: sourcing it would re-enable colour under NO_COLOR or in a pipe,
@@ -1975,6 +1988,186 @@ ensure_existing_cluster_cmek() {
     --database-encryption-key="$key_resource" --project "$project_id" --quiet
 }
 
+# Determines the total node count of a GKE node pool to scale operation timeouts (#1286).
+# Queries Managed Instance Group targetSize values when available (reflecting live
+# autoscaled or resized counts), falling back to initialNodeCount * locations count.
+get_node_pool_node_count() {
+  local project_id="$1" cluster_name="$2" region="$3" pool_name="$4"
+  local describe_out=""
+  describe_out=$(trap - ERR; gcloud container node-pools describe "$pool_name" \
+    --cluster="$cluster_name" --location="$region" --project="$project_id" \
+    --format="value[separator='|'](initialNodeCount,locations.len(),instanceGroupUrls)" 2>/dev/null || true)
+  [ -n "$describe_out" ] || { echo 0; return 0; }
+
+  local init_count="" loc_count="" igm_urls=""
+  IFS='|' read -r init_count loc_count igm_urls <<< "$describe_out" || true
+
+  local total_igm_nodes=0
+  local igm_expected=0
+  local igm_succeeded=0
+  if [ -n "$igm_urls" ]; then
+    local url="" zone="" igm_name="" target_size=""
+    local IFS=';'
+    for url in $igm_urls; do
+      if [[ "$url" =~ /zones/([^/]+)/instanceGroupManagers/([^/;]+) ]]; then
+        igm_expected=$(( igm_expected + 1 ))
+        zone="${BASH_REMATCH[1]}"
+        igm_name="${BASH_REMATCH[2]}"
+        target_size=$(trap - ERR; gcloud compute instance-groups managed describe "$igm_name" \
+          --zone="$zone" --project="$project_id" --format="value(targetSize)" 2>/dev/null || true)
+        if [[ "$target_size" =~ ^[0-9]+$ ]]; then
+          total_igm_nodes=$(( total_igm_nodes + target_size ))
+          igm_succeeded=$(( igm_succeeded + 1 ))
+        fi
+      fi
+    done
+  fi
+
+  if [ "$igm_expected" -gt 0 ] && [ "$igm_succeeded" -eq "$igm_expected" ]; then
+    echo "$total_igm_nodes"
+    return 0
+  fi
+
+  if [[ "$init_count" =~ ^[0-9]+$ ]]; then
+    if [[ ! "$loc_count" =~ ^[0-9]+$ ]] || [ "$loc_count" -lt 1 ]; then
+      loc_count=1
+    fi
+    echo $(( init_count * loc_count ))
+    return 0
+  fi
+
+  echo 0
+}
+
+# Computes the dynamic wait timeout (in seconds) for a node pool update (#1286):
+# max(NODE_POOL_UPDATE_MIN_TIMEOUT_SECS, node_count * NODE_POOL_UPDATE_PER_NODE_TIMEOUT_SECS).
+calculate_node_pool_update_timeout() {
+  local node_count="${1:-0}"
+  if [[ ! "$node_count" =~ ^[0-9]+$ ]]; then
+    node_count=0
+  fi
+  local scaled=$(( node_count * NODE_POOL_UPDATE_PER_NODE_TIMEOUT_SECS ))
+  if [ "$scaled" -gt "$NODE_POOL_UPDATE_MIN_TIMEOUT_SECS" ]; then
+    echo "$scaled"
+  else
+    echo "$NODE_POOL_UPDATE_MIN_TIMEOUT_SECS"
+  fi
+}
+
+# Polls a GKE long-running node pool operation until it reaches DONE (#1286),
+# displaying progress while RUNNING/PENDING and extending the wait window up to
+# NODE_POOL_UPDATE_MAX_TIMEOUT_SECS if the operation is still actively RUNNING
+# when the estimated timeout is reached.
+wait_for_gke_node_pool_operation() {
+  local project_id="$1" region="$2" pool_name="$3" op_id="$4" timeout_secs="$5"
+  local elapsed=0
+  local consecutive_errors=0
+  local max_timeout="$NODE_POOL_UPDATE_MAX_TIMEOUT_SECS"
+  if [ "$timeout_secs" -gt "$max_timeout" ]; then
+    max_timeout="$timeout_secs"
+  fi
+
+  print_info "Polling operation '${op_id}' for node pool '${pool_name}' (timeout: ${timeout_secs}s)..."
+
+  while true; do
+    local desc_out="" op_status="" op_detail="" op_status_msg="" op_error_msg=""
+    if desc_out=$(trap - ERR; gcloud container operations describe "$op_id" \
+        --location="$region" --project="$project_id" \
+        --format="value[separator='|'](status,detail,statusMessage,error.message)" 2>/dev/null); then
+      IFS='|' read -r op_status op_detail op_status_msg op_error_msg <<< "$desc_out" || true
+      op_status="${op_status//[[:space:]]/}"
+    fi
+
+    if [ -z "$op_status" ]; then
+      consecutive_errors=$(( consecutive_errors + 1 ))
+      if [ "$consecutive_errors" -ge "$NODE_POOL_UPDATE_POLL_MAX_RETRIES" ]; then
+        print_error "Failed to query status of GKE operation '${op_id}' after ${consecutive_errors} consecutive attempts."
+        return 1
+      fi
+      print_warning "Transient error querying operation '${op_id}' (attempt ${consecutive_errors}/${NODE_POOL_UPDATE_POLL_MAX_RETRIES}); retrying..."
+    else
+      consecutive_errors=0
+      if [ "$op_status" = "$GKE_OP_STATUS_DONE" ]; then
+        local op_err="${op_error_msg:-$op_status_msg}"
+        if [ -n "$op_err" ]; then
+          print_error "GKE operation '${op_id}' for node pool '${pool_name}' finished with error: ${op_err}"
+          return 1
+        fi
+        print_success "Node pool '${pool_name}' metadata migration completed (operation '${op_id}')."
+        return 0
+      fi
+
+      local detail_suffix=""
+      if [ -n "$op_detail" ]; then
+        detail_suffix=" (${op_detail})"
+      fi
+      print_info "Node pool '${pool_name}' migration in progress: status=${op_status}${detail_suffix} (elapsed ${elapsed}s / ${timeout_secs}s)..."
+    fi
+
+    if [ "$elapsed" -ge "$timeout_secs" ]; then
+      if [ "$op_status" = "$GKE_OP_STATUS_RUNNING" ] && [ "$elapsed" -lt "$max_timeout" ]; then
+        timeout_secs=$(( timeout_secs + NODE_POOL_UPDATE_EXTENSION_SECS ))
+        if [ "$timeout_secs" -gt "$max_timeout" ]; then
+          timeout_secs="$max_timeout"
+        fi
+        print_warning "Operation '${op_id}' is still RUNNING after ${elapsed}s; extending wait timeout to ${timeout_secs}s..."
+      else
+        print_error "Timed out after ${elapsed}s waiting for GKE operation '${op_id}' on node pool '${pool_name}' (last status: ${op_status:-unknown})."
+        return 1
+      fi
+    fi
+
+    sleep "$NODE_POOL_UPDATE_POLL_INTERVAL_SECS"
+    elapsed=$(( elapsed + NODE_POOL_UPDATE_POLL_INTERVAL_SECS ))
+  done
+}
+
+# Migrates a legacy GCE_METADATA node pool to GKE_METADATA using async invocation
+# and operation polling with dynamic node-scaled timeout (#1286).
+migrate_node_pool_to_gke_metadata() {
+  local project_id="$1" cluster_name="$2" region="$3" legacy_pool="$4"
+  local node_count timeout_secs op_id
+  node_count="$(get_node_pool_node_count "$project_id" "$cluster_name" "$region" "$legacy_pool")"
+  timeout_secs="$(calculate_node_pool_update_timeout "$node_count")"
+  print_warning "Node pool '${legacy_pool}' (${node_count} node(s)) uses the legacy GCE metadata server; migrating to GKE_METADATA (this recreates the pool's nodes; timeout: ${timeout_secs}s)..."
+
+  if ! op_id=$(trap - ERR; gcloud container node-pools update "$legacy_pool" \
+      --cluster="$cluster_name" --location="$region" --project="$project_id" \
+      --workload-metadata=GKE_METADATA --async --format="value(name)" --quiet); then
+    print_error "Failed to initiate metadata migration on node pool '${legacy_pool}'."
+    return 1
+  fi
+  op_id="${op_id##*/}"
+  op_id="${op_id//[[:space:]]/}"
+
+  if [ -z "$op_id" ]; then
+    op_id=$({ trap - ERR; gcloud container operations list \
+      --location="$region" --project="$project_id" \
+      --filter="targetLink ~ /clusters/${cluster_name}/nodePools/${legacy_pool}$ AND (status=RUNNING OR status=PENDING)" \
+      --format="value(name)" 2>/dev/null || true; } | head -n1)
+    op_id="${op_id##*/}"
+    op_id="${op_id//[[:space:]]/}"
+  fi
+
+  if [ -n "$op_id" ]; then
+    wait_for_gke_node_pool_operation "$project_id" "$region" "$legacy_pool" "$op_id" "$timeout_secs"
+    return $?
+  fi
+
+  local live_mode=""
+  live_mode=$(trap - ERR; gcloud container node-pools describe "$legacy_pool" \
+    --cluster="$cluster_name" --location="$region" --project="$project_id" \
+    --format="value(config.workloadMetadataConfig.mode)" 2>/dev/null || true)
+  live_mode="${live_mode//[[:space:]]/}"
+  if [ "$live_mode" = "GKE_METADATA" ]; then
+    print_success "Node pool '${legacy_pool}' metadata migration completed."
+    return 0
+  fi
+
+  print_error "Node pool '${legacy_pool}' metadata migration did not produce an operation ID and mode remains '${live_mode:-unknown}'."
+  return 1
+}
+
 # Workload Identity on a pre-existing cluster is the other such behaviour:
 # kube-agents requires the pool (every KSA→GSA binding rides it — without it
 # the pods silently run as the node's service account), and the module's
@@ -2049,10 +2242,7 @@ ensure_existing_cluster_workload_identity() {
       return 1
     else
       for legacy_pool in "${legacy_pools[@]}"; do
-        print_warning "Node pool '${legacy_pool}' uses the legacy GCE metadata server; migrating to GKE_METADATA (this recreates the pool's nodes)..."
-        gcloud container node-pools update "$legacy_pool" \
-          --cluster="$cluster_name" --location="$region" --project="$project_id" \
-          --workload-metadata=GKE_METADATA --quiet
+        migrate_node_pool_to_gke_metadata "$project_id" "$cluster_name" "$region" "$legacy_pool"
       done
     fi
   fi

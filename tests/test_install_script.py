@@ -1645,6 +1645,8 @@ class EnsureExistingClusterWorkloadIdentityTest(unittest.TestCase):
                 f"  *autopilot.enabled*) printf '{autopilot}\\n' ;;\n"
                 f"  *workloadIdentityConfig.workloadPool*) printf '{workload_pool}\\n' ;;\n"
                 f"  *node-pools*list*) printf '{node_pools}\\n' ;;\n"
+                "  *'node-pools update'*) printf 'op-1\\n' ;;\n"
+                "  *'operations describe'*) printf 'DONE|||\\n' ;;\n"
                 "esac\n"
                 "exit 0\n"
             )
@@ -1712,6 +1714,382 @@ class EnsureExistingClusterWorkloadIdentityTest(unittest.TestCase):
         self.assertEqual(len(node_updates), 1)
         self.assertIn("--workload-metadata=GKE_METADATA", node_updates[0])
         self.assertIn("pool-1", node_updates[0])
+        self.assertIn("--async", node_updates[0])
+
+
+class NodePoolMetadataMigrationPollingTest(unittest.TestCase):
+    """Tests dynamic timeout scaling and GKE operation polling during node pool migration (#1286)."""
+
+    def test_dynamic_timeout_scales_with_node_count(self):
+        body = (
+            f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+            'for n in 0 1 5 6 9 12; do\n'
+            '  echo "$n=$(calculate_node_pool_update_timeout $n)"\n'
+            'done\n'
+        )
+        proc = subprocess.run(
+            ["bash", "-c", body],
+            capture_output=True,
+            text=True,
+            env=get_isolated_test_env(),
+            cwd=str(_REPO_ROOT),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        expected = "0=1800\n1=1800\n5=1800\n6=1800\n9=2700\n12=3600\n"
+        self.assertEqual(proc.stdout, expected)
+
+    def test_get_node_pool_node_count_prefers_igm_target_size(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            gcloud = bin_dir / "gcloud"
+            igm_urls = (
+                "https://compute.googleapis.com/compute/v1/projects/p/zones/us-central1-a/instanceGroupManagers/igm-a;"
+                "https://compute.googleapis.com/compute/v1/projects/p/zones/us-central1-b/instanceGroupManagers/igm-b;"
+                "https://compute.googleapis.com/compute/v1/projects/p/zones/us-central1-c/instanceGroupManagers/igm-c"
+            )
+            gcloud.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                f"  *'node-pools describe'*) printf '1|3|{igm_urls}\\n' ;;\n"
+                "  *'instance-groups managed describe'*) printf '3\\n' ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = (
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                "get_node_pool_node_count p c us-central1 pool-9\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), "9")
+
+    def test_get_node_pool_node_count_falls_back_to_initial_count_when_igm_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                "  *'node-pools describe'*) printf '3|3|\\n' ;;\n"
+                "  *'instance-groups managed describe'*) exit 1 ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = (
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                "get_node_pool_node_count p c us-central1 pool-9\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), "9")
+
+    def test_get_node_pool_node_count_respects_zero_node_live_igm_target_size(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                "  *'node-pools describe'*)\n"
+                "    printf '5|2|https://www.googleapis.com/compute/v1/projects/p/zones/us-central1-a/instanceGroupManagers/igm-a\\n'\n"
+                "    ;;\n"
+                "  *'instance-groups managed describe'*)\n"
+                "    printf '0\\n'\n"
+                "    ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = (
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                "get_node_pool_node_count p c us-central1 pool-zero\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), "0")
+
+    def test_get_node_pool_node_count_falls_back_on_partial_igm_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                "  *'node-pools describe'*)\n"
+                "    printf '4|2|https://www.googleapis.com/compute/v1/projects/p/zones/us-central1-a/instanceGroupManagers/igm-a;https://www.googleapis.com/compute/v1/projects/p/zones/us-central1-b/instanceGroupManagers/igm-b\\n'\n"
+                "    ;;\n"
+                "  *'instance-groups managed describe'*'igm-a'*)\n"
+                "    printf '4\\n'\n"
+                "    ;;\n"
+                "  *'instance-groups managed describe'*'igm-b'*)\n"
+                "    exit 1\n"
+                "    ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = (
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                "get_node_pool_node_count p c us-central1 pool-partial\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), "8")
+
+    def test_migration_polls_operation_until_done_and_extends_while_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            state_file = pathlib.Path(tmp) / "poll_count"
+            state_file.write_text("0")
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                "  *'node-pools describe'*) printf '9|1|\\n' ;;\n"
+                "  *'node-pools update'*) printf 'projects/p/zones/r/operations/op-1286\\n' ;;\n"
+                "  *'operations describe'*)\n"
+                f"    c=$(cat '{state_file}')\n"
+                "    c=$((c + 1))\n"
+                f"    printf '%s' \"$c\" > '{state_file}'\n"
+                "    if [ \"$c\" -lt 4 ]; then\n"
+                "      printf 'RUNNING|updating node %d of 9||\\n' \"$c\"\n"
+                "    else\n"
+                "      printf 'DONE|||\\n'\n"
+                "    fi\n"
+                "    ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = (
+                "export NODE_POOL_UPDATE_MIN_TIMEOUT_SECS=2\n"
+                "export NODE_POOL_UPDATE_PER_NODE_TIMEOUT_SECS=0\n"
+                "export NODE_POOL_UPDATE_EXTENSION_SECS=2\n"
+                "export NODE_POOL_UPDATE_MAX_TIMEOUT_SECS=10\n"
+                "export NODE_POOL_UPDATE_POLL_INTERVAL_SECS=1\n"
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                "migrate_node_pool_to_gke_metadata p c r pool-large\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertIn("Polling operation 'op-1286' for node pool 'pool-large'", proc.stdout)
+            self.assertIn("updating node 1 of 9", proc.stdout)
+            self.assertIn("Operation 'op-1286' is still RUNNING after 2s; extending wait timeout to 4s", proc.stdout)
+            self.assertIn("Node pool 'pool-large' metadata migration completed (operation 'op-1286')", proc.stdout)
+
+    def test_migration_fails_when_operation_finishes_with_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                "  *'node-pools describe'*) printf '2|1|\\n' ;;\n"
+                "  *'node-pools update'*) printf 'op-err-99\\n' ;;\n"
+                "  *'operations describe'*) printf 'DONE|||Quota exceeded | in region\\n' ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = (
+                "export NODE_POOL_UPDATE_POLL_INTERVAL_SECS=0\n"
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                "migrate_node_pool_to_gke_metadata p c r pool-err\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("finished with error: Quota exceeded | in region", proc.stdout + proc.stderr)
+
+    def test_migration_recovers_from_transient_describe_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            state_file = pathlib.Path(tmp) / "poll_count"
+            state_file.write_text("0")
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                "  *'node-pools describe'*) printf '2|1|\\n' ;;\n"
+                "  *'node-pools update'*) printf 'op-transient\\n' ;;\n"
+                "  *'operations describe'*)\n"
+                f"    c=$(cat '{state_file}')\n"
+                "    c=$((c + 1))\n"
+                f"    printf '%s' \"$c\" > '{state_file}'\n"
+                "    if [ \"$c\" -le 2 ]; then\n"
+                "      exit 1\n"
+                "    else\n"
+                "      printf 'DONE|||\\n'\n"
+                "    fi\n"
+                "    ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = (
+                "export NODE_POOL_UPDATE_POLL_INTERVAL_SECS=0\n"
+                "export NODE_POOL_UPDATE_POLL_MAX_RETRIES=3\n"
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                "migrate_node_pool_to_gke_metadata p c r pool-t\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+            self.assertIn("Transient error querying operation 'op-transient' (attempt 1/3)", proc.stdout)
+            self.assertIn("Transient error querying operation 'op-transient' (attempt 2/3)", proc.stdout)
+            self.assertIn("Node pool 'pool-t' metadata migration completed (operation 'op-transient')", proc.stdout)
+
+    def test_migration_times_out_when_exceeding_max_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                "  *'node-pools describe'*) printf '2|1|\\n' ;;\n"
+                "  *'node-pools update'*) printf 'op-stuck\\n' ;;\n"
+                "  *'operations describe'*) printf 'RUNNING|still running||\\n' ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = (
+                "export NODE_POOL_UPDATE_MIN_TIMEOUT_SECS=1\n"
+                "export NODE_POOL_UPDATE_PER_NODE_TIMEOUT_SECS=0\n"
+                "export NODE_POOL_UPDATE_EXTENSION_SECS=1\n"
+                "export NODE_POOL_UPDATE_MAX_TIMEOUT_SECS=2\n"
+                "export NODE_POOL_UPDATE_POLL_INTERVAL_SECS=1\n"
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                "migrate_node_pool_to_gke_metadata p c r pool-stuck\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("Timed out after 2s waiting for GKE operation 'op-stuck'", proc.stdout + proc.stderr)
+
+    def test_migration_fails_immediately_when_update_initiation_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                "  *'node-pools describe'*) printf '2|1|\\n' ;;\n"
+                "  *'node-pools update'*) exit 1 ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = (
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                "migrate_node_pool_to_gke_metadata p c r pool-fail-init\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("Failed to initiate metadata migration on node pool 'pool-fail-init'", proc.stdout + proc.stderr)
+
+    def test_migration_verifies_live_mode_when_op_id_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = pathlib.Path(tmp) / "bin"
+            bin_dir.mkdir()
+            gcloud = bin_dir / "gcloud"
+            gcloud.write_text(
+                "#!/usr/bin/env bash\n"
+                'case "$*" in\n'
+                "  *'node-pools describe'*'workloadMetadataConfig.mode'*)\n"
+                "    printf 'GCE_METADATA\\n'\n"
+                "    ;;\n"
+                "  *'node-pools describe'*)\n"
+                "    printf '2|1|\\n'\n"
+                "    ;;\n"
+                "  *'node-pools update'*)\n"
+                "    printf '\\n'\n"
+                "    ;;\n"
+                "  *'operations list'*)\n"
+                "    printf '\\n'\n"
+                "    ;;\n"
+                "esac\n"
+                "exit 0\n"
+            )
+            gcloud.chmod(gcloud.stat().st_mode | stat.S_IEXEC)
+            body = (
+                f'KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"\n'
+                "migrate_node_pool_to_gke_metadata p c r pool-no-op\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", body],
+                capture_output=True,
+                text=True,
+                env=get_isolated_test_env(bin_dir=str(bin_dir)),
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("did not produce an operation ID and mode remains 'GCE_METADATA'", proc.stdout + proc.stderr)
+
+
+
 
 
 class EnsureExistingClusterGatedOnCreateClusterTest(unittest.TestCase):
