@@ -1562,6 +1562,17 @@ func buildA2AGatewayDeployment(agent *agentv1alpha1.PlatformAgent) *appsv1.Deplo
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agent.Namespace, Labels: labels},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: ptr.To(int32(1)),
+			// Recreate, as the credential proxy is, rather than the
+			// RollingUpdate default: at one replica that default resolves
+			// maxUnavailable to 0, so a roll needs a surge Pod and stalls
+			// for good under a namespace ResourceQuota with no headroom
+			// (#977, #1267). maxUnavailable: 1 is not the fix here --
+			// gateway.FromEnv refuses a second backend because two gateways
+			// on one relay durable split event deliveries, so two instances
+			// overlapping during a roll is the wrong shape. Recreate stops
+			// the old one before the new one starts; the gap is the one
+			// the single-backend rule already implies.
+			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RecreateDeploymentStrategyType},
 			Selector: &metav1.LabelSelector{MatchLabels: selector},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: podLabels},

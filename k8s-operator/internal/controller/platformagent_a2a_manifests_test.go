@@ -700,6 +700,12 @@ func TestBuildA2AGatewayIdentityAndOwnerWiring(t *testing.T) {
 	agent := a2aTestAgent()
 
 	dep := buildA2AGatewayDeployment(agent)
+	// Recreate, not the RollingUpdate default: at one replica the default
+	// resolves maxUnavailable to 0 and the roll stalls under a full quota
+	// (#1506). The credential proxy makes the same choice.
+	if dep.Spec.Strategy.Type != appsv1.RecreateDeploymentStrategyType {
+		t.Errorf("gateway Deployment strategy = %q, want %q", dep.Spec.Strategy.Type, appsv1.RecreateDeploymentStrategyType)
+	}
 	pod := dep.Spec.Template.Spec
 	if pod.ServiceAccountName != "test-agent-a2a-gateway" {
 		t.Errorf("ServiceAccountName = %q", pod.ServiceAccountName)
