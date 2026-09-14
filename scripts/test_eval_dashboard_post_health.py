@@ -183,10 +183,14 @@ class RunHarness(unittest.TestCase):
         self.opener = FakeOpener()
         self.gh = FakeGh()
 
-    def tick(self, health_doc, now, environ=None, opener=None, dry_run=False, digest_hour=DIGEST_HOUR, digest_tz=None, gh=None):
+    def tick(self, health_doc, now, environ=None, opener=None, dry_run=False, digest_hour=DIGEST_HOUR, digest_tz=None, gh=None, data=None):
         path = self.dir / "health.json"
         path.write_text(json.dumps(health_doc))
         argv = ["--health", str(path), "--state", str(self.state), "--now", now.isoformat(), "--digest-hour", str(digest_hour)]
+        if data is not None:
+            data_path = self.dir / "data.json"
+            data_path.write_text(data if isinstance(data, str) else json.dumps(data))
+            argv += ["--data", str(data_path)]
         if digest_tz:
             argv += ["--digest-tz", digest_tz]
         if dry_run:
@@ -457,6 +461,53 @@ class Digest(RunHarness):
         # 16th in Toronto, so a digest at 9 AM local that day is a new one.
         self.tick(health(), datetime(2026, 1, 17, 14, 5, tzinfo=timezone.utc))
         self.assertEqual(len(self.opener.requests), 3)
+
+    def test_digest_carries_one_line_on_last_night_when_data_json_is_given(self):
+        # Two nights of the nightly tier; the digest goes out Fri 9 AM ET
+        # (13:00Z on 2026-09-04), so the night that started 00:00Z Friday
+        # (Thu 8 PM ET) is last night.
+        def night(build, day, tasks, **extra):
+            run = {"build_id": build, "tier": "nightly", "job": "ci-kube-agents-eval-nightly", "pr": None, "head_sha": "abc1234",
+                   "started": f"2026-09-{day:02d}T00:00:00+00:00", "finished": f"2026-09-{day:02d}T06:40:00+00:00",
+                   "result": "FAILURE", "duration_s": 24000, "tasks": tasks}
+            run.update(extra)
+            return run
+
+        def task(name, *results):
+            return {"name": name, "result": "fail" if "fail" in results else "pass",
+                    "reps": [{"n": i + 1, "result": r, "reason": None if r == "pass" else "check absent"} for i, r in enumerate(results)]}
+
+        cases = [{"name": n, "domain": "cost", "active": True, "nightly_active": True} for n in ("case-a", "case-b", "case-c")]
+        data = {"schema_version": 1, "generated_at": T0.isoformat(), "cases": cases, "runs": [
+            night("3000000000000000001", 3, [task("case-a", "pass", "pass", "pass"), task("case-b", "pass", "pass", "pass"), task("case-c", "pass", "pass", "pass")]),
+            night("3000000000000000002", 4, [task("case-a", "pass", "pass", "pass"), task("case-b", "pass", "fail", "pass"), task("case-c", "fail", "fail", "fail")]),
+        ]}
+        self.tick(health(), self.at(DIGEST_UTC, 5), data=data)
+        self.assertEqual(
+            self.opener.texts[0],
+            "📊 *Smoke gate, last 24h:* 31 runs · 26 green · 2 PR-caused red · 5 infra · typical run 125 min\n"
+            "🌙 Nightly: 3 cases · 1 passed all reps · 1 partial · 1 failed · newly failing: case-c · 6h 40m\n"
+            f"{post_health.NIGHTLY_URL}\n{URL}#since=2026-09-04T03:30:00Z&view=agent",
+        )
+        self.assertEqual(post_health.NIGHTLY_URL, "https://storage.cloud.google.com/kube-agents-dashboards/evals/nightly.html")
+        # A truncated night says so instead of numbers; a missing night too.
+        data["runs"].append(night("3000000000000000003", 5, data["runs"][-1]["tasks"][:2], result="ABORTED", duration_s=None))
+        self.tick(health(), self.at(DIGEST_UTC, 5, day=5), data=data)
+        self.assertIn("\n🌙 Nightly: truncated after 6h 40m · 2 of 3 cases recorded · the night's numbers are not comparable\n", self.opener.texts[1])
+        self.tick(health(), self.at(DIGEST_UTC, 5, day=7), data=data)
+        self.assertIn("\n🌙 Nightly: no run last night (the newest on record started Fri 8:00 PM ET)\n", self.opener.texts[2])
+        # No nightly run collected yet, and an unreadable data.json: the
+        # digest still goes out and the line says what happened.
+        self.tick(health(), self.at(DIGEST_UTC, 5, day=8), data={"schema_version": 1, "runs": [], "cases": []})
+        self.assertIn("\n🌙 Nightly: no run on record yet\n", self.opener.texts[3])
+        rc, err = self.tick(health(), self.at(DIGEST_UTC, 5, day=9), data="{not json")
+        self.assertEqual(rc, 0)
+        self.assertIn("warning:", err)
+        self.assertIn("\n🌙 Nightly: no data.json to read a night from\n", self.opener.texts[4])
+
+    def test_the_digest_without_data_json_is_unchanged(self):
+        self.tick(health(), self.at(DIGEST_UTC, 5))
+        self.assertNotIn("Nightly", self.opener.texts[0])
 
     def test_digest_hour_is_configurable_and_goes_out_beside_a_change(self):
         self.tick(outage(), T0.replace(hour=17, minute=50), digest_hour=14)  # 1:50 PM ET

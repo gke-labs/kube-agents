@@ -100,6 +100,7 @@ class TestFixtureParsing(unittest.TestCase):
         self.assertEqual(run["head_sha"], "b336c6c")
         self.assertEqual(run["project"], "kube-agents-evals-5")
         self.assertEqual(run["duration_s"], 2143)
+        self.assertEqual(run["eval_verdict"], "RED", "the final verdict line, in the release record's words")
         self.assertEqual(len(run["tasks"]), 11)
         by_name = {t["name"]: t for t in run["tasks"]}
         infra = by_name["compliance-rbac-overgrant"]
@@ -117,6 +118,9 @@ class TestFixtureParsing(unittest.TestCase):
         self.assertEqual(run["head_sha"], "13b2c71")
         self.assertEqual(run["project"], "kube-agents-evals-3")
         self.assertEqual(run["result"], "FAILURE")
+        # The deadline ended the job before its verdict line: recorded as such,
+        # since Prow says FAILURE here, not ABORTED.
+        self.assertIsNone(run["eval_verdict"])
         # No verdict line -> fall back to finished-started timestamps.
         self.assertEqual(run["duration_s"], 1787775335 - 1787770764)
         self.assertEqual(len(run["tasks"]), 5)
@@ -1030,15 +1034,25 @@ class TestNightlySource(_MergeBase):
         self.assertRegex(stderr, WORKFLOW_REFUSAL)
         self.assertIn(f"warning: gsutil ls failed for {FAKE_NIGHTLY_PREFIX}", stderr)
 
-    def test_an_unfinished_nightly_build_rides_pending_like_any_other(self):
+    def test_an_unfinished_nightly_build_rides_pending_with_its_tier(self):
+        """The retry list is shared, so the entry says which source listed
+        the build: the Grid's running columns are the presubmit's, and a
+        night in flight for hours must not draw one every morning."""
         gsutil, _ = self.fake_gsutil([])
         built = self.place_nightly_build(BUILD_998_FULL)
         (built / "finished.json").unlink()
         now = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
         data, stderr = self.quiet_collect(nightly_prefix=FAKE_NIGHTLY_PREFIX, gsutil=gsutil, now=now)
         self.assertEqual(data["runs"], [])
-        self.assertEqual(data["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat()}])
+        self.assertEqual(data["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "nightly"}])
         self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
+        # The tag survives a scan whose nightly listing does not name the
+        # build again (the listing failed, or the build fell off it).
+        prior = self.write_prior(data)
+        gsutil, _ = self.fake_gsutil([])
+        later = now + timedelta(minutes=15)
+        merged, _ = self.quiet_collect(nightly_prefix=FAKE_NIGHTLY_PREFIX, merge_with=prior, gsutil=gsutil, now=later)
+        self.assertEqual(merged["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "nightly"}])
 
     def test_cases_keep_the_two_records_apart(self):
         """The per-case fields are the presubmit's; the nightly's sit under
@@ -1148,7 +1162,7 @@ class TestContractShape(unittest.TestCase):
         # carries; the pod_* trio appears only when podinfo.json was read.
         self.assertEqual(
             list(data["runs"][0]),
-            ["build_id", "tier", "job", "pr", "head_sha", "project", "started", "finished", "result", "duration_s", "tasks", "has_build_log"],
+            ["build_id", "tier", "job", "pr", "head_sha", "project", "started", "finished", "result", "eval_verdict", "duration_s", "tasks", "has_build_log"],
         )
         self.assertEqual(
             list(data["runs"][0]["tasks"][0]),

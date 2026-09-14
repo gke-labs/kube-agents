@@ -21,6 +21,7 @@ only — anything that renames, removes or re-types a field bumps
       "started": "<iso8601>",
       "finished": "<iso8601>",
       "result": "SUCCESS|FAILURE|ABORTED",
+      "eval_verdict": "GREEN|RED|null",
       "duration_s": 5793,
       "tasks": [
         {
@@ -78,10 +79,11 @@ the same layout and is collected from the moment it starts running.
   health adjudicator's rules and 24-hour metrics, `classify.py`'s "is this
   mine?" (other PRs, the only-this-PR passes, the 30-day pass rate), the
   red comment's "runs from other PRs" count (`gate_comment.py`), the
-  Brief's runs list, the legacy page's gate band, matrix and Pareto — reads
-  presubmit runs only. A nightly run appears where the nightly is meant to:
-  `cases[].nightly`, the evidence table's nightly columns, and
-  `classify.py`'s per-case `nightly_failed_recent` note.
+  Brief's runs list, the Grid's columns, the Cases page's strips and
+  presubmit rates — reads presubmit runs only. A nightly run appears where
+  the nightly is meant to: `cases[].nightly`, the Cases page's nightly rate
+  columns and a case's last failure when the presubmit has none on record,
+  and `classify.py`'s per-case `nightly_failed_recent` note.
 - `job` — **optional, additive**: the Prow job name, read from the build
   directory's URL (the segment before the build id) or overridden by
   `--nightly-job`. `null` for a `--from-dir` build, which has no URL.
@@ -98,6 +100,13 @@ the same layout and is collected from the moment it starts running.
   ISO 8601 UTC; `null` when unparseable.
 - `result` — `finished.json`'s `result` verbatim: `SUCCESS`, `FAILURE` or
   `ABORTED`. This is the Prow job verdict, not the eval verdict.
+- `eval_verdict` — **optional, additive**: the eval loop's own verdict, from
+  the final `PR Smoke Test Evaluation Succeeded/Failed` line: `GREEN` or
+  `RED`. `null` when the log has no such line — the job ended before its
+  verdict: Prow's deadline (it delivers SIGTERM and records `FAILURE`, not
+  `ABORTED`; build 2092688354838581248 below is one), a death before the
+  cases, or step 0's revalidation (a `SUCCESS`). A record written before
+  the field existed has no key: unknown, which is not `null`.
 - `duration_s` — the `Total Duration` of the final
   `PR Smoke Test Evaluation Succeeded/Failed` line (eval loop only). A
   truncated log has no verdict line — and neither does a `SUCCESS` build that
@@ -211,8 +220,8 @@ side.
 - `nightly_active` — **optional, additive**: `true` iff the name is an
   uncommented entry in `TASKS` **or** `NIGHTLY_TASKS` — the nightly matrix
   is the presubmit's superset (`EVAL_TIER=nightly` appends the second
-  array). `active` implies `nightly_active`; the renderer's "NIGHTLY ONLY"
-  pill is `nightly_active and not active`.
+  array). `active` implies `nightly_active`; the Cases page's "nightly
+  only" status is `nightly_active and not active`.
 - `runs_on_record` — total task appearances across presubmit runs, `infra`
   included (it is history).
 - `pass_rate` — `passes / (passes + fails)`. **`infra` results are excluded
@@ -250,8 +259,10 @@ Additive, optional, and safe to omit — consumers must default them.
   readable `finished.json` yet (still running, or the upload failed), or an
   index pointer that could not be read this scan, so
   they are not in `runs[]` and do not raise the watermark. Entries are
-  `{"build_id": "<id>", "first_seen": "<iso8601>"}`, lowest id first;
-  `first_seen` is when the collector first listed the build. The next
+  `{"build_id": "<id>", "first_seen": "<iso8601>"}`, plus `"tier": "nightly"`
+  when the nightly periodic's listing named the build (absent: the
+  presubmit's, as for `runs[].tier`; the tag is kept across scans), lowest
+  id first; `first_seen` is when the collector first listed the build. The next
   incremental scan re-reads exactly these ids even though they sit at or
   below the watermark, and drops an entry once it is recorded or once
   `first_seen` is more than 2 days old (`PENDING_RETRY_DAYS` — a build
@@ -321,15 +332,18 @@ collector's derivation rules for both live under `runs[]` above; this is
 what the renderer does with them.
 
 - `runs[].pr_merged` — `true` | `false` | `null`: whether the run's PR has
-  merged. The renderer's "agent" band charts only runs where it is `true`
-  (the final such run per PR); absent or `null` keeps a run out of that
-  cohort without any other effect.
+  merged. No page reads it today — the merged-PR cohort it fed left with
+  the two-band page — and it stays in the contract as the collector writes
+  it; a consumer that reads it must treat absent and `null` alike (unknown).
 - `runs[].tasks[].reps` — the task's individual repetitions, in order:
   `[{"n": 1, "result": "pass"|"fail"|"infra", "reason": "<string>"|null}]`.
   `reason` is free-form log text (renderers must escape it). `infra` reps
   are excluded from every pass-fraction denominator, exactly like `infra`
   task results. When `reps` is absent the task's single `result` stands in
   for one rep.
+- `runs[].eval_verdict` — `GREEN` | `RED` | `null`: the Nightly report reads
+  it; a night that is not a `SUCCESS` and carries `null` was ended before
+  its verdict and is reported as truncated. Absent means unknown.
 - `runs[].has_build_log`, `runs[].pod_*` — a zero-task `FAILURE` with
   `pod_last_event: "NodeNotReady"` or `has_build_log: false` is a **lost
   pod**: `classify.py` gives it its own run-level headline (`infra`, never
@@ -438,24 +452,25 @@ what the renderer does with them.
 
 ## The rendered pages
 
-`render.py` writes three pages beside `data.json`. Every time shown on the
-first two is America/Toronto ("ET"), formatted in the browser with
+`render.py` writes five pages beside `data.json`. Every time shown is
+America/Toronto ("ET"), formatted in the browser with
 `Intl.DateTimeFormat`; URL parameters stay ISO 8601 UTC.
 
-| Page          | What it is                                                                                                                                                                                                                                                         |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `index.html`  | **The Brief**: the gate's state and why, what the agent saw, what changed right before, what is being done, and the runs in the window. Healthy: the last 24 hours in numbers and the last incident.                                                               |
-| `run.html`    | **The PR view**, `run.html#build=<prow build id>`: one run, each failed gate case tagged `failing on N other PRs` / `only your PR` / `quota storm` / `unexplained` with its check reason, 30-day pass rate, transcript link and a one-line Do; a "what to do" box. |
-| `legacy.html` | The two-band page (agent trend, gate matrix, Pareto — presubmit runs only) and the evidence table, the per-case view: presubmit depth and nightly count, pass rate over reps for each tier at 7 and 30 days, and which matrix runs the case.                       |
+| Page           | What it is                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `index.html`   | **The Brief**: the gate's state and why, what the agent saw, what changed right before, what is being done, the runs in the window with a "See it in the grid" link, and the last release-candidate eval runs (`releases[]`). Healthy: the last 24 hours in numbers and the last incident.                                                                                                                                                                                                                                                  |
+| `run.html`     | **The PR view**, `run.html#build=<prow build id>`: one run, each failed gate case tagged `failing on N other PRs` / `only your PR` / `quota storm` / `unexplained` with its check reason, 30-day pass rate, transcript link, a link to its row on the Cases page and a one-line Do; a "what to do" box.                                                                                                                                                                                                                                     |
+| `grid.html`    | **The Grid**: one row per case (blocking cases by domain, then the held-out ones, folded away when they passed everything in the window), one column per presubmit run in a window of 6 h, 24 h, 36 h or 7 days (header: PR # and ET start; a green run that recorded no cases gets no column); cells passed / failed all reps / failed some / quota-infra / died before the cases / still running (`pending_builds`); merges to main and incident starts and ends marked between the columns; a cell opens that run's detail for the case. |
+| `cases.html`   | **The Cases page** ("How reliable is each test?"): one row per case by domain — its last `STRIP_RUNS` presubmit outcomes, pass rate over reps at 7 and 30 days for the presubmit and the nightly apart (`—` when a tier has no graded run), its roster status (blocking / held out / demoted with its date / nightly only / not in any matrix), its last failure with the grader's reason, and its issues from `case-notes.yaml`.                                                                                                           |
+| `nightly.html` | **The Nightly report**: last night's run of the nightly tier (or the night `#build=` names) — its wall clock and whether it ran to the end, the counts (passed all reps / partial / failed / infra), what is newly failing against the night before and what passes again, every case by domain with its state, reps, the grader's reason and a transcript link, and the other nights on record. The Brief's "Last night's run" block and the 9 AM Chat digest link here. `nightly.py` derives it.                                          |
 
-The Brief and the PR view render in the browser from `brief.json` (below),
+The pages render in the browser from `brief.json` (below),
 which `render.py` inlines into each page as
 `<script type="application/json" id="inline-brief">` (the verdict it read,
 the same document as `brief.health`, again as `inline-health`), so a page
 needs no request beyond itself;
 the poll of the published `brief.json` and `health.json` every 60 seconds
-is a best-effort refresh on top, and the legacy page polls `data.json` the
-same way. That matters on `storage.cloud.google.com`, which answers an XHR
+is a best-effort refresh on top. That matters on `storage.cloud.google.com`, which answers an XHR
 with a login redirect: the pages still render whole there. The header
 badge says `updated <time> · Nm ago`, plus `· regenerated every 15 min`
 while no poll has succeeded (the workflow republishes every page on that
@@ -473,6 +488,9 @@ the question imports it.
 
 `index.html#since=<ISO 8601 UTC>&until=<ISO 8601 UTC>&cases=a,b&view=gate|agent`
 `run.html#build=<prow build id>`
+`grid.html#since=<ISO 8601 UTC>&until=<ISO 8601 UTC>&cases=a,b[&window=6h|24h|36h|7d][&rows=all|admitted|failing]`
+`cases.html#<case id>`, or `cases.html#sort=worst|domain|name&show=all|blocking|held`
+`nightly.html[#build=<prow build id>]`
 
 Every parameter travels in the URL fragment as `key=value` pairs joined
 by `&`. `storage.cloud.google.com` answers an unauthenticated request with
@@ -480,42 +498,51 @@ a login redirect that comes back without the query string, so a scope
 carried there arrived empty and the reader landed on the unscoped Brief; a
 browser never sends the fragment to the server and carries it through a
 redirect, so a scope carried there survives. The older form,
-`index.html?cases=a,b&since=…&until=…#gate|#agent` and
-`run.html?build=<id>`, is still read, so a link already posted to Chat, a
-pull request or an issue opens the same page wherever its query survives
-(a session the host does not redirect, a local render); a key present in
-both places is read from the query. `linkState()` in `template/pages.js` is the one
-parser; `post_health.dashboard_link` / `run_link` (Python: the Chat
-messages, the gate comment, the tracking issue) and `briefHref` /
-`runHref` (the pages' own links, `incidentHref` and `numbersHref` wrap
-the first; the nav's "Numbers" link in `page.html.tmpl` is the same
-text) are the writers. A writer omits an empty parameter.
+`index.html?cases=a,b&since=…&until=…#gate|#agent`, `run.html?build=<id>`
+and the same query form on the Grid and the Cases page, is still read, so
+a link already posted to Chat, a pull request or an issue opens the same
+page wherever its query survives (a session the host does not redirect, a
+local render); a key present in both places is read from the query.
+`linkState()` in `template/pages.js` is the one parser;
+`post_health.dashboard_link` / `run_link` (Python: the Chat messages, the
+gate comment, the tracking issue) and `briefHref` / `gridHref` / `runHref`
+/ `caseHref` / `nightHref` (the pages' own links; `incidentHref` and
+`numbersHref` wrap the first) are the writers. A writer omits an empty parameter.
 
 - `cases`, `since`, `until` scope the Brief to that incident (a past one
   when `until` is given). `since` is matched to an incident in
-  `health-history.jsonl`; without history the parameters describe it.
+  `health-history.jsonl`; without history the parameters describe it. On
+  the Grid the same three make the incident the window and pin its cases
+  first; the Brief's "See it in the grid" link carries them.
 - `view=agent` shows the last 24 hours in numbers; `view=gate` lands on
   the "why we think" block (the page scrolls to the section after it
   renders). No parameters: the current state from `health.json`.
 - Case ids match `[A-Za-z0-9][A-Za-z0-9._-]{0,79}`; the first 50
   (`maxLinkCases`) that do are read, and a link the pages write carries at
   most those 50. A value that fails its grammar is dropped and everything
-  reaches the DOM escaped.
+  reaches the DOM escaped. On the Cases page a `#<case id>` fragment
+  highlights that row; the PR view and the Grid link there.
 - `since` and `until` are read with a `Z`, a space separator, or a UTC
   offset written `+02:00` or `+0200`, and converted; the pages themselves
   write `Z`, and nothing a writer emits is percent-encoded (the case-id
   grammar and the `Z` form need none).
 - `run.html#build=<digits>`; an id not in `brief.json` shows a
   not-found page naming the window (`RUN_VIEW_DAYS`, 14 days).
+- `nightly.html#build=<digits>` opens that night instead of the newest;
+  an id not among the `nightly.nights[]` on record says so and links
+  last night's.
+- `window`, `rows`, `sort` and `show` are the Grid's and the Cases page's
+  chips as parameters; a value outside the vocabulary is the default.
 
 ### `brief.json` (written by `render.py`)
 
-`{schema_version, generated_at, stale_after_s, run_days, admitted[],
-health, history, merges, cases{}, runs[]}`. `runs[]` is the **presubmit's**
-last `run_days` of `data.json`, oldest first — a nightly run is nobody's
-pull request and is not listed — each carrying its identity and timing
-plus `classify.classify_run(...)`: `verdict` (`red` = looks like the PR,
-`green`, `infra` = the gate's), `headline`, `lede`, `matches_incident`,
+`{schema_version, generated_at, stale_after_s, run_days, rate_windows_days,
+strip_runs, admitted[], health, history, merges, catches, cases{}, runs[],
+pending[], releases[], nightly{}}`. `runs[]` is the **presubmit's** last `run_days` of
+`data.json`, oldest first — a nightly run is nobody's pull request and is
+not listed — each carrying its identity and timing plus
+`classify.classify_run(...)`: `verdict` (`red` = looks like the PR, `green`,
+`infra` = the gate's), `headline`, `lede`, `matches_incident`,
 `setup_death`, `storm_reps`, `do`, `cases[]` (`{case, outcome, cls,
 also_failing_prs, pass_rate_30d, reason, excerpt, do, admitted, reps,
 nightly_failed_recent}`) and `health_at` (the verdict in force when it
@@ -524,11 +551,70 @@ finished, from history; `null` without history). `also_failing_prs` and
 `true` / `false` when the newest nightly run within two days of this one
 graded the case and failed / did not fail it on every repetition, `null`
 when none did — evidence about `main`, shown beside the case, never a tag.
-`cases{}` is `{active, nightly_active, admitted}` per case. `health` is
+
+`cases{}` is, per case, `{active, nightly_active, admitted, domain, status,
+demoted_on, note, issues[], rates, strip[], last_failure}`. `status` is
+`blocking` (active and in `BOOTSTRAP_ADMITTED`), `held_out` (active, off
+the roster), `demoted` (held out, with `demoted_on` read from the hold-out
+entry in `docs/eval-gate-roster.md` that says `demoted YYYY-MM-DD`),
+`nightly_only`, or `retired` (in neither matrix on this checkout); an
+unreadable roster reads every active case as `blocking`, over-reporting
+rather than hiding. `rates` is `{presubmit: [[pass, fail], [pass, fail]],
+nightly: [...]}` over graded reps for each of `rate_windows_days` (7 and
+30), run-level events excluded, `null` when nothing was graded. `strip[]`
+is the case's last `strip_runs` presubmit appearances, oldest first,
+`{build, pr, at, state, event}` with `state` in `pass|partial|fail|infra`
+and `event` true for a run-level event. `last_failure` is the newest `fail`
+or `partial` appearance — the presubmit's, else the nightly's — as `{tier,
+build, pr, at, state, reps, reason, excerpt, cls, also_failing_prs, event}`
+(`cls` and `also_failing_prs` from the Brief's classification of that run
+when it is in `runs[]`, else `null` and `0`), or `null` when there is none.
+
+`pending[]` is `pending_builds` as `{build, first_seen}`, the Grid's "still
+running" columns — the presubmit's entries only (a night in flight,
+`tier: nightly`, gets no column) and only the ones first seen inside the last
+`PENDING_MAX_AGE_MS` (8 hours, past the presubmit's ceiling): an older one
+is a build that never finished, not one still running. `releases[]` is `data.json`'s `releases[]` newest first,
+at most `RELEASES_MAX_ROWS`, each reduced to `{build, rc_tag, commit, tier,
+verdict, result, started, duration_s, artifacts_url, pass_rate,
+baseline_rate, margin, cases{passed, graded, infra}}` — `artifacts_url`
+only when it is `https://`, else `null`; `cases` `null` when no task
+parsed. `catches` is `events.yaml`'s `catches` block or `null`. `health` is
 the current verdict, `history` the ticks and the incidents derived from
 them, `merges` the recent first-parent commits of the checkout (`null`
-when the checkout is shallow or has no git, and the page omits "what
-changed right before").
+when the checkout is shallow or has no git; the Brief then omits "what
+changed right before" and the Grid its merge markers).
+
+`nightly` is `{job, nights[], running[]}` from `nightly.py`: `job` the
+periodic's name as the newest nightly run carries it (the default when none
+is on record),
+`nights[]` the last `NIGHTS_ON_RECORD` (14) nightly runs **newest first**,
+each `{build, job, head_sha, project, started, finished, duration_s, result,
+log_url, truncated, complete, counts{expected, recorded, passed, partial,
+failed, infra, missing}, missing[], newly_failing[], fixed[],
+previous_build, cases[]}`. `cases[]` is every task row the night measured,
+sorted by domain then name, as `{case, domain, state, reps{pass, fail,
+infra}, reason, transcript_url}` with `state` in `pass|partial|fail|infra`
+by the strip's rule over the task's reps (no `reps` key: the task's result
+is one rep) and `reason` the first failing rep's grader text (`null` on a
+pass). `expected` counts the cases `nightly_active` on this checkout;
+`missing[]` names the expected cases the night did not record.
+`truncated` is a night Prow ended before its verdict: `result == "ABORTED"`
+(an interrupt), or any other non-`SUCCESS` result with `eval_verdict`
+`null` — the periodic's deadline arrives as SIGTERM and Prow records
+`FAILURE`, so `ABORTED` alone would miss it; a record without the field
+is unknown, not truncated. `complete` is neither truncated nor missing
+anything. `newly_failing`
+is every `fail` tonight that was not `fail` on `previous_build`, the night
+before it on record (the one past the window included), `fixed` every
+`fail` then that is `pass` now; both `[]` on the first night, when
+`previous_build` is `null`. `log_url` and `transcript_url` point at
+Spyglass under `logs/<job>/<build>`, a periodic's path. The nights are
+never in `runs[]`. `running[]` is the nightly's entries of `pending_builds`
+first seen inside `RUNNING_MAX_AGE` (9 hours: the periodic's 8-hour budget
+and Prow's time to write `finished.json`) of `generated_at`, oldest first,
+each `{build, first_seen, log_url}` — a night in flight, which the Brief's
+block, the report page and the digest say instead of "no night".
 
 ### `health.json` and `health-history.jsonl` (optional inputs)
 

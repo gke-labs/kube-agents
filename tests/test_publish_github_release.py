@@ -348,6 +348,101 @@ class PublishGithubReleaseScriptTest(unittest.TestCase):
         finally:
             temp_dir.cleanup()
 
+    def _repo_with_release_tags(self, temp_dir, repo_dir, git, tags):
+        """Tags the release commit with every tag in `tags` and returns the mock gh log path."""
+        bin_dir = pathlib.Path(temp_dir.name) / "bin"
+        _, gh_log = create_mock_gh_binary(bin_dir)
+        dummy_file = pathlib.Path(repo_dir) / "version.txt"
+        dummy_file.write_text(f"v{MOCK_TARGET_RELEASE_TAG}\n")
+        git("add", "version.txt")
+        git("commit", "-m", f"chore: release {MOCK_TARGET_RELEASE_TAG}")
+        for tag in tags:
+            git("tag", tag)
+        return bin_dir, gh_log
+
+    def _release_create_line(self, gh_log):
+        lines = [line for line in gh_log.read_text().splitlines() if "release create" in line]
+        self.assertEqual(len(lines), 1, gh_log.read_text())
+        return lines[0]
+
+    def test_publish_passes_the_previous_ga_tag_as_notes_start_tag(self):
+        """The previous GA tag is named explicitly: GA tags sit on stamped commits off main, so GitHub's ancestry walk misses them."""
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            bin_dir, gh_log = self._repo_with_release_tags(
+                temp_dir, repo_dir, git, tags=["0.1.0", MOCK_TARGET_RELEASE_TAG]
+            )
+            proc = self._run_script(
+                [MOCK_TARGET_RELEASE_TAG],
+                env={"CI": "true", "GH_TOKEN": MOCK_GH_TOKEN},
+                bin_dir=str(bin_dir),
+                cwd=repo_dir,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("Notes Start Tag:   0.1.0", proc.stdout)
+            create_line = self._release_create_line(gh_log)
+            self.assertIn("--generate-notes", create_line)
+            self.assertIn("--notes-start-tag 0.1.0", create_line)
+        finally:
+            temp_dir.cleanup()
+
+    def test_publish_omits_notes_start_tag_for_the_first_release(self):
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            bin_dir, gh_log = self._repo_with_release_tags(temp_dir, repo_dir, git, tags=[MOCK_TARGET_RELEASE_TAG])
+            proc = self._run_script(
+                [MOCK_TARGET_RELEASE_TAG],
+                env={"CI": "true", "GH_TOKEN": MOCK_GH_TOKEN},
+                bin_dir=str(bin_dir),
+                cwd=repo_dir,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("Notes Start Tag:   none", proc.stdout)
+            self.assertIn(f"No GA tag below '{MOCK_TARGET_RELEASE_TAG}' in this checkout", proc.stderr)
+            create_line = self._release_create_line(gh_log)
+            self.assertIn("--generate-notes", create_line)
+            self.assertNotIn("--notes-start-tag", gh_log.read_text())
+        finally:
+            temp_dir.cleanup()
+
+    def test_publish_honours_previous_version_from_the_environment(self):
+        temp_dir, repo_dir, git = create_mock_git_repo()
+        try:
+            bin_dir, gh_log = self._repo_with_release_tags(
+                temp_dir, repo_dir, git, tags=["0.1.0", MOCK_TARGET_RELEASE_TAG]
+            )
+            proc = self._run_script(
+                [MOCK_TARGET_RELEASE_TAG],
+                env={"CI": "true", "GH_TOKEN": MOCK_GH_TOKEN, "PREVIOUS_VERSION": "0.1.5"},
+                bin_dir=str(bin_dir),
+                cwd=repo_dir,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("Notes Start Tag:   0.1.5", proc.stdout)
+            self.assertIn("--notes-start-tag 0.1.5", self._release_create_line(gh_log))
+        finally:
+            temp_dir.cleanup()
+
+    def test_publish_rejects_a_previous_version_that_is_not_below_the_release(self):
+        for previous_version in (MOCK_TARGET_RELEASE_TAG, "0.3.0", "v0.1.0", "0.1"):
+            with self.subTest(previous_version=previous_version):
+                temp_dir, repo_dir, git = create_mock_git_repo()
+                try:
+                    bin_dir, gh_log = self._repo_with_release_tags(
+                        temp_dir, repo_dir, git, tags=["0.1.0", MOCK_TARGET_RELEASE_TAG]
+                    )
+                    proc = self._run_script(
+                        [MOCK_TARGET_RELEASE_TAG],
+                        env={"CI": "true", "GH_TOKEN": MOCK_GH_TOKEN, "PREVIOUS_VERSION": previous_version},
+                        bin_dir=str(bin_dir),
+                        cwd=repo_dir,
+                    )
+                    self.assertEqual(proc.returncode, 1, proc.stdout)
+                    self.assertIn(f"'{previous_version}'", proc.stderr)
+                    self.assertFalse(gh_log.exists(), "no gh call is expected before the previous version is validated")
+                finally:
+                    temp_dir.cleanup()
+
     def test_publish_script_uses_bash_32_guarded_array_syntax(self):
         """Verifies publish_github_release.sh uses ${dist_files[@]+"${dist_files[@]}"} to avoid macOS bash 3.2 unbound variable."""
         content = _PUBLISH_GITHUB_RELEASE_SH.read_text()

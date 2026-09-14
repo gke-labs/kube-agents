@@ -161,8 +161,9 @@ a mirrored install can redirect it, and most need other substitutions besides.
 These copies are the **development path**: a stock install gets the same
 components rendered by the [`kube-agents` Helm chart](https://github.com/gke-labs/kube-agents/tree/main/charts/kube-agents)
 (via the Terraform engine the installer drives), while `k8s-operator/config/`
-remains the source of truth for the CRDs and operator RBAC the chart copies
-(`make chart-check` enforces that). Deploy the dev copies via `make deploy-*`
+remains the source of truth for the CRDs, operator RBAC, admission policy and
+webhook configuration the chart copies or mirrors (`make chart-check` enforces
+that). Deploy the dev copies via `make deploy-*`
 from `k8s-operator/`:
 
 ```bash

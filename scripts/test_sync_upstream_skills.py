@@ -137,6 +137,59 @@ class ApplySubstitutionsTest(unittest.TestCase):
         self.assertIn(sync.GKE_MANIFEST_GENERATION_NEW_ROUTING_SNIPPET, content)
         self.assertTrue((skills_dir / "gcp-config-connector" / "SKILL.md").is_file())
 
+    def test_applies_manifest_generation_service_account_substitution(self):
+        d = self._skill_dir(
+            body="Always create and reference a dedicated `ServiceAccount`\n    "
+            + sync.GKE_MANIFEST_GENERATION_OLD_SERVICE_ACCOUNT_SNIPPET
+            + " for each microservice.\n"
+        )
+        self.assertTrue(sync.apply_substitutions(str(d), "gke-manifest-generation"))
+        text = self._read(d)
+        self.assertNotIn(sync.GKE_MANIFEST_GENERATION_OLD_SERVICE_ACCOUNT_SNIPPET, text)
+        self.assertNotIn("devteam-agent-sa", text)
+        self.assertIn(sync.GKE_MANIFEST_GENERATION_NEW_SERVICE_ACCOUNT_SNIPPET, text)
+        # Second call must be a no-op (replacement already present).
+        self.assertFalse(sync.apply_substitutions(str(d), "gke-manifest-generation"))
+        self.assertEqual(self._read(d).count(sync.GKE_MANIFEST_GENERATION_NEW_SERVICE_ACCOUNT_SNIPPET), 1)
+
+    def test_repo_manifest_generation_skill_uses_neutral_service_account(self):
+        # The in-tree mirror must already read as a fresh sync would leave it: the retired
+        # DevTeamAgent-era ServiceAccount name gone and the neutral example in its place.
+        repo_root = Path(__file__).resolve().parent.parent
+        skill_md = repo_root / "agents" / "platform" / "skills" / "gke-manifest-generation" / "SKILL.md"
+        content = skill_md.read_text(encoding="utf-8")
+        self.assertNotIn("devteam-agent-sa", content)
+        self.assertNotIn(sync.GKE_MANIFEST_GENERATION_OLD_SERVICE_ACCOUNT_SNIPPET, content)
+        self.assertIn(sync.GKE_MANIFEST_GENERATION_NEW_SERVICE_ACCOUNT_SNIPPET, content)
+
+    def test_applies_manifest_generation_output_path_substitution(self):
+        d = self._skill_dir(
+            body="        ```bash\n        gcloud container ai profiles manifests create \\\n"
+            "          --output=manifest \\\n"
+            + sync.GKE_MANIFEST_GENERATION_OLD_OUTPUT_PATH_SNIPPET
+            + "\n    -   *Constraint*: You must include all resources returned by this command\n"
+        )
+        self.assertTrue(sync.apply_substitutions(str(d), "gke-manifest-generation"))
+        text = self._read(d)
+        self.assertNotIn("--output-path={output_file_path}", text)
+        self.assertIn(sync.GKE_MANIFEST_GENERATION_NEW_OUTPUT_PATH_SNIPPET, text)
+        self.assertIn("> {output_file_path}", text)
+        self.assertIn("refuses it.", text)
+        # Second call must be a no-op (replacement already present).
+        self.assertFalse(sync.apply_substitutions(str(d), "gke-manifest-generation"))
+        self.assertEqual(self._read(d).count(sync.GKE_MANIFEST_GENERATION_NEW_OUTPUT_PATH_SNIPPET), 1)
+
+    def test_repo_manifest_generation_skill_carries_every_substitution(self):
+        # The in-tree mirror is rmtree'd and re-copied from upstream on every sync, so every local
+        # divergence has to be a registered pair, and the file has to already read as a fresh sync
+        # would leave it: every replacement present exactly once, every target gone.
+        repo_root = Path(__file__).resolve().parent.parent
+        skill_md = repo_root / "agents" / "platform" / "skills" / "gke-manifest-generation" / "SKILL.md"
+        content = skill_md.read_text(encoding="utf-8")
+        for target, replacement in sync.SKILL_SUBSTITUTIONS["gke-manifest-generation"]:
+            self.assertNotIn(target, content)
+            self.assertEqual(content.count(replacement), 1, replacement)
+
     def test_repo_workload_security_skills_have_enforcement_command(self):
         repo_root = Path(__file__).resolve().parent.parent
         for agent in ["platform", "cluster"]:

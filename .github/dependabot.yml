@@ -30,9 +30,12 @@ updates:
         patterns:
           - "*"
 
-  # k8s-operator holds the only go.mod in the tree.
+  # Every go.mod in the tree is listed here by path. A new one is added to this
+  # list by hand rather than picked up by a glob (see #763 above).
   - package-ecosystem: "gomod"
-    directory: "/k8s-operator"
+    directories:
+      - "/k8s-operator"
+      - "/a2a"
     schedule:
       interval: "weekly"
     cooldown:

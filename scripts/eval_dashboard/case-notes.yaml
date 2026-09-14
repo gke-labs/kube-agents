@@ -2,9 +2,13 @@
 #
 # Everything measurable on the dashboard comes from data.json; this file is
 # the one place for the sentence a number cannot carry -- why a case was
-# redesigned, which issue tracks a known failure. render.py tolerates an
+# redesigned, which issue tracks a known failure. The Cases page shows the
+# note under the case name and the issues in its Issue column; health.py
+# reads the issues as an incident's tracking issues. render.py tolerates an
 # absent file and a case with no entry (both simply mean "no note"), so
-# deleting a stale line can never break a render.
+# deleting a stale line can never break a render. A case's roster status
+# (blocking, held out, demoted) is not annotated here: the pages read it
+# from hack/ci-eval-pr.sh and docs/eval-gate-roster.md.
 #
 # Entry shape (all keys optional):
 #
@@ -12,22 +16,15 @@
 #     <case-name>:
 #       note: one-line human context, shown under the case name
 #       issues: ["#123", "#456"]   # rendered as links to this repo's issues
-#       badge: held-out            # matrix row pill: "held-out" or "new"
 
 notes:
   agent-kanban-smoke:
     note: redesigned 08-27
-  autoops-warning-event-triage:
-    badge: held-out
   capacity-pinned-pool-probe:
     issues: ["#1010"]
-    badge: held-out
-  cluster-agent-healthy-workload-no-finding:
-    badge: held-out
   compliance-rbac-overgrant:
     issues: ["#998", "#985", "#1171"]
-    badge: held-out
   gpu-stress-test-diagnosis:
     note: reuse regression under investigation
   security-overgrant-remediation-proposal:
-    badge: new
+    note: new case, earning its record

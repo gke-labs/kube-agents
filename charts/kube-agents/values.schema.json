@@ -1,0 +1,844 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "kube-agents chart values",
+  "description": "Every key values.yaml declares, closed at each level the templates read, so a misspelt or mistyped key fails `helm lint`, `helm template`, `helm install` and `helm upgrade` before anything renders. Left open, with no property list, because the templates pass them through or hand them to something else that validates them: platformAgent.annotations, platformAgent.networkPolicy, platformAgent.credentials.data, platformAgent.harness.tuning.{default,platform,cluster}, every resources block, both serviceAccountAnnotations maps, the operator.extraEnv and platformAgent.deployment.env items, the platformAgent.security.scopedServiceAccounts items, the litellm.redaction.rules items, litellm.redaction.ip.action, and the global.imagePullSecrets items (a Secret name or {name: ...}; the chart's helper decides). values.yaml documents what each key does.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "admissionPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": ["boolean", "null"]
+        }
+      }
+    },
+    "global": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "imageRegistry": {
+          "type": "string"
+        },
+        "thirdPartyImageRegistry": {
+          "type": "string"
+        },
+        "imagePullSecrets": {
+          "type": "array",
+          "items": {}
+        }
+      }
+    },
+    "operator": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "extraEnv": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "repository": {
+              "type": "string"
+            },
+            "tag": {
+              "type": ["string", "integer"]
+            },
+            "pullPolicy": {
+              "type": "string"
+            }
+          }
+        },
+        "replicaCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "rollingUpdate": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "maxSurge": {
+              "type": ["integer", "string", "null"]
+            },
+            "maxUnavailable": {
+              "type": ["integer", "string", "null"]
+            }
+          }
+        },
+        "podDisruptionBudget": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        },
+        "webhooks": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "certManager": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                }
+              }
+            },
+            "failurePolicy": {
+              "type": "string"
+            }
+          }
+        },
+        "resources": {
+          "type": "object"
+        }
+      }
+    },
+    "telemetry": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "otlpEndpoint": {
+          "type": "string"
+        },
+        "collectorNamespace": {
+          "type": "string"
+        }
+      }
+    },
+    "litellm": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "otel": {
+          "type": "boolean"
+        },
+        "modelProvider": {
+          "type": "string"
+        },
+        "modelDefaultName": {
+          "type": "string"
+        },
+        "vertex": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "serviceAccountName": {
+              "type": "string"
+            },
+            "serviceAccountAnnotations": {
+              "type": "object"
+            },
+            "projectId": {
+              "type": "string"
+            },
+            "location": {
+              "type": "string"
+            }
+          }
+        },
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "repository": {
+              "type": "string"
+            },
+            "tag": {
+              "type": ["string", "integer"]
+            },
+            "pullPolicy": {
+              "type": "string"
+            }
+          }
+        },
+        "replicaCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "rollingUpdate": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "properties": {
+            "maxSurge": {
+              "type": ["integer", "string", "null"]
+            },
+            "maxUnavailable": {
+              "type": ["integer", "string", "null"]
+            }
+          }
+        },
+        "podDisruptionBudget": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        },
+        "resources": {
+          "type": "object"
+        },
+        "networkPolicy": {
+          "type": "boolean"
+        },
+        "podMonitoring": {
+          "type": "boolean"
+        },
+        "redaction": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "ip": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "action": {},
+                "allowCidrs": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "rules": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            }
+          }
+        }
+      }
+    },
+    "hindsight": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": ["boolean", "null"]
+        },
+        "api": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "image": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "repository": {
+                  "type": "string"
+                },
+                "tag": {
+                  "type": ["string", "integer"]
+                },
+                "pullPolicy": {
+                  "type": "string"
+                }
+              }
+            },
+            "rollingUpdate": {
+              "type": ["object", "null"],
+              "additionalProperties": false,
+              "properties": {
+                "maxSurge": {
+                  "type": ["integer", "string", "null"]
+                },
+                "maxUnavailable": {
+                  "type": ["integer", "string", "null"]
+                }
+              }
+            },
+            "resources": {
+              "type": "object"
+            }
+          }
+        },
+        "postgresql": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "image": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "repository": {
+                  "type": "string"
+                },
+                "tag": {
+                  "type": ["string", "integer"]
+                },
+                "pullPolicy": {
+                  "type": "string"
+                }
+              }
+            },
+            "resources": {
+              "type": "object"
+            },
+            "storage": {
+              "type": ["string", "integer"]
+            }
+          }
+        },
+        "networkPolicy": {
+          "type": "boolean"
+        },
+        "podMonitoring": {
+          "type": "boolean"
+        },
+        "podDisruptionBudget": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "githubMinter": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "org": {
+          "type": "string"
+        },
+        "repo": {
+          "type": "string"
+        },
+        "appId": {
+          "type": ["string", "integer"]
+        },
+        "ksaName": {
+          "type": "string"
+        },
+        "gsaName": {
+          "type": "string"
+        },
+        "allowedServiceAccount": {
+          "type": "string"
+        },
+        "kms": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "keyring": {
+              "type": "string"
+            },
+            "key": {
+              "type": "string"
+            },
+            "keyVersion": {
+              "type": ["string", "integer"]
+            },
+            "location": {
+              "type": "string"
+            }
+          }
+        },
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "repository": {
+              "type": "string"
+            },
+            "tag": {
+              "type": ["string", "integer"]
+            },
+            "pullPolicy": {
+              "type": "string"
+            }
+          }
+        },
+        "replicaCount": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "resources": {
+          "type": "object"
+        },
+        "networkPolicy": {
+          "type": "boolean"
+        },
+        "podDisruptionBudget": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "fluentBit": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "repository": {
+              "type": "string"
+            },
+            "tag": {
+              "type": ["string", "integer"]
+            }
+          }
+        }
+      }
+    },
+    "agentSandbox": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "image": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "repository": {
+              "type": "string"
+            },
+            "tag": {
+              "type": ["string", "integer"]
+            }
+          }
+        }
+      }
+    },
+    "platformAgent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "name": {
+          "type": "string"
+        },
+        "annotations": {
+          "type": "object"
+        },
+        "harness": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "clusterName": {
+              "type": "string"
+            },
+            "location": {
+              "type": "string"
+            },
+            "projectId": {
+              "type": "string"
+            },
+            "hermes": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "dashboardEnabled": {
+                  "type": ["boolean", "null"]
+                },
+                "pluginsDebug": {
+                  "type": ["boolean", "null"]
+                },
+                "agentHome": {
+                  "type": "string"
+                }
+              }
+            },
+            "memory": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": ["boolean", "null"]
+                },
+                "provider": {
+                  "type": "string"
+                },
+                "userProfileEnabled": {
+                  "type": ["boolean", "null"]
+                }
+              }
+            },
+            "experimental": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "shellSandbox": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "enabled": {
+                      "type": ["boolean", "null"]
+                    },
+                    "image": {
+                      "type": "string"
+                    },
+                    "runtimeClassName": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            },
+            "tuning": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "maxInProgress": {
+                  "type": "integer"
+                },
+                "default": {
+                  "type": "object"
+                },
+                "platform": {
+                  "type": "object"
+                },
+                "cluster": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        },
+        "deployment": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "image": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "repository": {
+                  "type": "string"
+                },
+                "tag": {
+                  "type": ["string", "integer"]
+                },
+                "pullPolicy": {
+                  "type": "string"
+                }
+              }
+            },
+            "availability": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "replicas": {
+                  "type": ["integer", "null"],
+                  "minimum": 0
+                },
+                "runtimeClassName": {
+                  "type": "string"
+                }
+              }
+            },
+            "env": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "cleanupHook": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "image": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "repository": {
+                  "type": "string"
+                },
+                "tag": {
+                  "type": ["string", "integer"]
+                }
+              }
+            },
+            "timeout": {
+              "type": "string"
+            },
+            "activeDeadlineSeconds": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "security": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "serviceAccountName": {
+              "type": "string"
+            },
+            "serviceAccountAnnotations": {
+              "type": "object"
+            },
+            "scopedServiceAccounts": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            },
+            "workloadIdentityFederation": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "audience": {
+                  "type": "string"
+                },
+                "serviceAccountEmail": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "credentials": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "secretName": {
+              "type": "string"
+            },
+            "create": {
+              "type": "boolean"
+            },
+            "data": {
+              "type": "object"
+            }
+          }
+        },
+        "networkPolicy": {
+          "type": "object"
+        },
+        "integration": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "github": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "org": {
+                  "type": "string"
+                },
+                "gitRepo": {
+                  "type": "string"
+                }
+              }
+            },
+            "googleChat": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "topicName": {
+                  "type": "string"
+                },
+                "subscriptionName": {
+                  "type": "string"
+                },
+                "allowedUsers": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "homeChannel": {
+                  "type": "string"
+                },
+                "mode": {
+                  "type": "string"
+                }
+              }
+            },
+            "slack": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "allowedUsers": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "homeChannel": {
+                  "type": "string"
+                },
+                "homeChannelName": {
+                  "type": "string"
+                }
+              }
+            },
+            "teams": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "tenantId": {
+                  "type": "string"
+                },
+                "allowedUsers": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "allowAllUsers": {
+                  "type": "boolean"
+                },
+                "homeChannel": {
+                  "type": "string"
+                },
+                "serviceUrl": {
+                  "type": "string"
+                },
+                "adaptiveCards": {
+                  "type": "boolean"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "plugins": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "pubsubPlatform": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "name": {
+              "type": "string"
+            },
+            "agentRef": {
+              "type": "string"
+            },
+            "image": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "repository": {
+                  "type": "string"
+                },
+                "tag": {
+                  "type": ["string", "integer"]
+                },
+                "pullPolicy": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "stockoutInvestigator": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": {
+              "type": "boolean"
+            },
+            "name": {
+              "type": "string"
+            },
+            "agentRef": {
+              "type": "string"
+            },
+            "targetProfile": {
+              "type": "string"
+            },
+            "clusterName": {
+              "type": "string"
+            },
+            "image": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "repository": {
+                  "type": "string"
+                },
+                "tag": {
+                  "type": ["string", "integer"]
+                },
+                "pullPolicy": {
+                  "type": "string"
+                }
+              }
+            },
+            "pubsub": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "topic": {
+                  "type": "string"
+                },
+                "subscription": {
+                  "type": "string"
+                },
+                "sink": {
+                  "type": "string"
+                },
+                "thresholdCount": {
+                  "type": "integer"
+                },
+                "thresholdWindowSeconds": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

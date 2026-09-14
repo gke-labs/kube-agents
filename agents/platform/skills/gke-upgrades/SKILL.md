@@ -226,5 +226,8 @@ table rather than reasoning from memory:
 ```
 
 Without `--target-version` it measures each cluster against its own release channel's default and
-prints that baseline per member. It reads with `gcloud container` only and changes nothing. The
-plan, runbook and checklist for the members it flags are this skill's job.
+prints that baseline per member. Run again during a rollout, it says which members started,
+completed or stalled since the previous run. It reads with `gcloud container` only and changes
+nothing in GCP; the only thing it writes is its own record of each run under
+`/opt/data/state/fleet-upgrade-verification/`. The plan, runbook and checklist for the members it
+flags are this skill's job.

@@ -26,7 +26,7 @@ following rules:
     active `SETTINGS.md`. Never omit the namespace.
 -   **Dedicated ServiceAccount**: Avoid using the namespace's `default`
     ServiceAccount. Always create and reference a dedicated `ServiceAccount`
-    (e.g., `devteam-agent-sa`) for each microservice.
+    (e.g., `checkout-sa`) for each microservice.
 
 ### 2. GKE Resource Tuning (Autopilot & Standard)
 

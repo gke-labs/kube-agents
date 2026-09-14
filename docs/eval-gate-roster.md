@@ -90,12 +90,13 @@ original hold-out rationale stands —
 record. It enters `BOOTSTRAP_ADMITTED` when the lettered-options bar is settled and it
 has a clean record.
 
-The eval dashboard's legacy page ("Evidence on record") is the readable view of
-that record: per case, the presubmit and the nightly pass rate over repetitions
-at 7 and 30 days, kept apart — the nightly tier is the only place a case outside
-`TASKS` runs at all. The admission evidence itself is the baseline store
-([`bench/baselines/README.md`](../bench/baselines/README.md)); the page shows
-the same nightly runs, it does not replace the store.
+The eval dashboard's Cases page (`cases.html`, "How reliable is each test?") is
+the readable view of that record: per case, the presubmit and the nightly pass
+rate over repetitions at 7 and 30 days, kept apart — the nightly tier is the only
+place a case outside `TASKS` runs at all — beside the case's roster status, which
+it reads from the script and from this page. The admission evidence itself is the
+baseline store ([`bench/baselines/README.md`](../bench/baselines/README.md)); the
+page shows the same nightly runs, it does not replace the store.
 
 The others are simply new and earn their record like any case, then enter:
 **security-overgrant-remediation-proposal**
@@ -137,7 +138,9 @@ record holds a full window for a case, nothing automatic de-admits a listed one,
 why the manual edit stays the fast lever for now.
 
 A demoted case keeps running and reporting; give it a hold-out entry above with the issue
-that names its re-admission condition. That issue goes to the case's `owner:` in its
+that names its re-admission condition, and date it as `demoted YYYY-MM-DD` inside its
+`- **case-name** —` bullet, the shape the entries above use — the dashboard's Cases page
+reads that phrase from those bullets for the case's "demoted" pill. That issue goes to the case's `owner:` in its
 `task.yaml` — a GitHub login, or `maintainers` for the approvers in the root `OWNERS` file —
 who investigates and either fixes the case or proposes retiring it. A case whose owner does
 not answer stays demoted. The bar is the same for a contributed case and an in-house one;

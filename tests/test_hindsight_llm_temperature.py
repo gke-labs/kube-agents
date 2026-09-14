@@ -15,7 +15,8 @@ comment beside the variable.
 The Deployment exists twice on purpose: `k8s-operator/config/integrations/`
 is the dev path and `charts/kube-agents/templates/` is what an install renders.
 They are kept in step by hand, and `make chart-check` does not cover them — it
-syncs CRDs and RBAC only. So losing the variable from either copy is a silent
+guards the CRD, RBAC, admission-policy and webhook manifests, not the
+integration Deployments. So losing the variable from either copy is a silent
 edit whose symptom appears only on whichever install path lost it, which is
 what this pins.
 

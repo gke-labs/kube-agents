@@ -1,0 +1,127 @@
+# COMMENTED OUT — a commented-out entry in hack/ci-eval-pr.sh TASKS, which
+# registers it pending activation. Same hold as upgrades-fleet-version-table,
+# the skill's Phase-1 case: the maintainer's call on #1343 keeps both out
+# until #1254 is closed, the open issue on the sibling probe
+# upgrades-lagging-master-probe where a delegated run's acknowledgement is
+# graded as the final answer on unrelated pull requests (the #1010 family that
+# docs/eval-gate-roster.md holds two other cases out on). This case reads the
+# same final answer over the same fixture, so it cannot be watched to both
+# pass and fail until then; it stays `validated: false` and commented out.
+# Uncomment the TASKS line when #1254 is closed; nothing here changes.
+#
+# The Phase-2 case for the fleet-upgrade-verification skill (#1343 criterion
+# 2, #1410): not the point-in-time table (upgrades-fleet-version-table asks
+# for that) but what its script adds across runs — a "Rollout progress"
+# section comparing each member with the previous run for the same target,
+# and a `stalled (unchanged for <elapsed>)` verdict on a behind member that
+# has not moved while a rollout is active. The seeded fleet is read-only and
+# static, so no member can move between two runs; what the case observes is
+# the other half of the rule, which needs no mover: the user says a rollout is
+# under way, the agent passes `--rollout-in-progress`, and the second run in
+# the same turn flags the laggard `stalled` with its elapsed time. What is
+# graded is whether the agent pastes that section and names the stalled
+# member with its elapsed time as an observation, which is the SKILL.md rule
+# no unit test can reach. The report is graded, not the tool path.
+#
+# Not yet run anywhere. The pull request that added it (#1410) had no install
+# with the seeded fleet in reach, so it has not been seen red on main or
+# green on the branch; the first activation run is what validates it.
+#
+# Planted defect required: the seeded fleet's slot-b cluster held one minor
+# version behind the REGULAR channel default, enrolled in REGULAR, held between
+# reconciles by a NO_MINOR_UPGRADES maintenance exclusion (role version-laggard,
+# bench/tf/fleet/fixtures.json). The version NUMBERS move with the channel, so
+# nothing here asserts a version — only that seeded-b is flagged stalled.
+#
+# The record survives between runs: the script writes it under the shell
+# sandbox's /opt/data, a PersistentVolumeClaim, so a run on a pool project
+# that an earlier run already recorded compares against that run rather than
+# a fresh baseline. The elapsed time then counts from the earliest consecutive
+# run that saw seeded-b at these versions, which may be days; a fleet replant
+# that moved seeded-b's version in between makes the first run of the turn
+# grade it `started` and the second `stalled` again. Neither changes what the
+# checks below assert.
+#
+# Isolation class: read-only against GCP (chat prompt; the script writes only
+# its own record file on the sandbox volume; no audit helper, no GitOps-repo
+# write). Eligible tier: presubmit once #1254 is closed.
+#
+# No deterministic mutation safeguard, documented: the planted defect is the
+# control-plane version, a GKE-level facet rather than a Kubernetes object,
+# and the version-laggard role probes no objects, so a fleet_resource_property
+# check has nothing to ground on. The fleet's scheduled reconcile owns the
+# defect's integrity. Same documented residual as upgrades-fleet-version-table.
+id: upgrades-fleet-rollout-stall
+name: Fleet rollout tracking flags the member that has not moved during a rollout
+prompt: >-
+  A REGULAR-channel upgrade rollout is under way across this project's fleet.
+  Run the fleet version report twice this turn, the second run compared with
+  the first, and tell me which members moved between the two runs and which
+  are stalled behind the target, with how long each stalled member has been
+  unchanged. Read the versions; do not change or upgrade anything.
+expected_output: >-
+  The per-cluster version table from this run, followed by its "Rollout
+  progress" section comparing the second run with the first: per member the
+  versions then and now, the status, and a progress verdict. seeded-b is
+  reported as stalled, with the elapsed time it has been unchanged and the
+  previous run's time, presented as an observation (its wave may not have been
+  scheduled yet) rather than as a fault. Members at their channel default are
+  reported unchanged or completed; a member a patch behind may also be
+  reported stalled, as a patch gap. It recommends (not performs) the upgrade
+  path. It cites no CVE identifiers, because it has no vulnerability feed. No
+  mutation of any kind.
+infrastructure:
+  deployer: noop
+validated: false
+
+# Slug per docs/designs/domains.yaml.
+domain: upgrades
+
+# Who answers when this case flakes -- see bench/CONTRIBUTING.md.
+owner: maintainers
+
+# Named by ROLE, not cluster: bench/tf/fleet/fixtures.json;
+# docs/designs/bench-fleet-catalog.md is the rule.
+fixtures:
+  - version-laggard
+
+# report_contains: a chat prompt, so the reply is what is graded. Three
+# objectives, one for each thing the reply must do: name the laggard, say it
+# stalled with its elapsed time, invent nothing. Split so a red says which.
+verification_spec:
+  - name: the-report-names-the-lagging-member
+    role: objective
+    # assert, not converge: the transcript is immutable once the run ends.
+    mode: assert
+    check:
+      type: report_contains
+      # "seeded-b" is a rendering of slot b under the prefix's default, the same
+      # contract upgrades-fleet-version-table carries: it survives the default
+      # prefix and breaks loudly if the prefix changes. The prompt does not say
+      # it; the report has to find it.
+      required_phrases: ["seeded-b"]
+  - name: the-report-says-it-stalled-with-the-elapsed-time
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # The verdict as the script prints it and SKILL.md tells the agent to
+      # paste, plus prose spellings that carry the elapsed time with it. Not
+      # the bare word "stalled": report_contains matches substrings, and
+      # "installed" carries it; and not "is stalled" alone, which an agent on
+      # main could write from two identical tables without any comparison.
+      # The elapsed-time clause is what main cannot produce.
+      any_of_phrases:
+        [
+          "stalled (unchanged for",
+          "stalled, unchanged for",
+          "stalled for",
+          "stalled since",
+        ]
+  - name: no-invented-cves
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # No vulnerability feed; a CVE id in a rollout report is an invention.
+      forbidden_phrases: ["CVE-"]

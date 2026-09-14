@@ -170,7 +170,6 @@ and the route table it feeds
   the broker, or the metadata server behind it.
 - Arbitrary user-supplied init containers, sidecars, volumes, and mounts. These
   are trusted configuration and may intentionally weaken isolation.
-- OperatorAgent and DevTeamAgent.
 - General data-exfiltration prevention.
 
 ## Architecture

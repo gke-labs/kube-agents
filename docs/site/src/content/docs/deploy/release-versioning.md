@@ -54,8 +54,11 @@ Every GA release is created with `gh release create --generate-notes`
 (`scripts/release/publish_github_release.sh`), so GitHub writes the notes from the pull requests
 merged between the previous release tag and the new one, grouped under the label categories in
 `.github/release.yml`: features, bug fixes, security, documentation, infrastructure, and a
-catch-all for anything else. Dependabot's pull requests, and any labelled `duplicate`, `invalid`
-or `wontfix`, are left out. Read them on
+catch-all for anything else. The script names the previous GA tag itself with `--notes-start-tag`
+rather than leaving GitHub to pick one;
+[`scripts/release/README.md`](https://github.com/gke-labs/kube-agents/tree/main/scripts/release)
+says why. Dependabot's pull requests, and any labelled `duplicate`, `invalid` or `wontfix`, are
+left out. Read them on
 [the releases page](https://github.com/gke-labs/kube-agents/releases) once the release exists.
 
 Before it exists, the next release is whatever has merged since the latest GA tag, which

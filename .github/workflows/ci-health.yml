@@ -383,8 +383,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           # --digest-hour is a Toronto hour (the poster's default zone).
+          # --data is the data.json this tick collected (or, after a failed
+          # collect, the bucket's): the digest's nightly line reads last
+          # night's run from it.
           python3 scripts/eval_dashboard/post_health.py \
             --health work/health.json \
+            --data work/data.json \
             --state "$DASHBOARD_BUCKET/health-state.json" \
             --digest-hour 9
 

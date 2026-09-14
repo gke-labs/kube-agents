@@ -984,12 +984,28 @@ func realMain(argv []string) error {
 			// failing, so liveness of the goroutine proves nothing.
 			m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(0)
 			defer m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(0)
-			onSynced := func() {
-				synced.Add(1)
+			// The gauge follows every transition the watcher reports: 1 on the
+			// initial sync and again when a held cluster recovers, 0 while a
+			// 403 holds it. Only the first 1 counts toward synced — a recovery
+			// is the same cluster coming back, not another one syncing — and
+			// the guard is atomic because the watcher calls in from its own
+			// goroutines.
+			var counted atomic.Bool
+			onWatching := func(watching bool) {
+				if !watching {
+					m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(0)
+					log.Printf("k8s-event-watcher: [%s] events forbidden, no longer watching until the next successful attempt", tc.Name)
+					return
+				}
 				m.clusterUp.WithLabelValues(tc.Name, tc.ProjectID, tc.Location).Set(1)
-				log.Printf("k8s-event-watcher: [%s] informer synced, now watching", tc.Name)
+				if !counted.Swap(true) {
+					synced.Add(1)
+					log.Printf("k8s-event-watcher: [%s] informer synced, now watching", tc.Name)
+					return
+				}
+				log.Printf("k8s-event-watcher: [%s] events permitted again, watching resumed", tc.Name)
 			}
-			if err := w.Run(ctx, onSynced); err != nil {
+			if err := w.Run(ctx, onWatching); err != nil {
 				// Log and continue — one cluster's informer failing
 				// must not blind the rest. The peer goroutines keep
 				// running.

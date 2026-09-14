@@ -75,6 +75,15 @@ helm install kube-agents oci://ghcr.io/gke-labs/kube-agents/charts/kube-agents \
 `platformAgent.harness.{clusterName,location,projectId}` are required and have
 no defaults — rendering fails until they are set.
 
+The chart ships a `values.schema.json`, so an unknown or mistyped key — a
+`clustername` for `clusterName`, a `replicaCount` of `two` — fails `helm lint`,
+`helm template`, `helm install` and `helm upgrade` with the offending path before
+anything renders; the Terraform `helm_release` validates the same way. Blocks the
+templates hand on without reading, such as `platformAgent.annotations` and the
+`resources` maps, are not checked below their key; the schema's `description`
+lists every one. An all-digit image tag is admitted as an integer, so
+`--set operator.image.tag=20260913` renders without `--set-string`.
+
 These commands also sandbox the agent under the `gvisor` RuntimeClass, which the
 chart enables by default. On a cluster that has no such RuntimeClass the
 operator reports `RuntimeClassNotFound` and never writes the agent Deployment;
@@ -658,6 +667,9 @@ helm uninstall kube-agents -n kubeagents-system
   two published releases.
 - The CRD, RBAC and admission-policy manifests under this chart are generated
   copies of `k8s-operator/config/` — edit the source and run `make chart-sync`
-  (CI enforces this via `make chart-check`).
+  (CI enforces this via `make chart-check`). `make chart-check` also renders
+  `templates/operator-webhooks.yaml`, which is hand-maintained, and fails when
+  its webhooks or Service `targetPort` differ from `k8s-operator/config/webhook`
+  (`hack/check_chart_webhooks.py`); fix that one by editing the template.
 
 See [docs/site/src/content/docs/deploy/release-versioning.md](../../docs/site/src/content/docs/deploy/release-versioning.md) for versioning rules.

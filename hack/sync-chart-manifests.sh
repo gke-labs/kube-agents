@@ -7,6 +7,10 @@
 #   - templates/agent-rbac-admission-policy.yaml is config/admission/agent-rbac-policy.yaml
 #     wrapped in the chart's values gate. The chart is the only thing that installs those
 #     policies, so a drifted copy is a backstop nobody applies.
+#   - templates/operator-webhooks.yaml is hand-maintained (the chart adds values gates and
+#     the cert-manager objects), so it is compared rather than rewritten:
+#     hack/check_chart_webhooks.py renders it and diffs the webhooks and Service
+#     targetPort against config/webhook. Sync mode only prints a reminder.
 # Run with --check (CI, `make chart-check`) to fail instead of rewriting.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -17,6 +21,9 @@ ROLE_SRC=k8s-operator/config/rbac/role.yaml
 RBAC_TPL=charts/kube-agents/templates/operator-rbac.yaml
 VAP_SRC=k8s-operator/config/admission/agent-rbac-policy.yaml
 VAP_TPL=charts/kube-agents/templates/agent-rbac-admission-policy.yaml
+readonly WEBHOOK_SRC_DIR=k8s-operator/config/webhook
+readonly WEBHOOK_TPL=charts/kube-agents/templates/operator-webhooks.yaml
+readonly WEBHOOK_CHECK=hack/check_chart_webhooks.py
 
 check=false
 [[ "${1:-}" == "--check" ]] && check=true
@@ -114,8 +121,27 @@ tmp=$(mktemp)
 if $check; then
   diff -u "$VAP_TPL" "$tmp" >&2 || { rm -f "$tmp"; fail "chart admission policy out of date vs $VAP_SRC"; }
   rm -f "$tmp"
-  echo "Chart CRD, RBAC and admission-policy copies are in sync with k8s-operator/config."
 else
   mv "$tmp" "$VAP_TPL"
+fi
+
+# Webhooks: compared, not generated. The failure message is deliberately not fail(),
+# because `make chart-sync` does not touch this template; the fix is a hand edit.
+# The script exits 1 on drift and 2 when it could not run (no helm, no PyYAML,
+# a failed render); only the first gets the hand-edit hint, the second has
+# already said what to install.
+if $check; then
+  webhook_rc=0
+  python3 "$WEBHOOK_CHECK" || webhook_rc=$?
+  if [[ $webhook_rc -eq 1 ]]; then
+    echo "ERROR: $WEBHOOK_TPL has drifted from $WEBHOOK_SRC_DIR (see the diff above)." >&2
+    echo "       It is hand-maintained: edit the template to match the source, then rerun 'make chart-check'." >&2
+    exit 1
+  elif [[ $webhook_rc -ne 0 ]]; then
+    exit "$webhook_rc"
+  fi
+  echo "Chart CRD, RBAC and admission-policy copies are in sync with k8s-operator/config, and the webhook template matches $WEBHOOK_SRC_DIR."
+else
   echo "Chart CRD, RBAC and admission-policy copies synced from k8s-operator/config."
+  echo "Note: $WEBHOOK_TPL is hand-maintained and was not rewritten; 'make chart-check' compares it with $WEBHOOK_SRC_DIR."
 fi

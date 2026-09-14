@@ -14,6 +14,10 @@ export DEFAULT_REGISTRY_PREFIX="ghcr.io/gke-labs/kube-agents"
 export DEFAULT_RELEASE_REPO="gke-labs/kube-agents"
 export DEFAULT_INITIAL_VERSION="0.1.0"
 
+# The shape of a GA release tag: pure numeric X.Y.Z, no 'v' prefix. One
+# definition, so the validator and the two tag lookups below cannot drift apart.
+readonly GA_TAG_SHAPE_REGEX='^[0-9]+\.[0-9]+\.[0-9]+$'
+
 # The registry the docker-free existence probe below knows how to query, and the
 # manifest media types that probe must accept. Omitting the OCI types gets a
 # MANIFEST_UNKNOWN carrying "Accept header does not support OCI manifests" — a
@@ -209,7 +213,7 @@ validate_pure_numeric_semver() {
     echo "❌ ERROR: ${label} must be specified." >&2
     return 1
   fi
-  if [[ ! "${ver}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  if [[ ! "${ver}" =~ ${GA_TAG_SHAPE_REGEX} ]]; then
     echo "❌ ERROR: ${label} '${ver}' is not a valid pure numeric SemVer (e.g. 0.1.0, 0.2.0). 'v' prefix is not supported." >&2
     return 1
   fi
@@ -238,12 +242,45 @@ compare_semver() {
 get_latest_ga_tag() {
   local default_fallback="${1:-}"
   local latest
-  latest="$(git tag -l --sort=version:refname '[0-9]*' 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | tail -n 1 || true)"
+  latest="$(git tag -l --sort=version:refname '[0-9]*' 2>/dev/null | grep -E "${GA_TAG_SHAPE_REGEX}" | tail -n 1 || true)"
   if [ -n "${latest}" ]; then
     echo "${latest}"
   else
     echo "${default_fallback}"
   fi
+}
+
+# Finds the highest pure numeric GA tag strictly below a version (e.g. 0.4.0 for
+# 0.5.0). Prints nothing when no lower GA tag exists, as for the first release.
+#
+# Separate from get_latest_ga_tag because the two answer different questions at
+# different moments: by the time publish_github_release.sh runs, tag_ga_release.sh
+# has already created the new tag, so the latest GA tag *is* the release being
+# published, and what the release notes need is the one before it. Order comes
+# from compare_semver rather than from `--sort`, so 0.10.0 ranks above 0.9.0.
+#
+# Arguments: $1 = the version to look below (pure numeric X.Y.Z). Returns
+# non-zero without one, or with one that is not a GA version.
+get_previous_ga_tag() {
+  local version="${1:-}"
+  if [ -z "${version}" ]; then
+    echo "❌ ERROR: version is required for get_previous_ga_tag." >&2
+    return 1
+  fi
+  validate_pure_numeric_semver "${version}" "Version" || return 1
+
+  local previous="" tag
+  while IFS= read -r tag; do
+    [ -n "${tag}" ] || continue
+    if [ "$(compare_semver "${tag}" "${version}")" != "-1" ]; then
+      continue
+    fi
+    if [ -z "${previous}" ] || [ "$(compare_semver "${tag}" "${previous}")" = "1" ]; then
+      previous="${tag}"
+    fi
+  done < <(git tag -l '[0-9]*' 2>/dev/null | grep -E "${GA_TAG_SHAPE_REGEX}" || true)
+
+  echo "${previous}"
 }
 
 # Finds the latest validated release candidate tag (rc_*_validated)
