@@ -297,7 +297,7 @@ class Shapes(RunHarness):
             self.opener.texts[0],
             "🐢 *Smoke gate: slow* — the last 5 full runs took 152–213 min (median 183) against a 7-day typical of 151 min (p90 198); 2 reps lost to 429s."
             " Not a break, and /retest won't make yours faster.\n"
-            f"{URL}#since=2026-09-14T18:00:00Z&view=agent",
+            f"{URL}#view=agent",
         )
         self.assertEqual(self.recorded()["state"], "GREEN", "the note moves no state")
 

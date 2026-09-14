@@ -498,7 +498,11 @@ def render_slow(health: dict) -> str:
     return "\n".join(
         [
             f"🐢 *Smoke gate: slow* — {slow_text(slow)}. Not a break, and /retest won't make yours faster.",
-            dashboard_link(DASHBOARD_VIEW_AGENT, since=parse_iso(slow.get("since"))),
+            # No `since`: the Brief resolves a `since` to an incident, and the
+            # note's start is a GREEN tick that names none, so the page would
+            # show a synthetic past incident. The bare agent view is the
+            # healthy headline, which carries the same sentence.
+            dashboard_link(DASHBOARD_VIEW_AGENT),
         ]
     )
 
