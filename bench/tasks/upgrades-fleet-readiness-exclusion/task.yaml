@@ -115,7 +115,12 @@ verification_spec:
       # Not the bare word "blocked": a version table on main already carries
       # "lagging", and an agent could write "blocked" of anything. What main
       # cannot produce without the maintenance rule is the exclusion named as
-      # the thing holding the upgrade.
+      # the thing holding the upgrade. The "excludes exactly", "defers
+      # automatic" and "in effect" spellings were added after the first
+      # green run on 2026-09-14 (#1411), whose report wrote "excludes exactly
+      # the 1.34 -> 1.35 minor this cluster needs ... defers **automatic**
+      # upgrades only" and failed only this check; the markdown bold splits
+      # the plain phrase, hence the starred variant.
       any_of_phrases:
         [
           "blocks auto-upgrade",
@@ -141,6 +146,22 @@ verification_spec:
           "blocked by a maintenance exclusion",
           "held by the exclusion",
           "held by the maintenance exclusion",
+          "held by hold-the-minor-lag",
+          "blocked by hold-the-minor-lag",
+          "excludes exactly the",
+          "excludes the minor",
+          "excludes minor upgrades",
+          "minor upgrade is excluded",
+          "minor upgrades are excluded",
+          "holds back the minor",
+          "defers automatic",
+          "defers the automatic",
+          "defers **automatic**",
+          "deferring automatic",
+          "in effect now",
+          "in effect until",
+          "currently in effect",
+          "is in effect",
         ]
   - name: no-invented-cves
     role: objective
