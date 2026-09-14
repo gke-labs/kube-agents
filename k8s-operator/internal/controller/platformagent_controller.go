@@ -97,7 +97,7 @@ const (
 	deploymentRecreateDeleteTimeout = 60 * time.Second
 	// What applyDeploymentRecreatingOnInvalid calls the broker's Deployment in
 	// its log line and errors.
-	credentialBrokerRecreateLabel = "credential broker"
+	credentialBrokerRecreateLabel = "credential broker" // #nosec G101 -- Log label naming the workload, not a credential
 
 	AnnotationAPIServerCIDR           = "kubeagents.x-k8s.io/apiserver-cidr"
 	AnnotationCustomEgressCIDRs       = "kubeagents.x-k8s.io/custom-egress-cidrs"
