@@ -174,8 +174,19 @@ class ConfigValidationTest(unittest.TestCase):
 
     def test_the_fixture_is_the_live_config(self):
         # The docstring above promises the fixture mirrors the file, order
-        # included. Nothing else would notice the two drifting apart.
-        self.assertEqual(rr.load_config(LIVE_CONFIG), CONFIG)
+        # included. Nothing else would notice the two drifting apart. Dict
+        # equality is order-blind, so the glob order is compared on its own:
+        # it is the input `last_files_match_only` decides on.
+        live = rr.load_config(LIVE_CONFIG)
+        self.assertEqual(live, CONFIG)
+        self.assertEqual(list(live["files"]), list(CONFIG["files"]))
+
+    def test_eval_crew_stays_inside_the_root_owners(self):
+        # A mixed pull request routes to eval-crew alone (last match wins), and
+        # the promise that the requested reviewer can clear it rests on every
+        # member also being a root approver. Widening the group past
+        # repository-owners breaks that for the README half of such a change.
+        self.assertTrue(set(EVAL_CREW) <= set(OWNERS), f"{EVAL_CREW} is not within {OWNERS}")
 
     def test_per_author_is_refused(self):
         config = {"reviewers": {"per_author": {"alice": ["bob"]}}}

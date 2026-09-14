@@ -15,7 +15,9 @@ reviewers:
       - mateuszklinowski
       - mplakhtiy
     # Mirrors the eval-crew alias in OWNERS_ALIASES: only it can /approve a
-    # change under bench/tasks/ or to hack/ci-eval-pr.sh (#1546). Widen both.
+    # change under bench/tasks/ or to hack/ci-eval-pr.sh (#1546). Widen both
+    # together, and only with root approvers: a mixed pull request routes
+    # here alone, and its reviewer has to be able to clear the rest of it too.
     eval-crew:
       - jayantid
 
