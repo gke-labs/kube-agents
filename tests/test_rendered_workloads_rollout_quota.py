@@ -11,12 +11,19 @@ first. The suites they left (`test_litellm_rollout_quota.py`,
 `test_deployments_rollout_quota.py`) name workloads by file and read chart
 templates by regex over template text. Nothing there reads what the chart
 renders or what the operator emits, so a new workload in either source arrives
-untested. This suite closes that gap from the output side:
+untested. This suite reads the output side instead:
 
     helm template ...                          every Deployment the chart renders
-    k8s-operator/.../testdata/platform/expected  every Deployment the operator emits
-                                               (golden_test.go keeps these equal
-                                               to the operator's output)
+    k8s-operator/.../testdata/platform/expected  every Deployment the golden cases
+                                               emit (golden_test.go keeps these
+                                               equal to the operator's output)
+
+The golden half reaches only what the golden cases render. All six set
+`spec.mode: default`, so the `mode: next` stack is in none of them: the A2A
+gateway's strategy is asserted by `TestBuildA2AGatewayIdentityAndOwnerWiring`
+in `k8s-operator/internal/controller/`, and the A2A auth callout (two replicas,
+surge-first) is asserted by nothing here. A `mode: next` golden case would bring
+both into this sweep.
 
 Every Deployment in both must be `Recreate` or resolve `maxUnavailable >= 1`,
 unless its name is in `_SURGE_FIRST_BY_DESIGN`, where the entry carries the
@@ -31,6 +38,7 @@ fails on a runner. A skip there would let the chart half of this suite vanish
 from every pull request while the sweep reports green around it.
 """
 
+import functools
 import os
 import pathlib
 import shutil
@@ -105,8 +113,14 @@ def _deployments(text):
     return found
 
 
+@functools.lru_cache(maxsize=1)
 def _render_chart():
-    """The chart's rendered manifests, or None when helm is absent off CI."""
+    """The chart's rendered manifests, or None when helm is absent off CI.
+
+    Cached: three tests read the same render, and helm takes about half a
+    second per call. A raise is not cached, so the CI guard fires on every
+    call that reaches it.
+    """
     if shutil.which("helm") is None:
         if os.environ.get("CI"):
             raise AssertionError(
