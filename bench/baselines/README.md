@@ -8,14 +8,15 @@ suite aggregate, which compares pass rates and reports the result — it reds
 the job only once `EVAL_AGGREGATE_ARMED` is set to `1` (or `true`/`yes`).
 
 **This store ships empty, and it fills itself.** Every nightly run on `main`
-appends what it measured (`bench-gate record`), and a case is admitted once its
-accumulated evidence clears the bar. Until then nothing is admitted: rung 4
+appends what it measured (`bench-gate record`), and a case's record reads
+`would admit` once its accumulated evidence clears the bar. Until then nothing
+is admitted on evidence: rung 4
 cannot fire, rung 6 has nothing to compare against, and the aggregate is
 advisory. That is a legitimate green, not a broken gate — it is the gate
 collecting. `BOOTSTRAP_ADMITTED` in `hack/ci-eval-pr.sh` names the cases that
-keep blocking meanwhile — until the store holds a full window for a case at
-the current key, at which point the record decides either way and the list is
-not consulted for it; `docs/eval-gate-roster.md` has the switch-over.
+block meanwhile — and, under the default `EVAL_ADMISSION_MODE=roster`, after
+the store has filled too: the list decides and the record's verdict is reported
+beside it. See [Admission](#admission) below and `docs/eval-gate-roster.md`.
 
 ## Layout
 
@@ -213,9 +214,9 @@ still owed.
 
 ## Admission
 
-A case is admitted when its pooled evidence at the **current** key holds at
-least `EVAL_ADMISSION_MIN_RUNS` runs (default 20) at a rate of at least
-`EVAL_ADMISSION_RATE` (default 0.95).
+The record's verdict for a case is `would admit` when its pooled evidence at the
+**current** key holds at least `EVAL_ADMISSION_MIN_RUNS` runs (default 20) at a
+rate of at least `EVAL_ADMISSION_RATE` (default 0.95).
 
 Short of that the gate says so in the case's own words, and the four states are
 distinct on purpose:
@@ -231,19 +232,50 @@ Only the last is a problem with the case. The middle two are the store filling
 up, which is the ordinary state of a new case and of every case after a version
 bump.
 
-A case named in `BOOTSTRAP_ADMITTED` is admitted through the first three states
-by the list rather than the store, and, when the store holds anything for it,
-its reason says which state the store is in. In the fourth — and whenever the
-store holds at least the minimum runs at
-the current key — the record decides and the list is not consulted: a named
-case screened at 12/21 is turned away, and the reason says the record overrides
-the list. Every verdict carries `admission_source` (`record`, `bootstrap` or
-`neither`), and the markdown renders it per case once a store is configured or
-the record has decided any case — which includes evidence landed by hand in
+What the gate does with that answer is `EVAL_ADMISSION_MODE`, one of two:
+
+- **`roster`** (the default). `BOOTSTRAP_ADMITTED` in `hack/ci-eval-pr.sh`
+  decides rung 4: a listed case blocks on collapse and an unlisted case never
+  does, whatever the store holds. The record's verdict is computed all the same
+  and reported per case as a recommendation, in the per-case JSON as
+  `record_verdict`, in the admission reason, and in the verdict markdown's
+  **Admitted by · record says** column. One phrase per state:
+  - `record: would admit (21/21 at key …)`
+  - `record: would demote (17/21, below 95% over 20)`
+  - `record: collecting 9/20`
+  - `record: stale (key …)`
+  - `record: none`
+
+  A roster pull request cites that verdict; `docs/eval-gate-roster.md` has the
+  protocol.
+
+- **`record`.** Once the store holds at least the minimum runs at the current
+  key, the record decides and the list is not consulted: a named case screened
+  at 12/21 is turned away, and the reason says the record overrides the list.
+  The list is the fallback through the first three states.
+
+The default is the roster by decision
+([#1493](https://github.com/gke-labs/kube-agents/issues/1493), 2026-09-14):
+nobody should be able to move a case into or out of the blocking set without
+the eval crew knowing, and a roster edit reviewed in a pull request is that
+knowledge. A record that says otherwise is the evidence that edit cites, not a
+substitute for it. Any other value of the variable refuses to grade rather than
+falling back to the default, for the same reason a misspelled roster entry is
+reported loudly.
+
+In both modes a listed case short of a full window is admitted by the list, and
+when the store holds anything for it its reason says which state the store is
+in. Every verdict carries `admission_source` (`record`, `bootstrap` or
+`neither` — never `record` in roster mode) and `record_verdict`, and the
+markdown renders the admission column once a store is configured or the record
+has anything to say about any case — which includes evidence landed by hand in
 this directory with no store configured.
 
-Admission is computed here, never declared in `task.yaml`. A pull request
-author therefore cannot self-admit a case in the same diff that makes it pass.
+The record's verdict is computed here and never declared in `task.yaml`. In
+`record` mode that is what stops a pull request admitting its own case in the
+diff that makes it pass; in `roster` mode the same guard is the reviewed edit to
+`BOOTSTRAP_ADMITTED`, which `.agents/rules/eval_driven_development.md` forbids
+in that diff.
 
 ## What invalidates a record
 

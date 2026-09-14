@@ -96,8 +96,11 @@ SELECT case_id, week,
 FROM `eval_baselines.evidence_flat`
 GROUP BY case_id, week;
 
--- 5. Admission state. Which cases can actually block a pull request, and since
---    when? This mirrors what `baselines.py` computes at gate time: pool the
+-- 5. Admission state: the record's verdict per case and key, and since when --
+--    what `baselines.py` reports as `record: would admit` / `would demote`.
+--    Under the default EVAL_ADMISSION_MODE=roster this is a recommendation;
+--    BOOTSTRAP_ADMITTED in hack/ci-eval-pr.sh is what blocks. The arithmetic
+--    mirrors what `baselines.py` computes at gate time: pool the
 --    newest batches AT ONE KEY newest-first until the run bar is met. A version
 --    bump correctly shows everything falling back to unadmitted until it is
 --    re-screened, which is the behaviour most likely to be mistaken for a bug.

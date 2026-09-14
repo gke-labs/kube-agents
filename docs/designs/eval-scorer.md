@@ -909,7 +909,7 @@ Reported distinctly, because only one of them is a problem with the case:
 The middle two are the store filling up, which is the ordinary state of a new case and of every
 case after a version bump. During that window nothing is admitted on evidence, so for an unlisted
 case rung 4 cannot fire and rung 6 is silent — a legitimate green, not a broken gate. A listed case
-rides the bridge meanwhile; [Bootstrap](#bootstrap) below says what that arms.
+is admitted by the roster meanwhile; [Bootstrap](#bootstrap) below says what that arms.
 
 ## Resetting a baseline
 
@@ -934,23 +934,27 @@ inconvenient.
 
 ### Bootstrap
 
-`BOOTSTRAP_ADMITTED` names cases that keep blocking before screening exists for them. It is a
-bridge, not a destination: a bootstrap-admitted case has no full window at the current key, so it
-arms rung 4 by fiat. While the store holds nothing for it at that key it also leaves rung 6 quiet
-and contributes nothing to `main`'s side of the aggregate; once the nightly has appended a partial
-window (`collecting`), that evidence feeds both, and the list still decides admission until the
-window is full.
+`BOOTSTRAP_ADMITTED` names the cases that arm rung 4. Under the default `EVAL_ADMISSION_MODE=roster`
+it does so whatever the store holds; under `record` it does so only until the store holds a full
+window at the current key. In either mode, while the store holds nothing for a listed case at that
+key it also leaves rung 6 quiet and contributes nothing to `main`'s side of the aggregate; once the
+nightly has appended a partial window (`collecting`), that evidence feeds both.
 
-**The record governs once it holds a full window.** `BaselineStore.admission()` consults the store
-before the list: with at least `EVAL_ADMISSION_MIN_RUNS` runs at the current key, the pooled rate
-decides either way, and a listed case screened at 12/21 is turned away with a reason that says the
-record overrides the list. The list is consulted only in the first three pre-admission states
-above (nothing at this key, stale, collecting), and when the store holds anything for a listed
-case its state is appended to the reason, so the log says how far it is from being judged on
-evidence. Every verdict carries `admission_source` — `record`, `bootstrap` or `neither` — and the
-markdown renders it per case once a store is configured or the record has decided any case; with
-the store unset what the shell displays is unchanged (the per-case JSON gains that one key), which
-`bench/tests/test_store_unset_golden.py` pins. The switch-over criteria for deleting the list are in
+**Who decides once the record holds a full window is a mode, and the default is the list.**
+`BaselineStore.admission()` takes `EVAL_ADMISSION_MODE`. Under `roster`, the default by the
+decision on #1493, the list decides rung 4 outright and the record's verdict is carried on every
+decision as a recommendation — `record: would admit`, `would demote`, `collecting`, `stale`,
+`none` — in the reason, the per-case JSON (`record_verdict`) and the markdown's **Admitted by ·
+record says** column. Under `record`, with at least `EVAL_ADMISSION_MIN_RUNS` runs at the current
+key the pooled rate decides either way, and a listed case screened at 12/21 is turned away with a
+reason that says the record overrides the list; the list is consulted only in the first three
+pre-admission states above (nothing at this key, stale, collecting). In both modes, when the store
+holds anything for a listed case short of a full window, its state is appended to the reason, so
+the log says how far it is from being judged on evidence. Every verdict carries
+`admission_source` — `record`, `bootstrap` or `neither` — and the markdown renders the column once
+a store is configured or the record has anything to say about any case; with the store unset what
+the shell displays is unchanged in either mode (the per-case JSON gains the additive keys), which
+`bench/tests/test_store_unset_golden.py` pins. What a roster edit cites is in
 [`docs/eval-gate-roster.md`](../eval-gate-roster.md).
 
 **A name in it that matches no graded case is reported, loudly.** It is a free-text environment
@@ -960,7 +964,7 @@ exactly the way it would have if the list were right. `bench-gate suite` therefo
 list against the ids it actually graded and prints every unmatched name on stderr and as a banner
 in the markdown verdict. It is a warning rather than a red: the list is also legitimately allowed
 to name a case that is deactivated in the `TASKS` array or skipped on a given run, and redding for
-that would make the bridge harder to hold than the thing it bridges.
+that would make the roster harder to keep than the cases it protects.
 
 ## How "judged scores below main's baseline" is determined
 

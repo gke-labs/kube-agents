@@ -1704,15 +1704,19 @@ print(m.group(1).strip('\'\"') if m else '')
 " "$1" 2>/dev/null || echo ""
 }
 
-# The transition bridge: cases named here keep the old blocking behaviour
-# until the store holds a full window for them -- EVAL_ADMISSION_MIN_RUNS
-# runs at the current version key -- arming rung 4 meanwhile, and leaving
-# rung 6 quiet only while the store holds nothing for them at that key.
-# Once the window is full the record decides, either way: a name
-# here cannot keep a case the record turned away, and a case the record
-# admits blocks without being named. docs/eval-gate-roster.md has the
-# switch-over criteria for deleting this list. Comma- or whitespace-separated
-# task ids; bench-gate's _bootstrap_admitted() accepts either.
+# The blocking roster: cases named here arm rung 4 -- a listed case reds the
+# job by failing every repetition, an unlisted case never does -- and leave
+# rung 6 quiet only while the store holds nothing for them at the current
+# version key. Comma- or whitespace-separated task ids; bench-gate's
+# _bootstrap_admitted() accepts either.
+#
+# Who decides is EVAL_ADMISSION_MODE, below. In `roster`, the default, this
+# list is the authority and the evidence store's verdict is reported beside
+# it per case (record: would admit / would demote / collecting / stale /
+# none) for a roster pull request to cite. In `record` the store decides a
+# case once it holds a full window for it, either way, and this list is the
+# fallback while it cannot. docs/eval-gate-roster.md has the reasoning and
+# what a roster edit cites.
 #
 # The prose about this roster -- the admission bar, who is held out and on
 # which issue, the rung scoping, the demotion protocol -- lives in
@@ -1725,6 +1729,16 @@ print(m.group(1).strip('\'\"') if m else '')
 # this list, referencing the issue that names its re-admission condition.
 
 export BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-reliability-pdb-probe,security-overgrant-probe,upgrades-lagging-master-probe,consistency-authorized-networks-probe,cost-idle-pool-probe,obtainability-remediation-proposal,cluster-agent-crashloop-debug,cluster-agent-crashloop-misleading-symptom,cluster-agent-crashloop-evidence-chain,agent-kanban-smoke}"
+
+# Who decides admission for rung 4: `roster` (BOOTSTRAP_ADMITTED above
+# decides; the store's verdict is advisory and reported per case) or `record`
+# (the store decides once it holds a full window; the list is the fallback).
+# Defaulted here as well as in bench-gate so the job's environment says
+# which mode it ran under. `roster` is the decision on #1493 (2026-09-14):
+# a case enters or leaves the blocking set through a reviewed edit to the
+# list above that cites the record, never through the record alone. Any
+# other value refuses to grade rather than falling back to the default.
+export EVAL_ADMISSION_MODE="${EVAL_ADMISSION_MODE:-roster}"
 
 # Where the evidence itself lives. Unset means bench/baselines/ in the
 # checkout: hermetic, no credential, no network -- and no way for this job to
@@ -1779,6 +1793,21 @@ fi
 # Pre-warm the bench virtualenv once; N cold `uv run`s would sync it N times
 # concurrently.
 (cd "${BENCH_DIR}" && uv run python -c '' >/dev/null 2>&1) || true
+
+# Refuse a misspelled EVAL_ADMISSION_MODE here, in seconds. bench-gate refuses
+# to grade on an unknown value, but the first `bench-gate case` runs after the
+# whole fan-out below, so without this check a bad Prow-side override would
+# burn the 1.5-3.5 hour matrix before failing.
+(cd "${BENCH_DIR}" && uv run python - <<'PY'
+import sys
+from kube_agents_bench.baselines import admission_mode_from_env
+try:
+    admission_mode_from_env()
+except ValueError as exc:
+    print(f"ERROR: {exc}", file=sys.stderr)
+    sys.exit(1)
+PY
+) || exit 1
 
 # Launch-order hints, longest first, from measured runs (2026-08-27/28).
 # A wrong hint costs packing efficiency, never correctness.

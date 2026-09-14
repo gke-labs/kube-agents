@@ -33,8 +33,16 @@ regeneration -- after which the golden would pin whatever HEAD does and the
 
 Two things are normalised, and nothing else: the absolute fixture path inside
 ``run_dir`` (the checkout moves; the record does not), and the additive
-``admission_source`` key, which the store-unset presubmit never displays and
-which did not exist when the golden was captured.
+per-case keys -- ``admission_source`` (#1447), then ``record_verdict`` and
+``admission_mode`` (the ``EVAL_ADMISSION_MODE`` change) -- which the
+store-unset presubmit never displays and which did not exist when the golden
+was captured.
+
+The replay runs once per admission mode, and once with the variable unset.
+With no store configured the record has nothing to say, so the two modes
+must produce the same bytes as each other and as the golden: that is the
+claim that neither #1447 nor the mode changes anything on ``main`` until a
+store is armed.
 
 Regenerate with ``BENCH_UPDATE_GOLDEN=1 uv run pytest tests/test_store_unset_golden.py``
 and read the diff: it IS the behaviour change you are about to ship.
@@ -57,8 +65,9 @@ SHIPPED_VERSIONS = {"fleet": 1, "verifiers": 1}
 JUDGE = "gemini-3.1-pro-preview"
 PATH_TOKEN = "<FIXTURE_RUNS>"
 #: Additive since the golden was captured; popped before comparing.
-ADDITIVE_KEYS = ("admission_source",)
+ADDITIVE_KEYS = ("admission_source", "record_verdict", "admission_mode")
 UPDATE_ENV = "BENCH_UPDATE_GOLDEN"
+MODES = (None, "roster", "record")
 
 
 @pytest.fixture(autouse=True)
@@ -70,6 +79,7 @@ def _clean_env(monkeypatch):
         "EVAL_AGGREGATE_MARGIN",
         "EVAL_AGGREGATE_MIN_SCORED",
         "EVAL_AGGREGATE_ARMED",
+        "EVAL_ADMISSION_MODE",
         "EVAL_ADMISSION_RATE",
         "EVAL_ADMISSION_MIN_RUNS",
         "EVAL_JUDGED_MARGIN",
@@ -158,12 +168,15 @@ def replay(kanban_task: Path, tmp_path: Path, monkeypatch, capsys) -> dict[str, 
     return artifacts
 
 
+@pytest.mark.parametrize("mode", MODES, ids=["unset", "roster", "record"])
 def test_the_store_unset_gate_output_matches_the_golden(
-    kanban_task, tmp_path, monkeypatch, capsys
+    kanban_task, tmp_path, monkeypatch, capsys, mode
 ):
+    if mode is not None:
+        monkeypatch.setenv("EVAL_ADMISSION_MODE", mode)
     got = replay(kanban_task, tmp_path, monkeypatch, capsys)
 
-    if os.environ.get(UPDATE_ENV):
+    if os.environ.get(UPDATE_ENV) and mode is None:
         GOLDEN.mkdir(parents=True, exist_ok=True)
         for name, text in got.items():
             (GOLDEN / name).write_text(text, encoding="utf-8")

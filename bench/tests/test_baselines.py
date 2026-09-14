@@ -47,13 +47,17 @@ from pathlib import Path
 import pytest
 
 from kube_agents_bench.baselines import (
+    ADMISSION_MODE_RECORD,
+    ADMISSION_MODE_ROSTER,
     DEFAULT_ADMISSION_MIN_RUNS,
+    DEFAULT_ADMISSION_MODE,
     DEFAULT_ADMISSION_RATE,
     AdmissionBar,
     BaselineRecord,
     BaselineStore,
     VersionKey,
     Versions,
+    admission_mode_from_env,
     append_record,
     load_versions,
     utc_now,
@@ -61,6 +65,13 @@ from kube_agents_bench.baselines import (
 from kube_agents_bench.scoring import load_run
 
 from conftest import FIXTURE_RUNS
+
+#: The record's own answer. `mode` is required on the library methods, and
+#: under the gate's default (`roster`) an unlisted case is never admitted
+#: whatever the store holds -- so a test of the record's ARITHMETIC asks
+#: for the record's answer by name.
+RECORD = ADMISSION_MODE_RECORD
+ROSTER = ADMISSION_MODE_ROSTER
 
 BASELINES = Path(__file__).resolve().parents[1] / "baselines"
 
@@ -270,7 +281,7 @@ def test_a_re_screen_can_de_admit_without_deleting_the_evidence(tmp_path):
     """
     root = write_store(tmp_path, "planted-pdb", [record(passes=19), record(passes=10)])
     store = BaselineStore.load(root)
-    admitted, why = store.is_admitted("planted-pdb", KEY, bar=AdmissionBar())
+    admitted, why = store.is_admitted("planted-pdb", KEY, bar=AdmissionBar(), mode=RECORD)
     assert admitted is False
     assert "10/20" in why
     assert [r.passes for r in store.history_for("planted-pdb")] == [19, 10]
@@ -383,14 +394,14 @@ def test_the_bar_is_configurable_from_the_environment():
 
 def test_screening_evidence_admits(tmp_path):
     store = BaselineStore.load(write_store(tmp_path, "planted-pdb", [record()]))
-    admitted, why = store.is_admitted("planted-pdb", KEY, bar=AdmissionBar())
+    admitted, why = store.is_admitted("planted-pdb", KEY, bar=AdmissionBar(), mode=RECORD)
     assert admitted is True
     assert "19/20" in why
 
 
 def test_a_case_with_no_evidence_is_not_admitted(tmp_path):
     store = BaselineStore.load(tmp_path)
-    admitted, why = store.is_admitted("brand-new", KEY, bar=AdmissionBar())
+    admitted, why = store.is_admitted("brand-new", KEY, bar=AdmissionBar(), mode=RECORD)
     assert admitted is False
     assert "no screening evidence" in why
 
@@ -405,7 +416,7 @@ def test_a_key_with_no_record_reports_stale_rather_than_comparing(tmp_path):
 
     old = dataclasses.replace(KEY, judge_model="gemini-3.0-judge")
     store = BaselineStore.load(write_store(tmp_path, "planted-pdb", [record(old)]))
-    admitted, why = store.is_admitted("planted-pdb", KEY, bar=AdmissionBar())
+    admitted, why = store.is_admitted("planted-pdb", KEY, bar=AdmissionBar(), mode=RECORD)
     assert admitted is False
     assert why.startswith("stale:")
     assert "gemini-3.1-pro-preview" in why
@@ -413,7 +424,7 @@ def test_a_key_with_no_record_reports_stale_rather_than_comparing(tmp_path):
 
 def test_a_run_with_no_key_is_not_admitted(tmp_path):
     store = BaselineStore.load(write_store(tmp_path, "planted-pdb", [record()]))
-    admitted, why = store.is_admitted("planted-pdb", None, bar=AdmissionBar())
+    admitted, why = store.is_admitted("planted-pdb", None, bar=AdmissionBar(), mode=RECORD)
     assert admitted is False
     assert "no version key" in why
 
@@ -422,12 +433,13 @@ def test_evidence_below_the_bar_says_so(tmp_path):
     store = BaselineStore.load(
         write_store(tmp_path, "planted-pdb", [record(runs=20, passes=12)])
     )
-    admitted, why = store.is_admitted("planted-pdb", KEY, bar=AdmissionBar())
+    admitted, why = store.is_admitted("planted-pdb", KEY, bar=AdmissionBar(), mode=RECORD)
     assert admitted is False
     assert "12/20" in why and "below the bar" in why
 
 
-def test_bootstrap_admits_a_named_case_with_no_store_at_all(tmp_path):
+@pytest.mark.parametrize("mode", [ROSTER, RECORD])
+def test_bootstrap_admits_a_named_case_with_no_store_at_all(tmp_path, mode):
     """The transition bridge.
 
     Without it every case stops blocking on the day this lands, for as long
@@ -439,18 +451,21 @@ def test_bootstrap_admits_a_named_case_with_no_store_at_all(tmp_path):
         None,
         bar=AdmissionBar(),
         bootstrap=frozenset({"gpu-stress-test-diagnosis"}),
+        mode=mode,
     )
     assert admitted is True
     assert "BOOTSTRAP_ADMITTED" in why
 
 
-def test_bootstrap_does_not_leak_to_unnamed_cases(tmp_path):
+@pytest.mark.parametrize("mode", [ROSTER, RECORD])
+def test_bootstrap_does_not_leak_to_unnamed_cases(tmp_path, mode):
     store = BaselineStore.load(tmp_path)
     admitted, _ = store.is_admitted(
         "agent-kanban-smoke",
         None,
         bar=AdmissionBar(),
         bootstrap=frozenset({"gpu-stress-test-diagnosis"}),
+        mode=mode,
     )
     assert admitted is False
 
@@ -479,7 +494,7 @@ def test_seven_ordinary_runs_add_up_to_an_admission(tmp_path):
 
     evidence = store.evidence_for("planted-pdb", KEY, min_runs=20)
     assert (evidence.runs, evidence.passes, evidence.lines) == (21, 21, 7)
-    assert store.is_admitted("planted-pdb", KEY, bar=AdmissionBar())[0] is True
+    assert store.is_admitted("planted-pdb", KEY, bar=AdmissionBar(), mode=RECORD)[0] is True
 
 
 def test_a_single_twenty_run_campaign_still_admits_on_its_own(tmp_path):
@@ -493,7 +508,7 @@ def test_a_single_twenty_run_campaign_still_admits_on_its_own(tmp_path):
     )
     evidence = store.evidence_for("planted-pdb", KEY, min_runs=20)
     assert evidence.lines == 1
-    assert store.is_admitted("planted-pdb", KEY, bar=AdmissionBar())[0] is True
+    assert store.is_admitted("planted-pdb", KEY, bar=AdmissionBar(), mode=RECORD)[0] is True
 
 
 def test_pooling_stops_at_the_bar_rather_than_reading_the_whole_file(tmp_path):
@@ -524,7 +539,7 @@ def test_a_case_that_gets_worse_de_admits_itself(tmp_path):
     bad = [three(0, at=f"2026-09-{i + 1:02d}T00:00:00Z") for i in range(7)]
     store = BaselineStore.load(write_store(tmp_path, "planted-pdb", good + bad))
 
-    admitted, why = store.is_admitted("planted-pdb", KEY, bar=AdmissionBar())
+    admitted, why = store.is_admitted("planted-pdb", KEY, bar=AdmissionBar(), mode=RECORD)
     assert admitted is False
     assert "0/21" in why and "below the bar" in why
     # And every one of the fourteen lines is still on disk.
@@ -540,7 +555,7 @@ def test_partial_evidence_reports_collecting_not_failure(tmp_path):
     """
     lines = [three(3, at=f"2026-08-{20 + i:02d}T00:00:00Z") for i in range(2)]
     store = BaselineStore.load(write_store(tmp_path, "planted-pdb", lines))
-    admitted, why = store.is_admitted("planted-pdb", KEY, bar=AdmissionBar())
+    admitted, why = store.is_admitted("planted-pdb", KEY, bar=AdmissionBar(), mode=RECORD)
     assert admitted is False
     assert "collecting" in why and "14 more needed" in why
     assert "below the bar" not in why
@@ -700,59 +715,120 @@ def test_blocked_and_infra_counts_stay_out_of_the_rate(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# Who decides: the record once it holds a full window, the bootstrap list
-# until then. `admission()` is `is_admitted()` with the source attached.
+# Who decides is a mode. `roster` (the default): the bootstrap list decides
+# and the record recommends. `record`: the record once it holds a full
+# window, the list until then. `admission()` is `is_admitted()` with the
+# source and the record's verdict attached.
 # --------------------------------------------------------------------------
 
 
+def test_the_default_mode_is_the_roster():
+    assert DEFAULT_ADMISSION_MODE == ADMISSION_MODE_ROSTER
+    assert admission_mode_from_env({}) == ADMISSION_MODE_ROSTER
+    assert admission_mode_from_env({"EVAL_ADMISSION_MODE": ""}) == ADMISSION_MODE_ROSTER
+    assert admission_mode_from_env({"EVAL_ADMISSION_MODE": " Record "}) == RECORD
+
+
+def test_an_unknown_mode_is_an_error_not_the_default():
+    """`records` read as `roster` would silently change who decides -- the
+    same class as a misspelled BOOTSTRAP_ADMITTED entry, refused outright."""
+    with pytest.raises(ValueError, match="EVAL_ADMISSION_MODE='records' is not one of"):
+        admission_mode_from_env({"EVAL_ADMISSION_MODE": "records"})
+    with pytest.raises(ValueError, match="EVAL_ADMISSION_MODE='records' is not one of record, roster"):
+        BaselineStore({}).admission("x", KEY, bar=AdmissionBar(), mode="records")
+
+
+def test_the_roster_keeps_the_list_in_charge_and_the_record_recommends(tmp_path):
+    """The decision on #1493: a case enters or leaves the blocking set through
+    a reviewed roster edit that cites the record, never through the record
+    alone. So the listed 12/20 case stays admitted and the unlisted 20/20
+    case stays out -- and both reasons quote what the record would do."""
+    write_store(tmp_path, "planted-pdb", [record(runs=20, passes=12)])
+    write_store(tmp_path, "unlisted", [record(runs=20, passes=20)])
+    store = BaselineStore.load(tmp_path)
+    listed = frozenset({"planted-pdb"})
+
+    kept = store.admission("planted-pdb", KEY, bar=AdmissionBar(), bootstrap=listed, mode=ROSTER)
+    assert kept.admitted is True and kept.source == "bootstrap"
+    assert kept.record_verdict == "record: would demote (12/20, below 95% over 20)"
+    assert kept.reason == (
+        "admitted by BOOTSTRAP_ADMITTED (transition bridge); "
+        "record: would demote (12/20, below 95% over 20)"
+        " -- advisory; the roster decides (EVAL_ADMISSION_MODE=roster)"
+    )
+
+    out = store.admission("unlisted", KEY, bar=AdmissionBar(), bootstrap=listed, mode=ROSTER)
+    assert out.admitted is False and out.source == "neither"
+    assert out.record_verdict == (
+        "record: would admit (20/20 at key "
+        "gemini-3-1-pro-preview-kubeagents-mcp/gemini-3.1-pro-preview/v1-f1-v1)"
+    )
+    assert out.reason.startswith("not named in BOOTSTRAP_ADMITTED; record: would admit")
+    assert out.reason.endswith("the roster decides (EVAL_ADMISSION_MODE=roster)")
+
+    # The same store, asked for the record's answer: #1447's behaviour.
+    assert store.admission("planted-pdb", KEY, bar=AdmissionBar(), bootstrap=listed, mode=RECORD).admitted is False
+    assert store.admission("unlisted", KEY, bar=AdmissionBar(), bootstrap=listed, mode=RECORD).admitted is True
+
+
 def test_the_record_overrides_the_bootstrap_list_once_it_holds_a_full_window(tmp_path):
-    """A list that could overrule the evidence it bridges toward would never
-    be safe to delete. 12/20 turns the case away, listed or not."""
+    """Record mode. A list that could overrule the evidence it bridges toward
+    would never be safe to delete: 12/20 turns the case away, listed or not."""
     write_store(tmp_path, "planted-pdb", [record(runs=20, passes=12)])
     store = BaselineStore.load(tmp_path)
     decision = store.admission(
-        "planted-pdb", KEY, bar=AdmissionBar(), bootstrap=frozenset({"planted-pdb"})
+        "planted-pdb", KEY, bar=AdmissionBar(), bootstrap=frozenset({"planted-pdb"}), mode=RECORD
     )
     assert decision.admitted is False
     assert decision.source == "record"
     assert "overrides BOOTSTRAP_ADMITTED" in decision.reason
+    assert decision.record_verdict == "record: would demote (12/20, below 95% over 20)"
     # And a full window that clears the bar admits a case the list never named.
     write_store(tmp_path, "unlisted", [record(runs=20, passes=20)])
     decision = BaselineStore.load(tmp_path).admission(
-        "unlisted", KEY, bar=AdmissionBar(), bootstrap=frozenset({"planted-pdb"})
+        "unlisted", KEY, bar=AdmissionBar(), bootstrap=frozenset({"planted-pdb"}), mode=RECORD
     )
     assert decision.admitted is True and decision.source == "record"
+    assert decision.record_verdict.startswith("record: would admit (20/20 at key ")
 
 
-def test_the_bootstrap_list_is_the_fallback_while_the_record_cannot_judge(tmp_path):
-    """Nothing, stale, or collecting: the list decides, and the reason says
-    which of the three the store is in -- except for nothing, where the
-    sentence is the one the list has always produced."""
+@pytest.mark.parametrize("mode", [ROSTER, RECORD])
+def test_the_bootstrap_list_is_the_fallback_while_the_record_cannot_judge(tmp_path, mode):
+    """Nothing, stale, or collecting: the list decides in BOTH modes, and the
+    reason says which of the three the store is in -- except for nothing,
+    where the sentence is the one the list has always produced. The record's
+    verdict names the same state in its own short form."""
     listed = frozenset({"planted-pdb"})
     bare = BaselineStore.load(tmp_path).admission(
-        "planted-pdb", KEY, bar=AdmissionBar(), bootstrap=listed
+        "planted-pdb", KEY, bar=AdmissionBar(), bootstrap=listed, mode=mode
     )
     assert bare.admitted is True and bare.source == "bootstrap"
     assert bare.reason == "admitted by BOOTSTRAP_ADMITTED (transition bridge)"
+    assert bare.record_verdict == "record: none"
 
     import dataclasses
 
     old_key = dataclasses.replace(KEY, judge_model="gemini-3.0-judge")
     write_store(tmp_path, "planted-pdb", [record(old_key, runs=20, passes=20)])
     stale = BaselineStore.load(tmp_path).admission(
-        "planted-pdb", KEY, bar=AdmissionBar(), bootstrap=listed
+        "planted-pdb", KEY, bar=AdmissionBar(), bootstrap=listed, mode=mode
     )
     assert stale.admitted is True and stale.source == "bootstrap"
     assert "stale:" in stale.reason
+    assert stale.record_verdict == (
+        "record: stale (key gemini-3-1-pro-preview-kubeagents-mcp/gemini-3.1-pro-preview/v1-f1-v1)"
+    )
 
     write_store(tmp_path, "planted-pdb", [record(runs=9, passes=9)])
     collecting = BaselineStore.load(tmp_path).admission(
-        "planted-pdb", KEY, bar=AdmissionBar(), bootstrap=listed
+        "planted-pdb", KEY, bar=AdmissionBar(), bootstrap=listed, mode=mode
     )
     assert collecting.admitted is True and collecting.source == "bootstrap"
     assert "collecting: 9/9" in collecting.reason
+    assert collecting.record_verdict == "record: collecting 9/20"
 
     unlisted = BaselineStore.load(tmp_path).admission(
-        "planted-pdb", KEY, bar=AdmissionBar(), bootstrap=frozenset()
+        "planted-pdb", KEY, bar=AdmissionBar(), bootstrap=frozenset(), mode=mode
     )
     assert unlisted.admitted is False and unlisted.source == "neither"
+    assert unlisted.record_verdict == "record: collecting 9/20"

@@ -48,12 +48,16 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from kube_agents_bench.baselines import (
+    ADMISSION_MODE_ENV,
+    ADMISSION_MODE_ROSTER,
     ADMITTED_BY_RECORD,
+    RECORD_VERDICT_NONE,
     AdmissionBar,
     BaselineRecord,
     BaselineStore,
     StoreUnreachable,
     VersionKey,
+    admission_mode_from_env,
     append_record,
     load_versions,
     utc_now,
@@ -96,6 +100,14 @@ ADMISSION_CELL_NONE = "none"
 ADMISSION_CELL_RECORD_REFUSED = "record: not admitted"
 #: An admitted case whose hand-off predates `admission_source` (hand-authored).
 ADMISSION_CELL_UNKNOWN = "--"
+#: In roster mode (EVAL_ADMISSION_MODE, the default) the column carries both
+#: halves -- who admitted the case and what its record recommends -- so the
+#: verdict a roster pull request cites is on the row it is about. Shown on
+#: the same condition as the plain column, plus one: the record having
+#: anything to say about any case (evidence landed by hand with no store
+#: configured), which mirrors the record-decided trigger in record mode.
+ADMISSION_COLUMN_ROSTER = "Admitted by · record says"
+ADMISSION_CELL_SEPARATOR = " · "
 
 
 def _env_float(name: str, default: float) -> float:
@@ -159,6 +171,18 @@ def _aggregate_armed() -> bool:
 def _record_decided(cases: list[dict[str, Any]]) -> bool:
     """Whether the evidence store admitted or refused any case this run."""
     return any(c.get("admission_source") == ADMITTED_BY_RECORD for c in cases)
+
+
+def _record_spoke(cases: list[dict[str, Any]]) -> bool:
+    """Whether the record had anything beyond ``none`` to say about any case.
+
+    Roster mode's twin of :func:`_record_decided`: the record never decides
+    there, but a verdict it produced from evidence must not be invisible.
+    """
+    return any(
+        c.get("record_verdict") and c.get("record_verdict") != RECORD_VERDICT_NONE
+        for c in cases
+    )
 
 
 def _load_store(location: str) -> tuple[BaselineStore | None, str | None, str | None]:
@@ -269,9 +293,17 @@ def _cmd_case(args: argparse.Namespace) -> int:
         print(f"WARNING: baseline store {degraded}", file=sys.stderr)
         print("WARNING: grading with no baseline; nothing can be admitted.", file=sys.stderr)
 
+    try:
+        mode = admission_mode_from_env()
+    except ValueError as exc:
+        # Same class as a corrupt store: a misspelled mode must not grade as
+        # the default and quietly change who decides.
+        print(f"Task {spec.case_id} Result: [FAILED] {exc}", file=sys.stderr)
+        return 2
+
     bar = AdmissionBar.from_env()
     decision = store.admission(
-        spec.case_id, key, bar=bar, bootstrap=_bootstrap_admitted()
+        spec.case_id, key, bar=bar, bootstrap=_bootstrap_admitted(), mode=mode
     )
     admitted, admission_reason = decision.admitted, decision.reason
 
@@ -298,9 +330,13 @@ def _cmd_case(args: argparse.Namespace) -> int:
     payload = verdict.to_dict()
     payload["admission_reason"] = admission_reason
     # Who decided: record, bootstrap or neither. The suite renders it per case
-    # once a store is configured or the record decided any case, so a reader
-    # can tell a case the evidence admitted from one still riding the bridge.
+    # once a store is configured or the record had anything to say, so a
+    # reader can tell who admitted a case and what its record recommends.
     payload["admission_source"] = decision.source
+    # What the record would do, in both modes, and which mode was in force --
+    # so an artefact read later says whether the record decided or advised.
+    payload["record_verdict"] = decision.record_verdict
+    payload["admission_mode"] = mode
     payload["version_key"] = key.to_dict() if key else None
     payload["baseline_judged"] = baseline_judged
     payload["baseline_runs"] = evidence.runs if evidence else 0
@@ -344,8 +380,21 @@ def _admitted_by(case: dict[str, Any]) -> str:
     return ADMISSION_CELL_NONE
 
 
+def _admission_cell(case: dict[str, Any], *, roster: bool) -> str:
+    """The column's cell. Roster mode appends what the record says."""
+    cell = _admitted_by(case)
+    verdict = case.get("record_verdict")
+    if roster and verdict:
+        cell += ADMISSION_CELL_SEPARATOR + str(verdict)
+    return cell
+
+
 def _markdown(
-    verdict: Any, cases: list[dict[str, Any]], *, admission_column: bool = False
+    verdict: Any,
+    cases: list[dict[str, Any]],
+    *,
+    admission_column: bool = False,
+    roster: bool = False,
 ) -> str:
     lines = [
         "## Evaluation verdict",
@@ -366,7 +415,8 @@ def _markdown(
         lines += ["### Why it is red", ""]
         lines += [f"- {r}" for r in verdict.reasons]
         lines += [""]
-    extra_header = f" {ADMISSION_COLUMN} |" if admission_column else ""
+    column = ADMISSION_COLUMN_ROSTER if roster else ADMISSION_COLUMN
+    extra_header = f" {column} |" if admission_column else ""
     extra_rule = " --- |" if admission_column else ""
     lines += [
         f"| Case | Domain | Verdict |{extra_header} Passes | Detail |",
@@ -380,7 +430,9 @@ def _markdown(
         # A verifier's reason can contain a pipe (a required-phrase list, a
         # kubectl selector), which would silently split the table cell.
         detail = str(case.get("reason") or "").replace("|", "\\|")
-        extra_cell = f" {_admitted_by(case)} |" if admission_column else ""
+        extra_cell = (
+            f" {_admission_cell(case, roster=roster)} |" if admission_column else ""
+        )
         lines.append(
             f"| `{case.get('case')}` | {case.get('domain') or '--'} | {mark} "
             f"(rung {int(rung)}) |{extra_cell} {case.get('passes')}/{scored} | {detail} |"
@@ -455,6 +507,27 @@ def _cmd_suite(args: argparse.Namespace) -> int:
         print(f"::error::{fatal}", file=sys.stderr)
         return 1
 
+    try:
+        mode = admission_mode_from_env()
+    except ValueError as exc:
+        print(f"::error::{exc}", file=sys.stderr)
+        return 1
+
+    # The mode the cases were GRADED under is the one the table must render
+    # in, and each hand-off records it. The environment is the fallback for a
+    # hand-authored file. Two modes across one run is unaccounted state, like
+    # a missing case result; a run re-rendered under another environment is
+    # rendered as graded, with a banner saying so.
+    graded_modes = sorted({str(c["admission_mode"]) for c in cases if c.get("admission_mode")})
+    if len(graded_modes) > 1:
+        print(
+            "::error::case results were graded under different admission modes: "
+            f"{', '.join(graded_modes)}",
+            file=sys.stderr,
+        )
+        return 1
+    graded_mode = graded_modes[0] if graded_modes else mode
+
     # An explicit --baseline-rate wins, for a local run or a what-if. Otherwise
     # the number comes from the store, which is the whole point: the aggregate
     # rule was a flag nothing supplied, and so never fired.
@@ -493,12 +566,26 @@ def _cmd_suite(args: argparse.Namespace) -> int:
     text = _markdown(
         verdict,
         cases,
-        admission_column=_store_configured(args) or _record_decided(cases),
+        admission_column=(
+            _store_configured(args) or _record_decided(cases) or _record_spoke(cases)
+        ),
+        roster=graded_mode == ADMISSION_MODE_ROSTER,
     )
     # The banner goes in the markdown, not only in the log. A degraded read
     # silently loosens the gate, and the one thing that must not happen is a
     # green nobody knows was measured against nothing.
     banners = []
+    if graded_mode != mode:
+        print(
+            f"WARNING: case results were graded under {ADMISSION_MODE_ENV}="
+            f"{graded_mode} but this environment says {mode}; rendering as graded",
+            file=sys.stderr,
+        )
+        banners.append(
+            f"> **WARNING — admission mode mismatch.** The cases were graded under "
+            f"`{ADMISSION_MODE_ENV}={graded_mode}`; this environment says `{mode}`. "
+            "The table below reads as graded."
+        )
     if unknown:
         print(
             f"WARNING: BOOTSTRAP_ADMITTED names no graded case: {unknown}",

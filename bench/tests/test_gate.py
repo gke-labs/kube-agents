@@ -70,6 +70,7 @@ def _clean_env(monkeypatch):
         "DETERMINISTIC_CORRECTNESS_FLOOR",
         "EVAL_AGGREGATE_MARGIN",
         "EVAL_AGGREGATE_ARMED",
+        "EVAL_ADMISSION_MODE",
         "EVAL_ADMISSION_RATE",
         "EVAL_ADMISSION_MIN_RUNS",
         "EVAL_JUDGED_MARGIN",
@@ -626,6 +627,9 @@ def test_an_empty_store_collects_and_then_admits(kanban_task, tmp_path, monkeypa
     would really have shipped in.
     """
     monkeypatch.setenv("JUDGE_MODEL", JUDGE)
+    # The record's own decision is what accrues here; under the default
+    # roster mode an unlisted case is never admitted, whatever the store says.
+    monkeypatch.setenv("EVAL_ADMISSION_MODE", "record")
     store = store_with(tmp_path)
     out = tmp_path / "case.json"
     greens = [FIXTURE_RUNS / n for n in (GREEN_RUNS + GREEN_RUNS[:1])]
@@ -652,6 +656,9 @@ def test_the_suite_aggregate_comes_from_the_store_not_a_flag(
     """The rule was built and never armed: `--baseline-rate` was a flag the
     shell did not pass, so main's side of the comparison was always None."""
     monkeypatch.setenv("JUDGE_MODEL", JUDGE)
+    # Record mode: the aggregate pools ADMITTED cases, and this unlisted case
+    # is admitted only by its record.
+    monkeypatch.setenv("EVAL_ADMISSION_MODE", "record")
     store = store_with(
         tmp_path, *[
             baseline_line("agent-kanban-smoke", runs=3, passes=3, at=f"2026-08-0{i + 1}T00:00:00Z")
