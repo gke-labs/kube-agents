@@ -1168,7 +1168,7 @@ RUN /opt/hermes/.venv/bin/python3 /tmp/kanban-guardrail-exit/apply_state_db_sync
 # write site with install -m.
 # See the module docstring in deploy/docker/patches/credential_redaction.py.
 #
-# All seven patches ship in ONE COPY + ONE RUN on purpose. This stage is the base
+# Every patch in this block ships in ONE COPY + ONE RUN on purpose. This stage is the base
 # for `platform`, and the block-per-patch layout these would normally get pushed
 # that chain past Docker's layer-depth ceiling ("max depth exceeded" on build
 # f9f1747c, 2026-08-07). The guarantees are unchanged — same appliers,
