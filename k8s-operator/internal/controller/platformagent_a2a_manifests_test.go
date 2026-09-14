@@ -3076,6 +3076,53 @@ func a2aSameVerbsOn(streams []string, verbs ...string) map[string][]string {
 	return out
 }
 
+// a2aReservedSubjects returns, for one principal, subjects its row does not
+// record, and that no wildcard in either of its lists may therefore cover:
+// the account's JetStream discovery and STREAM.DELETE on every provisioned
+// stream (unless the row records the wholesale grant, which covers the whole
+// API), an ack on every stream the row grants no ACK on, a key in every
+// bucket it grants no KV on, and every other principal's inbox. users is
+// every principal in the table.
+//
+// The per-grant rules read a grant's spelling, and a spelling check cannot
+// see that "*.API.>" covers "$JS.API.STREAM.DELETE.TASKS" or that "*.>" in a
+// subscribe list covers everyone's inbox. This list is what the server would
+// be asked, so the caller matches every wildcard grant against it with
+// subjectMatches and the spelling stops mattering. It is not everything the
+// principal may not do; it is one subject per thing the row withholds, which
+// is enough for a wildcard to trip on.
+func a2aReservedSubjects(user string, row a2aGrantRow, users []string) []string {
+	const (
+		// One delivered message's ack subject, in the pre-domain form:
+		// consumer, delivered count, stream and consumer sequence,
+		// timestamp, pending. Any token values do for matching.
+		ackSuffix   = ".c.1.1.1.1.1"
+		keySuffix   = ".k"
+		inboxSuffix = ".x"
+	)
+	var out []string
+	if !row.wholesale {
+		out = append(out, "$JS.API.INFO")
+	}
+	for _, s := range a2aProvisionedStreams {
+		if !row.wholesale && !slices.Contains(row.streams[s], "STREAM.DELETE") {
+			out = append(out, "$JS.API.STREAM.DELETE."+s)
+		}
+		if !slices.Contains(row.streams[s], "ACK") {
+			out = append(out, "$JS.ACK."+s+ackSuffix)
+		}
+		if b, isBucket := strings.CutPrefix(s, a2aKVStreamPrefix); isBucket && !slices.Contains(row.streams[s], "KV") {
+			out = append(out, "$KV."+b+keySuffix)
+		}
+	}
+	for _, other := range users {
+		if other != user {
+			out = append(out, "_INBOX."+other+inboxSuffix)
+		}
+	}
+	return out
+}
+
 // checkA2AUserGrants asks the per-user property of one principal's publish
 // and subscribe lists against its row, whichever render the lists came from.
 func checkA2AUserGrants(t *testing.T, user string, row a2aGrantRow, lists map[string][]string) {
@@ -3086,7 +3133,12 @@ func checkA2AUserGrants(t *testing.T, user string, row a2aGrantRow, lists map[st
 		inboxPrefix      = "_INBOX."
 		topicsPrefix     = "a2a.topics."
 	)
-	unscoped := []string{">", "*", "$JS.>", "$JS.ACK.>", "$KV.>"}
+	// The namespaces a grant may start in: the bus's own subjects, the
+	// core-NATS heartbeats (agents.hb.>, spec-a2a-payloads' subject table),
+	// JetStream, KV, and inboxes. A first token outside them is a grant
+	// nothing here can read, and a wildcard there (">", "*.API.>", "*.>")
+	// covers all five at once, which no literal spelling check would see.
+	namespaces := []string{"a2a", "agents", "$JS", "$KV", "_INBOX"}
 	ownInbox := inboxPrefix + user + ".>"
 	reached := map[string]map[string]bool{}
 
@@ -3100,10 +3152,12 @@ func checkA2AUserGrants(t *testing.T, user string, row a2aGrantRow, lists map[st
 
 		var inboxes []string
 		for _, g := range grants {
-			// 2. Nothing unscoped, and the wholesale grant only where the
-			// table records it.
-			if slices.Contains(unscoped, g) {
-				t.Errorf("%s %s holds unscoped %q", user, section, g)
+			// 2. The first token names a namespace, literally; and the
+			// wholesale grant appears only where the table records it.
+			// Whether a wildcard further in covers a subject the row does
+			// not record is asked by subject matching in the caller.
+			if first, _, _ := strings.Cut(g, "."); !slices.Contains(namespaces, first) {
+				t.Errorf("%s %s holds %q, whose first token %q is none of %v", user, section, g, first, namespaces)
 				continue
 			}
 			if g == bareJetStreamAPI {
@@ -3385,29 +3439,84 @@ func TestEveryNATSUserGrantIsEnumeratedAndStreamScoped(t *testing.T) {
 		checkA2AUserGrants(t, user, rows[user], lists[user])
 	}
 
-	// 5, the other half: asked as the server would ask it. A publish
-	// wildcard need not spell a2a.topics. to cover a topic - a2a.> does, and
-	// so does a2a.*.shared.blueprint - so every wildcard publish grant of
-	// every principal is matched against every topic any principal
-	// publishes literally, and against the writerless probe.
+	// 7. The other half of 2 to 5, asked as the server would ask it. The
+	// rules above read spellings, and a wildcard need not spell what it
+	// covers: a2a.> and a2a.*.shared.blueprint cover a topic without
+	// naming a2a.topics., *.API.> covers $JS.API.STREAM.DELETE.TASKS
+	// without naming $JS, *.> in a subscribe list covers every inbox. So
+	// every wildcard grant in either list of every principal is matched
+	// against the subjects its row withholds (a2aReservedSubjects), and
+	// every wildcard publish grant against every topic any principal
+	// publishes literally plus the writerless probe.
+	users := slices.Sorted(maps.Keys(rows))
 	topics := []string{probeTopic}
-	for _, user := range slices.Sorted(maps.Keys(rows)) {
+	for _, user := range users {
 		for _, g := range lists[user]["publish"] {
 			if strings.HasPrefix(g, "a2a.topics.") && !strings.ContainsAny(g, "*>") && !slices.Contains(topics, g) {
 				topics = append(topics, g)
 			}
 		}
 	}
-	for _, user := range slices.Sorted(maps.Keys(rows)) {
-		for _, g := range lists[user]["publish"] {
-			if !strings.ContainsAny(g, "*>") {
-				continue
-			}
-			for _, topic := range topics {
-				if subjectMatches(g, topic) {
-					t.Errorf("%s publish %q covers topic %s without naming it; topic publishes are exact", user, g, topic)
+	for _, user := range users {
+		reserved := a2aReservedSubjects(user, rows[user], users)
+		for _, section := range []string{"publish", "subscribe"} {
+			for _, g := range lists[user][section] {
+				if !strings.ContainsAny(g, "*>") {
+					continue
+				}
+				for _, subject := range reserved {
+					if subjectMatches(g, subject) {
+						t.Errorf("%s %s %q covers %s, which its row does not record", user, section, g, subject)
+					}
+				}
+				if section != "publish" {
+					continue
+				}
+				for _, topic := range topics {
+					if subjectMatches(g, topic) {
+						t.Errorf("%s publish %q covers topic %s without naming it; topic publishes are exact", user, g, topic)
+					}
 				}
 			}
 		}
+	}
+}
+
+func TestA2AReservedSubjects(t *testing.T) {
+	users := []string{"a", "b", "c"}
+	row := a2aGrantRow{streams: map[string][]string{
+		"TASKS":            {"ACK", "STREAM.DELETE"},
+		"KV_runtime-state": {"KV"},
+	}}
+	got := a2aReservedSubjects("b", row, users)
+	for _, want := range []string{
+		"$JS.API.INFO",
+		"$JS.API.STREAM.DELETE.DIRECTORY",
+		"$JS.API.STREAM.DELETE.KV_runtime-state",
+		"$JS.ACK.DIRECTORY.c.1.1.1.1.1",
+		"$JS.ACK.KV_runtime-state.c.1.1.1.1.1",
+		"$KV.session-state.k",
+		"$KV.cap.k",
+		"_INBOX.a.x",
+		"_INBOX.c.x",
+	} {
+		if !slices.Contains(got, want) {
+			t.Errorf("reserved subjects for b lack %s: %q", want, got)
+		}
+	}
+	for _, notWant := range []string{
+		"$JS.API.STREAM.DELETE.TASKS", // the row grants it
+		"$JS.ACK.TASKS.c.1.1.1.1.1",   // the row grants ACK there
+		"$KV.runtime-state.k",         // the row grants KV there
+		"_INBOX.b.x",                  // its own inbox
+	} {
+		if slices.Contains(got, notWant) {
+			t.Errorf("reserved subjects for b hold %s, which its row records: %q", notWant, got)
+		}
+	}
+	if got := a2aReservedSubjects("a", a2aGrantRow{wholesale: true}, users); slices.ContainsFunc(got, func(s string) bool {
+		return strings.HasPrefix(s, "$JS.API.")
+	}) {
+		t.Errorf("a wholesale row reserves JetStream API subjects its grant covers: %q", got)
 	}
 }
