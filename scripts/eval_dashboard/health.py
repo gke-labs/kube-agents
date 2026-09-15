@@ -277,8 +277,8 @@ SLOW_CLEAR_FACTOR = 1.1
 # hack/eval/blocking-roster.txt by default; a replay over history passes
 # --roster-history because the roster moved four times in the week the
 # fixture covers. The roster lived in hack/ci-eval-pr.sh's BOOTSTRAP_ADMITTED
-# line until 2026-09-15 (#1546); Roster.from_file still reads that shape, so a
-# `git show <old-commit>:hack/ci-eval-pr.sh` resolves an era before the move.
+# line until 2026-09-15 (#1546); Roster.from_script_text reads that shape, so
+# a `git show <old-commit>:hack/ci-eval-pr.sh` resolves an era before the move.
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 BLOCKING_ROSTER_FILE = eval_rosters.BLOCKING_ROSTER_FILE
 
@@ -522,11 +522,20 @@ class Roster:
 
     @classmethod
     def from_file(cls, path: pathlib.Path = BLOCKING_ROSTER_FILE) -> Roster:
-        """The roster in hack/eval/blocking-roster.txt -- or in the old script text."""
+        """The roster in hack/eval/blocking-roster.txt (one id per line)."""
         admitted = eval_rosters.parse_blocking_roster(path.read_text())
         if not admitted:
             raise SystemExit(f"ERROR: no blocking roster found in {path}")
         return cls.fixed(admitted)
+
+    @classmethod
+    def from_script_text(cls, text: str) -> Roster:
+        """The roster of a pre-2026-09-15 hack/ci-eval-pr.sh, for an era in
+        roster history: hand it `git show <commit>:hack/ci-eval-pr.sh`."""
+        try:
+            return cls.fixed(eval_rosters.parse_script_roster(text))
+        except ValueError as exc:
+            raise SystemExit(f"ERROR: {exc}") from exc
 
     def at(self, when: datetime | None) -> frozenset[str]:
         current: frozenset[str] = frozenset()

@@ -247,10 +247,14 @@ class SharedBreak(unittest.TestCase):
             roster_file.write_text("# the roster\na-probe\nb-probe  # admitted 09-01\n\n")
             self.assertEqual(health.Roster.from_file(roster_file).current, frozenset({"a-probe", "b-probe"}))
             # The shape the script carried before 2026-09-15, for an era
-            # taken from `git show <old-commit>:hack/ci-eval-pr.sh`.
-            script = pathlib.Path(tmp) / "ci-eval-pr.sh"
-            script.write_text('#!/bin/bash\nexport BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-a-probe,b-probe}"\n')
-            self.assertEqual(health.Roster.from_file(script).current, frozenset({"a-probe", "b-probe"}))
+            # taken from `git show <old-commit>:hack/ci-eval-pr.sh`, has its
+            # own reader; the file reader treats that line as prose.
+            old_script = '#!/bin/bash\nexport BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-a-probe,b-probe}"\n'
+            self.assertEqual(health.Roster.from_script_text(old_script).current, frozenset({"a-probe", "b-probe"}))
+            roster_file.write_text("# a laptop run may export " + old_script.splitlines()[1] + "\nc-probe\n")
+            self.assertEqual(health.Roster.from_file(roster_file).current, frozenset({"c-probe"}))
+            with self.assertRaises(SystemExit):
+                health.Roster.from_script_text("c-probe\n")
             roster_file.write_text("# nothing admitted\n")
             with self.assertRaises(SystemExit):
                 health.Roster.from_file(roster_file)

@@ -115,14 +115,23 @@ class ParserTest(unittest.TestCase):
         text = "# roster\na-probe\nb-probe  # since 09-01\n\nc-probe\n"
         self.assertEqual(eval_rosters.parse_blocking_roster(text), ["a-probe", "b-probe", "c-probe"])
 
-    def test_the_blocking_roster_reads_the_old_script_shape(self):
+    def test_the_old_script_shape_has_its_own_parser(self):
         # An era before 2026-09-15 comes from `git show <commit>:hack/ci-eval-pr.sh`.
-        self.assertEqual(eval_rosters.parse_blocking_roster("#!/bin/bash\n" + OLD_SCRIPT_LINE), ["a-probe", "b-probe", "c-probe"])
+        self.assertEqual(eval_rosters.parse_script_roster("#!/bin/bash\n" + OLD_SCRIPT_LINE), ["a-probe", "b-probe", "c-probe"])
         self.assertEqual(
-            eval_rosters.parse_blocking_roster('BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-a-probe b-probe}"'),
+            eval_rosters.parse_script_roster('BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-a-probe b-probe}"'),
             ["a-probe", "b-probe"],
             "bench-gate accepts whitespace separators too",
         )
+        with self.assertRaises(ValueError):
+            eval_rosters.parse_script_roster("a-probe\nb-probe\n")
+
+    def test_a_comment_quoting_the_override_syntax_is_not_the_roster(self):
+        # The file parser never guesses: a header comment that shows the
+        # BOOTSTRAP_ADMITTED override form is a comment, and the shell,
+        # which strips comments first, must agree with it.
+        text = "# a laptop run may set " + OLD_SCRIPT_LINE + "real-probe\n"
+        self.assertEqual(eval_rosters.parse_blocking_roster(text), ["real-probe"])
 
     def test_the_real_files_parse(self):
         self.assertTrue(eval_rosters.presubmit_cases())

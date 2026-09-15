@@ -380,12 +380,7 @@ _ROSTER_CACHE: dict[str, frozenset | None] = {}
 
 
 def admitted_cases(roster_file: pathlib.Path = BLOCKING_ROSTER_FILE) -> frozenset | None:
-    """The blocking roster from hack/eval/blocking-roster.txt; None when unreadable.
-
-    The parse (scripts/eval_rosters.py) also reads the script's pre-split
-    BOOTSTRAP_ADMITTED line, so a checkout from before 2026-09-15 handed in
-    by path still resolves.
-    """
+    """The blocking roster from hack/eval/blocking-roster.txt; None when unreadable."""
     key = str(roster_file)
     if key not in _ROSTER_CACHE:
         roster = None

@@ -717,8 +717,8 @@ consumers compare it case-insensitively. `testdata_health/roster-history.json` i
 blocking roster per era over the same week, taken from the commits that
 changed it (the `BOOTSTRAP_ADMITTED` line of `hack/ci-eval-pr.sh` then;
 `hack/eval/blocking-roster.txt` since 2026-09-15 — `health.Roster.from_file`
-reads either shape, so an era from before the move is taken from the
-script at that commit). Together they are the replay fixture
+reads the file and `health.Roster.from_script_text` the old line, so an era
+from before the move is taken from the script at that commit). Together they are the replay fixture
 `scripts/test_eval_dashboard_health.py` asserts the week's incident
 timeline against. `testdata_health/lost-pods-2026-09-11.json.gz` is the same
 cut of the published `data.json` for 2026-09-11 (#1478) — the day five build

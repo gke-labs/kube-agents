@@ -16,11 +16,13 @@ dashboard read the files the shell does and cannot disagree with it about
 what is registered. It is stdlib-only on purpose: the dashboard's collector
 runs in a workflow with no third-party imports.
 
-The files replaced three bash arrays in the script. ``parse_blocking_roster``
-still understands the old ``BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-a,b}"``
-default line, so a reader handed the text of ``hack/ci-eval-pr.sh`` from a
-commit before the move (``git show <commit>:hack/ci-eval-pr.sh``, for roster
-history) resolves the same roster.
+The files replaced three bash arrays in the script. ``parse_script_roster``
+reads the old ``BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-a,b}"`` default line
+out of the text of ``hack/ci-eval-pr.sh`` from a commit before the move
+(``git show <commit>:hack/ci-eval-pr.sh``, for roster history). It is a
+separate function from ``parse_blocking_roster`` on purpose: a reader always
+knows which shape it holds, and a parser that guessed would take a comment in
+the roster file that quotes the override syntax for the roster itself.
 """
 
 from __future__ import annotations
@@ -91,17 +93,27 @@ def commented_out_cases(text: str) -> list[str]:
 
 
 def parse_blocking_roster(text: str) -> list[str]:
-    """Case ids of the blocking roster, from the file or from the old script.
+    """Case ids of the blocking roster file: one id per line, ``#`` comments.
 
-    File text: one id per line with ``#`` comments. Script text from before
-    the split: the ``BOOTSTRAP_ADMITTED`` default line. Either way the ids
-    come back in declaration order, split the way bench-gate splits the
-    variable.
+    Comments are stripped before anything is read, so a comment that quotes
+    the ``BOOTSTRAP_ADMITTED`` override syntax cannot become the roster.
+    """
+    return entries(text)
+
+
+def parse_script_roster(text: str) -> list[str]:
+    """Case ids of the ``BOOTSTRAP_ADMITTED`` default line in pre-split script text.
+
+    For ``hack/ci-eval-pr.sh`` as it stood before 2026-09-15, where the
+    roster was the variable's default. Split the way bench-gate splits the
+    variable (comma or whitespace). Raises ValueError when the text carries no
+    such line, so a caller that hands it a roster file by mistake hears about
+    it rather than getting an empty roster.
     """
     match = SCRIPT_ROSTER_RE.search(text)
-    if match is not None:
-        return [name for name in ROSTER_SEPARATORS_RE.split(match.group(1)) if name]
-    return entries(text)
+    if match is None:
+        raise ValueError("no BOOTSTRAP_ADMITTED default line in the text")
+    return [name for name in ROSTER_SEPARATORS_RE.split(match.group(1)) if name]
 
 
 def presubmit_cases(path: pathlib.Path = PRESUBMIT_CASES_FILE) -> list[str]:
