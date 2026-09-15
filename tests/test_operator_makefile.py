@@ -75,6 +75,13 @@ class DeployContractTest(unittest.TestCase):
             "k8s-operator/scripts/ is gone; the recipe must not resolve there",
         )
 
+    def test_images_check_delegates_to_parent_makefile(self):
+        """images-check delegates to the root Makefile target; verify that
+        `make -n images-check` invokes make -C .. images-check.
+        """
+        recipe = _make_n("images-check")
+        self.assertIn("-C .. images-check", recipe)
+
 
 def _check_img(img, env=None):
     """Run the real check-img target (no cluster needed) and return the result."""

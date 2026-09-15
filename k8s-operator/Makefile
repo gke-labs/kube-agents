@@ -316,6 +316,10 @@ endef
 dev-rebuild-agent: ## Fast local iteration: rebuild and redeploy an agent image (e.g. make dev-rebuild-agent ARGS="platform").
 	@$(MAKE) -C .. dev-rebuild-agent ARGS="$(ARGS)"
 
+.PHONY: images-check
+images-check: ## Verify images.json matches pins and the chart mirrors cleanly (delegates to root).
+	@$(MAKE) -C .. images-check
+
 ##@ Formatting
 
 prettier-check: ## Check Markdown/YAML formatting.
