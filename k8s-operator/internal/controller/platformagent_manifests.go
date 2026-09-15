@@ -1399,6 +1399,24 @@ type managedTerminalConfig struct {
 // outlived a month of rollouts, which nothing here does.
 const shellSandboxEnvLifetimeSeconds = 2592000
 
+// managedDatabaseConfig is the `database` block rendered into the managed scope
+// when the agent pod runs under a runtime class. The key is Hermes' own:
+// hermes_state.resolve_journal_mode reads `database.journal_mode` and
+// apply_wal_with_fallback — shared by every profile's state.db and by kanban.db —
+// creates a fresh database in that mode.
+type managedDatabaseConfig struct {
+	JournalMode string `json:"journal_mode"`
+}
+
+// sqliteJournalModeDelete is the rollback-journal mode Hermes accepts as
+// `database.journal_mode`. Under gVisor the data volume is a 9p gofer mount,
+// which accepts `PRAGMA journal_mode=WAL` but cannot honour WAL's shared-memory
+// and byte-range lock contract, and two databases corrupted in three days on
+// such a mount (#610). Hermes' own DELETE fallback fires only on error strings
+// gVisor never raises, so the operator, which knows the runtime for certain,
+// pins the mode instead.
+const sqliteJournalModeDelete = "delete"
+
 func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) string {
 	agentPlugins = filterValidAgentPlugins(agentPlugins)
 
@@ -1459,6 +1477,16 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		// human telling it to put the value back would be reason to trust the value.
 		// The managed scope is what makes that write have no effect.
 		Terminal *managedTerminalConfig `json:"terminal,omitempty"`
+		// The SQLite journal mode, rendered only when the agent pod has a runtime
+		// class (see sqliteJournalModeDelete). It meets both of this function's
+		// tests. Uniform: the runtime class is a property of the pod, so every
+		// profile's state.db and the shared kanban.db sit on the same 9p mount and
+		// need the same answer. Beyond the agent's repair: the failure is a
+		// corrupted database, which the agent discovers only after its sessions
+		// are already unreadable, and a profile-level key would let one profile
+		// opt back into the mode that corrupts the file every other profile shares
+		// the volume with.
+		Database *managedDatabaseConfig `json:"database,omitempty"`
 	}{}
 
 	// Model. The endpoint every profile in the pod reasons through, and the setting
@@ -1493,6 +1521,20 @@ func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv
 		SSHKey:          shellSandboxClientKeyFilePath(),
 		LifetimeSeconds: shellSandboxEnvLifetimeSeconds,
 		WorkspaceRoot:   shellSandboxDataPath,
+	}
+
+	// Database. The journal mode follows the pod's runtime class, not an env knob
+	// or a filesystem probe: the operator sets the runtime class and so knows
+	// whether the volume is a gofer mount, where a statfs check would be a guess
+	// that also changed behaviour for every FUSE and NFS install. Hermes never
+	// downgrades a database whose header already reads WAL, so the entrypoint's
+	// step 1.7 (deploy/shared/sqlite_journal_migrate.py) converts existing files
+	// once before anything opens them; this leaf is what keeps them that way and
+	// creates new ones in DELETE.
+	if agent.Spec.Deployment != nil && agent.Spec.Deployment.Availability != nil &&
+		agent.Spec.Deployment.Availability.RuntimeClassName != nil &&
+		*agent.Spec.Deployment.Availability.RuntimeClassName != "" {
+		cfg.Database = &managedDatabaseConfig{JournalMode: sqliteJournalModeDelete}
 	}
 
 	cfg.Display.Platforms = map[string]map[string]any{}
