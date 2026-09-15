@@ -59,7 +59,7 @@ Validates the full incident investigation loop from alert ingestion to GitOps PR
 Exercises bidirectional communication through Google Chat:
 
 - Posts a structured test message to the configured Google Chat Space via GCP Pub/Sub and verifies the agent returns the expected calculation or status response.
-- Automatically skips if Google Chat credentials are unconfigured in the execution environment.
+- Fails at once when `CHAT_SPACE_ID` is unset; reads the space back with the service account (app authentication) and falls back to the OTA user credential on a denial.
 
 ---
 
