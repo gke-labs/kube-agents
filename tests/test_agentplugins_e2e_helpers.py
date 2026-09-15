@@ -1,7 +1,8 @@
 """Unit tests for agentplugins_e2e_test helper functions.
 
 Verifies operator deployment name resolution across Helm and Kustomize installations,
-pod selector polling, and deployment rollout existence and retry mechanisms.
+pod selector polling, deployment rollout existence and retry mechanisms, and that
+step 17 leaves the gateway Deployment settled before the suite exits.
 """
 
 import os
@@ -141,6 +142,92 @@ class AgentPluginsE2EHelpersTest(unittest.TestCase):
                 e2e.wait_deployment_generation_change("platform-agent-gateway", min_gen=2, timeout_sec=2)
             self.assertIn("generation did not reach 2", str(ctx.exception))
             mock_get_gen.assert_called_once_with("platform-agent-gateway")
+
+
+class ReconcileAndWaitGenerationTest(unittest.TestCase):
+    """reconcile_and_wait must be able to use a generation captured before the mutation.
+
+    Reading the generation after applying or deleting the CR races the operator: a
+    reconcile that lands first bumps it, and waiting for gen_before + 1 then waits for a
+    second bump that never comes.
+    """
+
+    def test_uses_caller_supplied_generation_without_rereading(self):
+        with patch.object(e2e, "get_deployment_generation") as mock_get_gen, \
+             patch.object(e2e, "wait_deployment_generation_change") as mock_wait_gen, \
+             patch.object(e2e, "wait_deployment_rollout"):
+            e2e.reconcile_and_wait(17)
+
+        mock_get_gen.assert_not_called()
+        mock_wait_gen.assert_called_once_with(e2e.GATEWAY_DEPLOYMENT, min_gen=18)
+
+    def test_reads_generation_when_caller_supplies_none(self):
+        with patch.object(e2e, "get_deployment_generation", return_value=4) as mock_get_gen, \
+             patch.object(e2e, "wait_deployment_generation_change") as mock_wait_gen, \
+             patch.object(e2e, "wait_deployment_rollout"):
+            e2e.reconcile_and_wait()
+
+        mock_get_gen.assert_called_once_with(e2e.GATEWAY_DEPLOYMENT)
+        mock_wait_gen.assert_called_once_with(e2e.GATEWAY_DEPLOYMENT, min_gen=5)
+
+
+class Step17SettlesRolloutTest(unittest.TestCase):
+    """Step 17 is the last step of the suite, so whatever it leaves in flight lands on
+    whichever suite runs next. It must withdraw the plugin and wait for the resulting
+    rollout before returning, on the success path and after a mid-step failure alike.
+    """
+
+    def _patched(self, healed="LINK"):
+        """Patches every cluster-touching helper step 17 calls."""
+        self.calls = []
+        patches = {
+            "log": MagicMock(),
+            "profile_plugin_link": MagicMock(return_value="/plugins/link"),
+            "get_deployment_generation": MagicMock(return_value=7),
+            "apply_kubectl_manifest": MagicMock(),
+            "reconcile_and_wait": MagicMock(
+                side_effect=lambda *a, **k: self.calls.append("reconcile_and_wait")
+            ),
+            "agent_exec": MagicMock(
+                return_value=MagicMock(stdout="STAGED REACHABLE", stderr="")
+            ),
+            "restart_agent_pod": MagicMock(),
+            "agent_exec_until": MagicMock(return_value=healed),
+            "run_kubectl": MagicMock(
+                side_effect=lambda cmd, **k: self.calls.append(" ".join(cmd[:2]))
+            ),
+            "wait_deployment_rollout": MagicMock(
+                side_effect=lambda *a, **k: self.calls.append("wait_deployment_rollout")
+            ),
+        }
+        for name, mock in patches.items():
+            p = patch.object(e2e, name, mock)
+            p.start()
+            self.addCleanup(p.stop)
+        return patches
+
+    def test_withdraws_plugin_and_settles_before_returning(self):
+        """On success the CR is deleted and the rollout it triggers is waited out."""
+        self._patched()
+
+        e2e.step17_verify_link_self_heals_over_a_stale_directory("example/plugin:v1")
+
+        self.assertIn("delete agentplugin", self.calls)
+        # The delete must be followed by a reconcile wait, not left in flight.
+        delete_idx = self.calls.index("delete agentplugin")
+        self.assertIn("reconcile_and_wait", self.calls[delete_idx:])
+        # And the step must not return until the Deployment has settled.
+        self.assertEqual(self.calls[-1], "wait_deployment_rollout")
+
+    def test_settles_rollout_even_when_the_step_fails(self):
+        """A mid-step failure must still leave the Deployment settled for the next suite."""
+        self._patched(healed="STILL-A-DIR")
+
+        with self.assertRaises(AssertionError):
+            e2e.step17_verify_link_self_heals_over_a_stale_directory("example/plugin:v1")
+
+        self.assertIn("delete agentplugin", self.calls)
+        self.assertEqual(self.calls[-1], "wait_deployment_rollout")
 
 
 if __name__ == "__main__":
