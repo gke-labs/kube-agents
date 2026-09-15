@@ -216,6 +216,10 @@ IMAGE_OWNED = frozenset({"governance", "scripts", "skills"})
 # profile plumbing.
 AGENT_POD_ONLY = frozenset(
     {
+        # Read and written in-process on the agent pod through the
+        # capability_criteria MCP tool; a copy here would be a stale one the
+        # shell could read instead (agents/platform/capabilities/README.md).
+        "capabilities",
         "AGENTS.md",
         "CAPABILITIES.md",
         "SETTINGS.md",
