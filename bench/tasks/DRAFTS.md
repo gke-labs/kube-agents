@@ -116,7 +116,7 @@ What has **not** changed is reach. The GSA still sees every cluster in the lease
 
 ## The presubmit probes
 
-The six probes that carry the audit domains in presubmit after the 2026-08-26 recast. Each is a chat-prompted question about the domain's planted defect, graded on the reply (`report_contains`), read-only (no `audit_report.py`, no GitOps-repo write), with cluster-state safeguards wherever the plant is a mutable Kubernetes object. Expected ~150–350s each, on the `cluster-agent-crashloop-debug` shape (142s measured).
+The six probes that carry the audit domains in presubmit after the 2026-08-26 recast. Each is a chat-prompted question about the domain's planted defect, graded on the reply (`report_contains`), read-only (no `audit_report.py`, no GitOps-repo write), with cluster-state safeguards wherever the plant is a mutable Kubernetes object. Expected ~150–350s each, on the `cluster-agent-crashloop-debug` shape (142s measured); measured, `capacity-pinned-pool-probe` runs a median of 540s (p10 248s, p90 1318s over its 1155 presubmit repetitions to 2026-09-15 -- its task header and `unit_cost_hint` carry the figure).
 
 | Domain      | Probe                                    | Question asked                                                                            | Exact objective                           | Safeguard                                      |
 | ----------- | ---------------------------------------- | ----------------------------------------------------------------------------------------- | ----------------------------------------- | ---------------------------------------------- |
