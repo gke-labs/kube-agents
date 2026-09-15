@@ -43,6 +43,7 @@ else
   C_GREEN='\033[92m'
   C_YELLOW='\033[93m'
   C_MAGENTA='\033[95m'
+  # shellcheck disable=SC2034 # palette entry read by the scripts that source this file
   C_BLUE='\033[94m'
   C_RED='\033[91m'
   C_RESET='\033[0m'

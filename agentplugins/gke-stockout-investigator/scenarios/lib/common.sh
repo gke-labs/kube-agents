@@ -93,7 +93,9 @@ GITOPS_REPO="${GITOPS_REPO:-}"
 PLUGIN_NAME="${PLUGIN_NAME:-gkestockoutinvestigator}"
 
 # Zones of the target region, used by scenarios that pin a workload to one zone.
+# shellcheck disable=SC2034 # read by the scenario scripts that source this file
 ZONE_A="${CLUSTER_LOCATION}-b"
+# shellcheck disable=SC2034 # read by the scenario scripts that source this file
 ZONE_B="${CLUSTER_LOCATION}-c"
 
 # Defaults a scenario may override before calling scenario_main.
@@ -628,8 +630,8 @@ apply_workload() {
     # by the time it looks. Autopilot marks the pod Pending and records the
     # provisioning failure within a few tens of seconds.
     info "waiting up to 90s for the pods to go Pending with a scheduling failure"
-    local i pending blocked
-    for i in $(seq 1 18); do
+    local pending blocked
+    for _ in $(seq 1 18); do
         pending="$(kprod get pods -n "$WORKLOAD_NAMESPACE" \
             -l "scenario=${SCENARIO_SLUG}" \
             -o jsonpath='{range .items[?(@.status.phase=="Pending")]}{.metadata.name}{"\n"}{end}' \
@@ -689,8 +691,8 @@ cleanup_workload() {
         # Count controllers, not `all`: the delete above does not wait, so pods and
         # replica sets from the scenario just removed are still terminating and would
         # make an empty namespace look occupied.
-        local left i
-        for i in 1 2 3; do
+        local left
+        for _ in 1 2 3; do
             left="$(kprod get deploy,statefulset,job -n "$WORKLOAD_NAMESPACE" \
                 -o name 2>/dev/null | grep -c . || true)"
             [ "${left:-0}" -eq 0 ] && break

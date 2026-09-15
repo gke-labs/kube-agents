@@ -72,3 +72,11 @@ pyyaml
 # installs cannot drift.
 coverage
 diff-cover
+
+# tests/test_lint_python.py runs ruff over the whole tree with the error-only
+# rule set it declares, and `make lint-python` runs the same command. Unpinned
+# like its neighbours: the rule set is the stable part, and a new ruff that
+# reports a real syntax error or undefined name is reporting a defect. Without
+# it the test skips locally and fails under CI, so a runner that lost the
+# install cannot report the gate green.
+ruff

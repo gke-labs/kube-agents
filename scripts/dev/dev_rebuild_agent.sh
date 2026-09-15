@@ -16,6 +16,7 @@ INSTALLER_DIR="${REPO_ROOT}/scripts/installer"
 # Pointed at the installer helpers rather than at this directory: load_state
 # creates the file when it is absent, and defaulting it from SCRIPT_DIR would
 # leave a stray scripts/dev/vars.sh behind.
+# shellcheck disable=SC2034 # read by the installer's load_state, sourced below
 VARS_FILE="${INSTALLER_DIR}/vars.sh"
 
 # ─── ANSI Colors ──────────────────────────────────────────────────────────────

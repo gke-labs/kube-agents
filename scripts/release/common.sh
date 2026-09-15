@@ -2,7 +2,8 @@
 # Common helper functions for Release Candidate CI/CD automation scripts.
 set -euo pipefail
 
-export REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+export REPO_ROOT
 
 # gke_dns_endpoint_flag, so release automation reaches a cluster over the same
 # endpoint the installer would.
@@ -1091,7 +1092,7 @@ create_stamped_release_commit() {
   local orig_ref
   orig_ref="$(git -C "${repo_dir}" symbolic-ref --short -q HEAD 2>/dev/null || git -C "${repo_dir}" rev-parse HEAD 2>/dev/null || echo "")"
   if [ -n "${orig_ref}" ]; then
-    # shellcheck disable=SC2064
+    # shellcheck disable=SC2064,SC2154 # expand now on purpose; f is the trap's own loop variable
     trap "for f in \"\${candidate_files[@]}\"; do git -C '${repo_dir}' checkout -- \"\$f\" >/dev/null 2>&1 || true; done; git -C '${repo_dir}' checkout '${orig_ref}' >/dev/null 2>&1 || true" RETURN
   fi
 

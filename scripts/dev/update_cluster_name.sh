@@ -15,7 +15,6 @@ C_GREEN="\033[0;32m"
 C_RED="\033[0;31m"
 C_YELLOW="\033[0;33m"
 C_RESET="\033[0m"
-C_BOLD="\033[1m"
 
 print_info() {
   echo -e "${C_YELLOW}[INFO]${C_RESET} $1"
