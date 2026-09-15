@@ -10,15 +10,11 @@ reviewers:
       - jayantid
       - toshiowang
       - dshnayder
-    waw-leads:
-      - fatoshoti
-      - mateuszklinowski
-      - mplakhtiy
     # Mirrors the eval-crew alias in OWNERS_ALIASES: only it can /approve a
     # change to hack/eval/presubmit-cases.txt or hack/eval/blocking-roster.txt
-    # (#1546; hack/OWNERS). Keep the two lists identical. A mixed pull request routes here alone, so a member who
-    # is not a root approver can clear the case or roster half and the rest
-    # still waits on a root approver's /approve.
+    # (#1546; hack/OWNERS). Keep the two lists identical. A mixed pull request
+    # routes here alone, so a member who is not a root approver can clear the
+    # roster half and the rest still waits on a root approver's /approve.
     eval-crew:
       - jayantid
       - lapis2002
@@ -28,12 +24,6 @@ files:
   # You can assign groups defined above as well as GitHub usernames.
   "**":
     - repository-owners # group
-  "k8s-operator/**":
-    - waw-leads
-  ".github/workflows/k8s-operator-test.yml":
-    - waw-leads
-  ".github/workflows/staging-deploy.yml":
-    - waw-leads
   # Listed after "**" so the last match sends these to the only approvers
   # who can clear them. The author is never requested, so eval-crew's own
   # pull requests fall back to the defaults for their lgtm.

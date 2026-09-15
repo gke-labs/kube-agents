@@ -1,9 +1,4 @@
 aliases:
-  waw-leads:
-    - AntonTyb
-    - fatoshoti
-    - mateuszklinowski
-    - mplakhtiy
   # Who approves what runs and what blocks in the presubmit eval gate:
   # hack/eval/presubmit-cases.txt and hack/eval/blocking-roster.txt
   # (hack/OWNERS). The nightly file beside them and the case directories

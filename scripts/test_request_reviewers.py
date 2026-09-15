@@ -36,15 +36,11 @@ CONFIG = {
         "defaults": ["repository-owners"],
         "groups": {
             "repository-owners": ["bradhoekstra", "jayantid", "toshiowang", "dshnayder"],
-            "waw-leads": ["fatoshoti", "mateuszklinowski", "mplakhtiy"],
             "eval-crew": ["jayantid", "lapis2002"],
         },
     },
     "files": {
         "**": ["repository-owners"],
-        "k8s-operator/**": ["waw-leads"],
-        ".github/workflows/k8s-operator-test.yml": ["waw-leads"],
-        ".github/workflows/staging-deploy.yml": ["waw-leads"],
         "hack/eval/presubmit-cases.txt": ["eval-crew"],
         "hack/eval/blocking-roster.txt": ["eval-crew"],
     },
@@ -58,7 +54,6 @@ CONFIG = {
 }
 
 OWNERS = CONFIG["reviewers"]["groups"]["repository-owners"]
-WAW = CONFIG["reviewers"]["groups"]["waw-leads"]
 EVAL_CREW = CONFIG["reviewers"]["groups"]["eval-crew"]
 LIVE_CONFIG = _HERE.parent / rr.DEFAULT_CONFIG_PATH
 
@@ -134,8 +129,8 @@ class GlobTest(unittest.TestCase):
         self.assert_matches("**", "docs/site/src/content/docs/contributing.md")
 
     def test_double_star_does_not_match_a_dot_segment(self):
-        # The dotfile rule, and the reason `.github/workflows/...` needs its own
-        # literal entries in the config: `**` does not reach them.
+        # The dotfile rule: `**` does not reach `.github/workflows/...`, so a
+        # dotfile path is routed only by a literal entry or by the defaults.
         self.assert_no_match("**", ".github/workflows/validate.yml")
         self.assert_no_match("**", ".gitignore")
         self.assert_no_match("k8s-operator/**", "k8s-operator/.golangci.yml")
@@ -207,17 +202,12 @@ class SelectionTest(unittest.TestCase):
         matched = rr.reviewers_by_changed_files(CONFIG, ["README.md"], "author")
         self.assertEqual(matched, OWNERS)
 
-    def test_last_matching_glob_wins(self):
-        # Both `**` and `k8s-operator/**` match, and the later entry replaces
-        # the earlier one rather than adding to it.
-        matched = rr.reviewers_by_changed_files(CONFIG, ["README.md", "k8s-operator/main.go"], "author")
-        self.assertEqual(matched, WAW)
-
     def test_a_literal_dot_entry_still_matches(self):
-        matched = rr.reviewers_by_changed_files(
-            CONFIG, [".github/workflows/k8s-operator-test.yml"], "author"
-        )
-        self.assertEqual(matched, WAW)
+        # The live config names no dotfile path today, but the port has to
+        # honour a literal entry when one exists: `**` cannot stand in for it.
+        config = dict(CONFIG, files={**CONFIG["files"], ".github/workflows/validate.yml": ["eval-crew"]})
+        matched = rr.reviewers_by_changed_files(config, [".github/workflows/validate.yml"], "author")
+        self.assertEqual(matched, EVAL_CREW)
 
     def test_dotfile_only_change_matches_no_glob_and_uses_defaults(self):
         # `**` cannot reach `.github/workflows/validate.yml`, so nothing matches
@@ -288,8 +278,8 @@ class SelectionTest(unittest.TestCase):
 
     def test_fewer_candidates_than_requested_is_not_an_error(self):
         config = dict(CONFIG, options=dict(CONFIG["options"], number_of_reviewers=5))
-        picked = rr.select_reviewers(config, ["k8s-operator/main.go"], "author", rng=random.Random(0))
-        self.assertCountEqual(picked, WAW)
+        picked = rr.select_reviewers(config, ["README.md"], "author", rng=random.Random(0))
+        self.assertCountEqual(picked, OWNERS)
 
     def test_teams_are_split_from_users(self):
         users, teams = rr.split_teams(["bradhoekstra", "team:sre"])

@@ -1,6 +1,6 @@
 """Invariants of the nightly pipeline that only the workflow YAML can carry.
 
-Five of these are failures that would be silent in CI — a green run that did the
+Six of these are failures that would be silent in CI — a green run that did the
 wrong thing — which is why they are pinned here rather than left to review:
 
   * a job pointed at `rc` instead of `nightly` tears down the RC environment,
@@ -11,7 +11,9 @@ wrong thing — which is why they are pinned here rather than left to review:
   * a staging tag shape the redeploy trigger does not match promotes nothing and
     still reports success,
   * a redeploy that deploys the pushed ref's SHA rather than the commit it peels
-    to pulls an image tag nothing ever published.
+    to pulls an image tag nothing ever published,
+  * an optional-suite order that runs `gchat` after `agent-plugin` sends the chat
+    prompt at a gateway the 17-step plugin suite is still rolling.
 """
 
 import fnmatch
@@ -121,6 +123,20 @@ class NightlyPipelineWiringTest(unittest.TestCase):
             if str(step.get("uses", "")).startswith("actions/checkout@")
         )
         self.assertIn(token_step.get("id", "release-token"), checkout["with"]["token"])
+
+    def test_optional_suites_runs_gchat_before_agent_plugin(self):
+        """Running gchat before agent-plugin executes chat E2E on a quiescent cluster
+        before the 17-step AgentPlugins suite repeatedly rolls platform-agent-gateway."""
+        matrix_job = self.jobs["step-3-run-e2e-matrix"]
+        optional_suites = matrix_job["with"]["optional_suites"]
+        suites = [s.strip() for s in optional_suites.split(",")]
+        self.assertIn("gchat", suites)
+        self.assertIn("agent-plugin", suites)
+        self.assertLess(
+            suites.index("gchat"),
+            suites.index("agent-plugin"),
+            f"gchat must run before agent-plugin in optional_suites, got: {optional_suites!r}",
+        )
 
 
 class ConcurrencyGroupTest(unittest.TestCase):

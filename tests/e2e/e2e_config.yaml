@@ -113,7 +113,7 @@ suites:
   # Every nightly test file in one unit, for a hand-dispatched "run the lot".
   # nightly-pipeline.yml does NOT run it as a single suite: it gates the staging
   # promotion on `rc` — the subset with a green run on a real cluster behind it —
-  # and runs `agent-plugin`, `gchat` and `stockout-full` alongside as optional
+  # and runs `gchat`, `agent-plugin` and `stockout-full` alongside as optional
   # coverage. Those three cover the files this suite adds on top of `rc`, so the
   # pipeline still executes everything here; what it does not do is let a file
   # that has never passed decide whether staging moves. Fold one back into the
