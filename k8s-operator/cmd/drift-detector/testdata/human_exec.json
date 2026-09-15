@@ -1,0 +1,47 @@
+{
+  "insertId": "c1d9f0a7-2e64-4f1b-9a35-6be2f0c4d871",
+  "labels": {
+    "authorization.k8s.io/decision": "allow",
+    "authorization.k8s.io/reason": "access granted by IAM permissions."
+  },
+  "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+  "operation": {
+    "first": true,
+    "id": "c1d9f0a7-2e64-4f1b-9a35-6be2f0c4d871",
+    "last": true,
+    "producer": "k8s.io"
+  },
+  "protoPayload": {
+    "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+    "authenticationInfo": {
+      "principalEmail": "engineer@example.com"
+    },
+    "authorizationInfo": [
+      {
+        "granted": true,
+        "permission": "io.k8s.core.v1.pods.exec.create",
+        "resource": "core/v1/namespaces/kubeagents-system/pods/standalone-replay-7d9c8b6f5-xk2mq/exec"
+      }
+    ],
+    "methodName": "io.k8s.core.v1.pods.exec.create",
+    "requestMetadata": {
+      "callerIp": "203.0.113.10",
+      "callerSuppliedUserAgent": "kubectl/v1.36.4 (linux/amd64) kubernetes/bb826b1"
+    },
+    "resourceName": "core/v1/namespaces/kubeagents-system/pods/standalone-replay-7d9c8b6f5-xk2mq/exec",
+    "serviceName": "k8s.io",
+    "status": {
+      "code": 0
+    }
+  },
+  "receiveTimestamp": "2026-09-04T20:44:51.118204773Z",
+  "resource": {
+    "labels": {
+      "cluster_name": "prod-1",
+      "location": "us-east4",
+      "project_id": "example-project"
+    },
+    "type": "k8s_cluster"
+  },
+  "timestamp": "2026-09-04T20:44:41.302887Z"
+}

@@ -1,0 +1,54 @@
+{
+  "insertId": "804a823a-b500-4283-83f6-494ba93d5d39",
+  "labels": {
+    "authorization.k8s.io/decision": "allow",
+    "authorization.k8s.io/reason": "access granted by IAM permissions.",
+    "mutation.webhook.admission.k8s.io/round_0_index_6": "{\"configuration\":\"warden-mutating.config.common-webhooks.networking.gke.io\",\"webhook\":\"warden-mutating.common-webhooks.networking.gke.io\",\"mutated\":false}"
+  },
+  "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+  "operation": {
+    "first": true,
+    "id": "804a823a-b500-4283-83f6-494ba93d5d39",
+    "last": true,
+    "producer": "k8s.io"
+  },
+  "protoPayload": {
+    "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+    "authenticationInfo": {
+      "principalEmail": "engineer@example.com"
+    },
+    "authorizationInfo": [
+      {
+        "granted": true,
+        "permission": "io.k8s.apps.v1.deployments.patch",
+        "resource": "apps/v1/namespaces/kubeagents-system/deployments/standalone-replay"
+      }
+    ],
+    "methodName": "io.k8s.apps.v1.deployments.patch",
+    "request": {
+      "_trimmed": "body removed for the fixture; the detector does not decode it"
+    },
+    "requestMetadata": {
+      "callerIp": "203.0.113.10",
+      "callerSuppliedUserAgent": "kubectl/v1.36.4 (linux/amd64) kubernetes/bb826b1"
+    },
+    "resourceName": "apps/v1/namespaces/kubeagents-system/deployments/standalone-replay",
+    "response": {
+      "_trimmed": "body removed for the fixture; the detector does not decode it"
+    },
+    "serviceName": "k8s.io",
+    "status": {
+      "code": 0
+    }
+  },
+  "receiveTimestamp": "2026-09-04T20:41:13.814718932Z",
+  "resource": {
+    "labels": {
+      "cluster_name": "prod-1",
+      "location": "us-east4",
+      "project_id": "example-project"
+    },
+    "type": "k8s_cluster"
+  },
+  "timestamp": "2026-09-04T20:41:03.889214Z"
+}

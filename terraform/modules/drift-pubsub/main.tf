@@ -44,7 +44,17 @@ locals {
   # service agent behind: in the same sample container-engine-robot accounted
   # for 287 lease writes, which would have inflated the surviving stream by 65%.
   # Matching any *.iam.gserviceaccount.com covers it and every future service
-  # agent without another edit here.
+  # agent that carries the "iam" label. It does not cover the Google-managed
+  # accounts, which do not: the Compute Engine default is
+  # "<number>-compute@developer.gserviceaccount.com", and Cloud Build, App
+  # Engine and the cloudservices agent use "@cloudbuild.", "@appspot." and
+  # "@cloudservices." respectively. Their lease writes therefore survive this
+  # exclusion and reach the topic. That costs volume and nothing else -- the
+  # detector's own classifier matches the whole ".gserviceaccount.com" domain
+  # (gcpServiceAccountSuffix in k8s-operator/cmd/drift-detector/classify.go)
+  # and drops them as automation. Widening the suffix here would cut delivered
+  # volume; it is left alone deliberately, because changing a sink filter
+  # changes what a deployed install receives and belongs in its own change.
   #
   # Kept to a single line on purpose: Cloud Logging treats a newline as an
   # implicit AND, which would break the OR grouping if this were wrapped.

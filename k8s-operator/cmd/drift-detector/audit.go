@@ -41,6 +41,17 @@ const (
 	// ("io.k8s.apps.v1.deployments.patch") into its components. The verb is
 	// the last one.
 	methodNameSeparator = "."
+
+	// statusCodeOK is the google.rpc.Status code for a call that succeeded.
+	// The audit log records attempts, not just successes: a write rejected by
+	// RBAC, refused by an admission webhook, or beaten to the object by
+	// another writer is an entry with a mutating methodName that changed
+	// nothing. Failures are not an edge case -- a 24-hour query for failed
+	// mutating calls on one project returned its full 5000-row limit, so 5000
+	// is a floor and not a total, and 4793 of those were code 10 (ABORTED, a
+	// lost optimistic-concurrency race). Drift is a change that happened, so
+	// the tier filter drops anything but this.
+	statusCodeOK = 0
 )
 
 // errNotKubernetesAudit reports an entry that is not a Kubernetes API audit
@@ -82,6 +93,17 @@ type auditPayload struct {
 	RequestMetadata struct {
 		CallerSuppliedUserAgent string `json:"callerSuppliedUserAgent"`
 	} `json:"requestMetadata"`
+
+	// Status is google.rpc.Status: the outcome of the call. Success is
+	// reported two ways depending on who rendered the JSON -- proto3 drops a
+	// zero-valued field on the wire, while the captures in testdata/ all carry
+	// an explicit "code": 0 -- and both decode to the same zero value here.
+	// That is why the field is a plain struct and not a pointer: there is no
+	// case where absent and zero need telling apart.
+	Status struct {
+		Code    int64  `json:"code"`
+		Message string `json:"message"`
+	} `json:"status"`
 }
 
 // AuditRecord is one mutating Kubernetes API call, decomposed into the fields
@@ -104,8 +126,9 @@ type AuditRecord struct {
 	Verb string
 
 	// UserAgent is the caller-supplied user agent. It is a hint, not evidence:
-	// anything can set it, so T2 classifies on Principal and uses this only to
-	// explain a decision to a human.
+	// anything can set it, so T2 classifies on Principal alone and only prints
+	// this, on the line for a record it forwards. The dropped-record line does
+	// not carry it.
 	UserAgent string
 
 	// Resource identifies the object the call touched.
@@ -120,6 +143,22 @@ type AuditRecord struct {
 
 	// Timestamp is when the API server recorded the call.
 	Timestamp time.Time
+
+	// StatusCode is the google.rpc.Status code the API server returned.
+	// statusCodeOK means the mutation actually took effect; anything else
+	// means the call is in the log but the cluster did not change. See
+	// Succeeded.
+	StatusCode int64
+
+	// StatusMessage is the human-readable half of that status, empty on
+	// success. Carried so a dropped record can say why it was dropped.
+	StatusMessage string
+}
+
+// Succeeded reports whether the call changed the cluster. An audit entry
+// exists for rejected and aborted calls too, and those are not drift.
+func (r AuditRecord) Succeeded() bool {
+	return r.StatusCode == statusCodeOK
 }
 
 // parseAuditEntry decodes one Pub/Sub message body into an AuditRecord.
@@ -167,6 +206,9 @@ func parseAuditEntry(data []byte) (AuditRecord, error) {
 		Project:    entry.Resource.Labels.ProjectID,
 		Location:   entry.Resource.Labels.Location,
 		Timestamp:  entry.Timestamp,
+
+		StatusCode:    entry.ProtoPayload.Status.Code,
+		StatusMessage: entry.ProtoPayload.Status.Message,
 	}, nil
 }
 

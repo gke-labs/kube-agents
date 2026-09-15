@@ -1,0 +1,47 @@
+{
+  "insertId": "4897b84f-253e-4744-a131-0204b1521d1d",
+  "labels": {
+    "authorization.k8s.io/decision": "allow",
+    "authorization.k8s.io/reason": "RBAC: allowed by RoleBinding \"system:anet-manager-role-binding/kube-system\" of Role \"system:anet-manager-role\" to User \"system:anet-controller-manager\""
+  },
+  "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+  "operation": {
+    "first": true,
+    "id": "4897b84f-253e-4744-a131-0204b1521d1d",
+    "last": true,
+    "producer": "k8s.io"
+  },
+  "protoPayload": {
+    "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+    "authenticationInfo": {
+      "principalEmail": "system:anet-controller-manager"
+    },
+    "authorizationInfo": [
+      {
+        "granted": true,
+        "permission": "io.k8s.core.v1.configmaps.patch",
+        "resource": "core/v1/namespaces/kube-system/configmaps/dpv2-fast-start-config"
+      }
+    ],
+    "methodName": "io.k8s.core.v1.configmaps.patch",
+    "requestMetadata": {
+      "callerIp": "203.0.113.10",
+      "callerSuppliedUserAgent": "faststart/v0.0.0 (linux/arm64) kubernetes/$Format/anet-controller-manager/1119e51"
+    },
+    "resourceName": "core/v1/namespaces/kube-system/configmaps/dpv2-fast-start-config",
+    "serviceName": "k8s.io",
+    "status": {
+      "code": 0
+    }
+  },
+  "receiveTimestamp": "2026-09-15T22:57:20.106386764Z",
+  "resource": {
+    "labels": {
+      "cluster_name": "prod-1",
+      "location": "us-east1",
+      "project_id": "example-project"
+    },
+    "type": "k8s_cluster"
+  },
+  "timestamp": "2026-09-15T22:57:18.905239Z"
+}

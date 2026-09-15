@@ -37,6 +37,90 @@ func TestParseFlagsDefaults(t *testing.T) {
 	}
 }
 
+// The classifier flags default to the permissive end: no allowlist, and any
+// domain counts as human. A default that silently narrowed the human test
+// would drop real drift with nothing in the log to say so.
+func TestParseFlagsClassifierDefaults(t *testing.T) {
+	f, err := parseFlags([]string{"--project", "example-project"})
+	if err != nil {
+		t.Fatalf("parseFlags returned error: %v", err)
+	}
+	if f.automationPrincipals != "" {
+		t.Errorf("automationPrincipals = %q, want empty", f.automationPrincipals)
+	}
+	if f.humanDomains != "" {
+		t.Errorf("humanDomains = %q, want empty", f.humanDomains)
+	}
+	if f.logDropped {
+		t.Error("logDropped = true, want false: a line per drop is the whole audit stream")
+	}
+}
+
+func TestParseFlagsClassifierValues(t *testing.T) {
+	f, err := parseFlags([]string{
+		"--project", "example-project",
+		"--automation-principals", "ci-bot@example.com,kubelet-nodepool-bootstrap",
+		"--human-domains", "corp.example",
+		"--log-dropped",
+	})
+	if err != nil {
+		t.Fatalf("parseFlags returned error: %v", err)
+	}
+	if want := "ci-bot@example.com,kubelet-nodepool-bootstrap"; f.automationPrincipals != want {
+		t.Errorf("automationPrincipals = %q, want %q", f.automationPrincipals, want)
+	}
+	if f.humanDomains != "corp.example" {
+		t.Errorf("humanDomains = %q, want corp.example", f.humanDomains)
+	}
+	if !f.logDropped {
+		t.Error("logDropped = false, want true")
+	}
+}
+
+// The two classifier flags are both strings, so transposing them at the
+// NewClassifier call site compiles and vets clean, and every test that builds a
+// Classifier directly still passes while the deployed detector classifies the
+// whole stream wrongly. This drives the wiring from parsed flags instead, which
+// is the only place that mistake is visible.
+func TestNewFilterFromFlagsWiring(t *testing.T) {
+	f, err := parseFlags([]string{
+		"--project", "example-project",
+		"--automation-principals", "ci-bot@example.com",
+		"--human-domains", "corp.example",
+		"--log-dropped",
+	})
+	if err != nil {
+		t.Fatalf("parseFlags returned error: %v", err)
+	}
+	filter := newFilterFromFlags(f)
+
+	if !filter.logDropped {
+		t.Error("logDropped did not reach the filter")
+	}
+
+	for _, principal := range []string{
+		"ci-bot@example.com", // the allowlist: automation
+		"ada@corp.example",   // the configured domain: human, and actionable
+		"mallory@other.test", // a domain, but not a configured one
+	} {
+		filter.Handle(AuditRecord{Principal: principal, StatusCode: statusCodeOK})
+	}
+
+	counts := filter.Counts()
+	if got := counts.ByTier[TierAutomation]; got != 1 {
+		t.Errorf("automation = %d, want 1 -- the allowlist did not reach the classifier", got)
+	}
+	if got := counts.ByTier[TierHuman]; got != 1 {
+		t.Errorf("human = %d, want 1 -- the domain list did not reach the classifier", got)
+	}
+	if got := counts.ByTier[TierUnattributed]; got != 1 {
+		t.Errorf("unattributed = %d, want 1", got)
+	}
+	if counts.Actionable != 1 {
+		t.Errorf("actionable = %d, want 1", counts.Actionable)
+	}
+}
+
 // realMain rejects bad configuration before it builds a client, so these cases
 // need no credentials and no subscription.
 func TestRealMainRejectsBadConfiguration(t *testing.T) {

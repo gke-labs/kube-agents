@@ -1,0 +1,56 @@
+{
+  "insertId": "22b05738-62a2-434b-9e67-692f39ba004e",
+  "labels": {
+    "authentication.kubernetes.io/credential-id": "X509SHA256=2222222222222222222222222222222222222222222222222222222222222222",
+    "authorization.k8s.io/decision": "allow",
+    "authorization.k8s.io/reason": "RBAC: allowed by ClusterRoleBinding \"kubelet-nodepool-bootstrapper\" of ClusterRole \"system:node-bootstrapper\" to User \"kubelet-nodepool-bootstrap\""
+  },
+  "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+  "operation": {
+    "first": true,
+    "id": "22b05738-62a2-434b-9e67-692f39ba004e",
+    "last": true,
+    "producer": "k8s.io"
+  },
+  "protoPayload": {
+    "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+    "authenticationInfo": {
+      "principalEmail": "kubelet-nodepool-bootstrap"
+    },
+    "authorizationInfo": [
+      {
+        "granted": true,
+        "permission": "io.k8s.certificates.v1.certificatesigningrequests.create",
+        "resource": "certificates.k8s.io/v1/certificatesigningrequests/node-csr-hpM6hbesnl8Z0M7FGF_PN6R9fhRs7ySusYK9FwbSF_A"
+      }
+    ],
+    "methodName": "io.k8s.certificates.v1.certificatesigningrequests.create",
+    "request": {
+      "_trimmed": "body removed for the fixture; the detector does not decode it",
+      "_type": "certificates.k8s.io/v1.CertificateSigningRequest"
+    },
+    "requestMetadata": {
+      "callerIp": "203.0.113.10",
+      "callerSuppliedUserAgent": "gke-exec-auth-plugin/v0.0.0 (linux/amd64) kubernetes/$Format"
+    },
+    "resourceName": "certificates.k8s.io/v1/certificatesigningrequests/node-csr-hpM6hbesnl8Z0M7FGF_PN6R9fhRs7ySusYK9FwbSF_A",
+    "response": {
+      "_trimmed": "body removed for the fixture; the detector does not decode it",
+      "_type": "certificates.k8s.io/v1.CertificateSigningRequest"
+    },
+    "serviceName": "k8s.io",
+    "status": {
+      "code": 0
+    }
+  },
+  "receiveTimestamp": "2026-09-15T22:57:15.145334078Z",
+  "resource": {
+    "labels": {
+      "cluster_name": "prod-1",
+      "location": "us-east1",
+      "project_id": "example-project"
+    },
+    "type": "k8s_cluster"
+  },
+  "timestamp": "2026-09-15T22:57:08.216985Z"
+}

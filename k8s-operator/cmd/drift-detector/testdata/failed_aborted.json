@@ -1,0 +1,48 @@
+{
+  "insertId": "c31ecfc1-d3bd-48dc-bb6f-e5d59d73a2d2",
+  "labels": {
+    "authorization.k8s.io/decision": "allow",
+    "authorization.k8s.io/reason": "RBAC: allowed by RoleBinding \"gke-spiffe-controller-uses-leaderelection/kube-system\" of Role \"gke-spiffe-leaderelection\" to User \"system:gke-spiffe-controller\""
+  },
+  "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+  "operation": {
+    "first": true,
+    "id": "c31ecfc1-d3bd-48dc-bb6f-e5d59d73a2d2",
+    "last": true,
+    "producer": "k8s.io"
+  },
+  "protoPayload": {
+    "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+    "authenticationInfo": {
+      "principalEmail": "system:gke-spiffe-controller"
+    },
+    "authorizationInfo": [
+      {
+        "granted": true,
+        "permission": "io.k8s.coordination.v1.leases.create",
+        "resource": "coordination.k8s.io/v1/namespaces/kube-system/leases/gke-spiffe-controller-c4afa9e1-2626-4975-903d-57c6936e78f9"
+      }
+    ],
+    "methodName": "io.k8s.coordination.v1.leases.create",
+    "requestMetadata": {
+      "callerIp": "203.0.113.10",
+      "callerSuppliedUserAgent": "gke_spiffe_controller/v0.0.0 (linux/amd64) kubernetes/$Format"
+    },
+    "resourceName": "coordination.k8s.io/v1/namespaces/kube-system/leases/gke-spiffe-controller-c4afa9e1-2626-4975-903d-57c6936e78f9",
+    "serviceName": "k8s.io",
+    "status": {
+      "code": 10,
+      "message": "leases.coordination.k8s.io \"gke-spiffe-controller-c4afa9e1-2626-4975-903d-57c6936e78f9\" already exists"
+    }
+  },
+  "receiveTimestamp": "2026-09-15T22:57:18.870448354Z",
+  "resource": {
+    "labels": {
+      "cluster_name": "prod-1",
+      "location": "asia-east1",
+      "project_id": "example-project"
+    },
+    "type": "k8s_cluster"
+  },
+  "timestamp": "2026-09-15T22:57:18.027049Z"
+}

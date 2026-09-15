@@ -1,0 +1,51 @@
+{
+  "insertId": "d8ab2ed7-dabc-4b9b-94e4-8e61c24fe8fa",
+  "logName": "projects/example-project/logs/cloudaudit.googleapis.com%2Factivity",
+  "operation": {
+    "first": true,
+    "id": "d8ab2ed7-dabc-4b9b-94e4-8e61c24fe8fa",
+    "last": true,
+    "producer": "k8s.io"
+  },
+  "protoPayload": {
+    "@type": "type.googleapis.com/google.cloud.audit.AuditLog",
+    "authenticationInfo": {},
+    "authorizationInfo": [
+      {
+        "permission": "io.k8s.core.templates.preview.create",
+        "resource": "core/templates/preview"
+      }
+    ],
+    "methodName": "io.k8s.core.templates.preview.create",
+    "requestMetadata": {
+      "callerIp": "203.0.113.10",
+      "callerSuppliedUserAgent": "Mozilla/5.0 (compatible; KimiBot/1.0; +https://kimi.ai/)"
+    },
+    "resourceName": "core/templates/preview",
+    "response": {
+      "@type": "core.k8s.io/v1.Status",
+      "apiVersion": "v1",
+      "code": 401,
+      "kind": "Status",
+      "message": "Unauthorized",
+      "metadata": {},
+      "reason": "Unauthorized",
+      "status": "Failure"
+    },
+    "serviceName": "k8s.io",
+    "status": {
+      "code": 16,
+      "message": "Unauthorized"
+    }
+  },
+  "receiveTimestamp": "2026-09-15T19:53:03.348957496Z",
+  "resource": {
+    "labels": {
+      "cluster_name": "prod-1",
+      "location": "us-east1",
+      "project_id": "example-project"
+    },
+    "type": "k8s_cluster"
+  },
+  "timestamp": "2026-09-15T19:53:00.533800Z"
+}
