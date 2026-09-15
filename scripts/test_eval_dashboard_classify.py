@@ -249,6 +249,21 @@ class StormAndSetupTest(unittest.TestCase):
         self.assertEqual(verdict["do"], classify.DO_SETUP)
         self.assertFalse(classify_run(target, [target])["matches_incident"])
 
+    def test_a_conflicted_merge_is_the_branch_s_own_and_says_rebase(self):
+        # #1608: the same zero-task FAILURE shape, but the run page must not
+        # send the author to /retest -- that re-runs the same merge.
+        target = dict(run(1, 1, T0, minutes=3, result="FAILURE"), merge_conflict=True)
+        self.assertTrue(classify.is_merge_conflict(target))
+        self.assertFalse(classify.is_setup_death(target))
+        verdict = classify_run(target, [target], health_at=SETUP)
+        self.assertEqual((verdict["verdict"], verdict["setup_death"], verdict["cases"]), ("red", False, []))
+        self.assertEqual(verdict["do"], classify.DO_MERGE_CONFLICT)
+        # A setup-death outage running at the same time is not this run's.
+        self.assertFalse(verdict["matches_incident"])
+        # False and absent both stay setup deaths.
+        for other in ({"merge_conflict": False}, {}):
+            self.assertTrue(classify.is_setup_death(dict(run(1, 1, T0, minutes=3, result="FAILURE"), **other)))
+
     def test_a_lost_pod_is_run_level_and_never_a_setup_death(self):
         # The build node went away (#1478): zero tasks, FAILURE, no build
         # log, NodeNotReady -- at any duration, including under five minutes.

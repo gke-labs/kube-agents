@@ -74,14 +74,23 @@ repetitions lost to 429s or empty records across 3+ pull requests among the
 runs that finished in the last 2 hours, #1225 / #1214), or setup deaths (3+ runs
 that concluded `FAILURE` under 5 minutes with no tasks, on 2+ pull requests, in
 2 hours, #1172; an aborted zero-task run is a superseded push). A zero-task run
-is either a lost pod or a setup death, never both: a lost pod is never a setup
-death, whatever its duration. When more than one condition fires, the order
+is at most one of a lost pod, a conflicted merge (below) and a setup death, in
+that order: a lost pod is never a setup death, whatever its duration. When more
+than one condition fires, the order
 above decides which one the message carries; the others stay in the evidence.
 For a storm, retest after the time the message gives; for lost pods, once new
 jobs are progressing.
 
+A pull request that will not merge into `main` dies in the same seconds with
+no tasks and is not a setup death either (`merge_conflict` in SCHEMA.md,
+#1608): the fix is the author's rebase, so it is neither an outage nor a
+reason to retest. It is counted nowhere — not green, not red, not infra — and
+the run page says to rebase.
+
 A run collected before the collector recorded how a build ended (SCHEMA.md,
-`has_build_log`, `pod_*`) is unknown and is never a lost pod.
+`has_build_log`, `pod_*`) is unknown and is never a lost pod. An unknown
+`merge_conflict` defaults the other way and reads as a setup death, which is
+what keeps the replay fixtures cut before the field valid.
 
 **GREEN** — none of the above. No message of its own beyond the recovery that
 announces it; the daily digest carries the last 24 hours' runs, greens,
@@ -205,8 +214,8 @@ Ran 128 min before the node went away · build log
 While `health.json`'s condition is `lost_pods` the box adds "part of a
 build-cluster event: N runs on M PRs" (below the 8-run event bar, "one of N
 runs on M PRs that lost their build node") and the incident brief link. Prow's
-build-log page shows the pod's events. Setup deaths stay silent: a clone
-failure is usually the branch's own merge conflict, and the build log says so.
+build-log page shows the pod's events. Setup deaths and conflicted merges stay
+silent; the build log says which it was.
 
 The comment starts with a hidden marker (`<!-- smoke-gate-comment -->`); a
 later red on the same pull request edits it in place, and a build already

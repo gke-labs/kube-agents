@@ -112,7 +112,7 @@ record. It enters the roster when the lettered-options bar is settled and it has
 record.
 
 Every case that is not in the presubmit runs in the nightly, since 2026-09-15 including
-the eight that used to wait commented out in the script (the reasons each cannot take a
+the nine that used to wait commented out in the script (the reasons each cannot take a
 presubmit seat yet are beside its line in `hack/eval/nightly-cases.txt`). A new case lands
 there by default and earns its presubmit seat, and then its roster seat, on the record
 the nightly builds ([`docs/designs/bench-case-format.md`](designs/bench-case-format.md),

@@ -18,7 +18,8 @@ resolved best-effort through `gh`), `runs[].tier` / `runs[].job` (which job
 produced the run: the presubmit gate, or the nightly periodic below),
 `runs[].has_build_log` plus the `runs[].pod_*` trio (how the build ended,
 from Prow's podinfo.json -- read only for a build that looks like a lost
-pod, below) and `releases[]` (release-candidate eval runs, below).
+pod, below), `runs[].merge_conflict` (below) and `releases[]`
+(release-candidate eval runs, below).
 
 Two tiers, one schema. The presubmit (pull-kube-agents-smoke-test) runs the
 gate matrix on every pull request; the nightly periodic
@@ -37,6 +38,11 @@ and is indistinguishable from a clone failure without the pod's last event.
 So when a build has no build log, or concluded FAILURE with no tasks,
 podinfo.json is read as well -- one extra object per such build, none for a
 build that ran -- and the pod's phase, node and last event are recorded.
+
+A pull request that will not merge into main leaves the same zero-task
+FAILURE (2026-09-15: #1569, #1572, #1575, reported as an infrastructure
+degradation; #1608). clone-records.json is read for those builds too, and
+`merge_conflict` says which of the two it was.
 
 Release candidates are collected separately and land in `releases[]`, never
 in `runs[]`. post-kube-agents-eval-rc drives the same hack/ci-eval-pr.sh, so
@@ -220,6 +226,17 @@ INFRA_FAILURE_MARKER = "KUBE_AGENTS_INFRA_FAILURE"
 # the health adjudicator needs to tell a lost pod from a clone failure.
 PODINFO_FILE = "podinfo.json"
 BUILD_LOG_FILE = "build-log.txt"
+# Prow's clone-records.json: `[{refs, commands[], failed}]`. Read for the
+# zero-task FAILURE builds, to separate a pull request that would not merge
+# into its base from a setup crash.
+CLONE_RECORDS_FILE = "clone-records.json"
+# The clonerefs command that merges the pull request into the base ref.
+# Spaced: an unspaced needle also matches a path ending in "git".
+CLONE_MERGE_COMMAND = " git merge "
+# git prints it once per conflicted path. Required, because a merge can also
+# fail on a full disk or a broken workspace -- a build-cluster outage, which
+# must stay a setup death rather than being charged to the author.
+CLONE_CONFLICT_MARKER = "CONFLICT"
 # Prow's uploader container. A pod the kubelet stopped reporting on is
 # frozen with its sidecar `running`, and nothing ever uploaded a log; every
 # other sidecar state means a log exists somewhere -- `terminated` uploaded
@@ -507,6 +524,37 @@ def parse_podinfo(text: str | None) -> dict | None:
     }
 
 
+def parse_clone_records(text: str | None) -> bool | None:
+    """Whether the clone failed on the merge, from clone-records.json text.
+
+    True only for a record that carries pull requests, failed, and whose
+    merge command reported a conflict. A base-ref clone that fails, a merge
+    record that failed earlier on a fetch, and a merge that failed without a
+    conflict are all False: those are the pool's problem, not the author's.
+    None when there is no parseable document."""
+    if text is None:
+        return None
+    try:
+        records = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(records, list):
+        return None
+    conflict = False
+    for record in records:
+        if not isinstance(record, dict) or not record.get("failed"):
+            continue
+        refs = record.get("refs") if isinstance(record.get("refs"), dict) else {}
+        if not refs.get("pulls"):
+            continue
+        for command in record.get("commands") or []:
+            if not isinstance(command, dict) or not command.get("error"):
+                continue
+            if CLONE_MERGE_COMMAND in str(command.get("command") or "") and CLONE_CONFLICT_MARKER in str(command.get("output") or ""):
+                conflict = True
+    return conflict
+
+
 def build_run(
     build_id: str,
     read,
@@ -581,6 +629,14 @@ def build_run(
             ended = {"has_build_log": True}
         else:
             print(f"warning: build {build_id}: no build-log.txt and no readable podinfo.json; how it ended is unknown", file=sys.stderr)
+        # Second read, for the zero-task FAILURE subset: that is also the
+        # shape a conflicted merge leaves. A pod that uploaded no log
+        # uploaded no clone record either, so skip it rather than spend a
+        # round trip per lost pod on a build-cluster event.
+        if zero_task_failure and ended.get("has_build_log") is not False:
+            conflict = parse_clone_records(read(CLONE_RECORDS_FILE))
+            if conflict is not None:
+                ended["merge_conflict"] = conflict
     else:
         ended = {"has_build_log": True}
 
@@ -1069,8 +1125,8 @@ def _gcs_reader(base: str, gsutil: str):
     """A build_run/build_release reader over one GCS build directory.
 
     Caches per file: build_run asks for finished.json, started.json and
-    build-log.txt (and podinfo.json for a build that looks like a lost pod),
-    and build_release re-asks for the log. A failed read is not cached, so
+    build-log.txt (plus podinfo.json and clone-records.json for a build that
+    ended with no tasks), and build_release re-asks for the log. A failed read is not cached, so
     build_run's retry of the log is a real second attempt.
     """
     cache: dict[str, str] = {}

@@ -39,18 +39,19 @@
 # SERIAL at three repetitions: the eighteen-case presubmit (~211min), the
 # two tofu incumbents (~106min, #1218), the four audit-shaped recasts hinted
 # at 900s in unit_cost_hint (~190min with the probe-shaped fifth), and
-# knowledge-grounding-sources-probe (~25-45min, #945). The eight cases that
-# joined on 2026-09-15 add ~115min: seven are deployer: noop and
-# probe-shaped (~200s a repetition, ~10min each at three), and
-# fleet-cost-idle-pool is a full cost audit priced with the 900s audit band
-# (~45min). Thirty-five cases, ~647-667min serial. The periodic runs at
-# 00:00 UTC -- 8 PM EDT, after the working day's presubmit herd -- with a
-# 480m deadline, EVAL_TASK_PARALLELISM=6 and EVAL_REPETITIONS at its default
-# 3 (#1491). At the ~1.15x the presubmit realised on whole-job wall clock at
-# parallelism 4 under daytime quota contention that would be ~560-580min,
-# over the deadline; 480m holds only if the nightly, alone on the model quota
-# at that hour and two lanes wider, realises ~1.4x or better, which is
-# priced, not measured. The first nights after this change measure it:
+# knowledge-grounding-sources-probe (~25-45min, #945). 2026-09-15 added
+# eleven: #1079's two (chat-routing-board-read ~10min, pdb-remediation-pr
+# ~63min at its 1250s hint) and the nine this decision moved here, of which
+# eight are deployer: noop and probe-shaped (~200s a repetition, ~10min each
+# at three) and fleet-cost-idle-pool is a full cost audit priced with the
+# 900s audit band (~45min). Thirty-eight cases, ~730-750min serial. The
+# periodic runs at 00:00 UTC -- 8 PM EDT, after the working day's presubmit
+# herd -- with a 480m deadline, EVAL_TASK_PARALLELISM=6 and EVAL_REPETITIONS
+# at its default 3 (#1491). At the ~1.15x the presubmit realised on
+# whole-job wall clock at parallelism 4 under daytime quota contention that
+# would be ~635-650min, over the deadline; 480m holds only if the nightly,
+# alone on the model quota at that hour and two lanes wider, realises ~1.55x
+# or better, which is priced, not measured. The first nights after this change measure it:
 # record the wall clock and any truncation on #1491, and if the deadline
 # bites, the lever is the periodic's timeout or this list's tail, in that
 # order. A deadline kill is survivable by design -- the cost-hinted queue
@@ -111,10 +112,26 @@
 # skill, so it grades the silence side only and earns its record here.
 ./tasks/cluster-agent-stalled-controller-healthy-silence/task.yaml
 
+# #1023's remediation and chat-and-routing second cases (#1079), nightly
+# from the start (2026-09-15) rather than presubmit: the presubmit seats stay
+# with the probes, and the record the nightly builds here is what a later
+# blocking-roster edit cites (#1568). Both measured in the authoring pull
+# request's presubmit runs before the move:
+#   -- chat-routing-board-read: 9/9 across builds 2094517532634386432,
+#      2094843196214349824 and 2099539376672346112 (11-94s agent latency;
+#      the default 200s hint fits).
+#   -- pdb-remediation-pr: 7/9 across the same builds; the two misses are
+#      #1097 (delegation slot) and #1590 (submit-suggestion in the sandbox).
+#      980-1929s a repetition on 2026-09-14; priced at 1250s in
+#      unit_cost_hint.
+./tasks/chat-routing-board-read/task.yaml
+./tasks/pdb-remediation-pr/task.yaml
+
 # ── Moved here 2026-09-15 from the commented-out state (#1546, #1564) ───────
-# Each carries the blocker that kept it parked. None was activatable as a
-# presubmit seat then and none is now; what changed is where an unproven
-# case waits -- here, building a record, instead of in a comment.
+# Nine cases; each carries the blocker that kept it parked. None was
+# activatable as a presubmit seat then and none is now; what changed is
+# where an unproven case waits -- here, building a record, instead of in a
+# comment.
 
 # Blocker: the agent, not the case (#982). On 2026-08-26 the agent read the
 # cluster, changed nothing (all three safeguards green) and misdiagnosed: it
@@ -133,11 +150,15 @@
 # nightly record.
 ./tasks/obtainability-refusal-direct-mutation/task.yaml
 
-# Blocker: A2 (bench/tasks/DRAFTS.md). AGENT_SERVICE_NAME in the script is
-# one global target, so every case reaches the platform agent; this scenario
-# needs the chat front door and fails its delegation objective on a correct
-# system until the harness can target an agent per case. It costs no domain
-# coverage: the two kanban probes already cover chat-and-routing.
+# Blocker: validation, not routing. AGENT_SERVICE_NAME in the script is one
+# global target, and the 2026-08-31 measurement (chat-routing-board-read's
+# activating run, build 2094517532634386432) settled that the endpoint serves
+# the front-door profile -- the one this scenario needs -- so A2 proper
+# (targeting a profile OTHER than the endpoint's) holds no case by itself
+# (bench/tasks/DRAFTS.md, A2). What holds a presubmit seat is that it had
+# never been run (`validated: false`) and its delegation objective rides the
+# worker round trip whose dropped results #1097 is investigating. It costs no
+# domain coverage: the two kanban probes already cover chat-and-routing.
 ./tasks/chat-routing-fleet-question/task.yaml
 
 # Blocker: A3 (bench/tasks/DRAFTS.md), a calendar. The SOP-faithful cost
@@ -151,16 +172,22 @@
 # shape, unmeasured: priced with the 900s band in unit_cost_hint.
 ./tasks/fleet-cost-idle-pool/task.yaml
 
-# Blocker: #1254, for all three fleet-upgrade-verification cases (#1343
-# Phases 1-3: #1365, #1410, #1411). #1254 is the open issue on
+# Blocker: #1254, for all four fleet-upgrade-verification cases (#1343
+# Phases 1-4: #1365, #1410, #1411, #1412). #1254 is the open issue on
 # upgrades-lagging-master-probe: a delegated run's acknowledgement graded as
-# the final answer on unrelated pull requests. These read the same final
-# answer from the same version-laggard fixture, so they could not be watched
-# to pass and fail while it stands; the nightly record will show it. All
-# three `validated: false`; none needs a change to run.
+# the final answer on unrelated pull requests. The first three read the same
+# final answer from the same version-laggard fixture, so they could not be
+# watched to pass and fail while it stands; the nightly record will show it.
+# The fourth, the deprecation scan of the linked GitOps repository, was held
+# with them by the maintainer's call on the #1412 review; its eval loop was
+# not run because its author's only install linked no GitOps repository,
+# and the eval projects link their *-infra repositories as managed_repos, so
+# the nightly is its first observed run on a fleet. All four
+# `validated: false`; none needs a change to run.
 ./tasks/upgrades-fleet-version-table/task.yaml
 ./tasks/upgrades-fleet-rollout-stall/task.yaml
 ./tasks/upgrades-fleet-readiness-exclusion/task.yaml
+./tasks/upgrades-api-deprecation-clean-repo/task.yaml
 
 # Blocker: never run (`validated: false`). The refusal variant of cluster
 # debugging: its compliant answer is a pull request on the eval GitOps repo,

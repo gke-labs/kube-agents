@@ -196,6 +196,16 @@ the same layout and is collected from the moment it starts running.
   over by `--merge-with` keep whatever they have (older documents have
   none).
 
+- `merge_conflict` — **optional, additive**: `true` when the zero-task
+  `FAILURE` was a pull request that would not merge into its base rather than
+  a setup crash (#1608). One read of `clone-records.json`, for the zero-task
+  `FAILURE` subset of the builds `podinfo.json` is read for, and skipped when
+  that read already said no log was uploaded: `true` when a record carrying
+  `pulls` has `failed: true` and a `git merge` command that both errored and
+  printed `CONFLICT`. A merge that failed any other way is `false` — a full
+  disk fails the merge too, and that is the pool's problem. Absent means
+  unknown and reads as a setup crash, as it did before the field existed.
+
 A truncated log yields a **partial run** (fewer tasks, fallback duration),
 never an error. A task line whose name matches nothing under `bench/tasks/`
 on the current checkout still parses; only its domain lookup degrades (see
@@ -351,6 +361,11 @@ what the renderer does with them.
   never as a setup death, and `gate_comment.py` leaves the one-line "run
   lost" comment on its pull request. Absent fields make none of that
   happen.
+- `runs[].merge_conflict` — `true` makes the same zero-task `FAILURE` the
+  branch's own: `classify.py` verdicts it `red` with a rebase as the `do`,
+  and `health.py` excludes it from `setup_deaths` and `infra_reds`.
+  `gate_comment.py` does not read it; no comment is left either way.
+  Absent reads as a setup crash.
 
 ### `coverage` — from `docs/designs/domains.yaml`
 
@@ -408,7 +423,7 @@ what the renderer does with them.
 - `--nightly-job <name>` — the `job` recorded on nightly runs; default
   derived from the prefix.
 - `--from-dir <dir>` — local `<build_id>/` subdirectories with the same
-  three files; the offline/testing path. Its runs are the presubmit with
+  files; the offline/testing path. Its runs are the presubmit with
   `job: null`.
 - `--rc-glob <gs glob>` (repeatable) / `--rc-from-dir <dir>` — the same two
   shapes for `post-kube-agents-eval-rc`, collected into `releases[]` rather
@@ -676,12 +691,14 @@ token observed in the wild (`pass`, `fail`, `infra`, `blocked`):
 zero-task shapes the health adjudicator has to tell apart. `started.json` /
 `finished.json` are verbatim; `podinfo.json` is trimmed to the pod's
 metadata, node, phase, container states and events (the values are real);
-PR 1446's build log keeps the clone header and the failing tail:
+PR 1446's build log keeps the clone header and the failing tail, and its
+`clone-records.json` keeps every field the parser reads, with only the long
+`git` transcripts in `output` cut short:
 
-| build               | why it is here                                                                                    |
-| ------------------- | ------------------------------------------------------------------------------------------------- |
-| 2098383791838990336 | PR 1118 — node went NotReady 2h08m in; no build-log.txt; `has_build_log: false`                   |
-| 2098418565454499840 | PR 1446 — clone failed (merge conflict) in 0 s; log present, last event `Started`, phase `Failed` |
+| build               | why it is here                                                                                                             |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| 2098383791838990336 | PR 1118 — node went NotReady 2h08m in; no build-log.txt; `has_build_log: false`                                            |
+| 2098418565454499840 | PR 1446 — clone failed (merge conflict) in 0 s; log and `clone-records.json` present, last event `Started`, phase `Failed` |
 
 `testdata_rc/` holds one **real** `post-kube-agents-eval-rc` build — the
 release-candidate job, which is a postsubmit, so its `started.json` carries no

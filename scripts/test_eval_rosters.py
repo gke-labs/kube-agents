@@ -8,7 +8,7 @@ entry raises rather than being skipped, because the shell stops the job on
 it. The contents: the presubmit file and the blocking roster hold exactly the
 sets the script carried at the split -- what runs on every pull request and
 what blocks did not move -- and the nightly file holds the script's nightly
-array plus the eight cases the TASKS array held commented out, which the
+array plus the nine cases the TASKS array held commented out, which the
 same decision moved into the nightly (#1546, #1564). A later roster change
 edits the expected sets here in the same pull request; that is the point of
 pinning them, since the files are what the eval-crew rule in hack/OWNERS
@@ -30,7 +30,7 @@ import eval_rosters
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
 
-# The TASKS array's uncommented entries at the split (main at 33344683), in
+# The TASKS array's uncommented entries at the split (main at 8263e7fd), in
 # order: the presubmit matrix, eighteen cases.
 PRESUBMIT_AT_SPLIT = [
     "reliability-pdb-probe",
@@ -65,7 +65,7 @@ ROSTER_AT_SPLIT = [
     "cluster-agent-crashloop-evidence-chain",
     "agent-kanban-smoke",
 ]
-# NIGHTLY_TASKS at the split, in order: nine cases.
+# NIGHTLY_TASKS at the split, in order: eleven cases.
 NIGHTLY_AT_SPLIT = [
     "obtainability-planted-pdb",
     "stockout-pinned-pool",
@@ -76,8 +76,10 @@ NIGHTLY_AT_SPLIT = [
     "autoops-warning-event-triage",
     "knowledge-grounding-sources-probe",
     "cluster-agent-stalled-controller-healthy-silence",
+    "chat-routing-board-read",
+    "pdb-remediation-pr",
 ]
-# The eight cases TASKS held commented out at the split, moved into the
+# The nine cases TASKS held commented out at the split, moved into the
 # nightly by the same decision. The two commented-out cases NOT here --
 # obtainability-declared-intent-no-finding (#1341) and vcs-history-only-fact
 # (#1253) -- have no fixture at all and wait in the validator's
@@ -90,6 +92,7 @@ MOVED_TO_NIGHTLY = [
     "upgrades-fleet-version-table",
     "upgrades-fleet-rollout-stall",
     "upgrades-fleet-readiness-exclusion",
+    "upgrades-api-deprecation-clean-repo",
     "cluster-agent-crashloop-fix-request",
 ]
 

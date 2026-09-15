@@ -1603,6 +1603,9 @@ unit_cost_hint() {
     upgrade-readiness-lagging-cluster | consistency-drift-outlier) echo 900 ;;
     fleet-cost-idle-pool) echo 900 ;;
     compliance-rbac-overgrant | rca-remediation-pr) echo 700 ;;
+    # Nightly-only. Measured 980-1929s across build 2099539376672346112's
+    # three repetitions (267-559s in August); median of the September run.
+    pdb-remediation-pr) echo 1250 ;;
     consistency-authorized-networks-probe) echo 300 ;;
     # Nightly-only since 2026-09-09. Median of its first three measured
     # repetitions (615/715/166s, build 2097362391401500672); the 200s default

@@ -150,5 +150,5 @@
 #   (obtainability-planted-pdb, stockout-pinned-pool,
 #   upgrade-readiness-lagging-cluster, consistency-drift-outlier), each
 #   domain covered by its probe above; obtainability-direct-query,
-#   superseded here by reliability-pdb-probe; and on 2026-09-15 the eight
+#   superseded here by reliability-pdb-probe; and on 2026-09-15 the nine
 #   cases this file's predecessor held commented out.

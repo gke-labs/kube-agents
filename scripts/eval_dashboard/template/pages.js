@@ -845,9 +845,19 @@ function caseCard(run, c) {
     `<div class="links">${url ? `<a href="${esc(url)}">transcript (rep 1)</a>` : ""}${log ? `<a href="${esc(log)}">build log</a>` : ""}<a href="${esc(caseHref(c.case))}">this case's history</a></div></div>`;
 }
 
+// classify.py's run-level `do` for a run with no cases, as "<imperative>.
+// <why>." Bolding its own first sentence rather than prefixing one is what
+// lets the advice differ: a conflicted merge says rebase, not retest (#1608).
+function runDoHtml(text) {
+  const cut = text.indexOf(". ");
+  const lead = cut < 0 ? text : text.slice(0, cut + 1);
+  return `<li><b>${esc(lead)}</b>${cut < 0 ? "" : " " + esc(text.slice(cut + 2))}</li>`;
+}
+
 function whatToDoHtml(run) {
   const items = [];
-  if (run.setup_death || (!measured(run) && run.verdict === "infra")) items.push("<li><b>Retest.</b> " + esc(run.do || "Nothing ran, so nothing here is about your change.") + "</li>");
+  if (!measured(run) && run.do) items.push(runDoHtml(run.do));
+  else if (run.setup_death || (!measured(run) && run.verdict === "infra")) items.push("<li><b>Retest.</b> Nothing ran, so nothing here is about your change.</li>");
   else if (!measured(run) && run.verdict === "green") items.push("<li><b>Nothing.</b> The gate revalidated this branch's earlier green run.</li>");
   else if (!measured(run)) items.push("<li><b>Read the build log.</b> The failure is before the eval loop; a broken image build or deploy on this branch looks like this.</li>");
   else if (run.verdict === "green") items.push("<li><b>Nothing.</b> This run is green.</li>");
