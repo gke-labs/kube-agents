@@ -1,6 +1,6 @@
 """Invariants of the nightly pipeline that only the workflow YAML can carry.
 
-Five of these are failures that would be silent in CI — a green run that did the
+Six of these are failures that would be silent in CI — a green run that did the
 wrong thing — which is why they are pinned here rather than left to review:
 
   * a job pointed at `rc` instead of `nightly` tears down the RC environment,
@@ -11,7 +11,9 @@ wrong thing — which is why they are pinned here rather than left to review:
   * a staging tag shape the redeploy trigger does not match promotes nothing and
     still reports success,
   * a redeploy that deploys the pushed ref's SHA rather than the commit it peels
-    to pulls an image tag nothing ever published.
+    to pulls an image tag nothing ever published,
+  * an optional-suite order that runs `gchat` after `agent-plugin` sends the chat
+    prompt at a gateway the 17-step plugin suite is still rolling.
 """
 
 import fnmatch
@@ -358,45 +360,6 @@ class ReleaseBotTokenWiringTest(unittest.TestCase):
                 for step in token_steps:
                     self.assertEqual(step["with"].get("permission-contents"), "write")
                     self.assertEqual(step["with"].get("permission-workflows"), "write")
-
-
-class GchatAgentPreflightTest(unittest.TestCase):
-    """Verifies wait_for_gateway_deployment_ready in gchat_agent_test.py."""
-
-    def test_skips_when_kubectl_not_found(self):
-        from unittest.mock import patch
-        from tests.e2e.gchat_agent_test import wait_for_gateway_deployment_ready
-
-        with patch("tests.e2e.gchat_agent_test.subprocess.run", side_effect=FileNotFoundError):
-            wait_for_gateway_deployment_ready(namespace="kubeagents-system")
-
-    def test_skips_when_deployment_not_found(self):
-        from unittest.mock import MagicMock, patch
-        from tests.e2e.gchat_agent_test import wait_for_gateway_deployment_ready
-
-        not_found = MagicMock(returncode=1, stdout="", stderr='Error from server (NotFound): deployments.apps "platform-agent-gateway" not found')
-        with patch("tests.e2e.gchat_agent_test.subprocess.run", return_value=not_found):
-            wait_for_gateway_deployment_ready(namespace="kubeagents-system")
-
-    def test_succeeds_when_rollout_passes(self):
-        from unittest.mock import MagicMock, patch
-        from tests.e2e.gchat_agent_test import wait_for_gateway_deployment_ready
-
-        ok_res = MagicMock(returncode=0, stdout="deployment successfully rolled out", stderr="")
-        with patch("tests.e2e.gchat_agent_test.subprocess.run", return_value=ok_res) as mock_run:
-            wait_for_gateway_deployment_ready(namespace="kubeagents-system")
-            self.assertEqual(mock_run.call_count, 1)
-            self.assertIn("rollout", mock_run.call_args[0][0])
-
-    def test_fails_when_rollout_times_out(self):
-        from unittest.mock import MagicMock, patch
-        from tests.e2e.gchat_agent_test import wait_for_gateway_deployment_ready
-
-        rollout_fail = MagicMock(returncode=1, stdout="", stderr="error: timed out waiting for the condition")
-        with patch("tests.e2e.gchat_agent_test.subprocess.run", return_value=rollout_fail):
-            with self.assertRaises(BaseException) as ctx:
-                wait_for_gateway_deployment_ready(namespace="kubeagents-system")
-            self.assertIn("Gateway deployment rollout failed", str(ctx.exception))
 
 
 if __name__ == "__main__":

@@ -16,6 +16,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+import pytest
+
 try:
     import google.auth
     from google.auth.credentials import Credentials
@@ -29,14 +31,6 @@ except ImportError:
     UserCredentials = Any  # type: ignore
     Resource = Any  # type: ignore
     HttpError = Exception  # type: ignore
-try:
-    import pytest
-except ImportError:
-    class _DummyPytest:
-        fixture = staticmethod(lambda *a, **kw: (lambda f: f))
-        fail = staticmethod(lambda msg: (_ for _ in ()).throw(AssertionError(msg)))
-        main = staticmethod(lambda *a, **kw: None)
-    pytest = _DummyPytest()  # type: ignore
 
 # Configuration from Environment Variables (read dynamically from tests/e2e/.env or the CI environment)
 GCP_PROJECT_ID: Optional[str] = os.environ.get("GCP_PROJECT_ID") or os.environ.get("PROJECT_ID")
