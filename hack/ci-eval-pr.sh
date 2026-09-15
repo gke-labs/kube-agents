@@ -1325,6 +1325,12 @@ TASKS=(
   # clone-plus-history round trip prices above a presubmit seat.
   # "./tasks/vcs-history-only-fact/task.yaml"
   "./tasks/agent-kanban-smoke/task.yaml"
+  # TEMPORARY measurement seat, PR #1625 only: incident-triage-oom-event-probe
+  # is a NIGHTLY_TASKS case (its entry is below) and the presubmit runs TASKS
+  # alone, so this line is how the authoring pull request measures its three
+  # repetitions (bench/tasks/DRAFTS.md, "Second cases per domain"). It is
+  # reverted, with the domains.yaml allowlist entry it displaces, before merge.
+  "./tasks/incident-triage-oom-event-probe/task.yaml"
   # knowledge-grounding-sources-probe: moved to NIGHTLY_TASKS 2026-09-09 after one
   # presubmit cycle (#945) -- knowledge grounding is not a core kube-agents journey.
   # Last, because it is the only entry that pays twice. Its stack plants an
@@ -1620,7 +1626,9 @@ NIGHTLY_TASKS=(
   # unit_cost_hint fits until its own measurement says otherwise. Measured
   # in the authoring PR's draft presubmit run (build id and per-repetition
   # costs recorded in the task header and bench/tasks/DRAFTS.md).
-  "./tasks/incident-triage-oom-event-probe/task.yaml"
+  # Commented out while PR #1625's TEMPORARY measurement seat in TASKS runs;
+  # the two arrays must stay disjoint. Restored before merge.
+  # "./tasks/incident-triage-oom-event-probe/task.yaml"
 )
 
 # Which matrix this run gets. "presubmit" -- the default, and what every
