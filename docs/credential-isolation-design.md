@@ -101,8 +101,11 @@ The shared agent volume used to be the live gap here: a `core.fsmonitor` entry t
 sandbox wrote under a workspace root ran in the credential holder on the next
 `git status`, with no lease taken and no mutating verb, so neither the workspace-lease
 floor nor the argument-level deny policy reached it. Separate Pods close it. There is no
-volume both sides mount, the broker owns the only checkout, and the skills that write to
-a forge hand it file content and a commit message rather than a directory.
+writable volume both sides mount — the one object both Pods project is the
+`<agent>-gitops-state` ConfigMap, read-only in each, a list of repository names rather
+than a filesystem either can write into — the broker owns the only checkout, and the
+skills that write to a forge hand it file content and a commit message rather than a
+directory.
 
 `spec.deployment.env` is applied to the credential runtime because it may
 contain credentials. A short allowlist may also be copied to the sandbox — the

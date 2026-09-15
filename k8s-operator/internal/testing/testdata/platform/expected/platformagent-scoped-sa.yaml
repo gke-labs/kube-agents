@@ -645,6 +645,9 @@ spec:
               name: settings
               readOnly: true
               subPath: SETTINGS.md
+            - mountPath: /etc/gitops
+              name: gitops-state-volume
+              readOnly: true
       enableServiceLinks: false
       serviceAccountName: platformagent-shell
       shareProcessNamespace: false
@@ -669,6 +672,10 @@ spec:
                   audience: kubeagents-credential-proxy
                   expirationSeconds: 3600
                   path: token
+        - configMap:
+            defaultMode: 420
+            name: platformagent-gitops-state
+          name: gitops-state-volume
   updateStrategy: {}
   volumeClaimTemplates:
     - metadata:
