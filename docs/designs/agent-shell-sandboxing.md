@@ -2585,7 +2585,14 @@ WAL-mode SQLite on the gofer-backed mount, and `session_kv.db` is WAL-mode SQLit
 That is a fact about the agent pod, which is where the session DB lives. The sandbox
 pod holds no SQLite, so it can run under the sentry while the agent pod does not —
 which is the argument for the separate field, and the reason this is a prerequisite
-for the runtime rather than for the design. What it does still mean is that the
+for the runtime rather than for the design.
+
+Since then the agent pod's `runtimeClassName` has come to pin Hermes' own databases
+(`state.db`, `kanban.db` and the stores Hermes opens the same way) to the DELETE journal
+mode and convert existing ones once at start-up; the
+[CRD reference](../site/src/content/docs/operator/platformagent-crd.md) is canonical for
+what that covers. `session_kv.db` is not among them: it sets WAL itself, so it remains
+the database this split still protects. What it does still mean is that the
 sandbox's storage has to be re-audited for SQLite whenever something new is written
 to `/opt/data`: the safety of the setting is a property of what the image puts there,
 not of the setting.
