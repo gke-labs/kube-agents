@@ -40,11 +40,11 @@ This directory contains the automated E2E test suite for verifying the **Hermes 
 
 - **Google Chat API Event Suppression**: Google Chat API does not generate Pub/Sub interaction events for messages posted programmatically via `spaces.messages.create` to prevent infinite bot loops.
 - **Hybrid Test Flow**:
-  0. **Pre-Flight (when `kubectl` is reachable)**: Waits up to `GATEWAY_ROLLOUT_TIMEOUT_SEC` (default `900`s) for `deployment/platform-agent-gateway` in `AGENT_NAMESPACE` (or `NAMESPACE`, default `kubeagents-system`) to finish any rolling restart before posting.
-  1. **Step 1**: Test runner posts a prompt via Service Account WIF to establish a real Google Chat Space Thread ID (`spaces/{SPACE_ID}/threads/{THREAD_ID}`).
-  2. **Step 2**: Test runner constructs a valid Google Chat event payload referencing the real Thread ID and authorized test identity (`TEST_USER_EMAIL`), publishing it directly to Pub/Sub topic `platform-agent-chat-events`.
-  3. **Step 3**: **Hermes Agent** in GKE receives the Pub/Sub event, computes a well-known, predictable answer that can be validated deterministically, and posts the reply into the real space thread.
-  4. **Step 4**: Test runner polls the thread via `poll_chat_service` using the OTA User credentials (`chat.messages.readonly`) and asserts the expected response.
+  1. **Pre-Flight (when `kubectl` is reachable)**: Waits up to `GATEWAY_ROLLOUT_TIMEOUT_SEC` (default `900`s) for `deployment/platform-agent-gateway` in `AGENT_NAMESPACE` (or `NAMESPACE`, default `kubeagents-system`) to finish any rolling restart before posting.
+  2. **Step 1**: Test runner posts a prompt via Service Account WIF to establish a real Google Chat Space Thread ID (`spaces/{SPACE_ID}/threads/{THREAD_ID}`).
+  3. **Step 2**: Test runner constructs a valid Google Chat event payload referencing the real Thread ID and authorized test identity (`TEST_USER_EMAIL`), publishing it directly to Pub/Sub topic `platform-agent-chat-events`.
+  4. **Step 3**: **Hermes Agent** in GKE receives the Pub/Sub event, computes a well-known, predictable answer that can be validated deterministically, and posts the reply into the real space thread.
+  5. **Step 4**: Test runner polls the thread via `poll_chat_service` using the OTA User credentials (`chat.messages.readonly`) and asserts the expected response.
 
 ---
 
