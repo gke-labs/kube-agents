@@ -530,7 +530,7 @@ variable "stockout_pubsub_sink" {
 }
 
 variable "enable_drift_pubsub" {
-  description = "Provision the drift detector's audit-log ingress (drift-pubsub module): the GKE audit-log Log Router sink, the drift-audit Pub/Sub topic and pull subscription, and the sink-writer publisher and agent-GSA subscriber/viewer IAM. Exports every GKE cluster in the project (the module's cluster_names default). The module's naming and retention defaults are not re-exposed here. Nothing consumes the subscription yet: the detector does not exist (docs/designs/drift-detection.md). The installer front doors write no value for this variable into terraform.tfvars; through them it is a TF_VAR_enable_drift_pubsub line in install.env, as agent_ksa_name is."
+  description = "Provision the drift detector's audit-log ingress (drift-pubsub module): the GKE audit-log Log Router sink, the drift-audit Pub/Sub topic and pull subscription, and the sink-writer publisher and agent-GSA subscriber/viewer IAM. Exports every GKE cluster in the project (the module's cluster_names default). The module's naming and retention defaults are not re-exposed here. Nothing consumes the subscription yet: the detector, k8s-operator/cmd/drift-detector, is not built into any image or launched by any install (docs/designs/drift-detection.md). The installer front doors write no value for this variable into terraform.tfvars; through them it is a TF_VAR_enable_drift_pubsub line in install.env, as agent_ksa_name is."
   type        = bool
   default     = false
 }
