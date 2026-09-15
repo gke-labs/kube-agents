@@ -18,9 +18,9 @@ module "gke_cluster" {
 ```
 
 The same pin applies to the other modules (`kube-agents-iam`, `chat-pubsub`, `github-minter`,
-`drift-pubsub`);
+`gke-backup-plan`, `drift-pubsub`);
 [`terraform/examples/full-install/`](../../../../../terraform/examples/full-install/README.md) is the
-canonical single-apply composition of all but `drift-pubsub`, and the
+canonical single-apply composition of every module (`drift-pubsub` behind `enable_drift_pubsub`), and the
 [release versioning & promotion guide](../../../../../docs/site/src/content/docs/deploy/release-versioning.md)
 owns the pinning rules.
 

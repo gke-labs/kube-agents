@@ -529,6 +529,12 @@ variable "stockout_pubsub_sink" {
   default     = "gke-stockout-alerts-sink"
 }
 
+variable "enable_drift_pubsub" {
+  description = "Provision the drift detector's audit-log ingress (drift-pubsub module): the GKE audit-log Log Router sink, the drift-audit Pub/Sub topic and pull subscription, and the sink-writer publisher and agent-GSA subscriber/viewer IAM. Exports every GKE cluster in the project (the module's cluster_names default). The module's naming and retention defaults are not re-exposed here. Nothing consumes the subscription yet: the detector, k8s-operator/cmd/drift-detector, is not built into any image or launched by any install (docs/designs/drift-detection.md). The installer front doors write no value for this variable into terraform.tfvars; through them it is a TF_VAR_enable_drift_pubsub line in install.env, as agent_ksa_name is."
+  type        = bool
+  default     = false
+}
+
 variable "extra_helm_values" {
   description = "Extra values for the kube-agents Helm release, covering chart settings this composition does not expose as its own variable (telemetry.otlpEndpoint, litellm.otel, the resource blocks, the PlatformAgent harness knobs). Passed as a second values document, so Helm deep-merges it key by key over the ones computed here and anything set wins. Setting a key the composition also computes — platformAgent.harness.clusterName, say — overrides it, which is rarely what you want."
   type        = any
