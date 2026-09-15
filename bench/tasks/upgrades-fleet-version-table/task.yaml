@@ -1,5 +1,5 @@
-# COMMENTED OUT — a commented-out entry in hack/ci-eval-pr.sh TASKS, which
-# registers it pending activation. The hold is the maintainer's call on #1343:
+# NIGHTLY — registered in hack/eval/nightly-cases.txt since 2026-09-15,
+# commented out of the presubmit's TASKS array before that. The hold is the maintainer's call on #1343:
 # activate when #1254 is closed. #1254 is the open issue on the sibling probe,
 # upgrades-lagging-master-probe, where a delegated run's acknowledgement is
 # graded as the final answer on unrelated pull requests (the #1010 family that
@@ -8,8 +8,9 @@
 # collapse rule; this case would enter unadmitted, so it could not red the job
 # on quality, but its report_contains objectives read the same final answer and
 # would grade the acknowledgement rather than the table. A case that cannot be
-# watched to both pass and fail stays `validated: false` and commented out.
-# Uncomment the TASKS line when #1254 is closed; nothing here changes.
+# watched to both pass and fail stays `validated: false` and out of the
+# presubmit. Its nightly record from #1254's close on is what earns a seat;
+# nothing here changes.
 #
 # The Phase-1 case for the fleet-upgrade-verification skill (#1343): not "is
 # one cluster current" (upgrades-lagging-master-probe asks that) but "give me

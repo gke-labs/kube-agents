@@ -1081,7 +1081,7 @@ class TestNightlySource(_MergeBase):
         self.assertTrue(cases["reliability-pdb-probe"]["active"])
         self.assertTrue(cases["reliability-pdb-probe"]["nightly_active"], "TASKS is in the nightly too")
         self.assertFalse(cases["obtainability-planted-pdb"]["active"])
-        self.assertTrue(cases["obtainability-planted-pdb"]["nightly_active"], "an uncommented NIGHTLY_TASKS entry")
+        self.assertTrue(cases["obtainability-planted-pdb"]["nightly_active"], "a nightly-cases.txt entry")
         self.assertFalse(cases["compliance-rbac-overgrant"]["nightly_active"] and not cases["compliance-rbac-overgrant"]["active"])
 
     def test_head_sha_falls_back_to_the_started_commit_for_a_periodic(self):
@@ -1120,7 +1120,7 @@ class TestNightlySource(_MergeBase):
 
 
 class TestRepoDerivedFacts(unittest.TestCase):
-    def test_nightly_tasks_are_tasks_plus_the_nightly_only_array(self):
+    def test_nightly_tasks_are_the_presubmit_plus_the_nightly_file(self):
         nightly = collect.nightly_task_names()
         self.assertTrue(collect.active_task_names() <= nightly)
         self.assertIn("obtainability-planted-pdb", nightly)
@@ -1135,11 +1135,11 @@ class TestRepoDerivedFacts(unittest.TestCase):
         self.assertEqual(cov["uncovered"], ["incident-triage"])
         self.assertEqual(cov["domains_covered"], cov["domains_total"] - len(cov["uncovered"]))
 
-    def test_active_tasks_are_the_uncommented_entries(self):
+    def test_active_tasks_are_the_presubmit_file_entries(self):
         active = collect.active_task_names()
         self.assertIn("reliability-pdb-probe", active)
         self.assertIn("compliance-rbac-overgrant", active)
-        self.assertNotIn("obtainability-planted-pdb", active)  # registered, commented out
+        self.assertNotIn("obtainability-planted-pdb", active)  # nightly only
         self.assertNotIn("stockout-pinned-pool", active)
 
 

@@ -241,16 +241,21 @@ class SharedBreak(unittest.TestCase):
         self.assertEqual(roster.at(T0 - timedelta(days=3)), frozenset())
         self.assertEqual(roster.current, frozenset())
 
-    def test_the_roster_is_read_from_the_ci_script_default_line(self):
+    def test_the_roster_is_read_from_the_roster_file_or_the_old_script(self):
         with tempfile.TemporaryDirectory() as tmp:
+            roster_file = pathlib.Path(tmp) / "blocking-roster.txt"
+            roster_file.write_text("# the roster\na-probe\nb-probe  # admitted 09-01\n\n")
+            self.assertEqual(health.Roster.from_file(roster_file).current, frozenset({"a-probe", "b-probe"}))
+            # The shape the script carried before 2026-09-15, for an era
+            # taken from `git show <old-commit>:hack/ci-eval-pr.sh`.
             script = pathlib.Path(tmp) / "ci-eval-pr.sh"
             script.write_text('#!/bin/bash\nexport BOOTSTRAP_ADMITTED="${BOOTSTRAP_ADMITTED:-a-probe,b-probe}"\n')
-            self.assertEqual(health.Roster.from_script(script).current, frozenset({"a-probe", "b-probe"}))
-            script.write_text("#!/bin/bash\n")
+            self.assertEqual(health.Roster.from_file(script).current, frozenset({"a-probe", "b-probe"}))
+            roster_file.write_text("# nothing admitted\n")
             with self.assertRaises(SystemExit):
-                health.Roster.from_script(script)
+                health.Roster.from_file(roster_file)
         # And the real one parses to a non-empty roster of case names.
-        live = health.Roster.from_script()
+        live = health.Roster.from_file()
         self.assertTrue(live.current)
         self.assertTrue(all("/" not in name and " " not in name for name in live.current))
 

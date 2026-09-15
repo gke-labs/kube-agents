@@ -193,9 +193,9 @@ never a pass and never a fail, and an errored check drops `VerificationCoverage`
 
 ## What actually reds a build
 
-`hack/ci-eval-pr.sh` runs one devops-bench invocation per entry in its task matrix — the
-`TASKS` array, plus `NIGHTLY_TASKS` when the job exports `EVAL_TIER=nightly` — and
-grades the resulting record. For a case that carries a `verification_spec`, three keys
+`hack/ci-eval-pr.sh` runs one devops-bench invocation per entry in its task matrix —
+`hack/eval/presubmit-cases.txt`, plus `hack/eval/nightly-cases.txt` when the job exports
+`EVAL_TIER=nightly` — and grades the resulting record. For a case that carries a `verification_spec`, three keys
 decide the merge:
 
 | Key                        | Gate                           | Meaning                                    |
@@ -234,7 +234,7 @@ anything, and the conservative reading is an unmet objective.
 
 `domain:` is a slug from `docs/designs/domains.yaml`, and it is how coverage is counted.
 `scripts/test_domain_coverage.py` treats a domain as covered when some case claims its
-slug, carries a non-empty spec, and is an active — uncommented — entry in `TASKS`.
+slug, carries a non-empty spec, and is an entry in `hack/eval/presubmit-cases.txt`.
 Everything else is on the allowlist, and the shrinking allowlist is the programme's
 progress metric.
 
@@ -254,7 +254,7 @@ checked" and "nobody remembered".
 
 `hack/ci-eval-pr.sh` falls back to `OutcomeValidity >= 0.7` for a case with no
 `verification_spec`. That fallback is transitional, and the script says so in the comment
-above the branch that implements it: once every entry in `TASKS` carries a spec, it is
+above the branch that implements it: once every presubmit entry carries a spec, it is
 dead code to delete.
 
 Declare the spec as a block, not inline. The script decides whether a case has one by
@@ -272,7 +272,7 @@ took.
 The minimum a case owes is one objective that names something the case itself planted,
 and one safeguard for the thing the case must not do. Both can be written before the
 fixture exists — the `bench/tasks/DRAFTS.md` corpus did exactly that, specs first,
-registered commented-out, activated later. Writing the spec is what surfaces "this case
+parked, activated later. Writing the spec is what surfaces "this case
 cannot fail" while it is still cheap to fix.
 
 Where the exact check genuinely does not exist yet, the escape is the same shape as the
@@ -281,24 +281,39 @@ reason and what would close it. An entry there is a debt with a name on it.
 
 ## Registration
 
-`hack/ci-eval-pr.sh` runs the tasks in its `TASKS` array — plus, when the job exports
-`EVAL_TIER=nightly`, its `NIGHTLY_TASKS` array — and only those. Cases under
-`bench/tasks/` are not discovered. A case registered nowhere never runs, and the suite
-reports green around it — which is how `agent-kanban-smoke`, a case whose whole purpose
-is to smoke the deployed pipeline, sat unregistered while the presubmit ran one case for
-months.
+`hack/ci-eval-pr.sh` runs the cases in `hack/eval/presubmit-cases.txt` — plus, when the
+job exports `EVAL_TIER=nightly`, those in `hack/eval/nightly-cases.txt` — and only those.
+Cases under `bench/tasks/` are not discovered. A case registered nowhere never runs, and
+the suite reports green around it — which is how `agent-kanban-smoke`, a case whose whole
+purpose is to smoke the deployed pipeline, sat unregistered while the presubmit ran one
+case for months.
 
-A commented-out `TASKS` entry counts as registered. That is the intended state for a
-case whose fixture or blocker is not ready: it is written down, it is greppable, and
-activation is uncommenting one line. The alternative — leaving it out entirely — is
-indistinguishable from forgetting. A `NIGHTLY_TASKS` entry counts too, and means more:
-the case runs every night, kept out of the presubmit for cost, because a cheaper probe
-holds its presubmit seat, or because what it grades is not one of the core journeys the
-presubmit gate is for — never out of doubt about the case, which is what the
-commented-out state is for. The core journeys are the `journey:` rows of
-`docs/designs/domains.yaml`; a case that claims no domain there is outside them by
-construction. This paragraph is the one statement of the rule; `bench/CUSTOM-TASKS.md`
-and `docs/designs/testing-strategy.md` restate it and defer here.
+A new case lands in the nightly file (decided 2026-09-15,
+[#1546](https://github.com/gke-labs/kube-agents/issues/1546),
+[#1564](https://github.com/gke-labs/kube-agents/issues/1564)). It runs every night from
+the night it merges, its record accrues in the evidence store, and a presubmit seat is a
+later pull request that moves its line to the presubmit file and cites that record —
+never the pull request that makes it pass. Cases that stay in the nightly for good are
+the ones kept out of the presubmit for cost, because a cheaper probe holds their presubmit
+seat, or because what they grade is not one of the core journeys the presubmit gate is
+for; the core journeys are the `journey:` rows of `docs/designs/domains.yaml`, and a case
+that claims no domain there is outside them by construction. A case the agent cannot pass
+yet, or that a harness limit blocks, is a nightly case too: its record shows that, which
+is what the record is for.
+
+The commented-out registration — a `# ./tasks/<id>/task.yaml` line — is retired. It was
+the parking state for a case whose fixture or blocker was not ready, and it was
+indistinguishable from a case nobody had decided about. A `#` line in a roster file is a
+comment, and the validator rejects a case path inside one. The one case that does not go
+in a roster file is one whose fixture does not exist at all: it is a `FIXTURE_NOT_READY`
+entry in `scripts/validate_bench_cases.py`, with the issue that plants the fixture, and it
+moves to the nightly file in the pull request that lands the fixture.
+
+Who approves follows the split: an edit to the presubmit file or to
+`hack/eval/blocking-roster.txt` needs an `eval-crew` approver (`hack/OWNERS`); the nightly
+file and a new case directory need only the normal approvers. This section is the one
+statement of the rule; `bench/CUSTOM-TASKS.md`, `bench/CONTRIBUTING.md` and
+`docs/designs/testing-strategy.md` restate it and defer here.
 
 ## The validator
 

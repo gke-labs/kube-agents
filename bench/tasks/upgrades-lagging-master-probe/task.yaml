@@ -1,4 +1,4 @@
-# ACTIVE — an uncommented entry in hack/ci-eval-pr.sh TASKS, and what takes
+# ACTIVE — an entry in hack/eval/presubmit-cases.txt, and what takes
 # `upgrades` off the coverage allowlist in docs/designs/domains.yaml.
 #
 # A PROBE, not the audit. The full security-patch-orchestrator sweep exists

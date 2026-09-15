@@ -8,7 +8,7 @@
 # absent file and a case with no entry (both simply mean "no note"), so
 # deleting a stale line can never break a render. A case's roster status
 # (blocking, held out, demoted) is not annotated here: the pages read it
-# from hack/ci-eval-pr.sh and docs/eval-gate-roster.md.
+# from hack/eval/blocking-roster.txt and docs/eval-gate-roster.md.
 #
 # Entry shape (all keys optional):
 #

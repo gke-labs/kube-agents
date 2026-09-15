@@ -1,4 +1,4 @@
-# ACTIVE — an uncommented entry in hack/ci-eval-pr.sh TASKS. Coverage of the
+# ACTIVE — an entry in hack/eval/presubmit-cases.txt. Coverage of the
 # reliability domain is reliability-pdb-probe's; this variation grades what
 # the probe does not ask for: a PodDisruptionBudget remediation in the
 # reply, checked on the manifest's load-bearing nouns (PodDisruptionBudget,

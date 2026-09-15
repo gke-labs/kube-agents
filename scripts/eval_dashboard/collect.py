@@ -143,6 +143,11 @@ try:
 except ImportError:  # run as a script: python3 scripts/eval_dashboard/collect.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     import tiers
+try:
+    import eval_rosters
+except ImportError:  # run as a script: scripts/ is not on sys.path yet
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+    import eval_rosters
 
 SCHEMA_VERSION = 1
 
@@ -267,7 +272,6 @@ RC_RELEASES_MAX = 20
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
 TASKS_DIR = REPO_ROOT / "bench" / "tasks"
-EVAL_SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
 DOMAINS_YAML = REPO_ROOT / "docs" / "designs" / "domains.yaml"
 
 # One line per evaluated case, printed by hack/ci-eval-pr.sh. Observed shapes:
@@ -747,42 +751,31 @@ def task_domain(name: str, repo_root: pathlib.Path = REPO_ROOT) -> str:
     return m.group(1) if m else "unknown"
 
 
-def _task_array_names(text: str, array: str) -> set[str]:
-    """The uncommented `./tasks/<name>/task.yaml` entries of one bash array."""
-    m = re.search(rf"^{array}=\(\n(.*?)^\)$", text, re.MULTILINE | re.DOTALL)
-    if not m:
-        raise ValueError(f"{array}=( ... ) array not found in hack/ci-eval-pr.sh")
-    names = set()
-    for line in m.group(1).splitlines():
-        line = line.strip()
-        if line.startswith('"') and line.endswith('"'):
-            entry = re.fullmatch(r"\./tasks/([^/]+)/task\.yaml", line.strip('"'))
-            if entry:
-                names.add(entry.group(1))
-    return names
+def _case_file_names(path: pathlib.Path) -> set[str]:
+    """The case ids one roster file under hack/eval/ names."""
+    return set(eval_rosters.case_names(path.read_text()))
 
 
 def active_task_names(repo_root: pathlib.Path = REPO_ROOT) -> set[str]:
-    """Case names the presubmit actually runs: uncommented TASKS entries.
+    """Case names the presubmit actually runs: hack/eval/presubmit-cases.txt.
 
-    Same narrow textual parse as scripts/test_domain_coverage.py -- the
-    script provisions clusters, so executing it to ask is not an option.
+    The same parse scripts/eval_rosters.py gives scripts/test_domain_coverage.py
+    and the registration lint, so the dashboard and the lints cannot disagree
+    about what runs.
     """
-    text = (repo_root / "hack" / "ci-eval-pr.sh").read_text()
-    return _task_array_names(text, "TASKS")
+    return _case_file_names(repo_root / "hack" / "eval" / "presubmit-cases.txt")
 
 
 def nightly_task_names(repo_root: pathlib.Path = REPO_ROOT) -> set[str]:
-    """Case names the nightly runs: TASKS plus the uncommented NIGHTLY_TASKS.
+    """Case names the nightly runs: the presubmit file plus hack/eval/nightly-cases.txt.
 
-    EVAL_TIER=nightly appends NIGHTLY_TASKS to TASKS in hack/ci-eval-pr.sh,
-    so the nightly matrix is the presubmit's superset by construction.
+    EVAL_TIER=nightly appends the nightly file to the presubmit one in
+    hack/ci-eval-pr.sh, so the nightly matrix is the presubmit's superset by
+    construction.
     """
-    return nightly_task_names_from((repo_root / "hack" / "ci-eval-pr.sh").read_text())
-
-
-def nightly_task_names_from(text: str) -> set[str]:
-    return _task_array_names(text, "TASKS") | _task_array_names(text, "NIGHTLY_TASKS")
+    return active_task_names(repo_root) | _case_file_names(
+        repo_root / "hack" / "eval" / "nightly-cases.txt"
+    )
 
 
 def coverage(repo_root: pathlib.Path = REPO_ROOT) -> dict:
@@ -850,9 +843,8 @@ def build_cases(runs: list[dict], repo_root: pathlib.Path = REPO_ROOT) -> list[d
     gate's own history stay two numbers. A case only the nightly has run is
     still on record, with an empty presubmit side.
     """
-    script = (repo_root / "hack" / "ci-eval-pr.sh").read_text()
-    active = _task_array_names(script, "TASKS")
-    nightly_active = nightly_task_names_from(script)
+    active = active_task_names(repo_root)
+    nightly_active = nightly_task_names(repo_root)
     history = _case_history(tiers.presubmit_runs(runs))
     nightly_history = _case_history(tiers.nightly_runs(runs))
 

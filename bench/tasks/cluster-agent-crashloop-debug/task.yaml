@@ -1,4 +1,4 @@
-# ACTIVE — an uncommented entry in hack/ci-eval-pr.sh TASKS, and the first of
+# ACTIVE — an entry in hack/eval/presubmit-cases.txt, and the first of
 # the ten Phase 2 domain scenarios to get there. It was blocked on A5 alone
 # (bench/tasks/DRAFTS.md): no GitHub write, so neither A1 nor A4, and no date
 # gate. A5 cleared when the runner learned to write one kubeconfig per fixture

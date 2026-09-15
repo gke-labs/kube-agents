@@ -14,25 +14,28 @@ This test is what makes the rule a build failure:
 Delete allowlist entries as Phase 2 ACTIVATES scenarios. The shrinking
 allowlist is the tier-2 progress metric of the testing implementation plan.
 
-Covered means running: a task counts toward its domain only when its spec is
-non-empty AND its path is an active (uncommented) entry in ci-eval-pr.sh's
-TASKS array. A spec-ready task registered commented-out -- the Phase 2
-scenarios awaiting the seeded fleet -- is progress, but it blocks nothing,
-and a domain whose only scenario is dormant is still uncovered. Without this
-distinction the allowlist would have emptied the day the specs were written,
-ten scenarios before any of them ran.
+Covered means running on every pull request: a task counts toward its domain
+only when its spec is non-empty AND its path is an entry in
+hack/eval/presubmit-cases.txt, the file hack/ci-eval-pr.sh reads into TASKS.
+A case in hack/eval/nightly-cases.txt runs every night and blocks nothing on
+a pull request, so a domain whose only scenario is nightly-only is still
+uncovered here. Without this distinction the allowlist would have emptied the
+day the specs were written, ten scenarios before any of them ran.
 """
 
 import pathlib
-import re
+import sys
 import unittest
 
 import yaml
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+
+import eval_rosters  # noqa: E402
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 DOMAINS_FILE = REPO_ROOT / "docs" / "designs" / "domains.yaml"
 TASKS_GLOB = "bench/tasks/*/task.yaml"
-EVAL_SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
 
 
 def load_domains():
@@ -41,18 +44,11 @@ def load_domains():
 
 
 def active_task_paths():
-    """Task paths the eval script actually runs: uncommented TASKS entries."""
-    text = EVAL_SCRIPT.read_text()
-    m = re.search(r"^TASKS=\(\n(.*?)^\)$", text, re.M | re.S)
-    if not m:
-        raise AssertionError("TASKS=( ... ) array not found in hack/ci-eval-pr.sh")
-    active = set()
-    for line in m.group(1).splitlines():
-        line = line.strip()
-        if line.startswith('"') and line.endswith('"'):
-            # "./tasks/<name>/task.yaml" relative to bench/
-            active.add("bench/" + line.strip('"').lstrip("./"))
-    return active
+    """Task paths the presubmit runs: the entries of hack/eval/presubmit-cases.txt."""
+    names = eval_rosters.presubmit_cases()
+    if not names:
+        raise AssertionError(f"{eval_rosters.PRESUBMIT_CASES_FILE} parsed to no cases")
+    return {f"bench/tasks/{name}/task.yaml" for name in names}
 
 
 def covered_domains():

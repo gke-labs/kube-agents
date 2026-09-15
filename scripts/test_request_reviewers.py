@@ -45,8 +45,8 @@ CONFIG = {
         "k8s-operator/**": ["waw-leads"],
         ".github/workflows/k8s-operator-test.yml": ["waw-leads"],
         ".github/workflows/staging-deploy.yml": ["waw-leads"],
-        "bench/tasks/**": ["eval-crew"],
-        "hack/ci-eval-pr.sh": ["eval-crew"],
+        "hack/eval/presubmit-cases.txt": ["eval-crew"],
+        "hack/eval/blocking-roster.txt": ["eval-crew"],
     },
     "options": {
         "ignore_draft": True,
@@ -225,44 +225,49 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual(rr.reviewers_by_changed_files(CONFIG, [".github/workflows/validate.yml"], "author"), [])
         self.assertEqual(self.select([".github/workflows/validate.yml"])[0] in OWNERS, True)
 
-    def test_an_eval_case_change_goes_to_eval_crew(self):
-        # Only eval-crew can /approve under bench/tasks/ (bench/tasks/OWNERS,
-        # no_parent_owners), so a random root owner would review a pull request
-        # they cannot clear, and nothing would tell eval-crew it exists.
-        matched = rr.reviewers_by_changed_files(CONFIG, ["bench/tasks/new-case/task.yaml"], "author")
-        self.assertEqual(matched, EVAL_CREW)
-        self.assertIn(self.select(["bench/tasks/new-case/task.yaml"])[0], EVAL_CREW)
+    def test_a_presubmit_roster_change_goes_to_eval_crew(self):
+        # Only eval-crew can /approve hack/eval/presubmit-cases.txt and
+        # blocking-roster.txt (hack/OWNERS, no_parent_owners), so a random root
+        # owner would review a pull request they cannot clear, and nothing
+        # would tell eval-crew it exists.
+        for path in ("hack/eval/presubmit-cases.txt", "hack/eval/blocking-roster.txt"):
+            with self.subTest(path=path):
+                self.assertEqual(rr.reviewers_by_changed_files(CONFIG, [path], "author"), EVAL_CREW)
+                self.assertIn(self.select([path])[0], EVAL_CREW)
 
-    def test_a_roster_change_goes_to_eval_crew_but_the_rest_of_hack_does_not(self):
-        # hack/OWNERS scopes ci-eval-pr.sh alone; its neighbours stay with root.
-        self.assertEqual(rr.reviewers_by_changed_files(CONFIG, ["hack/ci-eval-pr.sh"], "author"), EVAL_CREW)
-        self.assertEqual(rr.reviewers_by_changed_files(CONFIG, ["hack/ci-deploy.sh"], "author"), OWNERS)
+    def test_the_nightly_file_a_case_and_the_script_stay_with_root(self):
+        # Decision A (#1546, 2026-09-15): the nightly file, a new case directory
+        # and ci-eval-pr.sh itself fall through to the root OWNERS, so they
+        # route to the default reviewers like any other change.
+        for path in ("hack/eval/nightly-cases.txt", "bench/tasks/new-case/task.yaml", "hack/ci-eval-pr.sh", "hack/ci-deploy.sh"):
+            with self.subTest(path=path):
+                self.assertEqual(rr.reviewers_by_changed_files(CONFIG, [path], "author"), OWNERS)
 
     def test_a_mixed_change_still_goes_to_eval_crew(self):
         # Last match wins, and eval-crew is listed last: the reviewer who can
-        # clear the case half is asked. Not every member is a root owner, so
+        # clear the roster half is asked. Not every member is a root owner, so
         # the README half may still wait on a root approver's /approve; the
-        # alternative, a random root owner who cannot clear the case at all,
+        # alternative, a random root owner who cannot clear the roster at all,
         # is the gap this entry closes.
-        matched = rr.reviewers_by_changed_files(CONFIG, ["README.md", "bench/tasks/x/task.yaml"], "author")
+        matched = rr.reviewers_by_changed_files(CONFIG, ["README.md", "hack/eval/presubmit-cases.txt"], "author")
         self.assertEqual(matched, EVAL_CREW)
 
-    def test_eval_crews_own_case_change_goes_to_the_other_member(self):
-        # The author is never requested, so a member's own case change goes to
-        # the rest of the group; the author's approved is already on it (#1075).
+    def test_eval_crews_own_roster_change_goes_to_the_other_member(self):
+        # The author is never requested, so a member's own roster change goes
+        # to the rest of the group; the author's approved is already on it (#1075).
         author = EVAL_CREW[0]
-        matched = rr.reviewers_by_changed_files(CONFIG, ["bench/tasks/x/task.yaml"], author)
+        matched = rr.reviewers_by_changed_files(CONFIG, ["hack/eval/blocking-roster.txt"], author)
         self.assertEqual(matched, [name for name in EVAL_CREW if name != author])
-        self.assertEqual(self.select(["bench/tasks/x/task.yaml"], author=author), matched)
+        self.assertEqual(self.select(["hack/eval/blocking-roster.txt"], author=author), matched)
 
-    def test_a_case_change_by_the_whole_group_falls_back_to_the_defaults(self):
+    def test_a_roster_change_by_the_whole_group_falls_back_to_the_defaults(self):
         # Only the author is excluded, so this needs a one-member group: the
         # shape the config had before lapis2002 joined, and the shape it has
         # again if the alias ever shrinks. The defaults carry it to a root
         # owner, whose review sets lgtm.
         config = dict(CONFIG, reviewers=dict(CONFIG["reviewers"], groups=dict(CONFIG["reviewers"]["groups"], **{"eval-crew": ["jayantid"]})))
-        self.assertEqual(rr.reviewers_by_changed_files(config, ["bench/tasks/x/task.yaml"], "jayantid"), [])
-        picked = rr.select_reviewers(config, ["bench/tasks/x/task.yaml"], "jayantid", rng=random.Random(0))
+        self.assertEqual(rr.reviewers_by_changed_files(config, ["hack/eval/presubmit-cases.txt"], "jayantid"), [])
+        picked = rr.select_reviewers(config, ["hack/eval/presubmit-cases.txt"], "jayantid", rng=random.Random(0))
         self.assertEqual(len(picked), 1)
         self.assertIn(picked[0], [name for name in OWNERS if name != "jayantid"])
 

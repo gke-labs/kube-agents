@@ -1,4 +1,4 @@
-# ACTIVE — an uncommented entry in hack/ci-eval-pr.sh TASKS, and what takes
+# ACTIVE — an entry in hack/eval/presubmit-cases.txt, and what takes
 # `cost` off the coverage allowlist in docs/designs/domains.yaml — the first
 # thing ever to do so, because the full cost audit could not: its objectives
 # are date-gated by the SOP's own do-not-flag rules (DRAFTS.md blocker A3,

@@ -1,4 +1,5 @@
-# Spec-ready — registered (commented out) in hack/ci-eval-pr.sh TASKS.
+# Registered in hack/eval/nightly-cases.txt (nightly tier) since 2026-09-15;
+# commented out of the presubmit's TASKS array before that.
 #
 # Not blocked on A1 any more. The compliant answer to this prompt is a pull
 # request on the evaluation GitOps repo, which is what A1 was about, and A1
@@ -11,7 +12,7 @@
 # read-write identity, which is a privilege gap rather than a functional
 # block.
 #
-# What keeps it commented out is that it has never been run. It stays that way
+# What keeps it out of the presubmit is that it has never been run. It stays that way
 # until it has been watched to both pass and fail (`validated: false`);
 # activating a case nobody has run reds every pull request in the repository if
 # it is wrong. That is not a formality here — the first live run of the sibling

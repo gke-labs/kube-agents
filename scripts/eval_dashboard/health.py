@@ -59,6 +59,11 @@ try:
 except ImportError:  # run as a script: python3 scripts/eval_dashboard/health.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     import tiers
+try:
+    import eval_rosters
+except ImportError:  # run as a script: scripts/ is not on sys.path yet
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+    import eval_rosters
 
 HEALTH_SCHEMA_VERSION = 1
 
@@ -268,12 +273,14 @@ SLOW_CLEAR_FACTOR = 1.1
 
 # --- Roster ------------------------------------------------------------------
 # The admitted roster is the source of truth for what can red a pull request
-# (AGENTS.md, "The behavioural presubmit gate"). Read from the checkout by
-# default; a replay over history passes --roster-history because the roster
-# moved four times in the week the fixture covers.
+# (AGENTS.md, "The behavioural presubmit gate"). Read from the checkout's
+# hack/eval/blocking-roster.txt by default; a replay over history passes
+# --roster-history because the roster moved four times in the week the
+# fixture covers. The roster lived in hack/ci-eval-pr.sh's BOOTSTRAP_ADMITTED
+# line until 2026-09-15 (#1546); Roster.from_file still reads that shape, so a
+# `git show <old-commit>:hack/ci-eval-pr.sh` resolves an era before the move.
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[2]
-CI_EVAL_SCRIPT = REPO_ROOT / "hack" / "ci-eval-pr.sh"
-ROSTER_RE = re.compile(r'BOOTSTRAP_ADMITTED="\$\{BOOTSTRAP_ADMITTED:-([^}]*)\}"')
+BLOCKING_ROSTER_FILE = eval_rosters.BLOCKING_ROSTER_FILE
 
 # case-notes.yaml is the dashboard's per-case annotation file; its `issues`
 # list is where the tracking issue for a broken case already lives, so the
@@ -514,11 +521,12 @@ class Roster:
         return cls(eras)
 
     @classmethod
-    def from_script(cls, path: pathlib.Path = CI_EVAL_SCRIPT) -> Roster:
-        match = ROSTER_RE.search(path.read_text())
-        if not match:
-            raise SystemExit(f"ERROR: no BOOTSTRAP_ADMITTED default found in {path}")
-        return cls.fixed(name for name in match.group(1).split(",") if name)
+    def from_file(cls, path: pathlib.Path = BLOCKING_ROSTER_FILE) -> Roster:
+        """The roster in hack/eval/blocking-roster.txt -- or in the old script text."""
+        admitted = eval_rosters.parse_blocking_roster(path.read_text())
+        if not admitted:
+            raise SystemExit(f"ERROR: no blocking roster found in {path}")
+        return cls.fixed(admitted)
 
     def at(self, when: datetime | None) -> frozenset[str]:
         current: frozenset[str] = frozenset()
@@ -1358,7 +1366,7 @@ def build_roster(args) -> Roster:
         return Roster.from_history(history)
     if args.admitted is not None:
         return Roster.fixed(name for name in args.admitted.split(",") if name)
-    return Roster.from_script(args.ci_eval_script)
+    return Roster.from_file(args.blocking_roster)
 
 
 def parse_args(argv):
@@ -1375,9 +1383,9 @@ def parse_args(argv):
     parser.add_argument("--fixture-status", type=pathlib.Path, help="optional fixtures.json to surface in metrics")
     parser.add_argument("--case-notes", type=pathlib.Path, default=DEFAULT_CASE_NOTES, help="case-notes.yaml for tracking issues")
     roster = parser.add_mutually_exclusive_group()
-    roster.add_argument("--admitted", help="comma-separated admitted roster (default: BOOTSTRAP_ADMITTED in hack/ci-eval-pr.sh)")
+    roster.add_argument("--admitted", help="comma-separated admitted roster (default: hack/eval/blocking-roster.txt)")
     roster.add_argument("--roster-history", help="JSON [{since, admitted[]}] of roster eras, for replay over history")
-    parser.add_argument("--ci-eval-script", type=pathlib.Path, default=CI_EVAL_SCRIPT, help=argparse.SUPPRESS)
+    parser.add_argument("--blocking-roster", "--ci-eval-script", dest="blocking_roster", type=pathlib.Path, default=BLOCKING_ROSTER_FILE, help=argparse.SUPPRESS)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--replay", action="store_true", help="walk the data as if the job had run every --step; print the timeline")
     mode.add_argument("--trim", action="store_true", help="write a fixture: the runs in [--from, --to) reduced to the fields read here")
