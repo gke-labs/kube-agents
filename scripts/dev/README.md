@@ -1,10 +1,9 @@
 # Development Scripts
 
-Local iteration tooling for this repository: rebuilding and redeploying agent images,
-setting up Workload Identity Federation for CI, and tearing down the dev Artifact
-Registry. These sat under `k8s-operator/scripts/dev/` until they moved here — they are
-repository tooling rather than operator code, and the shared helpers they source now
-live in the sibling [`../installer/`](../installer/README.md).
+Local iteration tooling for this repository. These sat under `k8s-operator/scripts/dev/`
+until they moved here — they are repository tooling rather than operator code, and the
+shared helpers they source now live in the sibling
+[`../installer/`](../installer/README.md).
 
 | Script                                     | What it does                                                                            |
 | ------------------------------------------ | --------------------------------------------------------------------------------------- |

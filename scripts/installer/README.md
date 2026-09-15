@@ -38,6 +38,7 @@ their own copies:
 | `DEFAULT_KUBE_AGENTS_STATE_BUCKET`                                        | The `KUBE_AGENTS_STATE_BUCKET` sentinel (`auto`) that derives the state bucket         |
 | `DEFAULT_TF_STATE_BUCKET_SUFFIX` / `DEFAULT_TF_STATE_PREFIX_ROOT`         | The derived bucket `<PROJECT_ID><suffix>` and prefix `<root>/<CLUSTER_NAME>`           |
 | `DEFAULT_REGISTRY_PREFIX`                                                 | Container registry prefix                                                              |
+| `DEFAULT_HELM_TIMEOUT`                                                    | Wait timeout for the `cert_manager` and `kube_agents` releases (`600`s, range 540-899) |
 | `default_model_for_provider <provider>`                                   | The default model for a provider                                                       |
 | `is_valid_model_provider <provider>`                                      | Accepted providers: `gemini`, `vertex_ai`, `anthropic`, `openai`                       |
 | `is_valid_permission_set <set>`                                           | Accepted GCP IAM permission sets: `read-only`, `custom`                                |
@@ -51,6 +52,7 @@ their own copies:
 | `tf_state_has_cluster`                                                    | Whether that state manages THIS cluster (project, location and name all match)         |
 | `check_service_account_ownership`                                         | Refuses an apply that would 409 on a service account another install owns              |
 | `write_tfvars_from_state <dest> [tag]`                                    | The `terraform.tfvars` generator (reads the loaded `install.env` variable set)         |
+| `check_existing_cluster_capacity_preflight`                               | Preflights schedulable capacity on untainted nodes for adopted Standard clusters       |
 
 The values themselves live in [`install.defaults.env`](../../install.defaults.env) at the
 repository root, which `installer_common.sh` sources. That file does one job and holds
@@ -139,7 +141,10 @@ only disagree with the live answer. `PROJECT_NUMBER` comes from `gcloud projects
 describe` and `KMS_LOCATION` from `derive_kms_location`. `create_cluster` and the
 **effective** `CLUSTER_MODE` come from `write_tfvars_from_state`'s own probe of the live
 cluster. `NO_CONFIRM` describes an invocation, not an install, and comes from
-`-y`/`--non-interactive`. The identity keys (`PLATFORM_AGENT_GSA_NAME`,
+`-y`/`--non-interactive`. Bypass flags (`SKIP_CAPACITY_CHECK`, `ALLOW_UNENCRYPTED_SECRETS`,
+`ALLOW_UNVERIFIED_SOURCE`) describe an invocation rather than an install, so the installer
+never writes them back: a bypass describes one run, and persisting it would silently skip
+the check on later runs. The identity keys (`PLATFORM_AGENT_GSA_NAME`,
 `GITHUB_MINTER_GSA_NAME`, `LITELLM_GSA_NAME`, `GKE_DB_KMS_KEYRING`, `GKE_DB_KMS_KEY`) are
 written into a new `install.env` only when the run set them — a default copied in
 would freeze at that release, and a custom name that went missing would replace the
@@ -191,6 +196,11 @@ making any cluster changes because kube-agents requires NetworkPolicy enforcemen
 
 `ALLOW_UNENCRYPTED_SECRETS=true` skips the out-of-band Cloud KMS CMEK database encryption on
 pre-existing clusters (testing environments only).
+
+`SKIP_CAPACITY_CHECK=true` (or `--skip-capacity-check`) bypasses the pre-apply schedulable capacity
+preflight check on adopted GKE Standard clusters. Schedulable capacity on untainted nodes is required
+for trusted system workloads (operator, LiteLLM, cert-manager) that cannot tolerate the sandbox taint
+on `gvisor-pool`.
 
 ### The predecessor: `vars.sh`
 

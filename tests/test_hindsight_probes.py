@@ -41,6 +41,7 @@ import yaml
 _ROOT = pathlib.Path(__file__).resolve().parents[1]
 _API_YAML = _ROOT / "k8s-operator" / "config" / "integrations" / "hindsight" / "api.yaml"
 _FULL_INSTALL_MAIN_TF = _ROOT / "terraform" / "examples" / "full-install" / "main.tf"
+_FULL_INSTALL_VARIABLES_TF = _ROOT / "terraform" / "examples" / "full-install" / "variables.tf"
 
 # What the gate must have over the startupProbe budget, in seconds, for the
 # pull that precedes the container starting at all. The pinned image is 1.4 GB
@@ -92,6 +93,24 @@ def _kube_agents_release_block():
     return match.group(0)
 
 
+def _gate_variable_name():
+    """The variable the gate reads, or None when the timeout is a literal."""
+    block = _kube_agents_release_block()
+    if re.search(r"^\s*timeout\s*=\s*(\d+)\s*$", block, re.MULTILINE):
+        return None
+    var_match = re.search(r"^\s*timeout\s*=\s*var\.(\w+)\s*$", block, re.MULTILINE)
+    assert var_match, "could not find the timeout on helm_release.kube_agents"
+    return var_match.group(1)
+
+
+def _variable_block(var_name):
+    match = re.search(
+        rf'variable "{var_name}" \{{.*?\n\}}', _FULL_INSTALL_VARIABLES_TF.read_text(), re.DOTALL
+    )
+    assert match, f"could not find variable {var_name} in variables.tf"
+    return match.group(0)
+
+
 def _default_gate_seconds():
     """The rollout budget the install waits for: the helm_release timeout.
 
@@ -99,9 +118,40 @@ def _default_gate_seconds():
     asserting against a number no install uses. The helm provider's timeout is
     plain seconds, no unit suffix.
     """
-    match = re.search(r"^\s*timeout\s*=\s*(\d+)\s*$", _kube_agents_release_block(), re.MULTILINE)
-    assert match, "could not find the timeout on helm_release.kube_agents"
-    return int(match.group(1))
+    block = _kube_agents_release_block()
+    match = re.search(r"^\s*timeout\s*=\s*(\d+)\s*$", block, re.MULTILINE)
+    if match:
+        return int(match.group(1))
+    var_block = _variable_block(_gate_variable_name())
+    default_match = re.search(r"^\s*default\s*=\s*(\d+)\s*$", var_block, re.MULTILINE)
+    assert default_match, "could not find the default for the gate variable in variables.tf"
+    return int(default_match.group(1))
+
+
+def _gate_bounds_seconds():
+    """The window the gate variable's `validation` block admits, inclusive.
+
+    Returns None when the timeout is a literal, which has no window to read.
+    A variable without one is a failure, not a None: the ordering below then
+    holds for the default and for nothing else an operator can pass.
+    """
+    var_name = _gate_variable_name()
+    if var_name is None:
+        return None
+    var_block = _variable_block(var_name)
+    condition = re.search(r"^\s*condition\s*=\s*(.+)$", var_block, re.MULTILINE)
+    assert condition, (
+        f"variable {var_name} needs a validation block: without one every value "
+        "except the default is unchecked at both ends"
+    )
+    expression = condition.group(1)
+    lower = re.search(rf"var\.{var_name}\s*(>=|>)\s*(\d+)", expression)
+    upper = re.search(rf"var\.{var_name}\s*(<=|<)\s*(\d+)", expression)
+    assert lower, f"variable {var_name}'s validation sets no floor: {expression}"
+    assert upper, f"variable {var_name}'s validation sets no ceiling: {expression}"
+    floor = int(lower.group(2)) + (1 if lower.group(1) == ">" else 0)
+    ceiling = int(upper.group(2)) - (1 if upper.group(1) == "<" else 0)
+    return floor, ceiling
 
 
 class StartupProbeTest(unittest.TestCase):
@@ -175,6 +225,40 @@ class RolloutBudgetTest(unittest.TestCase):
         )
         self.assertGreater(self.deadline, self.gate)
 
+    def test_every_gate_an_operator_can_set_covers_the_startup_budget(self):
+        # The two tests above read the default. Once the timeout is a variable
+        # the default is one value out of a range, and the ordering has to hold
+        # across the range or it holds only for the value nobody changed.
+        bounds = _gate_bounds_seconds()
+        if bounds is None:
+            self.skipTest("the gate is a literal, so there is no range to bound")
+        floor, _ = bounds
+        self.assertGreaterEqual(
+            floor,
+            self.startup + _PULL_ALLOWANCE_SECONDS,
+            f"the gate variable admits {floor}s, which leaves "
+            f"{floor - self.startup}s for a 1.4 GB pull on top of a "
+            f"{self.startup}s startupProbe budget; an operator who sets it "
+            "aborts a hindsight-api cold roll that is loading normally",
+        )
+
+    def test_no_gate_an_operator_can_set_outlasts_the_progress_deadline(self):
+        # Above the deadline the number is decorative: helm stops waiting when
+        # the Deployment gives up, so the extra minutes an operator asked for
+        # buy nothing and the failure reads as a different error.
+        bounds = _gate_bounds_seconds()
+        if bounds is None:
+            self.skipTest("the gate is a literal, so there is no range to bound")
+        _, ceiling = bounds
+        self.assertLess(
+            ceiling,
+            self.deadline,
+            f"the gate variable admits {ceiling}s against a "
+            f"{self.deadline}s progressDeadlineSeconds; helm reports "
+            "'exceeded its progress deadline' at the deadline however long it "
+            "was asked to wait",
+        )
+
     def test_the_release_waits_with_an_explicit_gate(self):
         # wait defaulted-on is not enough: the provider's default timeout is
         # 300s, below the startup budget plus a slow pull, so leaving the
@@ -188,7 +272,7 @@ class RolloutBudgetTest(unittest.TestCase):
         )
         self.assertRegex(
             block,
-            r"(?m)^\s*timeout\s*=\s*\d+\s*$",
+            r"(?m)^\s*timeout\s*=\s*(\d+|var\.\w+)\s*$",
             "helm_release.kube_agents needs an explicit timeout; the provider "
             "default (300s) gives up on a cold hindsight-api roll that is "
             "loading normally",
