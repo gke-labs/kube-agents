@@ -119,16 +119,19 @@ env:
   CI_HEALTH_MUTE: ${{ vars.CI_HEALTH_MUTE || 'false' }}
   # collect.py's inputs, the same values hack/ci-dashboard-refresh.sh uses:
   # the smoke-test presubmit's archive, the nightly periodic's log prefix
-  # (same bucket, so the reader's grant already covers it; until the
-  # periodic exists the prefix lists nothing, which collect.py notes and
-  # carries on -- it is not the refusal line below until a night is on
-  # record, after which a prefix that stops listing is), the bound collect.py
+  # (its own bucket, gs://kube-agents-evals-nightly-logs, since the nightly's
+  # identity cannot write the cluster default; the collect step's
+  # github-actions@kube-agents-prow holds objectViewer on it. Until a night
+  # lands there the prefix holds no objects, which collect.py notes and
+  # carries on -- with or without a night on record from the old bucket; a
+  # prefix that fails to list for any other reason once a night is on
+  # record is the refusal line below), the bound collect.py
   # applies to a prior it finds unusable (a corrupt download; a missing one
   # stops the step before collect.py runs), and the freshness-badge
   # threshold written into data.json (this job's 15m cadence with slack for
   # ~2 missed ticks).
   PR_GLOB: gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*
-  NIGHTLY_PREFIX: gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly/
+  NIGHTLY_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/
   # The release-candidate lane's archive. A postsubmit, so logs/ rather than
   # pr-logs/. Bounded by --rc-limit rather than by the presubmit watermark.
   RC_GLOB: gs://kube-agents-prow/logs/post-kube-agents-eval-rc/*

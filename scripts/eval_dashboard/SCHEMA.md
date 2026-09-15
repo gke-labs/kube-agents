@@ -260,8 +260,10 @@ Additive, optional, and safe to omit — consumers must default them.
   index pointer that could not be read this scan, so
   they are not in `runs[]` and do not raise the watermark. Entries are
   `{"build_id": "<id>", "first_seen": "<iso8601>"}`, plus `"tier": "nightly"`
-  when the nightly periodic's listing named the build (absent: the
-  presubmit's, as for `runs[].tier`; the tag is kept across scans), lowest
+  and `"log_url"` (Spyglass's page for the build directory, as for
+  `runs[].log_url`) when the nightly periodic's listing named the build
+  (absent: the presubmit's, as for `runs[].tier`; both are kept across
+  scans), lowest
   id first; `first_seen` is when the collector first listed the build. The next
   incremental scan re-reads exactly these ids even though they sit at or
   below the watermark, and drops an entry once it is recorded or once
@@ -344,6 +346,13 @@ what the renderer does with them.
 - `runs[].eval_verdict` — `GREEN` | `RED` | `null`: the Nightly report reads
   it; a night that is not a `SUCCESS` and carries `null` was ended before
   its verdict and is reported as truncated. Absent means unknown.
+- `runs[].log_url` — nightly runs only: Spyglass's page for the build
+  directory the collector listed
+  (`https://oss.gprow.dev/view/gs/<bucket>/logs/<job>/<build>`), so the
+  Nightly report's links follow whichever bucket the nightly logs to.
+  Absent on a nightly record means it predates the field and was read from
+  the bucket the nightly used before 2026-09-15, `gs://kube-agents-prow`;
+  `nightly.py` links it there.
 - `runs[].has_build_log`, `runs[].pod_*` — a zero-task `FAILURE` with
   `pod_last_event: "NodeNotReady"` or `has_build_log: false` is a **lost
   pod**: `classify.py` gives it its own run-level headline (`infra`, never
@@ -390,15 +399,20 @@ what the renderer does with them.
   names every build and the watermark filter runs on it directly. Every
   build read through it is `tier: "nightly"`, `pr: null`, `job` the
   prefix's last segment (or `--nightly-job`). Given without a value it is
-  `gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly/`; omitted, no
+  `gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/`
+  (the nightly's own bucket; the presubmit and the RC lane stay on the
+  cluster default `gs://kube-agents-prow`); omitted, no
   nightly scan happens (`--merge-with` alone still recomputes without
-  touching the bucket). A prefix that does not list is read by whether a
-  night is already on record. With none (no nightly watermark) the
-  periodic may simply not have run yet, so that is a
+  touching the bucket). A prefix that does not list is read three ways. A
+  prefix with no objects (`gsutil` says "matched no objects") is a job
+  that has not run there yet — before its first night, or after its bucket
+  moved while nights from the old one are on record — so that is a
   `note: nightly prefix ... did not list` line and no nightly runs this
   scan, **not** the refusal line below: the nightly is evidence beside the
   gate, and a missing night must not stop the gate's dashboard from
-  publishing. With a night on record it is a
+  publishing. Any other failure with no night on record (no nightly
+  watermark) is the same note: the periodic may simply not exist yet. With
+  a night on record, any other failure is a
   `warning: gsutil ls failed for ...` line — the refusal line — because a
   prefix that listed yesterday and not today is the bucket or the grant
   failing, and republishing would freeze the nightly record under a fresh
@@ -609,7 +623,9 @@ is every `fail` tonight that was not `fail` on `previous_build`, the night
 before it on record (the one past the window included), `fixed` every
 `fail` then that is `pass` now; both `[]` on the first night, when
 `previous_build` is `null`. `log_url` and `transcript_url` point at
-Spyglass under `logs/<job>/<build>`, a periodic's path. The nights are
+Spyglass under `logs/<job>/<build>`, a periodic's path, in the bucket the
+run's `runs[].log_url` names (without it: `gs://kube-agents-prow`, the
+bucket before 2026-09-15). The nights are
 never in `runs[]`. `running[]` is the nightly's entries of `pending_builds`
 first seen inside `RUNNING_MAX_AGE` (9 hours: the periodic's 8-hour budget
 and Prow's time to write `finished.json`) of `generated_at`, oldest first,

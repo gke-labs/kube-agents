@@ -256,7 +256,12 @@ def local(url):
 
 if sys.argv[1] == "ls":
     base = local(sys.argv[2].rstrip("*"))
+    if os.environ.get("FAKE_GSUTIL_DENY") and os.environ["FAKE_GSUTIL_DENY"] in argv:
+        print("AccessDeniedException: 403 fake@fake.iam.gserviceaccount.com does not have storage.objects.list access", file=sys.stderr)
+        sys.exit(1)
     if not base.is_dir():
+        # gsutil's wording for a prefix that exists but holds nothing.
+        print("CommandException: One or more URLs matched no objects.", file=sys.stderr)
         sys.exit(1)
     for p in sorted(base.iterdir()):
         rel = BUCKET + p.relative_to(root).as_posix()
@@ -330,6 +335,7 @@ class _MergeBase(unittest.TestCase):
         self.addCleanup(os.environ.pop, "FAKE_GSUTIL_ROOT", None)
         self.addCleanup(os.environ.pop, "FAKE_GSUTIL_LOG", None)
         self.addCleanup(os.environ.pop, "FAKE_GSUTIL_SLEEP", None)
+        self.addCleanup(os.environ.pop, "FAKE_GSUTIL_DENY", None)
         return str(gsutil), log
 
     @staticmethod
@@ -941,6 +947,9 @@ class TestNightlySource(_MergeBase):
         self.assertEqual(run["build_id"], BUILD_998_FULL)
         self.assertEqual(run["tier"], "nightly")
         self.assertEqual(run["job"], FAKE_NIGHTLY_JOB, "derived from the prefix, not hardcoded")
+        # Spyglass's page for the directory the listing named, so the report
+        # links follow the bucket rather than one the renderer assumes.
+        self.assertEqual(run["log_url"], f"https://oss.gprow.dev/view/gs/fake-prow/logs/{FAKE_NIGHTLY_JOB}/{BUILD_998_FULL}")
         # The real fixture's started.json says pull 998; a periodic runs main
         # and its run is nobody's pull request whatever the metadata says.
         self.assertIsNone(run["pr"])
@@ -1021,9 +1030,10 @@ class TestNightlySource(_MergeBase):
         self.assertIn("nightly scan resumed above build None, 0 new", stderr)
 
     def test_a_known_prefix_that_stops_listing_is_the_refusal_line(self):
-        """Once a night is on record, a prefix that does not list is a stall,
+        """Once a night is on record, a prefix that fails to list is a stall,
         not an absent job: republishing would freeze the nightly record."""
         gsutil, _ = self.fake_gsutil([BUILD_998_FULL])
+        os.environ["FAKE_GSUTIL_DENY"] = FAKE_NIGHTLY_PREFIX
         prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_INFRA])).read_text())
         prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="nightly", pr=None))
         merged, stderr = self.quiet_collect(
@@ -1033,6 +1043,23 @@ class TestNightlySource(_MergeBase):
         self.assertEqual(len(merged["runs"]), 3, "the presubmit side still collected")
         self.assertRegex(stderr, WORKFLOW_REFUSAL)
         self.assertIn(f"warning: gsutil ls failed for {FAKE_NIGHTLY_PREFIX}", stderr)
+
+    def test_a_known_but_empty_prefix_is_a_note_the_night_the_bucket_moves(self):
+        """The nightly's logs moved buckets on 2026-09-15 with one night on
+        record from the old one; until the first night lands in the new
+        prefix, `gsutil ls` says it matched no objects. That is not the
+        bucket or the grant failing, and the gate's dashboard must keep
+        publishing through the day."""
+        gsutil, _ = self.fake_gsutil([BUILD_998_FULL])
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_INFRA])).read_text())
+        prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="nightly", pr=None))
+        merged, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], nightly_prefix=FAKE_NIGHTLY_PREFIX, merge_with=self.write_prior(prior_data),
+            gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX,
+        )
+        self.assertEqual(len(merged["runs"]), 3, "the old night stays on record")
+        self.assertIn(f"note: nightly prefix {FAKE_NIGHTLY_PREFIX} did not list", stderr)
+        self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
 
     def test_an_unfinished_nightly_build_rides_pending_with_its_tier(self):
         """The retry list is shared, so the entry says which source listed
@@ -1044,15 +1071,16 @@ class TestNightlySource(_MergeBase):
         now = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
         data, stderr = self.quiet_collect(nightly_prefix=FAKE_NIGHTLY_PREFIX, gsutil=gsutil, now=now)
         self.assertEqual(data["runs"], [])
-        self.assertEqual(data["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "nightly"}])
+        url = f"https://oss.gprow.dev/view/gs/fake-prow/logs/{FAKE_NIGHTLY_JOB}/{BUILD_998_FULL}"
+        self.assertEqual(data["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "nightly", "log_url": url}])
         self.assertIsNone(WORKFLOW_REFUSAL.search(stderr))
-        # The tag survives a scan whose nightly listing does not name the
-        # build again (the listing failed, or the build fell off it).
+        # The tag and the link survive a scan whose nightly listing does not
+        # name the build again (the listing failed, or the build fell off it).
         prior = self.write_prior(data)
         gsutil, _ = self.fake_gsutil([])
         later = now + timedelta(minutes=15)
         merged, _ = self.quiet_collect(nightly_prefix=FAKE_NIGHTLY_PREFIX, merge_with=prior, gsutil=gsutil, now=later)
-        self.assertEqual(merged["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "nightly"}])
+        self.assertEqual(merged["pending_builds"], [{"build_id": BUILD_998_FULL, "first_seen": now.isoformat(), "tier": "nightly", "log_url": url}])
 
     def test_cases_keep_the_two_records_apart(self):
         """The per-case fields are the presubmit's; the nightly's sit under
@@ -1113,7 +1141,7 @@ class TestNightlySource(_MergeBase):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(collect.main(["--nightly-prefix", "--gsutil", gsutil, "--gh", "", "--out", str(out)]), 0)
         self.assertEqual([c for c in log.read_text().splitlines() if c.startswith("ls ")], [f"ls {collect.DEFAULT_NIGHTLY_PREFIX}"])
-        self.assertEqual(collect.DEFAULT_NIGHTLY_PREFIX, "gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly/")
+        self.assertEqual(collect.DEFAULT_NIGHTLY_PREFIX, "gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/")
         # Nothing at all is still an error.
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
             collect.main(["--out", str(out)])
@@ -1173,6 +1201,14 @@ class TestContractShape(unittest.TestCase):
             ["name", "domain", "active", "nightly_active", "runs_on_record", "pass_rate", "last3", "durations", "ov_history", "nightly"],
         )
         self.assertEqual(list(data["cases"][0]["nightly"]), ["runs_on_record", "pass_rate", "last3"])
+
+    def test_spyglass_url_follows_the_bucket(self):
+        self.assertEqual(collect.spyglass_url("gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/2099649477534027777/"),
+                         "https://oss.gprow.dev/view/gs/kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/2099649477534027777")
+        self.assertEqual(collect.spyglass_url("gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly/2099649477534027776"),
+                         "https://oss.gprow.dev/view/gs/kube-agents-prow/logs/ci-kube-agents-eval-nightly/2099649477534027776")
+        self.assertIsNone(collect.spyglass_url("/tmp/builds/1"))
+        self.assertIsNone(collect.spyglass_url(None))
 
     def test_from_dir_runs_are_the_presubmit_with_no_job(self):
         """The offline source has no URL to read a job from; the tier is the

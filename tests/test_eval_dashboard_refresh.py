@@ -305,7 +305,7 @@ class RefreshScriptTest(unittest.TestCase):
         self.assertIn("--nightly-prefix", argv)
         self.assertEqual(
             argv[argv.index("--nightly-prefix") + 1],
-            "gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly/",
+            "gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/",
         )
         argv_log.unlink()
         run_script(

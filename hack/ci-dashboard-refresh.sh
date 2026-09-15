@@ -123,7 +123,7 @@ trap cleanup EXIT
 trap 'exit 143' TERM INT
 
 EVAL_DASHBOARD_PR_GLOB="${EVAL_DASHBOARD_PR_GLOB:-gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*}"
-EVAL_DASHBOARD_NIGHTLY_PREFIX="${EVAL_DASHBOARD_NIGHTLY_PREFIX-gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly/}"
+EVAL_DASHBOARD_NIGHTLY_PREFIX="${EVAL_DASHBOARD_NIGHTLY_PREFIX-gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/}"
 # The release-candidate archive, which feeds the Brief's release-candidate table.
 # post-kube-agents-eval-rc is a postsubmit, so its builds land under logs/
 # rather than pr-logs/. Set to the empty string to leave the section on its
