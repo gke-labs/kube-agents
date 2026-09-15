@@ -258,7 +258,7 @@ func TestTheBrokerRecreationGivesTheReconcileBackWhenTheDeleteHangs(t *testing.T
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	key := client.ObjectKey{Name: credentialBrokerName(agent), Namespace: agent.Namespace}
-	if err := r.awaitDeploymentGone(ctx, key, credentialBrokerRecreateLabel); err == nil {
+	if err := r.awaitCredentialProxyDeploymentGone(ctx, key); err == nil {
 		t.Fatal("a wait that cannot finish must return an error, not report the object gone")
 	}
 }

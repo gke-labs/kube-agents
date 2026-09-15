@@ -56,6 +56,7 @@ import (
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	agentv1alpha1 "github.com/gke-labs/kube-agents/k8s-operator/api/v1alpha1"
 )
@@ -75,9 +76,12 @@ const (
 	// are pinned together by TestReconcileA2ADeletesSupersededProvisionJobs.
 	a2aProvisionComponent = "provision"
 
-	// What applyDeploymentRecreatingOnInvalid calls the gateway's Deployment
-	// in its log line and errors.
-	a2aGatewayRecreateLabel = "A2A gateway"
+	// The merge patch applyA2AGatewayDeployment sends when the apply of the
+	// gateway's Recreate strategy is refused over the rollingUpdate block the
+	// API server defaulted onto a gateway applied before the strategy was set.
+	// Both keys in one patch: nulling the block alone leaves the type at
+	// RollingUpdate, and the server defaults the block straight back.
+	a2aGatewayRecreateStrategyPatch = `{"spec":{"strategy":{"type":"Recreate","rollingUpdate":null}}}`
 
 	// The LiteLLM ports the session fence grants, for the reason
 	// buildAgentEgressNetworkPolicy's LiteLLM rule states in full: a Pod
@@ -1909,16 +1913,54 @@ func (r *PlatformAgentReconciler) reconcileA2A(ctx context.Context, agent *agent
 	if err := ctrl.SetControllerReference(agent, dep, r.Scheme); err != nil {
 		return state, err
 	}
-	// Recreating on Invalid rather than a plain applyManaged: a gateway
-	// Deployment applied before the strategy became Recreate carries the
-	// server-defaulted rollingUpdate block, which no manager owns, so the
-	// apply that sets Recreate is refused until the object is replaced.
-	// applyDeploymentRecreatingOnInvalid says why an update cannot do it.
-	if err := r.applyDeploymentRecreatingOnInvalid(ctx, agent, dep, a2aGatewayRecreateLabel); err != nil {
+	if err := r.applyA2AGatewayDeployment(ctx, agent, dep); err != nil {
 		return state, fmt.Errorf("failed to apply A2A gateway Deployment: %w", err)
 	}
 
 	return state, nil
+}
+
+// applyA2AGatewayDeployment applies the gateway Deployment and, when the API
+// server refuses the apply as Invalid, clears the strategy in place and applies
+// again.
+//
+// A gateway Deployment applied before the builder set Recreate named no
+// strategy, so the server defaulted a rollingUpdate block onto the live object.
+// No field manager owns that block, so a server-side apply of `type: Recreate`
+// leaves it in place and is refused with "spec.strategy.rollingUpdate:
+// Forbidden: may not be specified when strategy type is 'Recreate'" -- on every
+// reconcile, since ForceOwnership only settles conflicts between managers and
+// this block has none. The apply would fail forever and take the rest of the
+// reconcile with it.
+//
+// A merge patch, not the delete-and-recreate the credential broker uses for
+// its immutable selector (applyCredentialProxyDeployment). Every session pod
+// the gateway spawns carries an ownerReference to this Deployment, by UID
+// (A2A_OWNER_DEPLOYMENT; a2a/gateway/spawn.go resolveOwner), so deleting the
+// object would hand every in-flight session to the garbage collector along
+// with the gateway pod. The patch keeps the object and its UID, and a strategy
+// change alone touches no pod template, so nothing rolls: the gateway pod and
+// its sessions run on. The same move clearForeignPDBBudgetField makes for a
+// field on the PodDisruptionBudget that another manager left behind.
+//
+// Invalid is checked once, not by parsing the message: the strategy is the one
+// field this render changed on a live gateway, and a refusal the patch does not
+// cure comes back from the second apply as the error it is.
+func (r *PlatformAgentReconciler) applyA2AGatewayDeployment(ctx context.Context, agent *agentv1alpha1.PlatformAgent, dep *appsv1.Deployment) error {
+	err := r.applyManaged(ctx, agent, dep)
+	if !errors.IsInvalid(err) {
+		return err
+	}
+
+	logf.FromContext(ctx).Info("the A2A gateway Deployment carries a rollingUpdate block no manager owns; clearing it in place",
+		"deployment", dep.Name, "reason", err.Error())
+
+	live := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: dep.Name, Namespace: dep.Namespace}}
+	patch := client.RawPatch(types.MergePatchType, []byte(a2aGatewayRecreateStrategyPatch))
+	if patchErr := r.Patch(ctx, live, patch); patchErr != nil {
+		return fmt.Errorf("failed to clear the strategy of the A2A gateway Deployment %s/%s: %w", dep.Namespace, dep.Name, patchErr)
+	}
+	return r.applyManaged(ctx, agent, dep)
 }
 
 // a2aTeardownEntry is one namespaced object cleanupA2A removes, with the reader
