@@ -52,13 +52,18 @@ Sources:
               `latest-build.txt` this collector ignores -- so one `gsutil
               ls` of it names every build. Given without a value it is the
               live nightly's prefix (DEFAULT_NIGHTLY_PREFIX); omitted, no
-              nightly scan happens. A prefix that does not list while no
-              night is on record (the job has not run yet) is a note and no
-              nightly runs this scan, not the refusal line below: the
-              nightly is evidence beside the gate, and a missing night must
-              not stop the gate's dashboard from publishing. Once a night is
-              on record, a prefix that stops listing IS the refusal line: a
-              stall, not an absent job.
+              nightly scan happens. A prefix that does not list is read
+              three ways. One that holds no objects (gsutil: "matched no
+              objects") is a job that has not run there yet -- before its
+              first night, or after its bucket moved -- and is a note and
+              no nightly runs this scan whether or not a night is on
+              record, not the refusal line below: the nightly is evidence
+              beside the gate, and a missing night must not stop the gate's
+              dashboard from publishing (a prefix emptied or mistyped reads
+              the same way, and shows as "no night" on the digest and the
+              Nightly page instead). Any other failure with no night on
+              record is the same note. Once a night is on record, any other
+              failure IS the refusal line: a stall, not an absent job.
   --nightly-job  the job name recorded on nightly runs (`runs[].job`);
               defaults to the prefix's last path segment.
   --index-prefix  Prow's per-job directory index, gs://<bucket>/pr-logs/
@@ -162,6 +167,11 @@ DEFAULT_NIGHTLY_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_JOB}/"
 # Where Prow's Spyglass shows a build directory: the gs:// path after the
 # scheme, so a link follows the bucket the build was read from.
 SPYGLASS_VIEW = "https://oss.gprow.dev/view/gs/"
+# What `gsutil ls` says about a prefix that exists but holds nothing yet, as
+# distinct from a bucket or a grant failing (AccessDeniedException,
+# BucketNotFoundException, a timeout): the nightly's prefix reads that way
+# from the day its bucket moves until the first night lands there.
+_NO_OBJECTS = re.compile(r"matched no objects")
 # What a build's job is called, read from the build directory's URL: the
 # segment before the build id, for a presubmit
 # (.../pull/<org_repo>/<pr>/<job>/<build>/) and a periodic
@@ -1023,12 +1033,6 @@ def _gsutil_call(args: list[str], gsutil: str = "gsutil") -> tuple[str | None, s
 
 def _gsutil(args: list[str], gsutil: str = "gsutil") -> str | None:
     return _gsutil_call(args, gsutil)[0]
-
-
-# What `gsutil ls` says about a prefix that exists but holds nothing yet, as
-# distinct from a bucket or a grant failing (AccessDeniedException,
-# BucketNotFoundException, a timeout).
-_NO_OBJECTS = re.compile(r"matched no objects")
 
 
 _PR_IN_PATH = re.compile(r"/pull/[^/]+/(\d+)/")

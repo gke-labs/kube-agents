@@ -23,11 +23,13 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 #   A. Collect runs as github-actions@kube-agents-prow. It is the only
 #      account with a read grant on gs://kube-agents-prow (the OSS Prow
 #      project's bucket; the grant cannot be copied from here). It reads the
-#      archive and the prior data.json and writes the merged data.json to
-#      the runner's disk. It writes nothing to any bucket. A read grant for
-#      the dedicated publisher has been requested from the OSS Prow owners;
-#      once it lands, this step switches account and the job is
-#      single-identity.
+#      archive, the nightly's own bucket gs://kube-agents-evals-nightly-logs
+#      (kube-agents-owned; it holds objectViewer there too, and whichever
+#      account replaces it needs the same) and the prior data.json, and
+#      writes the merged data.json to the runner's disk. It writes nothing
+#      to any bucket. A read grant for the dedicated publisher has been
+#      requested from the OSS Prow owners; once it lands, this step
+#      switches account and the job is single-identity.
 #   B. Everything else runs as eval-dashboard-publisher@kube-agents-prow --
 #      the dedicated publisher hack/ci-eval-pr.sh names for this bucket. It
 #      holds roles/storage.objectUser on gs://kube-agents-dashboards and is
@@ -219,7 +221,7 @@ jobs:
           # attempt (header). Seed once by hand and the next tick is
           # incremental.
           if ! gsutil -q cp "$DASHBOARD_BUCKET/data.json" work/prior-data.json; then
-            echo "::error::no published data.json at $DASHBOARD_BUCKET/data.json; this job runs the incremental path only. Seed the bucket once with: EVAL_DASHBOARD_TARGET=$DASHBOARD_BUCKET/ JOB_TYPE=periodic EVAL_DASHBOARD_TIMEOUT=3600 ./hack/ci-dashboard-refresh.sh (from a machine whose account can read gs://kube-agents-prow and write the bucket)"
+            echo "::error::no published data.json at $DASHBOARD_BUCKET/data.json; this job runs the incremental path only. Seed the bucket once with: EVAL_DASHBOARD_TARGET=$DASHBOARD_BUCKET/ JOB_TYPE=periodic EVAL_DASHBOARD_TIMEOUT=3600 ./hack/ci-dashboard-refresh.sh (from a machine whose account can read gs://kube-agents-prow and gs://kube-agents-evals-nightly-logs and write the bucket)"
             exit 1
           fi
           timeout "$COLLECT_TIMEOUT_S" python3 scripts/eval_dashboard/collect.py \

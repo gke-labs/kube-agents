@@ -974,6 +974,7 @@ class TestNightlySource(_MergeBase):
         data, _ = self.quiet_collect(pr_globs=[FAKE_GLOB], gsutil=gsutil)
         (run,) = data["runs"]
         self.assertEqual((run["tier"], run["job"], run["pr"]), ("presubmit", "pull-kube-agents-smoke-test", 998))
+        self.assertNotIn("log_url", run, "the nightly's field; the pages build a presubmit's link themselves")
 
     def test_each_source_resumes_above_its_own_watermark(self):
         """Prow build ids are one global sequence, so the newest presubmit
@@ -1043,6 +1044,36 @@ class TestNightlySource(_MergeBase):
         self.assertEqual(len(merged["runs"]), 3, "the presubmit side still collected")
         self.assertRegex(stderr, WORKFLOW_REFUSAL)
         self.assertIn(f"warning: gsutil ls failed for {FAKE_NIGHTLY_PREFIX}", stderr)
+
+    def test_a_known_prefix_that_times_out_is_the_refusal_line(self):
+        """A hung listing says nothing about objects; with a night on record
+        it is the refusal line, as any hung gsutil call is."""
+        gsutil, _ = self.fake_gsutil([BUILD_998_FULL])
+        self.place_nightly_build(BUILD_998_FULL)
+        prior_data = json.loads(pathlib.Path(self.prior_with([BUILD_998_INFRA])).read_text())
+        prior_data["runs"].append(dict(prior_data["runs"][0], build_id="1", tier="nightly", pr=None))
+        self.addCleanup(setattr, collect, "GSUTIL_TIMEOUT_S", collect.GSUTIL_TIMEOUT_S)
+        collect.GSUTIL_TIMEOUT_S = 1
+        os.environ["FAKE_GSUTIL_SLEEP"] = json.dumps({f"ls {FAKE_NIGHTLY_PREFIX}": 3})
+        merged, stderr = self.quiet_collect(
+            pr_globs=[FAKE_GLOB], nightly_prefix=FAKE_NIGHTLY_PREFIX, merge_with=self.write_prior(prior_data),
+            gsutil=gsutil, index_prefix=FAKE_INDEX_PREFIX,
+        )
+        self.assertEqual(len(merged["runs"]), 3, "the presubmit side still collected")
+        self.assertRegex(stderr, WORKFLOW_REFUSAL)
+
+    def test_a_prior_pending_night_without_a_link_keeps_its_tier_and_gets_none(self):
+        """An entry the collector wrote before `log_url` existed rides the
+        retry list with its tier and no link; the Nightly page then links it
+        under the legacy bucket, which is where such a build is."""
+        gsutil, _ = self.fake_gsutil([])
+        now = datetime(2026, 9, 10, 12, 0, tzinfo=timezone.utc)
+        prior = self.write_prior({
+            "schema_version": 1, "generated_at": now.isoformat(), "source": "logs", "runs": [], "cases": [],
+            "pending_builds": [{"build_id": "2099649477534027776", "first_seen": now.isoformat(), "tier": "nightly"}],
+        })
+        merged, _ = self.quiet_collect(nightly_prefix=FAKE_NIGHTLY_PREFIX, merge_with=prior, gsutil=gsutil, now=now + timedelta(minutes=15))
+        self.assertEqual(merged["pending_builds"], [{"build_id": "2099649477534027776", "first_seen": now.isoformat(), "tier": "nightly"}])
 
     def test_a_known_but_empty_prefix_is_a_note_the_night_the_bucket_moves(self):
         """The nightly's logs moved buckets on 2026-09-15 with one night on
