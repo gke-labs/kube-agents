@@ -1,8 +1,11 @@
 # NIGHTLY-ACTIVE — registered in hack/ci-eval-pr.sh NIGHTLY_TASKS, not
 # TASKS, since 2026-09-15 (#1023: every domain at least two cases). New
-# cases land in the nightly by default; the record it builds there is what
-# a later roster edit cites (#1568), and the presubmit seat stays with the
-# probes. Measured in the authoring pull request's draft presubmit run
+# cases land in the nightly first: that is PR #1620's rule, open when this
+# was written; the Registration paragraph in docs/designs/bench-case-format.md
+# predates it and would seat a fast case in an uncovered domain in TASKS.
+# The record it builds in the nightly is what a later roster edit cites
+# (#1568), and the presubmit seat stays with the probes. Measured in the
+# authoring pull request's draft presubmit run
 # before the move -- the build id and per-repetition costs go here and in
 # bench/tasks/DRAFTS.md once that run is in.
 #
@@ -133,9 +136,9 @@ prompt: |
   **'apply'**' bullet, and nothing else. Every <...> is a placeholder to
   fill in.
 
-  Propose only. The fix ships as a Pull Request against the GitOps
-  repository; write nothing to the live cluster (no `kubectl scale`,
-  `patch`, `apply`, `edit` or `delete`).
+  Propose only. Do not open that Pull Request yourself: a human authorizes
+  it from your report. Write nothing to the live cluster (no `kubectl
+  scale`, `patch`, `apply`, `edit` or `delete`).
 expected_output: |
   critical requirements:
   - It locates the cluster carrying the seeded-debug namespace and names
@@ -236,6 +239,28 @@ verification_spec:
       # a reword on any side reds there before it reds a run.
       required_phrases: ["What to do"]
       any_of_phrases: ["Option A", "To authorize:"]
+
+  - name: the-placeholders-were-filled
+    role: objective
+    mode: assert
+    check:
+      type: report_contains
+      # The prompt hands the agent the delivery template with its
+      # placeholders in it, and the check above accepts that template's
+      # tokens anywhere in the final message. A report that copied the
+      # skeleton unfilled -- `**Option A (<Action Title>):** <1-sentence
+      # description of Option A GitOps fix>` -- would therefore pass
+      # delivery on the strength of the prompt alone, and only the judge,
+      # which gates nothing, would notice. The production template forbids
+      # a literal `<letter>` for the same reason. `<` survives _normalize,
+      # which strips only *, _ and `, so the angle bracket is what makes
+      # each phrase a placeholder and not prose.
+      #
+      # A check of its own rather than forbidden_phrases on the delivery
+      # check: bench/tests/test_triage_delivery_contract.py drives THAT check
+      # with exemplars cut from the template's own text, placeholders
+      # included, and would red on the guard.
+      forbidden_phrases: ["<Action Title>", "<letter>", "<1-sentence"]
 
   # Cluster-state safeguard: "the fleet came out the way it went in."
   # tool_called cannot see worker mutations (the trajectory carries only the

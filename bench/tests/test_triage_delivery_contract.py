@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The triage delivery contract, held together across the three files that own it.
+"""The triage delivery contract, held together across the files that own it.
 
 ``_triage_task_body`` (agents/platform/scripts/session_kv_server.py) writes the
 report template a Cluster Agent fills in. It permits two shapes, and the
@@ -29,8 +29,8 @@ template:
 * ``actionable_report`` (deploy/docker/patches/kanban_notifier.py) decides in
   production whether a completed card earns an ``incidents`` row — whether a
   reply saying ``apply`` will find a report to act on. Three regexes.
-* ``autoops-warning-event-triage``'s delivery objective decides whether the eval
-  case passes. Phrase lists in a task.yaml.
+* The delivery objective of each case in ``CASE_PATHS`` decides whether that
+  eval case passes. Phrase lists in a task.yaml.
 
 So one decision lives in three files, joined by string literals. **The
 template↔notifier half of that join is already held**, by
