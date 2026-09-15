@@ -584,9 +584,11 @@ Three outputs, each `null` while the flag is off: `drift_pubsub_topic`,
 fully-qualified path the drift detector's `--subscription` flag takes.
 
 The subscription is the input to the drift detector of
-[`docs/designs/drift-detection.md`](../../../docs/designs/drift-detection.md),
-which does not exist yet: no code in this repository detects drift, so nothing
-consumes it. Turned on ahead of the detector, the sink publishes every mutating
+[`docs/designs/drift-detection.md`](../../../docs/designs/drift-detection.md).
+Its ingestion half exists as
+[`k8s-operator/cmd/drift-detector`](../../../k8s-operator/cmd/drift-detector/README.md),
+but no image builds it and no install launches it, so nothing consumes the
+subscription yet. Turned on ahead of the detector, the sink publishes every mutating
 call on every GKE cluster in the project (about 60k messages a day after the
 module's lease filter, per its README) into a subscription that retains them
 for 31 days and never expires: Pub/Sub storage cost and a backlog, not a
