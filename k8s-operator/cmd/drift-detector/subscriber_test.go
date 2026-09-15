@@ -30,6 +30,12 @@ type fakeSource struct {
 
 	acked  []string
 	nacked []string
+
+	// recordCtxErr captures the context state each settle call was made on, so
+	// a test can assert that shutdown does not abort them.
+	recordCtxErr bool
+	ackCtxErr    error
+	nackCtxErr   error
 }
 
 func (f *fakeSource) Pull(ctx context.Context, maxMessages int64) ([]receivedMessage, error) {
@@ -46,11 +52,17 @@ func (f *fakeSource) Pull(ctx context.Context, maxMessages int64) ([]receivedMes
 }
 
 func (f *fakeSource) Ack(ctx context.Context, ackIDs []string) error {
+	if f.recordCtxErr && len(ackIDs) > 0 {
+		f.ackCtxErr = ctx.Err()
+	}
 	f.acked = append(f.acked, ackIDs...)
 	return nil
 }
 
 func (f *fakeSource) Nack(ctx context.Context, ackIDs []string) error {
+	if f.recordCtxErr && len(ackIDs) > 0 {
+		f.nackCtxErr = ctx.Err()
+	}
 	f.nacked = append(f.nacked, ackIDs...)
 	return nil
 }
@@ -112,6 +124,36 @@ func TestProcessBatchNacksUndecodableMessage(t *testing.T) {
 	}
 	if got := sub.Counts().Failed; got != 1 {
 		t.Errorf("failed count = %d, want 1", got)
+	}
+}
+
+// On SIGTERM the loop's context is already cancelled by the time the batch it
+// was working on has to be settled. Settling on that context would abort every
+// ack, and the whole batch -- already handled -- would be redelivered to the
+// next instance. At T4 that is a duplicate inject on every restart.
+func TestProcessBatchSettlesAfterContextCancelled(t *testing.T) {
+	source := &fakeSource{recordCtxErr: true}
+	sub := newSubscriber(source, func(AuditRecord) {}, defaultMaxMessages)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	sub.processBatch(ctx, []receivedMessage{
+		{AckID: "ack-parsed", Data: []byte(humanPatchEntry)},
+		{AckID: "ack-failed", Data: []byte(malformedEntry)},
+	})
+
+	if !equalStrings(source.acked, []string{"ack-parsed"}) {
+		t.Errorf("acked = %v, want [ack-parsed]", source.acked)
+	}
+	if !equalStrings(source.nacked, []string{"ack-failed"}) {
+		t.Errorf("nacked = %v, want [ack-failed]", source.nacked)
+	}
+	if source.ackCtxErr != nil {
+		t.Errorf("Ack ran on a cancelled context (%v); it must survive shutdown", source.ackCtxErr)
+	}
+	if source.nackCtxErr != nil {
+		t.Errorf("Nack ran on a cancelled context (%v); it must survive shutdown", source.nackCtxErr)
 	}
 }
 

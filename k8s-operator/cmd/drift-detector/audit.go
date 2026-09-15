@@ -25,10 +25,17 @@ import (
 const (
 	// kubernetesAuditService is the serviceName Cloud Audit Logs stamps on
 	// Kubernetes API calls. The sink filter already restricts to
-	// resource.type="k8s_cluster", so an entry failing this check means the
-	// sink filter and this detector have drifted apart, not that an unrelated
-	// message arrived.
+	// resource.type="k8s_cluster", so an entry carrying a different service is
+	// a sink whose filter no longer matches this detector: understood, not
+	// actionable, and acked -- but counted and logged, because a subscription
+	// where every message takes that path is a misconfiguration and not a quiet
+	// cluster.
 	kubernetesAuditService = "k8s.io"
+
+	// kubernetesClusterResourceType is the monitored-resource type the sink
+	// filter selects on. An entry carrying some other non-empty type reached
+	// the topic from outside that filter.
+	kubernetesClusterResourceType = "k8s_cluster"
 
 	// methodNameSeparator splits a Cloud Audit Logs methodName
 	// ("io.k8s.apps.v1.deployments.patch") into its components. The verb is
@@ -46,7 +53,6 @@ var errNotKubernetesAudit = errors.New("entry is not a Kubernetes audit record")
 // decoding only these fields keeps the hot path off them.
 type logEntry struct {
 	InsertID     string       `json:"insertId"`
-	LogName      string       `json:"logName"`
 	Timestamp    time.Time    `json:"timestamp"`
 	Resource     logResource  `json:"resource"`
 	ProtoPayload auditPayload `json:"protoPayload"`
@@ -129,8 +135,20 @@ func parseAuditEntry(data []byte) (AuditRecord, error) {
 		return AuditRecord{}, fmt.Errorf("decode log entry: %w", err)
 	}
 
+	// An absent serviceName is not a message from another service -- it is a
+	// message whose protoPayload this parser could not find. json.Unmarshal
+	// zeroes what it cannot match, so a renamed or restructured payload decodes
+	// without error and arrives here looking exactly like an empty one. Treating
+	// that as a skip would ack every message on the subscription while logging
+	// nothing, which is the one failure mode the nack path exists to prevent.
+	if entry.ProtoPayload.ServiceName == "" {
+		return AuditRecord{}, errors.New("entry has no protoPayload.serviceName: the payload shape is not the one this parser expects")
+	}
 	if entry.ProtoPayload.ServiceName != kubernetesAuditService {
 		return AuditRecord{}, fmt.Errorf("%w: serviceName %q", errNotKubernetesAudit, entry.ProtoPayload.ServiceName)
+	}
+	if entry.Resource.Type != "" && entry.Resource.Type != kubernetesClusterResourceType {
+		return AuditRecord{}, fmt.Errorf("%w: resource.type %q", errNotKubernetesAudit, entry.Resource.Type)
 	}
 
 	ref, err := parseResourceName(entry.ProtoPayload.ResourceName)

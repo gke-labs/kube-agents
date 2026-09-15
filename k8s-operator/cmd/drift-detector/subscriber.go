@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	pubsub "google.golang.org/api/pubsub/v1"
@@ -52,9 +53,30 @@ const (
 	// subscription's own retry_policy backoff applies.
 	nackAckDeadlineSeconds = 0
 
+	// ackDeadlineSecondsField names that field for ForceSendFields, which takes
+	// the Go field name rather than the JSON one.
+	ackDeadlineSecondsField = "AckDeadlineSeconds"
+
 	// subscriptionPathFormat builds the fully qualified subscription name the
 	// API expects from a project and a bare subscription id.
 	subscriptionPathFormat = "projects/%s/subscriptions/%s"
+
+	// subscriptionPathPrefix marks a --subscription value that is already
+	// fully qualified. The drift-pubsub module's subscription_id output is
+	// that form and its README tells the operator to feed it to this flag, so
+	// prefixing unconditionally would build
+	// projects/P/subscriptions/projects/P/subscriptions/name and pull a
+	// subscription that does not exist -- which surfaces as an empty log,
+	// indistinguishable from no drift. The gateway's Python adapter accepts
+	// either form for the same reason.
+	subscriptionPathPrefix = "projects/"
+
+	// settleGracePeriod bounds the ack and nack calls issued while shutting
+	// down. The pull loop's context is already cancelled by then, so settling
+	// on it would abort: up to maxMessages records would be handled and then
+	// redelivered to the next instance, which at T4 is a duplicate inject per
+	// restart.
+	settleGracePeriod = 10 * time.Second
 )
 
 // receivedMessage is one Pub/Sub message with its payload already decoded.
@@ -100,8 +122,20 @@ func newPubsubSource(ctx context.Context, project, subscription string) (*pubsub
 	}
 	return &pubsubSource{
 		service:      service,
-		subscription: fmt.Sprintf(subscriptionPathFormat, project, subscription),
+		subscription: subscriptionPath(project, subscription),
 	}, nil
+}
+
+// subscriptionPath qualifies a bare subscription id with its project, and
+// passes an already-qualified one through. Both forms reach this binary: the
+// drift-pubsub module's README hands the operator its subscription_id output,
+// which is fully qualified, while the default and the Helm values carry the
+// bare name.
+func subscriptionPath(project, subscription string) string {
+	if strings.HasPrefix(subscription, subscriptionPathPrefix) {
+		return subscription
+	}
+	return fmt.Sprintf(subscriptionPathFormat, project, subscription)
 }
 
 func (p *pubsubSource) Pull(ctx context.Context, maxMessages int64) ([]receivedMessage, error) {
@@ -145,7 +179,16 @@ func (p *pubsubSource) Nack(ctx context.Context, ackIDs []string) error {
 	if len(ackIDs) == 0 {
 		return nil
 	}
-	req := &pubsub.ModifyAckDeadlineRequest{AckIds: ackIDs, AckDeadlineSeconds: nackAckDeadlineSeconds}
+	req := &pubsub.ModifyAckDeadlineRequest{
+		AckIds:             ackIDs,
+		AckDeadlineSeconds: nackAckDeadlineSeconds,
+		// The generated client omits zero-valued scalars from the request body
+		// unless they are named here, and the deadline we want is zero. Without
+		// this the field is absent, the server keeps the subscription's own
+		// ackDeadlineSeconds, and a nacked message sits invisible for a minute
+		// instead of redelivering now.
+		ForceSendFields: []string{ackDeadlineSecondsField},
+	}
 	if _, err := p.service.Projects.Subscriptions.ModifyAckDeadline(p.subscription, req).Context(ctx).Do(); err != nil {
 		return fmt.Errorf("nack %d message(s): %w", len(ackIDs), err)
 	}
@@ -234,6 +277,9 @@ func (s *subscriber) processBatch(ctx context.Context, messages []receivedMessag
 	ackIDs := make([]string, 0, len(messages))
 	nackIDs := make([]string, 0)
 
+	skipped := 0
+	var firstSkip error
+
 	for _, msg := range messages {
 		record, err := parseAuditEntry(msg.Data)
 		switch {
@@ -246,6 +292,10 @@ func (s *subscriber) processBatch(ctx context.Context, messages []receivedMessag
 			// Understood and not actionable. Acking is the point: leaving these
 			// on the subscription would redeliver them until retention expired.
 			s.counts.Skipped++
+			skipped++
+			if firstSkip == nil {
+				firstSkip = err
+			}
 			ackIDs = append(ackIDs, msg.AckID)
 
 		default:
@@ -257,12 +307,33 @@ func (s *subscriber) processBatch(ctx context.Context, messages []receivedMessag
 		}
 	}
 
-	if err := s.source.Ack(ctx, ackIDs); err != nil {
+	// One line per batch rather than one per message: a misconfigured sink can
+	// make every message a skip, and the point is that dropping is visible, not
+	// that each drop is. Silence here is what would make a sink filter that
+	// stopped matching Kubernetes audit look identical to a quiet cluster.
+	if skipped > 0 {
+		log.Printf("drift-detector: acked and dropped %d of %d message(s) as not actionable; first: %v",
+			skipped, len(messages), firstSkip)
+	}
+
+	settleCtx, cancel := s.settleContext(ctx)
+	defer cancel()
+
+	if err := s.source.Ack(settleCtx, ackIDs); err != nil {
 		log.Printf("drift-detector: %v", err)
 	}
-	if err := s.source.Nack(ctx, nackIDs); err != nil {
+	if err := s.source.Nack(settleCtx, nackIDs); err != nil {
 		log.Printf("drift-detector: %v", err)
 	}
+}
+
+// settleContext returns the context the ack and nack calls run on. It survives
+// cancellation of the pull loop's context, because that is exactly when
+// settling matters: on SIGTERM the loop's context is already cancelled, and
+// settling on it would abort every call, leaving a whole batch of already
+// handled records to be redelivered to the next instance.
+func (s *subscriber) settleContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), settleGracePeriod)
 }
 
 // Counts reports what the loop has settled so far.
@@ -275,8 +346,15 @@ func (s *subscriber) Counts() subscriberCounts {
 // shows up here, with all five fields populated and the resource path
 // decomposed.
 func logRecord(record AuditRecord) {
-	log.Printf("drift-detector: audit cluster=%s principal=%q verb=%s method=%s resource=%s group=%q version=%s namespace=%q name=%q subresource=%q user_agent=%q timestamp=%s insert_id=%s",
+	// project and location are logged alongside the cluster name because a
+	// cluster name is only unique within a project and a location -- the fleet
+	// ambiguity AuditRecord's comment describes. Reading the log without them
+	// cannot tell two same-named clusters apart, which is the mistake T2's
+	// classification would then inherit.
+	log.Printf("drift-detector: audit cluster=%s project=%s location=%s principal=%q verb=%s method=%s resource=%s group=%q version=%s namespace=%q name=%q subresource=%q user_agent=%q timestamp=%s insert_id=%s",
 		record.Cluster,
+		record.Project,
+		record.Location,
 		record.Principal,
 		record.Verb,
 		record.MethodName,

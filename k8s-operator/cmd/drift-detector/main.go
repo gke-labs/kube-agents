@@ -47,6 +47,11 @@ const (
 	// without the other is the likeliest reason this binary finds nothing.
 	defaultSubscriptionName = "platform-agent-drift-audit-sub"
 
+	// maxMessagesCeiling is the largest batch the Pub/Sub pull API accepts. A
+	// larger request is rejected on every pull, so rejecting it at startup
+	// turns a loop that backs off forever into one line at launch.
+	maxMessagesCeiling = 1000
+
 	// exitFailure is the status returned when realMain reports an error.
 	exitFailure = 1
 )
@@ -97,9 +102,14 @@ func realMain(argv []string) error {
 	if f.subscription == "" {
 		return errors.New("--subscription must not be empty")
 	}
+	if f.maxMessages < 1 || f.maxMessages > maxMessagesCeiling {
+		return fmt.Errorf("--max-messages must be between 1 and %d, got %d", maxMessagesCeiling, f.maxMessages)
+	}
 
-	// Cancelled on SIGINT or SIGTERM so an in-flight batch is settled before
-	// the process goes away, rather than being redelivered.
+	// Cancelled on SIGINT or SIGTERM, which stops the pull loop. Settling the
+	// batch it was working on does not run on this context -- see
+	// subscriber.settleContext, which is why an interrupted batch is acked
+	// rather than redelivered.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -108,8 +118,11 @@ func realMain(argv []string) error {
 		return err
 	}
 
+	// Log the path actually pulled, not the flag: --subscription accepts a bare
+	// id or a fully qualified name, and reporting the raw flag back would hide
+	// which of the two this run resolved to.
 	sub := newSubscriber(source, logRecord, f.maxMessages)
-	log.Printf("%s: pulling %s (project=%s, max-messages=%d)", commandName, f.subscription, f.project, f.maxMessages)
+	log.Printf("%s: pulling %s (max-messages=%d)", commandName, source.subscription, f.maxMessages)
 
 	runErr := sub.Run(ctx)
 	counts := sub.Counts()

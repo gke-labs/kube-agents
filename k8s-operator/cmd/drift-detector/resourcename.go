@@ -40,6 +40,10 @@ const (
 
 	// pathSeparator separates resourceName segments.
 	pathSeparator = "/"
+
+	// maxRenderedRefParts is how many segments String can emit: namespace,
+	// resource, name, subresource.
+	maxRenderedRefParts = 4
 )
 
 // namespaceSubresources are the subresources the namespace object itself has.
@@ -77,9 +81,10 @@ type ResourceRef struct {
 	Namespace string
 
 	// Resource is the plural, lowercase API resource -- "deployments", not
-	// "Deployment". The task breakdown calls this field "kind"; the audit log
-	// gives the resource, and the resource is what a dynamic client indexes
-	// by, so it is not converted to a kind here.
+	// "Deployment". It is deliberately not converted to a kind: the audit log
+	// gives the resource, and the resource is what a dynamic client indexes by,
+	// so converting would mean a RESTMapper lookup here and the reverse lookup
+	// again in T3.
 	Resource string
 
 	// Name is empty on a create, whose name the API server assigns after the
@@ -93,7 +98,7 @@ type ResourceRef struct {
 // String renders the reference the way a human reading the structured log
 // would write it, for the log's human-facing field.
 func (r ResourceRef) String() string {
-	parts := make([]string, 0, 4)
+	parts := make([]string, 0, maxRenderedRefParts)
 	if r.Namespace != "" {
 		parts = append(parts, r.Namespace)
 	}

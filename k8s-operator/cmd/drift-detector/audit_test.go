@@ -155,6 +155,45 @@ func TestParseAuditEntryMalformedIsNotASkip(t *testing.T) {
 	}
 }
 
+// json.Unmarshal zeroes fields it cannot match, so a payload whose shape
+// changed decodes without error and reaches the parser looking like an empty
+// one. If that were treated as a skip, every message on the subscription would
+// be acked and dropped, and the log would be indistinguishable from a cluster
+// with no drift. It has to nack.
+func TestParseAuditEntryUnrecognisablePayloadIsNotASkip(t *testing.T) {
+	tests := []struct {
+		name  string
+		entry string
+	}{
+		{name: "protoPayload absent", entry: `{"insertId":"x","resource":{"type":"k8s_cluster"}}`},
+		{name: "protoPayload renamed", entry: `{"insertId":"x","protoPayloadV2":{"serviceName":"k8s.io"}}`},
+		{name: "protoPayload empty", entry: `{"insertId":"x","protoPayload":{}}`},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseAuditEntry([]byte(tc.entry))
+			if err == nil {
+				t.Fatal("parseAuditEntry succeeded on an unrecognisable payload, want error")
+			}
+			if errors.Is(err, errNotKubernetesAudit) || errors.Is(err, errNoResourceName) {
+				t.Errorf("unrecognisable payload reported as a skip (%v); it must nack instead", err)
+			}
+		})
+	}
+}
+
+// The sink filter selects resource.type="k8s_cluster". Anything else on the
+// topic came from outside that filter.
+func TestParseAuditEntryWrongResourceTypeIsASkip(t *testing.T) {
+	entry := `{"resource":{"type":"gce_instance"},
+	           "protoPayload":{"serviceName":"k8s.io",
+	                           "resourceName":"apps/v1/namespaces/prod/deployments/checkout"}}`
+	if _, err := parseAuditEntry([]byte(entry)); !errors.Is(err, errNotKubernetesAudit) {
+		t.Errorf("parseAuditEntry() error = %v, want errNotKubernetesAudit", err)
+	}
+}
+
 func TestMethodVerb(t *testing.T) {
 	tests := []struct {
 		methodName string
