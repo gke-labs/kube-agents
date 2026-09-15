@@ -223,19 +223,37 @@ class GateTest(_Case):
 
 class DiscoveryTest(_Case):
     def test_the_governed_files_are_found_at_every_home(self):
-        expected = [
-            _make_db(self.home / "state.db"),
-            _make_db(self.home / "kanban.db"),
-            _make_db(self.home / "profiles" / "alpha" / "state.db"),
-            _make_db(self.home / "profiles" / "beta" / "state.db"),
-            _make_db(self.home / "kanban" / "boards" / "ops" / "kanban.db"),
-        ]
+        expected = [_make_db(self.home / "kanban.db"), _make_db(self.home / "kanban" / "boards" / "ops" / "kanban.db")]
+        for home in (self.home, self.home / "profiles" / "alpha", self.home / "profiles" / "beta"):
+            expected.extend(_make_db(home / relative) for relative in sjm.HOME_DATABASES)
         self.assertEqual(set(sjm.governed_databases(self.home)), set(expected))
+        self.assertEqual(len(expected), 2 + 3 * len(sjm.HOME_DATABASES))
+
+    def test_every_hermes_opener_of_the_pin_is_governed(self):
+        """The pin is read only by apply_wal_with_fallback; these are its callers at the base.
+
+        A file the pin reaches but the conversion skips stays in WAL on the gofer mount
+        for as long as it predates the pin, which is the gap #610 was filed for.
+        """
+        self.assertEqual(
+            set(sjm.HOME_DATABASES),
+            {
+                "state.db",
+                "cron/executions.db",
+                "cron/notepad.db",
+                "projects.db",
+                "verification_evidence.db",
+                "response_store.db",
+                "memory_store.db",
+                "gateway/discord_message_recovery.db",
+            },
+        )
 
     def test_other_databases_on_the_volume_are_not_governed(self):
-        """Files that set their own journal mode are their owners', not this script's."""
+        """Files whose opener sets its own journal mode are their owners', not this script's."""
         others = [
-            _make_db(self.home / "cron" / "executions.db"),
+            _make_db(self.home / "session_kv.db"),
+            _make_db(self.home / "otel" / "live.db"),
             _make_db(self.home / "notepad.db"),
             _make_db(self.home / "profiles" / "alpha" / "kanban.db"),
             _make_db(self.home / "kanban" / "boards" / "ops" / "state.db"),
@@ -304,6 +322,7 @@ class ContractTest(unittest.TestCase):
     def test_the_layout_matches_hermes(self):
         """kanban_db.py: default board at <root>/kanban.db, others under kanban/boards/<slug>/."""
         self.assertEqual(sjm.KANBAN_DB_NAME, "kanban.db")
+        self.assertNotIn(sjm.KANBAN_DB_NAME, sjm.HOME_DATABASES)
         self.assertEqual(str(sjm.BOARDS_DIR), os.path.join("kanban", "boards"))
         self.assertEqual(sjm.PROFILES_DIR, "profiles")
 

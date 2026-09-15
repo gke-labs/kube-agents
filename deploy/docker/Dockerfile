@@ -1454,12 +1454,15 @@ COPY agents/chat/scripts/ agents/platform/scripts/ /opt/defaults/scripts/
 #                              scaffolded later). Runs here rather than in the sandbox
 #                              because the profile list and the SSH key are both on this
 #                              side — see tests/test_sandbox_mirror.py.
-#   sqlite_journal_migrate.py  converts state.db and kanban.db out of WAL once the
-#                              operator pins database.journal_mode: delete (entrypoint
-#                              step 1.7 in the owner, --check in the non-owner's wait).
-#                              Hermes never downgrades a database that is already WAL,
-#                              so without this the pin reaches only databases created
-#                              after it — see tests/test_sqlite_journal_migrate.py.
+#   sqlite_journal_migrate.py  converts the databases Hermes opens through
+#                              apply_wal_with_fallback (state.db, kanban.db, the cron,
+#                              project, evidence, response, memory and Discord stores)
+#                              out of WAL once the operator pins database.journal_mode:
+#                              delete (entrypoint step 1.7 in the owner, --check in the
+#                              non-owner's wait). Hermes never downgrades a database that
+#                              is already WAL, so without this the pin reaches only
+#                              databases created after it — see
+#                              tests/test_sqlite_journal_migrate.py.
 COPY deploy/shared/profile_overlay.py \
      deploy/shared/profile_plugins.py \
      deploy/shared/otel_config.py \

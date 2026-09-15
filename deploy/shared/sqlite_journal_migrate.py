@@ -18,10 +18,16 @@ managed config says `delete`, and nothing is touched while another connection ho
 database: the checkpoint reports busy, or the switch raises `database is locked`, and the
 file is left exactly as it was for the next start to retry.
 
-The governed set is the two databases Hermes opens through apply_wal_with_fallback:
-`state.db` at the agent home and under each `profiles/<name>/`, and `kanban.db` at the
-agent home and under each `kanban/boards/<slug>/` (hermes_cli/kanban_db.py's layout).
-Other databases on the volume set their own journal mode and are not this script's.
+The governed set is every database the pinned base opens through
+apply_wal_with_fallback, which is the only reader of the pin. Eight of them are resolved
+from get_hermes_home() and so exist at the agent home and again under each
+`profiles/<name>/`: `state.db`, `cron/executions.db`, `cron/notepad.db`, `projects.db`,
+`verification_evidence.db`, `response_store.db`, `memory_store.db` and
+`gateway/discord_message_recovery.db`. The ninth, `kanban.db`, is shared across profiles
+(kanban_db.kanban_home anchors at the root) and lives at the agent home and under each
+`kanban/boards/<slug>/`. Databases whose opener sets its own journal mode, such as the
+session KV store this repository runs beside Hermes, are not this script's: the pin never
+reaches them, so a conversion here would be undone at their next open.
 
 `--check` is the non-owner's side of the same step: exit 1 while the managed config says
 `delete` and any governed header still reads WAL, exit 0 otherwise, so a sidecar can wait
@@ -56,8 +62,21 @@ HEADER_VERSION_ROLLBACK = 1
 HEADER_MODE_WAL = "wal"
 HEADER_MODE_ROLLBACK = "rollback"
 
-# The governed files and where Hermes keeps them.
-STATE_DB_NAME = "state.db"
+# The governed files and where Hermes keeps them. HOME_DATABASES are relative to a
+# Hermes home (the agent home, and each profiles/<name>/ under it); each is opened
+# through apply_wal_with_fallback by the module named beside it, at the pinned base.
+HOME_DATABASES = (
+    "state.db",  # hermes_state.SessionDB
+    "cron/executions.db",  # cron/executions.py
+    "cron/notepad.db",  # cron/notepad.py
+    "projects.db",  # hermes_cli/projects_db.py
+    "verification_evidence.db",  # agent/verification_evidence.py
+    "response_store.db",  # gateway/platforms/api_server.py
+    "memory_store.db",  # plugins/memory/holographic/store.py
+    "gateway/discord_message_recovery.db",  # plugins/platforms/discord/recovery.py
+)
+# The board is shared across profiles (hermes_cli/kanban_db.py), so it is looked for
+# at the agent home and under each named board only, never under profiles/.
 KANBAN_DB_NAME = "kanban.db"
 PROFILES_DIR = "profiles"
 BOARDS_DIR = pathlib.Path("kanban") / "boards"
@@ -115,9 +134,12 @@ def configured_journal_mode(managed_config: pathlib.Path) -> str | None:
 
 
 def governed_databases(agent_home: pathlib.Path) -> list[pathlib.Path]:
-    """Every governed database that exists under `agent_home`, sorted."""
-    candidates = [agent_home / STATE_DB_NAME, agent_home / KANBAN_DB_NAME]
-    candidates.extend(sorted((agent_home / PROFILES_DIR).glob(f"*/{STATE_DB_NAME}")))
+    """Every governed database that exists under `agent_home`, in a stable order."""
+    homes = [agent_home] + sorted(
+        path for path in (agent_home / PROFILES_DIR).glob("*") if path.is_dir()
+    )
+    candidates = [home / relative for home in homes for relative in HOME_DATABASES]
+    candidates.append(agent_home / KANBAN_DB_NAME)
     candidates.extend(sorted((agent_home / BOARDS_DIR).glob(f"*/{KANBAN_DB_NAME}")))
     return [path for path in candidates if path.is_file()]
 
