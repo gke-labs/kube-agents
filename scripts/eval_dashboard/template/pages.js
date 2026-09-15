@@ -592,7 +592,7 @@ function agentSawHtml(inc, inWindow) {
   const quote = pick.c.excerpt
     ? `<div class="q">“${esc(pick.c.excerpt)}”<small>From the agent's report on ${prLink(pick.run.pr)} · <code>${esc(pick.c.case)}</code>${url ? ` · <a href="${esc(url)}">full transcript</a>` : ""}</small></div>`
     : "";
-  return `${quote}<div class="reason">${esc(pick.c.reason)}</div><small class="mut">The check that failed, as the grader wrote it, on ${prLink(pick.run.pr)} · <code>${esc(pick.c.case)}</code>${url ? ` · <a href="${esc(url)}">transcript (rep 1)</a>` : ""}. data.json carries no agent report text, so nothing here is quoted from the agent.</small>`;
+  return `${quote}<div class="reason">${esc(pick.c.reason)}</div><small class="mut">The check that failed, as the grader wrote it, on ${prLink(pick.run.pr)} · <code>${esc(pick.c.case)}</code>${url ? ` · <a href="${esc(url)}">transcript (rep 1)</a>` : ""}.${pick.c.excerpt ? "" : " The build log carried no report excerpt for this repetition, so nothing here is quoted from the agent."}</small>`;
 }
 
 function changedBeforeHtml(inc, inWindow) {

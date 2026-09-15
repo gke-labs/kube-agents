@@ -130,7 +130,8 @@ the same layout and is collected from the moment it starts running.
   - `reps` — **optional, additive**: per-repetition grading detail, one
     entry per indented `rep N: <verdict> -- <text>` grading line under the
     task's verdict line, in log order:
-    `{"n": <1-based int>, "result": "pass"|"fail"|"infra", "reason": <string|null>}`.
+    `{"n": <1-based int>, "result": "pass"|"fail"|"infra", "reason": <string|null>}`,
+    plus `"excerpt": <string>` when the log carried one (below).
     - `result` maps the grading verdict token: `pass` → `pass`; `infra` →
       `infra`, as is any **non-pass** rep whose line carries the literal
       `KUBE_AGENTS_INFRA_FAILURE` marker; anything else (`fail`, `blocked`,
@@ -140,6 +141,20 @@ the same layout and is collected from the moment it starts running.
       delimiter themselves), with the trailing `[OutcomeScore=…]` metrics
       dump stripped, truncated to 300 chars. `null` for passing reps and
       when nothing remains.
+    - `excerpt` — **optional, additive**: the agent's own words — the text
+      of the `rep N report: <text>` line `bench-gate case` prints right
+      under the grading line of a repetition that did not pass (since
+      2026-09-15): the first 300 characters of the agent's final report
+      (`results.json`'s `output`, the "Actual Output" the judge grades),
+      whitespace collapsed to single spaces, `<` dropped, an ellipsis in the
+      last position where it was cut; capped at 300 again here. The key is
+      **absent** — never `null` or `""` — when the log carries no such line:
+      a passing rep, an empty report (a transport failure's), a report line
+      for a rep the log never graded (dropped, never an entry of its own),
+      and every build graded before the line existed. `classify.py`'s
+      `excerpt_of` reads it into the Brief's "What the agent saw" quote, the
+      run page's case card and a case's `last_failure`; nothing is quoted
+      when it is absent.
     - **Omission semantics:** the key is absent — never `[]` — when the log
       has no `rep N:` grading lines for the task: single-repetition-era
       builds (branches predating the multi-repetition eval of 2026-08-28;

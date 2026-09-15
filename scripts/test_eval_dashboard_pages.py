@@ -12,6 +12,7 @@ cell click opens. Every asserted time is America/Toronto.
 """
 
 import contextlib
+import copy
 import gzip
 import html
 import io
@@ -529,6 +530,33 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("Release candidates", app)
         self.assertNotIn(" UTC", app, "no UTC clock text on the page")
         self.assertNotIn("legacy", app.lower())
+
+    def test_the_brief_quotes_the_agents_report_when_the_log_carried_one(self):
+        """reps[].excerpt, the agent's own words from the build log, is quoted
+        in "What the agent saw" and on the run page's case card; without it
+        the Brief says nothing is quoted rather than inventing a quote."""
+        app = dom_text(self.index)
+        self.assertIn("nothing here is quoted from the agent", app)
+        self.assertNotIn('<div class="q">', app)
+        words = "I checked every namespace and found no pod in CrashLoopBackOff; the deployment looks healthy to me."
+        data = copy.deepcopy(self.data)
+        quoted = 0
+        for run in data["runs"]:
+            for task in run.get("tasks") or []:
+                if task.get("name") not in CRASHLOOP_TRIO:
+                    continue
+                for rep in task.get("reps") or []:
+                    if rep.get("result") == "fail":
+                        rep["excerpt"] = words
+                        quoted += 1
+        self.assertGreater(quoted, 0)
+        out = render_to(pathlib.Path(self.tmp.name) / "excerpt", data, health=health_doc())
+        app = dom_text(out / "index.html")
+        self.assertIn(f'<div class="q">“{words}”', app)
+        self.assertIn("From the agent's report on", app)
+        self.assertNotIn("nothing here is quoted from the agent", app)
+        run_page = dom_text(out / "run.html", query="build=2097282860221206528")
+        self.assertIn(f'<div class="quote">“{words}”</div>', run_page)
 
     def test_storm_brief(self):
         app = self.render_state(health_doc("DEGRADED", condition="storm", failing_cases=[], tracking_issues=[],

@@ -232,6 +232,12 @@ READ_WORKERS = 8
 # pathological line from bloating data.json.
 REP_REASON_MAX_CHARS = 300
 
+# Cap on the agent's report excerpt kept from a `rep N report:` line. The gate
+# (bench/kube_agents_bench/gate.py, REPORT_EXCERPT_MAX_CHARS) already cuts
+# the line to this many characters; the cap here is the belt for a foreign
+# or hand-edited log.
+REP_EXCERPT_MAX_CHARS = 300
+
 # The literal hack/ci-eval-pr.sh stamps on a repetition it excluded as an
 # infrastructure failure. The `infra` verdict token on the grading line is the
 # primary signal; the marker is the fallback for lines that carry the literal
@@ -340,6 +346,13 @@ _TASK_LINE = re.compile(
 _REP_LINE = re.compile(
     r"^\s+rep (?P<n>\d+): (?P<verdict>[A-Za-z0-9_-]+)(?: -- (?P<rest>.*))?$"
 )
+# The agent's own words: one optional line right under a repetition's grading
+# line, printed by `bench-gate case` (since 2026-09-15) for a repetition that
+# did not pass and whose report was not empty -- the first 300 characters of
+# the final report, whitespace collapsed, `<` dropped, an ellipsis where it
+# was cut. Its own shape, `rep N report:`, so `_REP_LINE` never matches it.
+#   rep 2 report: I looked for a pool named pinned-inference-pool and found ...
+_REP_REPORT_LINE = re.compile(r"^\s+rep (?P<n>\d+) report: (?P<text>.*)$")
 # The bracketed per-rep score dump ending most grading lines: structured
 # metrics, not reason text.
 _REP_SCORES_TAIL = re.compile(r"\s*\[OutcomeScore=[^\]]*\]\s*$")
@@ -430,6 +443,23 @@ def _rep_from_match(m: re.Match) -> dict:
     return {"n": int(m.group("n")), "result": result, "reason": reason}
 
 
+def _attach_excerpt(task: dict, n: int, text: str) -> None:
+    """Record a `rep N report:` line as ``excerpt`` on the rep it follows.
+
+    The line rides under its own grading line, so the rep is already in
+    reps[]; a report line for a repetition the log never graded is dropped,
+    never fabricated into an entry, and a blank one adds no key -- absence
+    means the log carried no report, and consumers read it that way.
+    """
+    excerpt = text.strip()[:REP_EXCERPT_MAX_CHARS]
+    if not excerpt:
+        return
+    for rep in reversed(task.get("reps") or []):
+        if rep["n"] == n:
+            rep["excerpt"] = excerpt
+            return
+
+
 def parse_build_log(text: str) -> dict:
     """Extract the eval facts from one build-log.txt, best effort.
 
@@ -437,7 +467,8 @@ def parse_build_log(text: str) -> dict:
     tasks and no final verdict. `rep N:` grading lines attach to the `Task
     <name> Result:` line they follow; a task whose log has none (single-rep
     era, or a log truncated before grading) simply gets no `reps` key --
-    absence means unknown, never fabricated.
+    absence means unknown, never fabricated. A `rep N report:` line under a
+    grading line becomes that rep's `excerpt`, the agent's own words.
     """
     project = None
     tasks = []
@@ -466,6 +497,10 @@ def parse_build_log(text: str) -> dict:
             m = _REP_LINE.match(line)
             if m:
                 current.setdefault("reps", []).append(_rep_from_match(m))
+                continue
+            m = _REP_REPORT_LINE.match(line)
+            if m:
+                _attach_excerpt(current, int(m.group("n")), m.group("text"))
                 continue
             if line.startswith((">>>", "===", "---")):
                 # A section header (a launch or grading marker, a stage
