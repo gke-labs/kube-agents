@@ -575,9 +575,6 @@ class PassTest(_Harness):
         assert "7 role(s) in their designed state" in done.stderr
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class ReportTest(_Harness):
     """`--report` writes every catalog role's verdict as JSON, for the health
@@ -619,3 +616,7 @@ class ReportTest(_Harness):
         done = self.run_script(_healthy_world())
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(list(self.tmp.glob("*.json")), [self.world])
+
+
+if __name__ == "__main__":
+    unittest.main()
