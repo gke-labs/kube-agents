@@ -1902,6 +1902,9 @@ unit_cost_hint() {
     # three repetitions (267-559s in August); median of the September run.
     pdb-remediation-pr) echo 1250 ;;
     consistency-authorized-networks-probe) echo 300 ;;
+    # Median of its 1155 presubmit repetitions 2026-09-04 to 09-15 (p10 248s,
+    # p90 1318s); the 200s default under-packed it by 2.7x (#1023).
+    capacity-pinned-pool-probe) echo 540 ;;
     # Nightly-only since 2026-09-09. Median of its first three measured
     # repetitions (615/715/166s, build 2097362391401500672); the 200s default
     # under-packs it by 3x.
