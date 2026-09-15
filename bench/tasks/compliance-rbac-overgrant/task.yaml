@@ -31,10 +31,11 @@
 # carries, not which cluster it reaches.
 #
 # Domain: fleet-audits (SOP machinery; the slug is docs/designs/domains.yaml's
-# and this task is its only carrier). The compliance-audit SOP is the vehicle;
-# the ai-security-audit SOP is the same machinery's second stream and gets its
-# own scenario at the nightly tier — its planted defect would be an
-# internet-reachable model server or plaintext registry credential.
+# — this task carried it alone until #1023). The compliance-audit SOP is the
+# vehicle; the ai-security-audit SOP is the same machinery's second stream,
+# and ai-security-planted-model-audit now carries it in presubmit over a
+# per-run planted defect (a floating model-image tag and a plaintext
+# registry credential).
 # Journey: a scheduled audit SOP runs end to end — delegates to a worker,
 # sweeps the fleet, and files a ledger issue a human can act on.
 #

@@ -1327,7 +1327,9 @@ TASKS=(
   "./tasks/agent-kanban-smoke/task.yaml"
   # knowledge-grounding-sources-probe: moved to NIGHTLY_TASKS 2026-09-09 after one
   # presubmit cycle (#945) -- knowledge grounding is not a core kube-agents journey.
-  # Last, because it is the only entry that pays twice. Its stack plants an
+  # It sat last here because it was the only entry that pays twice; it and
+  # its #1023 sibling autoops-crashloop-config-triage now pay those two waits
+  # in the nightly tier, where launch order is unit_cost_hint's. Its stack plants an
   # OOM-killed workload on the host cluster and blocks until the event
   # watcher's leading-edge debounce clears and the incident opens (~1 minute,
   # bounded at 12), and then the agent turn itself waits on the AutoOps card,
@@ -1338,7 +1340,7 @@ TASKS=(
   # bench/tf/prebuilt/autoops-incident/main.tf for why it cannot, and why it
   # is the host cluster and not the per-run one that gets the incident.
   # autoops-warning-event-triage: moved to NIGHTLY_TASKS 2026-09-03 (tofu wall clock, #1218/#1202).
-  # Five registered scenarios stay commented out, and eleven more run in the
+  # Six registered scenarios stay commented out, and twelve more run in the
   # nightly tier only -- NIGHTLY_TASKS below; the task-registration lint
   # reads both arrays. A commented entry here counts as registered, so a
   # line is a promise the scenario exists, not that it runs; the
@@ -1608,6 +1610,28 @@ NIGHTLY_TASKS=(
   #      sandbox). 980-1929s a repetition on 2026-09-14, priced below.
   "./tasks/chat-routing-board-read/task.yaml"
   "./tasks/pdb-remediation-pr/task.yaml"
+  # #1023's fleet-audits and incident-triage second cases, nightly from the
+  # start (2026-09-15). Both are tofu-provisioned and hold the infra lock for
+  # a whole invocation, the shape #1218 moved out of presubmit; the
+  # authoring PR's run 1 reproduced it (a 2279s audit rep starved its sibling
+  # past the 1800s lock wait). The record they build here is what a later
+  # BOOTSTRAP_ADMITTED edit cites (#1568). Measured in that PR's presubmit
+  # runs:
+  #   -- ai-security-planted-model-audit: 2/3 on build 2099607409826729984
+  #      (1415-1488s a repetition with the ledger write; the miss is #1590);
+  #      0/3 on 2099539466187182080 (#1590 x3, #1592 x2).
+  #   -- autoops-crashloop-config-triage: 0/3 on 2099607409826729984, every
+  #      card blocked on the host cluster's unscaffolded Cluster Agent
+  #      profile (#1593); the stack itself provisions since the
+  #      agent-api-auth fix (#1591 is the incumbent's copy of it).
+  "./tasks/ai-security-planted-model-audit/task.yaml"
+  # autoops-crashloop-config-triage: registered, commented out until #1593
+  # lands. Until the host cluster's Cluster Agent profile exists, every card
+  # the watcher opens for it blocks, so a nightly rep is ~5-8 minutes of the
+  # serialized infra lock recording a 0/3 that says nothing about the case.
+  # Uncomment with the #1593 fix (or right after it); the entry below is the
+  # line to restore, its unit_cost_hint entry stays.
+  # "./tasks/autoops-crashloop-config-triage/task.yaml"
 )
 
 # Which matrix this run gets. "presubmit" -- the default, and what every
@@ -1901,6 +1925,11 @@ unit_cost_hint() {
     # Nightly-only. Measured 980-1929s across build 2099539376672346112's
     # three repetitions (267-559s in August); median of the September run.
     pdb-remediation-pr) echo 1250 ;;
+    # Nightly-only. The audit measured 1415-1488s a repetition with its ledger
+    # write (build 2099607409826729984); the crashloop triage takes the
+    # incumbent autoops hint (same watcher and card waits) until it passes.
+    ai-security-planted-model-audit) echo 1450 ;;
+    autoops-crashloop-config-triage) echo 900 ;;
     consistency-authorized-networks-probe) echo 300 ;;
     # Nightly-only since 2026-09-09. Median of its first three measured
     # repetitions (615/715/166s, build 2097362391401500672); the 200s default
@@ -1932,6 +1961,20 @@ for TASK in "${TASKS[@]}"; do
     TASK_REUSE+=("")
   fi
 done
+
+# How long a stack-bearing unit waits for lock-infra before giving up. The
+# lock is held for a unit's whole invocation and the queue launches every
+# repetition-1 unit within the first few lanes, so with N stack-bearing
+# tasks the last waiter has to outlast N-1 holders in a row: at 1800s flat
+# the third and fourth contenders in a four-tofu nightly cannot, and which
+# one loses is the mkdir race (the #1103 presubmit run showed it at N=2, a
+# 2279s audit rep starving its sibling). 1800s a contender keeps the
+# holder-died guard the flat figure was for, scaled to the matrix; the
+# presubmit, with no stack-bearing task, keeps the flat 1800s.
+STACK_CONTENDERS=0
+for HAS in "${TASK_HAS_STACK[@]}"; do [ -n "${HAS}" ] && STACK_CONTENDERS=$((STACK_CONTENDERS + 1)); done
+INFRA_LOCK_DEADLINE=$(( 1800 * (STACK_CONTENDERS > 1 ? STACK_CONTENDERS : 1) ))
+echo "Infra lock: ${STACK_CONTENDERS} stack-bearing task(s); a unit waits up to ${INFRA_LOCK_DEADLINE}s for lock-infra"
 
 # One unit, in a background subshell: its exports stay local, its output goes
 # only to its own log (kept as an artifact either way), and its run directory
@@ -1985,7 +2028,7 @@ run_one_unit() { # <task-path> <task-name> <rep> <reuse:true|empty> <has-stack:t
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on its task lock" >&2
     return 0
   fi
-  if [ -n "${has_stack}" ] && ! lock_acquire "${STATE_DIR}/lock-infra"; then
+  if [ -n "${has_stack}" ] && ! lock_acquire "${STATE_DIR}/lock-infra" "${INFRA_LOCK_DEADLINE}"; then
     lock_release "${STATE_DIR}/lock-task-${name}"
     echo "<<< [$(date -u +'%Y-%m-%dT%H:%M:%SZ')] ${name} rep ${rep} gave up on the infra lock" >&2
     return 0
