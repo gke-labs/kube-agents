@@ -52,6 +52,13 @@ const (
 	metadataDaemonPortName          = "metadata-server"
 	metadataDaemonDefaultPort int32 = 988
 
+	// openShiftDNSNamespace and openShiftDNSServiceName locate the OpenShift CoreDNS Service
+	// when kube-system/kube-dns is absent.
+	openShiftDNSNamespace         = "openshift-dns"
+	openShiftDNSServiceName       = "dns-default"
+	openShiftDNSDaemonSetLabelKey = "dns.operator.openshift.io/daemonset-dns"
+	openShiftDNSDaemonSetLabelVal = "default"
+
 	// Source constants reporting how the network policy values were chosen.
 	netpolSourceSpec        = "Spec"
 	netpolSourceAnnotation  = "Annotation"
@@ -149,6 +156,35 @@ func (r *PlatformAgentReconciler) resolveNetpolProfile(ctx context.Context, agen
 		} else if !apierrors.IsNotFound(err) {
 			log.Info("Failed to discover kube-dns ClusterIP", "error", err)
 			// Anti-flap: on transient error, preserve previously discovered status if present
+			if agent != nil && agent.Status.NetworkPolicy.DNSClusterIPsSource == netpolSourceDiscovered && len(agent.Status.NetworkPolicy.DNSClusterIPs) > 0 {
+				p.DNSClusterIPs = append([]string(nil), agent.Status.NetworkPolicy.DNSClusterIPs...)
+				p.DNSSource = netpolSourceDiscovered
+			}
+		}
+	}
+
+	// 4a. In-cluster discovery from OpenShift openshift-dns/dns-default Service
+	if len(p.DNSClusterIPs) == 0 {
+		var ocpSvc corev1.Service
+		if err := r.Get(ctx, types.NamespacedName{Namespace: openShiftDNSNamespace, Name: openShiftDNSServiceName}, &ocpSvc); err == nil {
+			var discovered []string
+			if len(ocpSvc.Spec.ClusterIPs) > 0 {
+				for _, ip := range ocpSvc.Spec.ClusterIPs {
+					trimmed := strings.TrimSpace(ip)
+					if trimmed != "" && trimmed != "None" && net.ParseIP(trimmed) != nil {
+						discovered = append(discovered, trimmed)
+					}
+				}
+			} else if ip := strings.TrimSpace(ocpSvc.Spec.ClusterIP); ip != "" && ip != "None" && net.ParseIP(ip) != nil {
+				discovered = append(discovered, ip)
+			}
+
+			if len(discovered) > 0 {
+				p.DNSClusterIPs = discovered
+				p.DNSSource = netpolSourceDiscovered
+			}
+		} else if !apierrors.IsNotFound(err) {
+			log.Info("Failed to discover OpenShift dns-default ClusterIP", "error", err)
 			if agent != nil && agent.Status.NetworkPolicy.DNSClusterIPsSource == netpolSourceDiscovered && len(agent.Status.NetworkPolicy.DNSClusterIPs) > 0 {
 				p.DNSClusterIPs = append([]string(nil), agent.Status.NetworkPolicy.DNSClusterIPs...)
 				p.DNSSource = netpolSourceDiscovered
