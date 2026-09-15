@@ -32,7 +32,7 @@ CRASHLOOP_TRIO = [
     "cluster-agent-crashloop-evidence-chain",
     "cluster-agent-crashloop-misleading-symptom",
 ]
-# The roster in force on 2026-09-08 (hack/ci-eval-pr.sh at this checkout).
+# The roster in force on 2026-09-08 (hack/eval/blocking-roster.txt at this checkout).
 ADMITTED = frozenset(
     CRASHLOOP_TRIO
     + [
@@ -117,12 +117,12 @@ class RepAndOutcomeTest(unittest.TestCase):
         with_excerpt = dict(task("a", "fff"), excerpt="  payments-api is Pending  ")
         self.assertEqual(classify.excerpt_of(with_excerpt), "payments-api is Pending")
 
-    def test_the_roster_is_read_from_the_ci_script(self):
+    def test_the_roster_is_read_from_the_roster_file(self):
         roster = classify.admitted_cases()
         self.assertIsNotNone(roster)
         for name in CRASHLOOP_TRIO:
             self.assertIn(name, roster)
-        self.assertIsNone(classify.admitted_cases(pathlib.Path("/nonexistent/ci-eval-pr.sh")))
+        self.assertIsNone(classify.admitted_cases(pathlib.Path("/nonexistent/blocking-roster.txt")))
 
 
 class SharedRuleTest(unittest.TestCase):

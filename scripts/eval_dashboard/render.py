@@ -187,11 +187,11 @@ DAY_MS = 24 * 3600 * 1000
 TIER_RATE_WINDOWS_DAYS = (7, 30)
 
 # --- the roster: what blocks, what is held out, what was demoted when ------
-# Admission is BOOTSTRAP_ADMITTED in hack/ci-eval-pr.sh (classify.py reads
-# it). The demotion dates are prose: docs/eval-gate-roster.md's hold-out
-# entries say "demoted YYYY-MM-DD" -- data.json carries no roster history,
-# so that page is where the date lives, and this reads it the same way
-# classify.py reads the script, degrading to "no date" when it cannot.
+# Admission is hack/eval/blocking-roster.txt (classify.py reads it). The
+# demotion dates are prose: docs/eval-gate-roster.md's hold-out entries say
+# "demoted YYYY-MM-DD" -- data.json carries no roster history, so that page
+# is where the date lives, and this reads it the same way classify.py reads
+# the roster file, degrading to "no date" when it cannot.
 ROSTER_DOC = classify.REPO_ROOT / "docs" / "eval-gate-roster.md"
 # One hold-out entry: a "- **case-name** —" bullet and its indented body,
 # up to the next bullet or the next unindented line.
@@ -202,10 +202,10 @@ ROSTER_ENTRY_RE = re.compile(
 DEMOTED_RE = re.compile(r"\bdemoted (\d{4}-\d{2}-\d{2})")
 # A case's roster status on the Cases page (the pill) and on the Grid (which
 # rows are blocking). The words the pages print for each live in pages.js.
-STATUS_BLOCKING = "blocking"  # active and in BOOTSTRAP_ADMITTED
+STATUS_BLOCKING = "blocking"  # active and in hack/eval/blocking-roster.txt
 STATUS_HELD_OUT = "held_out"  # active, never admitted (or no date on record)
 STATUS_DEMOTED = "demoted"  # active, held out, with a demotion date
-STATUS_NIGHTLY_ONLY = "nightly_only"  # in NIGHTLY_TASKS only
+STATUS_NIGHTLY_ONLY = "nightly_only"  # in hack/eval/nightly-cases.txt only
 STATUS_RETIRED = "retired"  # in neither matrix on this checkout
 # A case's state in one run, on the strip and in a Grid cell: every graded
 # rep passed, some failed (the gate counts that as a pass), every graded rep

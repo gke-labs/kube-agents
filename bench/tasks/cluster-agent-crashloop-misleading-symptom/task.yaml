@@ -1,4 +1,4 @@
-# ACTIVE — an uncommented entry in hack/ci-eval-pr.sh TASKS.
+# ACTIVE — an entry in hack/eval/presubmit-cases.txt.
 #
 # Domain: cluster debugging. Journey: the user reports a true symptom with a
 # wrong cause attached, and the agent has to look past the framing it was

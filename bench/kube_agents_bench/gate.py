@@ -511,7 +511,7 @@ def _cmd_suite(args: argparse.Namespace) -> int:
         armed=_aggregate_armed(),
     )
 
-    # BOOTSTRAP_ADMITTED is hand-edited in hack/ci-eval-pr.sh, and a
+    # BOOTSTRAP_ADMITTED is hand-edited in hack/eval/blocking-roster.txt, and a
     # misspelling there does not fail -- it silently un-arms the case it was
     # written to keep blocking. `crashloop-debug` for
     # `cluster-agent-crashloop-debug` reads as a working entry and gates
@@ -521,7 +521,7 @@ def _cmd_suite(args: argparse.Namespace) -> int:
     # in a log line nobody reads on a green run.
     #
     # A warning rather than a red. The name might belong to a case that is
-    # legitimately absent from this run -- commented out of TASKS, or filtered
+    # legitimately absent from this run -- not in the presubmit file, or filtered
     # -- and redding the job for naming a case it did not run would make the
     # variable unusable for the transition it exists to cover.
     unknown = sorted(_bootstrap_admitted() - {str(c.get("case")) for c in cases})

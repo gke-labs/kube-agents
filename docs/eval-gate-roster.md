@@ -1,17 +1,21 @@
 # The eval gate roster
 
-`BOOTSTRAP_ADMITTED` in [`hack/ci-eval-pr.sh`](../hack/ci-eval-pr.sh) names the eval cases
-that can red `pull-kube-agents-smoke-test`. This page is the prose that used to sit above
-that export: what admits a case, which cases are held out and on which issue, how far the
-roster's promise reaches, and how a flaky case is demoted. The list itself stays in the
-script — edit it there, and keep this page in step. A roster edit merges only with an
-`approved` from the `eval-crew` alias in [`OWNERS_ALIASES`](../OWNERS_ALIASES):
-[`hack/OWNERS`](../hack/OWNERS) scopes `ci-eval-pr.sh` to that alias with
-`no_parent_owners`, so a root approver does not count for it, and
-[`bench/tasks/OWNERS`](../bench/tasks/OWNERS) does the same for a new or changed case
-([#1546](https://github.com/gke-labs/kube-agents/issues/1546)). It lives under `docs/` on purpose:
-the script's step-0 revalidation treats `docs/` as inert (and the Prow path filter in
-`oss-test-infra` does today too), so a review finding against this prose costs no eval run
+[`hack/eval/blocking-roster.txt`](../hack/eval/blocking-roster.txt) names the eval cases
+that can red `pull-kube-agents-smoke-test`; [`hack/ci-eval-pr.sh`](../hack/ci-eval-pr.sh)
+reads it at startup as the default of `BOOTSTRAP_ADMITTED`. This page is the prose that
+used to sit above that export: what admits a case, which cases are held out and on which
+issue, how far the roster's promise reaches, and how a flaky case is demoted. The list
+itself stays in the file — edit it there, and keep this page in step. A roster edit merges
+only with an `approved` from the `eval-crew` alias in [`OWNERS_ALIASES`](../OWNERS_ALIASES):
+[`hack/OWNERS`](../hack/OWNERS) scopes `blocking-roster.txt` and
+`hack/eval/presubmit-cases.txt` — what blocks and what runs on every pull request — to that
+alias with `no_parent_owners`, so a root approver does not count for either. Nothing else
+carries the rule: `hack/eval/nightly-cases.txt`, a new case directory under `bench/tasks/`
+and the script itself need only the normal approvers
+([#1546](https://github.com/gke-labs/kube-agents/issues/1546), decided 2026-09-15). This
+page lives under `docs/` on purpose: the script's step-0 revalidation treats `docs/` as
+inert (and the Prow path filter in `oss-test-infra` does today too), so a review finding
+against this prose costs no eval run
 ([#1179](https://github.com/gke-labs/kube-agents/issues/1179)), which is exactly what
 roster-comment edits used to cost.
 
@@ -60,10 +64,11 @@ The variable is comma- or whitespace-separated task ids; `_bootstrap_admitted()`
 
 ## The admission bar, and who clears it
 
-Ten of the eighteen active cases are admitted (recount the uncommented entries in the
-script's `TASKS` array rather than trusting this sentence — an earlier copy of it
-miscounted twice): the ones whose recent record shows failures only on their own
-regressions or on infra classes the harness already excludes from the verdict.
+Ten of the eighteen presubmit cases are admitted (recount the entries of
+`hack/eval/presubmit-cases.txt` and `blocking-roster.txt` rather than trusting this
+sentence — an earlier copy of it miscounted twice): the ones whose recent record shows
+failures only on their own regressions or on infra classes the harness already excludes
+from the verdict.
 
 The rest still run and report on every pull request, and they cannot red one on a GRADED
 failure. Four are held out with a filed issue naming the exit condition:
@@ -98,20 +103,26 @@ failure. Four are held out with a filed issue naming the exit condition:
   collapse. Its own record was 12/13 clean before the storms. Enters when #1189's
   re-admission bar holds.
 
-**autoops-warning-event-triage** is no longer in the presubmit `TASKS` array at all
-(tofu wall clock, [#1218](https://github.com/gke-labs/kube-agents/pull/1218)); it runs
-and accrues its record via the nightly tier
-([#1175](https://github.com/gke-labs/kube-agents/pull/1175)) once that runs. Its
-original hold-out rationale stands —
+**autoops-warning-event-triage** is no longer in the presubmit at all (tofu wall clock,
+[#1218](https://github.com/gke-labs/kube-agents/pull/1218)); it runs and accrues its
+record via the nightly tier ([#1175](https://github.com/gke-labs/kube-agents/pull/1175)).
+Its original hold-out rationale stands —
 [#1101](https://github.com/gke-labs/kube-agents/issues/1101): 0/5 graded repetitions on
-record. It enters `BOOTSTRAP_ADMITTED` when the lettered-options bar is settled and it
-has a clean record.
+record. It enters the roster when the lettered-options bar is settled and it has a clean
+record.
+
+Every case that is not in the presubmit runs in the nightly, since 2026-09-15 including
+the nine that used to wait commented out in the script (the reasons each cannot take a
+presubmit seat yet are beside its line in `hack/eval/nightly-cases.txt`). A new case lands
+there by default and earns its presubmit seat, and then its roster seat, on the record
+the nightly builds ([`docs/designs/bench-case-format.md`](designs/bench-case-format.md),
+"Registration").
 
 The eval dashboard's Cases page (`cases.html`, "How reliable is each test?") is
 the readable view of that record: per case, the presubmit and the nightly pass
 rate over repetitions at 7 and 30 days, kept apart — the nightly tier is the only
-place a case outside `TASKS` runs at all — beside the case's roster status, which
-it reads from the script and from this page. The admission evidence itself is the
+place a case outside the presubmit file runs at all — beside the case's roster status,
+which it reads from `hack/eval/blocking-roster.txt` and from this page. The admission evidence itself is the
 baseline store ([`bench/baselines/README.md`](../bench/baselines/README.md)); the
 page shows the same nightly runs, it does not replace the store.
 
@@ -138,9 +149,9 @@ on that side rather than on the roster.
 ## Demoting a flaky case
 
 If an admitted case reds a pull request its diff cannot explain on a graded failure,
-demote it: delete its name from `BOOTSTRAP_ADMITTED` and reference its issue. Demotion is
-a one-line same-day edit to the script — that file, not the Prow config, is deliberately
-the fast lever. It is the lever for rung-4 reds ONLY: a rung-1–3 red (a mutation, an
+demote it: delete its line from `hack/eval/blocking-roster.txt` and reference its issue.
+Demotion is a one-line same-day edit to that file — the file, not the Prow config, is
+deliberately the fast lever. It is the lever for rung-4 reds ONLY: a rung-1–3 red (a mutation, an
 erroring verifier, an empty record on a task that provisions nothing — a record whose
 deployer died before any agent ran grades INFRA and reds nobody) does not stop when its
 case leaves the list.

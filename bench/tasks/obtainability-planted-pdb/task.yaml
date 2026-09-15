@@ -1,5 +1,5 @@
 # NIGHTLY-TIER ACTIVE — recast out of the presubmit on 2026-08-26, an
-# entry in hack/ci-eval-pr.sh NIGHTLY_TASKS since 2026-09-02: the nightly
+# entry in hack/eval/nightly-cases.txt since 2026-09-02: the nightly
 # runs it (EVAL_TIER=nightly), the presubmit never does. Its one measured
 # run PASSED
 # clean — every exact check green, OutcomeValidity 0.7 recorded — in 962s

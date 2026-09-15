@@ -52,7 +52,7 @@ provider "google" {
 provider "kind" {}
 
 # The directory name is historical and is deliberately NOT being changed:
-# hack/ci-eval-pr.sh's TASKS list, testgrid history and the task.yaml
+# hack/eval/nightly-cases.txt, testgrid history and the task.yaml
 # `stack:` reference all point at "prebuilt/gpu-stress-test", and a rename
 # costs far more than it buys. Nothing here is GPU-backed and nothing ever
 # was in anger. The whole incident is seeded by null_resource

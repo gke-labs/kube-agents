@@ -1,4 +1,4 @@
-# ACTIVE — an uncommented entry in hack/ci-eval-pr.sh TASKS, one of the three
+# ACTIVE — an entry in hack/eval/presubmit-cases.txt, one of the three
 # activations that take the reliability domain to five enabled tasks (#1049).
 # Grades what nothing active grades: fleet-wide DISCOVERY. Every active
 # reliability task names checkout-gateway in its prompt; this one does not —

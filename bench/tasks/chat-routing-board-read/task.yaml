@@ -1,5 +1,5 @@
-# NIGHTLY-ACTIVE — registered in hack/ci-eval-pr.sh NIGHTLY_TASKS, not
-# TASKS, since 2026-09-15: the nightly record informs the roster edit that
+# NIGHTLY-ACTIVE — registered in hack/eval/nightly-cases.txt, not the
+# presubmit file, since 2026-09-15: the nightly record informs the roster edit that
 # would admit it (#1568: roster by default, record verdicts reported), and
 # the presubmit seat stays with the domain's probe. Measured before the move: 9/9 across three presubmit builds (11-94s).
 # The paragraph below is the original activation note, kept for the

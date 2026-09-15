@@ -615,7 +615,7 @@ function beingDoneHtml(inc) {
   const lines = [];
   if (inc.tracking.length) lines.push(`<p>Tracking ${inc.tracking.map(issueLink).join(", ")}. The gate comes back on its own once the fix lands: the bot reports healthy after ${PAGE.recoveryGreenRuns} clean runs on different PRs.</p>`);
   if (inc.recovering) lines.push(`<p><b>The condition has cleared.</b> A retest is reasonable now; ${recoveryProgress(inc)} of ${PAGE.recoveryGreenRuns} clean runs on distinct PRs so far.</p>`);
-  else if (isBreak(inc) && !inc.tracking.length && !inc.past) lines.push(`<p>No issue is filed yet. File one with the <code>presubmit-gate</code> label and link this page. Demoting the case in <code>hack/ci-eval-pr.sh</code> unblocks merges while the fixture is fixed; re-admit it afterwards.</p>`);
+  else if (isBreak(inc) && !inc.tracking.length && !inc.past) lines.push(`<p>No issue is filed yet. File one with the <code>presubmit-gate</code> label and link this page. Demoting the case in <code>hack/eval/blocking-roster.txt</code> unblocks merges while the fixture is fixed; re-admit it afterwards.</p>`);
   else if (inc.condition === "storm" && !inc.past) {
     const retest = stormRetestMs(inc);
     lines.push(`<p>Wait it out${retest != null ? `: retest after ${esc(et(retest))}` : ""}. The API quota is fixed, so fewer runs at once is the only lever; a retest inside the storm loses repetitions the same way.</p>`);

@@ -16,14 +16,20 @@ repositories that CI pulls from.
    one, under `bench/tf/prebuilt/<name>/`. Both directories are what the rules below scan.
 2. Run `make bench-case-check`. It applies every rule on this page that a machine can, in
    about a second, with PyYAML alone: no cluster, no `bench/` virtualenv.
-3. Register the case in `hack/ci-eval-pr.sh`: an active `TASKS` entry, a commented-out one
-   for a case whose fixture is not ready, or a `NIGHTLY_TASKS` entry for a case too slow for
-   the presubmit. The format document's "Registration" section says which and why.
-4. Open the pull request. `scripts/test_task_registration.py` runs the same rules in CI and
-   the presubmit runs an active entry three times against the branch, so a case that cannot
-   pass or cannot fail shows up on its own pull request.
-5. The case merges unadmitted. It runs and reports on every pull request from then on, and
-   earns admission on its record, as described under "Roster admission" below.
+3. Register the case: add its `./tasks/<name>/task.yaml` line to
+   `hack/eval/nightly-cases.txt`, with a `#` line naming anything that still blocks it. That
+   is where a new case lands; a presubmit seat (`hack/eval/presubmit-cases.txt`) is a later
+   pull request that cites the case's nightly record, and it needs an `eval-crew` approver
+   where the nightly line needs only the normal ones. A case whose fixture does not exist at
+   all is not registered yet: it goes in `scripts/validate_bench_cases.py`'s
+   `FIXTURE_NOT_READY` with the issue that plants the fixture. The format document's
+   "Registration" section says which and why.
+4. Open the pull request. `scripts/test_task_registration.py` runs the same rules in CI, and
+   the nightly runs the case from the night it merges, so a case that cannot pass or cannot
+   fail shows up on its record.
+5. The case merges unadmitted. It runs and reports every night from then on, earns a
+   presubmit seat on that record, and then admission, as described under "Roster admission"
+   below.
 
 A case for a gap whose fix is not yours takes the same path with one addition: it lands marked
 `expected_fail: true`, having been seen red, and the owner's fix flips the marker in the diff
@@ -50,7 +56,7 @@ its own `deployer: tofu` stack costs every pull request a multi-minute provision
 the agent run, which is why the two tofu-provisioned incumbents were moved to the nightly
 tier ([#1218](https://github.com/gke-labs/kube-agents/pull/1218)). Prefer a seeded-fleet
 fixture from `bench/tf/fleet/fixtures.json` or `deployer: noop`; a case that needs its own
-stack says in the pull request why neither would do, and starts in `NIGHTLY_TASKS`.
+stack says in the pull request why neither would do, and stays in the nightly.
 
 ## Fixture sanitization
 
@@ -115,8 +121,10 @@ answer stays demoted. The bar there is the same for a contributed case and an in
 
 ## Roster admission
 
-A merged case runs on every pull request, and cannot red one on a graded failure until it is
-admitted, which means named in `BOOTSTRAP_ADMITTED` in `hack/ci-eval-pr.sh`. The evidence
+A merged case runs every night, on every pull request once it has a presubmit seat, and
+cannot red one on a graded failure until it is admitted, which means named in
+`hack/eval/blocking-roster.txt` (the default of `BOOTSTRAP_ADMITTED` in
+`hack/ci-eval-pr.sh`). The evidence
 store's record of the case is computed beside that and reported in every verdict, but under
 the default `EVAL_ADMISSION_MODE=roster` it informs the roster edit rather than making it.
 Admission, the hold-outs, how far the roster's promise reaches, demotion and what the record
@@ -127,13 +135,14 @@ absolute rungs (a forbidden cluster mutation, an erroring verifier, a record tha
 real run) red a pull request for every case, admitted or not, and a case earns its seat on
 its record rather than on who wrote it.
 
-Proposing admission is a pull request that adds the case to `BOOTSTRAP_ADMITTED` and cites
-the record: the verdict's **Record says** column once the store holds a full window
+Proposing admission is a pull request that adds the case to `hack/eval/blocking-roster.txt`
+and cites the record: the verdict's **Record says** column once the store holds a full window
 (`would-admit`), or before that the runs, what failed and why each failure was the case's own
 regression or an infrastructure class the harness already excludes. The roster page's
 hold-out entries are the shape of the evidence a reviewer expects.
 
-**Check:** none mechanical, but the approver is: a roster edit needs an `approved` from the
-`eval-crew` alias ([`hack/OWNERS`](../hack/OWNERS) scopes `ci-eval-pr.sh` to it, and
-[`OWNERS`](tasks/OWNERS) in `tasks/` does the same for a case), and a root approver alone
-cannot merge either.
+**Check:** none mechanical, but the approver is: a roster edit, and a presubmit-seat edit,
+needs an `approved` from the `eval-crew` alias ([`hack/OWNERS`](../hack/OWNERS) scopes
+`hack/eval/blocking-roster.txt` and `presubmit-cases.txt` to it), and a root approver
+alone cannot merge either. The nightly file and the case directory itself need only the
+normal approvers.

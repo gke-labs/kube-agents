@@ -1,5 +1,5 @@
-# COMMENTED OUT — a commented-out entry in hack/ci-eval-pr.sh TASKS, which
-# registers it pending activation. Same hold as upgrades-fleet-version-table
+# NIGHTLY — registered in hack/eval/nightly-cases.txt since 2026-09-15,
+# commented out of the presubmit's TASKS array before that. Same hold as upgrades-fleet-version-table
 # and upgrades-fleet-rollout-stall, the skill's Phase-1 and Phase-2 cases: the
 # maintainer's call on #1343 keeps them out until #1254 is closed, the open
 # issue on the sibling probe upgrades-lagging-master-probe where a delegated
@@ -7,8 +7,8 @@
 # requests (the #1010 family that docs/eval-gate-roster.md holds two other
 # cases out on). This case reads the same final answer over the same fixture,
 # so it cannot be watched to both pass and fail until then; it stays
-# `validated: false` and commented out. Uncomment the TASKS line when #1254 is
-# closed; nothing here changes.
+# `validated: false` and out of the presubmit. Its nightly record from #1254's
+# close on is what earns a seat; nothing here changes.
 #
 # The Phase-3 case for the fleet-upgrade-verification skill (#1343 criterion
 # 3, #1411): not which members lag (upgrades-fleet-version-table asks that)

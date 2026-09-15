@@ -1,7 +1,0 @@
-# A new or changed eval case runs on every pull request, so it needs an
-# eval-crew approver; a root approver does not count here (no_parent_owners).
-# bench/CONTRIBUTING.md "Roster admission" states the rule.
-approvers:
-- eval-crew
-options:
-  no_parent_owners: true

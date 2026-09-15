@@ -223,14 +223,14 @@ side.
   `bench/tasks/<name>/task.yaml` **on the checkout the collector runs
   from**; `"unknown"` for a historical task with no yaml (renamed or
   deleted). Never a crash.
-- `active` — `true` iff the name is an **uncommented** entry in
-  `hack/ci-eval-pr.sh`'s `TASKS` array (same textual parse as
+- `active` — `true` iff the name is an entry in
+  `hack/eval/presubmit-cases.txt` (the same parse, `scripts/eval_rosters.py`, as
   `scripts/test_domain_coverage.py`). Historical-only cases are kept with
   `active: false`.
 - `nightly_active` — **optional, additive**: `true` iff the name is an
-  uncommented entry in `TASKS` **or** `NIGHTLY_TASKS` — the nightly matrix
-  is the presubmit's superset (`EVAL_TIER=nightly` appends the second
-  array). `active` implies `nightly_active`; the Cases page's "nightly
+  entry in `hack/eval/presubmit-cases.txt` **or** `hack/eval/nightly-cases.txt`
+  — the nightly matrix is the presubmit's superset (`EVAL_TIER=nightly`
+  appends the second file). `active` implies `nightly_active`; the Cases page's "nightly
   only" status is `nightly_active and not active`.
 - `runs_on_record` — total task appearances across presubmit runs, `infra`
   included (it is history).
@@ -569,8 +569,8 @@ when none did — evidence about `main`, shown beside the case, never a tag.
 
 `cases{}` is, per case, `{active, nightly_active, admitted, domain, status,
 demoted_on, note, issues[], rates, strip[], last_failure}`. `status` is
-`blocking` (active and in `BOOTSTRAP_ADMITTED`), `held_out` (active, off
-the roster), `demoted` (held out, with `demoted_on` read from the hold-out
+`blocking` (active and in `hack/eval/blocking-roster.txt`), `held_out`
+(active, off the roster), `demoted` (held out, with `demoted_on` read from the hold-out
 entry in `docs/eval-gate-roster.md` that says `demoted YYYY-MM-DD`),
 `nightly_only`, or `retired` (in neither matrix on this checkout); an
 unreadable roster reads every active case as `blocking`, over-reporting
@@ -731,8 +731,11 @@ its `trimmed` key records the source and the cut. Six of its zero-task runs
 carry `result: "failure"` in lowercase, as Prow wrote them on 2026-09-05 —
 the one departure from the `result` vocabulary above seen in the wild, so
 consumers compare it case-insensitively. `testdata_health/roster-history.json` is the
-`BOOTSTRAP_ADMITTED` roster per era over the same week, taken from the
-commits that changed it. Together they are the replay fixture
+blocking roster per era over the same week, taken from the commits that
+changed it (the `BOOTSTRAP_ADMITTED` line of `hack/ci-eval-pr.sh` then;
+`hack/eval/blocking-roster.txt` since 2026-09-15 — `health.Roster.from_file`
+reads the file and `health.Roster.from_script_text` the old line, so an era
+from before the move is taken from the script at that commit). Together they are the replay fixture
 `scripts/test_eval_dashboard_health.py` asserts the week's incident
 timeline against. `testdata_health/lost-pods-2026-09-11.json.gz` is the same
 cut of the published `data.json` for 2026-09-11 (#1478) — the day five build

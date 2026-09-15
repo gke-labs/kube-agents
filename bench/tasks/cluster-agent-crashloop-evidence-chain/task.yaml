@@ -1,4 +1,4 @@
-# ACTIVE — an uncommented entry in hack/ci-eval-pr.sh TASKS.
+# ACTIVE — an entry in hack/eval/presubmit-cases.txt.
 #
 # Domain: cluster debugging. Journey: the RCA has to be backed by what the
 # agent actually observed, not by a plausible label.
