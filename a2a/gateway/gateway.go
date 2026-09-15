@@ -87,7 +87,11 @@ type Gateway struct {
 	gchatAllowed  map[string]bool
 	gchatAllowAll bool
 	// droppedNotices records which unverifiable senders have been told so —
-	// the drop is visible once per sender, not once per message.
+	// the drop is visible once per sender, not once per message. Per
+	// sender, NOT per conversation: a channel mention mints a fresh
+	// conversation every time, so a conversation-scoped key would be no
+	// bound at all. Bounded by droppedNoticesCap, so an unverified sender
+	// cannot grow it without bound either.
 	droppedNotices map[string]bool
 	// relayDurable is the event relay's durable name (Options.RelayDurable).
 	relayDurable string

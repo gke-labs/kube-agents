@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/hkdf"
 	"crypto/sha256"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -21,6 +22,8 @@ func setBaseEnv(t *testing.T) {
 	t.Setenv("NATS_URL", "nats://127.0.0.1:4222")
 	t.Setenv("NATS_PASSWORD", "pw")
 	t.Setenv("DISCORD_TOKEN", "x")
+	t.Setenv("SLACK_BOT_TOKEN", "")
+	t.Setenv("SLACK_APP_TOKEN", "")
 	t.Setenv("SESSION_KV_SALT", "")
 	t.Setenv("A2A_ATTRIBUTION_SALT", "")
 	t.Setenv("A2A_TASK_DEADLINE_SECONDS", "")
@@ -288,6 +291,112 @@ func TestFromEnvAskTTL(t *testing.T) {
 		t.Setenv("A2A_ASK_TTL", bad)
 		if _, err := FromEnv(); err == nil {
 			t.Fatalf("A2A_ASK_TTL=%q accepted", bad)
+		}
+	}
+}
+
+// TestFromEnvBackendSelection: exactly one chat backend per gateway
+// process — two gateways bound to one relay durable split event deliveries
+// (Options.RelayDurable), so a second backend is a second Deployment, and
+// zero backends is a gateway with no front door. Socket Mode needs both
+// Slack tokens, so half a pair refuses too.
+func TestFromEnvBackendSelection(t *testing.T) {
+	setBaseEnv(t)
+
+	cfg, err := FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Backend() != "discord" {
+		t.Fatalf("Backend() = %q, want discord", cfg.Backend())
+	}
+
+	t.Setenv("DISCORD_TOKEN", "")
+	t.Setenv("SLACK_BOT_TOKEN", "xoxb-1")
+	t.Setenv("SLACK_APP_TOKEN", "xapp-1")
+	cfg, err = FromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Backend() != "slack" {
+		t.Fatalf("Backend() = %q, want slack", cfg.Backend())
+	}
+
+	t.Setenv("DISCORD_TOKEN", "x")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("two backends accepted; one relay durable means one backend per gateway")
+	}
+
+	t.Setenv("DISCORD_TOKEN", "")
+	t.Setenv("SLACK_BOT_TOKEN", "")
+	t.Setenv("SLACK_APP_TOKEN", "")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("no backend accepted")
+	}
+
+	t.Setenv("SLACK_BOT_TOKEN", "xoxb-1")
+	if _, err := FromEnv(); err == nil {
+		t.Fatal("half a Slack token pair accepted; Socket Mode needs both")
+	}
+}
+
+// TestFromEnvBackendCombinations walks every combination of the three
+// backends' credentials, because with three backends the pairs are exactly
+// what a hand-enumerated switch leaves a hole in — the two-backend switch
+// this merged from only knew about one pair, and a fourth backend must not
+// be addable with a combination nobody checked. Exactly one backend armed is
+// the only accepted shape; zero, any pair, all three, and any half Slack
+// pair all refuse.
+func TestFromEnvBackendCombinations(t *testing.T) {
+	const (
+		discord = "x"
+		bot     = "xoxb-1"
+		app     = "xapp-1"
+		relay   = "http://relay.ns.svc:8081"
+	)
+	for _, d := range []string{"", discord} {
+		for _, b := range []string{"", bot} {
+			for _, a := range []string{"", app} {
+				for _, g := range []string{"", relay} {
+					name := fmt.Sprintf("discord=%t/bot=%t/app=%t/gchat=%t", d != "", b != "", a != "", g != "")
+					t.Run(name, func(t *testing.T) {
+						setBaseEnv(t)
+						t.Setenv("DISCORD_TOKEN", d)
+						t.Setenv("SLACK_BOT_TOKEN", b)
+						t.Setenv("SLACK_APP_TOKEN", a)
+						t.Setenv("A2A_GCHAT_RELAY_URL", g)
+
+						// A half Slack pair is a typo, never a choice.
+						halfPair := (b != "") != (a != "")
+						armed := 0
+						want := ""
+						if g != "" {
+							armed, want = armed+1, "gchat"
+						}
+						if b != "" {
+							armed, want = armed+1, "slack"
+						}
+						if d != "" {
+							armed, want = armed+1, "discord"
+						}
+
+						cfg, err := FromEnv()
+						if halfPair || armed != 1 {
+							if err == nil {
+								t.Fatalf("FromEnv() accepted %s (armed=%d, halfPair=%t); backend = %q",
+									name, armed, halfPair, cfg.Backend())
+							}
+							return
+						}
+						if err != nil {
+							t.Fatalf("FromEnv() refused the one armed backend: %v", err)
+						}
+						if got := cfg.Backend(); got != want {
+							t.Fatalf("Backend() = %q, want %q", got, want)
+						}
+					})
+				}
+			}
 		}
 	}
 }
