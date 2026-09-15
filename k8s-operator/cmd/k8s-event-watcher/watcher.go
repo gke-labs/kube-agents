@@ -56,9 +56,17 @@ const (
 	// preflightResource and the two verbs are what the preflight asks the API
 	// server about: the core Events list and watch the informer is about to
 	// make, at the cluster scope, in that order. The list is asked first
-	// because it is the first request the classic reflector makes; the watch
-	// is asked only once the list is allowed, so a denied cluster costs one
-	// review per check, not two.
+	// because it is the first request the classic reflector makes and the
+	// permission GKE's IAM names in its refusal; the watch is asked only once
+	// the list is allowed, so a denied cluster costs one review per check,
+	// not two. Both are required: the reflector's watch-list mode (see
+	// newListWatch) streams the initial state through the watch and falls
+	// back to the list only when that stream fails, so an identity granted
+	// watch but not list would have been served there and is held here. That
+	// grant shape does not occur in practice — every role template and IAM
+	// role pairs the two — and the hold is the price of asking for the
+	// permissions the informer is documented to need rather than the ones a
+	// particular reflector mode happens to exercise.
 	preflightResource  = "events"
 	preflightListVerb  = "list"
 	preflightWatchVerb = "watch"
@@ -72,11 +80,8 @@ const (
 	// GKE names the missing IAM permission.
 	preflightDeniedFormat = "watcher: [%s] %s %s denied at preflight, holding %s before the next check: %s"
 	// preflightInconclusiveFormat is the one line logged when the review
-	// itself failed, before falling through to building the informer.
+	// could not decide, before falling through to building the informer.
 	preflightInconclusiveFormat = "watcher: [%s] preflight inconclusive, starting the informer anyway: %v"
-	// preflightEvaluationErrorFormat appends a review's status.evaluationError
-	// to its reason: the authorizer answered no and said why it was unsure.
-	preflightEvaluationErrorFormat = "%s (evaluation error: %s)"
 )
 
 // preflightVerbs is the order the preflight asks in (see preflightResource).
@@ -247,9 +252,10 @@ func (w *watcher) Run(ctx context.Context, onWatching func(watching bool)) error
 // contract handleWatchError keeps after the informer is up.
 //
 // The preflight is advisory: a review that cannot be made at all (an
-// authorizer that does not answer SelfSubjectAccessReview, a webhook outage,
-// a stripped system:basic-user) is logged once and the informer is built
-// exactly as it would have been without the preflight, so this can only make
+// authorizer that does not answer SelfSubjectAccessReview, a stripped
+// system:basic-user) or that the authorizer could not decide (a webhook
+// outage; see preflight) is logged once and the informer is built exactly as
+// it would have been without the preflight, so this can only make
 // a denied cluster quieter, never withhold one the reflector would have
 // watched. It is also blind to a permission revoked after it ran; that is
 // handleWatchError's path. Nothing is reported through onWatching from here:
@@ -276,27 +282,45 @@ func (w *watcher) awaitPermitted(ctx context.Context) error {
 			reason = preflightNoReason
 		}
 		log.Printf(preflightDeniedFormat, w.cluster.Name, preflightResource, verb, w.forbiddenHold, reason)
-		hold := time.NewTimer(w.forbiddenHold)
-		select {
-		case <-ctx.Done():
-			hold.Stop()
+		if !holdOrDone(ctx, w.forbiddenHold) {
 			return fmt.Errorf("watcher: stopped while held at preflight (%s %s denied: %s): %w", preflightResource, verb, reason, ctx.Err())
-		case <-hold.C:
 		}
+	}
+}
+
+// holdOrDone waits d, or until ctx is done, whichever comes first, and reports
+// whether the hold ran its full length. Both holds go through here — the
+// preflight's after a denial (awaitPermitted) and the reflector's after a 403
+// (handleWatchError) — so the one clock and one contract the comments above
+// promise cannot drift apart between two copies of the same select.
+func holdOrDone(ctx context.Context, d time.Duration) bool {
+	hold := time.NewTimer(d)
+	defer hold.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-hold.C:
+		return true
 	}
 }
 
 // preflight asks the API server, one SelfSubjectAccessReview per verb in
 // preflightVerbs, whether this identity may list and then watch Events at the
 // cluster scope, stopping at the first refusal. It returns the refused verb
-// and the review's status.reason (with its evaluationError appended when the
-// authorizer set one), or an empty verb when both are allowed. An error means
-// the question could not be asked, not that the answer was no; awaitPermitted
-// treats the two differently. SelfSubjectAccessReview needs no
-// grant of its own — system:basic-user binds it to system:authenticated — and
-// on GKE it resolves through the same authorizer chain as the list itself,
-// IAM included, so the reason it returns is the one the reflector would have
-// been refused with.
+// and the review's status.reason, or an empty verb when both are allowed. An
+// error means the question was not answered, not that the answer was no;
+// awaitPermitted treats the two differently. A review that comes back not
+// allowed with status.evaluationError set is an error here, not a refusal:
+// the authorizer chain could not decide (a webhook authorizer, GKE's IAM
+// among them, that cannot reach its backend), and the API server answers the
+// list itself with a 500 in that state, not a 403, which the reflector
+// retries on its default backoff. Holding on it would withhold a cluster the
+// reflector would have been watching moments after the authorizer recovered.
+//
+// SelfSubjectAccessReview needs no grant of its own — system:basic-user binds
+// it to system:authenticated — and on GKE it resolves through the same
+// authorizer chain as the list itself, IAM included, so the reason it returns
+// is the one the reflector would have been refused with.
 func (w *watcher) preflight(ctx context.Context) (string, string, error) {
 	for _, verb := range preflightVerbs {
 		review := &authorizationv1.SelfSubjectAccessReview{
@@ -312,13 +336,13 @@ func (w *watcher) preflight(ctx context.Context) (string, string, error) {
 		if err != nil {
 			return "", "", fmt.Errorf("SelfSubjectAccessReview for %s %s: %w", verb, preflightResource, err)
 		}
-		if !result.Status.Allowed {
-			reason := result.Status.Reason
-			if result.Status.EvaluationError != "" {
-				reason = fmt.Sprintf(preflightEvaluationErrorFormat, reason, result.Status.EvaluationError)
-			}
-			return verb, reason, nil
+		if result.Status.Allowed {
+			continue
 		}
+		if result.Status.EvaluationError != "" {
+			return "", "", fmt.Errorf("SelfSubjectAccessReview for %s %s: authorizer could not decide: %s", verb, preflightResource, result.Status.EvaluationError)
+		}
+		return verb, result.Status.Reason, nil
 	}
 	return "", "", nil
 }
@@ -461,12 +485,7 @@ func (w *watcher) handleWatchError(ctx context.Context, r *cache.Reflector, err 
 	}
 	w.markHeld()
 	log.Printf("watcher: [%s] events forbidden, holding %s before the next attempt: %v", w.cluster.Name, w.forbiddenHold, err)
-	hold := time.NewTimer(w.forbiddenHold)
-	defer hold.Stop()
-	select {
-	case <-ctx.Done():
-	case <-hold.C:
-	}
+	holdOrDone(ctx, w.forbiddenHold)
 }
 
 // dispatch converts a *corev1.Event to the internal TriageEvent

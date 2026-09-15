@@ -161,6 +161,9 @@ type preflightStub struct {
 	reason  string
 	err     error
 	reviews atomic.Int64
+	// evaluationError, when set, is put on every refused review's status: the
+	// authorizer's "I could not decide" alongside allowed=false.
+	evaluationError string
 }
 
 func (s *preflightStub) set(deny, reason string, err error) {
@@ -175,7 +178,7 @@ func stubPreflight(client *fake.Clientset, deny, reason string, err error) *pref
 	client.PrependReactor("create", "selfsubjectaccessreviews", func(action k8stesting.Action) (bool, runtime.Object, error) {
 		s.reviews.Add(1)
 		s.mu.Lock()
-		deny, reason, err := s.deny, s.reason, s.err
+		deny, reason, err, evaluationError := s.deny, s.reason, s.err, s.evaluationError
 		s.mu.Unlock()
 		if err != nil {
 			return true, nil, err
@@ -188,6 +191,7 @@ func stubPreflight(client *fake.Clientset, deny, reason string, err error) *pref
 		review.Status.Allowed = attrs.Verb != deny
 		if !review.Status.Allowed {
 			review.Status.Reason = reason
+			review.Status.EvaluationError = evaluationError
 		}
 		return true, review, nil
 	})
@@ -882,6 +886,48 @@ func TestRun_PreflightErrorFallsThroughToTheInformer(t *testing.T) {
 	}
 	if strings.Contains(logs.String(), "denied at preflight") {
 		t.Errorf("an inconclusive preflight must not read as a denial:\n%s", logs.String())
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return within 2s of cancellation")
+	}
+}
+
+// A review the authorizer could not decide — allowed=false with an
+// evaluationError, which is what a webhook authorizer that cannot reach its
+// backend produces — is inconclusive, not a denial: the API server would have
+// answered the list itself with a 500 the reflector retries within seconds,
+// so holding here would withhold a cluster the reflector would have watched.
+func TestRun_PreflightEvaluationErrorIsInconclusive(t *testing.T) {
+	logs := captureLog(t)
+	client, lists := countingListClient()
+	stub := stubPreflight(client, "list", "", nil)
+	stub.evaluationError = "webhook authorizer: connection refused"
+	w := newWatcher(client, nopDispatcher{}, targetCluster{Name: "undecided"}, 0)
+	w.forbiddenHold = time.Hour
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	rec := &transitionRecorder{}
+	go func() { done <- w.Run(ctx, rec.record) }()
+
+	eventually(t, 10*time.Second, func() bool { return rec.count() >= 1 }, "the sync to be reported")
+	if got, want := rec.snapshot(), []bool{true}; !equalBools(got, want) {
+		t.Errorf("transitions = %v; want %v", got, want)
+	}
+	if got := lists.Load(); got < 1 {
+		t.Errorf("want the informer's list after an undecided preflight, got %d", got)
+	}
+	want := "[undecided] preflight inconclusive, starting the informer anyway: SelfSubjectAccessReview for list events: authorizer could not decide: webhook authorizer: connection refused"
+	if got := strings.Count(logs.String(), want); got != 1 {
+		t.Errorf("want exactly one inconclusive line %q, got %d in:\n%s", want, got, logs.String())
+	}
+	if strings.Contains(logs.String(), "denied at preflight") {
+		t.Errorf("an undecided review must not read as a denial:\n%s", logs.String())
 	}
 
 	cancel()

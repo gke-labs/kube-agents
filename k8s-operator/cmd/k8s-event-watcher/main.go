@@ -975,7 +975,7 @@ func realMain(argv []string) error {
 		go func(tc targetCluster, disp *dispatcher) {
 			defer wg.Done()
 			w := newWatcher(tc.Client, disp, tc, 0)
-			log.Printf("k8s-event-watcher: [%s] starting informer (source=%s project=%s location=%s)",
+			log.Printf("k8s-event-watcher: [%s] starting: preflight, then informer (source=%s project=%s location=%s)",
 				tc.Name, tc.Profile, tc.ProjectID, tc.Location)
 			// Starts at 0 and only reaches 1 once the initial list completes.
 			// Setting it before Run would have reported every cluster up the
@@ -1056,7 +1056,7 @@ func realMain(argv []string) error {
 	}
 	select {
 	case <-syncFailed:
-		return fmt.Errorf("no cluster synced within %s; %d informer(s) started but none completed their initial list", initialSyncGrace, started)
+		return fmt.Errorf("no cluster synced within %s; %d cluster(s) started but none completed an initial list (a cluster denied at preflight never attempts one; see its preflight line)", initialSyncGrace, started)
 	default:
 	}
 	return nil
