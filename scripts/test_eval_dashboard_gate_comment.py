@@ -197,6 +197,30 @@ class Shapes(Harness):
         self.assertNotIn("Incident brief", body)
         self.assertIn("6 cases passed.", body)
 
+    def test_the_reason_line_is_the_graders_check_not_the_agents_report(self):
+        # Since 2026-09-15 the collector keeps the agent's report under a
+        # failing rep as `excerpt` (the Brief's quote). The comment's Reason
+        # line must still be the check that failed; the excerpt stands in
+        # only for a rep that has no reason at all.
+        report = "🔀 Delegated to the **platform** agent Created as task `t_169f6f10`. The pod is `Running` and the service answers on port 8080."
+        with_both = task("security-overgrant-probe", "fff")
+        for rep in with_both["reps"]:
+            rep["excerpt"] = report
+        tasks = [with_both] + [task(name, "ppp") for name in sorted(ADMITTED) if name != "security-overgrant-probe"] + [task(HELD_OUT, "ppp")]
+        mine = [run(100 + i, 913, NOW - timedelta(hours=3 - i), tasks=tasks) for i in range(4)]
+        self.tick(data(*mine, *green_others()), green_health())
+        body = self.gh.bodies()[0]
+        self.assertIn("Reason: `sandbox pod never reached Running (ImagePullBackOff: agent-sandbox:pr-913)`", body)
+        self.assertNotIn("Delegated", body)
+
+        for rep in with_both["reps"]:
+            rep["reason"] = None
+        other_pr = [run(200 + i, 914, NOW - timedelta(hours=3 - i), tasks=tasks) for i in range(4)]
+        gh = FakeGh()
+        self.tick(data(*other_pr, *green_others()), green_health(), gh=gh)
+        body = gh.bodies()[0]
+        self.assertIn("Reason: `" + report.replace("`", "'")[:gate_comment.EXCERPT_CHARS] + "`", body)
+
     def test_a_green_night_is_not_another_pr(self):
         # The nightly periodic's run shares data.json with no pull request
         # (tiers.py). Green an hour ago, it passed every case: it must neither

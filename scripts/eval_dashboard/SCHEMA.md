@@ -154,7 +154,9 @@ the same layout and is collected from the moment it starts running.
       and every build graded before the line existed. `classify.py`'s
       `excerpt_of` reads it into the Brief's "What the agent saw" quote, the
       run page's case card and a case's `last_failure`; nothing is quoted
-      when it is absent.
+      when it is absent. The PR gate comment's Reason line stays the
+      grader's `reason` and falls back to the excerpt only for a rep that
+      has no reason at all.
     - **Omission semantics:** the key is absent — never `[]` — when the log
       has no `rep N:` grading lines for the task: single-repetition-era
       builds (branches predating the multi-repetition eval of 2026-08-28;
