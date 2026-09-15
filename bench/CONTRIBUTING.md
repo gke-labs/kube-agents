@@ -25,6 +25,12 @@ repositories that CI pulls from.
 5. The case merges unadmitted. It runs and reports on every pull request from then on, and
    earns admission on its record, as described under "Roster admission" below.
 
+A case for a gap whose fix is not yours takes the same path with one addition: it lands marked
+`expected_fail: true`, having been seen red, and the owner's fix flips the marker in the diff
+that closes the gap. [`.agents/rules/eval_driven_development.md`](../.agents/rules/eval_driven_development.md),
+"When the fix is not yours", is the rule; the validator in step 2 rejects a marker that is not a
+bare YAML boolean.
+
 ## The task format
 
 `task.yaml` follows [`docs/designs/bench-case-format.md`](../docs/designs/bench-case-format.md):

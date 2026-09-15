@@ -97,6 +97,13 @@ the field the demotion mechanic in `docs/eval-gate-roster.md` addresses its issu
 `bench/CONTRIBUTING.md` is where the commitment, and the reason the login is bare, are
 spelled out.
 
+`expected_fail` is the eval-driven-development marker, for a case whose fix is not yours: the
+case lands red so the gap is on record, and `bench-gate` reads it inverted — failing is the
+declared outcome, and passing every repetition reds the job until the marker is flipped. It
+defaults to `false`, a case for your own change never carries it, and it must be a bare YAML
+boolean: `"false"` is a string, and truthy, and the validator rejects it.
+`.agents/rules/eval_driven_development.md` has the rule; devops-bench ignores the key.
+
 `verification_spec` is the exact half of the grade, and the rest of this document is
 mostly about it.
 
@@ -301,7 +308,8 @@ id that disagrees with its directory, a `domain:` that is missing or not in
 `domains.yaml`, a `fixtures:` role the fleet catalog does not define, a cluster-reading
 case that declares no `fixtures:` at all, a missing, empty or inline `verification_spec`,
 a check that carries no assertion and so can only pass, a missing `owner:` or one written
-as a mention or as something other than a login, and a case that is registered nowhere. It
+as a mention or as something other than a login, an `expected_fail:` that is not a bare YAML
+boolean, and a case that is registered nowhere. It
 also applies the entry vocabulary above — role, the severity pairing, the rejected `hold`
 mode, a positive weight — which devops-bench enforces too, at spec-load time, after the
 lease.
