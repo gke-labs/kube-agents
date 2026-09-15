@@ -204,6 +204,13 @@
         "podMonitoring": {
           "type": "boolean"
         },
+        "responseCache": {
+          "type": "string",
+          "enum": ["", "conservative", "testing", "risky"]
+        },
+        "responseCachePackage": {
+          "type": "string"
+        },
         "redaction": {
           "type": "object",
           "additionalProperties": false,
