@@ -1338,7 +1338,7 @@ TASKS=(
   # bench/tf/prebuilt/autoops-incident/main.tf for why it cannot, and why it
   # is the host cluster and not the per-run one that gets the incident.
   # autoops-warning-event-triage: moved to NIGHTLY_TASKS 2026-09-03 (tofu wall clock, #1218/#1202).
-  # Five registered scenarios stay commented out, and eleven more run in the
+  # Five registered scenarios stay commented out, and twelve more run in the
   # nightly tier only -- NIGHTLY_TASKS below; the task-registration lint
   # reads both arrays. A commented entry here counts as registered, so a
   # line is a promise the scenario exists, not that it runs; the
@@ -1608,6 +1608,19 @@ NIGHTLY_TASKS=(
   #      sandbox). 980-1929s a repetition on 2026-09-14, priced below.
   "./tasks/chat-routing-board-read/task.yaml"
   "./tasks/pdb-remediation-pr/task.yaml"
+  # #1023's incident-triage second case, nightly from the start
+  # (2026-09-15): the presubmit-eligible probe the domains.yaml allowlist
+  # entry asks for. The prompt is the watcher's warning payload in the
+  # _triage_task_body shape, pointed at the seeded fleet's payments-api
+  # crashloop (role crashloop-workload) -- deployer: noop, no infra lock,
+  # no watcher or card wait, unlike autoops-warning-event-triage above. It
+  # grades the delivery contract (`What to do` plus an option letter or
+  # `To authorize:`) that #1101 measured the agent failing and that no
+  # presubmit case grades. The crashloop-debug cost band; the default
+  # unit_cost_hint fits until its own measurement says otherwise. Measured
+  # in the authoring PR's draft presubmit run (build id and per-repetition
+  # costs recorded in the task header and bench/tasks/DRAFTS.md).
+  "./tasks/incident-triage-oom-event-probe/task.yaml"
 )
 
 # Which matrix this run gets. "presubmit" -- the default, and what every
