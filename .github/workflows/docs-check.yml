@@ -50,6 +50,13 @@ jobs:
       - name: Documentation map covers every doc
         run: make docs-check-map
 
+      # The published site is for people running kube-agents on their own
+      # clusters. A workflow secret name, a GitHub App ID, or a service account
+      # in a maintainers' project on a site page is a runbook that belongs at
+      # another home (.agents/rules/documentation.md).
+      - name: Site pages carry no maintainer identifier
+        run: make docs-check-audience
+
       # AGENTS.md and CLAUDE.md are loaded into every agent session before the
       # first prompt, so their size is a cost paid by every task here. Nothing
       # about that is visible in a diff, and the file quietly tripled in nine

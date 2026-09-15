@@ -125,6 +125,14 @@ CI enforcement: `make docs-check` runs the same checks as
   not inventory them and the check does not require them — the map and the
   check share one scope. A dot-directory nested inside a documented area
   (`examples/gitops-repo/.github/`) is example content and stays in scope.
+- `docs-check-audience` — `scripts/check_docs_audience.py`; no page under
+  `docs/site/src/content/docs/` may match a shape in
+  `scripts/docs_audience_denylist.txt` (workflow secret and variable names, App
+  and installation IDs, the maintainers' Prow project, internal repositories),
+  name a project ID `hack/ci-env.sh` exports (the evaluation pool), or name a
+  service-account email in a non-placeholder project; it also fails when it
+  finds no site page or derives no project ID. The rule is
+  `.agents/rules/documentation.md`.
 - `docs-check-context-budget` — `scripts/check_context_budget.py`; `AGENTS.md`
   plus `CLAUDE.md` are loaded into every agent session before the first prompt,
   and their combined size must stay inside the `BUDGET` that file sets.
@@ -162,6 +170,7 @@ identifier appears, add its source here.
 | `make` targets | the root `Makefile` and `k8s-operator/Makefile` |
 | The GitHub environment variables an install is configured from, which install.env key each becomes, and which are required to reconcile a long-lived environment | `MAPPING`, `REQUIRED_ALWAYS` and `REQUIRED_STRICT` in `scripts/release/render_install_env.sh` |
 | Paths baked into the agent image (`/opt/defaults/...`) | `deploy/docker/Dockerfile` |
+| The maintainers' CI project IDs, which `docs-check-audience` forbids on the site | `hack/ci-env.sh` (the `PROJECT_ID` export) |
 | Image-patch module names and the behaviour they add | the module's own docstring under `deploy/docker/patches/`, plus the `COPY`/`RUN` list in `deploy/docker/Dockerfile` |
 | Bundled Hermes platform plugins the image installs (no patch) | the plugin's own `adapter.py` docstring under `deploy/docker/plugins/`, plus the `COPY`/`RUN` list in `deploy/docker/Dockerfile` |
 | Slack bot token scopes an install must grant | upstream `_build_full_manifest` in `hermes_cli/slack_cli.py` as patched by `deploy/docker/patches/apply_slack_reactions_scope.py`; the one prose copy, in `INSTALL.md`, must match it (`scripts/installer/print_instructions_slack.sh` defers to `hermes slack manifest` and carries no copy) |
@@ -386,7 +395,7 @@ only what the title does not say.
 | --- | --- | --- | --- | --- |
 | `index.mdx` | Site page | Landing page (hero + cards): the project pitch and entry points. | Chat + Platform agents, components, skills | Everyone |
 | `404.md` | Site page | Custom not-found page linking to key entry points. | Navigation | Site infrastructure |
-| `contributing.md` | Site page | The CLA and community guidelines, a pointer to the repository's `CONTRIBUTING.md` and `AGENTS.md` for the contributor workflow, and where to file issues. | CLA, feedback form | Users and prospective contributors; the workflow itself lives in the repository |
+| `contributing.md` | Site page | The CLA and community guidelines, a pointer to the repository's `CONTRIBUTING.md` and `AGENTS.md` for the contributor workflow, and where to file issues. | CLA, feedback form | Prospective contributors — the CLA has to be reachable from the public site; the workflow itself lives in the repository's `CONTRIBUTING.md` |
 | `overview/what-is-kube-agents.md` | Site page | Inventory of the first-party components: what installs where and what runs after the provisioner reconciles. | Operator, agent Deployment, gateway, Minty | New users |
 | `overview/architecture.mdx` | Site page | Component map and the three request flows (chat, cron tick, remediation PR) through one Hermes gateway hosting the two profiles. | Flows, kanban coordination, topology, failure modes | The shipping-architecture page |
 | `overview/proactive-autonomy.md` | Site page | The hands-free loop: cron jobs fire the Platform Agent at governance SOPs; audits, PRs, alerts. | Watchdog loop, safety rails | New users |
@@ -490,11 +499,22 @@ only what the title does not say.
 - `make docs-check` mechanically guards **presence and shape**:
   `docs-check-map` fails CI when a tracked `.md`/`.mdx` file outside a
   root-level dot-directory has no inventory entry here, when a path in the
-  inventory's path column no longer exists, or when a table row has been
-  re-padded. It deliberately checks no counts — see section 1. The prose
+  inventory's path column no longer exists, when a table row has been
+  re-padded, or when a published-site row's audience cell names maintainers,
+  CI engineers, or contributors; a map with no published-site table is an
+  error, not a pass. It deliberately checks no counts — see
+  section 1. The prose
   summaries, key-topic cells, and the identifier-sources table have no
   mechanical guard; PR review (and the drift skill) is the only check on their
   honesty.
+- **A site row's audience cell may not name maintainers, CI engineers, or
+  contributors.** The site is for people installing and operating kube-agents
+  on their own clusters; a page for anyone else belongs under one of the other
+  homes the canonical-home table in `AGENTS.md` names (maintainer environments,
+  release runbooks, the evaluation pool), typed as it is there, with its row in
+  that section of this map. `docs-check-map` rejects the words, with the CLA
+  page `contributing.md` as the one exemption; `docs-check-audience` rejects
+  the identifiers such a page carries.
 - **A file deleted from inside a collapsed family is caught by
   [`family-roster.txt`](family-roster.txt), not by this file.** A glob keeps
   matching its survivors, so the inventory row still reads true after one of

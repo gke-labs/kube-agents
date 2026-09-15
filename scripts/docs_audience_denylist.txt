@@ -1,0 +1,31 @@
+# Shapes no page under docs/site/src/content/docs/ may carry. One Python regular
+# expression per line; lines starting with `#` and blank lines are ignored.
+# scripts/check_docs_audience.py applies every line to every site page. It also
+# adds, at run time, the project IDs that hack/ci-env.sh exports and any
+# service-account email whose project is not a placeholder -- neither is listed
+# here, so a new project never needs a new line.
+#
+# The rule this enforces is .agents/rules/documentation.md, "Identifiers the
+# site never carries". Add the next identifier as one line, by shape where a
+# shape exists. Every literal below already appears in scripts/ or hack/, where
+# the values are meant to live; nothing here is new to the repository.
+
+# GitHub Actions workflow secrets and variables.
+secrets\.[A-Z_]+
+vars\.[A-Z_]+
+
+# GitHub App and installation IDs: the Terraform/config key, and a numeric ID
+# written next to the words. `<APP_ID>` and `GITHUB_APP_ID` placeholders do not
+# match: the key is lowercase and the numeric shape needs digits.
+\bapp_id\b
+\binstallation_id\b
+(?i)\b(?:app|installation) id\b\D{0,12}\d{5,}
+
+# The maintainers' Prow project and build cluster, and its Deck host. The
+# evaluation pool's project ID is not here: hack/ci-env.sh exports it and the
+# check derives it from there.
+kube-agents-prow
+oss\.gprow\.dev
+
+# Internal repositories.
+gke-internal/

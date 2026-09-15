@@ -12,7 +12,7 @@ This repository contains the Kubernetes Agentic Harness (`kube-agents`). It is a
   - `cluster/`: The Cluster Agent profile _template_ (persona, scoped config, and runtime-debugging skills). The Platform Agent scaffolds this into per-cluster Hermes profiles at runtime; it is not deployed directly.
   - `contributor/`: The contributor-agent protocol: the claim/PR/review/escalation loop for external bots (e.g. Kyber, Codebot Robot) coordinating over GitHub alone. Not a runtime blueprint; not shipped in the images.
 - `.agents/skills/`: Repository-level skills, not shipped in the agent images — review skills (adversarial change review, security audits, docs-drift, skill quality) run against pull requests and clusters, with `review-preflight` running the pre-PR set of them in a context that did not write the change, plus the `install-kube-agents`/`uninstall-kube-agents`/`upgrade-kube-agents` lifecycle skills that drive the repository's installer scripts.
-- `.agents/rules/`: Repository-level rules an agent follows, one file per family: the code (`core_engineering.md`), workflows (`github_actions.md`), the pre-PR passes (`pre_pr_review.md`), eval-driven development (`eval_driven_development.md`). This file states each rule and links there; the split keeps `AGENTS.md` inside the budget `scripts/check_context_budget.py` enforces.
+- `.agents/rules/`: Repository-level rules an agent follows, one file per family: the code (`core_engineering.md`), workflows (`github_actions.md`), the pre-PR passes (`pre_pr_review.md`), eval-driven development (`eval_driven_development.md`), docs (`documentation.md`). This file states each rule and links there; the split keeps `AGENTS.md` inside the budget `scripts/check_context_budget.py` enforces.
 - `a2a/`: Go module for the agent-to-agent bus — wire-protocol library and `a2a` topics CLI per `docs/designs/spec-a2a-payloads.md`, plus agent profiles, persona, gateway and auth-callout.
 - `charts/`: Canonical Helm charts (`kube-agents`) for deploying the Kube-Agents operator and profiles.
 - `terraform/`: Companion reusable Terraform modules (`gke-cluster`, `kube-agents-iam`, `chat-pubsub`, `github-minter`, `gke-backup-plan`, `drift-pubsub`) for infrastructure provisioning, plus `examples/full-install/`, the single-apply composition that installs the Helm chart on top. `drift-pubsub` is not yet part of that composition.
@@ -167,59 +167,61 @@ Layout). Read the file that covers what you are writing before you write it.
 
 ## Documentation Guidelines
 
-Every fact has one home. Duplicating documentation across files is how it goes stale, so before
-adding a paragraph, check whether the topic already has an owner:
+Every fact has one home; the duplicate is what goes stale. Before adding a paragraph, check whether
+the topic has an owner:
 
-| Content                                                     | Canonical home                               |
-| ----------------------------------------------------------- | -------------------------------------------- |
-| User-facing narrative, how-to, and reference                | `docs/site/src/content/docs/`                |
-| End-state architecture                                      | `docs/architecture/`                         |
-| Per-feature design rationale                                | `docs/designs/`                              |
-| Shared installer defaults and the `install.env` model       | `scripts/installer/README.md`                |
-| Which container images an install pulls, and their pins     | `images.json`                                |
-| The install procedure (self-contained, agent-executable)    | `INSTALL.md`                                 |
-| The commands behind this file's pull-request rules          | `docs/pull-request-workflow.md`              |
-| What the agent is and is not permitted to do                | the site's `reference/security-and-iam.md`   |
-| How to develop a specific directory                         | that directory's `README.md` (keep it short) |
-| Rules an agent follows, by family (code, CI, pre-PR, evals) | `.agents/rules/`                             |
+| Content                                                   | Canonical home                               |
+| --------------------------------------------------------- | -------------------------------------------- |
+| Installing and running kube-agents yourself; nothing else | `docs/site/src/content/docs/`                |
+| End-state architecture                                    | `docs/architecture/`                         |
+| Per-feature design rationale                              | `docs/designs/`                              |
+| Shared installer defaults and the `install.env` model     | `scripts/installer/README.md`                |
+| Which container images an install pulls, and their pins   | `images.json`                                |
+| The install procedure (self-contained, agent-executable)  | `INSTALL.md`                                 |
+| The commands behind this file's pull-request rules        | `docs/pull-request-workflow.md`              |
+| What the agent is and is not permitted to do              | the site's `reference/security-and-iam.md`   |
+| How to develop a specific directory                       | that directory's `README.md` (keep it short) |
+| Maintainer environments and workflow secret/variable maps | `docs/environment-reconcile.md`              |
+| Release runbooks                                          | `scripts/release/README.md`                  |
+| The evaluation project pool and Prow configuration        | `docs/ci-pool-projects.md`                   |
+| Agent rules, by family (code, CI, pre-PR, evals, docs)    | `.agents/rules/`                             |
 
 Rules:
 
-- **Do not hand-write a table that mirrors a machine-readable file.** The cron schedule, the skill
-  catalogue, and the container-image inventory are generated into
-  `<!-- BEGIN GENERATED -->` regions by `scripts/generate_docs.py`, which also writes
-  `docs/family-roster.txt` whole. Edit the source, then run `make docs-generate`.
-- **Do not restate the `make` targets.** `make help` prints them from the Makefile. New targets get
-  a `## description` comment.
+- **Do not hand-write a table that mirrors a machine-readable file.** The cron schedule, skill
+  catalogue and image inventory are generated into `<!-- BEGIN GENERATED -->` regions by
+  `scripts/generate_docs.py`, which also writes `docs/family-roster.txt` whole. Edit the source,
+  then run `make docs-generate`.
+- **Do not restate the `make` targets.** `make help` prints them; new targets get a `## description`
+  comment.
 - **Link rather than summarise** when another page already owns the topic. If you must summarise,
-  say which page is canonical, the way the site's credential-isolation page defers to
-  `docs/credential-isolation-design.md`.
-- **Do not document pull-request status.** Docs describe the current state of `main`; a merged PR
-  leaves that prose silently stale.
+  say which page is canonical.
+- **The site carries no maintainer identifier** — no App or installation ID, secret or variable
+  name, internal project, service account, Workload Identity pool, repository path, environment
+  or cluster; placeholders and the defaults an install creates are fine.
+  [`.agents/rules/documentation.md`](.agents/rules/documentation.md) has the list and the reader
+  test behind it.
+- **Do not document pull-request status,** and do not cite a PR or issue number as the reason a
+  behaviour exists. Docs describe the current state of `main`: a merged PR leaves the first stale,
+  and a number tells the reader nothing they can act on.
 - **Verify identifiers against source, not against other docs.** GCP service account names live
   in `install.defaults.env`, the Go version in `k8s-operator/go.mod`.
 - **Add a document to the map (`docs/README.md`) with one line, and change nothing else there.**
-  Write the row in the compact `| cell | cell |` form and never re-align a table: the map is edited
-  from several branches every week, and a re-aligned table rewrites rows your PR did not author.
-  `docs/README.md` §5 owns the rest of that contract — including why a file inside an existing
-  family needs no map edit at all.
-- **Write it straight.** Lead with the fact — no preamble, no restating the question, no "it's
-  worth noting". Cut hype and self-assessment (`comprehensive`, `robust`, `seamless`, `simply`,
-  `powerful`). Skip the "not X, but Y" antithesis and rule-of-three padding: one precise example
-  beats three synonyms. Prefer prose to a `**Bold term:** explanation` list. Claim first, caveat
-  after; a hedge in front of a fact hides it. `SKILL.md` files are the exception to the prose
-  preference — `.agents/skills/skill-review/SKILL.md` asks for terse imperative bullets there.
-- **Match a document's length to what the task needs.** Agent-written documents run long by
-  default, so cover the substance and stop: no filler sections, no summary that repeats the
-  section above it, no boilerplate scaffolding a reader will skip. Anthropic's
-  [Opus 5 prompting guide](https://platform.claude.com/docs/en/build-with-claude/prompt-engineering/prompting-claude-opus-5)
-  is the upstream source for this and for the conciseness rule above.
+  Compact `| cell | cell |` rows, never re-aligned: the map is edited from several branches a
+  week, and a re-aligned table rewrites rows your PR did not author. `docs/README.md` §5 owns the
+  rest.
+- **Write it straight.** Lead with the fact; cut hype and self-assessment (`comprehensive`,
+  `robust`, `seamless`); skip "not X, but Y" and rule-of-three padding; prefer prose to a
+  `**Bold term:** explanation` list; claim first, caveat after. `SKILL.md` files are the
+  exception (`.agents/skills/skill-review/SKILL.md`: terse imperative bullets).
+- **Match a document's length to what the task needs.** Cover the substance and stop: no filler
+  sections, no summary that repeats the section above it, no scaffolding a reader will skip.
+  `.agents/rules/documentation.md` has the full form of both rules and their upstream guide.
 
-Run `make docs-check` before pushing. It verifies generated regions are current, relative links
-resolve, identifiers match their source, every Markdown document outside the root dot-directories
-has an entry in the documentation
-map (`docs/README.md`), and this file plus `CLAUDE.md` stay inside the context budget
-(`scripts/check_context_budget.py`) — the same five checks CI runs.
+Run `make docs-check` before pushing. It checks generated regions, relative links, identifiers
+against source, map (`docs/README.md`) coverage of every Markdown document outside the root
+dot-directories, site pages for maintainer identifiers, and this file plus `CLAUDE.md` against
+the context budget — the six checks CI runs.
 
 ## Contributing as an agent
 
@@ -284,7 +286,7 @@ Agents with a user in the loop follow this file.
   (`.agents/skills/review-docs-drift/SKILL.md`) against your branch diff and address its
   Blocking findings. This is a required pre-PR step for AI agents working in this repository;
   `make docs-check` enforces only the mechanical subset (generated regions, links, terminology,
-  map coverage, context budget), while the skill also verifies that doc prose still matches the
+  map coverage, site audience, context budget), while the skill also verifies that doc prose still matches the
   source. Its dispositions go in **Self-Review** with the adversarial pass's, not in a section of
   their own. `/pr-preflight` runs this pass alongside the adversarial one, each in its own context.
 - **Live-test the change before opening a PR, and describe it in the PR body.** Every pull
