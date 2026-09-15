@@ -1801,8 +1801,48 @@ spec:
         run_kubectl(["delete", "agentplugin", TARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE])
         reconcile_and_wait(gen_before)
     finally:
-        run_kubectl(["delete", "agentplugin", TARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE], check=False)
-        wait_deployment_rollout(GATEWAY_DEPLOYMENT)
+        # The delete is unconditional. `check=False` already swallows NotFound, and a `get`
+        # that fails for any other reason -- an API blip, an expired credential, the wrong
+        # context -- must not be read as "already gone" and skip it: leaving the plugin
+        # mounted on the gateway for whichever suite runs next is the failure this block
+        # exists to prevent.
+        #
+        # What the probe decides is which wait follows it, so it runs before the delete and
+        # nothing between here and there is allowed to raise. On the success path the step
+        # has already withdrawn the CR and waited its rollout out, and the plain rollout
+        # wait is a settled-state re-check. On a failure path the CR is still here and the
+        # delete below is what starts the rollout -- and wait_deployment_rollout cannot see
+        # that one coming, because `kubectl rollout status` succeeds as soon as the observed
+        # generation matches the current one, which is still the pre-delete generation. It
+        # would return against the revision that still has the plugin in it. So capture the
+        # generation first and wait for the operator's bump, the way step 6 does.
+        gen_before_cleanup = None
+        try:
+            cr_still_present = run_kubectl(
+                ["get", "agentplugin", TARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE],
+                check=False,
+                capture_output=True,
+            ).returncode == 0
+            if cr_still_present:
+                gen_before_cleanup = get_deployment_generation(GATEWAY_DEPLOYMENT)
+        except subprocess.CalledProcessError:
+            # Reading the cluster failed, which says nothing about what the cleanup owes.
+            # Fall through to the delete and settle with the generation-blind wait.
+            pass
+
+        deleted = run_kubectl(
+            ["delete", "agentplugin", TARGETED_PLUGIN_CR_NAME, "-n", NAMESPACE],
+            check=False,
+            capture_output=True,
+        ).returncode == 0
+
+        # A delete that did not land starts no rollout, so waiting for a generation bump
+        # would spend DEFAULT_GENERATION_TIMEOUT_SEC on one that is never coming and then
+        # raise a TimeoutError over whatever the step actually failed on.
+        if gen_before_cleanup is not None and deleted:
+            reconcile_and_wait(gen_before_cleanup)
+        else:
+            wait_deployment_rollout(GATEWAY_DEPLOYMENT)
 
     log("STEP 17 SUCCESS: stale plugin directory self-heals into the link on startup.")
 

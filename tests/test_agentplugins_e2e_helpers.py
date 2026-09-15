@@ -177,14 +177,49 @@ class Step17SettlesRolloutTest(unittest.TestCase):
     rollout before returning, on the success path and after a mid-step failure alike.
     """
 
-    def _patched(self, healed="LINK"):
+    GENERATION = 7
+
+    def _run_kubectl(self, cmd, **kwargs):
+        """Records the call, and answers the cleanup's `get` probe and its delete.
+
+        The probe's returncode is what the finally block reads, so the fake tracks whether
+        the CR is on the cluster: absent until the step applies it, gone again once the
+        step deletes it. `probe_rc` and `delete_rc` override that to stage the failures a
+        real cluster produces -- a read that fails for a reason other than absence, and a
+        delete that does not land.
+        """
+        verb = " ".join(cmd[:2])
+        self.calls.append(verb)
+        if verb == "get agentplugin":
+            if self.probe_raises:
+                raise subprocess.CalledProcessError(1, cmd)
+            rc = self.probe_rc if self.probe_rc is not None else (0 if self.cr_present else 1)
+            return MagicMock(returncode=rc, stdout="", stderr="")
+        if verb == "delete agentplugin":
+            if self.delete_rc == 0:
+                self.cr_present = False
+            return MagicMock(returncode=self.delete_rc, stdout="", stderr="")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    def _read_generation(self, *args, **kwargs):
+        """Recorded in call order because when it is read is the property under test."""
+        self.calls.append("get_deployment_generation")
+        return self.GENERATION
+
+    def _patched(self, healed="LINK", probe_rc=None, probe_raises=False, delete_rc=0):
         """Patches every cluster-touching helper step 17 calls."""
         self.calls = []
+        self.cr_present = False
+        self.probe_rc = probe_rc
+        self.probe_raises = probe_raises
+        self.delete_rc = delete_rc
         patches = {
             "log": MagicMock(),
             "profile_plugin_link": MagicMock(return_value="/plugins/link"),
-            "get_deployment_generation": MagicMock(return_value=7),
-            "apply_kubectl_manifest": MagicMock(),
+            "get_deployment_generation": MagicMock(side_effect=self._read_generation),
+            "apply_kubectl_manifest": MagicMock(
+                side_effect=lambda *a, **k: setattr(self, "cr_present", True)
+            ),
             "reconcile_and_wait": MagicMock(
                 side_effect=lambda *a, **k: self.calls.append("reconcile_and_wait")
             ),
@@ -193,9 +228,7 @@ class Step17SettlesRolloutTest(unittest.TestCase):
             ),
             "restart_agent_pod": MagicMock(),
             "agent_exec_until": MagicMock(return_value=healed),
-            "run_kubectl": MagicMock(
-                side_effect=lambda cmd, **k: self.calls.append(" ".join(cmd[:2]))
-            ),
+            "run_kubectl": MagicMock(side_effect=self._run_kubectl),
             "wait_deployment_rollout": MagicMock(
                 side_effect=lambda *a, **k: self.calls.append("wait_deployment_rollout")
             ),
@@ -206,6 +239,11 @@ class Step17SettlesRolloutTest(unittest.TestCase):
             self.addCleanup(p.stop)
         return patches
 
+    def _last_index(self, name):
+        """The last time `name` was called -- the cleanup's calls, not the step body's."""
+        self.assertIn(name, self.calls)
+        return len(self.calls) - 1 - self.calls[::-1].index(name)
+
     def test_withdraws_plugin_and_settles_before_returning(self):
         """On success the CR is deleted and the rollout it triggers is waited out."""
         self._patched()
@@ -213,21 +251,84 @@ class Step17SettlesRolloutTest(unittest.TestCase):
         e2e.step17_verify_link_self_heals_over_a_stale_directory("example/plugin:v1")
 
         self.assertIn("delete agentplugin", self.calls)
-        # The delete must be followed by a reconcile wait, not left in flight.
+        # The step's own delete must be followed by a reconcile wait, not left in flight.
         delete_idx = self.calls.index("delete agentplugin")
         self.assertIn("reconcile_and_wait", self.calls[delete_idx:])
         # And the step must not return until the Deployment has settled.
         self.assertEqual(self.calls[-1], "wait_deployment_rollout")
+        # The cleanup deletes unconditionally -- a probe that fails for a reason other
+        # than absence must not be able to skip it -- so on this path there is a second,
+        # redundant delete of a CR that is already gone. What must not follow it is a
+        # generation wait: nothing is rolling, and waiting for a bump that is not coming
+        # would burn DEFAULT_GENERATION_TIMEOUT_SEC and then raise over a passing step.
+        cleanup_delete_idx = self._last_index("delete agentplugin")
+        self.assertGreater(cleanup_delete_idx, delete_idx)
+        self.assertNotIn("reconcile_and_wait", self.calls[cleanup_delete_idx:])
 
     def test_settles_rollout_even_when_the_step_fails(self):
-        """A mid-step failure must still leave the Deployment settled for the next suite."""
-        self._patched(healed="STILL-A-DIR")
+        """A mid-step failure leaves the CR on the cluster, so the cleanup's own delete is
+        what starts the rollout -- and it must be waited out generation-first.
+
+        wait_deployment_rollout on its own cannot do that. It reads the Deployment as it
+        stands before the operator reacts to the delete, finds the generation it is already
+        observing, and returns against the revision that still has the plugin in it.
+        """
+        patches = self._patched(healed="STILL-A-DIR")
 
         with self.assertRaises(AssertionError):
             e2e.step17_verify_link_self_heals_over_a_stale_directory("example/plugin:v1")
 
-        self.assertIn("delete agentplugin", self.calls)
+        delete_idx = self._last_index("delete agentplugin")
+        self.assertIn(
+            "reconcile_and_wait",
+            self.calls[delete_idx:],
+            "the cleanup delete must be followed by a generation-aware wait",
+        )
+        # Read before the delete, not after: reading it afterwards races the operator, and
+        # gen_before + 1 then waits for a bump that has already happened.
+        self.assertLess(self._last_index("get_deployment_generation"), delete_idx)
+        # Passed through explicitly, for the same reason -- reconcile_and_wait(None) would
+        # re-read the generation on the far side of the delete.
+        self.assertEqual(
+            patches["reconcile_and_wait"].call_args_list[-1],
+            call(self.GENERATION),
+        )
+
+    def test_a_failed_probe_does_not_skip_the_cleanup_delete(self):
+        """A `get` returns non-zero for NotFound and for an API blip alike.
+
+        Reading the second as "already gone" and skipping the delete would leave the
+        plugin mounted on the gateway for the next suite -- the leak this block exists to
+        prevent -- so the delete does not depend on the probe. Only the wait does.
+        """
+        for label, kwargs in (
+            ("probe returned non-zero", {"probe_rc": 1}),
+            ("probe raised", {"probe_raises": True}),
+        ):
+            with self.subTest(label):
+                self._patched(healed="STILL-A-DIR", **kwargs)
+
+                with self.assertRaises(AssertionError):
+                    e2e.step17_verify_link_self_heals_over_a_stale_directory("example/plugin:v1")
+
+                self.assertIn("delete agentplugin", self.calls[self._last_index("get agentplugin"):])
+                # Nothing was learned before the delete, so the generation-blind wait is
+                # the only one available -- but the step still may not return mid-rollout.
+                self.assertEqual(self.calls[-1], "wait_deployment_rollout")
+
+    def test_a_delete_that_did_not_land_is_not_waited_on_for_a_generation_bump(self):
+        """No delete, no rollout, no bump. Waiting for one burns the generation timeout and
+        then reports a TimeoutError over whatever the step actually failed on."""
+        patches = self._patched(healed="STILL-A-DIR", delete_rc=1)
+
+        with self.assertRaises(AssertionError):
+            e2e.step17_verify_link_self_heals_over_a_stale_directory("example/plugin:v1")
+
+        delete_idx = self._last_index("delete agentplugin")
+        self.assertNotIn("reconcile_and_wait", self.calls[delete_idx:])
         self.assertEqual(self.calls[-1], "wait_deployment_rollout")
+        # The one reconcile_and_wait on this path is the step body's, after the apply.
+        self.assertEqual(patches["reconcile_and_wait"].call_count, 1)
 
 
 if __name__ == "__main__":
