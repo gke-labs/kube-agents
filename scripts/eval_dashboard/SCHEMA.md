@@ -654,7 +654,7 @@ block, the report page and the digest say instead of "no night".
 `state` (`GREEN|DEGRADED|OUTAGE`), `condition`
 (`shared_break|storm|setup_deaths|lost_pods`), `since`, `cause`, `advice`,
 `failing_cases`, `tracking_issues`, `incident`, `recovering`, `stale`,
-`slow`, `generated_at`, `tick`. Any other state, or an unreadable file, means no
+`slow`, `pool`, `generated_at`, `tick`. Any other state, or an unreadable file, means no
 verdict: the Brief says no verdict is published and shows the last 24
 hours in numbers and the runs, the PR view classifies from the runs alone
 and shows no gate banner. Only a `GREEN` verdict reads as healthy. For
@@ -669,6 +669,17 @@ baseline_p50_s, baseline_p90_s, infra_reps}`, `docs/ci-health.md`, "A slow
 gate"); the pages read `since`, `runs`, `median_s`, `baseline_p50_s` and
 `baseline_days` for the one sentence the Brief's healthy headline adds while
 it is set.
+
+`pool` is `null` or the pool-pressure note (`docs/ci-health.md`, "A backed-up
+pool"): `{since, verdict, measured_at}` always, plus `{runs, p50_s, p95_s,
+worst_s, threshold_p50_s, threshold_p95_s, free, total, cause,
+max_concurrency}` when `verdict` is `BREACH` or `UNMEASURED`. A `STALE`
+verdict carries no numbers — the hourly periodic stopped publishing and the
+last reading is not evidence about now. Unlike `slow` it is set in every
+state, and the pages read `verdict`, `since`, `measured_at`, `p50_s` and
+`threshold_p50_s` for one sentence on the Brief's healthy headline and on the
+last-24-hours view. `metrics.queue_wait_p50_s` is the same job's median wait
+over the last day, or `null`; it is not derived from the runs.
 
 `health-history.jsonl` is one JSON object per line, each the full
 `health.json` document as published at that tick plus

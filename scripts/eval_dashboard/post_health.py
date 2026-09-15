@@ -75,9 +75,14 @@ from zoneinfo import ZoneInfo
 
 try:
     from eval_dashboard import gate_issue, ghcli, nightly
+
+    # By name, not as a module: `health` is the parameter every render_*
+    # function here takes, and importing the module would shadow it.
+    from eval_dashboard.health import POOL_STALE, POOL_UNMEASURED, wait_text
 except ImportError:  # run as a script: scripts/eval_dashboard/post_health.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
     from eval_dashboard import gate_issue, ghcli, nightly
+    from eval_dashboard.health import POOL_STALE, POOL_UNMEASURED, wait_text
 
 STATE_SCHEMA_VERSION = 1
 
@@ -103,13 +108,23 @@ DEFAULT_WINDOW_HOURS = 24
 # a note without `baseline_days`.
 DEFAULT_SLOW_BASELINE_DAYS = 7
 
+# pool-pressure.json's vocabulary (scripts/pool_pressure.py owns it), carried
+# through health.json's `pool` note. Mirrored rather than imported: importing
+# it would put pool_pressure.py in the diff, and that costs the eval matrix.
+# The four causes have four different remedies, one of which spends money, so
+# the message branches on them rather than printing the label.
+CAUSE_CAPACITY = "CAPACITY"
+CAUSE_CONCURRENCY_CAP = "CONCURRENCY_CAP"
+CAUSE_CONTROL_PLANE = "CONTROL_PLANE"
+
 # The kinds of message this script sends.
 KIND_CHANGE = "change"  # a new state, condition or (in an OUTAGE) case list
 KIND_RECOVERY = "recovery"  # back to GREEN, with how long it took
 KIND_STALE = "stale"  # data.json stopped refreshing, or started again
 KIND_SLOW = "slow"  # the gate's runs are far longer than usual; once per episode
+KIND_POOL = "pool"  # runs are waiting to start; once per episode
 KIND_DIGEST = "digest"  # the daily numbers
-TOLD_KINDS = (KIND_CHANGE, KIND_RECOVERY, KIND_STALE, KIND_SLOW)
+TOLD_KINDS = (KIND_CHANGE, KIND_RECOVERY, KIND_STALE, KIND_SLOW, KIND_POOL)
 
 # Where the message goes. The space is a resource name, the token a bearer
 # credential minted by the workflow; the webhook is the legacy alternative.
@@ -171,6 +186,17 @@ NO_ISSUE_TEXT = "no issue yet — file one with the presubmit-gate label"
 # Mirrors health.py's STORM_COOLDOWN: a run started the minute the last
 # storm-hit run finished still overlaps its tail.
 STORM_COOLDOWN = timedelta(minutes=30)
+
+# Rule 8 sends the reader somewhere. The build cluster is named by its real
+# identifiers because `build-kube-agents` is Prow's context alias for it
+# (oss-test-infra prow/oss/cluster/kubeconfigs/kubeconfigs.yaml), and the alias
+# finds nothing in kubectl.
+POOL_BUILD_CLUSTER = "kube-agents-prow"
+POOL_BUILD_PROJECT = "kube-agents-prow"
+POOL_PRESSURE_JOB = "ci-kube-agents-pool-pressure"
+POOL_JOB_HISTORY_URL = (
+    f"https://oss.gprow.dev/job-history/gs/kube-agents-prow/logs/{POOL_PRESSURE_JOB}"
+)
 
 # gsutil is how the state object is read and written; publish.py uses the
 # same header so a reader never gets an hour-stale copy.
@@ -284,6 +310,14 @@ def decide(health: dict, prev: dict | None, now: datetime, digest_hour: int, tz=
     # digest carries it while it lasts, and "back to normal" is not news.
     if health.get("slow") and not (prev or {}).get("slow"):
         kinds.append(KIND_SLOW)
+
+    # Rule 8, the same once-per-episode rule -- plus one re-post when the
+    # verdict changes inside an episode. `since` carries across a change, so
+    # without this a breach whose periodic then died would go quiet on the
+    # one fact the reader needs: the numbers stopped.
+    pool = health.get("pool") or {}
+    if pool and pool.get("verdict") != (prev or {}).get("pool_verdict"):
+        kinds.append(KIND_POOL)
 
     if in_digest_window(now, digest_hour, tz) and (prev or {}).get("last_digest_date") != local_date(now, tz):
         kinds.append(KIND_DIGEST)
@@ -507,6 +541,75 @@ def render_slow(health: dict) -> str:
     )
 
 
+def pool_numbers(pool: dict) -> str:
+    """The wait with each figure beside its own limit. "against 15/45" makes
+    the reader pair four numbers positionally, and gets it wrong."""
+    return (
+        f"Median wait {wait_text(pool.get('p50_s'))} against a {minutes_text(pool.get('threshold_p50_s'))} min limit;"
+        f" p95 {wait_text(pool.get('p95_s'))} against {minutes_text(pool.get('threshold_p95_s'))}."
+    )
+
+
+def pool_cause_text(pool: dict) -> str:
+    """What to do, by cause. The four remedies differ and one of them spends
+    money, so an unrecognised cause falls through to the message that asks for
+    nothing."""
+    cause = pool.get("cause")
+    if cause == CAUSE_CAPACITY:
+        return (
+            f"*Smoke gate: pool full* — all {pool.get('total', '?')} projects are leased"
+            " and runs are queuing. Consider onboarding a project."
+        )
+    if cause == CAUSE_CONCURRENCY_CAP:
+        return (
+            f"*Smoke gate: concurrency cap* — the pool has {pool.get('total', '?')} projects"
+            f" but the concurrency cap is only {pool.get('max_concurrency', '?')}. Raise the cap."
+        )
+    if cause == CAUSE_CONTROL_PLANE:
+        # "looks like", not "is": occupancy is read live while the waits come
+        # from a window, so a pool free now can sit beside real contention
+        # then (pool_pressure.py's cause()).
+        return (
+            f"*Smoke gate: runs not starting* — {pool.get('free', '?')} of {pool.get('total', '?')} projects"
+            " were free, so this looks like Prow rather than the pool.\n"
+            f"Check the build cluster: {POOL_BUILD_CLUSTER}, project {POOL_BUILD_PROJECT}."
+        )
+    return (
+        "*Smoke gate: queue backed up* — cause unclear: the job couldn't read"
+        " how many projects were in use."
+    )
+
+
+def render_pool(health: dict) -> str:
+    """Rule 8. Two monitoring failures in ⚪, the colour this file already uses
+    for the bot losing sight of its data; a real backlog in ⏳, headed by its
+    cause."""
+    pool = health.get("pool") or {}
+    if pool.get("verdict") == POOL_STALE:
+        # No numbers: a reading hours old is not evidence about now, and a
+        # figure in the message gets read as current whatever the caveat says.
+        return "\n".join(
+            [
+                f"⚪ *Smoke gate: pool check stopped* — last reading {clock(parse_iso(pool.get('measured_at')))};"
+                f" {POOL_PRESSURE_JOB} runs hourly and has missed the last few."
+                " If the next one doesn't land, it needs checking.",
+                POOL_JOB_HISTORY_URL,
+            ]
+        )
+    if pool.get("verdict") == POOL_UNMEASURED:
+        return "⚪ *Smoke gate: wait unknown* — the hourly pool check ran but couldn't read the queue."
+    return "\n".join(
+        [
+            f"⏳ {pool_cause_text(pool)}",
+            pool_numbers(pool),
+            "Runs still pass; /retest makes the queue longer.",
+            # The agent view, for the same reason render_slow uses it: the
+            # note starts on a tick that names no incident.
+            dashboard_link(DASHBOARD_VIEW_AGENT),
+        ]
+    )
+
+
 def short_cause(prev: dict) -> str:
     condition = prev.get("condition")
     if condition == "shared_break":
@@ -541,6 +644,23 @@ def render_recovery(health: dict, prev: dict, now: datetime) -> str:
     return "\n".join(lines)
 
 
+def pool_digest_line(pool: dict) -> str:
+    """One line under the digest while the episode lasts. Cause-free: a line
+    under a summary cannot branch four ways, and the alert already named it."""
+    verdict = pool.get("verdict")
+    if verdict == POOL_STALE:
+        return (
+            f"⚪ No pool numbers since {clock(parse_iso(pool.get('measured_at')))}"
+            f" — {POOL_PRESSURE_JOB} has stopped reporting."
+        )
+    if verdict == POOL_UNMEASURED:
+        return "⚪ Queue wait unknown — the hourly pool check couldn't read it."
+    return (
+        f"⏳ Queue backed up — median wait {wait_text(pool.get('p50_s'))}"
+        f" against a {minutes_text(pool.get('threshold_p50_s'))} min limit."
+    )
+
+
 def render_digest(health: dict, now: datetime, data: dict | None = None) -> str:
     """The 24h numbers, the stale note while a stall lasts, and -- when
     data.json was given -- one line on last night's nightly run with a link
@@ -549,11 +669,15 @@ def render_digest(health: dict, now: datetime, data: dict | None = None) -> str:
     metrics = health.get("metrics") or {}
     p50 = metrics.get("wall_clock_p50_s")
     typical = f"{int(p50 // 60)} min" if p50 is not None else "n/a"
+    # How long a run waited before it started, every morning and not only
+    # during an alert: the wait is normally seconds, and a number nobody sees
+    # on an ordinary day is a number nobody can read on a bad one.
+    wait = metrics.get("queue_wait_p50_s")
     headline = (
         f"📊 *Smoke gate, last {metrics.get('window_hours', DEFAULT_WINDOW_HOURS)}h:*"
         f" {metrics.get('full_runs', 0)} runs · {metrics.get('green_runs', 0)} green"
         f" · {metrics.get('pr_caused_reds', 0)} PR-caused red · {metrics.get('infra_reds', 0)} infra"
-        f" · typical run {typical}"
+        f" · typical run {typical} · typical wait {wait_text(wait) if wait is not None else 'n/a'}"
     )
     lines = [headline]
     if health.get("stale"):
@@ -562,6 +686,8 @@ def render_digest(health: dict, now: datetime, data: dict | None = None) -> str:
         lines.append(f"⚪ No fresh data since {clock(parse_iso(health.get('generated_at')))} — these numbers stop there. Someone check the refresh job.")
     if health.get("slow"):
         lines.append(f"🐢 Slow since {clock(parse_iso(health['slow'].get('since')))}: {slow_text(health['slow'])}.")
+    if health.get("pool"):
+        lines.append(pool_digest_line(health["pool"]))
     if data is not None:
         lines.append(nightly.digest_line(data, now, clock=lambda value: clock(value, weekday=True)))
         lines.append(NIGHTLY_URL)
@@ -578,6 +704,8 @@ def render(kind: str, health: dict, prev: dict | None, now: datetime, issue: dic
         return render_stale(health)
     if kind == KIND_SLOW:
         return render_slow(health)
+    if kind == KIND_POOL:
+        return render_pool(health)
     return render_change(health, prev, issue)
 
 
@@ -726,6 +854,9 @@ def run(
     told_state = KIND_CHANGE in sent or KIND_RECOVERY in sent
     told_stale = KIND_STALE in sent
     told_slow = KIND_SLOW in sent or KIND_SLOW not in kinds
+    # The pool note records its verdict rather than a bit, because a verdict
+    # change inside one episode is its own message (see decide).
+    told_pool = KIND_POOL in sent or KIND_POOL not in kinds
     if prev is None:
         # First tick: whatever was not due is recorded as told, so a green,
         # fresh start is not announced later as a change.
@@ -744,6 +875,7 @@ def run(
         "issues": carried if source.get("state") not in (None, GREEN) else [],
         "stale": bool(health.get("stale")) if told_stale else bool(before.get("stale")),
         "slow": bool(health.get("slow")) if told_slow else bool(before.get("slow")),
+        "pool_verdict": (health.get("pool") or {}).get("verdict") if told_pool else before.get("pool_verdict"),
         "posted_at": before.get("posted_at"),
         "last_digest_date": before.get("last_digest_date"),
         "updated_at": now.isoformat(timespec="seconds"),

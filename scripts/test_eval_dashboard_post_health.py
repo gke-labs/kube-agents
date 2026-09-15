@@ -54,7 +54,9 @@ def health(state="GREEN", cause="", cases=(), since="2026-09-04T03:30:00+00:00",
         "recovering": False,
         "stale": False,
         "slow": None,
+        "pool": None,
         "metrics": {
+            "queue_wait_p50_s": None,
             "window_hours": 24,
             "full_runs": 31,
             "prs": 19,
@@ -82,6 +84,37 @@ def slow_note(since="2026-09-14T18:00:00+00:00", infra_reps=2):
 def slow(**note):
     doc = health()
     doc["slow"] = slow_note(**note)
+    return doc
+
+
+def pool_note(verdict="BREACH", cause="CAPACITY", since="2026-09-04T09:00:00+00:00", **over):
+    """health.py's rule-8 note. The default is the #1069 incident's shape: a
+    full pool, a 22-minute median against the runbook's 15."""
+    note = {
+        "since": since,
+        "verdict": verdict,
+        "measured_at": "2026-09-04T11:23:00+00:00",
+        "runs": 586,
+        "p50_s": 22 * 60,
+        "p95_s": 61 * 60,
+        "worst_s": 175 * 60,
+        "threshold_p50_s": 15 * 60,
+        "threshold_p95_s": 45 * 60,
+        "free": 0,
+        "total": 30,
+        "cause": cause,
+        "max_concurrency": 30,
+    }
+    if verdict == "STALE":
+        # health.py strips every number from a stale note.
+        note = {"since": since, "verdict": verdict, "measured_at": note["measured_at"]}
+    return note | over
+
+
+def pooled(state="GREEN", wait_s=None, **note):
+    doc = health(state)
+    doc["pool"] = pool_note(**note)
+    doc["metrics"]["queue_wait_p50_s"] = wait_s
     return doc
 
 
@@ -279,7 +312,7 @@ class Shapes(RunHarness):
         self.tick(health(), self.at(DIGEST_UTC, 5))
         self.assertEqual(
             self.opener.texts[0],
-            f"📊 *Smoke gate, last 24h:* 31 runs · 26 green · 2 PR-caused red · 5 infra · typical run 125 min\n{URL}#since=2026-09-04T03:30:00Z&view=agent",
+            f"📊 *Smoke gate, last 24h:* 31 runs · 26 green · 2 PR-caused red · 5 infra · typical run 125 min · typical wait n/a\n{URL}#since=2026-09-04T03:30:00Z&view=agent",
         )
 
     def test_stale_and_fresh_again(self):
@@ -507,7 +540,7 @@ class Digest(RunHarness):
         self.tick(health(), self.at(DIGEST_UTC, 5), data=data)
         self.assertEqual(
             self.opener.texts[0],
-            "📊 *Smoke gate, last 24h:* 31 runs · 26 green · 2 PR-caused red · 5 infra · typical run 125 min\n"
+            "📊 *Smoke gate, last 24h:* 31 runs · 26 green · 2 PR-caused red · 5 infra · typical run 125 min · typical wait n/a\n"
             "🌙 Nightly: 3 cases · 1 passed all reps · 1 partial · 1 failed · newly failing: case-c · 6h 40m\n"
             f"{post_health.NIGHTLY_URL}\n{URL}#since=2026-09-04T03:30:00Z&view=agent",
         )
@@ -555,6 +588,36 @@ class Digest(RunHarness):
         doc["metrics"]["wall_clock_p50_s"] = None
         self.tick(doc, self.at(DIGEST_UTC, 5))
         self.assertIn("typical run n/a", self.opener.texts[0])
+
+    def test_digest_prints_the_typical_wait_on_an_ordinary_day(self):
+        # The point of the field: the wait is normally seconds, and a number
+        # nobody sees on a quiet day is one nobody can read on a bad one.
+        doc = health()
+        doc["metrics"]["queue_wait_p50_s"] = 24
+        self.tick(doc, self.at(DIGEST_UTC, 5))
+        self.assertIn("typical run 125 min · typical wait 24s", self.opener.texts[0])
+
+    def test_digest_prints_n_a_when_there_is_no_pool_artifact(self):
+        self.tick(health(), self.at(DIGEST_UTC, 5))
+        self.assertIn("typical wait n/a", self.opener.texts[0])
+
+    def test_digest_carries_a_cause_free_pool_line_while_the_episode_lasts(self):
+        self.tick(pooled(wait_s=22 * 60), T0.replace(hour=7))  # the note itself
+        self.tick(pooled(wait_s=22 * 60), self.at(DIGEST_UTC, 5))
+        self.assertEqual(
+            self.opener.texts[1].split("\n")[1],
+            "⏳ Queue backed up — median wait 22 min against a 15 min limit.",
+        )
+
+    def test_digest_says_the_numbers_stopped_rather_than_quoting_them(self):
+        self.tick(pooled(verdict="STALE"), T0.replace(hour=7))
+        self.tick(pooled(verdict="STALE"), self.at(DIGEST_UTC, 5))
+        line = self.opener.texts[1].split("\n")[1]
+        self.assertEqual(
+            line,
+            "⚪ No pool numbers since 7:23 AM ET — ci-kube-agents-pool-pressure has stopped reporting.",
+        )
+        self.assertIn("typical wait n/a", self.opener.texts[1])
 
     def test_digest_carries_the_slow_line_while_it_lasts(self):
         self.tick(slow(), T0.replace(hour=7))  # the note itself
@@ -609,6 +672,124 @@ class SlowNote(RunHarness):
         self.tick(slow(), self.at(10, 30))
         self.assertEqual([text.split(" ")[0] for text in self.opener.texts][2:], ["🟢", "🐢"])
         self.assertTrue(self.recorded()["slow"])
+
+
+class PoolNote(RunHarness):
+    """Rule 8 (#1607): one message per episode, one more when the verdict
+    changes inside it, and a header that names the cause."""
+
+    def first(self):
+        return self.opener.texts[0].split("\n")
+
+    def test_the_full_pool_message_asks_for_a_project_and_pairs_each_number_with_its_limit(self):
+        self.tick(pooled(), self.at(10))
+        lines = self.first()
+        self.assertEqual(
+            lines[0],
+            "⏳ *Smoke gate: pool full* — all 30 projects are leased and runs are queuing. Consider onboarding a project.",
+        )
+        self.assertEqual(lines[1], "Median wait 22 min against a 15 min limit; p95 61 min against 45.")
+        self.assertEqual(lines[2], "Runs still pass; /retest makes the queue longer.")
+        self.assertEqual(lines[3], f"{URL}#view=agent")
+
+    def test_the_cap_message_names_the_cap_and_the_pool_it_is_below(self):
+        self.tick(pooled(cause="CONCURRENCY_CAP", free=4, max_concurrency=26), self.at(10))
+        self.assertEqual(
+            self.first()[0],
+            "⏳ *Smoke gate: concurrency cap* — the pool has 30 projects but the concurrency cap is only 26. Raise the cap.",
+        )
+
+    def test_the_control_plane_message_hedges_and_names_the_build_cluster(self):
+        # "looks like", not "is": occupancy is sampled live, the waits are a
+        # window, so a free pool now can sit beside real contention then.
+        self.tick(pooled(cause="CONTROL_PLANE", free=4), self.at(10))
+        lines = self.first()
+        self.assertEqual(
+            lines[0],
+            "⏳ *Smoke gate: runs not starting* — 4 of 30 projects were free, so this looks like Prow rather than the pool.",
+        )
+        self.assertEqual(lines[1], "Check the build cluster: kube-agents-prow, project kube-agents-prow.")
+        self.assertIn("Median wait 22 min", lines[2])
+
+    def test_an_unreadable_pool_asks_for_nothing(self):
+        self.tick(pooled(cause="UNKNOWN"), self.at(10))
+        self.assertEqual(
+            self.first()[0],
+            "⏳ *Smoke gate: queue backed up* — cause unclear: the job couldn't read how many projects were in use.",
+        )
+
+    def test_an_unrecognised_cause_falls_through_to_the_message_that_asks_for_nothing(self):
+        # A cause pool_pressure.py adds later must not read as "onboard".
+        self.tick(pooled(cause="SOMETHING_NEW"), self.at(10))
+        self.assertIn("cause unclear", self.first()[0])
+
+    def test_a_check_that_could_not_measure_is_white_and_carries_no_numbers(self):
+        self.tick(pooled(verdict="UNMEASURED"), self.at(10))
+        self.assertEqual(
+            self.opener.texts[0],
+            "⚪ *Smoke gate: wait unknown* — the hourly pool check ran but couldn't read the queue.",
+        )
+
+    def test_a_stopped_check_names_the_job_and_quotes_no_numbers(self):
+        self.tick(pooled(verdict="STALE"), self.at(10))
+        lines = self.first()
+        self.assertEqual(
+            lines[0],
+            "⚪ *Smoke gate: pool check stopped* — last reading 7:23 AM ET;"
+            " ci-kube-agents-pool-pressure runs hourly and has missed the last few."
+            " If the next one doesn't land, it needs checking.",
+        )
+        self.assertEqual(lines[1], post_health.POOL_JOB_HISTORY_URL)
+        # A reading hours old is not evidence about now, and a number in the
+        # message gets read as current whatever the caveat says.
+        self.assertNotIn("22 min", self.opener.texts[0])
+
+    def test_posted_once_per_episode(self):
+        self.tick(pooled(), self.at(10))
+        self.tick(pooled(), self.at(10, 15))
+        self.tick(pooled(), self.at(10, 30))
+        self.assertEqual(len(self.opener.requests), 1)
+        self.assertEqual(self.recorded()["pool_verdict"], "BREACH")
+
+    def test_a_verdict_that_changes_inside_an_episode_is_told_again(self):
+        # The episode's `since` carries across, so without this the periodic
+        # dying mid-breach would go unsaid.
+        self.tick(pooled(), self.at(10))
+        self.tick(pooled(verdict="STALE"), self.at(10, 15))
+        self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["⏳", "⚪"])
+        self.assertEqual(self.recorded()["pool_verdict"], "STALE")
+
+    def test_a_cleared_note_is_not_news_and_a_new_episode_is(self):
+        self.tick(pooled(), self.at(10))
+        self.tick(health(), self.at(10, 15))
+        self.assertEqual(len(self.opener.requests), 1)
+        self.assertIsNone(self.recorded()["pool_verdict"])
+        self.tick(pooled(since="2026-09-04T14:30:00+00:00"), self.at(15))
+        self.assertEqual(len(self.opener.requests), 2)
+
+    def test_a_failed_note_is_retried_next_tick(self):
+        self.tick(health(), self.at(9))
+        rc, err = self.tick(pooled(), self.at(10), opener=FakeOpener(statuses=[500]))
+        self.assertEqual(rc, 1)
+        self.assertIn("failed to post: pool", err)
+        self.assertIsNone(self.recorded()["pool_verdict"], "not told yet")
+        self.tick(pooled(), self.at(10, 15))
+        self.assertEqual(len(self.opener.requests), 1)
+        self.assertEqual(self.recorded()["pool_verdict"], "BREACH")
+
+    def test_the_note_rides_beside_an_incident_unlike_the_slow_one(self):
+        # The one deliberate difference from rule 7: a different job reading
+        # different data cannot be this incident's own symptom.
+        doc = outage()
+        doc["pool"] = pool_note()
+        self.tick(doc, self.at(10))
+        self.assertEqual([text.split(" ")[0] for text in self.opener.texts], ["🔴", "⏳"])
+
+    def test_a_sub_minute_median_prints_seconds_not_zero_minutes(self):
+        # The gate breaches on p50 or p95, so a p95-only breach carries an
+        # ordinary median; whole minutes would render it "0 min".
+        self.tick(pooled(p50_s=24), self.at(10))
+        self.assertIn("Median wait 24s against a 15 min limit", self.opener.texts[0])
 
 
 # --------------------------------------------------------------------------- #

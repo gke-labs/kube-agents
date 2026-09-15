@@ -73,6 +73,9 @@ const PAGE = {
   views: { gate: "gate", agent: "agent" },
   states: { GREEN: "hs-green", DEGRADED: "hs-amber", OUTAGE: "hs-red", PAST: "hs-past" },
   glyphs: { GREEN: "🟢", DEGRADED: "🟡", OUTAGE: "🔴", PAST: "⚪" },
+  // health.py's pool verdicts (rule 8). The verdict picks the lede's
+  // sentence, so an unrecognised one renders nothing rather than guessing.
+  poolVerdicts: ["BREACH", "UNMEASURED", "STALE"],
   spyglass: "https://oss.gprow.dev/view/gs/kube-agents-prow/pr-logs/pull/gke-labs_kube-agents",
   job: "pull-kube-agents-smoke-test",
   prUrl: "https://github.com/gke-labs/kube-agents/pull",
@@ -191,6 +194,7 @@ function normalizeHealth(raw) {
   const list = (key) => (Array.isArray(raw[key]) ? raw[key].filter((v) => typeof v === "string") : []);
   const incident = raw.incident && typeof raw.incident === "object" ? raw.incident : null;
   const slow = raw.slow && typeof raw.slow === "object" ? raw.slow : null;
+  const pool = raw.pool && typeof raw.pool === "object" ? raw.pool : null;
   const count = (v) => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : null);
   return {
     state,
@@ -217,6 +221,14 @@ function normalizeHealth(raw) {
       baseline_p50_s: count(slow.baseline_p50_s),
       baseline_days: count(slow.baseline_days),
     } : null,
+    // The pool note (health.py rule 8), as render.py normalizes it.
+    pool: pool ? {
+      verdict: PAGE.poolVerdicts.includes(pool.verdict) ? pool.verdict : null,
+      since: parseIso(pool.since) != null ? pool.since : null,
+      measured_at: parseIso(pool.measured_at) != null ? pool.measured_at : null,
+      p50_s: count(pool.p50_s),
+      threshold_p50_s: count(pool.threshold_p50_s),
+    } : null,
     tick: parseIso(raw.tick) != null ? raw.tick : null,
   };
 }
@@ -228,6 +240,24 @@ function slowSentence(h) {
   if (!s || s.median_s == null || s.baseline_p50_s == null) return "";
   const since = s.since ? ` since ${esc(et(parseIso(s.since)))}` : "";
   return ` Runs are slow${since}: the last ${s.runs ?? "few"} full runs took a median of ${Math.round(s.median_s / 60)} min against a ${s.baseline_days ?? "7"}-day typical of ${Math.round(s.baseline_p50_s / 60)}. Nothing is broken; /retest won't make yours faster.`;
+}
+
+// One sentence for the Brief's headline while runs are waiting to start; ""
+// otherwise. Cause-free, like the digest's line: the Chat alert names the
+// cause and what to do, this says the gate is queuing and nothing is broken.
+function poolSentence(h) {
+  // health.py's wait_text: the gate breaches on p50 or p95, so a p95-only
+  // breach carries a sub-minute median that whole minutes print as "0 min".
+  const waitText = (s) => (s < 60 ? `${Math.round(s)}s` : `${Math.floor(s / 60)} min`);
+  const p = h && h.pool;
+  if (!p || !p.verdict) return "";
+  if (p.verdict === "STALE") {
+    return ` No pool numbers since ${esc(et(parseIso(p.measured_at)))}: the hourly pool check has stopped reporting.`;
+  }
+  if (p.verdict === "UNMEASURED") return " The queue wait is unknown: the hourly pool check ran but could not read it.";
+  if (p.p50_s == null || p.threshold_p50_s == null) return "";
+  const since = p.since ? ` since ${esc(et(parseIso(p.since)))}` : "";
+  return ` Runs are waiting to start${since}: a median wait of ${waitText(p.p50_s)} against a ${Math.floor(p.threshold_p50_s / 60)} min limit. Runs still pass; /retest makes the queue longer.`;
 }
 
 /* ---- URL contract ---- */
@@ -746,7 +776,7 @@ function briefHtml(link) {
     let head, lede, pill;
     if (healthy) {
       head = "Smoke gate is healthy";
-      lede = `No shared breaks, quota storms or setup failures right now. ${n.green} of ${n.green + n.reds} concluded runs in the last 24 hours were green.${health.stale ? " The data behind this state has stopped refreshing." : ""}${slowSentence(health)}`;
+      lede = `No shared breaks, quota storms or setup failures right now. ${n.green} of ${n.green + n.reds} concluded runs in the last 24 hours were green.${health.stale ? " The data behind this state has stopped refreshing." : ""}${slowSentence(health)}${poolSentence(health)}`;
       pill = pillHtml(health.stale ? "DEGRADED" : "GREEN", health.stale ? "HEALTHY · STALE" : "HEALTHY");
     } else if (noVerdict) {
       // No health.json beside the data: the runs alone cannot say the gate is healthy.
@@ -755,7 +785,10 @@ function briefHtml(link) {
       pill = pillHtml("PAST", "NO VERDICT");
     } else {
       head = "The last 24 hours in numbers";
-      lede = `The gate is ${inc.recovering ? "recovering" : inc.state.toLowerCase()} — <a href="${PAGE.pages.brief}">read the brief</a>. These are the plain counts.`;
+      // The pool sentence rides here too, unlike the slow one: a different
+      // job measuring different data cannot be this incident's own symptom,
+      // and when leases are the incident the wait is the explanation.
+      lede = `The gate is ${inc.recovering ? "recovering" : inc.state.toLowerCase()} — <a href="${PAGE.pages.brief}">read the brief</a>. These are the plain counts.${poolSentence(health)}`;
       pill = pillHtml(inc.state, stateWord(inc));
     }
     return `<div class="sec head">${pill}<h1>${esc(head)}</h1><div class="lede">${lede}</div></div>` +

@@ -111,6 +111,9 @@ concurrency:
 
 env:
   DASHBOARD_BUCKET: gs://kube-agents-dashboards/evals
+  # Rule 8's input: where the hourly pool-pressure periodic (#1069) archives
+  # its runs. `latest-build.txt` beside them names the newest.
+  POOL_PRESSURE_LOGS: gs://kube-agents-prow/logs/ci-kube-agents-pool-pressure
   WIF_PROVIDER: projects/125393897113/locations/global/workloadIdentityPools/github-actions-pool/providers/github-provider
   # Step A's identity: the Prow-archive reader (see the header).
   COLLECT_SA: github-actions@kube-agents-prow.iam.gserviceaccount.com
@@ -255,6 +258,18 @@ jobs:
               sys.exit("collected zero runs: refusing to publish an empty dashboard over a good one")
           '
 
+      # Rule 8's input (#1607): the hourly pool-pressure periodic's newest
+      # artifact, read here because it lives in the Prow archive and only this
+      # half of the job holds the reader credential. Optional throughout -- a
+      # missing file means no note and no digest wait, which is what "not
+      # wired up" should look like; health.py judges a present one's age.
+      - name: Fetch the pool-pressure artifact
+        continue-on-error: true
+        run: |
+          mkdir -p work
+          build=$(gsutil -q cat "$POOL_PRESSURE_LOGS/latest-build.txt") || exit 0
+          gsutil -q cp "$POOL_PRESSURE_LOGS/$build/artifacts/pool-pressure.json" work/pool-pressure.json || true
+
       # ---- B. everything that writes or posts, as the dedicated publisher --
       - name: Authenticate to Google Cloud (dashboard publisher and Chat app)
         uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
@@ -290,6 +305,7 @@ jobs:
             --data work/data.json \
             --prev work/health-prev.json \
             --posted-state work/health-state.json \
+            --pool-pressure work/pool-pressure.json \
             --out work/health.json
           python3 -c 'import json; h = json.load(open("work/health.json")); print(h["state"], "-", h["cause"] or "no cause", "- stale" if h["stale"] else "")'
 

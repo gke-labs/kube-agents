@@ -819,6 +819,152 @@ class SlowGate(unittest.TestCase):
         self.assertTrue(result["evidence"][-1].endswith("; 3 reps lost to infra"), result["evidence"])
 
 
+# --------------------------------------------------------------------------- #
+# Rule 8: pool pressure
+# --------------------------------------------------------------------------- #
+
+
+def pressure(verdict="OK", cause=None, window_end=T0, p50=0.4, p95=0.5, today_p50=None, free=25, **over):
+    """pool-pressure.json in the shape the periodic publishes it.
+
+    `p50`/`p95` are the seven-day window the note quotes; `today_p50` is the
+    newest `days[]` row, which the digest reads instead. They are separate
+    arguments so a test can pin them to different values and catch a swap.
+    """
+    return {
+        "job": "pull-kube-agents-smoke-test",
+        "window_start": health.iso(window_end - timedelta(days=7)),
+        "window_end": health.iso(window_end),
+        "max_concurrency": 30,
+        "cause": cause,
+        "breached": verdict == "BREACH",
+        "verdict": verdict,
+        "thresholds": {"p50_minutes": 15, "p95_minutes": 45},
+        "pool": {"busy": 30 - free, "free": free, "total": 30, "in_transition": 0, "stranded": 0},
+        "trend": {
+            "runs": 586,
+            "p50_minutes": p50,
+            "p95_minutes": p95,
+            "worst_minutes": 175.2,
+            "days": [
+                {"day": "2026-09-06", "runs": 12, "p50_minutes": 99.0, "max_concurrency": 30, "breached": True, "judged": True},
+                {
+                    "day": "2026-09-07",
+                    "runs": 65,
+                    "p50_minutes": p50 if today_p50 is None else today_p50,
+                    "p95_minutes": p95,
+                    "worst_minutes": 2.5,
+                    "max_concurrency": 30,
+                    "breached": verdict == "BREACH",
+                    "judged": True,
+                },
+            ],
+        },
+    } | over
+
+
+def pooled(doc=None, now=T0, prev=None, **artifact):
+    return health.adjudicate(
+        doc or data(),
+        now,
+        prev,
+        health.Roster.fixed(ADMITTED),
+        pool_pressure=pressure(**artifact),
+    )
+
+
+class PoolNote(unittest.TestCase):
+    def test_a_breach_becomes_a_note_of_the_periodics_own_numbers(self):
+        # The #1069 incident's shape, in the units health.json stores.
+        result = pooled(verdict="BREACH", cause="CAPACITY", p50=24.1, p95=157.3, free=0)
+        self.assertEqual(result["state"], "GREEN", "a backed-up pool is a note, not a state")
+        self.assertEqual(
+            result["pool"],
+            {
+                "since": health.iso(T0),
+                "verdict": "BREACH",
+                "measured_at": health.iso(T0),
+                "runs": 586,
+                "p50_s": 1446,
+                "p95_s": 9438,
+                "worst_s": 10512,
+                "threshold_p50_s": 900,
+                "threshold_p95_s": 2700,
+                "free": 0,
+                "total": 30,
+                "cause": "CAPACITY",
+                "max_concurrency": 30,
+            },
+        )
+        self.assertIn(
+            "backed-up pool: median wait 24 min (p95 157 min) against thresholds of 15/45 min; 0 of 30 projects free",
+            result["evidence"],
+        )
+
+    def test_a_fresh_pass_and_a_missing_artifact_are_both_silent(self):
+        self.assertIsNone(pooled(verdict="OK")["pool"])
+        bare = health.adjudicate(data(), T0, None, health.Roster.fixed(ADMITTED))
+        self.assertIsNone(bare["pool"])
+        self.assertIsNone(bare["metrics"]["queue_wait_p50_s"])
+        self.assertFalse(any(line.startswith("backed-up pool") for line in bare["evidence"]), bare["evidence"])
+
+    def test_an_episode_keeps_its_start_and_a_new_one_gets_a_new_start(self):
+        first = pooled(verdict="BREACH", cause="CAPACITY", p50=24.1)
+        later = T0 + timedelta(hours=2)
+        held = pooled(now=later, prev=first, verdict="BREACH", cause="CAPACITY", p50=20.0, window_end=later)
+        self.assertEqual(held["pool"]["since"], health.iso(T0))
+        self.assertEqual(held["pool"]["p50_s"], 1200, "the numbers are this tick's")
+        cleared = pooled(now=later, prev=held, verdict="OK", window_end=later)
+        self.assertIsNone(cleared["pool"])
+        again = T0 + timedelta(hours=5)
+        self.assertEqual(
+            pooled(now=again, prev=cleared, verdict="BREACH", cause="CAPACITY", window_end=again)["pool"]["since"],
+            health.iso(again),
+        )
+
+    def test_an_artifact_that_stopped_moving_carries_no_numbers(self):
+        # latest-build.txt keeps resolving after the periodic dies, so a stale
+        # window_end is the only signal that the numbers stopped.
+        measured = T0 - timedelta(hours=4)
+        note = pooled(verdict="BREACH", cause="CAPACITY", window_end=measured)["pool"]
+        self.assertEqual(note, {"since": health.iso(T0), "verdict": "STALE", "measured_at": health.iso(measured)})
+        self.assertIn(
+            f"queue wait unmeasured: last reading {health.iso(measured)};"
+            " the hourly pool-pressure job has missed the last few",
+            pooled(verdict="BREACH", cause="CAPACITY", window_end=measured)["evidence"],
+        )
+        # Two missed hourly runs plus the job's own timeout: still fresh at 3h.
+        self.assertEqual(pooled(verdict="BREACH", cause="CAPACITY", window_end=T0 - timedelta(hours=3))["pool"]["verdict"], "BREACH")
+
+    def test_a_stale_artifact_also_drops_the_digest_number(self):
+        self.assertIsNone(pooled(verdict="OK", window_end=T0 - timedelta(hours=4))["metrics"]["queue_wait_p50_s"])
+
+    def test_unmeasured_is_a_note_even_though_nothing_breached(self):
+        result = pooled(verdict="UNMEASURED")
+        self.assertEqual(result["pool"]["verdict"], "UNMEASURED")
+        self.assertIn("pool pressure: the hourly check ran but could not measure the queue wait", result["evidence"])
+
+    def test_the_digest_wait_is_todays_median_not_the_seven_day_one(self):
+        # "last 24h" in the headline: the seven-day median under it would be a
+        # different window's number wearing the same label.
+        result = pooled(verdict="OK", p50=9.0, today_p50=0.4)
+        self.assertEqual(result["metrics"]["queue_wait_p50_s"], 24)
+
+    def test_the_note_rides_beside_an_incident_unlike_the_slow_one(self):
+        # Three setup deaths on two pull requests make the state DEGRADED
+        # (rule 3). Rule 7 is suppressed there; rule 8 is not -- a different
+        # job measuring different data cannot be this incident's own symptom.
+        doc = data(*(run(300 + i, pr, T0 - timedelta(minutes=10 * i), minutes=1, result="FAILURE") for i, pr in enumerate([1, 1, 2])))
+        result = pooled(doc=doc, verdict="BREACH", cause="CAPACITY", p50=24.1)
+        self.assertEqual(result["state"], "DEGRADED")
+        self.assertIsNotNone(result["pool"])
+
+    def test_a_sub_minute_wait_reads_in_seconds(self):
+        self.assertEqual(health.wait_text(24), "24s")
+        self.assertEqual(health.wait_text(1320), "22 min")
+        self.assertEqual(health.wait_text(None), "?")
+
+
 class Advice(unittest.TestCase):
     def test_outage_advice_cites_the_tracking_issue_from_case_notes(self):
         notes = {"compliance-rbac-overgrant": {"issues": ["#998", "#1171"]}}

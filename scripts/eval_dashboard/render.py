@@ -95,12 +95,14 @@ import yaml
 
 try:
     from . import classify, nightly, post_health, tiers
+    from .health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED
 except ImportError:  # run as a script: python3 scripts/eval_dashboard/render.py
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     import classify
     import nightly
     import post_health
     import tiers
+    from health import POOL_BREACH, POOL_STALE, POOL_UNMEASURED
 
 HERE = pathlib.Path(__file__).resolve().parent
 PAGE_TEMPLATE = HERE / "template" / "page.html.tmpl"
@@ -505,6 +507,10 @@ def normalize_health(raw) -> dict | None:
     # The slow-gate note (health.py rule 7): the fields the Brief's one
     # sentence reads; the rest of the note stays in health.json.
     slow = raw.get("slow") if isinstance(raw.get("slow"), dict) else None
+    # The pool note (health.py rule 8), same treatment. The verdict is checked
+    # against the three health.py writes rather than passed through: it picks
+    # the page's sentence, so an unknown string would render as none of them.
+    pool = raw.get("pool") if isinstance(raw.get("pool"), dict) else None
     return {
         "state": state,
         "condition": raw["condition"] if isinstance(raw.get("condition"), str) else None,
@@ -529,6 +535,13 @@ def normalize_health(raw) -> dict | None:
             "baseline_p50_s": slow.get("baseline_p50_s") if is_count(slow.get("baseline_p50_s")) else None,
             "baseline_days": slow.get("baseline_days") if is_count(slow.get("baseline_days")) else None,
         } if slow else None,
+        "pool": {
+            "verdict": pool.get("verdict") if pool.get("verdict") in (POOL_BREACH, POOL_UNMEASURED, POOL_STALE) else None,
+            "since": pool.get("since") if iso_ms(pool.get("since")) is not None else None,
+            "measured_at": pool.get("measured_at") if iso_ms(pool.get("measured_at")) is not None else None,
+            "p50_s": pool.get("p50_s") if is_count(pool.get("p50_s")) else None,
+            "threshold_p50_s": pool.get("threshold_p50_s") if is_count(pool.get("threshold_p50_s")) else None,
+        } if pool else None,
         "tick": raw["tick"] if iso_ms(raw.get("tick")) is not None else None,
     }
 

@@ -203,6 +203,19 @@ class HealthInputsTest(unittest.TestCase):
         )
         self.assertIsNone(render.normalize_health(health_doc("GREEN", slow={"median_s": "long"}))["slow"]["median_s"])
         self.assertIsNone(render.normalize_health(health_doc("GREEN", slow=[]))["slow"])
+        # The rule-8 note, same treatment: the five fields the lede reads, and
+        # a verdict the page does not know about is dropped rather than shown.
+        self.assertIsNone(minimal["pool"])
+        note = {"since": "2026-09-08T12:00:00+00:00", "verdict": "BREACH", "measured_at": "2026-09-08T13:23:00+00:00",
+                "p50_s": 1320, "p95_s": 3660, "threshold_p50_s": 900, "free": 0, "total": 30, "cause": "CAPACITY"}
+        self.assertEqual(
+            render.normalize_health(health_doc("GREEN", pool=note))["pool"],
+            {"verdict": "BREACH", "since": "2026-09-08T12:00:00+00:00", "measured_at": "2026-09-08T13:23:00+00:00",
+             "p50_s": 1320, "threshold_p50_s": 900},
+        )
+        self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=note | {"verdict": "WEDGED"}))["pool"]["verdict"])
+        self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=note | {"p50_s": "ages"}))["pool"]["p50_s"])
+        self.assertIsNone(render.normalize_health(health_doc("GREEN", pool=[]))["pool"])
 
     def test_load_health_degrades_on_absent_or_broken_files(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -620,6 +633,32 @@ class BrowserTest(unittest.TestCase):
         self.assertNotIn("PAST", linked.split('id="agent"', 1)[0], "the headline is the healthy one")
         control = dom_text(render_to(pathlib.Path(self.tmp.name) / "notslow", self.data, health=health_doc("GREEN")) / "index.html")
         self.assertNotIn("Runs are slow", control)
+
+    def test_brief_says_when_runs_are_waiting_to_start(self):
+        # health.py's rule-8 note, dated 8:00 AM ET on the page's Tuesday.
+        # Unlike 🐢 it also rides on an incident lede, so both are rendered.
+        note = {"since": "2026-09-08T12:00:00+00:00", "verdict": "BREACH", "measured_at": "2026-09-08T13:23:00+00:00",
+                "p50_s": 1320, "threshold_p50_s": 900}
+        sentence = "Runs are waiting to start since Tue 8:00 AM ET: a median wait of 22 min against a 15 min limit. Runs still pass; /retest makes the queue longer."
+        healthy = dom_text(render_to(pathlib.Path(self.tmp.name) / "pool", self.data, health=health_doc("GREEN", pool=note)) / "index.html")
+        self.assertIn("Smoke gate is healthy", healthy)
+        self.assertIn(sentence, healthy)
+        # During an incident it rides on the agent view, which is where the ⏳
+        # message's own link lands; the incident brief keeps its own lede.
+        out = render_to(pathlib.Path(self.tmp.name) / "poolred", self.data, health=health_doc("OUTAGE", pool=note))
+        self.assertIn(sentence, dom_text(out / "index.html", fragment="#view=agent"))
+        # The gate breaches on p50 or p95, so a p95-only breach carries a
+        # sub-minute median that whole minutes would print as "0 min".
+        quick = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolquick", self.data,
+                                   health=health_doc("GREEN", pool=note | {"p50_s": 24})) / "index.html")
+        self.assertIn("a median wait of 24s against a 15 min limit", quick)
+        # A stopped periodic says so instead of quoting a reading hours old.
+        stale = dom_text(render_to(pathlib.Path(self.tmp.name) / "poolstale", self.data,
+                                   health=health_doc("GREEN", pool={"verdict": "STALE", "measured_at": "2026-09-08T13:23:00+00:00"})) / "index.html")
+        self.assertIn("No pool numbers since Tue 9:23 AM ET: the hourly pool check has stopped reporting.", stale)
+        self.assertNotIn("median wait", stale)
+        control = dom_text(render_to(pathlib.Path(self.tmp.name) / "notpool", self.data, health=health_doc("GREEN")) / "index.html")
+        self.assertNotIn("Runs are waiting to start", control)
 
     def test_healthy_brief_without_any_health_files(self):
         out = render_to(pathlib.Path(self.tmp.name) / "nohealth", self.data)

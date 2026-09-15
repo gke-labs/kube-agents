@@ -13,7 +13,8 @@ the dashboard's Brief bakes that verdict and its history (`render.py --health`,
 `scripts/eval_dashboard/post_health.py` tells `#kube-agents-ci-health` on Google
 Chat — only when the state changes, plus one digest a day at 9 AM Toronto time,
 plus one line, once per episode, when the gate is slow without being broken
-([below](#a-slow-gate)).
+([below](#a-slow-gate)) or when runs are waiting to start
+([below](#a-backed-up-pool)).
 The digest also carries one line on last night's run of the nightly tier
 (`--data`, the `data.json` the tick collected): the cases recorded, how many
 passed all reps, partial and failed, what is newly failing against the night
@@ -31,8 +32,10 @@ OUTAGE lacks or the one a build-cluster node loss owes the cluster owner
 Every message ends with a deep link into the dashboard:
 `index.html#since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>][&cases=<comma-separated case ids>]&view=gate`
 for an incident (`until` on the recovery message), `view=agent` for the
-digest, and the bare `index.html#view=agent` for the slow-gate note, whose
-start is a GREEN tick that names no incident. The scope rides in the URL
+digest, and the bare `index.html#view=agent` for the slow-gate and pool notes,
+whose start is a tick that names no incident. The `pool check stopped` message
+links to the periodic's job history instead, the one place that shows whether
+it has started running again. The scope rides in the URL
 fragment because the host's login redirect drops a query string and a browser
 carries the fragment through the redirect.
 The contract, and the older `?cases=…#gate` form the pages still read (it
@@ -169,6 +172,52 @@ minutes because 09-08 to 09-11 had been slow too), while the median rule
 fired from 2:00 PM ET and stayed quiet over 09-06 to 09-09 and the 09-12/13
 weekend. Model latency is not sampled: the per-repetition eval logs carry
 it, and reading them is not something a tick does.
+
+## A backed-up pool
+
+Every number above is measured from a run's start, so nothing here sees a run
+that sat in the queue first. The `ci-kube-agents-pool-pressure` periodic
+(#1069) measures that hourly and grades it against the runbook's thresholds;
+this job reads its `pool-pressure.json` and never re-derives the verdict, so
+the two cannot disagree (#1607). A missing artifact is not an alert — that is
+"not wired up", not "the pool is fine".
+
+Like the slow note it rides beside the state and never becomes one: the runs
+still pass, they just start late, and DEGRADED would tell people to retest,
+which lengthens the queue being reported. Unlike the slow note it is **not**
+held back outside GREEN — a different job reading different data cannot be
+this incident's own symptom.
+
+The poster sends one line when the note appears, and again if its verdict
+changes inside the episode. The header names the cause, because the four
+causes have four different remedies and one of them spends money:
+
+```text
+⏳ Smoke gate: pool full — all 30 projects are leased and runs are queuing.
+Consider onboarding a project.
+Median wait 22 min against a 15 min limit; p95 61 min against 45.
+Runs still pass; /retest makes the queue longer.
+```
+
+`concurrency cap` (the cap is below the pool size — raise it), `runs not
+starting` (projects were free and the cap was not the limit, so the delay is
+Prow's; the message names the build cluster) and `queue backed up` (the job
+could not read how many projects were in use) carry the same three lines
+under a different first one.
+
+Two ⚪ messages are about the monitoring rather than the pool: `wait unknown`
+when the hourly check ran and could not read the queue, and `pool check
+stopped` when `window_end` is more than 3 hours old — two missed runs plus the
+job's own timeout. The stopped message carries **no numbers at all**:
+`latest-build.txt` keeps resolving after the periodic dies, so a stopped job
+reads as an unchanging healthy artifact, and a figure hours old gets read as
+current whatever the caveat says.
+
+The digest carries the median wait every morning whether or not anything is
+wrong (`typical wait`, beside `typical run`), and repeats a one-line version
+of the note while it lasts. The Brief's lede carries the same sentence. There
+is no tile for it: the tiles recompute for the reader's date range, and the
+wait is a fixed 24-hour figure that is not in the run data.
 
 ## The comment on a red pull request
 
