@@ -24,9 +24,15 @@ since the day before yesterday, says so instead of numbers.
 same nightly runs.
 The same tick comments on each pull request whose run went red or whose
 build node went away (`gate_comment.py`), files the tracking issue a new
-OUTAGE lacks or the one a build-cluster node loss owes the cluster owner
-(`gate_issue.py`), and appends `health.json` to a history feed. A
-`workflow_dispatch` of the same workflow is the on-demand refresh button.
+OUTAGE lacks or the one a build-cluster node loss or a seeded-fixture drift
+owes its owner (`gate_issue.py`), and appends `health.json` to a history
+feed. A second job in the same workflow, on its own hourly cron, scans every
+CI pool project's seeded fleet for fixtures out of their designed state and
+publishes `fixture-state.json` beside `health.json` ([The seeded-fleet
+scan](#the-seeded-fleet-scan)); the tick reads it for the `fixture_drift`
+condition and the digest carries one line on the latest scan. A
+`workflow_dispatch` of the same workflow is the on-demand refresh button
+(its `fixture_state_scan` input also runs the scan).
 
 Every message ends with a deep link into the dashboard:
 `index.html#since=<ISO 8601 UTC>[&until=<ISO 8601 UTC>][&cases=<comma-separated case ids>]&view=gate`
@@ -73,13 +79,18 @@ condition), a quota storm (15+
 repetitions lost to 429s or empty records across 3+ pull requests among the
 runs that finished in the last 2 hours, #1225 / #1214), or setup deaths (3+ runs
 that concluded `FAILURE` under 5 minutes with no tasks, on 2+ pull requests, in
-2 hours, #1172; an aborted zero-task run is a superseded push). A zero-task run
+2 hours, #1172; an aborted zero-task run is a superseded push), or seeded
+fixture drift (the hourly scan found the same fixture role out of its designed
+state on the same pool project on two consecutive scans, or on 3+ projects in
+one scan; #1550, below). A zero-task run
 is at most one of a lost pod, a conflicted merge (below) and a setup death, in
 that order: a lost pod is never a setup death, whatever its duration. When more
 than one condition fires, the order
 above decides which one the message carries; the others stay in the evidence.
 For a storm, retest after the time the message gives; for lost pods, once new
-jobs are progressing.
+jobs are progressing; for fixture drift, once the fleet owner has re-applied
+the stack — a red on a case that depends on the drifted fixture, from a run
+that leased one of those projects, is the fixture's, not the change's.
 
 A pull request that will not merge into `main` dies in the same seconds with
 no tasks and is not a setup death either (`merge_conflict` in SCHEMA.md,
@@ -262,6 +273,119 @@ once per event. Each issue records the condition it was filed for (`{number,
 url, condition}`): an outage's issue is never cited as the lost pods' tracking,
 nor the reverse, so a break followed by a node loss files both, and both are
 commented on when the gate recovers.
+
+## The seeded-fleet scan
+
+Presence probes passed on 2026-09-07 while every slot-a fixture sat Pending on
+all 30 pool projects (#1278). `hack/fleet-fixture-state.py` is the check that
+would have failed (#1544: each role's `state` assertions in
+`bench/tf/fleet/fixtures.json`), and the `fixture-state-scan` job in
+`.github/workflows/ci-health.yml` runs it on a clock rather than per lease: at
+the top of every hour (`0 * * * *`, a second cron in the same workflow; the
+`github.event.schedule` guards send each run to one job) it runs
+`scripts/eval_dashboard/fixture_state.py`, which, per pool project and in a
+temporary directory of its own, runs `hack/fleet-kubeconfigs.sh` and then
+`hack/fleet-fixture-state.py --wait 0 --report`, six projects at a time, and
+publishes `gs://kube-agents-dashboards/evals/fixture-state.json`. It is its
+own job rather than a step on the top-of-hour tick because it needs `kubectl`
+and `gke-gcloud-auth-plugin`, runs thirty projects for a few minutes (a
+healthy project takes about 20 s), and must never hold the 15-minute verdict:
+the tick reads whatever scan is published. The project list is
+`gitops_repo_for_project()` in `hack/ci-deploy.sh`, the one list of pool
+projects this repository holds; the leasable roster is Boskos's, and every
+leasable project is mapped there first. A mapped project that is not
+provisioned or not visible scans as "not checked".
+
+**The document.** `fixture-state.json` is `{schema_version, scanned_at,
+duration_s, projects{}, summary, previous}`. `projects` has one entry per
+pool project, `{roles{}, summary, duration_s, reader, error?}`, and `roles`
+one entry per catalog role: `{"state": "healthy" | "drifted" | "not_checked",
+"detail": [...]}` — for a drifted role, the assertion and what the scan
+observed, as `hack/fleet-fixture-state.py` writes it (`deployment/checkout-gateway
+status.readyReplicas eq 2: observed 0`); for one not checked, why (the reader
+could not be impersonated, the runner published no kubeconfig for it, its
+read failed). `summary` counts projects, projects checked (at least one role
+read), projects with drift, and roles by state. `previous` is the prior
+document's `scanned_at` and its `{project: [drifted roles]}` map, carried so
+the adjudicator can ask "drifted last scan too?" from one file.
+
+**The identity and the one grant.** Every read runs as that project's
+read-only account, `seeded-fleet-reader@<project>.iam.gserviceaccount.com`
+(`bench/tf/fleet`): `CLOUDSDK_AUTH_IMPERSONATE_SERVICE_ACCOUNT` makes gcloud
+impersonate it for the cluster listing, the credentials and the control-plane
+describes, and `FLEET_READONLY_SA` makes the runner rewrite each kubeconfig so
+`kubectl`'s token is minted as it too. The bot,
+`eval-dashboard-publisher@kube-agents-prow`, therefore needs exactly one grant
+per pool project — `roles/iam.serviceAccountTokenCreator` on that account, the
+grant #1238 gave the presubmit's identity — and nothing on the project itself.
+The grant lives on the service account resource, so it is per project by
+nature (the pool projects sit directly under the organisation, with no folder
+to grant on). `bench/tf/fleet`'s `fleet_reader_token_creators` defaults to both
+identities, so an apply of the fleet stack in a project grants it; for projects
+applied before that default, the repair is one command per project:
+
+```bash
+BOT=eval-dashboard-publisher@kube-agents-prow.iam.gserviceaccount.com
+for p in $(sed -n '/^gitops_repo_for_project() {/,/^}/p' hack/ci-deploy.sh \
+          | sed -n 's/^[[:space:]]*\(kube-agents-evals[-0-9]*\)).*/\1/p'); do
+  gcloud iam service-accounts add-iam-policy-binding \
+    "seeded-fleet-reader@${p}.iam.gserviceaccount.com" --project "$p" \
+    --member "serviceAccount:${BOT}" --role roles/iam.serviceAccountTokenCreator --quiet
+done
+```
+
+Until the grant is in place the scan pre-flights one token mint per project,
+fails it, and records every role as "not checked" with gcloud's own words.
+
+**The condition.** `health.py`'s `fixture_drift` fires when the same role is
+drifted on the same project in two consecutive scans, or on 3 or more projects
+in one scan. One scan on one project is not enough: in #1278's retest sweep the
+crashloop fixture lagged the node repair by about 40 minutes on one project (it
+needs its first restart before OOMKilled evidence exists), and one hourly scan
+can land inside that window. Three projects at once is the fleet-wide shape
+(#1278 was all 30) and waits for nothing. It is DEGRADED, ranked below every
+run-based condition (nothing in the presubmit runs this check and nothing acts on a
+drift, so a drifted fixture reds only the cases that depend on it, on the runs that
+lease those projects; the run-based conditions see that red as it happens, and
+this one names the cause and its owner), and it ends the hour a scan that could
+read the incident's roles on the incident's projects no longer shows it — three
+green runs could all have leased healthy projects and say nothing about the
+fixture, and a scan that is missing, stale, blind, or that could not read one of
+those projects holds the condition with a note in the evidence rather than
+posting a recovery nothing observed. A scan older than 3 hours is ignored with a
+note in the evidence; a scan that could check no project at all (the grant missing,
+`kubectl` missing) is `fixture_state.unknown` in `health.json`: the poster says
+so once, and once more when the scan sees the fleet again, and it is never a
+drift. `health.json`'s `fixture_state` block carries the latest scan's time,
+how many projects it could read, every project's drifted roles, and the
+`unknown` and `stale` flags with the commonest reason.
+
+**What it posts.** A new `fixture_drift` condition is a state change like any
+other: one Chat message naming the roles and how many projects, that a red on
+a case depending on them from a run in those projects is the fixture and not
+the code, that a retest waits for the re-apply, and `Tracking
+#NNN`; the gate comment's health box carries the same sentence on a red run
+while the condition lasts; the 9 AM digest always carries one line on the
+latest scan (`🧭 Seeded fleet: 30 of 30 pool projects checked at 8:00 AM ET,
+every fixture in its designed state`, or the drifted projects and roles, or
+that the scan is stale or could see nothing). The tracking issue is filed for
+the fleet owner, labelled `presubmit-gate`: `Seeded fleet drift:
+crashloop-workload out of designed state on 3 pool projects since Mon 9:00 AM
+ET`, with the roles, per project the assertion and what was observed, the
+window, the evidence, and the reconcile — re-apply `bench/tf/fleet` in each
+project named (`bench/tf/fleet/README.md`, "State and reconcile") — and the
+line "Filed automatically by the smoke health bot; the fleet owner should
+re-apply the stack in the projects named; the bot will not close it." An open
+`presubmit-gate` issue that already names every drifted role is adopted
+instead. The recovery comments on it as on any other.
+
+**What never fails the bot.** A missing `kubectl` or `gcloud`, a project the
+publisher cannot read, a missing grant, a runner or a state check that hangs
+past its ceiling (300 s per project, 1500 s for the scan): each is "not
+checked" with its reason, the scan exits 0 and publishes, and the tick reads
+it as such. Only a repository bug — no mapping in `hack/ci-deploy.sh`, no
+catalog — reds the scan job. `fixture_state.py --projects <id> --no-impersonate`
+runs the same scan from a laptop with direct access to one project.
 
 ## The history feed
 

@@ -575,5 +575,48 @@ class PassTest(_Harness):
         assert "7 role(s) in their designed state" in done.stderr
 
 
+
+class ReportTest(_Harness):
+    """`--report` writes every catalog role's verdict as JSON, for the health
+    bot's scan (scripts/eval_dashboard/fixture_state.py), which runs this
+    script per project and must not parse its warnings."""
+
+    def test_the_report_carries_every_roles_verdict(self):
+        world = _healthy_world()
+        world["kubectl"]["deployment/checkout-gateway"] = {"status": {"readyReplicas": 0, "replicas": 2}}
+        world["describe"].pop("seeded-c")
+        self.provision(roles=[role for role in self.catalog["roles"] if role != "idle-nodepool"])
+        report = self.tmp / "report.json"
+        done = self.run_script(world, "--report", str(report))
+        self.assertEqual(done.returncode, 0, done.stderr)
+        doc = json.loads(report.read_text())
+        self.assertEqual(doc["schema_version"], 1)
+        self.assertEqual(doc["project"], "kube-agents-evals")
+        states = {role: entry["state"] for role, entry in doc["roles"].items()}
+        self.assertEqual(
+            states,
+            {
+                "crashloop-workload": "converged",
+                "drift-outlier": "unchecked",
+                "hpa-saturated": "converged",
+                "idle-nodepool": "unpublished",
+                "no-pdb-workload": "drifted",
+                "rbac-overgrant": "converged",
+                "version-laggard": "converged",
+            },
+        )
+        self.assertEqual(doc["roles"]["no-pdb-workload"]["detail"], self.drift_files()["no-pdb-workload"].splitlines())
+        self.assertTrue(doc["roles"]["drift-outlier"]["detail"][0].startswith("cluster: clusters describe seeded-c failed"), doc["roles"]["drift-outlier"])
+        self.assertEqual(doc["roles"]["idle-nodepool"], {"cluster_slot": "a", "state": "unpublished", "detail": []})
+        self.assertEqual(doc["roles"]["version-laggard"]["cluster_slot"], "b")
+        self.assertEqual(doc["summary"], {"converged": 4, "drifted": 1, "unchecked": 1})
+        self.assertIn("1 drifted, 1 not checked", done.stderr)
+
+    def test_without_the_flag_no_report_is_written(self):
+        done = self.run_script(_healthy_world())
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(list(self.tmp.glob("*.json")), [self.world])
+
+
 if __name__ == "__main__":
     unittest.main()
