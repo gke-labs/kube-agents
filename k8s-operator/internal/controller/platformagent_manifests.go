@@ -102,6 +102,16 @@ const (
 	// containerMemoryLimitResource is the Downward API resource selector for
 	// a container's own memory limit.
 	containerMemoryLimitResource = "limits.memory"
+
+	// sqliteJournalModeDelete is the rollback-journal mode Hermes accepts as
+	// `database.journal_mode`, rendered into the managed scope by renderConfigYAML
+	// when the agent pod has a runtime class. Under gVisor the data volume is a 9p
+	// gofer mount, which accepts `PRAGMA journal_mode=WAL` but cannot honour WAL's
+	// shared-memory and byte-range lock contract, and two databases corrupted in
+	// three days on such a mount (#610). Hermes' own DELETE fallback fires only on
+	// error strings gVisor never raises, so the operator, which knows the runtime
+	// for certain, pins the mode instead.
+	sqliteJournalModeDelete = "delete"
 )
 
 // Shared-state ownership. Step 1.5 of deploy/shared/docker-entrypoint.sh reads this
@@ -1407,15 +1417,6 @@ const shellSandboxEnvLifetimeSeconds = 2592000
 type managedDatabaseConfig struct {
 	JournalMode string `json:"journal_mode"`
 }
-
-// sqliteJournalModeDelete is the rollback-journal mode Hermes accepts as
-// `database.journal_mode`. Under gVisor the data volume is a 9p gofer mount,
-// which accepts `PRAGMA journal_mode=WAL` but cannot honour WAL's shared-memory
-// and byte-range lock contract, and two databases corrupted in three days on
-// such a mount (#610). Hermes' own DELETE fallback fires only on error strings
-// gVisor never raises, so the operator, which knows the runtime for certain,
-// pins the mode instead.
-const sqliteJournalModeDelete = "delete"
 
 func renderConfigYAML(agent *agentv1alpha1.PlatformAgent, agentPlugins []*agentv1alpha1.AgentPlugin) string {
 	agentPlugins = filterValidAgentPlugins(agentPlugins)
