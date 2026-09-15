@@ -1847,5 +1847,284 @@ class A2AModeProbeTest(unittest.TestCase):
             self.assertFalse(marker.exists(), "a managed .env value was executed")
 
 
+
+def _extract_nested_block(opener, indent, closer="fi"):
+    """Like `_extract_shell_block`, for a step written inside another block.
+
+    `opener` and `closer` are matched at exactly `indent` spaces and the block comes
+    back dedented by that much, so the shipped lines run at top level in a test shell.
+    """
+    lines = _ENTRYPOINT.read_text(encoding="utf-8").splitlines()
+    pad = " " * indent
+    starts = [i for i, line in enumerate(lines) if line == pad + opener]
+    if len(starts) != 1:
+        raise AssertionError(f"expected one `{opener}` at indent {indent} in {_ENTRYPOINT}, found {len(starts)}")
+    start = starts[0]
+    for end in range(start + 1, len(lines)):
+        if lines[end] == pad + closer:
+            block = lines[start : end + 1]
+            return "\n".join(line[indent:] if line.startswith(pad) else line for line in block) + "\n"
+    raise AssertionError(f"`{opener}` is never closed by `{closer}` at indent {indent} in {_ENTRYPOINT}")
+
+
+_JOURNAL_SCRIPT = _REPO / "deploy" / "shared" / "sqlite_journal_migrate.py"
+_JOURNAL_STEP_OPENER = (
+    'if [ -n "${HERMES_MANAGED_DIR:-}" ] && [ -f "$SQLITE_JOURNAL_MIGRATE_SCRIPT" ] '
+    '&& [ -x "$INSTALL_DIR/.venv/bin/python3" ]; then'
+)
+_JOURNAL_WAIT_OPENER = 'if [ -f "$SQLITE_JOURNAL_MIGRATE_SCRIPT" ] && [ -x "$INSTALL_DIR/.venv/bin/python3" ]; then'
+_JOURNAL_WAIT_INDENT = 8
+_DELETE_PIN = "database:\n  journal_mode: delete\n"
+
+
+def _wal_database(path):
+    import sqlite3
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE t (x INTEGER)")
+    conn.commit()
+    conn.close()
+    return path
+
+
+def _header_versions(path):
+    with path.open("rb") as handle:
+        header = handle.read(100)
+    return header[18], header[19]
+
+
+class _JournalModeCase(unittest.TestCase):
+    """Shared staging for the two halves of the WAL-to-DELETE conversion.
+
+    The block is run with the real script and the real interpreter, reached through a
+    wrapper at the venv path the entrypoint hard-codes, so what is tested is the shipped
+    shell driving the shipped Python — not a stub of either.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = pathlib.Path(self._tmp.name)
+        self.target = self.tmp / "data"
+        self.target.mkdir()
+        self.managed = self.tmp / "managed"
+        self.managed.mkdir()
+        self.invoked = self.tmp / "invoked"
+        self.python = self.tmp / "hermes" / ".venv" / "bin" / "python3"
+        self.python.parent.mkdir(parents=True)
+        self._install_python(f'exec "{sys.executable}" "$@"\n')
+
+    def _install_python(self, body):
+        self.python.write_text(f'#!/bin/sh\ntouch "{self.invoked}"\n{body}', encoding="utf-8")
+        self.python.chmod(0o755)
+
+    def pin(self, text=_DELETE_PIN):
+        (self.managed / "config.yaml").write_text(text, encoding="utf-8")
+
+    def env(self, managed=True, script=None):
+        env = {
+            **os.environ,
+            "TARGET_DIR": str(self.target),
+            "INSTALL_DIR": str(self.tmp / "hermes"),
+            "SQLITE_JOURNAL_MIGRATE_SCRIPT": str(script or _JOURNAL_SCRIPT),
+        }
+        env.pop("HERMES_MANAGED_DIR", None)
+        if managed:
+            env["HERMES_MANAGED_DIR"] = str(self.managed)
+        return env
+
+
+class JournalModeConversionStepTest(_JournalModeCase):
+    """Step 1.7: the owner converts the volume's databases out of WAL once, before step 2."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._BLOCK = _extract_shell_block(_JOURNAL_STEP_OPENER)
+
+    def _run(self, **env_kwargs):
+        return subprocess.run(
+            ["sh", "-c", f"set -e\n{self._BLOCK}\necho REACHED-EXEC\n"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=self.env(**env_kwargs),
+        )
+
+    def test_the_owner_converts_a_wal_database_when_delete_is_pinned(self):
+        db = _wal_database(self.target / "profiles" / "platform" / "state.db")
+        self.pin()
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(self.invoked.exists())
+        self.assertEqual(_header_versions(db), (1, 1), proc.stderr)
+        self.assertIn("converted to delete", proc.stderr, "the conversion has to reach the container log")
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_no_pin_leaves_the_database_in_wal(self):
+        db = _wal_database(self.target / "state.db")
+        self.pin("model:\n  default: x\n")
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(self.invoked.exists(), "the gate is in the script; the step itself must still run")
+        self.assertEqual(_header_versions(db), (2, 2))
+
+    def test_no_managed_scope_means_the_step_does_not_run(self):
+        """Outside the operator nobody pins anything, and the step must not even try."""
+        db = _wal_database(self.target / "state.db")
+        proc = self._run(managed=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(self.invoked.exists())
+        self.assertEqual(_header_versions(db), (2, 2))
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_a_missing_script_is_skipped_not_fatal(self):
+        self.pin()
+        proc = self._run(script=self.tmp / "absent.py")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(self.invoked.exists())
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_a_conversion_that_fails_warns_and_start_up_continues(self):
+        """Best-effort: the volume is no worse than WAL left it, and the next start retries."""
+        self._install_python("exit 3\n")
+        self.pin()
+        proc = self._run()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(self.invoked.exists())
+        self.assertIn("WARN", proc.stderr)
+        self.assertIn("exit 3", proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+
+    def test_the_step_sits_between_the_bootstrap_lock_and_the_default_sync(self):
+        """After the lock, so one container converts; before step 2, which opens databases."""
+        text = _ENTRYPOINT.read_text(encoding="utf-8")
+        lock = text.index("flock -w 300 9")
+        step = text.index(_JOURNAL_STEP_OPENER)
+        sync = text.index("# 2. Sync default agent files")
+        self.assertLess(lock, step)
+        self.assertLess(step, sync)
+
+    def test_the_script_path_is_named_once_and_used_by_both_halves(self):
+        text = _ENTRYPOINT.read_text(encoding="utf-8")
+        self.assertEqual(text.count('SQLITE_JOURNAL_MIGRATE_SCRIPT="/opt/defaults/scripts/sqlite_journal_migrate.py"'), 1)
+        self.assertIn(_JOURNAL_WAIT_OPENER, text)
+        self.assertLess(text.index(_JOURNAL_WAIT_OPENER), text.index(_JOURNAL_STEP_OPENER))
+
+
+class JournalModeWaitTest(_JournalModeCase):
+    """The non-owner's bounded wait for step 1.7.
+
+    A sidecar that opens a database while the owner is converting it is exactly the
+    concurrent opener the conversion refuses to run under, so the two would settle into
+    "left in WAL" on every start. The wait holds the sidecar back, ends as soon as the
+    headers flip, and proceeds anyway at the budget, like the config wait beside it.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls._BLOCK = _extract_nested_block(_JOURNAL_WAIT_OPENER, _JOURNAL_WAIT_INDENT)
+
+    def _run(self, wait_secs=30, convert_after=None, timeout=None, **env_kwargs):
+        """Run the wait with `_wait_secs` already parsed, the way the branch above it does.
+
+        `convert_after`, in seconds, runs the real conversion from a timer thread — the
+        owner finishing step 1.7 while this container waits.
+        """
+        timer = None
+        if convert_after is not None:
+            timer = threading.Timer(
+                convert_after,
+                lambda: subprocess.run(
+                    [sys.executable, str(_JOURNAL_SCRIPT), "--agent-home", str(self.target),
+                     "--managed-config", str(self.managed / "config.yaml")],
+                    check=True,
+                    capture_output=True,
+                    timeout=60,
+                ),
+            )
+            timer.start()
+        started = time.monotonic()
+        try:
+            proc = subprocess.run(
+                ["sh", "-c", f"set -e\n_wait_secs={wait_secs}\n{self._BLOCK}\necho REACHED-EXEC\n"],
+                capture_output=True,
+                text=True,
+                timeout=timeout if timeout is not None else wait_secs + 60,
+                env=self.env(**env_kwargs),
+            )
+        finally:
+            if timer is not None:
+                timer.cancel()
+        return proc, time.monotonic() - started
+
+    def test_a_volume_with_nothing_to_convert_is_not_waited_for(self):
+        """The steady state: every restart after the conversion must not pause."""
+        _wal_database(self.target / "notepad.db")  # not governed
+        self.pin()
+        proc, elapsed = self._run(wait_secs=600, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("waiting up to", proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+        self.assertLess(elapsed, 20)
+
+    def test_the_wait_ends_as_soon_as_the_owner_has_converted(self):
+        _wal_database(self.target / "state.db")
+        self.pin()
+        proc, elapsed = self._run(wait_secs=60, convert_after=2)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("waiting up to 60s", proc.stderr)
+        self.assertIn("conversion finished after", proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+        self.assertLess(elapsed, 30, f"the wait polls; taking the budget means it is a sleep:\n{proc.stderr}")
+
+    def test_a_conversion_that_never_comes_starts_the_process_anyway(self):
+        """Bounded: a non-owner that never starts is worse than one that starts early."""
+        db = _wal_database(self.target / "state.db")
+        self.pin()
+        proc, _ = self._run(wait_secs=2)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("WARN", proc.stderr)
+        self.assertIn("still reads WAL after 2s", proc.stderr)
+        self.assertIn("REACHED-EXEC", proc.stdout)
+        self.assertEqual(_header_versions(db), (2, 2), "the waiter converted the database itself")
+
+    def test_no_pin_means_no_wait_however_many_databases_read_wal(self):
+        _wal_database(self.target / "state.db")
+        self.pin("model:\n  default: x\n")
+        proc, elapsed = self._run(wait_secs=600, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("waiting up to", proc.stderr)
+        self.assertLess(elapsed, 20)
+
+    def test_a_missing_managed_config_means_no_wait(self):
+        """The config wait above already covers a scope that has not arrived."""
+        _wal_database(self.target / "state.db")
+        proc, elapsed = self._run(wait_secs=600, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("waiting up to", proc.stderr)
+        self.assertLess(elapsed, 20)
+
+    def test_a_host_without_the_interpreter_does_not_wait(self):
+        _wal_database(self.target / "state.db")
+        self.pin()
+        self.python.unlink()
+        proc, elapsed = self._run(wait_secs=600, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(self.invoked.exists())
+        self.assertIn("REACHED-EXEC", proc.stdout)
+        self.assertLess(elapsed, 20)
+
+    def test_the_wait_is_inside_the_non_owner_branch(self):
+        """It is the sidecar that waits; the owner is the one being waited for."""
+        text = _ENTRYPOINT.read_text(encoding="utf-8")
+        disowns = text.index(f'echo "[ENTRYPOINT] \'$*\' {_DISOWNS}')
+        wait = text.index(_JOURNAL_WAIT_OPENER)
+        gate_end = text.index("# 1.55 Check the image's skill trees")
+        self.assertLess(disowns, wait)
+        self.assertLess(wait, gate_end)
+
+
 if __name__ == "__main__":
     unittest.main()
