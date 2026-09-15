@@ -293,8 +293,8 @@ crashloop fixture lagged the node repair by about 40 minutes on one project (it
 needs its first restart before OOMKilled evidence exists), and one hourly scan
 can land inside that window. Three projects at once is the fleet-wide shape
 (#1278 was all 30) and waits for nothing. It is DEGRADED, ranked below every
-run-based condition (the presubmit detects a drift and does not act on it, so
-a drifted fixture reds only the cases that depend on it, on the runs that
+run-based condition (nothing in the presubmit runs this check and nothing acts on a
+drift, so a drifted fixture reds only the cases that depend on it, on the runs that
 lease those projects; the run-based conditions see that red as it happens, and
 this one names the cause and its owner), and it ends the hour the scan no
 longer shows it — three green runs could all have leased healthy projects and

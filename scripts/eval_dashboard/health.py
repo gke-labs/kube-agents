@@ -223,8 +223,8 @@ NOON = 12
 # (hack/fleet-fixture-state.py) is what would have said so, and the CI health
 # workflow now runs it against every pool project once an hour and publishes
 # fixture-state.json beside health.json (scripts/eval_dashboard/
-# fixture_state.py). The presubmit detects a drift and does not act on it
-# (decision 2026-09-14: evals v1 detects, does not act), so a drifted role
+# fixture_state.py). Nothing in the presubmit runs this check and nothing
+# acts on a drift (decision 2026-09-14: evals v1 detects, does not act), so a drifted role
 # reds the cases that depend on it on the runs that lease those projects;
 # the run-based rules above see that red as it happens, and this rule names
 # the cause and its owner (the fleet's reconcile). DEGRADED, not an OUTAGE:

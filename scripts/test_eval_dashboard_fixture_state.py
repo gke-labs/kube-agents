@@ -507,6 +507,37 @@ class Workflow(unittest.TestCase):
         for line in re.findall(r"^\s*uses: .*$", job_text, re.MULTILINE):
             self.assertRegex(line, r"@[0-9a-f]{40} # v\d", f"{line.strip()} is not pinned to a SHA with its version")
 
+    def test_the_upload_steps_summary_script_runs(self):
+        """The inline python that prints the scan's summary is shell-quoted
+        with single quotes, so a double quote inside an f-string expression
+        must not be escaped with a backslash (a SyntaxError on 3.12 that
+        would red the job after the document was already published)."""
+        import subprocess
+        import sys
+
+        steps = self.jobs["fixture-state-scan"]["steps"]
+        upload = next(step for step in steps if "cp work/fixture-state.json" in step.get("run", ""))
+        run = upload["run"]
+        code = run[run.index("python3 -c '") + len("python3 -c '") :]
+        code = code[: code.index("\n'")]
+        compile(code, "<upload step>", "exec")
+        with tempfile.TemporaryDirectory() as tmp:
+            work = pathlib.Path(tmp) / "work"
+            work.mkdir()
+            document = {
+                "summary": {"checked": 1, "projects": 2, "drifted_projects": 1, "healthy": 6, "drifted": 1, "not_checked": 7},
+                "projects": {
+                    "p1": {"roles": {"r1": {"state": "drifted"}, "r2": {"state": "healthy"}}},
+                    "p2": {"roles": {"r1": {"state": "not_checked"}}, "error": "cannot mint a token"},
+                },
+            }
+            (work / "fixture-state.json").write_text(json.dumps(document), encoding="utf-8")
+            proc = subprocess.run([sys.executable, "-c", code], cwd=tmp, capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("1 of 2 projects checked; drifted on 1", proc.stdout)
+        self.assertIn("p1: drifted: r1", proc.stdout)
+        self.assertIn("p2: not checked: cannot mint a token", proc.stdout)
+
     def test_the_tick_reads_the_published_scan(self):
         steps = self.jobs["refresh-and-adjudicate"]["steps"]
         fetch = next(step for step in steps if "fixture-state.json" in step.get("run", "") and "health-prev.json" in step["run"])

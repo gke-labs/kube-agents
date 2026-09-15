@@ -540,7 +540,7 @@ jobs:
           import json
           doc = json.load(open("work/fixture-state.json"))
           s = doc["summary"]
-          print(f"{s[\"checked\"]} of {s[\"projects\"]} projects checked; drifted on {s[\"drifted_projects\"]}; roles healthy {s[\"healthy\"]}, drifted {s[\"drifted\"]}, not checked {s[\"not_checked\"]}")
+          print(f"{s['checked']} of {s['projects']} projects checked; drifted on {s['drifted_projects']}; roles healthy {s['healthy']}, drifted {s['drifted']}, not checked {s['not_checked']}")
           for project, entry in sorted(doc["projects"].items()):
               drifted = [r for r, v in entry["roles"].items() if v["state"] == "drifted"]
               if drifted or entry.get("error"):
