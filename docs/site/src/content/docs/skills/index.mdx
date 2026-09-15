@@ -108,6 +108,12 @@ Generated from the `name` and `description` frontmatter of every `agents/platfor
 | [`pr-conversation`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/pr-conversation/SKILL.md) | Answer a reviewer who addressed you on one of your own pull requests — read the thread, answer or amend the branch, and reply in the thread. |
 | [`version-control`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/version-control/SKILL.md) | Read and change a hosted repository through forge-neutral verbs. Version control here is abstracted — remote operations go through vcs.py, local operations use a credential-free VCS binary on a working copy that vcs.py puts on disk. Covers history, file modes, proposals and issues, so no forge CLI is needed. |
 
+### Other
+
+| Skill | Description |
+| ----- | ----------- |
+| [`openshift-gcp-obtainability`](https://github.com/gke-labs/kube-agents/blob/main/agents/platform/skills/openshift-gcp-obtainability/SKILL.md) | Orchestrates resource obtainability, zonal stockout recovery, and machine type fallbacks for OpenShift clusters running on Google Compute Engine (GCE). Trigger when OpenShift MachineSets fail to provision nodes due to ZONE_RESOURCE_POOL_EXHAUSTED or QUOTA_EXCEEDED, when pods remain Pending with FailedScheduling, or when designing stockout-resilient machine topologies. |
+
 ### Cluster Agent (per-cluster runtime)
 
 | Skill | Description |
