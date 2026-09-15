@@ -33,7 +33,7 @@ Set the variable to `false` to export the unfiltered stream while debugging.
 
 ## Prerequisites
 
-The caller must have `pubsub.googleapis.com` and `logging.googleapis.com` enabled on the project. `logging.googleapis.com` is unconditional in [`full-install`](../../examples/full-install/), but **`pubsub.googleapis.com` is currently gated behind `enable_google_chat`** there — an install without Chat will not have it. Move Pub/Sub out of that conditional before wiring this module into the composition.
+The caller must have `pubsub.googleapis.com` and `logging.googleapis.com` enabled on the project. [`full-install`](../../examples/full-install/) enables both when it instantiates this module (`enable_drift_pubsub = true`; `logging.googleapis.com` is unconditional there, and `pubsub.googleapis.com` is enabled whenever any of its Pub/Sub-backed features is on). A standalone caller enables them itself: no module in this repository calls `google_project_service`.
 
 ## Usage
 

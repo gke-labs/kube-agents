@@ -135,6 +135,20 @@ readonly MINTER_KEY_ABSENT_PATTERN='NOT_FOUND|SERVICE_DISABLED|has not been used
 readonly HELM_RELEASE_ADDRESS="helm_release.kube_agents"
 readonly AGENT_GSA_ADDRESS="module.kube_agents_iam.google_service_account.agent"
 readonly CHAT_SUBSCRIPTION_ADDRESS="module.chat_pubsub[0].google_pubsub_subscription.chat_events"
+# The drift-pubsub module's three importable resources, adopted by adopt_kms
+# the way the stockout trio is. Their names are constants rather than tfvar
+# reads: the composition passes the module no names, so they are the defaults
+# of topic_name, subscription_name and sink_name in
+# terraform/modules/drift-pubsub/variables.tf, and a default that moves there
+# must move here too. A stale name costs an unadopted resource and a 409 on
+# re-install, never a wrong import, because each address is paired with the
+# one name it can hold.
+readonly DRIFT_TOPIC_ADDRESS="module.drift_pubsub[0].google_pubsub_topic.drift_audit"
+readonly DRIFT_SUBSCRIPTION_ADDRESS="module.drift_pubsub[0].google_pubsub_subscription.drift_audit"
+readonly DRIFT_SINK_ADDRESS="module.drift_pubsub[0].google_logging_project_sink.drift_audit"
+readonly DRIFT_TOPIC_NAME="platform-agent-drift-audit"
+readonly DRIFT_SUBSCRIPTION_NAME="platform-agent-drift-audit-sub"
+readonly DRIFT_SINK_NAME="platform-agent-drift-audit-sink"
 
 #
 # One argument, "readonly", suppresses the bucket creation for `plan`. A plan
@@ -370,6 +384,14 @@ adopt_kms() {
       "google_pubsub_topic.stockout_alerts[0]	pubsub_topic	projects/$project/topics/$stockout_topic"
       "google_pubsub_subscription.stockout_alerts[0]	pubsub_sub	projects/$project/subscriptions/$stockout_sub"
       "google_logging_project_sink.stockout_alerts[0]	logging_sink	projects/$project/sinks/$stockout_sink"
+    )
+  fi
+
+  if [[ "$(tfvar enable_drift_pubsub)" == "true" ]]; then
+    targets+=(
+      "$DRIFT_TOPIC_ADDRESS	pubsub_topic	projects/$project/topics/$DRIFT_TOPIC_NAME"
+      "$DRIFT_SUBSCRIPTION_ADDRESS	pubsub_sub	projects/$project/subscriptions/$DRIFT_SUBSCRIPTION_NAME"
+      "$DRIFT_SINK_ADDRESS	logging_sink	projects/$project/sinks/$DRIFT_SINK_NAME"
     )
   fi
 

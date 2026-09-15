@@ -535,6 +535,12 @@ variable "stockout_pubsub_sink" {
   default     = "gke-stockout-alerts-sink"
 }
 
+variable "enable_drift_pubsub" {
+  description = "Provision the drift detector's audit-log ingress (drift-pubsub module): the GKE audit-log Log Router sink, the drift-audit Pub/Sub topic and pull subscription, and the sink-writer publisher and agent-GSA subscriber/viewer IAM. Exports every GKE cluster in the project (the module's cluster_names default). The module's naming and retention defaults are not re-exposed here. Nothing in the composition consumes the subscription yet; the detector is the consumer."
+  type        = bool
+  default     = false
+}
+
 variable "extra_helm_values" {
   description = "Extra values for the kube-agents Helm release, covering chart settings this composition does not expose as its own variable (telemetry.otlpEndpoint, litellm.otel, the resource blocks, the PlatformAgent harness knobs). Passed as a second values document, so Helm deep-merges it key by key over the ones computed here and anything set wins. Setting a key the composition also computes — platformAgent.harness.clusterName, say — overrides it, which is rarely what you want."
   type        = any
