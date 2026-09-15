@@ -86,7 +86,19 @@ if ! grep -qE "\"${HOST_LABEL}\"[[:space:]]*=[[:space:]]*\"true\"" terraform/exa
 fi
 
 # --- Go toolchain ---------------------------------------------------------
-# Ground truth: k8s-operator/go.mod
+# Two ground truths, because two different things in this repository need Go
+# and they need different versions:
+#   k8s-operator/go.mod                 — the toolchain that builds the operator
+#   scripts/installer/min_versions.sh   — the toolchain install.sh needs to build
+#                                         the Minty CLI for the KMS key import
+#
+# One rule for both cannot be right, and this check used to have one. A single
+# ground truth forces the operator's number onto every sentence about the key
+# import, because any other number there reads as stale — so the prose either
+# states a version the import does not need, or dodges the guard by not
+# writing one. Widening the window to {0,60} sharpened the check for the
+# operator and, in the same stroke, pulled the import's sentences into its
+# reach, which is what made telling the two apart unavoidable.
 GO_MOD_VERSION=$(awk '/^go /{print $2; exit}' k8s-operator/go.mod)
 if [ -z "$GO_MOD_VERSION" ]; then
   echo "ERROR: could not read the go directive from k8s-operator/go.mod." >&2
@@ -94,14 +106,85 @@ if [ -z "$GO_MOD_VERSION" ]; then
 fi
 GO_MINOR=$(printf '%s' "$GO_MOD_VERSION" | cut -d. -f1,2)   # 1.25.8 -> 1.25
 
+MINTY_GO_MINOR=$(awk -F'"' '/^MIN_GO_VERSION=/{print $2; exit}' scripts/installer/min_versions.sh)
+if [ -z "$MINTY_GO_MINOR" ]; then
+  echo "ERROR: could not read MIN_GO_VERSION from scripts/installer/min_versions.sh." >&2
+  exit 1
+fi
+
 # {0,60} rather than {0,20}: at 20 this reached only "Go 1.N+." in the operator
 # development guide. INSTALL.md states it inside a padded table cell and
 # k8s-operator/README.md behind a ~38-character markdown link, so both sat
 # outside the window and a stale version in either passed the check.
-WRONG_GO=$(search 'Go[^0-9]{0,60}1\.[0-9]+\+' | grep -vF "${GO_MINOR}+" || true)
+#
+# `[Gg]o`, because the token minter guide writes the requirement lowercase —
+# "`go` 1.21+", the way you type the binary rather than the way you name the
+# language. A case-sensitive `Go` read straight past that line, which is how
+# the canonical page kept a stale version through three rounds of correcting
+# the pages that defer to it. The word boundaries keep Django and mongo out;
+# without them, case-insensitivity would match any word ending in "go" that
+# happens to precede a version number.
+GO_MENTIONS=$(search '\b[Gg]o\b[^0-9]{0,60}1\.[0-9]+\+')
+
+# Which number a sentence owes is decided by whether it is about the key
+# import. Naming the Minty CLI is the clearest signal, but the install skill
+# stated the requirement as "only needed if performing automated `.pem` import
+# during install" and named no tool, so it read as an operator sentence and
+# kept the operator's number for a path that never builds the operator. The
+# subject matter has to be the test, not the brand name.
+#
+# A single line can owe both: INSTALL.md's prerequisites table states one Go
+# requirement for building the operator and, in the same cell, for importing
+# the key. So the rule is a set rather than one expected string — a line about
+# the import must carry Minty's number and may carry the operator's; any other
+# line must carry the operator's and nothing else. Checking only "does it
+# contain the required number" would let the second number on a shared line go
+# stale unseen, which is the hole splitting this check would otherwise open.
+MINTY_SUBJECT='minty|token[ -]minter|\.pem|private key'
+
+WRONG_GO=""
+while IFS= read -r HIT; do
+  [ -n "$HIT" ] || continue
+
+  # `search` emits `path:line:text`. Classify and version-check the text alone:
+  # the path is not prose and must not vote. It did — every path component is
+  # part of the string, and `docs/…/deploy/token-minter.md` contains
+  # "token-minter", so every Go sentence in the one file most likely to discuss
+  # both toolchains was pre-classified as the import's, whatever it said. An
+  # operator sentence there was failed for "does not state 1.21+".
+  HIT_TEXT=${HIT#*:}        # drop path:
+  HIT_TEXT=${HIT_TEXT#*:}   # drop line:
+
+  if printf '%s\n' "$HIT_TEXT" | grep -qiE "$MINTY_SUBJECT"; then
+    REQUIRED="${MINTY_GO_MINOR}+"
+    ALLOWED="^(${GO_MINOR}|${MINTY_GO_MINOR})\+$"
+    OWED="the Minty CLI import needs MIN_GO_VERSION=${MINTY_GO_MINOR} (scripts/installer/min_versions.sh)"
+  else
+    REQUIRED="${GO_MINOR}+"
+    ALLOWED="^${GO_MINOR}\+$"
+    OWED="building the operator needs go ${GO_MOD_VERSION} (k8s-operator/go.mod)"
+  fi
+
+  REASON=""
+  if ! printf '%s\n' "$HIT_TEXT" | grep -qF "$REQUIRED"; then
+    REASON="does not state ${REQUIRED} — ${OWED}"
+  else
+    STRAY=$(printf '%s\n' "$HIT_TEXT" | grep -oE '1\.[0-9]+\+' | grep -Ev "$ALLOWED" | sort -u | tr '\n' ' ')
+    if [ -n "$STRAY" ]; then
+      REASON="also states ${STRAY}which matches no Go requirement in this repository"
+    fi
+  fi
+
+  if [ -n "$REASON" ]; then
+    WRONG_GO="${WRONG_GO}${HIT}
+  -> ${REASON}
+"
+  fi
+done <<< "$GO_MENTIONS"
+
 if [ -n "$WRONG_GO" ]; then
-  echo "::error::Documented Go version does not match k8s-operator/go.mod (go ${GO_MOD_VERSION}; expected \"${GO_MINOR}+\")."
-  printf '%s\n\n' "$WRONG_GO" | sed 's/^/    /'
+  echo "::error::Documented Go version does not match its source of truth (operator: go ${GO_MOD_VERSION}; Minty CLI: ${MINTY_GO_MINOR}). A line counts as the Minty CLI's when it is about the private-key import."
+  printf '%s\n' "$WRONG_GO" | sed 's/^/    /'
   FAILED=1
 fi
 

@@ -504,6 +504,61 @@ class InstallerCommonTest(unittest.TestCase):
         proc = self._run('hcl_csv_list ""')
         self.assertEqual(proc.stdout, "[]", proc.stderr)
 
+    # ── expand_tilde_path: a ~ the operator's shell never resolved ───────────
+
+    def _run_expand_tilde_path(self, path, home):
+        """Run expand_tilde_path with HOME set to `home`, or unset when None.
+
+        `_run` cannot express this: its overrides only add variables, and an
+        unset HOME is the whole point. An empty HOME would not have caught the
+        bug -- `${path/#\\~/$HOME}` aborted under `set -u` only when HOME was
+        missing outright, which is what a systemd system unit or a container
+        with no passwd entry gives you.
+        """
+        env = get_isolated_test_env(overrides={} if home is None else {"HOME": home})
+        if home is None:
+            env.pop("HOME", None)
+        body = (
+            f"set -u\n{_PRINT_STUBS}\n"
+            f'source "{_INSTALLER_COMMON}"\n'
+            f'expand_tilde_path "{path}"'
+        )
+        return subprocess.run(
+            ["bash", "-c", body],
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=str(_REPO_ROOT),
+        )
+
+    def test_expand_tilde_path_resolves_a_leading_tilde(self):
+        for path, expected in (("~/app.pem", "/home/me/app.pem"), ("~", "/home/me")):
+            with self.subTest(path=path):
+                proc = self._run_expand_tilde_path(path, "/home/me")
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout, expected, proc.stderr)
+
+    def test_expand_tilde_path_leaves_a_path_without_a_tilde_alone(self):
+        # The regression: HOME was read whether or not the pattern matched, so
+        # an ordinary absolute --github-pem-path aborted the caller with
+        # `HOME: unbound variable` wherever HOME was not set.
+        for path in ("/tmp/app.pem", "/tmp/a~b.pem"):
+            with self.subTest(path=path):
+                proc = self._run_expand_tilde_path(path, None)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout, path, proc.stderr)
+                self.assertNotIn("unbound variable", proc.stderr)
+
+    def test_expand_tilde_path_names_the_path_it_cannot_expand(self):
+        # HOME is genuinely needed here and genuinely missing, so this must
+        # fail -- but by the path the operator passed, not by the variable
+        # they never set.
+        proc = self._run_expand_tilde_path("~/app.pem", None)
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertEqual(proc.stdout, "", "no half-expanded path may reach the caller")
+        self.assertIn("HOME is unset", proc.stderr)
+        self.assertIn("~/app.pem", proc.stderr)
+
     # ── write_tfvars_from_state: the API_SERVER_KEY guard ────────────────────
 
     def test_tfvars_generation_without_api_server_key_fails_with_guidance(self):

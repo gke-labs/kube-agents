@@ -144,13 +144,13 @@ identifier appears, add its source here.
 | Kubernetes service-account names | `scripts/installer/common.sh` |
 | GCP service-account names an install creates, release namespace, GKE CMEK key ring and key | `install.defaults.env` |
 | Defaults an install gets for saying nothing (region, cluster, permission set, registry prefix) | `install.defaults.env` |
-| Go toolchain version | `k8s-operator/go.mod` (and `a2a/go.mod`, kept in step) |
+| Go toolchain version | `k8s-operator/go.mod` (and `a2a/go.mod`, kept in step) for building the operator; `scripts/installer/min_versions.sh` (`MIN_GO_VERSION`) for the host that imports the GitHub App key, which builds the Minty CLI and not the operator |
 | A2A wire constants: protocol version, stream names, size thresholds, token grammar | `a2a/lib/envelope.go` and `a2a/lib/topics.go` |
 | The A2A gateway process's env (backend selection, gchat relay and allowlist, display mode, addressee) | `a2a/gateway/config.go` (`FromEnv`) |
 | Credential-proxy relay env vars, audiences, and route roles | reader `agents/platform/scripts/credential_proxy.py` (`serve`, `build_authenticator`, `ROUTE_ROLES`); the audience values are written by `k8s-operator/internal/controller/platformagent_broker_split.go` |
 | The bus principal set: every NATS user the A2A fabric issues or renders, which are static and which authenticate through the callout, and the subject grants each one gets | `k8s-operator/internal/controller/platformagent_a2a_identities.go` (the rendered map and the surviving static users) and `a2a/authcallout/session.go` (the per-session grants, which are in no map) |
 | The bus token contract: the audience a bus token must carry, the path the projected volume delivers it on, and its expiry | `a2a/lib/credentials.go` (client side) and `k8s-operator/internal/controller/platformagent_a2a_callout.go` (what the operator projects); the two must agree or every client is refused at connect |
-| Minimum supported tool versions (`gcloud`) | `scripts/installer/min_versions.sh` |
+| Minimum supported tool versions (`gcloud`, `terraform`, `go`) | `scripts/installer/min_versions.sh` |
 | Toolsets, plugins, and MCP servers of an agent profile | that profile's `config.yaml` (`agents/platform/`, `agents/chat/`, `agents/cluster/`) |
 | Cron job rosters and schedules | `agents/chat/defaults/cron/jobs.json` and `agents/platform/cron/jobs.json` |
 | Persona rules and `§N` section numbering | the profile's `SOUL.md` |
@@ -468,7 +468,7 @@ only what the title does not say.
 | `terraform/modules/gke-cluster/README.md` | Component README | Reusable Terraform module for the GKE cluster hosting Kube-Agents: Autopilot or Standard (`cluster_mode`), existing-cluster mode, optional gVisor pool and CMEK. | Cluster shapes, Workload Identity, CMEK | Infrastructure engineers |
 | `terraform/modules/kube-agents-iam/README.md` | Component README | Reusable Terraform module for provisioning the agent's GSA, Workload Identity binding, and read-only IAM role set. | GCP IAM, Workload Identity, role grants | Infrastructure engineers |
 | `terraform/modules/chat-pubsub/README.md` | Component README | Reusable Terraform module for the Google Chat inbound backend: events topic/subscription, both service-identity registrations, publisher/subscriber IAM. | Chat Pub/Sub, service identities, IAM | Infrastructure engineers |
-| `terraform/modules/github-minter/README.md` | Component README | Reusable Terraform module for the GitHub token-minter identity: minter GSA, Workload Identity binding, import-only KMS signing key (the one-shot PEM import via the Minty CLI is documented there and run by `install.sh`). | Minter GSA, KMS asymmetric key, WI | Infrastructure engineers |
+| `terraform/modules/github-minter/README.md` | Component README | Reusable Terraform module for the GitHub token-minter identity: minter GSA, Workload Identity binding, import-only KMS signing key (links to upstream guide for key import; also run by `install.sh`). | Minter GSA, KMS asymmetric key, WI | Infrastructure engineers |
 | `terraform/modules/gke-backup-plan/README.md` | Component README | Reusable Terraform module for the scheduled Backup for GKE BackupPlan covering the release namespace; opt-in for cost reasons. | BackupPlan, retention, CMEK, cost | Infrastructure engineers |
 | `terraform/modules/drift-pubsub/README.md` | Component README | Reusable Terraform module for the drift detector's audit-log ingress: Log Router sink, drift-audit topic and pull subscription, sink-writer and subscriber IAM; not yet part of the full-install composition. | Audit-log sink, Pub/Sub, writer identity | Infrastructure engineers |
 | `tests/e2e/README.md` | Component README | The pytest E2E suite for the Google Chat integration and its hybrid auth flow (service-account posting + test-account polling via Pub/Sub event injection). | Hybrid auth, Pub/Sub injection, CI setup | CI maintainers |

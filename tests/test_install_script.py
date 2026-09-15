@@ -466,6 +466,142 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
         self.assertIn("RC=2", proc.stdout)
         self.assertIn("--dry-run and --generate-only are different modes and cannot be combined", proc.stdout)
 
+    # ── require_min_go_version: the toolchain that builds the Minty CLI ──────
+
+    def _run_with_go(
+        self,
+        go_stdout,
+        func_call='rc=0; require_min_go_version || rc=$?; echo "rc=$rc"',
+    ):
+        """Run `func_call` with a stub `go` that prints `go_stdout` for any call.
+
+        A stub rather than the host's Go: the check's whole job is to judge a
+        version, so a suite that asked the developer's toolchain would pass or
+        fail by whose machine it ran on.
+        """
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        bin_dir = pathlib.Path(tmp.name) / "bin"
+        bin_dir.mkdir()
+        go = bin_dir / "go"
+        go.write_text(f"#!/usr/bin/env bash\nprintf '%s\\n' '{go_stdout}'\nexit 0\n")
+        go.chmod(0o755)
+        return self._run_install_func(func_call, bin_dir=str(bin_dir))
+
+    def test_a_go_too_old_for_the_minty_cli_is_refused(self):
+        """Debian 12's golang-go, which auto_install_tool happily installs.
+
+        `command -v go` answers for it, so the installer used to call it a
+        success and spend six `retry` attempts on a build that cannot satisfy
+        the CLI's go.mod.
+        """
+        for version in ("go1.18.1", "go1.19.8", "go1.20.14"):
+            with self.subTest(version=version):
+                proc = self._run_with_go(f"go version {version} linux/amd64")
+                self.assertIn("rc=1", proc.stdout, proc.stdout + proc.stderr)
+                self.assertIn("too old", proc.stdout)
+
+    def test_a_go_that_can_fetch_the_toolchain_is_accepted(self):
+        """1.21 is the floor because 1.21 is where toolchain downloads arrived.
+
+        Pinning the CLI's own 1.24 here would refuse 1.22 and 1.23 hosts that
+        fetch 1.24 themselves and build perfectly well.
+        """
+        for version in ("go1.21.0", "go1.22.11", "go1.26.0"):
+            with self.subTest(version=version):
+                proc = self._run_with_go(f"go version {version} linux/amd64")
+                self.assertIn("rc=0", proc.stdout, proc.stdout + proc.stderr)
+                self.assertNotIn("too old", proc.stdout)
+
+    def test_an_unreadable_go_version_warns_instead_of_refusing(self):
+        # The same call the other two checks in min_versions.sh make: a regex
+        # that missed must not be the reason an import is refused, because the
+        # build reports an unusable toolchain anyway.
+        proc = self._run_with_go("go: unknown command")
+        self.assertIn("rc=0", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("Could not determine the Go version", proc.stdout)
+
+    def test_the_go_version_is_read_out_of_the_release_string(self):
+        proc = self._run_with_go(
+            "go version go1.26.0 linux/amd64", func_call="go_core_version"
+        )
+        self.assertEqual(proc.stdout.strip().splitlines()[-1], "1.26.0", proc.stderr)
+
+    def test_every_version_floor_resolves_when_installed_by_curl_pipe_bash(self):
+        """install.sh alone, with no repository beside it — the documented one-liner.
+
+        min_versions.sh cannot be sourced there, so the else arm hand-stubs the
+        floors. The call sites are unguarded, which makes a floor the arm
+        forgets not a skipped check but `command not found`; the caller's
+        `|| return 1` then reports it as the operation failing, on a host where
+        nothing was wrong. require_min_go_version shipped in exactly that state.
+
+        The expected set is read out of install.sh rather than listed here, so
+        a floor added later cannot satisfy this test by being absent from both
+        the else arm and the assertion.
+        """
+        names = sorted(set(re.findall(r"\brequire_min_\w+", _INSTALL_SH.read_text())))
+        self.assertGreaterEqual(len(names), 3, f"expected the known floors, found {names}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            outside = pathlib.Path(tmp) / "outside"
+            outside.mkdir()
+            # The copy is the point: no scripts/installer/ next to it, exactly
+            # as when the script arrives over the wire.
+            (outside / "install.sh").write_text(_INSTALL_SH.read_text())
+            probe = "; ".join(f'echo "{n}=$(type -t {n})"' for n in names)
+            proc = subprocess.run(
+                ["bash", "-c", f'KUBE_AGENTS_SOURCE_ONLY=true source ./install.sh >/dev/null 2>&1; {probe}'],
+                capture_output=True,
+                text=True,
+                stdin=subprocess.DEVNULL,
+                timeout=120,
+                env=get_isolated_test_env(),
+                cwd=str(outside),
+            )
+
+        for name in names:
+            self.assertIn(
+                f"{name}=function",
+                proc.stdout,
+                f"{name} is undefined when install.sh runs outside a checkout; "
+                f"add a stub to the else arm beside the source of min_versions.sh.\n"
+                f"{proc.stdout}\n{proc.stderr}",
+            )
+
+    def test_a_missing_go_neither_refuses_a_dry_run_nor_installs_during_generate_only(self):
+        """Step 8 must not reach auto_install_tool for Go.
+
+        The interview runs inside step 8, which main crosses before both the
+        --dry-run exit and the --generate-only exit. Neither mode imports a
+        key, so neither has any business refusing over a toolchain or putting
+        a package on the operator's machine -- yet auto_install_tool does
+        exactly one of those in each.
+
+        Two halves, because the defect had two: that the call is harmful where
+        it stood, and that it is no longer there.
+        """
+        # Harmful: the refusal is real, and it ends the whole run.
+        proc = self._run_install_func('PARAM_DRY_RUN=true auto_install_tool "go"')
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("Dry-run validation will not install missing tools", proc.stdout)
+
+        # Gone: the surviving call sits where the toolchain is about to be
+        # used, which main reaches only past both exits.
+        body = _INSTALL_SH.read_text().splitlines()
+        start = next(i for i, line in enumerate(body) if line.startswith("import_github_pem() {"))
+        end = next(i for i in range(start + 1, len(body)) if body[i] == "}")
+        sites = [i for i, line in enumerate(body) if 'auto_install_tool "go"' in line]
+        self.assertTrue(sites, "import_github_pem must still be able to install Go")
+        for i in sites:
+            self.assertTrue(
+                start < i < end,
+                f"install.sh:{i + 1} installs Go outside import_github_pem "
+                f"(lines {start + 1}-{end + 1}); step 8 runs before --dry-run "
+                f"and --generate-only exit, so a call there refuses the first "
+                f"mode and mutates the host in the second.",
+            )
+
     def test_parse_args_cluster_mode(self):
         """Verifies parse_args captures --cluster-mode."""
         cmd = 'parse_args --cluster-mode=autopilot; echo "MODE=$PARAM_CLUSTER_MODE"'
@@ -707,6 +843,200 @@ out_dir=""; acquire_source_repo out_dir "{requested_ref}"; echo "RESOLVED=$out_d
         proc = self._run_install_func(cmd)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("LOC=us-east4", proc.stdout)
+
+    def test_parse_args_github_minter_flags(self):
+        cmd = (
+            'parse_args --github-app-id=123456 --github-pem-path=/tmp/app.pem '
+            '--kms-keyring=custom-keyring --kms-key=custom-key; '
+            'echo "APP_ID=$PARAM_GITHUB_APP_ID PEM=$PARAM_GITHUB_PEM_PATH '
+            'KEYRING=$PARAM_KMS_KEYRING KEY=$PARAM_KMS_KEY"'
+        )
+        proc = self._run_install_func(cmd)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(
+            "APP_ID=123456 PEM=/tmp/app.pem KEYRING=custom-keyring KEY=custom-key",
+            proc.stdout,
+        )
+
+    def test_missing_github_pem_path_is_deferred_not_rejected_early(self):
+        """A .pem deleted after a successful import must not abort the early preflight.
+
+        The installer's own docs tell the operator to delete the file once it is
+        in Cloud KMS, and install.env may still name it. Rejecting that path up
+        front makes every later run unusable, so the decision belongs with the
+        KMS lookup that can see the imported key.
+
+        The run is expected to fail -- --dry-run makes the prerequisites step
+        refuse to install the gcloud a sterile PATH cannot provide -- but it
+        must fail *there*, past the PEM preflight, rather than on the missing
+        file. stdin is closed so a regression that reintroduces a prompt fails
+        the test instead of hanging it.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            bin_dir = create_minimal_tools_bin(tmp_dir)
+            test_env = get_isolated_test_env(
+                overrides={
+                    "KUBE_AGENTS_LOCK_FILE": str(self._empty_install_env.parent / "test.lock"),
+                    "PATH": str(bin_dir),
+                },
+            )
+            proc = subprocess.run(
+                [
+                    "bash",
+                    str(_INSTALL_SH),
+                    "--image-tag=0.1.0",
+                    "--dry-run",
+                    "--github-pem-path=/tmp/nonexistent-pem-file-12345.pem",
+                ],
+                capture_output=True,
+                text=True,
+                env=test_env,
+                cwd=str(_REPO_ROOT),
+                stdin=subprocess.DEVNULL,
+                timeout=120,
+            )
+            combined = proc.stdout + proc.stderr
+            self.assertNotIn(
+                "GitHub App private key PEM file does not exist",
+                combined,
+                f"the early preflight must not decide a missing .pem:\n{combined}",
+            )
+            self.assertIn(
+                "Checking Prerequisites",
+                combined,
+                f"the run should have reached the prerequisites step:\n{combined}",
+            )
+
+    def test_the_missing_pem_decision_runs_after_the_kms_helpers_are_sourced(self):
+        """The KMS-aware half of the PEM check must sit below source_provisioning_helpers.
+
+        derive_kms_location and kms_key_enabled_version live in
+        installer_common.sh, and DEFAULT_KMS_KEYRING in install.defaults.env,
+        which a `curl | bash` run has no copy of. Calling either above the
+        sourcing aborts the installer with `command not found` (127) or an
+        unbound variable long before it can print anything useful, and it does
+        so only on the runs that carry a PEM path -- which is why a green suite
+        is not evidence here and this ordering is pinned instead.
+        """
+        body = _INSTALL_SH.read_text()
+
+        # Markers unique to the step 8 block. The bare "PEM file does not exist"
+        # wording is not: validate_non_interactive_minter_config carries it too,
+        # and that function is *defined* above main() while only being *called*
+        # from step 8, so matching on it would compare a definition against a
+        # call site and fail for the wrong reason.
+        sourced_at = body.index('source_provisioning_helpers "$repo_dir"')
+        for marker in (
+            'pem_kms_loc="$(derive_kms_location "$region")"',
+            'pem_enabled_ver="$(kms_key_enabled_version',
+            "has no ENABLED version, so the import still needs that file.",
+        ):
+            self.assertLess(
+                sourced_at,
+                body.index(marker),
+                f"{marker!r} must come after installer_common.sh is sourced",
+            )
+
+    def test_skipping_the_gitops_interview_keeps_the_minter_configuration(self):
+        """"Skip for now" must not empty the four names that gate the minter.
+
+        write_tfvars_from_state enables the minter only when GITOPS_ORG,
+        GITOPS_REPO and GITHUB_APP_ID are all non-empty, so clearing them on
+        the skip arm renders enable_github_minter = false and the apply removes
+        a deployed minter -- its GSA, its Workload Identity binding, and the
+        chart's Deployment, Service, NetworkPolicy and KSA -- on a re-run where
+        the operator only meant to decline the questions.
+        """
+        body = _INSTALL_SH.read_text()
+
+        marker = "GitOps repository connection skipped."
+        arm_start = body.rindex("else", 0, body.index(marker))
+        arm = body[arm_start : body.index(marker)]
+
+        for cleared in (
+            'github_org=""',
+            'github_repo=""',
+            'github_app_id=""',
+        ):
+            self.assertNotIn(
+                cleared,
+                arm,
+                f"the skip arm must not clear {cleared!r}: it disables and removes a deployed minter",
+            )
+
+    def test_preflight_rejects_directory_github_pem_path(self):
+        """Preflight must fail fast when --github-pem-path is a directory instead of a file."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            test_env = get_isolated_test_env(
+                overrides={"KUBE_AGENTS_LOCK_FILE": str(self._empty_install_env.parent / "test.lock")}
+            )
+            proc = subprocess.run(
+                ["bash", str(_INSTALL_SH), "--image-tag=0.1.0", f"--github-pem-path={tmp_dir}"],
+                capture_output=True,
+                text=True,
+                env=test_env,
+                cwd=str(_REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 1, f"Expected exit code 1, got {proc.returncode}:\n{proc.stdout}\n{proc.stderr}")
+            combined = proc.stdout + proc.stderr
+            self.assertIn("not a regular file", combined)
+
+    def test_validate_non_interactive_minter_config(self):
+        """validate_non_interactive_minter_config enforces intent-driven validation."""
+        # 1. No App ID and no PEM path -> succeeds (optional feature omitted)
+        cmd1 = f'{_SOURCE_INSTALLER_COMMON}validate_non_interactive_minter_config "" "" "ring" "key" "us-central1" "p1" ""'
+        proc1 = self._run_install_func(cmd1)
+        self.assertEqual(proc1.returncode, 0, proc1.stderr)
+
+        # 2. PEM path provided, but App ID is missing -> fails fast
+        cmd2 = f'{_SOURCE_INSTALLER_COMMON}validate_non_interactive_minter_config "" "/tmp/key.pem" "ring" "key" "us-central1" "p1" "my-org"'
+        proc2 = self._run_install_func(cmd2)
+        self.assertEqual(proc2.returncode, 1, proc2.stderr)
+        self.assertIn("--github-pem-path was provided, but --github-app-id is missing", proc2.stdout + proc2.stderr)
+
+        # 3. App ID provided, but GitOps organization is missing -> fails fast
+        cmd3 = f'{_SOURCE_INSTALLER_COMMON}validate_non_interactive_minter_config "12345" "" "ring" "key" "us-central1" "p1" ""'
+        proc3 = self._run_install_func(cmd3)
+        self.assertEqual(proc3.returncode, 1, proc3.stderr)
+        self.assertIn("provided in non-interactive mode, but --gitops-org is missing", proc3.stdout + proc3.stderr)
+
+        # 4. App ID provided with org, but no KMS key and no PEM path -> fails fast
+        cmd4 = (
+            f'{_SOURCE_INSTALLER_COMMON}'
+            'kms_key_enabled_version() { echo ""; }; '
+            'validate_non_interactive_minter_config "12345" "" "ring" "key" "us-central1" "p1" "my-org"'
+        )
+        proc4 = self._run_install_func(cmd4)
+        self.assertEqual(proc4.returncode, 1, proc4.stderr)
+        self.assertIn("provided in non-interactive mode, but no ENABLED KMS key exists", proc4.stdout + proc4.stderr)
+
+        # 5. App ID provided with org and existing KMS key version (AOT path) -> succeeds
+        cmd5 = (
+            f'{_SOURCE_INSTALLER_COMMON}'
+            'kms_key_enabled_version() { echo "1"; }; '
+            'validate_non_interactive_minter_config "12345" "" "ring" "key" "us-central1" "p1" "my-org"'
+        )
+        proc5 = self._run_install_func(cmd5)
+        self.assertEqual(proc5.returncode, 0, proc5.stderr)
+
+        # 6. App ID provided with org and valid PEM file path (automated path) -> succeeds
+        with tempfile.NamedTemporaryFile() as tf:
+            cmd6 = (
+                f'{_SOURCE_INSTALLER_COMMON}'
+                'kms_key_enabled_version() { echo ""; }; '
+                f'validate_non_interactive_minter_config "12345" "{tf.name}" "ring" "key" "us-central1" "p1" "my-org"'
+            )
+            proc6 = self._run_install_func(cmd6)
+            self.assertEqual(proc6.returncode, 0, proc6.stderr)
+
+        # 7. App ID provided with existing KMS key version, even if PEM path is non-existent -> succeeds (AOT takes precedence)
+        cmd7 = (
+            f'{_SOURCE_INSTALLER_COMMON}'
+            'kms_key_enabled_version() { echo "1"; }; '
+            'validate_non_interactive_minter_config "12345" "/path/to/deleted.pem" "ring" "key" "us-central1" "p1" "my-org"'
+        )
+        proc7 = self._run_install_func(cmd7)
+        self.assertEqual(proc7.returncode, 0, proc7.stderr)
 
     def test_parse_args_migrate_node_pools(self):
         cmd = 'parse_args --migrate-node-pools; echo "MIGRATE=$PARAM_MIGRATE_NODE_POOLS"'
@@ -3404,7 +3734,7 @@ class UnrecordedInterviewAnswersAreReportedTest(unittest.TestCase):
             for key in (
                 "ALLOWED_USERS", "GOOGLE_CHAT_HOME_CHANNEL", "SLACK_ALLOWED_USERS",
                 "SLACK_HOME_CHANNEL", "SLACK_HOME_CHANNEL_NAME", "GITOPS_ORG",
-                "GITHUB_APP_ID", "GITHUB_PEM_PATH",
+                "GITHUB_APP_ID",
             )
         )
         proc = self._warn(recorded, {})
@@ -3715,6 +4045,68 @@ KUBE_AGENTS_SOURCE_ONLY=true source "{_INSTALL_SH}"
             self.assertIn("installed successfully", proc.stdout)
             logged = log_file.read_text()
             self.assertIn("gcloud components install gke-gcloud-auth-plugin -q", logged)
+
+    def test_auto_install_go_via_brew(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            bin_dir = create_minimal_tools_bin(tmp_path)
+            log_file = tmp_path / "calls.log"
+
+            go_path = bin_dir / "go"
+            brew_bin = bin_dir / "brew"
+            brew_bin.write_text(
+                f"#!/bin/bash\n"
+                f"printf 'brew %s\\n' \"$*\" >> '{log_file}'\n"
+                f"if [ \"$1\" = \"install\" ] && [ \"$2\" = \"go\" ]; then\n"
+                f"  printf '#!/bin/bash\\nexit 0\\n' > '{go_path}'\n"
+                f"  chmod +x '{go_path}'\n"
+                f"fi\n"
+                f"exit 0\n"
+            )
+            brew_bin.chmod(brew_bin.stat().st_mode | stat.S_IEXEC)
+
+            proc = self._run_func(
+                "PARAM_NON_INTERACTIVE=true auto_install_tool go",
+                bin_dir=str(bin_dir),
+                strict_path=True,
+            )
+            self.assertEqual(proc.returncode, 0, f"Failed: {proc.stdout}\n{proc.stderr}")
+            self.assertIn("installed successfully", proc.stdout)
+            logged = log_file.read_text()
+            self.assertIn("brew install go", logged)
+
+    def test_auto_install_go_via_apt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            bin_dir = create_minimal_tools_bin(tmp_path)
+            log_file = tmp_path / "calls.log"
+
+            go_path = bin_dir / "go"
+            apt_bin = bin_dir / "apt-get"
+            apt_bin.write_text(
+                f"#!/bin/bash\n"
+                f"printf 'apt-get %s\\n' \"$*\" >> '{log_file}'\n"
+                f"if [ \"$1\" = \"install\" ] && [ \"$2\" = \"-y\" ] && [ \"$3\" = \"golang-go\" ]; then\n"
+                f"  printf '#!/bin/bash\\nexit 0\\n' > '{go_path}'\n"
+                f"  chmod +x '{go_path}'\n"
+                f"fi\n"
+                f"exit 0\n"
+            )
+            apt_bin.chmod(apt_bin.stat().st_mode | stat.S_IEXEC)
+
+            sudo_bin = bin_dir / "sudo"
+            sudo_bin.write_text('#!/bin/bash\nexec "$@"\n')
+            sudo_bin.chmod(sudo_bin.stat().st_mode | stat.S_IEXEC)
+
+            proc = self._run_func(
+                "PARAM_NON_INTERACTIVE=true auto_install_tool go",
+                bin_dir=str(bin_dir),
+                strict_path=True,
+            )
+            self.assertEqual(proc.returncode, 0, f"Failed: {proc.stdout}\n{proc.stderr}")
+            self.assertIn("installed successfully", proc.stdout)
+            logged = log_file.read_text()
+            self.assertIn("apt-get install -y golang-go", logged)
 
     def test_auto_install_fails_when_tool_remains_missing(self):
         with tempfile.TemporaryDirectory() as tmp:

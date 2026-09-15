@@ -99,3 +99,52 @@ require_min_gcloud_version() {
   print_success "Google Cloud SDK ${found} meets the minimum of ${MIN_GCLOUD_VERSION}."
   return 0
 }
+
+# The Minty CLI is what imports the GitHub App private key into Cloud KMS, and
+# install.sh runs it out of a clone with `go run`. Upstream's go.mod at
+# MINTY_CLI_GIT_TAG declares `go 1.24` — but 1.24 is not the floor here.
+# Automatic toolchain downloads arrived in Go 1.21, so a 1.21 host fetches the
+# 1.24 toolchain itself and the build succeeds. Below 1.21 there is no such
+# mechanism and the build fails outright, which is exactly what `apt-get
+# install golang-go` leaves behind on Debian 12 (1.19) and Ubuntu 22.04 (1.18)
+# — the hosts install.sh's own auto_install_tool targets.
+#
+# So this number is the toolchain mechanism's, not minty's. Pinning 1.24 would
+# refuse a 1.22 host that would have worked.
+#
+# Unrelated to the Go in k8s-operator/go.mod, which is what builds the
+# operator; hack/check-docs-terminology.sh keeps the documented copies of that
+# one in step.
+MIN_GO_VERSION="1.21"
+
+# Echo the Go toolchain version, e.g. "1.26.0", from `go version`
+# ("go version go1.26.0 linux/amd64"). A release candidate prints "go1.21rc1"
+# and yields "1.21", which orders correctly for this comparison.
+go_core_version() {
+  go version 2>/dev/null | sed -n 's/^go version go\([0-9][0-9.]*\).*/\1/p' | head -n1
+}
+
+# Fail unless the installed Go is at least MIN_GO_VERSION.
+#
+# An unreadable version warns rather than errors, for the same reason the two
+# checks above do: `go run` reports a toolchain it cannot satisfy anyway, and
+# refusing an import because a regex missed is the worse failure.
+require_min_go_version() {
+  local found
+  found="$(go_core_version)"
+
+  if [ -z "$found" ]; then
+    print_warning "Could not determine the Go version; skipping the >= ${MIN_GO_VERSION} check (the Minty CLI build reports an unusable toolchain anyway)."
+    return 0
+  fi
+
+  if version_lt "$found" "$MIN_GO_VERSION"; then
+    print_error "Go ${found} is too old to build the Minty CLI; ${MIN_GO_VERSION} or newer is required."
+    print_info "The CLI asks for the Go 1.24 toolchain, and only 1.21 and later can download it on demand."
+    print_info "Distribution packages are often older than this (Debian 12 ships 1.19, Ubuntu 22.04 ships 1.18). Install a current Go from https://go.dev/dl/, or import the key from a host that has one."
+    return 1
+  fi
+
+  print_success "Go ${found} meets the minimum of ${MIN_GO_VERSION}."
+  return 0
+}

@@ -116,7 +116,7 @@ jobs:
       needs.step-1-resolve-candidate.outputs.skip_pipeline != 'true'
     # `inherit` for the reason rc-release-pipeline.yml's step 2 records: the
     # called job declares an `environment:` and reads environment secrets
-    # (GH_APP_ID, GH_APP_PRIVATE_KEY, GEMINI_API_KEY) from it. A `uses:` job
+    # (GH_APP_ID, GEMINI_API_KEY) from it. A `uses:` job
     # cannot declare an environment, so an explicit mapping here resolves at
     # repository scope and forwards empties.
     uses: ./.github/workflows/deploy-environment.yml # zizmor: ignore[secrets-inherit]

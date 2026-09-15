@@ -777,7 +777,7 @@ guard_minter_key() {
 
   warn "enable_github_minter is true, but KMS signing key '$location/$keyring/$key' $reason."
   warn "Applying now would deploy the minter and wedge waiting on its readiness probe."
-  warn "Import the GitHub App private key before applying (see k8s-operator/config/integrations/github/README.md),"
+  warn "Import the GitHub App private key before applying (see https://github.com/abcxyz/github-token-minter),"
   warn "or set enable_github_minter = false in terraform.tfvars."
   exit 1
 }

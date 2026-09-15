@@ -2,6 +2,9 @@
 
 This directory contains the configuration and deployment manifests for integrating the **GitHub Token Minter (Minty)** broker into the cluster. This integration allows agents to securely request short-lived GitHub access tokens without storing long-lived, static credentials, enabling them to safely perform write operations on the Kubernetes infrastructure via GitOps.
 
+- **Upstream Project & Guide:** [`abcxyz/github-token-minter`](https://github.com/abcxyz/github-token-minter)
+- **Operational Model:** **Ahead-Of-Time (AOT)**. Cloud KMS keyrings, asymmetric signing keys, and the GitHub App private key import are pre-provisioned once upfront as durable cloud infrastructure. Because Cloud KMS keys cannot be destroyed or deleted in GCP, once Version 1 is `ENABLED`, it persists permanently across cluster teardowns and redeployments.
+
 ## How It All Works
 
 Minty acts as a secure broker between Google Cloud IAM (Workload Identity) and GitHub. When an agent requires access to a GitHub repository, the following flow occurs:
@@ -31,11 +34,11 @@ This holds regardless of App ID, key, or installation state, so it is worth ruli
 
 Create the GitOps repository under an organization, or transfer an existing repository into one — a free organization suffices. GitHub shares a single namespace between users and organizations, so an organization cannot take the same name as your personal account.
 
-### Setting up the GitHub App
+### Setting up the GitHub App (AOT)
 
-1. Navigate to your GitHub Organization (or personal settings) -> **Developer Settings** -> **GitHub Apps** -> **New GitHub App**.
+1. Navigate to your GitHub Organization (or personal settings) -> **Developer Settings** -> **GitHub Apps** -> **New GitHub App** (see [upstream setup guide](https://github.com/abcxyz/github-token-minter#readme)).
 2. Assign a name and configure the required repository permissions (e.g., `Contents: Read & write`, `Pull requests: Read & write`, `Issues: Read & write`).
-3. Once created, note the **App ID**.
+3. Once created, note the numeric **App ID**.
 4. Scroll down and click **Generate a private key**. This will download a `.pem` file to your local machine.
 5. Navigate to the target repository the agent is intended to manage, go to **Settings** -> **GitHub Apps**, and install the newly created App.
 
@@ -43,12 +46,13 @@ The App may be owned by the organization or by a personal account, but an App cr
 
 ### Provisioning Configuration Variables
 
-To deploy the agent with GitHub integration, `install.sh` collects the details of your GitHub App into `install.env` (and the chart's `githubMinter.*` values through the generated `terraform.tfvars`).
+When configuring the installer or Terraform (`install.env` or `terraform.tfvars`), set the GitOps repository coordinates:
 
 - `GITHUB_APP_ID`: The unique numeric ID of the GitHub App (found in the App's General Settings).
-- `GITHUB_ORG`: The name of the GitHub organization or user account where the repository is hosted.
-- `GITHUB_REPO`: The name of the target repository the agent will manage.
-- `GITHUB_PEM_PATH`: The absolute local file path to the downloaded `.pem` private key file. If provided, the provisioning script will automatically use the Minty CLI to import it into Google Cloud KMS. If omitted, the deployment will proceed but Minty will fail readiness probes until a key is manually imported.
+- `GITOPS_ORG`: The name of the GitHub organization hosting the GitOps repository.
+- `GITOPS_REPO`: The name of the target repository the agent will manage.
+
+When deploying manually via the Kustomize Makefile target (`make deploy-github`), export `GITHUB_ORG` and `GITHUB_REPO` directly in the environment and create the `github-app-credentials` Secret in the target namespace first. Both steps, with the commands, are in [`k8s-operator/README.md`](../../../README.md#deploying-github-integration), which documents this path end to end.
 
 ## Minty Limitations & GSA Tokens
 
@@ -58,52 +62,15 @@ Minty was originally designed for integration with GitHub Actions, which inheren
 - **KSA Tokens are Unsupported:** Native Kubernetes Service Account (KSA) tokens do not support the injection of arbitrary custom claims such as `"repository"`. Consequently, Minty's default validation engine will reject KSA tokens due to the missing claim.
 - **GSA Tokens (The Solution):** To resolve this, Workload Identity is utilized to provide Google Service Account (GSA) OIDC tokens. Minty implements a specific exemption for tokens where the issuer is `https://accounts.google.com`. When processing a Google-issued token, Minty bypasses the `"repository"` claim requirement. Instead, it validates the caller's identity via the `assertion.email` rule and derives the target repository directly from the JSON POST payload.
 
-## Cryptographic Key Import via Minty CLI
+## Cloud KMS Key Provisioning & Key Import
 
-During the install, `install.sh` runs the Minty CLI (a shallow clone of the tag, then `go run ./cmd/minty tools import-pk` — the `go run <module>@v2.7.1` form does not resolve, because upstream's go.mod lacks the `/v2` suffix its v2 tags require) to upload the GitHub `.pem` file to Google Cloud KMS.
+The GitHub Token Minter requires an asymmetric signing key (`rsa-sign-pkcs1-2048-sha256` or `rsa-sign-pkcs1-4096-sha512`) in Google Cloud KMS with your GitHub App private key imported (Version 1 `ENABLED`).
 
-This approach is required due to the cryptographic wrapping prerequisites of the Google Cloud KMS API. Uploading an asymmetric private key natively via the Google Cloud CLI (`gcloud kms keys versions import`) strictly requires that the target key be explicitly converted from PKCS#1 into an unencrypted PKCS#8 format, and necessitates the provisioning of a separate KMS "Import Job" to facilitate secure RSA-OAEP wrapping.
-
-The Minty CLI abstracts this complex cryptographic workflow. It automatically provisions the KMS Import Job, securely reformats the PKCS#1 string into PKCS#8 in-memory, performs the RSA-OAEP wrapping, and uploads the payload securely to KMS, ensuring a robust and standardized key import process.
-
-### Importing Without the Minty CLI
-
-**Skip this unless the automatic import failed.** With a working Go toolchain on the provisioning host the CLI does all of the above for you and there is nothing to do here.
-
-It is worth knowing the recovery path exists, though, because the installer's own advice is circular when Go is the missing piece: it warns `Go is not installed, so the App key cannot be imported automatically` — and the manual command it prints is another `go run …/cmd/minty` invocation. Either way it continues, leaving the KMS key with no enabled version, so the Minter deploys and then never passes its readiness probe.
-
-`gcloud` does the same import in four commands. Run them, then restart the minter Deployment:
-
-```bash
-# 1. PKCS#1 (what GitHub downloads) to unencrypted PKCS#8 DER (what KMS accepts).
-openssl pkcs8 -topk8 -nocrypt -inform PEM -in "${GITHUB_PEM_PATH}" \
-    -outform DER -out /tmp/gh-app-key.p8.der
-
-# 2. An Import Job supplies the RSA-OAEP wrapping key. Its protection level must
-#    match the target key's (the provisioner creates a SOFTWARE key).
-gcloud kms import-jobs create gh-app-key-import \
-    --location="${KMS_LOCATION}" --keyring="${KMS_KEYRING}" \
-    --import-method=rsa-oaep-4096-sha256-aes-256 --protection-level=software \
-    --project="${PROJECT_ID}"
-
-# 3. Wait for it to reach ACTIVE — key generation takes a few seconds.
-gcloud kms import-jobs describe gh-app-key-import \
-    --location="${KMS_LOCATION}" --keyring="${KMS_KEYRING}" \
-    --project="${PROJECT_ID}" --format="value(state)"
-
-# 4. gcloud wraps the key locally and uploads it. CLOUDSDK_PYTHON_SITEPACKAGES=1
-#    is required: without it gcloud reports "Cannot load the Pyca cryptography
-#    library" even when its own interpreter has the module installed.
-CLOUDSDK_PYTHON_SITEPACKAGES=1 gcloud kms keys versions import \
-    --import-job=gh-app-key-import \
-    --location="${KMS_LOCATION}" --keyring="${KMS_KEYRING}" \
-    --key="${KMS_KEY}" --algorithm=rsa-sign-pkcs1-2048-sha256 \
-    --target-key-file=/tmp/gh-app-key.p8.der --project="${PROJECT_ID}"
-
-rm -f /tmp/gh-app-key.p8.der
-```
-
-The version reports `PENDING_IMPORT` briefly before becoming `ENABLED`. Delete the DER file afterwards — unlike the KMS copy, it is raw key material on local disk. Re-running the provisioner then resolves the active version and skips the Minty CLI, because it only attempts an import when no enabled version exists.
+- **Key Coordinates:** By default, `kube-agents` expects the key ring `github-token-minter-keyring` and crypto key `github-token-minter-key` in your cluster's Cloud KMS region (`KMS_LOCATION`).
+- **Permanence:** Cloud KMS key rings and crypto keys cannot be destroyed or deleted in GCP. Once Version 1 is imported and `ENABLED`, it persists permanently across cluster teardowns (`uninstall.sh`) and re-installations.
+- **Import Methods:**
+  - **Option 1 (Automated via `install.sh`):** Pass `--github-pem-path="/path/to/app-private-key.pem"` during install. `install.sh` provisions the key and uses the Minty CLI to import it into Cloud KMS. Once imported, delete the local `.pem` file. Subsequent runs skip the import.
+  - **Option 2 (Pre-provisioned AOT):** Follow the [upstream GitHub Token Minter guide](https://github.com/abcxyz/github-token-minter#readme) and [Google Cloud KMS documentation](https://cloud.google.com/kms/docs/importing-a-key) to provision the key and import the private key before installing (recommended for CI/CD and release automation). Deployments run without `.pem` or Go on the host.
 
 ## Manual Testing
 
