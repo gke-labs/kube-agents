@@ -47,6 +47,14 @@ The rest of the line gets the same treatment, for the same reason. `/agent fix t
 
 Scope is the agent's own pull requests — head branch `platform-agent/*`, minus anything labelled `agent:ignore`.
 
+## Getting an unmergeable PR moving again
+
+A reviewer's comment is one of three things that can stop a PR merging, and the only one somebody has to say out loud. The other two — the branch conflicting with its base, and CI going red on the head commit — happen on their own, and until the [`update-pr`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills/update-pr) skill nothing watched for either. The same poller now reads both conditions on every tick and hands an unmergeable PR to that skill.
+
+It works three stages in a fixed order — resolve the conflict, then answer the reviewers, then fix CI — and pushes one commit per stage. The order is forced: a change a reviewer asked for, applied to a branch that will not merge, is a change nobody can take, and CI on a conflicted branch is testing a tree that will never exist. The reviewer stage is `pr-conversation` run in full rather than a second implementation of it. Stage 1 **merges** `origin/<base>` into the branch and never rebases: a rebase rewrites the commits under review and detaches every inline review comment from the line it was written against, which costs more than the extra merge commit on a branch that is about to be squash-merged.
+
+This is the one path where the agent pushes with nobody having asked, so it is bounded by attempt rather than by permission: one attempt per head commit, five per pull request, both recorded as hidden markers in the thread. Past that it comments and waits for a human. [`docs/designs/pr-update-sweep.md`](https://github.com/gke-labs/kube-agents/blob/main/docs/designs/pr-update-sweep.md) is canonical.
+
 ## The `fleet-audit` skill
 
 Source: [`agents/platform/skills/fleet-audit/`](https://github.com/gke-labs/kube-agents/tree/main/agents/platform/skills/fleet-audit).
