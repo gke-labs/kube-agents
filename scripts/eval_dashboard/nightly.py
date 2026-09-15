@@ -75,10 +75,14 @@ RUNNING_MAX_AGE = datetime.timedelta(hours=9)
 # 9 AM the newest night is at most 13 hours old; 36 hours tolerates one
 # late or re-run night without reading the night before as last night.
 LAST_NIGHT_MAX_AGE = datetime.timedelta(hours=36)
-# Where Prow's Spyglass shows a periodic's build and its artifacts. A
-# presubmit's build lives under pr-logs/pull/<org_repo>/<pr>/; a periodic's
-# under logs/<job>/, with no pull request in the path.
-SPYGLASS_LOGS_ROOT = "https://oss.gprow.dev/view/gs/kube-agents-prow/logs"
+# Where Prow's Spyglass shows a periodic's build and its artifacts. The
+# collector records it per nightly run (``runs[].log_url``, SCHEMA.md) from
+# the build directory it listed, so the link follows whichever bucket the
+# nightly logs to. A nightly record without the field predates it and was
+# read from the bucket the nightly used before 2026-09-15, the cluster
+# default gs://kube-agents-prow; a periodic's build lives under logs/<job>/
+# there, with no pull request in the path.
+LEGACY_SPYGLASS_LOGS_ROOT = "https://oss.gprow.dev/view/gs/kube-agents-prow/logs"
 DEFAULT_NIGHTLY_JOB = "ci-kube-agents-eval-nightly"
 # The per-case transcript hack/ci-eval-pr.sh archives, first repetition
 # (the same object pages.js links for a presubmit run).
@@ -182,8 +186,11 @@ def build_url(run: dict) -> str | None:
     build = run.get("build_id")
     if not isinstance(build, str) or not build.isdigit():
         return None
+    recorded = run.get("log_url")
+    if isinstance(recorded, str) and recorded.startswith("https://"):
+        return recorded
     job = run.get("job") if isinstance(run.get("job"), str) and run.get("job") else DEFAULT_NIGHTLY_JOB
-    return f"{SPYGLASS_LOGS_ROOT}/{job}/{build}"
+    return f"{LEGACY_SPYGLASS_LOGS_ROOT}/{job}/{build}"
 
 
 def transcript_url(run: dict, case: str) -> str | None:
@@ -331,7 +338,7 @@ def running_nights(data: dict, now: datetime.datetime | None) -> list[dict]:
             continue
         if now is not None and now - seen > RUNNING_MAX_AGE:
             continue
-        out.append({"build": build, "first_seen": seen.isoformat(), "log_url": build_url({"build_id": build, "job": job})})
+        out.append({"build": build, "first_seen": seen.isoformat(), "log_url": build_url({"build_id": build, "job": job, "log_url": entry.get("log_url")})})
     out.sort(key=lambda e: int(e["build"]))
     return out
 

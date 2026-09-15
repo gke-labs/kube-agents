@@ -52,13 +52,18 @@ Sources:
               `latest-build.txt` this collector ignores -- so one `gsutil
               ls` of it names every build. Given without a value it is the
               live nightly's prefix (DEFAULT_NIGHTLY_PREFIX); omitted, no
-              nightly scan happens. A prefix that does not list while no
-              night is on record (the job has not run yet) is a note and no
-              nightly runs this scan, not the refusal line below: the
-              nightly is evidence beside the gate, and a missing night must
-              not stop the gate's dashboard from publishing. Once a night is
-              on record, a prefix that stops listing IS the refusal line: a
-              stall, not an absent job.
+              nightly scan happens. A prefix that does not list is read
+              three ways. One that holds no objects (gsutil: "matched no
+              objects") is a job that has not run there yet -- before its
+              first night, or after its bucket moved -- and is a note and
+              no nightly runs this scan whether or not a night is on
+              record, not the refusal line below: the nightly is evidence
+              beside the gate, and a missing night must not stop the gate's
+              dashboard from publishing (a prefix emptied or mistyped reads
+              the same way, and shows as "no night" on the digest and the
+              Nightly page instead). Any other failure with no night on
+              record is the same note. Once a night is on record, any other
+              failure IS the refusal line: a stall, not an absent job.
   --nightly-job  the job name recorded on nightly runs (`runs[].job`);
               defaults to the prefix's last path segment.
   --index-prefix  Prow's per-job directory index, gs://<bucket>/pr-logs/
@@ -150,10 +155,23 @@ SCHEMA_VERSION = 1
 # EVAL_TIER=nightly companion of the presubmit) and where Prow archives it.
 # A periodic's log prefix holds one directory per build and a
 # latest-build.txt, so listing it is the directory index; there is no
-# pointer object to follow.
+# pointer object to follow. The bucket is the nightly's own, not the
+# cluster default gs://kube-agents-prow the presubmit and the RC lane log
+# to: the nightly runs as an identity that cannot write that one (night one
+# died in initupload on a 403), so its job overrides the bucket and
+# github-actions@kube-agents-prow reads it as objectViewer. Only the bucket
+# differs; Prow's path strategy still puts a periodic under logs/<job>/.
 DEFAULT_NIGHTLY_JOB = "ci-kube-agents-eval-nightly"
-PROW_LOGS_ROOT = "gs://kube-agents-prow/logs"
-DEFAULT_NIGHTLY_PREFIX = f"{PROW_LOGS_ROOT}/{DEFAULT_NIGHTLY_JOB}/"
+NIGHTLY_LOGS_ROOT = "gs://kube-agents-evals-nightly-logs/logs"
+DEFAULT_NIGHTLY_PREFIX = f"{NIGHTLY_LOGS_ROOT}/{DEFAULT_NIGHTLY_JOB}/"
+# Where Prow's Spyglass shows a build directory: the gs:// path after the
+# scheme, so a link follows the bucket the build was read from.
+SPYGLASS_VIEW = "https://oss.gprow.dev/view/gs/"
+# What `gsutil ls` says about a prefix that exists but holds nothing yet, as
+# distinct from a bucket or a grant failing (AccessDeniedException,
+# BucketNotFoundException, a timeout): the nightly's prefix reads that way
+# from the day its bucket moves until the first night lands there.
+_NO_OBJECTS = re.compile(r"matched no objects")
 # What a build's job is called, read from the build directory's URL: the
 # segment before the build id, for a presubmit
 # (.../pull/<org_repo>/<pr>/<job>/<build>/) and a periodic
@@ -995,7 +1013,8 @@ def annotate_pr_merged(runs: list[dict], gh: str, now: datetime | None = None) -
 # --------------------------------------------------------------------------
 
 
-def _gsutil(args: list[str], gsutil: str = "gsutil") -> str | None:
+def _gsutil_call(args: list[str], gsutil: str = "gsutil") -> tuple[str | None, str]:
+    """(stdout, stderr) of one gsutil call; stdout None when it failed."""
     try:
         proc = subprocess.run(
             [gsutil, *args],
@@ -1006,10 +1025,14 @@ def _gsutil(args: list[str], gsutil: str = "gsutil") -> str | None:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         print(f"warning: {gsutil} {' '.join(args)}: {exc}", file=sys.stderr)
-        return None
+        return None, str(exc)
     if proc.returncode != 0:
-        return None
-    return proc.stdout
+        return None, proc.stderr
+    return proc.stdout, proc.stderr
+
+
+def _gsutil(args: list[str], gsutil: str = "gsutil") -> str | None:
+    return _gsutil_call(args, gsutil)[0]
 
 
 _PR_IN_PATH = re.compile(r"/pull/[^/]+/(\d+)/")
@@ -1094,6 +1117,16 @@ def _gcs_reader(base: str, gsutil: str):
     return reader
 
 
+def spyglass_url(base: str) -> str | None:
+    """Spyglass's page for the build directory at gs:// URL `base`, or None
+    for anything that is not one. The nightly's runs and pending entries
+    carry it (`log_url`) so the report links follow the bucket the build was
+    listed in rather than a bucket the renderer assumes."""
+    if not isinstance(base, str) or not base.startswith("gs://"):
+        return None
+    return SPYGLASS_VIEW + base[len("gs://"):].rstrip("/")
+
+
 def _read_build(
     build_id: str,
     base: str,
@@ -1128,6 +1161,8 @@ def _read_build(
     if run is None:
         print(f"note: build {build_id}: no finished.json; skipping", file=sys.stderr)
         return build_id, None, _UNFINISHED
+    if tier == tiers.TIER_NIGHTLY:
+        run["log_url"] = spyglass_url(base)
     return build_id, run, _RECORDED
 
 
@@ -1329,21 +1364,25 @@ def runs_from_periodic(
     build and the watermark filter runs on it directly; there is no pointer
     to resolve. Every run comes back tagged tier `nightly`, `pr` null and
     `job` = `job` (default: the prefix's last segment). A prefix that does
-    not list is read two ways. With no nightly on record yet (no watermark)
-    the job may simply not have run, and the nightly must never be what
-    stops the gate's dashboard publishing, so that is a note and no runs,
-    deliberately NOT the `warning: gsutil ls ... failed` line the refresh
-    workflow refuses on. Once a night IS on record, a prefix that listed
-    yesterday and does not today is the bucket or the grant failing, and
-    republishing would freeze the nightly record under a fresh generated_at
-    with nothing said -- so that one is the warning line. A listing that
-    hangs past GSUTIL_TIMEOUT_S is the warning line either way.
+    not list is read three ways. A prefix with no objects (gsutil says so:
+    "matched no objects") is a job that has not run there yet -- before its
+    first night, or after its bucket moved while nights from the old one are
+    on record -- and the nightly must never be what stops the gate's
+    dashboard publishing, so that is a note and no runs, deliberately NOT
+    the `warning: gsutil ls ... failed` line the refresh workflow refuses
+    on. Any other failure with no nightly on record (no watermark) is the
+    same note: the job may simply not exist yet. Once a night IS on record,
+    a prefix that listed yesterday and fails today for any other reason is
+    the bucket or the grant failing, and republishing would freeze the
+    nightly record under a fresh generated_at with nothing said -- so that
+    one is the warning line. A listing that hangs past GSUTIL_TIMEOUT_S is
+    the warning line either way.
     """
     prefix = prefix.rstrip("/") + "/"
     job = job or prefix.rstrip("/").rsplit("/", 1)[-1]
-    listing = _gsutil(["ls", prefix], gsutil)
+    listing, stderr = _gsutil_call(["ls", prefix], gsutil)
     if listing is None:
-        if after_build is not None:
+        if after_build is not None and not _NO_OBJECTS.search(stderr or ""):
             print(
                 f"warning: gsutil ls failed for {prefix}; the nightly record is not"
                 " refreshed this scan",
@@ -1663,6 +1702,9 @@ def collect(
     # pending_builds entry carries the tier, so a consumer whose columns are
     # the presubmit's (the Grid) can keep a night in flight off them.
     nightly_pending: set[str] = set()
+    # And where each of those sits, as Spyglass shows it: the prior's entry
+    # when it carried one, else the prefix this scan listed the build under.
+    nightly_pending_urls: dict[str, str] = {}
     # One watermark per source. Prow's build ids are one global sequence
     # ordered by start, so the newest presubmit id (dozens of builds a day)
     # is normally above every nightly id (one a day); the newest id on
@@ -1685,11 +1727,11 @@ def collect(
                     )
                 else:
                     retry[build_id] = first_seen
-            nightly_pending.update(
-                entry["build_id"]
-                for entry in (prior_data.get("pending_builds") if isinstance(prior_data.get("pending_builds"), list) else [])
-                if isinstance(entry, dict) and entry.get("build_id") in retry and tiers.is_nightly(entry)
-            )
+            for entry in prior_data.get("pending_builds") if isinstance(prior_data.get("pending_builds"), list) else []:
+                if isinstance(entry, dict) and entry.get("build_id") in retry and tiers.is_nightly(entry):
+                    nightly_pending.add(entry["build_id"])
+                    if isinstance(entry.get("log_url"), str):
+                        nightly_pending_urls[entry["build_id"]] = entry["log_url"]
         # No usable prior -- or a prior that yields no numeric watermark --
         # means the incremental scan cannot resume, and an unbounded cold
         # sweep is ~3 gsutil calls per archived build. Bound the recovery
@@ -1764,6 +1806,8 @@ def collect(
             job=nightly_job,
         )
         nightly_pending |= unfinished - listed_before
+        for build_id in unfinished - listed_before:
+            nightly_pending_urls.setdefault(build_id, spyglass_url(nightly_prefix.rstrip("/") + f"/{build_id}/"))
         fresh.extend(nightly_fresh)
     if merge_with is not None:
         print(
@@ -1810,6 +1854,7 @@ def collect(
                 "build_id": build_id,
                 "first_seen": pending[build_id],
                 **({tiers.TIER_KEY: tiers.TIER_NIGHTLY} if build_id in nightly_pending else {}),
+                **({"log_url": nightly_pending_urls[build_id]} if nightly_pending_urls.get(build_id) else {}),
             }
             for build_id in sorted(pending, key=int)
         ]

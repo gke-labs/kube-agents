@@ -23,11 +23,13 @@ name: CI Health (dashboard refresh + presubmit gate adjudicator)
 #   A. Collect runs as github-actions@kube-agents-prow. It is the only
 #      account with a read grant on gs://kube-agents-prow (the OSS Prow
 #      project's bucket; the grant cannot be copied from here). It reads the
-#      archive and the prior data.json and writes the merged data.json to
-#      the runner's disk. It writes nothing to any bucket. A read grant for
-#      the dedicated publisher has been requested from the OSS Prow owners;
-#      once it lands, this step switches account and the job is
-#      single-identity.
+#      archive, the nightly's own bucket gs://kube-agents-evals-nightly-logs
+#      (kube-agents-owned; it holds objectViewer there too, and whichever
+#      account replaces it needs the same) and the prior data.json, and
+#      writes the merged data.json to the runner's disk. It writes nothing
+#      to any bucket. A read grant for the dedicated publisher has been
+#      requested from the OSS Prow owners; once it lands, this step
+#      switches account and the job is single-identity.
 #   B. Everything else runs as eval-dashboard-publisher@kube-agents-prow --
 #      the dedicated publisher hack/ci-eval-pr.sh names for this bucket. It
 #      holds roles/storage.objectUser on gs://kube-agents-dashboards and is
@@ -119,16 +121,19 @@ env:
   CI_HEALTH_MUTE: ${{ vars.CI_HEALTH_MUTE || 'false' }}
   # collect.py's inputs, the same values hack/ci-dashboard-refresh.sh uses:
   # the smoke-test presubmit's archive, the nightly periodic's log prefix
-  # (same bucket, so the reader's grant already covers it; until the
-  # periodic exists the prefix lists nothing, which collect.py notes and
-  # carries on -- it is not the refusal line below until a night is on
-  # record, after which a prefix that stops listing is), the bound collect.py
+  # (its own bucket, gs://kube-agents-evals-nightly-logs, since the nightly's
+  # identity cannot write the cluster default; the collect step's
+  # github-actions@kube-agents-prow holds objectViewer on it. Until a night
+  # lands there the prefix holds no objects, which collect.py notes and
+  # carries on -- with or without a night on record from the old bucket; a
+  # prefix that fails to list for any other reason once a night is on
+  # record is the refusal line below), the bound collect.py
   # applies to a prior it finds unusable (a corrupt download; a missing one
   # stops the step before collect.py runs), and the freshness-badge
   # threshold written into data.json (this job's 15m cadence with slack for
   # ~2 missed ticks).
   PR_GLOB: gs://kube-agents-prow/pr-logs/pull/gke-labs_kube-agents/*/pull-kube-agents-smoke-test/*
-  NIGHTLY_PREFIX: gs://kube-agents-prow/logs/ci-kube-agents-eval-nightly/
+  NIGHTLY_PREFIX: gs://kube-agents-evals-nightly-logs/logs/ci-kube-agents-eval-nightly/
   # The release-candidate lane's archive. A postsubmit, so logs/ rather than
   # pr-logs/. Bounded by --rc-limit rather than by the presubmit watermark.
   RC_GLOB: gs://kube-agents-prow/logs/post-kube-agents-eval-rc/*
@@ -216,7 +221,7 @@ jobs:
           # attempt (header). Seed once by hand and the next tick is
           # incremental.
           if ! gsutil -q cp "$DASHBOARD_BUCKET/data.json" work/prior-data.json; then
-            echo "::error::no published data.json at $DASHBOARD_BUCKET/data.json; this job runs the incremental path only. Seed the bucket once with: EVAL_DASHBOARD_TARGET=$DASHBOARD_BUCKET/ JOB_TYPE=periodic EVAL_DASHBOARD_TIMEOUT=3600 ./hack/ci-dashboard-refresh.sh (from a machine whose account can read gs://kube-agents-prow and write the bucket)"
+            echo "::error::no published data.json at $DASHBOARD_BUCKET/data.json; this job runs the incremental path only. Seed the bucket once with: EVAL_DASHBOARD_TARGET=$DASHBOARD_BUCKET/ JOB_TYPE=periodic EVAL_DASHBOARD_TIMEOUT=3600 ./hack/ci-dashboard-refresh.sh (from a machine whose account can read gs://kube-agents-prow and gs://kube-agents-evals-nightly-logs and write the bucket)"
             exit 1
           fi
           timeout "$COLLECT_TIMEOUT_S" python3 scripts/eval_dashboard/collect.py \
