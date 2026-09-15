@@ -173,6 +173,53 @@ func TestBuildConfigMap(t *testing.T) {
 	}
 }
 
+// The SQLite journal mode follows the agent pod's runtime class (#610). Under
+// gVisor the data volume is a 9p gofer mount that accepts WAL and then corrupts
+// it, and Hermes' own DELETE fallback never fires there. The leaf is rendered
+// into the managed scope because it is machine-global by nature — every
+// profile's state.db and the shared kanban.db sit on the same mount — and it is
+// rendered ONLY under a runtime class, so a default install's managed config
+// stays byte-identical and its databases stay in WAL.
+func TestManagedConfigPinsJournalModeUnderARuntimeClass(t *testing.T) {
+	withRuntimeClass := newTestPlatformAgent()
+	withRuntimeClass.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+		Availability: &agentv1alpha1.AvailabilitySpec{RuntimeClassName: ptr.To("gvisor")},
+	}
+	var cfg map[string]any
+	if err := yaml.Unmarshal([]byte(buildConfigMapData(withRuntimeClass, nil)[managedConfigKey]), &cfg); err != nil {
+		t.Fatalf("managed config does not parse as YAML: %v", err)
+	}
+	database, _ := cfg["database"].(map[string]any)
+	if got := database["journal_mode"]; got != "delete" {
+		t.Errorf("runtimeClassName gvisor: database.journal_mode = %v, want delete; the pod's "+
+			"SQLite stays in WAL on a gofer mount", got)
+	}
+
+	for name, agent := range map[string]*agentv1alpha1.PlatformAgent{
+		"no deployment spec": newTestPlatformAgent(),
+		"availability without a runtime class": func() *agentv1alpha1.PlatformAgent {
+			a := newTestPlatformAgent()
+			a.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+				Availability: &agentv1alpha1.AvailabilitySpec{Replicas: ptr.To(int32(1))},
+			}
+			return a
+		}(),
+		"an empty runtime class": func() *agentv1alpha1.PlatformAgent {
+			a := newTestPlatformAgent()
+			a.Spec.Deployment = &agentv1alpha1.DeploymentSpec{
+				Availability: &agentv1alpha1.AvailabilitySpec{RuntimeClassName: ptr.To("")},
+			}
+			return a
+		}(),
+	} {
+		if content := buildConfigMapData(agent, nil)[managedConfigKey]; strings.Contains(content, "database:") ||
+			strings.Contains(content, "journal_mode") {
+			t.Errorf("%s: the managed config pins a journal mode, so a default install's "+
+				"databases leave WAL for no reason:\n%s", name, content)
+		}
+	}
+}
+
 // The memory subtree is no longer rendered into the managed scope: it is
 // profile-shaped (the front door's per-user provider is exactly what a
 // kanban-spawned specialist must not get), and the scope is machine-global. The
