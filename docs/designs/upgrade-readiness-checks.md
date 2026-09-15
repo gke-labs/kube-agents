@@ -34,7 +34,7 @@ and never upgrades a cluster.
 
 ## How it is delivered
 
-The checks are one capability on the
+The checks are one capability — an audit — on the
 [capability delivery vehicle](capability-delivery-vehicle.md), which gives them five properties
 without any of them being built here: they ship **pre-defined** with the agent; they run
 **scheduled** as a weekly job; they are **triggerable** from chat at any time, for the whole fleet

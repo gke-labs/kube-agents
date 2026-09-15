@@ -37,7 +37,7 @@ fleet and reports a finding and never changes a cluster.
 
 ## How it is delivered
 
-The checks are one capability on the
+The checks are one capability — an audit — on the
 [capability delivery vehicle](capability-delivery-vehicle.md), which gives them five properties
 without any of them being built here: they ship **pre-defined** with the agent; they run
 **scheduled** as cron jobs, one per section at its own cadence; they are **triggerable** from chat
