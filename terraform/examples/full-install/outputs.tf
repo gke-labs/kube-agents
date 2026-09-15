@@ -95,6 +95,21 @@ output "stockout_pubsub_sink" {
   value       = try(google_logging_project_sink.stockout_alerts[0].name, null)
 }
 
+output "drift_pubsub_topic" {
+  description = "Pub/Sub topic the drift audit-log sink publishes to (null when enable_drift_pubsub is false)"
+  value       = try(module.drift_pubsub[0].topic_name, null)
+}
+
+output "drift_pubsub_subscription" {
+  description = "Pub/Sub pull subscription the drift detector reads from (null when enable_drift_pubsub is false)"
+  value       = try(module.drift_pubsub[0].subscription_name, null)
+}
+
+output "drift_pubsub_subscription_id" {
+  description = "Fully-qualified drift subscription path, projects/<project>/subscriptions/<name>, the value the drift detector's --subscription flag takes (null when enable_drift_pubsub is false)"
+  value       = try(module.drift_pubsub[0].subscription_id, null)
+}
+
 output "scoped_service_accounts" {
   description = "Map from GKE resource name to the service account for that cluster. The key is what the credential broker matches on, so the two are directly comparable. The accounts hold no IAM grant as of 2026-08-12; see scoped_pool.tf."
   value       = module.kube_agents_iam.scoped_service_accounts

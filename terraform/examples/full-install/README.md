@@ -61,6 +61,11 @@ install without the interview.
   backend and `AgentPlugin/gkestockoutinvestigator`: Pub/Sub topic (`stockout_pubsub_topic`),
   subscription (`stockout_pubsub_subscription`), Cloud Logging project sink
   (`stockout_pubsub_sink`), and publisher IAM binding.
+- Optionally (`enable_drift_pubsub = true`) the drift detector's audit-log
+  ingress ([`drift-pubsub`](../../modules/drift-pubsub) module): a Log Router
+  sink exporting GKE audit logs, the drift-audit Pub/Sub topic and pull
+  subscription, and the sink-writer and agent-GSA IAM on them. See
+  [Drift audit-log ingress](#drift-audit-log-ingress).
 - Optionally (`model_provider = "vertex_ai"`) the Vertex AI / Model Garden path:
   a second [`kube-agents-iam`](../../modules/kube-agents-iam) instantiation for
   the gateway's service account, `roles/aiplatform.user` on
@@ -555,6 +560,34 @@ uninstall its standalone release before setting these variables (`helm uninstall
 `helm uninstall gkestockoutinvestigator -n <namespace>`). Helm checks object ownership metadata
 (`meta.helm.sh/release-name`) and refuses to adopt existing resources owned by another release.
 
+### Drift audit-log ingress
+
+`enable_drift_pubsub = true` (default `false`) instantiates the
+[`drift-pubsub`](../../modules/drift-pubsub) module: a Log Router sink that
+exports mutating GKE audit-log calls, the `platform-agent-drift-audit` topic,
+the `platform-agent-drift-audit-sub` pull subscription, `roles/pubsub.publisher`
+on the topic for the sink's writer identity, and `roles/pubsub.subscriber` plus
+`roles/pubsub.viewer` on the subscription for the agent's GSA. It also adds
+`pubsub.googleapis.com` to the enabled APIs. Only the module's two required
+inputs are passed, so its defaults decide the names, the 31-day retention and
+the cluster scope, which is every GKE cluster in the project; a caller that
+needs the module's other knobs instantiates it directly.
+
+Three outputs, each `null` while the flag is off: `drift_pubsub_topic`,
+`drift_pubsub_subscription`, and `drift_pubsub_subscription_id`, the
+fully-qualified path the drift detector's `--subscription` flag takes.
+
+The subscription is the input to the drift detector of
+[`docs/designs/drift-detection.md`](../../../docs/designs/drift-detection.md),
+which is not part of this composition yet, so nothing consumes it. Turned on
+ahead of the detector, the sink publishes every mutating call on every GKE
+cluster in the project (about 60k messages a day after the module's lease
+filter, per its README) into a subscription that retains them for 31 days and
+never expires: Pub/Sub storage cost and a backlog, not a running feature.
+`lifecycle.sh apply` adopts a topic, subscription or sink of those names left
+behind by an earlier install before applying, the way it adopts the stockout
+trio, so a re-install does not 409 on them.
+
 **Manual steps that no IaC can perform** — canonical walkthrough:
 [INSTALL.md § Enable Google Chat & Slack Integrations](../../../INSTALL.md#step-5-enable-google-chat--slack-integrations-manual-required-steps):
 
@@ -585,8 +618,8 @@ module "gke_cluster" {
 }
 ```
 
-(and likewise for `kube-agents-iam`, `chat-pubsub`, `github-minter`, and
-`gke-backup-plan`), and
+(and likewise for `kube-agents-iam`, `chat-pubsub`, `github-minter`,
+`gke-backup-plan`, and `drift-pubsub`), and
 would install the chart from the OCI registry rather than a local path — see
 the [chart README](../../../charts/kube-agents/README.md).
 

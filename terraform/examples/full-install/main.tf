@@ -14,7 +14,7 @@ locals {
     "gkebackup.googleapis.com",
     "developerknowledge.googleapis.com",
   ]
-  pubsub_apis = (var.enable_google_chat || var.enable_pubsub_platform || var.enable_stockout_investigator) ? [
+  pubsub_apis = (var.enable_google_chat || var.enable_pubsub_platform || var.enable_stockout_investigator || var.enable_drift_pubsub) ? [
     "pubsub.googleapis.com",
   ] : []
   chat_apis = var.enable_google_chat ? [
@@ -339,6 +339,21 @@ module "chat_pubsub" {
   agent_service_account_email = module.kube_agents_iam.service_account_email
   topic_name                  = var.chat_topic_name
   subscription_name           = var.chat_subscription_name
+
+  depends_on = [google_project_service.required]
+}
+
+# The drift detector's audit-log ingress: Log Router sink, drift-audit topic
+# and pull subscription, and the sink-writer and detector IAM. Only the two
+# required inputs are passed, so the module's defaults decide the names, the
+# retention and the cluster scope (every GKE cluster in the project). The
+# detector that consumes the subscription is not part of this composition yet.
+module "drift_pubsub" {
+  source = "../../modules/drift-pubsub"
+  count  = var.enable_drift_pubsub ? 1 : 0
+
+  project_id                     = var.project_id
+  detector_service_account_email = module.kube_agents_iam.service_account_email
 
   depends_on = [google_project_service.required]
 }

@@ -123,6 +123,12 @@ api_server_key = "REPLACE_WITH_A_STRONG_RANDOM_KEY"
 # enable_pubsub_platform       = true
 # enable_stockout_investigator = true
 
+# Optional drift audit-log ingress: the Log Router sink, drift-audit Pub/Sub
+# topic and pull subscription the drift detector will read. Exports every GKE
+# cluster in the project, and nothing consumes the subscription yet -- see the
+# README before turning it on.
+# enable_drift_pubsub = true
+
 # IAM. "read-only" (default) selects the bundle the composition grants;
 # "custom" requires project_roles. An explicit project_roles list overrides
 # permission_set either way. There is no admin bundle -- widening access
