@@ -1476,7 +1476,7 @@ TASKS=(
   # "./tasks/upgrades-fleet-readiness-exclusion/task.yaml"
   #
   # The deprecation scan of the linked GitOps repository (#1412, the same
-  # skill's Phase-4 case). Same hold as the two above, by the maintainer's
+  # skill's Phase-4 case). Same hold as the three above, by the maintainer's
   # call on the #1412 review: commented out pending #1254. Its eval loop was
   # not run (`validated: false`): the only install its author could reach
   # links no GitOps repository, so the scan there reads nothing and a run

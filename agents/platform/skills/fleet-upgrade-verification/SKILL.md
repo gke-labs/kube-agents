@@ -193,6 +193,7 @@ as a read failure for that member and sets exit code 1, like a failed gcloud rea
 maintenance and skew rules are still graded, and the other members are unaffected. `--at` with a
 value that is not RFC 3339, or `--at` or `--kubeconfig-dir` without `--readiness`, is a usage
 error (exit 2).
+
 ## Scan the GitOps manifests
 
 ```bash
