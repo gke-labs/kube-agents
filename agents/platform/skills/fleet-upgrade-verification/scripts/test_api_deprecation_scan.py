@@ -533,6 +533,22 @@ class MainTest(unittest.TestCase):
         self.assertEqual(ensure.call_args.kwargs["lease"], "api-deprecation-scan-session-7")
 
 
+    def test_repo_that_is_not_a_slug_is_refused_before_any_read(self):
+        # workspace_path joins the name under the lease directory after checking
+        # only that owner and name are non-empty, so a name carrying `..` would
+        # aim ensure_workspace(reset=True) at a tree outside the scan's lease.
+        for repo in ("acme/../../etc", "acme", "../x", "acme/infra;rm", "acme/infra.git"):
+            with self.subTest(repo=repo), patch.object(scan, "content_mode_available") as probe, patch.object(
+                scan.gitops_workspace, "ensure_workspace"
+            ) as ensure:
+                rc, out, err = self.run_main(["--repo", repo, "--current-version", "1.24", "--target-version", "1.27"])
+            self.assertEqual(rc, scan.EXIT_USAGE)
+            self.assertIn("--repo", err)
+            self.assertIn(repr(repo), err)
+            self.assertEqual(out, "")
+            probe.assert_not_called()
+            ensure.assert_not_called()
+
 class ScanLeaseTest(unittest.TestCase):
     def test_explicit_lease_is_used_as_given(self):
         self.assertEqual(scan.scan_lease("my lease"), "my-lease")

@@ -803,6 +803,17 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"--target-version {target_text!r} is not MAJOR.MINOR[.PATCH][-gke.BUILD]\n")
         return EXIT_USAGE
 
+    # A --repo that is not owner/name is refused before anything reads it. The
+    # managed_repos default is built by extract_github_slug and can only yield a
+    # parsed slug, but --repo reaches workspace_path as typed, which joins the
+    # name under the lease directory after checking only that owner and name
+    # are non-empty: a name carrying `..` would point ensure_workspace(reset=True)
+    # at a tree outside the scan's lease. The same guard the sibling scripts apply.
+    for repo in args.repo or []:
+        if not gitops_workspace.is_valid_repo_slug(repo):
+            sys.stderr.write(f"--repo {repo!r} is not an owner/name slug\n")
+            return EXIT_USAGE
+
     endpoint = proxy_endpoint()
     # The broker is asked only when a repository will be read: a --manifests-dir
     # run on a workstation has no broker to ask.
