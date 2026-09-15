@@ -159,9 +159,11 @@ table below. Security's second case, `security-overgrant-remediation-proposal`, 
 rule and holds a presubmit seat (#1066, 2026-09-01). The fleet-audits and incident-triage second
 cases are authored alongside these two. The audits that were once candidates for reactivation in
 presubmit (`stockout-pinned-pool`, `consistency-drift-outlier`, `upgrade-readiness-lagging-cluster`)
-already run nightly and were not reactivated (the table above). **`fleet-cost-idle-pool` stays
-parked**: its A3 date gate re-arms pool-wide on every project onboarding or fixture replant,
-which is structural flakiness, not a wait.
+already run nightly and were not reactivated (the table above). **`fleet-cost-idle-pool` runs
+nightly since 2026-09-15 and takes no presubmit seat**: its A3 date gate re-arms pool-wide on
+every project onboarding or fixture replant, so the disk half of its objective fails whenever
+the pool is younger than thirty days, which is structural flakiness in a presubmit and a record
+the nightly can show.
 
 | Case                       | Domain           | What it grades that the domain's active case does not                                                                                                 | Status                                                                                                                                                                            |
 | -------------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
