@@ -54,6 +54,40 @@ terraform.tfvars.json
 build/
 *.tgz
 
+# Go build output left in a working directory. A build without -o writes the
+# executable next to wherever it was run, and that lands in one of two places:
+# the module root, from `go build ./cmd/<name>` or from `go build cmd/main.go`
+# (k8s-operator's Makefile passes -o bin/manager, so only dropping the flag
+# produces k8s-operator/main); or inside the package, from the in-place form
+# k8s-operator/cmd/k8s-event-watcher/README.md documents. Either leaves tens of
+# megabytes for `git add -A` to offer, so both locations are listed for every
+# package that can reach them.
+#
+# Full paths rather than bare names. A pattern with no slash matches at every
+# depth, so a bare `a2a` would ignore the a2a/ module itself and a bare
+# `k8s-event-watcher` its source directory; the slash anchors each pattern to
+# this file's directory, the repo root.
+#
+# Two things deliberately absent. `go build ./...` needs no rule at all: given
+# more than one package it discards the binaries, which is why `make verify`
+# uses it. And a2a/authcallout, gateway, hermes-bridge and worker-adapter have
+# no module-root entry because a same-named directory already occupies a2a/ and
+# go refuses to overwrite it -- only their in-package copies are reachable.
+k8s-operator/main
+k8s-operator/k8s-event-watcher
+k8s-operator/cmd/k8s-event-watcher/k8s-event-watcher
+a2a/a2a
+a2a/cmd/a2a/a2a
+a2a/cmd/authcallout/authcallout
+a2a/cmd/gateway/gateway
+a2a/cmd/hermes-bridge/hermes-bridge
+a2a/cmd/worker-adapter/worker-adapter
+
+# drift-detector's sources arrive with #1594. The rules precede them on purpose:
+# they match nothing until that merges, and the binary is never offered after.
+k8s-operator/drift-detector
+k8s-operator/cmd/drift-detector/drift-detector
+
 # Per-developer Claude Code state (session settings). The shared
 # slash commands in .claude/commands/ and the review skills in .agents/skills/
 # are committed; .claude/settings.json and .claude/settings.local.json stay
