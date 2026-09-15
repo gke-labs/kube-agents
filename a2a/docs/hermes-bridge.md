@@ -104,8 +104,12 @@ ack just redelivers), `working` when the subprocess spawns, the stdout as a `res
 artifact (chunked if large), one terminal `status-update` with `final: true`. A nonzero
 exit is terminal `failed` with the exit code and a stderr tail in the status message. A
 submission with no text parts is terminal `rejected`. New-task detection is the
-dispatcher's rule: empty `…events` subject means new; anything on `…in` for a task with
-a terminal event is acked with a warning and nothing else.
+dispatcher's rule, and 9/9 widened it: BOTH event subjects empty means new, not `…events`
+alone (profiles spec). The bridge still reads `…events` only, and that is a real gap now
+rather than a spelling difference - the gateway's supervisor grant is an addressee
+wildcard, so a platform task CAN carry a terminal on `…supervisor` and nothing on
+`…events`, and the bridge would read that as a new task and run it again. Anything on
+`…in` for a task with a terminal event is acked with a warning and nothing else.
 
 **Steering:** `hermes chat -Q -q` is one-shot - there is no stdin to inject into. A
 follow-up message to a running task is acked and answered with a non-final status
@@ -122,8 +126,21 @@ matching the profile's `activeDeadlineSeconds`) takes the same kill path and lan
 
 ## Supervision
 
-The bridge is its own janitor, per the ratified split - every task's supervisor is the
-component that spawned its execution. Two failure classes:
+The bridge finalizes its own orphans, which is not the same as being their supervisor.
+The ratified split says every task's supervisor is the component that spawned its
+execution; the bridge spawned its own execution, so there is no separate supervisor to
+be - and no supervisor WRITE either.
+
+**It is not a supervisor principal, and 9/9's subject split does not move it.** The
+gateway spawns session pods and finalizes tasks it did not execute, so it publishes on
+`…supervisor`, a subject no executor reaches. The bridge is the executor. When it
+finalizes an orphan it is finishing its OWN task across a restart, as itself, so its
+terminal stays on `…events` where every other event it writes goes, and its `from`
+agrees with that subject like any executor's. Profile-addressed tasks have no
+supervisor ROLE until the dispatcher lands - though the gateway's rendered grant is an
+addressee wildcard and reaches their `…supervisor` regardless, which the profiles spec
+spells out; that is a gap the profiles
+spec names, not one this sweep fills. Two failure classes:
 
 - **The subprocess dies under a live bridge.** The runner sees the exit and publishes
   terminal `failed` with the evidence. Ordinary executor path, nothing special.
@@ -139,6 +156,14 @@ expected-last-subject-sequence pinned to the last event the fold saw. A dying
 subprocess's flush racing the sweep wins cleanly, the CAS is rejected, and the sweep
 re-reads instead of double-finalizing. Whichever writer loses lands in the
 warn-and-drop path like any other post-final event.
+
+That still holds here after 9/9, and it is worth saying why, because the profiles spec
+records that the same CAS stopped protecting the dispatcher's janitor on that date.
+Expected-last-subject-sequence is per subject. The janitor's terminal moved to
+`…supervisor` while the executor kept writing `…events`, so the two writers stopped
+sharing the subject the CAS is evaluated on. The bridge's sweep reads and writes the
+same `…events` subject as the runner it is racing, so the racing write still
+invalidates the expectation and the server still refuses the loser.
 
 The sweep assumes incarnations are serial. That assumption is real on this install -
 the kubelet restarts the sidecar container in place, and the operator renders the agent
@@ -173,4 +198,8 @@ runs executions as Jobs, where the problem does not exist.
 A task published to `a2a.tasks.platform.<id>.in` on the W6 install returns the platform
 agent's real answer as a `result` artifact. Cancel works. The event sequence passes
 the lifecycle conformance assertions (9, 10, 12, 13, 14, 15, 18), table-driven like the
-`a2a/lib` conformance suite.
+`a2a/lib` conformance suite. Two of those changed meaning on 9/9 without changing number:
+9 gained the supervisor-only-terminal exception and 10 now spans both event subjects, and
+the bridge's own tests still assert the single-subject form. They pass because a
+platform task has no supervisor writing to it in practice, not because they cover the
+new wording - so do not read a green bridge suite as coverage of the split.

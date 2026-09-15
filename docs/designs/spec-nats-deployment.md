@@ -45,12 +45,12 @@ window, not the delivery lifecycle. Concretely:
 
 Streams bind to the payload spec's subjects and topic classes:
 
-| Stream           | Subjects             | Retention                                   | Consumers                                                                                                                                                                                                                                                                                                                |
-| :--------------- | :------------------- | :------------------------------------------ | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `TASKS`          | `a2a.tasks.>`        | Age window W (72h dev default), R3          | One durable per profile, held by the dispatcher, on `a2a.tasks.{profile}.*.in`, `MaxAckPending` ~50 per profile - per-profile consumers so one capped or crash-looping profile's unacked backlog cannot head-of-line block another profile's dispatch. `tasks/get` is an ephemeral replay of `…events`, never a consume. |
-| `DIRECTORY`      | `a2a.agents.>`       | `max_msgs_per_subject: 1`, R3               | Last-value; the tombstone replaces the card                                                                                                                                                                                                                                                                              |
-| `TOPICS-STATE`   | state-class topics   | `max_msgs_per_subject: 8`, no age limit, R3 | Read latest-per-subject                                                                                                                                                                                                                                                                                                  |
-| `TOPICS-JOURNAL` | journal-class topics | `max_age: 30d`, R3                          |                                                                                                                                                                                                                                                                                                                          |
+| Stream           | Subjects             | Retention                                   | Consumers                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| :--------------- | :------------------- | :------------------------------------------ | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TASKS`          | `a2a.tasks.>`        | Age window W (72h dev default), R3          | One durable per profile, held by the dispatcher, on `a2a.tasks.{profile}.*.in`, `MaxAckPending` ~50 per profile - per-profile consumers so one capped or crash-looping profile's unacked backlog cannot head-of-line block another profile's dispatch. `tasks/get` is an ephemeral replay of `…events` and `…supervisor` together, in stream order, never a consume; the supervisor's terminal has its own subject token since 9/9, and both match this stream's filter. |
+| `DIRECTORY`      | `a2a.agents.>`       | `max_msgs_per_subject: 1`, R3               | Last-value; the tombstone replaces the card                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `TOPICS-STATE`   | state-class topics   | `max_msgs_per_subject: 8`, no age limit, R3 | Read latest-per-subject                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `TOPICS-JOURNAL` | journal-class topics | `max_age: 30d`, R3                          |                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 
 State and journal topics both live under `a2a.topics.>`, so the two topic streams' subject
 lists are rendered per topic from the provisioned registry - which topics exist is already
@@ -183,6 +183,30 @@ Layout:
   session grants do. The addressee token in the task subjects (payload spec
   0.4) is what makes these grants expressible - executor-granularity at connect time,
   with per-task scoping the parked tightening under the authority work.
+- **Three task-subject classes, and the publish grants split along them** (9/9, payload
+  spec 0.4). `…in` is the requester's, `…events` the executor's, and `…supervisor` the
+  supervisor's - one writer class each, which is the whole point: a consumer derives the
+  publisher from the subject, so a class with two rendered writers derives nothing. A
+  supervisor terminal sitting on the executor's subject is exactly what a hostile executor
+  would forge, so the supervisor's terminal grant and the executor's must not name the
+  same subject. **The grant lists are the render's, not this document's**:
+  `platformagent_a2a_identities.go` and the golden
+  `a2a/authcallout/testdata/rendered-nats.conf` are what to read and what to reconcile
+  toward, and the rule above is what they are meant to satisfy - an earlier draft of this
+  bullet had it the other way round and enumerated the lists here as canonical, which
+  invites squaring the render against prose. Two consequences of the split the render does
+  not show on its face. First, the supervisor grant is a wildcard over the ADDRESSEE
+  (`a2a.tasks.*.*.supervisor`), not a scope to the sessions the gateway spawned, which a
+  static render cannot express - so it reaches every profile's supervisor subject too, and
+  a profile task's `…supervisor` must not be modelled as unreachable. Second, the class
+  that is not yet single-writer is `…events`, and the holder is the static `worker`
+  credential the Hermes bridge authenticates with: its `a2a.tasks.*.*.events` wildcards the
+  addressee token, so it reaches session and profile subjects alike until that credential
+  is retired. A session's grant, by contrast, is derived per incarnation by the auth
+  callout and reaches only its own pod's `…events`. `spec-a2a-payloads.md` states the
+  consumer rule that rests on all of this and enumerates what is not yet decision-grade -
+  including a redirection route onto `…supervisor` that no assertion pins. Read that
+  section before treating any class as closed.
 - **The JetStream tax.** Deny-by-default reaches JetStream's own plumbing, and three
   grants are part of being a JetStream client at all: the `$JS.API` subjects a role's
   streams and buckets need, enumerated per stream and per verb where the caller set is

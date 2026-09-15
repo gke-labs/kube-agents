@@ -101,8 +101,11 @@ either answer.
 ### What the CRD deliberately does not hold: task state
 
 There is no `AgentTask` CR and no task status mirrored into the API server. Tasks live
-on the bus: submission on `a2a.tasks.{profile}.{taskId}.in`, every event on
-`a2a.tasks.{profile}.{taskId}.events`, status answered by replay. Mirroring that into etcd would create a second source of truth
+on the bus: submission on `a2a.tasks.{profile}.{taskId}.in`, the executor's events on
+`a2a.tasks.{profile}.{taskId}.events` and its supervisor's terminal on
+`a2a.tasks.{profile}.{taskId}.supervisor`, status answered by replaying both. Both, not
+just the first: a status-by-replay built on `…events` alone never terminates a task the
+supervisor declared dead. Mirroring that into etcd would create a second source of truth
 that is guaranteed to lag the first, plus an API-server write per status event. The
 kanban board is a task database bolted to the side of the harness. The durable stream is
 the task database now, and it comes with the audit story attached. The only Kubernetes
@@ -178,7 +181,7 @@ so "one dispatcher" and "exactly one final event" are elected properties, not de
 accidents. Scaling the operator for HA changes nothing here: followers hold no
 consumers. Only a
 task-starting submission renders a Job: before creating, the dispatcher checks the
-task's `…events` subject, and empty means new task. A task with events already is not
+task's `…events` and `…supervisor` subjects, and both empty means new task. A task with events already is not
 the dispatcher's business - follow-ups, steers, and cancels for a live task belong to
 the in-pod adapter, and `…in` traffic for a task with a terminal event is acked with a
 warning and no Job. Without that check, a follow-up or cancel arriving after
@@ -352,19 +355,49 @@ source of truth instead of a poll over pods.
 
 The synthesize is a compare-and-swap, not a read-then-write: the janitor publishes its
 terminal event with the expected last subject sequence it observed when it found no
-terminal - so a dying pod's SIGTERM flush racing the sweep wins cleanly, the janitor's
-publish is rejected, and it re-reads instead of double-finalizing. "Exactly one final
-event" is arbitrated by the write, not by the check before it; whichever writer loses
-lands in the warn-and-drop path like any other post-final event.
+terminal, so two janitor incarnations - a leader-election flap, a restart mid-sweep -
+cannot both finalize the same task. One of them is rejected and re-reads.
+
+**What that CAS stopped covering on 9/9, and what replaces it.** JetStream's
+expected-last-subject-sequence is per SUBJECT. While the janitor and the executor both
+wrote to `…events`, the janitor's expected sequence was invalidated by the executor's
+racing SIGTERM flush, and the losing writer was refused at the server - the property
+this paragraph used to claim. The supervisor split ends that: the janitor's CAS is now
+on `…supervisor`, a subject no executor can write, so an executor's terminal landing
+between the janitor's read and its publish does not invalidate anything and both
+terminals reach the stream. The CAS still does the job it is written for above, which
+is janitor-against-janitor; it no longer arbitrates janitor-against-executor.
+
+"Exactly one final event" is therefore arbitrated by the FOLD, not by the write. The
+two subjects share the `TASKS` sequence, so replay sees a total order: the first
+terminal in stream order is the task's, and the other is a post-final drop, counted
+like any other. A janitor should still re-read both subjects immediately before
+publishing - it narrows the window and costs one `GetLastMsgForSubject` per subject -
+but it must not be written as though a refusal will save it, because none is coming.
+The cost of the change is a duplicate terminal on the wire where there used to be a
+server-side refusal; live consumers drop it, and a relay that renders terminals should
+expect to see one it has already rendered.
 
 This is the dispatcher's half of the payload spec's orphaned-task answer; the gateway
 sweeps its own chat sessions the same way (the ratified 8/24 split - every task's
 supervisor is its janitor). The janitor's grant is publish on its own profiles'
-`…events` subjects - subject-level, since NATS permissions cannot see the envelope
-`kind`; that a janitor emits only terminal `status-update` is a conformance assertion,
-not a connect-time control. The grant is in the identity-to-permissions map like every
-other, and synthesized events carry the janitor's own identity in `from`, so replay
-always distinguishes "the worker said failed" from "the janitor declared it dead."
+`…supervisor` subjects (the 9/9 split; before it, `…events`, which made every
+executor's subject two-writer) - subject-level, since NATS permissions cannot see the
+envelope `kind`; that a janitor emits only terminal `status-update` is a conformance
+assertion (payload spec 22), not a connect-time control. The grant is in the
+identity-to-permissions map like every other. Replay distinguishes "the worker said
+failed" from "the janitor declared it dead" by which subject the terminal is on, and
+consumers check `from` for agreement with that subject rather than trusting it. Until
+the dispatcher exists there is no janitor ROLE for profile-addressed tasks; the Hermes
+bridge's startup sweep is the executor finalising its own predecessor's orphan and writes
+on `…events` as itself. No role is not the same as no writer, and the render is the thing
+to read: the gateway's supervisor grant is `a2a.tasks.*.*.supervisor`, a wildcard over the
+addressee, so the gateway can write every profile's supervisor subject even though nothing
+asks it to. Production would scope that grant to the sessions the gateway spawned; a static
+render cannot express it. A consumer with no configured supervisor name falls back to the
+negative form - `from` is not the addressee - which a gateway-credentialled terminal
+satisfies. So do not model a profile task's `…supervisor` as unreachable, and do not treat
+an envelope arriving there as impossible.
 
 **What is deliberately absent: automatic retry.** Today the board charges a retry
 budget, forgives infrastructure deaths, and trips a breaker on repeat offenders. This
