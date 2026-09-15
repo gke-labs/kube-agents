@@ -602,6 +602,15 @@ func buildShellSandboxContainers(agent *agentv1alpha1.PlatformAgent, env []corev
 // presents to the broker, which buys the caller nothing except the right to ask.
 // The broker's kubeconfig, gcloud configuration and federated token are in
 // another pod.
+//
+// The GitOps state ConfigMap is the one volume shared with the agent container,
+// and it carries no credential: two repository lists a cluster administrator
+// wrote. It is here because the skills that read it run in this pod, and
+// gitops_workspace._read_state_key falls back to `kubectl get configmap` with
+// the shell's ambient context when the file is not on disk -- in a fleet task
+// that context is usually the fleet cluster the model just switched to, which
+// has no kubeagents-system namespace, and `submit-suggestion prepare` and the
+// fleet-audit ledger write fail on the reps where it is (#1590).
 func buildShellSandboxVolumes(agent *agentv1alpha1.PlatformAgent, authorizedKeysSecret string) []corev1.Volume {
 	volumes := []corev1.Volume{{
 		Name: shellSandboxKeysVolume,
@@ -636,7 +645,7 @@ func buildShellSandboxVolumes(agent *agentv1alpha1.PlatformAgent, authorizedKeys
 		// mount, not what is behind it.
 		Name:         shellSandboxHermesHomeVolume,
 		VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
-	}, buildShellSandboxCredentialProxyTokenVolume()}
+	}, buildShellSandboxCredentialProxyTokenVolume(), buildGitopsStateVolume(agent)}
 	return volumes
 }
 
@@ -753,6 +762,22 @@ func buildShellSandboxContainer(agent *agentv1alpha1.PlatformAgent, env []corev1
 				Name:      shellSandboxSettingsVolume,
 				MountPath: path.Join(shellSandboxDataPath, settingsFileName),
 				SubPath:   settingsFileName,
+				ReadOnly:  true,
+			},
+			{
+				// The same mount the agent container has, at the same path,
+				// for the same reader: gitops_workspace.py defaults
+				// GITOPS_STATE_PATH to a file under gitopsStateDir, so the
+				// path alone is enough and no variable has to cross sshd
+				// (deploy/sandbox/entrypoint.sh forwards an allowlist of the
+				// pod's environment into sessions, and a variable set here
+				// and not there is invisible to every command the model
+				// runs). Directory mount, never subPath, for the reason the
+				// agent's mount gives: a subPath does not receive kubelet
+				// ConfigMap updates, and a repository registered after the
+				// pod started has to be visible without a restart.
+				Name:      gitopsStateVolumeName,
+				MountPath: gitopsStateDir,
 				ReadOnly:  true,
 			},
 		},
