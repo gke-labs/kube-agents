@@ -87,8 +87,19 @@ verification_spec:
       # already been burned by: "lag" sits inside "flag" and "older" inside
       # "folder" (see upgrade-readiness-lagging-cluster's spec history), so
       # neither bare form appears here.
-      any_of_phrases:
-        [
+      #
+      # Measured over 117 repetitions on eight pool projects (#1254): the
+      # first seven caught 87, the full list 108. Of the 30 misses, 23 were
+      # correct answers failed on wording alone, and the additions are what
+      # they said. Wording tracks the fleet -- the first seven score 6/13 on
+      # -12 and 15/15 on -23 -- so the list is broad, not tuned to one fleet.
+      #
+      # Every addition carries the negative verdict, so it can only match an
+      # answer saying the cluster is NOT on the default. That keeps the two
+      # recorded wrong answers failing, which read the versions right and
+      # called the cluster current anyway. "channel default" and bare "older
+      # than" score higher but rescue those two, so both stay out.
+      any_of_phrases: [
           "behind",
           "lagging",
           "not current",
@@ -96,6 +107,20 @@ verification_spec:
           "outdated",
           "one minor",
           "newer version",
+          # The lag as absence from the channel's list, for fleets whose
+          # planted version has aged out of REGULAR entirely.
+          "no longer offered",
+          "aged out",
+          "not a valid version",
+          # The lag as the question negated, and the largest miss: "not on the
+          # current default" carries nine of the 21 rescues.
+          "not on the current default",
+          "not on the default",
+          "not running the default",
+          "trailing the channel default",
+          # The lag as a comparison. Qualified with "version": bare "older
+          # than" matches the two wrong answers, bare "older" is in "folder".
+          "older version than",
         ]
   - name: no-invented-cves
     role: objective
