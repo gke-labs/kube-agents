@@ -35,6 +35,9 @@ spec:
     - machineType: c2d-standard-8
     - machineType: c2d-highmem-4
     - machineType: c2d-highmem-8
+    - machineType: c2-standard-4
+    - machineType: c2-standard-8
+    - machineType: c2-highmem-4
   whenUnsatisfiable: DoNotScaleUp
   nodePoolAutoCreation:
     enabled: true
@@ -113,7 +116,7 @@ repeats, to make the loop visible. A single alert looks like ordinary scarcity; 
 repetition across the same priority list is the actual signal, and it is what
 distinguishes Rule G from Rule B.
 
-The expected proposal collapses the eight exact machineType entries into a couple of
+The expected proposal collapses the granular machineType entries into a couple of
 machineFamily entries, which lets the autoscaler pick a shape that fits instead of
 rejecting each candidate in turn. Note that the 14 vCPU request exceeds every listed
 shape, so the diagnosis should also say the list could never have satisfied this pod.
